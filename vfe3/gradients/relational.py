@@ -12,7 +12,7 @@ from vfe3.gradients.qkv import (
 from vfe3.divergence import get_functional, get_functional_per_coord, renyi, renyi_per_coord
 from vfe3.families.gaussian import DiagonalGaussian
 from vfe3.model.relational_operators import RelationalOperators
-from vfe3.relational_scoring import projected_moments, projected_gaussian_kl
+from vfe3.relational_scoring import projected_moments, projected_gaussian_kl, projected_noisy_query_cost
 
 
 def relational_score(
@@ -23,8 +23,11 @@ def relational_score(
     frame:        CanonicalFrameContext,               # (..., N, H, d, d) compact or (..., N, K, K) dense
     operators:    RelationalOperators,
     capture:      Optional[Dict[str, Any]] = None,     # out-param: pre-update projected covariances
-) -> torch.Tensor:                                     # (..., H, N, N) projected KL scores
-    r"""Compute KL(S_Q U_i^{-1} q_i || S_K U_j^{-1} q_j), retaining full reduced covariance.
+) -> torch.Tensor:                                     # (..., H, N, N) projected routing costs
+    r"""Compute KL(S_Q U_i^{-1} q_i || S_K U_j^{-1} q_j) or the noisy-query cost, retaining full reduced covariance.
+
+    ``operators.routing`` selects the cost: ``"gaussian_kl"`` (projected_gaussian_kl) or
+    ``"noisy_query"`` (projected_noisy_query_cost, the expected-likelihood source posterior).
 
     The comparison reads each head's canonical coordinates through the head blocks of
     :math:`U^{-1}`, which equal the full canonical coordinates only when :math:`U^{-1}` is
@@ -77,7 +80,8 @@ def relational_score(
     if capture is not None:
         capture["projected_covariance_pre"] = G_q.detach()
         capture["projected_key_covariance_pre"] = G_k.detach()
-    return projected_gaussian_kl(
+    score = projected_noisy_query_cost if operators.routing == "noisy_query" else projected_gaussian_kl
+    return score(
         a_q, G_q, a_k, G_k,
         projection_q=(sigma_h, inverse, S_q, mu_h),
         projection_k=(source_sigma_h, key_inverse, S_k, source_mu_h))
@@ -140,7 +144,7 @@ def relational_predictive_readout(
     value_frame: Optional[CanonicalFrameContext] = None,
     capture:     Optional[Dict[str, Any]] = None,
 ) -> torch.Tensor:
-    r"""Return the conditional predictive mean with KL routing and live source graphs.
+    r"""Return the conditional predictive mean with the configured projected routing cost and live source graphs.
 
     This is a separate content mixture, not a Fisher step on the comparison belief.
     Its covariance is not estimated here. No source, router, or map is detached.

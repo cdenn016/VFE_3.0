@@ -352,6 +352,7 @@ class VFE3Config:
     relational_output_init:              str           = "identity"             # "identity" | "depth_scaled" (initial O times 1/sqrt(2 n_layers))
 
     relational_identity_content:         bool          = False                  # predictive_content requires learned content maps
+    relational_routing:                  str           = "gaussian_kl"          # "gaussian_kl" | "noisy_query" (projected_predictive only)
 
     ######################################
     #                Self Energy:
@@ -786,6 +787,9 @@ class VFE3Config:
             raise ValueError("relational_output_scope='full' requires predictive_content")
         if self.attention_mode == "projected_predictive" and self.relational_identity_content:
             raise ValueError("predictive_content requires learned content maps")
+        _require(self.relational_routing, ("gaussian_kl", "noisy_query"), "relational_routing")
+        if self.relational_routing == "noisy_query" and self.attention_mode != "projected_predictive":
+            raise ValueError("relational_routing='noisy_query' requires attention_mode='projected_predictive'")
         for name in ("m_relational_score_lr", "m_relational_content_lr"):
             rate = getattr(self, name)
             if rate is not None and (
@@ -2281,7 +2285,8 @@ class VFE3Config:
         if self.m_phi_update_mode != "pullback_group":
             mark(("m_phi_group_trust_radius",), "only read by m_phi_update_mode='pullback_group'")
         if self.attention_mode == "transported":
-            mark(("relational_identity_content", "m_relational_score_lr", "m_relational_content_lr"),
+            mark(("relational_identity_content", "m_relational_score_lr", "m_relational_content_lr",
+                  "relational_routing"),
                  "only read by projected attention; transported attention creates no relational parameters")
         else:
             mark(("compile_pair_kernel",), "projected attention bypasses the belief-gradient pair kernel")

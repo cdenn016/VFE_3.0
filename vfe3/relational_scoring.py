@@ -459,6 +459,154 @@ def _projected_kl_tile(
                  + logdet_k.unsqueeze(-2) - logdet_q.unsqueeze(-1))
 
 
+def projected_noisy_query_cost(
+    a_q: torch.Tensor,  # (..., Nq, H, r)
+    G_q: torch.Tensor,  # (..., Nq, H, r, r)
+    a_k: torch.Tensor,  # (..., Nk, H, r)
+    G_k: torch.Tensor,  # (..., Nk, H, r, r)
+
+    *,
+    projection_q: Optional[Tuple[torch.Tensor, ...]] = None,
+    projection_k: Optional[Tuple[torch.Tensor, ...]] = None,
+) -> torch.Tensor:      # (..., H, Nq, Nk)
+    r"""Compute D_ij = -log N(a_i; b_j, W_ij) - log det(2 pi G_q,i)/2 with W_ij = G_q,i + G_k,j.
+
+    With delta_ij = a_i - b_j,
+
+        D_ij = (delta_ij^T W_ij^{-1} delta_ij + log det W_ij - log det G_q,i) / 2 >= 0.
+
+    softmax_j(-D_ij + log pi_ij) is the exact source posterior when the projected query mean is a
+    noisy measurement, with covariance G_q,i, of a draw from the key law N(b_j, G_k,j);
+    N(a_i; b_j, W_ij) is the expected likelihood kernel of the two laws (Jebara, Kondor and
+    Howard, 2004). The log det G_q,i term is a row constant: the softmax ignores it, and it makes
+    D_ij nonnegative because W_ij > G_q,i. Each pair needs its own r x r Cholesky factor of W_ij.
+
+    Factorization and recovery follow projected_gaussian_kl: zero jitter, no covariance repair,
+    float64 source recovery for flagged entries, bounded checkpointed pair tiles, and the float64
+    route selected per pair, so healthy pairs are bit-identical to a call without recovery.
+    Recovered entries enter the working-dtype grid as identity placeholders, so no factorization
+    of a numerically non-SPD sum runs even for a pair whose value the factor route replaces.
+    """
+    if a_q.ndim < 3 or a_k.ndim < 3 or a_q.shape[-2:] != a_k.shape[-2:]:
+        raise ValueError("projected means must have matching head and comparison dimensions")
+    r = a_q.shape[-1]
+    if G_q.shape != (*a_q.shape, r) or G_k.shape != (*a_k.shape, r):
+        raise ValueError("projected covariances must match their means with one additional matrix axis")
+    dtype = _compute_dtype(a_q, G_q, a_k, G_k)
+    with torch.autocast(device_type=a_q.device.type, enabled=False):
+        aq, ak = a_q.to(dtype), a_k.to(dtype)
+        Gq, Gk = G_q.to(dtype), G_k.to(dtype)
+        q_status, k_status = _cholesky_status(Gq), _cholesky_status(Gk)
+        # One host transfer for both roles and the means on the healthy path.
+        decisions = torch.cat(((torch.isfinite(aq).all() & torch.isfinite(ak).all()).reshape(1),
+                               q_status[-1], k_status[-1])).tolist()
+        if not decisions[0]:
+            raise ValueError("projected means must contain only finite values")
+        chol_q, rec_q = _strict_cholesky(Gq, projection_q, (*q_status[:3], decisions[1:5]))
+        chol_k, rec_k = _strict_cholesky(Gk, projection_k, (*k_status[:3], decisions[5:9]))
+        eye = torch.eye(r, device=Gq.device, dtype=dtype)
+        # Working-dtype inputs; recovered entries become identity placeholders.
+        Gq_work = Gq if rec_q is None else torch.where(rec_q[..., None, None], eye, Gq)
+        Gk_work = Gk if rec_k is None else torch.where(rec_k[..., None, None], eye, Gk)
+        # Healthy factors round-trip bit-exactly through the cast.
+        logdet_q_work = 2 * chol_q.to(dtype).diagonal(dim1=-2, dim2=-1).log().sum(-1).transpose(-1, -2)
+        work = (aq.movedim(-2, -3), ak.movedim(-2, -3),             # (..., H, N, r)
+                Gq_work.movedim(-3, -4), Gk_work.movedim(-3, -4),   # (..., H, N, r, r)
+                logdet_q_work)                                      # (..., H, Nq)
+        nq, nk = work[0].shape[-2], work[1].shape[-2]
+        batch_heads = work[0].numel() // (nq * r)
+
+        def _tile_steps(element_size: int) -> Tuple[int, int]:
+            # Each pair holds W_ij and its factor: two r x r matrices.
+            pair_budget = max(1, (32 * 1024 ** 2) // (element_size * batch_heads * 2 * r * r))
+            q_step = max(1, min(nq, 32, pair_budget))
+            return q_step, max(1, min(nk, pair_budget // q_step))
+
+        def _slice(route: tuple, i: int, j: int, q_step: int, k_step: int) -> tuple:
+            return (route[0][..., i:i+q_step, :], route[1][..., j:j+k_step, :],
+                    route[2][..., i:i+q_step, :, :], route[3][..., j:j+k_step, :, :],
+                    route[4][..., i:i+q_step])
+
+        def _tile(args: tuple, q_step: int, k_step: int) -> Tuple[torch.Tensor, torch.Tensor]:
+            if torch.is_grad_enabled() and (nq > q_step or nk > k_step) and any(x.requires_grad for x in args):
+                return checkpoint(_noisy_query_tile, *args, use_reentrant=False, preserve_rng_state=False)
+            return _noisy_query_tile(*args)
+
+        failures = []
+        # Working-dtype grid in the healthy tile geometry: exactly the no-recovery computation.
+        q_step, k_step = _tile_steps(aq.element_size())
+        rows = []
+        for i in range(0, nq, q_step):
+            columns = []
+            for j in range(0, nk, k_step):
+                value, failed = _tile(_slice(work, i, j, q_step, k_step), q_step, k_step)
+                columns.append(value)
+                failures.append(failed)
+            rows.append(torch.cat(columns, dim=-1))
+        score = torch.cat(rows, dim=-2)                             # (..., H, Nq, Nk)
+        if rec_q is not None or rec_k is not None:
+            # Factor route only for pairs that touch a recovered entry, selected per (b, h, i, j),
+            # from float64 moments rebuilt from the (possibly recovered) factors and sources.
+            means = [aq, ak]
+            for role, projection in enumerate((projection_q, projection_k)):
+                if projection is not None and len(projection) == 4:
+                    _, inverse, S, mu = projection
+                    means[role] = (_projected_linear_map(S.double(), inverse.double())
+                                   @ mu.double().unsqueeze(-1)).squeeze(-1)
+            factor_q, factor_k = chol_q.double(), chol_k.double()
+            exact = (means[0].double().movedim(-2, -3), means[1].double().movedim(-2, -3),
+                     (factor_q @ factor_q.transpose(-1, -2)).movedim(-3, -4),
+                     (factor_k @ factor_k.transpose(-1, -2)).movedim(-3, -4),
+                     2 * factor_q.diagonal(dim1=-2, dim2=-1).log().sum(-1).transpose(-1, -2))
+            q_rec = (rec_q.movedim(-1, -2) if rec_q is not None                       # (..., H, Nq)
+                     else torch.zeros(Gq.shape[:-4] + (Gq.shape[-3], Gq.shape[-4]),
+                                      dtype=torch.bool, device=Gq.device))
+            k_rec = (rec_k.movedim(-1, -2) if rec_k is not None                       # (..., H, Nk)
+                     else torch.zeros(Gk.shape[:-4] + (Gk.shape[-3], Gk.shape[-4]),
+                                      dtype=torch.bool, device=Gk.device))
+            pair_rec = q_rec.unsqueeze(-1) | k_rec.unsqueeze(-2)                      # (..., H, Nq, Nk)
+            # Fold token-level recovery flags into one host transfer, recovery path only.
+            flags = torch.cat((q_rec.movedim(-1, 0).reshape(nq, -1).any(dim=-1),
+                               k_rec.movedim(-1, 0).reshape(nk, -1).any(dim=-1))).tolist()
+            q_needs, k_needs = flags[:nq], flags[nq:]
+            q_step, k_step = _tile_steps(torch.finfo(torch.float64).bits // 8)
+            rows = []
+            for i in range(0, nq, q_step):
+                columns = []
+                for j in range(0, nk, k_step):
+                    value = score[..., i:i+q_step, j:j+k_step]
+                    if any(q_needs[i:i+q_step]) or any(k_needs[j:j+k_step]):
+                        exact_value, failed = _tile(_slice(exact, i, j, q_step, k_step), q_step, k_step)
+                        value = torch.where(pair_rec[..., i:i+q_step, j:j+k_step],
+                                            exact_value.to(dtype), value)
+                        failures.append(failed)
+                    columns.append(value)
+                rows.append(torch.cat(columns, dim=-1))
+            score = torch.cat(rows, dim=-2)
+        # One device-side reduction and one host check for every tile factorization.
+        if bool(torch.stack(failures).any()):
+            raise ValueError("noisy-query covariance G_q + G_k is not positive definite: "
+                             "zero-jitter Cholesky failed; no repair applied")
+        return score
+
+
+def _noisy_query_tile(
+    aq:       torch.Tensor,  # (..., H, I, r)
+    ak:       torch.Tensor,  # (..., H, J, r)
+    Gq:       torch.Tensor,  # (..., H, I, r, r)
+    Gk:       torch.Tensor,  # (..., H, J, r, r)
+    logdet_q: torch.Tensor,  # (..., H, I)
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Compute one tile of D_ij = (delta^T W_ij^{-1} delta + log det W_ij - log det G_q,i)/2, W_ij = G_q,i + G_k,j."""
+    delta = aq.unsqueeze(-2) - ak.unsqueeze(-3)                    # (..., H, I, J, r)
+    W = Gq.unsqueeze(-3) + Gk.unsqueeze(-4)                        # (..., H, I, J, r, r), exactly symmetric
+    chol, info = torch.linalg.cholesky_ex(W, check_errors=False)
+    whitened = torch.linalg.solve_triangular(chol, delta.unsqueeze(-1), upper=False)
+    quadratic = whitened.square().sum(dim=(-2, -1))                # (..., H, I, J)
+    logdet_w = 2 * chol.diagonal(dim1=-2, dim2=-1).log().sum(-1)   # (..., H, I, J)
+    return .5 * (quadratic + logdet_w - logdet_q.unsqueeze(-1)), (info != 0).any()
+
+
 def relational_mixture_mean(
     xi:             torch.Tensor,  # (..., Nk, H, d)
     forward_blocks: torch.Tensor,  # (..., Nq, H, d, d)

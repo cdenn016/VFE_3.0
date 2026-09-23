@@ -20,6 +20,8 @@ class RelationalOperators(nn.Module):
     ``identity_content`` drops T/O and carries the transported belief unchanged.
     ``output_init_scale`` multiplies the initial output map, :math:`O_h(0) = s\,I_d` (placed on its
     head block under full output scope); ``s = 1`` is the identity start.
+    ``routing`` selects the projected routing cost: Gaussian KL, or the noisy-query cost
+    N(a_i; b_j, V_Q + V_K) of the expected likelihood kernel (predictive_content only).
     """
 
     def __init__(
@@ -32,6 +34,7 @@ class RelationalOperators(nn.Module):
         attention_residual:    bool  = False,
         identity_content:      bool  = False,
         output_init_scale:     float = 1.0,
+        routing:               str   = "gaussian_kl",
     ) -> None:
         super().__init__()
         if not irrep_dims or any(type(d) is not int or d < 1 for d in irrep_dims) or len(set(irrep_dims)) != 1:
@@ -59,6 +62,11 @@ class RelationalOperators(nn.Module):
         if readout_mode == "predictive_content" and identity_content:
             raise ValueError("predictive_content requires learned content maps")
         self.readout_mode = readout_mode
+        if routing not in ("gaussian_kl", "noisy_query"):
+            raise ValueError("relational routing must be 'gaussian_kl' or 'noisy_query'")
+        if routing == "noisy_query" and readout_mode != "predictive_content":
+            raise ValueError("noisy_query routing requires predictive_content")
+        self.routing = routing
         self.output_scope = output_scope
         self.input_scope = input_scope
         self.input_dim = H * d if input_scope == "full" else d

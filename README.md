@@ -97,6 +97,24 @@ $$
 D_{ij}^{(h)}=D_{\mathrm{KL}}(Q_{i,h}\Vert K_{j,h}).
 $$
 
+Setting `relational_routing="noisy_query"` (predictive route only) replaces this cost by the
+noisy-query cost of Remark 9 in the v2 manuscript. Writing $Q_{i,h}=\mathcal N(a_i,V_{Q,i})$ and
+$K_{j,h}=\mathcal N(b_j,V_{K,j})$ as above, with $W_{ij}=V_{Q,i}+V_{K,j}$,
+
+$$
+D_{ij}^{(h)}=\tfrac12(a_i-b_j)^{\top}W_{ij}^{-1}(a_i-b_j)+\tfrac12\log\det W_{ij}-\tfrac12\log\det V_{Q,i}
+=-\log\mathcal N(a_i;b_j,W_{ij})-\tfrac12\log\det(2\pi V_{Q,i}).
+$$
+
+At unit temperature ($\tau_h=1$, that is `kappa_beta` $=1/\sqrt d$) and while no cost reaches the
+`kl_max` clamp, the Gibbs row of the next section,
+$\beta_{ij}^{(h)}\propto\pi_{ij}^{(h)}\mathcal N(a_i;b_j,W_{ij})$, is the exact posterior of the
+source label when the projected query mean is a noisy measurement of a draw from the key law, so
+query uncertainty flattens the row. The last term is a row constant that keeps the cost
+nonnegative. The rule adds no parameters, and a model trained with Gaussian-KL routing loads
+unchanged. It costs one $d\times d$ Cholesky factorization per token pair, where the KL cost
+needs one per key.
+
 Positive-definite projected covariances require full row rank of the comparison
 maps. Their rows are initialized orthonormally, then trained as free matrices;
 the implementation does not continually orthonormalize them.
@@ -236,6 +254,7 @@ config.update(
     relational_input_scope="full",
     relational_output_scope="full",
     attention_residual=True,
+    relational_routing="gaussian_kl",     # or "noisy_query"
     gradient_mode="filtering",
     include_attention_entropy=True,
     divergence_family="renyi",

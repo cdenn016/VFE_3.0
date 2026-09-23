@@ -357,7 +357,8 @@ class VFEModel(nn.Module):
                                     cfg.relational_readout_mode, cfg.relational_output_scope,
                                     attention_residual=cfg.attention_residual,
                                     identity_content=cfg.relational_identity_content,
-                                    output_init_scale=output_init_scale)
+                                    output_init_scale=output_init_scale,
+                                    routing=cfg.relational_routing)
                 for layer_index in range(cfg.n_layers)
             ]
             self.relational_operators = layers[0]
