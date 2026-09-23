@@ -131,6 +131,7 @@ config = dict(
     relational_output_scope          = "full",                  # transformers: "full": requires predictive_content, legacy: 'head'
     
     attention_residual               = True,   # predictive S/T/O: add the incoming mean
+    relational_routing               = "gaussian_kl",  # "gaussian_kl" | "noisy_query": exact posterior N(a_i; b_j, V_Q + V_K), predictive only
    
        
     

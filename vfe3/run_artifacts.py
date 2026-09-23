@@ -75,6 +75,7 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
     counts = {role: count * cfg.n_layers for role, count in layer_counts.items()}
     return {"relational_operators": {
         "attention_mode": cfg.attention_mode,
+        "routing": cfg.relational_routing,
         "n_layers": cfg.n_layers, "layer_parameter_sharing": "independent",
         "per_layer_parameter_counts": layer_counts,
         "shape_scope": "per_layer",
