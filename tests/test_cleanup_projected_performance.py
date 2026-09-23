@@ -267,10 +267,11 @@ def test_full_input_router_tiling_autocast_and_recomputed_gradients(
     monkeypatch.setattr(scoring, "_projected_moments_tile", record)
     with torch.autocast("cpu", dtype=torch.bfloat16):
         actual = relational_score(mu, sigma, mu, sigma, frame, operators)
-    assert len(tile_shapes) == 6
+    # Self-scoring batches both comparison maps into one projected_moments call.
+    assert len(tile_shapes) == 3
     assert all(shape[-3] == 1 for shape in tile_shapes)
     actual_grad = torch.autograd.grad(actual.square().sum(), inputs)
-    assert len(tile_shapes) > 6  # Backward actually recomputed checkpointed tiles.
+    assert len(tile_shapes) > 3  # Backward actually recomputed checkpointed tiles.
     monkeypatch.setattr(scoring, "_PROJECTION_TILE_BYTES", 1024 ** 3)
     with torch.autocast("cpu", dtype=torch.bfloat16):
         expected = relational_score(mu, sigma, mu, sigma, frame, operators)

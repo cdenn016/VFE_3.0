@@ -48,12 +48,16 @@ def relational_score(
             if x.ndim == mu.ndim + 1 else x.reshape(*x.shape[:-1], H, d)
             for x in (sigma, source_sigma))
     S_q, S_k = operators.comparison_pair()
-    # mu_h/sigma_h/inverse are already numerically identical to source_mu_h/source_sigma_h/
-    # key_inverse in the predictive self-comparison case (mu is source_mu): S_q and S_k still
-    # differ, so both per-map contractions L=S U^-1 are required either way. projected_moments
-    # takes S as (H, r, d); it does not accept a stacked (2, H, r, d) map.
-    a_q, G_q = projected_moments(mu_h, sigma_h, inverse, S_q)
-    a_k, G_k = projected_moments(source_mu_h, source_sigma_h, key_inverse, S_k)
+    if mu is source_mu and sigma is source_sigma and inverse is key_inverse:
+        # Predictive readout scores a belief against itself: one batched projection over both
+        # comparison maps. S_q and S_k still differ, so two L = S U^-1 maps are formed, but the
+        # covariance contraction G = L Sigma L^T is batched across the role axis.
+        a, G = projected_moments(mu_h, sigma_h, inverse, torch.stack((S_q, S_k)))
+        a_q, G_q = a[0], G[0]
+        a_k, G_k = a[1], G[1]
+    else:
+        a_q, G_q = projected_moments(mu_h, sigma_h, inverse, S_q)
+        a_k, G_k = projected_moments(source_mu_h, source_sigma_h, key_inverse, S_k)
     if capture is not None:
         capture["projected_covariance_pre"] = G_q.detach()
         capture["projected_key_covariance_pre"] = G_k.detach()

@@ -64,6 +64,25 @@ def canonical_e_step_update(name: str) -> str:
         raise ValueError(f"unknown e_step_update {name!r}; expected one of: {choices}") from exc
 
 
+def _belief_update_consumes_omega(
+    e_step_update: str,
+    relational_operators: Optional["RelationalOperators"] = None,
+) -> bool:
+    r"""True when the belief-update branch reads the forward transport ``omega``.
+
+    ``mm_exact`` consumes ``omega`` in ``mm_exact_update``. The ``predictive_content``
+    readout replaces ``mu`` and keeps ``sigma`` and never reads ``omega``. The filtering
+    and ``belief_gradients`` branches consume ``omega`` / ``omega_builder``. The phi
+    sub-step builds its own transport and is unaffected either way.
+    """
+    if e_step_update == "mm_exact":
+        return True
+    if (relational_operators is not None
+            and relational_operators.readout_mode == "predictive_content"):
+        return False
+    return True
+
+
 def _transport(
     phi:                torch.Tensor,             # (N, n_gen) or (B, N, n_gen)
     group:              GaugeGroup,
@@ -689,7 +708,15 @@ def e_step_iteration(
     # gradient). Pre-building here as well would only double the most expensive build in the
     # codebase.
     transport_registration = get_transport_registration(transport_mode)
-    if transport_registration.needs_mu or transport_registration.needs_sigma:
+    consumes_omega = _belief_update_consumes_omega(e_step_update, relational_operators)
+    if not consumes_omega:
+        # Predictive-content replaces mu and keeps sigma and never reads omega; the phi
+        # sub-step and the post-phi chart check build their own transports. Skip this dead
+        # build and leave ``transport_status`` unfilled. On the live projected route the
+        # model already builds ``shared_omega`` for the relational frame and reuses it via
+        # ``_prebuilt_omega``, so this gate only helps un-hoisted callers.
+        omega, omega_builder = None, None
+    elif transport_registration.needs_mu or transport_registration.needs_sigma:
         omega = None
 
         def _omega_builder(mu_q: torch.Tensor, sigma_q: torch.Tensor,
@@ -1123,7 +1150,9 @@ def e_step(
         and group.phi_coordinate_layout == "block_head_row_major"
     )
     _hoisted_omega: 'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport | None' = None
-    if e_phi_lr == 0.0 and transport_mode_kw == "flat":
+    e_step_update_kw = canonical_e_step_update(kwargs.get("e_step_update", "gradient"))
+    consumes_omega = _belief_update_consumes_omega(e_step_update_kw, relational_operators)
+    if consumes_omega and e_phi_lr == 0.0 and transport_mode_kw == "flat":
         if prebuilt_transport is not None:
             # The caller built the eligible flat transport ONCE from the SAME phi (both channels
             # hold it fixed at e_phi_lr=0) and shared it across E-step calls, skipping this redundant

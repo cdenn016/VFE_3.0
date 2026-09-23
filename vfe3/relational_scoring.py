@@ -38,7 +38,7 @@ def projected_moments(
     mu_h:           torch.Tensor,  # (..., N, H, d)
     Sigma_h:        torch.Tensor,  # (..., N, H, d) or (..., N, H, d, d)
     inverse_blocks: torch.Tensor,  # (..., N, H, d, d)
-    S:              torch.Tensor,  # (H, r, d)
+    S:              torch.Tensor,  # (H, r, d) or (R, H, r, d)
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Return a_i = S U_i^{-1} mu_i and G_i = S U_i^{-1} Sigma_i U_i^{-T} S^T.
 
@@ -47,10 +47,17 @@ def projected_moments(
     transpose to remove multiplication roundoff without adding jitter.
     Large projected maps use checkpointed token tiles to bound saved map
     intermediates; the output moments and source-factor recovery stay unchanged.
-    Returns (..., N, H, r) and (..., N, H, r, r).
+    A role-stacked ``S`` of shape ``(R, H, r, d)`` returns a leading ``R`` axis,
+    ``(R, ..., N, H, r)`` and ``(R, ..., N, H, r, r)``, sharing one frame map and
+    one covariance contraction across the roles.
+    Returns (..., N, H, r) and (..., N, H, r, r) for a single map.
     """
-    if mu_h.ndim < 3 or S.ndim != 3 or S.shape[::2] != mu_h.shape[-2:]:
+    if mu_h.ndim < 3 or S.ndim not in (3, 4):
+        raise ValueError("comparison maps must have (H, r, d) or (R, H, r, d) matching mean (..., N, H, d)")
+    if S.ndim == 3 and S.shape[::2] != mu_h.shape[-2:]:
         raise ValueError("comparison maps must have (H, r, d) matching mean (..., N, H, d)")
+    if S.ndim == 4 and S.shape[1::2] != mu_h.shape[-2:]:
+        raise ValueError("role-stacked comparison maps must have (R, H, r, d) matching mean (..., N, H, d)")
     H, d = mu_h.shape[-2:]
     if not 1 <= S.shape[-2] <= d:
         raise ValueError("comparison rank must lie between one and the head dimension")
@@ -65,7 +72,8 @@ def projected_moments(
     dtype = _compute_dtype(mu_h, Sigma_h, inverse_blocks, S)
     tokens = mu_h.shape[-3]
     batch = torch.broadcast_shapes(mu_h.shape[:-3], inverse_blocks.shape[:-4])
-    bytes_per_token = math.prod(batch) * H * S.shape[-2] * d * (torch.finfo(dtype).bits // 8)
+    roles = S.shape[0] if S.ndim == 4 else 1
+    bytes_per_token = math.prod(batch) * roles * H * S.shape[-2] * d * (torch.finfo(dtype).bits // 8)
     # Small projections keep the single contraction. Large projections checkpoint
     # token tiles: tiling alone would retain every L and weighted L for backward.
     if tokens * bytes_per_token > _PROJECTION_TILE_BYTES:
@@ -95,18 +103,35 @@ def _projected_moments_tile(
     inverse_blocks: torch.Tensor,
     S:              torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Compute a=L mu and G=L Sigma L^T for one token tile."""
+    r"""Compute a=L mu and G=L Sigma L^T for one token tile.
+
+    ``S`` is ``(H, r, d)`` for one comparison map or ``(R, H, r, d)`` for a
+    role-stacked pair; the stacked form returns a leading ``R`` axis and batches
+    the covariance contraction across roles while keeping one frame map.
+    """
     diagonal = Sigma_h.shape == mu_h.shape
     dtype = _compute_dtype(mu_h, Sigma_h, inverse_blocks, S)
     with torch.autocast(device_type=mu_h.device.type, enabled=False):
         mu = mu_h.to(dtype)
         Sigma = Sigma_h.to(dtype)
-        L = _projected_linear_map(S.to(dtype), inverse_blocks.to(dtype))
-        a = (L @ mu.unsqueeze(-1)).squeeze(-1)
-        if diagonal:
-            G = (L * Sigma.unsqueeze(-2)) @ L.transpose(-1, -2)
+        inverse = inverse_blocks.to(dtype)
+        if S.ndim == 3:
+            L = _projected_linear_map(S.to(dtype), inverse)  # (..., N, H, r, d)
+            a = (L @ mu.unsqueeze(-1)).squeeze(-1)
+            if diagonal:
+                G = (L * Sigma.unsqueeze(-2)) @ L.transpose(-1, -2)
+            else:
+                G = L @ Sigma @ L.transpose(-1, -2)
         else:
-            G = L @ Sigma @ L.transpose(-1, -2)
+            # Role-stacked maps: one map per role, batched into a single G contraction.
+            L = torch.stack(
+                [_projected_linear_map(S[role].to(dtype), inverse) for role in range(S.shape[0])],
+                dim=0)  # (R, ..., N, H, r, d)
+            a = (L @ mu.unsqueeze(-1).unsqueeze(0)).squeeze(-1)  # (R, ..., N, H, r)
+            if diagonal:
+                G = (L * Sigma.unsqueeze(0).unsqueeze(-2)) @ L.transpose(-1, -2)
+            else:
+                G = L @ Sigma.unsqueeze(0) @ L.transpose(-1, -2)
         # The two off-diagonal contractions can round differently near zero.
         # Keep the covariance exactly symmetric for strict zero-jitter Cholesky.
         G = .5 * G + .5 * G.transpose(-1, -2)
@@ -142,13 +167,19 @@ def _strict_cholesky(
     G:          torch.Tensor,
     projection: Optional[Tuple[torch.Tensor, ...]] = None,
     prepared:   Optional[tuple] = None,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Factor G with zero jitter, optionally recovering its factor from source moments.
 
     A failed rounded Gram matrix can lose SPD although its source measurement
     still has full row rank. For failed or poorly conditioned float32 entries, reconstruct
     X = S U^{-1} Sigma^{1/2} in float64 and factor X^T = QR, giving C = R^T.
     No jitter, covariance floor, or projection constraint is introduced.
+
+    Returns ``(chol, recover_mask)``. ``chol`` stays in ``G.dtype`` on the healthy
+    path. When source recovery is applied the whole factor tensor is promoted to
+    float64 so the rebuilt entries keep their QR accuracy, and ``recover_mask``
+    marks exactly those entries so the pair path can escalate only the tiles that
+    touch them. ``recover_mask`` is ``None`` on the healthy path.
     """
     if prepared is None:
         chol, failed, screen, status = _cholesky_status(G)
@@ -175,7 +206,9 @@ def _strict_cholesky(
         if projection is None:
             if failed_any:
                 raise ValueError("projected covariance is not positive definite: zero-jitter Cholesky failed; no repair applied")
-            return _strict_cholesky(G.double())
+            chol64, _ = _strict_cholesky(G.double())
+            # Whole-tensor float64 refactor: every entry takes the factor route.
+            return chol64, torch.ones_like(failed)
         failed = failed | ill_conditioned
         Sigma, inverse, S = projection[:3]
         batch, r, d = G.shape[:-2], G.shape[-1], S.shape[-1]
@@ -195,7 +228,7 @@ def _strict_cholesky(
                     raise ValueError("source covariance must be finite and positive for projected factorization")
                 root = L * variance.sqrt().unsqueeze(-2)
             elif Sigma.shape == (*batch, d, d):
-                root = L @ _strict_cholesky(Sigma[failed].double())
+                root = L @ _strict_cholesky(Sigma[failed].double())[0]
             else:
                 raise ValueError("source covariance shape does not match projected token/head dimensions")
             if not bool(torch.isfinite(root).all()):
@@ -209,9 +242,10 @@ def _strict_cholesky(
             recovered = R.transpose(-1, -2) * signs.unsqueeze(-2)
         # Never backpropagate through a failed Cholesky, even with zero cotangent.
         safe = torch.where(failed[..., None, None], torch.eye(r, device=G.device, dtype=G.dtype), G)
-        chol = _strict_cholesky(safe).double()
+        chol = _strict_cholesky(safe)[0].double()
         chol[failed] = recovered
-    return chol
+        return chol, failed
+    return chol, None
 
 
 def projected_gaussian_kl(
@@ -249,10 +283,13 @@ def projected_gaussian_kl(
                                q_status[-1], k_status[-1])).tolist()
         if not decisions[0]:
             raise ValueError("projected means must contain only finite values")
-        chol_q = _strict_cholesky(Gq, projection_q, (*q_status[:3], decisions[1:5]))
-        chol_k = _strict_cholesky(Gk, projection_k, (*k_status[:3], decisions[5:9]))
-        factor_trace = chol_q.dtype == torch.float64 or chol_k.dtype == torch.float64
-        if factor_trace:
+        chol_q, rec_q = _strict_cholesky(Gq, projection_q, (*q_status[:3], decisions[1:5]))
+        chol_k, rec_k = _strict_cholesky(Gk, projection_k, (*k_status[:3], decisions[5:9]))
+        # Only tiles that touch a recovered query or key entry need the float64
+        # triangular solves. Healthy-healthy tiles keep the cheap einsum path in the
+        # working dtype; the healthy factors round-trip bit-exactly through the cast.
+        factor_trace_any = rec_q is not None or rec_k is not None
+        if factor_trace_any:
             # Preserve source accuracy through means, triangular solves and the final scalar.
             for role, projection in enumerate((projection_q, projection_k)):
                 if projection is not None and len(projection) == 4:
@@ -264,32 +301,59 @@ def projected_gaussian_kl(
                     else:
                         ak = mean
             aq, ak = aq.double(), ak.double()
-            q_matrix, k_matrix = chol_q.double(), chol_k.double()
+            q_factor, k_factor = chol_q, chol_k                 # float64 where recovered
+            q_cov_healthy = Gq                                  # working dtype
+            k_prec_healthy = torch.cholesky_inverse(chol_k.to(dtype))
+            # Fold token-level recover flags into one host transfer, recovery path only.
+            def _token_recover_flags(mask: torch.Tensor, n_tokens: int) -> torch.Tensor:
+                return mask.movedim(-2, 0).reshape(n_tokens, -1).any(dim=-1)
+            nq_flags, nk_flags = Gq.shape[-3], Gk.shape[-3]
+            q_tok = (_token_recover_flags(rec_q, nq_flags) if rec_q is not None
+                     else torch.zeros(nq_flags, dtype=torch.bool))
+            k_tok = (_token_recover_flags(rec_k, nk_flags) if rec_k is not None
+                     else torch.zeros(nk_flags, dtype=torch.bool))
+            flags = torch.cat((q_tok, k_tok)).tolist()
+            q_needs, k_needs = flags[:nq_flags], flags[nq_flags:]
         else:
-            q_matrix, k_matrix = Gq, torch.cholesky_inverse(chol_k)
+            q_cov_healthy, k_prec_healthy = Gq, torch.cholesky_inverse(chol_k)
+            q_needs = k_needs = None
         aq, ak = aq.movedim(-2, -3), ak.movedim(-2, -3)  # (..., H, N, r)
-        q_matrix = q_matrix.movedim(-3, -4)              # (..., H, Nq, r, r)
-        k_matrix = k_matrix.movedim(-3, -4)              # (..., H, Nk, r, r)
+        q_cov_healthy = q_cov_healthy.movedim(-3, -4)   # (..., H, Nq, r, r)
+        k_prec_healthy = k_prec_healthy.movedim(-3, -4)  # (..., H, Nk, r, r)
+        if factor_trace_any:
+            q_factor = q_factor.movedim(-3, -4)           # (..., H, Nq, r, r) float64
+            k_factor = k_factor.movedim(-3, -4)
         logdet_q = 2 * chol_q.diagonal(dim1=-2, dim2=-1).log().sum(-1).transpose(-1, -2)
         logdet_k = 2 * chol_k.diagonal(dim1=-2, dim2=-1).log().sum(-1).transpose(-1, -2)
+        if factor_trace_any:
+            logdet_q_healthy, logdet_k_healthy = logdet_q.to(dtype), logdet_k.to(dtype)
+        else:
+            logdet_q_healthy, logdet_k_healthy = logdet_q, logdet_k
         nq, nk = aq.shape[-2], ak.shape[-2]
         batch_heads = aq.numel() // (nq * r)
-        per_pair = r * r if factor_trace else r
+        per_pair = r * r if factor_trace_any else r
         pair_budget = max(1, (32 * 1024 ** 2) // (aq.element_size() * batch_heads * per_pair))
         q_step = max(1, min(nq, 32, pair_budget))
         k_step = max(1, min(nk, pair_budget // q_step))
         rows = []
         for i in range(0, nq, q_step):
             columns = []
+            i_rec = any(q_needs[i:i+q_step]) if factor_trace_any else False
             for j in range(0, nk, k_step):
-                args = (aq[..., i:i+q_step, :], ak[..., j:j+k_step, :],
-                        q_matrix[..., i:i+q_step, :, :], k_matrix[..., j:j+k_step, :, :],
-                        logdet_q[..., i:i+q_step], logdet_k[..., j:j+k_step])
+                ft = bool(factor_trace_any and (i_rec or any(k_needs[j:j+k_step])))
+                if ft:
+                    args = (aq[..., i:i+q_step, :], ak[..., j:j+k_step, :],
+                            q_factor[..., i:i+q_step, :, :], k_factor[..., j:j+k_step, :, :],
+                            logdet_q[..., i:i+q_step], logdet_k[..., j:j+k_step])
+                else:
+                    args = (aq[..., i:i+q_step, :], ak[..., j:j+k_step, :],
+                            q_cov_healthy[..., i:i+q_step, :, :], k_prec_healthy[..., j:j+k_step, :, :],
+                            logdet_q_healthy[..., i:i+q_step], logdet_k_healthy[..., j:j+k_step])
                 if torch.is_grad_enabled() and (nq > q_step or nk > k_step) and any(x.requires_grad for x in args):
-                    value = checkpoint(_projected_kl_tile, *args, factor_trace,
+                    value = checkpoint(_projected_kl_tile, *args, ft,
                                        use_reentrant=False, preserve_rng_state=False)
                 else:
-                    value = _projected_kl_tile(*args, factor_trace)
+                    value = _projected_kl_tile(*args, ft)
                 columns.append(value)
             rows.append(torch.cat(columns, dim=-1))
         return torch.cat(rows, dim=-2).to(dtype)

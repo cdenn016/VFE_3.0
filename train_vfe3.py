@@ -390,7 +390,7 @@ config = dict(
                                                  # over ~1.05M 20x20 matrices per call at B64/N128.
                                                  
       
-    skip_belief_sigma_update             = True,        # skip the belief-channel sigma E-step update
+    skip_belief_sigma_update             = False,        # skip the belief-channel sigma E-step update
     compile_pair_kernel                  = False,       # torch.compile the closed-form pair kernel 
     
     transport_clamp_monitor              = False,
