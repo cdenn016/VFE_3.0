@@ -1,4 +1,5 @@
 import hashlib
+from collections.abc import Callable
 
 import pytest
 import torch
@@ -81,6 +82,10 @@ def test_default_adamw_one_step_is_byte_identical_to_golden():
     from vfe3.train import build_optimizer, train_step
 
     torch.manual_seed(0)
+    # The golden was captured under the library defaults in force before the imported config WIP
+    # (docs/audits/audit-2026-09-22.md flip table); pin them so the parameter groups, optimizer
+    # state and loss are those of the captured step. The block MLP, decode bias and affine block
+    # LayerNorm each add a parameter group under the current defaults.
     cfg = VFE3Config(
         vocab_size=8,
         embed_dim=4,
@@ -89,6 +94,15 @@ def test_default_adamw_one_step_is_byte_identical_to_golden():
         n_layers=1,
         n_e_steps=1,
         pos_phi="none",
+        use_block_mlp=False,
+        norm_type_block="none",
+        layernorm_affine=False,
+        decode_bias=False,
+        untie_decode_bank=False,
+        decode_unigram_prior=False,
+        skip_belief_sigma_update=False,
+        beta_attention_prior="causal",
+        decode_av_precision="fp32",
     )
     model = VFEModel(cfg)
     optimizer = build_optimizer(model, cfg)
@@ -178,19 +192,19 @@ def test_default_adamw_one_step_matches_recompute_dense_low_level_oracle(
         )
 
 
-@pytest.mark.parametrize(
-    ("e_step_update", "pos_rotation"),
-    [
-        pytest.param("gradient", "none", id="plain-gradient"),
-        pytest.param("gradient", "rope", id="rope-gradient"),
-        pytest.param("mm_exact", "rope", id="rope-mm-exact"),
-    ],
-)
-def test_single_head_forward_matches_recompute_dense_low_level_oracle(
-    monkeypatch: pytest.MonkeyPatch,
+def _pair_route_models(
+    monkeypatch:   pytest.MonkeyPatch,
+    n_heads:       int,
     e_step_update: str,
     pos_rotation:  str,
-) -> None:
+) -> tuple[torch.Tensor, list[torch.Tensor], list[None], Callable[[], torch.Tensor]]:
+    r"""Run production's forward while recording the E-step's pair-energy route.
+
+    Returns production logits, every generic ``pairwise_energy`` tensor, one entry per
+    ``diagonal_kl_pair_stats`` reuse call, and a thunk that runs the SAME weights through a
+    recompute oracle: no pair-statistics reuse, no compact/per-head transport, and no model-level
+    prebuilt transport (the E-step builds its own). The recorders stay live for the oracle run.
+    """
     from vfe3.config import VFE3Config
     from vfe3.gradients import kernels as kernels_module
     from vfe3.model import block as block_module
@@ -200,7 +214,7 @@ def test_single_head_forward_matches_recompute_dense_low_level_oracle(
     cfg = VFE3Config(
         vocab_size=8,
         embed_dim=4,
-        n_heads=2,
+        n_heads=n_heads,
         max_seq_len=4,
         n_layers=1,
         n_e_steps=1,
@@ -213,14 +227,14 @@ def test_single_head_forward_matches_recompute_dense_low_level_oracle(
     oracle = VFEModel(cfg).eval()
     oracle.load_state_dict(production.state_dict())
     tokens = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]], dtype=torch.long)
-    production_energies: list[torch.Tensor] = []
+    energies: list[torch.Tensor] = []
     stats_calls: list[None] = []
     original_pairwise_energy = kernels_module.pairwise_energy
     original_pair_stats = kernels_module.diagonal_kl_pair_stats
 
     def _capture_pairwise_energy(*args: object, **kwargs: object) -> torch.Tensor:
         energy = original_pairwise_energy(*args, **kwargs)
-        production_energies.append(energy.detach().clone())
+        energies.append(energy.detach().clone())
         return energy
 
     def _capture_pair_stats(*args: object, **kwargs: object) -> object:
@@ -232,27 +246,89 @@ def test_single_head_forward_matches_recompute_dense_low_level_oracle(
     with torch.no_grad():
         production_logits = production(tokens)
 
+    def run_oracle() -> torch.Tensor:
+        original_e_step = block_module.e_step
+
+        def recompute_dense_e_step(*args: object, **kwargs: object) -> object:
+            kwargs["reuse_pairwise_kl_stats"] = False
+            kwargs["compact_phi_block_transport"] = False
+            kwargs["transport_mean_per_head"] = False
+            kwargs["prebuilt_transport"] = None
+            return original_e_step(*args, **kwargs)
+
+        monkeypatch.setattr(block_module, "e_step", recompute_dense_e_step)
+        with torch.no_grad():
+            return oracle(tokens)
+
+    return production_logits, energies, stats_calls, run_oracle
+
+
+@pytest.mark.parametrize(
+    "e_step_update",
+    [
+        pytest.param("gradient", id="plain-gradient"),
+        pytest.param("mm_exact", id="plain-mm-exact"),
+    ],
+)
+def test_single_head_forward_matches_recompute_dense_low_level_oracle(
+    monkeypatch:   pytest.MonkeyPatch,
+    e_step_update: str,
+) -> None:
+    r"""One head is one [K] block: a dense transport on which pair-statistics reuse fails closed.
+
+    Production must take the generic pair-energy route (no ``diagonal_kl_pair_stats`` call, a zero
+    self-energy diagonal) and be byte-identical to the recompute oracle. Single-block RoPE is
+    rejected at construction (RoPE needs at least two irrep blocks), so RoPE is covered by the
+    multi-head test below.
+    """
+    production_logits, energies, stats_calls, run_oracle = _pair_route_models(
+        monkeypatch, 1, e_step_update, "none")
+
     assert stats_calls == []
-    assert len(production_energies) == 1
-    self_energy = production_energies[0].diagonal(dim1=-2, dim2=-1)
+    assert len(energies) == 1
+    self_energy = energies[0].diagonal(dim1=-2, dim2=-1)
     self_mask = ((self_energy > 0.0) & (self_energy < 100.0)).to(self_energy.dtype)
     assert torch.equal(self_energy, torch.zeros_like(self_energy))
     assert torch.equal(self_mask, torch.zeros_like(self_mask))
 
-    original_e_step = block_module.e_step
+    energies.clear()
+    oracle_logits = run_oracle()
 
-    def recompute_dense_e_step(*args: object, **kwargs: object) -> object:
-        kwargs["reuse_pairwise_kl_stats"] = False
-        kwargs["compact_phi_block_transport"] = False
-        kwargs["transport_mean_per_head"] = False
-        return original_e_step(*args, **kwargs)
-
-    production_energies.clear()
-    monkeypatch.setattr(block_module, "e_step", recompute_dense_e_step)
-    with torch.no_grad():
-        oracle_logits = oracle(tokens)
-
+    assert stats_calls == []
+    assert len(energies) == 1
     assert torch.equal(production_logits, oracle_logits)
+
+
+@pytest.mark.parametrize(
+    "e_step_update",
+    [
+        pytest.param("gradient", id="rope-gradient"),
+        pytest.param("mm_exact", id="rope-mm-exact"),
+    ],
+)
+def test_multi_head_rope_forward_reuses_pair_stats_and_matches_recompute_oracle(
+    monkeypatch:   pytest.MonkeyPatch,
+    e_step_update: str,
+) -> None:
+    r"""Two heads give a factored [2, 2] transport, on which production reuses pair statistics.
+
+    ``vfe_block`` forwards ``reuse_pairwise_kl_stats=True`` and the shared factored transport admits
+    it, so production makes exactly one ``diagonal_kl_pair_stats`` call and no generic pair-energy
+    call. The recompute oracle takes the generic route instead; the two evaluation orders round
+    differently, so they agree to a float32 tolerance rather than bitwise (as in
+    tests/test_p3_pairwise_stats_reuse_20260711.py).
+    """
+    production_logits, energies, stats_calls, run_oracle = _pair_route_models(
+        monkeypatch, 2, e_step_update, "rope")
+
+    assert stats_calls == [None]
+    assert energies == []
+
+    oracle_logits = run_oracle()
+
+    assert stats_calls == [None]                       # the oracle made no reuse call
+    assert len(energies) == 1                          # it recomputed the generic pair energy
+    torch.testing.assert_close(production_logits, oracle_logits, atol=1e-5, rtol=1e-6)
 
 
 @pytest.mark.parametrize(
@@ -603,7 +679,7 @@ def test_pullback_group_candidate_rejects_chart_bound(monkeypatch):
     import vfe3.gauge_optim as gauge_optim
 
     group = get_group("glk")(K=2, dtype=torch.float64)
-    phi = torch.tensor([[0.99, 0.0, 0.0, 0.0]], dtype=torch.float64)
+    phi = torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float64)
     xi = torch.tensor([[-0.2, 0.0, 0.0, 0.0]], dtype=torch.float64)
     monkeypatch.setattr(
         gauge_optim,
@@ -611,17 +687,20 @@ def test_pullback_group_candidate_rejects_chart_bound(monkeypatch):
         lambda *args, **kwargs: _fixed_direction(xi),
     )
 
-    with pytest.raises(FloatingPointError, match="chart norm"):
-        stage_pullback_group_candidate(
-            torch.ones_like(phi),
-            phi,
-            group,
-            learning_rate=1.0,
-            trust_radius=1.0,
-            chart_max_norm=1.0,
-            bch_residual_max=1e-6,
-            phi_precond_mode="pullback",
-        )
+    # Audit 2026-09-23 #10: a row whose every backtracked candidate leaves the chart is rejected
+    # (it keeps its chart) instead of aborting the whole step.
+    candidate = stage_pullback_group_candidate(
+        -torch.ones_like(phi),
+        phi,
+        group,
+        learning_rate=1.0,
+        trust_radius=1.0,
+        chart_max_norm=1.0,
+        bch_residual_max=1e-6,
+        phi_precond_mode="pullback",
+    )
+    assert candidate.rejected_rows.tolist() == [True]
+    assert torch.equal(candidate.candidate_phi, phi)
 
 
 def test_pullback_group_step_rejects_two_parameter_groups_atomically(monkeypatch):

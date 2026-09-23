@@ -20,7 +20,7 @@ Precision is left exactly as the run configured it: the weights stay fp32 and th
 own ``cfg.amp_dtype`` autocast internally (a bf16 E-step with fp32 decode/CE islands), so there is
 no dtype knob here to set.
 
-``--self-ce`` adds the diagnostic that separates a sampler artifact from a model property. Each
+``SELF_CE`` adds the diagnostic that separates a sampler artifact from a model property. Each
 generated continuation is scored teacher-forced against its own prompt, and compared with held-out
 corpus slices of the same length that carry an equal window of preceding text. Both go through the
 identical scorer, which anchors its blocks at the end of the stream so the scored tail keeps as much
@@ -32,35 +32,44 @@ one model against itself, and says nothing about how its held-out CE compares to
 
 Usage
 -----
-    python generate_text.py
-    python generate_text.py --prompt "The history of the city" --max-new-tokens 64
-    python generate_text.py --greedy
-    python generate_text.py --prompt "..." --temperature 0.8 --top-k 40 --top-p 0.95 --seed 1
-    python generate_text.py --self-ce --greedy --max-new-tokens 128
-    python generate_text.py --self-ce --reference-draws 8 --split test
+Click-to-run: edit the settings below and run ``python generate_text.py``. ``RUN_DIR = None`` picks
+the most recently finalized run under ``RUN_ROOT`` (the launcher's ``vfe3_runs/<ppl>_<label>/``
+folders, or a ``<timestamp>_<label>/`` folder not yet renamed). For example, ``GREEDY = True`` for
+argmax decoding, ``TEMPERATURE = 0.8; TOP_K = 40; TOP_P = 0.95; SEED = 1`` for sampling, and
+``SELF_CE = True; REFERENCE_DRAWS = 8; SPLIT = "test"`` for the self-CE diagnostic.
 """
 
-import argparse
 import json
 import math
 import sys
 from pathlib import Path
-from typing import List, NamedTuple, Optional, Sequence
+from typing import List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
 
-RUN_ROOT = "vfe3_runs"
-DEFAULT_RUN_DIR = str(Path(RUN_ROOT) / "31.04_wikitext-103_K256_4-layer_noHM")
-
-# WikiText-flavored openers used when no --prompt is supplied.
-DEFAULT_PROMPTS = (
+# ---- click-to-run settings (sampling knobs mirror VFEModel.generate) ---------------------------
+RUN_ROOT: str = "vfe3_runs"
+RUN_DIR: Optional[str] = None             # run folder with config.json + best_model.pt; None -> newest
+PROMPT_PLACEHOLDER = "<PROMPT>"           # marks where the continuation is spliced into a prompt
+PROMPTS: Tuple[str, ...] = (              # WikiText-flavored openers; may contain PROMPT_PLACEHOLDER
     "The history of the city",
    # "In 1923 , the company",
    # "The film was released on",
 )
-
-PROMPT_PLACEHOLDER = "<PROMPT>"
+MAX_NEW_TOKENS: int = 256                 # tokens generated per prompt
+GREEDY: bool = False                      # argmax each step; ignores TEMPERATURE/TOP_K/TOP_P/SEED
+TEMPERATURE: float = 1.0                  # logit temperature on the sampled path
+TOP_K: Optional[int] = 10                 # keep only the k largest logits
+TOP_P: Optional[float] = None             # nucleus sampling threshold
+SEED: int = 0                             # sampling seed (ignored when GREEDY)
+DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
+SELF_CE: bool = False                     # score continuations teacher-forced against held-out text
+REFERENCE_DRAWS: int = 4                  # held-out slices averaged for the reference CE (SELF_CE)
+SPLIT: str = "validation"                 # corpus split for the held-out reference (SELF_CE)
+BASELINE: str = "none"                    # "none" | "gpt2": calibrate the self-CE delta (SELF_CE)
+BLOCK_TOKENS: Optional[int] = None        # BASELINE scoring block; None -> its own context window
+JSON_OUTPUT: bool = False                 # emit JSON instead of formatted text
 
 
 class LoadedRun(NamedTuple):
@@ -77,7 +86,7 @@ class LoadedRun(NamedTuple):
 class Generation(NamedTuple):
     """One prompt's decoded continuation, with the exact token ids behind it.
 
-    The ids are kept so ``--self-ce`` scores what the sampler actually emitted rather than a
+    The ids are kept so ``SELF_CE`` scores what the sampler actually emitted rather than a
     decode-then-re-encode round trip, which BPE does not guarantee to be an identity.
     """
 
@@ -98,47 +107,23 @@ class SelfCEScore(NamedTuple):
                 min(self.reference), max(self.reference))
 
 
-def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    r"""Parse the command line; sampling knobs mirror :meth:`VFEModel.generate`."""
-    parser = argparse.ArgumentParser(
-        description="Load a finalized run's best model and generate text.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument("--run-dir", default=DEFAULT_RUN_DIR,
-                        help="run directory holding config.json and best_model.pt")
-    parser.add_argument("--prompt", action="append", default=None, metavar="TEXT",
-                        help=f"prompt to continue; repeatable, and may contain {PROMPT_PLACEHOLDER} "
-                             "to mark where the generated continuation is spliced in "
-                             "(default: a few WikiText openers)")
-    parser.add_argument("--max-new-tokens", type=int, default=256,
-                        help="number of tokens to generate per prompt")
-    parser.add_argument("--greedy", action="store_true",
-                        help="take the argmax each step and ignore temperature/top-k/top-p")
-    parser.add_argument("--temperature", type=float, default=1.0,
-                        help="logit temperature on the sampled path")
-    parser.add_argument("--top-k", type=int, default=10, help="keep only the k largest logits")
-    parser.add_argument("--top-p", type=float, default=None, help="nucleus sampling threshold")
-    parser.add_argument("--seed", type=int, default=0, help="sampling seed (ignored when --greedy)")
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu",
-                        help="torch device for the forward pass")
-    parser.add_argument("--self-ce", action="store_true",
-                        help="score each generated continuation teacher-forced and compare it "
-                             "against held-out corpus text of matching length")
-    parser.add_argument("--reference-draws", type=int, default=4,
-                        help="held-out slices to average the reference cross-entropy over "
-                             "(with --self-ce)")
-    parser.add_argument("--split", default="validation",
-                        help="corpus split for the held-out reference (with --self-ce)")
-    parser.add_argument("--baseline", choices=("none", "gpt2"), default="none",
-                        help="also run this model through the identical protocol, to calibrate the "
-                             "self-CE delta against a reference LM (requires --self-ce)")
-    parser.add_argument("--block-tokens", type=int, default=None, metavar="N",
-                        help="scoring block length for --baseline (default: the baseline's own "
-                             "context window). The run's model always scores at its trained "
-                             "max_seq_len, whose positional table does not extrapolate")
-    parser.add_argument("--json", action="store_true",
-                        help="emit results as JSON instead of formatted text")
-    return parser.parse_args(argv)
+def newest_run_dir(root: 'str | Path') -> Path:
+    r"""Return the most recently finalized run directory under ``root``.
+
+    ``train_vfe3.py`` reserves ``<root>/<timestamp>_<label>/`` while a run trains and renames it to
+    ``<root>/<ppl>_<label>/`` at finalization, and a multi-seed launch can nest runs one level deeper,
+    so every directory below ``root`` holding both ``config.json`` and ``best_model.pt`` is a
+    candidate, ranked by the newest modification time of those two files (ties by path).
+    """
+    candidates = [path.parent for path in Path(root).rglob("best_model.pt")
+                  if path.is_file() and (path.parent / "config.json").is_file()]
+    if not candidates:
+        raise FileNotFoundError(
+            f"no run with config.json and best_model.pt under {str(root)!r}; set RUN_DIR or train "
+            "a run first")
+    return max(candidates, key=lambda run: (
+        max((run / name).stat().st_mtime_ns for name in ("config.json", "best_model.pt")),
+        str(run)))
 
 
 def validated_run_dir(path: Path) -> Path:
@@ -281,7 +266,8 @@ def stream_ce(
     preceding context as ``seq_len`` allows. Scoring the tail cold instead would let the
     no-context first position dominate whenever ``tail`` is short, which is an artifact of the
     measurement rather than a property of the text. Each tail token is scored exactly once, so two
-    texts of equal length are directly comparable.
+    texts of equal length are directly comparable; with an empty ``prefix`` the first tail token has
+    no context to be predicted from and is the one position left unscored.
     """
     n_prefix = int(prefix.shape[0])
     n_tail = int(tail.shape[0])
@@ -292,7 +278,10 @@ def stream_ce(
     total_nats = 0.0
     total_tokens = 0
     end = n_prefix + n_tail - 1     # last target index; position i is scored as the target of i-1
-    while end > n_prefix:
+    # A block scores targets start+1..end, so the block that scores the first tail token (index
+    # n_prefix) must END there. Stopping at end == n_prefix would skip it whenever a block boundary
+    # lands on start == n_prefix, i.e. whenever (n_tail - 1) % seq_len == 0.
+    while end >= max(n_prefix, 1):
         start = max(0, end - seq_len)
         inputs = combined[start:end].unsqueeze(0).to(device)          # (1, end - start)
         targets = combined[start + 1:end + 1].unsqueeze(0).to(device)
@@ -344,7 +333,7 @@ def held_out_token_ids(
     if step < max(0, warmup):
         raise ValueError(
             f"{dataset}/{split} ({total} tokens) is too short to place {draws} reference tails "
-            f"with {warmup} tokens of warmup each; reduce --reference-draws or --block-tokens")
+            f"with {warmup} tokens of warmup each; reduce REFERENCE_DRAWS or BLOCK_TOKENS")
     # Fewer tails than requested is a coverage cap, so it is reported rather than silently
     # absorbed: the caller prints len(reference) back.
     available = min(draws, max(0, (total - n_tokens) // step))
@@ -426,34 +415,38 @@ def render(prompt: str, continuation: str) -> str:
     return prompt + continuation
 
 
-def main(argv: Optional[Sequence[str]] = None) -> None:
-    args = parse_args(argv)
-    run_dir = validated_run_dir(Path(args.run_dir))
+def main() -> None:
+    r"""Click-to-run entry point: generate with the module-level settings at the top of this file."""
+    run_dir = validated_run_dir(Path(RUN_DIR) if RUN_DIR is not None else newest_run_dir(RUN_ROOT))
 
-    loaded = load_run(run_dir, args.device)
-    prompts = list(args.prompt) if args.prompt else list(DEFAULT_PROMPTS)
+    loaded = load_run(run_dir, DEVICE)
+    prompts = list(PROMPTS)
+    if not prompts:
+        raise SystemExit("PROMPTS must hold at least one prompt")
 
-    sampler = "greedy" if args.greedy else (
-        f"temperature={args.temperature}, top_k={args.top_k}, top_p={args.top_p}, seed={args.seed}")
-    if args.self_ce and args.max_new_tokens < 2:
-        raise SystemExit("--self-ce needs at least two generated tokens to score")
-    if args.self_ce and args.reference_draws < 1:
-        raise SystemExit("--reference-draws must be at least 1")
-    if args.baseline != "none" and not args.self_ce:
-        raise SystemExit("--baseline requires --self-ce: the control is the self-CE delta")
-    if args.block_tokens is not None and args.baseline == "none":
-        raise SystemExit("--block-tokens sizes the --baseline scorer; the run's own model always "
+    sampler = "greedy" if GREEDY else (
+        f"temperature={TEMPERATURE}, top_k={TOP_K}, top_p={TOP_P}, seed={SEED}")
+    if SELF_CE and MAX_NEW_TOKENS < 2:
+        raise SystemExit("SELF_CE needs at least two generated tokens to score (MAX_NEW_TOKENS >= 2)")
+    if SELF_CE and REFERENCE_DRAWS < 1:
+        raise SystemExit("REFERENCE_DRAWS must be at least 1")
+    if BASELINE not in ("none", "gpt2"):
+        raise SystemExit(f"BASELINE must be 'none' or 'gpt2', got {BASELINE!r}")
+    if BASELINE != "none" and not SELF_CE:
+        raise SystemExit("BASELINE requires SELF_CE: the control is the self-CE delta")
+    if BLOCK_TOKENS is not None and BASELINE == "none":
+        raise SystemExit("BLOCK_TOKENS sizes the BASELINE scorer; the run's own model always "
                          "scores at its trained max_seq_len")
 
     generations = generate_for_prompts(
         loaded,
         prompts,
-        args.max_new_tokens,
-        greedy=args.greedy,
-        temperature=args.temperature,
-        top_k=args.top_k,
-        top_p=args.top_p,
-        seed=None if args.greedy else args.seed,
+        MAX_NEW_TOKENS,
+        greedy=GREEDY,
+        temperature=TEMPERATURE,
+        top_k=TOP_K,
+        top_p=TOP_P,
+        seed=None if GREEDY else SEED,
     )
     scores = None
     baseline_scores = None
@@ -461,40 +454,40 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     baseline_texts: Optional[List[str]] = None
     seq_len = 0
     baseline_seq_len = 0
-    if args.self_ce:
+    if SELF_CE:
         seq_len = int(loaded.cfg.max_seq_len)
         prompt_ids = [prompt_token_ids(generation.prompt, loaded.dataset)
                       for generation in generations]
-        if args.baseline != "none":
-            baseline = HuggingFaceBaseline(args.baseline, args.device)
-            if args.block_tokens is not None and args.block_tokens > baseline.context:
+        if BASELINE != "none":
+            baseline = HuggingFaceBaseline(BASELINE, DEVICE)
+            if BLOCK_TOKENS is not None and BLOCK_TOKENS > baseline.context:
                 raise SystemExit(
-                    f"--block-tokens {args.block_tokens} exceeds {args.baseline}'s own context "
+                    f"BLOCK_TOKENS={BLOCK_TOKENS} exceeds {BASELINE}'s own context "
                     f"window of {baseline.context}; its position embeddings do not extend")
-            baseline_seq_len = (args.block_tokens if args.block_tokens is not None
+            baseline_seq_len = (BLOCK_TOKENS if BLOCK_TOKENS is not None
                                 else baseline.context)
         # Drawn once and shared, so both models score the identical corpus slices. Warming to the
         # LARGER block keeps the longer-block model supplied; the shorter-block one ignores the rest.
         warmup = max(seq_len, baseline_seq_len)
         draws = held_out_token_ids(
-            loaded.dataset, args.split, args.max_new_tokens, args.reference_draws, warmup=warmup)
+            loaded.dataset, SPLIT, MAX_NEW_TOKENS, REFERENCE_DRAWS, warmup=warmup)
         scores = score_streams(
             loaded.model, prompt_ids, [g.token_ids for g in generations],
-            draws, args.max_new_tokens, seq_len)
+            draws, MAX_NEW_TOKENS, seq_len)
         if baseline is not None:
-            baseline_ids = [baseline.generate(ids, args.max_new_tokens) for ids in prompt_ids]
+            baseline_ids = [baseline.generate(ids, MAX_NEW_TOKENS) for ids in prompt_ids]
             baseline_texts = [decode_ids(ids, loaded.dataset) for ids in baseline_ids]
             baseline_scores = score_streams(
-                baseline, prompt_ids, baseline_ids, draws, args.max_new_tokens, baseline_seq_len)
+                baseline, prompt_ids, baseline_ids, draws, MAX_NEW_TOKENS, baseline_seq_len)
 
-    if args.json:
+    if JSON_OUTPUT:
         payload = {
             "run_dir":        str(run_dir),
             "dataset":        loaded.dataset,
             "best_step":      loaded.best_step,
             "best_val_ppl":   loaded.best_val_ppl,
             "sampler":        sampler,
-            "max_new_tokens": args.max_new_tokens,
+            "max_new_tokens": MAX_NEW_TOKENS,
             "results": [
                 {"prompt":       generation.prompt,
                  "continuation": generation.text,
@@ -507,7 +500,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             mean, low, high = scores.summary()
             payload["self_ce"] = {
                 "units":              "nats_per_token",
-                "split":              args.split,
+                "split":              SPLIT,
                 "reference_mean":     mean,
                 "reference_min":      low,
                 "reference_max":      high,
@@ -520,7 +513,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             if baseline_scores is not None:
                 base_mean, base_low, base_high = baseline_scores.summary()
                 payload["self_ce"]["baseline"] = {
-                    "name":               args.baseline,
+                    "name":               BASELINE,
                     "parameters":         baseline.parameter_count(),
                     "block_tokens":       baseline_seq_len,
                     "reference_mean":     base_mean,
@@ -539,13 +532,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     ppl = "n/a" if loaded.best_val_ppl is None else f"{loaded.best_val_ppl:.3f}"
     print(f"\nrun:     {run_dir}")
     print(f"dataset: {loaded.dataset}   best_step: {loaded.best_step}   best_val_ppl: {ppl}")
-    print(f"device:  {args.device}   sampler: {sampler}"
-          f"   max_new_tokens: {args.max_new_tokens}\n")
+    print(f"device:  {DEVICE}   sampler: {sampler}"
+          f"   max_new_tokens: {MAX_NEW_TOKENS}\n")
     if scores is not None:
         mean, low, high = scores.summary()
         print("self-CE (teacher-forced nats/token; one scorer and one shared held-out reference)")
-        print(f"  held-out {args.split}: {mean:.3f}  [{low:.3f}, {high:.3f}] over "
-              f"{len(scores.reference)} x {args.max_new_tokens} tokens   ppl {math.exp(mean):.2f}")
+        print(f"  held-out {SPLIT}: {mean:.3f}  [{low:.3f}, {high:.3f}] over "
+              f"{len(scores.reference)} x {MAX_NEW_TOKENS} tokens   ppl {math.exp(mean):.2f}")
         print("  delta < 0 means the model finds its own output less surprising than real text")
         # Each model gets its own held-out number: they score the same draws but are different
         # models, and the delta is only interpretable against a model's own baseline.
@@ -557,7 +550,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         if baseline_scores is not None:
             base_mean = sum(baseline_scores.generated) / len(baseline_scores.generated)
             base_ref = baseline_scores.summary()[0]
-            base_label = f"{args.baseline} ({baseline.parameter_count() / 1e6:.0f}M)"
+            base_label = f"{BASELINE} ({baseline.parameter_count() / 1e6:.0f}M)"
             print(f"  {base_label:<38}{baseline_seq_len:>6}{base_ref:>10.3f}{base_mean:>10.3f}"
                   f"{base_mean - base_ref:>+9.3f}{math.exp(base_mean):>9.2f}")
         print()
@@ -570,11 +563,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             print(f"  self-CE {value:.3f}  (delta {value - mean:+.3f}, ppl {math.exp(value):.2f})")
             if baseline_scores is not None:
                 base_value = baseline_scores.generated[index]
-                print(f"  {args.baseline:<7} {base_value:.3f}  (delta {base_value - mean:+.3f}, "
+                print(f"  {BASELINE:<7} {base_value:.3f}  (delta {base_value - mean:+.3f}, "
                       f"ppl {math.exp(base_value):.2f})")
                 # Printed because the loop-vs-no-loop question is the whole point of the control:
                 # a low self-CE means nothing without seeing what the baseline actually produced.
-                print(f"  {args.baseline} continuation:")
+                print(f"  {BASELINE} continuation:")
                 print(baseline_texts[index] if baseline_texts is not None else "")
         print()
 

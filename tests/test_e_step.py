@@ -176,7 +176,9 @@ def test_keys_freezing_bites_on_stepped_belief():
 # --- Task 4: e_step loop + trajectory + fixed-seed regression --------------
 from vfe3.inference.e_step import e_step
 
-EXPECTED_CHECKSUM = 6.6499   # frozen from the first trusted green run (seed=7, n_iter=3)
+# Re-frozen 2026-09-23 (audit #6): the filtering phi step now differentiates only each frame's
+# own receiver row (sender frames detached); with that detach disabled the run still gives 6.6499.
+EXPECTED_CHECKSUM = 6.7064   # seed=7, n_iter=3
 
 
 def test_e_step_runs_n_iter_and_returns_trajectory():

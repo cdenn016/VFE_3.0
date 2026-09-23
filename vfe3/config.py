@@ -175,6 +175,7 @@ class VFE3Config:
                                                      # | (dense legacy, opt-in) "diagonal" | "full" | "family"
 
     decode_tau:                float = 1.0           # KL-to-prior decode temperature; inert under decode_mode="linear"
+    decode_temperature_learned: bool = True          # False freezes decode_log_scale, so tau_eff == decode_tau exactly
 
     # Unigram log-prior decode (Bayes-correct class prior): adds kappa*log pi_v to the decode logits,
     # pi_v the corpus unigram frequency -- a fixed DATA statistic, not a learned parameter. train()
@@ -348,6 +349,7 @@ class VFE3Config:
     relational_input_scope:              str           = "head"                 # "head" | "full"
     relational_output_scope:             str           = "head"                 # "head" | "full"
     attention_residual:                  bool          = False                  # requires predictive_content
+    relational_output_init:              str           = "identity"             # "identity" | "depth_scaled" (initial O times 1/sqrt(2 n_layers))
 
     relational_identity_content:         bool          = False                  # predictive_content requires learned content maps
 
@@ -760,6 +762,9 @@ class VFE3Config:
         ):
             if type(value) is not bool:
                 raise _ConfigTypeError(f"{name} must be a plain bool")
+        # An InitVar is not a dataclass field, so keep the admission on the instance for
+        # serialize_config to persist (it shadows the class-level default False).
+        self._allow_legacy_dense_decode = _allow_legacy_dense_decode
         for field in fields(self):
             if field.type in (bool, int):
                 value = getattr(self, field.name)
@@ -795,8 +800,14 @@ class VFE3Config:
                 "e_step_gradient": "unroll", "oracle_unroll_grad": True,
                 "n_e_steps": 1,
                 "e_phi_lr": 0.0, "transport_mode": "flat", "gauge_group": "block_glk",
-                "encode_mode": "per_token",
             }
+            # encode_mode admits 'per_token_additive' beside 'per_token': the additive encoder
+            # zeroes the token frame and moves the same learned (V, n_gen) phi table into a mean
+            # shift, which is the capacity-matched Omega = I control for a gauge on/off contrast on
+            # this route. The projected executors read only the realized frame and the encoded
+            # moments, so no step depends on the encoder beyond them. Its positional requirement
+            # (pos_phi='none', pos_rotation='none') is enforced after the gauge_transport
+            # coercion below, which can itself supply pos_phi='none'.
             # skip_belief_sigma_update is deliberately ABSENT from the envelope above: it is INERT
             # on every projected route, not incompatible. 'projected_predictive' replaces the mean
             # and keeps covariance (e_step.py predictive branch assigns sigma = belief.sigma and
@@ -835,6 +846,9 @@ class VFE3Config:
                 for name, expected in requirements.items()
                 if getattr(self, name) != expected
             ]
+            if self.encode_mode not in ("per_token", "per_token_additive"):
+                incompatible.append(
+                    f"encode_mode={self.encode_mode!r} (requires 'per_token' or 'per_token_additive')")
             if self.family not in ("gaussian_diagonal", "gaussian_full",
                                    "gaussian_diagonal_exact", "gaussian_frame_diagonal"):
                 incompatible.append(f"family={self.family!r} (requires a supported Gaussian family)")
@@ -1682,6 +1696,16 @@ class VFE3Config:
         # decode / encode
         if not math.isfinite(self.decode_tau) or self.decode_tau <= 0.0:
             raise ValueError(f"decode_tau must be finite and positive, got {self.decode_tau}")
+        if not self.decode_temperature_learned and self.decode_mode == "linear":
+            raise ValueError(
+                "decode_temperature_learned=False freezes decode_log_scale, which only the prior-bank "
+                "decoders read; decode_mode='linear' discards tau_eff")
+        _require(self.relational_output_init, ("identity", "depth_scaled"), "relational_output_init")
+        if self.relational_output_init == "depth_scaled" and (
+                self.attention_mode == "transported" or self.relational_identity_content):
+            raise ValueError(
+                "relational_output_init='depth_scaled' scales the learned relational output map O, "
+                "which exists only on the projected attention routes with learned content maps")
         # decode_mode / encode_mode validated against the LIVE decode/encode REGISTRIES (not static
         # literals) so a newly registered kernel is config-selectable without editing this validator.
         # Dense kernels remain registered as exact legacy/oracle implementations but fresh public
@@ -1815,21 +1839,9 @@ class VFE3Config:
         if self.decode_chunk_size < 1:
             raise ValueError(f"decode_chunk_size must be >= 1, got {self.decode_chunk_size}")
         _require(self.decode_ce_checkpoint, ("auto", "always", "never"), "decode_ce_checkpoint")
-        # decode_bias is a learned per-vocab log-unigram bias on the LINEAR decode. On the prior-bank
-        # KL path the per-vocab priors already carry the unigram role and the bias is never created, so
-        # warn rather than let a True + prior_bank pair be silently a no-op.
-        if self.decode_bias and self.decode_mode != "linear":
-            import warnings
-            warnings.warn(
-                "decode_bias=True is inert for non-linear prior-bank decoders",
-                ConfigNotice,
-            )
-        if self.decode_mode == "linear" and self.decode_tau != 1.0:
-            import warnings
-            warnings.warn(
-                f"decode_tau={self.decode_tau} is inert when decode_mode='linear'",
-                ConfigNotice,
-            )
+        # decode_bias (linear decode only) and decode_tau (prior-bank decode only) are reported by
+        # inactive_fields(), so the default-guarded notice below covers them and untouched
+        # defaults stay silent.
         # Capability validation: the optimized 'diagonal'/'full' kernels hardcode a gaussian alpha=1
         # KL readout and ignore divergence_family/renyi_order, so a non-Gaussian family or a
         # noncanonical divergence would read the belief out under the WRONG geometry. Such a config on
@@ -1870,6 +1882,23 @@ class VFE3Config:
             )
         # encode_mode is validated against the live encoder registry.
         _require(self.encode_mode, tuple(sorted(_ENCODERS)), "encode_mode")
+        # 'per_token_additive' is the Omega = I capacity control: the token frame is zero, but a
+        # positional frame (pos_phi's right factor, or the gauge-RoPE fold) still composes into
+        # U_i, so Omega_ij = U_i U_j^{-1} != I and the control is contaminated. Checked after the
+        # gauge_transport coercion, which supplies pos_phi='none' under 'off'.
+        if (self.encode_mode == "per_token_additive"
+                and (self.pos_phi != "none" or self.pos_rotation != "none")):
+            detail = (
+                f"encode_mode='per_token_additive' with pos_phi={self.pos_phi!r}, "
+                f"pos_rotation={self.pos_rotation!r}: the positional frame keeps Omega_ij != I, "
+                "so the additive encoder is not the Omega = I capacity control; set "
+                "pos_phi='none' and pos_rotation='none'"
+            )
+            if self.attention_mode != "transported":
+                raise ValueError(detail + " on the projected routes")
+            import warnings
+            warnings.warn(detail + " for a capacity-matched gauge contrast.", UserWarning,
+                          stacklevel=2)
         if self.encode_mode == "canonical_content_gauge":
             import warnings
             warnings.warn(
@@ -2165,20 +2194,10 @@ class VFE3Config:
                 "exp_fp64_norm_threshold must be finite and > 0, got "
                 f"{self.exp_fp64_norm_threshold}"
             )
-        if self.sigma_weight_decay is not None and (
-                not math.isfinite(self.sigma_weight_decay)
-                or self.sigma_weight_decay < 0.0):
-            raise ValueError(
-                f"sigma_weight_decay must be finite and >= 0 or None, "
-                f"got {self.sigma_weight_decay}"
-            )
-        if self.untie_decode_bank and self.decode_mode == "linear":
-            import warnings
-            warnings.warn(
-                "untie_decode_bank=True is inert under decode_mode='linear' (the linear decode is "
-                "already untied by construction); the toggle is read only by the KL-to-bank decode.",
-                ConfigNotice, stacklevel=2,
-            )
+        for name in ("sigma_weight_decay", "mu_weight_decay"):
+            value = getattr(self, name)
+            if value is not None and (not math.isfinite(value) or value < 0.0):
+                raise ValueError(f"{name} must be finite and >= 0 or None, got {value}")
 
         # Activity is structural, independent of values and warning visibility. Notices only
         # display settings that differ from their defaults; sweep validation uses the full map.
@@ -2320,6 +2339,83 @@ class VFE3Config:
         )
         if registration.family_consistent and not canonical_family_dispatch:
             mark(("decode_av_precision",), "generic family-consistent decoding does not call _decode_av")
+
+        # The route-specific rules below were confirmed by tiny launcher-derived CPU probes: loss and
+        # every parameter gradient stay torch.equal under an override of the marked knob
+        # (tests/test_remediation_20260923_A.py). The self-coupling rule is exact in real
+        # arithmetic; where an autograd oracle executes it (full-covariance families) the
+        # override leaves only a floating-point roundoff residue in the gradients.
+        if self.decode_mode == "linear":
+            mark(("decode_tau",), "read only by the prior-bank KL decode")
+            mark(("untie_decode_bank",),
+                 "read only by the KL-to-bank decode; the linear decode is untied by construction")
+        else:
+            mark(("decode_bias",), "linear decode only; the prior-bank KL decoders create no output bias")
+        if self.beta_attention_prior not in ("windowed", "causal_windowed"):
+            mark(("attention_window",), "only the windowed/causal_windowed priors read the band half-width")
+        from vfe3.families.base import bhattacharyya, jeffreys, squared_hellinger
+        if get_functional(self.divergence_family) in (bhattacharyya, jeffreys, squared_hellinger):
+            mark(("renyi_order",), "this order-free divergence functional fixes its own Renyi order")
+        if self.gauge_transport in ("off", "frozen"):
+            mark(("m_pos_phi_lr", "phi_weight_decay"),
+                 f"gauge_transport={self.gauge_transport!r} sets requires_grad=False on the frame "
+                 "tables, so no phi-role step or decay applies")
+        if self.attention_mode != "transported" or self.skip_belief_sigma_update:
+            mark(("e_q_sigma_lr", "e_sigma_q_trust", "sigma_max"),
+                 "the belief covariance is frozen on projected routes and under "
+                 "skip_belief_sigma_update, so no sigma step, trust region, or SPD ceiling runs")
+        if self.attention_mode != "transported":
+            mark(("full_cov_kl_backend",),
+                 "projected scoring never calls the transported full-covariance pair backend")
+        if self.attention_mode == "projected_predictive":
+            mark(("lambda_beta",), "predictive_content weights no belief-coupling block")
+            mark(("full_cov_congruence_precision", "full_cov_congruence_certification",
+                  "congruence_cond_escalation"),
+                 "predictive_content never transports a covariance by congruence")
+        if "e_mu_q_trust" in inactive or self.e_mu_q_trust is None or self.diagonal_covariance:
+            mark(("mu_trust_cholesky_rounds",),
+                 "only an active mean trust region on a full covariance factors sigma_q")
+        # stack._can_omit_prior_handoff at config level: predictive_content never reads the prior
+        # and no M-step prior consumer is enabled.
+        if (self.attention_mode == "projected_predictive" and self.mstep_self_coupling_weight == 0.0
+                and self.cg_energy_weight == 0.0 and self.e_step_update == "gradient"
+                and self.e_phi_lr == 0.0):
+            mark(("prior_handoff_rho", "prior_handoff_sigma"),
+                 "predictive_content never reads the prior and no M-step prior consumer is enabled")
+        # The stack enters the E-step with q = p; one gradient iteration in one layer therefore
+        # evaluates the self-coupling at D(q||p) = 0, where its force and derivatives vanish.
+        if (canonical_e_step_update(self.e_step_update) == "gradient" and self.n_e_steps == 1
+                and self.n_layers == 1 and self.mstep_self_coupling_weight == 0.0):
+            mark(("lambda_alpha_mode", "lambda_alpha", "b0", "c0"),
+                 "the single gradient E-step iteration starts at q = p, where the self-coupling "
+                 "force vanishes")
+        # Every exponentiated block norm is bounded by its frame's chart norm, so the fp64 island
+        # (block norm >= threshold) is unreachable once the threshold exceeds the chart bound.
+        if (self.transport_chart_max_norm is not None
+                and self.exp_fp64_norm_threshold > self.transport_chart_max_norm):
+            mark(("exp_fp64_norm_threshold",),
+                 "transport_chart_max_norm rejects a frame before any block norm reaches this "
+                 "threshold, so the float64 exponential island is unreachable")
+        # Transported gaussian_frame_diagonal is frame-intrinsic: the flat coboundary cancels the
+        # whole vertex frame, including the RoPE fold and the positional right factor.
+        if self.attention_mode == "transported" and self.family == "gaussian_frame_diagonal":
+            mark(("pos_rotation", "rope_base", "rope_on_value", "pos_phi", "pos_phi_scale",
+                  "pos_phi_project_slk", "m_pos_phi_lr"),
+                 "transported gaussian_frame_diagonal cancels the vertex frame, including the "
+                 "RoPE fold and the positional right factor")
+        from vfe3.model.block_mlp import get_block_mlp_registration
+        if (self.attention_mode == "projected_predictive" and self.family == "gaussian_full"
+                and self.encode_mode in ("per_token", "per_token_additive")
+                and not self.use_head_mixer and not self.rope_full_gauge
+                and not (self.use_block_mlp and (
+                    self.block_mlp_covariance != "passthrough"
+                    or get_block_mlp_registration(self.block_mlp_mode).gauge_class
+                    == "invariant_scalar_intertwiner"))):
+            mark(("family",),
+                 "value-identical to gaussian_diagonal under the rank-matched decoder on this "
+                 "route: stored covariance is a diagonal token lookup and no seam densifies it; "
+                 "full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, "
+                 "or attention_mode='transported'")
         return inactive
 
     @property
@@ -2414,6 +2510,10 @@ def serialize_config(config: VFE3Config) -> dict[str, Any]:
     payload = asdict(config)
     if math.isinf(config.kl_max):
         payload["kl_max"] = "inf"  # Strict JSON has no Infinity number.
+    # asdict omits the InitVar. Persist it only when set, so every ordinary config serializes and
+    # fingerprints exactly as before while an admitted dense-decode config survives a round trip.
+    if getattr(config, "_allow_legacy_dense_decode", False):
+        payload["_allow_legacy_dense_decode"] = True
     return payload
 
 
@@ -2432,6 +2532,9 @@ def config_from_serialized(
     if not isinstance(payload, Mapping):
         raise ValueError(f"serialized config from {source} must be a mapping")
     payload = dict(payload)
+    allow_legacy_dense_decode = _normalize_serialized_boolean(
+        payload.pop("_allow_legacy_dense_decode", False), "_allow_legacy_dense_decode",
+        source=source)
     if "grad_clip_per_role" in payload:
         per_role = _normalize_serialized_boolean(
             payload.pop("grad_clip_per_role"), "grad_clip_per_role", source=source)
@@ -2481,7 +2584,7 @@ def config_from_serialized(
     }
     if values.get("kl_max") == "inf":
         values["kl_max"] = math.inf
-    return VFE3Config(**values)
+    return VFE3Config(**values, _allow_legacy_dense_decode=allow_legacy_dense_decode)
 
 
 def _normalize_serialized_boolean(

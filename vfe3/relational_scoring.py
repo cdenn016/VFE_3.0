@@ -6,7 +6,7 @@ Successful factorization always uses zero jitter and no spectral repair.
 """
 
 import math
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 from torch.utils.checkpoint import checkpoint
@@ -14,6 +14,43 @@ from torch.utils.checkpoint import checkpoint
 
 # Budget for one projected map L; its covariance product can require a second.
 _PROJECTION_TILE_BYTES = 32 * 1024 ** 2
+
+# Cumulative (token, head) covariance entries whose Cholesky factor was rebuilt by the float64
+# source-factor recovery, per device. Updated asynchronously on the recovery path only, so the
+# healthy path pays nothing (audit 2026-09-23 low: the recovery had no activation counter).
+_SOURCE_RECOVERY_COUNTS: Dict[str, torch.Tensor] = {}
+
+
+def _count_source_recovery(recovered: torch.Tensor) -> None:
+    r"""Accumulate recovered entries per device (async add, no host sync)."""
+    key = str(recovered.device)
+    counter = _SOURCE_RECOVERY_COUNTS.get(key)
+    if counter is None:
+        counter = torch.zeros((), dtype=torch.int64, device=recovered.device)
+        _SOURCE_RECOVERY_COUNTS[key] = counter
+    counter += recovered.sum()
+
+
+def source_recovery_counter(device: torch.device) -> torch.Tensor:
+    r"""On-device snapshot of the cumulative recovered-entry count (no host sync).
+
+    Differences of two snapshots count the recoveries between them.
+    """
+    counter = _SOURCE_RECOVERY_COUNTS.get(str(device))
+    if counter is None:
+        return torch.zeros((), dtype=torch.int64, device=device)
+    return counter.clone()
+
+
+def source_recovery_elements() -> int:
+    r"""Recovered covariance entries since the last reset, over all devices. Host-syncs."""
+    return int(sum(int(count) for count in _SOURCE_RECOVERY_COUNTS.values()))
+
+
+def reset_source_recovery_elements() -> None:
+    r"""Zero the per-device source-recovery counters."""
+    for count in _SOURCE_RECOVERY_COUNTS.values():
+        count.zero_()
 
 
 def _compute_dtype(*tensors: torch.Tensor) -> torch.dtype:
@@ -139,11 +176,16 @@ def _projected_moments_tile(
 
 
 def _cholesky_status(G: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-    r"""Bound eps ||G||_F ||G^{-1}||_F using trace and determinant before inversion.
+    r"""Factor G and certify eps ||G||_F ||G^{-1}||_F <= 1e-4 for every float32 entry on device.
 
-    For SPD G of order r>1, lambda_min >= det(G)/(tr(G)/(r-1))^(r-1).
-    Thus ||G^{-1}||_F <= sqrt(r)/lambda_min. Unlike pivot spread, this
-    conservative bound detects shear. All decisions remain on the device.
+    The certificate is evaluated EXACTLY for every successfully factored float32 entry from its
+    own factor (``cholesky_inverse``), so ``screen`` marks exactly the ill-conditioned entries and
+    the verdict joins the caller's single host transfer. It replaces the former AM-GM
+    trace/determinant screen, :math:`\lambda_{\min} \ge \det G / (\operatorname{tr} G/(r-1))^{r-1}`,
+    which was valid but about 4.5e4 times loose at the live condition, so almost every call paid a
+    second host synchronization and masked gathers to evaluate this same certificate on the flagged
+    entries (audit 2026-09-23 low). The recovery decision is unchanged: the screen was a necessary
+    condition for the certificate, and the certificate alone decided recovery.
     """
     chol, info = torch.linalg.cholesky_ex(G, check_errors=False)
     with torch.no_grad():
@@ -151,11 +193,11 @@ def _cholesky_status(G: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         screen = torch.zeros_like(failed)
         r = G.shape[-1]
         if G.dtype == torch.float32 and r > 1:
-            logdet = 2 * chol.diagonal(dim1=-2, dim2=-1).abs().log().sum(-1)
-            trace = G.diagonal(dim1=-2, dim2=-1).sum(-1)
-            log_bound = (math.log(torch.finfo(G.dtype).eps) + G.norm(dim=(-2, -1)).log()
-                         + .5 * math.log(r) + (r - 1) * (trace / (r - 1)).log() - logdet)
-            screen = (~failed) & (log_bound > math.log(1e-4))
+            eye = torch.eye(r, device=G.device, dtype=G.dtype)
+            safe_factor = torch.where(failed[..., None, None], eye, chol)
+            inverse_norm = torch.cholesky_inverse(safe_factor).norm(dim=(-2, -1))
+            certificate = torch.finfo(G.dtype).eps * G.norm(dim=(-2, -1)) * inverse_norm > 1e-4
+            screen = (~failed) & certificate
         tolerance = 32 * torch.finfo(G.dtype).eps
         status = torch.stack((torch.isfinite(G).all(),
                               torch.isclose(G, G.transpose(-1, -2), rtol=tolerance, atol=0.).all(),
@@ -187,17 +229,10 @@ def _strict_cholesky(
     else:
         chol, failed, screen, decisions = prepared
     finite, symmetric, suspicious_any, failed_any = decisions
-    ill_conditioned = torch.zeros_like(failed)
-    recover_any = failed_any
-    if finite and symmetric and suspicious_any:
-        with torch.no_grad():
-            suspicious = failed | screen
-            eye = torch.eye(G.shape[-1], device=G.device, dtype=G.dtype)
-            safe_factor = torch.where(failed[..., None, None], eye, chol)
-            inverse_norm = torch.cholesky_inverse(safe_factor[suspicious]).norm(dim=(-2, -1))
-            certificate = torch.finfo(G.dtype).eps * G[suspicious].norm(dim=(-2, -1)) * inverse_norm > 1e-4
-            ill_conditioned[suspicious] = certificate
-            recover_any = bool((failed | ill_conditioned).any())
+    # ``screen`` is the exact conditioning certificate (see _cholesky_status), so the recovery
+    # decision is already on the host: no second synchronization and no masked gathers.
+    ill_conditioned = screen
+    recover_any = suspicious_any
     if not finite:
         raise ValueError("projected covariance must be finite for zero-jitter Cholesky")
     if not symmetric:
@@ -208,7 +243,9 @@ def _strict_cholesky(
                 raise ValueError("projected covariance is not positive definite: zero-jitter Cholesky failed; no repair applied")
             chol64, _ = _strict_cholesky(G.double())
             # Whole-tensor float64 refactor: every entry takes the factor route.
-            return chol64, torch.ones_like(failed)
+            recovered_all = torch.ones_like(failed)
+            _count_source_recovery(recovered_all)
+            return chol64, recovered_all
         failed = failed | ill_conditioned
         Sigma, inverse, S = projection[:3]
         batch, r, d = G.shape[:-2], G.shape[-1], S.shape[-1]
@@ -244,6 +281,7 @@ def _strict_cholesky(
         safe = torch.where(failed[..., None, None], torch.eye(r, device=G.device, dtype=G.dtype), G)
         chol = _strict_cholesky(safe)[0].double()
         chol[failed] = recovered
+        _count_source_recovery(failed)
         return chol, failed
     return chol, None
 
@@ -267,6 +305,13 @@ def projected_gaussian_kl(
     symmetrization, jitter, or repair is applied. Optional (Sigma,U^-1,S[,mu])
     source tuples allow inaccurate rounded covariances and projected means to
     be recomputed from their original sources; covariance-only non-SPD inputs fail explicitly.
+
+    The float64 factor route is selected PER PAIR (audit 2026-09-23 low): a pair (b, h, i, j) takes
+    it only when its own query entry (b, i, h) or key entry (b, j, h) was recovered. Every other
+    pair is the working-dtype value from the healthy tile geometry, bit-identical to the call in
+    which no entry anywhere in the batch needed recovery, so an ill-conditioned token in another
+    sequence or at a later position cannot change a healthy pair's arithmetic. The selection uses
+    the recovery masks already on the device and the host flags the recovery path already reads.
     """
     if a_q.ndim < 3 or a_k.ndim < 3 or a_q.shape[-2:] != a_k.shape[-2:]:
         raise ValueError("projected means must have matching head and comparison dimensions")
@@ -328,34 +373,63 @@ def projected_gaussian_kl(
         logdet_q = 2 * chol_q.diagonal(dim1=-2, dim2=-1).log().sum(-1).transpose(-1, -2)
         logdet_k = 2 * chol_k.diagonal(dim1=-2, dim2=-1).log().sum(-1).transpose(-1, -2)
         if factor_trace_any:
-            logdet_q_healthy, logdet_k_healthy = logdet_q.to(dtype), logdet_k.to(dtype)
+            # Healthy factors round-trip bit-exactly through the cast, so the working-dtype
+            # log-determinants repeat the no-recovery arithmetic exactly.
+            logdet_q_healthy = (
+                2 * chol_q.to(dtype).diagonal(dim1=-2, dim2=-1).log().sum(-1).transpose(-1, -2))
+            logdet_k_healthy = (
+                2 * chol_k.to(dtype).diagonal(dim1=-2, dim2=-1).log().sum(-1).transpose(-1, -2))
         else:
             logdet_q_healthy, logdet_k_healthy = logdet_q, logdet_k
         nq, nk = aq.shape[-2], ak.shape[-2]
         batch_heads = aq.numel() // (nq * r)
-        per_pair = r * r if factor_trace_any else r
-        pair_budget = max(1, (32 * 1024 ** 2) // (aq.element_size() * batch_heads * per_pair))
-        q_step = max(1, min(nq, 32, pair_budget))
-        k_step = max(1, min(nk, pair_budget // q_step))
+
+        def _tile_steps(element_size: int, per_pair: int) -> Tuple[int, int]:
+            pair_budget = max(1, (32 * 1024 ** 2) // (element_size * batch_heads * per_pair))
+            q_step = max(1, min(nq, 32, pair_budget))
+            return q_step, max(1, min(nk, pair_budget // q_step))
+
+        def _tile(args: tuple, ft: bool, q_step: int, k_step: int) -> torch.Tensor:
+            if torch.is_grad_enabled() and (nq > q_step or nk > k_step) and any(x.requires_grad for x in args):
+                return checkpoint(_projected_kl_tile, *args, ft,
+                                  use_reentrant=False, preserve_rng_state=False)
+            return _projected_kl_tile(*args, ft)
+
+        # Working-dtype grid in the healthy tile geometry: exactly the no-recovery computation.
+        q_step, k_step = _tile_steps(aq_healthy.element_size(), r)
         rows = []
         for i in range(0, nq, q_step):
             columns = []
-            i_rec = any(q_needs[i:i+q_step]) if factor_trace_any else False
             for j in range(0, nk, k_step):
-                ft = bool(factor_trace_any and (i_rec or any(k_needs[j:j+k_step])))
-                if ft:
+                args = (aq_healthy[..., i:i+q_step, :], ak_healthy[..., j:j+k_step, :],
+                        q_cov_healthy[..., i:i+q_step, :, :], k_prec_healthy[..., j:j+k_step, :, :],
+                        logdet_q_healthy[..., i:i+q_step], logdet_k_healthy[..., j:j+k_step])
+                columns.append(_tile(args, False, q_step, k_step))
+            rows.append(torch.cat(columns, dim=-1))
+        healthy = torch.cat(rows, dim=-2)
+        if not factor_trace_any:
+            return healthy.to(dtype)
+        # Factor route only for pairs that touch a recovered entry, selected per (b, h, i, j).
+        q_rec = (rec_q.movedim(-1, -2) if rec_q is not None                       # (..., H, Nq)
+                 else torch.zeros(Gq.shape[:-4] + (Gq.shape[-3], Gq.shape[-4]),
+                                  dtype=torch.bool, device=Gq.device))
+        k_rec = (rec_k.movedim(-1, -2) if rec_k is not None                       # (..., H, Nk)
+                 else torch.zeros(Gk.shape[:-4] + (Gk.shape[-3], Gk.shape[-4]),
+                                  dtype=torch.bool, device=Gk.device))
+        pair_rec = q_rec.unsqueeze(-1) | k_rec.unsqueeze(-2)                      # (..., H, Nq, Nk)
+        q_step, k_step = _tile_steps(aq.element_size(), r * r)
+        rows = []
+        for i in range(0, nq, q_step):
+            columns = []
+            i_rec = any(q_needs[i:i+q_step])
+            for j in range(0, nk, k_step):
+                value = healthy[..., i:i+q_step, j:j+k_step]
+                if i_rec or any(k_needs[j:j+k_step]):
                     args = (aq[..., i:i+q_step, :], ak[..., j:j+k_step, :],
                             q_factor[..., i:i+q_step, :, :], k_factor[..., j:j+k_step, :, :],
                             logdet_q[..., i:i+q_step], logdet_k[..., j:j+k_step])
-                else:
-                    args = (aq_healthy[..., i:i+q_step, :], ak_healthy[..., j:j+k_step, :],
-                            q_cov_healthy[..., i:i+q_step, :, :], k_prec_healthy[..., j:j+k_step, :, :],
-                            logdet_q_healthy[..., i:i+q_step], logdet_k_healthy[..., j:j+k_step])
-                if torch.is_grad_enabled() and (nq > q_step or nk > k_step) and any(x.requires_grad for x in args):
-                    value = checkpoint(_projected_kl_tile, *args, ft,
-                                       use_reentrant=False, preserve_rng_state=False)
-                else:
-                    value = _projected_kl_tile(*args, ft)
+                    factor_value = _tile(args, True, q_step, k_step).to(dtype)
+                    value = torch.where(pair_rec[..., i:i+q_step, j:j+k_step], factor_value, value)
                 columns.append(value)
             rows.append(torch.cat(columns, dim=-1))
         return torch.cat(rows, dim=-2).to(dtype)

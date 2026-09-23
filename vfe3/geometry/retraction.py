@@ -18,6 +18,7 @@ from vfe3.geometry.lie_ops import (
     retract_glk,
     retract_son,
 )
+from vfe3.numerics import safe_eigh
 
 
 def _check_sigma_max(sigma_max: Optional[float], eps: float) -> None:
@@ -101,7 +102,9 @@ class _EighDamped(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, A: torch.Tensor, gap_eps):             # gap_eps: float or 0-d tensor  # noqa: D401
-        w, V = torch.linalg.eigh(A)
+        # safe_eigh: value-identical to torch.linalg.eigh, but chunks the flattened batch below the
+        # cuSOLVER batched-eigensolver ceiling (audit 2026-09-23 low; see numerics._EIG_MAX_BATCH).
+        w, V = safe_eigh(A)
         ctx.save_for_backward(w, V)
         ctx.gap_eps = gap_eps
         return w, V
@@ -787,6 +790,7 @@ def retract_phi(
     trust_region:   Optional[float] = None, # None -> group default (GL:0.1, SO:0.3)
     max_norm:       Optional[float] = None, # None -> group default (GL:5.0, SO:pi)
     trace_clamp:    Optional[float] = None, # soft per-block |tr| cap (GL only)
+    residual_max:   Optional[float] = None, # opt-in fail-closed BCH-to-group-product residual gate
 ) -> torch.Tensor:
     r"""Group-aware phi retraction dispatcher (Gaussian-specialized).
 
@@ -795,6 +799,10 @@ def retract_phi(
       project_slk=True  hard-projects each block to sl(K) (det Omega_h = 1);
       else trace_clamp soft-bounds |tr| per block. Defaults for trust_region /
       max_norm are taken from the group's compactness when not given.
+    ``max_norm`` caps the step, not the base point: a row is capped at
+    ``max(max_norm, ||phi||)``, so ``R_phi(0) = phi`` for every frame (see ``_retract_core``).
+    ``residual_max`` (None = off) forwards to ``compose_bch``'s fail-closed residual gate under
+    ``mode='bch'``.
     """
     G = group.generators
     compact_blocks = (
@@ -810,7 +818,7 @@ def retract_phi(
     if group.skew_symmetric:
         return retract_son(
             phi, delta_phi, G, step_size=step_size, trust_region=trust_region,
-            max_norm=max_norm, eps=eps, order=order, mode=mode,
+            max_norm=max_norm, eps=eps, order=order, mode=mode, residual_max=residual_max,
         )
 
     phi_new = retract_glk(
@@ -818,6 +826,7 @@ def retract_phi(
         max_norm=max_norm, eps=eps, order=order, mode=mode,
         compact_blocks=compact_blocks,
         block_dims=(group.irrep_dims if compact_blocks else None),
+        residual_max=residual_max,
     )
     if project_slk:
         phi_new = project_phi_to_slk(phi_new, G, group.irrep_dims)

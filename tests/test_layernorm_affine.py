@@ -1,9 +1,10 @@
 r"""Learned per-feature affine LayerNorm (layernorm_affine).
 
 layernorm_affine=True adds a learned gamma/beta to any "layernorm" norm seam via the
-AffineLayerNorm nn.Module (mu_norm = gamma*LN(mu) + beta). Default-OFF member of the
+AffineLayerNorm nn.Module (mu_norm = gamma*LN(mu) + beta). Default-ON member of the
 learned-parameter exception family: gamma inits to 1 and beta to 0, so step 0 is
-byte-identical to the parameter-free "layernorm". Non-gauge-equivariant (the same break
+byte-identical to the parameter-free "layernorm". ``_cfg`` pins the parameter-free variant
+(layernorm_affine=False) and the block MLP off, so each test opts into exactly the seam it checks. Non-gauge-equivariant (the same break
 "layernorm" itself carries). As the BLOCK norm it is E-step-coupled (detach / straight_through
 freeze footgun); as the FINAL norm it is post-stack and trains under any estimator.
 
@@ -22,7 +23,8 @@ from vfe3.model.model import VFEModel
 
 def _cfg(**kw):
     base = dict(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=2,
-                n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0)
+                n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0,
+                layernorm_affine=False, use_block_mlp=False)
     base.update(kw)
     return VFE3Config(**base)
 
@@ -35,8 +37,10 @@ def _batch(seed: int = 0):
 
 # --- defaults / pure path ----------------------------------------------------
 
-def test_layernorm_affine_defaults_false():
-    assert VFE3Config().layernorm_affine is False
+def test_layernorm_affine_default_is_on():
+    # The library default is the learned affine (SANCTIONED LEARNED-SCALAR EXCEPTION, default ON);
+    # the parameter-free LayerNorm stays reachable with layernorm_affine=False (next test).
+    assert VFE3Config().layernorm_affine is True
 
 
 def test_param_free_when_affine_off():
@@ -99,8 +103,8 @@ def test_final_affine_trains_under_any_estimator():
     torch.manual_seed(0)
     with warnings.catch_warnings(record=True) as rec:
         warnings.simplefilter("always")
-        m = VFEModel(_cfg(norm_type_final="layernorm", layernorm_affine=True,
-                          e_step_gradient="detach"))
+        m = VFEModel(_cfg(norm_type_block="none", norm_type_final="layernorm",
+                          layernorm_affine=True, e_step_gradient="detach"))
     assert not any("freezes the BLOCK" in str(w.message) for w in rec)
     _, loss, _ = m(x, y)
     loss.backward()

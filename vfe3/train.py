@@ -70,6 +70,7 @@ from vfe3.numerics import (                    # non-equivariant / non-PD fallba
     reset_mm_cholesky_fallback_elements,
     reset_mu_trust_fallback_elements,
 )
+from vfe3.relational_scoring import reset_source_recovery_elements   # projected float64 source-factor recovery count
 
 
 _PHI_CLAMP_WARNED:   bool = False
@@ -118,7 +119,7 @@ def _warn_phi_transport_clamp(
 
     max_norm: float = TRANSPORT_CLAMP_MAX_NORM,   # single source: stable_matrix_exp_pair's Frobenius clamp
 ) -> None:
-    r"""Warn once per channel when a gauge-frame table exceeds the transport clamp.
+    r"""Warn once per channel when a gauge-frame table exceeds the transport clamp or chart bound.
 
     ``stable_matrix_exp_pair`` rescales any ``||M||_F > max_norm`` (the shared transport-clamp
     default) and returns the surrogate ``exp(max_norm * M/||M||_F)``, NOT ``exp(M)``; its per-call
@@ -129,8 +130,16 @@ def _warn_phi_transport_clamp(
     log/eval-cadence steps (off the hot path) and shares the exact norm kernel used by the projected
     M-step. Certified orthogonal bases use their diagonal Gram; uncertified custom bases use the
     dense exact fallback in bounded chunks.
+
+    When ``cfg.transport_chart_max_norm`` is set, the transport build RAISES (fail-closed) for any
+    frame above it, which aborts training; the warning therefore trips at
+    :math:`\min(\text{max\_norm}, \text{transport\_chart\_max\_norm})`, the first bound a drifting
+    row actually meets.
     """
     global _PHI_CLAMP_WARNED
+    chart_max_norm = getattr(getattr(model, "cfg", None), "transport_chart_max_norm", None)
+    threshold = max_norm if chart_max_norm is None else min(max_norm, float(chart_max_norm))
+    chart_binds = threshold < max_norm
     tables = [("belief.phi_embed", getattr(model.prior_bank, "phi_embed", None)),
               ("belief.pos_phi_free", getattr(model, "pos_phi_free", None))]
     with torch.no_grad():
@@ -155,17 +164,22 @@ def _warn_phi_transport_clamp(
                     warn_fallback=False,
                 )
                 norm_max.copy_(torch.maximum(norm_max, norm.max()))
-            if bool(norm_max > max_norm):              # host sync: log-cadence only
+            if bool(norm_max > threshold):             # host sync: log-cadence only
                 import warnings
-                remediation = (
-                    "bound the belief frame (mass_phi, lower m_phi_lr) or accept the surrogate transport"
-                )
+                if chart_binds:
+                    consequence = (
+                        f"exceeds transport_chart_max_norm={threshold}; the fail-closed chart "
+                        "validity check raises ValueError on the next transport build that reads this "
+                        "row, which aborts training. Set phi_mstep_max_matrix_norm below the chart "
+                        "bound (or lower m_phi_lr)")
+                else:
+                    consequence = (
+                        f"exceeds the transport clamp max_norm={threshold}; stable_matrix_exp_pair "
+                        "now returns the clamped surrogate exp(max_norm*M/||M||), not exp(M). Bound "
+                        "the belief frame (mass_phi, lower m_phi_lr) or accept the surrogate transport")
                 warnings.warn(
-                    f"{name}: embedded gauge-frame Frobenius norm "
-                    f"{float(norm_max):.2f} exceeds the transport clamp "
-                    f"max_norm={max_norm}; stable_matrix_exp_pair now returns the clamped surrogate "
-                    f"exp(max_norm*M/||M||), not exp(M). {remediation}. Warned once for this "
-                    "channel; further drift is not re-reported.",
+                    f"{name}: embedded gauge-frame Frobenius norm {float(norm_max):.2f} "
+                    f"{consequence}. Warned once for this channel; further drift is not re-reported.",
                     RuntimeWarning, stacklevel=2,
                 )
                 _PHI_CLAMP_WARNED = True
@@ -233,6 +247,8 @@ def build_optimizer(
     groups = []
     if pb.mu_embed is not None:
         groups.append({"params": [pb.mu_embed], "lr": cfg.m_p_mu_lr, "role": "mu", **mu_wd})
+    # decode_temperature_learned=False freezes decode_log_scale (requires_grad=False in VFEModel), so
+    # this filter keeps it out of every optimizer group and the readout temperature stays fixed.
     sigma_parameters = [parameter for parameter in (pb.sigma_log_embed, pb.decode_log_scale)
                         if parameter is not None and parameter.requires_grad]
     if sigma_parameters:
@@ -1166,6 +1182,42 @@ def evaluate(
     }
 
 
+@torch.no_grad()
+def _eval_protocol_train_ce(
+    model:       VFEModel,
+    tokens:      torch.Tensor,           # (B, N) disjoint training windows
+    targets:     torch.Tensor,           # (B, N) next-token ids (-100 = ignore)
+    eval_stride: int,                    # validation scores the last eval_stride targets per window
+) -> float:
+    r"""Training-batch CE scored under the validation sliding-window protocol.
+
+    With ``eval_stride = s < N`` every held-out window after the first scores only its last ``s``
+    targets, so each scored position sees at least :math:`N - s + 1` tokens of context, while the
+    disjoint training windows score every position :math:`t = 0, \dots, N-1` uniformly. Comparing
+    the two biases ``generalization_gap`` negative, because CE falls with context. This scores the
+    same position set on the training batch,
+
+    .. math::
+        \mathrm{CE}_{\text{train}} = \frac{1}{|S|} \sum_{(b, t) \in S} -\log p(y_{b,t} \mid y_{b, \le t}),
+        \qquad S = \{(b, t) : t \ge N - s,\ y_{b,t} \ne -100\},
+
+    in evaluation mode like :func:`evaluate`, so both sides of the gap share one protocol. The CPU
+    and device RNG streams are restored, so the call leaves the training stream untouched.
+    """
+    masked = targets.clone()
+    masked[:, :max(0, targets.shape[-1] - eval_stride)] = -100             # (B, N) score the tail only
+    device = tokens.device
+    was_training = model.training
+    with torch.random.fork_rng(devices=([device] if device.type == "cuda" else [])):
+        model.eval()
+        try:
+            _, _, decode_stats = model(tokens, masked, return_decode_stats=True)
+        finally:
+            if was_training:
+                model.train()
+    return float(decode_stats.ce)
+
+
 # Fixed column set for the held-out per-eval probes (initialized to NaN before training and carried
 # forward like last_val, so every metrics.csv row carries the SAME columns -- rectangular -- whether
 # or not an eval has run yet). Config-conditional keys (val_head_redundancy_js needs >= 2 heads;
@@ -1958,6 +2010,7 @@ def train(
     reset_mu_trust_fallback_elements()   # ... the mu-trust-region equivariance fallback
     reset_decode_logdet_fallback_elements()   # ... and the decode log-det non-PD fallback
     reset_mm_cholesky_fallback_elements()   # ... and failed full-Gaussian MM Cholesky rows
+    reset_source_recovery_elements()        # ... and projected float64 source-factor recoveries
 
     def _step_indices() -> Iterable[int]:
         if not show_bar:
@@ -2070,6 +2123,12 @@ def train(
             # no_grad, so no weight change,
             # leaving the train_step RNG stream and weights byte-identical.
             d = model.diagnostics(tokens)
+        # generalization_gap's train side under the validation protocol when that protocol is the
+        # sliding window (eval_stride < max_seq_len); pre-step, like train_ce. None keeps train_ce.
+        gap_train_ce: Optional[float] = None
+        if (do_eval and do_csv and cfg.eval_stride is not None
+                and cfg.eval_stride < cfg.max_seq_len):
+            gap_train_ce = _eval_protocol_train_ce(model, tokens, targets, cfg.eval_stride)
         step_status: Dict[str, bool] = {}
         if timer is not None:
             timer.start_step()
@@ -2325,13 +2384,21 @@ def train(
             # Peak memory (Tier-1): CUDA peak MB at the clean train-window boundary.
             row["peak_mem_mb"] = peak_mem_mb
             # Generalization gap (Tier-1): val-set CE minus the per-step train CE (positive = overfit,
-            # the standard convention). The train side is seq-0 (diagnostics runs on seq 0) while val is
-            # the token-weighted val-set mean, so read it as a TREND, not an absolute. Eval-cadence like
-            # val_ce above: written only on an eval row, blank (NaN) on the log-interval rows in between.
+            # the standard convention). The train side is this step's batch while val is the
+            # token-weighted val-set mean, so read it as a TREND, not an absolute. Under a sliding
+            # validation window (eval_stride < max_seq_len) the train side is scored on the SAME
+            # positions (the last eval_stride of each window, eval mode; _eval_protocol_train_ce),
+            # since the disjoint-window train_ce averages shorter contexts and biases the gap negative.
+            # Eval-cadence like val_ce above: written only on an eval row, blank (NaN) in between.
             # (The complexity-vs-fit comparison is inner_alignment_energy_total vs
             # val_ce, both already columns; a separate "elbo_ce_gap" would subtract a CE from a
             # complexity-only F -- d["total"] carries no -E_q[log p] data term -- so it is NOT emitted.)
-            row["generalization_gap"] = (last_val["ce"] - ce) if do_eval else float("nan")
+            gap_train_side = ce if gap_train_ce is None else gap_train_ce
+            row["generalization_gap"] = (last_val["ce"] - gap_train_side) if do_eval else float("nan")
+            if cfg.decode_mode != "linear":
+                # Realized readout temperature tau_eff = decode_tau * exp(-clamp(decode_log_scale,
+                # -3, 3)). While decode_temperature_learned=True, decode_tau is only its init.
+                row["decode_tau_eff"] = float(model.prior_bank._tau_eff().detach())
             # Extended per-eval diagnostics (Tier-1/2): already-reduced gauge / geometry / numerical-
             # health scalars from diagnostics() -- NOT per-token sums, so logged RAW (no /n_tok).
             # Conditional mixer/connection keys appear only with their toggle; the
@@ -2405,6 +2472,7 @@ def train(
                         "phi_group_trust_scale_min",
                         "phi_group_active_rows",
                         "phi_group_chart_norm_max",
+                        "phi_group_rejected_rows",
                         "phi_chart_displacement_mean",
                         "phi_chart_displacement_max",
                         "phi_frame_displacement_mean",
@@ -2489,7 +2557,13 @@ def train(
     # the artifacts object because train() returns only `losses`. summary.json's "n_steps" is
     # cfg.max_steps -- what was ASKED for. These say what actually happened, so an arm that quietly
     # trained on 95% of its budget is visible instead of being compared as if it had the full one.
-    attempted = int(n_steps - start_step)
+    # CUMULATIVE over a resume: attempted counts every outer step from 0, and accepted_updates is the
+    # optimizer's persisted accepted-update clock (restored by load_checkpoint and advanced by
+    # train_step), so a continuation reports the whole run's budget, not only its own segment.
+    # The fallback-element counters below are per-process and still cover this call only.
+    attempted = int(n_steps)
+    accepted = _successful_update_count(optimizer)
+    skipped_total = attempted - accepted
     if artifacts is not None:
         neutralized = nonfinite_tangent_elements()
         mu_fallbacks = mu_trust_fallback_elements()
@@ -2497,23 +2571,23 @@ def train(
         artifacts.final_step = int(n_steps)
         artifacts.realized_updates = {
             "attempted_steps":      attempted,
-            "accepted_updates":     int(attempted - skipped_steps),
-            "skipped_steps":        int(skipped_steps),
-            "accepted_update_frac": (float(attempted - skipped_steps) / attempted
+            "accepted_updates":     int(accepted),
+            "skipped_steps":        int(skipped_total),
+            "accepted_update_frac": (float(accepted) / attempted
                                      if attempted else float("nan")),
             "nonfinite_tangent_elements": int(neutralized),
             "mu_trust_fallback_elements": int(mu_fallbacks),
             "mm_cholesky_fallback_elements": int(mm_fallbacks),
             "decode_logdet_fallback_elements": int(decode_logdet_fallback_elements()),
         }
-        if skipped_steps or neutralized or mu_fallbacks or mm_fallbacks:
+        if skipped_total or neutralized or mu_fallbacks or mm_fallbacks:
             logger.warning(
                 " realized budget: %d/%d optimizer updates accepted (%.3f%%); "
                 "%d SPD tangent element(s) neutralized as non-finite; "
                 "%d belief(s) whitened by the non-equivariant mu-trust fallback; "
                 "%d belief row(s) retained after MM Cholesky fallback",
-                attempted - skipped_steps, attempted,
-                100.0 * (attempted - skipped_steps) / max(attempted, 1),
+                accepted, attempted,
+                100.0 * accepted / max(attempted, 1),
                 neutralized, mu_fallbacks, mm_fallbacks)
     if (terminal_validation_signature is not None
             and terminal_validation_metrics is not None
@@ -2628,12 +2702,16 @@ def parameter_report(
         tgt = torch.randint(0, int(model.cfg.vocab_size), (int(batch), n), generator=g).to(device)
         model.zero_grad(set_to_none=True)
         rng_state = torch.get_rng_state()                          # m31: the probe forward may draw the
+        import vfe3.model.prior_bank as _prior_bank                # the probe runs before train() fills the
+        unigram_warned = _prior_bank._WARNED_UNIGRAM_UNSET          # unigram table: hold PriorBank's once-per-
+        _prior_bank._WARNED_UNIGRAM_UNSET = True                   # process "unset" warning, which would be false
         try:                                                       # restore global RNG
             out  = model(ids, tgt)                                 # (logits|None, loss, ce) with targets
             loss = out[1] if isinstance(out, tuple) else out
             loss.backward()
         finally:
             torch.set_rng_state(rng_state)                         # global stream untouched, per the docstring
+            _prior_bank._WARNED_UNIGRAM_UNSET = unigram_warned
         dead_names = [name for name, p in named if p.requires_grad and p.grad is None]
         live = sum(p.numel() for _, p in named if p.requires_grad and p.grad is not None)
         model.zero_grad(set_to_none=True)                          # leave no grads for training

@@ -876,7 +876,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         # bit-identical logits at lambda_alpha 0.0 vs 7.5, i.e. seven identical runs. Same reason
         # lambda_alpha_mode / b0 / c0 are inert at depth 1.
         "param": "lambda_alpha", "values": [0, 0.5, 1, 5],
-        "requires": {"lambda_alpha_mode": "constant", "n_e_steps": 1},
+        "requires": {"lambda_alpha_mode": "constant", "n_e_steps": 2},
     },
     
     
@@ -3664,8 +3664,13 @@ def run_sweep(
     max_tokens:  Optional[int] = None,
     max_steps:   Optional[int] = None,
     stop_after_steps: Optional[int] = None,
+    collected_out: Optional[List[Dict[str, Any]]] = None,   # out-param: the collected cohort, even when incomplete
 ) -> List[Dict[str, Any]]:
-    r"""Run every cell of one sweep; per-cell failures are isolated so the sweep completes."""
+    r"""Run every cell of one sweep; per-cell failures are isolated so the sweep completes.
+
+    Returns the collected cohort only for a complete sweep and ``[]`` otherwise. ``collected_out``
+    receives the collected cohort in either case, for callers that rank partial results.
+    """
     stop_after_steps = _validated_stop_after_steps(stop_after_steps)
     sweep_name = _validated_sweep_name(sweep_name)
     save_model_artifacts = _require_exact_bool(
@@ -4187,6 +4192,8 @@ def run_sweep(
         **report_metadata,
     })
 
+    if collected_out is not None:
+        collected_out[:] = union
     if sweep_error is not None:
         print(f"\nSWEEP INCOMPLETE: {sweep_name}  ->  {sweep_error}")
         return []
@@ -4229,8 +4236,9 @@ def _base_label(label: str) -> str:
 
 def _seed_aggregate(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     r"""Group finished cells by base label into across-seed statistics: n, and the mean / SD / CV of the
-    primary val PPL. A single-seed base reports n=1, SD=0. Sorted by mean PPL; bases with no finite PPL
-    are dropped. The honest endpoint for reading a sub-3-percent ablation effect against seed noise."""
+    primary val PPL. A single-seed base reports n=1 with SD = CV = NaN: its seed variance is unknown,
+    not zero. Sorted by mean PPL; bases with no finite PPL are dropped. The honest endpoint for
+    reading a sub-3-percent ablation effect against seed noise."""
     groups: Dict[str, List[float]] = {}
     for r in rows:
         ppl = _as_float(r.get("primary_val_ppl"))
@@ -4240,7 +4248,7 @@ def _seed_aggregate(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for base, vals in groups.items():
         n = len(vals)
         mean = sum(vals) / n
-        sd = (sum((v - mean) ** 2 for v in vals) / (n - 1)) ** 0.5 if n > 1 else 0.0
+        sd = (sum((v - mean) ** 2 for v in vals) / (n - 1)) ** 0.5 if n > 1 else float("nan")
         agg.append({"label": base, "n": n, "mean": mean, "sd": sd,
                     "cv": (sd / mean) if mean > 0 else float("nan")})
     return sorted(agg, key=lambda d: d["mean"])
@@ -4568,8 +4576,14 @@ def _plot_seed_aggregate(sweep_dir: Path, fig_dir: Path) -> None:
         return
     y = list(range(len(agg)))
     fig, ax = plt.subplots(figsize=(7, 0.5 * len(agg) + 1.5))
-    ax.errorbar([a["mean"] for a in agg], y, xerr=[a["sd"] for a in agg], fmt="o",
-                color="#0072B2", ecolor="#888888", capsize=3)
+    multi = [i for i, a in enumerate(agg) if a["n"] > 1]
+    single = [i for i, a in enumerate(agg) if a["n"] == 1]
+    ax.errorbar([agg[i]["mean"] for i in multi], multi, xerr=[agg[i]["sd"] for i in multi],
+                fmt="o", color="#0072B2", ecolor="#888888", capsize=3, label="n >= 2: mean $\\pm$ 1 SD")
+    if single:                                   # unknown seed variance: no error bar, distinct marker
+        ax.plot([agg[i]["mean"] for i in single], single, linestyle="none", marker="D",
+                markerfacecolor="none", color="#D55E00", label="n = 1: single seed, SD unknown")
+        ax.legend(loc="best", fontsize=8)
     ax.set_yticks(y)
     ax.set_yticklabels([f"{a['label']} (n={a['n']})" for a in agg])
     ax.invert_yaxis()

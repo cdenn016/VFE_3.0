@@ -63,7 +63,8 @@ from vfe3.train import _fmt_tau, evaluate, train
 # training type kept, the corpus's own <unk> marker at id 0). The size is MEASURED for the pinned
 # revision, not the 267735 quoted for the original release. NOTE it is a much larger vocabulary:
 # phi_embed alone costs V * n_gen parameters, so at the shipped K=20/H=2 shape the model grows
-# ~5.3x (13.1M -> 69.9M). Lower it by rebuilding with `--min-count N` to drop rare types.
+# ~5.3x (13.1M -> 69.9M). Lower it by setting MIN_COUNT in build_wikitext103_word_cache.py and
+# rebuilding, which drops rare types.
 DATASET = "wikitext-103"
 
 # Cap the *training* stream for fast smoke runs (the validation split is always read
@@ -82,8 +83,8 @@ SEEDS    = 6,#[6,23,54,66,122]        # 54 is best seed so far; must list at lea
 # DATA_SEED (EXP-1 variance floor): when set to an int, the TRAIN loader's shuffle order is fixed to
 # this seed via an explicit generator, INDEPENDENT of the per-run model seed -- so a multi-seed run
 # shares ONE batch order across seeds and the measured across-seed SD is init+optimization variance,
-# NOT data-order noise. None (default) keeps the legacy behavior (shuffle drawn from the global RNG,
-# which the post-build reseed pins to cfg.seed -- byte-identical to before, reproducible vs ablation.py).
+# NOT data-order noise. None seeds the train generator from each run's cfg.seed instead (a per-seed
+# batch order with a resumable cursor, mirroring ablation._effective_data_seed).
 DATA_SEED = 3
 
 # Where each run's artifacts go: vfe3_runs/<timestamp>_<label>/ while training (config.json,
@@ -456,6 +457,12 @@ def _validated_data_seed() -> Optional[int]:
     return DATA_SEED
 
 
+def _effective_data_seed(cfg: VFE3Config) -> int:
+    """Return DATA_SEED, or the run's own ``cfg.seed`` when DATA_SEED is None."""
+    data_seed = _validated_data_seed()
+    return cfg.seed if data_seed is None else data_seed
+
+
 def _select_loader(
     dataset: str,
     cfg:     VFE3Config,
@@ -481,10 +488,10 @@ def _select_loader(
     """
     is_train = (split == "train")
     cap = MAX_TOKENS if is_train else None
-    # Fix the TRAIN shuffle order across seeds (EXP-1) only when DATA_SEED is set; None -> no generator
-    # -> legacy global-RNG shuffle (byte-identical). Val/test do not shuffle, so a generator is moot there.
-    data_seed = _validated_data_seed()
-    gen = torch.Generator().manual_seed(data_seed) if (is_train and data_seed is not None) else None
+    # The TRAIN shuffle always draws from an explicit generator, so train() can checkpoint and restore
+    # its data cursor: DATA_SEED fixes one order across seeds (EXP-1), None gives each run its own
+    # cfg.seed order. Val/test do not shuffle, so a generator is moot there.
+    gen = torch.Generator().manual_seed(_effective_data_seed(cfg)) if is_train else None
     return make_dataloader(dataset, split, cfg.max_seq_len, cfg.batch_size,
                            shuffle=is_train, drop_last=is_train, max_tokens=cap,
                            stride=(None if is_train else cfg.eval_stride),
@@ -605,6 +612,13 @@ def _run_once(
     from vfe3.run_artifacts import RunArtifacts, finalize_run
 
     cfg = VFE3Config(**{**config, "seed": seed})         # per-run seed override (config `seed` is the default)
+    # Always shown, unlike the env-gated ConfigNotice: every setting this launcher names explicitly
+    # that no active path reads under the resolved config, with the structural reason.
+    inert = {name: reason for name, reason in cfg.inactive_fields().items() if name in config}
+    if inert:
+        logger.info("Inactive launcher settings under this config (read by no active path):\n%s",
+                    "\n".join(f"  - {name}={getattr(cfg, name)!r}: {reason}"
+                              for name, reason in inert.items()))
     seed_everything(cfg.seed, deterministic=cfg.deterministic)
     model = VFEModel(cfg).to(DEVICE)
     train_loader = _select_loader(DATASET, cfg, split="train")
@@ -637,13 +651,12 @@ def _run_once(
             full_corpus_tokens = None
     logger.info(_banner(model, cfg, DATASET, DEVICE, cfg.max_steps,
                         train_loader=train_loader, full_corpus_tokens=full_corpus_tokens))
-    # Reseed AFTER model construction so the train data-shuffle order does NOT depend on the
-    # config-dependent amount of global RNG VFEModel(cfg) consumes at init. make_dataloader builds
-    # the train loader with no explicit generator, so its RandomSampler draws each epoch permutation
-    # from the GLOBAL RNG at the first iter(loader) inside train(); leaving the RNG model-advanced
-    # here would make this entry point train on a DIFFERENT batch order than ablation.py for an
-    # identical config+seed (model init itself is already identical). Mirrors ablation.run_single's
-    # post-build reseed so the two entry points reproduce each other.
+    # Reseed AFTER model construction so every later global-RNG draw does NOT depend on the
+    # config-dependent amount of global RNG VFEModel(cfg) consumes at init. The train shuffle has
+    # its own explicit generator (see _select_loader); the remaining global draws inside train()
+    # would otherwise differ from ablation.py for an identical config+seed (model init itself is
+    # already identical). Mirrors ablation.run_single's post-build reseed so the two entry points
+    # reproduce each other.
     seed_everything(cfg.seed, deterministic=cfg.deterministic)
     t0 = time.perf_counter()
     final_validation: Dict[str, Optional[float]] = {}
@@ -692,7 +705,7 @@ def _run_once(
             val_loader=val_loader,
             test_loader=test_loader,
             losses=losses,
-            data_seed=DATA_SEED,
+            data_seed=_effective_data_seed(cfg),
             max_tokens=MAX_TOKENS,
             tokenizer_tag=_tokenizer_tag(DATASET),
             device=torch.device(DEVICE),
@@ -715,6 +728,13 @@ def _resolve_seeds(
     config_seed = run_config.get("seed")
     if type(config_seed) is not int or config_seed < 0:
         raise ValueError(f"config seed must be an exact non-negative integer, got {config_seed!r}")
+    # A resumed run restores the checkpoint's weights, optimizer, RNG and data cursor, so every
+    # seed would continue the SAME run while its folder carries a different seed label. The
+    # resolved list always has NUM_RUNS entries.
+    if run_config.get("resume_from") is not None and num_runs > 1:
+        raise ValueError(
+            "resume_from continues one checkpointed run and cannot be combined with more than one "
+            f"seed (NUM_RUNS={num_runs}); set NUM_RUNS=1")
     if seeds:
         if any(type(seed) is not int or seed < 0 for seed in seeds):
             raise ValueError("SEEDS must contain exact non-negative integers")

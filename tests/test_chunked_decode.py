@@ -133,8 +133,10 @@ def test_chunked_forward_loss_matches_diagonal_forward_loss():
     out = ch(tokens, targets)
     logits_ch, loss_ch, ce_ch = out
     assert logits_ch is None                               # fused path forms no (B,N,V) logits
-    assert torch.allclose(loss_ch, loss_full, atol=1e-3)
-    assert torch.allclose(ce_ch, ce_full, atol=1e-3)
+    # Under the default decode_av_precision='fp64' the fused chunked CE keeps float64 while
+    # model.forward's dense branch casts to float32; compare values across that dtype boundary.
+    assert torch.allclose(loss_ch.to(loss_full.dtype), loss_full, atol=1e-3)
+    assert torch.allclose(ce_ch.to(ce_full.dtype), ce_full, atol=1e-3)
 
 
 def test_chunked_inference_targets_none_returns_full_logits():

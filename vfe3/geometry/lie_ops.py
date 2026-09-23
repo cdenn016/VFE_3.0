@@ -698,13 +698,26 @@ def _retract_core(
     generators:     Optional[torch.Tensor] = None,
     gram_pinv_:     Optional[torch.Tensor] = None,
     block_dims:     Optional[List[int]]    = None,
+    residual_max:   Optional[float]        = None,  # opt-in BCH-to-group-product residual gate
 ) -> torch.Tensor:
-    r"""Shared retraction: scale -> trust-region clamp -> compose -> max-norm clamp.
+    r"""Shared retraction: scale -> trust-region clamp -> compose -> step-bounding norm cap.
 
       update   = clamp_||.|| ( step_size * delta_phi , trust_region )
       phi_new  = compose(phi, update; mode, order)
-      phi_new <- clamp_||.|| ( phi_new , max_norm )
-    Trust region and max norm are applied to the coordinate-vector norm.
+      c        = max( max_norm , ||phi|| )                    (per row)
+      phi_new <- clamp_||.|| ( phi_new , c )
+    Trust region and cap are applied to the coordinate-vector norm.
+
+    The cap bounds the STEP, not the base point (audit 2026-09-23 #7). With the former cap
+    ``c = max_norm``, a frame already outside the ball was rescaled onto it at ANY step size, so
+    :math:`R_\phi(0) \ne \phi` and the retraction axiom (Absil, Mahony and Sepulchre 2008,
+    Def. 4.1.1) failed. With ``c = max(max_norm, ||phi||)`` a zero step returns ``phi`` (exactly
+    for the euclidean and compact-block BCH compositions; to the ``extract_phi`` projection
+    roundoff for the dense BCH composition), rows inside the ball keep ``dR(0) = id``, and a row
+    outside the ball can move tangentially or inward but never outward. The retractions have no
+    caller that relies on the former point projection: the only production caller is the E-step
+    phi retraction, and the public ``retract_glk``/``retract_son`` contracts (a step from inside the
+    ball saturates at ``max_norm``) are unchanged.
     """
     update = step_size * delta_phi
     if trust_region is not None and trust_region > 0:
@@ -720,13 +733,18 @@ def _retract_core(
             gram_pinv_=gram_pinv_,
             block_dims=block_dims,
             compact_blocks=True,
+            residual_max=residual_max,
         )
     else:
         phi_new = compose_phi(phi, update, generators, order=order, mode=mode,
-                              gram_pinv_=gram_pinv_)
+                              gram_pinv_=gram_pinv_, residual_max=residual_max)
     if max_norm is not None and max_norm > 0:
         n_norm = phi_new.norm(dim=-1, keepdim=True)
-        phi_new = torch.where(n_norm > max_norm, phi_new * (max_norm / (n_norm + eps)), phi_new)
+        cap = phi.norm(dim=-1, keepdim=True).clamp(min=max_norm)          # max(max_norm, ||phi||)
+        outside = n_norm > cap
+        # The denominator is n_norm > cap > 0 on the rescaled rows and cap on the others, so both
+        # torch.where branches stay finite (no eps, whose bias would move a zero-step exterior row).
+        phi_new = torch.where(outside, phi_new * (cap / torch.where(outside, n_norm, cap)), phi_new)
     return phi_new
 
 
@@ -746,13 +764,14 @@ def retract_glk(
     compact_blocks: bool                   = False,
     gram_pinv_:     Optional[torch.Tensor] = None,
     block_dims:     Optional[List[int]]    = None,
+    residual_max:   Optional[float]        = None,   # opt-in BCH-to-group-product residual gate
 ) -> torch.Tensor:
     r"""GL(K) retraction (no det control here; the dispatcher applies it)."""
     return _retract_core(
         phi, delta_phi, step_size=step_size, trust_region=trust_region,
         max_norm=max_norm, eps=eps, order=order, mode=mode,
         compact_blocks=compact_blocks, generators=generators, gram_pinv_=gram_pinv_,
-        block_dims=block_dims,
+        block_dims=block_dims, residual_max=residual_max,
     )
 
 
@@ -770,12 +789,13 @@ def retract_son(
     order:        int   = 4,
     mode:         str   = "euclidean",
     gram_pinv_:   Optional[torch.Tensor] = None,
+    residual_max: Optional[float]        = None,   # opt-in BCH-to-group-product residual gate
 ) -> torch.Tensor:
     r"""SO(N) retraction. det(exp) = 1 automatic (skew generators)."""
     return _retract_core(
         phi, delta_phi, step_size=step_size, trust_region=trust_region,
         max_norm=max_norm, eps=eps, order=order, mode=mode,
-        generators=generators, gram_pinv_=gram_pinv_,
+        generators=generators, gram_pinv_=gram_pinv_, residual_max=residual_max,
     )
 
 

@@ -25,10 +25,14 @@ from vfe3.train import (
 
 def test_optimizer_groups_priors_by_m_lr():
     # A prior-bank decoder has no output_proj_weight group, so the four prior tables map to
-    # exactly four LR groups (linear decode adds an output-projection group).
+    # exactly four LR groups (linear decode adds an output-projection group). The block MLP, the
+    # untied decode tables and the affine block LayerNorm (all on by default) each add their own
+    # group, so they are pinned off to isolate the prior-table grouping.
     cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2,
                      m_p_mu_lr=0.01, m_p_sigma_lr=0.002, m_phi_lr=0.005,
-                     decode_mode="diagonal_chunked")
+                     decode_mode="diagonal_chunked",
+                     use_block_mlp=False, untie_decode_bank=False,
+                     norm_type_block="none", layernorm_affine=False)
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
     lrs = sorted(g["lr"] for g in opt.param_groups)

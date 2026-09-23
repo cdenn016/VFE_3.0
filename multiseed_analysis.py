@@ -949,9 +949,11 @@ def _write_md(path: Path, root: Path, seeds, scalars, per_layer) -> None:
     path.write_text("\n".join(L), encoding="utf-8")
 
 
-def _emit_figures(root: Path, scalars, curves, per_layer) -> None:
+def _emit_figures(root: Path, scalars, curves, per_layer,
+                  data_order: Optional[Mapping[str, Any]] = None) -> None:
     r"""Write the full figure set into ``root/figures``; each figure is best-effort (a plotting /
-    dependency error is logged and skipped), mirroring the rest of the figure suite."""
+    dependency error is logged and skipped), mirroring the rest of the figure suite. ``data_order``
+    (the request design's ``data_order`` record) sets the noise-band caption."""
     try:
         from vfe3.viz import figures as figs
     except Exception as exc:                                      # matplotlib optional / headless
@@ -973,7 +975,9 @@ def _emit_figures(root: Path, scalars, curves, per_layer) -> None:
     key = CONFIG["key"]
     if key in scalars:
         out = fig_dir / f"noise_band__{_slug(key)}.png"
-        _try(lambda: figs.plot_ppl_noise_band(scalars[key], label=key, path=str(out)), out)
+        order_status = data_order.get("status") if isinstance(data_order, Mapping) else None
+        _try(lambda: figs.plot_ppl_noise_band(scalars[key], label=key,
+                                              data_order_status=order_status, path=str(out)), out)
 
     out = fig_dir / "scalar_cv_summary.png"
     _try(lambda: figs.plot_scalar_cv_summary(scalars, path=str(out)), out)
@@ -1133,7 +1137,7 @@ def main() -> int:
         print(f"  data    -> {root / name}")
 
     if publication_complete:
-        _emit_figures(root, scalars, curves, per_layer)
+        _emit_figures(root, scalars, curves, per_layer, request_design["data_order"])
     return 0 if publication_complete else 1
 
 

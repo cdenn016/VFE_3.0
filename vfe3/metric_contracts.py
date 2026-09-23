@@ -4,6 +4,11 @@ from __future__ import annotations
 import math
 from numbers import Real
 
+# A scaling power law is reported with R^2, an exponent CI, or a lack-of-fit verdict only from this
+# many distinct sizes. Two sizes give R^2 = 1 exactly, and three leave at most one residual degree of
+# freedom for the two-parameter law (none for the offset law), so any monotone curve passes.
+SCALING_MIN_TESTABLE_SIZES = 4
+
 
 def perplexity_from_ce(ce: float) -> float:
     """Return the exact image ``exp(CE)``; finite-CE overflow is positive infinity."""

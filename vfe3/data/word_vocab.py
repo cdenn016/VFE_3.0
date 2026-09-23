@@ -25,6 +25,8 @@ size knob through ``min_count``.
 """
 
 import json
+import os
+import tempfile
 from collections import Counter
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -147,7 +149,12 @@ class WordVocabulary:
         return n_tokens, n_oov
 
     def save(self, path: Path) -> None:
-        """Write the vocabulary as JSON, with the schema and cutoff it was built at."""
+        """Write the vocabulary as JSON, with the schema and cutoff it was built at.
+
+        The write is atomic: the payload goes to a sibling temporary file that ``os.replace``
+        publishes, so a reader never observes a partially written table and a failed write leaves
+        any previous sidecar untouched.
+        """
         payload = {
             "schema_version": VOCAB_SCHEMA_VERSION,
             "tokenizer": "word",
@@ -155,8 +162,18 @@ class WordVocabulary:
             "vocab_size": self.vocab_size,
             "words": list(self.words),
         }
-        Path(path).write_text(
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        target = Path(path)
+        handle, temporary = tempfile.mkstemp(
+            dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                stream.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, target)
+        except BaseException:
+            Path(temporary).unlink(missing_ok=True)
+            raise
 
     @classmethod
     def load(cls, path: Path) -> "WordVocabulary":

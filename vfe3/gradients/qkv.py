@@ -248,7 +248,14 @@ def qkv_filtering_gradients(
                 value_frame.forward, value_frame.inverse, sum(dims))
                 if value_frame.block_diagonal else FactoredTransport(
                     value_frame.forward, value_frame.inverse, dims))
-        values = transport_mean(omega_work, relational_operators.apply_content(source_mu, value_frame))
+        # Value gauge: under RoPE with on_value=False the value link is the UN-rotated base
+        # transport, values_ij = U_i O T U_j^{-1} mu_j, exactly as the predictive route and the
+        # transported oracle's value-gauge coupling energy (gradients/oracle.py) use it; the router
+        # score below still reads the rotated frame. Mean and covariance share this value transport.
+        value_omega = (omega_work.base
+                       if isinstance(omega_work, RopeTransport) and not omega_work.on_value
+                       else omega_work)
+        values = transport_mean(value_omega, relational_operators.apply_content(source_mu, value_frame))  # (..., N, N, K)
         transport_sigma = (torch.diag_embed(source_sigma)
                            if pair_family == "gaussian_full" and source_sigma.ndim == source_mu.ndim
                            else source_sigma)
@@ -261,12 +268,12 @@ def qkv_filtering_gradients(
                 *source_mu.shape[:-2], mu.shape[-2], source_mu.shape[-2], H, d, d)
         else:
             sigma_t = (transport_covariance_head_blocks(
-                omega_work, transport_sigma, diagonal_out=False, marginal_blocks=dims,
+                value_omega, transport_sigma, diagonal_out=False, marginal_blocks=dims,
                 retain_full_precision=(full_cov_kl_precision == "fp64"))
                 if pair_family == "gaussian_full" else None)
         if sigma_t is None:
             sigma_t = transport_covariance(
-                omega_work, transport_sigma, diagonal_out=(pair_family != "gaussian_full"),
+                value_omega, transport_sigma, diagonal_out=(pair_family != "gaussian_full"),
                 marginal_blocks=dims)
         if analytic:
             sigma_t_safe = sigma_t.clamp(min=eps)

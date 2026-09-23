@@ -58,9 +58,10 @@ def test_encode_is_unchanged_by_decoder_mode():
 
 def test_linear_mode_uses_no_nn_linear_module():
     # The exception is a single learned weight matrix (nn.Parameter), NOT an nn.Linear/MLP.
+    # The block MLP (on by default) is a separate opt-in nn surface, so it is pinned off here.
     import torch.nn as nn
     cfg = VFE3Config(vocab_size=10, embed_dim=4, n_heads=2, max_seq_len=3,
-                     decode_mode="linear")
+                     decode_mode="linear", use_block_mlp=False)
     model = VFEModel(cfg)
     for m in model.modules():
         assert not isinstance(m, (nn.Linear, nn.MultiheadAttention, nn.RNNBase, nn.Conv1d))

@@ -53,6 +53,27 @@ def _bank(*, renyi_order=0.5, **kw):
     return model, model.prior_bank
 
 
+def _decode_mu_grad(pb):
+    r"""Gradient of the (V, K) mean table the decode actually scores against.
+
+    ``_decode_mu_table()`` is ``decode_mu_embed`` under the default ``untie_decode_bank=True`` and
+    ``mu_embed`` on a tied bank; the fused CE on precomputed (mu, sigma) reaches only that table.
+    """
+    return pb._decode_mu_table().grad
+
+
+def _non_default_decode_av_precision():
+    r"""A ``decode_av_precision`` value that differs from the dataclass default.
+
+    Inert-setting notices display only non-default values; activity itself is the structural
+    ``inactive_fields()`` map, which does not depend on the value.
+    """
+    from vfe3.config import VFE3Config
+
+    default = VFE3Config.__dataclass_fields__["decode_av_precision"].default
+    return "fp32" if default != "fp32" else "fp64"
+
+
 def _inputs(model):
     B, N, K = 2, 5, model.cfg.embed_dim
     g = torch.Generator().manual_seed(0)
@@ -186,7 +207,7 @@ def test_narrowed_slices_match_the_unnarrowed_gradient(monkeypatch, spy):
     def _grad():
         pb.zero_grad(set_to_none=True)
         pb.decode_ce_family_chunked(mu, sigma, targets).backward()
-        return pb.mu_embed.grad.clone()
+        return _decode_mu_grad(pb).clone()
 
     wide = _grad()
     n_wide = len(spy)
@@ -397,12 +418,16 @@ def test_decode_av_precision_is_reported_inert_on_the_family_route():
 
     base = dict(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                 family="gaussian_full", gauge_group="block_glk")
+    non_default = _non_default_decode_av_precision()
 
     def _inert_mentions(mode, **overrides):
         with warnings.catch_warnings(record=True) as record:
             warnings.simplefilter("always")
-            VFE3Config(**base, decode_mode=mode, decode_av_precision="fp64", **overrides)
-        return any("decode_av_precision" in str(r.message) for r in record)
+            cfg = VFE3Config(**base, decode_mode=mode, decode_av_precision=non_default, **overrides)
+        shown = any("decode_av_precision" in str(r.message) for r in record)
+        structural = "decode_av_precision" in cfg.inactive_fields()
+        assert shown == structural, f"{mode}: notice {shown} != inactive_fields() {structural}"
+        return structural
 
     canonical = dict(renyi_order=1.0, full_cov_kl_precision="fp32_escalate")
     assert not _inert_mentions("family_chunked", **canonical)
@@ -443,12 +468,14 @@ def test_same_name_family_chunked_override_keeps_decode_av_precision_inert():
     )(generic_logits)
     try:
         with pytest.warns(Warning) as record:
-            VFE3Config(
+            cfg = VFE3Config(
                 vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                 family="gaussian_full", gauge_group="block_glk",
                 decode_mode="family_chunked", renyi_order=1.0,
-                full_cov_kl_precision="fp32_escalate", decode_av_precision="fp64",
+                full_cov_kl_precision="fp32_escalate",
+                decode_av_precision=_non_default_decode_av_precision(),
             )
+        assert "decode_av_precision" in cfg.inactive_fields()
         assert any("decode_av_precision" in str(warning.message) for warning in record)
     finally:
         prior_bank.register_decode(
@@ -483,4 +510,4 @@ def test_forward_backward_is_finite_at_a_binding_ceiling(monkeypatch, multiple):
     ce.backward()
 
     assert torch.isfinite(ce)
-    assert torch.isfinite(pb.mu_embed.grad).all()
+    assert _decode_mu_grad(pb) is not None and torch.isfinite(_decode_mu_grad(pb)).all()

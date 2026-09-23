@@ -26,6 +26,7 @@ def _pure_cfg(mode, covariance="passthrough"):
         transport_mode="flat",
         pos_phi="none",
         pos_rotation="none",
+        norm_type_block="none",          # the default "layernorm" is not gauge-equivariant
         sigma_max=None,
         transport_chart_max_norm=12.0,
         e_phi_lr=0.0,

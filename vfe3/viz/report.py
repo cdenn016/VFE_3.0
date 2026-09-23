@@ -955,11 +955,15 @@ def generate_figures(
     _emit("reliability_diagram",
           lambda p: figs.plot_reliability_diagram(reliability, path=p),
           "reliability_diagram.png" in planned_figures)
+    # Frozen-at-encode covariance: tr Sigma is the input-token table variance, relabeled as such.
+    frozen_covariance = metrics.covariance_frozen_at_encode(cfg)
     _emit("sigma_stratified_error",
-          lambda p: figs.plot_sigma_stratified_error(ce_bank, path=p),
+          lambda p: figs.plot_sigma_stratified_error(
+              ce_bank, frozen_covariance=frozen_covariance, path=p),
           "sigma_stratified_error.png" in planned_figures)
     _emit("sigma_ce_scatter",
-          lambda p: figs.plot_sigma_ce_scatter(ce_bank, path=p),
+          lambda p: figs.plot_sigma_ce_scatter(
+              ce_bank, frozen_covariance=frozen_covariance, path=p),
           "sigma_ce_scatter.png" in planned_figures)
 
     # Per-layer metrics CSV (rows = inference depth): the metrics.csv is final-block-only, so this is

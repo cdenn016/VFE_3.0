@@ -144,7 +144,10 @@ def test_gradients_stay_finite_through_a_degenerate_position():
 
     pb.decode_ce_family_chunked(mu, sigma, targets).backward()
     assert mu.grad is not None and torch.isfinite(mu.grad).all()
-    assert torch.isfinite(pb.mu_embed.grad).all()
+    # The decode reads _decode_mu_table(): decode_mu_embed under the default untie_decode_bank=True,
+    # mu_embed on a tied bank. Its gradient is the one the decode CE reaches.
+    decode_mu_grad = pb._decode_mu_table().grad
+    assert decode_mu_grad is not None and torch.isfinite(decode_mu_grad).all()
 
 
 def test_logits_row_for_a_degenerate_position_is_finite_and_uniform():

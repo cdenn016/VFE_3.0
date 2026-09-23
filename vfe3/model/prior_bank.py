@@ -36,9 +36,10 @@ to EXACTLY (and under ``log_softmax``) on the canonical path.
 """
 
 import warnings
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Callable, Dict, FrozenSet, List, Mapping, Optional, Protocol, Tuple
+from typing import Callable, Dict, FrozenSet, Iterator, List, Mapping, Optional, Protocol, Tuple
 
 import torch
 import torch.utils.checkpoint as _checkpoint
@@ -308,6 +309,28 @@ def _decode_av_lhs(
     ], dim=-1)
 
 
+@contextmanager
+def _ieee_fp32_matmul() -> Iterator[None]:
+    r"""Run the enclosed fp32 GEMMs under IEEE fp32 (``"highest"``), then restore the process policy.
+
+    The a_v interval certificate bounds the fp32 inner product of length :math:`n = 2K` by
+    :math:`\gamma = (2n + 4)\,u\,\sum |l_k r_k|` with :math:`u` = ``torch.finfo(float32).eps``. That
+    bound holds only for IEEE fp32 multiplication; TF32 (``"high"``) or bf16 (``"medium"``) inputs
+    round to :math:`u = 2^{-10}` or :math:`2^{-7}` and void it, so the global
+    ``fp32_matmul_precision`` is pinned to ``"highest"`` here and restored on every exit path,
+    including exceptions.
+    """
+    previous = torch.get_float32_matmul_precision()
+    if previous == "highest":
+        yield
+        return
+    torch.set_float32_matmul_precision("highest")
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(previous)
+
+
 def _decode_av(
     sq:    torch.Tensor,                  # (..., N, K) query variances (diag(Sigma_q) for the full family)
     mc_q:  torch.Tensor,                  # (..., N, K) centered query means
@@ -343,9 +366,13 @@ def _decode_av(
         bias = (mc_v ** 2 * inv_v).sum(-1) + lsum
     else:
         bias = (mc_v ** 2 * inv_v * coord_delta).sum(-1) + lsum
-    out = lhs @ rhs.transpose(-1, -2) + bias
+    # The fp32 GEMMs run under IEEE fp32 whatever the process-global matmul policy, so the eps-based
+    # certificate below describes the arithmetic that actually ran. fp64 GEMMs ignore the policy.
+    with (_ieee_fp32_matmul() if lhs.dtype is torch.float32 else nullcontext()):
+        out = lhs @ rhs.transpose(-1, -2) + bias                                  # (..., N, Vc)
+        if sq.dtype is torch.float32 and precision == "fp32":
+            absolute_sum = lhs.abs() @ rhs.abs().transpose(-1, -2) + bias.abs()
     if sq.dtype is torch.float32 and precision == "fp32":
-        absolute_sum = lhs.abs() @ rhs.abs().transpose(-1, -2) + bias.abs()
         gamma = ((2.0 * lhs.shape[-1] + 4.0) * torch.finfo(out.dtype).eps)
         error_bound = gamma * absolute_sum
     else:
@@ -831,7 +858,8 @@ class PriorBank(nn.Module):
     pi_v = N(mu_v, exp(sigma_log_v)) with gauge frame phi_v. ``mu_embed`` and ``sigma_log_embed``
     are always allocated and are the ONLY belief prior. They are PRIORS (nn.Parameter), not a
     neural map: there is no nn.Linear/MLP/activation anywhere in this module. The learnable
-    scalar ``decode_log_scale`` tunes the decode temperature.
+    scalar ``decode_log_scale`` tunes the decode temperature; ``VFEModel`` freezes it when
+    ``decode_temperature_learned=False``, fixing tau_eff at its initialized value.
     """
 
     output_proj_weight: Optional[nn.Parameter]   # (V, K) linear-decode weight; None for prior-bank modes
@@ -1117,8 +1145,9 @@ class PriorBank(nn.Module):
         r"""The (V, K) mean table the DECODE boundary scores against: the untied decode table
         decode_mu_embed when untie_decode_bank created it, else the shared prior table
         (_prior_mu_table). Encode and the E-step self-coupling target always read the prior
-        table, so the untie toggle splits ONLY the decode readout. On the default (tied) path
-        this returns the identical tensor _prior_mu_table does -- byte-identical.
+        table, so the untie toggle splits ONLY the decode readout. On a tied bank
+        (untie_decode_bank=False; the default is untied) this returns the identical tensor
+        _prior_mu_table does -- byte-identical.
         """
         return self.decode_mu_embed if self.untie_decode_bank else self._prior_mu_table()
 

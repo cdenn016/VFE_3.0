@@ -275,11 +275,18 @@ def test_noncanonical_divergence_and_uninvertible_transport_fail_closed() -> Non
         ExactCongruenceDiagonalGaussian.coupling_energy(
             mu, sigma, mu, sigma, omega, divergence_family="jeffreys")
 
+    # Audit 2026-09-23 #6: an uncertified (query/key-split) vertex frame has no pair-transpose
+    # inverse, so it is inverted on the dense reference route rather than via the fast route.
     uncertified = FactoredTransport(
         exp_phi=torch.linalg.matrix_exp(torch.randn(n, k, k, dtype=torch.float64) * 0.3),
         exp_neg_phi=torch.linalg.matrix_exp(torch.randn(n, k, k, dtype=torch.float64) * 0.3),
         irrep_dims=[2, 2], same_frame_flat_cocycle=False)
-    with pytest.raises(TypeError, match="certified same-frame flat cocycle"):
+    assert torch.equal(
+        ExactCongruenceDiagonalGaussian.coupling_energy(mu, sigma, mu, sigma, uncertified),
+        ExactCongruenceDiagonalGaussian.coupling_energy(
+            mu, sigma, mu, sigma, uncertified.to_dense_omega()))
+    # Its dense factors are not block-diagonal, so a per-block energy still fails closed.
+    with pytest.raises(ValueError, match="block-diagonal dense transport"):
         ExactCongruenceDiagonalGaussian.coupling_energy(
             mu, sigma, mu, sigma, uncertified, irrep_dims=[2, 2])
 

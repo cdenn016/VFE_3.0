@@ -128,8 +128,10 @@ def test_build_group_forwards_cross_couplings():
     from vfe3.config import VFE3Config
     from vfe3.model.model import build_group
     base = build_group(VFE3Config(embed_dim=4, n_heads=2, gauge_group="block_glk"))
+    # Headless positional prior: the default per-head causal_alibi bias is fail-closed rejected
+    # once cross-coupling collapses the irreps to a single [K] block.
     coupled = build_group(VFE3Config(embed_dim=4, n_heads=2, gauge_group="block_glk",
-                                     cross_couplings=[(0, 1)]))
+                                     cross_couplings=[(0, 1)], beta_attention_prior="causal"))
     assert coupled.generators.shape[0] == base.generators.shape[0] + 4
     assert coupled.generators.shape[0] > base.generators.shape[0]   # strictly larger
     assert base.irrep_dims == [2, 2]
@@ -192,16 +194,21 @@ def test_full_model_logits_invariant_under_global_gauge():
     # end-to-end. Pure path chosen so the diagonal (V,K) sigma table can represent the gauge action:
     # so_k => g is ORTHOGONAL (g Sigma g^T = Sigma stays diagonal), Sigma = I, frames = identity (Omega = I),
     # family=gaussian_full (diagonal KL is NOT congruence-invariant), flat transport, pos_rotation='none',
-    # no head mixer, and a prior-bank decoder that co-transforms. Transforming mu_embed (tied,
-    # so it feeds BOTH the belief and the decode vocab prior) realizes the global gauge; the E-step still
-    # evolves non-trivial full covariances that transform by congruence.
+    # no head mixer, and a prior-bank decoder that co-transforms. Transforming every (V,K) mean table
+    # (mu_embed feeds the belief, and the decode vocab prior on a tied bank; the untied default adds
+    # decode_mu_embed) realizes the global gauge; the E-step still evolves non-trivial full
+    # covariances that transform by congruence. The fixed-basis seams now on by default are pinned
+    # off, since each breaks exact global-gauge invariance by construction: the block LayerNorm
+    # (non-equivariant registry entry), the coordinate block MLP, and the frozen-sigma E-step (which
+    # would leave the covariances untransformed rather than evolving them).
     from vfe3.config import VFE3Config
     from vfe3.model.model import VFEModel
 
     def _cfg(**over):
         base = dict(vocab_size=6, embed_dim=4, n_heads=1, max_seq_len=4, n_layers=1, n_e_steps=3,
                     gauge_group="so_k", family="gaussian_full", transport_mode="flat",
-                    pos_rotation="none", use_head_mixer=False, decode_mode="full_chunked")
+                    pos_rotation="none", use_head_mixer=False, decode_mode="full_chunked",
+                    norm_type_block="none", use_block_mlp=False, skip_belief_sigma_update=False)
         base.update(over)
         return VFE3Config(**base)
 
@@ -224,7 +231,9 @@ def test_full_model_logits_invariant_under_global_gauge():
         tok = torch.randint(0, 6, (1, 4), generator=torch.Generator().manual_seed(2))
         with torch.no_grad():
             logits0 = m(tok)[0].clone()
-            m.prior_bank.mu_embed.copy_(torch.einsum("kl,vl->vk", g, m.prior_bank.mu_embed))
+            for table in (m.prior_bank.mu_embed, getattr(m.prior_bank, "decode_mu_embed", None)):
+                if table is not None:                      # every (V,K) mean table the model holds
+                    table.copy_(torch.einsum("kl,vl->vk", g, table))
             logits1 = m(tok)[0].clone()
         return float((logits0 - logits1).abs().max())
 

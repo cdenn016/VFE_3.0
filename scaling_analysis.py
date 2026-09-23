@@ -9,7 +9,10 @@ and writes the scaling figures via ``vfe3.viz.figures``. There is no model re-ru
 edit ``CONFIG`` and run ``python scaling_analysis.py``.
 
 The y-axis is ``test_ce`` (nats/token), the canonical additive scaling quantity; perplexity is a
-nonlinear re-read. The x-axis is the recorded ``n_params`` (never a derived ``d^2`` proxy). Runs whose
+nonlinear re-read. The x-axis is the recorded ``n_params`` (never a derived ``d^2`` proxy); when the runs
+record ``n_non_embedding_params`` (total minus per-token / positional lookup tables, ~99% of ``n_params``
+at the scaling widths) the law is also fit against that axis. R^2, the exponent CI, and the lack-of-fit
+test are reported only from four distinct sizes; fewer leave the fit ``not_testable``. Runs whose
 ``test_ce`` is null (no test split) or non-positive are dropped before the log fit; the analysis warns
 if the harvested points span more than one ``data_sha256`` (mixed corpus) or ``git_sha`` (code drift),
 either of which confounds a frontier.
@@ -54,7 +57,11 @@ import numpy as np
 
 from vfe3.artifact_utils import canonical_json_sha256 as _canonical_json_sha256
 from vfe3.config import config_from_serialized
-from vfe3.metric_contracts import perplexity_matches_ce, target_blind_objective_interpretation  # noqa: E402
+from vfe3.metric_contracts import (  # noqa: E402
+    SCALING_MIN_TESTABLE_SIZES,
+    perplexity_matches_ce,
+    target_blind_objective_interpretation,
+)
 from vfe3.path_utils import portable_path_component_key
 from vfe3.viz.sweep_adapters import aggregate_validation_points, capacity_scaling_kwargs, pareto_frontier_kwargs
 from vfe3.run_artifacts import _write_json_atomic
@@ -77,12 +84,13 @@ CONFIG: Dict[str, Any] = {
     "input_dir":                       "vfe3_scaling_results",  # scaling.py output root and design
     "with_offset":                     True,                    # False -> A*N^-alpha; True -> E + A*N^-alpha
     "n_bootstrap":                     2000,                    # nested points-by-seeds bootstrap
-    "min_points":                      2,                       # sizes required for a per-route fit
+    "min_points":                      2,                       # sizes required for a per-route fit (R^2/CI need 4)
     "force_accept_code_identity_drift": False,                  # analysis-only; all other checks stay strict
 }
 
 _CSV_COLUMNS = [
-    "route", "scale_knob", "label", "seed", "n_params", "n_learnable_params", "embed_dim", "n_heads",
+    "route", "scale_knob", "label", "seed", "n_params", "n_learnable_params",
+    "n_non_embedding_params", "embed_dim", "n_heads",
     "n_gen", "gauge_group", "n_layers", "n_e_steps", "family", "divergence_family",
     "full_cov_kl_precision",
     "use_block_mlp", "block_mlp_mode", "block_mlp_covariance", "block_mlp_expansion",
@@ -462,6 +470,8 @@ def harvest(
             "artifact_verified": True,
             "n_params":    verified["n_params"],
             "n_learnable_params":      sp.get("n_learnable_params"),
+            # total minus per-token / positional lookup tables (absent on older runs)
+            "n_non_embedding_params":  sp.get("n_non_embedding_params"),
             "embed_dim":   effective_cfg.get("embed_dim"),
             "n_heads":     effective_cfg.get("n_heads"),
             "n_gen":       sp.get("n_gen", cell.get("n_gen")),
@@ -837,9 +847,17 @@ def _pooled_status(
     frontier:   Dict[str, Any],
 
     *,
-    has_fit:    bool,
-    n_routes:   int,
+    has_fit:          bool,
+    n_routes:         int,
+    n_distinct_sizes: int,
+    lack_of_fit:      Optional[Mapping[str, Any]],
 ) -> Tuple[str, List[str]]:
+    r"""Classify the pooled L(N) fit: provenance confounds first, then testability, then form.
+
+    ``not_testable`` below ``SCALING_MIN_TESTABLE_SIZES`` distinct sizes (R^2 and the CI are
+    withheld there); ``lack_of_fit`` when the pure-error F-test rejects the fitted law; ``clean``
+    only when the design is testable, the lack-of-fit test ran and did not reject, and the frontier
+    question is settled or moot."""
     if not has_fit:
         return "not_fitted", []
     reasons: List[str] = []
@@ -859,11 +877,86 @@ def _pooled_status(
         reasons.append("routes_diverge")
     if reasons:
         return "confounded", reasons
+    if n_distinct_sizes < SCALING_MIN_TESTABLE_SIZES:
+        return "not_testable", []
+    if lack_of_fit is not None and lack_of_fit.get("rejected") is True:
+        return "lack_of_fit", []
     if frontier.get("testable") and frontier.get("collapses") is None:
         return "unassessed", []
     if n_routes > 1 and not frontier.get("testable"):
         return "unassessed", []
+    if lack_of_fit is None or lack_of_fit.get("testable") is not True:
+        return "unassessed", []
     return "clean", []
+
+
+def _lack_of_fit_test(
+    points: List[Dict[str, Any]],
+    fit:    Mapping[str, Any],
+
+    *,
+    x_key:  str = "n_params",
+) -> Dict[str, Any]:
+    r"""Pure-error lack-of-fit F-test of a fitted L(N) law, in log-CE space.
+
+    Seeds at one distinct size are replicates. With :math:`y_{ij} = \log \mathrm{CE}` of seed j at
+    size i (:math:`n_i` seeds, m sizes, n observations), the fitted curve
+    :math:`\hat y_i = \log(E + A N_i^{-\alpha})` and p fitted parameters (2, or 3 with the offset),
+
+    .. math::
+        SS_{PE} = \sum_{ij} (y_{ij} - \bar y_i)^2, \quad
+        SS_{LOF} = \sum_i n_i (\bar y_i - \hat y_i)^2, \quad
+        F = \frac{SS_{LOF} / (m - p)}{SS_{PE} / (n - m)} \sim F_{m-p,\, n-m}
+
+    under the null that the law's form is right (Draper and Smith 1998, Sec. 2.1). The headline fit is
+    SEM-weighted, so the test is approximate; it is untestable without a residual degree of freedom
+    (m <= p) or without replicate seeds (n = m or zero pure error)."""
+    groups: Dict[float, List[float]] = {}
+    for p in points:
+        size = _as_float(p.get(x_key))
+        if not (np.isfinite(size) and size > 0.0):
+            continue
+        groups.setdefault(size, []).extend(
+            math.log(c) for c in (_as_float(v) for v in p.get("ce_seeds", ()))
+            if np.isfinite(c) and c > 0.0)
+    groups = {size: ys for size, ys in groups.items() if ys}
+    m = len(groups)
+    n = sum(len(ys) for ys in groups.values())
+    n_fit_parameters = 3 if fit.get("form") == "offset_power_law" else 2
+    df_lof, df_pe = m - n_fit_parameters, n - m
+    out: Dict[str, Any] = {"testable": False, "rejected": None, "df_lof": df_lof, "df_pe": df_pe,
+                           "n_fit_parameters": n_fit_parameters}
+    if df_lof < 1:
+        out["reason"] = "no residual degree of freedom beyond the fitted parameters"
+        return out
+    if df_pe < 1:
+        out["reason"] = "no replicate seeds (no pure-error estimate)"
+        return out
+    alpha, A, E = (_as_float(fit.get(key)) for key in ("alpha", "A", "E"))
+    ss_pe = ss_lof = 0.0
+    for size, ys in groups.items():
+        ybar = sum(ys) / len(ys)
+        ss_pe += sum((y - ybar) ** 2 for y in ys)
+        predicted = E + A * size ** (-alpha)
+        if not (np.isfinite(predicted) and predicted > 0.0):
+            out["reason"] = "fitted curve is not positive at a fitted size"
+            return out
+        ss_lof += len(ys) * (ybar - math.log(predicted)) ** 2
+    if ss_pe <= 0.0:
+        out["reason"] = "zero pure error across replicate seeds"
+        return out
+    F = (ss_lof / df_lof) / (ss_pe / df_pe)
+    try:
+        from scipy.stats import f as f_dist
+        p_value = float(f_dist.sf(F, df_lof, df_pe))
+    except Exception:
+        p_value = float("nan")
+    out.update({"F": float(F), "ss_lof": ss_lof, "ss_pe": ss_pe})
+    if not np.isfinite(p_value):
+        out["reason"] = "F distribution unavailable"
+        return out
+    out.update({"testable": True, "p_value": p_value, "rejected": p_value <= 0.05})
+    return out
 
 
 def _frontier_verdict(frontier: Dict[str, Any]) -> str:
@@ -897,6 +990,7 @@ def aggregate_points(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not ce:
             continue
         npars = [_as_float(g["n_params"]) for g in grp if np.isfinite(_as_float(g["n_params"]))]
+        non_embedding = {_as_float(g.get("n_non_embedding_params")) for g in grp}
         # C2/EXP-5: per-seed converged final E-step F/token and named bit metrics.
         f_seeds = [c for c in (_as_float(g.get("estep_final_f_per_token")) for g in grp) if np.isfinite(c)]
         bits_per_token = [
@@ -909,6 +1003,11 @@ def aggregate_points(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         points.append({
             "route": route, "label": label, "scale_knob": grp[0]["scale_knob"],
             "n_params": npars[0] if npars else float("nan"),
+            # one finite value shared by every seed, else NaN (the non-embedding fit is withheld)
+            "n_non_embedding_params": (
+                next(iter(non_embedding))
+                if len(non_embedding) == 1 and np.isfinite(next(iter(non_embedding)))
+                else float("nan")),
             "embed_dim": _as_float(grp[0].get("embed_dim")),         # F1/EXP-6 K axis
             "n_gen": _as_float(grp[0].get("n_gen")),
             "tokens_seen": _as_float(grp[0].get("tokens_seen")),
@@ -1190,7 +1289,8 @@ def analyze() -> None:
         "n_fitted_param_points": len(fit_param_points),
         "design": design,
         "provenance": provenance, "pooled_fit": None, "pooled_fit_status": "not_fitted",
-        "pooled_fit_confounds": [], "per_route": {}, "frontier_collapse": frontier,
+        "pooled_fit_confounds": [], "pooled_fit_lack_of_fit": None,
+        "pooled_fit_non_embedding": None, "per_route": {}, "frontier_collapse": frontier,
         "route_notes": route_notes, "estep_structural": None,
     }
 
@@ -1218,29 +1318,73 @@ def analyze() -> None:
     summary["n_harvested_param_sizes"] = n_harvested_param_sizes
     summary["n_fit_param_sizes"] = n_fit_param_sizes
     summary["n_distinct_param_sizes"] = n_fit_param_sizes
+    # Below SCALING_MIN_TESTABLE_SIZES the law is still fit (alpha is a descriptive slope), but R^2
+    # and the CI are withheld and the status reads 'not_testable' (two sizes give R^2 = 1 exactly).
+    fit_testable = n_fit_param_sizes >= SCALING_MIN_TESTABLE_SIZES
+    lack_of_fit: Optional[Dict[str, Any]] = None
     if n_fit_param_sizes >= 2:
         from vfe3.viz.figures import _fit_power_law
         xs = np.array([p["n_params"] for p in fit_param_points], dtype=float)
         ys = np.array([p["ce_mean"] for p in fit_param_points], dtype=float)
         fit = _fit_power_law(xs, ys, weights=fit_weights, with_offset=CONFIG["with_offset"])
-        _a_hat, lo, hi = bootstrap_exponent_ci(
-            fit_param_points,
-            weights=fit_weights,
-            n_boot=CONFIG["n_bootstrap"],
-            with_offset=CONFIG["with_offset"],
-        )
+        lo = hi = None
+        if fit_testable:
+            _a_hat, lo, hi = bootstrap_exponent_ci(
+                fit_param_points,
+                weights=fit_weights,
+                n_boot=CONFIG["n_bootstrap"],
+                with_offset=CONFIG["with_offset"],
+            )
         if np.isfinite(_as_float(fit.get("alpha"))):
-            print(f"\nPOOLED L(N) fit ({fit['form']}):  alpha = {fit['alpha']:.4f}  "
-                  f"[95% CI {lo:.4f}, {hi:.4f}]   A = {fit['A']:.4g}   "
-                  + (f"E = {fit['E']:.4f}   " if fit["form"] == "offset_power_law" else "")
-                  + f"R^2 = {fit['r2']:.4f}   over {fit['n_distinct_sizes']} distinct sizes")
+            n_fit_parameters = 3 if fit["form"] == "offset_power_law" else 2
+            if fit_testable:
+                lack_of_fit = _lack_of_fit_test(fit_param_points, fit)
+                print(f"\nPOOLED L(N) fit ({fit['form']}):  alpha = {fit['alpha']:.4f}  "
+                      f"[95% CI {lo:.4f}, {hi:.4f}]   A = {fit['A']:.4g}   "
+                      + (f"E = {fit['E']:.4f}   " if fit["form"] == "offset_power_law" else "")
+                      + f"R^2 = {fit['r2']:.4f}   over {fit['n_distinct_sizes']} distinct sizes")
+                if lack_of_fit.get("testable"):
+                    print(f"  lack-of-fit F({lack_of_fit['df_lof']},{lack_of_fit['df_pe']}) = "
+                          f"{lack_of_fit['F']:.3f}  p = {lack_of_fit['p_value']:.4g}")
+                else:
+                    print(f"  lack-of-fit test not testable ({lack_of_fit.get('reason')})")
+            else:
+                print(f"\nPOOLED L(N) fit ({fit['form']}):  alpha = {fit['alpha']:.4f}   "
+                      f"A = {fit['A']:.4g}   over {fit['n_distinct_sizes']} distinct sizes -- "
+                      f"NOT TESTABLE (< {SCALING_MIN_TESTABLE_SIZES} sizes): R^2 and CI withheld")
             summary["pooled_fit"] = {
-                "form": fit["form"], "alpha": fit["alpha"], "alpha_ci": [lo, hi],
-                "A": fit["A"], "E": fit.get("E"), "r2": fit["r2"], "n_points": fit["n_points"],
-                "n_distinct_sizes": fit["n_distinct_sizes"],
+                "form": fit["form"], "alpha": fit["alpha"],
+                "alpha_ci": [lo, hi] if fit_testable else None,
+                "A": fit["A"], "E": fit.get("E"), "r2": fit["r2"] if fit_testable else None,
+                "n_points": fit["n_points"], "n_distinct_sizes": fit["n_distinct_sizes"],
+                "n_fit_parameters": n_fit_parameters,
+                "residual_dof": int(fit["n_distinct_sizes"]) - n_fit_parameters,
+                "testable": fit_testable,
             }
+            summary["pooled_fit_lack_of_fit"] = lack_of_fit
         else:
             print("\n(pooled L(N) estimator returned no finite exponent; no estimate persisted)")
+        # ---- the same law against NON-EMBEDDING parameters (total minus per-token / positional
+        # lookup tables, which are ~99% of N at the scaling widths; Kaplan et al. 2020) ----
+        non_embedding = np.array([_as_float(p.get("n_non_embedding_params"))
+                                  for p in fit_param_points], dtype=float)
+        if (non_embedding.size and np.all(np.isfinite(non_embedding)) and np.all(non_embedding > 0.0)
+                and np.unique(non_embedding).size >= 2):
+            ne_fit = _fit_power_law(non_embedding, ys, weights=fit_weights,
+                                    with_offset=CONFIG["with_offset"])
+            ne_testable = int(ne_fit["n_distinct_sizes"]) >= SCALING_MIN_TESTABLE_SIZES
+            if np.isfinite(_as_float(ne_fit.get("alpha"))):
+                print(f"NON-EMBEDDING L(N) fit ({ne_fit['form']}):  alpha = {ne_fit['alpha']:.4f}   "
+                      + (f"R^2 = {ne_fit['r2']:.4f}   " if ne_testable
+                         else f"R^2 withheld (< {SCALING_MIN_TESTABLE_SIZES} sizes)   ")
+                      + f"over {ne_fit['n_distinct_sizes']} distinct sizes")
+                summary["pooled_fit_non_embedding"] = {
+                    "x_axis": "n_non_embedding_params", "form": ne_fit["form"],
+                    "alpha": ne_fit["alpha"], "A": ne_fit["A"], "E": ne_fit.get("E"),
+                    "r2": ne_fit["r2"] if ne_testable else None,
+                    "n_points": ne_fit["n_points"], "n_distinct_sizes": ne_fit["n_distinct_sizes"],
+                    "testable": ne_testable,
+                }
         # ---- per-route fits use exact slices of the one pooled SEM-weight vector ----
         if routes:
             print("\nper-route exponents:")
@@ -1257,12 +1401,16 @@ def analyze() -> None:
                         print(f"  {r:<14} (estimator returned no finite exponent; no estimate persisted)")
                         continue
                     display = f"{r} [structural ablation]" if r in route_notes else r
-                    print(f"  {display:<36} alpha={fr['alpha']:.4f}  R^2={fr['r2']:.4f}  "
+                    route_testable = int(fr["n_distinct_sizes"]) >= SCALING_MIN_TESTABLE_SIZES
+                    r2_text = (f"R^2={fr['r2']:.4f}" if route_testable
+                               else f"R^2 not testable (< {SCALING_MIN_TESTABLE_SIZES} sizes)")
+                    print(f"  {display:<36} alpha={fr['alpha']:.4f}  {r2_text}  "
                           f"({fr['n_distinct_sizes']} distinct sizes; {fr['form']})")
                     summary["per_route"][r] = {
                         "form": fr["form"], "alpha": fr["alpha"], "A": fr["A"], "E": fr.get("E"),
-                        "r2": fr["r2"], "n_points": fr["n_points"],
+                        "r2": fr["r2"] if route_testable else None, "n_points": fr["n_points"],
                         "n_distinct_sizes": fr["n_distinct_sizes"], "n_sizes": fr["n_distinct_sizes"],
+                        "testable": route_testable,
                     }
                 else:
                     print(f"  {r:<14} (only {len(route_sizes)} distinct size; need >= 2 to fit)")
@@ -1290,6 +1438,8 @@ def analyze() -> None:
             frontier,
             has_fit=summary["pooled_fit"] is not None,
             n_routes=len(routes),
+            n_distinct_sizes=n_fit_param_sizes,
+            lack_of_fit=lack_of_fit,
         )
     else:
         status, confounds = "incomplete_design", ["incomplete_design"]
@@ -1405,13 +1555,33 @@ def _write_scaling_md(path: Path, summary: Dict[str, Any]) -> None:
         status_line += f" ({', '.join(str(reason) for reason in confounds)})"
     if pf:
         n_sizes = pf.get("n_distinct_sizes", pf.get("n_points"))
+        alpha_ci = pf.get("alpha_ci")
+        ci_text = (f"95% CI [{alpha_ci[0]:.4f}, {alpha_ci[1]:.4f}]"
+                   if alpha_ci is not None and None not in alpha_ci
+                   else f"CI withheld: not testable below {SCALING_MIN_TESTABLE_SIZES} distinct sizes")
+        r2_text = (f"R^2 = {pf['r2']:.4f}" if pf.get("r2") is not None
+                   else f"R^2 withheld (not testable below {SCALING_MIN_TESTABLE_SIZES} distinct sizes)")
         L += ["## Pooled L(N) power law", "",
               status_line,
               f"- realized fit form: `{pf.get('form', 'unknown')}`",
-              f"- exponent alpha = {pf['alpha']:.4f}  (95% CI [{pf['alpha_ci'][0]:.4f}, {pf['alpha_ci'][1]:.4f}])",
+              f"- exponent alpha = {pf['alpha']:.4f}  ({ci_text})",
               f"- A = {pf['A']:.4g}" + (f", E = {pf['E']:.4f}"
                                         if pf.get("form") == "offset_power_law" and pf.get("E") is not None else ""),
-              f"- R^2 = {pf['r2']:.4f} over {n_sizes} distinct sizes ({pf['n_points']} points)", ""]
+              f"- {r2_text} over {n_sizes} distinct sizes ({pf['n_points']} points)"]
+        if pf.get("residual_dof") is not None:
+            L.append(f"- residual degrees of freedom: {pf['residual_dof']} "
+                     f"({pf.get('n_fit_parameters')} fitted parameters)")
+        lof = summary.get("pooled_fit_lack_of_fit")
+        if lof:
+            L.append(f"- lack-of-fit F({lof['df_lof']},{lof['df_pe']}) = {lof['F']:.3f}, "
+                     f"p = {lof['p_value']:.4g}" if lof.get("testable")
+                     else f"- lack-of-fit test not testable ({lof.get('reason')})")
+        ne = summary.get("pooled_fit_non_embedding")
+        if ne:
+            L.append(f"- non-embedding parameters: alpha = {ne['alpha']:.4f}, "
+                     + (f"R^2 = {ne['r2']:.4f}" if ne.get("r2") is not None else "R^2 withheld")
+                     + f" over {ne['n_distinct_sizes']} distinct sizes")
+        L.append("")
     else:
         L += ["## Pooled L(N) power law", "", status_line,
               "- no pooled estimate is available", ""]
@@ -1421,7 +1591,8 @@ def _write_scaling_md(path: Path, summary: Dict[str, Any]) -> None:
               "| route | realized form | alpha | R^2 | distinct sizes |",
               "|---|---|---|---|---|"]
         L += [
-            f"| {r} | {d.get('form', 'unknown')} | {d['alpha']:.4f} | {d['r2']:.4f} | "
+            f"| {r} | {d.get('form', 'unknown')} | {d['alpha']:.4f} | "
+            f"{(format(d['r2'], '.4f') if d.get('r2') is not None else 'not testable')} | "
             f"{d.get('n_distinct_sizes', d.get('n_sizes'))} |"
             for r, d in pr.items()
         ]
@@ -1501,6 +1672,14 @@ def _make_figures(
         _try("scaling_ce_vs_params.png", lambda: figs.plot_scaling_law(
             param_points, x_key="n_params", xlabel="parameters N",
             with_offset=CONFIG["with_offset"], path=str(fig_dir / "scaling_ce_vs_params.png")))
+        # Same law against non-embedding parameters when every point records them.
+        if all(np.isfinite(_as_float(p.get("n_non_embedding_params"))) for p in param_points):
+            _try("scaling_ce_vs_non_embedding_params.png", lambda: figs.plot_scaling_law(
+                param_points, x_key="n_non_embedding_params",
+                xlabel="non-embedding parameters (N minus lookup tables)",
+                with_offset=CONFIG["with_offset"],
+                title="Scaling law (test CE vs non-embedding parameters)",
+                path=str(fig_dir / "scaling_ce_vs_non_embedding_params.png")))
         if len({p["route"] for p in param_points}) > 1:
             _try("scaling_routes_overlay.png", lambda: figs.plot_scaling_routes(
                 param_points, x_key="n_params", xlabel="parameters N",

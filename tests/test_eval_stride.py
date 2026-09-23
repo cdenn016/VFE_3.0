@@ -215,11 +215,14 @@ def test_ablation_get_loader_strides_eval_only_and_keys_its_cache(monkeypatch):
 def test_strided_eval_removes_the_head_of_window_context_starvation():
     r"""On a stream whose structure needs context, the disjoint windows score strictly worse.
 
-    A period-5 stream is predictable from one token of context and unpredictable from none, so the
-    only positions a trained model gets wrong are the starved heads of each disjoint window. Halving
-    the stride halves how many such heads exist per scored token, so the CE must FALL while the
-    scored-token count stays fixed -- the signature of removing starvation rather than of a better
-    model or of double counting.
+    The period-5 stream 3 7 3 9 4 repeats the token 3, whose successor (7 or 9) is fixed only by the
+    token BEFORE it. Every position with a predecessor in its window is therefore deterministic,
+    while a disjoint window whose head is a 3 cannot tell 7 from 9 and pays about log 2 however well
+    the model trains (40 of the 100 heads here, a floor of ~0.035 nats per scored token). Strided
+    windows score only positions with at least ``seq_len - stride`` tokens of context, so the CE must
+    FALL while the scored-token count stays fixed -- the signature of removing starvation rather than
+    of a better model or of double counting. (A stream with no repeated token is predictable from
+    the head token alone; a trained model then drives both CEs to exactly 0 and nothing is measured.)
     """
     from vfe3.model.model import VFEModel
     from vfe3.train import evaluate
@@ -229,7 +232,7 @@ def test_strided_eval_removes_the_head_of_window_context_starvation():
                      gauge_group="glk", n_e_steps=2, batch_size=8)
     torch.manual_seed(0)
     model = VFEModel(cfg)
-    tokens = torch.tensor([3, 7, 1, 9, 4]).repeat(160)[:800].clone()
+    tokens = torch.tensor([3, 7, 3, 9, 4]).repeat(160)[:800].clone()
 
     train_loader = DataLoader(TokenWindows(tokens, seq_len), batch_size=8,
                               shuffle=True, drop_last=True)

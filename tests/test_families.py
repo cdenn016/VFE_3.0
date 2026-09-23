@@ -247,10 +247,22 @@ def test_full_gaussian_natural_promotes_mixed_public_dtypes_before_lu_solve(mu_d
 
 
 def test_full_gaussian_per_coord_raises():
+    r"""Full-Gaussian per-coordinate divergence is KL-only (docs/2026-09-22.md).
+
+    At alpha=1 it returns ordered conditional KL contributions with
+    \sum_k D_k = KL(q || p) before clipping; any other Renyi order has no KL chain rule and raises.
+    """
     from vfe3.families.gaussian import FullGaussian
-    q = FullGaussian(torch.zeros(2, 2), torch.eye(2).expand(2, 2, 2))
-    with pytest.raises((AttributeError, NotImplementedError)):
-        q.renyi_per_coord(q, alpha=1.0)
+    q = FullGaussian(torch.tensor([[0.2, -0.3], [0.5, 0.1]], dtype=torch.float64),
+                     torch.tensor([[1.0, 0.4], [0.4, 1.2]], dtype=torch.float64).expand(2, 2, 2))
+    p = FullGaussian(torch.tensor([-0.1, 0.2], dtype=torch.float64),
+                     torch.tensor([[1.4, -0.2], [-0.2, 0.8]], dtype=torch.float64))
+    per_coord = q.renyi_per_coord(p, alpha=1.0)
+    assert per_coord.shape == (2, 2)
+    torch.testing.assert_close(per_coord.sum(-1), q.renyi_closed_form(p, alpha=1.0),
+                               atol=1e-12, rtol=1e-12)
+    with pytest.raises(ValueError, match="KL"):
+        q.renyi_per_coord(p, alpha=0.5)
 
 
 def test_families_package_reexports_api_and_registers_builtins():
