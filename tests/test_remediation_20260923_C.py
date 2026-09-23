@@ -557,6 +557,7 @@ def _score(mu, sigma, inverse, S_q, S_k) -> torch.Tensor:
                                  projection_k=(sigma, inverse, S_k, mu))
 
 
+@pytest.mark.usefixtures("condition_recovery_on")
 def test_factor_route_is_selected_per_pair_and_counted() -> None:
     healthy_inputs = _projected_inputs(ill=False)
     ill_inputs = _projected_inputs(ill=True)

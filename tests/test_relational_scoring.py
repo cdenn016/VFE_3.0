@@ -203,6 +203,7 @@ def test_autocast_keeps_factorization_precision_and_leading_batch_dims(dtype: to
     assert torch.isfinite(D).all()
 
 
+@pytest.mark.usefixtures("condition_recovery_on")
 @pytest.mark.parametrize('smallest', [1e-4, 1e-5, 1e-6])
 def test_ill_conditioned_source_maps_preserve_projected_kl(smallest: float) -> None:
     from vfe3.contracts import CanonicalFrameContext
@@ -251,15 +252,17 @@ def test_pair_tiles_match_mean_distance_and_gradient_without_full_vector_grid(dt
     assert vector_grids and (35, 35, 2) not in vector_grids
 
 
-def test_healthy_projected_kl_uses_only_the_key_precision_inverse() -> None:
+@pytest.mark.parametrize("recovery", [True, False])
+def test_healthy_projected_kl_uses_only_the_key_precision_inverse(recovery: bool) -> None:
     """Healthy factors pay one batched on-device certificate inverse per role, never a host read.
 
     Audit 2026-09-23 (low): the exact eps ||G||_F ||G^-1||_F certificate replaced the AM-GM screen,
     which was ~4.5e4x loose and so sent almost every live call through a second host read and
     masked gathers to evaluate this same certificate; the score still uses one key-precision inverse.
+    The certificate runs only under the opt-in projected_cov_condition_recovery.
     """
     from torch.utils._python_dispatch import TorchDispatchMode
-    from vfe3.relational_scoring import projected_gaussian_kl
+    from vfe3.relational_scoring import projected_gaussian_kl, set_projected_condition_recovery
 
     class CountInverses(TorchDispatchMode):
         count = 0
@@ -273,12 +276,17 @@ def test_healthy_projected_kl_uses_only_the_key_precision_inverse() -> None:
     mu = torch.randn(1, 4, 1, 2, generator=torch.Generator().manual_seed(11))
     covariance = torch.eye(2).expand(1, 4, 1, 2, 2)
     counter = CountInverses()
-    with counter:
-        score = projected_gaussian_kl(mu, covariance, mu, covariance)
+    previous = set_projected_condition_recovery(recovery)
+    try:
+        with counter:
+            score = projected_gaussian_kl(mu, covariance, mu, covariance)
+    finally:
+        set_projected_condition_recovery(previous)
     assert torch.isfinite(score).all()
-    assert counter.count == 3
+    assert counter.count == (3 if recovery else 1)
 
 
+@pytest.mark.usefixtures("condition_recovery_on")
 def test_shear_source_recovery_matches_unprojected_kl() -> None:
     """Equal Cholesky pivots do not certify a well-conditioned covariance."""
     from vfe3.relational_scoring import projected_gaussian_kl, projected_moments

@@ -189,3 +189,15 @@ def device() -> torch.device:
     if resolved_device.type == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA requested but not available")
     return resolved_device
+
+
+@pytest.fixture
+def condition_recovery_on() -> Iterator[None]:
+    """Enable the opt-in conditioning-triggered projected source recovery for one test."""
+    from vfe3.relational_scoring import set_projected_condition_recovery
+
+    previous = set_projected_condition_recovery(True)
+    try:
+        yield
+    finally:
+        set_projected_condition_recovery(previous)

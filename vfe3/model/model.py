@@ -74,6 +74,7 @@ from vfe3.geometry.transport import (
     set_full_cov_congruence_precision,
 )
 from vfe3.numerics import set_mu_trust_cholesky_rounds, set_safe_cholesky_jitter_mode
+from vfe3.relational_scoring import set_projected_condition_recovery
 from vfe3.runtime import set_fp32_matmul_precision
 from vfe3.model.relational_operators import RelationalOperators
 
@@ -334,6 +335,7 @@ class VFEModel(nn.Module):
         set_full_cov_congruence_precision(cfg.full_cov_congruence_precision)
         set_full_cov_congruence_certification(cfg.full_cov_congruence_certification)
         set_frame_pair_fp64_escalation(cfg.frame_pair_fp64_escalation)
+        set_projected_condition_recovery(cfg.projected_cov_condition_recovery)
         set_safe_cholesky_jitter_mode(cfg.safe_cholesky_jitter_mode)
         set_mu_trust_cholesky_rounds(cfg.mu_trust_cholesky_rounds)
         # ... and the fp32 matmul / TF32 policy (audit 2026-08-06 C7/F25), which is process-global

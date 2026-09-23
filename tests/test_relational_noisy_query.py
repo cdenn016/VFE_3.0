@@ -191,6 +191,7 @@ def test_routing_gradients_match_finite_differences() -> None:
     assert torch.autograd.gradcheck(routed, (S_q, S_k), eps=1e-6, atol=1e-5, rtol=1e-4)
 
 
+@pytest.mark.usefixtures("condition_recovery_on")
 def test_recovery_is_selected_per_pair_and_leaves_healthy_pairs_bit_identical() -> None:
     from tests.test_remediation_20260923_C import _projected_inputs
 
