@@ -12,7 +12,9 @@ from vfe3.gradients.qkv import (
 from vfe3.divergence import get_functional, get_functional_per_coord, renyi, renyi_per_coord
 from vfe3.families.gaussian import DiagonalGaussian
 from vfe3.model.relational_operators import RelationalOperators
-from vfe3.relational_scoring import projected_moments, projected_gaussian_kl, projected_noisy_query_cost
+from vfe3.relational_scoring import (
+    _compute_dtype, projected_moments, projected_gaussian_kl, projected_noisy_query_cost,
+)
 
 
 def relational_score(
@@ -77,14 +79,17 @@ def relational_score(
     else:
         a_q, G_q = projected_moments(mu_h, sigma_h, inverse, S_q)              # (..., N, H, d), (..., N, H, d, d)
         a_k, G_k = projected_moments(source_mu_h, source_sigma_h, key_inverse, S_k)
+    # An escalated float64 frame (audit 2026-09-23 #12) runs the whole projection and score in
+    # float64; the results are returned at the dtype a lower-precision frame would have produced.
+    public = _compute_dtype(mu, sigma, source_mu, source_sigma, S_q, S_k)
     if capture is not None:
-        capture["projected_covariance_pre"] = G_q.detach()
-        capture["projected_key_covariance_pre"] = G_k.detach()
+        capture["projected_covariance_pre"] = G_q.detach().to(public)
+        capture["projected_key_covariance_pre"] = G_k.detach().to(public)
     score = projected_noisy_query_cost if operators.routing == "noisy_query" else projected_gaussian_kl
     return score(
         a_q, G_q, a_k, G_k,
         projection_q=(sigma_h, inverse, S_q, mu_h),
-        projection_k=(source_sigma_h, key_inverse, S_k, source_mu_h))
+        projection_k=(source_sigma_h, key_inverse, S_k, source_mu_h)).to(public)
 
 
 def compute_relational_filtering_gradients(

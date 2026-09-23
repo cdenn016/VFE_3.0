@@ -1709,7 +1709,13 @@ def gauge_equivariance_residual(
     """
     from vfe3.families.base import get_family
     from vfe3.free_energy import attention_tau, attention_weights, pairwise_energy
-    from vfe3.geometry.transport import transport_mean
+    from vfe3.geometry.transport import _factor_dtype, transport_mean
+
+    if _factor_dtype(omega) == torch.float64 and mu.dtype != torch.float64:
+        # Escalated float64 frames (audit 2026-09-23 #12): certify the whole congruence at float64,
+        # so the random group elements g (built at mu.dtype, from generators cast to it) share the
+        # operator's dtype.
+        mu, sigma = mu.double(), sigma.double()
 
     compact_factors: Optional[
         Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]
@@ -1798,7 +1804,7 @@ def gauge_equivariance_residual(
     in_e, in_b, out_e, out_b = [], [], [], []
     for _ in range(n_samples):
         c = scale * torch.randn(group.generators.shape[0], generator=gen, device=mu.device, dtype=mu.dtype)
-        g_in = torch.linalg.matrix_exp(torch.einsum("a,aij->ij", c, group.generators))
+        g_in = torch.linalg.matrix_exp(torch.einsum("a,aij->ij", c, group.generators.to(c.dtype)))
         re, rb = _residuals(g_in)
         in_e.append(re)
         in_b.append(rb)

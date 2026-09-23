@@ -306,7 +306,12 @@ def fold_rope_into_frame(
     Because :math:`V_i V_j^{-1}` is an ordinary flat coboundary, the folded transport is a plain
     factored container: every downstream contraction, the cocycle certification, and the fast paths
     all apply unchanged. That is the point of folding rather than wrapping.
+
+    An escalated float64 base (audit 2026-09-23 #12) folds in the rotation re-orthogonalized at
+    float64 (:func:`_rope_at_frame_precision`), so the folded pair stays one float64 group-inverse
+    pair.
     """
+    rope = _rope_at_frame_precision(rope, _factor_dtype(base))
     rope_t = rope.transpose(-1, -2)
     if isinstance(base, CompactFactoredTransport):
         H, d = base.exp_blocks.shape[-3], base.exp_blocks.shape[-1]
@@ -346,9 +351,41 @@ def _rope_dense_omega(
         base.to_dense_omega()
         if isinstance(base, (FactoredTransport, CompactFactoredTransport)) else base
     )                                                                               # (...,N,N,K,K)
+    rope = _rope_at_frame_precision(rope, omega.dtype)   # escalated frames (audit 2026-09-23 #12)
     # R_i Omega_ij R_j^T: contract R on the left of the i-axis output and the right (transposed) of j.
     rot = torch.einsum("...ikl,...ijlm,...jnm->...ijkn", rope, omega, rope)
     return rot
+
+
+def _rope_at_frame_precision(
+    rope:  torch.Tensor,                  # (..., N, K, K) block-diagonal orthogonal rotation
+    dtype: torch.dtype,                   # storage dtype of the frame pair it meets
+) -> torch.Tensor:                        # (..., N, K, K) rotation at the frames' precision
+    r"""The positional rotation at an escalated float64 frame pair's precision (audit 2026-09-23 #12).
+
+    The model builds :math:`R` at the generator dtype (float32), whose rounded cosines and sines
+    leave an orthogonality defect :math:`E_0 = R^{T} R - I` of about :math:`4\times10^{-8}`. A cast
+    to float64 keeps that defect, the folded pair :math:`(U R^{T}, R U^{-1})` inherits it as its
+    inverse residual, and the float64 canonical-frame contract (tolerance
+    :math:`64 K \varepsilon_{64} \kappa \approx 10^{-13}` on a healthy block) rejects it. Two
+    Newton--Schulz polar steps (Higham, *Functions of Matrices*, SIAM 2008, ch. 8)
+
+    .. math::
+        R_{k+1} = \tfrac{1}{2} R_k \left(3I - R_k^{T} R_k\right), \qquad
+        E_{k+1} = -\tfrac{3}{4} E_k^{2} + O(E_k^{3}),
+
+    take the defect to float64 rounding. The iteration converges to the orthogonal polar factor of
+    the float32 rotation, its nearest orthogonal matrix, and keeps the structural block-diagonal
+    zeros exact. Any other pairing returns ``rope`` itself, so the float32 path is untouched and a
+    rotation that is already float64 is not perturbed.
+    """
+    if dtype != torch.float64 or rope.dtype == torch.float64:
+        return rope
+    R = rope.double()
+    eye = torch.eye(R.shape[-1], dtype=R.dtype, device=R.device)
+    for _ in range(2):
+        R = 0.5 * (R @ (3.0 * eye - R.transpose(-1, -2) @ R))
+    return R
 
 
 # -- connection-regime registry --
@@ -708,6 +745,18 @@ def _congruence_compute_dtype(source_dtype: torch.dtype) -> torch.dtype:
         return torch.float64
     return torch.float32
 
+
+def _congruence_work_dtype(factor_dtype: torch.dtype, source_dtype: torch.dtype) -> torch.dtype:
+    r"""Congruence working dtype: float64 for float64 frames, else the policy's choice.
+
+    On float32 beliefs a float64 frame pair is an escalated pair whose float32 storage failed the
+    condition certificate (audit 2026-09-23 #12). The congruence squares that condition, so
+    contracting it in float32 would discard exactly the precision the escalation bought.
+    """
+    if factor_dtype == torch.float64:
+        return torch.float64
+    return _congruence_compute_dtype(source_dtype)
+
 # Process-wide "the exponential clamp has fired at least once" latch (audit 2026-07-25 F2). The clamp
 # returns a surrogate operator rather than exp(M), so its first occurrence is reported even when the
 # per-build clamp_monitor is off; the latch keeps the default path from paying a host sync forever.
@@ -716,6 +765,85 @@ _CLAMP_SURROGATE_WARNED: bool = False
 # Latch for the diagonal congruence's float64 escalation (audit 2026-07-25 F3): report the first
 # escalation, then stay quiet so a persistently ill-conditioned run does not flood the log.
 _DIAG_CONGRUENCE_NEGATIVE_WARNED: bool = False
+
+# Measured-condition escalation of the stored frame pair (audit 2026-09-23 #12). The pair
+# (U, U^-1) is stored in float32. With the opt-in escalation enabled
+# (VFE3Config.frame_pair_fp64_escalation, installed by VFEModel), a producer call whose stored pair
+# cannot stay mutually inverse at float32 is redone in float64 as a whole. Disabled (the default),
+# no condition certificate is formed and every producer behaves exactly as before the escalation
+# existed. The tolerance is the projected scorer's certificate threshold and is read at call time.
+# The counter is a host int incremented from the already-read decision, so it adds no device work
+# and no synchronization.
+_FRAME_PAIR_FP64_ESCALATION: bool = False
+_FRAME_PAIR_CONDITION_TOL: float = 1e-4
+_FRAME_PAIR_FP64_ESCALATIONS: int = 0
+
+
+def set_frame_pair_fp64_escalation(enabled: bool) -> bool:
+    r"""Enable or disable the condition-keyed float64 frame-pair escalation; returns the previous value."""
+    if not isinstance(enabled, bool):
+        raise ValueError(f"frame-pair float64 escalation must be bool, got {enabled!r}")
+    global _FRAME_PAIR_FP64_ESCALATION
+    previous = _FRAME_PAIR_FP64_ESCALATION
+    _FRAME_PAIR_FP64_ESCALATION = enabled
+    return previous
+
+
+def frame_pair_fp64_escalation() -> bool:
+    r"""Return whether producers certify the float32 frame pair and escalate it to float64."""
+    return _FRAME_PAIR_FP64_ESCALATION
+
+
+def frame_pair_fp64_escalations() -> int:
+    r"""Producer calls whose frame pair was escalated to float64 since the last reset.
+
+    One call is one ``stable_matrix_exp_pair`` / compact-pair build, so a composed
+    ``build_factored_transport`` can count two. Diagnostic and evaluation builds count too.
+    """
+    return _FRAME_PAIR_FP64_ESCALATIONS
+
+
+def reset_frame_pair_fp64_escalations() -> None:
+    r"""Zero the frame-pair float64 escalation counter (per-run accounting)."""
+    global _FRAME_PAIR_FP64_ESCALATIONS
+    _FRAME_PAIR_FP64_ESCALATIONS = 0
+
+
+def _count_frame_pair_escalation() -> None:
+    global _FRAME_PAIR_FP64_ESCALATIONS
+    _FRAME_PAIR_FP64_ESCALATIONS += 1
+
+
+def _frame_pair_kappa(
+    right:  Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # (..., d, d) right pair (E, E^-1)
+    gather: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,  # unique -> occurrence rows
+) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+    r"""Build the Frobenius condition of the pair a producer call will actually store.
+
+    For each trailing ``(d, d)`` block,
+
+    .. math::
+        \kappa_F(U_b) = \lVert U_b \rVert_F \lVert U_b^{-1} \rVert_F \ge \kappa_2(U_b),
+
+    and the stored pair's consistency obeys
+    :math:`\lVert \mathrm{fl}(U)\,\mathrm{fl}(U^{-1}) - I \rVert \lesssim \kappa(U)\,\varepsilon`.
+    The producer escalates iff :math:`\max_b \kappa_F(U_b)\,\varepsilon_{32} > \tau` with
+    :math:`\tau = 10^{-4}` (``_FRAME_PAIR_CONDITION_TOL``). Note :math:`\kappa_F \ge d`.
+
+    With ``right`` the stored pair is the composition :math:`(U E, E^{-1} U^{-1})`, so the condition
+    is taken of that product; ``gather`` first expands deduplicated token rows to the occurrence
+    layout the right factor is indexed by. The returned callable receives the float64 forward
+    elements and the float64 inverses the certified inverse has already formed.
+    """
+    def kappa(forward64: torch.Tensor, inverse64: torch.Tensor) -> torch.Tensor:
+        if gather is not None:
+            forward64, inverse64 = gather(forward64), gather(inverse64)
+        if right is not None:
+            forward64 = forward64 @ right[0].double()                    # (..., d, d) U E
+            inverse64 = right[1].double() @ inverse64                    # (..., d, d) E^-1 U^-1
+        return (torch.linalg.matrix_norm(forward64)
+                * torch.linalg.matrix_norm(inverse64)).amax()
+    return kappa
 
 
 def _escalate_if_negative(
@@ -797,6 +925,8 @@ def stable_matrix_exp_pair(
     clamp_monitor:           bool                = False,    # opt-in: warn when the Frobenius clamp fires (host sync)
     block_dims:              Optional[List[int]] = None,     # per-block sizes (sum==d) for a block-diagonal M
     validity_max_norm:       Optional[float]     = None,     # opt-in fail-closed pre-clamp chart bound
+    _right_pair:             Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # certify (U E, E^-1 U^-1)
+    _force_fp64:             bool                = False,    # skip the float32 attempt (joint escalation)
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Represented exp(M) and optionally its float64-computed inverse.
 
@@ -826,6 +956,12 @@ def stable_matrix_exp_pair(
     Float64 inputs retain float64 storage but follow the same interior precision rule. Numerical
     oracles can pass a float64 input and threshold zero to force float64 computation.
     The config owns its threshold of 20; low-level callers retain their threshold of 5.
+
+    Storage precision is decided separately, from the stored pair's measured condition (audit
+    2026-09-23 #12): a float32 pair failing :func:`_frame_pair_kappa`'s certificate is returned in
+    float64 for the whole call, recomputed from the same clamped ``M`` and inverted from the float64
+    ``exp(M)``. The verdict rides the inverse's existing host read; ``only_forward`` builds no
+    inverse and is never certified.
     """
     # Global Frobenius clamp on the FULL matrix (one scale for all blocks) -- identical to the
     # un-blocked path, so block slicing below cannot change the operator. The norm/scale is kept
@@ -922,20 +1058,34 @@ def stable_matrix_exp_pair(
     # deliberately supports -- matrix_exp would then run in bf16 on CPU-AMP runs.
     with torch.amp.autocast(matrix.device.type, enabled=False):
         matrix_up = matrix.to(up_dtype).contiguous()
+        blocked = block_dims is not None and len(block_dims) > 1
 
-        if block_dims is not None and len(block_dims) > 1:
-            exp_pos = _blockwise_matrix_exp(matrix_up, block_dims).to(orig_dtype)
-            if only_forward:
-                exp_neg = None
-            else:
-                exp_neg = _blockwise_group_inverse(exp_pos, block_dims)
-            return exp_pos, exp_neg
+        def _exp(m: torch.Tensor) -> torch.Tensor:
+            return _blockwise_matrix_exp(m, block_dims) if blocked else torch.linalg.matrix_exp(m)
 
-        exp_pos = torch.linalg.matrix_exp(matrix_up).to(orig_dtype)
+        exp_up = _exp(matrix_up)
+        exp_pos = exp_up.to(orig_dtype)
         if only_forward:
-            exp_neg = None
+            return exp_pos, None
+        if orig_dtype == torch.float64:
+            escalate = False
+            exp_neg = (_blockwise_group_inverse(exp_pos, block_dims) if blocked
+                       else _checked_group_inverse(exp_pos))
+        elif _force_fp64:
+            escalate = True
+        elif blocked:
+            exp_neg, escalate = _blockwise_group_inverse_certified(
+                exp_pos, block_dims, certify=_FRAME_PAIR_FP64_ESCALATION, right_pair=_right_pair)
         else:
-            exp_neg = _checked_group_inverse(exp_pos)
+            exp_neg, escalate = _checked_group_inverse_certified(
+                exp_pos, kappa=(_frame_pair_kappa(_right_pair)
+                                if _FRAME_PAIR_FP64_ESCALATION else None))
+        if escalate:
+            exp_pos = (exp_up if exp_up.dtype == torch.float64
+                       else _exp(matrix.to(torch.float64).contiguous()))
+            exp_neg = (_blockwise_group_inverse(exp_pos, block_dims) if blocked
+                       else _checked_group_inverse(exp_pos))
+            _count_frame_pair_escalation()
     return exp_pos, exp_neg
 
 
@@ -987,28 +1137,62 @@ def _blockwise_group_inverse(
     block_dims: List[int],                # block sizes; sum == d
 ) -> torch.Tensor:                        # (..., d, d) inverse with structural off-block zeros
     r"""Invert represented diagonal blocks in float64 without materializing a full dense solve."""
+    return _blockwise_group_inverse_certified(matrix, block_dims)[0]
+
+
+def _blockwise_group_inverse_certified(
+    matrix:     torch.Tensor,             # (..., d, d) represented block-diagonal group element
+    block_dims: List[int],                # block sizes; sum == d
+
+    *,
+    certify:    bool = False,             # also return the frame-pair escalation verdict
+    right_pair: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # (..., d, d) block-diagonal (E, E^-1)
+) -> Tuple[torch.Tensor, bool]:           # ((..., d, d) inverse, escalate to float64)
+    r""":func:`_blockwise_group_inverse` plus the per-block frame-pair verdict (audit 2026-09-23 #12).
+
+    Equal blocks certify the stacked ``(..., H, d, d)`` blocks inside their one inverse read;
+    unequal blocks OR the verdicts of their existing per-block reads. A block-diagonal right factor
+    composes block by block, so the certificate uses its matching diagonal blocks.
+    """
     out = torch.zeros_like(matrix)
+    escalate = False
     if len(set(block_dims)) == 1 and len(block_dims) > 1:
         H, d = len(block_dims), block_dims[0]
         batch = matrix.shape[:-2]
-        matrix_view = matrix.reshape(*batch, H, d, H, d)
-        blocks = torch.diagonal(
-            matrix_view,
-            dim1=-4,
-            dim2=-2,
-        ).movedim(-1, -3).contiguous()
-        inverses = _checked_group_inverse(blocks)
+
+        def _diag_blocks(t: torch.Tensor) -> torch.Tensor:          # (..., H, d, d)
+            return torch.diagonal(
+                t.reshape(*t.shape[:-2], H, d, H, d),
+                dim1=-4,
+                dim2=-2,
+            ).movedim(-1, -3)
+
+        blocks = _diag_blocks(matrix).contiguous()
+        kappa = None
+        if certify:
+            right = (None if right_pair is None
+                     else (_diag_blocks(right_pair[0]), _diag_blocks(right_pair[1])))
+            kappa = _frame_pair_kappa(right)
+        inverses, escalate = _checked_group_inverse_certified(blocks, kappa=kappa)
         out_view = out.reshape(*batch, H, d, H, d)
         torch.diagonal(out_view, dim1=-4, dim2=-2).copy_(inverses.movedim(-3, -1))
-        return out
+        return out, escalate
 
     start = 0
     for dim in block_dims:
         end = start + dim
         block = matrix[..., start:end, start:end].contiguous()
-        out[..., start:end, start:end] = _checked_group_inverse(block)
+        kappa = None
+        if certify:
+            right = (None if right_pair is None
+                     else (right_pair[0][..., start:end, start:end],
+                           right_pair[1][..., start:end, start:end]))
+            kappa = _frame_pair_kappa(right)
+        inverse, block_escalate = _checked_group_inverse_certified(block, kappa=kappa)
+        out[..., start:end, start:end] = inverse
+        escalate = escalate or block_escalate
         start = end
-    return out
+    return out, escalate
 
 
 def compute_transport_operators(
@@ -1137,15 +1321,36 @@ def _checked_group_inverse(
     (audit 2026-07-25 F2). The check costs one reduction, which joins the same single host read, so
     it is opt-in and off on the training hot path.
     """
+    return _checked_group_inverse_certified(
+        omega, validate=validate, residual_tol=residual_tol)[0]
+
+
+def _checked_group_inverse_certified(
+    omega:        torch.Tensor,             # (..., d, d) stored full elements or compact blocks
+
+    *,
+    validate:     bool            = True,
+    residual_tol: Optional[float] = None,
+    kappa:        Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
+) -> Tuple[torch.Tensor, bool]:           # (inverse at omega.dtype, escalate to float64)
+    r""":func:`_checked_group_inverse` plus the frame-pair escalation verdict (audit 2026-09-23 #12).
+
+    ``kappa`` (see :func:`_frame_pair_kappa`) maps the float64 elements and their float64 inverses
+    to :math:`\max_b \kappa_F`; the verdict :math:`\kappa_F\,\varepsilon(\text{omega.dtype}) > \tau`
+    joins the strict route's ONE host read, so certifying costs no extra synchronization. When it
+    escalates, the caller discards the cast inverse and rebuilds the pair in float64, so a cast that
+    overflowed ``omega.dtype`` is not an error on that call. Without ``kappa`` the verdict is False.
+    """
     if not validate:
         try:
             with torch.amp.autocast(omega.device.type, enabled=False):
                 inverse64 = torch.linalg.inv(omega.double())
         except RuntimeError as exc:
             raise ValueError("omega group element is singular and cannot be inverted") from exc
-        return inverse64.to(omega.dtype)
+        return inverse64.to(omega.dtype), False
     with torch.amp.autocast(omega.device.type, enabled=False):
-        inverse64, info = torch.linalg.inv_ex(omega.double())
+        omega64 = omega.double()
+        inverse64, info = torch.linalg.inv_ex(omega64)
     inverse = inverse64.to(omega.dtype)
     with torch.no_grad():
         flags = [
@@ -1159,9 +1364,14 @@ def _checked_group_inverse(
             eye = torch.eye(omega.shape[-1], device=omega.device, dtype=torch.float64)
             residual = (omega.double() @ inverse.double() - eye).abs().amax()
             flags.append(~(residual <= residual_tol))
+        if kappa is not None:
+            flags.append(kappa(omega64, inverse64) * torch.finfo(omega.dtype).eps
+                         > _FRAME_PAIR_CONDITION_TOL)
         # The single host read for the whole strict certificate.
-        nonfinite_omega, singular, nonfinite_64, nonfinite_cast, *residual_bad = (
-            torch.stack(flags).tolist())
+        host = torch.stack(flags).tolist()
+    nonfinite_omega, singular, nonfinite_64, nonfinite_cast = host[:4]
+    residual_bad = residual_tol is not None and host[4]
+    escalate = kappa is not None and bool(host[-1])
     if nonfinite_omega:
         raise FloatingPointError(
             "omega group element contains nonfinite values before inversion")
@@ -1171,10 +1381,10 @@ def _checked_group_inverse(
         raise FloatingPointError(
             "omega group-element inverse is nonfinite; the element is singular or "
             "numerically unrepresentable")
-    if nonfinite_cast:
+    if nonfinite_cast and not escalate:
         raise FloatingPointError(
             f"omega group-element inverse is nonfinite after conversion to {omega.dtype}")
-    if residual_bad and residual_bad[0]:
+    if residual_bad:
         raise FloatingPointError(
             "stored omega group-element pair violates the inverse identity: "
             f"||U U^-1 - I||_inf={float(residual):.6g} > residual_tol={residual_tol:.6g} "
@@ -1182,7 +1392,7 @@ def _checked_group_inverse(
             "inverse no longer form a group-inverse pair, so the transport cocycle is "
             "not exact"
         )
-    return inverse
+    return inverse, escalate
 
 
 def _stable_compact_glk_exp_pair(
@@ -1193,12 +1403,21 @@ def _stable_compact_glk_exp_pair(
     clamp_monitor:           bool            = False,
     validity_max_norm:       Optional[float] = None,
     _content_token_ids:      Optional[torch.Tensor] = None,
+    _right_pair:             Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # certify (U E, E^-1 U^-1)
+    _force_fp64:             bool            = False,     # skip the float32 attempt (joint escalation)
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Exponentiate packed blocks and invert their represented values in float64.
 
     Private token IDs certify a built-in table lookup. Pre-exp decisions still see every
     occurrence; only exp/inverse work is shared, then gathered before composition. The
     table gradient is equivalent in real arithmetic, with a different reduction order.
+
+    Float32 storage is certified by :func:`_frame_pair_kappa` inside the inverse's single host
+    read (audit 2026-09-23 #12). A call that fails it returns the whole pair in float64:
+    ``U = exp(M)`` recomputed in float64 from the same clamped blocks and ``U^-1`` inverted from
+    that float64 ``U`` itself, never the float64 inverse of the rounded float32 ``U`` (which is
+    no more consistent with a float64 ``U`` than the float32 pair was). ``_right_pair`` certifies
+    the composed pair instead, and ``_force_fp64`` goes straight to float64.
     """
     if validity_max_norm is not None and (
         not math.isfinite(validity_max_norm) or validity_max_norm <= 0.0
@@ -1260,8 +1479,27 @@ def _stable_compact_glk_exp_pair(
             inverse_index = None
     with torch.amp.autocast(blocks.device.type, enabled=False):
         blocks_up = blocks.to(up_dtype).contiguous()
-        exp_pos = torch.linalg.matrix_exp(blocks_up).to(store_dtype)
-        exp_neg = _checked_group_inverse(exp_pos)
+        exp_up = torch.linalg.matrix_exp(blocks_up)
+        exp_pos = exp_up.to(store_dtype)
+        if store_dtype == torch.float64:
+            exp_neg, escalate = _checked_group_inverse(exp_pos), False
+        elif _force_fp64:
+            escalate = True
+        else:
+            gather = None
+            if inverse_index is not None and _right_pair is not None:
+                index, shape = inverse_index, occurrence_shape
+
+                def gather(t: torch.Tensor) -> torch.Tensor:
+                    return t.index_select(0, index).reshape(shape)
+            exp_neg, escalate = _checked_group_inverse_certified(
+                exp_pos, kappa=(_frame_pair_kappa(_right_pair, gather)
+                                if _FRAME_PAIR_FP64_ESCALATION else None))
+        if escalate:
+            exp_pos = (exp_up if exp_up.dtype == torch.float64
+                       else torch.linalg.matrix_exp(blocks.to(torch.float64).contiguous()))
+            exp_neg = _checked_group_inverse(exp_pos)
+            _count_frame_pair_escalation()
     if inverse_index is not None:
         exp_pos = exp_pos.index_select(0, inverse_index).reshape(occurrence_shape)
         exp_neg = exp_neg.index_select(0, inverse_index).reshape(occurrence_shape)
@@ -1334,21 +1572,35 @@ def build_factored_transport(
         # element to bf16 before exponentiation, so the fp32 store floor in the exp helper could not
         # recover the already-lost input precision. Parity with the dense route is now maintained at
         # float32, because stable_matrix_exp_pair carries the same floor.
+        # The right factor is built FIRST (audit 2026-09-23 #12): consumers apply the composed pair
+        # (U E, E^-1 U^-1), so the left call certifies that product inside its own single read, and
+        # an escalation of either factor rebuilds the other in float64 so the composition is one
+        # consistent float64 pair rather than a float64 factor times a float32-rounded inverse.
+        right_pair = None
+        if right_phi is not None:
+            right_blocks = right_phi.reshape(*right_phi.shape[:-1], H, d, d)
+
+            def _build_right(force_fp64: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+                return _stable_compact_glk_exp_pair(
+                    right_blocks,
+                    exp_fp64_norm_threshold=exp_fp64_norm_threshold,
+                    clamp_monitor=clamp_monitor,
+                    validity_max_norm=validity_max_norm,
+                    _force_fp64=force_fp64,
+                )
+            right_pair = _build_right()
         exp_blocks, inv_blocks = _stable_compact_glk_exp_pair(
             phi_blocks,
             exp_fp64_norm_threshold=exp_fp64_norm_threshold,
             clamp_monitor=clamp_monitor,
             validity_max_norm=validity_max_norm,
             _content_token_ids=_content_token_ids,
+            _right_pair=right_pair,
+            _force_fp64=right_pair is not None and right_pair[0].dtype == torch.float64,
         )
-        if right_phi is not None:
-            right_blocks = right_phi.reshape(*right_phi.shape[:-1], H, d, d)
-            right_exp, right_inv = _stable_compact_glk_exp_pair(
-                right_blocks,
-                exp_fp64_norm_threshold=exp_fp64_norm_threshold,
-                clamp_monitor=clamp_monitor,
-                validity_max_norm=validity_max_norm,
-            )
+        if right_pair is not None:
+            right_exp, right_inv = (right_pair if right_pair[0].dtype == exp_blocks.dtype
+                                    else _build_right(force_fp64=True))
             # Preserve the exponentials' fp32/fp64 storage floor through composition.
             # Autocast rounding here destroys the mutual-inverse frame contract.
             with torch.amp.autocast(phi.device.type, enabled=False):
@@ -1359,6 +1611,22 @@ def build_factored_transport(
             mean_per_head=mean_per_head, same_frame_flat_cocycle=True,
             cond_escalation=cond_escalation)
 
+    # Right factor first, as on the compact route above (audit 2026-09-23 #12).
+    right_pair = None
+    if right_phi is not None:
+        right_matrix = _embed_algebra_fp32_floor(right_phi, group)
+
+        def _build_right(force_fp64: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+            return stable_matrix_exp_pair(
+                right_matrix,
+                block_dims=block_dims,
+                exp_fp64_norm_threshold=exp_fp64_norm_threshold,
+                max_norm=(float("inf") if group.skew_symmetric else TRANSPORT_CLAMP_MAX_NORM),
+                clamp_monitor=clamp_monitor,
+                validity_max_norm=validity_max_norm,
+                _force_fp64=force_fp64,
+            )
+        right_pair = _build_right()
     phi_matrix = _embed_algebra_fp32_floor(phi, group)
     exp_phi, exp_neg_phi = stable_matrix_exp_pair(
         phi_matrix, block_dims=block_dims,
@@ -1370,17 +1638,12 @@ def build_factored_transport(
         max_norm=(float("inf") if group.skew_symmetric else TRANSPORT_CLAMP_MAX_NORM),
         clamp_monitor=clamp_monitor,
         validity_max_norm=validity_max_norm,
+        _right_pair=right_pair,
+        _force_fp64=right_pair is not None and right_pair[0].dtype == torch.float64,
     )
-    if right_phi is not None:
-        right_matrix = _embed_algebra_fp32_floor(right_phi, group)
-        right_exp, right_inv = stable_matrix_exp_pair(
-            right_matrix,
-            block_dims=block_dims,
-            exp_fp64_norm_threshold=exp_fp64_norm_threshold,
-            max_norm=(float("inf") if group.skew_symmetric else TRANSPORT_CLAMP_MAX_NORM),
-            clamp_monitor=clamp_monitor,
-            validity_max_norm=validity_max_norm,
-        )
+    if right_pair is not None:
+        right_exp, right_inv = (right_pair if right_pair[0].dtype == exp_phi.dtype
+                                else _build_right(force_fp64=True))
         with torch.amp.autocast(phi.device.type, enabled=False):
             exp_phi = exp_phi @ right_exp
             exp_neg_phi = right_inv @ exp_neg_phi
@@ -1429,6 +1692,37 @@ def _restore_certified_self_links_(
     return output
 
 
+def _factor_dtype(
+    omega: 'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport',
+) -> torch.dtype:
+    r"""Storage dtype of a transport's vertex factors, or of a dense operator; RoPE reports its base."""
+    if isinstance(omega, RopeTransport):
+        return _factor_dtype(omega.base)
+    if isinstance(omega, CompactFactoredTransport):
+        return omega.exp_blocks.dtype
+    if isinstance(omega, FactoredTransport):
+        return omega.exp_phi.dtype
+    return omega.dtype
+
+
+def _at_frame_precision(
+    omega: 'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport',
+    x:     torch.Tensor,                                          # (..., N, K) source moments
+    fn:    Callable[[torch.Tensor], torch.Tensor],
+) -> torch.Tensor:
+    r"""Apply ``fn`` to ``x`` at float64 when the frames were escalated, returning ``x.dtype``.
+
+    A producer call whose float32 frame pair failed its condition certificate stores the pair in
+    float64 (audit 2026-09-23 #12). Applying it to lower-precision beliefs promotes the source,
+    contracts with autocast off, and casts the result back so downstream dtypes are unchanged.
+    Every other case calls ``fn(x)`` exactly as before.
+    """
+    if _factor_dtype(omega) != torch.float64 or x.dtype == torch.float64:
+        return fn(x)
+    with torch.amp.autocast(x.device.type, enabled=False):
+        return fn(x.double()).to(x.dtype)
+
+
 def transport_mean(
     omega: 'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport',
     mu:    torch.Tensor,                                          # (..., N, K) source (key, index j) means
@@ -1464,16 +1758,19 @@ def transport_mean(
         out = torch.einsum("...ikl,...ijl->...ijk", omega.rope, t)    # post-rotate by R_i
         return _restore_certified_self_links_(out, mu, omega, event_ndim=1)
     if isinstance(omega, CompactFactoredTransport):
-        out = _compact_factored_mean(omega, mu)
+        out = _at_frame_precision(omega, mu, lambda x: _compact_factored_mean(omega, x))
         return _restore_certified_self_links_(out, mu, omega, event_ndim=1)
     if isinstance(omega, FactoredTransport):
         if omega.mean_per_head:
-            out = _factored_per_head_mean(omega, mu)
+            out = _at_frame_precision(omega, mu, lambda x: _factored_per_head_mean(omega, x))
         else:
-            m = torch.einsum("...jlp,...jp->...jl", omega.exp_neg_phi, mu)  # (..., N, K): exp(-phi_j) @ mu_j
-            out = torch.einsum("...ikl,...jl->...ijk", omega.exp_phi, m)    # (..., N, N, K): exp(phi_i) @ m_j
+            def _full_k(x: torch.Tensor) -> torch.Tensor:
+                m = torch.einsum("...jlp,...jp->...jl", omega.exp_neg_phi, x)  # (..., N, K): exp(-phi_j) @ mu_j
+                return torch.einsum("...ikl,...jl->...ijk", omega.exp_phi, m)  # (..., N, N, K): exp(phi_i) @ m_j
+            out = _at_frame_precision(omega, mu, _full_k)
         return _restore_certified_self_links_(out, mu, omega, event_ndim=1)
-    return torch.einsum("...ijkl,...jl->...ijk", omega, mu)
+    return _at_frame_precision(
+        omega, mu, lambda x: torch.einsum("...ijkl,...jl->...ijk", omega, x))
 
 
 def transport_covariance(
@@ -1563,8 +1860,9 @@ def transport_covariance(
                 marginal_blocks=marginal_blocks,
             )
         if isinstance(omega.base, CompactFactoredTransport):
-            blocks = _equal_diag_blocks(
-                omega.rope, omega.base.n_blocks, omega.base.block_dim)
+            blocks = _equal_diag_blocks(                 # escalated frames: audit 2026-09-23 #12
+                _rope_at_frame_precision(omega.rope, omega.base.dtype),
+                omega.base.n_blocks, omega.base.block_dim)
             exp_blocks = torch.einsum(
                 "...nhkl,...nhlm->...nhkm", blocks, omega.base.exp_blocks)
             inv_blocks = torch.einsum(
@@ -1603,7 +1901,8 @@ def transport_covariance(
             if diagonal_out is None else diagonal_out
         )
         if is_diag:
-            out = _compact_factored_diagonal_covariance(omega, sigma)
+            out = _at_frame_precision(
+                omega, sigma, lambda s: _compact_factored_diagonal_covariance(omega, s))
         else:
             sigma_work = sigma.double() if retain_full_precision else sigma
             out = _compact_factored_full_covariance(
@@ -1621,7 +1920,7 @@ def transport_covariance(
         # because the factored exps carry one fewer N axis than the dense (..., N, N, K, K)).
         is_diag = sigma.dim() == omega.exp_phi.dim() - 1 if diagonal_out is None else diagonal_out
         if is_diag:
-            out = _factored_diagonal_covariance(omega, sigma)
+            out = _at_frame_precision(omega, sigma, lambda s: _factored_diagonal_covariance(omega, s))
         else:
             sigma_work = sigma.double() if retain_full_precision else sigma
             out = _factored_full_covariance(omega, sigma_work)
@@ -1640,6 +1939,8 @@ def transport_covariance(
         # escalation or floor; only the working precision was missing.
         with torch.amp.autocast(sigma.device.type, enabled=False):
             work = sigma.dtype if sigma.dtype in (torch.float32, torch.float64) else torch.float32
+            if omega.dtype == torch.float64:          # escalated frames (audit 2026-09-23 #12)
+                work = torch.float64
             out = torch.einsum("...ijkl,...ijkl,...jl->...ijk",
                                omega.to(work), omega.to(work), sigma.to(work))
         return out.to(sigma.dtype)
@@ -1672,7 +1973,7 @@ def transport_covariance(
     # or use a compact group / diagonal family there. Reached only on the full-covariance path
     # (family='gaussian_full'); the diagonal default above and the compact (orthogonal Omega, cond=1)
     # groups are untouched, so the hot path is unchanged.
-    work = _congruence_compute_dtype(sigma.dtype)          # fp64 by default; see the policy above
+    work = _congruence_work_dtype(omega.dtype, sigma.dtype)  # fp64 by default; see the policy above
     out = torch.einsum("...ijkl,...jlm,...ijnm->...ijkn",
                        omega.to(work), sigma.to(work), omega.to(work))
     return _certify_full_congruence(
@@ -1839,7 +2140,7 @@ def _compact_head_block_congruence(
     blocks directly through :func:`transport_covariance_head_blocks` and skip the round trip.
     """
     H, d = factored.n_blocks, factored.block_dim
-    work = _congruence_compute_dtype(sigma.dtype)          # fp64 by default; see the policy above
+    work = _congruence_work_dtype(factored.dtype, sigma.dtype)  # fp64 by default; see the policy above
     omega_blocks = _compact_pair_blocks(factored).to(work)
     sigma_diag = _head_diagonal_blocks(sigma, H, d)                # (..., N, H, d, d)
     def _contract(pair: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -1884,8 +2185,9 @@ def _resolve_compact_for_head_blocks(
         if folded is not None:                                     # RIGHT: an ordinary coboundary
             return _resolve_compact_for_head_blocks(folded)
         if isinstance(omega.base, CompactFactoredTransport):
-            blocks = _equal_diag_blocks(
-                omega.rope, omega.base.n_blocks, omega.base.block_dim)
+            blocks = _equal_diag_blocks(                 # escalated frames: audit 2026-09-23 #12
+                _rope_at_frame_precision(omega.rope, omega.base.dtype),
+                omega.base.n_blocks, omega.base.block_dim)
             return CompactFactoredTransport(
                 torch.einsum("...nhkl,...nhlm->...nhkm", blocks, omega.base.exp_blocks),
                 torch.einsum("...nhkl,...nhml->...nhkm", omega.base.inv_blocks, blocks),
@@ -1997,7 +2299,7 @@ def _compact_factored_full_covariance(
             out[..., h, :, h, :] = diag_out[..., h, :, :]
         return out.reshape(*out.shape[:-4], factored.K, factored.K)
     sigma_blocks = sigma.reshape(*sigma.shape[:-3], sigma.shape[-3], H, d, H, d)
-    work = _congruence_compute_dtype(sigma.dtype)          # fp64 by default; see the policy above
+    work = _congruence_work_dtype(factored.dtype, sigma.dtype)  # fp64 by default; see the policy above
     omega_blocks = _compact_pair_blocks(factored).to(work)
     out = torch.einsum(
         "...ijhkl,...jhlgm,...ijgnm->...ijhkgn",
@@ -2175,6 +2477,6 @@ def _factored_full_covariance(
                     "...ijkl,...jlm,...ijnm->...ijkn", oh, sig_blk, oh2)
         return out
 
-    work = _congruence_compute_dtype(sigma.dtype)
+    work = _congruence_work_dtype(factored.exp_phi.dtype, sigma.dtype)
     return _certify_full_congruence(
         _reduce(work), work, _reduce, source_dtype=sigma.dtype)

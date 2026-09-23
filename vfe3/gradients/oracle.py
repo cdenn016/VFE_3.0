@@ -37,9 +37,17 @@ from vfe3.geometry.transport import (
 def _transport_to_float(
     omega: 'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport',
 ) -> 'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport':
-    r"""Cast only an oracle island's transport tensors to fp32, preserving its representation."""
+    r"""Cast only an oracle island's transport tensors to fp32, preserving its representation.
+
+    Float64 factors are kept: they are frame pairs escalated because their float32 storage was not
+    mutually inverse (audit 2026-09-23 #12), and re-rounding them here would restore that defect.
+    The transport contractions promote fp32 beliefs themselves and return fp32.
+    """
+    def _float(t: torch.Tensor) -> torch.Tensor:
+        return t if t.dtype == torch.float64 else t.float()
+
     if isinstance(omega, torch.Tensor):
-        return omega.float()
+        return _float(omega)
     # cond_escalation MUST be carried on every rebuild (audit 2026-08-05): it defaults to False, so
     # dropping it here silently disabled the opt-in conditioning guard INSIDE the oracle island while
     # the rest of the forward still had it on -- the gradient and the reported objective would then
@@ -47,15 +55,15 @@ def _transport_to_float(
     # transport.py propagates it; these three did not.
     if isinstance(omega, CompactFactoredTransport):
         return CompactFactoredTransport(
-            omega.exp_blocks.float(), omega.inv_blocks.float(), omega.K,
+            _float(omega.exp_blocks), _float(omega.inv_blocks), omega.K,
             mean_per_head=omega.mean_per_head,
             same_frame_flat_cocycle=omega.same_frame_flat_cocycle,
             cond_escalation=omega.cond_escalation,
         )
     if isinstance(omega, FactoredTransport):
         return FactoredTransport(
-            exp_phi=omega.exp_phi.float(),
-            exp_neg_phi=omega.exp_neg_phi.float(),
+            exp_phi=_float(omega.exp_phi),
+            exp_neg_phi=_float(omega.exp_neg_phi),
             irrep_dims=omega.irrep_dims,
             mean_per_head=omega.mean_per_head,
             same_frame_flat_cocycle=omega.same_frame_flat_cocycle,
@@ -64,7 +72,7 @@ def _transport_to_float(
     if isinstance(omega, RopeTransport):
         return RopeTransport(
             base=_transport_to_float(omega.base),
-            rope=omega.rope.float(),
+            rope=_float(omega.rope),
             on_cov=omega.on_cov,
             on_value=omega.on_value,
             insertion=omega.insertion,

@@ -89,7 +89,9 @@ def common_frame_kl_energy(
     if any(dtype not in (torch.float32, torch.float64) for dtype in (*dtypes, U.dtype, V.dtype)):
         return None
     public_dtype = torch.float64 if torch.float64 in dtypes else torch.float32
-    work = torch.float64 if precision_policy == "fp64" or public_dtype == torch.float64 else torch.float32
+    # Escalated float64 frames (audit 2026-09-23 #12) are contracted at float64, not re-rounded.
+    work = (torch.float64 if precision_policy == "fp64" or public_dtype == torch.float64
+            or torch.float64 in (U.dtype, V.dtype) else torch.float32)
     # Preserve the stricter pair-pivot policy rather than substituting a token proxy.
     if precision_policy == "fp32_escalate_cond":
         return None

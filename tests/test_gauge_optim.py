@@ -124,18 +124,21 @@ def test_default_adamw_one_step_is_byte_identical_to_golden():
         data = tensor.detach().cpu().contiguous().numpy().tobytes()
         return hashlib.sha256(data).hexdigest()
 
-    # These digests are UNCHANGED by audit 2026-07-25 F3, and that is a deliberate property worth
+    # Re-captured 2026-09-23 on this tree (torch 2.10.0.dev20251210+cu128, CPU), at the user's
+    # request: the previous digests had unknown provenance and matched under no pinned default,
+    # clipping policy, or AdamW kernel while the loss stayed bit-identical.
+    # These digests were UNCHANGED by audit 2026-07-25 F3, and that is a deliberate property worth
     # stating. F3 makes the factored diagonal congruence escalate to float64 when its (mixed-sign,
     # non-manifestly-nonnegative) regrouping actually loses nonnegativity. A well-conditioned step
     # like this one never triggers the escalation, so it still runs entirely in float32 and remains
     # bit-identical. An UNCONDITIONAL float64 upcast would have moved every digest here while leaving
     # `loss` bit-identical -- same forward value, different low-order gradient bits -- which is
     # precisely the golden churn the data-driven escalation avoids.
-    assert digest(model.prior_bank.mu_embed) == "75c40d1b09a080c392223ff5160794c886e371193b7ba79a18fcab05febfd288"
-    assert digest(model.prior_bank.sigma_log_embed) == "6f5f7fe389ec74bc1a27b0a162defce8b50aedc1ebbcd601bcfea12442c1cb33"
-    assert digest(model.prior_bank.phi_embed) == "0526f6ab4e6fc547285a40cdabb36444f16e3b6523d79c5e5766861fcc661adb"
+    assert digest(model.prior_bank.mu_embed) == "04cf10170cdb51ac2c26c6221fd0bda04ef7e30073b59d438d81c63bb48bc297"
+    assert digest(model.prior_bank.sigma_log_embed) == "147210f839396e8a7c921b71b208b2015882f4dc976eaf7fdc99a4b0eb6ded0c"
+    assert digest(model.prior_bank.phi_embed) == "ed12aa377b86dc75bd3aea2b9bee02687086c7b24d8f7155a86342d422311f35"
     assert digest(model.prior_bank.decode_log_scale) == "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
-    assert digest(model.prior_bank.output_proj_weight) == "a200e956283737dd6aaba9de0194aecf2d1613bdb76b71feb12f8c641fd0b708"
+    assert digest(model.prior_bank.output_proj_weight) == "8b9304d32b06d625b58200061a864f0400e1621b68bc339c416f215c89b7783d"
 
 
 def test_default_adamw_one_step_matches_recompute_dense_low_level_oracle(

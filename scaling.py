@@ -113,7 +113,7 @@ CONFIG: Dict[str, Any] = {
 # divisible by n_heads (and even per-head widths with RoPE). Depth adds layer-owned
 # relational maps and MLPs when enabled. Step sweeps hold model size and batch/context fixed.
 SWEEPS: Dict[str, List[int]] = {
-    "widths": [40, 80, 160],
+    "widths": [20, 40, 80, 160],     # four sizes: the analyzer withholds R^2/CI below four
     "depths": [1, 2, 4, 6],
     "train_steps": [10000, 30000, 100000],
 }

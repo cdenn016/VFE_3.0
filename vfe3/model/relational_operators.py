@@ -191,4 +191,6 @@ class RelationalOperators(nn.Module):
             if not frame.block_diagonal:
                 body = body.reshape(*mu.shape[:-1], mu.shape[-1])
             result = (frame.forward.to(dtype) @ body.unsqueeze(-1)).squeeze(-1)
-        return result.reshape(*mu.shape[:-1], mu.shape[-1])
+        # An escalated float64 frame (audit 2026-09-23 #12) promotes the computation only; the
+        # result keeps the dtype the lower-precision frame would have produced.
+        return result.reshape(*mu.shape[:-1], mu.shape[-1]).to(_compute_dtype(mu, self.T, self.O))

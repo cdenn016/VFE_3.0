@@ -71,6 +71,10 @@ from vfe3.numerics import (                    # non-equivariant / non-PD fallba
     reset_mu_trust_fallback_elements,
 )
 from vfe3.relational_scoring import reset_source_recovery_elements   # projected float64 source-factor recovery count
+from vfe3.geometry.transport import (                           # float64 frame-pair escalation count
+    frame_pair_fp64_escalations,
+    reset_frame_pair_fp64_escalations,
+)
 
 
 _PHI_CLAMP_WARNED:   bool = False
@@ -1418,7 +1422,8 @@ def _terminal_validation_signature(
          dataset.overlap_prefix, dataset.n, loader.batch_size, loader.drop_last,
          loader.batch_sampler.batch_size, loader.batch_sampler.drop_last),
         (nonfinite_tangent_elements(), mu_trust_fallback_elements(),
-         mm_cholesky_fallback_elements(), decode_logdet_fallback_elements()),
+         mm_cholesky_fallback_elements(), decode_logdet_fallback_elements(),
+         frame_pair_fp64_escalations()),
     )
 
 
@@ -2011,6 +2016,7 @@ def train(
     reset_decode_logdet_fallback_elements()   # ... and the decode log-det non-PD fallback
     reset_mm_cholesky_fallback_elements()   # ... and failed full-Gaussian MM Cholesky rows
     reset_source_recovery_elements()        # ... and projected float64 source-factor recoveries
+    reset_frame_pair_fp64_escalations()     # ... and float64 frame-pair escalations
 
     def _step_indices() -> Iterable[int]:
         if not show_bar:
@@ -2579,6 +2585,7 @@ def train(
             "mu_trust_fallback_elements": int(mu_fallbacks),
             "mm_cholesky_fallback_elements": int(mm_fallbacks),
             "decode_logdet_fallback_elements": int(decode_logdet_fallback_elements()),
+            "frame_pair_fp64_escalations": int(frame_pair_fp64_escalations()),
         }
         if skipped_total or neutralized or mu_fallbacks or mm_fallbacks:
             logger.warning(

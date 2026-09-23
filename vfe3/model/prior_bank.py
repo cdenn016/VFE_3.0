@@ -1341,7 +1341,14 @@ class PriorBank(nn.Module):
                 f"{expected_frame_shape}, got forward={tuple(canonical_frame.forward.shape)} and "
                 f"inverse={tuple(canonical_frame.inverse.shape)}"
             )
-        if (canonical_frame.forward.dtype != mu_q.dtype
+        # Exactly one mismatch is admitted: a float64 frame pair escalated from float32 storage
+        # (audit 2026-09-23 #12) against a same-dtype lower-precision query. It pulls back at
+        # float64 and returns the query's dtype; every other mismatch still fails closed.
+        escalated = (canonical_frame.forward.dtype == torch.float64
+                     and canonical_frame.inverse.dtype == torch.float64
+                     and mu_q.dtype != torch.float64
+                     and sigma_q.dtype == mu_q.dtype)
+        if not escalated and (canonical_frame.forward.dtype != mu_q.dtype
                 or canonical_frame.inverse.dtype != mu_q.dtype
                 or sigma_q.dtype != mu_q.dtype):
             raise ValueError(
@@ -1357,6 +1364,10 @@ class PriorBank(nn.Module):
                 f"query={mu_q.device}, variance={sigma_q.device}, "
                 f"forward={canonical_frame.forward.device}, inverse={canonical_frame.inverse.device}"
             )
+        if escalated:
+            mu_c, cov_c = pullback_diagonal_query(
+                mu_q.double(), sigma_q.double(), canonical_frame.inverse)
+            return mu_c.to(mu_q.dtype), cov_c.to(mu_q.dtype)
         return pullback_diagonal_query(mu_q, sigma_q, canonical_frame.inverse)
 
     def decode(

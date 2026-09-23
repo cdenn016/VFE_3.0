@@ -22,9 +22,20 @@ from vfe3.model.model import VFEModel
 V, K, H, N, B = 11, 4, 2, 6, 2
 
 
+# The route these rules were derived on: the launcher as audited on 2026-09-23. Pinned so the
+# tests do not track later edits to the user-editable launcher dict.
+_AUDITED_ROUTE = dict(
+    n_layers=2, family="gaussian_full", decode_mode="full_chunked", untie_decode_bank=True,
+    lambda_alpha_mode="constant", decode_av_precision="fp32",
+    decode_ranking_fp64_escalation=False, full_cov_congruence_certification=False,
+    skip_belief_sigma_update=False,
+)
+
+
 def _launcher(**overrides: Any) -> Dict[str, Any]:
-    """The train_vfe3 config dict at tiny width (every other launcher value kept)."""
+    """The train_vfe3 config dict at tiny width, on the audited route (other launcher values kept)."""
     cfg = copy.deepcopy(dict(train_vfe3.config))
+    cfg.update(_AUDITED_ROUTE)
     cfg.update(vocab_size=V, embed_dim=K, n_heads=H, max_seq_len=N, kl_max=8 * K,
                amp_dtype=None, batch_size=B, eval_stride=None, attention_window=N)
     cfg.update(overrides)
