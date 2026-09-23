@@ -667,6 +667,17 @@ class VFE3Config:
     # the additional certificate or fallback recompute.
     full_cov_congruence_certification: bool = False
 
+    # Conditioning-triggered float64 source recovery in the projected attention scorers. A float32
+    # projected covariance G whose zero-jitter Cholesky FAILS is always rebuilt from its source
+    # (X = S U^-1 Sigma^1/2, QR in float64). With this on, entries that factor but fail the
+    # certificate eps_32 ||G||_F ||G^-1||_F <= 1e-4 are rebuilt too. It is OPT-IN because it is not
+    # free: torch.linalg.qr on CUDA factors the flagged matrices one at a time. At B=64, N=128, K=20,
+    # H=2 on the launcher route it flagged 8,019 of 16,384 query entries by step 250 and cost
+    # ~550 ms per scorer call forward+backward against 11 ms without it, taking the RTX 5090 step
+    # from 0.11 s to 0.60-0.79 s. Off, a flagged entry keeps its float32 factor (relative error
+    # O(kappa eps_32) in its scores) and the certificate's two batched inverses are skipped.
+    projected_cov_condition_recovery: bool = False
+
     # Scaling of safe_cholesky's jitter ladder. The ridge eps*10^t is ABSOLUTE by default, so at an
     # eigenvalue on the eps=1e-6 SPD floor the t=0 ridge DOUBLES it and shifts logdet by exactly
     # log 2 per floored direction, while at sigma_max=100 the same ridge is a 1e-8 relative no-op.
@@ -1628,6 +1639,10 @@ class VFE3Config:
             raise ValueError(
                 "full_cov_congruence_certification must be bool, got "
                 f"{self.full_cov_congruence_certification!r}")
+        if not isinstance(self.projected_cov_condition_recovery, bool):
+            raise ValueError(
+                "projected_cov_condition_recovery must be bool, got "
+                f"{self.projected_cov_condition_recovery!r}")
         if self.safe_cholesky_jitter_mode not in ("absolute", "relative"):
             raise ValueError(
                 "safe_cholesky_jitter_mode must be one of ('absolute', 'relative'), "
@@ -2292,6 +2307,8 @@ class VFE3Config:
             mark(("relational_identity_content", "m_relational_score_lr", "m_relational_content_lr",
                   "relational_routing"),
                  "only read by projected attention; transported attention creates no relational parameters")
+            mark(("projected_cov_condition_recovery",),
+                 "only read by the projected attention scorers")
         else:
             mark(("compile_pair_kernel",), "projected attention bypasses the belief-gradient pair kernel")
         gradient_controls = ("e_q_mu_lr", "e_q_sigma_lr", "e_step_mu_precond",

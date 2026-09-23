@@ -53,6 +53,28 @@ def reset_source_recovery_elements() -> None:
         count.zero_()
 
 
+# Conditioning-triggered float64 source recovery (config ``projected_cov_condition_recovery``,
+# installed by VFEModel). Off, only entries whose zero-jitter float32 Cholesky FAILS are rebuilt
+# from source; entries that factor but fail the certificate eps_32 ||G||_F ||G^{-1}||_F <= 1e-4
+# keep their float32 factor, and the certificate itself is not evaluated.
+_CONDITION_RECOVERY: bool = False
+
+
+def set_projected_condition_recovery(enabled: bool) -> bool:
+    r"""Set conditioning-triggered float64 source recovery; returns the previous value."""
+    if not isinstance(enabled, bool):
+        raise ValueError(f"projected condition recovery must be bool, got {enabled!r}")
+    global _CONDITION_RECOVERY
+    previous = _CONDITION_RECOVERY
+    _CONDITION_RECOVERY = enabled
+    return previous
+
+
+def projected_condition_recovery() -> bool:
+    r"""Return whether factored but ill-conditioned float32 entries take source recovery."""
+    return _CONDITION_RECOVERY
+
+
 def _compute_dtype(*tensors: torch.Tensor) -> torch.dtype:
     return torch.float64 if any(tensor.dtype == torch.float64 for tensor in tensors) else torch.float32
 
@@ -186,13 +208,16 @@ def _cholesky_status(G: torch.Tensor) -> Tuple[torch.Tensor, ...]:
     second host synchronization and masked gathers to evaluate this same certificate on the flagged
     entries (audit 2026-09-23 low). The recovery decision is unchanged: the screen was a necessary
     condition for the certificate, and the certificate alone decided recovery.
+
+    The certificate is evaluated only under :func:`projected_condition_recovery`. Otherwise
+    ``screen`` is all False and only failed factorizations are flagged for recovery.
     """
     chol, info = torch.linalg.cholesky_ex(G, check_errors=False)
     with torch.no_grad():
         failed = (info != 0) | ~torch.isfinite(chol).all(dim=(-2, -1))
         screen = torch.zeros_like(failed)
         r = G.shape[-1]
-        if G.dtype == torch.float32 and r > 1:
+        if G.dtype == torch.float32 and r > 1 and _CONDITION_RECOVERY:
             eye = torch.eye(r, device=G.device, dtype=G.dtype)
             safe_factor = torch.where(failed[..., None, None], eye, chol)
             inverse_norm = torch.cholesky_inverse(safe_factor).norm(dim=(-2, -1))
@@ -213,7 +238,8 @@ def _strict_cholesky(
     r"""Factor G with zero jitter, optionally recovering its factor from source moments.
 
     A failed rounded Gram matrix can lose SPD although its source measurement
-    still has full row rank. For failed or poorly conditioned float32 entries, reconstruct
+    still has full row rank. For failed float32 entries, and for poorly conditioned ones under
+    :func:`projected_condition_recovery`, reconstruct
     X = S U^{-1} Sigma^{1/2} in float64 and factor X^T = QR, giving C = R^T.
     No jitter, covariance floor, or projection constraint is introduced.
 

@@ -89,6 +89,7 @@ def test_mixed_success_and_fallback_batch_has_finite_gradients(device: torch.dev
     assert all(torch.isfinite(g).all() and g.abs().sum() > 0 for g in gradients)
 
 
+@pytest.mark.usefixtures("condition_recovery_on")
 def test_recovery_keeps_healthy_pair_tiles_in_working_dtype(device: torch.device) -> None:
     r"""Healthy-healthy pair tiles beside a recovered entry stay in the working dtype.
 
