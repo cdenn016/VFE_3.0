@@ -289,6 +289,8 @@ def projected_gaussian_kl(
         # triangular solves. Healthy-healthy tiles keep the cheap einsum path in the
         # working dtype; the healthy factors round-trip bit-exactly through the cast.
         factor_trace_any = rec_q is not None or rec_k is not None
+        # Healthy tiles read the working-dtype means; only factor-route tiles use float64 means.
+        aq_healthy, ak_healthy = aq.movedim(-2, -3), ak.movedim(-2, -3)  # (..., H, N, r)
         if factor_trace_any:
             # Preserve source accuracy through means, triangular solves and the final scalar.
             for role, projection in enumerate((projection_q, projection_k)):
@@ -346,7 +348,7 @@ def projected_gaussian_kl(
                             q_factor[..., i:i+q_step, :, :], k_factor[..., j:j+k_step, :, :],
                             logdet_q[..., i:i+q_step], logdet_k[..., j:j+k_step])
                 else:
-                    args = (aq[..., i:i+q_step, :], ak[..., j:j+k_step, :],
+                    args = (aq_healthy[..., i:i+q_step, :], ak_healthy[..., j:j+k_step, :],
                             q_cov_healthy[..., i:i+q_step, :, :], k_prec_healthy[..., j:j+k_step, :, :],
                             logdet_q_healthy[..., i:i+q_step], logdet_k_healthy[..., j:j+k_step])
                 if torch.is_grad_enabled() and (nq > q_step or nk > k_step) and any(x.requires_grad for x in args):

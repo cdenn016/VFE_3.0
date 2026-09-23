@@ -5,7 +5,7 @@ import torch
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.gradients.relational import relational_score
 from vfe3.model.relational_operators import RelationalOperators
-from vfe3.relational_scoring import projected_gaussian_kl, projected_moments
+from vfe3.relational_scoring import _strict_cholesky, projected_gaussian_kl, projected_moments
 
 
 def _inputs(device: str | torch.device = "cpu") -> tuple:
@@ -87,3 +87,34 @@ def test_mixed_success_and_fallback_batch_has_finite_gradients(device: torch.dev
                                  projection_k=(sigma, inverse, identity))
     gradients = torch.autograd.grad(score.sum(), (S, inverse))
     assert all(torch.isfinite(g).all() and g.abs().sum() > 0 for g in gradients)
+
+
+def test_recovery_keeps_healthy_pair_tiles_in_working_dtype(device: torch.device) -> None:
+    r"""Healthy-healthy pair tiles beside a recovered entry stay in the working dtype.
+
+    Thirty-three query tokens span two 32-row pair tiles and only query token 0 is
+    ill-conditioned, so the second row tile never touches a recovered factor and
+    must pair working-dtype means with the working-dtype key precision.
+    """
+    generator = torch.Generator().manual_seed(5)
+    mu_q, mu_k = (torch.randn(1, 33, 1, 2, generator=generator).to(device) for _ in range(2))
+    sigma_q, sigma_k = (torch.ones(1, 33, 1, 2, device=device) for _ in range(2))
+    sigma_q[0, 0, 0, 1] = 1e-4  # cond(G) = 1e4 exceeds the float32 certificate
+    variables = tuple(x.requires_grad_() for x in (mu_q, mu_k, sigma_q, sigma_k))
+    inverse = torch.eye(2, device=device).expand(1, 33, 1, 2, 2)
+    S = torch.eye(2, device=device)[None]
+    aq, Gq = projected_moments(mu_q, sigma_q, inverse, S)
+    ak, Gk = projected_moments(mu_k, sigma_k, inverse, S)
+    source_q, source_k = (sigma_q, inverse, S, mu_q), (sigma_k, inverse, S, mu_k)
+    assert _strict_cholesky(Gq.detach(), source_q)[1].nonzero().tolist() == [[0, 0, 0]]
+    assert _strict_cholesky(Gk.detach(), source_k)[1] is None
+    score = projected_gaussian_kl(aq, Gq, ak, Gk, projection_q=source_q, projection_k=source_k)
+    assert score.dtype == torch.float32
+    aq64, Gq64 = projected_moments(mu_q.double(), sigma_q.double(), inverse.double(), S.double())
+    ak64, Gk64 = projected_moments(mu_k.double(), sigma_k.double(), inverse.double(), S.double())
+    reference = projected_gaussian_kl(aq64, Gq64, ak64, Gk64)
+    torch.testing.assert_close(score.double(), reference, rtol=2e-5, atol=2e-5)
+    for actual_grad, reference_grad in zip(
+            torch.autograd.grad(score.sum(), variables, retain_graph=True),
+            torch.autograd.grad(reference.sum(), variables)):
+        torch.testing.assert_close(actual_grad, reference_grad, rtol=5e-4, atol=5e-3)
