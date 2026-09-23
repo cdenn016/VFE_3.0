@@ -15,6 +15,7 @@ import torch
 
 from vfe3.alpha_i import alpha_gradient_coefficient, alpha_is_per_coord
 from vfe3.families.base import get_family
+from vfe3.families.policy import family_instance as _family_instance
 from vfe3.families.gaussian import diag_kl_unclamped, diag_kl_unclamped_per_coord
 from vfe3.free_energy import attention_weights, pairwise_energy, self_divergence_for_alpha
 from vfe3.geometry.transport import (
@@ -32,13 +33,6 @@ from vfe3.numerics import _count_mm_cholesky_fallback, safe_cholesky
 
 _KERNELS: Dict[str, Callable] = {}
 _COMPILED_KERNELS: Dict[str, Callable] = {}   # lazy torch.compile cache (compile_pair_kernel toggle)
-
-
-def _family_instance(family, mu: torch.Tensor, sigma: torch.Tensor, precision_policy: Optional[str]):
-    """Construct the built-in full family with an explicit model policy when supplied."""
-    if family is FullGaussian and precision_policy is not None:
-        return family(mu, sigma, _precision_policy=precision_policy)
-    return family(mu, sigma)
 
 
 @dataclass(frozen=True)
@@ -782,8 +776,8 @@ def mm_exact_update(
     sigma_t = transport_covariance(omega, sigma_k, diagonal_out=(sigma_k.dim() == mu_k.dim()))
     fam = get_family(family)
     sd = self_divergence_for_alpha(
-                                   _family_instance(fam, mu, sigma, full_cov_kl_precision),
-                                   _family_instance(fam, mu_p, sigma_p, full_cov_kl_precision), alpha=1.0, kl_max=kl_max, eps=eps,
+                                   _family_instance(mu, sigma, fam, full_cov_kl_precision),
+                                   _family_instance(mu_p, sigma_p, fam, full_cov_kl_precision), alpha=1.0, kl_max=kl_max, eps=eps,
                                    divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode)
     pair_stats = None
     decoupled_value = isinstance(omega, RopeTransport) and not omega.on_value
@@ -816,7 +810,7 @@ def mm_exact_update(
         key = (fam.from_transported(mu_t, sigma_t, sigma_k, _precision_policy=full_cov_kl_precision)
                if fam is FullGaussian and full_cov_kl_precision is not None
                else fam.from_transported(mu_t, sigma_t, sigma_k))
-        energy = pairwise_energy(_family_instance(fam, mu, sigma, full_cov_kl_precision), key,
+        energy = pairwise_energy(_family_instance(mu, sigma, fam, full_cov_kl_precision), key,
                                  alpha=1.0, kl_max=kl_max, eps=eps,
                                  divergence_family=divergence_family, irrep_dims=irrep_dims)
     else:

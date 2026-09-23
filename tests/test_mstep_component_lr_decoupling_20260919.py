@@ -108,7 +108,7 @@ def test_layernorm_group_reports_its_own_auxiliary_rate() -> None:
 
 _NOTICE_BASE = dict(vocab_size=8, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
                     family="gaussian_diagonal", gauge_group="block_glk",
-                    skip_belief_sigma_update=True, relational_mode="projected_filtering",
+                    skip_belief_sigma_update=True, attention_mode="projected_conditional",
                     relational_input_scope="full")
 
 
@@ -173,18 +173,35 @@ def test_an_unset_component_rate_inherits_its_component_step_size() -> None:
 # the ablation sweeps registered for both
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("name,expected_arms", [("m_pos_phi_lr", 4), ("m_layernorm_lr", 4)])
-def test_sweeps_are_registered_and_construct(name: str, expected_arms: int) -> None:
+@pytest.fixture
+def fixed_component_sweeps(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test sweep behavior independently of the user's editable experiment choices."""
+    import ablation
+    baseline = serialize_config(_cfg(m_phi_lr=0.0015, m_p_mu_lr=0.009,
+                                     m_pos_phi_lr=None, m_layernorm_lr=None))
+    monkeypatch.setattr(ablation, "_resolved_sweep_baseline", lambda: dict(baseline))
+    for name, values in (("m_pos_phi_lr", [0.0005, 0.0015, 0.003, 0.006]),
+                         ("m_layernorm_lr", [0.001, 0.003, 0.009, 0.02])):
+        monkeypatch.setitem(ablation.SWEEPS, name, dict(ablation.SWEEPS[name], values=values))
+
+
+@pytest.mark.parametrize("name", ["m_pos_phi_lr", "m_layernorm_lr"])
+def test_sweeps_are_registered_and_construct(name: str, fixed_component_sweeps: None) -> None:
     import ablation
     assert name in ablation.SWEEPS
-    ablation.validate_sweeps([name], require_construction=True)   # includes the all-arms-inert guard
-    assert ablation.sweep_n_runs(ablation.SWEEPS[name]) == expected_arms
+    ablation.validate_sweeps([name], require_construction=True)
+    assert ablation.sweep_n_runs(ablation.SWEEPS[name]) == 4
 
 
 @pytest.mark.parametrize("name,inherited", [("m_pos_phi_lr", 0.0015), ("m_layernorm_lr", 0.009)])
-def test_each_sweep_contains_the_inherited_baseline_arm(name: str, inherited: float) -> None:
-    """Each sweep carries an arm at the value the parameter used to inherit, so the decoupling is
-    measured against an arm that reproduces the pre-decoupling baseline rather than confounded
-    with a rate change."""
+def test_sweep_preserves_explicit_inherited_baseline_arm(
+    name: str, inherited: float, fixed_component_sweeps: None,
+) -> None:
+    """A requested inherited-rate control survives arm generation and config resolution."""
     import ablation
-    assert inherited in ablation.SWEEPS[name]["values"]
+    arms = ablation.make_run_overrides(name)
+    controls = [overrides for _, overrides in arms if overrides[name] == inherited]
+    assert len(controls) == 1
+    cfg = VFE3Config(**ablation._cell_cfg_dict(controls[0], seed=0))
+    assert getattr(cfg, name) == inherited
+    assert inherited == (cfg.m_phi_lr if name == "m_pos_phi_lr" else cfg.m_p_mu_lr)

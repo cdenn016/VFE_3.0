@@ -75,8 +75,8 @@ def test_adamw_reports_nondefault_group_trust_radius() -> None:
 
 def test_scaling_rejects_inert_mup_before_creating_model(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     import scaling
-    baseline = dict(scaling.BASELINE, e_step_update="mm_exact", relational_mode="off",
-                    relational_readout_mode="conditional_update", relational_output_scope="head",
+    baseline = dict(scaling.BASELINE, e_step_update="mm_exact", attention_mode="transported",
+                    relational_output_scope="head",
                     attention_residual=False, eval_stride=None,
                     embed_dim=4, n_heads=2, vocab_size=7, max_seq_len=3, n_layers=1)
     monkeypatch.setattr(scaling, "BASELINE", baseline)

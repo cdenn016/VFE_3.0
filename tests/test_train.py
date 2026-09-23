@@ -649,14 +649,13 @@ def test_train_step_skips_on_nonfinite_grad_with_finite_loss():
 
 
 # =============================================================================
-# Gradient-clipping runtime pinning (PB-15): None/zero disable, global vs
-# per-role clip counts, omitted-vs-explicit equivalence, terminal-callback seam.
+# Gradient-clipping runtime pinning (PB-15): None/zero disable,
+# fixed per-role clip counts, omitted-vs-explicit equivalence, terminal-callback seam.
 # =============================================================================
 
-def _clip_case(*, per_role=False):
+def _clip_case():
     cfg = VFE3Config(
         vocab_size=8, embed_dim=4, n_heads=2, max_seq_len=4,
-        grad_clip_per_role=per_role,
     )
     model = VFEModel(cfg)
     optimizer = build_optimizer(model, cfg)
@@ -680,15 +679,17 @@ def _install_clip_spy(monkeypatch):
     return calls
 
 
-def test_grad_clip_global_calls_once_with_all_parameters(monkeypatch):
-    model, optimizer, scheduler, tokens, targets = _clip_case(per_role=False)
+def test_grad_clip_roles_do_not_rescale_each_other(monkeypatch):
+    model, optimizer, scheduler, tokens, targets = _clip_case()
+    parameters = [group["params"][0] for group in optimizer.param_groups[:2]]
+    assert optimizer.param_groups[0]["role"] != optimizer.param_groups[1]["role"]
     calls = _install_clip_spy(monkeypatch)
     train_step(model, optimizer, scheduler, tokens, targets, grad_clip=0.25)
-    assert calls == [({id(p) for p in model.parameters()}, 0.25)]
+    assert not any(all(id(parameter) in ids for parameter in parameters) for ids, _ in calls)
 
 
 def test_grad_clip_per_role_calls_once_per_nonempty_role(monkeypatch):
-    model, optimizer, scheduler, tokens, targets = _clip_case(per_role=True)
+    model, optimizer, scheduler, tokens, targets = _clip_case()
     expected = {}
     for group in optimizer.param_groups:
         expected.setdefault(group.get("role", "other"), set()).update(

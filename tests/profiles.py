@@ -11,7 +11,7 @@ def tiny_config(**overrides: object) -> VFE3Config:
                   beta_attention_prior='causal', fp32_matmul_precision=None,
                   decode_ranking_fp64_escalation=False, decode_av_precision='fp32',
                   e_mu_q_trust=None, block_mlp_expansion=2, transport_clamp_monitor=False,
-                  generate_embedding_figures=False, exp_fp64_mode='dim',
+                  generate_embedding_figures=False,
                   exp_fp64_norm_threshold=15., full_cov_congruence_certification=False,
                   skip_belief_sigma_update=False)
     values.update(overrides)

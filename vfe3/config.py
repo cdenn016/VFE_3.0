@@ -25,15 +25,16 @@ class ConfigNotice(UserWarning):
     ignores.
 
     Subclasses ``UserWarning``, so anything already filtering or asserting on ``UserWarning``
-    (``pytest.warns``, the ablation inertness guard) keeps matching without changes.
+    (such as ``pytest.warns``) keeps matching without changes. Sweep validation reads
+    ``inactive_fields()`` directly.
     """
 
 
 # Console visibility of ConfigNotice. Default HIDDEN: on a settled config these fire on every single
 # construction -- every ablation arm, every worker -- and say nothing new after the first read.
 # Suppression is a DISPLAY filter, not a removal: ``warnings.catch_warnings`` with an explicit
-# ``simplefilter`` still sees them, which is why ``ablation.validate_sweeps``'s dead-sweep detector
-# (audit 2026-08-06 A1/F20) is unaffected and keeps failing a sweep whose swept parameter is inert.
+# ``simplefilter`` still sees them. Sweep admission uses the structured activity map,
+# independently of this display setting.
 #
 # Enable with ``VFE3_CONFIG_NOTICES=1`` in the environment, or ``set_config_notices(True)`` before
 # constructing the config.
@@ -340,13 +341,10 @@ class VFE3Config:
     #          Methods
     #################################
 
-    # Exact projected Gaussian routing with the conditional ambient mean update. Every relational
-    # rank is the head dimension; identity content drops the T/O value maps. DEFAULTS ARE THE PURE
-    # PATH: the relational regime is opt-in and fully reachable by setting all four explicitly, as
-    # train_vfe3.py does. A bare VFE3Config() must stay constructible -- the relational envelope
-    # rejects the untouched defaults -- so the pure/legacy path stays the documented default.
-    relational_mode:                     str           = "off"                  # "off" | "projected_filtering"
-    relational_readout_mode:             str           = "conditional_update"   # "conditional_update" | "predictive_content"
+    # One attention selector chooses transported inference, conditional projected updates, or
+    # predictive projected content. Projection ranks still follow the gauge block dimensions.
+    # Projected attention requires the explicit support envelope validated below.
+    attention_mode:                      str           = "transported"          # "transported" | "projected_conditional" | "projected_predictive"
     relational_input_scope:              str           = "head"                 # "head" | "full"
     relational_output_scope:             str           = "head"                 # "head" | "full"
     attention_residual:                  bool          = False                  # requires predictive_content
@@ -602,14 +600,9 @@ class VFE3Config:
 
     mu_trust_mode:             str   = "ball"          # "ball" | "box" (consulted only when e_mu_q_trust is not None)
 
-    # Global-norm gradient clipping threshold consumed by train(). None disables clipping.
+    # L2 clipping threshold applied independently to each optimizer role after accumulation.
+    # None or zero disables clipping.
     grad_clip:       Optional[float] = 1.0
-
-    # Per-role gradient clipping: clip each optimizer role group (mu / sigma / phi / ...) to
-    # grad_clip separately instead of one GLOBAL norm over all parameters (which is dominated by
-    # phi_embed and silently rescales every other group when it binds). False = the pure
-    # long-standing global clip.
-    grad_clip_per_role:        bool  = True
 
     # Opt-in mixed precision for CUDA throughput (RTX 5090). None (default) = OFF = the pure fp32
     # path: NO autocast context is entered anywhere in the forward, so the loss/logits are
@@ -631,12 +624,9 @@ class VFE3Config:
     # permit TF32/bf16x3 reductions.
     fp32_matmul_precision: Optional[str] = "highest"       # None (leave as-is) | "highest" | "high" | "medium"
 
-    # fp64 island keying for stable_matrix_exp_pair. 'dim' (default): upcast when the block dim >=
-    # its dim_threshold (the long-standing rule). 'norm': upcast only when the clamped block
-    # Frobenius norm exceeds exp_fp64_norm_threshold -- the conditioning argument is a norm argument,
-    # not a dimension argument; small-norm blocks are fp32-accurate at any dim.
-    exp_fp64_mode:             str   = "norm"          # "norm" | "dim"
-    exp_fp64_norm_threshold:   float = 20.0            # 'norm' mode: upcast when max ||M||_F >= this
+    # Matrix exponential precision is norm-based. The config threshold is passed explicitly;
+    # low-level geometry helpers retain their separate default threshold of 5.
+    exp_fp64_norm_threshold:   float = 20.0            # upcast when max ||M||_F >= this
 
     # Second trigger for the diagonal-congruence float64 escalation. The DEFAULT guard is sign-only:
     # recompute in float64 iff the working-dtype congruence went negative -- one amin reduction the
@@ -654,9 +644,7 @@ class VFE3Config:
     # family already keys its island on operand dtypes). "fp64" is the historical unconditional
     # float64 island, so leaving it alone is byte-identical to the pre-2026-08-05 build.
     # "fp32_escalate" evaluates the (B,N,N,K,K) grid in float32 and recomputes in float64 only when a
-    # Cholesky actually fails -- measured 15.7x faster on that kernel, with post-softmax attention
-    # weights moving by at most 4.0e-6 and zero SPD failures at the trained operating point. A
-    # float64 PUBLIC family still computes in float64 either way.
+    # Cholesky actually fails
     full_cov_kl_precision:     str   = "fp32_escalate"   # "fp32_escalate" | "fp64" | "fp32_escalate_cond"
 
     # Working precision of the full-covariance CONGRUENCE Omega Sigma Omega^T. Distinct from
@@ -673,7 +661,7 @@ class VFE3Config:
     # this checks 1,048,576 separate 20x20 matrices and the promoted field is about 3.1 GiB. Keep
     # this opt-in for accuracy investigations; False retains the selected working precision without
     # the additional certificate or fallback recompute.
-    full_cov_congruence_certification: bool = True
+    full_cov_congruence_certification: bool = False
 
     # Scaling of safe_cholesky's jitter ladder. The ridge eps*10^t is ABSOLUTE by default, so at an
     # eigenvalue on the eps=1e-6 SPD floor the t=0 ridge DOUBLES it and shifts logdet by exactly
@@ -782,39 +770,47 @@ class VFE3Config:
                     )
 
         # Validate the declared relational envelope before downstream selector coercions.
-        _require(self.relational_mode, ("off", "projected_filtering"), "relational_mode")
+        _require(self.attention_mode, ("transported", "projected_conditional", "projected_predictive"), "attention_mode")
         _require(self.relational_input_scope, ("head", "full"), "relational_input_scope")
         if type(self.attention_residual) is not bool:
             raise ValueError("attention_residual must be a bool")
-        if self.attention_residual:
-            if (self.relational_mode != "projected_filtering"
-                    or self.relational_readout_mode != "predictive_content"):
-                raise ValueError("attention_residual requires relational predictive_content")
-        _require(self.relational_readout_mode, ("conditional_update", "predictive_content"), "relational_readout_mode")
+        if self.attention_residual and self.attention_mode != "projected_predictive":
+            raise ValueError("attention_residual requires attention_mode='projected_predictive'")
         _require(self.relational_output_scope, ("head", "full"), "relational_output_scope")
-        if self.relational_output_scope == "full" and self.relational_readout_mode != "predictive_content":
+        if self.relational_output_scope == "full" and self.attention_mode != "projected_predictive":
             raise ValueError("relational_output_scope='full' requires predictive_content")
-        if self.relational_readout_mode == "predictive_content":
-            if self.relational_mode != "projected_filtering":
-                raise ValueError("predictive_content requires relational_mode='projected_filtering'")
-            if self.relational_identity_content:
-                raise ValueError("predictive_content requires learned content maps")
+        if self.attention_mode == "projected_predictive" and self.relational_identity_content:
+            raise ValueError("predictive_content requires learned content maps")
         for name in ("m_relational_score_lr", "m_relational_content_lr"):
             rate = getattr(self, name)
             if rate is not None and (
                     isinstance(rate, bool) or not isinstance(rate, Real)
                     or not math.isfinite(rate) or rate < 0.0):
                 raise ValueError(f"{name} must be finite and >= 0 or None, got {rate!r}")
-        if self.relational_mode == "projected_filtering":
+        if self.attention_mode != "transported":
             requirements = {
                 "divergence_family": "renyi",
                 "renyi_order": 1.0, "include_attention_entropy": True,
                 "gradient_mode": "filtering", "e_step_update": "gradient",
                 "e_step_gradient": "unroll", "oracle_unroll_grad": True,
-                "n_e_steps": 1, "skip_belief_sigma_update": True,
+                "n_e_steps": 1,
                 "e_phi_lr": 0.0, "transport_mode": "flat", "gauge_group": "block_glk",
-                "encode_mode": "per_token", "decode_mode": "linear",
+                "encode_mode": "per_token",
             }
+            # skip_belief_sigma_update is deliberately ABSENT from the envelope above: it is INERT
+            # on every projected route, not incompatible. 'projected_predictive' replaces the mean
+            # and keeps covariance (e_step.py predictive branch assigns sigma = belief.sigma and
+            # never reads the flag); 'projected_conditional' filtering returns grad_sigma=None by
+            # signature (relational.py:85), so there is no sigma arm to skip. The previous pin to
+            # True only kept skip=False from reaching the float*None retraction; the None guard in
+            # e_step_iteration covers that now. Inertness is reported by inactive_fields.
+            # decode_mode is deliberately ABSENT from the envelope above: the prior-bank KL
+            # decoders (diagonal_chunked / full_chunked / family_chunked) are live on this route.
+            # The fused CE path already branches on active_decode_mode != 'linear' (model.py), and
+            # family/cov-kind pairing for 'gaussian_full' + 'full_chunked' is enforced by the
+            # decoder registration and the rank checks below. Pinning 'linear' was a support
+            # default with no stated mathematical obstruction -- and the linear readout discards
+            # Sigma_q, which is exactly what a full-covariance family should not do at decode.
             # compile_pair_kernel is deliberately ABSENT from the envelope above: it is INERT here,
             # not incompatible. Its only consumer is the closed-form pair kernel inside
             # belief_gradients (kernels.py:669), which this mode never reaches -- with relational
@@ -844,7 +840,7 @@ class VFE3Config:
                 incompatible.append(f"family={self.family!r} (requires a supported Gaussian family)")
             # Predictive content composes through the existing stack; conditional updates
             # retain their original single-layer support envelope.
-            if self.relational_readout_mode != "predictive_content" and self.n_layers != 1:
+            if self.attention_mode == "projected_conditional" and self.n_layers != 1:
                 incompatible.append(f"n_layers={self.n_layers!r} (requires 1 for conditional_update)")
             if self.n_heads < 2:
                 incompatible.append(f"n_heads={self.n_heads!r} (requires at least 2)")
@@ -854,7 +850,7 @@ class VFE3Config:
                 incompatible.append(f"cross_couplings={self.cross_couplings!r} (requires none)")
             if incompatible:
                 raise ValueError(
-                    "relational_mode='projected_filtering' has unsupported configuration: "
+                    f"attention_mode={self.attention_mode!r} has unsupported projected_filtering configuration: "
                     + "; ".join(incompatible)
                 )
 
@@ -2163,7 +2159,6 @@ class VFE3Config:
         if not math.isfinite(self.unigram_kappa) or self.unigram_kappa < 0.0:
             raise ValueError(
                 f"unigram_kappa must be finite and >= 0, got {self.unigram_kappa}")
-        _require(self.exp_fp64_mode, ("dim", "norm"), "exp_fp64_mode")
         if (not math.isfinite(self.exp_fp64_norm_threshold)
                 or self.exp_fp64_norm_threshold <= 0.0):
             raise ValueError(
@@ -2185,190 +2180,20 @@ class VFE3Config:
                 ConfigNotice, stacklevel=2,
             )
 
-        # ------------------------------------------------------------------------------------------
-        # Detection only -- NOTHING below changes a config VALUE or a default; each block reports a
-        # condition that was previously silent. A knob could otherwise be turned with no observable
-        # effect and no way to distinguish that from an ineffective mechanism.
-        # ------------------------------------------------------------------------------------------
-        # Only report a setting the caller actually CHANGED from its dataclass default: several
-        # defaults are non-trivial, so an absolute test would fire on a bare VFE3Config() and break the
-        # invariant that a clean/pure config constructs with zero warnings.
-        _defaults = {f.name: f.default for f in fields(self) if f.default is not MISSING}
-
-        def _changed(*names: str) -> bool:
-            return any(name in _defaults and getattr(self, name) != _defaults[name] for name in names)
-
-        _inert: List[str] = []
-        if self.m_phi_update_mode != "pullback_group" and _changed("m_phi_group_trust_radius"):
-            _inert.append("m_phi_group_trust_radius (only read by m_phi_update_mode='pullback_group')")
-        if self.relational_mode == "off":
-            _relational_dead = [
-                name for name in (
-                    "relational_identity_content",
-                    "m_relational_score_lr", "m_relational_content_lr",
-                ) if _changed(name)
-            ]
-            if _relational_dead:
-                _inert.append(
-                    f"{'/'.join(_relational_dead)} (only read when "
-                    "relational_mode='projected_filtering'; mode 'off' creates no relational "
-                    "module, parameters, or state keys)"
-                )
-        # The reverse direction: a knob live on the NON-relational route and dead on the relational
-        # one. compile_pair_kernel's only consumer is the closed-form pair kernel inside
-        # belief_gradients; with relational operators present the E-step dispatches to the relational
-        # readout/gradient kernels instead, so the toggle cannot change a single number here. Advisory
-        # rather than an error, so an in-envelope click-to-run config is not blocked.
-        if self.relational_mode == "projected_filtering" and _changed("compile_pair_kernel"):
-            _inert.append(
-                f"compile_pair_kernel={self.compile_pair_kernel} (reached only by the "
-                "non-relational belief-gradient branch; this mode routes to the relational "
-                "readout/gradient kernels, which never consult it)"
-            )
-        if (self.relational_mode == "projected_filtering"
-                and self.relational_readout_mode == "predictive_content"):
-            predictive_dead = [name for name in (
-                "e_q_mu_lr", "e_q_sigma_lr", "e_step_mu_precond",
-                "e_mu_q_trust", "mu_trust_mode", "e_sigma_q_trust",
-            ) if _changed(name)]
-            if predictive_dead:
-                _inert.append(
-                    f"{'/'.join(predictive_dead)} (unread under predictive_content, "
-                    "which replaces the mean with its predictive mixture and keeps covariance)")
-        if (self.relational_readout_mode == "predictive_content"
-                and self.mstep_self_coupling_weight == 0.0
-                and _changed("lambda_alpha_mode", "lambda_alpha", "b0", "c0")):
-            _inert.append("lambda_alpha_mode/lambda_alpha/b0/c0 (unused by predictive_content "
-                          "when mstep_self_coupling_weight=0)")
-        if not self.use_block_mlp and _changed(
-                "block_mlp_mode", "block_mlp_covariance", "block_mlp_covariance_floor", "block_mlp_expansion",
-                "block_mlp_activation", "block_mlp_dropout", "m_block_mlp_lr"):
-            _inert.append(
-                "block MLP settings block_mlp_mode/block_mlp_covariance/block_mlp_covariance_floor/"
-                "block_mlp_expansion/block_mlp_activation/block_mlp_dropout/"
-                "m_block_mlp_lr (only read when use_block_mlp=True)")
-        if canonical_e_step_update != "mm_exact" and _changed("mm_damping"):
-            _inert.append(f"mm_damping={self.mm_damping} (only read by e_step_update='mm_exact')")
-        # The REVERSE direction of the rule above: the mm_exact branch of e_step_iteration reads only
-        # mm_damping/eps/sigma_max/skip_belief_sigma_update; every step-size, preconditioner,
-        # trust-region and SPD-retraction knob is read exclusively in the `else` (gradient) branch.
-        # Only the forward rule existed, so seven ablation sweeps varied these against an mm_exact
-        # baseline and recorded byte-identical arms.
-        if canonical_e_step_update == "mm_exact":
-            _mm_dead = [
-                name for name in (
-                    "e_q_mu_lr", "e_q_sigma_lr",
-                    "e_step_mu_precond", "e_mu_q_trust", "mu_trust_mode",
-                    "e_sigma_q_trust",
-                )
-                if _changed(name)
-            ]
-            if _mm_dead:
-                _inert.append(
-                    f"{'/'.join(_mm_dead)} (unread under e_step_update='mm_exact', whose only step "
-                    f"control is mm_damping={self.mm_damping}; set e_step_update='gradient' to use them)")
-        if (not self.use_priorbank_head_evidence_mixer
-                and _changed("m_head_evidence_lr")):
-            _inert.append(
-                "m_head_evidence_lr (only read when "
-                "use_priorbank_head_evidence_mixer=True)"
-            )
-        # m_pos_phi_lr is read only when the positional frame table EXISTS: pos_phi='learned' is the
-        # only mode that creates pos_phi_free, so 'none'/'frozen' have no parameter to step.
-        if self.pos_phi != "learned" and _changed("m_pos_phi_lr"):
-            _inert.append(
-                "m_pos_phi_lr (only read when pos_phi='learned', the only mode that creates the "
-                "learnable pos_phi_free table)"
-            )
-        # m_layernorm_lr is read only when the affine gamma/beta exist, which needs BOTH
-        # layernorm_affine=True AND a 'layernorm' norm seam; model.py warns on the miss.
-        if _changed("m_layernorm_lr") and not (
-                self.layernorm_affine
-                and "layernorm" in (self.norm_type_block, self.norm_type_final)):
-            _inert.append(
-                "m_layernorm_lr (only read when layernorm_affine=True and norm_type_block or "
-                "norm_type_final is 'layernorm', the only seams that build gamma/beta)"
-            )
-        if not self.decode_unigram_prior and _changed("unigram_kappa"):
-            _inert.append(f"unigram_kappa={self.unigram_kappa} (needs decode_unigram_prior=True)")
-        if self.lambda_alpha_mode == "constant" and _changed("b0", "c0"):
-            _inert.append("b0/c0 (only read by a state_dependent lambda_alpha_mode)")
-        if self.pos_rotation == "none" and _changed("rope_on_value"):
-            _inert.append("rope_on_value (only read by pos_rotation='rope')")
-        if self.pos_rotation == "none":
-            for _rope_field in ("rope_base", "rope_full_gauge"):
-                if _changed(_rope_field):
-                    _inert.append(f"{_rope_field} (only read by pos_rotation='rope')")
-        if self.pos_phi == "none" and _changed("pos_phi_project_slk"):
-            _inert.append("pos_phi_project_slk (only read by a non-'none' pos_phi)")
-        # A window at or above the context length allows EVERY entry, so the sliding-window prior is
-        # byte-identical to plain causal -- measured torch.equal(...) True.
-        if self.beta_attention_prior in ("windowed", "causal_windowed"):
-            if self.attention_window >= self.max_seq_len - 1:
-                _inert.append(
-                    f"attention_window={self.attention_window} >= max_seq_len-1="
-                    f"{self.max_seq_len - 1}: the windowed prior allows every entry and is "
-                    "byte-identical to plain 'causal'")
-        # The handoff blend is the LAST statement of the per-layer loop body and nothing after the loop
-        # reads mu_p/sigma_p, so at n_layers=1 its output is dead.
-        if self.n_layers == 1 and _changed("prior_handoff_rho", "prior_handoff_sigma"):
-            _inert.append(
-                f"prior_handoff_rho={self.prior_handoff_rho}/"
-                f"prior_handoff_sigma={self.prior_handoff_sigma} (the handoff blend closes each layer "
-                "and nothing reads it after the loop, so it is dead at n_layers=1)")
-        # The phi preconditioner is consumed only by the E-step phi substep (e_phi_lr>0) or the
-        # pullback_group M-step policy.
-        if (self.phi_precond_mode != "none" and self.e_phi_lr == 0.0
-                and self.m_phi_update_mode != "pullback_group"):
-            _inert.append(
-                f"phi_precond_mode={self.phi_precond_mode!r} (reached only by e_phi_lr>0 or "
-                "m_phi_update_mode='pullback_group')")
-        # decode_ce_checkpoint is read only inside decode_ce_*_chunked, which model.py reaches
-        # exclusively through a decode registration whose fused_ce is not None. 'full'/'family' have no
-        # fused_ce, so the toggle does nothing there.
-        from vfe3.model.prior_bank import (
-            PriorBank,
-            _DECODERS as _decode_registry,
-            _decode_family_chunked,
-        )
-        _active_decode_mode = self.decode_mode
-        if (not _decode_registry[_active_decode_mode].supports_chunked
-                and _changed("decode_ce_checkpoint")):
-            _inert.append(
-                f"decode_ce_checkpoint={self.decode_ce_checkpoint!r} (decode_mode="
-                f"{self.decode_mode!r} has no fused_ce registration; only "
-                "'diagonal_chunked'/'full_chunked'/'family_chunked'/'expected_likelihood_chunked', "
-                "or 'linear', route through a checkpointed chunked CE kernel)")
-        # decode_av_precision governs the working dtype of _decode_av, the expanded a_v form. Generic
-        # family-consistent decodes hand the pair to a registered functional and leave it inert, but
-        # built-in full-Gaussian / Renyi(alpha=1) family_chunked delegates to full_chunked under the
-        # fp32-escalate policy, where this selects whether that delegate is eligible.
-        from vfe3.divergence import get_functional, renyi
-        from vfe3.families.gaussian import FullGaussian
-        canonical_family_dispatch_reachable = (
-            _active_decode_mode == "family_chunked"
-            and _decode_registry[_active_decode_mode].callable is _decode_family_chunked
-            and _decode_registry[_active_decode_mode].fused_ce is PriorBank.decode_ce_family_chunked
-            and _family_cls is FullGaussian
-            and get_functional(self.divergence_family) is renyi
-            and type(self.renyi_order) in (int, float)
-            and self.renyi_order == 1.0
-            and self.full_cov_kl_precision == "fp32_escalate"
-        )
-        if (_decode_registry[_active_decode_mode].family_consistent
-                and not canonical_family_dispatch_reachable
-                and _changed("decode_av_precision")):
-            _inert.append(
-                f"decode_av_precision={self.decode_av_precision!r} (decode_mode="
-                f"{self.decode_mode!r} is on the generic family-consistent route: it invokes the "
-                "registered divergence functional, not _decode_av -- the analytic exception is "
-                "built-in gaussian_full + built-in Renyi(alpha=1) + "
-                "full_cov_kl_precision='fp32_escalate')")
-        if _inert:
+        # Activity is structural, independent of values and warning visibility. Notices only
+        # display settings that differ from their defaults; sweep validation uses the full map.
+        defaults = {field.name: field.default for field in fields(self) if field.default is not MISSING}
+        inactive = self.inactive_fields()
+        notices = [
+            f"{name}={getattr(self, name)!r} ({reason})"
+            for name, reason in inactive.items()
+            if getattr(self, name) != defaults.get(name)
+        ]
+        if notices:
             import warnings
             warnings.warn(
                 "inert configuration setting(s) -- these values are read by no active path, so "
-                "changing them will have no effect:\n  - " + "\n  - ".join(_inert),
+                "changing them will have no effect:\n  - " + "\n  - ".join(notices),
                 ConfigNotice, stacklevel=2,
             )
 
@@ -2389,13 +2214,20 @@ class VFE3Config:
                     UserWarning, stacklevel=2,
                 )
 
-        if self.skip_belief_sigma_update and self.decode_mode != "linear":
+        if self.decode_mode != "linear" and (
+            self.skip_belief_sigma_update or self.attention_mode != "transported"
+        ):
             import warnings
+            frozen_by = (
+                "skip_belief_sigma_update=True"
+                if self.skip_belief_sigma_update
+                else f"attention_mode={self.attention_mode!r} (projected routes keep covariance)"
+            )
             warnings.warn(
-                "skip_belief_sigma_update=True with a prior-bank decode: the KL decode READS "
-                "sigma_q, so skipping the belief sigma update changes predictions (sigma stays at "
-                "encode). This toggle is meant for configs where q's sigma is dead (linear decode, "
-                "no norms).",
+                f"prior-bank decode with frozen belief sigma ({frozen_by}): the KL decode READS "
+                "sigma_q, so a frozen sigma changes predictions (sigma stays at encode). "
+                "skip_belief_sigma_update is meant for configs where q's sigma is dead "
+                "(linear decode, no norms); projected routes freeze sigma regardless of that flag.",
                 UserWarning, stacklevel=2,
             )
         if self.grad_clip is not None:
@@ -2409,6 +2241,96 @@ class VFE3Config:
                     "grad_clip must be None or a finite real value >= 0; "
                     f"got {self.grad_clip!r}"
                 )
+
+    def inactive_fields(self) -> dict[str, str]:
+        """Return inactive config field names and reasons, including default-valued fields.
+
+        The same structural result drives display notices and sweep admission. Consumers
+        must not infer activity from whether a warning happens to be visible.
+        """
+        from vfe3.inference.e_step import canonical_e_step_update
+        from vfe3.model.prior_bank import PriorBank, _DECODERS, _decode_family_chunked
+        from vfe3.divergence import get_functional, renyi
+        from vfe3.families.base import get_family
+        from vfe3.families.gaussian import FullGaussian
+
+        inactive: dict[str, str] = {}
+
+        def mark(names: tuple[str, ...], reason: str) -> None:
+            inactive.update(dict.fromkeys(names, reason))
+
+        if self.m_phi_update_mode != "pullback_group":
+            mark(("m_phi_group_trust_radius",), "only read by m_phi_update_mode='pullback_group'")
+        if self.attention_mode == "transported":
+            mark(("relational_identity_content", "m_relational_score_lr", "m_relational_content_lr"),
+                 "only read by projected attention; transported attention creates no relational parameters")
+        else:
+            mark(("compile_pair_kernel",), "projected attention bypasses the belief-gradient pair kernel")
+        gradient_controls = ("e_q_mu_lr", "e_q_sigma_lr", "e_step_mu_precond",
+                             "e_mu_q_trust", "mu_trust_mode", "e_sigma_q_trust")
+        if self.attention_mode != "transported":
+            mark(("skip_belief_sigma_update",),
+                 "projected routes keep covariance: predictive_content does not estimate it and "
+                 "relational filtering returns no sigma gradient")
+        if self.attention_mode == "projected_predictive":
+            mark(gradient_controls, "predictive_content replaces the mean and keeps covariance")
+            if self.mstep_self_coupling_weight == 0.0:
+                mark(("lambda_alpha_mode", "lambda_alpha", "b0", "c0"),
+                     "predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer")
+        if not self.use_block_mlp:
+            mark(("block_mlp_mode", "block_mlp_covariance", "block_mlp_covariance_floor",
+                  "block_mlp_expansion", "block_mlp_activation", "block_mlp_dropout", "m_block_mlp_lr"),
+                 "only read when use_block_mlp=True")
+        if canonical_e_step_update(self.e_step_update) == "mm_exact":
+            mark(gradient_controls, "unread under e_step_update='mm_exact'; its step control is mm_damping")
+        else:
+            mark(("mm_damping",), "only read by e_step_update='mm_exact'")
+        if not self.use_priorbank_head_evidence_mixer:
+            mark(("m_head_evidence_lr",), "only read when use_priorbank_head_evidence_mixer=True")
+        if self.pos_phi != "learned":
+            mark(("m_pos_phi_lr",), "only pos_phi='learned' creates the learnable positional table")
+        if not (self.layernorm_affine and "layernorm" in (self.norm_type_block, self.norm_type_final)):
+            mark(("m_layernorm_lr",), "requires layernorm_affine and a layernorm seam")
+        if not self.decode_unigram_prior:
+            mark(("unigram_kappa",), "needs decode_unigram_prior=True")
+        if self.lambda_alpha_mode == "constant":
+            mark(("b0", "c0"), "only read by a state_dependent lambda_alpha_mode")
+        if self.pos_rotation == "none":
+            mark(("rope_on_value", "rope_base", "rope_full_gauge"), "only read by pos_rotation='rope'")
+        if self.pos_phi == "none":
+            mark(("pos_phi_project_slk",), "only read by a non-'none' pos_phi")
+        if (self.beta_attention_prior in ("windowed", "causal_windowed")
+                and self.attention_window >= self.max_seq_len - 1):
+            mark(("attention_window",), "window covers the context and is identical to plain causal")
+        if self.n_layers == 1:
+            mark(("prior_handoff_rho", "prior_handoff_sigma"), "no next layer consumes the handoff")
+        if self.e_phi_lr == 0.0 and self.m_phi_update_mode != "pullback_group":
+            mark(("phi_precond_mode",), "reached only by e_phi_lr>0 or m_phi_update_mode='pullback_group'")
+        registration = _DECODERS[self.decode_mode]
+        if not registration.supports_chunked:
+            mark(("decode_ce_checkpoint",), "the selected decoder has no checkpointed chunked CE kernel")
+        canonical_family_dispatch = (
+            self.decode_mode == "family_chunked"
+            and registration.callable is _decode_family_chunked
+            and registration.fused_ce is PriorBank.decode_ce_family_chunked
+            and get_family(self.family) is FullGaussian
+            and get_functional(self.divergence_family) is renyi
+            and type(self.renyi_order) in (int, float) and self.renyi_order == 1.0
+            and self.full_cov_kl_precision == "fp32_escalate"
+        )
+        if registration.family_consistent and not canonical_family_dispatch:
+            mark(("decode_av_precision",), "generic family-consistent decoding does not call _decode_av")
+        return inactive
+
+    @property
+    def relational_mode(self) -> str:
+        """Internal compatibility view; attention_mode is the only writable selector."""
+        return "off" if self.attention_mode == "transported" else "projected_filtering"
+
+    @property
+    def relational_readout_mode(self) -> str:
+        """Internal executor selection derived from attention_mode."""
+        return "predictive_content" if self.attention_mode == "projected_predictive" else "conditional_update"
 
     @property
     def tau(self) -> float:
@@ -2503,11 +2425,38 @@ def config_from_serialized(
 ) -> VFE3Config:
     """Build a config from a serialized mapping, refusing any field this build does not declare.
 
-    Only the current field set is accepted. A mapping written by a different configuration
-    generation is refused by name rather than reinterpreted under today's defaults.
+    Historical per-role clipping and norm precision migrate without changing behavior.
+    Retired global clipping and dimension precision are refused. Historical attention pairs
+    translate to one canonical selector; conflicting old/new selectors are refused.
     """
     if not isinstance(payload, Mapping):
         raise ValueError(f"serialized config from {source} must be a mapping")
+    payload = dict(payload)
+    if "grad_clip_per_role" in payload:
+        per_role = _normalize_serialized_boolean(
+            payload.pop("grad_clip_per_role"), "grad_clip_per_role", source=source)
+        if not per_role:
+            raise ValueError(f"serialized config from {source} requests retired global gradient clipping "
+                             "(grad_clip_per_role=False); continuation requires an explicit policy change")
+    if "exp_fp64_mode" in payload and payload.pop("exp_fp64_mode") != "norm":
+        raise ValueError(f"serialized config from {source} requests a retired exp_fp64_mode; "
+                         "only historical 'norm' is accepted without a numerical-policy change")
+    if "relational_mode" in payload or "relational_readout_mode" in payload:
+        mode = payload.pop("relational_mode", "off")
+        readout = payload.pop("relational_readout_mode", "conditional_update")
+        legacy_modes = {
+            ("off", "conditional_update"): "transported",
+            ("projected_filtering", "conditional_update"): "projected_conditional",
+            ("projected_filtering", "predictive_content"): "projected_predictive",
+        }
+        try:
+            attention_mode = legacy_modes[(mode, readout)]
+        except (KeyError, TypeError):
+            raise ValueError(f"serialized config from {source} has an invalid historical attention pair "
+                             f"({mode!r}, {readout!r})") from None
+        if "attention_mode" in payload and payload["attention_mode"] != attention_mode:
+            raise ValueError(f"serialized config from {source} has conflicting attention selectors")
+        payload["attention_mode"] = attention_mode
     config_fields = {field.name: field for field in fields(VFE3Config)}
     unknown = sorted(str(key) for key in payload if key not in config_fields)
     if unknown:

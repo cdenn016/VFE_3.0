@@ -77,7 +77,7 @@ import sys
 import time
 import warnings
 from collections.abc import Mapping
-from dataclasses import MISSING as _DATACLASS_MISSING, asdict, fields as dataclass_fields
+from dataclasses import asdict, fields as dataclass_fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -311,12 +311,11 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     warmup_steps              = 100,
     deterministic             = True,
     
-    # Exact projected relational routing with conditional mean filtering.
-    relational_mode                  = "projected_filtering",  # "off" | "projected_filtering"
+    # Attention execution and projected input/output scopes.
+    attention_mode                   = "projected_predictive",  # "transported" | "projected_conditional" | "projected_predictive"
 
     relational_input_scope           = "full",         # each head reads all K coordinates; "head" is legacy behavior
 
-    relational_readout_mode          = "predictive_content",  # Transformers:"predictive_content", legacy: "conditional_update"
     relational_output_scope          = "full",                  # transformers: "full": requires predictive_content, legacy: 'head'
     attention_residual               = True,   # predictive S/T/O: add the incoming mean
     
@@ -355,7 +354,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     decode_mode                       = 'linear',  # prior-bank: diagonal_chunked/full_chunked/expected_likelihood_chunked/family_chunked
     encode_mode                       = "per_token",   #"per_token_additive" is ~1.5x faster at K=80 currently unablated
-                                                       # "canonical_content_projected" REQUIRES decode_mode = 'full_*" and full gauissians
+                                                       # "canonical_content_projected" requires gaussian_diagonal input and a full decoder
     decode_chunk_size                 = 8192,
     decode_tau                        = 0.008,       #prior_bank = True temperature
     
@@ -526,10 +525,8 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     amp_dtype                            = 'bf16',        # None=fp32 | 'bf16' , 'fp16'. Sigma must be at least fp32
     fp32_matmul_precision                = "highest",       # None (leave as-is) | "highest" | "high" | "medium"  
     
-    grad_clip                            = 1.0,         # gradient clip: global L2 norm unless grad_clip_per_role
-    grad_clip_per_role                   = True,        # clip grads per role (mu/sigma/phi) instead of one global norm
+    grad_clip                            = 1.0,         # L2 gradient clip applied independently per optimizer role
     
-    exp_fp64_mode                        = "norm",        # "dim" | "norm" norm ~1.5x faster at K=80
     exp_fp64_norm_threshold              = 20.0,          # "norm" mode threshold
     
 
@@ -736,7 +733,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "values": [0.001, 0.0025, 0.005, 0.0075, 0.01],
         "scale": "linear",
         "requires": {
-            "relational_mode": "projected_filtering",
+            "attention_mode": "projected_predictive",
         },
     },
 
@@ -746,7 +743,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "values": [0.001, 0.0025, 0.005, 0.0075, 0.01],
         "scale": "linear",
         "requires": {
-            "relational_mode": "projected_filtering",
+            "attention_mode": "projected_predictive",
         },
     },
     
@@ -992,21 +989,19 @@ _ATTENTION_REQUIRES = {
     "encode_mode": "per_token", "decode_mode": "linear",
     "compile_pair_kernel": False,
     "cross_couplings": None, "use_priorbank_head_evidence_mixer": False,
-    "relational_mode": "projected_filtering", "relational_input_scope": "full",
-    "relational_readout_mode": "predictive_content", "relational_output_scope": "head",
+    "attention_mode": "projected_predictive", "relational_input_scope": "full",
+    "relational_output_scope": "head",
     "m_relational_score_lr": None, "m_relational_content_lr": None,
     "relational_identity_content": False,
     "use_head_mixer": True,
 }
-_ATTENTION_RELATIONAL_OFF = {"relational_mode": "off"}
+_ATTENTION_RELATIONAL_OFF = {"attention_mode": "transported"}
 _ATTENTION_CROSS_CONTROL = {
     **_ATTENTION_RELATIONAL_OFF, "use_head_mixer": False,
     "beta_attention_prior": "causal",
-    # The residual is a projected_filtering feature, so the relational-off control must switch it
-    # off explicitly rather than inherit BASELINE_CONFIG's enabled value. predictive_content
-    # likewise requires projected_filtering, so these controls pin the legacy readout.
+    # The residual belongs to projected predictive attention. The transported control
+    # disables it explicitly instead of inheriting the projected baseline's setting.
     "attention_residual": False,
-    "relational_readout_mode": "conditional_update",
 }
 _ATTENTION_CROSS_PAIRS = [
     (i, j) for i in range(BASELINE_CONFIG["n_heads"])
@@ -1020,7 +1015,7 @@ _ATTENTION_ARMS = {
         # predictive_content requires learned content maps, and the residual in turn requires
         # predictive_content, so this arm pins both of its own.
         {"label": "relational_identity_content", "relational_identity_content": True,
-         "relational_readout_mode": "conditional_update", "attention_residual": False},
+         "attention_mode": "projected_conditional", "attention_residual": False},
         {"label": "relational_no_head_mixer", "use_head_mixer": False},
         {"label": "relational_frozen_score", "m_relational_score_lr": 0.0},
         {"label": "relational_frozen_content", "m_relational_content_lr": 0.0},
@@ -1256,6 +1251,18 @@ def _parameter_match_selection(sweep_name: str) -> Dict[str, Any]:
             f"{details}"
         )
 
+    # Candidate-grid axes are search knobs, not necessarily training contrasts. Check only
+    # the retained arms so inactive candidates do not masquerade as selected comparisons.
+    selected_overrides = [record["overrides"] for record in selected]
+    varying = {key for key in set().union(*(set(arm) for arm in selected_overrides))
+               if len({repr(arm.get(key)) for arm in selected_overrides}) > 1}
+    inactive = [set(VFE3Config(**_cell_cfg_dict(arm, seed=0)).inactive_fields())
+                for arm in selected_overrides]
+    always_dead = sorted(varying & set.intersection(*inactive))
+    if always_dead:
+        raise ValueError("parameter-matched selected contrast(s) " + ", ".join(always_dead)
+                         + " are INERT on EVERY selected arm")
+
     for record in selected:
         record.pop("candidate_index", None)
     for record in rejected:
@@ -1443,63 +1450,18 @@ def validate_sweeps(sweep_names: List[str], *, require_construction: bool = True
             if len({repr(ov.get(key)) for _label, ov in runs}) > 1
         }
         inert_per_arm: List[set] = []
-        # An arm that happens to set the swept parameter to its OWN DEFAULT is never reported as
-        # inert, because config.py's detector only flags settings that CHANGED from the default.
-        # Treating that silence as evidence of liveness defeats the every-arm rule below: one
-        # default-valued arm in the grid would hide a completely dead sweep. So default-valued arms
-        # abstain rather than vote (audit 2026-08-06).
-        _cfg_defaults = {
-            f.name: (f.default_factory() if f.default is _DATACLASS_MISSING else f.default)
-            for f in dataclass_fields(VFE3Config)
-        }
-        abstain_per_arm: List[set] = []
         for label, overrides in runs:
             cfg = _resolved_sweep_baseline()
             cfg.update(overrides)
             try:
-                # An INERT arm is a silent measurement failure, not a construction failure: the run
-                # completes, publishes a number, and the number is the baseline's because the swept
-                # value is read by no active path. config.py already detects this and says so -- but
-                # it says it through warnings.warn, which this call site discarded, so six registered
-                # sweeps shipped dead (audit 2026-08-06 F20).
-                #
-                # Only an inert setting the ARM ITSELF varies is an error. The BASELINE carries its
-                # own inert settings -- under e_step_update='gradient' the whole mm_exact family
-                # (mm_damping, ...) is inert by construction -- and failing on those would reject all
-                # ten currently-scheduled sweeps at startup, which is the opposite of useful. So
-                # intersect the reported inert names with the keys this sweep actually VARIES,
-                # and require the key to be inert on EVERY arm before calling it a defect:
-                # "the parameter this sweep varies is read by no active path in any arm" is
-                # precisely the F20 failure. An inert constant shared by every arm is not (it is a
-                # regime setting), and a key that is inert on one arm but LIVE on another is not
-                # either -- gauge_mstep_optim's phi_precond_mode is inert on the adamw arm and live
-                # on the pullback_group arm, and that contrast is exactly what the sweep measures.
-                with warnings.catch_warnings(record=True) as caught:
-                    warnings.simplefilter("always")
-                    VFE3Config(**cfg)
-                # config.py emits three shapes of entry: "name=value (reason)", "name (reason)",
-                # and slash-joined "name1/name2 (reason)". Take the leading token (up to the first
-                # space), split it on "/", then drop any "=value" -- splitting on "=" first would
-                # cut inside the REASON text, e.g. "(only read by n_e_steps >= 2)".
-                inert_names = {
-                    piece.split("=", 1)[0].strip()
-                    for warning in caught if "inert configuration setting" in str(warning.message)
-                    for entry in str(warning.message).splitlines()
-                    if entry.strip().startswith("- ")
-                    for piece in entry.strip()[2:].split(" ", 1)[0].split("/")
-                }
-                inert_per_arm.append(inert_names & varying_keys)
-                abstain_per_arm.append({
-                    key for key in varying_keys
-                    if key in _cfg_defaults and overrides.get(key) == _cfg_defaults[key]
-                })
+                # Activity is structural, including default-valued fields; warnings are display only.
+                resolved = VFE3Config(**cfg)
+                inert_per_arm.append(set(resolved.inactive_fields()) & varying_keys)
             except (TypeError, ValueError) as exc:
                 construction_errors.append((name, label, str(exc)))
         if inert_per_arm and len(inert_per_arm) == len(runs):
-            # Dead iff every arm either REPORTS it inert or abstains (is default-valued), and at
-            # least one arm actually reports it -- so an all-abstain key cannot trip the guard.
-            votes = [i | a for i, a in zip(inert_per_arm, abstain_per_arm)]
-            always_dead = sorted(set.intersection(*votes) & set().union(*inert_per_arm))
+            # A contrast may be live in only one arm. Reject it only when every arm is inactive.
+            always_dead = sorted(set.intersection(*inert_per_arm))
             if always_dead:
                 construction_errors.append((
                     name, "all arms",

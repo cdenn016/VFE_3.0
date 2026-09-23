@@ -15,7 +15,7 @@ from vfe3.train import build_optimizer, train_step
 
 def _outer_cfg(**overrides: object) -> VFE3Config:
     values: dict[str, object] = {
-        "vocab_size": 12,
+        "vocab_size": 9,
         "embed_dim": 4,
         "n_heads": 2,
         "max_seq_len": 4,
@@ -27,7 +27,6 @@ def _outer_cfg(**overrides: object) -> VFE3Config:
         "mstep_self_coupling_weight": 0.0,
         "seed": 19,
         "gradient_mode": "smoothing",
-        "grad_clip_per_role": False,
     }
     values.update(overrides)
     return VFE3Config(**values)
@@ -148,6 +147,16 @@ def test_completed_outer_loss_not_reconstructed_ce_supplies_phi_covector(record_
     assert float((loss_fd - ce_fd).abs()) >= 0.5 * float(autograd_directional.abs())
 
 
+def _clip_reference_roles(optimizer: torch.optim.Optimizer, clip: float) -> float:
+    """Clip each reference role independently and return the pre-clip phi norm."""
+    role_parameters: dict[str, list[torch.Tensor]] = {}
+    for group in optimizer.param_groups:
+        role_parameters.setdefault(group.get("role", "other"), []).extend(group["params"])
+    norms = {role: float(torch.nn.utils.clip_grad_norm_(parameters, clip))
+             for role, parameters in role_parameters.items()}
+    return norms["phi"]
+
+
 def _processed_regularized_phi_covector(
     model:    VFEModel,
     tokens:   torch.Tensor,
@@ -167,7 +176,7 @@ def _processed_regularized_phi_covector(
         if logits is None:
             torch.manual_seed(0)
             logits = model(tokens)
-        flat_logits = logits.reshape(-1, model.cfg.vocab_size).float()
+        flat_logits = logits.reshape(-1, model.cfg.vocab_size)
         flat_targets = targets.reshape(-1)
         n_valid = (flat_targets != -100).sum().clamp_min(1)
         selected = F.cross_entropy(
@@ -179,7 +188,7 @@ def _processed_regularized_phi_covector(
         torch.testing.assert_close(selected.detach(), returned_ce, rtol=1e-6, atol=1e-7)
     scaler.scale(selected).backward()
     scaler.unscale_(optimizer)
-    pre_clip_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), clip))
+    pre_clip_norm = _clip_reference_roles(optimizer, clip)
     gradient = model.prior_bank.phi_embed.grad.detach().clone()
     active = gradient.abs().sum(dim=-1) > 0
     return gradient[active].double(), pre_clip_norm
@@ -291,7 +300,7 @@ def test_geometry_receives_exact_post_unscale_post_clip_covector(
     reference_loss = reference(tokens, targets)[1]
     reference_scaler.scale(reference_loss).backward()
     reference_scaler.unscale_(reference_optimizer)
-    pre_clip_norm = float(torch.nn.utils.clip_grad_norm_(reference.parameters(), clip))
+    pre_clip_norm = _clip_reference_roles(reference_optimizer, clip)
     assert pre_clip_norm > clip
     expected_full = reference.prior_bank.phi_embed.grad.detach().clone()
     active = expected_full.abs().sum(dim=-1) > 0
@@ -319,7 +328,7 @@ def test_geometry_receives_exact_post_unscale_post_clip_covector(
 
     assert len(received) == 1
     torch.testing.assert_close(received[0], expected, rtol=0.0, atol=0.0)
-    record_property("pre_clip_global_norm", pre_clip_norm)
+    record_property("pre_clip_phi_norm", pre_clip_norm)
     record_property("processed_phi_covector_norm", float(torch.linalg.vector_norm(expected)))
     assert not torch.isclose(torch.linalg.vector_norm(received[0]), torch.tensor(1.0, dtype=torch.float64))
 
@@ -337,7 +346,7 @@ def test_pullback_group_gradient_accumulation_uses_accumulated_covector(
         dtype=torch.long,
     )
     targets = torch.tensor(
-        [[1, 2, 3, 4], [5, 6, 7, 8], [2, 4, 6, 8], [3, 5, 7, 9]],
+        [[1, 2, 3, 4], [5, 6, 7, 8], [2, 4, 6, 8], [3, 5, 7, 0]],
         dtype=torch.long,
     )
     captures: list[tuple[torch.Tensor, torch.Tensor]] = []

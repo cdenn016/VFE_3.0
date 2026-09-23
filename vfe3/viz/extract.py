@@ -325,7 +325,6 @@ def _iter_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor]) -
         compact_phi_block_transport=model._compact_phi_blocks_enabled(),
         transport_mean_per_head=True,
         congruence_cond_escalation=cfg.congruence_cond_escalation,
-        exp_fp64_mode=cfg.exp_fp64_mode,
         exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
         transport_chart_max_norm=cfg.transport_chart_max_norm,
         transport_status=model._transport_status,
@@ -1197,7 +1196,6 @@ def converged_state(
         )
         exp_phi = build_factored_transport(
             out.phi, model.group,
-            exp_fp64_mode=cfg.exp_fp64_mode,
             exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
             clamp_monitor=cfg.transport_clamp_monitor,
             validity_max_norm=cfg.transport_chart_max_norm,

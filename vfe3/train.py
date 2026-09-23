@@ -634,12 +634,10 @@ def train_step(
 
     Zeroes the prior-table gradients, runs the forward (encode -> unrolled E-step ->
     decode -> CE), backpropagates the loss through inference to the prior tables, clips
-    the global gradient norm to ``grad_clip``, then takes one AdamW + scheduler step.
+    each optimizer role's gradient norm to ``grad_clip``, then takes one AdamW + scheduler step.
     ``grad_clip`` of ``None`` or ``0.0`` disables clipping entirely (the optimizer and
-    scheduler still step on the raw gradient); any positive value clips ONCE, after
-    accumulation and unscale, to that global L2 norm. Under ``cfg.grad_clip_per_role``
-    the same threshold is applied independently to each optimizer-group role
-    (mu/sigma/phi) rather than once over all parameters together.
+    scheduler still step on the raw gradient). After accumulation and unscale, a positive
+    threshold is applied once independently to each optimizer role (mu/sigma/phi/other).
 
     With ``grad_accum_steps == K > 1`` the batch is split into ``K`` equal-size chunks along
     the batch axis. Each microbatch mean loss is multiplied by the decoder's exact scored-token
@@ -848,7 +846,7 @@ def train_step(
     )
     loss_finite = math.isfinite(step_loss)
     if metrics_out is not None:
-        # Pre-clip gradient health -- the global L2 norm clip_grad_norm_ RETURNS-and-discards, plus
+        # Pre-clip gradient health: the combined L2 norm plus
         # per-ROLE norms (mu/sigma/phi from each group's "role" tag in build_optimizer, aggregated in
         # quadrature across ALL groups carrying that role). Role -- not the old groups[0/1/2] index --
         # so the LIVE tables are attributed correctly under any config (previously mu/sigma logged a
@@ -906,28 +904,13 @@ def train_step(
         metrics_out["grad_finite"] = float(grad_finite)
     if grad_clip is not None and grad_clip > 0 and not skip_step:
         clip_norms = []
-        if getattr(model.cfg, "grad_clip_per_role", False):
-            # Per-role clipping: the global L2 norm below couples the roles, so when it binds it
-            # rescales every OTHER role's effective LR -- the kl_max silent-bind pattern. Clip each
-            # role's parameter set to grad_clip separately instead (the roles partition the
-            # optimizer groups; see build_optimizer).
-            #
-            # Correction (audit 2026-08-06 F33): phi_embed dominates the SPIKES, not the steady
-            # state. At the live K=20 / N=64 settings sigma dominates the global norm and neither
-            # clip binds, so this toggle is inert there and matters on the tail. The measurement it
-            # was flipped on came from run 221.24, which is K=20/N=64 -- not the K=30/N=128 believed
-            # at the time; what separates that run from the live cells is m_phi_lr, e_q_mu_lr and
-            # mu_trust_mode, not K or N. Per-role clipping does change
-            # direction (median 0 deg, p95 12.9 deg, max 37.6 deg from the global-clipped vector) and
-            # raises the post-clip bound to sqrt(3)*grad_clip, but AdamW attenuates a CONSTANT
-            # rescale to 4.26e-4 relative, so it acts only through that factor's time-variation.
-            role_params: dict = {}
-            for _g in optimizer.param_groups:
-                role_params.setdefault(_g.get("role", "other"), []).extend(_g["params"])
-            for _ps in role_params.values():
-                clip_norms.append(torch.nn.utils.clip_grad_norm_(_ps, grad_clip))
-        else:
-            clip_norms.append(torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip))
+        # Optimizer groups partition parameters into roles; each role gets one L2 bound.
+        role_params: dict = {}
+        for group in optimizer.param_groups:
+            role_params.setdefault(group.get("role", "other"), []).extend(group["params"])
+        for parameters in role_params.values():
+            if parameters:
+                clip_norms.append(torch.nn.utils.clip_grad_norm_(parameters, grad_clip))
         clip_finite = bool(torch.isfinite(torch.stack([norm.to(tokens.device) for norm in clip_norms])).all())
         skip_step = not clip_finite
         if metrics_out is not None:

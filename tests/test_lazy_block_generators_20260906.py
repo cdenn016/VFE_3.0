@@ -134,7 +134,7 @@ def test_dense_autograd_and_compact_transport_finite_difference() -> None:
     weights = torch.randn(1, 2, 2, 2, 2, dtype=torch.float64)
     def objective(coords: torch.Tensor) -> torch.Tensor:
         return (build_factored_transport(
-            coords, group, compact_blocks=True, exp_fp64_mode="norm",
+            coords, group, compact_blocks=True,
             exp_fp64_norm_threshold=0.0).exp_blocks * weights).sum()
     gradient, = torch.autograd.grad(objective(phi), phi)
     direction = torch.randn_like(phi)

@@ -409,18 +409,12 @@ _TRANSPORT_BUILDER_RESERVED_STATE_KEYS = frozenset({
     "sigma",
     "sigma_key",
     "clamp_monitor",
-    "exp_fp64_mode",
     "exp_fp64_norm_threshold",
     "materialize",
     "validity_max_norm",
     "exactness_out",
+    "right_phi",
 })
-_TRANSPORT_NEEDS_MU:    set = set()   # regimes whose Omega builder reads the belief means mu
-_TRANSPORT_NEEDS_SIGMA: set = set()   # regimes whose Omega builder reads the belief covariance sigma
-_TRANSPORT_BATCH_INDEPENDENT: set = set()   # regimes whose Omega is the SAME for every sequence in the
-#                                             batch (depends only on a model parameter, not phi/mu/sigma),
-#                                             so the builder returns a batch-collapsed (N,N,K,K) Omega that
-#                                             broadcasts downstream instead of a dense (B,N,N,K,K).
 
 
 def register_transport(
@@ -472,8 +466,7 @@ def register_transport(
     Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an existing
     name silently shadowed the first, so a config-selected seam could dispatch to an unintended
     implementation. Pass ``override=True`` to replace deliberately. The callable and all declarations
-    are installed together as one frozen record; the legacy routing sets are then derived from that
-    complete record, so stale membership cannot survive an override.
+    are installed together as one frozen record, so stale routing flags cannot survive an override.
     """
     if not isinstance(covariance_class, str) or not covariance_class:
         raise ValueError("transport covariance_class must be a nonempty string")
@@ -524,17 +517,6 @@ def register_transport(
             runtime_exactness_key=runtime_exactness_key,
         )
         _TRANSPORTS[name] = registration
-        # Compatibility views for existing hot-path membership checks. Their values are derived only
-        # from the just-installed complete record; none is inherited from an overridden registration.
-        _TRANSPORT_NEEDS_MU.discard(name)
-        _TRANSPORT_NEEDS_SIGMA.discard(name)
-        _TRANSPORT_BATCH_INDEPENDENT.discard(name)
-        if registration.needs_mu:
-            _TRANSPORT_NEEDS_MU.add(name)
-        if registration.needs_sigma:
-            _TRANSPORT_NEEDS_SIGMA.add(name)
-        if registration.batch_independent:
-            _TRANSPORT_BATCH_INDEPENDENT.add(name)
         return fn
     return _wrap
 
@@ -564,7 +546,6 @@ def _build_flat(
 
     *,
     gauge_mode:              str             = "learned",   # 'learned' (Regime I flat) or 'trivial'
-    exp_fp64_mode:           str             = "dim",       # stable_matrix_exp_pair float64-island keying ('dim' | 'norm')
     exp_fp64_norm_threshold: float           = 5.0,         # 'norm' mode: max clamped block ||M||_F upcast threshold
     clamp_monitor:           bool            = False,       # opt-in: warn when the exp Frobenius clamp fires
     validity_max_norm:       Optional[float] = None,        # opt-in fail-closed pre-clamp chart bound
@@ -578,7 +559,6 @@ def _build_flat(
     without editing the registry call sites.
     """
     return compute_transport_operators(phi, group, gauge_mode=gauge_mode,
-                                       exp_fp64_mode=exp_fp64_mode,
                                        exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                                        clamp_monitor=clamp_monitor,
                                        validity_max_norm=validity_max_norm)
@@ -811,15 +791,11 @@ def stable_matrix_exp_pair(
     matrix:                  torch.Tensor,       # (..., d, d) Lie-algebra matrices
 
     *,
-    exp_fp64_mode:           str                 = "dim",    # float64-island keying: 'dim' (dimension rule) | 'norm'
     max_norm:                float               = TRANSPORT_CLAMP_MAX_NORM,
     exp_fp64_norm_threshold: float               = 5.0,      # 'norm' mode: upcast when max clamped block ||M||_F >= this
-    dim_threshold:           int                 = 20,
-    skew_symmetric:          bool                = False,
     only_forward:            bool                = False,
     clamp_monitor:           bool                = False,    # opt-in: warn when the Frobenius clamp fires (host sync)
     block_dims:              Optional[List[int]] = None,     # per-block sizes (sum==d) for a block-diagonal M
-    exp_dim:                 Optional[int]       = None,     # dimension for the float64-island decision (None -> d)
     validity_max_norm:       Optional[float]     = None,     # opt-in fail-closed pre-clamp chart bound
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Represented exp(M) and optionally its float64-computed inverse.
@@ -840,24 +816,16 @@ def stable_matrix_exp_pair(
     ``block_dims`` (audit 4b): when M is block-diagonal with these blocks (e.g. block_glk's
     GL(d_head)^H), exp(M) is exactly block-diagonal with the per-block exponentials, so each
     d_head x d_head block is exponentiated independently -- an O(H * d_head^3) cost instead of
-    O(K^3) for the full K x K. The result is BIT-equivalent to the full exp (the global
-    Frobenius clamp is applied to the WHOLE matrix first, and each block keeps the dtype the
-    full-K path would pick, so neither the scale nor the precision changes). ``None`` (a single
-    block, a cross-coupled basis, or a skew group) takes the full-matrix path unchanged.
+    O(K^3) for the full K x K. The global Frobenius clamp is applied to the WHOLE matrix
+    first. All blocks share the dtype selected by their maximum block norm; an unblocked
+    call instead selects its dtype from the full-matrix norm. ``None`` (a single block, a
+    cross-coupled basis, or a skew group) takes the full-matrix path.
 
-    ``exp_dim`` (audit 2026-06-10 F8c, default None = unchanged): an explicit override of the
-    dimension the float64-island decision keys on. By DEFAULT the per-block path keeps the
-    full-K dtype so blocking never changes precision (the bit-equivalence pin above). A caller
-    whose conditioning argument lives at the BLOCK scale may pass ``exp_dim=max(block_dims)`` to run
-    small blocks in fp32 instead of upcasting the whole batch to float64 at K >= dim_threshold.
-
-    ``exp_fp64_mode`` (Tier-1 toggle; default 'dim' = the long-standing dimension rule above,
-    untouched): 'norm' keys the float64 island on the max CLAMPED block Frobenius norm instead of
-    the dimension -- the conditioning argument for matrix_exp is a NORM argument (fp32 matrix_exp
-    is ~1e-7 accurate at the small block norms the phi retraction guarantees, at any block dim),
-    so small-norm blocks stay fp32 while the fp64 island stays REACHABLE for genuinely large
-    norms (upcast when max ||M_block||_F >= ``exp_fp64_norm_threshold``). Costs one host sync (a
-    scalar norm compare) per call; the clamp / monitor behavior above is identical in both modes.
+    Precision is selected by the maximum clamped block Frobenius norm. Blocks below
+    ``exp_fp64_norm_threshold`` compute in float32; the remaining calls compute in float64.
+    Float64 inputs retain float64 storage but follow the same interior precision rule. Numerical
+    oracles can pass a float64 input and threshold zero to force float64 computation.
+    The config owns its threshold of 20; low-level callers retain their threshold of 5.
     """
     # Global Frobenius clamp on the FULL matrix (one scale for all blocks) -- identical to the
     # un-blocked path, so block slicing below cannot change the operator. The norm/scale is kept
@@ -917,43 +885,26 @@ def stable_matrix_exp_pair(
                 )
     matrix = matrix * scale
 
-    d = matrix.shape[-1]
     # float32 storage floor, matching _stable_compact_glk_exp_pair (audit 2026-07-25 F2). The dense
     # route reaches here with an autocast-eligible einsum(phi, generators) result, so without this the
     # dense and compact representations would only agree on their (reduced) storage dtype by both
     # being wrong. Parity between the two paths is preserved -- at float32 rather than at bf16.
     orig_dtype = matrix.dtype if matrix.dtype in (torch.float32, torch.float64) else torch.float32
-    if exp_fp64_mode == "norm":
-        # Norm-keyed float64 island (Tier-1 toggle): upcast ONLY when the max CLAMPED block
-        # Frobenius norm reaches the threshold. Computed from the already-clamped matrices (the
-        # clamp above ran first), so the keying norm is the norm actually exponentiated; the
-        # island stays reachable for genuinely large norms. One host sync (the bool compare),
-        # opt-in by mode.
-        with torch.no_grad():
-            if block_dims is not None and len(block_dims) > 1:
-                start = 0
-                key_norm = matrix.new_zeros(())
-                for blk in block_dims:
-                    end = start + blk
-                    key_norm = torch.maximum(
-                        key_norm, matrix[..., start:end, start:end].norm(dim=(-2, -1)).max())
-                    start = end
-            else:
-                key_norm = (mat_norm * scale).max()      # clamped full-matrix norm (single block)
-        up_dtype = torch.float64 if bool(key_norm >= exp_fp64_norm_threshold) else torch.float32
-    elif exp_fp64_mode == "dim":
-        # 'dim': the long-standing dimension rule. The full-K path's dtype choice; the per-block
-        # path forces the SAME dtype so a small block (d_head < dim_threshold) does not silently
-        # drop to float32 and drift from the full exp. exp_dim (when given) overrides the keying
-        # dimension -- see the docstring.
-        d_eff = exp_dim if exp_dim is not None else d
-        with torch.no_grad():
-            large_skew = skew_symmetric and bool(
-                (mat_norm * scale).max() >= exp_fp64_norm_threshold
-            )
-        up_dtype = torch.float64 if d_eff >= dim_threshold or large_skew else torch.float32
-    else:
-        raise ValueError(f"exp_fp64_mode must be 'dim' or 'norm', got {exp_fp64_mode!r}")
+    # Upcast when the maximum clamped block norm reaches the threshold.
+    # The clamp already ran, so the keying norm is the norm actually exponentiated.
+    # The float64 island stays reachable for large norms; the comparison uses one host sync.
+    with torch.no_grad():
+        if block_dims is not None and len(block_dims) > 1:
+            start = 0
+            key_norm = matrix.new_zeros(())
+            for blk in block_dims:
+                end = start + blk
+                key_norm = torch.maximum(
+                    key_norm, matrix[..., start:end, start:end].norm(dim=(-2, -1)).max())
+                start = end
+        else:
+            key_norm = (mat_norm * scale).max()      # clamped full-matrix norm (single block)
+    up_dtype = torch.float64 if bool(key_norm >= exp_fp64_norm_threshold) else torch.float32
 
     # Keyed to the TENSOR's device (audit 2026-07-05 m10): the old 'cuda' literal left the island
     # open under a CPU autocast context (torch.amp.autocast('cpu', bf16)), which _amp_context
@@ -1055,7 +1006,6 @@ def compute_transport_operators(
 
     *,
     gauge_mode:              str             = "learned",   # 'learned' (Regime I flat) or 'trivial'
-    exp_fp64_mode:           str             = "dim",       # stable_matrix_exp_pair float64-island keying ('dim' | 'norm')
     exp_fp64_norm_threshold: float           = 5.0,         # 'norm' mode: max clamped block ||M||_F upcast threshold
     clamp_monitor:           bool            = False,       # opt-in: warn when the exp Frobenius clamp fires
     validity_max_norm:       Optional[float] = None,        # opt-in fail-closed pre-clamp chart bound
@@ -1096,18 +1046,10 @@ def compute_transport_operators(
     phi_matrix = _embed_algebra_fp32_floor(phi, group, pattern="bna,aij->bnij")
     # Per-block exp when the group is genuinely block-diagonal (block_glk without cross-couplings
     # -> irrep_dims [d_head]*H); single-block ([K]: glk, so_k, cross-coupled) takes the full path.
-    # exp_dim keys the float64-island decision on the dimension actually exponentiated -- the
-    # per-head block (audit F8c) -- and the always-fp32
-    # per-block exp at d_head < 20. The conditioning argument lives at the block scale: the
-    # retraction bounds ||phi|| (coords) by max_norm=5.0, so each block's Frobenius norm is far
-    # inside fp32 matrix_exp's exact regime; without the override every flat run at K >= 20 paid
-    # a (B, N, K, K) float64 upcast (vram audit 2026-06-10: ~0.4 GB of f64 transients per build
-    # plus fp64-throughput matrix_exp on a consumer GPU) for blocks that never needed it.
     block_dims = group.irrep_dims if len(group.irrep_dims) > 1 else None
     exp_phi, exp_neg_phi = stable_matrix_exp_pair(
-        phi_matrix, skew_symmetric=group.skew_symmetric, block_dims=block_dims,
-        exp_dim=(max(block_dims) if block_dims is not None else None),
-        exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
+        phi_matrix, block_dims=block_dims,
+        exp_fp64_norm_threshold=exp_fp64_norm_threshold,
         # m16: matrix_exp of a skew matrix is exactly orthogonal at ANY norm, so the Frobenius clamp
         # only gratuitously shortens the rotation on the pure so_n/so_k tower path (whose retraction
         # caps ||phi|| in COORDINATES, under-bounding the embedded norm). Disable it for skew; the
@@ -1218,7 +1160,6 @@ def _stable_compact_glk_exp_pair(
     blocks:                  torch.Tensor,       # (..., H, d, d) block-diagonal gl(d)^H element
 
     *,
-    exp_fp64_mode:           str             = "dim",     # float64-island keying: 'dim' | 'norm'
     exp_fp64_norm_threshold: float           = 5.0,
     clamp_monitor:           bool            = False,
     validity_max_norm:       Optional[float] = None,
@@ -1249,10 +1190,9 @@ def _stable_compact_glk_exp_pair(
         if clamp_monitor:
             decisions["clamp_fraction"] = (scale < 1.0).float().mean()
     blocks = blocks * scale
-    if exp_fp64_mode == "norm":
-        with torch.no_grad():
-            key_norm = blocks.norm(dim=(-2, -1)).max()
-            decisions["use_fp64"] = key_norm >= exp_fp64_norm_threshold
+    with torch.no_grad():
+        key_norm = blocks.norm(dim=(-2, -1)).max()
+        decisions["use_fp64"] = key_norm >= exp_fp64_norm_threshold
     host = dict(zip(decisions, torch.stack(tuple(decisions.values())).tolist())) if decisions else {}
     # Preserve the original exception/warning precedence after the single healthy-path read.
     if host.get("nonfinite", False):
@@ -1273,15 +1213,9 @@ def _stable_compact_glk_exp_pair(
             RuntimeWarning, stacklevel=2,
         )
 
-    d = blocks.shape[-1]
     # Preserve both the represented fp32 storage floor and the configured interior precision.
     store_dtype = blocks.dtype if blocks.dtype in (torch.float32, torch.float64) else torch.float32
-    if exp_fp64_mode == "norm":
-        up_dtype = torch.float64 if host["use_fp64"] else torch.float32
-    elif exp_fp64_mode == "dim":
-        up_dtype = torch.float64 if d >= 20 else torch.float32
-    else:
-        raise ValueError(f"exp_fp64_mode must be 'dim' or 'norm', got {exp_fp64_mode!r}")
+    up_dtype = torch.float64 if host["use_fp64"] else torch.float32
 
     inverse_index = None
     occurrence_shape = blocks.shape
@@ -1311,7 +1245,6 @@ def build_factored_transport(
 
     *,
     gauge_mode:              str                    = "learned",   # 'learned' (Regime I flat) or 'trivial'
-    exp_fp64_mode:           str                    = "dim",       # stable_matrix_exp_pair float64-island keying ('dim' | 'norm')
     exp_fp64_norm_threshold: float                  = 5.0,         # 'norm' mode: max clamped block ||M||_F upcast threshold
     clamp_monitor:           bool                   = False,       # opt-in: warn when the exp Frobenius clamp fires
     mean_per_head:           bool                   = False,       # container flag: transport_mean contracts per gauge block
@@ -1374,7 +1307,6 @@ def build_factored_transport(
         # float32, because stable_matrix_exp_pair carries the same floor.
         exp_blocks, inv_blocks = _stable_compact_glk_exp_pair(
             phi_blocks,
-            exp_fp64_mode=exp_fp64_mode,
             exp_fp64_norm_threshold=exp_fp64_norm_threshold,
             clamp_monitor=clamp_monitor,
             validity_max_norm=validity_max_norm,
@@ -1384,7 +1316,6 @@ def build_factored_transport(
             right_blocks = right_phi.reshape(*right_phi.shape[:-1], H, d, d)
             right_exp, right_inv = _stable_compact_glk_exp_pair(
                 right_blocks,
-                exp_fp64_mode=exp_fp64_mode,
                 exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                 clamp_monitor=clamp_monitor,
                 validity_max_norm=validity_max_norm,
@@ -1400,12 +1331,9 @@ def build_factored_transport(
             cond_escalation=cond_escalation)
 
     phi_matrix = _embed_algebra_fp32_floor(phi, group)
-    # exp_dim: same block-scale float64-island keying as compute_transport_operators (see the
-    # comment there) -- the factored hot path is exactly where the (B, N, K, K) f64 upcast hurt.
     exp_phi, exp_neg_phi = stable_matrix_exp_pair(
-        phi_matrix, skew_symmetric=group.skew_symmetric, block_dims=block_dims,
-        exp_dim=(max(block_dims) if block_dims is not None else None),
-        exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
+        phi_matrix, block_dims=block_dims,
+        exp_fp64_norm_threshold=exp_fp64_norm_threshold,
         # m16: matrix_exp of a skew matrix is exactly orthogonal at ANY norm, so the Frobenius clamp
         # only gratuitously shortens the rotation on the pure so_n/so_k tower path (whose retraction
         # caps ||phi|| in COORDINATES, under-bounding the embedded norm). Disable it for skew; the
@@ -1418,10 +1346,7 @@ def build_factored_transport(
         right_matrix = _embed_algebra_fp32_floor(right_phi, group)
         right_exp, right_inv = stable_matrix_exp_pair(
             right_matrix,
-            skew_symmetric=group.skew_symmetric,
             block_dims=block_dims,
-            exp_dim=(max(block_dims) if block_dims is not None else None),
-            exp_fp64_mode=exp_fp64_mode,
             exp_fp64_norm_threshold=exp_fp64_norm_threshold,
             max_norm=(float("inf") if group.skew_symmetric else TRANSPORT_CLAMP_MAX_NORM),
             clamp_monitor=clamp_monitor,

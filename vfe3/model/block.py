@@ -162,7 +162,6 @@ def vfe_block(
         transport_mean_per_head=True,
         congruence_cond_escalation=cfg.congruence_cond_escalation,
         compact_phi_block_transport=compact_phi_blocks,
-        exp_fp64_mode=cfg.exp_fp64_mode,
         exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
         transport_chart_max_norm=cfg.transport_chart_max_norm,
         transport_status=transport_status,

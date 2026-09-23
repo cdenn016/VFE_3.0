@@ -540,11 +540,14 @@ def generate_figures(
     Pass ``model`` to drive live in-memory weights instead.
     ``loader`` defaults to a stable unshuffled loader for the run's dataset (raises if the cache is
     absent; pass ``loader`` to override).
-    When both population caps are omitted, the belief/model banks use the controlled default of
-    exactly 16,384 tokens. Explicit ``max_sequences`` calls preserve the exploratory compatibility
-    path; the two caps are mutually exclusive. ``generate_embedding_figures`` enables the complete
-    category-separation and six-UMAP family. When false, their belief/model banks and UMAP worker are
-    not constructed. Full-vocabulary computation is always skipped when its actual-batch,
+    When both population caps are omitted, the belief/model banks target the controlled default of
+    16,384 tokens; a loader that cannot supply that many (small split/dataset) still populates the
+    bank and renders the belief-UMAP figures at the smaller actual population, with a warning that
+    the controlled sidecar will not be comparable to a full 16,384-token run. Explicit
+    ``max_sequences`` calls preserve the exploratory compatibility path; the two caps are mutually
+    exclusive. ``generate_embedding_figures`` enables the complete category-separation and six-UMAP
+    family. When false, their belief/model banks and UMAP worker are not constructed.
+    Full-vocabulary computation is always skipped when its actual-batch,
     decode-aware workspace estimate exceeds the internal 8 GB safety guard; lighter inputs and
     figures still run. ``prepare_saved_probes`` persists missing depth-sensitivity and phi-numerics
     inputs from the already-loaded model and retained report batch so an isolated on-demand worker
@@ -794,9 +797,9 @@ def generate_figures(
         "spd_ellipses":               cstate is not None,
         "holonomy_curvature":         cstate is not None and "omega" in cstate,
         "numerical_trust":            cstate is not None,
-        "belief_umap_mu":             bank is not None and belief_controlled_ready,
-        "belief_umap_sigma":          bank is not None and belief_controlled_ready,
-        "belief_umap_phi":            bank is not None and belief_controlled_ready,
+        "belief_umap_mu":             bank is not None,
+        "belief_umap_sigma":          bank is not None,
+        "belief_umap_phi":            bank is not None,
         "vocab_probability_heatmap":  vstats is not None,
         "vocab_calibration":          vstats is not None,
         "vocab_confusion":            vstats is not None and decode is not None,
@@ -904,9 +907,12 @@ def generate_figures(
     if generate_embedding_figures:
         if controlled_bank and bank is not None and not belief_controlled_ready:
             logger.warning(
-                "controlled belief UMAP skipped: requested %d tokens but loader supplied %d",
+                "controlled belief UMAP population short: requested %d tokens but loader "
+                "supplied %d; rendering at actual population (sidecar will not be comparable "
+                "to a full %d-token controlled run)",
                 max_tokens,
                 bank["token_ids"].shape[0],
+                max_tokens,
             )
         with figs.UMAPWorker() as umap_worker:
             for ch in ("mu", "sigma", "phi"):                     # one UMAP per belief channel

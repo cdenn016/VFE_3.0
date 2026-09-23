@@ -102,7 +102,7 @@ config: Dict[str, Any] = dict(
 
     decode_mode                       = 'linear',  # prior-bank: diagonal_chunked/full_chunked/expected_likelihood_chunked/family_chunked
     encode_mode                       = "per_token",   #"per_token_additive" is ~1.5x faster at K=80 currently unablated
-                                                       # "canonical_content_projected" REQUIRES decode_mode = 'full_*" and full gauissians
+                                                       # "canonical_content_projected" requires gaussian_diagonal input and a full decoder
     decode_chunk_size                 = 8192,
     decode_tau                        = 0.008,  #prior_bank = True temperature
     decode_ce_checkpoint              = "auto",  # "auto" | "always" | "never"
@@ -301,10 +301,8 @@ config: Dict[str, Any] = dict(
     amp_dtype                            = 'bf16',        # None=fp32 | 'bf16' , 'fp16'. Sigma must be at least fp32
     fp32_matmul_precision                = "highest",       # None (leave as-is) | "highest" | "high" | "medium"
 
-    grad_clip                            = 1.0,         # gradient clip: global L2 norm unless grad_clip_per_role
-    grad_clip_per_role                   = True,        # clip grads per role (mu/sigma/phi) instead of one global norm
+    grad_clip                            = 1.0,         # L2 gradient clip applied independently per optimizer role
 
-    exp_fp64_mode                        = "norm",        # "dim" | "norm" norm ~1.5x faster at K=80
     exp_fp64_norm_threshold              = 20.0,          # "norm" mode threshold
     transport_chart_max_norm             = 20,
 

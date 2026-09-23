@@ -104,16 +104,16 @@ config = dict(
                                                                   # (gpt2 50257 / cl100k 100277 /
                                                                   #  word 267735); override to narrow
 
-    embed_dim                 = 160,                  # K, total belief dim (must be divisible by n_heads)
-    n_heads                   = 5,                   # = number of irrep blocks (alibi priors require this)
+    embed_dim                 = 20,                  # K, total belief dim (must be divisible by n_heads)
+    n_heads                   = 2,                   # = number of irrep blocks (alibi priors require this)
 
-    max_seq_len               = 256,                 # N, context length
-    eval_stride               = 128,
+    max_seq_len               = 128,                 # N, context length
+    eval_stride               = 32,
 
-    batch_size                = 8,
-    max_steps                 = 240000,
+    batch_size                = 32,
+    max_steps                 = 30000,
 
-    n_layers                  = 6,                   # L, number of blocks
+    n_layers                  = 2,                   # L, number of blocks
     n_e_steps                 = 1,                   # T, E-step inner iterations
 
     seed                      = 6,
@@ -122,12 +122,11 @@ config = dict(
     
     gradient_mode             = "filtering",   #"smoothing"
     
-    # Exact projected relational routing with conditional mean filtering.
-    relational_mode                  = "projected_filtering",  # "off" | "projected_filtering"
+    # Attention execution and projected input/output scopes.
+    attention_mode                   = "projected_predictive",  # "transported" | "projected_conditional" | "projected_predictive"
 
     relational_input_scope           = "full",         # each head reads all K coordinates; "head" is legacy behavior
 
-    relational_readout_mode          = "predictive_content",  # Transformers:"predictive_content", legacy: "conditional_update"
     relational_output_scope          = "full",                  # transformers: "full": requires predictive_content, legacy: 'head'
     
     attention_residual               = True,   # predictive S/T/O: add the incoming mean
@@ -141,7 +140,7 @@ config = dict(
     divergence_family         = "renyi",   # "renyi", "squared_hellinger","bhattacharyya", "jeffreys",
     renyi_order               = 1.0,       # Renyi order (1.0 -> KL)
 
-    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full" | "laplace_diagonal" | "gaussian_frame_diagonal"
+    family                    = "gaussian_full", # "gaussian_diagonal" | "gaussian_full" | "laplace_diagonal" | "gaussian_frame_diagonal"
                                                      # | "gaussian_diagonal_exact" (single covariance toggle; diagonal_covariance is derived)
 
      
@@ -165,9 +164,9 @@ config = dict(
     use_priorbank_head_evidence_mixer = False,
                                          
     
-    decode_mode                       = 'linear',  # prior-bank: diagonal_chunked/full_chunked/expected_likelihood_chunked/family_chunked
+    decode_mode                       = 'full_chunked',  # prior-bank: diagonal_chunked/full_chunked/expected_likelihood_chunked/family_chunked
     encode_mode                       = "per_token",   #"per_token_additive" is ~1.5x faster at K=80 currently unablated
-                                                       # "canonical_content_projected" REQUIRES decode_mode = 'full_*" and full gauissians
+                                                       # "canonical_content_projected" requires gaussian_diagonal input and a full decoder
     decode_chunk_size                 = 8192,
     decode_tau                        = 0.008,       #prior_bank = True temperature
     
@@ -175,7 +174,7 @@ config = dict(
 
     
     decode_unigram_prior              = True,       # add kappa*log pi_v (corpus unigram) to decode logits    
-    untie_decode_bank                 = False,       # prior-bank modes only: decode reads its OWN cloned (V,K) tables
+    untie_decode_bank                 = True,       # prior-bank modes only: decode reads its OWN cloned (V,K) tables
     
     
     #################################
@@ -217,7 +216,7 @@ config = dict(
     #                Self Energy:
     #        Sum_i alpha_i * KL(q_i||p_i)
     ######################################
-    lambda_alpha_mode          = "state_dependent_per_coord",  # "constant" | "state_dependent" | "state_dependent_per_coord"
+    lambda_alpha_mode          = "constant",  # "constant" | "state_dependent" | "state_dependent_per_coord"
 
     b0   = 1.0,                                # state-dependent alpha shape: alpha* = c0/(b0 + D)
     c0   = 1.0,                                 # state-dependent alpha shape (numerator)
@@ -281,6 +280,7 @@ config = dict(
     m_p_mu_lr                 = 0.005,
     m_p_sigma_lr              = 0.001,
     m_phi_lr                  = 0.0015,
+    
     m_pos_phi_lr              = 0.001,      # None inherits m_phi_lr; own M-step rate for the LEARNED
                                            # positional frame table (active only at pos_phi='learned')
 
@@ -327,9 +327,9 @@ config = dict(
     #         Misc/Logging
     #################################
 
-    log_interval               = 1200,       # console log every N steps (0 = off)
-    eval_interval              = 24000,      # periodic validation every N steps (0 = off)
-    checkpoint_interval        = 60000,     # save a resumable checkpoint every N steps (0 = off)
+    log_interval               = 100,       # console log every N steps (0 = off)
+    eval_interval              = 1500,      # periodic validation every N steps (0 = off)
+    checkpoint_interval        = 15000,     # save a resumable checkpoint every N steps (0 = off)
 
 
     #################################
@@ -343,12 +343,10 @@ config = dict(
    
    
     amp_dtype                            = 'bf16',        # None=fp32 | 'bf16' , 'fp16'. Sigma must be at least fp32
-    fp32_matmul_precision                = "highest",       # None (leave as-is) | "highest" | "high" | "medium"  
+    fp32_matmul_precision                = "highest",          # None (leave as-is) | "highest" | "high" | "medium" ("high" permits TF32 on the decode/energy GEMMs)
     
-    grad_clip                            = 1.0,         # gradient clip: global L2 norm unless grad_clip_per_role
-    grad_clip_per_role                   = True,        # clip grads per role (mu/sigma/phi) instead of one global norm
+    grad_clip                            = 1.0,         # L2 gradient clip applied independently per optimizer role
     
-    exp_fp64_mode                        = "norm",        # "dim" | "norm" norm ~1.5x faster at K=80
     exp_fp64_norm_threshold              = 20.0,          # "norm" mode threshold
     
 
@@ -361,7 +359,7 @@ config = dict(
     # problem, not a factorization problem. sigma_log_embed trains freely against only the eps=1e-6
     # floor, so this is harmless at init and about one order of magnitude of shrinkage from
     # material; watch decode_sigma_v_min. Default "fp32" is bit-identical to every run on disk.
-    decode_av_precision                  = "fp64",     #  "fp32" | "fp64"
+    decode_av_precision                  = "fp32",     #  "fp32" | "fp64"
 
 
     # Strict decoder ranking guard. When enabled, analytic
@@ -370,7 +368,7 @@ config = dict(
     # That is an accuracy diagnostic, not a production-safe fallback: at B=64, N=128, V=50,257
     # the promoted logits alone occupy about 3.1 GiB before backward intermediates. Keep it
     # opt-in so the default chunked route remains streamed and bounded.
-    decode_ranking_fp64_escalation       = True,             
+    decode_ranking_fp64_escalation       = False,             
      
     # DEFAULT guard is sign-only: recompute in float64 iff the working-dtype congruence went
     # negative -- one amin reduction the floor needs regardless. Positivity is necessary but not
@@ -387,7 +385,7 @@ config = dict(
     # uncertified. At B=64, N=128, K=20 this checks 1,048,576 separate 20x20 matrices and the
     # promoted field is about 3.1 GiB. Keep this opt-in for accuracy investigations; False retains
     # the selected working precision without the additional certificate or fallback recompute.
-    full_cov_congruence_certification    = True,  # False: no per-pair Cholesky certificate or
+    full_cov_congruence_certification    = False,  # False: no per-pair Cholesky certificate or
                                                  # whole-field fp64 retry. True: strict M13 audit
                                                  # over ~1.05M 20x20 matrices per call at B64/N128.
                                                  
@@ -395,7 +393,7 @@ config = dict(
     skip_belief_sigma_update             = True,        # skip the belief-channel sigma E-step update
     compile_pair_kernel                  = False,       # torch.compile the closed-form pair kernel 
     
-    transport_clamp_monitor              = True,
+    transport_clamp_monitor              = False,
     generate_embedding_figures           = True,
 )
 

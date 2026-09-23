@@ -14,7 +14,7 @@ from vfe3.model.relational_operators import RelationalOperators
 def test_gaussian_family_live_forward_backward(family: str, readout: str) -> None:
     torch.manual_seed(17)
     model = VFEModel(_cfg(family=family, relational_input_scope="full",
-                         relational_readout_mode=readout,
+                         attention_mode=("projected_predictive" if readout == "predictive_content" else "projected_conditional"),
                          relational_output_scope="full" if readout == "predictive_content" else "head"))
     ids, targets = _tokens()
     capture = {}
@@ -67,7 +67,7 @@ def test_full_covariance_score_matches_dense_marginals(scope: str) -> None:
 def test_gaussian_rope_autocast_snapshot(family: str, readout: str, rope_on_value: bool) -> None:
     torch.manual_seed(9)
     model = VFEModel(_cfg(family=family, relational_input_scope="full",
-                         relational_readout_mode=readout,
+                         attention_mode=("projected_predictive" if readout == "predictive_content" else "projected_conditional"),
                          relational_output_scope="full" if readout == "predictive_content" else "head",
                          pos_rotation="rope", rope_full_gauge=family == "gaussian_full",
                          rope_on_value=rope_on_value))
@@ -94,7 +94,7 @@ def test_gaussian_rope_autocast_snapshot(family: str, readout: str, rope_on_valu
 def test_intrinsic_family_does_not_pull_back_stored_coordinates_twice(readout: str) -> None:
     torch.manual_seed(3)
     model = VFEModel(_cfg(family="gaussian_frame_diagonal", relational_input_scope="full",
-                         relational_readout_mode=readout, use_head_mixer=False, use_block_mlp=False))
+                         attention_mode=("projected_predictive" if readout == "predictive_content" else "projected_conditional"), use_head_mixer=False, use_block_mlp=False))
     ids, _ = _tokens()
     first = model.forward_beliefs(ids)[0].mu
     with torch.no_grad():
@@ -147,8 +147,9 @@ def test_laplace_remains_outside_gaussian_projection_envelope() -> None:
 @pytest.mark.parametrize("readout", ["conditional_update", "predictive_content", "ordinary"])
 def test_full_gaussian_active_per_coordinate_alpha(readout: str) -> None:
     model = VFEModel(_cfg(family="gaussian_full", relational_input_scope="full",
-                         relational_mode="off" if readout == "ordinary" else "projected_filtering",
-                         relational_readout_mode="conditional_update" if readout == "ordinary" else readout,
+                         attention_mode=("transported" if readout == "ordinary" else
+                                         "projected_predictive" if readout == "predictive_content"
+                                         else "projected_conditional"),
                          lambda_alpha_mode="state_dependent_per_coord",
                          mstep_self_coupling_weight=.2, full_cov_kl_precision="fp64"))
     ids, targets = _tokens()

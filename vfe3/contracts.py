@@ -158,11 +158,15 @@ class MStepCapture(TypedDict, total=False):
 
 
 class EStepGradientRecord(TypedDict, total=False):
-    """Detached tensor-valued E-step gradient norms before host conversion."""
+    """Detached gradient norms; None denotes an unavailable predictive gradient.
 
-    mu:    torch.Tensor
-    sigma: torch.Tensor
-    phi:   torch.Tensor
+    Missing keys retain the historical unrecorded zero at the public output boundary.
+    Explicit None values become Python NaNs there without allocating device scalars.
+    """
+
+    mu:    Optional[torch.Tensor]
+    sigma: Optional[torch.Tensor]
+    phi:   Optional[torch.Tensor]
 
 
 class EStepGradientOutput(TypedDict, total=False):

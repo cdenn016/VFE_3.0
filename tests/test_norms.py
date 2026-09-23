@@ -195,7 +195,7 @@ def test_layernorm_predictive_bf16_runtime_and_gradients() -> None:
     from vfe3.model.model import VFEModel
 
     torch.manual_seed(17)
-    model = VFEModel(_cfg(relational_readout_mode="predictive_content",
+    model = VFEModel(_cfg(attention_mode="projected_predictive",
                           norm_type_block="layernorm", layernorm_affine=True,
                           attention_residual=True))
     observed = []

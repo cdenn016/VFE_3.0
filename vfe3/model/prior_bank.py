@@ -956,11 +956,11 @@ class PriorBank(nn.Module):
         # with a canonical gaussian/renyi/alpha=1 seam. Defaults reproduce the old fixed-KL readout.
         self.divergence_family = divergence_family
         self.renyi_order = renyi_order
-        self.full_cov_kl_precision = (
-            full_cov_kl_precision()
-            if full_cov_precision_policy is None
-            else validate_full_cov_kl_precision(full_cov_precision_policy)
-        )
+        # Default to the VFE3Config spelling rather than snapshotting the process global, so a
+        # standalone PriorBank cannot inherit the module-level "fp64" fallback. The model-owned
+        # bank is always constructed with the explicit cfg policy.
+        self.full_cov_kl_precision = validate_full_cov_kl_precision(
+            "fp32_escalate" if full_cov_precision_policy is None else full_cov_precision_policy)
         self.encode_mode = encode_mode
         self.decode_mode = decode_mode
         self.decode_chunk_size = decode_chunk_size

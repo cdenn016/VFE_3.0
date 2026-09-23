@@ -103,8 +103,11 @@ class RelationalOperators(nn.Module):
             coordinates = canonical.flatten(-2).unsqueeze(-2) if self.input_scope == "full" else canonical
             values = (self.T.to(dtype) @ coordinates.to(dtype).unsqueeze(-1)).squeeze(-1)
             pooled = torch.einsum("...hij,...jhs->...ihs", beta.to(dtype), values)
-            mixed = (self.O.to(dtype) @ pooled.unsqueeze(-1)).squeeze(-1)
-            body = mixed.sum(-2) if self.output_scope == "full" else mixed.flatten(-2)
+            if self.output_scope == "full":
+                # Sum heads inside the contraction, avoiding a (..., N, H, K) result.
+                body = torch.einsum("hks,...nhs->...nk", self.O.to(dtype), pooled)
+            else:
+                body = (self.O.to(dtype) @ pooled.unsqueeze(-1)).squeeze(-1).flatten(-2)
             if frame.block_diagonal:
                 body = body.reshape(*mu.shape[:-1], H, d)
             result = (frame.forward.to(dtype) @ body.unsqueeze(-1)).squeeze(-1)

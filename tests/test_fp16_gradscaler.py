@@ -12,7 +12,7 @@ from vfe3.train import build_optimizer, train, train_step
 
 
 def _tiny_cfg(**overrides) -> VFE3Config:
-    base = dict(vocab_size=8, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1, grad_clip_per_role=False)
+    base = dict(vocab_size=8, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1)
     base.update(overrides)
     return VFE3Config(**base)
 
@@ -42,7 +42,11 @@ def test_gradscaler_disabled_is_byte_identical_to_unscaled_step():
     optB.zero_grad(set_to_none=True)
     _, lossB, _ = mB(tok, tgt)
     lossB.backward()
-    torch.nn.utils.clip_grad_norm_(mB.parameters(), 1.0)
+    role_parameters = {}
+    for group in optB.param_groups:
+        role_parameters.setdefault(group.get("role", "other"), []).extend(group["params"])
+    for parameters in role_parameters.values():
+        torch.nn.utils.clip_grad_norm_(parameters, 1.0)
     optB.step()
 
     for (na, pa), (nb, pb) in zip(mA.named_parameters(), mB.named_parameters()):

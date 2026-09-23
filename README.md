@@ -1,6 +1,6 @@
-# V3_Transformer
+# VFE_3.0
 
-V3_Transformer is an experimental language model built from Gaussian attention and
+VFE_3.0 is an experimental language model built from Gaussian attention and
 learned matrix-valued communication links. Each token carries a mean, covariance, and
 local frame. Query and key projections compare Gaussian observables; value and output
 maps determine what content is sent and how it enters the receiver's state.
@@ -10,6 +10,13 @@ attention with predictive-content readout**. Its attention step directly aggrega
 content, with a residual connection. The attention weights have a variational
 derivation. A single latent variational free energy for the complete language model
 is not established; the predictor trains on supervised next-token cross-entropy.
+
+This is an independent local copy of `V3_Transformer`. Its source, tests, and
+launcher edits were copied before cleanup; training output, caches, environments,
+and the source repository's Git metadata were not copied. The Python package
+remains `vfe3` to preserve imports and checkpoint parameter names. See
+[cleanup and migration notes](docs/implementation/cleanup-migration-2026-09-22.md)
+for the simplified configuration and compatibility boundaries.
 
 ## Architecture
 
@@ -152,7 +159,7 @@ over source probabilities gives
 
 $$
 \beta_{ij}^{(h)}
-=\operatorname{softmax}_j\left(\log\pi_{ij}^{(h)}-D_{ij}^{(h)}/\tau_h\right).
+=\mathrm{softmax}_j\left(\log\pi_{ij}^{(h)}-D_{ij}^{(h)}/\tau_h\right).
 $$
 
 This is the variational attention calculation. `include_attention_entropy=True`
@@ -217,9 +224,8 @@ rather than a complete standalone configuration:
 
 ```python
 config.update(
-    relational_mode="projected_filtering",
+    attention_mode="projected_predictive",
     relational_input_scope="full",
-    relational_readout_mode="predictive_content",
     relational_output_scope="full",
     attention_residual=True,
     gradient_mode="filtering",
@@ -275,7 +281,7 @@ normalized autoregressive model. With $\mathcal T$ the unmasked targets and
 $M=|\mathcal T|$,
 
 $$
-p_\theta(x_{i+1}\mid x_{\le i})=\operatorname{softmax}(z_i)_{x_{i+1}},\qquad
+p_\theta(x_{i+1}\mid x_{\le i})=\mathrm{softmax}(z_i)_{x_{i+1}},\qquad
 \mathcal L_{\mathrm{CE}}=-\frac1M\sum_{i\in\mathcal T}
 \log p_\theta(x_{i+1}\mid x_{\le i}).
 $$
@@ -284,10 +290,12 @@ Outer backpropagation trains enabled prior, frame, interface, MLP, normalization
 and decoder parameters. Optional outer penalties are separate choices. This loss
 is not the same scalar as the variational routing objective.
 
-Prior-bank divergence decoders remain available in other compatible profiles.
-For example, `diagonal_chunked` and `full_chunked` score vocabulary Gaussians.
-That output choice is distinct from token initialization; the current projected
-route requires `linear` decoding.
+Prior-bank divergence decoders score vocabulary Gaussians. For example,
+`diagonal_chunked` and `full_chunked` are available on the projected route as well
+as on transported profiles. That output choice is distinct from token initialization.
+On a projected route the belief covariance is kept at its encode value (the
+predictive readout replaces only the mean, and relational filtering returns no
+sigma gradient), so a prior-bank KL decode scores against that encode covariance.
 
 ### Optional belief-revision paths
 
@@ -296,10 +304,10 @@ The engine retains gradient filtering, smoothing and surrogate objectives, and
 `mm_exact` minimizes a frozen-attention surrogate, not the entire language-model
 objective.
 
-`relational_readout_mode="conditional_update"` selects projected conditional
+`attention_mode="projected_conditional"` selects projected conditional
 belief gradients. Its current envelope permits one layer and head-local output.
 Changing from predictive content requires compatible settings beyond one switch.
-`relational_mode="off"` enables other supported belief-refinement constructions.
+`attention_mode="transported"` enables other supported belief-refinement constructions.
 The optional gradient machinery is not a required derivation of predictive content.
 
 ## Geometry and scope

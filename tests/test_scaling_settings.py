@@ -13,8 +13,8 @@ def _baseline() -> dict:
     return dict(vocab_size=7, embed_dim=4, n_heads=2, n_layers=1, n_e_steps=1,
                 max_seq_len=3, batch_size=2, max_steps=12, warmup_steps=1,
                 eval_stride=None, gauge_group="block_glk", pos_phi="none",
-                relational_mode="projected_filtering", relational_input_scope="full",
-                relational_readout_mode="predictive_content", relational_output_scope="full",
+                relational_input_scope="full",
+                attention_mode="projected_predictive", relational_output_scope="full",
                 use_block_mlp=True, block_mlp_expansion=2, kl_max=32.)
 
 
@@ -31,7 +31,7 @@ def test_grids_preserve_baseline_and_change_only_declared_axes(monkeypatch: pyte
     assert len(routes["width_depth"]) == 4
     for cell in routes["width"]:
         cfg = scaling._cell_cfg_dict(cell["overrides"], 3, None)
-        assert cfg["relational_readout_mode"] == "predictive_content"
+        assert cfg["attention_mode"] == "projected_predictive"
         assert cfg["n_heads"] == 2 and cfg["n_layers"] == 1
         assert cfg["kl_max"] / cfg["embed_dim"] == 8
     for cell in routes["depth"]:

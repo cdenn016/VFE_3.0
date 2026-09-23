@@ -48,6 +48,10 @@ def relational_score(
             if x.ndim == mu.ndim + 1 else x.reshape(*x.shape[:-1], H, d)
             for x in (sigma, source_sigma))
     S_q, S_k = operators.comparison_pair()
+    # mu_h/sigma_h/inverse are already numerically identical to source_mu_h/source_sigma_h/
+    # key_inverse in the predictive self-comparison case (mu is source_mu): S_q and S_k still
+    # differ, so both per-map contractions L=S U^-1 are required either way. projected_moments
+    # takes S as (H, r, d); it does not accept a stacked (2, H, r, d) map.
     a_q, G_q = projected_moments(mu_h, sigma_h, inverse, S_q)
     a_k, G_k = projected_moments(source_mu_h, source_sigma_h, key_inverse, S_k)
     if capture is not None:
@@ -126,8 +130,9 @@ def relational_predictive_readout(
     dtype = torch.float64 if mu.dtype == torch.float64 else torch.float32
     with torch.autocast(device_type=mu.device.type, enabled=False):
         mu_work = mu.to(dtype)
+        sigma_work = sigma.to(dtype)
         score = safe_kl_clamp(relational_score(
-            mu_work, sigma.to(dtype), mu_work, sigma.to(dtype), frame, operators, capture), kl_max=kl_max)
+            mu_work, sigma_work, mu_work, sigma_work, frame, operators, capture), kl_max=kl_max)
         beta = attention_weights(score, tau=tau,
                                  log_prior=None if log_prior is None else log_prior.to(dtype))
         result = operators.predictive_content(mu_work, beta, value_frame or frame).to(mu.dtype)

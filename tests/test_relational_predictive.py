@@ -79,7 +79,7 @@ def test_predictive_finite_difference(name: str) -> None:
     torch.testing.assert_close(derivative[index], (plus-minus)/2e-6, rtol=2e-5, atol=2e-8)
     assert derivative.abs().sum() > 1e-8
 def test_predictive_live_model_config_optimizer_and_diagnostics() -> None:
-    cfg = _cfg(relational_input_scope="full", relational_readout_mode="predictive_content",
+    cfg = _cfg(relational_input_scope="full", attention_mode="projected_predictive",
                relational_output_scope="full")
     model = VFEModel(cfg)
     ids, targets = _tokens()
@@ -103,7 +103,7 @@ def test_predictive_full_scope_accepts_rope_and_keeps_outer_gradients(
 ) -> None:
     cfg = _cfg(
         relational_input_scope="full",
-        relational_readout_mode="predictive_content",
+        attention_mode="projected_predictive",
         relational_output_scope="full",
         pos_rotation="rope",
         rope_on_value=rope_on_value,
@@ -123,13 +123,16 @@ def test_invalid_predictive_combinations_are_rejected() -> None:
     with pytest.raises(ValueError, match="predictive"):
         _cfg(relational_output_scope="full")
     with pytest.raises(ValueError, match="learned content"):
-        _cfg(relational_readout_mode="predictive_content", relational_identity_content=True)
-    with pytest.raises(ValueError, match="predictive_content"):
-        _cfg(relational_mode="off", relational_readout_mode="predictive_content")
+        _cfg(attention_mode="projected_predictive", relational_identity_content=True)
+    with pytest.raises(ValueError, match="predictive|conflict"):
+        legacy = asdict(_cfg())
+        legacy.pop("attention_mode")
+        legacy.update(relational_mode="off", relational_readout_mode="predictive_content")
+        config_from_serialized(legacy, source="invalid legacy pair")
 
 
 def test_predictive_bypasses_fisher_step_and_uses_source_content_graph() -> None:
-    settings = dict(relational_input_scope="full", relational_readout_mode="predictive_content",
+    settings = dict(relational_input_scope="full", attention_mode="projected_predictive",
                     relational_output_scope="full", use_block_mlp=False, use_head_mixer=False)
     first = VFEModel(_cfg(**settings, e_q_mu_lr=0.0))
     second = VFEModel(_cfg(**settings, e_q_mu_lr=9.0))

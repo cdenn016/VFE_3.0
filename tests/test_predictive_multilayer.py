@@ -10,7 +10,7 @@ from vfe3.run_artifacts import RunArtifacts, load_checkpoint
 
 
 def _depth_cfg(layers: int, **kwargs) -> VFE3Config:
-    return _cfg(n_layers=layers, relational_readout_mode="predictive_content",
+    return _cfg(n_layers=layers, attention_mode="projected_predictive",
                 relational_input_scope="full", relational_output_scope="full",
                 attention_residual=True,
                 prior_handoff_rho=1.0, prior_handoff_sigma=0.1, **kwargs)

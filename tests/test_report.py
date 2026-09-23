@@ -225,6 +225,51 @@ def test_generate_figures_reuses_one_same_token_snapshot(tmp_path, monkeypatch):
         assert (tmp_path / "run" / "figures" / f"belief_umap_{channel}.png").exists()
 
 
+def test_generate_figures_renders_belief_umap_below_default_controlled_population(
+    tmp_path, monkeypatch, caplog,
+):
+    r"""A loader shorter than the 16,384-token controlled default must still render the belief
+    UMAP figures (2026-09-23): the exact-match ``belief_controlled_ready`` gate previously marked
+    ``belief_umap_mu/sigma/phi`` entirely unavailable whenever the loader could not fill the full
+    controlled population, even with ``generate_embedding_figures=True`` and a nonempty bank.
+    """
+    from vfe3.viz import report
+
+    model = _model()
+
+    class _NoopUMAPWorker:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return None
+
+    umap_calls = []
+
+    def plot_umap(_bank: dict, channel: str = "mu", **kwargs: object) -> object:
+        umap_calls.append((channel, kwargs.get("controlled")))
+        figure = plt.figure()
+        figure.savefig(str(kwargs["path"]))
+        return figure
+
+    monkeypatch.setattr(report.figs, "UMAPWorker", _NoopUMAPWorker)
+    monkeypatch.setattr(report.figs, "plot_belief_umap", plot_umap)
+
+    paths = generate_figures(
+        tmp_path / "run",
+        model=model,
+        loader=_loader(),                 # 600-token base stream, far under the controlled cap
+        generate_embedding_figures=True,  # max_tokens/max_sequences both omitted -> default 16,384
+    )
+
+    written = {path.name for path in paths}
+    assert {"belief_umap_mu.png", "belief_umap_sigma.png", "belief_umap_phi.png"} <= written
+    assert {channel for channel, _ in umap_calls} == {"mu", "sigma", "phi"}
+    assert all(controlled is True for _, controlled in umap_calls)
+    assert "controlled belief UMAP population short: requested 16384 tokens but loader supplied" \
+        in caplog.text
+
+
 def test_generate_figures_forwards_model_owned_full_gaussian_policy(tmp_path, monkeypatch):
     """The report driver forwards the live model policy to its gauge-residual measurement."""
     from vfe3 import metrics

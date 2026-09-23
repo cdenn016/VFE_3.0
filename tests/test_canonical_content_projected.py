@@ -973,7 +973,9 @@ def test_projected_manual_decode_matches_canonical_full_oracle(
     ))
     assert not torch.allclose(context.forward, token_only, atol=1e-6, rtol=1e-6)
     assert logits is not None
-    assert torch.allclose(logits, expected, atol=4e-4, rtol=4e-4)
+    # The chunked KL decode preserves a float64 ranking escalation (_decode_analytic_kl_logits);
+    # this hand oracle inherits float32 from its inputs. Compare values, not dtypes.
+    assert torch.allclose(logits.to(expected.dtype), expected, atol=4e-4, rtol=4e-4)
 
 
 def test_projected_missing_frame_fails_closed_at_priorbank_decode() -> None:
@@ -1314,8 +1316,10 @@ def test_projected_model_dense_fused_training_threads_context_and_gradients() ->
     assert fused_logits is None
     assert isinstance(dense_holder.get("canonical_frame"), CanonicalFrameContext)
     assert isinstance(fused_holder.get("canonical_frame"), CanonicalFrameContext)
-    assert torch.allclose(fused_ce, dense_ce, atol=7e-4, rtol=7e-4)
-    assert torch.allclose(fused_loss, dense_loss, atol=7e-4, rtol=7e-4)
+    # Fused chunked CE preserves a float64 ranking escalation; the dense twin casts to mu_q.dtype.
+    # Values agree to ~1e-7; compare across the intentional dtype boundary.
+    assert torch.allclose(fused_ce.to(dense_ce.dtype), dense_ce, atol=7e-4, rtol=7e-4)
+    assert torch.allclose(fused_loss.to(dense_loss.dtype), dense_loss, atol=7e-4, rtol=7e-4)
 
     dense_belief = dense_holder["belief"]
     fused_belief = fused_holder["belief"]

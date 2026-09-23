@@ -19,7 +19,7 @@ def _cfg(**overrides: Any) -> VFE3Config:
                   e_phi_lr=0.0, oracle_unroll_grad=True, warmup_steps=0,
                   max_steps=2, log_interval=0, eval_interval=0,
                   pos_phi="learned", use_head_mixer=True, use_block_mlp=True,
-                  block_mlp_expansion=1, relational_mode="projected_filtering")
+                  block_mlp_expansion=1, attention_mode="projected_conditional")
     values.update(overrides)
     return VFE3Config(**values)
 
@@ -48,7 +48,7 @@ def test_real_forward_uses_router_content_and_live_outer_gradients() -> None:
 
 
 def test_disabled_mode_has_no_parameters_or_rng_effect() -> None:
-    cfg = _cfg(relational_mode="off")
+    cfg = _cfg(attention_mode="transported")
     torch.manual_seed(91)
     first = VFEModel(cfg)
     expected_rng = torch.random.get_rng_state()

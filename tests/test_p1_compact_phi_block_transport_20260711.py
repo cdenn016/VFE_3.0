@@ -161,12 +161,11 @@ def test_compact_phi_block_transport_changes_only_opted_in_block_glk_layout(
 
 
 @pytest.mark.parametrize(
-    ("exp_fp64_mode", "threshold"),
-    [("dim", 5.0), ("norm", 0.0)],
+    "threshold",
+    [20.0, 0.0],
 )
 def test_compact_phi_block_transport_preserves_global_full_frame_clamp_and_dtype_rule(
     device:         torch.device,
-    exp_fp64_mode: str,
     threshold:     float,
 ) -> None:
     group = get_group("block_glk")(4, 2, device=device)
@@ -178,14 +177,12 @@ def test_compact_phi_block_transport_preserves_global_full_frame_clamp_and_dtype
         phi,
         group,
         transport_mode="flat",
-        exp_fp64_mode=exp_fp64_mode,
         exp_fp64_norm_threshold=threshold,
     )
     compact = build_belief_transport(
         phi,
         group,
         transport_mode="flat",
-        exp_fp64_mode=exp_fp64_mode,
         exp_fp64_norm_threshold=threshold,
         compact_phi_block_transport=True,
     )

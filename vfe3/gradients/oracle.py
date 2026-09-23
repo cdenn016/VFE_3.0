@@ -20,6 +20,7 @@ import torch
 
 from vfe3.alpha_i import self_coupling_alpha
 from vfe3.families.base import get_family
+from vfe3.families.policy import coupling_energy as _coupling_energy, family_instance as _family_instance
 from vfe3.families.gaussian import FullGaussian
 from vfe3.free_energy import free_energy, self_divergence_for_alpha
 # Forward transport containers are named in the `omega` forward-ref annotation below; import them
@@ -31,30 +32,6 @@ from vfe3.geometry.transport import (
     FactoredTransport,
     RopeTransport,
 )
-
-
-def _coupling_energy(
-    family, *args,
-    log_prior:         Optional[torch.Tensor] = None,
-    precision_policy:  Optional[str]          = None,
-    score_backend:     str                    = "pairwise",
-    **kwargs,
-) -> torch.Tensor:
-    """Use an explicit policy for the built-in full family without changing custom-family APIs."""
-    if family is FullGaussian:
-        kwargs["score_backend"] = score_backend
-        if precision_policy is not None:
-            kwargs["precision_policy"] = precision_policy
-        if log_prior is not None:
-            kwargs["pair_support"] = ~torch.isneginf(log_prior)
-    return family.coupling_energy(*args, **kwargs)
-
-
-def _family_instance(family, mu: torch.Tensor, sigma: torch.Tensor, precision_policy: Optional[str]):
-    """Construct the built-in full family with an explicit model policy when supplied."""
-    if family is FullGaussian and precision_policy is not None:
-        return family(mu, sigma, _precision_policy=precision_policy)
-    return family(mu, sigma)
 
 
 def _transport_to_float(
@@ -229,8 +206,8 @@ def belief_gradients_autograd(
     # omega routes correctly against a batched diagonal sigma (its rank gap vs the omega
     # would otherwise misinfer the full sandwich); behavior-identical for a batched dense omega.
     sd = self_divergence_for_alpha(
-                                   _family_instance(fam, mu_q, sigma_q, full_cov_kl_precision),
-                                   _family_instance(fam, mu_p, sigma_p, full_cov_kl_precision), alpha=renyi_order, kl_max=kl_max, eps=eps,
+                                   _family_instance(mu_q, sigma_q, fam, full_cov_kl_precision),
+                                   _family_instance(mu_p, sigma_p, fam, full_cov_kl_precision), alpha=renyi_order, kl_max=kl_max, eps=eps,
                                    divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode)
     alpha, reg = self_coupling_alpha(sd, mode=lambda_alpha_mode, value=value, b0=b0, c0=c0)
     energy = _coupling_energy(

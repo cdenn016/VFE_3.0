@@ -34,8 +34,6 @@ from vfe3.geometry.lie_ops import CompactBlockElement, project_phi_to_slk
 from vfe3.geometry.norms import get_norm
 from vfe3.geometry.rope import get_pos_rotation
 from vfe3.geometry.transport import (
-    _TRANSPORT_NEEDS_MU,
-    _TRANSPORT_NEEDS_SIGMA,
     CompactFactoredTransport,
     FactoredTransport,
     RopeTransport,
@@ -60,7 +58,13 @@ from vfe3.model.prior_bank import (
     _encode_per_token,
 )
 from vfe3.model.stack import vfe_stack
-from vfe3.families.gaussian import FullGaussian, validate_full_cov_kl_precision
+from vfe3.families.gaussian import (
+    FullGaussian,
+    set_full_cov_kl_precision,
+    validate_full_cov_kl_precision,
+)
+from vfe3.families.base import BeliefParams
+from vfe3.families.policy import coupling_energy, family_instance
 from vfe3.geometry.transport import (
     set_full_cov_congruence_certification,
     set_full_cov_congruence_precision,
@@ -68,14 +72,6 @@ from vfe3.geometry.transport import (
 from vfe3.numerics import set_mu_trust_cholesky_rounds, set_safe_cholesky_jitter_mode
 from vfe3.runtime import set_fp32_matmul_precision
 from vfe3.model.relational_operators import RelationalOperators
-
-
-# Transport-mode state-routing sets: which regimes' Omega builders read mu/sigma. Sourced from the
-# transport registry metadata (register_transport(needs_mu=/needs_sigma=)) so a new stateful regime
-# advertises its requirements AT REGISTRATION; the callers below feed mu/sigma by membership here,
-# never by matching literal mode names (the add-by-registering contract).
-_REGIME_NEEDS_MU    = _TRANSPORT_NEEDS_MU
-_REGIME_NEEDS_SIGMA = _TRANSPORT_NEEDS_SIGMA
 
 
 def _block_mlp_diagnostic_eval(method: Callable) -> Callable:
@@ -307,15 +303,16 @@ class VFEModel(nn.Module):
         # before model + loader are built), NOT here: seeding inside __init__ would clobber a
         # caller-set RNG state (e.g. a test that seeds then constructs several models).
         self.cfg = cfg
-        # The full-covariance KL precision policy is immutable model state. The standalone module
-        # default remains available to direct family callers, but constructing another model must
-        # never change this model's transport, divergence, decoder, or workspace behavior. The
-        # boolean config is compiled into the already-supported strict policy spelling here, so
-        # every model-owned family object continues to carry one immutable precision value.
+        # The full-covariance KL precision policy is model state and the process-wide default for
+        # un-threaded family callers. It is installed under the same one-place-set rule as the
+        # congruence, Cholesky, and fp32-matmul policies below, so direct FullGaussian calls and the
+        # PriorBank fallback resolve the config-selected policy rather than the module default.
         self.full_cov_kl_precision = validate_full_cov_kl_precision(
             cfg.full_cov_kl_precision)
         self.full_cov_kl_backend = cfg.full_cov_kl_backend
-        # Same one-place-set rule for the congruence that feeds it (audit 2026-08-06 C1).
+        # Same one-place-set rule for the KL policy itself and the congruence that feeds it
+        # (audit 2026-08-06 C1).
+        set_full_cov_kl_precision(self.full_cov_kl_precision)
         set_full_cov_congruence_precision(cfg.full_cov_congruence_precision)
         set_full_cov_congruence_certification(cfg.full_cov_congruence_certification)
         set_safe_cholesky_jitter_mode(cfg.safe_cholesky_jitter_mode)
@@ -662,17 +659,14 @@ class VFEModel(nn.Module):
         # detached, so only this bounded scalar prior learns; the analytic E-step still receives one
         # fixed log-prior tensor rather than a candidate-dependent score network.
     def _coupling_energy(
-        self, family, *args,
+        self, family: type[BeliefParams], *args: Any,
         log_prior: Optional[torch.Tensor] = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> torch.Tensor:
         """Evaluate a model-owned coupling grid under this model's immutable precision policy."""
-        if family is FullGaussian:
-            kwargs["precision_policy"] = self.full_cov_kl_precision
-            kwargs["score_backend"] = self.full_cov_kl_backend
-            if log_prior is not None:
-                kwargs["pair_support"] = ~torch.isneginf(log_prior)
-        return family.coupling_energy(*args, **kwargs)
+        return coupling_energy(
+            family, *args, log_prior=log_prior, precision_policy=self.full_cov_kl_precision,
+            score_backend=self.full_cov_kl_backend, **kwargs)
 
     @property
     def relational_operators_by_layer(self) -> Tuple[RelationalOperators, ...]:
@@ -698,11 +692,11 @@ class VFEModel(nn.Module):
         r"""Return the ambient block sizes the beta score is computed in."""
         return self.group.irrep_dims
 
-    def _family_instance(self, family, *args):
-        """Construct a model-owned full Gaussian with this model's immutable policy."""
-        if family is FullGaussian:
-            return family(*args, _precision_policy=self.full_cov_kl_precision)
-        return family(*args)
+    def _family_instance(
+        self, family: type[BeliefParams], mu: torch.Tensor, sigma: torch.Tensor,
+    ) -> BeliefParams:
+        """Construct a model-owned Gaussian with this model's immutable policy."""
+        return family_instance(mu, sigma, family, self.full_cov_kl_precision)
 
     def _transport_dispersion(self, family, dispersion, omega, **kwargs) -> torch.Tensor:
         """Transport model-owned full covariance under this model's immutable policy."""
@@ -947,7 +941,6 @@ class VFEModel(nn.Module):
             congruence_cond_escalation=self.cfg.congruence_cond_escalation,
             compact_phi_block_transport=self._compact_phi_blocks_enabled(),
             require_vertex_factors=require_vertex_factors,
-            exp_fp64_mode=self.cfg.exp_fp64_mode,
             exp_fp64_norm_threshold=self.cfg.exp_fp64_norm_threshold,
             validity_max_norm=self.cfg.transport_chart_max_norm,
             exactness_out=self._transport_status,
@@ -1231,10 +1224,10 @@ class VFEModel(nn.Module):
                 capture=capture, grad_record=grad_rec,
                 transport_status=self._transport_status,
                 prebuilt_transport=shared_omega)
-        if estep_grad_out is not None:                           # one host sync, only when requested
+        if estep_grad_out is not None:                           # real tensor norms read only when requested
             for _gk in ("mu", "sigma", "phi"):
-                _gv = grad_rec.get(_gk) if grad_rec is not None else None
-                estep_grad_out[_gk] = float(_gv) if _gv is not None else 0.0
+                _gv = grad_rec.get(_gk, 0.0) if grad_rec is not None else 0.0
+                estep_grad_out[_gk] = float(_gv) if _gv is not None else float("nan")
         mu_final = out.mu                                        # (B, N, K); head mixer (if any) applied PER BLOCK
         sigma_final = out.sigma                                  # inside vfe_stack now, not post-stack
 
@@ -1684,10 +1677,11 @@ class VFEModel(nn.Module):
         from vfe3.inference.e_step import _transport, build_belief_transport
 
         cfg = self.cfg
+        registration = get_transport_registration(cfg.transport_mode)
         kwargs = {
             "transport_mode": cfg.transport_mode,
-            "mu": (belief.mu if cfg.transport_mode in _REGIME_NEEDS_MU else None),
-            "sigma": (belief.sigma if cfg.transport_mode in _REGIME_NEEDS_SIGMA else None),
+            "mu": (belief.mu if registration.needs_mu else None),
+            "sigma": (belief.sigma if registration.needs_sigma else None),
             "transport_state": self.transport_state,
             "clamp_monitor": cfg.transport_clamp_monitor,
             "validity_max_norm": cfg.transport_chart_max_norm,
@@ -1701,7 +1695,6 @@ class VFEModel(nn.Module):
                 compact_phi_block_transport=True,
                 transport_mean_per_head=True,
                 congruence_cond_escalation=cfg.congruence_cond_escalation,
-                exp_fp64_mode=cfg.exp_fp64_mode,
                 exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
                 **kwargs,
             )
@@ -2228,7 +2221,6 @@ class VFEModel(nn.Module):
         # Active-frame health, evaluated on the active vertex frame.
         active_vertex = build_factored_transport(
             out.phi, self.group,
-            exp_fp64_mode=cfg.exp_fp64_mode,
             exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
             clamp_monitor=cfg.transport_clamp_monitor,
             validity_max_norm=cfg.transport_chart_max_norm,
@@ -2771,7 +2763,6 @@ class VFEModel(nn.Module):
                 metrics.gauge_trace_spread(belief.phi, self.group)))
             active_vertex = build_factored_transport(
                 belief.phi, self.group,
-                exp_fp64_mode=cfg.exp_fp64_mode,
                 exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
                 clamp_monitor=cfg.transport_clamp_monitor,
                 validity_max_norm=cfg.transport_chart_max_norm,

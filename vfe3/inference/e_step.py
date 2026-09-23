@@ -24,6 +24,7 @@ from vfe3.contracts import CanonicalFrameContext, EStepGradientRecord
 from vfe3.gradients.qkv import qkv_conditional_cost
 from vfe3.gradients.relational import compute_relational_filtering_gradients, relational_predictive_readout
 from vfe3.families.base import get_family
+from vfe3.families.policy import coupling_energy as _coupling_energy, family_instance as _family_instance
 from vfe3.families.gaussian import FullGaussian
 from vfe3.free_energy import attention_weights, free_energy, reduced_free_energy, self_divergence_for_alpha
 from vfe3.geometry.groups import GaugeGroup
@@ -31,14 +32,11 @@ from vfe3.geometry.phi_preconditioner import _bch_chart_direction, precondition_
 from vfe3.geometry.retraction import retract_phi, retract_spd_affine
 from vfe3.numerics import apply_mu_trust_region
 from vfe3.geometry.transport import (
-    _TRANSPORT_NEEDS_MU,
-    _TRANSPORT_NEEDS_SIGMA,
     CompactFactoredTransport,
     FactoredTransport,
     RopeTransport,
     TransportState,
     build_factored_transport,
-    get_transport,
     get_transport_registration,
 )
 from vfe3.gradients.kernels import (
@@ -50,30 +48,6 @@ _E_STEP_UPDATE_ALIASES = {
     "gradient": "gradient",
     "mm_exact": "mm_exact",
 }
-
-
-def _coupling_energy(
-    family, *args,
-    log_prior:         Optional[torch.Tensor] = None,
-    precision_policy:  Optional[str]          = None,
-    score_backend:     str                    = "pairwise",
-    **kwargs,
-) -> torch.Tensor:
-    """Call the built-in full family with a model-owned policy; other families stay unchanged."""
-    if family is FullGaussian:
-        kwargs["score_backend"] = score_backend
-        if precision_policy is not None:
-            kwargs["precision_policy"] = precision_policy
-        if log_prior is not None:
-            kwargs["pair_support"] = ~torch.isneginf(log_prior)
-    return family.coupling_energy(*args, **kwargs)
-
-
-def _family_instance(family, mu: torch.Tensor, sigma: torch.Tensor, precision_policy: Optional[str]):
-    """Construct the built-in full family with an explicit model policy when supplied."""
-    if family is FullGaussian and precision_policy is not None:
-        return family(mu, sigma, _precision_policy=precision_policy)
-    return family(mu, sigma)
 
 
 def canonical_e_step_update(name: str) -> str:
@@ -97,7 +71,6 @@ def _transport(
     *,
     transport_mode:         str   = "flat",     # connection-regime registry key (default = flat)
     gauge_mode:             str   = "learned",  # 'learned' | 'trivial' (forwarded to the builder)
-    exp_fp64_mode:          str   = "dim",      # stable_matrix_exp_pair island keying ('dim' | 'norm')
 
     exp_fp64_norm_threshold: float = 5.0,        # 'norm': max clamped block ||M||_F upcast threshold
 
@@ -134,7 +107,6 @@ def _transport(
         built = build_factored_transport(
             phi, group,
             gauge_mode=gauge_mode,
-            exp_fp64_mode=exp_fp64_mode,
             exp_fp64_norm_threshold=exp_fp64_norm_threshold,
             clamp_monitor=clamp_monitor,
             validity_max_norm=validity_max_norm,
@@ -143,7 +115,8 @@ def _transport(
             right_phi=right_phi,
         )
         return built.to_dense_omega() if materialize else built
-    build = get_transport(transport_mode)
+    registration = get_transport_registration(transport_mode)
+    build = registration.callable
     if phi.dim() == 2:
         mu_b = mu.unsqueeze(0) if mu is not None else None
         mu_kb = mu_key.unsqueeze(0) if mu_key is not None else None
@@ -153,19 +126,19 @@ def _transport(
         omega = build(phi.unsqueeze(0), group, gauge_mode=gauge_mode, mu=mu_b, mu_key=mu_kb,
                       sigma=sig_b, sigma_key=sig_kb,
                       clamp_monitor=clamp_monitor,
-                      exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
+                      exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                       materialize=False,
                       validity_max_norm=validity_max_norm, exactness_out=exactness_out,
                       right_phi=right_b,
                       **transport_state)["Omega"]
         # The unbatched compatibility/diagnostic path builds a batch of one -> strip that leading
-        # batch axis back off the dense (1, N, N, K, K) Omega.
-        built = omega[0]
+        # batch axis back off unless the builder already returns (N, N, K, K).
+        built = omega if registration.batch_independent else omega[0]
     else:
         built = build(phi, group, gauge_mode=gauge_mode, mu=mu, mu_key=mu_key,
                       sigma=sigma, sigma_key=sigma_key,
                       clamp_monitor=clamp_monitor,
-                      exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
+                      exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                       materialize=False,
                       validity_max_norm=validity_max_norm, exactness_out=exactness_out,
                       right_phi=right_phi,
@@ -199,9 +172,6 @@ def build_belief_transport(
     clamp_monitor:               bool                                        = False,     # opt-in: warn when the exp Frobenius clamp fires (host sync)
     rope_on_cov:                 bool                                        = False,     # rotate the covariance too (full-gauge)
     rope_on_value:               bool                                        = True,      # False -> value aggregation uses the un-rotated base
-    # Tier-1 transport perf toggles (2026-07-05; default OFF = byte-identical: the dense einsum and
-    # the 'dim' island rule stay the default code paths).
-    exp_fp64_mode:               str                                         = "dim",    # stable_matrix_exp_pair island keying (flat builders; 'dim' | 'norm')
     rope_insertion:              str = "right",   # "right" (pure, folded frame) | "left" (legacy)
     exp_fp64_norm_threshold:     float                                       = 5.0,      # 'norm': upcast only when max clamped block ||M||_F >= this
     transport_mean_per_head:     bool                                        = False,    # factored transport_mean contracts per gauge block (fused path only)
@@ -229,8 +199,8 @@ def build_belief_transport(
     exact reassociation; the diagonal covariance factors per head). Single-block / cross-coupled
     groups and the trivial gauge fall back to ``_transport``'s DENSE Omega exactly as before, so
     those numerics are
-    unchanged; that fallback is REGISTRY-driven (belief tensors gated on ``_TRANSPORT_NEEDS_MU`` /
-    ``_TRANSPORT_NEEDS_SIGMA`` membership, never on literal mode names). The factored container flows
+    unchanged; that fallback is REGISTRY-driven (belief tensors gated on the registration's
+    ``needs_mu`` / ``needs_sigma`` flags, never on literal mode names). The factored container flows
     OPAQUELY through ``belief_gradients`` (kernel + oracle), which only ever forward it to
     ``transport_mean`` / ``transport_covariance``; the oracle's full-cov / smoothing routes rebuild
     the dense Omega from the factors on demand (byte-identical).
@@ -242,16 +212,13 @@ def build_belief_transport(
     Tier-1 perf toggles (default OFF, byte-identical): ``transport_mean_per_head`` marks the
     factored container so ``transport_mean`` contracts per gauge block (fp32 reassociation only;
     inert on the dense fallback, whose mean has no factored form -- the RoPE wrapper recurses into
-    the container, so the fused RoPE path is covered). ``exp_fp64_mode`` /
-    ``exp_fp64_norm_threshold`` re-key ``stable_matrix_exp_pair``'s float64 island from the
-    dimension rule to the max clamped block norm; forwarded to the flat builders on both the fused
-    and dense routes.
+    the container, so the fused RoPE path is covered). ``exp_fp64_norm_threshold`` controls
+    the maximum clamped block norm at which the flat builders compute in float64 on both routes.
     """
     if transport_mode == "flat" and (
         require_vertex_factors or right_phi is not None or _can_fuse_flat(transport_mode, group)
     ):
         built = build_factored_transport(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor,
-                                         exp_fp64_mode=exp_fp64_mode,
                                          exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                                          mean_per_head=transport_mean_per_head,
                                          cond_escalation=congruence_cond_escalation,
@@ -261,16 +228,17 @@ def build_belief_transport(
                                          compact_blocks=compact_phi_block_transport)
     else:
         # Registry-driven routing (audit 2026-07-01 round-3, punch 12b): forward ALL state kwargs
-        # once, gating the belief tensors on the registry's needs-sets (the add-by-registering
+        # once, gating the belief tensors on the registration's flags (the add-by-registering
         # contract) instead of matching literal mode names; builders tolerate unused kwargs.
+        registration = get_transport_registration(transport_mode)
         built = _transport(phi, group, transport_mode=transport_mode, gauge_mode=gauge_mode,
-                           mu=(mu if transport_mode in _TRANSPORT_NEEDS_MU else None),
-                           mu_key=(mu_key if transport_mode in _TRANSPORT_NEEDS_MU else None),
-                           sigma=(sigma if transport_mode in _TRANSPORT_NEEDS_SIGMA else None),
-                           sigma_key=(sigma_key if transport_mode in _TRANSPORT_NEEDS_SIGMA else None),
+                           mu=(mu if registration.needs_mu else None),
+                           mu_key=(mu_key if registration.needs_mu else None),
+                           sigma=(sigma if registration.needs_sigma else None),
+                           sigma_key=(sigma_key if registration.needs_sigma else None),
                            transport_state=transport_state,
                            clamp_monitor=clamp_monitor,
-                           exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
+                           exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                            materialize=False,
                            validity_max_norm=validity_max_norm, right_phi=right_phi,
                            exactness_out=exactness_out)
@@ -372,7 +340,6 @@ def free_energy_value(
     divergence_family:         str  = "renyi",
     lambda_alpha_mode:         str  = "constant",
     gradient_mode:             str  = "filtering",     # accepted-and-ignored iteration-only knob
-    exp_fp64_mode:             str  = "dim",           # HONORED: forwarded to the global-F _transport float64-island keying
     rope_insertion:              str = "right",   # "right" (pure, folded frame) | "left" (legacy)
     phi_precond_mode:          str  = "none",          # accepted-and-ignored iteration-only knob
     phi_retract_mode:          str  = "euclidean",     # accepted-and-ignored iteration-only knob
@@ -405,10 +372,10 @@ def free_energy_value(
     model path, so under gauge-RoPE the logged F is the F being descended, not the un-rotated one.
     ``transport_mean_per_head`` is forwarded to the phi-path factored builders. Compact builds retain
     the configured metadata; the legacy noncompact diagnostic seam still materializes its dense
-    operator. The exp-island toggles (``exp_fp64_mode`` / ``exp_fp64_norm_threshold``) are HONORED for
-    the global (``keys=None``) F: they are forwarded to the ``_transport`` build so the fp64 island keys
+    operator. The exp-island threshold (``exp_fp64_norm_threshold``) is HONORED for
+    the global (``keys=None``) F: it is forwarded to the ``_transport`` build so the fp64 island keys
     identically to the model E-step (audit PB-12; the two-hop scorer reuses this evaluator,
-    so its numerics match the active objective, not a default dim-keyed diagnostic).
+    so its numerics match the active objective, with the same norm threshold).
     """
     # keys=None -> global F (query = key = belief). keys given -> filtered F: the transport
     # Omega_ij uses the CURRENT query frame phi_i (belief) and the FROZEN key frame phi_j (keys),
@@ -417,16 +384,16 @@ def free_energy_value(
     if keys is None:
         # Build Omega under the ACTIVE connection regime so the logged global F matches the objective
         # the beliefs actually descend.
+        registration = get_transport_registration(transport_mode)
         transport_kwargs = {
             "transport_mode": transport_mode,
             "right_phi": belief.right_phi,
-            "mu": (belief.mu if transport_mode in _TRANSPORT_NEEDS_MU else None),
-            "sigma": (belief.sigma if transport_mode in _TRANSPORT_NEEDS_SIGMA else None),
+            "mu": (belief.mu if registration.needs_mu else None),
+            "sigma": (belief.sigma if registration.needs_sigma else None),
             "transport_state": transport_state,
             "clamp_monitor": clamp_monitor,
             "transport_mean_per_head": transport_mean_per_head,
             "congruence_cond_escalation": congruence_cond_escalation,
-            "exp_fp64_mode": exp_fp64_mode,
             "exp_fp64_norm_threshold": exp_fp64_norm_threshold,
             "validity_max_norm": transport_chart_max_norm,
             "exactness_out": transport_status,
@@ -483,8 +450,8 @@ def free_energy_value(
         k_mu, k_sigma = key_belief.mu.unsqueeze(0), key_belief.sigma.unsqueeze(0)
         batched = True
     sd = self_divergence_for_alpha(
-                                   _family_instance(fam, belief.mu, belief.sigma, full_cov_kl_precision),
-                                   _family_instance(fam, mu_p, sigma_p, full_cov_kl_precision), alpha=renyi_order, kl_max=kl_max,
+                                   _family_instance(belief.mu, belief.sigma, fam, full_cov_kl_precision),
+                                   _family_instance(mu_p, sigma_p, fam, full_cov_kl_precision), alpha=renyi_order, kl_max=kl_max,
                                    eps=eps, divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode)
     alpha, reg = self_coupling_alpha(sd, value=value, mode=lambda_alpha_mode, b0=b0, c0=c0)
     energy = _coupling_energy(fam, q_mu, q_sigma, k_mu, k_sigma, effective,
@@ -537,7 +504,6 @@ def phi_alignment_loss(
     include_attention_entropy: bool  = True,
     transport_mode:            str   = "flat",        # connection-regime registry key (default flat)
     clamp_monitor:             bool  = False,         # opt-in: warn when the exp Frobenius clamp fires
-    exp_fp64_mode:                 str   = "dim",  # flat phi-factor float64-island keying
     rope_insertion:              str = "right",   # "right" (pure, folded frame) | "left" (legacy)
     exp_fp64_norm_threshold:       float = 5.0,
     transport_mean_per_head:       bool  = False,
@@ -584,8 +550,6 @@ def phi_alignment_loss(
                                    right_phi=right_phi,
                                    transport_state=transport_state,
                                    clamp_monitor=clamp_monitor,
-
-                                   exp_fp64_mode=exp_fp64_mode,
                                    exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                                    transport_mean_per_head=transport_mean_per_head,
                                    congruence_cond_escalation=congruence_cond_escalation,
@@ -673,7 +637,6 @@ def e_step_iteration(
     rope_insertion:              str = "right",   # "right" (pure, folded frame) | "left" (legacy)
     oracle_unroll_grad:        bool = False,                  # opt-in: oracle returns a differentiable grad (unroll)
     clamp_monitor:             bool = False,                   # opt-in: warn when the exp Frobenius clamp fires (host sync)
-    exp_fp64_mode:                 str   = "dim",  # Tier-1: flat-builder float64-island keying ('dim' | 'norm')
     exp_fp64_norm_threshold:       float = 5.0,    # Tier-1 'norm': max clamped block ||M||_F upcast threshold
     transport_mean_per_head:       bool  = False,  # Tier-1: factored transport_mean contracts per gauge block
     congruence_cond_escalation:    bool = False,   # opt-in conditioning trigger for the fp64 congruence escalation
@@ -756,7 +719,7 @@ def e_step_iteration(
                 mu=belief.mu, transport_state=transport_state,
                 clamp_monitor=clamp_monitor,
 
-                exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
+                exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                 transport_mean_per_head=transport_mean_per_head,
                 congruence_cond_escalation=congruence_cond_escalation,
                 compact_phi_block_transport=compact_phi_block_transport,
@@ -876,7 +839,7 @@ def e_step_iteration(
         if grad_record is not None:
             # No comparison-belief gradient is taken in the predictive branch.
             for role in ("mu", "sigma", "phi"):
-                grad_record[role] = mu.new_full((), float("nan"))
+                grad_record[role] = None
     else:
         if relational_operators is not None:
             if relational_frame is None:
@@ -974,8 +937,12 @@ def e_step_iteration(
                 family=family,
             )
         mu = belief.mu - delta_mu
-        if skip_belief_sigma_update:
+        if skip_belief_sigma_update or nat_sigma is None:
             # skip_belief_sigma_update: sigma passes through UNCHANGED (no retraction, no clamp).
+            # nat_sigma is None whenever the gradient route produced no sigma arm -- relational
+            # filtering always does (its return type is Tuple[Tensor, None]), and belief_gradients
+            # does when need_sigma_grad=False. Retracting with a None step is a TypeError and there
+            # is no step to take, so freeze either way.
             sigma = belief.sigma
         else:
             # The affine SPD retraction owns the diagonal-vs-full rank decision internally
@@ -1024,7 +991,6 @@ def e_step_iteration(
                 # terms into transport-state gradients.
                 transport_state={key: value.detach() for key, value in transport_state.items()},
                 clamp_monitor=clamp_monitor,
-                exp_fp64_mode=exp_fp64_mode,
                 exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                 transport_mean_per_head=transport_mean_per_head,
                 congruence_cond_escalation=congruence_cond_escalation,
@@ -1066,8 +1032,6 @@ def e_step_iteration(
 
 
                     clamp_monitor=clamp_monitor,
-
-                    exp_fp64_mode=exp_fp64_mode,
                     exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                     transport_mean_per_head=transport_mean_per_head,
                     congruence_cond_escalation=congruence_cond_escalation,
@@ -1105,7 +1069,6 @@ def e_step(
     rope_insertion:              str = "right",   # "right" (pure, folded frame) | "left" (legacy)
     # Tier-1 transport perf toggles (2026-07-05; explicit, off the F_diag bag -- that diagnostic
     # deliberately keeps the default transport numerics). All default OFF/byte-identical.
-    exp_fp64_mode:             str = "dim",       # flat-builder float64-island keying ('dim' | 'norm')
 
     return_trajectory:           bool = False,
     oracle_unroll_grad:          bool = False,    # explicit (not in kwargs): keep it off the F_diag bag
@@ -1175,7 +1138,7 @@ def e_step(
                 right_phi=belief.right_phi,
                 gauge_mode="learned",   # not an e_step kwarg (no **kwargs sink downstream); literal, not a dead kwargs read (m14)
                 clamp_monitor=kwargs.get("clamp_monitor", False),
-                exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
+                exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                 transport_mean_per_head=transport_mean_per_head,
                 congruence_cond_escalation=congruence_cond_escalation,
                 compact_phi_block_transport=compact_phi_block_transport,
@@ -1250,7 +1213,7 @@ def e_step(
             belief, mu_p, sigma_p, group, tau=tau,
             e_q_mu_lr=e_q_mu_lr, e_q_sigma_lr=e_q_sigma_lr, e_phi_lr=e_phi_lr,
             e_step_gradient=e_step_gradient, oracle_unroll_grad=oracle_unroll_grad,
-            exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
+            exp_fp64_norm_threshold=exp_fp64_norm_threshold,
             transport_mean_per_head=transport_mean_per_head,
             congruence_cond_escalation=congruence_cond_escalation,
             compact_phi_block_transport=compact_phi_block_transport,

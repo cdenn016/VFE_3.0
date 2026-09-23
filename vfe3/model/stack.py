@@ -2,7 +2,8 @@ r"""The VFE block stack for VFE_3.0: L blocks with the belief handoff mu_q -> mu
 
 After each block the updated belief becomes (a blend toward) the next block's prior:
 mu_p_next = (1 - rho) mu_p + rho mu_q (rho = prior_handoff_rho); sigma_p frozen at the
-embedding by default; phi flows through the belief, not the prior.
+embedding by default; phi flows through the belief, not the prior. Uncaptured
+all-predictive stacks omit this arithmetic when no prior consumer is enabled.
 
 Placement note (audit 2026-06-09 overnight F23): the opt-in head_mixer / cg_coupling run
 inside each block after its E-step and before its norm; the opt-in block MLP runs after
@@ -30,6 +31,28 @@ from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.transport import TransportState
 from vfe3.free_energy import attention_tau
 from vfe3.model.block import _as_coeff, vfe_block
+
+
+def _can_omit_prior_handoff(
+    cfg:                           VFE3Config,
+    capture:                       Optional[MStepCapture],
+    grad_record:                   Optional[EStepGradientRecord],
+    relational_capture:            Optional[dict],
+    relational_operators:          Optional["RelationalOperators"],
+    relational_operators_by_layer: Optional[Sequence["RelationalOperators"]],
+) -> bool:
+    """Admit only unobserved predictive stacks with no prior-dependent consumer."""
+    from vfe3.model.relational_operators import RelationalOperators
+
+    if (capture is not None or grad_record is not None or relational_capture is not None
+            or cfg.mstep_self_coupling_weight != 0.0 or cfg.cg_energy_weight != 0.0
+            or cfg.e_step_update != "gradient" or cfg.e_phi_lr != 0.0):
+        return False
+    layers = (relational_operators_by_layer if relational_operators_by_layer is not None
+              else (relational_operators,) * cfg.n_layers)
+    return len(layers) == cfg.n_layers and all(
+        type(operator) is RelationalOperators and operator.readout_mode == "predictive_content"
+        for operator in layers)
 
 
 def vfe_stack(
@@ -77,6 +100,9 @@ def vfe_stack(
     path); ``rope_on_cov`` enables the full-gauge covariance sandwich rotation."""
     rho = cfg.prior_handoff_rho
     rho_s = cfg.prior_handoff_sigma
+    need_prior_handoff = not _can_omit_prior_handoff(
+        cfg, capture, grad_record, relational_capture,
+        relational_operators, relational_operators_by_layer)
     # The model runs the detach estimator under torch.no_grad(), but the outer M-step still learns
     # the prior. Track the same handoff values in a narrow grad-enabled recurrence: the real stack
     # input stays connected, while every E-step output is fixed state for the M-step contract.
@@ -141,7 +167,7 @@ def vfe_stack(
             diagnostic_capture["layer_outputs"].append(belief)
             diagnostic_capture["layer_block_mlp_inputs"].append(capture["block_mlp_input"])
             diagnostic_capture["layer_block_mlp_outputs"].append(capture["block_mlp_output"])
-        if layer_index < cfg.n_layers - 1:
+        if need_prior_handoff and layer_index < cfg.n_layers - 1:
             mu_p = (1.0 - rho) * mu_p + rho * belief.mu
             sigma_p = (1.0 - rho_s) * sigma_p + rho_s * belief.sigma
         if detach_capture and layer_index < cfg.n_layers - 1:

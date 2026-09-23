@@ -12,6 +12,10 @@ import torch
 from torch.utils.checkpoint import checkpoint
 
 
+# Budget for one projected map L; its covariance product can require a second.
+_PROJECTION_TILE_BYTES = 32 * 1024 ** 2
+
+
 def _compute_dtype(*tensors: torch.Tensor) -> torch.dtype:
     return torch.float64 if any(tensor.dtype == torch.float64 for tensor in tensors) else torch.float32
 
@@ -41,6 +45,8 @@ def projected_moments(
     Diagonal input covariance is contracted directly into a full reduced
     covariance. The mathematically symmetric result is averaged with its
     transpose to remove multiplication roundoff without adding jitter.
+    Large projected maps use checkpointed token tiles to bound saved map
+    intermediates; the output moments and source-factor recovery stay unchanged.
     Returns (..., N, H, r) and (..., N, H, r, r).
     """
     if mu_h.ndim < 3 or S.ndim != 3 or S.shape[::2] != mu_h.shape[-2:]:
@@ -56,6 +62,41 @@ def projected_moments(
     full = Sigma_h.shape == (*mu_h.shape, d)
     if not diagonal and not full:
         raise ValueError("covariance must match the mean as diagonal entries or full head matrices")
+    dtype = _compute_dtype(mu_h, Sigma_h, inverse_blocks, S)
+    tokens = mu_h.shape[-3]
+    batch = torch.broadcast_shapes(mu_h.shape[:-3], inverse_blocks.shape[:-4])
+    bytes_per_token = math.prod(batch) * H * S.shape[-2] * d * (torch.finfo(dtype).bits // 8)
+    # Small projections keep the single contraction. Large projections checkpoint
+    # token tiles: tiling alone would retain every L and weighted L for backward.
+    if tokens * bytes_per_token > _PROJECTION_TILE_BYTES:
+        step = max(1, min(tokens, 32, _PROJECTION_TILE_BYTES // bytes_per_token))
+        means, covariances = [], []
+        for start in range(0, tokens, step):
+            inverse = (inverse_blocks[..., start:start+step, :, :, :]
+                       if inverse_blocks.ndim >= 4 and inverse_blocks.shape[-4] == tokens
+                       else inverse_blocks)
+            sigma = (Sigma_h[..., start:start+step, :, :] if diagonal
+                     else Sigma_h[..., start:start+step, :, :, :])
+            args = (mu_h[..., start:start+step, :, :], sigma, inverse, S)
+            if torch.is_grad_enabled() and any(x.requires_grad for x in args):
+                a, G = checkpoint(_projected_moments_tile, *args,
+                                  use_reentrant=False, preserve_rng_state=False)
+            else:
+                a, G = _projected_moments_tile(*args)
+            means.append(a)
+            covariances.append(G)
+        return torch.cat(means, dim=-3), torch.cat(covariances, dim=-4)
+    return _projected_moments_tile(mu_h, Sigma_h, inverse_blocks, S)
+
+
+def _projected_moments_tile(
+    mu_h:           torch.Tensor,
+    Sigma_h:        torch.Tensor,
+    inverse_blocks: torch.Tensor,
+    S:              torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Compute a=L mu and G=L Sigma L^T for one token tile."""
+    diagonal = Sigma_h.shape == mu_h.shape
     dtype = _compute_dtype(mu_h, Sigma_h, inverse_blocks, S)
     with torch.autocast(device_type=mu_h.device.type, enabled=False):
         mu = mu_h.to(dtype)

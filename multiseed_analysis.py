@@ -28,11 +28,12 @@ import json
 import math
 import os
 import re
-import subprocess
-import sys
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
+
+
+from vfe3.process_utils import run_isolated_python
 
 
 _CHILD_TIMEOUT_SECONDS = 3600      # bound the isolated worker; see run_process_tree
@@ -40,44 +41,8 @@ _CHILD_SENTINEL = "_VFE3_MULTISEED_ANALYSIS_CHILD"
 
 
 def _run_isolated_child() -> int:
-    r"""Run this click-to-run driver in a disposable interpreter and return its status."""
-    script = Path(__file__).resolve()
-    environment = os.environ.copy()
-    environment[_CHILD_SENTINEL] = "1"
-    environment["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-    environment["PYTHONUNBUFFERED"] = "1"
-    try:
-        # Bounded wait (audit 2026-07-27): the raw call had NO timeout, so a child wedged inside
-        # matplotlib/numba/UMAP blocked the parent forever on the capture pipe. subprocess.run's
-        # timeout kills the direct child on expiry. The Job-Object containment that would also reap
-        # grandchildren lives in vfe3.process_utils.run_process_tree, which this driver deliberately
-        # does NOT use: the parent here is kept stdlib-only so OpenMP stays scoped to the child
-        # (pinned by tests/test_analysis_driver_isolation_20260717.py), and importing vfe3 in the
-        # parent breaks that invariant. Timeout without containment is the fix available here.
-        completed = subprocess.run(
-            [sys.executable, str(script)],
-            cwd=str(script.parent),
-            env=environment,
-            check=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=_CHILD_TIMEOUT_SECONDS,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-    except subprocess.TimeoutExpired:
-        print(f"isolated worker exceeded {_CHILD_TIMEOUT_SECONDS}s and was terminated with its "
-              f"process tree", file=sys.stderr)
-        return 1
-    except (OSError, subprocess.SubprocessError) as exc:
-        print(f"isolated multi-seed analysis worker could not start: {exc}", file=sys.stderr)
-        return 1
-    if completed.stdout:
-        print(completed.stdout, end="")
-    if completed.stderr:
-        print(completed.stderr, end="", file=sys.stderr)
-    return int(completed.returncode)
+    """Run this driver without loading scientific libraries in the parent."""
+    return run_isolated_python(__file__, _CHILD_SENTINEL, _CHILD_TIMEOUT_SECONDS, "multi-seed analysis")
 
 
 if __name__ == "__main__" and os.environ.get(_CHILD_SENTINEL) != "1":

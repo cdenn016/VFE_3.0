@@ -23,8 +23,7 @@ def _model() -> VFEModel:
         n_layers=1, n_e_steps=1, family="gaussian_diagonal", gauge_group="block_glk",
         skip_belief_sigma_update=True, e_phi_lr=0.0, oracle_unroll_grad=True,
         pos_phi="learned", use_head_mixer=True, use_block_mlp=True, block_mlp_expansion=1,
-        relational_mode="projected_filtering",
-        relational_input_scope="full", relational_readout_mode="predictive_content",
+        relational_input_scope="full", attention_mode="projected_predictive",
         relational_output_scope="full",
     )).eval()
 

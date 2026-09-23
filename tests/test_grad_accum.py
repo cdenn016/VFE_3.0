@@ -275,7 +275,6 @@ class _ScriptedScoredTokenModel(torch.nn.Module):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.tensor(1.0))
         self.cfg = SimpleNamespace(
-            grad_clip_per_role=False,
             m_phi_update_mode="adamw",
             phi_mstep_max_matrix_norm=None,
         )

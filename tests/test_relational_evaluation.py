@@ -17,7 +17,7 @@ def test_relational_strided_evaluation_matches_logits(identity_content: bool) ->
     cfg = VFE3Config(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=4,
         n_layers=1, n_e_steps=1, gauge_group="block_glk", family="gaussian_diagonal",
         skip_belief_sigma_update=True, e_phi_lr=0.0, oracle_unroll_grad=True,
-        relational_mode="projected_filtering",
+        attention_mode="projected_conditional",
         relational_identity_content=identity_content)
     model = VFEModel(cfg)
     stream = torch.tensor([0, 1, 2, 3, 4, 1, 3, 2, 0, 4])

@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 from dataclasses import dataclass
 import os
+from pathlib import Path
 import signal
 import subprocess
 import sys
@@ -502,3 +503,43 @@ def run_process_tree(
     finally:
         if job is not None:
             job.close()
+
+
+def run_isolated_python(
+    script_path: str,
+    sentinel:    str,
+    timeout:     float,
+    label:       str,
+) -> int:
+    """Run an analysis script with isolated native runtimes and bounded child lifetime."""
+    script = Path(script_path).resolve()
+    environment = os.environ.copy()
+    environment[sentinel] = "1"
+    environment["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+    environment["PYTHONUNBUFFERED"] = "1"
+    try:
+        completed = run_process_tree(
+            [sys.executable, str(script)],
+            cwd=str(script.parent),
+            env=environment,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            f"isolated worker exceeded {timeout:g}s and was terminated with its process tree",
+            file=sys.stderr,
+        )
+        return 1
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"isolated {label} worker could not start: {exc}", file=sys.stderr)
+        return 1
+    if completed.stdout:
+        print(completed.stdout, end="")
+    if completed.stderr:
+        print(completed.stderr, end="", file=sys.stderr)
+    return int(completed.returncode)

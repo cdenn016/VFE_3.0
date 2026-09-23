@@ -133,8 +133,8 @@ def test_per_block_exp_is_bit_equivalent_to_full_exp():
     assert float((blk - full).abs().max()) < 1e-12
 
     # and the public pair (as called by compute_transport_operators) matches the full path
-    ep_blk, en_blk = stable_matrix_exp_pair(pm, skew_symmetric=False, block_dims=grp.irrep_dims)
-    ep_full, en_full = stable_matrix_exp_pair(pm, skew_symmetric=False, block_dims=None)
+    ep_blk, en_blk = stable_matrix_exp_pair(pm, block_dims=grp.irrep_dims)
+    ep_full, en_full = stable_matrix_exp_pair(pm, block_dims=None)
     assert float((ep_blk - ep_full).abs().max()) < 1e-6
     assert float((en_blk - en_full).abs().max()) < 1e-6
 
@@ -162,25 +162,19 @@ def test_estep_fuses_tied_block_glk_to_factored_container():
     assert isinstance(out, FactoredTransport)
 
 
-# --- vram audit 2026-06-10: flat exp float64-island keyed on the block dim, blocked BCH,
-# --- and the beta_coord-free kernel pair contraction -------------------------------------
-def test_flat_builders_key_float64_island_on_block_dim(monkeypatch):
-    # Both flat transport builders must pass exp_dim=max(block_dims) so the float64-island
-    # decision keys on the dimension actually exponentiated (the per-head block), mirroring
-    # the regime_ii edge exp -- not on full K, which upcast every (B, N, K, K) phi_matrix to
-    # float64 whenever K >= 20.
+def test_flat_builders_forward_norm_threshold_and_block_layout(monkeypatch):
+    # Both flat builders preserve the caller's norm threshold and gauge block layout.
     import vfe3.geometry.transport as T
-    from vfe3.geometry.transport import build_factored_transport
     calls = []
     orig = T.stable_matrix_exp_pair
     def spy(matrix, **kw):
-        calls.append(kw.get("exp_dim"))
+        calls.append((kw.get("exp_fp64_norm_threshold"), kw.get("block_dims")))
         return orig(matrix, **kw)
     monkeypatch.setattr(T, "stable_matrix_exp_pair", spy)
-    grp, phi, _, _ = _transport_inputs()                   # block_glk K=8, irrep_dims [4,4]
-    build_factored_transport(phi, grp)
-    compute_transport_operators(phi, grp)
-    assert calls == [4, 4]
+    grp, phi, _, _ = _transport_inputs()
+    T.build_factored_transport(phi, grp, exp_fp64_norm_threshold=3.0)
+    compute_transport_operators(phi, grp, exp_fp64_norm_threshold=3.0)
+    assert calls == [(3.0, [4, 4]), (3.0, [4, 4])]
 
 
 def test_compose_bch_blocked_matches_dense():

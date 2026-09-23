@@ -22,17 +22,17 @@ collapses seeds keyed on the persisted ``best_val_ppl`` (never a test metric) in
 """
 
 import csv
-import hashlib
 import json
 import logging
 import math
 import os
-import subprocess
-import sys
 import warnings
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+
+
+from vfe3.process_utils import run_isolated_python
 
 
 _CHILD_TIMEOUT_SECONDS = 3600      # bound the isolated worker; see run_process_tree
@@ -40,44 +40,8 @@ _CHILD_SENTINEL = "_VFE3_SCALING_ANALYSIS_CHILD"
 
 
 def _run_isolated_child() -> int:
-    r"""Run this click-to-run driver in a disposable interpreter and return its status."""
-    script = Path(__file__).resolve()
-    environment = os.environ.copy()
-    environment[_CHILD_SENTINEL] = "1"
-    environment["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-    environment["PYTHONUNBUFFERED"] = "1"
-    try:
-        # Bounded wait (audit 2026-07-27): the raw call had NO timeout, so a child wedged inside
-        # matplotlib/numba/UMAP blocked the parent forever on the capture pipe. subprocess.run's
-        # timeout kills the direct child on expiry. The Job-Object containment that would also reap
-        # grandchildren lives in vfe3.process_utils.run_process_tree, which this driver deliberately
-        # does NOT use: the parent here is kept stdlib-only so OpenMP stays scoped to the child
-        # (pinned by tests/test_analysis_driver_isolation_20260717.py), and importing vfe3 in the
-        # parent breaks that invariant. Timeout without containment is the fix available here.
-        completed = subprocess.run(
-            [sys.executable, str(script)],
-            cwd=str(script.parent),
-            env=environment,
-            check=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=_CHILD_TIMEOUT_SECONDS,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-    except subprocess.TimeoutExpired:
-        print(f"isolated worker exceeded {_CHILD_TIMEOUT_SECONDS}s and was terminated with its "
-              f"process tree", file=sys.stderr)
-        return 1
-    except (OSError, subprocess.SubprocessError) as exc:
-        print(f"isolated scaling-analysis worker could not start: {exc}", file=sys.stderr)
-        return 1
-    if completed.stdout:
-        print(completed.stdout, end="")
-    if completed.stderr:
-        print(completed.stderr, end="", file=sys.stderr)
-    return int(completed.returncode)
+    """Run this driver without loading scientific libraries in the parent."""
+    return run_isolated_python(__file__, _CHILD_SENTINEL, _CHILD_TIMEOUT_SECONDS, "scaling-analysis")
 
 
 if __name__ == "__main__" and os.environ.get(_CHILD_SENTINEL) != "1":
@@ -88,6 +52,7 @@ if os.environ.get(_CHILD_SENTINEL) == "1":
 
 import numpy as np
 
+from vfe3.artifact_utils import canonical_json_sha256 as _canonical_json_sha256
 from vfe3.config import config_from_serialized
 from vfe3.metric_contracts import perplexity_matches_ce, target_blind_objective_interpretation  # noqa: E402
 from vfe3.path_utils import portable_path_component_key
@@ -166,18 +131,6 @@ def _read_json(path: Path) -> Dict[str, Any]:
 def _is_exact_nonnegative_seed(value: Any) -> bool:
     """Whether ``value`` is a plain Python ``int`` seed in the supported domain."""
     return type(value) is int and value >= 0
-
-
-def _canonical_json_sha256(value: object) -> str:
-    """SHA-256 of one finite JSON value under the scaling writer's canonical encoding."""
-    encoded = json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _is_sha256(value: object) -> bool:

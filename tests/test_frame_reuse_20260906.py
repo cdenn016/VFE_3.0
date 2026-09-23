@@ -79,8 +79,8 @@ def test_norm_fallback_retains_reduction(kind: str, device: torch.device,
 
 
 @pytest.mark.parametrize('dtype', [torch.float32, torch.float64])
-@pytest.mark.parametrize('mode,threshold', [('dim', 20.0), ('norm', 20.0), ('norm', 0.0)])
-def test_unique_factors_values_gradients_hvp(dtype: torch.dtype, mode: str, threshold: float,
+@pytest.mark.parametrize('threshold', [20.0, 0.0])
+def test_unique_factors_values_gradients_hvp(dtype: torch.dtype, threshold: float,
                                            device: torch.device) -> None:
     torch.manual_seed(20)
     ids = torch.tensor([[2, 0, 2, 1], [0, 2, 2, 0]], device=device)
@@ -93,7 +93,7 @@ def test_unique_factors_values_gradients_hvp(dtype: torch.dtype, mode: str, thre
     for reuse in (False, True):
         factors = transport.build_factored_transport(
             table[ids].flatten(-3), group, compact_blocks=True, right_phi=position,
-            exp_fp64_mode=mode, exp_fp64_norm_threshold=threshold,
+            exp_fp64_norm_threshold=threshold,
             _content_token_ids=ids if reuse else None, validity_max_norm=18.0, clamp_monitor=True)
         loss = (factors.exp_blocks * weights[0]).sum() + (factors.inv_blocks * weights[1]).sum()
         grads = torch.autograd.grad(loss, (table, position), create_graph=True)
@@ -121,7 +121,7 @@ def test_unique_exp_work_and_occurrence_clamp_fraction(device: torch.device,
     assert any('75.0%' in str(w.message) for w in recorded)
 
 
-@pytest.mark.parametrize('kind', ['nonfinite', 'bound', 'mode'])
+@pytest.mark.parametrize('kind', ['nonfinite', 'bound'])
 def test_unique_errors_precede_deduplication(kind: str, device: torch.device,
                                            monkeypatch: pytest.MonkeyPatch) -> None:
     blocks = torch.zeros(1, 4, 2, 2, 2, device=device)
@@ -133,7 +133,7 @@ def test_unique_errors_precede_deduplication(kind: str, device: torch.device,
     with pytest.raises(ValueError):
         transport._stable_compact_glk_exp_pair(
             blocks, _content_token_ids=torch.zeros(1, 4, dtype=torch.long, device=device),
-            validity_max_norm=18.0, exp_fp64_mode='invalid' if kind == 'mode' else 'norm')
+            validity_max_norm=18.0)
 
 
 def test_unique_table_directional_finite_difference(device: torch.device) -> None:
@@ -143,8 +143,7 @@ def test_unique_table_directional_finite_difference(device: torch.device) -> Non
     direction = torch.randn_like(table)
     weights = torch.randn(1, 4, 2, 2, 2, dtype=table.dtype, device=device)
     def objective(x: torch.Tensor) -> torch.Tensor:
-        factors = transport._stable_compact_glk_exp_pair(x[ids], exp_fp64_mode='norm',
-            exp_fp64_norm_threshold=0.0, _content_token_ids=ids)
+        factors = transport._stable_compact_glk_exp_pair(x[ids], exp_fp64_norm_threshold=0.0, _content_token_ids=ids)
         return (factors[0] * weights).sum()
     gradient, = torch.autograd.grad(objective(table), table)
     delta = 1e-5

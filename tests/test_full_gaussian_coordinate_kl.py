@@ -51,7 +51,7 @@ def test_full_coordinate_non_kl_renyi_fails_explicitly() -> None:
     with pytest.raises(ValueError, match="KL"):
         q.renyi_per_coord(q, alpha=.5)
     with pytest.raises(ValueError, match="KL"):
-        _cfg(family="gaussian_full", relational_mode="off", renyi_order=.5,
+        _cfg(family="gaussian_full", attention_mode="transported", renyi_order=.5,
              lambda_alpha_mode="state_dependent_per_coord")
 
 

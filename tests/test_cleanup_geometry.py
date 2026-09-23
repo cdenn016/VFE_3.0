@@ -1,0 +1,134 @@
+"""Focused regressions for the VFE 3.0 transport cleanup."""
+import pytest
+import torch
+
+from vfe3.geometry import transport
+from vfe3.geometry.groups import get_group
+from vfe3.inference.e_step import _transport, build_belief_transport
+
+
+def test_batch_independent_transport_preserves_both_token_axes(monkeypatch: pytest.MonkeyPatch) -> None:
+    name = "cleanup_batch_independent"
+    monkeypatch.setattr(transport, "_TRANSPORTS", dict(transport._TRANSPORTS))
+    group = get_group("glk")(2)
+    expected = torch.eye(2).expand(3, 3, 2, 2).clone()
+    @transport.register_transport(name, covariance_class="test", batch_independent=True)
+    def build(phi: torch.Tensor, group: object, **kwargs: object) -> dict:
+        return {"Omega": expected}
+    actual = _transport(torch.zeros(3, 4), group, transport_mode=name)
+    assert actual.shape == (3, 3, 2, 2)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_right_phi_cannot_be_a_registered_state_key() -> None:
+    with pytest.raises(ValueError, match="reserved.*right_phi"):
+        transport.register_transport(
+            "cleanup_right_phi", covariance_class="test", serialization_keys=("right_phi",),
+            state_builder=lambda cfg, group: {})
+
+
+def test_overridden_transport_routes_current_registration_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    name = "cleanup_override"
+    monkeypatch.setattr(transport, "_TRANSPORTS", dict(transport._TRANSPORTS))
+    group = get_group("glk")(2)
+    phi = torch.zeros(1, 3, 4)
+    mu = torch.randn(1, 3, 2)
+    sigma = torch.ones_like(mu)
+    seen = []
+    def build(phi: torch.Tensor, group: object, **kwargs: object) -> dict:
+        seen.append((kwargs.get("mu"), kwargs.get("sigma")))
+        return {"Omega": torch.eye(2).expand(1, 3, 3, 2, 2)}
+    transport.register_transport(name, covariance_class="test", needs_mu=True)(build)
+    build_belief_transport(phi, group, transport_mode=name, mu=mu, sigma=sigma)
+    transport.register_transport(name, covariance_class="test", needs_sigma=True, override=True)(build)
+    build_belief_transport(phi, group, transport_mode=name, mu=mu, sigma=sigma)
+    assert seen[0][0] is mu and seen[0][1] is None
+    assert seen[1][0] is None and seen[1][1] is sigma
+
+
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("threshold,expected_dtype", [(5.0, torch.float32), (0.0, torch.float64)])
+def test_norm_precision_preserves_float64_storage_and_explicit_oracle(
+    monkeypatch: pytest.MonkeyPatch, compact: bool, threshold: float, expected_dtype: torch.dtype,
+) -> None:
+    matrix = torch.tensor([[0.04, 0.02], [-0.03, -0.01]], dtype=torch.float64)
+    reference = torch.linalg.matrix_exp(matrix)
+    seen = []
+    original = torch.linalg.matrix_exp
+    def recorded(value: torch.Tensor) -> torch.Tensor:
+        seen.append(value.dtype)
+        return original(value)
+    monkeypatch.setattr(torch.linalg, "matrix_exp", recorded)
+    if compact:
+        actual, inverse = transport._stable_compact_glk_exp_pair(
+            matrix.reshape(1, 1, 1, 2, 2), exp_fp64_norm_threshold=threshold)
+        actual, inverse = actual[0, 0, 0], inverse[0, 0, 0]
+    else:
+        actual, inverse = transport.stable_matrix_exp_pair(matrix, exp_fp64_norm_threshold=threshold)
+    assert seen == [expected_dtype]
+    assert actual.dtype == inverse.dtype == torch.float64
+    torch.testing.assert_close(actual @ inverse, torch.eye(2, dtype=torch.float64), rtol=1e-13, atol=1e-13)
+    if threshold == 0.0:
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
+def test_shared_policy_adapter_preserves_exact_family_and_omitted_keywords(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vfe3.families.gaussian import FullGaussian
+    from vfe3.families.policy import coupling_energy, family_instance
+    mu, sigma = torch.zeros(1, 2), torch.eye(2).unsqueeze(0)
+    seen = []
+    class CustomFull(FullGaussian):
+        def __init__(self, mu: torch.Tensor, sigma: torch.Tensor, **kwargs: object) -> None:
+            seen.append(kwargs)
+        @staticmethod
+        def coupling_energy(*args: object, **kwargs: object) -> torch.Tensor:
+            seen.append(kwargs)
+            return torch.tensor(0.0)
+    prior = torch.tensor([[0.0, -torch.inf]])
+    family_instance(mu, sigma, CustomFull, "fp64")
+    coupling_energy(CustomFull, mu, log_prior=prior, precision_policy="fp64", score_backend="common_frame")
+    assert seen == [{}, {}]
+    assert family_instance(mu, sigma, FullGaussian, "fp64")._precision_policy == "fp64"
+    assert family_instance(mu, sigma, FullGaussian, None)._precision_policy is None
+    monkeypatch.setattr(FullGaussian, "coupling_energy", CustomFull.coupling_energy)
+    coupling_energy(FullGaussian, mu, log_prior=prior, precision_policy="fp64", score_backend="common_frame")
+    assert seen[-1]["precision_policy"] == "fp64"
+    assert seen[-1]["score_backend"] == "common_frame"
+    torch.testing.assert_close(seen[-1]["pair_support"], ~torch.isneginf(prior))
+    coupling_energy(FullGaussian, mu)
+    assert seen[-1] == {"score_backend": "pairwise"}
+
+
+def test_predictive_gradient_capture_uses_host_nan_and_preserves_real_norms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib
+    import math
+    from tests.profiles import tiny_config
+    from vfe3.model.model import VFEModel
+    module = importlib.import_module("vfe3.inference.e_step")
+    original = module.e_step_iteration
+    records = []
+    def recorded(*args: object, **kwargs: object) -> object:
+        output = original(*args, **kwargs)
+        if kwargs.get("grad_record") is not None:
+            records.append(dict(kwargs["grad_record"]))
+        return output
+    monkeypatch.setattr(module, "e_step_iteration", recorded)
+    cfg = tiny_config(attention_mode="projected_predictive", n_layers=6,
+                      relational_input_scope="full", relational_output_scope="full",
+                      skip_belief_sigma_update=True, e_phi_lr=0.0)
+    model = VFEModel(cfg)
+    out = {}
+    model.forward_beliefs(torch.tensor([[0, 1, 2]]), estep_grad_out=out)
+    assert len(records) == 6
+    assert all(record == {"mu": None, "sigma": None, "phi": None} for record in records)
+    assert all(type(out[key]) is float and math.isnan(out[key]) for key in ("mu", "sigma", "phi"))
+    records.clear()
+    ordinary = VFEModel(tiny_config(attention_mode="transported"))
+    ordinary.forward_beliefs(torch.tensor([[0, 1, 2]]), estep_grad_out=out)
+    assert records and isinstance(records[-1]["mu"], torch.Tensor)
+    assert all(type(out[key]) is float and math.isfinite(out[key]) for key in ("mu", "sigma", "phi"))
+

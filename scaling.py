@@ -35,7 +35,7 @@ if os.environ.get("VFE3_ALLOW_DUPLICATE_OPENMP") == "1":
 
 import copy
 import gc
-import hashlib
+from vfe3.artifact_utils import canonical_json_sha256 as _canonical_json_sha256
 import json
 import logging
 import math
@@ -151,12 +151,11 @@ config = dict(
 
     gradient_mode             = "filtering",   #"smoothing"
 
-    # Exact projected relational routing with conditional mean filtering.
-    relational_mode                  = "projected_filtering",  # "off" | "projected_filtering"
+    # Attention execution and projected input/output scopes.
+    attention_mode                   = "projected_predictive",  # "transported" | "projected_conditional" | "projected_predictive"
 
     relational_input_scope           = "full",         # each head reads all K coordinates; "head" is legacy behavior
 
-    relational_readout_mode          = "predictive_content",  # Transformers:"predictive_content", legacy: "conditional_update"
     relational_output_scope          = "full",                  # transformers: "full": requires predictive_content, legacy: 'head'
 
     attention_residual               = True,   # predictive S/T/O: add the incoming mean
@@ -196,7 +195,7 @@ config = dict(
 
     decode_mode                       = 'linear',  # prior-bank: diagonal_chunked/full_chunked/expected_likelihood_chunked/family_chunked
     encode_mode                       = "per_token",   #"per_token_additive" is ~1.5x faster at K=80 currently unablated
-                                                       # "canonical_content_projected" REQUIRES decode_mode = 'full_*" and full gauissians
+                                                       # "canonical_content_projected" requires gaussian_diagonal input and a full decoder
     decode_chunk_size                 = 8192,
     decode_tau                        = 0.008,       #prior_bank = True temperature
 
@@ -374,10 +373,8 @@ config = dict(
     amp_dtype                            = 'bf16',        # None=fp32 | 'bf16' , 'fp16'. Sigma must be at least fp32
     fp32_matmul_precision                = "highest",       # None (leave as-is) | "highest" | "high" | "medium"
 
-    grad_clip                            = 1.0,         # gradient clip: global L2 norm unless grad_clip_per_role
-    grad_clip_per_role                   = True,        # clip grads per role (mu/sigma/phi) instead of one global norm
+    grad_clip                            = 1.0,         # L2 gradient clip applied independently per optimizer role
 
-    exp_fp64_mode                        = "norm",        # "dim" | "norm" norm ~1.5x faster at K=80
     exp_fp64_norm_threshold              = 20.0,          # "norm" mode threshold
 
 
@@ -905,18 +902,6 @@ def _loader_data_source_identities(
             raise RuntimeError(f"{split} loader data identity is unavailable or mismatched")
         sources[split] = data_identity.get("source")
     return _validated_data_source_identities(sources)
-
-
-def _canonical_json_sha256(value: object) -> str:
-    """SHA-256 of one finite, JSON-safe value under a stable canonical encoding."""
-    encoded = json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _scaling_reuse_contract_sha256(cellmeta: Mapping[str, object]) -> str:

@@ -61,7 +61,7 @@ class _OverflowModel(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.weight = torch.nn.Parameter(torch.tensor(0.))
-        self.cfg = SimpleNamespace(grad_clip_per_role=False, m_phi_update_mode='adamw', phi_mstep_max_matrix_norm=None)
+        self.cfg = SimpleNamespace(m_phi_update_mode='adamw', phi_mstep_max_matrix_norm=None)
 
     def forward(self, tokens: torch.Tensor, targets: torch.Tensor, **kwargs: object) -> tuple:
         loss = self.weight * 1e35 + 1.
