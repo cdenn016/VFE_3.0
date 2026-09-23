@@ -252,7 +252,12 @@ def test_pair_tiles_match_mean_distance_and_gradient_without_full_vector_grid(dt
 
 
 def test_healthy_projected_kl_uses_only_the_key_precision_inverse() -> None:
-    """Healthy factors must not pay an inverse-based conditioning probe."""
+    """Healthy factors pay one batched on-device certificate inverse per role, never a host read.
+
+    Audit 2026-09-23 (low): the exact eps ||G||_F ||G^-1||_F certificate replaced the AM-GM screen,
+    which was ~4.5e4x loose and so sent almost every live call through a second host read and
+    masked gathers to evaluate this same certificate; the score still uses one key-precision inverse.
+    """
     from torch.utils._python_dispatch import TorchDispatchMode
     from vfe3.relational_scoring import projected_gaussian_kl
 
@@ -271,7 +276,7 @@ def test_healthy_projected_kl_uses_only_the_key_precision_inverse() -> None:
     with counter:
         score = projected_gaussian_kl(mu, covariance, mu, covariance)
     assert torch.isfinite(score).all()
-    assert counter.count == 1
+    assert counter.count == 3
 
 
 def test_shear_source_recovery_matches_unprojected_kl() -> None:

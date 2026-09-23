@@ -31,6 +31,7 @@ from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.phi_preconditioner import _bch_chart_direction, precondition_phi_gradient
 from vfe3.geometry.retraction import retract_phi, retract_spd_affine
 from vfe3.numerics import apply_mu_trust_region
+from vfe3.relational_scoring import source_recovery_counter
 from vfe3.geometry.transport import (
     CompactFactoredTransport,
     FactoredTransport,
@@ -333,7 +334,8 @@ def free_energy_value(
     lambda_beta:               'float | torch.Tensor' = 1.0,   # weight on the belief-coupling block (1.0 = pure)
     kl_max:                    float = 100.0,
     eps:                       float = 1e-6,
-    sigma_max:                 float = 10.0,           # matches VFE3Config.sigma_max; accepted-and-ignored iteration-only knob
+    sigma_max:                 Optional[float] = 100.0,  # matches VFE3Config.sigma_max; accepted-and-ignored iteration-only knob
+    bch_residual_max:          Optional[float] = None,   # accepted-and-ignored iteration-only knob
     e_sigma_q_trust:           float = 5.0,            # accepted-and-ignored iteration-only knob
     e_mu_q_trust:              Optional[float] = None, # accepted-and-ignored iteration-only knob
     mu_trust_mode:             str  = "box",           # accepted-and-ignored iteration-only knob
@@ -380,7 +382,7 @@ def free_energy_value(
         E_ij = D(q_i || Omega_ij q_j),  beta = softmax_j(log_prior - E/tau).
 
     The step-size / E-step-only knobs (gradient_mode, phi_precond_mode, phi_retract_mode,
-    sigma_max, e_sigma_q_trust, reuse_pairwise_kl_stats) are declared here as
+    sigma_max, bch_residual_max, e_sigma_q_trust, reuse_pairwise_kl_stats) are declared here as
     EXPLICIT accept-and-ignore
     parameters (not a blanket ``**kwargs`` sink) so the common ``e_step`` call site may forward one knob
     bag to both this and ``e_step_iteration`` while a MISSPELLED real parameter still raises
@@ -502,6 +504,50 @@ def free_energy_value(
     return F
 
 
+def _detach_key_frames(
+    omega: 'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport',
+) -> 'CompactFactoredTransport | FactoredTransport | RopeTransport':
+    r"""Receiver-live, sender-detached copy of a vertex-factored flat transport.
+
+    For :math:`\Omega_{ij} = U_i U_j^{-1}` the receiver factor :math:`U_i` keeps its graph and
+    the sender factor :math:`U_j^{-1}` is detached, so any energy built from the copy
+    differentiates to the receiver-row derivative only. Values are bit-identical. The copy is no
+    longer ONE differentiable vertex table, so it is marked non-cocycle: a consumer that exploits
+    :math:`\Omega_{ij}^{-1} = \Omega_{ji}` or a common frame would otherwise route the derivative
+    to the wrong endpoint, and the certified self-link restore no longer applies (the self pair
+    carries only roundoff, and its first-order energy change vanishes because every divergence is
+    minimized at :math:`\Omega_{ii} = I`).
+    """
+    if isinstance(omega, RopeTransport):
+        return RopeTransport(
+            base=_detach_key_frames(omega.base),
+            rope=omega.rope,
+            on_cov=omega.on_cov,
+            on_value=omega.on_value,
+            insertion=omega.insertion,
+            same_frame_flat_cocycle=False,
+        )
+    if isinstance(omega, CompactFactoredTransport):
+        return CompactFactoredTransport(
+            omega.exp_blocks, omega.inv_blocks.detach(), omega.K,
+            mean_per_head=omega.mean_per_head,
+            same_frame_flat_cocycle=False,
+            cond_escalation=omega.cond_escalation,
+        )
+    if isinstance(omega, FactoredTransport):
+        return FactoredTransport(
+            exp_phi=omega.exp_phi,
+            exp_neg_phi=omega.exp_neg_phi.detach(),
+            irrep_dims=omega.irrep_dims,
+            mean_per_head=omega.mean_per_head,
+            same_frame_flat_cocycle=False,
+            cond_escalation=omega.cond_escalation,
+        )
+    raise TypeError(
+        "the filtering phi objective detaches the sender frames of a vertex-factored flat "
+        f"transport; got {type(omega).__name__!r}, which exposes no per-vertex factors")
+
+
 def phi_alignment_loss(
     mu:        torch.Tensor,             # (N, K)
     sigma:     torch.Tensor,             # (N, K)
@@ -530,6 +576,7 @@ def phi_alignment_loss(
     compact_phi_block_transport:   bool  = False,
     rope_on_cov:                   bool  = False,  # gauge-RoPE: rotate the covariance sandwich too
     rope_on_value:                 bool  = True,   # False -> value aggregation uses the un-rotated base
+    detach_key_frames:             bool  = False,  # filtering: receiver-row phi gradient only
 
     rope:                     Optional[torch.Tensor]   = None,  # (N,K,K) gauge-RoPE rotation (None -> off)
     right_phi:                Optional[torch.Tensor]   = None,  # exact right positional factor exp(Y)
@@ -553,6 +600,12 @@ def phi_alignment_loss(
     energy while the coupling sum uses the unrotated base-transport value energy; beta remains live
     because it is not stationary for that decoupled block.
 
+    ``detach_key_frames=True`` is the filtering objective (audit 2026-09-23 #6): the sender frames
+    :math:`U_j` of :math:`\Omega_{ij} = U_i U_j^{-1}` are detached, so
+    :math:`\partial L / \partial \phi_i = \partial F_i / \partial \phi_i` is receiver row
+    :math:`i` alone, and under a causal prior no later row :math:`i > j` reaches :math:`\phi_j`.
+    The value of ``L`` is unchanged. A ``'coboundary'`` family cancels the frames exactly, so its
+    energy carries no frame dependence and its certified transport is kept.
     """
     # Build Omega under the ACTIVE connection regime so the phi step descends the SAME objective as
     # the mu/sigma step. The transport is held constant w.r.t. the phi gradient (only phi varies). The
@@ -565,6 +618,8 @@ def phi_alignment_loss(
         and transport_mode == "flat"
         and group.phi_coordinate_layout == "block_head_row_major"
     )
+    fam = get_family(family)
+    detach_key_frames = detach_key_frames and fam.transport_requirement != "coboundary"
     omega = build_belief_transport(phi, group, transport_mode=transport_mode, mu=mu, sigma=sigma,
                                    right_phi=right_phi,
                                    transport_state=transport_state,
@@ -573,10 +628,12 @@ def phi_alignment_loss(
                                    transport_mean_per_head=transport_mean_per_head,
                                    congruence_cond_escalation=congruence_cond_escalation,
                                    compact_phi_block_transport=compact_phi_block_transport,
+                                   require_vertex_factors=detach_key_frames,
                                    validity_max_norm=transport_chart_max_norm,
                                    exactness_out=transport_status,
                                    rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value, rope_insertion=rope_insertion)
-    fam = get_family(family)
+    if detach_key_frames:
+        omega = _detach_key_frames(omega)
     # The family coupling seam owns the whole transport + divergence composition (see
     # BeliefParams.coupling_energy), so the phi step descends the SAME energy the belief step does
     # under any family, including one that evaluates the transported divergence exactly.
@@ -630,7 +687,8 @@ def e_step_iteration(
     lambda_beta:               'float | torch.Tensor' = 1.0,   # weight on the belief-coupling block (1.0 = pure)
     kl_max:                    float = 100.0,
     eps:                       float = 1e-6,
-    sigma_max:                 float = 10.0,           # matches VFE3Config.sigma_max
+    sigma_max:                 Optional[float] = 100.0,  # matches VFE3Config.sigma_max (None = no ceiling)
+    bch_residual_max:          Optional[float] = None,   # opt-in fail-closed BCH residual gate on the phi retraction
     e_sigma_q_trust:           float = 5.0,
     e_mu_q_trust:              Optional[float] = None,   # mean trust radius (sigma units); None = unbounded
     mu_trust_mode:             str  = "box",             # "box" | "ball" (only when e_mu_q_trust is not None)
@@ -783,6 +841,11 @@ def e_step_iteration(
             UserWarning,
             stacklevel=2,
         )
+    # Per-iteration count of float64 source-factor recoveries in the relational scorer, reduced
+    # on the device (no host sync); published by the relational diagnostics (audit 2026-09-23 low).
+    recovery_before = (source_recovery_counter(belief.mu.device)
+                       if relational_capture is not None and relational_operators is not None
+                       else None)
     if e_step_update == "mm_exact":
         # Closed-form MM/coordinate-exact update: precision fusion at frozen beta (kernels.py,
         # ``mm_exact_update``). Derived from the diagonal-KL filtering kernel, so it is
@@ -978,6 +1041,9 @@ def e_step_iteration(
                 belief.sigma, -e_q_sigma_lr * nat_sigma, belief.mu.dim(),
                 trust_region=e_sigma_q_trust, eps=eps, sigma_max=sigma_max,
             )
+    if recovery_before is not None:
+        relational_capture["relational_covariance_repair_count"] = (
+            source_recovery_counter(belief.mu.device) - recovery_before)
 
     if relational_capture is not None and "conditional_context" in relational_capture:
         with torch.no_grad():
@@ -991,7 +1057,7 @@ def e_step_iteration(
         # substep is evaluated at the UPDATED (mu, sigma) with the pre-update phi -- each substep
         # descends F at the current point of the sweep. This mixed state is the standard
         # coordinate-descent sweep, not a frozen joint state.
-        # The phi natural gradient fundamentally requires autograd (autograd.grad on a
+        # The phi gradient fundamentally requires autograd (autograd.grad on a
         # fresh requires_grad leaf), so it must run under an enable_grad island even when
         # the caller wraps the stack in no_grad (the detached fixed-point regime).
         # create_graph defaults to False, so grad_phi is detached from the outer graph and
@@ -1024,6 +1090,10 @@ def e_step_iteration(
                 compact_phi_block_transport=compact_phi_block_transport,
                 transport_chart_max_norm=transport_chart_max_norm,
                 transport_status=transport_status,
+                # Filtering is query-side coordinate ascent for phi too (audit 2026-09-23 #6):
+                # detach the sender frames so phi_j receives no rows i > j. Smoothing keeps the
+                # full envelope gradient through both endpoints.
+                detach_key_frames=(gradient_mode == "filtering"),
             )
             grad_phi = torch.autograd.grad(L, phi_g)[0]
         if grad_record is not None:                      # RAW phi-gradient norm (pre-precondition)
@@ -1043,6 +1113,7 @@ def e_step_iteration(
             step_size=e_phi_lr,
             mode=phi_retract_mode,
             compact_blocks=compact_phi_block_transport,
+            residual_max=bch_residual_max,
         )
         if transport_chart_max_norm is not None:
             # The phi objective validates the pre-step frame, but a large retraction can leave the

@@ -377,6 +377,55 @@ def load_cached_tokens(
     )
 
 
+def _require_word_cache_matches_vocabulary(
+    dataset:   str,
+    split:     str,
+
+    *,
+    cache_dir: Optional[Path] = None,
+) -> None:
+    r"""Fail closed when a word cache's build metadata disagrees with the vocabulary sidecar.
+
+    A word cache's ids mean something only relative to the vocabulary they were encoded with. The
+    builder records that vocabulary's ``vocab_size`` and ``min_count`` in the cache's
+    ``.pt.meta.json``; the loader resolves ids through the separate vocabulary sidecar. When the
+    metadata records either field, the sidecar must exist and agree on it, otherwise the cache would
+    be silently decoded, bounded, and identity-bound against a different table. BPE caches, and word
+    caches whose metadata records neither field, are unaffected.
+    """
+    if not is_word_level(dataset):
+        return
+    meta_path = Path(str(cache_path(dataset, split, suffix="pt", cache_dir=cache_dir)) + ".meta.json")
+    if not meta_path.is_file():
+        return
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"word cache metadata {meta_path} is unreadable") from exc
+    if not isinstance(meta, dict):
+        raise ValueError(f"word cache metadata {meta_path} must be a JSON object")
+    recorded = {key: meta[key] for key in ("vocab_size", "min_count") if key in meta}
+    if not recorded:
+        return
+    from vfe3.data.word_vocab import vocabulary_path
+
+    vocabulary = _load_word_vocabulary(dataset, _tokenizer_tag(dataset), cache_dir=cache_dir)
+    sidecar = vocabulary_path(dataset, tag=_tokenizer_tag(dataset), cache_dir=cache_dir)
+    if vocabulary is None:
+        raise FileNotFoundError(
+            f"word cache {meta_path.name} records {recorded} but its vocabulary sidecar {sidecar} is "
+            "absent; rebuild the word cache")
+    actual = {"vocab_size": vocabulary.vocab_size, "min_count": vocabulary.min_count}
+    differing = sorted(key for key in recorded if recorded[key] != actual[key])
+    if differing:
+        encoded_with = {key: recorded[key] for key in differing}
+        sidecar_has = {key: actual[key] for key in differing}
+        raise ValueError(
+            f"word cache {meta_path.name} was encoded with {encoded_with} but the vocabulary "
+            f"sidecar {sidecar} has {sidecar_has}; the cache ids would be read against a different "
+            "table. Rebuild the word cache (FORCE = True in build_wikitext103_word_cache.py)")
+
+
 def _load_identity_bound_tokens(
     dataset:   str,
     split:     str,
@@ -386,6 +435,7 @@ def _load_identity_bound_tokens(
     limit:     Optional[int]  = None,
 ) -> Tuple[torch.Tensor, Dict[str, object]]:
     r"""Load tokens only when the exact source identity is stable across the load."""
+    _require_word_cache_matches_vocabulary(dataset, split, cache_dir=cache_dir)
     identity_before = cache_source_identity(dataset, split, cache_dir=cache_dir)
     tokens = (
         load_cached_tokens(dataset, split, cache_dir=cache_dir)

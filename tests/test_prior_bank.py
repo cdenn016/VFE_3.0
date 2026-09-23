@@ -75,7 +75,13 @@ def test_decode_matches_reference_across_table_routes(
         logits = pb.decode(mu_q, sigma_q, tau=1.7)
     with pytest.warns(RuntimeWarning, match="max_log=80"):
         ref = pb.reference_decode(mu_q, sigma_q, tau=1.7)
-    assert torch.allclose(logits, ref, atol=1e-3, rtol=0.0)
+    # The sigma_log=-20 rows put |logit| near 1.3e6, where one float32 ulp is 0.125, so an absolute
+    # 1e-3 alone would demand bitwise-identical rounding from two different evaluation orders
+    # (decode's closed form vs the family seam; each lands within 1-2 ulp of the fp64 value, at
+    # different entries). Allow a few ulps relative on top of the 1e-3 used for O(1) entries: a wrong
+    # table route moves these logits by O(1)..O(1e6), far outside this bound.
+    few_ulps = 4 * torch.finfo(torch.float32).eps
+    torch.testing.assert_close(logits, ref, atol=1e-3, rtol=few_ulps)
 
 
 def test_decode_tau_scaling():

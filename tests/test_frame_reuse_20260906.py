@@ -200,4 +200,4 @@ def test_reuse_extreme_token_counts(same_token: bool, device: torch.device,
 
 def test_unique_factors_under_active_bf16_autocast(device: torch.device) -> None:
     with torch.autocast(device.type, dtype=torch.bfloat16):
-        test_unique_factors_values_gradients_hvp(torch.float32, 'norm', 20.0, device)
+        test_unique_factors_values_gradients_hvp(torch.float32, 20.0, device)

@@ -280,6 +280,26 @@ def _load_token_vector(sweep_dir: Path, marker: Mapping[str, Any]) -> Optional[t
     return tensor
 
 
+def _cell_eval_window(marker: Mapping[str, Any]) -> Optional[int]:
+    r"""The cell's evaluation window length ``max_seq_len`` from its RunArtifacts ``config.json``.
+
+    The persisted validation vector concatenates the valid targets of an unshuffled loader in stream
+    order, so consecutive ``max_seq_len``-token blocks are contiguous text sharing context: the
+    sequence clusters of the paired bootstrap. ``None`` when the record is absent or malformed."""
+    cell_dir = marker.get("_cell_dir")
+    if not cell_dir:
+        return None
+    try:
+        record = json.loads((Path(cell_dir) / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    config = record.get("config") if isinstance(record, Mapping) else None
+    window = config.get("max_seq_len") if isinstance(config, Mapping) else None
+    if type(window) is not int or window < 1:
+        return None
+    return window
+
+
 def ablation_forest_kwargs(
     sweep_dir:      Path,
     baseline_label: str,
@@ -287,12 +307,16 @@ def ablation_forest_kwargs(
     *,
     admitted_rows: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Optional[Dict[str, Any]]:
-    r"""Build ``plot_ablation_forest``'s ``rows`` kwarg from persisted, aligned paired-token vectors.
+    r"""Build ``plot_ablation_forest``'s kwargs from persisted, aligned paired-token vectors.
 
     The named baseline arm must exist and load; every arm must be aligned (same token length) with
-    it; each arm's delta / lo / hi is the paired bootstrap-over-tokens band (``seed=0``) converted
-    from nats to BITS per token (divided by ``ln 2``). A missing baseline, a shape mismatch, or a
-    token file whose identity no longer verifies withholds the whole figure (returns ``None``).
+    it; each arm's delta / lo / hi is the paired SEQUENCE-cluster bootstrap band (``seed=0``, whole
+    evaluation windows of the baseline cell's ``max_seq_len`` tokens resampled, as
+    ``bootstrap_ce_band`` does) converted from nats to BITS per token (divided by ``ln 2``). Tokens
+    of one window share context, so a token-iid resample would undercover. ``n_seeds`` counts the
+    distinct training seeds among the admitted cells, which sets the single-seed caption. A missing
+    baseline, a missing window length, a shape mismatch, or a token file whose identity no longer
+    verifies withholds the whole figure (returns ``None``).
     """
     if admitted_rows is None:
         markers = _successful_markers_by_label(sweep_dir)
@@ -316,6 +340,11 @@ def ablation_forest_kwargs(
     if baseline is None:
         logger.warning("ablation_forest withheld: baseline token vector failed identity verification")
         return None
+    window = _cell_eval_window(baseline_marker)
+    if window is None:
+        logger.warning("ablation_forest withheld: the baseline cell records no evaluation window "
+                       "length, so the sequence-cluster bootstrap cannot be formed")
+        return None
     rows: List[Dict[str, Any]] = []
     for label in sorted(markers):
         arm = _load_token_vector(sweep_dir, markers[label])
@@ -323,10 +352,12 @@ def ablation_forest_kwargs(
             logger.warning("ablation_forest withheld: arm %r has a missing or misaligned token vector",
                            label)
             return None
-        band = bootstrap_token_ce_band(arm, baseline, seed=0)
+        band = bootstrap_token_ce_band(arm, baseline, seed=0, block_len=window)
         rows.append({"label": label, **{key: band[key] / math.log(2.0)
                                         for key in ("delta", "lo", "hi")}})
-    return {"rows": rows}
+    n_seeds = len({marker.get("seed") for marker in markers.values()
+                   if type(marker.get("seed")) is int})
+    return {"rows": rows, "n_seeds": max(1, n_seeds)}
 
 
 def lr_grid_heatmap_kwargs(

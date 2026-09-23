@@ -89,7 +89,9 @@ def test_so_n_mixed_tower_model_constructs_with_mixer_and_trains():
                      n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0,
                      gauge_group="so_n", group_n=3,
                      irrep_spec=[("l0", 1), ("l1", 1), ("l0", 1), ("l1", 1)],
-                     use_head_mixer=True, phi_precond_mode="none")
+                     use_head_mixer=True, phi_precond_mode="none",
+                     # headless prior: a per-head alibi bias needs n_heads == 4 irrep blocks
+                     beta_attention_prior="causal")
     model = VFEModel(cfg)                       # pre-fix: raises (unequal dims [1,3,1,3])
     assert [tuple(d.shape) for d in model.head_mixer.mixer_deltas] == [(1, 1), (1, 1), (1, 1), (1, 1)]
     with torch.no_grad():

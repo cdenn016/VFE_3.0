@@ -40,14 +40,22 @@ def _prefix_encode_one(model, token_ids: torch.Tensor):
 
 
 def _stack(model, belief, log_prior, rope):
-    r"""The extractors' shared ``vfe_stack`` replay (mirrors belief_bank / converged_state)."""
+    r"""The extractors' shared ``vfe_stack`` replay (mirrors belief_bank / converged_state).
+
+    Includes the per-layer block MLPs (on by default) and their frame transport exactly as the
+    extractors and forward pass them; a replay without them no longer describes the trained model.
+    """
     cfg = model.cfg
+    block_mlp_transport, block_mlp_frame = model._block_mlp_frame_transport(belief, rope)
     return vfe_stack(
         belief, belief.mu, belief.sigma, model.group, cfg,
         log_prior=log_prior, block_norm=model.block_norm,
+        block_mlps=model.block_mlps, block_mlp_frame=block_mlp_frame,
         head_mixer=model.head_mixer, cg_coupling=model.cg_coupling,
         lambda_beta=cfg.lambda_beta,
-        rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value, rope_insertion=model.cfg.rope_insertion)
+        transport_state=model.transport_state,
+        rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
+        prebuilt_transport=block_mlp_transport, rope_insertion=model.cfg.rope_insertion)
 
 
 def _forward_reference(model, tokens: torch.Tensor):
@@ -327,6 +335,7 @@ def test_projected_rope_detached_replay_matches_production_snapshot() -> None:
             pos_rotation="rope",
             rope_full_gauge=False,
             e_step_gradient="detach",
+            use_block_mlp=False,          # the block MLP requires a gradient-carrying E-step
         )
 
     belief, _, rope = extract._encode_one(model, tokens)

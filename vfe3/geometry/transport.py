@@ -844,45 +844,31 @@ def stable_matrix_exp_pair(
             f"{validity_max_norm!r}"
         )
 
+    # Every pre-exponential scalar decision (chart validity, clamp activation, float64 island) is
+    # reduced on the device and read in ONE host transfer below, mirroring
+    # _stable_compact_glk_exp_pair (audit 2026-09-23 low: the clamp latch used to set only once the
+    # clamp FIRED, so a well-conditioned run paid its extra sync on every build, forever).
+    global _CLAMP_SURROGATE_WARNED
+    decisions = {}
     with torch.no_grad():
         raw_mat_norm = matrix.norm(dim=(-2, -1), keepdim=True)
-        if validity_max_norm is not None and bool((~torch.isfinite(raw_mat_norm)).any()):
-            raise ValueError(
-                "transport chart validity bound encountered a nonfinite matrix norm"
-            )
-        if validity_max_norm is not None and bool((raw_mat_norm > validity_max_norm).any()):
-            observed = float(raw_mat_norm.max())
-            raise ValueError(
-                "transport chart validity bound exceeded before matrix-exponential clamp: "
-                f"observed ||M||_F={observed:.6g} > {validity_max_norm:.6g}"
-            )
+        if validity_max_norm is not None:
+            decisions["nonfinite"] = (~torch.isfinite(raw_mat_norm)).any()
+            decisions["outside_chart"] = (raw_mat_norm > validity_max_norm).any()
         mat_norm = raw_mat_norm.clamp(min=1e-8)
         scale = (max_norm / mat_norm).clamp(max=1.0)
         # The clamp substitutes exp(M * scale) for exp(M) -- a DIFFERENT operator, not a rounding of
         # the intended one (measured ~98% relative error at ||M||_F = 30). Before audit 2026-07-25 F2
         # this was announced only under the opt-in clamp_monitor, so the default configuration could
         # model a surrogate transport with no signal whatsoever. The verbose per-build report stays
-        # gated on clamp_monitor; the FIRST occurrence is now always reported. The reduction costs one
-        # host sync per build (one per forward on the internally shared transport route), so the
-        # default path stops paying it once it has fired. transport_chart_max_norm remains the
-        # fail-closed alternative and its default is deliberately unchanged: every value the
-        # pullback_group validator admits (5.0 < bound < 20.0) would hard-abort runs whose observed
-        # ||M||_F already reaches 18, so failing closed stays the caller's explicit choice.
-        global _CLAMP_SURROGATE_WARNED
+        # gated on clamp_monitor; the FIRST occurrence is always reported. Its reduction rides along
+        # with the float64-island decision the build already reads, so detection adds no host sync;
+        # after the first report the default path stops computing it. transport_chart_max_norm
+        # remains the fail-closed alternative and its default is deliberately unchanged: every value
+        # the pullback_group validator admits (5.0 < bound < 20.0) would hard-abort runs whose
+        # observed ||M||_F already reaches 18, so failing closed stays the caller's explicit choice.
         if clamp_monitor or not _CLAMP_SURROGATE_WARNED:
-            frac = (scale < 1.0).float().mean()
-            if bool(frac > 0):
-                import warnings
-                _CLAMP_SURROGATE_WARNED = True
-                once = ("" if clamp_monitor else
-                        " Warned once for this process; set transport_clamp_monitor=True to report "
-                        "every occurrence, or transport_chart_max_norm to fail closed instead.")
-                warnings.warn(
-                    f'stable_matrix_exp_pair: Frobenius clamp active on {float(frac):.1%} of matrices '
-                    f'(max_norm={max_norm}); the returned factor is a SURROGATE exp(M*scale), NOT '
-                    f'exp(M).{once}',
-                    RuntimeWarning, stacklevel=2,
-                )
+            decisions["clamp_fraction"] = (scale < 1.0).float().mean()
     matrix = matrix * scale
 
     # float32 storage floor, matching _stable_compact_glk_exp_pair (audit 2026-07-25 F2). The dense
@@ -892,7 +878,7 @@ def stable_matrix_exp_pair(
     orig_dtype = matrix.dtype if matrix.dtype in (torch.float32, torch.float64) else torch.float32
     # Upcast when the maximum clamped block norm reaches the threshold.
     # The clamp already ran, so the keying norm is the norm actually exponentiated.
-    # The float64 island stays reachable for large norms; the comparison uses one host sync.
+    # The float64 island stays reachable for large norms.
     with torch.no_grad():
         if block_dims is not None and len(block_dims) > 1:
             start = 0
@@ -904,7 +890,32 @@ def stable_matrix_exp_pair(
                 start = end
         else:
             key_norm = (mat_norm * scale).max()      # clamped full-matrix norm (single block)
-    up_dtype = torch.float64 if bool(key_norm >= exp_fp64_norm_threshold) else torch.float32
+        decisions["use_fp64"] = key_norm >= exp_fp64_norm_threshold
+    host = dict(zip(decisions, torch.stack(tuple(decisions.values())).tolist()))
+    # Preserve the original exception/warning precedence after the single read.
+    if host.get("nonfinite", False):
+        raise ValueError(
+            "transport chart validity bound encountered a nonfinite matrix norm"
+        )
+    if host.get("outside_chart", False):
+        observed = float(raw_mat_norm.max())
+        raise ValueError(
+            "transport chart validity bound exceeded before matrix-exponential clamp: "
+            f"observed ||M||_F={observed:.6g} > {validity_max_norm:.6g}"
+        )
+    if host.get("clamp_fraction", 0.0) > 0:
+        import warnings
+        _CLAMP_SURROGATE_WARNED = True
+        once =("" if clamp_monitor else
+                " Warned once for this process; set transport_clamp_monitor=True to report "
+                "every occurrence, or transport_chart_max_norm to fail closed instead.")
+        warnings.warn(
+            f'stable_matrix_exp_pair: Frobenius clamp active on {host["clamp_fraction"]:.1%} of '
+            f'matrices (max_norm={max_norm}); the returned factor is a SURROGATE exp(M*scale), NOT '
+            f'exp(M).{once}',
+            RuntimeWarning, stacklevel=2,
+        )
+    up_dtype = torch.float64 if host["use_fp64"] else torch.float32
 
     # Keyed to the TENSOR's device (audit 2026-07-05 m10): the old 'cuda' literal left the island
     # open under a CPU autocast context (torch.amp.autocast('cpu', bf16)), which _amp_context
@@ -1109,50 +1120,68 @@ def _checked_group_inverse(
     validate:     bool            = True,   # strict public/offline check; False is the async hot path
     residual_tol: Optional[float] = None,
 ) -> torch.Tensor:
-    r"""True float64 inverse with immediate nonfinite/singular failure and dtype restoration.
+    r"""True float64 inverse with nonfinite/singular failure and dtype restoration.
+
+    The strict (``validate=True``) route pays exactly ONE host synchronization per call (audit
+    2026-09-23 #5): the finiteness of ``omega``, the LU status of the float64 inverse, the finiteness
+    of ``inverse64`` and of the cast ``inverse`` (plus the optional residual verdict) are reduced on
+    the device into one flag vector and read once. ``torch.linalg.inv_ex`` replaces
+    ``torch.linalg.inv`` on that route because the latter checks its LU status with its own host
+    read. The detailed error message is built only after a failure, in the original precedence.
+    ``validate=False`` keeps ``torch.linalg.inv`` and performs no additional check.
 
     When ``residual_tol`` is supplied, the STORED pair is additionally verified against
     :math:`\lVert U U^{-1} - I \rVert_\infty \le \texttt{residual\_tol}`. The finiteness checks alone
     cannot see precision loss: the inverse is exact in float64, so every way this pair stops being a
     group-inverse pair is a rounding effect of the storage dtype, which stays perfectly finite
-    (audit 2026-07-25 F2). The check costs one reduction and a host sync, so it is opt-in and off on
-    the training hot path.
+    (audit 2026-07-25 F2). The check costs one reduction, which joins the same single host read, so
+    it is opt-in and off on the training hot path.
     """
-    if validate:
-        with torch.no_grad():
-            if not bool(torch.isfinite(omega).all()):
-                raise FloatingPointError(
-                    "omega group element contains nonfinite values before inversion")
-    try:
-        with torch.amp.autocast(omega.device.type, enabled=False):
-            inverse64 = torch.linalg.inv(omega.double())
-    except RuntimeError as exc:
-        raise ValueError("omega group element is singular and cannot be inverted") from exc
-    if validate:
-        with torch.no_grad():
-            if not bool(torch.isfinite(inverse64).all()):
-                raise FloatingPointError(
-                    "omega group-element inverse is nonfinite; the element is singular or "
-                    "numerically unrepresentable")
+    if not validate:
+        try:
+            with torch.amp.autocast(omega.device.type, enabled=False):
+                inverse64 = torch.linalg.inv(omega.double())
+        except RuntimeError as exc:
+            raise ValueError("omega group element is singular and cannot be inverted") from exc
+        return inverse64.to(omega.dtype)
+    with torch.amp.autocast(omega.device.type, enabled=False):
+        inverse64, info = torch.linalg.inv_ex(omega.double())
     inverse = inverse64.to(omega.dtype)
-    if validate:
-        with torch.no_grad():
-            if not bool(torch.isfinite(inverse).all()):
-                raise FloatingPointError(
-                    f"omega group-element inverse is nonfinite after conversion to {omega.dtype}")
-            if residual_tol is not None:
-                eye = torch.eye(omega.shape[-1], device=omega.device, dtype=torch.float64)
-                residual = float(
-                    (omega.double() @ inverse.double() - eye).abs().amax()
-                )
-                if not (residual <= residual_tol):
-                    raise FloatingPointError(
-                        "stored omega group-element pair violates the inverse identity: "
-                        f"||U U^-1 - I||_inf={residual:.6g} > residual_tol={residual_tol:.6g} "
-                        f"(storage dtype {omega.dtype}); the represented element and its stored "
-                        "inverse no longer form a group-inverse pair, so the transport cocycle is "
-                        "not exact"
-                    )
+    with torch.no_grad():
+        flags = [
+            ~torch.isfinite(omega).all(),
+            (info != 0).any(),
+            ~torch.isfinite(inverse64).all(),
+            ~torch.isfinite(inverse).all(),
+        ]
+        residual = None
+        if residual_tol is not None:
+            eye = torch.eye(omega.shape[-1], device=omega.device, dtype=torch.float64)
+            residual = (omega.double() @ inverse.double() - eye).abs().amax()
+            flags.append(~(residual <= residual_tol))
+        # The single host read for the whole strict certificate.
+        nonfinite_omega, singular, nonfinite_64, nonfinite_cast, *residual_bad = (
+            torch.stack(flags).tolist())
+    if nonfinite_omega:
+        raise FloatingPointError(
+            "omega group element contains nonfinite values before inversion")
+    if singular:
+        raise ValueError("omega group element is singular and cannot be inverted")
+    if nonfinite_64:
+        raise FloatingPointError(
+            "omega group-element inverse is nonfinite; the element is singular or "
+            "numerically unrepresentable")
+    if nonfinite_cast:
+        raise FloatingPointError(
+            f"omega group-element inverse is nonfinite after conversion to {omega.dtype}")
+    if residual_bad and residual_bad[0]:
+        raise FloatingPointError(
+            "stored omega group-element pair violates the inverse identity: "
+            f"||U U^-1 - I||_inf={float(residual):.6g} > residual_tol={residual_tol:.6g} "
+            f"(storage dtype {omega.dtype}); the represented element and its stored "
+            "inverse no longer form a group-inverse pair, so the transport cocycle is "
+            "not exact"
+        )
     return inverse
 
 

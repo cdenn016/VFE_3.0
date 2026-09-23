@@ -280,12 +280,14 @@ def test_config_decode_ce_checkpoint_silent_at_default_even_when_inert():
     # The silence contract (audit 2026-07-25 F4 family): leaving a field at its dataclass default
     # must not warn even where it would be inert under this config, matching every sibling
     # `_changed(...)` guard in the inertness block. oracle_unroll_grad=True silences the unrelated
-    # detached-oracle advisory this family/decode_mode pair also triggers (see test above).
+    # detached-oracle advisory this family/decode_mode pair also triggers (see test above), and
+    # skip_belief_sigma_update=False silences the frozen-sigma correctness advisory that the
+    # current default skip_belief_sigma_update=True legitimately raises under a prior-bank decode.
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         VFE3Config(decode_mode="full", family="gaussian_full",
                    _allow_legacy_dense_decode=True,
-                   oracle_unroll_grad=True)
+                   oracle_unroll_grad=True, skip_belief_sigma_update=False)
 
 
 def test_config_decode_ce_checkpoint_live_under_full_chunked():

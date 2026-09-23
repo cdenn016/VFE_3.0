@@ -452,6 +452,24 @@ def _phi_chart_norm_route(
     return route_name
 
 
+def _decode_tau_eff(
+    model: torch.nn.Module,
+    cfg:   object,
+) -> Optional[float]:
+    r"""Realized prior-bank decode temperature, or ``None`` when no KL-to-bank decode is active.
+
+    .. math:: \tau_{\mathrm{eff}} = \tau \exp(-\mathrm{clamp}(s, -3, 3)),
+
+    with ``tau = decode_tau`` and ``s = decode_log_scale``. The scale is trainable unless the run
+    froze it, so the persisted ``decode_tau`` is only the initialization of the temperature the
+    decode ``logits = -KL / tau_eff`` actually used."""
+    prior_bank = getattr(model, "prior_bank", None)
+    if prior_bank is None or getattr(cfg, "decode_mode", "linear") == "linear":
+        return None
+    with torch.no_grad():
+        return float(prior_bank._tau_eff())
+
+
 def _atomic_replace(
     final: Path,                         # destination (the artifact name readers load)
     tmp:   Path,                         # same-directory temp file, already fully written
@@ -1630,6 +1648,9 @@ class RunArtifacts:
         self.best_path = self.run_dir / "best_model.pt"
         self.final_path = self.run_dir / "final_model.pt"
         self.cfg = cfg                                       # kept for figure scaling (lambda_beta) + guards
+        # Import-time digest of the code this process actually executes, kept beside the (possibly
+        # newer) on-disk digest so provenance can flag a mixed-generation process.
+        self.process_code_identity_sha256 = _PROCESS_PACKAGE_CODE_IDENTITY
         self.code_identity_sha256 = _verified_process_code_identity()
         self.run_start_git_identity = dict(_git_code_identity())
         self.selection_data_identity: Optional[Dict[str, object]] = None
@@ -1643,6 +1664,10 @@ class RunArtifacts:
 
         config_record = {
             "config":    serialize_config(cfg),
+            # Structural inert set (field -> reason) BESIDE the config mapping, never inside it:
+            # every reader reloads and fingerprints only record["config"], so this key cannot
+            # change config reload, semantic fingerprints, or selection projections.
+            "inactive_fields": dict(cfg.inactive_fields()),
             "n_params":  int(sum(p.numel() for p in model.parameters())),
             "dataset":   dataset,
             "device":    str(device),
@@ -2291,14 +2316,30 @@ def load_checkpoint(
     if resume_cfg is not None:
         if config_drift:
             import warnings
-            warnings.warn(
+            other_drift = [field for field in config_drift if field != "seed"]
+            message = (
                 f"resume config drift: the checkpoint at {Path(path).name} was written under a "
-                f"different config for field(s) {config_drift}; the resumed run uses the CURRENT values "
-                f"(weights/optimizer load strictly, but semantic knobs are not restored from the "
-                f"bundle).",
-                UserWarning,
-                stacklevel=2,
+                f"different config for field(s) {config_drift}"
             )
+            if other_drift:
+                message += (
+                    f"; {other_drift} use the CURRENT values (weights/optimizer load strictly, but "
+                    f"semantic knobs are not restored from the bundle)"
+                )
+            if "seed" in config_drift:
+                # The seed acts only through initialization and the random stream. Initialization
+                # is overwritten by the restored weights, so the new seed reaches the run only
+                # through an RNG state that is not restored.
+                message += (
+                    "; 'seed' is NOT applied: the checkpoint's weights and RNG state are restored, "
+                    "so the continuation follows the checkpoint's random stream and the new seed has "
+                    "no effect on it"
+                    if restore_rng and saved_rng_state is not None else
+                    "; 'seed' is only partly applied: the checkpoint's weights are restored (the new "
+                    "seed's initialization is discarded) and only the unrestored global RNG stream "
+                    "derives from the current seed"
+                )
+            warnings.warn(message + ".", UserWarning, stacklevel=2)
     if restore_rng:
         rng = saved_rng_state
         # RNG tensors must be CPU ByteTensors regardless of map_location (set_rng_state asserts this).
@@ -2530,8 +2571,9 @@ def _verified_process_code_identity() -> str:
     Relabeling such a mixed process with the new disk digest would be false provenance, so under
     ``STRICT_CODE_IDENTITY`` a new run in a long-lived Spyder kernel stops until that kernel restarts
     and imports one coherent source generation. With gating off the current disk digest is returned
-    instead: provenance still records what the source looked like at run start, and the caller is
-    responsible for knowing the process may hold a mixed generation.
+    instead: provenance still records what the source looked like at run start, a warning is logged,
+    and ``RunArtifacts`` keeps the import-time digest so ``_write_provenance`` reports
+    ``source_identity_status='mixed_generation'`` rather than ``'stable'``.
     """
     current = _package_code_identity()
     if current != _PROCESS_PACKAGE_CODE_IDENTITY:
@@ -2540,6 +2582,12 @@ def _verified_process_code_identity() -> str:
                 "vfe3 source changed after this Python process imported the package; restart the "
                 "Spyder kernel before starting another run"
             )
+        # Non-strict: keep running, but never silently. RunArtifacts also keeps the import-time
+        # digest so provenance reports source_identity_status='mixed_generation', not 'stable'.
+        logging.getLogger(__name__).warning(
+            "vfe3 source changed after this process imported the package: the on-disk code "
+            "identity is recorded, but the process may execute an older, mixed source generation"
+        )
         return current
     return _PROCESS_PACKAGE_CODE_IDENTITY
 
@@ -2705,6 +2753,16 @@ def _write_provenance(
     else:
         source_identity_status = "unverifiable"
         source_identity_drift = None
+    # Non-strict code identity records the on-disk digest at run start. When that differs from the
+    # digest this process imported, the executed code is an older (possibly mixed) generation, so
+    # the run-boundary comparison above cannot certify it as 'stable'.
+    process_code_identity = getattr(artifacts, "process_code_identity_sha256", None)
+    process_code_identity_match = (
+        None if process_code_identity is None
+        else process_code_identity == artifacts.code_identity_sha256
+    )
+    if process_code_identity_match is False:
+        source_identity_status = "mixed_generation"
 
     prov: Dict[str, object] = {
         "seed":                cfg.seed,
@@ -2717,6 +2775,8 @@ def _write_provenance(
         "max_tokens":          (int(max_tokens) if max_tokens is not None else None),
         "tokenizer_tag":       tokenizer_tag,
         "code_identity_sha256":       artifacts.code_identity_sha256,
+        "process_code_identity_sha256": process_code_identity,
+        "process_code_identity_match":  process_code_identity_match,
         "selection_data_identity":    artifacts.selection_data_identity,
         "final_code_identity_sha256": final_code_identity_sha256,
         "code_identity_drift":        code_identity_drift,
@@ -2760,7 +2820,12 @@ def _write_provenance(
     prov["data_sha256"] = prov["test_data_sha256"]
     prov["data_n_tokens"] = prov["test_data_n_tokens"]
     artifacts.save_json("provenance.json", prov)
-    if source_identity_status == "drifted":
+    if source_identity_status == "mixed_generation":
+        logger.warning(
+            "the process executed code imported before a source edit; provenance records both the "
+            "import-time and on-disk code identities (source_identity_status='mixed_generation')"
+        )
+    elif source_identity_status == "drifted":
         logger.warning(
             "source identity drifted during the run; provenance records both boundaries"
         )
@@ -2954,21 +3019,71 @@ def _write_research_artifacts(
     # B1/EXP-3 Sigma_q calibration headline: Spearman rho(tr Sigma_q, CE) and the across-token
     # spread gate CV(tr Sigma_q) > 0.10 (below it the covariance channel is inert -- reported as
     # such, NOT miscoded as "decode doesn't matter"). Off-graph; capped at a few batches.
+    # On a route whose covariance is frozen at encode, tr Sigma is the input token's table variance
+    # tr Sigma(x_i), a function of the token id alone, so rho pairs input-token variance with
+    # next-token CE (a type-level association) and the CV gate cannot certify belief uncertainty:
+    # the statistics are kept under that label and the gate is withheld (None, with a reason).
     try:
         from vfe3.viz.extract import belief_ce_bank
         from vfe3 import metrics as _cal_metrics
         bank = belief_ce_bank(model, test_loader, device=device, max_batches=10)
         tr = bank["tr_sigma"]
         if tr.numel() >= 2:
+            frozen_covariance = _cal_metrics.covariance_frozen_at_encode(cfg)
+            out["sigma_trace_source"] = (
+                "input_token_variance" if frozen_covariance else "belief_covariance")
             out["sigma_ce_spearman"] = _cal_metrics.spearman_rho(tr, bank["ce"])
             out["sigma_trace_cv"] = _cal_metrics.cv(tr)
-            out["sigma_trace_cv_gate_pass"] = bool(out["sigma_trace_cv"] > 0.10)
-            logger.info("Sigma_q calibration: rho(trSigma,CE)=%.3f CV(trSigma)=%.3f (gate>0.10: %s)",
-                        out["sigma_ce_spearman"], out["sigma_trace_cv"], out["sigma_trace_cv_gate_pass"])
+            if frozen_covariance:
+                out["sigma_trace_cv_gate_pass"] = None
+                out["sigma_trace_cv_gate_reason"] = (
+                    "covariance frozen at encode (projected attention_mode or "
+                    "skip_belief_sigma_update=True, no delta_full covariance seam): tr Sigma is "
+                    "the input-token variance tr Sigma(x_i), not a context-dependent belief "
+                    "uncertainty, so the CV>0.10 calibration gate is withheld")
+                logger.info("input-token variance vs next-token CE: rho(trSigma(x_i),CE)=%.3f "
+                            "CV(trSigma(x_i))=%.3f (calibration gate withheld: covariance frozen "
+                            "at encode)", out["sigma_ce_spearman"], out["sigma_trace_cv"])
+            else:
+                out["sigma_trace_cv_gate_pass"] = bool(out["sigma_trace_cv"] > 0.10)
+                logger.info("Sigma_q calibration: rho(trSigma,CE)=%.3f CV(trSigma)=%.3f (gate>0.10: %s)",
+                            out["sigma_ce_spearman"], out["sigma_trace_cv"],
+                            out["sigma_trace_cv_gate_pass"])
     except Exception as exc:
         logger.warning("Sigma_q calibration probe failed (%s); skipped", exc)
     if out:
         artifacts.save_json("research.json", out)
+
+
+# Lookup tables indexed by token id (prior bank) or absolute position (model). Their sum is the
+# "embedding" parameter count that Kaplan et al. (2020, arXiv:2001.08361) exclude from N.
+_TOKEN_TABLE_PARAMETERS: Tuple[Tuple[str, str], ...] = (
+    ("prior_bank", "mu_embed"),
+    ("prior_bank", "sigma_log_embed"),
+    ("prior_bank", "phi_embed"),
+    ("prior_bank", "output_proj_weight"),
+    ("prior_bank", "output_proj_bias"),
+    ("prior_bank", "decode_mu_embed"),
+    ("prior_bank", "decode_sigma_log_embed"),
+    ("", "pos_phi_free"),
+)
+
+
+def _token_table_parameter_count(model: torch.nn.Module) -> Optional[int]:
+    r"""Parameters held in per-token (and absolute-position) lookup tables, or ``None`` if unknown.
+
+    ``n_non_embedding_params = n_params - n_token_table_params`` is the context-processing count a
+    scaling fit should also be reported against: at the scaling widths the vocabulary-indexed
+    ``phi``/``mu``/``sigma``/decode tables are ~99% of ``n_params``."""
+    if getattr(model, "prior_bank", None) is None:
+        return None
+    total = 0
+    for owner_name, name in _TOKEN_TABLE_PARAMETERS:
+        owner = getattr(model, owner_name) if owner_name else model
+        parameter = getattr(owner, name, None)
+        if isinstance(parameter, torch.nn.Parameter):
+            total += int(parameter.numel())
+    return total
 
 
 def _cost_model_fields(
@@ -3061,6 +3176,10 @@ def _cost_model_fields(
         "device_name":             (torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"),
         "amp_dtype":               cfg.amp_dtype,
     }
+    token_table_params = _token_table_parameter_count(model)
+    out["n_token_table_params"] = token_table_params
+    out["n_non_embedding_params"] = (
+        None if token_table_params is None else int(n_params) - token_table_params)
     conditional_fields = _conditional_artifact_fields(cfg)
     if conditional_fields:
         out.update(conditional_fields)
@@ -3191,6 +3310,13 @@ def finalize_run(
         artifacts.save_json("final_validation.json", {"step": final_step, **final_validation})
         if final_step is not None:
             artifacts.maybe_save_best(final_step, model, float(final_validation["ppl"]))
+    # Reachability guard (PB-03), the same invariant finalize_validation_run and save_checkpoint
+    # enforce: finite best-model metadata is published below (test_results.json, summary.json), so
+    # it must name weights that exist. Checked after the final validation had its chance to save.
+    if (artifacts.save_model_artifacts
+            and math.isfinite(float(artifacts.best_val_ppl))
+            and not artifacts.best_path.is_file()):
+        raise RuntimeError("finite best-model metadata has no reachable weights")
     if artifacts.save_model_artifacts:
         config = serialize_config(artifacts.cfg)
         with _unique_sibling_temp(artifacts.final_path) as tmp:
@@ -3230,9 +3356,11 @@ def finalize_run(
             (f"{float(m['bpc']):.4f}" if m["bpc"] is not None else "unavailable"),
         )
     best_val_ppl = artifacts.best_val_ppl if artifacts.best_val_ppl != float("inf") else None
+    decode_tau_eff = _decode_tau_eff(model, cfg)
     results.update({"best_val_ppl": best_val_ppl, "best_step": artifacts.best_step,
                     "reloaded_best": False, "evaluation_weights": "final",
-                    "evaluated_step": final_step, **final_val_fields})
+                    "evaluated_step": final_step, **final_val_fields,
+                    "decode_tau_eff": decode_tau_eff})
 
     # Held-out inference-depth counterfactual, always attempted when test metrics are available. This does not replace any selected headline
     # metric: it is published only under the diagnostic namespace after a complete successful probe.
@@ -3423,6 +3551,7 @@ def finalize_run(
         "final_train_loss": (losses[-1] if losses else None),
         "wall_time_s":  wall_time,
         "decode_mode":     cfg.decode_mode,
+        "decode_tau_eff":  decode_tau_eff,
         "use_head_mixer":  cfg.use_head_mixer,
         "phi_chart_norm_route": _phi_chart_norm_route(model, cfg),
         "scaling_point":   scaling_point,
@@ -4359,6 +4488,7 @@ def finalize_validation_run(
         "save_model_artifacts": artifacts.save_model_artifacts,
         "figures_written":     figures_written,
         "phi_chart_norm_route": _phi_chart_norm_route(model, cfg),
+        "decode_tau_eff":      _decode_tau_eff(model, cfg),
     })
 
     return {
@@ -4399,8 +4529,11 @@ def _pure_path_report(
     ``on_theory_pure_path`` combines the explicitly enumerated ``theory_flags``.
 
     ``pure_flags`` intentionally retains its historical meaning and does not enumerate every
-    default-off learned-scalar toggle. ``converged_stress`` reads the last finite value of each guard
-    or flatness column (``None`` if absent)."""
+    default-off learned-scalar toggle. The covariance and E-step facets (``full_sigma_update``,
+    ``gradient_e_step_update``, ``fixed_covariance_surrogate``, ``spd_retraction_*``) are derived
+    from ``attention_mode`` and the branch the E-step executes, and read ``'not_applicable'`` when
+    that route runs no such step. ``converged_stress`` reads the last finite value of each guard or
+    flatness-residual column (``None`` if absent)."""
     def _last(key: str) -> Optional[float]:
         for r in reversed(history):
             v = r.get(key)
@@ -4491,12 +4624,32 @@ def _pure_path_report(
     else:
         transport_exactness_status = "exact" if regime_ii_covariant_exact else "approximate"
 
+    # Covariance / E-step facets come from the EXECUTED branch of e_step_iteration, not raw toggles:
+    #   transported           -> the configured updater ('gradient' or 'mm_exact'); the covariance
+    #                            moves unless skip_belief_sigma_update, and only the gradient updater
+    #                            applies the affine SPD retraction (mm_exact blends precisions);
+    #   projected_conditional -> a relational-filtering gradient step on the mean only (no sigma arm);
+    #   projected_predictive  -> the predictive readout replaces the mean; no E-step descent runs.
+    # Projected routes keep sigma = belief.sigma, so their covariance is frozen at encode whatever
+    # skip_belief_sigma_update says. A facet with no executed counterpart is 'not_applicable'.
+    from vfe3.inference.e_step import canonical_e_step_update
+    attention_mode = getattr(cfg, "attention_mode", "transported")
+    transported = attention_mode == "transported"
+    e_step_updater = canonical_e_step_update(getattr(cfg, "e_step_update", "gradient"))
+    covariance_updated = transported and not cfg.skip_belief_sigma_update
+    gradient_e_step_update: 'bool | str' = (
+        e_step_updater == "gradient" if transported
+        else True if attention_mode == "projected_conditional"
+        else "not_applicable"
+    )
+    spd_retraction_applies = covariance_updated and e_step_updater == "gradient"
+
     sigma_max = getattr(cfg, "sigma_max", 10.0)
     spd_trust_region = getattr(cfg, "e_sigma_q_trust", 5.0)
-    spd_retraction_trust_projection_active = (
+    spd_retraction_trust_projection_active: 'bool | str' = (
         spd_trust_region is not None and float(spd_trust_region) > 0.0)
     # The affine SPD route calls an exp_bounded kernel with fixed [-50, 50] bounds.
-    spd_retraction_exponential_clipping_active = True
+    spd_retraction_exponential_clipping_active: 'bool | str' = True
     spd_route_parts = ["airm"]
     if spd_retraction_trust_projection_active:
         spd_route_parts.append("trust_projected")
@@ -4505,7 +4658,12 @@ def _pure_path_report(
     if sigma_max is not None:
         spd_route_parts.append("spectral_cap")
     spd_retraction_route = "_".join(spd_route_parts)
-    spd_retraction_exact = len(spd_route_parts) == 1
+    spd_retraction_exact: 'bool | str' = len(spd_route_parts) == 1
+    if not spd_retraction_applies:
+        spd_retraction_route = "not_applicable"
+        spd_retraction_exact = "not_applicable"
+        spd_retraction_trust_projection_active = "not_applicable"
+        spd_retraction_exponential_clipping_active = "not_applicable"
 
     beta_prior = get_prior_registration(getattr(cfg, "beta_attention_prior", "causal"))
     causal_flags = {
@@ -4528,7 +4686,8 @@ def _pure_path_report(
         "prior_bank_decode":           cfg.decode_mode != "linear",
         "no_head_mixer":               not cfg.use_head_mixer,
         "no_priorbank_head_evidence_mixer": not priorbank_head_evidence_mixer,
-        "full_sigma_update":           not cfg.skip_belief_sigma_update,
+        # Executed-route facet: False on every projected route, where sigma stays at encode.
+        "full_sigma_update":           covariance_updated,
         "no_block_mlp":                not block_mlp_active,
         # The E-STEP UPDATE RULE axis (audit 2026-07-26 D-03). 'mm_exact' is the closed-form
         # minimizer of the STRICT-PAIR-MASKED surrogate, which excludes the structural E_ii = 0
@@ -4536,8 +4695,10 @@ def _pure_path_report(
         # (see the e_step_update note and D-01). Without this key a run whose E-step descends that
         # surrogate published on_pure_path: True with no record of the substitution anywhere: the
         # only trace, state_dependent_alpha_majorizer, is False at the pure lambda_alpha_mode=
-        # 'constant', so the ledger asserted purity it had not checked.
-        "gradient_e_step_update":      getattr(cfg, "e_step_update", "gradient") == "gradient",
+        # 'constant', so the ledger asserted purity it had not checked. 'not_applicable' on
+        # projected_predictive, where no E-step descent runs; like any non-False facet it does not
+        # lower on_pure_path (that route is already off it through canonical_attention_entropy).
+        "gradient_e_step_update":      gradient_e_step_update,
     }
     # Second, INDEPENDENT purity axis (audit 2026-07-01 F8): the gauge / model-channel path. Keyed
     # on pos_rotation itself rather than the RoPE sub-toggles (rope_full_gauge / rope_on_value),
@@ -4631,8 +4792,10 @@ def _pure_path_report(
             "mm_damping":                    float(getattr(cfg, "mm_damping", 1.0)),
             # Truthful fixed-surrogate ledger (C6): these derived booleans expose when the run
             # intentionally freezes a state-dependent quantity rather than following its full
-            # joint objective. Defaults are False, preserving the pure path.
-            "fixed_covariance_surrogate":   bool(getattr(cfg, "skip_belief_sigma_update", False)),
+            # joint objective. Defaults are False, preserving the pure path. The covariance is
+            # frozen on every projected route as well as under skip_belief_sigma_update.
+            "fixed_covariance_surrogate":   not covariance_updated,
+            "attention_mode":               attention_mode,
             "state_dependent_alpha_majorizer": (
                 getattr(cfg, "e_step_update", "gradient") == "mm_exact"
                 and cfg.lambda_alpha_mode in ("state_dependent", "state_dependent_per_coord")

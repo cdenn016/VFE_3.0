@@ -460,10 +460,10 @@ def test_self_divergence_for_alpha_routes_by_declared_reduction():
     assert (a.std(dim=-1) > 1e-6).all()                          # alpha actually varies across coords
 
 
-def test_self_divergence_per_coord_requires_diagonal_renyi():
-    # Per-coordinate self-divergence exists only for the diagonal family (full-cov KL does
-    # not decompose coordinate-wise) and the Renyi functional (the only registered one).
-    # Both restrictions raise rather than silently summing the wrong thing.
+def test_self_divergence_per_coord_requires_kl_for_full_and_a_registered_functional():
+    # Full covariance is supported for KL only: ordered conditional KL contributions that sum to
+    # the full KL before clipping (docs/2026-09-22.md); a non-KL Renyi order raises. An
+    # unregistered functional still raises rather than silently summing the wrong thing.
     import pytest
     from vfe3.families.gaussian import DiagonalGaussian, FullGaussian
     from vfe3.free_energy import self_divergence_per_coord
@@ -472,8 +472,12 @@ def test_self_divergence_per_coord_requires_diagonal_renyi():
     mu = torch.randn(N, K); sigma = torch.rand(N, K) + 0.5
     mu_p = torch.randn(N, K); sigma_p = torch.rand(N, K) + 0.5
     cov = torch.eye(K).expand(N, K, K).contiguous()
-    with pytest.raises((ValueError, NotImplementedError, KeyError)):
-        self_divergence_per_coord(FullGaussian(mu, cov), FullGaussian(mu_p, cov.clone()))
+    q_full, p_full = FullGaussian(mu, cov), FullGaussian(mu_p, cov.clone())
+    per_coord = self_divergence_per_coord(q_full, p_full)
+    assert per_coord.shape == (N, K)
+    assert torch.allclose(per_coord.sum(-1), q_full.renyi_closed_form(p_full), atol=1e-5)
+    with pytest.raises(ValueError, match="KL"):
+        self_divergence_per_coord(q_full, p_full, alpha=0.5)
     with pytest.raises((ValueError, NotImplementedError, KeyError)):
         self_divergence_per_coord(DiagonalGaussian(mu, sigma), DiagonalGaussian(mu_p, sigma_p),
                                   divergence_family="not_a_functional")

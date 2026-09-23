@@ -85,6 +85,16 @@ def _load_golden_kernels_module():
 
 @pytest.fixture(scope="module")
 def golden_kernels():
+    # An independent clone may not carry the pre-change history (VFE_3.0's starts at 57d9ea0). The
+    # byte-identity guard cannot run without the historical blob, so skip with that reason: the
+    # nodes are NOT RUN, never passed. Any other git failure still errors in the loader.
+    present = subprocess.run(
+        ["git", "cat-file", "-e", f"{_PRE_CHANGE_COMMIT}^{{commit}}"],
+        cwd=str(REPO_ROOT), capture_output=True,
+    ).returncode == 0
+    if not present:
+        pytest.skip(f"golden commit {_PRE_CHANGE_COMMIT} is not in this clone's git history; the "
+                    "pre-change kernels.py oracle is unavailable (byte-identity guard not run)")
     return _load_golden_kernels_module()
 
 

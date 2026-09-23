@@ -424,7 +424,14 @@ def _write_forest_cell(sweep_dir: Path, label: str, tensor: torch.Tensor, *, pai
         "val_token_nats_dtype": str(tensor.dtype) if paired else None,
     }
     (cell / "ablation_result.json").write_text(json.dumps(marker), encoding="utf-8")
+    # The cell's RunArtifacts config record supplies the evaluation window (audit 2026-09-23 #19):
+    # the forest resamples whole max_seq_len-token sequences, not independent tokens.
+    (cell / "config.json").write_text(json.dumps({"config": {"max_seq_len": _FOREST_WINDOW}}),
+                                      encoding="utf-8")
     return cell, tpath
+
+
+_FOREST_WINDOW = 8
 
 
 def test_ablation_forest_kwargs_rows_match_paired_bootstrap_oracle(tmp_path):
@@ -441,8 +448,10 @@ def test_ablation_forest_kwargs_rows_match_paired_bootstrap_oracle(tmp_path):
     assert out is not None
     rows = {r["label"]: r for r in out["rows"]}
     assert set(rows) == set(arms)
+    assert out["n_seeds"] == 1
     for label, arm in arms.items():
-        band = bootstrap_token_ce_band(arm, baseline, seed=0)      # oracle: same seed as the adapter
+        band = bootstrap_token_ce_band(arm, baseline, seed=0,      # oracle: same seed and
+                                       block_len=_FOREST_WINDOW)   # sequence clusters as the adapter
         assert rows[label]["delta"] == pytest.approx(band["delta"] / math.log(2.0))
         assert rows[label]["lo"] == pytest.approx(band["lo"] / math.log(2.0))
         assert rows[label]["hi"] == pytest.approx(band["hi"] / math.log(2.0))

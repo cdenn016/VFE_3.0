@@ -441,6 +441,10 @@ def belief_ce_bank(
     argmax-equals-gold indicator -- the aligned pairs the Spearman rho / CV gate
     (``vfe3.metrics.spearman_rho`` / ``cv``) and the Sigma-stratified-error / Sigma-CE-scatter
     figures consume. ``max_batches`` caps the join.
+
+    When ``metrics.covariance_frozen_at_encode(model.cfg)`` holds (projected routes, or
+    ``skip_belief_sigma_update``), ``out.sigma`` is the encode lookup, so ``tr_sigma`` is the input
+    token's table variance tr Sigma(x_i) and the consumers label it that way.
     """
     device = device or _model_device(model)
     if inference_bank is not None:

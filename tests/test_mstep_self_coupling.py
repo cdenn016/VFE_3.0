@@ -22,12 +22,18 @@ from vfe3.model.stack import vfe_stack
 def _converged_self_divergence(model: VFEModel, tokens: torch.Tensor) -> torch.Tensor:
     r"""Replicate forward's ``sc`` recipe on ``model`` for ``tokens``: encode -> vfe_stack
     -> reconstruct the last-block prior via the prior_handoff fold -> mean self-divergence
-    of the converged belief vs that prior. Used as the independent oracle for linearity."""
+    of the converged belief vs that prior. Used as the independent oracle for linearity.
+
+    Forward scores the converged q* captured BEFORE the post-inference transforms (head mixer, CG
+    coupling, block norm; block.py ``capture["converged"]``, audit 2026-06-09 F19). With the
+    default ``norm_type_block='layernorm'`` the post-norm stack output is not q*, so the oracle runs
+    the single-layer stack with ``block_norm=None`` and reads q* directly under any norm setting."""
     cfg = model.cfg
+    assert cfg.n_layers == 1, "the block_norm=None replay equals q* only for a single block"
     beliefs = model.prior_bank.encode(tokens)
     log_prior = model._attention_log_prior(tokens.shape[1], tokens.device)
     out = vfe_stack(beliefs, beliefs.mu, beliefs.sigma, model.group, cfg,
-                    log_prior=log_prior, block_norm=model.block_norm)
+                    log_prior=log_prior, block_norm=None)
     rho, rho_s = cfg.prior_handoff_rho, cfg.prior_handoff_sigma
     mu_p, sigma_p = beliefs.mu, beliefs.sigma
     for _ in range(cfg.n_layers - 1):
@@ -75,12 +81,14 @@ def _converged_self_coupling_per_coord(
     converged belief + last-block prior, then weight each coordinate's self-divergence by its
     OWN alpha^(k)* = c0/(b0 + D^(k)) (detached, the envelope-stationary value), sum over k, mean
     over (B, N). alpha^(k) is recomputed from the closed form here, not via ``self_coupling_alpha``,
-    so the test is an independent check of the formula forward applies."""
+    so the test is an independent check of the formula forward applies. Like
+    ``_converged_self_divergence`` it reads the pre-norm converged q* (``block_norm=None``)."""
     cfg = model.cfg
+    assert cfg.n_layers == 1, "the block_norm=None replay equals q* only for a single block"
     beliefs = model.prior_bank.encode(tokens)
     log_prior = model._attention_log_prior(tokens.shape[1], tokens.device)
     out = vfe_stack(beliefs, beliefs.mu, beliefs.sigma, model.group, cfg,
-                    log_prior=log_prior, block_norm=model.block_norm)
+                    log_prior=log_prior, block_norm=None)
     rho, rho_s = cfg.prior_handoff_rho, cfg.prior_handoff_sigma
     mu_p, sigma_p = beliefs.mu, beliefs.sigma
     for _ in range(cfg.n_layers - 1):

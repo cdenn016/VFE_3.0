@@ -24,6 +24,7 @@ matplotlib.use("Agg")                                            # non-interacti
 import matplotlib.pyplot as plt
 
 from vfe3.families.base import get_functional_display
+from vfe3.metric_contracts import SCALING_MIN_TESTABLE_SIZES
 from vfe3.process_utils import ProcessTree, spawn_process_tree
 import numpy as np
 from matplotlib.colors import LogNorm
@@ -1912,7 +1913,7 @@ def plot_geometry_health(
             ("cocycle_residual", "cocycle residual", _CB[1]),
             ("holonomy_deviation", r"$\langle\|H-I\|_F\rangle$ (frame-dependent)", _CB[2])]},
         {"title": "Gauge-frame spread", "ylabel": "spread", "series": [
-            ("gauge_invariant_spread", "gauge invariant", _CB[3]),
+            ("gauge_invariant_spread", "frame class-function spread", _CB[3]),
             ("gauge_head_logdet_spread", r"head $\log|\det|$", _CB[4])]},
         {"title": "Gauge-frame magnitude", "ylabel": r"$\|\phi\|$", "series": [
             ("phi_norm_mean", r"mean $\|\phi\|$", _CB[0]),
@@ -1955,7 +1956,7 @@ def plot_geometry_health(
             ("guard_selfdiv_klmax_frac", "selfdiv klmax", _CB[4])]},
         {"title": "Numerical safety", "ylabel": "fraction", "series": [
             ("nonfinite_frac", "nonfinite", _CB[1]),
-            ("renyi_band_frac", "Renyi band", _CB[5])]},
+            ("renyi_band_frac", "energy near kl_max", _CB[5])]},
         {"title": "Attention-entropy collapse", "ylabel": "count / nats", "series": [
             ("attn_entropy_collapsed_heads", "collapsed heads", _CB[0]),
             ("attn_entropy_min", "min row entropy", _CB[3])]},
@@ -2032,11 +2033,11 @@ def plot_validation_sanity(
             ("val_prev_token_mass", "prev-token", _CB[0]),
             ("val_period_match_mass", "period-match", _CB[1]),
             ("val_head_redundancy_js", "redundancy JS", _CB[2])]},
-        {"title": "Held-out flatness", "ylabel": "curvature", "logy": True, "series": [
+        {"title": "Held-out closure residual (roundoff)", "ylabel": "closure residual", "logy": True, "series": [
             ("val_holonomy_wilson", "Wilson holonomy (gauge-invariant)", _CB[0]),
             ("val_cocycle_residual", "cocycle residual", _CB[1])]},
         {"title": "Held-out gauge spread", "ylabel": "spread",
-         "series": [("val_gauge_invariant_spread", "gauge invariant", _CB[3])]},
+         "series": [("val_gauge_invariant_spread", "frame class-function spread", _CB[3])]},
         {"title": "Held-out conditioning", "ylabel": r"$\kappa(\Sigma)$", "logy": True,
          "series": [("val_belief_cond_p95", "p95", _CB[1])]},
         {"title": "Held-out precision", "ylabel": fisher_label,
@@ -3066,7 +3067,7 @@ def plot_per_layer_diagnostics(
     axes[0][1].set(xticks=x, xlabel="layer", ylabel="deviation", title="Holonomy / curvature by layer")
     axes[0][1].legend(fontsize=8, frameon=False)
     for k, c, lab in (("gauge_trace_spread", _CB[0], "tr spread"),
-                      ("gauge_invariant_spread", _CB[1], "group-invariant spread"),
+                      ("gauge_invariant_spread", _CB[1], "class-function spread"),
                       ("phi_norm_mean", _CB[2], r"mean $\|\phi\|$")):
         if k in per_layer:
             axes[1][0].plot(x, g(k), _m, color=c, lw=1.4, label=lab)
@@ -3229,8 +3230,9 @@ def plot_holonomy_curvature(
 ):
     r"""F10: holonomy / curvature with corrected sampling.
 
-    Panel A: per-triangle holonomy violins -- the flat cocycle spikes at eps (a flatness
-    certificate), a non-cocycle transport spreads to genuine curvature. Panel B: holonomy vs
+    Panel A: per-triangle holonomy violins -- the flat cocycle spikes at eps (roundoff of the
+    coboundary construction, not a flatness certificate), a non-cocycle transport spreads to
+    genuine curvature. Panel B: holonomy vs
     triangle span.
     Panel C (optional): the spatial curvature field for a fixed anchor.
     """
@@ -3385,27 +3387,35 @@ def plot_ablation_forest(
     rows: list,                          # [{label, delta, [lo], [hi]}] delta bits/token vs the full model
 
     *,
+    n_seeds: int = 1,                    # distinct training seeds the sweep declared
     path: Optional[str] = None,
 ):
     r"""F12 Panel A: baseline-ladder ablation forest of delta bits/token from the full model.
 
-    Each disabling ablation is a point with a paired bootstrap-over-tokens interval (single-seed
-    within-run, not a cross-seed CI), sorted by effect size; the zero line is the full model. The
-    axis is delta bits/token (paired per-token nats divided by ln 2), NOT the character-corrected
-    bits-per-character of the scaling figures.
+    Each disabling ablation is a point with a paired sequence-cluster bootstrap interval over the
+    shared validation stream, sorted by effect size; the zero line is the full model. The interval
+    is within-run uncertainty over the evaluation set only; it omits training-seed variance, so
+    unless the sweep declares at least 3 seeds the caption marks every arm as a single-seed
+    estimate. The axis is delta bits/token (paired per-token nats divided by ln 2), NOT the
+    character-corrected bits-per-character of the scaling figures.
     """
     rows = sorted(rows, key=lambda r: r["delta"])
     y = np.arange(len(rows))
     delta = np.array([r["delta"] for r in rows])
     lo = np.array([r.get("lo", r["delta"]) for r in rows])
     hi = np.array([r.get("hi", r["delta"]) for r in rows])
-    fig, ax = plt.subplots(figsize=(6.4, 0.5 * len(rows) + 1.5))
+    fig, ax = plt.subplots(figsize=(6.4, 0.5 * len(rows) + 1.8))
     ax.errorbar(delta, y, xerr=[delta - lo, hi - delta], fmt="o", color=_CB[0],
                 ecolor="#888888", capsize=3)
     ax.axvline(0.0, color="#444444", ls="--", lw=1)
     ax.set_yticks(y)
     ax.set_yticklabels([r["label"] for r in rows])
-    ax.set(xlabel=r"$\Delta$ bits/token vs full model", title="Component ablations (paired token bootstrap)")
+    # The caption rides in the title block: the ablation driver adds its own bottom disclosure.
+    caption = ("single-seed arms: within-run eval-set uncertainty only, no training-seed variance"
+               if int(n_seeds) < 3 else
+               f"{int(n_seeds)} seeds: per-cell within-run eval-set uncertainty")
+    ax.set(xlabel=r"$\Delta$ bits/token vs full model")
+    ax.set_title(f"Component ablations (paired sequence bootstrap)\n{caption}", fontsize=9)
     fig.tight_layout()
     return _save(fig, path)
 
@@ -3637,7 +3647,8 @@ def plot_scaling_law(
     error bars, the fitted power law overlaid, and a residual subpanel.
 
     The fit is a (SEM-weighted) log-log least squares ``L = A N^{-alpha}`` (or the Chinchilla
-    ``E + A N^{-alpha}`` when ``with_offset``); the exponent ``alpha`` and ``R^2`` are annotated.
+    ``E + A N^{-alpha}`` when ``with_offset``); the exponent ``alpha`` is annotated, and ``R^2`` only
+    from ``SCALING_MIN_TESTABLE_SIZES`` distinct sizes (fewer are labeled "not testable").
     The residual panel plots ``log(mean / fit)`` against ``log N`` -- systematic curvature there is
     the signature of a pre-asymptotic (not-yet-power-law) regime. The point count is annotated so a
     two-or-three-size fit is never read as more precise than it is."""
@@ -3655,7 +3666,12 @@ def plot_scaling_law(
         fit = _fit_power_law(st["x"], st["mean"], weights=w, with_offset=with_offset)
         xx = np.geomspace(st["x"].min(), st["x"].max(), 100)
         yy = fit["E"] + fit["A"] * np.power(xx, -fit["alpha"])
-        lbl = (rf"fit $\alpha$={fit['alpha']:.3f}, $R^2$={fit['r2']:.3f}"
+        # Below SCALING_MIN_TESTABLE_SIZES distinct sizes the curve has <= 1 residual dof, so R^2
+        # (exactly 1 at two sizes) tests nothing: annotate "not testable" instead of printing it.
+        testable = int(fit["n_distinct_sizes"]) >= SCALING_MIN_TESTABLE_SIZES
+        lbl = (rf"fit $\alpha$={fit['alpha']:.3f}, "
+               + (rf"$R^2$={fit['r2']:.3f}" if testable
+                  else f"not testable (<{SCALING_MIN_TESTABLE_SIZES} sizes)")
                + (f", E={fit['E']:.3f}" if fit["form"] == "offset_power_law" else "")
                + f", {_scaling_fit_form_label(fit['form'])}")
         ax.plot(xx, yy, "--", color="#444444", lw=1.6, label=lbl, zorder=4)
@@ -4003,6 +4019,20 @@ def plot_reliability_diagram(
     return _save(fig, path)
 
 
+def _sigma_trace_labels(frozen_covariance: bool) -> Dict[str, str]:
+    r"""Axis / title wording for tr Sigma: belief uncertainty only when the covariance is live.
+
+    On a route whose covariance is frozen at encode (``metrics.covariance_frozen_at_encode``) the
+    trace is the input token's table variance tr Sigma(x_i), so the figures relabel it as such."""
+    if frozen_covariance:
+        return {"quantity": "input-token variance",
+                "axis": r"input-token variance tr$\,\Sigma(x_i)$",
+                "bin": "tr Sigma(x_i)"}
+    return {"quantity": "belief uncertainty",
+            "axis": r"belief uncertainty tr$(\Sigma_q)$",
+            "bin": "tr(Sigma_q)"}
+
+
 @register_figure("sigma_stratified_error")
 def plot_sigma_stratified_error(
     bank: Dict,                          # belief_ce_bank: tr_sigma (M,), ce (M,)
@@ -4010,6 +4040,7 @@ def plot_sigma_stratified_error(
     *,
     n_bins:  int = 10,
     n_boot:  int = 400,
+    frozen_covariance: bool = False,     # covariance frozen at encode -> input-token variance labels
     path:    Optional[str] = None,
 ):
     r"""B1/EXP-3: held-out CE stratified by belief uncertainty tr(Sigma_q) (decile bins).
@@ -4018,7 +4049,12 @@ def plot_sigma_stratified_error(
     monotonically across increasing-tr(Sigma_q) bins. Tokens are split into ``n_bins`` equal-count
     quantile bins of tr(Sigma_q); each point is that bin's mean CE with a bootstrap 10-90 band
     (``n_boot`` resamples, fixed seed -> deterministic). A flat curve means the covariance channel is
-    inert (see the CV>0.10 gate)."""
+    inert (see the CV>0.10 gate). With ``frozen_covariance`` the trace is the input token's table
+    variance tr Sigma(x_i), so the figure is titled next-token CE by input-token variance: a
+    type-level association, not a calibration of belief uncertainty."""
+    labels = _sigma_trace_labels(frozen_covariance)
+    title = (f"Next-token CE by {labels['quantity']}" if frozen_covariance
+             else f"CE stratified by {labels['quantity']}")
     tr = _np(bank["tr_sigma"]).ravel()
     ce = _np(bank["ce"]).ravel()
     fig, ax = plt.subplots(figsize=(6.2, 4.4))
@@ -4036,13 +4072,13 @@ def plot_sigma_stratified_error(
             boot = cb[rng.integers(0, cb.size, size=(n_boot, cb.size))].mean(axis=1)
             los.append(float(np.percentile(boot, 10)))
             his.append(float(np.percentile(boot, 90)))
-        ax.plot(xs, ms, "o-", color=_CB[0], lw=1.8, label="mean CE per tr(Sigma_q) decile")
+        ax.plot(xs, ms, "o-", color=_CB[0], lw=1.8, label=f"mean CE per {labels['bin']} decile")
         ax.fill_between(xs, los, his, color=_CB[0], alpha=0.2, label="bootstrap 10-90 band")
         rho = _spearman_np(tr, ce)
-        ax.set_title(f"CE stratified by belief uncertainty  (Spearman rho={rho:+.3f})")
+        ax.set_title(f"{title}  (Spearman rho={rho:+.3f})")
     else:
-        ax.set_title("CE stratified by belief uncertainty (insufficient tokens)")
-    ax.set(xlabel=r"belief uncertainty tr$(\Sigma_q)$", ylabel="cross-entropy (nats)")
+        ax.set_title(f"{title} (insufficient tokens)")
+    ax.set(xlabel=labels["axis"], ylabel="cross-entropy (nats)")
     ax.legend(fontsize=8, frameon=False)
     fig.tight_layout()
     return _save(fig, path)
@@ -4053,13 +4089,16 @@ def plot_sigma_ce_scatter(
     bank: Dict,                          # belief_ce_bank: tr_sigma (M,), ce (M,)
 
     *,
+    frozen_covariance: bool = False,     # covariance frozen at encode -> input-token variance labels
     path: Optional[str] = None,
 ):
     r"""B1/EXP-3: per-token tr(Sigma_q) vs CE hexbin with the Spearman rho in the title.
 
     The raw joint distribution behind the stratified curve -- the headline statistic rho(tr Sigma_q,
     CE) is the rank correlation; a positive tilt means more-uncertain beliefs are harder tokens
-    (the calibration channel carries signal)."""
+    (the calibration channel carries signal). With ``frozen_covariance`` the trace is the input
+    token's table variance tr Sigma(x_i) and the axes say so."""
+    labels = _sigma_trace_labels(frozen_covariance)
     tr = _np(bank["tr_sigma"]).ravel()
     ce = _np(bank["ce"]).ravel()
     fig, ax = plt.subplots(figsize=(6.0, 4.6))
@@ -4067,8 +4106,11 @@ def plot_sigma_ce_scatter(
         hb = ax.hexbin(tr, ce, gridsize=40, bins="log", cmap="viridis", mincnt=1)
         fig.colorbar(hb, ax=ax, fraction=0.046, pad=0.02, label="tokens (log)")
     rho = _spearman_np(tr, ce) if tr.size >= 2 else float("nan")
-    ax.set(xlabel=r"belief uncertainty tr$(\Sigma_q)$", ylabel="cross-entropy (nats)")
-    ax.set_title(rf"$\mathrm{{tr}}(\Sigma_q)$ vs CE  (Spearman $\rho$={rho:+.3f}, n={tr.size})")
+    ax.set(xlabel=labels["axis"],
+           ylabel=("next-token cross-entropy (nats)" if frozen_covariance
+                   else "cross-entropy (nats)"))
+    trace_symbol = r"$\mathrm{tr}\,\Sigma(x_i)$" if frozen_covariance else r"$\mathrm{tr}(\Sigma_q)$"
+    ax.set_title(trace_symbol + rf" vs CE  (Spearman $\rho$={rho:+.3f}, n={tr.size})")
     fig.tight_layout()
     return _save(fig, path)
 
@@ -4548,14 +4590,14 @@ PUB_LABELS: Dict[str, str] = {
     "corpus_freq_strata_ce.frequent": r"$\mathrm{CE}_{\mathrm{frequent}}$ (nats)",
     # -- geometry-health dashboard (gauge / SPD / Fisher / guard) --
     "holonomy_wilson":         r"Wilson holonomy $1-\mathrm{Re}\,\mathrm{Tr}(H)/K$ (gauge-invariant)",
-    "cocycle_residual":        "cocycle residual (flatness)",
-    "gauge_invariant_spread":  r"gauge-invariant spread $\mathrm{std}_i\,I(\exp\phi_i)$",
+    "cocycle_residual":        "cocycle residual (roundoff)",
+    "gauge_invariant_spread":  r"frame class-function spread $\mathrm{std}_i\,I(\exp\phi_i)$",
     "phi_norm_mean":           r"gauge-frame norm $\langle\|\phi_i\|\rangle$",
     "belief_cond_p95":         r"belief conditioning $\kappa_{95}(\Sigma)$",
     "eff_rank_median":         r"belief effective rank $\mathrm{med}_i\,\mathrm{erank}(\Sigma_i)$",
     "fisher_trace_median":     r"Half Fisher trace $\mathrm{med}_i\mathrm{tr}(I_{\mu,i})/2$",
     "nonfinite_frac":          "non-finite fraction",
-    "renyi_band_frac":         "Renyi cancellation-band fraction",
+    "renyi_band_frac":         "pair-energy fraction in (0.9, 1.0) kl_max",
     "attn_entropy_min":        r"min row entropy $\min_{i,h}H(\beta)$",
     "attn_entropy_collapsed_heads": "collapsed-head count",
     # -- E-step inference quality --
@@ -4608,22 +4650,34 @@ def plot_ppl_noise_band(
     *,
     label: str  = "K=20 baseline",
     grid:  Optional[Dict] = None,        # optional {ablation label: single-seed ppl} overlay
+    data_order_status: Optional[str] = None,   # multiseed data_order["status"], e.g. 'shared_explicit'
     path:  Optional[str]  = None,
 ):
-    r"""I1/EXP-1: per-seed test PPL with the across-seed mean ± 1 SD (and ± 2 SD) band -- the seed
-    noise floor every ablation 'win' must clear.
+    r"""I1/EXP-1: per-seed test PPL with the across-seed mean ± 1 SD and a 95% prediction band --
+    the seed noise floor every ablation 'win' must clear.
 
-    The band is the init+optimization spread (the per-run reseed shares the data order; a lower bound
-    on deployment variance). An optional ``grid`` overlays single-seed ablation cells so a referee can
-    read directly whether a cell's margin exceeds the band."""
+    The outer band is the two-sided 95% prediction interval for ONE new run from the same seed
+    distribution,
+
+    .. math:: \bar{x} \pm t_{n-1,\,0.975}\, s \sqrt{1 + 1/n},
+
+    since :math:`(X_{\mathrm{new}} - \bar{x}) / (s\sqrt{1 + 1/n}) \sim t_{n-1}`; a fixed ± 2 SD covers
+    only 77.5% of new runs at n=3 and 86% at n=5. The band is the init+optimization spread; when the
+    runs share one explicit data order (``data_order_status='shared_explicit'``) it omits data-order
+    variance and is a lower bound on deployment variance, which the caption states. An optional
+    ``grid`` overlays single-seed ablation cells so a referee can read directly whether a cell's
+    margin exceeds the band."""
     vals = np.asarray(agg.get("values", []), float)
     mean, sd = float(agg.get("mean", float("nan"))), float(agg.get("sd", float("nan")))
+    n = int(agg.get("n", vals.size) or vals.size)
     disp = pub_label(label)
     fig, ax = plt.subplots(figsize=(7.0, 4.4))
     if np.isfinite(mean):
         ax.axhline(mean, color=_CB[0], lw=1.6, label=f"mean={mean:.3f}")
-        if np.isfinite(sd):
-            ax.axhspan(mean - 2 * sd, mean + 2 * sd, color=_CB[0], alpha=0.08, label="±2 SD")
+        if np.isfinite(sd) and n >= 2:
+            half_width = _t95(n) * sd * np.sqrt(1.0 + 1.0 / n)
+            ax.axhspan(mean - half_width, mean + half_width, color=_CB[0], alpha=0.08,
+                       label=rf"95% prediction ($t_{{{n - 1}}}$)")
             ax.axhspan(mean - sd, mean + sd, color=_CB[0], alpha=0.18, label="±1 SD")
     seeds = agg.get("seeds", list(range(vals.size))) or list(range(vals.size))
     xs = np.arange(vals.size)
@@ -4637,7 +4691,12 @@ def plot_ppl_noise_band(
     ax.set_xticks(ticks)
     ax.set_xticklabels(ticklabels, rotation=45, ha="right", fontsize=7)
     ax.set(xlabel="seed / cell", ylabel=disp)
-    ax.set_title("Multi-seed variance floor (init + optimization spread)")
+    caption = ("runs share one explicit data order: the spread omits data-order variance "
+               "(a lower bound on deployment variance)"
+               if data_order_status == "shared_explicit" else
+               "data-order sharing not recorded" if data_order_status is None else
+               "data order varies or is unspecified across runs")
+    ax.set_title(f"Multi-seed variance floor (init + optimization spread)\n{caption}", fontsize=9)
     ax.legend(fontsize=8, frameon=False)
     fig.tight_layout()
     return _save(fig, path)

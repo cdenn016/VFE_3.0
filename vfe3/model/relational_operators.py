@@ -1,5 +1,6 @@
 r"""Role-specific comparison and content operators in realized canonical frames."""
 
+import math
 from typing import List, Optional, Tuple
 
 import torch
@@ -17,17 +18,20 @@ class RelationalOperators(nn.Module):
     Independent maps are free matrices initialized with orthonormal rows.
     Their projected covariances must remain strictly positive definite.
     ``identity_content`` drops T/O and carries the transported belief unchanged.
+    ``output_init_scale`` multiplies the initial output map, :math:`O_h(0) = s\,I_d` (placed on its
+    head block under full output scope); ``s = 1`` is the identity start.
     """
 
     def __init__(
         self,
         irrep_dims:            List[int],
         seed:                  int,
-        input_scope:           str = "head",
-        readout_mode:          str = "conditional_update",
-        output_scope:          str = "head",
-        attention_residual:    bool = False,
-        identity_content:      bool = False,
+        input_scope:           str   = "head",
+        readout_mode:          str   = "conditional_update",
+        output_scope:          str   = "head",
+        attention_residual:    bool  = False,
+        identity_content:      bool  = False,
+        output_init_scale:     float = 1.0,
     ) -> None:
         super().__init__()
         if not irrep_dims or any(type(d) is not int or d < 1 for d in irrep_dims) or len(set(irrep_dims)) != 1:
@@ -37,6 +41,10 @@ class RelationalOperators(nn.Module):
             raise ValueError("relational seed must be an integer")
         if type(identity_content) is not bool:
             raise ValueError("identity_content must be a bool")
+        if (isinstance(output_init_scale, bool) or not isinstance(output_init_scale, (int, float))
+                or not math.isfinite(output_init_scale) or output_init_scale <= 0.0):
+            raise ValueError(
+                f"output_init_scale must be finite and positive, got {output_init_scale!r}")
         if attention_residual and readout_mode != "predictive_content":
             raise ValueError("attention residual requires predictive_content")
         self.attention_residual = attention_residual
@@ -69,7 +77,7 @@ class RelationalOperators(nn.Module):
             self.register_parameter("O", None)
         else:
             self.T = nn.Parameter(eye.clone())
-            self.O = nn.Parameter(eye.clone())
+            self.O = nn.Parameter(eye.clone() * float(output_init_scale))
         if input_scope == "full" and self.T is not None:
             # Preserve the local identity/projector start; all input columns train.
             T_full = self.T.new_zeros(H, d, H * d)

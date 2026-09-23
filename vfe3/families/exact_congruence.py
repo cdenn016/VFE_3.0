@@ -46,12 +46,23 @@ log-determinants.
 REFERENCE (dense pairwise ``omega``). :math:`\Omega_{ij}^{-1}` is formed explicitly and the pair
 log-determinants are taken per block. This assumes nothing about the connection, so it is the
 correctness oracle the fast route is pinned against, but it is :math:`O(N^2K^3)` and only sensible
-where the caller has already materialized the dense operator.
+where the caller has already materialized the dense operator. A vertex-factored container that does
+NOT certify a same-frame cocycle (a query/key-split frame, e.g. the filtering phi objective's
+sender-detached transport) takes this route through its exact dense operator, the product of its
+stored query and key factors, because the transpose identity is unavailable for it.
+
+RoPE (audit 2026-09-23 #21). A right-insertion :class:`~vfe3.geometry.transport.RopeTransport`
+is scored through its folded vertex frame :math:`V_i = U_i R_i^{\top}` for BOTH moments, i.e. the
+coherent :math:`\mathrm{KL}(q_i \| \Omega^{V}_{ij\#} q_j)` with
+:math:`\Omega^{V}_{ij} = V_i V_j^{-1}`. The pullback identity requires a single operator, so the
+means-only split (mean under :math:`\Omega^V`, covariance under the un-rotated base) has no exact
+diagonal form here; the former fast route mixed the two operators and matched neither energy. A
+left-insertion wrapper has no vertex frame and still raises.
 
 SCOPE. The identity above is specific to KL: for a Renyi order other than one the blend
 :math:`(1-\alpha)\Sigma_1 + \alpha\Sigma_2` mixes a dense covariance with a diagonal one and does
-not reduce. A non-KL divergence, a non-flat or RoPE-wrapped transport, and an uncertified factored
-cocycle all raise rather than silently falling back to the truncated energy.
+not reduce. A non-KL divergence and a transport that exposes neither a dense operator nor vertex
+factors raise rather than silently falling back to the truncated energy.
 """
 
 from typing import List, Optional, Tuple
@@ -118,10 +129,8 @@ def _vertex_log_abs_det(
 
     # A gauge-RoPE wrapper rotates by an ORTHOGONAL R (rope.py builds it block-diagonally from 2x2
     # rotations), so |det(R_i Omega_ij R_j^T)| = |det Omega_ij| and the per-vertex ell_i - ell_j
-    # identity is unchanged. `_certifies_same_frame_flat_cocycle` already recurses into the wrapper
-    # and returns True, so `_pullback_query` takes the fast route -- and then landed on the "no
-    # vertex factors" raise below, making family='gaussian_diagonal_exact' + pos_rotation='rope' a
-    # config-accepted first-forward crash (audit 2026-07-26 E-02). Unwrap to the base instead.
+    # identity is unchanged (audit 2026-07-26 E-02). `_pullback_query` now hands this helper the
+    # folded frame itself; a wrapper that still reaches here is unwrapped to its base.
     if isinstance(omega, RopeTransport):
         omega = omega.base
 
@@ -170,10 +179,32 @@ def _pullback_query(
     """
     from vfe3.geometry.lie_ops import _equal_diag_blocks
     from vfe3.geometry.transport import (
+        CompactFactoredTransport,
+        FactoredTransport,
+        RopeTransport,
         _certifies_same_frame_flat_cocycle,
         transport_covariance,
         transport_mean,
     )
+
+    if isinstance(omega, RopeTransport):
+        # Coherent RoPE (audit 2026-09-23 #21): pull BOTH moments back through the one operator the
+        # score transports under, the folded frame V_i = U_i R_i^T. The former route pulled the mean
+        # back through V and the covariance through the un-rotated base U, an energy that equals
+        # neither KL(q_i || Omega^V# q_j) nor the means-only hybrid.
+        certified = _certifies_same_frame_flat_cocycle(omega)
+        folded = omega.score_operator()
+        if folded is None:
+            raise TypeError(
+                "exact-congruence coupling cannot invert a left-insertion RoPE transport: it has no "
+                "vertex frame, so neither the pair-transpose inverse nor a single dense operator is "
+                "available. Use rope_insertion='right' or family='gaussian_diagonal'.")
+        omega = folded if certified else folded.to_dense_omega()
+    if isinstance(omega, (CompactFactoredTransport, FactoredTransport)) and (
+            not omega.same_frame_flat_cocycle):
+        # A query/key-split vertex frame has no pair-transpose inverse; invert its exact dense
+        # operator on the reference route instead of failing (audit 2026-09-23 #6).
+        omega = omega.to_dense_omega()
 
     if isinstance(omega, torch.Tensor):
         # Reference route: invert the dense operator outright, assuming nothing about the connection.

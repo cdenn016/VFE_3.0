@@ -16,38 +16,54 @@ from vfe3.relational_scoring import projected_moments, projected_gaussian_kl
 
 
 def relational_score(
-    mu:       torch.Tensor,
-    sigma:    torch.Tensor,
-    source_mu: torch.Tensor,
-    source_sigma: torch.Tensor,
-    frame:    CanonicalFrameContext,
-    operators: RelationalOperators,
-    capture: Optional[Dict[str, Any]] = None,
-) -> torch.Tensor:
-    r"""Compute KL(S_Q U_Qi^-1 q_i || S_K U_Kj^-1 q_j), retaining full reduced covariance."""
+    mu:           torch.Tensor,                        # (..., N, K) receiver (query) means
+    sigma:        torch.Tensor,                        # (..., N, K) diagonal or (..., N, K, K) full covariance
+    source_mu:    torch.Tensor,                        # (..., N, K) source (key) means
+    source_sigma: torch.Tensor,                        # (..., N, K) or (..., N, K, K), same layout as sigma
+    frame:        CanonicalFrameContext,               # (..., N, H, d, d) compact or (..., N, K, K) dense
+    operators:    RelationalOperators,
+    capture:      Optional[Dict[str, Any]] = None,     # out-param: pre-update projected covariances
+) -> torch.Tensor:                                     # (..., H, N, N) projected KL scores
+    r"""Compute KL(S_Q U_i^{-1} q_i || S_K U_j^{-1} q_j), retaining full reduced covariance.
+
+    The comparison reads each head's canonical coordinates through the head blocks of
+    :math:`U^{-1}`, which equal the full canonical coordinates only when :math:`U^{-1}` is
+    block-diagonal. A dense-layout frame is therefore admitted only when its inverse has no
+    off-diagonal head block; a genuinely dense frame is rejected rather than silently truncated, since
+    the content side (``canonical_mean`` / ``predictive_content``) always applies the full inverse.
+    """
     H, d = len(operators.irrep_dims), operators.irrep_dims[0]
     inverse = frame.inverse
     if not frame.block_diagonal:
+        if H > 1:
+            with torch.no_grad():
+                block_mask = torch.block_diag(
+                    *(torch.ones(d, d, dtype=torch.bool, device=inverse.device) for _ in range(H)))
+                if bool((inverse.detach()[..., ~block_mask] != 0).any()):       # one host sync
+                    raise ValueError(
+                        "relational_score requires a head-block-diagonal frame: the dense frame "
+                        "inverse couples gauge heads, and scoring its diagonal blocks would disagree "
+                        "with the full-inverse content readout")
         inverse = torch.stack(
-            [inverse[..., h*d:(h+1)*d, h*d:(h+1)*d] for h in range(H)], dim=-3)
+            [inverse[..., h*d:(h+1)*d, h*d:(h+1)*d] for h in range(H)], dim=-3)     # (..., N, H, d, d)
     # Both roles read the one shared frame: there is no separate key-side inverse.
     key_inverse = inverse
     if operators.input_scope == "full":
         # Broadcast the same whole belief to readout heads; gauge blocks stay compact.
-        mu_h, source_mu_h = (
+        mu_h, source_mu_h = (                                                   # (..., N, H, K)
             x.unsqueeze(-2).expand(*x.shape[:-1], H, H*d) for x in (mu, source_mu))
-        sigma_h, source_sigma_h = (
+        sigma_h, source_sigma_h = (                                             # (..., N, H, K[, K])
             x.unsqueeze(-3).expand(*x.shape[:-2], H, H*d, H*d)
             if x.ndim == mu.ndim + 1 else x.unsqueeze(-2).expand(*x.shape[:-1], H, H*d)
             for x in (sigma, source_sigma))
     else:
-        mu_h, source_mu_h = (
+        mu_h, source_mu_h = (                                                   # (..., N, H, d)
             x.reshape(*x.shape[:-1], H, d) for x in (mu, source_mu))
-        sigma_h, source_sigma_h = (
+        sigma_h, source_sigma_h = (                                             # (..., N, H, d[, d])
             torch.stack([x[..., h*d:(h+1)*d, h*d:(h+1)*d] for h in range(H)], dim=-3)
             if x.ndim == mu.ndim + 1 else x.reshape(*x.shape[:-1], H, d)
             for x in (sigma, source_sigma))
-    S_q, S_k = operators.comparison_pair()
+    S_q, S_k = operators.comparison_pair()                                     # each (H, d, input_dim)
     if mu is source_mu and sigma is source_sigma and inverse is key_inverse:
         # Predictive readout scores a belief against itself: one batched projection over both
         # comparison maps. S_q and S_k still differ, so two L = S U^-1 maps are formed, but the
@@ -56,7 +72,7 @@ def relational_score(
         a_q, G_q = a[0], G[0]
         a_k, G_k = a[1], G[1]
     else:
-        a_q, G_q = projected_moments(mu_h, sigma_h, inverse, S_q)
+        a_q, G_q = projected_moments(mu_h, sigma_h, inverse, S_q)              # (..., N, H, d), (..., N, H, d, d)
         a_k, G_k = projected_moments(source_mu_h, source_sigma_h, key_inverse, S_k)
     if capture is not None:
         capture["projected_covariance_pre"] = G_q.detach()

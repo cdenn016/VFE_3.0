@@ -6,10 +6,11 @@ the Lie-algebra retraction. A config-selected registry of metrics:
                      gradient lives in the Lie algebra g, a vector space).
   clip               norm-clip baseline grad * min(1, c / ||grad||).
   killing            Cartan-involution metric g~ = 2K*gram - 2*tr(x)tr(.), center-
-                     regularized then inverted (natural gradient grad @ g~^{-1}).
+                     regularized then inverted (Killing-form-preconditioned gradient
+                     grad @ g~^{-1}).
   killing_per_block  block-diagonal Killing metric (per irrep block).
-  pullback           position-dependent natural gradient via the differential of
-                     the exponential map: G_ab(phi) = <d exp_phi(T_a), d exp_phi(T_b)>_F.
+  pullback           Riemannian gradient under the Frobenius-pullback metric of the
+                     exponential map: G_ab(phi) = <d exp_phi(T_a), d exp_phi(T_b)>_F.
   pullback_per_block per-irrep-block pullback metric (each block's local d_h-dim rep;
                      feasible at K > max_k where the full pullback raises).
 Coordinates in, coordinates out (..., n_gen) -- same units as retract_phi's
@@ -19,10 +20,16 @@ generator TENSOR, not a GaugeGroup.
 Gauge-equivariance caveat (killing / killing_per_block): the Cartan-involution
 metric uses the Frobenius form tr(G_a^T G_b), which is Ad-invariant only under
 the COMPACT subgroup (tr((gXg^-1)^T gYg^-1) = tr(X^T Y) iff g^T g = I). So the
-Killing-preconditioned natural gradient is gauge-equivariant under SO(N) but NOT
+Killing-form-preconditioned gradient is gauge-equivariant under SO(N) but NOT
 under general GL(K) in the non-compact (symmetric) directions; it is a left-/
 Ad(K)-invariant metric, not a bi-invariant one. The pullback metric is the
 position-dependent alternative for the non-compact regime.
+
+Neither conditioner is a natural gradient in Amari's sense (Amari 1998, Neural Computation
+10(2)): the Frobenius pullback is the ambient flat form pulled back through d exp, and the
+Killing form is Ad(K)-invariant only on the compact subgroup. Neither is a Fisher metric of a
+statistical model over phi, so both are extrinsic preconditioners; "natural gradient" is reserved
+for the Gaussian-belief Fisher step (``retraction.natural_gradient``).
 """
 
 from collections import OrderedDict
@@ -35,7 +42,7 @@ from typing import Callable, Dict, List, Optional
 
 import torch
 
-from vfe3.geometry.lie_ops import gram_pinv, warn_if_basis_not_closed
+from vfe3.geometry.lie_ops import extract_phi, gram_pinv, warn_if_basis_not_closed
 from vfe3.numerics import safe_eigvalsh
 
 _PRECOND: Dict[str, Callable[..., torch.Tensor]] = {}
@@ -52,6 +59,9 @@ class PullbackGroupDirectionResult:
     series_order:                        int
     # Full (..., d, d), or equal direct-sum blocks (..., H, d, d).
     current_element:                     Optional[torch.Tensor] = None
+    # (...) bool, set only under reject_ill_conditioned_rows: rows whose metric passed the
+    # undamped-eigenvalue floor and the damped-condition gate. Rejected rows carry v_phi = xi = 0.
+    accepted_rows:                       Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +88,7 @@ class _MixedPhiDifferentialOrder(ValueError):
 _PHI_GROUP_DIRECTIONS: Dict[str, Callable[..., PullbackGroupDirectionResult]] = {}
 _PHI_GROUP_DIRECTION_ACCEPTS_COORDINATE_LAYOUT: Dict[str, bool] = {}
 _PHI_GROUP_DIRECTION_ACCEPTS_DIFFERENTIAL_MODE: Dict[str, bool] = {}
+_PHI_GROUP_DIRECTION_ACCEPTS_ROW_REJECTION: Dict[str, bool] = {}
 _PHI_GROUP_DIRECTION_REQUIRES_SOURCE_BASIS: Dict[str, bool] = {}
 
 # Candidate orders at which the tail certificate below is TESTED. The floor is not a precision
@@ -202,12 +213,22 @@ def register_phi_group_direction(
                 or parameter.kind is inspect.Parameter.VAR_KEYWORD
                 for parameter in parameters
             )
+            accepts_row_rejection = any(
+                parameter.name == "reject_ill_conditioned_rows"
+                and parameter.kind in (
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                )
+                for parameter in parameters
+            )
         except (TypeError, ValueError):
             accepts_coordinate_layout = False
             accepts_differential_mode = False
+            accepts_row_rejection = False
         _PHI_GROUP_DIRECTIONS[name] = fn
         _PHI_GROUP_DIRECTION_ACCEPTS_COORDINATE_LAYOUT[name] = accepts_coordinate_layout
         _PHI_GROUP_DIRECTION_ACCEPTS_DIFFERENTIAL_MODE[name] = accepts_differential_mode
+        _PHI_GROUP_DIRECTION_ACCEPTS_ROW_REJECTION[name] = accepts_row_rejection
         _PHI_GROUP_DIRECTION_REQUIRES_SOURCE_BASIS[name] = bool(preserve_source_basis)
         return fn
     return _wrap
@@ -234,12 +255,19 @@ def pullback_group_direction(
     coordinate_layout: Optional[str]       = None,
     differential_mode: Optional[str]       = None,
     irrep_dims:        Optional[List[int]] = None,
+    reject_ill_conditioned_rows: bool      = False,  # per-row rejection instead of a whole-batch raise
 ) -> PullbackGroupDirectionResult:
     r"""Return the strict M-step direction in an autocast-disabled float64 island.
 
     The chart covector is solved against the Gram-relative pullback system
     ``(J(phi)^T J(phi) + 1e-6 B) v_phi = grad_phi`` and then converted to the
     left-trivialized group velocity ``xi = Psi_L(ad_phi) v_phi``.
+
+    ``reject_ill_conditioned_rows=True`` (audit 2026-09-23 #10; the optimizer's staging route)
+    turns the undamped-eigenvalue floor and the ``1e6`` damped-condition gate into a per-row
+    verdict: failing rows return ``v_phi = xi = 0`` and ``accepted_rows`` marks the rest. A
+    nonfinite metric spectrum, and a Cholesky or solve-residual failure on an ACCEPTED row, still
+    raise. The default keeps the whole-batch fail-closed contract.
     """
     with torch.autocast(device_type=grad_phi.device.type, enabled=False):
         direction = get_phi_group_direction(mode)
@@ -250,6 +278,8 @@ def pullback_group_direction(
             raise ValueError(f"invalid phi group differential mode {differential_mode!r}")
         if _PHI_GROUP_DIRECTION_ACCEPTS_DIFFERENTIAL_MODE.get(mode, False):
             kwargs["differential_mode"] = differential_mode
+        if reject_ill_conditioned_rows and _PHI_GROUP_DIRECTION_ACCEPTS_ROW_REJECTION.get(mode, False):
+            kwargs["reject_ill_conditioned_rows"] = True
         direction_generators = (
             generators
             if _PHI_GROUP_DIRECTION_REQUIRES_SOURCE_BASIS.get(mode, False)
@@ -738,6 +768,7 @@ def _chunked_pullback_group_direction(
     differential_mode:  str,
     rows_per_chunk:     int,
     fixed_series_order: Optional[int] = None,
+    reject_ill_conditioned_rows: bool = False,
 ) -> PullbackGroupDirectionResult:
     r"""Bound dense workspaces while preserving the local batch series order.
 
@@ -756,6 +787,7 @@ def _chunked_pullback_group_direction(
         return _full_pullback_group_direction(
             grad_chunks[index], phi_chunks[index], preparation.basis,
             differential_mode=mode, fixed_series_order=order, preparation=preparation,
+            reject_ill_conditioned_rows=reject_ill_conditioned_rows,
         )
 
     results = [evaluate(i, differential_mode, fixed_series_order) for i in range(len(phi_chunks))]
@@ -782,6 +814,7 @@ def _chunked_pullback_group_direction(
         scaled_solve_residual=combine("scaled_solve_residual", ()),
         series_order=order,
         current_element=combine("current_element", (dimension, dimension)),
+        accepted_rows=(combine("accepted_rows", ()) if reject_ill_conditioned_rows else None),
     )
 
 
@@ -795,6 +828,7 @@ def _full_pullback_group_direction(
     differential_mode:            Optional[str]                    = None,
     fixed_series_order:           Optional[int]                    = None,
     preparation:                  Optional[_StrictBasisPreparation] = None,
+    reject_ill_conditioned_rows:  bool                             = False,
 ) -> PullbackGroupDirectionResult:
     r"""Compute one certified full-block pullback direction.
 
@@ -822,6 +856,7 @@ def _full_pullback_group_direction(
             differential_mode=evaluation_mode,
             fixed_series_order=fixed_series_order,
             rows_per_chunk=rows_per_chunk,
+            reject_ill_conditioned_rows=reject_ill_conditioned_rows,
         )
     basis_64 = preparation.basis
     structure = preparation.structure
@@ -858,29 +893,43 @@ def _full_pullback_group_direction(
     min_undamped = undamped_eigenvalues[..., 0]
     max_undamped = undamped_eigenvalues[..., -1]
     undamped_condition = max_undamped / min_undamped
-    if not bool(torch.isfinite(undamped_eigenvalues).all()
-                & (min_undamped >= _PHI_GROUP_MIN_UNDAMPED_EIG).all()):
-        minimum = float(min_undamped.min())
-        raise ValueError(
-            "strict phi group direction undamped generalized eigenvalue "
-            f"{minimum:.3e} is below {_PHI_GROUP_MIN_UNDAMPED_EIG:.1e}"
-        )
     damped = metric + _PHI_GROUP_GRAM_RIDGE * gram
     damped_eigenvalues = undamped_eigenvalues + _PHI_GROUP_GRAM_RIDGE
     damped_condition = damped_eigenvalues[..., -1] / damped_eigenvalues[..., 0]
-    if (
-        not bool((torch.isfinite(damped_condition)
-                  & (damped_condition <= _PHI_GROUP_MAX_DAMPED_COND)).all())
-    ):
-        maximum = float(damped_condition.max())
-        raise ValueError(
-            "strict phi group direction damped generalized condition "
-            f"{maximum:.3e} exceeds {_PHI_GROUP_MAX_DAMPED_COND:.1e}"
-        )
+    accepted = None
+    if reject_ill_conditioned_rows:
+        # Per-row conditioning verdict (audit 2026-09-23 #10). Only a nonfinite spectrum raises.
+        if not bool(torch.isfinite(undamped_eigenvalues).all()):
+            raise ValueError("strict phi group direction produced a nonfinite metric spectrum")
+        accepted = ((min_undamped >= _PHI_GROUP_MIN_UNDAMPED_EIG)
+                    & torch.isfinite(damped_condition)
+                    & (damped_condition <= _PHI_GROUP_MAX_DAMPED_COND))
+    else:
+        if not bool(torch.isfinite(undamped_eigenvalues).all()
+                    & (min_undamped >= _PHI_GROUP_MIN_UNDAMPED_EIG).all()):
+            minimum = float(min_undamped.min())
+            raise ValueError(
+                "strict phi group direction undamped generalized eigenvalue "
+                f"{minimum:.3e} is below {_PHI_GROUP_MIN_UNDAMPED_EIG:.1e}"
+            )
+        if (
+            not bool((torch.isfinite(damped_condition)
+                      & (damped_condition <= _PHI_GROUP_MAX_DAMPED_COND)).all())
+        ):
+            maximum = float(damped_condition.max())
+            raise ValueError(
+                "strict phi group direction damped generalized condition "
+                f"{maximum:.3e} exceeds {_PHI_GROUP_MAX_DAMPED_COND:.1e}"
+            )
     factor, info = torch.linalg.cholesky_ex(damped)
-    if bool((info != 0).any()):
+    cholesky_failed = info != 0
+    if accepted is not None:
+        cholesky_failed = cholesky_failed & accepted
+    if bool(cholesky_failed.any()):
         raise ValueError("strict phi group direction damped Cholesky factorization failed")
     v_phi = torch.cholesky_solve(grad_64.unsqueeze(-1), factor).squeeze(-1)
+    if accepted is not None:
+        v_phi = torch.where(accepted.unsqueeze(-1), v_phi, torch.zeros_like(v_phi))
     residual = torch.linalg.vector_norm(
         torch.einsum("...ab,...b->...a", damped, v_phi) - grad_64,
         dim=-1,
@@ -896,18 +945,23 @@ def _full_pullback_group_direction(
         + torch.linalg.vector_norm(grad_64, dim=-1)
     )
     scaled_residual = residual / scale.clamp_min(torch.finfo(torch.float64).tiny)
-    if (
-        not bool((torch.isfinite(scaled_residual)
-                  & (scaled_residual <= _PHI_GROUP_SOLVE_RESIDUAL)).all())
-    ):
+    residual_bad = ~(torch.isfinite(scaled_residual)
+                     & (scaled_residual <= _PHI_GROUP_SOLVE_RESIDUAL))
+    if accepted is not None:
+        residual_bad = residual_bad & accepted
+    if bool(residual_bad.any()):
         maximum = float(scaled_residual.max())
         raise ValueError(
             "strict phi group direction scaled solve residual "
             f"{maximum:.3e} exceeds {_PHI_GROUP_SOLVE_RESIDUAL:.1e}"
         )
     xi = apply_left(v_phi)
+    condition_finite = torch.isfinite(undamped_condition)
+    if accepted is not None:
+        xi = torch.where(accepted.unsqueeze(-1), xi, torch.zeros_like(xi))
+        condition_finite = condition_finite | ~accepted
     if not bool(torch.isfinite(v_phi).all() & torch.isfinite(xi).all()
-                & torch.isfinite(undamped_condition).all()):
+                & condition_finite.all()):
         raise ValueError("strict phi group direction produced a nonfinite certificate")
     return PullbackGroupDirectionResult(
         v_phi=v_phi,
@@ -918,6 +972,7 @@ def _full_pullback_group_direction(
         scaled_solve_residual=scaled_residual,
         series_order=series_order,
         current_element=exp_phi,
+        accepted_rows=accepted,
     )
 
 
@@ -931,6 +986,7 @@ def _pullback_group_direction(
     coordinate_layout: Optional[str]       = None,
     differential_mode: Optional[str]       = None,
     irrep_dims:        Optional[List[int]] = None,
+    reject_ill_conditioned_rows: bool      = False,
 ) -> PullbackGroupDirectionResult:
     del coordinate_layout, irrep_dims
     preparation = _strict_block_preparations(
@@ -946,6 +1002,7 @@ def _pullback_group_direction(
         generators,
         preparation=preparation,
         differential_mode=differential_mode,
+        reject_ill_conditioned_rows=reject_ill_conditioned_rows,
     )
 
 
@@ -959,6 +1016,7 @@ def _pullback_group_direction_per_block(
     coordinate_layout: Optional[str]       = None,
     differential_mode: Optional[str]       = None,
     irrep_dims:        Optional[List[int]] = None,
+    reject_ill_conditioned_rows: bool      = False,
 ) -> PullbackGroupDirectionResult:
     r"""Solve each direct-sum block independently and aggregate global extrema.
 
@@ -966,6 +1024,9 @@ def _pullback_group_direction_per_block(
     ``A_h v_h = grad_h``. The global generalized condition is
     ``max_h(lambda_max,h) / min_h(lambda_min,h)`` rather than the largest local
     condition, while the solve certificate is the maximum local residual.
+    Under ``reject_ill_conditioned_rows`` the row verdict uses these GLOBAL extrema; a row
+    rejected by any local block is rejected globally, because the global floor and condition
+    bound every local one.
     """
     if irrep_dims is None:
         raise ValueError("pullback_per_block requires irrep_dims")
@@ -983,6 +1044,7 @@ def _pullback_group_direction_per_block(
             generators,
             preparation=preparations[0].basis,
             differential_mode=differential_mode,
+            reject_ill_conditioned_rows=reject_ill_conditioned_rows,
         )
     grad_64 = grad_phi.to(dtype=torch.float64)
     phi_64 = phi.to(dtype=torch.float64)
@@ -1019,6 +1081,7 @@ def _pullback_group_direction_per_block(
                 require_uniform_series_order=True,
                 preparation=preparations[0].basis,
                 differential_mode=differential_mode,
+                reject_ill_conditioned_rows=reject_ill_conditioned_rows,
             )
         except ValueError:
             batch_equal_blocks = False
@@ -1044,6 +1107,7 @@ def _pullback_group_direction_per_block(
                 preparation.basis.basis,
                 preparation=preparation.basis,
                 differential_mode=differential_mode,
+                reject_ill_conditioned_rows=reject_ill_conditioned_rows,
             )
             local_results.append(local)
         evaluation_mode = (_PHI_GROUP_DIFFERENTIAL_MODE
@@ -1060,6 +1124,7 @@ def _pullback_group_direction_per_block(
                         grad_64[..., preparation.index], phi_64[..., preparation.index],
                         preparation.basis.basis, preparation=preparation.basis,
                         differential_mode="series",
+                        reject_ill_conditioned_rows=reject_ill_conditioned_rows,
                     )
                     for preparation, result in zip(preparations, local_results)
                 ]
@@ -1094,42 +1159,55 @@ def _pullback_group_direction_per_block(
     min_undamped = local_min_undamped.amin(dim=0)
     max_undamped = local_max_undamped.amax(dim=0)
     undamped_condition = max_undamped / min_undamped
-    if (
-        not bool((torch.isfinite(min_undamped)
-                  & (min_undamped >= _PHI_GROUP_MIN_UNDAMPED_EIG)).all())
-    ):
-        minimum = float(min_undamped.min())
-        raise ValueError(
-            "strict phi group direction undamped generalized eigenvalue "
-            f"{minimum:.3e} is below {_PHI_GROUP_MIN_UNDAMPED_EIG:.1e}"
-        )
-
     local_min_damped = local_min_undamped + _PHI_GROUP_GRAM_RIDGE
     local_max_damped = local_max_undamped + _PHI_GROUP_GRAM_RIDGE
     damped_condition = local_max_damped.amax(dim=0) / local_min_damped.amin(dim=0)
-    if (
-        not bool((torch.isfinite(damped_condition)
-                  & (damped_condition <= _PHI_GROUP_MAX_DAMPED_COND)).all())
-    ):
-        maximum = float(damped_condition.max())
-        raise ValueError(
-            "strict phi group direction damped generalized condition "
-            f"{maximum:.3e} exceeds {_PHI_GROUP_MAX_DAMPED_COND:.1e}"
-        )
+    accepted = None
+    if reject_ill_conditioned_rows:
+        if not bool(torch.isfinite(min_undamped).all() & torch.isfinite(max_undamped).all()):
+            raise ValueError("strict phi group direction produced a nonfinite metric spectrum")
+        accepted = ((min_undamped >= _PHI_GROUP_MIN_UNDAMPED_EIG)
+                    & torch.isfinite(damped_condition)
+                    & (damped_condition <= _PHI_GROUP_MAX_DAMPED_COND))
+        v_phi = torch.where(accepted.unsqueeze(-1), v_phi, torch.zeros_like(v_phi))
+        xi = torch.where(accepted.unsqueeze(-1), xi, torch.zeros_like(xi))
+    else:
+        if (
+            not bool((torch.isfinite(min_undamped)
+                      & (min_undamped >= _PHI_GROUP_MIN_UNDAMPED_EIG)).all())
+        ):
+            minimum = float(min_undamped.min())
+            raise ValueError(
+                "strict phi group direction undamped generalized eigenvalue "
+                f"{minimum:.3e} is below {_PHI_GROUP_MIN_UNDAMPED_EIG:.1e}"
+            )
+        if (
+            not bool((torch.isfinite(damped_condition)
+                      & (damped_condition <= _PHI_GROUP_MAX_DAMPED_COND)).all())
+        ):
+            maximum = float(damped_condition.max())
+            raise ValueError(
+                "strict phi group direction damped generalized condition "
+                f"{maximum:.3e} exceeds {_PHI_GROUP_MAX_DAMPED_COND:.1e}"
+            )
 
     scaled_residual = local_scaled_residual.amax(dim=0)
-    if (
-        not bool((torch.isfinite(scaled_residual)
-                  & (scaled_residual <= _PHI_GROUP_SOLVE_RESIDUAL)).all())
-    ):
+    residual_bad = ~(torch.isfinite(scaled_residual)
+                     & (scaled_residual <= _PHI_GROUP_SOLVE_RESIDUAL))
+    if accepted is not None:
+        residual_bad = residual_bad & accepted
+    if bool(residual_bad.any()):
         maximum = float(scaled_residual.max())
         raise ValueError(
             "strict phi group direction scaled solve residual "
             f"{maximum:.3e} exceeds {_PHI_GROUP_SOLVE_RESIDUAL:.1e}"
         )
 
+    condition_finite = torch.isfinite(undamped_condition)
+    if accepted is not None:
+        condition_finite = condition_finite | ~accepted
     if not bool(torch.isfinite(v_phi).all() & torch.isfinite(xi).all()
-                & torch.isfinite(undamped_condition).all()):
+                & condition_finite.all()):
         raise ValueError("strict phi group direction produced a nonfinite certificate")
     return PullbackGroupDirectionResult(
         v_phi=v_phi,
@@ -1140,6 +1218,7 @@ def _pullback_group_direction_per_block(
         scaled_solve_residual=scaled_residual,
         series_order=series_order,
         current_element=current_element,
+        accepted_rows=accepted,
     )
 
 
@@ -1313,7 +1392,7 @@ def _precond_killing(
     inv_metric: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> torch.Tensor:
-    r"""Natural gradient under the (center-regularized) Killing metric: grad @ g~^{-1}."""
+    r"""Killing-form-preconditioned gradient (center-regularized metric): grad @ g~^{-1}."""
     Minv = build_killing_preconditioner(generators, center_reg=center_reg) if inv_metric is None else inv_metric
     return torch.einsum("...a,ab->...b", grad_phi, Minv)
 
@@ -1389,7 +1468,7 @@ def _precond_killing_per_block(
     inv_metric: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> torch.Tensor:
-    r"""Natural gradient under the per-block Killing metric."""
+    r"""Killing-form-preconditioned gradient under the per-block Killing metric."""
     if inv_metric is None:
         if irrep_dims is None:
             raise ValueError("killing_per_block requires irrep_dims")
@@ -1443,7 +1522,7 @@ def pullback_metric(
     series_order: int   = 40,
     max_k:        int   = 12,
 ) -> torch.Tensor:                        # (..., n_gen, n_gen) position-dependent metric
-    r"""Pullback natural-gradient metric G_ab(phi) = <d exp_phi(T_a), d exp_phi(T_b)>_F.
+    r"""Frobenius-pullback metric G_ab(phi) = <d exp_phi(T_a), d exp_phi(T_b)>_F.
 
     d exp_phi(T) = Psi(ad_phi)(T) exp(phi), Psi(z) = (e^z - 1)/z = sum_k z^k/(k+1)!.
     ad_phi acts on coordinates: (ad_phi)_{cb} = sum_a phi^a f[a,b,c]. The Psi series is
@@ -1506,7 +1585,7 @@ def _precond_pullback(
     series_order: int   = 40,
     **kwargs,
 ) -> torch.Tensor:
-    r"""Position-dependent natural gradient: solve G(phi) nat = grad_phi."""
+    r"""Riemannian gradient under the Frobenius-pullback metric: solve G(phi) v = grad_phi."""
     orig_dtype = grad_phi.dtype
     G_metric = pullback_metric(phi, generators, series_tol=series_tol, series_order=series_order)
     eye = torch.eye(G_metric.shape[-1], dtype=G_metric.dtype, device=G_metric.device)
@@ -1524,7 +1603,7 @@ def pullback_metric_per_block(
     series_order: int   = 40,
     max_k:        int   = 12,
 ) -> torch.Tensor:                        # (..., n_gen, n_gen) block-diagonal pullback metric
-    r"""Block-diagonal pullback metric: per-irrep-block exp-map natural-gradient metric.
+    r"""Block-diagonal pullback metric: per-irrep-block Frobenius pullback of the exp map.
 
     For a block-diagonal algebra g = (+)_h gl(d_h) (block_glk: irrep_dims = [d_h]*H),
     phi is block-diagonal, so d exp_phi stays inside each block and the pullback metric
@@ -1569,11 +1648,11 @@ def _precond_pullback_per_block(
     irrep_dims:   Optional[List[int]] = None,
     **kwargs,
 ) -> torch.Tensor:
-    r"""Per-block position-dependent natural gradient: solve G_block(phi) nat = grad_phi.
+    r"""Per-block Frobenius-pullback Riemannian gradient: solve G_block(phi) v = grad_phi.
 
-    The block-diagonal counterpart of ``pullback`` (the exact natural gradient for a
-    block-diagonal gauge group like block_glk), feasible at K > max_k because each block's
-    metric is built on its local d_h <= max_k representation."""
+    The block-diagonal counterpart of ``pullback`` (the same Frobenius-pullback metric for a
+    block-diagonal gauge group like block_glk, which is exactly block-diagonal there), feasible
+    at K > max_k because each block's metric is built on its local d_h <= max_k representation."""
     if irrep_dims is None:
         raise ValueError("pullback_per_block requires irrep_dims")
     orig_dtype = grad_phi.dtype
@@ -1592,12 +1671,28 @@ def _bch_chart_direction(
     *,
     irrep_dims: Optional[List[int]] = None,
 ) -> torch.Tensor:
-    r"""Convert a chart direction to the right operand of the implemented BCH4 step.
+    r"""Right operand ``v`` whose EXACT group product moves the chart with velocity ``delta_phi``.
 
-    D_2 BCH4(phi, 0) = B4(ad_phi), B4(A) = I + A/2 + A^2/12 - A^4/720.
-    Solving B4 v = delta_phi makes the composed step's first derivative equal to
-    delta_phi. This is the differential of the finite polynomial used by retraction,
-    not an approximation substituted for the exact exponential differential.
+    For :math:`Z(t) = \log(e^{X} e^{tV})` with :math:`X = \mathrm{embed}(\phi)`,
+
+    .. math:: Z'(0) = \psi(\mathrm{ad}_X) V, \qquad \psi(z) = \frac{z}{1 - e^{-z}},
+
+    the inverse of the left-trivialized exponential differential (Hall 2015, *Lie Groups, Lie
+    Algebras, and Representations*, Thm 5.4). Solving :math:`\psi(\mathrm{ad}_X) v = \delta\phi`
+    is therefore the explicit product :math:`v = \Psi_L(\mathrm{ad}_X)\,\delta\phi` with the entire
+    function :math:`\Psi_L(z) = (1 - e^{-z})/z`: there is no linear solve and no root. It is
+    evaluated exactly (to matrix-exponential accuracy) from the block-triangular Frechet
+    derivative (Higham 2008, *Functions of Matrices*, Thm 3.6),
+
+    .. math:: \Psi_L(\mathrm{ad}_X) D = e^{-X} L_{\exp}(X, D), \qquad
+              \exp\begin{pmatrix} X & D \\ 0 & X \end{pmatrix}
+              = \begin{pmatrix} e^{X} & L_{\exp}(X, D) \\ 0 & e^{X} \end{pmatrix}.
+
+    Audit 2026-09-23 #11 replaced the former solve against the degree-4 Bernoulli truncation
+    :math:`B_4(z) = 1 + z/2 + z^2/12 - z^4/720`, which has a spurious real root at
+    :math:`z \approx -3.879` inside the phi chart (the exact :math:`\psi` has no real zeros). The
+    E-step composition itself remains ``compose_bch``, whose first-order velocity is
+    :math:`B_4(\mathrm{ad}_X) v = \delta\phi + O(\lVert\mathrm{ad}_X\rVert^6)\,\delta\phi`.
     """
     if irrep_dims is not None and len(irrep_dims) > 1:
         block_of = _generator_block_index(generators, irrep_dims)
@@ -1609,12 +1704,19 @@ def _bch_chart_direction(
             result[..., idx] = _bch_chart_direction(delta_phi[..., idx], phi[..., idx], sub)
             start += d
         return result
-    f = _structure_constants(generators.double())
-    ad = torch.einsum("...a,abc->...cb", phi.double(), f)  # (..., n_gen, n_gen)
-    ad2 = ad @ ad
-    eye = torch.eye(ad.shape[-1], dtype=ad.dtype, device=ad.device)
-    differential = eye + 0.5 * ad + ad2 / 12.0 - (ad2 @ ad2) / 720.0
-    return torch.linalg.solve(differential, delta_phi.double().unsqueeze(-1)).squeeze(-1).to(delta_phi.dtype)
+    with torch.autocast(device_type=phi.device.type, enabled=False):
+        basis = generators.double()
+        X = torch.einsum("...a,aij->...ij", phi.double(), basis)            # (..., K, K)
+        D = torch.einsum("...a,aij->...ij", delta_phi.double(), basis)      # (..., K, K)
+        X, D = torch.broadcast_tensors(X, D)
+        upper = torch.cat((X, D), dim=-1)                                   # (..., K, 2K)
+        lower = torch.cat((torch.zeros_like(X), X), dim=-1)                 # (..., K, 2K)
+        block_exp = torch.linalg.matrix_exp(torch.cat((upper, lower), dim=-2))  # (..., 2K, 2K)
+        K = X.shape[-1]
+        # e^{-X} L_exp(X, D): solve against the SAME e^{X} block instead of a second exponential.
+        left = torch.linalg.solve(block_exp[..., :K, :K], block_exp[..., :K, K:])  # (..., K, K)
+        v = extract_phi(left, basis)                                        # (..., n_gen)
+    return v.to(delta_phi.dtype)
 
 
 def precondition_phi_gradient(

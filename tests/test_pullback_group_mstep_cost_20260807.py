@@ -165,12 +165,14 @@ def test_nonfinite_inputs_still_raise(poison):
         _stage(grad, phi, group)
 
 
-def test_chart_norm_bound_still_raises_with_its_measured_maximum():
+def test_chart_norm_bound_rejects_rows_without_moving_them():
+    # Audit 2026-09-23 #10: chart-bound failures are per-row rejections, not a whole-step raise.
     group = _group()
     grad, phi = _staging_inputs()
 
-    with pytest.raises(FloatingPointError, match="exceeds bound"):
-        _stage(grad, phi, group, chart_max_norm=1e-6)
+    candidate = _stage(grad, phi, group, chart_max_norm=1e-6)
+    assert bool(candidate.rejected_rows.all())
+    assert torch.equal(candidate.candidate_phi, phi)
 
 
 # -- (f) the lopsided mixed-order case still falls back, bit-exactly ----------------------------

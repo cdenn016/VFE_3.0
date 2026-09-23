@@ -468,7 +468,7 @@ SEARCH_CONFIG: Dict[str, Any] = {
         "lambda_alpha": {
             "enabled": False, "bounds": None, "values": [0.0, 0.5, 1.0, 5.0],
             "scale": "linear",
-            "requires": {"lambda_alpha_mode": "constant", "n_e_steps": 1},
+            "requires": {"lambda_alpha_mode": "constant", "n_e_steps": 2},
             "description": "Constant self-coupling value.",
         },
         "lambda_beta": {
@@ -571,11 +571,6 @@ def _resolved_model_config(model_config: Mapping[str, Any]) -> Dict[str, Any]:
         warnings.simplefilter("ignore")
         cfg = VFE3Config(**copy.deepcopy(dict(model_config)))
     return asdict(cfg)
-
-
-def _validate_model_config(model_config: Mapping[str, Any]) -> None:
-    """Validate a partial local config without reading defaults from ablation.py."""
-    _resolved_model_config(model_config)
 
 
 @contextmanager
@@ -907,10 +902,15 @@ def _result_base_label(
 
 
 def _leaderboard_rows(
-    candidates: Sequence[Mapping[str, Any]],
-    results:    Sequence[Mapping[str, Any]],
+    candidates:     Sequence[Mapping[str, Any]],
+    results:        Sequence[Mapping[str, Any]],
+    expected_seeds: int,
 ) -> List[Dict[str, Any]]:
-    """Aggregate validation perplexity by candidate and rank finite means first."""
+    """Aggregate validation perplexity by candidate; rank only candidates with every seed.
+
+    A candidate missing any requested seed is marked ``status='incomplete'`` and left unranked
+    after the ranked rows, so one failed cell no longer hides the completed candidates.
+    """
     grouped: Dict[str, List[float]] = {
         str(candidate["label"]): [] for candidate in candidates
     }
@@ -931,7 +931,9 @@ def _leaderboard_rows(
         mean = statistics.fmean(values) if values else math.inf
         std = statistics.stdev(values) if len(values) > 1 else 0.0
         rows.append({
-            "rank":                     0,
+            "rank":                     None,
+            "status":                   ("complete" if len(values) == expected_seeds
+                                         else "incomplete"),
             "label":                    label,
             "mean_primary_val_ppl":     mean,
             "std_primary_val_ppl":      std,
@@ -942,8 +944,10 @@ def _leaderboard_rows(
                 candidate["overrides"], sort_keys=True, separators=(",", ":")
             ),
         })
-    rows.sort(key=lambda row: (row["mean_primary_val_ppl"], row["label"]))
-    for rank, row in enumerate(rows, start=1):
+    rows.sort(key=lambda row: (row["status"] != "complete",
+                               row["mean_primary_val_ppl"], row["label"]))
+    complete = [row for row in rows if row["status"] == "complete"]
+    for rank, row in enumerate(complete, start=1):
         row["rank"] = rank
     return rows
 
@@ -952,6 +956,7 @@ def _write_leaderboard(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     """Atomically write the compact candidate-level validation leaderboard."""
     fieldnames = [
         "rank",
+        "status",
         "label",
         "mean_primary_val_ppl",
         "std_primary_val_ppl",
@@ -1570,15 +1575,16 @@ def _print_parameter_catalog(parameters: Mapping[str, Mapping[str, Any]]) -> Non
 
 
 def _print_leaderboard(rows: Sequence[Mapping[str, Any]], *, limit: int = 10) -> None:
-    """Print the best finite candidate aggregates."""
+    """Print the best finite candidate aggregates; an incomplete candidate shows rank '-'."""
     print("\nValidation leaderboard:\n")
     print(f"  {'rank':>4}  {'label':<22}{'mean PPL':>12}{'std':>12}{'seeds':>8}")
     print("-" * 62)
     for row in rows[:limit]:
         mean = float(row["mean_primary_val_ppl"])
         std = float(row["std_primary_val_ppl"])
+        rank = "-" if row["rank"] is None else str(int(row["rank"]))
         print(
-            f"  {int(row['rank']):>4}  {str(row['label']):<22}"
+            f"  {rank:>4}  {str(row['label']):<22}"
             f"{mean:>12.6f}{std:>12.6f}{int(row['successful_seeds']):>8}"
         )
 
@@ -1679,6 +1685,7 @@ def main() -> int:
         )
     sweep = _joint_sweep(candidates, seeds)
     ablation.SWEEPS[_JOINT_SWEEP_NAME] = sweep
+    collected: List[Dict[str, Any]] = []
     try:
         with _ablation_baseline_scope(model_config):
             ablation.validate_sweeps([_JOINT_SWEEP_NAME])
@@ -1692,18 +1699,21 @@ def main() -> int:
                 save_model_artifacts=_SAVE_MODEL_ARTIFACTS,
                 max_tokens=max_tokens,
                 max_steps=SEARCH_CONFIG.get("max_steps"),
+                collected_out=collected,
             )
     finally:
         if ablation.SWEEPS.get(_JOINT_SWEEP_NAME) is sweep:
             del ablation.SWEEPS[_JOINT_SWEEP_NAME]
 
-    rows = _leaderboard_rows(candidates, results)
+    # run_sweep returns [] for an incomplete sweep; rank its collected cohort instead, so one
+    # failed cell leaves the completed candidates ranked and marks the rest incomplete.
+    rows = _leaderboard_rows(candidates, results or collected, len(seeds))
     _write_leaderboard(output_dir / "leaderboard.csv", rows)
     expected_results = len(candidates) * len(seeds)
     complete = len(results) == expected_results
     figure_status, figures, tables, figure_error = _try_write_sweep_figures(
         output_dir,
-        rows,
+        [row for row in rows if row["status"] == "complete"],
         candidates,
         SEARCH_CONFIG,
         model_config,

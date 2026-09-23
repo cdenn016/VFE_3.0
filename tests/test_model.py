@@ -90,18 +90,22 @@ def test_detached_e_step_with_phi_runs_and_reaches_decode_priors():
     # under its own enable_grad island, so the blanket no_grad does not strangle it.
     # Under detach the E-step is severed, so priors are reached only via decode (mu/sigma);
     # phi_embed is frozen (no gradient path) -- pin both as the as-built semantics.
-    # The prior-bank decode reaches mu_embed because its KL scores
-    # against it; the linear-decode default would leave mu_embed grad None under a severed E-step.
+    # The prior-bank decode reaches the mean table its KL scores against (_decode_mu_table():
+    # decode_mu_embed under the default untie_decode_bank=True, mu_embed on a tied bank); the
+    # linear-decode default would leave it grad None under a severed E-step. The block MLP (on by
+    # default) requires a gradient-carrying E-step, so it is pinned off for detach.
     cfg = VFE3Config(vocab_size=15, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=2,
                      n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.02,
-                     e_step_gradient="detach", decode_mode="diagonal_chunked")
+                     e_step_gradient="detach", decode_mode="diagonal_chunked",
+                     use_block_mlp=False)
     model = VFEModel(cfg)
     tokens = torch.randint(0, 15, (2, 4)); targets = torch.randint(0, 15, (2, 4))
     _, loss, _ = model(tokens, targets)
     assert torch.isfinite(loss)                                    # no crash, finite loss
     loss.backward()
-    assert model.prior_bank.mu_embed.grad is not None              # decode reaches mu prior
-    assert model.prior_bank.mu_embed.grad.abs().sum() > 0
+    decode_mu = model.prior_bank._decode_mu_table()
+    assert decode_mu.grad is not None                              # decode reaches mu prior
+    assert decode_mu.grad.abs().sum() > 0
     assert model.prior_bank.phi_embed.grad is None                 # phi frozen under detach
 
 
@@ -129,10 +133,17 @@ def test_all_ignore_batch_yields_finite_zero_loss():
 
 def test_model_has_no_nn_layers():
     import torch.nn as nn
-    cfg = VFE3Config(vocab_size=10, embed_dim=4, n_heads=2, max_seq_len=3)
+    nn_layers = (nn.Linear, nn.MultiheadAttention, nn.RNNBase, nn.Conv1d)
+    # The pure path: with the opt-in block MLP off, no conventional nn layer exists anywhere.
+    cfg = VFE3Config(vocab_size=10, embed_dim=4, n_heads=2, max_seq_len=3, use_block_mlp=False)
     model = VFEModel(cfg)
     for m in model.modules():
-        assert not isinstance(m, (nn.Linear, nn.MultiheadAttention, nn.RNNBase, nn.Conv1d))
+        assert not isinstance(m, nn_layers)
+    # With the block MLP on (the current default), its fc1/fc2 are the ONLY nn layers.
+    mlp_model = VFEModel(VFE3Config(vocab_size=10, embed_dim=4, n_heads=2, max_seq_len=3,
+                                    use_block_mlp=True))
+    layer_names = [name for name, m in mlp_model.named_modules() if isinstance(m, nn_layers)]
+    assert layer_names and all(name.startswith("block_mlps.") for name in layer_names)
 
 
 def test_build_group_dispatches_on_arity_for_every_group():
@@ -173,7 +184,7 @@ def test_norm_type_layernorm_is_wired_both_seams():
     # logits vs 'none'. Parameter-free: it adds no learnable parameters over the 'none' model, so
     # there is no optimizer wiring to do (the whole point of the parameter-free variant).
     base = dict(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=2,
-                n_e_steps=1, e_q_mu_lr=0.05)
+                n_e_steps=1, e_q_mu_lr=0.05, layernorm_affine=False)     # parameter-free variant
     tok = torch.randint(0, 12, (2, 4))
     torch.manual_seed(0); m_ln   = VFEModel(VFE3Config(**base, norm_type_block="layernorm",
                                                        norm_type_final="layernorm"))
@@ -283,12 +294,14 @@ def test_attention_maps_shape_and_row_stochastic():
 
 def test_attention_maps_last_layer_matches_diagnostics():
     # The canonical resolution of "what is per-layer attention": the last layer's map is the SAME
-    # attention diagnostics() reads at the converged belief. At n_layers=1 (stack is one block, the
-    # handoff loop is empty) this is exact -- the mean row entropy of maps[-1] equals diagnostics'
-    # attn_entropy byte for byte, which guards the block-by-block replay against trajectory drift.
+    # attention diagnostics() reads at the converged belief. diagnostics() scores the pre-transform
+    # converged belief (audit 2026-09-23 #20) while attention_maps scores the block output, so the
+    # post-E-step transforms are switched off here; then the mean row entropy of maps[-1] equals
+    # diagnostics' attn_entropy, which guards the block-by-block replay against trajectory drift.
     from vfe3 import metrics
     cfg = VFE3Config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                     n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.05)
+                     n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.05,
+                     norm_type_block="none", use_block_mlp=False)
     model = VFEModel(cfg)
     tokens = torch.randint(0, 12, (2, 5))
     maps = model.attention_maps(tokens)
@@ -341,9 +354,12 @@ def test_model_runs_under_sp_gauge_group():
     # and finite, grad-connected gradients on the prior tables. embed_dim=4 (even, K=2m with m=2);
     # n_heads=2 divides it for the multihead attention/decode (the gauge group itself is the
     # single super-block sp(4)). Mirrors test_model_runs_under_cross_coupled_block_glk.
+    # A headless positional prior: the default causal_alibi builds an (n_heads, N, N) per-head
+    # bias, which the single-block sp group's energy head axis (1) fail-closed rejects.
     cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                      n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.05, m_phi_lr=0.01,
-                     gauge_group="sp", phi_precond_mode="none")
+                     gauge_group="sp", phi_precond_mode="none",
+                     beta_attention_prior="causal")
     model = VFEModel(cfg)
     assert model.group.generators.shape[0] == 2 * (2 * 2 + 1)   # m(2m+1) = 10 for m=2
     assert model.group.irrep_dims == [4]
@@ -360,10 +376,12 @@ def test_model_runs_under_cross_coupled_block_glk():
     # through the same model/E-step machinery: a forward + loss.backward() with targets yields a
     # finite loss and finite, grad-connected gradients on the prior tables. This mirrors the
     # verify-first check; it is the oracle that the wired cross-coupled path works end-to-end.
+    # Headless positional prior: cross-coupled block_glk collapses to one [K] block, so the
+    # default per-head causal_alibi bias is fail-closed rejected.
     cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                      n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.05, m_phi_lr=0.01,
                      gauge_group="block_glk", cross_couplings=[(0, 1)],
-                     phi_precond_mode="none")
+                     phi_precond_mode="none", beta_attention_prior="causal")
     model = VFEModel(cfg)
     # the cross-coupled group is the extended (larger-than-direct-sum) basis
     d_head = cfg.embed_dim // cfg.n_heads

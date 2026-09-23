@@ -680,8 +680,12 @@ def floor_eigenvalues(
     *,
     floor:  float = 1e-6,
 ) -> torch.Tensor:                       # (..., K, K) SPD with eigenvalues >= floor
-    r"""Project a symmetric matrix to SPD by clamping its eigenvalues up to ``floor``."""
-    M = _symmetrize(matrix.float())
+    r"""Project a symmetric matrix to SPD by clamping its eigenvalues up to ``floor``.
+
+    float64 stays float64 (the module dtype policy); every other dtype computes in float32.
+    """
+    compute_dtype = torch.float64 if matrix.dtype == torch.float64 else torch.float32
+    M = _symmetrize(matrix.to(compute_dtype))
     evals, evecs = safe_eigh(M)
     evals = evals.clamp(min=floor)
     out = (evecs * evals.unsqueeze(-2)) @ evecs.transpose(-1, -2)
@@ -712,16 +716,18 @@ def condition_number(
             "condition_number kind='full' requires square trailing dimensions (..., K, K), "
             f"got shape {tuple(matrix.shape)}")
     full = kind == "full" or (kind == "auto" and square)
+    # float64 stays float64 (the module dtype policy); every other dtype computes in float32.
+    compute_dtype = torch.float64 if matrix.dtype == torch.float64 else torch.float32
     if not full:
         if matrix.dim() == 0:
             raise ValueError("condition_number diagonal input must have at least one dimension")
-        spec = matrix.float()
+        spec = matrix.to(compute_dtype)
         lam_min = spec.min(dim=-1).values
         cond = spec.max(dim=-1).values / lam_min.clamp(min=eps)
         # non-positive variance -> no condition number; surface +inf, mirroring the full-matrix branch
         # (audit 2026-06-17 round 2 id1), not a large positive value from clamping a zero/negative up to eps.
         return torch.where(lam_min > 0, cond, cond.new_tensor(float("inf"))).to(matrix.dtype)
-    evals = safe_eigvalsh(_symmetrize(matrix.float()))
+    evals = safe_eigvalsh(_symmetrize(matrix.to(compute_dtype)))
     lam_min = evals[..., 0]
     cond = evals[..., -1] / lam_min.clamp(min=eps)
     # A non-PD matrix (lambda_min <= 0) has no condition number; surface +inf rather than the large

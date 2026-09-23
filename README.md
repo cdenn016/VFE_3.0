@@ -7,8 +7,10 @@ maps determine what content is sent and how it enters the receiver's state.
 
 The primary configuration in `train_vfe3.py` uses **full-input/full-output projected
 attention with predictive-content readout**. Its attention step directly aggregates
-content, with a residual connection. The attention weights have a variational
-derivation. A single latent variational free energy for the complete language model
+content, with a residual connection. Given routing costs, the attention weights are the
+entropy-regularized (Gibbs) minimizer, as they are for any softmax attention; what is
+specific to this model is the cost itself, a Gaussian KL divergence between projected
+moments. A single latent variational free energy for the complete language model
 is not established; the predictor trains on supervised next-token cross-entropy.
 
 This is an independent local copy of `V3_Transformer`. Its source, tests, and
@@ -32,7 +34,7 @@ flowchart TD
     Pool --> Receive["O: write full reference state; apply receiver frame"]
     Receive --> Residual["Attention residual + configured block transforms"]
     Residual --> Next["Repeat through the layer stack"]
-    Next --> Decode["Linear vocabulary readout"]
+    Next --> Decode["Prior-bank KL readout with unigram prior"]
     Decode --> Loss["Next-token cross-entropy"]
 ```
 
@@ -66,10 +68,12 @@ q_i=\mathcal N(\mu_i,\Sigma_i),\qquad
 C_i=U_i^{-1}\Sigma_i U_i^{-\top}.
 $$
 
-The full-Gaussian theory assumes $\Sigma_i\succ0$. The current launcher uses
-`gaussian_diagonal`. The projected route also admits `gaussian_full`,
+The full-Gaussian theory assumes $\Sigma_i\succ0$. The current launcher selects
+`gaussian_full`; the projected route also admits `gaussian_diagonal`,
 `gaussian_diagonal_exact`, and `gaussian_frame_diagonal` under its configuration
-guards. A diagonal stored state can yield a dense projected covariance.
+guards. A diagonal stored state can yield a dense projected covariance. On the
+launcher's route the stored covariance itself stays diagonal, so `gaussian_full` computes
+the same function as `gaussian_diagonal` there (see the configuration table below).
 
 ### Comparison interfaces
 
@@ -162,11 +166,15 @@ $$
 =\mathrm{softmax}_j\left(\log\pi_{ij}^{(h)}-D_{ij}^{(h)}/\tau_h\right).
 $$
 
-This is the variational attention calculation. `include_attention_entropy=True`
-is required by the projected route; entropy regularization determines the Gibbs
-weights without an iterative gradient update over them. The attention-temperature
-policy uses `kappa_beta` and head dimensions. The current launcher selects a
-`causal_alibi` source prior and a finite `attention_window`.
+This Gibbs identity holds for any cost placed in a softmax, including the dot-product
+score of ordinary attention, so it does not by itself distinguish this model. The
+model-specific content is the choice of $D_{ij}^{(h)}$ as a Gaussian KL divergence
+between projected moments, which the construction posits rather than derives.
+`include_attention_entropy=True` is required by the projected route; entropy
+regularization determines the Gibbs weights without an iterative gradient update over
+them. The attention-temperature policy uses `kappa_beta` and head dimensions. The
+current launcher selects an unwindowed `causal_alibi` source prior; `attention_window`
+is read only by the windowed priors, so the launcher's value is inactive.
 
 Runtime numerical KL bounds apply before softmax. Finite `kl_max` clips large
 energies; `float("inf")` removes the upper ceiling while retaining the nonnegative
@@ -235,10 +243,14 @@ config.update(
     gauge_group="block_glk",
     transport_mode="flat",                # reference frames; links also include O @ T
     n_e_steps=1,
-    skip_belief_sigma_update=True,
     e_phi_lr=0.0,
+    family="gaussian_full",               # value-identical to gaussian_diagonal on this route
     encode_mode="per_token",
-    decode_mode="linear",
+    decode_mode="full_chunked",           # prior-bank KL readout
+    decode_unigram_prior=True,
+    untie_decode_bank=True,
+    beta_attention_prior="causal_alibi",
+    fp32_matmul_precision="highest",      # TF32 is not enabled
 )
 ```
 
@@ -258,11 +270,33 @@ Consult the validator for the complete admission rules.
 | `lambda_alpha`, `lambda_alpha_mode`, `b0`, `c0` | Unused by predictive readout; may affect separately enabled outer self-coupling. |
 | `m_relational_score_lr` | Outer rate for $S_Q,S_K$ across layers. |
 | `m_relational_content_lr` | Outer rate for $T,O$ across layers. |
-| `family="gaussian_full"` | Full stored covariance, independent of input/output scope. |
+| `family="gaussian_full"` | Value-identical to `gaussian_diagonal` here; see below. |
+| `encode_mode="per_token_additive"` | Capacity-matched $\Omega=I$ control; requires `pos_phi="none"` and `pos_rotation="none"`. |
 
 Relational rates of `None` inherit `m_p_mu_lr`; `0.0` freezes that role's
 parameters while retaining its forward operation. Score and content groups have
 zero weight decay.
+
+On this route `family="gaussian_full"` computes the same function as
+`gaussian_diagonal` with the rank-matched decoder. The encoder stores the covariance as
+the diagonal of a per-token table, the predictive readout keeps it, and under the
+inherited `block_mlp_covariance="passthrough"` no later seam densifies it; a float64
+probe with shared parameters gives identical losses and an exactly zero off-diagonal
+covariance. A genuinely full covariance requires `block_mlp_covariance="delta_full"`,
+`use_head_mixer=True`, or `attention_mode="transported"`. `VFE3Config.inactive_fields()`
+reports this equivalence, together with every other setting that no active path reads
+(for example `lambda_beta`, `sigma_max`, and the congruence-precision knobs on this
+route), and `train_vfe3.py` prints the inactive settings it names explicitly at every
+launch.
+
+The gauge-frame contrast needs a capacity control. `gauge_transport="off"` removes
+the per-token frame table and the positional table together with the group structure,
+so on its own it cannot separate frame structure from lookup capacity. The
+`per_token_additive` encoder keeps the same learned $(V,n_{\mathrm{gen}})$ table but
+applies it as an additive mean shift with $\Omega_{ij}=I$; it is admitted on the projected
+routes only with `pos_phi="none"` and `pos_rotation="none"`, since a positional frame
+would reintroduce a non-identity transport. A gauge on/off result on this route should
+be reported against that arm.
 
 The launcher constructs `VFE3Config` from its dictionary with a per-run seed
 override. The model creates one `RelationalOperators` instance per layer and the
@@ -273,12 +307,21 @@ fixed architectural constants.
 ### Token priors and language-model loss
 
 `PriorBank.encode` initializes states from learned token priors. Token and
-configured positional components form the frames. The input bank remains present
-with a linear decoder; there is no `use_prior_bank` switch.
+configured positional components form the frames. The input bank is present under
+every decoder; there is no `use_prior_bank` switch.
 
-A linear vocabulary readout of the final mean, followed by softmax, defines a
-normalized autoregressive model. With $\mathcal T$ the unmasked targets and
-$M=|\mathcal T|$,
+The launcher decodes with `decode_mode="full_chunked"`: each vocabulary item $v$ owns a
+Gaussian $p_v$ (an untied copy of the token tables under `untie_decode_bank=True`), and
+the logits combine the divergence to it with the corpus unigram log-prior,
+
+$$
+z_{iv}=-\frac{D_{\mathrm{KL}}(q_i\Vert p_v)}{\tau_{\mathrm{eff}}}+\kappa\log u_v,
+$$
+
+with $\tau_{\mathrm{eff}}$ the effective decode temperature, $u_v$ the add-one-smoothed
+training-split unigram frequency, and $\kappa$ = `unigram_kappa`.
+The softmax of these logits defines a normalized autoregressive model. With
+$\mathcal T$ the unmasked targets and $M=|\mathcal T|$,
 
 $$
 p_\theta(x_{i+1}\mid x_{\le i})=\mathrm{softmax}(z_i)_{x_{i+1}},\qquad
@@ -286,16 +329,21 @@ p_\theta(x_{i+1}\mid x_{\le i})=\mathrm{softmax}(z_i)_{x_{i+1}},\qquad
 \log p_\theta(x_{i+1}\mid x_{\le i}).
 $$
 
-Outer backpropagation trains enabled prior, frame, interface, MLP, normalization,
-and decoder parameters. Optional outer penalties are separate choices. This loss
-is not the same scalar as the variational routing objective.
+`decode_mode="linear"` instead reads out $z_i=W\mu_i(+b)$ from the final mean and
+discards the covariance. Outer backpropagation trains enabled prior, frame, interface,
+MLP, normalization, and decoder parameters. Optional outer penalties are separate
+choices. This loss is not the same scalar as the variational routing objective.
 
-Prior-bank divergence decoders score vocabulary Gaussians. For example,
-`diagonal_chunked` and `full_chunked` are available on the projected route as well
-as on transported profiles. That output choice is distinct from token initialization.
-On a projected route the belief covariance is kept at its encode value (the
-predictive readout replaces only the mean, and relational filtering returns no
-sigma gradient), so a prior-bank KL decode scores against that encode covariance.
+Prior-bank divergence decoders such as `diagonal_chunked` and `full_chunked` are
+available on the projected route as well as on transported profiles. On a projected
+route the belief covariance is kept at its encode value: the predictive readout replaces
+only the mean, and relational filtering returns no sigma gradient. The covariance terms
+of the KL readout therefore depend on the input token and the vocabulary item alone.
+With frozen $\Sigma_q$ they form a context-free (input token, vocabulary) bias table
+added to every logit at scale $1/\tau_{\mathrm{eff}}$, a lookup channel that bypasses
+attention, normalization, and the MLP. A gain from switching a linear decode to
+`full_chunked` on this route cannot be credited to uncertainty-aware decoding without a
+control arm for that channel.
 
 ### Optional belief-revision paths
 
@@ -381,7 +429,8 @@ them, and `vocab_size` follows the dataset automatically. The word vocabulary is
 reference set (267,734 ids: the training split's distinct tokens, with the corpus's own `<unk>`
 marker at id 0), which is far larger than the GPT-2 vocabulary, so token tables and
 vocabulary readout can dominate parameter and memory cost.
-`--min-count N` rebuilds with a frequency cutoff to trade vocabulary size against OOV.
+Setting `MIN_COUNT` in `build_wikitext103_word_cache.py` and rebuilding applies a frequency
+cutoff that trades vocabulary size against OOV.
 
 ### Click-to-run workflow
 

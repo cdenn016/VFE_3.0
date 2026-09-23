@@ -496,7 +496,7 @@ def test_seed_aggregate_groups_seeds():
     by = {a["label"]: a for a in agg}
     assert by["a"]["n"] == 2 and abs(by["a"]["mean"] - 31.0) < 1e-9
     assert abs(by["a"]["sd"] - 2.0 ** 0.5) < 1e-9 and abs(by["a"]["cv"] - (2.0 ** 0.5) / 31.0) < 1e-9
-    assert by["b"]["n"] == 1 and by["b"]["sd"] == 0.0
+    assert by["b"]["n"] == 1 and math.isnan(by["b"]["sd"]) and math.isnan(by["b"]["cv"])  # unknown, not 0
     assert "c" not in by                                       # no finite seed -> dropped
     assert [a["label"] for a in agg] == ["a", "b"]             # sorted by mean PPL
 
@@ -804,7 +804,9 @@ def test_indeterminate_ancova_is_unassessed_not_divergent(tmp_path, monkeypatch,
 
     summary = json.loads((tmp_path / "scaling_summary.json").read_text(encoding="utf-8"))
     assert summary["pooled_fit"] is not None
-    assert summary["pooled_fit_status"] == "unassessed"
+    # Two sizes per route: not confounded (the indeterminate ANCOVA is not divergence), and below
+    # the four-size testability floor (audit 2026-09-23 #18) the status is 'not_testable'.
+    assert summary["pooled_fit_status"] == "not_testable"
     assert summary["pooled_fit_confounds"] == []
     console = capsys.readouterr().out.lower()
     assert "indeterminate" in console
@@ -868,7 +870,8 @@ def test_ancova_requires_distinct_sizes_per_route(tmp_path, monkeypatch):
     assert summary["pooled_fit"] is not None
     assert summary["frontier_collapse"]["testable"] is False
     assert summary["frontier_collapse"]["routes"] == {}
-    assert summary["pooled_fit_status"] == "unassessed"
+    # Two distinct sizes: below the four-size testability floor (audit 2026-09-23 #18).
+    assert summary["pooled_fit_status"] == "not_testable"
 
 
 def test_scaling_md_persists_not_fitted_status(tmp_path):
@@ -1143,6 +1146,10 @@ def test_ablation_renderer_dispatches_registered_figures_by_name_and_keeps_legac
             vec = torch.rand(48, generator=g, dtype=torch.float32) * 0.1 + 1.0 + forest_offsets[label]
             tpath = run_dir / "val_token_nats.pt"
             torch.save(vec, tpath)
+            # A real cell's RunArtifacts config.json carries the evaluation window that the
+            # forest's sequence-cluster bootstrap resamples (audit 2026-09-23 #19).
+            (run_dir / "config.json").write_text(json.dumps({"config": {"max_seq_len": 8}}),
+                                                 encoding="utf-8")
             ppl = float(vec.mean())
             result.update({
                 "primary_val_ppl": ppl, "final_val_ppl": ppl,

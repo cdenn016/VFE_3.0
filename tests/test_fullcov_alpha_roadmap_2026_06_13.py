@@ -210,6 +210,10 @@ def test_state_dependent_per_position_nonrenyi_forward_backward(div_name):
 # NO per-pair (K,K) Cholesky -- one logdet(Sigma_q) per position, then matmuls over V. It must equal
 # the dense full decode CE (F.cross_entropy(_decode_full(...))) to atol-1e-3, without materializing
 # (B,N,V,K,K).
+# Under the default decode_av_precision='fp64' the fused chunked routes keep float64 through the
+# finished logit/CE (_decode_analytic_kl_logits' near-tie ranking preservation), while the dense
+# `full` kernel and model.forward's dense branch cast to float32. Values agree to ~1e-6; the
+# comparisons below therefore compare values across that intentional dtype boundary.
 # ---------------------------------------------------------------------------
 def _full_model(vocab_size=64, **kw):
     decode_mode = kw.pop("decode_mode", "full_chunked")
@@ -254,7 +258,8 @@ def test_full_chunked_ce_matches_dense_full_ce_multiple_chunk_sizes():
         ch.load_state_dict(ref.state_dict())
         mu_c, sigma_c = _full_converged(ch)(tokens)
         ce = ch.prior_bank.decode_ce_full_chunked(mu_c, sigma_c, targets)
-        assert torch.allclose(ce, full_ce, atol=1e-3), f"chunk={chunk}: {ce.item()} != {full_ce.item()}"
+        assert torch.allclose(ce.to(full_ce.dtype), full_ce, atol=1e-3), (
+            f"chunk={chunk}: {ce.item()} != {full_ce.item()}")
 
 
 def test_full_chunked_honors_ignore_index():
@@ -270,7 +275,7 @@ def test_full_chunked_honors_ignore_index():
     ch.load_state_dict(ref.state_dict())
     mu_c, sigma_c = _full_converged(ch)(tokens)
     ce = ch.prior_bank.decode_ce_full_chunked(mu_c, sigma_c, targets)
-    assert torch.allclose(ce, full_ce, atol=1e-3)
+    assert torch.allclose(ce.to(full_ce.dtype), full_ce, atol=1e-3)
 
 
 def test_full_chunked_all_ignore_is_finite_zero():
@@ -295,7 +300,7 @@ def test_full_chunked_inference_matches_dense_full_logits():
     ch.load_state_dict(ref.state_dict())
     logits_ch = ch(tokens)
     assert logits_ch.shape == (2, 5, V)
-    assert torch.allclose(logits_ch, logits_full, atol=1e-3)
+    assert torch.allclose(logits_ch.to(logits_full.dtype), logits_full, atol=1e-3)
 
 
 def test_full_chunked_forward_loss_matches_full_forward_loss():
@@ -308,8 +313,8 @@ def test_full_chunked_forward_loss_matches_full_forward_loss():
     ch.load_state_dict(base.state_dict())
     logits_ch, loss_ch, ce_ch = ch(tokens, targets)
     assert logits_ch is None                               # fused path forms no (B,N,V) logits
-    assert torch.allclose(loss_ch, loss_full, atol=1e-3)
-    assert torch.allclose(ce_ch, ce_full, atol=1e-3)
+    assert torch.allclose(loss_ch.to(loss_full.dtype), loss_full, atol=1e-3)
+    assert torch.allclose(ce_ch.to(ce_full.dtype), ce_full, atol=1e-3)
 
 
 def test_full_chunked_ce_grad_reaches_prior_tables():
@@ -363,7 +368,7 @@ def test_full_cov_chunked_matches_dense_on_non_pd():
 
     good = torch.ones(B, N, dtype=torch.bool)
     good[0, 1] = False
-    assert torch.allclose(chunked[good], dense[good], atol=1e-3)
+    assert torch.allclose(chunked[good].to(dense.dtype), dense[good], atol=1e-3)
     assert pb.decode_degenerate_positions(sigma_q)[good].sum() == 0
 
 

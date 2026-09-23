@@ -1,3 +1,5 @@
+import re
+
 import pytest
 import torch
 from torch import nn
@@ -71,8 +73,12 @@ def test_off_mode_registers_no_mlp_state_or_parameters():
     ],
 )
 def test_off_mode_warns_when_mlp_only_setting_is_nondefault(setting):
-    with pytest.warns(ConfigNotice, match="block MLP"):
-        _tiny_cfg(use_block_mlp=False, **setting)
+    # CL01: the structured inactive-field notice names each inert field with its value, and the
+    # same structural map feeds sweep admission through inactive_fields().
+    (name, value), = setting.items()
+    with pytest.warns(ConfigNotice, match=re.escape(f"{name}={value!r}")):
+        cfg = _tiny_cfg(use_block_mlp=False, **setting)
+    assert name in cfg.inactive_fields()
 
 
 def test_active_mlp_is_untied_per_layer():

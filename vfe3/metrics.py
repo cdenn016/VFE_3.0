@@ -656,6 +656,27 @@ def sigma_trace(
     return sigma.sum(dim=-1)
 
 
+def covariance_frozen_at_encode(cfg: object) -> bool:
+    r"""Whether the stack's output covariance is the encode-time token lookup Sigma(x_i).
+
+    No E-step covariance update runs on a projected ``attention_mode`` (the predictive readout keeps
+    ``sigma = belief.sigma``; relational filtering has no sigma arm) or under
+    ``skip_belief_sigma_update=True``. After the E-step only the mean-dependent delta-method seams
+    rewrite sigma -- a block MLP with ``block_mlp_covariance='delta_full'`` or CG coupling with
+    ``cg_covariance_mode='delta_full'``; the head mixer is a fixed per-token congruence and the
+    norms act on the mean alone. Without those seams tr Sigma_q(x_i) is a function of the input
+    token id x_i only, so the B1/EXP-3 statistics measure input-token variance against next-token
+    CE, not context-dependent belief uncertainty.
+    """
+    e_step_frozen = (getattr(cfg, "attention_mode", "transported") != "transported"
+                     or bool(getattr(cfg, "skip_belief_sigma_update", False)))
+    mlp_rewrites_sigma = (bool(getattr(cfg, "use_block_mlp", False))
+                          and getattr(cfg, "block_mlp_covariance", "passthrough") == "delta_full")
+    cg_rewrites_sigma = (bool(getattr(cfg, "use_cg_coupling", False))
+                         and getattr(cfg, "cg_covariance_mode", "passthrough") == "delta_full")
+    return e_step_frozen and not (mlp_rewrites_sigma or cg_rewrites_sigma)
+
+
 def rank_one_residual(
     mu:  torch.Tensor,                   # (..., N, K) per-token belief means of ONE layer
 
@@ -963,16 +984,28 @@ def guard_saturation(
     return out
 
 
-# --- gauge invariants (group-dispatched; fixes gauge_trace_spread's det-blindness) ---
+# --- per-token frame class functions (group-dispatched; fixes gauge_trace_spread's det-blindness) ---
+#
+# NOT gauge invariants of the declared local action. The model's gauge acts on vertex frames on the
+# LEFT, U_i -> g_i U_i with mu_i -> g_i mu_i, and on the flat coboundary Omega_ij = U_i U_j^{-1} the
+# local choice g_i = U_i^{-1} sends every frame to I (a pure-gauge connection), so no nonconstant
+# function of a single vertex frame is invariant under it. The functions below are conjugation-class
+# functions: invariant under one GLOBAL conjugation U_i -> g U_i g^{-1}, i.e. statistics of the frame
+# in the model's reference trivialization. Their metric keys ('gauge_invariant_spread',
+# 'gauge_head_*') are historical names kept for artifact compatibility.
 
 def group_gauge_invariant(
     exp_phi: torch.Tensor,               # (..., K, K) per-token vertex factor exp(embed(phi_i))
-    group,                               # GaugeGroup (dispatches the right invariant)
+    group,                               # GaugeGroup (dispatches the class function)
 
     *,
     eps:     float = 1e-12,
-) -> torch.Tensor:                       # (...) per-token scalar gauge invariant
-    r"""Per-token gauge invariant, dispatched on the group so it is non-vacuous for every group.
+) -> torch.Tensor:                       # (...) per-token scalar conjugation-class function
+    r"""Per-token frame class function, dispatched on the group so it is non-vacuous for every group.
+
+    Invariant under a global conjugation exp(phi_i) -> g exp(phi_i) g^{-1}, NOT under the declared
+    local left action U_i -> g_i U_i (see the section note above): it is a reference-trivialization
+    frame statistic, not a gauge-invariant observable, despite the historical function name.
 
     The logged ``gauge_trace_spread`` (= std of log|det Omega| = tr embed(phi)) is identically 0
     for the unimodular groups SO(K) and Sp(2m) (traceless generators, det == 1), so it is blind
@@ -987,8 +1020,9 @@ def group_gauge_invariant(
         ang = torch.angle(torch.linalg.eigvals(exp_phi))         # (..., K) eigenphases
         return 0.5 * ang.abs().sum(dim=-1)
     if name in ("sp", "sp_n"):
-        # The gauge action is GL(K) CONGRUENCE, so exp(phi) transforms by conjugation g exp(phi) g^{-1};
-        # the singular-value squeeze log(s_max/s_min) is invariant only under ORTHOGONAL conjugation, and
+        # The target symmetry is a GLOBAL conjugation g exp(phi) g^{-1} (see the section note: no
+        # vertex-frame function survives the local left action); the singular-value squeeze
+        # log(s_max/s_min) is invariant only under ORTHOGONAL conjugation, and
         # Sp(2m,R) is not orthogonal. Use the eigenvalue-MODULUS squeeze instead -- eigenvalues are
         # conjugation-invariant and symplectic spectra come in reciprocal pairs, so this is the natural
         # Ad-invariant squeeze (was frame-dependent under svdvals; audit 2026-06-13 review).
@@ -1004,7 +1038,11 @@ def per_head_gauge_invariants(
     *,
     eps:        float = 1e-12,
 ) -> Dict[str, torch.Tensor]:
-    r"""Per-head, per-token GL(d_head) invariants from the converged vertex factor.
+    r"""Per-head, per-token GL(d_head) conjugation-class functions of the converged vertex factor.
+
+    Invariant under a global in-group conjugation, NOT under the declared local left action
+    U_i -> g_i U_i (see the section note above), so these are reference-trivialization frame
+    statistics; the function name and the ``gauge_head_*`` keys are historical.
 
     For a block-diagonal group the head-h frame is the (d_head, d_head) diagonal block of
     ``exp_phi``; returns its log-volume ``logdet`` (..., H) and the eigenvalue-modulus squeeze
@@ -1012,14 +1050,15 @@ def per_head_gauge_invariants(
     (``irrep_dims = [K]``) yields H = 1. Feeds the per-head gauge-specialization ridgelines.
 
     ``anisotropy`` WAS the singular-value ratio ``s_max / s_min`` (audit 2026-07-27). That is
-    invariant only under ORTHOGONAL conjugation, while the gauge action here is GL(K) conjugation
-    ``g exp(phi) g^{-1}`` -- the same defect this module already corrected for ``sp`` in
+    invariant only under ORTHOGONAL conjugation, while the symmetry these statistics target is a
+    global GL(K) conjugation ``g exp(phi) g^{-1}`` -- the same defect this module already corrected for ``sp`` in
     ``group_gauge_invariant`` above, and for the same reason, but the per-head twin was left
     behind on ``block_glk``, the group the live config actually runs. Measured at block_glk K=4 in
     float64 under an in-group conjugation drawn from the group's own generators: ``logdet`` moved by
     3.7e-15 and the eigenvalue-modulus squeeze by 8.3e-15, while the SVD ratio moved by up to 301%.
-    Both returned entries are now genuine conjugacy-class functions, so the ``gauge_head_*`` keys and
-    the ``per_head_gauge_invariants`` name are honest.
+    Both returned entries are genuine conjugacy-class functions; that makes them invariant under a
+    global conjugation only, which is all the ``gauge_head_*`` keys and the
+    ``per_head_gauge_invariants`` name can claim.
 
     The value is a LOG ratio where the old one was a bare ratio, so the published
     ``gauge_head_aniso_mean`` column changes scale: it is now 0 at an isometric block and grows
@@ -1252,6 +1291,14 @@ def positional_content_score(
 
 
 # --- holonomy / curvature (corrected sampling; Regime-II quantity) ---
+#
+# Every registered, config-reachable transport is the coboundary Omega_ij = U_i U_j^{-1} built from
+# one vertex table ('flat', pair_transport_kind='coboundary'). On it the triangle holonomy
+# Omega_ij Omega_jk Omega_ki and the cocycle defect Omega_ik - Omega_ij Omega_jk telescope to I and 0
+# by construction (pure-gauge links close every Wilson loop), so these diagnostics can detect only
+# floating-point roundoff and the conditioning of the stored (U, U^{-1}) pair. They are
+# roundoff/consistency monitors of the coboundary construction, NOT flatness certificates; they
+# would carry structural information only for a registered non-coboundary transport.
 
 def holonomy_deviation_sampled(
     omega:            'torch.Tensor | CompactFactoredTransport',
@@ -1267,7 +1314,8 @@ def holonomy_deviation_sampled(
     samples the same low-index-token triangles -- a systematically biased curvature estimate)
     with seeded random distinct (i, j, k), returning the full per-triple distribution, a
     bootstrap-over-triples mean CI, and each triple's index span max|.-.|. On the flat phi-cocycle
-    every triangle closes (H = I) so this is ~0 (a flatness certificate).
+    every triangle closes (H = I) by construction, so this is ~0 up to roundoff: a numerical
+    consistency monitor of the coboundary, not a flatness certificate (see the section note).
     """
     compact = isinstance(omega, CompactFactoredTransport)
     n = _require_unbatched_square_token_transport(omega, "holonomy_deviation_sampled")
@@ -1328,7 +1376,9 @@ def holonomy_wilson_sampled(
     so the d_b-weighted mean sum_b (d_b/K) W^(b)/d_b recovers the full W/K; ``irrep_dims=None``
     keeps the equal-chunk decomposition byte-identical.
     The real part is exact (= Tr) for the real groups built today; it would need ``.real`` only for
-    a complex GL(K, C) gauge. On the flat phi-cocycle every triangle closes so W/K = 1 (deviation 0).
+    a complex GL(K, C) gauge. On the flat phi-cocycle every triangle closes by construction so
+    W/K = 1 (deviation 0) up to roundoff; on the coboundary-only registry this is a roundoff monitor,
+    not curvature evidence (see the section note).
     Seeded random triples match
     ``holonomy_deviation_sampled`` so the two observables are directly comparable.
     """
@@ -1431,9 +1481,12 @@ def cocycle_residual_sampled(
 ) -> torch.Tensor:                       # () mean ||Omega_ik - Omega_ij Omega_jk||_F over random triples
     r"""Cocycle defect mean ||Omega_ik - Omega_ij Omega_jk||_F over random distinct triples.
 
-    The flatness certificate at the level of the COMPOSITION law itself: a flat phi-cocycle
+    A consistency check of the COMPOSITION law itself: a flat phi-cocycle
     Omega_ij = exp(phi_i) exp(-phi_j) satisfies Omega_ik = Omega_ij Omega_jk exactly, so this is ~0
     (cheaper and more fundamental than the triangle holonomy, which is the special case k -> i).
+    Because every registered transport is built this way, a nonzero value measures floating-point
+    roundoff and the conditioning of the stored frame pair, never a property of the construction:
+    a roundoff monitor, not a flatness certificate (see the section note above).
     Seeded random triples (matching
     ``holonomy_deviation_sampled``) avoid the row-major low-index sampling bias.
     """
@@ -1574,21 +1627,45 @@ def bootstrap_token_ce_band(
     seed:            int   = 0,
     q_lo:            float = 0.025,
     q_hi:            float = 0.975,
+    block_len:       Optional[int] = None,
 ) -> Dict[str, float]:
-    r"""Paired bootstrap-over-TOKENS band for the ablation delta (arm minus full) cross-entropy.
+    r"""Paired bootstrap band for the ablation delta (arm minus full) cross-entropy.
 
     The SAME resample index is applied to both arms (paired), so the band reflects the per-token
     correlation between models, not independent noise. Single-seed-legitimate (within-run over the
     shared token set), not a cross-seed CI.
+
+    ``block_len`` selects the cluster design. The aligned stream is cut into consecutive blocks
+    b of ``block_len`` tokens (the evaluation window; the last block may be shorter), with paired
+    sums and counts
+
+    .. math:: D_b = \sum_{t \in b} (\ell^{\mathrm{arm}}_t - \ell^{\mathrm{full}}_t), \qquad n_b = |b|,
+
+    and whole blocks are resampled, each replicate being :math:`\sum_b D_b / \sum_b n_b` -- the
+    per-sequence ratio design of :func:`bootstrap_ce_band`. Tokens of one sequence share context,
+    so resampling them independently (``block_len=None``, kept for API compatibility) undercovers
+    whenever the per-token deltas are correlated within a sequence.
     """
     if arm_token_nats.shape != full_token_nats.shape:
         raise ValueError(f"paired bootstrap needs aligned tokens; got {tuple(arm_token_nats.shape)} "
                          f"vs {tuple(full_token_nats.shape)}")
     gen = torch.Generator(device=arm_token_nats.device).manual_seed(int(seed))
     m = arm_token_nats.shape[0]
-    idx = torch.randint(0, m, (n_boot, m), generator=gen, device=arm_token_nats.device)
-    delta = arm_token_nats[idx].mean(dim=1) - full_token_nats[idx].mean(dim=1)
     point = float(arm_token_nats.mean() - full_token_nats.mean())
+    if block_len is None:
+        idx = torch.randint(0, m, (n_boot, m), generator=gen, device=arm_token_nats.device)
+        delta = arm_token_nats[idx].mean(dim=1) - full_token_nats[idx].mean(dim=1)
+    else:
+        if isinstance(block_len, bool) or not isinstance(block_len, int) or block_len < 1:
+            raise ValueError(f"block_len must be a positive integer, got {block_len!r}")
+        paired = (arm_token_nats - full_token_nats).to(torch.float64)                  # (M,)
+        blocks = paired.split(block_len)
+        block_sums = torch.stack([chunk.sum() for chunk in blocks])                    # (S,) D_b
+        block_sizes = torch.tensor([chunk.numel() for chunk in blocks],
+                                   dtype=torch.float64, device=paired.device)          # (S,) n_b
+        s = block_sums.shape[0]
+        idx = torch.randint(0, s, (n_boot, s), generator=gen, device=paired.device)
+        delta = block_sums[idx].sum(dim=1) / block_sizes[idx].sum(dim=1)
     return {"delta": point, "lo": float(torch.quantile(delta, q_lo)), "hi": float(torch.quantile(delta, q_hi))}
 
 

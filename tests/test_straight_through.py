@@ -38,9 +38,13 @@ def _data(seed=0, V=15, B=2, N=4):
 
 # --- config validation -----------------------------------------------------
 def test_config_accepts_the_three_modes():
+    # The block MLP (on by default) runs inside the no-grad detach stack and would freeze, so
+    # detach is admitted only with it off; the fail-closed gate itself is pinned below.
     for mode in ("unroll", "straight_through", "detach"):
-        cfg = VFE3Config(e_step_gradient=mode)
+        cfg = VFE3Config(e_step_gradient=mode, use_block_mlp=False)
         assert cfg.e_step_gradient == mode
+    with pytest.raises(ValueError, match="gradient-carrying E-step"):
+        VFE3Config(e_step_gradient="detach", use_block_mlp=True)
 
 
 def test_config_rejects_unknown_mode():
@@ -59,7 +63,7 @@ def test_config_default_is_unroll():
 def test_config_mode_passthrough_is_canonical():
     assert VFE3Config(e_step_gradient="unroll").e_step_gradient == "unroll"
     assert VFE3Config(e_step_gradient="straight_through").e_step_gradient == "straight_through"
-    assert VFE3Config(e_step_gradient="detach").e_step_gradient == "detach"
+    assert VFE3Config(e_step_gradient="detach", use_block_mlp=False).e_step_gradient == "detach"
 
 
 # --- forward identity (the strong oracle) -----------------------------------

@@ -83,6 +83,9 @@ def test_bias_in_weight_decay_free_optimizer_group():
 
 
 def test_decode_bias_inert_under_prior_bank_warns():
+    # decode_bias is structurally inactive under a prior-bank decoder; the notice shows only a
+    # non-default value (the default True is silent), matching every other inactive field.
     with pytest.warns(UserWarning, match="decode_bias"):
-        VFE3Config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=4,
-                   decode_mode="diagonal_chunked", decode_bias=True)
+        cfg = VFE3Config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=4,
+                         decode_mode="diagonal_chunked", decode_bias=False)
+    assert "decode_bias" in cfg.inactive_fields()

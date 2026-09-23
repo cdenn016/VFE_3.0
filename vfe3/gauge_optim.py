@@ -4,6 +4,9 @@ Ordinary parameter groups retain standard AdamW. A stored phi-factor group selec
 ``pullback_group`` policy is staged in float64 through the strict pullback direction, trust scaling,
 a first-order-correct chart retraction, and exact right-product validation after storage rounding. Every phi candidate is validated before any phi
 table is mutated; committed gradients are consumed so base AdamW cannot apply a second update.
+A row whose pullback metric fails the conditioning certificate, or whose candidate cannot be
+backtracked inside the chart bound, is rejected individually (zero update, counted on the
+optimizer) instead of aborting the whole step (audit 2026-09-23 #10); nonfinite state still raises.
 """
 
 import math
@@ -135,6 +138,9 @@ class PullbackGroupCandidate:
     candidate_chart_norm:    torch.Tensor
     group_product_residual:  torch.Tensor
     direction:               PullbackGroupDirectionResult
+    # (active,) bool: rows whose update was rejected (candidate == current chart), either by the
+    # direction's conditioning certificate or because no backtracked step stayed inside the chart.
+    rejected_rows:           Optional[torch.Tensor] = None
 
 
 def _require_positive_finite(value: float, name: str) -> float:
@@ -227,11 +233,19 @@ def stage_pullback_group_candidate(
 ) -> PullbackGroupCandidate:
     r"""Stage the chart retraction ``phi_new = phi - eta v_phi`` without mutation.
 
-    Its derivative at eta=0 is the pullback natural direction at the CURRENT chart.
+    Its derivative at eta=0 is the Frobenius-pullback Riemannian direction at the CURRENT chart.
     Trust scaling uses ``xi = Psi_L(ad_phi) v_phi``. Backtracking bounds the difference
     from ``exp(phi) exp(-eta xi)``; this is a chart retraction, not exact group
     multiplication. The legacy ``bch_residual_max`` keyword retains that product
     tolerance. Certification uses values rounded to the input chart's storage dtype.
+
+    Per-row rejection (audit 2026-09-23 #10): a row whose pullback metric fails the direction
+    solver's conditioning certificate (undamped-eigenvalue floor or ``1e6`` damped condition)
+    takes a zero step, and a row whose candidate leaves ``chart_max_norm`` is backtracked like a
+    residual failure; if no backtracked step returns inside the chart, that row alone keeps its
+    current chart. Both are marked in ``rejected_rows``. Nonfinite inputs, candidates, residuals
+    and certificates of accepted rows still raise, as does a product-residual or descent failure
+    that survives every backtrack.
     """
     if not isinstance(group, GaugeGroup):
         raise TypeError(f"group must be a GaugeGroup, got {type(group).__name__}")
@@ -282,6 +296,14 @@ def stage_pullback_group_candidate(
             differential_mode=differential_mode,
             coordinate_layout=group.phi_coordinate_layout,
             irrep_dims=list(group.irrep_dims),
+            reject_ill_conditioned_rows=True,
+        )
+        # Rows the direction solver rejected on conditioning carry v_phi = xi = 0; a direction
+        # rule without per-row rejection keeps its own whole-batch fail-closed raise.
+        rejected = (
+            torch.zeros(grad64.shape[0], dtype=torch.bool, device=grad64.device)
+            if direction.accepted_rows is None
+            else ~direction.accepted_rows.reshape(grad64.shape[0])
         )
         direction_tensors = (
             direction.v_phi,
@@ -292,9 +314,13 @@ def stage_pullback_group_candidate(
             direction.scaled_solve_residual,
         )
         # Six separate ``bool()`` calls collapsed into one device-side reduction (audit 2026-08-07).
+        # A rejected row's certificates may be nonfinite (its metric is what failed); its step is 0.
         certificates_finite = direction_tensors[0].new_tensor(True, dtype=torch.bool)
         for value in direction_tensors:
-            certificates_finite = certificates_finite & torch.isfinite(value).all()
+            finite = torch.isfinite(value)
+            if finite.dim() > 1:
+                finite = finite.all(dim=-1)
+            certificates_finite = certificates_finite & (finite | rejected).all()
         if not bool(certificates_finite):
             raise FloatingPointError("pullback group direction returned a nonfinite certificate")
 
@@ -329,25 +355,18 @@ def stage_pullback_group_candidate(
             proposed = phi64[remaining] - learning_rate * scales * direction.v_phi[remaining]
             proposed = proposed.to(dtype=phi.dtype).to(dtype=torch.float64)
             chart_norm = embedded_phi_frobenius_norm(proposed, group, warn_fallback=False)
-            candidate_ok = (
-                torch.isfinite(proposed).all()
-                & torch.isfinite(chart_norm).all()
-                & (chart_norm <= chart_max_norm).all()
-            )
-            if not bool(candidate_ok):
-                if not bool(torch.isfinite(proposed).all() & torch.isfinite(chart_norm).all()):
-                    raise FloatingPointError("pullback group staging produced a nonfinite candidate")
-                raise FloatingPointError(
-                    "pullback group candidate chart norm "
-                    f"{float(chart_norm.max()):.6g} exceeds bound {chart_max_norm:.6g}"
-                )
+            if not bool(torch.isfinite(proposed).all() & torch.isfinite(chart_norm).all()):
+                raise FloatingPointError("pullback group staging produced a nonfinite candidate")
+            # A chart-bound violation is a per-row backtracking failure, not a whole-step abort.
+            outside_chart = chart_norm > chart_max_norm
             residual = _pullback_group_product_residual(
                 proposed, current_element[remaining], delta, group,
             )
             # Rounding must not turn the preconditioned chart descent into ascent.
             slope = (grad64[remaining] * (proposed - phi64[remaining])).sum(dim=-1)
             residual_finite = torch.isfinite(residual)
-            failures = (residual > residual_limit) | ~residual_finite | (slope > 0)
+            retraction_failed = (residual > residual_limit) | ~residual_finite | (slope > 0)
+            failures = retraction_failed | outside_chart
             candidate_phi[remaining] = proposed
             candidate_chart_norm[remaining] = chart_norm
             group_product_residual[remaining] = residual
@@ -359,16 +378,34 @@ def stage_pullback_group_candidate(
                     candidate_chart_norm=candidate_chart_norm,
                     group_product_residual=group_product_residual,
                     direction=direction,
+                    rejected_rows=rejected,
                 )
             if not bool(residual_finite.all()):
                 raise FloatingPointError(
                     "pullback group staging produced a nonfinite group-product residual"
                 )
             if attempt == max_backtracks:
-                raise FloatingPointError(
-                    "pullback group stored chart retraction failed its product residual "
-                    f"({float(residual.max()):.3e} versus {residual_limit:.1e}) or descent "
-                    f"check after {max_backtracks} reductions"
+                if bool(retraction_failed.any()):
+                    raise FloatingPointError(
+                        "pullback group stored chart retraction failed its product residual "
+                        f"({float(residual.max()):.3e} versus {residual_limit:.1e}) or descent "
+                        f"check after {max_backtracks} reductions"
+                    )
+                # Only chart-bound failures remain: those rows keep their current chart.
+                stuck = remaining[outside_chart]
+                candidate_phi[stuck] = phi64[stuck]
+                candidate_chart_norm[stuck] = embedded_phi_frobenius_norm(
+                    phi64[stuck], group, warn_fallback=False)
+                group_product_residual[stuck] = 0.0
+                rejected[stuck] = True
+                return PullbackGroupCandidate(
+                    candidate_phi=candidate_phi,
+                    trust_scale=trust_scale,
+                    backtracking_reductions=reductions,
+                    candidate_chart_norm=candidate_chart_norm,
+                    group_product_residual=group_product_residual,
+                    direction=direction,
+                    rejected_rows=rejected,
                 )
             # Accepted rows are retained; only unresolved rows pay for subsequent exponentials.
             remaining = remaining[failures]
@@ -526,6 +563,18 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
         # right-factor scale, active-row count, and accepted chart norm.
         self._collect_gauge_diag = False
         self._gauge_diag: dict   = {}
+        # Cumulative pullback-group rows whose update was rejected (zero step), kept on the device
+        # so the hot path never synchronizes for it; read through ``phi_rejected_rows``.
+        self._phi_rejected_rows: Optional[torch.Tensor] = None
+
+    @property
+    def phi_rejected_rows(self) -> int:
+        r"""Cumulative count of pullback-group row updates rejected since construction.
+
+        Counts rows rejected by the direction's conditioning certificate or by the chart bound
+        (audit 2026-09-23 #10). Reading it synchronizes with the device.
+        """
+        return 0 if self._phi_rejected_rows is None else int(self._phi_rejected_rows)
 
     def __setstate__(self, state) -> None:                             # type: ignore[override]
         r"""Restore generically, running Adam's step migration only where ``"step"`` exists.
@@ -591,6 +640,7 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
         covector_norm_acc: List[torch.Tensor] = []
         direction_norm_acc: List[torch.Tensor] = []
         effective_scale_acc: List[torch.Tensor] = []
+        rejected_acc: List[torch.Tensor] = []
         phi_active_rows = 0
 
         # Reject every nonfinite processed phi covector before deriving an active-row mask or
@@ -653,6 +703,9 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                     accepted_scale = candidate.trust_scale / torch.exp2(
                         candidate.backtracking_reductions.to(dtype=torch.float64)
                     )
+                    if candidate.rejected_rows is not None:
+                        accepted_scale = accepted_scale * (~candidate.rejected_rows).to(
+                            dtype=accepted_scale.dtype)
                     trust_acc.append(accepted_scale.reshape(-1))
                     chart_acc.append(candidate.candidate_chart_norm.reshape(-1))
                     previous = flat_phi[active].to(dtype=torch.float64)
@@ -680,6 +733,12 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                     committed = candidate.candidate_phi.to(dtype=p.dtype)
                     flat_phi[active] = committed
                     p.grad = None
+                    if candidate.rejected_rows is not None:
+                        rejected = candidate.rejected_rows.sum()
+                        rejected_acc.append(rejected)
+                        self._phi_rejected_rows = (
+                            rejected if self._phi_rejected_rows is None
+                            else self._phi_rejected_rows + rejected)
                 for p in pending_zero_gradients:
                     p.grad = None
                 continue
@@ -707,6 +766,8 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                     torch.cat(direction_norm_acc).mean(),
                     effective_scale.mean(),
                     effective_scale.min(),
+                    (torch.stack(rejected_acc).sum().to(dtype=effective_scale.dtype)
+                     if rejected_acc else effective_scale.new_zeros(())),
                 )).cpu().tolist()
                 self._gauge_diag.update({
                     "phi_ridge_direction_cosine_mean":         values[0],
@@ -724,5 +785,6 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                     "phi_conditioned_direction_norm_mean":     values[11],
                     "phi_effective_step_scale_mean":           values[12],
                     "phi_effective_step_scale_min":            values[13],
+                    "phi_group_rejected_rows":                 values[14],
                 })
         return super().step()                                          # closure already rejected above
