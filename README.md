@@ -1,0 +1,488 @@
+# V3_Transformer
+
+V3_Transformer is an experimental language model built from Gaussian attention and
+learned matrix-valued communication links. Each token carries a mean, covariance, and
+local frame. Query and key projections compare Gaussian observables; value and output
+maps determine what content is sent and how it enters the receiver's state.
+
+The primary configuration in `train_vfe3.py` uses **full-input/full-output projected
+attention with predictive-content readout**. Its attention step directly aggregates
+content, with a residual connection. The attention weights have a variational
+derivation. A single latent variational free energy for the complete language model
+is not established; the predictor trains on supervised next-token cross-entropy.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    Tokens["Token IDs"] --> Bank["PriorBank: means, covariances, frames"]
+    Bank --> State["Current Gaussian states and realized frames"]
+    State --> Compare["S_Q / S_K: projected Gaussian comparison"]
+    Compare --> Router["Gaussian KL + causal source prior: routing weights"]
+    State --> Send["T: extract content in reference coordinates"]
+    Router --> Pool["Weighted source aggregation"]
+    Send --> Pool
+    Pool --> Receive["O: write full reference state; apply receiver frame"]
+    Receive --> Residual["Attention residual + configured block transforms"]
+    Residual --> Next["Repeat through the layer stack"]
+    Next --> Decode["Linear vocabulary readout"]
+    Decode --> Loss["Next-token cross-entropy"]
+```
+
+Every layer has its own query, key, value, and output maps. The current launcher
+also enables a block MLP and block LayerNorm. Forward computations use the available
+prefix; next-token targets enter the training loss.
+
+| Symbol | Meaning |
+|---|---|
+| $K$ | Total state dimension (`embed_dim`). |
+| $H$ | Communication-head count (`n_heads`). |
+| $d=K/H$ | Comparison and value dimension per head in the equal-head implementation. |
+| $\ell$ | Layer index, suppressed below for one layer. |
+| $U_i$ | Invertible realized frame at token $i$. |
+| $(\mu_i,\Sigma_i)$ | Gaussian mean and covariance at that token. |
+| $\beta_{ij}^{(h)}$ | Receiver $i$'s routing weight for sender $j$ in head $h$. |
+
+## States, frames, and matrix links
+
+The theory starts from a principal bundle of frames with structure group
+$G=\mathrm{GL}(K,\mathbb R)$ and its associated vector and Gaussian-state bundles.
+A frame section and a belief section are distinct objects. The finite token model
+uses token-indexed fibers and a reference trivialization; it does not require a
+smooth contextual base or discretize a continuum connection.
+
+Write the state and its moments in reference coordinates as
+
+$$
+q_i=\mathcal N(\mu_i,\Sigma_i),\qquad
+\xi_i=U_i^{-1}\mu_i,\qquad
+C_i=U_i^{-1}\Sigma_i U_i^{-\top}.
+$$
+
+The full-Gaussian theory assumes $\Sigma_i\succ0$. The current launcher uses
+`gaussian_diagonal`. The projected route also admits `gaussian_full`,
+`gaussian_diagonal_exact`, and `gaussian_frame_diagonal` under its configuration
+guards. A diagonal stored state can yield a dense projected covariance.
+
+### Comparison interfaces
+
+With full input scope, each head reads all $K$ reference coordinates through
+
+$$
+S_{Q,h},S_{K,h}\in\mathbb R^{d\times K}.
+$$
+
+The query measures the receiver and the key measures the sender in a common
+$d$-dimensional comparison space:
+
+$$
+Q_{i,h}=\mathcal N(S_{Q,h}\xi_i,S_{Q,h}C_iS_{Q,h}^{\top}),\qquad
+K_{j,h}=\mathcal N(S_{K,h}\xi_j,S_{K,h}C_jS_{K,h}^{\top}).
+$$
+
+The routing cost is the directed Gaussian divergence
+
+$$
+D_{ij}^{(h)}=D_{\mathrm{KL}}(Q_{i,h}\Vert K_{j,h}).
+$$
+
+Positive-definite projected covariances require full row rank of the comparison
+maps. Their rows are initialized orthonormally, then trained as free matrices;
+the implementation does not continually orthonormalize them.
+
+The two measurement maps $S_{Q,h}U_i^{-1}$ and $S_{K,h}U_j^{-1}$ do not uniquely
+specify a map back into the receiver's full state. Content transmission supplies
+that additional choice.
+
+### Sending and receiving interfaces
+
+With full input and output scope,
+
+$$
+T_h\in\mathbb R^{d\times K},\qquad O_h\in\mathbb R^{K\times d}.
+$$
+
+The sender extracts content through $T_hU_j^{-1}$; the receiver places it through
+$U_iO_h$. Their composition is the matrix link
+
+$$
+L_{ij}^{(h)}=(U_iO_h)(T_hU_j^{-1}).
+$$
+
+Each head can read and write every state coordinate through a smaller channel.
+$T_h,O_h$ start at corresponding block placements, but their other input columns
+and output rows are trainable. **Full input/output describes access scope, not
+full covariance.** These interfaces select and place content; no Shannon
+channel-capacity or coding theorem is assumed.
+
+A link can be rank deficient even though its endpoint frames are invertible.
+It is an additional map on associated vector fibers, not generally a group-valued
+principal-bundle transition function. The flat frame identification
+
+$$
+\Omega_{ij}=U_iU_j^{-1}
+$$
+
+is recovered when the intervening processing map is the identity. Generally,
+$O_hT_h\ne I_K$ and $L_{ij}L_{jk}\ne L_{ik}$. Such processing effects do not imply
+curvature of the flat reference connection.
+
+### Heads and frame blocks
+
+The current `block_glk` implementation couples the number of equal frame blocks
+to the number of heads. The theory distinguishes them: a full-input/output head
+can access several frame blocks. Calling each such head an irreducible
+representation requires additional restrictions on its interface maps.
+Block-diagonal frames alone also do not imply statistical independence of
+Gaussian blocks.
+
+## Routing and predictive content
+
+Let $\pi_{ij}^{(h)}$ be a normalized prior on the permitted sources, with zero
+mass outside causal support, and let $\tau_h>0$. At fixed states, minimizing
+
+$$
+\mathcal F_i^{(h)}(\beta)
+=\sum_j\beta_{ij}^{(h)}D_{ij}^{(h)}
++\tau_h\sum_j\beta_{ij}^{(h)}
+\log\frac{\beta_{ij}^{(h)}}{\pi_{ij}^{(h)}}
+$$
+
+over source probabilities gives
+
+$$
+\beta_{ij}^{(h)}
+=\operatorname{softmax}_j\left(\log\pi_{ij}^{(h)}-D_{ij}^{(h)}/\tau_h\right).
+$$
+
+This is the variational attention calculation. `include_attention_entropy=True`
+is required by the projected route; entropy regularization determines the Gibbs
+weights without an iterative gradient update over them. The attention-temperature
+policy uses `kappa_beta` and head dimensions. The current launcher selects a
+`causal_alibi` source prior and a finite `attention_window`.
+
+Runtime numerical KL bounds apply before softmax. Finite `kl_max` clips large
+energies; `float("inf")` removes the upper ceiling while retaining the nonnegative
+floor. The implemented energy can therefore differ from the unmodified KL above.
+
+The predictive message and attention output are
+
+$$
+m_i=\sum_h\sum_j\beta_{ij}^{(h)}L_{ij}^{(h)}\mu_j,\qquad
+\mu_i^{\mathrm{attn}}=
+\begin{cases}
+\mu_i+m_i,&\text{with attention residual},\\
+m_i,&\text{without attention residual}.
+\end{cases}
+$$
+
+The code extracts values, pools sources, applies output maps, sums heads, and
+applies the receiver frame. It need not materialize every $K\times K$ pair link.
+These formulas use a common score/value frame, as in the current launcher's
+`pos_rotation="none"` setting; optional rotary-position policies can give
+comparison and content distinct realized frames.
+
+`predictive_content` leaves covariance unchanged **within this attention step**.
+It does not compute the covariance of a Gaussian mixture or a routed population
+joint law. Subsequent block transforms and stack handoff have separate covariance
+policies. Mean aggregation alone is not exact Gaussian propagation through an
+entire nonlinear layer.
+
+**There is no gradient-based inner belief E-step on this branch.** Source means,
+routing scores, frames, and content maps retain their outer training graphs.
+Outer learning therefore still differentiates through the attention computation.
+
+### Transformer correspondence
+
+Content aggregation has the usual value/output factorization, expressed through
+frames. If every projected key covariance in a head equals $C_K$, write
+$a_i=S_Q\xi_i$ and $b_j=S_K\xi_j$. Then
+
+$$
+-D_{\mathrm{KL}}(Q_i\Vert K_j)
+=a_i^\top C_K^{-1}b_j-\frac12 b_j^\top C_K^{-1}b_j
++\text{row constant}.
+$$
+
+The score contains a dot product **and a key-norm bias**. Ordinary dot-product
+routing additionally requires the bias to be constant or canceled by a specified
+source prior, with appropriate temperature scaling. Varying key covariances retain
+further uncertainty-dependent terms. The current model does not impose this limit.
+
+## Configuration and training
+
+The editable launcher dictionary is distinct from the defaults in
+[`VFE3Config`](vfe3/config.py). These selectors describe the primary route,
+rather than a complete standalone configuration:
+
+```python
+config.update(
+    relational_mode="projected_filtering",
+    relational_input_scope="full",
+    relational_readout_mode="predictive_content",
+    relational_output_scope="full",
+    attention_residual=True,
+    gradient_mode="filtering",
+    include_attention_entropy=True,
+    divergence_family="renyi",
+    renyi_order=1.0,                       # Gaussian KL
+    gauge_group="block_glk",
+    transport_mode="flat",                # reference frames; links also include O @ T
+    n_e_steps=1,
+    skip_belief_sigma_update=True,
+    e_phi_lr=0.0,
+    encode_mode="per_token",
+    decode_mode="linear",
+)
+```
+
+The validator also requires `e_step_update="gradient"`,
+`e_step_gradient="unroll"`, and `oracle_unroll_grad=True`. Despite that selector
+name, `predictive_content` dispatches to direct readout before the belief-gradient
+branch. Equal heads, at least two heads, and no cross-couplings are required.
+Consult the validator for the complete admission rules.
+
+| Setting | Effect on the predictive route |
+|---|---|
+| `projected_filtering` | Selects projected comparison and relational operators. |
+| `predictive_content` | Selects direct content aggregation. |
+| `gradient_mode="filtering"` | Required family selector; does not imply an inner gradient step here. |
+| `e_q_mu_lr`, `e_q_sigma_lr` | Unread by the predictive readout. |
+| `e_phi_lr=0` | No inner frame update; outer frame learning can remain active. |
+| `lambda_alpha`, `lambda_alpha_mode`, `b0`, `c0` | Unused by predictive readout; may affect separately enabled outer self-coupling. |
+| `m_relational_score_lr` | Outer rate for $S_Q,S_K$ across layers. |
+| `m_relational_content_lr` | Outer rate for $T,O$ across layers. |
+| `family="gaussian_full"` | Full stored covariance, independent of input/output scope. |
+
+Relational rates of `None` inherit `m_p_mu_lr`; `0.0` freezes that role's
+parameters while retaining its forward operation. Score and content groups have
+zero weight decay.
+
+The launcher constructs `VFE3Config` from its dictionary with a per-run seed
+override. The model creates one `RelationalOperators` instance per layer and the
+stack passes the matching instance to the attention step. Saved configurations
+and provenance identify experiments; mutable launcher widths and rates are not
+fixed architectural constants.
+
+### Token priors and language-model loss
+
+`PriorBank.encode` initializes states from learned token priors. Token and
+configured positional components form the frames. The input bank remains present
+with a linear decoder; there is no `use_prior_bank` switch.
+
+A linear vocabulary readout of the final mean, followed by softmax, defines a
+normalized autoregressive model. With $\mathcal T$ the unmasked targets and
+$M=|\mathcal T|$,
+
+$$
+p_\theta(x_{i+1}\mid x_{\le i})=\operatorname{softmax}(z_i)_{x_{i+1}},\qquad
+\mathcal L_{\mathrm{CE}}=-\frac1M\sum_{i\in\mathcal T}
+\log p_\theta(x_{i+1}\mid x_{\le i}).
+$$
+
+Outer backpropagation trains enabled prior, frame, interface, MLP, normalization,
+and decoder parameters. Optional outer penalties are separate choices. This loss
+is not the same scalar as the variational routing objective.
+
+Prior-bank divergence decoders remain available in other compatible profiles.
+For example, `diagonal_chunked` and `full_chunked` score vocabulary Gaussians.
+That output choice is distinct from token initialization; the current projected
+route requires `linear` decoding.
+
+### Optional belief-revision paths
+
+The engine retains gradient filtering, smoothing and surrogate objectives, and
+`mm_exact` frozen-attention updates. These are alternative update families.
+`mm_exact` minimizes a frozen-attention surrogate, not the entire language-model
+objective.
+
+`relational_readout_mode="conditional_update"` selects projected conditional
+belief gradients. Its current envelope permits one layer and head-local output.
+Changing from predictive content requires compatible settings beyond one switch.
+`relational_mode="off"` enables other supported belief-refinement constructions.
+The optional gradient machinery is not a required derivation of predictive content.
+
+## Geometry and scope
+
+For consistently transformed full Gaussian data, the passive endpoint change
+
+$$
+\mu_i\mapsto g_i\mu_i,\quad
+\Sigma_i\mapsto g_i\Sigma_i g_i^\top,\quad
+U_i\mapsto g_iU_i
+$$
+
+leaves reference measurements and routing invariant and yields
+
+$$
+L_{ij}^{(h)}\mapsto g_iL_{ij}^{(h)}g_j^{-1}.
+$$
+
+This is a property of the attention construction, not an unrestricted symmetry
+guarantee for the entire executable model. Diagonal projection, coordinate
+LayerNorm, nonlinear MLPs, numerical clipping, and a fixed vocabulary decoder
+each require their own analysis. Full-Gaussian theory and the selected executable
+approximation should remain distinct.
+
+## Implementation map
+
+| Responsibility | Source |
+|---|---|
+| Defaults, compatibility, inactive-setting advisories | [`config.py`](vfe3/config.py) |
+| Per-layer interfaces and factorized aggregation | [`relational_operators.py`](vfe3/model/relational_operators.py) |
+| Projected Gaussian scoring | [`relational_scoring.py`](vfe3/relational_scoring.py) |
+| Predictive readout and conditional gradients | [`relational.py`](vfe3/gradients/relational.py) |
+| Gibbs weights and optional objectives | [`free_energy.py`](vfe3/free_energy.py) |
+| Runtime branch selection | [`e_step.py`](vfe3/inference/e_step.py) |
+| Encoding and alternative decoders | [`prior_bank.py`](vfe3/model/prior_bank.py) |
+| Groups, frames, and reference transport | [`geometry/`](vfe3/geometry/) |
+| Model and stack | [`model.py`](vfe3/model/model.py), [`stack.py`](vfe3/model/stack.py) |
+| Block transforms | [`block.py`](vfe3/model/block.py), [`block_mlp.py`](vfe3/model/block_mlp.py) |
+| Outer optimizer and training | [`train.py`](vfe3/train.py) |
+| Belief representations and families | [`belief.py`](vfe3/belief.py), [`families/`](vfe3/families/) |
+
+Registries expose distribution, divergence, transport, encoding, decoding, and
+other extension points. Configuration guards and runtime contracts determine
+which combinations the projected route supports.
+
+## Running the repository
+
+### Installation and data
+
+Use Python 3.10 or newer. Install the project and its development, data, and visualization
+extras from the repository root:
+
+```powershell
+python -m pip install -e ".[dev,data,viz]"
+```
+
+Real-corpus entrypoints are cache-only. They expect pre-tokenized `.pt` streams or
+`.bin` streams with their sidecars under `~/.cache/tokenized_cache`. The loaders do not
+download, tokenize, or replace a missing real corpus with synthetic data.
+
+That applies to the loaders, not to the corpus builders. The word-level WikiText-103 cache is
+built by a script that does fetch and tokenize:
+
+```powershell
+python build_wikitext103_word_cache.py
+```
+
+It pins the corpus revision, tokenizes on whitespace, and writes the `wikitext-103-word` caches
+plus their vocabulary sidecar. Setting `DATASET = "wikitext-103-word"` in an entrypoint selects
+them, and `vocab_size` follows the dataset automatically. The word vocabulary is the measured
+reference set (267,734 ids: the training split's distinct tokens, with the corpus's own `<unk>`
+marker at id 0), which is far larger than the GPT-2 vocabulary, so token tables and
+vocabulary readout can dominate parameter and memory cost.
+`--min-count N` rebuilds with a frequency cutoff to trade vocabulary size against OOV.
+
+### Click-to-run workflow
+
+Entrypoints do not parse command-line configuration. Edit the configuration dictionary
+near the top of the selected script, then run it directly:
+
+```powershell
+python train_vfe3.py
+```
+
+Use a CUDA-enabled PyTorch environment for GPU training. On the author's workstation
+this is `C:/anaconda/python.exe`; bare `python` resolves to a CPU-only installation.
+The launcher checks CUDA availability, so the wrong interpreter can select CPU.
+
+| Entrypoint | Scope |
+|---|---|
+| [`train_vfe3.py`](train_vfe3.py) | Primary cached-corpus training, evaluation, and finalization path. |
+| [`ablation.py`](ablation.py) | Named architecture and configuration ablations. |
+| [`scaling.py`](scaling.py) | Independent baseline with width, depth, joint-size, and training-budget grids; see [scaling settings](docs/scaling-settings.md). |
+| [`make_figures.py`](make_figures.py) | Regenerates eligible figures from a saved run. |
+
+### Focused validation
+
+Locate tests relevant to the changed path:
+
+```powershell
+rg --files tests | rg "relational|predictive|projected"
+```
+
+Run selected files with `python -m pytest tests/<selected_file>.py`. The pytest
+configuration already supplies quiet output. For device-aware CUDA tests, select a
+CUDA-enabled interpreter and set `$env:VFE3_TEST_DEVICE = "cuda"`. Setting that
+variable alone does not make a CPU-only PyTorch installation CUDA-capable.
+CPU model tests should use tiny dimensions.
+
+## Outputs and diagnostics
+
+When a [`RunArtifacts`](vfe3/run_artifacts.py) instance is supplied, a run directory under
+`vfe3_runs/` becomes the durable record.
+
+| Artifact | Contents |
+|---|---|
+| `config.json` | Full configuration plus run metadata. |
+| `metrics.csv` | Periodic training, validation, and diagnostic rows. |
+| `checkpoints/step_<N>.pt` | Resumable model, optimizer, RNG, configuration, and step state. |
+| `best_model.pt` | Semantic best-validation model bundle with configuration fingerprint. |
+| `final_model.pt` | Fully trained weights with configuration and code identity; used for final testing and reports. |
+| `final_validation.json` | Validation metrics at the final training step. |
+| `test_results.json` | Held-out test evaluation of the final training weights, with the evaluated step recorded. |
+| `provenance.json` | Git, environment, and dataset provenance. |
+| `summary.json` | Headline end-of-run values and timing. |
+| `pure_path_report.json` | Configuration audit attempted during every finalization; write failures are logged and skipped. |
+| `research.json` and figure files | Optional research probes and diagnostic or publication-oriented plots. |
+
+All finalization-time plotting and plot-only model replays obey `generate_figures`. Setting it to
+`False` is a strict compute and filesystem opt-out. `make_figures.py` later regenerates the
+model-replay publication set, missing depth/phi probes, and every history dashboard supported by the
+run's persisted metrics. A full-resolution `loss_curve.png` is available only when end-of-training
+figure generation receives the in-memory per-step loss history; strict-opt-out runs persist cadence-
+sampled losses rather than that complete list. Numeric artifacts remain available when optional
+visualization fails.
+
+### Figure registry and report selection
+
+`vfe3/viz/figures.py` registers every figure generator under a name through `register_figure`;
+`get_figure` resolves that name to a callable at call time. Registration and report selection are
+separate steps: a registered generator is merely available, and becomes production-reachable only
+when some report driver selects it by name, either through a `vfe3.viz.specs.FigureSpec` (name,
+output filename, and an adapter mapping a shared context to that generator's kwargs or to `None`
+to skip) dispatched by `emit_registered_figures`, or, for a scalar diagnostic, through the
+`DIAGNOSTIC_METRIC_OUTPUTS` name list in `vfe3/metrics.py` that `VFEModel.diagnostics()` reads.
+`emit_registered_figures` isolates failures per spec and publishes each output atomically (a
+same-directory temporary file replaces the target only after a nonempty write succeeds), so one
+builder crashing, or an adapter returning `None`, withholds only that one figure.
+
+Two production drivers dispatch through this seam. `scaling_analysis.analyze()` writes
+`capacity_scaling.png` and `pareto_frontier.png` under `<input_dir>/figures/` alongside the
+existing `scaling_points.csv` / `scaling_summary.json` / `SCALING_ANALYSIS.md` / legacy figures;
+both read `vfe3.viz.sweep_adapters.aggregate_validation_points`, which collapses seeds into one
+point per `(route, label)` keyed on each run's persisted `best_val_ppl` (never a test metric), so
+neither figure requires the held-out test split the rest of the scaling report uses. An axis or
+the whole figure is withheld, not fabricated, when a required route never ran or a point is
+missing. `ablation.py`'s per-sweep loop writes `ablation_forest.png` for any sweep declaring
+`paired_token_bootstrap=True` (reading each cell's persisted `val_token_nats.pt`, re-verified by
+SHA-256, size, numel, and dtype against its `ablation_result.json` marker before it is trusted)
+and `lr_grid_heatmap.png` for any sweep declaring `grid_x`/`grid_y` (requiring the exact declared
+Cartesian product of cells, each carrying a finite `primary_val_ppl`), alongside the existing
+`sweep_results.csv` / `sweep_meta.json` / per-sweep PPL figure. The two sweeps that populate these
+figures, `component_ablation_forest` and `e_q_mu_sigma_lr_grid`, are registered but kept out of
+`SWEEP_ORDER`, so a default ablation run does not pay for them; naming either sweep explicitly
+runs it and its figure.
+
+## Theory and manuscripts
+
+This README follows `GL(K)_attention_v2.tex`. The current manuscript sources are
+maintained outside this checkout in the author's `Research/manuscripts/` directory:
+
+| Document | Scope |
+|---|---|
+| `GL(K)_attention_v2.tex` | Principal/associated bundles, comparison interfaces, matrix links, token priors, predictive composition, and transformer correspondence. |
+| `GL(K)_supplementary_v2.tex` | Supporting probabilistic, covariance, nonlinear-closure, and causal-prediction results. |
+| `GL(K)_gradients.tex` | Optional variational belief objectives, derivatives, and gradient updates. |
+| `PIFB2.tex` | Broader contextual bundle/variational framework; not an implemented multiscale language-model specification. |
+
+The current v2 set is maintained in that external manuscript directory. The
+formulas and implementation map above describe the architecture without depending
+on older manuscript copies.
+
+The `grow_K_mup` scaling route varies `e_q_mu_lr` and requires gradient belief
+updates; it rejects `mm_exact` and `predictive_content`, which do not read that rate.
+Use the standard width/depth/budget grids for predictive content; see
+[scaling settings](docs/scaling-settings.md).

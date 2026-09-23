@@ -1,0 +1,22 @@
+{
+  "schema_version": "rigorous-theory-search/v1",
+  "contract_id": "{{CONTRACT_ID}}",
+  "target_digest": "{{TARGET_DIGEST}}",
+  "attacks": [],
+  "independent_reconstruction": {
+    "claim_ids": [],
+    "method": "Independent reconstruction has not been performed.",
+    "result": "NOT_RUN",
+    "conclusion": "No reconstruction conclusion is available.",
+    "artifact_path": null,
+    "artifact_sha256": null
+  },
+  "oracle_erasure": {
+    "claim_ids": [],
+    "method": "Oracle erasure has not been performed.",
+    "result": "NOT_RUN",
+    "conclusion": "No oracle-erasure conclusion is available.",
+    "artifact_path": null,
+    "artifact_sha256": null
+  }
+}

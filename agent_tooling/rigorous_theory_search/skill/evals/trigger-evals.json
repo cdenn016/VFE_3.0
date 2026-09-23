@@ -1,0 +1,34 @@
+[
+  {
+    "query": "Develop and prove a complete new conjecture about Fisher pullback geometry, using independent proof routes and adversarial verification.",
+    "should_trigger": true
+  },
+  {
+    "query": "Construct the exact coarse-grained effective VFE for a general attention-weighted multi-agent network and derive its RG flow and fixed points.",
+    "should_trigger": true
+  },
+  {
+    "query": "Give a rigorous local-to-global ELBO derivation, including all gluing hypotheses and interaction corrections.",
+    "should_trigger": true
+  },
+  {
+    "query": "Prove a full theorem about sections of associated statistical bundles pulling Fisher geometry back to the base.",
+    "should_trigger": true
+  },
+  {
+    "query": "Solve the linear system 2x+y=5 and x-y=1.",
+    "should_trigger": false
+  },
+  {
+    "query": "Fix the off-by-one error in this Python list loop and add a unit test.",
+    "should_trigger": false
+  },
+  {
+    "query": "Summarize the abstract of this supplied paper in three sentences.",
+    "should_trigger": false
+  },
+  {
+    "query": "Explain what a principal bundle is to a graduate student.",
+    "should_trigger": false
+  }
+]

@@ -1,0 +1,1640 @@
+r"""Gauge-frame (phi) gradient preconditioner for VFE_3.0 (Gaussian-specialized).
+
+Conditions a Euclidean gradient grad_phi (coordinates in a generator basis) before
+the Lie-algebra retraction. A config-selected registry of metrics:
+  none               identity (the canonical update: no metric correction; the
+                     gradient lives in the Lie algebra g, a vector space).
+  clip               norm-clip baseline grad * min(1, c / ||grad||).
+  killing            Cartan-involution metric g~ = 2K*gram - 2*tr(x)tr(.), center-
+                     regularized then inverted (natural gradient grad @ g~^{-1}).
+  killing_per_block  block-diagonal Killing metric (per irrep block).
+  pullback           position-dependent natural gradient via the differential of
+                     the exponential map: G_ab(phi) = <d exp_phi(T_a), d exp_phi(T_b)>_F.
+  pullback_per_block per-irrep-block pullback metric (each block's local d_h-dim rep;
+                     feasible at K > max_k where the full pullback raises).
+Coordinates in, coordinates out (..., n_gen) -- same units as retract_phi's
+delta_phi, so the E-step is grad -> precondition -> retract. Pure: takes a
+generator TENSOR, not a GaugeGroup.
+
+Gauge-equivariance caveat (killing / killing_per_block): the Cartan-involution
+metric uses the Frobenius form tr(G_a^T G_b), which is Ad-invariant only under
+the COMPACT subgroup (tr((gXg^-1)^T gYg^-1) = tr(X^T Y) iff g^T g = I). So the
+Killing-preconditioned natural gradient is gauge-equivariant under SO(N) but NOT
+under general GL(K) in the non-compact (symmetric) directions; it is a left-/
+Ad(K)-invariant metric, not a bi-invariant one. The pullback metric is the
+position-dependent alternative for the non-compact regime.
+"""
+
+from collections import OrderedDict
+from dataclasses import dataclass
+import inspect
+import math
+import warnings
+import weakref
+from typing import Callable, Dict, List, Optional
+
+import torch
+
+from vfe3.geometry.lie_ops import gram_pinv, warn_if_basis_not_closed
+from vfe3.numerics import safe_eigvalsh
+
+_PRECOND: Dict[str, Callable[..., torch.Tensor]] = {}
+
+
+@dataclass(frozen=True)
+class PullbackGroupDirectionResult:
+    v_phi:                               torch.Tensor
+    xi:                                  torch.Tensor
+    min_undamped_generalized_eigenvalue: torch.Tensor
+    undamped_generalized_condition:      torch.Tensor
+    damped_generalized_condition:        torch.Tensor
+    scaled_solve_residual:               torch.Tensor
+    series_order:                        int
+    # Full (..., d, d), or equal direct-sum blocks (..., H, d, d).
+    current_element:                     Optional[torch.Tensor] = None
+
+
+@dataclass(frozen=True)
+class _StrictBasisPreparation:
+    basis:             torch.Tensor
+    structure:         torch.Tensor
+    gram:              torch.Tensor
+    gram_factor:       torch.Tensor
+    gram_inverse_half: torch.Tensor
+    gram_is_identity:  bool
+
+
+@dataclass(frozen=True)
+class _StrictBlockPreparation:
+    index:               torch.Tensor
+    basis:               _StrictBasisPreparation
+    matches_first_basis: bool
+
+
+class _MixedPhiDifferentialOrder(ValueError):
+    """Signal that leading strict blocks have different first certified orders."""
+
+
+_PHI_GROUP_DIRECTIONS: Dict[str, Callable[..., PullbackGroupDirectionResult]] = {}
+_PHI_GROUP_DIRECTION_ACCEPTS_COORDINATE_LAYOUT: Dict[str, bool] = {}
+_PHI_GROUP_DIRECTION_ACCEPTS_DIFFERENTIAL_MODE: Dict[str, bool] = {}
+_PHI_GROUP_DIRECTION_REQUIRES_SOURCE_BASIS: Dict[str, bool] = {}
+
+# Candidate orders at which the tail certificate below is TESTED. The floor is not a precision
+# setting -- the certificate is what bounds the error, and it is unchanged -- it only decides how
+# early the loop is allowed to notice it has already converged (audit 2026-08-07).
+#
+# It was 40. Measured against the live block_glk structure constants at phi_scale=0.06, the
+# geometric majorant certifies by order 17 (raw term magnitude crosses 1e-12 by order 12), so 40
+# ran ~23 redundant matmuls of the full (n_blocks, active_rows, n_gen, n_gen) workspace -- 78.5% of
+# the staging call at 256 active rows. In the other direction 40 is not conservative either: at 8x
+# the live phi scale the certificate demands 58, and the floor cannot help there because it is a
+# floor, not a target. Testing from 8 in steps of 4 costs at most a few extra certificate
+# evaluations and returns the first order the SAME majorant accepts.
+_PHI_GROUP_MIN_SERIES_ORDER: int   = 8
+_PHI_GROUP_MAX_SERIES_ORDER: int   = 128
+_PHI_GROUP_SERIES_ORDER_STEP: int  = 4
+_PHI_GROUP_TAIL_TOL: float         = 1e-12
+_PHI_GROUP_GRAM_RIDGE: float       = 1e-6
+_PHI_GROUP_MIN_UNDAMPED_EIG: float = 1e-8
+_PHI_GROUP_MAX_DAMPED_COND: float  = 1e6
+_PHI_GROUP_SOLVE_RESIDUAL: float   = 1e-10
+
+# How the trivialized exponential differentials Psi_R / Psi_L are evaluated (audit 2026-08-08).
+#
+# "series"   -- the truncated power series with the geometric-majorant certificate. The historical
+#               default, and still the default: it is basis-agnostic, real-arithmetic, and has no
+#               conditioning failure mode.
+# "spectral" -- the exact Daleckii-Krein closed form. Psi(ad_X) is diagonal in the eigenbasis of
+#               ad_X, whose eigenvalues are lam_i - lam_j for lam = eig(X), so ONE d x d
+#               eigendecomposition replaces the whole matmul ladder. Exact in exact arithmetic:
+#               there is no truncation and hence no order to certify.
+#
+# OPT-IN, because the closed form trades a truncation error for a CONDITIONING one. It needs
+# P = eigenvectors(X), and X is a general real matrix built from an unconstrained gradient: it can
+# be defective (P singular, no eigenbasis at all) and is near-defective on a set of positive
+# measure. Measured loss is about 2*log10(kappa(P)) digits. At the live phi scale kappa(P) has
+# median 11 / p99 70 / max 117 over 400 draws, i.e. ~12 digits retained -- comfortable -- but the
+# guards below fall back to the series rather than trusting that in general.
+_PHI_GROUP_DIFFERENTIAL_MODES = ("series", "spectral")
+_PHI_GROUP_DIFFERENTIAL_MODE: str = "series"
+# kappa_F(P) = ||P||_F ||P^-1||_F, an upper bound on kappa_2(P), so the trigger is conservative:
+# it can fall back when the true conditioning is fine, never the reverse.
+_PHI_GROUP_SPECTRAL_MAX_COND: float = 1e6
+# Two basis changes amplify floating-point error by kappa(P)^2. This budget
+# supplements invertibility; it is not a forward-error certificate for eig.
+_PHI_GROUP_SPECTRAL_ROUNDOFF_BUDGET: float = 1e-10
+# Bound the main float64 n_gen-by-n_gen workspaces, including temporaries.
+_PHI_GROUP_WORKSPACE_BYTES: int = 64 * 1024 * 1024
+_PHI_GROUP_DENSE_WORKSPACES: int = 12
+# Psi(ad_X) is a real operator on a real algebra, so its coordinate matrix must come out real. A
+# nonneglible imaginary residue is the eigendecomposition telling us it failed -- a free check on
+# tensors already computed, and the reason the spectral route can fail closed rather than silently.
+_PHI_GROUP_SPECTRAL_MAX_IMAG: float = 1e-8
+
+_STRICT_PULLBACK_PREP_CACHE_MAXSIZE: int = 32
+_STRICT_PULLBACK_PREP_CACHE: OrderedDict[
+    tuple,
+    tuple[
+        weakref.ReferenceType[torch.Tensor],
+        tuple[_StrictBlockPreparation, ...],
+    ],
+] = OrderedDict()
+
+
+def register_precond(name: str, *, override: bool = False) -> Callable:
+    """Decorator registering a preconditioning rule grad_phi -> preconditioned grad.
+
+    Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
+    existing name silently shadowed the first. Pass ``override=True`` to replace deliberately.
+    """
+    def _wrap(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
+        if name in _PRECOND and not override:
+            raise KeyError(f"phi preconditioner {name!r} already registered; pass override=True to replace")
+        _PRECOND[name] = fn
+        return fn
+    return _wrap
+
+
+def get_precond(name: str) -> Callable[..., torch.Tensor]:
+    """Return the registered preconditioning rule (KeyError if absent)."""
+    if name not in _PRECOND:
+        raise KeyError(f"no preconditioner {name!r}; available: {sorted(_PRECOND)}")
+    return _PRECOND[name]
+
+
+def register_phi_group_direction(
+    name: str,
+
+    *,
+    override:              bool = False,
+    preserve_source_basis: bool = False,
+) -> Callable:
+    """Register one strict M-step pullback-group direction rule."""
+    def _wrap(
+        fn: Callable[..., PullbackGroupDirectionResult],
+    ) -> Callable[..., PullbackGroupDirectionResult]:
+        if name in _PHI_GROUP_DIRECTIONS and not override:
+            raise KeyError(
+                f"phi group direction {name!r} already registered; pass override=True to replace"
+            )
+        try:
+            parameters = tuple(inspect.signature(fn).parameters.values())
+            accepts_coordinate_layout = any(
+                (
+                    parameter.name == "coordinate_layout"
+                    and parameter.kind in (
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        inspect.Parameter.KEYWORD_ONLY,
+                    )
+                )
+                or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+            accepts_differential_mode = any(
+                (
+                    parameter.name == "differential_mode"
+                    and parameter.kind in (
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        inspect.Parameter.KEYWORD_ONLY,
+                    )
+                )
+                or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            accepts_coordinate_layout = False
+            accepts_differential_mode = False
+        _PHI_GROUP_DIRECTIONS[name] = fn
+        _PHI_GROUP_DIRECTION_ACCEPTS_COORDINATE_LAYOUT[name] = accepts_coordinate_layout
+        _PHI_GROUP_DIRECTION_ACCEPTS_DIFFERENTIAL_MODE[name] = accepts_differential_mode
+        _PHI_GROUP_DIRECTION_REQUIRES_SOURCE_BASIS[name] = bool(preserve_source_basis)
+        return fn
+    return _wrap
+
+
+def get_phi_group_direction(
+    name: str,
+) -> Callable[..., PullbackGroupDirectionResult]:
+    """Return a registered strict M-step pullback-group direction rule."""
+    if name not in _PHI_GROUP_DIRECTIONS:
+        raise KeyError(
+            f"no phi group direction {name!r}; available: {sorted(_PHI_GROUP_DIRECTIONS)}"
+        )
+    return _PHI_GROUP_DIRECTIONS[name]
+
+
+def pullback_group_direction(
+    grad_phi:   torch.Tensor,             # (..., n_gen) processed outer-objective covector
+    phi:        torch.Tensor,             # (..., n_gen) current chart coordinates
+    generators: torch.Tensor,             # (n_gen, K, K) registered basis
+
+    *,
+    mode:              str,
+    coordinate_layout: Optional[str]       = None,
+    differential_mode: Optional[str]       = None,
+    irrep_dims:        Optional[List[int]] = None,
+) -> PullbackGroupDirectionResult:
+    r"""Return the strict M-step direction in an autocast-disabled float64 island.
+
+    The chart covector is solved against the Gram-relative pullback system
+    ``(J(phi)^T J(phi) + 1e-6 B) v_phi = grad_phi`` and then converted to the
+    left-trivialized group velocity ``xi = Psi_L(ad_phi) v_phi``.
+    """
+    with torch.autocast(device_type=grad_phi.device.type, enabled=False):
+        direction = get_phi_group_direction(mode)
+        kwargs = {"irrep_dims": irrep_dims}
+        if _PHI_GROUP_DIRECTION_ACCEPTS_COORDINATE_LAYOUT.get(mode, False):
+            kwargs["coordinate_layout"] = coordinate_layout
+        if differential_mode is not None and differential_mode not in _PHI_GROUP_DIFFERENTIAL_MODES:
+            raise ValueError(f"invalid phi group differential mode {differential_mode!r}")
+        if _PHI_GROUP_DIRECTION_ACCEPTS_DIFFERENTIAL_MODE.get(mode, False):
+            kwargs["differential_mode"] = differential_mode
+        direction_generators = (
+            generators
+            if _PHI_GROUP_DIRECTION_REQUIRES_SOURCE_BASIS.get(mode, False)
+            else generators.to(device=phi.device, dtype=torch.float64)
+        )
+        return direction(grad_phi, phi, direction_generators, **kwargs)
+
+
+def _strict_structure_constants(
+    generators: torch.Tensor,             # (n_gen, K, K)
+
+    *,
+    closure_tol: float = 1e-4,
+    max_k:       int   = 12,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    r"""Return certified bracket coordinates and the generator Gram in float64.
+
+    For ``B_cd = <G_c, G_d>_F`` and ``[G_a, G_b] = f_ab^c G_c``, the coordinates
+    solve ``B_cd f_ab^d = <G_c, [G_a, G_b]>_F`` through the Cholesky factor of
+    ``B``. Reconstruction of every bracket certifies closure of the span.
+    """
+    K = generators.shape[-1]
+    if K > max_k:
+        raise ValueError(f"strict phi group direction: K={K} exceeds max_k={max_k}")
+    basis = generators.to(dtype=torch.float64)
+    gram = torch.einsum("aij,bij->ab", basis, basis)
+    gram_factor, info = torch.linalg.cholesky_ex(gram)
+    if bool((info != 0).any()):
+        raise ValueError("strict phi group direction requires an independent generator basis")
+    bracket = (
+        torch.einsum("aij,bjk->abik", basis, basis)
+        - torch.einsum("bij,ajk->abik", basis, basis)
+    )
+    pairings = torch.einsum("cij,abij->abc", basis, bracket)
+    n_gen = basis.shape[0]
+    coordinates = torch.cholesky_solve(
+        pairings.reshape(-1, n_gen).transpose(0, 1),
+        gram_factor,
+    ).transpose(0, 1).reshape(n_gen, n_gen, n_gen)
+    reconstructed = torch.einsum("abc,cij->abij", coordinates, basis)
+    residual = torch.linalg.matrix_norm(reconstructed - bracket, dim=(-2, -1))
+    bracket_norm = torch.linalg.matrix_norm(bracket, dim=(-2, -1))
+    relative = residual / (bracket_norm + torch.finfo(torch.float64).eps)
+    if not bool(torch.isfinite(relative).all()) or float(relative.max()) > closure_tol:
+        raise ValueError(
+            "strict phi group direction requires a bracket-closed generator span; "
+            f"relative reconstruction residual={float(relative.max()):.3e}"
+        )
+    return coordinates, gram
+
+
+def _adaptive_phi_differentials(
+    ad: torch.Tensor,                     # (..., n_gen, n_gen)
+
+    *,
+    require_uniform_leading_batch: bool          = False,
+    fixed_order:                   Optional[int] = None,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    r"""Evaluate certified right and left trivialized exponential differentials.
+
+    The right series is ``Psi_R(z) = (exp(z) - 1) / z = sum z^k/(k+1)!`` and
+    the left series is ``Psi_L(z) = (1 - exp(-z)) / z = sum (-z)^k/(k+1)!``.
+    A geometric majorant for the first omitted term certifies both series at
+    candidate orders from 8 through 128. A fixed order retains the same tail
+    certificate and arithmetic when independently evaluated chunks are reunited.
+    """
+    if fixed_order is not None and (
+        fixed_order < _PHI_GROUP_MIN_SERIES_ORDER
+        or fixed_order > _PHI_GROUP_MAX_SERIES_ORDER
+        or fixed_order % _PHI_GROUP_SERIES_ORDER_STEP
+    ):
+        raise ValueError("invalid fixed phi differential series order")
+    n_gen = ad.shape[-1]
+    eye = torch.eye(n_gen, dtype=ad.dtype, device=ad.device).expand_as(ad).clone()
+    psi_right = eye.clone()
+    psi_left = eye.clone()
+    term = eye.clone()
+    norm_one = torch.linalg.matrix_norm(ad, ord=1, dim=(-2, -1))
+    norm_inf = torch.linalg.matrix_norm(ad, ord=float("inf"), dim=(-2, -1))
+    use_one = norm_one <= norm_inf
+    alpha = torch.where(use_one, norm_one, norm_inf)
+    bound_k = torch.ones_like(alpha)
+    for k in range(1, _PHI_GROUP_MAX_SERIES_ORDER):
+        term = torch.matmul(term, ad) / float(k + 1)
+        psi_right = psi_right + term
+        psi_left = psi_left + (term if k % 2 == 0 else -term)
+        bound_k = bound_k * alpha / float(k + 1)
+        order = k + 1
+        if order < _PHI_GROUP_MIN_SERIES_ORDER or order % _PHI_GROUP_SERIES_ORDER_STEP:
+            continue
+        if fixed_order is not None and order != fixed_order:
+            continue
+        first_omitted = bound_k * alpha / float(order + 1)
+        ratio = alpha / float(order + 2)
+        tail = torch.where(
+            ratio < 1.0,
+            first_omitted / (1.0 - ratio),
+            torch.full_like(ratio, torch.inf),
+        )
+        right_one = torch.linalg.matrix_norm(psi_right, ord=1, dim=(-2, -1))
+        right_inf = torch.linalg.matrix_norm(psi_right, ord=float("inf"), dim=(-2, -1))
+        left_one = torch.linalg.matrix_norm(psi_left, ord=1, dim=(-2, -1))
+        left_inf = torch.linalg.matrix_norm(psi_left, ord=float("inf"), dim=(-2, -1))
+        right_norm = torch.where(use_one, right_one, right_inf)
+        left_norm = torch.where(use_one, left_one, left_inf)
+        right_ok = tail <= _PHI_GROUP_TAIL_TOL * torch.maximum(torch.ones_like(tail), right_norm)
+        left_ok = tail <= _PHI_GROUP_TAIL_TOL * torch.maximum(torch.ones_like(tail), left_norm)
+        certified = right_ok & left_ok & torch.isfinite(tail)
+        if require_uniform_leading_batch:
+            leading_certified = certified.reshape(certified.shape[0], -1).all(dim=-1)
+            if bool(leading_certified.all()):
+                return psi_right, psi_left, order
+            # Partial certification still falls back, DELIBERATELY (re-affirmed audit 2026-08-07).
+            # The caller catches this to drop out of the batched fast path into the per-block loop,
+            # which is what makes the batched result bit-identical to the per-block one -- the
+            # contract pinned by
+            # test_pullback_group_equal_blocks_with_mixed_series_orders_fall_back_exactly.
+            # Continuing to the first UNIFORMLY certified order instead would keep the fast path but
+            # evaluate the low-order block at a higher order than the per-block route would, which
+            # is equally certified and NOT bit-identical -- so it was rejected.
+            #
+            # Lowering the floor to 8 does not make this fire more often at the live distribution:
+            # both leading blocks draw phi from the same init, so they certify together. Measured at
+            # K=20/H=2 over 108 trials (scale 0.06/0.0632/0.2 x 64/256/1024 active rows): ZERO
+            # fallbacks under both the old (40, step 8) and new (8, step 4) grids. The mixed state
+            # needs blocks with very different ||phi||, which is exactly what that test constructs.
+            if bool(leading_certified.any()):
+                raise _MixedPhiDifferentialOrder(
+                    "strict phi group blocks require different adaptive series orders"
+                )
+        elif bool(certified.all()):
+            return psi_right, psi_left, order
+        if fixed_order is not None:
+            break
+    raise ValueError(
+        f"strict phi group differential series certificate failed by order "
+        f"{_PHI_GROUP_MAX_SERIES_ORDER if fixed_order is None else fixed_order}"
+    )
+
+
+def set_phi_group_differential_mode(mode: str) -> str:
+    r"""Set the process-wide Psi evaluation route; returns the previous value."""
+    global _PHI_GROUP_DIFFERENTIAL_MODE
+    if mode not in _PHI_GROUP_DIFFERENTIAL_MODES:
+        raise ValueError(
+            f"phi group differential mode must be one of {_PHI_GROUP_DIFFERENTIAL_MODES}, "
+            f"got {mode!r}"
+        )
+    previous = _PHI_GROUP_DIFFERENTIAL_MODE
+    _PHI_GROUP_DIFFERENTIAL_MODE = mode
+    return previous
+
+
+def phi_group_differential_mode() -> str:
+    r"""Return the active Psi evaluation route."""
+    return _PHI_GROUP_DIFFERENTIAL_MODE
+
+
+def _sinhc(u: torch.Tensor) -> torch.Tensor:
+    r"""``sinh(u)/u`` continued to ``u = 0``, for complex ``u``.
+
+    This is what makes the closed form need no branch at a repeated eigenvalue. The naive quotient
+    ``(exp(z) - 1)/z`` is 0/0 exactly where ``lam_i == lam_j``, which is not a rare input -- it is
+    the ENTIRE diagonal ``i == j`` of every single evaluation. Rewriting through ``sinh`` moves the
+    singularity into a function that is entire, so the limit is a value rather than a special case.
+    The small-argument series is for floating point, not for the mathematics: near zero the
+    subtraction inside ``sinh`` cancels, so the quotient loses precision long before it loses
+    meaning.
+    """
+    small = u.abs() < 1e-6
+    u_safe = torch.where(small, torch.ones_like(u), u)
+    series = 1.0 + u * u / 6.0 + (u ** 4) / 120.0
+    return torch.where(small, series, torch.sinh(u_safe) / u_safe)
+
+
+def _spectral_phi_differentials(
+    phi:         torch.Tensor,            # (..., n_gen) float64 chart coordinates
+    preparation: "_StrictBasisPreparation",
+) -> "tuple[torch.Tensor, Callable[[torch.Tensor], torch.Tensor]] | None":
+    r"""Exact ``Psi_R(ad_X)`` and ``Psi_L(ad_X)`` in generator coordinates, or None to fall back.
+
+    ``ad_X`` acting on the algebra has eigenvectors ``P E_ij P^-1`` with eigenvalues
+    ``lam_i - lam_j``, where ``X = P diag(lam) P^-1``. So for any analytic ``f``,
+
+        f(ad_X)(T) = P [ f(lam_i - lam_j) . (P^-1 T P) ] P^-1              (. = entrywise)
+
+    -- the Daleckii-Krein divided-difference form (Higham, *Functions of Matrices*, 2008, §3.2).
+    With ``z = lam_i - lam_j`` and ``u = z/2``:
+
+        Psi_R(z) = (e^z - 1)/z = e^u sinhc(u),   Psi_L(z) = (1 - e^-z)/z = e^-u sinhc(u)
+
+    which is ``Psi_L(z) = Psi_R(-z)``, matching the alternating sign the series branch carries.
+    NOTE this is Psi ALONE, not the full differential: the caller multiplies by ``exp(phi)``
+    separately, so the ``e^{(lam_i + lam_j)/2}`` factor of the combined ``D exp`` does not belong
+    here.
+
+    Returned in the SAME convention the series branch produces -- column ``a`` holds the
+    coordinates of ``Psi(ad_X)(G_a)`` -- so the caller is unchanged. Coordinates are recovered
+    through the Gram matrix, so a non-orthonormal generator basis is handled rather than assumed.
+
+    Returns ``None`` when the eigendecomposition fails, its conditioning exhausts
+    the roundoff budget, or the imaginary residue is too large. The roundoff
+    screen uses ``gamma_(8K) kappa_F(P)^2`` for four complex matrix products;
+    it is a conservative accuracy screen, not a complete forward-error bound.
+    """
+    basis = preparation.basis                                        # (n_gen, K, K) float64
+    X = torch.einsum("...a,aij->...ij", phi, basis)                  # (..., K, K)
+    try:
+        lam, P = torch.linalg.eig(X)                                 # complex (..., K), (..., K, K)
+        P_inv = torch.linalg.inv(P)
+    except torch.linalg.LinAlgError:                                  # defective X: no eigenbasis
+        return None
+    cond = (torch.linalg.matrix_norm(P, dim=(-2, -1))
+            * torch.linalg.matrix_norm(P_inv, dim=(-2, -1))).abs()
+    unit_roundoff = torch.finfo(phi.dtype).eps / 2.0
+    operations = 8 * X.shape[-1]
+    gamma = operations * unit_roundoff / (1.0 - operations * unit_roundoff)
+    roundoff = gamma * cond.square()
+    eig_residual = torch.linalg.matrix_norm(
+        X.to(P.dtype) @ P - P * lam.unsqueeze(-2), dim=(-2, -1),
+    )
+    eig_scale = (
+        torch.linalg.matrix_norm(X, dim=(-2, -1)).clamp_min(1.0)
+        * torch.linalg.matrix_norm(P, dim=(-2, -1))
+    )
+    eig_error = cond.square() * eig_residual / eig_scale
+    spectral_ok = (
+        torch.isfinite(lam).all()
+        & torch.isfinite(P).all()
+        & torch.isfinite(P_inv).all()
+        & (cond <= _PHI_GROUP_SPECTRAL_MAX_COND).all()
+        & (roundoff + eig_error <= _PHI_GROUP_SPECTRAL_ROUNDOFF_BUDGET).all()
+    )
+    if not bool(spectral_ok):
+        return None
+
+    u = 0.5 * (lam.unsqueeze(-1) - lam.unsqueeze(-2))                # (..., K, K), u_ij
+    sinhc = _sinhc(u)
+    psi_r_entries = torch.exp(u) * sinhc                             # Psi_R(lam_i - lam_j)
+    psi_l_entries = torch.exp(-u) * sinhc                            # Psi_L(lam_i - lam_j)
+
+    basis_c = basis.to(P.dtype)
+
+    def _conjugate(entries: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        r"""``P [entries . (P^-1 target P)] P^-1`` over a trailing (..., m, K, K) stack."""
+        inner = torch.einsum("...ij,...ajk,...kl->...ail", P_inv, target, P)
+        return torch.einsum(
+            "...ij,...ajk,...kl->...ail", P, entries.unsqueeze(-3) * inner, P_inv,
+        )
+
+    def _real(value: torch.Tensor) -> "torch.Tensor | None":
+        scale = value.real.abs().amax(dim=(-2, -1), keepdim=True).clamp_min(1.0)
+        if not bool((torch.isfinite(value) &
+                     (value.imag.abs() <= _PHI_GROUP_SPECTRAL_MAX_IMAG * scale)).all()):
+            return None                                              # eig failed; fail closed
+        return value.real.contiguous()
+
+    # RIGHT: return the pushed MATRICES, not coordinates. The caller's next line is
+    # ``pushed = einsum("...ca,cij->...aij", psi_right, basis)`` -- it expands the coordinate matrix
+    # straight back into matrices, so projecting onto the basis here only to have it undone is the
+    # single most expensive step in the routine (n_gen^2 K^2 per row, in complex arithmetic) and it
+    # is pure round trip. Handing back the matrices skips both halves.
+    pushed = _real(_conjugate(psi_r_entries, basis_c.expand(*P.shape[:-2], *basis_c.shape)))
+    if pushed is None:
+        return None
+
+    def _apply_left(v_phi: torch.Tensor) -> torch.Tensor:
+        r"""``Psi_L(ad_X) v_phi`` in coordinates, WITHOUT materializing Psi_L.
+
+        The series branch builds the full (n_gen, n_gen) operator and then uses it exactly once, on
+        one vector. Embedding that vector, conjugating it, and projecting the single result back is
+        O(K^3 + n_gen K^2) against O(n_gen^2 K^2) for build-then-apply.
+        """
+        embedded = torch.einsum("...b,bij->...ij", v_phi.to(P.dtype), basis_c)
+        conjugated = _conjugate(psi_l_entries, embedded.unsqueeze(-3)).squeeze(-3)
+        proj = torch.einsum("bij,...ij->...b", basis_c, conjugated)
+        coeff = (proj if preparation.gram_is_identity
+                 else torch.cholesky_solve(
+                     proj.unsqueeze(-1), preparation.gram_factor.to(proj.dtype)).squeeze(-1))
+        return coeff.real
+
+    return pushed, _apply_left
+
+
+def _build_strict_basis_preparation(
+    basis: torch.Tensor,                  # (n_gen, K, K) float64 target-device basis
+) -> _StrictBasisPreparation:
+    """Build the immutable tensors shared by strict directions for one basis."""
+    structure, gram = _strict_structure_constants(basis)
+    gram_factor, gram_info = torch.linalg.cholesky_ex(gram)
+    if bool((gram_info != 0).any()):
+        raise ValueError("strict phi group direction generator Gram factorization failed")
+    identity = torch.eye(gram.shape[-1], dtype=gram.dtype, device=gram.device)
+    gram_inverse_half = torch.linalg.solve_triangular(
+        gram_factor,
+        identity,
+        upper=False,
+    )
+    return _StrictBasisPreparation(
+        basis=basis,
+        structure=structure,
+        gram=gram,
+        gram_factor=gram_factor,
+        gram_inverse_half=gram_inverse_half,
+        gram_is_identity=bool(torch.equal(gram, identity)),
+    )
+
+
+def _strict_preparation_cache_key(
+    generators:       torch.Tensor,       # source basis
+    irrep_dims:       Optional[List[int]],
+    coordinate_layout: Optional[str],
+
+    *,
+    target_device: torch.device,
+    target_dtype:  torch.dtype,
+) -> tuple:
+    """Return the complete identity/version key for strict basis preparation."""
+    return (
+        id(generators),
+        int(generators._version),
+        tuple(generators.shape),
+        generators.device,
+        generators.dtype,
+        target_device,
+        target_dtype,
+        None if irrep_dims is None else tuple(irrep_dims),
+        coordinate_layout,
+    )
+
+
+def _build_strict_block_preparations(
+    generators:        torch.Tensor,      # source basis
+    irrep_dims:        Optional[List[int]],
+    coordinate_layout: Optional[str],
+
+    *,
+    target_device: torch.device,
+    target_dtype:  torch.dtype,
+    detach:        bool,
+) -> tuple[_StrictBlockPreparation, ...]:
+    """Build full or direct-sum local basis preparations on the staging device."""
+    source = generators.detach() if detach else generators
+    basis = source.to(device=target_device, dtype=target_dtype)
+    if detach:
+        # A cache value must not strongly retain its weakly keyed source, including when
+        # source and target device/dtype already match and ``Tensor.to`` returns itself.
+        basis = basis.clone()
+    if irrep_dims is None or len(irrep_dims) == 1:
+        index = torch.arange(basis.shape[0], dtype=torch.long, device=target_device)
+        return (
+            _StrictBlockPreparation(
+                index,
+                _build_strict_basis_preparation(basis),
+                True,
+            ),
+        )
+    if any(d <= 0 for d in irrep_dims) or sum(irrep_dims) != basis.shape[-1]:
+        raise ValueError("pullback_per_block requires positive irrep_dims summing to K")
+
+    if coordinate_layout == "block_head_row_major":
+        expected = sum(dimension * dimension for dimension in irrep_dims)
+        if basis.shape[0] != expected:
+            raise ValueError(
+                "block_head_row_major coordinates require one full row-major GL basis "
+                f"per block; got {basis.shape[0]} generators, expected {expected}"
+            )
+        indices = []
+        coordinate_start = 0
+        for dimension in irrep_dims:
+            coordinate_stop = coordinate_start + dimension * dimension
+            indices.append(
+                torch.arange(
+                    coordinate_start,
+                    coordinate_stop,
+                    dtype=torch.long,
+                    device=target_device,
+                )
+            )
+            coordinate_start = coordinate_stop
+    else:
+        block_of = _generator_block_index(basis, irrep_dims)
+        indices = [
+            (block_of == block).nonzero(as_tuple=True)[0]
+            for block in range(len(irrep_dims))
+        ]
+
+    preparations = []
+    first_local_basis = None
+    matrix_start = 0
+    for block, dimension in enumerate(irrep_dims):
+        index = indices[block]
+        if index.numel() == 0:
+            raise ValueError(f"pullback_per_block block {block} has no generators")
+        local_basis = basis[index][
+            :,
+            matrix_start:matrix_start + dimension,
+            matrix_start:matrix_start + dimension,
+        ].contiguous()
+        matches_first_basis = (
+            first_local_basis is None
+            or torch.equal(local_basis, first_local_basis)
+        )
+        if first_local_basis is None:
+            first_local_basis = local_basis
+        preparations.append(
+            _StrictBlockPreparation(
+                index,
+                _build_strict_basis_preparation(local_basis),
+                matches_first_basis,
+            )
+        )
+        matrix_start += dimension
+    return tuple(preparations)
+
+
+def _strict_block_preparations(
+    generators:        torch.Tensor,      # source basis
+    irrep_dims:        Optional[List[int]],
+    coordinate_layout: Optional[str],
+
+    *,
+    target_device: torch.device,
+    target_dtype:  torch.dtype,
+) -> tuple[_StrictBlockPreparation, ...]:
+    """Return weakly cached immutable strict-basis preparation, or bypass for autograd."""
+    if generators.requires_grad:
+        return _build_strict_block_preparations(
+            generators,
+            irrep_dims,
+            coordinate_layout,
+            target_device=target_device,
+            target_dtype=target_dtype,
+            detach=False,
+        )
+    key = _strict_preparation_cache_key(
+        generators,
+        irrep_dims,
+        coordinate_layout,
+        target_device=target_device,
+        target_dtype=target_dtype,
+    )
+    cached = _STRICT_PULLBACK_PREP_CACHE.get(key)
+    if cached is not None:
+        generators_ref, preparations = cached
+        if generators_ref() is generators:
+            _STRICT_PULLBACK_PREP_CACHE.move_to_end(key)
+            return preparations
+        _STRICT_PULLBACK_PREP_CACHE.pop(key, None)
+
+    preparations = _build_strict_block_preparations(
+        generators,
+        irrep_dims,
+        coordinate_layout,
+        target_device=target_device,
+        target_dtype=target_dtype,
+        detach=True,
+    )
+
+    def _remove_dead_entry(
+        generators_ref: weakref.ReferenceType[torch.Tensor],
+    ) -> None:
+        entry = _STRICT_PULLBACK_PREP_CACHE.get(key)
+        if entry is not None and entry[0] is generators_ref:
+            _STRICT_PULLBACK_PREP_CACHE.pop(key, None)
+
+    generators_ref = weakref.ref(generators, _remove_dead_entry)
+    _STRICT_PULLBACK_PREP_CACHE[key] = (generators_ref, preparations)
+    _STRICT_PULLBACK_PREP_CACHE.move_to_end(key)
+    while len(_STRICT_PULLBACK_PREP_CACHE) > _STRICT_PULLBACK_PREP_CACHE_MAXSIZE:
+        _STRICT_PULLBACK_PREP_CACHE.popitem(last=False)
+    return preparations
+
+
+def _phi_group_rows_per_chunk(n_gen: int) -> int:
+    """Bound twelve dense float64 coordinate workspaces to the staging budget."""
+    return max(1, _PHI_GROUP_WORKSPACE_BYTES // (_PHI_GROUP_DENSE_WORKSPACES * 8 * n_gen * n_gen))
+
+
+def _chunked_pullback_group_direction(
+    grad_phi:          torch.Tensor,
+    phi:               torch.Tensor,
+    preparation:       _StrictBasisPreparation,
+
+    *,
+    differential_mode:  str,
+    rows_per_chunk:     int,
+    fixed_series_order: Optional[int] = None,
+) -> PullbackGroupDirectionResult:
+    r"""Bound dense workspaces while preserving the local batch series order.
+
+    Each chunk first finds its certified order; only chunks below the batch
+    maximum are evaluated again. If any spectral chunk declines, all chunks
+    use the series, as they would in one unsplit spectral call. Only the small
+    result tensors survive each chunk in optimizer no-grad staging. Calls that
+    request autograd still retain the graphs needed by their returned tensors.
+    """
+    leading_shape = phi.shape[:-1]
+    n_gen = phi.shape[-1]
+    phi_chunks = phi.reshape(-1, n_gen).split(rows_per_chunk)
+    grad_chunks = grad_phi.reshape(-1, n_gen).split(rows_per_chunk)
+
+    def evaluate(index: int, mode: str, order: Optional[int]) -> PullbackGroupDirectionResult:
+        return _full_pullback_group_direction(
+            grad_chunks[index], phi_chunks[index], preparation.basis,
+            differential_mode=mode, fixed_series_order=order, preparation=preparation,
+        )
+
+    results = [evaluate(i, differential_mode, fixed_series_order) for i in range(len(phi_chunks))]
+    if differential_mode == "spectral" and any(result.series_order > 0 for result in results):
+        results = [evaluate(i, "series", None) if result.series_order == 0 else result
+                   for i, result in enumerate(results)]
+    order = max(result.series_order for result in results)
+    if order > 0:
+        results = [evaluate(i, "series", order) if result.series_order != order else result
+                   for i, result in enumerate(results)]
+
+    def combine(name: str, trailing_shape: tuple[int, ...]) -> torch.Tensor:
+        return torch.cat([getattr(result, name) for result in results], dim=0).reshape(
+            *leading_shape, *trailing_shape,
+        )
+
+    dimension = preparation.basis.shape[-1]
+    return PullbackGroupDirectionResult(
+        v_phi=combine("v_phi", (n_gen,)),
+        xi=combine("xi", (n_gen,)),
+        min_undamped_generalized_eigenvalue=combine("min_undamped_generalized_eigenvalue", ()),
+        undamped_generalized_condition=combine("undamped_generalized_condition", ()),
+        damped_generalized_condition=combine("damped_generalized_condition", ()),
+        scaled_solve_residual=combine("scaled_solve_residual", ()),
+        series_order=order,
+        current_element=combine("current_element", (dimension, dimension)),
+    )
+
+
+def _full_pullback_group_direction(
+    grad_phi:   torch.Tensor,             # (..., n_gen)
+    phi:        torch.Tensor,             # (..., n_gen)
+    generators: torch.Tensor,             # (n_gen, K, K)
+
+    *,
+    require_uniform_series_order: bool                             = False,
+    differential_mode:            Optional[str]                    = None,
+    fixed_series_order:           Optional[int]                    = None,
+    preparation:                  Optional[_StrictBasisPreparation] = None,
+) -> PullbackGroupDirectionResult:
+    r"""Compute one certified full-block pullback direction.
+
+    With ``J_a = D exp_X[G_a]`` and ``M_ab = <J_a, J_b>_F``, this solves
+    ``A v_phi = grad_phi`` for ``A = sym(M) + 1e-6 B`` by Cholesky. The returned
+    group velocity is ``xi = Psi_L(ad_phi) v_phi``. Generalized eigenvalues are
+    those of ``B^{-1/2} sym(M) B^{-1/2}`` and are certified before damping.
+    """
+    phi_64 = phi.to(dtype=torch.float64)
+    grad_64 = grad_phi.to(dtype=torch.float64)
+    if preparation is None:
+        preparation = _build_strict_basis_preparation(
+            generators.to(device=phi.device, dtype=torch.float64)
+        )
+    evaluation_mode = (_PHI_GROUP_DIFFERENTIAL_MODE
+                       if differential_mode is None else differential_mode)
+    if evaluation_mode not in _PHI_GROUP_DIFFERENTIAL_MODES:
+        raise ValueError(f"invalid phi group differential mode {evaluation_mode!r}")
+    rows_per_chunk = _phi_group_rows_per_chunk(phi_64.shape[-1])
+    if phi_64.shape == grad_64.shape and phi_64.numel() // phi_64.shape[-1] > rows_per_chunk:
+        if require_uniform_series_order:
+            raise _MixedPhiDifferentialOrder("large strict blocks require independent chunk staging")
+        return _chunked_pullback_group_direction(
+            grad_64, phi_64, preparation,
+            differential_mode=evaluation_mode,
+            fixed_series_order=fixed_series_order,
+            rows_per_chunk=rows_per_chunk,
+        )
+    basis_64 = preparation.basis
+    structure = preparation.structure
+    gram = preparation.gram
+    # Psi_R / Psi_L, either exactly (spectral) or by certified truncation (series). Both return the
+    # SAME coordinate convention -- column a holds Psi(ad_X)(G_a) -- so everything below, including
+    # every certificate, the ridge and the Cholesky, is untouched by the choice (audit 2026-08-08).
+    # series_order = 0 marks the closed form: there is no truncation, so there is no order.
+    pushed = apply_left = None
+    series_order = 0
+    if evaluation_mode == "spectral" and fixed_series_order is None:
+        spectral = _spectral_phi_differentials(phi_64, preparation)
+        if spectral is not None:
+            pushed, apply_left = spectral
+    if pushed is None:
+        # Also the fallback when the spectral route declines (defective or ill-conditioned P),
+        # which is why that helper returns None rather than raising.
+        ad = torch.einsum("...a,abc->...cb", phi_64, structure)
+        series_kwargs = {"require_uniform_leading_batch": require_uniform_series_order}
+        if fixed_series_order is not None:
+            series_kwargs["fixed_order"] = fixed_series_order
+        psi_right, psi_left, series_order = _adaptive_phi_differentials(ad, **series_kwargs)
+        pushed = torch.einsum("...ca,cij->...aij", psi_right, basis_64)
+        apply_left = lambda v: torch.einsum("...ab,...b->...a", psi_left, v)   # noqa: E731
+    exp_phi = torch.linalg.matrix_exp(torch.einsum("...a,aij->...ij", phi_64, basis_64))
+    differential = torch.einsum("...aij,...jk->...aik", pushed, exp_phi)
+    metric = torch.einsum("...aij,...bij->...ab", differential, differential)
+    metric = 0.5 * (metric + metric.transpose(-1, -2))
+    gram_inverse_half = preparation.gram_inverse_half
+    whitened = (metric if preparation.gram_is_identity else
+                torch.matmul(torch.matmul(gram_inverse_half, metric),
+                             gram_inverse_half.transpose(-1, -2)))
+    undamped_eigenvalues = safe_eigvalsh(0.5 * (whitened + whitened.transpose(-1, -2)))
+    min_undamped = undamped_eigenvalues[..., 0]
+    max_undamped = undamped_eigenvalues[..., -1]
+    undamped_condition = max_undamped / min_undamped
+    if not bool(torch.isfinite(undamped_eigenvalues).all()
+                & (min_undamped >= _PHI_GROUP_MIN_UNDAMPED_EIG).all()):
+        minimum = float(min_undamped.min())
+        raise ValueError(
+            "strict phi group direction undamped generalized eigenvalue "
+            f"{minimum:.3e} is below {_PHI_GROUP_MIN_UNDAMPED_EIG:.1e}"
+        )
+    damped = metric + _PHI_GROUP_GRAM_RIDGE * gram
+    damped_eigenvalues = undamped_eigenvalues + _PHI_GROUP_GRAM_RIDGE
+    damped_condition = damped_eigenvalues[..., -1] / damped_eigenvalues[..., 0]
+    if (
+        not bool((torch.isfinite(damped_condition)
+                  & (damped_condition <= _PHI_GROUP_MAX_DAMPED_COND)).all())
+    ):
+        maximum = float(damped_condition.max())
+        raise ValueError(
+            "strict phi group direction damped generalized condition "
+            f"{maximum:.3e} exceeds {_PHI_GROUP_MAX_DAMPED_COND:.1e}"
+        )
+    factor, info = torch.linalg.cholesky_ex(damped)
+    if bool((info != 0).any()):
+        raise ValueError("strict phi group direction damped Cholesky factorization failed")
+    v_phi = torch.cholesky_solve(grad_64.unsqueeze(-1), factor).squeeze(-1)
+    residual = torch.linalg.vector_norm(
+        torch.einsum("...ab,...b->...a", damped, v_phi) - grad_64,
+        dim=-1,
+    )
+    damped_operator_norm = (
+        damped_eigenvalues[..., -1]
+        if preparation.gram_is_identity
+        else torch.linalg.matrix_norm(damped, ord=2, dim=(-2, -1))
+    )
+    scale = (
+        damped_operator_norm
+        * torch.linalg.vector_norm(v_phi, dim=-1)
+        + torch.linalg.vector_norm(grad_64, dim=-1)
+    )
+    scaled_residual = residual / scale.clamp_min(torch.finfo(torch.float64).tiny)
+    if (
+        not bool((torch.isfinite(scaled_residual)
+                  & (scaled_residual <= _PHI_GROUP_SOLVE_RESIDUAL)).all())
+    ):
+        maximum = float(scaled_residual.max())
+        raise ValueError(
+            "strict phi group direction scaled solve residual "
+            f"{maximum:.3e} exceeds {_PHI_GROUP_SOLVE_RESIDUAL:.1e}"
+        )
+    xi = apply_left(v_phi)
+    if not bool(torch.isfinite(v_phi).all() & torch.isfinite(xi).all()
+                & torch.isfinite(undamped_condition).all()):
+        raise ValueError("strict phi group direction produced a nonfinite certificate")
+    return PullbackGroupDirectionResult(
+        v_phi=v_phi,
+        xi=xi,
+        min_undamped_generalized_eigenvalue=min_undamped,
+        undamped_generalized_condition=undamped_condition,
+        damped_generalized_condition=damped_condition,
+        scaled_solve_residual=scaled_residual,
+        series_order=series_order,
+        current_element=exp_phi,
+    )
+
+
+@register_phi_group_direction("pullback", preserve_source_basis=True)
+def _pullback_group_direction(
+    grad_phi:   torch.Tensor,             # (..., n_gen)
+    phi:        torch.Tensor,             # (..., n_gen)
+    generators: torch.Tensor,             # (n_gen, K, K)
+
+    *,
+    coordinate_layout: Optional[str]       = None,
+    differential_mode: Optional[str]       = None,
+    irrep_dims:        Optional[List[int]] = None,
+) -> PullbackGroupDirectionResult:
+    del coordinate_layout, irrep_dims
+    preparation = _strict_block_preparations(
+        generators,
+        None,
+        None,
+        target_device=phi.device,
+        target_dtype=torch.float64,
+    )[0].basis
+    return _full_pullback_group_direction(
+        grad_phi,
+        phi,
+        generators,
+        preparation=preparation,
+        differential_mode=differential_mode,
+    )
+
+
+@register_phi_group_direction("pullback_per_block", preserve_source_basis=True)
+def _pullback_group_direction_per_block(
+    grad_phi:   torch.Tensor,             # (..., n_gen)
+    phi:        torch.Tensor,             # (..., n_gen)
+    generators: torch.Tensor,             # (n_gen, K, K)
+
+    *,
+    coordinate_layout: Optional[str]       = None,
+    differential_mode: Optional[str]       = None,
+    irrep_dims:        Optional[List[int]] = None,
+) -> PullbackGroupDirectionResult:
+    r"""Solve each direct-sum block independently and aggregate global extrema.
+
+    For ``g = direct_sum_h g_h``, each local system is
+    ``A_h v_h = grad_h``. The global generalized condition is
+    ``max_h(lambda_max,h) / min_h(lambda_min,h)`` rather than the largest local
+    condition, while the solve certificate is the maximum local residual.
+    """
+    if irrep_dims is None:
+        raise ValueError("pullback_per_block requires irrep_dims")
+    preparations = _strict_block_preparations(
+        generators,
+        irrep_dims,
+        coordinate_layout,
+        target_device=phi.device,
+        target_dtype=torch.float64,
+    )
+    if len(irrep_dims) == 1:
+        return _full_pullback_group_direction(
+            grad_phi,
+            phi,
+            generators,
+            preparation=preparations[0].basis,
+            differential_mode=differential_mode,
+        )
+    grad_64 = grad_phi.to(dtype=torch.float64)
+    phi_64 = phi.to(dtype=torch.float64)
+    v_phi = torch.zeros_like(grad_64)
+    xi = torch.zeros_like(grad_64)
+    equal_blocks_compatible = (
+        coordinate_layout == "block_head_row_major"
+        and grad_64.ndim > 1
+        and grad_64.shape[:-1] == phi_64.shape[:-1]
+        and not generators.requires_grad
+        and len(preparations) > 1
+        and len(set(irrep_dims)) == 1
+        and all(preparation.matches_first_basis for preparation in preparations)
+    )
+    batch_equal_blocks = (
+        equal_blocks_compatible
+        and phi_64.numel() // preparations[0].basis.basis.shape[0]
+            <= _phi_group_rows_per_chunk(preparations[0].basis.basis.shape[0])
+    )
+    if batch_equal_blocks:
+        batched_grad = torch.stack(
+            [grad_64[..., preparation.index] for preparation in preparations],
+            dim=0,
+        )
+        batched_phi = torch.stack(
+            [phi_64[..., preparation.index] for preparation in preparations],
+            dim=0,
+        )
+        try:
+            local = _full_pullback_group_direction(
+                batched_grad,
+                batched_phi,
+                preparations[0].basis.basis,
+                require_uniform_series_order=True,
+                preparation=preparations[0].basis,
+                differential_mode=differential_mode,
+            )
+        except ValueError:
+            batch_equal_blocks = False
+    if batch_equal_blocks:
+        for block, preparation in enumerate(preparations):
+            v_phi = v_phi.index_copy(-1, preparation.index, local.v_phi[block])
+            xi = xi.index_copy(-1, preparation.index, local.xi[block])
+        local_min_undamped = local.min_undamped_generalized_eigenvalue
+        local_max_undamped = (
+            local.min_undamped_generalized_eigenvalue
+            * local.undamped_generalized_condition
+        )
+        local_scaled_residual = local.scaled_solve_residual
+        series_order = local.series_order
+        current_element = local.current_element.movedim(0, -3)
+    else:
+        local_results = []
+        for preparation in preparations:
+            index = preparation.index
+            local = _full_pullback_group_direction(
+                grad_64[..., index],
+                phi_64[..., index],
+                preparation.basis.basis,
+                preparation=preparation.basis,
+                differential_mode=differential_mode,
+            )
+            local_results.append(local)
+        evaluation_mode = (_PHI_GROUP_DIFFERENTIAL_MODE
+                           if differential_mode is None else differential_mode)
+        if (equal_blocks_compatible and evaluation_mode == "spectral"
+                and any(result.series_order > 0 for result in local_results)
+                and any(result.series_order == 0 for result in local_results)):
+            # An unsplit equal-head call declines spectral evaluation jointly.
+            # It keeps the all-series result only when every head certifies at
+            # the same order; mixed orders/failures use independent head routes.
+            try:
+                series_results = [
+                    result if result.series_order > 0 else _full_pullback_group_direction(
+                        grad_64[..., preparation.index], phi_64[..., preparation.index],
+                        preparation.basis.basis, preparation=preparation.basis,
+                        differential_mode="series",
+                    )
+                    for preparation, result in zip(preparations, local_results)
+                ]
+            except ValueError:
+                series_results = []
+            if series_results and len({result.series_order for result in series_results}) == 1:
+                local_results = series_results
+        for preparation, local in zip(preparations, local_results):
+            v_phi = v_phi.index_copy(-1, preparation.index, local.v_phi)
+            xi = xi.index_copy(-1, preparation.index, local.xi)
+        local_min_undamped = torch.stack(
+            [result.min_undamped_generalized_eigenvalue for result in local_results],
+            dim=0,
+        )
+        local_max_undamped = torch.stack(
+            [
+                result.min_undamped_generalized_eigenvalue
+                * result.undamped_generalized_condition
+                for result in local_results
+            ],
+            dim=0,
+        )
+        local_scaled_residual = torch.stack(
+            [result.scaled_solve_residual for result in local_results],
+            dim=0,
+        )
+        series_order = max(result.series_order for result in local_results)
+        current_element = (
+            torch.stack([result.current_element for result in local_results], dim=-3)
+            if len(set(irrep_dims)) == 1 else None
+        )
+    min_undamped = local_min_undamped.amin(dim=0)
+    max_undamped = local_max_undamped.amax(dim=0)
+    undamped_condition = max_undamped / min_undamped
+    if (
+        not bool((torch.isfinite(min_undamped)
+                  & (min_undamped >= _PHI_GROUP_MIN_UNDAMPED_EIG)).all())
+    ):
+        minimum = float(min_undamped.min())
+        raise ValueError(
+            "strict phi group direction undamped generalized eigenvalue "
+            f"{minimum:.3e} is below {_PHI_GROUP_MIN_UNDAMPED_EIG:.1e}"
+        )
+
+    local_min_damped = local_min_undamped + _PHI_GROUP_GRAM_RIDGE
+    local_max_damped = local_max_undamped + _PHI_GROUP_GRAM_RIDGE
+    damped_condition = local_max_damped.amax(dim=0) / local_min_damped.amin(dim=0)
+    if (
+        not bool((torch.isfinite(damped_condition)
+                  & (damped_condition <= _PHI_GROUP_MAX_DAMPED_COND)).all())
+    ):
+        maximum = float(damped_condition.max())
+        raise ValueError(
+            "strict phi group direction damped generalized condition "
+            f"{maximum:.3e} exceeds {_PHI_GROUP_MAX_DAMPED_COND:.1e}"
+        )
+
+    scaled_residual = local_scaled_residual.amax(dim=0)
+    if (
+        not bool((torch.isfinite(scaled_residual)
+                  & (scaled_residual <= _PHI_GROUP_SOLVE_RESIDUAL)).all())
+    ):
+        maximum = float(scaled_residual.max())
+        raise ValueError(
+            "strict phi group direction scaled solve residual "
+            f"{maximum:.3e} exceeds {_PHI_GROUP_SOLVE_RESIDUAL:.1e}"
+        )
+
+    if not bool(torch.isfinite(v_phi).all() & torch.isfinite(xi).all()
+                & torch.isfinite(undamped_condition).all()):
+        raise ValueError("strict phi group direction produced a nonfinite certificate")
+    return PullbackGroupDirectionResult(
+        v_phi=v_phi,
+        xi=xi,
+        min_undamped_generalized_eigenvalue=min_undamped,
+        undamped_generalized_condition=undamped_condition,
+        damped_generalized_condition=damped_condition,
+        scaled_solve_residual=scaled_residual,
+        series_order=series_order,
+        current_element=current_element,
+    )
+
+
+@register_precond("none")
+def _precond_none(
+    grad_phi:   torch.Tensor,             # (..., n_gen)
+    phi:        torch.Tensor,             # (..., n_gen) (unused)
+    generators: torch.Tensor,             # (n_gen, K, K) (unused)
+
+    **kwargs,
+) -> torch.Tensor:
+    r"""Identity: the canonical no-correction update (gradient lives in g)."""
+    return grad_phi
+
+
+@register_precond("clip")
+def _precond_clip(
+    grad_phi:   torch.Tensor,             # (..., n_gen)
+    phi:        torch.Tensor,             # (..., n_gen) (unused)
+    generators: torch.Tensor,             # (n_gen, K, K) (unused)
+
+    *,
+    clip_c:     float = 10.0,
+    eps:        float = 1e-6,
+    **kwargs,
+) -> torch.Tensor:
+    r"""Norm-clip baseline grad * min(1, clip_c / ||grad||)."""
+    norm = grad_phi.norm(dim=-1, keepdim=True)
+    return torch.where(norm > clip_c, grad_phi * (clip_c / (norm + eps)), grad_phi)
+
+
+def killing_metric(
+    generators: torch.Tensor,             # (n_gen, K, K) basis
+) -> torch.Tensor:                        # (n_gen, n_gen) Cartan-involution metric
+    r"""Cartan-involution Killing metric g~_ab = 2K*tr(G_a^T G_b) - 2 tr(G_a) tr(G_b).
+
+    Equals -B(theta X, Y) with theta(X) = -X^T; positive-definite on sl(K). The
+    bare Killing form B(X,Y) = 2K*tr(XY) - 2 tr(X)tr(Y) is indefinite and is NOT
+    used. ``gram`` is the FROBENIUS inner product tr(G_a^T G_b).
+    """
+    K = generators.shape[-1]
+    gram   = torch.einsum("aij,bij->ab", generators, generators)      # tr(G_a^T G_b)
+    traces = generators.diagonal(dim1=-2, dim2=-1).sum(-1)            # (n_gen,)
+    return 2.0 * K * gram - 2.0 * torch.outer(traces, traces)
+
+
+# Memoized Killing inverses, weakly keyed on generator identity and mutation version. The inverse
+# depends only on the fixed generator basis, so it is loop-invariant across every E-step iteration;
+# caching avoids rebuilding an O(n_gen^3) float64 eigh when a Killing preconditioner is active.
+_KILLING_INV_CACHE_MAXSIZE: int = 32
+_KILLING_INV_CACHE: OrderedDict[
+    tuple, tuple[weakref.ReferenceType[torch.Tensor], torch.Tensor]
+] = OrderedDict()
+_PULLBACK_SERIES_WARNED: bool = False           # warn-once guard for Psi-series non-convergence (m19)
+
+
+def _killing_cache_key(
+    generators: torch.Tensor,             # (n_gen, K, K) basis
+    variant:    tuple,                    # ("full",) or ("per_block", irrep_dims)
+
+    *,
+    tol:        float           = 1e-6,
+    center_reg: Optional[float] = None,
+) -> tuple:
+    """Return the identity/version cache key for one Killing-inverse variant."""
+    return (
+        id(generators), int(generators._version), tuple(generators.shape),
+        generators.dtype, generators.device, variant, center_reg, tol,
+    )
+
+
+def _get_cached_killing_inverse(
+    generators: torch.Tensor,             # (n_gen, K, K) basis
+    key:        tuple,
+) -> Optional[torch.Tensor]:
+    """Return an identity-valid cache hit and promote it to most recently used."""
+    cached = _KILLING_INV_CACHE.get(key)
+    if cached is None:
+        return None
+    generators_ref, inverse = cached
+    if generators_ref() is not generators:
+        _KILLING_INV_CACHE.pop(key, None)
+        return None
+    _KILLING_INV_CACHE.move_to_end(key)
+    return inverse
+
+
+def _cache_killing_inverse(
+    generators: torch.Tensor,             # (n_gen, K, K) basis
+    inverse:    torch.Tensor,             # (n_gen, n_gen) inverse metric
+    key:        tuple,
+) -> torch.Tensor:
+    """Store one weak cache entry and evict the least-recently-used overflow."""
+    def _remove_dead_entry(
+        generators_ref: weakref.ReferenceType[torch.Tensor],
+    ) -> None:
+        cached = _KILLING_INV_CACHE.get(key)
+        if cached is not None and cached[0] is generators_ref:
+            _KILLING_INV_CACHE.pop(key, None)
+
+    generators_ref = weakref.ref(generators, _remove_dead_entry)
+    _KILLING_INV_CACHE[key] = (generators_ref, inverse)
+    _KILLING_INV_CACHE.move_to_end(key)
+    while len(_KILLING_INV_CACHE) > _KILLING_INV_CACHE_MAXSIZE:
+        _KILLING_INV_CACHE.popitem(last=False)
+    return inverse
+
+
+def _build_killing_preconditioner_uncached(
+    generators: torch.Tensor,             # (n_gen, K, K) basis
+
+    *,
+    center_reg: Optional[float] = None,   # None -> 2*K; lifts the numerical nullspace
+    tol:        float           = 1e-6,
+) -> torch.Tensor:                        # (n_gen, n_gen) regularized inverse metric
+    """Build the inverse Killing metric without reading or writing the shared cache."""
+    with torch.no_grad():
+        K = generators.shape[-1]
+        reg = float(2 * K) if center_reg is None else float(center_reg)
+        orig_dtype = generators.dtype
+        M = killing_metric(generators).double()
+        M = 0.5 * (M + M.transpose(-1, -2))
+        evals, evecs = torch.linalg.eigh(M)
+        evals = torch.where(evals.abs() < tol, torch.full_like(evals, reg), evals)
+        inv = (evecs * (1.0 / evals).unsqueeze(-2)) @ evecs.transpose(-1, -2)
+        return inv.to(orig_dtype)
+
+
+def build_killing_preconditioner(
+    generators: torch.Tensor,             # (n_gen, K, K) basis
+
+    *,
+    center_reg: Optional[float] = None,   # None -> 2*K; lifts the numerical nullspace
+    tol:        float           = 1e-6,
+) -> torch.Tensor:                        # (n_gen, n_gen) regularized inverse metric
+    r"""Inverse Killing metric, regularizing only the numerical nullspace.
+
+    eigh(g~) -> (lambda, V); eigenvalues with |lambda| < tol (the center/identity
+    direction) are lifted to ``center_reg`` before inversion. Non-null eigenvalues
+    are untouched, so the inverse is EXACT on sl(K) (a ridge center_reg*I is not).
+    so(K) (already positive-definite) acquires no regularization. eigh in float64.
+    ASSUMPTION (audit 2026-06-13 L12): the magnitude cut ``|lambda| < tol`` isolates ONLY the
+    intended center because the Killing/trace-form spectrum of the shipped groups is 0 (the center)
+    or O(K) (the semisimple part) -- a clean gap, no genuine eigenvalue near ``tol``. A custom basis
+    with a true small-but-nonzero Killing eigenvalue would have it wrongly lifted; on this inactive
+    opt-in path (mode='none' is the default pure path) that case does not arise for shipped groups.
+    Memoized weakly on the generator basis identity and mutation version (see
+    ``_KILLING_INV_CACHE``): loop-invariant, so it is built once per
+    (basis, version, center_reg, tol), not per E-step iteration.
+    """
+    key = _killing_cache_key(
+        generators, ("full",), center_reg=center_reg, tol=tol,
+    )
+    cached = _get_cached_killing_inverse(generators, key)
+    if cached is not None:
+        return cached
+    inverse = _build_killing_preconditioner_uncached(
+        generators, center_reg=center_reg, tol=tol,
+    )
+    return _cache_killing_inverse(generators, inverse, key)
+
+
+@register_precond("killing")
+def _precond_killing(
+    grad_phi:   torch.Tensor,             # (..., n_gen)
+    phi:        torch.Tensor,             # (..., n_gen) (unused)
+    generators: torch.Tensor,             # (n_gen, K, K)
+
+    *,
+    center_reg: Optional[float]        = None,
+    inv_metric: Optional[torch.Tensor] = None,
+    **kwargs,
+) -> torch.Tensor:
+    r"""Natural gradient under the (center-regularized) Killing metric: grad @ g~^{-1}."""
+    Minv = build_killing_preconditioner(generators, center_reg=center_reg) if inv_metric is None else inv_metric
+    return torch.einsum("...a,ab->...b", grad_phi, Minv)
+
+
+def _generator_block_index(
+    generators: torch.Tensor,             # (n_gen, K, K)
+    irrep_dims: List[int],                # block sizes; sum == K
+
+    *,
+    tol:        float = 1e-9,
+) -> torch.Tensor:                        # (n_gen,) block id per generator
+    r"""Block membership of each generator (asserts single-block support)."""
+    bounds, start = [], 0
+    for d in irrep_dims:
+        bounds.append((start, start + d))
+        start += d
+    n_gen = generators.shape[0]
+    block_of = torch.full((n_gen,), -1, dtype=torch.long, device=generators.device)
+    for a in range(n_gen):
+        mass  = [float(generators[a, s:e, s:e].abs().sum()) for (s, e) in bounds]
+        total = float(generators[a].abs().sum())
+        hits  = [h for h, m in enumerate(mass) if m > tol]
+        if len(hits) != 1 or abs(sum(mass) - total) > tol:
+            raise ValueError(f"generator {a} is not supported in a single irrep block")
+        block_of[a] = hits[0]
+    return block_of
+
+
+def build_killing_preconditioner_per_block(
+    generators: torch.Tensor,             # (n_gen, K, K)
+    irrep_dims: List[int],                # block sizes; sum == K
+
+    *,
+    center_reg: Optional[float] = None,
+    tol:        float           = 1e-6,
+) -> torch.Tensor:                        # (n_gen, n_gen) block-diagonal inverse metric
+    r"""Block-diagonal Killing inverse: per-block local-dimension Cartan metric.
+
+    Single global block (irrep_dims == [K], e.g. cross-coupled bases) reduces to
+    build_killing_preconditioner. Otherwise each generator's own block supplies
+    the local Killing metric (block dimension d_h), with no cross-block coupling.
+    """
+    if len(irrep_dims) == 1:
+        return build_killing_preconditioner(generators, center_reg=center_reg, tol=tol)
+    key = _killing_cache_key(
+        generators, ("per_block", tuple(irrep_dims)), center_reg=center_reg, tol=tol,
+    )
+    cached = _get_cached_killing_inverse(generators, key)
+    if cached is not None:
+        return cached
+    block_of = _generator_block_index(generators, irrep_dims)
+    n_gen = generators.shape[0]
+    Minv  = torch.zeros(n_gen, n_gen, dtype=generators.dtype, device=generators.device)
+    start = 0
+    for h, d in enumerate(irrep_dims):
+        idx     = (block_of == h).nonzero(as_tuple=True)[0]
+        sub     = generators[idx][:, start:start + d, start:start + d].contiguous()   # local d_h rep
+        sub_inv = _build_killing_preconditioner_uncached(sub, center_reg=center_reg, tol=tol)
+        Minv[idx.unsqueeze(-1), idx.unsqueeze(0)] = sub_inv
+        start += d
+    return _cache_killing_inverse(generators, Minv, key)
+
+
+@register_precond("killing_per_block")
+def _precond_killing_per_block(
+    grad_phi:   torch.Tensor,             # (..., n_gen)
+    phi:        torch.Tensor,             # (..., n_gen) (unused)
+    generators: torch.Tensor,             # (n_gen, K, K)
+
+    *,
+    center_reg: Optional[float]        = None,
+    irrep_dims: Optional[List[int]]    = None,
+    inv_metric: Optional[torch.Tensor] = None,
+    **kwargs,
+) -> torch.Tensor:
+    r"""Natural gradient under the per-block Killing metric."""
+    if inv_metric is None:
+        if irrep_dims is None:
+            raise ValueError("killing_per_block requires irrep_dims")
+        inv_metric = build_killing_preconditioner_per_block(generators, irrep_dims, center_reg=center_reg)
+    return torch.einsum("...a,ab->...b", grad_phi, inv_metric)
+
+
+def _structure_constants(
+    generators: torch.Tensor,             # (n_gen, K, K)
+
+    *,
+    closure_tol: float                 = 1e-4,
+    eps:         float                 = 1e-12,
+    gram_pinv_:  Optional[torch.Tensor] = None,
+) -> torch.Tensor:                        # (n_gen, n_gen, n_gen) f[a,b,c]: [G_a,G_b]=sum_c f G_c
+    r"""Structure constants f[a,b,c] = coords_c([G_a, G_b]) in the generator basis.
+
+    On a basis NOT closed under the Lie bracket (e.g. a 3+-head ``cross_couplings``
+    chain built with ``close_basis=False``) the bracket :math:`[G_a, G_b]` carries an
+    out-of-span component that the span projection
+    :math:`f[a,b,c] = \langle G_c, [G_a,G_b]\rangle\,(\mathrm{Gram}^+)_{cd}` silently
+    truncates, so the structure constants (and any pullback metric built on them) drop
+    those terms. A diagnostic guard measures the max relative out-of-span residual
+    :math:`\max_{a,b} \lVert [G_a,G_b] - \mathrm{embed}(f_{ab\cdot})\rVert_F /
+    (\lVert [G_a,G_b]\rVert_F + \epsilon)` and warns once if it exceeds ``closure_tol``;
+    on a closed (default direct-sum) basis the residual is ~0 so the guard is silent and
+    the returned tensor is unchanged.
+    """
+    G = generators
+    brak   = torch.einsum("aij,bjk->abik", G, G) - torch.einsum("bij,ajk->abik", G, G)   # [G_a,G_b]
+    gp     = gram_pinv(G) if gram_pinv_ is None else gram_pinv_
+    coords = torch.einsum("cij,abij->abc", G, brak)       # <G_c, [G_a,G_b]>
+    f      = torch.einsum("abc,cd->abd", coords, gp)      # (n_gen, n_gen, n_gen)
+
+    # Diagnostic (cached, one-time): warn if the basis is not bracket-closed, in which case the
+    # span projection above truncates the out-of-span part of [G_a,G_b]. Depends only on the fixed
+    # generators, so it runs once per basis (the shared lie_ops cache), off the hot path. Size-gated
+    # (max_elements): large direct-sum bases are skipped as closed-by-construction (avoids the O(K^4)
+    # OOM); small non-closed cross_couplings chains are scanned exactly.
+    warn_if_basis_not_closed(G, where="_structure_constants (pullback metric)",
+                             closure_tol=closure_tol, eps=eps, gram_pinv_=gp)
+    return f
+
+
+def pullback_metric(
+    phi:          torch.Tensor,           # (..., n_gen) frame coordinates
+    generators:   torch.Tensor,           # (n_gen, K, K)
+
+    *,
+    series_tol:   float = 1e-12,
+    series_order: int   = 40,
+    max_k:        int   = 12,
+) -> torch.Tensor:                        # (..., n_gen, n_gen) position-dependent metric
+    r"""Pullback natural-gradient metric G_ab(phi) = <d exp_phi(T_a), d exp_phi(T_b)>_F.
+
+    d exp_phi(T) = Psi(ad_phi)(T) exp(phi), Psi(z) = (e^z - 1)/z = sum_k z^k/(k+1)!.
+    ad_phi acts on coordinates: (ad_phi)_{cb} = sum_a phi^a f[a,b,c]. The Psi series is
+    summed through ``series_order`` and its final term is checked against ``series_tol``
+    once after the loop. Truncation error of Psi(ad_phi) grows with ||phi||, so a fixed
+    low order is inaccurate in the non-compact (large-norm) regime the pullback metric
+    exists for; the default order keeps it accurate up to retract_phi's max_norm.
+    The 1/(k+1)! coefficient is a float (an int divisor overflows past order ~20). The
+    structure-constants tensor is O(n_gen^2 K^2); guarded for K > max_k (infeasible for
+    large K). The finite-difference of exp is the correctness arbiter for this kernel.
+    """
+    K = generators.shape[-1]
+    if K > max_k:
+        raise ValueError(f"pullback_metric: K={K} exceeds max_k={max_k} (structure-constants OOM)")
+    n_gen      = generators.shape[0]
+    G          = generators.double()
+    phi        = phi.double()
+
+    f  = _structure_constants(G)                           # (n_gen,n_gen,n_gen) f[a,b,c]
+    ad = torch.einsum("...a,abc->...cb", phi, f)           # (...,n_gen,n_gen) (ad_phi)_{cb}
+
+    eye    = torch.eye(n_gen, dtype=ad.dtype, device=ad.device).expand_as(ad).clone()
+    psi    = eye.clone()
+    ad_pow = eye.clone()
+    last_term_tensor = torch.zeros((), dtype=ad.dtype, device=ad.device)
+    for k in range(1, series_order):
+        ad_pow = torch.einsum("...ij,...jk->...ik", ad_pow, ad)
+        term   = ad_pow * (1.0 / float(math.factorial(k + 1)))   # float coeff: int overflows >~20
+        psi    = psi + term
+        last_term_tensor = term.detach().abs().max()
+    last_term = float(last_term_tensor)
+    converged = last_term < series_tol
+    global _PULLBACK_SERIES_WARNED
+    if not converged and series_order > 1 and not _PULLBACK_SERIES_WARNED:
+        _PULLBACK_SERIES_WARNED = True
+        warnings.warn(                                     # m19: exhausting series_order silently returned a truncated metric
+            f"pullback_metric: Psi(ad_phi) series did not converge in series_order={series_order} "
+            f"(last term {last_term:.2e} >= series_tol={series_tol:.1e}); the pullback preconditioner "
+            f"metric may be inaccurate. Raise series_order or reduce ||phi||. Warned once per process.",
+            RuntimeWarning, stacklevel=2,
+        )
+
+    # d exp_phi(e_a) coords = psi @ e_a = column a of psi -> embed -> times exp(phi)
+    W       = torch.einsum("...ca,cij->...aij", psi, G)    # (...,n_gen,K,K) Psi(ad_phi)(T_a)
+    exp_phi = torch.linalg.matrix_exp(torch.einsum("...a,aij->...ij", phi, G))
+    dexp    = torch.einsum("...aij,...jk->...aik", W, exp_phi)
+    metric  = torch.einsum("...aij,...bij->...ab", dexp, dexp)
+    return metric
+
+
+@register_precond("pullback")
+def _precond_pullback(
+    grad_phi:     torch.Tensor,           # (..., n_gen)
+    phi:          torch.Tensor,           # (..., n_gen)
+    generators:   torch.Tensor,           # (n_gen, K, K)
+
+    *,
+    series_tol:   float = 1e-12,
+    eps:          float = 1e-6,
+    series_order: int   = 40,
+    **kwargs,
+) -> torch.Tensor:
+    r"""Position-dependent natural gradient: solve G(phi) nat = grad_phi."""
+    orig_dtype = grad_phi.dtype
+    G_metric = pullback_metric(phi, generators, series_tol=series_tol, series_order=series_order)
+    eye = torch.eye(G_metric.shape[-1], dtype=G_metric.dtype, device=G_metric.device)
+    sol = torch.linalg.solve(G_metric + eps * eye, grad_phi.double().unsqueeze(-1))
+    return sol.squeeze(-1).to(orig_dtype)
+
+
+def pullback_metric_per_block(
+    phi:          torch.Tensor,           # (..., n_gen) frame coordinates
+    generators:   torch.Tensor,           # (n_gen, K, K)
+    irrep_dims:   List[int],              # block sizes; sum == K
+
+    *,
+    series_tol:   float = 1e-12,
+    series_order: int   = 40,
+    max_k:        int   = 12,
+) -> torch.Tensor:                        # (..., n_gen, n_gen) block-diagonal pullback metric
+    r"""Block-diagonal pullback metric: per-irrep-block exp-map natural-gradient metric.
+
+    For a block-diagonal algebra g = (+)_h gl(d_h) (block_glk: irrep_dims = [d_h]*H),
+    phi is block-diagonal, so d exp_phi stays inside each block and the pullback metric
+    G_ab(phi) = <d exp_phi(T_a), d exp_phi(T_b)>_F is itself block-diagonal: generators of
+    distinct blocks have disjoint support, so their cross terms vanish. Each diagonal block
+    is built by ``pullback_metric`` on that block's LOCAL d_h-dimensional representation
+    (the d_h x d_h corner). This is the key feasibility win over the full ``pullback_metric``:
+    the structure-constants tensor is O(n_gen_block^2 d_h^2) per block instead of
+    O(n_gen^2 K^2), so a K = 20 block_glk (d_h = 10 <= max_k) is buildable where the full
+    pullback (K = 20 > max_k) raises. Single global block (irrep_dims == [K]) reduces to
+    ``pullback_metric``. Pure: takes a generator TENSOR, not a GaugeGroup.
+    """
+    if len(irrep_dims) == 1:
+        return pullback_metric(phi, generators, series_tol=series_tol,
+                               series_order=series_order, max_k=max_k)
+    block_of = _generator_block_index(generators, irrep_dims)
+    n_gen = generators.shape[0]
+    batch = phi.shape[:-1]
+    G_metric = torch.zeros(*batch, n_gen, n_gen, dtype=torch.float64, device=phi.device)
+    start = 0
+    for h, d in enumerate(irrep_dims):
+        idx     = (block_of == h).nonzero(as_tuple=True)[0]
+        sub     = generators[idx][:, start:start + d, start:start + d].contiguous()   # (n_h, d, d) local rep
+        phi_blk = phi[..., idx]                                                        # (..., n_h)
+        Gb      = pullback_metric(phi_blk, sub, series_tol=series_tol,
+                                  series_order=series_order, max_k=max_k)              # (..., n_h, n_h)
+        G_metric[..., idx.unsqueeze(-1), idx.unsqueeze(0)] = Gb
+        start += d
+    return G_metric
+
+
+@register_precond("pullback_per_block")
+def _precond_pullback_per_block(
+    grad_phi:     torch.Tensor,           # (..., n_gen)
+    phi:          torch.Tensor,           # (..., n_gen)
+    generators:   torch.Tensor,           # (n_gen, K, K)
+
+    *,
+    series_tol:   float = 1e-12,
+    eps:          float = 1e-6,
+    series_order: int   = 40,
+    irrep_dims:   Optional[List[int]] = None,
+    **kwargs,
+) -> torch.Tensor:
+    r"""Per-block position-dependent natural gradient: solve G_block(phi) nat = grad_phi.
+
+    The block-diagonal counterpart of ``pullback`` (the exact natural gradient for a
+    block-diagonal gauge group like block_glk), feasible at K > max_k because each block's
+    metric is built on its local d_h <= max_k representation."""
+    if irrep_dims is None:
+        raise ValueError("pullback_per_block requires irrep_dims")
+    orig_dtype = grad_phi.dtype
+    G_metric = pullback_metric_per_block(phi, generators, irrep_dims,
+                                         series_tol=series_tol, series_order=series_order)
+    eye = torch.eye(G_metric.shape[-1], dtype=G_metric.dtype, device=G_metric.device)
+    sol = torch.linalg.solve(G_metric + eps * eye, grad_phi.double().unsqueeze(-1))
+    return sol.squeeze(-1).to(orig_dtype)
+
+
+def _bch_chart_direction(
+    delta_phi:  torch.Tensor,             # (..., n_gen) desired chart direction
+    phi:        torch.Tensor,             # (..., n_gen) current chart
+    generators: torch.Tensor,             # (n_gen, K, K)
+
+    *,
+    irrep_dims: Optional[List[int]] = None,
+) -> torch.Tensor:
+    r"""Convert a chart direction to the right operand of the implemented BCH4 step.
+
+    D_2 BCH4(phi, 0) = B4(ad_phi), B4(A) = I + A/2 + A^2/12 - A^4/720.
+    Solving B4 v = delta_phi makes the composed step's first derivative equal to
+    delta_phi. This is the differential of the finite polynomial used by retraction,
+    not an approximation substituted for the exact exponential differential.
+    """
+    if irrep_dims is not None and len(irrep_dims) > 1:
+        block_of = _generator_block_index(generators, irrep_dims)
+        result = torch.zeros_like(delta_phi)
+        start = 0
+        for h, d in enumerate(irrep_dims):
+            idx = (block_of == h).nonzero(as_tuple=True)[0]
+            sub = generators[idx][:, start:start + d, start:start + d].contiguous()
+            result[..., idx] = _bch_chart_direction(delta_phi[..., idx], phi[..., idx], sub)
+            start += d
+        return result
+    f = _structure_constants(generators.double())
+    ad = torch.einsum("...a,abc->...cb", phi.double(), f)  # (..., n_gen, n_gen)
+    ad2 = ad @ ad
+    eye = torch.eye(ad.shape[-1], dtype=ad.dtype, device=ad.device)
+    differential = eye + 0.5 * ad + ad2 / 12.0 - (ad2 @ ad2) / 720.0
+    return torch.linalg.solve(differential, delta_phi.double().unsqueeze(-1)).squeeze(-1).to(delta_phi.dtype)
+
+
+def precondition_phi_gradient(
+    grad_phi:     torch.Tensor,           # (..., n_gen) Euclidean grad wrt phi coords
+    phi:          torch.Tensor,           # (..., n_gen) current frame (used by pullback)
+    generators:   torch.Tensor,           # (n_gen, K, K)
+
+    *,
+    clip_c:       float = 10.0,
+    series_tol:   float = 1e-12,
+    series_order: int   = 40,
+    mode:         str   = "none",
+
+    center_reg:   Optional[float]        = None,   # None -> 2*K
+    irrep_dims:   Optional[List[int]]    = None,   # required for killing_per_block
+    inv_metric:   Optional[torch.Tensor] = None,   # cached Killing inverse (n_gen, n_gen)
+) -> torch.Tensor:                        # (..., n_gen) preconditioned gradient
+    r"""Dispatch to the registered preconditioning rule `mode` (default 'none')."""
+    return get_precond(mode)(
+        grad_phi, phi, generators,
+        clip_c=clip_c, series_tol=series_tol, series_order=series_order,
+        center_reg=center_reg, irrep_dims=irrep_dims, inv_metric=inv_metric,
+    )

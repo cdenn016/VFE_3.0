@@ -1,0 +1,21 @@
+{
+  "schema_version": "rigorous-theory-search/v1",
+  "contract_id": "{{CONTRACT_ID}}",
+  "target_digest": "{{TARGET_DIGEST}}",
+  "mechanism_families": [
+    {
+      "family_id": "family-001",
+      "core_mechanism": "Candidate mechanism to be specified.",
+      "target_obligation_ids": ["target"],
+      "representation": "Candidate representation to be specified.",
+      "invariant_or_obstruction": "Candidate invariant or obstruction to be investigated.",
+      "obligations": ["State the precise proof or counterexample obligation."],
+      "bridge": "No bridge result has been established.",
+      "failure_test": "Specify a falsifying instance or failed obligation.",
+      "verified_results": [],
+      "open_gaps": ["All mathematical obligations remain open."],
+      "novelty_fingerprint": "Candidate only; novelty is unassessed.",
+      "disposition": "open"
+    }
+  ]
+}

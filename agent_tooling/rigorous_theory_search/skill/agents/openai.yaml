@@ -1,0 +1,4 @@
+interface:
+  display_name: "Rigorous Theory Search"
+  short_description: "Adversarial search for rigorous theory results"
+  default_prompt: "Use $rigorous-theory-search to solve this research-level problem with diverse constructions and evidence-gated adversarial verification."

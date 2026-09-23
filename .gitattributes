@@ -1,0 +1,6 @@
+agent_tooling/rigorous_theory_search/skill/evals/*.json text eol=lf
+
+# Preserve the recorded bytes of this audit and its implementation evidence.
+docs/audits/audit-2026-09-06.md -text
+docs/audits/evidence/deep-audit-20260906/** -text
+docs/audits/evidence/audit-fixes-20260906/** -text

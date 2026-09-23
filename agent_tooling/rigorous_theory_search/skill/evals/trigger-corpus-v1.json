@@ -1,0 +1,47 @@
+{
+  "schema_version": "rigorous-theory-search-trigger-evals/v1",
+  "corpus_id": "rigorous-theory-search-triggers-v1",
+  "frozen_on": "2026-08-02",
+  "cases": [
+    {
+      "id": "trigger_unsolved_conjecture",
+      "should_trigger": true,
+      "prompt": "Develop and prove a complete new conjecture about Fisher pullback geometry, using independent proof routes and adversarial verification."
+    },
+    {
+      "id": "trigger_effective_theory",
+      "should_trigger": true,
+      "prompt": "Construct the exact coarse-grained effective VFE for a general attention-weighted multi-agent network and derive its RG flow and fixed points."
+    },
+    {
+      "id": "trigger_local_global_elbo",
+      "should_trigger": true,
+      "prompt": "Give a rigorous local-to-global ELBO derivation, including all gluing hypotheses and interaction corrections."
+    },
+    {
+      "id": "trigger_gauge_information_geometry",
+      "should_trigger": true,
+      "prompt": "Prove a full theorem about sections of associated statistical bundles pulling Fisher geometry back to the base."
+    },
+    {
+      "id": "no_trigger_routine_algebra",
+      "should_trigger": false,
+      "prompt": "Solve the linear system 2x+y=5 and x-y=1."
+    },
+    {
+      "id": "no_trigger_code_debugging",
+      "should_trigger": false,
+      "prompt": "Fix the off-by-one error in this Python list loop and add a unit test."
+    },
+    {
+      "id": "no_trigger_literature_summary",
+      "should_trigger": false,
+      "prompt": "Summarize the abstract of this supplied paper in three sentences."
+    },
+    {
+      "id": "no_trigger_standard_explanation",
+      "should_trigger": false,
+      "prompt": "Explain what a principal bundle is to a graduate student."
+    }
+  ]
+}

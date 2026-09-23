@@ -1,0 +1,254 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Verification claim ledger",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "mode", "artifact_revision", "claims"],
+  "$defs": {
+    "revision": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!\\s*(?:[Uu][Nn][Ss][Pp][Ee][Cc][Ii][Ff][Ii][Ee][Dd]|[Uu][Nn][Kk][Nn][Oo][Ww][Nn]|<?[Pp][Ll][Aa][Cc][Ee][Hh][Oo][Ll][Dd][Ee][Rr]>?|[Tt][Bb][Dd]|[Tt][Oo][Dd][Oo]|[Nn][Oo][Nn][Ee]|[Nn][Uu][Ll][Ll]|[Nn]/[Aa])\\s*$).*\\S.*$",
+      "not": {
+        "enum": ["UNSPECIFIED", "UNKNOWN", "PLACEHOLDER", "<PLACEHOLDER>", "TBD", "TODO", "NONE", "NULL", "N/A"]
+      }
+    },
+    "criterion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "score"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "score": {"type": "number", "minimum": 0, "maximum": 20}
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "location", "artifact_revision"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "kind": {
+          "enum": ["llm_judgment", "mechanical", "reproduced_output", "derivation", "formal_proof", "numerical", "primary_source", "reproduced_source"]
+        },
+        "location": {"type": "string", "minLength": 1},
+        "artifact_revision": {"$ref": "#/$defs/revision"}
+      }
+    },
+    "counterevidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "location", "artifact_revision", "supports"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "kind": {
+          "enum": ["llm_judgment", "mechanical", "reproduced_output", "derivation", "formal_proof", "numerical", "primary_source", "reproduced_source"]
+        },
+        "location": {"type": "string", "minLength": 1},
+        "artifact_revision": {"$ref": "#/$defs/revision"},
+        "supports": {"type": "boolean"}
+      }
+    },
+    "verifier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "view_ids", "result", "evidence_ids", "result_location"],
+      "properties": {
+        "role": {"type": "string", "minLength": 1},
+        "view_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "result": {"enum": ["support", "refute", "abstain"]},
+        "evidence_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "result_location": {"type": "string", "minLength": 1}
+      }
+    }
+  },
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "mode": {"enum": ["triage", "closure"]},
+    "artifact_revision": {"$ref": "#/$defs/revision"},
+    "claims": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "domain", "statement", "severity", "state", "artifact_revision", "escalation_triggers", "escalation_target", "evidence", "counterevidence", "verifiers", "open_obligations", "evidence_invalidated"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "domain": {"enum": ["code", "experiment", "mathematics", "evidence", "research", "source", "general"]},
+          "statement": {"type": "string", "minLength": 1},
+          "severity": {"enum": ["low", "medium", "high", "critical"]},
+          "state": {"enum": ["CANDIDATE", "LLM_SUPPORTED", "EVIDENCE_VERIFIED", "REFUTED", "INCONCLUSIVE"]},
+          "artifact_revision": {"$ref": "#/$defs/revision"},
+          "criteria": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"$ref": "#/$defs/criterion"}
+          },
+          "escalation_triggers": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {"enum": ["small_margin", "high_dispersion", "criterion_disagreement", "high_severity"]}
+          },
+          "escalation_target": {"enum": [2, 4, 8]},
+          "views": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["calibration_kind", "unresolved_disagreement", "comparison", "scores"],
+            "properties": {
+              "calibration_kind": {"type": "string", "minLength": 1},
+              "unresolved_disagreement": {"type": "boolean"},
+              "comparison": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["method", "candidate_count", "candidate_ids", "candidate_descriptions", "pivot_ids", "orders", "matches"],
+                "properties": {
+                  "method": {"enum": ["pairwise", "pivot_tournament"]},
+                  "candidate_count": {"type": "integer", "minimum": 2},
+                  "candidate_ids": {
+                    "type": "array",
+                    "minItems": 2,
+                    "uniqueItems": true,
+                    "items": {"type": "string", "minLength": 1}
+                  },
+                  "candidate_descriptions": {
+                    "type": "array",
+                    "minItems": 2,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["id", "description"],
+                      "properties": {
+                        "id": {"type": "string", "minLength": 1},
+                        "description": {"type": "string", "minLength": 1}
+                      }
+                    }
+                  },
+                  "pivot_ids": {
+                    "type": "array",
+                    "uniqueItems": true,
+                    "items": {"type": "string", "minLength": 1}
+                  },
+                  "orders": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1}
+                  },
+                  "matches": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["left", "right", "view_id", "outcome", "criteria", "result_location"],
+                      "properties": {
+                        "left": {"type": "string", "minLength": 1},
+                        "right": {"type": "string", "minLength": 1},
+                        "view_id": {"type": "string", "minLength": 1},
+                        "outcome": {"enum": ["left", "right", "tie", "inconclusive"]},
+                        "criteria": {
+                          "type": "array",
+                          "minItems": 1,
+                          "items": {"$ref": "#/$defs/criterion"}
+                        },
+                        "result_location": {"type": "string", "minLength": 1}
+                      }
+                    }
+                  }
+                }
+              },
+              "scores": {
+                "type": "array",
+                "minItems": 2,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["view_id", "criteria"],
+                  "properties": {
+                    "view_id": {"type": "string", "minLength": 1},
+                    "criteria": {
+                      "type": "array",
+                      "minItems": 1,
+                      "items": {"$ref": "#/$defs/criterion"}
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "evidence": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/evidence"}
+          },
+          "counterevidence": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/counterevidence"}
+          },
+          "verifiers": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/verifier"}
+          },
+          "open_obligations": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1}
+          },
+          "evidence_invalidated": {"type": "boolean"}
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"state": {"not": {"const": "CANDIDATE"}}}},
+            "then": {"required": ["criteria", "views"]}
+          },
+          {
+            "if": {"properties": {"state": {"enum": ["EVIDENCE_VERIFIED", "REFUTED", "INCONCLUSIVE"]}}},
+            "then": {
+              "properties": {
+                "verifiers": {
+                  "contains": {
+                    "allOf": [
+                      {"$ref": "#/$defs/verifier"},
+                      {"properties": {"role": {"const": "verifier-adjudicator"}}}
+                    ]
+                  },
+                  "minContains": 1,
+                  "maxContains": 1
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "severity": {"enum": ["high", "critical"]},
+                "state": {"enum": ["EVIDENCE_VERIFIED", "REFUTED"]}
+              }
+            },
+            "then": {
+              "properties": {
+                "verifiers": {
+                  "contains": {
+                    "allOf": [
+                      {"$ref": "#/$defs/verifier"},
+                      {"properties": {"role": {"const": "verifier-skeptic"}}}
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {"properties": {"state": {"enum": ["EVIDENCE_VERIFIED", "REFUTED"]}}},
+            "then": {"properties": {"evidence_invalidated": {"const": false}}}
+          }
+        ]
+      }
+    }
+  }
+}

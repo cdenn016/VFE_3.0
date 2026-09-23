@@ -1,0 +1,11 @@
+# Adversarial verification and oracle erasure
+
+Begin with an isolated first-pass falsifier who receives the frozen statement, assumptions, and proof artifact without the coordinator's diagnosis or favored route. The falsifier targets hidden existence assumptions, circular dependencies, invalid analytic interchanges, local-to-global gaps, singular and boundary cases, gauge or coordinate artifacts, missing generated operators, and claims stronger than their quantifiers.
+
+A defender independently reconstructs reachability from the frozen premises, answers each concrete attack with eligible evidence, and states falsification conditions. Unanswered attacks remain obligations; confidence and role agreement are not evidence.
+
+Require an independent reconstruction from the problem contract, claim ledger, and dependency DAG without the intended narrative. The reconstruction re-derives each load-bearing interface and checks that evidence proves the exact recorded statement. Evidence-weighted adjudication compares derivations, counterexamples, theorem hypotheses, and source artifacts; it is not voting and does not split differences to manufacture consensus.
+
+Before every terminal release, perform oracle erasure. Remove the affirmative search prior from the logical context, scan artifacts for direct or paraphrased use, and recompute the target's closure. The audit rechecks every ancestor in the dependency graph. If any node loses support, downgrade the release or make it `INCONCLUSIVE`. Passing oracle erasure shows only that the prior was unnecessary; it does not prove the theorem.
+
+Record a nonempty attack portfolio in the durable adversarial report. Each attack has a unique ID, affected claim IDs, a substantive attack, `REJECTED`, `SUSTAINED`, or `PARTIALLY_SUSTAINED` disposition, a substantive response, and a contained artifact path with its recomputed SHA-256. The union of attacks covers the target and every transitive dependency. Independent reconstruction and oracle erasure are substantive records rather than completion booleans: each records covered claim IDs, method, `PASS` result, conclusion, and a contained artifact with its SHA-256. Every rejected attack needs a cited proof step or artifact. Every sustained attack names the affected claim and the smallest unresolved obligation.

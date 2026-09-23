@@ -1,0 +1,21 @@
+{
+  "schema_version": "rigorous-theory-search/v1",
+  "contract_id": "{{CONTRACT_ID}}",
+  "target_digest": "{{TARGET_DIGEST}}",
+  "assumptions": [],
+  "evidence": [],
+  "claims": [
+    {
+      "id": "target",
+      "statement": "Candidate target: specify the construction or theorem to be investigated; no result is asserted.",
+      "quantifiers": "To be specified before any proof or refutation claim.",
+      "kind": "MATHEMATICAL",
+      "target_digest": "{{TARGET_DIGEST}}",
+      "state": "CANDIDATE",
+      "assumption_ids": [],
+      "evidence_ids": [],
+      "bridge_premise_ids": [],
+      "falsifier": "Specify a counterexample, obstruction, or failed premise."
+    }
+  ]
+}

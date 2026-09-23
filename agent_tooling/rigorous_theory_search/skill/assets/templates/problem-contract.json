@@ -1,0 +1,25 @@
+{
+  "schema_version": "rigorous-theory-search/v1",
+  "contract_id": "{{CONTRACT_ID}}",
+  "target_digest": "{{TARGET_DIGEST}}",
+  "target": {
+    "statement": "Candidate target: specify the construction or theorem to be investigated; no result is asserted.",
+    "kind": "MATHEMATICAL",
+    "quantifier_class": "MIXED",
+    "quantifiers": "To be specified before any proof or refutation claim.",
+    "domains": ["To be specified."],
+    "codomains": ["To be specified."],
+    "regularity": "To be specified.",
+    "measures": ["To be specified if applicable."],
+    "boundary_conditions": ["To be specified if applicable."],
+    "symmetries": ["To be specified if applicable."],
+    "equivalence": "To be specified.",
+    "premises": ["No premises have been accepted beyond this candidate scaffold."],
+    "modeling_postulates": [],
+    "search_priors": [],
+    "permitted_theorems": [],
+    "negative_certificate_kind": "COUNTEREXAMPLE",
+    "falsification_criterion": "Specify a disconfirming construction, counterexample, or nonexistence argument.",
+    "literature_policy": "Record primary sources and their exact scope before reliance."
+  }
+}

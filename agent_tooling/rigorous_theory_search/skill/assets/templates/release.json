@@ -1,0 +1,11 @@
+{
+  "schema_version": "rigorous-theory-search/v1",
+  "contract_id": "{{CONTRACT_ID}}",
+  "target_digest": "{{TARGET_DIGEST}}",
+  "checkpoint": "candidate scaffold",
+  "target_claim": "target",
+  "terminal_status": null,
+  "certificate_claim": null,
+  "strongest_result": "No theorem, construction, or counterexample has been established.",
+  "unresolved_obligations": ["Specify and investigate the candidate target claim."]
+}
