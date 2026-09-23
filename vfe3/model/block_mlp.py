@@ -35,6 +35,25 @@ def _require_canonical_frame_context(
     return frame_context
 
 
+def _escalated_frame(frame: CanonicalFrameContext, mu: torch.Tensor) -> bool:
+    r"""Whether a float64 frame (escalated pair, audit 2026-09-23 #12) acts on lower-precision beliefs."""
+    return frame.forward.dtype == torch.float64 and mu.dtype != torch.float64
+
+
+def _frame_action(
+    frame: CanonicalFrameContext,
+    mu:    torch.Tensor,
+) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+    r"""The map ``(M, x) -> M x`` used for this frame's vertex factors.
+
+    An escalated frame applies each factor at float64 and returns ``x.dtype``, so the MLP and every
+    downstream tensor keep their dtypes; any other frame uses the plain contraction unchanged.
+    """
+    if _escalated_frame(frame, mu):
+        return lambda M, x: torch.einsum("...ij,...j->...i", M, x.double()).to(x.dtype)
+    return lambda M, x: torch.einsum("...ij,...j->...i", M, x)
+
+
 
 def block_mlp_activation(name: str) -> nn.Module:
     try:
@@ -331,9 +350,10 @@ class CanonicalFrameBlockMLP(BlockMLP):
         frame: Optional[CanonicalFrameContext],
     ) -> torch.Tensor:
         frame = _require_canonical_frame_context(frame)
-        canonical_mu = torch.einsum("...ij,...j->...i", frame.inverse, mu)
+        apply = _frame_action(frame, mu)
+        canonical_mu = apply(frame.inverse, mu)
         canonical_out = super().forward(canonical_mu)
-        return torch.einsum("...ij,...j->...i", frame.forward, canonical_out)
+        return apply(frame.forward, canonical_out)
 
     def forward_moments(
         self,
@@ -343,16 +363,22 @@ class CanonicalFrameBlockMLP(BlockMLP):
         frame_context: Optional[CanonicalFrameContext] = None,
     ) -> BlockMLPMomentResult:
         frame_context = _require_canonical_frame_context(frame_context)
-        canonical_mu = torch.einsum("...ij,...j->...i", frame_context.inverse, mu)
+        apply = _frame_action(frame_context, mu)
+        canonical_mu = apply(frame_context.inverse, mu)
         if self.covariance_contract == "passthrough":
             canonical_out = super().forward(canonical_mu)
-            mu_out = torch.einsum("...ij,...j->...i", frame_context.forward, canonical_out)
+            mu_out = apply(frame_context.forward, canonical_out)
             return BlockMLPMomentResult(mu_out, sigma, None)
         canonical_out, canonical_jacobian = self._coordinate_update_with_jacobian(canonical_mu)
-        mu_out = torch.einsum("...ij,...j->...i", frame_context.forward, canonical_out)
-        realized_jacobian = (
-            frame_context.forward @ canonical_jacobian @ frame_context.inverse
-        )
+        mu_out = apply(frame_context.forward, canonical_out)
+        if not _escalated_frame(frame_context, mu):
+            realized_jacobian = (
+                frame_context.forward @ canonical_jacobian @ frame_context.inverse
+            )
+        else:
+            realized_jacobian = (
+                frame_context.forward @ canonical_jacobian.double() @ frame_context.inverse
+            ).to(canonical_jacobian.dtype)
         return BlockMLPMomentResult(
             mu_out,
             _delta_covariance(realized_jacobian, sigma, self.covariance_floor),

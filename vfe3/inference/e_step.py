@@ -305,8 +305,11 @@ def _transport_qk(
     )
     if not isinstance(query, FactoredTransport) or not isinstance(key, FactoredTransport):
         raise TypeError("mixed-frame transport requires dense FactoredTransport factors")
-    exp_q = query.exp_phi
-    exp_neg_k = key.exp_neg_phi
+    # The two builds escalate to float64 independently (audit 2026-09-23 #12); this operator is a
+    # mixed-frame product, not a stored inverse pair, so promotion is all it needs.
+    common = torch.promote_types(query.exp_phi.dtype, key.exp_neg_phi.dtype)
+    exp_q = query.exp_phi.to(common)
+    exp_neg_k = key.exp_neg_phi.to(common)
     if preserve_factors:
         return FactoredTransport(
             exp_q,

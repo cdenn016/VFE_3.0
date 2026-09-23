@@ -32,7 +32,7 @@ from vfe3.contracts import (
     MStepCapture,
 )
 from vfe3.geometry.groups import GaugeGroup, get_group
-from vfe3.geometry.lie_ops import CompactBlockElement, project_phi_to_slk
+from vfe3.geometry.lie_ops import CompactBlockElement, _equal_diag_blocks, project_phi_to_slk
 from vfe3.geometry.norms import get_norm
 from vfe3.geometry.rope import get_pos_rotation
 from vfe3.geometry.transport import (
@@ -68,6 +68,8 @@ from vfe3.families.gaussian import (
 from vfe3.families.base import BeliefParams
 from vfe3.families.policy import coupling_energy, family_instance
 from vfe3.geometry.transport import (
+    _rope_at_frame_precision,
+    set_frame_pair_fp64_escalation,
     set_full_cov_congruence_certification,
     set_full_cov_congruence_precision,
 )
@@ -331,6 +333,7 @@ class VFEModel(nn.Module):
         set_full_cov_kl_precision(self.full_cov_kl_precision)
         set_full_cov_congruence_precision(cfg.full_cov_congruence_precision)
         set_full_cov_congruence_certification(cfg.full_cov_congruence_certification)
+        set_frame_pair_fp64_escalation(cfg.frame_pair_fp64_escalation)
         set_safe_cholesky_jitter_mode(cfg.safe_cholesky_jitter_mode)
         set_mu_trust_cholesky_rounds(cfg.mu_trust_cholesky_rounds)
         # ... and the fp32 matmul / TF32 policy (audit 2026-08-06 C7/F25), which is process-global
@@ -1001,11 +1004,22 @@ class VFEModel(nn.Module):
             raise RuntimeError(
                 "projected canonical content did not receive a factored vertex representation")
         canonical_frame = self._canonical_frame_context(transport)
-        materialized_mu, materialized_sigma = project_canonical_diagonal(
-            beliefs.mu,
-            beliefs.sigma,
-            canonical_frame.forward,
-        )
+        if (canonical_frame.forward.dtype == torch.float64
+                and beliefs.mu.dtype != torch.float64):
+            # Escalated float64 frame (audit 2026-09-23 #12): project at float64, keep belief dtypes.
+            materialized_mu, materialized_sigma = project_canonical_diagonal(
+                beliefs.mu.double(),
+                beliefs.sigma.double(),
+                canonical_frame.forward,
+            )
+            materialized_mu = materialized_mu.to(beliefs.mu.dtype)
+            materialized_sigma = materialized_sigma.to(beliefs.sigma.dtype)
+        else:
+            materialized_mu, materialized_sigma = project_canonical_diagonal(
+                beliefs.mu,
+                beliefs.sigma,
+                canonical_frame.forward,
+            )
         return (
             beliefs._replace(mu=materialized_mu, sigma=materialized_sigma),
             transport,
@@ -1211,10 +1225,23 @@ class VFEModel(nn.Module):
                                          dtype=base.forward.dtype).expand_as(base.forward)
                     intrinsic = CanonicalFrameContext(identity, identity, base.block_diagonal)
                     with torch.autocast(device_type=base.forward.device.type, enabled=False):
-                        relational_frame = (CanonicalFrameContext(
-                            base.inverse @ relational_frame.forward,
-                            relational_frame.inverse @ base.forward, base.block_diagonal)
-                            if rope is not None else intrinsic)
+                        if rope is not None and base.forward.dtype == torch.float64:
+                            # Escalated float64 frames (audit 2026-09-23 #12): U^-1 (U R^T) = R^T
+                            # exactly, so the intrinsic frame is built from the re-orthogonalized
+                            # rotation; forming it through U leaves cond(U) eps64 of rounding that
+                            # the float64 frame contract rejects. Float32 frames keep the product.
+                            rot = _rope_at_frame_precision(rope, torch.float64)   # (N, K, K)
+                            if base.block_diagonal:
+                                rot = _equal_diag_blocks(rot, base.forward.shape[-3],
+                                                         base.forward.shape[-1])  # (N, H, d, d)
+                            relational_frame = CanonicalFrameContext(
+                                rot.transpose(-1, -2).expand_as(base.forward),
+                                rot.expand_as(base.forward), base.block_diagonal)
+                        else:
+                            relational_frame = (CanonicalFrameContext(
+                                base.inverse @ relational_frame.forward,
+                                relational_frame.inverse @ base.forward, base.block_diagonal)
+                                if rope is not None else intrinsic)
                     relational_value_frame = (relational_frame
                                               if self.cfg.rope_on_value else intrinsic)
             if (

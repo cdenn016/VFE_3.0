@@ -1007,11 +1007,16 @@ def test_projected_missing_frame_fails_closed_at_full_fused_ce() -> None:
         fused_ce(bank, mu_q, var_q, targets)
 
 
-@pytest.mark.parametrize("incompatibility", ["shape", "dtype", "device"])
+@pytest.mark.parametrize(
+    "incompatibility", ["shape", "dtype", "dtype_reduced", "dtype_variance", "device"])
 def test_projected_incompatible_frame_fails_closed_at_priorbank_decode(
     incompatibility: str,
 ) -> None:
-    """Broadcasting, promotion, or cross-device frame reuse would decode the wrong query."""
+    """Broadcasting, promotion, or cross-device frame reuse would decode the wrong query.
+
+    A float64 frame on a float32 query is NOT in this list: that is the escalated frame pair of
+    audit 2026-09-23 #12 and is admitted (see the test below). Every other dtype mismatch fails.
+    """
     bank = _projected_bank()
     mu_q = torch.zeros(1, 2, bank.K)
     var_q = torch.ones_like(mu_q)
@@ -1019,13 +1024,35 @@ def test_projected_incompatible_frame_fails_closed_at_priorbank_decode(
     if incompatibility == "shape":
         frame = frame[:, :1]
     elif incompatibility == "dtype":
-        frame = frame.double()
+        mu_q, var_q = mu_q.double(), var_q.double()        # float32 frame, float64 query
+    elif incompatibility == "dtype_reduced":
+        mu_q, var_q = mu_q.bfloat16(), var_q.bfloat16()    # float32 frame, bf16 query
+    elif incompatibility == "dtype_variance":
+        frame, var_q = frame.double(), var_q.double()       # float64 frame, mixed query moments
     else:
         frame = torch.eye(bank.K, device="meta").expand(1, 2, bank.K, bank.K)
     context = CanonicalFrameContext(forward=frame, inverse=frame.clone())
 
     with pytest.raises(ValueError):
         bank.decode(mu_q, var_q, canonical_frame=context)
+
+
+def test_projected_escalated_float64_frame_is_admitted_at_priorbank_decode() -> None:
+    """An escalated float64 frame pulls a float32 query back at float64 and returns float32."""
+    bank = _projected_bank()
+    torch.manual_seed(5)
+    mu_q = torch.randn(1, 2, bank.K)
+    var_q = torch.rand(1, 2, bank.K) + 0.5
+    frame64 = torch.linalg.matrix_exp(0.3 * torch.randn(1, 2, bank.K, bank.K, dtype=torch.float64))
+    inverse64 = torch.linalg.inv(frame64)
+    escalated = CanonicalFrameContext(forward=frame64, inverse=inverse64)
+
+    got = bank._query_in_decode_frame(mu_q, var_q, escalated)
+    want = bank._query_in_decode_frame(mu_q.double(), var_q.double(), escalated)
+    assert all(t.dtype == torch.float32 for t in got)
+    for g, w in zip(got, want):
+        torch.testing.assert_close(g, w.float(), rtol=1e-6, atol=1e-6)
+    assert torch.isfinite(bank.decode(mu_q, var_q, canonical_frame=escalated)).all()
 
 
 def test_ordinary_decode_rejects_frame_context_and_is_unchanged_without_it() -> None:

@@ -630,6 +630,7 @@ class VFE3Config:
     # Matrix exponential precision is norm-based. The config threshold is passed explicitly;
     # low-level geometry helpers retain their separate default threshold of 5.
     exp_fp64_norm_threshold:   float = 20.0            # upcast when max ||M||_F >= this
+    frame_pair_fp64_escalation: bool = False          # opt-in: redo a frame pair (U, U^-1) in float64 when kappa_F(U) eps32 > 1e-4
 
     # Second trigger for the diagonal-congruence float64 escalation. The DEFAULT guard is sign-only:
     # recompute in float64 iff the working-dtype congruence went negative -- one amin reduction the
@@ -2192,6 +2193,9 @@ class VFE3Config:
         if not math.isfinite(self.unigram_kappa) or self.unigram_kappa < 0.0:
             raise ValueError(
                 f"unigram_kappa must be finite and >= 0, got {self.unigram_kappa}")
+        if not isinstance(self.frame_pair_fp64_escalation, bool):
+            raise ValueError(
+                f"frame_pair_fp64_escalation must be bool, got {self.frame_pair_fp64_escalation!r}")
         if (not math.isfinite(self.exp_fp64_norm_threshold)
                 or self.exp_fp64_norm_threshold <= 0.0):
             raise ValueError(
