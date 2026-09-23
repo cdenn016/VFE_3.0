@@ -309,9 +309,9 @@ def projected_gaussian_kl(
                 return mask.movedim(-2, 0).reshape(n_tokens, -1).any(dim=-1)
             nq_flags, nk_flags = Gq.shape[-3], Gk.shape[-3]
             q_tok = (_token_recover_flags(rec_q, nq_flags) if rec_q is not None
-                     else torch.zeros(nq_flags, dtype=torch.bool))
+                     else torch.zeros(nq_flags, dtype=torch.bool, device=Gq.device))
             k_tok = (_token_recover_flags(rec_k, nk_flags) if rec_k is not None
-                     else torch.zeros(nk_flags, dtype=torch.bool))
+                     else torch.zeros(nk_flags, dtype=torch.bool, device=Gk.device))
             flags = torch.cat((q_tok, k_tok)).tolist()
             q_needs, k_needs = flags[:nq_flags], flags[nq_flags:]
         else:
