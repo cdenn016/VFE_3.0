@@ -216,6 +216,13 @@ class VFE3Config:
     # fallback: at B=64, N=128, V=50257 the promoted logits alone occupy ~3.1 GiB before backward
     # intermediates. Keep it opt-in so the default chunked route remains streamed and bounded.
     decode_ranking_fp64_escalation:             bool = True
+    # How that guard resolves an uncertain ranking (optimization_plan.md WS5). "full" recomputes the
+    # whole (B,N,V) decode in float64, as above, and also promotes the fused CE. "candidates"
+    # recomputes in float64 only the candidates whose float32 interval reaches the winner's, in only
+    # the uncertain rows: the same argmax as "full" at O(candidates * K) instead of O(B N V K), with
+    # non-candidate values left at float32 accuracy. The fused CE never reads the ranking, so under
+    # "candidates" it streams in float32 exactly as with the guard off.
+    decode_ranking_refinement:                  str  = "full"      # "full" | "candidates"
     _allow_legacy_dense_decode:        InitVar[bool] = False
 
     #################################
@@ -1641,6 +1648,10 @@ class VFE3Config:
             raise ValueError(
                 "decode_ranking_fp64_escalation must be bool, got "
                 f"{self.decode_ranking_fp64_escalation!r}")
+        if self.decode_ranking_refinement not in ("full", "candidates"):
+            raise ValueError(
+                "decode_ranking_refinement must be one of ('full', 'candidates'), "
+                f"got {self.decode_ranking_refinement!r}")
         if self.full_cov_congruence_precision not in ("fp64", "fp32_escalate"):
             raise ValueError(
                 "full_cov_congruence_precision must be one of ('fp64', 'fp32_escalate'), "
@@ -2382,6 +2393,8 @@ class VFE3Config:
         )
         if registration.family_consistent and not canonical_family_dispatch:
             mark(("decode_av_precision",), "generic family-consistent decoding does not call _decode_av")
+        if not self.decode_ranking_fp64_escalation:
+            mark(("decode_ranking_refinement",), "only read when decode_ranking_fp64_escalation=True")
 
         # The route-specific rules below were confirmed by tiny launcher-derived CPU probes: loss and
         # every parameter gradient stay torch.equal under an override of the marked knob

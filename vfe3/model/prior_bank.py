@@ -582,6 +582,89 @@ def _promoted_expanded_decode(
         final_logits = final_logits + pb._unigram_bias().double()
     return kernel_logits, final_logits
 
+_DECODE_RANKING_REFINEMENTS = ("full", "candidates")
+
+
+def _pairwise_decode_av(
+    sq:          torch.Tensor,                   # (P, K) query variances
+    mc_q:        torch.Tensor,                   # (P, K) centered query means
+    mc_v:        torch.Tensor,                   # (P, K) centered prior means
+    inv_v:       torch.Tensor,                   # (P, K) 1/sigma_v
+    lsum:        torch.Tensor,                   # (P,)   sum_k log sigma_v (times coord_delta)
+    coord_delta: Optional[torch.Tensor] = None,  # (K,) head-evidence coefficients w_h - 1
+) -> torch.Tensor:                               # (P,)
+    r"""The expanded-form ``a_v`` of :func:`_decode_av` for P explicit (query, prior) pairs.
+
+    Same algebra, one prior per query row instead of a shared vocabulary table:
+    :math:`a = \sum_k w_k [(s_k + m_k^2) / \sigma_k - 2 m_k \bar m_k / \sigma_k
+    + \bar m_k^2 / \sigma_k] + \ell`, with :math:`w = 1` or the head-evidence coefficients.
+    """
+    weight = 1. if coord_delta is None else coord_delta
+    return (((sq + mc_q ** 2) - 2. * mc_q * mc_v + mc_v ** 2) * inv_v * weight).sum(-1) + lsum
+
+
+def _refined_candidate_decode(
+    pb:             'PriorBank',
+    mu_q:           torch.Tensor,   # (B, N, K) posterior means
+    sigma_q:        torch.Tensor,   # (B, N, K) variances, or (B, N, K, K) prepared covariances
+    tau_eff:        torch.Tensor,
+    ranking_logits: torch.Tensor,   # (B, N, V) float32 final ranking scores
+    ranking_bound:  torch.Tensor,   # (B, N, V) their certified absolute error bounds
+    kernel_logits:  torch.Tensor,   # (B, N, V) float32 kernel logits (no unigram bias)
+    *,
+    full_covariance: bool,
+) -> torch.Tensor:                  # (B, N, V) float64 kernel logits
+    r"""Resolve an uncertain float32 ranking by recomputing only its candidates in float64.
+
+    A candidate of row (b, n) is a v whose outward interval upper end reaches the nominal winner's
+    outward lower end. Every non-candidate j therefore has exact score at most
+    :math:`u_j < \ell_w \le s^*_w \le \max_v s^*_v`, so the exact argmax is a candidate, and the
+    float64 candidate values resolve it as the full float64 recompute would. The returned kernel
+    logits are the float32 values upcast (exact) with the candidates of uncertain rows replaced by
+    float64 values. The unigram bias added by :meth:`PriorBank.decode` in float64 keeps every
+    non-candidate inside its certified interval, so the final argmax matches the full promotion.
+    Non-candidate VALUES keep float32 accuracy, exactly as when no row is uncertain; only the
+    ranking is certified. Cost O(P K) float64 for P candidates, instead of the O(B N V K)
+    recompute. The row and candidate selection reads one host index list, on the escalation path.
+    """
+    winner = ranking_logits.argmax(dim=-1, keepdim=True)
+    winner_lower = _outward_lower(ranking_logits.gather(-1, winner), ranking_bound.gather(-1, winner))
+    candidates = _outward_upper(ranking_logits, ranking_bound) >= winner_lower         # (B, N, V)
+    candidates &= candidates.sum(dim=-1, keepdim=True) > 1                             # uncertain rows only
+    b, n, v = candidates.nonzero(as_tuple=True)
+    mu_v = pb._decode_mu_table().double()
+    sigma_v = bounded_variance_from_log(pb._decode_sigma_log_table().double(), eps=pb.eps)
+    c = mu_v.mean(dim=0, keepdim=True)                         # the full-vocabulary shift, as expanded
+    mc_v, sigma_v = (mu_v - c)[v], sigma_v[v]                  # (P, K)
+    inv_v = 1.0 / sigma_v
+    mc_q = mu_q[b, n].double() - c                             # (P, K)
+    sigma = sigma_q[b, n].double()
+    if full_covariance:
+        # The full-covariance helpers take (B, N, K, K) rows; the P candidates form one row batch.
+        sq, logdet, _ = pb._full_cov_query_invariants(sigma.unsqueeze(0))
+        sq, logdet = sq[0], logdet[0]
+        per_pos = pb.K + logdet
+    else:
+        sq = sigma
+        per_pos = pb.K + torch.log(sigma.clamp(min=pb.eps)).sum(-1)
+    a_v = _pairwise_decode_av(sq, mc_q, mc_v, inv_v, torch.log(sigma_v).sum(-1))
+    evidence_delta = None
+    if hasattr(pb, "head_evidence_logits"):
+        head_delta, coord_delta = pb._head_evidence_deltas(dtype=torch.float64, device=mu_q.device)
+        if full_covariance:
+            delta_per_pos = pb._head_evidence_full_marginal_invariants(
+                sigma.unsqueeze(0), head_delta)[0][0].squeeze(-1)
+        else:
+            delta_per_pos = (coord_delta * (1.0 + torch.log(sigma.clamp(min=pb.eps)))).sum(-1)
+        delta_a_v = _pairwise_decode_av(sq, mc_q, mc_v, inv_v,
+                                        (torch.log(sigma_v) * coord_delta).sum(-1), coord_delta)
+        evidence_delta = 0.5 * (delta_a_v - delta_per_pos)
+    refined = kernel_logits.double()
+    refined[b, n, v] = _decode_analytic_kl_logits(
+        a_v, per_pos, tau_eff.double(), torch.float64, evidence_delta=evidence_delta)
+    return refined
+
+
 # Registries: mode name -> callable. Variants swap by config; add a variant by
 # writing-and-registering it, never by editing call sites.
 #   encode: fn(pb, token_ids) -> BeliefState
@@ -891,6 +974,7 @@ class PriorBank(nn.Module):
         decode_av_precision: Optional[str] = None,
         decode_ce_checkpoint: str  = "auto",
         decode_ranking_fp64_escalation: bool = True,
+        decode_ranking_refinement: str = "full",
 
         unigram_kappa:        float = 1.0,
         decode_unigram_prior: bool  = False,
@@ -969,6 +1053,10 @@ class PriorBank(nn.Module):
             raise ValueError(
                 "decode_ranking_fp64_escalation must be bool, got "
                 f"{decode_ranking_fp64_escalation!r}")
+        if decode_ranking_refinement not in _DECODE_RANKING_REFINEMENTS:
+            raise ValueError(
+                f"decode ranking refinement must be one of {_DECODE_RANKING_REFINEMENTS}, "
+                f"got {decode_ranking_refinement!r}")
         self.vocab_size = vocab_size
         self.K = K
         self.n_gen = n_gen
@@ -994,6 +1082,7 @@ class PriorBank(nn.Module):
         self.decode_chunk_size = decode_chunk_size
         self.decode_ce_checkpoint = decode_ce_checkpoint
         self.decode_ranking_fp64_escalation = decode_ranking_fp64_escalation
+        self.decode_ranking_refinement = decode_ranking_refinement
         self.unigram_kappa = unigram_kappa
         self.decode_unigram_prior = decode_unigram_prior
         self.gauge_group_name = gauge_group_name
@@ -1619,10 +1708,13 @@ class PriorBank(nn.Module):
         global_bounds = torch.stack(bound_chunks, dim=-1)
         max_uppers = torch.stack(max_upper_chunks, dim=-1)
         runner_uppers = torch.stack(runner_upper_chunks, dim=-1)
-        if (self.decode_ranking_fp64_escalation and _streamed_final_ranking_uncertain(
-            global_ranking, global_bounds, max_uppers, runner_uppers,
-            vocab_size=V,
-        )):
+        # The CE never reads the ranking; only the "full" refinement promotes it (see
+        # _refined_candidate_decode for the "candidates" contract).
+        if (self.decode_ranking_fp64_escalation and self.decode_ranking_refinement == "full"
+                and _streamed_final_ranking_uncertain(
+                    global_ranking, global_bounds, max_uppers, runner_uppers,
+                    vocab_size=V,
+                )):
             _, promoted_logits = _promoted_expanded_decode(
                 self, mu_q, sigma_q, tau_eff, full_covariance=False)
             promoted_lse = torch.logsumexp(promoted_logits, dim=-1)
@@ -1772,6 +1864,9 @@ class PriorBank(nn.Module):
         mu_q, sigma_q, factor_q, spd_ok = self._query_in_decode_frame_for_full_decode(
             mu_q, sigma_q, canonical_frame)
         self._validate_fused_ce_targets(targets, ignore_index=ignore_index)
+        # Only the "full" refinement promotes the CE on an uncertain ranking; the CE never reads the
+        # ranking itself, so "candidates" streams exactly as with the guard off.
+        ranking_guard = self.decode_ranking_fp64_escalation and self.decode_ranking_refinement == "full"
         tau_eff = self._tau_eff(tau)
         chunk = self.decode_chunk_size if chunk_size is None else chunk_size
         V = self.vocab_size
@@ -1826,7 +1921,7 @@ class PriorBank(nn.Module):
             ``sq_``/``mc_q_`` carry the UNEXPANDED query pieces alongside ``lhs_`` so the "exact"
             a_v form can difference before squaring (audit 2026-08-06 F32).
             """
-            if not self.decode_ranking_fp64_escalation:
+            if not ranking_guard:
                 a_v = _decode_av(
                     sq_, mc_q_, mu_v_c, inv_v_c, lsum_c, lhs=lhs_, precision=self.decode_av_precision)
                 evidence_delta = None
@@ -1916,7 +2011,7 @@ class PriorBank(nn.Module):
             lse_chunk, contrib = chunk_result[:2]
             lse_chunks.append(lse_chunk)
             target_logit = target_logit + contrib                          # exactly one chunk contributes per valid pos
-            if self.decode_ranking_fp64_escalation:
+            if ranking_guard:
                 ranking_chunk, bound_chunk, max_upper, runner_upper = chunk_result[2:]
                 ranking_chunks.append(ranking_chunk)
                 bound_chunks.append(bound_chunk)
@@ -1925,14 +2020,14 @@ class PriorBank(nn.Module):
 
         logsumexp_v = torch.logsumexp(torch.stack(lse_chunks, dim=0), dim=0)  # (B, N)
         global_ranking = (
-            torch.stack(ranking_chunks, dim=-1) if self.decode_ranking_fp64_escalation else None)
+            torch.stack(ranking_chunks, dim=-1) if ranking_guard else None)
         global_bounds = (
-            torch.stack(bound_chunks, dim=-1) if self.decode_ranking_fp64_escalation else None)
+            torch.stack(bound_chunks, dim=-1) if ranking_guard else None)
         max_uppers = (
-            torch.stack(max_upper_chunks, dim=-1) if self.decode_ranking_fp64_escalation else None)
+            torch.stack(max_upper_chunks, dim=-1) if ranking_guard else None)
         runner_uppers = (
-            torch.stack(runner_upper_chunks, dim=-1) if self.decode_ranking_fp64_escalation else None)
-        if (self.decode_ranking_fp64_escalation and _streamed_final_ranking_uncertain(
+            torch.stack(runner_upper_chunks, dim=-1) if ranking_guard else None)
+        if (ranking_guard and _streamed_final_ranking_uncertain(
             global_ranking, global_bounds, max_uppers, runner_uppers,
             vocab_size=V,
         )):
@@ -2536,6 +2631,12 @@ def _decode_diagonal(
         a_error_bound=a_bound, evidence_error_bound=evidence_bound,
         unigram_bias=unigram, return_error_bound=True)
     if pb.decode_ranking_fp64_escalation and _final_ranking_uncertain(ranking_logits, ranking_bound):
+        if pb.decode_ranking_refinement == "candidates":
+            return _refined_candidate_decode(
+                pb, mu_q, sigma_q, tau_eff, ranking_logits, ranking_bound,
+                _decode_analytic_kl_logits(a_v, per_pos, tau_eff, mu_q.dtype,
+                                           evidence_delta=evidence_delta),
+                full_covariance=False)
         kernel_logits, _ = _promoted_expanded_decode(
             pb, mu_q, sigma_q, tau_eff, full_covariance=False)
         return kernel_logits
@@ -2687,8 +2788,15 @@ def _decode_full_chunked(
         a_error_bound=a_bound, evidence_error_bound=evidence_bound,
         unigram_bias=unigram, return_error_bound=True)
     if pb.decode_ranking_fp64_escalation and _final_ranking_uncertain(ranking_logits, ranking_bound):
-        logits, _ = _promoted_expanded_decode(
-            pb, mu_q, sigma_q, tau_eff, full_covariance=True)
+        if pb.decode_ranking_refinement == "candidates":
+            logits = _refined_candidate_decode(
+                pb, mu_q, sigma_q, tau_eff, ranking_logits, ranking_bound,
+                _decode_analytic_kl_logits(a_v, per_pos, tau_eff, mu_q.dtype,
+                                           evidence_delta=evidence_delta),
+                full_covariance=True)
+        else:
+            logits, _ = _promoted_expanded_decode(
+                pb, mu_q, sigma_q, tau_eff, full_covariance=True)
     else:
         logits = _decode_analytic_kl_logits(
             a_v, per_pos, tau_eff, mu_q.dtype, evidence_delta=evidence_delta)

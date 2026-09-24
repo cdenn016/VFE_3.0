@@ -407,6 +407,7 @@ class VFEModel(nn.Module):
             decode_chunk_size=cfg.decode_chunk_size,
             decode_ce_checkpoint=cfg.decode_ce_checkpoint,
             decode_ranking_fp64_escalation=cfg.decode_ranking_fp64_escalation,
+            decode_ranking_refinement=cfg.decode_ranking_refinement,
             # Tier-1/Tier-2 decode toggles (2026-07-05; all default OFF, byte-identical):
             unigram_kappa=cfg.unigram_kappa,
             decode_unigram_prior=cfg.decode_unigram_prior,
