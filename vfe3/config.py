@@ -678,6 +678,16 @@ class VFE3Config:
     # O(kappa eps_32) in its scores) and the certificate's two batched inverses are skipped.
     projected_cov_condition_recovery: bool = False
 
+    # Factor route of the projected Gaussian-KL scorer (optimization_plan.md WS1). "gram" factors the
+    # rounded float32 Gram G = fl(X X^T), X = S U^-1 Sigma^1/2, so its factor, precision and
+    # log-determinant carry error O(eps kappa(X)^2). "cholesky_qr2" factors X itself by CholeskyQR2:
+    # the same Gaussian and the same KL in exact arithmetic, with error O(eps kappa(X)); the recovery
+    # certificate above becomes eps kappa_1(C) > 3e-4 on the factor, and a failed CholeskyQR2 retries
+    # shifted CholeskyQR3 in float32 before float64. Measured on the saved K=64/K=128 runs (Phase 0,
+    # 2026-09-24): max KL error / tau 2.3e-4 (gram) vs 5e-5 (cholesky_qr2) against a float64 oracle.
+    # The noisy-query cost factors per-pair sums G_q + G_k and keeps the Gram route.
+    projected_factor_route: str = "gram"     # "gram" | "cholesky_qr2"
+
     # Scaling of safe_cholesky's jitter ladder. The ridge eps*10^t is ABSOLUTE by default, so at an
     # eigenvalue on the eps=1e-6 SPD floor the t=0 ridge DOUBLES it and shifts logdet by exactly
     # log 2 per floored direction, while at sigma_max=100 the same ridge is a 1e-8 relative no-op.
@@ -1643,6 +1653,10 @@ class VFE3Config:
             raise ValueError(
                 "projected_cov_condition_recovery must be bool, got "
                 f"{self.projected_cov_condition_recovery!r}")
+        if self.projected_factor_route not in ("gram", "cholesky_qr2"):
+            raise ValueError(
+                "projected_factor_route must be one of ('gram', 'cholesky_qr2'), "
+                f"got {self.projected_factor_route!r}")
         if self.safe_cholesky_jitter_mode not in ("absolute", "relative"):
             raise ValueError(
                 "safe_cholesky_jitter_mode must be one of ('absolute', 'relative'), "
@@ -2307,10 +2321,13 @@ class VFE3Config:
             mark(("relational_identity_content", "m_relational_score_lr", "m_relational_content_lr",
                   "relational_routing"),
                  "only read by projected attention; transported attention creates no relational parameters")
-            mark(("projected_cov_condition_recovery",),
+            mark(("projected_cov_condition_recovery", "projected_factor_route"),
                  "only read by the projected attention scorers")
         else:
             mark(("compile_pair_kernel",), "projected attention bypasses the belief-gradient pair kernel")
+            if self.relational_routing == "noisy_query":
+                mark(("projected_factor_route",),
+                     "the noisy-query cost factors per-pair sums G_q + G_k and keeps the Gram route")
         gradient_controls = ("e_q_mu_lr", "e_q_sigma_lr", "e_step_mu_precond",
                              "e_mu_q_trust", "mu_trust_mode", "e_sigma_q_trust")
         if self.attention_mode != "transported":
