@@ -216,6 +216,13 @@ class VFE3Config:
     # fallback: at B=64, N=128, V=50257 the promoted logits alone occupy ~3.1 GiB before backward
     # intermediates. Keep it opt-in so the default chunked route remains streamed and bounded.
     decode_ranking_fp64_escalation:             bool = True
+    # How that guard resolves an uncertain ranking (optimization_plan.md WS5). "full" recomputes the
+    # whole (B,N,V) decode in float64, as above, and also promotes the fused CE. "candidates"
+    # recomputes in float64 only the candidates whose float32 interval reaches the winner's, in only
+    # the uncertain rows: the same argmax as "full" at O(candidates * K) instead of O(B N V K), with
+    # non-candidate values left at float32 accuracy. The fused CE never reads the ranking, so under
+    # "candidates" it streams in float32 exactly as with the guard off.
+    decode_ranking_refinement:                  str  = "full"      # "full" | "candidates"
     _allow_legacy_dense_decode:        InitVar[bool] = False
 
     #################################
@@ -678,6 +685,19 @@ class VFE3Config:
     # O(kappa eps_32) in its scores) and the certificate's two batched inverses are skipped.
     projected_cov_condition_recovery: bool = False
 
+    # Factor route of the projected Gaussian-KL scorer (optimization_plan.md WS1). "gram" factors the
+    # rounded float32 Gram G = fl(X X^T), X = S U^-1 Sigma^1/2, so its factor, precision and
+    # log-determinant carry error O(eps kappa(X)^2). "cholesky_qr2" factors X itself by CholeskyQR2:
+    # the same Gaussian and the same KL in exact arithmetic, with error O(eps kappa(X)); the recovery
+    # certificate above becomes eps kappa_1(C) > 3e-4 on the factor, and a failed CholeskyQR2 retries
+    # shifted CholeskyQR3 in float32 before float64. Measured on the saved K=64/K=128 runs (Phase 0,
+    # 2026-09-24): max KL error / tau 2.5e-4 / 4.6e-5 (gram) vs 2.0e-4 / 3.3e-5 (cholesky_qr2) against
+    # a float64 oracle; the float32 pair-stage GEMM tr(P_k G_q) dominates what remains. With
+    # condition recovery on, "cholesky_qr2" recovered no entry where "gram" recovered 127,112 (K=64),
+    # but it raised CUDA kernel time per training step from 216 to 362 ms (K=64, B=64).
+    # The noisy-query cost factors per-pair sums G_q + G_k and keeps the Gram route.
+    projected_factor_route: str = "gram"     # "gram" | "cholesky_qr2"
+
     # Scaling of safe_cholesky's jitter ladder. The ridge eps*10^t is ABSOLUTE by default, so at an
     # eigenvalue on the eps=1e-6 SPD floor the t=0 ridge DOUBLES it and shifts logdet by exactly
     # log 2 per floored direction, while at sigma_max=100 the same ridge is a 1e-8 relative no-op.
@@ -761,7 +781,11 @@ class VFE3Config:
     generate_embedding_figures:     bool = True
     # Exact common-frame KL scoring for eligible flat full-Gaussian transports.
     # Unsupported paths retain the pairwise implementation; default preserves existing runs.
-    full_cov_kl_backend:           str   = "common_frame"  # "common_frame" | "pairwise"
+    # "common_frame_factored" (optimization_plan.md WS3) scores the same pulled-back KL from
+    # square-root CholeskyQR2 factors and certifies those factors (eps kappa_1 <= 3e-4) instead of
+    # admitting only cond(U_i)^2 cond(C_j) <= 1/(64 d eps), which rejected every call on the saved
+    # K=64/K=128 frames (Phase 0, 2026-09-24), so the route fell back to the pairwise congruence.
+    full_cov_kl_backend:           str   = "common_frame"  # "common_frame" | "common_frame_factored" | "pairwise"
 
     
 
@@ -1619,9 +1643,9 @@ class VFE3Config:
         # The full-covariance KL precision spellings are inlined rather than imported from
         # vfe3.families.gaussian (importing a family module inside __post_init__ perturbs import
         # order). set_full_cov_kl_precision validates the same set.
-        if self.full_cov_kl_backend not in ("pairwise", "common_frame"):
+        if self.full_cov_kl_backend not in ("pairwise", "common_frame", "common_frame_factored"):
             raise ValueError(
-                "full_cov_kl_backend must be one of ('pairwise', 'common_frame'), "
+                "full_cov_kl_backend must be one of ('pairwise', 'common_frame', 'common_frame_factored'), "
                 f"got {self.full_cov_kl_backend!r}")
         if self.full_cov_kl_precision not in ("fp64", "fp32_escalate", "fp32_escalate_cond"):
             raise ValueError(
@@ -1631,6 +1655,10 @@ class VFE3Config:
             raise ValueError(
                 "decode_ranking_fp64_escalation must be bool, got "
                 f"{self.decode_ranking_fp64_escalation!r}")
+        if self.decode_ranking_refinement not in ("full", "candidates"):
+            raise ValueError(
+                "decode_ranking_refinement must be one of ('full', 'candidates'), "
+                f"got {self.decode_ranking_refinement!r}")
         if self.full_cov_congruence_precision not in ("fp64", "fp32_escalate"):
             raise ValueError(
                 "full_cov_congruence_precision must be one of ('fp64', 'fp32_escalate'), "
@@ -1643,6 +1671,10 @@ class VFE3Config:
             raise ValueError(
                 "projected_cov_condition_recovery must be bool, got "
                 f"{self.projected_cov_condition_recovery!r}")
+        if self.projected_factor_route not in ("gram", "cholesky_qr2"):
+            raise ValueError(
+                "projected_factor_route must be one of ('gram', 'cholesky_qr2'), "
+                f"got {self.projected_factor_route!r}")
         if self.safe_cholesky_jitter_mode not in ("absolute", "relative"):
             raise ValueError(
                 "safe_cholesky_jitter_mode must be one of ('absolute', 'relative'), "
@@ -2307,10 +2339,13 @@ class VFE3Config:
             mark(("relational_identity_content", "m_relational_score_lr", "m_relational_content_lr",
                   "relational_routing"),
                  "only read by projected attention; transported attention creates no relational parameters")
-            mark(("projected_cov_condition_recovery",),
+            mark(("projected_cov_condition_recovery", "projected_factor_route"),
                  "only read by the projected attention scorers")
         else:
             mark(("compile_pair_kernel",), "projected attention bypasses the belief-gradient pair kernel")
+            if self.relational_routing == "noisy_query":
+                mark(("projected_factor_route",),
+                     "the noisy-query cost factors per-pair sums G_q + G_k and keeps the Gram route")
         gradient_controls = ("e_q_mu_lr", "e_q_sigma_lr", "e_step_mu_precond",
                              "e_mu_q_trust", "mu_trust_mode", "e_sigma_q_trust")
         if self.attention_mode != "transported":
@@ -2365,6 +2400,8 @@ class VFE3Config:
         )
         if registration.family_consistent and not canonical_family_dispatch:
             mark(("decode_av_precision",), "generic family-consistent decoding does not call _decode_av")
+        if not self.decode_ranking_fp64_escalation:
+            mark(("decode_ranking_refinement",), "only read when decode_ranking_fp64_escalation=True")
 
         # The route-specific rules below were confirmed by tiny launcher-derived CPU probes: loss and
         # every parameter gradient stay torch.equal under an override of the marked knob

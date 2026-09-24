@@ -74,7 +74,7 @@ from vfe3.geometry.transport import (
     set_full_cov_congruence_precision,
 )
 from vfe3.numerics import set_mu_trust_cholesky_rounds, set_safe_cholesky_jitter_mode
-from vfe3.relational_scoring import set_projected_condition_recovery
+from vfe3.relational_scoring import set_projected_condition_recovery, set_projected_factor_route
 from vfe3.runtime import set_fp32_matmul_precision
 from vfe3.model.relational_operators import RelationalOperators
 
@@ -336,6 +336,7 @@ class VFEModel(nn.Module):
         set_full_cov_congruence_certification(cfg.full_cov_congruence_certification)
         set_frame_pair_fp64_escalation(cfg.frame_pair_fp64_escalation)
         set_projected_condition_recovery(cfg.projected_cov_condition_recovery)
+        set_projected_factor_route(cfg.projected_factor_route)
         set_safe_cholesky_jitter_mode(cfg.safe_cholesky_jitter_mode)
         set_mu_trust_cholesky_rounds(cfg.mu_trust_cholesky_rounds)
         # ... and the fp32 matmul / TF32 policy (audit 2026-08-06 C7/F25), which is process-global
@@ -406,6 +407,7 @@ class VFEModel(nn.Module):
             decode_chunk_size=cfg.decode_chunk_size,
             decode_ce_checkpoint=cfg.decode_ce_checkpoint,
             decode_ranking_fp64_escalation=cfg.decode_ranking_fp64_escalation,
+            decode_ranking_refinement=cfg.decode_ranking_refinement,
             # Tier-1/Tier-2 decode toggles (2026-07-05; all default OFF, byte-identical):
             unigram_kappa=cfg.unigram_kappa,
             decode_unigram_prior=cfg.decode_unigram_prior,

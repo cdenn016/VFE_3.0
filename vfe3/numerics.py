@@ -675,6 +675,114 @@ def validated_cholesky_solve(
         factor_residual, solve_residual)
 
 
+# Certificate tolerance for square-root (CholeskyQR2) factors, eps * kappa_1-estimate(C) <= this.
+# Shared by the projected scorer and the factored common-frame KL (optimization_plan.md WS2/WS3).
+# Set just above the observed maximum eps * kappa_1 = 1.3e-4 on the saved K=64/K=128 runs; see
+# relational_scoring._factor_status for the error model and why the P2 max-norm reading is not used.
+FACTOR_CONDITION_TOL: float = 3e-4
+
+
+def guarded_cholesky(
+    W: torch.Tensor,   # (..., n, n) symmetric
+) -> Tuple[torch.Tensor, torch.Tensor]:   # (..., n, n) lower factor, (...) failed
+    r"""Zero-jitter Cholesky whose failed entries factor the identity instead.
+
+    Autograd through a failed Cholesky is NaN even under a zero cotangent, and a batched NaN
+    reaches every shared parameter. A detached pass finds the failures, and the differentiable pass
+    factors ``I`` in their place, so ``failed`` entries return the identity with finite (zero)
+    gradients. Healthy entries repeat the same factorization of the same input, bit for bit.
+    """
+    with torch.no_grad():
+        failed = torch.linalg.cholesky_ex(W.detach())[1] != 0
+    eye = torch.eye(W.shape[-1], dtype=W.dtype, device=W.device)
+    return torch.linalg.cholesky_ex(torch.where(failed[..., None, None], eye, W))[0], failed
+
+
+def cholesky_qr2(
+    X: torch.Tensor,   # (..., r, m) source root with r <= m
+
+    *,
+    shift: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:   # (..., r, r) lower factor, (...) failed
+    r"""Lower Cholesky factor C of G = X X^T by CholeskyQR2, error O(eps kappa(X)).
+
+    .. math::
+        C_1 C_1^T = \mathrm{fl}(X X^T), \qquad Y = C_1^{-1} X, \qquad
+        C_2 C_2^T = \mathrm{fl}(Y Y^T), \qquad C = C_1 C_2 .
+
+    In exact arithmetic :math:`C C^T = C_1 Y Y^T C_1^T = X X^T`, so C is the unique Cholesky factor
+    of G and its log-determinant and inverse are the same functions of X. The second pass corrects
+    the first pass's squared-conditioning error: CholeskyQR2 is backward stable in X for
+    :math:`\kappa(X) \lesssim \varepsilon^{-1/2}` (Fukaya et al. 2014; Yamamoto et al. 2015), so C
+    carries relative error of order :math:`\varepsilon \kappa(X)`, not
+    :math:`\varepsilon \kappa(X)^2`. ``shift=True`` is shifted CholeskyQR3 (Fukaya et al. 2020):
+    the first pass factors :math:`\mathrm{fl}(X X^T) + s I` with
+    :math:`s = 11 (m r + r (r + 1)) \varepsilon \lVert X \rVert_F^2`, and CholeskyQR2 then runs on
+    :math:`C_1^{-1} X`. The shift is a preconditioner only: the product still factors
+    :math:`X X^T` exactly, and validity extends to :math:`\kappa(X) \approx \varepsilon^{-1}`.
+    No jitter enters the result.
+
+    ``failed`` marks entries whose factorizations failed or went non-finite. Their factor is
+    meaningless but finite with finite gradients (failed passes factor the identity, see
+    :func:`guarded_cholesky`), so a caller may overwrite them and still differentiate the rest.
+    """
+    r, m = X.shape[-2:]
+    W1 = X @ X.transpose(-1, -2)
+    W1 = .5 * W1 + .5 * W1.transpose(-1, -2)
+    if shift:
+        scale = 11 * (m * r + r * (r + 1)) * torch.finfo(X.dtype).eps
+        W1 = W1 + (scale * X.square().sum(dim=(-2, -1)))[..., None, None] * torch.eye(
+            r, dtype=X.dtype, device=X.device)
+    C1, failed1 = guarded_cholesky(W1)
+    Y = torch.linalg.solve_triangular(C1, X, upper=False)
+    if shift:
+        C2, failed2 = cholesky_qr2(Y)
+    else:
+        W2 = Y @ Y.transpose(-1, -2)
+        C2, failed2 = guarded_cholesky(.5 * W2 + .5 * W2.transpose(-1, -2))
+    C = C1 @ C2
+    with torch.no_grad():
+        failed = failed1 | failed2 | ~torch.isfinite(C).all(dim=(-2, -1))
+    return C, failed
+
+
+def triangular_condition_estimate(
+    C: torch.Tensor,   # (..., n, n) lower triangular, nonsingular
+
+    *,
+    iterations: int = 3,
+) -> torch.Tensor:     # (...) estimate of kappa_1(C)
+    r"""Hager-Higham estimate of :math:`\kappa_1(C) = \lVert C \rVert_1 \lVert C^{-1} \rVert_1`.
+
+    :math:`\lVert C^{-1} \rVert_1` is estimated by Hager's power iteration on the unit 1-norm
+    ball (Hager 1984) with Higham's extra alternating-sign test vector (Higham 1988; the algorithm
+    behind LAPACK xLACN2/xTRCON), using only triangular solves: O(n^2) per matrix. Every candidate
+    is :math:`\lVert C^{-1} v \rVert_1 / \lVert v \rVert_1` for an explicit v, so the result is a
+    LOWER bound on :math:`\kappa_1(C)` whatever the iteration count; it is typically within a
+    factor of about 3 of the true value. The iteration count is fixed, so batched calls run with no
+    data-dependent control flow and no host synchronization.
+    """
+    n = C.shape[-1]
+    with torch.no_grad():
+        C = C.detach()
+        norm = C.abs().sum(dim=-2).amax(dim=-1)                                # ||C||_1
+        if n == 1:
+            return torch.ones_like(norm)
+        x = torch.full((*C.shape[:-1], 1), 1. / n, dtype=C.dtype, device=C.device)
+        estimate = torch.zeros_like(norm)
+        for _ in range(iterations):
+            y = torch.linalg.solve_triangular(C, x, upper=False)                # C^{-1} x
+            estimate = torch.maximum(estimate, y.abs().sum(dim=(-2, -1)))
+            signs = torch.where(y >= 0, torch.ones_like(y), -torch.ones_like(y))
+            z = torch.linalg.solve_triangular(C.transpose(-1, -2), signs, upper=True)  # C^{-T} sign(y)
+            x = torch.zeros_like(x).scatter_(-2, z.abs().argmax(dim=-2, keepdim=True), 1.)
+        index = torch.arange(n, dtype=C.dtype, device=C.device)
+        alternating = ((-1.) ** index * (1. + index / (n - 1))).expand(*C.shape[:-1]).unsqueeze(-1)
+        y = torch.linalg.solve_triangular(C, alternating, upper=False)
+        estimate = torch.maximum(estimate, 2. * y.abs().sum(dim=(-2, -1)) / (3. * n))
+        return norm * estimate
+
+
 def floor_eigenvalues(
     matrix: torch.Tensor,                # (..., K, K) symmetric
     *,
