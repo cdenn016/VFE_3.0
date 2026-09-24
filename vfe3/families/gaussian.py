@@ -741,9 +741,10 @@ class FullGaussian(BeliefParams):
         routes retain their existing complete-grid evaluation.
         """
         policy = full_cov_kl_precision() if precision_policy is None else validate_full_cov_kl_precision(precision_policy)
-        if score_backend not in ("pairwise", "common_frame"):
+        if score_backend not in ("pairwise", "common_frame", "common_frame_factored"):
             raise ValueError(f"Unsupported full covariance score backend: {score_backend!r}")
-        if score_backend == "common_frame" and cls is FullGaussian and not diagonal_out:
+        if (score_backend in ("common_frame", "common_frame_factored")
+                and cls is FullGaussian and not diagonal_out):
             from vfe3.families.base import get_functional, renyi
             # Registry identity matters: a same-name replacement must keep its own semantics.
             if alpha == 1.0 and get_functional(divergence_family) is renyi:
@@ -751,7 +752,7 @@ class FullGaussian(BeliefParams):
                 energy = common_frame_kl_energy(
                     mu_q, dispersion_q, mu_k, dispersion_k, omega,
                     kl_max=kl_max, precision_policy=policy, irrep_dims=irrep_dims,
-                    pair_support=pair_support,
+                    pair_support=pair_support, factored=(score_backend == "common_frame_factored"),
                 )
                 if energy is not None:
                     return energy

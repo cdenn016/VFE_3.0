@@ -691,7 +691,10 @@ class VFE3Config:
     # the same Gaussian and the same KL in exact arithmetic, with error O(eps kappa(X)); the recovery
     # certificate above becomes eps kappa_1(C) > 3e-4 on the factor, and a failed CholeskyQR2 retries
     # shifted CholeskyQR3 in float32 before float64. Measured on the saved K=64/K=128 runs (Phase 0,
-    # 2026-09-24): max KL error / tau 2.3e-4 (gram) vs 5e-5 (cholesky_qr2) against a float64 oracle.
+    # 2026-09-24): max KL error / tau 2.5e-4 / 4.6e-5 (gram) vs 2.0e-4 / 3.3e-5 (cholesky_qr2) against
+    # a float64 oracle; the float32 pair-stage GEMM tr(P_k G_q) dominates what remains. With
+    # condition recovery on, "cholesky_qr2" recovered no entry where "gram" recovered 127,112 (K=64),
+    # but it raised CUDA kernel time per training step from 216 to 362 ms (K=64, B=64).
     # The noisy-query cost factors per-pair sums G_q + G_k and keeps the Gram route.
     projected_factor_route: str = "gram"     # "gram" | "cholesky_qr2"
 
@@ -778,7 +781,11 @@ class VFE3Config:
     generate_embedding_figures:     bool = True
     # Exact common-frame KL scoring for eligible flat full-Gaussian transports.
     # Unsupported paths retain the pairwise implementation; default preserves existing runs.
-    full_cov_kl_backend:           str   = "common_frame"  # "common_frame" | "pairwise"
+    # "common_frame_factored" (optimization_plan.md WS3) scores the same pulled-back KL from
+    # square-root CholeskyQR2 factors and certifies those factors (eps kappa_1 <= 3e-4) instead of
+    # admitting only cond(U_i)^2 cond(C_j) <= 1/(64 d eps), which rejected every call on the saved
+    # K=64/K=128 frames (Phase 0, 2026-09-24), so the route fell back to the pairwise congruence.
+    full_cov_kl_backend:           str   = "common_frame"  # "common_frame" | "common_frame_factored" | "pairwise"
 
     
 
@@ -1636,9 +1643,9 @@ class VFE3Config:
         # The full-covariance KL precision spellings are inlined rather than imported from
         # vfe3.families.gaussian (importing a family module inside __post_init__ perturbs import
         # order). set_full_cov_kl_precision validates the same set.
-        if self.full_cov_kl_backend not in ("pairwise", "common_frame"):
+        if self.full_cov_kl_backend not in ("pairwise", "common_frame", "common_frame_factored"):
             raise ValueError(
-                "full_cov_kl_backend must be one of ('pairwise', 'common_frame'), "
+                "full_cov_kl_backend must be one of ('pairwise', 'common_frame', 'common_frame_factored'), "
                 f"got {self.full_cov_kl_backend!r}")
         if self.full_cov_kl_precision not in ("fp64", "fp32_escalate", "fp32_escalate_cond"):
             raise ValueError(

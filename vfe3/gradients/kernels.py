@@ -796,7 +796,7 @@ def mm_exact_update(
             eps=eps,
             irrep_dims=irrep_dims,
         )
-    if fam is FullGaussian and full_cov_kl_backend == "common_frame":
+    if fam is FullGaussian and full_cov_kl_backend in ("common_frame", "common_frame_factored"):
         # The full-covariance fusion still consumes transported moments, but its attention
         # score follows the configured coupling backend just like the gradient oracle.
         energy = fam.coupling_energy(

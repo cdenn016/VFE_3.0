@@ -11,7 +11,9 @@ from typing import Dict, Optional, Tuple
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from vfe3.numerics import cholesky_qr2, guarded_cholesky, triangular_condition_estimate
+from vfe3.numerics import (
+    FACTOR_CONDITION_TOL, cholesky_qr2, guarded_cholesky, triangular_condition_estimate,
+)
 
 
 # Budget for one projected map L; its covariance product can require a second.
@@ -84,7 +86,7 @@ def projected_condition_recovery() -> bool:
 # eps kappa_1(C) > _FACTOR_CONDITION_TOL on the factor itself (see _factor_status).
 _FACTOR_ROUTES = ("gram", "cholesky_qr2")
 _FACTOR_ROUTE: str = "gram"
-_FACTOR_CONDITION_TOL: float = 3e-4
+_FACTOR_CONDITION_TOL: float = FACTOR_CONDITION_TOL
 
 
 def set_projected_factor_route(route: str) -> str:

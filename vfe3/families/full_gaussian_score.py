@@ -1,11 +1,16 @@
 """Exact flat full-Gaussian KL contractions with token-sized matrix workspaces."""
 
+import math
 from typing import List, Optional, Tuple
 
 import torch
+from torch.utils.checkpoint import checkpoint
 
 from vfe3.families.base import _logdet_chol, safe_kl_clamp
-from vfe3.numerics import safe_eigvalsh, validated_cholesky_solve
+from vfe3.numerics import (
+    FACTOR_CONDITION_TOL, cholesky_qr2, guarded_cholesky, safe_eigvalsh, triangular_condition_estimate,
+    validated_cholesky_solve,
+)
 
 
 def _frame_blocks(
@@ -56,6 +61,7 @@ def common_frame_kl_energy(
     precision_policy: str,
     irrep_dims:       Optional[List[int]] = None,
     pair_support:     Optional[torch.Tensor] = None,
+    factored:         bool = False,
 ) -> Optional[torch.Tensor]:              # (..., H, Nq, Nk), headless when H=1; None -> legacy
     r"""Compute the complete KL in common coordinates, or request the legacy scorer.
 
@@ -71,6 +77,10 @@ def common_frame_kl_energy(
     policy owns their result. This is algebraic equality, not bitwise equality.
     No detached statistics enter the differentiable score; only the common mean
     offset and numerical admission decisions are detached.
+
+    ``factored=True`` (backend ``"common_frame_factored"``, optimization_plan.md WS3) scores the
+    same KL but certifies the algorithm that runs instead of the transported covariance it avoids:
+    see :func:`_factored_common_frame_energy`.
     """
     if Sigma_q.dim() != mu_q.dim() + 1 or Sigma_k.dim() != mu_k.dim() + 1:
         return None
@@ -118,6 +128,13 @@ def common_frame_kl_energy(
         Sk = torch.stack([Sigma_k[..., h*d:(h+1)*d, h*d:(h+1)*d] for h in range(H)], dim=-3).to(work)
         Sq = torch.where(q_used[..., None, None], Sq, eye)
         Sk = torch.where(k_used[..., None, None], Sk, eye)
+        if factored:
+            energy = _factored_common_frame_energy(U, V, mq, mk, Sq, Sk, support, q_used, k_used)
+            if energy is None:
+                return None
+            energy = safe_kl_clamp(energy, kl_max=kl_max).masked_fill(~support, 0.)
+            energy = energy.to(public_dtype)
+            return energy.squeeze(-3) if H == 1 else energy
         if not bool(torch.isfinite(U).all() & torch.isfinite(V).all()
                     & torch.isfinite(mq).all() & torch.isfinite(mk).all()):
             return None
@@ -191,3 +208,135 @@ def common_frame_kl_energy(
         energy = safe_kl_clamp(energy, kl_max=kl_max).masked_fill(~support, 0.)
         energy = energy.to(public_dtype)
         return energy.squeeze(-3) if H == 1 else energy
+
+
+def _factored_common_frame_energy(
+    U:       torch.Tensor,   # (..., Nq, H, d, d) receiver frames, working dtype
+    V:       torch.Tensor,   # (..., Nk, H, d, d) source inverse frames
+    mq:      torch.Tensor,   # (..., Nq, H, d) receiver means
+    mk:      torch.Tensor,   # (..., Nk, H, d) source means
+    Sq:      torch.Tensor,   # (..., Nq, H, d, d) receiver head-marginal covariances
+    Sk:      torch.Tensor,   # (..., Nk, H, d, d) source head-marginal covariances
+    support: torch.Tensor,   # (..., H, Nq, Nk) read pairs
+    q_used:  torch.Tensor,   # (..., Nq, H)
+    k_used:  torch.Tensor,   # (..., Nk, H)
+) -> Optional[torch.Tensor]:  # (..., H, Nq, Nk) unclamped KL, or None -> legacy
+    r"""Common-frame KL from square-root factors, certified by one host transfer.
+
+    The pulled-back covariance :math:`C_i = U_i^{-1} \Sigma_i U_i^{-T}` is factored from its root
+    :math:`U_i^{-1} L_i` (:math:`L_i = \mathrm{chol}\,\Sigma_i`, zero jitter) by CholeskyQR2, so its
+    factor, precision and log-determinant carry error of order
+    :math:`\varepsilon\,\kappa(U_i^{-1} L_i) \le \varepsilon\,\kappa(U_i)\,\kappa(\Sigma_i)^{1/2}`,
+    never :math:`\kappa(U_i)^2 \kappa(C_j)`: nothing transported is materialized, so the squared
+    bound of the unfactored backend certifies an object this algorithm never forms.
+
+    The Mahalanobis term is a sum of squares, :math:`\lVert W_j (x_i - x_j) \rVert^2` with
+    :math:`W_j = F_j^{-1}` for the key factor :math:`F_j`, instead of the expanded
+    :math:`x_i^T H_j x_i - 2 x_i^T H_j x_j + x_j^T H_j x_j`, whose cancellation made the float32
+    rounding bound reject 0.5-0.6% of the pairs on the saved K=64/K=128 frames. It costs
+    O(N^2 d^2), the order of the trace product, in query-row tiles. The trace product
+    :math:`\langle C_i, H_j \rangle_F` then pairs two SPD matrices.
+
+    Admission, on the read entries and in one host transfer: every local and root factorization
+    succeeds; in float32 every factor passes :math:`\varepsilon\,\hat\kappa_1 \le`
+    ``FACTOR_CONDITION_TOL`` (Hager-Higham, no eigensolver); the receiver frame solve succeeds;
+    covariances are symmetric to :math:`64 d \varepsilon`; the assembled energy is finite; and, in
+    float32, the first-order error model
+
+    .. math::
+        |\delta E_{ij}| \le \varepsilon\,(\hat\kappa_{1,i} + \hat\kappa_{1,j})
+        (\mathrm{tr}\,H_j C_i + \lVert W_j (x_i - x_j) \rVert^2 + d)
+
+    stays within :math:`10^{-3} \max(|E_{ij}|, \sqrt d)`. The unfactored backend's
+    :math:`8 d \varepsilon`-times-magnitude check charges each log-determinant in proportion to its
+    size, while its absolute error follows the factor's relative accuracy, so it rejected accurate
+    near-self pairs whose two large log-determinants cancel. On the saved K=64/K=128 frames the model
+    bounded every measured float32 error with a factor of 2.6 to spare, and the check rejected no
+    pair; with a floor of 1 nat instead of :math:`\sqrt d` it would have rejected 0.02-0.06%. The
+    floor is :math:`10^{-3}\tau` for the attention temperature :math:`\tau = \kappa_\beta \sqrt d`
+    at :math:`\kappa_\beta = 1`. The mean offset and identity self links are the unfactored backend's.
+    """
+    work, d, Nq = U.dtype, U.shape[-1], mq.shape[-3]
+    eye = torch.eye(d, device=U.device, dtype=work)
+    eps = torch.finfo(work).eps
+    Lq, local_q_failed = guarded_cholesky(Sq)
+    Lk, local_k_failed = guarded_cholesky(Sk)
+    # Solve against the RECEIVER factor, as the unfactored backend does.
+    inverse_q, info = torch.linalg.solve_ex(U, eye.expand_as(U))
+    Fq, root_q_failed = cholesky_qr2(inverse_q @ Lq)
+    Fk, root_k_failed = cholesky_qr2(V @ Lk)
+    xq = (inverse_q @ mq.unsqueeze(-1)).squeeze(-1)
+    xk = (V @ mk.unsqueeze(-1)).squeeze(-1)
+    # Common translation, as in the unfactored backend: zero derivative in the exact KL.
+    offset = xk.detach().mean(dim=-3, keepdim=True)
+    xq, xk = xq - offset, xk - offset
+    Wk = torch.linalg.solve_triangular(Fk, eye.expand_as(Fk), upper=False)      # (..., Nk, H, d, d) F_k^{-1}
+    Hk = Wk.transpose(-1, -2) @ Wk
+    trace = torch.einsum("...ihab,...jhab->...hij", Fq @ Fq.transpose(-1, -2), Hk)
+    quadratic = _whitened_quadratic(xq, Wk, (Wk @ xk.unsqueeze(-1)).squeeze(-1))
+    key_term = _logdet_chol(Fk).movedim(-1, -2)
+    query_term = _logdet_chol(Fq).movedim(-1, -2)
+    energy = .5 * (trace + quadratic + key_term.unsqueeze(-2) - query_term.unsqueeze(-1) - d)
+    # Identity self maps restored exactly from the local factors.
+    delta = mq - mk
+    precision_local_k = torch.cholesky_inverse(Lk)
+    self_energy = .5 * ((precision_local_k * Sq.transpose(-1, -2)).sum((-1, -2))
+                       + (delta * (precision_local_k @ delta.unsqueeze(-1)).squeeze(-1)).sum(-1)
+                       - d + _logdet_chol(Lk) - _logdet_chol(Lq))
+    diagonal = torch.eye(Nq, device=energy.device, dtype=torch.bool)
+    energy = torch.where(diagonal, self_energy.movedim(-1, -2).unsqueeze(-1), energy)
+    with torch.no_grad():
+        q_bad = (local_q_failed | root_q_failed | (info != 0)
+                 | ~torch.isfinite(inverse_q).all(dim=(-2, -1)) | _asymmetric(Sq, d, eps))
+        k_bad = local_k_failed | root_k_failed | _asymmetric(Sk, d, eps)
+        if work == torch.float32:
+            kappa_q, kappa_k = triangular_condition_estimate(Fq), triangular_condition_estimate(Fk)
+            q_bad = (q_bad | (eps * triangular_condition_estimate(Lq) > FACTOR_CONDITION_TOL)
+                     | (eps * kappa_q > FACTOR_CONDITION_TOL))
+            k_bad = (k_bad | (eps * triangular_condition_estimate(Lk) > FACTOR_CONDITION_TOL)
+                     | (eps * kappa_k > FACTOR_CONDITION_TOL))
+            bound = eps * ((kappa_q.movedim(-1, -2).unsqueeze(-1) + kappa_k.movedim(-1, -2).unsqueeze(-2))
+                           * (trace + quadratic + d))                            # (..., H, Nq, Nk)
+            roundoff = (bound > 1e-3 * energy.abs().clamp_min(d ** .5)) & support & ~diagonal
+        else:
+            roundoff = torch.zeros_like(support)
+        reject = torch.stack(((q_bad & q_used).any(), (k_bad & k_used).any(), roundoff.any(),
+                              (~torch.isfinite(energy) & support).any()))
+        if bool(reject.any()):
+            return None
+    return energy
+
+
+def _whitened_quadratic(
+    xq: torch.Tensor,   # (..., Nq, H, d) pulled-back receiver means
+    Wk: torch.Tensor,   # (..., Nk, H, d, d) inverse key factors F_k^{-1}
+    wk: torch.Tensor,   # (..., Nk, H, d) whitened key means F_k^{-1} x_k
+) -> torch.Tensor:      # (..., H, Nq, Nk)
+    r"""Sum of squares :math:`\lVert W_j x_i - w_j \rVert^2` in checkpointed query-row tiles.
+
+    The (..., H, I, Nk, d) whitened differences are bounded by a 32 MiB tile budget.
+    """
+    Nq, Nk, H, d = xq.shape[-3], Wk.shape[-4], Wk.shape[-3], Wk.shape[-1]
+    per_row = math.prod(torch.broadcast_shapes(xq.shape[:-3], Wk.shape[:-4])) * H * Nk * d * xq.element_size()
+    step = max(1, min(Nq, (32 * 1024 ** 2) // max(per_row, 1)))
+    rows = []
+    for start in range(0, Nq, step):
+        args = (xq[..., start:start + step, :, :], Wk, wk)
+        if torch.is_grad_enabled() and step < Nq and any(x.requires_grad for x in args):
+            rows.append(checkpoint(_whitened_quadratic_tile, *args, use_reentrant=False,
+                                   preserve_rng_state=False))
+        else:
+            rows.append(_whitened_quadratic_tile(*args))
+    return torch.cat(rows, dim=-2)
+
+
+def _whitened_quadratic_tile(xq: torch.Tensor, Wk: torch.Tensor, wk: torch.Tensor) -> torch.Tensor:
+    difference = (torch.einsum("...jhed,...ihd->...hije", Wk, xq)
+                  - wk.movedim(-3, -2).unsqueeze(-3))                           # (..., H, I, Nk, d)
+    return difference.square().sum(-1)
+
+
+def _asymmetric(S: torch.Tensor, d: int, eps: float) -> torch.Tensor:
+    r"""Entries whose max asymmetry exceeds 64 d eps of their largest magnitude."""
+    scale = S.abs().amax(dim=(-2, -1)).clamp_min(torch.finfo(S.dtype).tiny)
+    return (S - S.transpose(-1, -2)).abs().amax(dim=(-2, -1)) > 64. * d * eps * scale

@@ -675,6 +675,13 @@ def validated_cholesky_solve(
         factor_residual, solve_residual)
 
 
+# Certificate tolerance for square-root (CholeskyQR2) factors, eps * kappa_1-estimate(C) <= this.
+# Shared by the projected scorer and the factored common-frame KL (optimization_plan.md WS2/WS3).
+# Set just above the observed maximum eps * kappa_1 = 1.3e-4 on the saved K=64/K=128 runs; see
+# relational_scoring._factor_status for the error model and why the P2 max-norm reading is not used.
+FACTOR_CONDITION_TOL: float = 3e-4
+
+
 def guarded_cholesky(
     W: torch.Tensor,   # (..., n, n) symmetric
 ) -> Tuple[torch.Tensor, torch.Tensor]:   # (..., n, n) lower factor, (...) failed

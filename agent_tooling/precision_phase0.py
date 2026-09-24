@@ -369,9 +369,14 @@ def measure_call(call: Dict[str, object]) -> Dict[str, object]:
 
 
 def _is_fp64_kernel(name: str) -> bool:
+    # Profiler keys are usually Itanium-mangled: a double template argument is "Id"/"IKd" followed by
+    # the next argument or "E" (larft_T_32IdLi1024E, CUDAFunctor_addIdE), and cutlass names the dtype
+    # in the tile tag (tensorop_d884gemm).
     lowered = name.lower()
     return ("double" in lowered or "<d" in lowered or "complex<double" in lowered
             or re.search(r"(^|[_ ])d(gemm|trsm|potrf|syrk|geqrf|trsv|gemv|getrf|orgqr|ormqr)", lowered) is not None
+            or re.search(r"I(K?d)+[EILNPRSdfij0-9_]", name) is not None
+            or re.search(r"_d\d*gemm", lowered) is not None
             or "_f64" in lowered or "fp64" in lowered)
 
 
