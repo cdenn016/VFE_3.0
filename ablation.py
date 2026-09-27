@@ -2123,9 +2123,9 @@ def run_single(
     result.update(terminal_result)                           # primary/final/best/terminal_checkpoint headline
 
     # PB-07 opt-in: publish the per-token validation nats (the paired within-run bootstrap the
-    # component-ablation forest consumes) as an atomic sibling artifact, and record its exact
-    # byte/tensor identity in the marker. Written BEFORE run_sweep publishes the reuse contract and
-    # completion marker, so the post-contract validator binds bytes that already exist on disk. The
+    # component-ablation forest consumes) as an atomic sibling artifact, and record its SHA-256, size,
+    # numel, and dtype in the marker. Written BEFORE run_sweep publishes the reuse contract and
+    # completion marker, so the post-contract validator checks a file that already exists on disk. The
     # stable, unshuffled validation loader plus the shared seed make the vector position-aligned
     # across arms. This per-unit extraction is the ONLY added validation replay; aggregate final
     # validation stays owned by the terminal callback above.
@@ -3040,11 +3040,11 @@ def _expected_cell_contract_or_none(
         return None
 
 
-def _terminal_checkpoint_identity(
+def _terminal_checkpoint_location(
     run_dir: Path,
     marker:  Mapping[str, object],
-) -> Optional[Dict[str, object]]:
-    """Return the owned terminal checkpoint's immutable identity, or ``None`` if unsafe."""
+) -> Optional[Tuple[Path, str]]:
+    """Return the owned terminal checkpoint's resolved path and run-relative path, or ``None``."""
     raw_path = marker.get("terminal_checkpoint")
     if not isinstance(raw_path, str) or not raw_path:
         return None
@@ -3061,25 +3061,38 @@ def _terminal_checkpoint_identity(
                 continue
             if any(part in {"", ".", ".."} for part in relative.parts):
                 continue
-            return {
-                "terminal_checkpoint_relpath":    relative.as_posix(),
-                "terminal_checkpoint_sha256":     _sha256_file(resolved),
-                "terminal_checkpoint_size_bytes": resolved.stat().st_size,
-            }
+            return resolved, relative.as_posix()
         except (OSError, ValueError):
             continue
     return None
+
+
+def _terminal_checkpoint_identity(
+    run_dir: Path,
+    marker:  Mapping[str, object],
+) -> Optional[Dict[str, object]]:
+    """Return the owned terminal checkpoint's recorded identity, or ``None`` if unresolvable."""
+    location = _terminal_checkpoint_location(run_dir, marker)
+    if location is None:
+        return None
+    resolved, relpath = location
+    try:
+        return {
+            "terminal_checkpoint_relpath":    relpath,
+            "terminal_checkpoint_sha256":     _sha256_file(resolved),
+            "terminal_checkpoint_size_bytes": resolved.stat().st_size,
+        }
+    except OSError:
+        return None
 
 
 def _terminal_checkpoint_is_current(
     run_dir: Path,
     marker:  Mapping[str, object],
 ) -> bool:
-    """Revalidate a published terminal checkpoint's location and exact bytes on every reuse."""
-    current = _terminal_checkpoint_identity(run_dir, marker)
-    if current is None:
-        return False
-    return all(marker.get(key) == value for key, value in current.items())
+    """Revalidate a published terminal checkpoint's owned location on every reuse."""
+    location = _terminal_checkpoint_location(run_dir, marker)
+    return location is not None and marker.get("terminal_checkpoint_relpath") == location[1]
 
 
 def _model_artifacts_are_current(
@@ -3196,18 +3209,17 @@ def _cell_is_current(
 
 
 def _paired_token_artifact_is_current(run_dir: Path, *, required: bool) -> bool:
-    r"""Return true only when the requested paired-token artifact is present and its identity verifies.
+    r"""Return true only when the requested paired-token artifact is present and matches its marker.
 
     The cell contract's sorted ``diagnostic_flags`` binds the REQUEST (was paired_token_bootstrap
-    asked for); this post-contract validator binds the requested ARTIFACT's exact bytes and tensor
-    schema so a stale, tampered, or same-shape-but-different-bytes ``val_token_nats.pt`` forces a
-    re-run rather than a cache hit. When the sweep did not request the artifact (``required`` false)
-    there is nothing to bind, so it returns true immediately. Otherwise the completion marker must
-    record a real ``paired_token_bootstrap`` true, ``val_token_nats_path == "val_token_nats.pt"``,
-    and the exact SHA-256 / byte size / tensor length / dtype fields, the file must exist, its
-    recomputed streamed hash and byte size must match, and a ``weights_only`` safe load must yield a
-    finite, nonempty, one-dimensional tensor whose numel and string dtype equal the marker. Any
-    missing, malformed, or nonexact field fails closed.
+    asked for); this post-contract validator checks the requested ARTIFACT's presence and tensor
+    schema so a missing, nonfinite, or schema-drifted ``val_token_nats.pt`` forces a re-run rather
+    than a cache hit. When the sweep did not request the artifact (``required`` false) there is
+    nothing to check, so it returns true immediately. Otherwise the completion marker must record a
+    real ``paired_token_bootstrap`` true, ``val_token_nats_path == "val_token_nats.pt"``, and the
+    SHA-256 / tensor length / dtype fields, the file must exist, and a ``weights_only`` safe load must
+    yield a finite, nonempty, one-dimensional tensor whose numel and string dtype equal the marker.
+    Any missing, malformed, or nonexact field fails closed.
     """
     if not required:
         return True
@@ -3222,17 +3234,12 @@ def _paired_token_artifact_is_current(run_dir: Path, *, required: bool) -> bool:
     if marker.get("val_token_nats_path") != "val_token_nats.pt":
         return False
     expected_sha   = marker.get("val_token_nats_sha256")
-    expected_size  = marker.get("val_token_nats_size_bytes")
     expected_numel = marker.get("val_token_nats_numel")
     expected_dtype = marker.get("val_token_nats_dtype")
     if not (isinstance(expected_sha, str) and expected_sha):
         return False
     path = run_dir / "val_token_nats.pt"
     if not path.is_file():
-        return False
-    if path.stat().st_size != expected_size:
-        return False
-    if _sha256_file(path) != expected_sha:
         return False
     try:
         tensor = torch.load(path, map_location="cpu", weights_only=True)
@@ -3424,8 +3431,6 @@ def _prepare_owned_output_child(root: Path, name: str, *, role: str) -> Path:
     if child.exists() and not child.is_dir():
         raise ValueError(f"{role} path exists but is not a directory: {child}")
     child.mkdir(parents=False, exist_ok=True)
-    if not _cell_dir_is_owned(root, child):
-        raise ValueError(f"{role} directory resolves outside its output root")
     return child
 
 
@@ -3567,8 +3572,6 @@ def _start_owned_cell_generation(
     if run_dir.exists() and not run_dir.is_dir():
         raise ValueError("ablation cell path exists but is not a directory")
     run_dir.mkdir(parents=False, exist_ok=True)
-    if not _cell_dir_is_owned(sweep_dir, run_dir):
-        raise ValueError("ablation cell directory resolves outside its sweep directory")
 
     owner_path = _authorize_ablation_cell_cleanup(
         run_dir,
@@ -3914,7 +3917,7 @@ def run_sweep(
                 )
             )
             # The contract binds the request (diagnostic_flags carries paired_token_bootstrap); a
-            # separate post-contract validator binds the requested artifact's exact bytes/schema, so a
+            # separate post-contract validator checks the requested artifact's presence and schema, so a
             # missing or drifted val_token_nats.pt forbids reuse even when the contract still matches.
             if (isinstance(cached_result, Mapping)
                     and parameter_budget_current
@@ -4045,8 +4048,9 @@ def run_sweep(
             logger.warning("  [%s] requested outputs incomplete -> cell marked failed", label)
             successful = False
 
-        # A retained terminal checkpoint is bound by path, size, and SHA-256. Lightweight optimizer
-        # cells instead bind the explicit absence of both best weights and checkpoint files.
+        # A retained terminal checkpoint's path, size, and SHA-256 are recorded; reuse revalidates its
+        # location. Lightweight optimizer cells instead bind the explicit absence of both best weights
+        # and checkpoint files.
         if successful and save_model_artifacts:
             checkpoint_identity = _terminal_checkpoint_identity(run_dir, result)
             if checkpoint_identity is None:

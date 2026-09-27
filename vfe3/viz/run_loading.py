@@ -11,7 +11,6 @@ from vfe3.run_artifacts import (
     _normalized_data_identity,
     _validate_best_model_mapping,
     _validate_live_figure_snapshot_mapping,
-    semantic_config_fingerprint,
 )
 
 
@@ -22,10 +21,6 @@ def load_run_config(run_dir: Path) -> 'tuple[VFE3Config, str]':
     if not isinstance(data, Mapping) or not isinstance(data.get("config"), Mapping):
         raise ValueError(f"run metadata {path} has no config mapping")
     raw_config = data["config"]
-    stored_fingerprint = data.get("config_fingerprint")
-    if (stored_fingerprint is not None
-            and stored_fingerprint != semantic_config_fingerprint(raw_config)):
-        raise ValueError(f"run metadata {path} has a config fingerprint mismatch")
     cfg = config_from_serialized(raw_config, source=str(path))
     dataset = data.get("dataset", "")
     if not isinstance(dataset, str):

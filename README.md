@@ -533,8 +533,8 @@ point per `(route, label)` keyed on each run's persisted `best_val_ppl` (never a
 neither figure requires the held-out test split the rest of the scaling report uses. An axis or
 the whole figure is withheld, not fabricated, when a required route never ran or a point is
 missing. `ablation.py`'s per-sweep loop writes `ablation_forest.png` for any sweep declaring
-`paired_token_bootstrap=True` (reading each cell's persisted `val_token_nats.pt`, re-verified by
-SHA-256, size, numel, and dtype against its `ablation_result.json` marker before it is trusted)
+`paired_token_bootstrap=True` (reading each cell's persisted `val_token_nats.pt`, whose numel and
+dtype must match its `ablation_result.json` marker)
 and `lr_grid_heatmap.png` for any sweep declaring `grid_x`/`grid_y` (requiring the exact declared
 Cartesian product of cells, each carrying a finite `primary_val_ppl`), alongside the existing
 `sweep_results.csv` / `sweep_meta.json` / per-sweep PPL figure. The two sweeps that populate these

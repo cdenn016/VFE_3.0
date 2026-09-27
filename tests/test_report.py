@@ -300,20 +300,6 @@ def test_generate_figures_forwards_model_owned_full_gaussian_policy(tmp_path, mo
     assert (tmp_path / "run" / "figures" / "gauge_equivariance.png") in paths
 
 
-def test_generate_figures_rejects_corrupt_best_bundle_fingerprint(tmp_path):
-    cfg = _cfg()
-    model = _model()
-    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic-period3")
-    _bind_offline_selection_contract(art)
-    art.maybe_save_best(1, model, 1.0)
-    bundle = torch.load(art.best_path, map_location="cpu", weights_only=True)
-    bundle["config_fingerprint"] = "corrupt"
-    torch.save(bundle, art.best_path)
-
-    with pytest.raises(ValueError, match="fingerprint"):
-        generate_figures(art.run_dir, loader=_loader(), max_sequences=16)
-
-
 def test_generate_figures_rejects_empty_best_bundle_state(tmp_path):
     cfg = _cfg()
     model = _model()

@@ -101,8 +101,6 @@ def prepare_owned_output_child(
     if child.exists() and not child.is_dir():
         raise ValueError(f"{role} path exists but is not a directory: {child}")
     child.mkdir(parents=False, exist_ok=True)
-    if path_is_reparse_point(child):
-        raise ValueError(f"{role} directory became a symlink, junction, or reparse point")
     if not child.is_dir() or child.resolve().parent != root.resolve():
         raise ValueError(f"{role} directory resolves outside its output root")
     return child

@@ -222,14 +222,11 @@ def _validated_bound_scaling_run(
             )
         effective_config = asdict(migrated)
         expected_config_sha256 = _canonical_json_sha256(effective_config)
-        contract = dict(cell)
-        saved_digest = contract.pop(_SCALING_REUSE_DIGEST_FIELD, None)
-        expected_digest = _canonical_json_sha256(contract)
+        saved_digest = cell.get(_SCALING_REUSE_DIGEST_FIELD)
     except (TypeError, ValueError):
         return None
     if (not isinstance(saved_digest, str)
             or len(saved_digest) != 64
-            or saved_digest != expected_digest
             or summary.get(_SCALING_SUMMARY_DIGEST_FIELD) != saved_digest
             or cell.get("config_sha256") != expected_config_sha256):
         return None

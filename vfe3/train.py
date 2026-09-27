@@ -1705,7 +1705,7 @@ def _loader_data_identity(
 
     Production loaders receive a cache-backed contract from ``make_dataloader``. A direct
     ``TokenWindows`` loader used by tests or library callers receives an equivalent in-memory
-    contract whose bounded canonical digest still prevents splicing a different tensor at resume.
+    contract whose bounded canonical digest still detects a different tensor at resume.
     """
     dataset = getattr(loader, "dataset", None)
     tokens = getattr(dataset, "tokens", None)

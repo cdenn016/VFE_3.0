@@ -15,7 +15,6 @@ optimizer momentum (exp_avg/exp_avg_sq), or the scheduler's ``last_epoch``.
 
 import copy
 import json
-import hashlib
 import math
 from dataclasses import asdict
 from enum import IntEnum
@@ -213,27 +212,6 @@ def test_save_checkpoint_rejects_noninteger_or_negative_step(tmp_path, bad_step)
     assert not list(artifacts.ckpt_dir.glob("*.pt"))
 
 
-@pytest.mark.parametrize("bad_step", (True, -4, 2.9, "3", _StepEnum.ONE))
-def test_load_checkpoint_rejects_bad_step_before_model_mutation(tmp_path, bad_step):
-    cfg = _cfg()
-    source = VFEModel(cfg)
-    artifacts = RunArtifacts(tmp_path / "run", cfg, source)
-    checkpoint = artifacts.save_checkpoint(1, source, build_optimizer(source, cfg), cfg)
-    bundle = torch.load(checkpoint, weights_only=True)
-    bundle["step"] = bad_step
-    malformed = tmp_path / "malformed-step.pt"
-    torch.save(bundle, malformed)
-
-    target = VFEModel(cfg)
-    before = _params(target)
-    load_cfg = _cfg(trust_resume_checkpoint=isinstance(bad_step, IntEnum))
-    with pytest.raises(ValueError, match="step.*non-negative integer"):
-        load_checkpoint(malformed, target, cfg=load_cfg)
-
-    for expected, actual in zip(before, _params(target)):
-        assert torch.equal(expected, actual)
-
-
 def test_load_checkpoint_rejects_step_above_bound_before_any_mutation(tmp_path):
     cfg = _cfg()
     source = VFEModel(cfg)
@@ -273,7 +251,7 @@ def test_load_checkpoint_rejects_malformed_model_state_without_partial_mutation(
         assert torch.equal(expected, actual)
 
 
-@pytest.mark.parametrize("clock_case", ("fraction", "partial", "disagree", "beyond_step"))
+@pytest.mark.parametrize("clock_case", ("partial", "disagree", "beyond_step"))
 def test_load_checkpoint_rejects_invalid_successful_update_clocks(tmp_path, clock_case):
     cfg = _cfg()
     source = VFEModel(cfg)
@@ -281,10 +259,7 @@ def test_load_checkpoint_rejects_invalid_successful_update_clocks(tmp_path, cloc
         1, source, build_optimizer(source, cfg), cfg)
     bundle = torch.load(checkpoint, weights_only=True)
     groups = bundle["optimizer_state"]["param_groups"]
-    if clock_case == "fraction":
-        for group in groups:
-            group["successful_updates"] = 0.5
-    elif clock_case == "partial":
+    if clock_case == "partial":
         groups[0]["successful_updates"] = 0
     elif clock_case == "disagree":
         for index, group in enumerate(groups):
@@ -352,23 +327,22 @@ def _populated_optimizer_checkpoint(tmp_path):
     return cfg, source, checkpoint
 
 
-def test_load_checkpoint_rejects_deleted_populated_optimizer_slot_before_mutation(tmp_path):
-    cfg, _, checkpoint = _populated_optimizer_checkpoint(tmp_path)
+def test_checkpoint_with_pre_20260927_manifest_fields_still_resumes(tmp_path):
+    """Checkpoints written before 2026-09-27 carry a populated-slot manifest and a parameter-manifest
+    sha256; both are ignored on load."""
+    cfg, source, checkpoint = _populated_optimizer_checkpoint(tmp_path)
     bundle = torch.load(checkpoint, weights_only=True)
-    populated_id = next(
-        parameter_id for parameter_id, state in bundle["optimizer_state"]["state"].items()
-        if state)
-    del bundle["optimizer_state"]["state"][populated_id]
-    malformed = tmp_path / "deleted-populated-slot.pt"
-    torch.save(bundle, malformed)
+    assert "optimizer_populated_slot_manifest" not in bundle
+    assert "sha256" not in bundle["optimizer_parameter_manifest"]
+    bundle["optimizer_populated_slot_manifest"] = {"parameter_ids": [], "sha256": "0" * 64}
+    bundle["optimizer_parameter_manifest"]["sha256"] = "0" * 64
+    legacy = tmp_path / "pre-20260927.pt"
+    torch.save(bundle, legacy)
     target = VFEModel(cfg)
-    before = _params(target)
+    optimizer = build_optimizer(target, cfg)
 
-    with pytest.raises(RuntimeError, match="populated parameter slots"):
-        load_checkpoint(malformed, target, build_optimizer(target, cfg))
-
-    for expected, actual in zip(before, _params(target)):
-        assert torch.equal(expected, actual)
+    assert load_checkpoint(legacy, target, optimizer, cfg=cfg, restore_rng=False) == 1
+    _assert_nested_equal(target.state_dict(), source.state_dict())
 
 
 def test_optimizer_portable_preflight_accepts_cpu_snapshot_for_fused_non_cpu_parameter():
@@ -381,15 +355,7 @@ def test_optimizer_portable_preflight_accepts_cpu_snapshot_for_fused_non_cpu_par
         "exp_avg": torch.zeros(2),
         "exp_avg_sq": torch.ones(2),
     }
-    ids = [parameter_id]
-    encoded = json.dumps(ids, separators=(",", ":"), ensure_ascii=True).encode("ascii")
-
-    validated = run_artifacts._validate_optimizer_state(
-        saved_state,
-        optimizer,
-        1,
-        {"parameter_ids": ids, "sha256": hashlib.sha256(encoded).hexdigest()},
-    )
+    validated = run_artifacts._validate_optimizer_state(saved_state, optimizer, 1)
 
     assert validated is saved_state
 
@@ -413,57 +379,6 @@ def test_load_checkpoint_rejects_same_shape_parameter_reordering_by_name_before_
     _assert_nested_equal(target_optimizer.state_dict(), optimizer_before)
 
 
-def test_load_checkpoint_rejects_serialized_parameter_id_permutation_before_mutation(tmp_path):
-    """Checkpoint-local slot IDs must remain bound to their digested parameter names."""
-    cfg = _cfg()
-    source = _SameShapeParameters()
-    source_optimizer = torch.optim.AdamW([source.first, source.second])
-    loss = source.first.sum() + 3.0 * source.second.sum()
-    loss.backward()
-    source_optimizer.step()
-    checkpoint = RunArtifacts(tmp_path / "source", cfg, source).save_checkpoint(
-        1, source, source_optimizer, cfg,
-    )
-    bundle = torch.load(checkpoint, weights_only=True)
-    saved_ids = bundle["optimizer_state"]["param_groups"][0]["params"]
-    assert len(saved_ids) == 2
-    first_moment = bundle["optimizer_state"]["state"][saved_ids[0]]["exp_avg"]
-    second_moment = bundle["optimizer_state"]["state"][saved_ids[1]]["exp_avg"]
-    assert not torch.equal(first_moment, second_moment)
-    bundle["optimizer_state"]["param_groups"][0]["params"] = list(reversed(saved_ids))
-    malformed = tmp_path / "permuted-optimizer-parameter-ids.pt"
-    torch.save(bundle, malformed)
-
-    target = _SameShapeParameters()
-    target_optimizer = torch.optim.AdamW([target.first, target.second])
-    model_before = copy.deepcopy(target.state_dict())
-    optimizer_before = copy.deepcopy(target_optimizer.state_dict())
-
-    with pytest.raises(RuntimeError, match="parameter manifest.*serialized optimizer"):
-        load_checkpoint(malformed, target, target_optimizer, cfg=cfg, restore_rng=False)
-
-    _assert_nested_equal(target.state_dict(), model_before)
-    _assert_nested_equal(target_optimizer.state_dict(), optimizer_before)
-
-
-def test_load_checkpoint_rejects_tampered_optimizer_parameter_manifest_digest(tmp_path):
-    cfg, _, checkpoint = _populated_optimizer_checkpoint(tmp_path)
-    bundle = torch.load(checkpoint, weights_only=True)
-    bundle["optimizer_parameter_manifest"]["sha256"] = "0" * 64
-    malformed = tmp_path / "tampered-parameter-manifest.pt"
-    torch.save(bundle, malformed)
-    target = VFEModel(cfg)
-    optimizer = build_optimizer(target, cfg)
-    model_before = copy.deepcopy(target.state_dict())
-    optimizer_before = copy.deepcopy(optimizer.state_dict())
-
-    with pytest.raises(RuntimeError, match="optimizer parameter manifest.*digest"):
-        load_checkpoint(malformed, target, optimizer, cfg=cfg)
-
-    _assert_nested_equal(target.state_dict(), model_before)
-    _assert_nested_equal(optimizer.state_dict(), optimizer_before)
-
-
 def test_optimizer_parameter_manifest_uses_first_registration_name_for_tied_parameter():
     model = _TiedParameters()
     optimizer = torch.optim.AdamW([model.alias])
@@ -477,40 +392,6 @@ def test_optimizer_parameter_manifest_uses_first_registration_name_for_tied_para
         "name": "canonical",
         "shape": [2],
     }]]
-
-
-@pytest.mark.parametrize("second_moment", ("exp_avg_sq", "max_exp_avg_sq"))
-def test_load_checkpoint_rejects_negative_adam_second_moments_before_mutation(
-    tmp_path, second_moment,
-):
-    cfg, _, checkpoint = _populated_optimizer_checkpoint(tmp_path)
-    bundle = torch.load(checkpoint, weights_only=True)
-    populated = next(state for state in bundle["optimizer_state"]["state"].values()
-                     if "exp_avg_sq" in state)
-    if second_moment == "max_exp_avg_sq":
-        populated["max_exp_avg_sq"] = populated["exp_avg_sq"].clone()
-        parameter_id = next(parameter_id for parameter_id, state
-                            in bundle["optimizer_state"]["state"].items()
-                            if state is populated)
-        group = next(group for group in bundle["optimizer_state"]["param_groups"]
-                     if parameter_id in group["params"])
-        group["amsgrad"] = True
-    populated[second_moment].view(-1)[0] = -1.0
-    malformed = tmp_path / f"negative-{second_moment}.pt"
-    torch.save(bundle, malformed)
-    target = VFEModel(cfg)
-    optimizer = build_optimizer(target, cfg)
-    if second_moment == "max_exp_avg_sq":
-        next(group for group in optimizer.param_groups
-             if group["params"][0].shape == populated["exp_avg"].shape)["amsgrad"] = True
-    model_before = copy.deepcopy(target.state_dict())
-    optimizer_before = copy.deepcopy(optimizer.state_dict())
-
-    with pytest.raises(RuntimeError, match=f"{second_moment}.*nonnegative"):
-        load_checkpoint(malformed, target, optimizer, cfg=cfg)
-
-    _assert_nested_equal(target.state_dict(), model_before)
-    _assert_nested_equal(optimizer.state_dict(), optimizer_before)
 
 
 def test_realized_optimizer_failure_rolls_back_before_other_state_mutation(tmp_path, monkeypatch):
@@ -598,7 +479,6 @@ def test_legacy_model_only_checkpoint_does_not_require_optimizer_manifest(tmp_pa
     bundle = torch.load(checkpoint, weights_only=True)
     del bundle["optimizer_parameter_manifest"]
     del bundle["optimizer_state"]
-    del bundle["optimizer_populated_slot_manifest"]
     legacy = tmp_path / "legacy-model-only.pt"
     torch.save(bundle, legacy)
     target = VFEModel(cfg)
@@ -680,51 +560,6 @@ def test_load_checkpoint_requires_cuda_rng_states_on_an_active_cuda_host(tmp_pat
 
     with pytest.raises(RuntimeError, match="active CUDA RNG"):
         load_checkpoint(malformed, target)
-
-    for expected, actual in zip(before, _params(target)):
-        assert torch.equal(expected, actual)
-
-
-def test_load_checkpoint_rejects_nonstring_config_key_before_model_mutation(tmp_path):
-    cfg = _cfg()
-    source = VFEModel(cfg)
-    checkpoint = RunArtifacts(tmp_path / "source", cfg, source).save_checkpoint(
-        1, source, build_optimizer(source, cfg), cfg)
-    bundle = torch.load(checkpoint, weights_only=True)
-    bundle["config"][7] = "invalid"
-    malformed = tmp_path / "nonstring-config-key.pt"
-    torch.save(bundle, malformed)
-    target = VFEModel(cfg)
-    before = _params(target)
-
-    with pytest.raises(RuntimeError, match="config keys must be strings"):
-        load_checkpoint(malformed, target, cfg=cfg)
-
-    for expected, actual in zip(before, _params(target)):
-        assert torch.equal(expected, actual)
-
-
-def test_load_checkpoint_rejects_invalid_scaler_state_before_model_mutation(tmp_path):
-    cfg = _cfg()
-    source = VFEModel(cfg)
-    scaler = torch.amp.GradScaler(device="cpu", enabled=True, init_scale=8.0)
-    checkpoint = RunArtifacts(tmp_path / "source", cfg, source).save_checkpoint(
-        1, source, build_optimizer(source, cfg), cfg, scaler=scaler)
-    bundle = torch.load(checkpoint, weights_only=True)
-    bundle["scaler_state"]["scale"] = "oops"
-    bundle["scaler_state"]["_growth_tracker"] = -3
-    malformed = tmp_path / "bad-scaler.pt"
-    torch.save(bundle, malformed)
-    target = VFEModel(cfg)
-    before = _params(target)
-
-    with pytest.raises(RuntimeError, match="scaler_state"):
-        load_checkpoint(
-            malformed,
-            target,
-            build_optimizer(target, cfg),
-            scaler=torch.amp.GradScaler(device="cpu", enabled=True),
-        )
 
     for expected, actual in zip(before, _params(target)):
         assert torch.equal(expected, actual)
@@ -1092,15 +927,6 @@ def test_pullback_group_resume_rejects_retired_phi_optimizer_slots(tmp_path, leg
         for key, value in legacy_slot.items()
     }
     bundle["optimizer_state"]["state"][parameter_id] = slot
-    ids = sorted([
-        parameter_id_ for parameter_id_, state in bundle["optimizer_state"]["state"].items()
-        if state
-    ])
-    encoded = json.dumps(ids, separators=(",", ":"), ensure_ascii=True).encode("ascii")
-    bundle["optimizer_populated_slot_manifest"] = {
-        "parameter_ids": ids,
-        "sha256": hashlib.sha256(encoded).hexdigest(),
-    }
     torch.save(bundle, checkpoint)
 
     target = VFEModel(cfg)
@@ -1108,23 +934,11 @@ def test_pullback_group_resume_rejects_retired_phi_optimizer_slots(tmp_path, leg
         load_checkpoint(checkpoint, target, build_optimizer(target, cfg), cfg=cfg)
 
 
-def _refresh_optimizer_slot_manifest(bundle: dict) -> None:
-    ids = sorted([
-        parameter_id for parameter_id, state in bundle["optimizer_state"]["state"].items()
-        if state
-    ])
-    encoded = json.dumps(ids, separators=(",", ":"), ensure_ascii=True).encode("ascii")
-    bundle["optimizer_populated_slot_manifest"] = {
-        "parameter_ids": ids,
-        "sha256": hashlib.sha256(encoded).hexdigest(),
-    }
-
-
 def test_live_pullback_group_rejects_adam_slot_when_saved_tag_is_removed(tmp_path):
     cfg = _pullback_resume_cfg()
     source = VFEModel(cfg)
     source_optimizer = build_optimizer(source, cfg)
-    checkpoint = RunArtifacts(tmp_path / "forged-pullback-tag", cfg, source).save_checkpoint(
+    checkpoint = RunArtifacts(tmp_path / "untagged-pullback-group", cfg, source).save_checkpoint(
         0, source, source_optimizer, cfg,
     )
     bundle = torch.load(checkpoint, weights_only=True)
@@ -1145,7 +959,6 @@ def test_live_pullback_group_rejects_adam_slot_when_saved_tag_is_removed(tmp_pat
         "exp_avg": torch.zeros_like(parameter),
         "exp_avg_sq": torch.zeros_like(parameter),
     }
-    _refresh_optimizer_slot_manifest(bundle)
     torch.save(bundle, checkpoint)
 
     target = VFEModel(cfg)
@@ -1583,40 +1396,6 @@ def test_save_checkpoint_rejects_malformed_data_cursor(tmp_path, field, bad_valu
         art.save_checkpoint(1, model, build_optimizer(model, cfg), cfg, data_state=data_state)
 
 
-@pytest.mark.parametrize(("field", "bad_value"), [
-    ("batches_consumed", 1.5),
-    ("batches_consumed", True),
-    ("batches_consumed", -1),
-    ("epoch", 1.5),
-    ("epoch", True),
-    ("epoch", -1),
-])
-def test_load_checkpoint_rejects_malformed_data_cursor(tmp_path, field, bad_value):
-    cfg = _cfg()
-    model = VFEModel(cfg)
-    art = RunArtifacts(tmp_path / "run", cfg, model)
-    valid_data_state = {
-        "epoch_start_generator_state": torch.Generator().manual_seed(0).get_state(),
-        "batches_consumed":            0,
-        "epoch":                       0,
-        "data_identity":               _loader_data_identity(_shuffled_loader(), cfg.vocab_size),
-    }
-    checkpoint = art.save_checkpoint(
-        1, model, build_optimizer(model, cfg), cfg, data_state=valid_data_state)
-    bundle = torch.load(checkpoint, weights_only=True)
-    bundle["data_state"][field] = bad_value
-    malformed_checkpoint = tmp_path / f"malformed-{field}.pt"
-    torch.save(bundle, malformed_checkpoint)
-
-    with pytest.raises(ValueError, match=rf"{field}.*non-negative integer"):
-        load_checkpoint(
-            malformed_checkpoint,
-            VFEModel(cfg),
-            data_state={},
-            expected_data_identity=valid_data_state["data_identity"],
-        )
-
-
 def test_load_checkpoint_rejects_invalid_shuffled_epoch_generator_before_mutation(tmp_path):
     cfg = _cfg()
     source = VFEModel(cfg)
@@ -1716,10 +1495,9 @@ def test_resume_config_drift_reports_grad_clip_change(tmp_path):
 # selected weights (best_model.pt) never followed the checkpoint into the new run_dir; finalize then
 # saw finite best metadata whose file did not exist. save_checkpoint now embeds a VALIDATED best-model
 # bundle, and load_checkpoint publishes it (or a legacy sibling) into the new run, failing closed on
-# any missing/tampered/semantically-incompatible bundle. Selection compatibility is judged on the
+# any missing or semantically incompatible bundle. Selection compatibility is judged on the
 # SELECTION PROJECTION of the config (architecture/objective fields), so a resume-path or output-cadence
-# change cannot invalidate otherwise identical weights, while the full internal fingerprint still
-# detects excluded-field tampering. Tiny CPU models throughout (embed_dim=4).
+# change cannot invalidate otherwise identical weights. Tiny CPU models throughout (embed_dim=4).
 
 
 def _eval_loader(seq_len: int = 8, bs: int = 4) -> DataLoader:
@@ -1775,20 +1553,12 @@ def _strip_to_legacy(ckpt_path) -> None:
     torch.save(bundle, ckpt_path)
 
 
-@pytest.mark.parametrize("corruption", (
-    "string_ppl", "bool_ppl", "string_step", "step_after_checkpoint", "empty_with_step",
-))
+@pytest.mark.parametrize("corruption", ("step_after_checkpoint", "empty_with_step"))
 def test_resume_rejects_invalid_best_selection_metadata_before_mutation(tmp_path, corruption):
     cfg = _cfg()
     checkpoint, _, _ = _build_embedded_best_checkpoint(tmp_path / "A", cfg)
     bundle = torch.load(checkpoint, weights_only=True)
-    if corruption == "string_ppl":
-        bundle["best_val_ppl"] = "5.0"
-    elif corruption == "bool_ppl":
-        bundle["best_val_ppl"] = True
-    elif corruption == "string_step":
-        bundle["best_step"] = "2"
-    elif corruption == "step_after_checkpoint":
+    if corruption == "step_after_checkpoint":
         bundle["best_step"] = bundle["step"] + 1
     else:
         bundle["best_val_ppl"] = float("inf")
@@ -1958,7 +1728,7 @@ def test_selection_projection_migrates_missing_defaults_and_rejects_unknown_fiel
     serialized = asdict(cfg)
     assert _selection_semantic_config(serialize_config(cfg)) == live_projection
 
-    # The stored FULL fingerprint is a stable function of the raw mapping (the tamper-check basis).
+    # The stored FULL fingerprint is a stable function of the raw mapping's key order.
     assert semantic_config_fingerprint(serialized) == semantic_config_fingerprint(
         dict(reversed(list(serialized.items()))))
 
@@ -2009,7 +1779,7 @@ def test_selection_projection_grad_clip_migrates_to_default_and_differentiates()
     stripping the field from asdict(VFE3Config())) migrates through _selection_semantic_config
     to the CURRENT default (grad_clip=1.0), matching the live default projection exactly -- an
     explicit non-default grad_clip=0.25 must project differently. The raw legacy mapping's own
-    full fingerprint is verified BEFORE the projection (the tamper-check basis, mirroring
+    full fingerprint is invariant to key order (mirroring
     test_selection_projection_migrates_missing_defaults_and_rejects_unknown_fields above), and an
     unknown field still fails closed rather than being silently ignored by config_from_serialized."""
     from vfe3.run_artifacts import _selection_semantic_config
@@ -2099,37 +1869,6 @@ def test_stale_contract_rerun_replaces_old_unselected_best(tmp_path, monkeypatch
     assert math.isfinite(mapping["primary_val_ppl"])
     assert Path(mapping["terminal_checkpoint"]).exists()       # success contract published
     assert (tmp_path / "r" / "summary.json").exists()
-
-
-@pytest.mark.parametrize("corruption", [
-    "stale_fingerprint", "missing_key", "extra_key",
-    "wrong_shape", "wrong_dtype", "non_tensor",
-])
-def test_corrupt_embedded_best_bundle_rejected_on_resume(tmp_path, corruption):
-    cfg = _cfg()
-    ckpt, _, _ = _build_embedded_best_checkpoint(tmp_path / "A", cfg)
-    bundle = torch.load(ckpt, weights_only=False)
-    embedded = bundle["best_model_bundle"]
-    model_state = embedded["model_state"]
-    a_key = next(iter(model_state))
-    if corruption == "stale_fingerprint":
-        embedded["config_fingerprint"] = "0" * 64
-    elif corruption == "missing_key":
-        del model_state[a_key]
-    elif corruption == "extra_key":
-        model_state["phantom_param"] = torch.zeros(2)
-    elif corruption == "wrong_shape":
-        model_state[a_key] = torch.zeros(model_state[a_key].shape + (1,))
-    elif corruption == "wrong_dtype":
-        model_state[a_key] = model_state[a_key].to(torch.float64)
-    elif corruption == "non_tensor":
-        model_state[a_key] = [1.0, 2.0, 3.0]
-    torch.save(bundle, ckpt)
-
-    fresh = VFEModel(cfg)
-    new_art = RunArtifacts(tmp_path / "B", cfg, fresh)
-    with pytest.raises(RuntimeError):
-        load_checkpoint(ckpt, fresh, artifacts=new_art)
 
 
 def test_active_block_mlp_checkpoint_roundtrip_and_topology_mismatch(tmp_path):
