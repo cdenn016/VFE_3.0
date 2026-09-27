@@ -364,7 +364,9 @@ class VFEModel(nn.Module):
                                     attention_residual=cfg.attention_residual,
                                     identity_content=cfg.relational_identity_content,
                                     output_init_scale=output_init_scale,
-                                    routing=cfg.relational_routing)
+                                    routing=cfg.relational_routing,
+                                    predictive_covariance=cfg.predictive_covariance,
+                                    predictive_covariance_floor=cfg.predictive_covariance_floor)
                 for layer_index in range(cfg.n_layers)
             ]
             self.relational_operators = layers[0]

@@ -360,6 +360,14 @@ class VFE3Config:
 
     relational_identity_content:         bool          = False                  # predictive_content requires learned content maps
     relational_routing:                  str           = "gaussian_kl"          # "gaussian_kl" | "noisy_query" (projected_predictive only)
+    # Belief covariance after the predictive readout. "passthrough" keeps the incoming covariance
+    # (a per-token-type routing state); "moment_matched" replaces it by the exact moment-matched
+    # covariance of the predictive kernel (GL(K) v2 Theorem thm:probabilistic_status (2)): source
+    # covariances pushed through M_h = O_h T_h, cross-head terms, between-source spread, the
+    # residual persistence term when attention_residual=True, and the covariant reference floor
+    # floor * (tr C_i / K) I (local floor * (tr C_i / K) U_i U_i^T).
+    predictive_covariance:               str           = "passthrough"          # "passthrough" | "moment_matched" (projected_predictive only)
+    predictive_covariance_floor:         float         = 1e-4                   # Q~_i = floor * (tr C_i / K) I, keeps Sigma^+ positive definite and well conditioned
 
     ######################################
     #                Self Energy:
@@ -434,7 +442,7 @@ class VFE3Config:
 
     # Optional residual feed-forward unit applied after each belief block.
     use_block_mlp:              bool  = True
-    block_mlp_mode:             str   = "coordinate"  # "coordinate" | "gauge_gate" | "canonical_frame"
+    block_mlp_mode:             str   = "coordinate"  # "coordinate" | "gauge_gate" | "canonical_frame" | "gaussian_template" (passthrough only)
     block_mlp_covariance:       str   = "passthrough" # "passthrough" | "delta_full"
     block_mlp_activation:       str   = "gelu"        # "gelu" | "silu" | "relu"
 
@@ -826,6 +834,17 @@ class VFE3Config:
         _require(self.relational_routing, ("gaussian_kl", "noisy_query"), "relational_routing")
         if self.relational_routing == "noisy_query" and self.attention_mode != "projected_predictive":
             raise ValueError("relational_routing='noisy_query' requires attention_mode='projected_predictive'")
+        _require(self.predictive_covariance, ("passthrough", "moment_matched"), "predictive_covariance")
+        if self.predictive_covariance == "moment_matched" and self.attention_mode != "projected_predictive":
+            raise ValueError(
+                "predictive_covariance='moment_matched' requires attention_mode='projected_predictive'")
+        if (isinstance(self.predictive_covariance_floor, bool)
+                or not isinstance(self.predictive_covariance_floor, Real)
+                or not math.isfinite(float(self.predictive_covariance_floor))
+                or float(self.predictive_covariance_floor) <= 0.0):
+            raise ValueError(
+                "predictive_covariance_floor must be a finite real value > 0, "
+                f"got {self.predictive_covariance_floor!r}")
         for name in ("m_relational_score_lr", "m_relational_content_lr"):
             rate = getattr(self, name)
             if rate is not None and (
@@ -850,8 +869,9 @@ class VFE3Config:
             # coercion below, which can itself supply pos_phi='none'.
             # skip_belief_sigma_update is deliberately ABSENT from the envelope above: it is INERT
             # on every projected route, not incompatible. 'projected_predictive' replaces the mean
-            # and keeps covariance (e_step.py predictive branch assigns sigma = belief.sigma and
-            # never reads the flag); 'projected_conditional' filtering returns grad_sigma=None by
+            # and, by predictive_covariance, either keeps covariance (passthrough: e_step.py assigns
+            # sigma = belief.sigma) or assigns the predictive kernel's moment-matched covariance
+            # (moment_matched); neither reads the flag. 'projected_conditional' filtering returns grad_sigma=None by
             # signature (relational.py:85), so there is no sigma arm to skip. The previous pin to
             # True only kept skip=False from reaching the float*None retraction; the None guard in
             # e_step_iteration covers that now. Inertness is reported by inactive_fields.
@@ -2288,7 +2308,9 @@ class VFE3Config:
                     UserWarning, stacklevel=2,
                 )
 
-        if self.decode_mode != "linear" and (
+        predictive_moment_matched = (self.attention_mode == "projected_predictive"
+                                     and self.predictive_covariance == "moment_matched")
+        if self.decode_mode != "linear" and not predictive_moment_matched and (
             self.skip_belief_sigma_update or self.attention_mode != "transported"
         ):
             import warnings
@@ -2346,14 +2368,20 @@ class VFE3Config:
             if self.relational_routing == "noisy_query":
                 mark(("projected_factor_route",),
                      "the noisy-query cost factors per-pair sums G_q + G_k and keeps the Gram route")
+        if self.attention_mode != "projected_predictive":
+            mark(("predictive_covariance", "predictive_covariance_floor"),
+                 "only read by attention_mode='projected_predictive'")
+        elif self.predictive_covariance == "passthrough":
+            mark(("predictive_covariance_floor",), "only read by predictive_covariance='moment_matched'")
         gradient_controls = ("e_q_mu_lr", "e_q_sigma_lr", "e_step_mu_precond",
                              "e_mu_q_trust", "mu_trust_mode", "e_sigma_q_trust")
         if self.attention_mode != "transported":
             mark(("skip_belief_sigma_update",),
-                 "projected routes keep covariance: predictive_content does not estimate it and "
-                 "relational filtering returns no sigma gradient")
+                 "projected routes run no sigma E-step: predictive_content keeps or moment-matches "
+                 "covariance by predictive_covariance, and relational filtering returns no sigma gradient")
         if self.attention_mode == "projected_predictive":
-            mark(gradient_controls, "predictive_content replaces the mean and keeps covariance")
+            mark(gradient_controls, "predictive_content replaces the mean (and, under "
+                 "predictive_covariance='moment_matched', the covariance) by readout, not a gradient step")
             if self.mstep_self_coupling_weight == 0.0:
                 mark(("lambda_alpha_mode", "lambda_alpha", "b0", "c0"),
                      "predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer")
@@ -2361,6 +2389,9 @@ class VFE3Config:
             mark(("block_mlp_mode", "block_mlp_covariance", "block_mlp_covariance_floor",
                   "block_mlp_expansion", "block_mlp_activation", "block_mlp_dropout", "m_block_mlp_lr"),
                  "only read when use_block_mlp=True")
+        elif self.block_mlp_mode == "gaussian_template":
+            mark(("block_mlp_activation", "block_mlp_covariance_floor"),
+                 "gaussian_template gates by softmax over template KLs and keeps covariance")
         if canonical_e_step_update(self.e_step_update) == "mm_exact":
             mark(gradient_controls, "unread under e_step_update='mm_exact'; its step control is mm_damping")
         else:
@@ -2425,8 +2456,9 @@ class VFE3Config:
                  "tables, so no phi-role step or decay applies")
         if self.attention_mode != "transported" or self.skip_belief_sigma_update:
             mark(("e_q_sigma_lr", "e_sigma_q_trust", "sigma_max"),
-                 "the belief covariance is frozen on projected routes and under "
-                 "skip_belief_sigma_update, so no sigma step, trust region, or SPD ceiling runs")
+                 "no sigma E-step runs on projected routes or under skip_belief_sigma_update "
+                 "(a moment-matched predictive covariance is a readout with its own floor), so no "
+                 "sigma step, trust region, or SPD ceiling runs")
         if self.attention_mode != "transported":
             mark(("full_cov_kl_backend",),
                  "projected scoring never calls the transported full-covariance pair backend")
@@ -2470,6 +2502,7 @@ class VFE3Config:
         if (self.attention_mode == "projected_predictive" and self.family == "gaussian_full"
                 and self.encode_mode in ("per_token", "per_token_additive")
                 and not self.use_head_mixer and not self.rope_full_gauge
+                and self.predictive_covariance == "passthrough"
                 and not (self.use_block_mlp and (
                     self.block_mlp_covariance != "passthrough"
                     or get_block_mlp_registration(self.block_mlp_mode).gauge_class
@@ -2478,7 +2511,7 @@ class VFE3Config:
                  "value-identical to gaussian_diagonal under the rank-matched decoder on this "
                  "route: stored covariance is a diagonal token lookup and no seam densifies it; "
                  "full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, "
-                 "or attention_mode='transported'")
+                 "predictive_covariance='moment_matched', or attention_mode='transported'")
         return inactive
 
     @property

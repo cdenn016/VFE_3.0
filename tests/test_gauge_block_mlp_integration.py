@@ -131,10 +131,14 @@ def test_block_uses_moment_api_and_forwards_canonical_frame():
 
 def test_editable_launchers_expose_mode_and_covariance_toggles():
     selectors = {"block_mlp_mode", "block_mlp_covariance", "block_mlp_covariance_floor"}
-    assert selectors.isdisjoint(train_vfe3.config)
+    # The training launcher writes the toggles explicitly (2026-09-27); the ablation baseline
+    # still omits them and resolves through the canonical public defaults.
+    assert selectors <= set(train_vfe3.config)
     assert selectors.isdisjoint(ablation.BASELINE_CONFIG)
 
-    # Omitted derived selectors resolve through the canonical public defaults.
+    defaults = VFE3Config()
+    for name in selectors:
+        assert train_vfe3.config[name] == getattr(defaults, name)
     cfg = VFE3Config(**train_vfe3.config)
     assert cfg.block_mlp_mode == "coordinate"
     assert cfg.block_mlp_covariance == "passthrough"

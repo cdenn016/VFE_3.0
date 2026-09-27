@@ -660,16 +660,23 @@ def covariance_frozen_at_encode(cfg: object) -> bool:
     r"""Whether the stack's output covariance is the encode-time token lookup Sigma(x_i).
 
     No E-step covariance update runs on a projected ``attention_mode`` (the predictive readout keeps
-    ``sigma = belief.sigma``; relational filtering has no sigma arm) or under
-    ``skip_belief_sigma_update=True``. After the E-step only the mean-dependent delta-method seams
+    ``sigma = belief.sigma`` unless ``predictive_covariance='moment_matched'`` assigns the
+    predictive kernel's context-dependent covariance; relational filtering has no sigma arm) or under
+    ``skip_belief_sigma_update=True`` on the transported route. After the E-step only the mean-dependent delta-method seams
     rewrite sigma -- a block MLP with ``block_mlp_covariance='delta_full'`` or CG coupling with
     ``cg_covariance_mode='delta_full'``; the head mixer is a fixed per-token congruence and the
     norms act on the mean alone. Without those seams tr Sigma_q(x_i) is a function of the input
     token id x_i only, so the B1/EXP-3 statistics measure input-token variance against next-token
     CE, not context-dependent belief uncertainty.
     """
-    e_step_frozen = (getattr(cfg, "attention_mode", "transported") != "transported"
-                     or bool(getattr(cfg, "skip_belief_sigma_update", False)))
+    attention_mode = getattr(cfg, "attention_mode", "transported")
+    if attention_mode == "transported":
+        e_step_frozen = bool(getattr(cfg, "skip_belief_sigma_update", False))
+    elif attention_mode == "projected_predictive":
+        # The predictive readout rewrites sigma only under the moment-matched covariance.
+        e_step_frozen = getattr(cfg, "predictive_covariance", "passthrough") != "moment_matched"
+    else:
+        e_step_frozen = True
     mlp_rewrites_sigma = (bool(getattr(cfg, "use_block_mlp", False))
                           and getattr(cfg, "block_mlp_covariance", "passthrough") == "delta_full")
     cg_rewrites_sigma = (bool(getattr(cfg, "use_cg_coupling", False))

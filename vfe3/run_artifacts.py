@@ -103,7 +103,12 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
                    else getattr(cfg, f"m_relational_{role}_lr")) if counts[role] else None
             for role in counts},
         "score_covariance_contract": "exact_full_reduced_covariance_from_local_gaussian",
-        "content_covariance_contract": ("frozen_receiver_bookkeeping_not_predictive_covariance" if predictive
+        "covariance_update": (getattr(cfg, "predictive_covariance", "passthrough") if predictive
+                              else "not_applicable"),
+        "content_covariance_contract": ("exact_predictive_kernel_moment_match_plus_covariant_floor"
+                                        if predictive and getattr(cfg, "predictive_covariance",
+                                                                  "passthrough") == "moment_matched"
+                                        else "frozen_receiver_bookkeeping_not_predictive_covariance" if predictive
                                         else "legacy_transported_diagonal_variance_mean_only_content"
                                         if cfg.family == "gaussian_diagonal"
                                         else "full_gaussian_transported_head_marginals_mean_only_content"),
@@ -3038,8 +3043,9 @@ def _write_research_artifacts(
             if frozen_covariance:
                 out["sigma_trace_cv_gate_pass"] = None
                 out["sigma_trace_cv_gate_reason"] = (
-                    "covariance frozen at encode (projected attention_mode or "
-                    "skip_belief_sigma_update=True, no delta_full covariance seam): tr Sigma is "
+                    "covariance frozen at encode (projected attention_mode without "
+                    "predictive_covariance='moment_matched', or skip_belief_sigma_update=True, "
+                    "no delta_full covariance seam): tr Sigma is "
                     "the input-token variance tr Sigma(x_i), not a context-dependent belief "
                     "uncertainty, so the CV>0.10 calibration gate is withheld")
                 logger.info("input-token variance vs next-token CE: rho(trSigma(x_i),CE)=%.3f "
@@ -4632,18 +4638,24 @@ def _pure_path_report(
     #   projected_conditional -> a relational-filtering gradient step on the mean only (no sigma arm);
     #   projected_predictive  -> the predictive readout replaces the mean; no E-step descent runs.
     # Projected routes keep sigma = belief.sigma, so their covariance is frozen at encode whatever
-    # skip_belief_sigma_update says. A facet with no executed counterpart is 'not_applicable'.
+    # skip_belief_sigma_update says, except that predictive_covariance='moment_matched' assigns the
+    # predictive kernel's covariance (a readout: no retraction). A facet with no executed
+    # counterpart is 'not_applicable'.
     from vfe3.inference.e_step import canonical_e_step_update
     attention_mode = getattr(cfg, "attention_mode", "transported")
     transported = attention_mode == "transported"
     e_step_updater = canonical_e_step_update(getattr(cfg, "e_step_update", "gradient"))
-    covariance_updated = transported and not cfg.skip_belief_sigma_update
+    predictive_covariance_updated = (
+        attention_mode == "projected_predictive"
+        and getattr(cfg, "predictive_covariance", "passthrough") == "moment_matched")
+    covariance_updated = (transported and not cfg.skip_belief_sigma_update) or predictive_covariance_updated
     gradient_e_step_update: 'bool | str' = (
         e_step_updater == "gradient" if transported
         else True if attention_mode == "projected_conditional"
         else "not_applicable"
     )
-    spd_retraction_applies = covariance_updated and e_step_updater == "gradient"
+    spd_retraction_applies = (transported and not cfg.skip_belief_sigma_update
+                              and e_step_updater == "gradient")
 
     sigma_max = getattr(cfg, "sigma_max", 10.0)
     spd_trust_region = getattr(cfg, "e_sigma_q_trust", 5.0)
@@ -4687,7 +4699,8 @@ def _pure_path_report(
         "prior_bank_decode":           cfg.decode_mode != "linear",
         "no_head_mixer":               not cfg.use_head_mixer,
         "no_priorbank_head_evidence_mixer": not priorbank_head_evidence_mixer,
-        # Executed-route facet: False on every projected route, where sigma stays at encode.
+        # Executed-route facet: False on projected routes, where sigma stays at encode, unless
+        # predictive_covariance='moment_matched' assigns the predictive kernel's covariance.
         "full_sigma_update":           covariance_updated,
         "no_block_mlp":                not block_mlp_active,
         # The E-STEP UPDATE RULE axis (audit 2026-07-26 D-03). 'mm_exact' is the closed-form
@@ -4784,6 +4797,8 @@ def _pure_path_report(
                 else "means_only_unrotated_covariance"
             ),
             "skip_belief_sigma_update":      bool(cfg.skip_belief_sigma_update),
+            "predictive_covariance":         getattr(cfg, "predictive_covariance", "passthrough"),
+            "predictive_covariance_floor":   float(getattr(cfg, "predictive_covariance_floor", 1e-4)),
             "gauge_group":                   cfg.gauge_group,
             "family":                        cfg.family,
             "group_invariant_families":      list(invariant_families),
@@ -4794,7 +4809,8 @@ def _pure_path_report(
             # Truthful fixed-surrogate ledger (C6): these derived booleans expose when the run
             # intentionally freezes a state-dependent quantity rather than following its full
             # joint objective. Defaults are False, preserving the pure path. The covariance is
-            # frozen on every projected route as well as under skip_belief_sigma_update.
+            # frozen on projected routes (unless predictive_covariance='moment_matched') as well
+            # as under skip_belief_sigma_update.
             "fixed_covariance_surrogate":   not covariance_updated,
             "attention_mode":               attention_mode,
             "state_dependent_alpha_majorizer": (
