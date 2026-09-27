@@ -83,9 +83,9 @@ def test_decode_temperature_learned_default_keeps_the_learned_scale() -> None:
                for group in sigma_groups for parameter in group["params"])
 
 
-def test_frozen_decode_temperature_is_rejected_where_it_is_inert() -> None:
-    with pytest.raises(ValueError, match="decode_temperature_learned"):
-        _tiny(decode_mode="linear", decode_temperature_learned=False)
+def test_frozen_decode_temperature_is_inert_under_linear_decode() -> None:
+    cfg = _tiny(decode_mode="linear", decode_temperature_learned=False)
+    assert "decode_temperature_learned" in cfg.inactive_fields()
 
 
 # ---- #4 decode GEMM precision ---------------------------------------------------------------
