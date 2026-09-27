@@ -1768,10 +1768,6 @@ class VFE3Config:
         # decode / encode
         if not math.isfinite(self.decode_tau) or self.decode_tau <= 0.0:
             raise ValueError(f"decode_tau must be finite and positive, got {self.decode_tau}")
-        if not self.decode_temperature_learned and self.decode_mode == "linear":
-            raise ValueError(
-                "decode_temperature_learned=False freezes decode_log_scale, which only the prior-bank "
-                "decoders read; decode_mode='linear' discards tau_eff")
         _require(self.relational_output_init, ("identity", "depth_scaled"), "relational_output_init")
         if self.relational_output_init == "depth_scaled" and (
                 self.attention_mode == "transported" or self.relational_identity_content):
@@ -2440,7 +2436,7 @@ class VFE3Config:
         # arithmetic; where an autograd oracle executes it (full-covariance families) the
         # override leaves only a floating-point roundoff residue in the gradients.
         if self.decode_mode == "linear":
-            mark(("decode_tau",), "read only by the prior-bank KL decode")
+            mark(("decode_tau", "decode_temperature_learned"), "read only by the prior-bank KL decode")
             mark(("untie_decode_bank",),
                  "read only by the KL-to-bank decode; the linear decode is untied by construction")
         else:
