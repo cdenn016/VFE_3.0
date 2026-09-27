@@ -606,6 +606,7 @@ SWEEP_ORDER: List[str] = [
   # "m_pos_phi_lr", 
 
   # "m_relational_content_lr",
+  # "m_relational_lr_tied",
    
   
    
@@ -742,6 +743,18 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "param": "m_relational_content_lr",
         "values": [0.001, 0.0025, 0.005, 0.0075, 0.01],
         "scale": "linear",
+        "requires": {
+            "attention_mode": "projected_predictive",
+        },
+    },
+
+    "m_relational_lr_tied": {
+        "description": "Q/K score-map and T/O content-map M-step LRs swept together at equal values",
+        "configs": [
+            {"label": f"m_relational_lr_tied={lr}",
+             "m_relational_score_lr": lr, "m_relational_content_lr": lr}
+            for lr in (0.0015, 0.003, 0.005, 0.01, 0.02)
+        ],
         "requires": {
             "attention_mode": "projected_predictive",
         },
