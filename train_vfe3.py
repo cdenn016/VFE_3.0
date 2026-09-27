@@ -132,6 +132,8 @@ config = dict(
     
     attention_residual               = True,   # predictive S/T/O: add the incoming mean
     relational_routing               = "gaussian_kl",  # "gaussian_kl" | "noisy_query": exact posterior N(a_i; b_j, V_Q + V_K), predictive only
+    predictive_covariance            = "passthrough",  # "passthrough" (Sigma kept at encode) | "moment_matched" (exact predictive-kernel covariance), predictive only
+    predictive_covariance_floor      = 1e-4,           # moment_matched only: covariant floor floor * (tr C_i / K) I in reference coordinates
    
        
     
@@ -183,6 +185,9 @@ config = dict(
     #     Optional Block MLP        #
     #################################
     use_block_mlp             = True,      
+    block_mlp_mode            = "coordinate",   # "coordinate" | "gauge_gate" | "canonical_frame" | "gaussian_template" (template routing, passthrough covariance)
+    block_mlp_covariance      = "passthrough",  # "passthrough" | "delta_full" (needs gaussian_full; not for gaussian_template)
+    block_mlp_covariance_floor = 1e-4,          # delta_full only: Sigma+ = J Sigma J^T + floor Sigma
     block_mlp_expansion       = 8,
     block_mlp_activation      = "gelu",
     block_mlp_dropout         = 0.00,

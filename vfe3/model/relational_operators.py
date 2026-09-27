@@ -35,6 +35,8 @@ class RelationalOperators(nn.Module):
         identity_content:      bool  = False,
         output_init_scale:     float = 1.0,
         routing:               str   = "gaussian_kl",
+        predictive_covariance: str   = "passthrough",
+        predictive_covariance_floor: float = 1e-4,
     ) -> None:
         super().__init__()
         if not irrep_dims or any(type(d) is not int or d < 1 for d in irrep_dims) or len(set(irrep_dims)) != 1:
@@ -67,6 +69,17 @@ class RelationalOperators(nn.Module):
         if routing == "noisy_query" and readout_mode != "predictive_content":
             raise ValueError("noisy_query routing requires predictive_content")
         self.routing = routing
+        if predictive_covariance not in ("passthrough", "moment_matched"):
+            raise ValueError("predictive_covariance must be 'passthrough' or 'moment_matched'")
+        if predictive_covariance == "moment_matched" and readout_mode != "predictive_content":
+            raise ValueError("moment_matched predictive covariance requires predictive_content")
+        if (isinstance(predictive_covariance_floor, bool)
+                or not isinstance(predictive_covariance_floor, (int, float))
+                or not math.isfinite(predictive_covariance_floor) or predictive_covariance_floor <= 0.0):
+            raise ValueError(
+                f"predictive_covariance_floor must be finite and positive, got {predictive_covariance_floor!r}")
+        self.predictive_covariance = predictive_covariance
+        self.predictive_covariance_floor = float(predictive_covariance_floor)
         self.output_scope = output_scope
         self.input_scope = input_scope
         self.input_dim = H * d if input_scope == "full" else d
@@ -128,6 +141,96 @@ class RelationalOperators(nn.Module):
                 body = body.reshape(*mu.shape[:-1], H, d)
             result = (frame.forward.to(dtype) @ body.unsqueeze(-1)).squeeze(-1)
         return result.reshape_as(mu).to(mu.dtype)
+
+    def _ambient_content_maps(self, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""Return (T_hat, O_hat), each head's content maps embedded in the full state space.
+
+        T_hat is ``(H, d, K)`` and O_hat is ``(H, K, d)``, so M_h = O_hat_h T_hat_h is the head's
+        K x K content map in every input/output scope. Head scope places T_h / O_h on head block h.
+        """
+        H, d = len(self.irrep_dims), self.irrep_dims[0]
+        eye = torch.eye(H, dtype=dtype, device=self.T.device)
+        T, O = self.T.to(dtype), self.O.to(dtype)
+        if self.input_scope == "head":
+            T = torch.einsum("hab,hg->hagb", T, eye).reshape(H, d, H * d)
+        if self.output_scope == "head":
+            O = torch.einsum("hab,hg->hgab", O, eye).reshape(H, H * d, d)
+        return T, O
+
+    def predictive_covariance_update(
+        self,
+        mu:    torch.Tensor,  # (..., N, K) source means, the values predictive_content reads
+        sigma: torch.Tensor,  # (..., N, K) diagonal or (..., N, K, K) full local covariance
+        beta:  torch.Tensor,  # (..., H, N, N) routing weights, rows sum to one
+        frame: CanonicalFrameContext,
+    ) -> torch.Tensor:        # same layout as sigma: the moment-matched covariance Sigma_i^+
+        r"""Moment-matched covariance of the predictive kernel (GL(K) v2, Theorem thm:probabilistic_status (2)).
+
+        With independent head labels J^h ~ beta_i^h, independent sources k_j ~ N(mu_j, Sigma_j), and
+        the kernel k_i' | k, J ~ N(r k_i + sum_h L_{iJ^h}^h k_{J^h}, Q_i), where r = 1 under
+        ``attention_residual`` and 0 otherwise, the covariance in reference coordinates is
+
+        .. math::
+            C_i^{\mathrm{att}} = \widetilde Q_i
+              + r\Bigl[C_i + \sum_h \beta_{ii}^h (M_h C_i + C_i M_h^\top)\Bigr]
+              + \sum_j \sum_{h,h'} c_{ij}^{hh'} M_h C_j M_{h'}^\top
+              + \sum_h \Bigl[\sum_j \beta_{ij}^h n_{ij}^h n_{ij}^{h\top} - \bar n_i^h \bar n_i^{h\top}\Bigr],
+
+        with M_h = O_h T_h, C_j = U_j^{-1} Sigma_j U_j^{-T}, c^{hh} = beta^h, c^{hh'} = beta^h beta^{h'}
+        (h != h'), n_ij^h = M_h xi_j, and the reference floor Q~_i = floor * (tr C_i / K) I, which is
+        covariant (local Q_i = floor * (tr C_i / K) U_i U_i^T, with tr C_i frame-invariant).
+        The result is Sigma_i^+ = U_i C_i^att U_i^T in the frame the mean content uses. A diagonal
+        input returns diag(Sigma_i^+), the KL(p || q) moment projection onto the diagonal family.
+        Head-space pooling keeps the cost at an attention with d x d values per head pair.
+        """
+        H, d = len(self.irrep_dims), self.irrep_dims[0]
+        K = H * d
+        diagonal = sigma.dim() == mu.dim()
+        dtype = _compute_dtype(mu, sigma, self.T, self.O, frame.forward)
+        with torch.autocast(device_type=mu.device.type, enabled=False):
+            forward, inverse = frame.forward.to(dtype), frame.inverse.to(dtype)
+            if frame.block_diagonal:                            # (..., N, H, d, d) -> (..., N, K, K)
+                eye_h = torch.eye(H, dtype=dtype, device=mu.device)
+                forward = torch.einsum("...hab,hg->...hagb", forward, eye_h).reshape(*forward.shape[:-3], K, K)
+                inverse = torch.einsum("...hab,hg->...hagb", inverse, eye_h).reshape(*inverse.shape[:-3], K, K)
+            local = torch.diag_embed(sigma.to(dtype)) if diagonal else sigma.to(dtype)
+            C = inverse @ local @ inverse.transpose(-1, -2)                        # (..., N, K, K)
+            C = 0.5 * (C + C.transpose(-1, -2))
+            xi = (inverse @ mu.to(dtype).unsqueeze(-1)).squeeze(-1)                # (..., N, K)
+            T_hat, O_hat = self._ambient_content_maps(dtype)                       # (H,d,K), (H,K,d)
+            b = beta.to(dtype)                                                     # (..., H, N, N)
+            eye_h = torch.eye(H, dtype=dtype, device=mu.device)
+
+            values = torch.einsum("hsk,...nk->...nhs", T_hat, xi)                  # (..., N, H, d)
+            TC = torch.einsum("hsk,...nkm->...nhsm", T_hat, C)                     # (..., N, H, d, K)
+            source = torch.einsum("...nhsm,gtm->...nhgst", TC, T_hat)             # (..., N, H, H, d, d)
+            # c^{hh'}_ij: beta^h on the head diagonal, beta^h beta^h' off it.
+            c = torch.einsum("...hij,...gij->...hgij", b, b)
+            c = c * (1.0 - eye_h)[..., None, None] + torch.einsum("...hij,hg->...hgij", b, eye_h)
+            pooled = torch.einsum("...hgij,...jhgst->...ihgst", c, source)        # (..., N, H, H, d, d)
+            second = torch.einsum("...hij,...jhst->...ihst",
+                                  b, values.unsqueeze(-1) * values.unsqueeze(-2))  # (..., N, H, d, d)
+            mean = torch.einsum("...hij,...jhs->...ihs", b, values)                # (..., N, H, d)
+            spread = second - mean.unsqueeze(-1) * mean.unsqueeze(-2)
+            pooled = pooled + torch.einsum("...ihst,hg->...ihgst", spread, eye_h)
+            lifted = torch.einsum("hks,...nhgst->...ngkt", O_hat, pooled)         # (..., N, H, K, d)
+            C_att = torch.einsum("...ngkt,gmt->...nkm", lifted, O_hat)             # (..., N, K, K)
+            if self.attention_residual:
+                self_weight = b.diagonal(dim1=-2, dim2=-1).transpose(-1, -2)       # (..., N, H) beta_ii^h
+                cross = torch.einsum("hks,...nhsm->...nkm", O_hat,
+                                     TC * self_weight[..., None, None])            # sum_h beta_ii M_h C_i
+                C_att = C_att + C + cross + cross.transpose(-1, -2)
+            # Isotropic reference floor scaled by the invariant tr(C_i)/K: a relative floor
+            # floor * C_i compounds as floor**depth along a residual-free stack and loses float32
+            # definiteness; this one keeps cond(C_att) bounded by the content spread over floor.
+            scale = torch.diagonal(C, dim1=-2, dim2=-1).mean(dim=-1)              # (..., N) tr(C_i)/K
+            C_att = C_att + (self.predictive_covariance_floor * scale)[..., None, None] * torch.eye(
+                K, dtype=dtype, device=mu.device)
+            result = forward @ C_att @ forward.transpose(-1, -2)
+            result = 0.5 * (result + result.transpose(-1, -2))
+            if diagonal:
+                result = torch.diagonal(result, dim1=-2, dim2=-1)
+        return result.to(sigma.dtype)
 
     @staticmethod
     def _orthonormal_columns(raw: torch.Tensor) -> torch.Tensor:

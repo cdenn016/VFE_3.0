@@ -385,6 +385,88 @@ class CanonicalFrameBlockMLP(BlockMLP):
             realized_jacobian,
         )
 
+class GaussianTemplateBlockMLP(nn.Module):
+    r"""Residual block computed as Gibbs routing to M = expansion * K learned Gaussian templates.
+
+    Each template a carries a diagonal Gaussian p_a = N(nu_a, diag(lambda_a)), a log prior weight
+    log pi_a, and a value w_a. Under a mixture prior p(k) = sum_a pi_a p_a, the optimal variational
+    responsibilities of the belief q_i = N(mu_i, Sigma_i) are
+
+    .. math::
+        r_{ia} \propto \pi_a \exp\bigl(-D_{\mathrm{KL}}(q_i \,\|\, p_a)\bigr),
+
+    because the entropy H(q_i) is template-independent. Dropping every a-independent term,
+
+    .. math::
+        \log r_{ia} = \log\pi_a - \tfrac12 \sum_k \Bigl[
+            \frac{(\Sigma_i)_{kk} + (\mu_{ik} - \nu_{ak})^2}{\lambda_{ak}} + \log\lambda_{ak}
+        \Bigr] + \mathrm{const}_i,
+
+    and the mean update is mu_i + sum_a r_ia w_a (Gaussian mixture regression with zero regression
+    blocks). Only diag(Sigma_i) enters, so full and diagonal covariance layouts give the same
+    logits. With shared isotropic covariances the logits are affine in mu_i and the block is a
+    width-M MLP whose GELU gate is replaced by a softmax over templates. The covariance passes
+    through unchanged; the block acts in the same local coordinates as the coordinate MLP.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        expansion: int,
+        dropout: float,
+        *,
+        covariance_contract: str = "passthrough",
+    ) -> None:
+        super().__init__()
+        if covariance_contract != "passthrough":
+            raise ValueError(
+                "gaussian_template block MLP supports only covariance_contract='passthrough', "
+                f"got {covariance_contract!r}")
+        n_templates = embed_dim * expansion
+        self.covariance_contract = covariance_contract
+        # Initialization mirrors BlockMLP: template means match fc1 rows, values match fc2 columns.
+        bound_in = embed_dim ** -0.5
+        bound_out = n_templates ** -0.5
+        self.nu = nn.Parameter(torch.empty(n_templates, embed_dim).uniform_(-bound_in, bound_in))
+        self.log_lambda = nn.Parameter(torch.zeros(n_templates, embed_dim))    # lambda_a = 1 at init
+        self.log_pi = nn.Parameter(torch.zeros(n_templates))                   # uniform prior at init
+        self.values = nn.Parameter(
+            torch.empty(n_templates, embed_dim).uniform_(-bound_out, bound_out))
+        self.dropout = nn.Dropout(dropout)
+
+    def responsibilities(self, mu: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        r"""Return r_ia, shape (..., M), from mu (..., K) and sigma (..., K) or (..., K, K)."""
+        sigma_diag = sigma if sigma.dim() == mu.dim() else torch.diagonal(sigma, dim1=-2, dim2=-1)
+        nu = self.nu.to(mu.dtype)
+        precision = torch.exp(-self.log_lambda.to(mu.dtype))                   # (M, K)
+        # sum_k (Sigma_kk + mu_k^2 - 2 mu_k nu_ak + nu_ak^2) / lambda_ak, contracted as matmuls
+        quadratic = (
+            (sigma_diag.to(mu.dtype) + mu.square()) @ precision.T              # (..., M)
+            - 2.0 * mu @ (nu * precision).T
+            + (nu.square() * precision).sum(dim=-1)
+        )
+        logits = self.log_pi.to(mu.dtype) - 0.5 * (
+            quadratic + self.log_lambda.to(mu.dtype).sum(dim=-1))
+        return torch.softmax(logits, dim=-1)
+
+    def mean_update(self, mu: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        message = self.responsibilities(mu, sigma) @ self.values.to(mu.dtype)  # (..., K)
+        return mu + self.dropout(message)
+
+    def forward(self, mu: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        return self.mean_update(mu, sigma)
+
+    def forward_moments(
+        self,
+        mu: torch.Tensor,
+        sigma: torch.Tensor,
+        *,
+        frame_context: Optional[CanonicalFrameContext] = None,
+    ) -> BlockMLPMomentResult:
+        del frame_context
+        return BlockMLPMomentResult(self.mean_update(mu, sigma), sigma, None)
+
+
 BlockMLPFactory = Callable[..., nn.Module]
 BlockMLPReportLabel = Callable[[str], str]
 BlockMLPWidth = Callable[[int, Sequence[int]], int]
@@ -403,6 +485,10 @@ class BlockMLPRegistration:
     width: BlockMLPWidth
     extra_flops_per_layer: BlockMLPExtraFlops
     report_label: BlockMLPReportLabel
+    # (width, expansion) -> per-layer count, for modes whose parameters are not a two-layer MLP.
+    parameter_count_per_layer: Optional[Callable[[int, int], int]] = None
+    # (width, expansion) -> per-layer matmul FLOPs replacing the two-layer 4 * expansion * width^2.
+    matmul_flops_per_layer: Optional[Callable[[int, int], float]] = None
 
     def parameter_count(
         self,
@@ -413,6 +499,8 @@ class BlockMLPRegistration:
         n_layers: int = 1,
     ) -> int:
         width = self.width(embed_dim, irrep_dims)
+        if self.parameter_count_per_layer is not None:
+            return int(n_layers) * self.parameter_count_per_layer(width, expansion)
         per_layer = 2 * expansion * width * width + (expansion + 1) * width
         return int(n_layers) * per_layer
 
@@ -426,8 +514,12 @@ class BlockMLPRegistration:
         n_layers: int,
     ) -> float:
         width = self.width(embed_dim, irrep_dims)
-        per_layer = 4.0 * expansion * width * width
-        per_layer += self.extra_flops_per_layer(embed_dim, irrep_dims)
+        per_layer = (
+            self.matmul_flops_per_layer(width, expansion)
+            if self.matmul_flops_per_layer is not None
+            else 4.0 * expansion * width * width
+        )
+        per_layer +=self.extra_flops_per_layer(embed_dim, irrep_dims)
         if covariance_contract == "delta_full":
             per_layer += 4.0 * embed_dim ** 3
         return float(n_layers) * per_layer
@@ -446,6 +538,12 @@ def _gauge_gate_factory(**kwargs) -> nn.Module:
 def _canonical_frame_factory(**kwargs) -> nn.Module:
     kwargs.pop("irrep_dims")
     return CanonicalFrameBlockMLP(**kwargs)
+
+
+def _gaussian_template_factory(**kwargs) -> nn.Module:
+    for unused in ("irrep_dims", "activation", "covariance_floor"):
+        kwargs.pop(unused)
+    return GaussianTemplateBlockMLP(**kwargs)
 
 
 def _coordinate_report_label(covariance: str) -> str:
@@ -488,6 +586,20 @@ BLOCK_MLP_REGISTRATIONS: Mapping[str, BlockMLPRegistration] = MappingProxyType({
         width=lambda embed_dim, _irrep_dims: embed_dim,
         extra_flops_per_layer=lambda embed_dim, _irrep_dims: float(4 * embed_dim ** 2),
         report_label=lambda _covariance: "canonical_frame_left_equivariant_right_fixed",
+    ),
+    # nu, log_lambda, values: (M, K) each; log_pi: (M,); M = expansion * K.
+    "gaussian_template": BlockMLPRegistration(
+        factory=_gaussian_template_factory,
+        requires_frame_context=False,
+        covariance_kinds=frozenset({"passthrough"}),
+        gauge_class="coordinate_nonintertwiner",
+        intertwiner_compatible=False,
+        width=lambda embed_dim, _irrep_dims: embed_dim,
+        extra_flops_per_layer=lambda _embed_dim, _irrep_dims: 0.0,
+        report_label=lambda _covariance: "gaussian_template_mean_only_nonintertwiner",
+        parameter_count_per_layer=lambda width, expansion: (
+            3 * expansion * width * width + expansion * width),
+        matmul_flops_per_layer=lambda width, expansion: 6.0 * expansion * width * width,
     ),
 })
 

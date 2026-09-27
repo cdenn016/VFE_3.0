@@ -148,11 +148,15 @@ def relational_predictive_readout(
     log_prior:   Optional[torch.Tensor] = None,
     value_frame: Optional[CanonicalFrameContext] = None,
     capture:     Optional[Dict[str, Any]] = None,
-) -> torch.Tensor:
+    return_covariance: bool = False,
+) -> 'torch.Tensor | Tuple[torch.Tensor, torch.Tensor]':
     r"""Return the conditional predictive mean with the configured projected routing cost and live source graphs.
 
-    This is a separate content mixture, not a Fisher step on the comparison belief.
-    Its covariance is not estimated here. No source, router, or map is detached.
+    This is a separate content mixture, not a Fisher step on the comparison belief. With
+    ``return_covariance`` it also returns ``(mean, sigma_plus)``, where sigma_plus is the
+    moment-matched covariance of the same predictive kernel
+    (``RelationalOperators.predictive_covariance_update``), computed from the same routing weights
+    and value frame as the mean. No source, router, or map is detached.
     """
     from vfe3.families.base import safe_kl_clamp
     from vfe3.free_energy import attention_weights
@@ -167,9 +171,13 @@ def relational_predictive_readout(
         result = operators.predictive_content(mu_work, beta, value_frame or frame).to(mu.dtype)
         if operators.attention_residual:
             result = mu + result
+        sigma_plus = (operators.predictive_covariance_update(mu_work, sigma_work, beta, value_frame or frame)
+                      .to(sigma.dtype) if return_covariance else None)
     if capture is not None:
         capture.update(beta_pre=beta.detach(), score_energy_pre=score.detach(),
                        relational_mean_displacement_norm=(result-mu).norm().detach())
+    if return_covariance:
+        return result, sigma_plus
     return result
 
 

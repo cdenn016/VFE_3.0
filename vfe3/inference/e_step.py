@@ -72,7 +72,8 @@ def _belief_update_consumes_omega(
     r"""True when the belief-update branch reads the forward transport ``omega``.
 
     ``mm_exact`` consumes ``omega`` in ``mm_exact_update``. The ``predictive_content``
-    readout replaces ``mu`` and keeps ``sigma`` and never reads ``omega``. The filtering
+    readout replaces ``mu`` (and ``sigma`` under ``predictive_covariance='moment_matched'``,
+    otherwise it keeps ``sigma``) and never reads ``omega``. The filtering
     and ``belief_gradients`` branches consume ``omega`` / ``omega_builder``. The phi
     sub-step builds its own transport and is unaffected either way.
     """
@@ -924,11 +925,16 @@ def e_step_iteration(
           and relational_operators.readout_mode == "predictive_content"):
         if relational_frame is None:
             raise ValueError("predictive content requires the realized query/key frames")
-        mu = relational_predictive_readout(
+        # 'moment_matched' replaces both moments by those of the predictive kernel;
+        # 'passthrough' replaces the mean and keeps the incoming covariance.
+        moment_matched = getattr(relational_operators, "predictive_covariance",
+                                 "passthrough") == "moment_matched"
+        readout = relational_predictive_readout(
             belief.mu, belief.sigma, relational_frame, relational_operators,
             tau=tau, kl_max=kl_max, log_prior=log_prior,
-            value_frame=relational_value_frame, capture=relational_capture)
-        sigma = belief.sigma
+            value_frame=relational_value_frame, capture=relational_capture,
+            **({"return_covariance": True} if moment_matched else {}))
+        mu, sigma = readout if moment_matched else (readout, belief.sigma)
         if grad_record is not None:
             # No comparison-belief gradient is taken in the predictive branch.
             for role in ("mu", "sigma", "phi"):
