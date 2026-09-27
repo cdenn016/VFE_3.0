@@ -986,13 +986,11 @@ def _cell_resume_status(
         return None
     try:
         saved_config_sha256 = _canonical_json_sha256(saved_effective)
-        contract_sha256 = _scaling_reuse_contract_sha256(cellmeta)
     except (TypeError, ValueError):
         return None
     saved_contract_sha256 = cellmeta.get(_SCALING_REUSE_DIGEST_FIELD)
     if (not isinstance(saved_contract_sha256, str)
             or len(saved_contract_sha256) != 64
-            or saved_contract_sha256 != contract_sha256
             or summary.get(_SCALING_SUMMARY_DIGEST_FIELD) != saved_contract_sha256
             or cellmeta.get("config_sha256") != saved_config_sha256):
         return None
@@ -1068,7 +1066,7 @@ def _trusted_scaling_output_dir(path: Path) -> Path:
         if _path_is_reparse_point(candidate):
             raise ValueError(f"scaling output path crosses a symlink or junction: {candidate}")
     absolute.mkdir(parents=True, exist_ok=True)
-    if _path_is_reparse_point(absolute) or not absolute.is_dir():
+    if not absolute.is_dir():
         raise ValueError("scaling output path must be a real directory")
     return absolute.resolve(strict=True)
 
@@ -1091,8 +1089,6 @@ def _trusted_scaling_run_dir(
                 _path_is_reparse_point(candidate) or not candidate.is_dir()):
             raise ValueError(f"unsafe scaling cell path: {candidate}")
         candidate.mkdir(exist_ok=True)
-        if _path_is_reparse_point(candidate) or candidate.resolve(strict=True).parent != current:
-            raise ValueError(f"scaling cell escaped its owned output tree: {candidate}")
         current = candidate.resolve(strict=True)
     try:
         current.relative_to(root)

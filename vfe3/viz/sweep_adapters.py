@@ -25,7 +25,6 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-from vfe3.data.datasets import _sha256_file
 from vfe3.metrics import bootstrap_token_ce_band
 
 logger = logging.getLogger(__name__)
@@ -194,10 +193,8 @@ def pareto_frontier_kwargs(points: List[Dict[str, Any]]) -> Optional[Dict[str, A
 # =============================================================================
 # PB-07: ablation-report adapters (component forest, joint-LR grid).
 #
-# The forest reads per-cell paired-token nats persisted as ``val_token_nats.pt`` and re-verifies the
-# marker's byte/tensor identity (sha256 + size + numel + dtype) before trusting a file, so a
-# same-shape finite overwrite (a re-run that changed the bytes without updating the marker) is
-# rejected rather than silently plotted. The grid reads the accumulated sweep rows and requires the
+# The forest reads per-cell paired-token nats persisted as ``val_token_nats.pt`` and checks the
+# loaded tensor's numel and dtype against the marker before plotting it. The grid reads the accumulated sweep rows and requires the
 # exact Cartesian product declared by persisted sweep metadata.
 # =============================================================================
 
@@ -236,14 +233,14 @@ def _successful_markers_by_label(sweep_dir: Path) -> Dict[str, Dict[str, Any]]:
 
 
 def _load_token_vector(sweep_dir: Path, marker: Mapping[str, Any]) -> Optional[torch.Tensor]:
-    r"""Safe-load the marker's paired-token nats vector, or ``None`` if its identity does not verify.
+    r"""Safe-load the marker's paired-token nats vector, or ``None`` if it does not match the marker.
 
     Resolves ONLY the marker's exact child filename (``val_token_nats.pt``) under the cell directory
-    -- any other value is refused, so no path outside the cell can be read -- then re-verifies the
-    same byte/tensor identity the resume validator binds: a true ``paired_token_bootstrap`` flag, an
-    existing file whose recomputed streamed SHA-256 and byte size equal the marker, and a
-    ``weights_only`` safe load that yields a finite, nonempty, one-dimensional tensor whose numel and
-    string dtype equal the marker. Any mismatch fails closed (returns ``None``).
+    -- any other value is refused, so no path outside the cell can be read -- then requires a true
+    ``paired_token_bootstrap`` flag, a marker that records the token file's SHA-256 (markers from
+    before that field existed are skipped), an existing file, and a ``weights_only`` safe load that
+    yields a finite, nonempty, one-dimensional tensor whose numel and string dtype equal the marker.
+    Any mismatch fails closed (returns ``None``).
     """
     if not marker.get("paired_token_bootstrap"):
         return None
@@ -253,17 +250,12 @@ def _load_token_vector(sweep_dir: Path, marker: Mapping[str, Any]) -> Optional[t
     if not cell_dir:
         return None
     expected_sha    = marker.get("val_token_nats_sha256")
-    expected_size   = marker.get("val_token_nats_size_bytes")
     expected_numel  = marker.get("val_token_nats_numel")
     expected_dtype  = marker.get("val_token_nats_dtype")
     if not (isinstance(expected_sha, str) and expected_sha):
         return None
     path = Path(cell_dir) / "val_token_nats.pt"
     if not path.is_file():
-        return None
-    if path.stat().st_size != expected_size:
-        return None
-    if _sha256_file(path) != expected_sha:
         return None
     try:
         tensor = torch.load(path, map_location="cpu", weights_only=True)

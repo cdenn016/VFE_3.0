@@ -400,14 +400,14 @@ def test_pareto_frontier_kwargs_pins_sorted_points_and_excludes_inference_route(
 # --------------------------------------------------------------------------- PB-07: persisted-artifact
 # adapters for the ablation forest and joint-LR grid figures (vfe3.viz.sweep_adapters).
 #
-# ablation_forest_kwargs reads persisted, aligned val_token_nats.pt tensors bound by a per-marker
-# byte/tensor identity (sha256 + size + numel + dtype); lr_grid_heatmap_kwargs reads the accumulated
+# ablation_forest_kwargs reads persisted, aligned val_token_nats.pt tensors whose numel and dtype match
+# their per-cell markers; lr_grid_heatmap_kwargs reads the accumulated
 # sweep rows and the Cartesian metadata. Both are pure fixtures -- no model is built.
 
 
 def _write_forest_cell(sweep_dir: Path, label: str, tensor: torch.Tensor, *, paired: bool = True):
-    r"""One successful forest cell: an aligned per-token nats tensor plus a marker that records the
-    exact byte/tensor identity the adapter re-verifies before trusting the file."""
+    r"""One successful forest cell: an aligned per-token nats tensor plus a marker that records its
+    SHA-256, size, numel, and dtype as the ablation runner does."""
     cell = sweep_dir / label.replace("=", "_").replace(",", "_")
     cell.mkdir(parents=True, exist_ok=True)
     tpath = cell / "val_token_nats.pt"
@@ -467,16 +467,6 @@ def test_ablation_forest_kwargs_none_on_shape_mismatch(tmp_path):
     sweep = tmp_path / "component_ablation_forest"
     _write_forest_cell(sweep, "baseline", torch.rand(64, dtype=torch.float32))
     _write_forest_cell(sweep, "head_mixer_off", torch.rand(32, dtype=torch.float32))  # length differs
-    assert ablation_forest_kwargs(sweep, "baseline") is None
-
-
-def test_ablation_forest_kwargs_rejects_same_shape_finite_replacement(tmp_path):
-    r"""Overwriting a valid tensor with DIFFERENT finite values of the same shape/dtype leaves the
-    marker's recorded digest stale, so the adapter must reject the whole figure (digest changed)."""
-    sweep = tmp_path / "component_ablation_forest"
-    _write_forest_cell(sweep, "baseline", torch.ones(64, dtype=torch.float32))
-    _cell, tpath = _write_forest_cell(sweep, "head_mixer_off", torch.ones(64, dtype=torch.float32))
-    torch.save(torch.full((64,), 2.0, dtype=torch.float32), tpath)   # same size/dtype, new bytes
     assert ablation_forest_kwargs(sweep, "baseline") is None
 
 

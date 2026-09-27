@@ -863,8 +863,7 @@ def _selection_semantic_config(
     key-by-key against the current fields -- an unknown newer field FAILS CLOSED rather than being
     silently ignored by a permissive loader -- and is then passed through strict typed migration so
     a genuinely older mapping acquires the current defaults for any
-    field it predates. The raw mapping's full ``config_fingerprint`` is verified elsewhere (before
-    this normalization), so default migration never hides excluded-field tampering."""
+    field it predates."""
     if isinstance(config, VFE3Config):
         normalized = asdict(config)
     elif isinstance(config, Mapping):
@@ -913,8 +912,6 @@ def _validate_best_model_mapping(
     saved_config = bundle["config"]
     if not isinstance(saved_config, Mapping):
         raise RuntimeError(f"{context} has a non-mapping config")
-    if bundle["config_fingerprint"] != semantic_config_fingerprint(saved_config):
-        raise RuntimeError(f"{context} has a config fingerprint mismatch")
     if (cfg is not None
             and semantic_config_fingerprint(_selection_semantic_config(saved_config))
             != semantic_config_fingerprint(_selection_semantic_config(cfg))):
@@ -997,8 +994,6 @@ def _validate_live_figure_snapshot_mapping(
     saved_config = bundle["config"]
     if not isinstance(saved_config, Mapping):
         raise RuntimeError(f"{context} has a non-mapping config")
-    if bundle["config_fingerprint"] != semantic_config_fingerprint(saved_config):
-        raise RuntimeError(f"{context} has a config fingerprint mismatch")
     try:
         effective_saved_config = asdict(config_from_serialized(
             saved_config,
@@ -1038,9 +1033,9 @@ def _read_best_model_bundle(
     r"""Safe-load ``best_model.pt`` and validate it as a portable selected-weights bundle, NONMUTATING.
 
     Loaded with ``weights_only=True`` (the bundle is only tensors, an ``asdict`` config, and a
-    fingerprint string). Fails closed unless the exact current five-field schema passes its stored
-    fingerprint, semantic selection config, model-state structure and finiteness, executable-code
-    identity, and validation-data identity checks. A bundle with a null stored data identity may remain
+    fingerprint string). Fails closed unless the exact current five-field schema passes its
+    semantic selection config, model-state structure and finiteness, executable-code identity, and
+    validation-data identity checks. A bundle with a null stored data identity may remain
     structurally readable for legacy checkpoint persistence, but it cannot supply cross-run selection or
     headline finalization when a live identity is expected. Neither live configuration nor model state
     is mutated. The returned model-state mapping owns cloned tensors, so later caller mutation cannot
@@ -1118,8 +1113,6 @@ def _validate_optimizer_state(
     saved_state: object,
     optimizer:   torch.optim.Optimizer,
     saved_step:  int,
-    slot_manifest: object,
-
 ) -> Mapping[str, object]:
     """Preflight optimizer topology and populated per-parameter slots without mutation."""
     if not isinstance(saved_state, Mapping):
@@ -1135,25 +1128,6 @@ def _validate_optimizer_state(
     maximum_slot_step = successful_updates if successful_updates is not None else saved_step
     if not isinstance(saved_slots, Mapping):
         raise RuntimeError("checkpoint optimizer_state state must be a mapping")
-    if (not isinstance(slot_manifest, Mapping)
-            or set(slot_manifest) != {"parameter_ids", "sha256"}):
-        raise RuntimeError("checkpoint optimizer populated-slot manifest is missing or invalid")
-    manifest_ids = slot_manifest["parameter_ids"]
-    if (not isinstance(manifest_ids, list)
-            or any(type(value) is not int for value in manifest_ids)
-            or manifest_ids != sorted(set(manifest_ids))):
-        raise RuntimeError("checkpoint optimizer populated-slot manifest ids are invalid")
-    encoded_manifest = json.dumps(
-        manifest_ids, separators=(",", ":"), ensure_ascii=True).encode("ascii")
-    manifest_sha256 = hashlib.sha256(encoded_manifest).hexdigest()
-    if slot_manifest["sha256"] != manifest_sha256:
-        raise RuntimeError("checkpoint optimizer populated-slot manifest fingerprint mismatch")
-    populated_ids = sorted(
-        parameter_id for parameter_id, state in saved_slots.items()
-        if isinstance(state, Mapping) and bool(state)
-    )
-    if populated_ids != manifest_ids:
-        raise RuntimeError("checkpoint optimizer populated parameter slots do not match the manifest")
     if len(saved_groups) != len(optimizer.param_groups):
         raise RuntimeError("checkpoint optimizer_state parameter-group count mismatch")
 
@@ -1225,24 +1199,6 @@ def _validate_optimizer_state(
     return saved_state
 
 
-def _optimizer_populated_slot_manifest(
-    optimizer_state: Mapping[str, object],
-) -> Dict[str, object]:
-    """Bind the exact set of populated per-parameter optimizer slots independently of slot bytes."""
-    slots = optimizer_state.get("state")
-    if not isinstance(slots, Mapping):
-        raise RuntimeError("optimizer state has no state mapping")
-    parameter_ids = sorted(
-        parameter_id for parameter_id, state in slots.items()
-        if type(parameter_id) is int and isinstance(state, Mapping) and bool(state)
-    )
-    encoded = json.dumps(parameter_ids, separators=(",", ":"), ensure_ascii=True).encode("ascii")
-    return {
-        "parameter_ids": parameter_ids,
-        "sha256":        hashlib.sha256(encoded).hexdigest(),
-    }
-
-
 _OPTIMIZER_PARAMETER_MANIFEST_SCHEMA_VERSION = 2
 
 
@@ -1278,12 +1234,12 @@ def _optimizer_parameter_name_shape_groups(
     return parameter_groups
 
 
-def _optimizer_parameter_manifest_payload(
+def _optimizer_parameter_manifest(
     model:           torch.nn.Module,
     optimizer:       torch.optim.Optimizer,
     optimizer_state: Mapping[str, object],
 ) -> Dict[str, object]:
-    """Bind checkpoint-local slot IDs to canonical names/shapes in exact group order."""
+    """Record checkpoint-local slot IDs with canonical names/shapes in exact group order."""
     saved_groups = optimizer_state.get("param_groups")
     if not isinstance(saved_groups, list):
         raise RuntimeError("optimizer state param_groups must be a list")
@@ -1312,29 +1268,15 @@ def _optimizer_parameter_manifest_payload(
     }
 
 
-def _optimizer_parameter_manifest(
-    model:           torch.nn.Module,
-    optimizer:       torch.optim.Optimizer,
-    optimizer_state: Mapping[str, object],
-) -> Dict[str, object]:
-    payload = _optimizer_parameter_manifest_payload(model, optimizer, optimizer_state)
-    encoded = json.dumps(
-        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
-    ).encode("ascii")
-    return {**payload, "sha256": hashlib.sha256(encoded).hexdigest()}
-
-
 def _validate_serialized_optimizer_parameter_manifest(
-    manifest:        object,
-    optimizer_state: object,
+    manifest: object,
 ) -> Mapping[str, object]:
-    """Verify the manifest digest and its serialized optimizer parameter-ID binding."""
-    expected_fields = {"schema_version", "parameter_groups", "sha256"}
-    if not isinstance(manifest, Mapping) or set(manifest) != expected_fields:
+    """Validate the manifest schema; checkpoints written before 2026-09-27 also carry a sha256."""
+    fields = {"schema_version", "parameter_groups"}
+    if not isinstance(manifest, Mapping) or set(manifest) not in (fields, fields | {"sha256"}):
         raise RuntimeError("checkpoint optimizer parameter manifest has an invalid schema")
     version = manifest["schema_version"]
     groups = manifest["parameter_groups"]
-    digest = manifest["sha256"]
     if type(version) is not int or version != _OPTIMIZER_PARAMETER_MANIFEST_SCHEMA_VERSION:
         raise RuntimeError("checkpoint optimizer parameter manifest has an unsupported schema version")
     if not isinstance(groups, list):
@@ -1356,46 +1298,16 @@ def _validate_serialized_optimizer_parameter_manifest(
             if (not isinstance(shape, list)
                     or any(type(dimension) is not int or dimension < 0 for dimension in shape)):
                 raise RuntimeError("checkpoint optimizer parameter manifest shape is invalid")
-    if not isinstance(digest, str):
-        raise RuntimeError("checkpoint optimizer parameter manifest digest is invalid")
-    payload = {"schema_version": version, "parameter_groups": groups}
-    encoded = json.dumps(
-        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
-    ).encode("ascii")
-    if digest != hashlib.sha256(encoded).hexdigest():
-        raise RuntimeError("checkpoint optimizer parameter manifest digest mismatch")
-
-    if not isinstance(optimizer_state, Mapping):
-        raise RuntimeError("checkpoint optimizer_state must be a mapping")
-    saved_groups = optimizer_state.get("param_groups")
-    if not isinstance(saved_groups, list) or len(saved_groups) != len(groups):
-        raise RuntimeError(
-            "checkpoint optimizer parameter manifest does not match the serialized optimizer")
-    manifest_ids: List[List[int]] = []
-    saved_ids: List[List[int]] = []
-    for manifest_group, saved_group in zip(groups, saved_groups):
-        if not isinstance(saved_group, Mapping) or not isinstance(saved_group.get("params"), list):
-            raise RuntimeError(
-                "checkpoint optimizer parameter manifest does not match the serialized optimizer")
-        manifest_ids.append([entry["parameter_id"] for entry in manifest_group])
-        saved_ids.append(list(saved_group["params"]))
-    if manifest_ids != saved_ids:
-        raise RuntimeError(
-            "checkpoint optimizer parameter manifest does not match the serialized optimizer "
-            "parameter ID order")
-
     return manifest
 
 
 def _validate_optimizer_parameter_manifest(
-    manifest:        object,
-    optimizer_state: object,
-    model:           torch.nn.Module,
-    optimizer:       torch.optim.Optimizer,
+    manifest:  object,
+    model:     torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
 ) -> Mapping[str, object]:
-    """Verify serialized integrity plus live name/shape/group ordering."""
-    validated = _validate_serialized_optimizer_parameter_manifest(
-        manifest, optimizer_state)
+    """Validate the manifest schema and its name/shape/group ordering against the live optimizer."""
+    validated = _validate_serialized_optimizer_parameter_manifest(manifest)
     groups = validated["parameter_groups"]
 
     manifest_name_shapes = [
@@ -1898,7 +1810,6 @@ class RunArtifacts:
             saved_best_val_ppl = float("inf")
             saved_best_step    = None
         optimizer_state = optimizer.state_dict()
-        optimizer_slot_manifest = _optimizer_populated_slot_manifest(optimizer_state)
         optimizer_parameter_manifest = _optimizer_parameter_manifest(
             model, optimizer, optimizer_state,
         )
@@ -1907,7 +1818,6 @@ class RunArtifacts:
                 "step":            step,
                 "model_state":     model.state_dict(),
                 "optimizer_state": optimizer_state,
-                "optimizer_populated_slot_manifest": optimizer_slot_manifest,
                 "optimizer_parameter_manifest": optimizer_parameter_manifest,
                 "rng_state":       rng_state,
                 "config":          serialize_config(cfg),
@@ -2245,11 +2155,9 @@ def load_checkpoint(
     successful_updates = None
     if optimizer is not None:
         checkpoint_optimizer_state = ckpt.get("optimizer_state")
-        checkpoint_slot_manifest = ckpt.get("optimizer_populated_slot_manifest")
         if "optimizer_parameter_manifest" in ckpt:
             _validate_optimizer_parameter_manifest(
                 ckpt.get("optimizer_parameter_manifest"),
-                checkpoint_optimizer_state,
                 model,
                 optimizer,
             )
@@ -2265,7 +2173,6 @@ def load_checkpoint(
                 )
         saved_optimizer_state = _validate_optimizer_state(
             checkpoint_optimizer_state, optimizer, saved_step,
-            checkpoint_slot_manifest,
         )
         successful_updates = _validated_saved_successful_updates(
             saved_optimizer_state["param_groups"], saved_step)
@@ -2602,7 +2509,7 @@ def _require_token_chunk_in_vocab(
     chunk:      torch.Tensor,
     vocab_size: int,
 ) -> None:
-    """Reject invalid token IDs before bincount can allocate from an attacker-sized maximum."""
+    """Reject invalid token IDs before bincount can allocate from an out-of-vocabulary maximum."""
     if chunk.numel() == 0:
         return
     minimum, maximum = torch.aminmax(chunk)

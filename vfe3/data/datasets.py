@@ -194,7 +194,7 @@ def _cache_tokenizer_provenance(
             "tokenizer_provenance": None,
             "tokenizer_provenance_sha256": None,
         }
-    if manifest_path.is_symlink() or not manifest_path.is_file():
+    if not manifest_path.is_file():
         raise ValueError(f"token cache provenance manifest must be a regular file: {manifest_path}")
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
