@@ -74,7 +74,9 @@ def _fast_figures(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _tiny_run(root: Path, name: str = "tiny", **over) -> Tuple[Path, VFEModel]:
     options = dict(vocab_size=V, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=2, e_phi_lr=0.0,
-                   attention_mode="projected_predictive")
+                   attention_mode="projected_predictive",
+                   norm_type_block="none", layernorm_affine=False,           # pinned: independent of
+                   skip_belief_sigma_update=False)                           # the config defaults
     options.update(over)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")

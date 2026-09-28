@@ -39,7 +39,8 @@ def _cfg(route: str = "conditional", **overrides: Any) -> VFE3Config:
         n_layers=2, n_e_steps=1, warmup_steps=0, max_steps=12, log_interval=0, eval_interval=0,
         checkpoint_interval=0, skip_belief_sigma_update=True, e_phi_lr=0.0,
         oracle_unroll_grad=True, generate_embedding_figures=False, pos_phi="learned",
-        use_block_mlp=True, block_mlp_expansion=1, beta_attention_prior="causal_alibi")
+        use_block_mlp=True, block_mlp_expansion=1, beta_attention_prior="causal_alibi",
+        norm_type_block="none", layernorm_affine=False)      # pinned: independent of the config defaults
     if route == "conditional":
         values.update(family="gaussian_diagonal", gauge_group="block_glk",
                       attention_mode="projected_predictive", attention_residual=True,
