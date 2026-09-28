@@ -30,6 +30,9 @@ viz = [
 [tool.setuptools.packages.find]
 include = ["vfe3", "vfe3.*"]
 
+[tool.setuptools.package-data]
+"vfe3.semantics" = ["resources/*.json"]      # curated lexicon / relations read by vfe3.semantics.resources
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --strict-config --strict-markers"
