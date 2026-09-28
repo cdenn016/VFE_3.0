@@ -448,7 +448,9 @@ def project_phi_parameter_rows_(
 
     Projection rescales algebra coordinates along their current ray and deliberately leaves
     optimizer moments unchanged. It covers belief token frames, independent model-channel frames,
-    and the learned positional table when present.
+    and the learned positional table when present. A table frozen by design (``requires_grad=False``,
+    e.g. the zero token frames under ``gauge_transport='off'``) is never stepped, so it is skipped:
+    neither checked nor counted in ``count_out`` or the returned row totals.
 
     ``count_out`` (training counters, 2026-09-28): when given, the number of rows this call
     rescales (scale :math:`< 1`) and the number of rows it checks are added to ``count_out[0]`` and
@@ -474,7 +476,7 @@ def project_phi_parameter_rows_(
     unique = []
     seen = set()
     for table in tables:
-        if table is not None and id(table) not in seen:
+        if table is not None and table.requires_grad and id(table) not in seen:
             unique.append(table)
             seen.add(id(table))
 

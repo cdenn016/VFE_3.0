@@ -246,11 +246,32 @@ def load_config(
     Strict :func:`vfe3.config.config_from_serialized` first; when that refuses fields this build no
     longer declares and ``drop_unknown_config_fields`` is set, the lenient loader drops them and
     returns them. A config that still cannot be built yields ``(None, "failed: ...", {})``: the
-    assemblers then read the raw saved values only.
+    assemblers then read the raw saved values only. A config tagged with another ``model_family``
+    (the conventional baseline, ``'conventional_transformer'``) is built by that family's loader
+    (:func:`vfe3.baseline.baseline_config_from_serialized`), with the same strict-then-lenient rule.
     """
     import warnings
 
     from vfe3.config import config_from_serialized
+    from vfe3.contracts import VFE_MODEL_FAMILY, model_family_of
+
+    family = model_family_of(config_raw)
+    if family != VFE_MODEL_FAMILY:
+        try:
+            from vfe3.baseline import MODEL_FAMILY, baseline_config_from_serialized
+            if family != MODEL_FAMILY:
+                raise ValueError(f"unknown model_family {family!r}")
+            try:
+                cfg, _ = baseline_config_from_serialized(dict(config_raw), source=source)
+                return cfg, "strict", {}
+            except ValueError:
+                if not drop_unknown_config_fields:
+                    raise
+                cfg, dropped = baseline_config_from_serialized(
+                    dict(config_raw), source=source, drop_unknown_config_fields=True)
+                return cfg, "lenient", dict(dropped)
+        except Exception as exc:                              # noqa: BLE001 - any refusal
+            return None, f"failed: {type(exc).__name__}: {exc}", {}
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")                       # construction warnings are not ours
         try:
@@ -571,13 +592,28 @@ def latest_training_checkpoint(run: RunRecord) -> Optional[Path]:
     return max(found)[1] if found else None
 
 
+def _parameter_cfg_like(run: RunRecord) -> SimpleNamespace:
+    r"""The config fields the parameter breakdown reads (family, vocabulary, decode, frozen tables)."""
+    return SimpleNamespace(
+        model_family=run.value("model_family", "vfe") or "vfe",
+        vocab_size=run.value("vocab_size"),
+        decode_mode=run.value("decode_mode"),
+        gauge_transport=run.value("gauge_transport", "on"),
+        decode_temperature_learned=run.value("decode_temperature_learned", True),
+    )
+
+
 def parameter_counts(run: RunRecord, *, read_checkpoints: bool = True) -> Dict[str, Any]:
-    r"""Parameter breakdown by role (:func:`vfe3.run_resources.parameter_breakdown`).
+    r"""Parameter breakdown by role (:func:`vfe3.run_resources.parameter_breakdown`), trainable only.
 
     Sources in order: ``resources.json``, ``posthoc.json`` (``resources.parameter_breakdown``), the
     breakdown of ``final_model.pt`` read memory-mapped (shapes only), and finally the total alone from
-    ``summary.json n_params``. Returns the breakdown sections plus ``source`` (None when nothing is
-    recorded).
+    ``summary.json`` (``n_params_trainable``, else ``n_params``). Returns the breakdown sections plus
+    ``source`` (None when nothing is recorded). Tables the config freezes by design
+    (``requires_grad=False``: the token and positional frames under ``gauge_transport`` ``'off'`` or
+    ``'frozen'``) are excluded from every section and from ``total`` and listed under ``frozen``; a
+    breakdown recorded before that section existed is recomputed from its recorded shapes
+    (:func:`vfe3.run_resources.exclude_frozen_from_breakdown`).
     """
     if "parameter_counts" in run._cache:
         return run._cache["parameter_counts"]
@@ -588,20 +624,32 @@ def parameter_counts(run: RunRecord, *, read_checkpoints: bool = True) -> Dict[s
         if isinstance(candidate, Mapping) and _is_int(candidate.get("total")):
             breakdown, source = candidate, name
             break
+    if breakdown is not None:
+        try:
+            from vfe3.run_resources import exclude_frozen_from_breakdown
+            corrected = exclude_frozen_from_breakdown(breakdown, _parameter_cfg_like(run))
+            if corrected is not None:
+                breakdown = corrected
+                source = f"{source} (frozen tables excluded from its recorded shapes)"
+        except Exception as exc:                              # noqa: BLE001 - recorded, not raised
+            run.notes.append(f"frozen-table correction of the {source} breakdown failed: {exc!r}")
     if breakdown is None and read_checkpoints and (run.run_dir / "final_model.pt").is_file():
         try:
             from vfe3.posthoc.maps import load_map_state
-            from vfe3.run_resources import parameter_breakdown
+            from vfe3.run_resources import frozen_parameter_names, parameter_breakdown
             state, _ = load_map_state(run.run_dir / "final_model.pt")
-            cfg_like = SimpleNamespace(vocab_size=run.value("vocab_size"),
-                                       decode_mode=run.value("decode_mode"))
-            breakdown = parameter_breakdown(state, cfg_like)
+            cfg_like = _parameter_cfg_like(run)
+            breakdown = parameter_breakdown(state, cfg_like,
+                                            frozen=frozen_parameter_names(cfg_like, state.keys()))
             source = "final_model.pt (vfe3.run_resources.parameter_breakdown)"
         except Exception as exc:                              # noqa: BLE001 - recorded, not raised
             run.notes.append(f"parameter breakdown from final_model.pt failed: {exc!r}")
     out: Dict[str, Any] = {"source": source}
     if breakdown is not None:
         out.update({key: value for key, value in breakdown.items() if key != "roles_by_name"})
+    elif _is_int(run.summary.get("n_params_trainable")):
+        out.update(total=int(run.summary["n_params_trainable"]),
+                   source="summary.json n_params_trainable (total only)")
     elif _is_int(run.summary.get("n_params")):
         out.update(total=int(run.summary["n_params"]), source="summary.json n_params (total only)")
     run._cache["parameter_counts"] = out

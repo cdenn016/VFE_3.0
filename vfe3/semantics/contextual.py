@@ -380,6 +380,10 @@ def _readout(model: Any, mu: torch.Tensor, sigma: torch.Tensor, canonical_frame:
     """
     with torch.no_grad():
         if model.final_norm is not None:
+            if getattr(model.cfg, "block_coordinates", "local") == "reference":
+                # forward_beliefs applies U FN(U^{-1} .) there; this replay has no frame to do so.
+                raise NotImplementedError("logit lens replay of a final norm under "
+                                          "block_coordinates='reference' is not supported")
             mu = model.final_norm(mu, sigma)
         return model._decode_belief_with_context(mu, sigma, canonical_frame=canonical_frame)
 

@@ -265,3 +265,182 @@ def test_canonical_frame_is_not_invariant_to_a_generic_right_frame_change():
     changed = mlp.forward_moments(mu, sigma, frame_context=changed_context)
 
     assert not torch.allclose(changed.mu, base.mu, atol=1e-9, rtol=1e-9)
+
+
+# Diagonal covariance layout of the gauge gate (M2 intertwiner arm, 2026-09-28). The gate reads
+# sigma (..., K) = diag Sigma and s_b = sum_{k in b} mu_k^2 / sigma_k.
+
+
+def _diagonal_gate(irrep_dims, *, seed, covariance_contract="passthrough"):
+    r"""A float64 gate with a nonzero, nonlinear response: fc1 columns scaled by 1/d_b since s_b ~ d_b."""
+    torch.manual_seed(seed)
+    mlp = GaugeGateBlockMLP(
+        irrep_dims=irrep_dims, expansion=2, activation="gelu", dropout=0.0,
+        covariance_contract=covariance_contract,
+    ).double()
+    with torch.no_grad():
+        mlp.fc1.weight.normal_(0.0, 1.0).div_(torch.tensor(irrep_dims, dtype=torch.float64))
+        mlp.fc2.weight.normal_(0.0, 0.3)
+        mlp.fc2.bias.normal_(0.0, 0.1)
+    return mlp
+
+
+def _diagonal_state(batch_shape, dim):
+    mu = torch.randn(*batch_shape, dim, dtype=torch.float64)
+    sigma = torch.empty(*batch_shape, dim, dtype=torch.float64).uniform_(0.5, 2.0)
+    return mu, sigma
+
+
+def _orthogonal_times_scale(batch_shape, dim):
+    r"""Q diag(exp u) with Q orthogonal and u ~ U(-0.7, 0.7), so cond <= e^{1.4}."""
+    q, _ = torch.linalg.qr(torch.randn(*batch_shape, dim, dim, dtype=torch.float64))
+    scale = torch.empty(*batch_shape, dim, dtype=torch.float64).uniform_(-0.7, 0.7).exp()
+    return q * scale.unsqueeze(-2)
+
+
+def _block_frame(batch_shape, irrep_dims):
+    r"""g = (+)_b g_b in prod_b GL(d_b), each g_b = Q_b diag(exp u_b)."""
+    dim = sum(irrep_dims)
+    g = torch.zeros(*batch_shape, dim, dim, dtype=torch.float64)
+    start = 0
+    for block_dim in irrep_dims:
+        stop = start + block_dim
+        g[..., start:stop, start:stop] = _orthogonal_times_scale(batch_shape, block_dim)
+        start = stop
+    return g
+
+
+def _matvec(matrix, vector):
+    return (matrix @ vector.unsqueeze(-1)).squeeze(-1)
+
+
+def _block_sums(values, irrep_dims):
+    return torch.stack([chunk.sum(dim=-1) for chunk in values.split(list(irrep_dims), dim=-1)], dim=-1)
+
+
+@pytest.mark.parametrize("irrep_dims", [(2, 2), (3, 1, 2)])
+def test_diagonal_gate_equals_the_full_gate_on_diag_embed(irrep_dims):
+    mlp = _diagonal_gate(irrep_dims, seed=61)
+    mu, sigma = _diagonal_state((2, 3), sum(irrep_dims))
+
+    s_diagonal = mlp._invariants(mu, sigma)[0]
+    s_full = mlp._invariants(mu, torch.diag_embed(sigma))[0]
+    diagonal = mlp.forward_moments(mu, sigma)
+    full = mlp.forward_moments(mu, torch.diag_embed(sigma))
+
+    torch.testing.assert_close(
+        s_diagonal, _block_sums(mu.square() / sigma, irrep_dims), rtol=1e-14, atol=1e-14)
+    torch.testing.assert_close(s_diagonal, s_full, rtol=1e-13, atol=1e-13)
+    torch.testing.assert_close(diagonal.mu, full.mu, rtol=1e-13, atol=1e-13)
+    assert diagonal.sigma is sigma and diagonal.jacobian is None
+    assert not torch.allclose(diagonal.mu, mu)          # the gate is not trivially the identity here
+
+
+@pytest.mark.parametrize("irrep_dims", [(2, 2), (3, 1, 2), (32, 32)])
+def test_diagonal_gate_is_covariant_under_the_block_frame_group(irrep_dims):
+    r"""gate_full(g mu, g diag(sigma) g^T) = g gate_diag(mu, sigma) for g in prod_b GL(d_b)."""
+    mlp = _diagonal_gate(irrep_dims, seed=62)
+    mu, sigma = _diagonal_state((3,), sum(irrep_dims))
+    g = _block_frame((3,), irrep_dims)
+
+    base = mlp.forward_moments(mu, sigma)
+    moved = mlp.forward_moments(_matvec(g, mu), _congruence(g, torch.diag_embed(sigma)))
+
+    torch.testing.assert_close(moved.mu, _matvec(g, base.mu), rtol=1e-10, atol=1e-10)
+
+
+def test_diagonal_gate_is_not_covariant_under_a_dense_frame():
+    r"""Negative control: a dense GL(K) change mixes the blocks, so s_b is not invariant."""
+    irrep_dims = (2, 2)
+    mlp = _diagonal_gate(irrep_dims, seed=62)
+    mu, sigma = _diagonal_state((3,), sum(irrep_dims))
+    g = _orthogonal_times_scale((3,), sum(irrep_dims))
+
+    base = mlp.forward_moments(mu, sigma)
+    moved = mlp.forward_moments(_matvec(g, mu), _congruence(g, torch.diag_embed(sigma)))
+
+    assert (moved.mu - _matvec(g, base.mu)).abs().max() > 1e-3
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_fresh_diagonal_gate_is_exactly_the_identity(dtype):
+    torch.manual_seed(63)
+    mlp = GaugeGateBlockMLP(
+        irrep_dims=(2, 2), expansion=2, activation="gelu", dropout=0.0,
+        covariance_contract="passthrough",
+    ).to(dtype)
+    mu = torch.randn(2, 3, 4, dtype=dtype)
+    sigma = torch.rand(2, 3, 4, dtype=dtype) + 0.5
+
+    out = mlp.forward_moments(mu, sigma)
+
+    assert torch.equal(out.mu, mu)
+    assert out.sigma is sigma
+
+
+def test_reference_coordinate_invariant_equals_the_local_diagonal_invariant():
+    r"""xi_b^T (C_bb)^{-1} xi_b = mu_b^T Sigma_bb^{-1} mu_b for xi = U^{-1} mu, C = U^{-1} Sigma U^{-T}."""
+    irrep_dims = (3, 1, 2)
+    mlp = _diagonal_gate(irrep_dims, seed=64)
+    mu, sigma = _diagonal_state((2, 3), sum(irrep_dims))
+    frame = _block_frame((2, 3), irrep_dims)
+    frame_inverse = torch.linalg.inv(frame)
+    xi = _matvec(frame_inverse, mu)
+    C = _congruence(frame_inverse, torch.diag_embed(sigma))
+
+    torch.testing.assert_close(
+        mlp._invariants(xi, C)[0], mlp._invariants(mu, sigma)[0], rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(
+        _matvec(frame, mlp.forward_moments(xi, C).mu),
+        mlp.forward_moments(mu, sigma).mu, rtol=1e-10, atol=1e-10)
+
+
+def test_diagonal_layout_rejects_delta_full_in_the_module_and_the_config():
+    mlp = _diagonal_gate((2, 2), seed=65, covariance_contract="delta_full")
+    mu, sigma = _diagonal_state((3,), 4)
+
+    with pytest.raises(ValueError, match="delta_full"):
+        mlp.forward_moments(mu, sigma)
+    assert mlp.forward_moments(mu, torch.diag_embed(sigma)).jacobian is not None
+
+    from vfe3.config import VFE3Config
+
+    with pytest.raises(ValueError, match="delta_full"):
+        VFE3Config(
+            vocab_size=17, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1, n_e_steps=1,
+            e_phi_lr=0.0, family="gaussian_diagonal", decode_mode="linear",
+            use_block_mlp=True, block_mlp_mode="gauge_gate", block_mlp_covariance="delta_full",
+            norm_type_block="none", layernorm_affine=False, skip_belief_sigma_update=False,
+        )
+
+
+def test_diagonal_invariants_are_evaluated_in_at_least_float32():
+    mlp = GaugeGateBlockMLP(
+        irrep_dims=(2, 2), expansion=1, activation="gelu", dropout=0.0,
+        covariance_contract="passthrough",
+    )
+    torch.manual_seed(66)
+    mu = torch.randn(5, 4).bfloat16()
+    sigma = (torch.rand(5, 4) + 0.5).bfloat16()
+
+    s = mlp._invariants(mu, sigma)[0]
+
+    mu32, sigma32 = mu.float(), sigma.float()
+    assert s.dtype == torch.float32
+    torch.testing.assert_close(s, _block_sums(mu32 * (mu32 / sigma32), (2, 2)))
+
+
+def test_diagonal_gate_gradients_match_finite_differences_including_sigma():
+    r"""gradcheck in (mu, sigma); the sigma channel ds_b/dsigma_k = -mu_k^2 / sigma_k^2 is new."""
+    irrep_dims = (2, 1)
+    mlp = _diagonal_gate(irrep_dims, seed=67)
+    mu, sigma = _diagonal_state((2,), sum(irrep_dims))
+    mu.requires_grad_(True)
+    sigma.requires_grad_(True)
+
+    assert torch.autograd.gradcheck(
+        lambda mu_in, sigma_in: mlp.forward_moments(mu_in, sigma_in).mu, (mu, sigma))
+    mlp.forward_moments(mu, sigma).mu.square().sum().backward()
+    assert sigma.grad.abs().sum() > 0
+    for name, parameter in mlp.named_parameters():
+        assert parameter.grad is not None and torch.isfinite(parameter.grad).all(), name

@@ -1,22 +1,28 @@
 r"""Build the WORD-level WikiText-103 token cache consumed by ``vfe3.data.datasets``.
 
-Produces, in the shared cache directory:
+Produces, in the shared cache directory, for ``DATASET`` (``wikitext-103-word`` or
+``wikitext-103-word-eos``):
 
-  ``wikitext-103-word_{train,validation,test}_word_tokens.pt``   int64 id streams
-  ``..._tokens.pt.meta.json``                                    per-split build provenance
-  ``wikitext-103-word_word_vocab.json``                          the id-to-word table
+  ``{DATASET}_{train,validation,test}_word_tokens.pt``   int64 id streams
+  ``..._tokens.pt.meta.json``                            per-split build provenance
+  ``{DATASET}_word_vocab.json``                          the id-to-word table
 
 The run is source-bound: the corpus revision is pinned, and the tokenizer code is hashed into the
 sidecar, so a cache that was produced by different code or a different revision is detectable.
 
 Vocabulary (see :mod:`vfe3.data.word_vocab`): every whitespace token type observed in the TRAIN
 split, ordered by descending frequency then lexicographically, with ``<unk>`` reserved at id 0.
-That reproduces the benchmark's quoted 267,735 (= 267,734 observed types + ``<unk>``); the builder
-asserts the count so a preprocessing drift fails loudly rather than silently re-indexing every
-embedding table. ``MIN_COUNT`` raises the cutoff to trade OOV for a smaller ``phi_embed``.
+For ``wikitext-103-word`` that is 267,734 ids (the 267,734 observed types, ``<unk>`` among them).
+``wikitext-103-word-eos`` appends one ``<eos>`` to every row, blank rows included, and fixes it at
+id 1; that is the published WikiText-103 stream, vocabulary 267,735 and 103,227,021 / 217,646 /
+245,569 tokens. A reference build asserts the vocabulary size (and, for the ``<eos>`` stream, the
+three token counts) before anything is written, so a preprocessing drift fails loudly rather than
+silently re-indexing every embedding table. ``MIN_COUNT`` raises the cutoff to trade OOV for a
+smaller ``phi_embed``.
 
-Click-to-run: edit the constants below (``MIN_COUNT``, ``CACHE_DIR``, ``FORCE``) and run the file.
-``MIN_COUNT = DEFAULT_MIN_COUNT`` is the reference build; ``MIN_COUNT = 3`` a capped vocabulary.
+Click-to-run: edit the constants below (``DATASET``, ``MIN_COUNT``, ``CACHE_DIR``, ``FORCE``) and run
+the file. ``MIN_COUNT = DEFAULT_MIN_COUNT`` is the reference build; ``MIN_COUNT = 3`` a capped
+vocabulary.
 Every split target is checked for existence before anything is written, so a refused rerun leaves
 the existing caches and their vocabulary untouched. Each split's metadata and token cache are
 published atomically, and the vocabulary sidecar is published LAST, so an interrupted build can leave
@@ -41,20 +47,25 @@ import torch
 from vfe3.data.datasets import cache_path, default_cache_dir
 from vfe3.data.word_vocab import (
     DEFAULT_MIN_COUNT,
-    REFERENCE_VOCAB_SIZE,
+    REFERENCE_N_TOKENS_EOS,
+    WORD_DATASET,
+    WORD_EOS_DATASET,
     WordVocabulary,
+    appends_eos,
     count_tokens,
+    reference_vocab_size,
     tokenize_row,
     vocabulary_from_counts,
     vocabulary_path,
 )
 
 # ---- click-to-run settings --------------------------------------------------------------------
+DATASET: str = WORD_DATASET               # "wikitext-103-word" | "wikitext-103-word-eos" (published stream)
 MIN_COUNT: int = DEFAULT_MIN_COUNT        # keep types occurring STRICTLY MORE than this many times
 CACHE_DIR: Optional[Path] = None          # None -> ~/.cache/tokenized_cache
 FORCE: bool = False                       # True overwrites existing token caches
 
-DATASET = "wikitext-103-word"
+WORD_DATASETS = (WORD_DATASET, WORD_EOS_DATASET)
 DATASET_ID = "Salesforce/wikitext"
 DATASET_CONFIG = "wikitext-103-v1"
 DATASET_REVISION = "6231e49f19a707241d6b84d9cff60a3a86b85a85"
@@ -103,11 +114,12 @@ def _read_rows(file_name: str) -> List[str]:
     return table.column("text").to_pylist()
 
 
-def _count_split_tokens(split: str) -> "tuple[int, int, int, object]":
+def _count_split_tokens(split: str, *, eos: bool = False) -> "tuple[int, int, int, object]":
     r"""Count tokens and characters for ``split`` one parquet object at a time.
 
-    Returns ``(n_rows, n_tokens, n_chars, counts)``. Streaming per object keeps the peak memory at
-    one shard's rows: the full training split is 1.8M rows and ~535M characters.
+    Returns ``(n_rows, n_tokens, n_chars, counts)``; with ``eos`` every row contributes one
+    ``<eos>``. Streaming per object keeps the peak memory at one shard's rows: the full training
+    split is 1.8M rows and ~535M characters.
     """
     from collections import Counter
 
@@ -117,7 +129,7 @@ def _count_split_tokens(split: str) -> "tuple[int, int, int, object]":
         rows = _read_rows(file_name)
         n_rows += len(rows)
         n_chars += sum(len(row) for row in rows)
-        shard_counts = count_tokens(rows)
+        shard_counts = count_tokens(rows, eos=eos)
         counts += shard_counts
         n_tokens += sum(shard_counts.values())
         del rows
@@ -125,19 +137,21 @@ def _count_split_tokens(split: str) -> "tuple[int, int, int, object]":
 
 
 def _encode_split(split: str, vocabulary: WordVocabulary) -> np.ndarray:
-    r"""Encode ``split`` into one flat int64 array, shard by shard.
+    r"""Encode ``split`` into one flat int64 array, shard by shard (rows end in ``<eos>`` when the
+    vocabulary is an ``<eos>`` vocabulary).
 
     Each parquet object becomes its own array, concatenated at the end, so nothing holds more than
     one shard's rows plus the finished stream.
     """
+    eos = vocabulary.eos
     shards = []
     for file_name in SPLIT_FILES[split]:
         rows = _read_rows(file_name)
-        n_tokens = sum(len(tokenize_row(row)) for row in rows)
+        n_tokens = sum(len(tokenize_row(row, eos=eos)) for row in rows)
         out = np.empty(n_tokens, dtype=np.int64)
         cursor = 0
         for row in rows:
-            tokens = tokenize_row(row)
+            tokens = tokenize_row(row, eos=eos)
             if tokens:
                 ids = vocabulary.encode(tokens)
                 out[cursor:cursor + len(ids)] = ids
@@ -166,39 +180,63 @@ def build(
     min_count: int = DEFAULT_MIN_COUNT,
     cache_dir: Path | None = None,
     force: bool = False,
+    dataset: Optional[str] = None,
 ) -> Dict[str, object]:
-    r"""Build the vocabulary and every split's token cache; return a provenance summary."""
+    r"""Build the vocabulary and every split's token cache; return a provenance summary.
+
+    ``dataset`` (default: the module-level ``DATASET``) is ``wikitext-103-word`` or
+    ``wikitext-103-word-eos``; the latter ends every row in ``<eos>`` (id 1).
+    """
+    dataset = DATASET if dataset is None else dataset
+    if dataset not in WORD_DATASETS:
+        raise SystemExit(f"DATASET={dataset!r} is not a word dataset; expected one of {WORD_DATASETS}")
+    eos = appends_eos(dataset)
     root = default_cache_dir() if cache_dir is None else Path(cache_dir)
     root.mkdir(parents=True, exist_ok=True)
 
     # Refuse BEFORE writing anything: a rerun at a different cutoff must not replace the vocabulary
     # sidecar that the existing caches' ids are defined against.
-    targets = {split: cache_path(DATASET, split, suffix="pt", cache_dir=root) for split in SPLIT_FILES}
+    targets = {split: cache_path(dataset, split, suffix="pt", cache_dir=root) for split in SPLIT_FILES}
     existing = [str(target) for target in targets.values() if target.exists()]
     if existing and not force:
         raise SystemExit(f"{', '.join(existing)} already exists; set FORCE = True to rebuild")
 
-    print(f"[1/3] counting training tokens (min_count={min_count}) ...", flush=True)
-    n_train_rows, n_train_tokens, n_train_chars, counts = _count_split_tokens("train")
+    print(f"[1/3] counting training tokens (dataset={dataset}, min_count={min_count}) ...", flush=True)
+    n_train_rows, n_train_tokens, n_train_chars, counts = _count_split_tokens("train", eos=eos)
     print(f"      train rows={n_train_rows:,} tokens={n_train_tokens:,} "
           f"chars={n_train_chars:,} types={len(counts):,}", flush=True)
 
-    words = vocabulary_from_counts(counts, min_count=min_count)
-    vocabulary = WordVocabulary(words, min_count=min_count)
-    if min_count == DEFAULT_MIN_COUNT and vocabulary.vocab_size != REFERENCE_VOCAB_SIZE:
+    words = vocabulary_from_counts(counts, min_count=min_count, eos=eos)
+    vocabulary = WordVocabulary(words, min_count=min_count, eos=eos)
+    expected_vocab = reference_vocab_size(dataset)
+    if min_count == DEFAULT_MIN_COUNT and vocabulary.vocab_size != expected_vocab:
         raise SystemExit(
             f"reference vocabulary mismatch: built {vocabulary.vocab_size} ids, expected "
-            f"{REFERENCE_VOCAB_SIZE}. The corpus revision or the tokenization changed; refusing to "
+            f"{expected_vocab}. The corpus revision or the tokenization changed; refusing to "
             f"write a cache whose ids would not mean what the benchmark's ids mean."
         )
+    if eos and min_count == DEFAULT_MIN_COUNT:
+        # The published stream's sizes are a property of every split, not only of the vocabulary:
+        # check all three before anything is written (validation and test are small to recount).
+        measured = {"train": n_train_tokens}
+        for split in SPLIT_FILES:
+            if split != "train":
+                measured[split] = _count_split_tokens(split, eos=True)[1]
+        wrong = {split: (measured[split], REFERENCE_N_TOKENS_EOS[split]) for split in measured
+                 if measured[split] != REFERENCE_N_TOKENS_EOS.get(split)}
+        if wrong:
+            raise SystemExit(
+                "reference token-count mismatch (measured, expected): "
+                + ", ".join(f"{split}={pair}" for split, pair in sorted(wrong.items()))
+                + ". The corpus revision or the <eos> policy changed; refusing to write the cache.")
     print(f"      vocabulary: {vocabulary.vocab_size:,} ids "
           f"({len(counts):,} observed types, min_count={min_count})", flush=True)
 
-    vocab_file = vocabulary_path(DATASET, tag="word", cache_dir=root)
+    vocab_file = vocabulary_path(dataset, tag="word", cache_dir=root)
 
     code_sha = _tokenization_code_sha256()
     summary: Dict[str, object] = {
-        "dataset": DATASET,
+        "dataset": dataset,
         "dataset_id": DATASET_ID,
         "dataset_config": DATASET_CONFIG,
         "dataset_revision": DATASET_REVISION,
@@ -213,7 +251,7 @@ def build(
     for split in SPLIT_FILES:
         target = targets[split]
         meta_target = Path(str(target) + ".meta.json")
-        n_rows, n_tokens, n_chars_source, _counts = _count_split_tokens(split)
+        n_rows, n_tokens, n_chars_source, _counts = _count_split_tokens(split, eos=eos)
         ids = _encode_split(split, vocabulary)
         if ids.size != n_tokens:
             raise AssertionError(f"{split}: encoded {ids.size} ids but counted {n_tokens}")
@@ -231,8 +269,12 @@ def build(
             "tokens_per_char": (float(ids.size) / n_chars_source) if n_chars_source else None,
             "tokenization_code_sha256": code_sha,
             "tokenizer_config_sha256": hashlib.sha256(json.dumps(
-                {"tokenizer": "word", "min_count": min_count, "vocab_size": vocabulary.vocab_size},
+                {"tokenizer": "word", "min_count": min_count, "vocab_size": vocabulary.vocab_size,
+                 **({"eos": True} if eos else {})},
                 sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
+            # Recorded only by <eos> builds (the no-<eos> metadata keeps its original keys); the
+            # loader requires the vocabulary sidecar to agree on it.
+            **({"eos": True} if eos else {}),
         }
         # Metadata first, then the ids: until the vocabulary is replaced below, a new cache is always
         # visible to the loader as recorded vocab_size/min_count disagreeing with the old sidecar.
@@ -257,8 +299,8 @@ def build(
 
 
 def main() -> int:
-    r"""Click-to-run entry point: build with the module-level ``MIN_COUNT``/``CACHE_DIR``/``FORCE``."""
-    summary = build(min_count=MIN_COUNT, cache_dir=CACHE_DIR, force=FORCE)
+    r"""Click-to-run entry point: build ``DATASET`` with the module-level ``MIN_COUNT``/``CACHE_DIR``/``FORCE``."""
+    summary = build(min_count=MIN_COUNT, cache_dir=CACHE_DIR, force=FORCE, dataset=DATASET)
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
 

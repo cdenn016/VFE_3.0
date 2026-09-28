@@ -77,14 +77,16 @@ def load_model(
     precision: str = "fp32",
     drop_unknown_config_fields: bool = False,
 ) -> LoadedModel:
-    r"""Build the model of ``<run_dir>/<checkpoint>`` and load its state strictly.
+    r"""Build the model of ``<run_dir>/<checkpoint>`` and load its state strictly (either family).
 
     ``precision="fp32"`` replays in float32 with autocast off. ``precision="run"`` keeps the run's
     ``amp_dtype`` on CUDA (the arithmetic the run was evaluated in); on the CPU it falls back to
     float32, recorded in ``notes``. ``drop_unknown_config_fields`` ignores config fields this build
     no longer declares (see :func:`vfe3.posthoc.streams.config_from_bundle`); they are returned in
-    ``dropped_config_fields``.
+    ``dropped_config_fields``. A bundle whose config carries ``model_family =
+    'conventional_transformer'`` builds :class:`vfe3.baseline.BaselineTransformer`.
     """
+    from vfe3.contracts import is_vfe_config
     from vfe3.model.model import VFEModel
     from vfe3.posthoc.streams import config_from_bundle
 
@@ -101,12 +103,19 @@ def load_model(
                      f"amp_dtype={cfg.amp_dtype!r})")
     elif amp is None and cfg.amp_dtype is not None:
         notes.append(f"replayed in float32 with autocast off (trained with amp_dtype={cfg.amp_dtype!r})")
-    eval_cfg = dataclasses.replace(
-        cfg, amp_dtype=amp,
-        _allow_legacy_dense_decode=bool(getattr(cfg, "_allow_legacy_dense_decode", False)))
+    if not is_vfe_config(cfg):
+        from vfe3.baseline import BaselineTransformer
+
+        eval_cfg = dataclasses.replace(cfg, amp_dtype=amp)
+        model_class: Callable[[Any], torch.nn.Module] = BaselineTransformer
+    else:
+        eval_cfg = dataclasses.replace(
+            cfg, amp_dtype=amp,
+            _allow_legacy_dense_decode=bool(getattr(cfg, "_allow_legacy_dense_decode", False)))
+        model_class = VFEModel
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        model = VFEModel(eval_cfg)
+        model = model_class(eval_cfg)
     notes.extend(sorted({f"model construction warning: {w.message}" for w in caught}))
     model.load_state_dict(bundle["model_state"], strict=True)
     model.to(device).eval()
@@ -198,7 +207,7 @@ def nll_pass(
     """
     cfg = model.cfg
     V = int(cfg.vocab_size)
-    need_frame = cfg.encode_mode == "canonical_content_projected"
+    need_frame = getattr(cfg, "encode_mode", None) == "canonical_content_projected"
     parts: Dict[str, List[np.ndarray]] = {k: [] for k in ("nll", "target_pos", "token", "window", "context")}
     expected = 0
     excluded = 0

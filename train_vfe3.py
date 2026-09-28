@@ -180,7 +180,7 @@ config = dict(
     decode_unigram_prior              = True,       # add kappa*log pi_v (corpus unigram) to decode logits    
     untie_decode_bank                 = True,       # prior-bank modes only: decode reads its OWN cloned (V,K) tables
     
-    
+    decode_coordinates                = "local",       # "local" | "reference"
     #################################
     #     Optional Block MLP        #
     #################################
@@ -191,8 +191,9 @@ config = dict(
     block_mlp_expansion       = 8,
     block_mlp_activation      = "gelu",
     block_mlp_dropout         = 0.00,
+    per_type_hidden_bias      = False,          # per-type (V x n_gen) bias on the MLP hidden layer; coordinate MLP, projected route
 
-    
+
     #################################
     #          Gauge Group
     #################################
@@ -309,6 +310,7 @@ config = dict(
 
     
     m_block_mlp_lr            = 0.001,
+    m_per_type_hidden_bias_lr = None,      # None inherits the declared m_phi_lr; active only with per_type_hidden_bias
     m_layernorm_lr            = 0.05,      # None inherits m_p_mu_lr; own M-step rate for the
                                            
 
@@ -328,6 +330,7 @@ config = dict(
     layernorm_affine          = True,
     norm_type_block           = "layernorm",        # "none" | "mahalanobis" |"layernorm"
     norm_type_final           = "none",             # "none" | "mahalanobis" |"layernorm"
+    block_coordinates         = "local",            # "local" | "reference" (LN and MLP applied as U Phi(U^-1 .))
     
    
     #################################

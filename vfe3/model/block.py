@@ -128,6 +128,7 @@ def vfe_block(
     relational_frame: Optional[CanonicalFrameContext] = None,
     relational_value_frame: Optional[CanonicalFrameContext] = None,
     relational_capture: Optional[dict] = None,
+    hidden_bias:     Optional[torch.Tensor]                  = None,      # (B, N, w) per-type hidden bias (None -> off)
 ) -> BeliefState:
     r"""Run n_e_steps of the E-step from ``belief`` toward the prior, then optional norm.
 
@@ -138,7 +139,13 @@ def vfe_block(
     the precomputed block-diagonal positional rotation R(theta) (None = off, the pure path);
     ``rope_on_cov`` enables the full-gauge covariance sandwich rotation. ``tau`` is the softmax
     temperature (kappa * sqrt(dim_h)); when None it is computed here from cfg.kappa_beta and
-    group.irrep_dims. Pass a precomputed value from vfe_stack to avoid recomputing each layer."""
+    group.irrep_dims. Pass a precomputed value from vfe_stack to avoid recomputing each layer.
+    ``hidden_bias`` (``per_type_hidden_bias``) is this layer's ``(B, N, w)`` slice of the per-type table,
+    handed to the block MLP's ``forward_moments(..., hidden_bias=...)``. Under
+    ``cfg.block_coordinates='reference'`` the norm and MLP act in reference coordinates through
+    ``relational_frame`` (:func:`_reference_coordinate_block`)."""
+    if hidden_bias is not None and block_mlp is None:
+        raise ValueError("hidden_bias (per_type_hidden_bias) needs a block MLP")
     if tau is None:
         tau = attention_tau(_as_coeff(cfg.kappa_beta, belief.mu.device), group.irrep_dims)
     compact_phi_blocks = (
@@ -215,17 +222,79 @@ def vfe_block(
         else:
             mu_cg, sigma_cg = cg_coupling(out.mu, out.sigma)
             out = out._replace(mu=mu_cg, sigma=sigma_cg)   # _replace preserves phi/reflection
+    if getattr(cfg, "block_coordinates", "local") == "reference":
+        return _reference_coordinate_block(
+            out, block_norm=block_norm, block_mlp=block_mlp, frame=relational_frame,
+            capture=capture, hidden_bias=hidden_bias)
     if block_norm is not None:               # cached parameter-free norm (audit 2d/4f)
         out = out._replace(mu=block_norm(out.mu, out.sigma))   # _replace preserves phi/reflection
     if capture is not None:
         capture["block_mlp_input"] = out     # exact immediate seam after mixer/CG/norm
     if block_mlp is not None:                # default-off residual moment transform, after norm before handoff
         if hasattr(block_mlp, "forward_moments"):
+            extra = {} if hidden_bias is None else {"hidden_bias": hidden_bias}
             result = block_mlp.forward_moments(
-                out.mu, out.sigma, frame_context=block_mlp_frame)
+                out.mu, out.sigma, frame_context=block_mlp_frame, **extra)
             out = out._replace(mu=result.mu, sigma=result.sigma)
         else:                                # legacy callable compatibility: coordinate mean only
+            if hidden_bias is not None:
+                raise TypeError("a legacy block-MLP callable cannot take hidden_bias")
             out = out._replace(mu=block_mlp(out.mu))
+    if capture is not None:
+        capture["block_mlp_output"] = out
+    return out
+
+
+def _reference_coordinate_block(
+    out:         BeliefState,                              # post-attention belief, local coordinates
+    *,
+    block_norm:  Optional[Callable[..., torch.Tensor]],
+    block_mlp:   Optional[Callable],
+    frame:       Optional[CanonicalFrameContext],          # realized U_i: (B, N, K, K) or (B, N, G, d, d)
+    capture:     Optional[MStepCapture],
+    hidden_bias: Optional[torch.Tensor],                   # (B, N, w) or None
+) -> BeliefState:
+    r"""Norm and MLP in reference coordinates, one conjugation per block (``block_coordinates='reference'``).
+
+    With the realized frame :math:`U_i` (fixed through the stack on the projected route),
+
+    .. math::
+        \xi_i = U_i^{-1}\mu_i^{\mathrm{att}},\qquad
+        v_i = \mathrm{LN}_{\gamma,b}(\xi_i),\qquad
+        \xi_i^+ = v_i + \mathrm{MLP}(v_i),\qquad
+        \mu_i^{(\ell+1)} = U_i\xi_i^+,\qquad \Sigma_i^{(\ell+1)} = \Sigma_i^{\mathrm{att}},
+
+    and a Gaussian-template MLP reads the reference variances :math:`c_i = \operatorname{diag}C_i`,
+    :math:`C_i = U_i^{-1}\Sigma_i U_i^{-\top}`. Under the passive action
+    :math:`(\mu, \Sigma, U) \to (g\mu, g\Sigma g^\top, gU)` the pair :math:`(\xi, C)` is invariant and
+    :math:`\mu^{(\ell+1)} \to g\mu^{(\ell+1)}`. The frame actions run with autocast off (float32, float64
+    for an escalated frame); the norm and MLP keep the ambient autocast. The captured
+    ``block_mlp_input``/``block_mlp_output`` stay in local coordinates (:math:`U_iv_i`, :math:`U_i\xi_i^+`).
+    """
+    from vfe3.model.block_mlp import GaussianTemplateBlockMLP
+    from vfe3.model.frame_actions import frame_matvec, reference_variances
+
+    if frame is None:
+        raise RuntimeError(
+            "block_coordinates='reference' requires the realized relational frame U_i; this block "
+            "received none (every reference-coordinate forward goes through forward_beliefs)")
+    bd = frame.block_diagonal
+    xi = frame_matvec(frame.inverse, out.mu, bd)                             # (B, N, K) xi = U^{-1} mu
+    template = isinstance(block_mlp, GaussianTemplateBlockMLP)
+    c = reference_variances(out.mu, out.sigma, frame) if template else out.sigma   # diag C, or unread
+    if block_norm is not None:
+        xi = block_norm(xi, c)                                               # LN acts on xi only
+    if capture is not None:
+        capture["block_mlp_input"] = out._replace(mu=frame_matvec(frame.forward, xi, bd))
+    if block_mlp is not None:
+        if hasattr(block_mlp, "forward_moments"):
+            extra = {} if hidden_bias is None else {"hidden_bias": hidden_bias}
+            xi = block_mlp.forward_moments(xi, c, **extra).mu                # passthrough: covariance kept
+        else:
+            if hidden_bias is not None:
+                raise TypeError("a legacy block-MLP callable cannot take hidden_bias")
+            xi = block_mlp(xi)
+    out = out._replace(mu=frame_matvec(frame.forward, xi, bd))               # (B, N, K) mu = U xi^+
     if capture is not None:
         capture["block_mlp_output"] = out
     return out

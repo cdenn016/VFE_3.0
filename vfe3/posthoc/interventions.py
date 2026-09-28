@@ -44,6 +44,9 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tupl
 import numpy as np
 import torch
 
+from vfe3.model.frame_actions import frame_matvec as _frame_matvec
+from vfe3.model.frame_actions import reference_variances as _reference_variances
+
 
 class NotApplicable(RuntimeError):
     r"""The intervention has nothing to act on in this model (recorded, not a failure)."""
@@ -311,56 +314,10 @@ FRAME_DESCRIPTION: str = (
     "vertex factor the relational operators read")
 
 
-def _frame_matvec(
-    matrix:         torch.Tensor,                  # (..., N, G, d, d) compact blocks or (..., N, K, K) dense
-    x:              torch.Tensor,                  # (..., N, K)
-    block_diagonal: bool,
-) -> torch.Tensor:                                 # (..., N, K) in x's dtype
-    r"""Per-token :math:`M_i x_i` for a realized frame factor :math:`M_i \in \{U_i, U_i^{-1}\}`.
-
-    Evaluated with autocast off at the frame's precision (float64 for an escalated frame) and returned
-    in ``x``'s dtype, as the model's own frame actions (``RelationalOperators.canonical_mean``) are.
-    """
-    dtype = torch.float64 if torch.float64 in (matrix.dtype, x.dtype) else torch.float32
-    with torch.autocast(device_type=x.device.type, enabled=False):
-        work, factor = x.to(dtype), matrix.to(dtype)
-        if block_diagonal:
-            G, d = factor.shape[-3], factor.shape[-1]
-            out = (factor @ work.reshape(*x.shape[:-1], G, d).unsqueeze(-1)).flatten(-3)   # (..., N, K)
-        else:
-            out = (factor @ work.unsqueeze(-1)).squeeze(-1)                               # (..., N, K)
-    return out.to(x.dtype)
-
-
-def _reference_variances(
-    mu:    torch.Tensor,                           # (..., N, K) local means (layout reference only)
-    sigma: torch.Tensor,                           # (..., N, K) diagonal or (..., N, K, K) full local covariance
-    frame: Any,                                    # CanonicalFrameContext of U_i
-) -> torch.Tensor:                                 # (..., N, K)
-    r"""Reference variances :math:`\operatorname{diag}C_i` with :math:`C_i = U_i^{-1}\Sigma_i U_i^{-\top}`.
-
-    For diagonal :math:`\Sigma_i = \operatorname{diag}\sigma_i`,
-    :math:`(C_i)_{kk} = \sum_m (U_i^{-1})_{km}^2\,\sigma_{im}`; for full :math:`\Sigma_i`,
-    :math:`(C_i)_{kk} = \sum_m (U_i^{-1}\Sigma_i)_{km}(U_i^{-1})_{km}`, blockwise for a block-diagonal
-    frame, where only the diagonal blocks of :math:`\Sigma_i` enter.
-    """
-    inverse = frame.inverse
-    diagonal = sigma.dim() == mu.dim()
-    dtype = torch.float64 if torch.float64 in (inverse.dtype, sigma.dtype) else torch.float32
-    with torch.autocast(device_type=sigma.device.type, enabled=False):
-        inv, s = inverse.to(dtype), sigma.to(dtype)
-        if frame.block_diagonal:
-            G, d = inv.shape[-3], inv.shape[-1]
-            if diagonal:
-                out = (inv.square() @ s.reshape(*s.shape[:-1], G, d).unsqueeze(-1)).flatten(-3)
-            else:
-                blocks = torch.stack([s[..., g*d:(g+1)*d, g*d:(g+1)*d] for g in range(G)], dim=-3)  # (..., N, G, d, d)
-                out = ((inv @ blocks) * inv).sum(dim=-1).flatten(-2)
-        elif diagonal:
-            out = (inv.square() @ s.unsqueeze(-1)).squeeze(-1)
-        else:
-            out = ((inv @ s) * inv).sum(dim=-1)
-    return out.to(sigma.dtype)
+# _frame_matvec and _reference_variances (imported above from vfe3.model.frame_actions) are shared with
+# the training-time reference-coordinate block and decoder (``block_coordinates`` /
+# ``decode_coordinates='reference'``), so the M5 patches and the trained arms run one numerics path:
+# autocast off, float32 (float64 for an escalated frame), operand dtype out.
 
 
 class _ConjugatedNorm:
@@ -413,14 +370,18 @@ class _ConjugatedBlockMLP:
         sigma: torch.Tensor,                               # (..., N, K) or (..., N, K, K), passed through
         *,
         frame_context: Optional[Any] = None,
+        hidden_bias:   Optional[torch.Tensor] = None,      # (..., N, w) per-type hidden bias, reference side
     ) -> Any:
         from vfe3.model.block_mlp import BlockMLPMomentResult
 
         del frame_context
+        if hidden_bias is not None and self.template:
+            raise ValueError("hidden_bias does not apply to the Gaussian-template block")
         bd = self.frame.block_diagonal
         xi = _frame_matvec(self.frame.inverse, mu, bd)                                     # (..., N, K)
+        extra = {} if hidden_bias is None else {"hidden_bias": hidden_bias}
         out = (self.inner.mean_update(xi, _reference_variances(mu, sigma, self.frame)) if self.template
-               else self.inner.forward(xi))
+               else self.inner.forward(xi, **extra))
         return BlockMLPMomentResult(_frame_matvec(self.frame.forward, out, bd), sigma, None)
 
 
@@ -504,6 +465,25 @@ def _mlp_plan(mlp: torch.nn.Module) -> str:
     raise NotApplicable(
         f"block MLP {type(mlp).__name__} (covariance_contract={getattr(mlp, 'covariance_contract', None)!r}) "
         "has no mean-only reference conjugate here")
+
+
+def _role_trained_frame_free(model: torch.nn.Module, role: str) -> Optional[str]:
+    r"""Why ``role`` already carries no frame on a model trained in reference coordinates, else ``None``.
+
+    ``block_coordinates='reference'`` trains :math:`\mu \mapsto U_i\Phi(U_i^{-1}\mu)` (normalization, MLP
+    and final norm in reference coordinates), so row 11 has nothing to remove and a second conjugation
+    would be wrong; ``decode_coordinates='reference'`` trains logits :math:`W_{\mathrm{out}}U_i^{-1}\mu_i`
+    (or a Gaussian decode of :math:`(U_i^{-1}\mu_i, C_i)`), so row 12 has nothing to remove.
+    """
+    cfg = model.cfg
+    if role == ROLE_NORM_MLP and getattr(cfg, "block_coordinates", "local") == "reference":
+        return ("block_coordinates='reference': the normalization and MLP already act in reference "
+                "coordinates (mu -> U_i Phi(U_i^{-1} mu)), so the norm/MLP role carries no frame: "
+                "nothing to remove")
+    if role == ROLE_DECODER and getattr(cfg, "decode_coordinates", "local") == "reference":
+        return ("decode_coordinates='reference': the decoder already reads the reference moments "
+                "xi_i = U_i^{-1} mu_i, so the decoder role carries no frame: nothing to remove")
+    return None
 
 
 def _require_linear_decoder(model: torch.nn.Module) -> None:
@@ -663,7 +643,9 @@ def frames_removed(model: torch.nn.Module, roles: Sequence[str]) -> Iterator[Dic
     **Scope.** Outside the normal form each row raises :class:`NotApplicable` with the reason: no relational
     predictive content on every layer, RoPE, frame-intrinsic beliefs, a non-``per_token`` encoder, a head
     mixer or CG coupling; row 10 also needs covariance passthrough in attention and MLP, row 11 a mean-only
-    normalization or MLP acting in local coordinates, row 12 the linear decoder. The decoder patch acts on
+    normalization or MLP acting in local coordinates, row 12 the linear decoder. A model trained with
+    ``block_coordinates='reference'`` (row 11) or ``decode_coordinates='reference'`` (row 12) carries no
+    frame in that role, so the row raises :class:`NotApplicable` rather than conjugating twice. The decoder patch acts on
     the logits readout (``forward_beliefs(..., return_logits=True)``, the post-hoc evaluation path), not on
     the fused training cross-entropy.
     """
@@ -674,6 +656,10 @@ def frames_removed(model: torch.nn.Module, roles: Sequence[str]) -> Iterator[Dic
     roles = tuple(role for role in FRAME_ROLES if role in wanted)
     _require_normal_form(model)
     cfg = model.cfg
+    for role in roles:
+        reason = _role_trained_frame_free(model, role)
+        if reason is not None:
+            raise NotApplicable(reason)
     record: Dict[str, Any] = {"roles": list(roles), "frame": FRAME_DESCRIPTION, "stack_calls": 0}
     norm_plan, final_plan, mlp_plans = "absent", "absent", []
     if ROLE_ROUTING_COVARIANCE in roles:
@@ -790,11 +776,17 @@ def frame_role_composite_check(
 
     Both are the predictor with :math:`U_i = I` in every role (:func:`frames_removed`), so the per-target
     NLLs agree up to the floating-point round trips :math:`U_i(U_i^{-1}x)`. Without positional frames
-    the reference is row 7 alone (``positional_frames`` False).
+    the reference is row 7 alone (``positional_frames`` False). A role the model was trained without a
+    frame in (``block_coordinates`` or ``decode_coordinates`` set to ``'reference'``) is already
+    frame-free, so it is left out of the patch and listed under ``frame_free_by_construction``.
     """
     from vfe3.posthoc import evaluate as ev
 
-    with frames_removed(model, FRAME_ROLES) as record:
+    frame_free = [role for role in FRAME_ROLES if _role_trained_frame_free(model, role) is not None]
+    patched = tuple(role for role in FRAME_ROLES if role not in frame_free)
+    if not patched:
+        raise NotApplicable("every frame role is frame-free by construction on this model")
+    with frames_removed(model, patched) as record:
         composite = ev.nll_pass(model, dataset, indices, batch_size=batch_size, device=device)
     with ExitStack() as patches:
         patches.enter_context(token_frames_identity(model))
@@ -809,6 +801,7 @@ def frame_role_composite_check(
             "positional_frames": positional, "n_targets": composite.n,
             "max_abs_nll_difference": float(difference.max()) if difference.size else float("nan"),
             "mean_abs_nll_difference": float(difference.mean()) if difference.size else float("nan"),
+            "frame_free_by_construction": frame_free,
             "record": dict(record)}
 
 

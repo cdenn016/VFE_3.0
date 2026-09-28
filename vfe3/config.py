@@ -76,6 +76,10 @@ _VALID_GRADIENT_MODES      = ("filtering", "smoothing")
 _VALID_E_STEP_GRADIENTS    = ("unroll", "straight_through", "detach")
 _VALID_GAUGE_TRANSPORT     = ("on", "off", "frozen")
 _DENSE_DECODE_MODES        = frozenset({"diagonal", "full", "family"})
+# Decoders decode_coordinates='reference' admits: linear reads xi = U^{-1} mu; the full Gaussian-KL
+# kernels read (xi, C); the diagonal Gaussian-KL kernels read (xi, diag C), exact up to a per-position
+# constant against a diagonal bank.
+_REFERENCE_DECODE_MODES    = ("linear", "diagonal", "diagonal_chunked", "full", "full_chunked")
 
 
 class _ConfigTypeError(TypeError, ValueError):
@@ -173,6 +177,15 @@ class VFE3Config:
     decode_mode:               str   = "linear"      # "linear" | "diagonal_chunked" | "full_chunked"
                                                      # | "family_chunked" | "expected_likelihood_chunked"
                                                      # | (dense legacy, opt-in) "diagonal" | "full" | "family"
+
+    # Coordinates the decoder reads. "local" (default) decodes the local moments (mu_i, Sigma_i).
+    # "reference" decodes the reference moments xi_i = U_i^{-1} mu_i and C_i = U_i^{-1} Sigma_i U_i^{-T}
+    # with the same realized relational frame the attention reads: linear logits W_out xi_i + b
+    # (+ kappa log p_uni), a full Gaussian decode KL(N(xi_i, C_i) || p_v), and a diagonal Gaussian decode
+    # of diag C_i (equal to the full-C KL up to a per-position constant that cancels in the softmax).
+    # Applies on the fused training CE and the dense logits path alike. Requires a projected
+    # attention_mode, pos_rotation='none', and decode_mode in linear/diagonal*/full*.
+    decode_coordinates:        str   = "local"       # "local" | "reference"
 
     decode_tau:                float = 1.0           # KL-to-prior decode temperature; inert under decode_mode="linear"
     decode_temperature_learned: bool = True          # False freezes decode_log_scale, so tau_eff == decode_tau exactly
@@ -435,6 +448,16 @@ class VFE3Config:
     norm_type_block:            str   = "layernorm"   # "layernorm" | "mahalanobis" | "none"
     norm_type_final:            str   = "none"        # "layernorm" | "mahalanobis" | "none"
 
+    # Coordinates the block norm, the block MLP and the final norm act in. "local" (default) applies
+    # them to the local mean mu_i. "reference" applies them to the reference mean xi_i = U_i^{-1} mu_i
+    # and maps back, mu -> U_i Phi(U_i^{-1} mu), with ONE conjugation per block (LN and MLP together) by
+    # the realized relational frame U_i = exp(X_{x_i}) exp(Y_i); a Gaussian-template MLP reads
+    # diag C_i, C_i = U_i^{-1} Sigma_i U_i^{-T}. This is the training counterpart of M5 row 11. Frame
+    # actions run with autocast off (float32, float64 for an escalated frame); the MLP keeps the
+    # ambient autocast. Requires attention_mode='projected_predictive', pos_rotation='none', a
+    # 'none'/'layernorm' norm, and a passthrough 'coordinate'/'gaussian_template' MLP.
+    block_coordinates:          str   = "local"       # "local" | "reference"
+
     # Cross-block belief handoff (mu_q -> mu_p). Both blends must be convex so the prior stays on the
     # SPD cone: sigma_p_next = (1-rho_s) sigma_p + rho_s sigma_q stays > 0 iff rho_s in [0,1].
     prior_handoff_rho:          float = 1.0           # 1.0 = full flow; 0.0 = priors frozen
@@ -451,6 +474,20 @@ class VFE3Config:
     block_mlp_dropout:          float = 0.0
 
     m_block_mlp_lr:   Optional[float] = None
+
+    # Per-type hidden bias (capacity-bearing per-type table): an nn.Parameter E of shape (V, n_gen),
+    # n_gen the gauge-generator count (the token-frame table's width), zero-initialized so step 0 equals
+    # the model without it. E[x_i] is gathered once per forward and split over the layers into widths
+    # w_l = floor(n_gen / L) (+1 on the first n_gen mod L layers); layer l adds its slice to the first
+    # w_l hidden pre-activation units of the block MLP, h^(l) = W_1 u + b_1 + E^(l)[x_i]. It enters
+    # after the norm and inside the nonlinearity at every layer, so it is not absorbable into mu_v.
+    # Requires a projected attention_mode, use_block_mlp with a 'coordinate' or 'canonical_frame' MLP,
+    # and w_l <= its hidden width.
+    per_type_hidden_bias:       bool  = False
+    # Step size of that table; None resolves to the DECLARED m_phi_lr (read before gauge_transport
+    # 'off'/'frozen' coerces m_phi_lr to 0), the phi-table hyperparameter it mirrors. Its decay is
+    # phi_weight_decay.
+    m_per_type_hidden_bias_lr:  Optional[float] = None
 
     # SANCTIONED LEARNED-SCALAR EXCEPTION (default ON; inert, no params, warned, unless a norm seam is
     # "layernorm"). Adds a learned per-feature affine gamma/beta to any "layernorm" seam:
@@ -1024,6 +1061,9 @@ class VFE3Config:
                 f"{self.bch_residual_max!r}"
             )
 
+        # The declared phi step size, read BEFORE the coercion below can zero it: the per-type hidden-bias
+        # table (per_type_hidden_bias) inherits it when m_per_type_hidden_bias_lr is None.
+        declared_m_phi_lr = self.m_phi_lr
         # gauge_transport meta-toggle: coerce the gauge-frame fields UP FRONT so every downstream
         # validation and the optimizer/table wiring see the resolved state. 'on' is a no-op.
         _require(self.gauge_transport, _VALID_GAUGE_TRANSPORT, "gauge_transport")
@@ -2016,15 +2056,23 @@ class VFE3Config:
                 "block_mlp_covariance_floor must be a finite real value > 0, "
                 f"got {self.block_mlp_covariance_floor!r}"
             )
-        if self.use_block_mlp and (
-                block_mlp_registration.gauge_class == "invariant_scalar_intertwiner"
-                or self.block_mlp_covariance == "delta_full"
-        ) and self.family != "gaussian_full":
+        if self.use_block_mlp and self.block_mlp_covariance == "delta_full" and self.family != "gaussian_full":
             raise ValueError(
-                "block_mlp_mode='gauge_gate' and block_mlp_covariance='delta_full' need a "
-                "full-covariance Gaussian family (family='gaussian_full'); invariant "
-                "Mahalanobis gates and dense J Sigma J^T cannot be represented by a "
+                "block_mlp_covariance='delta_full' needs a full-covariance Gaussian family "
+                "(family='gaussian_full'): the dense J Sigma J^T cannot be represented by a "
                 f"diagonal/non-Gaussian family (got family={self.family!r})."
+            )
+        # The invariant Mahalanobis gate reads s_b = mu_b^T Sigma_bb^{-1} mu_b per irrep block. With a
+        # passthrough covariance it is exact on the diagonal family (Sigma_bb = diag sigma_b gives
+        # s_b = sum_k mu_k^2 / sigma_k), where it equals the full-family gate on diag_embed(sigma);
+        # other families are not admitted.
+        if (self.use_block_mlp
+                and block_mlp_registration.gauge_class == "invariant_scalar_intertwiner"
+                and self.family not in ("gaussian_full", "gaussian_diagonal")):
+            raise ValueError(
+                "block_mlp_mode='gauge_gate' needs a Gaussian family whose block covariance it can "
+                "invert exactly (family='gaussian_full', or 'gaussian_diagonal' with "
+                f"block_mlp_covariance='passthrough'); got family={self.family!r}."
             )
         if self.use_block_mlp and block_mlp_registration.requires_frame_context:
             incompatible = []
@@ -2054,6 +2102,88 @@ class VFE3Config:
                 "block_mlp_dropout must be a finite real value in [0, 1), "
                 f"got {self.block_mlp_dropout!r}"
             )
+
+        # Reference coordinates (M2 arms: LN and MLP in reference coordinates; the covariant decoder).
+        # Both conjugate by the realized relational frame U_i, which is defined, fixed through the
+        # stack, and equal to the content frame only on a projected route (e_phi_lr=0, flat transport)
+        # without RoPE and outside the frame-intrinsic family. Everything else fails closed.
+        _require(self.block_coordinates, ("local", "reference"), "block_coordinates")
+        _require(self.decode_coordinates, ("local", "reference"), "decode_coordinates")
+        frame_requirements = []
+        if self.pos_rotation != "none":
+            frame_requirements.append(
+                f"pos_rotation={self.pos_rotation!r} (RoPE folds a rotation into the routing frame, "
+                "so the content/decode frame is not U_i)")
+        if self.family == "gaussian_frame_diagonal":
+            frame_requirements.append(
+                "family='gaussian_frame_diagonal' (beliefs are already frame-intrinsic)")
+        if self.e_phi_lr != 0.0:
+            frame_requirements.append(f"e_phi_lr={self.e_phi_lr!r} (the frame moves inside the stack)")
+        if self.transport_mode != "flat":
+            frame_requirements.append(f"transport_mode={self.transport_mode!r} (requires 'flat')")
+        if self.encode_mode == "canonical_content_projected":
+            frame_requirements.append(
+                "encode_mode='canonical_content_projected' (already decodes through its own frame)")
+        if self.block_coordinates == "reference":
+            incompatible = list(frame_requirements)
+            if self.attention_mode != "projected_predictive":
+                incompatible.append(f"attention_mode={self.attention_mode!r} (requires 'projected_predictive')")
+            for name in ("norm_type_block", "norm_type_final"):
+                if getattr(self, name) not in ("none", "layernorm"):
+                    incompatible.append(f"{name}={getattr(self, name)!r} (requires 'none' or 'layernorm')")
+            if self.use_head_mixer:
+                incompatible.append("use_head_mixer=True (acts in local coordinates before the norm)")
+            if self.use_cg_coupling:
+                incompatible.append("use_cg_coupling=True (acts in local coordinates before the norm)")
+            if self.use_block_mlp and self.block_mlp_mode not in ("coordinate", "gaussian_template"):
+                incompatible.append(
+                    f"block_mlp_mode={self.block_mlp_mode!r} (requires 'coordinate' or 'gaussian_template'; "
+                    "canonical_frame is already conjugated and gauge_gate is already covariant)")
+            if self.use_block_mlp and self.block_mlp_covariance != "passthrough":
+                incompatible.append(f"block_mlp_covariance={self.block_mlp_covariance!r} (requires 'passthrough')")
+            if incompatible:
+                raise ValueError(
+                    "block_coordinates='reference' conjugates the block by the realized relational frame "
+                    "and is defined only where that frame is; got " + "; ".join(incompatible))
+        if self.decode_coordinates == "reference":
+            incompatible = list(frame_requirements)
+            if self.attention_mode == "transported":
+                incompatible.append(
+                    "attention_mode='transported' (the realized relational frame exists only on the "
+                    "projected routes)")
+            if self.decode_mode not in _REFERENCE_DECODE_MODES:
+                incompatible.append(
+                    f"decode_mode={self.decode_mode!r} (requires one of {_REFERENCE_DECODE_MODES}: the "
+                    "Gaussian-KL reduction to (xi, C) is exact only for these kernels)")
+            if incompatible:
+                raise ValueError(
+                    "decode_coordinates='reference' decodes the reference moments through the realized "
+                    "relational frame and is defined only where that frame is; got " + "; ".join(incompatible))
+
+        # Per-type hidden bias on the block-MLP pre-activation (capacity-bearing per-type table).
+        if self.per_type_hidden_bias:
+            incompatible = []
+            if not self.use_block_mlp:
+                incompatible.append("use_block_mlp=False")
+            elif self.block_mlp_mode not in ("coordinate", "canonical_frame"):
+                incompatible.append(
+                    f"block_mlp_mode={self.block_mlp_mode!r} (requires a coordinate hidden layer: "
+                    "'coordinate' or 'canonical_frame')")
+            if self.attention_mode == "transported":
+                # Transported diagnostics replay vfe_stack/vfe_block directly and would omit the
+                # table; the projected routes replay through forward_beliefs, which gathers it.
+                incompatible.append("attention_mode='transported' (requires a projected route)")
+            if incompatible:
+                raise ValueError(
+                    "per_type_hidden_bias=True adds the per-type table to the block MLP's fc1 hidden "
+                    "pre-activation; got " + ", ".join(incompatible))
+            if self.m_per_type_hidden_bias_lr is None:
+                self.m_per_type_hidden_bias_lr = declared_m_phi_lr
+        rate = self.m_per_type_hidden_bias_lr
+        if rate is not None and (
+                isinstance(rate, bool) or not isinstance(rate, Real)
+                or not math.isfinite(rate) or rate < 0.0):
+            raise ValueError(f"m_per_type_hidden_bias_lr must be finite and >= 0 or None, got {rate!r}")
 
         # M-step / training
         # e_step_gradient is the single E-step backward-estimator selector.
@@ -2494,20 +2624,36 @@ class VFE3Config:
                   "pos_phi_project_slk", "m_pos_phi_lr"),
                  "transported gaussian_frame_diagonal cancels the vertex frame, including the "
                  "RoPE fold and the positional right factor")
-        from vfe3.model.block_mlp import get_block_mlp_registration
         if (self.attention_mode == "projected_predictive" and self.family == "gaussian_full"
                 and self.encode_mode in ("per_token", "per_token_additive")
                 and not self.use_head_mixer and not self.rope_full_gauge
                 and self.predictive_covariance == "passthrough"
-                and not (self.use_block_mlp and (
-                    self.block_mlp_covariance != "passthrough"
-                    or get_block_mlp_registration(self.block_mlp_mode).gauge_class
-                    == "invariant_scalar_intertwiner"))):
+                and self.block_coordinates == "local" and self.decode_coordinates == "local"
+                and not (self.use_block_mlp and self.block_mlp_covariance != "passthrough")):
+            # A passthrough gauge gate no longer distinguishes the families: the diagonal gate on
+            # (mu, sigma) is the full gate on (mu, diag_embed sigma), and nothing densifies sigma.
             mark(("family",),
                  "value-identical to gaussian_diagonal under the rank-matched decoder on this "
                  "route: stored covariance is a diagonal token lookup and no seam densifies it; "
                  "full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, "
                  "predictive_covariance='moment_matched', or attention_mode='transported'")
+        # Reference coordinates. With identically-I frames xi = mu and C = Sigma exactly, so both
+        # selectors are no-ops; without a block norm, final norm or block MLP nothing is conjugated.
+        identity_frames = (self.gauge_transport == "off"
+                           or (self.encode_mode == "per_token_additive" and self.pos_phi == "none"))
+        if identity_frames:
+            mark(("block_coordinates", "decode_coordinates"),
+                 "the realized frames are identically I (gauge_transport='off', or per_token_additive "
+                 "without positional frames), so reference and local coordinates coincide")
+        elif (self.norm_type_block == "none" and self.norm_type_final == "none"
+              and not self.use_block_mlp):
+            mark(("block_coordinates",), "no block norm, final norm or block MLP to conjugate")
+        if not self.per_type_hidden_bias:
+            mark(("m_per_type_hidden_bias_lr",), "only read when per_type_hidden_bias=True")
+        else:
+            # The per-type table's optimizer group is decayed by phi_weight_decay even when the
+            # frame tables are frozen (gauge_transport 'off'/'frozen').
+            inactive.pop("phi_weight_decay", None)
         return inactive
 
     @property

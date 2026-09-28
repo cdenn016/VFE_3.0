@@ -32,7 +32,7 @@ except ImportError:                                 # tqdm optional: absent -> n
     _tqdm = None                                    # log lines still emit at log_interval as before
     _redirect_logging = contextlib.nullcontext
 
-from vfe3.contracts import is_conditional_filtering
+from vfe3.contracts import is_conditional_filtering, is_vfe_model, model_family_of
 from vfe3.config import VFE3Config
 from vfe3.contracts import DataState, DataStateBuffer
 from vfe3.data.datasets import make_dataloader
@@ -211,7 +211,18 @@ def build_optimizer(
     Registry-owned trainable transport state is grouped at ``m_phi_lr`` (a gauge-connection scale),
     so a newly registered stateful transport trains without a parameter-name branch while the exact
     model-parameter coverage guard remains fail-closed.
+
+    The per-type block-MLP hidden bias (``per_type_hidden_bias``, the capacity-bearing per-type table
+    of the identity-frame arm) takes the frame table's hyperparameters, the step size
+    ``m_per_type_hidden_bias_lr`` (the declared ``m_phi_lr`` unless set) and ``phi_weight_decay``,
+    and its role ``"phi"`` (so its own per-role clip budget, as the frame table it stands in for),
+    without the pullback-group metadata: it is not a Lie-algebra coordinate.
+
+    A model of another family (``model_family``, e.g. :class:`vfe3.baseline.BaselineTransformer`)
+    builds its own optimizer through ``model.build_optimizer(cfg)``.
     """
+    if not is_vfe_model(model):
+        return model.build_optimizer(cfg)
     pb = model.prior_bank
     # The selected policy contributes metadata only to stored phi-factor groups. An empty AdamW
     # policy leaves every established group dictionary unchanged. The pullback-group policy marks
@@ -311,6 +322,18 @@ def build_optimizer(
                      "weight_decay": cfg.phi_weight_decay, "role": "phi"}
         pos_group.update(phi_group_metadata)
         groups.append(pos_group)
+    hidden_bias = getattr(model, "per_type_hidden_bias", None)
+    if hidden_bias is not None:                                 # per_type_hidden_bias=True table
+        hidden_bias_parameters = ([hidden_bias] if isinstance(hidden_bias, torch.nn.Parameter)
+                                  else list(hidden_bias.parameters()))
+        hidden_bias_parameters = [p for p in hidden_bias_parameters if p.requires_grad]
+        # m_per_type_hidden_bias_lr resolves (in VFE3Config) to the DECLARED m_phi_lr, which
+        # gauge_transport 'off'/'frozen' would otherwise have coerced to 0 for this table too.
+        hidden_bias_lr = getattr(cfg, "m_per_type_hidden_bias_lr", None)
+        if hidden_bias_parameters:
+            groups.append({"params": hidden_bias_parameters,
+                           "lr": cfg.m_phi_lr if hidden_bias_lr is None else hidden_bias_lr,
+                           "weight_decay": cfg.phi_weight_decay, "role": "phi"})
     if getattr(model, "t5_bias", None) is not None:             # t5_learnable_bias=True relative-position bias
         # weight_decay=0: the per-bucket T5 bias b_{i-j} is a relative-position PRIOR shaping the
         # attention pi, not capacity; L2-decaying it toward zero biases the prior toward a flat/uniform
@@ -408,8 +431,17 @@ def build_optimizer(
 def _learning_rates_by_role(
     param_groups: Sequence[Dict[str, object]],
     lrs:          Sequence[float],
+
+    *,
+    required:     Collection[str] = ("mu", "sigma", "phi"),
 ) -> Dict[str, float]:
-    """Resolve the stable CSV learning-rate fields from optimizer role metadata."""
+    """Resolve the stable CSV learning-rate fields from optimizer role metadata.
+
+    The report roles must include every ``required`` role and lie within ``{mu, sigma, phi}``; a
+    role that is allowed but absent (only possible when ``required`` is narrowed, as for a
+    conventional-transformer baseline) resolves to NaN. With the default ``required`` this is the
+    exact-set check the VFE optimizer has always satisfied.
+    """
     if len(param_groups) != len(lrs):
         raise RuntimeError("optimizer parameter groups and scheduler learning rates differ in length")
     resolved = {
@@ -417,13 +449,14 @@ def _learning_rates_by_role(
         for group, lr in zip(param_groups, lrs)
         if "lr_report_role" in group
     }
-    required = {"mu", "sigma", "phi"}
-    if set(resolved) != required:
+    allowed = {"mu", "sigma", "phi"}
+    required_set = set(required)
+    if not required_set <= set(resolved) or not set(resolved) <= allowed:
         raise RuntimeError(
-            f"optimizer learning-rate report roles must be exactly {sorted(required)}, "
-            f"got {sorted(resolved)}"
+            f"optimizer learning-rate report roles must include {sorted(required_set)} within "
+            f"{sorted(allowed)}, got {sorted(resolved)}"
         )
-    return resolved
+    return {**{role: float("nan") for role in ("mu", "sigma", "phi")}, **resolved}
 
 
 def _learning_rates_by_aux_role(
@@ -977,7 +1010,7 @@ def train_step(
     if (
         did_step
         and getattr(_cfg, "m_phi_update_mode", "adamw") == "adamw"
-        and _cfg.phi_mstep_max_matrix_norm is not None
+        and getattr(_cfg, "phi_mstep_max_matrix_norm", None) is not None
     ):
         collect_projection_stats = metrics_out is not None
         # The device counter rides along only when requested; None keeps the original call.
@@ -1324,10 +1357,11 @@ UPDATE_NORM_CHUNK_ELEMENTS: int = 1 << 22  # device chunk for ||theta_{t+1} - th
 
 # Named parameter groups for gradient, parameter and update norms (by parameter NAME, not by the
 # optimizer's role tag, whose "mu" role also holds W_out, the MLPs, the relational maps and the
-# LayerNorm).
+# LayerNorm). "per_type_table" is the equal-size capacity-control table: the VFE per-type block-MLP
+# hidden bias, or the conventional baseline's per-type read map (its columns are blank otherwise).
 PARAMETER_GROUPS: Tuple[str, ...] = (
     "mu_embed", "sigma_log_embed", "phi_embed", "pos_phi", "decode",
-    "relational_score", "relational_content", "block_mlp", "norm", "other",
+    "relational_score", "relational_content", "block_mlp", "norm", "per_type_table", "other",
 )
 _GROUP_COLUMNS: Tuple[str, ...] = tuple(
     f"{kind}_group_{group}"
@@ -1386,6 +1420,13 @@ def _numerics_counter_skip_reasons(
     ``attempted_updates`` are defined on every route.
     """
     cfg = model.cfg
+    if not is_vfe_model(model):
+        family = model_family_of(model)
+        return {
+            "cap_activation": f"model_family={family!r}: no capped routing cost exists",
+            "factorization": f"model_family={family!r}: no reduced covariance is factorized",
+            "frame_projection": f"model_family={family!r}: no frame table is projected",
+        }
     reasons: Dict[str, Optional[str]] = {
         "cap_activation": None, "factorization": None, "frame_projection": None}
     if not is_conditional_filtering(model):
@@ -1628,14 +1669,19 @@ def _parameter_group(
     r"""Named group of one model parameter (see ``PARAMETER_GROUPS``).
 
     ``decode`` holds the linear readout ``output_proj_*``, the untied decode tables ``decode_*``
-    and ``decode_log_scale``; ``norm`` holds the block and final normalization affines; anything
+    and ``decode_log_scale``; ``norm`` holds the block and final normalization affines;
+    ``per_type_table`` holds the per-type block-MLP hidden bias ``per_type_hidden_bias``; anything
     not matched lands in ``other`` (listed once in the training log). A leading wrapper prefix
     (``_orig_mod.`` from ``torch.compile``, ``module.`` from data parallelism) is ignored.
+    Names no VFE rule matches are looked up in the conventional-transformer role map
+    (:func:`vfe3.baseline.baseline_parameter_group`), whose names no VFE parameter uses.
     """
     for prefix in ("_orig_mod.", "module."):
         if name.startswith(prefix):
             name = name[len(prefix):]
     leaf = name.rsplit(".", 1)[-1]
+    if name == "per_type_hidden_bias" or name.startswith("per_type_hidden_bias."):
+        return "per_type_table"
     if name == "prior_bank.mu_embed":
         return "mu_embed"
     if name == "prior_bank.sigma_log_embed":
@@ -1656,7 +1702,8 @@ def _parameter_group(
         return "block_mlp"
     if name.startswith(("block_norm.", "final_norm.")):
         return "norm"
-    return "other"
+    from vfe3.baseline import baseline_parameter_group
+    return baseline_parameter_group(name) or "other"
 
 
 def _group_gradient_norms(
@@ -1968,7 +2015,8 @@ def _residual_and_attention_rows(
     conditional = is_conditional_filtering(model)
     block_norm = model.block_norm
     ln_defined = (block_norm is not None and model.head_mixer is None
-                  and model.cg_coupling is None and _residual_update_is_additive(model))
+                  and model.cg_coupling is None and _residual_update_is_additive(model)
+                  and getattr(model.cfg, "block_coordinates", "local") == "local")
     ratios: Dict[int, List[torch.Tensor]] = {}
     ln_changes: Dict[int, List[torch.Tensor]] = {}
     sums: Dict[Tuple[int, int], List[float]] = {}          # (layer, head) -> [H_norm, dist, self, overlap, n]
@@ -2657,8 +2705,8 @@ class TrainingTerminalState(NamedTuple):
     r"""Snapshot of the resumable training state handed to a ``train`` terminal callback.
 
     Captured immediately after the final optimizer step: the completed-step count, live optimizer,
-    scaler, and data cursor, plus cloned copies of the last-iterate
-    ``state_dict`` and CPU/CUDA global RNG states. A validation-only finalizer scores validation,
+    scaler, and data cursor, plus host (CPU) copies of the last-iterate ``state_dict`` and clones of
+    the CPU/CUDA global RNG states. A validation-only finalizer scores validation,
     restores the captured model/RNG state, and writes a resumable checkpoint whose weights and
     optimizer moments describe the same iterate.
     """
@@ -2949,7 +2997,7 @@ def train(
             if _counts is None:
                 raise RuntimeError("training token counts are unavailable for unigram decode")
             _counts = _counts.to(torch.float32)
-            model.prior_bank.set_unigram_log_prior(_counts.to(device))
+            getattr(model, "prior_bank", model).set_unigram_log_prior(_counts.to(device))
         else:
             import warnings
             warnings.warn(
@@ -3075,6 +3123,9 @@ def train(
     ) or bool(early_eval_steps)
     timer = TrainingTimer(device) if timing_enabled else None
     last_val: Dict[str, Optional[float]] = {}        # most recent validation, carried into each CSV row
+    # VFE-only diagnostics (held-out probes, residual/attention capture, frame-clamp warning) are
+    # skipped for another model family; their columns keep the VFE schema and stay blank.
+    vfe_model = is_vfe_model(model)
     val_diag_keys = _VAL_DIAG_KEYS + (
         _VAL_RELATIONAL_DIAG_KEYS if is_conditional_filtering(model) else ())
     last_val_diag: Dict[str, float] = {k: float("nan") for k in val_diag_keys}
@@ -3150,10 +3201,16 @@ def train(
                             fixed_train_sample.seq_len, fixed_train_sample.stride)
                 except Exception as exc:
                     _record_diagnostic_failure(diagnostics_failures, "train_sample_build", exc, logger)
-                try:
-                    diagnostic_windows = _diagnostic_windows(val_loader)
-                except Exception as exc:
-                    _record_diagnostic_failure(diagnostics_failures, "diagnostic_windows", exc, logger)
+                if vfe_model:
+                    try:
+                        diagnostic_windows = _diagnostic_windows(val_loader)
+                    except Exception as exc:
+                        _record_diagnostic_failure(diagnostics_failures, "diagnostic_windows", exc,
+                                                   logger)
+                else:
+                    logger.info(" residual-ratio and attention-statistics captures skipped "
+                                "(model_family=%r: they read the VFE belief capture)",
+                                model_family_of(model))
     if run_step_zero:
         # Step-0 evaluation before the first update (M3 curves need a beginning). Everything here
         # runs under a forked CPU/CUDA RNG, so the training stream is untouched. Its row is held
@@ -3165,10 +3222,11 @@ def train(
                             zero["ce"], zero["ppl"])
                 zero_diag: Dict[str, float] = {k: float("nan") for k in val_diag_keys}
                 try:
-                    zero_diag.update(_val_diagnostics(
-                        model, val_loader, device,
-                        batches=getattr(cfg, "val_diagnostic_batches", 1),
-                        failures=diagnostics_failures).metrics)
+                    if vfe_model:
+                        zero_diag.update(_val_diagnostics(
+                            model, val_loader, device,
+                            batches=getattr(cfg, "val_diagnostic_batches", 1),
+                            failures=diagnostics_failures).metrics)
                 except Exception as exc:
                     _record_diagnostic_failure(diagnostics_failures, "step0_val_diagnostics",
                                                exc, logger)
@@ -3231,7 +3289,8 @@ def train(
                 # health values visible as if they were collected for this attempt.
                 optimizer._gauge_diag = {}
         if do_log or do_csv:                                 # off the hot path (audit 2026-07-05 m8)
-            _warn_phi_transport_clamp(model)
+            if vfe_model:
+                _warn_phi_transport_clamp(model)
             # m7: diagnostics on the PRE-step weights so the logged F-decomposition shares the pre-step
             # provenance of train_loss/train_ce (train_ce is captured pre-step inside train_step). Under
             # no_grad, so no weight change,
@@ -3399,11 +3458,12 @@ def train(
                 # kills training.
                 validation_diagnostics: Optional[ValidationDiagnostics] = None
                 try:
-                    validation_diagnostics = _val_diagnostics(
-                        model, val_loader, device,
-                        batches=getattr(cfg, "val_diagnostic_batches", 1),
-                        failures=diagnostics_failures)
-                    last_val_diag.update(validation_diagnostics.metrics)
+                    if vfe_model:
+                        validation_diagnostics = _val_diagnostics(
+                            model, val_loader, device,
+                            batches=getattr(cfg, "val_diagnostic_batches", 1),
+                            failures=diagnostics_failures)
+                        last_val_diag.update(validation_diagnostics.metrics)
                 except Exception as exc:
                     terminal_validation_signature = None
                     logger.warning("       (validation diagnostics failed: %s); continuing", exc)
@@ -3488,7 +3548,8 @@ def train(
         if do_csv:
             n_tok = max(int(tokens.shape[1]), 1)
             raw_lrs = scheduler.get_last_lr()
-            lrs = _learning_rates_by_role(optimizer.param_groups, raw_lrs)
+            lrs = (_learning_rates_by_role(optimizer.param_groups, raw_lrs) if vfe_model
+                   else _learning_rates_by_role(optimizer.param_groups, raw_lrs, required=("mu",)))
             aux_lrs = _learning_rates_by_aux_role(optimizer.param_groups, raw_lrs)
             row = {
                 "step":              step + 1,
@@ -3523,7 +3584,7 @@ def train(
                 # fields are deliberately unweighted while "total" routes through the weighted
                 # evaluator, so a naive column sum missed the total by up to 98% relative at
                 # lambda_beta=0.5 with no column to reconcile it. Now each row is self-describing.
-                "lambda_beta":        float(cfg.lambda_beta),
+                "lambda_beta":        float(getattr(cfg, "lambda_beta", float("nan"))),
                 "effective_rank":     d["effective_rank"],
                 "holonomy_deviation": d["holonomy_deviation"],
                 "gauge_trace_spread": d["gauge_trace_spread"],
@@ -3604,7 +3665,7 @@ def train(
                             "expected_targets", "scored_targets", "excluded_targets"):
                     if _gk in step_metrics:
                         row[_gk] = step_metrics[_gk]
-            if cfg.phi_mstep_max_matrix_norm is not None:
+            if getattr(cfg, "phi_mstep_max_matrix_norm", None) is not None:
                 for _pk in (
                     "phi_chart_projected_rows",
                     "phi_chart_total_rows",
@@ -3709,9 +3770,11 @@ def train(
     # artifact set -- validation eval, best weights, summary, and a resumable terminal checkpoint -- in
     # one opt-in operation. The model-state and CPU/CUDA RNG clones let the finalizer restore the
     # final training iterate after validation. terminal_callback=None keeps the pure path free of
-    # those snapshots.
+    # those snapshots. The model-state copy goes to HOST memory: a device clone of every table while
+    # the parameters, gradients and AdamW moments are still resident doubles the parameter footprint
+    # at the end of the run (a likely OOM for vocabulary-sized tables); load_state_dict copies it back.
     if terminal_callback is not None:
-        raw_model_state = {name: tensor.detach().clone()
+        raw_model_state = {name: tensor.detach().to("cpu", copy=True)
                            for name, tensor in model.state_dict().items()}
         rng_state: Dict[str, object] = {
             "cpu":  torch.get_rng_state().clone(),

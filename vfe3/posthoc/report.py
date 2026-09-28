@@ -87,6 +87,44 @@ class PosthocOptions:
     routing_split:              Optional[str] = "validation"   # at the final weights
 
 
+def baseline_posthoc_options(
+    options: PosthocOptions,
+) -> Tuple[PosthocOptions, Dict[str, str]]:
+    r"""The preset for a conventional-transformer run: ``options`` with the VFE-only analyses off.
+
+    Kept: the per-target passes, the ``vfe3.train.evaluate`` cross-check, the reproduction check,
+    the bootstrap intervals, CE by context, calibration, resources, latency and the ALiBi slopes.
+    Turned off, each with the reason returned in the second element (recorded in ``posthoc.json``
+    under ``skipped_analyses``): the M5 frame/role interventions, the KL-cap observer, the
+    attention-statistics and residual observers (they read the projected-router capture), the
+    routing-covariance section, the M4 routing decomposition and the relational map invariants.
+    """
+    skipped: Dict[str, str] = {}
+    changes: Dict[str, Any] = {}
+    if options.interventions is None or len(options.interventions) > 0:
+        changes["interventions"] = ()
+        skipped["interventions"] = "the M5 rows remove frame roles of the VFE predictor"
+    if options.klcap_splits:
+        changes["klcap_splits"] = ()
+        skipped["klcap"] = "the routing-cost cap exists only on the VFE projected router"
+    if options.attention_split is not None:
+        changes["attention_split"] = None
+        skipped["attention"] = "the attention-statistics observer reads the VFE router capture"
+    if options.residual_split is not None:
+        changes["residual_split"] = None
+        skipped["residual"] = "the residual observer reads the VFE belief-stack capture"
+    if options.covariance:
+        changes["covariance"] = False
+        skipped["covariance"] = "there is no routing covariance C_i without frames"
+    if options.routing:
+        changes["routing"] = False
+        skipped["routing"] = "the M4 decomposition splits the VFE routing energy"
+    if options.maps:
+        changes["maps"] = False
+        skipped["maps"] = "the map invariants read the VFE relational operators"
+    return (dataclasses.replace(options, **changes) if changes else options), skipped
+
+
 # ----------------------------------------------------------------------------------------------
 # Small helpers
 # ----------------------------------------------------------------------------------------------
@@ -470,6 +508,13 @@ def run_posthoc(
     final_ckpt = next((c for c in options.checkpoints if c.startswith("final")), options.checkpoints[0])
     info = st.load_run_info(run_dir, final_ckpt, drop_unknown_config_fields=options.drop_unknown_config_fields)
     cfg = info.cfg
+    from vfe3.contracts import is_vfe_config, model_family_of
+
+    skipped_analyses: Dict[str, str] = {}
+    if not is_vfe_config(cfg):
+        options, skipped_analyses = baseline_posthoc_options(options)
+        log(f"[posthoc] model_family={model_family_of(cfg)!r}: VFE-only analyses skipped: "
+            f"{', '.join(sorted(skipped_analyses)) or 'none'}")
     batch_size = int(options.batch_size or cfg.batch_size)
     log(f"[posthoc] {run_dir.name}: K={cfg.embed_dim} L={cfg.n_layers} H={cfg.n_heads} "
         f"seq_len={info.seq_len} stride={info.eval_stride} batch={batch_size} device={device} "
@@ -491,6 +536,9 @@ def run_posthoc(
         "resources": None, "alibi_slopes": None, "figures": [], "tables": {}, "notes": [],
         "residual": {}, "covariance": {}, "calibration": None, "routing": None, "ce_by_context": None,
     }
+    if not is_vfe_config(cfg):
+        report["model_family"] = model_family_of(cfg)
+        report["skipped_analyses"] = skipped_analyses
 
     datasets, records, stream_units, tokens_by_split = _datasets(info, options, log)
     report["streams"] = records
@@ -949,11 +997,12 @@ def _maps(run_dir: Path, checkpoints: Sequence[str], cfg: Any, out: Path, figure
 
 def _resources(run_dir: Path, checkpoint: str, cfg: Any, latency: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     from vfe3.posthoc.maps import load_map_state
-    from vfe3.run_resources import optimizer_state_bytes, parameter_breakdown, throughput_summary
+    from vfe3.run_resources import (frozen_parameter_names, optimizer_state_bytes, parameter_breakdown,
+                                    throughput_summary)
 
     out: Dict[str, Any] = {}
     state, _ = load_map_state(run_dir / checkpoint)
-    breakdown = parameter_breakdown(state, cfg)
+    breakdown = parameter_breakdown(state, cfg, frozen=frozen_parameter_names(cfg, state.keys()))
     out["parameter_breakdown"] = {k: v for k, v in breakdown.items() if k != "roles_by_name"}
     latest = _latest_training_checkpoint(run_dir)
     if latest is not None:

@@ -1,17 +1,27 @@
 r"""Parameter, optimizer-state and throughput accounting of a vfe3 run, by parameter role.
 
-:func:`parameter_breakdown` assigns every parameter to one of four sections by its NAME:
+:func:`parameter_breakdown` assigns every trainable parameter to one of four sections by its NAME:
 
 * ``per_type_tables``: the vocabulary-indexed tables of the prior bank (``mu_embed``,
   ``sigma_log_embed``, ``phi_embed`` and the decode tables ``output_proj_weight``,
   ``output_proj_bias``, ``decode_mu_embed``, ``decode_sigma_log_embed``, and any other prior-bank
-  parameter whose leading axis is the vocabulary);
+  parameter whose leading axis is the vocabulary), and the per-type block-MLP hidden bias
+  ``per_type_hidden_bias`` when present;
 * ``positional_frames``: the positional frame generators ``pos_phi_free``;
 * ``context_processing``: the relational comparison maps ``raw_score_q``/``raw_score_k``
   (``relational_score``), the content maps ``T``/``O`` (``relational_content``), the block MLPs
   (``block_mlp``), the block and final normalizations (``norm``), and the opt-in head mixer and CG
   coupling when present;
 * ``other``: everything else (for example the scalar ``decode_log_scale``).
+
+A conventional-transformer baseline (``cfg.model_family == 'conventional_transformer'``) is
+classified by :func:`vfe3.baseline.baseline_parameter_role` into the same sections and role names.
+
+Parameters frozen by design (``requires_grad=False``: the token and positional frames under
+``gauge_transport='off'`` or ``'frozen'``, ``decode_log_scale`` under
+``decode_temperature_learned=False``) are constants of the run, not trained parameters: they are
+listed in the separate ``frozen`` section and excluded from the four sections, ``total`` and the
+parameters read per token (``total_including_frozen`` adds them back).
 
 Buffers are not parameters: a state dict passed in place of ``named_parameters()`` has its known
 buffers (:data:`BUFFER_LEAVES`) removed and listed under ``excluded_buffers``.
@@ -37,9 +47,12 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import (TYPE_CHECKING, Any, Collection, Dict, Iterable, List, Mapping, Optional, Sequence,
+                    Tuple, Union)
 
 import torch
+
+from vfe3.contracts import VFE_MODEL_FAMILY, model_family_of
 
 if TYPE_CHECKING:
     from vfe3.config import VFE3Config
@@ -86,15 +99,28 @@ def parameter_role(
 
     *,
     vocab_size: Optional[int] = None,
+    model_family: str = VFE_MODEL_FAMILY,
 ) -> Tuple[str, str]:
     r"""Return ``(section, role)`` of one parameter from its dotted state-dict ``name``.
 
     ``shape`` and ``vocab_size`` only matter for a prior-bank parameter outside the known table
-    names: it is a per-type table when its leading axis is the vocabulary, else ``other``. Wrapper
+    names: it is a per-type table when its leading axis is the vocabulary, else ``other``. The
+    per-type block-MLP hidden bias ``per_type_hidden_bias`` (``VFE3Config.per_type_hidden_bias``, a
+    :math:`V \times n_{\mathrm{gen}}` table split over layers) is a per-type table. Wrapper
     prefixes (``_orig_mod.`` from ``torch.compile``, ``module.`` from data parallelism) are ignored.
+    ``model_family`` other than ``"vfe"`` dispatches to that family's role map
+    (:func:`vfe3.baseline.baseline_parameter_role` for the conventional transformer).
     """
     name = canonical_name(name)
     leaf = _leaf(name)
+    if model_family != VFE_MODEL_FAMILY:
+        from vfe3.baseline import MODEL_FAMILY as _BASELINE_FAMILY, baseline_parameter_role
+        if model_family != _BASELINE_FAMILY:
+            raise ValueError(f"unknown model_family {model_family!r}")
+        return baseline_parameter_role(name)
+    if name == "per_type_hidden_bias" or name.startswith("per_type_hidden_bias."):
+        # V x n_gen per-type bias on the block-MLP hidden pre-activation (split over layers).
+        return "per_type_tables", "per_type_hidden_bias"
     if name.startswith("prior_bank."):
         if leaf in ENCODE_TABLE_LEAVES:
             return "per_type_tables", leaf
@@ -122,9 +148,40 @@ def parameter_role(
     return "other", leaf
 
 
+def _cfg_value(cfg: Any, key: str, default: Any = None) -> Any:
+    r"""``key`` of a config object, namespace or serialized mapping (``default`` when absent)."""
+    if isinstance(cfg, Mapping):
+        return cfg.get(key, default)
+    return getattr(cfg, key, default)
+
+
+def frozen_parameter_names(
+    cfg:   Any,
+    names: Iterable[str],
+) -> List[str]:
+    r"""The parameters in ``names`` that ``cfg`` freezes by design (``requires_grad=False`` when built).
+
+    For a state dict, whose tensors carry no ``requires_grad``, this reproduces what the built model
+    freezes: ``prior_bank.phi_embed`` and ``pos_phi_free`` under ``gauge_transport`` ``'off'`` or
+    ``'frozen'``, and ``prior_bank.decode_log_scale`` under ``decode_temperature_learned=False``. The
+    conventional-transformer baseline freezes nothing. ``cfg`` may be a config, a namespace or a
+    serialized mapping; returned names are canonical (wrapper prefixes stripped).
+    """
+    if model_family_of(cfg) != VFE_MODEL_FAMILY:
+        return []
+    wanted = set()
+    if _cfg_value(cfg, "gauge_transport", "on") in ("off", "frozen"):
+        wanted |= {"prior_bank.phi_embed", "pos_phi_free"}
+    if _cfg_value(cfg, "decode_temperature_learned", True) is False:
+        wanted.add("prior_bank.decode_log_scale")
+    return [canonical_name(name) for name in names if canonical_name(name) in wanted]
+
+
 def _decoder_full_tables(names: Iterable[str], cfg: "VFE3Config") -> List[str]:
     r"""Names of the per-type tables every decoded token reads IN FULL (all V rows)."""
     names = list(names)
+    if model_family_of(cfg) != VFE_MODEL_FAMILY:                        # the baseline's linear decoder
+        return [n for n in names if _leaf(n) in ("output_proj_weight", "output_proj_bias")]
     if cfg.decode_mode == "linear":
         wanted = ("output_proj_weight", "output_proj_bias")
     elif any(_leaf(n) == "decode_mu_embed" for n in names):
@@ -137,21 +194,32 @@ def _decoder_full_tables(names: Iterable[str], cfg: "VFE3Config") -> List[str]:
 def parameter_breakdown(
     named_params: Mapping[str, torch.Tensor],
     cfg:          "VFE3Config",
+
+    *,
+    frozen:       Optional[Collection[str]] = None,
 ) -> Dict[str, Any]:
-    r"""Counts and shares of the parameters by role, and the parameters read per token.
+    r"""Counts and shares of the trainable parameters by role, and the parameters read per token.
 
     ``named_params`` is ``dict(model.named_parameters())`` or a model state dict (known buffers are
-    dropped). Only shapes are read, so memory-mapped or meta tensors are fine. Returns::
+    dropped). Only shapes are read, so memory-mapped or meta tensors are fine. A parameter is frozen
+    when it is an ``nn.Parameter`` with ``requires_grad=False`` (``named_parameters()`` input) or when
+    its name is in ``frozen`` (pass :func:`frozen_parameter_names` for a state dict, whose tensors
+    carry no ``requires_grad``). Frozen parameters are listed under ``frozen`` and counted in no other
+    section, in neither ``total`` nor the parameters read per token. Returns::
 
         {"per_type_tables":    {"mu_embed", "sigma_log_embed", "phi_embed", "decode", ..., "total", "share"},
          "positional_frames":  {"pos_phi", "total", "share"},
          "context_processing": {"relational_score", "relational_content", "block_mlp", "norm", ..., "total", "share"},
          "other":              {<leaf>: n, ..., "total", "share"},
-         "total", "parameters_read_per_token", "read_per_token_components",
-         "roles_by_name", "excluded_buffers", "definition"}
+         "frozen":             {<name>: n, ..., "total"},
+         "total", "total_including_frozen", "parameters_read_per_token", "read_per_token_components",
+         "roles_by_name", "excluded_buffers", "definition", "model_family"}
     """
     V = int(cfg.vocab_size)
+    family = model_family_of(cfg)
+    frozen_names = {canonical_name(name) for name in (frozen or ())}
     sections: Dict[str, Dict[str, int]] = {name: {} for name in SECTIONS}
+    frozen_section: Dict[str, int] = {}
     roles_by_name: Dict[str, Dict[str, Any]] = {}
     excluded: List[str] = []
     for name, tensor in named_params.items():
@@ -161,13 +229,21 @@ def parameter_breakdown(
             continue
         shape = tuple(int(s) for s in tensor.shape)
         numel = int(math.prod(shape))
-        section, role = parameter_role(name, shape, vocab_size=V)
-        sections[section][role] = sections[section].get(role, 0) + numel
-        roles_by_name[name] = {"section": section, "role": role, "numel": numel, "shape": list(shape)}
+        section, role = parameter_role(name, shape, vocab_size=V, model_family=family)
+        is_frozen = name in frozen_names or (
+            isinstance(tensor, torch.nn.Parameter) and not tensor.requires_grad)
+        if is_frozen:
+            frozen_section[name] = frozen_section.get(name, 0) + numel
+        else:
+            sections[section][role] = sections[section].get(role, 0) + numel
+        roles_by_name[name] = {"section": section, "role": role, "numel": numel, "shape": list(shape),
+                               "frozen": bool(is_frozen)}
     if "context_processing" in sections:
         for role in ("relational_score", "relational_content", "block_mlp", "norm"):
             sections["context_processing"].setdefault(role, 0)
-    for role in ("mu_embed", "sigma_log_embed", "phi_embed", "decode"):
+    default_tables = (("mu_embed", "sigma_log_embed", "phi_embed", "decode") if family == VFE_MODEL_FAMILY
+                      else ("token_embed", "decode"))
+    for role in default_tables:
         sections["per_type_tables"].setdefault(role, 0)
     sections["positional_frames"].setdefault("pos_phi", 0)
 
@@ -177,13 +253,16 @@ def parameter_breakdown(
         section_total = sum(roles.values())
         out[section] = {**roles, "total": section_total,
                         "share": (section_total / total) if total else float("nan")}
+    out["frozen"] = {**frozen_section, "total": sum(frozen_section.values())}
     out["total"] = total
+    out["total_including_frozen"] = total + out["frozen"]["total"]
 
-    # Parameters read per token.
-    decode_full = _decoder_full_tables(roles_by_name, cfg)
+    # Parameters read per token (trainable parameters only; frozen tables are run constants).
+    trainable = {name: entry for name, entry in roles_by_name.items() if not entry["frozen"]}
+    decode_full = _decoder_full_tables(trainable, cfg)
     encode_rows = 0
     decode_rows = 0
-    for name, entry in roles_by_name.items():
+    for name, entry in trainable.items():
         if entry["section"] != "per_type_tables":
             continue
         if name in decode_full:
@@ -191,10 +270,10 @@ def parameter_breakdown(
         elif _leaf(name) not in DECODE_TABLE_LEAVES:
             encode_rows += entry["numel"] // max(1, entry["shape"][0])     # one row of the table
     positional_row = sum(entry["numel"] // max(1, entry["shape"][0])
-                         for entry in roles_by_name.values() if entry["section"] == "positional_frames")
+                         for entry in trainable.values() if entry["section"] == "positional_frames")
     decode_scalars = 0
     if cfg.decode_mode != "linear":
-        decode_scalars = sum(entry["numel"] for name, entry in roles_by_name.items()
+        decode_scalars = sum(entry["numel"] for name, entry in trainable.items()
                              if _leaf(name) == "decode_log_scale")
     context = out["context_processing"]["total"]
     components = {
@@ -209,13 +288,44 @@ def parameter_breakdown(
     out["read_per_token_components"] = components
     out["roles_by_name"] = roles_by_name
     out["excluded_buffers"] = excluded
-    out["definition"] = (
-        "per-type tables are the vocabulary-indexed prior-bank tables (token frames, prior means and "
-        "log-variances, decoder weights and biases); context processing is the relational comparison "
-        "and content maps, block MLPs and normalizations; parameters read per token are one row of each "
-        "encoder table, every row of the decoder tables (the softmax normalizes over the vocabulary), "
-        "one positional-frame row, and all context-processing parameters")
+    out["model_family"] = family
+    if family == VFE_MODEL_FAMILY:
+        out["definition"] = (
+            "per-type tables are the vocabulary-indexed prior-bank tables (token frames, prior means and "
+            "log-variances, decoder weights and biases); context processing is the relational comparison "
+            "and content maps, block MLPs and normalizations; parameters read per token are one row of "
+            "each encoder table, every row of the decoder tables (the softmax normalizes over the "
+            "vocabulary), one positional-frame row, and all context-processing parameters; frozen "
+            "(requires_grad=False) tables are run constants, listed apart and counted nowhere else")
+    else:
+        out["definition"] = (
+            "conventional transformer: per-type tables are the token table, the per-type read map when "
+            "present and the decoder weights and bias; context processing is W_Q, W_K "
+            "(relational_score), W_V, W_O (relational_content), the MLPs (block_mlp) and every "
+            "normalization (norm); parameters read per token are one row of the token table and of the "
+            "read map, every row of the decoder, and all context-processing parameters")
     return out
+
+
+def exclude_frozen_from_breakdown(
+    breakdown: Mapping[str, Any],
+    cfg:       Any,
+) -> Optional[Dict[str, Any]]:
+    r"""Recompute a breakdown recorded before the ``frozen`` section existed, or None when not needed.
+
+    Returns None when ``breakdown`` already has a ``frozen`` section, carries no ``roles_by_name``,
+    or ``cfg`` freezes nothing it lists (:func:`frozen_parameter_names`). Otherwise the breakdown is
+    rebuilt from the recorded shapes with those parameters frozen.
+    """
+    if "frozen" in breakdown or not isinstance(breakdown.get("roles_by_name"), Mapping):
+        return None
+    roles = breakdown["roles_by_name"]
+    frozen = frozen_parameter_names(cfg, roles.keys())
+    if not frozen:
+        return None
+    shapes = {name: torch.empty([int(s) for s in entry.get("shape", [])], device="meta")
+              for name, entry in roles.items()}
+    return parameter_breakdown(shapes, cfg, frozen=frozen)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -275,7 +385,8 @@ def optimizer_state_bytes(
         pid = int(pid)
         name = names.get(pid)
         if name is not None:
-            section, role = parameter_role(name, vocab_size=vocab_size)
+            section, role = parameter_role(name, vocab_size=vocab_size,
+                                           model_family=model_family_of(cfg_like))
         else:
             section, role = "unnamed", f"parameter_{pid}"
         for slot, value in slots.items():
