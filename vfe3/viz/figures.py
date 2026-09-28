@@ -21,14 +21,16 @@ from uuid import uuid4
 import matplotlib
 
 matplotlib.use("Agg")                                            # non-interactive (headless / tests)
+import matplotlib.figure
 import matplotlib.pyplot as plt
 
 from vfe3.families.base import get_functional_display
 from vfe3.metric_contracts import SCALING_MIN_TESTABLE_SIZES
 from vfe3.process_utils import ProcessTree, spawn_process_tree
 import numpy as np
+from matplotlib.collections import PathCollection, QuadMesh
 from matplotlib.colors import LogNorm
-from matplotlib.ticker import FuncFormatter, MaxNLocator
+from matplotlib.ticker import FuncFormatter, LogLocator, MaxNLocator, NullFormatter
 
 from vfe3.viz.text import installed_multilingual_sans_serif, token_label
 
@@ -83,8 +85,237 @@ def _figure_target_path(path: 'str | Path') -> Path:
     return target
 
 
+def _plain_tick(value: float, _pos: object = None) -> str:
+    r"""Plain decimal tick label (0.3, 20, 1500) for a log axis spanning at most three decades."""
+    v = float(value)
+    if not np.isfinite(v) or v <= 0.0:
+        return ""
+    if 1e4 <= v < 1e9:
+        return _count_label(v)                                   # 20000 -> '20k'
+    if 1e-3 <= v < 1e4:
+        text = f"{v:.3g}"
+        return f"{v:.0f}" if "e" in text else text
+    exponent = int(np.floor(np.log10(v)))
+    mantissa = v / 10.0 ** exponent
+    if abs(mantissa - 1.0) < 1e-6:
+        return rf"$10^{{{exponent}}}$"
+    return rf"${mantissa:.2g}\times10^{{{exponent}}}$"
+
+
+def _tidy_log_axis(axis: object) -> None:
+    r"""Readable ticks on one log-scaled axis.
+
+    Matplotlib labels a log axis at decades and, over a narrow range, at minor ticks in
+    :math:`a\times10^b` form, so a panel spanning 0.3 to 0.5 reads "3x10^-1, 4x10^-1" and one spanning
+    130 to 1800 carries a single "10^3" label. Below 0.6 decade the axis gets linear-step ticks, up to
+    1.5 decades ticks at 1, 2, 3, 5 per decade, up to three decades at 1, 2, 5, all with plain decimal
+    labels; wider axes keep the decade labels. Minor ticks stay unlabeled throughout.
+    """
+    lo, hi = sorted(float(v) for v in axis.get_view_interval())
+    if not (np.isfinite(lo) and np.isfinite(hi) and lo > 0.0 and hi > lo):
+        return
+    axis.set_minor_formatter(NullFormatter())
+    decades = float(np.log10(hi / lo))
+    if decades > 3.0:
+        return
+    if decades < 0.6:
+        axis.set_major_locator(MaxNLocator(nbins=4, steps=[1, 2, 2.5, 5, 10]))
+    elif decades < 1.5:
+        axis.set_major_locator(LogLocator(base=10.0, subs=(1.0, 2.0, 3.0, 5.0)))
+    else:
+        axis.set_major_locator(LogLocator(base=10.0, subs=(1.0, 2.0, 5.0)))
+    axis.set_major_formatter(FuncFormatter(_plain_tick))
+
+
+# Legend positions tried when a legend overlaps data, in order of preference.
+_LEGEND_LOCATIONS = ("upper right", "upper left", "lower right", "lower left",
+                     "center right", "center left", "upper center", "lower center")
+_LEGEND_MAX_HEADROOM = 0.5               # largest axes fraction a legend may claim above the data
+
+
+def _box_overlap(
+    ax:       object,
+    box:      object,                    # display-coordinate Bbox
+    renderer: object,
+
+    *,
+    exclude:  Sequence[object] = (),     # artists not counted (the one being placed)
+) -> float:
+    r"""How much of the axes content a display box covers.
+
+    A drawn line, marker set, scatter or hexbin cloud, bar, or text that the box touches costs 1; a
+    translucent band (``fill_between``) costs 0.25, so a box over a band is preferred to one over
+    a curve. The box is grown by 2 pt first, so a marker just outside it still counts.
+    """
+    from matplotlib.path import Path as MplPath
+
+    box = box.padded(renderer.points_to_pixels(2.0))
+    cost = 0.0
+    for line in ax.get_lines():
+        if not line.get_visible():
+            continue
+        xy = line.get_transform().transform(line.get_xydata())
+        xy = xy[np.isfinite(xy).all(axis=1)]
+        if not xy.size:
+            continue
+        if line.get_linestyle() in ("None", "none", "", " ") or xy.shape[0] == 1:
+            hit = box.count_contains(xy) > 0
+        else:
+            hit = MplPath(xy).intersects_bbox(box, filled=False)
+        cost += 1.0 if hit else 0.0
+    for collection in ax.collections:
+        if not collection.get_visible():
+            continue
+        offsets = np.asarray(collection.get_offsets())
+        if isinstance(collection, PathCollection) or offsets.shape[0] > 1:
+            points = collection.get_offset_transform().transform(offsets)
+            cost += 1.0 if box.count_contains(points[np.isfinite(points).all(axis=1)]) else 0.0
+        else:
+            transform = collection.get_transform()
+            if any(transform.transform_path(path).intersects_bbox(box, filled=True)
+                   for path in collection.get_paths()):
+                cost += 0.25
+    for artist in list(ax.patches) + list(ax.texts):
+        if (artist.get_visible() and artist not in exclude
+                and artist.get_window_extent(renderer).overlaps(box)):
+            cost += 1.0
+    return cost
+
+
+def _legend_overlap(ax: object, legend: object, renderer: object) -> float:
+    r""":func:`_box_overlap` of the legend's current box."""
+    return _box_overlap(ax, legend.get_window_extent(renderer), renderer)
+
+
+def _best_legend_location(ax: object, legend: object, renderer: object) -> tuple:
+    r"""``(cost, location)`` of the least-overlapping :data:`_LEGEND_LOCATIONS` entry (first zero wins);
+    the legend is left at that location."""
+    best_cost, best_location = np.inf, legend._loc
+    for location in _LEGEND_LOCATIONS:
+        legend.set_loc(location)
+        cost = _legend_overlap(ax, legend, renderer)
+        if cost < best_cost:
+            best_cost, best_location = cost, location
+        if cost == 0.0:
+            break
+    legend.set_loc(best_location)
+    return best_cost, best_location
+
+
+def _place_legend(ax: object, legend: object, renderer: object) -> None:
+    r"""Move an in-axes legend off the data it overlaps.
+
+    The legend keeps its position when that overlaps nothing. Otherwise the first overlap-free
+    position of :data:`_LEGEND_LOCATIONS` is taken. A single-column legend of four or more entries
+    that still overlaps is set in two columns when those fit the axes width. When every position
+    overlaps a curve, the y range is extended upward by the legend height (at most
+    :data:`_LEGEND_MAX_HEADROOM` of the axes) so the legend sits above the data. A legend anchored
+    outside the axes by its caller is left alone.
+    """
+    if getattr(legend, "_bbox_to_anchor", None) is not None:
+        return
+    if _legend_overlap(ax, legend, renderer) == 0.0:
+        return
+    best_cost, best_location = _best_legend_location(ax, legend, renderer)
+    if best_cost == 0.0:
+        return
+    if len(legend.get_texts()) >= 4 and getattr(legend, "_ncols", 1) == 1:
+        legend.set_ncols(2)
+        if legend.get_window_extent(renderer).width <= 0.98 * ax.bbox.width:
+            best_cost, best_location = _best_legend_location(ax, legend, renderer)
+            if best_cost == 0.0:
+                return
+        else:
+            legend.set_ncols(1)
+            legend.set_loc(best_location)
+    scale = ax.get_yscale()
+    if best_cost < 1.0 or scale not in ("linear", "log") or ax.yaxis_inverted():
+        return
+    height = legend.get_window_extent(renderer).height / max(ax.bbox.height, 1.0)
+    headroom = height + 0.04
+    if headroom > _LEGEND_MAX_HEADROOM:
+        return
+    y0, y1 = ax.get_ylim()
+    if scale == "log":
+        if y0 <= 0.0 or y1 <= 0.0:
+            return
+        top = 10.0 ** (np.log10(y0) + (np.log10(y1) - np.log10(y0)) / (1.0 - headroom))
+    else:
+        top = y0 + (y1 - y0) / (1.0 - headroom)
+    ax.set_ylim(y0, top)
+    raised_cost, raised_location = np.inf, best_location
+    for location in ("upper right", "upper left", "upper center"):
+        legend.set_loc(location)
+        cost = _legend_overlap(ax, legend, renderer)
+        if cost < raised_cost:
+            raised_cost, raised_location = cost, location
+    if raised_cost < best_cost:
+        legend.set_loc(raised_location)
+    else:
+        ax.set_ylim(y0, y1)
+        legend.set_loc(best_location)
+
+
+def tidy_figure(fig: object) -> object:
+    r"""Final layout pass applied to every saved figure.
+
+    Grid lines are removed from image axes (a heatmap's cells, not its coordinates, carry the
+    data), in-axes legends are moved off the data they overlap (:func:`_place_legend`), and log
+    axes get readable tick labels (:func:`_tidy_log_axis`). The figure is laid out once so the
+    legend and data boxes are in their final display positions.
+    """
+    for ax in fig.axes:
+        if ax.images or any(isinstance(c, QuadMesh) for c in ax.collections):
+            ax.grid(False)
+    fig.draw_without_rendering()
+    renderer = fig.canvas.get_renderer()
+    for ax in fig.axes:
+        legend = ax.get_legend()
+        if legend is not None and legend.get_visible() and not ax.images:
+            _place_legend(ax, legend, renderer)
+    for ax in fig.axes:
+        for axis in (ax.xaxis, ax.yaxis):
+            if axis.get_scale() == "log":
+                _tidy_log_axis(axis)
+        _unclip_edge_markers(ax)
+    return fig
+
+
+def _unclip_edge_markers(ax: object) -> None:
+    r"""Draw markers on the axes edge whole.
+
+    A step axis ends exactly at the first and last logged step, so their markers are cut in half by
+    the spines. A marker line or scatter whose data all lie inside the view limits cannot reach
+    beyond them, so it is drawn unclipped.
+    """
+    (x0, x1), (y0, y1) = sorted(ax.get_xlim()), sorted(ax.get_ylim())
+
+    def inside(xy: np.ndarray) -> bool:
+        xy = np.asarray(xy, dtype=float).reshape(-1, 2)
+        xy = xy[np.isfinite(xy).all(axis=1)]
+        tol_x, tol_y = 1e-9 * max(abs(x0), abs(x1), 1.0), 1e-9 * max(abs(y0), abs(y1), 1e-300)
+        return bool(xy.size) and bool(((xy[:, 0] >= x0 - tol_x) & (xy[:, 0] <= x1 + tol_x)
+                                       & (xy[:, 1] >= y0 - tol_y) & (xy[:, 1] <= y1 + tol_y)).all())
+
+    for line in ax.get_lines():
+        if (line.get_marker() not in (None, "None", "none", "", " ")
+                and line.get_transform() == ax.transData and inside(line.get_xydata())):
+            line.set_clip_on(False)
+    for collection in ax.collections:
+        if (isinstance(collection, PathCollection)
+                and collection.get_offset_transform() == ax.transData
+                and inside(collection.get_offsets())):
+            collection.set_clip_on(False)
+
+
 def _save(fig, path: Optional[str]):
     if path is not None:
+        if isinstance(fig, matplotlib.figure.Figure):
+            try:
+                tidy_figure(fig)
+            except Exception as exc:                             # layout polish never costs the figure
+                import logging
+                logging.getLogger(__name__).warning("tidy_figure skipped for %s (%s)", path, exc)
         target = _figure_target_path(path)
         temporary = target.with_name(
             f".{target.stem}.{uuid4().hex}.tmp{target.suffix}"
@@ -903,14 +1134,21 @@ def _attn_log_bounds(
 
 def _attn_imshow(ax, B: np.ndarray, *, vmin: float, vmax: float, log: bool = True, cmap: str = "magma"):
     r"""imshow one (N, N) attention map. ``log`` (default) uses ``LogNorm`` to resolve the peaky
-    off-diagonal structure a linear scale washes to black; exact-zero (causal-masked) entries are
-    non-positive, so ``LogNorm`` masks them and ``set_bad`` renders them black. ``cmap`` selects the
-    color family (belief beta = 'magma')."""
+    off-diagonal structure a linear scale washes to black. On a causal map (every entry above the
+    diagonal zero) the future keys are masked and drawn light gray, so they cannot be mistaken for
+    scorable keys with negligible weight; a zero weight on or below the diagonal (fp32 underflow) is
+    drawn at the bottom of the scale. ``cmap`` selects the color family (belief beta = 'magma')."""
     cmap_obj = plt.get_cmap(cmap).copy()
-    cmap_obj.set_bad("black")
+    cmap_obj.set_bad("#dddddd")
+    B = np.asarray(B, dtype=float)
+    shown = np.where(B > 0, B, vmin if log else 0.0)
+    if B.ndim == 2 and B.shape[0] == B.shape[1] and B.shape[0] > 1:
+        future = np.triu(np.ones(B.shape, dtype=bool), 1)
+        if not np.any(B[future] > 0):
+            shown = np.where(future, np.nan, shown)
     if log:
-        return ax.imshow(B, cmap=cmap_obj, aspect="auto", norm=LogNorm(vmin=vmin, vmax=vmax))
-    return ax.imshow(B, cmap=cmap_obj, aspect="auto", vmin=0.0, vmax=vmax)
+        return ax.imshow(shown, cmap=cmap_obj, aspect="auto", norm=LogNorm(vmin=vmin, vmax=vmax))
+    return ax.imshow(shown, cmap=cmap_obj, aspect="auto", vmin=0.0, vmax=vmax)
 
 
 def plot_attention_heatmap(
@@ -1028,6 +1266,17 @@ def _rolling_mean(v: np.ndarray, window: int) -> np.ndarray:
         return num / den
 
 
+def _log_rolling_mean(v: np.ndarray, window: int) -> np.ndarray:
+    r"""Centered rolling geometric mean :math:`\exp\bigl(\overline{\log v}\bigr)` for a positive series.
+
+    The trend of a series drawn on a log axis. An arithmetic mean turns one sample ten times its
+    neighbors into a window-wide plateau at twice the baseline, a level that was never logged; in log
+    space the same sample is a bump of :math:`10^{1/w}`.
+    """
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.exp(_rolling_mean(np.log(v), window))
+
+
 def _kstep(v, _pos=None) -> str:
     r"""Compact training-step tick label: 5000 -> '5k', 12500 -> '12.5k' (5-digit step labels
     overrun into an unreadable smear at the trajectory figure width otherwise)."""
@@ -1112,20 +1361,18 @@ def plot_trajectory(
         ax.axhline(med, color="#444444", ls="--", lw=1)
         ax.annotate(f"median {med:.2g}", xy=(0.985, med), xycoords=("axes fraction", "data"),
                     ha="right", va="bottom", fontsize=7, color="#444444")
+    callout = None
     if annotate in ("min", "max") and v.size:
         idx = int(np.argmin(v) if annotate == "min" else np.argmax(v))
         tag = "best" if annotate == "min" else "max"
         ax.scatter([x[idx]], [v[idx]], s=28, color="black", zorder=5)
-        # Offset the callout INTO the plot, away from the edge the extremum sits against: a 'min'
-        # hugs the floor -> label upward, a 'max' hugs the ceiling -> label downward, so the text
-        # never overruns the title (the grad_norm.png 'max'-into-title collision).
-        dy, va = (30, "bottom") if annotate == "min" else (-30, "top")
         # ``:.4g`` (matching annotate_final) so a heavy-tailed log series whose extremum is O(1e-4)
         # -- holonomy.png -- prints its real value instead of rounding to "0.0" under ``:.1f``.
-        ax.annotate(f"{tag} {v[idx]:.4g}\n@ step {int(x[idx]):,}",
-                    xy=(x[idx], v[idx]), xytext=(-12, dy), textcoords="offset points",
-                    fontsize=7.5, ha="right", va=va,
-                    arrowprops=dict(arrowstyle="->", lw=0.8, color="black"))
+        callout = ax.annotate(f"{tag} {v[idx]:.4g}\n@ step {int(x[idx]):,}",
+                              xy=(x[idx], v[idx]), xytext=(0, 0), textcoords="offset points",
+                              fontsize=7.5, arrowprops=dict(arrowstyle="->", lw=0.8, color="black"))
+        finite_x = x[np.isfinite(x)]
+        left_half = bool(finite_x.size) and x[idx] < 0.5 * (finite_x.min() + finite_x.max())
     if annotate_final and v.size:
         ax.annotate(f"{v[-1]:.4g}", xy=(x[-1], v[-1]), xytext=(6, 0), textcoords="offset points",
                     va="center", fontsize=8, fontweight="bold", color=color)
@@ -1133,7 +1380,54 @@ def plot_trajectory(
         _step_xaxis(ax)
     ax.set(title=title, xlabel="training step", ylabel=ylabel)
     fig.tight_layout()
+    if callout is not None:
+        _place_callout(ax, callout, toward_interior=1 if left_half else -1,
+                       upward=annotate == "min")
     return _save(fig, path)
+
+
+def _place_callout(
+    ax:              object,
+    callout:         object,             # Annotation with textcoords="offset points"
+    *,
+    toward_interior: int,                # +1: the point is in the left half, -1: the right half
+    upward:          bool,               # True for a minimum (room above it), False for a maximum
+) -> None:
+    r"""Put an extremum callout where its text stays inside the axes and crosses the fewest artists.
+
+    Candidates, in order: beside the point toward the middle of the x range, then diagonally into
+    the plot, then the same on the other side. A box outside the axes is ruled out, since it
+    would overrun the tick labels (belief_condition.png, max near the left edge) or the title
+    (grad_norm.png, max near the top).
+    """
+    fig = ax.figure
+    fig.draw_without_rendering()
+    renderer = fig.canvas.get_renderer()
+    vertical = 1 if upward else -1
+    near, far = ("bottom", "top") if upward else ("top", "bottom")
+    candidates = []
+    for side in (toward_interior, -toward_interior):
+        ha = "left" if side > 0 else "right"
+        candidates += [(14 * side, 4 * vertical, ha, near), (14 * side, -4 * vertical, ha, far),
+                       (12 * side, 30 * vertical, ha, near), (40 * side, 30 * vertical, ha, near),
+                       (12 * side, 55 * vertical, ha, near), (60 * side, 55 * vertical, ha, near)]
+    best = None
+    for dx, dy, ha, va in candidates:
+        callout.xyann = (dx, dy)
+        callout.set_horizontalalignment(ha)
+        callout.set_verticalalignment(va)
+        box = callout.get_window_extent(renderer)
+        inside = (box.x0 >= ax.bbox.x0 and box.x1 <= ax.bbox.x1
+                  and box.y0 >= ax.bbox.y0 and box.y1 <= ax.bbox.y1)
+        cost = _box_overlap(ax, box, renderer, exclude=(callout,)) + (0.0 if inside else 100.0)
+        if best is None or cost < best[0]:
+            best = (cost, dx, dy, ha, va)
+        if cost == 0.0:
+            break
+    _, dx, dy, ha, va = best
+    callout.xyann = (dx, dy)
+    callout.set_horizontalalignment(ha)
+    callout.set_verticalalignment(va)
 
 
 # ---------------------------------------------------------------------------
@@ -1409,7 +1703,7 @@ def _grad_norm_decomp_fig(
                 continue
             roles.append(role)
             ax.plot(x, vv, lw=0.6, color=color, alpha=0.25)
-            ax.plot(x, _rolling_mean(vv, w), lw=1.5, color=color, label=f"{label}  ={vv[-1]:.3g}")
+            ax.plot(x, _rolling_mean(vv, w), lw=1.5, color=color, label=f"{label} (last {vv[-1]:.3g})")
         if roles:
             ax.set_yscale("log")
             if step.size and _set_finite_xlim(ax, step):
@@ -1478,21 +1772,97 @@ def _live(history: Mapping[str, object], key: str) -> bool:
     return key in history and bool(np.isfinite(_np(history[key]).astype(float)).any())
 
 
+# Line-end labels are read beside the data, so the decode label drops its parenthetical.
+_GROUP_SHORT_LABELS = {**_GROUP_LABELS, "decode": "decode"}
+# The two parameter families of the small-multiple figures, each in one color.
+_FAMILIES = (("Per-type tables", _TABLE_GROUPS, _CB[0]),
+             ("Context processing", _CONTEXT_GROUPS, _CB[2]))
+
+
 def _group_panels(
     prefix:  str,
     ylabel:  str,
 
     *,
     exclude: Sequence[str] = (),
+    short:   bool          = False,      # line-end labels (_GROUP_SHORT_LABELS)
 ) -> List[Dict[str, object]]:
     r"""Two log-y panels over the named groups of ``prefix``: per-type tables and context processing."""
+    names = _GROUP_SHORT_LABELS if short else _GROUP_LABELS
     panels = []
     for title, groups in (("per-type tables", _TABLE_GROUPS),
                           ("context processing", _CONTEXT_GROUPS)):
-        series = [(f"{prefix}{group}", _GROUP_LABELS[group], _GROUP_COLORS[group])
+        series = [(f"{prefix}{group}", names[group], _GROUP_COLORS[group])
                   for group in groups if group not in exclude]
         panels.append({"title": title, "ylabel": ylabel, "logy": True, "series": series})
     return panels
+
+
+def _family_small_multiples(
+    history:  Mapping[str, object],
+    prefix:   str,                       # column prefix, e.g. "grad_norm_group_"
+    ylabel:   str,
+    suptitle: str,
+    path:     Optional[str],
+
+    *,
+    max_cols: int = 5,
+) -> object:
+    r"""One small log-y panel per live parameter group of ``prefix``, grouped by family, no legends.
+
+    Each family of :data:`_FAMILIES` starts a new row under a bold header, in its own color; a panel
+    is titled with its group and draws the raw series faintly under a rolling geometric-mean trend
+    (:func:`_log_rolling_mean`). Every panel shares one log y axis, so magnitudes compare across
+    groups and families, and one step axis. With one panel per series nothing can overlap, which is
+    why this layout replaces the overlaid two-panel form whose legends covered half of each panel.
+    """
+    step = _np(history["step"]).astype(float)
+    families = [(title, [g for g in groups if _live(history, f"{prefix}{g}")], color)
+                for title, groups, color in _FAMILIES]
+    families = [family for family in families if family[1]]
+    if not families:
+        raise FigureSkipped(f"no finite {prefix}<group> column")
+    ncols = max(1, min(int(max_cols), max(len(groups) for _, groups, _ in families)))
+    rows = [(title if start == 0 else None, groups[start:start + ncols], color)
+            for title, groups, color in families for start in range(0, len(groups), ncols)]
+    with _compact_style():
+        fig, axes = plt.subplots(len(rows), ncols, squeeze=False, sharex=True, sharey=True,
+                                 figsize=(MAX_FIGURE_WIDTH_IN, 1.6 * len(rows) + 0.5))
+        title_pt = float(plt.rcParams["axes.titlesize"])
+        for r, (header, groups, color) in enumerate(rows):
+            for c in range(ncols):
+                ax = axes[r][c]
+                if c >= len(groups):
+                    ax.axis("off")
+                    continue
+                v = _np(history[f"{prefix}{groups[c]}"]).astype(float)
+                keep = np.isfinite(v) & (v > 0) & np.isfinite(step)
+                x, vv = step[keep], v[keep]
+                if vv.size > 50:
+                    ax.plot(x, vv, lw=0.5, color=color, alpha=0.3)
+                    ax.plot(x, _log_rolling_mean(vv, max(5, vv.size // 80)), lw=1.2, color=color)
+                else:
+                    ax.plot(x, vv, "o-", ms=2.0, lw=1.0, color=color)
+                ax.set_yscale("log")
+                ax.set_title(_GROUP_LABELS[groups[c]])
+                ax.tick_params(labelbottom=True, labelleft=c == 0)
+                if c == 0:
+                    ax.set_ylabel(ylabel)
+                    if header is not None:
+                        # Above the panel title: titlepad plus a mathtext-tall title line.
+                        ax.annotate(header, xy=(0.0, 1.0), xycoords="axes fraction",
+                                    xytext=(0.0, float(plt.rcParams["axes.titlepad"]) + 1.6 * title_pt),
+                                    textcoords="offset points", ha="left", va="bottom",
+                                    fontsize=title_pt, fontweight="bold")
+        first = axes[0][0]
+        if _set_finite_xlim(first, step):
+            first.xaxis.set_major_locator(MaxNLocator(nbins=3, integer=True, steps=[1, 2, 2.5, 5, 10]))
+            first.xaxis.set_major_formatter(FuncFormatter(_kstep))
+        _tidy_log_axis(first.yaxis)                                  # final tick labels before layout
+        fig.suptitle(suptitle)
+        fig.supxlabel("training step", fontsize=float(plt.rcParams["axes.labelsize"]))
+        fig.tight_layout()
+        return _save(fig, path)
 
 
 @register_figure("grad_norm_decomposition")
@@ -1504,9 +1874,10 @@ def plot_grad_norm_decomposition(
 ):
     r"""M-STEP pre-clip parameter-gradient L2 norms over training, by named parameter group.
 
-    With the ``grad_norm_group_<g>`` columns (``g`` in :data:`PARAMETER_GROUPS`) the per-type tables
-    (mu, log-variance and phi tables, positional frames, decode) and the context-processing
-    parameters (score maps, content maps, block MLP, normalization, other) are drawn in two panels.
+    With the ``grad_norm_group_<g>`` columns (``g`` in :data:`PARAMETER_GROUPS`) each live group gets
+    its own panel (:func:`_family_small_multiples`): the per-type tables (mu, log-variance and phi
+    tables, positional frames, decode) in one row block and the context-processing parameters (score
+    maps, content maps, block MLP, normalization, other) in the next, all on one shared log y axis.
     A run that logged only the legacy per-ROLE columns falls back to those, labeled with what each
     role aggregates: the 'mu' role holds every parameter outside the Sigma and phi tables (decode,
     MLPs, relational maps, normalization), so it is not a mu-table gradient. Captured after
@@ -1514,9 +1885,9 @@ def plot_grad_norm_decomposition(
     ``estep_grad_norm_decomposition``.
     """
     if any(_live(history, f"grad_norm_group_{group}") for group in PARAMETER_GROUPS):
-        return _history_dashboard(
-            history, _group_panels("grad_norm_group_", r"pre-clip $\|\nabla L\|_2$"),
-            "M-step gradient norm by parameter group", path, ncols=2)
+        return _family_small_multiples(
+            history, "grad_norm_group_", r"pre-clip $\|\nabla L\|_2$",
+            "M-step gradient norm by parameter group", path)
     spec = [
         ("grad_norm_mu",    _ROLE_LABELS["mu"],    _CB[0], "mu"),
         ("grad_norm_sigma", _ROLE_LABELS["sigma"], _CB[1], "sigma"),
@@ -1780,13 +2151,13 @@ def plot_context_sensitivity(
                 transform=ax.transAxes, fontsize=9)
         ax.set_axis_off()
         return _save(fig, path)
-    bars = ax.bar(labels, values, color=_CB[:len(values)], width=0.55)
+    bars = ax.bar([name.replace("_", " ") for name in labels], values, color=_CB[:len(values)],
+                  width=0.55)
     for bar, value in zip(bars, values):
         ax.annotate(f"{value:.3f}", (bar.get_x() + bar.get_width() / 2.0, value),
                     ha="center", va="bottom", fontsize=8)
     ax.set(ylabel="relative belief shift (prefix randomized)",
            title="Where context enters the belief")
-    ax.tick_params(axis="x", labelsize=8)
     fig.tight_layout()
     return _save(fig, path)
 
@@ -1816,8 +2187,16 @@ def plot_phi_numerics_reference(
     axes[0].bar(x - 0.18, fp32, 0.36, color=_CB[0], label="fp32")
     axes[0].bar(x + 0.18, fp64, 0.36, color=_CB[1], label="fp64 reference")
     axes[0].set_xticks(x, labels)
-    if any(np.isfinite(value) and value > 0.0 for value in fp32 + fp64):
+    finite = [value for value in fp32 + fp64 if np.isfinite(value) and value > 0.0]
+    if finite:
         axes[0].set_yscale("log")
+        # Printed values: on a log axis a bar's visible height is set by the arbitrary axis floor.
+        for offset, values in ((-0.18, fp32), (0.18, fp64)):
+            for xi, value in zip(x + offset, values):
+                if np.isfinite(value) and value > 0.0:
+                    axes[0].annotate(_plain_tick(value), (xi, value), xytext=(0, 2),
+                                     textcoords="offset points", ha="center", va="bottom", fontsize=7)
+        axes[0].set_ylim(min(finite) / 10.0, max(finite) * 1e3)
     else:
         axes[0].text(0.5, 0.92, "zero at displayed precision",
                      transform=axes[0].transAxes, ha="center", va="top", fontsize=8)
@@ -1896,14 +2275,204 @@ def _series_panel(
         if vv.size > 50:
             ax.plot(x, vv, lw=0.6, color=color, alpha=0.25)
             ax.plot(x, _rolling_mean(vv, max(5, vv.size // 80)), lw=1.5, color=color,
-                    label=f"{label} ={vv[-1]:.3g}")
+                    label=f"{label} (last {vv[-1]:.3g})")
         else:
-            ax.plot(x, vv, "o-", ms=2.5, lw=1.2, color=color, label=f"{label} ={vv[-1]:.3g}")
+            ax.plot(x, vv, "o-", ms=2.5, lw=1.2, color=color, label=f"{label} (last {vv[-1]:.3g})")
     if drawn:
         if logy:
             ax.set_yscale("log")
         ax.legend(fontsize=6, frameon=False, loc="best")
     return drawn
+
+
+# Line-end labels of the direct-label dashboards (plot_optimizer_geometry).
+_LABEL_PT = 6.0                          # label font size (= MIN_TEXT_PT)
+_LABEL_GAP_PT = 1.0                      # clear space between two stacked labels
+_LABEL_MIN_CONTRAST = 4.5                # WCAG minimum for small text on white
+_LABEL_X_PT = 9.0                        # label left edge, right of the axes' right edge
+_LEADER_X_PT = (1.5, 7.5)                # leader start and end, right of the line end
+_LEADER_MIN_PT = 1.0                     # a label displaced by less than this gets no leader
+
+
+def _pack_labels(
+    y:   np.ndarray,                     # (n,) anchor positions, any order
+    gap: float,                          # minimum spacing between consecutive labels
+    lo:  float,                          # lowest allowed position
+    hi:  float,                          # highest allowed position
+) -> np.ndarray:
+    r"""Least-squares label positions at least ``gap`` apart that keep the anchors' order.
+
+    With the anchors sorted, :math:`y_{(1)}\le\dots\le y_{(n)}`, the positions solve
+    :math:`\min_p\sum_i(p_i-y_{(i)})^2` subject to :math:`p_{i+1}-p_i\ge g` and :math:`lo\le p_i\le hi`.
+    Substituting :math:`z_i=p_i-(i-1)g` turns the spacing constraint into :math:`z` nondecreasing,
+    which pool-adjacent-violators solves exactly; the bounds become the box
+    :math:`lo\le z_i\le hi-(n-1)g`, and clipping the isotonic solution onto it is optimal.
+    """
+    y = np.asarray(y, dtype=float)
+    n = y.size
+    if n == 0:
+        return y
+    order = np.argsort(y, kind="stable")
+    shift = gap * np.arange(n)
+    sums: List[float] = []
+    counts: List[int] = []
+    for value in y[order] - shift:                               # pool adjacent violators
+        sums.append(float(value))
+        counts.append(1)
+        while len(sums) > 1 and sums[-2] / counts[-2] > sums[-1] / counts[-1]:
+            total, count = sums.pop(), counts.pop()
+            sums[-1] += total
+            counts[-1] += count
+    fitted = np.concatenate([np.full(c, s / c) for s, c in zip(sums, counts)])
+    fitted = np.clip(fitted, lo, max(lo, hi - gap * (n - 1)))
+    out = np.empty(n)
+    out[order] = fitted + shift
+    return out
+
+
+def _label_color(color: str) -> tuple:
+    r"""The line color darkened toward black, hue kept, until its contrast on white
+    :math:`1.05/(L+0.05)` reaches :data:`_LABEL_MIN_CONTRAST` (:math:`L` the WCAG relative
+    luminance). Orange and pink lines are too faint as 6 pt text otherwise."""
+    from matplotlib.colors import to_rgb
+
+    def luminance(rgb: np.ndarray) -> float:
+        linear = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
+        return float(0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2])
+
+    rgb = np.array(to_rgb(color))
+    for _ in range(60):
+        if 1.05 / (luminance(rgb) + 0.05) >= _LABEL_MIN_CONTRAST:
+            break
+        rgb = rgb * 0.95
+    return tuple(float(c) for c in rgb)
+
+
+def _fit_ylim(ax: object, values: Sequence[np.ndarray], *, logy: bool, pad: float = 0.04) -> None:
+    r"""Y range = the drawn values' range padded by ``pad`` of its span (in :math:`\log_{10}` on a log
+    axis), so no decade above or below the data is left empty."""
+    v = np.concatenate([np.asarray(a, dtype=float).ravel() for a in values])
+    v = v[np.isfinite(v) & ((v > 0) if logy else True)]
+    if not v.size:
+        return
+    lo, hi = float(v.min()), float(v.max())
+    if logy:
+        a, b = np.log10(lo), np.log10(hi)
+        margin = pad * (b - a) if b > a else 0.05
+        ax.set_ylim(10.0 ** (a - margin), 10.0 ** (b + margin))
+    else:
+        margin = pad * (hi - lo) if hi > lo else max(0.05 * abs(lo), 1e-12)
+        ax.set_ylim(lo - margin, hi + margin)
+
+
+def _labeled_series_panel(
+    ax,
+    history: Dict,
+    step:    np.ndarray,
+    specs:   list,                       # [(column_key, label, color), ...]
+
+    *,
+    logy:    bool = False,
+) -> int:
+    r"""Plot each present series like :func:`_series_panel`, but name the lines at their right ends.
+
+    The trend of a long series is a rolling mean, taken in log space on a log axis
+    (:func:`_log_rolling_mean`). The y range is fitted to the drawn values; with two or more series
+    each line gets a label in a gutter right of the axes (:func:`_add_direct_labels`), so no legend
+    covers the data. Returns the series count drawn.
+    """
+    entries, drawn_values = [], []
+    for key, label, color in specs:
+        if key not in history:
+            continue
+        v = _np(history[key]).astype(float)
+        keep = np.isfinite(v) & np.isfinite(step)
+        if logy:
+            keep = keep & (v > 0)
+        x, vv = step[keep], v[keep]
+        if not vv.size:
+            continue
+        if vv.size > 50:
+            window = max(5, vv.size // 80)
+            trend = _log_rolling_mean(vv, window) if logy else _rolling_mean(vv, window)
+            ax.plot(x, vv, lw=0.6, color=color, alpha=0.25)
+            ax.plot(x, trend, lw=1.3, color=color)
+            drawn_values += [vv, trend]
+        else:
+            trend = vv
+            ax.plot(x, vv, "o-", ms=2.5, lw=1.2, color=color)
+            drawn_values.append(vv)
+        entries.append((label, color, float(x[-1]), float(trend[-1])))
+    if not entries:
+        return 0
+    if logy:
+        ax.set_yscale("log")
+    _fit_ylim(ax, drawn_values, logy=logy)
+    if logy:
+        _tidy_log_axis(ax.yaxis)                                 # final tick labels before the layout
+    if len(entries) > 1:
+        _add_direct_labels(ax, entries)
+    return len(entries)
+
+
+def _add_direct_labels(
+    ax:      object,
+    entries: Sequence[tuple],            # (text, color, x_end, y_end), anchors in data coordinates
+) -> None:
+    r"""Create the line-end labels and leaders of ``ax``; :func:`_settle_direct_labels` places them.
+
+    The texts are created right of the axes before the layout pass, so ``tight_layout`` reserves the
+    gutter they need; only their heights change afterwards, never their widths.
+    """
+    from matplotlib.lines import Line2D
+
+    labels = []
+    for text, color, x_end, y_end in entries:
+        label = ax.text(1.0, 0.5, text, transform=ax.transAxes, color=_label_color(color),
+                        fontsize=_LABEL_PT, ha="left", va="center", clip_on=False)
+        leader = Line2D([1.0, 1.0], [0.5, 0.5], transform=ax.transAxes, color=color, lw=0.6,
+                        clip_on=False, visible=False)
+        ax.add_line(leader)
+        labels.append({"text": label, "leader": leader, "x": x_end, "y": y_end})
+    ax._vfe3_direct_labels = labels
+    _settle_axes_labels(ax)
+
+
+def _settle_axes_labels(ax: object) -> None:
+    r"""Place the direct labels of one axes for its current position (axes-fraction coordinates).
+
+    Label spacing comes from the tallest measured label (a superscripted mathtext label is taller
+    than the font size); :func:`_pack_labels` keeps the anchors' order and moves each label as little
+    as it can, and a leader joins a displaced label to its line end.
+    """
+    labels = getattr(ax, "_vfe3_direct_labels", None)
+    if not labels:
+        return
+    fig = ax.figure
+    position = ax.get_position()
+    width_pt = position.width * fig.get_figwidth() * 72.0
+    height_pt = position.height * fig.get_figheight() * 72.0
+    to_axes = ax.transAxes.inverted()
+    anchors = np.array([to_axes.transform(ax.transData.transform((lab["x"], lab["y"])))
+                        for lab in labels])                      # (n, 2) axes fraction
+    renderer = fig.canvas.get_renderer()
+    tallest_pt = max(lab["text"].get_window_extent(renderer).height for lab in labels) * 72.0 / fig.dpi
+    gap = (tallest_pt + _LABEL_GAP_PT) / height_pt
+    placed = _pack_labels(anchors[:, 1], gap, 0.5 * gap, 1.0 - 0.5 * gap)
+    x_text = 1.0 + _LABEL_X_PT / width_pt
+    for lab, (xa, ya), yl in zip(labels, anchors, placed):
+        lab["text"].set_position((x_text, yl))
+        displaced = abs(yl - ya) * height_pt > _LEADER_MIN_PT
+        lab["leader"].set_visible(bool(displaced))
+        if displaced:
+            lab["leader"].set_data([xa + _LEADER_X_PT[0] / width_pt, 1.0 + _LEADER_X_PT[1] / width_pt],
+                                   [ya, yl])
+
+
+def _settle_direct_labels(fig: object) -> None:
+    r""":func:`_settle_axes_labels` on every axes of ``fig`` (after the final layout pass)."""
+    for ax in fig.axes:
+        _settle_axes_labels(ax)
 
 
 def _history_dashboard(
@@ -1915,6 +2484,7 @@ def _history_dashboard(
     *,
     ncols:    int           = 3,
     note:     Optional[str] = None,      # one-line figure footnote (e.g. what a legend role holds)
+    labels:   str           = "legend",  # "legend" (in-axes legend) | "direct" (line-end labels)
 ) -> object:
     r"""Small-multiples dashboard over training history: one mini-panel per group of commensurate
     columns. A panel whose every column is absent or all-NaN is dropped (so a run missing a metric
@@ -1924,7 +2494,10 @@ def _history_dashboard(
 
     A panel may carry its own ``"data"`` history (``{step, key: [...]}``) and ``"xlabel"``; it then
     plots against that step axis instead of the shared one (an eval-cadence long-format table next
-    to log-cadence columns)."""
+    to log-cadence columns). ``labels="direct"`` names each line at its right end instead of drawing
+    a legend (:func:`_labeled_series_panel`), for panels of several series that a legend would cover."""
+    if labels not in ("legend", "direct"):
+        raise ValueError(f"labels must be 'legend' or 'direct', got {labels!r}")
     live = []
     for p in panels:
         source = p.get("data", history)
@@ -1946,19 +2519,24 @@ def _history_dashboard(
             ax = axes[i // ncols][i % ncols]
             source = p.get("data", history)
             panel_step = _np(source["step"]).astype(float)
-            _series_panel(ax, source, panel_step, p["series"], logy=bool(p.get("logy", False)))
+            draw = _labeled_series_panel if labels == "direct" else _series_panel
+            draw(ax, source, panel_step, p["series"], logy=bool(p.get("logy", False)))
             ax.set(xlabel=p.get("xlabel", "training step"), ylabel=p["ylabel"], title=p["title"])
             if panel_step.size and _set_finite_xlim(ax, panel_step):
                 _step_xaxis(ax)
         for j in range(len(live), nrows * ncols):                # blank the unused grid cells
             axes[j // ncols][j % ncols].axis("off")
         fig.suptitle(suptitle)
+        # Direct labels sit in a gutter right of each panel: keep a clear gap before the next
+        # column's y label.
+        w_pad = 1.8 if labels == "direct" else None
         if note:
             fig.text(0.01, 0.005, note, fontsize=6, color="#444444", ha="left", va="bottom",
                      wrap=True)
-            fig.tight_layout(rect=(0.0, 0.035, 1.0, 1.0))
+            fig.tight_layout(rect=(0.0, 0.035, 1.0, 1.0), w_pad=w_pad)
         else:
-            fig.tight_layout()
+            fig.tight_layout(w_pad=w_pad)
+        _settle_direct_labels(fig)
         return _save(fig, path)
 
 
@@ -2043,7 +2621,7 @@ def _readout_panels(
         ]
     panels += [
         {"title": "Comparison covariance conditioning", "ylabel": "condition number", "logy": True,
-         "series": [("relational_projected_cov_max_condition", "maximum Q/K", _CB[1])]},
+         "series": [("relational_projected_cov_max_condition", "maximum over Q and K", _CB[1])]},
         {"title": "Comparison map smallest singular value", "ylabel": "singular value", "series": [
             ("relational_score_q_raw_min_singular_value", "Q", _CB[0]),
             ("relational_score_k_raw_min_singular_value", "K", _CB[1])]},
@@ -2275,8 +2853,10 @@ def plot_optimizer_geometry(
     update-to-weight ratios :math:`\lVert\Delta\theta_g\rVert/\lVert\theta_g\rVert` are drawn for the
     per-type tables and the context-processing parameters. The log-variance table is excluded from
     both: under weight decay its norm decays toward 0, so a ratio with that denominator rises for a
-    trivial reason. It is drawn instead as the mean and standard deviation of the stored
-    :math:`\log\sigma^2` entries (``sigma_log_mean``, ``sigma_log_sd``). A run with only the legacy
+    trivial reason. It is drawn instead as the mean and, in its own panel, the standard deviation of
+    the stored :math:`\log\sigma^2` entries (``sigma_log_mean``, ``sigma_log_sd``). Lines are named at
+    their right ends (``labels="direct"`` of :func:`_history_dashboard`), and each y range is fitted
+    to its data. A run with only the legacy
     per-ROLE columns shows role norms and :math:`\lVert\nabla_\theta\rVert/\lVert\theta\rVert` for
     the 'mu' and 'phi' roles with what each role aggregates in a figure note, and the norm of the
     log-variance table labeled as a norm. The phi pullback-group panels (ridge-direction cosine,
@@ -2290,9 +2870,9 @@ def plot_optimizer_geometry(
                   for group in PARAMETER_GROUPS)
     if grouped:
         norm_panels = _group_panels("param_norm_group_", r"$\|\theta_g\|_2$",
-                                    exclude=("sigma_log_embed",))
+                                    exclude=("sigma_log_embed",), short=True)
         ratio_panels = _group_panels("update_ratio_group_", r"$\|\Delta\theta_g\|/\|\theta_g\|$",
-                                     exclude=("sigma_log_embed",))
+                                     exclude=("sigma_log_embed",), short=True)
         for panel in norm_panels:
             panel["title"] = f"Parameter norm, {panel['title']}"
         for panel in ratio_panels:
@@ -2315,9 +2895,14 @@ def plot_optimizer_geometry(
                 ("grad_weight_ratio_phi", "'phi' role", _CB[2])]},
         ]
     if _live(hist, "sigma_log_mean") or _live(hist, "sigma_log_sd"):
-        panels.append({"title": r"Stored log-variances $\log\sigma^2$", "ylabel": "value", "series": [
-            ("sigma_log_mean", "mean", _CB[1]),
-            ("sigma_log_sd", "standard deviation", _CB[3])]})
+        # One panel each: the standard deviation (about 0.05) is two orders of magnitude below the
+        # mean (about 2), so on one linear axis it is a flat line at zero.
+        panels += [
+            {"title": "Stored log-variances: mean", "ylabel": r"mean of $\log\sigma^2$",
+             "series": [("sigma_log_mean", "mean", _CB[1])]},
+            {"title": "Stored log-variances: standard deviation", "ylabel": r"sd of $\log\sigma^2$",
+             "series": [("sigma_log_sd", "standard deviation", _CB[3])]},
+        ]
     else:
         panels.append({"title": r"Norm of the $\log\sigma^2$ table", "ylabel": r"$\|\log\sigma^2\|_2$",
                        "logy": True, "series": [
@@ -2342,7 +2927,7 @@ def plot_optimizer_geometry(
     title = ("Optimizer geometry with pullback-group phi update" if pullback
              else "Optimizer geometry")
     return _history_dashboard(hist, panels, title, path, ncols=2,
-                              note=None if grouped else _ROLE_NOTE)
+                              note=None if grouped else _ROLE_NOTE, labels="direct")
 
 
 # ---------------------------------------------------------------------------
@@ -2450,11 +3035,11 @@ def plot_learning_curves(
         for ax, (kind, x_axis, xlabel) in zip(axes, panels):
             keep = eval_rows & np.isfinite(x_axis)
             ax.plot(x_axis[keep], val[keep], "o-", ms=2.5, lw=1.2, color=_CB[0],
-                    label=f"validation ={val[keep][-1]:.3f}" if keep.any() else "validation")
+                    label=f"validation (last {val[keep][-1]:.3f})" if keep.any() else "validation")
             train_rows = np.isfinite(train) & np.isfinite(x_axis)
             if train_rows.any():
                 ax.plot(x_axis[train_rows], train[train_rows], "s--", ms=2.5, lw=1.2,
-                        color=_CB[1], label=f"fixed training sample ={train[train_rows][-1]:.3f}")
+                        color=_CB[1], label=f"fixed training sample (last {train[train_rows][-1]:.3f})")
             _passes(ax, x_axis)
             ax.set(xlabel=xlabel, ylabel="CE (nats/token)",
                    title="CE vs training tokens" if kind == "tokens" else "CE vs wall-clock time")
@@ -2467,7 +3052,7 @@ def plot_learning_curves(
             ax = axes[-1]
             keep = np.isfinite(gap) & np.isfinite(tokens)
             ax.plot(tokens[keep], gap[keep], "o-", ms=2.5, lw=1.2, color=_CB[2],
-                    label=f"gap ={gap[keep][-1]:.3f}" if keep.any() else "gap")
+                    label=f"gap (last {gap[keep][-1]:.3f})" if keep.any() else "gap")
             ax.axhline(0.0, color="#444444", lw=0.7, ls="--")
             _passes(ax, tokens)
             ax.set(xlabel=token_label, ylabel=r"$\mathrm{CE}_{\mathrm{val}}-\mathrm{CE}_{\mathrm{train}}$",
@@ -2485,9 +3070,11 @@ def plot_learning_curves(
 
 _ATTENTION_STATS = (
     ("entropy_norm", r"normalized entropy $H(\beta_{i\cdot})/\log n_i$", (0.0, 1.0)),
-    ("distance_mean", r"mean distance $\sum_j\beta_{ij}|i-j|$ (tokens)", None),
+    # ``{\sum}_j`` sets the index beside the sum; mathtext's ``\sum_j`` stacks it underneath, where
+    # it runs into the top edge of the panel below the title.
+    ("distance_mean", r"mean distance ${\sum}_j\beta_{ij}|i-j|$ (tokens)", None),
     ("self_weight", r"self-weight $\beta_{ii}$", (0.0, 1.0)),
-    ("prior_overlap", r"prior overlap $\sum_j\min(\beta_{ij},\beta^{\mathrm{prior}}_{ij})$", (0.0, 1.0)),
+    ("prior_overlap", r"prior overlap ${\sum}_j\min(\beta_{ij},\beta^{\mathrm{prior}}_{ij})$", (0.0, 1.0)),
 )
 
 
@@ -2966,7 +3553,7 @@ def plot_head_block_norms(
                                 ax.text(b, h, f"{share[h, b]:.2f}", ha="center", va="center",
                                         fontsize=6, color="white" if share[h, b] < 0.6 * vmax
                                         else "black")
-        fig.suptitle(f"Head x frame-block energy share of the interface maps "
+        fig.suptitle(f"Head \u00d7 frame-block energy share of the interface maps "
                      f"(row sums 1; uniform 1/B = {1.0 / n_blocks:.2f})")
         fig.tight_layout()
         if image is not None:
@@ -3004,27 +3591,30 @@ def plot_attention_structure(
     rows = _np(metrics.attention_entropy_rows(b))               # (L*H, N)
     n = b.shape[-1]
     h = b.shape[0]
-    _rot = 90 if h > 3 else 0                                    # rotate crowded (layer,head) ticks
+    _rot = 90 if h > 8 else 0                                    # rotate only crowded (layer,head) ticks
+    _tick_size = 6 if h > 8 else 8
     fig, axes = plt.subplots(1, 3, figsize=(13.2, 3.8))
     axes[0].violinplot([rows[i] for i in range(h)], showmeans=True)
     axes[0].axhline(float(np.log(n)), color="#444444", ls="--", lw=1, label=r"uniform $\log N$")
     axes[0].set(xticks=range(1, h + 1), ylabel="row entropy (nats)", title="Per-(layer,head) attention entropy")
-    axes[0].set_xticklabels(labels, rotation=_rot, fontsize=7)
+    axes[0].set_xticklabels(labels, rotation=_rot, fontsize=_tick_size)
     axes[0].legend(fontsize=8, frameon=False)
     js = _np(metrics.head_redundancy_js(b))                     # (L*H, L*H) over all (layer,head) maps
     im = axes[1].imshow(js, cmap="magma", aspect="auto")
     fig.colorbar(im, ax=axes[1], shrink=0.8, label="JS divergence (nats)")
     axes[1].set(xticks=range(h), yticks=range(h), xlabel="layer-head", ylabel="layer-head", title="Head redundancy")
-    axes[1].set_xticklabels(labels, rotation=90, fontsize=6)
-    axes[1].set_yticklabels(labels, fontsize=6)
+    axes[1].set_xticklabels(labels, rotation=_rot, fontsize=_tick_size)
+    axes[1].set_yticklabels(labels, fontsize=_tick_size)
     dd = metrics.attention_distance_decay(b)
     prof = _np(dd["profile"])                                    # (L*H, N)
     off = _np(dd["offsets"])
     for i in range(h):
-        axes[2].plot(off, np.clip(prof[i], 1e-8, None), color=plt.cm.viridis(i / max(h - 1, 1)), lw=1.2, label=labels[i])
+        # Below 1e-8 the profile is numerical zero: end the curve there instead of drawing the
+        # floor as a plateau that stretches the log axis over decades of nothing.
+        axes[2].plot(off, np.where(prof[i] > 1e-8, prof[i], np.nan), color=plt.cm.viridis(i / max(h - 1, 1)), lw=1.2, label=labels[i])
     axes[2].set_yscale("log")
-    axes[2].set(xlabel="offset |i - j|", ylabel=r"mean $\beta$", title="Attention distance decay")
-    axes[2].legend(fontsize=6, frameon=False, ncol=2)
+    axes[2].set(xlabel=r"offset $|i-j|$", ylabel=r"mean $\beta$", title="Attention distance decay")
+    axes[2].legend(fontsize=7, frameon=False, ncol=2)
     fig.tight_layout()
     return _save(fig, path)
 
@@ -3179,8 +3769,15 @@ def plot_belief_spectrum(
                 title="Per-token effective rank")
     kk = np.arange(1, eig.shape[1] + 1)
     _median_band(axes[1], kk, eig.T, _CB[0], "eigenvalue")
-    axes[1].axhline(covariance_eps, color=_CB[1], ls="--", lw=1,
-                    label=r"$\varepsilon$ floor")
+    positive = eig[np.isfinite(eig) & (eig > 0)]
+    if positive.size and covariance_eps < float(positive.min()) * 1e-3:
+        # Three or more decades below every eigenvalue: drawing it would squeeze the spectrum into
+        # the top of the panel, so the legend states it instead.
+        axes[1].plot([], [], color=_CB[1], ls="--", lw=1,
+                     label=rf"$\varepsilon$ floor = {_plain_tick(covariance_eps)} (below the axis)")
+    else:
+        axes[1].axhline(covariance_eps, color=_CB[1], ls="--", lw=1,
+                        label=r"$\varepsilon$ floor")
     if covariance_max is not None:
         axes[1].axhline(covariance_max, color=_CB[2], ls="--", lw=1,
                         label=r"$\sigma_{\max}$ ceiling")
@@ -3192,6 +3789,9 @@ def plot_belief_spectrum(
                 title="Belief conditioning")
     fig.tight_layout()
     return _save(fig, path)
+
+
+_ELLIPSE_MAX = 24                        # ellipses outlined by plot_spd_ellipses
 
 
 @register_figure("spd_ellipses")
@@ -3210,7 +3810,9 @@ def plot_spd_ellipses(
 
     For a full covariance the ellipse orientation and axes come from the eigendecomposition of the
     2x2 coordinate sub-block (the old ellipse used diagonal variances only, showing no correlation);
-    a diagonal belief degrades to axis-aligned. Facecolor encodes per-token effective rank.
+    a diagonal belief degrades to axis-aligned. The outline color encodes per-token effective rank;
+    with more than :data:`_ELLIPSE_MAX` tokens a subset spread evenly over the rank order is
+    outlined and every other token is shown by its mean only.
     """
     from matplotlib.patches import Ellipse
     from matplotlib.cm import ScalarMappable
@@ -3237,7 +3839,15 @@ def plot_spd_ellipses(
     norm = Normalize(vmin=rank.min(), vmax=rank.max() + 1e-12)
     cmap = plt.cm.viridis
     fig, ax = plt.subplots(figsize=(5, 4.4))
-    for i in range(m.shape[0]):
+    # A hundred overlapping ellipses read as one blob: outline a subset spread evenly over the
+    # effective-rank order (both extremes included) and mark every token's mean.
+    n_tokens = m.shape[0]
+    shown = np.arange(n_tokens)
+    if n_tokens > _ELLIPSE_MAX:
+        by_rank = np.argsort(rank, kind="stable")
+        shown = by_rank[np.unique(np.linspace(0, n_tokens - 1, _ELLIPSE_MAX).round().astype(int))]
+    shapes = []
+    for i in shown:
         if is_full:
             sub = s[i][np.ix_([a, b], [a, b])]
             w, v = np.linalg.eigh(0.5 * (sub + sub.T))
@@ -3245,11 +3855,21 @@ def plot_spd_ellipses(
             width, height = 2 * np.sqrt(np.clip(w[1], 0, None)), 2 * np.sqrt(np.clip(w[0], 0, None))
         else:
             ang, width, height = 0.0, 2 * np.sqrt(s[i, a]), 2 * np.sqrt(s[i, b])
+        shapes.append((i, ang, width, height))
+    # Largest first with a light fill and a rank-colored outline: overlapping opaque fills of a
+    # hundred tokens otherwise merge into one blob that hides every small ellipse.
+    for i, ang, width, height in sorted(shapes, key=lambda shape: -shape[2] * shape[3]):
+        color = cmap(norm(rank[i]))
         ax.add_patch(Ellipse((m[i, a], m[i, b]), width=width, height=height, angle=ang,
-                             alpha=0.35, facecolor=cmap(norm(rank[i])), edgecolor="#26456E", lw=0.5))
-    ax.scatter(m[:, a], m[:, b], s=8, color="#26456E")
+                             facecolor="none", edgecolor=color, lw=0.9))
+    ax.scatter(m[:, a], m[:, b], s=5, color="#9a9a9a", lw=0, zorder=2)
+    ax.scatter(m[shown, a], m[shown, b], s=12, c=[cmap(norm(rank[i])) for i in shown],
+               edgecolors="#26456E", linewidths=0.4, zorder=3)
     fig.colorbar(ScalarMappable(norm=norm, cmap=cmap), ax=ax, shrink=0.8, label="effective rank")
-    ax.set(title="Belief SPD covariance ellipses", xlabel=f"dim {a}", ylabel=f"dim {b}")
+    subtitle = (f"{shown.size} of {n_tokens} tokens outlined; gray dots: every mean"
+                if shown.size < n_tokens else f"{n_tokens} tokens")
+    ax.set(title=f"Belief covariance ellipses, dims {a} and {b}\n{subtitle}",
+           xlabel=f"dim {a}", ylabel=f"dim {b}")
     ax.autoscale_view()
     return _save(fig, path)
 
@@ -3510,12 +4130,13 @@ def plot_numerical_trust(
     """
     guard_denominators = dict(guard_denominators or {})
     guard_names = {
-        "sigma_floor_frac":       "variance at the floor eps",
-        "sigma_ceil_frac":        "variance at the ceiling sigma_max",
-        "energy_klmax_frac":      "pair energy at kl_max (all pairs)",
-        "energy_klmax_frac_live": "pair energy at kl_max (causal pairs)",
-        "selfdiv_klmax_frac":     "self-divergence at kl_max",
+        "sigma_floor_frac":       r"variance at the floor $\varepsilon$",
+        "sigma_ceil_frac":        r"variance at the ceiling $\sigma_{\max}$",
+        "energy_klmax_frac":      r"pair energy at $\mathrm{KL}_{\max}$ (all pairs)",
+        "energy_klmax_frac_live": r"pair energy at $\mathrm{KL}_{\max}$ (causal pairs)",
+        "selfdiv_klmax_frac":     r"self-divergence at $\mathrm{KL}_{\max}$",
     }
+    symbols = {"mu": r"$\mu$", "sigma": r"$\Sigma$", "phi": r"$\phi$", "beta": r"$\beta$"}
     rows: List[List[str]] = []
     nonzero: List[bool] = []
 
@@ -3532,18 +4153,18 @@ def plot_numerical_trust(
             _add(label, float(guard[key]), guard_denominators.get(key))
     for key in (k for k in health if k.startswith("nan_")):
         name = key.removeprefix("nan_")
-        _add(f"non-finite {name}", float(health[key]), health.get(f"numel_{name}"))
+        _add(f"non-finite {symbols.get(name, name)}", float(health[key]), health.get(f"numel_{name}"))
     if causal is not None:
         leak = _np(causal["future_leakage"]).astype(float).ravel()
         n_maps = int(leak.size)
         n_leaking = int((~(leak <= leak_tol)).sum())                 # NaN counts as leaking
-        rows.append([f"(layer, head) maps with future attention > {leak_tol:g}",
+        rows.append([f"(layer, head) maps with future attention > {_plain_tick(leak_tol)}",
                      f"{n_leaking:,}", f"{n_maps:,}", f"{n_leaking / max(n_maps, 1):.3g}"])
         nonzero.append(n_leaking > 0)
         if "row_sum_error" in causal:
             row_err = _np(causal["row_sum_error"]).astype(float).ravel()
             n_bad = int((~(row_err <= row_sum_tol)).sum())
-            rows.append([f"(layer, head) maps with |row sum - 1| > {row_sum_tol:g}",
+            rows.append([rf"(layer, head) maps with $|{{\sum}}_j\beta_{{ij}}-1|$ > {_plain_tick(row_sum_tol)}",
                          f"{n_bad:,}", f"{int(row_err.size):,}",
                          f"{n_bad / max(int(row_err.size), 1):.3g}"])
             nonzero.append(n_bad > 0)
@@ -3557,8 +4178,11 @@ def plot_numerical_trust(
         table.auto_set_font_size(False)
         table.set_fontsize(7)
         table.scale(1.0, 1.25)
-        for (row, _col), cell in table.get_celld().items():
+        for (row, col), cell in table.get_celld().items():
             cell.set_linewidth(0.4)
+            # Text column flush left, count columns flush right, with a narrow inset.
+            cell.PAD = 0.02 if col == 0 else 0.06
+            cell.get_text().set_horizontalalignment("left" if col == 0 else "right")
             if row == 0:
                 cell.set_text_props(fontweight="bold")
             elif nonzero[row - 1]:
@@ -3567,10 +4191,9 @@ def plot_numerical_trust(
         title = "Numerical trust: counts with denominators"
         if population:
             title += f" ({population})"
-        ax.set_title(title, fontsize=8)
         if max_condition is not None and np.isfinite(float(max_condition)):
-            fig.text(0.01, 0.01, f"largest covariance condition number: {float(max_condition):.4g}",
-                     fontsize=6.5, color="#444444")
+            title += f"\nlargest covariance condition number: {float(max_condition):.4g}"
+        ax.set_title(title, fontsize=8)
         fig.tight_layout()
         return _save(fig, path)
 
@@ -3895,6 +4518,31 @@ def _tok_label(decode, tid) -> str:
     return token_label(int(tid), decode=decode)
 
 
+def _distinct_token_labels(decode, ids: Sequence[int]) -> List[str]:
+    r"""Labels of :func:`_tok_label` made distinct across ``ids``.
+
+    Distinct tokens that differ only in whitespace (``"."`` and ``" ."``) share a label, so a label
+    that repeats is rewritten with its spaces shown as ``·``; one still repeating gets its id.
+    """
+    from collections import Counter
+
+    labels = [_tok_label(decode, t) for t in ids]
+    counts = Counter(labels)
+    out = []
+    for tid, label in zip(ids, labels):
+        if counts[label] > 1 and decode is not None:
+            try:
+                raw = decode([int(tid)])
+            except Exception:
+                raw = ""
+            visible = raw.replace(" ", "\u00b7").replace("\n", "\n").replace("\t", "\t")
+            if visible and visible.isprintable():
+                label = visible if len(visible) <= 12 else visible[:11] + "\u2026"
+        out.append(label)
+    counts = Counter(out)
+    return [f"{label} #{int(tid)}" if counts[label] > 1 else label for tid, label in zip(ids, out)]
+
+
 @register_figure("vocab_probability_heatmap")
 def plot_vocab_probability_heatmap(
     arms,                                # list of vocab_prediction_stats dicts (+ "label")
@@ -3923,7 +4571,7 @@ def plot_vocab_probability_heatmap(
         vmin = max(vmin, vmax * 1e-4, 1e-12)
         im = ax.imshow(prob, aspect="auto", cmap=cmap, norm=LogNorm(vmin=vmin, vmax=max(vmax, vmin * 1.1)))
         ax.set_yticks(range(prob.shape[0]))
-        ax.set_yticklabels([_tok_label(decode, t) for t in rows], fontsize=6)
+        ax.set_yticklabels(_distinct_token_labels(decode, rows), fontsize=6)
         ax.set_xlabel("sequence position")
         for p in range(min(prob.shape[1], truth.shape[0])):
             r = int(truth[p])
@@ -3961,16 +4609,18 @@ def plot_vocab_calibration(
         if x.size:
             hb = ax.hexbin(x, y, gridsize=40, bins="log", cmap="viridis", mincnt=1)
             fig.colorbar(hb, ax=ax, fraction=0.046, pad=0.02, label="tokens (log)")
-            lo = float(min(x.min(), y.min()))
-            hi = float(max(x.max(), y.max()))
-            ax.plot([lo, hi], [lo, hi], color=_CB[1], lw=1.2, ls="--", label="y=x (marginal predictor)")
+            # Over the x range only: drawn over the y range, the diagonal stretches the x axis far
+            # past the data (predicted probabilities run decades below any unigram frequency).
+            lo, hi = float(x.min()), float(x.max())
+            ax.plot([lo, hi], [lo, hi], color=_CB[1], lw=1.2, ls="--", label="y = x (marginal predictor)")
             ax.legend(fontsize=7, frameon=False, loc="best")
         hp = float(arm.get("mean_pred_entropy", float("nan")))
         hu = float(arm.get("unigram_entropy", float("nan")))
-        ax.set_xlabel("log10 empirical next-token freq")
-        ax.set_ylabel("log10 mean predicted prob")
-        ax.set_title(f"{arm.get('label', '')}  Hpred={hp:.2f}  Huni={hu:.2f}  gain={hu - hp:.2f}")
-    fig.suptitle("Vocabulary calibration: predicted prob vs unigram (collapse -> mass on y=x, gain -> 0)")
+        ax.set_xlabel(r"$\log_{10}$ empirical next-token frequency")
+        ax.set_ylabel(r"$\log_{10}$ mean predicted probability")
+        ax.set_title(rf"{arm.get('label', '')}: $H_{{\mathrm{{pred}}}}$ = {hp:.2f}, "
+                     rf"$H_{{\mathrm{{uni}}}}$ = {hu:.2f}, gain = {hu - hp:.2f}")
+    fig.suptitle("Vocabulary calibration\n(collapse: mass on y = x and gain near 0)")
     fig.tight_layout()
     return _save(fig, path)
 
@@ -4012,8 +4662,9 @@ def plot_vocab_confusion(
             for j in range(C):
                 ax.text(j, i, f"{Mn[i, j]:.2f}", ha="center", va="center", fontsize=6,
                         color="white" if Mn[i, j] < 0.6 else "black")
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02, label="P(pred cat | true cat)")
-    fig.suptitle(f"Next-token category confusion ({taxonomy}, row-normalized)")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02, label="P(predicted | true category)")
+    taxonomy_name = {"function_content": "function/content"}.get(taxonomy, taxonomy.replace("_", " "))
+    fig.suptitle(f"Next-token category confusion ({taxonomy_name}, row-normalized)")
     fig.tight_layout()
     return _save(fig, path)
 
@@ -4043,9 +4694,10 @@ def plot_decode_readout(
         ax.set_yticks(range(0, W.shape[0], step))
         ax.set_yticklabels([_tok_label(decode, rows[i]) for i in range(0, W.shape[0], step)], fontsize=6)
         ax.set_xlabel("latent dimension k")
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
         ax.set_title(str(arm.get("label", "")))
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02, label="W[v, k]")
-    fig.suptitle("Linear decode readout W (top-norm vocab rows): logits = mu_q @ W^T")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02, label=r"$W_{vk}$")
+    fig.suptitle(r"Linear decode readout $W$ (top-norm vocabulary rows), $\mathrm{logits}=\mu_q W^{\top}$")
     fig.tight_layout()
     return _save(fig, path)
 
@@ -4102,7 +4754,7 @@ def plot_reliability_diagram(
                        label="bin (area ~ token frac)")
         ax.set(xlim=(0, 1), ylim=(0, 1), xlabel="decode confidence (max softmax prob)",
                ylabel="empirical accuracy")
-        title = "Decode reliability" + (f"  (ECE={ece:.3f})" if ece is not None else "")
+        title = "Decode reliability" + (f" (ECE = {ece:.3f})" if ece is not None else "")
         if population:
             title += f"\n{population}"
         ax.set_title(title)
@@ -4119,10 +4771,10 @@ def _sigma_trace_labels(frozen_covariance: bool) -> Dict[str, str]:
     if frozen_covariance:
         return {"quantity": "input-token variance",
                 "axis": r"input-token variance tr$\,\Sigma(x_i)$",
-                "bin": "tr Sigma(x_i)"}
+                "bin": r"tr$\,\Sigma(x_i)$"}
     return {"quantity": "belief uncertainty",
             "axis": r"belief uncertainty tr$(\Sigma_q)$",
-            "bin": "tr(Sigma_q)"}
+            "bin": r"tr$(\Sigma_q)$"}
 
 
 @register_figure("sigma_stratified_error")
@@ -4167,11 +4819,13 @@ def plot_sigma_stratified_error(
         ax.plot(xs, ms, "o-", color=_CB[0], lw=1.8, label=f"mean CE per {labels['bin']} decile")
         ax.fill_between(xs, los, his, color=_CB[0], alpha=0.2, label="bootstrap 10-90 band")
         rho = _spearman_np(tr, ce)
-        ax.set_title(f"{title}  (Spearman rho={rho:+.3f})")
+        ax.set_title(rf"{title} (Spearman $\rho$ = {rho:+.3f})")
     else:
         ax.set_title(f"{title} (insufficient tokens)")
     ax.set(xlabel=labels["axis"], ylabel="cross-entropy (nats)")
-    ax.legend(fontsize=8, frameon=False)
+    ax.xaxis.set_major_formatter(FuncFormatter(_count_label))
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend(fontsize=8, frameon=False)
     fig.tight_layout()
     return _save(fig, path)
 
@@ -4205,15 +4859,21 @@ def plot_sigma_ce_scatter(
     with _compact_style():
         fig, ax = plt.subplots(figsize=(4.8, 3.6))
         if tr.size:
-            hb = ax.hexbin(tr, ce, gridsize=40, bins="log", cmap="viridis", mincnt=1)
+            # A log trace axis: a few tokens with a trace several times the median otherwise stretch a
+            # linear axis until the bulk of the cloud fills its left fifth.
+            positive = bool((tr > 0).all())
+            hb = ax.hexbin(tr, ce, gridsize=40, bins="log", cmap="viridis", mincnt=1,
+                           xscale="log" if positive else "linear")
             fig.colorbar(hb, ax=ax, fraction=0.046, pad=0.02, label="tokens (log)")
+            if not positive:
+                ax.xaxis.set_major_formatter(FuncFormatter(_count_label))
         rho = _spearman_np(tr, ce) if tr.size >= 2 else float("nan")
         ax.set(xlabel=labels["axis"],
                ylabel=("next-token cross-entropy (nats)" if frozen_covariance
                        else "cross-entropy (nats)"))
         trace_symbol = (r"$\mathrm{tr}\,\Sigma(x_i)$" if frozen_covariance
                         else r"$\mathrm{tr}(\Sigma_q)$")
-        title = trace_symbol + rf" vs CE  (Spearman $\rho$={rho:+.3f}, n={tr.size:,})"
+        title = trace_symbol + rf" vs CE (Spearman $\rho$ = {rho:+.3f}, n = {tr.size:,})"
         if frozen_covariance:
             title = r"$\Sigma$ frozen at encode: " + title
         ax.set_title(title)
@@ -4228,9 +4888,10 @@ def plot_sigma_ce_scatter(
         if population:
             notes.append(population)
         if notes:
-            ax.text(0.02, 0.98, "\n".join(notes), transform=ax.transAxes, va="top", ha="left",
-                    fontsize=6, bbox=dict(boxstyle="round,pad=0.25", facecolor="white",
-                                          edgecolor="#999999", alpha=0.85))
+            # Under the x label, not over the data: an in-axes box covers the high-CE hexbins.
+            ax.annotate("\n".join(notes), xy=(0.0, 0.0), xycoords="axes fraction",
+                        xytext=(0.0, -30.0), textcoords="offset points", va="top", ha="left",
+                        fontsize=6, color="#444444")
         fig.tight_layout()
         return _save(fig, path)
 

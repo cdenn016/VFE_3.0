@@ -5357,7 +5357,7 @@ def _save_figures(
             fig = figs.plot_trajectory(
                 ny, nx, ylabel=r"$\|\nabla\|_2$ (pre-clip)", title="Gradient norm",
                 color=figs._CB[5 % len(figs._CB)], logy=True, smooth=max(5, len(ny) // 80),
-                annotate="max", path=str(run / "grad_norm.png"))
+                path=str(run / "grad_norm.png"))
             figs.plt.close(fig)
         # M-step per-role gradient-norm decomposition (mu / sigma / phi): the parameter-learning
         # channels the aggregate grad_norm.png folds together. Columns logged by train_step (aggregated
@@ -5396,8 +5396,8 @@ def _save_figures(
         if cy and "belief_condition" not in route_skips:
             fig = figs.plot_trajectory(
                 cy, cx, ylabel=r"median $\lambda_{\max}/\lambda_{\min}$",
-                title="Belief covariance conditioning", color=figs._CB[6 % len(figs._CB)],
-                logy=True, smooth=max(5, len(cy) // 80), annotate="max",
+                title="Belief covariance conditioning", color=figs._CB[4 % len(figs._CB)],
+                logy=True, smooth=max(5, len(cy) // 80),
                 path=str(run / "belief_condition.png"))
             figs.plt.close(fig)
         ex, ey = _aligned("estep_f_drop")

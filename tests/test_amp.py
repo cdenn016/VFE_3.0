@@ -203,6 +203,8 @@ def test_sigma_calibration_figures_render_from_a_bf16_bank(tmp_path):
     }
     stratified = tmp_path / "sigma_stratified_error.png"
     scatter = tmp_path / "sigma_ce_scatter.png"
-    figs.plot_sigma_stratified_error(bank, n_bins=4, n_boot=8, path=str(stratified))
-    figs.plot_sigma_ce_scatter(bank, path=str(scatter))
+    figures = [figs.plot_sigma_stratified_error(bank, n_bins=4, n_boot=8, path=str(stratified)),
+               figs.plot_sigma_ce_scatter(bank, path=str(scatter))]
+    for figure in figures:
+        figs.plt.close(figure)                   # an open figure fails later tests' leak checks
     assert stratified.exists() and scatter.exists()
