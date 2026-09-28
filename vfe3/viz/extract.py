@@ -816,8 +816,9 @@ def numerical_health(
     r"""Non-finite fractions of the converged intermediates + the worst covariance conditioning.
 
     Replays the converged belief and its energy / attention (as model.diagnostics does) and
-    reports ``nan_inf_fraction`` for mu, sigma, phi, energy, and beta, plus the maximum spectral
-    condition number of the belief covariances. A near-zero finiteness map certifies stability is
+    reports ``nan_inf_fraction`` for mu, sigma, phi, energy, and beta (``nan_<x>``) with the entry
+    count each fraction is taken over (``numel_<x>``, so a fraction converts to "k of N"), plus the
+    maximum spectral condition number of the belief covariances. A near-zero finiteness map certifies stability is
     genuine convergence, not masked blow-ups. (Numerical-FALLBACK activation counters --
     safe_cholesky jitter rounds, pinv fallbacks -- would require instrumenting numerics and are
     left to a future pass.)
@@ -841,6 +842,8 @@ def numerical_health(
             "nan_energy": nan_inf_fraction(capture["score_energy_pre"]),
             "nan_beta": nan_inf_fraction(capture["beta_pre"]),
             "max_condition": float(condition.max()),
+            **_numel_counts(mu=out.mu, sigma=out.sigma, phi=out.phi,
+                            energy=capture["score_energy_pre"], beta=capture["beta_pre"]),
         }
     from vfe3.numerics import nan_inf_fraction
     from vfe3.geometry.transport import RopeTransport   # m5: used below under pos_rotation='rope' (was NameError)
@@ -900,8 +903,71 @@ def numerical_health(
         "nan_energy": nan_inf_fraction(energy),
         "nan_beta":   nan_inf_fraction(beta),
         "max_condition": cond,
+        **_numel_counts(mu=out.mu, sigma=out.sigma, phi=out.phi, energy=energy, beta=beta),
     }
     return health
+
+
+def _numel_counts(**tensors: torch.Tensor) -> Dict[str, int]:
+    r"""``numel_<name>``: the number of entries each ``nan_<name>`` fraction was taken over."""
+    return {f"numel_{name}": int(tensor.numel()) for name, tensor in tensors.items()}
+
+
+def guard_denominators(
+    sigma:    torch.Tensor,                    # (..., K) diagonal OR (..., K, K) full covariance
+    energy:   torch.Tensor,                    # (..., N, N) pairwise energies
+    self_div: Optional[torch.Tensor] = None,   # (..., N) or (..., N, K) self-divergences
+
+    *,
+    diagonal: Optional[bool] = None,
+) -> Dict[str, int]:
+    r"""Entry counts behind each :func:`vfe3.metrics.guard_saturation` fraction.
+
+    The variance guards examine the covariance spectrum: one value per coordinate of a diagonal
+    covariance (``sigma.numel()``) and ``K`` eigenvalues per ``K x K`` full covariance
+    (``sigma.numel() / K``). The energy guard examines every pair of the ``(..., N, N)`` grid,
+    masked pairs included, and the self-divergence guard every self-divergence entry. A count
+    multiplied by its fraction gives the number of pinned entries. ``diagonal`` is resolved exactly
+    as ``guard_saturation`` resolves it (explicit value, else a trailing square pair means full).
+    """
+    full = (not diagonal) if diagonal is not None else (
+        sigma.dim() >= 2 and sigma.shape[-1] == sigma.shape[-2])
+    spectrum = int(sigma.numel() // sigma.shape[-1]) if full else int(sigma.numel())
+    counts = {
+        "sigma_floor_frac":  spectrum,
+        "sigma_ceil_frac":   spectrum,
+        "energy_klmax_frac": int(energy.numel()),
+    }
+    if self_div is not None:
+        counts["selfdiv_klmax_frac"] = int(self_div.numel())
+    return counts
+
+
+@torch.no_grad()
+def vocabulary_sigma_trace(
+    model:  torch.nn.Module,
+
+    *,
+    chunk:  int = 1024,
+) -> torch.Tensor:
+    r"""Per-type encode covariance trace :math:`\mathrm{tr}\,\Sigma(v)` for every vocabulary id ``v``.
+
+    Encodes the ids ``0..V-1`` through ``model.prior_bank.encode`` in chunks and reduces with
+    :func:`vfe3.metrics.sigma_trace` (the same reduction as :func:`belief_ce_bank`). On a route whose
+    covariance is frozen at encode this is the covariance every occurrence of ``v`` carries, so its
+    coefficient of variation over the vocabulary is the type-level spread, unweighted by frequency.
+    Returns a CPU float64 tensor of shape (V,).
+    """
+    cfg = model.cfg
+    device = _model_device(model)
+    traces = []
+    for start in range(0, int(cfg.vocab_size), int(chunk)):
+        ids = torch.arange(start, min(start + int(chunk), int(cfg.vocab_size)),
+                           device=device).unsqueeze(0)                       # (1, n)
+        sigma = model.prior_bank.encode(ids).sigma                           # (1, n, K) or (1, n, K, K)
+        traces.append(metrics.sigma_trace(
+            sigma, diagonal=cfg.diagonal_covariance, family=cfg.family).reshape(-1).double().cpu())
+    return torch.cat(traces)
 
 
 @torch.no_grad()
@@ -928,6 +994,7 @@ def readout_state(
     state = {
         "mu": out.mu, "sigma": out.sigma, "phi": out.phi,
         "energy": cap["score_energy_pre"], "beta": cap["beta_pre"], "guard": guard,
+        "guard_denominators": guard_denominators(out.sigma, cap["score_energy_pre"], diagonal=True),
         "inference_semantics": model.conditional_semantics,
         "covariance_semantics": "receiver_bookkeeping",
     }

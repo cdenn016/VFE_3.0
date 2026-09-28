@@ -80,9 +80,12 @@ def test_predictive_report_emits_state_figures_and_finite_readout_panels(tmp_pat
         max_sequences=1,
     )
     names = {p.name for p in written}
-    assert {"iterate_trajectory.png", "belief_trajectories.png", "belief_spectrum.png",
-            "spd_ellipses.png", "numerical_trust.png", "per_layer_diagnostics.png",
-            "gauge_head_specialization.png", "holonomy_curvature.png"} <= names
+    assert {"numerical_trust.png", "per_layer_diagnostics.png", "head_block_norms.png"} <= names
+    # Route gates (audit k160 Section 4): one readout and no E-step iterates, covariance frozen at
+    # encode, flat transport; the retired gauge_head_specialization is replaced by head_block_norms.
+    assert names.isdisjoint({"iterate_trajectory.png", "belief_trajectories.png",
+                             "belief_spectrum.png", "spd_ellipses.png",
+                             "gauge_head_specialization.png", "holonomy_curvature.png"})
     assert "gauge_equivariance.png" not in names
     fig = figures.plot_per_layer_diagnostics(model.diagnostics_per_layer(tokens))
     assert all(any(torch.isfinite(torch.as_tensor(line.get_ydata())).any() for line in ax.lines)
@@ -105,7 +108,10 @@ def test_existing_unavailable_probes_are_refreshed_without_changing_valid_record
         record = json.loads((tmp_path / f"{name}.json").read_text())
         assert record["available"] is True
         assert record["report_replay"]["split"] == "test"
-        assert (tmp_path / f"{name}.png").stat().st_size > 0
+        if name == "estep_character":                 # single readout: record kept, figure skipped
+            assert not (tmp_path / f"{name}.png").exists()
+        else:
+            assert (tmp_path / f"{name}.png").stat().st_size > 0
     # A subsequent call has no work; even the placeholder depth and phi records are preserved.
     before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
     report._prepare_missing_saved_probes(

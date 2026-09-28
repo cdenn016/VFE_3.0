@@ -13,14 +13,73 @@ References: Roy & Vetterli (EUSIPCO 2007, effective rank); Rudman et al. (Findin
 IsoScore); Ethayarajh (EMNLP 2019, anisotropy); Facco et al. (Sci. Rep. 7:12140, 2017, TwoNN);
 Kornblith et al. (ICML 2019, CKA) with the unbiased HSIC of Song et al. (JMLR 2012); Radovanovic
 et al. (JMLR 2010, hubness); Timkey & van Schijndel (EMNLP 2021, rogue dimensions).
+
+Compute backend. The hot paths (exact kNN through :func:`knn`, the scatter eigendecomposition
+:func:`scatter_eigh`, linear CKA) take a ``device`` argument. ``None`` or ``"cpu"`` runs numpy in
+float64 (the reference path). A CUDA device (``"cuda"``, ``"cuda:<i>"``) runs torch on that device:
+kNN and CKA in IEEE float32 (the process-wide TF32 policy is pinned to ``"highest"`` for the call),
+the scatter eigendecomposition in float64 (see :func:`scatter_eigh`). :data:`TORCH_CPU` selects the
+same torch code on the CPU, which is how the GPU path is tested without a GPU. Results always come
+back as float64 numpy arrays.
 """
 
 from __future__ import annotations
 
+import contextlib
 import math
-from typing import Any, Dict, Hashable, Optional, Sequence, Tuple
+from typing import Any, Dict, Hashable, Iterator, Optional, Sequence, Tuple
 
 import numpy as np
+
+
+# ----------------------------------------------------------------------------------------------
+# Compute backend (numpy float64 on the CPU, torch on a CUDA device)
+# ----------------------------------------------------------------------------------------------
+
+TORCH_CPU = "torch-cpu"          # device spec: the torch path on the CPU (tests of the GPU code path)
+
+
+def torch_device(device: Any) -> Optional[Any]:
+    r"""The ``torch.device`` of the accelerated path for ``device``, or ``None`` for numpy.
+
+    ``"cuda"``, ``"cuda:<i>"`` or a CUDA ``torch.device`` select that GPU and raise ``RuntimeError``
+    when CUDA is unavailable (callers decide whether to fall back, and say so). :data:`TORCH_CPU`
+    selects the torch path on the CPU. ``None``, ``"cpu"`` and every other value select the numpy
+    float64 path.
+    """
+    if device is None:
+        return None
+    text = str(device)
+    if text == TORCH_CPU:
+        import torch
+        return torch.device("cpu")
+    if not text.startswith("cuda"):
+        return None
+    import torch
+    dev = torch.device(text)
+    if not torch.cuda.is_available():
+        raise RuntimeError(f"device {text!r} requested but torch.cuda.is_available() is False")
+    return dev
+
+
+@contextlib.contextmanager
+def ieee_fp32_matmul() -> Iterator[None]:
+    r"""Run the enclosed torch float32 GEMMs in IEEE float32 (``"highest"``), then restore the policy.
+
+    A process that enabled TF32 (``"high"``) would otherwise round the GEMM inputs to a 10-bit
+    mantissa (relative error about ``1e-3``), enough to reorder near neighbors and analogy candidates.
+    """
+    import torch
+
+    previous = torch.get_float32_matmul_precision()
+    if previous == "highest":
+        yield
+        return
+    torch.set_float32_matmul_precision("highest")
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(previous)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -114,14 +173,80 @@ def explained_variance_from_eigenvalues(lam: np.ndarray, k: int = 50) -> np.ndar
     return (lam / lam.sum())[:k]
 
 
-def knn(X: Any, k: int, metric: str = "cosine", *, chunk: int = 1024) -> Tuple[np.ndarray, np.ndarray]:
+def scatter_eigh(X: Any, *, side: str = "auto", device: Any = None) -> Tuple[np.ndarray, np.ndarray, str]:
+    r"""Eigenpairs (ascending) of the centered scatter matrix of the rows, float64.
+
+    ``side="features"``: :math:`S = X_c^\top X_c` ``(D, D)``, eigenvectors are the principal axes;
+    ``"samples"``: :math:`G = X_c X_c^\top` ``(n, n)``, eigenvectors are the normalized principal
+    scores (:math:`X_c v_i = \sqrt{\lambda_i}\,u_i`); ``"auto"``: the smaller one (features when
+    ``D <= n``). Both share the nonzero eigenvalues :math:`\lambda_i = s_i^2`. Returns
+    ``(w, V, side)``.
+
+    On a torch device the matrix and its ``eigh`` are computed in float64 on that device: the small
+    eigenvalues set the whitening rank (relative cutoff :math:`10^{-10}`) and enter effective rank and
+    IsoScore, and float32 resolves eigenvalues only down to about :math:`10^{-7}\lambda_{\max}`.
+    """
+    Xc = _centered(_f64(X))                                            # (n, D)
+    n, D = Xc.shape
+    if side == "auto":
+        side = "features" if D <= n else "samples"
+    if side not in ("features", "samples"):
+        raise ValueError(f"unknown side {side!r}")
+    dev = torch_device(device)
+    if dev is None:
+        G = Xc.T @ Xc if side == "features" else Xc @ Xc.T             # (D, D) or (n, n)
+        w, V = np.linalg.eigh(G)
+        return w, V, side
+    import torch
+
+    Xt = torch.as_tensor(Xc, dtype=torch.float64, device=dev)
+    G_t = Xt.T @ Xt if side == "features" else Xt @ Xt.T
+    w_t, V_t = torch.linalg.eigh(G_t)
+    return w_t.cpu().numpy(), V_t.cpu().numpy(), side
+
+
+def _knn_torch(X: np.ndarray, k: int, metric: str, chunk: int, dev: Any) -> Tuple[np.ndarray, np.ndarray]:
+    r"""Torch float32 twin of :func:`knn` (``X`` already validated; unit rows for cosine)."""
+    import torch
+
+    n = X.shape[0]
+    with ieee_fp32_matmul():
+        Z = torch.as_tensor(X, dtype=torch.float32, device=dev)         # (n, D)
+        sq = (Z * Z).sum(dim=1) if metric == "euclidean" else None      # (n,)
+        idx = torch.empty((n, k), dtype=torch.int64, device=dev)
+        score = torch.empty((n, k), dtype=torch.float32, device=dev)
+        for start in range(0, n, chunk):
+            stop = min(start + chunk, n)
+            local = torch.arange(stop - start, device=dev)
+            G = Z[start:stop] @ Z.T                                     # (c, n)
+            if metric == "cosine":
+                G[local, local + start] = -math.inf
+                vals, part = torch.topk(G, k, dim=1, largest=True, sorted=True)
+            else:
+                key = sq[start:stop, None] - 2.0 * G + sq[None, :]
+                key[local, local + start] = math.inf
+                _, part = torch.topk(key, k, dim=1, largest=False, sorted=True)
+                vals = torch.empty(part.shape, dtype=torch.float32, device=dev)
+                for j in range(k):                                      # (c, D) per column: explicit differences
+                    vals[:, j] = torch.linalg.vector_norm(Z[part[:, j]] - Z[start:stop], dim=1)
+                vals, order = torch.sort(vals, dim=1, stable=True)
+                part = torch.gather(part, 1, order)
+            idx[start:stop] = part
+            score[start:stop] = vals
+    return idx.cpu().numpy(), score.cpu().numpy().astype(np.float64)
+
+
+def knn(X: Any, k: int, metric: str = "cosine", *, chunk: int = 1024,
+        device: Any = None) -> Tuple[np.ndarray, np.ndarray]:
     r"""Exact ``k`` nearest neighbors of every row among the other rows (self excluded).
 
     ``metric="cosine"`` ranks by cosine similarity of the rows as given (they are L2-normalized
     here, not centered); ``"euclidean"`` ranks by distance, and the returned distances of the
     selected neighbors are recomputed from explicit differences (no Gram cancellation).
     Returns ``(idx, score)``, both ``(n, k)``, nearest first; ``score`` is the cosine or the distance.
-    Work is chunked over query rows, so memory is ``O(chunk * n)``.
+    Work is chunked over query rows, so memory is ``O(chunk * n)``. ``device``: see the module
+    docstring (a torch device runs ``topk`` in float32; neighbors agree with the float64 path except
+    where two candidates are closer than float32 resolution).
     """
     X = _f64(X)
     n = X.shape[0]
@@ -134,6 +259,9 @@ def knn(X: Any, k: int, metric: str = "cosine", *, chunk: int = 1024) -> Tuple[n
         sq = (X * X).sum(axis=1)
     else:
         raise ValueError(f"unknown metric {metric!r}")
+    dev = torch_device(device)
+    if dev is not None:
+        return _knn_torch(Z, k, metric, chunk, dev)
     idx = np.empty((n, k), dtype=np.int64)
     score = np.empty((n, k), dtype=np.float64)
     for start in range(0, n, chunk):
@@ -255,7 +383,8 @@ def rogue_dimensions(X: Any, rng: Optional[np.random.Generator] = None, n_pairs:
 # Intrinsic dimension
 # ----------------------------------------------------------------------------------------------
 
-def twonn_dimension(X: Any, rng: np.random.Generator, max_points: int = 5000) -> Dict[str, Any]:
+def twonn_dimension(X: Any, rng: np.random.Generator, max_points: int = 5000, *,
+                    device: Any = None) -> Dict[str, Any]:
     r"""TwoNN intrinsic dimension (Facco et al. 2017).
 
     For each point the ratio ``mu_i = r_2/r_1`` of its second to first nearest-neighbor Euclidean
@@ -266,7 +395,7 @@ def twonn_dimension(X: Any, rng: np.random.Generator, max_points: int = 5000) ->
       ``-log(1 - F_emp(mu))`` against ``log mu`` over the smallest 90% of ``mu``.
 
     Exact duplicate rows are dropped first (they give ``r_1 = 0``); at most ``max_points`` distinct
-    rows are used (uniform subsample from ``rng``).
+    rows are used (uniform subsample from ``rng``). ``device`` runs the neighbor search (:func:`knn`).
     """
     X = _f64(X)
     distinct = np.unique(X, axis=0)
@@ -276,7 +405,7 @@ def twonn_dimension(X: Any, rng: np.random.Generator, max_points: int = 5000) ->
     N = distinct.shape[0]
     if N < 10:
         raise ValueError(f"TwoNN needs at least 10 distinct points, got {N}")
-    _, dist = knn(distinct, 2, "euclidean")
+    _, dist = knn(distinct, 2, "euclidean", device=device)
     mu = dist[:, 1] / dist[:, 0]                                        # (N,) >= 1
     log_mu = np.log(mu)
     mle = float(N / log_mu.sum()) if log_mu.sum() > 0.0 else float("inf")
@@ -303,7 +432,22 @@ def _debiased_dot(xty: float, ssr_x: np.ndarray, ssr_y: np.ndarray, sq_x: float,
     return float(xty - n / (n - 2.0) * float(ssr_x @ ssr_y) + sq_x * sq_y / ((n - 1.0) * (n - 2.0)))
 
 
-def linear_cka(X: Any, Y: Any, debiased: bool = False) -> float:
+def _cross_norms(X: np.ndarray, Y: np.ndarray, device: Any) -> Tuple[float, float, float]:
+    r"""``(||X^T Y||_F^2, ||X^T X||_F^2, ||Y^T Y||_F^2)`` of centered rows, numpy float64 or torch float32."""
+    dev = torch_device(device)
+    if dev is None:
+        return (float(np.linalg.norm(X.T @ Y) ** 2), float(np.linalg.norm(X.T @ X) ** 2),
+                float(np.linalg.norm(Y.T @ Y) ** 2))
+    import torch
+
+    with ieee_fp32_matmul():
+        Xt = torch.as_tensor(X, dtype=torch.float32, device=dev)       # (n, D_x), centered in float64
+        Yt = torch.as_tensor(Y, dtype=torch.float32, device=dev)       # (n, D_y)
+        sq = [float(torch.linalg.matrix_norm(A.T @ B).double() ** 2) for A, B in ((Xt, Yt), (Xt, Xt), (Yt, Yt))]
+    return sq[0], sq[1], sq[2]
+
+
+def linear_cka(X: Any, Y: Any, debiased: bool = False, *, device: Any = None) -> float:
     r"""Linear CKA between two row-matched representations (Kornblith et al. 2019).
 
     .. math:: \mathrm{CKA}(X,Y) = \frac{\lVert Y_c^\top X_c\rVert_F^2}
@@ -312,15 +456,15 @@ def linear_cka(X: Any, Y: Any, debiased: bool = False) -> float:
     with column-centered ``X_c, Y_c``. Invariant to orthogonal transforms and isotropic scaling of
     either side. ``debiased=True`` replaces each HSIC by the unbiased estimator of Song et al.
     (2012), which removes the upward bias of CKA when ``n`` is not much larger than the widths.
+    ``device``: a torch device forms the three cross products in float32 (centering and the
+    debiasing terms stay float64).
     """
     X = _centered(_f64(X))
     Y = _centered(_f64(Y))
     n = X.shape[0]
     if Y.shape[0] != n:
         raise ValueError(f"row counts differ: {n} vs {Y.shape[0]}")
-    xty = float(np.linalg.norm(X.T @ Y) ** 2)
-    xtx = float(np.linalg.norm(X.T @ X) ** 2)
-    yty = float(np.linalg.norm(Y.T @ Y) ** 2)
+    xty, xtx, yty = _cross_norms(X, Y, device)
     if not debiased:
         denom = math.sqrt(xtx * yty)
         if denom <= 0.0:
@@ -444,16 +588,88 @@ def unit_bootstrap_weights(unit_a: Any, unit_b: Any, n_units: int, rng: np.rando
 # Label-based cluster quality
 # ----------------------------------------------------------------------------------------------
 
+PURITY_NULLS: Tuple[str, ...] = ("permutation", "frequency_stratified", "both")
+N_FREQUENCY_STRATA = 10          # log-count deciles of the frequency-stratified purity null
+
+
+def frequency_strata(log_count: Any, n_strata: int = N_FREQUENCY_STRATA) -> np.ndarray:
+    r"""Frequency stratum of each row: ``n_strata`` equal-size bins of the log-count rank (0 = rarest).
+
+    Rows are ranked by ``log_count`` (ties kept in row order) and the row of rank ``r`` gets
+    ``floor(r * s / n)`` with ``s = min(n_strata, n)``; ``n_strata = 10`` gives deciles.
+    """
+    lc = np.asarray(log_count, dtype=np.float64).reshape(-1)
+    if not np.isfinite(lc).all():
+        raise ValueError("non-finite log counts")
+    n = lc.size
+    if n == 0 or n_strata < 1:
+        raise ValueError(f"need n >= 1 rows and n_strata >= 1, got n={n}, n_strata={n_strata}")
+    s = min(int(n_strata), n)
+    strata = np.empty(n, dtype=np.int64)
+    strata[np.argsort(lc, kind="stable")] = (np.arange(n) * s) // n
+    return strata
+
+
+def _null_summary(null: np.ndarray, obs: float) -> Dict[str, Any]:
+    r"""Mean, sd, ``z = (obs - mean)/sd`` and one-sided ``p = (1 + #\{null >= obs\})/(1 + n)`` of null draws."""
+    n_perm = null.size
+    null_mean = float(null.mean()) if n_perm else float("nan")
+    null_std = float(null.std(ddof=1)) if n_perm > 1 else float("nan")
+    z = (obs - null_mean) / null_std if n_perm > 1 and null_std > 0.0 else float("nan")
+    p = float((1 + (null >= obs).sum()) / (1 + n_perm)) if n_perm else float("nan")
+    return {"null_mean": null_mean, "null_std": null_std, "z": float(z), "p": p, "n_perm": int(n_perm)}
+
+
+def _stratified_chance(codes: np.ndarray, idx: np.ndarray, strata: np.ndarray, n_labels: int) -> float:
+    r"""Exact expected ``P@k`` when labels are permuted independently within each stratum.
+
+    With ``n_{s,c}`` rows of label ``c`` in stratum ``s`` (``n_s`` in total), the labels of two
+    distinct rows agree with probability
+
+    .. math:: P_{st} = \sum_c \frac{n_{s,c}}{n_s}\frac{n_{t,c}}{n_t}\ (s \ne t), \qquad
+              P_{ss} = \sum_c \frac{n_{s,c}(n_{s,c}-1)}{n_s(n_s-1)},
+
+    and the expected purity is the mean of :math:`P_{s(i) s(j)}` over the ``n k`` graph edges.
+    """
+    S = int(strata.max()) + 1
+    N = np.zeros((S, n_labels), dtype=np.float64)                      # (S, C) label counts per stratum
+    np.add.at(N, (strata, codes), 1.0)
+    size = N.sum(axis=1)                                                # (S,)
+    frac = N / size[:, None]
+    P = frac @ frac.T                                                   # (S, S) across strata
+    with np.errstate(invalid="ignore", divide="ignore"):
+        within = (N * (N - 1.0)).sum(axis=1) / (size * (size - 1.0))
+    P[np.diag_indices(S)] = np.where(size > 1, within, 0.0)
+    return float(P[strata[:, None], strata[idx]].mean())
+
+
 def knn_label_purity(X: Any, labels: Sequence[Hashable], k: int = 10, metric: str = "cosine",
-                     rng: Optional[np.random.Generator] = None, n_perm: int = 200) -> Dict[str, Any]:
-    r"""kNN label purity ``P@k`` with a label-permutation null.
+                     rng: Optional[np.random.Generator] = None, n_perm: int = 200, *,
+                     null: str = "permutation", log_count: Any = None,
+                     n_strata: int = N_FREQUENCY_STRATA, device: Any = None) -> Dict[str, Any]:
+    r"""kNN label purity ``P@k`` with a label-permutation null and/or a frequency-stratified null.
 
     ``purity_i`` is the fraction of the ``k`` nearest neighbors of row ``i`` (self excluded) that
-    share its label; the statistic is the mean over rows. The null keeps the neighbor graph and
-    shuffles labels ``n_perm`` times; ``z = (obs - mean_null)/std_null`` and the one-sided
-    ``p = (1 + #\{null >= obs\})/(1 + n_perm)``. ``chance`` is the exact expected purity under random
-    labeling, ``sum_c n_c(n_c - 1) / (n(n-1))`` (approximately ``sum_c p_c^2``).
+    share its label; the statistic is the mean over rows. Every null keeps the neighbor graph and
+    reassigns labels ``n_perm`` times; ``z = (obs - mean_null)/std_null`` and the one-sided
+    ``p = (1 + #\{null >= obs\})/(1 + n_perm)``.
+
+    * ``null="permutation"`` shuffles labels over all rows. ``chance`` is its exact expectation
+      ``sum_c n_c(n_c - 1) / (n(n-1))`` (approximately ``sum_c p_c^2``), and
+      ``per_label_chance[c] = (n_c - 1)/(n - 1)`` is the expected purity of a row of label ``c``.
+    * ``null="frequency_stratified"`` shuffles labels only within the ``n_strata`` log-count
+      quantile bins of :func:`frequency_strata` (``log_count`` required, one value per row). A view
+      whose neighbors merely share frequency, in a lexicon whose labels differ in frequency, reaches
+      this null's purity without any semantic structure. Its ``chance`` is the exact expectation
+      (:func:`_stratified_chance`).
+    * ``null="both"``: the top-level null fields are the permutation null (drawn first, so they
+      equal a ``null="permutation"`` call with the same generator) and ``frequency_stratified``
+      holds the stratified record ``{null_mean, null_std, z, p, n_perm, chance, n_strata}``.
+
+    ``null`` names the null of the top-level fields. ``device`` runs the neighbor search.
     """
+    if null not in PURITY_NULLS:
+        raise ValueError(f"unknown null {null!r}; known: {list(PURITY_NULLS)}")
     X = _f64(X)
     codes, names = _label_codes(labels)
     n = X.shape[0]
@@ -463,35 +679,57 @@ def knn_label_purity(X: Any, labels: Sequence[Hashable], k: int = 10, metric: st
         raise ValueError("kNN purity needs at least two labels")
     if n_perm > 0 and rng is None:
         raise ValueError("an rng is required for the permutation null")
+    strata = None
+    if null != "permutation":
+        if log_count is None:
+            raise ValueError(f"null={null!r} needs log_count (one value per row)")
+        strata = frequency_strata(log_count, n_strata)
+        if strata.size != n:
+            raise ValueError(f"{strata.size} log counts for {n} rows")
     k_eff = min(k, n - 1)
-    idx, _ = knn(X, k_eff, metric)
+    idx, _ = knn(X, k_eff, metric, device=device)
     per_row = (codes[idx] == codes[:, None]).mean(axis=1)               # (n,)
     obs = float(per_row.mean())
     counts = np.bincount(codes, minlength=len(names)).astype(np.float64)
     chance = float((counts * (counts - 1.0)).sum() / (n * (n - 1.0)))
-    null = np.empty(n_perm, dtype=np.float64)
-    for t in range(n_perm):
-        perm = rng.permutation(codes)
-        null[t] = (perm[idx] == perm[:, None]).mean()
-    null_mean = float(null.mean()) if n_perm else float("nan")
-    null_std = float(null.std(ddof=1)) if n_perm > 1 else float("nan")
-    z = (obs - null_mean) / null_std if n_perm > 1 and null_std > 0.0 else float("nan")
-    p = float((1 + (null >= obs).sum()) / (1 + n_perm)) if n_perm else float("nan")
-    return {
-        "purity":       obs,
-        "k":            int(k_eff),
-        "n":            int(n),
-        "n_labels":     len(names),
-        "per_label":    {str(name): float(per_row[codes == c].mean()) for c, name in enumerate(names)},
-        "per_label_n":  {str(name): int(counts[c]) for c, name in enumerate(names)},
-        "chance":       chance,
-        "null_mean":    null_mean,
-        "null_std":     null_std,
-        "z":            float(z),
-        "p":            p,
-        "n_perm":       int(n_perm),
-        "metric":       metric,
+
+    def permutation_null() -> np.ndarray:
+        draws = np.empty(n_perm, dtype=np.float64)
+        for t in range(n_perm):
+            perm = rng.permutation(codes)
+            draws[t] = (perm[idx] == perm[:, None]).mean()
+        return draws
+
+    def stratified_null() -> Dict[str, Any]:
+        grouped = np.argsort(strata, kind="stable")                    # positions grouped by stratum
+        draws = np.empty(n_perm, dtype=np.float64)
+        for t in range(n_perm):
+            shuffled = np.lexsort((rng.random(n), strata))             # grouped by stratum, random within
+            perm = np.empty_like(codes)
+            perm[grouped] = codes[shuffled]
+            draws[t] = (perm[idx] == perm[:, None]).mean()
+        return {**_null_summary(draws, obs), "chance": _stratified_chance(codes, idx, strata, len(names)),
+                "n_strata": int(strata.max()) + 1}
+
+    out: Dict[str, Any] = {
+        "purity":           obs,
+        "k":                int(k_eff),
+        "n":                int(n),
+        "n_labels":         len(names),
+        "per_label":        {str(name): float(per_row[codes == c].mean()) for c, name in enumerate(names)},
+        "per_label_n":      {str(name): int(counts[c]) for c, name in enumerate(names)},
+        "per_label_chance": {str(name): float((counts[c] - 1.0) / (n - 1.0)) for c, name in enumerate(names)},
+        "chance":           chance,
+        "metric":           metric,
+        "null":             null,
     }
+    if null == "frequency_stratified":
+        out.update(stratified_null())
+    else:
+        out.update(_null_summary(permutation_null(), obs))
+        if null == "both":
+            out["frequency_stratified"] = stratified_null()
+    return out
 
 
 def silhouette(X: Any, labels: Sequence[Hashable], metric: str = "cosine") -> Dict[str, Any]:
@@ -515,19 +753,19 @@ def silhouette(X: Any, labels: Sequence[Hashable], metric: str = "cosine") -> Di
     }
 
 
-def hubness(X: Any, k: int = 10, metric: str = "cosine") -> Dict[str, Any]:
+def hubness(X: Any, k: int = 10, metric: str = "cosine", *, device: Any = None) -> Dict[str, Any]:
     r"""Hubness of the ``k``-NN graph (Radovanovic et al. 2010).
 
     ``N_k(x)`` counts how often row ``x`` appears among the ``k`` nearest neighbors of the other
     rows (``sum_x N_k = n k``). Reports the skewness of ``N_k`` (population moments), its maximum,
-    the anti-hub fraction ``P(N_k = 0)``, and the top-10 hub rows.
+    the anti-hub fraction ``P(N_k = 0)``, and the top-10 hub rows. ``device`` runs :func:`knn`.
     """
     from scipy import stats as sps
 
     X = _f64(X)
     n = X.shape[0]
     k_eff = min(k, n - 1)
-    idx, _ = knn(X, k_eff, metric)
+    idx, _ = knn(X, k_eff, metric, device=device)
     Nk = np.bincount(idx.reshape(-1), minlength=n)
     top = np.argsort(-Nk, kind="stable")[: min(10, n)]
     return {

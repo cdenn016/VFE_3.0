@@ -39,7 +39,7 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from numbers import Real
 from pathlib import Path, PureWindowsPath
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
@@ -1535,6 +1535,29 @@ def _publish_best_model_bundle(
         _atomic_replace(artifacts.best_path, tmp)
 
 
+_CHECKPOINT_NUMERICS_KEYS: Tuple[str, ...] = (
+    "frame_projection_count", "frame_projection_total", "frame_projection_since_step")
+
+
+def _checkpoint_numerics_counters(
+    value: object,
+) -> Optional[Dict[str, int]]:
+    r"""The checkpoint's cumulative frame-projection counts as ``{key: int >= 0}``, or None.
+
+    Tolerant by design: these are diagnostics, so a missing or malformed record (an older
+    checkpoint, a hand-edited file) yields None rather than failing a save or a resume.
+    """
+    if not isinstance(value, Mapping):
+        return None
+    out: Dict[str, int] = {}
+    for key in _CHECKPOINT_NUMERICS_KEYS:
+        count = value.get(key)
+        if type(count) is not int or count < 0:
+            return None
+        out[key] = count
+    return out
+
+
 class RunArtifacts:
     r"""Owns a run directory and its incremental metrics, reports, and optional model files.
 
@@ -1597,6 +1620,75 @@ class RunArtifacts:
         if isinstance(executable_build, ExecutableBuildMetadata):
             config_record["executable_build"] = asdict(executable_build)
         self.save_json("config.json", config_record)
+
+        # Training-time diagnostic handoff (audit 2026-09-28), filled by train() and read by
+        # finalize_run: fixed training-sample CE by evaluated step, per-name diagnostic failure
+        # counts, and the optimizer-state footprint.
+        self.dataset = dataset
+        self.train_sample_by_step: Dict[int, float] = {}
+        self.diagnostics_failures: Dict[str, int] = {}
+        self.optimizer_state_bytes: Optional[Dict[str, int]] = None
+        # S1 panel D counters (2026-09-28): summary.json "numerics_counters" (set by train()), the
+        # cumulative frame-projection counts a checkpoint carries (numerics_counters_state), and
+        # those a resumed checkpoint carried in (resumed_numerics_counters, set by load_checkpoint).
+        self.numerics_counters: Optional[Dict[str, object]] = None
+        self.numerics_counters_state: Optional[Dict[str, int]] = None
+        self.resumed_numerics_counters: Optional[Dict[str, int]] = None
+        # Source bytes at run start: vfe3/**/*.py, root *.py drivers and pyproject.toml, zipped with
+        # their hash, the Git HEAD and the dirty-file list. Best-effort: a failure is recorded in
+        # the returned mapping (and later in provenance.json), never raised.
+        from vfe3.run_archive import write_source_archive
+        self.source_archive: Dict[str, object] = write_source_archive(self.run_dir)
+
+    def append_diagnostic_rows(
+        self,
+        name:       str,
+        fieldnames: Sequence[str],
+        rows:       Iterable[Mapping[str, object]],
+    ) -> Path:
+        r"""Append long-format rows to ``run_dir/diagnostics/<name>`` (header written once).
+
+        NaN cells are written blank, as in ``metrics.csv``. A header that differs from
+        ``fieldnames`` raises rather than mixing two schemas in one file.
+        """
+        if not name or "/" in name or "\\" in name or Path(name).name != name:
+            raise ValueError(f"diagnostic file name must be a bare filename, got {name!r}")
+        directory = self.run_dir / "diagnostics"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / name
+        fields = list(fieldnames)
+        if path.is_file() and path.stat().st_size > 0:
+            with path.open("r", newline="", encoding="utf-8") as handle:
+                header = next(csv.reader(handle), None)
+            if header != fields:
+                raise ValueError(f"{path} has header {header}, expected {fields}")
+            write_header = False
+        else:
+            write_header = True
+        with path.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            if write_header:
+                writer.writeheader()
+            for row in rows:
+                writer.writerow({
+                    key: ("" if isinstance(value, float) and math.isnan(value) else value)
+                    for key, value in row.items()
+                })
+        return path
+
+    def save_map_snapshot(
+        self,
+        step:  int,
+        state: Mapping[str, torch.Tensor],
+    ) -> Path:
+        r"""Write ``run_dir/map_snapshots/step_<N:07d>.pt = {"step": N, "state": state}`` atomically."""
+        directory = self.run_dir / "map_snapshots"
+        directory.mkdir(parents=True, exist_ok=True)
+        final = directory / f"step_{int(step):07d}.pt"
+        with _unique_sibling_temp(final) as tmp:
+            torch.save({"step": int(step), "state": dict(state)}, tmp)
+            _atomic_replace(final, tmp)
+        return final
 
     def bind_selection_data_identity(self, identity: Mapping[str, object]) -> None:
         """Bind every selected-weight comparison in this run to one validation data contract."""
@@ -1830,6 +1922,10 @@ class RunArtifacts:
                 "best_step":       saved_best_step,
                 "best_model_bundle": best_model_bundle,
                 "data_state":      saved_data_state,
+                # Cumulative S1 panel D frame-projection counts (flat str -> int, or None); a
+                # diagnostic, never read by the resume contract itself.
+                "numerics_counters": _checkpoint_numerics_counters(
+                    getattr(self, "numerics_counters_state", None)),
             }, tmp)
             _atomic_replace(path, tmp)
         return path
@@ -2269,6 +2365,10 @@ def load_checkpoint(
                 "data_identity":               saved_data_identity,
             })
     if artifacts is not None:
+        # Cumulative S1 panel D frame-projection counts (None for an older checkpoint); train()
+        # continues counting from them so a resumed run's columns stay cumulative since step 0.
+        artifacts.resumed_numerics_counters = _checkpoint_numerics_counters(
+            ckpt.get("numerics_counters"))
         saved_code_identity = ckpt.get("code_identity_sha256")
         code_identity_match = (
             saved_code_identity == expected_code_identity
@@ -2732,6 +2832,35 @@ def _write_provenance(
     # Backward-compatible held-out aliases consumed by existing scaling-analysis artifacts.
     prov["data_sha256"] = prov["test_data_sha256"]
     prov["data_n_tokens"] = prov["test_data_n_tokens"]
+    # Source bytes (audit 2026-09-28): the run-start archive record, the tree re-hashed now, and a
+    # second archive (source_archive_end) only when the tree drifted during the run. Best-effort.
+    try:
+        from vfe3.run_archive import verify_source_archive
+        start_archive = getattr(artifacts, "source_archive", None)
+        start_archive = start_archive if isinstance(start_archive, dict) else None
+        prov["source_archive"] = start_archive
+        check = verify_source_archive(artifacts.run_dir, start_archive)
+        prov["source_archive_drift"] = check.get("drift")
+        prov["source_tree_sha256_end"] = check.get("tree_sha256_end")
+        if check.get("error") is not None:
+            prov["source_archive_check_error"] = check["error"]
+        if check.get("drift"):
+            prov["source_archive_end"] = check.get("source_archive_end")
+            logger.warning("source tree changed during the run; archived the finalize-time tree as "
+                           "source_archive_end.zip beside the run-start source_archive.zip")
+    except Exception as exc:                                  # never block finalize on bookkeeping
+        prov["source_archive_check_error"] = repr(exc)
+    # Tokenizer manifest: library version, encoding, vocabulary size and a hash of the token table.
+    try:
+        from vfe3.run_archive import tokenizer_manifest
+        prov["tokenizer_manifest"] = tokenizer_manifest(
+            tokenizer_tag,
+            dataset=(getattr(artifacts, "dataset", None) or None),
+            cache_dir=getattr(getattr(train_loader, "dataset", None), "cache_dir", None),
+        )
+    except Exception as exc:
+        prov["tokenizer_manifest"] = {"kind": tokenizer_tag, "status": "unavailable",
+                                      "reason": repr(exc)}
     artifacts.save_json("provenance.json", prov)
     if source_identity_status == "mixed_generation":
         logger.warning(
@@ -3057,6 +3186,21 @@ def _cost_model_fields(
         decode_readout = V * K + (V if cfg.decode_bias else 0)
     active = token_row + decode_readout
     active += block_mlp_params
+    # Audit 2026-09-28: every token also reads one row of the learned positional-frame table
+    # (pos_phi_free is (max_seq_len, n_gen)) and every block/final normalization affine; both were
+    # omitted (K160: +5,120 + 320 = 11,182,897). Parameters are deduplicated by identity, so a
+    # normalization shared across layers counts once.
+    pos_phi_free = getattr(model, "pos_phi_free", None)
+    if (isinstance(pos_phi_free, torch.nn.Parameter) and pos_phi_free.dim() >= 1
+            and pos_phi_free.shape[0] > 0):
+        active += int(pos_phi_free.numel() // pos_phi_free.shape[0])
+    norm_parameters: Dict[int, int] = {}
+    for norm_name in ("block_norm", "final_norm"):
+        norm_module = getattr(model, norm_name, None)
+        if isinstance(norm_module, torch.nn.Module):
+            for parameter in norm_module.parameters():
+                norm_parameters[id(parameter)] = int(parameter.numel())
+    active += sum(norm_parameters.values())
     # Transparent analytic FLOP proxy. Per token: decode over all V (2VK) and L*T belief E-step
     # iterations. Each E-step iteration has O(N) attention energy (2NK) plus O(N) transport
     # application (2N*d_head^2). Constants are O(1); this is a proxy, not a calibrated count.
@@ -3183,6 +3327,180 @@ def _scheduler_metadata(
     }
 
 
+def _resolved_alibi_slopes(cfg: VFE3Config) -> Optional[List[float]]:
+    r"""Per-head ALiBi slopes the attention prior applies, or None for a non-ALiBi prior.
+
+    The Press et al. schedule scaled by ``alibi_slope`` (:func:`vfe3.attention_prior._press_slopes`):
+    for a power-of-two :math:`H`, :math:`s_h = s_0\, 2^{-8h/H}`, :math:`h = 1, \dots, H`; otherwise
+    the nearest lower power-of-two schedule followed by the even-indexed entries of the next one.
+    """
+    name = getattr(cfg, "beta_attention_prior", None)
+    if not isinstance(name, str) or "alibi" not in name:
+        return None
+    from vfe3.attention_prior import _press_slopes
+    slopes = _press_slopes(int(cfg.n_heads), float(cfg.alibi_slope), "cpu", torch.float64)  # (H,)
+    return [float(value) for value in slopes.tolist()]
+
+
+def _best_weight_and_train_sample_evaluation(
+    model:        torch.nn.Module,
+    artifacts:    RunArtifacts,
+    cfg:          VFE3Config,
+    logger:       logging.Logger,
+
+    *,
+    final_step:      Optional[int],
+    final_test:      Mapping[str, object],
+    train_loader:    Optional[Iterable],
+    val_loader:      Optional[Iterable],
+    test_loader:     Optional[Iterable],
+    tokens_per_char: Optional[float],
+    device:          torch.device,
+) -> Dict[str, object]:
+    r"""Test CE at the best-validation weights and fixed training-sample CE at final and best weights.
+
+    The headline stays the final weights (``evaluation_weights = "final"``); this adds
+    ``test_best_{ce,ppl,step}`` for the validation-selected weights and
+    ``train_sample_ce_{final,best}`` on the fixed training sample of
+    :func:`vfe3.train._build_fixed_train_sample` (the one scored during training). A value already
+    measured during training at the same step is reused. The best bundle is read with the
+    run's selection contract (config, code identity, validation-data identity), loaded into the
+    model, and the final state is restored bitwise from a host copy in a ``finally`` block. CPU and
+    CUDA RNG are forked, so later finalize probes draw the same numbers as before.
+    """
+    from vfe3.train import _build_fixed_train_sample, evaluate
+
+    out: Dict[str, object] = {
+        "test_best_ce": None, "test_best_ppl": None, "test_best_step": artifacts.best_step,
+        "test_best_status": None,
+        "train_sample_ce_final": None, "train_sample_ce_best": None,
+    }
+    by_step = getattr(artifacts, "train_sample_by_step", None) or {}
+    rng_devices = [device] if device.type == "cuda" else []
+    with torch.random.fork_rng(devices=rng_devices):
+        sample = None
+        if train_loader is not None:
+            try:
+                sample, reason = _build_fixed_train_sample(train_loader, val_loader, cfg)
+                if sample is None:
+                    out["train_sample_unavailable_reason"] = reason
+            except Exception as exc:
+                out["train_sample_unavailable_reason"] = repr(exc)
+        if final_step is not None and final_step in by_step:
+            out["train_sample_ce_final"] = float(by_step[final_step])
+        elif sample is not None:
+            try:
+                out["train_sample_ce_final"] = float(evaluate(model, sample, device=device)["ce"])
+            except Exception as exc:
+                logger.warning("fixed training-sample CE at the final weights failed (%s)", exc)
+        best_step = artifacts.best_step
+        if best_step is None:
+            out["test_best_status"] = "no validation-selected weights"
+        elif final_step is not None and best_step == final_step:
+            out.update(test_best_ce=final_test.get("test_ce"), test_best_ppl=final_test.get("test_ppl"),
+                       train_sample_ce_best=out["train_sample_ce_final"],
+                       test_best_status="best weights are the final weights")
+        elif not artifacts.save_model_artifacts or not artifacts.best_path.is_file():
+            out["test_best_status"] = "best_model.pt was not saved (save_model_artifacts=False)"
+        else:
+            final_state = {name: tensor.detach().to("cpu", copy=True)
+                           for name, tensor in model.state_dict().items()}
+            try:
+                bundle = _read_best_model_bundle(
+                    artifacts.best_path, artifacts.cfg, model.state_dict(), "cpu",
+                    artifacts.code_identity_sha256, artifacts.selection_data_identity)
+                model.load_state_dict(bundle["model_state"], strict=True)
+                del bundle
+                if test_loader is not None:
+                    best = evaluate(model, test_loader, tokens_per_char=tokens_per_char, device=device)
+                    out.update(test_best_ce=float(best["ce"]), test_best_ppl=float(best["ppl"]),
+                               test_best_bits_per_token=float(best["bits_per_token"]),
+                               test_best_status="evaluated")
+                    logger.info("Test at best-validation weights (step %s) | CE: %.4f | PPL: %.2f",
+                                best_step, best["ce"], best["ppl"])
+                else:
+                    out["test_best_status"] = "no test loader"
+                if best_step in by_step:
+                    out["train_sample_ce_best"] = float(by_step[best_step])
+                elif sample is not None:
+                    out["train_sample_ce_best"] = float(
+                        evaluate(model, sample, device=device)["ce"])
+            except Exception as exc:
+                out["test_best_status"] = f"failed: {exc!r}"
+                logger.warning("test at best-validation weights failed (%s); headline unaffected", exc)
+            finally:
+                model.load_state_dict(final_state, strict=True)       # bitwise restore of the final weights
+                del final_state
+    return out
+
+
+def _quantile_summary(values: Sequence[float]) -> Optional[Dict[str, float]]:
+    r"""``n``, mean and the 5/25/50/75/95% quantiles (linear interpolation) of finite values."""
+    finite = [float(value) for value in values
+              if isinstance(value, (int, float)) and math.isfinite(float(value))]
+    if not finite:
+        return None
+    data = torch.tensor(finite, dtype=torch.float64)
+    levels = torch.tensor([0.05, 0.25, 0.5, 0.75, 0.95], dtype=torch.float64)
+    q05, q25, q50, q75, q95 = torch.quantile(data, levels).tolist()
+    return {"n": len(finite), "mean": float(data.mean()),
+            "q05": q05, "q25": q25, "q50": q50, "q75": q75, "q95": q95}
+
+
+def _resources_record(
+    model:     torch.nn.Module,
+    artifacts: RunArtifacts,
+    cfg:       VFE3Config,
+
+    *,
+    device:    torch.device,
+    wall_time: Optional[float],
+) -> Dict[str, object]:
+    r"""``resources.json``: parameter breakdown, optimizer/model bytes, peak memory, throughput.
+
+    ``parameter_breakdown`` comes from :func:`vfe3.run_resources.parameter_breakdown` (imported
+    lazily; a failure is recorded, not raised). ``optimizer_state_bytes`` is measured in
+    :func:`vfe3.train.train` after the last step. ``peak_gpu_memory_mb`` is the maximum of the
+    per-log-window ``peak_mem_mb`` column (train() resets the allocator peak at every log row) and
+    the allocator peak since the last reset. Throughput quantiles are over the logged windows of
+    ``tokens_per_s`` (pipeline, includes data loading) and ``train_step_tokens_per_s``; the
+    windows that contain an evaluation are included, so the pipeline quantiles bracket both.
+    """
+    record: Dict[str, object] = {
+        "device_name": (torch.cuda.get_device_name(device) if device.type == "cuda"
+                        else "cpu"),
+        "device_type": device.type,
+        "amp_dtype":   getattr(cfg, "amp_dtype", None),
+        "wall_time_s": (float(wall_time) if wall_time is not None else None),
+    }
+    try:
+        from vfe3.run_resources import parameter_breakdown
+        record["parameter_breakdown"] = parameter_breakdown(dict(model.named_parameters()), cfg)
+    except Exception as exc:
+        record["parameter_breakdown"] = None
+        record["parameter_breakdown_error"] = repr(exc)
+    record["optimizer_state_bytes"] = getattr(artifacts, "optimizer_state_bytes", None)
+    record["model_state_bytes"] = int(sum(
+        tensor.numel() * tensor.element_size() for tensor in model.state_dict().values()))
+    history = list(getattr(artifacts, "history", []) or [])
+    peaks = [float(row["peak_mem_mb"]) for row in history
+             if isinstance(row.get("peak_mem_mb"), (int, float))
+             and math.isfinite(float(row["peak_mem_mb"]))]
+    if device.type == "cuda":
+        peaks.append(torch.cuda.max_memory_allocated(device) / 1e6)
+    record["peak_gpu_memory_mb"] = max(peaks) if peaks else None
+    record["throughput_tokens_per_s"] = {
+        column: _quantile_summary([row.get(column) for row in history])
+        for column in ("tokens_per_s", "train_step_tokens_per_s")
+    }
+    seen = [row.get("tokens_seen") for row in history
+            if isinstance(row.get("tokens_seen"), (int, float))]
+    record["tokens_seen"] = int(seen[-1]) if seen else None
+    if wall_time is not None and wall_time > 0:
+        record["device_hours"] = float(wall_time) / 3600.0
+    return record
+
+
 def finalize_run(
     model:       torch.nn.Module,
     artifacts:   RunArtifacts,
@@ -3269,6 +3587,21 @@ def finalize_run(
             m["ce"], m["ppl"], m["bits_per_token"],
             (f"{float(m['bpc']):.4f}" if m["bpc"] is not None else "unavailable"),
         )
+    # Test at the best-validation weights and the fixed training-sample CE at final and best weights
+    # (audit 2026-09-28). Published in summary.json only; the live final weights are restored
+    # bitwise before any later probe or figure reads the model.
+    try:
+        best_weight_fields = _best_weight_and_train_sample_evaluation(
+            model, artifacts, cfg, logger,
+            final_step=final_step, final_test=results, train_loader=train_loader,
+            val_loader=val_loader, test_loader=test_loader, tokens_per_char=tokens_per_char,
+            device=device)
+    except Exception as exc:
+        logger.warning("best-weight / training-sample finalize evaluation failed (%s)", exc)
+        best_weight_fields = {"test_best_ce": None, "test_best_ppl": None,
+                              "test_best_step": artifacts.best_step,
+                              "test_best_status": f"failed: {exc!r}",
+                              "train_sample_ce_final": None, "train_sample_ce_best": None}
     best_val_ppl = artifacts.best_val_ppl if artifacts.best_val_ppl != float("inf") else None
     decode_tau_eff = _decode_tau_eff(model, cfg)
     results.update({"best_val_ppl": best_val_ppl, "best_step": artifacts.best_step,
@@ -3469,7 +3802,23 @@ def finalize_run(
         "use_head_mixer":  cfg.use_head_mixer,
         "phi_chart_norm_route": _phi_chart_norm_route(model, cfg),
         "scaling_point":   scaling_point,
+        # Audit 2026-09-28: test at the validation-selected weights beside the final-weight
+        # headline, the fixed training-sample CE at both, the per-head ALiBi slopes the prior
+        # applied, and the per-name count of training-time diagnostics that failed (and were
+        # skipped without affecting training).
+        **best_weight_fields,
+        "alibi_slopes":    _resolved_alibi_slopes(cfg),
+        "diagnostics_failures": dict(sorted(
+            (getattr(artifacts, "diagnostics_failures", None) or {}).items())),
+        # S1 panel D counters (2026-09-28; see vfe3.train._numerics_counters_summary): final
+        # cumulative counts, the last evaluation's cap/factorization counts, and skip reasons.
+        "numerics_counters": getattr(artifacts, "numerics_counters", None),
     })
+    try:
+        artifacts.save_json("resources.json", _resources_record(
+            model, artifacts, cfg, device=device, wall_time=wall_time))
+    except Exception as exc:
+        logger.warning("resources.json failed (%s); skipped", exc)
 
     # Pure-path certificate: the config toggles for the principal gauge / decode / free-energy purity
     # axes (flat gauge, canonical F, prior-bank decode, no head mixer, ...), plus the converged-state
@@ -4403,6 +4752,7 @@ def finalize_validation_run(
         "figures_written":     figures_written,
         "phi_chart_norm_route": _phi_chart_norm_route(model, cfg),
         "decode_tau_eff":      _decode_tau_eff(model, cfg),
+        "numerics_counters":   getattr(artifacts, "numerics_counters", None),
     })
 
     return {
@@ -4810,6 +5160,13 @@ def _save_figures(
         figs = _IsolatedFigures()
         figs.set_publication_style()
         run = artifacts.run_dir
+        try:
+            route_skips = raw_figs.route_figure_skip_reasons(getattr(artifacts, "cfg", None))
+        except Exception as exc:                               # no gates beats no figures
+            logger.warning("route figure gates unavailable (%s); emitting every figure", exc)
+            route_skips = {}
+        for name, reason in route_skips.items():
+            logger.info("figure %s skipped (%s)", name, reason)
 
         def _aligned(key: str) -> tuple:
             r"""Aligned (step, value) for a history column, dropping pre-first-eval NaN rows."""
@@ -4841,8 +5198,16 @@ def _save_figures(
             readout_history = _hist_subset(readout_keys + (
                 "attn_entropy", "attn_entropy_min", "effective_rank", "belief_cond_median"))
             if readout_history is not None:
+                try:
+                    from vfe3.metrics import covariance_frozen_at_encode
+                    frozen = bool(covariance_frozen_at_encode(artifacts.cfg))
+                except Exception:                              # config-free artifacts: assume live Sigma
+                    frozen = False
                 fig = figs.plot_readout_diagnostics(
-                    readout_history, path=str(run / "readout_diagnostics.png"))
+                    readout_history,
+                    residual_ratio=raw_figs.read_long_table(run / "diagnostics" / "residual_ratio.csv"),
+                    covariance_frozen=frozen,
+                    path=str(run / "readout_diagnostics.png"))
                 figs.plt.close(fig)
 
         if losses:
@@ -4914,17 +5279,11 @@ def _save_figures(
         # by each optimizer group's "role" tag, so the live tables are attributed correctly under any
         # config); present only on a run that captured step_metrics, so gate on their presence (the CSV
         # stays rectangular per run). A SEPARATE figure from the aggregate, same pre-clip magnitudes.
-        gd_keys = ("grad_norm_mu", "grad_norm_sigma", "grad_norm_phi")
-        gd_present = [k for k in gd_keys
-                      if any(k in r and math.isfinite(r[k]) for r in artifacts.history)]
-        if gd_present:
-            gd_rows = [r for r in artifacts.history
-                       if all(k in r and math.isfinite(r[k]) for k in gd_present)]
-            if gd_rows:
-                hist_gd = {"step": [r.get("step", i) for i, r in enumerate(gd_rows)],
-                           **{k: [r[k] for r in gd_rows] for k in gd_present}}
-                fig = figs.plot_grad_norm_decomposition(hist_gd, path=str(run / "grad_norm_decomposition.png"))
-                figs.plt.close(fig)
+        # Per-named-group columns when logged (NaN-padded per series), else the legacy role columns.
+        hist_gd = _hist_subset(raw_figs.GRAD_NORM_DECOMPOSITION_COLUMNS)
+        if hist_gd:
+            fig = figs.plot_grad_norm_decomposition(hist_gd, path=str(run / "grad_norm_decomposition.png"))
+            figs.plt.close(fig)
         # E-step belief-gradient decomposition (mu / sigma / phi): the INFERENCE analogue of the M-step
         # figure above -- ||grad F|| over the belief tuple per inner-loop component, logged by train_step
         # from model.forward's estep_grad_out. Accumulated runs prefer the explicitly named arithmetic
@@ -4940,7 +5299,7 @@ def _save_figures(
                    else ("estep_grad_norm_mu", "estep_grad_norm_sigma", "estep_grad_norm_phi"))
         eg_present = [k for k in eg_keys
                       if any(k in r and math.isfinite(r[k]) for r in artifacts.history)]
-        if eg_present:
+        if eg_present and "estep_grad_norm_decomposition" not in route_skips:
             eg_rows = [r for r in artifacts.history
                        if all(k in r and math.isfinite(r[k]) for k in eg_present)]
             if eg_rows:
@@ -4949,7 +5308,7 @@ def _save_figures(
                 fig = figs.plot_estep_grad_norm_decomposition(hist_eg, path=str(run / "estep_grad_norm_decomposition.png"))
                 figs.plt.close(fig)
         cx, cy = _aligned("belief_cond_median")
-        if cy:
+        if cy and "belief_condition" not in route_skips:
             fig = figs.plot_trajectory(
                 cy, cx, ylabel=r"median $\lambda_{\max}/\lambda_{\min}$",
                 title="Belief covariance conditioning", color=figs._CB[6 % len(figs._CB)],
@@ -5017,21 +5376,14 @@ def _save_figures(
             "estep_r_mu_last", "estep_r_sigma_last", "estep_r_phi_last",
             "estep_fp_kl", "estep_fp_mu_rms", "estep_fp_sigma_rms", "estep_fp_phi_rms",
             "estep_target_gap", "estep_beta_js", "estep_alpha_rms_delta"))
-        if hist_estep:
+        if hist_estep and "estep_quality" not in route_skips:
             fig = figs.plot_estep_quality(hist_estep, path=str(run / "estep_quality.png"))
             figs.plt.close(fig)
         # Held-out validation-sanity dashboard: the per-eval probes (_val_diagnostics) that were CSV-only
         # -- generalization gap, positional loss, causal/attention sanity, and the held-out geometry.
-        hist_val = _hist_subset((
-            "generalization_gap", "pos_loss_first_q", "pos_loss_last_q", "pos_loss_ratio",
-            "val_future_leakage", "val_row_sum_error", "val_pos_content_r2",
-            "val_prev_token_mass", "val_period_match_mass", "val_head_redundancy_js",
-            "val_holonomy_wilson", "val_cocycle_residual", "val_gauge_invariant_spread",
-            "val_belief_cond_p95", "val_fisher_trace_mean", "val_guard_sigma_floor_frac",
-            "val_guard_sigma_ceil_frac", "val_guard_energy_klmax_frac",
-            "val_phi_norm_mean", "val_phi_norm_std", "val_phi_matrix_norm_p95",
-            "val_phi_matrix_norm_p99", "val_phi_matrix_norm_max", "val_phi_exp_clamp_frac",
-            "val_phi_exp_scale_min", "val_vertex_cond_p99"))
+        hist_val = _hist_subset(raw_figs.VALIDATION_SANITY_COLUMNS + (
+            "val_phi_matrix_norm_p95", "val_phi_matrix_norm_p99", "val_phi_matrix_norm_max",
+            "val_phi_exp_clamp_frac", "val_phi_exp_scale_min", "val_vertex_cond_p99"))
         if hist_val:
             fig = figs.plot_validation_sanity(
                 hist_val,
@@ -5041,13 +5393,7 @@ def _save_figures(
             figs.plt.close(fig)
         # Pullback-group optimizer dashboard: ridge-direction reshaping, certified conditioning,
         # accepted factor scale/chart health, per-role weight norms, and gradient-to-weight ratio.
-        hist_opt = _hist_subset((
-            "phi_ridge_direction_cosine_mean",
-            "phi_pullback_damped_gen_cond_median", "phi_pullback_damped_gen_cond_max",
-            "phi_group_trust_scale_mean", "phi_group_trust_scale_min",
-            "phi_group_active_rows", "phi_group_chart_norm_max",
-            "weight_norm_mu", "weight_norm_sigma", "weight_norm_phi",
-            "grad_norm_mu", "grad_norm_sigma", "grad_norm_phi"))
+        hist_opt = _hist_subset(raw_figs.OPTIMIZER_GEOMETRY_COLUMNS)
         if hist_opt:
             fig = figs.plot_optimizer_geometry(hist_opt, path=str(run / "optimizer_geometry.png"))
             figs.plt.close(fig)

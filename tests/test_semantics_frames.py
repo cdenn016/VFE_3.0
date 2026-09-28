@@ -683,3 +683,25 @@ def test_run_phi_section_skips_with_too_few_candidates(tmp_path: Path, n_ids: in
     res = F.run_phi_section(run, _ctx(tmp_path, run, np.arange(n_ids, dtype=np.int64)))
     assert res.status == "skipped" and res.error is None and not res.figures
     assert "candidate token" in res.notes[0]
+
+
+def test_pmap_matches_the_unsplit_batch() -> None:
+    from vfe3.semantics import frames as fr
+
+    torch.manual_seed(0)
+    A = torch.linalg.matrix_exp(0.3 * torch.randn(300, 6, 6, dtype=torch.float64))
+    B = torch.randn(300, 6, 6, dtype=torch.float64)
+    prev = torch.get_num_threads()
+    torch.set_num_threads(4)
+    old_min = fr._PAR_MIN_ROWS
+    fr._PAR_MIN_ROWS = 16
+    try:
+        lam, V = fr._pmap(torch.linalg.eig, A)
+        lam0, V0 = torch.linalg.eig(A)
+        assert torch.equal(lam, lam0) and torch.equal(V, V0)
+        assert torch.equal(fr._pmap(torch.linalg.solve, A, B), torch.linalg.solve(A, B))
+        assert torch.equal(fr._pmap(torch.linalg.eigvals, A), torch.linalg.eigvals(A))
+        assert torch.get_num_threads() == 4
+    finally:
+        fr._PAR_MIN_ROWS = old_min
+        torch.set_num_threads(prev)

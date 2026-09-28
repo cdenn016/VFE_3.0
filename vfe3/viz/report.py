@@ -79,8 +79,8 @@ _SINGLE_RUN_FIGURE_INVENTORY = (
     "belief_trajectories.png",
     "attention_structure.png",
     "per_layer_diagnostics.png",
+    "head_block_norms.png",
     "gauge_equivariance.png",
-    "gauge_head_specialization.png",
     "belief_spectrum.png",
     "spd_ellipses.png",
     "holonomy_curvature.png",
@@ -97,6 +97,10 @@ _SINGLE_RUN_FIGURE_INVENTORY = (
 _ENGLISH_ONLY_SINGLE_RUN_FIGURES = frozenset({
     "vocab_confusion.png",
 })
+
+# Figures of the run's eval-cadence tables, written by :func:`generate_history_figures` from
+# ``metrics.csv`` and ``diagnostics/*.csv`` without a model replay.
+HISTORY_FIGURES = ("learning_curves", "attention_stats", "attention_stats_training", "residual_ratio")
 
 
 def plan_single_run_figures(
@@ -474,9 +478,12 @@ def _prepare_missing_saved_probes(
             record["report_replay"] = {"split": split, "n_sequences": int(tokens.shape[0]),
                                        "sequence_length": int(tokens.shape[1])}
             _write_json_atomic(run_dir / f"{name}.json", record)
-            fig = getattr(figs, f"plot_{name}")(record, path=str(run_dir / f"{name}.png"))
-            figs.plt.close(fig)
             logger.info("refreshed supported probe -> %s", name)
+            try:
+                fig = getattr(figs, f"plot_{name}")(record, path=str(run_dir / f"{name}.png"))
+                figs.plt.close(fig)
+            except figs.FigureSkipped as exc:
+                logger.info("probe figure %r skipped (%s); record kept in %s.json", name, exc, name)
         except Exception as exc:
             logger.warning("supported probe %s failed (%s); skipped", name, exc)
     if depth_path.is_file():
@@ -495,6 +502,121 @@ def _prepare_missing_saved_probes(
         logger.info("saved probe -> %s", depth_path)
     except Exception as exc:
         logger.warning("E-step depth-sensitivity probe failed (%s); skipped", exc)
+
+
+def _write_figure(
+    figdir: Path,
+    name:   str,
+    thunk:  Callable[[str], object],
+    logger: logging.Logger,
+) -> Optional[Path]:
+    r"""Write ``figdir/<name>.png`` from ``thunk(path)`` through a sibling temporary; return the path.
+
+    Returns None when the builder raises :class:`vfe3.viz.figures.FigureSkipped` (logged at INFO with
+    its reason) or fails in any other way (logged as a warning). Pyplot figures the builder
+    registered before raising are closed, so a failed figure never leaks.
+    """
+    before = set(figs.plt.get_fignums())            # registry snapshot for the leak sweep below
+    try:
+        path = figdir / f"{name}.png"
+        with _unique_sibling_output_temp(path) as temporary_path:
+            fig = thunk(str(temporary_path))
+            outcomes = getattr(fig, "_vfe3_publication_outcomes", None)
+            if not temporary_path.is_file() or temporary_path.stat().st_size == 0:
+                raise RuntimeError(f"figure {name!r} did not write a nonempty temporary output")
+            _atomic_replace(path, temporary_path)
+        figs.plt.close(fig)
+        logger.info("figure -> %s", path)
+        if isinstance(outcomes, Mapping):
+            sidecar = outcomes.get("sidecar")
+            if isinstance(sidecar, Mapping) and sidecar.get("published"):
+                logger.info("sidecar -> %s", sidecar.get("path"))
+            elif isinstance(sidecar, Mapping) and sidecar.get("error"):
+                logger.warning("figure %r sidecar failed (%s); figure retained",
+                               name, sidecar.get("error"))
+        return path
+    except figs.FigureSkipped as exc:
+        for num in set(figs.plt.get_fignums()) - before:
+            figs.plt.close(num)
+        logger.info("figure %r skipped (%s)", name, exc)
+    except Exception as exc:
+        # The thunk can register a pyplot figure and then raise (tight_layout/savefig) before
+        # this function ever receives it; close what it registered (audit 2026-07-01 round-3).
+        for num in set(figs.plt.get_fignums()) - before:
+            figs.plt.close(num)
+        logger.warning("figure %r failed (%s); continuing", name, exc)
+    return None
+
+
+def _tokens_per_step(run_dir: Path, cfg: Optional[VFE3Config]) -> Optional[float]:
+    r"""Nominal training tokens per optimizer step, ``batch_size x max_seq_len``.
+
+    The token axis of runs that predate the ``tokens_seen`` column (the training loop counts the
+    same product per step; gradient accumulation splits the pulled batch, so it does not enter).
+    Read from ``cfg`` when given, else from the raw ``config.json`` mapping so a config carrying
+    retired fields still yields its batch geometry. None when neither is readable.
+    """
+    try:
+        if cfg is not None:
+            return float(int(cfg.batch_size) * int(cfg.max_seq_len))
+        raw = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))["config"]
+        return float(int(raw["batch_size"]) * int(raw["max_seq_len"]))
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def generate_history_figures(
+    run_dir: 'str | Path',
+
+    *,
+    cfg:     Optional[VFE3Config]     = None,
+    logger:  Optional[logging.Logger] = None,
+) -> List[Path]:
+    r"""Write the figures of the run's eval-cadence tables into ``run_dir/figures/`` (no model replay).
+
+    ``learning_curves`` (M3) reads ``metrics.csv``: validation CE and the fixed training-sample CE
+    against ``tokens_seen`` and ``wall_clock_s``, and ``generalization_gap_fixed``.
+    ``attention_stats`` (final evaluation) and ``attention_stats_training`` read
+    ``diagnostics/attention_stats.csv``; ``residual_ratio`` reads ``diagnostics/residual_ratio.csv``.
+    Each figure is written only when its table exists and holds data; otherwise the skip reason is
+    logged. ``cfg`` supplies the token axis of runs without ``tokens_seen`` (default: the run's
+    ``config.json``). Returns the figure paths written.
+    """
+    run_dir = Path(run_dir)
+    logger = logger or logging.getLogger(__name__)
+    metrics_columns = figs.read_metrics_columns(run_dir / "metrics.csv")
+    attention_table = figs.read_long_table(run_dir / "diagnostics" / "attention_stats.csv")
+    residual_table = figs.read_long_table(run_dir / "diagnostics" / "residual_ratio.csv")
+    jobs = {
+        "learning_curves": (
+            metrics_columns, "metrics.csv",
+            lambda p: figs.plot_learning_curves(
+                metrics_columns, tokens_per_step=_tokens_per_step(run_dir, cfg), path=p)),
+        "attention_stats": (
+            attention_table, "diagnostics/attention_stats.csv",
+            lambda p: figs.plot_attention_stats(attention_table, path=p)),
+        "attention_stats_training": (
+            attention_table, "diagnostics/attention_stats.csv",
+            lambda p: figs.plot_attention_stats_training(attention_table, path=p)),
+        "residual_ratio": (
+            residual_table, "diagnostics/residual_ratio.csv",
+            lambda p: figs.plot_residual_ratio(residual_table, path=p)),
+    }
+    if all(table is None for table, _, _ in jobs.values()):
+        logger.info("history figures skipped: no metrics.csv or diagnostics tables in %s", run_dir)
+        return []
+    figdir = prepare_owned_output_child(run_dir, "figures", role="single-run figure")
+    figs.set_publication_style()
+    written: List[Path] = []
+    for name in HISTORY_FIGURES:
+        table, source, thunk = jobs[name]
+        if table is None:
+            logger.info("figure %r skipped (%s absent or empty)", name, source)
+            continue
+        path = _write_figure(figdir, name, thunk, logger)
+        if path is not None:
+            written.append(path)
+    return written
 
 
 def generate_figures(
@@ -533,6 +655,13 @@ def generate_figures(
     can render the corresponding finalization figures without a second report replay. ``n_e_steps``
     overrides the E-step trace length (default: the trained ``cfg.n_e_steps``). Returns the figure
     paths actually written (best-effort: a failed figure is logged and omitted).
+
+    Figures that are identically trivial on the configured route are not emitted; the reason from
+    :func:`vfe3.viz.figures.route_figure_skip_reasons` is logged instead (flat-transport holonomy,
+    the E-step family without E-step iterates, the belief-covariance figures when the covariance is
+    frozen at encode). ``head_block_norms`` (the head x frame-block energy of the interface maps)
+    needs :func:`vfe3.posthoc.maps.head_block_norms` and the relational maps. The eval-cadence
+    history figures of :func:`generate_history_figures` are written too.
     """
     if type(generate_embedding_figures) is not bool:
         raise TypeError("generate_embedding_figures must be bool")
@@ -664,10 +793,15 @@ def generate_figures(
     if (snapshot is not None and n_e_steps is not None
             and int(n_e_steps) != len(snapshot.trace_states) - 1):
         trace_snapshot = None
+    # Route gates (audit k160 Section 4): figures that are identically trivial on this route are
+    # skipped with a logged reason, and the E-step traces feeding only such figures are not replayed.
+    skip_reasons = figs.route_figure_skip_reasons(cfg)
+    estep_family_live = "iterate_trajectory" not in skip_reasons
     trace       = _safe(lambda: extract.e_step_belief_trace(
-        model, tok, n_iter=n_e_steps, snapshot=trace_snapshot), "e_step_belief_trace")
+        model, tok, n_iter=n_e_steps, snapshot=trace_snapshot),
+        "e_step_belief_trace") if estep_family_live else None
     layer_trace = _safe(lambda: extract.across_layer_belief_trace(
-        model, tok, snapshot=snapshot), "across_layer_belief_trace")
+        model, tok, snapshot=snapshot), "across_layer_belief_trace") if estep_family_live else None
     cstate = (
         _safe(lambda: extract.converged_state(model, tok, snapshot=snapshot), "converged_state")
         if not is_conditional_filtering(model)
@@ -725,6 +859,24 @@ def generate_figures(
     readout     = _safe(lambda: extract.decode_readout(model), "decode_readout")
     run_label   = f"K{cfg.embed_dim}"
 
+    # S2 panel A: head x frame-block norms of the relational interface maps, from the weights alone.
+    # Replaces the retired gauge_head_specialization, which paired frame block h with head h.
+    block_norms = None
+    if not is_conditional_filtering(model):
+        skip_reasons.setdefault("head_block_norms", "no relational interface maps on this route")
+    else:
+        try:
+            from vfe3.posthoc.maps import head_block_norms as _head_block_norms
+        except ImportError as exc:
+            skip_reasons.setdefault(
+                "head_block_norms", f"vfe3.posthoc.maps.head_block_norms unavailable ({exc})")
+        else:
+            map_state = {key: value.detach().to("cpu", torch.float32)
+                         for key, value in model.state_dict().items()
+                         if key.startswith("relational_operators")}
+            block_norms = _safe(lambda: _head_block_norms(map_state, cfg), "head_block_norms")
+    report_population = (f"{split} split, one {int(tok.shape[-1])}-token sequence")
+
     # gpt2/cl100k decoder for the vocabulary figures' token labels and the confusion figure's category
     # bucketing (None when tiktoken is absent or the dataset has no real tokenizer -> labels by id).
     decode = None
@@ -739,23 +891,31 @@ def generate_figures(
     # Decode-calibration reliability bins (conf/acc/frac) come from THIS invocation's already-decoded
     # CE bank. A saved fallback is accepted only when research.json records the same split; legacy
     # files with unknown provenance must not silently mix finalization/test with on-demand/validation.
-    reliability = None
+    # The population is printed on the figure: the saved fallback is a different sample (the first
+    # finalization test batches) than this report's bank, and the two are not to be mistaken.
+    reliability, reliability_population = None, None
+    bank_population = (f"{split} split, report bank, n={int(ce_bank['ce'].numel()):,} scored tokens"
+                       if ce_bank is not None and "ce" in ce_bank else None)
     if ce_bank is not None:
         try:
             reliability = _reliability_from_ce_bank(ce_bank)
+            reliability_population = bank_population
         except (RuntimeError, TypeError, ValueError) as exc:
             logger.warning("current-split reliability reduction failed (%s); trying saved input", exc)
     if reliability is None:
         reliability = _saved_reliability_for_split(run_dir, split, logger)
+        if reliability is not None:
+            reliability_population = (f"research.json sample ({split} split, finalization "
+                                      "batches), not this report's bank")
 
     availability = {
         "iterate_trajectory":         trace is not None,
         "belief_trajectories":        trace is not None,
         "attention_structure":        amaps is not None,
         "per_layer_diagnostics":      per_layer is not None,
+        "head_block_norms":           block_norms is not None or "head_block_norms" in skip_reasons,
         "gauge_equivariance":         cstate is not None and "omega" in cstate
                                       and not is_conditional_filtering(model),
-        "gauge_head_specialization":  cstate is not None and "exp_phi" in cstate,
         "belief_spectrum":            cstate is not None,
         "spd_ellipses":               cstate is not None,
         "holonomy_curvature":         cstate is not None and "omega" in cstate,
@@ -773,35 +933,17 @@ def generate_figures(
     written: List[Path] = []
 
     def _emit(name: str, thunk: Callable[[str], object], available: bool) -> None:
-        r"""Write ``figures/<name>.png`` from ``thunk(path)``; skip when an input is missing."""
+        r"""Write ``figures/<name>.png`` from ``thunk(path)``; skip a route-trivial figure with its
+        logged reason, or one whose input is missing."""
+        if name in skip_reasons:
+            logger.info("figure %r skipped (%s)", name, skip_reasons[name])
+            return
         if not available:
             logger.info("figure %r skipped (input unavailable)", name)
             return
-        _before = set(figs.plt.get_fignums())            # registry snapshot for the leak sweep below
-        try:
-            path = figdir / f"{name}.png"
-            with _unique_sibling_output_temp(path) as temporary_path:
-                fig = thunk(str(temporary_path))
-                outcomes = getattr(fig, "_vfe3_publication_outcomes", None)
-                if not temporary_path.is_file() or temporary_path.stat().st_size == 0:
-                    raise RuntimeError(f"figure {name!r} did not write a nonempty temporary output")
-                _atomic_replace(path, temporary_path)
-            figs.plt.close(fig)
+        path = _write_figure(figdir, name, thunk, logger)
+        if path is not None:
             written.append(path)
-            logger.info("figure -> %s", path)
-            if isinstance(outcomes, Mapping):
-                sidecar = outcomes.get("sidecar")
-                if isinstance(sidecar, Mapping) and sidecar.get("published"):
-                    logger.info("sidecar -> %s", sidecar.get("path"))
-                elif isinstance(sidecar, Mapping) and sidecar.get("error"):
-                    logger.warning("figure %r sidecar failed (%s); figure retained",
-                                   name, sidecar.get("error"))
-        except Exception as exc:
-            # The thunk can register a pyplot figure and then raise (tight_layout/savefig) before
-            # _emit ever receives it; close what it registered (audit 2026-07-01 round-3).
-            for num in set(figs.plt.get_fignums()) - _before:
-                figs.plt.close(num)
-            logger.warning("figure %r failed (%s); continuing", name, exc)
 
     _emit("iterate_trajectory",
           lambda p: figs.plot_iterate_trajectory(trace, diagonal=cfg.diagonal_covariance,
@@ -816,9 +958,17 @@ def generate_figures(
     # Per-head beta attention heatmaps are NOT emitted here: training already writes them at
     # every eval_interval (RunArtifacts.save_attention_maps under <run_dir>/attention/), so
     # end-of-training copies in figures/ were redundant.
+    # Frozen-at-encode covariance: tr Sigma is the input-token table row, so the receiver-covariance
+    # panels are constant and the Sigma figures are relabeled as input-token variance.
+    frozen_covariance = metrics.covariance_frozen_at_encode(cfg)
+    residual_table = figs.read_long_table(run_dir / "diagnostics" / "residual_ratio.csv")
     _emit("per_layer_diagnostics",                               # the depth axis the aggregates collapse
-          lambda p: figs.plot_per_layer_diagnostics(per_layer, path=p),
+          lambda p: figs.plot_per_layer_diagnostics(
+              per_layer, residual_ratio=residual_table, covariance_frozen=frozen_covariance, path=p),
           "per_layer_diagnostics.png" in planned_figures)
+    _emit("head_block_norms",
+          lambda p: figs.plot_head_block_norms(block_norms, path=p),
+          "head_block_norms.png" in planned_figures)
     _emit("gauge_equivariance",
           lambda p: figs.plot_gauge_equivariance(metrics.gauge_equivariance_residual(
               cstate["mu"], cstate["sigma"], cstate["omega"], model.group,
@@ -826,14 +976,6 @@ def generate_figures(
               diagonal=cfg.diagonal_covariance, divergence_family=cfg.divergence_family,
               full_cov_kl_precision=model.full_cov_kl_precision), path=p),
           "gauge_equivariance.png" in planned_figures)
-    _emit("gauge_head_specialization",
-          lambda p: figs.plot_gauge_head_specialization(
-              metrics.per_head_gauge_invariants(cstate["exp_phi"], model.group.irrep_dims),
-              # cstate["exp_phi"] is the FINAL block's gauge frame, so pair it with the FINAL layer's
-              # per-head entropy (amaps[-1]) -- NOT the all-layer mean, which mismatched the depths.
-              head_entropy=(metrics.attention_entropy_rows(amaps[-1]).mean(dim=-1) if amaps is not None else None),
-              path=p),
-          "gauge_head_specialization.png" in planned_figures)
     _emit("belief_spectrum",
           lambda p: figs.plot_belief_spectrum(
               cstate["sigma"], eps=cfg.eps, sigma_max=cfg.sigma_max,
@@ -855,7 +997,11 @@ def generate_figures(
                   cstate["sigma"], cstate["energy"], cstate["self_div"],
                   eps=cfg.eps, sigma_max=cfg.sigma_max, kl_max=cfg.kl_max)),
               health if health is not None else {},
-              causal=(metrics.causal_sanity(amaps) if amaps is not None else None), path=p),
+              causal=(metrics.causal_sanity(amaps) if amaps is not None else None),
+              guard_denominators=(cstate["guard_denominators"] if "guard_denominators" in cstate
+                                  else extract.guard_denominators(
+                                      cstate["sigma"], cstate["energy"], cstate.get("self_div"))),
+              population=report_population, path=p),
           "numerical_trust.png" in planned_figures)
     # Next-token vocabulary-probability figures (single-arm here; the cross-run K70-vs-K120 contrast
     # is the two-arm vocab_comparison_figures driver). vocab_confusion needs the token decoder for its
@@ -876,17 +1022,21 @@ def generate_figures(
     # B1/EXP-3 -- Sigma_q-as-calibrated-uncertainty: the decode-reliability control + the two
     # Sigma_q<->CE figures (stratified error curve, rho scatter) off the belief_ce_bank join.
     _emit("reliability_diagram",
-          lambda p: figs.plot_reliability_diagram(reliability, path=p),
+          lambda p: figs.plot_reliability_diagram(reliability, population=reliability_population,
+                                                  path=p),
           "reliability_diagram.png" in planned_figures)
-    # Frozen-at-encode covariance: tr Sigma is the input-token table variance, relabeled as such.
-    frozen_covariance = metrics.covariance_frozen_at_encode(cfg)
+    # On the frozen route the scatter also reports CV(tr Sigma) over the vocabulary types, the
+    # frequency-unweighted spread of the encode table (the bank CV is occurrence-weighted).
+    vocab_cv = (_safe(lambda: metrics.cv(extract.vocabulary_sigma_trace(model)), "vocabulary_sigma_cv")
+                if frozen_covariance and "sigma_ce_scatter.png" in planned_figures else None)
     _emit("sigma_stratified_error",
           lambda p: figs.plot_sigma_stratified_error(
               ce_bank, frozen_covariance=frozen_covariance, path=p),
           "sigma_stratified_error.png" in planned_figures)
     _emit("sigma_ce_scatter",
           lambda p: figs.plot_sigma_ce_scatter(
-              ce_bank, frozen_covariance=frozen_covariance, path=p),
+              ce_bank, frozen_covariance=frozen_covariance, vocab_cv=vocab_cv,
+              population=bank_population, path=p),
           "sigma_ce_scatter.png" in planned_figures)
 
     # Per-layer metrics CSV (rows = inference depth): the metrics.csv is final-block-only, so this is
@@ -913,6 +1063,9 @@ def generate_figures(
 
     if prepare_saved_probes:
         _prepare_missing_saved_probes(model, report_batches, run_dir, device, logger, split=split)
+
+    # Eval-cadence history figures (metrics.csv, diagnostics/*.csv): no model replay.
+    written.extend(generate_history_figures(run_dir, cfg=cfg, logger=logger))
 
     # Semantic geometry of the selected checkpoint (vfe3.semantics), last because it is the slowest.
     if generate_embedding_figures:

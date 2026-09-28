@@ -29,7 +29,6 @@ from vfe3.viz.figures import (
     plot_free_energy_codescent,
     plot_free_energy_decomposition,
     plot_gauge_equivariance,
-    plot_gauge_head_specialization,
     plot_grad_norm_decomposition,
     plot_estep_grad_norm_decomposition,
     plot_holonomy_curvature,
@@ -457,12 +456,12 @@ def test_plot_gauge_equivariance_saves(tmp_path):
     assert _saved_nonempty(p)
 
 
-def test_plot_gauge_head_specialization_saves(tmp_path):
-    per_head = {"logdet": torch.randn(40, 2), "anisotropy": torch.rand(40, 2) + 1.0}
-    p1 = tmp_path / "f7a.png"; p2 = tmp_path / "f7b.png"
-    fig = plot_gauge_head_specialization(per_head, path=str(p1)); plt.close(fig)
-    fig = plot_gauge_head_specialization(per_head, head_entropy=torch.rand(2), path=str(p2)); plt.close(fig)
-    assert _saved_nonempty(p1) and _saved_nonempty(p2)
+def test_gauge_head_specialization_is_retired():
+    # It paired frame block h with head h, which no measurement supports; head_block_norms replaces it.
+    assert not hasattr(figures_mod, "plot_gauge_head_specialization")
+    with pytest.raises(KeyError):
+        get_figure("gauge_head_specialization")
+    assert callable(get_figure("head_block_norms"))
 
 
 def test_plot_attention_structure_saves(tmp_path):
@@ -603,13 +602,17 @@ def test_plot_ablation_forest_and_lr_grid_save(tmp_path):
 def test_plot_numerical_trust_saves(tmp_path):
     guard = {"sigma_floor_frac": 0.0, "sigma_ceil_frac": 0.0, "energy_klmax_frac": 0.0, "selfdiv_klmax_frac": 0.0}
     health = {"nan_mu": 0.0, "nan_sigma": 0.0, "nan_phi": 0.0, "nan_energy": 0.0, "nan_beta": 0.0, "max_condition": 12.0}
-    # future_leakage is (L, H) (causal_sanity keeps the leading layer,head axes); the bars must be
-    # labeled by (layer, head), not a flat 0..L*H-1 axis mislabeled "head".
+    # future_leakage is (L, H) (causal_sanity keeps the leading layer,head axes): the causal row
+    # counts (layer, head) maps, so its denominator is L*H = 6. Guard rows without a recorded
+    # denominator say so instead of guessing one.
     causal = {"future_leakage": torch.zeros(3, 2), "row_sum_error": torch.zeros(2), "active_set_slope": torch.ones(2)}
     p = tmp_path / "f13.png"
     fig = plot_numerical_trust(guard, health, causal, path=str(p))
-    labs = [t.get_text() for t in fig.axes[2].get_xticklabels()]
-    assert labs == [f"L{l}H{h}" for l in range(3) for h in range(2)]
+    cells = {(r, c): cell.get_text().get_text()
+             for table in fig.axes[0].tables for (r, c), cell in table.get_celld().items()}
+    rows = {cells[(r, 0)]: (cells[(r, 1)], cells[(r, 2)]) for r in range(1, 1 + max(k[0] for k in cells))}
+    assert rows["(layer, head) maps with future attention > 1e-06"] == ("0", "6")
+    assert rows["variance at the floor eps"] == ("n/a", "not recorded")
     plt.close(fig)
     assert _saved_nonempty(p)
 
