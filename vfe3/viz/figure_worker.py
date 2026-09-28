@@ -192,6 +192,11 @@ def _render_saved_probe_figures(run_dir: Path, logger: logging.Logger) -> List[P
                 plt.close(figure)
             written.append(final_path)
         except Exception as exc:
+            from vfe3.viz.figures import FigureSkipped
+
+            if isinstance(exc, FigureSkipped):
+                logger.info("saved probe figure %s skipped (%s)", figure_name, exc)
+                continue
             logger.warning(
                 "saved probe figure %s failed (%s); remaining figures continue",
                 figure_name,

@@ -18,7 +18,7 @@ import math
 import time
 from numbers import Real
 from pathlib import Path
-from typing import (Callable, Collection, Dict, Iterable, List, Mapping, NamedTuple, Optional,
+from typing import (Any, Callable, Collection, Dict, Iterable, List, Mapping, NamedTuple, Optional,
                     Sequence, Tuple)
 
 import torch
@@ -649,6 +649,7 @@ def train_step(
     scaler:           Optional['torch.amp.GradScaler']  = None,
     metrics_out:      Optional[dict]                     = None,
     status_out:       Optional[dict]                     = None,
+    frame_projection_out: Optional[torch.Tensor]         = None,   # (2,) int64 device counter
 ) -> float:
     r"""One M-step (one optimizer step) on the cross-entropy of a batch; returns the loss.
 
@@ -682,6 +683,11 @@ def train_step(
     When ``status_out`` is provided, ``status_out["did_step"]`` records whether the optimizer
     accepted the update. It is false for the explicit nonfinite gate and when an enabled
     GradScaler decreases its scale after ``update()``, which signals an overflow-skipped step.
+
+    ``frame_projection_out`` (S1 panel D counters): a ``(2,)`` int64 tensor on the generator
+    device. When given and the post-update frame projection runs, the rows it rescales and the rows
+    it checks are added to it on the device (no host synchronization); ``None`` makes exactly the
+    call the step made before the counter existed.
     """
     # A disabled scaler is a documented no-op (scale -> identity, unscale_ -> nothing,
     # step -> optimizer.step()), so scaler=None keeps this path byte-identical to the unscaled loop.
@@ -893,6 +899,13 @@ def train_step(
             # weight norm of the same role: with the logged grad_norm + per-group LR, the
             # update-to-weight ratio (the ~1e-3 LR-scale sanity check) is derivable offline.
             metrics_out[f"weight_norm_{_name}"] = role_w_sq[_name] ** 0.5
+        # Pre-clip gradient norm per NAMED parameter group (audit 2026-09-28): the role tags above
+        # lump W_out, the MLPs, the relational maps and the LayerNorm into "mu". Read-only; a
+        # failure is handed to train() under a private key and never reaches the update.
+        try:
+            metrics_out.update(_group_gradient_norms(model))
+        except Exception as exc:
+            metrics_out[_GROUP_GRAD_ERROR_KEY] = f"{type(exc).__name__}: {exc}"
         # E-step belief-gradient norms: the raw ||grad_mu/sigma/phi|| of F captured inside the last
         # E-step iteration (model.forward estep_grad_out) -- the INFERENCE analogue of the M-step
         # per-role grads above (parameter learning). Under accumulation, each contributing
@@ -967,6 +980,9 @@ def train_step(
         and _cfg.phi_mstep_max_matrix_norm is not None
     ):
         collect_projection_stats = metrics_out is not None
+        # The device counter rides along only when requested; None keeps the original call.
+        projection_count = ({} if frame_projection_out is None
+                            else {"count_out": frame_projection_out})
         if collect_projection_stats:
             projection_device = model.group.generator_device
             if projection_device.type == "cuda":
@@ -978,6 +994,7 @@ def train_step(
                         model,
                         _cfg.phi_mstep_max_matrix_norm,
                         collect_stats=True,
+                        **projection_count,
                     )
                     projection_end.record()
                     projection_end.synchronize()
@@ -988,6 +1005,7 @@ def train_step(
                     model,
                     _cfg.phi_mstep_max_matrix_norm,
                     collect_stats=True,
+                    **projection_count,
                 )
                 projection_ms = (time.perf_counter() - projection_start_cpu) * 1000.0
             metrics_out.update(projection_stats)
@@ -998,6 +1016,7 @@ def train_step(
                 model,
                 _cfg.phi_mstep_max_matrix_norm,
                 collect_stats=False,
+                **projection_count,
             )
     if did_step:
         successful_updates += 1
@@ -1270,6 +1289,880 @@ _VAL_RELATIONAL_DIAG_KEYS = (
     "projected_cov_min_eigenvalue", "projected_cov_max_condition", "covariance_repair_count"))
 
 
+# =============================================================================
+# Training-time diagnostics for the multi-seed runs (audit 2026-09-28, Section 2).
+#
+# Every quantity below is computed only on a log/eval-cadence step (or at step 0 of an evaluated
+# run), off the training graph, with the CPU and CUDA RNG streams restored. None of it runs on the
+# silent path (log_interval and eval_interval falsy), and none of it feeds back into the optimizer,
+# so the training trajectory is unchanged. A failure is logged once per diagnostic name, counted in
+# ``RunArtifacts.diagnostics_failures`` (summary.json) and in the cumulative ``diagnostics_failures``
+# metrics column, and training continues.
+# =============================================================================
+
+# Log-spaced evaluations below the first regular evaluation, in completed optimizer steps. Step 0
+# is evaluated before the first update. Only steps below ``eval_interval`` are used, and only when
+# evaluation is enabled with a run directory (``artifacts``) and ``eval_interval >=
+# EARLY_EVAL_MIN_INTERVAL``: a shorter cadence already samples the start of training, and the gate
+# keeps the metrics.csv schedule of short debug/test runs unchanged. The step-0 evaluation does not
+# take part in best-model selection (the untrained initialization is never a selection candidate);
+# the positive early steps are ordinary evaluations and do.
+EARLY_EVAL_STEPS:        Tuple[int, ...] = (0, 1000, 3000, 8000)
+EARLY_EVAL_MIN_INTERVAL: int             = 1000
+
+# Fixed training sample for the generalization gap: windows of the TRAIN split drawn by a generator
+# with this fixed seed (independent of cfg.seed and the data seed, so every seed of a multi-seed
+# study scores the same windows), scored under the validation protocol, and sized to the validation
+# split's scored-target count, capped here.
+TRAIN_SAMPLE_SEED:        int = 0
+TRAIN_SAMPLE_MAX_TARGETS: int = 262_144
+
+# Fixed validation windows for the per-layer residual ratio and per-head attention statistics.
+DIAGNOSTIC_WINDOWS:       int = 8
+DIAGNOSTIC_CHUNK_WINDOWS: int = 4          # windows per diagnostic forward (bounds capture memory)
+UPDATE_NORM_CHUNK_ELEMENTS: int = 1 << 22  # device chunk for ||theta_{t+1} - theta_t|| (~32 MB fp64 per temporary)
+
+# Named parameter groups for gradient, parameter and update norms (by parameter NAME, not by the
+# optimizer's role tag, whose "mu" role also holds W_out, the MLPs, the relational maps and the
+# LayerNorm).
+PARAMETER_GROUPS: Tuple[str, ...] = (
+    "mu_embed", "sigma_log_embed", "phi_embed", "pos_phi", "decode",
+    "relational_score", "relational_content", "block_mlp", "norm", "other",
+)
+_GROUP_COLUMNS: Tuple[str, ...] = tuple(
+    f"{kind}_group_{group}"
+    for kind in ("grad_norm", "param_norm", "update_ratio") for group in PARAMETER_GROUPS)
+_GRAD_GROUP_COLUMNS: Tuple[str, ...] = tuple(f"grad_norm_group_{group}" for group in PARAMETER_GROUPS)
+_TRAIN_SAMPLE_COLUMNS: Tuple[str, ...] = (
+    "train_sample_ce", "train_sample_ppl", "generalization_gap_fixed")
+_GROUP_GRAD_ERROR_KEY = "_group_gradient_norm_error"     # private train_step -> train handoff
+
+# Held-out columns the conditional route now fills from its own capture (all members of _VAL_DIAG_KEYS).
+_CONDITIONAL_STRUCTURE_KEYS: Tuple[str, ...] = (
+    "val_effective_rank", "val_belief_cond_median",
+    "val_attn_entropy_min_all", "val_attn_entropy_min_norm", "val_attn_collapsed_heads",
+    "val_future_leakage", "val_row_sum_error", "val_pos_content_r2", "val_prev_token_mass",
+    "val_period_match_mass", "val_head_redundancy_js",
+    "pos_loss_first_q", "pos_loss_last_q", "pos_loss_ratio",
+)
+
+RESIDUAL_RATIO_FIELDS: Tuple[str, ...] = (
+    "step", "layer", "q10", "q50", "q90", "ln_rel_change_q50")
+ATTENTION_STATS_FIELDS: Tuple[str, ...] = (
+    "step", "layer", "head", "entropy_norm", "distance_mean", "self_weight", "prior_overlap", "n_rows")
+
+# S1 panel D numerical-event counters (GL(K)_attention_v2 fig:placeholder_numerics, 2026-09-28).
+# Every count is an integer with its denominator beside it. NUMERICS_EVAL_COLUMNS are measured at
+# every evaluation (and at step 0) on the DIAGNOSTIC_WINDOWS fixed validation windows inside the
+# residual-ratio capture pass (no extra forward), with one diagnostics/cap_activation.csv row per
+# (layer, head); they are NaN on rows without an evaluation, on the transported route, when the run
+# has no diagnostic windows, and when their capture pass fails. NUMERICS_CUMULATIVE_COLUMNS are on
+# every metrics row and cover every attempted optimizer step since step 0 (frame_projection_* NaN
+# without a post-update frame projection). The exact definitions and skip rules are in
+# _capture_numerics_counts, _numerics_counter_skip_reasons and _cumulative_counter_columns; the
+# final values go to summary.json "numerics_counters" (_numerics_counters_summary).
+NUMERICS_EVAL_COLUMNS: Tuple[str, ...] = (
+    "cap_active_count", "cap_entry_count", "factorization_fallback_count", "factorization_count")
+NUMERICS_CUMULATIVE_COLUMNS: Tuple[str, ...] = (
+    "frame_projection_count", "frame_projection_total", "skipped_updates", "attempted_updates")
+CAP_ACTIVATION_FIELDS: Tuple[str, ...] = ("step", "layer", "head", "capped", "entries")
+_EVAL_CADENCE_COLUMNS: Tuple[str, ...] = _TRAIN_SAMPLE_COLUMNS + NUMERICS_EVAL_COLUMNS
+
+
+def _numerics_counter_skip_reasons(
+    model: VFEModel,
+) -> Dict[str, Optional[str]]:
+    r"""Why each S1 panel D counter family is undefined for ``model``; None where it is measured.
+
+    ``cap_activation`` (``cap_active_count``, ``cap_entry_count``, ``diagnostics/cap_activation.csv``)
+    and ``factorization`` (``factorization_fallback_count``, ``factorization_count``) are measured on
+    the projected routes (``attention_mode`` ``'projected_conditional'`` or ``'projected_predictive'``),
+    whose single pre-update router records its capped costs and reduced covariances in the diagnostic
+    capture. On ``'transported'`` both stay NaN: that E-step recomputes its capped pair energies at
+    every iteration without recording them, and it factorizes no reduced covariance.
+    ``frame_projection`` (``frame_projection_count``, ``frame_projection_total``) is measured when
+    :func:`train_step` runs the post-update frame projection, i.e. ``m_phi_update_mode='adamw'`` with
+    ``phi_mstep_max_matrix_norm`` set; otherwise both stay NaN. ``skipped_updates`` and
+    ``attempted_updates`` are defined on every route.
+    """
+    cfg = model.cfg
+    reasons: Dict[str, Optional[str]] = {
+        "cap_activation": None, "factorization": None, "frame_projection": None}
+    if not is_conditional_filtering(model):
+        route = getattr(cfg, "attention_mode", "transported")
+        reasons["cap_activation"] = (
+            f"attention_mode={route!r}: the transported E-step recomputes its capped pair costs at "
+            "every iteration and records none; cap activations are counted on the projected routes")
+        reasons["factorization"] = (
+            f"attention_mode={route!r}: no reduced (projected) covariance is factorized on this route")
+    mode = getattr(cfg, "m_phi_update_mode", "adamw")
+    if mode != "adamw":
+        reasons["frame_projection"] = (
+            f"m_phi_update_mode={mode!r}: no post-update frame projection (the pullback-group step "
+            "rejects rows outside the chart bound instead of projecting them)")
+    elif cfg.phi_mstep_max_matrix_norm is None:
+        reasons["frame_projection"] = (
+            "phi_mstep_max_matrix_norm is None: the run has no post-update frame projection")
+    return reasons
+
+
+@torch.no_grad()
+def _capture_numerics_counts(
+    diagnostic: Mapping[str, Any],
+    kl_max:     float,
+) -> Tuple[List[List[Tuple[int, int]]], List[Tuple[int, int]]]:
+    r"""Cost-cap activations per (layer, head) and reduced-covariance factorizations per layer.
+
+    Reads the projected-route records ``layer_conditional_captures`` and ``log_prior`` of one
+    ``forward_beliefs(capture={"diagnostic": {}})`` call over ``B`` windows.
+
+    Cap activation. The router bounds every routing cost before the softmax,
+    :math:`\bar D_{ij} = \min(D_{ij}, \kappa)` with :math:`\kappa` = ``cfg.kl_max`` (a non-finite cost is
+    set to :math:`\kappa`). With :math:`S_i` the causal sources of query :math:`i` (the finite entries of
+    the attention log-prior; :math:`\beta_{ij} > 0` when the model has none), the entries evaluated are
+    the pairs :math:`(i, j)`, :math:`j \in S_i`, of every query row with :math:`|S_i| \ge 2` (a
+    single-source row puts all its weight on itself whatever its cost, so the cap cannot act on it),
+    in every window, layer and head. An entry is capped when :math:`\bar D_{ij} \ge \kappa`. This is
+    the ``computed`` population of :class:`vfe3.posthoc.klcap.KLCapObserver` on unpadded windows.
+    With ``kl_max = inf`` only non-finite costs count as capped.
+
+    Factorizations. Each layer factors its reduced query and key covariances
+    :math:`G = L \Sigma L^\top` (:math:`L = S U^{-1}`, comparison rank :math:`r`) once per (window,
+    token, head) and role, so the layer's denominator is
+    :math:`\mathrm{numel}(G_q)/r^2 + \mathrm{numel}(G_k)/r^2`. The factorization uses zero jitter and
+    no spectral repair; its only fallback is the source-factor recovery of
+    :func:`vfe3.relational_scoring._strict_cholesky` (float64 QR of the source root
+    :math:`L \Sigma^{1/2}`, or a shifted CholeskyQR3 retry on the ``cholesky_qr2`` factor route) for an
+    entry whose working-precision factor failed, or failed the conditioning certificate under
+    ``projected_cov_condition_recovery``. The numerator is the layer's recovered-entry count
+    ``relational_covariance_repair_count``, a subset of the same entries. The pair-level factorizations
+    of :math:`G_{q,i} + G_{k,j}` on the noisy-query route have no fallback (a failure raises) and are
+    not counted.
+
+    Returns ``(cap, factorization)`` with ``cap[l][h] = (capped, entries)`` and
+    ``factorization[l] = (recovered, attempted)``, all Python ints, after one host transfer.
+    """
+    from vfe3.posthoc.klcap import causal_support       # the post-hoc cap statistic's support rule
+
+    captures = diagnostic.get("layer_conditional_captures") or []
+    if not captures:
+        raise RuntimeError("the projected-route capture holds no per-layer router records")
+    log_prior = diagnostic.get("log_prior")
+    device_counts: List[torch.Tensor] = []
+    heads: List[int] = []
+    attempted: List[int] = []
+    for capture in captures:
+        score = capture["score_energy_pre"].detach()                        # (B, H, N, N) capped cost
+        beta = capture["beta_pre"].detach()                                 # (B, H, N, N) router
+        if beta.dim() == 3:
+            score, beta = score.unsqueeze(1), beta.unsqueeze(1)             # (B, 1, N, N)
+        support = causal_support(beta, log_prior)                           # (B, H, N, N) bool
+        rows = support.sum(dim=-1, keepdim=True) >= 2                       # (B, H, N, 1)
+        entries = support & rows                                            # (B, H, N, N)
+        capped = entries & (score >= kl_max)                                # (B, H, N, N)
+        G_q = capture["projected_covariance_pre"]                           # (B, N, H, r, r)
+        G_k = capture["projected_key_covariance_pre"]                       # (B, N, H, r, r)
+        attempted.append(int(G_q.numel() // (G_q.shape[-1] ** 2)
+                             + G_k.numel() // (G_k.shape[-1] ** 2)))
+        recovered = torch.as_tensor(capture["relational_covariance_repair_count"]).reshape(1)
+        heads.append(int(beta.shape[1]))
+        device_counts.append(torch.cat((
+            capped.sum(dim=(0, 2, 3)), entries.sum(dim=(0, 2, 3)),          # (H,), (H,)
+            recovered.to(device=beta.device, dtype=torch.long))))          # (1,)
+    values = torch.cat(device_counts).cpu().tolist()                         # one host transfer
+    cap: List[List[Tuple[int, int]]] = []
+    factorization: List[Tuple[int, int]] = []
+    offset = 0
+    for n_heads, n_attempted in zip(heads, attempted):
+        capped_h = values[offset:offset + n_heads]
+        entries_h = values[offset + n_heads:offset + 2 * n_heads]
+        cap.append([(int(c), int(e)) for c, e in zip(capped_h, entries_h)])
+        factorization.append((int(values[offset + 2 * n_heads]), n_attempted))
+        offset += 2 * n_heads + 1
+    return cap, factorization
+
+
+def _merge_numerics_counts(
+    accumulator:   Dict[str, Any],
+    cap:           List[List[Tuple[int, int]]],
+    factorization: List[Tuple[int, int]],
+) -> None:
+    r"""Add one chunk's counts to the per-evaluation accumulator (keys ``cap`` and ``factorization``)."""
+    per_head = accumulator.setdefault("cap", {})
+    for layer, layer_counts in enumerate(cap):
+        for head, (capped, entries) in enumerate(layer_counts):
+            total = per_head.setdefault((layer, head), [0, 0])
+            total[0] += capped
+            total[1] += entries
+    fact = accumulator.setdefault("factorization", [0, 0])
+    for recovered, attempted in factorization:
+        fact[0] += recovered
+        fact[1] += attempted
+
+
+def _numerics_eval_columns(
+    accumulator: Mapping[str, Any],
+    step:        int,
+) -> Tuple[Dict[str, int], List[Dict[str, int]]]:
+    r"""Metrics columns and ``cap_activation.csv`` rows from one evaluation's accumulator.
+
+    Raises the error a chunk stored (so the caller counts one ``numerics_counters`` failure and
+    leaves the columns NaN) and refuses an accumulator that saw no capture.
+    """
+    error = accumulator.get("error")
+    if error is not None:
+        raise error
+    cap = accumulator.get("cap") or {}
+    fact = accumulator.get("factorization")
+    if not cap or fact is None:
+        raise RuntimeError("no projected-route capture was counted on the diagnostic windows")
+    rows = [{"step": int(step), "layer": int(layer), "head": int(head),
+             "capped": int(capped), "entries": int(entries)}
+            for (layer, head), (capped, entries) in sorted(cap.items())]
+    columns = {
+        "cap_active_count": sum(row["capped"] for row in rows),
+        "cap_entry_count": sum(row["entries"] for row in rows),
+        "factorization_fallback_count": int(fact[0]),
+        "factorization_count": int(fact[1]),
+    }
+    return columns, rows
+
+
+def _note_numerics_eval(
+    last:   Dict[str, Any],
+    step:   int,
+    values: Mapping[str, object],
+) -> None:
+    r"""Keep the latest evaluation whose per-evaluation counters were all measured (summary.json)."""
+    counts = {column: values.get(column) for column in NUMERICS_EVAL_COLUMNS}
+    if all(isinstance(value, int) and not isinstance(value, bool) for value in counts.values()):
+        last.clear()
+        last.update({"eval_step": int(step), **counts})
+
+
+def _frame_projection_state(
+    frame_counter: Optional[torch.Tensor],
+    frame_base:    Tuple[int, int],
+    since_step:    Optional[int],
+) -> Optional[Dict[str, int]]:
+    r"""Host copy of the cumulative frame-projection counts for a checkpoint (one host transfer)."""
+    if frame_counter is None:
+        return None
+    changed, checked = (int(value) for value in frame_counter.tolist())
+    return {"frame_projection_count": int(frame_base[0]) + changed,
+            "frame_projection_total": int(frame_base[1]) + checked,
+            "frame_projection_since_step": int(since_step or 0)}
+
+
+def _numerics_counters_summary(
+    completed_steps: int,
+    optimizer:       torch.optim.Optimizer,
+    frame_state:     Optional[Mapping[str, int]],
+    last_eval:       Mapping[str, Any],
+    reasons:         Mapping[str, Optional[str]],
+    windows:         Optional[torch.Tensor],   # (W, N) diagnostic windows
+) -> Dict[str, object]:
+    r"""The ``numerics_counters`` record of summary.json (JSON null wherever a count is undefined).
+
+    ``cap_active_count``, ``cap_entry_count``, ``factorization_fallback_count`` and
+    ``factorization_count`` are those of the last evaluation that measured them (``eval_step``) on
+    ``diagnostic_windows`` fixed validation windows; ``frame_projection_count`` /
+    ``frame_projection_total`` (counted from ``frame_projection_since_step``, 0 unless a resumed
+    checkpoint carried no counts), ``skipped_updates`` and ``attempted_updates`` are the final
+    cumulative values. ``skip_reasons`` names why a family is undefined (None where measured).
+    """
+    accepted = _successful_update_count(optimizer)
+    frame = dict(frame_state) if frame_state is not None else {}
+    return {
+        "eval_step": last_eval.get("eval_step"),
+        **{column: last_eval.get(column) for column in NUMERICS_EVAL_COLUMNS},
+        "diagnostic_windows": (int(windows.shape[0]) if isinstance(windows, torch.Tensor) else None),
+        "frame_projection_count": frame.get("frame_projection_count"),
+        "frame_projection_total": frame.get("frame_projection_total"),
+        "frame_projection_since_step": frame.get("frame_projection_since_step"),
+        "skipped_updates": int(completed_steps) - int(accepted),
+        "attempted_updates": int(completed_steps),
+        "skip_reasons": dict(reasons),
+    }
+
+
+def _cumulative_counter_columns(
+    completed_steps: int,
+    optimizer:       torch.optim.Optimizer,
+    frame_counter:   Optional[torch.Tensor],   # (2,) int64 device [rows rescaled, rows checked]
+    frame_base:      Tuple[int, int],
+) -> Dict[str, float]:
+    r"""Cumulative update and frame-projection counters since step 0, for one metrics row.
+
+    ``attempted_updates`` is the number of completed outer training steps (every attempted
+    optimizer update) and ``skipped_updates`` the ones the optimizer rejected (nonfinite loss or
+    gradient, nonfinite clip norm, zero scored targets, or an AMP scale backoff): attempted minus the
+    accepted-update clock that :func:`train_step` keeps in the optimizer groups (restored on resume).
+    Both are host integers already, so they cost nothing.
+
+    ``frame_projection_count`` / ``frame_projection_total``: frame-generator rows (rows of
+    ``prior_bank.phi_embed`` and of the learned positional table ``pos_phi_free``) that the
+    post-update projection onto the embedded Frobenius ball of radius ``phi_mstep_max_matrix_norm``
+    rescaled (scale :math:`< 1`), and the rows it checked, summed over every projection call, i.e.
+    over the accepted updates. They accumulate on the device inside
+    :func:`vfe3.gauge_optim.project_phi_parameter_rows_` and are read here, on a metrics row only.
+    ``frame_base`` carries the counts restored from a checkpoint on resume. NaN when the run has
+    no post-update projection (see :func:`_numerics_counter_skip_reasons`) or no counter.
+    """
+    accepted = _successful_update_count(optimizer)
+    out: Dict[str, float] = {
+        "frame_projection_count": float("nan"), "frame_projection_total": float("nan"),
+        "skipped_updates": int(completed_steps) - int(accepted),
+        "attempted_updates": int(completed_steps),
+    }
+    if frame_counter is not None:
+        changed, checked = (int(value) for value in frame_counter.tolist())   # log row only
+        out["frame_projection_count"] = int(frame_base[0]) + changed
+        out["frame_projection_total"] = int(frame_base[1]) + checked
+    return out
+
+
+def _parameter_group(
+    name: str,
+) -> str:
+    r"""Named group of one model parameter (see ``PARAMETER_GROUPS``).
+
+    ``decode`` holds the linear readout ``output_proj_*``, the untied decode tables ``decode_*``
+    and ``decode_log_scale``; ``norm`` holds the block and final normalization affines; anything
+    not matched lands in ``other`` (listed once in the training log). A leading wrapper prefix
+    (``_orig_mod.`` from ``torch.compile``, ``module.`` from data parallelism) is ignored.
+    """
+    for prefix in ("_orig_mod.", "module."):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+    leaf = name.rsplit(".", 1)[-1]
+    if name == "prior_bank.mu_embed":
+        return "mu_embed"
+    if name == "prior_bank.sigma_log_embed":
+        return "sigma_log_embed"
+    if name == "prior_bank.phi_embed":
+        return "phi_embed"
+    if name == "pos_phi_free":
+        return "pos_phi"
+    if name.startswith("prior_bank.") and leaf.startswith(("output_proj", "decode_")):
+        return "decode"
+    if name.startswith("relational_operators"):
+        if leaf in ("raw_score_q", "raw_score_k"):
+            return "relational_score"
+        if leaf in ("T", "O"):
+            return "relational_content"
+        return "other"
+    if name.startswith("block_mlps."):
+        return "block_mlp"
+    if name.startswith(("block_norm.", "final_norm.")):
+        return "norm"
+    return "other"
+
+
+def _group_gradient_norms(
+    model: torch.nn.Module,
+) -> Dict[str, float]:
+    r"""Pre-clip gradient norm of each named group, ``||g_G|| = (sum_{p in G} ||grad_p||_2^2)^{1/2}``.
+
+    A group with trainable parameters but no gradient reports 0.0 (the role columns' convention); a
+    group with no trainable parameter reports NaN. One host transfer for all groups.
+    """
+    present = set()
+    squares: List[torch.Tensor] = []
+    owners: List[str] = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        group = _parameter_group(name)
+        present.add(group)
+        if parameter.grad is not None:
+            squares.append(torch.linalg.vector_norm(parameter.grad.detach()).to(torch.float64).square())
+            owners.append(group)
+    totals = {group: 0.0 for group in present}
+    if squares:
+        for group, value in zip(owners, torch.stack(squares).cpu().tolist()):
+            totals[group] += value
+    return {f"grad_norm_group_{group}": (math.sqrt(totals[group]) if group in totals else float("nan"))
+            for group in PARAMETER_GROUPS}
+
+
+def _parameter_snapshot(
+    model: torch.nn.Module,
+) -> Dict[str, torch.Tensor]:
+    r"""Host copies of every trainable parameter, taken before an optimizer step on a log step.
+
+    Kept on the CPU so the update-ratio probe never adds device memory to a training step.
+    """
+    return {name: parameter.detach().to("cpu", copy=True)
+            for name, parameter in model.named_parameters() if parameter.requires_grad}
+
+
+@torch.no_grad()
+def _group_update_statistics(
+    model:  torch.nn.Module,
+    before: Mapping[str, torch.Tensor],       # _parameter_snapshot taken before the step
+) -> Dict[str, float]:
+    r"""Parameter norm and realized update ratio of each named group across one training step.
+
+    .. math::
+        \|\theta_G\| = \Big(\sum_{p \in G} \|p_t\|_2^2\Big)^{1/2},\qquad
+        r_G = \frac{\big(\sum_{p \in G} \|p_{t+1} - p_t\|_2^2\big)^{1/2}}{\|\theta_G\|},
+
+    with :math:`p_t` the pre-step value and :math:`p_{t+1}` the value after the optimizer step and any
+    post-step projection (the realized update, including weight decay). A rejected step gives
+    :math:`r_G = 0`. The difference is formed in float64 on the parameter's device in bounded chunks.
+    """
+    delta_sq: Dict[str, float] = {}
+    norm_sq: Dict[str, float] = {}
+    for name, parameter in model.named_parameters():
+        previous = before.get(name)
+        if previous is None:
+            continue
+        group = _parameter_group(name)
+        current = parameter.detach().reshape(-1)
+        prior = previous.reshape(-1)
+        delta = torch.zeros((), dtype=torch.float64, device=current.device)
+        for start in range(0, current.numel(), UPDATE_NORM_CHUNK_ELEMENTS):
+            stop = start + UPDATE_NORM_CHUNK_ELEMENTS
+            chunk = prior[start:stop].to(device=current.device, dtype=torch.float64)
+            delta.add_((current[start:stop].to(torch.float64) - chunk).square().sum())
+        delta_sq[group] = delta_sq.get(group, 0.0) + float(delta)
+        norm_sq[group] = norm_sq.get(group, 0.0) + float(
+            torch.linalg.vector_norm(prior, dtype=torch.float64).square())   # host tensor
+    out: Dict[str, float] = {}
+    for group in PARAMETER_GROUPS:
+        if group not in norm_sq:
+            out[f"param_norm_group_{group}"] = float("nan")
+            out[f"update_ratio_group_{group}"] = float("nan")
+            continue
+        weight = math.sqrt(norm_sq[group])
+        out[f"param_norm_group_{group}"] = weight
+        out[f"update_ratio_group_{group}"] = (
+            math.sqrt(delta_sq[group]) / weight if weight > 0.0 else float("nan"))
+    return out
+
+
+@torch.no_grad()
+def _group_parameter_norms(
+    model: torch.nn.Module,
+) -> Dict[str, float]:
+    r"""``param_norm_group_<g>`` alone (no step): the step-0 reference norms."""
+    norm_sq: Dict[str, float] = {}
+    for name, parameter in model.named_parameters():
+        if parameter.requires_grad:
+            group = _parameter_group(name)
+            norm_sq[group] = norm_sq.get(group, 0.0) + float(
+                torch.linalg.vector_norm(parameter.detach()).to(torch.float64).square())
+    return {f"param_norm_group_{group}": (math.sqrt(norm_sq[group]) if group in norm_sq
+                                          else float("nan"))
+            for group in PARAMETER_GROUPS}
+
+
+@torch.no_grad()
+def _sigma_log_statistics(
+    model: torch.nn.Module,
+) -> Dict[str, float]:
+    r"""Mean and standard deviation of the whole prior log-variance table ``sigma_log_embed``.
+
+    Reported instead of its norm: the norm decays toward 0 under weight decay, so a
+    gradient-to-weight ratio built on it rises for a trivial reason. Population statistics
+    (``correction=0``) in the table's own precision, with no full-size float64 copy on the device.
+    """
+    table = getattr(getattr(model, "prior_bank", None), "sigma_log_embed", None)
+    if not isinstance(table, torch.Tensor) or table.numel() == 0:
+        return {"sigma_log_mean": float("nan"), "sigma_log_sd": float("nan")}
+    values = table.detach()
+    if not values.is_floating_point() or values.element_size() < 4:
+        values = values.float()
+    sd, mean = torch.std_mean(values, correction=0)
+    return {"sigma_log_mean": float(mean), "sigma_log_sd": float(sd)}
+
+
+def _record_diagnostic_failure(
+    failures: Dict[str, int],
+    name:     str,
+    exc:      BaseException,
+    logger:   logging.Logger,
+) -> None:
+    r"""Count one failed diagnostic; warn only on its first failure."""
+    failures[name] = failures.get(name, 0) + 1
+    if failures[name] == 1:
+        logger.warning(
+            "       (diagnostic %r failed: %s: %s); training continues and further failures of "
+            "this diagnostic are counted in diagnostics_failures", name, type(exc).__name__, exc)
+
+
+class FixedTrainSample:
+    r"""Fixed training-split windows scored under the validation protocol (an ``evaluate`` loader).
+
+    Window ``k`` is training window ``indices[k]`` of the train loader's dataset (the windows the
+    model is trained on). Under a sliding validation window (``stride < seq_len``) only its last
+    ``stride`` targets are scored, so every scored target has at least ``seq_len - stride`` tokens of
+    context, as in validation; with disjoint validation windows every target is scored. Batches are
+    assembled on the CPU without a DataLoader, so iteration draws no RNG.
+    """
+
+    def __init__(
+        self,
+        dataset:    object,
+        indices:    Sequence[int],
+        batch_size: int,
+        stride:     int,
+    ) -> None:
+        self.dataset = dataset
+        self.indices = [int(index) for index in indices]
+        self.batch_size = max(1, int(batch_size))
+        self.seq_len = int(getattr(dataset, "seq_len"))
+        self.stride = int(stride)
+        self.masked_prefix = max(0, self.seq_len - self.stride)
+
+    def __len__(self) -> int:
+        return -(-len(self.indices) // self.batch_size)
+
+    @property
+    def scored_targets_per_window(self) -> int:
+        return self.seq_len - self.masked_prefix
+
+    def _window(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        inputs, targets = self.dataset[index]
+        targets = targets.clone()                     # never mask a view into the corpus
+        if self.masked_prefix:
+            targets[:self.masked_prefix] = -100
+        return inputs, targets
+
+    def __iter__(self) -> Iterable[Tuple[torch.Tensor, torch.Tensor]]:
+        for start in range(0, len(self.indices), self.batch_size):
+            pairs = [self._window(index) for index in self.indices[start:start + self.batch_size]]
+            yield (torch.stack([pair[0] for pair in pairs]),        # (B, N)
+                   torch.stack([pair[1] for pair in pairs]))        # (B, N)
+
+
+def _build_fixed_train_sample(
+    train_loader: object,
+    val_loader:   Optional[object],
+    cfg:          VFE3Config,
+) -> Tuple[Optional[FixedTrainSample], Optional[str]]:
+    r"""Choose the fixed training sample; returns ``(sample, None)`` or ``(None, reason)``.
+
+    Target count :math:`T = \min(T_{\rm val}, \texttt{TRAIN\_SAMPLE\_MAX\_TARGETS})`, with
+    :math:`T_{\rm val}` the validation split's transition count (every transition is scored once
+    under the padded evaluation contract), or the cap when the validation loader exposes no token
+    stream. :math:`\lceil T / s \rceil` windows are drawn without replacement by
+    ``torch.randperm`` under a generator seeded with ``TRAIN_SAMPLE_SEED``, and sorted.
+    """
+    dataset = getattr(train_loader, "dataset", None)
+    if dataset is None or not isinstance(getattr(dataset, "tokens", None), torch.Tensor):
+        return None, "train loader exposes no token-window dataset"
+    try:
+        n_windows_total = int(len(dataset))
+        seq_len = int(dataset.seq_len)
+    except (TypeError, AttributeError) as exc:
+        return None, f"train dataset has no window length ({exc!r})"
+    if n_windows_total <= 0:
+        return None, "train dataset has no windows"
+    stride = seq_len if cfg.eval_stride is None else min(int(cfg.eval_stride), seq_len)
+    val_tokens = getattr(getattr(val_loader, "dataset", None), "tokens", None)
+    val_targets = (int(val_tokens.numel()) - 1 if isinstance(val_tokens, torch.Tensor)
+                   else TRAIN_SAMPLE_MAX_TARGETS)
+    n_targets = max(1, min(val_targets, TRAIN_SAMPLE_MAX_TARGETS))
+    n_windows = min(n_windows_total, -(-n_targets // stride))
+    generator = torch.Generator().manual_seed(TRAIN_SAMPLE_SEED)
+    chosen = torch.randperm(n_windows_total, generator=generator)[:n_windows]
+    indices = sorted(int(index) for index in chosen.tolist())
+    batch_size = int(getattr(val_loader, "batch_size", None) or cfg.batch_size)
+    return FixedTrainSample(dataset, indices, batch_size, stride), None
+
+
+def _diagnostic_windows(
+    val_loader: object,
+
+    *,
+    n_windows: int = DIAGNOSTIC_WINDOWS,
+) -> Optional[torch.Tensor]:
+    r"""``(W, N)`` fixed validation input windows for the residual and attention probes, or None.
+
+    From a window dataset: ``W = min(n_windows, usable)`` windows at evenly spaced indices over the
+    split (the padded final window of an evaluation stream is excluded). Otherwise the first rows of
+    the loader's batches. Callers hold the RNG streams fixed around this (a DataLoader iterator draws
+    a base seed).
+    """
+    dataset = getattr(val_loader, "dataset", None)
+    if dataset is not None and hasattr(dataset, "__getitem__") and hasattr(dataset, "__len__"):
+        total = int(len(dataset))
+        usable = total - 1 if (getattr(dataset, "pad_final", False) and total > 1) else total
+        if usable > 0:
+            count = min(int(n_windows), usable)
+            positions = torch.linspace(0, usable - 1, count, dtype=torch.float64).round().long()
+            indices = sorted(set(int(index) for index in positions.tolist()))
+            return torch.stack([dataset[index][0].to(torch.long) for index in indices])
+    rows: List[torch.Tensor] = []
+    for batch in val_loader:
+        tokens = batch[0] if isinstance(batch, (tuple, list)) else batch
+        for row in tokens:
+            rows.append(row.to(torch.long))
+            if len(rows) >= n_windows:
+                return torch.stack(rows)
+    return torch.stack(rows) if rows else None
+
+
+def _map_snapshot_state(
+    model: torch.nn.Module,
+) -> Dict[str, torch.Tensor]:
+    r"""Every ``relational_operators*`` and ``pos_phi_free`` tensor of the state dict, CPU fp32."""
+    return {name: tensor.detach().to(device="cpu", dtype=torch.float32, copy=True)
+            for name, tensor in model.state_dict().items()
+            if name.startswith("relational_operators") or name.split(".")[-1] == "pos_phi_free"}
+
+
+def _residual_update_is_additive(
+    model: VFEModel,
+) -> bool:
+    r"""Whether the layer's mean update has the residual form ``mu + m`` (so removing ``mu`` is defined).
+
+    False only for the predictive-content readout with ``attention_residual=False``, which replaces
+    the mean by the predictive mean.
+    """
+    cfg = model.cfg
+    return not (is_conditional_filtering(model)
+                and getattr(cfg, "relational_readout_mode", None) == "predictive_content"
+                and not getattr(cfg, "attention_residual", False))
+
+
+@torch.no_grad()
+def _residual_and_attention_rows(
+    model:   VFEModel,
+    windows: torch.Tensor,                    # (W, N) fixed validation input windows
+    step:    int,
+    device:  torch.device,
+
+    *,
+    counters_out: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[Dict[str, float]], List[Dict[str, float]]]:
+    r"""Per-layer residual-ratio quantiles and per-head attention statistics on fixed windows.
+
+    ``counters_out`` (projected routes): when a dict is given, the S1 panel D per-evaluation counts
+    of the same captures (:func:`_capture_numerics_counts`) are accumulated into it, so the counters
+    share this forward. A counting error is stored under ``"error"`` (later chunks are then not
+    counted) and never disturbs the residual and attention rows.
+
+    One ``forward_beliefs(capture={"diagnostic": {}})`` per chunk of windows, in eval mode (module
+    modes restored). For layer :math:`l`, input mean :math:`\mu_i` (the stack-entry belief at
+    :math:`l = 0`, else layer :math:`l-1`'s output) and the layer's attention output
+    :math:`\mu_i + m_i` (the pre-transform converged mean), per token
+
+    .. math::
+        \rho_i = \frac{\|m_i\|}{\|\mu_i\|},\qquad
+        \delta_i = \frac{\|\mathrm{LN}(\mu_i + m_i) - \mathrm{LN}(m_i)\|}{\|\mathrm{LN}(\mu_i + m_i)\|},
+
+    reporting the 10/50/90% quantiles of :math:`\rho` and the median of :math:`\delta`.
+    :math:`\delta` is NaN when the block has no normalization, when a head mixer or CG coupling sits
+    between the E-step and the norm (the norm then does not see :math:`\mu + m`), and for the
+    predictive readout without ``attention_residual`` (no residual exists to remove).
+
+    Attention: :math:`\beta` is the router the forward used (``beta_pre`` on the conditional route;
+    the entry-scored map on the legacy route). Over query rows with at least two admissible sources
+    (support of the attention log-prior, or :math:`\beta > 0` without one), per layer and head, the
+    means of :math:`H(\beta_{i\cdot})/\log|S_i|`, :math:`\sum_j \beta_{ij}|i-j|`, :math:`\beta_{ii}` and
+    :math:`\sum_j \min(\beta_{ij}, \pi_{ij})` with :math:`\pi = \mathrm{softmax}_j(B)` the prior alone.
+    """
+    conditional = is_conditional_filtering(model)
+    block_norm = model.block_norm
+    ln_defined = (block_norm is not None and model.head_mixer is None
+                  and model.cg_coupling is None and _residual_update_is_additive(model))
+    ratios: Dict[int, List[torch.Tensor]] = {}
+    ln_changes: Dict[int, List[torch.Tensor]] = {}
+    sums: Dict[Tuple[int, int], List[float]] = {}          # (layer, head) -> [H_norm, dist, self, overlap, n]
+    modes = [(module, module.training) for module in model.modules()]
+    model.eval()
+    try:
+        for chunk in windows.split(max(1, DIAGNOSTIC_CHUNK_WINDOWS)):
+            ids = chunk.to(device)                                              # (B, N)
+            capture: dict = {"diagnostic": {}}
+            model.forward_beliefs(ids, capture=capture)
+            diagnostic = capture["diagnostic"]
+            if counters_out is not None and conditional and "error" not in counters_out:
+                try:
+                    cap_counts, factorization_counts = _capture_numerics_counts(
+                        diagnostic, float(model.cfg.kl_max))
+                    _merge_numerics_counts(counters_out, cap_counts, factorization_counts)
+                except Exception as exc:                  # noqa: BLE001 - reported by the caller
+                    counters_out["error"] = exc
+            n_layers = len(diagnostic["layer_converged"])
+            for layer in range(n_layers):
+                source = (diagnostic["initial_belief"] if layer == 0
+                          else diagnostic["layer_outputs"][layer - 1])
+                mu_in = source.mu.float()                                       # (B, N, K)
+                converged = diagnostic["layer_converged"][layer]
+                mu_out = converged.mu.float()                                   # (B, N, K) = mu + m
+                message = mu_out - mu_in                                        # (B, N, K) m_i
+                in_norm = torch.linalg.vector_norm(mu_in, dim=-1)               # (B, N)
+                ratio = torch.linalg.vector_norm(message, dim=-1) / in_norm
+                ratios.setdefault(layer, []).append(ratio[torch.isfinite(ratio)].reshape(-1).cpu())
+                if ln_defined:
+                    sigma = converged.sigma.float()
+                    full = block_norm(mu_out, sigma).float()                    # (B, N, K) LN(mu + m)
+                    removed = block_norm(message, sigma).float()                # (B, N, K) LN(m)
+                    change = (torch.linalg.vector_norm(full - removed, dim=-1)
+                              / torch.linalg.vector_norm(full, dim=-1))
+                    ln_changes.setdefault(layer, []).append(
+                        change[torch.isfinite(change)].reshape(-1).cpu())
+            log_prior = diagnostic.get("log_prior")
+            if conditional:
+                betas = [capture_l["beta_pre"].float()
+                         for capture_l in diagnostic["layer_conditional_captures"]]
+            else:
+                per_window = torch.stack([model.attention_maps(ids[b:b + 1], score_at="entry")
+                                          for b in range(ids.shape[0])]).float()  # (B, L, H, N, N)
+                betas = [per_window[:, layer] for layer in range(per_window.shape[1])]
+            for layer, beta in enumerate(betas):
+                if beta.dim() == 3:
+                    beta = beta.unsqueeze(1)                                    # (B, 1, N, N)
+                n = beta.shape[-1]
+                if isinstance(log_prior, torch.Tensor):
+                    prior_logits = log_prior.float()
+                    while prior_logits.dim() < 4:
+                        prior_logits = prior_logits.unsqueeze(0)                # (1|B, 1|H, N, N)
+                    support = torch.isfinite(prior_logits).expand_as(beta)
+                    prior = torch.softmax(prior_logits, dim=-1).expand_as(beta)
+                else:
+                    support = beta > 0.0
+                    prior = torch.full_like(beta, 1.0 / n)
+                n_sources = support.sum(dim=-1)                                 # (B, H, N)
+                rows = n_sources >= 2                                           # (B, H, N)
+                entropy = -torch.special.xlogy(beta, beta).sum(dim=-1)          # (B, H, N)
+                entropy_norm = entropy / torch.log(n_sources.clamp_min(2).to(beta.dtype))
+                offsets = torch.arange(n, device=beta.device)
+                distance = (beta * (offsets.view(-1, 1) - offsets.view(1, -1)).abs().to(beta.dtype)
+                            ).sum(dim=-1)                                       # (B, H, N)
+                self_weight = torch.diagonal(beta, dim1=-2, dim2=-1)            # (B, H, N)
+                overlap = torch.minimum(beta, prior).sum(dim=-1)                # (B, H, N)
+                weights = rows.to(torch.float64)
+                per_head = torch.stack([
+                    (entropy_norm.double() * weights).sum(dim=(0, 2)),
+                    (distance.double() * weights).sum(dim=(0, 2)),
+                    (self_weight.double() * weights).sum(dim=(0, 2)),
+                    (overlap.double() * weights).sum(dim=(0, 2)),
+                    weights.sum(dim=(0, 2)),
+                ], dim=-1).cpu().tolist()                                       # (H, 5)
+                for head, values in enumerate(per_head):
+                    total = sums.setdefault((layer, head), [0.0] * 5)
+                    for slot, value in enumerate(values):
+                        total[slot] += value
+    finally:
+        for module, was_training in modes:
+            module.training = was_training
+    nan = float("nan")
+    residual_rows: List[Dict[str, float]] = []
+    for layer in sorted(ratios):
+        values = torch.cat(ratios[layer]).double()
+        q10, q50, q90 = (torch.quantile(values, torch.tensor([0.1, 0.5, 0.9], dtype=torch.float64)).tolist()
+                         if values.numel() else (nan, nan, nan))
+        changes = torch.cat(ln_changes[layer]).double() if layer in ln_changes else torch.empty(0)
+        residual_rows.append({
+            "step": int(step), "layer": int(layer), "q10": q10, "q50": q50, "q90": q90,
+            "ln_rel_change_q50": (float(changes.median()) if changes.numel() else nan),
+        })
+    attention_rows: List[Dict[str, float]] = []
+    for (layer, head), (h_sum, d_sum, s_sum, o_sum, count) in sorted(sums.items()):
+        attention_rows.append({
+            "step": int(step), "layer": int(layer), "head": int(head),
+            "entropy_norm": h_sum / count if count else nan,
+            "distance_mean": d_sum / count if count else nan,
+            "self_weight": s_sum / count if count else nan,
+            "prior_overlap": o_sum / count if count else nan,
+            "n_rows": int(count),
+        })
+    return residual_rows, attention_rows
+
+
+def _eval_cadence_diagnostics(
+    model:        VFEModel,
+    artifacts:    "RunArtifacts",
+    logger:       logging.Logger,
+
+    *,
+    step:         int,
+    val_ce:       float,
+    train_sample: Optional[FixedTrainSample],
+    windows:      Optional[torch.Tensor],
+    device:       torch.device,
+    failures:     Dict[str, int],
+    count_numerics: bool = False,
+) -> Dict[str, float]:
+    r"""Run the eval-cadence additions for one evaluation; return its metrics columns.
+
+    (1) CE of the fixed training sample under the validation protocol, and
+    ``generalization_gap_fixed = val_ce - train_sample_ce`` (positive = the model fits its training
+    windows better than held-out text); (2) ``diagnostics/residual_ratio.csv`` and
+    ``diagnostics/attention_stats.csv`` rows on the fixed validation windows; (3) with
+    ``count_numerics`` (projected routes), the S1 panel D per-evaluation counters of the same
+    capture pass (``NUMERICS_EVAL_COLUMNS``, see :func:`_capture_numerics_counts`) and their
+    per-(layer, head) rows in ``diagnostics/cap_activation.csv``; (4) the map snapshot
+    ``map_snapshots/step_<N:07d>.pt``. Each part is isolated: a failure is counted and the others
+    still run (the counters are NaN when their shared capture pass fails; that failure is counted
+    once, as ``residual_attention``). CPU and CUDA RNG states are restored on exit.
+    """
+    out = {column: float("nan") for column in _EVAL_CADENCE_COLUMNS}
+    rng_devices = [device] if device.type == "cuda" else []
+    with torch.random.fork_rng(devices=rng_devices):
+        if train_sample is not None:
+            try:
+                sample = evaluate(model, train_sample, device=device)
+                out["train_sample_ce"] = float(sample["ce"])
+                out["train_sample_ppl"] = float(sample["ppl"])
+                out["generalization_gap_fixed"] = float(val_ce) - float(sample["ce"])
+                artifacts.train_sample_by_step[int(step)] = float(sample["ce"])
+            except Exception as exc:
+                _record_diagnostic_failure(failures, "train_sample", exc, logger)
+        if windows is not None:
+            counters: Optional[Dict[str, Any]] = {} if count_numerics else None
+            try:
+                residual_rows, attention_rows = _residual_and_attention_rows(
+                    model, windows, step, device, counters_out=counters)
+            except Exception as exc:
+                _record_diagnostic_failure(failures, "residual_attention", exc, logger)
+                residual_rows = attention_rows = None
+                counters = None                   # its capture pass failed; counted once above
+            if residual_rows is not None:
+                try:
+                    artifacts.append_diagnostic_rows(
+                        "residual_ratio.csv", RESIDUAL_RATIO_FIELDS, residual_rows)
+                    artifacts.append_diagnostic_rows(
+                        "attention_stats.csv", ATTENTION_STATS_FIELDS, attention_rows)
+                except Exception as exc:
+                    _record_diagnostic_failure(failures, "residual_attention", exc, logger)
+            if counters is not None:
+                try:
+                    columns, cap_rows = _numerics_eval_columns(counters, step)
+                    out.update(columns)
+                    artifacts.append_diagnostic_rows(
+                        "cap_activation.csv", CAP_ACTIVATION_FIELDS, cap_rows)
+                except Exception as exc:
+                    _record_diagnostic_failure(failures, "numerics_counters", exc, logger)
+        try:
+            state = _map_snapshot_state(model)
+            if state:
+                artifacts.save_map_snapshot(step, state)
+        except Exception as exc:
+            _record_diagnostic_failure(failures, "map_snapshot", exc, logger)
+    return out
+
+
+def _optimizer_state_bytes(
+    optimizer: torch.optim.Optimizer,
+) -> Dict[str, int]:
+    r"""Bytes held by optimizer state tensors (AdamW moments, step counters), total and by dtype."""
+    total = 0
+    by_dtype: Dict[str, int] = {}
+    for state in optimizer.state.values():
+        for value in state.values():
+            if isinstance(value, torch.Tensor):
+                size = int(value.numel()) * int(value.element_size())
+                total += size
+                by_dtype[str(value.dtype)] = by_dtype.get(str(value.dtype), 0) + size
+    return {"total": total, **{f"dtype:{key}": value for key, value in sorted(by_dtype.items())}}
+
+
 class ValidationDiagnostics(NamedTuple):
     r"""Metrics and bounded held-out state shared by one periodic evaluation event."""
 
@@ -1286,6 +2179,7 @@ def _val_diagnostics(
 
     *,
     batches:    int = 1,
+    failures:   Optional[Dict[str, int]] = None,
 ) -> ValidationDiagnostics:
     r"""Held-out per-eval probes, averaged over the first ``batches`` validation batches.
 
@@ -1310,7 +2204,7 @@ def _val_diagnostics(
     costs that column one sample instead of the whole eval.
     """
     if batches <= 1:
-        return _val_diagnostics_one(model, next(iter(val_loader)), device)
+        return _val_diagnostics_one(model, next(iter(val_loader)), device, failures=failures)
 
     first: Optional[ValidationDiagnostics] = None
     sums:   Dict[str, float] = {}
@@ -1318,7 +2212,7 @@ def _val_diagnostics(
     for index, batch in enumerate(val_loader):
         if index >= batches:
             break
-        one = _val_diagnostics_one(model, batch, device)
+        one = _val_diagnostics_one(model, batch, device, failures=failures)
         for key, value in one.metrics.items():
             if math.isfinite(value):
                 sums[key]   = sums.get(key, 0.0) + value
@@ -1328,7 +2222,7 @@ def _val_diagnostics(
         else:
             del one                      # release this batch's snapshot (dense logits) immediately
     if first is None:                    # empty loader: preserve the old failure mode
-        return _val_diagnostics_one(model, next(iter(val_loader)), device)
+        return _val_diagnostics_one(model, next(iter(val_loader)), device, failures=failures)
     averaged = {
         key: (sums[key] / counts[key]) if counts.get(key) else float("nan")
         for key in first.metrics
@@ -1427,11 +2321,82 @@ def _terminal_validation_signature(
     )
 
 
+def _attention_structure_metrics(
+    amaps: torch.Tensor,                      # (L, H, N, N) all layers/heads, one sequence
+) -> Dict[str, float]:
+    r"""Held-out attention-map structure: entropy collapse, causal sanity, positional/content, redundancy.
+
+    Shared by both routes of :func:`_val_diagnostics_one`; the legacy route passes the entry-scored
+    replay, the conditional route the actual pre-update router ``snapshot.beta_maps``.
+    """
+    from vfe3 import metrics as M
+
+    out: Dict[str, float] = {}
+    # Row-support filter (audit 2026-08-05): attention_entropy_rows floors beta at eps, so a
+    # hard-masked row of an N-key grid returns (#masked)*eps*|ln eps| -- a pure function of N and
+    # eps. Unfiltered, val_attn_entropy_min_all was CONSTANT across every logged step of every run
+    # (1.740754e-09 = 63*1e-12*ln(1e-12)) and val_attn_collapsed_heads pinned at n_heads, so the
+    # collapsed-head alarm could never fire. model.py already applies this filter for the
+    # val_attn_entropy_min twin; these two were missed.
+    # The collapse test is scored on entropy NORMALIZED by each row's own ceiling ln(support_i)
+    # (audit 2026-08-06 F22). A fixed ln 2 threshold is exactly the ceiling of the first two-key row,
+    # so the strict `<` was decided by float noise -- measured 2 of 2 heads flagged on an untrained
+    # model whose attention is as uniform as the causal mask permits. See metrics.attention_head_collapse.
+    ent_rows = M.attention_entropy_rows(amaps)                  # (L, H, N)
+    scorable = (amaps > 0.0).sum(dim=-1) >= 2                   # rows with >=2 admissible keys
+    hmin = ent_rows.masked_fill(~scorable, float("inf")).min(dim=-1).values   # (L, H)
+    finite_hmin = hmin[torch.isfinite(hmin)]
+    out["val_attn_entropy_min_all"] = (float(finite_hmin.min()) if finite_hmin.numel()
+                                       else float("nan"))
+    worst_norm, collapsed = M.attention_head_collapse(amaps)    # (L, H) each
+    finite_norm = worst_norm[torch.isfinite(worst_norm)]
+    out["val_attn_entropy_min_norm"] = (float(finite_norm.min()) if finite_norm.numel()
+                                        else float("nan"))
+    out["val_attn_collapsed_heads"] = float(collapsed.float().sum())
+    cs = M.causal_sanity(amaps)
+    out["val_future_leakage"] = float(cs["future_leakage"].max())   # soft causal prior can leak silently
+    out["val_row_sum_error"]  = float(cs["row_sum_error"].max())
+    out["val_pos_content_r2"] = float(M.positional_content_score(amaps).mean())
+    sh = M.structured_head_scores(amaps)
+    out["val_prev_token_mass"]   = float(sh["prev_token"].mean())
+    out["val_period_match_mass"] = float(sh["period_match"].mean())
+    if amaps.shape[1] > 1:                                       # head redundancy needs >= 2 heads
+        h = amaps.shape[1]
+        off = ~torch.eye(h, dtype=torch.bool, device=amaps.device)
+        out["val_head_redundancy_js"] = float(torch.stack(
+            [M.head_redundancy_js(amaps[li])[off].mean() for li in range(amaps.shape[0])]).mean())
+    return out
+
+
+def _position_loss_metrics(
+    logits:  torch.Tensor,                    # (B, N, V) captured held-out logits
+    targets: torch.Tensor,                    # (B, N) next-token ids (-100 = ignore)
+) -> Dict[str, float]:
+    r"""Per-position within-sequence loss: mean CE over the first and last quarter of positions."""
+    import torch.nn.functional as F
+
+    out: Dict[str, float] = {}
+    b, n = targets.shape
+    per = F.cross_entropy(logits.reshape(-1, logits.shape[-1]).float(), targets.reshape(-1),
+                          ignore_index=-100, reduction="none").reshape(b, n)
+    valid = (targets != -100).float()
+    pos_ce = (per * valid).sum(0) / valid.sum(0).clamp(min=1.0)   # (N,) mean CE at each position
+    q = n // 4
+    if q > 0:
+        out["pos_loss_first_q"] = float(pos_ce[:q].mean())
+        out["pos_loss_last_q"]  = float(pos_ce[-q:].mean())
+        out["pos_loss_ratio"]   = float(pos_ce[-q:].mean() / pos_ce[:q].mean().clamp(min=1e-9))
+    return out
+
+
 @torch.no_grad()
 def _val_diagnostics_one(
     model:      VFEModel,
     batch:      object,
     device:     torch.device,
+
+    *,
+    failures:   Optional[Dict[str, int]] = None,
 ) -> ValidationDiagnostics:
     r"""Held-out per-eval probes (the train-loop ``diagnostics`` runs on the live TRAIN batch).
 
@@ -1441,6 +2406,25 @@ def _val_diagnostics_one(
     within-sequence loss. Off the graph (no_grad). Best-effort: the CALLER wraps this so a replay
     error simply leaves the previous values carried forward; the returned subset is ``.update``-d
     into a NaN-initialized dict, so the CSV stays rectangular.
+
+    Conditional (relational) route: the attention-structure columns (``val_attn_entropy_min_all``,
+    ``val_attn_entropy_min_norm``, ``val_attn_collapsed_heads``, ``val_future_leakage``,
+    ``val_row_sum_error``, ``val_pos_content_r2``, ``val_prev_token_mass``,
+    ``val_period_match_mass``, ``val_head_redundancy_js``) are computed on the actual pre-update
+    router ``snapshot.beta_maps`` of the same capture, the ``pos_loss_*`` columns on its logits, and
+    ``val_effective_rank`` / ``val_belief_cond_median`` from the last layer's converged covariance
+    (as the relational diagnostics report them). The following stay NaN on this route, by definition
+    rather than by omission: the legacy free-energy decomposition (``val_self_coupling``,
+    ``val_self_divergence``, ``val_belief_coupling``, ``val_attention_entropy``,
+    ``val_inner_alignment_energy_total``), because routing plus readout does not define the shared
+    stationary objective; the E-step certificate (``estep_*`` except ``estep_f_comparisons = 0``),
+    because the route performs one pre-update readout with no iterate sequence; and the held-out
+    geometry/guard columns (``val_holonomy_wilson``, ``val_cocycle_residual``,
+    ``val_gauge_invariant_spread``, ``val_fisher_trace_mean``, ``val_belief_cond_p95``,
+    ``val_belief_lam_*``, ``val_belief_cond_valid_frac``, ``val_phi_*``, ``val_vertex_cond_p99``,
+    ``val_pos_phi_*``, ``val_guard_*``, ``val_live_pair_frac``, ``val_nonfinite_frac``), which come from
+    the legacy ``diagnostics`` geometry pass that the relational diagnostics do not run. The
+    head-mixer ``val_builder_resid`` stays legacy-route only.
     """
     import torch.nn.functional as F
     from vfe3 import metrics as M
@@ -1471,6 +2455,27 @@ def _val_diagnostics_one(
             out["val_relational_snapshot_ce"] = float(F.cross_entropy(
                 snapshot.logits.reshape(-1, snapshot.logits.shape[-1]).float(),
                 diagnostic_targets.reshape(-1)))
+        # Definitions that carry over from the legacy route, on the same capture (audit
+        # 2026-09-28: the early return left these NaN). Isolated so a failure here keeps the
+        # relational columns above; the whole set is NaN-reset first so a failed evaluation can
+        # never carry a previous evaluation's value forward.
+        out.update({key: float("nan") for key in _CONDITIONAL_STRUCTURE_KEYS})
+        try:
+            structure: Dict[str, float] = {
+                "val_effective_rank": float(vd["effective_rank"]),
+                "val_belief_cond_median": float(vd["belief_cond_median"]),
+            }
+            structure.update(_attention_structure_metrics(snapshot.beta_maps.float()))
+            if diagnostic_targets is not None:
+                structure.update(_position_loss_metrics(snapshot.logits, diagnostic_targets))
+            out.update(structure)
+        except Exception as exc:
+            if failures is not None:
+                _record_diagnostic_failure(failures, "conditional_val_structure", exc,
+                                           logging.getLogger(__name__))
+            else:
+                logging.getLogger(__name__).warning(
+                    "conditional-route attention-structure diagnostics failed (%s)", exc)
         return ValidationDiagnostics(out, diagnostic_tokens, snapshot)
     out["val_self_coupling"]      = vd["self_coupling"]     / vn
     out["val_self_divergence"]    = vd["self_divergence"]   / vn
@@ -1545,39 +2550,7 @@ def _val_diagnostics_one(
         diagnostic_tokens,
         score_at="entry",
     )
-    # Row-support filter (audit 2026-08-05): attention_entropy_rows floors beta at eps, so a
-    # hard-masked row of an N-key grid returns (#masked)*eps*|ln eps| -- a pure function of N and
-    # eps. Unfiltered, val_attn_entropy_min_all was CONSTANT across every logged step of every run
-    # (1.740754e-09 = 63*1e-12*ln(1e-12)) and val_attn_collapsed_heads pinned at n_heads, so the
-    # collapsed-head alarm could never fire. model.py already applies this filter for the
-    # val_attn_entropy_min twin; these two were missed.
-    # The collapse test is scored on entropy NORMALIZED by each row's own ceiling ln(support_i)
-    # (audit 2026-08-06 F22). A fixed ln 2 threshold is exactly the ceiling of the first two-key row,
-    # so the strict `<` was decided by float noise -- measured 2 of 2 heads flagged on an untrained
-    # model whose attention is as uniform as the causal mask permits. See metrics.attention_head_collapse.
-    ent_rows = M.attention_entropy_rows(amaps)                  # (L, H, N)
-    scorable = (amaps > 0.0).sum(dim=-1) >= 2                   # rows with >=2 admissible keys
-    hmin = ent_rows.masked_fill(~scorable, float("inf")).min(dim=-1).values   # (L, H)
-    finite_hmin = hmin[torch.isfinite(hmin)]
-    out["val_attn_entropy_min_all"] = (float(finite_hmin.min()) if finite_hmin.numel()
-                                       else float("nan"))
-    worst_norm, collapsed = M.attention_head_collapse(amaps)    # (L, H) each
-    finite_norm = worst_norm[torch.isfinite(worst_norm)]
-    out["val_attn_entropy_min_norm"] = (float(finite_norm.min()) if finite_norm.numel()
-                                        else float("nan"))
-    out["val_attn_collapsed_heads"] = float(collapsed.float().sum())
-    cs = M.causal_sanity(amaps)
-    out["val_future_leakage"] = float(cs["future_leakage"].max())   # soft causal prior can leak silently
-    out["val_row_sum_error"]  = float(cs["row_sum_error"].max())
-    out["val_pos_content_r2"] = float(M.positional_content_score(amaps).mean())
-    sh = M.structured_head_scores(amaps)
-    out["val_prev_token_mass"]   = float(sh["prev_token"].mean())
-    out["val_period_match_mass"] = float(sh["period_match"].mean())
-    if amaps.shape[1] > 1:                                       # head redundancy needs >= 2 heads
-        h = amaps.shape[1]
-        off = ~torch.eye(h, dtype=torch.bool, device=amaps.device)
-        out["val_head_redundancy_js"] = float(torch.stack(
-            [M.head_redundancy_js(amaps[li])[off].mean() for li in range(amaps.shape[0])]).mean())
+    out.update(_attention_structure_metrics(amaps))
 
     tr = ex.e_step_belief_trace(                                # captured E-step trajectory
         model,
@@ -1611,17 +2584,8 @@ def _val_diagnostics_one(
     ))
 
     if diagnostic_targets is not None:                          # per-position within-sequence loss
-        vlog = snapshot.logits                                  # (B, N, V) same captured inference path
-        b, n = diagnostic_tokens.shape
-        per = F.cross_entropy(vlog.reshape(-1, vlog.shape[-1]).float(), diagnostic_targets.reshape(-1),
-                              ignore_index=-100, reduction="none").reshape(b, n)
-        valid = (diagnostic_targets != -100).float()
-        pos_ce = (per * valid).sum(0) / valid.sum(0).clamp(min=1.0)   # (N,) mean CE at each position
-        q = n // 4
-        if q > 0:
-            out["pos_loss_first_q"] = float(pos_ce[:q].mean())
-            out["pos_loss_last_q"]  = float(pos_ce[-q:].mean())
-            out["pos_loss_ratio"]   = float(pos_ce[-q:].mean() / pos_ce[:q].mean().clamp(min=1e-9))
+        # (B, N, V) logits of the same captured inference path
+        out.update(_position_loss_metrics(snapshot.logits, diagnostic_targets))
 
     # Builder-break gauge-equivariance residual per eval (A2/EXP-9): the head-mixer congruence defect
     # at the converged belief (~eps under the tied gauge; climbs as the untied block_glk mixer drifts
@@ -1668,6 +2632,15 @@ def _save_eval_attention_maps(
     """
     entry_maps = model.attention_maps(token_ids, score_at="entry")
     artifacts.save_attention_maps(step, entry_maps, logger=logger)
+    try:
+        from vfe3.viz.figures import route_figure_skip_reasons
+
+        skip = route_figure_skip_reasons(model.cfg).get("attention_estep")
+    except Exception:                                        # noqa: BLE001 - no gate: replay as before
+        skip = None
+    if skip is not None:
+        logger.info("attention_estep skipped (%s)", skip)
+        return
     try:
         estep_maps = torch.stack([
             entry_maps,
@@ -2083,18 +3056,151 @@ def train(
     finally:
         if replay_cpu_rng is not None:
             torch.set_rng_state(replay_cpu_rng)
+    # Early evaluations (audit 2026-09-28): log-spaced completed-step counts below the first regular
+    # evaluation, gated by EARLY_EVAL_MIN_INTERVAL and a run directory. Empty on the silent path.
+    early_eval_enabled = bool(
+        eval_interval and val_loader is not None and artifacts is not None
+        and eval_interval >= EARLY_EVAL_MIN_INTERVAL)
+    early_eval_steps = frozenset(
+        int(s) for s in EARLY_EVAL_STEPS
+        if early_eval_enabled and 0 < int(s) < eval_interval and start_step < int(s) <= n_steps)
+    run_step_zero = bool(early_eval_enabled and 0 in EARLY_EVAL_STEPS
+                         and start_step == 0 and n_steps > 0)
     # A timer is useful only if its absolute execution interval reaches a reporting step.
     timing_enabled = (
         bool(log_interval) and n_steps // log_interval > start_step // log_interval
     ) or (
         artifacts is not None and val_loader is not None and bool(eval_interval)
         and n_steps // eval_interval > start_step // eval_interval
-    )
+    ) or bool(early_eval_steps)
     timer = TrainingTimer(device) if timing_enabled else None
     last_val: Dict[str, Optional[float]] = {}        # most recent validation, carried into each CSV row
     val_diag_keys = _VAL_DIAG_KEYS + (
         _VAL_RELATIONAL_DIAG_KEYS if is_conditional_filtering(model) else ())
     last_val_diag: Dict[str, float] = {k: float("nan") for k in val_diag_keys}
+    # Training-time diagnostic state (audit 2026-09-28). Built only for a persisted run; the silent
+    # path and the console-only path allocate nothing here.
+    diagnostics_failures: Dict[str, int] = {}
+    fixed_train_sample: Optional[FixedTrainSample] = None
+    diagnostic_windows: Optional[torch.Tensor] = None
+    last_train_sample: Dict[str, float] = {column: float("nan") for column in _EVAL_CADENCE_COLUMNS}
+    pending_step_zero_row: Optional[Dict[str, float]] = None
+    tokens_seen = int(start_step) * int(cfg.batch_size) * int(cfg.max_seq_len)   # resume: nominal B*N per step
+    # S1 panel D counters (2026-09-28). The frame-projection counter is a (2,) int64 device tensor
+    # that project_phi_parameter_rows_ adds to on every accepted step (no host sync); it exists only
+    # for a persisted run whose config has the post-update projection. frame_projection_base holds
+    # the counts a resumed checkpoint carried; frame_projection_since is the step they start from.
+    numerics_reasons: Dict[str, Optional[str]] = {}
+    frame_projection_counter: Optional[torch.Tensor] = None
+    frame_projection_base: Tuple[int, int] = (0, 0)
+    frame_projection_since: Optional[int] = None
+    numerics_last_eval: Dict[str, Any] = {}
+    if artifacts is not None:
+        other_parameters = [name for name, parameter in model.named_parameters()
+                            if parameter.requires_grad and _parameter_group(name) == "other"]
+        if other_parameters and (log_interval or eval_interval):
+            logger.info(" parameter group 'other' (grad/param/update_ratio_group_other) holds: %s",
+                        ", ".join(other_parameters))
+        existing_failures = getattr(artifacts, "diagnostics_failures", None)
+        if isinstance(existing_failures, dict):
+            diagnostics_failures = existing_failures
+        else:
+            artifacts.diagnostics_failures = diagnostics_failures
+        if not isinstance(getattr(artifacts, "train_sample_by_step", None), dict):
+            artifacts.train_sample_by_step = {}
+        try:
+            numerics_reasons = _numerics_counter_skip_reasons(model)
+            for family, reason in sorted(numerics_reasons.items()):
+                if reason is not None:
+                    logger.info(" S1 numerics counter %r not measured: %s", family, reason)
+            if numerics_reasons["frame_projection"] is None:
+                frame_projection_counter = torch.zeros(
+                    2, dtype=torch.long, device=model.group.generator_device)
+                resumed = getattr(artifacts, "resumed_numerics_counters", None)
+                if start_step == 0:
+                    frame_projection_since = 0
+                elif (isinstance(resumed, Mapping)
+                      and isinstance(resumed.get("frame_projection_count"), int)
+                      and isinstance(resumed.get("frame_projection_total"), int)):
+                    frame_projection_base = (int(resumed["frame_projection_count"]),
+                                             int(resumed["frame_projection_total"]))
+                    since = resumed.get("frame_projection_since_step")
+                    frame_projection_since = int(since) if isinstance(since, int) else 0
+                else:
+                    frame_projection_since = int(start_step)
+                    logger.info(" resumed checkpoint carries no frame-projection counts; "
+                                "frame_projection_* count from step %d", start_step)
+        except Exception as exc:
+            _record_diagnostic_failure(diagnostics_failures, "numerics_counter_setup", exc, logger)
+            frame_projection_counter = None
+        if eval_interval and val_loader is not None:
+            with torch.random.fork_rng(devices=([device] if device.type == "cuda" else [])):
+                try:
+                    fixed_train_sample, sample_reason = _build_fixed_train_sample(
+                        loader, val_loader, cfg)
+                    if fixed_train_sample is None:
+                        logger.info(" fixed training sample unavailable (%s); train_sample_* "
+                                    "columns stay blank", sample_reason)
+                    else:
+                        logger.info(
+                            " fixed training sample: %d windows x %d scored targets "
+                            "(seed %d, eval protocol seq_len=%d stride=%d)",
+                            len(fixed_train_sample.indices),
+                            fixed_train_sample.scored_targets_per_window, TRAIN_SAMPLE_SEED,
+                            fixed_train_sample.seq_len, fixed_train_sample.stride)
+                except Exception as exc:
+                    _record_diagnostic_failure(diagnostics_failures, "train_sample_build", exc, logger)
+                try:
+                    diagnostic_windows = _diagnostic_windows(val_loader)
+                except Exception as exc:
+                    _record_diagnostic_failure(diagnostics_failures, "diagnostic_windows", exc, logger)
+    if run_step_zero:
+        # Step-0 evaluation before the first update (M3 curves need a beginning). Everything here
+        # runs under a forked CPU/CUDA RNG, so the training stream is untouched. Its row is held
+        # until the first regular metrics row fixes the CSV schema, then written first.
+        with torch.random.fork_rng(devices=([device] if device.type == "cuda" else [])):
+            try:
+                zero = evaluate(model, val_loader, tokens_per_char=tokens_per_char, device=device)
+                logger.info(" \n Validation @ step 0 (before the first update): CE %.4f | PPL %.1f",
+                            zero["ce"], zero["ppl"])
+                zero_diag: Dict[str, float] = {k: float("nan") for k in val_diag_keys}
+                try:
+                    zero_diag.update(_val_diagnostics(
+                        model, val_loader, device,
+                        batches=getattr(cfg, "val_diagnostic_batches", 1),
+                        failures=diagnostics_failures).metrics)
+                except Exception as exc:
+                    _record_diagnostic_failure(diagnostics_failures, "step0_val_diagnostics",
+                                               exc, logger)
+                zero_extra = _eval_cadence_diagnostics(
+                    model, artifacts, logger, step=0, val_ce=float(zero["ce"]),
+                    train_sample=fixed_train_sample, windows=diagnostic_windows,
+                    device=device, failures=diagnostics_failures,
+                    count_numerics=numerics_reasons.get("cap_activation", "unset") is None)
+                _note_numerics_eval(numerics_last_eval, 0, zero_extra)
+                zero_cumulative = {column: float("nan") for column in NUMERICS_CUMULATIVE_COLUMNS}
+                try:
+                    zero_cumulative = _cumulative_counter_columns(
+                        0, optimizer, frame_projection_counter, frame_projection_base)
+                except Exception as exc:
+                    _record_diagnostic_failure(diagnostics_failures, "numerics_cumulative",
+                                               exc, logger)
+                pending_step_zero_row = {
+                    **zero_cumulative,
+                    "step": 0,
+                    "val_ce": zero["ce"], "val_ppl": zero["ppl"],
+                    "val_bits_per_token": zero["bits_per_token"],
+                    "val_bpc": (zero["bpc"] if zero["bpc"] is not None else float("nan")),
+                    "val_expected_targets": zero["expected_targets"],
+                    "val_scored_targets": zero["scored_targets"],
+                    "val_excluded_targets": zero["excluded_targets"],
+                    **zero_diag, **zero_extra,
+                    **_group_parameter_norms(model), **_sigma_log_statistics(model),
+                    "tokens_seen": 0,
+                    "diagnostics_failures": int(sum(diagnostics_failures.values())),
+                }
+            except Exception as exc:
+                _record_diagnostic_failure(diagnostics_failures, "step0_evaluation", exc, logger)
     for step in _step_indices():
         try:
             tokens, targets = next(it)
@@ -2107,10 +3213,12 @@ def train(
             it = iter(loader)
             tokens, targets = next(it)
         batches_consumed += 1
+        tokens_seen += int(tokens.numel())                   # input-token presentations (metadata only)
         tokens = tokens.to(device, non_blocking=True)
         targets = _transfer_targets(targets, model, device)
         do_log  = bool(log_interval) and (step + 1) % log_interval == 0
-        do_eval = bool(eval_interval) and val_loader is not None and (step + 1) % eval_interval == 0
+        do_eval = bool(eval_interval) and val_loader is not None and (
+            (step + 1) % eval_interval == 0 or (step + 1) in early_eval_steps)
         do_csv  = artifacts is not None and (do_log or do_eval)
         # Capture pre-clip gradient health only on a step that will log or persist. A silent step
         # performs no exact-count host materialization, extra unscale_, or grad-norm pass; its
@@ -2135,14 +3243,35 @@ def train(
         if (do_eval and do_csv and cfg.eval_stride is not None
                 and cfg.eval_stride < cfg.max_seq_len):
             gap_train_ce = _eval_protocol_train_ce(model, tokens, targets, cfg.eval_stride)
+        # Named-group update ratios (audit 2026-09-28): host copies of the pre-step parameters on a
+        # persisted log/eval row only, outside the timed train step. Reading parameters does not
+        # change the step.
+        update_before: Optional[Dict[str, torch.Tensor]] = None
+        group_stats: Dict[str, float] = {}
+        if do_csv:
+            try:
+                update_before = _parameter_snapshot(model)
+            except Exception as exc:
+                _record_diagnostic_failure(diagnostics_failures, "parameter_snapshot", exc, logger)
         step_status: Dict[str, bool] = {}
         if timer is not None:
             timer.start_step()
         losses.append(train_step(model, optimizer, scheduler, tokens, targets,
                                   grad_clip=grad_clip, grad_accum_steps=cfg.grad_accum_steps,
-                                  scaler=scaler, metrics_out=step_metrics, status_out=step_status))
+                                  scaler=scaler, metrics_out=step_metrics, status_out=step_status,
+                                  **({"frame_projection_out": frame_projection_counter}
+                                     if frame_projection_counter is not None else {})))
         if timer is not None:
             timer.finish_step(n_tokens=tokens.numel())
+        if update_before is not None:
+            try:
+                group_stats = _group_update_statistics(model, update_before)
+            except Exception as exc:
+                _record_diagnostic_failure(diagnostics_failures, "group_update_statistics", exc, logger)
+            update_before = None                              # release the host copy immediately
+        if step_metrics is not None and _GROUP_GRAD_ERROR_KEY in step_metrics:
+            _record_diagnostic_failure(diagnostics_failures, "group_gradient_norms",
+                                       RuntimeError(step_metrics.pop(_GROUP_GRAD_ERROR_KEY)), logger)
         # Gradient reachability, read off the first step that actually updated: grads are still live
         # here (train_step zeroes on entry). Gated on did_step because the nonfinite-grad path drops
         # them, which would read as "every parameter is dead" and mute the whole end-of-run check.
@@ -2272,7 +3401,8 @@ def train(
                 try:
                     validation_diagnostics = _val_diagnostics(
                         model, val_loader, device,
-                        batches=getattr(cfg, "val_diagnostic_batches", 1))
+                        batches=getattr(cfg, "val_diagnostic_batches", 1),
+                        failures=diagnostics_failures)
                     last_val_diag.update(validation_diagnostics.metrics)
                 except Exception as exc:
                     terminal_validation_signature = None
@@ -2300,6 +3430,18 @@ def train(
                     # until the next evaluation overwrites it. Release after the final consumer on
                     # enabled, disabled, and failed-map branches before training resumes.
                     validation_diagnostics = None
+                # Fixed training-sample CE, residual/attention CSVs and the map snapshot (audit
+                # 2026-09-28). Each part is exception-isolated and counted; RNG is forked inside.
+                try:
+                    last_train_sample = _eval_cadence_diagnostics(
+                        model, artifacts, logger, step=step + 1, val_ce=float(m["ce"]),
+                        train_sample=fixed_train_sample, windows=diagnostic_windows,
+                        device=device, failures=diagnostics_failures,
+                        count_numerics=numerics_reasons.get("cap_activation", "unset") is None)
+                    _note_numerics_eval(numerics_last_eval, step + 1, last_train_sample)
+                except Exception as exc:
+                    _record_diagnostic_failure(diagnostics_failures, "eval_cadence", exc, logger)
+                    last_train_sample = {column: float("nan") for column in _EVAL_CADENCE_COLUMNS}
             torch.set_rng_state(eval_cpu_rng)            # F30: hand the training stream back untouched
 
         # Periodic resumable checkpoint (opt-in; needs the artifacts dir and the optimizer state).
@@ -2317,6 +3459,15 @@ def train(
             # torch.save stream failure ("ios_base::badbit set") at step 120000 of 180000
             # previously aborted 10 hours of training with a perfectly healthy model in memory.
             # Loud warning, then continue -- the next interval attempts a fresh save.
+            # The cumulative frame-projection counts travel with the checkpoint (one host read at
+            # checkpoint cadence), so a resumed run keeps counting from step 0.
+            try:
+                artifacts.numerics_counters_state = _frame_projection_state(
+                    frame_projection_counter, frame_projection_base, frame_projection_since)
+            except Exception as exc:
+                _record_diagnostic_failure(diagnostics_failures, "numerics_checkpoint_state",
+                                           exc, logger)
+                artifacts.numerics_counters_state = None
             try:
                 artifacts.save_checkpoint(step + 1, model, optimizer, cfg, scaler=scaler,
                                           data_state=checkpoint_data_state)
@@ -2399,6 +3550,11 @@ def train(
             # (The complexity-vs-fit comparison is inner_alignment_energy_total vs
             # val_ce, both already columns; a separate "elbo_ce_gap" would subtract a CE from a
             # complexity-only F -- d["total"] carries no -E_q[log p] data term -- so it is NOT emitted.)
+            # generalization_gap is kept for continuity with earlier runs, but it is a ONE-BATCH
+            # estimate (the current training batch), so its eval-to-eval noise is of the order of
+            # the gap itself. generalization_gap_fixed (below) replaces it for analysis: validation
+            # CE minus the CE of a FIXED training sample of validation size, scored under the same
+            # protocol at every eval (FixedTrainSample; audit 2026-09-28 M5).
             gap_train_side = ce if gap_train_ce is None else gap_train_ce
             row["generalization_gap"] = (last_val["ce"] - gap_train_side) if do_eval else float("nan")
             if cfg.decode_mode != "linear":
@@ -2494,14 +3650,59 @@ def train(
             # log-interval rows in between, NOT carried forward. The key set is identical in both
             # branches (val_diag_keys), so the CSV stays rectangular.
             row.update(last_val_diag if do_eval else {k: float("nan") for k in val_diag_keys})
+            # Training-time diagnostics (audit 2026-09-28). Fixed key set on every row: the
+            # train-sample columns are eval-cadence (NaN between evals); the named-group grad norms
+            # come from train_step, the parameter norms and realized update ratios from the host
+            # snapshot around this step; NaN wherever a probe failed or a group is empty.
+            # The S1 panel D per-evaluation counters ride in the same eval-cadence set.
+            row.update(last_train_sample if do_eval
+                       else {column: float("nan") for column in _EVAL_CADENCE_COLUMNS})
+            group_values = {**(step_metrics or {}), **group_stats}
+            for column in _GROUP_COLUMNS:
+                row[column] = float(group_values.get(column, float("nan")))
+            try:
+                row.update(_sigma_log_statistics(model))
+            except Exception as exc:
+                _record_diagnostic_failure(diagnostics_failures, "sigma_log_statistics", exc, logger)
+                row.update({"sigma_log_mean": float("nan"), "sigma_log_sd": float("nan")})
+            # S1 panel D cumulative counters on every row (one host read of the device counter).
+            try:
+                row.update(_cumulative_counter_columns(
+                    step + 1, optimizer, frame_projection_counter, frame_projection_base))
+            except Exception as exc:
+                _record_diagnostic_failure(diagnostics_failures, "numerics_cumulative", exc, logger)
+                row.update({column: float("nan") for column in NUMERICS_CUMULATIVE_COLUMNS})
+            row["tokens_seen"] = tokens_seen
+            row["diagnostics_failures"] = int(sum(diagnostics_failures.values()))
             pipeline_timing = timer.sample_pipeline_window()
             row["train_step_ms_mean"]      = train_timing.train_step_ms_mean
             row["train_step_tokens_per_s"] = train_timing.train_step_tokens_per_s
             row["pipeline_tokens_per_s"]   = pipeline_timing.pipeline_tokens_per_s
             row["tokens_per_s"]            = pipeline_timing.pipeline_tokens_per_s
             row["wall_clock_s"]            = pipeline_timing.wall_clock_s
+            if pending_step_zero_row is not None:
+                # The step-0 evaluation row goes first, on this row's key set (NaN where step 0 has
+                # no value: no training step, no timing window).
+                zero_row = {key: pending_step_zero_row.get(key, float("nan")) for key in row}
+                pending_step_zero_row = None
+                try:
+                    artifacts.log_metrics(zero_row)
+                except Exception as exc:
+                    _record_diagnostic_failure(diagnostics_failures, "step0_row", exc, logger)
             artifacts.log_metrics(row)
             timer.reset_pipeline_window()
+    # S1 panel D handoff (2026-09-28), before the terminal callback so its checkpoint and summary see
+    # it: the cumulative frame-projection counts for any later checkpoint, and summary.json's
+    # "numerics_counters" (final cumulative counts, last measured per-evaluation counts, skip reasons).
+    if artifacts is not None:
+        try:
+            artifacts.numerics_counters_state = _frame_projection_state(
+                frame_projection_counter, frame_projection_base, frame_projection_since)
+            artifacts.numerics_counters = _numerics_counters_summary(
+                n_steps, optimizer, artifacts.numerics_counters_state, numerics_last_eval,
+                numerics_reasons, diagnostic_windows)
+        except Exception as exc:
+            _record_diagnostic_failure(diagnostics_failures, "numerics_summary", exc, logger)
     # Terminal callback seam (PB-02): immediately after the final optimizer step, hand the resumable
     # training state to an optional callback so a
     # default cell (log/eval interval above max_steps, checkpoint_interval=0) can finalize a complete
@@ -2571,6 +3772,23 @@ def train(
     accepted = _successful_update_count(optimizer)
     skipped_total = attempted - accepted
     if artifacts is not None:
+        # Training-time diagnostic handoff to finalize_run (audit 2026-09-28): a step-0 row that no
+        # later metrics row flushed (no log/eval row in the run), the optimizer-state footprint for
+        # resources.json, and the per-name diagnostic failure counts for summary.json.
+        if pending_step_zero_row is not None:
+            try:
+                artifacts.log_metrics(pending_step_zero_row)
+            except Exception as exc:
+                _record_diagnostic_failure(diagnostics_failures, "step0_row", exc, logger)
+            pending_step_zero_row = None
+        try:
+            artifacts.optimizer_state_bytes = _optimizer_state_bytes(optimizer)
+        except Exception as exc:
+            _record_diagnostic_failure(diagnostics_failures, "optimizer_state_bytes", exc, logger)
+        artifacts.diagnostics_failures = diagnostics_failures
+        if diagnostics_failures:
+            logger.warning(" diagnostic failures during training (counted, training unaffected): %s",
+                           dict(sorted(diagnostics_failures.items())))
         neutralized = nonfinite_tangent_elements()
         mu_fallbacks = mu_trust_fallback_elements()
         mm_fallbacks = mm_cholesky_fallback_elements()

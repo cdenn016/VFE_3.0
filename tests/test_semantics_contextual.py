@@ -257,9 +257,63 @@ def test_forward_split_halves_failed_batches_and_skips_single_failures():
     pieces = C._forward_split(_FakeModel(poison=(4,)), x, log, offset=10)
     assert log.skipped == [14] and log.resplit_batches == 4             # 7, 3, 4 and (3, 4) were halved
     assert [(a, b) for a, b, _ in pieces] == [(0, 1), (1, 3), (3, 4), (5, 7)]
-    assert log.record() == {"resplit_batches": 4, "skipped_windows": 1, "skipped_window_index": [14]}
+    assert log.record() == {"resplit_batches": 4, "oom_resplits": 0, "skipped_windows": 1,
+                            "skipped_window_index": [14]}
     with pytest.raises(ValueError, match="other failure"):              # any other error propagates
         C._forward_split(_FakeModel(message="other failure"), x, C._SplitLog())
+
+
+class _OutOfMemoryModel(_FakeModel):
+    r"""Raises ``torch.cuda.OutOfMemoryError`` for batches larger than ``max_batch``."""
+
+    def __init__(self, max_batch: int = 2) -> None:
+        super().__init__()
+        self.max_batch = max_batch
+
+    def forward_beliefs(self, x, return_logits=False, capture=None):
+        if x.shape[0] > self.max_batch:
+            self.calls.append(int(x.shape[0]))
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory (planted)")
+        return super().forward_beliefs(x, return_logits=return_logits, capture=capture)
+
+
+def test_forward_split_halves_out_of_memory_batches():
+    x = torch.arange(7)[:, None].repeat(1, 3)
+    model = _OutOfMemoryModel(max_batch=2)
+    log = C._SplitLog()
+    pieces = C._forward_split(model, x, log, offset=0)
+    assert log.oom_resplits == 3 and log.resplit_batches == 0 and log.skipped == []
+    assert [(a, b) for a, b, _ in pieces] == [(0, 1), (1, 3), (3, 5), (5, 7)]
+    mu = torch.cat([out["layers"][-1].mu[..., 0] for _, _, out in pieces])
+    torch.testing.assert_close(mu, x.float(), rtol=0.0, atol=0.0)
+    assert log.record()["oom_resplits"] == 3
+    with pytest.raises(torch.cuda.OutOfMemoryError):                    # a single window cannot be split
+        C._forward_split(_OutOfMemoryModel(max_batch=0), x[:1], C._SplitLog())
+
+
+def test_device_budgets_and_host_sync_free_helpers(tmp_path):
+    cpu, cuda = torch.device("cpu"), torch.device("cuda")
+    assert C._auto_batch_windows(cpu, 256) == 8 and C._auto_batch_windows(cuda, 256) == 16
+    assert C._auto_batch_windows(cuda, 10 ** 5) == 1                    # at least one window
+    assert C._auto_lens_chunk_tokens(cpu, 50257, 256) == 1024
+    gib = 1 << 30
+    # 0.25 * 8 GiB / (4 bytes * 50257 * 8 live (B, N, V) tensors) = 1335 tokens
+    assert C._auto_lens_chunk_tokens(cuda, 50257, 256, free_bytes=8 * gib) == (2 * gib) // (4 * 50257 * 8)
+    assert C._auto_lens_chunk_tokens(cuda, 50257, 256, free_bytes=1 << 20) == 256    # at least one window
+    assert C._auto_lens_chunk_tokens(cuda, 100, 256, free_bytes=64 * gib) == 16384   # capped
+    run = _run(tmp_path, "budgets", {})
+    opts = C._resolved_options(_ctx(tmp_path, run), run)
+    assert opts["contextual_batch_size"] == 8 and opts["occurrence_batch_size"] == 8
+    assert opts["lens_chunk_tokens"] == 1024
+    explicit = C._resolved_options(_ctx(tmp_path, run, contextual_batch_size=3, lens_chunk_tokens=16), run)
+    assert explicit["contextual_batch_size"] == 3 and explicit["lens_chunk_tokens"] == 16
+
+    a = torch.randn(2, 3, 5)
+    assert bool(C._equal_flag(a, a.clone(), cpu)) and not bool(C._equal_flag(a, a + 1.0, cpu))
+    assert not bool(C._equal_flag(a, a[:1], cpu)) and bool(C._equal_flag(None, None, cpu))
+    assert not bool(C._equal_flag(a, None, cpu))
+    b = torch.randn(2, 3, 5)
+    torch.testing.assert_close(C._rowdot(a, b), (a * b).sum(-1), rtol=1e-6, atol=1e-6)
 
 
 def test_bank_lens_and_occurrences_survive_the_symmetry_failure(tmp_path):
@@ -571,6 +625,9 @@ def test_run_contextual_section_end_to_end_moving_sigma(tmp_path):
     json.dumps(to_jsonable(res.headline), allow_nan=False)
     assert any(k.startswith("contextual: lens CE") for k in res.headline)
     assert m["failed_steps"] == [] and m["forward_resplits"]["resplit_batches"] == 0
+    assert m["forward_resplits"]["oom_resplits"] == 0 and m["device"] == "cpu"
+    assert m["options"]["contextual_batch_size"] == 8 and m["options"]["occurrence_batch_size"] == 8
+    assert m["options"]["lens_chunk_tokens"] == 16                     # explicit value kept
     sem = m["layerwise_semantics"]
     head = res.headline["contextual: distilled 3CosAdd (ONLY-B) final layer / static μ, retrieval among the "
                         "collected words"]

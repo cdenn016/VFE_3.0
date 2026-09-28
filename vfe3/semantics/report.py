@@ -21,6 +21,27 @@ view drops frames without a real principal logarithm). The unit normalization ``
 \log\sigma^2_{vk}` over all candidates, the same reference set the ``sigma`` section uses; the
 ``phi_log`` chart takes its ``D0`` and barycenter from the ``frame_ref_count`` most frequent
 candidates, as the ``phi`` section does.
+
+Presets (:data:`PRESETS`, option ``"preset"``). ``"full"`` keeps :data:`DEFAULT_OPTIONS`.
+``"quick"`` is the lean per-seed battery of a multi-seed study: the views are the run's headline
+decode view (``decode_W_causal`` for a linear decode, ``decode_natural_causal`` for a Gaussian KL
+decode), ``phi_log``, ``mu_raw`` and ``xi_ref`` (:func:`preset_views`); no UMAP; the group-analogy
+log rerank on 100 benchmark questions; geometry on 4,000 rows; a 16,384-token contextual bank and a
+65,536-token occurrence budget. The occurrence budget serves the ambiguous words first, so the
+token clouds are kept. Explicit options override the preset's values.
+
+Timings. Measured for the full preset on the K160 run (``30.14_wikitext-103_K160_n=256_6-layer``,
+K = 160, 6 layers, 20,072 candidates; 16 CPU threads; ``metrics.json`` timings): 1,644 s in total,
+phi 257 s (canonical frames 59 s, group-analogy benchmark with 500 reranked questions 124 s),
+embeddings 786 s over 9 views (per view battery + figures: phi_log 277 s, phi_raw 211 s,
+decode_W_causal 57 s, mu_raw 35 s, xi_ref 34 s), sigma 29 s, contextual 570 s (bank 78 s, logit lens
+28 s, occurrence forwards 444 s for 196,608 tokens). The quick preset on the same run is estimated,
+not measured, from those per-step times: embeddings about 330-350 s (four views, no UMAP), phi about
+150-230 s (the share of the 124 s rerank that 100 instead of 500 questions saves is not recorded
+separately), sigma 29 s and contextual about 230 s on the CPU (bank 39 s, lens 28 s, occurrences about
+150 s), about 12-14 minutes in total on 16 CPU threads. With ``device="cuda"`` the contextual forward
+passes move to the GPU (the audit estimates 20-40 s for the full contextual budget); the frame chart
+stays on the CPU in float64.
 """
 
 from __future__ import annotations
@@ -28,6 +49,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import math
+import os
 import re
 import sys
 import time
@@ -49,6 +71,7 @@ from vfe3.semantics.common import (
 
 
 DEFAULT_OPTIONS: Dict[str, Any] = {
+    "preset":              "full",        # "full" | "quick" (PRESETS; explicit options override it)
     "min_count":           100,
     "max_candidates":      20000,
     "seed":                0,
@@ -66,6 +89,7 @@ DEFAULT_OPTIONS: Dict[str, Any] = {
     "context_len":         48,
     "views":               None,          # None -> every applicable view (subset of VIEW_NAMES)
     "headline_view":       None,          # None -> first of _HEADLINE_PRIORITY present
+    "drop_unknown_config_fields": False,  # True: drop retired config toggles at load (load_semantic_run)
 }
 
 SECTIONS: Tuple[str, ...] = ("embeddings", "sigma", "phi", "contextual")
@@ -77,6 +101,22 @@ _HEADLINE_PRIORITY: Tuple[str, ...] = ("decode_W_causal", "decode_natural_causal
                                        "decode_mu", "mu_raw")
 _EXECUTION_ORDER: Tuple[str, ...] = ("phi", "embeddings", "sigma", "contextual")
 _WHITEN_RTOL = 1e-10                   # covariance eigenvalues below rtol * max are dropped
+
+# Option values each preset sets on top of DEFAULT_OPTIONS (explicit options win). The quick
+# preset's views depend on the run's decode kind and are resolved after loading (preset_views).
+PRESETS: Dict[str, Dict[str, Any]] = {
+    "full":  {},
+    "quick": {
+        "umap":                   False,
+        "frame_rerank_questions": 100,
+        "geometry_max_points":    4000,
+        "contextual_tokens":      16384,
+        "occurrence_tokens":      65536,
+    },
+}
+QUICK_VIEWS: Tuple[str, ...] = ("phi_log", "mu_raw", "xi_ref")   # plus the headline decode view
+_HEADLINE_DECODE_VIEW: Dict[str, str] = {"linear": "decode_W_causal", "gaussian": "decode_natural_causal"}
+CANDIDATE_IDS_FILE = "candidate_ids.npy"   # the run's candidate ids, frequency-descending (int64)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -526,6 +566,21 @@ def _analogy_accuracies(batteries: Mapping[str, Mapping[str, Any]]) -> Dict[str,
     return out
 
 
+def _macro_margin(bench: Mapping[str, Any]) -> str:
+    r"""Macro-averaged (equal weight per Google category) 3CosAdd − ONLY-B, or "–" when not recorded."""
+    a = _num(_get(bench, "overall", "macro", "methods", "3cosadd", "acc", "mean"))
+    ob = _num(_get(bench, "overall", "macro", "methods", "only_b", "acc", "mean"))
+    return f"{a - ob:+.3f}" if a is not None and ob is not None else "–"
+
+
+def _stratified_null(purity: Optional[Mapping[str, Any]]) -> str:
+    r"""The frequency-stratified purity null (labels permuted within log-count deciles) and its z."""
+    strat = purity.get("frequency_stratified") if isinstance(purity, Mapping) else None
+    if not isinstance(strat, Mapping) or _num(strat.get("null_mean")) is None:
+        return "–"
+    return f"{_f(strat['null_mean'])} (z = {_f(strat.get('z'), 1)})"
+
+
 def _selection_tail(n: int) -> str:
     return f"maximum over {n} view{'s' if n != 1 else ''}, not adjusted for selection"
 
@@ -600,8 +655,49 @@ def _contextual_section(run: Any, ctx: AnalysisContext) -> SectionResult:
 # Orchestration
 # ----------------------------------------------------------------------------------------------
 
+def preset_views(preset: str, decode_kind: str) -> Optional[Tuple[str, ...]]:
+    r"""The views a preset selects for a run of the given decode kind (``None``: every view).
+
+    ``"quick"`` keeps the headline decode view of the decode kind (``decode_W_causal`` for a
+    linear decode, ``decode_natural_causal`` for a Gaussian KL decode, none otherwise) and
+    :data:`QUICK_VIEWS`.
+    """
+    if preset not in PRESETS:
+        raise ValueError(f"unknown preset {preset!r}; known: {sorted(PRESETS)}")
+    if preset != "quick":
+        return None
+    decode = _HEADLINE_DECODE_VIEW.get(decode_kind)
+    return ((decode,) if decode is not None else ()) + QUICK_VIEWS
+
+
+def _validate_device(device: Any) -> str:
+    r"""The device string, after checking that torch parses it and that a CUDA device exists.
+
+    A CUDA request on a machine without a usable CUDA device fails here, before any section
+    runs, instead of partway through the contextual forwards.
+    """
+    try:
+        parsed = torch.device(str(device))
+    except (RuntimeError, TypeError) as exc:
+        raise ValueError(f"device {device!r} is not a torch device: {exc}") from exc
+    if parsed.type == "cuda":
+        if not torch.cuda.is_available():
+            raise ValueError(f"device {device!r} requested but torch.cuda.is_available() is False")
+        if parsed.index is not None and parsed.index >= torch.cuda.device_count():
+            raise ValueError(f"device {device!r} requested but only {torch.cuda.device_count()} CUDA "
+                             "device(s) exist")
+    elif parsed.type != "cpu":
+        raise ValueError(f"device {device!r}: only 'cpu' and 'cuda[:i]' are supported")
+    return str(device)
+
+
 def _resolve_options(options: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
-    opts: Dict[str, Any] = {**DEFAULT_OPTIONS, **dict(options or {})}
+    r"""``DEFAULT_OPTIONS``, then the preset's values (:data:`PRESETS`), then the explicit ``options``."""
+    user = dict(options or {})
+    preset = user.get("preset", DEFAULT_OPTIONS["preset"])
+    if preset not in PRESETS:
+        raise ValueError(f"unknown preset {preset!r}; known: {sorted(PRESETS)}")
+    opts: Dict[str, Any] = {**DEFAULT_OPTIONS, **PRESETS[preset], **user}
     sections = tuple(opts["sections"])
     unknown = set(sections) - set(SECTIONS)
     if unknown:
@@ -695,6 +791,16 @@ def _section_record(res: SectionResult, out_dir: Path) -> Dict[str, Any]:
     }
 
 
+def _save_candidate_ids(path: Path, ids: np.ndarray) -> Path:
+    r"""Atomically write the (n,) int64 candidate ids as ``.npy`` (the multi-seed stability reads them)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.stem}.tmp.npy")
+    np.save(temporary, np.asarray(ids, dtype=np.int64).reshape(-1))
+    os.replace(temporary, path)
+    return path
+
+
 def _relative(path: Any, root: Path) -> str:
     path = Path(path)
     try:
@@ -715,28 +821,45 @@ def analyze_run(
     r"""Analyze one trained run and write ``metrics.json`` and ``REPORT.md``; returns the report path.
 
     ``out_dir`` defaults to ``<run_dir>/semantics``. ``options`` override :data:`DEFAULT_OPTIONS`
-    (extra keys are passed through to the section modules, e.g. the ``frames.PHI_DEFAULTS`` budgets).
-    ``vocab`` overrides the tokenizer vocabulary (``vocab.custom_vocab`` for non-standard runs).
-    Sections run in the order phi, embeddings, sigma, contextual; each failure is recorded and
-    the remaining sections still run.
+    and the preset (``options["preset"]``, :data:`PRESETS`); extra keys are passed through to the
+    section modules, e.g. the ``frames.PHI_DEFAULTS`` budgets. The quick preset's views follow the
+    run's decode kind (:func:`preset_views`) unless ``options`` names ``views`` explicitly.
+    ``options["device"]`` (``"cpu"`` or ``"cuda[:i]"``, validated before loading) is
+    ``ctx.device``: the contextual forward passes and the vector battery read it; the frame chart
+    stays on the CPU in float64. ``vocab`` overrides the tokenizer vocabulary
+    (``vocab.custom_vocab`` for non-standard runs). Sections run in the order phi, embeddings,
+    sigma, contextual; each failure is recorded and the remaining sections still run. Besides
+    ``metrics.json`` and ``REPORT.md`` the candidate ids are saved as :data:`CANDIDATE_IDS_FILE`
+    (read by :mod:`vfe3.semantics.multiseed`). ``options["drop_unknown_config_fields"]`` reopens a
+    run whose checkpoint config carries fields this code line no longer declares (retired toggles):
+    they are dropped by :func:`~vfe3.semantics.run.load_semantic_run` and listed in ``run_notes``.
     """
     from vfe3.semantics.run import load_semantic_run, prepare_context
 
     opts = _resolve_options(options)
+    opts["device"] = _validate_device(opts["device"])
     started = datetime.datetime.now()
     t_total = time.perf_counter()
     timings: Dict[str, Any] = {}
 
     t = time.perf_counter()
-    run = load_semantic_run(run_dir, checkpoint=checkpoint, vocab=vocab)
+    run = load_semantic_run(run_dir, checkpoint=checkpoint, vocab=vocab,
+                            drop_unknown_config_fields=bool(opts["drop_unknown_config_fields"]))
     timings["load"] = time.perf_counter() - t
     out = Path(out_dir) if out_dir is not None else run.run_dir / "semantics"
     _log(f"[semantics] run {run.run_dir} (K={run.K}, {run.n_layers} layers, {run.n_heads} heads, "
          f"decode {run.decode_kind}) loaded in {timings['load']:.1f} s; output {out}")
+    if "views" not in dict(options or {}):
+        views = preset_views(opts["preset"], run.decode_kind)
+        if views is not None:
+            opts["views"] = views
+    _log(f"[semantics] preset {opts['preset']}; device {opts['device']}; views "
+         + ("all applicable" if opts["views"] is None else ", ".join(opts["views"])))
 
     t = time.perf_counter()
     ctx = prepare_context(run, out, options=opts)
     timings["context"] = time.perf_counter() - t
+    _save_candidate_ids(out / CANDIDATE_IDS_FILE, ctx.candidate_ids)
     _log(f"[semantics] context: {ctx.candidate_ids.size} candidates, {len(ctx.analogies)} Google questions, "
          f"{sum(len(v) for v in ctx.lexicon.values())} lexicon words; {ctx.threads} threads "
          f"({timings['context']:.1f} s)")
@@ -784,19 +907,24 @@ def analyze_run(
 _FIGURE_CAPTIONS: Dict[str, str] = {
     "map": "PCA and UMAP maps of the semantic-lexicon words colored by field",
     "offsets": "relation offsets a → a* in a per-relation 2-D PCA",
-    "analogy_categories": "Google analogy 3CosAdd accuracy per category and view, with the ONLY-B baseline",
+    "analogy_categories": ("Google analogy 3CosAdd accuracy minus ONLY-B per category and view (cell text: "
+                           "accuracy with ONLY-B in parentheses), with micro and macro rows"),
     "analogy_methods": "overall analogy accuracy per method and view",
     "similarity": "SimLex-999 / WordSim-353 Spearman ρ per view with bootstrap 95% CI",
-    "fields": "semantic-field kNN purity (permutation null band) and silhouette per view",
+    "fields": ("semantic-field kNN purity with the permutation null band (grey) and the frequency-stratified "
+               "null band (tan), and silhouette per view"),
     "geometry": "effective rank, IsoScore, mean cosine and TwoNN intrinsic dimension per view",
-    "directions": "concept-direction cosines under the causal inner product",
+    "directions": ("concept-direction cosines under the causal inner product, as the excess over a "
+                   "frequency-matched random-target null (grey where |z| < 2)"),
     "scree": "PCA spectra of the centered rows per view",
     "frequency": "frequency confound: ridge probe of log count and PC1 / norm Spearman per view",
     "projections": "semantic projection onto antonym axes",
 }
 _COMPARE_CAPTIONS: Dict[str, str] = {
     **_FIGURE_CAPTIONS,
-    "offsets": "relation-offset consistency (OCS z against the re-pairing null) per relation and view",
+    "offsets": ("relation-offset consistency as the effect size (OCS − null)/(1 − null) against the re-pairing "
+                "null per relation and view (dot: p < 0.05)"),
+    "field_purity": "per-field kNN purity above chance, (P_f − c_f)/(1 − c_f), per view (n_f annotated)",
 }
 _SECTION_CAPTIONS: Dict[Tuple[str, str], str] = {
     ("sigma", "overview"): "covariance-table dispersion, log-variance histogram and initialization",
@@ -919,6 +1047,7 @@ def _headline_tables(res: SectionResult, ctx: AnalysisContext) -> str:
             "Google covered / benchmark": (_covered_of_total(bench.get("n_covered"), total or bench.get("n_total"))
                                            if _ok(bench) else "–"),
             "overall 3CosAdd − ONLY-B": f"{a - ob:+.3f}" if a is not None and ob is not None else "–",
+            "macro 3CosAdd − ONLY-B": _macro_margin(bench) if _ok(bench) else "–",
             "semantic 3CosAdd (ONLY-B)": _acc_pair(bench.get("semantic")) if _ok(bench) else "–",
             "syntactic 3CosAdd (ONLY-B)": _acc_pair(bench.get("syntactic")) if _ok(bench) else "–",
             "honest top-1 = b": _f(_get(bench, "overall", "honest", "top1_is_b")) if _ok(bench) else "–",
@@ -934,6 +1063,7 @@ def _headline_tables(res: SectionResult, ctx: AnalysisContext) -> str:
             "view": label, "D": meta.get(name, {}).get("dim", "–"),
             "field kNN purity@10 (null; z)": (f"{purity['purity']:.3f} ({_f(purity['null_mean'])}; "
                                              f"z = {_f(purity['z'], 1)})") if purity else "–",
+            "frequency-stratified null (z)": _stratified_null(purity),
             "silhouette": _f(_get(fields, "silhouette", "silhouette")) if _ok(fields) else "–",
             "erank / D": f"{erank / dim:.3f}" if erank is not None and dim else "–",
             "IsoScore": _f(_get(geo, "isoscore")),
@@ -1679,7 +1809,8 @@ def _render_report(run: Any, ctx: AnalysisContext, results: Mapping[str, Section
     rows.append({"stage": "total", "seconds": float(timings.get("total", 0.0))})
     add(markdown_table(rows, ["stage", "seconds"], digits=1))
     opts = ctx.options
-    add(f"Options: min_count {opts.get('min_count')}, max_candidates {opts.get('max_candidates')}, seed "
+    add(f"Options: preset {opts.get('preset')}, min_count {opts.get('min_count')}, max_candidates "
+        f"{opts.get('max_candidates')}, seed "
         f"{ctx.seed}, threads {ctx.threads}, device {ctx.device}, umap {opts.get('umap')}, reference_position "
         f"{opts.get('reference_position')}, frame_ref_count {opts.get('frame_ref_count')}, "
         f"geometry_max_points {opts.get('geometry_max_points')}, headline_view {opts.get('headline_view')}. "

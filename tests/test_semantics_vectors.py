@@ -7,16 +7,20 @@ labels) with fixed seeds.
 
 from __future__ import annotations
 
+import copy
+import dataclasses
+import itertools
 import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List
 
 import numpy as np
 import pytest
 
 from vfe3.semantics import stats, vectors
-from vfe3.semantics.common import AnalogyQuestion, AnalysisContext, VectorView, to_jsonable
+from vfe3.semantics.common import OKABE_ITO, AnalogyQuestion, AnalysisContext, VectorView, to_jsonable
 
 
 # ----------------------------------------------------------------------------------------------
@@ -477,6 +481,9 @@ def test_offset_consistency_planted_relation_vs_random_pairs() -> None:
     assert planted["top_pc_share"] > 0.99 and planted["null_top_pc_share_mean"] < 0.9
     assert planted["loo_proj_mean"] > 0.95 * np.linalg.norm(delta)
     assert planted["null_mean"] < 0.9                                  # re-pairing adds x_pi(i) - x_i noise
+    assert planted["effect_size"] == pytest.approx((planted["ocs"] - planted["null_mean"]) / (1.0 - planted["null_mean"]))
+    assert planted["effect_size"] > 0.9 and abs(random["effect_size"]) < 0.5
+    assert math.isnan(vectors._effect_size(0.5, 1.0)) and vectors._effect_size(0.3, 0.3) == 0.0
     assert random["p"] > 0.01
     # random-pair baseline (Park et al. Fig. 2): m random word pairs on the real LOO directions
     assert planted["n_random_pairs"] == 10 and len(planted["random_loo_proj"]) == 10
@@ -679,6 +686,28 @@ def test_run_vector_battery_is_complete_and_json_serializable(world: tuple) -> N
         assert bench["overall"]["coverage"] == pytest.approx(61 / 230)
         assert battery["coverage"]["analogies_total"] == 230 and battery["coverage"]["analogies_resolved"] == 61
     mu = results["mu_raw"]
+    assert mu["backend"] == {"requested": "cpu", "device": None, "path": "numpy float64"}
+    for group in ("overall", "semantic", "syntactic"):                 # macro beside micro
+        macro = mu["analogy_benchmark"][group]["macro"]
+        cats = macro["category_n"]
+        expected = np.mean([mu["analogy_benchmark"]["categories"][c]["methods"]["3cosadd"]["acc"]["mean"] for c in cats])
+        assert macro["methods"]["3cosadd"]["acc"]["mean"] == pytest.approx(expected)
+        assert mu["analogy_benchmark"][group]["largest_category"] in cats
+    strat = mu["fields"]["purity"]["frequency_stratified"]             # counts known: both purity nulls
+    assert mu["fields"]["purity"]["null"] == "both" and strat["n_strata"] == 10 and strat["n_perm"] == 200
+    for f, rec in mu["fields"]["per_field"].items():
+        assert rec["chance"] == pytest.approx((rec["n"] - 1) / (mu["fields"]["n_words"] - 1))
+        assert rec["purity_excess"] == pytest.approx((rec["purity"] - rec["chance"]) / (1 - rec["chance"]))
+    gender = mu["offsets"]["relations"]["gender"]
+    assert gender["effect_size"] == pytest.approx((gender["ocs"] - gender["null_mean"]) / (1 - gender["null_mean"]))
+    for key in ("directions_raw", "directions_whitened"):
+        d = mu[key]
+        assert d["n_null"] == vectors.DIRECTION_NULL_DRAWS and d["frequency_matched"]
+        excess = np.asarray(d["excess"], dtype=np.float64)
+        assert np.isnan(np.diag(excess)).all()
+        off = ~np.eye(excess.shape[0], dtype=bool)
+        np.testing.assert_allclose(excess[off], (np.asarray(d["cosine"]) - np.asarray(d["null_mean"]))[off],
+                                   atol=1e-12)
     assert mu["offsets"]["relations"]["gender"]["z"] > 3
     assert mu["fields"]["purity"]["purity"] > 0.75 and mu["fields"]["purity"]["z"] > 3   # max 9/10 at k=10
     assert mu["analogy_benchmark"]["semantic"]["methods"]["3cosadd"]["acc"]["mean"] > 0.5
@@ -745,23 +774,62 @@ def test_offsets_figure_tables_and_comparison(world: tuple, monkeypatch: pytest.
     assert "| family | 56 / 120 |" in bench_text and "coverage" in bench_text and "pairs" in bench_text
     assert "| currency | 0 / 30 |" in bench_text and "full Google benchmark" in bench_text
     offsets_text = (Path(ctx.tables_dir) / "embeddings" / "mu_raw" / "offsets.md").read_text(encoding="utf-8")
-    assert "| LOO proj | re-paired | random pairs |" in offsets_text
+    assert "| LOO proj | re-paired | random pairs |" in offsets_text and "| effect size |" in offsets_text
+    assert "3CosAdd macro" in bench_text and "largest category (share)" in bench_text
     figures: Dict[str, Any] = {}
     real_save = vectors.save_figure
 
     def capture(fig: Any, context: Any, section: str, name: str) -> list:
-        figures[name] = (len(fig.axes[0].images), [t.get_text() for t in fig.axes[0].texts])
+        figures[name] = fig
         return real_save(fig, context, section, name)
 
     monkeypatch.setattr(vectors, "save_figure", capture)
     ctx.cache.pop("vectors_failed_steps", None)
     written = vectors.plot_views_comparison(results, views, ctx)
     stems = {p.stem for p in written}
-    assert {"analogy_categories", "analogy_methods", "similarity", "fields", "geometry", "offsets",
+    assert {"analogy_categories", "analogy_methods", "similarity", "fields", "field_purity", "geometry", "offsets",
             "directions", "scree", "frequency", "projections_mu_raw"} <= stems
     assert all(p.exists() for p in written) and not ctx.cache.get("vectors_failed_steps")
-    images, texts = figures["analogy_categories"]                      # heatmap, cells "acc\n(ONLY-B)"
-    assert images == 1 and any("\n(" in t for t in texts)
+    order = list(results)
+    # (a) analogy heatmap: color = 3CosAdd - ONLY-B, cells "acc\n(ONLY-B)", micro and macro rows
+    ax = figures["analogy_categories"].axes[0]
+    shown = np.ma.filled(ax.images[0].get_array(), np.nan)
+    assert any("\n(" in t.get_text() for t in ax.texts)
+    for c, v in enumerate(order):
+        overall = results[v]["analogy_benchmark"]["overall"]
+        for r, g in enumerate((overall, overall["macro"])):             # rows: overall, overall macro
+            margin = g["methods"]["3cosadd"]["acc"]["mean"] - g["methods"]["only_b"]["acc"]["mean"]
+            assert shown[r, c] == pytest.approx(margin)
+    assert [t.get_text() for t in ax.get_yticklabels()][1].startswith("overall macro")
+    # (b) offsets heatmap: color = effect size, one dot per cell with p < 0.05
+    ax = figures["offsets"].axes[0]
+    shown = np.ma.filled(ax.images[0].get_array(), np.nan)
+    rels = list(results[order[0]]["offsets"]["relations"])
+    n_dots = 0
+    for c, v in enumerate(order):
+        for r, name in enumerate(rels):
+            rec = results[v]["offsets"]["relations"][name]
+            assert shown[r, c] == pytest.approx(rec["effect_size"])
+            n_dots += int(rec["p"] < vectors.OFFSET_ALPHA)
+    assert len(ax.lines[0].get_xdata()) == n_dots > 0
+    # (c) directions: observed minus null mean, masked (grey) where |z| < 2
+    ax = figures["directions"].axes[0]
+    by_label = {views[v].label: v for v in order}
+    d = results[by_label[ax.get_title().split(",")[0]]]["directions_whitened"]
+    shown = np.ma.filled(ax.images[0].get_array(), np.nan)
+    excess, z = np.asarray(d["excess"], dtype=np.float64), np.asarray(d["z"], dtype=np.float64)
+    loud = np.abs(np.nan_to_num(z)) >= vectors.DIRECTION_Z
+    np.testing.assert_allclose(shown[loud], excess[loud])
+    assert np.isnan(shown[~loud]).all()
+    # (d) fields: both null bands per view; (e) per-field heatmap of (P_f - c_f)/(1 - c_f)
+    assert len(figures["fields"].axes[0].collections) == 2 * len(order)
+    ax = figures["field_purity"].axes[0]
+    shown = np.ma.filled(ax.images[0].get_array(), np.nan)
+    fields = list(results[order[0]]["fields"]["per_field"])
+    for c, v in enumerate(order):
+        for r, f in enumerate(fields):
+            assert shown[r, c] == pytest.approx(results[v]["fields"]["per_field"][f]["purity_excess"])
+    assert [t.get_text() for t in ax.get_yticklabels()][0].endswith("(10)")
 
 
 def test_direction_panels_pick_one_view_per_channel() -> None:
@@ -798,3 +866,343 @@ def test_failed_steps_are_recorded_and_the_rest_continues(world: tuple, monkeypa
     assert ctx.cache.pop("vectors_failed_steps") == [{"step": "compare.scree", "error": "RuntimeError: boom"}]
     assert "frequency" in {p.stem for p in written} and "scree" not in {p.stem for p in written}
     assert any("'scree' failed" in note for note in ctx.cache.get("vectors_notes", []))
+
+
+# ----------------------------------------------------------------------------------------------
+# Compute backend: the torch path (run on the CPU through stats.TORCH_CPU) against numpy float64
+# ----------------------------------------------------------------------------------------------
+
+def test_torch_device_resolution_fallback_and_precision_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    torch = pytest.importorskip("torch")
+    assert stats.torch_device(None) is None and stats.torch_device("cpu") is None
+    assert stats.torch_device(stats.TORCH_CPU) == torch.device("cpu")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="cuda"):
+        stats.torch_device("cuda:0")
+    notes: List[str] = []                                               # the battery falls back to numpy and says so
+    assert vectors._battery_device(SimpleNamespace(device="cuda"), notes) is None
+    assert len(notes) == 1 and "numpy float64" in notes[0]
+    assert vectors._battery_device(SimpleNamespace(device=stats.TORCH_CPU), notes) == stats.TORCH_CPU
+    previous = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("high")                          # a process that enabled TF32
+    try:
+        with stats.ieee_fp32_matmul():
+            assert torch.get_float32_matmul_precision() == "highest"
+        assert torch.get_float32_matmul_precision() == "high"
+    finally:
+        torch.set_float32_matmul_precision(previous)
+
+
+@pytest.mark.parametrize("metric", ["cosine", "euclidean"])
+def test_torch_knn_hubness_and_purity_match_numpy(metric: str) -> None:
+    pytest.importorskip("torch")
+    rng = np.random.default_rng(40)
+    X = rng.standard_normal((53, 6))
+    idx, score = stats.knn(X, 5, metric, chunk=16)
+    idx_t, score_t = stats.knn(X, 5, metric, chunk=16, device=stats.TORCH_CPU)
+    np.testing.assert_array_equal(idx_t, idx)
+    np.testing.assert_allclose(score_t, score, rtol=1e-5, atol=1e-5)
+    assert score_t.dtype == np.float64
+    h = stats.hubness(X, k=5, metric=metric)
+    h_t = stats.hubness(X, k=5, metric=metric, device=stats.TORCH_CPU)
+    assert json.dumps(to_jsonable(h_t)) == json.dumps(to_jsonable(h))
+    labels = np.repeat(["a", "b", "c"], [20, 20, 13])
+    lc = rng.uniform(0.0, 5.0, size=53)
+    kwargs = dict(k=5, metric=metric, n_perm=50, null="both", log_count=lc)
+    p = stats.knn_label_purity(X, labels, rng=np.random.default_rng(1), **kwargs)
+    p_t = stats.knn_label_purity(X, labels, rng=np.random.default_rng(1), device=stats.TORCH_CPU, **kwargs)
+    assert json.dumps(to_jsonable(p_t)) == json.dumps(to_jsonable(p))  # same graph, same draws
+    if metric == "euclidean":
+        t = stats.twonn_dimension(X, np.random.default_rng(2))
+        t_t = stats.twonn_dimension(X, np.random.default_rng(2), device=stats.TORCH_CPU)
+        assert t_t["n"] == t["n"] and t_t["mle"] == pytest.approx(t["mle"], rel=1e-5)
+        assert t_t["fit"] == pytest.approx(t["fit"], rel=1e-5)
+
+
+def test_torch_scatter_eigh_whitener_and_cka_match_numpy() -> None:
+    pytest.importorskip("torch")
+    rng = np.random.default_rng(41)
+    X = rng.standard_normal((30, 7)) @ np.diag([5.0, 3.0, 2.0, 1.0, 0.5, 0.1, 0.01]) + 2.0
+    Xc = X - X.mean(axis=0)
+    for side in ("features", "samples"):
+        w, V, used = stats.scatter_eigh(X, side=side)
+        w_t, V_t, used_t = stats.scatter_eigh(X, side=side, device=stats.TORCH_CPU)
+        assert used == used_t == side and w_t.dtype == np.float64
+        np.testing.assert_allclose(w_t, w, atol=1e-10 * w.max())
+        keep = w > 1e-8 * w.max()                                       # distinct nonzero eigenvalues: same vectors up to sign
+        np.testing.assert_allclose(np.abs((V_t[:, keep] * V[:, keep]).sum(axis=0)), 1.0, atol=1e-8)
+    np.testing.assert_allclose(stats.scatter_eigh(X)[0], np.linalg.eigvalsh(Xc.T @ Xc), atol=1e-9)
+    assert stats.scatter_eigh(rng.standard_normal((8, 20)))[2] == "samples"
+    P, rank = vectors._whitener(X)
+    P_t, rank_t = vectors._whitener(X, stats.TORCH_CPU)
+    assert rank == rank_t == 7
+    np.testing.assert_allclose(P_t @ P_t.T, P @ P.T, rtol=1e-8, atol=1e-10 * np.abs(P @ P.T).max())
+    np.testing.assert_allclose(P @ P.T, np.linalg.inv(Xc.T @ Xc / 29.0), rtol=1e-6)   # full rank: Cov^{-1}
+    Y = rng.standard_normal((30, 4)) + X[:, :4]
+    for debiased in (False, True):
+        ref = stats.linear_cka(X, Y, debiased)
+        assert stats.linear_cka(X, Y, debiased, device=stats.TORCH_CPU) == pytest.approx(ref, abs=1e-5)
+
+
+@pytest.mark.parametrize("metric,center,exclude", [
+    ("cosine", True, True), ("cosine", False, False), ("euclidean", False, True),
+])
+def test_torch_analogy_scores_neighbors_and_benchmark_match_numpy(metric: str, center: bool, exclude: bool) -> None:
+    pytest.importorskip("torch")
+    rng = np.random.default_rng(42)
+    n = 64
+    view = VectorView("v", "v", np.arange(n) + 500, rng.standard_normal((n, 7)), metric=metric)
+    qs = [AnalogyQuestion(q.category, q.a + 500, q.a_star + 500, q.b + 500, q.b_star + 500)
+          for q in _random_questions(n, 300, rng)]                      # > _QUESTION_CHUNK: two chunks
+    ref = vectors.analogy_scores(view, qs, center=center, exclude_queries=exclude, topk=4)
+    got = vectors.analogy_scores(view, qs, center=center, exclude_queries=exclude, topk=4, device=stats.TORCH_CPU)
+    assert list(got["methods"]) == list(ref["methods"])
+    for method in ref["methods"]:
+        np.testing.assert_array_equal(got["methods"][method]["rank"], ref["methods"][method]["rank"])
+        if method == "ignore_a" and not exclude:
+            # a* and b tie exactly (score 1 + cos(a*, b)), so either may fill a slot: identify them
+            a_star = np.array([q.a_star for q in qs])[:, None]
+            b = np.array([q.b for q in qs])[:, None]
+            merged = [np.sort(np.where(top == b, a_star, top), axis=1)
+                      for top in (got["methods"][method]["topk"], ref["methods"][method]["topk"])]
+            np.testing.assert_array_equal(merged[0], merged[1])
+        else:
+            np.testing.assert_array_equal(got["methods"][method]["topk"], ref["methods"][method]["topk"])
+    np.testing.assert_array_equal(got["honest"]["rank"], ref["honest"]["rank"])
+    np.testing.assert_array_equal(got["honest"]["top1"], ref["honest"]["top1"])
+    probes = [500, 510, 520, 999]
+    nn = vectors.nearest_neighbors(view, probes, k=5)
+    nn_t = vectors.nearest_neighbors(view, probes, k=5, device=stats.TORCH_CPU)
+    assert set(nn_t) == set(nn) == {500, 510, 520}
+    for q in nn:
+        assert [t for t, _ in nn_t[q]] == [t for t, _ in nn[q]]
+        np.testing.assert_allclose([s for _, s in nn_t[q]], [s for _, s in nn[q]], rtol=1e-5, atol=1e-5)
+    bench = vectors.analogy_benchmark(view, qs, np.random.default_rng(1), n_boot=50)
+    bench_t = vectors.analogy_benchmark(view, qs, np.random.default_rng(1), n_boot=50, device=stats.TORCH_CPU)
+    assert json.dumps(to_jsonable(bench_t)) == json.dumps(to_jsonable(bench))
+
+
+def test_battery_torch_path_matches_the_numpy_path(world: tuple) -> None:
+    pytest.importorskip("torch")
+    ctx, views, results = world
+    ctx_t = dataclasses.replace(ctx, device=stats.TORCH_CPU, cache={})
+    got, ref = vectors.run_vector_battery(views["mu_raw"], ctx_t), results["mu_raw"]
+    assert got["backend"]["device"] == stats.TORCH_CPU and got["backend"]["path"].startswith("torch")
+    assert got["failed_steps"] == [] and _statuses(got) == []
+    for key in ("analogy_benchmark", "analogy_examples", "offsets", "fields", "clusters", "similarity"):
+        assert json.dumps(to_jsonable(got[key])) == json.dumps(to_jsonable(ref[key])), key
+    for q, row in ref["neighbors"].items():
+        assert [t for t, _ in got["neighbors"][q]] == [t for t, _ in row]
+    for key in ("directions_raw", "directions_whitened"):
+        for field in ("cosine", "null_mean", "excess"):
+            np.testing.assert_allclose(np.asarray(got[key][field], dtype=np.float64),
+                                       np.asarray(ref[key][field], dtype=np.float64), atol=1e-8)
+    g, g_ref = got["geometry"], ref["geometry"]
+    for key in ("effective_rank", "isoscore", "participation_ratio"):
+        assert g[key] == pytest.approx(g_ref[key], rel=1e-9)
+    assert g["twonn"]["mle"] == pytest.approx(g_ref["twonn"]["mle"], rel=1e-5)
+    assert json.dumps(to_jsonable(g["hubness"])) == json.dumps(to_jsonable(g_ref["hubness"]))
+
+
+# ----------------------------------------------------------------------------------------------
+# Frequency-stratified purity null
+# ----------------------------------------------------------------------------------------------
+
+def test_frequency_strata_are_equal_count_log_count_bins() -> None:
+    lc = np.array([5.0, 1.0, 3.0, 3.0, 9.0, 0.0, 2.0, 7.0, 4.0, 6.0, 8.0, 1.5])
+    s = stats.frequency_strata(lc, 4)
+    np.testing.assert_array_equal(np.bincount(s), [3, 3, 3, 3])
+    assert s[np.argmin(lc)] == 0 and s[np.argmax(lc)] == 3
+    assert (np.diff(s[np.argsort(lc, kind="stable")]) >= 0).all()      # rarer rows never in a higher bin
+    assert stats.frequency_strata(lc[:3], 10).tolist() == [2, 0, 1]      # fewer rows than bins: one row each
+    with pytest.raises(ValueError, match="non-finite"):
+        stats.frequency_strata([1.0, np.nan])
+
+
+def test_stratified_chance_is_the_exact_within_stratum_permutation_mean() -> None:
+    codes = np.array([0, 1, 0, 1, 1, 0, 1])
+    strata = np.array([0, 0, 0, 1, 1, 1, 1])
+    idx = np.array([[1, 2], [0, 3], [4, 0], [6, 5], [3, 2], [4, 6], [5, 1]])
+    pos = [np.flatnonzero(strata == s) for s in (0, 1)]
+    values = []
+    for p0 in itertools.permutations(pos[0]):                           # all 3! x 4! within-stratum permutations
+        for p1 in itertools.permutations(pos[1]):
+            perm = codes.copy()
+            perm[pos[0]], perm[pos[1]] = codes[list(p0)], codes[list(p1)]
+            values.append((perm[idx] == perm[:, None]).mean())
+    assert stats._stratified_chance(codes, idx, strata, 2) == pytest.approx(float(np.mean(values)), abs=1e-12)
+
+
+def test_frequency_stratified_null_absorbs_frequency_coded_neighbors() -> None:
+    rng = np.random.default_rng(43)
+    n = 200
+    lc = np.sort(rng.uniform(0.0, 10.0, n))
+    X = np.column_stack([lc, 0.01 * rng.standard_normal(n)])            # neighbors = words of similar frequency
+    frequent = rng.random(n) < 1.0 / (1.0 + np.exp(-1.5 * (lc - 5.0)))
+    labels = np.where(frequent, "frequent", "rare")                     # the two fields differ only in frequency
+    kwargs = dict(k=5, metric="euclidean", n_perm=300)
+    both = stats.knn_label_purity(X, labels, rng=np.random.default_rng(0), null="both", log_count=lc, **kwargs)
+    perm = stats.knn_label_purity(X, labels, rng=np.random.default_rng(0), **kwargs)
+    for key in ("purity", "null_mean", "null_std", "z", "p", "chance", "per_label", "per_label_chance"):
+        assert both[key] == perm[key], key                              # the permutation null is drawn first
+    assert both["null"] == "both" and perm["null"] == "permutation"
+    assert both["purity"] > 0.8 and both["z"] > 10                      # the uniform null calls this structure
+    strat = both["frequency_stratified"]
+    assert strat["n_strata"] == 10 and strat["n_perm"] == 300
+    assert abs(strat["z"]) < 2 and strat["p"] > 0.05                    # frequency alone reaches it
+    assert abs(strat["null_mean"] - strat["chance"]) < 4 * strat["null_std"] / math.sqrt(300)
+    alone = stats.knn_label_purity(X, labels, rng=np.random.default_rng(0), null="frequency_stratified",
+                                   log_count=lc, **kwargs)
+    assert alone["null"] == "frequency_stratified" and alone["chance"] == strat["chance"]
+    assert alone["n_strata"] == 10 and abs(alone["z"]) < 2
+    with pytest.raises(ValueError, match="log_count"):
+        stats.knn_label_purity(X, labels, rng=rng, null="both", **kwargs)
+    with pytest.raises(ValueError, match="log counts"):
+        stats.knn_label_purity(X, labels, rng=rng, null="both", log_count=lc[:-1], **kwargs)
+    with pytest.raises(ValueError, match="unknown null"):
+        stats.knn_label_purity(X, labels, rng=rng, null="uniform", **kwargs)
+
+
+def test_field_clustering_reports_both_nulls_and_per_field_excess() -> None:
+    rng = np.random.default_rng(19)
+    dirs = _orthonormal(8, 3, rng).T * 5.0
+    X = np.vstack([np.repeat(dirs, 8, axis=0) + 0.3 * rng.standard_normal((24, 8)), rng.standard_normal((6, 8))])
+    view = VectorView("v", "v", np.arange(30), X)
+    lexicon = {"f0": list(range(0, 8)), "f1": list(range(8, 16)), "f2": list(range(16, 24))}
+    lc = rng.permutation(np.log1p(np.arange(30, 0, -1).astype(np.float64)))   # frequency unrelated to the fields
+    with_counts = vectors.field_clustering(view, lexicon, np.random.default_rng(5), k=5, log_count=lc)
+    without = vectors.field_clustering(view, lexicon, np.random.default_rng(5), k=5)
+    for key in ("purity", "null_mean", "null_std", "z", "p"):
+        assert with_counts["purity"][key] == without["purity"][key]
+    assert without["purity"]["frequency_stratified"]["status"] == "skipped"
+    strat = with_counts["purity"]["frequency_stratified"]
+    assert strat["n_strata"] == 10 and strat["p"] < 0.05                 # separable fields beat the stratified null too
+    ordered = vectors.field_clustering(view, lexicon, np.random.default_rng(5), k=5,
+                                       log_count=np.log1p(np.arange(30, 0, -1).astype(np.float64)))
+    assert ordered["purity"]["frequency_stratified"]["p"] > 0.05           # fields ordered by frequency: absorbed
+    for f, rec in with_counts["per_field"].items():
+        assert rec["n"] == 8 and rec["chance"] == pytest.approx(7 / 23)
+        assert rec["purity_excess"] == pytest.approx((rec["purity"] - 7 / 23) / (1 - 7 / 23))
+    with pytest.raises(ValueError, match="view rows"):
+        vectors.field_clustering(view, lexicon, rng, k=5, log_count=lc[:10])
+
+
+# ----------------------------------------------------------------------------------------------
+# Macro-averaged analogy accuracy, concept-direction null, view styles, heatmap collapse
+# ----------------------------------------------------------------------------------------------
+
+def test_analogy_macro_average_weights_categories_equally() -> None:
+    rng = np.random.default_rng(30)
+    view, qs = _crossed_only_b_world(rng)
+    bench = vectors.analogy_benchmark(view, qs, rng, n_boot=500)
+    overall = bench["overall"]
+    assert overall["methods"]["only_b"]["acc"]["mean"] == pytest.approx(45 / 120)   # micro: 90 + 30 questions
+    macro = overall["macro"]
+    assert macro["n_categories"] == 2 and macro["category_n"] == {"family": 90, "gram8-plural": 30}
+    only_b = macro["methods"]["only_b"]["acc"]
+    assert only_b["mean"] == pytest.approx(0.25) and only_b["ci_lo"] < 0.25 < only_b["ci_hi"]
+    assert only_b["ci_method"] == "bootstrap over pairs"
+    assert overall["largest_category"] == "family" and overall["largest_category_share"] == pytest.approx(0.75)
+    for m in bench["methods"]:
+        for stat in ("acc", "hits5", "mrr"):
+            expected = np.mean([bench["categories"][c]["methods"][m][stat]["mean"] for c in ("family", "gram8-plural")])
+            assert macro["methods"][m][stat]["mean"] == pytest.approx(expected)
+    assert macro["honest"]["acc"]["mean"] == pytest.approx(
+        np.mean([bench["categories"][c]["honest"]["acc"]["mean"] for c in ("family", "gram8-plural")]))
+    assert bench["semantic"]["macro"]["methods"]["only_b"]["acc"]["mean"] == pytest.approx(0.5)
+    zero = bench["syntactic"]["macro"]["methods"]["only_b"]["acc"]
+    assert zero["mean"] == 0.0 and zero["ci_method"] == "Wilson on 6 pairs"
+    assert "macro" not in bench["categories"]["family"]
+
+
+def test_direction_null_removes_the_shared_source_cosine() -> None:
+    rng = np.random.default_rng(44)
+    n, D, m = 1500, 16, 12
+    X = rng.standard_normal((n, D))
+    X[:m] += 1.5 * rng.standard_normal(D)                               # shared sources with a common part
+    delta = 3.0 * rng.standard_normal(D)
+    c1, c2 = 200 + 110 * np.arange(m), 255 + 110 * np.arange(m)         # planted targets, > 50 ranks apart
+    X[c1] = X[20:20 + m] + delta + 0.3 * rng.standard_normal((m, D))
+    X[c2] = X[40:40 + m] + delta + 0.3 * rng.standard_normal((m, D))
+    rels = {"u1": [(i, 100 + i) for i in range(m)],                     # shared sources, random targets:
+            "u2": [(i, 150 + i) for i in range(m)],                     # no coupling, but -mean(x_a) is common
+            "c1": [(20 + i, int(c1[i])) for i in range(m)],             # distinct sources, one shared offset
+            "c2": [(40 + i, int(c2[i])) for i in range(m)]}
+    view = VectorView("v", "v", np.arange(n), X)
+    lc = np.log1p(np.arange(n, 0, -1).astype(np.float64))              # frequency rank = row index
+    for whiten in (False, True):
+        out = vectors.concept_direction_cosines(view, rels, whiten=whiten, rng=np.random.default_rng(7), log_count=lc)
+        assert out["n_null"] == 200 and out["frequency_matched"] and "matched frequency" in out["null"]
+        assert out["cosine"][0, 1] > 0.8 and out["null_mean"][0, 1] > 0.8       # the shared-source effect
+        assert abs(out["z"][0, 1]) < vectors.DIRECTION_Z and not out["significant"][0, 1]
+        assert abs(out["excess"][0, 1]) < 0.05
+        assert out["significant"][2, 3] and out["excess"][2, 3] > 0.5            # a real common offset survives
+        assert np.isnan(np.diag(out["excess"])).all() and np.isnan(np.diag(out["z"])).all()
+        np.testing.assert_array_equal(out["significant"], out["significant"].T)
+    plain = vectors.concept_direction_cosines(view, rels, whiten=False)
+    assert "excess" not in plain and "null_mean" not in plain           # no rng: no null (and no extra draws)
+    uniform = vectors.concept_direction_cosines(view, rels, whiten=False, rng=np.random.default_rng(7), n_null=20)
+    assert not uniform["frequency_matched"] and "uniformly random" in uniform["null"]
+
+
+def test_matched_replacements_stay_in_the_frequency_window_and_avoid_the_target() -> None:
+    rng = np.random.default_rng(45)
+    n, h = 100, 5
+    lc = rng.permutation(np.log1p(np.arange(n, dtype=np.float64)))
+    rank = np.empty(n, dtype=np.int64)
+    rank[np.argsort(-lc, kind="stable")] = np.arange(n)
+    targets = np.array([int(np.argmin(rank)), int(np.argmax(rank)), int(np.flatnonzero(rank == 50)[0])])
+    R = vectors._matched_replacements(targets, n, lc, rng, 3000, h)
+    assert R.shape == (3000, 3) and (R != targets[None, :]).all()
+    for j, t in enumerate(targets):
+        lo = int(np.clip(rank[t] - h, 0, n - (2 * h + 1)))              # window shifted inward at the ends
+        got = rank[R[:, j]]
+        assert got.min() >= lo and got.max() <= lo + 2 * h
+        assert np.unique(R[:, j]).size == 2 * h                         # every other slot of the window is used
+    U = vectors._matched_replacements(targets, n, None, rng, 500, h)
+    assert (U != targets[None, :]).all() and U.min() >= 0 and U.max() < n
+
+
+def test_view_style_gives_every_known_view_a_distinct_family_coded_style() -> None:
+    styles = {name: vectors.view_style(name) for name in vectors.VIEW_STYLE}
+    assert len({(s["color"], s["marker"], s["filled"]) for s in styles.values()}) == len(styles)
+    for name, s in styles.items():
+        assert s["color"] == vectors.FAMILY_COLORS[vectors.VIEW_STYLE[name]["family"]]
+        assert (s["face"] == "white") != s["filled"]
+    assert styles["mu_raw"]["filled"] and not styles["mu_sigma_units"]["filled"]
+    assert styles["decode_W"]["color"] == styles["decode_W_causal"]["color"] != styles["mu_raw"]["color"]
+    assert styles["phi_raw"]["filled"] and not styles["phi_log"]["filled"]
+    layer = VectorView("layer_3", "layer 3", np.arange(2), np.eye(2), group="contextual")
+    assert vectors.view_style("layer_3", layer) == vectors.view_style("layer_3", layer)   # stable
+    assert vectors.view_style("layer_3", layer)["color"] == vectors.FAMILY_COLORS["contextual"]
+    assert vectors.view_style("mystery")["color"] in {OKABE_ITO[5], OKABE_ITO[6], OKABE_ITO[7]}
+
+
+def test_analogy_category_heatmap_collapses_all_zero_views(world: tuple) -> None:
+    import matplotlib.pyplot as plt
+
+    ctx, views, results = world
+    zero = copy.deepcopy(results["w2_chart"])
+    bench = zero["analogy_benchmark"]
+    records = [bench[g] for g in ("overall", "semantic", "syntactic")] + list(bench["categories"].values())
+    for rec in records + [r["macro"] for r in records if "macro" in r]:
+        acc = _get_path(rec, "methods", "3cosadd", "acc")
+        if acc is not None:
+            acc["mean"] = 0.0
+    fig = vectors._compare_analogy_categories({"mu_raw": results["mu_raw"], "w2_chart": zero}, views, ctx,
+                                              ["mu_raw", "w2_chart"])
+    try:
+        assert fig.axes[0].images[0].get_array().shape[1] == 1           # only mu raw in the main heatmap
+        assert fig.axes[1].get_xticklabels()[0].get_text() == "1 view"
+        assert any("Collapsed" in t.get_text() and "W2 chart" in t.get_text().replace("\n", " ")
+                   for t in fig.texts)
+    finally:
+        plt.close(fig)
+
+
+def _get_path(node: Any, *keys: str) -> Any:
+    for key in keys:
+        if not isinstance(node, dict) or key not in node:
+            return None
+        node = node[key]
+    return node

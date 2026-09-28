@@ -99,6 +99,127 @@ def _save(fig, path: Optional[str]):
     return fig
 
 
+# Page geometry of the figures rebuilt on 2026-09-28 (audit k160 Section 4): at most one two-column
+# text width, and no text below 6 pt at that width. The compact rc below is applied while those
+# figures are built AND saved, so draw-time tick labels inherit it.
+MAX_FIGURE_WIDTH_IN = 7.2
+MIN_TEXT_PT = 6.0
+_COMPACT_RC: Dict[str, object] = {
+    "font.size":        7.0,
+    "axes.titlesize":   7.5,
+    "axes.labelsize":   7.0,
+    "xtick.labelsize":  6.5,
+    "ytick.labelsize":  6.5,
+    "legend.fontsize":  6.0,
+    "figure.titlesize": 8.5,
+}
+
+
+class FigureSkipped(RuntimeError):
+    r"""Raised by a figure builder whose figure is route-trivial or has no data to show.
+
+    The message is the logged skip reason. Nothing is written: a caller that catches this logs the
+    reason and moves on, and a caller that treats every exception as a failed figure still logs the
+    reason text. Retired placeholders (a text box saying "unavailable") are no longer drawn.
+    """
+
+
+def has_estep_iterates(cfg: object) -> bool:
+    r"""Whether the configured forward has belief E-step iterates to trace.
+
+    The projected attention routes (``attention_mode != 'transported'``) run one captured readout,
+    and ``n_e_steps = 0`` runs none, so the E-step trajectory, depth-sensitivity, character, and
+    E-step attention figures have nothing to show there.
+    """
+    return (getattr(cfg, "attention_mode", "transported") == "transported"
+            and int(getattr(cfg, "n_e_steps", 1)) >= 1)
+
+
+def route_figure_skip_reasons(cfg: object) -> Dict[str, str]:
+    r"""Skip reasons for figures that are identically trivial on the configured route.
+
+    Returns ``{figure_name: reason}``; a name absent from the result is emitted normally. The single
+    source of the route gates of audit k160 Section 4, used by :mod:`vfe3.viz.report` and available to
+    the training-time emitters (``attention_estep``, ``estep_*``, ``belief_condition``).
+
+    * ``holonomy_curvature`` when ``transport_mode = 'flat'``: the holonomy of flat transport is the
+      identity by construction, so the figure plots float32 roundoff.
+    * The E-step family when :func:`has_estep_iterates` is false: there is one readout and no iterate
+      trajectory (the ``attention_estep`` maps equal the ``attention`` maps).
+    * ``belief_spectrum``, ``spd_ellipses`` and ``belief_condition`` when the covariance is frozen at
+      encode (:func:`vfe3.metrics.covariance_frozen_at_encode`): they would describe the decayed
+      token table, not beliefs.
+    """
+    from vfe3 import metrics
+    reasons: Dict[str, str] = {}
+    if getattr(cfg, "transport_mode", "flat") == "flat":
+        reasons["holonomy_curvature"] = (
+            "transport_mode='flat': holonomy is the identity by construction, so the figure would "
+            "plot float32 roundoff")
+    if not has_estep_iterates(cfg):
+        why = (f"attention_mode={getattr(cfg, 'attention_mode', 'transported')!r} runs one captured "
+               "readout" if getattr(cfg, "attention_mode", "transported") != "transported"
+               else "n_e_steps=0")
+        reason = f"no E-step iterates ({why})"
+        for name in ("iterate_trajectory", "belief_trajectories", "estep_depth_sensitivity",
+                     "estep_character", "estep_quality", "estep_grad_norm_decomposition",
+                     "attention_estep"):
+            reasons[name] = reason
+    if metrics.covariance_frozen_at_encode(cfg):
+        reason = ("covariance frozen at encode: Sigma is the input-token table row, not a belief "
+                  "covariance")
+        for name in ("belief_spectrum", "spd_ellipses", "belief_condition"):
+            reasons[name] = reason
+    return reasons
+
+
+# ---------------------------------------------------------------------------
+# Run-directory table readers for the history figures (metrics.csv and the
+# long-format diagnostics/*.csv files written at eval cadence).
+# ---------------------------------------------------------------------------
+
+def read_metrics_columns(path: 'str | Path') -> Optional[Dict[str, np.ndarray]]:
+    r"""Read ``metrics.csv`` as ``{column: float64 array}``; blank or non-numeric cells are NaN.
+
+    Returns None when the file is absent or has no data rows. Rows keep their file order, so an
+    eval-cadence column is NaN on the log-cadence rows between evaluations.
+    """
+    import csv
+    path = Path(path)
+    if not path.is_file():
+        return None
+    with path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    if not rows:
+        return None
+    columns: Dict[str, np.ndarray] = {}
+    for key in rows[0]:
+        if key is None:
+            continue
+        values = np.full(len(rows), np.nan)
+        for index, row in enumerate(rows):
+            raw = row.get(key)
+            if raw is None or raw == "":
+                continue
+            try:
+                values[index] = float(raw)
+            except ValueError:
+                pass
+        columns[key] = values
+    return columns
+
+
+def read_long_table(path: 'str | Path') -> Optional[Dict[str, np.ndarray]]:
+    r"""Read a long-format diagnostics CSV (``diagnostics/residual_ratio.csv``,
+    ``diagnostics/attention_stats.csv``) as ``{column: float64 array}``; None when absent or empty."""
+    return read_metrics_columns(path)
+
+
+def _compact_style():
+    r"""Context manager applying :data:`_COMPACT_RC` (7.2 in figures, text >= 6 pt)."""
+    return plt.rc_context(_COMPACT_RC)
+
+
 def _zoom_bar_value_axis(ax, values, *, vertical: bool = True,
                          lo_frac: float = 0.25, hi_frac: float = 0.12) -> None:
     r"""Zoom a bar chart's VALUE axis to a padded ``[min, max]`` window (not ``[0, max]``) so
@@ -1274,55 +1395,135 @@ def _grad_norm_decomp_fig(
     role is omitted from the title suffix.
     """
     step = _np(history["step"]).astype(float)
-    fig, ax = plt.subplots(figsize=(6.8, 4.0))
-    w = max(5, step.size // 80)
-    roles = []
-    for key, label, color, role in spec:
-        if key not in history:
-            continue
-        v = _np(history[key]).astype(float)
-        keep = np.isfinite(v) & (v > 0)                           # log y: drop non-positive (dead/off-substep) points
-        x, vv = step[keep], v[keep]
-        if not vv.size:
-            continue
-        roles.append(role)
-        ax.plot(x, vv, lw=0.7, color=color, alpha=0.25)
-        ax.plot(x, _rolling_mean(vv, w), lw=2.0, color=color, label=f"{label}  ={vv[-1]:.3g}")
-    if roles:
-        ax.set_yscale("log")
-        if step.size and _set_finite_xlim(ax, step):
-            _step_xaxis(ax)
-        ax.legend(fontsize=8, frameon=False, loc="best")
-        title = f"{title} ({' / '.join(roles)})"
-    ax.set(xlabel="training step", ylabel=ylabel, title=title)
-    fig.tight_layout()
-    return _save(fig, path)
+    with _compact_style():
+        fig, ax = plt.subplots(figsize=(5.4, 3.2))
+        w = max(5, step.size // 80)
+        roles = []
+        for key, label, color, role in spec:
+            if key not in history:
+                continue
+            v = _np(history[key]).astype(float)
+            keep = np.isfinite(v) & (v > 0)                       # log y: drop non-positive (dead/off-substep) points
+            x, vv = step[keep], v[keep]
+            if not vv.size:
+                continue
+            roles.append(role)
+            ax.plot(x, vv, lw=0.6, color=color, alpha=0.25)
+            ax.plot(x, _rolling_mean(vv, w), lw=1.5, color=color, label=f"{label}  ={vv[-1]:.3g}")
+        if roles:
+            ax.set_yscale("log")
+            if step.size and _set_finite_xlim(ax, step):
+                _step_xaxis(ax)
+            ax.legend(fontsize=6.5, frameon=False, loc="best")
+            title = f"{title} ({' / '.join(roles)})"
+        ax.set(xlabel="training step", ylabel=ylabel, title=title)
+        fig.tight_layout()
+        return _save(fig, path)
+
+
+# Named parameter groups of the per-group optimizer columns (implementation contract 2026-09-28):
+# ``grad_norm_group_<g>``, ``param_norm_group_<g>`` and ``update_ratio_group_<g>`` on log rows,
+# assigned by parameter NAME, so the per-type tables and the context-processing maps are separate.
+PARAMETER_GROUPS = ("mu_embed", "sigma_log_embed", "phi_embed", "pos_phi", "decode",
+                    "relational_score", "relational_content", "block_mlp", "norm", "other")
+_TABLE_GROUPS = ("mu_embed", "sigma_log_embed", "phi_embed", "pos_phi", "decode")
+_CONTEXT_GROUPS = ("relational_score", "relational_content", "block_mlp", "norm", "other")
+_GROUP_LABELS = {
+    "mu_embed":           r"$\mu$ table",
+    "sigma_log_embed":    r"$\log\sigma^2$ table",
+    "phi_embed":          r"$\phi$ table",
+    "pos_phi":            "positional frames",
+    "decode":             r"decode ($W_{\mathrm{out}}$, $b_{\mathrm{out}}$)",
+    "relational_score":   r"score maps $S_Q,S_K$",
+    "relational_content": r"content maps $T,O$",
+    "block_mlp":          "block MLP",
+    "norm":               "normalization",
+    "other":              "other",
+}
+_GROUP_COLORS = {
+    "mu_embed": _CB[0], "sigma_log_embed": _CB[1], "phi_embed": _CB[2], "pos_phi": _CB[4],
+    "decode": _CB[3], "relational_score": _CB[0], "relational_content": _CB[1],
+    "block_mlp": _CB[2], "norm": _CB[3], "other": _CB[7],
+}
+# The legacy per-ROLE columns (grad_norm_mu / _sigma / _phi, weight_norm_*) aggregate optimizer groups
+# by their build_optimizer role tag. The 'mu' role is everything outside the Sigma and phi tables.
+_ROLE_LABELS = {
+    "mu":    r"'mu' role: $\mu$ table, decode, MLPs, relational maps, norm",
+    "sigma": r"'sigma' role: $\log\sigma^2$ table(s)",
+    "phi":   r"'phi' role: $\phi$ table, positional frames",
+}
+_ROLE_NOTE = ("'mu' role = mu table, decode (W_out, b_out), block MLPs, relational maps, normalization; "
+              "'phi' role = phi table, positional frames; 'sigma' role = log-variance table(s)")
+_PULLBACK_COLUMNS = (
+    "phi_ridge_direction_cosine_mean",
+    "phi_pullback_damped_gen_cond_median", "phi_pullback_damped_gen_cond_max",
+    "phi_group_trust_scale_mean", "phi_group_trust_scale_min",
+    "phi_group_active_rows", "phi_group_chart_norm_max",
+)
+# History columns each training-time dashboard reads; run_artifacts._save_figures selects these.
+GRAD_NORM_DECOMPOSITION_COLUMNS = (
+    tuple(f"grad_norm_group_{group}" for group in PARAMETER_GROUPS)
+    + ("grad_norm_mu", "grad_norm_sigma", "grad_norm_phi"))
+OPTIMIZER_GEOMETRY_COLUMNS = (
+    _PULLBACK_COLUMNS
+    + tuple(f"param_norm_group_{group}" for group in PARAMETER_GROUPS)
+    + tuple(f"update_ratio_group_{group}" for group in PARAMETER_GROUPS)
+    + ("sigma_log_mean", "sigma_log_sd",
+       "weight_norm_mu", "weight_norm_sigma", "weight_norm_phi",
+       "grad_norm_mu", "grad_norm_sigma", "grad_norm_phi"))
+
+
+def _live(history: Mapping[str, object], key: str) -> bool:
+    r"""Whether ``history[key]`` exists and has at least one finite sample."""
+    return key in history and bool(np.isfinite(_np(history[key]).astype(float)).any())
+
+
+def _group_panels(
+    prefix:  str,
+    ylabel:  str,
+
+    *,
+    exclude: Sequence[str] = (),
+) -> List[Dict[str, object]]:
+    r"""Two log-y panels over the named groups of ``prefix``: per-type tables and context processing."""
+    panels = []
+    for title, groups in (("per-type tables", _TABLE_GROUPS),
+                          ("context processing", _CONTEXT_GROUPS)):
+        series = [(f"{prefix}{group}", _GROUP_LABELS[group], _GROUP_COLORS[group])
+                  for group in groups if group not in exclude]
+        panels.append({"title": title, "ylabel": ylabel, "logy": True, "series": series})
+    return panels
 
 
 @register_figure("grad_norm_decomposition")
 def plot_grad_norm_decomposition(
-    history: Dict,                       # step + any of: grad_norm_mu, grad_norm_sigma, grad_norm_phi
+    history: Dict,                       # step + grad_norm_group_<g> and/or legacy grad_norm_mu/_sigma/_phi
 
     *,
     path:    Optional[str] = None,
 ):
-    r"""M-STEP per-role pre-clip parameter-gradient L2 norms over training: the mu / sigma / phi
-    decomposition of the aggregate ``grad_norm`` curve.
+    r"""M-STEP pre-clip parameter-gradient L2 norms over training, by named parameter group.
 
-    Each optimizer group is tagged with a role in {mu, sigma, phi} (build_optimizer); the logged
-    norm aggregates the pre-clip grad over ALL groups of a role, so it isolates WHICH belief-component
-    family the LEARNING signal flows into regardless of which tables are live -- the aggregate
-    grad_norm.png sums them and hides that. Captured AFTER unscale_ but BEFORE clip in train_step, so
-    these are the true pre-clip magnitudes; the E-step inference analogue is
-    estep_grad_norm_decomposition.
+    With the ``grad_norm_group_<g>`` columns (``g`` in :data:`PARAMETER_GROUPS`) the per-type tables
+    (mu, log-variance and phi tables, positional frames, decode) and the context-processing
+    parameters (score maps, content maps, block MLP, normalization, other) are drawn in two panels.
+    A run that logged only the legacy per-ROLE columns falls back to those, labeled with what each
+    role aggregates: the 'mu' role holds every parameter outside the Sigma and phi tables (decode,
+    MLPs, relational maps, normalization), so it is not a mu-table gradient. Captured after
+    ``unscale_`` and before clipping in ``train_step``; the E-step analogue is
+    ``estep_grad_norm_decomposition``.
     """
+    if any(_live(history, f"grad_norm_group_{group}") for group in PARAMETER_GROUPS):
+        return _history_dashboard(
+            history, _group_panels("grad_norm_group_", r"pre-clip $\|\nabla L\|_2$"),
+            "M-step gradient norm by parameter group", path, ncols=2)
     spec = [
-        ("grad_norm_mu",    r"$\|\nabla_\mu L\|_2$",    _CB[0], "mu"),
-        ("grad_norm_sigma", r"$\|\nabla_\Sigma L\|_2$", _CB[1], "sigma"),
-        ("grad_norm_phi",   r"$\|\nabla_\phi L\|_2$",   _CB[2], "phi"),
+        ("grad_norm_mu",    _ROLE_LABELS["mu"],    _CB[0], "mu"),
+        ("grad_norm_sigma", _ROLE_LABELS["sigma"], _CB[1], "sigma"),
+        ("grad_norm_phi",   _ROLE_LABELS["phi"],   _CB[2], "phi"),
     ]
     return _grad_norm_decomp_fig(
-        history, spec, "M-step gradient norm decomposition",
+        history, spec, "M-step gradient norm by optimizer role",
         r"pre-clip $\|\nabla_\theta L\|_2$ (per role)", path)
 
 
@@ -1438,9 +1639,13 @@ def plot_estep_depth_sensitivity(
     *,
     path:   Optional[str] = None,
 ):
-    r"""Plot current-weight CE and free energy across enabled inference depths."""
+    r"""Plot current-weight CE and free energy across enabled inference depths.
+
+    Raises :class:`FigureSkipped` with the recorded reason when the probe is unavailable (a single
+    configured readout has no depth sweep); the JSON record keeps the reason.
+    """
     if record.get("available") is False:
-        return _unavailable_probe_figure(record, path)
+        raise FigureSkipped(str(record.get("reason", "inference-depth probe unavailable")))
     points = list(record.get("points", []))
     depths = np.asarray([point["depth"] for point in points], dtype=float)
     ce = np.asarray([point["ce"] for point in points], dtype=float)
@@ -1473,9 +1678,18 @@ def plot_estep_character(
     Left axis is the relative belief displacement, right axis the PAIR (attention) share of the
     fused ``mm_exact`` precision, whose complement is the prior residual. A flat displacement curve
     with a high residual share is one aggregation, not convergent inference.
+
+    Raises :class:`FigureSkipped` when the probe is unavailable or covers only the single configured
+    readout (``depth_sweep_available`` false): there are no E-step iterates, and the one point is
+    the layer-0 message-to-prior ratio, which ``diagnostics/residual_ratio.csv`` reports per layer and
+    per token.
     """
     if record.get("available") is False:
-        return _unavailable_probe_figure(record, path)
+        raise FigureSkipped(str(record.get("reason", "E-step character probe unavailable")))
+    if record.get("depth_sweep_available") is False:
+        raise FigureSkipped(
+            "single configured readout: no E-step iterates; the layer-0 message-to-prior ratio is "
+            "reported per layer by diagnostics/residual_ratio.csv")
     points = [p for p in record.get("points", []) if p.get("rel_displacement") is not None]
     fig, ax_move = plt.subplots(figsize=(5.6, 3.6))
     if not points:
@@ -1486,12 +1700,6 @@ def plot_estep_character(
     depths = np.asarray([p["belief_depth"] for p in points], dtype=float)
     displacement = np.asarray([p["rel_displacement"] for p in points], dtype=float)
     ax_move.plot(depths, displacement, "o-", color=_CB[0], label=r"$\|\Delta\mu\|/\|\mu_p\|$")
-    if record.get("depth_sweep_available") is False:
-        ax_move.set(xticks=depths, xlabel="configured readout steps",
-                    ylabel="relative mean displacement", title="Captured readout before block transforms")
-        ax_move.legend(frameon=False, fontsize=8)
-        fig.tight_layout()
-        return _save(fig, path)
     ax_share = ax_move.twinx()
     shares = np.asarray([p["pair_precision_share"] if p.get("pair_precision_share") is not None
                          else np.nan for p in points], dtype=float)
@@ -1669,7 +1877,10 @@ def _series_panel(
     r"""Plot each PRESENT, finite series of ``specs`` onto ``ax`` (a faint raw line under a rolling-mean
     trend for a long series, ``o-`` markers for a short one), masking non-finite samples per series so
     an eval-cadence column (NaN on non-eval rows) draws only on its eval steps. Returns the series count
-    actually drawn."""
+    actually drawn.
+
+    The rolling mean applies only above 50 finite samples (as in :func:`plot_trajectory`): an
+    eval-cadence series of ten points is drawn point by point, not smoothed through."""
     drawn = 0
     for key, label, color in specs:
         if key not in history:
@@ -1682,16 +1893,16 @@ def _series_panel(
         if not vv.size:
             continue
         drawn += 1
-        if vv.size > 8:
-            ax.plot(x, vv, lw=0.7, color=color, alpha=0.25)
-            ax.plot(x, _rolling_mean(vv, max(5, vv.size // 80)), lw=2.0, color=color,
+        if vv.size > 50:
+            ax.plot(x, vv, lw=0.6, color=color, alpha=0.25)
+            ax.plot(x, _rolling_mean(vv, max(5, vv.size // 80)), lw=1.5, color=color,
                     label=f"{label} ={vv[-1]:.3g}")
         else:
-            ax.plot(x, vv, "o-", ms=4, lw=1.6, color=color, label=f"{label} ={vv[-1]:.3g}")
+            ax.plot(x, vv, "o-", ms=2.5, lw=1.2, color=color, label=f"{label} ={vv[-1]:.3g}")
     if drawn:
         if logy:
             ax.set_yscale("log")
-        ax.legend(fontsize=7, frameon=False, loc="best")
+        ax.legend(fontsize=6, frameon=False, loc="best")
     return drawn
 
 
@@ -1702,58 +1913,164 @@ def _history_dashboard(
     path:     Optional[str],
 
     *,
-    ncols:    int = 3,
+    ncols:    int           = 3,
+    note:     Optional[str] = None,      # one-line figure footnote (e.g. what a legend role holds)
 ) -> object:
     r"""Small-multiples dashboard over training history: one mini-panel per group of commensurate
     columns. A panel whose every column is absent or all-NaN is dropped (so a run missing a metric
-    family simply shows fewer panels), and the grid self-sizes to the surviving panel count."""
-    step = _np(history["step"]).astype(float)
+    family simply shows fewer panels), and the grid self-sizes to the surviving panel count: at most
+    three columns, never more columns than live panels, and at most :data:`MAX_FIGURE_WIDTH_IN` wide
+    with text of at least :data:`MIN_TEXT_PT`.
+
+    A panel may carry its own ``"data"`` history (``{step, key: [...]}``) and ``"xlabel"``; it then
+    plots against that step axis instead of the shared one (an eval-cadence long-format table next
+    to log-cadence columns)."""
     live = []
     for p in panels:
+        source = p.get("data", history)
         present = [(k, lab, c) for (k, lab, c) in p["series"]
-                   if k in history and bool(np.isfinite(_np(history[k]).astype(float)).any())]
+                   if k in source and bool(np.isfinite(_np(source[k]).astype(float)).any())]
         if present:
             live.append({**p, "series": present})
-    if not live:
-        fig, ax = plt.subplots(figsize=(4.0, 3.0))
-        ax.text(0.5, 0.5, "no history columns present", ha="center", va="center")
-        ax.axis("off")
+    with _compact_style():
+        if not live:
+            fig, ax = plt.subplots(figsize=(3.6, 2.4))
+            ax.text(0.5, 0.5, "no history columns present", ha="center", va="center")
+            ax.axis("off")
+            return _save(fig, path)
+        ncols = max(1, min(int(ncols), 3, len(live)))
+        nrows = (len(live) + ncols - 1) // ncols
+        width = MAX_FIGURE_WIDTH_IN if ncols > 1 else MAX_FIGURE_WIDTH_IN / 2.0
+        fig, axes = plt.subplots(nrows, ncols, figsize=(width, 2.3 * nrows + 0.35), squeeze=False)
+        for i, p in enumerate(live):
+            ax = axes[i // ncols][i % ncols]
+            source = p.get("data", history)
+            panel_step = _np(source["step"]).astype(float)
+            _series_panel(ax, source, panel_step, p["series"], logy=bool(p.get("logy", False)))
+            ax.set(xlabel=p.get("xlabel", "training step"), ylabel=p["ylabel"], title=p["title"])
+            if panel_step.size and _set_finite_xlim(ax, panel_step):
+                _step_xaxis(ax)
+        for j in range(len(live), nrows * ncols):                # blank the unused grid cells
+            axes[j // ncols][j % ncols].axis("off")
+        fig.suptitle(suptitle)
+        if note:
+            fig.text(0.01, 0.005, note, fontsize=6, color="#444444", ha="left", va="bottom",
+                     wrap=True)
+            fig.tight_layout(rect=(0.0, 0.035, 1.0, 1.0))
+        else:
+            fig.tight_layout()
         return _save(fig, path)
-    nrows = (len(live) + ncols - 1) // ncols
-    fig, axes = plt.subplots(nrows, ncols, figsize=(4.3 * ncols, 3.1 * nrows), squeeze=False)
-    for i, p in enumerate(live):
-        ax = axes[i // ncols][i % ncols]
-        _series_panel(ax, history, step, p["series"], logy=bool(p.get("logy", False)))
-        ax.set(xlabel="training step", ylabel=p["ylabel"], title=p["title"])
-        if step.size and _set_finite_xlim(ax, step):
-            _step_xaxis(ax)
-    for j in range(len(live), nrows * ncols):                    # blank the unused grid cells
-        axes[j // ncols][j % ncols].axis("off")
-    fig.suptitle(suptitle, fontsize=12)
-    fig.tight_layout()
-    return _save(fig, path)
 
 
-@register_figure("readout_diagnostics")
-def plot_readout_diagnostics(history: Dict, *, path: Optional[str] = None) -> object:
-    """Plot captured routing, mean movement, and Gaussian conditioning with no shared-F claim."""
-    panels = [
+def _layer_colors(n_layers: int) -> List[str]:
+    r"""One sequential (viridis) color per layer, so depth reads as a gradient across curves."""
+    from matplotlib.colors import to_hex
+    return [to_hex(plt.cm.viridis(index / max(n_layers - 1, 1) * 0.9)) for index in range(n_layers)]
+
+
+def _long_rows(
+    table:   Mapping[str, object],
+    *values: str,
+) -> tuple:
+    r"""``(step, layer, *values)`` arrays of a long-format table, restricted to rows whose step and
+    layer are finite (``layer`` as int). Missing value columns come back as NaN."""
+    steps = _np(table["step"]).astype(float).reshape(-1)
+    layers = _np(table["layer"]).astype(float).reshape(-1)
+    keep = np.isfinite(steps) & np.isfinite(layers)
+    out = [steps[keep], layers[keep].astype(int)]
+    for name in values:
+        column = (_np(table[name]).astype(float).reshape(-1) if name in table
+                  else np.full(steps.size, np.nan))
+        out.append(column[keep])
+    return tuple(out)
+
+
+def _residual_ratio_training_panel(table: Mapping[str, object]) -> Optional[Dict[str, object]]:
+    r"""Dashboard panel of the per-layer median residual ratio over training.
+
+    ``table`` is ``diagnostics/residual_ratio.csv`` as columns (step, layer, q10, q50, q90, ...).
+    The plotted quantity is the per-token median over the fixed validation windows of
+    :math:`\lVert m_i\rVert/\lVert\mu_i\rVert`, the attention message relative to the layer's input
+    mean. Returns None when the table has no finite median.
+    """
+    steps, layers, q50 = _long_rows(table, "q50")
+    if not np.isfinite(q50).any():
+        return None
+    grid = np.unique(steps)
+    data: Dict[str, object] = {"step": grid}
+    series = []
+    colors = _layer_colors(int(layers.max()) + 1)
+    for layer in np.unique(layers):
+        column = np.full(grid.size, np.nan)
+        rows = layers == layer
+        for step_value, value in zip(steps[rows], q50[rows]):
+            column[np.searchsorted(grid, step_value)] = value
+        key = f"residual_ratio_q50_layer{int(layer)}"
+        data[key] = column
+        series.append((key, f"layer {int(layer)}", colors[int(layer)]))
+    return {"title": r"Residual ratio $\|m_i\|/\|\mu_i\|$ (token median)", "ylabel": "ratio",
+            "logy": True, "data": data, "series": series}
+
+
+def _readout_panels(
+    covariance_frozen: bool,
+    residual_panel:    Optional[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    r"""Panels shared by :func:`plot_readout_diagnostics` and the conditional per-layer figure.
+
+    The normalized residual-ratio panel replaces the unnormalized displacement
+    :math:`\lVert \mathrm{result}-\mu\rVert_F` when ``diagnostics/residual_ratio.csv`` exists; the
+    receiver-covariance panels are dropped when the covariance is frozen at encode (they would plot
+    the constant token-table row).
+    """
+    panels: List[Dict[str, object]] = [
         {"title": "Pre-update routing entropy", "ylabel": "nats", "series": [
             ("attn_entropy", "mean row entropy", _CB[0]),
             ("attn_entropy_min", "minimum scorable row", _CB[1])]},
-        {"title": "Readout mean displacement", "ylabel": "L2 norm", "series": [
-            ("relational_mean_displacement_norm", "captured readout", _CB[0])]},
-        {"title": "Receiver covariance rank", "ylabel": "effective rank", "series": [
-            ("effective_rank", "receiver bookkeeping", _CB[2])]},
-        {"title": "Receiver covariance conditioning", "ylabel": "condition number", "series": [
-            ("belief_cond_median", "median", _CB[3])]},
+    ]
+    if residual_panel is not None:
+        panels.append(residual_panel)
+    else:
+        panels.append({"title": r"Unnormalized displacement $\|\mathrm{out}-\mu\|_F$",
+                       "ylabel": "L2 norm (no denominator)", "series": [
+                           ("relational_mean_displacement_norm", "whole sequence", _CB[0])]})
+    if not covariance_frozen:
+        panels += [
+            {"title": "Receiver covariance rank", "ylabel": "effective rank", "series": [
+                ("effective_rank", "receiver bookkeeping", _CB[2])]},
+            {"title": "Receiver covariance conditioning", "ylabel": "condition number", "series": [
+                ("belief_cond_median", "median", _CB[3])]},
+        ]
+    panels += [
         {"title": "Comparison covariance conditioning", "ylabel": "condition number", "logy": True,
          "series": [("relational_projected_cov_max_condition", "maximum Q/K", _CB[1])]},
         {"title": "Comparison map smallest singular value", "ylabel": "singular value", "series": [
             ("relational_score_q_raw_min_singular_value", "Q", _CB[0]),
             ("relational_score_k_raw_min_singular_value", "K", _CB[1])]},
     ]
-    return _history_dashboard(history, panels, "Routing and readout diagnostics", path, ncols=2)
+    return panels
+
+
+@register_figure("readout_diagnostics")
+def plot_readout_diagnostics(
+    history: Dict,
+
+    *,
+    residual_ratio:    Optional[Mapping[str, object]] = None,   # diagnostics/residual_ratio.csv columns
+    covariance_frozen: bool                           = False,
+    path:              Optional[str]                  = None,
+) -> object:
+    r"""Plot captured routing, the residual ratio, and Gaussian conditioning with no shared-F claim.
+
+    With ``residual_ratio`` (the long-format table of :func:`read_long_table`) the displacement panel
+    is the per-layer token-median ratio :math:`\lVert m_i\rVert/\lVert\mu_i\rVert` over training;
+    without it the legacy unnormalized final-layer displacement is drawn and labeled as such.
+    ``covariance_frozen`` drops the receiver-covariance panels (constant on that route).
+    """
+    residual_panel = (_residual_ratio_training_panel(residual_ratio)
+                      if residual_ratio is not None else None)
+    return _history_dashboard(history, _readout_panels(covariance_frozen, residual_panel),
+                              "Routing and readout diagnostics", path, ncols=2)
 
 
 @register_figure("geometry_health")
@@ -1885,11 +2202,22 @@ def plot_validation_sanity(
     causal-mask sanity (future leakage, row-sum error), positional-vs-content structure, structured-head
     masses and head redundancy, and the held-out gauge / SPD / Fisher geometry (the more credible
     counterpart to the train-batch ``geometry_health`` figure). Each panel self-gates on column
-    presence; eval-cadence columns draw only on their eval steps."""
+    presence and only live panels are laid out; eval-cadence columns draw only on their eval steps.
+
+    The generalization gap is ``generalization_gap_fixed`` (validation CE minus the CE of a fixed
+    training-split sample under the evaluation protocol) when the run logged it; otherwise the
+    legacy single-training-batch ``generalization_gap``, titled as such because one batch makes it
+    swing by tenths of a nat between evaluations."""
     fisher_label = pub_label("val_fisher_trace_mean", family=family)
+    gap_ylabel = r"$\mathrm{CE}_{\mathrm{val}}-\mathrm{CE}_{\mathrm{train}}$"
+    gap_panel = (
+        {"title": "Generalization gap (fixed train sample)", "ylabel": gap_ylabel,
+         "series": [("generalization_gap_fixed", "fixed sample", _CB[0])]}
+        if _live(history, "generalization_gap_fixed") else
+        {"title": "Generalization gap (one training batch)", "ylabel": gap_ylabel,
+         "series": [("generalization_gap", "single batch", _CB[0])]})
     panels = [
-        {"title": "Generalization gap", "ylabel": r"$\mathrm{CE}_{\mathrm{val}}-\mathrm{CE}_{\mathrm{train}}$",
-         "series": [("generalization_gap", "gap", _CB[0])]},
+        gap_panel,
         {"title": "Positional loss", "ylabel": "CE (nats)", "series": [
             ("pos_loss_first_q", "first quartile", _CB[0]),
             ("pos_loss_last_q", "last quartile", _CB[1])]},
@@ -1921,32 +2249,80 @@ def plot_validation_sanity(
             ("val_phi_norm_mean", r"mean $\|\phi\|$", _CB[0]),
             ("val_phi_norm_std", r"std $\|\phi\|$", _CB[5])]},
     ]
-    return _history_dashboard(history, panels, "Held-out validation sanity", path, ncols=4)
+    return _history_dashboard(history, panels, "Held-out validation sanity", path, ncols=3)
+
+
+VALIDATION_SANITY_COLUMNS = (
+    "generalization_gap_fixed", "generalization_gap", "pos_loss_first_q", "pos_loss_last_q",
+    "pos_loss_ratio", "val_future_leakage", "val_row_sum_error", "val_pos_content_r2",
+    "val_prev_token_mass", "val_period_match_mass", "val_head_redundancy_js",
+    "val_holonomy_wilson", "val_cocycle_residual", "val_gauge_invariant_spread",
+    "val_belief_cond_p95", "val_fisher_trace_mean", "val_guard_sigma_floor_frac",
+    "val_guard_sigma_ceil_frac", "val_guard_energy_klmax_frac",
+    "val_phi_norm_mean", "val_phi_norm_std")
 
 
 @register_figure("optimizer_geometry")
 def plot_optimizer_geometry(
-    history: Dict,                       # pullback-group certificates + role weight and gradient norms
+    history: Dict,                       # step + per-group norms / update ratios, sigma_log moments, legacy role norms
 
     *,
     path:    Optional[str] = None,
 ):
-    r"""Pullback-group optimizer dashboard over training.
+    r"""Optimizer geometry over training: parameter norms and update scales by parameter group.
 
-    The phi panels show the fixed-coordinate cosine between the ridge-regularized chart direction and
-    processed covector, the reused damped generalized-condition certificate, the accepted right-factor
-    scale after BCH backtracking, active rows, and the accepted embedded chart norm. Role panels retain
-    parameter norms and ``||grad_theta|| / ||theta||``. The cosine is a reshaping diagnostic, not a
-    basis-invariant angle.
+    With the per-group columns, the parameter norms :math:`\lVert\theta_g\rVert_2` and the
+    update-to-weight ratios :math:`\lVert\Delta\theta_g\rVert/\lVert\theta_g\rVert` are drawn for the
+    per-type tables and the context-processing parameters. The log-variance table is excluded from
+    both: under weight decay its norm decays toward 0, so a ratio with that denominator rises for a
+    trivial reason. It is drawn instead as the mean and standard deviation of the stored
+    :math:`\log\sigma^2` entries (``sigma_log_mean``, ``sigma_log_sd``). A run with only the legacy
+    per-ROLE columns shows role norms and :math:`\lVert\nabla_\theta\rVert/\lVert\theta\rVert` for
+    the 'mu' and 'phi' roles with what each role aggregates in a figure note, and the norm of the
+    log-variance table labeled as a norm. The phi pullback-group panels (ridge-direction cosine,
+    damped generalized condition, accepted factor scale, active rows, accepted chart norm) appear
+    only when the run logged them, i.e. under the pullback-group phi update, and only then does the
+    title name that update. The cosine is a reshaping diagnostic, not a basis-invariant angle.
     """
     hist = dict(history)
-    for role in ("mu", "sigma", "phi"):                          # synthesize the gradient-to-weight ratio
-        gk, wk = f"grad_norm_{role}", f"weight_norm_{role}"
-        if gk in hist and wk in hist:
-            g = _np(hist[gk]).astype(float)
-            w = _np(hist[wk]).astype(float)
-            hist[f"grad_weight_ratio_{role}"] = np.where(w > 0, g / w, np.nan)
-    panels = [
+    panels: List[Dict[str, object]] = []
+    grouped = any(_live(hist, f"param_norm_group_{group}") or _live(hist, f"update_ratio_group_{group}")
+                  for group in PARAMETER_GROUPS)
+    if grouped:
+        norm_panels = _group_panels("param_norm_group_", r"$\|\theta_g\|_2$",
+                                    exclude=("sigma_log_embed",))
+        ratio_panels = _group_panels("update_ratio_group_", r"$\|\Delta\theta_g\|/\|\theta_g\|$",
+                                     exclude=("sigma_log_embed",))
+        for panel in norm_panels:
+            panel["title"] = f"Parameter norm, {panel['title']}"
+        for panel in ratio_panels:
+            panel["title"] = f"Update-to-weight ratio, {panel['title']}"
+        panels += norm_panels + ratio_panels
+    else:
+        for role in ("mu", "phi"):                               # synthesize the gradient-to-weight ratio
+            gk, wk = f"grad_norm_{role}", f"weight_norm_{role}"
+            if gk in hist and wk in hist:
+                g = _np(hist[gk]).astype(float)
+                w = _np(hist[wk]).astype(float)
+                hist[f"grad_weight_ratio_{role}"] = np.where(w > 0, g / w, np.nan)
+        panels += [
+            {"title": "Role parameter norm", "ylabel": r"$\|\theta\|_2$", "logy": True, "series": [
+                ("weight_norm_mu", "'mu' role", _CB[0]),
+                ("weight_norm_phi", "'phi' role", _CB[2])]},
+            {"title": "Gradient-to-weight ratio", "ylabel": r"$\|\nabla_\theta\|/\|\theta\|$",
+             "logy": True, "series": [
+                ("grad_weight_ratio_mu", "'mu' role", _CB[0]),
+                ("grad_weight_ratio_phi", "'phi' role", _CB[2])]},
+        ]
+    if _live(hist, "sigma_log_mean") or _live(hist, "sigma_log_sd"):
+        panels.append({"title": r"Stored log-variances $\log\sigma^2$", "ylabel": "value", "series": [
+            ("sigma_log_mean", "mean", _CB[1]),
+            ("sigma_log_sd", "standard deviation", _CB[3])]})
+    else:
+        panels.append({"title": r"Norm of the $\log\sigma^2$ table", "ylabel": r"$\|\log\sigma^2\|_2$",
+                       "logy": True, "series": [
+                           ("weight_norm_sigma", "decays toward 0 under weight decay", _CB[1])]})
+    panels += [
         {"title": "Ridge-direction cosine",
          "ylabel": r"$\cos(v_\phi,g_\phi)$",
          "series": [("phi_ridge_direction_cosine_mean", "ridge direction", _CB[0])]},
@@ -1961,17 +2337,369 @@ def plot_optimizer_geometry(
             ("phi_group_active_rows", "active", _CB[2])]},
         {"title": "Accepted chart norm", "ylabel": r"$\|\phi\|_F$", "series": [
             ("phi_group_chart_norm_max", "max", _CB[3])]},
-        {"title": "Role weight norms", "ylabel": r"$\|\theta\|_2$", "logy": True, "series": [
-            ("weight_norm_mu", r"$\mu$", _CB[0]),
-            ("weight_norm_sigma", r"$\Sigma$", _CB[1]),
-            ("weight_norm_phi", r"$\phi$", _CB[2])]},
-        {"title": "Gradient-to-weight ratio", "ylabel": r"$\|\nabla_\theta\|/\|\theta\|$", "logy": True,
-         "series": [
-            ("grad_weight_ratio_mu", r"$\mu$", _CB[0]),
-            ("grad_weight_ratio_sigma", r"$\Sigma$", _CB[1]),
-            ("grad_weight_ratio_phi", r"$\phi$", _CB[2])]},
     ]
-    return _history_dashboard(hist, panels, "Pullback-group optimizer geometry", path, ncols=2)
+    pullback = any(_live(hist, key) for key in _PULLBACK_COLUMNS)
+    title = ("Optimizer geometry with pullback-group phi update" if pullback
+             else "Optimizer geometry")
+    return _history_dashboard(hist, panels, title, path, ncols=2,
+                              note=None if grouped else _ROLE_NOTE)
+
+
+# ---------------------------------------------------------------------------
+# Figures of the eval-cadence diagnostics (metrics.csv M3 columns and the long-format
+# diagnostics/residual_ratio.csv and diagnostics/attention_stats.csv tables).
+# ---------------------------------------------------------------------------
+
+def _count_label(value: float, _pos: object = None) -> str:
+    r"""Compact count tick label: 4.9e8 -> '490M', 1.2e9 -> '1.2B', 2.4e4 -> '24k'."""
+    value = float(value)
+    for scale, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "k")):
+        if abs(value) >= scale:
+            scaled = value / scale
+            return f"{scaled:.0f}{suffix}" if abs(scaled) >= 10 else f"{scaled:.1f}{suffix}"
+    return f"{value:.0f}"
+
+
+def _interp_on_step(
+    step:   np.ndarray,
+    values: np.ndarray,
+    query:  np.ndarray,
+) -> np.ndarray:
+    r"""Evaluate a monotone per-row column (``tokens_seen``, ``wall_clock_s``) at ``query`` steps.
+
+    Linear interpolation over the finite ``(step, value)`` pairs, so an eval row that did not carry
+    the column is placed between its log-cadence neighbors; one finite pair scales proportionally
+    with the step. NaN when the column has no finite value.
+    """
+    keep = np.isfinite(step) & np.isfinite(values)
+    if not keep.any():
+        return np.full(query.shape, np.nan)
+    xs, ys = step[keep], values[keep]
+    order = np.argsort(xs)
+    xs, ys = xs[order], ys[order]
+    if xs.size == 1:
+        return query * (ys[0] / xs[0]) if xs[0] != 0 else np.full(query.shape, ys[0])
+    return np.interp(query, xs, ys, left=np.nan, right=np.nan)
+
+
+@register_figure("learning_curves")
+def plot_learning_curves(
+    history: Mapping[str, object],       # metrics.csv columns (read_metrics_columns)
+
+    *,
+    tokens_per_step: Optional[float] = None,   # fallback token axis for runs without tokens_seen
+    path:            Optional[str]   = None,
+):
+    r"""M3 learning curves: held-out and training-sample CE against training tokens and wall-clock.
+
+    Panel A: validation CE (``val_ce``) and, when logged, the CE of the fixed training-split sample
+    under the evaluation protocol (``train_sample_ce``) against cumulative training tokens
+    (``tokens_seen``; for older runs ``step x tokens_per_step`` when given, else the step, labeled as
+    such). Panel B: the same curves against wall-clock hours (``wall_clock_s``). Panel C: the fixed
+    generalization gap :math:`\mathrm{CE}_{\mathrm{val}}-\mathrm{CE}_{\mathrm{train\,sample}}`
+    (``generalization_gap_fixed``). Each panel appears only when its columns exist; completed corpus
+    passes (``corpus_pass``) are marked by dotted lines. Raises :class:`FigureSkipped` when no
+    finite ``val_ce`` exists.
+    """
+    step = _np(history["step"]).astype(float)
+
+    def _column(name: str) -> np.ndarray:
+        return (_np(history[name]).astype(float) if name in history
+                else np.full(step.shape, np.nan))
+
+    val = _column("val_ce")
+    eval_rows = np.isfinite(val) & np.isfinite(step)
+    if not eval_rows.any():
+        raise FigureSkipped("metrics.csv has no finite val_ce")
+    train = _column("train_sample_ce")
+    gap = _column("generalization_gap_fixed")
+    if _live(history, "tokens_seen"):
+        tokens = _interp_on_step(step, _column("tokens_seen"), step)
+        token_label = "training tokens"
+    elif tokens_per_step:
+        tokens = step * float(tokens_per_step)
+        token_label = "training tokens (step x tokens per step)"
+    else:
+        tokens, token_label = step, "training step"
+    hours = _interp_on_step(step, _column("wall_clock_s"), step) / 3600.0
+    pass_steps = np.array([], dtype=float)
+    corpus_pass = _column("corpus_pass")
+    finite_pass = np.isfinite(corpus_pass) & np.isfinite(step)
+    if finite_pass.any():
+        passes, pass_step = np.floor(corpus_pass[finite_pass]), step[finite_pass]
+        pass_steps = pass_step[1:][passes[1:] > passes[:-1]]
+
+    panels = [("tokens", tokens, token_label)]
+    if np.isfinite(hours[eval_rows]).any():
+        panels.append(("hours", hours, "wall-clock hours"))
+    has_gap = bool(np.isfinite(gap).any())
+    with _compact_style():
+        n_panels = len(panels) + (1 if has_gap else 0)
+        fig, axes = plt.subplots(1, n_panels, squeeze=False,
+                                 figsize=(MAX_FIGURE_WIDTH_IN if n_panels > 1 else 3.6, 2.6))
+        axes = axes[0]
+
+        def _passes(ax, x_of_step: np.ndarray) -> None:
+            known = np.isfinite(x_of_step) & np.isfinite(step)
+            if not known.any():
+                return
+            for boundary in pass_steps:
+                x = np.interp(boundary, step[known], x_of_step[known])
+                ax.axvline(x, color="#777777", ls=":", lw=0.7, alpha=0.6, zorder=0)
+
+        for ax, (kind, x_axis, xlabel) in zip(axes, panels):
+            keep = eval_rows & np.isfinite(x_axis)
+            ax.plot(x_axis[keep], val[keep], "o-", ms=2.5, lw=1.2, color=_CB[0],
+                    label=f"validation ={val[keep][-1]:.3f}" if keep.any() else "validation")
+            train_rows = np.isfinite(train) & np.isfinite(x_axis)
+            if train_rows.any():
+                ax.plot(x_axis[train_rows], train[train_rows], "s--", ms=2.5, lw=1.2,
+                        color=_CB[1], label=f"fixed training sample ={train[train_rows][-1]:.3f}")
+            _passes(ax, x_axis)
+            ax.set(xlabel=xlabel, ylabel="CE (nats/token)",
+                   title="CE vs training tokens" if kind == "tokens" else "CE vs wall-clock time")
+            if kind == "tokens" and token_label != "training step":
+                ax.xaxis.set_major_formatter(FuncFormatter(_count_label))
+            elif kind == "tokens":
+                _step_xaxis(ax)
+            ax.legend(frameon=False, loc="upper right")
+        if has_gap:
+            ax = axes[-1]
+            keep = np.isfinite(gap) & np.isfinite(tokens)
+            ax.plot(tokens[keep], gap[keep], "o-", ms=2.5, lw=1.2, color=_CB[2],
+                    label=f"gap ={gap[keep][-1]:.3f}" if keep.any() else "gap")
+            ax.axhline(0.0, color="#444444", lw=0.7, ls="--")
+            _passes(ax, tokens)
+            ax.set(xlabel=token_label, ylabel=r"$\mathrm{CE}_{\mathrm{val}}-\mathrm{CE}_{\mathrm{train}}$",
+                   title="Generalization gap (fixed sample)")
+            if token_label != "training step":
+                ax.xaxis.set_major_formatter(FuncFormatter(_count_label))
+            else:
+                _step_xaxis(ax)
+            ax.legend(frameon=False, loc="best")
+        fig.suptitle("Learning curves" + (" (dotted: completed corpus passes)" if pass_steps.size
+                                          else ""))
+        fig.tight_layout()
+        return _save(fig, path)
+
+
+_ATTENTION_STATS = (
+    ("entropy_norm", r"normalized entropy $H(\beta_{i\cdot})/\log n_i$", (0.0, 1.0)),
+    ("distance_mean", r"mean distance $\sum_j\beta_{ij}|i-j|$ (tokens)", None),
+    ("self_weight", r"self-weight $\beta_{ii}$", (0.0, 1.0)),
+    ("prior_overlap", r"prior overlap $\sum_j\min(\beta_{ij},\beta^{\mathrm{prior}}_{ij})$", (0.0, 1.0)),
+)
+
+
+def _layer_head_grid(
+    table: Mapping[str, object],
+    name:  str,
+    rows:  np.ndarray,                   # boolean row mask (one evaluation step)
+) -> np.ndarray:
+    r"""The (L, H) matrix of statistic ``name`` over the masked rows (NaN where absent)."""
+    layers = _np(table["layer"]).astype(float)[rows].astype(int)
+    heads = _np(table["head"]).astype(float)[rows].astype(int)
+    values = _np(table[name]).astype(float)[rows]
+    grid = np.full((int(layers.max()) + 1, int(heads.max()) + 1), np.nan)
+    grid[layers, heads] = values
+    return grid
+
+
+@register_figure("attention_stats")
+def plot_attention_stats(
+    table: Mapping[str, object],         # diagnostics/attention_stats.csv columns
+
+    *,
+    step:  Optional[float] = None,       # evaluation step to show (default: the last one)
+    path:  Optional[str]   = None,
+):
+    r"""Per-layer, per-head attention statistics at one evaluation (S2 panel B), as heatmaps.
+
+    From ``diagnostics/attention_stats.csv`` (mean over causal query rows with at least two sources,
+    on the fixed validation windows): the normalized entropy :math:`H(\beta_{i\cdot})/\log n_i`, the
+    mean attention distance :math:`\sum_j\beta_{ij}|i-j|`, the self-weight :math:`\beta_{ii}`, and the
+    overlap :math:`\sum_j\min(\beta_{ij},\beta^{\mathrm{prior}}_{ij})` with the attention of the
+    log-prior alone (1 means the prior explains the pattern). Bounded statistics share the [0, 1]
+    color range so layers and runs compare directly.
+    """
+    steps = _np(table["step"]).astype(float)
+    finite_steps = steps[np.isfinite(steps)]
+    if not finite_steps.size:
+        raise FigureSkipped("attention_stats.csv has no rows")
+    shown = float(finite_steps.max()) if step is None else float(step)
+    rows = (steps == shown) & np.isfinite(_np(table["layer"]).astype(float)) \
+        & np.isfinite(_np(table["head"]).astype(float))
+    stats = [spec for spec in _ATTENTION_STATS
+             if spec[0] in table and np.isfinite(_np(table[spec[0]]).astype(float)[rows]).any()]
+    if not stats:
+        raise FigureSkipped(f"attention_stats.csv has no finite statistic at step {shown:.0f}")
+    grids = [(spec, _layer_head_grid(table, spec[0], rows)) for spec in stats]
+    n_layers, n_heads = grids[0][1].shape
+    annotate = n_layers * n_heads <= 48
+    n_cols = 2 if len(grids) > 1 else 1
+    n_rows_fig = (len(grids) + n_cols - 1) // n_cols
+    panel_height = max(1.7, 0.28 * n_layers + 0.9)
+    with _compact_style():
+        fig, axes = plt.subplots(n_rows_fig, n_cols, squeeze=False,
+                                 figsize=(MAX_FIGURE_WIDTH_IN if n_cols > 1 else 3.6,
+                                          panel_height * n_rows_fig + 0.4))
+        for index, ((name, label, bounds), grid) in enumerate(grids):
+            ax = axes[index // n_cols][index % n_cols]
+            ax.grid(False)
+            vmin, vmax = bounds if bounds is not None else (np.nanmin(grid), np.nanmax(grid))
+            image = ax.imshow(grid, cmap="viridis", vmin=vmin, vmax=vmax, aspect="auto")
+            fig.colorbar(image, ax=ax, shrink=0.85, pad=0.02)
+            ax.set_title(label)
+            ax.set(xticks=range(n_heads), yticks=range(n_layers), xlabel="head", ylabel="layer")
+            if annotate:
+                span = (vmax - vmin) or 1.0
+                for layer in range(n_layers):
+                    for head in range(n_heads):
+                        value = grid[layer, head]
+                        if np.isfinite(value):
+                            ax.text(head, layer, f"{value:.2f}" if abs(value) < 100 else f"{value:.0f}",
+                                    ha="center", va="center", fontsize=6,
+                                    color="white" if (value - vmin) / span < 0.6 else "black")
+        for index in range(len(grids), n_rows_fig * n_cols):
+            axes[index // n_cols][index % n_cols].axis("off")
+        n_query = _np(table["n_rows"]).astype(float)[rows] if "n_rows" in table else np.array([])
+        suffix = (f", {int(np.nanmedian(n_query)):,} query rows per head"
+                  if n_query.size and np.isfinite(n_query).any() else "")
+        fig.suptitle(f"Attention statistics by layer and head (step {shown:,.0f}{suffix})")
+        fig.tight_layout()
+        return _save(fig, path)
+
+
+@register_figure("attention_stats_training")
+def plot_attention_stats_training(
+    table: Mapping[str, object],         # diagnostics/attention_stats.csv columns
+
+    *,
+    path:  Optional[str] = None,
+):
+    r"""The attention statistics of :func:`plot_attention_stats` over training.
+
+    For each statistic and layer, the line is the mean over heads and the band spans the heads'
+    minimum and maximum, so both the layer trend and the spread between heads are visible. Raises
+    :class:`FigureSkipped` with fewer than two evaluation steps.
+    """
+    steps = _np(table["step"]).astype(float)
+    grid_steps = np.unique(steps[np.isfinite(steps)])
+    if grid_steps.size < 2:
+        raise FigureSkipped("attention_stats.csv has fewer than two evaluation steps")
+    stats = [spec for spec in _ATTENTION_STATS
+             if spec[0] in table and np.isfinite(_np(table[spec[0]]).astype(float)).any()]
+    if not stats:
+        raise FigureSkipped("attention_stats.csv has no finite statistic")
+    layers = _np(table["layer"]).astype(float)
+    layer_ids = np.unique(layers[np.isfinite(layers)]).astype(int)
+    colors = _layer_colors(int(layer_ids.max()) + 1)
+    n_cols = 2 if len(stats) > 1 else 1
+    n_rows_fig = (len(stats) + n_cols - 1) // n_cols
+    with _compact_style():
+        fig, axes = plt.subplots(n_rows_fig, n_cols, squeeze=False,
+                                 figsize=(MAX_FIGURE_WIDTH_IN if n_cols > 1 else 3.6,
+                                          2.2 * n_rows_fig + 0.4))
+        for index, (name, label, bounds) in enumerate(stats):
+            ax = axes[index // n_cols][index % n_cols]
+            values = _np(table[name]).astype(float)
+            for layer in layer_ids:
+                mean, low, high = [], [], []
+                for step_value in grid_steps:
+                    chunk = values[(steps == step_value) & (layers == layer)]
+                    chunk = chunk[np.isfinite(chunk)]
+                    mean.append(chunk.mean() if chunk.size else np.nan)
+                    low.append(chunk.min() if chunk.size else np.nan)
+                    high.append(chunk.max() if chunk.size else np.nan)
+                ax.plot(grid_steps, mean, "o-", ms=2, lw=1.1, color=colors[layer],
+                        label=f"layer {layer}")
+                ax.fill_between(grid_steps, low, high, color=colors[layer], alpha=0.15, lw=0)
+            if bounds is not None:
+                ax.set_ylim(*bounds)
+            ax.set(xlabel="training step", title=label)
+            if _set_finite_xlim(ax, grid_steps):
+                _step_xaxis(ax)
+            if index == 0:
+                ax.legend(frameon=False, loc="best", ncol=2 if layer_ids.size > 4 else 1)
+        for index in range(len(stats), n_rows_fig * n_cols):
+            axes[index // n_cols][index % n_cols].axis("off")
+        fig.suptitle("Attention statistics over training (line: head mean; band: head range)")
+        fig.tight_layout()
+        return _save(fig, path)
+
+
+@register_figure("residual_ratio")
+def plot_residual_ratio(
+    table: Mapping[str, object],         # diagnostics/residual_ratio.csv columns
+
+    *,
+    path:  Optional[str] = None,
+):
+    r"""Residual ratio per layer (S1 panel A) and the normalization change when the residual is removed.
+
+    Panel A: the token quantiles of :math:`r_i=\lVert m_i\rVert/\lVert\mu_i\rVert`, the attention
+    message :math:`m_i` (the layer's attention output minus its input mean) relative to the input
+    mean :math:`\mu_i`, on the fixed validation windows: the median per layer with a 10th to 90th
+    percentile band over training, or with error bars at a single evaluation. A ratio far above 1
+    means the residual term :math:`\mu_i` is small next to the message. Panel B: the median relative
+    change :math:`\lVert\mathrm{LN}(\mu_i+m_i)-\mathrm{LN}(m_i)\rVert/\lVert\mathrm{LN}(\mu_i+m_i)\rVert`
+    of the block normalization output when the residual is removed; omitted when every value is NaN
+    (no block normalization).
+    """
+    steps, layers, q10, q50, q90, ln_change = _long_rows(
+        table, "q10", "q50", "q90", "ln_rel_change_q50")
+    if not np.isfinite(q50).any():
+        raise FigureSkipped("residual_ratio.csv has no finite median")
+    layer_ids = np.unique(layers)
+    colors = _layer_colors(int(layer_ids.max()) + 1)
+    grid_steps = np.unique(steps)
+    has_ln = bool(np.isfinite(ln_change).any())
+    with _compact_style():
+        n_panels = 2 if has_ln else 1
+        fig, axes = plt.subplots(1, n_panels, squeeze=False,
+                                 figsize=(MAX_FIGURE_WIDTH_IN if n_panels > 1 else 3.6, 2.7))
+        axes = axes[0]
+        if grid_steps.size >= 2:
+            for layer in layer_ids:
+                rows = layers == layer
+                order = np.argsort(steps[rows])
+                x = steps[rows][order]
+                axes[0].plot(x, q50[rows][order], "o-", ms=2, lw=1.1, color=colors[layer],
+                             label=f"layer {layer}")
+                axes[0].fill_between(x, q10[rows][order], q90[rows][order], color=colors[layer],
+                                     alpha=0.15, lw=0)
+                if has_ln:
+                    axes[1].plot(x, ln_change[rows][order], "o-", ms=2, lw=1.1,
+                                 color=colors[layer], label=f"layer {layer}")
+            for ax in axes:
+                ax.set_xlabel("training step")
+                if _set_finite_xlim(ax, grid_steps):
+                    _step_xaxis(ax)
+            axes[0].set_title(r"$\|m_i\|/\|\mu_i\|$: median, 10-90% band")
+        else:
+            order = np.argsort(layers)
+            x, mid = layers[order], q50[order]
+            lower = np.clip(mid - q10[order], 0, None)
+            upper = np.clip(q90[order] - mid, 0, None)
+            axes[0].errorbar(x, mid, yerr=np.vstack([lower, upper]), fmt="o", ms=3, capsize=2,
+                             color=_CB[0], label="median (bars: 10-90%)")
+            if has_ln:
+                axes[1].plot(x, ln_change[order], "o", ms=3, color=_CB[1])
+            for ax in axes:
+                ax.set(xlabel="layer", xticks=layer_ids)
+            axes[0].set_title(rf"$\|m_i\|/\|\mu_i\|$ at step {grid_steps[0]:,.0f}")
+        axes[0].set_yscale("log")
+        axes[0].set_ylabel("ratio (log)")
+        axes[0].legend(frameon=False, loc="best", ncol=2 if layer_ids.size > 4 else 1)
+        if has_ln:
+            positive = ln_change[np.isfinite(ln_change)]
+            if (positive > 0).all():
+                axes[1].set_yscale("log")
+            axes[1].set_ylabel("relative change")
+            axes[1].set_title(r"normalization output change without $\mu_i$ (median)")
+        fig.suptitle("Residual ratio per layer on the fixed validation windows")
+        fig.tight_layout()
+        return _save(fig, path)
 
 
 @register_figure("ln3_symmetry_breaking")
@@ -2163,41 +2891,88 @@ def plot_gauge_equivariance(
     return _save(fig, path)
 
 
-@register_figure("gauge_head_specialization")
-def plot_gauge_head_specialization(
-    per_head:     Dict,                  # per_head_gauge_invariants output: logdet (M,H), anisotropy (M,H)
-    head_entropy: Optional[object] = None,  # (H,) per-head mean attention entropy
+_MAP_ORDER = ("S_Q", "S_K", "T", "O")
+_MAP_LABELS = {"S_Q": r"$S_{Q,h}$", "S_K": r"$S_{K,h}$", "T": r"$T_h$", "O": r"$O_h$"}
+
+
+@register_figure("head_block_norms")
+def plot_head_block_norms(
+    norms: Mapping[int, Mapping[str, object]],   # layer -> {"S_Q","S_K","T","O"} -> (H, B) Frobenius norms
 
     *,
-    path:         Optional[str] = None,
+    path:  Optional[str] = None,
 ):
-    r"""F7: per-head gauge specialization and its link to attention structure (FINAL layer).
+    r"""Head x frame-block energy of the comparison and content maps, per layer (S2 panel A).
 
-    The gauge frame here is the converged FINAL-block frame (``cstate["exp_phi"]``), so "head" is the
-    per-irrep-block index of that single layer, not a per-layer head; pair it with the FINAL layer's
-    per-head entropy (see report.py) so both axes describe the same depth. Per-LAYER gauge action is
-    in the ``per_layer_diagnostics`` figure. Panel A: per-head violins of the group-correct gauge
-    invariant (log-volume). Panel B: per-head violins of the shear/anisotropy, or -- when
-    ``head_entropy`` is given -- a scatter of per-head gauge magnitude vs attention row entropy.
+    ``norms`` is :func:`vfe3.posthoc.maps.head_block_norms` output: for each layer and each map
+    :math:`M\in\{S_{Q,h},S_{K,h},T_h,O_h\}`, the :math:`H\times B` matrix of Frobenius norms
+    :math:`n_{hb}=\lVert M_h|_b\rVert_F` of head :math:`h`'s map restricted to frame block
+    :math:`b`'s coordinates. Each cell shows the block's share of the head's energy,
+
+    .. math:: s_{hb}=\frac{n_{hb}^2}{\sum_{b'}n_{hb'}^2},
+
+    so every row sums to one and a head that reads all blocks evenly has :math:`s_{hb}=1/B`. When
+    :math:`H=B` the panel title gives the range of the diagonal (own-block) shares, which is the
+    pairing the retired ``gauge_head_specialization`` figure assumed without measuring it.
     """
-    logdet = _np(per_head["logdet"])                             # (M, H) -- H = irrep blocks of the FINAL frame
-    aniso = _np(per_head["anisotropy"])
-    h = logdet.shape[1]
-    fig, axes = plt.subplots(1, 2, figsize=(9, 3.8))
-    axes[0].violinplot([logdet[:, i] for i in range(h)], showmeans=True)
-    axes[0].axhline(0.0, color="#888888", ls=":", lw=1)
-    axes[0].set(xticks=range(1, h + 1), xticklabels=[f"h{i}" for i in range(h)],
-                ylabel=r"$\log|\det\exp\phi^{(h)}|$", title="Per-head gauge volume (final layer)")
-    if head_entropy is not None:
-        axes[1].scatter(np.abs(logdet).mean(0), _np(head_entropy), s=40, color=_CB[0])
-        axes[1].set(xlabel="mean |gauge volume|", ylabel="attention row entropy (nats)",
-                    title="Gauge action vs attention (final layer)")
-    else:
-        axes[1].violinplot([aniso[:, i] for i in range(h)], showmeans=True)
-        axes[1].set(xticks=range(1, h + 1), xticklabels=[f"h{i}" for i in range(h)],
-                    ylabel=r"$s_{\max}/s_{\min}$", title="Per-head shear (final layer)")
-    fig.tight_layout()
-    return _save(fig, path)
+    layers = sorted(int(layer) for layer in norms)
+    if not layers:
+        raise FigureSkipped("head_block_norms returned no layers")
+    maps = [name for name in _MAP_ORDER if any(name in norms[layer] for layer in layers)]
+    if not maps:
+        raise FigureSkipped("head_block_norms returned none of S_Q, S_K, T, O")
+    shares: Dict[tuple, np.ndarray] = {}
+    for layer in layers:
+        for name in maps:
+            if name not in norms[layer]:
+                continue
+            energy = np.square(_np(norms[layer][name]).astype(float))       # (H, B)
+            total = energy.sum(axis=1, keepdims=True)
+            shares[(layer, name)] = np.divide(energy, total, out=np.full_like(energy, np.nan),
+                                              where=total > 0)
+    n_heads, n_blocks = next(iter(shares.values())).shape
+    finite_max = [float(np.nanmax(value)) for value in shares.values() if np.isfinite(value).any()]
+    vmax = max(finite_max) if finite_max else 1.0
+    annotate = n_heads * n_blocks <= 36
+    with _compact_style():
+        fig, axes = plt.subplots(len(layers), len(maps), squeeze=False,
+                                 figsize=(MAX_FIGURE_WIDTH_IN, 1.35 * len(layers) + 1.0))
+        image = None
+        for row, layer in enumerate(layers):
+            for col, name in enumerate(maps):
+                ax = axes[row][col]
+                ax.grid(False)
+                if (layer, name) not in shares:
+                    ax.axis("off")
+                    continue
+                share = shares[(layer, name)]
+                image = ax.imshow(share, cmap="viridis", vmin=0.0, vmax=vmax, aspect="auto")
+                title = f"layer {layer}, {_MAP_LABELS[name]}"
+                if share.shape[0] == share.shape[1]:
+                    diagonal = np.diag(share)
+                    title += f" (own {np.nanmin(diagonal):.2f}-{np.nanmax(diagonal):.2f})"
+                ax.set_title(title, fontsize=6.5)
+                ax.set_xticks(range(share.shape[1]))
+                ax.set_yticks(range(share.shape[0]))
+                ax.tick_params(labelsize=6, length=1.5)
+                if row == len(layers) - 1:
+                    ax.set_xlabel("frame block b")
+                if col == 0:
+                    ax.set_ylabel("head h")
+                if annotate:
+                    for h in range(share.shape[0]):
+                        for b in range(share.shape[1]):
+                            if np.isfinite(share[h, b]):
+                                ax.text(b, h, f"{share[h, b]:.2f}", ha="center", va="center",
+                                        fontsize=6, color="white" if share[h, b] < 0.6 * vmax
+                                        else "black")
+        fig.suptitle(f"Head x frame-block energy share of the interface maps "
+                     f"(row sums 1; uniform 1/B = {1.0 / n_blocks:.2f})")
+        fig.tight_layout()
+        if image is not None:
+            fig.colorbar(image, ax=axes.ravel().tolist(), shrink=0.6, pad=0.02,
+                         label=r"$\|M_h|_b\|_F^2/\|M_h\|_F^2$")
+        return _save(fig, path)
 
 
 @register_figure("attention_structure")
@@ -2259,7 +3034,9 @@ def plot_per_layer_diagnostics(
     per_layer: Dict,                     # diagnostics_per_layer output: each value an (L,) sequence
 
     *,
-    path:      Optional[str] = None,
+    residual_ratio:    Optional[Mapping[str, object]] = None,   # diagnostics/residual_ratio.csv columns
+    covariance_frozen: bool                           = False,
+    path:              Optional[str]                  = None,
 ):
     r"""F8b: per-LAYER (inference-depth) diagnostics -- the depth axis the stack collapses.
 
@@ -2270,64 +3047,89 @@ def plot_per_layer_diagnostics(
     entropy, total) vs layer. Panel B: holonomy / Wilson curvature vs layer (~0 on the flat cocycle).
     Panel C: gauge action (trace spread, group-invariant spread, mean ``||phi||``) vs layer. Panel D:
     belief geometry (effective rank, attention entropy; condition number on a twin log axis) vs layer.
+
+    On the conditional (readout) route the panels are those of :func:`plot_readout_diagnostics`
+    with layer on the x axis. With ``residual_ratio`` the unnormalized displacement panel is replaced
+    by the 10th, 50th and 90th token percentiles of :math:`\lVert m_i\rVert/\lVert\mu_i\rVert` per
+    layer at the table's last evaluation step; ``covariance_frozen`` drops the constant
+    receiver-covariance panels.
     """
     if any(k.endswith("_semantics") for k in per_layer):
         n_layers = len(per_layer["attn_entropy"])
-        fig = plot_readout_diagnostics({**per_layer, "step": np.arange(n_layers)})
-        for ax in fig.axes:
-            if ax.axison:
-                ax.set(xlabel="layer", xticks=np.arange(n_layers))
-        fig.suptitle("Captured routing and readout by layer")
-        fig.tight_layout()
-        return _save(fig, path)
+        residual_panel = None
+        if residual_ratio is not None:
+            steps, layers, q10, q50, q90 = _long_rows(residual_ratio, "q10", "q50", "q90")
+            if steps.size and np.isfinite(q50).any():
+                last = steps == steps.max()
+                order = np.argsort(layers[last])
+                data: Dict[str, object] = {"step": layers[last][order].astype(float)}
+                for name, values in (("q10", q10), ("q50", q50), ("q90", q90)):
+                    data[f"residual_ratio_{name}"] = values[last][order]
+                residual_panel = {
+                    "title": rf"Residual ratio $\|m_i\|/\|\mu_i\|$ (step {int(steps.max()):,})",
+                    "ylabel": "ratio", "logy": True, "data": data, "series": [
+                        ("residual_ratio_q90", "90th percentile", _CB[3]),
+                        ("residual_ratio_q50", "median", _CB[0]),
+                        ("residual_ratio_q10", "10th percentile", _CB[5])]}
+        fig = _history_dashboard({**per_layer, "step": np.arange(n_layers)},
+                                 _readout_panels(covariance_frozen, residual_panel),
+                                 "Captured routing and readout by layer", None, ncols=2)
+        with _compact_style():
+            for ax in fig.axes:
+                if ax.axison:
+                    ax.set(xlabel="layer", xticks=np.arange(n_layers))
+                    ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _pos: f"{v:.0f}"))
+            fig.tight_layout()
+            return _save(fig, path)
     g = lambda k: _np(per_layer[k]).reshape(-1)
     L = g("self_coupling").size if "self_coupling" in per_layer else g(next(iter(per_layer))).size
     x = np.arange(L)
     _m = "o-" if L > 1 else "o"                                  # a single layer has no line to draw
-    fig, axes = plt.subplots(2, 2, figsize=(10.5, 7.2))
-    for k, c, lab in (("self_coupling", _CB[0], r"self $\alpha\,$KL$(q\|p)$"),
-                      ("belief_coupling", _CB[1], r"belief $\sum\beta\,$KL"),
-                      ("attention_entropy", _CB[2], "attn entropy term"),
-                      ("total", _CB[7], "total (belief F)")):
-        if k in per_layer:
-            axes[0][0].plot(x, g(k), _m, color=c, lw=1.4, label=lab)
-    axes[0][0].set(xticks=x, xlabel="layer", ylabel="nats", title="Free-energy budget by layer")
-    axes[0][0].legend(fontsize=8, frameon=False)
-    for k, c, lab in (("holonomy_deviation", _CB[0], r"$\|H-I\|_F$ (frame-dependent)"),
-                      ("holonomy_wilson", _CB[1], r"Wilson $1-\mathrm{Re}\,\mathrm{Tr}\,H/K$ (gauge-invariant)")):
-        if k in per_layer:
-            axes[0][1].plot(x, g(k), _m, color=c, lw=1.4, label=lab)
-    axes[0][1].set(xticks=x, xlabel="layer", ylabel="deviation", title="Holonomy / curvature by layer")
-    axes[0][1].legend(fontsize=8, frameon=False)
-    for k, c, lab in (("gauge_trace_spread", _CB[0], "tr spread"),
-                      ("gauge_invariant_spread", _CB[1], "class-function spread"),
-                      ("phi_norm_mean", _CB[2], r"mean $\|\phi\|$")):
-        if k in per_layer:
-            axes[1][0].plot(x, g(k), _m, color=c, lw=1.4, label=lab)
-    axes[1][0].set(xticks=x, xlabel="layer", ylabel="magnitude", title="Gauge action by layer")
-    axes[1][0].legend(fontsize=8, frameon=False)
-    ax = axes[1][1]
-    if "effective_rank" in per_layer:
-        ax.plot(x, g("effective_rank"), _m, color=_CB[0], lw=1.4, label="effective rank")
-    if "attn_entropy" in per_layer:
-        ax.plot(x, g("attn_entropy"), ("s--" if L > 1 else "s"), color=_CB[2], lw=1.2, label="attn entropy (nats)")
-    ax.set(xticks=x, xlabel="layer", ylabel="rank / nats", title="Belief geometry by layer")
-    handles, labels = ax.get_legend_handles_labels()
-    if "belief_cond_median" in per_layer:
-        axr = ax.twinx()
-        # Name the axis in the label: this marker lives on the right (log) condition-number axis, not
-        # the left rank/nats axis -- without it the lone triangle reads as a second entropy series.
-        axr.plot(x, g("belief_cond_median"), ("^:" if L > 1 else "^"), color=_CB[1], lw=1.2,
-                 label="cond median (right, log)")
-        axr.set_ylabel("condition number")
-        axr.set_yscale("log")
-        axr.grid(False)
-        h2, l2 = axr.get_legend_handles_labels()
-        handles += h2
-        labels += l2
-    ax.legend(handles, labels, fontsize=8, frameon=False, loc="upper left")
-    fig.tight_layout()
-    return _save(fig, path)
+    with _compact_style():
+        fig, axes = plt.subplots(2, 2, figsize=(MAX_FIGURE_WIDTH_IN, 5.4))
+        for k, c, lab in (("self_coupling", _CB[0], r"self $\alpha\,$KL$(q\|p)$"),
+                          ("belief_coupling", _CB[1], r"belief $\sum\beta\,$KL"),
+                          ("attention_entropy", _CB[2], "attn entropy term"),
+                          ("total", _CB[7], "total (belief F)")):
+            if k in per_layer:
+                axes[0][0].plot(x, g(k), _m, color=c, lw=1.4, label=lab)
+        axes[0][0].set(xticks=x, xlabel="layer", ylabel="nats", title="Free-energy budget by layer")
+        axes[0][0].legend(fontsize=6, frameon=False)
+        for k, c, lab in (("holonomy_deviation", _CB[0], r"$\|H-I\|_F$ (frame-dependent)"),
+                          ("holonomy_wilson", _CB[1], r"Wilson $1-\mathrm{Re}\,\mathrm{Tr}\,H/K$ (gauge-invariant)")):
+            if k in per_layer:
+                axes[0][1].plot(x, g(k), _m, color=c, lw=1.4, label=lab)
+        axes[0][1].set(xticks=x, xlabel="layer", ylabel="deviation", title="Holonomy / curvature by layer")
+        axes[0][1].legend(fontsize=6, frameon=False)
+        for k, c, lab in (("gauge_trace_spread", _CB[0], "tr spread"),
+                          ("gauge_invariant_spread", _CB[1], "class-function spread"),
+                          ("phi_norm_mean", _CB[2], r"mean $\|\phi\|$")):
+            if k in per_layer:
+                axes[1][0].plot(x, g(k), _m, color=c, lw=1.4, label=lab)
+        axes[1][0].set(xticks=x, xlabel="layer", ylabel="magnitude", title="Gauge action by layer")
+        axes[1][0].legend(fontsize=6, frameon=False)
+        ax = axes[1][1]
+        if "effective_rank" in per_layer:
+            ax.plot(x, g("effective_rank"), _m, color=_CB[0], lw=1.4, label="effective rank")
+        if "attn_entropy" in per_layer:
+            ax.plot(x, g("attn_entropy"), ("s--" if L > 1 else "s"), color=_CB[2], lw=1.2, label="attn entropy (nats)")
+        ax.set(xticks=x, xlabel="layer", ylabel="rank / nats", title="Belief geometry by layer")
+        handles, labels = ax.get_legend_handles_labels()
+        if "belief_cond_median" in per_layer:
+            axr = ax.twinx()
+            # Name the axis in the label: this marker lives on the right (log) condition-number axis, not
+            # the left rank/nats axis -- without it the lone triangle reads as a second entropy series.
+            axr.plot(x, g("belief_cond_median"), ("^:" if L > 1 else "^"), color=_CB[1], lw=1.2,
+                     label="cond median (right, log)")
+            axr.set_ylabel("condition number")
+            axr.set_yscale("log")
+            axr.grid(False)
+            h2, l2 = axr.get_legend_handles_labels()
+            handles += h2
+            labels += l2
+        ax.legend(handles, labels, fontsize=6, frameon=False, loc="upper left")
+        fig.tight_layout()
+        return _save(fig, path)
 
 
 @register_figure("belief_spectrum")
@@ -2683,45 +3485,94 @@ def plot_lr_grid_heatmap(
 
 @register_figure("numerical_trust")
 def plot_numerical_trust(
-    guard:  Dict,                        # guard_saturation output
-    health: Dict,                        # numerical_health output
+    guard:  Dict,                        # guard_saturation output (fractions)
+    health: Dict,                        # numerical_health output (nan_* fractions, numel_* counts)
     causal: Optional[Dict] = None,       # causal_sanity output
 
     *,
-    path:   Optional[str] = None,
+    guard_denominators: Optional[Mapping[str, int]] = None,  # guard key -> entries examined
+    population:         Optional[str]               = None,  # e.g. "test split, one sequence of 64 tokens"
+    leak_tol:           float                       = 1e-6,
+    row_sum_tol:        float                       = 1e-5,
+    path:               Optional[str]               = None,
 ):
-    r"""F13: numerical-trust panel -- guard saturation, finiteness, and causal correctness.
+    r"""F13: numerical trust as counts with denominators ("k of N"), one row per check.
 
-    Panel A: the fraction of converged entries pinned at each numerical guard boundary, with a 1%
-    reference line. Panel B: the non-finite fraction of each intermediate. Panel C (optional):
-    per-head future-attention leakage (must be ~0 under the causal mask).
+    Guard rows count entries pinned at a numerical boundary: :math:`k=\mathrm{round}(fN)` from the
+    saturation fraction :math:`f` of :func:`vfe3.metrics.guard_saturation` and the number :math:`N`
+    of entries it examined (``guard_denominators``, from
+    :func:`vfe3.viz.extract.guard_denominators`). Finiteness rows count non-finite entries of each
+    intermediate (``nan_<x>`` fractions with ``numel_<x>`` counts from
+    :func:`vfe3.viz.extract.numerical_health`). Causal rows count (layer, head) maps with future
+    attention :math:`\max_{j>i}\beta_{ij}>` ``leak_tol`` and with row-sum error above
+    ``row_sum_tol``. A missing denominator is printed as such rather than guessed. Nonzero counts
+    are shaded. ``population`` names what the counts were measured on.
     """
-    ncol = 3 if causal is not None else 2
-    fig, axes = plt.subplots(1, ncol, figsize=(4.4 * ncol, 3.6), squeeze=False)
-    gk = list(guard)
-    axes[0][0].bar(range(len(gk)), [float(guard[k]) for k in gk], color=_CB[0])
-    axes[0][0].axhline(0.01, color=_CB[1], ls="--", lw=1, label="1%")
-    axes[0][0].set(xticks=range(len(gk)), ylabel="fraction pinned", title="Guard saturation")
-    axes[0][0].set_xticklabels(gk, rotation=30, ha="right", fontsize=7)
-    axes[0][0].legend(fontsize=8, frameon=False)
-    hk = [k for k in health if k.startswith("nan")]
-    axes[0][1].bar(range(len(hk)), [float(health[k]) for k in hk], color=_CB[2])
-    axes[0][1].set(xticks=range(len(hk)), ylabel="non-finite fraction", title="Numerical health")
-    axes[0][1].set_xticklabels(hk, rotation=30, ha="right", fontsize=7)
+    guard_denominators = dict(guard_denominators or {})
+    guard_names = {
+        "sigma_floor_frac":       "variance at the floor eps",
+        "sigma_ceil_frac":        "variance at the ceiling sigma_max",
+        "energy_klmax_frac":      "pair energy at kl_max (all pairs)",
+        "energy_klmax_frac_live": "pair energy at kl_max (causal pairs)",
+        "selfdiv_klmax_frac":     "self-divergence at kl_max",
+    }
+    rows: List[List[str]] = []
+    nonzero: List[bool] = []
+
+    def _add(label: str, fraction: float, denominator: Optional[float]) -> None:
+        if denominator is None or not np.isfinite(float(denominator)):
+            rows.append([label, "n/a", "not recorded", f"{fraction:.3g}"])
+        else:
+            count = int(round(fraction * float(denominator)))
+            rows.append([label, f"{count:,}", f"{int(denominator):,}", f"{fraction:.3g}"])
+        nonzero.append(bool(fraction > 0.0))
+
+    for key, label in guard_names.items():
+        if key in guard:
+            _add(label, float(guard[key]), guard_denominators.get(key))
+    for key in (k for k in health if k.startswith("nan_")):
+        name = key.removeprefix("nan_")
+        _add(f"non-finite {name}", float(health[key]), health.get(f"numel_{name}"))
     if causal is not None:
-        leak = _np(causal["future_leakage"])
-        if leak.ndim == 2:                                       # (L, H) -> label each bar by (layer, head)
-            lab = [f"L{l}H{hh}" for l in range(leak.shape[0]) for hh in range(leak.shape[1])]
-            leak = leak.ravel()
-        else:                                                    # (H,) single layer -> plain head labels
-            leak = leak.ravel()
-            lab = [f"h{hh}" for hh in range(leak.size)]
-        axes[0][2].bar(range(leak.size), leak, color=_CB[3])
-        axes[0][2].set(xticks=range(leak.size), xlabel="layer-head", ylabel="max future-attention",
-                       title="Causal leakage (expect 0)")
-        axes[0][2].set_xticklabels(lab, rotation=(90 if leak.size > 3 else 0), fontsize=6)
-    fig.tight_layout()
-    return _save(fig, path)
+        leak = _np(causal["future_leakage"]).astype(float).ravel()
+        n_maps = int(leak.size)
+        n_leaking = int((~(leak <= leak_tol)).sum())                 # NaN counts as leaking
+        rows.append([f"(layer, head) maps with future attention > {leak_tol:g}",
+                     f"{n_leaking:,}", f"{n_maps:,}", f"{n_leaking / max(n_maps, 1):.3g}"])
+        nonzero.append(n_leaking > 0)
+        if "row_sum_error" in causal:
+            row_err = _np(causal["row_sum_error"]).astype(float).ravel()
+            n_bad = int((~(row_err <= row_sum_tol)).sum())
+            rows.append([f"(layer, head) maps with |row sum - 1| > {row_sum_tol:g}",
+                         f"{n_bad:,}", f"{int(row_err.size):,}",
+                         f"{n_bad / max(int(row_err.size), 1):.3g}"])
+            nonzero.append(n_bad > 0)
+    if not rows:
+        raise FigureSkipped("no guard, finiteness or causal counts to tabulate")
+    with _compact_style():
+        fig, ax = plt.subplots(figsize=(MAX_FIGURE_WIDTH_IN, 0.24 * (len(rows) + 1) + 0.75))
+        ax.axis("off")
+        table = ax.table(cellText=rows, colLabels=["check", "count k", "of N", "fraction k/N"],
+                         colWidths=[0.58, 0.14, 0.14, 0.14], cellLoc="left", loc="upper center")
+        table.auto_set_font_size(False)
+        table.set_fontsize(7)
+        table.scale(1.0, 1.25)
+        for (row, _col), cell in table.get_celld().items():
+            cell.set_linewidth(0.4)
+            if row == 0:
+                cell.set_text_props(fontweight="bold")
+            elif nonzero[row - 1]:
+                cell.set_facecolor("#FBE3C8")
+        max_condition = health.get("max_condition")
+        title = "Numerical trust: counts with denominators"
+        if population:
+            title += f" ({population})"
+        ax.set_title(title, fontsize=8)
+        if max_condition is not None and np.isfinite(float(max_condition)):
+            fig.text(0.01, 0.01, f"largest covariance condition number: {float(max_condition):.4g}",
+                     fontsize=6.5, color="#444444")
+        fig.tight_layout()
+        return _save(fig, path)
 
 
 # ===========================================================================
@@ -3220,8 +4071,9 @@ def plot_reliability_diagram(
     reliability,                         # list of {conf, acc, frac} bins (run_artifacts._calibration_and_strata)
 
     *,
-    ece:  Optional[float] = None,
-    path: Optional[str]   = None,
+    ece:        Optional[float] = None,
+    population: Optional[str]   = None,  # the sample the bins come from, e.g. "test split, n=8,320"
+    path:       Optional[str]   = None,
 ):
     r"""B1/EXP-3 control: decode-calibration reliability diagram (accuracy vs confidence).
 
@@ -3229,27 +4081,34 @@ def plot_reliability_diagram(
     measured against. Each bar is a confidence bin: height = empirical accuracy, the ``y=x`` diagonal
     is perfect calibration, and the gap (over/under-confidence) integrated and frac-weighted is the
     ECE annotated in the title. Consumes the bins ``run_artifacts`` already computes (conf / acc /
-    frac) but never plotted."""
+    frac) but never plotted. ``population`` is printed under the title, so bins from the report bank
+    and bins from a ``research.json`` sample are not mistaken for one another."""
     rel = list(reliability or [])
     conf = np.array([b["conf"] for b in rel], float)
     acc = np.array([b["acc"] for b in rel], float)
     frac = np.array([b.get("frac", 0.0) for b in rel], float)
     if ece is None and rel:
         ece = float((frac * np.abs(acc - conf)).sum())
-    fig, ax = plt.subplots(figsize=(5.2, 5.0))
-    ax.plot([0, 1], [0, 1], color=_CB[7], lw=1.2, ls="--", label="perfect calibration (y=x)")
-    if conf.size:
-        width = 1.0 / max(len(rel), 1)
-        ax.bar(conf, acc, width=0.9 * width, color=_CB[0], alpha=0.55,
-               edgecolor=_CB[0], label="empirical accuracy")
-        ax.scatter(conf, acc, s=8.0 + 240.0 * frac, color=_CB[1], zorder=3,
-                   label="bin (area ~ token frac)")
-    ax.set(xlim=(0, 1), ylim=(0, 1), xlabel="decode confidence (max softmax prob)",
-           ylabel="empirical accuracy")
-    ax.set_title("Decode reliability" + (f"  (ECE={ece:.3f})" if ece is not None else ""))
-    ax.legend(fontsize=8, frameon=False, loc="upper left")
-    fig.tight_layout()
-    return _save(fig, path)
+    with _compact_style():
+        fig, ax = plt.subplots(figsize=(3.8, 3.7))
+        ax.plot([0, 1], [0, 1], color=_CB[7], lw=1.0, ls="--", label="perfect calibration (y=x)")
+        if conf.size:
+            # Each bar is centered on its bin's mean confidence; narrow the edge bars so none
+            # extends past [0, 1].
+            width = np.minimum(0.9 / max(len(rel), 1), 2.0 * np.minimum(conf, 1.0 - conf))
+            ax.bar(conf, acc, width=width, color=_CB[0], alpha=0.55,
+                   edgecolor=_CB[0], label="empirical accuracy")
+            ax.scatter(conf, acc, s=6.0 + 160.0 * frac, color=_CB[1], zorder=3,
+                       label="bin (area ~ token frac)")
+        ax.set(xlim=(0, 1), ylim=(0, 1), xlabel="decode confidence (max softmax prob)",
+               ylabel="empirical accuracy")
+        title = "Decode reliability" + (f"  (ECE={ece:.3f})" if ece is not None else "")
+        if population:
+            title += f"\n{population}"
+        ax.set_title(title)
+        ax.legend(fontsize=6, frameon=False, loc="upper left")
+        fig.tight_layout()
+        return _save(fig, path)
 
 
 def _sigma_trace_labels(frozen_covariance: bool) -> Dict[str, str]:
@@ -3323,6 +4182,8 @@ def plot_sigma_ce_scatter(
 
     *,
     frozen_covariance: bool = False,     # covariance frozen at encode -> input-token variance labels
+    vocab_cv:   Optional[float] = None,  # CV of tr Sigma over the vocabulary types (frozen route)
+    population: Optional[str]   = None,  # e.g. "test split, report bank"
     path: Optional[str] = None,
 ):
     r"""B1/EXP-3: per-token tr(Sigma_q) vs CE hexbin with the Spearman rho in the title.
@@ -3330,22 +4191,48 @@ def plot_sigma_ce_scatter(
     The raw joint distribution behind the stratified curve -- the headline statistic rho(tr Sigma_q,
     CE) is the rank correlation; a positive tilt means more-uncertain beliefs are harder tokens
     (the calibration channel carries signal). With ``frozen_covariance`` the trace is the input
-    token's table variance tr Sigma(x_i) and the axes say so."""
+    token's table variance tr Sigma(x_i): the axes say so, the title states that Sigma is frozen at
+    encode, and the annotation gives the coefficient of variation
+
+    .. math:: \mathrm{CV}=\frac{\mathrm{sd}(\mathrm{tr}\,\Sigma)}{|\mathrm{mean}(\mathrm{tr}\,\Sigma)|}
+
+    over the plotted tokens (occurrence-weighted) and, when ``vocab_cv`` is given, over the
+    vocabulary types. A CV of a few percent means the covariance is nearly constant, so the scatter
+    shows token-type identity, not uncertainty."""
     labels = _sigma_trace_labels(frozen_covariance)
-    tr = _np(bank["tr_sigma"]).ravel()
-    ce = _np(bank["ce"]).ravel()
-    fig, ax = plt.subplots(figsize=(6.0, 4.6))
-    if tr.size:
-        hb = ax.hexbin(tr, ce, gridsize=40, bins="log", cmap="viridis", mincnt=1)
-        fig.colorbar(hb, ax=ax, fraction=0.046, pad=0.02, label="tokens (log)")
-    rho = _spearman_np(tr, ce) if tr.size >= 2 else float("nan")
-    ax.set(xlabel=labels["axis"],
-           ylabel=("next-token cross-entropy (nats)" if frozen_covariance
-                   else "cross-entropy (nats)"))
-    trace_symbol = r"$\mathrm{tr}\,\Sigma(x_i)$" if frozen_covariance else r"$\mathrm{tr}(\Sigma_q)$"
-    ax.set_title(trace_symbol + rf" vs CE  (Spearman $\rho$={rho:+.3f}, n={tr.size})")
-    fig.tight_layout()
-    return _save(fig, path)
+    tr = _np(bank["tr_sigma"]).astype(float).ravel()
+    ce = _np(bank["ce"]).astype(float).ravel()
+    with _compact_style():
+        fig, ax = plt.subplots(figsize=(4.8, 3.6))
+        if tr.size:
+            hb = ax.hexbin(tr, ce, gridsize=40, bins="log", cmap="viridis", mincnt=1)
+            fig.colorbar(hb, ax=ax, fraction=0.046, pad=0.02, label="tokens (log)")
+        rho = _spearman_np(tr, ce) if tr.size >= 2 else float("nan")
+        ax.set(xlabel=labels["axis"],
+               ylabel=("next-token cross-entropy (nats)" if frozen_covariance
+                       else "cross-entropy (nats)"))
+        trace_symbol = (r"$\mathrm{tr}\,\Sigma(x_i)$" if frozen_covariance
+                        else r"$\mathrm{tr}(\Sigma_q)$")
+        title = trace_symbol + rf" vs CE  (Spearman $\rho$={rho:+.3f}, n={tr.size:,})"
+        if frozen_covariance:
+            title = r"$\Sigma$ frozen at encode: " + title
+        ax.set_title(title)
+        notes = []
+        if tr.size >= 2 and abs(float(tr.mean())) > 0:
+            occurrence_cv = float(tr.std(ddof=1) / abs(tr.mean()))
+            notes.append(rf"CV(tr$\,\Sigma$) over these tokens = {occurrence_cv:.3f}")
+        if vocab_cv is not None and np.isfinite(float(vocab_cv)):
+            notes.append(rf"CV(tr$\,\Sigma$) over the vocabulary = {float(vocab_cv):.3f}")
+        if frozen_covariance:
+            notes.append("constant per input-token type: not a belief uncertainty")
+        if population:
+            notes.append(population)
+        if notes:
+            ax.text(0.02, 0.98, "\n".join(notes), transform=ax.transAxes, va="top", ha="left",
+                    fontsize=6, bbox=dict(boxstyle="round,pad=0.25", facecolor="white",
+                                          edgecolor="#999999", alpha=0.85))
+        fig.tight_layout()
+        return _save(fig, path)
 
 
 # ===========================================================================

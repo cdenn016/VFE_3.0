@@ -24,6 +24,16 @@ literature adapted to Gaussian beliefs:
 All forward passes run under ``torch.no_grad()`` (``inference_mode`` is rejected by the
 conditional-filtering route) in float32 with autocast disabled (``SemanticRun.build_model``).
 Figures go to ``figures/contextual/``, tables to ``tables/contextual/``.
+
+Device. The model and every forward run on ``ctx.device``. Each captured forward moves its results
+to the host in one transfer per batch (all layers stacked), the logit-lens statistics of all layers
+of a batch are reduced on the device and transferred once, and the equality flags that detect a
+frozen Σ or φ are accumulated on the device and read once at the end, so no loop over layers
+synchronizes with the host. The batch sizes and the lens chunk are device-dependent when their
+options are ``None`` (:func:`_auto_batch_windows`, :func:`_auto_lens_chunk_tokens`): the CPU keeps 8
+windows per forward and 1,024 lens tokens; a CUDA device takes about 4,096 tokens per captured
+forward and sizes the lens chunk to a quarter of the free device memory. A CUDA out-of-memory error
+in a forward halves the batch (recorded as ``oom_resplits``), as the exact-symmetry failure does.
 """
 
 from __future__ import annotations
@@ -56,25 +66,35 @@ from vfe3.semantics.common import (
 
 _SECTION = "contextual"
 
-# Budgets and switches read from ``ctx.options`` (any key may be overridden there).
+# Budgets and switches read from ``ctx.options`` (any key may be overridden there). ``None`` batch
+# sizes and lens chunk are resolved per device by ``_resolved_options`` (CPU: 8 windows, 1024 tokens).
 CONTEXTUAL_DEFAULTS: Dict[str, Any] = {
     "contextual_tokens":     32768,    # bank size (held-out tokens)
     "contextual_split":      "validation",
     "contextual_seq_len":    None,     # None -> cfg.max_seq_len
-    "contextual_batch_size": 8,        # windows per bank forward
+    "contextual_batch_size": None,     # windows per bank forward (None -> _auto_batch_windows)
     "lens_tokens":           8192,     # tokens decoded at every layer by the logit lens
-    "lens_chunk_tokens":     1024,     # tokens per lens forward (bounds the (B, N, V) logits)
+    "lens_chunk_tokens":     None,     # tokens per lens forward, bounds the (B, N, V) logits
+                                       # (None -> _auto_lens_chunk_tokens)
     "contextual_points":     4096,     # token sample for per-layer geometry and CKA
     "min_type_occurrences":  5,        # Ethayarajh: types with at least this many bank occurrences
     "max_type_occurrences":  50,       # occurrences per type used (seeded subsample)
     "occurrence_tokens":     131072,   # forward budget of the occurrence contexts
     "occurrence_split":      "train",
     "occurrence_per_word":   4,
-    "occurrence_batch_size": 8,        # windows per occurrence forward
+    "occurrence_batch_size": None,     # windows per occurrence forward (None -> _auto_batch_windows)
     "cloud_per_word":        32,       # occurrences per ambiguous word (token clouds)
     "context_len":           48,
     "n_boot":                1000,
 }
+
+# Device-dependent forward budgets (used when the options above are None).
+_CPU_BATCH_WINDOWS = 8                 # windows per captured forward on the CPU (bank, occurrences)
+_CPU_LENS_CHUNK_TOKENS = 1024          # tokens per logit-lens forward on the CPU
+_CUDA_FORWARD_TOKENS = 4096            # tokens per captured forward on a CUDA device
+_CUDA_LENS_MEMORY_FRACTION = 0.25      # share of the free CUDA memory the lens's (B, N, V) tensors may take
+_CUDA_LENS_MAX_CHUNK_TOKENS = 16384    # upper bound of the automatic CUDA lens chunk
+_LENS_LIVE_VOCAB_TENSORS = 8           # float32 (B, N, V) tensors alive at once in one lens chunk
 
 # Stable per-step random streams, so each stochastic step draws the same numbers whatever else ran.
 _STEP_STREAM = {"bank": 11, "lens": 12, "sample": 13, "geometry": 14, "cka": 15, "contextuality": 16,
@@ -191,6 +211,67 @@ def _token_sample(bank: "ContextualBank", ctx: AnalysisContext, max_points: int)
     return np.sort(_rng(ctx, "sample").choice(n, size=int(max_points), replace=False)).astype(np.int64)
 
 
+def _auto_batch_windows(device: torch.device, seq_len: int) -> int:
+    r"""Windows per captured forward: :data:`_CPU_BATCH_WINDOWS` on the CPU, about
+    :data:`_CUDA_FORWARD_TOKENS` tokens (at least one window) on a CUDA device."""
+    if torch.device(device).type == "cuda":
+        return max(1, _CUDA_FORWARD_TOKENS // max(1, int(seq_len)))
+    return _CPU_BATCH_WINDOWS
+
+
+def _auto_lens_chunk_tokens(device: torch.device, vocab_size: int, seq_len: int,
+                            free_bytes: Optional[int] = None) -> int:
+    r"""Tokens per logit-lens forward.
+
+    CPU: :data:`_CPU_LENS_CHUNK_TOKENS`. CUDA: the lens holds about
+    :data:`_LENS_LIVE_VOCAB_TENSORS` float32 ``(B, N, V)`` tensors at once, so with ``F`` free bytes
+    (``torch.cuda.mem_get_info`` unless ``free_bytes`` is given) the chunk is
+
+    .. math:: T = \Big\lfloor \frac{f F}{4 V n_\mathrm{live}} \Big\rfloor,
+              \qquad f = 0.25,
+
+    clipped to ``[seq_len, 16384]`` (at least one window).
+    """
+    device = torch.device(device)
+    if device.type != "cuda":
+        return _CPU_LENS_CHUNK_TOKENS
+    if free_bytes is None:
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+    per_token = 4 * int(vocab_size) * _LENS_LIVE_VOCAB_TENSORS
+    tokens = int(_CUDA_LENS_MEMORY_FRACTION * float(free_bytes)) // per_token
+    return int(min(_CUDA_LENS_MAX_CHUNK_TOKENS, max(int(seq_len), tokens)))
+
+
+def _resolved_options(ctx: AnalysisContext, run: Any) -> Dict[str, Any]:
+    r"""Every :data:`CONTEXTUAL_DEFAULTS` key read from ``ctx.options``, with the ``None`` batch sizes
+    and lens chunk resolved for ``ctx.device`` (these are the values the section uses and records)."""
+    opts = {k: _opt(ctx, k) for k in CONTEXTUAL_DEFAULTS}
+    device = torch.device(ctx.device)
+    N = int(opts["contextual_seq_len"] if opts["contextual_seq_len"] is not None else run.cfg.max_seq_len)
+    if opts["contextual_batch_size"] is None:
+        opts["contextual_batch_size"] = _auto_batch_windows(device, N)
+    if opts["occurrence_batch_size"] is None:
+        opts["occurrence_batch_size"] = _auto_batch_windows(device, int(opts["context_len"]))
+    if opts["lens_chunk_tokens"] is None:
+        opts["lens_chunk_tokens"] = _auto_lens_chunk_tokens(device, int(run.vocab_size), N)
+    return opts
+
+
+def _equal_flag(a: Optional[torch.Tensor], b: Optional[torch.Tensor], device: torch.device) -> torch.Tensor:
+    r"""``torch.equal(a, b)`` as a 0-dim bool tensor on ``device``, without a host synchronization."""
+    if a is None or b is None:
+        return torch.tensor(a is None and b is None, device=device)
+    if a.shape != b.shape:
+        return torch.zeros((), dtype=torch.bool, device=device)
+    return torch.eq(a, b).all()
+
+
+def _rowdot(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    r""":math:`\sum_v a_{\dots v} b_{\dots v}` over the last dim as a batched matmul, so no ``a * b``
+    temporary of the full ``(B, N, V)`` size is allocated. Returns shape ``a.shape[:-1]``."""
+    return torch.matmul(a.unsqueeze(-2), b.unsqueeze(-1))[..., 0, 0]
+
+
 def _snippet(vocab: Any, context: np.ndarray, n_tokens: int = 8) -> str:
     r"""The last ``n_tokens`` of a context as text, the final (occurrence) token bracketed."""
     ids = [int(t) for t in context[-n_tokens:]]
@@ -238,35 +319,49 @@ _SYMMETRY_FAILURE = "must be symmetric for zero-jitter Cholesky"
 class _SplitLog:
     r"""Re-split bookkeeping of one forward step (bank, logit lens or occurrences)."""
 
-    resplit_batches: int = 0                                          # failed multi-window forwards, halved
+    resplit_batches: int = 0                                          # symmetry-failed multi-window forwards, halved
+    oom_resplits:    int = 0                                          # CUDA out-of-memory forwards, halved
     skipped: List[int] = field(default_factory=list)                  # window indices that failed alone
 
     def record(self) -> Dict[str, Any]:
-        return {"resplit_batches": int(self.resplit_batches), "skipped_windows": len(self.skipped),
-                "skipped_window_index": [int(i) for i in self.skipped]}
+        return {"resplit_batches": int(self.resplit_batches), "oom_resplits": int(self.oom_resplits),
+                "skipped_windows": len(self.skipped), "skipped_window_index": [int(i) for i in self.skipped]}
 
 
 def _forward_split(model: Any, x: torch.Tensor, log: _SplitLog, *, return_logits: bool = False,
                    offset: int = 0) -> List[Tuple[int, int, Dict[str, Any]]]:
-    r"""Captured forwards of the windows ``x`` (B, N), halving the batch on the exact-symmetry failure.
+    r"""Captured forwards of the windows ``x`` (B, N), halving the batch on the exact-symmetry
+    failure or on a CUDA out-of-memory error.
 
     Runs :func:`_forward_layers` on the whole batch; when the model raises the ``ValueError`` of its
     zero-jitter Cholesky symmetry check (message containing :data:`_SYMMETRY_FAILURE`), the batch is
     split into halves that are retried recursively, down to single windows. A single window that
-    still fails is skipped and its index ``offset + i`` recorded in ``log``; any other exception
-    propagates. Returns the successful pieces as ``(start, stop, out)`` with ``x[start:stop]`` the
-    windows of ``out``, in ascending order.
+    still fails is skipped and its index ``offset + i`` recorded in ``log``. A
+    ``torch.cuda.OutOfMemoryError`` of a multi-window batch empties the CUDA cache and halves the
+    batch the same way (counted in ``log.oom_resplits``); on a single window it propagates, as does
+    any other exception. Returns the successful pieces as ``(start, stop, out)`` with
+    ``x[start:stop]`` the windows of ``out``, in ascending order.
     """
     B = int(x.shape[0])
+    out_of_memory = False
     try:
         return [(0, B, _forward_layers(model, x, return_logits=return_logits))]
     except ValueError as exc:
         if _SYMMETRY_FAILURE not in str(exc):
             raise
-    if B == 1:
+    except torch.cuda.OutOfMemoryError:
+        if B == 1:
+            raise
+        out_of_memory = True
+    if out_of_memory:                                  # the handler has released the failed forward's frames
+        log.oom_resplits += 1
+        if x.device.type == "cuda":
+            torch.cuda.empty_cache()
+    elif B == 1:
         log.skipped.append(int(offset))
         return []
-    log.resplit_batches += 1
+    else:
+        log.resplit_batches += 1
     h = B // 2
     pieces = _forward_split(model, x[:h], log, return_logits=return_logits, offset=offset)
     right = _forward_split(model, x[h:], log, return_logits=return_logits, offset=offset + h)
@@ -390,27 +485,34 @@ def collect_bank(
     n = n_windows * N
     mu = np.empty((L + 1, n, K), dtype=np.float32)
     var = np.empty((L + 1, n, K), dtype=np.float32)
-    sigma_equal, phi_equal, encoded_equal = True, True, True
     sigma_kind = "diagonal"
     device = torch.device(ctx.device)
+    # Frozen-Σ/φ and encoded-equals-input flags, accumulated on the device and read once at the end.
+    sigma_flag = torch.ones((), dtype=torch.bool, device=device)
+    phi_flag = torch.ones((), dtype=torch.bool, device=device)
+    encoded_flag = torch.ones((), dtype=torch.bool, device=device)
+    windows_dev = torch.from_numpy(windows).to(device)                 # (n_seq, N), one transfer
     split_log = _SplitLog()
     for b0 in range(0, n_windows, batch_size):
         b1 = min(n_windows, b0 + batch_size)
-        x = torch.from_numpy(windows[b0:b1]).to(device)                # (B, N)
+        x = windows_dev[b0:b1]                                          # (B, N)
         for s, e, out in _forward_split(model, x, split_log, offset=b0):
             layers = out["layers"]
             base = layers[0]
             if base.sigma.dim() == 4:
                 sigma_kind = "full"
             rows = slice((b0 + s) * N, (b0 + e) * N)
-            for l, belief in enumerate(layers):
-                mu[l, rows] = belief.mu.reshape(-1, K).float().cpu().numpy()
-                var[l, rows] = _covariance_diagonal(run, belief.sigma).reshape(-1, K).float().cpu().numpy()
-                if l:
-                    sigma_equal = sigma_equal and torch.equal(belief.sigma, base.sigma)
-                    phi_equal = phi_equal and torch.equal(belief.phi, base.phi)
+            # every layer of the piece stacked on the device, then one host transfer each
+            mu[:, rows] = torch.stack([b.mu.reshape(-1, K) for b in layers]).float().cpu().numpy()   # (L+1, B*N, K)
+            var[:, rows] = torch.stack([_covariance_diagonal(run, b.sigma).reshape(-1, K)
+                                        for b in layers]).float().cpu().numpy()                     # (L+1, B*N, K)
+            for belief in layers[1:]:
+                sigma_flag = sigma_flag & _equal_flag(belief.sigma, base.sigma, device)
+                phi_flag = phi_flag & _equal_flag(belief.phi, base.phi, device)
             enc = out["encoded"]
-            encoded_equal = encoded_equal and torch.equal(enc.mu, base.mu) and torch.equal(enc.sigma, base.sigma)
+            encoded_flag = (encoded_flag & _equal_flag(enc.mu, base.mu, device)
+                            & _equal_flag(enc.sigma, base.sigma, device))
+    sigma_equal, phi_equal, encoded_equal = bool(sigma_flag), bool(phi_flag), bool(encoded_flag)
 
     resplit = split_log.record()
     if split_log.skipped:                                               # drop windows that failed alone
@@ -489,6 +591,11 @@ def logit_lens(
     :math:`\mathrm{softmax}(\kappa\log\pi)` gives the context-free baseline CE. Forwards go through
     :func:`_forward_split`; ``window_index`` lists the bank windows actually decoded and
     ``forward_resplit`` the re-split and skipped counts.
+
+    Every statistic of a chunk is reduced on the model's device; the chunk's ``(L+1, 5, n_valid)``
+    statistics and its re-run means go to the host in one transfer each. The row sums
+    :math:`\sum_v p_v \log p_v` are batched matmuls (:func:`_rowdot`), so a chunk holds a few
+    ``(B, N, V)`` tensors at a time (``chunk_tokens`` bounds ``B N``).
     """
     N = bank.seq_len
     n_win = min(bank.windows.shape[0], max(1, int(max_tokens) // N))
@@ -496,60 +603,72 @@ def logit_lens(
     L = bank.n_layers
     targets_w = bank.targets.reshape(-1, N)                              # (n_seq, N)
     device = torch.device(ctx.device)
-    per: Dict[str, List[List[np.ndarray]]] = {k: [[] for _ in range(L + 1)]
-                                              for k in ("ce", "acc", "agree", "kl", "entropy")}
+    keys = ("ce", "acc", "agree", "kl", "entropy")
+    per: Dict[str, List[List[np.ndarray]]] = {k: [[] for _ in range(L + 1)] for k in keys}
     clusters: List[np.ndarray] = []
     pos_kept: List[np.ndarray] = []
     target_kept: List[np.ndarray] = []
-    max_logit_diff = 0.0
+    logit_diff = torch.zeros((), dtype=torch.float32, device=device)   # read once at the end
     max_mu_diff = 0.0
     example: Optional[Dict[str, Any]] = None
     P = min(N, 16)
     split_log = _SplitLog()
     used: List[int] = []                                                 # bank windows actually decoded
+    windows_dev = torch.from_numpy(bank.windows[:n_win]).to(device)    # (n_win, N), one transfer
+    targets_dev = torch.from_numpy(targets_w[:n_win]).to(device)       # (n_win, N)
     t_start = time.perf_counter()
     for c0 in range(0, n_win, B):
-        x = torch.from_numpy(bank.windows[c0:min(n_win, c0 + B)]).to(device)   # (B, N)
+        x = windows_dev[c0:min(n_win, c0 + B)]                          # (B, N)
         for s, e, out in _forward_split(model, x, split_log, return_logits=True, offset=c0):
             b0, b1 = c0 + s, c0 + e
             used.extend(range(b0, b1))
             layers, frame = out["layers"], out["canonical_frame"]
-            tgt = torch.from_numpy(targets_w[b0:b1]).to(device)         # (B, N)
+            tgt = targets_dev[b0:b1]                                    # (B, N)
             valid = tgt >= 0
-            safe_tgt = tgt.clamp_min(0)
-            for l, belief in enumerate(layers):
-                got = belief.mu.reshape(-1, bank.K).float().cpu().numpy()
-                max_mu_diff = max(max_mu_diff, float(np.abs(got - bank.mu[l, b0 * N:b1 * N]).max()))
+            safe_tgt = tgt.clamp_min(0)[..., None]                      # (B, N, 1)
+            rerun = torch.stack([b.mu.reshape(-1, bank.K) for b in layers]).float().cpu().numpy()   # (L+1, B*N, K)
+            max_mu_diff = max(max_mu_diff, float(np.abs(rerun - bank.mu[:, b0 * N:b1 * N]).max()))
             logits_L = _readout(model, layers[L].mu, layers[L].sigma, frame)  # (B, N, V)
-            max_logit_diff = max(max_logit_diff, float((logits_L - out["logits"]).abs().max()))
-            logp_L = torch.log_softmax(logits_L.float(), dim=-1)
-            p_L = logp_L.exp()
+            logit_diff = torch.maximum(logit_diff, (logits_L - out["logits"]).abs().max().float())
             top_L = logits_L.argmax(dim=-1)                             # (B, N)
-            top_example = []
+            logp_L = torch.log_softmax(logits_L.float(), dim=-1)        # (B, N, V)
+            del logits_L
+            p_L = logp_L.exp()                                          # (B, N, V)
+            stats_l: List[torch.Tensor] = []
+            top_first: List[torch.Tensor] = []
             for l in range(L + 1):
-                logits = logits_L if l == L else _readout(model, layers[l].mu, layers[l].sigma, frame)
-                logp = logp_L if l == L else torch.log_softmax(logits.float(), dim=-1)   # (B, N, V)
-                top = logits.argmax(dim=-1)                              # (B, N)
-                ce = -logp.gather(-1, safe_tgt[..., None])[..., 0]
-                entropy = -(logp.exp() * logp).sum(dim=-1)
-                kl = (p_L * (logp_L - logp)).sum(dim=-1)
-                for key, value in (("ce", ce), ("acc", (top == tgt).double()),
-                                   ("agree", (top == top_L).double()), ("kl", kl), ("entropy", entropy)):
-                    per[key][l].append(value[valid].double().cpu().numpy())
+                if l == L:
+                    logp, top = logp_L, top_L
+                else:
+                    logits = _readout(model, layers[l].mu, layers[l].sigma, frame)   # (B, N, V)
+                    top = logits.argmax(dim=-1)                          # (B, N)
+                    logp = torch.log_softmax(logits.float(), dim=-1)     # (B, N, V)
+                    del logits
+                ce = -logp.gather(-1, safe_tgt)[..., 0]                  # (B, N)
+                entropy = -_rowdot(logp.exp(), logp)                     # (B, N)
+                kl = _rowdot(p_L, logp_L - logp)                         # KL(p_L || p_l), (B, N)
+                stats_l.append(torch.stack([ce.double(), (top == tgt).double(), (top == top_L).double(),
+                                            kl.double(), entropy.double()]))   # (5, B, N)
                 if example is None:
-                    top_example.append(top[0, :P].cpu().numpy())
-                del logits, logp
+                    top_first.append(top[0, :P])
+                del logp
+            piece = torch.stack(stats_l)[:, :, valid].cpu().numpy()     # (L+1, 5, n_valid), one transfer
+            for l in range(L + 1):
+                for k, key in enumerate(keys):
+                    per[key][l].append(piece[l, k])
             if example is None:
                 example = {"window": bank.windows[b0, :P].copy(), "targets": targets_w[b0, :P].copy(),
-                           "top1": np.stack(top_example)}               # (L+1, P)
+                           "top1": torch.stack(top_first).cpu().numpy()}   # (L+1, P)
+            del logp_L, p_L
             seq = np.repeat(np.arange(b0, b1, dtype=np.int64), N).reshape(b1 - b0, N)
-            keep = valid.cpu().numpy()
+            keep = targets_w[b0:b1] >= 0                                 # the host copy of ``valid``
             clusters.append(seq[keep])
             pos_kept.append(np.tile(np.arange(N, dtype=np.int64), (b1 - b0, 1))[keep])
             target_kept.append(targets_w[b0:b1][keep])
 
     if not clusters:
         raise RuntimeError("every logit-lens window failed the model's exact-symmetry check")
+    max_logit_diff = float(logit_diff)
     cl = np.concatenate(clusters)
     positions = np.concatenate(pos_kept)
     tgt_all = np.concatenate(target_kept)
@@ -969,19 +1088,23 @@ def collect_occurrences(
     m = pos.size
     mu = np.empty((L + 1, m, K), dtype=np.float32)
     var = np.empty((L + 1, m, K), dtype=np.float32)
-    sigma_moves = False
     device = torch.device(ctx.device)
+    sigma_flag = torch.ones((), dtype=torch.bool, device=device)      # Σ equal at every layer; read once
+    contexts_dev = torch.from_numpy(contexts).to(device)               # (m, context_len), one transfer
     split_log = _SplitLog()
     for c0 in range(0, m, batch_size):
-        x = torch.from_numpy(contexts[c0:min(m, c0 + batch_size)]).to(device)   # (B, context_len)
+        x = contexts_dev[c0:min(m, c0 + batch_size)]                    # (B, context_len)
         for s, e, out in _forward_split(model, x, split_log, offset=c0):
             b0, b1 = c0 + s, c0 + e
-            base = out["layers"][0]
-            for l, belief in enumerate(out["layers"]):
-                mu[l, b0:b1] = belief.mu[:, -1].float().cpu().numpy()
-                var[l, b0:b1] = _covariance_diagonal(run, belief.sigma[:, -1]).float().cpu().numpy()
-                if l and not torch.equal(belief.sigma, base.sigma):
-                    sigma_moves = True
+            layers = out["layers"]
+            base = layers[0]
+            # the last position of every layer stacked on the device, then one host transfer each
+            mu[:, b0:b1] = torch.stack([b.mu[:, -1] for b in layers]).float().cpu().numpy()          # (L+1, B, K)
+            var[:, b0:b1] = torch.stack([_covariance_diagonal(run, b.sigma[:, -1])
+                                         for b in layers]).float().cpu().numpy()                     # (L+1, B, K)
+            for belief in layers[1:]:
+                sigma_flag = sigma_flag & _equal_flag(belief.sigma, base.sigma, device)
+    sigma_moves = not bool(sigma_flag)
     resplit = split_log.record()
     resplit["skipped_stream_positions"] = [int(pos[i]) for i in split_log.skipped]
     result["forward_resplit"] = resplit
@@ -1041,13 +1164,16 @@ def _battery_summary(view: VectorView, ctx: AnalysisContext, rng: np.random.Gene
                  "top5_3cosadd": r["methods"]["3cosadd"]["topk"]} for r in rows if r["covered"]]
 
     def fields() -> Dict[str, Any]:
-        res = vectors.field_clustering(view, ctx.lexicon, rng)
+        res = vectors.field_clustering(view, ctx.lexicon, rng, log_count=ctx.log_count(view.ids),
+                                       device=ctx.device)
         if not _ok(res):
             return res
         pur = res["purity"]
+        strat = pur.get("frequency_stratified") if isinstance(pur.get("frequency_stratified"), Mapping) else {}
         return {"n_words": res["n_words"], "n_fields": res["n_fields"], "purity": pur["purity"],
                 "null_mean": pur["null_mean"], "null_std": pur["null_std"], "z": pur["z"], "p": pur["p"],
-                "chance": pur["chance"], "silhouette": res["silhouette"]["silhouette"]}
+                "chance": pur["chance"], "silhouette": res["silhouette"]["silhouette"],
+                "stratified_null_mean": strat.get("null_mean"), "stratified_z": strat.get("z")}
 
     if ctx.analogies:
         _attempt(rec, "analogies", analogies, notes)
@@ -1814,19 +1940,21 @@ def run_contextual_section(run: Any, ctx: AnalysisContext) -> SectionResult:
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(max(1, int(ctx.threads)))
     timings: Dict[str, float] = {}
-    metrics: Dict[str, Any] = {"options": {k: _opt(ctx, k) for k in CONTEXTUAL_DEFAULTS}, "timings": timings}
+    opts = _resolved_options(ctx, run)                                  # device-resolved budgets, recorded
+    metrics: Dict[str, Any] = {"options": opts, "device": str(ctx.device), "timings": timings}
     notes = res.notes
+    model: Any = None
     try:
         model = run.build_model(ctx.device)
         if run.cfg.amp_dtype is not None:
             notes.append(f"the model was trained with amp_dtype={run.cfg.amp_dtype!r} and is replayed here in "
                          "float32 with autocast disabled")
         t = time.perf_counter()
-        split = str(_opt(ctx, "contextual_split"))
+        split = str(opts["contextual_split"])
         try:
-            bank = collect_bank(run, model, ctx, split=split, n_tokens=int(_opt(ctx, "contextual_tokens")),
-                                seq_len=_opt(ctx, "contextual_seq_len"),
-                                batch_size=int(_opt(ctx, "contextual_batch_size")))
+            bank = collect_bank(run, model, ctx, split=split, n_tokens=int(opts["contextual_tokens"]),
+                                seq_len=opts["contextual_seq_len"],
+                                batch_size=int(opts["contextual_batch_size"]))
         except FileNotFoundError as exc:
             res.status = "skipped"
             notes.append(f"no cached {split!r} token stream for {run.dataset!r}: {exc}")
@@ -1838,8 +1966,8 @@ def run_contextual_section(run: Any, ctx: AnalysisContext) -> SectionResult:
 
         t = time.perf_counter()
         lens = _attempt(metrics, "logit_lens", lambda: logit_lens(
-            run, model, bank, ctx, max_tokens=int(_opt(ctx, "lens_tokens")),
-            chunk_tokens=int(_opt(ctx, "lens_chunk_tokens"))), notes)
+            run, model, bank, ctx, max_tokens=int(opts["lens_tokens"]),
+            chunk_tokens=int(opts["lens_chunk_tokens"])), notes)
         timings["logit_lens"] = time.perf_counter() - t
         if _ok(lens):
             notes.extend(lens["notes"])
@@ -1861,12 +1989,12 @@ def run_contextual_section(run: Any, ctx: AnalysisContext) -> SectionResult:
             notes.append("no resolved lexicon/analogy/ambiguous words: occurrence analyses skipped")
         else:
             t = time.perf_counter()
-            occ_split = str(_opt(ctx, "occurrence_split"))
+            occ_split = str(opts["occurrence_split"])
             try:
                 occ = collect_occurrences(
-                    run, model, ctx, words, split=occ_split, per_word=int(_opt(ctx, "occurrence_per_word")),
-                    context_len=int(_opt(ctx, "context_len")), budget_tokens=int(_opt(ctx, "occurrence_tokens")),
-                    per_word_overrides=overrides, batch_size=int(_opt(ctx, "occurrence_batch_size")))
+                    run, model, ctx, words, split=occ_split, per_word=int(opts["occurrence_per_word"]),
+                    context_len=int(opts["context_len"]), budget_tokens=int(opts["occurrence_tokens"]),
+                    per_word_overrides=overrides, batch_size=int(opts["occurrence_batch_size"]))
             except FileNotFoundError as exc:
                 metrics["occurrences"] = {"status": "skipped", "reason": str(exc)}
                 notes.append(f"no cached {occ_split!r} stream: occurrence analyses skipped ({exc})")
@@ -1901,12 +2029,18 @@ def run_contextual_section(run: Any, ctx: AnalysisContext) -> SectionResult:
             resplits["occurrences"] = occ["forward_resplit"]
         n_split = sum(r["resplit_batches"] for r in resplits.values())
         n_skip = sum(r["skipped_windows"] for r in resplits.values())
-        metrics["forward_resplits"] = {"resplit_batches": n_split, "skipped_windows": n_skip, "by_step": resplits}
+        n_oom = sum(r.get("oom_resplits", 0) for r in resplits.values())
+        metrics["forward_resplits"] = {"resplit_batches": n_split, "oom_resplits": n_oom, "skipped_windows": n_skip,
+                                       "by_step": resplits}
         if n_split or n_skip:
             detail = ", ".join(f"{step} {r['resplit_batches']}/{r['skipped_windows']}" for step, r in resplits.items())
             notes.append(f"{n_split} batches were re-run in smaller sub-batches because the model's exact-symmetry "
                          f"check failed under CPU BLAS summation order; {n_skip} windows were skipped "
                          f"(re-split batches/skipped windows: {detail})")
+        if n_oom:
+            detail = ", ".join(f"{step} {r.get('oom_resplits', 0)}" for step, r in resplits.items())
+            notes.append(f"{n_oom} batches ran out of {ctx.device} memory and were re-run in halves ({detail}); "
+                         "the per-window results do not depend on the batch composition")
         for step, r in resplits.items():
             if r["skipped_windows"]:
                 failed.append({"step": f"{step} forward ({r['skipped_windows']} single windows skipped)",
@@ -1957,6 +2091,9 @@ def run_contextual_section(run: Any, ctx: AnalysisContext) -> SectionResult:
         _headline(res, lens, metrics["cka"], metrics["contextuality"], sem, bank)
     finally:
         torch.set_num_threads(previous_threads)
+        model = None                                                    # release the replayed model on any exit
+        if torch.device(ctx.device).type == "cuda":
+            torch.cuda.empty_cache()
     res.metrics = metrics
     res.seconds = time.perf_counter() - t_start
     return res

@@ -449,6 +449,7 @@ def load_semantic_run(
     checkpoint: str = "best_model.pt",
     vocab:      Optional[Vocab] = None,
     cache_dir:  Optional[Path] = None,
+    drop_unknown_config_fields: bool = False,
 ) -> SemanticRun:
     r"""Open ``<run_dir>/<checkpoint>`` for analysis without building the model.
 
@@ -458,7 +459,9 @@ def load_semantic_run(
     checkpoint's ``unigram_log_prior`` (:func:`counts_from_unigram_log_prior`) when present and
     set, else from a bincount of the cached training stream, else they are unavailable; the choice
     and any reason for it are recorded in ``notes``. ``cache_dir`` overrides the token-cache
-    directory (default ``~/.cache/tokenized_cache``).
+    directory (default ``~/.cache/tokenized_cache``). ``drop_unknown_config_fields`` reopens a run
+    trained by an older code line: config fields this build no longer declares (retired toggles)
+    are dropped by :func:`vfe3.legacy_config.lenient_config_from_serialized` and listed in ``notes``.
     """
     from vfe3.model.model import build_group
 
@@ -470,9 +473,17 @@ def load_semantic_run(
     if not isinstance(bundle, Mapping) or not isinstance(bundle.get("model_state"), Mapping) \
             or not isinstance(bundle.get("config"), Mapping):
         raise ValueError(f"{checkpoint_path} is not a model bundle with 'model_state' and 'config'")
-    cfg = config_from_serialized(bundle["config"], source=str(checkpoint_path))
-    state: Mapping[str, torch.Tensor] = bundle["model_state"]
     notes: List[str] = []
+    if drop_unknown_config_fields:
+        from vfe3.legacy_config import lenient_config_from_serialized
+
+        cfg, dropped = lenient_config_from_serialized(bundle["config"], source=str(checkpoint_path))
+        if dropped:
+            notes.append("config fields this code line no longer declares were dropped at load "
+                         "(retired toggles): " + ", ".join(f"{k}={v!r}" for k, v in sorted(dropped.items())))
+    else:
+        cfg = config_from_serialized(bundle["config"], source=str(checkpoint_path))
+    state: Mapping[str, torch.Tensor] = bundle["model_state"]
 
     selection_identity = bundle.get("selection_data_identity")
     if selection_identity is not None and not isinstance(selection_identity, Mapping):

@@ -375,6 +375,83 @@ def test_view_selection_and_option_validation(tmp_path):
         R._resolve_options({"views": ("mu_raw", "nope")})
 
 
+def test_presets_views_and_device_validation(monkeypatch):
+    quick = R._resolve_options({"preset": "quick"})
+    assert (quick["umap"], quick["frame_rerank_questions"], quick["geometry_max_points"],
+            quick["contextual_tokens"], quick["occurrence_tokens"]) == (False, 100, 4000, 16384, 65536)
+    assert quick["min_count"] == R.DEFAULT_OPTIONS["min_count"] and quick["views"] is None   # views follow the run
+    full = R._resolve_options({})
+    assert full["preset"] == "full" and full["umap"] is True and full["geometry_max_points"] == 8000
+    assert "frame_rerank_questions" not in full                         # frames.PHI_DEFAULTS applies
+    assert R._resolve_options({"preset": "quick", "umap": True, "contextual_tokens": 7})["umap"] is True
+    assert R._resolve_options({"preset": "quick", "contextual_tokens": 7})["contextual_tokens"] == 7
+    with pytest.raises(ValueError, match="unknown preset"):
+        R._resolve_options({"preset": "fast"})
+    assert R.preset_views("quick", "linear") == ("decode_W_causal", "phi_log", "mu_raw", "xi_ref")
+    assert R.preset_views("quick", "gaussian") == ("decode_natural_causal", "phi_log", "mu_raw", "xi_ref")
+    assert R.preset_views("quick", "other") == ("phi_log", "mu_raw", "xi_ref")
+    assert R.preset_views("full", "linear") is None
+    assert R._validate_device("cpu") == "cpu"
+    with pytest.raises(ValueError, match="not a torch device"):
+        R._validate_device("gpu0")
+    with pytest.raises(ValueError, match="only 'cpu' and 'cuda"):
+        R._validate_device("meta")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(ValueError, match="is_available"):
+        R._validate_device("cuda")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    assert R._validate_device("cuda:0") == "cuda:0"
+    with pytest.raises(ValueError, match="only 1 CUDA"):
+        R._validate_device("cuda:1")
+
+
+def test_quick_preset_resolves_views_and_saves_candidate_ids(tmp_path):
+    run_dir, _ = _tiny_run(tmp_path)
+    out = tmp_path / "quick"
+    small = {k: v for k, v in SMALL.items() if k not in ("umap", "geometry_max_points", "frame_rerank_questions")}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        R.analyze_run(run_dir, out_dir=out, vocab=custom_vocab(STRINGS),
+                      options={**small, "preset": "quick", "sections": ("embeddings",)})
+    metrics = json.loads((out / "metrics.json").read_text(encoding="utf-8"))
+    opts = metrics["options"]
+    assert opts["preset"] == "quick" and opts["umap"] is False and opts["geometry_max_points"] == 4000
+    assert opts["frame_rerank_questions"] == 100 and opts["drop_unknown_config_fields"] is False
+    assert tuple(opts["views"]) == ("decode_W_causal", "phi_log", "mu_raw", "xi_ref")
+    assert set(metrics["sections"]["embeddings"]["metrics"]["batteries"]) == set(opts["views"])
+    ids = np.load(out / R.CANDIDATE_IDS_FILE)
+    assert ids.dtype == np.int64 and ids.size == metrics["run"]["n_candidates"] > 0
+    run = _load(run_dir)
+    np.testing.assert_array_equal(ids, _context(run, tmp_path / "ctx").candidate_ids)
+    assert "preset quick" in (out / "REPORT.md").read_text(encoding="utf-8")
+
+
+def test_drop_unknown_config_fields_reopens_a_run_with_retired_toggles(tmp_path):
+    run_dir, _ = _tiny_run(tmp_path)
+    bundle = torch.load(run_dir / "best_model.pt", weights_only=True)
+    bundle["config"] = {**bundle["config"], "qk_frame_mode": "shared", "emission_weight": 0.0}
+    torch.save(bundle, run_dir / "best_model.pt")
+    options = {"sections": ("sigma",), "views": ("mu_raw",)}
+    with pytest.raises(ValueError, match="unknown field"):
+        _analyze(run_dir, tmp_path / "strict", **options)
+    _, metrics = _analyze(run_dir, tmp_path / "lenient", drop_unknown_config_fields=True, **options)
+    assert metrics["sections"]["sigma"]["status"] == "ok"
+    assert metrics["options"]["drop_unknown_config_fields"] is True
+    note = next(n for n in metrics["run_notes"] if "no longer declares" in n)
+    assert "emission_weight=0.0" in note and "qk_frame_mode='shared'" in note
+
+
+def test_click_to_run_driver_drops_retired_config_fields_by_default():
+    import ast
+
+    source = (Path(__file__).resolve().parents[1] / "analyze_semantics.py").read_text(encoding="utf-8")
+    config = next(ast.literal_eval(node.value) for node in ast.parse(source).body
+                  if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", None) == "CONFIG")
+    assert config["drop_unknown_config_fields"] is True and config["preset"] in R.PRESETS
+    assert set(config) - {"run_dir", "out_dir", "checkpoint"} <= set(R.DEFAULT_OPTIONS)
+
+
 def test_json_ready_maps_tensors_sets_and_unknowns():
     unknown = []
     out = R._json_ready({"t": torch.ones(2), "s": {3, 1}, "c": np.array([1 + 2j]), "sl": slice(0, 4),

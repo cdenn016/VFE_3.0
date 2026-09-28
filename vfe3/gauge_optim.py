@@ -442,12 +442,18 @@ def project_phi_parameter_rows_(
     temporary_bytes: int  = _PHI_PROJECTION_TEMPORARY_BYTES,
     collect_stats:   bool = True,
     chunk_rows:      Optional[int] = None,
+    count_out:       Optional[torch.Tensor] = None,   # (2,) int64 on the generator device, or None
 ) -> Dict[str, float]:
     r"""Project every trainable phi-table row to an embedded Frobenius-norm ball.
 
     Projection rescales algebra coordinates along their current ray and deliberately leaves
     optimizer moments unchanged. It covers belief token frames, independent model-channel frames,
     and the learned positional table when present.
+
+    ``count_out`` (training counters, 2026-09-28): when given, the number of rows this call
+    rescales (scale :math:`< 1`) and the number of rows it checks are added to ``count_out[0]`` and
+    ``count_out[1]`` on the device, with no host synchronization. It only reads ``scale``; the rows
+    written are the same with or without it, and ``None`` runs the unchanged code path.
     """
     if not math.isfinite(max_matrix_norm) or max_matrix_norm <= 0.0:
         raise ValueError(
@@ -457,6 +463,10 @@ def project_phi_parameter_rows_(
         raise ValueError(f"chunk_rows must be a positive int, got {chunk_rows!r}")
     if type(temporary_bytes) is not int or temporary_bytes < 1:
         raise ValueError(f"temporary_bytes must be a positive int, got {temporary_bytes!r}")
+    if count_out is not None and (
+            not isinstance(count_out, torch.Tensor) or tuple(count_out.shape) != (2,)
+            or count_out.dtype != torch.long or count_out.device != model.group.generator_device):
+        raise ValueError("count_out must be a (2,) int64 tensor on the generator device")
     tables = [
         getattr(model.prior_bank, "phi_embed", None),
         getattr(model, "pos_phi_free", None),
@@ -496,7 +506,11 @@ def project_phi_parameter_rows_(
                 projected_rows.add_((scale < 1.0).sum())
                 norm_max_before.copy_(torch.maximum(norm_max_before, norm.max()))
                 minimum_scale.copy_(torch.minimum(minimum_scale, scale.min()))
+            if count_out is not None:
+                count_out[0].add_((scale < 1.0).sum())
             chunk.mul_(scale.unsqueeze(-1))
+    if count_out is not None:
+        count_out[1].add_(total_rows)
     if not collect_stats:
         return {}
     projected_rows_value, norm_max_value, minimum_scale_value = torch.stack((

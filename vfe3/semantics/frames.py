@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -56,6 +58,7 @@ _CHUNK = 4096                 # matrices per batched linear-algebra call (bounds
 _BRANCH_TOL = 1e-8            # |arg lambda| >= pi - tol counts as on the closed negative real axis
 _ISS_RADIUS = 0.25            # inverse scaling and squaring stops once ||B - I||_F < 0.25
 _ISS_TERMS = 18               # atanh series terms: ||Z||_2 <= 0.143 => truncation < 1e-29
+_PAR_MIN_ROWS = 64           # smallest per-worker share of a batch worth a thread (see _pmap)
 
 # run_phi_section budgets; every key is overridable through ctx.options
 PHI_DEFAULTS: Dict[str, Any] = {
@@ -80,6 +83,41 @@ def _t(x: Any) -> Tensor:
     return torch.from_numpy(np.ascontiguousarray(np.asarray(x, dtype=np.float64)))
 
 
+@contextmanager
+def _one_intra_op_thread():
+    r"""Pin torch's intra-op pool to one thread for the duration (restored afterwards)."""
+    prev = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        yield prev
+    finally:
+        torch.set_num_threads(prev)
+
+
+def _pmap(fn: Callable[..., Any], *xs: Tensor) -> Any:
+    r"""Apply a batched op ``fn`` to row blocks of ``xs`` (split on dim 0) on a thread pool.
+
+    Torch runs a batch of small ``eig``/``eigvals`` calls on one thread, and a batch of small
+    ``solve`` calls slows down under intra-op threading (per-matrix LAPACK work on 32 x 32 blocks is
+    too small to share). The batch is therefore split into ``k = min(T, n / _PAR_MIN_ROWS)`` row
+    blocks, with ``T`` the current torch thread count, and each block runs on its own worker with the
+    intra-op pool pinned to one thread. Every matrix goes through the same LAPACK call as in the
+    unsplit batch, so the result does not depend on ``k``. ``fn`` returns a tensor or a tuple of
+    tensors, concatenated back along dim 0.
+    """
+    n = int(xs[0].shape[0])
+    with _one_intra_op_thread() as threads:
+        k = max(1, min(int(threads), n // _PAR_MIN_ROWS))
+        if k == 1:
+            return fn(*xs)
+        bounds = [round(i * n / k) for i in range(k + 1)]
+        with ThreadPoolExecutor(max_workers=k) as ex:
+            parts = list(ex.map(lambda i: fn(*(x[bounds[i]:bounds[i + 1]] for x in xs)), range(k)))
+    if isinstance(parts[0], tuple):
+        return tuple(torch.cat([p[j] for p in parts]) for j in range(len(parts[0])))
+    return torch.cat(parts)
+
+
 def _fro(A: Tensor) -> Tensor:
     r"""Frobenius norm over the last two dims: (..., d, d) -> (...)."""
     return torch.linalg.matrix_norm(A, ord="fro")
@@ -88,11 +126,13 @@ def _fro(A: Tensor) -> Tensor:
 def _expm(X: Tensor, chunk: int = _CHUNK) -> Tensor:
     r"""Chunked ``torch.matrix_exp`` of a (n, d, d) batch (float64)."""
     X = _t(X)
-    if X.dim() == 2 or X.shape[0] <= chunk:
+    if X.dim() == 2:
         return torch.matrix_exp(X)
+    if X.shape[0] <= chunk:
+        return _pmap(torch.matrix_exp, X)
     out = torch.empty_like(X)
     for s in range(0, X.shape[0], chunk):
-        out[s:s + chunk] = torch.matrix_exp(X[s:s + chunk])
+        out[s:s + chunk] = _pmap(torch.matrix_exp, X[s:s + chunk])
     return out
 
 
@@ -100,7 +140,7 @@ def _eigvals(A: Tensor, chunk: int = _CHUNK) -> Tensor:
     r"""Chunked complex eigenvalues of a (n, d, d) real batch -> (n, d) complex128."""
     out = torch.empty(A.shape[:-1], dtype=torch.complex128)
     for s in range(0, A.shape[0], chunk):
-        out[s:s + chunk] = torch.linalg.eigvals(A[s:s + chunk])
+        out[s:s + chunk] = _pmap(torch.linalg.eigvals, A[s:s + chunk])
     return out
 
 
@@ -157,10 +197,10 @@ def _logm_eig(A: Tensor) -> Tuple[Tensor, Tensor]:
     real axis (``|arg lambda| >= pi - tol`` or ``lambda == 0``), which have no real principal log.
     Rows whose eigenvector matrix is singular come back non-finite.
     """
-    lam, V = torch.linalg.eig(A)                                   # (m, d), (m, d, d) complex
+    lam, V = _pmap(torch.linalg.eig, A)                            # (m, d), (m, d, d) complex
     on_cut = ((lam.abs() == 0) | (lam.angle().abs() >= math.pi - _BRANCH_TOL)).any(-1)
     rhs = V * torch.log(lam).unsqueeze(-2)                         # V diag(log lambda)
-    Lc, info = torch.linalg.solve_ex(V, rhs, left=False)           # X V = V diag(log lambda)
+    Lc, info = _pmap(lambda V_, r_: torch.linalg.solve_ex(V_, r_, left=False), V, rhs)   # X V = V diag(log lambda)
     L = Lc.real.contiguous()
     L[info != 0] = float("nan")
     return L, on_cut
@@ -326,7 +366,7 @@ def bi_invariant_mean(
     best_norm, best_m, best_failed = float("inf"), m, 0
     converged, n_failed, it = False, 0, 0
     for it in range(cap + 1):
-        Lr, _, okr = logm_real(torch.linalg.solve(m, U))           # log(m^{-1} U_a)
+        Lr, _, okr = logm_real(_pmap(lambda U_: torch.linalg.solve(m, U_), U))   # log(m^{-1} U_a)
         n_failed = int((~okr).sum())
         if not bool(okr.any()):
             break
@@ -725,7 +765,7 @@ def group_analogies(
         Rc = R[s:s + chunk]
         q = Rc.shape[0]
         ra, rs, rb, rt = (torch.from_numpy(Rc[:, j]) for j in range(4))
-        P = [Uh[rs] @ torch.linalg.solve(Uh[ra], Uh[rb]) for Uh in cf.U_hat]          # (q, d, d)
+        P = [Uh[rs] @ _pmap(torch.linalg.solve, Uh[ra], Uh[rb]) for Uh in cf.U_hat]   # (q, d, d)
         score = sum(2.0 * Pb.reshape(q, -1) @ f.T for Pb, f in zip(P, flat)) - sq[None, :]   # (q, n)
         excl = torch.from_numpy(Rc[:, :3])
         score.scatter_(1, excl, float("-inf"))
@@ -749,7 +789,8 @@ def group_analogies(
             pool = torch.topk(score[ts], rerank, dim=1).indices                     # (qs, R)
             resid = torch.zeros(pool.shape, dtype=_F64)
             for Pb, Uh in zip(P, cf.U_hat):
-                Mx = torch.linalg.solve(Uh[pool], Pb[ts][:, None].expand(-1, rerank, -1, -1), left=False)
+                Mx = _pmap(lambda A_, B_: torch.linalg.solve(A_, B_, left=False),
+                           Uh[pool], Pb[ts][:, None].expand(-1, rerank, -1, -1))
                 Lx, _, okx = logm_real(Mx)                                          # log(P U_x^{-1})
                 resid += torch.where(okx, _fro(Lx) ** 2, torch.full_like(resid, float("inf")))
             order = torch.argsort(resid, dim=1)
@@ -835,8 +876,8 @@ def relation_transports(
         vecs, ok, lam = [], torch.ones(m, m, dtype=torch.bool), []
         for Uh in cf.U_hat:
             d = Uh.shape[-1]
-            T = torch.linalg.solve(Uh[ra][:, None].expand(m, m, d, d), Uh[rs][None, :].expand(m, m, d, d),
-                                   left=False)                                  # T_ij = U_{a*_j} U_{a_i}^{-1}
+            T = _pmap(lambda A_, B_: torch.linalg.solve(A_, B_, left=False),
+                      Uh[ra][:, None].expand(m, m, d, d), Uh[rs][None, :].expand(m, m, d, d))   # T_ij = U_{a*_j} U_{a_i}^{-1}
             LT, _, okT = logm_real(T)
             vecs.append(LT.reshape(m, m, -1))
             ok &= okT
@@ -1054,7 +1095,7 @@ def positional_frames(
         lam = torch.empty(mm.size, V.shape[-1], dtype=torch.complex128)
         for s in range(0, mm.size, _CHUNK):
             sl = slice(s, s + _CHUNK)
-            lam[sl] = torch.linalg.eigvals(V[torch.from_numpy(mm[sl])] @ Vinv[torch.from_numpy(nn[sl])])
+            lam[sl] = _pmap(torch.linalg.eigvals, V[torch.from_numpy(mm[sl])] @ Vinv[torch.from_numpy(nn[sl])])
         log_mod = torch.log(lam.abs()).numpy()
         phase = lam.angle().numpy()
         lm_sorted, ph_sorted = np.sort(log_mod, axis=1), np.sort(np.abs(phase), axis=1)

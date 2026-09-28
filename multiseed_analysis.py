@@ -809,12 +809,21 @@ def flag_noise_dominated(
 CONFIG: Dict[str, Any] = {
     "run_root": "K=60_GL(10)",   # run folder (bare name resolves under vfe3_runs/) OR a path
     "key":      "best_val_ppl",  # exploratory selection/noise metric; test remains final endpoint
+    "curve_x":  "step",          # x axis of the per-step curves: "step" or "tokens_seen" (CURVE_X_OPTIONS)
 }
 
+# metrics.csv columns accepted as the curve x axis, with their axis labels. ``tokens_seen`` (training
+# token presentations) is logged by runs trained on or after 2026-09-28; older runs have only ``step``.
+CURVE_X_OPTIONS: Dict[str, str] = {"step": "training step", "tokens_seen": "training tokens"}
+
 # Headline scalars to aggregate (searched in summary.json -> test_results.json -> research.json).
-# Dotted keys dig into nested research blocks.
+# Dotted keys dig into nested research blocks. ``test_best_*`` are the test split at the
+# best-validation weights and ``train_sample_ce_{final,best}`` the fixed training sample under the
+# evaluation protocol (summary.json of runs trained on or after 2026-09-28).
 SCALAR_KEYS: List[str] = [
     "test_ppl", "best_val_ppl", "test_ce", "test_bits_per_token", "test_bpc",
+    "test_best_ce", "test_best_ppl", "test_best_step",
+    "train_sample_ce_final", "train_sample_ce_best",
     "diagnostics.zero_e_steps_counterfactual.counterfactual_ce",
     "diagnostics.zero_e_steps_counterfactual.ce_delta_vs_headline",
     "wall_time_s", "ece", "overall_ce", "sigma_trace_cv", "sigma_ce_spearman",
@@ -842,6 +851,8 @@ CURVE_SPECS: List[tuple] = [
     ("belief_cond_median", True),
     ("fisher_trace_mean",  False),
     ("generalization_gap", False),
+    ("train_sample_ce",    False),                     # fixed training sample, evaluation protocol
+    ("generalization_gap_fixed", False),               # val_ce - train_sample_ce
 ]
 
 GRID_COLS: List[str] = [                                          # overview-grid subset
@@ -866,6 +877,14 @@ def _data_order_status(data_seeds: Iterable[object]) -> Dict[str, object]:
 
 CAVEAT = ("Data-order sharing is reported only for one explicit common data_seed; data_seed=None "
           "means nonshared/unspecified order, not a shared shuffle stream.")
+
+
+def _curve_x() -> str:
+    r"""The configured curve x column (``CONFIG["curve_x"]``, default ``step``), validated."""
+    x = CONFIG.get("curve_x", "step")
+    if x not in CURVE_X_OPTIONS:
+        raise ValueError(f"CONFIG['curve_x']={x!r}; expected one of {sorted(CURVE_X_OPTIONS)}")
+    return x
 
 
 def _slug(s: str) -> str:
@@ -963,6 +982,7 @@ def _emit_figures(root: Path, scalars, curves, per_layer,
     fig_dir = root / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
     made = 0
+    x_label = CURVE_X_OPTIONS[_curve_x()]
 
     def _try(make, out: Path) -> None:
         nonlocal made
@@ -971,6 +991,16 @@ def _emit_figures(root: Path, scalars, curves, per_layer,
             made += 1
         except Exception as exc:                                  # one bad figure never aborts the rest
             print(f"  (figure {out.name} skipped: {exc})")
+
+    def _relabeled(fig, out: Path, *, grid: bool = False):
+        r"""Set a curve figure's x label to the configured axis, then save (the builders say 'step')."""
+        if x_label != CURVE_X_OPTIONS["step"]:
+            if grid:
+                fig.supxlabel(x_label, fontsize=9)
+            else:
+                for ax in fig.axes:
+                    ax.set_xlabel(x_label)
+        return figs._save(fig, str(out))
 
     key = CONFIG["key"]
     if key in scalars:
@@ -987,16 +1017,16 @@ def _emit_figures(root: Path, scalars, curves, per_layer,
         if d is None or not np.any(np.isfinite(d["mean"])):
             continue
         out = fig_dir / f"curve_band__{_slug(col)}.png"
-        _try(lambda d=d, logy=logy, col=col, out=out:
+        _try(lambda d=d, logy=logy, col=col, out=out: _relabeled(
              figs.plot_curve_band(d["steps"], d["mean"], d["sd"], label=col,
-                                  n=d["n"], logy=logy, path=str(out)), out)
+                                  n=d["n"], logy=logy), out), out)
 
     grid = [{"steps": curves[c]["steps"], "mean": curves[c]["mean"], "sd": curves[c]["sd"],
              "title": c, "logy": c in _LOGY_COLS}
             for c in GRID_COLS if c in curves and np.any(np.isfinite(curves[c]["mean"]))]
     if grid:
         out = fig_dir / "curve_band_grid.png"
-        _try(lambda: figs.plot_curve_band_grid(grid, path=str(out)), out)
+        _try(lambda: _relabeled(figs.plot_curve_band_grid(grid), out, grid=True), out)
 
     for metric in PER_LAYER_METRICS:
         if per_layer and any(metric in cols for cols in per_layer.values()):
@@ -1028,7 +1058,8 @@ def main() -> int:
         for key in dict.fromkeys([CONFIG["key"], *SCALAR_KEYS])
     }
     headline = scalar_candidates[CONFIG["key"]]
-    curves = aggregate_seed_curves(root)
+    curve_x = _curve_x()
+    curves = aggregate_seed_curves(root, x=curve_x)
     per_layer = aggregate_per_layer(root)
     per_layer_requested = False
     for cell in request_design["cells"]:
@@ -1125,6 +1156,7 @@ def main() -> int:
         },
         "caveat": CAVEAT,
         "scalars": scalars,
+        "curve_x": curve_x,                                      # the "step" of curves_final_step is this column
         "curves_final_step": {c: _final_finite(d) for c, d in curves.items()},
         "per_layer": {str(L): {c: {"mean": s["mean"], "sd": s["sd"], "n": s["n"]}
                                for c, s in cols.items()}
