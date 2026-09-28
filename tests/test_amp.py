@@ -206,26 +206,3 @@ def test_sigma_calibration_figures_render_from_a_bf16_bank(tmp_path):
     figs.plot_sigma_stratified_error(bank, n_bins=4, n_boot=8, path=str(stratified))
     figs.plot_sigma_ce_scatter(bank, path=str(scatter))
     assert stratified.exists() and scatter.exists()
-
-
-def test_belief_channel_features_and_clustering_accept_a_bf16_bank():
-    # belief_category_separation and the mu/sigma UMAP panels crossed to numpy through
-    # _belief_channel_features -> clustering_metrics; phi survived only because the gauge path
-    # keeps its own fp32 island. Cover the full-covariance chart too: torch.linalg.eigh has no
-    # bfloat16 kernel, so the log-Euclidean branch fails before the numpy boundary is reached.
-    diagonal_bank = {
-        "mu":    torch.randn(8, 3, dtype=torch.bfloat16),
-        "sigma": torch.rand(8, 3, dtype=torch.bfloat16) + 0.5,
-        "phi":   torch.randn(8, 3),
-    }
-    labels = np.array([0, 0, 0, 0, 1, 1, 1, 1])
-    for channel in ("mu", "sigma", "phi"):
-        features = figs._np(figs._belief_channel_features(diagonal_bank, channel))
-        assert features.dtype == np.float32
-        assert np.isfinite(features).all()
-        assert np.isfinite(figs.clustering_metrics(features, labels)["silhouette"])
-
-    spd = torch.eye(3).expand(8, 3, 3) * (1.0 + torch.rand(8, 1, 1))
-    full_bank = {**diagonal_bank, "sigma": spd.to(torch.bfloat16)}
-    vech = figs._np(figs._belief_channel_features(full_bank, "sigma"))
-    assert vech.dtype == np.float32 and np.isfinite(vech).all()

@@ -8,8 +8,10 @@ Edit ``CONFIG`` below and run. Points at a run directory written by ``train_vfe3
 
 Training's ``finalize_run`` already auto-runs the publication set. This driver re-runs the
 model-replay set and every history/probe figure supported by the saved run. The single
-``generate_embedding_figures`` switch controls only the slow UMAP/category-separation family;
-standard figures and data are always attempted.
+``generate_embedding_figures`` switch adds only the slow semantic-geometry analysis of
+``best_model.pt`` (:func:`vfe3.semantics.report.analyze_run` at report budgets, written to
+``<run_dir>/figures/semantics/``; ``analyze_semantics.py`` runs the full budgets); standard figures
+and data are always attempted.
 Historical strict-opt-out runs do not retain the complete per-step loss list needed to reproduce the
 original full-resolution ``loss_curve.png``; their cadence-sampled metrics remain available.
 """
@@ -43,9 +45,9 @@ CONFIG = {
     "run_dir":       None,                                  # None -> newest run under RUN_ROOT
     "device":        "cuda" if torch.cuda.is_available() else "cpu",
     "split":         "validation",                          # split the representative batch is drawn from
-    "max_sequences": 256,                                   # belief-bank size for the UMAP triptych
+    "max_sequences": 256,                                   # report-batch population of the model-replay figures
     "n_e_steps":     None,                                  # E-step trace length (None -> trained cfg.n_e_steps)
-    "generate_embedding_figures": False,                    # slow UMAP/category-separation family
+    "generate_embedding_figures": False,                    # slow semantic-geometry analysis (vfe3.semantics)
 }
 
 

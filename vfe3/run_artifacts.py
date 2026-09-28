@@ -3485,7 +3485,7 @@ def finalize_run(
         logger.warning("pure-path report failed (%s); skipped", exc)
 
     # Research records and standard publication figures are always attempted. The downstream
-    # embedding switch excludes only UMAP/category-clustering routes and their private banks.
+    # embedding switch adds only the vfe3.semantics analysis (figures/semantics/) of best_model.pt.
     try:
         _write_research_artifacts(model, artifacts, cfg, train_loader, test_loader, device, logger)
     except Exception as exc:

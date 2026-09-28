@@ -4,7 +4,6 @@ from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 from vfe3.viz.extract import (
     across_layer_belief_trace,
-    belief_bank,
     e_step_belief_trace,
     numerical_health,
     per_unit_eval_nats,
@@ -29,18 +28,6 @@ def test_per_unit_eval_nats_shapes_and_token_count():
     assert float(out["per_seq_tokens"].sum()) == 12.0                  # 15 - 3 ignored
     assert out["per_token_nats"].shape == (12,)
     assert torch.isfinite(out["per_token_nats"]).all()
-
-
-def test_belief_bank_collects_all_components():
-    model = _model()
-    tokens = torch.randint(0, 20, (3, 5))
-    bank = belief_bank(model, [tokens])
-    assert bank["mu"].shape == (15, 4)
-    assert bank["phi"].shape[0] == 15
-    assert bank["token_ids"].shape == (15,)
-    assert bank["seq_idx"].shape == (15,)
-    assert int(bank["seq_idx"].max()) == 2                             # three sequences
-    assert torch.equal(bank["token_ids"], tokens.reshape(-1))
 
 
 def test_numerical_health_under_rope_does_not_raise():

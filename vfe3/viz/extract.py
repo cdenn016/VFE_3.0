@@ -130,30 +130,13 @@ def _validate_bank_caps(
     max_tokens:    Optional[int],
     max_sequences: Optional[int],
 ) -> None:
-    """Reject ambiguous or empty belief-bank population requests."""
+    """Reject ambiguous or empty report-bank population requests."""
     if max_tokens is not None and max_sequences is not None:
         raise ValueError("max_tokens and max_sequences are mutually exclusive")
     if max_tokens is not None and max_tokens <= 0:
         raise ValueError("max_tokens must be positive")
     if max_sequences is not None and max_sequences <= 0:
         raise ValueError("max_sequences must be positive")
-
-
-def _slice_bank_to_cap(
-    bank: Dict[str, torch.Tensor],
-
-    *,
-    max_tokens:    Optional[int],
-    max_sequences: Optional[int],
-) -> Dict[str, torch.Tensor]:
-    """Slice every token-aligned bank field to the requested exact population."""
-    if max_tokens is not None:
-        limit = min(max_tokens, bank["token_ids"].shape[0])
-    elif max_sequences is not None:
-        limit = int((bank["seq_idx"] < max_sequences).sum().item())
-    else:
-        return bank
-    return {key: value[:limit] for key, value in bank.items()}
 
 
 def _inference_record_valid_positions(
@@ -431,7 +414,7 @@ def belief_ce_bank(
     (``prior_bank.encode`` -> pos_phi -> the precision-bias fold -> ``vfe_stack`` with the trained
     head_mixer / cg_coupling / block_norm) for the per-token covariance ``out.sigma``, AND the
     inference forward ``model(tokens)`` for the decode logits, then reduces the cross-entropy with
-    ``reduction='none'``. The replay is applied here (and in ``belief_bank`` too) so the traced
+    ``reduction='none'``. The replay is applied here so the traced
     Sigma_q IS the belief whose mean produced the logits -- otherwise tr(Sigma_q) and CE would come
     from different beliefs and the calibration headline reads off the wrong covariance. The belief at
     position n is the one whose mean produced the logits predicting target n, so tr(Sigma_q)[n] and
@@ -560,144 +543,6 @@ def belief_ce_bank(
         "conf":      torch.cat(confs),               # per-token max softmax prob (sigma-gate ECE)
         "correct":   torch.cat(corrects),            # per-token 1.0 if argmax == gold (sigma-gate ECE)
     }
-
-
-@torch.no_grad()
-def belief_bank(
-    model,
-    token_batches:  Iterable[torch.Tensor],   # iterable of (B, N) token-id batches
-
-    *,
-    device:         Optional[torch.device]              = None,
-    max_tokens:     Optional[int]                       = None,
-    max_sequences:  Optional[int]                       = None,
-    inference_bank: 'Optional[List[Dict[str, object]]]' = None,
-) -> Dict[str, torch.Tensor]:
-    r"""Collect converged beliefs (mu, Sigma, phi) over many sequences into one bank.
-
-    For each batch runs the model's belief pipeline (prior_bank.encode -> pos_phi -> vfe_stack
-    with the SAME per-block head_mixer / cg_coupling / block_norm the training forward applies,
-    mirroring forward up to the stack's handoff belief; only final-norm decode prep is omitted) and
-    stacks the per-token converged ``mu`` (M, K), ``sigma`` (M, K) or (M, K, K), ``phi``
-    (M, n_gen), with ``token_ids`` (M,), ``seq_idx`` (M,), and within-sequence ``pos_idx``
-    (M,). ``max_tokens`` and ``max_sequences`` are mutually exclusive; either cap is applied
-    exactly to every aligned field. Shared inference records retain only positions whose aligned
-    target is not ``-100``; ``token_ids`` remains the input token encoded by that belief row. Feeds
-    the mu / Sigma / phi UMAP triptych and the at-scale clustering scores.
-    """
-    _validate_bank_caps(max_tokens=max_tokens, max_sequences=max_sequences)
-    if inference_bank is not None:
-        mus, sigmas, phis, tids, sidx, pidx = [], [], [], [], [], []
-        seq_counter = 0
-        for record in inference_bank:
-            tokens = record["tokens"]
-            out = record["out"]
-            b, n = tokens.shape
-            valid = _inference_record_valid_positions(
-                tokens,
-                record["targets"],
-            ).reshape(-1)
-            mus.append(out.mu.reshape(b * n, -1)[valid])
-            sigmas.append(out.sigma.reshape(b * n, *out.sigma.shape[2:])[valid])
-            phis.append(out.phi.reshape(b * n, -1)[valid])
-            tids.append(tokens.reshape(b * n)[valid])
-            sidx.append(
-                torch.arange(
-                    seq_counter,
-                    seq_counter + b,
-                    device=tokens.device,
-                ).repeat_interleave(n)[valid]
-            )
-            pidx.append(torch.arange(n, device=tokens.device).repeat(b)[valid])
-            seq_counter += b
-            token_count = sum(batch.shape[0] for batch in tids)
-            if ((max_tokens is not None and token_count >= max_tokens)
-                    or (max_sequences is not None and seq_counter >= max_sequences)):
-                break
-        bank = {
-            "mu": torch.cat(mus),
-            "sigma": torch.cat(sigmas),
-            "phi": torch.cat(phis),
-            "token_ids": torch.cat(tids),
-            "seq_idx": torch.cat(sidx),
-            "pos_idx": torch.cat(pidx),
-        }
-        return _slice_bank_to_cap(
-            bank,
-            max_tokens=max_tokens,
-            max_sequences=max_sequences,
-        )
-
-    from vfe3.model.stack import vfe_stack
-    device = device or _model_device(model)
-    cfg = model.cfg
-    was_training = model.training
-    model.eval()
-    mus, sigmas, phis, tids, sidx, pidx = [], [], [], [], [], []
-    seq_counter = 0
-    try:
-        for tokens in token_batches:
-            tokens = tokens.to(device)
-            beliefs = model.prior_bank.encode(tokens)
-            beliefs = beliefs._replace(
-                phi=model._apply_pos_phi(beliefs.phi),
-                right_phi=model._pos_phi_right(beliefs.phi),
-            )
-            n = tokens.shape[1]
-            rope = model._rope_rotation(n, device)
-            log_prior = model._attention_log_prior(n, device)
-            block_mlp_transport, block_mlp_frame = model._block_mlp_frame_transport(
-                beliefs, rope)
-            if is_conditional_filtering(model):
-                conditional_capture: dict = {}
-                model.forward_beliefs(tokens, capture=conditional_capture)
-                out = conditional_capture["out"]
-                del conditional_capture
-            else:
-                out = vfe_stack(
-                    beliefs, beliefs.mu, beliefs.sigma, model.group, cfg,
-                    log_prior=log_prior, block_norm=model.block_norm,
-                    block_mlps=model.block_mlps,
-                    block_mlp_frame=block_mlp_frame,
-                    head_mixer=model.head_mixer, cg_coupling=model.cg_coupling,   # replay the trained
-                    lambda_beta=cfg.lambda_beta,  # model
-                    transport_state=model.transport_state,
-                    rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
-                    prebuilt_transport=block_mlp_transport,
-                    rope_insertion=cfg.rope_insertion,
-                )
-            b = tokens.shape[0]
-            mus.append(_cpu_bank_value(out.mu.reshape(b * n, -1)))
-            sigmas.append(_cpu_bank_value(out.sigma.reshape(b * n, *out.sigma.shape[2:])))
-            phis.append(_cpu_bank_value(out.phi.reshape(b * n, -1)))
-            tids.append(_cpu_bank_value(tokens.reshape(b * n)))
-            sidx.append(_cpu_bank_value(
-                torch.arange(seq_counter, seq_counter + b, device=device).repeat_interleave(n)
-            ))
-            pidx.append(_cpu_bank_value(torch.arange(n, device=device).repeat(b)))
-            seq_counter += b
-            token_count = sum(batch.shape[0] for batch in tids)
-            stop = ((max_tokens is not None and token_count >= max_tokens)
-                    or (max_sequences is not None and seq_counter >= max_sequences))
-            del tokens, beliefs, rope, log_prior, out
-            if stop:
-                break
-    finally:
-        if was_training:
-            model.train()
-    bank = {
-        "mu":        torch.cat(mus),
-        "sigma":     torch.cat(sigmas),
-        "phi":       torch.cat(phis),
-        "token_ids": torch.cat(tids),
-        "seq_idx":   torch.cat(sidx),
-        "pos_idx":   torch.cat(pidx),
-    }
-    return _slice_bank_to_cap(
-        bank,
-        max_tokens=max_tokens,
-        max_sequences=max_sequences,
-    )
 
 
 @torch.no_grad()

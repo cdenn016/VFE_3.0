@@ -814,7 +814,7 @@ def _cell_cfg_dict(overrides: Dict[str, Any], seed: int, max_steps: Optional[int
     d.update(overrides)
     d["seed"] = _require_scaling_seed(seed)
     d["checkpoint_interval"] = 0                             # no per-cell step_N.pt blowup
-    d["generate_embedding_figures"] = False                 # skip only slow embedding/clustering outputs
+    d["generate_embedding_figures"] = False                 # skip only the slow semantic-geometry analysis
     if max_steps is not None:
         d["max_steps"] = int(max_steps)
     return d
