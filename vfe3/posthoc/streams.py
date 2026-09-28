@@ -92,14 +92,22 @@ def config_from_bundle(
     source:                     str,
     drop_unknown_config_fields: bool = False,
 ) -> Tuple[Any, Dict[str, Any]]:
-    r"""``(VFE3Config, dropped)`` from a checkpoint's serialized config.
+    r"""``(config, dropped)`` from a checkpoint's serialized config (``VFE3Config`` unless tagged).
 
     Strict by default (:func:`vfe3.config.config_from_serialized` refuses undeclared fields). With
     ``drop_unknown_config_fields`` the fields this build no longer declares are dropped by
     :func:`vfe3.legacy_config.lenient_config_from_serialized` and returned, so the caller records
     them next to its reproduction check: a dropped toggle that changed the forward pass shows up as a
-    failure to reproduce the run's recorded loss.
+    failure to reproduce the run's recorded loss. A payload tagged ``model_family =
+    'conventional_transformer'`` builds :class:`vfe3.baseline.BaselineConfig` under the same rule.
     """
+    from vfe3.contracts import is_vfe_config
+
+    if not is_vfe_config(payload):
+        from vfe3.baseline import baseline_config_from_serialized
+
+        return baseline_config_from_serialized(
+            payload, source=source, drop_unknown_config_fields=drop_unknown_config_fields)
     if drop_unknown_config_fields:
         from vfe3.legacy_config import lenient_config_from_serialized
 

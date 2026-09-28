@@ -36,14 +36,20 @@ import sys
 import tempfile
 import time
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
 from numbers import Real
 from pathlib import Path, PureWindowsPath
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
-from vfe3.contracts import is_conditional_filtering
+from vfe3.contracts import (
+    VFE_MODEL_FAMILY,
+    is_conditional_filtering,
+    is_vfe_config,
+    is_vfe_model,
+    model_family_of,
+)
 from vfe3.config import (
     VFE3Config,
     config_from_serialized,
@@ -61,8 +67,42 @@ if TYPE_CHECKING:                                        # forward ref only: tra
     from vfe3.train import TrainingTerminalState         # at top level, so a runtime import here cycles
 
 
+def _serialize_run_config(cfg: Any) -> Dict[str, object]:
+    r"""Serialize a run config of any model family (the VFE path is :func:`vfe3.config.serialize_config`).
+
+    A config of another family (``cfg.model_family``, e.g. :class:`vfe3.baseline.BaselineConfig`)
+    serializes itself; its mapping carries the ``model_family`` tag every loader dispatches on.
+    """
+    if is_vfe_config(cfg):
+        return serialize_config(cfg)
+    return cfg.serialize()
+
+
+def _config_from_run_serialized(
+    payload: Mapping[str, object],
+
+    *,
+    source:  str,
+) -> Any:
+    r"""Strictly rebuild a run config from its serialized mapping, dispatching on ``model_family``.
+
+    An untagged mapping is a VFE config (:func:`vfe3.config.config_from_serialized`, unchanged);
+    ``'conventional_transformer'`` builds :class:`vfe3.baseline.BaselineConfig`. Any other tag, or a
+    malformed baseline mapping, raises ``ValueError`` like the VFE loader.
+    """
+    family = model_family_of(payload) if isinstance(payload, Mapping) else VFE_MODEL_FAMILY
+    if family == VFE_MODEL_FAMILY:
+        return config_from_serialized(payload, source=source)
+    from vfe3.baseline import MODEL_FAMILY as BASELINE_FAMILY, BaselineConfig
+    if family != BASELINE_FAMILY:
+        raise ValueError(f"{source}: unknown model_family {family!r}")
+    return BaselineConfig.from_serialized(payload, source=source)
+
+
 def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
     """Describe exact marginal routing and its separate conditional mean update."""
+    if not is_vfe_config(cfg):                        # another model family has no relational route
+        return {}
     if cfg.relational_mode == "off":
         return {}
     H, d = cfg.n_heads, cfg.d_head
@@ -147,6 +187,22 @@ def _conditional_unavailable_probe(probe: str, cfg: Optional[VFE3Config] = None)
                    else "routing and readout do not define the legacy shared stationary free-energy objective"),
         "points": [],
         "stages": {},
+    }
+
+
+def _non_vfe_skipped_analyses(model: torch.nn.Module) -> Dict[str, str]:
+    r"""The VFE-only finalize analyses a model of another family skips, each with its reason."""
+    family = model_family_of(model)
+    return {
+        "zero_e_steps_counterfactual": f"model_family={family!r} has no E-step whose depth could be set to zero",
+        "estep_final_f": f"model_family={family!r} has no E-step free energy",
+        "mechanism_probes": (f"model_family={family!r}: the E-step depth, character, beta-channel and "
+                             "context-sensitivity probes read the VFE belief stack"),
+        "phi_numerics": f"model_family={family!r} has no gauge frames",
+        "pure_path_report": f"model_family={family!r}: the pure-path toggles are VFE3Config fields",
+        "research_artifacts": f"model_family={family!r}: the research records read the prior bank",
+        "figures": (f"model_family={family!r}: the figure worker rebuilds a VFE3Config and VFEModel; "
+                    "curves come from metrics.csv"),
     }
 
 
@@ -684,7 +740,7 @@ def _run_figures_isolated(
                 live_model_path: Optional[str] = None
                 if generate_publication:
                     # Replay the caller's evaluated state even when an earlier best exists.
-                    config = serialize_config(artifacts.cfg)
+                    config = _serialize_run_config(artifacts.cfg)
                     torch.save({
                         "artifact_kind":        _LIVE_FIGURE_SNAPSHOT_KIND,
                         "schema_version":       _LIVE_FIGURE_SNAPSHOT_SCHEMA_VERSION,
@@ -866,9 +922,11 @@ def _selection_semantic_config(
     field it predates."""
     if isinstance(config, VFE3Config):
         normalized = asdict(config)
+    elif not is_vfe_config(config) and is_dataclass(config) and not isinstance(config, type):
+        normalized = asdict(config)                   # a live config of another model family
     elif isinstance(config, Mapping):
         try:
-            normalized = asdict(config_from_serialized(
+            normalized = asdict(_config_from_run_serialized(
                 config,
                 source="best-model selection compatibility",
             ))
@@ -995,7 +1053,7 @@ def _validate_live_figure_snapshot_mapping(
     if not isinstance(saved_config, Mapping):
         raise RuntimeError(f"{context} has a non-mapping config")
     try:
-        effective_saved_config = asdict(config_from_serialized(
+        effective_saved_config = asdict(_config_from_run_serialized(
             saved_config,
             source="live figure snapshot config",
         ))
@@ -1604,7 +1662,7 @@ class RunArtifacts:
         self._fieldnames: Optional[List[str]] = None
 
         config_record = {
-            "config":    serialize_config(cfg),
+            "config":    _serialize_run_config(cfg),
             # Structural inert set (field -> reason) BESIDE the config mapping, never inside it:
             # every reader reloads and fingerprints only record["config"], so this key cannot
             # change config reload, semantic fingerprints, or selection projections.
@@ -1753,7 +1811,7 @@ class RunArtifacts:
             self.best_step = int(step)
             if not self.save_model_artifacts:
                 return True
-            config = serialize_config(self.cfg)
+            config = _serialize_run_config(self.cfg)
             bundle = {
                 "model_state":        model.state_dict(),
                 "config":             config,
@@ -1912,7 +1970,7 @@ class RunArtifacts:
                 "optimizer_state": optimizer_state,
                 "optimizer_parameter_manifest": optimizer_parameter_manifest,
                 "rng_state":       rng_state,
-                "config":          serialize_config(cfg),
+                "config":          _serialize_run_config(cfg),
                 "code_identity_sha256": self.code_identity_sha256,
                 "git_identity":    _git_code_identity(),
                 "selection_data_identity": self.selection_data_identity,
@@ -2054,7 +2112,7 @@ def _preflight_resume_config(
     if any(not isinstance(key, str) for key in saved_config):
         raise RuntimeError("checkpoint config keys must be strings")
     try:
-        parsed = config_from_serialized(saved_config, source="checkpoint resume config")
+        parsed = _config_from_run_serialized(saved_config, source="checkpoint resume config")
     except ValueError as exc:
         raise RuntimeError(str(exc)) from exc
     raw_config = dict(saved_config)
@@ -2233,7 +2291,7 @@ def load_checkpoint(
         if any(not isinstance(key, str) for key in raw_checkpoint_config):
             raise RuntimeError("checkpoint config keys must be strings")
         try:
-            config_from_serialized(raw_checkpoint_config, source="checkpoint exact resume config")
+            _config_from_run_serialized(raw_checkpoint_config, source="checkpoint exact resume config")
         except ValueError as exc:
             raise RuntimeError(str(exc)) from exc
         saved_config = dict(raw_checkpoint_config)
@@ -2398,7 +2456,7 @@ def load_checkpoint(
                 if isinstance(saved_config, Mapping) else None
             ),
             "current_config_fingerprint":      (
-                semantic_config_fingerprint(serialize_config(resume_cfg))
+                semantic_config_fingerprint(_serialize_run_config(resume_cfg))
                 if resume_cfg is not None else None
             ),
             "saved_code_identity_sha256":      saved_code_identity,
@@ -3176,6 +3234,7 @@ def _cost_model_fields(
             embed_dim=K,
             irrep_dims=model.group.irrep_dims,
             n_layers=int(cfg.n_layers),
+            covariance_layout=("full" if getattr(cfg, "family", None) == "gaussian_full" else "diagonal"),
         )
     )
     block_mlp_active = block_mlp_build.enabled
@@ -3550,7 +3609,7 @@ def finalize_run(
             and not artifacts.best_path.is_file()):
         raise RuntimeError("finite best-model metadata has no reachable weights")
     if artifacts.save_model_artifacts:
-        config = serialize_config(artifacts.cfg)
+        config = _serialize_run_config(artifacts.cfg)
         with _unique_sibling_temp(artifacts.final_path) as tmp:
             torch.save({
                 "artifact_kind":        _LIVE_FIGURE_SNAPSHOT_KIND,
@@ -3564,6 +3623,11 @@ def finalize_run(
     logger.info("Testing final training weights (step %s)", final_step)
 
     conditional_enabled = is_conditional_filtering(model)
+    # Another model family (the conventional baseline) runs the model-agnostic parts of finalize
+    # (test at final and best weights, training sample, provenance, summary, resources) and skips the
+    # VFE-only probes, recording why under "skipped_analyses".
+    vfe_model = is_vfe_model(model)
+    skipped_analyses: Dict[str, str] = {} if vfe_model else _non_vfe_skipped_analyses(model)
     results: Dict[str, object] = {
         "diagnostics": {},
         **_conditional_artifact_fields(cfg),
@@ -3614,7 +3678,7 @@ def finalize_run(
     if conditional_enabled:
         results["diagnostics"]["zero_e_steps_counterfactual"] = _conditional_unavailable_probe("zero_e_steps_counterfactual", cfg=model.cfg)
         results["diagnostics"]["legacy_reduced_free_energy"] = _conditional_unavailable_probe("legacy_reduced_free_energy", cfg=model.cfg)
-    if (not conditional_enabled and test_loader is not None
+    if (vfe_model and not conditional_enabled and test_loader is not None
             and results.get("test_ce") is not None):
         _saved_ne = model.cfg.n_e_steps
         try:
@@ -3648,7 +3712,7 @@ def finalize_run(
     # cross-arm reader (scaling_analysis) can describe the final-F/CE relationship across an
     # n_e_steps sweep -- the structural non-Neal-Hinton EM prediction (the E-step serves a distinct
     # functional, not the likelihood). Off-graph, best-effort, on a fixed test batch (sequence 0).
-    if test_loader is not None and not conditional_enabled:
+    if vfe_model and test_loader is not None and not conditional_enabled:
         try:
             from vfe3.viz.extract import e_step_belief_trace
             _b = next(iter(test_loader))
@@ -3670,7 +3734,7 @@ def finalize_run(
     # numeric probes or ordinary publication figures. Batch extraction remains best-effort so an
     # exhausted or malformed loader cannot invalidate the already-computed headline metrics.
     _depth_tokens = _depth_targets = None
-    if depth_loader is not None:
+    if depth_loader is not None and vfe_model:
         try:
             _batch = next(iter(depth_loader))
             if not isinstance(_batch, (tuple, list)) or len(_batch) < 2:
@@ -3710,7 +3774,7 @@ def finalize_run(
         except Exception as exc:
             logger.warning("context-sensitivity probe failed (%s); skipped", exc)
         _log_mechanism_diagnostics(logger, _character_record, _beta_record, _context_record)
-    if depth_loader is not None:
+    if depth_loader is not None and vfe_model:
         try:
             _phi_batch = next(iter(depth_loader))
             _phi_tokens = (
@@ -3720,6 +3784,11 @@ def finalize_run(
             artifacts.save_json("phi_numerics.json", _phi_record)
         except Exception as exc:
             logger.warning("phi numerical-reference probe failed (%s); skipped", exc)
+    if skipped_analyses:
+        results["model_family"] = model_family_of(model)
+        results["skipped_analyses"] = dict(skipped_analyses)
+        logger.info("model_family=%r: VFE-only finalize analyses skipped: %s",
+                    model_family_of(model), ", ".join(sorted(skipped_analyses)))
     artifacts.save_json("test_results.json", results)
 
     # Reproducibility provenance (git SHA / data hash / versions) + a scaling-law data point -- the
@@ -3738,6 +3807,9 @@ def finalize_run(
         tokenizer_tag=tokenizer_tag,
     )
     n_params = int(sum(p.numel() for p in model.parameters()))
+    # Trainable count: parameters frozen by design (requires_grad=False, e.g. the zero token frames
+    # under gauge_transport='off') are run constants and are excluded (resources.json lists them).
+    n_params_trainable = int(sum(p.numel() for p in model.parameters() if p.requires_grad))
     tokens_seen = int(cfg.max_steps) * int(cfg.batch_size) * int(cfg.max_seq_len)
     # scaling-law data point: the 6ND FLOP proxy is LOOSE for a no-NN E-step model, so record the
     # inputs too (a cross-run frontier can be re-fit offline with the right cost model). The
@@ -3756,7 +3828,10 @@ def finalize_run(
         "excluded_targets":      results.get("excluded_targets"),
     }
     try:
-        scaling_point.update(_cost_model_fields(model, cfg, n_params, tokens_seen, wall_time=wall_time))
+        if vfe_model:
+            scaling_point.update(_cost_model_fields(model, cfg, n_params, tokens_seen, wall_time=wall_time))
+        else:
+            scaling_point.update(model.cost_model_fields(n_params, tokens_seen, wall_time=wall_time))
     except Exception as exc:
         logger.warning("cost-model fields failed (%s); scaling_point keeps the 6ND proxy only", exc)
     # "n_steps" is the CONFIGURED budget. The realized counts sit beside it rather than replacing it
@@ -3769,6 +3844,7 @@ def finalize_run(
         "n_steps":      cfg.max_steps,
         **_realized,
         "n_params":     n_params,
+        "n_params_trainable": n_params_trainable,
         "best_val_ppl": best_val_ppl,
         "best_step":    artifacts.best_step,
         "reloaded_best": False,
@@ -3799,7 +3875,7 @@ def finalize_run(
         "wall_time_s":  wall_time,
         "decode_mode":     cfg.decode_mode,
         "decode_tau_eff":  decode_tau_eff,
-        "use_head_mixer":  cfg.use_head_mixer,
+        "use_head_mixer":  getattr(cfg, "use_head_mixer", None),
         "phi_chart_norm_route": _phi_chart_norm_route(model, cfg),
         "scaling_point":   scaling_point,
         # Audit 2026-09-28: test at the validation-selected weights beside the final-weight
@@ -3813,12 +3889,17 @@ def finalize_run(
         # S1 panel D counters (2026-09-28; see vfe3.train._numerics_counters_summary): final
         # cumulative counts, the last evaluation's cap/factorization counts, and skip reasons.
         "numerics_counters": getattr(artifacts, "numerics_counters", None),
+        # Another model family: its tag and the VFE-only analyses finalize skipped, with reasons.
+        **({"model_family": model_family_of(model), "skipped_analyses": dict(skipped_analyses)}
+           if not vfe_model else {}),
     })
     try:
         artifacts.save_json("resources.json", _resources_record(
             model, artifacts, cfg, device=device, wall_time=wall_time))
     except Exception as exc:
         logger.warning("resources.json failed (%s); skipped", exc)
+    if not vfe_model:
+        return results
 
     # Pure-path certificate: the config toggles for the principal gauge / decode / free-energy purity
     # axes (flat gauge, canonical F, prior-bank decode, no head mixer, ...), plus the converged-state
@@ -4608,7 +4689,9 @@ def finalize_validation_run(
         raise RuntimeError("finite best-model metadata has no reachable weights")
 
     n_params = int(sum(p.numel() for p in model.parameters()))
+    n_params_trainable = int(sum(p.numel() for p in model.parameters() if p.requires_grad))
     final_train_loss = (float(losses[-1]) if losses else None)
+    vfe_model = is_vfe_model(model)
 
     try:
         metrics = evaluate(model, val_loader, tokens_per_char=tokens_per_char, device=device)
@@ -4687,28 +4770,29 @@ def finalize_validation_run(
             train_loader=train_loader, val_loader=val_loader, test_loader=None,
             data_seed=data_seed, max_tokens=max_tokens, tokenizer_tag=tokenizer_tag,
         )
-        try:
-            artifacts.save_json("pure_path_report.json", _pure_path_report(
-                cfg,
-                artifacts.history,
-                executable_build=model.executable_build,
-            ))
-        except Exception as exc:
-            logger.warning("pure-path report failed (%s); skipped", exc)
-        try:
-            _run_figures_isolated(
-                model,
-                artifacts,
-                losses,
-                logger,
-                generate_publication=False,
-                generate_embedding_figures=cfg.generate_embedding_figures,
-            )
-        except Exception as exc:
-            logger.warning(
-                "isolated figure preparation failed (%s); validation results are saved",
-                exc,
-            )
+        if vfe_model:                   # VFE-only reports (see _non_vfe_skipped_analyses)
+            try:
+                artifacts.save_json("pure_path_report.json", _pure_path_report(
+                    cfg,
+                    artifacts.history,
+                    executable_build=model.executable_build,
+                ))
+            except Exception as exc:
+                logger.warning("pure-path report failed (%s); skipped", exc)
+            try:
+                _run_figures_isolated(
+                    model,
+                    artifacts,
+                    losses,
+                    logger,
+                    generate_publication=False,
+                    generate_embedding_figures=cfg.generate_embedding_figures,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "isolated figure preparation failed (%s); validation results are saved",
+                    exc,
+                )
     finally:
         # Strict raw-state reload + RNG restore, on BOTH the success and failure paths: the terminal
         # checkpoint below pairs the captured model with its optimizer moments, and the global RNG is
@@ -4745,6 +4829,7 @@ def finalize_validation_run(
         "best_step":           artifacts.best_step,
         "n_steps":             completed_step,
         "n_params":            n_params,
+        "n_params_trainable":  n_params_trainable,
         "final_train_loss":    final_train_loss,
         "wall_time_s":         (float(wall_time) if wall_time is not None else None),
         "terminal_checkpoint": terminal_checkpoint,

@@ -44,7 +44,11 @@ QUANTILES: Tuple[float, ...] = (0.1, 0.5, 0.9)
 # ----------------------------------------------------------------------------------------------
 
 def ln_change_applicability(model: torch.nn.Module) -> Tuple[bool, Optional[str]]:
-    r"""``(defined, reason)`` for :math:`\delta_i`, with the training probe's four conditions."""
+    r"""``(defined, reason)`` for :math:`\delta_i`, with the training probe's conditions.
+
+    Under ``block_coordinates='reference'`` the norm reads :math:`U_i^{-1}(\mu_i + m_i)`, so the
+    local-coordinate :math:`\delta_i` does not describe what the model computes and is undefined.
+    """
     from vfe3.train import _residual_update_is_additive
 
     if getattr(model, "block_norm", None) is None:
@@ -55,6 +59,9 @@ def ln_change_applicability(model: torch.nn.Module) -> Tuple[bool, Optional[str]
         return False, "a CG coupling sits between the E-step and the norm, which then does not see mu + m"
     if not _residual_update_is_additive(model):
         return False, "predictive readout without attention_residual: no additive residual to remove"
+    if getattr(getattr(model, "cfg", None), "block_coordinates", "local") != "local":
+        return False, ("block_coordinates='reference': the norm acts on U_i^{-1}(mu + m) in reference "
+                       "coordinates, not on mu + m")
     return True, None
 
 

@@ -133,6 +133,57 @@ def test_reported_parameter_count_and_flops_match_the_module():
     assert metadata.report_label == "gaussian_template_mean_only_nonintertwiner"
 
 
+def _ambient_responsibilities(mlp: GaussianTemplateBlockMLP, mu: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+    r"""The pre-2026-09-28 expression, evaluated under whatever autocast is ambient (sigma diagonal)."""
+    nu = mlp.nu.to(mu.dtype)
+    precision = torch.exp(-mlp.log_lambda.to(mu.dtype))
+    quadratic = (
+        (sigma.to(mu.dtype) + mu.square()) @ precision.T
+        - 2.0 * mu @ (nu * precision).T
+        + (nu.square() * precision).sum(dim=-1)
+    )
+    logits = mlp.log_pi.to(mu.dtype) - 0.5 * (quadratic + mlp.log_lambda.to(mu.dtype).sum(dim=-1))
+    return torch.softmax(logits, dim=-1)
+
+
+def _bf16_regime_template() -> 'tuple[GaussianTemplateBlockMLP, torch.Tensor, torch.Tensor]':
+    r"""K = 8, M = 16, stored variance 15 (the sigma_init regime): K (sigma + mu^2) / lambda ~ 150."""
+    torch.manual_seed(81)
+    mlp = GaussianTemplateBlockMLP(embed_dim=8, expansion=2, dropout=0.0)
+    with torch.no_grad():
+        mlp.log_lambda.normal_(0.0, 0.3)
+        mlp.log_pi.normal_(0.0, 0.3)
+    mu = 2.0 * torch.randn(64, 8)
+    sigma = torch.full((64, 8), 15.0)
+    return mlp, mu, sigma
+
+
+def test_responsibilities_under_bf16_autocast_match_the_float32_reference():
+    mlp, mu, sigma = _bf16_regime_template()
+    reference = mlp.responsibilities(mu, sigma)                               # float32, autocast off
+
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        under_autocast = mlp.responsibilities(mu, sigma)
+        naive = _ambient_responsibilities(mlp, mu, sigma)                     # pre-fix bf16 path
+
+    assert under_autocast.dtype == torch.float32
+    torch.testing.assert_close(under_autocast, reference)                     # fp32 tolerance
+    # The inputs are in the regime that exposes bf16 rounding: the unprotected path moves r by a
+    # total variation far outside fp32 tolerance (measured max 0.078 over the 64 states at K = 8).
+    total_variation = 0.5 * (naive.float() - reference).abs().sum(dim=-1)
+    assert total_variation.max() > 1e-2
+
+
+def test_responsibilities_without_autocast_are_bitwise_the_previous_expression():
+    mlp, mu, sigma = _bf16_regime_template()
+    assert torch.equal(mlp.responsibilities(mu, sigma), _ambient_responsibilities(mlp, mu, sigma))
+    mlp64 = _random_template()
+    mu64 = torch.randn(4, 3, dtype=torch.float64)
+    sigma64 = torch.rand(4, 3, dtype=torch.float64) + 0.5
+    assert torch.equal(mlp64.responsibilities(mu64, sigma64),
+                       _ambient_responsibilities(mlp64, mu64, sigma64))
+
+
 def test_delta_full_covariance_is_rejected():
     with pytest.raises(ValueError, match="block_mlp_covariance"):
         _tiny_cfg(block_mlp_covariance="delta_full")

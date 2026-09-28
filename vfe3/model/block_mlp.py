@@ -17,12 +17,23 @@ _ACTIVATIONS = {
 
 
 _BLOCK_MLP_COVARIANCE_CONTRACTS = frozenset({"passthrough", "delta_full"})
+# Tensor layout of the belief covariance the block reads: (..., K, K) or its diagonal (..., K).
+_COVARIANCE_LAYOUTS = frozenset({"full", "diagonal"})
 
 
 def _validate_block_mlp_covariance_contract(covariance_contract: str) -> str:
     if covariance_contract not in _BLOCK_MLP_COVARIANCE_CONTRACTS:
         raise ValueError(f"unknown BlockMLP covariance contract {covariance_contract!r}")
     return covariance_contract
+
+
+def _validate_covariance_layout(covariance_layout: str) -> str:
+    if covariance_layout not in _COVARIANCE_LAYOUTS:
+        raise ValueError(
+            f"covariance_layout must be one of {sorted(_COVARIANCE_LAYOUTS)}, "
+            f"got {covariance_layout!r}")
+    return covariance_layout
+
 
 def _require_canonical_frame_context(
     frame_context: Optional[CanonicalFrameContext],
@@ -83,6 +94,42 @@ def _dropout_scale(dropout: nn.Dropout, reference: torch.Tensor) -> torch.Tensor
         torch.ones_like(reference), p=dropout.p, training=True)
 
 
+def _add_hidden_bias(hidden_pre: torch.Tensor, hidden_bias: torch.Tensor) -> torch.Tensor:
+    r"""Add a per-token bias to the first ``w`` units of the fc1 pre-activation.
+
+    .. math::
+        h_{ij} = (W_1 u_i + b_1)_j + E_{x_i j}\,[j < w],
+
+    with ``hidden_pre`` (..., H) and ``hidden_bias`` (..., w), identical leading axes and w <= H. The
+    bias is cast to the pre-activation dtype, as fc1's own bias is under autocast, so the hidden path
+    keeps the dtype of the unbiased path; its gradient still reaches the stored table at full precision.
+    """
+    hidden_width = hidden_pre.shape[-1]
+    if hidden_bias.dim() != hidden_pre.dim() or hidden_bias.shape[:-1] != hidden_pre.shape[:-1]:
+        raise ValueError(
+            "hidden_bias must be (..., w) with the leading axes of the hidden pre-activation "
+            f"{tuple(hidden_pre.shape[:-1])}, got {tuple(hidden_bias.shape)}")
+    width = hidden_bias.shape[-1]
+    if width > hidden_width:
+        raise ValueError(
+            f"hidden_bias width w={width} exceeds the fc1 hidden width {hidden_width}")
+    bias = hidden_bias.to(hidden_pre.dtype)                               # (..., w)
+    if width == hidden_width:
+        return hidden_pre + bias
+    # Units w..H-1 are passed through untouched (not added to zero), so they stay bit-identical.
+    return torch.cat([hidden_pre[..., :width] + bias, hidden_pre[..., width:]], dim=-1)
+
+
+def _reject_hidden_bias(hidden_bias: Optional[torch.Tensor], reason: str) -> None:
+    if hidden_bias is not None:
+        raise ValueError(f"hidden_bias does not apply: {reason}")
+
+
+def _is_diagonal_layout(mu: torch.Tensor, sigma: torch.Tensor) -> bool:
+    r"""Whether ``sigma`` is the diagonal layout (..., K) of Sigma rather than the full (..., K, K)."""
+    return sigma.shape == mu.shape
+
+
 class BlockMLPMomentResult(NamedTuple):
     """Post-MLP belief moments and, when requested, the mean-map Jacobian."""
 
@@ -125,14 +172,31 @@ class BlockMLP(nn.Module):
         self.fc2 = nn.Linear(hidden_dim, embed_dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, mu: torch.Tensor) -> torch.Tensor:
-        return mu + self.dropout(self.fc2(self.activation(self.fc1(mu))))
+    def _hidden_pre(
+        self,
+        mu:          torch.Tensor,                    # (..., K)
+        hidden_bias: Optional[torch.Tensor],          # (..., w) or None
+    ) -> torch.Tensor:                                # (..., H)
+        hidden_pre = self.fc1(mu)
+        if hidden_bias is None:
+            return hidden_pre
+        return _add_hidden_bias(hidden_pre, hidden_bias)
+
+    def forward(
+        self,
+        mu: torch.Tensor,
+        *,
+        hidden_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        r"""Residual update mu + W_2 act(W_1 mu + b_1 + E) + b_2, E = [hidden_bias, 0] (absent when None)."""
+        return mu + self.dropout(self.fc2(self.activation(self._hidden_pre(mu, hidden_bias))))
 
     def _coordinate_update_with_jacobian(
         self,
         mu: torch.Tensor,
+        hidden_bias: Optional[torch.Tensor] = None,
     ) -> 'tuple[torch.Tensor, torch.Tensor]':
-        hidden_pre = self.fc1(mu)
+        hidden_pre = self._hidden_pre(mu, hidden_bias)
         residual = self.fc2(self.activation(hidden_pre))
         dropout_scale = _dropout_scale(self.dropout, residual)
         mu_out = mu + dropout_scale * residual
@@ -152,11 +216,12 @@ class BlockMLP(nn.Module):
         sigma: torch.Tensor,
         *,
         frame_context: Optional[CanonicalFrameContext] = None,
+        hidden_bias: Optional[torch.Tensor] = None,    # (..., w), w <= H: per-token fc1 bias
     ) -> BlockMLPMomentResult:
         del frame_context
         if self.covariance_contract == "passthrough":
-            return BlockMLPMomentResult(self.forward(mu), sigma, None)
-        mu_out, jacobian = self._coordinate_update_with_jacobian(mu)
+            return BlockMLPMomentResult(self.forward(mu, hidden_bias=hidden_bias), sigma, None)
+        mu_out, jacobian = self._coordinate_update_with_jacobian(mu, hidden_bias)
         return BlockMLPMomentResult(
             mu_out, _delta_covariance(jacobian, sigma, self.covariance_floor), jacobian)
 
@@ -171,6 +236,13 @@ class GaugeGateBlockMLP(nn.Module):
     For every declared irrep block h, s_h = mu_h^T Sigma_hh^-1 mu_h is invariant under the
     corresponding invertible frame action. A scalar MLP maps the invariant vector s to one
     gate per block, and that scalar multiplies every coordinate in the block.
+
+    Sigma may be given in the full layout (..., K, K) or the diagonal layout (..., K). On the
+    diagonal layout the invariant is s_h = sum_{k in h} mu_k^2 / sigma_k, and the gate equals the
+    full-layout gate on diag_embed(sigma). The operator is covariant under the block frame group
+    prod_h GL(d_h) (not under a dense GL(K)): the diagonal family is not closed under that action,
+    but the image g diag(sigma) g^T is block-diagonal and the full-layout gate evaluates it.
+    delta_full (J Sigma J^T is dense) requires the full layout.
     """
 
     def __init__(
@@ -213,6 +285,8 @@ class GaugeGateBlockMLP(nn.Module):
                 "irrep_dims must sum to the mean dimension, got "
                 f"sum(irrep_dims)={expected_dim} and mean dimension={mu.shape[-1]}"
             )
+        if _is_diagonal_layout(mu, sigma):
+            return self._diagonal_invariants(mu, sigma)
         if sigma.shape[-2:] != (expected_dim, expected_dim):
             raise ValueError(
                 "gauge gate covariance axes must match sum(irrep_dims), got "
@@ -249,6 +323,36 @@ class GaugeGateBlockMLP(nn.Module):
             invariants.append((mu_h.to(solved.dtype) * solved).sum(dim=-1))
             start = stop
         return torch.stack(invariants, dim=-1), mu_blocks, sigma_solutions
+
+    def _diagonal_invariants(
+        self,
+        mu:    torch.Tensor,                          # (..., K)
+        sigma: torch.Tensor,                          # (..., K) = diag Sigma, sigma_k > 0
+    ) -> 'tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]':
+        r"""Block invariants of a diagonal covariance layout.
+
+        .. math::
+            s_b = \mu_b^\top \Sigma_{bb}^{-1} \mu_b = \sum_{k \in b} \frac{\mu_k^2}{\sigma_k},
+
+        evaluated at ``promote_types(mu, sigma, float32)`` (at least fp32; float64 stays float64). No
+        clamp: sigma is positive through its log parameterization, and a clamp would break the exact
+        agreement with the full-layout path on ``diag_embed(sigma)``.
+        """
+        compute_dtype = torch.promote_types(
+            torch.promote_types(mu.dtype, sigma.dtype), torch.float32)
+        mu_work = mu.to(compute_dtype)                # (..., K)
+        sigma_work = sigma.to(compute_dtype)          # (..., K)
+        mu_blocks, solutions, invariants = [], [], []
+        start = 0
+        for dim in self.irrep_dims:
+            stop = start + dim
+            mu_h = mu_work[..., start:stop]                               # (..., d_b)
+            solved = mu_h / sigma_work[..., start:stop]                   # Sigma_bb^{-1} mu_b
+            mu_blocks.append(mu[..., start:stop])
+            solutions.append(solved)
+            invariants.append((mu_h * solved).sum(dim=-1))                # (...,)
+            start = stop
+        return torch.stack(invariants, dim=-1), mu_blocks, solutions      # (..., B)
 
     def _gate_values(
         self,
@@ -291,10 +395,20 @@ class GaugeGateBlockMLP(nn.Module):
         sigma: torch.Tensor,
         *,
         frame_context: Optional[CanonicalFrameContext] = None,
+        hidden_bias: Optional[torch.Tensor] = None,
     ) -> BlockMLPMomentResult:
         del frame_context
-        invariants, mu_blocks, sigma_solutions = self._invariants(mu, sigma)
+        _reject_hidden_bias(
+            hidden_bias,
+            "the gauge_gate fc1 acts on the per-block Mahalanobis invariants, not on a coordinate "
+            "hidden layer")
         need_jacobian = self.covariance_contract == "delta_full"
+        if need_jacobian and _is_diagonal_layout(mu, sigma):
+            raise ValueError(
+                "gauge_gate covariance_contract='delta_full' needs the full (..., K, K) covariance "
+                "layout: the pushed covariance J Sigma J^T is dense, so a diagonal layout cannot "
+                "carry it")
+        invariants, mu_blocks, sigma_solutions = self._invariants(mu, sigma)
         gates, dgate_ds = self._gate_values(invariants, need_jacobian=need_jacobian)
         mu_out = torch.cat([
             (1.0 + gates[..., index:index + 1]) * mu_h
@@ -341,18 +455,22 @@ class CanonicalFrameBlockMLP(BlockMLP):
         mu: torch.Tensor,
         *,
         frame_context: Optional[CanonicalFrameContext] = None,
+        hidden_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return self.mean_update(mu, frame_context)
+        return self.mean_update(mu, frame_context, hidden_bias=hidden_bias)
 
     def mean_update(
         self,
         mu: torch.Tensor,
         frame: Optional[CanonicalFrameContext],
+        *,
+        hidden_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        r"""mu -> U F(U^{-1} mu); a hidden_bias enters F's fc1 pre-activation in canonical coordinates."""
         frame = _require_canonical_frame_context(frame)
         apply = _frame_action(frame, mu)
         canonical_mu = apply(frame.inverse, mu)
-        canonical_out = super().forward(canonical_mu)
+        canonical_out = super().forward(canonical_mu, hidden_bias=hidden_bias)
         return apply(frame.forward, canonical_out)
 
     def forward_moments(
@@ -361,15 +479,17 @@ class CanonicalFrameBlockMLP(BlockMLP):
         sigma: torch.Tensor,
         *,
         frame_context: Optional[CanonicalFrameContext] = None,
+        hidden_bias: Optional[torch.Tensor] = None,
     ) -> BlockMLPMomentResult:
         frame_context = _require_canonical_frame_context(frame_context)
         apply = _frame_action(frame_context, mu)
         canonical_mu = apply(frame_context.inverse, mu)
         if self.covariance_contract == "passthrough":
-            canonical_out = super().forward(canonical_mu)
+            canonical_out = super().forward(canonical_mu, hidden_bias=hidden_bias)
             mu_out = apply(frame_context.forward, canonical_out)
             return BlockMLPMomentResult(mu_out, sigma, None)
-        canonical_out, canonical_jacobian = self._coordinate_update_with_jacobian(canonical_mu)
+        canonical_out, canonical_jacobian = self._coordinate_update_with_jacobian(
+            canonical_mu, hidden_bias)
         mu_out = apply(frame_context.forward, canonical_out)
         if not _escalated_frame(frame_context, mu):
             realized_jacobian = (
@@ -435,19 +555,30 @@ class GaussianTemplateBlockMLP(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def responsibilities(self, mu: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-        r"""Return r_ia, shape (..., M), from mu (..., K) and sigma (..., K) or (..., K, K)."""
+        r"""Return r_ia, shape (..., M), from mu (..., K) and sigma (..., K) or (..., K, K).
+
+        The expanded square below reaches magnitudes of order K (Sigma_kk + mu_k^2) / lambda_ak and
+        cancels terms of that size, so it is evaluated with autocast disabled at
+        ``promote_types(mu, float32)`` (float64 stays float64); r is returned in ``mu.dtype``. Under
+        bf16 autocast the rounded logits otherwise moved r by a mean total variation of 0.05 at
+        variance ~1 and 0.26 at variance ~15 (CPU autocast, K = 256, M = 2048, 2026-09-28).
+        """
         sigma_diag = sigma if sigma.dim() == mu.dim() else torch.diagonal(sigma, dim1=-2, dim2=-1)
-        nu = self.nu.to(mu.dtype)
-        precision = torch.exp(-self.log_lambda.to(mu.dtype))                   # (M, K)
-        # sum_k (Sigma_kk + mu_k^2 - 2 mu_k nu_ak + nu_ak^2) / lambda_ak, contracted as matmuls
-        quadratic = (
-            (sigma_diag.to(mu.dtype) + mu.square()) @ precision.T              # (..., M)
-            - 2.0 * mu @ (nu * precision).T
-            + (nu.square() * precision).sum(dim=-1)
-        )
-        logits = self.log_pi.to(mu.dtype) - 0.5 * (
-            quadratic + self.log_lambda.to(mu.dtype).sum(dim=-1))
-        return torch.softmax(logits, dim=-1)
+        dtype = torch.promote_types(mu.dtype, torch.float32)
+        with torch.autocast(device_type=mu.device.type, enabled=False):
+            mu_work = mu.to(dtype)                                             # (..., K)
+            nu = self.nu.to(dtype)                                             # (M, K)
+            precision = torch.exp(-self.log_lambda.to(dtype))                  # (M, K)
+            # sum_k (Sigma_kk + mu_k^2 - 2 mu_k nu_ak + nu_ak^2) / lambda_ak, contracted as matmuls
+            quadratic = (
+                (sigma_diag.to(dtype) + mu_work.square()) @ precision.T        # (..., M)
+                - 2.0 * mu_work @ (nu * precision).T
+                + (nu.square() * precision).sum(dim=-1)
+            )
+            logits = self.log_pi.to(dtype) - 0.5 * (
+                quadratic + self.log_lambda.to(dtype).sum(dim=-1))
+            responsibilities = torch.softmax(logits, dim=-1)                   # (..., M)
+        return responsibilities.to(mu.dtype)
 
     def mean_update(self, mu: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
         message = self.responsibilities(mu, sigma) @ self.values.to(mu.dtype)  # (..., K)
@@ -462,8 +593,12 @@ class GaussianTemplateBlockMLP(nn.Module):
         sigma: torch.Tensor,
         *,
         frame_context: Optional[CanonicalFrameContext] = None,
+        hidden_bias: Optional[torch.Tensor] = None,
     ) -> BlockMLPMomentResult:
         del frame_context
+        _reject_hidden_bias(
+            hidden_bias,
+            "the gaussian_template block routes to templates and has no fc1 hidden layer")
         return BlockMLPMomentResult(self.mean_update(mu, sigma), sigma, None)
 
 
@@ -489,6 +624,9 @@ class BlockMLPRegistration:
     parameter_count_per_layer: Optional[Callable[[int, int], int]] = None
     # (width, expansion) -> per-layer matmul FLOPs replacing the two-layer 4 * expansion * width^2.
     matmul_flops_per_layer: Optional[Callable[[int, int], float]] = None
+    # extra_flops_per_layer for the diagonal covariance layout (..., K), for modes whose extra cost
+    # depends on the layout; None means the layout does not change the cost.
+    diagonal_extra_flops_per_layer: Optional[BlockMLPExtraFlops] = None
 
     def parameter_count(
         self,
@@ -512,6 +650,7 @@ class BlockMLPRegistration:
         expansion: int,
         covariance_contract: str,
         n_layers: int,
+        covariance_layout: str = "full",
     ) -> float:
         width = self.width(embed_dim, irrep_dims)
         per_layer = (
@@ -519,7 +658,11 @@ class BlockMLPRegistration:
             if self.matmul_flops_per_layer is not None
             else 4.0 * expansion * width * width
         )
-        per_layer +=self.extra_flops_per_layer(embed_dim, irrep_dims)
+        extra_flops = self.extra_flops_per_layer
+        if _validate_covariance_layout(covariance_layout) == "diagonal" \
+                and self.diagonal_extra_flops_per_layer is not None:
+            extra_flops = self.diagonal_extra_flops_per_layer
+        per_layer +=extra_flops(embed_dim, irrep_dims)
         if covariance_contract == "delta_full":
             per_layer += 4.0 * embed_dim ** 3
         return float(n_layers) * per_layer
@@ -576,6 +719,9 @@ BLOCK_MLP_REGISTRATIONS: Mapping[str, BlockMLPRegistration] = MappingProxyType({
             2.0 * dim ** 3 + 2.0 * dim ** 2 for dim in irrep_dims
         )),
         report_label=lambda _covariance: "invariant_scalar_gate",
+        # Diagonal layout: s_b = sum_k mu_k * (mu_k / sigma_k), a divide, a multiply and an add per
+        # coordinate, in place of the per-block Cholesky solve.
+        diagonal_extra_flops_per_layer=lambda _embed_dim, irrep_dims: 3.0 * float(sum(irrep_dims)),
     ),
     "canonical_frame": BlockMLPRegistration(
         factory=_canonical_frame_factory,
@@ -625,7 +771,9 @@ def block_mlp_build_metadata(
     embed_dim: int,
     irrep_dims: Sequence[int],
     n_layers: int,
+    covariance_layout: str = "full",
 ) -> BlockMLPBuildMetadata:
+    r"""Executable build record; ``covariance_layout`` ('full' | 'diagonal') selects layout-dependent FLOPs."""
     registration = get_block_mlp_registration(mode)
     if covariance not in registration.covariance_kinds:
         raise ValueError(f"unknown BlockMLP covariance contract {covariance!r}")
@@ -642,6 +790,7 @@ def block_mlp_build_metadata(
         expansion=expansion,
         covariance_contract=covariance,
         n_layers=n_layers,
+        covariance_layout=covariance_layout,
     )
     covariance_report = (
         "not_applicable" if not enabled else

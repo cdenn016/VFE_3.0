@@ -24,7 +24,9 @@ _CL100K_DATASETS = ("wiki-ja", "wiki-en", "wiki-ar")
 # Datasets whose cache holds WORD-level ids (whitespace tokens, not BPE). Their vocabulary is a
 # sidecar JSON beside the cache (vfe3.data.word_vocab) rather than a fixed published table, so the
 # bound used by validate_token_range is read from the table the ids were actually produced from.
-_WORD_DATASETS = ("wikitext-103-word",)
+# "wikitext-103-word-eos" is the published stream (one <eos> per row, vocabulary 267,735); the
+# no-<eos> "wikitext-103-word" cache is a separate dataset and is unchanged.
+_WORD_DATASETS = ("wikitext-103-word", "wikitext-103-word-eos")
 
 # Integer dtypes an on-disk token cache may hold. Uncapped loads keep any of these mapped in their
 # native width (no corpus-sized int64 copy); a capped load owns an int64 clone. Used by the cache
@@ -76,10 +78,10 @@ def tokenizer_vocab_size(dataset: str, *, cache_dir: Optional[Path] = None) -> i
     """
     tag = _tokenizer_tag(dataset)
     if tag == "word":
-        from vfe3.data.word_vocab import REFERENCE_VOCAB_SIZE
+        from vfe3.data.word_vocab import reference_vocab_size
 
         vocabulary = _load_word_vocabulary(dataset, tag, cache_dir=cache_dir)
-        return REFERENCE_VOCAB_SIZE if vocabulary is None else vocabulary.vocab_size
+        return reference_vocab_size(dataset) if vocabulary is None else vocabulary.vocab_size
     return _TOKENIZER_VOCAB_SIZE[tag]
 
 
@@ -404,7 +406,8 @@ def _require_word_cache_matches_vocabulary(
         raise ValueError(f"word cache metadata {meta_path} is unreadable") from exc
     if not isinstance(meta, dict):
         raise ValueError(f"word cache metadata {meta_path} must be a JSON object")
-    recorded = {key: meta[key] for key in ("vocab_size", "min_count") if key in meta}
+    # "eos" is recorded only by <eos> builds, so the no-<eos> caches are checked exactly as before.
+    recorded = {key: meta[key] for key in ("vocab_size", "min_count", "eos") if key in meta}
     if not recorded:
         return
     from vfe3.data.word_vocab import vocabulary_path
@@ -415,7 +418,8 @@ def _require_word_cache_matches_vocabulary(
         raise FileNotFoundError(
             f"word cache {meta_path.name} records {recorded} but its vocabulary sidecar {sidecar} is "
             "absent; rebuild the word cache")
-    actual = {"vocab_size": vocabulary.vocab_size, "min_count": vocabulary.min_count}
+    actual = {"vocab_size": vocabulary.vocab_size, "min_count": vocabulary.min_count,
+              "eos": vocabulary.eos}
     differing = sorted(key for key in recorded if recorded[key] != actual[key])
     if differing:
         encoded_with = {key: recorded[key] for key in differing}

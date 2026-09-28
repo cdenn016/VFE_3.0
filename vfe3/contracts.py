@@ -1,7 +1,7 @@
 """Shared type contracts for mutable runtime dictionaries."""
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, TypedDict
+from typing import Dict, List, Mapping, Optional, Tuple, TypedDict
 
 import torch
 
@@ -134,6 +134,31 @@ class ExecutableBuildMetadata:
 def is_conditional_filtering(model: object) -> bool:
     """Whether a model owns the relational conditional routing/content module."""
     return getattr(model, "relational_operators", None) is not None
+
+
+# Model families the shared training loop, finalize and the paper assemblers know. A model or config
+# without a ``model_family`` attribute (every VFEModel and VFE3Config) is the VFE family, so the VFE
+# paths never read the tag and stay exactly as they were.
+VFE_MODEL_FAMILY: str = "vfe"
+
+
+def model_family_of(obj: object) -> str:
+    r"""The model family of a model, a config, or a serialized config mapping (``"vfe"`` when untagged)."""
+    if isinstance(obj, Mapping):
+        family = obj.get("model_family", VFE_MODEL_FAMILY)
+    else:
+        family = getattr(obj, "model_family", VFE_MODEL_FAMILY)
+    return VFE_MODEL_FAMILY if family is None else str(family)
+
+
+def is_vfe_model(model: object) -> bool:
+    r"""Whether ``model`` is a VFE model (the gate of every VFE-specific call in the shared loop)."""
+    return model_family_of(model) == VFE_MODEL_FAMILY
+
+
+def is_vfe_config(cfg: object) -> bool:
+    r"""Whether ``cfg`` (a config object or a serialized mapping) belongs to the VFE family."""
+    return model_family_of(cfg) == VFE_MODEL_FAMILY
 
 
 class MStepCapture(TypedDict, total=False):

@@ -60,8 +60,11 @@ def test_block_mlp_mode_and_covariance_controls_validate(mode, covariance):
         ({"block_mlp_covariance": "unknown"}, "block_mlp_covariance"),
         ({"block_mlp_covariance_floor": 0.0}, "block_mlp_covariance_floor"),
         ({
+            # A passthrough gauge gate is admitted on gaussian_diagonal; the dense J Sigma J^T of
+            # delta_full still needs the full family.
             "use_block_mlp": True,
             "block_mlp_mode": "gauge_gate",
+            "block_mlp_covariance": "delta_full",
             "family": "gaussian_diagonal",
             "decode_mode": "diagonal_chunked",
         }, "full-covariance"),

@@ -363,6 +363,8 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     decode_unigram_prior              = True,       # add kappa*log pi_v (corpus unigram) to decode logits    
     untie_decode_bank                 = False,       # prior-bank modes only: decode reads its OWN cloned (V,K) tables
+
+    decode_coordinates                = "local",       # "local" | "reference"
     
     
     #################################
@@ -372,6 +374,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     block_mlp_expansion       = 8,
     block_mlp_activation      = "gelu",
     block_mlp_dropout         = 0.00,
+    per_type_hidden_bias      = False,          # per-type (V x n_gen) bias on the MLP hidden layer; coordinate MLP, projected route
 
     
     #################################
@@ -490,6 +493,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     m_head_evidence_lr        = None,      # active only with use_priorbank_head_evidence_mixer
 
     
+    m_per_type_hidden_bias_lr = None,      # None inherits the declared m_phi_lr; active only with per_type_hidden_bias
     min_lr_frac               = 0.01,
    
     
@@ -501,6 +505,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     layernorm_affine          = True,
     norm_type_block           = "layernorm",             # "none" | "mahalanobis" |"layernorm"
     norm_type_final           = "none",             # "none" | "mahalanobis" |"layernorm"
+    block_coordinates         = "local",            # "local" | "reference" (LN and MLP applied as U Phi(U^-1 .))
   
 
     #################################

@@ -51,6 +51,7 @@ from vfe3.model.block_mlp import (
     get_block_mlp_registration,
 )
 from vfe3.model.block import _as_coeff, vfe_block
+from vfe3.model.frame_actions import frame_matvec
 from vfe3.model.positional_phi import positional_phi_coords
 from vfe3.model.prior_bank import (
     DecodeCEResult,
@@ -122,6 +123,19 @@ def _positional_arity(builder: Callable) -> int:
         if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.default is p.empty:
             n += 1
     return n
+
+
+def per_type_hidden_widths(n_gen: int, n_layers: int) -> Tuple[int, ...]:
+    r"""Per-layer widths of the per-type hidden-bias table, :math:`\sum_\ell w_\ell = n_{\mathrm{gen}}`.
+
+    .. math:: w_\ell = \lfloor n_{\mathrm{gen}}/L \rfloor + [\ell < n_{\mathrm{gen}} \bmod L],
+
+    so the remainder units go to the first layers.
+    """
+    if n_layers < 1 or n_gen < 1:
+        raise ValueError(f"per_type_hidden_widths needs n_gen >= 1 and n_layers >= 1, got {n_gen}, {n_layers}")
+    base, extra = divmod(n_gen, n_layers)
+    return tuple(base + (1 if layer < extra else 0) for layer in range(n_layers))
 
 
 def build_group(cfg: VFE3Config) -> GaugeGroup:
@@ -418,6 +432,7 @@ class VFEModel(nn.Module):
             use_priorbank_head_evidence_mixer=cfg.use_priorbank_head_evidence_mixer,
             gauge_group_is_tied=(cfg.gauge_group == "tied_block_glk"),
             gauge_group_name=self.group.name,
+            decode_coordinates=cfg.decode_coordinates,
         )
         if not cfg.decode_temperature_learned:
             # Fixed Gibbs readout temperature: the parameter keeps its name (checkpoint layout is
@@ -452,6 +467,26 @@ class VFEModel(nn.Module):
                 for _ in range(cfg.n_layers)
             ]) if cfg.use_block_mlp else None
         )
+        # Per-type hidden bias (default off: no parameter, no state-dict key, no RNG draw). A (V, n_gen)
+        # table E, zero-initialized so step 0 equals the model without it, split over the layers into
+        # widths w_l; layer l adds E[x_i, slice_l] to the first w_l hidden pre-activation units of its
+        # block MLP. Every w_l must fit that layer's hidden width.
+        self._per_type_hidden_widths: Tuple[int, ...] = ()
+        if not cfg.per_type_hidden_bias:
+            self.per_type_hidden_bias = None
+        else:
+            widths = per_type_hidden_widths(n_gen, cfg.n_layers)
+            for layer_index, (width, mlp) in enumerate(zip(widths, self.block_mlps)):
+                fc1 = getattr(mlp, "fc1", None)
+                if fc1 is None or width > fc1.out_features:
+                    raise ValueError(
+                        f"per_type_hidden_bias: layer {layer_index} needs {width} hidden units of the "
+                        f"n_gen={n_gen} table split over n_layers={cfg.n_layers}, but its block MLP "
+                        f"{type(mlp).__name__} has "
+                        f"{'no fc1' if fc1 is None else f'{fc1.out_features} hidden units'}; raise "
+                        "block_mlp_expansion")
+            self.per_type_hidden_bias = nn.Parameter(torch.zeros(cfg.vocab_size, n_gen))   # (V, n_gen)
+            self._per_type_hidden_widths = widths
         self._block_mlp_registration = get_block_mlp_registration(cfg.block_mlp_mode)
         self.executable_build = ExecutableBuildMetadata(
             block_mlp=block_mlp_build_metadata(
@@ -465,6 +500,7 @@ class VFEModel(nn.Module):
                 embed_dim=cfg.embed_dim,
                 irrep_dims=self.group.irrep_dims,
                 n_layers=cfg.n_layers,
+                covariance_layout=("full" if cfg.family == "gaussian_full" else "diagonal"),
             )
         )
         self.final_norm = get_norm(cfg.norm_type_final)(cfg.embed_dim, eps=cfg.eps,
@@ -1094,6 +1130,7 @@ class VFEModel(nn.Module):
         _mean_only_loss: bool          = False,          # private linear-loss path; public beliefs retain full covariance
         capture:        Optional[MStepCapture]       = None,   # out-param: M-step intermediates (q*, final-block prior, raw out)
         estep_grad_out: Optional[EStepGradientOutput] = None,   # diag out-param: E-step belief-grad norms (forwarded)
+        _decode_frame_out: Optional[dict]            = None,   # private out-param: the reference decode frame
     ) -> 'Tuple[BeliefState, Optional[torch.Tensor]]':
         r"""Run the belief pipeline and return the converged belief q* (post final_norm), optionally
         with the decoded logits. This is the single belief-production seam used by ``forward`` and,
@@ -1116,6 +1153,16 @@ class VFEModel(nn.Module):
         pre-transform q*) and ``capture['final_block_prior']`` (the live ``(mu_p, sigma_p)`` entering
         that block), both written by ``vfe_stack``. ``capture['prior']`` retains the encode-time prior
         (post s-refine), and ``capture['out']`` retains the raw stack output (pre final_norm).
+
+        Reference coordinates. Under ``block_coordinates='reference'`` the final norm, like the block
+        norm and MLP, acts on :math:`\xi_i = U_i^{-1}\mu_i` and is mapped back,
+        :math:`\mu \mapsto U_i\,\mathrm{FN}(U_i^{-1}\mu)`; the returned belief stays in local coordinates.
+        Under ``decode_coordinates='reference'`` the realized relational frame :math:`U_i` is the decode
+        frame: it is stored as ``capture['canonical_frame']`` (the key every decode caller already
+        threads into ``_decode_belief_with_context``) and in the private ``_decode_frame_out['frame']``
+        for the fused training CE, so the logits read :math:`(\xi_i, C_i)` on every decode path.
+        ``per_type_hidden_bias`` gathers its table once here and hands layer ``l`` its width-``w_l``
+        slice.
 
         This seam carries the same internal
         ``run = no_grad() if e_step_gradient=='detach'
@@ -1250,6 +1297,17 @@ class VFEModel(nn.Module):
                                 if rope is not None else intrinsic)
                     relational_value_frame = (relational_frame
                                               if self.cfg.rope_on_value else intrinsic)
+            if self.cfg.decode_coordinates == "reference":
+                # The covariant decoder reads (xi, C) through the frame the attention reads.
+                if relational_frame is None:
+                    raise RuntimeError(
+                        "decode_coordinates='reference' requires the realized relational frame; this "
+                        "forward built none (projected attention route required)")
+                canonical_frame = relational_frame
+                if capture is not None:
+                    capture["canonical_frame"] = canonical_frame
+                if _decode_frame_out is not None:
+                    _decode_frame_out["frame"] = canonical_frame
             if (
                 self.executable_build.block_mlp.enabled
                 and self._block_mlp_registration.requires_frame_context
@@ -1270,6 +1328,13 @@ class VFEModel(nn.Module):
             grad_rec: Optional[EStepGradientRecord] = (
                 {} if estep_grad_out is not None else None
             )                                                       # E-step belief-grad capture (gated, off by default)
+            stack_extra: Dict[str, Any] = {}
+            if self.per_type_hidden_bias is not None:
+                # One gather per forward, split over the layers: layer l reads E^(l)[x_i], (B, N, w_l).
+                table = self.per_type_hidden_bias[token_ids]                    # (B, N, n_gen)
+                stack_extra["block_mlp_hidden_biases"] = [
+                    part if part.shape[-1] > 0 else None
+                    for part in torch.split(table, list(self._per_type_hidden_widths), dim=-1)]
             out = vfe_stack(
                 beliefs, beliefs.mu, beliefs.sigma, self.group, self.cfg,
                 log_prior=log_prior, block_norm=self.block_norm,
@@ -1296,7 +1361,8 @@ class VFEModel(nn.Module):
                 ),
                 capture=capture, grad_record=grad_rec,
                 transport_status=self._transport_status,
-                prebuilt_transport=shared_omega)
+                prebuilt_transport=shared_omega,
+                **stack_extra)
         if estep_grad_out is not None:                           # real tensor norms read only when requested
             for _gk in ("mu", "sigma", "phi"):
                 _gv = grad_rec.get(_gk, 0.0) if grad_rec is not None else 0.0
@@ -1305,7 +1371,18 @@ class VFEModel(nn.Module):
         sigma_final = out.sigma                                  # inside vfe_stack now, not post-stack
 
         if self.final_norm is not None:                          # config-selected final norm (cached)
-            mu_final = self.final_norm(mu_final, sigma_final)
+            if self.cfg.block_coordinates == "reference":
+                # Reference coordinates: mu -> U_i FN(U_i^{-1} mu), the same conjugation as the block.
+                if relational_frame is None:
+                    raise RuntimeError(
+                        "block_coordinates='reference' requires the realized relational frame for the "
+                        "final norm; this forward built none")
+                bd = relational_frame.block_diagonal
+                xi_final = frame_matvec(relational_frame.inverse, mu_final, bd)    # (B, N, K)
+                mu_final = frame_matvec(relational_frame.forward,
+                                        self.final_norm(xi_final, sigma_final), bd)
+            else:
+                mu_final = self.final_norm(mu_final, sigma_final)
 
         belief = BeliefState(mu=mu_final, sigma=sigma_final, phi=out.phi,
                              right_phi=out.right_phi)   # carry the exact positional right factor
@@ -1374,6 +1451,10 @@ class VFEModel(nn.Module):
             # appends to (or stacks) a CG list (PB-13).
             cap["cg_moment_energy_rows"] = []
             cap["cg_pre_moments"] = []
+        # decode_coordinates='reference' receives the decode frame through a private out-param, so the
+        # captureless fast paths (content-factor reuse, mean-only final layer) stay available.
+        decode_frame_out: Optional[dict] = (
+            {} if self.cfg.decode_coordinates == "reference" else None)
         belief, _ = self.forward_beliefs(
             token_ids,
             return_logits=False,
@@ -1381,11 +1462,14 @@ class VFEModel(nn.Module):
             estep_grad_out=estep_grad_out,
             _reuse_content_factors=True,
             _mean_only_loss=True,
+            **({} if decode_frame_out is None else {"_decode_frame_out": decode_frame_out}),
         )
         mu_final, sigma_final = belief.mu, belief.sigma          # (B, N, K) post final_norm; sigma = out.sigma
         canonical_frame = (
             cap.get("canonical_frame") if cap is not None else None
         )
+        if decode_frame_out is not None:
+            canonical_frame = decode_frame_out["frame"]          # realized U_i: the decoder reads (xi, C)
 
         # Decode + cross-entropy fp32 island. The decode matmul (_decode_diagonal) reconstructs the
         # Mahalanobis term via a catastrophically-cancelling subtraction pinned at atol-1e-3, and CE
@@ -1422,9 +1506,15 @@ class VFEModel(nn.Module):
                             canonical_frame=canonical_frame,
                             **fused_kwargs,
                         )
-                else:
+                elif canonical_frame is None:
                     fused_result = decode_registration.fused_ce(
                         self.prior_bank, mu_final.float(), targets,
+                        **fused_kwargs,
+                    )
+                else:                                            # decode_coordinates='reference'
+                    fused_result = decode_registration.fused_ce(
+                        self.prior_bank, mu_final.float(), targets,
+                        canonical_frame=canonical_frame,
                         **fused_kwargs,
                     )
                 if return_decode_stats and decode_registration.fused_ce_supports_stats:

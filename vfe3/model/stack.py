@@ -88,6 +88,7 @@ def vfe_stack(
     relational_frame: Optional[CanonicalFrameContext] = None,
     relational_value_frame: Optional[CanonicalFrameContext] = None,
     relational_capture: Optional[dict] = None,
+    block_mlp_hidden_biases: Optional[Sequence[Optional[torch.Tensor]]] = None,   # per layer (B, N, w_l) or None
 ) -> BeliefState:
     r"""Run L = cfg.n_layers blocks, handing the belief mean off to the next prior.
 
@@ -97,7 +98,13 @@ def vfe_stack(
     gradient, 'straight_through' detaches the per-iteration tangent; both share the forward value).
     'detach' is handled by the caller's no_grad wrapper, so here it behaves like 'unroll'.
     ``rope`` is the precomputed block-diagonal positional rotation R(theta) (None = off, the pure
-    path); ``rope_on_cov`` enables the full-gauge covariance sandwich rotation."""
+    path); ``rope_on_cov`` enables the full-gauge covariance sandwich rotation.
+    ``block_mlp_hidden_biases`` (``per_type_hidden_bias``) holds one ``(B, N, w_l)`` slice of the
+    per-type table per layer, added to that layer's block-MLP hidden pre-activation."""
+    if block_mlp_hidden_biases is not None and len(block_mlp_hidden_biases) != cfg.n_layers:
+        raise ValueError(
+            f"block_mlp_hidden_biases needs one entry per layer ({cfg.n_layers}), "
+            f"got {len(block_mlp_hidden_biases)}")
     rho = cfg.prior_handoff_rho
     rho_s = cfg.prior_handoff_sigma
     need_prior_handoff = not _can_omit_prior_handoff(
@@ -135,6 +142,9 @@ def vfe_stack(
             # Capture the exact base temperature used by the final block so reflection/two-hop
             # scoring reuses the forward value. The scorer reads it under no_grad.
             capture["final_block_tau"] = tau_b
+        hidden_bias = (block_mlp_hidden_biases[layer_index]
+                       if block_mlp_hidden_biases is not None else None)
+        block_extra = {} if hidden_bias is None else {"hidden_bias": hidden_bias}
         belief = vfe_block(belief, mu_p, sigma_p, group, cfg, log_prior=log_prior,
                            block_norm=block_norm, head_mixer=head_mixer, cg_coupling=cg_coupling,
                            block_mlp=(block_mlps[layer_index] if block_mlps is not None else None),
@@ -157,7 +167,8 @@ def vfe_stack(
                            state_record=(diagnostic_capture.setdefault(
                                "e_step_trace", {"sequence_index": 0})
                                          if diagnostic_capture is not None and layer_index == 0 else None),
-                           prebuilt_transport=prebuilt_transport)      # phi is loop-invariant when e_phi_lr==0
+                           prebuilt_transport=prebuilt_transport,      # phi is loop-invariant when e_phi_lr==0
+                           **block_extra)
         if diagnostic_capture is not None:
             if relational_capture is not None:
                 # The shared capture is overwritten by the next block. Preserve each
