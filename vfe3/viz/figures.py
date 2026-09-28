@@ -29,7 +29,7 @@ from vfe3.metric_contracts import SCALING_MIN_TESTABLE_SIZES
 from vfe3.process_utils import ProcessTree, spawn_process_tree
 import numpy as np
 from matplotlib.collections import PathCollection, QuadMesh
-from matplotlib.colors import LogNorm
+from matplotlib.colors import ListedColormap, LogNorm
 from matplotlib.ticker import FuncFormatter, LogLocator, MaxNLocator, NullFormatter
 
 from vfe3.viz.text import installed_multilingual_sans_serif, token_label
@@ -1110,13 +1110,13 @@ def _attn_log_bounds(
     vmax:  Optional[float] = None,
 
     *,
-    floor: float           = 1e-4,
+    floor: float           = 1e-6,
 ) -> tuple:                              # (vmin, vmax) valid for a LogNorm scale
-    r"""Positive-entry (vmin, vmax) for a log attention scale (scale bottoms out at ``floor`` = 1e-4).
+    r"""Positive-entry (vmin, vmax) for a log attention scale (scale bottoms out at ``floor`` = 1e-6).
 
     Causal-masked future positions are exact zeros (softmax over a -inf prior), so only the
-    active (positive) entries set the scale. ``vmin`` is floored at ``floor`` (default 1e-4) so the
-    log scale resolves attention weights down to 1e-4 while a long causal-softmax tail of near-zero
+    active (positive) entries set the scale. ``vmin`` is floored at ``floor`` (default 1e-6) so the
+    log scale resolves attention weights down to 1e-6 while a long causal-softmax tail of near-zero
     weights cannot wash a panel out, and kept strictly below ``vmax`` so a uniform map stays a valid
     LogNorm. Pass both bounds to share one scale across several panels.
     """
@@ -1126,7 +1126,7 @@ def _attn_log_bounds(
     if vmin is None:
         pos = M[M > 0]
         vmin = float(pos.min()) if pos.size else vmax * floor
-    vmin = max(vmin, floor)                                       # bottom the log scale at 1e-4
+    vmin = max(vmin, floor)                                       # bottom the log scale at 1e-6
     if vmin >= vmax:                                             # degenerate / uniform map
         vmin = vmax * floor
     return float(vmin), float(vmax)
@@ -1136,12 +1136,19 @@ def _attn_imshow(ax, B: np.ndarray, *, vmin: float, vmax: float, log: bool = Tru
     r"""imshow one (N, N) attention map. ``log`` (default) uses ``LogNorm`` to resolve the peaky
     off-diagonal structure a linear scale washes to black. On a causal map (every entry above the
     diagonal zero) the future keys are masked and drawn light gray, so they cannot be mistaken for
-    scorable keys with negligible weight; a zero weight on or below the diagonal (fp32 underflow) is
-    drawn at the bottom of the scale. ``cmap`` selects the color family (belief beta = 'magma')."""
-    cmap_obj = plt.get_cmap(cmap).copy()
+    scorable keys with negligible weight. On the log scale the colormap's near-black bottom 15% is
+    dropped, so the lowest in-range decade stays readable, and every weight below ``vmin`` --
+    including an exact zero on or below the diagonal (fp32 underflow) -- is drawn pure black as
+    "below the scale floor". ``cmap`` selects the color family (belief beta = 'magma')."""
+    base = plt.get_cmap(cmap)
+    if log:
+        cmap_obj = ListedColormap(base(np.linspace(0.15, 1.0, 256)), name=f"{base.name}_floored")
+        cmap_obj.set_under("black")
+    else:
+        cmap_obj = base.copy()
     cmap_obj.set_bad("#dddddd")
     B = np.asarray(B, dtype=float)
-    shown = np.where(B > 0, B, vmin if log else 0.0)
+    shown = np.where(B > 0, B, np.finfo(float).tiny if log else 0.0)
     if B.ndim == 2 and B.shape[0] == B.shape[1] and B.shape[0] > 1:
         future = np.triu(np.ones(B.shape, dtype=bool), 1)
         if not np.any(B[future] > 0):
@@ -1169,15 +1176,15 @@ def plot_attention_heatmap(
     so the default ``log`` scale (matplotlib ``LogNorm`` on beta) resolves the off-diagonal
     structure a linear scale collapses to black; the causal-masked zeros render as the 'bad'
     color. Pass shared ``vmin``/``vmax`` to make several panels comparable; otherwise the positive
-    entries set the scale (log floor at 1e-4). ``cmap``/``symbol`` set the heatmap color family and
-    the colorbar's math symbol.
+    entries set the scale (log floor at 1e-6; weights below it draw black). ``cmap``/``symbol`` set
+    the heatmap color family and the colorbar's math symbol.
     """
     B = _np(beta)
     vlo, vhi = _attn_log_bounds(B, vmin, vmax)
     fig, ax = plt.subplots(figsize=(4.5, 4))
     im = _attn_imshow(ax, B, vmin=vlo, vmax=vhi, log=log, cmap=cmap)
     label = rf"${symbol}_{{ij}}$ (log scale)" if log else rf"${symbol}_{{ij}}$"
-    fig.colorbar(im, ax=ax, shrink=0.8, label=label)
+    fig.colorbar(im, ax=ax, shrink=0.8, label=label, extend="min" if log else "neither")
     ax.set(title=title, xlabel="key j", ylabel="query i")
     return _save(fig, path)
 
@@ -1221,7 +1228,8 @@ def plot_attention_grid(
                 ax.set_xlabel("key $j$")
     if im is not None:
         label = r"$\beta_{ij}$ (log scale)" if log else r"$\beta_{ij}$"
-        fig.colorbar(im, ax=list(axes.ravel()), shrink=0.85, label=label)
+        fig.colorbar(im, ax=list(axes.ravel()), shrink=0.85, label=label,
+                     extend="min" if log else "neither")
     fig.suptitle(title)
     return _save(fig, path)
 
