@@ -611,8 +611,8 @@ def test_plot_numerical_trust_saves(tmp_path):
     cells = {(r, c): cell.get_text().get_text()
              for table in fig.axes[0].tables for (r, c), cell in table.get_celld().items()}
     rows = {cells[(r, 0)]: (cells[(r, 1)], cells[(r, 2)]) for r in range(1, 1 + max(k[0] for k in cells))}
-    assert rows["(layer, head) maps with future attention > 1e-06"] == ("0", "6")
-    assert rows["variance at the floor eps"] == ("n/a", "not recorded")
+    assert rows["(layer, head) maps with future attention > $10^{-6}$"] == ("0", "6")
+    assert rows[r"variance at the floor $\varepsilon$"] == ("n/a", "not recorded")
     plt.close(fig)
     assert _saved_nonempty(p)
 

@@ -248,10 +248,12 @@ def _group_history(n: int = 60) -> dict:
 def test_grad_norm_decomposition_uses_named_groups(tmp_path):
     fig = figs.plot_grad_norm_decomposition(_group_history(), path=str(tmp_path / "g.png"))
     assert fig._suptitle.get_text() == "M-step gradient norm by parameter group"
-    assert _titles(fig) == ["per-type tables", "context processing"]
-    legend = " ".join(t.get_text() for ax in fig.axes if ax.get_legend()
-                      for t in ax.get_legend().get_texts())
-    assert "decode" in legend and "score maps" in legend and "block MLP" in legend
+    # One panel per live group, per-type tables first, under one bold header per family.
+    assert _titles(fig) == [figs._GROUP_LABELS[g] for g in figs._TABLE_GROUPS + figs._CONTEXT_GROUPS]
+    assert [t.get_text() for ax in fig.axes for t in ax.texts] == ["Per-type tables",
+                                                                  "Context processing"]
+    assert all(ax.get_legend() is None for ax in fig.axes)
+    assert len({ax.get_ylim() for ax in _live_axes(fig)}) == 1          # one shared log y axis
     _check_page(fig)
     plt.close(fig)
 
@@ -277,9 +279,10 @@ def test_optimizer_geometry_groups_sigma_moments_and_title(tmp_path):
     assert "Parameter norm, per-type tables" in titles
     assert "Update-to-weight ratio, context processing" in titles
     assert any("Stored log-variances" in title for title in titles)
-    legend = " ".join(t.get_text() for ax in fig.axes if ax.get_legend()
-                      for t in ax.get_legend().get_texts())
-    assert r"$\log\sigma^2$ table" not in legend                     # excluded from norms and ratios
+    assert all(ax.get_legend() is None for ax in fig.axes)          # lines are labeled at their ends
+    labels = [t.get_text() for ax in fig.axes for t in ax.texts]
+    assert "decode" in labels and r"score maps $S_Q,S_K$" in labels
+    assert r"$\log\sigma^2$ table" not in labels                     # excluded from norms and ratios
     _check_page(fig)
     plt.close(fig)
     hist["phi_ridge_direction_cosine_mean"] = np.full(hist["step"].size, 0.9)
@@ -299,7 +302,7 @@ def test_optimizer_geometry_legacy_role_columns(tmp_path):
     assert fig._suptitle.get_text() == "Optimizer geometry"
     assert any("Norm of the" in title for title in titles)
     ratio_axis = next(ax for ax in fig.axes if ax.get_title() == "Gradient-to-weight ratio")
-    assert len(ratio_axis.get_legend().get_texts()) == 2             # no Sigma ratio
+    assert [t.get_text() for t in ratio_axis.texts] == ["'mu' role", "'phi' role"]   # no Sigma ratio
     assert any("'mu' role = mu table, decode" in t.get_text() for t in fig.texts)
     _check_page(fig)
     plt.close(fig)
@@ -386,11 +389,11 @@ def test_numerical_trust_counts_with_denominators(tmp_path):
              for (r, c), cell in fig.axes[0].tables[0].get_celld().items()}
     rows = {cells[(r, 0)]: (cells[(r, 1)], cells[(r, 2)])
             for r in range(1, 1 + max(key[0] for key in cells))}
-    assert rows["variance at the floor eps"] == ("2", "8")
-    assert rows["non-finite mu"] == ("2", "4")
-    assert rows["non-finite beta"] == ("0", "16")
-    assert rows["(layer, head) maps with future attention > 1e-06"] == ("1", "4")
-    assert rows["(layer, head) maps with |row sum - 1| > 1e-05"] == ("0", "4")
+    assert rows[r"variance at the floor $\varepsilon$"] == ("2", "8")
+    assert rows[r"non-finite $\mu$"] == ("2", "4")
+    assert rows[r"non-finite $\beta$"] == ("0", "16")
+    assert rows["(layer, head) maps with future attention > $10^{-6}$"] == ("1", "4")
+    assert rows[r"(layer, head) maps with $|{\sum}_j\beta_{ij}-1|$ > $10^{-5}$"] == ("0", "4")
     assert "test split, one 4-token sequence" in fig.axes[0].get_title()
     _check_page(fig)
     plt.close(fig)

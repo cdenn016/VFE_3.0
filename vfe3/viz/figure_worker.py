@@ -157,7 +157,10 @@ def _render_saved_probe_figures(run_dir: Path, logger: logging.Logger) -> List[P
         plot_estep_character,
         plot_estep_depth_sensitivity,
         plot_phi_numerics_reference,
+        set_publication_style,
     )
+
+    set_publication_style()
 
     saved_probes = (
         (
@@ -362,11 +365,11 @@ def _render_attention_request(request: Mapping[str, object], run_dir: Path) -> N
         for head in range(n_heads):
             if channel == "estep":
                 filename = f"step_{step}_layer{layer}_head{head}.png"
-                title = (f"E-step attention (step {step}) - layer {layer} head {head}"
+                title = (f"E-step attention (step {step:,}), layer {layer} head {head}"
                          "\nscored at the ENTRY belief (the pattern the E-step aggregated with)")
             else:
                 filename = f"step_{step}_layer{layer}_head{head}.png"
-                title = f"Attention (step {step}) - layer {layer} head {head}"
+                title = f"Attention (step {step:,}), layer {layer} head {head}"
             matrix = maps[layer, head]
             final_path = attention_dir / filename
             with _unique_sibling_output_temp(final_path) as temporary_path:

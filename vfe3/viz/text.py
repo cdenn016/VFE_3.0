@@ -35,11 +35,25 @@ def supports_english_linguistic_taxonomies(dataset: str) -> bool:
 
 
 def installed_multilingual_sans_serif() -> list[str]:
-    """Return the configured fallback families that Matplotlib can resolve on this machine."""
+    """Return the configured fallback families that Matplotlib can resolve on this machine.
+
+    A family counts as installed only when it has an upright regular-weight face. Matplotlib
+    otherwise substitutes the nearest weight, so a machine with only ``NotoSans-Bold.ttf`` renders
+    every normal-weight label bold. When the leading Latin family is unavailable, DejaVu Sans takes
+    its place at the front, so Latin text keeps a Latin face that matches the mathtext glyphs
+    instead of falling through to a CJK family.
+    """
     from matplotlib import font_manager
 
-    installed = {entry.name for entry in font_manager.fontManager.ttflist}
-    available = [name for name in MULTILINGUAL_SANS_SERIF if name in installed]
+    regular = set()
+    for entry in font_manager.fontManager.ttflist:
+        weight = font_manager.weight_dict.get(entry.weight, entry.weight)
+        if entry.style == "normal" and isinstance(weight, int) and 350 <= weight <= 500:
+            regular.add(entry.name)
+    available = [name for name in MULTILINGUAL_SANS_SERIF if name in regular]
+    if MULTILINGUAL_SANS_SERIF[0] not in available and "DejaVu Sans" in available:
+        available.remove("DejaVu Sans")
+        available.insert(0, "DejaVu Sans")
     return available or ["DejaVu Sans"]
 
 
