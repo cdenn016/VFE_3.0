@@ -976,9 +976,25 @@ def generate_figures(
               diagonal=cfg.diagonal_covariance, divergence_family=cfg.divergence_family,
               full_cov_kl_precision=model.full_cov_kl_precision), path=p),
           "gauge_equivariance.png" in planned_figures)
+    # sigma_max caps only the sigma E-step retraction. Where inactive_fields marks it inert (projected
+    # routes, whose moment-matched predictive covariance is an unclamped readout, and
+    # skip_belief_sigma_update) no ceiling bounds the plotted covariance, so neither the scree line
+    # nor the numerical-trust ceiling row is drawn.
+    def _sigma_ceiling() -> Optional[float]:
+        return None if "sigma_max" in cfg.inactive_fields() else cfg.sigma_max
+
+    def _numerical_guard() -> Dict[str, float]:
+        ceiling = _sigma_ceiling()
+        guard = dict(cstate["guard"]) if "guard" in cstate else metrics.guard_saturation(
+            cstate["sigma"], cstate["energy"], cstate["self_div"], diagonal=cfg.diagonal_covariance,
+            eps=cfg.eps, sigma_max=ceiling, kl_max=cfg.kl_max)
+        if ceiling is None:
+            guard.pop("sigma_ceil_frac", None)
+        return guard
+
     _emit("belief_spectrum",
           lambda p: figs.plot_belief_spectrum(
-              cstate["sigma"], eps=cfg.eps, sigma_max=cfg.sigma_max,
+              cstate["sigma"], eps=cfg.eps, sigma_max=_sigma_ceiling(),
               family=cfg.family, path=p),
           "belief_spectrum.png" in planned_figures)
     _emit("spd_ellipses",
@@ -993,14 +1009,13 @@ def generate_figures(
           "holonomy_curvature.png" in planned_figures)
     _emit("numerical_trust",
           lambda p: figs.plot_numerical_trust(
-              (cstate["guard"] if "guard" in cstate else metrics.guard_saturation(
-                  cstate["sigma"], cstate["energy"], cstate["self_div"],
-                  eps=cfg.eps, sigma_max=cfg.sigma_max, kl_max=cfg.kl_max)),
+              _numerical_guard(),
               health if health is not None else {},
               causal=(metrics.causal_sanity(amaps) if amaps is not None else None),
               guard_denominators=(cstate["guard_denominators"] if "guard_denominators" in cstate
                                   else extract.guard_denominators(
-                                      cstate["sigma"], cstate["energy"], cstate.get("self_div"))),
+                                      cstate["sigma"], cstate["energy"], cstate.get("self_div"),
+                                      diagonal=cfg.diagonal_covariance)),
               population=report_population, path=p),
           "numerical_trust.png" in planned_figures)
     # Next-token vocabulary-probability figures (single-arm here; the cross-run K70-vs-K120 contrast

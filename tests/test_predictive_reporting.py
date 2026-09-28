@@ -94,6 +94,45 @@ def test_predictive_report_emits_state_figures_and_finite_readout_panels(tmp_pat
     figures.plt.close(fig)
 
 
+@pytest.mark.parametrize("route, ceiling_binds", [
+    (dict(attention_mode="projected_predictive", predictive_covariance="moment_matched",
+          relational_input_scope="full", relational_output_scope="full", n_e_steps=1), False),
+    (dict(attention_mode="transported", skip_belief_sigma_update=False, n_e_steps=2,
+          e_q_sigma_lr=0.5), True),
+])
+def test_report_draws_sigma_max_only_where_it_bounds_the_belief(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: dict, ceiling_binds: bool) -> None:
+    # sigma_max caps only the sigma E-step retraction. The moment-matched predictive covariance is
+    # an unclamped readout, so with a token table above the cap every plotted variance exceeds it.
+    # N == K == 4 also pins that the guard reads the (N, K) diagonal as variances, not a K x K matrix.
+    torch.manual_seed(71)
+    model = VFEModel(VFE3Config(
+        vocab_size=7, embed_dim=4, n_heads=2, batch_size=1, max_seq_len=4,
+        n_layers=2, family="gaussian_diagonal", gauge_group="block_glk",
+        e_phi_lr=0.0, pos_phi="learned", use_block_mlp=True, block_mlp_expansion=1,
+        sigma_init=15.0, sigma_max=2.0, **route,
+    )).eval()
+    assert ("sigma_max" not in model.cfg.inactive_fields()) is ceiling_binds
+    seen = {}
+    spectrum, trust = figures.plot_belief_spectrum, figures.plot_numerical_trust
+    monkeypatch.setattr(figures, "plot_belief_spectrum",
+                        lambda sigma, **kw: seen.update(sigma=sigma, spectrum=kw) or spectrum(sigma, **kw))
+    monkeypatch.setattr(figures, "plot_numerical_trust",
+                        lambda guard, *a, **kw: seen.update(guard=guard) or trust(guard, *a, **kw))
+    tokens, targets = torch.tensor([[0, 1, 2, 3]]), torch.tensor([[1, 2, 3, 4]])
+    written = report.generate_figures(tmp_path, model=model, loader=[(tokens, targets)],
+                                      device=torch.device("cpu"), max_sequences=1)
+    assert {"belief_spectrum.png", "numerical_trust.png"} <= {p.name for p in written}
+    if ceiling_binds:
+        assert seen["spectrum"]["sigma_max"] == 2.0
+        assert float(seen["sigma"].max()) <= 2.0
+        assert seen["guard"]["sigma_ceil_frac"] == 1.0
+    else:
+        assert float(seen["sigma"].min()) > 2.0
+        assert seen["spectrum"]["sigma_max"] is None
+        assert "sigma_ceil_frac" not in seen["guard"]
+
+
 def test_existing_unavailable_probes_are_refreshed_without_changing_valid_records(tmp_path: Path) -> None:
     model = _model()
     tokens, targets = torch.tensor([[0, 1, 2, 3]]), torch.tensor([[1, 2, 3, 4]])
