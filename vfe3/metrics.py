@@ -426,7 +426,7 @@ def free_energy_terms(
 # Publication-figure metrics (pure measurements; no gradients, no side effects).
 # These return per-token / per-head VECTORS or small dicts for figures, rather
 # than the single CSV scalar the registry path logs. Runners that reload a
-# checkpoint or drive the model live (belief_bank, e_step_belief_trace,
+# checkpoint or drive the model live (e_step_belief_trace,
 # per_unit_eval_nats, ...) live in vfe3/viz/extract.py, NOT here, so this
 # module keeps its "pure measurement" contract.
 # ===========================================================================

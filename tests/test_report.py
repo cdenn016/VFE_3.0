@@ -86,10 +86,8 @@ def test_plan_single_run_figures_skips_english_taxonomies_for_japanese():
         "unknown_figure":             True,
         "vocab_probability_heatmap":  True,
         "vocab_confusion":            True,
-        "belief_category_separation": True,
-    }, generate_embedding_figures=True)
+    })
     written = set(planned)
-    assert "belief_category_separation.png" not in written
     assert "vocab_confusion.png" not in written
     assert {"vocab_probability_heatmap.png", "vocab_calibration.png", "decode_readout.png"} <= written
     assert "unknown_figure.png" not in written
@@ -129,7 +127,7 @@ def test_saved_reliability_requires_matching_split_provenance(tmp_path):
 
 
 def test_generate_figures_reuses_one_same_token_snapshot(tmp_path, monkeypatch):
-    from vfe3.viz import extract, report
+    from vfe3.viz import extract
 
     model = _model()
     built = []
@@ -162,36 +160,11 @@ def test_generate_figures_reuses_one_same_token_snapshot(tmp_path, monkeypatch):
 
         monkeypatch.setattr(model, name, wrapper)
 
-    class _NoopUMAPWorker:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, traceback):
-            return None
-
-    umap_calls = []
-
-    def plot_umap(
-        _bank:   dict,
-        channel: str = "mu",
-        **kwargs: object,
-    ) -> object:
-        kind = str(kwargs.get("kind", "Belief"))
-        path = str(kwargs["path"])
-        umap_calls.append((channel, kind, path))
-        figure = plt.figure()
-        figure.savefig(path)
-        return figure
-
-    monkeypatch.setattr(report.figs, "UMAPWorker", _NoopUMAPWorker)
-    monkeypatch.setattr(report.figs, "plot_belief_umap", plot_umap)
-
     paths = generate_figures(
         tmp_path / "run",
         model=model,
         loader=_loader(),
         max_sequences=1,
-        generate_embedding_figures=True,
     )
 
     assert len(built) == 1
@@ -210,64 +183,48 @@ def test_generate_figures_reuses_one_same_token_snapshot(tmp_path, monkeypatch):
     assert {
         "reliability_diagram.png",
     } <= written
-    belief_umap_calls = [call for call in umap_calls if call[1] == "Belief"]
-    assert {(channel, kind) for channel, kind, _ in belief_umap_calls} == {
-        ("mu", "Belief"),
-        ("sigma", "Belief"),
-        ("phi", "Belief"),
-    }
-    for channel, _, rendered_path in belief_umap_calls:
-        rendered = Path(rendered_path)
-        assert rendered.parent == tmp_path / "run" / "figures"
-        assert rendered.name.startswith(f".belief_umap_{channel}.")
-        assert rendered.name.endswith(".tmp.png")
-        assert not rendered.exists()
-        assert (tmp_path / "run" / "figures" / f"belief_umap_{channel}.png").exists()
 
 
-def test_generate_figures_renders_belief_umap_below_default_controlled_population(
-    tmp_path, monkeypatch, caplog,
-):
-    r"""A loader shorter than the 16,384-token controlled default must still render the belief
-    UMAP figures (2026-09-23): the exact-match ``belief_controlled_ready`` gate previously marked
-    ``belief_umap_mu/sigma/phi`` entirely unavailable whenever the loader could not fill the full
-    controlled population, even with ``generate_embedding_figures=True`` and a nonempty bank.
-    """
+def test_generate_figures_embedding_switch_runs_semantic_analysis(tmp_path, monkeypatch, caplog):
+    r"""``generate_embedding_figures`` drives :func:`vfe3.semantics.report.analyze_run` on the run's
+    ``best_model.pt`` into ``figures/semantics`` with the report budgets, after the standard figures;
+    with the switch off it is never called, and a failing analysis costs only its own output."""
+    from vfe3.semantics import report as semantics_report
     from vfe3.viz import report
 
-    model = _model()
+    calls = []
 
-    class _NoopUMAPWorker:
-        def __enter__(self):
-            return self
+    def analyze_run(run_dir, *, out_dir=None, checkpoint="best_model.pt", options=None, vocab=None):
+        calls.append((Path(run_dir), Path(out_dir), checkpoint, dict(options), vocab))
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        report_path = Path(out_dir) / "REPORT.md"
+        report_path.write_text("# semantic geometry\n", encoding="utf-8")
+        return report_path
 
-        def __exit__(self, exc_type, exc, traceback):
-            return None
+    monkeypatch.setattr(semantics_report, "analyze_run", analyze_run)
+    run_dir = tmp_path / "run"
 
-    umap_calls = []
+    paths = generate_figures(run_dir, model=_model(), loader=_loader(), max_sequences=1)
+    assert calls == []
+    assert not (run_dir / "figures" / "semantics").exists()
 
-    def plot_umap(_bank: dict, channel: str = "mu", **kwargs: object) -> object:
-        umap_calls.append((channel, kwargs.get("controlled")))
-        figure = plt.figure()
-        figure.savefig(str(kwargs["path"]))
-        return figure
+    paths = generate_figures(run_dir, model=_model(), loader=_loader(), max_sequences=1,
+                             generate_embedding_figures=True)
+    assert calls == [(run_dir, run_dir / "figures" / "semantics", "best_model.pt",
+                      report.SEMANTIC_ANALYSIS_OPTIONS, None)]
+    assert paths[-1] == run_dir / "figures" / "semantics" / "REPORT.md"
+    assert (run_dir / "figures" / "reliability_diagram.png") in paths
 
-    monkeypatch.setattr(report.figs, "UMAPWorker", _NoopUMAPWorker)
-    monkeypatch.setattr(report.figs, "plot_belief_umap", plot_umap)
+    def failing_analyze_run(*_args: object, **_kwargs: object) -> None:
+        raise FileNotFoundError("no checkpoint at best_model.pt")
 
-    paths = generate_figures(
-        tmp_path / "run",
-        model=model,
-        loader=_loader(),                 # 600-token base stream, far under the controlled cap
-        generate_embedding_figures=True,  # max_tokens/max_sequences both omitted -> default 16,384
-    )
-
-    written = {path.name for path in paths}
-    assert {"belief_umap_mu.png", "belief_umap_sigma.png", "belief_umap_phi.png"} <= written
-    assert {channel for channel, _ in umap_calls} == {"mu", "sigma", "phi"}
-    assert all(controlled is True for _, controlled in umap_calls)
-    assert "controlled belief UMAP population short: requested 16384 tokens but loader supplied" \
-        in caplog.text
+    monkeypatch.setattr(semantics_report, "analyze_run", failing_analyze_run)
+    with caplog.at_level(logging.WARNING):
+        paths = generate_figures(run_dir, model=_model(), loader=_loader(), max_sequences=1,
+                                 generate_embedding_figures=True)
+    assert "semantic analysis failed" in caplog.text
+    assert all(path.suffix == ".png" for path in paths)
+    assert (run_dir / "figures" / "reliability_diagram.png") in paths
 
 
 def test_generate_figures_forwards_model_owned_full_gaussian_policy(tmp_path, monkeypatch):

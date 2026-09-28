@@ -14,19 +14,16 @@ from vfe3.viz.figures import (
     _fe_terms,
     _fit_power_law,
     attention_graph,
-    clustering_metrics,
     get_figure,
     plot_ablation_forest,
     plot_attention_graph,
     plot_attention_grid,
     plot_attention_heatmap,
     plot_attention_structure,
-    plot_belief_category_separation,
     plot_belief_spectrum,
     plot_belief_trajectories,
     plot_capacity_scaling,
     plot_covariance_ellipses,
-    plot_embedding,
     plot_estep_capacity,
     plot_estep_convergence,
     plot_free_energy_codescent,
@@ -131,14 +128,6 @@ def test_token_display_wiring_preserves_japanese_and_shapes_arabic():
     assert figures_mod._tok_label(lambda ids: "日本語", 1) == "日本語"
     assert figures_mod._tok_label(lambda ids: "العربية", 2) != "العربية"
     assert figures_mod._tok_label(lambda ids: "�", 3) == "3"
-
-
-def test_non_english_cluster_labels_do_not_add_english_subword_marker():
-    assert figures_mod._lift_label_display("日本語") == "·日本語"
-    assert figures_mod._lift_label_display(
-        "日本語",
-        mark_subword_boundary=False,
-    ) == "日本語"
 
 
 def test_finite_xlim_pads_one_point_without_warning():
@@ -262,30 +251,11 @@ def test_scaling_routes_validates_supplied_weights_after_filtering():
         )
 
 
-def test_clustering_metrics_separated_blobs():
-    pytest.importorskip("sklearn")   # t4: optional dep -> skip (not hard-fail) when absent
-    g = torch.Generator().manual_seed(0)
-    a = torch.randn(30, 4, generator=g)
-    b = torch.randn(30, 4, generator=g) + 8.0                  # well separated
-    X = torch.cat([a, b]); y = torch.cat([torch.zeros(30), torch.ones(30)])
-    m = clustering_metrics(X, y)
-    assert m["silhouette"] > 0.5                                # clean separation
-    assert m["calinski_harabasz"] > 1.0
-
-
 def test_attention_graph_structure():
     beta = torch.softmax(torch.randn(5, 5), dim=-1)
     G = attention_graph(beta, threshold=0.0)
     assert G.number_of_nodes() == 5
     assert G.number_of_edges() <= 5 * 4                        # no self-loops
-
-
-def test_plot_embedding_saves(tmp_path):
-    coords = np.random.randn(20, 2)
-    p = tmp_path / "emb.png"
-    fig = plot_embedding(coords, labels=np.arange(20), path=str(p))
-    plt.close(fig)
-    assert _saved_nonempty(p)
 
 
 def test_plot_attention_graph_and_heatmap_save(tmp_path):
@@ -465,21 +435,6 @@ def test_plot_belief_trajectories_saves(tmp_path):
     assert _saved_nonempty(p)
 
 
-def _category_bank(M=60, K=4):
-    bank = {"mu": torch.randn(M, K), "sigma": torch.rand(M, K) + 0.3, "phi": torch.randn(M, 2),
-            "token_ids": torch.randint(0, 5, (M,)), "seq_idx": torch.zeros(M)}
-    fake = {0: " the", 1: ",", 2: " cat", 3: "ing", 4: " 42"}    # function/punct/content/subword/number
-    return bank, (lambda ids: fake.get(int(ids[0]), " x"))
-
-
-def test_plot_belief_category_separation_saves(tmp_path):
-    pytest.importorskip("sklearn")   # t4: optional dep -> skip (not hard-fail) when absent
-    bank, decode = _category_bank()
-    p = tmp_path / "f5c.png"
-    fig = plot_belief_category_separation(bank, decode=decode, sil_sample=50, path=str(p)); plt.close(fig)
-    assert _saved_nonempty(p)
-
-
 def test_token_category_helpers():
     from vfe3.viz.figures import _bpe_category, _funccontent_category
     assert _bpe_category(",") == 0          # punctuation
@@ -492,29 +447,6 @@ def test_token_category_helpers():
     assert _funccontent_category(" cat") == 3   # content word
     assert _funccontent_category(".") == 0      # punctuation
     assert _funccontent_category("42") == 1     # number
-
-
-def test_cluster_embedding_and_lift_labels():
-    pytest.importorskip("sklearn")   # t4: optional dep -> skip (not hard-fail) when absent
-    # the belief-UMAP redesign clusters the embedding and labels each cluster by DISTINCTIVE (lift)
-    # tokens, not raw frequency: a global stopword present in every cluster must not dominate the labels.
-    import numpy as np
-    from vfe3.viz.figures import _cluster_embedding, _cluster_lift_labels
-    rng = np.random.default_rng(0)
-    c0 = rng.normal([0, 0], 0.2, (80, 2)); c1 = rng.normal([10, 10], 0.2, (80, 2))
-    coords = np.vstack([c0, c1])
-    # cluster 0 = mostly token 5 ('apple') + stopword 0 ('the'); cluster 1 = mostly token 9 ('zebra') + 'the'
-    tids = np.concatenate([np.array([5] * 60 + [0] * 20), np.array([9] * 60 + [0] * 20)])
-    labels, method_desc = _cluster_embedding(coords, seed=0)
-    assert set(labels.tolist()) - {-1}                          # at least one real cluster found
-    assert method_desc.startswith(("HDBSCAN", "KMeans"))        # on-figure footer names the algorithm
-    names = {5: "apple", 9: "zebra", 0: "the"}
-    # top-1 by lift: the distinctive token (apple lift 2.0, zebra lift 2.0) outranks the stopword
-    # 'the' (present in both clusters -> lift ~1.0), so the per-cluster top label is never the stopword.
-    lab = _cluster_lift_labels(tids, labels, decode=lambda l: names[int(l[0])], k=1)
-    joined = " ".join(lab.values())
-    assert "apple" in joined and "zebra" in joined             # distinctive tokens surface
-    assert "the" not in joined                                  # the in-every-cluster stopword does not
 
 
 def test_plot_gauge_equivariance_saves(tmp_path):

@@ -11,10 +11,10 @@ runners and the
 
 This is OFF the training hot path but IS auto-run at the end of training: ``finalize_run`` calls
 it on the final training weights, and ``make_figures.py`` re-runs the same set on demand for an
-already-trained run. The UMAP and category-separation family is controlled by the single
-``generate_embedding_figures`` switch; the remaining figures are always attempted. Every figure is
-best-effort -- a plotting / dependency / shape error is logged and skipped so one bad figure never
-aborts the rest -- mirroring ``RunArtifacts._save_figures``.
+already-trained run. The single ``generate_embedding_figures`` switch adds the semantic-geometry
+analysis of :func:`vfe3.semantics.report.analyze_run` (``figures/semantics/REPORT.md``); the remaining
+figures are always attempted. Every figure is best-effort -- a plotting / dependency / shape error is
+logged and skipped so one bad figure never aborts the rest -- mirroring ``RunArtifacts._save_figures``.
 
 The SWEEP-level figures (capacity_scaling, estep_capacity, pareto_frontier, ablation_forest,
 lr_grid_heatmap) need multi-run data and belong to the ablation runner, not a single run; the
@@ -25,9 +25,8 @@ experiment to set up). Neither is produced here.
 import json
 import logging
 import math
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Mapping, Optional, Sequence
+from typing import Callable, Dict, List, Mapping, Optional, Sequence
 
 import torch
 
@@ -47,7 +46,6 @@ from vfe3.run_artifacts import (
     collect_phi_numerics,
 )
 from vfe3.viz import extract
-from vfe3.viz import embedding_comparison
 from vfe3.viz import figures as figs
 from vfe3.viz.run_loading import (
     load_best_model_state as _load_best_model_state,
@@ -63,10 +61,22 @@ CONTROLLED_BANK_TOKENS = 16_384
 _FULL_PAIR_MATRIX_WORKSETS = 8
 _COORDINATE_WORKSETS = 12
 
+# Report budgets of the semantic-geometry analysis behind ``generate_embedding_figures``: about a
+# quarter of the vfe3.semantics defaults, which analyze_semantics.py runs on demand. The contextual
+# forward passes stay on the CPU (the package default).
+SEMANTIC_ANALYSIS_OPTIONS: Dict[str, object] = {
+    "max_candidates":      5000,
+    "geometry_max_points": 4000,
+    "frame_ref_count":     1024,
+    "contextual_tokens":   8192,
+    "lens_tokens":         4096,
+    "contextual_points":   2048,
+    "occurrence_tokens":   32768,
+}
+
 _SINGLE_RUN_FIGURE_INVENTORY = (
     "iterate_trajectory.png",
     "belief_trajectories.png",
-    "belief_category_separation.png",
     "attention_structure.png",
     "per_layer_diagnostics.png",
     "gauge_equivariance.png",
@@ -75,9 +85,6 @@ _SINGLE_RUN_FIGURE_INVENTORY = (
     "spd_ellipses.png",
     "holonomy_curvature.png",
     "numerical_trust.png",
-    "belief_umap_mu.png",
-    "belief_umap_sigma.png",
-    "belief_umap_phi.png",
     "vocab_probability_heatmap.png",
     "vocab_calibration.png",
     "vocab_confusion.png",
@@ -87,15 +94,7 @@ _SINGLE_RUN_FIGURE_INVENTORY = (
     "sigma_ce_scatter.png",
 )
 
-_EMBEDDING_SINGLE_RUN_FIGURES = frozenset({
-    "belief_category_separation.png",
-    "belief_umap_mu.png",
-    "belief_umap_sigma.png",
-    "belief_umap_phi.png",
-})
-
 _ENGLISH_ONLY_SINGLE_RUN_FIGURES = frozenset({
-    "belief_category_separation.png",
     "vocab_confusion.png",
 })
 
@@ -103,34 +102,15 @@ _ENGLISH_ONLY_SINGLE_RUN_FIGURES = frozenset({
 def plan_single_run_figures(
     dataset:      str,
     availability: Mapping[str, bool],
-
-    *,
-    generate_embedding_figures: bool = False,
 ) -> tuple[str, ...]:
     """Return available single-run figure filenames in stable publication order."""
-    if type(generate_embedding_figures) is not bool:
-        raise TypeError("generate_embedding_figures must be bool")
     english_taxonomies = supports_english_linguistic_taxonomies(dataset)
     return tuple(
         filename
         for filename in _SINGLE_RUN_FIGURE_INVENTORY
         if availability.get(filename.removesuffix(".png"), False)
-        and (generate_embedding_figures or filename not in _EMBEDDING_SINGLE_RUN_FIGURES)
         and (english_taxonomies or filename not in _ENGLISH_ONLY_SINGLE_RUN_FIGURES)
     )
-
-
-@dataclass(frozen=True)
-class ArtifactPublicationResult:
-    """Separately report the newly published comparison sidecar and figure."""
-
-    json_path:   Optional[Path]
-    figure_path: Optional[Path]
-    outcomes:    Dict[str, Dict[str, object]]
-
-    def __iter__(self) -> Iterator[Optional[Path]]:
-        yield self.json_path
-        yield self.figure_path
 
 
 def _build_loader(dataset: str, cfg: VFE3Config, split: str):
@@ -540,13 +520,12 @@ def generate_figures(
     Pass ``model`` to drive live in-memory weights instead.
     ``loader`` defaults to a stable unshuffled loader for the run's dataset (raises if the cache is
     absent; pass ``loader`` to override).
-    When both population caps are omitted, the belief/model banks target the controlled default of
-    16,384 tokens; a loader that cannot supply that many (small split/dataset) still populates the
-    bank and renders the belief-UMAP figures at the smaller actual population, with a warning that
-    the controlled sidecar will not be comparable to a full 16,384-token run. Explicit
-    ``max_sequences`` calls preserve the exploratory compatibility path; the two caps are mutually
-    exclusive. ``generate_embedding_figures`` enables the complete category-separation and six-UMAP
-    family. When false, their belief/model banks and UMAP worker are not constructed.
+    When both population caps are omitted, the report batches target 16,384 tokens; a loader that
+    cannot supply that many (small split/dataset) drives the figures at its actual population. The
+    two caps are mutually exclusive. ``generate_embedding_figures`` runs
+    :func:`vfe3.semantics.report.analyze_run` on ``run_dir/best_model.pt`` with
+    :data:`SEMANTIC_ANALYSIS_OPTIONS` after every other figure, writing ``figures/semantics/``; like
+    the figures it is best-effort, and its ``REPORT.md`` is appended to the returned paths.
     Full-vocabulary computation is always skipped when its actual-batch,
     decode-aware workspace estimate exceeds the internal 8 GB safety guard; lighter inputs and
     figures still run. ``prepare_saved_probes`` persists missing depth-sensitivity and phi-numerics
@@ -615,7 +594,6 @@ def generate_figures(
         max_tokens=max_tokens,
         max_sequences=max_sequences,
     )
-    controlled_bank = max_tokens is not None
     report_batches = _collect_batches(
         loader,
         max_tokens=max_tokens,
@@ -690,13 +668,6 @@ def generate_figures(
         model, tok, n_iter=n_e_steps, snapshot=trace_snapshot), "e_step_belief_trace")
     layer_trace = _safe(lambda: extract.across_layer_belief_trace(
         model, tok, snapshot=snapshot), "across_layer_belief_trace")
-    bank = (
-        _safe(lambda: extract.belief_bank(
-            model, token_batches, max_tokens=max_tokens, max_sequences=max_sequences,
-            inference_bank=inference_bank), "belief_bank")
-        if generate_embedding_figures
-        else None
-    )
     cstate = (
         _safe(lambda: extract.converged_state(model, tok, snapshot=snapshot), "converged_state")
         if not is_conditional_filtering(model)
@@ -754,19 +725,16 @@ def generate_figures(
     readout     = _safe(lambda: extract.decode_readout(model), "decode_readout")
     run_label   = f"K{cfg.embed_dim}"
 
-    # gpt2/cl100k decoder for the belief-UMAP linguistic-category coloring + token labels (None when
-    # tiktoken is absent or the dataset has no real tokenizer -> the UMAP grays out and labels by id).
+    # gpt2/cl100k decoder for the vocabulary figures' token labels and the confusion figure's category
+    # bucketing (None when tiktoken is absent or the dataset has no real tokenizer -> labels by id).
     decode = None
     try:
         from vfe3.data.datasets import get_tiktoken_decoder
         decode = get_tiktoken_decoder(dataset)
     except Exception as exc:
-        logger.warning("token decoder unavailable (%s); belief UMAP will gray out", exc)
+        logger.warning("token decoder unavailable (%s); vocabulary figures label tokens by id", exc)
     if not english_linguistic_diagnostics:
-        logger.info(
-            "English-only belief-category and vocabulary-confusion figures disabled for dataset %r",
-            dataset,
-        )
+        logger.info("English-only vocabulary-confusion figure disabled for dataset %r", dataset)
 
     # Decode-calibration reliability bins (conf/acc/frac) come from THIS invocation's already-decoded
     # CE bank. A saved fallback is accepted only when research.json records the same split; legacy
@@ -780,14 +748,9 @@ def generate_figures(
     if reliability is None:
         reliability = _saved_reliability_for_split(run_dir, split, logger)
 
-    belief_controlled_ready = (
-        not controlled_bank
-        or (bank is not None and bank["token_ids"].shape[0] == max_tokens)
-    )
     availability = {
         "iterate_trajectory":         trace is not None,
         "belief_trajectories":        trace is not None,
-        "belief_category_separation": bank is not None,
         "attention_structure":        amaps is not None,
         "per_layer_diagnostics":      per_layer is not None,
         "gauge_equivariance":         cstate is not None and "omega" in cstate
@@ -797,9 +760,6 @@ def generate_figures(
         "spd_ellipses":               cstate is not None,
         "holonomy_curvature":         cstate is not None and "omega" in cstate,
         "numerical_trust":            cstate is not None,
-        "belief_umap_mu":             bank is not None,
-        "belief_umap_sigma":          bank is not None,
-        "belief_umap_phi":            bank is not None,
         "vocab_probability_heatmap":  vstats is not None,
         "vocab_calibration":          vstats is not None,
         "vocab_confusion":            vstats is not None and decode is not None,
@@ -808,11 +768,7 @@ def generate_figures(
         "sigma_stratified_error":     ce_bank is not None,
         "sigma_ce_scatter":           ce_bank is not None,
     }
-    planned_figures = frozenset(plan_single_run_figures(
-        dataset,
-        availability,
-        generate_embedding_figures=generate_embedding_figures,
-    ))
+    planned_figures = frozenset(plan_single_run_figures(dataset, availability))
 
     written: List[Path] = []
 
@@ -854,9 +810,6 @@ def generate_figures(
     _emit("belief_trajectories",
           lambda p: figs.plot_belief_trajectories(trace, layer_trace, path=p),
           "belief_trajectories.png" in planned_figures)
-    _emit("belief_category_separation",
-          lambda p: figs.plot_belief_category_separation(bank, decode=decode, path=p),
-          "belief_category_separation.png" in planned_figures)
     _emit("attention_structure",
           lambda p: figs.plot_attention_structure(amaps, path=p),
           "attention_structure.png" in planned_figures)
@@ -904,36 +857,6 @@ def generate_figures(
               health if health is not None else {},
               causal=(metrics.causal_sanity(amaps) if amaps is not None else None), path=p),
           "numerical_trust.png" in planned_figures)
-    if generate_embedding_figures:
-        if controlled_bank and bank is not None and not belief_controlled_ready:
-            logger.warning(
-                "controlled belief UMAP population short: requested %d tokens but loader "
-                "supplied %d; rendering at actual population (sidecar will not be comparable "
-                "to a full %d-token controlled run)",
-                max_tokens,
-                bank["token_ids"].shape[0],
-                max_tokens,
-            )
-        with figs.UMAPWorker() as umap_worker:
-            for ch in ("mu", "sigma", "phi"):                     # one UMAP per belief channel
-                _emit(f"belief_umap_{ch}",
-                      lambda p, ch=ch: figs.plot_belief_umap(
-                          bank, ch, decode=decode, controlled=controlled_bank,
-                          english_linguistic_diagnostics=english_linguistic_diagnostics,
-                          seeds=(embedding_comparison.CONTROLLED_SEEDS if controlled_bank else None),
-                          umap_worker=umap_worker, path=p,
-                          sidecar_path=(str(figdir / f"belief_umap_{ch}.json")
-                                        if controlled_bank else None)),
-                      f"belief_umap_{ch}.png" in planned_figures)
-        for cleanup_status in getattr(umap_worker, "cleanup_statuses", ()):
-            if (
-                cleanup_status.get("cleanup_error")
-                or cleanup_status.get("root_reaped") is False
-                or cleanup_status.get("tree_termination_confirmed") is False
-            ):
-                logger.warning(
-                    "UMAP worker cleanup incomplete: %s", cleanup_status,
-                )
     # Next-token vocabulary-probability figures (single-arm here; the cross-run K70-vs-K120 contrast
     # is the two-arm vocab_comparison_figures driver). vocab_confusion needs the token decoder for its
     # category bucketing; decode_readout is None (skipped) on prior-bank decode paths.
@@ -991,66 +914,19 @@ def generate_figures(
     if prepare_saved_probes:
         _prepare_missing_saved_probes(model, report_batches, run_dir, device, logger, split=split)
 
+    # Semantic geometry of the selected checkpoint (vfe3.semantics), last because it is the slowest.
+    if generate_embedding_figures:
+        try:
+            from vfe3.semantics import report as semantics_report
+            written.append(semantics_report.analyze_run(
+                run_dir, out_dir=figdir / "semantics", checkpoint="best_model.pt",
+                options=SEMANTIC_ANALYSIS_OPTIONS))
+            logger.info("semantic analysis -> %s", written[-1])
+        except Exception as exc:
+            logger.warning("semantic analysis failed (%s); continuing", exc)
+
     logger.info("wrote %d single-run figures to %s", len(written), figdir)
     return written
-
-
-def compare_belief_umap_sidecars(
-    sidecars: Sequence['str | Path'],
-    labels:   Sequence[str],
-
-    *,
-    json_path:   'str | Path',
-    figure_path: 'str | Path',
-) -> ArtifactPublicationResult:
-    """Validate controlled sidecars and write a metric-only JSON/PNG cross-run comparison."""
-    input_paths = [Path(sidecar) for sidecar in sidecars]
-    output_json = Path(json_path)
-    output_figure = figs._figure_target_path(figure_path)
-    if figs._paths_alias(output_json, output_figure):
-        raise ValueError("comparison JSON and figure outputs must not alias each other")
-    for input_path in input_paths:
-        if (figs._paths_alias(output_json, input_path)
-                or figs._paths_alias(output_figure, input_path)):
-            raise ValueError("comparison outputs must not alias an input sidecar")
-    records = []
-    for path in input_paths:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(payload, Mapping):
-            raise ValueError(f"controlled sidecar {path} is not a JSON object")
-        records.append(payload)
-    summary = embedding_comparison.comparison_summary(records, labels)
-    output_figure.parent.mkdir(parents=True, exist_ok=True)
-    outcomes: Dict[str, Dict[str, object]] = {
-        "figure": {"path": str(output_figure), "published": False, "error": None},
-        "sidecar": {"path": str(output_json), "published": False, "error": None},
-    }
-    figure = None
-    published_figure: Optional[Path] = None
-    published_json: Optional[Path] = None
-    try:
-        with _unique_sibling_output_temp(output_figure) as temporary_path:
-            figure = figs.plot_controlled_embedding_comparison(
-                summary,
-                path=str(temporary_path),
-            )
-            if not temporary_path.is_file() or temporary_path.stat().st_size == 0:
-                raise RuntimeError("controlled embedding comparison figure was not written")
-            _atomic_replace(output_figure, temporary_path)
-        outcomes["figure"]["published"] = True
-        published_figure = output_figure
-    except Exception as exc:
-        outcomes["figure"]["error"] = str(exc)
-    finally:
-        if figure is not None:
-            figs.plt.close(figure)
-    try:
-        embedding_comparison.write_json_atomic(summary, output_json)
-        outcomes["sidecar"]["published"] = True
-        published_json = output_json
-    except Exception as exc:
-        outcomes["sidecar"]["error"] = str(exc)
-    return ArtifactPublicationResult(published_json, published_figure, outcomes)
 
 
 def vocab_comparison_figures(

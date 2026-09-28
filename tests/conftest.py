@@ -7,7 +7,7 @@ from typing import Any, Iterator
 # MKL and the OpenMP runtime torch ships (libiomp) coexist here, and that duplicate-runtime state
 # makes Intel's LAPACK abort the ENTIRE interpreter on otherwise ordinary calls: np.polyfit on two
 # weighted points (vfe3/viz/figures.py _fit_power_law) and scipy's gaussian_kde bandwidth estimator
-# (plot_belief_umap) both aborted mid-suite, killing a full run with no pytest summary at all -- so
+# (the former belief-UMAP figure) both aborted mid-suite, killing a full run with no pytest summary at all -- so
 # the failures it had already found were never reported. The repository's own drivers (train_vfe3.py,
 # ablation.py, scaling.py, make_figures.py) already set this, each behind VFE3_ALLOW_DUPLICATE_OPENMP=1.
 # A test run that aborts reports nothing, so the suite takes it unconditionally; the setting only

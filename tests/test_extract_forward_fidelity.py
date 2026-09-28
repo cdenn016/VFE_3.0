@@ -1,6 +1,6 @@
 r"""C9 forward-fidelity tests for the viz belief extractors (audit 2026-07-01).
 
-``_encode_one`` and ``belief_bank`` must replay model.forward's belief pipeline exactly, so
+``_encode_one`` must replay model.forward's belief pipeline exactly, so
 every figure describes the model that actually trained. Pins:
 
   * on the default config the extractors are byte-identical to the pre-fix replay, so the
@@ -40,7 +40,7 @@ def _prefix_encode_one(model, token_ids: torch.Tensor):
 
 
 def _stack(model, belief, log_prior, rope):
-    r"""The extractors' shared ``vfe_stack`` replay (mirrors belief_bank / converged_state).
+    r"""The extractors' shared ``vfe_stack`` replay (mirrors converged_state).
 
     Includes the per-layer block MLPs (on by default) and their frame transport exactly as the
     extractors and forward pass them; a replay without them no longer describes the trained model.
@@ -81,24 +81,6 @@ def test_extractor_anchor_is_noop_on_default_config():
     assert torch.equal(belief.sigma, belief0.sigma)
     assert torch.equal(belief.phi,   belief0.phi)
     assert (log_prior is None and log_prior0 is None) or torch.equal(log_prior, log_prior0)
-    bank = extract.belief_bank(model, [tokens])
-    with torch.no_grad():                            # the PRE-fix bank body (no anchor, no fold)
-        beliefs0 = model.prior_bank.encode(tokens)
-        beliefs0 = beliefs0._replace(
-            phi=model._apply_pos_phi(beliefs0.phi),
-            right_phi=model._pos_phi_right(beliefs0.phi),
-        )
-        raw_prior = model._attention_log_prior(tokens.shape[1], tokens.device)
-        rope0 = model._rope_rotation(tokens.shape[1], tokens.device)
-        out0 = _stack(model, beliefs0, raw_prior, rope0)
-    b, n = tokens.shape
-    assert all(value.device.type == "cpu" for value in bank.values())
-    assert torch.equal(bank["mu"], out0.mu.reshape(b * n, -1).detach().cpu())
-    assert torch.equal(
-        bank["sigma"],
-        out0.sigma.reshape(b * n, *out0.sigma.shape[2:]).detach().cpu(),
-    )
-    assert torch.equal(bank["phi"], out0.phi.reshape(b * n, -1).detach().cpu())
 
 
 def _rope_model() -> VFEModel:
@@ -138,29 +120,6 @@ def test_encode_one_matches_forward_under_rope() -> None:
 
     assert torch.allclose(out.mu, ref.mu[0], atol=1e-5, rtol=1e-5)
     assert torch.allclose(out.sigma, ref.sigma[0], atol=1e-5, rtol=1e-5)
-
-
-def test_belief_bank_matches_forward_under_rope() -> None:
-    model = _rope_model()
-    tokens = torch.tensor(
-        [[0, 1, 2, 3, 4, 5, 6, 7], [7, 6, 5, 4, 3, 2, 1, 0]],
-        dtype=torch.long,
-        device=DEVICE,
-    )
-    ref = _forward_reference(model, tokens)
-    bank = extract.belief_bank(model, [tokens])
-    b, n = tokens.shape
-
-    assert all(value.device.type == "cpu" for value in bank.values())
-    assert torch.allclose(
-        bank["mu"], ref.mu.reshape(b * n, -1).detach().cpu(), atol=1e-5, rtol=1e-5,
-    )
-    assert torch.allclose(
-        bank["sigma"],
-        ref.sigma.reshape(b * n, *ref.sigma.shape[2:]).detach().cpu(),
-        atol=1e-5,
-        rtol=1e-5,
-    )
 
 
 def test_belief_ce_bank_matches_forward_sigma_under_rope() -> None:
