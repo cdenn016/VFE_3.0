@@ -1,0 +1,111 @@
+{
+  "description": "Curated English relation pairs, famous analogies, hypernym sets, semantic-projection axes (Grand et al. 2022), neighbor probes and ambiguous words for vfe3.semantics. Pairs are [a, a_star] with a_star = relation(a); analogies are [a, a_star, b, b_star, category] read a : a_star :: b : b_star with b_star the answer; axis pairs are [negative pole, positive pole]. Curated 2026-09-27 so that every word is a single GPT-2 token with a leading space and has a wikitext-103 training count >= 100, except where a hypernym set could not be filled from such words (flower).",
+  "relations": {
+    "gender": [["man", "woman"], ["king", "queen"], ["father", "mother"], ["boy", "girl"], ["brother", "sister"], ["son", "daughter"], ["husband", "wife"], ["uncle", "aunt"], ["he", "she"], ["his", "her"], ["prince", "princess"], ["actor", "actress"], ["male", "female"], ["nephew", "niece"], ["grandfather", "grandmother"], ["Mr", "Mrs"], ["lord", "lady"], ["men", "women"], ["boys", "girls"], ["kings", "queens"], ["fathers", "mothers"], ["sons", "daughters"], ["brothers", "sisters"], ["waiter", "waitress"], ["god", "goddess"], ["hero", "heroine"], ["monk", "nun"], ["groom", "bride"], ["masculine", "feminine"], ["himself", "herself"], ["gentleman", "lady"]],
+    "country_capital": [["France", "Paris"], ["Germany", "Berlin"], ["Italy", "Rome"], ["Japan", "Tokyo"], ["Russia", "Moscow"], ["Spain", "Madrid"], ["England", "London"], ["China", "Beijing"], ["Egypt", "Cairo"], ["Greece", "Athens"], ["Canada", "Ottawa"], ["Austria", "Vienna"], ["Ireland", "Dublin"], ["Portugal", "Lisbon"], ["Sweden", "Stockholm"], ["Norway", "Oslo"], ["Poland", "Warsaw"], ["Netherlands", "Amsterdam"], ["Belgium", "Brussels"], ["Hungary", "Budapest"], ["Finland", "Helsinki"], ["Denmark", "Copenhagen"], ["Thailand", "Bangkok"], ["Cuba", "Havana"], ["Iraq", "Baghdad"], ["Iran", "Tehran"], ["Afghanistan", "Kabul"], ["Peru", "Lima"], ["Australia", "Canberra"], ["Scotland", "Edinburgh"], ["Wales", "Cardiff"], ["Syria", "Damascus"], ["Lebanon", "Beirut"], ["Philippines", "Manila"], ["Chile", "Santiago"], ["Switzerland", "Bern"]],
+    "country_nationality": [["France", "French"], ["Germany", "German"], ["Italy", "Italian"], ["Spain", "Spanish"], ["Russia", "Russian"], ["China", "Chinese"], ["Japan", "Japanese"], ["England", "English"], ["India", "Indian"], ["Canada", "Canadian"], ["Australia", "Australian"], ["Brazil", "Brazilian"], ["Mexico", "Mexican"], ["Egypt", "Egyptian"], ["Greece", "Greek"], ["Poland", "Polish"], ["Sweden", "Swedish"], ["Norway", "Norwegian"], ["Ireland", "Irish"], ["Scotland", "Scottish"], ["Portugal", "Portuguese"], ["Turkey", "Turkish"], ["Netherlands", "Dutch"], ["Denmark", "Danish"], ["Finland", "Finnish"], ["Hungary", "Hungarian"], ["Korea", "Korean"], ["Israel", "Israeli"], ["Iran", "Iranian"], ["Iraq", "Iraqi"], ["Austria", "Austrian"], ["Switzerland", "Swiss"], ["Belgium", "Belgian"], ["America", "American"], ["Britain", "British"], ["Europe", "European"], ["Africa", "African"], ["Asia", "Asian"]],
+    "singular_plural": [["dog", "dogs"], ["cat", "cats"], ["horse", "horses"], ["woman", "women"], ["man", "men"], ["child", "children"], ["city", "cities"], ["house", "houses"], ["car", "cars"], ["bird", "birds"], ["tree", "trees"], ["book", "books"], ["ship", "ships"], ["king", "kings"], ["church", "churches"], ["country", "countries"], ["river", "rivers"], ["song", "songs"], ["year", "years"], ["day", "days"], ["eye", "eyes"], ["hand", "hands"], ["road", "roads"], ["army", "armies"], ["island", "islands"], ["building", "buildings"], ["player", "players"], ["school", "schools"], ["team", "teams"], ["village", "villages"]],
+    "adjective_comparative": [["big", "bigger"], ["small", "smaller"], ["large", "larger"], ["good", "better"], ["bad", "worse"], ["great", "greater"], ["high", "higher"], ["low", "lower"], ["long", "longer"], ["short", "shorter"], ["old", "older"], ["young", "younger"], ["strong", "stronger"], ["weak", "weaker"], ["fast", "faster"], ["slow", "slower"], ["hard", "harder"], ["easy", "easier"], ["early", "earlier"], ["late", "later"], ["wide", "wider"], ["deep", "deeper"], ["cheap", "cheaper"], ["heavy", "heavier"], ["dark", "darker"], ["bright", "brighter"], ["warm", "warmer"], ["cold", "colder"], ["close", "closer"], ["tall", "taller"]],
+    "adjective_superlative": [["big", "biggest"], ["small", "smallest"], ["large", "largest"], ["good", "best"], ["bad", "worst"], ["great", "greatest"], ["high", "highest"], ["low", "lowest"], ["long", "longest"], ["short", "shortest"], ["old", "oldest"], ["young", "youngest"], ["strong", "strongest"], ["fast", "fastest"], ["early", "earliest"], ["late", "latest"], ["deep", "deepest"], ["heavy", "heaviest"], ["tall", "tallest"], ["wide", "widest"], ["rich", "richest"], ["poor", "poorest"], ["bright", "brightest"], ["hot", "hottest"]],
+    "verb_past": [["walk", "walked"], ["go", "went"], ["run", "ran"], ["see", "saw"], ["take", "took"], ["give", "gave"], ["make", "made"], ["come", "came"], ["say", "said"], ["write", "wrote"], ["play", "played"], ["win", "won"], ["lose", "lost"], ["find", "found"], ["know", "knew"], ["think", "thought"], ["begin", "began"], ["leave", "left"], ["become", "became"], ["sing", "sang"], ["speak", "spoke"], ["eat", "ate"], ["drive", "drove"], ["fly", "flew"], ["fall", "fell"], ["build", "built"], ["buy", "bought"], ["sell", "sold"], ["teach", "taught"], ["bring", "brought"], ["fight", "fought"], ["send", "sent"], ["hold", "held"], ["meet", "met"], ["grow", "grew"], ["draw", "drew"]],
+    "verb_gerund": [["walk", "walking"], ["run", "running"], ["play", "playing"], ["sing", "singing"], ["write", "writing"], ["read", "reading"], ["go", "going"], ["swim", "swimming"], ["fly", "flying"], ["fight", "fighting"], ["work", "working"], ["build", "building"], ["teach", "teaching"], ["dance", "dancing"], ["speak", "speaking"], ["think", "thinking"], ["look", "looking"], ["move", "moving"], ["make", "making"], ["take", "taking"], ["live", "living"], ["eat", "eating"], ["drive", "driving"], ["sit", "sitting"]],
+    "adjective_adverb": [["quick", "quickly"], ["slow", "slowly"], ["easy", "easily"], ["happy", "happily"], ["sudden", "suddenly"], ["rapid", "rapidly"], ["careful", "carefully"], ["quiet", "quietly"], ["clear", "clearly"], ["strong", "strongly"], ["heavy", "heavily"], ["final", "finally"], ["recent", "recently"], ["usual", "usually"], ["general", "generally"], ["similar", "similarly"], ["complete", "completely"], ["direct", "directly"], ["previous", "previously"], ["eventual", "eventually"], ["successful", "successfully"], ["original", "originally"], ["active", "actively"], ["effective", "effectively"], ["rare", "rarely"], ["bad", "badly"], ["close", "closely"], ["near", "nearly"], ["main", "mainly"], ["public", "publicly"], ["serious", "seriously"], ["significant", "significantly"], ["simple", "simply"], ["typical", "typically"]],
+    "antonym": [["hot", "cold"], ["good", "bad"], ["big", "small"], ["high", "low"], ["long", "short"], ["old", "new"], ["up", "down"], ["left", "right"], ["black", "white"], ["day", "night"], ["open", "closed"], ["rich", "poor"], ["early", "late"], ["strong", "weak"], ["fast", "slow"], ["happy", "sad"], ["love", "hate"], ["win", "lose"], ["north", "south"], ["east", "west"], ["top", "bottom"], ["first", "last"], ["light", "dark"], ["true", "false"], ["wet", "dry"], ["alive", "dead"], ["war", "peace"], ["friend", "enemy"], ["inside", "outside"], ["above", "below"]]
+  },
+  "curated_analogies": [
+    ["man", "woman", "king", "queen", "gender"],
+    ["king", "queen", "man", "woman", "gender"],
+    ["man", "woman", "father", "mother", "gender"],
+    ["brother", "sister", "son", "daughter", "gender"],
+    ["he", "she", "his", "her", "gender"],
+    ["husband", "wife", "uncle", "aunt", "gender"],
+    ["prince", "princess", "actor", "actress", "gender"],
+    ["France", "Paris", "Germany", "Berlin", "capital"],
+    ["Paris", "France", "Berlin", "Germany", "capital"],
+    ["Italy", "Rome", "Japan", "Tokyo", "capital"],
+    ["Spain", "Madrid", "Russia", "Moscow", "capital"],
+    ["England", "London", "France", "Paris", "capital"],
+    ["Greece", "Athens", "Egypt", "Cairo", "capital"],
+    ["France", "French", "Germany", "German", "nationality"],
+    ["Italy", "Italian", "Spain", "Spanish", "nationality"],
+    ["China", "Chinese", "Japan", "Japanese", "nationality"],
+    ["big", "bigger", "small", "smaller", "comparative"],
+    ["good", "better", "bad", "worse", "comparative"],
+    ["big", "biggest", "small", "smallest", "superlative"],
+    ["good", "best", "bad", "worst", "superlative"],
+    ["walk", "walked", "go", "went", "past_tense"],
+    ["see", "saw", "take", "took", "past_tense"],
+    ["run", "running", "swim", "swimming", "gerund"],
+    ["dog", "dogs", "cat", "cats", "plural"],
+    ["man", "men", "woman", "women", "plural"],
+    ["car", "cars", "house", "houses", "plural"],
+    ["king", "kings", "queen", "queens", "plural"],
+    ["quick", "quickly", "slow", "slowly", "adverb"],
+    ["happy", "happily", "quick", "quickly", "adverb"],
+    ["Monday", "Tuesday", "Wednesday", "Thursday", "successor"],
+    ["January", "February", "March", "April", "successor"],
+    ["one", "two", "three", "four", "successor"]
+  ],
+  "hypernyms": {
+    "animal": ["dog", "cat", "horse", "cow", "pig", "sheep", "lion", "tiger", "bear", "wolf", "elephant", "monkey", "deer", "rabbit", "fox"],
+    "bird": ["eagle", "owl", "hawk", "crow", "duck", "goose", "pigeon", "dove", "raven", "gull"],
+    "fish": ["salmon", "trout", "shark", "tuna", "cod", "carp"],
+    "tree": ["oak", "pine", "maple", "fir", "palm"],
+    "fruit": ["apple", "banana", "orange", "grape", "lemon", "cherry", "pear", "plum", "lime", "coconut", "fig"],
+    "flower": ["rose", "poppy", "violet"],
+    "metal": ["iron", "copper", "gold", "silver", "zinc", "tin", "lead", "aluminium", "nickel", "platinum"],
+    "weapon": ["sword", "gun", "rifle", "spear", "bow", "knife", "axe", "pistol", "cannon", "dagger", "bomb", "missile", "arrow"],
+    "vehicle": ["car", "bus", "truck", "train", "bicycle", "motorcycle", "tram", "van", "tractor", "wagon", "taxi", "ambulance"],
+    "instrument": ["piano", "guitar", "violin", "drum", "trumpet", "organ", "bass", "keyboard"],
+    "sport": ["football", "tennis", "golf", "cricket", "baseball", "basketball", "hockey", "rugby", "boxing", "soccer", "wrestling"],
+    "emotion": ["anger", "fear", "joy", "sadness", "love", "hate", "grief", "pride", "shame", "jealousy", "happiness", "disgust"],
+    "color": ["red", "blue", "green", "yellow", "purple", "orange", "pink", "brown", "black", "white"],
+    "country": ["France", "Germany", "Italy", "Spain", "Japan", "China", "Russia", "Canada", "Brazil", "Egypt", "India", "Mexico"],
+    "city": ["Paris", "London", "Berlin", "Rome", "Tokyo", "Moscow", "Chicago", "Boston", "Madrid", "Sydney"],
+    "food": ["bread", "cheese", "rice", "meat", "soup", "cake", "pie", "sausage", "butter"],
+    "disease": ["cancer", "malaria", "influenza", "tuberculosis", "pneumonia", "measles", "plague", "diabetes", "fever", "asthma", "polio"],
+    "planet": ["Mars", "Venus", "Jupiter", "Saturn", "Mercury", "Neptune", "Pluto"],
+    "building": ["house", "church", "school", "hospital", "castle", "tower", "temple", "factory", "hotel", "prison"],
+    "language": ["English", "French", "German", "Latin", "Spanish", "Italian", "Russian", "Arabic", "Greek", "Chinese"]
+  },
+  "axes": {
+    "gender": {
+      "pairs": [["man", "woman"], ["he", "she"], ["his", "her"], ["male", "female"], ["boy", "girl"], ["father", "mother"], ["son", "daughter"], ["brother", "sister"], ["husband", "wife"], ["king", "queen"]],
+      "words": ["doctor", "nurse", "teacher", "lawyer", "engineer", "farmer", "writer", "poet", "painter", "artist", "singer", "musician", "scientist", "professor", "student", "judge", "pilot", "sailor", "driver", "merchant", "banker", "journalist", "architect", "secretary", "dancer", "surgeon", "chef", "photographer", "clerk", "manager", "designer", "author", "editor"],
+      "neg_label": "male",
+      "pos_label": "female"
+    },
+    "size": {
+      "pairs": [["small", "big"], ["small", "large"], ["tiny", "huge"], ["little", "big"], ["short", "tall"], ["narrow", "wide"], ["thin", "thick"]],
+      "words": ["dog", "cat", "horse", "cow", "pig", "sheep", "goat", "lion", "tiger", "bear", "wolf", "fox", "deer", "rabbit", "mouse", "rat", "elephant", "monkey", "snake", "bird", "fish", "eagle", "duck", "whale", "shark", "frog", "bee", "spider", "insect", "cattle"],
+      "neg_label": "small",
+      "pos_label": "large"
+    },
+    "danger": {
+      "pairs": [["safe", "dangerous"], ["harmless", "deadly"], ["gentle", "fierce"], ["peaceful", "violent"], ["calm", "aggressive"]],
+      "words": ["dog", "cat", "horse", "cow", "pig", "sheep", "goat", "lion", "tiger", "bear", "wolf", "fox", "deer", "rabbit", "mouse", "rat", "elephant", "monkey", "snake", "bird", "fish", "eagle", "duck", "whale", "shark", "frog", "bee", "spider", "insect", "cattle"],
+      "neg_label": "safe",
+      "pos_label": "dangerous"
+    },
+    "valence": {
+      "pairs": [["bad", "good"], ["sad", "happy"], ["hate", "love"], ["ugly", "beautiful"], ["terrible", "wonderful"], ["negative", "positive"], ["worst", "best"]],
+      "words": ["love", "hate", "joy", "anger", "fear", "sorrow", "grief", "pride", "shame", "guilt", "jealousy", "hope", "despair", "anxiety", "happiness", "sadness", "excitement", "surprise", "disgust", "envy", "rage", "delight", "panic", "loneliness", "affection", "gratitude"],
+      "neg_label": "negative",
+      "pos_label": "positive"
+    },
+    "temperature": {
+      "pairs": [["cold", "hot"], ["cool", "warm"], ["freezing", "boiling"], ["winter", "summer"], ["ice", "fire"]],
+      "words": ["rain", "snow", "wind", "storm", "cloud", "clouds", "fog", "thunder", "lightning", "hurricane", "tornado", "frost", "weather", "climate", "river", "sea", "ocean", "lake", "mountain", "mountains", "forest", "hill", "valley", "island", "desert", "beach", "coast"],
+      "neg_label": "cold",
+      "pos_label": "hot"
+    },
+    "wealth": {
+      "pairs": [["poor", "rich"], ["cheap", "expensive"], ["poverty", "wealth"]],
+      "words": ["doctor", "nurse", "teacher", "lawyer", "engineer", "farmer", "writer", "poet", "painter", "artist", "singer", "musician", "scientist", "professor", "student", "judge", "pilot", "sailor", "driver", "merchant", "banker", "journalist", "architect", "secretary", "dancer", "surgeon", "chef", "photographer", "clerk", "manager", "designer", "author", "editor"],
+      "neg_label": "poor",
+      "pos_label": "rich"
+    }
+  },
+  "probe_words": ["king", "queen", "man", "woman", "France", "Paris", "dog", "red", "one", "January", "Monday", "good", "run", "water", "music", "war", "science", "church", "city", "love", "computer", "river", "bank", "light"],
+  "ambiguous_words": ["bank", "spring", "play", "light", "right", "match", "bear", "rock", "plant", "fair", "bat", "star"]
+}
