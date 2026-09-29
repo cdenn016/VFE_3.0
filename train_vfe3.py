@@ -277,12 +277,14 @@ config = dict(
     #    Embedding/Priors M-step
     #        Learning Rates
     #################################
-    m_phi_update_mode         = "adamw",      # "adamw" | "pullback_group"
+    m_phi_update_mode         = "adamw",      # "adamw" | "pullback_group" | "fisher_group" (belief-Fisher natural gradient)
     phi_precond_mode          = "pullback_per_block",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback" | "pullback_per_block"
 
     transport_chart_max_norm  = 18,
     phi_mstep_max_matrix_norm = 12,
     m_phi_group_trust_radius  = 0.1,         
+    m_phi_group_retraction    = "chart",      # "chart" | "group_log" (exact Log(U e^{-eta xi}); pullback_group/fisher_group only)
+    m_phi_fisher_rotation_weight = 2.0,       # fisher_group only: completion weight on belief-invisible rotations
 
 
     m_p_mu_lr                 = 0.005,

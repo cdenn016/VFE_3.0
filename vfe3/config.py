@@ -604,8 +604,22 @@ class VFE3Config:
     # direction followed by a local right-group retraction; the trust radius bounds the
     # learning-rate-weighted right factor in the embedded Frobenius norm. The strict path is
     # intentionally limited by validation below.
-    m_phi_update_mode:         str       = "adamw"    # "adamw" | "pullback_group"
+    m_phi_update_mode:         str       = "adamw"    # "adamw" | "pullback_group" | "fisher_group"
     m_phi_group_trust_radius:  float     = 0.1
+    # Retraction of the manifold phi step. "chart" is the additive chart step phi - eta v_phi with
+    # its product-residual backtracking (the historical route, unchanged). "group_log" is the exact
+    # right product phi_new = Log(exp(phi) exp(-eta s xi)) with the closed-form U-space pullback
+    # direction (series direction off the principal strip); it halves only on log, residual,
+    # descent or chart-bound failure (derivation 2026-09-28, Track 1). glk / untied block_glk only.
+    m_phi_group_retraction:    str       = "chart"    # "chart" | "group_log"
+    # "fisher_group" (derivation 2026-09-28, Track 2) replaces the pullback direction by the belief-
+    # Fisher natural gradient: the Fisher-Rao metric of the reference belief U^{-1} q pulled back to
+    # the frame, at the layer-0 table rows, count-normalized (N_scored / n_v), and completed on its
+    # kernel (the stabilizer rotations) by this weight: M = g + lam ||asym Z||^2. lam = 2 gives the
+    # rotations the Fisher's own shear weight and makes the metric the Kronecker product
+    # C^{-1} X (2C + xi xi^T). It composes with either retraction; "group_log" is recommended, since
+    # the chart route's 1e-6 product certificate caps steps near 7e-3 per block at trained norms.
+    m_phi_fisher_rotation_weight: float  = 2.0
 
     #################################
     #        Weight Decays
@@ -1025,6 +1039,15 @@ class VFE3Config:
             raise ValueError(
                 "m_phi_group_trust_radius must be finite and positive, got "
                 f"{self.m_phi_group_trust_radius}"
+            )
+        _require(self.m_phi_group_retraction, ("chart", "group_log"), "m_phi_group_retraction")
+        if not (
+            math.isfinite(self.m_phi_fisher_rotation_weight)
+            and self.m_phi_fisher_rotation_weight > 0.0
+        ):
+            raise ValueError(
+                "m_phi_fisher_rotation_weight must be finite and positive, got "
+                f"{self.m_phi_fisher_rotation_weight}"
             )
         # sigma_max caps the covariance in the SPD retractions; a nonfinite or sub-eps cap would push
         # the clamped covariance below eps / negative / NaN. None stays permissive (no cap).
@@ -1589,6 +1612,51 @@ class VFE3Config:
                 "m_phi_update_mode='pullback_group' because the additive encoder does not "
                 "provide the group-chart state required by the pullback update"
             )
+        if phi_update_policy.requires_fisher_statistics:
+            # Belief-Fisher phi direction (derivation 2026-09-28, Track 2). The metric is read at the
+            # layer-0 table row (mu_v, diag s_v) in closed form, per head block, so the tables must
+            # hold LOCAL moments whose layer-0 covariance is diag(s) exactly: per_token encoding and
+            # a Gaussian family that encodes Sigma = diag(bounded_variance(sigma_log)).
+            # gaussian_diagonal_exact is accepted deliberately: it shares DiagonalGaussian's
+            # parameters and the per_token encoder (_encode_prior_sigma), so its layer-0 row is
+            # diag(s) exactly; only its pair coupling energy differs. The whitened closed forms
+            # need glk or untied block_glk (no cross couplings; the metric is block-diagonal
+            # across heads only for block-diagonal local covariance) and the full registered chart.
+            fisher_problems = []
+            if self.gauge_group == "block_glk":
+                if self.cross_couplings is not None:
+                    fisher_problems.append("gauge_group='block_glk' without cross_couplings")
+            elif self.gauge_group != "glk":
+                fisher_problems.append(
+                    f"gauge_group in ('glk', 'block_glk'); got {self.gauge_group!r}")
+            if self.encode_mode != "per_token":
+                fisher_problems.append(f"encode_mode='per_token'; got {self.encode_mode!r}")
+            if self.family not in ("gaussian_diagonal", "gaussian_full", "gaussian_diagonal_exact"):
+                fisher_problems.append(
+                    "family in ('gaussian_diagonal', 'gaussian_full', 'gaussian_diagonal_exact'), "
+                    f"whose layer-0 covariance is diag(s); got {self.family!r}")
+            if self.pos_phi not in ("none", "learned", "frozen"):
+                fisher_problems.append(f"pos_phi in ('none', 'learned', 'frozen'); got {self.pos_phi!r}")
+            if self.pos_phi_project_slk:
+                fisher_problems.append("pos_phi_project_slk=False (the metric uses the full chart)")
+            factor_radius = (
+                self.phi_mstep_max_matrix_norm
+                if self.phi_mstep_max_matrix_norm is not None
+                else 5.0
+            )
+            from vfe3.geometry.transport import TRANSPORT_CLAMP_MAX_NORM
+            if self.transport_chart_max_norm is None or not (
+                factor_radius
+                < self.transport_chart_max_norm
+                < TRANSPORT_CLAMP_MAX_NORM
+            ):
+                fisher_problems.append(
+                    f"an explicit transport_chart_max_norm with {factor_radius} < "
+                    f"transport_chart_max_norm < {TRANSPORT_CLAMP_MAX_NORM}; got "
+                    f"{self.transport_chart_max_norm!r}")
+            if fisher_problems:
+                raise ValueError(
+                    "m_phi_update_mode='fisher_group' requires " + "; ".join(fisher_problems))
         if phi_update_policy.requires_pullback_geometry:
             from vfe3.geometry.groups import get_group
             group_builder = get_group(self.gauge_group)
@@ -2481,8 +2549,14 @@ class VFE3Config:
         def mark(names: tuple[str, ...], reason: str) -> None:
             inactive.update(dict.fromkeys(names, reason))
 
-        if self.m_phi_update_mode != "pullback_group":
-            mark(("m_phi_group_trust_radius",), "only read by m_phi_update_mode='pullback_group'")
+        from vfe3.gauge_optim import get_phi_update_policy
+        phi_update_policy = get_phi_update_policy(self.m_phi_update_mode)
+        if not phi_update_policy.requires_manifold_optimizer:
+            mark(("m_phi_group_trust_radius", "m_phi_group_retraction"),
+                 "only read by the manifold phi optimizer "
+                 "(m_phi_update_mode='pullback_group' or 'fisher_group')")
+        if not phi_update_policy.requires_fisher_statistics:
+            mark(("m_phi_fisher_rotation_weight",), "only read by m_phi_update_mode='fisher_group'")
         if self.attention_mode == "transported":
             mark(("relational_identity_content", "m_relational_score_lr", "m_relational_content_lr",
                   "relational_routing"),

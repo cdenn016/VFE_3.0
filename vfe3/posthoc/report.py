@@ -975,6 +975,8 @@ def _maps(run_dir: Path, checkpoints: Sequence[str], cfg: Any, out: Path, figure
                                       "norm": float(value), "share": float(shares[h, b])})
         stem = _stem(checkpoint)
         _write_csv(out / "csv" / f"map_invariants_{stem}.csv", rows)
+        eig_rows = mp.link_eigenvalue_rows(state, cfg)
+        _write_csv(out / "csv" / f"link_eigenvalues_{stem}.csv", eig_rows)
         _write_csv(out / "csv" / f"head_block_norms_{stem}.csv", long_rows)
         result[checkpoint] = {"invariants": rows}
         if figures:
@@ -982,6 +984,9 @@ def _maps(run_dir: Path, checkpoints: Sequence[str], cfg: Any, out: Path, figure
                                                                            f"s2a_head_block_shares_{stem}")]
             report["figures"] += [str(p) for p in fg.plot_map_invariants(rows, out / "figures",
                                                                          f"s1b_map_invariants_{stem}")]
+            if eig_rows:
+                report["figures"] += [str(p) for p in fg.plot_link_spectrum(eig_rows, out / "figures",
+                                                                            f"s1b_link_spectrum_{stem}")]
     snapshots = run_dir / "map_snapshots"
     if mp.snapshot_files(snapshots):
         curves = mp.snapshot_curves(snapshots, cfg)

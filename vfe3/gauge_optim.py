@@ -7,25 +7,83 @@ table is mutated; committed gradients are consumed so base AdamW cannot apply a 
 A row whose pullback metric fails the conditioning certificate, or whose candidate cannot be
 backtracked inside the chart bound, is rejected individually (zero update, counted on the
 optimizer) instead of aborting the whole step (audit 2026-09-23 #10); nonfinite state still raises.
+The ``fisher_group`` policy uses the same staging with the belief-Fisher natural-gradient direction
+(:func:`belief_fisher_group_direction`, derivation 2026-09-28 Track 2) in place of the pullback.
 """
 
+import functools
 import math
 import warnings
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Dict, List, Mapping, Optional
+from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 import torch
 
 from vfe3.geometry.groups import GaugeGroup
+from vfe3.geometry.matrix_log import (
+    logm_frechet_pair,
+    logm_principal,
+    principal_strip_certificate,
+)
+from vfe3.geometry.phi_fisher import (
+    FisherRowStatistics,
+    fisher_type_solve,
+    jacobi_cholesky_solve,
+    stabilizer_leak,
+    type_metric_residual,
+    type_row_spectrum,
+    whitened_condition,
+)
 from vfe3.geometry.phi_preconditioner import (
     PullbackGroupDirectionResult,
     pullback_group_direction,
     phi_group_differential_mode,
+    uspace_ambient_gradient,
+    uspace_chart_velocity,
+    uspace_pullback_body_direction,
 )
 
 
 _PHI_PROJECTION_TEMPORARY_BYTES = 64 * 1024 * 1024
+# U-space (group_log) retraction, derivation 2026-09-28 Track 1. The margin keeps certified blocks
+# 0.25 inside the principal strip |Im lambda| < pi; it was chosen from sampling (0 log failures in
+# 4346 in-margin rows under a trust-saturated step), not from a proof.
+_UGROUP_STRIP_MARGIN = 0.25
+# Closed-form rows also need max_h kappa_2(U_h) <= this bound; larger ones take the series fallback,
+# whose 1e6 damped-condition certificate then decides. For normal X_h with real spectrum the
+# singular values of the exponential differential are divided differences of exp, so
+# kappa(D) <= kappa(U_h) and kappa(G_0) = kappa(D)^2 <= 1e6, the chart route's gate. The closed
+# form amplifies relative covector noise by about kappa(U_h) (review 2026-09-28).
+_UGROUP_FAST_FRAME_COND_MAX = 1e3
+_UGROUP_RETRACTIONS = ("chart", "group_log")
+# Optimizer diagnostics added only when the group_log retraction is active (fixed order).
+GROUP_LOG_DIAGNOSTIC_KEYS = (
+    "phi_group_fast_rows",
+    "phi_group_fallback_rows",
+    "phi_group_rechart_rows",
+    "phi_group_log_backtracks_max",
+    "phi_group_strip_margin_min",
+    "phi_group_fast_frame_cond_max",
+)
+# Optimizer diagnostics added only when the belief-Fisher direction (fisher_group) is active.
+FISHER_DIAGNOSTIC_KEYS = (
+    "phi_fisher_a_median",
+    "phi_fisher_kernel_leak_mean",
+    "phi_fisher_condP_max",
+    "phi_fisher_pos_lambda_min",
+    "phi_fisher_offstrip_rows",
+    "phi_fisher_pos_cond_max",
+)
+# (param, active row indices (R,)) -> statistics of those rows; see vfe3.train.PhiFisherStatisticsProvider.
+PhiStatisticsProvider = Callable[[torch.nn.Parameter, torch.Tensor], FisherRowStatistics]
+
+
+def _nan_amax(values: torch.Tensor) -> torch.Tensor:
+    r"""Maximum over non-NaN entries; NaN when every entry is NaN (torch has no ``nanmax``)."""
+    nan = values.isnan()
+    maximum = torch.where(nan, torch.full_like(values, -math.inf), values).amax()
+    return torch.where(nan.all(), torch.full_like(maximum, math.nan), maximum)
 
 
 @dataclass(frozen=True)
@@ -33,6 +91,8 @@ class PhiUpdatePolicy:
     optimizer_group_metadata: Mapping[str, object]
     requires_manifold_optimizer: bool
     requires_pullback_geometry: bool = False
+    # The optimizer needs a batch-statistics provider (belief-Fisher direction).
+    requires_fisher_statistics: bool = False
 
 
 _PHI_UPDATE_POLICIES: Dict[str, PhiUpdatePolicy] = {}
@@ -54,6 +114,7 @@ def register_phi_update_policy(
         optimizer_group_metadata=MappingProxyType(dict(policy.optimizer_group_metadata)),
         requires_manifold_optimizer=bool(policy.requires_manifold_optimizer),
         requires_pullback_geometry=bool(policy.requires_pullback_geometry),
+        requires_fisher_statistics=bool(policy.requires_fisher_statistics),
     )
 
 
@@ -68,6 +129,7 @@ def get_phi_update_policy(name: str) -> PhiUpdatePolicy:
         optimizer_group_metadata=MappingProxyType(dict(policy.optimizer_group_metadata)),
         requires_manifold_optimizer=policy.requires_manifold_optimizer,
         requires_pullback_geometry=policy.requires_pullback_geometry,
+        requires_fisher_statistics=policy.requires_fisher_statistics,
     )
 
 
@@ -84,6 +146,18 @@ register_phi_update_policy(
         optimizer_group_metadata={"pullback_group": True, "weight_decay": 0.0},
         requires_manifold_optimizer=True,
         requires_pullback_geometry=True,
+    ),
+)
+# Belief-Fisher natural gradient for the stored frames (derivation 2026-09-28, Track 2). It shares the
+# stateless manifold staging; the direction replaces the Frobenius pullback, so no pullback geometry
+# (structure constants, series metric) is required.
+register_phi_update_policy(
+    "fisher_group",
+    PhiUpdatePolicy(
+        optimizer_group_metadata={"pullback_group": True, "weight_decay": 0.0},
+        requires_manifold_optimizer=True,
+        requires_pullback_geometry=False,
+        requires_fisher_statistics=True,
     ),
 )
 
@@ -141,6 +215,14 @@ class PullbackGroupCandidate:
     # (active,) bool: rows whose update was rejected (candidate == current chart), either by the
     # direction's conditioning certificate or because no backtracked step stayed inside the chart.
     rejected_rows:           Optional[torch.Tensor] = None
+    # group_log only (None on the chart route). (active,) bool rows served by a closed-form direction;
+    # (active,) bool rows whose accepted candidate moved a block by more than pi in the chart
+    # (re-charted onto the principal logarithm); (active,) min over blocks of pi - ||skew X_h||_F,
+    # formed only on diagnostic steps; (active,) max_h kappa_2(U_h) where the direction formed it.
+    fast_rows:               Optional[torch.Tensor] = None
+    recharted_rows:          Optional[torch.Tensor] = None
+    strip_margin:            Optional[torch.Tensor] = None
+    frame_condition:         Optional[torch.Tensor] = None
 
 
 def _require_positive_finite(value: float, name: str) -> float:
@@ -216,8 +298,7 @@ def _pullback_group_product_residual(
     return error / scale.clamp_min(torch.finfo(torch.float64).tiny)
 
 
-@torch.no_grad()
-def stage_pullback_group_candidate(
+def _validated_staging_scalars(
     grad_phi: torch.Tensor,             # (active, n_gen) processed covector
     phi:      torch.Tensor,             # (active, n_gen) current chart
     group:    GaugeGroup,
@@ -227,26 +308,9 @@ def stage_pullback_group_candidate(
     trust_radius:     float,
     chart_max_norm:   float,
     bch_residual_max: float,
-    phi_precond_mode: str,
-    max_backtracks:   int = 10,
-    differential_mode: Optional[str] = None,
-) -> PullbackGroupCandidate:
-    r"""Stage the chart retraction ``phi_new = phi - eta v_phi`` without mutation.
-
-    Its derivative at eta=0 is the Frobenius-pullback Riemannian direction at the CURRENT chart.
-    Trust scaling uses ``xi = Psi_L(ad_phi) v_phi``. Backtracking bounds the difference
-    from ``exp(phi) exp(-eta xi)``; this is a chart retraction, not exact group
-    multiplication. The legacy ``bch_residual_max`` keyword retains that product
-    tolerance. Certification uses values rounded to the input chart's storage dtype.
-
-    Per-row rejection (audit 2026-09-23 #10): a row whose pullback metric fails the direction
-    solver's conditioning certificate (undamped-eigenvalue floor or ``1e6`` damped condition)
-    takes a zero step, and a row whose candidate leaves ``chart_max_norm`` is backtracked like a
-    residual failure; if no backtracked step returns inside the chart, that row alone keeps its
-    current chart. Both are marked in ``rejected_rows``. Nonfinite inputs, candidates, residuals
-    and certificates of accepted rows still raise, as does a product-residual or descent failure
-    that survives every backtrack.
-    """
+    max_backtracks:   int,
+) -> Tuple[float, float, float, float]:
+    r"""Validate staging inputs; return ``(learning_rate, trust_radius, chart_max_norm, bch_residual_max)``."""
     if not isinstance(group, GaugeGroup):
         raise TypeError(f"group must be a GaugeGroup, got {type(group).__name__}")
     if grad_phi.ndim != 2 or phi.ndim != 2 or grad_phi.shape != phi.shape:
@@ -277,6 +341,54 @@ def stage_pullback_group_candidate(
         )
     if grad_phi.shape[0] == 0:
         raise ValueError("pullback group staging requires at least one active row")
+    return learning_rate, trust_radius, chart_max_norm, bch_residual_max
+
+
+@torch.no_grad()
+def stage_pullback_group_candidate(
+    grad_phi: torch.Tensor,             # (active, n_gen) processed covector
+    phi:      torch.Tensor,             # (active, n_gen) current chart
+    group:    GaugeGroup,
+
+    *,
+    learning_rate:    float,
+    trust_radius:     float,
+    chart_max_norm:   float,
+    bch_residual_max: float,
+    phi_precond_mode: str,
+    max_backtracks:   int = 10,
+    differential_mode: Optional[str] = None,
+    direction_fn:     Optional[Callable[[torch.Tensor, torch.Tensor],
+                                        PullbackGroupDirectionResult]] = None,
+) -> PullbackGroupCandidate:
+    r"""Stage the chart retraction ``phi_new = phi - eta v_phi`` without mutation.
+
+    ``direction_fn(grad64, phi64)``, when given, replaces the Frobenius-pullback direction (the
+    belief-Fisher route passes one); ``None`` runs the historical call unchanged.
+
+    Its derivative at eta=0 is the Frobenius-pullback Riemannian direction at the CURRENT chart, or
+    the supplied direction when ``direction_fn`` is given.
+    Trust scaling uses ``xi = Psi_L(ad_phi) v_phi``. Backtracking bounds the difference
+    from ``exp(phi) exp(-eta xi)``; this is a chart retraction, not exact group
+    multiplication. The legacy ``bch_residual_max`` keyword retains that product
+    tolerance. Certification uses values rounded to the input chart's storage dtype.
+
+    Per-row rejection (audit 2026-09-23 #10): a row whose pullback metric fails the direction
+    solver's conditioning certificate (undamped-eigenvalue floor or ``1e6`` damped condition)
+    takes a zero step, and a row whose candidate leaves ``chart_max_norm`` is backtracked like a
+    residual failure; if no backtracked step returns inside the chart, that row alone keeps its
+    current chart. Both are marked in ``rejected_rows``. Nonfinite inputs, candidates, residuals
+    and certificates of accepted rows still raise, as does a product-residual or descent failure
+    that survives every backtrack.
+    """
+    learning_rate, trust_radius, chart_max_norm, bch_residual_max = _validated_staging_scalars(
+        grad_phi, phi, group,
+        learning_rate=learning_rate,
+        trust_radius=trust_radius,
+        chart_max_norm=chart_max_norm,
+        bch_residual_max=bch_residual_max,
+        max_backtracks=max_backtracks,
+    )
 
     with torch.amp.autocast(grad_phi.device.type, enabled=False):
         grad64 = grad_phi.to(dtype=torch.float64)
@@ -297,7 +409,7 @@ def stage_pullback_group_candidate(
             coordinate_layout=group.phi_coordinate_layout,
             irrep_dims=list(group.irrep_dims),
             reject_ill_conditioned_rows=True,
-        )
+        ) if direction_fn is None else direction_fn(grad64, phi64)
         # Rows the direction solver rejected on conditioning carry v_phi = xi = 0; a direction
         # rule without per-row rejection keeps its own whole-batch fail-closed raise.
         rejected = (
@@ -415,6 +527,441 @@ def stage_pullback_group_candidate(
     raise AssertionError("unreachable pullback group staging path")
 
 
+@dataclass(frozen=True)
+class GroupLogDirection:
+    r"""Body direction consumed by :func:`stage_group_log_candidate`.
+
+    ``xi`` is the left-trivialized body generator: the frame moves as
+    :math:`U \mapsto U e^{-\eta \xi}`. ``covector`` is a U-space covector representative
+    :math:`\bar G`, so that the first-order loss change of :math:`U \mapsto U + \delta U` is
+    :math:`\langle \bar G, \delta U \rangle_F`; the stager's descent gate reads it. Both are stacks of
+    blocks, ``(A, H, d, d)``, or ``(A, K, K)`` for glk. Rows with ``accepted`` False take no step.
+    The optional certificate fields fill the returned :class:`PullbackGroupDirectionResult` and are
+    NaN where absent.
+    """
+    xi:        torch.Tensor                            # (A, H, d, d) or (A, K, K)
+    covector:  torch.Tensor                            # (A, H, d, d) or (A, K, K)
+    accepted:  torch.Tensor                            # (A,) bool
+    v_phi:     Optional[torch.Tensor] = None           # (A, n_gen) chart velocity; NaN where not formed
+    min_undamped_generalized_eigenvalue: Optional[torch.Tensor] = None   # (A,)
+    undamped_generalized_condition:      Optional[torch.Tensor] = None   # (A,)
+    damped_generalized_condition:        Optional[torch.Tensor] = None   # (A,)
+    scaled_solve_residual:               Optional[torch.Tensor] = None   # (A,)
+    series_order: int = 0
+    fast_rows:    Optional[torch.Tensor] = None        # (A,) bool rows served by a closed form
+    frame_condition: Optional[torch.Tensor] = None     # (A,) max_h kappa_2(U_h)
+
+
+# direction(grad_phi (A, n_gen) f64, phi (A, n_gen) f64, current_blocks (A, H, d, d) f64, *, collect)
+GroupLogDirectionFn = Callable[..., GroupLogDirection]
+
+
+def group_log_block_shape(group: GaugeGroup) -> Tuple[int, int]:
+    r"""``(H, d)`` such that a chart row reshapes exactly to ``H`` blocks ``X_h`` of size ``d x d``.
+
+    Certified for untied block_glk (the built-in row-major elementary basis, any head count) and for
+    glk with the row-major elementary basis ``G_{iK+j} = E_{ij}`` (``H = 1``, ``d = K``). Every other
+    basis raises: the group_log route reads the chart through this reshape.
+    """
+    shape = group.elementary_block_shape
+    if shape is not None:
+        return shape
+    if group.name == "glk" and len(group.irrep_dims) == 1:
+        K = group.irrep_dims[0]
+        generators = group.generators
+        n_gen = K * K
+        if (tuple(generators.shape) == (n_gen, K, K) and not generators.requires_grad
+                and torch.equal(generators.reshape(n_gen, n_gen),
+                                torch.eye(n_gen, dtype=generators.dtype, device=generators.device))):
+            return 1, K
+    raise ValueError(
+        "m_phi_group_retraction='group_log' requires glk or untied block_glk with the built-in "
+        f"row-major elementary basis; got gauge group {group.name!r}"
+    )
+
+
+@torch.no_grad()
+def pullback_group_log_direction(
+    grad_phi:       torch.Tensor,               # (A, n_gen) float64 processed covector
+    phi:            torch.Tensor,               # (A, n_gen) float64 current chart
+    current_blocks: torch.Tensor,               # (A, H, d, d) float64 exp(X_h)
+
+    *,
+    collect:           bool,
+    group:             GaugeGroup,
+    phi_precond_mode:  str,
+    differential_mode: Optional[str] = None,
+) -> GroupLogDirection:
+    r"""Closed-form Frobenius-pullback body direction with the series direction off the strip.
+
+    Rows whose blocks all satisfy :math:`\max|\mathrm{Im}\,\lambda(X_h)| < \pi - 0.25` (Bendixson,
+    then exact eigenvalues) and :math:`\max_h \kappa_2(U_h) \le 10^3` use
+    :math:`\xi = U^{-1} L_{\log}(U^\top, M)` blockwise (:func:`uspace_pullback_body_direction`).
+    The other rows, and rows whose Frechet log fails, use :func:`pullback_group_direction` with
+    per-row conditioning rejection; rows it rejects are rejected. The frame-condition bound keeps
+    the chart route's acceptance semantics: the closed form has no metric certificate, and it
+    amplifies relative covector noise by about :math:`\kappa_2(U_h)`. The covector is :math:`U \xi = P_T \bar G`, which for gl and block gl is the ambient
+    gradient itself (with the Gram ridge on fallback rows). With ``collect`` the chart velocity
+    :math:`v = L_{\log}(U, U \xi)` is formed for the cosine diagnostic; fast rows carry NaN
+    conditioning fields because no metric is assembled for them.
+    """
+    rows, n_gen = grad_phi.shape
+    n_blocks, block_dim = current_blocks.shape[-3], current_blocks.shape[-1]
+    X = phi.view(rows, n_blocks, block_dim, block_dim)                   # (A, H, d, d)
+    M = grad_phi.view(rows, n_blocks, block_dim, block_dim)              # (A, H, d, d), Gram B = I
+    U = current_blocks
+    certified, _ = principal_strip_certificate(X, margin=_UGROUP_STRIP_MARGIN)   # (A, H)
+    sigma = torch.linalg.svdvals(U)                                      # (A, H, d) descending
+    frame_condition = (sigma[..., 0] / sigma[..., -1].clamp_min(
+        torch.finfo(torch.float64).tiny)).amax(dim=-1)                   # (A,) max_h kappa_2(U_h)
+    fast = certified.all(dim=-1) & (frame_condition <= _UGROUP_FAST_FRAME_COND_MAX)   # (A,)
+    xi = torch.zeros_like(X)
+    accepted = torch.ones(rows, dtype=torch.bool, device=phi.device)
+    nan_rows = torch.full((rows,), float("nan"), dtype=torch.float64, device=phi.device)
+    certificates = [nan_rows.clone() for _ in range(4)]
+    v_phi = torch.full_like(phi, float("nan")) if collect else None
+    series_order = 0
+    fast_index = fast.nonzero(as_tuple=True)[0]
+    if fast_index.numel() > 0:
+        xi_fast, ok = uspace_pullback_body_direction(
+            X[fast_index], M[fast_index], U=U[fast_index], certified=certified[fast_index])
+        xi[fast_index] = xi_fast
+        fast[fast_index] = ok.all(dim=-1)                                # a log failure falls back
+    fallback_index = (~fast).nonzero(as_tuple=True)[0]
+    if fallback_index.numel() > 0:
+        series = pullback_group_direction(
+            grad_phi[fallback_index],
+            phi[fallback_index],
+            group.generators,
+            mode=phi_precond_mode,
+            differential_mode=differential_mode,
+            coordinate_layout=group.phi_coordinate_layout,
+            irrep_dims=list(group.irrep_dims),
+            reject_ill_conditioned_rows=True,
+        )
+        xi[fallback_index] = series.xi.reshape(-1, n_blocks, block_dim, block_dim)
+        if series.accepted_rows is not None:
+            accepted[fallback_index] = series.accepted_rows.reshape(-1)
+        for target, value in zip(certificates, (
+                series.min_undamped_generalized_eigenvalue,
+                series.undamped_generalized_condition,
+                series.damped_generalized_condition,
+                series.scaled_solve_residual)):
+            target[fallback_index] = value.reshape(-1)
+        if v_phi is not None:
+            v_phi[fallback_index] = series.v_phi.reshape(-1, n_gen)
+        series_order = series.series_order
+    if v_phi is not None:
+        fast_index = fast.nonzero(as_tuple=True)[0]
+        if fast_index.numel() > 0:
+            U_fast = U[fast_index]
+            _, v_fast, failed = logm_frechet_pair(U_fast, U_fast @ xi[fast_index])  # (f, H, d, d)
+            v_phi[fast_index] = torch.where(
+                failed.any(dim=-1, keepdim=True), float("nan"), v_fast.reshape(-1, n_gen))
+    return GroupLogDirection(
+        xi=xi,
+        covector=U @ xi,
+        accepted=accepted,
+        v_phi=v_phi,
+        min_undamped_generalized_eigenvalue=certificates[0],
+        undamped_generalized_condition=certificates[1],
+        damped_generalized_condition=certificates[2],
+        scaled_solve_residual=certificates[3],
+        series_order=series_order,
+        fast_rows=fast,
+        frame_condition=frame_condition,
+    )
+
+
+@torch.no_grad()
+def belief_fisher_group_direction(
+    grad_phi:       torch.Tensor,               # (A, n_gen) float64 processed covector
+    phi:            torch.Tensor,               # (A, n_gen) float64 current chart
+    current_blocks: torch.Tensor,               # (A, H, d, d) float64 exp(X_h)
+
+    *,
+    collect:         bool,
+    statistics:      FisherRowStatistics,
+    rotation_weight: float,
+    chart_velocity:  bool = False,
+    diagnostics_out: Optional[Dict[str, List[torch.Tensor]]] = None,
+) -> GroupLogDirection:
+    r"""Belief-Fisher natural-gradient body direction of the stored factor rows (Track 2).
+
+    Per head block, on the principal strip (the same certificate as the closed-form pullback):
+
+    .. math::
+        \bar G = L_{\log}(U^\top, M), \qquad G_W = \bar G U^\top, \qquad
+        \mathcal M(W) = \frac{N}{n}\,G_W, \qquad \xi = U^{-1} W U,
+
+    with :math:`\mathcal M` the completed belief Fisher in spatial coordinates: the closed form
+    :func:`~vfe3.geometry.phi_fisher.fisher_type_solve` at the layer-0 table row for
+    ``statistics.kind='type'``, the Jacobi-scaled Cholesky solve of the pooled column operator for
+    ``'pos'``. The count factor :math:`N/n` is ``total / count``. The frame moves as
+    :math:`U \mapsto U e^{-\eta\xi} = e^{-\eta W} U`, and
+    :math:`\langle \bar G, U\xi \rangle_F = \langle G_W, W \rangle_F > 0`. The covector for the
+    descent gate is :math:`\bar G`.
+
+    Rows with any block off the strip are rejected (zero step): no exact off-strip chart map is
+    implemented. Rows whose positional solve fails its residual gate, whose count is zero, or
+    whose outputs are nonfinite are rejected as well. With ``chart_velocity`` (the chart
+    retraction) the chart velocity :math:`v = L_{\log}(U, W U) = \Psi_R(\mathrm{ad}_X)^{-1} W` is the
+    step and a failure rejects the row; with only ``collect`` it feeds the cosine diagnostic and a
+    failure leaves NaN. ``diagnostics_out`` accumulates per-block statistics for
+    :data:`FISHER_DIAGNOSTIC_KEYS`. The conditioning fields carry :math:`\mathrm{cond}_{\mathcal P}`
+    (type rows) or the Jacobi-scaled operator condition (positional rows, computed only with
+    ``collect``, zero otherwise); they are not Frobenius-pullback conditions, so the optimizer logs
+    them under ``phi_fisher_condP_max`` / ``phi_fisher_pos_cond_max`` and leaves the
+    ``phi_pullback_damped_gen_cond_*`` columns NaN.
+    """
+    rows, n_gen = grad_phi.shape
+    n_blocks, block_dim = current_blocks.shape[-3], current_blocks.shape[-1]
+    X = phi.view(rows, n_blocks, block_dim, block_dim)                   # (A, H, d, d)
+    M = grad_phi.view(rows, n_blocks, block_dim, block_dim)              # (A, H, d, d), Gram B = I
+    U = current_blocks
+    certified, _ = principal_strip_certificate(X, margin=_UGROUP_STRIP_MARGIN)   # (A, H)
+    G_bar, covector_ok = uspace_ambient_gradient(X, M, U=U, certified=certified)
+    G_W = G_bar @ U.transpose(-1, -2)                                    # (A, H, d, d) spatial covector
+    count = statistics.count.to(dtype=torch.float64)
+    scale = statistics.total.to(dtype=torch.float64) / count.clamp_min(1.0)      # (A,) N / n
+    accepted = covector_ok.all(dim=-1) & (count > 0)
+    if statistics.kind == "type":
+        mu, s = statistics.local_mean, statistics.local_var              # (A, H, d)
+        W = fisher_type_solve(G_W, mu, s, scale, rotation_weight=rotation_weight)
+        a, lam_min, cond = type_row_spectrum(mu, s, rotation_weight=rotation_weight)   # (A, H)
+        residual = type_metric_residual(W, G_W, mu, s, scale, rotation_weight=rotation_weight)
+    elif statistics.kind == "pos":
+        operator = statistics.pooled_operator                            # (A, H, d*d, d*d)
+        solution, solved, solve_residual = jacobi_cholesky_solve(
+            operator, G_W.reshape(rows, n_blocks, block_dim * block_dim))
+        W = scale[:, None, None, None] * solution.view(rows, n_blocks, block_dim, block_dim)
+        accepted = accepted & solved.all(dim=-1)
+        # The spectrum is diagnostic only: one eigvalsh per block on collect steps, zeros otherwise
+        # (the chart stager reads these fields only for finiteness).
+        lam_min, cond = (whitened_condition(operator) if collect
+                         else (G_W.new_zeros(rows, n_blocks),) * 2)      # (A, H)
+        residual = solve_residual.amax(dim=-1)
+    else:
+        raise ValueError(f"unknown Fisher statistics kind {statistics.kind!r}")
+    xi = torch.linalg.solve(U, W @ U)                                    # (A, H, d, d) U^{-1} W U
+    accepted = (accepted & torch.isfinite(W).flatten(1).all(dim=-1)
+                & torch.isfinite(xi).flatten(1).all(dim=-1))
+    v_phi = None
+    if chart_velocity or collect:
+        v, velocity_ok = uspace_chart_velocity(X, W, U=U, certified=certified)
+        velocity_ok = velocity_ok.all(dim=-1)
+        if chart_velocity:
+            accepted = accepted & velocity_ok
+        v_phi = torch.where(velocity_ok[:, None], v.reshape(rows, n_gen), float("nan"))
+        v_phi = torch.where(accepted[:, None], v_phi, torch.zeros_like(v_phi))
+    keep = accepted[:, None, None, None]
+    if diagnostics_out is not None:
+        diagnostics_out.setdefault("offstrip_rows", []).append(
+            (~certified.all(dim=-1)).sum().to(dtype=torch.float64).reshape(1))
+        if statistics.kind == "type":
+            r = s.sqrt()                                                 # whitening L = S^{1/2}
+            leak = stabilizer_leak(G_W * (r[..., :, None] / r[..., None, :]), mu / r)   # (A, H)
+            diagnostics_out.setdefault("a", []).append(a.reshape(-1))
+            diagnostics_out.setdefault("leak", []).append(leak.reshape(-1))
+            diagnostics_out.setdefault("condP", []).append(cond.reshape(-1))
+        else:
+            diagnostics_out.setdefault("pos_lambda_min", []).append(lam_min.reshape(-1))
+            diagnostics_out.setdefault("pos_cond", []).append(cond.reshape(-1))
+    return GroupLogDirection(
+        xi=torch.where(keep, xi, torch.zeros_like(xi)),
+        covector=torch.where(keep, G_bar, torch.zeros_like(G_bar)),
+        accepted=accepted,
+        v_phi=v_phi,
+        min_undamped_generalized_eigenvalue=lam_min.amin(dim=-1),
+        undamped_generalized_condition=cond.amax(dim=-1),
+        damped_generalized_condition=cond.amax(dim=-1),
+        scaled_solve_residual=residual,
+    )
+
+
+def _fisher_chart_direction(
+    grad_phi: torch.Tensor,                     # (A, n_gen) float64
+    phi:      torch.Tensor,                     # (A, n_gen) float64
+
+    *,
+    group:     GaugeGroup,
+    direction: GroupLogDirectionFn,
+) -> PullbackGroupDirectionResult:
+    r"""Adapt a body direction with chart velocity to the chart stager's direction contract.
+
+    Used by ``fisher_group`` with ``m_phi_group_retraction='chart'``: the additive step
+    :math:`\varphi - \eta v_\varphi` with :math:`v_\varphi = \Psi_R(\mathrm{ad}_\varphi)^{-1} W`.
+    That route's :math:`10^{-6}` product-residual certificate is quadratic in the step and caps
+    chart steps near :math:`7\times10^{-3}` per block at trained norms (measured at d=6), so
+    ``group_log`` is the recommended retraction.
+    """
+    rows, n_gen = grad_phi.shape
+    n_blocks, block_dim = group_log_block_shape(group)
+    U = torch.linalg.matrix_exp(phi.view(rows, n_blocks, block_dim, block_dim))
+    proposal = direction(grad_phi, phi, U)
+    return PullbackGroupDirectionResult(
+        v_phi=proposal.v_phi,
+        xi=proposal.xi.reshape(rows, n_gen),
+        min_undamped_generalized_eigenvalue=proposal.min_undamped_generalized_eigenvalue,
+        undamped_generalized_condition=proposal.undamped_generalized_condition,
+        damped_generalized_condition=proposal.damped_generalized_condition,
+        scaled_solve_residual=proposal.scaled_solve_residual,
+        series_order=proposal.series_order,
+        current_element=U if n_blocks > 1 else U.reshape(rows, block_dim, block_dim),
+        accepted_rows=proposal.accepted,
+    )
+
+
+@torch.no_grad()
+def stage_group_log_candidate(
+    grad_phi: torch.Tensor,             # (active, n_gen) processed covector
+    phi:      torch.Tensor,             # (active, n_gen) current chart
+    group:    GaugeGroup,
+
+    *,
+    direction:        GroupLogDirectionFn,
+    learning_rate:    float,
+    trust_radius:     float,
+    chart_max_norm:   float,
+    bch_residual_max: float,
+    max_backtracks:   int  = 10,
+    collect:          bool = False,
+) -> PullbackGroupCandidate:
+    r"""Stage the exact group retraction :math:`\varphi_{\rm new} = \mathrm{coords}\,\mathrm{Log}(e^X e^{-\eta s \xi})`.
+
+    ``direction`` supplies the body generator :math:`\xi` (any rule: the closed-form pullback, or a
+    Fisher direction). Per row, :math:`s = \min(1, R / \|\eta \xi\|_F)` with the embedded norm over
+    all blocks, and :math:`Z = -\eta s \xi`. The candidate is the principal logarithm of the exact
+    right product :math:`U e^{Z}`, rounded to the chart's storage dtype before any gate. A nonfinite
+    ``xi`` or covector on a row the direction accepted raises. Gates: log
+    failure, nonfinite candidate, product residual
+    :math:`\|e^{\varphi_{\rm new}} - U e^Z\|_F / \|U e^Z\|_F > \min(10^{-6}, \mathrm{bch\_residual\_max})`,
+    positive first-order slope :math:`\langle \bar G, e^{\varphi_{\rm new}} - U \rangle_F > 0`, and
+    the chart bound. A failing row halves its scale; there is no halving for retraction truncation,
+    since the product is exact up to the log's accuracy. A row still failing after
+    ``max_backtracks`` halvings, or rejected by the direction, keeps its chart exactly (no
+    re-charting) and is marked rejected. Nonfinite inputs raise.
+
+    The returned :class:`PullbackGroupCandidate` has the chart route's contract, so the optimizer's
+    commit path is shared. ``direction.current_element`` is ``(A, H, d, d)``, or ``(A, K, K)`` when
+    ``H = 1``, matching :func:`_pullback_group_current_element`.
+    """
+    learning_rate, trust_radius, chart_max_norm, bch_residual_max = _validated_staging_scalars(
+        grad_phi, phi, group,
+        learning_rate=learning_rate,
+        trust_radius=trust_radius,
+        chart_max_norm=chart_max_norm,
+        bch_residual_max=bch_residual_max,
+        max_backtracks=max_backtracks,
+    )
+    n_blocks, block_dim = group_log_block_shape(group)
+    rows, n_gen = grad_phi.shape
+    tiny = torch.finfo(torch.float64).tiny
+
+    with torch.amp.autocast(grad_phi.device.type, enabled=False):
+        grad64 = grad_phi.to(dtype=torch.float64)
+        phi64 = phi.to(dtype=torch.float64)
+        if not bool((torch.isfinite(grad64).all() & torch.isfinite(phi64).all())):
+            raise FloatingPointError("group_log staging received a nonfinite grad or chart")
+        X = phi64.view(rows, n_blocks, block_dim, block_dim)             # (A, H, d, d)
+        U = torch.linalg.matrix_exp(X)                                   # (A, H, d, d)
+        proposal = direction(grad64, phi64, U, collect=collect)
+        block_shape = (rows, n_blocks, block_dim, block_dim)
+        xi = proposal.xi.to(dtype=torch.float64).reshape(block_shape)
+        covector = proposal.covector.to(dtype=torch.float64).reshape(block_shape)
+        accepted = proposal.accepted.reshape(rows)
+        # As on the chart route, a nonfinite output on a row the direction accepted is a kernel
+        # failure, not a geometric rejection: raise instead of counting it as rejected.
+        finite_rows = (torch.isfinite(xi).flatten(1).all(dim=-1)
+                       & torch.isfinite(covector).flatten(1).all(dim=-1))       # (A,)
+        if bool((accepted & ~finite_rows).any()):
+            raise FloatingPointError("group_log direction returned a nonfinite accepted row")
+        xi = torch.where(accepted[:, None, None, None], xi, torch.zeros_like(xi))
+        covector = torch.where(accepted[:, None, None, None], covector, torch.zeros_like(covector))
+
+        right_norm = torch.linalg.vector_norm((learning_rate * xi).reshape(rows, -1), dim=-1)
+        trust_scale = (trust_radius / right_norm.clamp_min(tiny)).clamp(max=1.0)   # (A,)
+        factor_scale = trust_scale.clone()
+        reductions = torch.zeros(rows, dtype=torch.long, device=phi64.device)
+        residual_limit = min(1e-6, bch_residual_max)
+        # Rejected and unresolved rows keep the current chart exactly.
+        candidate_phi = phi64.clone()
+        candidate_chart_norm = embedded_phi_frobenius_norm(phi64, group, warn_fallback=False)
+        group_product_residual = torch.zeros(rows, dtype=torch.float64, device=phi64.device)
+        recharted = torch.zeros(rows, dtype=torch.bool, device=phi64.device)
+        remaining = accepted.nonzero(as_tuple=True)[0]
+        for attempt in range(max_backtracks + 1):
+            if remaining.numel() == 0:
+                break
+            current = U[remaining]                                                   # (r, H, d, d)
+            scales = (learning_rate * factor_scale[remaining])[:, None, None, None]
+            target = current @ torch.linalg.matrix_exp(-scales * xi[remaining])      # U e^Z
+            X_new, log_failed, _ = logm_principal(target)
+            # Round BEFORE any gate so the commit cannot invalidate the certificate.
+            proposed = X_new.reshape(-1, n_gen).to(dtype=phi.dtype).to(dtype=torch.float64)
+            finite = torch.isfinite(proposed).all(dim=-1)
+            safe = torch.where(finite[:, None], proposed, phi64[remaining])
+            proposed_blocks = safe.view(-1, n_blocks, block_dim, block_dim)
+            element = torch.linalg.matrix_exp(proposed_blocks)                       # (r, H, d, d)
+            residual = ((element - target).square().sum(dim=(-3, -2, -1)).sqrt()
+                        / target.square().sum(dim=(-3, -2, -1)).sqrt().clamp_min(tiny))
+            slope = (covector[remaining] * (element - current)).sum(dim=(-3, -2, -1))
+            chart_norm = embedded_phi_frobenius_norm(safe, group, warn_fallback=False)
+            passed = (~log_failed.any(dim=-1) & finite
+                      & (residual <= residual_limit)
+                      & (slope <= 0.0)
+                      & (chart_norm <= chart_max_norm))
+            done = remaining[passed]
+            candidate_phi[done] = proposed[passed]
+            candidate_chart_norm[done] = chart_norm[passed]
+            group_product_residual[done] = residual[passed]
+            recharted[done] = torch.linalg.matrix_norm(
+                proposed_blocks[passed] - X[done]).amax(dim=-1) > math.pi
+            remaining = remaining[~passed]
+            if attempt < max_backtracks:
+                factor_scale[remaining] *= 0.5
+                reductions[remaining] += 1
+        rejected = ~accepted
+        rejected[remaining] = True
+
+        strip_margin = None
+        if collect:
+            strip_margin = (math.pi - torch.linalg.matrix_norm(
+                0.5 * (X - X.transpose(-1, -2)))).amin(dim=-1)                       # (A,)
+        nan_rows = torch.full((rows,), float("nan"), dtype=torch.float64, device=phi64.device)
+
+        def _row_field(value: Optional[torch.Tensor]) -> torch.Tensor:
+            return nan_rows if value is None else value.to(dtype=torch.float64).reshape(rows)
+
+        direction_result = PullbackGroupDirectionResult(
+            v_phi=(torch.full_like(phi64, float("nan")) if proposal.v_phi is None
+                   else proposal.v_phi.to(dtype=torch.float64).reshape(rows, n_gen)),
+            xi=xi.reshape(rows, n_gen),
+            min_undamped_generalized_eigenvalue=_row_field(
+                proposal.min_undamped_generalized_eigenvalue),
+            undamped_generalized_condition=_row_field(proposal.undamped_generalized_condition),
+            damped_generalized_condition=_row_field(proposal.damped_generalized_condition),
+            scaled_solve_residual=_row_field(proposal.scaled_solve_residual),
+            series_order=proposal.series_order,
+            current_element=U if n_blocks > 1 else U.reshape(rows, block_dim, block_dim),
+            accepted_rows=~rejected,
+        )
+        return PullbackGroupCandidate(
+            candidate_phi=candidate_phi,
+            trust_scale=trust_scale,
+            backtracking_reductions=reductions,
+            candidate_chart_norm=candidate_chart_norm,
+            group_product_residual=group_product_residual,
+            direction=direction_result,
+            rejected_rows=rejected,
+            fast_rows=(None if proposal.fast_rows is None else proposal.fast_rows.reshape(rows)),
+            recharted_rows=recharted,
+            strip_margin=strip_margin,
+            frame_condition=(None if proposal.frame_condition is None
+                             else proposal.frame_condition.reshape(rows)),
+        )
+
+
 def phi_projection_chunk_rows(
     coordinate_width: int,
     matrix_width:     int,
@@ -529,12 +1076,37 @@ def project_phi_parameter_rows_(
     }
 
 
+def _fisher_diagnostics(accumulated: Dict[str, List[torch.Tensor]]) -> Dict[str, float]:
+    r"""Reduce per-block belief-Fisher statistics to :data:`FISHER_DIAGNOSTIC_KEYS` (NaN when absent)."""
+    reductions = (
+        ("a", torch.median),
+        ("leak", torch.mean),
+        ("condP", torch.amax),
+        ("pos_lambda_min", torch.amin),
+        ("offstrip_rows", torch.sum),
+        ("pos_cond", torch.amax),
+    )
+    if not accumulated:
+        return {key: float("nan") for key in FISHER_DIAGNOSTIC_KEYS}
+    device = next(iter(accumulated.values()))[0].device
+    values = []
+    for name, reduce in reductions:
+        parts = accumulated.get(name)
+        values.append(reduce(torch.cat(parts)).to(dtype=torch.float64) if parts
+                      else torch.tensor(float("nan"), dtype=torch.float64, device=device))
+    return dict(zip(FISHER_DIAGNOSTIC_KEYS, torch.stack(values).cpu().tolist()))   # one host read
+
+
 class GaugeManifoldAdamW(torch.optim.AdamW):
     r"""AdamW for ordinary groups plus stateless phi group retractions.
 
-    A parameter group marked ``pullback_group=True`` is staged through
-    :func:`stage_pullback_group_candidate` on active rows only. The update creates no optimizer
-    state for the phi table.
+    A parameter group marked ``pullback_group=True`` is staged on active rows only, through
+    :func:`stage_pullback_group_candidate` (``phi_group_retraction='chart'``) or through
+    :func:`stage_group_log_candidate` with :func:`pullback_group_log_direction`
+    (``'group_log'``). With ``phi_statistics_provider`` (policy ``fisher_group``) the direction is
+    :func:`belief_fisher_group_direction` under either retraction; the provider supplies the batch
+    belief statistics of the active rows of each table. The update creates no optimizer state for
+    the phi table.
     """
 
     # Signature-convention exception: torch.optim.Optimizer's contract REQUIRES params as the
@@ -549,10 +1121,24 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
         phi_chart_max_norm:     float,
         phi_bch_residual_max:   float,
         phi_precond_mode:       str,
+        phi_group_retraction:   str = "chart",
+        phi_statistics_provider:    Optional[PhiStatisticsProvider] = None,
+        phi_fisher_rotation_weight: float = 2.0,
         **kwargs,
     ) -> None:
         if not isinstance(group, GaugeGroup):
             raise TypeError(f"group must be a GaugeGroup, got {type(group).__name__}")
+        if phi_group_retraction not in _UGROUP_RETRACTIONS:
+            raise ValueError(
+                f"phi_group_retraction must be one of {_UGROUP_RETRACTIONS}, got "
+                f"{phi_group_retraction!r}"
+            )
+        if phi_group_retraction == "group_log" or phi_statistics_provider is not None:
+            group_log_block_shape(group)                                # fail before any step
+        phi_fisher_rotation_weight = _require_positive_finite(
+            phi_fisher_rotation_weight,
+            "phi_fisher_rotation_weight",
+        )
         phi_group_trust_radius = _require_positive_finite(
             phi_group_trust_radius,
             "phi_group_trust_radius",
@@ -573,6 +1159,9 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
         self._phi_group_trust_radius = phi_group_trust_radius
         self._phi_chart_max_norm     = phi_chart_max_norm
         self._phi_bch_residual_max   = phi_bch_residual_max
+        self._phi_group_retraction   = phi_group_retraction
+        self.phi_statistics_provider = phi_statistics_provider
+        self._phi_fisher_rotation_weight = phi_fisher_rotation_weight
         # Training-time diagnostics are gated by train.py to log/eval steps. The silent hot path
         # performs no diagnostic tensor work or host reduction. Pullback groups report the fixed-
         # coordinate ridge-direction cosine, reused generalized-condition certificate, accepted
@@ -658,6 +1247,15 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
         effective_scale_acc: List[torch.Tensor] = []
         rejected_acc: List[torch.Tensor] = []
         phi_active_rows = 0
+        group_log = self._phi_group_retraction == "group_log"
+        fast_acc: List[Optional[torch.Tensor]] = []
+        rechart_acc: List[torch.Tensor] = []
+        backtrack_acc: List[torch.Tensor] = []
+        margin_acc: List[torch.Tensor] = []
+        frame_cond_acc: List[Optional[torch.Tensor]] = []
+        provider = self.phi_statistics_provider
+        fisher_acc: Optional[Dict[str, List[torch.Tensor]]] = (
+            {} if collect and provider is not None else None)
 
         # Reject every nonfinite processed phi covector before deriving an active-row mask or
         # staging any phi candidate. In particular, NaN must not compare false against zero and
@@ -694,17 +1292,59 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                 if not bool(active.any()):
                     pending_zero_gradients.append(p)
                     continue
-                candidate = stage_pullback_group_candidate(
-                    flat_gradient[active],
-                    flat_phi[active],
-                    self._group,
-                    learning_rate=phi_group["lr"],
-                    trust_radius=self._phi_group_trust_radius,
-                    chart_max_norm=self._phi_chart_max_norm,
-                    bch_residual_max=self._phi_bch_residual_max,
-                    phi_precond_mode=self._precond_mode,
-                    differential_mode=self._phi_group_differential_mode,
-                )
+                fisher = None
+                if provider is not None:
+                    statistics = provider(p, active.nonzero(as_tuple=True)[0])
+                    fisher = functools.partial(
+                        belief_fisher_group_direction,
+                        statistics=statistics,
+                        rotation_weight=self._phi_fisher_rotation_weight,
+                        diagnostics_out=fisher_acc,
+                    )
+                if group_log:
+                    candidate = stage_group_log_candidate(
+                        flat_gradient[active],
+                        flat_phi[active],
+                        self._group,
+                        direction=fisher if fisher is not None else functools.partial(
+                            pullback_group_log_direction,
+                            group=self._group,
+                            phi_precond_mode=self._precond_mode,
+                            differential_mode=self._phi_group_differential_mode,
+                        ),
+                        learning_rate=phi_group["lr"],
+                        trust_radius=self._phi_group_trust_radius,
+                        chart_max_norm=self._phi_chart_max_norm,
+                        bch_residual_max=self._phi_bch_residual_max,
+                        collect=collect,
+                    )
+                else:
+                    candidate = stage_pullback_group_candidate(
+                        flat_gradient[active],
+                        flat_phi[active],
+                        self._group,
+                        learning_rate=phi_group["lr"],
+                        trust_radius=self._phi_group_trust_radius,
+                        chart_max_norm=self._phi_chart_max_norm,
+                        bch_residual_max=self._phi_bch_residual_max,
+                        phi_precond_mode=self._precond_mode,
+                        differential_mode=self._phi_group_differential_mode,
+                        direction_fn=None if fisher is None else functools.partial(
+                            _fisher_chart_direction,
+                            group=self._group,
+                            direction=functools.partial(
+                                fisher, collect=collect, chart_velocity=True),
+                        ),
+                    )
+                if collect and group_log:
+                    fast_acc.append(candidate.fast_rows)
+                    rechart_acc.append(candidate.recharted_rows)
+                    backtrack_acc.append(candidate.backtracking_reductions)
+                    margin_acc.append(candidate.strip_margin)
+                    frame_cond_acc.append(
+                        None if candidate.frame_condition is None or candidate.fast_rows is None
+                        else torch.where(candidate.fast_rows, candidate.frame_condition,
+                                         float("nan")))
                 if collect:
                     cosine = torch.nn.functional.cosine_similarity(
                         candidate.direction.v_phi,
@@ -762,15 +1402,21 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
             if cos_acc:
                 all_cos = torch.cat(cos_acc)
                 allc = torch.cat(cond_acc)
+                if provider is not None:
+                    # Fisher conditions are logged under FISHER_DIAGNOSTIC_KEYS, not as pullback ones.
+                    allc = torch.full_like(allc, float("nan"))
                 all_trust = torch.cat(trust_acc)
                 all_chart = torch.cat(chart_acc)
                 chart_displacement = torch.cat(chart_displacement_acc)
                 frame_displacement = torch.cat(frame_displacement_acc)
                 effective_scale = torch.cat(effective_scale_acc)
-                values = torch.stack((
-                    all_cos.mean(),
-                    allc.median(),
-                    allc.max(),
+                direction_norm = torch.cat(direction_norm_acc)
+                # group_log: closed-form rows carry NaN conditioning (no metric is assembled), and a
+                # failed chart-velocity log leaves a NaN cosine; reduce those keys NaN-aware.
+                statistics = [
+                    all_cos.nanmean() if group_log else all_cos.mean(),
+                    allc.nanmedian() if group_log else allc.median(),
+                    _nan_amax(allc) if group_log else allc.max(),
                     all_trust.mean(),
                     all_trust.min(),
                     all_chart.max(),
@@ -779,12 +1425,26 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                     frame_displacement.mean(),
                     frame_displacement.max(),
                     torch.cat(covector_norm_acc).mean(),
-                    torch.cat(direction_norm_acc).mean(),
+                    direction_norm.nanmean() if group_log else direction_norm.mean(),
                     effective_scale.mean(),
                     effective_scale.min(),
                     (torch.stack(rejected_acc).sum().to(dtype=effective_scale.dtype)
                      if rejected_acc else effective_scale.new_zeros(())),
-                )).cpu().tolist()
+                ]
+                if group_log:
+                    nan = effective_scale.new_tensor(float("nan"))
+                    fast = (torch.cat(fast_acc) if all(f is not None for f in fast_acc)
+                            else None)
+                    statistics += [
+                        nan if fast is None else fast.sum().to(dtype=nan.dtype),
+                        nan if fast is None else (~fast).sum().to(dtype=nan.dtype),
+                        torch.cat(rechart_acc).sum().to(dtype=nan.dtype),
+                        torch.cat(backtrack_acc).amax().to(dtype=nan.dtype),
+                        torch.cat(margin_acc).amin(),
+                        (nan if any(c is None for c in frame_cond_acc)
+                         else _nan_amax(torch.cat(frame_cond_acc))),
+                    ]
+                values = torch.stack(statistics).cpu().tolist()
                 self._gauge_diag.update({
                     "phi_ridge_direction_cosine_mean":         values[0],
                     "phi_pullback_damped_gen_cond_median":     values[1],
@@ -803,4 +1463,8 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                     "phi_effective_step_scale_min":            values[13],
                     "phi_group_rejected_rows":                 values[14],
                 })
+                if group_log:
+                    self._gauge_diag.update(dict(zip(GROUP_LOG_DIAGNOSTIC_KEYS, values[15:])))
+            if fisher_acc is not None:
+                self._gauge_diag.update(_fisher_diagnostics(fisher_acc))
         return super().step()                                          # closure already rejected above

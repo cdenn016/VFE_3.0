@@ -7,9 +7,11 @@ emits a CSV/JSON-friendly record. The metrics are pure measurements (no gradient
 side effects) suitable for logging a training run or a figure.
 
 Provided: effective_rank (spectral participation ratio), attention_entropy (row entropy
-of beta), holonomy_deviation (cocycle/curvature departure of the transport from flat),
-gauge_trace_spread (spread of log|det Omega| = tr embed(phi)), and free_energy_terms
-(the per-term F decomposition).
+of beta), holonomy_deviation (closure residual of the coboundary transport
+Omega_ij = U_i U_j^{-1}; zero in exact arithmetic, so a roundoff and frame-conditioning monitor, not
+curvature), gauge_trace_spread (spread of log|det Omega| = tr embed(phi)), free_energy_terms
+(the per-term F decomposition), and content_link_spectrum (similarity invariants of the relational
+content maps M_h = O_h T_h).
 """
 
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -58,14 +60,15 @@ def holonomy_deviation(
     *,
     max_triangles: int = 512,
 ) -> torch.Tensor:                       # () mean ||Omega_ij Omega_jk Omega_ki - I||_F
-    r"""Curvature proxy: mean Frobenius departure of the triangle holonomy from identity.
+    r"""Coboundary closure residual: mean Frobenius departure of the triangle product from identity.
 
     FRAME-DEPENDENT (Frobenius; conjugation-invariant only for orthogonal gauges): under a GL(K)
     frame change the holonomy conjugates, H -> g H g^{-1}, and ||H - I||_F is preserved only for
-    orthogonal/unitary g -- use :func:`holonomy_wilson_sampled` for gauge-invariant curvature.
+    orthogonal/unitary g -- :func:`holonomy_wilson_sampled` is the conjugation-invariant trace analog.
 
-    For a flat (Regime I) cocycle Omega_ij = exp(phi_i)exp(-phi_j) every triangle closes
-    (H_ijk = I) so the deviation is ~0; a non-flat / non-cocycle transport gives > 0.
+    For the coboundary Omega_ij = U_i U_j^{-1} (every registered transport) H_ijk = I identically, so
+    the value is roundoff of the stored (U, U^{-1}) pair, growing with cond(U); it would carry
+    curvature only for a non-coboundary transport, and none is registered.
     """
     N, K = omega.shape[0], omega.shape[-1]
     eye = torch.eye(K, device=omega.device, dtype=omega.dtype)
@@ -1517,6 +1520,143 @@ def cocycle_residual_sampled(
     return torch.linalg.norm(o_ik - o_ij @ o_jk, dim=(-2, -1)).mean()
 
 
+# --- content-link spectrum (similarity invariants of M_h = O_h T_h) ---
+#
+# The content link is L_ij^h = U_i M_h U_j^{-1}. Its invariants under the passive left action (U_i -> g_i U_i),
+# the common reference change (U_i, S, T, O) -> (U_i a, S a, T a, a^{-1} O), and the per-head value basis
+# (T_h, O_h) -> (B T_h, O_h B^{-1}) are the similarity invariants of the tuple (M_h). By
+# det(z I_K - M_h) = z^{K-d} det(z I_d - W_h), they are read from the d x d W_h = T_hat_h O_hat_h, which removes
+# the K-d structural zeros exactly. Singular values and Frobenius norms of M_h (relational_content_max_singular_value)
+# are not invariant under the reference change: M_h -> a^{-1} M_h a.
+#
+# A rank-deficient head (singular W_h) has min|lambda| = 0, which is the expected value, and log|det W_h| = -inf;
+# the mean log-modulus is then written as NaN rather than -inf so that metrics.csv never carries an infinity.
+
+LINK_SPECTRUM_KEYS: Tuple[str, ...] = (
+    "relational_link_spectral_radius_max",
+    "relational_link_min_abs_eigenvalue",
+    "relational_link_mean_log_abs_eigenvalue",
+    "relational_link_unit_distance_max",
+    "relational_link_idempotency_defect_max",
+    "relational_link_trace",
+    "relational_link_trace_sq",
+    "relational_link_cross_trace",
+    "relational_link_selfloop_spectral_radius_max",
+    "relational_link_selfloop_spectral_radius_mean",
+)
+
+
+def _head_transfer(
+    T_hat: torch.Tensor,                  # (H, d, K) ambient sending maps
+    O_hat: torch.Tensor,                  # (H, K, d) ambient receiving maps
+) -> torch.Tensor:                        # (H, H, d, d) W_hg = T_hat_h O_hat_g, float64 CPU
+    r"""Head-transfer blocks :math:`W_{hg}=\hat T_h\hat O_g`; spec :math:`W_{hh}` is the nonzero spectrum of
+    :math:`M_h=\hat O_h\hat T_h` because :math:`\det(zI_K-M_h)=z^{K-d}\det(zI_d-W_{hh})`."""
+    T_hat = T_hat.detach().to("cpu", torch.float64)
+    O_hat = O_hat.detach().to("cpu", torch.float64)
+    return torch.einsum("hsk,gkt->hgst", T_hat, O_hat)
+
+
+def content_link_eigenvalues(
+    T_hat: torch.Tensor,                  # (H, d, K)
+    O_hat: torch.Tensor,                  # (H, K, d)
+) -> torch.Tensor:                        # (H, d) complex128, per head sorted by (-|lam|, -Re, -Im)
+    r"""Eigenvalues of :math:`\hat T_h\hat O_h` (the nonzero spectrum of :math:`M_h`), in a fixed order.
+
+    Lexicographic order by successive stable sorts: modulus (rounded to 12 decimals so exact conjugate
+    pairs tie) descending, then real part descending, then imaginary part descending.
+    """
+    W = _head_transfer(T_hat, O_hat)
+    lam = torch.linalg.eigvals(torch.diagonal(W, dim1=0, dim2=1).permute(2, 0, 1))   # (H, d)
+    for part in ("imag", "real", "abs"):                                             # last pass = primary key
+        key = (lam.imag if part == "imag" else lam.real if part == "real"
+               else torch.round(lam.abs(), decimals=12))
+        lam = lam.gather(-1, torch.sort(-key, dim=-1, stable=True).indices)
+    return lam
+
+
+def content_link_head_invariants(
+    T_hat: torch.Tensor,                  # (H, d, K)
+    O_hat: torch.Tensor,                  # (H, K, d)
+) -> List[Dict[str, float]]:
+    r"""Per-head similarity invariants of :math:`M_h=\hat O_h\hat T_h` from :math:`W_h=\hat T_h\hat O_h`.
+
+    ``link_spectral_radius`` :math:`\rho(W_h)`, ``link_min_abs_eigenvalue`` (0 for a rank-deficient head),
+    ``link_mean_log_abs_eigenvalue`` :math:`\tfrac1d\log|\det W_h|` (NaN for a singular head, where it is
+    :math:`-\infty`), ``link_unit_distance`` :math:`\max|\lambda-1|`,
+    ``link_idempotency_defect`` :math:`\max|\lambda(\lambda-1)|=\rho(M_h^2-M_h)`, ``link_trace``
+    :math:`\operatorname{Tr}M_h`, ``link_trace_sq`` :math:`\operatorname{Tr}M_h^2`, ``link_cross_trace``
+    :math:`\sum_{g\ne h}\operatorname{Tr}M_hM_g`, ``link_sum_spectral_radius`` :math:`\rho(\sum_gM_g)` (one
+    value per layer), and ``link_eigvec_condition`` :math:`\kappa_2(V_h)`, a numerics certificate that is
+    NOT invariant (it depends on the stored per-head basis, and is infinite or huge for a defective
+    :math:`W_h`).
+    """
+    W = _head_transfer(T_hat, O_hat)                                          # (H, H, d, d)
+    H, d = W.shape[0], W.shape[-1]
+    W_head = torch.diagonal(W, dim1=0, dim2=1).permute(2, 0, 1)               # (H, d, d)
+    lam, vec = torch.linalg.eig(W_head)                                       # (H, d), (H, d, d)
+    vec = vec / torch.linalg.vector_norm(vec, dim=-2, keepdim=True)
+    pair = (W * W.permute(1, 0, 3, 2)).sum(dim=(-2, -1))                      # (H, H) Tr(W_hg W_gh)
+    logdet = torch.linalg.slogdet(W_head).logabsdet                           # (H,), -inf when singular
+    logdet = torch.where(torch.isfinite(logdet), logdet, torch.full_like(logdet, float("nan")))
+    sum_rho = float(torch.linalg.eigvals(W.permute(0, 2, 1, 3).reshape(H * d, H * d)).abs().max())
+    rows = []
+    for h in range(H):
+        rows.append({
+            "link_spectral_radius": float(lam[h].abs().max()),
+            "link_min_abs_eigenvalue": float(lam[h].abs().min()),
+            "link_mean_log_abs_eigenvalue": float(logdet[h] / d),
+            "link_unit_distance": float((lam[h] - 1.0).abs().max()),
+            "link_idempotency_defect": float((lam[h] * (lam[h] - 1.0)).abs().max()),
+            "link_trace": float(torch.diagonal(W_head[h]).sum()),
+            "link_trace_sq": float(pair[h, h]),
+            "link_cross_trace": float(pair[h].sum() - pair[h, h]),
+            "link_sum_spectral_radius": sum_rho,
+            "link_eigvec_condition": float(torch.linalg.cond(vec[h])),
+        })
+    return rows
+
+
+def content_link_spectrum(
+    T_hat:     torch.Tensor,                    # (H, d, K)
+    O_hat:     torch.Tensor,                    # (H, K, d)
+    beta_self: Optional[torch.Tensor] = None,   # (..., H, N) self weights beta_ii^h; None -> NaN self-loop keys
+    residual:  bool = False,                    # attention_residual: A_ii = I + sum_h beta_ii^h M_h
+) -> Dict[str, float]:
+    r"""The ten ``relational_link_*`` scalars of one layer (keys and order: ``LINK_SPECTRUM_KEYS``).
+
+    Head reductions of :func:`content_link_head_invariants` plus the self-loop spectral radius
+    :math:`\rho(rI+\sum_h\beta_{ii}^hM_h)`, computed as :math:`\rho(rI+D_i\mathsf W)` with
+    :math:`D_i=\operatorname{diag}(\beta_{ii}^hI_d)` and :math:`\mathsf W=[W_{hg}]` (:math:`K=Hd`). Under a
+    causal prior the maximum over tokens is the spectral radius of the whole-sequence fixed-routing operator.
+    The mean log-modulus is NaN when any head is singular.
+    """
+    heads = content_link_head_invariants(T_hat, O_hat)
+    out = {
+        "relational_link_spectral_radius_max": max(r["link_spectral_radius"] for r in heads),
+        "relational_link_min_abs_eigenvalue": min(r["link_min_abs_eigenvalue"] for r in heads),
+        "relational_link_mean_log_abs_eigenvalue": sum(r["link_mean_log_abs_eigenvalue"] for r in heads) / len(heads),
+        "relational_link_unit_distance_max": max(r["link_unit_distance"] for r in heads),
+        "relational_link_idempotency_defect_max": max(r["link_idempotency_defect"] for r in heads),
+        "relational_link_trace": sum(r["link_trace"] for r in heads),
+        "relational_link_trace_sq": sum(r["link_trace_sq"] for r in heads),
+        "relational_link_cross_trace": 0.5 * sum(r["link_cross_trace"] for r in heads),
+        "relational_link_selfloop_spectral_radius_max": float("nan"),
+        "relational_link_selfloop_spectral_radius_mean": float("nan"),
+    }
+    if beta_self is not None:
+        W = _head_transfer(T_hat, O_hat)
+        H, d = W.shape[0], W.shape[-1]
+        W_full = W.permute(0, 2, 1, 3).reshape(H * d, H * d)                  # (Hd, Hd)
+        b = beta_self.detach().to("cpu", torch.float64)
+        b = b.reshape(-1, H, b.shape[-1]).transpose(-1, -2).reshape(-1, H)    # (B N, H)
+        A = b.repeat_interleave(d, dim=-1).unsqueeze(-1) * W_full             # (B N, Hd, Hd) = D_i W
+        rho = (torch.linalg.eigvals(A) + (1.0 if residual else 0.0)).abs().amax(dim=-1)   # (B N,)
+        out["relational_link_selfloop_spectral_radius_max"] = float(rho.max())
+        out["relational_link_selfloop_spectral_radius_mean"] = float(rho.mean())
+    return out
+
+
 # --- free-energy closure and per-token profile (the headline F figure) ---
 
 def free_energy_full_decomposition(
@@ -1943,11 +2083,11 @@ def _m_attn_entropy(*, beta: torch.Tensor, **kw) -> float:
 
 @register_metric("holonomy_deviation")
 def _m_holonomy(*, omega: 'torch.Tensor | CompactFactoredTransport', **kw) -> float:
-    """Mean triangle-holonomy departure from identity (curvature proxy).
+    """Mean triangle-holonomy departure from identity (coboundary closure residual; a roundoff monitor).
 
     Routes to the SAMPLED estimator (audit 2026-06-10 F16): the deterministic row-major
     ``holonomy_deviation`` always reads the same low-index-token triangles -- a systematically
-    biased curvature estimate -- and ``diagnostics()`` already logs the sampled one, so the
+    biased estimate -- and ``diagnostics()`` already logs the sampled one, so the
     registry key now agrees with the training log."""
     return float(holonomy_deviation_sampled(omega)["mean"])
 
