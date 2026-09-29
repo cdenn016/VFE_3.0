@@ -1514,19 +1514,19 @@ def _validate_rng_state(
     except RuntimeError as exc:
         raise RuntimeError("checkpoint rng_state cpu state is invalid") from exc
     cuda = rng_state["cuda"]
-    if torch.cuda.is_available() and cuda is None:
+    if torch.cuda.device_count() > 0 and cuda is None:
         raise RuntimeError("checkpoint rng_state must contain every active CUDA RNG state")
     if cuda is not None:
         if not isinstance(cuda, (list, tuple)):
             raise RuntimeError("checkpoint rng_state cuda states must be a sequence or null")
-        if torch.cuda.is_available() and len(cuda) != torch.cuda.device_count():
+        if torch.cuda.device_count() > 0 and len(cuda) != torch.cuda.device_count():
             raise RuntimeError(
                 "checkpoint rng_state CUDA state count does not match the active device count")
         for index, state in enumerate(cuda):
             if (not isinstance(state, torch.Tensor) or state.device.type != "cpu"
                     or state.dtype != torch.uint8):
                 raise RuntimeError("checkpoint rng_state CUDA states must be CPU ByteTensors")
-            if torch.cuda.is_available() and index < torch.cuda.device_count():
+            if index < torch.cuda.device_count():
                 try:
                     torch.Generator(device=f"cuda:{index}").set_state(state)
                 except RuntimeError as exc:
@@ -1915,7 +1915,7 @@ class RunArtifacts:
         path = self.ckpt_dir / f"step_{step}.pt"
         rng_state = {
             "cpu":  torch.get_rng_state(),
-            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.device_count() > 0 else None,
         }
         saved_data_state = None
         if data_state is not None:
@@ -2411,7 +2411,7 @@ def load_checkpoint(
         rng = saved_rng_state
         # RNG tensors must be CPU ByteTensors regardless of map_location (set_rng_state asserts this).
         torch.set_rng_state(rng["cpu"].cpu() if hasattr(rng["cpu"], "cpu") else rng["cpu"])
-        if rng.get("cuda") is not None and torch.cuda.is_available():
+        if rng.get("cuda") is not None and torch.cuda.device_count() > 0:
             torch.cuda.set_rng_state_all([s.cpu() for s in rng["cuda"]])
     if data_state is not None:
         data_state.clear()
@@ -3972,7 +3972,7 @@ def collect_estep_depth_sensitivity(
     was_training = bool(model.training)
     cpu_rng = torch.get_rng_state().clone()
     cuda_rng = ([state.clone() for state in torch.cuda.get_rng_state_all()]
-                if torch.cuda.is_available() else None)
+                if torch.cuda.device_count() > 0 else None)
 
     def _score(belief_depth: int) -> Dict[str, float | int]:
         model.cfg.n_e_steps = belief_depth
@@ -4257,7 +4257,7 @@ def collect_estep_character(
     realized_belief_calls: Dict[int, int] = {}
     cpu_rng = torch.get_rng_state().clone()
     cuda_rng = ([state.clone() for state in torch.cuda.get_rng_state_all()]
-                if torch.cuda.is_available() else None)
+                if torch.cuda.device_count() > 0 else None)
     try:
         model.eval()
         for module in holders:
@@ -4427,7 +4427,7 @@ def collect_beta_channel_decomposition(
 
     cpu_rng = torch.get_rng_state().clone()
     cuda_rng = ([state.clone() for state in torch.cuda.get_rng_state_all()]
-                if torch.cuda.is_available() else None)
+                if torch.cuda.device_count() > 0 else None)
     try:
         model.eval()
         for module in binders:
@@ -4500,7 +4500,7 @@ def collect_context_sensitivity(
     was_training = bool(model.training)
     cpu_rng = torch.get_rng_state().clone()
     cuda_rng = ([state.clone() for state in torch.cuda.get_rng_state_all()]
-                if torch.cuda.is_available() else None)
+                if torch.cuda.device_count() > 0 else None)
 
     vocab = int(model.cfg.vocab_size)
     generator = torch.Generator(device="cpu").manual_seed(int(seed))
@@ -4566,7 +4566,7 @@ def collect_phi_numerics(
     was_training = bool(model.training)
     cpu_rng = torch.get_rng_state().clone()
     cuda_rng = ([state.clone() for state in torch.cuda.get_rng_state_all()]
-                if torch.cuda.is_available() else None)
+                if torch.cuda.device_count() > 0 else None)
     try:
         model.eval()
         selected = tokens[:1, :max_tokens]
@@ -4618,7 +4618,7 @@ def _restore_rng_state(
     if cpu is not None:
         torch.set_rng_state(cpu.cpu() if hasattr(cpu, "cpu") else cpu)
     cuda = rng_state.get("cuda")
-    if cuda is not None and torch.cuda.is_available():
+    if cuda is not None and torch.cuda.device_count() > 0:
         torch.cuda.set_rng_state_all([s.cpu() if hasattr(s, "cpu") else s for s in cuda])
 
 

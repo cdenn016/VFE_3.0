@@ -555,6 +555,7 @@ def test_load_checkpoint_requires_cuda_rng_states_on_an_active_cuda_host(tmp_pat
     malformed = tmp_path / "missing-cuda-rng.pt"
     torch.save(bundle, malformed)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
     target = VFEModel(cfg)
     before = _params(target)
 

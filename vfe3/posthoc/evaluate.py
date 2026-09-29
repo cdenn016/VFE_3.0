@@ -47,7 +47,7 @@ CROSS_CHECK_TOL: float = 1e-4
 def resolve_device(name: str) -> torch.device:
     r"""``"auto"`` resolves to CUDA when available, else CPU; any other name is passed to torch."""
     if name == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return torch.device("cuda" if torch.cuda.device_count() > 0 else "cpu")
     return torch.device(name)
 
 
