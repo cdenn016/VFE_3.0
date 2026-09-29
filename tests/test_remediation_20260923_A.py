@@ -264,12 +264,35 @@ def test_full_family_is_value_identical_to_diagonal_on_launcher_route() -> None:
 @pytest.mark.parametrize("override", [
     {"block_mlp_covariance": "delta_full"},
     {"use_head_mixer": True},
-    {"block_mlp_mode": "gauge_gate"},
 ], ids=lambda o: next(iter(o)))
 def test_family_stays_live_where_a_seam_densifies_or_diagonal_is_not_admitted(
     override: Dict[str, Any],
 ) -> None:
     assert "family" not in _cfg(_launcher(**override)).inactive_fields()
+
+
+def test_passthrough_gauge_gate_keeps_family_value_identical() -> None:
+    # The gauge gate admits the diagonal family (2026-09-28): on a diagonal Sigma its invariant
+    # mu_b^T Sigma_bb^{-1} mu_b is sum_k mu_k^2 / sigma_k, exact up to the Cholesky solve's roundoff.
+    base = _launcher(block_mlp_mode="gauge_gate", predictive_covariance="passthrough",
+                     decode_coordinates="local")
+    assert "family" in _cfg(base).inactive_fields()
+    full, diag, ids, tgt = _fp64_pair(base)
+    with torch.no_grad():
+        belief, _ = full.forward_beliefs(ids, return_logits=False)
+    assert _off_diagonal(belief.sigma) == 0.0
+    _, loss_full, _ = full(ids, tgt)
+    _, loss_diag, _ = diag(ids, tgt)
+    loss_full.backward()
+    loss_diag.backward()
+    torch.testing.assert_close(loss_full, loss_diag, rtol=1e-12, atol=0.0)
+    grads_diag = dict(diag.named_parameters())
+    for name, p in full.named_parameters():
+        other = grads_diag[name].grad
+        assert (p.grad is None) == (other is None), name
+        if p.grad is not None:
+            torch.testing.assert_close(p.grad, other, rtol=1e-12, atol=1e-14,
+                                       msg=lambda m, name=name: f"{name}: {m}")
 
 
 def test_delta_full_densifies_the_stored_covariance() -> None:
