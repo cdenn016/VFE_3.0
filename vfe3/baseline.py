@@ -890,7 +890,7 @@ class BaselineTransformer(nn.Module):
             "flops_per_token_forward": forward_per_token,
             "flops_per_token_train":   3.0 * forward_per_token,
             "est_flops_analytic":      3.0 * forward_per_token * float(tokens_seen),
-            "device_name":             (torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"),
+            "device_name":             (torch.cuda.get_device_name(0) if torch.cuda.device_count() > 0 else "cpu"),
             "amp_dtype":               cfg.amp_dtype,
         }
         if wall_time is not None and tokens_seen > 0:
