@@ -81,7 +81,7 @@ def test_depth_checkpoint_and_optimizer(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_scaled_active_config_training_step(device: str) -> None:
-    if device == "cuda" and not torch.cuda.is_available():
+    if device == "cuda" and torch.cuda.device_count() == 0:
         pytest.skip("CUDA unavailable")
     import train_vfe3
 

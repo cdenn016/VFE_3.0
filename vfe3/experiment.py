@@ -137,7 +137,7 @@ def run_vfe(
     _validate_path_component(dataset, "dataset")
     _validate_path_component(label, "label")
     logger = logger or logging.getLogger("vfe3.experiment")
-    device = torch.device(device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu"))
+    device = torch.device(device if device is not None else ("cuda" if torch.cuda.device_count() > 0 else "cpu"))
     cfg = _with_seed(cfg, seed)
 
     seed_everything(cfg.seed, deterministic=cfg.deterministic)

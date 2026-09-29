@@ -676,7 +676,7 @@ def _periodic_generation(
     cpu_rng = torch.get_rng_state().clone()
     cuda_rng = (
         tuple(state.clone() for state in torch.cuda.get_rng_state_all())
-        if torch.cuda.is_available()
+        if torch.cuda.device_count() > 0
         else None
     )
     try:
@@ -3884,7 +3884,7 @@ def train(
         rng_state: Dict[str, object] = {
             "cpu":  torch.get_rng_state().clone(),
             "cuda": ([s.clone() for s in torch.cuda.get_rng_state_all()]
-                     if torch.cuda.is_available() else None),
+                     if torch.cuda.device_count() > 0 else None),
         }
         terminal_data_state: Optional[DataState] = ({
             "epoch_start_generator_state": epoch_start_generator_state,
@@ -4246,7 +4246,7 @@ def run_training(
     the end-of-run test eval. Kept only for the lightweight in-process smoke use it already had.
     """
     seed_everything(cfg.seed, deterministic=cfg.deterministic)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.device_count() > 0 else "cpu")
     model = VFEModel(cfg).to(device)         # move to CUDA where available (mirrors train_vfe3.main)
     loader = make_dataloader(dataset, split, cfg.max_seq_len, cfg.batch_size,
                              max_tokens=max_tokens, vocab_size=cfg.vocab_size)
