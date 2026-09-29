@@ -2841,7 +2841,7 @@ def _write_provenance(
         "n_params":            int(sum(p.numel() for p in model.parameters())),
         "torch_version":       torch.__version__,
         "cuda_version":        torch.version.cuda,
-        "device_name":         (torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"),
+        "device_name":         (torch.cuda.get_device_name(0) if torch.cuda.device_count() > 0 else "cpu"),
         "data_seed":           (int(data_seed) if data_seed is not None else None),
         "max_tokens":          (int(max_tokens) if max_tokens is not None else None),
         "tokenizer_tag":       tokenizer_tag,
@@ -3290,7 +3290,7 @@ def _cost_model_fields(
         "flops_per_token_estep":   fpt_estep,
         "block_mlp_params":         int(block_mlp_params),
         "flops_per_token_block_mlp": fpt_block_mlp,
-        "device_name":             (torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"),
+        "device_name":             (torch.cuda.get_device_name(0) if torch.cuda.device_count() > 0 else "cpu"),
         "amp_dtype":               cfg.amp_dtype,
     }
     token_table_params = _token_table_parameter_count(model)
