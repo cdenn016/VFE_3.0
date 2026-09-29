@@ -38,13 +38,18 @@ from vfe3.contracts import DataState, DataStateBuffer
 from vfe3.data.datasets import make_dataloader
 from vfe3.free_energy import attention_tau
 from vfe3.gauge_optim import (
+    FISHER_DIAGNOSTIC_KEYS,
+    GROUP_LOG_DIAGNOSTIC_KEYS,
     GaugeManifoldAdamW,
     embedded_phi_frobenius_norm,
     get_phi_update_policy,
+    group_log_block_shape,
     phi_projection_chunk_rows,
     project_phi_parameter_rows_,
 )
+from vfe3.geometry.phi_fisher import FisherRowStatistics, middle_fiber_moments, pooled_pos_operator
 from vfe3.metric_contracts import perplexity_from_ce
+from vfe3.metrics import LINK_SPECTRUM_KEYS
 from vfe3.model.block import _as_coeff
 from vfe3.model.model import DiagnosticSnapshot, VFEModel
 from vfe3.model.prior_bank import PriorBank, get_decode_registration
@@ -69,6 +74,7 @@ from vfe3.numerics import (                    # non-equivariant / non-PD fallba
     reset_decode_logdet_fallback_elements,
     reset_mm_cholesky_fallback_elements,
     reset_mu_trust_fallback_elements,
+    bounded_variance_from_log,
 )
 from vfe3.relational_scoring import reset_source_recovery_elements   # projected float64 source-factor recovery count
 from vfe3.geometry.transport import (                           # float64 frame-pair escalation count
@@ -187,6 +193,84 @@ def _warn_phi_transport_clamp(
                     RuntimeWarning, stacklevel=2,
                 )
                 _PHI_CLAMP_WARNED = True
+
+
+class PhiFisherStatisticsProvider:
+    r"""Batch belief statistics for the ``fisher_group`` phi direction (derivation 2026-09-28, Track 2).
+
+    The metric is evaluated at the layer-0 prior-bank rows -- the generative-model object the
+    M-step updates -- never at deeper-layer posteriors. :meth:`set_batch` is called by
+    :func:`train_step` immediately before the optimizer step with the full step's input tokens (the
+    microbatches of ``grad_accum_steps > 1`` are chunks of that tensor along dim 0, so it is their
+    concatenation) and the scored-token count :math:`N` that divides the CE gradient.
+
+    For ``phi_embed`` rows :math:`v` it returns the table row :math:`(\mu_v, s_v)` and
+    :math:`n_v`, the occurrences of :math:`v` among the input tokens. For ``pos_phi_free`` rows
+    :math:`p` it returns the pooled operator of the batch column ``tokens[:, p]`` over the
+    middle-fiber beliefs :math:`E_{v_b}^{-1}\cdot q_{v_b}`, and :math:`B_{\rm tot}`. Everything is
+    float64, detached, on the table's device.
+    """
+
+    def __init__(self, model: VFEModel, rotation_weight: float) -> None:
+        self._model = model
+        self._rotation_weight = float(rotation_weight)
+        self._blocks = group_log_block_shape(model.group)                     # (H, d)
+        self._tokens: Optional[torch.Tensor] = None
+        self._scored: Optional[torch.Tensor] = None
+
+    def set_batch(
+        self,
+        tokens: Optional[torch.Tensor],                                       # (B_tot, N) input ids
+        scored: Optional[torch.Tensor],                                       # () scored-token count
+    ) -> None:
+        r"""Record the step's tokens and scored count; ``None`` clears them after the step."""
+        self._tokens = tokens
+        self._scored = scored
+
+    def _type_moments(
+        self,
+        rows: torch.Tensor,                                                   # (T,) type ids
+    ) -> Tuple[torch.Tensor, torch.Tensor]:                                   # (T, H, d) mu, s
+        pb = self._model.prior_bank
+        H, d = self._blocks
+        mu = pb._prior_mu_table()[rows].detach().to(dtype=torch.float64)
+        s = bounded_variance_from_log(
+            pb._prior_sigma_log_table()[rows].detach().to(dtype=torch.float64), eps=pb.eps)
+        return mu.view(-1, H, d), s.view(-1, H, d)
+
+    @torch.no_grad()
+    def __call__(
+        self,
+        param: torch.nn.Parameter,
+        rows:  torch.Tensor,                                                  # (R,) active row ids
+    ) -> FisherRowStatistics:
+        if self._tokens is None or self._scored is None:
+            raise RuntimeError(
+                "fisher_group statistics requested without batch tokens; train_step sets them "
+                "immediately before the optimizer step")
+        tokens = self._tokens.to(device=rows.device)
+        total = self._scored.to(device=rows.device, dtype=torch.float64).clamp_min(1.0)
+        pb = self._model.prior_bank
+        if param is pb.phi_embed:
+            mu, s = self._type_moments(rows)
+            count = torch.bincount(tokens.reshape(-1), minlength=param.shape[0])[rows]
+            return FisherRowStatistics(kind="type", count=count.to(dtype=torch.float64),
+                                       total=total, local_mean=mu, local_var=s)
+        if param is getattr(self._model, "pos_phi_free", None):
+            H, d = self._blocks
+            columns = tokens[:, rows]                                         # (B_tot, R)
+            types, inverse = columns.unique(return_inverse=True)
+            X = pb.phi_embed[types].detach().to(dtype=torch.float64).view(-1, H, d, d)
+            xi0, C0, C0_inv = middle_fiber_moments(X, *self._type_moments(types))   # (T, H, ...)
+            gather = inverse.transpose(0, 1)                                  # (R, B_tot)
+            operator = pooled_pos_operator(
+                xi0[gather], C0[gather], C0_inv[gather],
+                rotation_weight=self._rotation_weight)                        # (R, H, d*d, d*d)
+            count = torch.full((rows.shape[0],), float(tokens.shape[0]),
+                               dtype=torch.float64, device=rows.device)
+            return FisherRowStatistics(kind="pos", count=count, total=total,
+                                       pooled_operator=operator)
+        raise ValueError("fisher_group statistics exist only for phi_embed and pos_phi_free")
 
 
 def build_optimizer(
@@ -419,6 +503,12 @@ def build_optimizer(
                 else 1e-6
             ),
             phi_precond_mode=cfg.phi_precond_mode,
+            phi_group_retraction=cfg.m_phi_group_retraction,
+            phi_statistics_provider=(
+                PhiFisherStatisticsProvider(model, cfg.m_phi_fisher_rotation_weight)
+                if phi_update_policy.requires_fisher_statistics else None
+            ),
+            phi_fisher_rotation_weight=cfg.m_phi_fisher_rotation_weight,
             weight_decay=cfg.weight_decay,
             fused=next(model.parameters()).is_cuda,
         )
@@ -997,8 +1087,14 @@ def train_step(
         else:
             _scaler.update()
     else:
+        # fisher_group: the belief-Fisher direction reads this step's tokens and CE denominator.
+        _fisher_provider = getattr(optimizer, "phi_statistics_provider", None)
+        if _fisher_provider is not None:
+            _fisher_provider.set_batch(tokens, _scored_det)
         _scaler.step(optimizer)
         _scaler.update()
+        if _fisher_provider is not None:
+            _fisher_provider.set_batch(None, None)
     did_step = not skip_step
     if scale_before is not None and float(_scaler.get_scale()) < scale_before:
         did_step = False
@@ -1319,7 +1415,8 @@ _VAL_RELATIONAL_DIAG_KEYS = (
     "score_raw_min_singular_value", "score_q_raw_min_singular_value",
     "score_k_raw_min_singular_value", "score_rank_per_head", "content_rank_per_head",
     "parameter_count", "content_max_singular_value", "content_effective_rank",
-    "projected_cov_min_eigenvalue", "projected_cov_max_condition", "covariance_repair_count"))
+    "projected_cov_min_eigenvalue", "projected_cov_max_condition", "covariance_repair_count")
+) + tuple(f"val_{key}" for key in LINK_SPECTRUM_KEYS)
 
 
 # =============================================================================
@@ -3706,6 +3803,14 @@ def train(
                         "phi_effective_step_scale_min",
                     ):
                         row[_pk] = _gd.get(_pk, float("nan"))
+                    # group_log adds its own fixed key set; the chart route's columns are unchanged.
+                    if getattr(optimizer, "_phi_group_retraction", "chart") == "group_log":
+                        for _pk in GROUP_LOG_DIAGNOSTIC_KEYS:
+                            row[_pk] = _gd.get(_pk, float("nan"))
+                    # fisher_group adds the belief-Fisher key set.
+                    if getattr(optimizer, "phi_statistics_provider", None) is not None:
+                        for _pk in FISHER_DIAGNOSTIC_KEYS:
+                            row[_pk] = _gd.get(_pk, float("nan"))
             # Held-out per-eval probes (Tier-2): the full fixed val-diag column set. Eval-cadence like
             # val_ce above -- the fresh probe values on an eval row, NaN (rendered blank) on the
             # log-interval rows in between, NOT carried forward. The key set is identical in both

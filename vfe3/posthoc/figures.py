@@ -4,7 +4,11 @@ r"""Publication figures of the post-hoc analyses (7.2 in maximum width, text at 
   :math:`S_{Q,h}, S_{K,h}, T_h, O_h` (share of :math:`\|M_h\|_F^2` on each frame block's coordinates).
 * :func:`plot_map_invariants`: S1 panel B endpoints, layer-by-head maps of the common scale, the
   relative-gain spread, the median principal angle and :math:`\sigma_{\max}(O_h T_h)`.
-* :func:`plot_map_invariant_curves`: the same quantities over training from map snapshots.
+* :func:`plot_map_invariant_curves`: the same quantities over training from map snapshots, with the
+  similarity-invariant floor :math:`\rho(T_h O_h)` of :math:`\sigma_{\max}`.
+* :func:`plot_link_spectrum`: per layer, the eigenvalues of :math:`T_h O_h` (the nonzero spectrum of the
+  content map :math:`M_h = O_h T_h`) in the complex plane, with the unit circle and the flat-composition
+  point :math:`1`.
 * :func:`plot_attention_stats`: S2 panel B, layer-by-head normalized entropy
   :math:`H(\beta_{i\cdot})/\log|\mathcal S_i|`, mean distance :math:`\sum_j \beta_{ij}|i-j|`, self-weight
   :math:`\beta_{ii}` and overlap with the prior-only routing :math:`\sum_j \min(\beta_{ij}, \pi_{ij})`.
@@ -191,9 +195,10 @@ def plot_map_invariant_curves(
     keys = [("scale_rms", "common scale", True),
             ("gain_spread", r"gain spread $g_{\max}/g_{\min}$", True),
             ("angle_median_deg", "median angle (deg)", False),
-            ("M_sigma_max", r"$\sigma_{\max}(O_hT_h)$", True)]
-    fig, axes = plt.subplots(1, 4, figsize=(MAX_WIDTH_IN, 1.9), constrained_layout=True)
-    for ax, letter, (key, label, log) in zip(axes, "ABCD", keys):
+            ("M_sigma_max", r"$\sigma_{\max}(O_hT_h)$", True),
+            ("link_spectral_radius", r"$\rho(T_hO_h)$", True)]
+    fig, axes = plt.subplots(1, len(keys), figsize=(MAX_WIDTH_IN, 1.9), constrained_layout=True)
+    for ax, letter, (key, label, log) in zip(axes, "ABCDE", keys):
         for layer in layers:
             series = []
             for step in steps:
@@ -215,6 +220,43 @@ def plot_map_invariant_curves(
             ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:g}"))
             ax.yaxis.set_minor_formatter(NullFormatter())
     axes[-1].legend(loc="best", fontsize=MIN_FONT_PT)
+    return _save(fig, out_dir, name)
+
+
+def plot_link_spectrum(
+    rows:    Sequence[Mapping[str, Any]],     # link_eigenvalue_rows: (layer, head, k, re, im, abs)
+    out_dir: Path,
+    name:    str = "s1b_link_spectrum",
+) -> List[Path]:
+    r"""Per layer, the eigenvalues of :math:`T_h O_h` of every head in the complex plane.
+
+    These are the nonzero spectrum of the content map :math:`M_h = O_h T_h`, a similarity invariant of the
+    content links. The dashed unit circle separates amplifying from attenuating directions, and the '+'
+    marks :math:`\lambda = 1`, the flat-composition point :math:`T_h O_h = I`.
+    """
+    import matplotlib.pyplot as plt
+
+    _style()
+    layers = sorted({int(r["layer"]) for r in rows})
+    heads = sorted({int(r["head"]) for r in rows})
+    fig, axes = plt.subplots(1, len(layers), figsize=(MAX_WIDTH_IN, MAX_WIDTH_IN / max(len(layers), 1)),
+                             squeeze=False, constrained_layout=True)
+    circle = np.linspace(0.0, 2.0 * np.pi, 256)
+    for ax, letter, layer in zip(axes[0], "ABCDEFGHIJKLMNOP", layers):
+        ax.plot(np.cos(circle), np.sin(circle), linestyle="--", linewidth=0.6, color="0.6")
+        ax.axhline(0.0, linewidth=0.4, color="0.85")
+        ax.axvline(0.0, linewidth=0.4, color="0.85")
+        ax.plot([1.0], [0.0], marker="+", markersize=7, color="0.2", linestyle="none")
+        for h in heads:
+            pts = [(float(r["re"]), float(r["im"])) for r in rows if int(r["layer"]) == layer and int(r["head"]) == h]
+            if pts:
+                re, im = zip(*pts)
+                ax.scatter(re, im, s=9, label=f"head {h}")
+        ax.set_aspect("equal", adjustable="datalim")
+        ax.set_xlabel(r"Re $\lambda$")
+        ax.set_ylabel(r"Im $\lambda$")
+        _title(ax, letter, f"layer {layer}")
+    axes[0][-1].legend(loc="best", fontsize=MIN_FONT_PT)
     return _save(fig, out_dir, name)
 
 

@@ -2634,6 +2634,16 @@ def _readout_panels(
             ("relational_score_q_raw_min_singular_value", "Q", _CB[0]),
             ("relational_score_k_raw_min_singular_value", "K", _CB[1])]},
     ]
+    panels += [
+        {"title": "Content-link spectrum (similarity invariant)", "ylabel": r"$|\lambda|$", "logy": True,
+         "series": [("relational_link_spectral_radius_max", r"max head $\rho(T_hO_h)$", _CB[0]),
+                    ("relational_link_selfloop_spectral_radius_max", "self-loop, max over tokens", _CB[1]),
+                    ("relational_link_selfloop_spectral_radius_mean", "self-loop, token mean", _CB[2]),
+                    ("relational_link_min_abs_eigenvalue", r"min head $|\lambda|$", _CB[3])]},
+        {"title": "Composition defect (spectral)", "ylabel": "distance",
+         "series": [("relational_link_unit_distance_max", r"max $|\lambda-1|$", _CB[0]),
+                    ("relational_link_idempotency_defect_max", r"max $|\lambda(\lambda-1)|$", _CB[1])]},
+    ]
     return panels
 
 
@@ -3640,9 +3650,10 @@ def plot_per_layer_diagnostics(
 
     The aggregate metrics.csv and every converged-state figure show only the FINAL block; this
     plots ``VFEModel.diagnostics_per_layer`` block-by-block so depth is legible: which layer carries
-    the coupling vs entropy mass, and whether gauge holonomy / curvature and belief rank build up
+    the coupling vs entropy mass, and whether frame-closure roundoff and belief rank build up
     with depth. Panel A: belief-channel free-energy budget (self-coupling, belief-coupling, attention
-    entropy, total) vs layer. Panel B: holonomy / Wilson curvature vs layer (~0 on the flat cocycle).
+    entropy, total) vs layer. Panel B: coboundary closure residual and Wilson trace deficit vs layer
+    (roundoff-level on the flat cocycle; not curvature).
     Panel C: gauge action (trace spread, group-invariant spread, mean ``||phi||``) vs layer. Panel D:
     belief geometry (effective rank, attention entropy; condition number on a twin log axis) vs layer.
 

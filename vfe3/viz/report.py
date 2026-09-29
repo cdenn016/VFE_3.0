@@ -1055,7 +1055,8 @@ def generate_figures(
           "sigma_ce_scatter.png" in planned_figures)
 
     # Per-layer metrics CSV (rows = inference depth): the metrics.csv is final-block-only, so this is
-    # the only place the per-layer belief-channel free energy / holonomy / gauge / belief geometry is
+    # the only place the per-layer belief-channel free energy / coboundary closure residual / gauge /
+    # belief geometry (and, on the relational route, the relational_link_* content-link spectrum) is
     # written to disk. Best-effort, like the figures.
     if per_layer is not None:
         try:

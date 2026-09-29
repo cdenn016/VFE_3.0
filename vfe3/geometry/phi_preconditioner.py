@@ -43,6 +43,7 @@ from typing import Callable, Dict, List, Optional
 import torch
 
 from vfe3.geometry.lie_ops import extract_phi, gram_pinv, warn_if_basis_not_closed
+from vfe3.geometry.matrix_log import logm_frechet_pair, principal_strip_certificate
 from vfe3.numerics import safe_eigvalsh
 
 _PRECOND: Dict[str, Callable[..., torch.Tensor]] = {}
@@ -1740,3 +1741,113 @@ def precondition_phi_gradient(
         clip_c=clip_c, series_tol=series_tol, series_order=series_order,
         center_reg=center_reg, irrep_dims=irrep_dims, inv_metric=inv_metric,
     )
+
+
+# --- U-space helpers for the group_log retraction (derivation 2026-09-28, Track 1) -----------------
+#
+# Matrix-level and pure: every argument is a stack of real d x d blocks (..., d, d). For gl and block
+# gl with the built-in row-major elementary basis (Gram B = I), a chart row reshapes exactly to its
+# blocks X, and the processed phi gradient reshapes to the chart covector block M. Each helper needs
+# spec(X) inside the principal strip |Im z| < pi; there the principal-log Frechet derivative inverts
+# the exponential differential. Off the strip it inverts the derivative at the wrong logarithm, so
+# every helper returns an ``ok`` mask (strip certificate, no log failure, finite) and zeroes the
+# blocks it cannot certify. The caller supplies its own off-strip route (the optimizer uses the
+# series direction ``pullback_group_direction``).
+
+
+def uspace_ambient_gradient(
+    X: torch.Tensor,                                     # (..., d, d) chart block
+    M: torch.Tensor,                                     # (..., d, d) chart covector block
+
+    *,
+    U:         Optional[torch.Tensor] = None,            # (..., d, d) exp(X), if already formed
+    certified: Optional[torch.Tensor] = None,            # (...) strip certificate, if already formed
+) -> tuple[torch.Tensor, torch.Tensor]:                  # (..., d, d) G_bar, (...) ok
+    r"""Recover the ambient covector :math:`\bar G = \nabla_U L` from the chart covector.
+
+    With :math:`U = e^X` and :math:`(\nabla_\varphi \ell)_a = \langle G_a,
+    \Psi_L(\mathrm{ad}_{X^\top})(U^\top \bar G) \rangle`, the chart covector block is
+    :math:`M = \Psi_L(\mathrm{ad}_{X^\top})(U^\top \bar G)`. On the principal strip
+    :math:`\Psi_L(\mathrm{ad}_A)^{-1}(M) = e^A L_{\log}(e^A, M)`, hence
+
+    .. math::
+        \bar G = L_{\log}(U^\top, M)
+        = \Bigl[\mathrm{Log}\begin{pmatrix} U^\top & M \ 0 & U^\top \end{pmatrix}\Bigr]_{12}.
+
+    For block gl this is the block-diagonal part of the ambient gradient, which is all the
+    Frobenius pullback reads. The map is linear in :math:`M`, so it commutes with gradient
+    accumulation, unscaling and clipping.
+    """
+    if U is None:
+        U = torch.linalg.matrix_exp(X)
+    if certified is None:
+        certified, _ = principal_strip_certificate(X)
+    _, G_bar, failed = logm_frechet_pair(U.transpose(-1, -2), M)
+    ok = certified & ~failed & torch.isfinite(G_bar).all(dim=-1).all(dim=-1)
+    return torch.where(ok[..., None, None], G_bar, torch.zeros_like(G_bar)), ok
+
+
+def uspace_spatial_covector(
+    X: torch.Tensor,                                     # (..., d, d) chart block
+    M: torch.Tensor,                                     # (..., d, d) chart covector block
+
+    *,
+    U:         Optional[torch.Tensor] = None,
+    certified: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:                  # (..., d, d) G_W, (...) ok
+    r"""Right-trivialized (spatial) covector :math:`G_W = \bar G U^\top = \Psi_R(\mathrm{ad}_{X^\top})^{-1}(M)`.
+
+    It pairs with a spatial velocity :math:`W` (:math:`\delta U = W U`) as
+    :math:`\langle \bar G, W U \rangle = \langle G_W, W \rangle`.
+    """
+    if U is None:
+        U = torch.linalg.matrix_exp(X)
+    G_bar, ok = uspace_ambient_gradient(X, M, U=U, certified=certified)
+    return G_bar @ U.transpose(-1, -2), ok
+
+
+def uspace_chart_velocity(
+    X: torch.Tensor,                                     # (..., d, d) chart block
+    W: torch.Tensor,                                     # (..., d, d) spatial velocity
+
+    *,
+    U:         Optional[torch.Tensor] = None,
+    certified: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:                  # (..., d, d) v, (...) ok
+    r"""Chart velocity :math:`v = \Psi_R(\mathrm{ad}_X)^{-1}(W) = L_{\log}(U, W U)`.
+
+    By :math:`D_X(v) = \Psi_R(\mathrm{ad}_X)(v)\, U`, the chart step :math:`X + t v` moves the
+    frame by :math:`W U` to first order. For a body generator :math:`\xi`,
+    :math:`W = U \xi U^{-1}` and :math:`W U = U \xi`.
+    """
+    if U is None:
+        U = torch.linalg.matrix_exp(X)
+    if certified is None:
+        certified, _ = principal_strip_certificate(X)
+    _, v, failed = logm_frechet_pair(U, W @ U)
+    ok = certified & ~failed & torch.isfinite(v).all(dim=-1).all(dim=-1)
+    return torch.where(ok[..., None, None], v, torch.zeros_like(v)), ok
+
+
+def uspace_pullback_body_direction(
+    X: torch.Tensor,                                     # (..., d, d) chart block
+    M: torch.Tensor,                                     # (..., d, d) chart covector block
+
+    *,
+    U:         Optional[torch.Tensor] = None,
+    certified: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:                  # (..., d, d) xi, (...) ok
+    r"""Closed-form left-trivialized Frobenius-pullback gradient :math:`\xi = U^{-1} \bar G`.
+
+    The Frobenius-pullback chart direction :math:`v = G_0^{-1} \nabla_\varphi \ell`,
+    :math:`G_0 = D^\top D`, satisfies :math:`D v = P_T \bar G = U \xi` with :math:`\xi` the solution
+    of :math:`\Pi_{\mathfrak g}(U^\top U \xi) = \Pi_{\mathfrak g}(U^\top \bar G)`. For gl and block
+    gl, :math:`U^\top U` preserves :math:`\mathfrak g`, so :math:`\xi = U^{-1} \bar G` blockwise
+    (Prop. 1.5 (i)). It equals ``pullback_group_direction(...).xi`` without the Gram ridge.
+    """
+    if U is None:
+        U = torch.linalg.matrix_exp(X)
+    G_bar, ok = uspace_ambient_gradient(X, M, U=U, certified=certified)
+    xi = torch.linalg.solve(U, G_bar)
+    ok = ok & torch.isfinite(xi).all(dim=-1).all(dim=-1)
+    return torch.where(ok[..., None, None], xi, torch.zeros_like(xi)), ok
