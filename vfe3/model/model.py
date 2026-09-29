@@ -2037,10 +2037,24 @@ class VFEModel(nn.Module):
         factors = ops.content_factors()
         if factors is not None:
             T, O = factors
+            # sigma_max(M_h) is basis-dependent (changes under (T, O) -> (T a, a^{-1} O)); rho = inf of sigma_max over similarity.
             singular = torch.linalg.svdvals(O.float() @ T.float())
             d["relational_content_max_singular_value"] = float(singular.max())
             d["relational_content_effective_rank"] = float(
                 torch.linalg.matrix_rank(O.float() @ T.float()).float().mean())
+        # Similarity invariants of the content links L_ij^h = U_i M_h U_j^{-1}, M_h = O_hat_h T_hat_h:
+        # unchanged by the frames, by (T_h, O_h) -> (B T_h, O_h B^{-1}) and by (T, O) -> (T a, a^{-1} O).
+        # relational_content_max_singular_value above is not invariant under the reference change.
+        if factors is None:
+            d.update({key: float("nan") for key in metrics.LINK_SPECTRUM_KEYS})
+        else:
+            with torch.autocast(device_type=ops.T.device.type, enabled=False):
+                T_hat, O_hat = ops._ambient_content_maps(torch.float64)          # (H, d, K), (H, K, d)
+            d.update(metrics.content_link_spectrum(
+                T_hat, O_hat,
+                beta_self=(beta.diagonal(dim1=-2, dim2=-1)                      # (B, H, N) beta_ii^h
+                           if ops.readout_mode == "predictive_content" else None),
+                residual=ops.attention_residual))
         covariance = torch.stack((cap["projected_covariance_pre"],
                                   cap["projected_key_covariance_pre"])).float()
         eig = torch.linalg.eigvalsh(covariance)
@@ -2373,14 +2387,16 @@ class VFEModel(nn.Module):
             transport_chart_max_norm=cfg.transport_chart_max_norm,
             exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
         ))
-        # Gauge-geometry probes (diagnostics tier): the curvature proxy -- mean Frobenius departure
-        # of the triangle holonomy Omega_ij Omega_jk Omega_ki from I (0 for the flat phi-cocycle) --
+        # Frame-numerics probes (diagnostics tier): the coboundary closure residual -- mean Frobenius
+        # departure of Omega_ij Omega_jk Omega_ki from I, identically 0 in exact arithmetic for
+        # Omega_ij = U_i U_j^{-1}, so it measures roundoff of the stored (U, U^{-1}) pair, not curvature --
         # and the spread of log|det Omega| = tr(embed(phi)) across tokens (0 at phi=0). Pure
         # measurements at the converged transport; off the training graph (no_grad).
-        # Curvature proxy from the SAMPLED estimator (seeded random distinct triples) rather than the
+        # The residual uses the SAMPLED estimator (seeded random distinct triples) rather than the
         # deterministic row-major prefix, which at N=128/max_triangles=512 covers only anchor i=0's
         # local neighborhood -- a systematically biased sample. The sampled mean is representative and
-        # still ~0 on the flat phi-cocycle (flatness certificate); the dict key is unchanged.
+        # still ~0 on the flat phi-cocycle (a roundoff monitor, not a flatness certificate; see the
+        # metrics.py holonomy section note); the dict key is unchanged.
         # ---- extended per-eval observability (2026-06-13 run-diagnostics rollout) ----
         # Every reduction below reads tensors already materialized above (out.mu/sigma/active frame,
         # omega, energy, beta, self_div); no extra forward, no_grad. NEW keys only -- d["total"] and
@@ -2393,10 +2409,10 @@ class VFEModel(nn.Module):
 
         hol = metrics.holonomy_deviation_sampled(omega)
         d["holonomy_deviation"] = float(hol["mean"])                 # unchanged key/semantics
-        d["holonomy_ci_lo"]     = float(hol["ci_lo"])                # bootstrap band: real curvature vs jitter
+        d["holonomy_ci_lo"]     = float(hol["ci_lo"])                # bootstrap band over sampled triples
         d["holonomy_ci_hi"]     = float(hol["ci_hi"])
-        # Manuscript-canonical gauge invariant: the Wilson-action density 1 - Re Tr(H)/K (PIFB:862-869),
-        # the trace complement of the Frobenius certificate above; ~0 on the flat cocycle.
+        # Conjugation-invariant trace analog 1 - Re Tr(H)/K (PIFB:862-869) of the residual above; on the
+        # coboundary it is also a roundoff monitor (~0), not a curvature measurement.
         d["holonomy_wilson"]    = float(metrics.holonomy_wilson_sampled(omega)["deviation_mean"])
         # Active-frame health, evaluated on the active vertex frame.
         active_vertex = build_factored_transport(

@@ -7,12 +7,21 @@ Each layer holds, per head :math:`h`, the comparison maps :math:`S_{Q,h}, S_{K,h
 :math:`[bd, (b+1)d)`; on the evaluated route :math:`H = B` and :math:`r_h = s_h = d`.
 
 Theorem ``thm:reference_moments`` (3) leaves every cost unchanged under
-:math:`(S_{Q,h}, S_{K,h}) \mapsto (A S_{Q,h}, A S_{K,h})`, :math:`A \in \mathrm{GL}(r_h)`, and every
-message unchanged under :math:`(T_h, O_h) \mapsto (B T_h, O_h B^{-1})`. The invariants reported are
+:math:`(S_{Q,h}, S_{K,h}) \mapsto (A S_{Q,h}, A S_{K,h})`, :math:`A \in \mathrm{GL}(r_h)`, every
+message unchanged under :math:`(T_h, O_h) \mapsto (B T_h, O_h B^{-1})`, and routing and means unchanged
+under the common reference change :math:`(U_i, S, T_h, O_h) \mapsto (U_i a, S a, T_h a, a^{-1} O_h)`
+(block-diagonal :math:`a` on the evaluated route; the moment-matched covariance floor is not invariant
+under it). The quantities reported are
 
-* the relative gains, :math:`g = \sqrt{\operatorname{eig}((S_K S_K^\top)^{-1} S_Q S_Q^\top)}`;
-* the principal angles between the row spaces of :math:`S_{Q,h}` and :math:`S_{K,h}`;
-* :math:`\sigma_{\max}(O_h T_h)` and :math:`\|O_h T_h\|_F` of the realized content map;
+* the relative gains, :math:`g = \sqrt{\operatorname{eig}((S_K S_K^\top)^{-1} S_Q S_Q^\top)}`, and
+  the principal angles between the row spaces of :math:`S_{Q,h}` and :math:`S_{K,h}`: invariant under
+  :math:`A`, not under the reference change;
+* :math:`\sigma_{\max}(O_h T_h)` and :math:`\|O_h T_h\|_F` of the realized content map: invariant under
+  :math:`B`, not under the reference change (:math:`M_h \mapsto a^{-1} M_h a`);
+* the ``link_*`` columns, similarity invariants of :math:`M_h = \hat O_h \hat T_h` read from the
+  :math:`d \times d` matrix :math:`\hat T_h \hat O_h` (:func:`vfe3.metrics.content_link_head_invariants`):
+  invariant under :math:`B` and the reference change, except the numerics certificate
+  ``link_eigvec_condition``;
 
 together with the motion along the symmetry directions, which gradient flow conserves and adaptive
 optimizers without weight decay do not: the common scale
@@ -38,7 +47,13 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 import numpy as np
 import torch
 
+from vfe3.metrics import content_link_eigenvalues, content_link_head_invariants
+
 MAP_NAMES: Tuple[str, ...] = ("S_Q", "S_K", "T", "O")
+LINK_COLUMNS: Tuple[str, ...] = (
+    "link_spectral_radius", "link_min_abs_eigenvalue", "link_mean_log_abs_eigenvalue", "link_unit_distance",
+    "link_idempotency_defect", "link_trace", "link_trace_sq", "link_cross_trace", "link_sum_spectral_radius",
+    "link_eigvec_condition")
 _LEAF_BY_MAP = {"S_Q": "raw_score_q", "S_K": "raw_score_k", "T": "T", "O": "O"}
 _LAYER_KEY = re.compile(r"^relational_operators(?:_extra\.(\d+))?\.(raw_score_q|raw_score_k|T|O)$")
 _SNAPSHOT_FILE = re.compile(r"^step_(\d+)\.pt$")
@@ -198,6 +213,32 @@ def principal_angles(S_Q: torch.Tensor, S_K: torch.Tensor) -> np.ndarray:
     return torch.arccos(cosines).numpy()
 
 
+def _ambient_content(T: torch.Tensor, O: torch.Tensor, d: int, B: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""(T_hat (H, d, K), O_hat (H, K, d)) from stored shapes; width K is full scope, width d head scope.
+
+    Head scope places :math:`T_h` on the input columns and :math:`O_h` on the output rows of block
+    :math:`h`, so :math:`M_h = \hat O_h \hat T_h` is the head's :math:`K \times K` content map in every scope.
+    """
+    H, K = T.shape[0], d * B
+    if T.shape[-1] == K:
+        T_hat = T
+    elif T.shape[-1] == d and H == B:
+        T_hat = T.new_zeros(H, d, K)
+        for h in range(H):
+            T_hat[h, :, h*d:(h+1)*d] = T[h]
+    else:
+        raise ValueError(f"content map width {T.shape[-1]} matches neither K={K} nor d={d}")
+    if O.shape[1] == K:
+        O_hat = O
+    elif O.shape[1] == d and H == B:
+        O_hat = O.new_zeros(H, K, d)
+        for h in range(H):
+            O_hat[h, h*d:(h+1)*d, :] = O[h]
+    else:
+        raise ValueError(f"output map height {O.shape[1]} matches neither K={K} nor d={d}")
+    return T_hat, O_hat
+
+
 def map_invariants(
     state: Mapping[str, torch.Tensor],
     cfg:   Any,
@@ -209,8 +250,14 @@ def map_invariants(
     ``scale_rms``; the relative gains ``gain_min``, ``gain_median``, ``gain_max``; the principal angles
     ``angle_min_deg``, ``angle_median_deg``, ``angle_max_deg``; ``M_sigma_max`` and ``M_fro`` of
     :math:`M_h = O_h T_h`; the conserved-quantity drifts ``conserved_S_drift``, ``conserved_TO_drift``;
-    and per map the energy share on the head's own block and the largest block share
-    (``{map}_own_block_share``, ``{map}_max_block_share``).
+    per map the energy share on the head's own block and the largest block share
+    (``{map}_own_block_share``, ``{map}_max_block_share``); and the ``LINK_COLUMNS`` of
+    :func:`vfe3.metrics.content_link_head_invariants`: the spectral radius, smallest modulus and mean
+    log-modulus of the eigenvalues :math:`\lambda` of :math:`\hat T_h \hat O_h`, the unit distance
+    :math:`\max|\lambda - 1|`, the idempotency defect :math:`\max|\lambda(\lambda - 1)|`, the traces
+    :math:`\operatorname{Tr} M_h`, :math:`\operatorname{Tr} M_h^2`, :math:`\sum_{g \ne h} \operatorname{Tr} M_h M_g`,
+    the per-layer :math:`\rho(\sum_g M_g)`, and the basis-dependent numerics certificate
+    ``link_eigvec_condition`` :math:`\kappa_2(V_h)`. All ``link_*`` columns are NaN without content maps.
     """
     state, _ = unwrap_state(state)
     s0 = _output_init_scale(cfg)
@@ -219,6 +266,8 @@ def map_invariants(
     for layer, maps in relational_maps(state).items():
         H, d, B = _frame_geometry(maps, cfg)
         shares = {name: block_energy_shares(norms) for name, norms in norms_by_layer[layer].items()}
+        link_rows = (content_link_head_invariants(*_ambient_content(maps["T"], maps["O"], d, B))
+                     if "T" in maps and "O" in maps else None)
         for h in range(H):
             S_Q, S_K = maps["S_Q"][h], maps["S_K"][h]                 # (r, w)
             r = S_Q.shape[0]
@@ -258,7 +307,27 @@ def map_invariants(
                 else:
                     row[f"{name}_own_block_share"] = float("nan")
                     row[f"{name}_max_block_share"] = float("nan")
+            row.update(link_rows[h] if link_rows is not None else {c: float("nan") for c in LINK_COLUMNS})
             rows.append(row)
+    return rows
+
+
+def link_eigenvalue_rows(state: Mapping[str, torch.Tensor], cfg: Any) -> List[Dict[str, float]]:
+    r"""Long rows (layer, head, k, re, im, abs): eigenvalues of :math:`\hat T_h \hat O_h`, the nonzero spectrum
+    of :math:`M_h = \hat O_h \hat T_h`, per head in the order :math:`(-|\lambda|, -\mathrm{Re}, -\mathrm{Im})`;
+    similarity invariants of the content links. Layers without content maps are skipped."""
+    state, _ = unwrap_state(state)
+    rows: List[Dict[str, float]] = []
+    for layer, maps in relational_maps(state).items():
+        if "T" not in maps or "O" not in maps:
+            continue
+        H, d, B = _frame_geometry(maps, cfg)
+        lam = content_link_eigenvalues(*_ambient_content(maps["T"], maps["O"], d, B))   # (H, d) complex128
+        for h in range(H):
+            for k in range(d):
+                z = complex(lam[h, k])
+                rows.append({"layer": int(layer), "head": int(h), "k": int(k),
+                             "re": z.real, "im": z.imag, "abs": abs(z)})
     return rows
 
 

@@ -54,7 +54,7 @@ def _fixed_direction(xi: torch.Tensor) -> PullbackGroupDirectionResult:
 
 
 def test_phi_update_policy_registry_contract_is_exact_and_immutable():
-    assert set(_PHI_UPDATE_POLICIES) == {"adamw", "pullback_group"}
+    assert set(_PHI_UPDATE_POLICIES) == {"adamw", "pullback_group", "fisher_group"}
 
     adamw = get_phi_update_policy("adamw")
     pullback = get_phi_update_policy("pullback_group")

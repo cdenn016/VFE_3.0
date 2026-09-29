@@ -12,7 +12,7 @@ A training run produces a self-contained directory::
       summary.json       headline numbers (best_val_ppl, test_ppl, wall_time, ...)
       loss_curve.png     training cross-entropy trajectory
       val_ppl.png        validation perplexity trajectory (log-y, best marked)
-      holonomy.png / gauge_trace_spread.png   gauge-geometry diagnostics
+      holonomy.png / gauge_trace_spread.png   frame-numerics diagnostics (coboundary closure residual; log|det| spread)
       free_energy_decomposition.png   per-token F budget snapshot + early/mid/late evolution
       free_energy_relationship.png     final-iterate objective vs validation CE
 
@@ -503,7 +503,7 @@ def _phi_chart_norm_route(
 ) -> Optional[str]:
     """Persist the active phi factor-bound norm route and pullback default radius."""
     configured_radius = getattr(cfg, "phi_mstep_max_matrix_norm", None)
-    pullback_group = getattr(cfg, "m_phi_update_mode", "adamw") == "pullback_group"
+    pullback_group = getattr(cfg, "m_phi_update_mode", "adamw") in ("pullback_group", "fisher_group")
     if configured_radius is None and not pullback_group:
         return None
     route = getattr(model.group, "phi_norm_route", None)
@@ -5070,7 +5070,8 @@ def _pure_path_report(
         "final_norm_gauge_equivariant": final_norm_registration.gauge_equivariant,
         "no_fixed_coordinate_spectral_cap": sigma_max is None,
         "no_phi_mstep_chart_cap": getattr(cfg, "phi_mstep_max_matrix_norm", None) is None,
-        "no_pullback_trust_region": getattr(cfg, "m_phi_update_mode", "adamw") != "pullback_group",
+        "no_pullback_trust_region": getattr(cfg, "m_phi_update_mode", "adamw") not in (
+            "pullback_group", "fisher_group"),
         "no_transport_exponential_clipping": (
             transport_chart_max_norm is not None
             and float(transport_chart_max_norm) <= float(TRANSPORT_CLAMP_MAX_NORM)
@@ -5173,6 +5174,8 @@ def _pure_path_report(
             "layernorm_affine":             bool(getattr(cfg, "layernorm_affine", False)),
             "m_phi_update_mode":            getattr(cfg, "m_phi_update_mode", "adamw"),
             "m_phi_group_trust_radius":      float(getattr(cfg, "m_phi_group_trust_radius", 0.1)),
+            "m_phi_group_retraction":        getattr(cfg, "m_phi_group_retraction", "chart"),
+            "m_phi_fisher_rotation_weight":  float(getattr(cfg, "m_phi_fisher_rotation_weight", 2.0)),
             "phi_mstep_max_matrix_norm":     getattr(cfg, "phi_mstep_max_matrix_norm", None),
             "transport_chart_max_norm":      transport_chart_max_norm,
             "e_phi_lr":                     float(getattr(cfg, "e_phi_lr", 0.0)),
@@ -5327,11 +5330,11 @@ def _save_figures(
                 color=figs._CB[1], logy=True, smooth=max(5, len(sy) // 80), annotate="min",
                 path=str(run / "val_ppl.png"))
             figs.plt.close(fig)
-        # Gauge-geometry trajectories (diagnostics tier): curvature proxy + gauge-trace spread.
+        # Frame-numerics trajectories (diagnostics tier): coboundary closure residual + gauge-trace spread.
         hx, hy = _aligned("holonomy_deviation")
         if hy:
             # Heavy-tailed (median ~1e-3, rare spikes ~1e3): log y + a median reference; NOT smoothed,
-            # so the curvature spikes survive.
+            # so the roundoff spikes survive.
             flat_transport = getattr(getattr(artifacts, "cfg", None), "transport_mode", "flat") == "flat"
             fig = figs.plot_trajectory(
                 hy, hx,
