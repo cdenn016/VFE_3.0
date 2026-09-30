@@ -372,14 +372,16 @@ def _decode_av(
     # certificate below describes the arithmetic that actually ran. fp64 GEMMs ignore the policy.
     with (_ieee_fp32_matmul() if lhs.dtype is torch.float32 else nullcontext()):
         out = lhs @ rhs.transpose(-1, -2) + bias                                  # (..., N, Vc)
-        if sq.dtype is torch.float32 and precision == "fp32":
+        if return_error_bound and sq.dtype is torch.float32 and precision == "fp32":
             absolute_sum = lhs.abs() @ rhs.abs().transpose(-1, -2) + bias.abs()
+    if not return_error_bound:
+        return out
     if sq.dtype is torch.float32 and precision == "fp32":
         gamma = ((2.0 * lhs.shape[-1] + 4.0) * torch.finfo(out.dtype).eps)
         error_bound = gamma * absolute_sum
     else:
         error_bound = torch.zeros_like(out)
-    return (out, error_bound) if return_error_bound else out
+    return out, error_bound
 
 
 def _decode_head_evidence_kl_delta(
@@ -1685,6 +1687,8 @@ class PriorBank(nn.Module):
         if canonical_frame is not None or self.decode_coordinates == "reference":
             mu_q, sigma_q = self._query_in_decode_frame(mu_q, sigma_q, canonical_frame)
         self._validate_fused_ce_targets(targets, ignore_index=ignore_index)
+        # Only "full" refinement reads the ranking certificate to promote the CE.
+        ranking_guard = self.decode_ranking_fp64_escalation and self.decode_ranking_refinement == "full"
         tau_eff = self._tau_eff(tau)
         chunk = self.decode_chunk_size if chunk_size is None else chunk_size
         V = self.vocab_size
@@ -1723,7 +1727,7 @@ class PriorBank(nn.Module):
                              mc_q_:   torch.Tensor,
                              coord_delta_: Optional[torch.Tensor],
                              delta_per_pos_: Optional[torch.Tensor],
-                             evidence_lhs_: Optional[torch.Tensor]) -> 'tuple[torch.Tensor, torch.Tensor]':
+                             evidence_lhs_: Optional[torch.Tensor]) -> 'tuple[torch.Tensor, ...]':
             r"""Reduce one vocab chunk to (lse_chunk, target_contrib), both (B, N), on the inside.
 
             logit_{i,v} = -0.5(a_v - per_pos)/tau_eff over the chunk (see _decode_diagonal). The
@@ -1734,6 +1738,25 @@ class PriorBank(nn.Module):
             a_v form can difference before squaring (audit 2026-08-06 F32); the default expanded
             form uses ``lhs_`` and ignores them.
             """
+            if not ranking_guard:
+                a_v = _decode_av(
+                    sq_, mc_q_, mu_v_c, inv_v_c, lsum_c, lhs=lhs_, precision=self.decode_av_precision)
+                evidence_delta = None
+                if coord_delta_ is not None and delta_per_pos_ is not None:
+                    evidence_delta = _decode_head_evidence_kl_delta(
+                        sq_, mc_q_, mu_v_c, inv_v_c, log_v_c,
+                        coord_delta_, delta_per_pos_, evidence_lhs_,
+                        precision=self.decode_av_precision)
+                logit_chunk = _decode_analytic_kl_logits(
+                    a_v, per_pos_, tau_eff, lhs_.dtype,
+                    evidence_delta=evidence_delta)
+                if u_c is not None:
+                    logit_chunk = logit_chunk + u_c.to(logit_chunk.dtype)
+                lse_chunk = torch.logsumexp(logit_chunk, dim=-1)
+                gathered = logit_chunk.gather(
+                    -1, local_idx.unsqueeze(-1)).squeeze(-1)
+                return lse_chunk, torch.where(
+                    in_chunk_f > 0, gathered, torch.zeros_like(gathered))
             a_v, a_bound = _decode_av(
                 sq_, mc_q_, mu_v_c, inv_v_c, lsum_c, lhs=lhs_, return_error_bound=True, precision=self.decode_av_precision)
             evidence_delta = None
@@ -1786,36 +1809,41 @@ class PriorBank(nn.Module):
             grad_active = torch.is_grad_enabled() and lhs.requires_grad
             activation_bytes = _decode_ce_chunk_activation_bytes(lhs, v1 - v0, inner=2)
             if _decode_ce_should_checkpoint(self.decode_ce_checkpoint, grad_active, activation_bytes):
-                (lse_chunk, contrib, ranking_chunk, bound_chunk,
-                 max_upper, runner_upper) = _checkpoint.checkpoint(
+                chunk_result = _checkpoint.checkpoint(
                     _chunk_summaries, lhs, per_pos, mc_v_c, inv_v_c, log_v_c, lsum_c,
                     in_chunk_f, local_idx,
                     u_c, sigma_q, mc_q, coord_delta, delta_per_pos, evidence_lhs,
                     use_reentrant=False,
                 )
             else:
-                (lse_chunk, contrib, ranking_chunk, bound_chunk,
-                 max_upper, runner_upper) = _chunk_summaries(
+                chunk_result = _chunk_summaries(
                     lhs, per_pos, mc_v_c, inv_v_c, log_v_c, lsum_c, in_chunk_f, local_idx, u_c,
                     sigma_q, mc_q, coord_delta, delta_per_pos, evidence_lhs,
                 )
+            lse_chunk, contrib = chunk_result[:2]
             lse_chunks.append(lse_chunk)
             target_logit = target_logit + contrib                          # exactly one chunk contributes per valid pos
 
-            ranking_chunks.append(ranking_chunk)
-            bound_chunks.append(bound_chunk)
-            max_upper_chunks.append(max_upper)
-            runner_upper_chunks.append(runner_upper)
+            if ranking_guard:
+                ranking_chunk, bound_chunk, max_upper, runner_upper = chunk_result[2:]
+                ranking_chunks.append(ranking_chunk)
+                bound_chunks.append(bound_chunk)
+                max_upper_chunks.append(max_upper)
+                runner_upper_chunks.append(runner_upper)
         # Combine the per-chunk logsumexps into the full-V logsumexp. The stacked summaries are
         # (n_chunks, B, N) = B*N*ceil(V/chunk), negligible vs (B, N, V).
         logsumexp_v = torch.logsumexp(torch.stack(lse_chunks, dim=0), dim=0)  # (B, N)
-        global_ranking = torch.stack(ranking_chunks, dim=-1)
-        global_bounds = torch.stack(bound_chunks, dim=-1)
-        max_uppers = torch.stack(max_upper_chunks, dim=-1)
-        runner_uppers = torch.stack(runner_upper_chunks, dim=-1)
+        global_ranking = (
+            torch.stack(ranking_chunks, dim=-1) if ranking_guard else None)
+        global_bounds = (
+            torch.stack(bound_chunks, dim=-1) if ranking_guard else None)
+        max_uppers = (
+            torch.stack(max_upper_chunks, dim=-1) if ranking_guard else None)
+        runner_uppers = (
+            torch.stack(runner_upper_chunks, dim=-1) if ranking_guard else None)
         # The CE never reads the ranking; only the "full" refinement promotes it (see
         # _refined_candidate_decode for the "candidates" contract).
-        if (self.decode_ranking_fp64_escalation and self.decode_ranking_refinement == "full"
+        if (ranking_guard
                 and _streamed_final_ranking_uncertain(
                     global_ranking, global_bounds, max_uppers, runner_uppers,
                     vocab_size=V,
