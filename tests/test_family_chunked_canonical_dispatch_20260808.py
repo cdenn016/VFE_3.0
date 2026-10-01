@@ -5,6 +5,9 @@ mixed public dtypes, and noncanonical precision policies must retain it.  Only t
 full-Gaussian / built-in Renyi(alpha=1) fp32 route may take the diagonal-prior analytic kernel.
 """
 
+import os
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -24,7 +27,7 @@ from vfe3.families.gaussian import (
 )
 
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
 
 
 @pytest.fixture(autouse=True)
@@ -44,24 +47,35 @@ def _restore_process_globals():
 
 def _bank(*, decode_mode="family_chunked", renyi_order=1.0, divergence_family="renyi",
           decode_unigram_prior=True, untie_decode_bank=True):
-    model = _tiny_model(
-        vocab_size=17,
-        embed_dim=4,
-        n_heads=2,
-        max_seq_len=3,
-        n_layers=1,
-        gauge_group="block_glk",
-        family="gaussian_full",
-        full_cov_kl_precision="fp32_escalate",
-        decode_mode=decode_mode,
-        decode_chunk_size=5,
-        renyi_order=renyi_order,
-        divergence_family=divergence_family,
-        untie_decode_bank=untie_decode_bank,
-        decode_unigram_prior=decode_unigram_prior,
-        unigram_kappa=0.7 if decode_unigram_prior else 1.0,
-    ).to(DEVICE)
-    pb = model.prior_bank
+    if renyi_order != 1.0 or divergence_family != "renyi":
+        pb = prior_bank.PriorBank(
+            vocab_size=17, K=4, n_gen=8, family="gaussian_full", diagonal_covariance=False,
+            decode_mode=decode_mode, decode_chunk_size=5, renyi_order=renyi_order,
+            divergence_family=divergence_family, decode_av_precision="fp32",
+            untie_decode_bank=untie_decode_bank, decode_unigram_prior=decode_unigram_prior,
+            unigram_kappa=0.7 if decode_unigram_prior else 1.0,
+            full_cov_precision_policy="fp32_escalate",
+        ).to(DEVICE)
+        model = SimpleNamespace(cfg=SimpleNamespace(embed_dim=4), prior_bank=pb)
+    else:
+        model = _tiny_model(
+            vocab_size=17,
+            embed_dim=4,
+            n_heads=2,
+            max_seq_len=3,
+            n_layers=1,
+            gauge_group="block_glk",
+            family="gaussian_full",
+            full_cov_kl_precision="fp32_escalate",
+            decode_mode=decode_mode,
+            decode_chunk_size=5,
+            renyi_order=renyi_order,
+            divergence_family=divergence_family,
+            untie_decode_bank=untie_decode_bank,
+            decode_unigram_prior=decode_unigram_prior,
+            unigram_kappa=0.7 if decode_unigram_prior else 1.0,
+        ).to(DEVICE)
+        pb = model.prior_bank
     # The dispatch contract deliberately targets the model-owned fp32 analytic configuration.
     set_full_cov_kl_precision("fp32_escalate")
     prior_bank.set_decode_av_precision("fp32")

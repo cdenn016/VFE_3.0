@@ -33,8 +33,8 @@ def _block_dense(blocks: torch.Tensor) -> torch.Tensor:
 def _setup(input_scope: str, output_scope: str, residual: bool, seed: int = 0):
     generator = torch.Generator().manual_seed(seed)
     randn = lambda *shape: torch.randn(*shape, generator=generator, dtype=torch.float64)
-    ops = RelationalOperators([D] * H, 11, input_scope=input_scope, readout_mode="predictive_content",
-                              output_scope=output_scope, attention_residual=residual,
+    ops = RelationalOperators([D] * H, 11,  readout_mode="predictive_content",
+                               attention_residual=residual,
                               predictive_covariance="moment_matched",
                               predictive_covariance_floor=1e-3).double()
     with torch.no_grad():
@@ -181,8 +181,8 @@ def test_depth_recursion_stays_well_conditioned_in_float32() -> None:
     """
     torch.manual_seed(0)
     Hq, Dq = 4, 2
-    ops = RelationalOperators([Dq] * Hq, 3, input_scope="full", readout_mode="predictive_content",
-                              output_scope="full", predictive_covariance="moment_matched")
+    ops = RelationalOperators([Dq] * Hq, 3, readout_mode="predictive_content",
+                              predictive_covariance="moment_matched")
     with torch.no_grad():
         ops.O.copy_(torch.randn(Hq, Hq * Dq, 1) @ torch.randn(Hq, 1, Dq))    # rank-one O_h
     n = 6
@@ -237,8 +237,8 @@ def _readout_fixture():
 
 def test_readout_returns_the_same_mean_and_the_operator_covariance() -> None:
     mu, sigma, frame, prior = _readout_fixture()
-    ops = RelationalOperators([2, 2], 11, input_scope="full", readout_mode="predictive_content",
-                              output_scope="full", attention_residual=True,
+    ops = RelationalOperators([2, 2], 11, readout_mode="predictive_content",
+                              attention_residual=True,
                               predictive_covariance="moment_matched").double()
     capture = {}
     mean_only = relational_predictive_readout(mu, sigma, frame, ops, tau=.9, log_prior=prior)
@@ -256,7 +256,7 @@ def test_operator_validation() -> None:
     with pytest.raises(ValueError, match="predictive_covariance must be"):
         RelationalOperators([2, 2], 1, readout_mode="predictive_content", predictive_covariance="full")
     with pytest.raises(ValueError, match="requires predictive_content"):
-        RelationalOperators([2, 2], 1, predictive_covariance="moment_matched")
+        RelationalOperators([2, 2], 1, readout_mode="full_link_update", predictive_covariance="moment_matched")
     for bad in (0.0, -1.0, float("nan"), True):
         with pytest.raises(ValueError, match="predictive_covariance_floor"):
             RelationalOperators([2, 2], 1, readout_mode="predictive_content",
@@ -275,7 +275,7 @@ def _cfg(**overrides: object) -> VFE3Config:
 
 def test_config_validation_and_serialization(monkeypatch: pytest.MonkeyPatch) -> None:
     assert test_config(predictive_covariance="passthrough").predictive_covariance == "passthrough"
-    for mode in ("transported", "projected_conditional"):
+    for mode in ("projected_gradient",):
         with pytest.raises(ValueError, match=re.escape(
                 "predictive_covariance='moment_matched' requires attention_mode='projected_predictive'")):
             test_config(attention_mode=mode, predictive_covariance="moment_matched")
@@ -333,7 +333,7 @@ def test_model_forward_backward_and_evolving_covariance(family, decode_mode, res
     tokens = torch.tensor([[1, 2, 3, 4]])
     targets = torch.tensor([[2, 3, 4, 5]])
     overrides = dict(family=family, decode_mode=decode_mode, attention_residual=residual,
-                     relational_input_scope="full", relational_output_scope="full")
+                     )
     torch.manual_seed(0)
     base = VFEModel(_cfg(**overrides))
     torch.manual_seed(0)

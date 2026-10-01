@@ -155,17 +155,6 @@ def _max_future_leak(cfg) -> float:
     return worst
 
 
-@pytest.mark.parametrize("depth", [dict(n_layers=2), dict(n_layers=1, n_e_steps=2)],
-                         ids=["two_layers", "one_layer_two_steps"])
-def test_transported_phi_estep_does_not_leak_future_tokens(depth: dict) -> None:
-    cfg = tiny_config(attention_mode="transported", beta_attention_prior="causal",
-                      predictive_covariance="passthrough", relational_output_scope="head",
-                      attention_residual=False, vocab_size=13, max_seq_len=6, e_phi_lr=0.05, **depth)
-    assert cfg.e_phi_lr > 0.0 and cfg.gradient_mode == "filtering"
-    # Before the fix this measured 3.0e-3 on this exact configuration.
-    assert _max_future_leak(cfg) <= 1e-6
-
-
 def _phi_objective_inputs(seed: int = 0):
     group = get_group("block_glk")(4, 2)
     generator = torch.Generator().manual_seed(seed)
@@ -207,25 +196,6 @@ def test_filtering_phi_gradient_uses_only_receiver_rows(family: str, compact: bo
                           phi_alignment_loss(mu, sigma, phi, group, **kwargs), rtol=1e-6, atol=1e-6)
 
 
-@pytest.mark.parametrize("gradient_mode, expected", [("filtering", True), ("smoothing", False)])
-def test_phi_objective_detach_follows_gradient_mode(monkeypatch, gradient_mode: str,
-                                                    expected: bool) -> None:
-    group, mu, sigma, phi, log_prior = _phi_objective_inputs()
-    seen = []
-    original = e_step_module.phi_alignment_loss
-
-    def spy(*args, **kwargs):
-        seen.append(kwargs.get("detach_key_frames", False))
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(e_step_module, "phi_alignment_loss", spy)
-    belief = BeliefState(mu=mu[0], sigma=sigma[0], phi=phi[0])
-    e_step_iteration(belief, mu[0].clone(), sigma[0].clone(), group, e_phi_lr=0.01,
-                     e_q_mu_lr=0.0, e_q_sigma_lr=0.0, gradient_mode=gradient_mode,
-                     log_prior=log_prior, sigma_max=10.0)
-    assert seen == [expected]
-
-
 # -- #7: the E-step phi retraction bounds the step, not the base point ---------------------------
 
 @pytest.mark.parametrize("group_name, mode, compact", [
@@ -262,21 +232,6 @@ def test_retract_phi_keeps_identity_differential_inside_and_bounds_outward_steps
                             1e3 * torch.ones(2, 9, dtype=torch.float64), group, trust_region=100.0)
     assert torch.allclose(saturated.norm(dim=-1), torch.full((2,), 5.0, dtype=torch.float64),
                           atol=1e-3)
-
-
-def test_estep_phi_step_no_longer_collapses_large_frames() -> None:
-    group = get_group("block_glk")(4, 2)
-    generator = torch.Generator().manual_seed(0)
-    N = 3
-    phi = torch.randn(N, group.generators.shape[0], generator=generator)
-    phi = 8.0 * phi / phi.norm(dim=-1, keepdim=True)
-    belief = BeliefState(mu=torch.randn(N, 4, generator=generator),
-                         sigma=torch.rand(N, 4, generator=generator) + 0.5, phi=phi)
-    out = e_step_iteration(belief, belief.mu.clone(), belief.sigma.clone(), group,
-                           e_phi_lr=1e-4, e_q_mu_lr=0.0, e_q_sigma_lr=0.0,
-                           phi_retract_mode="bch", sigma_max=10.0)
-    displacement = (out.phi - phi).norm(dim=-1) / phi.norm(dim=-1)
-    assert displacement.max() < 1e-2                  # was 0.375 (norm 8 -> 5) before the fix
 
 
 # -- #10: pullback_group rejects ill-conditioned or chart-violating rows individually ------------
@@ -399,24 +354,6 @@ def test_bch_chart_direction_per_block_matches_full_on_block_glk() -> None:
     per_block = _bch_chart_direction(delta, phi, G, irrep_dims=group.irrep_dims)
     full = _bch_chart_direction(delta, phi, G)
     assert torch.allclose(per_block, full, atol=1e-10)
-
-
-def test_estep_bch_residual_gate_reaches_compose_bch() -> None:
-    group = get_group("glk")(2)
-    generator = torch.Generator().manual_seed(5)
-    N = 3
-    belief = BeliefState(mu=torch.randn(N, 2, generator=generator),
-                         sigma=torch.rand(N, 2, generator=generator) + 0.5,
-                         phi=1.5 * torch.randn(N, 4, generator=generator))
-    kwargs = dict(e_phi_lr=5.0, e_q_mu_lr=0.0, e_q_sigma_lr=0.0, phi_retract_mode="bch",
-                  sigma_max=10.0)
-    e_step_iteration(belief, belief.mu.clone(), belief.sigma.clone(), group, **kwargs)
-    with pytest.raises(ValueError, match="BCH residual validity bound exceeded"):
-        e_step_iteration(belief, belief.mu.clone(), belief.sigma.clone(), group,
-                         bch_residual_max=1e-12, **kwargs)
-    # The shared knob bag also reaches the diagnostic F, which accepts and ignores it.
-    assert torch.isfinite(free_energy_value(belief, belief.mu, belief.sigma, group,
-                                            bch_residual_max=1e-12))
 
 
 # -- #21: gaussian_diagonal_exact under means-only RoPE is the coherent exact KL -----------------
@@ -604,7 +541,7 @@ def test_estep_capture_publishes_the_recovery_count(monkeypatch) -> None:
                      skip_belief_sigma_update=True, e_phi_lr=0.0, oracle_unroll_grad=True,
                      warmup_steps=0, max_steps=2, log_interval=0, eval_interval=0,
                      pos_phi="learned", use_head_mixer=True, use_block_mlp=True,
-                     block_mlp_expansion=1, attention_mode="projected_conditional")
+                     block_mlp_expansion=1, attention_mode="projected_gradient")
     torch.manual_seed(0)
     model = VFEModel(cfg)
     tokens = torch.tensor([[0, 1, 2, 3]])

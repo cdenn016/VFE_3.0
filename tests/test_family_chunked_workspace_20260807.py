@@ -33,6 +33,8 @@ buffers; (e) the slice width never reaches zero, however small the budget.
 from tests.profiles import test_config
 import warnings
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -49,9 +51,14 @@ from tests.test_amp import _tiny_model
 
 
 def _bank(*, renyi_order=0.5, **kw):
-    model = _tiny_model(gauge_group="block_glk", n_heads=2, family="gaussian_full",
-                        decode_mode="family_chunked", renyi_order=renyi_order, **kw)
-    return model, model.prior_bank
+    """Standalone decoder fixture; preserve the original generic Renyi objective."""
+    bank = prior_bank.PriorBank(
+        vocab_size=20, K=4, n_gen=8, family="gaussian_full", diagonal_covariance=False,
+        decode_mode="family_chunked", renyi_order=renyi_order,
+        decode_av_precision="fp32", untie_decode_bank=True, decode_unigram_prior=True,
+        full_cov_precision_policy="fp32_escalate", **kw,
+    )
+    return SimpleNamespace(cfg=SimpleNamespace(embed_dim=4), prior_bank=bank), bank
 
 
 def _decode_mu_grad(pb):
@@ -256,11 +263,13 @@ def test_registered_chunked_logits_preserve_values_when_workspace_retiles(monkey
 
 def test_dense_family_logits_remain_one_full_vocabulary_call_under_workspace_cap(monkeypatch, spy):
     r"""The dense ``family`` mode intentionally has no workspace-retiling contract."""
-    model = _tiny_model(
-        gauge_group="block_glk", n_heads=2, family="gaussian_full", decode_mode="family",
-        renyi_order=0.5, decode_chunk_size=20, _allow_legacy_dense_decode=True,
+    pb = prior_bank.PriorBank(
+        vocab_size=20, K=4, n_gen=8, family="gaussian_full", diagonal_covariance=False,
+        decode_mode="family", renyi_order=0.5, decode_chunk_size=20,
+        decode_av_precision="fp32", untie_decode_bank=True, decode_unigram_prior=True,
+        full_cov_precision_policy="fp32_escalate",
     )
-    pb = model.prior_bank
+    model = SimpleNamespace(cfg=SimpleNamespace(embed_dim=4), prior_bank=pb)
     mu, sigma, _ = _inputs(model)
     monkeypatch.setattr(prior_bank, "DECODE_CE_FAMILY_WORKSPACE_BYTES", _one_entry_budget(model))
 
@@ -432,8 +441,9 @@ def test_decode_av_precision_is_reported_inert_on_the_family_route():
 
     canonical = dict(renyi_order=1.0, full_cov_kl_precision="fp32_escalate")
     assert not _inert_mentions("family_chunked", **canonical)
-    assert _inert_mentions("family_chunked", renyi_order=0.5,
-                           full_cov_kl_precision="fp32_escalate")
+    with pytest.raises(ValueError, match="renyi_order=0.5"):
+        _inert_mentions("family_chunked", renyi_order=0.5,
+                        full_cov_kl_precision="fp32_escalate")
     # full_chunked genuinely reads it, so it must NOT be reported inert there.
     assert not _inert_mentions("full_chunked"), "full_chunked reads _decode_av -- not inert"
 

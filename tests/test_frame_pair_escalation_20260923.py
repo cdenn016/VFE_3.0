@@ -65,8 +65,8 @@ from vfe3.viz.extract import converged_state
 # run with the process switch on; the switch is restored after each test.
 def tiny_config(**overrides: object) -> VFE3Config:
     return _profile_tiny_config(**{
-        "frame_pair_fp64_escalation": True, "attention_mode": "transported",
-        "attention_residual": False, "relational_output_scope": "head",
+        "frame_pair_fp64_escalation": True, "attention_mode": "projected_predictive",
+        "attention_residual": False,
         "predictive_covariance": "passthrough", "lambda_alpha_mode": "constant",
         "mu_init_std": 0.02, "sigma_init": 1.0, "phi_scale": 0.01, **overrides,
     })
@@ -285,7 +285,7 @@ def test_escalated_producers_pay_one_read_for_the_float64_inverse(monkeypatch) -
     assert _producer_reads(monkeypatch) == (3, 3, 3, 5, 7)
 
 
-@pytest.mark.parametrize("route", ["launcher", "transported_kernel", "dense_glk"])
+@pytest.mark.parametrize("route", ['launcher'])
 def test_healthy_model_step_reads_do_not_depend_on_the_certificate(route: str, monkeypatch) -> None:
     # Measured on HEAD ba066d5 before this change: launcher 16, transported kernel 9, glk 8.
     cfg = _ROUTES[route]()
@@ -319,7 +319,7 @@ def _launcher(**overrides: object) -> VFE3Config:
     values = config_values(
         attention_mode="projected_predictive", pos_phi="learned", e_phi_lr=0.0,
         skip_belief_sigma_update=True, oracle_unroll_grad=True,
-        relational_input_scope="full", relational_output_scope="full",
+
         use_block_mlp=True, norm_type_block="layernorm", norm_type_final="layernorm",
         layernorm_affine=True, decode_mode="diagonal_chunked",
         decode_av_precision="fp32", decode_ranking_fp64_escalation=False,
@@ -340,58 +340,17 @@ _ROUTES: Dict[str, Callable[[], VFE3Config]] = {
     "launcher_bf16": lambda: _launcher(amp_dtype="bf16"),
     "launcher_noisy_query": lambda: _launcher(relational_routing="noisy_query"),
     "projected_predictive_diagonal": _tiny(attention_mode="projected_predictive",
-                                           relational_input_scope="full",
-                                           relational_output_scope="full",
+
+
                                            attention_residual=True),
-    "projected_conditional": _tiny(attention_mode="projected_conditional",
-                                   skip_belief_sigma_update=True),
-    "projected_conditional_frame_diagonal": _tiny(attention_mode="projected_conditional",
-                                                  family="gaussian_frame_diagonal",
-                                                  skip_belief_sigma_update=True),
-    "projected_conditional_full": _tiny(attention_mode="projected_conditional",
-                                        family="gaussian_full", decode_mode="full_chunked",
-                                        skip_belief_sigma_update=True),
-    "transported_kernel": _tiny(attention_mode="transported"),
-    "transported_mm_exact": _tiny(attention_mode="transported", e_step_update="mm_exact"),
-    "transported_full": _tiny(attention_mode="transported", family="gaussian_full",
-                              decode_mode="full_chunked"),
-    "transported_full_pairwise": _tiny(attention_mode="transported", family="gaussian_full",
-                                       decode_mode="full_chunked",
-                                       full_cov_kl_backend="pairwise"),
-    "dense_glk": _tiny(attention_mode="transported", gauge_group="glk", n_heads=1),
-    "dense_glk_no_pos": _tiny(attention_mode="transported", gauge_group="glk", n_heads=1,
-                              pos_phi="none"),
-    "rope": _tiny(attention_mode="transported", pos_rotation="rope"),
-    "rope_full_gauge": _tiny(attention_mode="transported", pos_rotation="rope",
-                             rope_full_gauge=True, family="gaussian_full",
-                             decode_mode="full_chunked"),
     # RoPE folded into a CanonicalFrameContext: the float32 rotation must meet the float64 pair
     # re-orthogonalized, or the float64 contract rejects the folded frame (review of #12).
     "launcher_rope": lambda: _launcher(pos_rotation="rope"),            # rope_on_value=False
     "launcher_rope_on_value": lambda: _launcher(pos_rotation="rope", rope_on_value=True),
     "projected_predictive_rope": _tiny(attention_mode="projected_predictive",
-                                       relational_input_scope="full", relational_output_scope="full",
+
                                        pos_rotation="rope"),
-    "projected_conditional_rope": _tiny(attention_mode="projected_conditional",
-                                        pos_rotation="rope", rope_on_value=False,
-                                        skip_belief_sigma_update=True),
-    "rope_full_gauge_block_mlp": _tiny(attention_mode="transported", pos_rotation="rope",
-                                       rope_full_gauge=True, family="gaussian_full",
-                                       decode_mode="full_chunked", use_block_mlp=True,
-                                       block_mlp_mode="canonical_frame"),
-    "block_mlp_canonical_frame": _tiny(attention_mode="transported", use_block_mlp=True,
-                                       block_mlp_mode="canonical_frame"),
-    "canonical_content_projected": _tiny(attention_mode="transported",
-                                         decode_mode="full_chunked",
-                                         encode_mode="canonical_content_projected"),
-    "laplace": _tiny(attention_mode="transported", family="laplace_diagonal"),
-    "exact_congruence": _tiny(attention_mode="transported", family="gaussian_diagonal_exact"),
-    "phi_step": _tiny(attention_mode="transported", e_phi_lr=0.01),
     # Intrinsic frame of a RoPE'd frame-diagonal state: built from R, never through U (review r2).
-    "projected_conditional_frame_diagonal_rope": _tiny(attention_mode="projected_conditional",
-                                                       family="gaussian_frame_diagonal",
-                                                       pos_rotation="rope",
-                                                       skip_belief_sigma_update=True),
 }
 
 
@@ -450,7 +409,7 @@ def test_forced_escalation_runs_end_to_end_at_unchanged_dtypes(route: str, monke
     assert forced["params_finite"]
 
 
-@pytest.mark.parametrize("route", ["launcher", "transported_kernel", "dense_glk"])
+@pytest.mark.parametrize("route", ['launcher'])
 def test_forced_escalation_diagnostics(route: str, monkeypatch) -> None:
     _force(monkeypatch)
     cfg = _ROUTES[route]()
@@ -473,11 +432,7 @@ def _plant(r: float, where: str) -> Callable[[VFEModel], None]:
     return mutate
 
 
-@pytest.mark.parametrize("route", ["launcher", "launcher_bf16", "projected_conditional_full",
-                                   "transported_kernel", "transported_full", "launcher_rope",
-                                   "launcher_rope_on_value", "projected_predictive_rope",
-                                   "rope_full_gauge_block_mlp",
-                                   "projected_conditional_frame_diagonal_rope"])
+@pytest.mark.parametrize("route", ['launcher', 'launcher_bf16', 'launcher_rope', 'launcher_rope_on_value', 'projected_predictive_rope'])
 def test_ill_conditioned_frames_escalate_from_data(route: str) -> None:
     r"""At ||M||_F = 12, inside the M-step radius, HEAD ba066d5 raised ValueError on the launcher
     (CanonicalFrameContext residual 1.13 > 1e-2); the escalated pair now trains."""
@@ -689,30 +644,6 @@ def test_an_escalating_terminal_validation_is_not_handed_off(forced: bool, monke
 
 
 # -- recorded diagnostic bank --------------------------------------------------------------------
-
-@pytest.mark.parametrize("route", ["transported_kernel", "dense_glk"])
-def test_escalated_diagnostic_bank_keeps_float64_frames(route: str, monkeypatch) -> None:
-    r"""``converged_state`` exports the producer's frames, float64 when escalated, while the belief
-    fields keep their dtype. Casting the operator back to float32 would restore the pair defect in
-    the holonomy panel (mean 9.2e-2 against 1.4e-10 at ||M||_F = 10 on the transported route), so
-    the bank keeps it. The equivariance certificate builds its group elements at that dtype."""
-    _force(monkeypatch)
-    cfg = _ROUTES[route]()
-    torch.manual_seed(0)
-    model = VFEModel(cfg).eval()
-    state = converged_state(model, _tokens(cfg))
-    assert state["mu"].dtype == state["sigma"].dtype == torch.float32
-    assert state["exp_phi"].dtype == transport._factor_dtype(state["omega"]) == torch.float64
-    assert float(metrics.holonomy_deviation_sampled(state["omega"])["mean"]) <= 1e-12
-    invariants = metrics.per_head_gauge_invariants(state["exp_phi"], model.group.irrep_dims)
-    assert all(bool(torch.isfinite(v).all()) for v in invariants.values() if torch.is_tensor(v))
-    residual = metrics.gauge_equivariance_residual(
-        state["mu"], state["sigma"], state["omega"], model.group, kappa=cfg.kappa_beta,
-        renyi_order=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
-        diagonal=cfg.diagonal_covariance, divergence_family=cfg.divergence_family,
-        full_cov_kl_precision=model.full_cov_kl_precision)
-    assert all(bool(torch.isfinite(v).all()) for v in residual.values())
-    assert float(residual["energy_in_group"].max()) <= 1e-9
 
 
 # -- the opt-in switch ------------------------------------------------------------------------------

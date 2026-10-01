@@ -31,6 +31,8 @@ Pins: (a) the slice width is honoured and bounds the workspace; (b) slicing is v
 scored; (e) the healthy path and the diagonal family are untouched.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -40,10 +42,14 @@ from tests.test_amp import _tiny_model
 
 
 def _bank(decode_mode="family_chunked", *, renyi_order=0.5, **kw):
-    model = _tiny_model(gauge_group="block_glk", n_heads=2, family="gaussian_full",
-                        decode_mode=decode_mode, renyi_order=renyi_order,
-                        _allow_legacy_dense_decode=decode_mode == "family", **kw)
-    return model, model.prior_bank
+    """Standalone decoder fixture; non-KL orders are outside projected model admission."""
+    bank = prior_bank.PriorBank(
+        vocab_size=20, K=4, n_gen=8, family="gaussian_full", diagonal_covariance=False,
+        decode_mode=decode_mode, renyi_order=renyi_order,
+        decode_av_precision="fp32", untie_decode_bank=True, decode_unigram_prior=True,
+        full_cov_precision_policy="fp32_escalate", **kw,
+    )
+    return SimpleNamespace(cfg=SimpleNamespace(embed_dim=4), prior_bank=bank), bank
 
 
 def _inputs(model, non_pd_at=None):

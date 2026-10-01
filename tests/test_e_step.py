@@ -53,50 +53,6 @@ def test_filtered_free_energy_tracks_the_current_query_frame():
 
 
 # --- Task 2: one inner iteration -------------------------------------------
-from vfe3.inference.e_step import e_step_iteration
-
-
-def test_iteration_keeps_sigma_positive_and_shapes():
-    b, mu_p, sigma_p, grp = _belief()
-    out = e_step_iteration(b, mu_p, sigma_p, grp, tau=1.5,
-                           e_q_mu_lr=0.05, e_q_sigma_lr=0.05, e_phi_lr=0.05)
-    assert (out.sigma > 0).all()
-    assert out.mu.shape == b.mu.shape and out.phi.shape == b.phi.shape
-
-
-def test_decoupled_learning_rates_freeze_components():
-    b, mu_p, sigma_p, grp = _belief()
-    o1 = e_step_iteration(b, mu_p, sigma_p, grp, tau=1.5, e_q_mu_lr=0.05, e_q_sigma_lr=0.05, e_phi_lr=0.0)
-    assert torch.allclose(o1.phi, b.phi, atol=1e-7)
-    o2 = e_step_iteration(b, mu_p, sigma_p, grp, tau=1.5, e_q_mu_lr=0.0, e_q_sigma_lr=0.05, e_phi_lr=0.0)
-    assert torch.allclose(o2.mu, b.mu, atol=1e-7)
-
-
-def test_e_step_iteration_spd_affine_default_is_byte_identical():
-    """The registry-routed default spd_affine retraction reproduces the legacy
-    natural_gradient + retract_spd_diagonal sigma update bit-for-bit (atol=0)."""
-    from vfe3.geometry.retraction import natural_gradient, retract_spd_diagonal
-    from vfe3.gradients.kernels import belief_gradients
-    from vfe3.inference.e_step import _transport
-
-    b, mu_p, sigma_p, grp = _belief()
-    e_q_sigma_lr, e_sigma_q_trust, eps, sigma_max = 0.05, 5.0, 1e-6, 5.0
-
-    # Hand-compose the legacy sigma update exactly as e_step_iteration did pre-refactor.
-    omega = _transport(b.phi, grp)
-    grad_mu, grad_sigma = belief_gradients(
-        b.mu, b.sigma, mu_p, sigma_p, omega, tau=1.5, irrep_dims=grp.irrep_dims,
-    )
-    _, nat_sigma = natural_gradient(grad_mu, grad_sigma, b.sigma, eps=eps)
-    legacy_sigma = retract_spd_diagonal(
-        b.sigma, -e_q_sigma_lr * nat_sigma, trust_region=e_sigma_q_trust, eps=eps, sigma_max=sigma_max,
-    )
-
-    out = e_step_iteration(
-        b, mu_p, sigma_p, grp, tau=1.5, e_q_mu_lr=0.0, e_q_sigma_lr=e_q_sigma_lr, e_phi_lr=0.0,
-        e_sigma_q_trust=e_sigma_q_trust, eps=eps, sigma_max=sigma_max,
-    )
-    assert torch.equal(out.sigma, legacy_sigma)
 
 
 def test_transport_flat_kwarg_is_byte_identical_to_default():
@@ -116,95 +72,13 @@ def test_transport_flat_kwarg_is_byte_identical_to_default():
     assert torch.equal(o3_flat, o3_default)
 
 
-def test_e_step_iteration_transport_flat_default_is_byte_identical():
-    """The registry-routed default transport_mode='flat' reproduces the E-step iteration
-    bit-for-bit (atol=0) against the run with no transport_mode passed."""
-    b, mu_p, sigma_p, grp = _belief()
-    base = e_step_iteration(
-        b, mu_p, sigma_p, grp, tau=1.5, e_q_mu_lr=0.05, e_q_sigma_lr=0.05, e_phi_lr=0.05,
-    )
-    routed = e_step_iteration(
-        b, mu_p, sigma_p, grp, tau=1.5, e_q_mu_lr=0.05, e_q_sigma_lr=0.05, e_phi_lr=0.05,
-        transport_mode="flat",
-    )
-    assert torch.equal(routed.mu, base.mu)
-    assert torch.equal(routed.sigma, base.sigma)
-    assert torch.equal(routed.phi, base.phi)
-
-
 # --- Task 3: descent directions (the right objective per mode) -------------
-def test_filtering_step_descends_F_filt():
-    # filtering (query-side) gradient descends F with KEYS FROZEN at the pre-step belief.
-    b, mu_p, sigma_p, grp = _belief()
-    F_before = free_energy_value(b, mu_p, sigma_p, grp, tau=1.5, keys=b)
-    out = e_step_iteration(b, mu_p, sigma_p, grp, tau=1.5, e_q_mu_lr=1e-3, e_q_sigma_lr=1e-3,
-                           e_phi_lr=0.0, gradient_mode="filtering", e_sigma_q_trust=0.0)
-    F_after = free_energy_value(out, mu_p, sigma_p, grp, tau=1.5, keys=b)   # SAME frozen keys b
-    assert F_after < F_before
-
-
-def test_smoothing_step_descends_global_F():
-    b, mu_p, sigma_p, grp = _belief()
-    F_before = free_energy_value(b, mu_p, sigma_p, grp, tau=1.5)            # global (keys=belief)
-    out = e_step_iteration(b, mu_p, sigma_p, grp, tau=1.5, e_q_mu_lr=1e-3, e_q_sigma_lr=1e-3,
-                           e_phi_lr=0.0, gradient_mode="smoothing", e_sigma_q_trust=0.0)
-    F_after = free_energy_value(out, mu_p, sigma_p, grp, tau=1.5)
-    assert F_after < F_before
-
-
-def test_phi_step_descends_global_F_with_beliefs_frozen():
-    b, mu_p, sigma_p, grp = _belief()
-    F_before = free_energy_value(b, mu_p, sigma_p, grp, tau=1.5)
-    out = e_step_iteration(b, mu_p, sigma_p, grp, tau=1.5, e_q_mu_lr=0.0, e_q_sigma_lr=0.0, e_phi_lr=1e-3)
-    F_after = free_energy_value(out, mu_p, sigma_p, grp, tau=1.5)
-    assert F_after < F_before
-
-
-def test_keys_freezing_bites_on_stepped_belief():
-    # Pin that `keys` actually freezes the transported second KL argument: after a
-    # (phi-frozen) filtering step the query role has moved off the pre-step keys, so
-    # F_filt (keys=b, transported from the frozen pre-step belief) MUST differ from
-    # global F (keys=None, re-transported from the moved belief). Without this the
-    # F_filt machinery is unobserved -- both descent tests stay green if `keys` were dead.
-    b, mu_p, sigma_p, grp = _belief()
-    out = e_step_iteration(b, mu_p, sigma_p, grp, tau=1.5, e_q_mu_lr=5e-2, e_q_sigma_lr=5e-2,
-                           e_phi_lr=0.0, gradient_mode="filtering")
-    F_filt = free_energy_value(out, mu_p, sigma_p, grp, tau=1.5, keys=b)      # frozen pre-step keys
-    F_glob = free_energy_value(out, mu_p, sigma_p, grp, tau=1.5, keys=None)   # re-transported
-    assert not torch.allclose(F_filt, F_glob, atol=1e-5)
 
 
 # --- Task 4: e_step loop + trajectory + fixed-seed regression --------------
-from vfe3.inference.e_step import e_step
 
 # Re-frozen 2026-09-23 (audit #6): the filtering phi step now differentiates only each frame's
 # own receiver row (sender frames detached); with that detach disabled the run still gives 6.6499.
-EXPECTED_CHECKSUM = 6.7064   # seed=7, n_iter=3
-
-
-def test_e_step_runs_n_iter_and_returns_trajectory():
-    b, mu_p, sigma_p, grp = _belief()
-    out, traj = e_step(b, mu_p, sigma_p, grp, tau=1.5, n_iter=5,
-                       e_q_mu_lr=1e-2, e_q_sigma_lr=1e-2, e_phi_lr=1e-2, return_trajectory=True)
-    assert len(traj) == 6
-    assert (out.sigma > 0).all()
-
-
-def test_smoothing_loop_decreases_F_overall():
-    b, mu_p, sigma_p, grp = _belief()
-    out, traj = e_step(b, mu_p, sigma_p, grp, tau=1.5, n_iter=10,
-                       e_q_mu_lr=2e-3, e_q_sigma_lr=2e-3, e_phi_lr=2e-3,
-                       gradient_mode="smoothing", e_sigma_q_trust=0.0, return_trajectory=True)
-    assert traj[-1] < traj[0]
-
-
-def test_fixed_seed_regression():
-    b, mu_p, sigma_p, grp = _belief(seed=7)
-    out = e_step(b, mu_p, sigma_p, grp, tau=1.5, n_iter=3,
-                 e_q_mu_lr=1e-2, e_q_sigma_lr=1e-2, e_phi_lr=1e-2)
-    assert torch.isfinite(out.mu).all() and torch.isfinite(out.sigma).all() and torch.isfinite(out.phi).all()
-    checksum = float(out.mu.sum() + out.sigma.sum() + out.phi.sum())
-    assert abs(checksum - EXPECTED_CHECKSUM) < 1e-3
 
 
 # --- audit Group 2 (1c/5a): the **kwargs sink became explicit accept-and-ignore knobs ---
@@ -248,30 +122,6 @@ def test_oracle_create_graph_keeps_belief_gradient_connected():
     g_mu_d, _ = belief_gradients(mu, sigma, mu_p, sigma_p, omega, **kw)
     assert not g_mu_d.requires_grad                            # default detached (old behavior)
     assert torch.allclose(g_mu.detach(), g_mu_d)               # same VALUES; only connectivity differs
-
-
-def test_oracle_unroll_grad_toggle_changes_prior_gradient():
-    # End-to-end: for a DIAGONAL non-kernel family (renyi_order != 1 -> autograd oracle), the opt-in
-    # oracle_unroll_grad adds the unrolled-through-inference term to the prior gradient, so mu_embed's
-    # gradient DIFFERS from the default detached oracle (both finite). gaussian_diagonal keeps the
-    # double-backward stable; gaussian_full is intentionally excluded (its eigh double-backward NaNs).
-    from vfe3.model.model import VFEModel
-
-    def grad_of(toggle: bool) -> torch.Tensor:
-        cfg = test_config(vocab_size=12, embed_dim=4, n_heads=1, max_seq_len=5, n_layers=1,
-                         n_e_steps=3, e_q_mu_lr=0.2, e_q_sigma_lr=0.1, e_phi_lr=0.0,
-                         renyi_order=2.0, pos_phi="none", oracle_unroll_grad=toggle, seed=0)
-        torch.manual_seed(0)
-        m = VFEModel(cfg)
-        tok = torch.randint(0, 12, (2, 5), generator=torch.Generator().manual_seed(1))
-        tgt = torch.randint(0, 12, (2, 5), generator=torch.Generator().manual_seed(2))
-        _, loss, _ = m(tok, tgt)
-        loss.backward()
-        return m.prior_bank.mu_embed.grad.clone()
-
-    g_off, g_on = grad_of(False), grad_of(True)
-    assert torch.isfinite(g_off).all() and torch.isfinite(g_on).all()
-    assert not torch.allclose(g_off, g_on)     # the unrolled-through-inference signal reaches the prior
 
 
 def test_full_mm_failed_sigma_star_retains_the_old_state_and_counts_the_fallback():

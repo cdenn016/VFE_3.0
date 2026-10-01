@@ -27,8 +27,8 @@ V, K, H, N, B = 11, 4, 2, 6, 2
 # tests do not track later edits to the user-editable launcher dict.
 _AUDITED_ROUTE = dict(
     n_layers=2, family="gaussian_full", decode_mode="full_chunked", untie_decode_bank=True,
-    attention_mode="projected_predictive", relational_input_scope="full",
-    relational_output_scope="full", attention_residual=True, predictive_covariance="passthrough",
+    attention_mode="projected_predictive",
+    attention_residual=True, predictive_covariance="passthrough",
     gauge_transport="on", pos_phi="learned", use_block_mlp=True,
     block_mlp_mode="coordinate", block_mlp_covariance="passthrough", block_mlp_expansion=2,
     decode_coordinates="local", decode_unigram_prior=True, decode_bias=True,
@@ -47,18 +47,6 @@ def _launcher(**overrides: Any) -> Dict[str, Any]:
                amp_dtype=None, batch_size=B, eval_stride=None, attention_window=N)
     cfg.update(overrides)
     return cfg
-
-
-def _conditional(**overrides: Any) -> Dict[str, Any]:
-    return _launcher(attention_mode="projected_conditional", n_layers=1,
-                     relational_output_scope="head", attention_residual=False, **overrides)
-
-
-def _transported(**overrides: Any) -> Dict[str, Any]:
-    base = dict(attention_mode="transported", n_layers=1, relational_output_scope="head",
-                attention_residual=False, family="gaussian_diagonal",
-                decode_mode="diagonal_chunked")
-    return _launcher(**{**base, **overrides})
 
 
 def _cfg(cfg_dict: Dict[str, Any]) -> VFE3Config:
@@ -117,54 +105,6 @@ def test_predictive_route_knob_is_marked_and_bit_inert(override: Dict[str, Any])
     _assert_bit_inert(base, override)
 
 
-def test_conditional_route_marks_only_its_inert_knobs() -> None:
-    inactive = _cfg(_conditional()).inactive_fields()
-    for name in ("sigma_max", "full_cov_kl_backend", "e_q_sigma_lr", "e_sigma_q_trust",
-                 "lambda_alpha", "lambda_alpha_mode", "b0", "c0"):
-        assert name in inactive, name
-    # Live here: lambda_beta weights the conditional coupling, the value covariance is
-    # transported by congruence, and the full-covariance mean trust region factors sigma_q.
-    for name in ("lambda_beta", "full_cov_congruence_precision",
-                 "full_cov_congruence_certification", "congruence_cond_escalation",
-                 "mu_trust_cholesky_rounds", "family"):
-        assert name not in inactive, name
-    _assert_bit_inert(_conditional(), {"sigma_max": 1e-3, "full_cov_kl_backend": "pairwise"})
-
-
-def test_self_coupling_inert_at_one_iteration_one_layer() -> None:
-    base = _transported()
-    assert {"lambda_alpha", "lambda_alpha_mode"} <= set(_cfg(base).inactive_fields())
-    _assert_bit_inert(base, {"lambda_alpha": 5.0})
-    _assert_bit_inert(base, {"lambda_alpha_mode": "state_dependent", "b0": 0.1, "c0": 3.0})
-    two_steps = _transported(n_e_steps=2)
-    assert "lambda_alpha" not in _cfg(two_steps).inactive_fields()
-    _, _, loss_a, _ = _loss_and_grads(two_steps)
-    _, _, loss_b, _ = _loss_and_grads({**two_steps, "lambda_alpha": 5.0})
-    assert not torch.equal(loss_a, loss_b)
-
-
-def test_frozen_sigma_channel_is_marked_and_bit_inert() -> None:
-    base = _transported(skip_belief_sigma_update=True, n_e_steps=2)
-    assert {"e_q_sigma_lr", "e_sigma_q_trust", "sigma_max"} <= set(_cfg(base).inactive_fields())
-    _assert_bit_inert(base, {"e_q_sigma_lr": 0.1, "e_sigma_q_trust": 50.0, "sigma_max": 1e-3})
-    live = {**base, "skip_belief_sigma_update": False}
-    assert "sigma_max" not in _cfg(live).inactive_fields()
-
-
-@pytest.mark.parametrize("functional", ["bhattacharyya", "jeffreys", "squared_hellinger"])
-def test_renyi_order_inert_under_order_free_functionals(functional: str) -> None:
-    base = _transported(n_e_steps=2, decode_mode="family_chunked", divergence_family=functional,
-                        renyi_order=0.5)
-    assert "renyi_order" in _cfg(base).inactive_fields()
-    _assert_bit_inert(base, {"renyi_order": 2.0})
-    assert "renyi_order" not in _cfg({**base, "divergence_family": "renyi"}).inactive_fields()
-
-
-def test_windowed_prior_keeps_attention_window_live() -> None:
-    assert "attention_window" not in _cfg(
-        _transported(beta_attention_prior="causal_windowed", attention_window=2)).inactive_fields()
-
-
 def _params_after_two_steps(cfg_dict: Dict[str, Any]) -> Dict[str, torch.Tensor]:
     from vfe3.train import build_optimizer
     cfg = _cfg(cfg_dict)
@@ -198,14 +138,6 @@ def test_fp64_island_unreachable_above_chart_bound() -> None:
     assert "exp_fp64_norm_threshold" in cfg.inactive_fields()
     assert "exp_fp64_norm_threshold" not in _cfg(
         _launcher(exp_fp64_norm_threshold=18.0)).inactive_fields()      # equality stays reachable
-
-
-def test_transported_frame_diagonal_drops_positional_channels() -> None:
-    base = _transported(family="gaussian_frame_diagonal", decode_mode="family_chunked",
-                        n_e_steps=2, pos_phi="none", rope_on_value=True)
-    inactive = _cfg(base).inactive_fields()
-    assert {"pos_rotation", "pos_phi", "rope_base", "m_pos_phi_lr"} <= set(inactive)
-    _assert_bit_inert(base, {"pos_rotation": "rope", "rope_base": 2.0})
 
 
 def test_decode_notices_only_report_active_explicit_settings(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -320,27 +252,7 @@ def test_delta_full_densifies_the_stored_covariance() -> None:
     assert _off_diagonal(belief.sigma) > 1e-3
 
 
-def test_conditional_route_keeps_family_live() -> None:
-    assert "family" not in _cfg(_conditional()).inactive_fields()
-
-
 # --------------------------------------------------------------------------- #8 capacity control
-
-@pytest.mark.parametrize("route", ["projected_predictive", "projected_conditional"])
-def test_additive_encoder_admitted_on_projected_routes(route: str) -> None:
-    base = (_launcher() if route == "projected_predictive" else _conditional())
-    base.update(encode_mode="per_token_additive", pos_phi="none")
-    model, _, loss, grads = _loss_and_grads(base)
-    assert torch.isfinite(loss)
-    assert all(torch.isfinite(g).all() for g in grads.values() if g is not None)
-    assert grads["prior_bank.phi_embed"] is not None                # the table stays trained
-    with pytest.raises(ValueError, match="per_token_additive.*positional frame"):
-        test_config(**{**base, "pos_phi": "learned"})
-
-
-def test_additive_encoder_contamination_warns_on_transported() -> None:
-    with pytest.warns(UserWarning, match="per_token_additive"):
-        test_config(**_transported(encode_mode="per_token_additive", pos_phi="learned"))
 
 
 # --------------------------------------------------------------------------- #26, low validation
@@ -428,14 +340,6 @@ def test_inert_sweep_is_rejected_when_selected(monkeypatch: pytest.MonkeyPatch) 
         with pytest.raises(ValueError, match=f"{name}.*INERT on EVERY"):
             ablation.validate_sweeps([name], require_construction=True)
     ablation.validate_sweeps(list(ablation.SWEEPS), require_construction=False)   # registry stays valid
-
-
-def test_lambda_alpha_sweeps_apply_local_two_e_step_requirement(monkeypatch: pytest.MonkeyPatch) -> None:
-    sweep = dict(param="lambda_alpha", values=[0.5, 1.0], requires={"n_e_steps": 2})
-    monkeypatch.setattr(ablation, "SWEEPS", {"lambda_alpha": sweep})
-    monkeypatch.setattr(ablation, "BASELINE_CONFIG", _transported(n_e_steps=1))
-    cells = ablation.make_run_overrides("lambda_alpha")
-    assert all(overrides["n_e_steps"] == 2 for _, overrides in cells)
 
 
 def test_single_seed_arm_has_unknown_spread_and_no_error_bar(

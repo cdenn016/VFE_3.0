@@ -17,14 +17,14 @@ def _config(**overrides: object) -> VFE3Config:
     values = dict(attention_mode="projected_predictive", predictive_covariance="moment_matched",
                   family="gaussian_diagonal", decode_mode="linear", gradient_mode="filtering",
                   e_step_update="gradient", lambda_alpha_mode="constant", attention_residual=False,
-                  relational_input_scope="full", relational_output_scope="full")
+                  )
     values.update(overrides)
     return tiny_config(**values)
 
 
 def _operator(centered: bool) -> RelationalOperators:
     ops = RelationalOperators(
-        [2], 3, input_scope="full", output_scope="full", readout_mode="predictive_content",
+        [2], 3, readout_mode="predictive_content",
         predictive_covariance="moment_matched", predictive_covariance_centering=centered,
     )
     with torch.no_grad():

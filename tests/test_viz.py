@@ -623,15 +623,15 @@ def _replay_model(**over):
     base = dict(
         vocab_size=8,
         embed_dim=4,
-        n_heads=1,
+        n_heads=2,
         max_seq_len=4,
         n_layers=1,
         n_e_steps=2,
-        gauge_group="glk",
+        gauge_group="block_glk",
         family="gaussian_full",
         transport_mode="flat",
         pos_rotation="none",
-        use_head_mixer=False,
+        use_head_mixer=False, use_block_mlp=False, norm_type_block="none",
         decode_mode="full_chunked",
         pos_phi="none",
         e_phi_lr=0.0,
@@ -656,19 +656,26 @@ def test_phi_extractors_remain_unchanged():
     model = _replay_model()
     tokens = torch.tensor([[0, 1, 2, 3]])
     forward = _raw_forward_belief(model, tokens)
-    state = extract.converged_state(model, tokens)
+    state = extract.readout_state(model, tokens)
     built = compute_transport_operators(state["phi"].unsqueeze(0), model.group)
 
     assert torch.allclose(state["mu"], forward.mu[0], atol=1e-5, rtol=1e-5)
     assert torch.equal(state["exp_phi"], built["exp_phi"][0])
-    assert torch.equal(state["omega"], built["Omega"][0])
+    omega = state["omega"].to_dense_omega()
+    expected = built["Omega"][0]
+    diagonal = torch.eye(tokens.shape[1], dtype=torch.bool, device=omega.device)
+    # The dense builder declares self-transport exactly; compact expansion computes exp(phi)exp(-phi).
+    identity = torch.eye(model.cfg.embed_dim, dtype=expected.dtype, device=expected.device)
+    assert torch.equal(expected[diagonal], identity.expand(tokens.shape[1], -1, -1))
+    torch.testing.assert_close(omega[~diagonal], expected[~diagonal], atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(omega[diagonal], expected[diagonal], atol=1e-5, rtol=1e-5)
 
 
 # --- vocabulary next-token probability figures (extractors + the four arm-list plotters) ---
 
 def _vocab_model(**kw):
     base = dict(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                n_e_steps=2, e_q_mu_lr=0.1, e_phi_lr=0.05)
+                n_e_steps=2, e_q_mu_lr=0.1, e_phi_lr=0.0)
     base.update(kw)
     torch.manual_seed(0)
     return VFEModel(test_config(**base))

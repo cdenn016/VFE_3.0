@@ -23,7 +23,7 @@ from vfe3.geometry.transport import build_factored_transport, transport_covarian
 from vfe3.model.model import VFEModel
 
 BASE = dict(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
-            e_step_update="mm_exact", decode_mode="linear")
+            e_step_update="gradient", decode_mode="linear")
 
 
 def _model(**overrides) -> VFEModel:
@@ -90,20 +90,3 @@ def test_the_toggle_does_not_change_a_well_conditioned_result():
 
 
 # --------------------------------------------------------------------------- the model wiring
-
-def test_default_model_forward_never_runs_the_conditioning_svd(monkeypatch):
-    r"""The toggle has to REACH the transport: a default forward pays no SVD."""
-    model = _model()
-    tokens = torch.randint(0, 16, (2, 4))
-    calls = _count_svdvals(monkeypatch)
-    model(tokens)
-    assert calls == []
-
-
-def test_enabled_model_forward_runs_the_conditioning_svd(monkeypatch):
-    r"""Same forward with the toggle on reaches the guard."""
-    model = _model(congruence_cond_escalation=True)
-    tokens = torch.randint(0, 16, (2, 4))
-    calls = _count_svdvals(monkeypatch)
-    model(tokens)
-    assert calls, "congruence_cond_escalation=True but svdvals never ran in the forward"

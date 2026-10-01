@@ -40,14 +40,15 @@ def test_numerical_health_under_rope_does_not_raise():
         assert k in health
 
 
-def test_e_step_belief_trace_captures_trajectory():
+def test_e_step_belief_trace_captures_configured_projected_states():
     model = _model()
     tokens = torch.randint(0, 20, (1, 5))
-    tr = e_step_belief_trace(model, tokens, n_iter=4)
-    assert tr["mu"].shape == (5, 5, 4)                                 # T+1, N, K
-    assert tr["phi"].shape[0] == 5
-    assert tr["free_energy"].shape == (5,)
-    assert torch.isfinite(tr["free_energy"]).all()
+    tr = e_step_belief_trace(model, tokens)
+    assert tr["mu"].shape[-2:] == (5, 4)
+    assert tr["mu"].shape[0] == tr["phi"].shape[0]
+    assert tr["free_energy_available"] is False
+    assert tr["free_energy"].numel() == 0
+    assert torch.isfinite(tr["mu"]).all()
 
 
 def test_across_layer_belief_trace_depth_and_base_zero():

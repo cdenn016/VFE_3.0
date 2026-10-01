@@ -308,35 +308,20 @@ def test_structural_helpers_preserve_the_subclass() -> None:
 
 
 def test_gauge_table_keeps_its_gradient_under_the_exact_family() -> None:
-    r"""End-to-end pin of the point of this family: phi stays live in the belief coupling.
-
-    Unlike ``gaussian_frame_diagonal`` (where the relative frame cancels and phi_embed receives no
-    gradient at all), the exact congruence keeps the gauge in the energy. The oracle route needs
-    ``oracle_unroll_grad=True`` for the unrolled E-step tangent to reach the prior tables, so both
-    settings are pinned: the toggle is the difference between a live and a frozen gauge here.
-    """
+    """The retained predictive exact-family path keeps the realized gauge frame differentiable."""
     from vfe3.model.model import VFEModel
-
-    grads = {}
-    for family in ("gaussian_diagonal_exact", "gaussian_frame_diagonal"):
-        for unroll in (False, True):
-            cfg = test_config(
-                embed_dim=4, n_heads=2, vocab_size=11, max_seq_len=6, batch_size=2,
-                n_layers=1, n_e_steps=2, family=family, e_step_update="gradient",
-                lambda_alpha_mode="constant", max_steps=1, oracle_unroll_grad=unroll,
-            )
-            torch.manual_seed(0)
-            model = VFEModel(cfg)
-            token_ids = torch.randint(0, 11, (2, 6))
-            targets = torch.randint(0, 11, (2, 6))
-            _, loss, _ = model(token_ids, targets)
-            loss.backward()
-            grads[(family, unroll)] = model.prior_bank.phi_embed.grad
-
-    assert grads[("gaussian_diagonal_exact", True)] is not None
-    assert grads[("gaussian_diagonal_exact", True)].norm() > 0.0
-    # The detached oracle tangent freezes phi; this is the config footgun the toggle docs name.
-    assert grads[("gaussian_diagonal_exact", False)] is None
-    # The frame family cancels the gauge out of the energy, so no estimator revives it.
-    assert grads[("gaussian_frame_diagonal", True)] is None
-    assert grads[("gaussian_frame_diagonal", False)] is None
+    cfg = test_config(
+        embed_dim=4, n_heads=2, vocab_size=7, max_seq_len=4, batch_size=2,
+        n_layers=1, n_e_steps=1, family="gaussian_diagonal_exact",
+        attention_mode="projected_predictive", attention_residual=False,
+        lambda_alpha_mode="constant", max_steps=1, oracle_unroll_grad=True,
+    )
+    torch.manual_seed(0)
+    model = VFEModel(cfg)
+    token_ids = torch.randint(0, 7, (2, 4))
+    targets = torch.randint(0, 7, (2, 4))
+    _, loss, _ = model(token_ids, targets)
+    loss.backward()
+    gradient = model.prior_bank.phi_embed.grad
+    assert gradient is not None and torch.isfinite(gradient).all()
+    assert gradient.norm() > 0.0

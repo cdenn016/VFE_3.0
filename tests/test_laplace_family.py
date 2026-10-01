@@ -67,8 +67,8 @@ def test_laplace_registered_and_config_selectable():
     assert "laplace_diagonal" in divergence_families()
     assert get_family("laplace_diagonal") is DiagonalLaplace
     assert DiagonalLaplace.cov_kind == "diagonal"
-    cfg = test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, family="laplace_diagonal")
-    assert cfg.family == "laplace_diagonal" and cfg.diagonal_covariance is True
+    with pytest.raises(ValueError, match="family=.*laplace_diagonal"):
+        test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, family="laplace_diagonal")
 
 
 # ---- non-EF contract: generic path is bypassed ----------------------------
@@ -206,15 +206,6 @@ def test_oracle_gradients_finite_for_laplace():
     assert torch.isfinite(g_mu).all() and torch.isfinite(g_sigma).all()
 
 
-def test_laplace_model_trains_end_to_end():
-    cfg = test_config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                     n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, family="laplace_diagonal")
-    torch.manual_seed(0)
-    m = VFEModel(cfg)
-    x = torch.randint(0, 12, (2, 8)); y = torch.randint(0, 12, (2, 8))
-    _, loss, _ = m(x, y); loss.backward()
-    assert torch.isfinite(loss)
-    assert torch.isfinite(m.prior_bank.mu_embed.grad).all()
 
 
 # ---- gradient correctness: finite difference of F vs the autograd oracle ----
@@ -407,15 +398,17 @@ def test_laplace_family_decode_ranking_differs_from_gaussian_kl():
     assert not torch.equal(lap_logits.argsort(-1), gauss_logits.argsort(-1))   # ranking genuinely differs
 
 
-def test_laplace_prior_bank_requires_family_consistent_decode():
-    # A Laplace belief with a fast Gaussian kernel is rejected; family_chunked is accepted.
-    with pytest.raises(ValueError, match="family-consistent"):
-        test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=5,
-                   family="laplace_diagonal", decode_mode="diagonal_chunked")
-    cfg = test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                     n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0,
-                     family="laplace_diagonal", decode_mode="family_chunked")
-    m = VFEModel(cfg)
-    x = torch.randint(0, 6, (2, 5)); y = torch.randint(0, 6, (2, 5))
-    _, loss, _ = m(x, y); loss.backward()
+def test_laplace_prior_bank_requires_family_consistent_decode() -> None:
+    from vfe3.model.prior_bank import get_decode_registration
+
+    # Registration metadata names the decoder that preserves the selected family.
+    assert get_decode_registration("family_chunked").family_consistent
+    assert not get_decode_registration("diagonal_chunked").family_consistent
+    bank = PriorBank(6, 4, 8, family="laplace_diagonal", decode_mode="family_chunked")
+    mu = torch.randn(2, 3, 4, requires_grad=True)
+    sigma = torch.ones_like(mu)
+    targets = torch.randint(0, 6, (2, 3))
+    loss = bank.decode_ce_family_chunked(mu, sigma, targets)
+    loss.backward()
     assert torch.isfinite(loss)
+    assert mu.grad is not None and torch.isfinite(mu.grad).all()

@@ -118,7 +118,7 @@ def test_predictive_gradient_capture_uses_host_nan_and_preserves_real_norms(
         return output
     monkeypatch.setattr(module, "e_step_iteration", recorded)
     cfg = tiny_config(attention_mode="projected_predictive", n_layers=6,
-                      relational_input_scope="full", relational_output_scope="full",
+
                       skip_belief_sigma_update=True, e_phi_lr=0.0)
     model = VFEModel(cfg)
     out = {}
@@ -128,11 +128,10 @@ def test_predictive_gradient_capture_uses_host_nan_and_preserves_real_norms(
     assert all(type(out[key]) is float and math.isnan(out[key]) for key in ("mu", "sigma", "phi"))
     records.clear()
     ordinary = VFEModel(tiny_config(
-        attention_mode="transported", relational_input_scope="head",
-        relational_output_scope="head", attention_residual=False,
+        attention_mode="projected_gradient",
+         attention_residual=False,
         predictive_covariance="passthrough",
     ))
     ordinary.forward_beliefs(torch.tensor([[0, 1, 2]]), estep_grad_out=out)
     assert records and isinstance(records[-1]["mu"], torch.Tensor)
     assert all(type(out[key]) is float and math.isfinite(out[key]) for key in ("mu", "sigma", "phi"))
-

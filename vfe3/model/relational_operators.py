@@ -1,7 +1,7 @@
 r"""Role-specific comparison and content operators in realized canonical frames."""
 
 import math
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import torch
 from torch import nn
@@ -11,14 +11,13 @@ from vfe3.relational_scoring import _compute_dtype
 
 
 class RelationalOperators(nn.Module):
-    r"""Headwise comparison maps S_Q, S_K and identity or full-width content B=OT.
+    r"""Full-width comparison maps S_Q, S_K and content B=OT.
 
     Every rank is the head dimension: S_Q/S_K are ``(H, d, input_dim)`` and T/O are
     ``(H, d, input_dim)`` / ``(H, output_dim, d)``, the untied standard-attention shapes.
-    Predictive content always reads and writes the full state; conditional updates retain their scopes.
+    Every head reads and writes the full state while retaining its reduced channel rank.
     Independent maps are free matrices initialized with orthonormal rows.
     Their projected covariances must remain strictly positive definite.
-    ``identity_content`` drops T/O and carries the transported belief unchanged.
     ``output_init_scale`` multiplies the initial output map, :math:`O_h(0) = s\,I_d` (placed on its
     head block under full output scope); ``s = 1`` is the identity start.
     ``routing`` selects the projected routing cost: Gaussian KL, or the noisy-query cost
@@ -29,16 +28,13 @@ class RelationalOperators(nn.Module):
         self,
         irrep_dims:            List[int],
         seed:                  int,
-        readout_mode:          str   = "conditional_update",
+        readout_mode:          str   = "predictive_content",
         attention_residual:    bool  = False,
-        identity_content:      bool  = False,
         output_init_scale:     float = 1.0,
         routing:               str   = "gaussian_kl",
         predictive_covariance: str   = "passthrough",
         predictive_covariance_floor: float = 1e-4,
         predictive_covariance_centering: bool = False,
-        input_scope:           Optional[str] = None,
-        output_scope:          Optional[str] = None,
         *,
         receiver_noise:        float = 1.0,
     ) -> None:
@@ -48,8 +44,6 @@ class RelationalOperators(nn.Module):
         d, H = irrep_dims[0], len(irrep_dims)
         if type(seed) is not int:
             raise ValueError("relational seed must be an integer")
-        if type(identity_content) is not bool:
-            raise ValueError("identity_content must be a bool")
         if (isinstance(output_init_scale, bool) or not isinstance(output_init_scale, (int, float))
                 or not math.isfinite(output_init_scale) or output_init_scale <= 0.0):
             raise ValueError(
@@ -57,23 +51,8 @@ class RelationalOperators(nn.Module):
         if attention_residual and readout_mode != "predictive_content":
             raise ValueError("attention residual requires predictive_content")
         self.attention_residual = attention_residual
-        default_scope = "full" if readout_mode in ("predictive_content", "full_link_update") else "head"
-        input_scope = default_scope if input_scope is None else input_scope
-        output_scope = default_scope if output_scope is None else output_scope
-        if readout_mode == "predictive_content" and (input_scope != "full" or output_scope != "full"):
-            raise ValueError("predictive_content fixes input_scope and output_scope to 'full'")
-        if input_scope not in ("head", "full"):
-            raise ValueError("relational input_scope must be 'head' or 'full'")
-        if readout_mode not in ("conditional_update", "predictive_content", "full_link_update"):
-            raise ValueError("invalid relational readout_mode")
-        if output_scope not in ("head", "full"):
-            raise ValueError("invalid relational output_scope")
-        if output_scope == "full" and readout_mode not in ("predictive_content", "full_link_update"):
-            raise ValueError("full output requires predictive_content")
-        if readout_mode in ("predictive_content", "full_link_update") and identity_content:
-            raise ValueError("predictive_content requires learned content maps")
-        if readout_mode == "full_link_update" and (input_scope != "full" or output_scope != "full"):
-            raise ValueError("full_link_update requires full input and output scopes")
+        if readout_mode not in ("predictive_content", "full_link_update"):
+            raise ValueError("relational readout_mode must be predictive_content or full_link_update")
         if (isinstance(receiver_noise, bool) or not isinstance(receiver_noise, (int, float))
                 or not math.isfinite(receiver_noise) or receiver_noise <= 0.0):
             raise ValueError("receiver_noise must be a finite positive reference variance")
@@ -98,45 +77,40 @@ class RelationalOperators(nn.Module):
         self.predictive_covariance_centering = predictive_covariance_centering
         self.predictive_covariance = predictive_covariance
         self.predictive_covariance_floor = float(predictive_covariance_floor)
-        self.output_scope = output_scope
-        self.input_scope = input_scope
-        self.input_dim = H * d if input_scope == "full" else d
+        self.input_dim = H * d
         self.irrep_dims = list(irrep_dims)
         self.score_rank_per_head = d
-        self.content_rank_per_head = None if identity_content else d
-        self.identity_content = identity_content
+        self.content_rank_per_head = d
         generator = torch.Generator().manual_seed(seed)
         eye = torch.eye(d).expand(H, d, d).clone()
         for role in ("q", "k"):
             raw = torch.randn(H, self.input_dim, d, generator=generator)
             rows = self._orthonormal_columns(raw).transpose(-1, -2).contiguous()
             setattr(self, f"raw_score_{role}", nn.Parameter(rows))
-        if identity_content:
-            self.register_parameter("T", None)
-            self.register_parameter("O", None)
-        else:
-            self.T = nn.Parameter(eye.clone())
-            self.O = nn.Parameter(eye.clone() * float(output_init_scale))
-        if input_scope == "full" and self.T is not None:
-            # Preserve the local identity/projector start; all input columns train.
-            T_full = self.T.new_zeros(H, d, H * d)
-            for h in range(H):
-                T_full[h, :, h*d:(h+1)*d] = self.T.detach()[h]
-            self.T = nn.Parameter(T_full)
-        if output_scope == "full":
-            # Start at the old block placement; off-block output rows are trainable.
-            O_full = self.O.new_zeros(H, H * d, d)
-            for h in range(H):
-                O_full[h, h*d:(h+1)*d] = self.O.detach()[h]
-            self.O = nn.Parameter(O_full)
+        # Preserve the released block-projector initialization and parameter names.
+        T_full = eye.new_zeros(H, d, H * d)
+        O_full = eye.new_zeros(H, H * d, d)
+        for h in range(H):
+            T_full[h, :, h*d:(h+1)*d] = eye[h]
+            O_full[h, h*d:(h+1)*d] = eye[h] * float(output_init_scale)
+        self.T = nn.Parameter(T_full)
+        self.O = nn.Parameter(O_full)
 
     @property
     def inference_semantics(self) -> str:
         """Name the actual mean update used by this module."""
-        if self.readout_mode == "full_link_update":
-            return "relational_full_link_frozen_filtering"
-        return ("relational_predictive_content" if self.readout_mode == "predictive_content"
-                else "relational_projected_conditional_filtering")
+        return ("relational_full_link_frozen_filtering" if self.readout_mode == "full_link_update"
+                else "relational_predictive_content")
+
+    @property
+    def input_scope(self) -> str:
+        """Report the fixed full-state input architecture."""
+        return "full"
+
+    @property
+    def output_scope(self) -> str:
+        """Report the fixed full-state output architecture."""
+        return "full"
 
     def predictive_content(
         self,
@@ -160,19 +134,8 @@ class RelationalOperators(nn.Module):
         return result.reshape_as(mu).to(mu.dtype)
 
     def _ambient_content_maps(self, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
-        r"""Return (T_hat, O_hat), each head's content maps embedded in the full state space.
-
-        T_hat is ``(H, d, K)`` and O_hat is ``(H, K, d)``, so M_h = O_hat_h T_hat_h is the head's
-        K x K content map in every input/output scope. Head scope places T_h / O_h on head block h.
-        """
-        H, d = len(self.irrep_dims), self.irrep_dims[0]
-        eye = torch.eye(H, dtype=dtype, device=self.T.device)
-        T, O = self.T.to(dtype), self.O.to(dtype)
-        if self.input_scope == "head":
-            T = torch.einsum("hab,hg->hagb", T, eye).reshape(H, d, H * d)
-        if self.output_scope == "head":
-            O = torch.einsum("hab,hg->hgab", O, eye).reshape(H, H * d, d)
-        return T, O
+        r"""Return full-state T_h and O_h of shapes (H,d,K) and (H,K,d)."""
+        return self.T.to(dtype), self.O.to(dtype)
 
     def predictive_covariance_update(
         self,
@@ -272,9 +235,9 @@ class RelationalOperators(nn.Module):
         r"""Return (S_Q,S_K), each (H,r,input_dim), with live role graphs."""
         return self.raw_score_q, self.raw_score_k
 
-    def content_factors(self) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        r"""Return (T,O) for B=OT, or None for parameter-free identity content."""
-        return None if self.T is None else (self.T, self.O)
+    def content_factors(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""Return full-state (T,O) for B_h=O_h T_h."""
+        return self.T, self.O
 
     def canonical_mean(
         self,
@@ -294,26 +257,3 @@ class RelationalOperators(nn.Module):
             coordinates = mu.to(dtype).reshape(*mu.shape[:-1], H, d) if frame.block_diagonal else mu.to(dtype)
             canonical = (frame.inverse.to(dtype) @ coordinates.unsqueeze(-1)).squeeze(-1)
         return canonical.reshape(*mu.shape[:-1], H, d)
-
-    def apply_content(
-        self,
-        mu:    torch.Tensor,  # (..., N, K)
-        frame: CanonicalFrameContext,
-    ) -> torch.Tensor:        # (..., N, K)
-        r"""Apply the local content template U_i O T U_i^{-1}mu_i to means only."""
-        if self.output_scope == "full":
-            raise ValueError("full output mixes after routing; use predictive_content")
-        canonical = self.canonical_mean(mu, frame)
-        if self.T is None:
-            return mu
-        dtype = _compute_dtype(canonical, frame.forward, self.T, self.O)
-        with torch.autocast(device_type=mu.device.type, enabled=False):
-            coordinates = canonical.flatten(-2).unsqueeze(-2) if self.input_scope == "full" else canonical
-            content = self.T.to(dtype) @ coordinates.to(dtype).unsqueeze(-1)
-            body = (self.O.to(dtype) @ content).squeeze(-1)
-            if not frame.block_diagonal:
-                body = body.reshape(*mu.shape[:-1], mu.shape[-1])
-            result = (frame.forward.to(dtype) @ body.unsqueeze(-1)).squeeze(-1)
-        # An escalated float64 frame (audit 2026-09-23 #12) promotes the computation only; the
-        # result keeps the dtype the lower-precision frame would have produced.
-        return result.reshape(*mu.shape[:-1], mu.shape[-1]).to(_compute_dtype(mu, self.T, self.O))

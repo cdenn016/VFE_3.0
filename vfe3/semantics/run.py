@@ -528,7 +528,7 @@ def load_semantic_run(
         notes.append("vfe3.metrics.covariance_frozen_at_encode is not importable: Sigma-frozen status unknown")
     else:
         sigma_frozen = bool(covariance_frozen_at_encode(cfg))
-    phi_frozen = float(cfg.e_phi_lr) == 0.0 or cfg.attention_mode != "transported"
+    phi_frozen = True  # both supported attention modes fix frames during inference
 
     counts: Optional[np.ndarray] = None
     counts_source = "unavailable"

@@ -1,6 +1,5 @@
-r"""Routing, construction, and consumer tests for diagonal-KL statistics reuse."""
+r"""Standalone construction and numerical consumer tests for diagonal-KL statistics reuse."""
 
-from tests.profiles import test_config
 
 import dataclasses
 import importlib
@@ -11,7 +10,6 @@ import torch
 
 from vfe3.alpha_i import alpha_gradient_coefficient, alpha_is_per_coord
 from vfe3.attention_prior import attention_log_prior
-from vfe3.config import VFE3Config
 from vfe3.families.base import get_family
 from vfe3.free_energy import (attention_weights, pairwise_energy, self_divergence_for_alpha)
 from vfe3.geometry.groups import get_group
@@ -25,64 +23,15 @@ from vfe3.geometry.transport import (
 from vfe3.gradients import kernels as kernels_module
 from vfe3.gradients.pairwise_stats import diagonal_kl_pair_stats
 from vfe3.gradients.kernels import belief_gradients, mm_exact_update
-from vfe3.model.model import VFEModel
 
 
 e_step_module = importlib.import_module("vfe3.inference.e_step")
-_TOKEN_IDS = torch.tensor([[0, 1, 2, 3, 4]], dtype=torch.long)
 
 
-def _tiny_config(
-    *,
-    e_step_update: str = "gradient",
-) -> VFE3Config:
-    return test_config(
-        vocab_size=9,
-        embed_dim=4,
-        n_heads=2,
-        max_seq_len=5,
-        n_layers=1,
-        n_e_steps=1,
-        e_phi_lr=0.0,
-        decode_mode="diagonal_chunked",
-        e_step_update=e_step_update,
-    )
 
 
-def _build_model(cfg: VFE3Config) -> VFEModel:
-    torch.manual_seed(13)
-    return VFEModel(cfg).eval()
 
 
-@pytest.mark.parametrize(
-    ("e_step_update", "consumer_name"),
-    [
-        pytest.param("gradient", "belief_gradients", id="gradient"),
-        pytest.param("mm_exact", "mm_exact_update", id="mm_exact"),
-    ],
-)
-def test_p3_production_forwards_true_to_the_q_consumer(
-    monkeypatch:   pytest.MonkeyPatch,
-    e_step_update: str,
-    consumer_name: str,
-) -> None:
-    original_consumer = getattr(e_step_module, consumer_name)
-    seen: list[tuple[object, object]] = []
-
-    def _capture_then_run(*args: object, **kwargs: object) -> object:
-        seen.append((kwargs.pop("reuse_pairwise_kl_stats", None), kwargs.get("lambda_beta")))
-        return original_consumer(*args, **kwargs)
-
-    # Patch the names imported by e_step_iteration, not the registry module.
-    monkeypatch.setattr(e_step_module, consumer_name, _capture_then_run)
-
-    model = _build_model(_tiny_config(e_step_update=e_step_update))
-    with torch.no_grad():
-        logits = model(_TOKEN_IDS)
-
-    # The belief q iteration runs with lambda_beta=1.0 and receives the production control.
-    assert seen == [(True, 1.0)]
-    assert torch.isfinite(logits).all()
 
 
 @pytest.mark.parametrize(

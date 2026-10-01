@@ -102,7 +102,6 @@ def test_config_json_records_inactive_fields_beside_config(tmp_path: Path, monke
         ({}, False),
         ({"skip_belief_sigma_update": True}, True),
         ({"attention_mode": "projected_predictive"}, True),
-        ({"attention_mode": "projected_conditional"}, True),
         ({"attention_mode": "projected_predictive", "use_block_mlp": True,
           "block_mlp_covariance": "delta_full"}, False),
         ({"skip_belief_sigma_update": True, "use_cg_coupling": True,
@@ -110,7 +109,7 @@ def test_config_json_records_inactive_fields_beside_config(tmp_path: Path, monke
     ],
 )
 def test_covariance_frozen_at_encode_follows_the_executed_route(overrides, frozen) -> None:
-    cfg = types.SimpleNamespace(**{"attention_mode": "transported",
+    cfg = types.SimpleNamespace(**{"attention_mode": "projected_gradient",
                                    "skip_belief_sigma_update": False, **overrides})
     assert metrics.covariance_frozen_at_encode(cfg) is frozen
 
@@ -199,20 +198,17 @@ def test_pure_path_facets_follow_the_executed_route() -> None:
         assert toggles[key] == "not_applicable"
     assert live["on_pure_path"] is False                            # still off it, for its own reason
 
-    conditional = _pure_path_report(_pure_ns(attention_mode="projected_conditional"), [])
-    assert conditional["pure_flags"]["gradient_e_step_update"] is True
-    assert conditional["pure_flags"]["full_sigma_update"] is False
+    fixed_covariance = _pure_path_report(_pure_ns(attention_mode="projected_gradient", skip_belief_sigma_update=True), [])
+    assert fixed_covariance["pure_flags"]["gradient_e_step_update"] is True
+    assert fixed_covariance["pure_flags"]["full_sigma_update"] is False
 
-    transported = _pure_path_report(_pure_ns(), [])
-    assert transported["pure_flags"]["full_sigma_update"] is True
-    assert transported["pure_flags"]["gradient_e_step_update"] is True
-    assert transported["config_toggles"]["fixed_covariance_surrogate"] is False
-    assert transported["config_toggles"]["spd_retraction_route"].startswith("airm")
-    assert transported["on_pure_path"] is True
-
-    mm_exact = _pure_path_report(_pure_ns(e_step_update="mm_exact"), [])
-    assert mm_exact["pure_flags"]["gradient_e_step_update"] is False
-    assert mm_exact["config_toggles"]["spd_retraction_route"] == "not_applicable"
+    gradient = _pure_path_report(_pure_ns(attention_mode="projected_gradient"), [])
+    assert gradient["pure_flags"]["full_sigma_update"] is True
+    assert gradient["pure_flags"]["gradient_e_step_update"] is True
+    assert gradient["config_toggles"]["fixed_covariance_surrogate"] is False
+    assert gradient["config_toggles"]["spd_retraction_route"].startswith("airm")
+    assert gradient["pure_flags"]["canonical_attention_entropy"] is False
+    assert gradient["on_pure_path"] is False
 
 
 # --------------------------------------------------------------------------- #18 scaling analysis

@@ -19,6 +19,7 @@ from vfe3.config import VFE3Config, config_from_serialized
 MIGRATED_HISTORICAL_KEYS = frozenset({
     "_allow_legacy_dense_decode", "grad_clip_per_role", "exp_fp64_mode",
     "relational_mode", "relational_readout_mode",
+    "relational_input_scope", "relational_output_scope", "relational_identity_content",
 })
 
 

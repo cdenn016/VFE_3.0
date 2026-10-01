@@ -77,7 +77,7 @@ the same function as `gaussian_diagonal` there (see the configuration table belo
 
 ### Comparison interfaces
 
-With full input scope, each head reads all $K$ reference coordinates through
+Each head reads all $K$ reference coordinates through
 
 $$
 S_{Q,h},S_{K,h}\in\mathbb R^{d\times K}.
@@ -125,7 +125,7 @@ that additional choice.
 
 ### Sending and receiving interfaces
 
-With full input and output scope,
+The full-width sending and receiving maps have shapes
 
 $$
 T_h\in\mathbb R^{d\times K},\qquad O_h\in\mathbb R^{K\times d}.
@@ -251,8 +251,6 @@ rather than a complete standalone configuration:
 ```python
 config.update(
     attention_mode="projected_predictive",
-    relational_input_scope="full",
-    relational_output_scope="full",
     attention_residual=True,
     relational_routing="gaussian_kl",     # or "noisy_query"
     gradient_mode="filtering",
@@ -302,7 +300,8 @@ the diagonal of a per-token table, the predictive readout keeps it, and under th
 inherited `block_mlp_covariance="passthrough"` no later seam densifies it; a float64
 probe with shared parameters gives identical losses and an exactly zero off-diagonal
 covariance. A genuinely full covariance requires `block_mlp_covariance="delta_full"`,
-`use_head_mixer=True`, or `attention_mode="transported"`. `VFE3Config.inactive_fields()`
+`use_head_mixer=True`, or the covariance updates of `attention_mode="projected_gradient"`.
+`VFE3Config.inactive_fields()`
 reports this equivalence, together with every other setting that no active path reads
 (for example `lambda_beta`, `sigma_max`, and the congruence-precision knobs on this
 route), and `train_vfe3.py` prints the inactive settings it names explicitly at every
@@ -354,9 +353,10 @@ MLP, normalization, and decoder parameters. Optional outer penalties are separat
 choices. This loss is not the same scalar as the variational routing objective.
 
 Prior-bank divergence decoders such as `diagonal_chunked` and `full_chunked` are
-available on the projected route as well as on transported profiles. With
-`predictive_covariance="passthrough"`, the predictive readout replaces only the mean;
-relational filtering likewise returns no sigma gradient. If no later seam rewrites
+available on both supported projected routes. With
+`predictive_covariance="passthrough"`, the predictive readout replaces only the mean.
+Projected-gradient attention preserves covariance only when its sigma update is disabled.
+If no later seam rewrites
 covariance, the belief covariance stays at its encode value, so the covariance terms of
 the KL readout depend on the input token and the vocabulary item alone. With frozen
 $\Sigma_q$ they form a context-free (input token, vocabulary) bias table added to every
@@ -371,18 +371,29 @@ depends on context and does not reduce to the frozen input-token bias table. Con
 dependence alone does not establish calibration quality or predictive benefit; those
 require matched empirical comparisons.
 
-### Optional belief-revision paths
+### Full-link belief revision
 
-The engine retains gradient filtering, smoothing and surrogate objectives, and
-`mm_exact` frozen-attention updates. These are alternative update families.
-`mm_exact` minimizes a frozen-attention surrogate, not the entire language-model
-objective.
+`attention_mode="projected_gradient"` uses full-width comparison and content maps to
+form noisy receiving Gaussian laws, freezes incoming source and routing values for
+an inference episode, and applies Fisher updates to the receiver mean and covariance.
+Multiple E-steps reuse this episode context. Sources and routing retain their outer
+gradient graph. This objective differs from predictive content aggregation.
 
-`attention_mode="projected_conditional"` selects projected conditional
-belief gradients. Its current envelope permits one layer and head-local output.
-Changing from predictive content requires compatible settings beyond one switch.
-`attention_mode="transported"` enables other supported belief-refinement constructions.
-The optional gradient machinery is not a required derivation of predictive content.
+Both supported attention modes have fixed full input and output. Every head reads
+and writes all $K$ state coordinates through a reduced $d=K/H$ channel. Q/K/T have
+shape $(H,d,K)$ and O has shape $(H,K,d)$; the maps contribute $4K^2$ parameters per
+layer. There are no configurable input/output scope fields or identity-content arm.
+
+`projected_gradient` requires constant alpha, `predictive_covariance="passthrough"`,
+filtering, and unrolled gradient updates. Its inner mean and covariance learning
+rates are active, so moving from predictive readout requires choosing compatible
+settings and calibrating those rates. Smoothing and `mm_exact` have no supported
+executor in the retained architecture.
+
+Serialized retained-mode configurations with historical full/full scopes are accepted
+and have those keys removed. Head-scoped configurations, identity content, and the
+retired `transported` and `projected_conditional` modes require explicit architecture
+migration; the loader never silently translates them into a different forward.
 
 ## Geometry and scope
 

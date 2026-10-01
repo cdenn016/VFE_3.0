@@ -767,7 +767,7 @@ def _assemble(
             "covariance": "diagonal" if len(pooled[0]["sigma_shape"]) == 2 else "full",
             "tau": [float(x) for x in tau.cpu()], "kl_max": float(cfg.kl_max),
             "attention_prior": getattr(cfg, "beta_attention_prior", None),
-            "input_scope": getattr(cfg, "relational_input_scope", None),
+            "input_scope": "full",
             "predictive_covariance": getattr(cfg, "predictive_covariance", None),
             "family": getattr(cfg, "family", None),
             "model_dtype": str(next(model.parameters()).dtype).replace("torch.", ""),

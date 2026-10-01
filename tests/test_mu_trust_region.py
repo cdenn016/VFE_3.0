@@ -72,19 +72,3 @@ def test_config_can_explicitly_disable_mean_trust():
     cfg = test_config(e_mu_q_trust=None, mu_trust_mode="ball")
     assert cfg.e_mu_q_trust is None                                 # explicit unbounded profile
     assert cfg.mu_trust_mode == "ball"
-
-
-def test_e_step_trust_none_is_current_behavior():
-    b, mu_p, sigma_p, grp = _belief()
-    off  = e_step_iteration(b, mu_p, sigma_p, grp, e_q_mu_lr=0.5, e_phi_lr=0.0)
-    none = e_step_iteration(b, mu_p, sigma_p, grp, e_q_mu_lr=0.5, e_phi_lr=0.0, e_mu_q_trust=None)
-    assert torch.equal(off.mu, none.mu)                            # default == explicit None == unbounded
-
-
-def test_e_step_trust_binds_changes_mu():
-    b, mu_p, sigma_p, grp = _belief()
-    off   = e_step_iteration(b, mu_p, sigma_p, grp, e_q_mu_lr=0.5, e_phi_lr=0.0)
-    clamp = e_step_iteration(b, mu_p, sigma_p, grp, e_q_mu_lr=0.5, e_phi_lr=0.0,
-                             e_mu_q_trust=1e-4, mu_trust_mode="box")
-    assert not torch.allclose(off.mu, clamp.mu)                    # a tight box bounds the step
-    assert (clamp.mu - b.mu).abs().max() < (off.mu - b.mu).abs().max()

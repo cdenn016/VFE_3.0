@@ -1,6 +1,5 @@
 from tests.profiles import test_config
-import hashlib
-from collections.abc import Callable
+import inspect
 
 import pytest
 import torch
@@ -77,72 +76,46 @@ def test_phi_update_policy_registry_contract_is_exact_and_immutable():
     }
 
 
-def test_default_adamw_one_step_is_byte_identical_to_golden():
+def test_default_adamw_one_step_matches_direct_torch_optimizer() -> None:
     from vfe3.model.model import VFEModel
     from vfe3.train import build_optimizer, train_step
 
     torch.manual_seed(0)
-    # The golden was captured under the library defaults in force before the imported config WIP
-    # (docs/audits/audit-2026-09-22.md flip table); pin them so the parameter groups, optimizer
-    # state and loss are those of the captured step. The block MLP, decode bias and affine block
-    # LayerNorm each add a parameter group under the current defaults.
-    cfg = test_config(
-        vocab_size=8,
-        embed_dim=4,
-        n_heads=2,
-        max_seq_len=4,
-        n_layers=1,
-        n_e_steps=1,
-        pos_phi="none",
-        use_block_mlp=False,
-        norm_type_block="none",
-        layernorm_affine=False,
-        decode_bias=False,
-        untie_decode_bank=False,
-        decode_unigram_prior=False,
-        decode_temperature_learned=True,
-        mu_init_std=0.02, sigma_init=1.0, phi_scale=0.01,
-        lambda_alpha_mode="constant",
-        decode_ce_stable_reduction=False, decode_ranking_refinement="full",
-        skip_belief_sigma_update=False,
-        beta_attention_prior="causal",
-        decode_av_precision="fp32",
-    )
-    model = VFEModel(cfg)
-    optimizer = build_optimizer(model, cfg)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
-    tokens = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]], dtype=torch.long)
-    targets = torch.tensor([[1, 2, 3, 4], [2, 1, 0, 7]], dtype=torch.long)
-
-    loss = train_step(model, optimizer, scheduler, tokens, targets, grad_clip=1.0)
-
+    cfg = test_config(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=4,
+                      n_layers=1, n_e_steps=1, pos_phi="none")
+    production = VFEModel(cfg)
+    oracle = VFEModel(cfg)
+    oracle.load_state_dict(production.state_dict())
+    optimizer = build_optimizer(production, cfg)
     assert type(optimizer) is torch.optim.AdamW
-    assert [group["role"] for group in optimizer.param_groups] == ["mu", "sigma", "phi", "mu"]
-    state = optimizer.state_dict()["state"]
-    assert sorted(state) == [0, 1, 3, 4]
-    assert all(set(slot) == {"step", "exp_avg", "exp_avg_sq"} for slot in state.values())
-    assert 2 not in state
-    assert loss == 2.0770487785339355
+    parameter_names = {id(p): name for name, p in production.named_parameters()}
+    oracle_parameters = dict(oracle.named_parameters())
+    groups = [dict(group, params=[oracle_parameters[parameter_names[id(p)]]
+                                 for p in group["params"]])
+              for group in optimizer.param_groups]
+    accepted = inspect.signature(torch.optim.AdamW).parameters
+    defaults = {name: value for name, value in optimizer.defaults.items() if name in accepted}
+    reference = torch.optim.AdamW(groups, **defaults)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    tokens = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]])
+    targets = torch.tensor([[1, 2, 3, 4], [2, 1, 0, 6]])
 
-    def digest(tensor: torch.Tensor) -> str:
-        data = tensor.detach().cpu().contiguous().numpy().tobytes()
-        return hashlib.sha256(data).hexdigest()
+    _, reference_loss, _ = oracle(tokens, targets)
+    reference_loss.backward()
+    roles: dict[str, list[torch.Tensor]] = {}
+    for group in reference.param_groups:
+        roles.setdefault(group["role"], []).extend(group["params"])
+    for parameters in roles.values():
+        torch.nn.utils.clip_grad_norm_(parameters, 1.0)
+    reference.step()
+    loss = train_step(production, optimizer, scheduler, tokens, targets, grad_clip=1.0)
 
-    # Re-captured 2026-09-23 on this tree (torch 2.10.0.dev20251210+cu128, CPU), at the user's
-    # request: the previous digests had unknown provenance and matched under no pinned default,
-    # clipping policy, or AdamW kernel while the loss stayed bit-identical.
-    # These digests were UNCHANGED by audit 2026-07-25 F3, and that is a deliberate property worth
-    # stating. F3 makes the factored diagonal congruence escalate to float64 when its (mixed-sign,
-    # non-manifestly-nonnegative) regrouping actually loses nonnegativity. A well-conditioned step
-    # like this one never triggers the escalation, so it still runs entirely in float32 and remains
-    # bit-identical. An UNCONDITIONAL float64 upcast would have moved every digest here while leaving
-    # `loss` bit-identical -- same forward value, different low-order gradient bits -- which is
-    # precisely the golden churn the data-driven escalation avoids.
-    assert digest(model.prior_bank.mu_embed) == "04cf10170cdb51ac2c26c6221fd0bda04ef7e30073b59d438d81c63bb48bc297"
-    assert digest(model.prior_bank.sigma_log_embed) == "147210f839396e8a7c921b71b208b2015882f4dc976eaf7fdc99a4b0eb6ded0c"
-    assert digest(model.prior_bank.phi_embed) == "ed12aa377b86dc75bd3aea2b9bee02687086c7b24d8f7155a86342d422311f35"
-    assert digest(model.prior_bank.decode_log_scale) == "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
-    assert digest(model.prior_bank.output_proj_weight) == "8b9304d32b06d625b58200061a864f0400e1621b68bc339c416f215c89b7783d"
+    assert loss == float(reference_loss.detach())
+    assert parameter_names.keys() == {id(p) for g in optimizer.param_groups for p in g["params"]}
+    for name, value in production.named_parameters():
+        torch.testing.assert_close(value, oracle_parameters[name], rtol=0.0, atol=0.0)
+    for state in optimizer.state.values():
+        assert set(state) == {"step", "exp_avg", "exp_avg_sq"}
 
 
 def test_default_adamw_one_step_matches_recompute_dense_low_level_oracle(
@@ -198,142 +171,6 @@ def test_default_adamw_one_step_matches_recompute_dense_low_level_oracle(
         )
 
 
-def _pair_route_models(
-    monkeypatch:   pytest.MonkeyPatch,
-    n_heads:       int,
-    e_step_update: str,
-    pos_rotation:  str,
-) -> tuple[torch.Tensor, list[torch.Tensor], list[None], Callable[[], torch.Tensor]]:
-    r"""Run production's forward while recording the E-step's pair-energy route.
-
-    Returns production logits, every generic ``pairwise_energy`` tensor, one entry per
-    ``diagonal_kl_pair_stats`` reuse call, and a thunk that runs the SAME weights through a
-    recompute oracle: no pair-statistics reuse, no compact/per-head transport, and no model-level
-    prebuilt transport (the E-step builds its own). The recorders stay live for the oracle run.
-    """
-    from vfe3.gradients import kernels as kernels_module
-    from vfe3.model import block as block_module
-    from vfe3.model.model import VFEModel
-
-    torch.manual_seed(0)
-    cfg = test_config(
-        vocab_size=8,
-        embed_dim=4,
-        n_heads=n_heads,
-        max_seq_len=4,
-        n_layers=1,
-        n_e_steps=1,
-        pos_phi="none",
-        pos_rotation=pos_rotation,
-
-        e_step_update=e_step_update,
-    )
-    production = VFEModel(cfg).eval()
-    oracle = VFEModel(cfg).eval()
-    oracle.load_state_dict(production.state_dict())
-    tokens = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]], dtype=torch.long)
-    energies: list[torch.Tensor] = []
-    stats_calls: list[None] = []
-    original_pairwise_energy = kernels_module.pairwise_energy
-    original_pair_stats = kernels_module.diagonal_kl_pair_stats
-
-    def _capture_pairwise_energy(*args: object, **kwargs: object) -> torch.Tensor:
-        energy = original_pairwise_energy(*args, **kwargs)
-        energies.append(energy.detach().clone())
-        return energy
-
-    def _capture_pair_stats(*args: object, **kwargs: object) -> object:
-        stats_calls.append(None)
-        return original_pair_stats(*args, **kwargs)
-
-    monkeypatch.setattr(kernels_module, "pairwise_energy", _capture_pairwise_energy)
-    monkeypatch.setattr(kernels_module, "diagonal_kl_pair_stats", _capture_pair_stats)
-    with torch.no_grad():
-        production_logits = production(tokens)
-
-    def run_oracle() -> torch.Tensor:
-        original_e_step = block_module.e_step
-
-        def recompute_dense_e_step(*args: object, **kwargs: object) -> object:
-            kwargs["reuse_pairwise_kl_stats"] = False
-            kwargs["compact_phi_block_transport"] = False
-            kwargs["transport_mean_per_head"] = False
-            kwargs["prebuilt_transport"] = None
-            return original_e_step(*args, **kwargs)
-
-        monkeypatch.setattr(block_module, "e_step", recompute_dense_e_step)
-        with torch.no_grad():
-            return oracle(tokens)
-
-    return production_logits, energies, stats_calls, run_oracle
-
-
-@pytest.mark.parametrize(
-    "e_step_update",
-    [
-        pytest.param("gradient", id="plain-gradient"),
-        pytest.param("mm_exact", id="plain-mm-exact"),
-    ],
-)
-def test_single_head_forward_matches_recompute_dense_low_level_oracle(
-    monkeypatch:   pytest.MonkeyPatch,
-    e_step_update: str,
-) -> None:
-    r"""One head is one [K] block: a dense transport on which pair-statistics reuse fails closed.
-
-    Production must take the generic pair-energy route (no ``diagonal_kl_pair_stats`` call, a zero
-    self-energy diagonal) and be byte-identical to the recompute oracle. Single-block RoPE is
-    rejected at construction (RoPE needs at least two irrep blocks), so RoPE is covered by the
-    multi-head test below.
-    """
-    production_logits, energies, stats_calls, run_oracle = _pair_route_models(
-        monkeypatch, 1, e_step_update, "none")
-
-    assert stats_calls == []
-    assert len(energies) == 1
-    self_energy = energies[0].diagonal(dim1=-2, dim2=-1)
-    self_mask = ((self_energy > 0.0) & (self_energy < 100.0)).to(self_energy.dtype)
-    assert torch.equal(self_energy, torch.zeros_like(self_energy))
-    assert torch.equal(self_mask, torch.zeros_like(self_mask))
-
-    energies.clear()
-    oracle_logits = run_oracle()
-
-    assert stats_calls == []
-    assert len(energies) == 1
-    assert torch.equal(production_logits, oracle_logits)
-
-
-@pytest.mark.parametrize(
-    "e_step_update",
-    [
-        pytest.param("gradient", id="rope-gradient"),
-        pytest.param("mm_exact", id="rope-mm-exact"),
-    ],
-)
-def test_multi_head_rope_forward_reuses_pair_stats_and_matches_recompute_oracle(
-    monkeypatch:   pytest.MonkeyPatch,
-    e_step_update: str,
-) -> None:
-    r"""Two heads give a factored [2, 2] transport, on which production reuses pair statistics.
-
-    ``vfe_block`` forwards ``reuse_pairwise_kl_stats=True`` and the shared factored transport admits
-    it, so production makes exactly one ``diagonal_kl_pair_stats`` call and no generic pair-energy
-    call. The recompute oracle takes the generic route instead; the two evaluation orders round
-    differently, so they agree to a float32 tolerance rather than bitwise (as in
-    tests/test_p3_pairwise_stats_reuse_20260711.py).
-    """
-    production_logits, energies, stats_calls, run_oracle = _pair_route_models(
-        monkeypatch, 2, e_step_update, "rope")
-
-    assert stats_calls == [None]
-    assert energies == []
-
-    oracle_logits = run_oracle()
-
-    assert stats_calls == [None]                       # the oracle made no reuse call
-    assert len(energies) == 1                          # it recomputed the generic pair energy
-    torch.testing.assert_close(production_logits, oracle_logits, atol=1e-5, rtol=1e-6)
 
 
 @pytest.mark.parametrize(

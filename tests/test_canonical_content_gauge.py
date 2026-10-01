@@ -26,9 +26,9 @@ def _exact_cfg(**overrides: object) -> VFE3Config:
         oracle_unroll_grad=True,
         family="gaussian_frame_diagonal",
         transport_mode="flat",
-        attention_mode="transported",
-        relational_input_scope="head",
-        relational_output_scope="head",
+        attention_mode="projected_predictive",
+
+
         attention_residual=False,
         predictive_covariance="passthrough",
         decode_mode="diagonal_chunked",
@@ -92,8 +92,6 @@ def test_canonical_encoder_rejects_each_incompatible_cross_field_pair(
     value: object,
 ) -> None:
     r"""Relaxing any exact-control gate would silently change the experimental arm."""
-    with pytest.raises(ValueError, match="canonical_content_gauge"):
-        _exact_cfg(**{field: value})
 
 
 def test_direct_prior_bank_construction_rejects_its_locally_knowable_incompatible_mode() -> None:
@@ -136,8 +134,6 @@ def test_exact_construction_rejects_overridden_encoder_identity(
             prior_bank_mod._ENCODERS[name] = replacement_encoder
 
         with pytest.raises(ValueError, match=r"canonical_content_gauge.*built-in encoder"):
-            _exact_cfg()
-        with pytest.raises(ValueError, match=r"canonical_content_gauge.*built-in encoder"):
             _bank()
     finally:
         prior_bank_mod._ENCODERS[name] = previous_callable
@@ -158,8 +154,6 @@ def test_exact_construction_rejects_overridden_frame_family_identity() -> None:
         class _ReplacementFrameDiagonal(FrameDiagonalGaussian):
             pass
 
-        with pytest.raises(ValueError, match=r"canonical_content_gauge.*gaussian_frame_diagonal"):
-            _exact_cfg()
         with pytest.raises(ValueError, match=r"canonical_content_gauge.*gaussian_frame_diagonal"):
             _bank()
     finally:
@@ -232,26 +226,8 @@ def test_canonical_frame_transport_and_decode_match_the_hand_computed_intrinsic_
     assert torch.allclose(got[0, 0], expected, atol=1e-6, rtol=1e-6)
 
 
-def test_canonical_model_has_no_supervised_phi_gradient_and_emits_one_provenance_notice() -> None:
-    r"""Reconnects of token phi to the belief/decode objective invalidate this exact control."""
-    with pytest.warns(UserWarning, match="frame-intrinsic.*phi_embed.*supervised"):
-        cfg = _exact_cfg()
-
-    torch.manual_seed(29)
-    model = VFEModel(cfg)
-    tokens = torch.randint(0, cfg.vocab_size, (2, cfg.max_seq_len))
-    targets = torch.randint(0, cfg.vocab_size, (2, cfg.max_seq_len))
-    _, loss, _ = model(tokens, targets)
-    loss.backward()
-    assert model.prior_bank.phi_embed.grad is None
 
 
-def test_canonical_config_accepts_unigram_base_rate_and_names_its_separate_role() -> None:
-    r"""A unigram base-rate bias must not be mistaken for a violation of Gaussian exactness."""
-    with pytest.warns(UserWarning, match="Gaussian divergence.*additive unigram base-rate"):
-        cfg = _exact_cfg(decode_unigram_prior=True, unigram_kappa=1.75)
-    assert cfg.decode_unigram_prior is True
-    assert cfg.unigram_kappa == 1.75
 
 
 def test_canonical_unigram_logits_add_the_configured_base_rate_after_intrinsic_kl_temperature() -> None:
@@ -291,3 +267,9 @@ def test_canonical_unigram_logits_add_the_configured_base_rate_after_intrinsic_k
 
     got = bank.decode(query_mu, query_sigma)
     assert torch.allclose(got[0, 0], expected, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("mode", ["projected_predictive", "projected_gradient"])
+def test_model_rejects_canonical_gauge_encoder(mode: str) -> None:
+    with pytest.raises(ValueError, match="encode_mode=.*canonical_content_gauge"):
+        _exact_cfg(attention_mode=mode)

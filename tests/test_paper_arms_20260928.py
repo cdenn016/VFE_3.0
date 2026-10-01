@@ -54,7 +54,7 @@ def _tiny_cfg(**over: Any) -> VFE3Config:
         family="gaussian_diagonal", gauge_group="block_glk", attention_mode="projected_predictive",
         attention_residual=True, decode_mode="linear", use_block_mlp=True, block_mlp_expansion=2,
         generate_embedding_figures=False, sigma_weight_decay=0.2, pos_phi="learned", seed=0,
-        relational_input_scope="full", relational_output_scope="full", **PINNED)
+        **PINNED)
     values.update(over)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")

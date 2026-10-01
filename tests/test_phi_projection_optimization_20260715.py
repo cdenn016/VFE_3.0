@@ -15,7 +15,7 @@ def _phi_table_model() -> VFEModel:
     cfg = test_config(
         vocab_size=8,
         embed_dim=4,
-        n_heads=1,
+        n_heads=2,
         max_seq_len=4,
         n_layers=1,
         pos_phi="none",
@@ -38,7 +38,7 @@ def _projection_train_case() -> tuple:
     cfg = test_config(
         vocab_size=8,
         embed_dim=4,
-        n_heads=1,
+        n_heads=2,
         max_seq_len=4,
         n_layers=1,
         n_e_steps=1,
@@ -382,12 +382,12 @@ def test_phi_chart_summary_route_is_none_when_disabled_and_named_when_enabled() 
     import vfe3.run_artifacts as run_artifacts
 
     assert hasattr(run_artifacts, "_phi_chart_norm_route")
-    disabled_cfg = test_config(vocab_size=8, embed_dim=4, n_heads=1)
+    disabled_cfg = test_config(vocab_size=8, embed_dim=4, n_heads=2)
     disabled_model = VFEModel(disabled_cfg)
     enabled_cfg = test_config(
         vocab_size=8,
         embed_dim=4,
-        n_heads=1,
+        n_heads=2,
         phi_mstep_max_matrix_norm=2.0,
     )
     enabled_model = VFEModel(enabled_cfg)
@@ -437,7 +437,7 @@ def test_enabled_projection_persists_timing_metrics_in_training_row(tmp_path) ->
     cfg = test_config(
         vocab_size=8,
         embed_dim=4,
-        n_heads=1,
+        n_heads=2,
         max_seq_len=4,
         n_layers=1,
         n_e_steps=1,

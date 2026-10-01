@@ -5,8 +5,7 @@ AffineLayerNorm nn.Module (mu_norm = gamma*LN(mu) + beta). Default-ON member of 
 learned-parameter exception family: gamma inits to 1 and beta to 0, so step 0 is
 byte-identical to the parameter-free "layernorm". ``_cfg`` pins the parameter-free variant
 (layernorm_affine=False) and the block MLP off, so each test opts into exactly the seam it checks. Non-gauge-equivariant (the same break
-"layernorm" itself carries). As the BLOCK norm it is E-step-coupled (detach / straight_through
-freeze footgun); as the FINAL norm it is post-stack and trains under any estimator.
+"layernorm" itself carries). Both norm seams train through the supported unrolled E-step.
 
 All models here are tiny (K = 4, single-digit dims), CPU-bound per the project testing rules.
 """
@@ -95,15 +94,14 @@ def test_perturbed_affine_changes_loss():
 
 # --- gradient flow / freeze --------------------------------------------------
 
-def test_final_affine_trains_under_any_estimator():
-    # FINAL norm is post-stack (outside the E-step wrapper): gamma/beta receive gradient even under
-    # 'detach', and construction does NOT emit a freeze warning for the final seam.
+def test_final_affine_trains_under_unroll():
+    # FINAL norm is post-stack and receives a gradient through the supported estimator.
     x, y = _batch()
     torch.manual_seed(0)
     with warnings.catch_warnings(record=True) as rec:
         warnings.simplefilter("always")
         m = VFEModel(_cfg(norm_type_block="none", norm_type_final="layernorm",
-                          layernorm_affine=True, e_step_gradient="detach"))
+                          layernorm_affine=True, e_step_gradient="unroll"))
     assert not any("freezes the BLOCK" in str(w.message) for w in rec)
     _, loss, _ = m(x, y)
     loss.backward()
@@ -122,33 +120,9 @@ def test_block_affine_trains_under_unroll():
     assert m.block_norm.bias.grad is not None
 
 
-def test_block_affine_frozen_under_detach():
-    # 'detach' runs the whole belief stack (incl. the block norm) under no_grad, so the block
-    # gamma/beta receive no gradient (the family's detach footgun) and construction warns.
-    x, y = _batch()
-    torch.manual_seed(0)
-    with pytest.warns(UserWarning, match="freezes the BLOCK"):
-        m = VFEModel(_cfg(norm_type_block="layernorm", layernorm_affine=True,
-                          e_step_gradient="detach"))
-    _, loss, _ = m(x, y)
-    loss.backward()
-    assert m.block_norm.weight.grad is None
-
-
-def test_block_affine_trains_under_straight_through():
-    # The block affine is applied to the belief VALUE, which 'straight_through' keeps
-    # differentiable, so gamma/beta DO
-    # train (nonzero grad) and construction does NOT emit a freeze warning.
-    x, y = _batch()
-    torch.manual_seed(0)
-    with warnings.catch_warnings(record=True) as rec:
-        warnings.simplefilter("always")
-        m = VFEModel(_cfg(norm_type_block="layernorm", layernorm_affine=True,
-                          e_step_gradient="straight_through"))
-    assert not any("freezes the BLOCK" in str(w.message) for w in rec)
-    _, loss, _ = m(x, y)
-    loss.backward()
-    assert m.block_norm.weight.grad is not None and m.block_norm.weight.grad.abs().sum() > 0
+def test_block_affine_rejects_retired_detach_estimator() -> None:
+    with pytest.raises(ValueError, match="e_step_gradient"):
+        _cfg(norm_type_block="layernorm", layernorm_affine=True, e_step_gradient="detach")
 
 
 def test_inert_warning_when_no_layernorm_seam():

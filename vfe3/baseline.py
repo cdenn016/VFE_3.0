@@ -352,17 +352,16 @@ class BaselineConfig:
         Adam moments are baseline fields (tune them on validation); ``overrides`` sets any field
         last. A mapping may be the whole ``config.json`` record (its ``"config"`` entry is used);
         fields absent from an older mapping take the current ``VFE3Config`` defaults. The base must
-        use full-scope interface maps (``relational_input_scope = relational_output_scope =
-        'full'``), the only scope at which the dense attention's :math:`4K^2` parameters per layer
-        equal the VFE's comparison and content maps; any other scope raises ``ValueError``.
+        use the current full-width projected attention architecture, whose comparison and content
+        maps have the same :math:`4K^2` parameters per layer as dense attention. Historical mappings
+        with head-scoped interfaces require explicit architecture migration.
         """
         values = _vfe_base_values(base)
-        scopes = (values["relational_input_scope"], values["relational_output_scope"])
-        if scopes != ("full", "full"):
-            raise ValueError(
-                "matched_to: the dense multi-head attention (4K^2 per layer) matches the VFE interface "
-                "maps only at relational_input_scope = relational_output_scope = 'full'; the base has "
-                f"{scopes}")
+        for field in ("relational_input_scope", "relational_output_scope"):
+            if field in values and values[field] not in (None, "full"):
+                raise ValueError(f"matched_to: {field}={values[field]!r}: head architecture requires explicit migration")
+        if values["attention_mode"] not in ("projected_predictive", "projected_gradient"):
+            raise ValueError(f"matched_to: retired attention mode {values['attention_mode']!r} requires explicit migration")
         derived: Dict[str, Any] = {name: values[name] for name in MATCHED_FIELDS}
         derived["mlp_expansion"] = int(values["block_mlp_expansion"])
         derived["decode_bias"] = (bool(values["decode_bias"]) if values["decode_mode"] == "linear" else True)
@@ -386,7 +385,7 @@ def _vfe_base_values(base: Any) -> Dict[str, Any]:
     r"""Field values of a VFE base (config object or mapping), current VFE3Config defaults for gaps."""
     from dataclasses import MISSING
 
-    from vfe3.config import VFE3Config
+    from vfe3.config import VFE3Config, _normalize_serialized_boolean
 
     if is_dataclass(base) and not isinstance(base, type):
         if model_family_of(base) != VFE_MODEL_FAMILY:
@@ -399,6 +398,19 @@ def _vfe_base_values(base: Any) -> Dict[str, Any]:
             raise ValueError(f"matched_to needs a VFE base config, got model_family={model_family_of(raw)!r}")
     else:
         raise TypeError(f"matched_to expects a VFE3Config or a mapping, got {type(base).__name__}")
+    if "relational_mode" in raw or "relational_readout_mode" in raw:
+        pair = (raw.pop("relational_mode", "off"),
+                raw.pop("relational_readout_mode", "conditional_update"))
+        if pair != ("projected_filtering", "predictive_content"):
+            raise ValueError(f"matched_to: retired attention selectors {pair!r} require explicit migration")
+        if "attention_mode" in raw and raw["attention_mode"] != "projected_predictive":
+            raise ValueError("matched_to: conflicting attention selectors")
+        raw["attention_mode"] = "projected_predictive"
+    if "relational_identity_content" in raw:
+        identity = _normalize_serialized_boolean(
+            raw.pop("relational_identity_content"), "relational_identity_content", source="matched_to")
+        if identity:
+            raise ValueError("matched_to: retired identity content requires explicit migration")
     defaults: Dict[str, Any] = {}
     for f in fields(VFE3Config):
         if f.default is not MISSING:

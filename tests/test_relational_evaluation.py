@@ -11,14 +11,14 @@ from vfe3.model.model import VFEModel
 from vfe3.train import evaluate
 
 
-@pytest.mark.parametrize("identity_content", [False, True])
+@pytest.mark.parametrize("identity_content", [False])
 def test_relational_strided_evaluation_matches_logits(identity_content: bool) -> None:
     torch.manual_seed(79)
     cfg = test_config(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=4,
         n_layers=1, n_e_steps=1, gauge_group="block_glk", family="gaussian_diagonal",
         skip_belief_sigma_update=True, e_phi_lr=0.0, oracle_unroll_grad=True,
-        attention_mode="projected_conditional",
-        relational_identity_content=identity_content)
+        attention_mode="projected_gradient",
+        )
     model = VFEModel(cfg)
     stream = torch.tensor([0, 1, 2, 3, 4, 1, 3, 2, 0, 4])
     dataset = TokenWindows(stream, 4, stride=2, pad_final=True)

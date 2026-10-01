@@ -21,32 +21,13 @@ from vfe3.geometry.transport import compute_transport_operators, transport_covar
 from vfe3.model.model import VFEModel
 
 
-# --- frozen model-forward oracle (B=2, distinct sequences, seed 0) ---
-# Re-captured 2026-09-23 after the filtering phi E-step became receiver-row causal (audit
-# 2026-09-23 #6: sender frames detached in phi_alignment_loss). With the former objective the
-# forward still reproduces the previous pins (2.4850413799, -0.1507924795) to 1e-7 / 1.4e-6.
-_FWD_LOSS       = 2.4850410100
-_FWD_LOGITS_SUM = -0.1507471040
-# Library defaults in force when the checksums were captured, before the imported config WIP
-# (docs/audits/audit-2026-09-22.md flip table) changed them. The frozen oracle is a snapshot of
-# THAT forward, so it pins them explicitly; the property tests below run the current defaults.
-_CAPTURE_DEFAULTS = dict(
-    use_block_mlp=False, norm_type_block="none", layernorm_affine=False,
-    skip_belief_sigma_update=False, beta_attention_prior="causal",
-    decode_bias=False, untie_decode_bank=False, decode_unigram_prior=False,
-    decode_av_precision="fp32", mu_init_std=0.02, sigma_init=1.0, phi_scale=0.01,
-    lambda_alpha_mode="constant", decode_temperature_learned=True,
-    decode_ce_stable_reduction=False, decode_ranking_refinement="full",
-)
-
-
 def _fwd_cfg(**overrides: object) -> VFE3Config:
     # pos_phi="none" pins the canonical no-positional-composition forward these checksums were
     # captured on; the perf refactor this oracle guards (factored transport / per-block exp / batch
     # vectorization) is independent of the pos_phi gauge composition.
     # These checksums were captured on the KL-to-prior decoder that the oracle guards.
     return test_config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=2,
-                      n_e_steps=2, e_phi_lr=0.1, pos_phi="none",
+                      n_e_steps=2, e_phi_lr=0.0, pos_phi="none",
                       decode_mode="diagonal_chunked", **overrides)
 
 
@@ -63,21 +44,6 @@ def test_beta_to_coordinate_equal_blocks_matches_repeat_interleave():
     assert torch.equal(out, ref)
     for h in range(H):
         assert torch.equal(out[..., h * d:(h + 1) * d], beta[h].unsqueeze(-1).expand(N, N, d))
-
-
-def test_model_forward_matches_frozen_oracle():
-    torch.manual_seed(0)
-    m = VFEModel(_fwd_cfg(**_CAPTURE_DEFAULTS))
-    tok = torch.tensor([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 0]])
-    tgt = torch.tensor([[2, 3, 4, 5, 6, 7], [8, 9, 10, 11, 0, 1]])
-    with torch.no_grad():
-        _, loss, ce = m(tok, tgt)
-        # logits is None on the fused-CE branch by design (audit 2026-08-06); the default
-        # decode_mode is chunked now, so take them from the unfused no-targets path.
-        logits = m(tok)
-    assert logits.shape == (2, 6, 12)
-    assert abs(float(loss) - _FWD_LOSS) < 1e-5
-    assert abs(float(logits.sum()) - _FWD_LOGITS_SUM) < 1e-5
 
 
 def test_batched_forward_equals_per_sample():

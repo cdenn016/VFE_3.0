@@ -28,8 +28,8 @@ def _single_cpu_thread() -> Any:
 def _cfg(**overrides: Any) -> VFE3Config:
     values = dict(
         attention_mode="projected_gradient",
-        relational_input_scope="full",
-        relational_output_scope="full",
+
+
         attention_residual=False,
         predictive_covariance="passthrough",
         predictive_covariance_centering=False,
@@ -223,8 +223,6 @@ def test_config_state_and_control_activity_round_trip() -> None:
         {"family": "gaussian_diagonal_exact"},
         {"family": "gaussian_frame_diagonal"},
         {"lambda_alpha_mode": "state_dependent"},
-        {"relational_input_scope": "head"},
-        {"relational_output_scope": "head"},
         {"e_step_update": "mm_exact"},
         {"gradient_mode": "smoothing"},
         {"e_step_gradient": "straight_through"},
@@ -241,7 +239,6 @@ def test_unsupported_gradient_envelopes_are_rejected(overrides: dict[str, Any]) 
 def test_receiving_noise_requires_finite_positive_model_variance(noise: Any) -> None:
     with pytest.raises(ValueError):
         _cfg(relational_receiver_noise=noise)
-
 
 
 @pytest.mark.parametrize("skip_sigma", [False, True])
@@ -285,26 +282,3 @@ def test_diagnostics_report_the_captured_frozen_receiver_cost() -> None:
     assert diagnostics["relational_receiver_noise"] == model.cfg.relational_receiver_noise
     assert diagnostics["relational_legacy_global_f_available"] == 0.0
     assert snapshot.trace_free_energy.numel() == 0
-
-
-@pytest.mark.parametrize("readout", ["predictive_content", "full_link_update"])
-def test_receiver_noise_keeps_existing_positional_operator_arguments(readout: str) -> None:
-    """Adding noise must preserve released routing/covariance/scope argument positions."""
-    from vfe3.model.relational_operators import RelationalOperators
-
-    positional = RelationalOperators(
-        [2, 2], 17, readout, False, False, 1.0, "gaussian_kl", "passthrough", 1e-4,
-        False, "full", "full", receiver_noise=0.7)
-    explicit = RelationalOperators(
-        [2, 2], 17, readout_mode=readout, routing="gaussian_kl",
-        predictive_covariance="passthrough", input_scope="full", output_scope="full",
-        receiver_noise=0.7)
-    from vfe3.contracts import CanonicalFrameContext
-
-    mu = torch.arange(12, dtype=torch.float32).reshape(1, 3, 4) / 10
-    identity = torch.eye(4).expand(1, 3, 4, 4)
-    frame = CanonicalFrameContext(identity, identity)
-    beta = torch.ones(1, 2, 3, 3) / 3
-    torch.testing.assert_close(
-        positional.predictive_content(mu, beta, frame),
-        explicit.predictive_content(mu, beta, frame), rtol=0, atol=0)

@@ -1,37 +1,9 @@
 from tests.profiles import test_config
 import torch
-from vfe3.belief import BeliefState
-from vfe3.geometry.groups import get_group
-from vfe3.model.block import vfe_block
-from vfe3.model.stack import vfe_stack
+import pytest
+from types import SimpleNamespace
 
 
-def _belief(N=4, K=4, n_gen=16, seed=0):
-    g = torch.Generator().manual_seed(seed)
-    return BeliefState(
-        mu=torch.randn(N, K, generator=g),
-        sigma=torch.rand(N, K, generator=g) + 0.5,
-        phi=0.1 * torch.randn(N, n_gen, generator=g),
-    )
-
-
-def test_block_runs_e_step_and_preserves_shapes():
-    cfg = test_config(embed_dim=4, n_heads=2, n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.0)
-    grp = get_group("block_glk")(4, 2)
-    b = _belief(K=4, n_gen=grp.generators.shape[0])
-    out = vfe_block(b, b.mu, b.sigma, grp, cfg)
-    assert out.mu.shape == b.mu.shape and (out.sigma > 0).all()
-
-
-def test_stack_handoff_updates_prior_across_blocks():
-    cfg = test_config(embed_dim=4, n_heads=2, n_layers=3, n_e_steps=1,
-                     e_q_mu_lr=0.05, e_phi_lr=0.0, prior_handoff_rho=1.0)
-    grp = get_group("block_glk")(4, 2)
-    b = _belief(K=4, n_gen=grp.generators.shape[0])
-    out = vfe_stack(b, b.mu, b.sigma, grp, cfg)
-    assert out.mu.shape == b.mu.shape and (out.sigma > 0).all()
-    # with rho=1 and a nonzero E-step, the stack moves the belief off the input
-    assert not torch.allclose(out.mu, b.mu, atol=1e-4)
 
 
 from vfe3.model.model import VFEModel
@@ -53,7 +25,7 @@ def test_loss_backward_reaches_prior_tables():
     # THE crown jewel: the unrolled E-step keeps the training graph connected, so the
     # M-step gradient reaches the encode/phi prior parameters (not just decode).
     cfg = test_config(vocab_size=15, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=2,
-                     n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.02, gradient_mode="filtering")
+                     n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.0, gradient_mode="filtering")
     model = VFEModel(cfg)
     tokens = torch.randint(0, 15, (2, 4)); targets = torch.randint(0, 15, (2, 4))
     _, loss, _ = model(tokens, targets)
@@ -62,51 +34,6 @@ def test_loss_backward_reaches_prior_tables():
     assert model.prior_bank.phi_embed.grad is not None
     assert model.prior_bank.mu_embed.grad.abs().sum() > 0          # gradient actually flows
     assert model.prior_bank.phi_embed.grad.abs().sum() > 0
-
-
-def test_phi_e_step_actually_moves_phi():
-    # Isolate the phi E-step: the crown jewel's phi_embed.grad>0 check passes even with
-    # e_phi_lr=0 (phi flows via the in-graph transport omega in the kernel), so it does
-    # not by itself exercise the phi update. Here we assert the OUTPUT belief.phi changes
-    # between e_phi_lr=0 (phi step skipped) and e_phi_lr>0 (phi natgrad applied), which
-    # exercises the phi E-step itself, not only the transport coupling.
-    grp = get_group("block_glk")(4, 2)
-    n_gen = grp.generators.shape[0]
-
-    def run(e_phi_lr):
-        b = _belief(K=4, n_gen=n_gen)
-        cfg = test_config(embed_dim=4, n_heads=2, n_layers=1, n_e_steps=2,
-                         e_q_mu_lr=0.05, e_phi_lr=e_phi_lr)
-        return vfe_stack(b, b.mu, b.sigma, grp, cfg).phi
-
-    phi_off = run(0.0)
-    phi_on = run(0.05)
-    assert not torch.allclose(phi_off, phi_on, atol=1e-6)  # the phi step moves phi
-
-
-def test_detached_e_step_with_phi_runs_and_reaches_decode_priors():
-    # The documented fixed-point/truncated mode must complete a
-    # forward+backward even with the phi E-step enabled (e_phi_lr>0): the phi natgrad runs
-    # under its own enable_grad island, so the blanket no_grad does not strangle it.
-    # Under detach the E-step is severed, so priors are reached only via decode (mu/sigma);
-    # phi_embed is frozen (no gradient path) -- pin both as the as-built semantics.
-    # The prior-bank decode reaches the mean table its KL scores against (_decode_mu_table():
-    # decode_mu_embed under the default untie_decode_bank=True, mu_embed on a tied bank); the
-    # linear-decode default would leave it grad None under a severed E-step. The block MLP (on by
-    # default) requires a gradient-carrying E-step, so it is pinned off for detach.
-    cfg = test_config(vocab_size=15, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=2,
-                     n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.02,
-                     e_step_gradient="detach", decode_mode="diagonal_chunked",
-                     use_block_mlp=False)
-    model = VFEModel(cfg)
-    tokens = torch.randint(0, 15, (2, 4)); targets = torch.randint(0, 15, (2, 4))
-    _, loss, _ = model(tokens, targets)
-    assert torch.isfinite(loss)                                    # no crash, finite loss
-    loss.backward()
-    decode_mu = model.prior_bank._decode_mu_table()
-    assert decode_mu.grad is not None                              # decode reaches mu prior
-    assert decode_mu.grad.abs().sum() > 0
-    assert model.prior_bank.phi_embed.grad is None                 # phi frozen under detach
 
 
 def test_prior_handoff_sigma_must_be_convex():
@@ -146,14 +73,14 @@ def test_model_has_no_nn_layers():
     assert layer_names and all(name.startswith("block_mlps.") for name in layer_names)
 
 
-def test_build_group_dispatches_on_arity_for_every_group():
+def test_build_group_dispatches_on_arity_for_every_group() -> None:
     from vfe3.model.model import build_group
-    # build_group must construct every registered group by positional arity alone,
-    # so a new group slots in via register_group without editing the dispatcher.
-    for g, n_gen_expected in (("glk", None), ("block_glk", None), ("so_k", None)):
-        cfg = test_config(vocab_size=10, embed_dim=4, n_heads=2, max_seq_len=3, gauge_group=g)
-        grp = build_group(cfg)
-        assert grp.generators.shape[-1] == 4  # K
+    # This is a standalone group-builder contract; model inference admits block_glk only.
+    for name in ("glk", "block_glk", "so_k"):
+        cfg = SimpleNamespace(gauge_group=name, embed_dim=4, n_heads=2,
+                              cross_couplings=None, group_n=None, irrep_spec=None)
+        group = build_group(cfg)
+        assert group.generators.shape[-1] == 4
 
 
 def test_group_generators_follow_dtype_move():
@@ -214,7 +141,7 @@ def test_killing_per_block_precond_runs_through_forward():
     # must not crash the forward. The per-block Killing metric needs the group's irrep_dims,
     # which the E-step must thread into precondition_phi_gradient.
     cfg = test_config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
-                     n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.05,
+                     n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.0,
                      phi_precond_mode="killing_per_block")
     model = VFEModel(cfg)
     tokens = torch.randint(0, 12, (2, 4)); targets = torch.randint(0, 12, (2, 4))
@@ -222,62 +149,21 @@ def test_killing_per_block_precond_runs_through_forward():
     assert torch.isfinite(loss)
 
 
-def test_b0_c0_threaded_into_state_dependent_alpha():
-    """cfg.b0/c0 reach the state-dependent self-coupling alpha; changing b0 changes the belief."""
-    grp = get_group("block_glk")(4, 2)
-    n_gen = grp.generators.shape[0]
-
-    def run(b0):
-        b = _belief(K=4, n_gen=n_gen)
-        cfg = test_config(embed_dim=4, n_heads=2, n_layers=1, n_e_steps=2, e_q_mu_lr=0.1,
-                         e_phi_lr=0.0, lambda_alpha_mode="state_dependent", b0=b0)
-        return vfe_block(b, b.mu, b.sigma, grp, cfg).mu
-
-    assert not torch.allclose(run(1.0), run(8.0), atol=1e-5)
+def test_model_rejects_tied_block_glk() -> None:
+    with pytest.raises(ValueError, match="gauge_group"):
+        test_config(gauge_group="tied_block_glk")
 
 
-def test_mass_phi_penalizes_phi_inside_the_e_step():
-    """mass_phi enters the phi E-step objective (manuscript Algorithm 1: +alpha_phi/2 ||phi||^2
-    inside the phi gradient), pulling the inferred phi toward 0 during inference -- not only the
-    outer M-step training loss. A larger mass_phi must shrink the E-step's output phi."""
-    grp = get_group("block_glk")(4, 2)
-    n_gen = grp.generators.shape[0]
-
-    def run(mass):
-        b = _belief(K=4, n_gen=n_gen)
-        cfg = test_config(embed_dim=4, n_heads=2, n_layers=1, n_e_steps=3, e_q_mu_lr=0.05,
-                         e_phi_lr=0.2, mass_phi=mass)
-        return vfe_stack(b, b.mu, b.sigma, grp, cfg).phi
-
-    assert run(5.0).norm() < run(0.0).norm()
-
-
-def test_model_runs_under_tied_block_glk():
-    # The tied_block_glk group (shared gauge across heads) must run end-to-end through the same
-    # model/E-step machinery as block_glk (it only changes the generator layout, not irrep_dims).
-    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                     n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.05, m_phi_lr=0.01,
-                     gauge_group="tied_block_glk", phi_precond_mode="none")
-    model = VFEModel(cfg)
-    tok = torch.randint(0, 20, (3, 5)); tgt = torch.randint(0, 20, (3, 5))
-    _, loss, _ = model(tok, tgt)
-    loss.backward()
-    assert torch.isfinite(loss)
-    assert model.prior_bank.phi_embed.grad is not None and model.prior_bank.mu_embed.grad.abs().sum() > 0
-
-
-def test_diagnostics_includes_gauge_geometry_probes():
-    # Part 1 (diagnostics tier): diagnostics must surface the gauge-geometry probes that
-    # vfe3/metrics.py already provides -- holonomy_deviation (curvature proxy on the converged
-    # transport) and gauge_trace_spread (std of log|det Omega| across tokens) -- as finite floats.
+def test_diagnostics_reports_projected_geometry_semantics() -> None:
     import math
-    cfg = test_config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
-                     n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.05)
-    model = VFEModel(cfg)
-    tokens = torch.randint(0, 12, (2, 4))
-    d = model.diagnostics(tokens)
-    assert "holonomy_deviation" in d and "gauge_trace_spread" in d
-    assert math.isfinite(d["holonomy_deviation"]) and math.isfinite(d["gauge_trace_spread"])
+    cfg = test_config(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
+                      n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.0)
+    d = VFEModel(cfg).diagnostics(torch.randint(0, 7, (2, 4)))
+    assert d["relational_semantics"] == "relational_full_link_frozen_filtering"
+    assert d["relational_legacy_global_f_available"] == 0.0
+    assert math.isnan(d["holonomy_deviation"]) and math.isnan(d["gauge_trace_spread"])
+    assert math.isfinite(d["relational_receiver_cost_before"])
+    assert math.isfinite(d["relational_receiver_cost_after"])
 
 
 def test_attention_maps_shape_and_row_stochastic():
@@ -300,7 +186,7 @@ def test_attention_maps_last_layer_matches_diagnostics():
     # diagnostics' attn_entropy, which guards the block-by-block replay against trajectory drift.
     from vfe3 import metrics
     cfg = test_config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                     n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.05,
+                     n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.0,
                      norm_type_block="none", use_block_mlp=False)
     model = VFEModel(cfg)
     tokens = torch.randint(0, 12, (2, 5))
@@ -310,18 +196,20 @@ def test_attention_maps_last_layer_matches_diagnostics():
 
 
 def test_diagnostics_per_layer_shape_and_finite():
-    # Per-layer (inference-depth) belief-channel diagnostics: one finite value per layer for every key,
-    # exposing the depth axis the scalar diagnostics() collapses to the final block.
+    # Each layer reports available projected diagnostics and explicit unavailable global terms.
     import math
     cfg = test_config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=3,
                      n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0, prior_handoff_rho=0.5)
     model = VFEModel(cfg)
     tokens = torch.randint(0, 12, (2, 6))
     pl = model.diagnostics_per_layer(tokens)
-    for k in ("self_coupling", "belief_coupling", "attention_entropy", "total", "holonomy_deviation",
-              "gauge_trace_spread", "effective_rank", "belief_cond_median", "phi_norm_mean"):
-        assert k in pl and len(pl[k]) == 3                          # one value per layer
+    for k in ("effective_rank", "belief_cond_median", "phi_norm_mean", "attn_entropy"):
+        assert k in pl and len(pl[k]) == 3
         assert all(math.isfinite(v) for v in pl[k])
+    for k in ("self_coupling", "belief_coupling", "attention_entropy", "total",
+              "holonomy_deviation", "gauge_trace_spread"):
+        assert k in pl and len(pl[k]) == 3
+        assert all(math.isnan(v) for v in pl[k])
 
 
 def test_diagnostics_per_layer_attn_entropy_matches_attention_maps():
@@ -338,79 +226,16 @@ def test_diagnostics_per_layer_attn_entropy_matches_attention_maps():
         assert abs(pl["attn_entropy"][li] - float(metrics.attention_entropy(maps[li]))) < 1e-5
 
 
-def test_attention_maps_single_block_group_has_unit_head_axis():
-    # A single-irrep-block group (so_k) yields H=1: the energy is full-K (N,N) and the method
-    # inserts a unit head axis, so the result is still (L, 1, N, N) (uniform with the multi-head case).
-    cfg = test_config(vocab_size=12, embed_dim=4, n_heads=1, max_seq_len=5, n_layers=1,
-                     gauge_group="so_k", n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0)
-    model = VFEModel(cfg)
-    maps = model.attention_maps(torch.randint(0, 12, (2, 5)))
-    assert maps.shape == (1, 1, 5, 5)
+def test_model_rejects_single_block_attention() -> None:
+    with pytest.raises(ValueError, match="gauge_group"):
+        test_config(gauge_group="so_k", n_heads=1)
 
 
-def test_model_runs_under_sp_gauge_group():
-    # The symplectic Sp(2m,R) gauge (single-block, non-skew) must run end-to-end through the
-    # same model/E-step machinery: a forward + loss.backward() with targets yields a finite loss
-    # and finite, grad-connected gradients on the prior tables. embed_dim=4 (even, K=2m with m=2);
-    # n_heads=2 divides it for the multihead attention/decode (the gauge group itself is the
-    # single super-block sp(4)). Mirrors test_model_runs_under_cross_coupled_block_glk.
-    # A headless positional prior: the default causal_alibi builds an (n_heads, N, N) per-head
-    # bias, which the single-block sp group's energy head axis (1) fail-closed rejects.
-    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                     n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.05, m_phi_lr=0.01,
-                     gauge_group="sp", phi_precond_mode="none",
-                     beta_attention_prior="causal")
-    model = VFEModel(cfg)
-    assert model.group.generators.shape[0] == 2 * (2 * 2 + 1)   # m(2m+1) = 10 for m=2
-    assert model.group.irrep_dims == [4]
-    tok = torch.randint(0, 20, (3, 5)); tgt = torch.randint(0, 20, (3, 5))
-    _, loss, _ = model(tok, tgt)
-    loss.backward()
-    assert torch.isfinite(loss)
-    assert torch.isfinite(model.prior_bank.mu_embed.grad).all()
-    assert torch.isfinite(model.prior_bank.phi_embed.grad).all()
+def test_model_rejects_sp_gauge_group() -> None:
+    with pytest.raises(ValueError, match="gauge_group"):
+        test_config(gauge_group="sp")
 
 
-def test_model_runs_under_cross_coupled_block_glk():
-    # The cross-coupled block_glk gauge (config cross_couplings=[(0,1)]) must run end-to-end
-    # through the same model/E-step machinery: a forward + loss.backward() with targets yields a
-    # finite loss and finite, grad-connected gradients on the prior tables. This mirrors the
-    # verify-first check; it is the oracle that the wired cross-coupled path works end-to-end.
-    # Headless positional prior: cross-coupled block_glk collapses to one [K] block, so the
-    # default per-head causal_alibi bias is fail-closed rejected.
-    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                     n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.05, m_phi_lr=0.01,
-                     gauge_group="block_glk", cross_couplings=[(0, 1)],
-                     phi_precond_mode="none", beta_attention_prior="causal")
-    model = VFEModel(cfg)
-    # the cross-coupled group is the extended (larger-than-direct-sum) basis
-    d_head = cfg.embed_dim // cfg.n_heads
-    assert model.group.generators.shape[0] == 3 * d_head * d_head
-    tok = torch.randint(0, 20, (3, 5)); tgt = torch.randint(0, 20, (3, 5))
-    _, loss, _ = model(tok, tgt)
-    loss.backward()
-    assert torch.isfinite(loss)
-    assert torch.isfinite(model.prior_bank.mu_embed.grad).all()
-    assert torch.isfinite(model.prior_bank.phi_embed.grad).all()
-    assert model.prior_bank.mu_embed.grad.abs().sum() > 0
-    assert model.prior_bank.phi_embed.grad.abs().sum() > 0
-
-
-def test_phi_retraction_bch_is_reached_by_the_stack(monkeypatch) -> None:
-    import importlib
-    module = importlib.import_module("vfe3.inference.e_step")
-    original = module.e_step_iteration
-    seen: list[str] = []
-
-    def record(*args: object, **kwargs: object) -> object:
-        seen.append(kwargs["phi_retract_mode"])
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(module, "e_step_iteration", record)
-    grp = get_group("block_glk")(4, 2)
-    b = _belief(K=4, n_gen=grp.generators.shape[0])
-    cfg = test_config(embed_dim=4, n_heads=2, n_layers=1, n_e_steps=3,
-                    e_q_mu_lr=0.05, e_phi_lr=0.2)
-    out = vfe_stack(b, b.mu, b.sigma, grp, cfg)
-    assert seen == ["bch"] * 3
-    assert torch.isfinite(out.phi).all()
+def test_model_rejects_cross_coupled_block_glk() -> None:
+    with pytest.raises(ValueError, match="cross_couplings"):
+        test_config(cross_couplings=[(0, 1)])

@@ -130,8 +130,8 @@ def test_train_contract_still_allows_a_stride_above_seq_len():
 
 
 def _cfg(**kw) -> VFE3Config:
-    base = dict(vocab_size=16, embed_dim=4, max_seq_len=8, n_layers=1, n_heads=1,
-                gauge_group="glk", n_e_steps=1)
+    base = dict(vocab_size=16, embed_dim=4, max_seq_len=8, n_layers=1, n_heads=2,
+                gauge_group="block_glk", n_e_steps=1)
     base.update(kw)
     return test_config(**base)
 
@@ -229,8 +229,8 @@ def test_strided_eval_removes_the_head_of_window_context_starvation():
     from vfe3.train import evaluate
 
     seq_len = 8
-    cfg = test_config(vocab_size=12, embed_dim=4, max_seq_len=seq_len, n_layers=1, n_heads=1,
-                     gauge_group="glk", n_e_steps=2, batch_size=8)
+    cfg = test_config(vocab_size=12, embed_dim=4, max_seq_len=seq_len, n_layers=1, n_heads=2,
+                     gauge_group="block_glk", n_e_steps=2, batch_size=8)
     torch.manual_seed(0)
     model = VFEModel(cfg)
     tokens = torch.tensor([3, 7, 3, 9, 4]).repeat(160)[:800].clone()

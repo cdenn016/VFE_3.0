@@ -56,54 +56,6 @@ def _spd(N, K, gen):
     return A @ A.transpose(-1, -2) + K * torch.eye(K)
 
 
-def test_full_covariance_e_step_keeps_sigma_spd_and_symmetric():
-    """One full-covariance E-step iteration on a NON-diagonal SPD belief stays SPD + symmetric
-    (the affine-invariant retract_spd_full, not the elementwise diagonal retraction)."""
-    grp = get_group("glk")(3)
-    g = torch.Generator().manual_seed(0)
-    N, K = 4, 3
-    b = BeliefState(
-        mu=torch.randn(N, K, generator=g),
-        sigma=_spd(N, K, g),
-        phi=0.1 * torch.randn(N, grp.generators.shape[0], generator=g),
-    )
-    mu_p = torch.randn(N, K, generator=g)
-    sigma_p = _spd(N, K, g)
-    out = e_step_iteration(b, mu_p, sigma_p, grp, tau=1.5, e_q_mu_lr=0.05, e_q_sigma_lr=0.05,
-                           e_phi_lr=0.0, family="gaussian_full")
-    assert out.sigma.shape == (N, K, K)
-    assert torch.allclose(out.sigma, out.sigma.transpose(-1, -2), atol=1e-5)   # symmetric
-    assert (torch.linalg.eigvalsh(out.sigma) > 0).all()                        # stays SPD
-
-
-def test_full_covariance_reduces_to_diagonal_at_identity_transport():
-    """Golden gate: with Omega=I (phi=0) and a diagonal-initialised covariance, the full-cov
-    E-step's diagonal matches the diagonal-cov E-step (full generalises, not replaces, diagonal)."""
-    grp = get_group("glk")(3)
-    g = torch.Generator().manual_seed(1)
-    N, K = 4, 3
-    n_gen = grp.generators.shape[0]
-    mu = torch.randn(N, K, generator=g)
-    sigma_diag = torch.rand(N, K, generator=g) + 0.5
-    phi = torch.zeros(N, n_gen)                             # Omega = I
-    mu_p = torch.randn(N, K, generator=g)
-    sigma_p_diag = torch.rand(N, K, generator=g) + 0.5
-
-    out_diag = e_step_iteration(
-        BeliefState(mu=mu, sigma=sigma_diag, phi=phi), mu_p, sigma_p_diag, grp,
-        tau=1.5, e_q_mu_lr=0.05, e_q_sigma_lr=0.01, e_phi_lr=0.0, family="gaussian_diagonal",
-    )
-    out_full = e_step_iteration(
-        BeliefState(mu=mu, sigma=torch.diag_embed(sigma_diag), phi=phi),
-        mu_p, torch.diag_embed(sigma_p_diag), grp,
-        tau=1.5, e_q_mu_lr=0.05, e_q_sigma_lr=0.01, e_phi_lr=0.0, family="gaussian_full",
-    )
-    assert torch.allclose(out_full.mu, out_diag.mu, atol=1e-4)
-    diag_of_full = torch.diagonal(out_full.sigma, dim1=-2, dim2=-1)
-    assert torch.allclose(diag_of_full, out_diag.sigma, atol=1e-3)
-    assert (out_full.sigma - torch.diag_embed(diag_of_full)).abs().max() < 1e-4
-
-
 def test_full_kl_survives_non_pd_covariance():
     # The alpha=1 full-covariance KL must CLAMP (not raise) on a numerically non-PD covariance.
     # Such a prior covariance can arise after training shifts it, and full-cov configs route the

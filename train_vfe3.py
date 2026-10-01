@@ -123,8 +123,8 @@ config = dict(
     
     gradient_mode             = "filtering",   #"smoothing"
     
-    # Attention execution and projected input/output scopes.
-    attention_mode                   = "projected_predictive",  # "transported" | "projected_conditional" | "projected_predictive"
+    # Attention execution; all interfaces have full input/output.
+    attention_mode                   = "projected_predictive",  # "projected_predictive" | "projected_gradient"
 
 
     

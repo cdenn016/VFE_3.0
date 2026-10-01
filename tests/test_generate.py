@@ -35,8 +35,8 @@ def _tiny_model(seed: int = 0, **overrides) -> VFEModel:
     return VFEModel(cfg)
 
 
-def _projected_tiny_model(seed: int = 0, **overrides) -> VFEModel:
-    """A tiny legal projected-canonical model for decode/generation consumers."""
+def _reference_tiny_model(seed: int = 0, **overrides) -> VFEModel:
+    """A tiny full-Gaussian model with same-forward reference decoding."""
     base = dict(
         vocab_size=16,
         embed_dim=4,
@@ -49,10 +49,11 @@ def _projected_tiny_model(seed: int = 0, **overrides) -> VFEModel:
         oracle_unroll_grad=True,
         e_q_mu_lr=0.05,
         e_phi_lr=0.0,
-        family="gaussian_diagonal",
+        family="gaussian_full",
         transport_mode="flat",
         decode_mode="full_chunked",
-        encode_mode="canonical_content_projected",
+        encode_mode="per_token",
+        decode_coordinates="reference",
         lambda_alpha_mode="constant",
         pos_phi="learned",
         seed=seed,
@@ -139,7 +140,7 @@ def test_generate_decodes_only_last_position(monkeypatch):
 
 def test_projected_decode_last_matches_full_last_position_for_multitoken_context():
     """The last query and its frame must be sliced together, never from the first position."""
-    model = _projected_tiny_model(seed=17)
+    model = _reference_tiny_model(seed=17)
     model.eval()
     prompt = torch.tensor([[2, 7, 4], [5, 1, 9]], device=PROJECTED_DEVICE)
     capture: dict = {}
@@ -165,7 +166,7 @@ def test_projected_decode_last_matches_full_last_position_for_multitoken_context
 
 def test_projected_generation_recomputes_context_after_sequence_growth():
     """Every greedy step must decode the last position of its newly grown same-forward context."""
-    model = _projected_tiny_model(seed=23)
+    model = _reference_tiny_model(seed=23)
     model.eval()
     prompt = torch.tensor([[2, 7, 4], [5, 1, 9]], device=PROJECTED_DEVICE)
     expected = prompt.clone()

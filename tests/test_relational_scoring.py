@@ -137,34 +137,28 @@ def test_reduced_score_and_content_have_correct_live_derivatives() -> None:
     assert all(gradient.abs().max() > 1e-6 for gradient in gradients)
 
 
-def test_operator_initialization_identity_content_and_compact_frames() -> None:
+def test_operator_initialization_and_compact_frames() -> None:
     from vfe3.contracts import CanonicalFrameContext
     from vfe3.model.relational_operators import RelationalOperators
 
     rng_before = torch.random.get_rng_state().clone()
-    identity_content = RelationalOperators([3, 3], seed=7, identity_content=True).double()
     content = RelationalOperators([3, 3], seed=7).double()
     assert torch.equal(rng_before, torch.random.get_rng_state())
-    assert identity_content.content_factors() is None
     identity = torch.eye(3, dtype=torch.float64).expand(2, 3, 3)
-    # Score rows are orthonormal at construction; they are stored in the parameter dtype,
-    # so the residual is float32 rounding, not a projection error.
     S_q, S_k = content.comparison_pair()
     torch.testing.assert_close(S_q @ S_q.transpose(-1, -2), identity, atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(S_k @ S_k.transpose(-1, -2), identity, atol=1e-6, rtol=1e-6)
     T, O = content.content_factors()
-    B = O @ T
-    torch.testing.assert_close(B, identity, atol=1e-6, rtol=1e-6)
+    B = (O @ T).sum(0)
+    torch.testing.assert_close(B, torch.eye(6, dtype=torch.float64), atol=1e-6, rtol=1e-6)
     mu, _, U = _fixture()
     frame = CanonicalFrameContext(U, torch.linalg.inv(U), block_diagonal=True)
     flat_mu = mu.flatten(-2)
-    xi = content.canonical_mean(flat_mu, frame)
-    expected = (U @ (B @ xi.unsqueeze(-1))).squeeze(-1).flatten(-2)
-    torch.testing.assert_close(content.apply_content(flat_mu, frame), expected)
-    torch.testing.assert_close(identity_content.apply_content(flat_mu, frame), flat_mu)
+    beta = torch.eye(3, dtype=mu.dtype).expand(1, 2, 3, 3)
+    torch.testing.assert_close(content.predictive_content(flat_mu, beta, frame), flat_mu)
     dense_U = torch.stack([torch.block_diag(*entry) for entry in U[0]])[None]
     dense_frame = CanonicalFrameContext(dense_U, torch.linalg.inv(dense_U))
-    torch.testing.assert_close(content.apply_content(flat_mu, dense_frame), expected)
+    torch.testing.assert_close(content.predictive_content(flat_mu, beta, dense_frame), flat_mu)
 
 
 def test_operator_rejects_rank_loss_and_invalid_heads() -> None:
@@ -172,8 +166,8 @@ def test_operator_rejects_rank_loss_and_invalid_heads() -> None:
 
     with pytest.raises(ValueError, match="equal-sized"):
         RelationalOperators([3, 2], seed=1)
-    with pytest.raises(ValueError, match="identity_content"):
-        RelationalOperators([3], seed=1, identity_content=1)
+    with pytest.raises(TypeError, match="identity_content"):
+        RelationalOperators([3], seed=1, identity_content=True)
     degenerate = torch.ones(1, 3, 2)
     degenerate[..., 1] = degenerate[..., 0]
     with pytest.raises(ValueError, match="rank"):
@@ -216,7 +210,7 @@ def test_ill_conditioned_source_maps_preserve_projected_kl(smallest: float) -> N
     mu = torch.tensor([[[.2, .3, .7, .2, .3, .7], [.1, -.2, .4, .1, -.2, .4]]])
     inverse = torch.eye(3).expand(1, 2, 2, 3, 3)
     frame = CanonicalFrameContext(inverse, inverse, block_diagonal=True)
-    ops = RelationalOperators([3, 3], 0, input_scope='full', readout_mode='predictive_content', output_scope='full')
+    ops = RelationalOperators([3, 3], 0, readout_mode='predictive_content')
     with torch.no_grad():
         maps = torch.zeros(2, 3, 6)
         maps[0, :, :3] = S; maps[1, :, 3:] = S

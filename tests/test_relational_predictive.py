@@ -16,8 +16,8 @@ from tests.test_relational_integration import _cfg, _tokens
 @pytest.mark.parametrize("output_scope", ["full"])
 def test_predictive_dense_reference_and_source_gradients(output_scope: str) -> None:
     mu, sigma, _, frame, _, prior = _fixture()
-    ops = RelationalOperators([2, 2], 11, input_scope="full",
-                              readout_mode="predictive_content", output_scope=output_scope).double()
+    ops = RelationalOperators([2, 2], 11,
+                              readout_mode="predictive_content").double()
     with torch.no_grad():
         ops.T.copy_(torch.arange(16, dtype=mu.dtype).reshape(2, 2, 4) / 9 + .1)
         ops.O.copy_(torch.arange(ops.O.numel(), dtype=mu.dtype).reshape_as(ops.O) / 8 + .1)
@@ -42,8 +42,8 @@ def test_predictive_dense_reference_and_source_gradients(output_scope: str) -> N
 
 def test_predictive_readout_uses_a_separate_value_frame() -> None:
     mu, sigma, _, score_frame, _, prior = _fixture()
-    ops = RelationalOperators([2, 2], 11, input_scope="full",
-                              readout_mode="predictive_content", output_scope="full").double()
+    ops = RelationalOperators([2, 2], 11,
+                              readout_mode="predictive_content").double()
     with torch.no_grad():
         ops.T.copy_(torch.arange(16, dtype=mu.dtype).reshape(2, 2, 4) / 9 + .1)
         ops.O.copy_(torch.arange(ops.O.numel(), dtype=mu.dtype).reshape_as(ops.O) / 8 + .1)
@@ -59,8 +59,8 @@ def test_predictive_readout_uses_a_separate_value_frame() -> None:
 @pytest.mark.parametrize("name", ["raw_score_q", "raw_score_k", "T", "O"])
 def test_predictive_finite_difference(name: str) -> None:
     mu, sigma, _, frame, _, prior = _fixture()
-    ops = RelationalOperators([2, 2], 11, input_scope="full",
-                              readout_mode="predictive_content", output_scope="full").double()
+    ops = RelationalOperators([2, 2], 11,
+                              readout_mode="predictive_content").double()
     parameter = getattr(ops, name)
     def objective() -> torch.Tensor:
         return relational_predictive_readout(mu, sigma, frame, ops, tau=.9, log_prior=prior)[0, 2].square().sum()
@@ -79,8 +79,7 @@ def test_predictive_finite_difference(name: str) -> None:
     torch.testing.assert_close(derivative[index], (plus-minus)/2e-6, rtol=2e-5, atol=2e-8)
     assert derivative.abs().sum() > 1e-8
 def test_predictive_live_model_config_optimizer_and_diagnostics() -> None:
-    cfg = _cfg(relational_input_scope="full", attention_mode="projected_predictive",
-               relational_output_scope="full")
+    cfg = _cfg(attention_mode="projected_predictive")
     model = VFEModel(cfg)
     ids, targets = _tokens()
     cap = {}
@@ -102,9 +101,9 @@ def test_predictive_full_scope_accepts_rope_and_keeps_outer_gradients(
     rope_on_value: bool,
 ) -> None:
     cfg = _cfg(
-        relational_input_scope="full",
+
         attention_mode="projected_predictive",
-        relational_output_scope="full",
+
         pos_rotation="rope",
         rope_on_value=rope_on_value,
     )
@@ -119,22 +118,14 @@ def test_predictive_full_scope_accepts_rope_and_keeps_outer_gradients(
         assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
     assert torch.isfinite(cap["relational_capture"]["beta_pre"]).all()
 
-def test_invalid_predictive_combinations_are_rejected() -> None:
-    with pytest.raises(ValueError, match="predictive"):
-        _cfg(relational_output_scope="full")
-    with pytest.raises(ValueError, match="learned content"):
-        _cfg(attention_mode="projected_predictive", relational_input_scope="full",
-             relational_output_scope="full", relational_identity_content=True)
-    with pytest.raises(ValueError, match="predictive|conflict"):
-        legacy = asdict(_cfg())
-        legacy.pop("attention_mode")
-        legacy.update(relational_mode="off", relational_readout_mode="predictive_content")
-        config_from_serialized(legacy, source="invalid legacy pair")
+def test_retired_identity_content_option_is_rejected() -> None:
+    with pytest.raises(TypeError, match="relational_identity_content"):
+        _cfg(attention_mode="projected_predictive", relational_identity_content=True)
 
 
 def test_predictive_bypasses_fisher_step_and_uses_source_content_graph() -> None:
-    settings = dict(relational_input_scope="full", attention_mode="projected_predictive",
-                    relational_output_scope="full", use_block_mlp=False, use_head_mixer=False)
+    settings = dict(attention_mode="projected_predictive",
+                    use_block_mlp=False, use_head_mixer=False)
     first = VFEModel(_cfg(**settings, e_q_mu_lr=0.0))
     second = VFEModel(_cfg(**settings, e_q_mu_lr=9.0))
     second.load_state_dict(first.state_dict())
@@ -144,8 +135,8 @@ def test_predictive_bypasses_fisher_step_and_uses_source_content_graph() -> None
     torch.testing.assert_close(one.mu, two.mu, rtol=0, atol=0)
     torch.testing.assert_close(one.sigma, two.sigma, rtol=0, atol=0)
     mu, _, _, frame, _, _ = _fixture()
-    ops = RelationalOperators([2, 2], 11, input_scope="full",
-                              readout_mode="predictive_content", output_scope="full").double()
+    ops = RelationalOperators([2, 2], 11,
+                              readout_mode="predictive_content").double()
     beta = torch.zeros(1, 2, 3, 3, dtype=mu.dtype)
     beta[..., 2, 0] = 1.
     out = ops.predictive_content(mu, beta, frame)

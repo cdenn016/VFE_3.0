@@ -33,8 +33,8 @@ def _projected_surface(**overrides: object) -> dict:
         vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
         n_e_steps=1, family="gaussian_full",
         attention_mode="projected_predictive",
-        relational_input_scope="full", relational_output_scope="full",
-        attention_residual=True, relational_identity_content=False,
+
+        attention_residual=True,
         divergence_family="renyi", renyi_order=1.0, include_attention_entropy=True,
         gradient_mode="filtering", e_step_update="gradient",
         e_step_gradient="unroll", oracle_unroll_grad=True,
@@ -103,40 +103,10 @@ def test_projected_predictive_full_chunked_tiny_train_step() -> None:
     loss.backward()
 
 
-def test_projected_filtering_skip_false_does_not_typeerror() -> None:
-    """skip_belief_sigma_update=False on the conditional route must not hit float * None.
-
-    relational filtering returns grad_sigma=None by signature; the E-step now freezes
-    sigma when nat_sigma is None instead of retracting with a None step.
-    """
-    cfg = test_config(**_projected_surface(
-        attention_mode="projected_conditional",
-        relational_output_scope="head",
-        attention_residual=False,
-        skip_belief_sigma_update=False,
-    ))
-    torch.manual_seed(0)
-    model = VFEModel(cfg)
-    tokens = torch.randint(0, cfg.vocab_size, (2, 4))
-    belief, logits = model.forward_beliefs(tokens, return_logits=True)
-    assert torch.isfinite(logits).all()
-    assert belief.sigma.shape == belief.mu.shape or (
-        belief.sigma.dim() == belief.mu.dim() + 1
-    )
-
-
-def test_transported_linear_still_constructs() -> None:
-    """The pure-path (transported + linear) profile is unchanged by the envelope edit."""
-    cfg = tiny_config(
-        attention_mode="transported",
-        predictive_covariance="passthrough",
-        attention_residual=False,
-        relational_output_scope="head",
-        decode_mode="linear",
-        skip_belief_sigma_update=True,
-    )
-    assert cfg.decode_mode == "linear"
-    assert cfg.attention_mode == "transported"
+@pytest.mark.parametrize("mode", ["transported", "projected_conditional"])
+def test_retired_attention_does_not_construct(mode: str) -> None:
+    with pytest.raises(ValueError, match="retired"):
+        tiny_config(attention_mode=mode)
 
 
 def test_projected_still_rejects_non_gaussian_family() -> None:

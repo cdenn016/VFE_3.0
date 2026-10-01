@@ -13,8 +13,8 @@ def _baseline() -> dict:
     return config_values(vocab_size=7, embed_dim=4, n_heads=2, n_layers=1, n_e_steps=1,
                 max_seq_len=3, batch_size=2, max_steps=12, warmup_steps=1,
                 eval_stride=None, gauge_group="block_glk", pos_phi="none",
-                relational_input_scope="full",
-                attention_mode="projected_predictive", relational_output_scope="full",
+
+                attention_mode="projected_predictive",
                 use_block_mlp=True, block_mlp_expansion=2, kl_max=32.)
 
 

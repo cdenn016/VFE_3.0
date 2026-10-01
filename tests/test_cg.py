@@ -259,37 +259,9 @@ def test_cg_forward_selects_passthrough_vs_delta_full():
     assert not torch.allclose(sig_f, sigma)             # delta_full pushes covariance forward
 
 
-def _e2e_cfg(**kw):
-    base = dict(vocab_size=20, embed_dim=9, n_heads=3, max_seq_len=5, n_layers=1,
-                n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0,
-                gauge_group="so_n", group_n=3,
-                irrep_spec=[("l0", 1), ("l1", 1), ("l2", 1)],
-                phi_precond_mode="none")
-    base.update(kw)
-    return test_config(**base)
 
 
 def test_use_cg_coupling_rejected_off_towers():
     with pytest.raises(ValueError, match="use_cg_coupling"):
         test_config(vocab_size=8, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
                    gauge_group="block_glk", use_cg_coupling=True)
-
-
-def test_cg_model_step0_byte_identical_and_trains():
-    from vfe3.model.model import VFEModel
-    from vfe3.train import build_optimizer
-    tok = torch.randint(0, 20, (2, 5)); tgt = torch.randint(0, 20, (2, 5))
-    torch.manual_seed(0)
-    base = VFEModel(_e2e_cfg())
-    torch.manual_seed(0)
-    cg = VFEModel(_e2e_cfg(use_cg_coupling=True))
-    lg_base = base(tok); lg_cg = cg(tok)
-    assert torch.equal(lg_base, lg_cg)                  # zero-init: step 0 byte-identical
-    build_optimizer(cg, cg.cfg)                         # exact-coverage guard must pass
-    with torch.no_grad():
-        cg.cg_coupling.path_weights.add_(0.05)
-    _, loss, _ = cg(tok, tgt)
-    loss.backward()
-    assert torch.isfinite(loss)
-    assert torch.isfinite(cg.cg_coupling.path_weights.grad).all()
-    assert cg.cg_coupling.path_weights.grad.abs().sum() > 0

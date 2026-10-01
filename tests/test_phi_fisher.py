@@ -341,7 +341,7 @@ def test_realized_frame_velocity_is_covariant_under_the_type_position_split() ->
 _ACTIVE_ROUTE = dict(
     vocab_size=16, embed_dim=6, n_heads=2, max_seq_len=6, eval_stride=3, n_layers=2, batch_size=3,
     gauge_group="block_glk", family="gaussian_diagonal", attention_mode="projected_predictive",
-    relational_input_scope="full", relational_output_scope="full",
+
     predictive_covariance="moment_matched", pos_phi="learned", e_phi_lr=0.0,
     decode_mode="diagonal_chunked", untie_decode_bank=True, decode_coordinates="local",
     block_coordinates="local", norm_type_block="mahalanobis", use_block_mlp=True,
@@ -595,8 +595,9 @@ def test_fisher_group_policy_config_validation_and_inactive_marks() -> None:
             (dict(m_phi_fisher_rotation_weight=float("nan")), "m_phi_fisher_rotation_weight")):
         with pytest.raises(ValueError, match=message):
             _fisher_cfg(**overrides)
-    _fisher_cfg(family="gaussian_diagonal_exact")                       # layer-0 row is diag(s)
-    _fisher_cfg(gauge_group="glk", embed_dim=3, n_heads=1)
+    _fisher_cfg(family="gaussian_diagonal_exact", attention_mode="projected_predictive")                       # layer-0 row is diag(s)
+    with pytest.raises(ValueError, match="gauge_group"):
+        _fisher_cfg(gauge_group="glk", embed_dim=3, n_heads=1)
     inactive = test_config(m_phi_update_mode="adamw", m_phi_fisher_rotation_weight=2.0)
     assert inactive.m_phi_fisher_rotation_weight == 2.0
     assert "m_phi_fisher_rotation_weight" in inactive.inactive_fields()
@@ -614,4 +615,3 @@ def test_fisher_group_policy_config_validation_and_inactive_marks() -> None:
                            phi_group_trust_radius=0.1, phi_chart_max_norm=5.0,
                            phi_bch_residual_max=1e-6, phi_precond_mode="pullback",
                            phi_statistics_provider=lambda param, rows: None)
-

@@ -243,9 +243,9 @@ CONFIG: Dict[str, Any] = {
     "list_only":   False,
 
     # One sweep name, or None -> every sweep in SWEEP_ORDER.
-    # New attention suite: "new_attention_features" (8 arms x NEW_ATTENTION_SEEDS).
-    # Smaller subsets: "relational_features", "cross_block_features".
-    "sweep":       None,   #"new_attention_features" 8-arms,  shorter: "relational_features" 6-arms
+    # New attention suite: "new_attention_features" (4 arms x NEW_ATTENTION_SEEDS).
+    # Smaller subset: "relational_features".
+    "sweep":       None,   #"new_attention_features" 4-arms; "relational_features" is the same subset
 
 
     # 'auto' picks CUDA when present (the RTX 5090), else CPU.
@@ -311,8 +311,8 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     warmup_steps              = 100,
     deterministic             = True,
     
-    # Attention execution and projected input/output scopes.
-    attention_mode                   = "projected_predictive",  # "transported" | "projected_conditional" | "projected_predictive"
+    # Attention execution; all interfaces have full input/output.
+    attention_mode                   = "projected_predictive",  # "projected_predictive" | "projected_gradient"
 
 
     predictive_covariance_centering  = False,          # False: historical raw moments; True: center source means to reduce covariance cancellation
@@ -1011,7 +1011,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
 
 
 # Opt-in attention ablations. Keep BASELINE_CONFIG and SWEEP_ORDER unchanged.
-# Select CONFIG["sweep"] = "new_attention_features" or one of the four subsets below.
+# Select CONFIG["sweep"] = "new_attention_features" or "relational_features".
 # Ranks track the declared baseline width; other training/data settings remain live.
 NEW_ATTENTION_SEEDS = [6]  # use [6] for a one-seed screen
 _ATTENTION_REQUIRES = {
@@ -1023,42 +1023,18 @@ _ATTENTION_REQUIRES = {
     "gauge_transport": "on", "pos_rotation": "none",
     "encode_mode": "per_token", "decode_mode": "linear",
     "cross_couplings": None, "use_priorbank_head_evidence_mixer": False,
-    "attention_mode": "projected_predictive", "relational_input_scope": "full",
-    "relational_output_scope": "full",
+    "attention_mode": "projected_predictive",
     "m_relational_score_lr": None, "m_relational_content_lr": None,
-    "relational_identity_content": False,
     "use_head_mixer": True,
 }
-_ATTENTION_RELATIONAL_OFF = {"attention_mode": "transported", "relational_output_scope": "head",
-                             "predictive_covariance": "passthrough"}
-_ATTENTION_CROSS_CONTROL = {
-    **_ATTENTION_RELATIONAL_OFF, "use_head_mixer": False,
-    "beta_attention_prior": "causal",
-    # The residual belongs to projected predictive attention. The transported control
-    # disables it explicitly instead of inheriting the projected baseline's setting.
-    "attention_residual": False,
-}
-_ATTENTION_CROSS_PAIRS = [
-    (i, j) for i in range(BASELINE_CONFIG["n_heads"])
-    for j in range(BASELINE_CONFIG["n_heads"]) if i != j
-]
+# Conditional identity-content and transported cross-block controls were retired with
+# their architectures. They cannot be replaced by a projected-gradient label.
 _ATTENTION_ARMS = {
     "relational_features": [
         {"label": "relational_reference"},
-        # Dropping the learned content maps is defined only on the conditional-update readout;
-        # predictive_content requires learned content maps, and the residual in turn requires
-        # predictive_content, so this arm pins both of its own.
-        {"label": "relational_identity_content", "relational_identity_content": True,
-         "attention_mode": "projected_conditional", "relational_output_scope": "head",
-         "predictive_covariance": "passthrough", "attention_residual": False},
         {"label": "relational_no_head_mixer", "use_head_mixer": False},
         {"label": "relational_frozen_score", "m_relational_score_lr": 0.0},
         {"label": "relational_frozen_content", "m_relational_content_lr": 0.0},
-    ],
-    "cross_block_features": [
-        {**_ATTENTION_CROSS_CONTROL, "label": f"cross_block_{mode}_tied",
-         "cross_couplings": _ATTENTION_CROSS_PAIRS if mode == "dense" else None}
-        for mode in ("control", "dense")
     ],
 }
 for _attention_name, _attention_arms in _ATTENTION_ARMS.items():
@@ -1070,7 +1046,7 @@ for _attention_name, _attention_arms in _ATTENTION_ARMS.items():
         "configs": _attention_arms,
     }
 SWEEPS["new_attention_features"] = {
-    "description": "All 7 attention arms: relational features and cross-block controls",
+    "description": "Four full-width projected attention feature controls",
     "requires": _ATTENTION_REQUIRES,
     "seeds": NEW_ATTENTION_SEEDS,
     "schedule_seed": 20260913,

@@ -548,27 +548,12 @@ def test_divergence_functionals_registry_derived():
     assert names == tuple(sorted(names))
 
 
-def test_config_accepts_squared_hellinger_and_rejects_unknown():
-    test_config(divergence_family="squared_hellinger", lambda_alpha_mode="constant")     # accepted
-    test_config(divergence_family="renyi")                 # still accepted
-    with pytest.raises(ValueError):
-        test_config(divergence_family="no_such_functional")
+@pytest.mark.parametrize("name", ["squared_hellinger", "bhattacharyya", "jeffreys", "no_such_functional"])
+def test_projected_config_rejects_non_kl_functionals(name: str) -> None:
+    with pytest.raises(ValueError, match="divergence_family"):
+        test_config(divergence_family=name, lambda_alpha_mode="constant")
 
 
-def test_model_forward_under_squared_hellinger():
-    """End-to-end: a VFEModel forward + finite loss with the new functional flowing through
-    pairwise_energy / self_divergence."""
-    from vfe3.model.model import VFEModel
-    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=2,
-                     n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0,
-                     divergence_family="squared_hellinger", lambda_alpha_mode="constant")
-    model = VFEModel(cfg)
-    tokens = torch.randint(0, 20, (3, 5))
-    targets = torch.randint(0, 20, (3, 5))
-    logits = model(tokens)
-    assert logits.shape == (3, 5, 20)
-    _, loss, _ = model(tokens, targets)
-    assert loss.shape == () and torch.isfinite(loss)
 
 
 # --- bhattacharyya and jeffreys (added 2026-06-13: extend the f-divergence registry) -----------
@@ -631,20 +616,3 @@ def test_new_divergence_self_is_zero(name, family):
     fam = get_family(family)
     out = get_functional(name)(fam(mu, sigma), fam(mu, sigma))
     assert torch.allclose(out, torch.zeros(4), atol=1e-5)
-
-
-@pytest.mark.parametrize("name", ["bhattacharyya", "jeffreys"])
-def test_model_forward_under_new_divergence(name):
-    """End-to-end: a VFEModel forward + finite loss with the new functional flowing through
-    pairwise_energy / self_divergence (the autograd-oracle route, as for squared_hellinger)."""
-    from vfe3.model.model import VFEModel
-    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=2,
-                     n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0, divergence_family=name)
-    model = VFEModel(cfg)
-    tokens = torch.randint(0, 20, (3, 5))
-    targets = torch.randint(0, 20, (3, 5))
-    assert model(tokens).shape == (3, 5, 20)
-    _, loss, _ = model(tokens, targets)
-    assert loss.shape == () and torch.isfinite(loss)
-    loss.backward()
-    assert model.prior_bank.mu_embed.grad is not None   # belief/prior table must get gradient (t7: was a weak OR)

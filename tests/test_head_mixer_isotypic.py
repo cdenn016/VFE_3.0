@@ -82,23 +82,3 @@ def test_old_single_component_state_dict_still_loads():
     old_style = {"mixer_delta": 0.25 * torch.ones(3, 3)}
     m.load_state_dict(old_style)
     assert torch.allclose(m.mixer_deltas[0], 0.25 * torch.ones(3, 3))
-
-
-def test_so_n_mixed_tower_model_constructs_with_mixer_and_trains():
-    from vfe3.model.model import VFEModel
-    cfg = test_config(vocab_size=20, embed_dim=8, n_heads=2, max_seq_len=5, n_layers=1,
-                     n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0,
-                     gauge_group="so_n", group_n=3,
-                     irrep_spec=[("l0", 1), ("l1", 1), ("l0", 1), ("l1", 1)],
-                     use_head_mixer=True, phi_precond_mode="none",
-                     # headless prior: a per-head alibi bias needs n_heads == 4 irrep blocks
-                     beta_attention_prior="causal")
-    model = VFEModel(cfg)                       # pre-fix: raises (unequal dims [1,3,1,3])
-    assert [tuple(d.shape) for d in model.head_mixer.mixer_deltas] == [(1, 1), (1, 1), (1, 1), (1, 1)]
-    with torch.no_grad():
-        model.head_mixer.mixer_deltas[1].fill_(0.1)
-    tok = torch.randint(0, 20, (2, 5)); tgt = torch.randint(0, 20, (2, 5))
-    _, loss, _ = model(tok, tgt)
-    loss.backward()
-    assert torch.isfinite(loss)
-    assert torch.isfinite(model.head_mixer.mixer_deltas[1].grad).all()

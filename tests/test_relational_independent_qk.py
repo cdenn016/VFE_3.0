@@ -13,11 +13,11 @@ from tests.test_relational_integration import _cfg, _tokens
 
 def test_separate_maps_match_distribution_oracle_and_have_free_scales() -> None:
     mu, sigma, _, frame, _, _ = _fixture()
-    ops = RelationalOperators([2, 2], 11, identity_content=True).double()
+    ops = RelationalOperators([2, 2], 11).double()
     S_q, S_k = ops.comparison_pair()
     assert S_q.data_ptr() != S_k.data_ptr()
     assert not torch.equal(S_q, S_k)
-    assert {name for name, _ in ops.named_parameters()} == {"raw_score_q", "raw_score_k"}
+    assert {name for name, _ in ops.named_parameters()} == {"raw_score_q", "raw_score_k", "T", "O"}
     # Scaling Q is a learned degree of freedom, including at full rank.
     with torch.no_grad():
         ops.raw_score_q.mul_(1.3)
@@ -29,7 +29,7 @@ def test_separate_maps_match_distribution_oracle_and_have_free_scales() -> None:
             for j in range(3):
                 distributions = []
                 for token, S in ((i, S_q[h]), (j, S_k[h])):
-                    part = slice(2*h, 2*h+2)
+                    part = slice(0, 4)
                     L = S @ frame.inverse[0, token, part, part]
                     mean = L @ mu[0, token, part]
                     covariance = L @ torch.diag(sigma[0, token, part]) @ L.T
@@ -42,7 +42,7 @@ def test_separate_maps_match_distribution_oracle_and_have_free_scales() -> None:
 
 
 def test_optimizer_updates_both_roles_and_reports_counts() -> None:
-    cfg = _cfg(relational_identity_content=True)
+    cfg = _cfg()
     model = VFEModel(cfg)
     ops = model.relational_operators
     before = [p.detach().clone() for p in (ops.raw_score_q, ops.raw_score_k)]
@@ -54,6 +54,6 @@ def test_optimizer_updates_both_roles_and_reports_counts() -> None:
     for old, new in zip(before, (ops.raw_score_q, ops.raw_score_k)):
         assert not torch.equal(old, new)
     meta = _relational_artifact_fields(cfg)["relational_operators"]
-    assert meta["parameter_counts"]["score"] == 2*2*2*2      # 2 roles x H x d_head x d_head
-    assert meta["score_role_parameter_counts"] == {"q": 8, "k": 8}
-    assert meta["content_mode"] == "identity"
+    assert meta["parameter_counts"]["score"] == 2*2*2*4      # 2 roles x H x d_head x K
+    assert meta["score_role_parameter_counts"] == {"q": 16, "k": 16}
+    assert meta["content_mode"] == "full_width"

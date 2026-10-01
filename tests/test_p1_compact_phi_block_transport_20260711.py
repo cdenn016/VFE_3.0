@@ -705,39 +705,10 @@ def test_compact_phi_block_transport_keeps_bch_retraction_packed_and_matches_vjp
     assert torch.allclose(compact_grad[1], legacy_grad[1], atol=2e-6, rtol=1e-5)
 
 
-@pytest.mark.parametrize(
-    ("route", "expected"),
-    [("eligible", True)],
-)
-def test_model_threads_automatic_route_into_live_phi_bch_retraction(
-    monkeypatch: pytest.MonkeyPatch,
-    route:       str,
-    expected:    bool,
-) -> None:
-    values: dict[str, object] = {
-        "vocab_size": 9,
-        "embed_dim": 4,
-        "n_heads": 2,
-        "max_seq_len": 3,
-        "n_layers": 1,
-        "n_e_steps": 1,
-        "e_phi_lr": 0.01,
-        # phi_retract_mode was retired with the fixed-loop controls: BCH is the only route.
-        "pos_phi": "none",
-    }
-    cfg = test_config(**values)
-    model = VFEModel(cfg).eval()
-    seen: list[bool] = []
-    original = e_step_module.retract_phi
-
-    def _spy(*args: object, **kwargs: object) -> torch.Tensor:
-        seen.append(bool(kwargs.get("compact_blocks", False)))
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(e_step_module, "retract_phi", _spy)
-    model(torch.tensor([[0, 1, 2]]))
-
-    assert seen == [expected]
+def test_projected_model_rejects_inner_phi_updates() -> None:
+    with pytest.raises(ValueError, match="e_phi_lr"):
+        test_config(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=3,
+                    n_layers=1, n_e_steps=1, e_phi_lr=0.01, pos_phi="none")
 
 
 @pytest.mark.parametrize("route", ["glk", "tied", "cross", "single_head", "block_glk"])

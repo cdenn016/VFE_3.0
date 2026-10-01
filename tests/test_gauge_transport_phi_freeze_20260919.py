@@ -29,7 +29,7 @@ from tests.test_relational_integration import _cfg, _tokens
 # the same minimal projected_filtering config the retirement suite anchors its live-frame contract
 # on, which keeps the 'on' control below a known-good reference rather than a fresh guess.
 def _model(**overrides: Any) -> tuple[VFEModel, Any]:
-    cfg = _cfg(relational_input_scope="full", use_head_mixer=False, use_block_mlp=False, **overrides)
+    cfg = _cfg(use_head_mixer=False, use_block_mlp=False, **overrides)
     torch.manual_seed(11)
     return VFEModel(cfg), cfg
 

@@ -2,7 +2,7 @@ from tests.profiles import test_config
 import torch
 
 from vfe3.model.model import VFEModel
-from vfe3.viz.extract import across_layer_belief_trace, converged_state
+from vfe3.viz.extract import across_layer_belief_trace, readout_state
 
 
 def _canonical_cfg():
@@ -35,7 +35,7 @@ def test_canonical_frame_mode_replays_all_model_diagnostics():
     diagnostics = model.diagnostics(tokens)
     attention = model.attention_maps(tokens)
     per_layer = model.diagnostics_per_layer(tokens)
-    converged = converged_state(model, tokens)
+    converged = readout_state(model, tokens)
     layer_trace = across_layer_belief_trace(model, tokens)
 
     assert snapshot.stack_output.mu.shape == (1, 4, 4)

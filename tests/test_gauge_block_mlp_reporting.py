@@ -36,7 +36,7 @@ def _pure_cfg(mode, covariance="passthrough"):
 def test_pure_path_report_distinguishes_strict_gate_from_frame_fixed_mode():
     reference_kwargs = dict(
         attention_mode="projected_predictive", decode_coordinates="reference",
-        relational_input_scope="full", relational_output_scope="full",
+
         e_step_gradient="unroll", oracle_unroll_grad=True,
     )
     gate = _pure_path_report(

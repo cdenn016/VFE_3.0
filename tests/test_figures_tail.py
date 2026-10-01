@@ -111,7 +111,8 @@ def test_val_builder_resid_logged_with_head_mixer(tmp_path):
         rows = list(_csv.DictReader(fh))
     assert rows and "val_builder_resid" in rows[0]
     finite = [r for r in rows if r["val_builder_resid"] not in ("", "nan", None)]
-    assert finite, "an eval row must carry a finite builder residual under a head mixer"
+    assert not finite, "the legacy builder certificate is unavailable on projected attention"
+    assert any(r["val_relational_receiver_cost_after"] not in ("", "nan", None) for r in rows)
 
 
 # --------------------------------------------------------------------------- driver smokes

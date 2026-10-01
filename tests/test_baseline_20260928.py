@@ -75,7 +75,7 @@ def _vcfg(**over: Any) -> VFE3Config:
         generate_embedding_figures=False, pos_phi="learned", use_block_mlp=True,
         block_mlp_expansion=E, beta_attention_prior="causal_alibi", family="gaussian_diagonal",
         gauge_group="block_glk", attention_mode="projected_predictive", attention_residual=True,
-        relational_input_scope="full", relational_output_scope="full", decode_mode="linear",
+        decode_mode="linear",
         # pinned: independent of the config defaults the WIP flips
         norm_type_block="layernorm", layernorm_affine=True, skip_belief_sigma_update=True)
     values.update(over)
@@ -252,8 +252,6 @@ def test_context_processing_count_against_a_tiny_vfe_model() -> None:
         assert getattr(bcfg, name) == getattr(vcfg, name), name
     assert bcfg.mlp_expansion == E and bcfg.model_family == MODEL_FAMILY
     assert BaselineConfig.matched_to({"config": serialize_config(vcfg)}) == bcfg
-    with pytest.raises(ValueError, match="full"):
-        BaselineConfig.matched_to(_vcfg(relational_input_scope="head", relational_output_scope="head"))
 
 
 def test_block_read_table_has_the_frame_table_size() -> None:

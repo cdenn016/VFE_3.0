@@ -88,7 +88,7 @@ def _logits(model: VFEModel, tokens: torch.Tensor) -> torch.Tensor:
 LAYERNORM = dict(norm_type_block="layernorm", layernorm_affine=True, norm_type_final="layernorm")
 CONFIGS = {
     "mlp_only_head_scope":   {},
-    "layernorm_full_scope":  dict(LAYERNORM, relational_input_scope="full", relational_output_scope="full"),
+    "layernorm_full_scope":  dict(LAYERNORM, ),
     "template_mlp":          dict(norm_type_block="layernorm", norm_type_final="layernorm",
                                   block_mlp_mode="gaussian_template"),
     "full_family_gaussian_decode": dict(family="gaussian_full", decode_mode="full_chunked",
@@ -142,7 +142,7 @@ def test_single_roles_are_exact_identities_when_frames_are_identity(name: str) -
 
 @pytest.mark.parametrize("name", ["layernorm_full_scope", "template_mlp"])
 def test_rows_change_the_output_and_restore_the_model_bit_exactly(name: str) -> None:
-    from vfe3.gradients import qkv, relational
+    from vfe3.gradients import relational
     from vfe3.model import model as model_module
     from vfe3.model import stack as stack_module
 
@@ -165,7 +165,7 @@ def test_rows_change_the_output_and_restore_the_model_bit_exactly(name: str) -> 
     assert np.array_equal(_nll(model, dataset), base)
     assert all(torch.equal(before[k], v) for k, v in model.state_dict().items())
     assert model_module.vfe_stack is stack_module.vfe_stack
-    assert relational.relational_score is score and getattr(qkv, "relational_score", score) is score
+    assert relational.relational_score is score
     assert "_decode_belief_with_context" not in vars(model) and model.final_norm is final_norm
 
 
@@ -325,9 +325,6 @@ def _not_applicable(model: VFEModel, row: int) -> str:
 
 
 def test_not_applicable_routes() -> None:
-    transported = _model(_cfg(attention_mode="transported", attention_residual=False, relational_output_scope="head"))
-    for row in ROW_KEYS:
-        assert "projected predictive" in _not_applicable(transported, row)
     gaussian_decode = _model(_cfg(family="gaussian_full", decode_mode="full_chunked"))
     assert "linear decoder" in _not_applicable(gaussian_decode, 12)
     moment_matched = _model(_cfg(predictive_covariance="moment_matched"))

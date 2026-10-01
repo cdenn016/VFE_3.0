@@ -20,8 +20,7 @@ def _cfg(**overrides: Any) -> VFE3Config:
                   e_phi_lr=0.0, oracle_unroll_grad=True, warmup_steps=0,
                   max_steps=2, log_interval=0, eval_interval=0,
                   pos_phi="learned", use_head_mixer=True, use_block_mlp=True,
-                  block_mlp_expansion=1, attention_mode="projected_conditional",
-                  relational_input_scope="head", relational_output_scope="head",
+                  block_mlp_expansion=1, attention_mode="projected_gradient",
                   attention_residual=False, predictive_covariance="passthrough")
     values.update(overrides)
     return test_config(**values)
@@ -50,37 +49,24 @@ def test_real_forward_uses_router_content_and_live_outer_gradients() -> None:
     assert torch.equal(changed.sigma, belief.sigma)
 
 
-def test_disabled_mode_has_no_parameters_or_rng_effect() -> None:
-    cfg = _cfg(attention_mode="transported")
-    torch.manual_seed(91)
-    first = VFEModel(cfg)
-    expected_rng = torch.random.get_rng_state()
-    torch.manual_seed(91)
-    second = VFEModel(cfg)
-    assert torch.equal(expected_rng, torch.random.get_rng_state())
-    assert first.relational_operators is None
-    assert not any(k.startswith("relational_operators.") for k in first.state_dict())
-    ids, _ = _tokens()
-    torch.testing.assert_close(first.forward_beliefs(ids, return_logits=False)[0].mu, second.forward_beliefs(ids, return_logits=False)[0].mu)
+@pytest.mark.parametrize("mode", ["transported", "projected_conditional"])
+def test_retired_attention_modes_are_rejected(mode: str) -> None:
+    with pytest.raises(ValueError, match="retired"):
+        _cfg(attention_mode=mode)
 
 
-@pytest.mark.parametrize("identity_content", [False, True])
-def test_optimizer_owns_each_parameter_once(identity_content: bool) -> None:
-    cfg = _cfg(relational_identity_content=identity_content,
-               m_relational_score_lr=0.0,
-               m_relational_content_lr=None if identity_content else 0.002)
+def test_optimizer_owns_each_parameter_once() -> None:
+    cfg = _cfg(m_relational_score_lr=0.0, m_relational_content_lr=0.002)
     model = VFEModel(cfg)
     optimizer = build_optimizer(model, cfg)
     parameters = [p for group in optimizer.param_groups for p in group['params']]
     assert len(parameters) == len({id(p) for p in parameters})
     assert {id(p) for p in parameters} == {id(p) for p in model.parameters() if p.requires_grad}
     roles = {g.get('lr_aux_role'): g for g in optimizer.param_groups}
-    assert 'relational_score' in roles
-    assert ('relational_content' in roles) == (not identity_content)
+    assert 'relational_score' in roles and 'relational_content' in roles
     rates = _learning_rates_by_aux_role(optimizer.param_groups, [g['lr'] for g in optimizer.param_groups])
     assert rates['relational_score'] == 0.0
-    if not identity_content:
-        assert rates['relational_content'] == 0.002
+    assert rates['relational_content'] == 0.002
 
 
 def test_checkpoint_restores_operator_and_optimizer_state(tmp_path: Path) -> None:
@@ -104,7 +90,7 @@ def test_checkpoint_restores_operator_and_optimizer_state(tmp_path: Path) -> Non
 
 
 @pytest.mark.parametrize("autocast", [False, True])
-def test_snapshot_reports_actual_conditional_semantics(autocast: bool) -> None:
+def test_snapshot_reports_actual_receiver_semantics(autocast: bool) -> None:
     model = VFEModel(_cfg())
     ids, targets = _tokens()
     with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
@@ -112,12 +98,15 @@ def test_snapshot_reports_actual_conditional_semantics(autocast: bool) -> None:
     assert snapshot.relational_capture is not None
     assert snapshot.trace_free_energy.numel() == 0
     diagnostics = model.diagnostics(ids, snapshot=snapshot)
-    assert diagnostics["relational_semantics"] == "relational_projected_conditional_filtering"
+    assert diagnostics["relational_semantics"] == "relational_full_link_frozen_filtering"
     assert diagnostics["relational_legacy_global_f_available"] == 0.0
     assert diagnostics["relational_covariance_repair_count"] == 0.0
     trajectory = e_step_belief_trace(model, ids, snapshot=snapshot)
     assert trajectory['free_energy_available'] is False
-    assert 'relational_conditional_cost_before' in trajectory
+    assert trajectory['inference_semantics'] == model.conditional_semantics
+    for field in ("relational_receiver_cost_before", "relational_receiver_cost_after"):
+        assert diagnostics[field] == pytest.approx(float(snapshot.relational_capture[field]))
+        assert torch.isfinite(torch.tensor(diagnostics[field]))
     health = numerical_health(model, ids, snapshot=snapshot)
     assert health['nan_energy'] == health['nan_beta'] == 0
     validation = _val_diagnostics_one(model, (ids, targets), torch.device("cpu"))

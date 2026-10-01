@@ -110,8 +110,8 @@ def test_tiled_projection_keeps_source_factor_recovery(monkeypatch: pytest.Monke
 @pytest.mark.parametrize("input_scope", ["full"])
 def test_full_output_contraction_matches_expanded_reference(compact: bool, input_scope: str) -> None:
     torch.manual_seed(83)
-    operators = RelationalOperators([2, 2], 9, input_scope=input_scope,
-                                    readout_mode="predictive_content", output_scope="full").double()
+    operators = RelationalOperators([2, 2], 9,
+                                    readout_mode="predictive_content").double()
     with torch.no_grad():
         operators.O.add_(torch.randn_like(operators.O) * .1)
     mu = torch.randn(1, 3, 4, dtype=torch.float64).requires_grad_()
@@ -140,8 +140,8 @@ def _configuration(**overrides: Any) -> VFE3Config:
                     max_steps=2, log_interval=0, eval_interval=0,
                     decode_temperature_learned=False,
                     use_head_mixer=False, use_block_mlp=False,
-                    attention_mode="projected_predictive", relational_input_scope="full",
-                    relational_output_scope="full", prior_handoff_rho=.7, prior_handoff_sigma=.4)
+                    attention_mode="projected_predictive",
+                    prior_handoff_rho=.7, prior_handoff_sigma=.4)
     settings.update(overrides)
     return test_config(**settings)
 
@@ -179,11 +179,11 @@ def test_omitted_handoff_preserves_model_outputs_and_gradients(monkeypatch: pyte
 def test_handoff_guard_requires_unobserved_all_predictive_layers() -> None:
     cfg = _configuration()
     predictive = RelationalOperators([2, 2], 2, readout_mode="predictive_content")
-    conditional = RelationalOperators([2, 2], 2)
+    gradient = RelationalOperators([2, 2], 2, readout_mode="full_link_update")
     admit = stack_module._can_omit_prior_handoff
     assert admit(cfg, None, None, None, predictive, None)
     assert admit(cfg, None, None, None, None, [predictive, predictive])
-    assert not admit(cfg, None, None, None, None, [predictive, conditional])
+    assert not admit(cfg, None, None, None, None, [predictive, gradient])
     assert not admit(cfg, None, None, None, None, None)
     assert not admit(cfg, {}, None, None, predictive, None)
     assert not admit(cfg, None, {}, None, predictive, None)
@@ -250,7 +250,7 @@ def test_full_input_router_tiling_autocast_and_recomputed_gradients(
 ) -> None:
     from vfe3.gradients.relational import relational_score
     torch.manual_seed(37)
-    operators = RelationalOperators([2, 2], 9, input_scope="full")
+    operators = RelationalOperators([2, 2], 9)
     mu = torch.randn(1, 3, 4) * .1
     sigma = torch.rand(1, 3, 4) + 1.
     if full:
