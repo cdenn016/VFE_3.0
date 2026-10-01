@@ -130,7 +130,24 @@ def test_full_input_conditional_outer_gradient_finite_difference(name: str) -> N
     torch.testing.assert_close(expected, finite_difference, rtol=2e-4, atol=2e-7)
 
 
-@pytest.mark.parametrize("value", [None, True, "global"])
+@pytest.mark.parametrize("value", [True, "global"])
 def test_invalid_input_scope_rejected(value: object) -> None:
     with pytest.raises(ValueError, match="relational_input_scope"):
         _cfg(relational_input_scope=value)
+
+
+@pytest.mark.parametrize("mode", ["projected_conditional", "projected_predictive", "projected_gradient"])
+def test_unspecified_scopes_score_like_the_explicit_mode_defaults(mode: str) -> None:
+    """None resolves the same read/write maps as the mode's explicit valid scopes."""
+    scope = "head" if mode == "projected_conditional" else "full"
+    automatic = _cfg(attention_mode=mode, relational_input_scope=None, relational_output_scope=None)
+    explicit = _cfg(attention_mode=mode, relational_input_scope=scope, relational_output_scope=scope)
+    mu, sigma, _, frame, _, _ = _fixture()
+    operators = [
+        RelationalOperators([2, 2], 17, readout_mode=cfg.relational_readout_mode,
+                            input_scope=cfg.relational_input_scope, output_scope=cfg.relational_output_scope).double()
+        for cfg in (automatic, explicit)
+    ]
+    torch.testing.assert_close(
+        relational_score(mu, sigma, mu, sigma, frame, operators[0]),
+        relational_score(mu, sigma, mu, sigma, frame, operators[1]), rtol=0, atol=0)

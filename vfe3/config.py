@@ -367,13 +367,14 @@ class VFE3Config:
     # One attention selector chooses transported inference, conditional projected updates, or
     # predictive projected content. Projection ranks still follow the gauge block dimensions.
     # Projected attention requires the explicit support envelope validated below.
-    attention_mode:                      str           = "transported"          # "transported" | "projected_conditional" | "projected_predictive"
-    relational_input_scope:              Optional[str] = None                 # conditional only: "head" | "full"; predictive is fixed "full"
-    relational_output_scope:             Optional[str] = None                 # conditional: "head"; predictive is fixed "full"
+    attention_mode:                      str           = "transported"          # "transported" | "projected_conditional" | "projected_predictive" | "projected_gradient"
+    relational_input_scope:              Optional[str] = None                 # conditional: "head" | "full"; predictive/gradient are fixed "full"
+    relational_output_scope:             Optional[str] = None                 # conditional: "head"; predictive/gradient are fixed "full"
     attention_residual:                  bool          = False                  # requires predictive_content
     relational_output_init:              str           = "identity"             # "identity" | "depth_scaled" (initial O times 1/sqrt(2 n_layers))
 
     relational_identity_content:         bool          = False                  # predictive_content requires learned content maps
+    relational_receiver_noise:           float         = 1.0                   # projected_gradient: Q_h = variance * I in reference coordinates
     relational_routing:                  str           = "gaussian_kl"          # "gaussian_kl" | "noisy_query" (projected_predictive only)
     # Belief covariance after the predictive readout. "passthrough" keeps the incoming covariance
     # (a per-token-type routing state); "moment_matched" replaces it by the exact moment-matched
@@ -881,8 +882,9 @@ class VFE3Config:
                     )
 
         # Validate the declared relational envelope before downstream selector coercions.
-        _require(self.attention_mode, ("transported", "projected_conditional", "projected_predictive"), "attention_mode")
-        default_scope = "full" if self.attention_mode == "projected_predictive" else "head"
+        _require(self.attention_mode, ("transported", "projected_conditional", "projected_predictive", "projected_gradient"), "attention_mode")
+        full_link = self.attention_mode == "projected_gradient"
+        default_scope = "full" if self.attention_mode in ("projected_predictive", "projected_gradient") else "head"
         if self.relational_input_scope is None:
             self.relational_input_scope = default_scope
         if self.relational_output_scope is None:
@@ -898,9 +900,9 @@ class VFE3Config:
             raise ValueError(
                 "projected_predictive fixes relational_input_scope and relational_output_scope "
                 "to 'full'; historical head predictive configurations require explicit conversion")
-        if self.relational_output_scope == "full" and self.attention_mode != "projected_predictive":
+        if self.relational_output_scope == "full" and self.attention_mode not in ("projected_predictive", "projected_gradient"):
             raise ValueError("relational_output_scope='full' requires predictive_content")
-        if self.attention_mode == "projected_predictive" and self.relational_identity_content:
+        if self.attention_mode in ("projected_predictive", "projected_gradient") and self.relational_identity_content:
             raise ValueError("predictive_content requires learned content maps")
         _require(self.relational_routing, ("gaussian_kl", "noisy_query"), "relational_routing")
         if self.relational_routing == "noisy_query" and self.attention_mode != "projected_predictive":
@@ -916,6 +918,13 @@ class VFE3Config:
             raise ValueError(
                 "predictive_covariance_floor must be a finite real value > 0, "
                 f"got {self.predictive_covariance_floor!r}")
+        if (isinstance(self.relational_receiver_noise, bool)
+                or not isinstance(self.relational_receiver_noise, Real)
+                or not math.isfinite(float(self.relational_receiver_noise))
+                or self.relational_receiver_noise <= 0.0):
+            raise ValueError("relational_receiver_noise must be a finite positive reference variance")
+        if full_link and (self.relational_input_scope != "full" or self.relational_output_scope != "full"):
+            raise ValueError("projected_gradient requires full relational input and output scopes")
         for name in ("m_relational_score_lr", "m_relational_content_lr"):
             rate = getattr(self, name)
             if rate is not None and (
@@ -931,6 +940,11 @@ class VFE3Config:
                 "n_e_steps": 1,
                 "e_phi_lr": 0.0, "transport_mode": "flat", "gauge_group": "block_glk",
             }
+            if full_link:
+                # Each receiver episode uses one incoming router/source snapshot and can
+                # take multiple Fisher steps with the same live outer context.
+                requirements.pop("n_e_steps")
+                requirements.update(lambda_alpha_mode="constant", e_step_mu_precond="fisher")
             # encode_mode admits 'per_token_additive' beside 'per_token': the additive encoder
             # zeroes the token frame and moves the same learned (V, n_gen) phi table into a mean
             # shift, which is the capacity-matched Omega = I control for a gauge on/off contrast on
@@ -939,7 +953,7 @@ class VFE3Config:
             # (pos_phi='none', pos_rotation='none') is enforced after the gauge_transport
             # coercion below, which can itself supply pos_phi='none'.
             # skip_belief_sigma_update is deliberately ABSENT from the envelope above: it is INERT
-            # on every projected route, not incompatible. 'projected_predictive' replaces the mean
+            # on the preexisting projected routes, not incompatible. projected_gradient reads it. 'projected_predictive' replaces the mean
             # and, by predictive_covariance, either keeps covariance (passthrough: e_step.py assigns
             # sigma = belief.sigma) or assigns the predictive kernel's moment-matched covariance
             # (moment_matched); neither reads the flag. 'projected_conditional' filtering returns grad_sigma=None by
@@ -973,6 +987,8 @@ class VFE3Config:
             if self.family not in ("gaussian_diagonal", "gaussian_full",
                                    "gaussian_diagonal_exact", "gaussian_frame_diagonal"):
                 incompatible.append(f"family={self.family!r} (requires a supported Gaussian family)")
+            if full_link and self.family not in ("gaussian_diagonal", "gaussian_full"):
+                incompatible.append(f"family={self.family!r} (projected_gradient requires gaussian_diagonal or gaussian_full)")
             # Predictive content composes through the existing stack; conditional updates
             # retain their original single-layer support envelope.
             if self.attention_mode == "projected_conditional" and self.n_layers != 1:
@@ -2524,7 +2540,7 @@ class VFE3Config:
         predictive_moment_matched = (self.attention_mode == "projected_predictive"
                                      and self.predictive_covariance == "moment_matched")
         if self.decode_mode != "linear" and not predictive_moment_matched and (
-            self.skip_belief_sigma_update or self.attention_mode != "transported"
+            self.skip_belief_sigma_update or self.attention_mode in ("projected_conditional", "projected_predictive")
         ):
             import warnings
             frozen_by = (
@@ -2536,7 +2552,7 @@ class VFE3Config:
                 f"prior-bank decode with frozen belief sigma ({frozen_by}): the KL decode READS "
                 "sigma_q, so a frozen sigma changes predictions (sigma stays at encode). "
                 "skip_belief_sigma_update is meant for configs where q's sigma is dead "
-                "(linear decode, no norms); projected routes freeze sigma regardless of that flag.",
+                "(linear decode, no norms); conditional and passthrough predictive routes keep sigma.",
                 UserWarning, stacklevel=2,
             )
         if self.grad_clip is not None:
@@ -2595,9 +2611,11 @@ class VFE3Config:
         elif self.predictive_covariance == "passthrough":
             mark(("predictive_covariance_floor", "predictive_covariance_centering"),
                  "only read by predictive_covariance='moment_matched'")
+        if self.attention_mode != "projected_gradient":
+            mark(("relational_receiver_noise",), "only read by projected_gradient receiving laws")
         gradient_controls = ("e_q_mu_lr", "e_q_sigma_lr", "e_step_mu_precond",
                              "e_mu_q_trust", "mu_trust_mode", "e_sigma_q_trust")
-        if self.attention_mode != "transported":
+        if self.attention_mode in ("projected_conditional", "projected_predictive"):
             mark(("skip_belief_sigma_update",),
                  "projected routes run no sigma E-step: predictive_content keeps or moment-matches "
                  "covariance by predictive_covariance, and relational filtering returns no sigma gradient")
@@ -2682,7 +2700,7 @@ class VFE3Config:
             mark(("m_pos_phi_lr", "phi_weight_decay"),
                  f"gauge_transport={self.gauge_transport!r} sets requires_grad=False on the frame "
                  "tables, so no phi-role step or decay applies")
-        if self.attention_mode != "transported" or self.skip_belief_sigma_update:
+        if self.attention_mode in ("projected_conditional", "projected_predictive") or self.skip_belief_sigma_update:
             mark(("e_q_sigma_lr", "e_sigma_q_trust", "sigma_max"),
                  "no sigma E-step runs on projected routes or under skip_belief_sigma_update "
                  "(a moment-matched predictive covariance is a readout with its own floor), so no "
@@ -2766,6 +2784,8 @@ class VFE3Config:
     @property
     def relational_readout_mode(self) -> str:
         """Internal executor selection derived from attention_mode."""
+        if self.attention_mode == "projected_gradient":
+            return "full_link_update"
         return "predictive_content" if self.attention_mode == "projected_predictive" else "conditional_update"
 
     @property

@@ -1,0 +1,58 @@
+{
+  "head": "3720337f0da6263b8bad4dad8e88c625ba4e8586",
+  "captured_utc": "2026-10-01T19:09:58.9989894Z",
+  "sources": [
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\train_vfe3.py",
+      "sha256": "7C857480295845D1356BA03FBAB070F11BB036BCA8B927C9380D1D374557B895"
+    },
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\vfe3\\config.py",
+      "sha256": "96339D976E7D39C6194C1953DC690B9FF65C46A442794E4583D55B7DC6AC50EF"
+    },
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\vfe3\\model\\relational_operators.py",
+      "sha256": "5BC7F5A70AADF7F6C45082D14BB8C69456B808E589379AD1A0F4BD91F570B720"
+    },
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\vfe3\\model\\model.py",
+      "sha256": "706AADDD364920B87C601F6550B403247247E1483C20013EDFFC3E4EDEDE8FB3"
+    },
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\vfe3\\inference\\e_step.py",
+      "sha256": "D4B2905870B10992EE41E338D6BA70114A328852F4BDC002000B352237896E9F"
+    },
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\vfe3\\gradients\\relational.py",
+      "sha256": "D66B6474E6D99AE289783FA8840B178A93660ED61EF9E64552DA4594EB197CF7"
+    },
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\vfe3\\gradients\\qkv.py",
+      "sha256": "6D259C02F76BE26554AF3B018065AA61161530BFB8FDD048955474A2CC8744BC"
+    },
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\vfe3\\gradients\\oracle.py",
+      "sha256": "976ED4975B02ED259B6A797BC977303961D32CF8B6C25B44E78BC6A8BEF8CC0D"
+    },
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\vfe3\\free_energy.py",
+      "sha256": "FA09F7060EAA6A8F34E57BC5BA584BF7B41083165CE4827AAAEE0F7863604CAC"
+    },
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\Research\\manuscripts\\Attention\\GL(K)_attention_v2.tex",
+      "sha256": "B162C4EEB38ABBDCFEC4D7A6A46BD798FFA901465E4A18852F629D915C8F0ABD"
+    },
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\Research\\manuscripts\\Attention\\GL(K)_gradients.tex",
+      "sha256": "DF56FB4E4451F96C5F7FF3B34F748786F6124FDE3AA2CCE64FC986E007FCB46E"
+    },
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\Research\\manuscripts\\Attention\\GL(K)_extension.tex",
+      "sha256": "5C813357807A934E6C114504A741377A2FC1A6F14498F4659BDE7BDD427D8CBE"
+    },
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\Research\\manuscripts\\Attention\\projected_predictive.tex",
+      "sha256": "00FC3E556742AD5289402550B02AB4256E7DA050BAEE7DA3D9B1E588C93C46C3"
+    }
+  ]
+}

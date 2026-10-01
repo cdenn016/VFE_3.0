@@ -1,0 +1,23 @@
+{
+  "scope": "K=4,H=2,J=3 formula validation only; CPU tensors, no production model",
+  "torch_version": "2.10.0.dev20251210+cu128",
+  "threads": 1,
+  "mean_formula_max_error": 1.1102230246251565e-15,
+  "covariance_formula_max_error": 7.771561172376096e-16,
+  "mean_direction_fd_error": 1.70080172168241e-10,
+  "covariance_direction_fd_error": 6.540035180080395e-11,
+  "envelope_mean_max_error": 2.220446049250313e-16,
+  "envelope_covariance_max_error": 2.220446049250313e-16,
+  "content_optimum_mean_residual": 1.1102230246251565e-16,
+  "content_optimum_covariance_residual": 3.0414605478511374e-16,
+  "exclusive_vs_inclusive_diagonal_max_gap": 0.44945210343371667,
+  "coupled_vs_qk_only_beta_max_gap": 0.027130020132749177,
+  "live_outer_gradient_norms": {
+    "S_Q": 0.02289826598110031,
+    "S_K": 0.0213934752956619,
+    "T": 0.02124130683537141,
+    "O": 0.09359682421566588
+  },
+  "detached_ce_requires_grad": false,
+  "min_receiving_eigenvalue": 0.5999999999999852
+}

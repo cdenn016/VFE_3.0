@@ -1437,6 +1437,8 @@ _VAL_RELATIONAL_DIAG_KEYS = (
     "val_relational_conditional_cost_delta", "val_relational_conditional_cost_tokens",
     "val_relational_mean_displacement_norm", "val_relational_snapshot_ce",
     "val_relational_identity_content",
+    "val_relational_receiver_cost_before", "val_relational_receiver_cost_after",
+    "val_relational_receiver_cost_delta", "val_relational_receiver_noise",
 ) + tuple("val_relational_" + key for key in (
     "score_raw_min_singular_value", "score_q_raw_min_singular_value",
     "score_k_raw_min_singular_value", "score_rank_per_head", "content_rank_per_head",

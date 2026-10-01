@@ -21,6 +21,9 @@ if TYPE_CHECKING:
 from vfe3.alpha_i import self_coupling_alpha
 from vfe3.belief import BeliefState
 from vfe3.contracts import CanonicalFrameContext, EStepGradientRecord
+from vfe3.gradients.full_link import (
+    FullLinkContext, build_full_link_context, full_link_cost, full_link_gradients,
+)
 from vfe3.gradients.qkv import qkv_conditional_cost
 from vfe3.gradients.relational import compute_relational_filtering_gradients, relational_predictive_readout
 from vfe3.families.base import get_family
@@ -80,7 +83,7 @@ def _belief_update_consumes_omega(
     if e_step_update == "mm_exact":
         return True
     if (relational_operators is not None
-            and relational_operators.readout_mode == "predictive_content"):
+            and relational_operators.readout_mode in ("predictive_content", "full_link_update")):
         return False
     return True
 
@@ -734,6 +737,7 @@ def e_step_iteration(
     relational_value_frame:   Optional[CanonicalFrameContext] = None,
     relational_capture:       Optional[dict] = None,
 
+    _full_link_context:         Optional[FullLinkContext] = None,
     _prebuilt_omega:           'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport | None' = None,   # PRIVATE: forward-transport cache from e_step
 ) -> BeliefState:
     r"""One inner E-step iteration: mu, sigma (Fisher natgrad + SPD retraction) then phi
@@ -748,6 +752,14 @@ def e_step_iteration(
     ``mm_damping`` in natural coordinates; the phi sub-step is untouched either way."""
     transport_state = dict(transport_state or {})   # None = the pure stateless flat path
     e_step_update = canonical_e_step_update(e_step_update)
+    full_link = (relational_operators is not None
+                 and relational_operators.readout_mode == "full_link_update")
+    if full_link and (
+            e_step_update != "gradient" or e_phi_lr != 0.0 or gradient_mode != "filtering"
+            or e_step_gradient != "unroll" or lambda_alpha_mode != "constant"
+            or e_step_mu_precond != "fisher" or family not in ("gaussian_diagonal", "gaussian_full")):
+        raise ValueError("full-link filtering requires Gaussian gradient inference, constant alpha, "
+                         "fixed frames, filtering, and unrolled Fisher steps")
     compact_phi_block_transport = (
         compact_phi_block_transport
         and transport_mode == "flat"
@@ -938,7 +950,21 @@ def e_step_iteration(
             for role in ("mu", "sigma", "phi"):
                 grad_record[role] = None
     else:
-        if relational_operators is not None:
+        if full_link:
+            if relational_frame is None:
+                raise ValueError("full-link filtering requires the realized forward frame")
+            if _full_link_context is None:
+                _full_link_context = build_full_link_context(
+                    belief.mu, belief.sigma, mu_p, sigma_p, relational_frame, relational_operators,
+                    tau=tau, lambda_beta=lambda_beta, value=value,
+                    receiver_noise=relational_operators.receiver_noise, kl_max=kl_max,
+                    value_frame=relational_value_frame, log_prior=log_prior, capture=relational_capture)
+                if relational_capture is not None:
+                    with torch.no_grad():
+                        relational_capture["relational_receiver_cost_before"] = full_link_cost(
+                            belief.mu, belief.sigma, _full_link_context).detach()
+            grad_mu, grad_sigma = full_link_gradients(belief.mu, belief.sigma, _full_link_context)
+        elif relational_operators is not None:
             if relational_frame is None:
                 raise ValueError("relational filtering requires the realized forward frame")
             grad_mu, grad_sigma = compute_relational_filtering_gradients(
@@ -1050,6 +1076,13 @@ def e_step_iteration(
     if recovery_before is not None:
         relational_capture["relational_covariance_repair_count"] = (
             source_recovery_counter(belief.mu.device) - recovery_before)
+
+    if full_link and relational_capture is not None:
+        with torch.no_grad():
+            relational_capture["full_link_context"] = _full_link_context
+            relational_capture["relational_receiver_cost_after"] = full_link_cost(
+                mu, sigma, _full_link_context).detach()
+            relational_capture["relational_mean_displacement_norm"] = (mu - belief.mu).norm().detach()
 
     if relational_capture is not None and "conditional_context" in relational_capture:
         with torch.no_grad():
@@ -1253,6 +1286,23 @@ def e_step(
                 rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value, rope_insertion=rope_insertion,
             )
 
+    # One incoming-state episode: beta and source-law statistics stay fixed with respect
+    # to the fast receiver, while their graph retains outer source/router/map credit.
+    full_link_context = None
+    if (relational_operators is not None
+            and relational_operators.readout_mode == "full_link_update"):
+        if relational_frame is None:
+            raise ValueError("full-link filtering requires the realized forward frame")
+        full_link_context = build_full_link_context(
+            belief.mu, belief.sigma, mu_p, sigma_p, relational_frame, relational_operators,
+            tau=tau, lambda_beta=kwargs.get("lambda_beta", 1.0), value=kwargs.get("value", 1.0),
+            receiver_noise=relational_operators.receiver_noise, kl_max=kwargs.get("kl_max", 100.0),
+            value_frame=relational_value_frame, log_prior=log_prior, capture=relational_capture)
+        if relational_capture is not None:
+            with torch.no_grad():
+                relational_capture["relational_receiver_cost_before"] = full_link_cost(
+                    belief.mu, belief.sigma, full_link_context).detach()
+
     record_sequence_index = (
         state_record.get("sequence_index") if state_record is not None else None)
 
@@ -1331,6 +1381,7 @@ def e_step(
             relational_frame=relational_frame,
             relational_value_frame=relational_value_frame,
             relational_capture=relational_capture,
+            _full_link_context=full_link_context,
             _prebuilt_omega=_hoisted_omega,
             **kwargs,
         )
