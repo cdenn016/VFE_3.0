@@ -1875,7 +1875,10 @@ class VFE3Config:
                     f"transport factors per block, but gauge_group={self.gauge_group!r} has a "
                     f"single irrep block ({_dims}), so the flat transport is built as a dense "
                     f"pairwise Omega with no per-vertex frame to fold into. {_escapes}")
-        if self.pos_rotation == "rope" and not self.rope_full_gauge:
+        # Projected routing pushes both moments through the realized comparison frame.
+        # Means-only covariance treatment belongs to the transported attention path.
+        if (self.pos_rotation == "rope" and not self.rope_full_gauge
+                and self.attention_mode == "transported"):
             import warnings
             warnings.warn(
                 "pos_rotation='rope' with rope_full_gauge=False rotates the transported MEANS but "
@@ -2178,15 +2181,10 @@ class VFE3Config:
             if self.pos_rotation == "rope":
                 if self.rope_insertion != "right":
                     incompatible.append(f"rope_insertion={self.rope_insertion!r}")
-                if not self.rope_full_gauge:
-                    incompatible.append("rope_full_gauge=False")
-                if not self.rope_on_value:
-                    incompatible.append("rope_on_value=False")
             if incompatible:
                 raise ValueError(
                     "block_mlp_mode='canonical_frame' requires a fixed factored flat frame: "
-                    "e_phi_lr=0, and active RoPE must use right insertion with "
-                    "rope_full_gauge=True and rope_on_value=True; got "
+                    "e_phi_lr=0, and active RoPE must use right insertion; got "
                     + ", ".join(incompatible)
                 )
         if self.block_mlp_activation not in ("gelu", "silu", "relu"):

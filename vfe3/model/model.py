@@ -509,6 +509,20 @@ class VFEModel(nn.Module):
                 covariance_layout=("full" if cfg.family == "gaussian_full" else "diagonal"),
             )
         )
+        if (cfg.use_block_mlp and self._block_mlp_registration.requires_frame_context
+                and cfg.pos_rotation == "rope"):
+            rope_caveats = []
+            if not cfg.rope_on_value:
+                rope_caveats.append(
+                    "Values use U_i; the MLP uses U_i R_i^T (position-dependent MLP).")
+            if cfg.attention_mode == "transported" and not cfg.rope_full_gauge:
+                rope_caveats.append(
+                    "Means-only RoPE leaves the transported covariance unrotated.")
+            if rope_caveats:
+                # A build banner remains visible even when Python warnings are filtered.
+                print("\n" + "-" * 72 + "\n"
+                      "WARNING: canonical_frame + RoPE uses a split positional path.\n"
+                      + "\n".join(rope_caveats) + "\n" + "-" * 72 + "\n")
         self.final_norm = get_norm(cfg.norm_type_final)(cfg.embed_dim, eps=cfg.eps,
                                                          family=cfg.family,
                                                          affine=cfg.layernorm_affine) \
