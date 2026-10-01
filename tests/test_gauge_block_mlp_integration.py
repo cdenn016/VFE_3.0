@@ -1,4 +1,4 @@
-from tests.profiles import config_values, test_config
+from tests.profiles import config_values, test_config, tiny_config
 from types import SimpleNamespace
 
 import pytest
@@ -87,6 +87,77 @@ def test_block_mlp_mode_and_covariance_controls_validate(mode, covariance):
 def test_block_mlp_modes_fail_closed_on_incompatible_config(overrides, message):
     with pytest.raises((TypeError, ValueError), match=message):
         _full_cfg(**overrides)
+
+
+@pytest.mark.parametrize("attention_mode", ["projected_predictive", "projected_gradient", "transported"])
+@pytest.mark.parametrize("rope_full_gauge, rope_on_value", [(False, False), (False, True), (True, False)])
+def test_canonical_rope_split_config_builds_with_visible_caveat(
+    attention_mode: str, rope_full_gauge: bool, rope_on_value: bool,
+    capsys: pytest.CaptureFixture, recwarn: pytest.WarningsRecorder,
+) -> None:
+    cfg = tiny_config(
+        attention_mode=attention_mode,
+        attention_residual=False,
+        relational_input_scope="head" if attention_mode == "transported" else "full",
+        relational_output_scope="head" if attention_mode == "transported" else "full",
+        predictive_covariance="passthrough",
+        family="gaussian_full" if rope_full_gauge else "gaussian_diagonal",
+        decode_mode="full_chunked" if rope_full_gauge else "diagonal_chunked",
+        use_block_mlp=True,
+        block_mlp_mode="canonical_frame",
+        pos_rotation="rope",
+        rope_full_gauge=rope_full_gauge,
+        rope_on_value=rope_on_value,
+    )
+    VFEModel(cfg)
+    output = capsys.readouterr().out
+    if attention_mode != "transported":
+        assert not any("not the covariance sandwich" in str(warning.message) for warning in recwarn)
+    needs_caveat = not rope_on_value or (attention_mode == "transported" and not rope_full_gauge)
+    if needs_caveat:
+        assert output.count("WARNING: canonical_frame + RoPE") == 1
+        lines = output.strip().splitlines()
+        assert lines[0] == lines[-1] == "-" * 72
+        assert ("position-dependent MLP" in output) == (not rope_on_value)
+        assert ("transported covariance unrotated" in output) == (
+            attention_mode == "transported" and not rope_full_gauge)
+    else:
+        assert "WARNING: canonical_frame + RoPE" not in output
+
+
+def test_canonical_diagonal_predictive_rope_forward_backward() -> None:
+    cfg = tiny_config(
+        use_block_mlp=True,
+        block_mlp_mode="canonical_frame",
+        pos_rotation="rope",
+        rope_full_gauge=False,
+        rope_on_value=False,
+        attention_residual=False,
+        decode_unigram_prior=False,
+    )
+    torch.manual_seed(17)
+    model = VFEModel(cfg)
+    beliefs, logits = model.forward_beliefs(torch.tensor([[0, 1, 2]]), return_logits=True)
+    loss = torch.nn.functional.cross_entropy(logits.reshape(-1, 7), torch.tensor([1, 2, 3]))
+    loss.backward()
+    assert torch.isfinite(beliefs.mu).all()
+    assert torch.isfinite(beliefs.sigma).all()
+    assert torch.isfinite(logits).all()
+    gradients = [parameter.grad for parameter in model.parameters() if parameter.grad is not None]
+    assert gradients and all(torch.isfinite(gradient).all() for gradient in gradients)
+    assert model.block_mlps[0].fc1.weight.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize("pos_rotation, rope_full_gauge", [("none", False), ("rope", True)])
+def test_canonical_rope_build_caveat_is_absent_without_split(
+    pos_rotation: str, rope_full_gauge: bool, capsys: pytest.CaptureFixture,
+) -> None:
+    VFEModel(_full_cfg(
+        vocab_size=7, block_mlp_expansion=2,
+        use_block_mlp=True, block_mlp_mode="canonical_frame", pos_rotation=pos_rotation,
+        rope_full_gauge=rope_full_gauge, rope_on_value=True,
+    ))
+    assert "WARNING: canonical_frame + RoPE" not in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(
