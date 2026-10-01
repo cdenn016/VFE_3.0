@@ -111,7 +111,7 @@ def _dataset(seed: int = 3) -> Any:
     return st.eval_windows(torch.randint(0, V, (61,), generator=torch.Generator().manual_seed(seed)), 8, 4)
 
 
-LAYERNORM_FULL = dict(norm_type_final="layernorm", relational_input_scope="full", relational_output_scope="full")
+LAYERNORM_FULL = dict(norm_type_final="layernorm", )
 TEMPLATE = dict(block_mlp_mode="gaussian_template")
 MOMENT_MATCHED = dict(predictive_covariance="moment_matched", attention_residual=False)
 VARIANTS = {
@@ -337,9 +337,8 @@ def test_capture_keeps_local_coordinates() -> None:
 # ----------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("over, message", [
-    (dict(attention_mode="transported", attention_residual=False), "projected_predictive"),
-    (dict(attention_mode="projected_conditional", attention_residual=False, n_layers=1,
-          relational_output_scope="head"), "projected_predictive"),
+    (dict(attention_mode="transported", attention_residual=False), "retired"),
+    (dict(attention_mode="projected_conditional", attention_residual=False, n_layers=1), "retired"),
     (dict(pos_rotation="rope"), "pos_rotation"),
     (dict(family="gaussian_frame_diagonal", decode_mode="diagonal_chunked"), "gaussian_frame_diagonal"),
     (dict(block_mlp_mode="canonical_frame"), "block_mlp_mode"),

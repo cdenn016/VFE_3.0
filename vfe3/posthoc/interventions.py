@@ -104,16 +104,16 @@ def patch_bindings(
 
 def _attention_weight_modules() -> List[Any]:
     from vfe3 import free_energy
-    from vfe3.gradients import kernels, qkv
+    from vfe3.gradients import full_link, kernels
     from vfe3.inference import e_step
 
-    return [free_energy, kernels, e_step, qkv]
+    return [free_energy, kernels, e_step, full_link]
 
 
 def _relational_score_modules() -> List[Any]:
-    from vfe3.gradients import qkv, relational
+    from vfe3.gradients import full_link, relational
 
-    return [relational, qkv]
+    return [relational, full_link]
 
 
 # ----------------------------------------------------------------------------------------------
@@ -251,14 +251,9 @@ def _identity_covariance_score(
     inverse = frame.inverse
     if not frame.block_diagonal:
         inverse = torch.stack([inverse[..., h*d:(h+1)*d, h*d:(h+1)*d] for h in range(H)], dim=-3)
-    if operators.input_scope == "full":
-        mu_h, source_mu_h = (x.unsqueeze(-2).expand(*x.shape[:-1], H, H * d) for x in (mu, source_mu))
-        sigma_h = (sigma.unsqueeze(-3).expand(*sigma.shape[:-2], H, H * d, H * d)
-                   if sigma.ndim == mu.ndim + 1 else sigma.unsqueeze(-2).expand(*sigma.shape[:-1], H, H * d))
-    else:
-        mu_h, source_mu_h = (x.reshape(*x.shape[:-1], H, d) for x in (mu, source_mu))
-        sigma_h = (torch.stack([sigma[..., h*d:(h+1)*d, h*d:(h+1)*d] for h in range(H)], dim=-3)
-                   if sigma.ndim == mu.ndim + 1 else sigma.reshape(*sigma.shape[:-1], H, d))
+    mu_h, source_mu_h = (x.unsqueeze(-2).expand(*x.shape[:-1], H, H * d) for x in (mu, source_mu))
+    sigma_h = (sigma.unsqueeze(-3).expand(*sigma.shape[:-2], H, H * d, H * d)
+               if sigma.ndim == mu.ndim + 1 else sigma.unsqueeze(-2).expand(*sigma.shape[:-1], H, H * d))
     S_q, S_k = operators.comparison_pair()                                    # (H, r, w)
     a, _ = projected_moments(mu_h, sigma_h, inverse, torch.stack((S_q, S_k)))  # (2, ..., N, H, r)
     if mu is not source_mu:
@@ -526,18 +521,11 @@ def _frame_free_covariance_score(
                 if bool((inverse.detach()[..., ~mask] != 0).any()):
                     raise ValueError("relational_score requires a head-block-diagonal frame")
         inverse = torch.stack([inverse[..., h*d:(h+1)*d, h*d:(h+1)*d] for h in range(H)], dim=-3)  # (..., N, H, d, d)
-    if operators.input_scope == "full":
-        mu_h, source_mu_h = (x.unsqueeze(-2).expand(*x.shape[:-1], H, H * d) for x in (mu, source_mu))
-        sigma_h, source_sigma_h = (
-            x.unsqueeze(-3).expand(*x.shape[:-2], H, H * d, H * d)
-            if x.ndim == mu.ndim + 1 else x.unsqueeze(-2).expand(*x.shape[:-1], H, H * d)
-            for x in (sigma, source_sigma))
-    else:
-        mu_h, source_mu_h = (x.reshape(*x.shape[:-1], H, d) for x in (mu, source_mu))
-        sigma_h, source_sigma_h = (
-            torch.stack([x[..., h*d:(h+1)*d, h*d:(h+1)*d] for h in range(H)], dim=-3)
-            if x.ndim == mu.ndim + 1 else x.reshape(*x.shape[:-1], H, d)
-            for x in (sigma, source_sigma))
+    mu_h, source_mu_h = (x.unsqueeze(-2).expand(*x.shape[:-1], H, H * d) for x in (mu, source_mu))
+    sigma_h, source_sigma_h = (
+        x.unsqueeze(-3).expand(*x.shape[:-2], H, H * d, H * d)
+        if x.ndim == mu.ndim + 1 else x.unsqueeze(-2).expand(*x.shape[:-1], H, H * d)
+        for x in (sigma, source_sigma))
     eye = torch.eye(inverse.shape[-1], dtype=inverse.dtype, device=inverse.device).expand(inverse.shape)
     S_q, S_k = operators.comparison_pair()                                              # (H, r, w)
     if mu is source_mu and sigma is source_sigma:

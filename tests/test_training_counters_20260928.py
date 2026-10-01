@@ -3,8 +3,8 @@
 Tiny CPU models only (K=4, two heads, N=4, vocab 7). Covers the per-evaluation cost-cap and
 reduced-covariance factorization counts on the fixed diagnostic windows (and their agreement with
 the post-hoc cap observer), the cumulative frame-projection, skipped-update and attempted-update
-counters, diagnostics/cap_activation.csv, summary.json's numerics_counters, the transported-route
-skips, checkpoint carry-over on resume, exception isolation, and bitwise invariance of the training
+counters, diagnostics/cap_activation.csv, summary.json's numerics_counters,
+checkpoint carry-over on resume, exception isolation, and bitwise invariance of the training
 trajectory.
 """
 from tests.profiles import test_config
@@ -32,7 +32,7 @@ B, N, V = 2, 4, 7
 RADIUS = 0.05                       # small chart radius: the post-update projection binds
 
 
-def _cfg(route: str = "conditional", **overrides: Any) -> VFE3Config:
+def _cfg(**overrides: Any) -> VFE3Config:
     values: Dict[str, Any] = dict(
         vocab_size=V, embed_dim=4, n_heads=2, batch_size=B, max_seq_len=N, eval_stride=2,
         n_layers=2, n_e_steps=1, warmup_steps=0, max_steps=12, log_interval=0, eval_interval=0,
@@ -40,10 +40,9 @@ def _cfg(route: str = "conditional", **overrides: Any) -> VFE3Config:
         oracle_unroll_grad=True, generate_embedding_figures=False, pos_phi="learned",
         use_block_mlp=True, block_mlp_expansion=1, beta_attention_prior="causal_alibi",
         phi_mstep_max_matrix_norm=RADIUS)
-    if route == "conditional":
-        values.update(family="gaussian_diagonal", gauge_group="block_glk",
-                      attention_mode="projected_predictive", attention_residual=True,
-                      norm_type_block="layernorm", layernorm_affine=True, decode_mode="linear")
+    values.update(family="gaussian_diagonal", gauge_group="block_glk",
+                  attention_mode="projected_predictive", attention_residual=True,
+                  norm_type_block="layernorm", layernorm_affine=True, decode_mode="linear")
     values.update(overrides)
     return test_config(**values)
 
@@ -293,34 +292,6 @@ def test_factorization_fallback_is_counted(monkeypatch: pytest.MonkeyPatch) -> N
     assert columns["factorization_count"] == 2 * windows.shape[0] * N * cfg.n_heads * cfg.n_layers
 
 
-def test_transported_route_leaves_route_counters_nan(tmp_path: Path) -> None:
-    for radius, frame_defined in ((None, False), (RADIUS, True)):
-        cfg = _cfg("legacy", max_steps=6, phi_mstep_max_matrix_norm=radius)
-        model = _model(cfg)
-        run_dir = tmp_path / f"run_{frame_defined}"
-        artifacts = ra.RunArtifacts(run_dir, cfg, model, save_model_artifacts=False)
-        _train(model, cfg, _loaders(cfg), artifacts=artifacts, log_interval=2, eval_interval=3)
-        rows = _rows(run_dir / "metrics.csv")
-        assert [int(row["step"]) for row in rows] == [2, 3, 4, 6]
-        for row in rows:
-            assert all(row[column] == "" for column in T.NUMERICS_EVAL_COLUMNS)
-            assert _int(row["attempted_updates"]) == int(row["step"])
-            assert _int(row["skipped_updates"]) == 0
-            if frame_defined:
-                assert _int(row["frame_projection_total"]) == int(row["step"]) * _phi_rows(model)
-                assert 0 <= _int(row["frame_projection_count"]) <= _int(row["frame_projection_total"])
-            else:
-                assert row["frame_projection_count"] == row["frame_projection_total"] == ""
-        assert (run_dir / "diagnostics" / "residual_ratio.csv").is_file()
-        assert not (run_dir / "diagnostics" / "cap_activation.csv").exists()
-        summary = artifacts.numerics_counters
-        reasons = summary["skip_reasons"]
-        assert "transported" in reasons["cap_activation"] and "transported" in reasons["factorization"]
-        assert (reasons["frame_projection"] is None) == frame_defined
-        assert summary["cap_active_count"] is None and summary["eval_step"] is None
-        assert summary["attempted_updates"] == 6 and summary["skipped_updates"] == 0
-        assert (summary["frame_projection_total"] is not None) == frame_defined
-        assert artifacts.diagnostics_failures == {}
 
 
 def test_counters_do_not_change_the_training_trajectory(tmp_path: Path, early: None) -> None:
@@ -390,7 +361,7 @@ def test_skipped_updates_are_counted(tmp_path: Path) -> None:
 
 
 def test_frame_projection_counts_survive_resume(tmp_path: Path) -> None:
-    cfg = _cfg("legacy", max_steps=6, checkpoint_interval=3, m_phi_lr=0.05)
+    cfg = _cfg(max_steps=6, checkpoint_interval=3, m_phi_lr=0.05)
     straight_model = _model(cfg)
     straight = ra.RunArtifacts(tmp_path / "straight", cfg, straight_model)
     _train(straight_model, cfg, _loaders(cfg, shuffle=False), artifacts=straight, log_interval=3)

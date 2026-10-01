@@ -100,21 +100,12 @@ def _config_from_run_serialized(
 
 
 def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
-    """Describe exact marginal routing and its separate conditional mean update."""
+    """Describe full-width projected routing and its configured receiver update."""
     if not is_vfe_config(cfg):                        # another model family has no relational route
         return {}
-    if cfg.relational_mode == "off":
-        return {}
-    H, d = cfg.n_heads, cfg.d_head
-    r, s = d, (None if cfg.relational_identity_content else d)
-    predictive = cfg.relational_readout_mode == "predictive_content"
-    full_link = cfg.relational_readout_mode == "full_link_update"
-    input_scope = "full" if predictive else cfg.relational_input_scope
-    output_scope = "full" if predictive else cfg.relational_output_scope
-    input_dim = cfg.embed_dim if input_scope == "full" else d
-    output_dim = cfg.embed_dim if output_scope == "full" else d
-    layer_counts = {"score": 2*H*input_dim*r,
-                    "content": 0 if s is None else H*s*(input_dim+output_dim)}
+    H, d, K = cfg.n_heads, cfg.d_head, cfg.embed_dim
+    full_link = cfg.attention_mode == "projected_gradient"
+    layer_counts = {"score": 2*H*K*d, "content": 2*H*K*d}
     counts = {role: count * cfg.n_layers for role, count in layer_counts.items()}
     return {"relational_operators": {
         "attention_mode": cfg.attention_mode,
@@ -122,44 +113,38 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "n_layers": cfg.n_layers, "layer_parameter_sharing": "independent",
         "per_layer_parameter_counts": layer_counts,
         "shape_scope": "per_layer",
-        "inference_semantics": ("relational_full_link_frozen_filtering" if full_link else
-                                "relational_predictive_content" if predictive
-                                else "relational_projected_conditional_filtering"),
+        "inference_semantics": ("relational_full_link_frozen_filtering" if full_link
+                                else "relational_predictive_content"),
         "readout_mode": cfg.relational_readout_mode,
-        "output_scope": output_scope,
+        "output_scope": "full",
         "mean_update": ("receiver_fisher_step" if full_link else
                         "input_plus_predictive_mean" if cfg.attention_residual else
-                        "replace_with_predictive_mean" if predictive else "conditional_fisher_step"),
+                        "replace_with_predictive_mean"),
         "mode": cfg.relational_mode,
-        "input_scope": input_scope,
-        "input_dimension": input_dim,
-        "head_output_dimension": output_dim,
+        "input_scope": "full",
+        "input_dimension": K,
+        "head_output_dimension": K,
         "score_parameterization": "free_full_row_rank",
         "score_initialization": "independent_orthonormal_rows",
-        "score_role_parameter_counts": {"q": cfg.n_layers*H*input_dim*r, "k": cfg.n_layers*H*input_dim*r},
-        "score_rank_per_head": r, "content_rank_per_head": s,
-        "identity_content": cfg.relational_identity_content,
-        "content_mode": "identity" if s is None else "full_width",
-        "score_shape": [H, r, input_dim],
-        "content_shapes": None if s is None else [[H, s, input_dim], [H, output_dim, s]],
+        "score_role_parameter_counts": {"q": cfg.n_layers*H*K*d, "k": cfg.n_layers*H*K*d},
+        "score_rank_per_head": d, "content_rank_per_head": d,
+        "identity_content": False,
+        "content_mode": "full_width",
+        "score_shape": [H, d, K],
+        "content_shapes": [[H, d, K], [H, K, d]],
         "parameter_counts": counts, "total_parameters": sum(counts.values()),
         "learning_rates": {
             role: (cfg.m_p_mu_lr if getattr(cfg, f"m_relational_{role}_lr") is None
-                   else getattr(cfg, f"m_relational_{role}_lr")) if counts[role] else None
+                   else getattr(cfg, f"m_relational_{role}_lr"))
             for role in counts},
         "score_covariance_contract": "exact_full_reduced_covariance_from_local_gaussian",
         "receiver_noise": cfg.relational_receiver_noise if full_link else None,
-        "covariance_update": (("passthrough" if cfg.skip_belief_sigma_update else "fisher_step") if full_link else
-                              getattr(cfg, "predictive_covariance", "passthrough") if predictive
-                              else "not_applicable"),
+        "covariance_update": (("passthrough" if cfg.skip_belief_sigma_update else "fisher_step") if full_link
+                              else getattr(cfg, "predictive_covariance", "passthrough")),
         "content_covariance_contract": ("full_link_pushforward_plus_positive_reference_noise" if full_link else
                                         "exact_predictive_kernel_moment_match_plus_covariant_floor"
-                                        if predictive and getattr(cfg, "predictive_covariance",
-                                                                  "passthrough") == "moment_matched"
-                                        else "frozen_receiver_bookkeeping_not_predictive_covariance" if predictive
-                                        else "legacy_transported_diagonal_variance_mean_only_content"
-                                        if cfg.family == "gaussian_diagonal"
-                                        else "full_gaussian_transported_head_marginals_mean_only_content"),
+                                        if getattr(cfg, "predictive_covariance", "passthrough") == "moment_matched"
+                                        else "frozen_receiver_bookkeeping_not_predictive_covariance"),
         "self_coupling_coordinate_contract": (
             "ordered_conditional_kl_stored_coordinate_order"
             if cfg.family == "gaussian_full" and cfg.lambda_alpha_mode == "state_dependent_per_coord"
@@ -169,7 +154,7 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "temperature_convention": "kappa_beta_times_sqrt_ambient_head_dim",
         "routing_state": "episode_initial" if full_link else "pre_update",
         "state_destination": "receiver_belief_mean_and_covariance" if full_link else "receiver_belief_mean",
-        "source_beliefs": "live_episode_initial" if full_link else "live_pre_update" if predictive else "detached_pre_update",
+        "source_beliefs": "live_episode_initial" if full_link else "live_pre_update",
         "outer_operator_and_frame_graph": "live",
         "canonical_shared_objective": False,
         "gradient_clipping": "shares_existing_mu_role_and_global_budgets",
@@ -190,9 +175,7 @@ def _conditional_unavailable_probe(probe: str, cfg: Optional[VFE3Config] = None)
                                 if cfg is not None and cfg.relational_readout_mode == "full_link_update"
                                 else "relational_predictive_content"
                                 if cfg is not None and cfg.relational_readout_mode == "predictive_content"
-                                else "relational_projected_conditional_filtering"
-                                if cfg is not None and cfg.relational_mode != "off"
-                                else "legacy_mean_field"),
+                                else "projected_attention"),
         "reason": ("only the configured single readout is supported; inference-depth sweeps are unavailable"
                    if "depth" in probe or probe == "zero_e_steps_counterfactual"
                    else "routing and readout do not define the legacy shared stationary free-energy objective"),
@@ -3327,7 +3310,7 @@ def _cost_model_fields(
         # The existing analytic proxy counts the legacy hand kernel, not the new inner autograd.
         out["est_flops_analytic"] = None
         out["flops_per_token_estep"] = None
-        out["est_flops_analytic_unavailable_reason"] = "conditional routing/content cost is not modeled"
+        out["est_flops_analytic_unavailable_reason"] = "projected routing/content cost is not modeled"
     if wall_time is not None and tokens_seen > 0:
         out["wall_time_s"]         = float(wall_time)
         out["wall_time_per_token"] = float(wall_time) / float(tokens_seen)
@@ -4405,9 +4388,8 @@ def collect_beta_channel_decomposition(
     content channel. ``full`` reproducing the headline CE is the harness check -- if it drifts, the
     patch missed the live softmax and the other two arms mean nothing.
 
-    Patching the ``attention_weights`` binding inside ``gradients.kernels`` isolates the belief beta
-    exactly. Both belief routes read that binding -- ``belief_gradients`` and ``mm_exact_update``
-    each call it -- so this works under either ``e_step_update``. ``available`` records whether any
+    Patching every ``attention_weights`` binding isolates the live projected router on both
+    predictive and full-link gradient attention. ``available`` records whether any
     live softmax was actually intercepted; when it is False the arms are omitted rather than
     reported as numbers that describe nothing.
 
@@ -4419,7 +4401,7 @@ def collect_beta_channel_decomposition(
     import torch.nn.functional as F
     from vfe3 import free_energy as free_energy_module
     from vfe3.gradients import kernels as kernels_module
-    from vfe3.gradients import qkv as qkv_module
+    from vfe3.gradients import full_link as full_link_module
     from vfe3.inference import e_step as e_step_module
 
     was_training = bool(model.training)
@@ -4428,7 +4410,7 @@ def collect_beta_channel_decomposition(
     # the phi substep called the unablated function, so all three arms ran the true beta while the
     # record still reported `available: True`.
     original = free_energy_module.attention_weights
-    binders = [module for module in (free_energy_module, kernels_module, e_step_module, qkv_module)
+    binders = [module for module in (free_energy_module, kernels_module, e_step_module, full_link_module)
                if getattr(module, "attention_weights", None) is original]
     mode = {"arm": "full"}
 
@@ -4996,29 +4978,18 @@ def _pure_path_report(
     else:
         transport_exactness_status = "exact" if regime_ii_covariant_exact else "approximate"
 
-    # Covariance / E-step facets come from the EXECUTED branch of e_step_iteration, not raw toggles:
-    #   transported           -> the configured updater ('gradient' or 'mm_exact'); the covariance
-    #                            moves unless skip_belief_sigma_update, and only the gradient updater
-    #                            applies the affine SPD retraction (mm_exact blends precisions);
-    #   projected_conditional -> a relational-filtering gradient step on the mean only (no sigma arm);
-    #   projected_predictive  -> the predictive readout replaces the mean; no E-step descent runs.
-    # Projected routes keep sigma = belief.sigma, so their covariance is frozen at encode whatever
-    # skip_belief_sigma_update says, except that predictive_covariance='moment_matched' assigns the
-    # predictive kernel's covariance (a readout: no retraction). A facet with no executed
-    # counterpart is 'not_applicable'.
+    # Predictive attention assigns its configured readout covariance; projected_gradient
+    # executes Fisher receiver updates unless its covariance update is disabled.
     from vfe3.inference.e_step import canonical_e_step_update
-    attention_mode = getattr(cfg, "attention_mode", "transported")
-    transported = attention_mode == "transported"
-    receiver_gradient = attention_mode in ("transported", "projected_gradient")
+    attention_mode = cfg.attention_mode
+    receiver_gradient = attention_mode == "projected_gradient"
     e_step_updater = canonical_e_step_update(getattr(cfg, "e_step_update", "gradient"))
     predictive_covariance_updated = (
         attention_mode == "projected_predictive"
         and getattr(cfg, "predictive_covariance", "passthrough") == "moment_matched")
     covariance_updated = (receiver_gradient and not cfg.skip_belief_sigma_update) or predictive_covariance_updated
     gradient_e_step_update: 'bool | str' = (
-        e_step_updater == "gradient" if receiver_gradient
-        else True if attention_mode == "projected_conditional"
-        else "not_applicable"
+        e_step_updater == "gradient" if receiver_gradient else "not_applicable"
     )
     spd_retraction_applies = (receiver_gradient and not cfg.skip_belief_sigma_update
                               and e_step_updater == "gradient")
@@ -5066,8 +5037,8 @@ def _pure_path_report(
         "prior_bank_decode":           cfg.decode_mode != "linear",
         "no_head_mixer":               not cfg.use_head_mixer,
         "no_priorbank_head_evidence_mixer": not priorbank_head_evidence_mixer,
-        # Executed-route facet: False on projected routes, where sigma stays at encode, unless
-        # predictive_covariance='moment_matched' assigns the predictive kernel's covariance.
+        # Executed-route facet: gradient updates sigma unless skipped; predictive readout
+        # keeps it at encode unless moment_matched assigns the predictive covariance.
         "full_sigma_update":           covariance_updated,
         "no_block_mlp":                not block_mlp_active,
         # The E-STEP UPDATE RULE axis (audit 2026-07-26 D-03). 'mm_exact' is the closed-form

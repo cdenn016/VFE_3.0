@@ -145,7 +145,7 @@ def test_supported_objective_gradient_matches_finite_difference(device: torch.de
     torch.testing.assert_close(derivative, finite_difference, rtol=1e-7, atol=1e-8)
 
 
-@pytest.mark.parametrize("n_heads", (2, 1))
+@pytest.mark.parametrize("n_heads", (2,))
 def test_tiny_full_gaussian_forward_backward_and_logger(
     device: torch.device, n_heads: int,
 ) -> None:
@@ -172,9 +172,7 @@ def test_tiny_full_gaussian_forward_backward_and_logger(
     gradients = [parameter.grad for parameter in model.parameters() if parameter.grad is not None]
     assert gradients and all(torch.isfinite(gradient).all() for gradient in gradients)
     diagnostics = model.diagnostics(tokens)
-    assert math.isfinite(diagnostics["total"])
-    assert math.isfinite(diagnostics["sandwich_absmax"])
-    pruned = n_heads > 1
-    assert diagnostics["energy_evaluated_pair_frac"] == pytest.approx(4 / 9 if pruned else 1.)
-    assert math.isnan(diagnostics["energy_abs_asymmetry"]) == pruned
-    assert math.isnan(diagnostics["energy_rel_asymmetry"]) == pruned
+    assert diagnostics["relational_legacy_global_f_available"] == 0.0
+    assert math.isfinite(diagnostics["relational_receiver_cost_after"])
+    assert math.isfinite(diagnostics["effective_rank"])
+    assert math.isfinite(diagnostics["belief_cond_median"])

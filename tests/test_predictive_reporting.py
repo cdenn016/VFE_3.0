@@ -24,8 +24,8 @@ def _model() -> VFEModel:
         n_layers=1, n_e_steps=1, family="gaussian_diagonal", gauge_group="block_glk",
         skip_belief_sigma_update=True, e_phi_lr=0.0, oracle_unroll_grad=True,
         pos_phi="learned", use_head_mixer=True, use_block_mlp=True, block_mlp_expansion=1,
-        relational_input_scope="full", attention_mode="projected_predictive",
-        relational_output_scope="full",
+        attention_mode="projected_predictive",
+
     )).eval()
 
 
@@ -97,8 +97,8 @@ def test_predictive_report_emits_state_figures_and_finite_readout_panels(tmp_pat
 
 @pytest.mark.parametrize("route, ceiling_binds", [
     (dict(attention_mode="projected_predictive", predictive_covariance="moment_matched",
-          relational_input_scope="full", relational_output_scope="full", n_e_steps=1), False),
-    (dict(attention_mode="transported", skip_belief_sigma_update=False, n_e_steps=2,
+          n_e_steps=1), False),
+    (dict(attention_mode="projected_gradient", skip_belief_sigma_update=False, n_e_steps=2,
           e_q_sigma_lr=0.5), True),
 ])
 def test_report_draws_sigma_max_only_where_it_bounds_the_belief(
@@ -127,7 +127,10 @@ def test_report_draws_sigma_max_only_where_it_bounds_the_belief(
     if ceiling_binds:
         assert seen["spectrum"]["sigma_max"] == 2.0
         assert float(seen["sigma"].max()) <= 2.0
-        assert seen["guard"]["sigma_ceil_frac"] == 1.0
+        # Receiver descent can move some coordinates below the cap; the guard must
+        # report the actual spectrum, rather than assume every variance is saturated.
+        expected_fraction = float(((seen["sigma"] - 2.0).abs() < 2.0e-3).float().mean())
+        assert seen["guard"]["sigma_ceil_frac"] == expected_fraction
     else:
         assert float(seen["sigma"].min()) > 2.0
         assert seen["spectrum"]["sigma_max"] is None

@@ -473,9 +473,9 @@ def _rows_to_columns(rows: Sequence[Mapping[str, Any]]) -> Dict[str, np.ndarray]
 
 def _maps_panel(run: RunRecord) -> Dict[str, Any]:
     mode = run.value("attention_mode")
-    if mode == "transported":
+    if mode not in ("projected_predictive", "projected_gradient"):
         return {"status": "skipped",
-                "reason": "attention_mode='transported' has no relational interface maps"}
+                "reason": f"attention_mode={mode!r} is a retired architecture"}
     from vfe3.posthoc import maps as mp
     cfg_like = run.cfg_like()
     snapshots = run.run_dir / "map_snapshots"

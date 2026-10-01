@@ -1436,7 +1436,6 @@ _VAL_RELATIONAL_DIAG_KEYS = (
     "val_relational_conditional_cost_before", "val_relational_conditional_cost_after",
     "val_relational_conditional_cost_delta", "val_relational_conditional_cost_tokens",
     "val_relational_mean_displacement_norm", "val_relational_snapshot_ce",
-    "val_relational_identity_content",
     "val_relational_receiver_cost_before", "val_relational_receiver_cost_after",
     "val_relational_receiver_cost_delta", "val_relational_receiver_noise",
 ) + tuple("val_relational_" + key for key in (
@@ -1514,7 +1513,7 @@ ATTENTION_STATS_FIELDS: Tuple[str, ...] = (
 # Every count is an integer with its denominator beside it. NUMERICS_EVAL_COLUMNS are measured at
 # every evaluation (and at step 0) on the DIAGNOSTIC_WINDOWS fixed validation windows inside the
 # residual-ratio capture pass (no extra forward), with one diagnostics/cap_activation.csv row per
-# (layer, head); they are NaN on rows without an evaluation, on the transported route, when the run
+# (layer, head); they are NaN on rows without an evaluation, when the run
 # has no diagnostic windows, and when their capture pass fails. NUMERICS_CUMULATIVE_COLUMNS are on
 # every metrics row and cover every attempted optimizer step since step 0 (frame_projection_* NaN
 # without a post-update frame projection). The exact definitions and skip rules are in
@@ -1535,10 +1534,9 @@ def _numerics_counter_skip_reasons(
 
     ``cap_activation`` (``cap_active_count``, ``cap_entry_count``, ``diagnostics/cap_activation.csv``)
     and ``factorization`` (``factorization_fallback_count``, ``factorization_count``) are measured on
-    the projected routes (``attention_mode`` ``'projected_conditional'`` or ``'projected_predictive'``),
-    whose single pre-update router records its capped costs and reduced covariances in the diagnostic
-    capture. On ``'transported'`` both stay NaN: that E-step recomputes its capped pair energies at
-    every iteration without recording them, and it factorizes no reduced covariance.
+    both supported projected routes, whose pre-update router records its capped costs and reduced
+    covariances in the diagnostic capture. The full-link gradient episode keeps that router fixed
+    across its receiver iterations.
     ``frame_projection`` (``frame_projection_count``, ``frame_projection_total``) is measured when
     :func:`train_step` runs the post-update frame projection, i.e. ``m_phi_update_mode='adamw'`` with
     ``phi_mstep_max_matrix_norm`` set; otherwise both stay NaN. ``skipped_updates`` and
@@ -1554,13 +1552,6 @@ def _numerics_counter_skip_reasons(
         }
     reasons: Dict[str, Optional[str]] = {
         "cap_activation": None, "factorization": None, "frame_projection": None}
-    if not is_conditional_filtering(model):
-        route = getattr(cfg, "attention_mode", "transported")
-        reasons["cap_activation"] = (
-            f"attention_mode={route!r}: the transported E-step recomputes its capped pair costs at "
-            "every iteration and records none; cap activations are counted on the projected routes")
-        reasons["factorization"] = (
-            f"attention_mode={route!r}: no reduced (projected) covariance is factorized on this route")
     mode = getattr(cfg, "m_phi_update_mode", "adamw")
     if mode != "adamw":
         reasons["frame_projection"] = (
@@ -3420,7 +3411,15 @@ def train(
             # provenance of train_loss/train_ce (train_ce is captured pre-step inside train_step). Under
             # no_grad, so no weight change,
             # leaving the train_step RNG stream and weights byte-identical.
-            d = model.diagnostics(tokens)
+            try:
+                d = model.diagnostics(tokens)
+            except Exception as exc:                         # optional probes cannot stop training
+                _record_diagnostic_failure(diagnostics_failures, "training_diagnostics", exc, logger)
+                d = {key: float("nan") for key in (
+                    "attn_entropy", "self_coupling", "self_divergence", "belief_coupling",
+                    "attention_entropy", "total", "effective_rank", "holonomy_deviation",
+                    "gauge_trace_spread",
+                )}
         # generalization_gap's train side under the validation protocol when that protocol is the
         # sliding window (eval_stride < max_seq_len); pre-step, like train_ce. None keeps train_ce.
         gap_train_ce: Optional[float] = None

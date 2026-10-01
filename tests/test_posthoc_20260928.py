@@ -44,7 +44,7 @@ def _cfg(**over: Any) -> VFE3Config:
                   batch_size=2, attention_mode="projected_predictive", e_phi_lr=0.0, block_mlp_expansion=2,
                   norm_type_block="none", layernorm_affine=False,           # pinned: independent of
                   skip_belief_sigma_update=False, decode_temperature_learned=True,
-                  beta_attention_prior="causal_alibi", relational_output_scope="full")                           # the config defaults
+                  beta_attention_prior="causal_alibi")                           # the config defaults
     values.update(over)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")

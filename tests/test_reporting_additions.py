@@ -137,7 +137,7 @@ def test_save_figures_emits_dashboards(tmp_path):
             "phi_ridge_direction_cosine_mean", "weight_norm_mu", "grad_norm_mu")
     art.history = [{"step": s, **{k: 1.0 / (s + 1) + 0.1 for k in keys}} for s in range(12)]
     _save_figures(art, [3.0, 2.5], logging.getLogger("test"))
-    for png in ("geometry_health.png", "estep_quality.png", "validation_sanity.png",
+    for png in ("geometry_health.png", "validation_sanity.png",
                 "optimizer_geometry.png"):
         assert (tmp_path / png).exists(), f"{png} not emitted"
 
@@ -237,13 +237,14 @@ def _cost_cfg(**over):
         vocab_size=11, embed_dim=6, n_heads=2, max_seq_len=7, batch_size=2,
         n_layers=2, n_e_steps=3, max_steps=5,
         decode_mode="linear", decode_bias=False,
-        diagonal_covariance=True, gauge_group="block_glk", amp_dtype="fp32",
-        # _conditional_artifact_fields reads relational_mode on every _cost_model_fields call; the
-        # fake config must carry it. relational_mode="off" keeps the conditional block empty, which
-        # is the regime these cost-accounting assertions describe.
-        relational_mode="off",
+        diagonal_covariance=True, gauge_group="block_glk", amp_dtype="fp32", use_block_mlp=False,
+        relational_mode="projected_filtering", relational_readout_mode="full_link_update",
     )
+    base = {**config_values(), **base}
     base.update(over)
+    base.setdefault("d_head", base["embed_dim"] // base["n_heads"])
+    base.setdefault("relational_mode", "projected_filtering")
+    base.setdefault("relational_readout_mode", "full_link_update")
     return types.SimpleNamespace(**base)
 
 
@@ -277,13 +278,13 @@ def test_cost_model_linear_decode_does_not_count_prior_bank_readout():
         tokens_seen=13,
     )
 
-    assert linear["active_params_per_token"] == token_row + V * K
-    assert biased["active_params_per_token"] == token_row + V * K + V
-    assert prior_bank["active_params_per_token"] == token_row + 2 * V * K
+    assert linear["active_params_per_token"] == token_row + V * K + 4 * 2 * K * K
+    assert biased["active_params_per_token"] == token_row + V * K + V + 4 * 2 * K * K
+    assert prior_bank["active_params_per_token"] == token_row + 2 * V * K + 4 * 2 * K * K
     assert linear["flops_per_token_decode"] == prior_bank["flops_per_token_decode"] == 2.0 * V * K
 
 
-def test_cost_model_counts_the_belief_estep_once_per_layer_forward():
+def test_cost_model_declares_projected_estep_flops_unavailable():
     V, K, n_gen, N, L, T, n_blocks = 11, 6, 5, 7, 2, 3, 2
     tokens_seen = 13
     model = _cost_model(K=K, n_gen=n_gen, n_blocks=n_blocks)
@@ -295,15 +296,12 @@ def test_cost_model_counts_the_belief_estep_once_per_layer_forward():
 
     out = _cost_model_fields(model, cfg, n_params=123, tokens_seen=tokens_seen)
 
-    d_head = K / n_blocks
-    estep_kernel = 2.0 * N * K + 2.0 * N * d_head * d_head
-    belief_estep = L * T * estep_kernel
-    decode = 2.0 * V * K
     # The linear decoder reads only W, so the report must not count a prior-bank readout here.
-    expected_active = (2 * K + n_gen) + V * K
+    expected_active = (2 * K + n_gen) + V * K + 4 * L * K * K
     assert out["active_params_per_token"] == expected_active
-    assert out["flops_per_token_estep"] == belief_estep
-    assert out["est_flops_analytic"] == (decode + belief_estep) * tokens_seen
+    assert out["flops_per_token_estep"] is None
+    assert out["est_flops_analytic"] is None
+    assert "projected" in out["est_flops_analytic_unavailable_reason"]
 
 
 def _pure_ns(**over):
@@ -315,8 +313,10 @@ def _pure_ns(**over):
         lambda_beta=1.0,
         gauge_transport="on", pos_rotation="none", rope_full_gauge=False, rope_on_value=True,
         skip_belief_sigma_update=False,
-        gauge_group="glk", family="gaussian_full",
-        gradient_mode="filtering", relational_mode="off",
+        gauge_group="block_glk", family="gaussian_full",
+        gradient_mode="filtering", attention_mode="projected_gradient",
+        relational_mode="projected_filtering", relational_readout_mode="full_link_update",
+        embed_dim=4, n_heads=2, d_head=2,
         e_step_update="gradient", mm_damping=1.0,
         use_block_mlp=False, block_mlp_mode="coordinate", block_mlp_covariance="passthrough",
         block_mlp_expansion=4, block_mlp_covariance_floor=1e-4,
@@ -329,7 +329,11 @@ def _pure_ns(**over):
         phi_mstep_max_matrix_norm=None, transport_chart_max_norm=12.0,
         e_phi_lr=0.0,
         beta_attention_prior="causal")
+    base = {**config_values(), **base}
     base.update(over)
+    base.setdefault("d_head", base["embed_dim"] // base["n_heads"])
+    base.setdefault("relational_mode", "projected_filtering")
+    base.setdefault("relational_readout_mode", "full_link_update")
     return types.SimpleNamespace(**base)
 
 
@@ -338,7 +342,7 @@ def test_pure_path_report_structure_and_flags():
                 "guard_sigma_floor_frac": 0.0}]
     pure = _pure_ns()
     rep = _pure_path_report(pure, history)
-    assert rep["on_pure_path"] is True
+    assert rep["on_pure_path"] is False
     assert rep["on_gauge_pure_path"] is True
     preexisting = {
         "on_pure_path", "pure_flags", "config_toggles", "converged_stress",
@@ -351,7 +355,8 @@ def test_pure_path_report_structure_and_flags():
     assert preexisting <= rep.keys()
     assert additions <= rep.keys()
     assert rep["converged_stress"]["cocycle_residual"] == 1e-7
-    # flipping any defining toggle drops the run off the pure path
+    assert rep["pure_flags"]["canonical_attention_entropy"] is False
+    # Optional components retain independent flags despite the unavailable shared objective.
     impure = types.SimpleNamespace(**{**pure.__dict__, "use_head_mixer": True})
     rep2 = _pure_path_report(impure, history)
     assert rep2["on_pure_path"] is False and rep2["pure_flags"]["no_head_mixer"] is False
@@ -386,14 +391,14 @@ def test_pure_path_report_keeps_priorbank_evidence_role_separate_from_head_mixer
 
 
 def test_gauge_purity_axis_is_independent_of_fe_axis():
-    # F8 (audit 2026-07-01): the gauge axis is a SECOND, independent purity axis -- flipping a gauge
-    # toggle must drop on_gauge_pure_path while on_pure_path stays True.
+    # F8 (audit 2026-07-01): the gauge axis remains independent of the shared-objective flag; flipping a gauge
+    # toggle changes its own axis while projected attention remains off the shared-objective path.
     history = []
     rep = _pure_path_report(_pure_ns(gauge_transport="off"), history)
-    assert rep["on_pure_path"] is True and rep["on_gauge_pure_path"] is False
+    assert rep["on_pure_path"] is False and rep["on_gauge_pure_path"] is False
     assert rep["gauge_flags"]["learned_gauge_transport"] is False
     rep2 = _pure_path_report(_pure_ns(pos_rotation="rope"), history)
-    assert rep2["on_pure_path"] is True and rep2["on_gauge_pure_path"] is False
+    assert rep2["on_pure_path"] is False and rep2["on_gauge_pure_path"] is False
     assert rep2["gauge_flags"]["no_positional_rotation"] is False
     # the gauge settings are surfaced in config_toggles for transparency
     for key in ("gauge_transport", "pos_rotation", "rope_full_gauge", "rope_on_value"):
@@ -429,9 +434,13 @@ def _finalize_ns(**over):
         skip_belief_sigma_update=False,
         embed_dim=4, n_heads=2, n_layers=1, n_e_steps=1, diagonal_covariance=True,
         gauge_group="block_glk", family="gaussian_full",
-        relational_mode="off",
+        relational_mode="projected_filtering", relational_readout_mode="full_link_update",
         amp_dtype="fp32")
+    base = {**config_values(), **base}
     base.update(over)
+    base.setdefault("d_head", base["embed_dim"] // base["n_heads"])
+    base.setdefault("relational_mode", "projected_filtering")
+    base.setdefault("relational_readout_mode", "full_link_update")
     return types.SimpleNamespace(**base)
 
 
@@ -483,7 +492,8 @@ def test_train_logs_held_out_geometry(tmp_path):
         rows = list(_csv.DictReader(fh))
     assert rows and "val_holonomy_wilson" in rows[0]      # rectangular: column defined from row 0
     finite = [r for r in rows if r["val_holonomy_wilson"] not in ("", "nan", None)]
-    assert finite, "an eval row must carry a finite held-out Wilson holonomy"
+    assert not finite, "legacy geometry is unavailable on projected attention"
+    assert any(r["val_relational_receiver_cost_after"] not in ("", "nan", None) for r in rows)
 
 
 # --------------------------------------------------------------------------- ablation seed aggregation
@@ -557,12 +567,12 @@ def _write_scaling_analysis_run(
         seed=seed,
         vocab_size=16,
         embed_dim=4,
-        n_heads=1,
+        n_heads=2,
         max_seq_len=8,
         n_layers=1,
         n_e_steps=n_e_steps,
         family="gaussian_diagonal",
-        gauge_group="glk",
+        gauge_group="block_glk",
     )
     config = serialize_config(cfg)
     effective_config = asdict(cfg)
@@ -606,8 +616,8 @@ def _write_scaling_analysis_run(
             **metrics,
             "n_learnable_params": n_params,
             "embed_dim": 4,
-            "n_heads": 1,
-            "n_gen": 16,
+            "n_heads": cfg.n_heads,
+            "n_gen": cfg.embed_dim * cfg.d_head,
             "gauge_group": cfg.gauge_group,
             "n_layers": 1,
             "n_e_steps": n_e_steps,
@@ -994,12 +1004,12 @@ def _write_scaling_validation_run(root, *, route, label, embed_dim, n_params, te
         seed=seed,
         vocab_size=16,
         embed_dim=embed_dim,
-        n_heads=1,
+        n_heads=2,
         max_seq_len=8,
         n_layers=1,
         n_e_steps=1,
         family="gaussian_diagonal",
-        gauge_group="glk",
+        gauge_group="block_glk",
     )
     config = serialize_config(cfg)
     effective_config = asdict(cfg)
@@ -1044,8 +1054,8 @@ def _write_scaling_validation_run(root, *, route, label, embed_dim, n_params, te
             **metrics,
             "n_learnable_params": n_params,
             "embed_dim": embed_dim,
-            "n_heads": 1,
-            "n_gen": embed_dim * embed_dim,
+            "n_heads": cfg.n_heads,
+            "n_gen": embed_dim * cfg.d_head,
             "gauge_group": cfg.gauge_group,
             "n_layers": 1,
             "n_e_steps": 1,
@@ -1228,7 +1238,7 @@ def test_pure_path_reports_mlp_as_optional_nonintertwiner():
     """The default route remains pure; a coordinate MLP is explicitly reported as non-pure."""
     off = _pure_path_report(_pure_ns(use_block_mlp=False), [])
     assert off["pure_flags"]["no_block_mlp"] is True
-    assert off["on_pure_path"] is True
+    assert off["on_pure_path"] is False
     assert off["config_toggles"]["block_mlp_structural_mode"] == "disabled"
     assert off["config_toggles"]["block_mlp_covariance_contract"] == "not_applicable"
 
@@ -1251,7 +1261,7 @@ def test_cost_model_counts_untied_block_mlp_params_and_flops():
     off = _cost_model_fields(model, off_cfg, n_params=123, tokens_seen=13)
     per_layer = 2 * expansion * K * K + (expansion + 1) * K
     mlp_flops = 4.0 * layers * expansion * K * K
-    base_active = (2 * K + 5) + 11 * K
+    base_active = (2 * K + 5) + 11 * K + 4 * layers * K * K
 
     assert off["active_params_per_token"] == base_active
     assert out["active_params_per_token"] - base_active == layers * per_layer

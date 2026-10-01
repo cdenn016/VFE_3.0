@@ -75,20 +75,6 @@ def test_adamw_reports_nondefault_group_trust_radius() -> None:
         test_config(m_phi_update_mode="adamw", m_phi_group_trust_radius=.2)
 
 
-def test_scaling_rejects_inert_mup_before_creating_model(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import scaling
-    baseline = config_values(e_step_update="mm_exact", attention_mode="transported",
-                    relational_output_scope="head",
-                    attention_residual=False, eval_stride=None,
-                    embed_dim=4, n_heads=2, vocab_size=7, max_seq_len=3, n_layers=1)
-    monkeypatch.setattr(scaling, "BASELINE", baseline)
-    cell = {"label": "inert", "route": "grow_K_mup", "scale_knob": "embed_dim", "overrides": {}}
-    result = scaling.run_cell(cell, tmp_path / "cell", 1, dataset="unused", device=torch.device("cpu"))
-    assert result["error_kind"] == "config"
-    assert "grow_K_mup varies e_q_mu_lr" in result["error"]
-    assert not (tmp_path / "cell").exists()
-
-
 @pytest.mark.parametrize("mode", ["diagonal_chunked", "full_chunked"])
 def test_fp64_decode_policy_preserves_completed_logits(mode: str) -> None:
     from tests.test_priorbank_head_evidence import _reference_bank, _full_query, _diagonal_query

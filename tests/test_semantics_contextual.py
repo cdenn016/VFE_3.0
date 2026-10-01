@@ -136,12 +136,12 @@ READOUT_CONFIGS = [
     dict(attention_mode="projected_predictive", decode_mode="diagonal_chunked", untie_decode_bank=True),
     dict(norm_type_final="layernorm"),
     dict(family="gaussian_full", decode_mode="full_chunked"),
-    dict(encode_mode="canonical_content_projected", decode_mode="full_chunked", lambda_alpha_mode="constant"),
+    dict(encode_mode="per_token_additive", pos_phi="none", decode_mode="diagonal_chunked", lambda_alpha_mode="constant"),
 ]
 
 
 @pytest.mark.parametrize("over", READOUT_CONFIGS, ids=["linear", "projected_kl", "final_layernorm",
-                                                       "full_family", "canonical_projected"])
+                                                       "full_family", "additive_control"])
 def test_lens_at_last_layer_reproduces_forward_logits(over):
     cfg, model = _tiny_model(**over)
     x = torch.from_numpy(np.random.default_rng(3).integers(1, V, size=(3, N_CTX)))

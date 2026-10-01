@@ -22,7 +22,7 @@ def _tiny_config(**overrides: Any) -> VFE3Config:
         cross_couplings=None, pos_phi="none", pos_rotation="none",
         e_step_update="gradient", e_step_gradient="unroll",
         oracle_unroll_grad=True,
-        e_phi_lr=0.005, phi_precond_mode="killing_per_block",
+        e_phi_lr=0.0, phi_precond_mode="killing_per_block",
         decode_mode="linear", mu_init_std=0.01, phi_scale=0.01,
         lambda_alpha_mode="constant",
     )
@@ -88,7 +88,7 @@ def test_model_policy_is_owned_and_custom_family_api_is_unchanged(monkeypatch: p
     assert first._coupling_energy(CustomFamily, value) is value
 
 
-@pytest.mark.parametrize("update", ["gradient", "mm_exact"])
+@pytest.mark.parametrize("update", ["gradient"])
 def test_tiny_forward_and_backward_forward_backend_to_coupling(
     monkeypatch: pytest.MonkeyPatch,
     update: str,

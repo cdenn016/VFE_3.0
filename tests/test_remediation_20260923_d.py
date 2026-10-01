@@ -29,8 +29,6 @@ from vfe3.data.datasets import TokenWindows, make_dataloader
 from vfe3.data.word_vocab import WordVocabulary, vocabulary_path
 from vfe3.families.base import get_family
 from vfe3.free_energy import self_divergence_for_alpha
-from vfe3.geometry.transport import RopeTransport, transport_mean
-from vfe3.gradients.qkv import qkv_filtering_gradients
 from vfe3.gradients.relational import relational_score
 from vfe3.model import prior_bank as prior_bank_module
 from vfe3.model.model import VFEModel, _derived_seed
@@ -138,8 +136,8 @@ def test_decode_av_gemm_runs_ieee_fp32_and_restores_the_global_policy() -> None:
 
 @pytest.mark.parametrize("scope", ["full"])
 def test_relational_output_init_identity_and_depth_scaled(scope: str) -> None:
-    common = dict(attention_mode="projected_predictive", relational_output_scope=scope,
-                  relational_input_scope="full",
+    common = dict(attention_mode="projected_predictive",
+
                   attention_residual=True, n_layers=2)
     identity = VFEModel(_relational_cfg(**common))
     scaled = VFEModel(_relational_cfg(**common, relational_output_init="depth_scaled"))
@@ -155,9 +153,7 @@ def test_relational_output_init_identity_and_depth_scaled(scope: str) -> None:
         assert torch.equal(depth.raw_score_q, plain.raw_score_q)
 
 
-def test_depth_scaled_output_init_is_rejected_without_learned_output_maps() -> None:
-    with pytest.raises(ValueError, match="relational_output_init"):
-        _tiny(relational_output_init="depth_scaled")
+def test_invalid_depth_scaled_output_init_is_rejected() -> None:
     with pytest.raises(ValueError, match="relational_output_init"):
         _tiny(relational_output_init="bogus")
 
@@ -248,7 +244,7 @@ def _self_divergence(model: VFEModel, q, prior) -> float:
          use_block_mlp=False),
     dict(n_layers=1, n_e_steps=2, norm_type_block="layernorm", use_block_mlp=True),
 ])
-def test_transported_diagnostics_score_the_e_step_state_against_its_live_prior(
+def test_projected_diagnostics_do_not_report_a_transported_shared_objective(
         overrides: dict) -> None:
     torch.manual_seed(5)
     cfg = _tiny(vocab_size=12, max_seq_len=4, e_q_mu_lr=1.0, mu_init_std=0.5, pos_phi="none",
@@ -266,42 +262,14 @@ def test_transported_diagnostics_score_the_e_step_state_against_its_live_prior(
     assert expected > 1e-2
     replayed = model.diagnostics(tokens)
     from_snapshot = model.diagnostics(tokens, snapshot=snapshot)
-    assert replayed["self_divergence"] == pytest.approx(expected, rel=1e-5, abs=1e-7)
-    assert from_snapshot["self_divergence"] == pytest.approx(expected, rel=1e-5, abs=1e-7)
-    if overrides["use_block_mlp"]:
-        # The post-transform state keeps its own, separately named column.
-        assert replayed["post_block_mlp_self_divergence"] != pytest.approx(expected, rel=1e-3)
+    assert math.isnan(replayed["self_divergence"])
+    assert math.isnan(from_snapshot["self_divergence"])
+    assert replayed["relational_legacy_global_f_available"] == 0.0
+    assert math.isfinite(replayed["relational_receiver_cost_after"])
 
 
 # ---- #22 projected_conditional value gauge ----------------------------------------------------
 
-def _rope(n: int, dtype: torch.dtype) -> torch.Tensor:
-    rotation = torch.zeros(n, 4, 4, dtype=dtype)
-    for position in range(n):
-        for block, frequency in enumerate((0.7, 0.3)):
-            angle = torch.tensor(frequency * (position + 1), dtype=dtype)
-            c, s = torch.cos(angle), torch.sin(angle)
-            rotation[position, 2 * block:2 * block + 2, 2 * block:2 * block + 2] = torch.stack(
-                (torch.stack((c, -s)), torch.stack((s, c))))
-    return rotation                                              # (N, K, K) block-diagonal
-
-
-@pytest.mark.parametrize("on_value", [False, True])
-def test_conditional_values_use_the_value_gauge(on_value: bool) -> None:
-    mu, sigma, omega, frame, ops, prior = _fixture()
-    rope = RopeTransport(base=omega, rope=_rope(3, mu.dtype), on_value=on_value,
-                         same_frame_flat_cocycle=True)
-    capture: dict = {}
-    qkv_filtering_gradients(mu, sigma, mu.detach() + 0.2, sigma, rope, frame,
-                            value_frame=frame, log_prior=prior, tau=0.9, capture=capture,
-                            relational_operators=ops)
-    values = capture["conditional_context"].value_templates      # (1, N, N, K)
-    content = ops.apply_content(mu.detach(), frame)
-    unrotated = transport_mean(omega, content)                   # U_i O T U_j^{-1} mu_j
-    rotated = transport_mean(rope, content)                      # U_i R_i^T R_j O T U_j^{-1} mu_j
-    assert not torch.allclose(unrotated, rotated)
-    torch.testing.assert_close(values, unrotated if not on_value else rotated,
-                               rtol=1e-12, atol=1e-12)
 
 
 # ---- #25 word cache builder and loader --------------------------------------------------------
@@ -447,7 +415,7 @@ def test_module_init_streams_are_distinct_and_deterministic() -> None:
 
     def build(seed: int) -> VFEModel:
         return VFEModel(_relational_cfg(attention_mode="projected_predictive", n_layers=2,
-                                        relational_input_scope="full", relational_output_scope="full",
+
                                         seed=seed))
 
     six, six_again, seven = build(6), build(6), build(7)

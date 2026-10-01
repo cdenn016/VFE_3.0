@@ -24,7 +24,7 @@ from vfe3.geometry.transport import CompactFactoredTransport
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import RunArtifacts, semantic_config_fingerprint
 from vfe3.train import _loader_data_identity, train
-from vfe3.viz.extract import converged_state
+from vfe3.viz.extract import readout_state
 from vfe3.viz.figures import register_figure
 from vfe3.viz.report import generate_figures, plan_single_run_figures, vocab_comparison_figures
 from vfe3.viz.specs import FigureSpec, emit_registered_figures
@@ -39,7 +39,7 @@ def _loader(seed=0, n=600, seq_len=8, bs=8):
 
 def _cfg(**kw):
     base = dict(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                n_e_steps=2, e_q_mu_lr=0.1, e_phi_lr=0.05)
+                n_e_steps=2, e_q_mu_lr=0.1, e_phi_lr=0.0)
     base.update(kw)
     return test_config(**base)
 
@@ -63,7 +63,7 @@ def _bind_offline_selection_contract(
 def test_converged_state_shapes_and_finite():
     model = _model(n_layers=2)
     tok = torch.randint(0, 6, (2, 8))                          # only seq 0 is used
-    st = converged_state(model, tok)
+    st = readout_state(model, tok)
     n, k = 8, 4
     assert st["mu"].shape == (n, k)
     assert st["phi"].shape[0] == n
@@ -75,8 +75,7 @@ def test_converged_state_shapes_and_finite():
     assert torch.isfinite(st["omega"].inv_blocks).all()
     assert st["energy"].shape[-2:] == (n, n)
     assert st["beta"].shape[-2:] == (n, n)
-    assert st["self_div"].shape[0] == n
-    for key in ("mu", "sigma", "phi", "exp_phi", "energy", "beta", "self_div"):
+    for key in ("mu", "sigma", "phi", "exp_phi", "energy", "beta"):
         assert torch.isfinite(st[key]).all(), key
 
 
@@ -142,8 +141,7 @@ def test_generate_figures_reuses_one_same_token_snapshot(tmp_path, monkeypatch):
 
     monkeypatch.setattr(model, "build_diagnostic_snapshot", build_snapshot)
 
-    for name in ("e_step_belief_trace", "across_layer_belief_trace", "converged_state",
-                 "numerical_health"):
+    for name in ("readout_state", "numerical_health"):
         original = getattr(extract, name)
 
         def wrapper(*args, _name=name, _original=original, **kwargs):
@@ -169,16 +167,11 @@ def test_generate_figures_reuses_one_same_token_snapshot(tmp_path, monkeypatch):
     )
 
     assert len(built) == 1
-    expected = {"e_step_belief_trace", "across_layer_belief_trace", "converged_state",
-                "numerical_health", "attention_maps",
+    expected = {"readout_state", "numerical_health", "attention_maps",
                 "diagnostics_per_layer"}
     assert {name for name, _ in seen} == expected
-    # attention_maps is called with snapshot=None: it scores at "entry" now, which a snapshot
-    # cannot serve, so it REPLAYS from the model (audit 2026-08-06 F19 -- the figure and the CSV
-    # column had been measuring different objects under the same name). Every OTHER consumer still
-    # shares the one snapshot, and nothing builds a second, which is what this test pins.
-    assert all(snapshot is built[0] for name, snapshot in seen if name != "attention_maps")
-    assert all(snapshot is None for name, snapshot in seen if name == "attention_maps")
+    # Entry attention is the captured pre-update router; every same-token consumer shares its source.
+    assert all(snapshot is built[0] for _, snapshot in seen)
     assert len(built) == 1
     written = {path.name for path in paths}
     assert {
@@ -228,7 +221,7 @@ def test_generate_figures_embedding_switch_runs_semantic_analysis(tmp_path, monk
     assert (run_dir / "figures" / "reliability_diagram.png") in paths
 
 
-def test_generate_figures_forwards_model_owned_full_gaussian_policy(tmp_path, monkeypatch):
+def test_generate_figures_skips_legacy_gauge_certificate_on_projected_route(tmp_path, monkeypatch):
     """The report driver forwards the live model policy to its gauge-residual measurement."""
     from vfe3 import metrics
     from vfe3.viz import report
@@ -254,8 +247,8 @@ def test_generate_figures_forwards_model_owned_full_gaussian_policy(tmp_path, mo
     monkeypatch.setattr(metrics, "gauge_equivariance_residual", observed_residual)
     paths = generate_figures(tmp_path / "run", model=model, loader=_loader(), max_sequences=1)
 
-    assert seen == ["fp64"]
-    assert (tmp_path / "run" / "figures" / "gauge_equivariance.png") in paths
+    assert seen == []
+    assert (tmp_path / "run" / "figures" / "gauge_equivariance.png") not in paths
 
 
 def test_generate_figures_rejects_empty_best_bundle_state(tmp_path):
@@ -322,7 +315,7 @@ def test_generate_figures_memory_guard_uses_materialized_batch_peak(tmp_path, mo
 
     generate_figures(tmp_path / "small", model=_MemoryGuardModel(), loader=small_loader)
 
-    assert "trace" in calls
+    assert "trace" not in calls
     assert {"ce_bank", "vocab"} <= set(calls)
     assert "full-vocab" not in caplog.text
 

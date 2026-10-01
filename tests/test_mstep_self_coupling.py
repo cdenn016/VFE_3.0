@@ -17,29 +17,16 @@ import torch
 from vfe3.families import get_family
 from vfe3.free_energy import self_divergence_for_alpha
 from vfe3.model.model import VFEModel
-from vfe3.model.stack import vfe_stack
+from vfe3.contracts import MStepCapture
 
 
 def _converged_self_divergence(model: VFEModel, tokens: torch.Tensor) -> torch.Tensor:
-    r"""Replicate forward's ``sc`` recipe on ``model`` for ``tokens``: encode -> vfe_stack
-    -> reconstruct the last-block prior via the prior_handoff fold -> mean self-divergence
-    of the converged belief vs that prior. Used as the independent oracle for linearity.
-
-    Forward scores the converged q* captured BEFORE the post-inference transforms (head mixer, CG
-    coupling, block norm; block.py ``capture["converged"]``, audit 2026-06-09 F19). With the
-    default ``norm_type_block='layernorm'`` the post-norm stack output is not q*, so the oracle runs
-    the single-layer stack with ``block_norm=None`` and reads q* directly under any norm setting."""
+    r"""Independently evaluate mean KL(q*||p) from the live final-block capture."""
     cfg = model.cfg
-    assert cfg.n_layers == 1, "the block_norm=None replay equals q* only for a single block"
-    beliefs = model.prior_bank.encode(tokens)
-    log_prior = model._attention_log_prior(tokens.shape[1], tokens.device)
-    out = vfe_stack(beliefs, beliefs.mu, beliefs.sigma, model.group, cfg,
-                    log_prior=log_prior, block_norm=None)
-    rho, rho_s = cfg.prior_handoff_rho, cfg.prior_handoff_sigma
-    mu_p, sigma_p = beliefs.mu, beliefs.sigma
-    for _ in range(cfg.n_layers - 1):
-        mu_p = (1.0 - rho) * mu_p + rho * out.mu
-        sigma_p = (1.0 - rho_s) * sigma_p + rho_s * out.sigma
+    capture: MStepCapture = {}
+    model.forward_beliefs(tokens, capture=capture)
+    out = capture["converged"]
+    mu_p, sigma_p = capture["final_block_prior"]
     fam = get_family(cfg.family)
     return self_divergence_for_alpha(
         fam(out.mu, out.sigma), fam(mu_p, sigma_p),
@@ -78,31 +65,20 @@ def test_linear_in_weight():
 def _converged_self_coupling_per_coord(
     model: VFEModel, tokens: torch.Tensor, *, b0: float, c0: float,
 ) -> torch.Tensor:
-    r"""Independent oracle for the per-coord-weighted M-step self-term: replicate forward's
-    converged belief + last-block prior, then weight each coordinate's self-divergence by its
-    OWN alpha^(k)* = c0/(b0 + D^(k)) (detached, the envelope-stationary value), sum over k, mean
-    over (B, N). alpha^(k) is recomputed from the closed form here, not via ``self_coupling_alpha``,
-    so the test is an independent check of the formula forward applies. Like
-    ``_converged_self_divergence`` it reads the pre-norm converged q* (``block_norm=None``)."""
+    r"""Evaluate sum_k alpha_i^(k) D_i^(k), using alpha_i^(k)=c0/(b0+D_i^(k))."""
     cfg = model.cfg
-    assert cfg.n_layers == 1, "the block_norm=None replay equals q* only for a single block"
-    beliefs = model.prior_bank.encode(tokens)
-    log_prior = model._attention_log_prior(tokens.shape[1], tokens.device)
-    out = vfe_stack(beliefs, beliefs.mu, beliefs.sigma, model.group, cfg,
-                    log_prior=log_prior, block_norm=None)
-    rho, rho_s = cfg.prior_handoff_rho, cfg.prior_handoff_sigma
-    mu_p, sigma_p = beliefs.mu, beliefs.sigma
-    for _ in range(cfg.n_layers - 1):
-        mu_p = (1.0 - rho) * mu_p + rho * out.mu
-        sigma_p = (1.0 - rho_s) * sigma_p + rho_s * out.sigma
+    capture: MStepCapture = {}
+    model.forward_beliefs(tokens, capture=capture)
+    out = capture["converged"]
+    mu_p, sigma_p = capture["final_block_prior"]
     fam = get_family(cfg.family)
-    D = self_divergence_for_alpha(                      # (B, N, K) per-coordinate
+    D = self_divergence_for_alpha(
         fam(out.mu, out.sigma), fam(mu_p, sigma_p),
         alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
         divergence_family=cfg.divergence_family, lambda_alpha_mode=cfg.lambda_alpha_mode,
     )
-    a = (c0 / (b0 + D)).detach()                        # alpha^(k)* = c0/(b0 + D^(k))
-    return (a * D).sum(dim=-1).mean()                   # sum_k alpha^(k) D^(k), then mean over (B, N)
+    a = (c0 / (b0 + D)).detach()
+    return (a * D).sum(dim=-1).mean()
 
 
 def test_per_coord_alpha_weighting():
@@ -112,6 +88,7 @@ def test_per_coord_alpha_weighting():
     w, b0, c0 = 0.5, 0.5, 2.0
     cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                      n_e_steps=1, e_q_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0,
+                     attention_mode="projected_predictive",
                      lambda_alpha_mode="state_dependent_per_coord", b0=b0, c0=c0,
                      mstep_self_coupling_weight=w, seed=0)
     model = VFEModel(cfg)
@@ -133,7 +110,7 @@ def test_config_validation():
 def test_backward_finite_grads_on_prior_tables():
     # The term is grad-connected (no detach): backprop with weight>0 reaches the prior tables.
     cfg = test_config(vocab_size=15, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=2,
-                     n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.02, gradient_mode="filtering",
+                     n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.0, gradient_mode="filtering",
                      mstep_self_coupling_weight=0.5, seed=0)
     model = VFEModel(cfg)
     tokens = torch.randint(0, 15, (2, 4))

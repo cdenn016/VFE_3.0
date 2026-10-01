@@ -27,7 +27,7 @@ def test_predictive_spread_survives_common_translation(
     frame = CanonicalFrameContext(eye, eye, block_diagonal=compact_frame)
     beta = torch.tensor([[1., 0., 0.], [.5, .5, 0.], [.25, .25, .5]])
     beta = beta.expand(1, 2, 3, 3).clone()
-    ops = RelationalOperators([2, 2], 6, input_scope="full", output_scope="full",
+    ops = RelationalOperators([2, 2], 6,
                               readout_mode="predictive_content",
                               predictive_covariance="moment_matched", predictive_covariance_centering=True)
     actual = ops.predictive_covariance_update(mu, sigma, beta, frame)
@@ -90,7 +90,7 @@ def test_centered_predictive_covariance_retains_correlations_and_gradients(resid
     sigma = (forward @ C @ forward.transpose(-1, -2)).requires_grad_()
     logits = torch.tensor([[[[.1, -.2, .3], [.4, .2, -.5], [-.3, .5, .1]],
                              [[-.2, .4, .1], [.5, -.1, .2], [.2, -.4, .5]]]], requires_grad=True)
-    ops = RelationalOperators([2, 2], 6, input_scope="full", output_scope="full",
+    ops = RelationalOperators([2, 2], 6,
                               readout_mode="predictive_content", attention_residual=residual,
                               predictive_covariance="moment_matched", predictive_covariance_centering=True)
     with torch.no_grad():

@@ -370,44 +370,6 @@ def test_run_posthoc_routing_module_ok_failing_and_missing(tmp_path: Path, monke
     assert off["residual"] == {} and any("residual" in note for note in off["notes"])
 
 
-def test_run_posthoc_transported_route_records_reasons(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    r"""A run without a projected router: residual ratios still defined, C_i gap and self-weights skipped."""
-    import tests.test_posthoc_20260928 as base
-    from vfe3.model.model import VFEModel
-    from vfe3.posthoc.report import run_posthoc
-
-    def transported_cfg(**over: Any) -> Any:
-        return _cfg(attention_mode="transported", attention_residual=False, relational_output_scope="head")
-
-    def transported_model(cfg: Any, seed: int = 0) -> VFEModel:
-        torch.manual_seed(seed)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            model = VFEModel(cfg).eval()
-        with torch.no_grad():
-            model.prior_bank.sigma_log_embed.normal_(0.0, 0.5)
-            model.prior_bank.phi_embed.normal_(0.0, 0.3)
-        return model
-
-    monkeypatch.setattr(base, "_cfg", transported_cfg)
-    monkeypatch.setattr(base, "_model", transported_model)
-    run_dir, cache_dir = _fake_run(tmp_path)
-    report = run_posthoc(run_dir, out_dir=tmp_path / "out", options=_light_options(cache_dir, figures=True),
-                         log=lambda message: None)
-    assert all(p["status"] == "ok" for p in report["passes"])
-    residual = report["residual"]["final_model.pt"]
-    assert residual["status"] == "ok" and residual["residual_additive"]
-    assert residual["self_weight"]["status"] == "unavailable" and "no projected router" in residual["self_weight"]["reason"]
-    covariance = report["covariance"]["final_model.pt"]
-    assert covariance["routing_covariance"]["status"] == "not_applicable"
-    assert "no projected router" in covariance["routing_covariance"]["reason"]
-    assert covariance["hidden_temperature"]["status"] == "ok"
-    assert report["calibration"]["status"] == "not_applicable"
-    assert report["routing"]["status"] == "ok" or report["routing"].get("reason") or report["routing"].get("error")
-    assert (tmp_path / "out" / "figures" / "s1a_residual_ratio_final.pdf").is_file()
-    assert (tmp_path / "out" / "figures" / "v2_872_covariance_final.pdf").is_file()   # temperature panel only
-
-
 def test_run_posthoc_calibration_on_a_wikitext_named_synthetic_run(tmp_path: Path,
                                                                    monkeypatch: pytest.MonkeyPatch) -> None:
     r"""The report computes the calibration from its full test pass, with the byte decoder and word file."""

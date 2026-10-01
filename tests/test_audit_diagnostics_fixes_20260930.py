@@ -48,11 +48,8 @@ def test_gauge_badge_includes_decoder_coordinate_policy(decode_coordinates: str)
     [
         ("projected_predictive", "moment_matched", "gradient", False, False),
         ("projected_predictive", "passthrough", "gradient", False, False),
-        ("projected_conditional", "passthrough", "gradient", False, False),
-        ("transported", "passthrough", "gradient", False, True),
-        ("transported", "passthrough", "gradient", True, False),
-        ("transported", "passthrough", "mm_exact", False, True),
-        ("transported", "passthrough", "mm_exact", True, False),
+        ("projected_gradient", "passthrough", "gradient", False, True),
+        ("projected_gradient", "passthrough", "gradient", True, False),
     ],
 )
 @pytest.mark.parametrize("sigma_max", [None, 100.0])
@@ -68,7 +65,7 @@ def test_spectral_cap_facet_tracks_the_live_covariance_consumer(
         attention_mode=attention_mode, predictive_covariance=predictive_covariance,
         e_step_update=e_step_update, skip_belief_sigma_update=skip_sigma,
         sigma_max=sigma_max,
-        decode_coordinates="local" if attention_mode == "transported" else "reference",
+        decode_coordinates="reference",
     )
     report = ra._pure_path_report(cfg, [])
     expected = sigma_max is None if consumer else "not_applicable"

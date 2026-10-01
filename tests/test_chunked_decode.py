@@ -22,13 +22,8 @@ def _full_ce(model: VFEModel, tokens: torch.Tensor, targets: torch.Tensor) -> to
 
 
 def _converged(model: VFEModel, tokens: torch.Tensor):
-    """Run the E-step stack and return (mu_final, sigma_final) the decode consumes."""
-    from vfe3.model.stack import vfe_stack
-    B, N = tokens.shape
-    beliefs = model.prior_bank.encode(tokens)
-    log_prior = model._attention_log_prior(N, tokens.device)
-    out = vfe_stack(beliefs, beliefs.mu, beliefs.sigma, model.group, model.cfg,
-                    log_prior=log_prior, block_norm=model.block_norm)
+    """Return the same-forward full-width belief state consumed by the decoder."""
+    out, _ = model.forward_beliefs(tokens)
     return out.mu.float(), out.sigma.float()
 
 

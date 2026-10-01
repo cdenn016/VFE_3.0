@@ -78,38 +78,3 @@ def _geometric_mean_target(belief, mu_p, sigma_p, grp, tau, renyi_order):
     sigma_star = 1.0 / (0.5 * (Pp + sum_beta_Pt))
     mu_star = (Pp * mu_p + sum_beta_Pt_mu) / (Pp + sum_beta_Pt)
     return mu_star, sigma_star
-
-
-def test_forward_kl_converges_to_geometric_mean_fixed_point():
-    # renyi_order=1 (forward KL): the converged belief equals the geometric-mean Boltzmann target
-    # of eq:geometric_mean_target_supp to convergence tolerance.
-    belief, mu_p, sigma_p, grp = _setup()
-    out = e_step(belief, mu_p, sigma_p, grp, tau=_TAU, n_iter=_N_ITER,
-                 e_q_mu_lr=_LR, e_q_sigma_lr=_LR, e_phi_lr=0.0, renyi_order=1.0)
-    mu_star, sigma_star = _geometric_mean_target(out, mu_p, sigma_p, grp, _TAU, 1.0)
-    assert torch.allclose(out.mu, mu_star, atol=1e-4)
-    assert torch.allclose(out.sigma, sigma_star, atol=1e-4)
-
-
-def test_non_kl_divergence_breaks_the_geometric_mean_form():
-    # renyi_order=0.5 (a non-KL convex f-divergence): the converged belief does NOT take the
-    # geometric-mean form -- the closed form is forward-KL-specific (the theorem's "only if").
-    belief, mu_p, sigma_p, grp = _setup()
-    out = e_step(belief, mu_p, sigma_p, grp, tau=_TAU, n_iter=_N_ITER,
-                 e_q_mu_lr=_LR, e_q_sigma_lr=_LR, e_phi_lr=0.0, renyi_order=0.5)
-    mu_star, sigma_star = _geometric_mean_target(out, mu_p, sigma_p, grp, _TAU, 0.5)
-    dev = max((out.mu - mu_star).abs().max().item(), (out.sigma - sigma_star).abs().max().item())
-    assert dev > 1e-2          # converged Renyi fixed point departs the geometric-mean target
-
-
-def test_geometric_mean_gap_is_kl_specific():
-    # The two directions side by side: the KL gap is orders of magnitude below the non-KL gap.
-    belief, mu_p, sigma_p, grp = _setup(seed=1)
-    kw = dict(tau=_TAU, n_iter=_N_ITER, e_q_mu_lr=_LR, e_q_sigma_lr=_LR, e_phi_lr=0.0)
-    out_kl = e_step(belief, mu_p, sigma_p, grp, renyi_order=1.0, **kw)
-    out_r = e_step(belief, mu_p, sigma_p, grp, renyi_order=0.5, **kw)
-    m1, s1 = _geometric_mean_target(out_kl, mu_p, sigma_p, grp, _TAU, 1.0)
-    m2, s2 = _geometric_mean_target(out_r, mu_p, sigma_p, grp, _TAU, 0.5)
-    gap_kl = max((out_kl.mu - m1).abs().max().item(), (out_kl.sigma - s1).abs().max().item())
-    gap_r  = max((out_r.mu - m2).abs().max().item(),  (out_r.sigma - s2).abs().max().item())
-    assert gap_r > 100.0 * gap_kl

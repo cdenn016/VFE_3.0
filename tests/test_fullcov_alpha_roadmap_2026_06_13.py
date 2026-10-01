@@ -30,15 +30,6 @@ from vfe3.model.model import VFEModel
 # ---------------------------------------------------------------------------
 # A1: per-coordinate Bhattacharyya / Jeffreys
 # ---------------------------------------------------------------------------
-def test_per_coord_bhattacharyya_and_jeffreys_construct_squared_hellinger_still_rejected():
-    """state_dependent_per_coord now accepts the divergences that DECOMPOSE coordinate-wise
-    (bhattacharyya = 0.5 D_1/2, jeffreys = KL + KL_rev), and still rejects squared_hellinger
-    (H^2 = 1 - exp(-D_1/2/2) is a nonlinear transform of the SUMMED divergence)."""
-    test_config(lambda_alpha_mode="state_dependent_per_coord", divergence_family="bhattacharyya")
-    test_config(lambda_alpha_mode="state_dependent_per_coord", divergence_family="jeffreys")
-    test_config(lambda_alpha_mode="state_dependent_per_coord", divergence_family="renyi")
-    with pytest.raises(ValueError):
-        test_config(lambda_alpha_mode="state_dependent_per_coord", divergence_family="squared_hellinger")
 
 
 def test_per_coord_bhattacharyya_jeffreys_sum_to_scalar():
@@ -67,19 +58,6 @@ def test_per_coord_bhattacharyya_jeffreys_sum_to_scalar():
     assert torch.allclose(jf_pc.sum(-1), jf, atol=1e-5)
 
 
-def test_per_coord_bhattacharyya_forward_backward_runs():
-    """A model with state_dependent_per_coord + bhattacharyya runs forward+backward (routes to the
-    autograd oracle; the per-coordinate self-divergence shapes a per-coordinate alpha)."""
-    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                     n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.0,
-                     lambda_alpha_mode="state_dependent_per_coord", divergence_family="bhattacharyya")
-    model = VFEModel(cfg)
-    tokens = torch.randint(0, 20, (2, 5)); targets = torch.randint(0, 20, (2, 5))
-    _, loss, _ = model(tokens, targets)
-    assert torch.isfinite(loss)
-    loss.backward()
-    assert model.prior_bank.mu_embed.grad is not None
-    assert model.prior_bank.mu_embed.grad.abs().sum() > 0
 
 
 # ---------------------------------------------------------------------------
@@ -88,62 +66,10 @@ def test_per_coord_bhattacharyya_forward_backward_runs():
 # the _eigh_damped gap-regularized eigh backward (retraction.py); the single training backward is
 # now finite. This pins that, and contrasts it with the truncated default (oracle_unroll_grad=False).
 # ---------------------------------------------------------------------------
-def _fullcov_model(renyi_order=1.0, oracle_unroll_grad=True, **kw):
-    # A noncanonical Renyi order uses the family-consistent chunked decoder; canonical order 1
-    # keeps the fast full-covariance chunked kernel.
-    decode_mode = kw.pop("decode_mode", "full_chunked" if renyi_order == 1.0 else "family_chunked")
-    kw.setdefault("lambda_alpha_mode", "constant")
-    cfg = test_config(vocab_size=24, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                     n_e_steps=2, e_q_mu_lr=0.05, e_q_sigma_lr=0.02, e_phi_lr=0.01,
-                     family="gaussian_full", decode_mode=decode_mode,
-                     pos_phi="learned",
-                     renyi_order=renyi_order, e_step_gradient="unroll",
-                     oracle_unroll_grad=oracle_unroll_grad, **kw)
-    return VFEModel(cfg)
 
 
-@pytest.mark.parametrize("renyi_order", [0.5, 1.0])
-def test_fullcov_unroll_oracle_grad_is_finite(renyi_order):
-    """gaussian_full + e_step_gradient='unroll' + oracle_unroll_grad=True: the single training
-    backward is finite across Renyi orders (the _eigh_damped/safe_cholesky fix; the old
-    'expect NaNs' docstring is stale for the single-backward training path)."""
-    torch.manual_seed(0)
-    model = _fullcov_model(renyi_order=renyi_order)
-    tokens = torch.randint(0, 24, (2, 5)); targets = torch.randint(0, 24, (2, 5))
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")                  # alpha>1 convex-regime + oracle notices
-        _, loss, _ = model(tokens, targets)
-        loss.backward()
-    assert torch.isfinite(loss)
-    for name, p in model.named_parameters():
-        if p.grad is not None:
-            assert torch.isfinite(p.grad).all(), f"non-finite grad in {name} at renyi_order={renyi_order}"
 
 
-def test_fullcov_unroll_oracle_grad_reaches_gauge_frame_only_when_enabled():
-    """The through-inference signal to the gauge-frame table phi_embed is LIVE under
-    oracle_unroll_grad=True and TRUNCATED (None/zero) under the default False -- the documented
-    remedy actually works for full covariance."""
-    torch.manual_seed(1)
-    tokens = torch.randint(0, 24, (2, 5)); targets = torch.randint(0, 24, (2, 5))
-
-    on = _fullcov_model(oracle_unroll_grad=True)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        _, loss_on, _ = on(tokens, targets)
-        loss_on.backward()
-    g_on = on.prior_bank.phi_embed.grad
-    assert g_on is not None and torch.isfinite(g_on).all() and g_on.abs().sum() > 0
-
-    off = _fullcov_model(oracle_unroll_grad=False)
-    off.load_state_dict(on.state_dict())
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        _, loss_off, _ = off(tokens, targets)
-        loss_off.backward()
-    g_off = off.prior_bank.phi_embed.grad
-    # truncated: the E-step's through-inference signal to phi_embed never flows on the detached oracle
-    assert g_off is None or g_off.abs().sum() == 0
 
 
 # ---------------------------------------------------------------------------
@@ -187,22 +113,6 @@ def test_state_dependent_envelope_has_no_product_rule_residue(div_name):
     )
 
 
-@pytest.mark.parametrize("div_name", ["squared_hellinger", "bhattacharyya", "jeffreys"])
-def test_state_dependent_per_position_nonrenyi_forward_backward(div_name):
-    """Per-position state_dependent + a non-Renyi divergence constructs and trains (routes to the
-    oracle); the prior tables get a finite gradient."""
-    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                     n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.0,
-                     lambda_alpha_mode="state_dependent", divergence_family=div_name, b0=0.3)
-    model = VFEModel(cfg)
-    tokens = torch.randint(0, 20, (2, 5)); targets = torch.randint(0, 20, (2, 5))
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        _, loss, _ = model(tokens, targets)
-        loss.backward()
-    assert torch.isfinite(loss)
-    assert model.prior_bank.mu_embed.grad is not None
-    assert torch.isfinite(model.prior_bank.mu_embed.grad).all()
 
 
 # ---------------------------------------------------------------------------
@@ -226,14 +136,8 @@ def _full_model(vocab_size=64, **kw):
 
 
 def _full_converged(model):
-    from vfe3.model.stack import vfe_stack
-
     def run(tokens):
-        N = tokens.shape[1]
-        beliefs = model.prior_bank.encode(tokens)
-        log_prior = model._attention_log_prior(N, tokens.device)
-        out = vfe_stack(beliefs, beliefs.mu, beliefs.sigma, model.group, model.cfg,
-                        log_prior=log_prior, block_norm=model.block_norm)
+        out, _ = model.forward_beliefs(tokens)
         return out.mu.float(), out.sigma.float()
     return run
 
@@ -455,14 +359,3 @@ def test_warn_fullcov_linear_decode_discards_covariance():
     assert not _warns_matching("discards the converged",
                                family="gaussian_full",
                                decode_mode="full_chunked")
-
-
-def test_warn_state_dependent_bounded_divergence_b0():
-    assert _warns_matching("nearly constant",
-                           lambda_alpha_mode="state_dependent", divergence_family="squared_hellinger", b0=1.0)
-    # A small b0 (restoring a wide alpha* range) does NOT warn about the range.
-    assert not _warns_matching("nearly constant",
-                               lambda_alpha_mode="state_dependent", divergence_family="squared_hellinger", b0=0.05)
-    # An unbounded divergence (renyi/KL) does NOT warn at b0=1.
-    assert not _warns_matching("nearly constant",
-                               lambda_alpha_mode="state_dependent", divergence_family="renyi", b0=1.0)

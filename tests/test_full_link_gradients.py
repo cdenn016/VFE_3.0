@@ -31,7 +31,7 @@ def _fixture(full: bool = False, compact: bool = False) -> tuple:
         V = torch.stack((V[..., :2, :2], V[..., 2:, 2:]), dim=-3)
     frame = CanonicalFrameContext(U, V, block_diagonal=compact)
     ops = RelationalOperators(
-        [2, 2], 11, input_scope="full", output_scope="full",
+        [2, 2], 11,
         readout_mode="predictive_content", predictive_covariance="passthrough").double()
     with torch.no_grad():
         ops.T.add_(torch.tensor([[[.02, -.03, .21, .11], [.04, .01, -.14, .16]],

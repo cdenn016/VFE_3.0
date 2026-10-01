@@ -1,0 +1,14 @@
+{
+  "removed_fields": [
+    "relational_identity_content",
+    "relational_input_scope",
+    "relational_output_scope"
+  ],
+  "added_fields": [],
+  "changed_defaults": {
+    "attention_mode": {
+      "before": "'transported'",
+      "after": "'projected_predictive'"
+    }
+  }
+}

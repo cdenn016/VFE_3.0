@@ -73,7 +73,7 @@ def test_block_mlp_mode_and_covariance_controls_validate(mode, covariance):
             "use_block_mlp": True,
             "block_mlp_mode": "canonical_frame",
             "e_phi_lr": 0.01,
-        }, "canonical_frame"),
+        }, "e_phi_lr"),
         ({
             "use_block_mlp": True,
             "block_mlp_mode": "canonical_frame",
@@ -89,7 +89,7 @@ def test_block_mlp_modes_fail_closed_on_incompatible_config(overrides, message):
         _full_cfg(**overrides)
 
 
-@pytest.mark.parametrize("attention_mode", ["projected_predictive", "projected_gradient", "transported"])
+@pytest.mark.parametrize("attention_mode", ["projected_predictive", "projected_gradient"])
 @pytest.mark.parametrize("rope_full_gauge, rope_on_value", [(False, False), (False, True), (True, False)])
 def test_canonical_rope_split_config_builds_with_visible_caveat(
     attention_mode: str, rope_full_gauge: bool, rope_on_value: bool,
@@ -98,8 +98,8 @@ def test_canonical_rope_split_config_builds_with_visible_caveat(
     cfg = tiny_config(
         attention_mode=attention_mode,
         attention_residual=False,
-        relational_input_scope="head" if attention_mode == "transported" else "full",
-        relational_output_scope="head" if attention_mode == "transported" else "full",
+
+
         predictive_covariance="passthrough",
         family="gaussian_full" if rope_full_gauge else "gaussian_diagonal",
         decode_mode="full_chunked" if rope_full_gauge else "diagonal_chunked",
@@ -199,6 +199,8 @@ def test_block_uses_moment_api_and_forwards_canonical_frame():
         block_mlp=_MomentTransform(),
         block_mlp_frame=frame,
         capture=capture,
+        relational_operators=model.relational_operators_by_layer[0],
+        relational_frame=frame,
     )
     assert torch.equal(out.mu, capture["converged"].mu + 3.0)
     assert torch.equal(out.sigma, capture["converged"].sigma + 5.0)

@@ -15,7 +15,7 @@ from vfe3.run_artifacts import RunArtifacts, load_checkpoint
 
 def _depth_cfg(layers: int, **kwargs) -> VFE3Config:
     return _cfg(n_layers=layers, attention_mode="projected_predictive",
-                relational_input_scope="full", relational_output_scope="full",
+
                 attention_residual=True,
                 prior_handoff_rho=1.0, prior_handoff_sigma=0.1, **kwargs)
 
@@ -127,7 +127,6 @@ def test_depth_gradient_matches_finite_difference() -> None:
         minus = model.forward_beliefs(ids, return_logits=False)[0].mu.square().sum()
         param.flatten()[0] = initial
     torch.testing.assert_close(derivative, (plus-minus)/(2*step), rtol=1e-3, atol=1e-6)
-
 
 
 def test_projection_parameters_are_independent_and_optimized() -> None:

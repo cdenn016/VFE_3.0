@@ -226,8 +226,7 @@ def test_config_local_validation_serialization_and_inactive_mark(
     from tests.test_relational_integration import _cfg
     from vfe3.config import VFE3Config, config_from_serialized, serialize_config
 
-    predictive = dict(relational_input_scope="full", attention_mode="projected_predictive",
-                      relational_output_scope="full")
+    predictive = dict(attention_mode="projected_predictive")
     assert _cfg(**predictive).relational_routing == "gaussian_kl"
     cfg = _cfg(**predictive, relational_routing="noisy_query")
     assert asdict(config_from_serialized(serialize_config(cfg), source="noisy query")) == asdict(cfg)
@@ -240,23 +239,20 @@ def test_config_local_validation_serialization_and_inactive_mark(
     with pytest.raises(ValueError, match="relational_routing"):
         _cfg(**predictive, relational_routing="dot_product")
     with pytest.raises(ValueError, match="requires attention_mode='projected_predictive'"):
-        _cfg(relational_routing="noisy_query")  # _cfg defaults to projected_conditional
-    assert "relational_routing" in tiny_config(
-        attention_mode="transported", predictive_covariance="passthrough",
-        relational_output_scope="head", attention_residual=False).inactive_fields()
+        _cfg(relational_routing="noisy_query")  # _cfg defaults to projected_gradient
+    assert "relational_routing" not in tiny_config().inactive_fields()
 
 
 def test_operators_carry_routing_without_new_state() -> None:
     from vfe3.model.relational_operators import RelationalOperators
 
-    default = RelationalOperators([2, 2], 11, input_scope="full", readout_mode="predictive_content",
-                                  output_scope="full")
-    noisy = RelationalOperators([2, 2], 11, input_scope="full", readout_mode="predictive_content",
-                                output_scope="full", routing="noisy_query")
+    default = RelationalOperators([2, 2], 11, readout_mode="predictive_content")
+    noisy = RelationalOperators([2, 2], 11, readout_mode="predictive_content",
+                                routing="noisy_query")
     assert (default.routing, noisy.routing) == ("gaussian_kl", "noisy_query")
     assert set(noisy.state_dict()) == set(default.state_dict())
     with pytest.raises(ValueError, match="predictive_content"):
-        RelationalOperators([2, 2], 11, routing="noisy_query")
+        RelationalOperators([2, 2], 11, readout_mode="full_link_update", routing="noisy_query")
     with pytest.raises(ValueError, match="routing"):
         RelationalOperators([2, 2], 11, readout_mode="predictive_content", routing="dot_product")
 
@@ -273,8 +269,8 @@ def test_relational_score_dispatches_on_the_operator_routing(monkeypatch: pytest
     monkeypatch.setattr(relational, "projected_gaussian_kl",
                         lambda *args, **kwargs: called.append("gaussian_kl") or torch.zeros(()))
     for routing in ("gaussian_kl", "noisy_query"):
-        ops = RelationalOperators([2, 2], 11, input_scope="full", readout_mode="predictive_content",
-                                  output_scope="full", routing=routing).double()
+        ops = RelationalOperators([2, 2], 11, readout_mode="predictive_content",
+                                  routing=routing).double()
         relational.relational_score(mu, sigma, mu, sigma, frame, ops)
     assert called == ["gaussian_kl", "noisy_query"]
 
@@ -283,8 +279,8 @@ def test_run_record_names_the_routing() -> None:
     from tests.test_relational_integration import _cfg
     from vfe3.run_artifacts import _relational_artifact_fields
 
-    cfg = _cfg(relational_input_scope="full", attention_mode="projected_predictive",
-               relational_output_scope="full", relational_routing="noisy_query")
+    cfg = _cfg(attention_mode="projected_predictive",
+               relational_routing="noisy_query")
     assert _relational_artifact_fields(cfg)["relational_operators"]["routing"] == "noisy_query"
 
 
@@ -292,8 +288,8 @@ def test_noisy_query_model_trains_and_loads_gaussian_kl_checkpoints() -> None:
     from tests.test_relational_integration import _cfg, _tokens
     from vfe3.model.model import VFEModel
 
-    predictive = dict(relational_input_scope="full", attention_mode="projected_predictive",
-                      relational_output_scope="full", attention_residual=True)
+    predictive = dict(attention_mode="projected_predictive",
+                      attention_residual=True)
     torch.manual_seed(23)
     kl_model = VFEModel(_cfg(**predictive))
     noisy_model = VFEModel(_cfg(**predictive, relational_routing="noisy_query"))

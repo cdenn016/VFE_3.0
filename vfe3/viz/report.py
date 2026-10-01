@@ -835,9 +835,9 @@ def generate_figures(
             )
         )
     )   # B1/EXP-3 Sigma_q<->CE join (calibration figures)
-    # score_at="entry" to match the CSV columns and the shipped attention/ figures (audit 2026-08-06
-    # F19); the snapshot can only serve "converged", which is NOT the beta the forward used.
-    amaps       = _safe(lambda: model.attention_maps(tok, score_at="entry"), "attention_maps")
+    # Retained relational routes capture the actual pre-update router in the same-token snapshot.
+    amaps       = _safe(lambda: model.attention_maps(
+        tok, score_at="entry", snapshot=snapshot), "attention_maps")
     per_layer   = _safe(lambda: model.diagnostics_per_layer(
         tok, snapshot=snapshot), "diagnostics_per_layer")
     health      = _safe(lambda: extract.numerical_health(

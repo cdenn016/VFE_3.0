@@ -89,8 +89,8 @@ def _random_moments(B: int, N: int, H: int, r: int, seed: int) -> Dict[str, torc
 # ----------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("over", [
-    {}, {"relational_input_scope": "full"}, {"relational_input_scope": "full", "kl_max": 1.0},
-    {"family": "gaussian_full", "relational_input_scope": "full", "decode_mode": "full_chunked",
+    {}, {"kl_max": 1.0},
+    {"family": "gaussian_full", "decode_mode": "full_chunked",
      "predictive_covariance": "moment_matched"}])
 def test_components_sum_to_the_model_routing_logits(over: Dict[str, Any]) -> None:
     result = _run(_model(_cfg(**over)))
@@ -238,7 +238,7 @@ def test_frame_share_is_one_without_covariance_spread_and_zero_without_frames() 
 # Skips and outputs
 # ----------------------------------------------------------------------------------------------
 
-@pytest.mark.parametrize("over, fragment", [({"attention_mode": "transported"}, "attention_mode"),
+@pytest.mark.parametrize("over, fragment", [({"attention_mode": "projected_gradient", "predictive_covariance": "passthrough"}, "attention_mode"),
                                             ({"relational_routing": "noisy_query"}, "noisy")])
 def test_skip_with_reason_on_routes_without_the_projected_gaussian_router(
         over: Dict[str, Any], fragment: str, tmp_path: Path) -> None:
@@ -255,7 +255,7 @@ def test_skip_with_reason_on_routes_without_the_projected_gaussian_router(
 
 
 def test_write_outputs_writes_figure_table_and_samples(tmp_path: Path) -> None:
-    result = _run(_model(_cfg(relational_input_scope="full"), dtype=torch.float32))
+    result = _run(_model(_cfg(), dtype=torch.float32))
     assert result["status"] == "ok"
     paths = rt.write_routing_outputs(result, tmp_path)
     names = {p.name for p in paths}

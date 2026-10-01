@@ -10,7 +10,7 @@ from typing import Any
 from vfe3.config import VFE3Config
 
 
-# Stable historical controls, with tiny dimensions and figure generation disabled.
+# Explicit full-link baseline, with tiny dimensions and figure generation disabled.
 _CONFIG_VALUES: dict[str, Any] = {
     'vocab_size': 7,
     'embed_dim': 4,
@@ -71,12 +71,9 @@ _CONFIG_VALUES: dict[str, Any] = {
     'rope_base': 100.0,
     'rope_full_gauge': False,
     'rope_on_value': True,
-    'attention_mode': 'transported',
-    'relational_input_scope': 'head',
-    'relational_output_scope': 'head',
+    'attention_mode': 'projected_gradient',
     'attention_residual': False,
     'relational_output_init': 'identity',
-    'relational_identity_content': False,
     'relational_receiver_noise': 1.0,
     'relational_routing': 'gaussian_kl',
     'predictive_covariance': 'passthrough',
@@ -178,11 +175,6 @@ _CONFIG_VALUES: dict[str, Any] = {
 def config_values(**overrides: Any) -> dict[str, Any]:
     """Return a fresh complete configuration dictionary with local overrides."""
     values = deepcopy({**_CONFIG_VALUES, **overrides})
-    if values["attention_mode"] == "projected_predictive":
-        # Fixed predictive architecture; explicit legacy values still exercise rejection.
-        for name in ("relational_input_scope", "relational_output_scope"):
-            if name not in overrides:
-                values[name] = "full"
     return values
 
 
@@ -203,7 +195,7 @@ def tiny_config(**overrides: Any) -> VFE3Config:
                   decode_bias=False, decode_unigram_prior=False, untie_decode_bank=False,
                   beta_attention_prior='causal', fp32_matmul_precision=None,
                   attention_mode='projected_predictive', predictive_covariance='moment_matched',
-                  attention_residual=True, relational_input_scope='full', relational_output_scope='full',
+                  attention_residual=True,
                   decode_ranking_fp64_escalation=False, decode_av_precision='fp32',
                   e_mu_q_trust=None, block_mlp_expansion=2, transport_clamp_monitor=False,
                   generate_embedding_figures=False,

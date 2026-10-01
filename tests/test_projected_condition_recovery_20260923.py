@@ -45,14 +45,12 @@ def _reference(sources: tuple, cost: Callable) -> torch.Tensor:
     return cost(aq, Gq, ak, Gk)
 
 
-def test_config_disabled_validated_and_inactive_on_transported() -> None:
+def test_config_disabled_validated_and_active_on_supported_routes() -> None:
     from tests.profiles import tiny_config
     from tests.test_relational_integration import _cfg
     assert _cfg(projected_cov_condition_recovery=False).projected_cov_condition_recovery is False
     with pytest.raises(ValueError, match="projected_cov_condition_recovery"):
         _cfg(projected_cov_condition_recovery=1)
-    assert "projected_cov_condition_recovery" in tiny_config(attention_mode="transported", predictive_covariance="passthrough",
-                       attention_residual=False, relational_output_scope="head").inactive_fields()
     assert "projected_cov_condition_recovery" not in _cfg().inactive_fields()
 
 

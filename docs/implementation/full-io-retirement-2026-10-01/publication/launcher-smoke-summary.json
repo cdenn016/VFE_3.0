@@ -1,0 +1,742 @@
+{
+  "scope": "tiny CPU integration smoke from preserved publication launcher and config defaults",
+  "environment": {
+    "python": "C:\\anaconda\\python.exe",
+    "torch": "2.10.0.dev20251210+cu128",
+    "cuda_visible_devices": "-1",
+    "cuda_available": false,
+    "num_threads": 1,
+    "num_interop_threads": 1,
+    "device": "cpu"
+  },
+  "initial_snapshot_sha256": {
+    "train_vfe3.py": "1845d6b83291690366903eb193b1ed2fcd490e5830a1aea4a4494b8338602051",
+    "vfe3/config.py": "4501cee2fa99be33e3529f43e15b8a43de7fd8363205fc6eefe970355dd6978b"
+  },
+  "passed_smokes": [
+    {
+      "attention_mode": "projected_predictive",
+      "cpu_autocast": {
+        "enabled": true,
+        "dtype": "torch.bfloat16",
+        "captured_amp_dtype": "bf16"
+      },
+      "status": "passed",
+      "loss": 1.9575523138046265,
+      "ce": 1.9575523138046265,
+      "logits_shape": [
+        1,
+        3,
+        7
+      ],
+      "logits_dtype": "torch.float32",
+      "logits_device": "cpu",
+      "all_present_gradients_finite": true,
+      "trainable_parameters": 472,
+      "live_outer_gradients": {
+        "pos_phi_free": {
+          "device": "cpu",
+          "shape": [
+            3,
+            8
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.036737993359565735
+        },
+        "relational_operators_extra.0.raw_score_q": {
+          "device": "cpu",
+          "shape": [
+            2,
+            2,
+            4
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.0017494151834398508
+        },
+        "relational_operators_extra.0.raw_score_k": {
+          "device": "cpu",
+          "shape": [
+            2,
+            2,
+            4
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.0017877959180623293
+        },
+        "relational_operators_extra.0.T": {
+          "device": "cpu",
+          "shape": [
+            2,
+            2,
+            4
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.03560696542263031
+        },
+        "relational_operators_extra.0.O": {
+          "device": "cpu",
+          "shape": [
+            2,
+            4,
+            2
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.035496748983860016
+        },
+        "relational_operators.raw_score_q": {
+          "device": "cpu",
+          "shape": [
+            2,
+            2,
+            4
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.0003991910198237747
+        },
+        "relational_operators.raw_score_k": {
+          "device": "cpu",
+          "shape": [
+            2,
+            2,
+            4
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.0004007617535535246
+        },
+        "relational_operators.T": {
+          "device": "cpu",
+          "shape": [
+            2,
+            2,
+            4
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.03921056538820267
+        },
+        "relational_operators.O": {
+          "device": "cpu",
+          "shape": [
+            2,
+            4,
+            2
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.03921232745051384
+        },
+        "prior_bank.mu_embed": {
+          "device": "cpu",
+          "shape": [
+            7,
+            4
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.2691870331764221
+        },
+        "prior_bank.sigma_log_embed": {
+          "device": "cpu",
+          "shape": [
+            7,
+            4
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.003339929273352027
+        },
+        "prior_bank.phi_embed": {
+          "device": "cpu",
+          "shape": [
+            7,
+            8
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.0360904186964035
+        },
+        "prior_bank.decode_mu_embed": {
+          "device": "cpu",
+          "shape": [
+            7,
+            4
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.23441629111766815
+        },
+        "prior_bank.decode_sigma_log_embed": {
+          "device": "cpu",
+          "shape": [
+            7,
+            4
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.5564936995506287
+        },
+        "block_mlps.0.fc1.weight": {
+          "device": "cpu",
+          "shape": [
+            8,
+            4
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.013548459857702255
+        },
+        "block_mlps.0.fc1.bias": {
+          "device": "cpu",
+          "shape": [
+            8
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.001828269101679325
+        },
+        "block_mlps.0.fc2.weight": {
+          "device": "cpu",
+          "shape": [
+            4,
+            8
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.012533701956272125
+        },
+        "block_mlps.0.fc2.bias": {
+          "device": "cpu",
+          "shape": [
+            4
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.0055017932318151
+        },
+        "block_mlps.1.fc1.weight": {
+          "device": "cpu",
+          "shape": [
+            8,
+            4
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.014845683239400387
+        },
+        "block_mlps.1.fc1.bias": {
+          "device": "cpu",
+          "shape": [
+            8
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.0019277537940070033
+        },
+        "block_mlps.1.fc2.weight": {
+          "device": "cpu",
+          "shape": [
+            4,
+            8
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.0077658831141889095
+        },
+        "block_mlps.1.fc2.bias": {
+          "device": "cpu",
+          "shape": [
+            4
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.004435097333043814
+        }
+      },
+      "executor_calls": [
+        {
+          "readout": "predictive_content",
+          "input_scope": "full",
+          "output_scope": "full",
+          "frame_device": "cpu",
+          "n_iter": 1,
+          "receiver_shape": [
+            1,
+            3,
+            4
+          ]
+        },
+        {
+          "readout": "predictive_content",
+          "input_scope": "full",
+          "output_scope": "full",
+          "frame_device": "cpu",
+          "n_iter": 1,
+          "receiver_shape": [
+            1,
+            3,
+            4
+          ]
+        },
+        {
+          "readout": "predictive_content",
+          "input_scope": "full",
+          "output_scope": "full",
+          "frame_device": "cpu",
+          "n_iter": 1,
+          "receiver_shape": [
+            1,
+            3,
+            4
+          ]
+        },
+        {
+          "readout": "predictive_content",
+          "input_scope": "full",
+          "output_scope": "full",
+          "frame_device": "cpu",
+          "n_iter": 1,
+          "receiver_shape": [
+            1,
+            3,
+            4
+          ]
+        }
+      ],
+      "elapsed_seconds": 0.32491700001992285,
+      "data_limitations": [
+        "Synthetic V=7 tokens; no corpus or tokenizer loaded",
+        "Captured decode_unigram_prior=True retained; unset corpus counts give uniform decode prior"
+      ],
+      "validation_config": {
+        "vocab_size": 7,
+        "embed_dim": 4,
+        "n_heads": 2,
+        "n_layers": 2,
+        "n_e_steps": 1,
+        "attention_mode": "projected_predictive",
+        "family": "gaussian_diagonal",
+        "encode_mode": "per_token",
+        "decode_mode": "diagonal_chunked",
+        "decode_coordinates": "local",
+        "predictive_covariance": "moment_matched",
+        "predictive_covariance_centering": false,
+        "lambda_alpha_mode": "state_dependent_per_coord",
+        "block_mlp_mode": "canonical_frame",
+        "pos_phi": "learned",
+        "pos_rotation": "none",
+        "amp_dtype": "bf16"
+      },
+      "substituted_fields": [
+        "embed_dim",
+        "max_seq_len",
+        "batch_size",
+        "eval_stride",
+        "decode_chunk_size",
+        "block_mlp_expansion",
+        "kl_max"
+      ]
+    },
+    {
+      "attention_mode": "projected_gradient",
+      "cpu_autocast": {
+        "enabled": true,
+        "dtype": "torch.bfloat16",
+        "captured_amp_dtype": "bf16"
+      },
+      "status": "passed",
+      "loss": 1.9459415674209595,
+      "ce": 1.9459415674209595,
+      "logits_shape": [
+        1,
+        3,
+        7
+      ],
+      "logits_dtype": "torch.float32",
+      "logits_device": "cpu",
+      "all_present_gradients_finite": true,
+      "trainable_parameters": 472,
+      "live_outer_gradients": {
+        "pos_phi_free": {
+          "device": "cpu",
+          "shape": [
+            3,
+            8
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.2846751809120178
+        },
+        "relational_operators_extra.0.raw_score_q": {
+          "device": "cpu",
+          "shape": [
+            2,
+            2,
+            4
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.004037783946841955
+        },
+        "relational_operators_extra.0.raw_score_k": {
+          "device": "cpu",
+          "shape": [
+            2,
+            2,
+            4
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.005671021528542042
+        },
+        "relational_operators_extra.0.T": {
+          "device": "cpu",
+          "shape": [
+            2,
+            2,
+            4
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.024278249591588974
+        },
+        "relational_operators_extra.0.O": {
+          "device": "cpu",
+          "shape": [
+            2,
+            4,
+            2
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.25623539090156555
+        },
+        "relational_operators.raw_score_q": {
+          "device": "cpu",
+          "shape": [
+            2,
+            2,
+            4
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 1.8980554159497842e-05
+        },
+        "relational_operators.raw_score_k": {
+          "device": "cpu",
+          "shape": [
+            2,
+            2,
+            4
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 1.8997592633240856e-05
+        },
+        "relational_operators.T": {
+          "device": "cpu",
+          "shape": [
+            2,
+            2,
+            4
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.005495373625308275
+        },
+        "relational_operators.O": {
+          "device": "cpu",
+          "shape": [
+            2,
+            4,
+            2
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.037620916962623596
+        },
+        "prior_bank.mu_embed": {
+          "device": "cpu",
+          "shape": [
+            7,
+            4
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.6998792290687561
+        },
+        "prior_bank.sigma_log_embed": {
+          "device": "cpu",
+          "shape": [
+            7,
+            4
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.10959505289793015
+        },
+        "prior_bank.phi_embed": {
+          "device": "cpu",
+          "shape": [
+            7,
+            8
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.2849964201450348
+        },
+        "prior_bank.decode_mu_embed": {
+          "device": "cpu",
+          "shape": [
+            7,
+            4
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.2837359607219696
+        },
+        "prior_bank.decode_sigma_log_embed": {
+          "device": "cpu",
+          "shape": [
+            7,
+            4
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.592531681060791
+        },
+        "block_mlps.0.fc1.weight": {
+          "device": "cpu",
+          "shape": [
+            8,
+            4
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.01690208725631237
+        },
+        "block_mlps.0.fc1.bias": {
+          "device": "cpu",
+          "shape": [
+            8
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.0024173911660909653
+        },
+        "block_mlps.0.fc2.weight": {
+          "device": "cpu",
+          "shape": [
+            4,
+            8
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.014160288497805595
+        },
+        "block_mlps.0.fc2.bias": {
+          "device": "cpu",
+          "shape": [
+            4
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.040117524564266205
+        },
+        "block_mlps.1.fc1.weight": {
+          "device": "cpu",
+          "shape": [
+            8,
+            4
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.010372373275458813
+        },
+        "block_mlps.1.fc1.bias": {
+          "device": "cpu",
+          "shape": [
+            8
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.0015530693344771862
+        },
+        "block_mlps.1.fc2.weight": {
+          "device": "cpu",
+          "shape": [
+            4,
+            8
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.013678757473826408
+        },
+        "block_mlps.1.fc2.bias": {
+          "device": "cpu",
+          "shape": [
+            4
+          ],
+          "gradient_present": true,
+          "finite": true,
+          "norm": 0.004276267718523741
+        }
+      },
+      "executor_calls": [
+        {
+          "readout": "full_link_update",
+          "input_scope": "full",
+          "output_scope": "full",
+          "frame_device": "cpu",
+          "n_iter": 1,
+          "receiver_shape": [
+            1,
+            3,
+            4
+          ]
+        },
+        {
+          "readout": "full_link_update",
+          "input_scope": "full",
+          "output_scope": "full",
+          "frame_device": "cpu",
+          "n_iter": 1,
+          "receiver_shape": [
+            1,
+            3,
+            4
+          ]
+        },
+        {
+          "readout": "full_link_update",
+          "input_scope": "full",
+          "output_scope": "full",
+          "frame_device": "cpu",
+          "n_iter": 1,
+          "receiver_shape": [
+            1,
+            3,
+            4
+          ]
+        },
+        {
+          "readout": "full_link_update",
+          "input_scope": "full",
+          "output_scope": "full",
+          "frame_device": "cpu",
+          "n_iter": 1,
+          "receiver_shape": [
+            1,
+            3,
+            4
+          ]
+        }
+      ],
+      "elapsed_seconds": 0.021943399973679334,
+      "data_limitations": [
+        "Synthetic V=7 tokens; no corpus or tokenizer loaded",
+        "Captured decode_unigram_prior=True retained; unset corpus counts give uniform decode prior"
+      ],
+      "validation_config": {
+        "vocab_size": 7,
+        "embed_dim": 4,
+        "n_heads": 2,
+        "n_layers": 2,
+        "n_e_steps": 1,
+        "attention_mode": "projected_gradient",
+        "family": "gaussian_diagonal",
+        "encode_mode": "per_token",
+        "decode_mode": "diagonal_chunked",
+        "decode_coordinates": "local",
+        "predictive_covariance": "passthrough",
+        "predictive_covariance_centering": false,
+        "lambda_alpha_mode": "constant",
+        "block_mlp_mode": "canonical_frame",
+        "pos_phi": "learned",
+        "pos_rotation": "none",
+        "amp_dtype": "bf16"
+      },
+      "substituted_fields": [
+        "embed_dim",
+        "max_seq_len",
+        "batch_size",
+        "eval_stride",
+        "decode_chunk_size",
+        "block_mlp_expansion",
+        "kl_max",
+        "attention_mode",
+        "lambda_alpha_mode",
+        "predictive_covariance"
+      ]
+    }
+  ],
+  "implementation_sha256": {
+    "vfe3/config.py": "b1986b678aedccb6a8b40debe306549b5500ea1501209f1516972d539d71c0dd",
+    "vfe3/model/model.py": "5b8311c75158ba76b96790ba75e808a739891852b469717d6fbd3b818913e67e",
+    "vfe3/model/block.py": "85b8bad20867aca28f0d728c4ec0326d2612d3af086dbc4b3ad3ebfc3ae00da7",
+    "vfe3/model/relational_operators.py": "ae75da52ff48dc625501d2fe21805f171014c1be291e69adafd50eac6de1679b",
+    "vfe3/inference/e_step.py": "8fd1380b725325b0dc3ba2341620a7809de562a49a3b3bba8db5dccbe80d45bb",
+    "vfe3/gradients/relational.py": "b0c3ca9e912af2fdc3777ce92ce46100d47c63c9daa0cf685daadf8a00e7d2c1",
+    "vfe3/gradients/full_link.py": "740bc616aa164e9337aa513060f7c0a4d53422dd003f494311783aa1a1c49527"
+  },
+  "latest_active_snapshot_sha256": {
+    "train_vfe3.py": "069d78cdcc4257f8bd3b2488e60fabb61fff130729c466c408e3d8133f28bcb9",
+    "vfe3/config.py": "4501cee2fa99be33e3529f43e15b8a43de7fd8363205fc6eefe970355dd6978b"
+  },
+  "latest_active_smoke": {
+    "attention_mode": "projected_predictive",
+    "substitutions": {
+      "embed_dim": {
+        "captured": 20,
+        "validation": 4,
+        "reason": "tiny CPU dimensions or the preserved 8*K ceiling"
+      },
+      "max_seq_len": {
+        "captured": 128,
+        "validation": 3,
+        "reason": "tiny CPU dimensions or the preserved 8*K ceiling"
+      },
+      "batch_size": {
+        "captured": 64,
+        "validation": 1,
+        "reason": "tiny CPU dimensions or the preserved 8*K ceiling"
+      },
+      "eval_stride": {
+        "captured": 32,
+        "validation": 3,
+        "reason": "tiny CPU dimensions or the preserved 8*K ceiling"
+      },
+      "decode_chunk_size": {
+        "captured": 8192,
+        "validation": 7,
+        "reason": "tiny CPU dimensions or the preserved 8*K ceiling"
+      },
+      "block_mlp_expansion": {
+        "captured": 8,
+        "validation": 2,
+        "reason": "tiny CPU dimensions or the preserved 8*K ceiling"
+      },
+      "kl_max": {
+        "captured": 160,
+        "validation": 32,
+        "reason": "tiny CPU dimensions or the preserved 8*K ceiling"
+      }
+    },
+    "data_limitations": [
+      "Synthetic V=7 tokens; no corpus or tokenizer loaded",
+      "Captured decode_unigram_prior=True retained; unset corpus counts give uniform decode prior"
+    ],
+    "status": "limited",
+    "limitation_type": "ValueError",
+    "limitation": "encode_mode='per_token_additive' with pos_phi='learned', pos_rotation='none': the positional frame keeps Omega_ij != I, so the additive encoder is not the Omega = I capacity control; set pos_phi='none' and pos_rotation='none' on the projected routes",
+    "elapsed_seconds": 0.006186500017065555
+  },
+  "preexisting_positional_frame_guard_confirmed_in_base_58a8248": true,
+  "raw_wip_snapshots_published": false
+}

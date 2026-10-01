@@ -150,34 +150,6 @@ def test_block_and_stack_preserve_the_subclass() -> None:
     assert params.block(0, 2).coordinate_dim() == 2
 
 
-def test_frame_family_leaves_the_gauge_table_without_gradient() -> None:
-    r"""End-to-end pin of the documented CONSEQUENCE: under this family phi is inert.
-
-    Because the relative frame cancels from the pair energy and both transports are the identity,
-    nothing on the belief path consumes ``phi_embed`` and it receives no gradient, while the
-    fixed-basis family does. This is the ablation semantics the toggle exists to expose; if a
-    future change reconnects phi, this test fails and the docstring must be revisited.
-    """
-    from vfe3.model.model import VFEModel
-
-    grads = {}
-    for family in ("gaussian_diagonal", "gaussian_frame_diagonal"):
-        cfg = test_config(
-            embed_dim=4, n_heads=2, vocab_size=11, max_seq_len=6, batch_size=2,
-            n_layers=1, n_e_steps=2, family=family, e_step_update="gradient",
-            lambda_alpha_mode="constant", max_steps=1,
-        )
-        torch.manual_seed(0)
-        model = VFEModel(cfg)
-        token_ids = torch.randint(0, 11, (2, 6))
-        targets = torch.randint(0, 11, (2, 6))
-        _, loss, _ = model(token_ids, targets)
-        loss.backward()
-        grads[family] = model.prior_bank.phi_embed.grad
-
-    assert grads["gaussian_diagonal"] is not None
-    assert grads["gaussian_diagonal"].norm() > 0.0
-    assert grads["gaussian_frame_diagonal"] is None
 
 
 def test_entropy_matches_the_diagonal_parent() -> None:

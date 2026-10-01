@@ -356,14 +356,13 @@ class FigureSkipped(RuntimeError):
 
 
 def has_estep_iterates(cfg: object) -> bool:
-    r"""Whether the configured forward has belief E-step iterates to trace.
+    r"""Whether the legacy shared-objective E-step figure family applies.
 
-    The projected attention routes (``attention_mode != 'transported'``) run one captured readout,
-    and ``n_e_steps = 0`` runs none, so the E-step trajectory, depth-sensitivity, character, and
-    E-step attention figures have nothing to show there.
+    These figures trace the legacy shared-objective E-step. Predictive attention is a readout;
+    projected-gradient receiver iterations have a frozen incoming router and a separate receiver
+    objective, so the legacy trajectory and objective probes do not apply to either retained mode.
     """
-    return (getattr(cfg, "attention_mode", "transported") == "transported"
-            and int(getattr(cfg, "n_e_steps", 1)) >= 1)
+    return False
 
 
 def route_figure_skip_reasons(cfg: object) -> Dict[str, str]:
@@ -375,8 +374,8 @@ def route_figure_skip_reasons(cfg: object) -> Dict[str, str]:
 
     * ``holonomy_curvature`` when ``transport_mode = 'flat'``: the holonomy of flat transport is the
       identity by construction, so the figure plots float32 roundoff.
-    * The E-step family when :func:`has_estep_iterates` is false: there is one readout and no iterate
-      trajectory (the ``attention_estep`` maps equal the ``attention`` maps).
+    * The legacy E-step family when :func:`has_estep_iterates` is false: the retained routes use
+      predictive readout or a frozen-router receiver objective rather than that shared objective.
     * ``belief_spectrum``, ``spd_ellipses`` and ``belief_condition`` when the covariance is frozen at
       encode (:func:`vfe3.metrics.covariance_frozen_at_encode`): they would describe the decayed
       token table, not beliefs.
@@ -388,10 +387,8 @@ def route_figure_skip_reasons(cfg: object) -> Dict[str, str]:
             "transport_mode='flat': holonomy is the identity by construction, so the figure would "
             "plot float32 roundoff")
     if not has_estep_iterates(cfg):
-        why = (f"attention_mode={getattr(cfg, 'attention_mode', 'transported')!r} runs one captured "
-               "readout" if getattr(cfg, "attention_mode", "transported") != "transported"
-               else "n_e_steps=0")
-        reason = f"no E-step iterates ({why})"
+        reason = (f"attention_mode={getattr(cfg, 'attention_mode', 'projected_predictive')!r}: "
+                  "legacy shared-objective E-step probes do not apply")
         for name in ("iterate_trajectory", "belief_trajectories", "estep_depth_sensitivity",
                      "estep_character", "estep_quality", "estep_grad_norm_decomposition",
                      "attention_estep"):

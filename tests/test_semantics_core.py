@@ -6,6 +6,8 @@ directory, so the loader is exercised end to end on CPU without any real checkpo
 from tests.profiles import test_config
 
 import json
+from dataclasses import asdict, replace
+from types import SimpleNamespace
 import warnings
 from pathlib import Path
 from typing import Optional, Sequence
@@ -241,7 +243,7 @@ def test_gaussian_decode_tables_reproduce_kl_logits(tmp_path):
         run.decode_W(all_ids)
 
 
-def test_log_var_full_and_laplace_families(tmp_path):
+def test_log_var_full_and_standalone_laplace_accessor(tmp_path):
     ids = [2, 4, 6, 8]
     cfg_full, model_full = _tiny_model(family="gaussian_full", decode_mode="full_chunked")
     run_full = _load(_save_run(tmp_path, "full", cfg_full, model_full))
@@ -250,10 +252,9 @@ def test_log_var_full_and_laplace_families(tmp_path):
     np.testing.assert_allclose(
         run_full.log_var(ids), torch.log(torch.diagonal(sigma_full, dim1=-2, dim2=-1).double()).numpy(),
         atol=1e-6)
-    cfg_lap, model_lap = _tiny_model(family="laplace_diagonal")
-    run_lap = _load(_save_run(tmp_path, "laplace", cfg_lap, model_lap))
-    with torch.no_grad():
-        b = model_lap.prior_bank.encode(torch.tensor([ids])).sigma[0].double()  # (n, K) Laplace scale
+    run_lap = replace(run_full, cfg=SimpleNamespace(
+        **{**asdict(cfg_full), "family": "laplace_diagonal"}))
+    b = torch.exp(run_lap.state["prior_bank.sigma_log_embed"][ids].double())
     np.testing.assert_allclose(run_lap.log_var(ids), torch.log(2.0 * b * b).numpy(), atol=1e-6)
 
 

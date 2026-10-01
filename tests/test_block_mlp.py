@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from vfe3.config import ConfigNotice
+from vfe3.geometry.transport import build_factored_transport
 from vfe3.model.block import vfe_block
 from vfe3.model.block_mlp import BlockMLP
 from vfe3.model.model import VFEModel
@@ -112,6 +113,8 @@ def test_block_applies_norm_then_mlp_before_handoff():
     belief = model.prior_bank.encode(tokens)
     block_mlps = nn.ModuleList([_Add(3.0), _Add(5.0)])
     diagnostic = {}
+    frame = model._canonical_frame_context(
+        build_factored_transport(belief.phi, model.group, compact_blocks=True), compact=True)
 
     vfe_stack(
         belief,
@@ -122,6 +125,8 @@ def test_block_applies_norm_then_mlp_before_handoff():
         block_norm=lambda mu, sigma: mu + 2.0,
         block_mlps=block_mlps,
         capture={"diagnostic": diagnostic},
+        relational_operators_by_layer=model.relational_operators_by_layer,
+        relational_frame=frame,
     )
 
     first_converged = diagnostic["layer_converged"][0]
@@ -134,10 +139,12 @@ def test_block_applies_norm_then_mlp_before_handoff():
 def test_coordinate_mlp_preserves_covariance_and_other_belief_fields():
     for family, decode_mode in (("gaussian_diagonal", "diagonal_chunked"),
                                 ("gaussian_full", "full_chunked")):
-        cfg = _tiny_cfg(family=family, decode_mode=decode_mode, n_heads=1, embed_dim=2)
+        cfg = _tiny_cfg(family=family, decode_mode=decode_mode, n_heads=2, embed_dim=4)
         model = VFEModel(cfg)
         belief = model.prior_bank.encode(torch.tensor([[1, 2]]))
         capture = {}
+        frame = model._canonical_frame_context(
+            build_factored_transport(belief.phi, model.group, compact_blocks=True), compact=True)
 
         out = vfe_block(
             belief,
@@ -148,6 +155,8 @@ def test_coordinate_mlp_preserves_covariance_and_other_belief_fields():
             block_norm=lambda mu, sigma: mu + 2.0,
             block_mlp=_Add(3.0),
             capture=capture,
+            relational_operators=model.relational_operators_by_layer[0],
+            relational_frame=frame,
         )
 
         converged = capture["converged"]
@@ -157,7 +166,7 @@ def test_coordinate_mlp_preserves_covariance_and_other_belief_fields():
         assert out.right_phi is converged.right_phi
 
 
-@pytest.mark.parametrize("estimator", ["unroll", "straight_through"])
+@pytest.mark.parametrize("estimator", ["unroll"])
 def test_every_active_mlp_layer_receives_finite_gradients(estimator):
     tokens = torch.tensor([[1, 2, 3, 4]])
     targets = torch.tensor([[2, 3, 4, 5]])

@@ -16,7 +16,7 @@ def test_retired_policy_fields_are_not_constructor_or_serialized_fields() -> Non
     names = {field.name for field in fields(VFE3Config)}
     assert not names & {"grad_clip_per_role", "exp_fp64_mode", "relational_mode", "relational_readout_mode"}
     payload = serialize_config(_tiny())
-    assert payload["attention_mode"] == "transported"
+    assert payload["attention_mode"] == "projected_gradient"
     assert config_from_serialized(payload, source="round trip") == _tiny()
 
 
@@ -32,22 +32,14 @@ def test_retired_historical_algorithm_is_refused(field: str, value: object) -> N
         config_from_serialized(serialize_config(_tiny()) | {field: value}, source="old run")
 
 
-@pytest.mark.parametrize("old_readout,canonical", [
-    ("conditional_update", "projected_conditional"),
-    ("predictive_content", "projected_predictive"),
-])
-def test_historical_attention_pair_migrates(old_readout: str, canonical: str) -> None:
+def test_historical_predictive_attention_pair_migrates() -> None:
     payload = serialize_config(_tiny())
-    payload.pop("attention_mode", None)
-    payload.update(relational_mode="projected_filtering", relational_readout_mode=old_readout,
-                   e_step_update="gradient", e_step_gradient="unroll", oracle_unroll_grad=True,
-                   skip_belief_sigma_update=True, decode_mode="linear")
-    if canonical == "projected_predictive":
-        payload.update(relational_input_scope="full", relational_output_scope="full")
-    cfg = config_from_serialized(payload, source="legacy attention")
-    assert cfg.attention_mode == canonical
-    assert cfg.relational_mode == "projected_filtering"
-    assert cfg.relational_readout_mode == old_readout
+    payload.pop("attention_mode")
+    payload.update(relational_mode="projected_filtering", relational_readout_mode="predictive_content",
+                   relational_input_scope="full", relational_output_scope="full")
+    cfg = config_from_serialized(payload, source="legacy predictive attention")
+    assert cfg.attention_mode == "projected_predictive"
+    assert cfg.relational_readout_mode == "predictive_content"
     assert "relational_mode" not in serialize_config(cfg)
     with pytest.raises(AttributeError):
         cfg.relational_mode = "off"

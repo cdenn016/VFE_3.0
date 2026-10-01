@@ -315,9 +315,9 @@ def test_head_evidence_rejects_replaced_canonical_decoder_callable():
     ("overrides", "match"),
     [
         ({"decode_mode": "linear"}, "prior-bank decode_mode"),
-        ({"gauge_group": "glk"}, "at least two gauge blocks"),
-        ({"renyi_order": 0.5}, "divergence_family='renyi'.*renyi_order=1.0"),
-        ({"divergence_family": "squared_hellinger"}, "divergence_family='renyi'.*renyi_order=1.0"),
+        ({"gauge_group": "glk"}, "gauge_group=.*glk"),
+        ({"renyi_order": 0.5}, "renyi_order=0.5"),
+        ({"divergence_family": "squared_hellinger"}, "divergence_family=.*squared_hellinger"),
         ({"decode_mode": "family_chunked"}, "canonical KL decode"),
         ({"family": "gaussian_full", "decode_mode": "diagonal_chunked"}, "gaussian_full.*full.*full_chunked"),
     ],

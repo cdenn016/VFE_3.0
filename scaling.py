@@ -151,8 +151,8 @@ config = dict(
 
     gradient_mode             = "filtering",   #"smoothing"
 
-    # Attention execution and projected input/output scopes.
-    attention_mode                   = "projected_predictive",  # "transported" | "projected_conditional" | "projected_predictive"
+    # Attention execution; all interfaces have full input/output.
+    attention_mode                   = "projected_predictive",  # "projected_predictive" | "projected_gradient"
 
 
 
@@ -726,17 +726,7 @@ def predict_n_params(cfg: VFE3Config) -> Tuple[int, int]:
         )
     if cfg.layernorm_affine:
         n += 2 * K * sum(mode == "layernorm" for mode in (cfg.norm_type_block, cfg.norm_type_final))
-    if cfg.relational_mode == "projected_filtering":
-        dims = group.irrep_dims
-        per_layer = 0
-        for d in dims:
-            predictive = cfg.attention_mode == "projected_predictive"
-            input_dim = K if predictive or cfg.relational_input_scope == "full" else d
-            per_layer += 2 * d * input_dim                    # independent query/key maps
-            if not cfg.relational_identity_content:
-                output_dim = K if predictive or cfg.relational_output_scope == "full" else d
-                per_layer += d * input_dim + output_dim * d   # content T and O
-        n += int(cfg.n_layers) * per_layer
+    n += int(cfg.n_layers) * 4 * K * K                       # full-width Q/K/T/O maps
     return n, n_gen
 
 

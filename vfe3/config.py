@@ -364,16 +364,13 @@ class VFE3Config:
     #          Methods
     #################################
 
-    # One attention selector chooses transported inference, conditional projected updates, or
-    # predictive projected content. Projection ranks still follow the gauge block dimensions.
+    # Full-state projected attention uses predictive content or frozen-receiver gradients.
+    # Projection ranks still follow the gauge block dimensions.
     # Projected attention requires the explicit support envelope validated below.
-    attention_mode:                      str           = "transported"          # "transported" | "projected_conditional" | "projected_predictive" | "projected_gradient"
-    relational_input_scope:              Optional[str] = None                 # conditional: "head" | "full"; predictive/gradient are fixed "full"
-    relational_output_scope:             Optional[str] = None                 # conditional: "head"; predictive/gradient are fixed "full"
+    attention_mode:                      str           = "projected_predictive" # "projected_predictive" | "projected_gradient"
     attention_residual:                  bool          = False                  # requires predictive_content
     relational_output_init:              str           = "identity"             # "identity" | "depth_scaled" (initial O times 1/sqrt(2 n_layers))
 
-    relational_identity_content:         bool          = False                  # predictive_content requires learned content maps
     relational_receiver_noise:           float         = 1.0                   # projected_gradient: Q_h = variance * I in reference coordinates
     relational_routing:                  str           = "gaussian_kl"          # "gaussian_kl" | "noisy_query" (projected_predictive only)
     # Belief covariance after the predictive readout. "passthrough" keeps the incoming covariance
@@ -881,129 +878,73 @@ class VFE3Config:
                         f"{type(value).__name__}: {value!r}"
                     )
 
-        # Validate the declared relational envelope before downstream selector coercions.
-        _require(self.attention_mode, ("transported", "projected_conditional", "projected_predictive", "projected_gradient"), "attention_mode")
+        # The model architecture uses full-state projected interfaces in every layer.
+        if self.attention_mode in ("transported", "projected_conditional"):
+            raise ValueError(
+                f"retired attention mode {self.attention_mode!r}; full-state architecture "
+                "requires explicit migration to projected_predictive or projected_gradient")
+        _require(self.attention_mode, ("projected_predictive", "projected_gradient"), "attention_mode")
         full_link = self.attention_mode == "projected_gradient"
-        default_scope = "full" if self.attention_mode in ("projected_predictive", "projected_gradient") else "head"
-        if self.relational_input_scope is None:
-            self.relational_input_scope = default_scope
-        if self.relational_output_scope is None:
-            self.relational_output_scope = default_scope
-        _require(self.relational_input_scope, ("head", "full"), "relational_input_scope")
         if type(self.attention_residual) is not bool:
             raise ValueError("attention_residual must be a bool")
-        if self.attention_residual and self.attention_mode != "projected_predictive":
+        if self.attention_residual and full_link:
             raise ValueError("attention_residual requires attention_mode='projected_predictive'")
-        _require(self.relational_output_scope, ("head", "full"), "relational_output_scope")
-        if self.attention_mode == "projected_predictive" and (
-                self.relational_input_scope != "full" or self.relational_output_scope != "full"):
-            raise ValueError(
-                "projected_predictive fixes relational_input_scope and relational_output_scope "
-                "to 'full'; historical head predictive configurations require explicit conversion")
-        if self.relational_output_scope == "full" and self.attention_mode not in ("projected_predictive", "projected_gradient"):
-            raise ValueError("relational_output_scope='full' requires predictive_content")
-        if self.attention_mode in ("projected_predictive", "projected_gradient") and self.relational_identity_content:
-            raise ValueError("predictive_content requires learned content maps")
         _require(self.relational_routing, ("gaussian_kl", "noisy_query"), "relational_routing")
-        if self.relational_routing == "noisy_query" and self.attention_mode != "projected_predictive":
+        if self.relational_routing == "noisy_query" and full_link:
             raise ValueError("relational_routing='noisy_query' requires attention_mode='projected_predictive'")
         _require(self.predictive_covariance, ("passthrough", "moment_matched"), "predictive_covariance")
-        if self.predictive_covariance == "moment_matched" and self.attention_mode != "projected_predictive":
-            raise ValueError(
-                "predictive_covariance='moment_matched' requires attention_mode='projected_predictive'")
+        if self.predictive_covariance == "moment_matched" and full_link:
+            raise ValueError("predictive_covariance='moment_matched' requires attention_mode='projected_predictive'")
         if (isinstance(self.predictive_covariance_floor, bool)
                 or not isinstance(self.predictive_covariance_floor, Real)
                 or not math.isfinite(float(self.predictive_covariance_floor))
                 or float(self.predictive_covariance_floor) <= 0.0):
             raise ValueError(
-                "predictive_covariance_floor must be a finite real value > 0, "
+                f"predictive_covariance_floor must be a finite real value > 0, "
                 f"got {self.predictive_covariance_floor!r}")
         if (isinstance(self.relational_receiver_noise, bool)
                 or not isinstance(self.relational_receiver_noise, Real)
                 or not math.isfinite(float(self.relational_receiver_noise))
                 or self.relational_receiver_noise <= 0.0):
             raise ValueError("relational_receiver_noise must be a finite positive reference variance")
-        if full_link and (self.relational_input_scope != "full" or self.relational_output_scope != "full"):
-            raise ValueError("projected_gradient requires full relational input and output scopes")
         for name in ("m_relational_score_lr", "m_relational_content_lr"):
             rate = getattr(self, name)
             if rate is not None and (
                     isinstance(rate, bool) or not isinstance(rate, Real)
                     or not math.isfinite(rate) or rate < 0.0):
                 raise ValueError(f"{name} must be finite and >= 0 or None, got {rate!r}")
-        if self.attention_mode != "transported":
-            requirements = {
-                "divergence_family": "renyi",
-                "renyi_order": 1.0, "include_attention_entropy": True,
-                "gradient_mode": "filtering", "e_step_update": "gradient",
-                "e_step_gradient": "unroll", "oracle_unroll_grad": True,
-                "n_e_steps": 1,
-                "e_phi_lr": 0.0, "transport_mode": "flat", "gauge_group": "block_glk",
-            }
-            if full_link:
-                # Each receiver episode uses one incoming router/source snapshot and can
-                # take multiple Fisher steps with the same live outer context.
-                requirements.pop("n_e_steps")
-                requirements.update(lambda_alpha_mode="constant", e_step_mu_precond="fisher")
-            # encode_mode admits 'per_token_additive' beside 'per_token': the additive encoder
-            # zeroes the token frame and moves the same learned (V, n_gen) phi table into a mean
-            # shift, which is the capacity-matched Omega = I control for a gauge on/off contrast on
-            # this route. The projected executors read only the realized frame and the encoded
-            # moments, so no step depends on the encoder beyond them. Its positional requirement
-            # (pos_phi='none', pos_rotation='none') is enforced after the gauge_transport
-            # coercion below, which can itself supply pos_phi='none'.
-            # skip_belief_sigma_update is deliberately ABSENT from the envelope above: it is INERT
-            # on the preexisting projected routes, not incompatible. projected_gradient reads it. 'projected_predictive' replaces the mean
-            # and, by predictive_covariance, either keeps covariance (passthrough: e_step.py assigns
-            # sigma = belief.sigma) or assigns the predictive kernel's moment-matched covariance
-            # (moment_matched); neither reads the flag. 'projected_conditional' filtering returns grad_sigma=None by
-            # signature (relational.py:85), so there is no sigma arm to skip. The previous pin to
-            # True only kept skip=False from reaching the float*None retraction; the None guard in
-            # e_step_iteration covers that now. Inertness is reported by inactive_fields.
-            # decode_mode is deliberately ABSENT from the envelope above: the prior-bank KL
-            # decoders (diagonal_chunked / full_chunked / family_chunked) are live on this route.
-            # The fused CE path already branches on active_decode_mode != 'linear' (model.py), and
-            # family/cov-kind pairing for 'gaussian_full' + 'full_chunked' is enforced by the
-            # decoder registration and the rank checks below. Pinning 'linear' was a support
-            # default with no stated mathematical obstruction -- and the linear readout discards
-            # Sigma_q, which is exactly what a full-covariance family should not do at decode.
-            # gauge_transport is deliberately ABSENT from the envelope above: it is live in this
-            # path and is an ablation cell the click-to-run
-            # config must be able to reach. The frame is not bypassed here -- the conditional path
-            # builds its shared transport from it (_build_shared_flat_transport ->
-            # _canonical_frame_context, model.py:1265-1270), so gauge_transport='off' is the
-            # Omega_ij=I arm of the A1/EXP-2 ablation and its own coercion supplies the rest of the
-            # contract; and the learned partner residual folds into the effective log prior this
-            # E-step descends (_effective_beta_log_prior, model.py:1286-1295), which the residual
-            # test measures as a nonzero gradient on beta_prior_residual_weight.
-            incompatible = [
-                f"{name}={getattr(self, name)!r} (requires {expected!r})"
-                for name, expected in requirements.items()
-                if getattr(self, name) != expected
-            ]
-            if self.encode_mode not in ("per_token", "per_token_additive"):
-                incompatible.append(
-                    f"encode_mode={self.encode_mode!r} (requires 'per_token' or 'per_token_additive')")
-            if self.family not in ("gaussian_diagonal", "gaussian_full",
-                                   "gaussian_diagonal_exact", "gaussian_frame_diagonal"):
-                incompatible.append(f"family={self.family!r} (requires a supported Gaussian family)")
-            if full_link and self.family not in ("gaussian_diagonal", "gaussian_full"):
-                incompatible.append(f"family={self.family!r} (projected_gradient requires gaussian_diagonal or gaussian_full)")
-            # Predictive content composes through the existing stack; conditional updates
-            # retain their original single-layer support envelope.
-            if self.attention_mode == "projected_conditional" and self.n_layers != 1:
-                incompatible.append(f"n_layers={self.n_layers!r} (requires 1 for conditional_update)")
-            if self.n_heads < 2:
-                incompatible.append(f"n_heads={self.n_heads!r} (requires at least 2)")
-            elif self.embed_dim % self.n_heads:
-                incompatible.append(f"embed_dim={self.embed_dim!r} (requires equal heads)")
-            if self.cross_couplings:
-                incompatible.append(f"cross_couplings={self.cross_couplings!r} (requires none)")
-            if incompatible:
-                raise ValueError(
-                    f"attention_mode={self.attention_mode!r} has unsupported projected_filtering configuration: "
-                    + "; ".join(incompatible)
-                )
+        requirements = {
+            "divergence_family": "renyi", "renyi_order": 1.0, "include_attention_entropy": True,
+            "gradient_mode": "filtering", "e_step_update": "gradient",
+            "e_step_gradient": "unroll", "oracle_unroll_grad": True, "n_e_steps": 1,
+            "e_phi_lr": 0.0, "transport_mode": "flat", "gauge_group": "block_glk",
+        }
+        if full_link:
+            requirements.pop("n_e_steps")
+            requirements.update(lambda_alpha_mode="constant", e_step_mu_precond="fisher")
+        incompatible = [
+            f"{name}={getattr(self, name)!r} (requires {expected!r})"
+            for name, expected in requirements.items()
+            if getattr(self, name) != expected
+        ]
+        if self.encode_mode not in ("per_token", "per_token_additive"):
+            incompatible.append(
+                f"encode_mode={self.encode_mode!r} (requires 'per_token' or 'per_token_additive')")
+        if self.family not in ("gaussian_diagonal", "gaussian_full",
+                               "gaussian_diagonal_exact", "gaussian_frame_diagonal"):
+            incompatible.append(f"family={self.family!r} (requires a supported Gaussian family)")
+        if full_link and self.family not in ("gaussian_diagonal", "gaussian_full"):
+            incompatible.append(f"family={self.family!r} (projected_gradient requires gaussian_diagonal or gaussian_full)")
+        if self.n_heads < 2:
+            incompatible.append(f"n_heads={self.n_heads!r} (requires at least 2)")
+        elif self.embed_dim % self.n_heads:
+            incompatible.append(f"embed_dim={self.embed_dim!r} (requires equal heads)")
+        if self.cross_couplings:
+            incompatible.append(f"cross_couplings={self.cross_couplings!r} (requires none)")
+        if incompatible:
+            raise ValueError(
+                f"attention_mode={self.attention_mode!r} has unsupported projected_filtering configuration: "
+                + "; ".join(incompatible))
 
         # encode_mode='canonical_content_gauge' stores the token tables as canonical, frame-intrinsic
         # (a_v, s_v) coordinates; its exactness needs the whole flat-cocycle contract, so reject the
@@ -1877,17 +1818,6 @@ class VFE3Config:
                     f"pairwise Omega with no per-vertex frame to fold into. {_escapes}")
         # Projected routing pushes both moments through the realized comparison frame.
         # Means-only covariance treatment belongs to the transported attention path.
-        if (self.pos_rotation == "rope" and not self.rope_full_gauge
-                and self.attention_mode == "transported"):
-            import warnings
-            warnings.warn(
-                "pos_rotation='rope' with rope_full_gauge=False rotates the transported MEANS but "
-                "not the covariance sandwich -- an affine-incoherent transport pair (Mahalanobis "
-                "invariants are not preserved). The coherent gauge-RoPE is rope_full_gauge=True "
-                "with a full-covariance family.",
-                UserWarning,
-                stacklevel=2,
-            )
         # The per-block preconditioners build a per-HEAD metric and need generators that partition per
         # block (block_glk's independent gl(d_head) per head). The tied gauge's shared generators
         # kron(I_n, gl(d_head)) each act on EVERY block, so no per-block partition exists; reject BOTH
@@ -1906,11 +1836,6 @@ class VFE3Config:
         if not math.isfinite(self.decode_tau) or self.decode_tau <= 0.0:
             raise ValueError(f"decode_tau must be finite and positive, got {self.decode_tau}")
         _require(self.relational_output_init, ("identity", "depth_scaled"), "relational_output_init")
-        if self.relational_output_init == "depth_scaled" and (
-                self.attention_mode == "transported" or self.relational_identity_content):
-            raise ValueError(
-                "relational_output_init='depth_scaled' scales the learned relational output map O, "
-                "which exists only on the projected attention routes with learned content maps")
         # decode_mode / encode_mode validated against the LIVE decode/encode REGISTRIES (not static
         # literals) so a newly registered kernel is config-selectable without editing this validator.
         # Dense kernels remain registered as exact legacy/oracle implementations but fresh public
@@ -2102,8 +2027,7 @@ class VFE3Config:
                 "so the additive encoder is not the Omega = I capacity control; set "
                 "pos_phi='none' and pos_rotation='none'"
             )
-            if self.attention_mode != "transported":
-                raise ValueError(detail + " on the projected routes")
+            raise ValueError(detail + " on the projected routes")
             import warnings
             warnings.warn(detail + " for a capacity-matched gauge contrast.", UserWarning,
                           stacklevel=2)
@@ -2242,10 +2166,6 @@ class VFE3Config:
                     "and is defined only where that frame is; got " + "; ".join(incompatible))
         if self.decode_coordinates == "reference":
             incompatible = list(frame_requirements)
-            if self.attention_mode == "transported":
-                incompatible.append(
-                    "attention_mode='transported' (the realized relational frame exists only on the "
-                    "projected routes)")
             if self.decode_mode not in _REFERENCE_DECODE_MODES:
                 incompatible.append(
                     f"decode_mode={self.decode_mode!r} (requires one of {_REFERENCE_DECODE_MODES}: the "
@@ -2264,10 +2184,6 @@ class VFE3Config:
                 incompatible.append(
                     f"block_mlp_mode={self.block_mlp_mode!r} (requires a coordinate hidden layer: "
                     "'coordinate' or 'canonical_frame')")
-            if self.attention_mode == "transported":
-                # Transported diagnostics replay vfe_stack/vfe_block directly and would omit the
-                # table; the projected routes replay through forward_beliefs, which gathers it.
-                incompatible.append("attention_mode='transported' (requires a projected route)")
             if incompatible:
                 raise ValueError(
                     "per_type_hidden_bias=True adds the per-type table to the block MLP's fc1 hidden "
@@ -2538,7 +2454,7 @@ class VFE3Config:
         predictive_moment_matched = (self.attention_mode == "projected_predictive"
                                      and self.predictive_covariance == "moment_matched")
         if self.decode_mode != "linear" and not predictive_moment_matched and (
-            self.skip_belief_sigma_update or self.attention_mode in ("projected_conditional", "projected_predictive")
+            self.skip_belief_sigma_update or self.attention_mode == "projected_predictive"
         ):
             import warnings
             frozen_by = (
@@ -2550,7 +2466,7 @@ class VFE3Config:
                 f"prior-bank decode with frozen belief sigma ({frozen_by}): the KL decode READS "
                 "sigma_q, so a frozen sigma changes predictions (sigma stays at encode). "
                 "skip_belief_sigma_update is meant for configs where q's sigma is dead "
-                "(linear decode, no norms); conditional and passthrough predictive routes keep sigma.",
+                "(linear decode, no norms); passthrough predictive readout keeps sigma.",
                 UserWarning, stacklevel=2,
             )
         if self.grad_clip is not None:
@@ -2590,19 +2506,9 @@ class VFE3Config:
                  "(m_phi_update_mode='pullback_group' or 'fisher_group')")
         if not phi_update_policy.requires_fisher_statistics:
             mark(("m_phi_fisher_rotation_weight",), "only read by m_phi_update_mode='fisher_group'")
-        if self.attention_mode == "projected_predictive":
-            mark(("relational_input_scope", "relational_output_scope"),
-                 "predictive attention fixes full input/output; scope selectors belong to conditional updates")
-        if self.attention_mode == "transported":
-            mark(("relational_identity_content", "m_relational_score_lr", "m_relational_content_lr",
-                  "relational_routing"),
-                 "only read by projected attention; transported attention creates no relational parameters")
-            mark(("projected_cov_condition_recovery", "projected_factor_route"),
-                 "only read by the projected attention scorers")
-        else:
-            if self.relational_routing == "noisy_query":
-                mark(("projected_factor_route",),
-                     "the noisy-query cost factors per-pair sums G_q + G_k and keeps the Gram route")
+        if self.relational_routing == "noisy_query":
+            mark(("projected_factor_route",),
+                 "the noisy-query cost factors per-pair sums G_q + G_k and keeps the Gram route")
         if self.attention_mode != "projected_predictive":
             mark(("predictive_covariance", "predictive_covariance_floor", "predictive_covariance_centering"),
                  "only read by attention_mode='projected_predictive'")
@@ -2613,10 +2519,10 @@ class VFE3Config:
             mark(("relational_receiver_noise",), "only read by projected_gradient receiving laws")
         gradient_controls = ("e_q_mu_lr", "e_q_sigma_lr", "e_step_mu_precond",
                              "e_mu_q_trust", "mu_trust_mode", "e_sigma_q_trust")
-        if self.attention_mode in ("projected_conditional", "projected_predictive"):
+        if self.attention_mode == "projected_predictive":
             mark(("skip_belief_sigma_update",),
                  "projected routes run no sigma E-step: predictive_content keeps or moment-matches "
-                 "covariance by predictive_covariance, and relational filtering returns no sigma gradient")
+                 "covariance by predictive_covariance")
         if self.attention_mode == "projected_predictive":
             mark(gradient_controls, "predictive_content replaces the mean (and, under "
                  "predictive_covariance='moment_matched', the covariance) by readout, not a gradient step")
@@ -2698,14 +2604,13 @@ class VFE3Config:
             mark(("m_pos_phi_lr", "phi_weight_decay"),
                  f"gauge_transport={self.gauge_transport!r} sets requires_grad=False on the frame "
                  "tables, so no phi-role step or decay applies")
-        if self.attention_mode in ("projected_conditional", "projected_predictive") or self.skip_belief_sigma_update:
+        if self.attention_mode == "projected_predictive" or self.skip_belief_sigma_update:
             mark(("e_q_sigma_lr", "e_sigma_q_trust", "sigma_max"),
                  "no sigma E-step runs on projected routes or under skip_belief_sigma_update "
                  "(a moment-matched predictive covariance is a readout with its own floor), so no "
                  "sigma step, trust region, or SPD ceiling runs")
-        if self.attention_mode != "transported":
-            mark(("full_cov_kl_backend",),
-                 "projected scoring never calls the transported full-covariance pair backend")
+        mark(("full_cov_kl_backend",),
+             "projected scoring never calls the transported full-covariance pair backend")
         if self.attention_mode == "projected_predictive":
             mark(("lambda_beta",), "predictive_content weights no belief-coupling block")
             mark(("full_cov_congruence_precision", "full_cov_congruence_certification",
@@ -2737,11 +2642,6 @@ class VFE3Config:
                  "threshold, so the float64 exponential island is unreachable")
         # Transported gaussian_frame_diagonal is frame-intrinsic: the flat coboundary cancels the
         # whole vertex frame, including the RoPE fold and the positional right factor.
-        if self.attention_mode == "transported" and self.family == "gaussian_frame_diagonal":
-            mark(("pos_rotation", "rope_base", "rope_on_value", "pos_phi", "pos_phi_scale",
-                  "pos_phi_project_slk", "m_pos_phi_lr"),
-                 "transported gaussian_frame_diagonal cancels the vertex frame, including the "
-                 "RoPE fold and the positional right factor")
         if (self.attention_mode == "projected_predictive" and self.family == "gaussian_full"
                 and self.encode_mode in ("per_token", "per_token_additive")
                 and not self.use_head_mixer and not self.rope_full_gauge
@@ -2754,7 +2654,7 @@ class VFE3Config:
                  "value-identical to gaussian_diagonal under the rank-matched decoder on this "
                  "route: stored covariance is a diagonal token lookup and no seam densifies it; "
                  "full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, "
-                 "predictive_covariance='moment_matched', or attention_mode='transported'")
+                 "predictive_covariance='moment_matched', or attention_mode='projected_gradient'")
         # Reference coordinates. With identically-I frames xi = mu and C = Sigma exactly, so both
         # selectors are no-ops; without a block norm, final norm or block MLP nothing is conjugated.
         identity_frames = (self.gauge_transport == "off"
@@ -2777,14 +2677,14 @@ class VFE3Config:
     @property
     def relational_mode(self) -> str:
         """Internal compatibility view; attention_mode is the only writable selector."""
-        return "off" if self.attention_mode == "transported" else "projected_filtering"
+        return "projected_filtering"
 
     @property
     def relational_readout_mode(self) -> str:
         """Internal executor selection derived from attention_mode."""
         if self.attention_mode == "projected_gradient":
             return "full_link_update"
-        return "predictive_content" if self.attention_mode == "projected_predictive" else "conditional_update"
+        return "predictive_content"
 
     @property
     def tau(self) -> float:
@@ -2921,6 +2821,20 @@ def config_from_serialized(
         if "attention_mode" in payload and payload["attention_mode"] != attention_mode:
             raise ValueError(f"serialized config from {source} has conflicting attention selectors")
         payload["attention_mode"] = attention_mode
+    for name in ("relational_input_scope", "relational_output_scope"):
+        if name in payload:
+            scope = payload.pop(name)
+            if scope not in ("full", None):
+                raise ValueError(
+                    f"serialized config from {source} requests retired head architecture "
+                    f"({name}={scope!r}); head architecture requires explicit migration")
+    if "relational_identity_content" in payload:
+        identity = _normalize_serialized_boolean(
+            payload.pop("relational_identity_content"), "relational_identity_content", source=source)
+        if identity:
+            raise ValueError(
+                f"serialized config from {source} requests retired identity content; "
+                "identity content requires explicit migration")
     config_fields = {field.name: field for field in fields(VFE3Config)}
     unknown = sorted(str(key) for key in payload if key not in config_fields)
     if unknown:

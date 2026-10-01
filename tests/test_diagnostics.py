@@ -41,10 +41,14 @@ def _assert_scalar_dict_equal(actual: dict, expected: dict) -> None:
         if actual[key] is None or expected[key] is None:
             assert actual[key] is expected[key], key
             continue
-        if isinstance(actual[key], list):
+        if isinstance(actual[key], str):
+            assert actual[key] == expected[key], key
+        elif isinstance(actual[key], list):
             assert len(actual[key]) == len(expected[key]), key
             for actual_item, expected_item in zip(actual[key], expected[key]):
-                if isinstance(actual_item, float) and math.isnan(actual_item):
+                if isinstance(actual_item, str):
+                    assert actual_item == expected_item, key
+                elif isinstance(actual_item, float) and math.isnan(actual_item):
                     assert math.isnan(expected_item), key
                 else:
                     assert math.isclose(actual_item, expected_item,
@@ -57,25 +61,15 @@ def _assert_scalar_dict_equal(actual: dict, expected: dict) -> None:
             assert math.isclose(actual[key], expected[key], rel_tol=1e-5, abs_tol=1e-6), key
 
 
-def test_diagnostics_registry_dispatch_substitutes_attention_entropy() -> None:
-    r"""PB-07: ``diagnostics()`` routes the row-entropy ``attention_entropy`` metric through the metric
-    registry (aliased to ``attn_entropy``), so a registered override reaches it there -- while the
-    free-energy component named ``attention_entropy`` (returned by ``free_energy_terms``) is untouched,
-    proving the alias prevents the row entropy from overwriting the component of the same name."""
-    model = _model(embed_dim=2, n_heads=1, n_layers=1)
+def test_projected_router_entropy_is_distinct_from_global_free_energy_component() -> None:
+    model = _model(n_layers=1)
     tokens = _tokens()
-    baseline = model.diagnostics(tokens)
-    sentinel = -12345.0
-    original = metrics.get_metric("attention_entropy")
-    try:
-        metrics.register_metric("attention_entropy", override=True)(lambda **kw: sentinel)
-        d = model.diagnostics(tokens)
-    finally:
-        metrics.register_metric("attention_entropy", override=True)(original)
-    assert metrics.get_metric("attention_entropy") is original           # restore succeeded
-    assert d["attn_entropy"] == sentinel                                 # row entropy routed via registry
-    assert d["attention_entropy"] != sentinel                           # free-energy component distinct
-    assert d["attention_entropy"] == pytest.approx(baseline["attention_entropy"], rel=1e-6, abs=1e-9)
+    d = model.diagnostics(tokens)
+    beta = model.attention_maps(tokens)[0]
+    assert d["attn_entropy"] == pytest.approx(float(metrics.attention_entropy(beta)),
+                                              rel=1e-6, abs=1e-9)
+    assert math.isnan(d["attention_entropy"])
+    assert d["relational_legacy_global_f_available"] == 0.0
 
 
 def test_effective_rank_registry_dispatch_uses_explicit_diagonal_flag() -> None:
@@ -115,12 +109,12 @@ def test_eval_diagnostics_builds_one_snapshot(monkeypatch) -> None:
 
     assert calls == 1
     assert training_modes == [False]
-    assert math.isfinite(diagnostics.metrics["val_inner_alignment_energy_total"])
-    # The "val_free_energy_total" alias is retired (audit 2026-07-25 F7): it duplicated
-    # val_inner_alignment_energy_total under a name that claimed to include -E_q[log p(o|x)],
-    # which that value never carried. Nothing to compare it against now.
+    assert math.isfinite(diagnostics.metrics["val_relational_receiver_cost_before"])
+    assert math.isfinite(diagnostics.metrics["val_relational_receiver_cost_after"])
+    assert "val_inner_alignment_energy_total" not in diagnostics.metrics
     assert "val_free_energy_total" not in diagnostics.metrics
-    assert math.isfinite(diagnostics.metrics["estep_f_drop"])
+    assert diagnostics.metrics["estep_f_comparisons"] == 0.0
+    assert math.isnan(diagnostics.metrics["estep_f_drop"])
     assert math.isfinite(diagnostics.metrics["pos_loss_ratio"])
 
 
@@ -201,4 +195,5 @@ def test_attention_and_trace_reuse_snapshot_without_forward_replay(monkeypatch) 
     assert extract.across_layer_belief_trace(model, tokens, snapshot=snapshot)["mu"].shape[0] == 2
     assert diagonal_flags == [True]
     assert extract.numerical_health(model, tokens, snapshot=snapshot)
-    assert extract.converged_state(model, tokens, snapshot=snapshot)
+    with pytest.raises(NotImplementedError, match="unavailable"):
+        extract.converged_state(model, tokens, snapshot=snapshot)

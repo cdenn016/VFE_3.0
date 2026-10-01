@@ -42,8 +42,8 @@ def _one_thread() -> None:
 
 def _ops(input_scope: str, output_scope: str, residual: bool = False, scale: float = 1.0,
          perturb: bool = True, seed: int = 0) -> RelationalOperators:
-    ops = RelationalOperators([D] * H, 3, input_scope=input_scope, readout_mode="predictive_content",
-                              output_scope=output_scope, attention_residual=residual,
+    ops = RelationalOperators([D] * H, 3,  readout_mode="predictive_content",
+                               attention_residual=residual,
                               output_init_scale=scale).double()
     if perturb:
         gen = torch.Generator().manual_seed(seed)
@@ -306,7 +306,7 @@ def _model_cfg(**over: Any) -> VFE3Config:
                   family="gaussian_diagonal", gauge_group="block_glk", skip_belief_sigma_update=False,
                   e_phi_lr=0.0, oracle_unroll_grad=True, warmup_steps=0, max_steps=2, log_interval=0,
                   eval_interval=0, attention_mode="projected_predictive", decode_mode="linear",
-                  relational_input_scope="full", relational_output_scope="full",
+
                   predictive_covariance="moment_matched", beta_attention_prior="causal")
     values.update(over)
     with warnings.catch_warnings():
@@ -331,22 +331,6 @@ def test_relational_diagnostics_emit_link_keys_at_every_layer() -> None:
         assert len(per_layer[key]) == 2 and all(math.isfinite(v) for v in per_layer[key]), key
 
 
-@pytest.mark.parametrize("identity_content", [True, False])
-def test_conditional_update_route_emits_nan_where_undefined(identity_content: bool) -> None:
-    r"""Identity content has no content maps (all ten keys NaN); conditional_update has no predictive
-    routing weights to form self loops (self-loop keys NaN, head keys finite)."""
-    cfg = _model_cfg(n_layers=1, attention_mode="projected_conditional", relational_input_scope="head",
-                     relational_output_scope="head", predictive_covariance="passthrough",
-                     relational_identity_content=identity_content)
-    torch.manual_seed(0)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        d = VFEModel(cfg).eval().diagnostics(torch.tensor([[0, 1, 2, 3]]))
-    selfloop = ("relational_link_selfloop_spectral_radius_max", "relational_link_selfloop_spectral_radius_mean")
-    for key in metrics.LINK_SPECTRUM_KEYS:
-        assert math.isnan(d[key]) == (identity_content or key in selfloop), key
-
-
 def test_val_relational_keys_cover_link_keys() -> None:
     assert {f"val_{key}" for key in metrics.LINK_SPECTRUM_KEYS} <= set(_VAL_RELATIONAL_DIAG_KEYS)
 
@@ -354,7 +338,7 @@ def test_val_relational_keys_cover_link_keys() -> None:
 @pytest.mark.parametrize("input_scope,output_scope", SCOPES)
 def test_posthoc_link_columns_are_invariant_under_the_reference_change(input_scope: str,
                                                                        output_scope: str) -> None:
-    cfg = _model_cfg(relational_input_scope=input_scope, relational_output_scope=output_scope)
+    cfg = _model_cfg()
     torch.manual_seed(0)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")

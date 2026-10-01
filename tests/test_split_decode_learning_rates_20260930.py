@@ -104,6 +104,10 @@ def test_omitted_split_rates_preserve_group_topology_and_parameter_bytes(
                       0.025 if legacy_rate is None else 0.117, "mu", 0.05, None),
                      (("prior_bank.decode_sigma_log_embed",),
                       0.0025 if legacy_rate is None else 0.117, "sigma", 0.05, None)]
+    expected += [(("relational_operators.raw_score_q", "relational_operators.raw_score_k"),
+                  0.025, "mu", 0.0, None),
+                 (("relational_operators.T", "relational_operators.O"),
+                  0.025, "mu", 0.0, None)]
     assert topology == expected
     assert optimizer.state_dict() == explicit_optimizer.state_dict()
     for name, parameter in implicit.state_dict().items():

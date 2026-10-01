@@ -1,17 +1,13 @@
-r"""The E-step for VFE_3.0: an iterative natural-gradient descent on F over the
-Gaussian belief (mu, sigma, phi).
+r"""Projected full-input/full-output attention inference.
 
-One inner iteration (all positions in parallel, updates sequential):
-  transport Omega(phi) -> belief_gradients (envelope kernel / oracle) -> Fisher
-  preconditioner -> retract mu (Euclidean) + sigma (SPD) -> phi (autograd of the
-  canonical belief-coupling block -> precondition -> Lie retraction).
-Decoupled learning rates and trust regions. Parallel mean-field updates are not
-guaranteed monotone per iteration; F-descent holds as a DIRECTION property
-(filtering descends F_filt; smoothing and the phi step descend global F).
+Predictive content directly replaces the receiving moments. Full-link gradient
+inference freezes incoming routing and source statistics for an episode, retains
+their outer graph, and takes Gaussian Fisher steps with the configured trust
+regions and SPD retraction. Transport and energy helpers remain available for
+independent geometric diagnostics.
 """
 
-import math
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -24,15 +20,12 @@ from vfe3.contracts import CanonicalFrameContext, EStepGradientRecord
 from vfe3.gradients.full_link import (
     FullLinkContext, build_full_link_context, full_link_cost, full_link_gradients,
 )
-from vfe3.gradients.qkv import qkv_conditional_cost
-from vfe3.gradients.relational import compute_relational_filtering_gradients, relational_predictive_readout
+from vfe3.gradients.relational import relational_predictive_readout
 from vfe3.families.base import get_family
 from vfe3.families.policy import coupling_energy as _coupling_energy, family_instance as _family_instance
-from vfe3.families.gaussian import FullGaussian
 from vfe3.free_energy import attention_weights, free_energy, reduced_free_energy, self_divergence_for_alpha
 from vfe3.geometry.groups import GaugeGroup
-from vfe3.geometry.phi_preconditioner import _bch_chart_direction, precondition_phi_gradient
-from vfe3.geometry.retraction import retract_phi, retract_spd_affine
+from vfe3.geometry.retraction import retract_spd_affine
 from vfe3.numerics import apply_mu_trust_region
 from vfe3.relational_scoring import source_recovery_counter
 from vfe3.geometry.transport import (
@@ -43,49 +36,19 @@ from vfe3.geometry.transport import (
     build_factored_transport,
     get_transport_registration,
 )
-from vfe3.gradients.kernels import (
-    belief_gradients, mm_damped_precision_blend_full, mm_exact_update, uses_kernel_route,
-)
 
 
-_E_STEP_UPDATE_ALIASES = {
-    "gradient": "gradient",
-    "mm_exact": "mm_exact",
-}
+_E_STEP_UPDATE_ALIASES = {"gradient": "gradient"}
 
 
 def canonical_e_step_update(name: str) -> str:
-    r"""Return the executable updater name while preserving config serialization.
-
-    ``mm_exact`` names the closed-form minimizer of the frozen-attention,
-    strict-pair-masked surrogate; it does not claim a fixed point of the live
-    self-consistent E-step.
-    """
+    """Return the supported projected receiver updater."""
     try:
         return _E_STEP_UPDATE_ALIASES[name]
     except KeyError as exc:
-        choices = ", ".join(sorted(_E_STEP_UPDATE_ALIASES))
-        raise ValueError(f"unknown e_step_update {name!r}; expected one of: {choices}") from exc
-
-
-def _belief_update_consumes_omega(
-    e_step_update: str,
-    relational_operators: Optional["RelationalOperators"] = None,
-) -> bool:
-    r"""True when the belief-update branch reads the forward transport ``omega``.
-
-    ``mm_exact`` consumes ``omega`` in ``mm_exact_update``. The ``predictive_content``
-    readout replaces ``mu`` (and ``sigma`` under ``predictive_covariance='moment_matched'``,
-    otherwise it keeps ``sigma``) and never reads ``omega``. The filtering
-    and ``belief_gradients`` branches consume ``omega`` / ``omega_builder``. The phi
-    sub-step builds its own transport and is unaffected either way.
-    """
-    if e_step_update == "mm_exact":
-        return True
-    if (relational_operators is not None
-            and relational_operators.readout_mode in ("predictive_content", "full_link_update")):
-        return False
-    return True
+        raise ValueError(
+            f"unsupported e_step_update {name!r}; projected attention requires 'gradient'"
+        ) from exc
 
 
 def _transport(
@@ -390,18 +353,17 @@ def free_energy_value(
     The step-size / E-step-only knobs (gradient_mode, phi_precond_mode, phi_retract_mode,
     sigma_max, bch_residual_max, e_sigma_q_trust, reuse_pairwise_kl_stats) are declared here as
     EXPLICIT accept-and-ignore
-    parameters (not a blanket ``**kwargs`` sink) so the common ``e_step`` call site may forward one knob
-    bag to both this and ``e_step_iteration`` while a MISSPELLED real parameter still raises
+    parameters (not a blanket ``**kwargs`` sink) so direct diagnostic callers can reuse
+    the config-derived knob bag while a misspelled real parameter still raises
     ``TypeError`` here instead of being silently swallowed. ``transport_mode`` IS honored for the
-    global (``keys=None``) F so the logged trajectory matches
-    the objective the beliefs descend. ``rope``/``rope_on_cov`` are honored too (audit
+    global (``keys=None``) F to select its standalone transported objective. ``rope``/``rope_on_cov`` are honored too (audit
     2026-06-09 PP6): the built transport is wrapped in :class:`RopeTransport` exactly as on the
-    model path, so under gauge-RoPE the logged F is the F being descended, not the un-rotated one.
+    frame representation, so the scalar evaluates the configured gauge-RoPE objective.
     ``transport_mean_per_head`` is forwarded to the phi-path factored builders. Compact builds retain
     the configured metadata; the legacy noncompact diagnostic seam still materializes its dense
     operator. The exp-island threshold (``exp_fp64_norm_threshold``) is HONORED for
     the global (``keys=None``) F: it is forwarded to the ``_transport`` build so the fp64 island keys
-    identically to the model E-step (audit PB-12; the two-hop scorer reuses this evaluator,
+    identically to frame construction (audit PB-12; the two-hop scorer reuses this evaluator,
     so its numerics match the active objective, with the same norm threshold).
     """
     # keys=None -> global F (query = key = belief). keys given -> filtered F: the transport
@@ -445,7 +407,7 @@ def free_energy_value(
         )
     fam = get_family(family)
     # Both energies go through the family coupling seam (BeliefParams.coupling_energy), so the logged
-    # F is built from the SAME transported divergence the beliefs descend under any family.
+    # The standalone F uses the selected family's transported divergence.
     base_omega = None
     if rope is not None:
         # Mirror the model path: R_i Omega_ij R_j^T on the means (and the covariance sandwich
@@ -613,8 +575,8 @@ def phi_alignment_loss(
     The value of ``L`` is unchanged. A ``'coboundary'`` family cancels the frames exactly, so its
     energy carries no frame dependence and its certified transport is kept.
     """
-    # Build Omega under the ACTIVE connection regime so the phi step descends the SAME objective as
-    # the mu/sigma step. The transport is held constant w.r.t. the phi gradient (only phi varies). The
+    # Build the standalone alignment transport under the selected connection regime.
+    # Only phi varies in this objective. The
     # factored-when-fusable dispatch (audit 2026-06-09 PE3) builds the per-token exps FROM THE
     # LIVE phi leaf -- the factored container is differentiable in phi, so the envelope
     # phi-gradient is preserved while the per-iteration dense (N,N,K,K) Omega disappears on the
@@ -641,8 +603,8 @@ def phi_alignment_loss(
     if detach_key_frames:
         omega = _detach_key_frames(omega)
     # The family coupling seam owns the whole transport + divergence composition (see
-    # BeliefParams.coupling_energy), so the phi step descends the SAME energy the belief step does
-    # under any family, including one that evaluates the transported divergence exactly.
+    # BeliefParams.coupling_energy), so this standalone objective follows the selected family,
+    # including one that evaluates the transported divergence exactly.
     score_energy = _coupling_energy(
         fam, mu, sigma, mu, sigma, omega, precision_policy=full_cov_kl_precision, score_backend=full_cov_kl_backend,
         log_prior=log_prior,
@@ -685,7 +647,7 @@ def e_step_iteration(
     tau:                       'float | torch.Tensor' = 1.0,
     e_q_mu_lr:                 float = 0.1,
     e_q_sigma_lr:              float = 0.1,
-    e_phi_lr:                  float = 0.1,
+    e_phi_lr:                  float = 0.0,
     renyi_order:               float = 1.0,
     value:                     float = 1.0,
     b0:                        'float | torch.Tensor' = 1.0,   # scalar, or (K,) per-coord for state_dependent_per_coord
@@ -699,9 +661,9 @@ def e_step_iteration(
     e_mu_q_trust:              Optional[float] = None,   # mean trust radius (sigma units); None = unbounded
     mu_trust_mode:             str  = "box",             # "box" | "ball" (only when e_mu_q_trust is not None)
     e_step_mu_precond:         str  = "fisher",          # "fisher" (nat-grad mean) | "raw" (B3/EXP-14 mu-arm)
-    e_step_update:             str  = "gradient",        # "gradient" (pure) | "mm_exact" (closed-form MM fusion)
+    e_step_update:             str  = "gradient",        # projected receiver updater
     mass_phi:                  float = 0.0,
-    mm_damping:                float = 1.0,              # mm_exact: natural-coordinate damping eta (1 = exact minimizer)
+    mm_damping:                float = 1.0,              # inactive compatibility field in the shared config bag
 
     include_attention_entropy: bool = True,
     skip_belief_sigma_update:  bool = False,             # freeze the belief sigma through this iteration (no grad, no retraction)
@@ -715,7 +677,7 @@ def e_step_iteration(
     phi_precond_mode:          str  = "none",
     phi_retract_mode:          str  = "euclidean",
     transport_mode:            str  = "flat",
-    e_step_gradient:           str  = "unroll",               # backward estimator: unroll | straight_through | detach
+    e_step_gradient:           str  = "unroll",               # projected receiver backward estimator
     rope_insertion:              str = "right",   # "right" (pure, folded frame) | "left" (legacy)
     oracle_unroll_grad:        bool = False,                  # opt-in: oracle returns a differentiable grad (unroll)
     clamp_monitor:             bool = False,                   # opt-in: warn when the exp Frobenius clamp fires (host sync)
@@ -738,207 +700,36 @@ def e_step_iteration(
     relational_capture:       Optional[dict] = None,
 
     _full_link_context:         Optional[FullLinkContext] = None,
-    _prebuilt_omega:           'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport | None' = None,   # PRIVATE: forward-transport cache from e_step
 ) -> BeliefState:
-    r"""One inner E-step iteration: mu, sigma (Fisher natgrad + SPD retraction) then phi
-    (autograd of the alignment block + preconditioner + Lie retraction).
+    r"""Update a projected receiver while retaining its incoming outer graph.
 
-    The belief-transport build is config-selected through the connection-regime registry
-    (``transport_mode``); 'flat' is the phi-cocycle (byte-identical). Because the flat Omega depends
-    only on ``belief.phi`` it is rebuilt from the CURRENT frame each iteration here.
-
-    ``e_step_update='mm_exact'`` (kernel route only) replaces the mu/sigma gradient + retraction
-    with the closed-form precision fusion at frozen beta (``mm_exact_update``), damped by
-    ``mm_damping`` in natural coordinates; the phi sub-step is untouched either way."""
-    transport_state = dict(transport_state or {})   # None = the pure stateless flat path
+    Predictive content assigns its mean and optional moment-matched covariance.
+    Full-link inference applies :math:`(\Sigma\nabla_\mu F,
+    2\Sigma\nabla_\Sigma F\Sigma)` through the family Fisher metric and retracts
+    the covariance on SPD. The realized frame is fixed throughout the episode.
+    """
     e_step_update = canonical_e_step_update(e_step_update)
-    full_link = (relational_operators is not None
-                 and relational_operators.readout_mode == "full_link_update")
+    if (relational_operators is None
+            or relational_operators.readout_mode not in ("predictive_content", "full_link_update")):
+        raise ValueError(
+            "transported and conditional attention are retired; projected inference requires "
+            "predictive_content or full_link_update relational operators")
+    if relational_frame is None:
+        raise ValueError("projected inference requires the realized forward frame")
+    if (e_phi_lr != 0.0 or gradient_mode != "filtering" or e_step_gradient != "unroll"
+            or transport_mode != "flat"):
+        raise ValueError("projected inference requires fixed flat frames, filtering, and unroll")
+    full_link = relational_operators.readout_mode == "full_link_update"
     if full_link and (
-            e_step_update != "gradient" or e_phi_lr != 0.0 or gradient_mode != "filtering"
-            or e_step_gradient != "unroll" or lambda_alpha_mode != "constant"
-            or e_step_mu_precond != "fisher" or family not in ("gaussian_diagonal", "gaussian_full")):
+            lambda_alpha_mode != "constant" or e_step_mu_precond != "fisher"
+            or family not in ("gaussian_diagonal", "gaussian_full")):
         raise ValueError("full-link filtering requires Gaussian gradient inference, constant alpha, "
-                         "fixed frames, filtering, and unrolled Fisher steps")
-    compact_phi_block_transport = (
-        compact_phi_block_transport
-        and transport_mode == "flat"
-        and group.phi_coordinate_layout == "block_head_row_major"
-    )
-    # Build the forward belief-transport (P0 #2): on the flat + block-diagonal-with-equal-blocks
-    # path this is a FactoredTransport (the per-token exps only, NO dense (B,N,N,K,K) Omega), which
-    # the belief-gradient kernel / oracle consume opaquely through transport_mean / covariance;
-    # single-block / cross-coupled groups keep the dense Omega exactly as before.
-    #
-    # A registration whose Omega depends on mu or sigma is NOT pre-built here. The hand kernel is a
-    # frozen-transport gradient, so every belief-dependent registration routes to the autograd
-    # oracle, which must rebuild the transport from its own differentiation leaves for the gradient
-    # value to carry d Omega/d belief in every regime. The builder closure binds phi/state/rope and
-    # receives (mu_query, sigma_query,
-    # mu_key, sigma_key) from the oracle -- the key slots are the oracle's detached keys under
-    # filtering (query-side coordinate ascent) and the shared live leaves under smoothing (full
-    # gradient). Pre-building here as well would only double the most expensive build in the
-    # codebase.
-    transport_registration = get_transport_registration(transport_mode)
-    consumes_omega = _belief_update_consumes_omega(e_step_update, relational_operators)
-    if not consumes_omega:
-        # Predictive-content replaces mu and keeps sigma and never reads omega; the phi
-        # sub-step and the post-phi chart check build their own transports. Skip this dead
-        # build and leave ``transport_status`` unfilled. On the live projected route the
-        # model already builds ``shared_omega`` for the relational frame and reuses it via
-        # ``_prebuilt_omega``, so this gate only helps un-hoisted callers.
-        omega, omega_builder = None, None
-    elif transport_registration.needs_mu or transport_registration.needs_sigma:
-        omega = None
+                         "and unrolled Fisher steps")
 
-        def _omega_builder(mu_q: torch.Tensor, sigma_q: torch.Tensor,
-                           mu_k: torch.Tensor, sigma_k: torch.Tensor):
-            return build_belief_transport(
-                belief.phi, group, transport_mode=transport_mode,
-                mu=mu_q, mu_key=mu_k, transport_state=transport_state,
-                # d Omega/d sigma on every path, not only the live unroll (audit 2026-07-01 C4).
-                sigma=sigma_q, sigma_key=sigma_k,
-                clamp_monitor=clamp_monitor,
-                validity_max_norm=transport_chart_max_norm,
-                exactness_out=transport_status,
-                rope=rope, rope_on_cov=rope_on_cov,
-                rope_on_value=rope_on_value, rope_insertion=rope_insertion,
-            )
-        omega_builder = _omega_builder
-    else:
-        # Use the hoisted transport when the caller pre-built it (flat path, e_phi_lr==0 so
-        # belief.phi is iteration-invariant). Fall back to building here for direct calls or
-        # when phi is live (e_phi_lr > 0 means the previous iteration updated phi).
-        if _prebuilt_omega is not None:
-            omega = _prebuilt_omega
-        else:
-            omega = build_belief_transport(
-                belief.phi, group, transport_mode=transport_mode,
-                right_phi=belief.right_phi,
-                mu=belief.mu, transport_state=transport_state,
-                clamp_monitor=clamp_monitor,
-
-                exp_fp64_norm_threshold=exp_fp64_norm_threshold,
-                transport_mean_per_head=transport_mean_per_head,
-                congruence_cond_escalation=congruence_cond_escalation,
-                compact_phi_block_transport=compact_phi_block_transport,
-                validity_max_norm=transport_chart_max_norm,
-                exactness_out=transport_status,
-                rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value, rope_insertion=rope_insertion,
-            )
-        omega_builder = None
-    # Runtime truncation warning (audit 2026-06-09 P8): under the 'unroll' estimator with a LIVE
-    # belief, a non-kernel route is served by the autograd oracle, which returns a DETACHED
-    # tangent unless oracle_unroll_grad=True -- silently severing the unrolled-through-inference
-    # signal to the prior tables. The config-time warning covers only the learnable-parameter
-    # cases; this fires when the truncation actually happens (default warnings filter: once).
-    # ``e_step_update != 'mm_exact'`` (audit 2026-08-07): under mm_exact the belief update NEVER
-    # calls belief_gradients/the oracle at all (mm_exact_update's own graph stays live under
-    # 'unroll' regardless of oracle_unroll_grad -- see its docstring), so this warning's "routes to
-    # the DETACHED oracle" claim is a false positive there; excluded rather than inherited from the
-    # GRADIENT-route predicate below.
-    if (e_step_gradient == "unroll" and not oracle_unroll_grad and belief.mu.requires_grad
-            and e_step_update != "mm_exact"
-            and not uses_kernel_route(
-                renyi_order=renyi_order, gradient_mode=gradient_mode, family=family,
-                divergence_family=divergence_family,
-                include_attention_entropy=include_attention_entropy,
-                transport_mode=transport_mode,
-                decoupled_value_gauge=(rope is not None and not rope_on_value),
-                route="gradient")):
-        import warnings
-        warnings.warn(
-            "e_step_gradient='unroll' is being served by the autograd ORACLE with "
-            "oracle_unroll_grad=False: the belief gradient is a detached tangent, so the "
-            "unrolled-through-inference signal to the prior tables is truncated. Set "
-            "oracle_unroll_grad=True for the differentiable oracle (or use the kernel route).",
-            UserWarning,
-            stacklevel=2,
-        )
-    # Per-iteration count of float64 source-factor recoveries in the relational scorer, reduced
-    # on the device (no host sync); published by the relational diagnostics (audit 2026-09-23 low).
     recovery_before = (source_recovery_counter(belief.mu.device)
-                       if relational_capture is not None and relational_operators is not None
-                       else None)
-    if e_step_update == "mm_exact":
-        # Closed-form MM/coordinate-exact update: precision fusion at frozen beta (kernels.py,
-        # ``mm_exact_update``). Derived from the diagonal-KL filtering kernel, so it is
-        # kernel-route ONLY; config __post_init__ rejects oracle-routed configs, and direct
-        # callers get the same rejection here.
-        if not math.isfinite(mm_damping) or not (0.0 < mm_damping <= 1.0):
-            raise ValueError(
-                f"mm_damping must be finite and in (0, 1], got {mm_damping}"
-            )
-        if not uses_kernel_route(
-                renyi_order=renyi_order, gradient_mode=gradient_mode, family=family,
-                divergence_family=divergence_family,
-                include_attention_entropy=include_attention_entropy,
-                transport_mode=transport_mode,
-                decoupled_value_gauge=(rope is not None and not rope_on_value),
-                route="mm_exact"):
-            raise ValueError(
-                "e_step_update='mm_exact' requires a family that registers the mm_exact closed-form "
-                "capability (filtering + renyi order 1 + attention entropy, flat transport, coupled "
-                "value gauge); this call routes the belief gradient to the autograd oracle (or has no "
-                "closed form at all)."
-            )
-        mu_star, sigma_star = mm_exact_update(
-            belief.mu, belief.sigma, mu_p, sigma_p, omega,
-            tau=tau, b0=b0, c0=c0, lambda_beta=lambda_beta,
-            kl_max=kl_max, eps=eps, value=value,
-            lambda_alpha_mode=lambda_alpha_mode, family=family,
-            full_cov_kl_precision=full_cov_kl_precision,
-            full_cov_kl_backend=full_cov_kl_backend,
-            divergence_family=divergence_family,
-            need_sigma_update=(not skip_belief_sigma_update),
-            reuse_pairwise_kl_stats=reuse_pairwise_kl_stats,
-            irrep_dims=group.irrep_dims, log_prior=log_prior,
-        )
-        # The MM forward blend is shared by all backward estimators. Straight-through
-        # attaches the live incoming-state chain after the complete blend and bounds.
-        if grad_record is not None:
-            # mm has no raw gradient; record the DISPLACEMENT norms ||theta* - theta|| instead
-            # (same keys, detached 0-dim tensors; phi overwritten below iff phi steps).
-            grad_record["mu"]    = (mu_star - belief.mu).detach().pow(2).sum().sqrt()
-            grad_record["sigma"] = (sigma_star - belief.sigma).detach().pow(2).sum().sqrt()
-            grad_record["phi"]   = belief.mu.new_zeros(())
-        # Damped step in NATURAL coordinates (mirror descent on the Gaussian natural parameters):
-        #   Lambda <- (1-eta) Lambda + eta Lambda*,  (Lambda mu) <- (1-eta) Lambda mu + eta Lambda* mu*,
-        # eta = mm_damping (eta=1 -> the exact coordinate minimizer in one step).
-        eta = mm_damping
-        if skip_belief_sigma_update:
-            # sigma frozen: the natural-parameter blend is undefined with Lambda held fixed, so
-            # damp the mean in MEAN coordinates instead (eta=1 still lands exactly on mu*).
-            mu    = (1.0 - eta) * belief.mu + eta * mu_star
-            sigma = belief.sigma
-        elif belief.sigma.dim() == belief.mu.dim() + 1:
-            # Full covariance (audit 2026-08-07): the SAME natural-parameter blend, generalized from
-            # the scalar 1/sigma below to the K x K precision matrix; see
-            # kernels.mm_damped_precision_blend_full for the derivation and the eta=0/eta=1 endpoint
-            # pins. The elementwise [eps, sigma_max] clamp below becomes an eigenvalue projection
-            # (the SAME one retract_spd_full applies for its own ceiling).
-            mu, sigma = mm_damped_precision_blend_full(
-                belief.mu, belief.sigma, mu_star, sigma_star, eta, eps=eps, sigma_max=sigma_max,
-            )
-        else:
-            lam_old = 1.0 / belief.sigma.clamp(min=eps)
-            lam_new = (1.0 - eta) * lam_old + eta / sigma_star           # sigma_star >= eps (kernel floor)
-            mu      = ((1.0 - eta) * lam_old * belief.mu + eta * mu_star / sigma_star) / lam_new
-            sigma   = 1.0 / lam_new
-            # the existing SPD bounds, applied AFTER the blend (mirrors the retraction's clamps)
-            sigma   = sigma.clamp(min=eps) if sigma_max is None else sigma.clamp(min=eps, max=sigma_max)
-        if e_step_gradient == "straight_through":
-            # Parenthesized zero carriers preserve the computed forward bits.
-            mu = mu.detach() + (belief.mu - belief.mu.detach())
-            sigma = sigma.detach() + (belief.sigma - belief.sigma.detach())
-    elif (relational_operators is not None
-          and relational_operators.readout_mode == "predictive_content"):
-        if relational_frame is None:
-            raise ValueError("predictive content requires the realized query/key frames")
-        # 'moment_matched' replaces both moments by those of the predictive kernel;
-        # 'passthrough' replaces the mean and keeps the incoming covariance.
-        moment_matched = getattr(relational_operators, "predictive_covariance",
-                                 "passthrough") == "moment_matched"
+                       if relational_capture is not None else None)
+    if not full_link:
+        moment_matched = relational_operators.predictive_covariance == "moment_matched"
         readout = relational_predictive_readout(
             belief.mu, belief.sigma, relational_frame, relational_operators,
             tau=tau, kl_max=kl_max, log_prior=log_prior,
@@ -946,244 +737,51 @@ def e_step_iteration(
             **({"return_covariance": True} if moment_matched else {}))
         mu, sigma = readout if moment_matched else (readout, belief.sigma)
         if grad_record is not None:
-            # No comparison-belief gradient is taken in the predictive branch.
             for role in ("mu", "sigma", "phi"):
                 grad_record[role] = None
     else:
-        if full_link:
-            if relational_frame is None:
-                raise ValueError("full-link filtering requires the realized forward frame")
-            if _full_link_context is None:
-                _full_link_context = build_full_link_context(
-                    belief.mu, belief.sigma, mu_p, sigma_p, relational_frame, relational_operators,
-                    tau=tau, lambda_beta=lambda_beta, value=value,
-                    receiver_noise=relational_operators.receiver_noise, kl_max=kl_max,
-                    value_frame=relational_value_frame, log_prior=log_prior, capture=relational_capture)
-                if relational_capture is not None:
-                    with torch.no_grad():
-                        relational_capture["relational_receiver_cost_before"] = full_link_cost(
-                            belief.mu, belief.sigma, _full_link_context).detach()
-            grad_mu, grad_sigma = full_link_gradients(belief.mu, belief.sigma, _full_link_context)
-        elif relational_operators is not None:
-            if relational_frame is None:
-                raise ValueError("relational filtering requires the realized forward frame")
-            grad_mu, grad_sigma = compute_relational_filtering_gradients(
-                belief.mu, belief.sigma, mu_p, sigma_p, omega, relational_operators,
-                relational_frame,
-                family=family, value_frame=relational_value_frame,
-                full_cov_kl_precision=full_cov_kl_precision,
-                tau=tau, lambda_beta=lambda_beta, kl_max=kl_max, eps=eps,
-                b0=b0, c0=c0, value=value, lambda_alpha_mode=lambda_alpha_mode,
-                log_prior=log_prior, create_graph=(oracle_unroll_grad and torch.is_grad_enabled()),
-                capture=relational_capture,
-            )
-        else:
-            grad_mu, grad_sigma = belief_gradients(
-                belief.mu, belief.sigma, mu_p, sigma_p, omega,
-                tau=tau, renyi_order=renyi_order, value=value, b0=b0, c0=c0, lambda_beta=lambda_beta,
-                kl_max=kl_max, eps=eps,
-                include_attention_entropy=include_attention_entropy, gradient_mode=gradient_mode,
-                family=family, full_cov_kl_precision=full_cov_kl_precision,
-                full_cov_kl_backend=full_cov_kl_backend,
-                divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode,
-                transport_mode=transport_mode, omega_builder=omega_builder,
-                irrep_dims=group.irrep_dims, log_prior=log_prior,
-                # skip_belief_sigma_update: the kernel skips the (B,N,N,K) sigma pair contraction
-                # entirely and returns grad_sigma=None (the oracle fallback still computes it; the
-                # sigma update below is skipped either way).
-                need_sigma_grad=(not skip_belief_sigma_update),
-                reuse_pairwise_kl_stats=reuse_pairwise_kl_stats,
-                # Opt-in unrolled-oracle: make the autograd oracle (non-kernel families) return a
-                # differentiable belief gradient so the through-inference signal reaches the prior, matching
-                # the hand kernel. Gated on the explicit oracle_unroll_grad toggle (default OFF preserves the
-                # detached oracle); only meaningful under the 'unroll' estimator (straight_through detaches
-                # downstream, detach runs under no_grad).
-                create_graph=(oracle_unroll_grad and e_step_gradient == "unroll"),
-            )
+        if _full_link_context is None:
+            _full_link_context = build_full_link_context(
+                belief.mu, belief.sigma, mu_p, sigma_p, relational_frame, relational_operators,
+                tau=tau, lambda_beta=lambda_beta, value=value,
+                receiver_noise=relational_operators.receiver_noise, kl_max=kl_max,
+                value_frame=relational_value_frame, log_prior=log_prior, capture=relational_capture)
+            if relational_capture is not None:
+                with torch.no_grad():
+                    relational_capture["relational_receiver_cost_before"] = full_link_cost(
+                        belief.mu, belief.sigma, _full_link_context).detach()
+        grad_mu, grad_sigma = full_link_gradients(belief.mu, belief.sigma, _full_link_context)
         if grad_record is not None:
-            # Diagnostic: the RAW belief-gradient L2 norms ||grad_mu||, ||grad_sigma|| (pre-natural-grade,
-            # the E-step analogue of the M-step's raw per-group grad_norm). Detached 0-dim tensors (no host
-            # sync here, no graph retained); phi defaults to 0 and is overwritten below iff phi steps.
-            grad_record["mu"]    = grad_mu.detach().pow(2).sum().sqrt()
+            grad_record["mu"] = grad_mu.detach().pow(2).sum().sqrt()
             grad_record["sigma"] = (grad_sigma.detach().pow(2).sum().sqrt()
                                     if grad_sigma is not None else grad_mu.new_zeros(()))
-            grad_record["phi"]   = grad_mu.new_zeros(())
-        # Fisher preconditioner is FAMILY-KEYED (add-by-registering): each BeliefParams owns its Fisher
-        # metric, so a non-Gaussian family (e.g. laplace_diagonal, I_mu=I_b=1/b^2) is descended in its
-        # own geometry instead of the hardcoded Gaussian Fisher. The Gaussian families delegate to the
-        # pinned geometry kernel (byte-identical); 'family' is the same key passed to belief_gradients.
-        # When both sigma is frozen and the mean uses the raw Euclidean arm, no natural-gradient
-        # component is consumed. Bypass the family preconditioner entirely instead of computing and
-        # discarding its sigma arm. The natural-mean route still delegates to the family metric.
-        if grad_sigma is None and e_step_mu_precond == "raw":
-            nat_mu, nat_sigma = grad_mu, None
-        else:
-            nat_mu, nat_sigma = get_family(family)(belief.mu, belief.sigma).natural_gradient(
-                grad_mu, grad_sigma, eps=eps)
-
-        # STRAIGHT-THROUGH (manuscript Algorithm 1, GL(K)_attention.tex:2050): detach the per-iteration
-        # tangent so only the ADDITIVE chain stays live -- the belief is rebuilt as mu_prev + delta and
-        # retract(sigma_prev, delta) below, giving d belief_next/d belief_prev = I WITHOUT the
-        # second-order d delta/d belief_prev term the unrolled path keeps. The tangent is detached AFTER
-        # natural_gradient (which reintroduces a live belief.sigma dependence), not at grad_mu/grad_sigma,
-        # so no second-order term leaks through the Fisher metric. 'unroll' (and the no_grad-wrapped
-        # 'detach') leave nat_mu/nat_sigma untouched, so those lines are byte-identical to before and the
-        # forward VALUE is unchanged (detach never alters a number). This mirrors the phi step, which is
-        # already straight-through (fresh detached leaf, create_graph=False).
-        if e_step_gradient == "straight_through":
-            nat_mu = nat_mu.detach()
-            if nat_sigma is not None:
-                nat_sigma = nat_sigma.detach()
-
-        # B3/EXP-14 mean-arm ablation: descend the Fisher natural gradient nat_mu (= Sigma*grad_mu for a
-        # diagonal Gaussian) by default, or the raw Euclidean grad_mu under e_step_mu_precond='raw'. The
-        # SPD sigma retraction below is unchanged either way, isolating the MEAN preconditioner; grad_mu is
-        # detached under straight_through to match nat_mu's per-iteration tangent severance.
-        if e_step_mu_precond == "raw":
-            mu_grad = grad_mu.detach() if e_step_gradient == "straight_through" else grad_mu
-        else:
-            mu_grad = nat_mu
-        delta_mu = e_q_mu_lr * mu_grad
-        # E-step MEAN trust region (default OFF). When e_mu_q_trust is set, bound the
-        # per-iteration mean step in sigma-whitened units before the additive update; None reproduces the
-        # bare mu = belief.mu - e_q_mu_lr*nat_mu bit-for-bit. is_diagonal mirrors the SPD-retraction rank
-        # rule below (full cov iff sigma.dim() == mu.dim() + 1).
+            grad_record["phi"] = grad_mu.new_zeros(())
+        nat_mu, nat_sigma = get_family(family)(belief.mu, belief.sigma).natural_gradient(
+            grad_mu, grad_sigma, eps=eps)
+        delta_mu = e_q_mu_lr * nat_mu
         if e_mu_q_trust is not None:
-            # m11: under straight_through the whitening sigma must be detached, else where the box/ball
-            # clamp binds the output +-trust*sqrt(sigma) leaks a live d/d(belief.sigma) gradient into mu
-            # -- the per-iteration tangent the ST estimator severs everywhere else. Values unchanged.
-            trust_sigma = belief.sigma.detach() if e_step_gradient == "straight_through" else belief.sigma
             delta_mu = apply_mu_trust_region(
-                delta_mu, trust_sigma, trust=e_mu_q_trust, mode=mu_trust_mode,
+                delta_mu, belief.sigma, trust=e_mu_q_trust, mode=mu_trust_mode,
                 is_diagonal=(belief.sigma.dim() == belief.mu.dim()), eps=eps,
-                family=family,
-            )
+                family=family)
         mu = belief.mu - delta_mu
         if skip_belief_sigma_update or nat_sigma is None:
-            # skip_belief_sigma_update: sigma passes through UNCHANGED (no retraction, no clamp).
-            # nat_sigma is None whenever the gradient route produced no sigma arm -- relational
-            # filtering always does (its return type is Tuple[Tensor, None]), and belief_gradients
-            # does when need_sigma_grad=False. Retracting with a None step is a TypeError and there
-            # is no step to take, so freeze either way.
             sigma = belief.sigma
         else:
-            # The affine SPD retraction owns the diagonal-vs-full rank decision internally
-            # (full covariance iff sigma.dim() == mu.dim() + 1).
             sigma = retract_spd_affine(
                 belief.sigma, -e_q_sigma_lr * nat_sigma, belief.mu.dim(),
-                trust_region=e_sigma_q_trust, eps=eps, sigma_max=sigma_max,
-            )
+                trust_region=e_sigma_q_trust, eps=eps, sigma_max=sigma_max)
+
     if recovery_before is not None:
         relational_capture["relational_covariance_repair_count"] = (
             source_recovery_counter(belief.mu.device) - recovery_before)
-
     if full_link and relational_capture is not None:
         with torch.no_grad():
             relational_capture["full_link_context"] = _full_link_context
             relational_capture["relational_receiver_cost_after"] = full_link_cost(
                 mu, sigma, _full_link_context).detach()
             relational_capture["relational_mean_displacement_norm"] = (mu - belief.mu).norm().detach()
-
-    if relational_capture is not None and "conditional_context" in relational_capture:
-        with torch.no_grad():
-            relational_capture["relational_conditional_cost_after"] = qkv_conditional_cost(
-                mu, relational_capture["conditional_context"]).detach()
-            relational_capture["relational_mean_displacement_norm"] = (mu - belief.mu).norm().detach()
-
-    phi = belief.phi
-    if e_phi_lr > 0.0:
-        # Sequential (Gauss-Seidel) coordinate descent, by design (audit 2026-06-10 F15): the phi
-        # substep is evaluated at the UPDATED (mu, sigma) with the pre-update phi -- each substep
-        # descends F at the current point of the sweep. This mixed state is the standard
-        # coordinate-descent sweep, not a frozen joint state.
-        # The phi gradient fundamentally requires autograd (autograd.grad on a
-        # fresh requires_grad leaf), so it must run under an enable_grad island even when
-        # the caller wraps the stack in no_grad (the detached fixed-point regime).
-        # create_graph defaults to False, so grad_phi is detached from the outer graph and
-        # acts as a constant tangent there; on the default unrolled path enable_grad is a
-        # no-op and the phi-graph connection still flows belief.phi -> retract_phi -> omega.
-        with torch.enable_grad():
-            phi_g = belief.phi.detach().clone().requires_grad_(True)
-            L = phi_alignment_loss(
-                mu, sigma, phi_g, group, tau=tau, renyi_order=renyi_order, kl_max=kl_max, eps=eps,
-                mass_phi=mass_phi, lambda_beta=lambda_beta,
-                family=family, divergence_family=divergence_family,
-                full_cov_kl_precision=full_cov_kl_precision,
-                full_cov_kl_backend=full_cov_kl_backend,
-                include_attention_entropy=include_attention_entropy, log_prior=log_prior,
-                transport_mode=transport_mode,
-                # gauge-RoPE: the phi step must descend the SAME rotated belief-coupling block as the
-                # mu/sigma step, else under pos_rotation='rope' + e_phi_lr>0 phi optimizes a different
-                # free energy than mu/sigma (audit 2026-06-17 round 2 id15). None/off -> byte-identical.
-                rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value, rope_insertion=rope_insertion,
-                right_phi=belief.right_phi,
-                # INTENTIONAL asymmetry (audit 2026-06-09 D3): registry-owned transport state is
-                # detached here, so it trains only through the mu/sigma belief path, never through
-                # the phi-step autograd island. Removing the detach would leak second-order phi-step
-                # terms into transport-state gradients.
-                transport_state={key: value.detach() for key, value in transport_state.items()},
-                clamp_monitor=clamp_monitor,
-                exp_fp64_norm_threshold=exp_fp64_norm_threshold,
-                transport_mean_per_head=transport_mean_per_head,
-                congruence_cond_escalation=congruence_cond_escalation,
-                compact_phi_block_transport=compact_phi_block_transport,
-                transport_chart_max_norm=transport_chart_max_norm,
-                transport_status=transport_status,
-                # Filtering is query-side coordinate ascent for phi too (audit 2026-09-23 #6):
-                # detach the sender frames so phi_j receives no rows i > j. Smoothing keeps the
-                # full envelope gradient through both endpoints.
-                detach_key_frames=(gradient_mode == "filtering"),
-            )
-            grad_phi = torch.autograd.grad(L, phi_g)[0]
-        if grad_record is not None:                      # RAW phi-gradient norm (pre-precondition)
-            grad_record["phi"] = grad_phi.detach().pow(2).sum().sqrt()
-        grad_phi = precondition_phi_gradient(
-            grad_phi, belief.phi, group.generators, mode=phi_precond_mode, irrep_dims=group.irrep_dims,
-        )
-        if phi_retract_mode == "bch" and phi_precond_mode in ("pullback", "pullback_per_block"):
-            grad_phi = _bch_chart_direction(
-                grad_phi, belief.phi, group.generators,
-                irrep_dims=(group.irrep_dims if phi_precond_mode == "pullback_per_block" else None),
-            )
-        phi = retract_phi(
-            belief.phi,
-            -grad_phi,
-            group,
-            step_size=e_phi_lr,
-            mode=phi_retract_mode,
-            compact_blocks=compact_phi_block_transport,
-            residual_max=bch_residual_max,
-        )
-        if transport_chart_max_norm is not None:
-            # The phi objective validates the pre-step frame, but a large retraction can leave the
-            # opt-in validity chart on the final iteration. Validate the actual returned transport
-            # immediately; there may be no later iteration or diagnostic to catch it.
-            with torch.no_grad():
-                build_belief_transport(
-                    phi,
-                    group,
-                    transport_mode=transport_mode,
-                    mu=mu,
-                    sigma=sigma,
-                    transport_state=transport_state,
-
-
-                    clamp_monitor=clamp_monitor,
-                    exp_fp64_norm_threshold=exp_fp64_norm_threshold,
-                    transport_mean_per_head=transport_mean_per_head,
-                    congruence_cond_escalation=congruence_cond_escalation,
-                    compact_phi_block_transport=compact_phi_block_transport,
-                    validity_max_norm=transport_chart_max_norm,
-                    right_phi=belief.right_phi,
-                    exactness_out=transport_status,
-                    rope=rope,
-                    rope_on_cov=rope_on_cov,
-                    rope_on_value=rope_on_value, rope_insertion=rope_insertion,
-                )
-
-    # _replace (not a fresh BeliefState): carry the untouched channels (right_phi) through the
-    # rebuild, so the next iteration's transport build still sees them.
-    return belief._replace(mu=mu, sigma=sigma, phi=phi)
+    return belief._replace(mu=mu, sigma=sigma)
 
 
 def e_step(
@@ -1197,18 +795,17 @@ def e_step(
 
     e_q_mu_lr:                 float = 0.1,
     e_q_sigma_lr:              float = 0.1,
-    e_phi_lr:                  float = 0.1,
+    e_phi_lr:                  float = 0.0,
     exp_fp64_norm_threshold:   float = 5.0,       # 'norm': max clamped block ||M||_F upcast threshold
 
     n_iter:                    int = 1,
 
     e_step_gradient:           str = "unroll",
     rope_insertion:              str = "right",   # "right" (pure, folded frame) | "left" (legacy)
-    # Tier-1 transport perf toggles (2026-07-05; explicit, off the F_diag bag -- that diagnostic
-    # deliberately keeps the default transport numerics). All default OFF/byte-identical.
+    # The model realizes frames before this projected receiver call.
 
     return_trajectory:           bool = False,
-    oracle_unroll_grad:          bool = False,    # explicit (not in kwargs): keep it off the F_diag bag
+    oracle_unroll_grad:          bool = False,    # inactive shared-knob compatibility field
     transport_mean_per_head:     bool = False,    # factored transport_mean contracts per gauge block
     congruence_cond_escalation:    bool = False,   # opt-in conditioning trigger for the fp64 congruence escalation
     compact_phi_block_transport: bool = False,    # packed canonical flat block_glk phi factors
@@ -1216,7 +813,7 @@ def e_step(
     rope_on_value:               bool = True,
 
     grad_record:                 Optional[EStepGradientRecord] = None,   # diag out-param: LAST iteration's belief-grad norms
-    state_record:                Optional[dict]                = None,   # diag out-param: every belief iterate + matching F tensor
+    state_record:                Optional[dict]                = None,   # diag out-param: every executed receiver iterate
     rope:                        Optional[torch.Tensor]        = None,
     log_prior:                   Optional[torch.Tensor]        = None,
     transport_chart_max_norm:   Optional[float]               = None,
@@ -1228,71 +825,26 @@ def e_step(
 
     prebuilt_transport: 'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport | None' = None,   # caller-prebuilt forward transport for the eligible fixed-flat route
     **kwargs,
-) -> 'BeliefState | Tuple[BeliefState, List[float]]':
-    r"""Iterate ``e_step_iteration`` ``n_iter`` times (parallel mean-field). Optionally
-    returns the global-F trajectory (a DIAGNOSTIC; parallel updates are not guaranteed
-    monotone per iteration). ``state_record`` captures the same initial/updated beliefs and
-    free-energy tensors without changing the return type; it is used only by the one-forward
-    diagnostic snapshot path.
+) -> BeliefState:
+    r"""Run projected receiver inference for one incoming-state episode.
 
-    ``e_step_gradient`` is the backward estimator forwarded to each iteration: 'unroll' (default,
-    full second-order trajectory gradient) or 'straight_through' (per-iteration tangent detached,
-    additive chain live). It is an EXPLICIT keyword (not in ``**kwargs``) so it binds here and does
-    NOT ride the forwarded knob bag into the diagnostic ``free_energy_value`` (which rejects unknown
-    kwargs). 'detach' is realized by the caller wrapping this in no_grad, so it is treated as
-    'unroll' here (no_grad already severs every gradient).
-
-    The loop always executes ``n_iter`` iterations, with backward behavior selected
-    by ``e_step_gradient`` and the caller's autograd context.
+    Full-link routing and source-law statistics keep fixed values during receiver
+    iterations, while retaining outer gradient credit. State records capture the
+    executed beliefs; these projected routes do not expose a global-F trajectory.
     """
-    traj: List[float] = []
+    if (relational_operators is None
+            or relational_operators.readout_mode not in ("predictive_content", "full_link_update")):
+        raise ValueError(
+            "transported and conditional attention are retired; projected inference requires "
+            "predictive_content or full_link_update relational operators")
+    canonical_e_step_update(kwargs.get("e_step_update", "gradient"))
+    if return_trajectory:
+        raise ValueError("Global-F trajectories are unavailable for projected attention")
+    if relational_frame is None:
+        raise ValueError("projected inference requires the realized forward frame")
 
-    # Hoist the flat transport when phi is frozen across iterations (e_phi_lr==0).  On the flat
-    # path the transport depends only on belief.phi, which the phi sub-step never updates when
-    # e_phi_lr==0, so it is iteration-invariant.  Build ONCE here and pass it into every
-    # e_step_iteration call via _prebuilt_omega, eliminating the redundant per-iteration rebuild.
-    # When e_phi_lr > 0 phi changes each iteration so we leave _prebuilt_omega=None and let
-    # e_step_iteration rebuild as before.
-    transport_mode_kw: str = kwargs.get("transport_mode", "flat")
-    compact_phi_block_transport = (
-        compact_phi_block_transport
-        and transport_mode_kw == "flat"
-        and group.phi_coordinate_layout == "block_head_row_major"
-    )
-    _hoisted_omega: 'torch.Tensor | CompactFactoredTransport | FactoredTransport | RopeTransport | None' = None
-    e_step_update_kw = canonical_e_step_update(kwargs.get("e_step_update", "gradient"))
-    consumes_omega = _belief_update_consumes_omega(e_step_update_kw, relational_operators)
-    if consumes_omega and e_phi_lr == 0.0 and transport_mode_kw == "flat":
-        if prebuilt_transport is not None:
-            # The caller built the eligible flat transport ONCE from the SAME phi (both channels
-            # hold it fixed at e_phi_lr=0) and shared it across E-step calls, skipping this redundant
-            # per-call matrix-exp build. Consumed ONLY inside the
-            # hoist guard above (e_phi_lr==0 + flat): on any other route the kwarg is ignored and
-            # the per-iteration rebuild stays authoritative.
-            _hoisted_omega = prebuilt_transport
-        else:
-            _hoisted_omega = build_belief_transport(
-                belief.phi, group,
-                transport_mode="flat",
-                right_phi=belief.right_phi,
-                gauge_mode="learned",   # not an e_step kwarg (no **kwargs sink downstream); literal, not a dead kwargs read (m14)
-                clamp_monitor=kwargs.get("clamp_monitor", False),
-                exp_fp64_norm_threshold=exp_fp64_norm_threshold,
-                transport_mean_per_head=transport_mean_per_head,
-                congruence_cond_escalation=congruence_cond_escalation,
-                compact_phi_block_transport=compact_phi_block_transport,
-                validity_max_norm=transport_chart_max_norm,
-                exactness_out=transport_status,
-                rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value, rope_insertion=rope_insertion,
-            )
-
-    # One incoming-state episode: beta and source-law statistics stay fixed with respect
-    # to the fast receiver, while their graph retains outer source/router/map credit.
     full_link_context = None
-    if (relational_operators is not None
-            and relational_operators.readout_mode == "full_link_update"):
-        if relational_frame is None:
-            raise ValueError("full-link filtering requires the realized forward frame")
+    if relational_operators.readout_mode == "full_link_update":
         full_link_context = build_full_link_context(
             belief.mu, belief.sigma, mu_p, sigma_p, relational_frame, relational_operators,
             tau=tau, lambda_beta=kwargs.get("lambda_beta", 1.0), value=kwargs.get("value", 1.0),
@@ -1303,67 +855,12 @@ def e_step(
                 relational_capture["relational_receiver_cost_before"] = full_link_cost(
                     belief.mu, belief.sigma, full_link_context).detach()
 
-    record_sequence_index = (
-        state_record.get("sequence_index") if state_record is not None else None)
-
-    def _f_diag(
-        b: BeliefState,
-        sequence_index: Optional[int] = None,
-    ) -> torch.Tensor:
-        # Diagnostic scalar: under no_grad so the logged trajectory never enters the
-        # training graph. The legacy float trajectory performs its explicit .item() below;
-        # diagnostic snapshots retain the scalar tensor and avoid that host transfer.
-        # rope/rope_on_cov are forwarded explicitly (audit PP6): the logged F carries the same
-        # RoPE-wrapped transport the iterations descend.
-        # NOTE (audit 2026-06-13): under a non-'constant' lambda_alpha_mode the forwarded kwargs
-        # carry the regularizer into free_energy_value (alpha_reg=R), so the logged F is the AUGMENTED
-        # objective F+R the iterations actually descend (the envelope-correct value), not the bare
-        # divergence-weighted F. At the constant default alpha_reg=None, so the trajectory is the pure F.
-        if relational_operators is not None:
-            raise ValueError("Global-F trajectories are unavailable for relational conditional filtering")
-        b_eval, mu_eval, sigma_eval, prior_eval, tau_eval = b, mu_p, sigma_p, log_prior, tau
-        if sequence_index is not None and b.mu.dim() >= 3:
-            b_eval = b._replace(
-                mu=b.mu[sequence_index], sigma=b.sigma[sequence_index], phi=b.phi[sequence_index],
-                right_phi=(b.right_phi[sequence_index]
-                           if b.right_phi is not None and b.right_phi.dim() == b.phi.dim()
-                           else b.right_phi))
-            mu_eval = mu_p[sequence_index]
-            sigma_eval = sigma_p[sequence_index]
-            if isinstance(tau, torch.Tensor) and tau.dim() >= 2 and tau.shape[0] == b.mu.shape[0]:
-                tau_eval = tau[sequence_index]
-            if log_prior is not None:
-                unbatched_rank = 2 if len(group.irrep_dims) == 1 else 3
-                if log_prior.dim() == unbatched_rank + 1 and log_prior.shape[0] == b.mu.shape[0]:
-                    prior_eval = log_prior[sequence_index]
-        with torch.no_grad():
-            return free_energy_value(b_eval, mu_eval, sigma_eval, group, tau=tau_eval, log_prior=prior_eval,
-                                     rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value, rope_insertion=rope_insertion,
-                                     compact_phi_block_transport=compact_phi_block_transport,
-                                     transport_mean_per_head=transport_mean_per_head,
-                                     congruence_cond_escalation=congruence_cond_escalation,
-                                     transport_chart_max_norm=transport_chart_max_norm,
-                                     transport_status=transport_status,
-                                     **kwargs).detach()
-
     if state_record is not None:
+        sequence_index = state_record.get("sequence_index")
         state_record.clear()
-        state_record["sequence_index"] = record_sequence_index
-        state_record["beliefs"] = []
-        state_record["free_energy"] = []
-
-    def _record_diagnostic_state(b: BeliefState) -> None:
-        if return_trajectory:
-            traj.append(_f_diag(b).item())
-        if state_record is not None:
-            state_record["beliefs"].append(b)
-            if relational_operators is None:
-                state_record["free_energy"].append(_f_diag(b, record_sequence_index))
-            else:
-                state_record["semantics"] = relational_operators.inference_semantics
-
-    if return_trajectory or state_record is not None:
-        _record_diagnostic_state(belief)
+        state_record.update(
+            sequence_index=sequence_index, beliefs=[belief], free_energy=[],
+            semantics=relational_operators.inference_semantics)
     for _ in range(n_iter):
         belief = e_step_iteration(
             belief, mu_p, sigma_p, group, tau=tau,
@@ -1375,16 +872,15 @@ def e_step(
             compact_phi_block_transport=compact_phi_block_transport,
             transport_chart_max_norm=transport_chart_max_norm,
             transport_status=transport_status,
-            grad_record=grad_record,                       # last iteration overwrites -> converged-ish grad
-            log_prior=log_prior, rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value, rope_insertion=rope_insertion,
+            grad_record=grad_record,
+            log_prior=log_prior, rope=rope, rope_on_cov=rope_on_cov,
+            rope_on_value=rope_on_value, rope_insertion=rope_insertion,
             relational_operators=relational_operators,
             relational_frame=relational_frame,
             relational_value_frame=relational_value_frame,
             relational_capture=relational_capture,
             _full_link_context=full_link_context,
-            _prebuilt_omega=_hoisted_omega,
-            **kwargs,
-        )
-        if return_trajectory or state_record is not None:
-            _record_diagnostic_state(belief)
-    return (belief, traj) if return_trajectory else belief
+            **kwargs)
+        if state_record is not None:
+            state_record["beliefs"].append(belief)
+    return belief

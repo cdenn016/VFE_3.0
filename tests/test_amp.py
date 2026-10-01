@@ -123,7 +123,7 @@ def test_bf16_backward_reaches_prior_tables():
     # Under bf16 the loss must still backprop through the unrolled E-step to the prior tables
     # (the AMP wrap does not sever the training graph). bf16 needs no GradScaler.
     tok = torch.randint(0, 20, (2, 5)); tgt = torch.randint(0, 20, (2, 5))
-    model = _tiny_model(amp_dtype="bf16", e_phi_lr=0.02)
+    model = _tiny_model(amp_dtype="bf16", e_phi_lr=0.0)
     _, loss, _ = model(tok, tgt)
     loss.backward()
     assert model.prior_bank.mu_embed.grad is not None
@@ -148,8 +148,9 @@ def test_bf16_head_mixer_validation_diagnostics_run_in_fp32():
     assert snapshot.stack_output.mu.dtype == torch.float32
     assert snapshot.stack_output.sigma.dtype == torch.float32
     assert snapshot.beta_maps.dtype == torch.float32
-    assert torch.isfinite(torch.tensor(diagnostics["total"]))
-    assert torch.isfinite(torch.tensor(val_diagnostics.metrics["val_inner_alignment_energy_total"]))
+    assert diagnostics["relational_legacy_global_f_available"] == 0.0
+    assert torch.isfinite(torch.tensor(diagnostics["relational_receiver_cost_after"]))
+    assert torch.isfinite(torch.tensor(val_diagnostics.metrics["val_relational_receiver_cost_after"]))
 
 
 # ---------------------------------------------------------------------------------------------

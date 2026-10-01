@@ -2,7 +2,9 @@ from tests.profiles import test_config
 import torch
 
 from vfe3.belief import BeliefState
-from vfe3.geometry.groups import get_group
+from vfe3.contracts import CanonicalFrameContext
+from vfe3.model.relational_operators import RelationalOperators
+from vfe3.geometry.groups import GaugeGroup, get_group
 from vfe3.model.head_mixer import HeadMixer
 from vfe3.model.stack import vfe_stack
 
@@ -14,6 +16,16 @@ def _belief_and_group(n=6, K=4, n_heads=2):
     belief = BeliefState(mu=torch.randn(n, K), sigma=torch.rand(n, K) + 0.5,
                          phi=torch.zeros(n, n_gen))
     return belief, group
+
+
+def _relational_stack_kwargs(belief: BeliefState, group: GaugeGroup) -> dict:
+    H, d = len(group.irrep_dims), group.irrep_dims[0]
+    frame = torch.eye(d, dtype=belief.mu.dtype).expand(belief.mu.shape[0], H, d, d)
+    return {
+        "relational_operators": RelationalOperators(list(group.irrep_dims), 11,
+                                                   readout_mode="full_link_update"),
+        "relational_frame": CanonicalFrameContext(frame, frame, block_diagonal=True),
+    }
 
 
 def _nonidentity_mixer(group):
@@ -31,8 +43,9 @@ def test_head_mixer_per_block_differs_from_post_stack_at_two_layers():
                      gauge_group="block_glk", prior_handoff_rho=1.0)
     belief, group = _belief_and_group()
     mixer = _nonidentity_mixer(group)
-    out_pb = vfe_stack(belief, belief.mu, belief.sigma, group, cfg, head_mixer=mixer)
-    out_no = vfe_stack(belief, belief.mu, belief.sigma, group, cfg, head_mixer=None)
+    kwargs = _relational_stack_kwargs(belief, group)
+    out_pb = vfe_stack(belief, belief.mu, belief.sigma, group, cfg, head_mixer=mixer, **kwargs)
+    out_no = vfe_stack(belief, belief.mu, belief.sigma, group, cfg, head_mixer=None, **kwargs)
     mu_once, _ = mixer(out_no.mu, out_no.sigma)
     assert not torch.allclose(out_pb.mu, mu_once, atol=1e-4)
 
@@ -44,8 +57,9 @@ def test_head_mixer_per_block_equals_post_stack_at_one_layer():
                      gauge_group="block_glk")
     belief, group = _belief_and_group()
     mixer = _nonidentity_mixer(group)
-    out_pb = vfe_stack(belief, belief.mu, belief.sigma, group, cfg, head_mixer=mixer)
-    out_no = vfe_stack(belief, belief.mu, belief.sigma, group, cfg, head_mixer=None)
+    kwargs = _relational_stack_kwargs(belief, group)
+    out_pb = vfe_stack(belief, belief.mu, belief.sigma, group, cfg, head_mixer=mixer, **kwargs)
+    out_no = vfe_stack(belief, belief.mu, belief.sigma, group, cfg, head_mixer=None, **kwargs)
     mu_once, sig_once = mixer(out_no.mu, out_no.sigma)
     assert torch.allclose(out_pb.mu, mu_once, atol=1e-5)
     assert torch.allclose(out_pb.sigma, sig_once, atol=1e-5)

@@ -155,27 +155,12 @@ def test_attention_tau_equal_blocks_unchanged_scalar():
 
 # ---------------------------------------------------------------- config validation
 
-def _so_n_cfg(**overrides) -> VFE3Config:
-    base = dict(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
-                gauge_group="so_n", group_n=3, irrep_spec=[("l0", 1), ("l1", 1)],
-                n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0)
-    base.update(overrides)
-    return test_config(**base)
 
 
-def test_config_so_n_accepts_and_coerces_json_pairs():
-    cfg = _so_n_cfg(irrep_spec=[["l0", 1], ["l1", 1]])        # JSON round-trip: lists -> tuples
-    assert cfg.irrep_spec == [("l0", 1), ("l1", 1)]
 
 
-def test_config_so_n_dim_sum_mismatch_rejected():
-    with pytest.raises(ValueError, match="sum to"):
-        _so_n_cfg(irrep_spec=[("l1", 1)])                     # 3 != embed_dim 4
 
 
-def test_config_so_n_requires_both_fields():
-    with pytest.raises(ValueError, match="requires both"):
-        _so_n_cfg(group_n=None)
 
 
 def test_config_irrep_fields_rejected_for_other_groups():
@@ -184,50 +169,14 @@ def test_config_irrep_fields_rejected_for_other_groups():
                    gauge_group="block_glk", irrep_spec=[("l1", 1)])
 
 
-def test_config_so_n_rejects_per_block_phi_preconditioners():
-    for mode in ("killing_per_block", "pullback_per_block"):
-        with pytest.raises(ValueError, match="per-block metric is undefined"):
-            _so_n_cfg(phi_precond_mode=mode)
 
 
-def test_config_so_n_per_head_kappa_keyed_to_block_count():
-    cfg = _so_n_cfg(kappa_beta=[1.0, 2.0])                    # 2 irrep blocks -> ok
-    assert list(cfg.kappa_beta) == [1.0, 2.0]
-    with pytest.raises(ValueError, match="one entry per irrep block"):
-        _so_n_cfg(kappa_beta=[1.0, 2.0, 3.0])
 
 
-def test_config_so_n_alibi_requires_head_count_match():
-    with pytest.raises(ValueError, match="irrep blocks"):
-        _so_n_cfg(beta_attention_prior="causal_alibi", n_heads=4)
-    cfg = _so_n_cfg(beta_attention_prior="causal_alibi", n_heads=2)    # 2 blocks == n_heads
-    assert cfg.beta_attention_prior == "causal_alibi"
 
 
 # ---------------------------------------------------------------- end-to-end model
 
-def test_model_runs_under_so_n_irrep_tower():
-    # The SO(3) spin tower l0 + l1 (UNEQUAL block dims [1, 3]) must run end-to-end through the
-    # same model/E-step machinery: forward + loss.backward() with targets yields a finite loss
-    # and finite grad on the prior tables. Mirrors test_model_runs_under_sp_gauge_group.
-    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                     n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.05, m_phi_lr=0.01,
-                     gauge_group="so_n", group_n=3, irrep_spec=[("l0", 1), ("l1", 1)],
-                     phi_precond_mode="none")
-    model = VFEModel(cfg)
-    assert model.group.irrep_dims == [1, 3]
-    assert model.group.generators.shape[0] == 3               # n_gen = dim so(3)
-    assert model.prior_bank.phi_embed.shape == (20, 3)        # phi table sized by n_gen
-    tok = torch.randint(0, 20, (3, 5)); tgt = torch.randint(0, 20, (3, 5))
-    _, loss, _ = model(tok, tgt)
-    loss.backward()
-    assert torch.isfinite(loss)
-    assert torch.isfinite(model.prior_bank.mu_embed.grad).all()
-    assert torch.isfinite(model.prior_bank.phi_embed.grad).all()
-    assert model.prior_bank.mu_embed.grad.abs().sum() > 0
-    # per-head attention over UNEQUAL irrep blocks: H = number of blocks
-    maps = model.attention_maps(torch.randint(0, 20, (2, 5)))
-    assert maps.shape == (1, 2, 5, 5)
 
 
 # ---------------------------------------------------------------- irrep_labels field
@@ -249,3 +198,10 @@ def test_irrep_labels_length_validated():
     with pytest.raises(ValueError, match="irrep_labels"):
         GaugeGroup(name="x", generators=torch.zeros(1, 4, 4), irrep_dims=[2, 2],
                    skew_symmetric=True, irrep_labels=["a"])
+
+
+@pytest.mark.parametrize("mode", ["projected_predictive", "projected_gradient"])
+def test_projected_model_rejects_so_n_group(mode: str) -> None:
+    with pytest.raises(ValueError, match="gauge_group=.*so_n"):
+        test_config(attention_mode=mode, gauge_group="so_n", group_n=3,
+                    irrep_spec=[("l0", 1), ("l1", 1)])

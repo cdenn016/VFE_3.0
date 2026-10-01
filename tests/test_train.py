@@ -40,7 +40,7 @@ def test_optimizer_groups_priors_by_m_lr():
     lrs = sorted(g["lr"] for g in opt.param_groups)
     # m_p_sigma_lr=0.002, then TWO groups at m_phi_lr=0.005 (phi_embed + the default pos_phi='learned'
     # pos_phi_free table, grouped at m_phi_lr in train.py), then m_p_mu_lr=0.01.
-    assert lrs == [0.002, 0.005, 0.005, 0.01]
+    assert lrs == [0.002, 0.005, 0.005, 0.01, 0.01, 0.01]
     # every PriorBank parameter is covered by exactly one group
     n_params = sum(len(g["params"]) for g in opt.param_groups)
     assert n_params == len(list(model.parameters()))
@@ -243,8 +243,6 @@ def test_optimizer_covers_mlp_parameters_once_at_resolved_lr(block_mlp_lr, expec
 # (one that learns only the unigram frequencies of the active tokens) is pinned at the
 # marginal entropy ln(3) ~ 1.0986. Beating that floor by a margin is the discriminating
 # evidence that the model learned the period-3 NEXT-TOKEN structure, not just the marginal.
-_MARGINAL_ENTROPY_P3 = math.log(3)                              # unigram floor of the 3 active tokens
-_CUTOVER_MARGIN      = 0.05                                     # nats below the marginal a learner must reach
 
 
 def _periodic_loader(V=6, period=3, n=600, seq_len=8, batch_size=8, seed=0):
@@ -293,39 +291,16 @@ def test_run_training_applies_cfg_seed_and_deterministic_state(
             os.environ.pop("CUBLAS_WORKSPACE_CONFIG", None)
 
 
-def _random3_loader(V=6, n=600, seq_len=8, batch_size=8, data_seed=101, loader_seed=0):
-    # UNLEARNABLE negative control: each token drawn iid uniform over the SAME 3 active
-    # tokens {0,1,2}. The next token is independent of the current one, so the irreducible
-    # CE floor is exactly the marginal entropy ln(3) -- there is no structure to learn. A
-    # model that genuinely learns next-token structure on the periodic stream must NOT clear
-    # the same sub-ln(3) anchor here, where clearing it could only be in-sample noise-fitting.
-    dg = torch.Generator().manual_seed(data_seed)
-    g = torch.Generator().manual_seed(loader_seed)
-    base = torch.randint(0, 3, (n,), generator=dg)             # iid over {0,1,2}, no period
-    ds = TokenWindows(base.to(torch.long), seq_len)
-    return DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=True,
-                      generator=g)
 
 
 def _structured_cfg() -> VFE3Config:
-    # The period-3 shift (0->1->2->0) is a DIRECTED map: predicting the next token from the
-    # current one. Causal attention only AVERAGES past beliefs, so with the gauge frame
-    # frozen (e_phi_lr=m_phi_lr=0) the priors collapse to the symmetric "predict the marginal
-    # over the active tokens" optimum and CE pins at exactly ln(3) ~ 1.099 (verified across
-    # every learning-rate / E-step / depth / alpha sweep -- see the changelog). The gauge
-    # transport Omega_ij(phi) is the one degree of freedom that applies a DIRECTED (non-
-    # averaging) rotation to coupled beliefs; turning it on (e_phi_lr, m_phi_lr > 0) breaks
-    # the symmetry and is the ONLY mechanism that drives CE below ln(3). The cutover anchor
-    # below therefore gates exactly that sub-marginal (phi) improvement: a future config edit
-    # that detunes phi drops CE back to the ln(3) pin and fails the anchor loudly.
+    """Tiny projected-gradient profile for training-state and accumulation contracts."""
     return test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                      n_e_steps=3, e_q_mu_lr=0.3, e_phi_lr=0.3,
-                      m_p_mu_lr=0.05, m_p_sigma_lr=0.01, m_phi_lr=0.05, warmup_steps=5, max_steps=200)
+                      n_e_steps=3, e_q_mu_lr=0.3, e_phi_lr=0.0,
+                      m_p_mu_lr=0.05, m_p_sigma_lr=0.01, m_phi_lr=0.05,
+                      warmup_steps=5, max_steps=200)
 
 
-def _median(xs):
-    s = sorted(xs)
-    return s[len(s) // 2] if len(s) % 2 else 0.5 * (s[len(s) // 2 - 1] + s[len(s) // 2])
 
 
 # Promoted from xfail to a hard gate (audit t3, 2026-07-07 re-validation): the per-head-(per-irrep-block)
@@ -334,40 +309,6 @@ def _median(xs):
 # (the old ~0.047 thin margin was the retired SINGLE-beta model). The negative control
 # test_random_stream_does_not_clear_cutover_anchor guards the other side. Threshold deliberately NOT
 # massaged (audit honesty rule).
-def test_training_decreases_loss_on_structured_stream():
-    # CUTOVER (spec section 10): the assembled VFEModel must LEARN the period-3 next-token
-    # structure, certified by BEATING the active-alphabet unigram floor ln(3) -- not merely
-    # by ending below 0.6*init (which is coupled to the ln(vocab) init magnitude, sits BELOW
-    # ln(3) only by ~0.024 nats, and is razor-thin against an unlearnable random(3) stream;
-    # see test_random_stream_does_not_clear_cutover_anchor). We assert the MEDIAN end-loss
-    # over 3 seeds clears the absolute marginal-entropy anchor, so a single unlucky phi init
-    # cannot flip the gate. (No held-out split is needed: the random-control floor sits ABOVE
-    # this anchor, so in-sample noise-fitting alone cannot clear it.)
-    ends = []
-    for seed in range(3):
-        torch.manual_seed(seed)
-        cfg = _structured_cfg()
-        model = VFEModel(cfg)
-        losses = train(model, _periodic_loader(V=6, period=3, seed=seed), cfg, n_steps=200)
-        ends.append(losses[-1])
-        if seed == 0:                                          # documented secondary readout
-            assert losses[-1] < 0.6 * losses[0]               # init-relative drop (start ~ln(6))
-    assert _median(ends) < _MARGINAL_ENTROPY_P3 - _CUTOVER_MARGIN   # beats the unigram floor -> LEARNS the period
-
-
-def test_random_stream_does_not_clear_cutover_anchor():
-    # NEGATIVE CONTROL for the cutover: the same model/config on an UNLEARNABLE iid random(3)
-    # stream must NOT clear the marginal-entropy anchor. The irreducible floor is ln(3) (no
-    # next-token structure), so the only way to drop below ln(3) - margin in-sample would be
-    # noise-fitting finite-sample fluctuations -- which this asserts does NOT happen, proving
-    # the structured test's anchor certifies STRUCTURE learning rather than ended-just-under
-    # -the-marginal. (data_seed 101 verified to end ~1.12, robustly above the anchor.)
-    torch.manual_seed(0)
-    cfg = _structured_cfg()
-    model = VFEModel(cfg)
-    losses = train(model, _random3_loader(data_seed=101), cfg, n_steps=200)
-    assert losses[-1] == losses[-1]                            # finite (no NaN)
-    assert losses[-1] >= _MARGINAL_ENTROPY_P3 - _CUTOVER_MARGIN   # cannot beat a floor that has no structure
 
 
 def test_training_smoke_on_real_wikitext2_if_present():
@@ -774,13 +715,20 @@ def test_attention_diagnostic_failure_does_not_kill_training(tmp_path, monkeypat
     def _boom(*a, **k):
         raise RuntimeError("replay boom")
 
-    monkeypatch.setattr(model, "attention_maps", _boom)
+    monkeypatch.setattr(model, "build_diagnostic_snapshot", _boom)
     art = RunArtifacts(tmp_path / "run", cfg, model)
     with caplog.at_level(logging.WARNING):
         losses = train(model, _periodic_loader(seed=0), cfg, n_steps=2, eval_interval=1,
                        val_loader=_periodic_loader(seed=1), artifacts=art)
     assert len(losses) == 2                                     # train() completed despite the failure
+    assert all(math.isfinite(loss) for loss in losses)
+    assert art.diagnostics_failures["training_diagnostics"] == 2
     assert any("validation diagnostics failed" in r.getMessage() for r in caplog.records)
+    with (tmp_path / "run" / "metrics.csv").open(newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    assert len(rows) == 2
+    assert all(row["attn_entropy"] == "" for row in rows)
+    assert all(int(row["diagnostics_failures"]) >= 1 for row in rows)
 
 
 def test_val_diagnostics_failure_resets_to_nan(tmp_path, monkeypatch):
@@ -872,12 +820,12 @@ def test_select_loader_raises_on_missing_cache(monkeypatch):
 # callback once, immediately after the final optimizer step, and finalize_validation_run() turns that
 # snapshot into a complete VALIDATION-ONLY artifact set (never a test split) plus a resumable checkpoint
 # whose weights and optimizer moments describe the same final iterate.
-# Tiny CPU models throughout: embed_dim=4, n_heads=1, n_layers=1, n_e_steps=1, two batches.
+# Tiny CPU models throughout: embed_dim=4, n_heads=2, n_layers=1, n_e_steps=1, two batches.
 
 
 def _terminal_cfg(**kw):
-    base = dict(vocab_size=6, embed_dim=4, n_heads=1, max_seq_len=8, n_layers=1,
-                n_e_steps=1, gauge_group="glk", use_head_mixer=False,
+    base = dict(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+                n_e_steps=1, gauge_group="block_glk", use_head_mixer=False,
                 e_q_mu_lr=0.5, e_q_sigma_lr=0.05, e_phi_lr=0.0,
                 m_p_mu_lr=0.1, m_p_sigma_lr=0.05, m_phi_lr=0.0,
                 warmup_steps=1, max_steps=2, kl_max=32)

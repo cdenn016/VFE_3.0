@@ -276,7 +276,6 @@ def test_identity_frame_arm_trains_the_table_and_not_the_frames() -> None:
     dict(use_block_mlp=False),
     dict(block_mlp_mode="gaussian_template"),
     dict(block_mlp_mode="gauge_gate", family="gaussian_full", decode_mode="full_chunked"),
-    dict(attention_mode="transported", attention_residual=False, relational_output_scope="head"),
 ])
 def test_config_fails_closed_without_a_coordinate_hidden_layer(over: Dict[str, Any]) -> None:
     with pytest.raises(ValueError, match="per_type_hidden_bias"):

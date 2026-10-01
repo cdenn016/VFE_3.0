@@ -47,6 +47,10 @@ def _stack(model, belief, log_prior, rope):
     """
     cfg = model.cfg
     block_mlp_transport, block_mlp_frame = model._block_mlp_frame_transport(belief, rope)
+    shared = model._build_shared_flat_transport(belief, rope, require_vertex_factors=True)
+    frame = model._canonical_frame_context(shared, fold_rope=True, compact=True)
+    value_frame = (model._canonical_frame_context(shared, compact=True)
+                   if rope is not None and not cfg.rope_on_value else frame)
     return vfe_stack(
         belief, belief.mu, belief.sigma, model.group, cfg,
         log_prior=log_prior, block_norm=model.block_norm,
@@ -55,7 +59,9 @@ def _stack(model, belief, log_prior, rope):
         lambda_beta=cfg.lambda_beta,
         transport_state=model.transport_state,
         rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
-        prebuilt_transport=block_mlp_transport, rope_insertion=model.cfg.rope_insertion)
+        prebuilt_transport=block_mlp_transport, rope_insertion=model.cfg.rope_insertion,
+        relational_operators_by_layer=model.relational_operators_by_layer,
+        relational_frame=frame, relational_value_frame=value_frame)
 
 
 def _forward_reference(model, tokens: torch.Tensor):
@@ -153,8 +159,8 @@ def _projected_extract_model(**overrides: object) -> VFEModel:
         e_phi_lr=0.0,
         family="gaussian_diagonal",
         transport_mode="flat",
-        decode_mode="full_chunked",
-        encode_mode="canonical_content_projected",
+        decode_mode="diagonal_chunked",
+        encode_mode="per_token",
         lambda_alpha_mode="constant",
         pos_phi="learned",
         max_steps=1,
@@ -211,11 +217,9 @@ def test_projected_encode_one_matches_production_initial_snapshot() -> None:
     torch.testing.assert_close(belief.mu, snapshot.initial_belief.mu[0], atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(
         belief.sigma, snapshot.initial_belief.sigma[0], atol=1e-6, rtol=1e-6)
-    assert not torch.allclose(
-        model.prior_bank.mu_embed[tokens[0]], snapshot.initial_belief.mu[0],
-        atol=1e-5,
-        rtol=1e-5,
-    )
+    # Per-token encoding preserves the prior moments while retaining nonzero local frames.
+    torch.testing.assert_close(model.prior_bank.mu_embed[tokens[0]], snapshot.initial_belief.mu[0])
+    assert bool((snapshot.initial_belief.phi != 0).any())
 
 
 def test_projected_e_step_trajectory_matches_production_snapshot() -> None:
@@ -277,23 +281,22 @@ def test_projected_converged_state_matches_production_snapshot() -> None:
     """Converged diagnostics must not silently replay canonical rather than realized moments."""
     model, tokens, snapshot = _projected_parity_case()
 
-    replay = extract.converged_state(model, tokens)
-    production = extract.converged_state(model, tokens, snapshot=snapshot)
+    replay = extract.readout_state(model, tokens)
+    production = extract.readout_state(model, tokens, snapshot=snapshot)
 
     _assert_tensor_dict_close(
         replay,
         production,
-        ("mu", "sigma", "phi", "energy", "beta", "self_div"),
+        ("mu", "sigma", "phi", "energy", "beta"),
     )
 
 
-def test_projected_rope_detached_replay_matches_production_snapshot() -> None:
-    """Allowed means-only gauge-RoPE and a detached E-step still share the projected q0 seam."""
+def test_projected_rope_unrolled_replay_matches_production_snapshot() -> None:
+    """Allowed means-only gauge-RoPE and an unrolled E-step share the projected q0 seam."""
     with pytest.warns(UserWarning, match="gauge"):
         model, tokens, snapshot = _projected_parity_case(
             pos_rotation="rope",
             rope_full_gauge=False,
-            e_step_gradient="detach",
             use_block_mlp=False,          # the block MLP requires a gradient-carrying E-step
         )
 
@@ -302,8 +305,8 @@ def test_projected_rope_detached_replay_matches_production_snapshot() -> None:
     torch.testing.assert_close(belief.mu, snapshot.initial_belief.mu[0], atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(
         belief.sigma, snapshot.initial_belief.sigma[0], atol=1e-6, rtol=1e-6)
-    replay = extract.converged_state(model, tokens)
-    production = extract.converged_state(model, tokens, snapshot=snapshot)
+    replay = extract.readout_state(model, tokens)
+    production = extract.readout_state(model, tokens, snapshot=snapshot)
     _assert_tensor_dict_close(replay, production, ("mu", "sigma", "phi", "energy", "beta"))
 
 
@@ -311,8 +314,7 @@ def test_projected_rope_detached_replay_matches_production_snapshot() -> None:
     ("overrides", "expected_shared_builds"),
     [
         pytest.param({}, 1, id="flat-fixed-no-rope"),
-        pytest.param({"e_phi_lr": 0.01}, 0, id="moving-phi"),
-        pytest.param({"pos_rotation": "rope"}, 0, id="rope"),
+        pytest.param({"pos_rotation": "rope"}, 1, id="rope"),
     ],
 )
 def test_refine_transport_sharing_is_derived_from_exact_eligibility(
@@ -352,8 +354,8 @@ def test_refine_transport_sharing_is_derived_from_exact_eligibility(
 def test_projected_inference_record_reuses_same_forward_frame_for_decode(
     sequence_length: int,
 ) -> None:
-    """A belief-only extraction record must retain its same-forward projected frame."""
-    model = _projected_extract_model()
+    """Reference decoding must retain the realized relational frame from the same forward."""
+    model = _projected_extract_model(decode_coordinates="reference")
     model.eval()
     tokens = torch.arange(2, 2 + sequence_length, device=DEVICE).unsqueeze(0)
     targets = torch.arange(7, 7 + sequence_length, device=DEVICE).remainder(
@@ -374,7 +376,7 @@ def test_projected_inference_record_reuses_same_forward_frame_for_decode(
     assert isinstance(frame, CanonicalFrameContext)
     assert frame.forward.device.type == "cpu"
     assert frame.inverse.device.type == "cpu"
-    assert frame.forward.shape == (1, sequence_length, 4, 4)
+    assert frame.forward.shape == (1, sequence_length, 2, 2, 2)
 
     decoded = extract._decode_inference_record(model, record, DEVICE)
     _, direct = model.forward_beliefs(tokens, return_logits=True)
@@ -407,6 +409,6 @@ def test_active_mlp_extract_replay_matches_forward() -> None:
     tokens = torch.tensor([[1, 3, 5, 7]], dtype=torch.long, device=DEVICE)
 
     reference = _forward_reference(model, tokens)
-    replay = extract.converged_state(model, tokens)
+    replay = extract.across_layer_belief_trace(model, tokens)
 
-    torch.testing.assert_close(replay["mu"], reference.mu[0], atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(replay["mu"][-1], reference.mu[0], atol=1e-6, rtol=1e-6)

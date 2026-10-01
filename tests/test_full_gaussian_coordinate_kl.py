@@ -48,10 +48,10 @@ def test_coordinate_kl_weighted_gradient_check() -> None:
 
 def test_full_coordinate_non_kl_renyi_fails_explicitly() -> None:
     q = FullGaussian(torch.zeros(2), torch.eye(2))
-    with pytest.raises(ValueError, match="KL"):
+    with pytest.raises(ValueError, match=r"KL \(alpha=1\)"):
         q.renyi_per_coord(q, alpha=.5)
-    with pytest.raises(ValueError, match="KL"):
-        _cfg(family="gaussian_full", attention_mode="transported", renyi_order=.5,
+    with pytest.raises(ValueError, match="renyi_order=0.5"):
+        _cfg(family="gaussian_full", attention_mode="projected_predictive", renyi_order=.5,
              lambda_alpha_mode="state_dependent_per_coord")
 
 

@@ -107,8 +107,8 @@ _SIGMA_FAMILY = {"belief_spectrum", "spd_ellipses", "belief_condition"}
 
 def test_route_gates_flat_projected_frozen():
     cfg = test_config(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
-                     attention_mode="projected_predictive", relational_input_scope="full",
-                     relational_output_scope="full", gauge_group="block_glk")
+                     attention_mode="projected_predictive",
+                     gauge_group="block_glk")
     reasons = figs.route_figure_skip_reasons(cfg)
     assert "flat" in reasons["holonomy_curvature"]
     assert _ESTEP_FAMILY <= set(reasons)
@@ -118,18 +118,20 @@ def test_route_gates_flat_projected_frozen():
     assert not figs.has_estep_iterates(cfg)
 
 
-def test_route_gates_transported_live_route_keeps_estep_and_sigma_figures():
-    cfg = SimpleNamespace(transport_mode="curved", attention_mode="transported", n_e_steps=2,
+def test_route_gates_gradient_keeps_sigma_but_skips_legacy_objective_figures() -> None:
+    cfg = SimpleNamespace(transport_mode="flat", attention_mode="projected_gradient", n_e_steps=2,
                           skip_belief_sigma_update=False)
-    assert figs.route_figure_skip_reasons(cfg) == {}
-    assert figs.has_estep_iterates(cfg)
+    reasons = figs.route_figure_skip_reasons(cfg)
+    assert _ESTEP_FAMILY <= set(reasons)
+    assert _SIGMA_FAMILY.isdisjoint(reasons)
+    assert not figs.has_estep_iterates(cfg)
 
 
-def test_route_gates_zero_estep_and_frozen_transported():
-    cfg = SimpleNamespace(transport_mode="flat", attention_mode="transported", n_e_steps=0,
+def test_route_gates_zero_estep_and_frozen_gradient() -> None:
+    cfg = SimpleNamespace(transport_mode="flat", attention_mode="projected_gradient", n_e_steps=0,
                           skip_belief_sigma_update=True)
     reasons = figs.route_figure_skip_reasons(cfg)
-    assert reasons["iterate_trajectory"] == "no E-step iterates (n_e_steps=0)"
+    assert "legacy shared-objective E-step probes do not apply" in reasons["iterate_trajectory"]
     assert _SIGMA_FAMILY <= set(reasons) and "holonomy_curvature" in reasons
 
 
@@ -164,8 +166,8 @@ def _projected_model() -> VFEModel:
         vocab_size=7, embed_dim=4, n_heads=2, batch_size=1, max_seq_len=4,
         n_layers=1, n_e_steps=1, family="gaussian_diagonal", gauge_group="block_glk",
         e_phi_lr=0.0, pos_phi="learned", use_head_mixer=True, use_block_mlp=True,
-        block_mlp_expansion=1, relational_input_scope="full", attention_mode="projected_predictive",
-        relational_output_scope="full",
+        block_mlp_expansion=1, attention_mode="projected_predictive",
+
     )).eval()
 
 
@@ -189,7 +191,7 @@ def test_report_gates_route_trivial_figures_and_emits_history_figures(tmp_path, 
         assert f"{name}.png" not in names
         assert f"figure '{name}' skipped (" in caplog.text
     assert "transport_mode='flat'" in caplog.text
-    assert "no E-step iterates (attention_mode='projected_predictive'" in caplog.text
+    assert "legacy shared-objective E-step probes do not apply" in caplog.text
     assert {"head_block_norms.png", "numerical_trust.png", "per_layer_diagnostics.png",
             "sigma_ce_scatter.png", "reliability_diagram.png"} <= names
     assert {f"{name}.png" for name in report.HISTORY_FIGURES} <= names

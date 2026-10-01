@@ -51,7 +51,7 @@ def test_full_rank_source_recovers_lost_gram_precision(device: torch.device, rol
 
 def test_actual_relational_router_uses_source_factorization(device: torch.device) -> None:
     mu, sigma, inverse, S = _inputs(device)
-    ops = RelationalOperators([3], 4, identity_content=True).to(device)
+    ops = RelationalOperators([3], 4).to(device)
     with torch.no_grad():
         ops.raw_score_q.copy_(S)
         ops.raw_score_k.copy_(torch.eye(3, device=device)[None])

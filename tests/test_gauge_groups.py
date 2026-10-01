@@ -1,4 +1,5 @@
 from tests.profiles import test_config
+from types import SimpleNamespace
 import pytest
 import torch
 
@@ -129,8 +130,9 @@ def test_build_group_forwards_cross_couplings():
     base = build_group(test_config(embed_dim=4, n_heads=2, gauge_group="block_glk"))
     # Headless positional prior: the default per-head causal_alibi bias is fail-closed rejected
     # once cross-coupling collapses the irreps to a single [K] block.
-    coupled = build_group(test_config(embed_dim=4, n_heads=2, gauge_group="block_glk",
-                                     cross_couplings=[(0, 1)], beta_attention_prior="causal"))
+    cfg = test_config(embed_dim=4, n_heads=2, gauge_group="block_glk")
+    group_settings = SimpleNamespace(**{**vars(cfg), "cross_couplings": [(0, 1)]})
+    coupled = build_group(group_settings)
     assert coupled.generators.shape[0] == base.generators.shape[0] + 4
     assert coupled.generators.shape[0] > base.generators.shape[0]   # strictly larger
     assert base.irrep_dims == [2, 2]
@@ -186,60 +188,6 @@ def test_full_kl_invariant_under_group_pushforward(spec):
     assert torch.allclose(base, moved, atol=1e-3, rtol=1e-3)
 
 
-def test_full_model_logits_invariant_under_global_gauge():
-    # t8 (audit 2026-07-06): the component tests pin gauge invariance of the divergence / transport /
-    # mixer / metric, but the COMPOSITE claim -- a full VFEModel's decode logits are invariant when the
-    # (tied) prior tables are transformed by ONE global structure-group element g -- is never pinned
-    # end-to-end. Pure path chosen so the diagonal (V,K) sigma table can represent the gauge action:
-    # so_k => g is ORTHOGONAL (g Sigma g^T = Sigma stays diagonal), Sigma = I, frames = identity (Omega = I),
-    # family=gaussian_full (diagonal KL is NOT congruence-invariant), flat transport, pos_rotation='none',
-    # no head mixer, and a prior-bank decoder that co-transforms. Transforming every (V,K) mean table
-    # (mu_embed feeds the belief, and the decode vocab prior on a tied bank; the untied default adds
-    # decode_mu_embed) realizes the global gauge; the E-step still evolves non-trivial full
-    # covariances that transform by congruence. The fixed-basis seams now on by default are pinned
-    # off, since each breaks exact global-gauge invariance by construction: the block LayerNorm
-    # (non-equivariant registry entry), the coordinate block MLP, and the frozen-sigma E-step (which
-    # would leave the covariances untransformed rather than evolving them).
-    from vfe3.model.model import VFEModel
-
-    def _cfg(**over):
-        base = dict(vocab_size=6, embed_dim=4, n_heads=1, max_seq_len=4, n_layers=1, n_e_steps=3,
-                    gauge_group="so_k", family="gaussian_full", transport_mode="flat",
-                    pos_rotation="none", use_head_mixer=False, decode_mode="full_chunked",
-                    norm_type_block="none", use_block_mlp=False, skip_belief_sigma_update=False)
-        base.update(over)
-        return test_config(**base)
-
-    def _delta_logits(dbl, **over):
-        torch.manual_seed(0)
-        m = VFEModel(_cfg(**over))
-        with torch.no_grad():
-            m.prior_bank.phi_embed.zero_()                 # frames -> identity (Omega = I)
-            if hasattr(m, "pos_phi_free"):
-                m.pos_phi_free.zero_()                     # no positional gauge
-            m.prior_bank.sigma_log_embed.zero_()           # Sigma = I (invariant under orthogonal g)
-        if dbl:
-            m = m.double()
-        m.eval()
-        gen = m.group.generators.to(torch.float64 if dbl else torch.float32)
-        c = 0.3 * torch.randn(gen.shape[0], generator=torch.Generator().manual_seed(1)).to(gen.dtype)
-        g = torch.linalg.matrix_exp(torch.einsum("a,aij->ij", c, gen))
-        eye = torch.eye(gen.shape[-1], dtype=gen.dtype)
-        assert torch.allclose(g @ g.transpose(-1, -2), eye, atol=1e-6)   # so_k => g orthogonal
-        tok = torch.randint(0, 6, (1, 4), generator=torch.Generator().manual_seed(2))
-        with torch.no_grad():
-            logits0 = m(tok)[0].clone()
-            for table in (m.prior_bank.mu_embed, getattr(m.prior_bank, "decode_mu_embed", None)):
-                if table is not None:                      # every (V,K) mean table the model holds
-                    table.copy_(torch.einsum("kl,vl->vk", g, table))
-            logits1 = m(tok)[0].clone()
-        return float((logits0 - logits1).abs().max())
-
-    # Pure path: the full-model decode logits are invariant to the global gauge transform (fp64).
-    assert _delta_logits(dbl=True) < 1e-6
-    # Teeth (non-vacuity): the linear mu@W^T decode does not co-transform, so the
-    # SAME transform changes the logits -- proving the invariance assertion above actually has bite.
-    assert _delta_logits(dbl=False, decode_mode="linear") > 1e-4
 
 
 def test_glk_generators_exact_entries():

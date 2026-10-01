@@ -260,23 +260,18 @@ def test_attention_maps_reflect_rope():
     assert not torch.allclose(a, b, atol=1e-5)             # RoPE changes the per-head attention
 
 
-def test_diagnostics_runs_under_rope():
-    # diagnostics() replays the E-step and must thread the ACTIVE rope into vfe_stack (matching the
-    # forward), so the rope!=None convergence branch is exercised. Default configs use pos_rotation
-    # 'none', so without this the threaded path is never run. Assert the metrics come back finite
-    # (abs(v) < inf is False for both +/-inf and NaN).
+def test_diagnostics_runs_under_rope() -> None:
+    """RoPE diagnostics capture the supported full-link receiver episode in float32."""
     torch.manual_seed(0)
     x = torch.randint(0, 6, (1, 8))
-    roped = VFEModel(_rope_cfg(pos_rotation="rope", ))
-    diag = roped.diagnostics(x)
-    optional_none = {"phi_mstep_max_matrix_norm", "transport_chart_max_norm"}
-    assert {key for key, value in diag.items() if value is None} == optional_none
-    # Every other metric must come back finite (abs(v) < inf is False for both +/-inf and NaN).
-    required = {
-        key: value for key, value in diag.items()
-        if key not in optional_none
-    }
-    assert required and all(torch.isfinite(torch.as_tensor(v)).all() for v in required.values())
+    roped = VFEModel(_rope_cfg(pos_rotation="rope"))
+    snapshot = roped.build_diagnostic_snapshot(x)
+    diag = roped.diagnostics(x, snapshot=snapshot)
+    assert snapshot.rope is not None
+    assert diag["relational_legacy_global_f_available"] == 0.0
+    for key in ("relational_receiver_cost_before", "relational_receiver_cost_after",
+                "relational_receiver_cost_delta", "effective_rank", "belief_cond_median"):
+        assert torch.isfinite(torch.as_tensor(diag[key])).all(), key
 
 
 from vfe3.gradients.kernels import belief_gradients

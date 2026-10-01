@@ -1,0 +1,50 @@
+{
+  "method": "Latest complete-file result replaces earlier cases; final two-case result overrides its matching cases. Expected-red results excluded. Removed legacy cases are not counted as passed.",
+  "latest": {
+    "passed": 3318,
+    "skipped": 16
+  },
+  "recorded_test_files": 191,
+  "history": [
+    {
+      "junit": "focused.xml",
+      "cases": 318,
+      "passed": 310,
+      "failed": 7,
+      "skipped": 1
+    },
+    {
+      "junit": "affected.xml",
+      "cases": 142,
+      "passed": 135,
+      "failed": 7
+    },
+    {
+      "junit": "broader.xml",
+      "cases": 2983,
+      "passed": 2681,
+      "failed": 287,
+      "skipped": 15
+    },
+    {
+      "junit": "repairs.xml",
+      "cases": 1200,
+      "passed": 1179,
+      "failed": 18,
+      "skipped": 3
+    },
+    {
+      "junit": "residual.xml",
+      "cases": 310,
+      "passed": 306,
+      "failed": 2,
+      "skipped": 2
+    },
+    {
+      "junit": "final-cases.xml",
+      "cases": 2,
+      "passed": 2
+    }
+  ],
+  "unresolved": []
+}

@@ -232,18 +232,6 @@ def test_spd_affine_bit_identical_full():
 # --- log_euclidean SPD retraction variant (ambient tangent -> log chart) ---
 
 
-
-
-
-
-
-
-
-
-
-
-
-
 def _f_uses_eigvecs(eighfn, A):
     """A scalar whose gradient genuinely depends on the EIGENVECTORS, so the off-diagonal
     F = 1/(lambda_i - lambda_j) gap term (and its SIGN) is actually exercised. Contracting sqrtA with
@@ -308,8 +296,6 @@ def test_retract_spd_full_finite_backward_at_isotropic_init():
     assert torch.isfinite(sigma.grad).all()
 
 
-
-
 def test_near_degenerate_exp_preserves_active_off_diagonal_derivative():
     """An fp32 output roundoff must not erase an active exponential Fréchet derivative."""
     from vfe3.geometry import retraction as retraction_module
@@ -337,29 +323,6 @@ def test_near_degenerate_exp_preserves_active_off_diagonal_derivative():
     flat_grad = torch.autograd.grad((flat_out * cotangent).sum(), flat)[0]
 
     assert flat_grad[0, 1].item() == 0.0
-
-
-def test_full_cov_e_step_isotropic_init_finite_backward():
-    """End-to-end reachability: a full-cov E-step at the ISOTROPIC Sigma = I init (the real default
-    prior init) gives finite grads on the DEFAULT 'unroll' estimator via spd_affine -> retract_spd_full."""
-    from vfe3.belief import BeliefState
-    from vfe3.geometry.groups import get_group
-    from vfe3.inference.e_step import e_step_iteration
-    torch.manual_seed(2)
-    N, K = 4, 4
-    group = get_group("glk")(K)
-    mu = torch.randn(1, N, K, requires_grad=True)
-    sigma = torch.eye(K).expand(1, N, K, K).clone().requires_grad_(True)   # isotropic == default init
-    phi = torch.zeros(1, N, group.generators.shape[0])
-    belief = BeliefState(mu=mu, sigma=sigma, phi=phi)
-    mu_p = torch.randn(N, K)
-    sigma_p = torch.eye(K).expand(N, K, K).clone()
-    out = e_step_iteration(belief, mu_p, sigma_p, group,
-                           e_q_mu_lr=0.1, e_q_sigma_lr=0.05, e_phi_lr=0.0,
-                           family="gaussian_full")
-    (out.mu.pow(2).sum() + out.sigma.pow(2).sum()).backward()
-    assert torch.isfinite(mu.grad).all()
-    assert torch.isfinite(sigma.grad).all()
 
 
 def test_full_cov_model_first_backward_finite_at_default_init():
@@ -408,7 +371,3 @@ def test_retract_valid_sigma_max_unaffected(sigma_max):
                              0.1 * torch.eye(K).expand(2, K, K).contiguous(), sigma_max=sigma_max)
     assert torch.isfinite(out_f).all()
     assert (torch.linalg.eigvalsh(out_f) > 0).all()
-
-
-
-

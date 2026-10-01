@@ -283,7 +283,7 @@ def _gate_model(family: str, decode_mode: str, decode_coordinates: str = "refere
     cfg = _cfg(vocab_size=V, embed_dim=K, n_heads=H, max_seq_len=N, n_layers=1, family=family,
                decode_mode=decode_mode, decode_coordinates=decode_coordinates, use_block_mlp=True,
                block_mlp_mode="gauge_gate", norm_type_block="mahalanobis", layernorm_affine=False,
-               relational_input_scope="full", relational_output_scope="full", pos_phi="none")
+               pos_phi="none")
     model = _build(cfg, dtype=torch.float64)
     g = torch.Generator().manual_seed(21)
     with torch.no_grad():
@@ -342,7 +342,7 @@ def test_functional_stack_is_covariant_under_block_frame_changes(decode: str) ->
 # ----------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("over, message", [
-    (dict(attention_mode="transported", attention_residual=False, relational_output_scope="head",
+    (dict(attention_mode="transported", attention_residual=False,
           decode_mode="diagonal_chunked"), "transported"),
     (dict(pos_rotation="rope"), "pos_rotation"),
     (dict(family="gaussian_frame_diagonal", decode_mode="diagonal_chunked"), "gaussian_frame_diagonal"),
@@ -396,8 +396,8 @@ def test_gauge_gate_admits_the_diagonal_family_and_delta_full_still_needs_full()
     with pytest.raises(ValueError, match="full-covariance"):
         _cfg(use_block_mlp=True, block_mlp_mode="gauge_gate", block_mlp_covariance="delta_full",
              decode_mode="diagonal_chunked")
-    with pytest.raises(ValueError, match="gauge_gate"):
-        _cfg(attention_mode="transported", attention_residual=False, relational_output_scope="head",
+    with pytest.raises(ValueError, match="retired"):
+        _cfg(attention_mode="transported", attention_residual=False,
              use_block_mlp=True, block_mlp_mode="gauge_gate", family="laplace_diagonal",
              decode_mode="family_chunked")
 

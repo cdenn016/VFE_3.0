@@ -31,7 +31,7 @@ from tests.test_relational_integration import _cfg
 # Both seams live on this config: pos_phi='learned' creates pos_phi_free, and layernorm_affine=True
 # on a 'layernorm' block seam creates the affine gamma/beta. That is also the shipped baseline in
 # train_vfe3.py and ablation.py, so these tests exercise the real configuration, not a corner.
-_LIVE = dict(relational_input_scope="full", use_head_mixer=False, use_block_mlp=False,
+_LIVE = dict(use_head_mixer=False, use_block_mlp=False,
              pos_phi="learned", layernorm_affine=True,
              norm_type_block="layernorm", norm_type_final="layernorm", phi_weight_decay=0.065)
 
@@ -100,8 +100,8 @@ def test_layernorm_group_reports_its_own_auxiliary_rate() -> None:
 
 _NOTICE_BASE = dict(vocab_size=8, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
                     family="gaussian_diagonal", gauge_group="block_glk",
-                    skip_belief_sigma_update=True, attention_mode="projected_conditional",
-                    relational_input_scope="full", m_pos_phi_lr=None, m_layernorm_lr=None)
+                    skip_belief_sigma_update=True, attention_mode="projected_gradient",
+                    m_pos_phi_lr=None, m_layernorm_lr=None)
 
 
 def _inert_fields(**overrides: Any) -> set:

@@ -10,12 +10,11 @@ from vfe3.model.relational_operators import RelationalOperators
 
 
 @pytest.mark.parametrize("family", ["gaussian_full", "gaussian_diagonal_exact", "gaussian_frame_diagonal"])
-@pytest.mark.parametrize("readout", ["conditional_update", "predictive_content"])
+@pytest.mark.parametrize("readout", ["predictive_content"])
 def test_gaussian_family_live_forward_backward(family: str, readout: str) -> None:
     torch.manual_seed(17)
-    model = VFEModel(_cfg(family=family, relational_input_scope="full",
-                         attention_mode=("projected_predictive" if readout == "predictive_content" else "projected_conditional"),
-                         relational_output_scope="full" if readout == "predictive_content" else "head"))
+    model = VFEModel(_cfg(family=family,
+                         attention_mode="projected_predictive"))
     ids, targets = _tokens()
     capture = {}
     belief, logits = model.forward_beliefs(ids, return_logits=True, capture=capture)
@@ -33,13 +32,13 @@ def test_gaussian_family_live_forward_backward(family: str, readout: str) -> Non
     assert torch.isfinite(snapshot.relational_capture["score_energy_pre"]).all()
 
 
-@pytest.mark.parametrize("scope", ["head", "full"])
+@pytest.mark.parametrize("scope", ["full"])
 def test_full_covariance_score_matches_dense_marginals(scope: str) -> None:
     mu, _, _, frame, _, _ = _fixture()
     root = torch.tensor([[1., .2, .3, 0.], [0., .9, .2, .1],
                          [.1, 0., 1.1, .2], [0., .1, 0., .8]], dtype=mu.dtype)
     Sigma = (root @ root.T).expand(1, 3, 4, 4).clone().requires_grad_()
-    ops = RelationalOperators([2, 2], 11, input_scope=scope).double()
+    ops = RelationalOperators([2, 2], 11).double()
     with torch.no_grad():
         ops.raw_score_q.add_(.08)
         ops.raw_score_k.sub_(.03)
@@ -62,13 +61,13 @@ def test_full_covariance_score_matches_dense_marginals(scope: str) -> None:
 
 
 @pytest.mark.parametrize("family", ["gaussian_full", "gaussian_diagonal_exact", "gaussian_frame_diagonal"])
-@pytest.mark.parametrize("readout", ["conditional_update", "predictive_content"])
+@pytest.mark.parametrize("readout", ["predictive_content"])
 @pytest.mark.parametrize("rope_on_value", [False, True])
 def test_gaussian_rope_autocast_snapshot(family: str, readout: str, rope_on_value: bool) -> None:
     torch.manual_seed(9)
-    model = VFEModel(_cfg(family=family, relational_input_scope="full",
-                         attention_mode=("projected_predictive" if readout == "predictive_content" else "projected_conditional"),
-                         relational_output_scope="full" if readout == "predictive_content" else "head",
+    model = VFEModel(_cfg(family=family,
+                         attention_mode="projected_predictive",
+
                          pos_rotation="rope", rope_full_gauge=family == "gaussian_full",
                          rope_on_value=rope_on_value))
     ids, targets = _tokens()
@@ -90,12 +89,12 @@ def test_gaussian_rope_autocast_snapshot(family: str, readout: str, rope_on_valu
     assert 0 < diagnostics["effective_rank"] <= 4.0001
 
 
-@pytest.mark.parametrize("readout", ["conditional_update", "predictive_content"])
+@pytest.mark.parametrize("readout", ["predictive_content"])
 def test_intrinsic_family_does_not_pull_back_stored_coordinates_twice(readout: str) -> None:
     torch.manual_seed(3)
-    model = VFEModel(_cfg(family="gaussian_frame_diagonal", relational_input_scope="full",
-                         attention_mode=("projected_predictive" if readout == "predictive_content" else "projected_conditional"),
-                         relational_output_scope="full" if readout == "predictive_content" else "head", use_head_mixer=False, use_block_mlp=False))
+    model = VFEModel(_cfg(family="gaussian_frame_diagonal",
+                         attention_mode="projected_predictive",
+                          use_head_mixer=False, use_block_mlp=False))
     ids, _ = _tokens()
     first = model.forward_beliefs(ids)[0].mu
     with torch.no_grad():
@@ -104,64 +103,20 @@ def test_intrinsic_family_does_not_pull_back_stored_coordinates_twice(readout: s
     torch.testing.assert_close(first, second, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("family", ["gaussian_full", "gaussian_diagonal_exact"])
-@pytest.mark.parametrize("name", ["raw_score_q", "raw_score_k", "T", "O"])
-def test_gaussian_conditional_outer_finite_difference(family: str, name: str) -> None:
-    from vfe3.gradients.relational import compute_relational_filtering_gradients
-    mu, sigma, omega, frame, _, prior = _fixture()
-    if family == "gaussian_full":
-        sigma = torch.diag_embed(sigma)
-        sigma[..., 0, 1] = sigma[..., 1, 0] = .12
-        sigma[..., 1, 2] = sigma[..., 2, 1] = .08
-    ops = RelationalOperators([2, 2], 11, input_scope="full").double()
-    with torch.no_grad():
-        ops.T.add_(.04)
-        ops.O.add_(.02)
-    parameter = getattr(ops, name)
-    def objective() -> torch.Tensor:
-        grad, _ = compute_relational_filtering_gradients(
-            mu, sigma, mu.detach() + .2, sigma, omega, ops, frame,
-            family=family, log_prior=prior, tau=.9, create_graph=True)
-        return (mu - .1 * grad)[0, 2].square().sum()
-    analytic = torch.autograd.grad(objective(), parameter)[0]
-    index = (0,) * parameter.ndim
-    original = parameter.detach().clone()
-    with torch.no_grad():
-        parameter[index] += 1e-6
-    plus = objective().detach()
-    with torch.no_grad():
-        parameter.copy_(original)
-        parameter[index] -= 1e-6
-    minus = objective().detach()
-    with torch.no_grad():
-        parameter.copy_(original)
-    torch.testing.assert_close(analytic[index], (plus - minus) / 2e-6, atol=2e-8, rtol=2e-5)
-    assert analytic.abs().sum() > 1e-8
-
-
 def test_laplace_remains_outside_gaussian_projection_envelope() -> None:
     with pytest.raises(ValueError, match="Gaussian family"):
         _cfg(family="laplace_diagonal")
 
 
-
-@pytest.mark.parametrize("readout", ["conditional_update", "predictive_content", "ordinary"])
-def test_full_gaussian_active_per_coordinate_alpha(readout: str) -> None:
-    model = VFEModel(_cfg(family="gaussian_full", relational_input_scope="full",
-                         attention_mode=("transported" if readout == "ordinary" else
-                                         "projected_predictive" if readout == "predictive_content"
-                                         else "projected_conditional"),
-                         relational_output_scope="full" if readout == "predictive_content" else "head",
+def test_full_gaussian_predictive_active_per_coordinate_alpha() -> None:
+    model = VFEModel(_cfg(family="gaussian_full", attention_mode="projected_predictive",
                          lambda_alpha_mode="state_dependent_per_coord",
                          mstep_self_coupling_weight=.2, full_cov_kl_precision="fp64"))
     ids, targets = _tokens()
     _, loss, _ = model(ids, targets)
     loss.backward()
     assert torch.isfinite(loss)
-    if readout != "ordinary":
-        assert all(p.grad is not None and torch.isfinite(p.grad).all()
-                   for p in model.relational_operators.parameters())
-        snapshot = model.build_diagnostic_snapshot(ids)
-        assert torch.isfinite(snapshot.relational_capture["score_energy_pre"]).all()
-    else:
-        assert torch.isfinite(model.prior_bank.mu_embed.grad).all()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all()
+               for p in model.relational_operators.parameters())
+    snapshot = model.build_diagnostic_snapshot(ids)
+    assert torch.isfinite(snapshot.relational_capture["score_energy_pre"]).all()

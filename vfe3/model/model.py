@@ -365,31 +365,25 @@ class VFEModel(nn.Module):
         # Keep layer zero's state-dict prefix for existing single-layer checkpoints.
         self.relational_operators = None
         self.relational_operators_extra = nn.ModuleList()
-        if cfg.relational_mode == "projected_filtering":
-            # 'depth_scaled' starts the residual-branch writer O at 1/sqrt(2 L) so the L-layer
-            # stack of near-uniform routing at init does not add a unit-gain token mean per layer.
-            output_init_scale = (1.0 / math.sqrt(2.0 * cfg.n_layers)
-                                 if cfg.relational_output_init == "depth_scaled" else 1.0)
-            layers = [
-                RelationalOperators(list(self.group.irrep_dims),
-                                    _derived_seed(cfg.seed, "relational_operators", layer_index),
-                                    readout_mode=cfg.relational_readout_mode,
-                                    input_scope=("full" if cfg.attention_mode == "projected_predictive"
-                                                 else cfg.relational_input_scope),
-                                    output_scope=("full" if cfg.attention_mode == "projected_predictive"
-                                                  else cfg.relational_output_scope),
-                                    attention_residual=cfg.attention_residual,
-                                    identity_content=cfg.relational_identity_content,
-                                    output_init_scale=output_init_scale,
-                                    receiver_noise=cfg.relational_receiver_noise,
-                                    routing=cfg.relational_routing,
-                                    predictive_covariance=cfg.predictive_covariance,
-                                    predictive_covariance_centering=cfg.predictive_covariance_centering,
-                                    predictive_covariance_floor=cfg.predictive_covariance_floor)
-                for layer_index in range(cfg.n_layers)
-            ]
-            self.relational_operators = layers[0]
-            self.relational_operators_extra.extend(layers[1:])
+        # 'depth_scaled' starts the residual-branch writer O at 1/sqrt(2 L) so the L-layer
+        # stack of near-uniform routing at init does not add a unit-gain token mean per layer.
+        output_init_scale = (1.0 / math.sqrt(2.0 * cfg.n_layers)
+                             if cfg.relational_output_init == "depth_scaled" else 1.0)
+        layers = [
+            RelationalOperators(list(self.group.irrep_dims),
+                                _derived_seed(cfg.seed, "relational_operators", layer_index),
+                                readout_mode=cfg.relational_readout_mode,
+                                attention_residual=cfg.attention_residual,
+                                output_init_scale=output_init_scale,
+                                receiver_noise=cfg.relational_receiver_noise,
+                                routing=cfg.relational_routing,
+                                predictive_covariance=cfg.predictive_covariance,
+                                predictive_covariance_centering=cfg.predictive_covariance_centering,
+                                predictive_covariance_floor=cfg.predictive_covariance_floor)
+            for layer_index in range(cfg.n_layers)
+        ]
+        self.relational_operators = layers[0]
+        self.relational_operators_extra.extend(layers[1:])
         # ALiBi-family priors carry a per-head (n_heads, N, N) axis, while the energy's head axis
         # is len(irrep_dims); a mismatch right-aligns the prior's head axis against the BATCH axis
         # of a single-block (B, N, N) energy -- silent corruption at B=1, RuntimeError otherwise
@@ -515,9 +509,6 @@ class VFEModel(nn.Module):
             if not cfg.rope_on_value:
                 rope_caveats.append(
                     "Values use U_i; the MLP uses U_i R_i^T (position-dependent MLP).")
-            if cfg.attention_mode == "transported" and not cfg.rope_full_gauge:
-                rope_caveats.append(
-                    "Means-only RoPE leaves the transported covariance unrotated.")
             if rope_caveats:
                 # A build banner remains visible even when Python warnings are filtered.
                 print("\n" + "-" * 72 + "\n"
@@ -780,8 +771,7 @@ class VFEModel(nn.Module):
 
     @property
     def conditional_semantics(self) -> str:
-        return (self.relational_operators.inference_semantics if self.relational_operators is not None
-                else "legacy_mean_field")
+        return self.relational_operators.inference_semantics
 
     def _belief_score_irrep_dims(self) -> Sequence[int]:
         r"""Return the ambient block sizes the beta score is computed in."""
@@ -2054,49 +2044,74 @@ class VFEModel(nn.Module):
         d["relational_score_raw_min_singular_value"] = min(minima)
         d["relational_score_rank_per_head"] = float(self.cfg.d_head)
         d["relational_content_rank_per_head"] = float(self.cfg.d_head)
-        d["relational_identity_content"] = float(self.cfg.relational_identity_content)
         d["relational_parameter_count"] = float(sum(
             p.numel() for layer in self.relational_operators_by_layer for p in layer.parameters()))
-        factors = ops.content_factors()
-        if factors is not None:
-            T, O = factors
-            # sigma_max(M_h) is basis-dependent (changes under (T, O) -> (T a, a^{-1} O)); rho = inf of sigma_max over similarity.
-            singular = torch.linalg.svdvals(O.float() @ T.float())
-            d["relational_content_max_singular_value"] = float(singular.max())
-            d["relational_content_effective_rank"] = float(
-                torch.linalg.matrix_rank(O.float() @ T.float()).float().mean())
+        T, O = ops.content_factors()
+        # sigma_max(M_h) is basis-dependent (changes under (T, O) -> (T a, a^{-1} O)); rho = inf of sigma_max over similarity.
+        singular = torch.linalg.svdvals(O.float() @ T.float())
+        d["relational_content_max_singular_value"] = float(singular.max())
+        d["relational_content_effective_rank"] = float(
+            torch.linalg.matrix_rank(O.float() @ T.float()).float().mean())
         # Similarity invariants of the content links L_ij^h = U_i M_h U_j^{-1}, M_h = O_hat_h T_hat_h:
         # unchanged by the frames, by (T_h, O_h) -> (B T_h, O_h B^{-1}) and by (T, O) -> (T a, a^{-1} O).
         # relational_content_max_singular_value above is not invariant under the reference change.
-        if factors is None:
-            d.update({key: float("nan") for key in metrics.LINK_SPECTRUM_KEYS})
-        else:
-            with torch.autocast(device_type=ops.T.device.type, enabled=False):
-                T_hat, O_hat = ops._ambient_content_maps(torch.float64)          # (H, d, K), (H, K, d)
-            d.update(metrics.content_link_spectrum(
-                T_hat, O_hat,
-                beta_self=(beta.diagonal(dim1=-2, dim2=-1)                      # (B, H, N) beta_ii^h
-                           if ops.readout_mode == "predictive_content" else None),
-                residual=ops.attention_residual))
+        with torch.autocast(device_type=ops.T.device.type, enabled=False):
+            T_hat, O_hat = ops._ambient_content_maps(torch.float64)          # (H, d, K), (H, K, d)
+        d.update(metrics.content_link_spectrum(
+            T_hat, O_hat,
+            beta_self=(beta.diagonal(dim1=-2, dim2=-1)                      # (B, H, N) beta_ii^h
+                       if ops.readout_mode == "predictive_content" else None),
+            residual=ops.attention_residual))
         covariance = torch.stack((cap["projected_covariance_pre"],
                                   cap["projected_key_covariance_pre"])).float()
         eig = torch.linalg.eigvalsh(covariance)
         d["relational_projected_cov_min_eigenvalue"] = float(eig.min())
         d["relational_projected_cov_max_condition"] = float((eig[..., -1]/eig[..., 0]).max())
         d["relational_covariance_repair_count"] = float(cap.get("relational_covariance_repair_count", 0.0))
+        # Frame magnitude and decoder/head-module state remain meaningful on both readouts.
+        belief = snapshot.layer_converged[layer_index]
+        from vfe3.geometry.transport import TRANSPORT_CLAMP_MAX_NORM
+        phi_norm = torch.linalg.norm(belief.phi, dim=-1)
+        d["phi_norm_mean"] = float(phi_norm.mean())
+        d["phi_norm_std"] = float(phi_norm.std(unbiased=False))
+        matrix_norm = metrics.diagnostic_frame_norm(
+            belief.phi.float(), self.group, max_norm=TRANSPORT_CLAMP_MAX_NORM, eps=self.cfg.eps)
+        exp_scale = (TRANSPORT_CLAMP_MAX_NORM / matrix_norm.clamp(min=self.cfg.eps)).clamp(max=1.0)
+        d["phi_matrix_norm_median"] = float(matrix_norm.median())
+        d["phi_matrix_norm_p95"] = float(torch.quantile(matrix_norm, 0.95))
+        d["phi_matrix_norm_p99"] = float(torch.quantile(matrix_norm, 0.99))
+        d["phi_matrix_norm_max"] = float(matrix_norm.max())
+        d["phi_exp_clamp_frac"] = float((exp_scale < 1.0).float().mean())
+        d["phi_exp_scale_min"] = float(exp_scale.min())
+        if self.head_mixer is not None and hasattr(self.head_mixer, "mixer_deltas"):
+            d["head_mixer_drift"] = max(
+                (float(torch.linalg.norm(p.detach())) for p in self.head_mixer.mixer_deltas), default=0.0)
+        if hasattr(self.prior_bank, "head_evidence_logits"):
+            weights, _ = self.prior_bank.head_evidence_weights(
+                dtype=self.prior_bank.head_evidence_logits.dtype,
+                device=self.prior_bank.head_evidence_logits.device)
+            probabilities = weights / weights.numel()
+            d["head_evidence_weights"] = weights.detach().cpu().tolist()
+            d["head_evidence_entropy"] = float(torch.special.entr(probabilities).sum())
+            d["head_evidence_max_abs_drift"] = float((weights - 1.0).abs().max())
         return d
 
     @torch.no_grad()
     @_block_mlp_diagnostic_eval
     def diagnostics(
         self,
-        token_ids: torch.Tensor,           # (B, N) token ids; only sequence 0 is used
+        token_ids: torch.Tensor,           # (B, N) token ids; projected diagnostics reduce the captured batch
 
         *,
         log_likelihood: Optional[torch.Tensor] = None,  # (N,) optional E_q[log p(o|k)] diagnostic seam
         snapshot:       Optional[DiagnosticSnapshot] = None,  # one-forward captured evaluation state
     ) -> dict:
-        r"""Faithful per-step VFE diagnostics at the converged belief (no_grad).
+        r"""Report captured projected routing, receiver costs, and state diagnostics (no_grad).
+
+        Both supported attention modes use the relational capture branch and reduce the captured batch.
+        Independent and supplied-snapshot calls therefore use the same source scope. Legacy shared-objective
+        fields are unavailable there and are reported as NaN. The fallback below retains the
+        historical diagnostic definitions.
 
         Recomputes the SAME quantities the E-step uses (transport, pairwise energy
         E_ij, attention weights beta_ij, self-divergence D(q_i||p_i), self-coupling
@@ -2137,7 +2152,7 @@ class VFEModel(nn.Module):
         belief-variance spectrum effective rank, not an attention rank).
         """
         if self.conditional_filtering_enabled:
-            snapshot = (self.build_diagnostic_snapshot(token_ids[:1]) if snapshot is None
+            snapshot = (self.build_diagnostic_snapshot(token_ids) if snapshot is None
                         else self._validate_diagnostic_snapshot(token_ids, snapshot))
             return self._relational_diagnostics(snapshot)
         from vfe3.geometry.transport import build_factored_transport
@@ -2821,7 +2836,7 @@ class VFEModel(nn.Module):
     @_block_mlp_diagnostic_eval
     def diagnostics_per_layer(
         self,
-        token_ids: torch.Tensor,           # (B, N) token ids; only sequence 0 is used
+        token_ids: torch.Tensor,           # (B, N) token ids; projected diagnostics reduce the captured batch
 
         *,
         log_likelihood: Optional[torch.Tensor] = None,  # (N,) optional E_q[log p(o|k)] diagnostic seam
@@ -2851,7 +2866,7 @@ class VFEModel(nn.Module):
         ``phi_norm_mean``.
         """
         if self.conditional_filtering_enabled:
-            snapshot = (self.build_diagnostic_snapshot(token_ids[:1]) if snapshot is None
+            snapshot = (self.build_diagnostic_snapshot(token_ids) if snapshot is None
                         else self._validate_diagnostic_snapshot(token_ids, snapshot))
             rows = [self._relational_diagnostics(snapshot, layer_index)
                     for layer_index in range(self.cfg.n_layers)]

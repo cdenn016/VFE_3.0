@@ -157,33 +157,6 @@ class Test1_DiagonalPathByteIdentical:
                         current = uses_kernel_route(**kwargs, route="gradient")
                         assert golden == current, kwargs
 
-    def test_e_step_iteration_mm_exact_diagonal_byte_identical(self):
-        # End-to-end through e_step_iteration (touched by this task for the full-cov damping
-        # branch): the diagonal branch's OWN source lines are untouched (see the PR diff), so this
-        # pins the runtime VALUE identity, not just the source-text argument.
-        N, K = 5, 3
-        g = torch.Generator().manual_seed(0)
-        grp = get_group("glk")(K)
-        n_gen = grp.generators.shape[0]
-        belief = BeliefState(
-            mu=torch.randn(N, K, generator=g),
-            sigma=torch.rand(N, K, generator=g) + 0.5,
-            phi=0.1 * torch.randn(N, n_gen, generator=g),
-        )
-        mu_p = torch.randn(N, K, generator=g)
-        sigma_p = torch.rand(N, K, generator=g) + 0.5
-        out_a = e_step_iteration(
-            belief, mu_p, sigma_p, grp, tau=1.3, e_q_mu_lr=0.1, e_q_sigma_lr=0.1, e_phi_lr=0.0,
-            e_step_update="mm_exact", mm_damping=0.6,
-        )
-        out_b = e_step_iteration(
-            belief, mu_p, sigma_p, grp, tau=1.3, e_q_mu_lr=0.1, e_q_sigma_lr=0.1, e_phi_lr=0.0,
-            e_step_update="mm_exact", mm_damping=0.6,
-        )
-        # Determinism / no accidental full-cov branch entry: reproducible bit-for-bit call to call.
-        assert torch.equal(out_a.mu, out_b.mu)
-        assert torch.equal(out_a.sigma, out_b.sigma)
-
 
 # --------------------------------------------------------------------------------------------
 # Full-covariance setup helpers
@@ -216,27 +189,7 @@ def _full_setup(N=8, K=4, seed=0, dtype=torch.float64, requires_grad=False):
 # --------------------------------------------------------------------------------------------
 
 class Test2_ConfigConstruction:
-    def test_gaussian_full_mm_exact_single_block_constructs(self):
-        cfg = test_config(
-            family="gaussian_full", e_step_update="mm_exact", gauge_group="glk",
-            embed_dim=8, n_heads=1, vocab_size=32, max_seq_len=16,
-            decode_mode="full_chunked",
-        )
-        assert cfg.family == "gaussian_full" and cfg.e_step_update == "mm_exact"
 
-    def test_gaussian_full_mm_exact_multi_head_accepted_at_config_time(self):
-        # 2026-08-07 gauge-audit reversal. The earlier blanket multi-head rejection was based on a
-        # probe using a dense randomly-initialised sigma_p. The live encode prior is built by
-        # torch.diag_embed (prior_bank._encode_prior_sigma), hence diagonal, hence block-diagonal,
-        # so the precision fusion decomposes exactly into per-head d x d problems. Reachability of
-        # block_glk is the whole point of the feature -- train_vfe3.py's own config uses it.
-        cfg = test_config(
-            family="gaussian_full", e_step_update="mm_exact", gauge_group="block_glk",
-            embed_dim=8, n_heads=2, vocab_size=32, max_seq_len=16,
-            decode_mode="full_chunked",
-        )
-        assert cfg.gauge_group == "block_glk" and cfg.n_heads == 2
-        assert cfg.family == "gaussian_full" and cfg.e_step_update == "mm_exact"
 
     def test_gaussian_full_gradient_mode_still_routes_to_oracle(self):
         # Regression: registering gaussian_full's mm_exact-only capability must NOT flip
@@ -264,35 +217,6 @@ class Test2_ConfigConstruction:
 # --------------------------------------------------------------------------------------------
 # Test 3: forward + backward through the real model
 # --------------------------------------------------------------------------------------------
-
-class Test3_ModelForwardBackward:
-    def test_forward_backward_all_grads_finite(self):
-        torch.manual_seed(0)
-        from vfe3.model.model import VFEModel
-
-        cfg = test_config(
-            vocab_size=17, embed_dim=6, n_heads=1, max_seq_len=8, n_layers=1,
-            gauge_group="glk", family="gaussian_full", decode_mode="full_chunked",
-            e_step_update="mm_exact", mm_damping=0.75, lambda_alpha_mode="constant",
-            n_e_steps=2, e_q_mu_lr=0.1, e_q_sigma_lr=0.1, e_phi_lr=0.05,
-        )
-        model = VFEModel(cfg)
-        tokens = torch.randint(0, cfg.vocab_size, (2, cfg.max_seq_len))
-        targets = torch.randint(0, cfg.vocab_size, (2, cfg.max_seq_len))
-        _, loss, _ce = model(tokens, targets)
-        assert torch.isfinite(loss)
-        loss.backward()
-        missing, nonfinite = [], []
-        for name, p in model.named_parameters():
-            if p.grad is None:
-                missing.append(name)
-            elif not torch.isfinite(p.grad).all():
-                nonfinite.append(name)
-        assert not nonfinite, f"non-finite grads: {nonfinite}"
-        # mu_embed/sigma-covariance/phi_embed must be live (the parameters this route exists for);
-        # report rather than blanket-require every table (some are legitimately config-inert).
-        for must_have_grad in ("prior_bank.mu_embed", "prior_bank.phi_embed"):
-            assert must_have_grad not in missing, f"{must_have_grad} has no gradient: {missing}"
 
 
 # --------------------------------------------------------------------------------------------
@@ -374,49 +298,6 @@ class Test4_MMDescent:
 # Test 5: fixed-point agreement with the gradient path
 # --------------------------------------------------------------------------------------------
 
-class Test5_FixedPointAgreement:
-    def test_converged_gradient_belief_is_a_near_fixed_point_of_mm_exact(self):
-        r"""Starting from the SAME belief, run MANY small-step gradient E-steps (phi frozen, so
-        the transport is fixed throughout) to approach the stationary point of the true (non-frozen
-        -beta) filtering objective, then take ONE mm_exact step FROM that near-converged belief.
-        mm_exact_update is (per its docstring) the exact zero of the SAME gradient kernel's
-        expressions, so at a true stationary point (grad_mu=grad_sigma=0) it is an EXACT no-op;
-        near one, by continuity, it is an approximate no-op. This is the fixed-point identity the
-        gradient path is iterating toward."""
-        N, K = 6, 3
-        grp = get_group("glk")(K)
-        grp = dataclasses.replace(grp, generators=grp.generators.double())
-        n_gen = grp.generators.shape[0]
-        g = torch.Generator().manual_seed(7)
-        mu0 = 0.2 * torch.randn(N, K, generator=g, dtype=torch.float64)
-        sigma0 = _spd(N, K, generator=g, dtype=torch.float64, scale=0.2, floor=1.5)
-        phi0 = torch.zeros(N, n_gen, dtype=torch.float64)   # e_phi_lr=0 below -> phi, hence omega, is FIXED
-        mu_p = 0.2 * torch.randn(N, K, generator=g, dtype=torch.float64)
-        sigma_p = _spd(N, K, generator=g, dtype=torch.float64, scale=0.2, floor=1.5)
-        belief = BeliefState(mu=mu0, sigma=sigma0, phi=phi0)
-
-        for _ in range(400):
-            belief = e_step_iteration(
-                belief, mu_p, sigma_p, grp, tau=1.0, e_q_mu_lr=0.05, e_q_sigma_lr=0.05,
-                e_phi_lr=0.0, e_step_update="gradient", family="gaussian_full", sigma_max=None,
-            )
-
-        # Confirm near-convergence: the raw belief gradient is small.
-        omega = compute_transport_operators(belief.phi.unsqueeze(0), grp)["Omega"][0]
-        grad_mu, grad_sigma = belief_gradients(
-            belief.mu, belief.sigma, mu_p, sigma_p, omega, tau=1.0, family="gaussian_full",
-        )
-        assert grad_mu.norm() < 1e-3, f"gradient path did not converge: ||grad_mu||={grad_mu.norm()}"
-        assert grad_sigma.norm() < 1e-3, f"gradient path did not converge: ||grad_sigma||={grad_sigma.norm()}"
-
-        after_mm = e_step_iteration(
-            belief, mu_p, sigma_p, grp, tau=1.0, e_q_mu_lr=0.05, e_q_sigma_lr=0.05,
-            e_phi_lr=0.0, e_step_update="mm_exact", mm_damping=1.0, family="gaussian_full",
-            sigma_max=None,
-        )
-        torch.testing.assert_close(after_mm.mu, belief.mu, atol=5e-3, rtol=1e-3)
-        torch.testing.assert_close(after_mm.sigma, belief.sigma, atol=5e-3, rtol=1e-3)
-
 
 # --------------------------------------------------------------------------------------------
 # Test 6: diagonal consistency
@@ -489,38 +370,6 @@ class Test7_MMDampingSemantics:
         )
         torch.testing.assert_close(mu_eta0, mu, atol=1e-9, rtol=1e-7)
         torch.testing.assert_close(sigma_eta0, sigma, atol=1e-9, rtol=1e-7)
-
-    def test_diagonal_path_convention_matches(self):
-        # The same two endpoint checks, run through the DIAGONAL branch (unchanged code) via
-        # e_step_iteration, to confirm the full-covariance branch matches an established convention
-        # rather than inventing its own.
-        N, K = 4, 3
-        g = torch.Generator().manual_seed(0)
-        grp = get_group("glk")(K)
-        n_gen = grp.generators.shape[0]
-        belief = BeliefState(
-            mu=torch.randn(N, K, generator=g),
-            sigma=torch.rand(N, K, generator=g) + 0.5,
-            phi=0.1 * torch.randn(N, n_gen, generator=g),
-        )
-        mu_p = torch.randn(N, K, generator=g)
-        sigma_p = torch.rand(N, K, generator=g) + 0.5
-        exact = e_step_iteration(
-            belief, mu_p, sigma_p, grp, tau=1.0, e_q_mu_lr=0.1, e_q_sigma_lr=0.1, e_phi_lr=0.0,
-            e_step_update="mm_exact", mm_damping=1.0,
-        )
-        mu_star, sigma_star = mm_exact_update(belief.mu, belief.sigma, mu_p, sigma_p,
-                                               compute_transport_operators(
-                                                   belief.phi.unsqueeze(0), grp)["Omega"][0],
-                                               family="gaussian_diagonal", irrep_dims=grp.irrep_dims)
-        torch.testing.assert_close(exact.mu, mu_star, atol=1e-6, rtol=1e-5)
-        # eta near 0 (config forbids exactly 0.0): negligible movement.
-        near_zero = e_step_iteration(
-            belief, mu_p, sigma_p, grp, tau=1.0, e_q_mu_lr=0.1, e_q_sigma_lr=0.1, e_phi_lr=0.0,
-            e_step_update="mm_exact", mm_damping=1e-6,
-        )
-        torch.testing.assert_close(near_zero.mu, belief.mu, atol=1e-4, rtol=1e-3)
-        torch.testing.assert_close(near_zero.sigma, belief.sigma, atol=1e-4, rtol=1e-3)
 
 
 # --------------------------------------------------------------------------------------------

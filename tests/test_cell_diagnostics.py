@@ -12,6 +12,7 @@ Device-agnostic (CPU by default; honors VFE3_TEST_DEVICE like the rest of the su
 """
 from tests.profiles import config_values, test_config
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -19,19 +20,20 @@ import torch
 import ablation
 from vfe3.metrics import head_mixer_gauge_residual
 from vfe3.model.model import VFEModel
+from vfe3.model.head_mixer import HeadMixer
+from vfe3.geometry.groups import get_group
 
 DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
 
 
-def _drifted_mixer_model(gauge_group: str) -> VFEModel:
-    """Tiny full-cov model with its head mixer pushed OFF identity (so a gauge break is visible)."""
-    cfg = test_config(vocab_size=64, embed_dim=4, n_heads=2, max_seq_len=8,
-                     gauge_group=gauge_group, use_head_mixer=True, family="gaussian_full")
-    model = VFEModel(cfg).to(DEVICE)
+def _drifted_mixer_model(gauge_group: str) -> SimpleNamespace:
+    """Standalone gauge/mixer fixture, independent of attention-mode admission."""
+    group = get_group(gauge_group)(4, 2)
+    mixer = HeadMixer(group.irrep_dims, group.irrep_labels, family="gaussian_full").to(DEVICE)
     with torch.no_grad():
-        for d in model.head_mixer.mixer_deltas:
-            d.normal_(0.0, 0.3)
-    return model
+        for delta in mixer.mixer_deltas:
+            delta.normal_(0.0, 0.3)
+    return SimpleNamespace(group=group, head_mixer=mixer)
 
 
 def test_builder_residual_distinguishes_tied_from_untied_gauge():

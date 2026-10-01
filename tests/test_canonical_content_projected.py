@@ -252,57 +252,10 @@ def test_projected_registry_returns_existing_canonical_table_coordinates() -> No
     assert not any("canonical" in name for name in projected._parameters)
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("family", "gaussian_full"),
-        ("e_phi_lr", 0.01),
-        ("decode_mode", "linear"),
-        ("decode_mode", "diagonal_chunked"),
-    ],
-)
-def test_projected_config_rejects_each_incompatible_cross_field_pair(
-    field: str,
-    value: object,
-) -> None:
-    """Relaxing any projected-mode gate would invalidate its shared-frame decode contract."""
-    with pytest.raises(ValueError, match="canonical_content_projected"):
-        _projected_cfg(**{field: value})
 
 
-@pytest.mark.parametrize("decode_mode", ["full", "full_chunked"])
-@pytest.mark.parametrize("pos_phi", ["learned", "frozen"])
-@pytest.mark.parametrize("untie_decode_bank", [False, True])
-def test_projected_config_accepts_supported_decode_position_and_tie_variants(
-    decode_mode: str,
-    pos_phi: str,
-    untie_decode_bank: bool,
-) -> None:
-    """Narrowing a legal projected variant would block current-frame rematerialization."""
-    cfg = _projected_cfg(
-        decode_mode=decode_mode,
-        pos_phi=pos_phi,
-        untie_decode_bank=untie_decode_bank,
-        m_phi_lr=0.02,
-    )
-    assert cfg.decode_mode == decode_mode
-    assert cfg.pos_phi == pos_phi
-    assert cfg.untie_decode_bank is untie_decode_bank
 
 
-@pytest.mark.parametrize("decode_mode", ["full", "full_chunked"])
-def test_projected_config_accepts_full_head_evidence_after_pullback(
-    decode_mode: str,
-) -> None:
-    """The projected rank exception must reach the built-in full evidence decoder only."""
-    cfg = _projected_cfg(
-        decode_mode=decode_mode,
-        use_priorbank_head_evidence_mixer=True,
-    )
-    assert cfg.encode_mode == "canonical_content_projected"
-    assert cfg.family == "gaussian_diagonal"
-    assert cfg.decode_mode == decode_mode
-    assert cfg.use_priorbank_head_evidence_mixer is True
 
 
 @pytest.mark.registry_mutation
@@ -322,8 +275,6 @@ def test_projected_construction_rejects_overridden_gaussian_full_family(
             pass
 
         with pytest.raises(ValueError, match=r"canonical_content_projected.*gaussian_full"):
-            _projected_cfg(use_priorbank_head_evidence_mixer=mixer_enabled)
-        with pytest.raises(ValueError, match=r"canonical_content_projected.*gaussian_full"):
             PriorBank(
                 vocab_size=9,
                 K=4,
@@ -340,7 +291,7 @@ def test_projected_construction_rejects_overridden_gaussian_full_family(
 
 
 @pytest.mark.registry_mutation
-@pytest.mark.parametrize("construction_seam", ["config", "prior_bank"])
+@pytest.mark.parametrize("construction_seam", ["prior_bank"])
 def test_projected_construction_rejects_overridden_diagonal_family_without_mixer(
     construction_seam: str,
 ) -> None:
@@ -356,10 +307,7 @@ def test_projected_construction_rejects_overridden_diagonal_family_without_mixer
             pass
 
         with pytest.raises(ValueError, match=r"canonical_content_projected.*gaussian_diagonal"):
-            if construction_seam == "config":
-                _projected_cfg(use_priorbank_head_evidence_mixer=False)
-            else:
-                _projected_bank()
+            _projected_bank()
     finally:
         _FAMILIES[name] = previous
     assert _FAMILIES[name] is previous
@@ -391,8 +339,6 @@ def test_projected_construction_rejects_overridden_encoder_identity(
         else:
             prior_bank_mod._ENCODERS[name] = replacement_encoder
 
-        with pytest.raises(ValueError, match=r"canonical_content_projected.*built-in encoder"):
-            _projected_cfg()
         with pytest.raises(ValueError, match=r"canonical_content_projected.*built-in encoder"):
             _projected_bank()
     finally:
@@ -456,14 +402,6 @@ def test_projected_construction_rejects_overridden_full_decoder_before_forward(
             override=True,
         )(decode_callable)
 
-        with pytest.raises(
-            ValueError,
-            match=r"canonical_content_projected.*built-in analytic.*full",
-        ):
-            _projected_cfg(
-                decode_mode=decode_mode,
-                use_priorbank_head_evidence_mixer=False,
-            )
         with pytest.raises(
             ValueError,
             match=r"canonical_content_projected.*built-in analytic.*full",
@@ -577,406 +515,24 @@ def test_projected_tied_and_untied_banks_share_only_the_canonical_initial_values
     assert untied.decode_sigma_log_embed.data_ptr() != untied.sigma_log_embed.data_ptr()
 
 
-def _set_noncommuting_model_frames(model: VFEModel, token_ids: torch.Tensor) -> None:
-    device = model.prior_bank.phi_embed.device
-    token_blocks = torch.tensor(
-        [
-            [[[0.10, 0.28], [-0.16, 0.05]], [[-0.08, 0.19], [0.07, 0.12]]],
-            [[[0.04, -0.21], [0.13, -0.09]], [[0.11, 0.06], [-0.18, 0.03]]],
-        ],
-        dtype=model.prior_bank.phi_embed.dtype,
-        device=device,
-    )
-    position_blocks = torch.tensor(
-        [
-            [[[0.03, -0.17], [0.09, 0.06]], [[-0.12, 0.04], [0.15, 0.02]]],
-            [[[-0.07, 0.14], [0.05, 0.08]], [[0.09, -0.13], [0.04, -0.05]]],
-        ],
-        dtype=model.prior_bank.phi_embed.dtype,
-        device=device,
-    )
-    with torch.no_grad():
-        model.prior_bank.phi_embed[token_ids[0]] = token_blocks.flatten(start_dim=1)
-        model.pos_phi_free[: token_ids.shape[1]] = position_blocks.flatten(start_dim=1)
-        model.prior_bank.mu_embed[token_ids[0]] = torch.tensor(
-            [[0.35, -0.25, 0.55, 0.10], [-0.40, 0.65, 0.15, -0.30]],
-            device=device,
-        )
-        model.prior_bank.sigma_log_embed[token_ids[0]] = torch.log(torch.tensor(
-            [[0.7, 1.3, 0.5, 1.1], [1.4, 0.6, 0.9, 1.2]],
-            device=device,
-        ))
 
 
-def test_projected_materialize_uses_one_shared_factored_frame_and_preserves_q0_equals_p(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Rebuilding transport or materializing q0 and p separately breaks their shared frame/value."""
-    import vfe3.inference.e_step as e_step_module
-    import vfe3.model.model as model_module
-
-    model = VFEModel(_projected_cfg(
-        pos_phi="learned",
-        e_step_update="mm_exact",
-    ))
-    monkeypatch.setattr(model, "_compact_phi_blocks_enabled", lambda: False)
-    token_ids = torch.tensor([[2, 5]])
-    _set_noncommuting_model_frames(model, token_ids)
-    canonical = model.prior_bank.encode(token_ids)
-
-    original_builder = e_step_module.build_belief_transport
-    built: list[object] = []
-
-    def tracked_builder(*args: object, **kwargs: object) -> object:
-        transport = original_builder(*args, **kwargs)
-        built.append(transport)
-        return transport
-
-    original_stack = model_module.vfe_stack
-    entry: dict[str, object] = {}
-
-    def tracked_stack(
-        belief: object,
-        mu_p: torch.Tensor,
-        sigma_p: torch.Tensor,
-        *args: object,
-        **kwargs: object,
-    ) -> object:
-        entry.update(
-            belief=belief,
-            mu_p=mu_p,
-            sigma_p=sigma_p,
-            prebuilt=kwargs.get("prebuilt_transport"),
-        )
-        return original_stack(belief, mu_p, sigma_p, *args, **kwargs)
-
-    monkeypatch.setattr(e_step_module, "build_belief_transport", tracked_builder)
-    monkeypatch.setattr(model_module, "vfe_stack", tracked_stack)
-    capture: dict = {}
-
-    model.forward_beliefs(token_ids, capture=capture)
-
-    assert len(built) == 1
-    transport = built[0]
-    assert isinstance(transport, FactoredTransport)
-    assert entry["prebuilt"] is transport
-    context = capture["canonical_frame"]
-    assert context.forward is transport.exp_phi
-    assert context.inverse is transport.exp_neg_phi
-
-    token_matrix = torch.einsum(
-        "...a,aij->...ij", canonical.phi, model.group.generators)
-    position_matrix = torch.einsum(
-        "...a,aij->...ij", model.pos_phi_free[: token_ids.shape[1]], model.group.generators)
-    expected_frame = torch.matrix_exp(token_matrix) @ torch.matrix_exp(position_matrix)
-    reversed_frame = torch.matrix_exp(position_matrix) @ torch.matrix_exp(token_matrix)
-    assert torch.allclose(context.forward, expected_frame, atol=2e-6, rtol=2e-6)
-    assert not torch.allclose(context.forward, reversed_frame, atol=1e-5, rtol=1e-5)
-
-    expected_mu, expected_var = project_canonical_diagonal(
-        canonical.mu, canonical.sigma, context.forward)
-    entry_belief = entry["belief"]
-    assert entry_belief.mu is entry["mu_p"]
-    assert entry_belief.sigma is entry["sigma_p"]
-    assert torch.equal(entry_belief.mu, expected_mu)
-    assert torch.equal(entry_belief.sigma, expected_var)
-    assert capture["prior"].mu is entry_belief.mu
-    assert capture["prior"].sigma is entry_belief.sigma
-
-    pulled_mu, pulled_cov = pullback_diagonal_query(
-        entry_belief.mu, entry_belief.sigma, context.inverse)
-    assert torch.equal(
-        pulled_mu,
-        torch.einsum("...ij,...j->...i", context.inverse, entry_belief.mu),
-    )
-    assert torch.equal(
-        pulled_cov,
-        context.inverse
-        @ torch.diag_embed(entry_belief.sigma)
-        @ context.inverse.transpose(-1, -2),
-    )
 
 
-def test_projected_materialize_expands_only_compact_vertex_factors(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Compact transport must supply dense vertices without materializing pairwise Omega."""
-    import vfe3.inference.e_step as e_step_module
-
-    model = VFEModel(_projected_cfg(
-        pos_phi="learned",
-        e_step_update="mm_exact",
-    ))
-    token_ids = torch.tensor([[2, 5]])
-    _set_noncommuting_model_frames(model, token_ids)
-    original_builder = e_step_module.build_belief_transport
-    built: list[object] = []
-
-    def tracked_builder(*args: object, **kwargs: object) -> object:
-        transport = original_builder(*args, **kwargs)
-        built.append(transport)
-        return transport
-
-    def pairwise_forbidden(_self: object) -> torch.Tensor:
-        raise AssertionError("projected materialization built pairwise Omega")
-
-    monkeypatch.setattr(e_step_module, "build_belief_transport", tracked_builder)
-    monkeypatch.setattr(CompactFactoredTransport, "to_dense_omega", pairwise_forbidden)
-    capture: dict = {}
-
-    model.forward_beliefs(token_ids, capture=capture)
-
-    assert len(built) == 1
-    transport = built[0]
-    assert isinstance(transport, CompactFactoredTransport)
-    context = capture["canonical_frame"]
-    assert torch.equal(
-        context.forward,
-        CompactBlockElement(transport.exp_blocks, transport.K).to_dense(),
-    )
-    assert torch.equal(
-        context.inverse,
-        CompactBlockElement(transport.inv_blocks, transport.K).to_dense(),
-    )
 
 
-def test_projected_fixed_depth_reuses_one_transport_across_all_layers(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The context frame must remain the E-step frame across every fixed-depth iteration."""
-    import vfe3.inference.e_step as e_step_module
-
-    model = VFEModel(_projected_cfg(
-        vocab_size=7,
-        n_layers=2,
-        n_e_steps=2,
-        e_step_update="mm_exact",
-    ))
-    token_ids = torch.tensor([[2, 5]])
-    original_builder = e_step_module.build_belief_transport
-    original_iteration = e_step_module.e_step_iteration
-    built: list[object] = []
-    consumed: list[object] = []
-
-    def tracked_builder(*args: object, **kwargs: object) -> object:
-        transport = original_builder(*args, **kwargs)
-        built.append(transport)
-        return transport
-
-    def tracked_iteration(*args: object, **kwargs: object) -> object:
-        consumed.append(kwargs.get("_prebuilt_omega"))
-        return original_iteration(*args, **kwargs)
-
-    monkeypatch.setattr(e_step_module, "build_belief_transport", tracked_builder)
-    monkeypatch.setattr(e_step_module, "e_step_iteration", tracked_iteration)
-    capture: dict = {}
-
-    model.forward_beliefs(token_ids, capture=capture)
-
-    assert len(built) == 1
-    assert len(consumed) == 4
-    assert all(transport is built[0] for transport in consumed)
-    context = capture["canonical_frame"]
-    if isinstance(built[0], CompactFactoredTransport):
-        assert torch.equal(
-            context.forward,
-            CompactBlockElement(built[0].exp_blocks, built[0].K).to_dense(),
-        )
-    else:
-        assert isinstance(built[0], FactoredTransport)
-        assert context.forward is built[0].exp_phi
 
 
-@pytest.mark.parametrize("gauge_group", ["block_glk", "glk"])
-def test_projected_single_head_groups_request_factored_vertex_transport(
-    gauge_group: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Single-block projected groups still require exact vertex factors, never pairwise Omega."""
-    import vfe3.inference.e_step as e_step_module
-
-    model = VFEModel(_projected_cfg(
-        gauge_group=gauge_group,
-        n_heads=1,
-        pos_phi="none",
-        e_step_update="mm_exact",
-    ))
-    original_builder = e_step_module.build_belief_transport
-    built: list[object] = []
-
-    def tracked_builder(*args: object, **kwargs: object) -> object:
-        transport = original_builder(*args, **kwargs)
-        built.append(transport)
-        return transport
-
-    def pairwise_forbidden(_self: object) -> torch.Tensor:
-        raise AssertionError("projected single-head path materialized pairwise Omega")
-
-    monkeypatch.setattr(e_step_module, "build_belief_transport", tracked_builder)
-    monkeypatch.setattr(FactoredTransport, "to_dense_omega", pairwise_forbidden)
-    capture: dict = {}
-
-    model.forward_beliefs(torch.tensor([[2, 5]]), capture=capture)
-
-    assert len(built) == 1
-    assert isinstance(built[0], FactoredTransport)
-    assert capture["canonical_frame"].forward is built[0].exp_phi
 
 
-def test_projected_model_materialization_preserves_float32_under_bf16_autocast() -> None:
-    """The model's public projected prior remains float32 inside its AMP region."""
-    model = VFEModel(_projected_cfg(
-        amp_dtype="bf16",
-        pos_phi="none",
-        e_step_update="mm_exact",
-    ))
-    capture: dict = {}
-
-    model.forward_beliefs(torch.tensor([[2, 5]]), capture=capture)
-
-    canonical = model.prior_bank.encode(torch.tensor([[2, 5]]))
-    context = capture["canonical_frame"]
-    prior = capture["prior"]
-    assert canonical.mu.dtype == torch.float32
-    assert context.forward.dtype == torch.float32
-    assert context.inverse.dtype == torch.float32
-    assert prior.mu.dtype == torch.float32
-    assert prior.sigma.dtype == torch.float32
 
 
-def test_projected_phi_gradient_reaches_canonical_tables_and_realized_frames() -> None:
-    """Detaching materialization severs at least one supervised mean/variance/frame gradient."""
-    model = VFEModel(_projected_cfg(
-        pos_phi="learned",
-        e_step_update="gradient",
-        e_q_mu_lr=0.03,
-        e_q_sigma_lr=0.02,
-    ))
-    token_ids = torch.tensor([[2, 5]])
-    _set_noncommuting_model_frames(model, token_ids)
-    capture: dict = {}
-    model.forward_beliefs(token_ids, capture=capture)
-    materialized_prior = capture["prior"]
-    target_mu = torch.tensor(
-        [[[0.8, -0.1, 0.2, -0.5], [-0.2, 0.3, 0.9, 0.4]]],
-        dtype=materialized_prior.mu.dtype,
-    )
-    target_var = torch.tensor(
-        [[[0.6, 1.0, 1.4, 0.8], [1.1, 0.7, 0.5, 1.3]]],
-        dtype=materialized_prior.sigma.dtype,
-    )
-    supervised_scalar = (
-        (materialized_prior.mu - target_mu).square().sum()
-        + 0.37 * (materialized_prior.sigma - target_var).square().sum()
-    )
-
-    supervised_scalar.backward()
-
-    for parameter in (
-        model.prior_bank.mu_embed,
-        model.prior_bank.sigma_log_embed,
-        model.prior_bank.phi_embed,
-        model.pos_phi_free,
-    ):
-        assert parameter.grad is not None
-        assert torch.isfinite(parameter.grad).all()
-        assert torch.count_nonzero(parameter.grad).item() > 0
 
 
-def _manual_canonical_full_logits(
-    bank: PriorBank,
-    mu_c: torch.Tensor,
-    cov_c: torch.Tensor,
-) -> torch.Tensor:
-    """Independent full-Gaussian KL against the bank's canonical diagonal priors."""
-    mu_v = bank.decode_mu_embed if bank.untie_decode_bank else bank.mu_embed
-    log_var_v = (
-        bank.decode_sigma_log_embed if bank.untie_decode_bank else bank.sigma_log_embed
-    )
-    var_v = torch.exp(log_var_v).clamp(min=bank.eps)
-    inv_var_v = var_v.reciprocal()
-    delta = mu_c.unsqueeze(-2) - mu_v
-    trace = torch.diagonal(cov_c, dim1=-2, dim2=-1) @ inv_var_v.transpose(-1, -2)
-    mahalanobis = (delta.square() * inv_var_v).sum(dim=-1)
-    logdet_q = torch.linalg.slogdet(cov_c).logabsdet.unsqueeze(-1)
-    logdet_v = torch.log(var_v).sum(dim=-1)
-    kl_v = 0.5 * (trace + mahalanobis - bank.K + logdet_v - logdet_q)
-    tau_eff = bank.decode_tau * torch.exp(-bank.decode_log_scale.clamp(-3.0, 3.0))
-    logits = -kl_v / tau_eff
-    if bank.decode_unigram_prior:
-        logits = logits + bank.unigram_kappa * bank.unigram_log_prior
-    return logits
 
 
-def _set_decode_oracle_tables(model: VFEModel) -> None:
-    bank = model.prior_bank
-    mu_values = torch.linspace(
-        -0.75, 0.85, steps=bank.vocab_size * bank.K,
-        dtype=bank.mu_embed.dtype,
-        device=bank.mu_embed.device,
-    ).reshape(bank.vocab_size, bank.K)
-    var_values = torch.linspace(
-        0.45, 1.65, steps=bank.vocab_size * bank.K,
-        dtype=bank.sigma_log_embed.dtype,
-        device=bank.sigma_log_embed.device,
-    ).reshape(bank.vocab_size, bank.K)
-    with torch.no_grad():
-        if bank.untie_decode_bank:
-            bank.decode_mu_embed.copy_(mu_values)
-            bank.decode_sigma_log_embed.copy_(var_values.log())
-        else:
-            bank.mu_embed.copy_(mu_values)
-            bank.sigma_log_embed.copy_(var_values.log())
-        bank.decode_log_scale.fill_(0.29)
-    bank.set_unigram_log_prior(
-        torch.tensor([2, 11, 5, 3, 17, 7, 13, 19, 23, 29, 31], dtype=torch.float32)
-    )
 
 
-@pytest.mark.parametrize("decode_mode", ["full", "full_chunked"])
-@pytest.mark.parametrize("untie_decode_bank", [False, True])
-def test_projected_manual_decode_matches_canonical_full_oracle(
-    decode_mode: str,
-    untie_decode_bank: bool,
-) -> None:
-    """Scoring the materialized diagonal query without pullback breaks this hand KL oracle."""
-    torch.manual_seed(101)
-    model = VFEModel(_projected_cfg(
-        decode_mode=decode_mode,
-        untie_decode_bank=untie_decode_bank,
-        decode_unigram_prior=True,
-        unigram_kappa=0.63,
-        pos_phi="learned",
-        e_step_update="mm_exact",
-    )).to(TASK6_DEVICE)
-    token_ids = torch.tensor([[2, 5]], device=TASK6_DEVICE)
-    _set_decode_oracle_tables(model)
-    _set_noncommuting_model_frames(model, token_ids)
-    capture: dict = {}
-
-    belief, logits = model.forward_beliefs(
-        token_ids,
-        return_logits=True,
-        capture=capture,
-    )
-
-    context = capture["canonical_frame"]
-    mu_c, cov_c = pullback_diagonal_query(
-        belief.mu,
-        belief.sigma,
-        context.inverse,
-    )
-    expected = _manual_canonical_full_logits(model.prior_bank, mu_c, cov_c)
-    token_only = torch.matrix_exp(torch.einsum(
-        "...a,aij->...ij",
-        model.prior_bank.encode(token_ids).phi,
-        model.group.generators,
-    ))
-    assert not torch.allclose(context.forward, token_only, atol=1e-6, rtol=1e-6)
-    assert logits is not None
-    # The chunked KL decode preserves a float64 ranking escalation (_decode_analytic_kl_logits);
-    # this hand oracle inherits float32 from its inputs. Compare values, not dtypes.
-    assert torch.allclose(logits.to(expected.dtype), expected, atol=4e-4, rtol=4e-4)
 
 
 def test_projected_missing_frame_fails_closed_at_priorbank_decode() -> None:
@@ -1280,100 +836,13 @@ def test_projected_dense_fused_value_gradient_parity_with_invalid_query() -> Non
         assert torch.allclose(fused_grads[name], dense_grads[name], atol=2e-8, rtol=2e-7), name
 
 
-def _retain_forward_query(model: VFEModel, holder: dict[str, object]) -> None:
-    original = model.forward_beliefs
-
-    def tracked(*args: object, **kwargs: object):
-        belief, logits = original(*args, **kwargs)
-        belief.mu.retain_grad()
-        belief.sigma.retain_grad()
-        holder["belief"] = belief
-        capture = kwargs.get("capture")
-        if isinstance(capture, dict):
-            holder["canonical_frame"] = capture.get("canonical_frame")
-        return belief, logits
-
-    model.forward_beliefs = tracked  # type: ignore[method-assign]
 
 
-def _projected_training_model(decode_mode: str) -> VFEModel:
-    torch.manual_seed(139)
-    model = VFEModel(_projected_cfg(
-        decode_mode=decode_mode,
-        decode_chunk_size=4,
-        decode_ce_checkpoint=("always" if decode_mode == "full_chunked" else "auto"),
-        decode_unigram_prior=True,
-        decode_temperature_learned=True,
-        unigram_kappa=0.61,
-        use_priorbank_head_evidence_mixer=True,
-        pos_phi="learned",
-        e_step_update="gradient",
-        e_q_mu_lr=0.03,
-        e_q_sigma_lr=0.02,
-    ))
-    token_ids = torch.tensor([[2, 5]])
-    _set_noncommuting_model_frames(model, token_ids)
-    model.prior_bank.set_unigram_log_prior(
-        torch.tensor([2, 11, 5, 3, 17, 7, 13, 19, 23, 29, 31])
-    )
-    with torch.no_grad():
-        model.prior_bank.decode_log_scale.fill_(0.23)
-        model.prior_bank.head_evidence_logits.copy_(torch.tensor([0.31, -0.19]))
-    return model.to(TASK6_DEVICE)
 
 
-def test_projected_model_dense_fused_training_threads_context_and_gradients() -> None:
-    """Dropping the same-forward frame from model training severs phi or decode gradients."""
-    dense = _projected_training_model("full")
-    fused = _projected_training_model("full_chunked")
-    fused.load_state_dict(dense.state_dict())
-    dense.train()
-    fused.train()
-    tokens = torch.tensor([[2, 5], [4, 7]], device=TASK6_DEVICE)
-    targets = torch.tensor([[10, -100], [3, 1]], device=TASK6_DEVICE)
-    dense_holder: dict[str, object] = {}
-    fused_holder: dict[str, object] = {}
-    _retain_forward_query(dense, dense_holder)
-    _retain_forward_query(fused, fused_holder)
 
-    dense_logits, dense_loss, dense_ce = dense(tokens, targets)
-    fused_logits, fused_loss, fused_ce = fused(tokens, targets)
-    dense_loss.backward()
-    fused_loss.backward()
 
-    assert dense_logits is not None
-    assert fused_logits is None
-    assert isinstance(dense_holder.get("canonical_frame"), CanonicalFrameContext)
-    assert isinstance(fused_holder.get("canonical_frame"), CanonicalFrameContext)
-    # Fused chunked CE preserves a float64 ranking escalation; the dense twin casts to mu_q.dtype.
-    # Values agree to ~1e-7; compare across the intentional dtype boundary.
-    assert torch.allclose(fused_ce.to(dense_ce.dtype), dense_ce, atol=7e-4, rtol=7e-4)
-    assert torch.allclose(fused_loss.to(dense_loss.dtype), dense_loss, atol=7e-4, rtol=7e-4)
-
-    dense_belief = dense_holder["belief"]
-    fused_belief = fused_holder["belief"]
-    gradient_pairs = {
-        "query_mean": (dense_belief.mu.grad, fused_belief.mu.grad),
-        "query_variance": (dense_belief.sigma.grad, fused_belief.sigma.grad),
-        "canonical_prior_mean": (dense.prior_bank.mu_embed.grad, fused.prior_bank.mu_embed.grad),
-        "canonical_prior_variance": (
-            dense.prior_bank.sigma_log_embed.grad,
-            fused.prior_bank.sigma_log_embed.grad,
-        ),
-        "token_phi": (dense.prior_bank.phi_embed.grad, fused.prior_bank.phi_embed.grad),
-        "positional_phi": (dense.pos_phi_free.grad, fused.pos_phi_free.grad),
-        "evidence_logits": (
-            dense.prior_bank.head_evidence_logits.grad,
-            fused.prior_bank.head_evidence_logits.grad,
-        ),
-        "temperature": (
-            dense.prior_bank.decode_log_scale.grad,
-            fused.prior_bank.decode_log_scale.grad,
-        ),
-    }
-    for name, (dense_grad, fused_grad) in gradient_pairs.items():
-        assert dense_grad is not None and fused_grad is not None, name
-        assert torch.isfinite(dense_grad).all() and torch.isfinite(fused_grad).all(), name
-        assert torch.count_nonzero(dense_grad).item() > 0, name
-        assert torch.count_nonzero(fused_grad).item() > 0, name
-        assert torch.allclose(fused_grad, dense_grad, atol=2e-3, rtol=6e-3), name
+@pytest.mark.parametrize("mode", ["projected_predictive", "projected_gradient"])
+def test_model_rejects_canonical_projected_encoder(mode: str) -> None:
+    with pytest.raises(ValueError, match="encode_mode=.*canonical_content_projected"):
+        _projected_cfg(attention_mode=mode)
