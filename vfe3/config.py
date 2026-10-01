@@ -382,6 +382,7 @@ class VFE3Config:
     # residual persistence term when attention_residual=True, and the covariant reference floor
     # floor * (tr C_i / K) I (local floor * (tr C_i / K) U_i U_i^T).
     predictive_covariance:               str           = "passthrough"          # "passthrough" | "moment_matched" (projected_predictive only)
+    predictive_covariance_centering:     bool          = False                  # True shifts source means before the covariance spread; False preserves historical arithmetic
     predictive_covariance_floor:         float         = 1e-4                   # Q~_i = floor * (tr C_i / K) I, keeps Sigma^+ positive definite and well conditioned
 
     ######################################
@@ -2590,10 +2591,11 @@ class VFE3Config:
                 mark(("projected_factor_route",),
                      "the noisy-query cost factors per-pair sums G_q + G_k and keeps the Gram route")
         if self.attention_mode != "projected_predictive":
-            mark(("predictive_covariance", "predictive_covariance_floor"),
+            mark(("predictive_covariance", "predictive_covariance_floor", "predictive_covariance_centering"),
                  "only read by attention_mode='projected_predictive'")
         elif self.predictive_covariance == "passthrough":
-            mark(("predictive_covariance_floor",), "only read by predictive_covariance='moment_matched'")
+            mark(("predictive_covariance_floor", "predictive_covariance_centering"),
+                 "only read by predictive_covariance='moment_matched'")
         gradient_controls = ("e_q_mu_lr", "e_q_sigma_lr", "e_step_mu_precond",
                              "e_mu_q_trust", "mu_trust_mode", "e_sigma_q_trust")
         if self.attention_mode != "transported":
