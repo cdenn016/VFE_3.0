@@ -214,14 +214,16 @@ class VFE3Config:
     # gradient-identical (the vocabulary reduction is a logsumexp over independent slices).
     decode_chunk_size:         int   = 8192
 
-    # Gradient checkpointing for the decode_ce_*_chunked fused-CE kernels. "always" reproduces the
-    # pre-2026-08-07 unconditional behavior (recompute the chunk in backward whenever grad is live).
-    # "never" keeps the chunk workspace live for backward and pays no recompute. "auto" checkpoints
-    # only when the (B,N,chunk_width) tensor the chunk would otherwise save, at its own dtype
-    # itemsize, exceeds a fixed 2 GiB budget -- a constant rather than a live device-memory query, so
-    # the decision is reproducible run-to-run and degrades to the same value on CPU. Inert when the
-    # active decode route has no fused_ce registration ('full'/'family').
-    decode_ce_checkpoint:      str   = "auto"        # "auto" | "always" | "never"
+    # Checkpointing trades backward recomputation for retained decoder memory.
+    # "auto" keeps historical per-chunk accounting for analytic/expected/linear CE.
+    # Generic family CE already uses aggregate retention. "auto_aggregate" explicitly opts
+    # into whole-vocabulary accounting, including fp64 scores and expected 2K worksets.
+    # Both automatic policies use a 2 GiB threshold; "always"/"never" force the policy.
+    decode_ce_checkpoint:       str  = "auto"  # "auto" | "auto_aggregate" | "always" | "never"
+
+    # Nonlinear fused CE only: centering avoids large-score fp32 cancellation but adds passes.
+    # False preserves historical loss arithmetic; True selects the numerical correction.
+    decode_ce_stable_reduction: bool = False
 
     # Strict decoder ranking guard. When enabled, analytic fp32 decoders construct conservative score
     # intervals and, if ANY row's winning interval overlaps a competitor, recompute the complete
@@ -586,6 +588,16 @@ class VFE3Config:
     m_p_mu_lr:                 float = 0.025
     m_p_sigma_lr:              float = 0.0025
     m_phi_lr:                  float = 0.015
+
+    # Independent rates for untied decode means (or linear weight/bias) and log variances.
+    # None inherits the corresponding encoder rate, with m_decode_lr as a legacy fallback.
+    # Shared encode/decode tables retain encoder rates. These fields do not change temperature.
+    m_decode_mu_lr:            Optional[float] = None
+    m_decode_sigma_lr:         Optional[float] = None
+
+    # Legacy combined override for older configs: fallback mean/variance plus learned temperature.
+    # Explicit split fields take precedence for their own tables. None preserves old grouping.
+    m_decode_lr:               Optional[float] = None
 
     # Optional absolute M-step rate for the LEARNED POSITIONAL frame table (pos_phi='learned'), which
     # otherwise rides m_phi_lr with phi_embed. The two tables compose into ONE clamped frame and so
@@ -2014,7 +2026,10 @@ class VFE3Config:
             )
         if self.decode_chunk_size < 1:
             raise ValueError(f"decode_chunk_size must be >= 1, got {self.decode_chunk_size}")
-        _require(self.decode_ce_checkpoint, ("auto", "always", "never"), "decode_ce_checkpoint")
+        _require(self.decode_ce_checkpoint, ("auto", "auto_aggregate", "always", "never"),
+                 "decode_ce_checkpoint")
+        if type(self.decode_ce_stable_reduction) is not bool:
+            raise ValueError("decode_ce_stable_reduction must be a bool")
         # decode_bias (linear decode only) and decode_tau (prior-bank decode only) are reported by
         # inactive_fields(), so the default-guarded notice below covers them and untouched
         # defaults stay silent.
@@ -2364,6 +2379,12 @@ class VFE3Config:
             v = getattr(self, name)
             if v is not None and (not math.isfinite(v) or v < 0.0):
                 raise ValueError(f"{name} must be finite and >= 0 or None, got {v}")
+        for name in ("m_decode_mu_lr", "m_decode_sigma_lr", "m_decode_lr"):
+            v = getattr(self, name)
+            if v is not None and (
+                    isinstance(v, bool) or not isinstance(v, Real)
+                    or not math.isfinite(v) or v < 0.0):
+                raise ValueError(f"{name} must be finite and >= 0 or None, got {v!r}")
         v = self.m_block_mlp_lr
         if v is not None and (
                 isinstance(v, bool) or not isinstance(v, Real)
@@ -2620,6 +2641,8 @@ class VFE3Config:
         registration = _DECODERS[self.decode_mode]
         if not registration.supports_chunked:
             mark(("decode_ce_checkpoint",), "the selected decoder has no checkpointed chunked CE kernel")
+        if not registration.supports_chunked or self.decode_mode == "linear":
+            mark(("decode_ce_stable_reduction",), "only read by nonlinear fused chunked CE")
         canonical_family_dispatch = (
             self.decode_mode == "family_chunked"
             and registration.callable is _decode_family_chunked
@@ -2640,10 +2663,14 @@ class VFE3Config:
         # arithmetic; where an autograd oracle executes it (full-covariance families) the
         # override leaves only a floating-point roundoff residue in the gradients.
         if self.decode_mode == "linear":
+            mark(("m_decode_sigma_lr",), "linear decode has no independent variance table")
             mark(("decode_tau", "decode_temperature_learned"), "read only by the prior-bank KL decode")
             mark(("untie_decode_bank",),
                  "read only by the KL-to-bank decode; the linear decode is untied by construction")
         else:
+            if not self.untie_decode_bank:
+                mark(("m_decode_mu_lr", "m_decode_sigma_lr"),
+                     "shared encode/decode tables use the encoder rates")
             mark(("decode_bias",), "linear decode only; the prior-bank KL decoders create no output bias")
         if self.beta_attention_prior not in ("windowed", "causal_windowed"):
             mark(("attention_window",), "only the windowed/causal_windowed priors read the band half-width")

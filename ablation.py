@@ -356,6 +356,8 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     encode_mode                       = "per_token",   #"per_token_additive" is ~1.5x faster at K=80 currently unablated
                                                        # "canonical_content_projected" requires gaussian_diagonal input and a full decoder
     decode_chunk_size                 = 8192,
+    decode_ce_checkpoint              = "auto",     # historical gate; "auto_aggregate" saves memory with recompute
+    decode_ce_stable_reduction        = False,      # True avoids large-score CE cancellation; adds tensor passes
     decode_tau                        = 0.008,       #prior_bank = True temperature
     
     unigram_kappa                     = 1.0,         # tempering on log pi_v (1.0 = exact Bayes class prior)
@@ -473,6 +475,8 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
 
     m_p_mu_lr                 = 0.005,
     m_p_sigma_lr              = 0.001,
+    m_decode_mu_lr            = None,       # None inherits m_p_mu_lr
+    m_decode_sigma_lr         = None,       # None inherits m_p_sigma_lr
     m_phi_lr                  = 0.0015,
     
 
@@ -732,6 +736,19 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "param": "m_p_sigma_lr", 
         "values": [0.0005, 0.001, 0.0025, 0.005],
         "scale": "linear",
+    },
+    "m_decode_mu_lr": {
+        "description": "M-step LR for untied decoder means or linear projection",
+        "param": "m_decode_mu_lr",
+        "values": [0.0005, 0.00075, 0.001, 0.0025],
+        "scale": "linear",
+    },
+    "m_decode_sigma_lr": {
+        "description": "M-step LR for untied decoder log variances",
+        "param": "m_decode_sigma_lr",
+        "values": [0.0005, 0.00075, 0.001, 0.0025],
+        "scale": "linear",
+        "requires": {"untie_decode_bank": True},
     },
     
     

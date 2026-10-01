@@ -69,7 +69,7 @@ PER_TYPE_TABLE_INITS: Tuple[str, ...] = ("zero", "phi_like")
 ATTENTION_PRIORS: Tuple[str, ...] = ("causal_alibi", "causal")
 AMP_DTYPES: Tuple[Optional[str], ...] = (None, "bf16", "fp16")
 FP32_MATMUL_PRECISIONS: Tuple[Optional[str], ...] = (None, "highest", "high", "medium")
-DECODE_CE_CHECKPOINTS: Tuple[str, ...] = ("auto", "always", "never")
+DECODE_CE_CHECKPOINTS: Tuple[str, ...] = ("auto", "auto_aggregate", "always", "never")
 
 # Pre-declared compute-matching rule (Table M2, "matched measured compute"). Hoffmann et al. (2022,
 # arXiv:2203.15556) put the compute-optimal token count near 20 tokens per parameter; Muennighoff et
@@ -868,6 +868,8 @@ class BaselineTransformer(nn.Module):
         :math:`3 C_f` per token. An analytic proxy, not a measurement: the matched-compute arm uses
         measured device-hours.
         """
+        from vfe3.run_artifacts import _execution_device_fields
+
         cfg = self.cfg
         K, L, N, V, e, d = (cfg.embed_dim, cfg.n_layers, cfg.max_seq_len, cfg.vocab_size,
                             cfg.mlp_expansion, cfg.d_head)
@@ -890,7 +892,7 @@ class BaselineTransformer(nn.Module):
             "flops_per_token_forward": forward_per_token,
             "flops_per_token_train":   3.0 * forward_per_token,
             "est_flops_analytic":      3.0 * forward_per_token * float(tokens_seen),
-            "device_name":             (torch.cuda.get_device_name(0) if torch.cuda.device_count() > 0 else "cpu"),
+            **_execution_device_fields(self),
             "amp_dtype":               cfg.amp_dtype,
         }
         if wall_time is not None and tokens_seen > 0:

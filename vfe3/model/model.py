@@ -422,6 +422,7 @@ class VFEModel(nn.Module):
             encode_mode=cfg.encode_mode, decode_mode=cfg.decode_mode,
             decode_chunk_size=cfg.decode_chunk_size,
             decode_ce_checkpoint=cfg.decode_ce_checkpoint,
+            decode_ce_stable_reduction=cfg.decode_ce_stable_reduction,
             decode_ranking_fp64_escalation=cfg.decode_ranking_fp64_escalation,
             decode_ranking_refinement=cfg.decode_ranking_refinement,
             # Tier-1/Tier-2 decode toggles (2026-07-05; all default OFF, byte-identical):
@@ -1747,63 +1748,57 @@ class VFEModel(nn.Module):
                 stacklevel=2,
             )
         seq = token_ids
-        for _ in range(max_new_tokens):
-            context = seq[:, -self.cfg.max_seq_len:]                 # (B, <=max_seq_len)
-            _belief, decoded = self.forward_beliefs(
-                context, return_logits=True, decode_last=True)
-            logits = decoded[:, 0, :]                                # (B, V) last position
-            invalid_row = torch.isnan(logits).any(dim=-1) | torch.isposinf(logits).any(dim=-1)
-            if bool(invalid_row.any()):
-                rows = invalid_row.nonzero(as_tuple=False).flatten().tolist()
-                raise ValueError(
-                    f"generation logits contain NaN or +inf values in rows {rows}")
-            finite_row = torch.isfinite(logits).any(dim=-1)
-            if not bool(finite_row.all()):
-                rows = (~finite_row).nonzero(as_tuple=False).flatten().tolist()
-                raise ValueError(f"generation logits have no finite value in rows {rows}")
-            if greedy:
-                next_token = logits.argmax(dim=-1, keepdim=True)    # (B, 1)
-                retained_logits = torch.gather(logits, 1, next_token)
-                retained_finite = torch.isfinite(retained_logits).all(dim=-1)
-                if not bool(retained_finite.all()):
-                    rows = (~retained_finite).nonzero(as_tuple=False).flatten().tolist()
+        with self.prior_bank.fixed_decode_bank():
+            for _ in range(max_new_tokens):
+                context = seq[:, -self.cfg.max_seq_len:]                 # (B, <=max_seq_len)
+                _belief, decoded = self.forward_beliefs(
+                    context, return_logits=True, decode_last=True)
+                logits = decoded[:, 0, :]                                # (B, V) last position
+                invalid_row = torch.isnan(logits).any(dim=-1) | torch.isposinf(logits).any(dim=-1)
+                finite_row = torch.isfinite(logits).any(dim=-1)
+                if greedy:
+                    row_errors = torch.stack((invalid_row, ~finite_row))
+                else:
+                    logits = logits / temperature
+                    retained = torch.ones_like(logits, dtype=torch.bool)
+                    if top_k is not None:
+                        kth = logits.topk(top_k, dim=-1).values[:, -1:]  # (B, 1) k-th largest
+                        remove_topk = logits < kth
+                        retained = ~remove_topk
+                        logits = logits.masked_fill(remove_topk, float("-inf"))
+                    retained_invalid = (retained & ~torch.isfinite(logits)).any(dim=-1)
+                    row_errors = torch.stack((invalid_row, ~finite_row, retained_invalid))
+                # One device-to-host decision keeps the original diagnostic priority. Validate
+                # retained sampled logits before nucleus filtering can remove a non-finite entry.
+                rejected = row_errors.any(dim=-1).tolist()
+                if rejected[0]:
+                    rows = invalid_row.nonzero(as_tuple=False).flatten().tolist()
+                    raise ValueError(
+                        f"generation logits contain NaN or +inf values in rows {rows}")
+                if rejected[1]:
+                    rows = (~finite_row).nonzero(as_tuple=False).flatten().tolist()
+                    raise ValueError(f"generation logits have no finite value in rows {rows}")
+                if not greedy and rejected[2]:
+                    rows = retained_invalid.nonzero(as_tuple=False).flatten().tolist()
                     raise ValueError(
                         f"generation retained logits contain non-finite values in rows {rows}")
-            else:
-                logits = logits / temperature
-                retained = torch.ones_like(logits, dtype=torch.bool)
-                if top_k is not None:
-                    kth = logits.topk(top_k, dim=-1).values[:, -1:]  # (B, 1) k-th largest
-                    remove_topk = logits < kth
-                    retained = ~remove_topk
-                    logits = logits.masked_fill(remove_topk, float("-inf"))
-                retained_finite = torch.where(
-                    retained, torch.isfinite(logits), torch.ones_like(retained)
-                ).all(dim=-1)
-                if not bool(retained_finite.all()):
-                    rows = (~retained_finite).nonzero(as_tuple=False).flatten().tolist()
-                    raise ValueError(
-                        f"generation retained logits contain non-finite values in rows {rows}")
-                if top_p is not None:
-                    sorted_logits, sorted_idx = torch.sort(logits, dim=-1, descending=True)
-                    sorted_probs = sorted_logits.softmax(dim=-1)       # compute the softmax once
-                    cumprobs = sorted_probs.cumsum(dim=-1)
-                    # Keep the smallest nucleus whose cumprob reaches top_p; the strict
-                    # shift always keeps the top token (its cumprob>=p never removes it).
-                    remove = cumprobs - sorted_probs >= top_p
-                    remove_unsorted = remove.scatter(-1, sorted_idx, remove)
-                    retained = retained & ~remove_unsorted
-                    logits = logits.masked_fill(remove_unsorted, float("-inf"))
-                retained_finite = torch.where(
-                    retained, torch.isfinite(logits), torch.ones_like(retained)
-                ).all(dim=-1)
-                if not bool(retained_finite.all()):
-                    rows = (~retained_finite).nonzero(as_tuple=False).flatten().tolist()
-                    raise ValueError(
-                        f"generation retained logits contain non-finite values in rows {rows}")
-                probs = logits.softmax(dim=-1)                      # (B, V)
-                next_token = torch.multinomial(probs, num_samples=1)  # (B, 1)
-            seq = torch.cat([seq, next_token], dim=-1)
+                if greedy:
+                    # A row with a finite value and no NaN/+inf has a finite argmax.
+                    next_token = logits.argmax(dim=-1, keepdim=True)    # (B, 1)
+                else:
+                    if top_p is not None:
+                        sorted_logits, sorted_idx = torch.sort(logits, dim=-1, descending=True)
+                        sorted_probs = sorted_logits.softmax(dim=-1)       # compute the softmax once
+                        cumprobs = sorted_probs.cumsum(dim=-1)
+                        # Keep the smallest nucleus whose cumprob reaches top_p; the strict
+                        # shift always keeps the top token (its cumprob>=p never removes it).
+                        remove = cumprobs - sorted_probs >= top_p
+                        remove_unsorted = remove.scatter(-1, sorted_idx, remove)
+                        logits = logits.masked_fill(remove_unsorted, float("-inf"))
+                    # Nucleus filtering only removes entries from the already validated set.
+                    probs = logits.softmax(dim=-1)                      # (B, V)
+                    next_token = torch.multinomial(probs, num_samples=1)  # (B, 1)
+                seq = torch.cat([seq, next_token], dim=-1)
         return seq
 
 

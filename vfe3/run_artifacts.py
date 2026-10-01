@@ -2781,6 +2781,18 @@ def _bincount_token_chunks(
     return counts
 
 
+def _execution_device_fields(model: torch.nn.Module) -> Dict[str, object]:
+    r"""Identify the model's execution device without querying unused CUDA hardware."""
+    parameter = next(model.parameters(), None)
+    device = parameter.device if parameter is not None else torch.device("cpu")
+    return {
+        "device":       str(device),
+        "device_type":  device.type,
+        "device_index": device.index,
+        "device_name":  torch.cuda.get_device_name(device) if device.type == "cuda" else device.type,
+    }
+
+
 def _write_provenance(
     artifacts: RunArtifacts,
     cfg:       VFE3Config,
@@ -2841,7 +2853,7 @@ def _write_provenance(
         "n_params":            int(sum(p.numel() for p in model.parameters())),
         "torch_version":       torch.__version__,
         "cuda_version":        torch.version.cuda,
-        "device_name":         (torch.cuda.get_device_name(0) if torch.cuda.device_count() > 0 else "cpu"),
+        **_execution_device_fields(model),
         "data_seed":           (int(data_seed) if data_seed is not None else None),
         "max_tokens":          (int(max_tokens) if max_tokens is not None else None),
         "tokenizer_tag":       tokenizer_tag,
@@ -3290,7 +3302,7 @@ def _cost_model_fields(
         "flops_per_token_estep":   fpt_estep,
         "block_mlp_params":         int(block_mlp_params),
         "flops_per_token_block_mlp": fpt_block_mlp,
-        "device_name":             (torch.cuda.get_device_name(0) if torch.cuda.device_count() > 0 else "cpu"),
+        **_execution_device_fields(model),
         "amp_dtype":               cfg.amp_dtype,
     }
     token_table_params = _token_table_parameter_count(model)
@@ -4872,8 +4884,8 @@ def _pure_path_report(
     remain executable and are labeled by independent certificate facets. ``on_pure_path`` preserves
     the legacy free-energy/decode schema. ``on_gauge_pure_path`` is the executable gauge facet and
     includes the active transport, norm, parameterization, clipping, temperature, encoder,
-    HeadMixer, and immutable BlockMLP seams. ``on_causal_lm_path`` comes independently from both
-    active attention-prior registrations. ``transport_exactness_status`` is affirmative only when
+    decoder coordinate, HeadMixer, and immutable BlockMLP seams. ``on_causal_lm_path`` comes
+    independently from both active attention-prior registrations. ``transport_exactness_status`` is affirmative only when
     complete runtime evidence warrants it; absent evidence is ``unknown``. The conjunctive
     ``on_theory_pure_path`` combines the explicitly enumerated ``theory_flags``.
 
@@ -5000,6 +5012,7 @@ def _pure_path_report(
                               and e_step_updater == "gradient")
 
     sigma_max = getattr(cfg, "sigma_max", 10.0)
+    sigma_cap_consumer_active = transported and not cfg.skip_belief_sigma_update
     spd_trust_region = getattr(cfg, "e_sigma_q_trust", 5.0)
     spd_retraction_trust_projection_active: 'bool | str' = (
         spd_trust_region is not None and float(spd_trust_region) > 0.0)
@@ -5068,7 +5081,8 @@ def _pure_path_report(
         "block_mlp_intertwiner_compatible": block_mlp_intertwiner_compatible,
         "block_norm_gauge_equivariant": block_norm_registration.gauge_equivariant,
         "final_norm_gauge_equivariant": final_norm_registration.gauge_equivariant,
-        "no_fixed_coordinate_spectral_cap": sigma_max is None,
+        "no_fixed_coordinate_spectral_cap": (
+            sigma_max is None if sigma_cap_consumer_active else "not_applicable"),
         "no_phi_mstep_chart_cap": getattr(cfg, "phi_mstep_max_matrix_norm", None) is None,
         "no_pullback_trust_region": getattr(cfg, "m_phi_update_mode", "adamw") not in (
             "pullback_group", "fisher_group"),
@@ -5078,6 +5092,7 @@ def _pure_path_report(
         ),
         "no_e_step_phi_retraction_clipping": float(getattr(cfg, "e_phi_lr", 0.0)) == 0.0,
         "no_additive_encoder_control": getattr(cfg, "encode_mode", "per_token") != "per_token_additive",
+        "decoder_gauge_compatible": getattr(cfg, "decode_coordinates", "local") == "reference",
     }
     on_gauge_pure_path = all(gauge_flags.values())
     theory_flags = {
@@ -5103,6 +5118,7 @@ def _pure_path_report(
             "lambda_alpha_mode":            cfg.lambda_alpha_mode,
             "lambda_beta":                  float(cfg.lambda_beta),
             "decode_mode":                  cfg.decode_mode,
+            "decode_coordinates":           getattr(cfg, "decode_coordinates", "local"),
             "use_head_mixer":               bool(cfg.use_head_mixer),
             "use_priorbank_head_evidence_mixer": priorbank_head_evidence_mixer,
             "encode_mode":                  getattr(cfg, "encode_mode", "per_token"),
