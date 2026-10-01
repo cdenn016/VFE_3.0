@@ -32,7 +32,7 @@ from vfe3.train import _VAL_RELATIONAL_DIAG_KEYS
 
 H, D, N = 2, 2, 4
 K = H * D
-SCOPES = [("head", "head"), ("full", "head"), ("head", "full"), ("full", "full")]
+SCOPES = [("full", "full")]
 
 
 @pytest.fixture(autouse=True)
@@ -293,7 +293,7 @@ def test_singular_head_gives_zero_min_modulus_and_nan_mean_log() -> None:
 
 
 def test_selfloop_keys_are_nan_without_routing_weights() -> None:
-    ops = _ops("head", "head")
+    ops = _ops("full", "full")
     with torch.no_grad():
         got = metrics.content_link_spectrum(*ops._ambient_content_maps(torch.float64))
     assert math.isnan(got["relational_link_selfloop_spectral_radius_max"])
@@ -318,7 +318,7 @@ def test_relational_diagnostics_emit_link_keys_at_every_layer() -> None:
     torch.manual_seed(0)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        model = VFEModel(_model_cfg(relational_input_scope="head", relational_output_scope="head")).eval()
+        model = VFEModel(_model_cfg()).eval()
     tokens = torch.tensor([[0, 1, 2, 3]])
     d = model.diagnostics(tokens)
     for key in metrics.LINK_SPECTRUM_KEYS:

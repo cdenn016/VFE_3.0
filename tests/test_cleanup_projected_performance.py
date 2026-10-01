@@ -107,7 +107,7 @@ def test_tiled_projection_keeps_source_factor_recovery(monkeypatch: pytest.Monke
 
 
 @pytest.mark.parametrize("compact", [False, True])
-@pytest.mark.parametrize("input_scope", ["head", "full"])
+@pytest.mark.parametrize("input_scope", ["full"])
 def test_full_output_contraction_matches_expanded_reference(compact: bool, input_scope: str) -> None:
     torch.manual_seed(83)
     operators = RelationalOperators([2, 2], 9, input_scope=input_scope,

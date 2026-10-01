@@ -368,8 +368,8 @@ class VFE3Config:
     # predictive projected content. Projection ranks still follow the gauge block dimensions.
     # Projected attention requires the explicit support envelope validated below.
     attention_mode:                      str           = "transported"          # "transported" | "projected_conditional" | "projected_predictive"
-    relational_input_scope:              str           = "head"                 # "head" | "full"
-    relational_output_scope:             str           = "head"                 # "head" | "full"
+    relational_input_scope:              Optional[str] = None                 # conditional only: "head" | "full"; predictive is fixed "full"
+    relational_output_scope:             Optional[str] = None                 # conditional: "head"; predictive is fixed "full"
     attention_residual:                  bool          = False                  # requires predictive_content
     relational_output_init:              str           = "identity"             # "identity" | "depth_scaled" (initial O times 1/sqrt(2 n_layers))
 
@@ -882,12 +882,22 @@ class VFE3Config:
 
         # Validate the declared relational envelope before downstream selector coercions.
         _require(self.attention_mode, ("transported", "projected_conditional", "projected_predictive"), "attention_mode")
+        default_scope = "full" if self.attention_mode == "projected_predictive" else "head"
+        if self.relational_input_scope is None:
+            self.relational_input_scope = default_scope
+        if self.relational_output_scope is None:
+            self.relational_output_scope = default_scope
         _require(self.relational_input_scope, ("head", "full"), "relational_input_scope")
         if type(self.attention_residual) is not bool:
             raise ValueError("attention_residual must be a bool")
         if self.attention_residual and self.attention_mode != "projected_predictive":
             raise ValueError("attention_residual requires attention_mode='projected_predictive'")
         _require(self.relational_output_scope, ("head", "full"), "relational_output_scope")
+        if self.attention_mode == "projected_predictive" and (
+                self.relational_input_scope != "full" or self.relational_output_scope != "full"):
+            raise ValueError(
+                "projected_predictive fixes relational_input_scope and relational_output_scope "
+                "to 'full'; historical head predictive configurations require explicit conversion")
         if self.relational_output_scope == "full" and self.attention_mode != "projected_predictive":
             raise ValueError("relational_output_scope='full' requires predictive_content")
         if self.attention_mode == "projected_predictive" and self.relational_identity_content:
@@ -2566,6 +2576,9 @@ class VFE3Config:
                  "(m_phi_update_mode='pullback_group' or 'fisher_group')")
         if not phi_update_policy.requires_fisher_statistics:
             mark(("m_phi_fisher_rotation_weight",), "only read by m_phi_update_mode='fisher_group'")
+        if self.attention_mode == "projected_predictive":
+            mark(("relational_input_scope", "relational_output_scope"),
+                 "predictive attention fixes full input/output; scope selectors belong to conditional updates")
         if self.attention_mode == "transported":
             mark(("relational_identity_content", "m_relational_score_lr", "m_relational_content_lr",
                   "relational_routing"),

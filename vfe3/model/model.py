@@ -373,8 +373,11 @@ class VFEModel(nn.Module):
             layers = [
                 RelationalOperators(list(self.group.irrep_dims),
                                     _derived_seed(cfg.seed, "relational_operators", layer_index),
-                                    cfg.relational_input_scope,
-                                    cfg.relational_readout_mode, cfg.relational_output_scope,
+                                    readout_mode=cfg.relational_readout_mode,
+                                    input_scope=("full" if cfg.attention_mode == "projected_predictive"
+                                                 else cfg.relational_input_scope),
+                                    output_scope=("full" if cfg.attention_mode == "projected_predictive"
+                                                  else cfg.relational_output_scope),
                                     attention_residual=cfg.attention_residual,
                                     identity_content=cfg.relational_identity_content,
                                     output_init_scale=output_init_scale,

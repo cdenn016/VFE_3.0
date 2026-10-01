@@ -301,7 +301,7 @@ def test_patched_rows_match_an_independent_reference_coordinate_forward(name: st
 
 @pytest.mark.parametrize("pos_phi", ["learned", "none"])
 def test_all_roles_removed_equals_frames_identity_in_every_role(pos_phi: str) -> None:
-    model = _model(_cfg(pos_phi=pos_phi, **LAYERNORM))
+    model = _model(_cfg(pos_phi=pos_phi, **LAYERNORM), seed=1)
     dataset = _dataset(9)
     check = iv.frame_role_composite_check(model, dataset, np.arange(len(dataset)), batch_size=2, device=DEVICE)
     assert check["positional_frames"] is (pos_phi != "none")

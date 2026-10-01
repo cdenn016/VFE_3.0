@@ -94,7 +94,8 @@ def test_gaussian_rope_autocast_snapshot(family: str, readout: str, rope_on_valu
 def test_intrinsic_family_does_not_pull_back_stored_coordinates_twice(readout: str) -> None:
     torch.manual_seed(3)
     model = VFEModel(_cfg(family="gaussian_frame_diagonal", relational_input_scope="full",
-                         attention_mode=("projected_predictive" if readout == "predictive_content" else "projected_conditional"), use_head_mixer=False, use_block_mlp=False))
+                         attention_mode=("projected_predictive" if readout == "predictive_content" else "projected_conditional"),
+                         relational_output_scope="full" if readout == "predictive_content" else "head", use_head_mixer=False, use_block_mlp=False))
     ids, _ = _tokens()
     first = model.forward_beliefs(ids)[0].mu
     with torch.no_grad():
@@ -150,6 +151,7 @@ def test_full_gaussian_active_per_coordinate_alpha(readout: str) -> None:
                          attention_mode=("transported" if readout == "ordinary" else
                                          "projected_predictive" if readout == "predictive_content"
                                          else "projected_conditional"),
+                         relational_output_scope="full" if readout == "predictive_content" else "head",
                          lambda_alpha_mode="state_dependent_per_coord",
                          mstep_self_coupling_weight=.2, full_cov_kl_precision="fp64"))
     ids, targets = _tokens()

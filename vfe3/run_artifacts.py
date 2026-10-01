@@ -107,9 +107,11 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         return {}
     H, d = cfg.n_heads, cfg.d_head
     r, s = d, (None if cfg.relational_identity_content else d)
-    input_dim = cfg.embed_dim if cfg.relational_input_scope == "full" else d
     predictive = cfg.relational_readout_mode == "predictive_content"
-    output_dim = cfg.embed_dim if cfg.relational_output_scope == "full" else d
+    input_scope = "full" if predictive else cfg.relational_input_scope
+    output_scope = "full" if predictive else cfg.relational_output_scope
+    input_dim = cfg.embed_dim if input_scope == "full" else d
+    output_dim = cfg.embed_dim if output_scope == "full" else d
     layer_counts = {"score": 2*H*input_dim*r,
                     "content": 0 if s is None else H*s*(input_dim+output_dim)}
     counts = {role: count * cfg.n_layers for role, count in layer_counts.items()}
@@ -122,11 +124,11 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "inference_semantics": ("relational_predictive_content" if predictive
                                 else "relational_projected_conditional_filtering"),
         "readout_mode": cfg.relational_readout_mode,
-        "output_scope": cfg.relational_output_scope,
+        "output_scope": output_scope,
         "mean_update": ("input_plus_predictive_mean" if cfg.attention_residual else
                         "replace_with_predictive_mean" if predictive else "conditional_fisher_step"),
         "mode": cfg.relational_mode,
-        "input_scope": cfg.relational_input_scope,
+        "input_scope": input_scope,
         "input_dimension": input_dim,
         "head_output_dimension": output_dim,
         "score_parameterization": "free_full_row_rank",

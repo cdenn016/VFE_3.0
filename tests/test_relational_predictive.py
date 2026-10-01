@@ -13,7 +13,7 @@ from tests.test_relational_filtering import _fixture
 from tests.test_relational_integration import _cfg, _tokens
 
 
-@pytest.mark.parametrize("output_scope", ["head", "full"])
+@pytest.mark.parametrize("output_scope", ["full"])
 def test_predictive_dense_reference_and_source_gradients(output_scope: str) -> None:
     mu, sigma, _, frame, _, prior = _fixture()
     ops = RelationalOperators([2, 2], 11, input_scope="full",
@@ -123,7 +123,8 @@ def test_invalid_predictive_combinations_are_rejected() -> None:
     with pytest.raises(ValueError, match="predictive"):
         _cfg(relational_output_scope="full")
     with pytest.raises(ValueError, match="learned content"):
-        _cfg(attention_mode="projected_predictive", relational_identity_content=True)
+        _cfg(attention_mode="projected_predictive", relational_input_scope="full",
+             relational_output_scope="full", relational_identity_content=True)
     with pytest.raises(ValueError, match="predictive|conflict"):
         legacy = asdict(_cfg())
         legacy.pop("attention_mode")

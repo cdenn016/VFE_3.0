@@ -154,9 +154,7 @@ config = dict(
     # Attention execution and projected input/output scopes.
     attention_mode                   = "projected_predictive",  # "transported" | "projected_conditional" | "projected_predictive"
 
-    relational_input_scope           = "full",         # each head reads all K coordinates; "head" is legacy behavior
 
-    relational_output_scope          = "full",                  # transformers: "full": requires predictive_content, legacy: 'head'
 
     attention_residual               = True,   # predictive S/T/O: add the incoming mean
 
@@ -732,10 +730,11 @@ def predict_n_params(cfg: VFE3Config) -> Tuple[int, int]:
         dims = group.irrep_dims
         per_layer = 0
         for d in dims:
-            input_dim = K if cfg.relational_input_scope == "full" else d
+            predictive = cfg.attention_mode == "projected_predictive"
+            input_dim = K if predictive or cfg.relational_input_scope == "full" else d
             per_layer += 2 * d * input_dim                    # independent query/key maps
             if not cfg.relational_identity_content:
-                output_dim = K if cfg.relational_output_scope == "full" else d
+                output_dim = K if predictive or cfg.relational_output_scope == "full" else d
                 per_layer += d * input_dim + output_dim * d   # content T and O
         n += int(cfg.n_layers) * per_layer
     return n, n_gen

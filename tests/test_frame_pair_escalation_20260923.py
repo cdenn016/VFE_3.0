@@ -370,6 +370,7 @@ _ROUTES: Dict[str, Callable[[], VFE3Config]] = {
     "launcher_rope": lambda: _launcher(pos_rotation="rope"),            # rope_on_value=False
     "launcher_rope_on_value": lambda: _launcher(pos_rotation="rope", rope_on_value=True),
     "projected_predictive_rope": _tiny(attention_mode="projected_predictive",
+                                       relational_input_scope="full", relational_output_scope="full",
                                        pos_rotation="rope"),
     "projected_conditional_rope": _tiny(attention_mode="projected_conditional",
                                         pos_rotation="rope", rope_on_value=False,

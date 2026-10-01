@@ -314,9 +314,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     # Attention execution and projected input/output scopes.
     attention_mode                   = "projected_predictive",  # "transported" | "projected_conditional" | "projected_predictive"
 
-    relational_input_scope           = "full",         # each head reads all K coordinates; "head" is legacy behavior
 
-    relational_output_scope          = "full",                  # transformers: "full": requires predictive_content, legacy: 'head'
     predictive_covariance_centering  = False,          # False: historical raw moments; True: center source means to reduce covariance cancellation
     attention_residual               = True,   # predictive S/T/O: add the incoming mean
     
@@ -1026,12 +1024,13 @@ _ATTENTION_REQUIRES = {
     "encode_mode": "per_token", "decode_mode": "linear",
     "cross_couplings": None, "use_priorbank_head_evidence_mixer": False,
     "attention_mode": "projected_predictive", "relational_input_scope": "full",
-    "relational_output_scope": "head",
+    "relational_output_scope": "full",
     "m_relational_score_lr": None, "m_relational_content_lr": None,
     "relational_identity_content": False,
     "use_head_mixer": True,
 }
-_ATTENTION_RELATIONAL_OFF = {"attention_mode": "transported"}
+_ATTENTION_RELATIONAL_OFF = {"attention_mode": "transported", "relational_output_scope": "head",
+                             "predictive_covariance": "passthrough"}
 _ATTENTION_CROSS_CONTROL = {
     **_ATTENTION_RELATIONAL_OFF, "use_head_mixer": False,
     "beta_attention_prior": "causal",
@@ -1046,12 +1045,12 @@ _ATTENTION_CROSS_PAIRS = [
 _ATTENTION_ARMS = {
     "relational_features": [
         {"label": "relational_reference"},
-        {"label": "relational_head_input", "relational_input_scope": "head"},
         # Dropping the learned content maps is defined only on the conditional-update readout;
         # predictive_content requires learned content maps, and the residual in turn requires
         # predictive_content, so this arm pins both of its own.
         {"label": "relational_identity_content", "relational_identity_content": True,
-         "attention_mode": "projected_conditional", "attention_residual": False},
+         "attention_mode": "projected_conditional", "relational_output_scope": "head",
+         "predictive_covariance": "passthrough", "attention_residual": False},
         {"label": "relational_no_head_mixer", "use_head_mixer": False},
         {"label": "relational_frozen_score", "m_relational_score_lr": 0.0},
         {"label": "relational_frozen_content", "m_relational_content_lr": 0.0},
@@ -1071,7 +1070,7 @@ for _attention_name, _attention_arms in _ATTENTION_ARMS.items():
         "configs": _attention_arms,
     }
 SWEEPS["new_attention_features"] = {
-    "description": "All 8 attention arms: relational features and cross-block controls",
+    "description": "All 7 attention arms: relational features and cross-block controls",
     "requires": _ATTENTION_REQUIRES,
     "seeds": NEW_ATTENTION_SEEDS,
     "schedule_seed": 20260913,
