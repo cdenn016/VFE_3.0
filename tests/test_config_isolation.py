@@ -12,7 +12,7 @@ from vfe3.config import VFE3Config
 @pytest.mark.parametrize("factory", [test_config, tiny_config])
 @pytest.mark.parametrize("changes", [
     dict(family="gaussian_full", decode_mode="full_chunked", gauge_transport="off",
-         predictive_covariance="passthrough", sigma_init=0.4, pos_phi="frozen"),
+         predictive_covariance="passthrough", predictive_covariance_centering=True, sigma_init=0.4, pos_phi="frozen"),
     dict(e_step_update="mm_exact", e_step_gradient="detach", lambda_alpha_mode="constant",
          m_decode_mu_lr=None, m_decode_sigma_lr=None, m_pos_phi_lr=None,
          frame_pair_fp64_escalation=True, phi_weight_decay=0.0),

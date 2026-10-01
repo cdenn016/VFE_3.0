@@ -79,6 +79,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'relational_identity_content': False,
     'relational_routing': 'gaussian_kl',
     'predictive_covariance': 'passthrough',
+    'predictive_covariance_centering': False,
     'predictive_covariance_floor': 0.0001,
     'lambda_alpha_mode': 'constant',
     'b0': 1.0,

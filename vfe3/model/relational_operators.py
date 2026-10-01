@@ -37,6 +37,7 @@ class RelationalOperators(nn.Module):
         routing:               str   = "gaussian_kl",
         predictive_covariance: str   = "passthrough",
         predictive_covariance_floor: float = 1e-4,
+        predictive_covariance_centering: bool = False,
     ) -> None:
         super().__init__()
         if not irrep_dims or any(type(d) is not int or d < 1 for d in irrep_dims) or len(set(irrep_dims)) != 1:
@@ -78,6 +79,9 @@ class RelationalOperators(nn.Module):
                 or not math.isfinite(predictive_covariance_floor) or predictive_covariance_floor <= 0.0):
             raise ValueError(
                 f"predictive_covariance_floor must be finite and positive, got {predictive_covariance_floor!r}")
+        if type(predictive_covariance_centering) is not bool:
+            raise ValueError("predictive_covariance_centering must be a bool")
+        self.predictive_covariance_centering = predictive_covariance_centering
         self.predictive_covariance = predictive_covariance
         self.predictive_covariance_floor = float(predictive_covariance_floor)
         self.output_scope = output_scope
@@ -201,10 +205,10 @@ class RelationalOperators(nn.Module):
             b = beta.to(dtype)                                                     # (..., H, N, N)
             eye_h = torch.eye(H, dtype=dtype, device=mu.device)
 
-            # Covariance is invariant to a shared source shift because each beta row sums to one.
-            # Center before T so the second-moment identity does not subtract squared common offsets.
-            centered_xi = xi - xi[..., :1, :]                                      # (..., N, K)
-            values = torch.einsum("hsk,...nk->...nhs", T_hat, centered_xi)         # (..., N, H, d)
+            if self.predictive_covariance_centering:
+                # A shared shift preserves covariance for normalized beta and reduces cancellation.
+                xi = xi - xi[..., :1, :]                                          # (..., N, K)
+            values = torch.einsum("hsk,...nk->...nhs", T_hat, xi)                  # (..., N, H, d)
             TC = torch.einsum("hsk,...nkm->...nhsm", T_hat, C)                     # (..., N, H, d, K)
             source = torch.einsum("...nhsm,gtm->...nhgst", TC, T_hat)             # (..., N, H, H, d, d)
             # c^{hh'}_ij: beta^h on the head diagonal, beta^h beta^h' off it.

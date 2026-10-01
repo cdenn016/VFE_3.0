@@ -27,3 +27,6 @@ The saved runners reproduce the validation setup against the current checkout, s
 
 
 Publication verification: 75 focused CPU cases passed with alternate defaults against the clean origin/main source, with zero failures, errors, or skips. The publication excludes the uncommitted covariance-centering implementation and its test module.
+
+
+Final publication verification after reconciliation with PR #25: 84 focused CPU tests passed with altered defaults, zero failures, errors, or skips; results are in publication-combined.xml.

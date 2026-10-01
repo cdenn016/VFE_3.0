@@ -166,5 +166,13 @@
     "skipped": 0,
     "passed": 75,
     "seconds": 7.134
+  },
+  "publication-combined": {
+    "tests": 84,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "passed": 84,
+    "seconds": 6.477
   }
 }
