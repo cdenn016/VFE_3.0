@@ -408,7 +408,6 @@ config = dict(
                                                  
       
     skip_belief_sigma_update             = False,        # skip the belief-channel sigma E-step update
-    compile_pair_kernel                  = False,       # torch.compile the closed-form pair kernel 
     
     transport_clamp_monitor              = False,
     generate_embedding_figures           = True,

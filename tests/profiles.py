@@ -168,7 +168,6 @@ _CONFIG_VALUES: dict[str, Any] = {
     'grad_accum_steps': 1,
     'min_lr': 0,
     'min_lr_frac': 0.01,
-    'compile_pair_kernel': False,
     'generate_embedding_figures': False,
     'full_cov_kl_backend': 'common_frame',
     '_allow_legacy_dense_decode': False,

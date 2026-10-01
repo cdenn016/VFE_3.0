@@ -352,7 +352,6 @@ def free_energy_value(
 
     include_attention_entropy: bool = True,
     skip_belief_sigma_update:  bool = False,           # accepted-and-ignored iteration-only knob
-    compile_pair_kernel:       bool = False,           # accepted-and-ignored iteration-only knob
     reuse_pairwise_kl_stats:   bool = False,           # accepted-and-ignored iteration-only knob
     transport_mean_per_head:   bool = False,           # HONORED: factored transport_mean contracts per gauge block
     congruence_cond_escalation:    bool = False,   # opt-in conditioning trigger for the fp64 congruence escalation
@@ -703,7 +702,6 @@ def e_step_iteration(
 
     include_attention_entropy: bool = True,
     skip_belief_sigma_update:  bool = False,             # freeze the belief sigma through this iteration (no grad, no retraction)
-    compile_pair_kernel:       bool = False,             # torch.compile the closed-form pair kernel (lazy cache)
     reuse_pairwise_kl_stats:   bool = False,             # opt-in P3 statistics reuse
     gradient_mode:             str  = "filtering",
     family:                    str  = "gaussian_diagonal",
@@ -968,7 +966,6 @@ def e_step_iteration(
                 # entirely and returns grad_sigma=None (the oracle fallback still computes it; the
                 # sigma update below is skipped either way).
                 need_sigma_grad=(not skip_belief_sigma_update),
-                compile_pair_kernel=compile_pair_kernel,
                 reuse_pairwise_kl_stats=reuse_pairwise_kl_stats,
                 # Opt-in unrolled-oracle: make the autograd oracle (non-kernel families) return a
                 # differentiable belief gradient so the through-inference signal reaches the prior, matching

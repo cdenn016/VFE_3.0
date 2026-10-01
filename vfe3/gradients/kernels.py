@@ -32,7 +32,6 @@ from vfe3.gradients.pairwise_stats import diagonal_kl_pair_stats
 from vfe3.numerics import _count_mm_cholesky_fallback, safe_cholesky
 
 _KERNELS: Dict[str, Callable] = {}
-_COMPILED_KERNELS: Dict[str, Callable] = {}   # lazy torch.compile cache (compile_pair_kernel toggle)
 
 
 @dataclass(frozen=True)
@@ -115,7 +114,7 @@ def register_kernel(
             callable=fn, covariance_kinds=resolved_kinds,
             provides_gradient=provides_gradient, provides_mm_exact=provides_mm_exact,
         )
-        _COMPILED_KERNELS.pop(name, None)
+    
         return fn
     return _wrap
 
@@ -323,29 +322,6 @@ def _pair_mass(
     return torch.repeat_interleave(x, reps, dim=-1)
 
 
-def _get_compiled_kernel(name: str) -> Callable:
-    r"""``torch.compile(dynamic=False)``-wrapped kernel for family ``name``, cached ONCE per
-    process (lazy). A wrap-time failure falls back to the eager kernel with a single warning
-    (call-time backend failures are handled at the ``belief_gradients`` call site, since
-    torch.compile typically defers backend errors -- e.g. Windows without triton -- to the
-    first invocation)."""
-    cached = _COMPILED_KERNELS.get(name)
-    if cached is not None:
-        return cached
-    fn = get_kernel(name)
-    try:
-        compiled = torch.compile(fn, dynamic=False)
-    except Exception as exc:
-        import warnings
-        warnings.warn(
-            f"torch.compile unavailable for the pair kernel ({exc!r}); using the eager kernel.",
-            UserWarning, stacklevel=2,
-        )
-        compiled = fn
-    _COMPILED_KERNELS[name] = compiled
-    return compiled
-
-
 def uses_kernel_route(
     *,
     renyi_order:               float,
@@ -431,7 +407,6 @@ def _same_state_masked_alpha_zero(
     kl_max:  float,
     family:            str,
     lambda_alpha_mode: str,
-    compile_pair_kernel: bool,
 ) -> Optional[torch.Tensor]:
     r"""Represent the masked coefficient 0*alpha at q is p without evaluating KL or alpha.
 
@@ -448,7 +423,7 @@ def _same_state_masked_alpha_zero(
     if (mu is not mu_p or sigma is not sigma_p
             or type(mu) is not torch.Tensor or type(sigma) is not torch.Tensor
             or mu.dtype not in (torch.float32, torch.float64) or sigma.dtype != mu.dtype
-            or mu.shape != sigma.shape or compile_pair_kernel
+            or mu.shape != sigma.shape
             or get_family(family) is not DiagonalGaussian
             or get_kernel(family) is not _diag_kl_filtering_kernel
             or get_alpha(lambda_alpha_mode) is not alpha_state_dependent_per_coord
@@ -482,7 +457,6 @@ def belief_gradients(
     include_attention_entropy: bool = True,
     create_graph:              bool = False,   # unroll: oracle returns a differentiable grad (to prior)
     need_sigma_grad:           bool = True,    # False -> kernel skips the sigma pair contraction (grad_sigma None)
-    compile_pair_kernel:       bool = False,   # torch.compile the closed-form kernel (lazy cache; eager fallback)
     reuse_pairwise_kl_stats:   bool = False,   # reuse graph-live diagonal-KL pair statistics on the canonical route
     gradient_mode:             str  = "filtering",
     family:                    str  = "gaussian_diagonal",
@@ -561,7 +535,6 @@ def belief_gradients(
                 include_attention_entropy=include_attention_entropy,
                 create_graph=create_graph,
                 need_sigma_grad=need_sigma_grad,
-                compile_pair_kernel=compile_pair_kernel,
                 reuse_pairwise_kl_stats=reuse_pairwise_kl_stats,
                 gradient_mode=gradient_mode,
                 family=family,
@@ -587,7 +560,7 @@ def belief_gradients(
     fam = get_family(family)
     coef = _same_state_masked_alpha_zero(
         mu, sigma, mu_p, sigma_p, b0, c0, eps, kl_max,
-        family, lambda_alpha_mode, compile_pair_kernel)
+        family, lambda_alpha_mode)
     if coef is None:
         sd = self_divergence_for_alpha(fam(mu, sigma), fam(mu_p, sigma_p), alpha=1.0,
             kl_max=kl_max, eps=eps, divergence_family=divergence_family,
@@ -640,19 +613,6 @@ def belief_gradients(
     if pair_stats is not None:
         kernel_kwargs["pair_inv_sigma_t"] = pair_stats.inv_sigma_t
         kernel_kwargs["pair_delta_tq"] = pair_stats.delta_tq
-    if compile_pair_kernel:
-        try:
-            return _get_compiled_kernel(family)(*kernel_args, **kernel_kwargs)
-        except Exception as exc:
-            # torch.compile defers backend errors (e.g. Windows without triton) to the first
-            # invocation; fall back to the eager kernel PERMANENTLY (cache the eager fn) with a
-            # single warning. The kernel is pure, so a rerun in eager is value-identical.
-            import warnings
-            warnings.warn(
-                f"compiled pair kernel failed ({exc!r}); falling back to the eager kernel.",
-                UserWarning, stacklevel=2,
-            )
-            _COMPILED_KERNELS[family] = get_kernel(family)
     return get_kernel(family)(*kernel_args, **kernel_kwargs)
 
 

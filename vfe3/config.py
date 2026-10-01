@@ -847,9 +847,6 @@ class VFE3Config:
     #                                          m_mu : m_sigma : m_phi base ratios into the tail.
     #                                          0.0 (with min_lr=0) is the pure half-cosine-to-zero path.
 
-    # Regional torch.compile on the closed-form pair kernel (static shapes; matrix_exp/eigh stay
-    # outside). Falls back to eager with a warning when the backend is unavailable (e.g. no triton).
-    compile_pair_kernel:            bool = False
     generate_embedding_figures:     bool = True
     # Exact common-frame KL scoring for eligible flat full-Gaussian transports.
     # Unsupported paths retain the pairwise implementation; default preserves existing runs.
@@ -946,16 +943,6 @@ class VFE3Config:
             # decoder registration and the rank checks below. Pinning 'linear' was a support
             # default with no stated mathematical obstruction -- and the linear readout discards
             # Sigma_q, which is exactly what a full-covariance family should not do at decode.
-            # compile_pair_kernel is deliberately ABSENT from the envelope above: it is INERT here,
-            # not incompatible. Its only consumer is the closed-form pair kernel inside
-            # belief_gradients (kernels.py:669), which this mode never reaches -- with relational
-            # operators present (and 'projected_filtering' always builds them) the E-step takes
-            # either relational_predictive_readout or compute_relational_filtering_gradients
-            # (e_step.py:1125-1149), and belief_gradients sits in the else branch below both. The
-            # knob was previously REJECTED, which turned a no-op into a config error and blocked a
-            # click-to-run config that is otherwise in-envelope; the inertness advisory at the end of
-            # this method now reports it instead. Kept out of the envelope rather than pinned False
-            # so the field stays sweepable without tripping the sweep all-arms-inert guard.
             # gauge_transport is deliberately ABSENT from the envelope above: it is live in this
             # path and is an ablation cell the click-to-run
             # config must be able to reach. The frame is not bypassed here -- the conditional path
@@ -2586,7 +2573,6 @@ class VFE3Config:
             mark(("projected_cov_condition_recovery", "projected_factor_route"),
                  "only read by the projected attention scorers")
         else:
-            mark(("compile_pair_kernel",), "projected attention bypasses the belief-gradient pair kernel")
             if self.relational_routing == "noisy_query":
                 mark(("projected_factor_route",),
                      "the noisy-query cost factors per-pair sums G_q + G_k and keeps the Gram route")
@@ -2885,6 +2871,9 @@ def config_from_serialized(
     if "exp_fp64_mode" in payload and payload.pop("exp_fp64_mode") != "norm":
         raise ValueError(f"serialized config from {source} requests a retired exp_fp64_mode; "
                          "only historical 'norm' is accepted without a numerical-policy change")
+    # compile_pair_kernel was a pure wall-clock toggle: the eager and compiled pair kernels are
+    # value-identical, so a recorded value cannot change a continuation's math. Drop it silently.
+    payload.pop("compile_pair_kernel", None)
     if "relational_mode" in payload or "relational_readout_mode" in payload:
         mode = payload.pop("relational_mode", "off")
         readout = payload.pop("relational_readout_mode", "conditional_update")

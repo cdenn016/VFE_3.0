@@ -67,7 +67,6 @@ def e_step_shared_kwargs(
         clamp_monitor=cfg.transport_clamp_monitor,
         e_step_update=cfg.e_step_update, mm_damping=cfg.mm_damping,
         skip_belief_sigma_update=cfg.skip_belief_sigma_update,
-        compile_pair_kernel=cfg.compile_pair_kernel,
         bch_residual_max=cfg.bch_residual_max,
         reuse_pairwise_kl_stats=True,
     )

@@ -542,7 +542,6 @@ def _filtering_call(
     *,
     lambda_alpha_mode: str,
     reuse:             bool,
-    compile_pair_kernel: bool = False,
 
     irrep_dims: list[int] | None = None,
     log_prior:  torch.Tensor | None = None,
@@ -557,7 +556,6 @@ def _filtering_call(
         lambda_alpha_mode=lambda_alpha_mode,
         irrep_dims=irrep_dims,
         log_prior=log_prior,
-        compile_pair_kernel=compile_pair_kernel,
         reuse_pairwise_kl_stats=reuse,
     )
     assert grad_sigma is not None
@@ -1036,21 +1034,22 @@ def test_p3_filtering_kernel_rejects_asymmetric_optional_statistics(
         )
 
 
-def test_p3_compiled_filtering_receives_statistics_kwargs(
+def test_p3_filtering_receives_statistics_kwargs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    r"""The P3 reuse hoist must actually reach the kernel, not silently fall back to the legacy
+    pair arithmetic (which is value-identical but slower, so an output comparison cannot tell)."""
     inputs = _certified_consumer_inputs()
     expected = _filtering_call(
         inputs,
         lambda_alpha_mode="state_dependent",
         reuse=True,
-        compile_pair_kernel=False,
         irrep_dims=[2, 2],
     )
     captured: dict[str, object] = {}
 
-    def _capturing_compiled_kernel(name: str) -> Callable:
-        eager_kernel = kernels_module.get_kernel(name)
+    def _capturing_get_kernel(name: str) -> Callable:
+        eager_kernel = kernels_module._KERNELS[name]
 
         def _capture(*args: object, **kwargs: object) -> object:
             captured["pair_inv_sigma_t"] = kwargs.get("pair_inv_sigma_t")
@@ -1061,20 +1060,19 @@ def test_p3_compiled_filtering_receives_statistics_kwargs(
 
         return _capture
 
-    monkeypatch.setattr(kernels_module, "_get_compiled_kernel", _capturing_compiled_kernel)
+    monkeypatch.setattr(kernels_module, "get_kernel", _capturing_get_kernel)
     actual = _filtering_call(
         inputs,
         lambda_alpha_mode="state_dependent",
         reuse=True,
-        compile_pair_kernel=True,
         irrep_dims=[2, 2],
     )
 
     assert isinstance(captured["pair_inv_sigma_t"], torch.Tensor)
     assert isinstance(captured["pair_delta_tq"], torch.Tensor)
     assert captured["pair_mask_dtype"] == captured["beta_dtype"]
-    for compiled_value, eager_value in zip(actual, expected):
-        torch.testing.assert_close(compiled_value, eager_value, atol=1e-5, rtol=1e-6)
+    for captured_value, eager_value in zip(actual, expected):
+        torch.testing.assert_close(captured_value, eager_value, atol=1e-5, rtol=1e-6)
 
 
 def _output_vjp(
