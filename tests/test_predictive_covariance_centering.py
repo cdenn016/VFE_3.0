@@ -5,7 +5,7 @@ import inspect
 import pytest
 import torch
 
-from tests.profiles import tiny_config
+from tests.profiles import config_values, tiny_config
 from vfe3.config import ConfigNotice, VFE3Config, config_from_serialized, serialize_config
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.model.model import VFEModel
@@ -54,9 +54,8 @@ def test_missing_centering_field_uses_local_historical_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     parameters = list(inspect.signature(VFE3Config.__init__).parameters)[1:]
-    defaults = list(VFE3Config.__init__.__defaults__)
-    defaults[parameters.index("predictive_covariance_centering")] = False
-    monkeypatch.setattr(VFE3Config.__init__, "__defaults__", tuple(defaults))
+    values = config_values(predictive_covariance_centering=False)
+    monkeypatch.setattr(VFE3Config.__init__, "__defaults__", tuple(values[name] for name in parameters))
     payload = serialize_config(_config(predictive_covariance_centering=True))
     payload.pop("predictive_covariance_centering")
     restored = config_from_serialized(payload, source="legacy centering test")
