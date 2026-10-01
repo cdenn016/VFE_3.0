@@ -1,4 +1,5 @@
 """Small end-to-end reachability, optimizer and snapshot tests on CPU."""
+from tests.profiles import test_config
 from pathlib import Path
 from typing import Any
 
@@ -19,9 +20,11 @@ def _cfg(**overrides: Any) -> VFE3Config:
                   e_phi_lr=0.0, oracle_unroll_grad=True, warmup_steps=0,
                   max_steps=2, log_interval=0, eval_interval=0,
                   pos_phi="learned", use_head_mixer=True, use_block_mlp=True,
-                  block_mlp_expansion=1, attention_mode="projected_conditional")
+                  block_mlp_expansion=1, attention_mode="projected_conditional",
+                  relational_input_scope="head", relational_output_scope="head",
+                  attention_residual=False, predictive_covariance="passthrough")
     values.update(overrides)
-    return VFE3Config(**values)
+    return test_config(**values)
 
 
 def _tokens() -> tuple[torch.Tensor, torch.Tensor]:

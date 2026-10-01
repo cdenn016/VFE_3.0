@@ -1,3 +1,4 @@
+from tests.profiles import test_config
 import pytest
 import torch
 
@@ -111,9 +112,8 @@ def test_block_glk_with_cross_coupling_grows_basis():
 def test_build_group_default_none_is_byte_identical():
     # Wiring cross_couplings into build_group must add NOTHING when unset: the default-None
     # path produces a group whose generators are bit-identical to the direct builder call.
-    from vfe3.config import VFE3Config
     from vfe3.model.model import build_group
-    cfg = VFE3Config(embed_dim=4, n_heads=2, gauge_group="block_glk")
+    cfg = test_config(embed_dim=4, n_heads=2, gauge_group="block_glk")
     assert cfg.cross_couplings is None
     wired = build_group(cfg)
     direct = get_group("block_glk")(4, 2)
@@ -125,12 +125,11 @@ def test_build_group_forwards_cross_couplings():
     # With cross_couplings set, build_group must forward the kwarg, yielding the extended
     # (strictly larger) cross-head basis and the [K] super-block irrep structure. d_head = 2,
     # base = n_heads * d_head^2 = 2*4 = 8; one coupling adds d_head^2 = 4 -> 12.
-    from vfe3.config import VFE3Config
     from vfe3.model.model import build_group
-    base = build_group(VFE3Config(embed_dim=4, n_heads=2, gauge_group="block_glk"))
+    base = build_group(test_config(embed_dim=4, n_heads=2, gauge_group="block_glk"))
     # Headless positional prior: the default per-head causal_alibi bias is fail-closed rejected
     # once cross-coupling collapses the irreps to a single [K] block.
-    coupled = build_group(VFE3Config(embed_dim=4, n_heads=2, gauge_group="block_glk",
+    coupled = build_group(test_config(embed_dim=4, n_heads=2, gauge_group="block_glk",
                                      cross_couplings=[(0, 1)], beta_attention_prior="causal"))
     assert coupled.generators.shape[0] == base.generators.shape[0] + 4
     assert coupled.generators.shape[0] > base.generators.shape[0]   # strictly larger
@@ -201,7 +200,6 @@ def test_full_model_logits_invariant_under_global_gauge():
     # off, since each breaks exact global-gauge invariance by construction: the block LayerNorm
     # (non-equivariant registry entry), the coordinate block MLP, and the frozen-sigma E-step (which
     # would leave the covariances untransformed rather than evolving them).
-    from vfe3.config import VFE3Config
     from vfe3.model.model import VFEModel
 
     def _cfg(**over):
@@ -210,7 +208,7 @@ def test_full_model_logits_invariant_under_global_gauge():
                     pos_rotation="none", use_head_mixer=False, decode_mode="full_chunked",
                     norm_type_block="none", use_block_mlp=False, skip_belief_sigma_update=False)
         base.update(over)
-        return VFE3Config(**base)
+        return test_config(**base)
 
     def _delta_logits(dbl, **over):
         torch.manual_seed(0)

@@ -104,9 +104,7 @@ def test_candidates_keep_the_streamed_ce(monkeypatch, full: bool) -> None:
 
 def test_refinement_config_default_validated_and_inactive_without_the_guard() -> None:
     from tests.profiles import tiny_config
-    from vfe3.config import VFE3Config
-
-    assert VFE3Config.decode_ranking_refinement == "full"
+    assert tiny_config(decode_ranking_refinement="full").decode_ranking_refinement == "full"
     with pytest.raises(ValueError, match="decode_ranking_refinement"):
         tiny_config(decode_ranking_refinement="some")
     assert "decode_ranking_refinement" in tiny_config().inactive_fields()      # guard off in profile

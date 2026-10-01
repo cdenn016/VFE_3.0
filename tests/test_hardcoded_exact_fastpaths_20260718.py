@@ -1,5 +1,7 @@
 """Architectural contract for exact fast paths that are mandatory in production."""
 
+from tests.profiles import test_config
+
 import ast
 from dataclasses import fields
 from pathlib import Path
@@ -123,7 +125,7 @@ def test_production_fastpath_requests_are_literal_true(
 
 
 def test_shared_e_step_kwargs_always_request_pairwise_reuse() -> None:
-    kwargs = e_step_shared_kwargs(VFE3Config(), torch.device("cpu"))
+    kwargs = e_step_shared_kwargs(test_config(), torch.device("cpu"))
     assert kwargs["reuse_pairwise_kl_stats"] is True
 
 
@@ -149,7 +151,7 @@ def test_compact_phi_route_is_automatic(
         "n_e_steps": 1,
     }
     values.update(overrides)
-    model = VFEModel(VFE3Config(**values)).eval()
+    model = VFEModel(test_config(**values)).eval()
     assert model._compact_phi_blocks_enabled() is expected
 
 

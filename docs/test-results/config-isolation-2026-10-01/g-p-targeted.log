@@ -1,0 +1,132 @@
+................                                                         [100%]
+============================== warnings summary ===============================
+tests/test_phi_outer_objective_gradient.py::test_returned_outer_ce_phi_covector_matches_central_differences
+tests/test_phi_outer_objective_gradient.py::test_completed_outer_loss_not_reconstructed_ce_supplies_phi_covector
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - m_relational_score_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - m_relational_content_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - predictive_covariance='passthrough' (only read by attention_mode='projected_predictive')
+    - m_pos_phi_lr=None (only pos_phi='learned' creates the learnable positional table)
+    - m_decode_sigma_lr=None (linear decode has no independent variance table)
+    - decode_temperature_learned=True (read only by the prior-bank KL decode)
+
+tests/test_phi_outer_objective_gradient.py::test_returned_outer_ce_phi_covector_matches_central_differences
+  C:\Users\chris and christine\Desktop\VFE_3.0\vfe3\model\model.py:1511: UserWarning: decode_unigram_prior=True but the unigram_log_prior table is unset (all-zero): the decode degenerates to the uniform prior. Call PriorBank.set_unigram_log_prior(counts) with the (V,) corpus counts.
+    fused_result = decode_registration.fused_ce(
+
+tests/test_phi_outer_objective_gradient.py::test_train_step_consumes_completed_regularized_loss_covector_at_geometry_seam
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - m_relational_score_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - m_relational_content_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - predictive_covariance='passthrough' (only read by attention_mode='projected_predictive')
+    - m_pos_phi_lr=None (only pos_phi='learned' creates the learnable positional table)
+
+tests/test_phi_outer_objective_gradient.py::test_train_step_consumes_completed_regularized_loss_covector_at_geometry_seam
+tests/test_phi_outer_objective_gradient.py::test_geometry_receives_exact_post_unscale_post_clip_covector
+tests/test_phi_outer_objective_gradient.py::test_pullback_group_gradient_accumulation_uses_accumulated_covector
+tests/test_phi_outer_objective_gradient.py::test_rejected_training_attempt_preserves_every_phi_factor_and_clock[nonfinite_gradient]
+tests/test_phi_outer_objective_gradient.py::test_rejected_training_attempt_preserves_every_phi_factor_and_clock[nonfinite_loss]
+tests/test_phi_outer_objective_gradient.py::test_pullback_group_train_step_bypasses_generic_phi_projector
+  <string>:161: UserWarning: phi_weight_decay=0.065 is OVERRIDDEN to 0.0 by the m_phi_update_mode='pullback_group' policy metadata, for every phi-role group (phi_embed, pos_phi_free). The configured value is what gets persisted, so treat the recorded phi_weight_decay as nominal for this run.
+
+tests/test_phi_outer_objective_gradient.py::test_train_step_consumes_completed_regularized_loss_covector_at_geometry_seam
+  <string>:161: UserWarning: prior-bank decode with frozen belief sigma (skip_belief_sigma_update=True): the KL decode READS sigma_q, so a frozen sigma changes predictions (sigma stays at encode). skip_belief_sigma_update is meant for configs where q's sigma is dead (linear decode, no norms); projected routes freeze sigma regardless of that flag.
+
+tests/test_phi_outer_objective_gradient.py::test_train_step_consumes_completed_regularized_loss_covector_at_geometry_seam
+  C:\anaconda\Lib\site-packages\triton\knobs.py:212: UserWarning: Failed to find cuobjdump.exe
+    warnings.warn(f"Failed to find {binary}")
+
+tests/test_phi_outer_objective_gradient.py::test_train_step_consumes_completed_regularized_loss_covector_at_geometry_seam
+  C:\anaconda\Lib\site-packages\triton\knobs.py:212: UserWarning: Failed to find nvdisasm.exe
+    warnings.warn(f"Failed to find {binary}")
+
+tests/test_phi_outer_objective_gradient.py::test_geometry_receives_exact_post_unscale_post_clip_covector
+tests/test_phi_outer_objective_gradient.py::test_pullback_group_gradient_accumulation_uses_accumulated_covector
+tests/test_phi_outer_objective_gradient.py::test_rejected_training_attempt_preserves_every_phi_factor_and_clock[nonfinite_gradient]
+tests/test_phi_outer_objective_gradient.py::test_rejected_training_attempt_preserves_every_phi_factor_and_clock[nonfinite_loss]
+tests/test_phi_outer_objective_gradient.py::test_pullback_group_train_step_bypasses_generic_phi_projector
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - m_relational_score_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - m_relational_content_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - predictive_covariance='passthrough' (only read by attention_mode='projected_predictive')
+    - m_pos_phi_lr=None (only pos_phi='learned' creates the learnable positional table)
+    - m_decode_sigma_lr=None (linear decode has no independent variance table)
+    - decode_temperature_learned=True (read only by the prior-bank KL decode)
+    - lambda_alpha_mode='constant' (the single gradient E-step iteration starts at q = p, where the self-coupling force vanishes)
+
+tests/test_gauge_optim.py::test_default_adamw_one_step_is_byte_identical_to_golden
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - m_relational_score_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - m_relational_content_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - predictive_covariance='passthrough' (only read by attention_mode='projected_predictive')
+    - m_pos_phi_lr=None (only pos_phi='learned' creates the learnable positional table)
+    - decode_ce_stable_reduction=False (only read by nonlinear fused chunked CE)
+    - m_decode_sigma_lr=None (linear decode has no independent variance table)
+    - decode_temperature_learned=True (read only by the prior-bank KL decode)
+    - untie_decode_bank=False (read only by the KL-to-bank decode; the linear decode is untied by construction)
+    - lambda_alpha_mode='constant' (the single gradient E-step iteration starts at q = p, where the self-coupling force vanishes)
+
+tests/test_head_mixer.py::test_optimizer_covers_head_mixer_params
+tests/test_posthoc_gaps_20260928.py::test_run_posthoc_transported_route_records_reasons
+tests/test_posthoc_gaps_20260928.py::test_run_posthoc_transported_route_records_reasons
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - m_relational_score_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - m_relational_content_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - predictive_covariance='passthrough' (only read by attention_mode='projected_predictive')
+    - m_decode_sigma_lr=None (linear decode has no independent variance table)
+    - decode_temperature_learned=True (read only by the prior-bank KL decode)
+
+tests/test_mm_exact_full_covariance_20260807.py::Test3_ModelForwardBackward::test_forward_backward_all_grads_finite
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - m_relational_score_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - m_relational_content_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - predictive_covariance='passthrough' (only read by attention_mode='projected_predictive')
+    - e_q_mu_lr=0.1 (unread under e_step_update='mm_exact'; its step control is mm_damping)
+    - e_q_sigma_lr=0.1 (unread under e_step_update='mm_exact'; its step control is mm_damping)
+
+tests/test_perf_equivalence.py::test_model_forward_matches_frozen_oracle
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - m_relational_score_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - m_relational_content_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - predictive_covariance='passthrough' (only read by attention_mode='projected_predictive')
+    - m_pos_phi_lr=None (only pos_phi='learned' creates the learnable positional table)
+    - m_decode_mu_lr=None (shared encode/decode tables use the encoder rates)
+    - m_decode_sigma_lr=None (shared encode/decode tables use the encoder rates)
+    - decode_bias=False (linear decode only; the prior-bank KL decoders create no output bias)
+
+tests/test_posthoc_gaps_20260928.py::test_run_posthoc_transported_route_records_reasons
+  C:\Users\chris and christine\Desktop\VFE_3.0\vfe3\posthoc\figures.py:87: UserWarning: Attempting to set identical low and high xlims makes transformation singular; automatically expanding.
+    image = ax.imshow(values, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto", interpolation="nearest")
+
+tests/test_posthoc_gaps_20260928.py::test_run_posthoc_transported_route_records_reasons
+  C:\Users\chris and christine\Desktop\VFE_3.0\vfe3\posthoc\figures.py:87: UserWarning: Attempting to set identical low and high ylims makes transformation singular; automatically expanding.
+    image = ax.imshow(values, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto", interpolation="nearest")
+
+tests/test_posthoc_gaps_20260928.py::test_run_posthoc_transported_route_records_reasons
+  C:\Users\chris and christine\Desktop\VFE_3.0\vfe3\posthoc\figures.py:58: UserWarning: constrained_layout not applied because axes sizes collapsed to zero.  Try making figure larger or Axes decorations smaller.
+    fig.savefig(str(temporary), dpi=300, bbox_inches="tight")
+
+tests/test_precision_factor_route_20260924.py::test_factor_route_config_validated_and_inactive_on_transported
+tests/test_projected_condition_recovery_20260923.py::test_config_disabled_validated_and_inactive_on_transported
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - predictive_covariance='passthrough' (only read by attention_mode='projected_predictive')
+    - skip_belief_sigma_update=True (projected routes run no sigma E-step: predictive_content keeps or moment-matches covariance by predictive_covariance, and relational filtering returns no sigma gradient)
+    - m_decode_sigma_lr=None (linear decode has no independent variance table)
+
+tests/test_precision_factor_route_20260924.py::test_factor_route_config_validated_and_inactive_on_transported
+tests/test_projected_condition_recovery_20260923.py::test_config_disabled_validated_and_inactive_on_transported
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - m_relational_score_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - m_relational_content_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - predictive_covariance='passthrough' (only read by attention_mode='projected_predictive')
+    - block_mlp_expansion=2 (only read when use_block_mlp=True)
+    - m_decode_sigma_lr=None (linear decode has no independent variance table)
+    - untie_decode_bank=False (read only by the KL-to-bank decode; the linear decode is untied by construction)
+
+tests/test_precision_factor_route_20260924.py::test_factor_route_config_validated_and_inactive_on_transported
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - skip_belief_sigma_update=True (projected routes run no sigma E-step: predictive_content keeps or moment-matches covariance by predictive_covariance, and relational filtering returns no sigma gradient)
+    - m_decode_sigma_lr=None (linear decode has no independent variance table)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+- generated xml file: C:\Users\chris and christine\Desktop\VFE_3.0\.test-output\config-isolation\g-p-targeted.xml -

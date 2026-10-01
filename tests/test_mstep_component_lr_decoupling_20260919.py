@@ -15,18 +15,14 @@ These contracts pin the inheritance, the decoupled override, the auxiliary repor
 inertness advisories, and the serialized-schema bump those two fields required.
 """
 
-from dataclasses import fields
+from tests.profiles import test_config
+
 from typing import Any
 
 import pytest
 import torch
 
-from vfe3.config import (
-    VFE3Config,
-    ConfigNotice,
-    config_from_serialized,
-    serialize_config,
-)
+from vfe3.config import ConfigNotice, config_from_serialized, serialize_config
 from vfe3.model.model import VFEModel
 from vfe3.train import _learning_rates_by_aux_role, build_optimizer
 
@@ -37,7 +33,7 @@ from tests.test_relational_integration import _cfg
 # train_vfe3.py and ablation.py, so these tests exercise the real configuration, not a corner.
 _LIVE = dict(relational_input_scope="full", use_head_mixer=False, use_block_mlp=False,
              pos_phi="learned", layernorm_affine=True,
-             norm_type_block="layernorm", norm_type_final="layernorm")
+             norm_type_block="layernorm", norm_type_final="layernorm", phi_weight_decay=0.065)
 
 def _groups(**overrides: Any) -> tuple[Any, dict]:
     cfg = _cfg(**_LIVE, **overrides)
@@ -52,15 +48,11 @@ def _groups(**overrides: Any) -> tuple[Any, dict]:
     return optimizer, by_param
 
 
-def test_both_rates_default_to_none() -> None:
-    """None is the inheriting sentinel, so an untouched config keeps the historical rates.
-
-    Asserted on the DECLARED dataclass defaults rather than on a constructed config, so the check
-    cannot be perturbed by unrelated validation on the rest of the field set.
-    """
-    defaults = {field.name: field.default for field in fields(VFE3Config)}
-    assert defaults["m_pos_phi_lr"] is None
-    assert defaults["m_layernorm_lr"] is None
+def test_both_rates_accept_the_inheriting_sentinel() -> None:
+    """None selects inheritance independently of editable experiment defaults."""
+    cfg = _cfg(m_pos_phi_lr=None, m_layernorm_lr=None)
+    assert cfg.m_pos_phi_lr is None
+    assert cfg.m_layernorm_lr is None
 
 
 def test_pos_phi_free_inherits_m_phi_lr_when_unset() -> None:
@@ -109,14 +101,14 @@ def test_layernorm_group_reports_its_own_auxiliary_rate() -> None:
 _NOTICE_BASE = dict(vocab_size=8, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
                     family="gaussian_diagonal", gauge_group="block_glk",
                     skip_belief_sigma_update=True, attention_mode="projected_conditional",
-                    relational_input_scope="full")
+                    relational_input_scope="full", m_pos_phi_lr=None, m_layernorm_lr=None)
 
 
 def _inert_fields(**overrides: Any) -> set:
     import warnings
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        VFE3Config(**{**_NOTICE_BASE, **overrides})
+        test_config(**{**_NOTICE_BASE, **overrides})
     messages = [str(item.message) for item in caught
                 if issubclass(item.category, ConfigNotice)]
     return {name for name in ("m_pos_phi_lr", "m_layernorm_lr")
@@ -136,7 +128,7 @@ def test_inertness_advisories(overrides: dict, expected: set) -> None:
     assert _inert_fields(**overrides) == expected
 
 
-def test_leaving_both_at_the_default_is_silent() -> None:
+def test_inheriting_component_rates_are_silent() -> None:
     """An abstaining config must not be nagged -- the advisory keys on a CHANGED value."""
     assert _inert_fields() == set()
 
@@ -202,6 +194,6 @@ def test_sweep_preserves_explicit_inherited_baseline_arm(
     arms = ablation.make_run_overrides(name)
     controls = [overrides for _, overrides in arms if overrides[name] == inherited]
     assert len(controls) == 1
-    cfg = VFE3Config(**ablation._cell_cfg_dict(controls[0], seed=0))
+    cfg = test_config(**ablation._cell_cfg_dict(controls[0], seed=0))
     assert getattr(cfg, name) == inherited
     assert inherited == (cfg.m_phi_lr if name == "m_pos_phi_lr" else cfg.m_p_mu_lr)

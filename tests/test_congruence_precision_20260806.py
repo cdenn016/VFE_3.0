@@ -12,11 +12,11 @@ the float32 contraction overflows; (e) the config field validates and reaches th
 ``VFEModel``.
 """
 
+from tests.profiles import test_config
 import pytest
 import torch
 
 import vfe3.geometry.transport as T
-from vfe3.config import VFE3Config
 from vfe3.geometry.transport import (
     CompactFactoredTransport,
     full_cov_congruence_precision,
@@ -129,7 +129,7 @@ def test_fp32_escalate_recovers_finiteness_by_escalating():
 
 
 def test_config_default_and_validation():
-    cfg = VFE3Config(vocab_size=32, embed_dim=K, n_heads=H, max_seq_len=8)
+    cfg = test_config(vocab_size=32, embed_dim=K, n_heads=H, max_seq_len=8)
     # The shipped default was deliberately moved to "fp32_escalate": the congruence is the
     # largest stage in the step and its float64 cost is not repaid at the trained operating
     # point. Runs recorded BEFORE that flip were produced under "fp64" -- pass it explicitly
@@ -137,7 +137,7 @@ def test_config_default_and_validation():
     # unaffected by which value is the default.
     assert cfg.full_cov_congruence_precision == "fp32_escalate"
     with pytest.raises(ValueError, match="full_cov_congruence_precision"):
-        VFE3Config(vocab_size=32, embed_dim=K, n_heads=H, max_seq_len=8,
+        test_config(vocab_size=32, embed_dim=K, n_heads=H, max_seq_len=8,
                    full_cov_congruence_precision="bogus")
 
 
@@ -145,6 +145,6 @@ def test_model_construction_sets_the_process_policy():
     from vfe3.model.model import VFEModel
 
     set_full_cov_congruence_precision("fp64")
-    VFEModel(VFE3Config(vocab_size=32, embed_dim=K, n_heads=H, max_seq_len=8,
+    VFEModel(test_config(vocab_size=32, embed_dim=K, n_heads=H, max_seq_len=8,
                         full_cov_congruence_precision="fp32_escalate"))
     assert full_cov_congruence_precision() == "fp32_escalate"

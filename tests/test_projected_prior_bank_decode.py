@@ -11,6 +11,8 @@ filtering returns no sigma gradient), which is reported separately by inactive_f
 """
 from __future__ import annotations
 
+from tests.profiles import test_config
+
 import os
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -20,7 +22,6 @@ import pytest
 import torch
 
 from tests.profiles import tiny_config
-from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 
 torch.set_num_threads(1)
@@ -57,7 +58,7 @@ def _projected_surface(**overrides: object) -> dict:
 
 def test_projected_predictive_admits_full_chunked_and_unpinned_sigma_flag() -> None:
     """decode_mode='full_chunked' and skip_belief_sigma_update=False construct under projected_predictive."""
-    cfg = VFE3Config(**_projected_surface())
+    cfg = test_config(**_projected_surface())
     assert cfg.decode_mode == "full_chunked"
     assert cfg.skip_belief_sigma_update is False
     assert cfg.family == "gaussian_full"
@@ -66,13 +67,13 @@ def test_projected_predictive_admits_full_chunked_and_unpinned_sigma_flag() -> N
 
 def test_projected_predictive_admits_family_chunked() -> None:
     """family_chunked is admitted alongside full_chunked for a full-covariance family."""
-    cfg = VFE3Config(**_projected_surface(decode_mode="family_chunked"))
+    cfg = test_config(**_projected_surface(decode_mode="family_chunked"))
     assert cfg.decode_mode == "family_chunked"
 
 
 def test_projected_predictive_admits_diagonal_chunked_for_diagonal_family() -> None:
     """diagonal_chunked is admitted when paired with a diagonal-covariance family."""
-    cfg = VFE3Config(**_projected_surface(
+    cfg = test_config(**_projected_surface(
         decode_mode="diagonal_chunked", family="gaussian_diagonal",
     ))
     assert cfg.decode_mode == "diagonal_chunked"
@@ -81,7 +82,7 @@ def test_projected_predictive_admits_diagonal_chunked_for_diagonal_family() -> N
 
 def test_projected_predictive_admits_skip_belief_sigma_update_true() -> None:
     """The frozen-sigma ablation remains reachable alongside the prior-bank decoders."""
-    cfg = VFE3Config(**_projected_surface(skip_belief_sigma_update=True))
+    cfg = test_config(**_projected_surface(skip_belief_sigma_update=True))
     assert cfg.skip_belief_sigma_update is True
 
 
@@ -91,7 +92,7 @@ def test_projected_predictive_full_chunked_tiny_train_step() -> None:
     Fused chunked CE returns logits=None by design (model.py:1321) -- the (B, N, V)
     tensor is never materialized -- so the assertion is on the loss, not the logits.
     """
-    cfg = VFE3Config(**_projected_surface())
+    cfg = test_config(**_projected_surface())
     torch.manual_seed(0)
     model = VFEModel(cfg)
     tokens = torch.randint(0, cfg.vocab_size, (2, 4))
@@ -108,7 +109,7 @@ def test_projected_filtering_skip_false_does_not_typeerror() -> None:
     relational filtering returns grad_sigma=None by signature; the E-step now freezes
     sigma when nat_sigma is None instead of retracting with a None step.
     """
-    cfg = VFE3Config(**_projected_surface(
+    cfg = test_config(**_projected_surface(
         attention_mode="projected_conditional",
         relational_output_scope="head",
         attention_residual=False,
@@ -128,6 +129,9 @@ def test_transported_linear_still_constructs() -> None:
     """The pure-path (transported + linear) profile is unchanged by the envelope edit."""
     cfg = tiny_config(
         attention_mode="transported",
+        predictive_covariance="passthrough",
+        attention_residual=False,
+        relational_output_scope="head",
         decode_mode="linear",
         skip_belief_sigma_update=True,
     )
@@ -138,12 +142,12 @@ def test_transported_linear_still_constructs() -> None:
 def test_projected_still_rejects_non_gaussian_family() -> None:
     """The Gaussian-family admission on the projected route is retained."""
     with pytest.raises(ValueError, match="unsupported projected_filtering configuration"):
-        VFE3Config(**_projected_surface(family="laplace_diagonal"))
+        test_config(**_projected_surface(family="laplace_diagonal"))
 
 
 def test_projected_full_chunked_still_rejects_cov_kind_mismatch() -> None:
     """full_chunked requires a full-covariance query family; the rank check is not bypassed."""
     with pytest.raises(ValueError, match="rank-incompatible"):
-        VFE3Config(**_projected_surface(
+        test_config(**_projected_surface(
             decode_mode="full_chunked", family="gaussian_diagonal",
         ))

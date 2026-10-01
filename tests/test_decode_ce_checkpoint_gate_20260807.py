@@ -20,13 +20,14 @@ sites (prior_bank.py's only five checkpoint uses), so the fix -- a shared
 all five for consistency, not just the dispatched target.
 """
 
+from tests.profiles import test_config
 import warnings
 
 import pytest
 import torch
 
 import vfe3.model.prior_bank as prior_bank_module
-from vfe3.config import ConfigNotice, VFE3Config
+from vfe3.config import ConfigNotice
 from vfe3.model.prior_bank import (
     DECODE_CE_CHECKPOINT_AUTO_BYTES,
     PriorBank,
@@ -251,17 +252,17 @@ def test_no_grad_never_checkpoints_in_any_mode(monkeypatch, mode):
 # 6. Config validation: invalid value raises; default is 'auto'.
 # ---------------------------------------------------------------------------
 def test_config_decode_ce_checkpoint_default_is_auto():
-    assert VFE3Config().decode_ce_checkpoint == "auto"
+    assert test_config().decode_ce_checkpoint == "auto"
 
 
 def test_config_decode_ce_checkpoint_rejects_invalid_value():
     with pytest.raises(ValueError, match="decode_ce_checkpoint"):
-        VFE3Config(decode_ce_checkpoint="sometimes")
+        test_config(decode_ce_checkpoint="sometimes")
 
 
 @pytest.mark.parametrize("value", ["auto", "always", "never"])
 def test_config_decode_ce_checkpoint_accepts_valid_values(value):
-    VFE3Config(decode_ce_checkpoint=value)
+    test_config(decode_ce_checkpoint=value)
 
 
 def test_config_decode_ce_checkpoint_inert_when_decode_route_has_no_fused_ce():
@@ -271,7 +272,7 @@ def test_config_decode_ce_checkpoint_inert_when_decode_route_has_no_fused_ce():
     # routes the belief gradient to the detached oracle" advisory this family/decode_mode pair
     # also triggers, so pytest.warns below asserts on decode_ce_checkpoint specifically.
     with pytest.warns(ConfigNotice, match="decode_ce_checkpoint"):
-        VFE3Config(decode_mode="full", family="gaussian_full",
+        test_config(decode_mode="full", family="gaussian_full",
                    _allow_legacy_dense_decode=True,
                    oracle_unroll_grad=True, decode_ce_checkpoint="always")
 
@@ -283,19 +284,26 @@ def test_config_decode_ce_checkpoint_silent_at_default_even_when_inert():
     # detached-oracle advisory this family/decode_mode pair also triggers (see test above), and
     # skip_belief_sigma_update=False silences the frozen-sigma correctness advisory that the
     # current default skip_belief_sigma_update=True legitimately raises under a prior-bank decode.
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        VFE3Config(decode_mode="full", family="gaussian_full",
-                   _allow_legacy_dense_decode=True,
-                   oracle_unroll_grad=True, skip_belief_sigma_update=False)
+    from vfe3.config import VFE3Config
+    selected = VFE3Config.__dataclass_fields__["decode_ce_checkpoint"].default
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", ConfigNotice)
+        cfg = test_config(decode_mode="full", family="gaussian_full",
+                          _allow_legacy_dense_decode=True,
+                          oracle_unroll_grad=True, skip_belief_sigma_update=False,
+                          decode_ce_checkpoint=selected)
+    assert "decode_ce_checkpoint" in cfg.inactive_fields()
+    assert not any("decode_ce_checkpoint=" in str(item.message) for item in caught)
 
 
 def test_config_decode_ce_checkpoint_live_under_full_chunked():
     # The dispatched target and the live train_vfe3.py decode_mode: no inert warning here.
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", ConfigNotice)
-        VFE3Config(decode_mode="full_chunked", family="gaussian_full",
-                   oracle_unroll_grad=True, decode_ce_checkpoint="always")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", ConfigNotice)
+        cfg = test_config(decode_mode="full_chunked", family="gaussian_full",
+                          oracle_unroll_grad=True, decode_ce_checkpoint="always")
+    assert "decode_ce_checkpoint" not in cfg.inactive_fields()
+    assert not any("decode_ce_checkpoint=" in str(item.message) for item in caught)
 
 
 # ---------------------------------------------------------------------------

@@ -8,6 +8,8 @@ batch axis, and there is no cross-sequence dependency in the E-step (the ``for b
 range(B)`` loop), so ``(1/K) * sum_k mean_k == mean_full`` for equal-sized microbatches.
 """
 
+from tests.profiles import test_config
+
 import math
 from types import SimpleNamespace
 
@@ -24,7 +26,7 @@ def _cfg(**over) -> VFE3Config:
                 n_e_steps=1, e_q_mu_lr=0.3, e_phi_lr=0.0,
                 m_p_mu_lr=0.05, m_p_sigma_lr=0.01, m_phi_lr=0.0, warmup_steps=2, max_steps=20)
     base.update(over)
-    return VFE3Config(**base)
+    return test_config(**base)
 
 
 def _full_batch_no_ignore(B=8, N=8, V=6, seed=0):
@@ -214,12 +216,12 @@ def test_train_loop_runs_under_grad_accum():
 
 
 def test_config_grad_accum_steps_validation():
-    assert VFE3Config().grad_accum_steps == 1                  # default OFF
-    VFE3Config(grad_accum_steps=4)                             # accepted
+    assert test_config(grad_accum_steps=1).grad_accum_steps == 1
+    test_config(grad_accum_steps=4)                             # accepted
     with pytest.raises(ValueError):
-        VFE3Config(grad_accum_steps=0)
+        test_config(grad_accum_steps=0)
     with pytest.raises(ValueError):
-        VFE3Config(grad_accum_steps=-3)
+        test_config(grad_accum_steps=-3)
 
 
 def test_uneven_microbatch_token_counts_warns():

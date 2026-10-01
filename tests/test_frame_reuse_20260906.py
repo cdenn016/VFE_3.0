@@ -1,4 +1,5 @@
 """Tiny numerical and dispatch regressions for S22 diagnostics and S18 factor reuse."""
+from tests.profiles import test_config
 from collections.abc import Iterator
 import importlib
 import os
@@ -8,7 +9,6 @@ import pytest
 import torch
 
 from vfe3 import metrics
-from vfe3.config import VFE3Config
 from vfe3.geometry import transport
 from vfe3.geometry.groups import GaugeGroup, get_group
 from vfe3.model.model import VFEModel
@@ -154,7 +154,7 @@ def test_unique_table_directional_finite_difference(device: torch.device) -> Non
 @pytest.mark.parametrize('fallback', ['none', 'encoder', 'basis', 'capture', 'position', 'int32', 'public', 'empty_capture'])
 def test_builtin_model_gate(fallback: str, device: torch.device, monkeypatch: pytest.MonkeyPatch) -> None:
     prior_bank = importlib.import_module('vfe3.model.prior_bank')
-    cfg = VFE3Config(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=4,
+    cfg = test_config(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=4,
                     batch_size=1, n_layers=1, n_e_steps=1, decode_mode='linear',
                     pos_phi='learned', e_phi_lr=0.0, block_mlp_expansion=2, amp_dtype=None)
     model = VFEModel(cfg).to(device)

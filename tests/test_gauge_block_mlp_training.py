@@ -1,13 +1,13 @@
+from tests.profiles import test_config
 import pytest
 import torch
 
-from vfe3.config import VFE3Config
 from vfe3.model.block_mlp import GaugeGateBlockMLP
 from vfe3.model.model import VFEModel
 
 
 def _training_cfg(mode, covariance):
-    return VFE3Config(
+    return test_config(
         vocab_size=17,
         embed_dim=4,
         n_heads=2,
@@ -69,7 +69,7 @@ def _diagonal_cfg(mode, **overrides):
         skip_belief_sigma_update=False,
     )
     values.update(overrides)
-    return VFE3Config(**values)
+    return test_config(**values)
 
 
 def _assert_diagonal_gate_training_gradients(model):

@@ -1,4 +1,5 @@
 """Tiny final-loss covariance consumer and gradient regressions for S09."""
+from tests.profiles import test_config
 from collections.abc import Iterator
 from dataclasses import replace
 import importlib
@@ -7,7 +8,6 @@ import os
 import pytest
 import torch
 
-from vfe3.config import VFE3Config
 from vfe3.families.gaussian import DiagonalGaussian
 from vfe3.model.head_mixer import HeadMixer
 from vfe3.model.model import VFEModel
@@ -36,7 +36,7 @@ def _model(device: torch.device, **overrides: object) -> VFEModel:
                    norm_type_block="none", norm_type_final="none", e_phi_lr=0.0,
                    amp_dtype=None)
     torch.manual_seed(27)
-    model = VFEModel(VFE3Config(**{**options, **overrides})).to(device)
+    model = VFEModel(test_config(**{**options, **overrides})).to(device)
     with torch.no_grad():
         for delta in model.head_mixer.mixer_deltas:
             delta.copy_(torch.randn_like(delta) * 0.07)

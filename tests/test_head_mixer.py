@@ -8,10 +8,11 @@ UNTIED per-block gauge the mixer breaks strict gauge equivariance (exact at init
 drifts) -- user-accepted; this suite pins the algebra and the wiring, not equivariance.
 """
 
+from tests.profiles import test_config
+
 import pytest
 import torch
 
-from vfe3.config import VFE3Config
 from vfe3.model.head_mixer import HeadMixer
 from vfe3.model.model import VFEModel
 from vfe3.train import build_optimizer
@@ -99,9 +100,9 @@ def test_requires_at_least_two_equal_blocks():
         HeadMixer([2, 3])                                    # unequal blocks: kron(A, I_d) ill-defined
 
 
-def test_config_use_head_mixer_default_off_and_toggles():
-    assert VFE3Config().use_head_mixer is False
-    assert VFE3Config(use_head_mixer=True).use_head_mixer is True
+def test_config_use_head_mixer_toggles():
+    assert test_config(use_head_mixer=False).use_head_mixer is False
+    assert test_config(use_head_mixer=True).use_head_mixer is True
 
 
 def test_model_head_mixer_is_noop_at_init_and_trains():
@@ -109,9 +110,9 @@ def test_model_head_mixer_is_noop_at_init_and_trains():
                 n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0)
     tok = torch.randint(0, 20, (3, 5))
     torch.manual_seed(0)
-    m_off = VFEModel(VFE3Config(**base, use_head_mixer=False))
+    m_off = VFEModel(test_config(**base, use_head_mixer=False))
     torch.manual_seed(0)
-    m_on = VFEModel(VFE3Config(**base, use_head_mixer=True))
+    m_on = VFEModel(test_config(**base, use_head_mixer=True))
     assert m_off.head_mixer is None and m_on.head_mixer is not None
     assert torch.allclose(m_off(tok), m_on(tok), atol=1e-6)  # identity init -> same logits at step 0
     targets = torch.randint(0, 20, (3, 5))
@@ -121,11 +122,12 @@ def test_model_head_mixer_is_noop_at_init_and_trains():
 
 
 def test_optimizer_covers_head_mixer_params():
-    cfg = VFE3Config(
+    cfg = test_config(
         vocab_size=20,
         embed_dim=4,
         n_heads=2,
         use_head_mixer=True,
+        decode_temperature_learned=True,
         m_p_mu_lr=0.0123,
         m_head_mixer_lr=0.0022,
     )
@@ -182,5 +184,5 @@ def test_head_mixer_rejected_for_single_block_group_at_model_build():
     # glk / so_k resolve to a single irrep block (nothing to mix); requesting the mixer there
     # must fail at construction, not silently no-op or crash at the first forward.
     with pytest.raises(ValueError):
-        VFEModel(VFE3Config(vocab_size=10, embed_dim=4, n_heads=2, max_seq_len=3,
+        VFEModel(test_config(vocab_size=10, embed_dim=4, n_heads=2, max_seq_len=3,
                             gauge_group="glk", use_head_mixer=True))

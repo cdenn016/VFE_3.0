@@ -1,3 +1,4 @@
+from tests.profiles import test_config
 import pytest
 import torch
 from torch.distributions import MultivariateNormal, kl_divergence
@@ -100,7 +101,7 @@ def _tiny_cfg(**overrides) -> VFE3Config:
         block_mlp_expansion=2,
     )
     config.update(overrides)
-    return VFE3Config(**config)
+    return test_config(**config)
 
 
 @pytest.mark.parametrize("overrides", [

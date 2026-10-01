@@ -14,13 +14,13 @@ is exactly the tensor the extractors return.
 
 Device-agnostic (CPU default; set VFE3_TEST_DEVICE=cuda for the GPU).
 """
+from tests.profiles import test_config
 import os
 
 import pytest
 import torch
 
 from vfe3.belief import BeliefState
-from vfe3.config import VFE3Config
 from vfe3.model.canonical_content import CanonicalFrameContext
 from vfe3.model.model import VFEModel
 from vfe3.model.stack import vfe_stack
@@ -70,7 +70,7 @@ def test_extractor_anchor_is_noop_on_default_config():
     # Regression guard: on the default config the fixed extractors reproduce the pre-fix
     # replay byte-for-byte.
     torch.manual_seed(0)
-    cfg = VFE3Config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=8)
+    cfg = test_config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=8)
     model = VFEModel(cfg).to(DEVICE)
     model.eval()
     tokens = torch.randint(0, 16, (2, 8), device=DEVICE)
@@ -90,7 +90,7 @@ def _rope_model() -> VFEModel:
     extractor replay has to reproduce; construction emits the documented gauge warning.
     """
     with pytest.warns(UserWarning, match="gauge"):
-        cfg = VFE3Config(
+        cfg = test_config(
             vocab_size=16,
             embed_dim=4,
             n_heads=2,
@@ -160,7 +160,7 @@ def _projected_extract_model(**overrides: object) -> VFEModel:
         max_steps=1,
     )
     values.update(overrides)
-    cfg = VFE3Config(**values)
+    cfg = test_config(**values)
     torch.manual_seed(151)
     return VFEModel(cfg).to(DEVICE)
 
@@ -243,7 +243,7 @@ def test_projected_across_layer_trace_matches_production_snapshot() -> None:
 
 
 def test_across_layer_trace_with_mlp_dropout_is_rng_neutral_and_restores_mode() -> None:
-    cfg = VFE3Config(
+    cfg = test_config(
         vocab_size=13,
         embed_dim=4,
         n_heads=2,
@@ -332,7 +332,7 @@ def test_refine_transport_sharing_is_derived_from_exact_eligibility(
         "e_phi_lr": 0.0,
     }
     values.update(overrides)
-    model = VFEModel(VFE3Config(**values)).to(DEVICE).eval()
+    model = VFEModel(test_config(**values)).to(DEVICE).eval()
     tokens = torch.tensor([[1, 3, 5]], dtype=torch.long, device=DEVICE)
     shared_builds = 0
     original = model._build_shared_flat_transport
@@ -395,7 +395,7 @@ def test_projected_inference_record_reuses_same_forward_frame_for_decode(
 
 def test_active_mlp_extract_replay_matches_forward() -> None:
     """Extractor replay must include every trained, untied post-block MLP."""
-    cfg = VFE3Config(
+    cfg = test_config(
         vocab_size=11, embed_dim=4, n_heads=2, max_seq_len=4,
         n_layers=2, n_e_steps=1, e_phi_lr=0.0, use_block_mlp=True,
     )

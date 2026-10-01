@@ -9,6 +9,7 @@ and projection skip under gauge_transport='off', the per_type_hidden_bias optimi
 host-side terminal snapshot.
 """
 
+from tests.profiles import test_config
 import csv
 import dataclasses
 import json
@@ -80,7 +81,7 @@ def _vcfg(**over: Any) -> VFE3Config:
     values.update(over)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        return VFE3Config(**values)
+        return test_config(**values)
 
 
 def _vmodel(cfg: VFE3Config, seed: int = 0) -> VFEModel:
@@ -493,7 +494,7 @@ def test_steps_for_device_hours_and_the_width_ladder_rule(tmp_path: Path) -> Non
 # ----------------------------------------------------------------------------------------------
 
 def test_frozen_tables_are_reported_apart_under_identity_frames(tmp_path: Path) -> None:
-    cfg = _vcfg(gauge_transport="off")
+    cfg = _vcfg(gauge_transport="off", decode_temperature_learned=True)
     model = _vmodel(cfg)
     phi = model.prior_bank.phi_embed
     assert not phi.requires_grad and getattr(model, "pos_phi_free", None) is None

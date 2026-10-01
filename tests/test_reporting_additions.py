@@ -14,6 +14,7 @@ r"""Tests for the 2026-06-28 reporting build-out (surfacing already-logged diagn
 
 Device-agnostic (CPU). Figures use the Agg backend.
 """
+from tests.profiles import config_values, test_config
 import csv as _csv
 import hashlib
 import json
@@ -32,7 +33,7 @@ import torch
 
 import ablation
 import scaling_analysis
-from vfe3.config import VFE3Config, serialize_config
+from vfe3.config import serialize_config
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import (
     RunArtifacts,
@@ -45,6 +46,13 @@ from vfe3.train import train
 from vfe3.viz import figures as figs
 
 DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
+
+
+@pytest.fixture(autouse=True)
+def _local_reporting_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(scaling_analysis, "CONFIG", dict(
+        input_dir="unused-test-reporting-input", with_offset=True,
+        n_bootstrap=0, min_points=2, force_accept_code_identity_drift=False))
 
 
 def _hist(keys, n=30, nan_every=0):
@@ -121,7 +129,7 @@ def test_dashboard_drops_absent_and_empty():
 
 def test_save_figures_emits_dashboards(tmp_path):
     torch.manual_seed(0)
-    cfg = VFE3Config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=2, batch_size=2)
+    cfg = test_config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=2, batch_size=2)
     model = VFEModel(cfg).to(DEVICE)
     art = RunArtifacts(str(tmp_path), cfg, model, dataset="synthetic", device=str(DEVICE))
     keys = ("holonomy_wilson", "cocycle_residual", "fisher_trace_mean", "belief_cond_p95",
@@ -429,7 +437,7 @@ def _finalize_ns(**over):
 
 def test_finalize_run_forwards_disabled_embedding_policy_to_figure_driver(tmp_path, monkeypatch):
     torch.manual_seed(0)
-    real_cfg = VFE3Config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=2,
+    real_cfg = test_config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=2,
                           batch_size=2)
     model = VFEModel(real_cfg).to(DEVICE)
     art = RunArtifacts(str(tmp_path), real_cfg, model, dataset="synthetic", device=str(DEVICE))
@@ -445,7 +453,7 @@ def test_finalize_run_forwards_disabled_embedding_policy_to_figure_driver(tmp_pa
 
 def test_finalize_run_forwards_enabled_embedding_policy_to_figure_driver(tmp_path, monkeypatch):
     torch.manual_seed(0)
-    real_cfg = VFE3Config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=2,
+    real_cfg = test_config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=2,
                           batch_size=2)
     model = VFEModel(real_cfg).to(DEVICE)
     art = RunArtifacts(str(tmp_path), real_cfg, model, dataset="synthetic", device=str(DEVICE))
@@ -463,7 +471,7 @@ def test_finalize_run_forwards_enabled_embedding_policy_to_figure_driver(tmp_pat
 
 def test_train_logs_held_out_geometry(tmp_path):
     torch.manual_seed(0)
-    cfg = VFE3Config(vocab_size=32, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=4,
+    cfg = test_config(vocab_size=32, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=4,
                      log_interval=2, eval_interval=2, batch_size=2)
     model = VFEModel(cfg).to(DEVICE)
     batches = [(torch.randint(0, 32, (2, 8), device=DEVICE),
@@ -545,7 +553,7 @@ def _write_scaling_analysis_run(
 ):
     run = root / route / label / f"s{seed}"
     run.mkdir(parents=True)
-    cfg = VFE3Config(
+    cfg = test_config(
         seed=seed,
         vocab_size=16,
         embed_dim=4,
@@ -982,7 +990,7 @@ def _write_scaling_validation_run(root, *, route, label, embed_dim, n_params, te
     (feeding the two PB-07 registered validation figures)."""
     run = root / route / label / f"s{seed}"
     run.mkdir(parents=True)
-    cfg = VFE3Config(
+    cfg = test_config(
         seed=seed,
         vocab_size=16,
         embed_dim=embed_dim,
@@ -1125,6 +1133,21 @@ def test_ablation_renderer_dispatches_registered_figures_by_name_and_keeps_legac
     monkeypatch.setattr(ablation, "_git_code_identity", lambda: dict(_FIXED_ABLATION_CODE_IDENTITY))
     monkeypatch.setattr(ablation, "cache_source_identity", _fake_ablation_source_ok)
     monkeypatch.setattr(ablation, "_cleanup", lambda: None)
+
+    monkeypatch.setattr(ablation, "BASELINE_CONFIG", config_values(
+        max_seq_len=8, use_head_mixer=True, attention_mode="projected_predictive",
+        family="gaussian_full", decode_mode="full_chunked", e_phi_lr=0.0,
+        max_steps=2, warmup_steps=1))
+    monkeypatch.setattr(ablation, "SWEEPS", {"component_ablation_forest": {
+        "description": "paired-token component ablation forest",
+        "configs": [{"label": "baseline"}, {"label": "head_mixer_off", "use_head_mixer": False}],
+        "paired_token_bootstrap": True, "forest_baseline_label": "baseline"}})
+    monkeypatch.setattr(ablation, "CONFIG", dict(
+        list_only=False, sweep="component_ablation_forest", device="cpu",
+        dataset="wikitext-103", max_tokens=None, max_steps=None,
+        stop_after_steps=None, seed=6, target_n_params=100,
+        max_param_relative_deviation=0.02, resume=False, output_dir=str(tmp_path)))
+    monkeypatch.setattr(ablation, "DATA_SEED", 3)
 
     forest_offsets = {"baseline": 0.0, "head_mixer_off": 0.4}
 

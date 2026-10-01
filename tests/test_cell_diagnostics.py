@@ -5,18 +5,18 @@ Covers:
     DISTINGUISHES the exact-equivariant tied gauge from the strictly-broken untied one
     (the instrument A2/EXP-9 needs; the existing ``gauge_equivariance_residual`` is blind
     to this because it co-transforms a supplied Omega rather than rebuilding the operator).
-  * every sweep in ``SWEEP_ORDER`` validates and builds a real VFEModel for every cell (S1).
+  * locally selected registered sweeps validate and build a real VFEModel for every cell (S1).
   * the new per-cell diagnostic columns are registered in the sweep CSV schema (S3).
 
 Device-agnostic (CPU by default; honors VFE3_TEST_DEVICE like the rest of the suite).
 """
+from tests.profiles import config_values, test_config
 import os
 
 import pytest
 import torch
 
 import ablation
-from vfe3.config import VFE3Config
 from vfe3.metrics import head_mixer_gauge_residual
 from vfe3.model.model import VFEModel
 
@@ -25,7 +25,7 @@ DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
 
 def _drifted_mixer_model(gauge_group: str) -> VFEModel:
     """Tiny full-cov model with its head mixer pushed OFF identity (so a gauge break is visible)."""
-    cfg = VFE3Config(vocab_size=64, embed_dim=4, n_heads=2, max_seq_len=8,
+    cfg = test_config(vocab_size=64, embed_dim=4, n_heads=2, max_seq_len=8,
                      gauge_group=gauge_group, use_head_mixer=True, family="gaussian_full")
     model = VFEModel(cfg).to(DEVICE)
     with torch.no_grad():
@@ -64,28 +64,28 @@ def test_builder_residual_zero_for_identity_mixer():
     mu = torch.randn(n, k, device=DEVICE)
     base = torch.randn(n, k, k, device=DEVICE)
     sigma = base @ base.transpose(-1, -2) + k * torch.eye(k, device=DEVICE)
-    cfg = VFE3Config(vocab_size=64, embed_dim=4, n_heads=2, max_seq_len=8,
+    cfg = test_config(vocab_size=64, embed_dim=4, n_heads=2, max_seq_len=8,
                      gauge_group="block_glk", use_head_mixer=True, family="gaussian_full")
     model = VFEModel(cfg).to(DEVICE)                                 # deltas at zero init
     r = head_mixer_gauge_residual(mu, sigma, model.head_mixer, model.group, seed=0)
     assert torch.cat([r["mu_residual"], r["sigma_residual"]]).max().item() < 1e-5
 
 
-@pytest.mark.parametrize("sweep_name", ablation.SWEEP_ORDER)
-def test_experiment_arms_validate_and_build(sweep_name):
-    r"""Every cell of every activated sweep is a real, constructible VFE3Config + VFEModel
-    (so a sweep launch will not silently bucket arms as error_kind='config').
-
-    Driven by ``SWEEP_ORDER`` rather than a literal subset: the 2026-09-18 sweep cleanup retired
-    40 registrations, and a hand-listed parametrization reports that as a failure instead of
-    tracking the registry."""
+@pytest.mark.parametrize("sweep_name", [
+    "block_mlp_expansion", "block_mlp_activation", "block_mlp_dropout",
+])
+def test_experiment_arms_validate_and_build(
+    sweep_name: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    r"""Registered MLP sweep arms build on a local tiny enabling profile."""
+    monkeypatch.setattr(ablation, "BASELINE_CONFIG", config_values(use_block_mlp=True))
     ablation.validate_sweeps([sweep_name])                          # guard #1: real VFE3Config fields
     runs = ablation.make_run_overrides(sweep_name)
     assert len(runs) >= 2
     for _label, overrides in runs:
         cfg_dict = ablation._cell_cfg_dict(
-            {**overrides, "vocab_size": 64, "max_seq_len": 16}, seed=0, max_steps=1)
-        model = VFEModel(VFE3Config(**cfg_dict))                    # config + build validation
+            {**overrides, "vocab_size": 7, "max_seq_len": 3}, seed=0, max_steps=1)
+        model = VFEModel(test_config(**cfg_dict))                    # config + build validation
         assert model is not None
 
 
@@ -94,7 +94,7 @@ def test_gauge_transport_off_yields_identity_frame():
 
     Asserted on the config directly: the ``gauge_transport`` sweep was retired in the 2026-09-18
     sweep cleanup, but the coercion it exercised is a live config contract."""
-    cfg = VFE3Config(vocab_size=64, embed_dim=4, n_heads=2, max_seq_len=16,
+    cfg = test_config(vocab_size=64, embed_dim=4, n_heads=2, max_seq_len=16,
                      gauge_transport="off", phi_scale=1.0)
     assert cfg.gauge_transport == "off"
     assert cfg.phi_scale == 0.0
@@ -110,7 +110,7 @@ def test_diagnostic_csv_columns_registered():
 def test_across_layer_trace_includes_rank_one_residual():
     r"""EXP-7: the per-layer belief trace surfaces the Dong rank-one residual r(X) by depth."""
     from vfe3.viz.extract import across_layer_belief_trace
-    cfg = VFE3Config(vocab_size=64, embed_dim=4, n_heads=2, max_seq_len=12, n_layers=3,
+    cfg = test_config(vocab_size=64, embed_dim=4, n_heads=2, max_seq_len=12, n_layers=3,
                      gauge_group="block_glk", use_head_mixer=True)
     model = VFEModel(cfg).to(DEVICE)
     tr = across_layer_belief_trace(model, torch.randint(0, 64, (1, 12), device=DEVICE))

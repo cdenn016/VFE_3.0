@@ -18,6 +18,8 @@ isolated module, rather than a hand-rederived reference -- the strongest form of
 values before editing" available after the fact.
 """
 
+from tests.profiles import test_config
+
 import dataclasses
 import importlib.util
 import pathlib
@@ -28,7 +30,6 @@ import torch
 
 from vfe3.alpha_i import alpha_gradient_coefficient, alpha_is_per_coord
 from vfe3.belief import BeliefState
-from vfe3.config import VFE3Config
 from vfe3.families.base import get_family
 from vfe3.free_energy import attention_weights, pairwise_energy, self_divergence_for_alpha
 from vfe3.geometry.groups import get_group
@@ -216,7 +217,7 @@ def _full_setup(N=8, K=4, seed=0, dtype=torch.float64, requires_grad=False):
 
 class Test2_ConfigConstruction:
     def test_gaussian_full_mm_exact_single_block_constructs(self):
-        cfg = VFE3Config(
+        cfg = test_config(
             family="gaussian_full", e_step_update="mm_exact", gauge_group="glk",
             embed_dim=8, n_heads=1, vocab_size=32, max_seq_len=16,
             decode_mode="full_chunked",
@@ -229,7 +230,7 @@ class Test2_ConfigConstruction:
         # torch.diag_embed (prior_bank._encode_prior_sigma), hence diagonal, hence block-diagonal,
         # so the precision fusion decomposes exactly into per-head d x d problems. Reachability of
         # block_glk is the whole point of the feature -- train_vfe3.py's own config uses it.
-        cfg = VFE3Config(
+        cfg = test_config(
             family="gaussian_full", e_step_update="mm_exact", gauge_group="block_glk",
             embed_dim=8, n_heads=2, vocab_size=32, max_seq_len=16,
             decode_mode="full_chunked",
@@ -269,10 +270,10 @@ class Test3_ModelForwardBackward:
         torch.manual_seed(0)
         from vfe3.model.model import VFEModel
 
-        cfg = VFE3Config(
+        cfg = test_config(
             vocab_size=17, embed_dim=6, n_heads=1, max_seq_len=8, n_layers=1,
             gauge_group="glk", family="gaussian_full", decode_mode="full_chunked",
-            e_step_update="mm_exact", mm_damping=0.75,
+            e_step_update="mm_exact", mm_damping=0.75, lambda_alpha_mode="constant",
             n_e_steps=2, e_q_mu_lr=0.1, e_q_sigma_lr=0.1, e_phi_lr=0.05,
         )
         model = VFEModel(cfg)

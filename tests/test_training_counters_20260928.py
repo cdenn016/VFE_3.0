@@ -7,6 +7,7 @@ counters, diagnostics/cap_activation.csv, summary.json's numerics_counters, the 
 skips, checkpoint carry-over on resume, exception isolation, and bitwise invariance of the training
 trajectory.
 """
+from tests.profiles import test_config
 import csv
 import json
 import logging
@@ -44,7 +45,7 @@ def _cfg(route: str = "conditional", **overrides: Any) -> VFE3Config:
                       attention_mode="projected_predictive", attention_residual=True,
                       norm_type_block="layernorm", layernorm_affine=True, decode_mode="linear")
     values.update(overrides)
-    return VFE3Config(**values)
+    return test_config(**values)
 
 
 def _loaders(cfg: VFE3Config, shuffle: bool = True) -> Tuple[DataLoader, DataLoader, DataLoader]:

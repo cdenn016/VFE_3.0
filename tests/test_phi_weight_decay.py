@@ -9,13 +9,14 @@ without changing the generic weight_decay on the belief tables. Under pullback-g
 stepped by a local group retraction, so its AdamW decay stays 0 regardless of the field.
 """
 
+from tests.profiles import test_config
+
 import torch
 
-from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 from vfe3.train import build_optimizer
 
-BASE = dict(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1)
+BASE = dict(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1)
 
 
 def _group_of(opt, param):
@@ -28,12 +29,12 @@ def _wd(group, opt):
     return group.get("weight_decay", opt.defaults["weight_decay"])
 
 
-def test_phi_weight_decay_default_is_0p065():
-    assert VFE3Config(**BASE).phi_weight_decay == 0.065
+def test_phi_weight_decay_accepts_explicit_strength():
+    assert test_config(**BASE, phi_weight_decay=0.065).phi_weight_decay == 0.065
 
 
-def test_phi_decay_distinct_from_generic_by_default():
-    cfg = VFE3Config(**BASE)                                     # weight_decay 0.05, phi_weight_decay 0.065
+def test_phi_decay_distinct_from_generic():
+    cfg = test_config(**BASE, weight_decay=0.05, phi_weight_decay=0.065)
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
     assert _wd(_group_of(opt, model.prior_bank.phi_embed), opt) == 0.065   # phi: own decay
@@ -44,7 +45,7 @@ def test_phi_decay_distinct_from_generic_by_default():
 
 
 def test_phi_weight_decay_override_protects_phi_only():
-    cfg = VFE3Config(**BASE, weight_decay=0.05, phi_weight_decay=0.0)
+    cfg = test_config(**BASE, weight_decay=0.05, phi_weight_decay=0.0)
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
     assert _wd(_group_of(opt, model.prior_bank.phi_embed), opt) == 0.0     # phi protected (weight_decay=0)
@@ -52,14 +53,14 @@ def test_phi_weight_decay_override_protects_phi_only():
 
 
 def test_pos_phi_free_uses_phi_weight_decay():
-    cfg = VFE3Config(**BASE, pos_phi="learned", phi_weight_decay=0.0)
+    cfg = test_config(**BASE, pos_phi="learned", phi_weight_decay=0.0)
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
     assert _wd(_group_of(opt, model.pos_phi_free), opt) == 0.0             # pos frame is a gauge frame too
 
 
 def test_pullback_group_forces_phi_decay_zero_regardless_of_field():
-    cfg = VFE3Config(**BASE, gauge_group="block_glk", m_phi_update_mode="pullback_group",
+    cfg = test_config(**BASE, gauge_group="block_glk", m_phi_update_mode="pullback_group",
                      phi_precond_mode="pullback_per_block", transport_chart_max_norm=6.0,
                      phi_weight_decay=0.065)
     model = VFEModel(cfg)

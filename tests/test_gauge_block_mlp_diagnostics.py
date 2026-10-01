@@ -1,12 +1,12 @@
+from tests.profiles import test_config
 import torch
 
-from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 from vfe3.viz.extract import across_layer_belief_trace, converged_state
 
 
 def _canonical_cfg():
-    return VFE3Config(
+    return test_config(
         vocab_size=17,
         embed_dim=4,
         n_heads=2,

@@ -2,6 +2,7 @@ r"""SO(N)/Sp(2m) irrep-tower gauge groups ('so_n' / 'sp_n'): irrep construction
 (symmetric-traceless tensor powers / Sym^p), representation property, group builders,
 per-head tau for unequal blocks, config validation, and the end-to-end model smoke.
 """
+from tests.profiles import test_config
 
 import math
 
@@ -159,7 +160,7 @@ def _so_n_cfg(**overrides) -> VFE3Config:
                 gauge_group="so_n", group_n=3, irrep_spec=[("l0", 1), ("l1", 1)],
                 n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0)
     base.update(overrides)
-    return VFE3Config(**base)
+    return test_config(**base)
 
 
 def test_config_so_n_accepts_and_coerces_json_pairs():
@@ -179,7 +180,7 @@ def test_config_so_n_requires_both_fields():
 
 def test_config_irrep_fields_rejected_for_other_groups():
     with pytest.raises(ValueError, match="consumed only by"):
-        VFE3Config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
+        test_config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
                    gauge_group="block_glk", irrep_spec=[("l1", 1)])
 
 
@@ -209,7 +210,7 @@ def test_model_runs_under_so_n_irrep_tower():
     # The SO(3) spin tower l0 + l1 (UNEQUAL block dims [1, 3]) must run end-to-end through the
     # same model/E-step machinery: forward + loss.backward() with targets yields a finite loss
     # and finite grad on the prior tables. Mirrors test_model_runs_under_sp_gauge_group.
-    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
+    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                      n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.05, m_phi_lr=0.01,
                      gauge_group="so_n", group_n=3, irrep_spec=[("l0", 1), ("l1", 1)],
                      phi_precond_mode="none")

@@ -9,6 +9,8 @@ restores the model bit-exactly; and routes outside the normal form raise ``NotAp
 
 from __future__ import annotations
 
+from tests.profiles import test_config
+
 import math
 import warnings
 from typing import Any, Sequence
@@ -44,7 +46,7 @@ def _cfg(**over: Any) -> VFE3Config:
     values.update(over)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        return VFE3Config(**values)
+        return test_config(**values)
 
 
 def _model(cfg: VFE3Config, *, identity_frames: bool = False, seed: int = 0) -> VFEModel:
@@ -323,7 +325,7 @@ def _not_applicable(model: VFEModel, row: int) -> str:
 
 
 def test_not_applicable_routes() -> None:
-    transported = _model(_cfg(attention_mode="transported", attention_residual=False))
+    transported = _model(_cfg(attention_mode="transported", attention_residual=False, relational_output_scope="head"))
     for row in ROW_KEYS:
         assert "projected predictive" in _not_applicable(transported, row)
     gaussian_decode = _model(_cfg(family="gaussian_full", decode_mode="full_chunked"))

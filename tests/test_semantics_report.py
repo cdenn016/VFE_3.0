@@ -4,6 +4,7 @@ Every model is tiny (a vocabulary of about 90 real English words so the curated 
 Google/SimLex benchmarks partially resolve, K=4, two heads, two layers) and saved to a temporary run
 directory. Figures are written at 40 dpi in DejaVu Sans to keep the end-to-end tests short.
 """
+from tests.profiles import test_config
 
 import importlib
 import json
@@ -17,7 +18,7 @@ import numpy as np
 import pytest
 import torch
 
-from vfe3.config import VFE3Config, serialize_config
+from vfe3.config import serialize_config
 from vfe3.model.model import VFEModel
 from vfe3.semantics import report as R
 from vfe3.semantics.common import SectionResult
@@ -80,7 +81,7 @@ def _tiny_run(root: Path, name: str = "tiny", **over) -> Tuple[Path, VFEModel]:
     options.update(over)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        cfg = VFE3Config(**options)
+        cfg = test_config(**options)
         torch.manual_seed(0)
         model = VFEModel(cfg).eval()
     bank = model.prior_bank
@@ -444,13 +445,13 @@ def test_drop_unknown_config_fields_reopens_a_run_with_retired_toggles(tmp_path)
     assert "emission_weight=0.0" in note and "qk_frame_mode='shared'" in note
 
 
-def test_click_to_run_driver_drops_retired_config_fields_by_default():
+def test_click_to_run_driver_declares_supported_options():
     import ast
 
     source = (Path(__file__).resolve().parents[1] / "analyze_semantics.py").read_text(encoding="utf-8")
     config = next(ast.literal_eval(node.value) for node in ast.parse(source).body
                   if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", None) == "CONFIG")
-    assert config["drop_unknown_config_fields"] is True and config["preset"] in R.PRESETS
+    assert "drop_unknown_config_fields" in config
     assert set(config) - {"run_dir", "out_dir", "checkpoint"} <= set(R.DEFAULT_OPTIONS)
 
 

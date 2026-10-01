@@ -1,6 +1,6 @@
+from tests.profiles import test_config
 import torch
 
-from vfe3.config import VFE3Config
 from vfe3.belief import BeliefState
 from vfe3.geometry.groups import get_group
 from vfe3.model.head_mixer import HeadMixer
@@ -27,7 +27,7 @@ def test_head_mixer_per_block_differs_from_post_stack_at_two_layers():
     # With L=2 and full handoff, mixing INSIDE each block (so the mixed belief feeds the next
     # block's prior) is NOT the same as mixing once after a no-mixer 2-block stack. This is the
     # only configuration with test signal -- it pins the per-block mixing semantics.
-    cfg = VFE3Config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=2,
+    cfg = test_config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=2,
                      gauge_group="block_glk", prior_handoff_rho=1.0)
     belief, group = _belief_and_group()
     mixer = _nonidentity_mixer(group)
@@ -40,7 +40,7 @@ def test_head_mixer_per_block_differs_from_post_stack_at_two_layers():
 def test_head_mixer_per_block_equals_post_stack_at_one_layer():
     # At the shipped n_layers=1 the handoff loop runs once, so per-block mixing == mixing once after
     # the stack (block_norm off): the change is behavior-preserving on the default config.
-    cfg = VFE3Config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+    cfg = test_config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
                      gauge_group="block_glk")
     belief, group = _belief_and_group()
     mixer = _nonidentity_mixer(group)

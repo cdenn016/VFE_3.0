@@ -1,5 +1,7 @@
 """P1 compact phi block transport: routing, equivalence, and model wiring."""
 
+from tests.profiles import test_config
+
 import dataclasses
 import importlib
 
@@ -723,7 +725,7 @@ def test_model_threads_automatic_route_into_live_phi_bch_retraction(
         # phi_retract_mode was retired with the fixed-loop controls: BCH is the only route.
         "pos_phi": "none",
     }
-    cfg = VFE3Config(**values)
+    cfg = test_config(**values)
     model = VFEModel(cfg).eval()
     seen: list[bool] = []
     original = e_step_module.retract_phi
@@ -763,7 +765,7 @@ def test_compact_phi_block_transport_routes_by_group_layout(route: str) -> None:
 
 
 def _tiny_config() -> VFE3Config:
-    return VFE3Config(
+    return test_config(
         vocab_size=9,
         embed_dim=4,
         n_heads=2,

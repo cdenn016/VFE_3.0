@@ -8,6 +8,7 @@ invoked through the model's call site, mirroring the existing alibi prior (whose
 default-only from the model); tuning them from config is the separate call-site-threading item.
 """
 
+from tests.profiles import test_config
 import math
 
 import torch
@@ -17,7 +18,6 @@ from vfe3.attention_prior import (
     _t5_relative_position_bucket,
     attention_log_prior,
 )
-from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 
 
@@ -25,7 +25,7 @@ def test_new_priors_are_registered_and_config_selectable():
     for name in ("windowed", "causal_windowed", "t5_relative_bias"):
         assert name in _PRIORS
         # config validation accepts the new prior names against the live registry
-        VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, beta_attention_prior=name)
+        test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, beta_attention_prior=name)
 
 
 def test_windowed_is_a_symmetric_band():
@@ -90,7 +90,7 @@ def test_t5_relative_bias_uses_supplied_learnable_table():
 
 
 def _model_forward_finite(prior_name: str):
-    cfg = VFE3Config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+    cfg = test_config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
                      n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, beta_attention_prior=prior_name)
     torch.manual_seed(0)
     model = VFEModel(cfg)
@@ -117,11 +117,11 @@ def _t5_learnable_cfg(**kw):
                 n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0,
                 beta_attention_prior="t5_relative_bias", t5_learnable_bias=True)
     base.update(kw)
-    return VFE3Config(**base)
+    return test_config(**base)
 
 
 def test_t5_learnable_bias_defaults_false():
-    assert VFE3Config().t5_learnable_bias is False
+    assert test_config().t5_learnable_bias is False
 
 
 def test_t5_relative_bias_gradient_flows_to_table():

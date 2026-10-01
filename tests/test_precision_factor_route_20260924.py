@@ -94,16 +94,14 @@ def factor_route():
     set_projected_factor_route(previous)
 
 
-def test_factor_route_config_default_validated_and_inactive_on_transported() -> None:
+def test_factor_route_config_validated_and_inactive_on_transported() -> None:
     from tests.profiles import tiny_config
     from tests.test_relational_integration import _cfg
-    from vfe3.config import VFE3Config
-
-    assert VFE3Config.projected_factor_route == "gram"
-    assert _cfg().projected_factor_route == "gram"
+    assert _cfg(projected_factor_route="gram").projected_factor_route == "gram"
     with pytest.raises(ValueError, match="projected_factor_route"):
         _cfg(projected_factor_route="qr")
-    assert "projected_factor_route" in tiny_config().inactive_fields()
+    assert "projected_factor_route" in tiny_config(attention_mode="transported", predictive_covariance="passthrough",
+                       attention_residual=False, relational_output_scope="head").inactive_fields()
     assert "projected_factor_route" not in _cfg().inactive_fields()
     assert "projected_factor_route" in _cfg(attention_mode="projected_predictive",
                                                relational_routing="noisy_query").inactive_fields()

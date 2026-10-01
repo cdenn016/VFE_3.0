@@ -1,12 +1,14 @@
 """Independent decoder mean/covariance rates preserve encoder and legacy behavior."""
 
+import inspect
 from typing import Any, Optional
 
 import pytest
 import torch
 
+from tests.profiles import config_values
 from tests.test_decode_learning_rate_20260930 import _config, _groups
-from vfe3.config import config_from_serialized, serialize_config
+from vfe3.config import VFE3Config, config_from_serialized, serialize_config
 from vfe3.model.model import VFEModel
 from vfe3.train import _floor_lr_lambdas, build_optimizer
 
@@ -28,7 +30,12 @@ def test_independent_split_rates_keep_encoder_and_temperature_rates() -> None:
 def test_split_rates_roundtrip_and_legacy_omission(
     mu_rate:    Optional[float],
     sigma_rate: Optional[float],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Legacy omissions use a test-owned constructor baseline for this loader call.
+    parameters = list(inspect.signature(VFE3Config.__init__).parameters)[1:]
+    values = config_values()
+    monkeypatch.setattr(VFE3Config.__init__, "__defaults__", tuple(values[name] for name in parameters))
     cfg = _config(m_decode_mu_lr=mu_rate, m_decode_sigma_lr=sigma_rate,
                   m_decode_lr=0.117)
     saved = serialize_config(cfg)

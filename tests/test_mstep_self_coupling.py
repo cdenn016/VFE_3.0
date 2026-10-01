@@ -9,10 +9,11 @@ is also 0), and (2) at weight w the loss is exactly ce + w * mean KL(q*||p), wit
 self-divergence ``sc`` recomputed independently by the same recipe ``forward`` uses.
 """
 
+from tests.profiles import test_config
+
 import pytest
 import torch
 
-from vfe3.config import VFE3Config
 from vfe3.families import get_family
 from vfe3.free_energy import self_divergence_for_alpha
 from vfe3.model.model import VFEModel
@@ -49,7 +50,7 @@ def _converged_self_divergence(model: VFEModel, tokens: torch.Tensor) -> torch.T
 
 def test_noop_at_weight_zero():
     # The key oracle: at weight 0 the new term is absent, so loss == ce (mass_phi=0 too).
-    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
+    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                      n_e_steps=1, e_q_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0,
                      mstep_self_coupling_weight=0.0, seed=0)
     model = VFEModel(cfg)
@@ -62,7 +63,7 @@ def test_noop_at_weight_zero():
 def test_linear_in_weight():
     # Pins the term: loss == ce + w * mean KL(q*||p), with sc recomputed independently.
     w = 0.5
-    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
+    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                      n_e_steps=1, e_q_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0,
                      mstep_self_coupling_weight=w, seed=0)
     model = VFEModel(cfg)
@@ -109,7 +110,7 @@ def test_per_coord_alpha_weighting():
     # per-coordinate alpha^(k)* = c0/(b0+D^(k)) (detached) as the E-step -- NOT a flat scalar:
     #   loss == ce + w * mean_i sum_k alpha_i^(k)* D_i^(k).
     w, b0, c0 = 0.5, 0.5, 2.0
-    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
+    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                      n_e_steps=1, e_q_mu_lr=0.5, e_phi_lr=0.0, mass_phi=0.0,
                      lambda_alpha_mode="state_dependent_per_coord", b0=b0, c0=c0,
                      mstep_self_coupling_weight=w, seed=0)
@@ -124,14 +125,14 @@ def test_per_coord_alpha_weighting():
 
 def test_config_validation():
     with pytest.raises(ValueError):
-        VFE3Config(mstep_self_coupling_weight=-1.0)
-    VFE3Config(mstep_self_coupling_weight=0.0)     # accepted
-    VFE3Config(mstep_self_coupling_weight=0.5)     # accepted
+        test_config(mstep_self_coupling_weight=-1.0)
+    test_config(mstep_self_coupling_weight=0.0)     # accepted
+    test_config(mstep_self_coupling_weight=0.5)     # accepted
 
 
 def test_backward_finite_grads_on_prior_tables():
     # The term is grad-connected (no detach): backprop with weight>0 reaches the prior tables.
-    cfg = VFE3Config(vocab_size=15, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=2,
+    cfg = test_config(vocab_size=15, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=2,
                      n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.02, gradient_mode="filtering",
                      mstep_self_coupling_weight=0.5, seed=0)
     model = VFEModel(cfg)

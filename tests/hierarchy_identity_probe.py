@@ -54,21 +54,29 @@ def main() -> None:
     # Deterministic CPU: fixed seeds plus deterministic kernels (warn-only so a missing deterministic
     # kernel degrades to a warning instead of aborting -- both repos run the SAME torch, so the path
     # is identical either way).
+    torch.set_num_threads(1)
     torch.use_deterministic_algorithms(True, warn_only=True)
     torch.manual_seed(0)
     device = torch.device("cpu")
 
-    from vfe3.config import VFE3Config
+    from tests.profiles import test_config
     from vfe3.model.model import VFEModel
     from vfe3.train import build_optimizer
     import vfe3.model.block as block
 
-    # Fixed pure-route config: diagonal family, flat transport, every Plan-5 toggle at its old-route
-    # default (unset here). Only fields that exist in BOTH the feature branch and its merge base are
-    # named, so the single script constructs identically under either repo.
-    cfg = VFE3Config(
+    # Fixed pure-route config from the test-owned profile. Both compared revisions must expose
+    # that profile, so mutable experiment settings cannot change the fingerprint.
+    cfg = test_config(
         vocab_size=9, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=2, n_e_steps=2,
-        family="gaussian_diagonal", transport_mode="flat",
+        family="gaussian_diagonal", transport_mode="flat", attention_mode="transported",
+        predictive_covariance="passthrough", attention_residual=False,
+        relational_input_scope="head", relational_output_scope="head",
+        use_block_mlp=False, use_head_mixer=False, use_cg_coupling=False,
+        norm_type_block="none", norm_type_final="none", layernorm_affine=False,
+        decode_mode="diagonal_chunked", decode_bias=False, decode_unigram_prior=False,
+        untie_decode_bank=False, decode_temperature_learned=False, pos_phi="none",
+        lambda_alpha_mode="constant", skip_belief_sigma_update=False,
+        mu_init_std=0.02, sigma_init=1.0, phi_scale=0.01, beta_attention_prior="causal",
     )
     torch.manual_seed(0)
     model = VFEModel(cfg).to(device)

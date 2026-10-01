@@ -8,10 +8,11 @@ nonlinear) and (b) the analytic kernel (which scales only its pair term) agrees 
 oracle (which differentiates lambda_beta*F_red).
 """
 
+from tests.profiles import test_config
+
 import pytest
 import torch
 
-from vfe3.config import VFE3Config
 from vfe3.free_energy import free_energy, pairwise_energy, self_divergence
 from vfe3.families.base import get_family
 from vfe3.geometry.groups import get_group
@@ -133,4 +134,4 @@ def test_free_energy_scales_block_by_lambda_beta():
 
 def test_config_rejects_negative_lambda_beta():
     with pytest.raises(ValueError, match="lambda_beta must be >= 0"):
-        VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, lambda_beta=-0.5)
+        test_config(vocab_size=20, embed_dim=4, n_heads=2, lambda_beta=-0.5)

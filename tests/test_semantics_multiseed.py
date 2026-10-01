@@ -5,6 +5,7 @@ stability metrics (their invariance class and their chance levels), and an end-t
 three tiny seeds (K=4, two heads, two layers, the 90-word vocabulary of ``test_semantics_report``)
 analyzed with the quick preset. Figures are written at 40 dpi in DejaVu Sans.
 """
+from tests.profiles import test_config
 
 import itertools
 import json
@@ -18,7 +19,7 @@ import pytest
 import torch
 
 from tests.test_semantics_report import COUNTS, SMALL, STRINGS, V
-from vfe3.config import VFE3Config, serialize_config
+from vfe3.config import serialize_config
 from vfe3.model.model import VFEModel
 from vfe3.semantics import multiseed as M
 from vfe3.semantics import report as R
@@ -57,7 +58,7 @@ def _seed_run(root: Path, name: str, seed: int, data_seed: Optional[int], **over
     options.update(over)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        cfg = VFE3Config(**options)
+        cfg = test_config(**options)
         torch.manual_seed(seed)
         model = VFEModel(cfg).eval()
     bank = model.prior_bank

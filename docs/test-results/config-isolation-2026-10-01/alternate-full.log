@@ -1,0 +1,771 @@
+........................................................................ [  2%]
+........................................................................ [  4%]
+........................................................................ [  6%]
+...........................FFF..FF...................................... [  8%]
+........................................................................ [ 10%]
+........................................................................ [ 12%]
+......................................F................................. [ 14%]
+........................................................................ [ 16%]
+...........F............................................................ [ 18%]
+........................................................................ [ 20%]
+....................F....F.............................................. [ 22%]
+........................................................................ [ 24%]
+..........sssssss...........s........................................... [ 26%]
+........................................................................ [ 29%]
+........................................................................ [ 31%]
+........................................................................ [ 33%]
+........................................................................ [ 35%]
+........................................................................ [ 37%]
+........................................................................ [ 39%]
+........................................................................ [ 41%]
+........................................................................ [ 43%]
+........................................................................ [ 45%]
+............................................................s........... [ 47%]
+........................................................................ [ 49%]
+....................................................................sss. [ 51%]
+........................................................................ [ 53%]
+........................................................................ [ 55%]
+........................................................................ [ 58%]
+..............................................s......................... [ 60%]
+........................................................................ [ 62%]
+........................................................................ [ 64%]
+........................................................................ [ 66%]
+........................................................................ [ 68%]
+.................................................................s...... [ 70%]
+........................................................................ [ 72%]
+........................................................................ [ 74%]
+........................................................................ [ 76%]
+........................................................................ [ 78%]
+.............F.......................................................... [ 80%]
+........................................................................ [ 82%]
+........................................................................ [ 84%]
+........................................................................ [ 87%]
+........................................................................ [ 89%]
+........................................................................ [ 91%]
+........................................................................ [ 93%]
+........................................................................ [ 95%]
+.............................................s.......................... [ 97%]
+..................................................s..................... [ 99%]
+.................                                                        [100%]
+================================== FAILURES ===================================
+__ test_exact_construction_rejects_overridden_encoder_identity[registration] __
+tests\test_canonical_content_gauge.py:134: in test_exact_construction_rejects_overridden_encoder_identity
+    _exact_cfg()
+tests\test_canonical_content_gauge.py:40: in _exact_cfg
+    return tiny_config(**values)
+tests\profiles.py:206: in tiny_config
+    return test_config(**values)
+tests\profiles.py:184: in test_config
+    return VFE3Config(**config_values(**overrides))
+<string>:161: in __init__
+    ???
+vfe3\config.py:990: in __post_init__
+    raise ValueError(
+E   ValueError: attention_mode='projected_predictive' has unsupported projected_filtering configuration: encode_mode='canonical_content_gauge' (requires 'per_token' or 'per_token_additive')
+
+During handling of the above exception, another exception occurred:
+tests\test_canonical_content_gauge.py:133: in test_exact_construction_rejects_overridden_encoder_identity
+    with pytest.raises(ValueError, match=r"canonical_content_gauge.*built-in encoder"):
+E   AssertionError: Regex pattern did not match.
+E    Regex: 'canonical_content_gauge.*built-in encoder'
+E    Input: "attention_mode='projected_predictive' has unsupported projected_filtering configuration: encode_mode='canonical_content_gauge' (requires 'per_token' or 'per_token_additive')"
+__ test_exact_construction_rejects_overridden_encoder_identity[callable_map] __
+tests\test_canonical_content_gauge.py:134: in test_exact_construction_rejects_overridden_encoder_identity
+    _exact_cfg()
+tests\test_canonical_content_gauge.py:40: in _exact_cfg
+    return tiny_config(**values)
+tests\profiles.py:206: in tiny_config
+    return test_config(**values)
+tests\profiles.py:184: in test_config
+    return VFE3Config(**config_values(**overrides))
+<string>:161: in __init__
+    ???
+vfe3\config.py:990: in __post_init__
+    raise ValueError(
+E   ValueError: attention_mode='projected_predictive' has unsupported projected_filtering configuration: encode_mode='canonical_content_gauge' (requires 'per_token' or 'per_token_additive')
+
+During handling of the above exception, another exception occurred:
+tests\test_canonical_content_gauge.py:133: in test_exact_construction_rejects_overridden_encoder_identity
+    with pytest.raises(ValueError, match=r"canonical_content_gauge.*built-in encoder"):
+E   AssertionError: Regex pattern did not match.
+E    Regex: 'canonical_content_gauge.*built-in encoder'
+E    Input: "attention_mode='projected_predictive' has unsupported projected_filtering configuration: encode_mode='canonical_content_gauge' (requires 'per_token' or 'per_token_additive')"
+______ test_exact_construction_rejects_overridden_frame_family_identity _______
+tests\test_canonical_content_gauge.py:157: in test_exact_construction_rejects_overridden_frame_family_identity
+    _exact_cfg()
+tests\test_canonical_content_gauge.py:40: in _exact_cfg
+    return tiny_config(**values)
+tests\profiles.py:206: in tiny_config
+    return test_config(**values)
+tests\profiles.py:184: in test_config
+    return VFE3Config(**config_values(**overrides))
+<string>:161: in __init__
+    ???
+vfe3\config.py:990: in __post_init__
+    raise ValueError(
+E   ValueError: attention_mode='projected_predictive' has unsupported projected_filtering configuration: encode_mode='canonical_content_gauge' (requires 'per_token' or 'per_token_additive')
+
+During handling of the above exception, another exception occurred:
+tests\test_canonical_content_gauge.py:156: in test_exact_construction_rejects_overridden_frame_family_identity
+    with pytest.raises(ValueError, match=r"canonical_content_gauge.*gaussian_frame_diagonal"):
+E   AssertionError: Regex pattern did not match.
+E    Regex: 'canonical_content_gauge.*gaussian_frame_diagonal'
+E    Input: "attention_mode='projected_predictive' has unsupported projected_filtering configuration: encode_mode='canonical_content_gauge' (requires 'per_token' or 'per_token_additive')"
+_ test_canonical_model_has_no_supervised_phi_gradient_and_emits_one_provenance_notice _
+tests\test_canonical_content_gauge.py:233: in test_canonical_model_has_no_supervised_phi_gradient_and_emits_one_provenance_notice
+    cfg = _exact_cfg()
+tests\test_canonical_content_gauge.py:40: in _exact_cfg
+    return tiny_config(**values)
+tests\profiles.py:206: in tiny_config
+    return test_config(**values)
+tests\profiles.py:184: in test_config
+    return VFE3Config(**config_values(**overrides))
+<string>:161: in __init__
+    ???
+vfe3\config.py:990: in __post_init__
+    raise ValueError(
+E   ValueError: attention_mode='projected_predictive' has unsupported projected_filtering configuration: encode_mode='canonical_content_gauge' (requires 'per_token' or 'per_token_additive')
+_ test_canonical_config_accepts_unigram_base_rate_and_names_its_separate_role _
+tests\test_canonical_content_gauge.py:247: in test_canonical_config_accepts_unigram_base_rate_and_names_its_separate_role
+    cfg = _exact_cfg(decode_unigram_prior=True, unigram_kappa=1.75)
+tests\test_canonical_content_gauge.py:40: in _exact_cfg
+    return tiny_config(**values)
+tests\profiles.py:206: in tiny_config
+    return test_config(**values)
+tests\profiles.py:184: in test_config
+    return VFE3Config(**config_values(**overrides))
+<string>:161: in __init__
+    ???
+vfe3\config.py:990: in __post_init__
+    raise ValueError(
+E   ValueError: attention_mode='projected_predictive' has unsupported projected_filtering configuration: encode_mode='canonical_content_gauge' (requires 'per_token' or 'per_token_additive')
+___ test_predictive_gradient_capture_uses_host_nan_and_preserves_real_norms ___
+tests\test_cleanup_geometry.py:130: in test_predictive_gradient_capture_uses_host_nan_and_preserves_real_norms
+    ordinary = VFEModel(tiny_config(attention_mode="transported"))
+tests\profiles.py:206: in tiny_config
+    return test_config(**values)
+tests\profiles.py:184: in test_config
+    return VFE3Config(**config_values(**overrides))
+<string>:161: in __init__
+    ???
+vfe3\config.py:892: in __post_init__
+    _require(self.relational_input_scope, ("head", "full"), "relational_input_scope")
+E   ValueError: attention_residual requires attention_mode='projected_predictive'
+___________ test_train_checkpoint_and_finalize_leave_cuda_rng_alone ___________
+tests\test_cuda_zero_device_gates_20260929.py:124: in test_train_checkpoint_and_finalize_leave_cuda_rng_alone
+    _train(model, cfg, loaders, artifacts=artifacts, log_interval=2, eval_interval=2)
+tests\test_training_diagnostics_20260928.py:81: in _train
+    return T.train(model, loaders[0], cfg, n_steps=cfg.max_steps, grad_clip=1.0,
+vfe3\train.py:3441: in train
+    losses.append(train_step(model, optimizer, scheduler, tokens, targets,
+vfe3\train.py:1120: in train_step
+    _scaler.step(optimizer)
+C:\anaconda\Lib\site-packages\torch\amp\grad_scaler.py:385: in step
+    return optimizer.step(*args, **kwargs)
+C:\anaconda\Lib\site-packages\torch\optim\lr_scheduler.py:166: in wrapper
+    return func.__get__(opt, opt.__class__)(*args, **kwargs)
+C:\anaconda\Lib\site-packages\torch\optim\optimizer.py:526: in wrapper
+    out = func(*args, **kwargs)
+C:\anaconda\Lib\site-packages\torch\optim\optimizer.py:81: in _use_grad
+    ret = func(*args, **kwargs)
+C:\anaconda\Lib\site-packages\torch\optim\adam.py:222: in step
+    self._cuda_graph_capture_health_check()
+C:\anaconda\Lib\site-packages\torch\optim\optimizer.py:467: in _cuda_graph_capture_health_check
+    capturing = torch.cuda.is_current_stream_capturing()
+C:\anaconda\Lib\site-packages\torch\cuda\graphs.py:54: in is_current_stream_capturing
+    return _cuda_isCurrentStreamCapturing()
+E   torch.AcceleratorError: CUDA error: no CUDA-capable device is detected
+E   Search for `cudaErrorNoDevice' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+E   CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+E   For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+E   Device-side assertions were explicitly omitted for this error check; the error probably arose while initializing the DSA handlers.
+---------------------------- Captured stderr call -----------------------------
+
+Training:   0%|          | 0/4 [00:00<?, ?it/s]
+Training:   0%|          | 0/4 [00:00<?, ?it/s]
+------------------------------ Captured log call ------------------------------
+WARNING  vfe3.run_artifacts:run_artifacts.py:2658 vfe3 source changed after this process imported the package: the on-disk code identity is recorded, but the process may execute an older, mixed source generation
+_______________ test_fused_ce_excludes_the_degenerate_position ________________
+tests\test_decode_nonpd_fallback_20260806.py:128: in test_fused_ce_excludes_the_degenerate_position
+    assert torch.equal(got, reference)
+E   assert False
+E    +  where False = <built-in method equal of type object at 0x00007FFD47AEFA70>(tensor(3.0118, grad_fn=<DivBackward0>), tensor(3.0118, grad_fn=<DivBackward0>))
+E    +    where <built-in method equal of type object at 0x00007FFD47AEFA70> = torch.equal
+__ test_nonfinite_rows_are_sanitized_excluded_counted_and_have_zero_gradient __
+tests\test_decode_nonpd_fallback_20260806.py:200: in test_nonfinite_rows_are_sanitized_excluded_counted_and_have_zero_gradient
+    assert torch.equal(result.ce.detach(), reference)
+E   assert False
+E    +  where False = <built-in method equal of type object at 0x00007FFD47AEFA70>(tensor(2.9885), tensor(2.9885, grad_fn=<DivBackward0>))
+E    +    where <built-in method equal of type object at 0x00007FFD47AEFA70> = torch.equal
+E    +    and   tensor(2.9885) = <built-in method detach of Tensor object at 0x0000016EB51E0C80>()
+E    +      where <built-in method detach of Tensor object at 0x0000016EB51E0C80> = tensor(2.9885, grad_fn=<DivBackward0>).detach
+E    +        where tensor(2.9885, grad_fn=<DivBackward0>) = DecodeCEResult(ce=tensor(2.9885, grad_fn=<DivBackward0>), scored_tokens=tensor(5), excluded_tokens=tensor(5)).ce
+____________ test_mixed_generation_process_is_not_reported_stable _____________
+tests\test_remediation_20260923_B.py:407: in test_mixed_generation_process_is_not_reported_stable
+    assert stable_record["source_identity_status"] == "stable"
+E   AssertionError: assert 'mixed_generation' == 'stable'
+E     - stable
+E     + mixed_generation
+------------------------------ Captured log call ------------------------------
+WARNING  vfe3.run_artifacts:run_artifacts.py:2658 vfe3 source changed after this process imported the package: the on-disk code identity is recorded, but the process may execute an older, mixed source generation
+WARNING  test:run_artifacts.py:2936 the process executed code imported before a source edit; provenance records both the import-time and on-disk code identities (source_identity_status='mixed_generation')
+============================== warnings summary ===============================
+tests/test_amp.py: 7 warnings
+tests/test_audit_diagnostics_fixes_20260930.py: 4 warnings
+tests/test_block_mlp.py: 7 warnings
+tests/test_block_mlp_launchers.py: 1 warning
+tests/test_canonical_content_projected.py: 23 warnings
+tests/test_causal_congruence_support_20260904.py: 2 warnings
+tests/test_chunked_decode.py: 6 warnings
+tests/test_decode_learning_rate_20260930.py: 22 warnings
+tests/test_decode_mode.py: 1 warning
+tests/test_decode_nonpd_fallback_20260806.py: 11 warnings
+tests/test_decode_performance_toggles_20260930.py: 2 warnings
+tests/test_extract_forward_fidelity.py: 6 warnings
+tests/test_family_chunked_canonical_dispatch_20260808.py: 10 warnings
+tests/test_family_chunked_decode_20260807.py: 12 warnings
+tests/test_family_chunked_workspace_20260807.py: 10 warnings
+tests/test_frame_pair_escalation_20260923.py: 14 warnings
+tests/test_full_covariance.py: 3 warnings
+tests/test_fullcov_alpha_roadmap_2026_06_13.py: 13 warnings
+tests/test_gauge_block_mlp_diagnostics.py: 1 warning
+tests/test_gauge_block_mlp_integration.py: 10 warnings
+tests/test_gauge_block_mlp_reporting.py: 10 warnings
+tests/test_gauge_block_mlp_training.py: 4 warnings
+tests/test_gaussian_template_block_mlp.py: 3 warnings
+tests/test_generate.py: 2 warnings
+tests/test_laplace_family.py: 1 warning
+tests/test_mm_exact_full_covariance_20260807.py: 3 warnings
+tests/test_model.py: 1 warning
+tests/test_p1_compact_phi_block_transport_20260711.py: 1 warning
+tests/test_p3_pairwise_stats_reuse_20260711.py: 2 warnings
+tests/test_perf_equivalence.py: 1 warning
+tests/test_phi_outer_objective_gradient.py: 1 warning
+tests/test_prior_bank.py: 1 warning
+tests/test_priorbank_head_evidence.py: 6 warnings
+tests/test_projected_prior_bank_decode.py: 1 warning
+tests/test_remediation_20260923_A.py: 2 warnings
+tests/test_remediation_20260923_B.py: 2 warnings
+tests/test_remediation_20260923_d.py: 5 warnings
+tests/test_reporting_additions.py: 2 warnings
+tests/test_retraction.py: 1 warning
+tests/test_rope.py: 1 warning
+tests/test_split_decode_learning_rates_20260930.py: 26 warnings
+tests/test_straight_through.py: 3 warnings
+tests/test_train.py: 1 warning
+tests/test_viz.py: 2 warnings
+  <string>:161: UserWarning: prior-bank decode with frozen belief sigma (skip_belief_sigma_update=True): the KL decode READS sigma_q, so a frozen sigma changes predictions (sigma stays at encode). skip_belief_sigma_update is meant for configs where q's sigma is dead (linear decode, no norms); projected routes freeze sigma regardless of that flag.
+
+tests/test_amp.py::test_default_off_enters_no_autocast_context
+  C:\Users\chris and christine\Desktop\VFE_3.0\vfe3\model\model.py:1500: UserWarning: decode_unigram_prior=True but the unigram_log_prior table is unset (all-zero): the decode degenerates to the uniform prior. Call PriorBank.set_unigram_log_prior(counts) with the (V,) corpus counts.
+    fused_result = decode_registration.fused_ce(
+
+tests/test_audit_diagnostics_fixes_20260930.py: 2 warnings
+tests/test_predictive_covariance.py: 4 warnings
+tests/test_projected_prior_bank_decode.py: 4 warnings
+tests/test_remediation_20260923_A.py: 2 warnings
+  <string>:161: UserWarning: prior-bank decode with frozen belief sigma (attention_mode='projected_predictive' (projected routes keep covariance)): the KL decode READS sigma_q, so a frozen sigma changes predictions (sigma stays at encode). skip_belief_sigma_update is meant for configs where q's sigma is dead (linear decode, no norms); projected routes freeze sigma regardless of that flag.
+
+tests/test_audit_diagnostics_fixes_20260930.py::test_spectral_cap_facet_tracks_the_live_covariance_consumer[None-projected_conditional-passthrough-gradient-False-False]
+tests/test_audit_diagnostics_fixes_20260930.py::test_spectral_cap_facet_tracks_the_live_covariance_consumer[100.0-projected_conditional-passthrough-gradient-False-False]
+tests/test_projected_prior_bank_decode.py::test_projected_filtering_skip_false_does_not_typeerror
+  <string>:161: UserWarning: prior-bank decode with frozen belief sigma (attention_mode='projected_conditional' (projected routes keep covariance)): the KL decode READS sigma_q, so a frozen sigma changes predictions (sigma stays at encode). skip_belief_sigma_update is meant for configs where q's sigma is dead (linear decode, no norms); projected routes freeze sigma regardless of that flag.
+
+tests/test_block_mlp.py::test_off_mode_registers_no_mlp_state_or_parameters
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_block_mlp.py:60: UserWarning: layernorm_affine=True but neither norm_type_block nor norm_type_final is 'layernorm': no affine gamma/beta are created and the toggle is inert. Set a norm seam to 'layernorm' to use the learned affine.
+    model = VFEModel(_tiny_cfg(use_block_mlp=False))
+
+tests/test_block_mlp.py::test_active_mlp_is_untied_per_layer
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_block_mlp.py:92: UserWarning: layernorm_affine=True but neither norm_type_block nor norm_type_final is 'layernorm': no affine gamma/beta are created and the toggle is inert. Set a norm seam to 'layernorm' to use the learned affine.
+    model = VFEModel(_tiny_cfg(use_block_mlp=True, n_layers=3))
+
+tests/test_block_mlp.py::test_block_applies_norm_then_mlp_before_handoff
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_block_mlp.py:110: UserWarning: layernorm_affine=True but neither norm_type_block nor norm_type_final is 'layernorm': no affine gamma/beta are created and the toggle is inert. Set a norm seam to 'layernorm' to use the learned affine.
+    model = VFEModel(cfg)
+
+tests/test_block_mlp.py::test_coordinate_mlp_preserves_covariance_and_other_belief_fields
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_block_mlp.py:138: UserWarning: layernorm_affine=True but neither norm_type_block nor norm_type_final is 'layernorm': no affine gamma/beta are created and the toggle is inert. Set a norm seam to 'layernorm' to use the learned affine.
+    model = VFEModel(cfg)
+
+tests/test_block_mlp.py::test_every_active_mlp_layer_receives_finite_gradients[unroll]
+tests/test_block_mlp.py::test_every_active_mlp_layer_receives_finite_gradients[straight_through]
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_block_mlp.py:164: UserWarning: layernorm_affine=True but neither norm_type_block nor norm_type_final is 'layernorm': no affine gamma/beta are created and the toggle is inert. Set a norm seam to 'layernorm' to use the learned affine.
+    model = VFEModel(_tiny_cfg(
+
+tests/test_block_mlp.py::test_every_active_mlp_layer_receives_finite_gradients[straight_through]
+tests/test_straight_through.py::test_config_accepts_the_three_modes
+tests/test_straight_through.py::test_config_mode_passthrough_is_canonical
+tests/test_straight_through.py::test_straight_through_forward_byte_identical_to_unroll
+tests/test_straight_through.py::test_straight_through_grad_flows_to_encode_tables
+tests/test_straight_through.py::test_straight_through_grad_differs_from_unroll
+  <string>:161: UserWarning: e_step_gradient='straight_through' severs the per-iteration E-step tangent, so a learnable parameter that enters the loss only through it (prior_bank.phi_embed -- the gauge-frame table that generates every transport operator -- whenever mass_phi=0) receives NO gradient and stays frozen. Use e_step_gradient='unroll' (the default) to train these.
+
+tests/test_block_mlp.py::test_every_active_mlp_layer_receives_finite_gradients[straight_through]
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_block_mlp.py:164: UserWarning: pos_phi='learned' with the effective E-step estimator 'straight_through' freezes pos_phi_free: the positional gauge element enters the loss only through the E-step transport, which the detached / straight-through E-step severs. Use an 'unroll' E-step (e_step_gradient='unroll') to train it.
+    model = VFEModel(_tiny_cfg(
+
+tests/test_block_mlp.py::test_diagnostic_snapshot_with_dropout_is_rng_neutral_and_restores_training_mode
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_block_mlp.py:182: UserWarning: layernorm_affine=True but neither norm_type_block nor norm_type_final is 'layernorm': no affine gamma/beta are created and the toggle is inert. Set a norm seam to 'layernorm' to use the learned affine.
+    model = VFEModel(_tiny_cfg(
+
+tests/test_cell_diagnostics.py: 2 warnings
+tests/test_cleanup_projected_performance.py: 1 warning
+tests/test_common_frame_factored_20260924.py: 1 warning
+tests/test_full_cov_kl_condition_toggle_20260814.py: 1 warning
+tests/test_full_gaussian_score_config.py: 5 warnings
+tests/test_gauge_groups.py: 1 warning
+tests/test_predictive_covariance.py: 3 warnings
+tests/test_relational_families.py: 9 warnings
+tests/test_report.py: 1 warning
+  <string>:161: UserWarning: family='gaussian_full' (full covariance) with decode_mode='linear': the linear decode logits = mu_q @ W^T discards the converged (B,N,K,K) covariance at the output boundary (it still shapes the E-step mean trajectory, so the result is correct). For the covariance to reach the logits use decode_mode='full_chunked' (the KL-to-prior decode).
+
+tests/test_cell_diagnostics.py::test_gauge_transport_off_yields_identity_frame
+tests/test_per_type_hidden_bias_20260928.py::test_step_size_resolves_to_the_declared_phi_step_before_coercion
+  <string>:161: UserWarning: gauge_transport='off': forcing the gauge frame to the identity (phi_scale=0.0, pos_phi='none', e_phi_lr=0.0, m_phi_lr=0.0), so the transport is identity and frozen.
+
+tests/test_checkpoint_resume.py::test_load_checkpoint_restores_optimizer_state
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_checkpoint_resume.py:611: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 3 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    train(model, loader, cfg, n_steps=3, artifacts=art)
+
+tests/test_checkpoint_resume.py::test_resume_matches_uninterrupted_run
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_checkpoint_resume.py:671: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 4 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    train(model_a, _const_loader(), cfg, n_steps=4)
+
+tests/test_checkpoint_resume.py::test_resume_matches_uninterrupted_run
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_checkpoint_resume.py:678: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 2 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    train(model_b, _const_loader(), cfg, n_steps=2, artifacts=art)
+
+tests/test_checkpoint_resume.py::test_resume_matches_uninterrupted_run
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_checkpoint_resume.py:683: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 2 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    losses_c = train(model_c, _const_loader(), cfg, n_steps=4, resume_from=ckpt)
+
+tests/test_checkpoint_resume.py: 6 warnings
+tests/test_fp16_gradscaler.py: 2 warnings
+tests/test_gauge_optim.py: 1 warning
+tests/test_phi_outer_objective_gradient.py: 6 warnings
+tests/test_phi_projection_optimization_20260715.py: 1 warning
+tests/test_phi_weight_decay.py: 1 warning
+tests/test_uspace_group_step.py: 3 warnings
+  <string>:161: UserWarning: phi_weight_decay=0.065 is OVERRIDDEN to 0.0 by the m_phi_update_mode='pullback_group' policy metadata, for every phi-role group (phi_embed, pos_phi_free). The configured value is what gets persisted, so treat the recorded phi_weight_decay as nominal for this run.
+
+tests/test_checkpoint_resume.py::test_sequential_resume_matches_uninterrupted_nonconstant_stream
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_checkpoint_resume.py:1063: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 6 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    uninterrupted_losses = train(uninterrupted, _sequential_loader(), cfg, n_steps=6)
+
+tests/test_checkpoint_resume.py::test_sequential_resume_matches_uninterrupted_nonconstant_stream
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_checkpoint_resume.py:1069: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 2 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    partial_losses = train(partial, _sequential_loader(), cfg, n_steps=2, artifacts=artifacts)
+
+tests/test_checkpoint_resume.py::test_sequential_resume_matches_uninterrupted_nonconstant_stream
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_checkpoint_resume.py:1078: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 4 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    resumed_losses = train(
+
+tests/test_checkpoint_resume.py::test_sequential_resume_ignores_non_sampling_loader_generator
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_checkpoint_resume.py:1096: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 6 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    uninterrupted_losses = train(
+
+tests/test_checkpoint_resume.py::test_sequential_resume_ignores_non_sampling_loader_generator
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_checkpoint_resume.py:1103: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 2 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    partial_losses = train(
+
+tests/test_checkpoint_resume.py::test_sequential_resume_ignores_non_sampling_loader_generator
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_checkpoint_resume.py:1111: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 4 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    resumed_losses = train(
+
+tests/test_checkpoint_resume.py::test_sequential_resume_replay_does_not_consume_restored_global_rng
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_checkpoint_resume.py:1129: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 2 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    train(model, _sequential_loader(), cfg, n_steps=2, artifacts=artifacts)
+
+tests/test_checkpoint_resume.py::test_resume_rejects_checkpoint_beyond_requested_terminal_step
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_checkpoint_resume.py:1150: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 2 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    train(source, _const_loader(), cfg, n_steps=2, artifacts=artifacts)
+
+tests/test_checkpoint_resume.py::test_resume_rejects_step_cursor_chronology_mismatch_before_model_mutation
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_checkpoint_resume.py:1172: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 2 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    train(source, loader, cfg, n_steps=2, artifacts=artifacts)
+
+tests/test_checkpoint_resume.py::test_generic_iterables_allow_artifacts_until_a_checkpoint_is_due
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_checkpoint_resume.py:1216: UserWarning: decode_unigram_prior=True but the training loader exposes no flat token stream (loader.dataset.tokens); the unigram table stays unset (decode warns, value no-op). Call model.prior_bank.set_unigram_log_prior(counts) manually.
+    losses = train(
+
+tests/test_checkpoint_resume.py::test_generic_iterables_allow_artifacts_until_a_checkpoint_is_due
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_checkpoint_resume.py:1216: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 1 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    losses = train(
+
+tests/test_checkpoint_resume.py::test_periodic_selection_binds_validation_identity_with_no_checkpoint_due
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_checkpoint_resume.py:1250: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 1 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    train(
+
+tests/test_checkpoint_resume.py::test_shuffled_resume_matches_uninterrupted_run
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_checkpoint_resume.py:1328: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 6 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    losses_a = train(model_a, _shuffled_loader(n=105), cfg, n_steps=6)
+
+tests/test_checkpoint_resume.py::test_shuffled_resume_matches_uninterrupted_run
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_checkpoint_resume.py:1336: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 3 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    losses_b = train(model_b, loader_b, cfg, n_steps=3, artifacts=art)
+
+tests/test_checkpoint_resume.py::test_shuffled_resume_matches_uninterrupted_run
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_checkpoint_resume.py:1350: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 3 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    losses_c = train(model_c, _shuffled_loader(n=105), cfg, n_steps=6,
+
+tests/test_checkpoint_resume.py::test_resume_from_cfg_field_is_picked_up
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_checkpoint_resume.py:1462: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 2 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    train(model_b, _const_loader(), cfg, n_steps=2, artifacts=art)
+
+tests/test_checkpoint_resume.py::test_resume_from_cfg_field_is_picked_up
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_checkpoint_resume.py:1467: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 2 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    losses_c = train(model_c, _const_loader(), cfg_resume, n_steps=4)
+
+tests/test_data.py::test_load_synthetic_bin_cache
+  C:\Users\chris and christine\Desktop\VFE_3.0\vfe3\data\datasets.py:373: UserWarning: The given NumPy array is not writable, and PyTorch does not support non-writable tensors. This means writing to this tensor will result in undefined behavior. You may want to copy the array to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\pytorch\torch\csrc\utils\tensor_numpy.cpp:219.)
+    tokens = torch.from_numpy(np.asarray(mm))
+
+tests/test_e_step.py::test_oracle_create_graph_keeps_belief_gradient_connected
+tests/test_e_step.py::test_oracle_unroll_grad_toggle_changes_prior_gradient
+  C:\Users\chris and christine\Desktop\VFE_3.0\vfe3\free_energy.py:242: RuntimeWarning: renyi: alpha=2.0 > 1 (family='DiagonalGaussian') leaves the convex regime; the blend (1-alpha)*Sigma_q + alpha*Sigma_t may be non-positive-definite (diagonal clamps; full may fail Cholesky and return NaN).
+    return get_functional(divergence_family)(
+
+tests/test_e_step.py::test_oracle_create_graph_keeps_belief_gradient_connected
+tests/test_e_step.py::test_oracle_unroll_grad_toggle_changes_prior_gradient
+  C:\Users\chris and christine\Desktop\VFE_3.0\vfe3\free_energy.py:197: RuntimeWarning: renyi: alpha=2.0 > 1 (family='DiagonalGaussian') leaves the convex regime; the blend (1-alpha)*Sigma_q + alpha*Sigma_t may be non-positive-definite (diagonal clamps; full may fail Cholesky and return NaN).
+    return functional(q_b, key, alpha=alpha, kl_max=kl_max, eps=eps)
+
+tests/test_e_step.py::test_oracle_unroll_grad_toggle_changes_prior_gradient
+tests/test_exact_congruence_family.py::test_gauge_table_keeps_its_gradient_under_the_exact_family
+tests/test_fullcov_alpha_roadmap_2026_06_13.py::test_fullcov_unroll_oracle_grad_reaches_gauge_frame_only_when_enabled
+  <string>:161: UserWarning: e_step_gradient='unroll' but this family/gradient_mode routes the belief gradient to the autograd ORACLE (NOT the closed-form kernel: that covers only gradient_mode='filtering' + family='gaussian_diagonal' + divergence_family='renyi' + renyi_order=1.0 + include_attention_entropy=True), which returns a DETACHED tangent while oracle_unroll_grad=False. A learnable parameter that enters the loss only through the E-step tangent (prior_bank.phi_embed -- the gauge-frame table generating every transport operator -- whenever mass_phi=0, pos_phi_free under pos_phi='learned', t5_bias under t5_learnable_bias with an active t5_relative_bias channel, therefore receives NO gradient and stays frozen. Set oracle_unroll_grad=True to make the oracle return a differentiable (unrolled) gradient.
+
+tests/test_e_step.py::test_oracle_unroll_grad_toggle_changes_prior_gradient
+tests/test_exact_congruence_family.py::test_gauge_table_keeps_its_gradient_under_the_exact_family
+  C:\Users\chris and christine\Desktop\VFE_3.0\vfe3\inference\e_step.py:1321: UserWarning: e_step_gradient='unroll' is being served by the autograd ORACLE with oracle_unroll_grad=False: the belief gradient is a detached tangent, so the unrolled-through-inference signal to the prior tables is truncated. Set oracle_unroll_grad=True for the differentiable oracle (or use the kernel route).
+    belief = e_step_iteration(
+
+tests/test_extract.py: 1 warning
+tests/test_extract_forward_fidelity.py: 1 warning
+tests/test_frame_pair_escalation_20260923.py: 13 warnings
+tests/test_gauge_block_mlp_reporting.py: 1 warning
+tests/test_gauge_optim.py: 2 warnings
+tests/test_relational_families.py: 12 warnings
+tests/test_relational_predictive.py: 2 warnings
+tests/test_rope.py: 10 warnings
+  <string>:161: UserWarning: pos_rotation='rope' is a deliberate residual gauge-FIXING layer: the position-fixed rotations R(theta_i) do not commute with a global gauge element, so gauge-RoPE breaks the global gauge equivariance of F/beta for every group (probe: beta residual 0.44-0.61 under rope vs 7e-6 without). The equivariant positional paths are pos_phi='frozen'/'learned' (composed into phi) or pos_rotation='none'.
+
+tests/test_extract.py: 1 warning
+tests/test_extract_forward_fidelity.py: 1 warning
+tests/test_frame_pair_escalation_20260923.py: 10 warnings
+tests/test_gauge_optim.py: 2 warnings
+tests/test_relational_families.py: 8 warnings
+tests/test_relational_predictive.py: 2 warnings
+tests/test_rope.py: 9 warnings
+  <string>:161: UserWarning: pos_rotation='rope' with rope_full_gauge=False rotates the transported MEANS but not the covariance sandwich -- an affine-incoherent transport pair (Mahalanobis invariants are not preserved). The coherent gauge-RoPE is rope_full_gauge=True with a full-covariance family.
+
+tests/test_figures_tail.py::test_val_builder_resid_logged_with_head_mixer
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_figures_tail.py:108: UserWarning: decode_unigram_prior=True but the training loader exposes no flat token stream (loader.dataset.tokens); the unigram table stays unset (decode warns, value no-op). Call model.prior_bank.set_unigram_log_prior(counts) manually.
+    train(model, batches, cfg, n_steps=4, log_interval=2, eval_interval=2,
+
+tests/test_figures_tail.py::test_plot_gauge_transport_driver
+  C:\anaconda\Lib\site-packages\jupyter_client\connect.py:22: DeprecationWarning: Jupyter is migrating its paths to use standard platformdirs
+  given by the platformdirs library.  To remove this warning and
+  see the appropriate new directories, set the environment variable
+  `JUPYTER_PLATFORM_DIRS=1` and then run `jupyter --paths`.
+  The use of platformdirs will be the default in `jupyter_core` v6
+    from jupyter_core.paths import jupyter_data_dir, jupyter_runtime_dir, secure_write
+
+tests/test_final_covariance_20260906.py: 21 warnings
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_final_covariance_20260906.py:39: UserWarning: layernorm_affine=True but neither norm_type_block nor norm_type_final is 'layernorm': no affine gamma/beta are created and the toggle is inert. Set a norm seam to 'layernorm' to use the learned affine.
+    model = VFEModel(test_config(**{**options, **overrides})).to(device)
+
+tests/test_full_covariance.py::test_family_decode_matches_direct_functional_full_gaussian[1.5]
+  C:\Users\chris and christine\Desktop\VFE_3.0\vfe3\model\prior_bank.py:3213: RuntimeWarning: renyi: alpha=1.5 > 1 (family='FullGaussian') leaves the convex regime; the blend (1-alpha)*Sigma_q + alpha*Sigma_t may be non-positive-definite (diagonal clamps; full may fail Cholesky and return NaN).
+    energy = functional(q, p, alpha=pb.renyi_order,
+
+tests/test_full_covariance.py::test_family_decode_matches_direct_functional_full_gaussian[1.5]
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_full_covariance.py:172: RuntimeWarning: renyi: alpha=1.5 > 1 (family='FullGaussian') leaves the convex regime; the blend (1-alpha)*Sigma_q + alpha*Sigma_t may be non-positive-definite (diagonal clamps; full may fail Cholesky and return NaN).
+    energy = functional(q, p, alpha=pb.renyi_order, kl_max=float("inf"), eps=pb.eps)
+
+tests/test_gauge_block_mlp_integration.py::test_model_builds_selected_untied_block_mlp_type[gauge_gate-GaugeGateBlockMLP]
+tests/test_gauge_block_mlp_integration.py::test_model_builds_selected_untied_block_mlp_type[canonical_frame-CanonicalFrameBlockMLP]
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_gauge_block_mlp_integration.py:100: UserWarning: layernorm_affine=True but neither norm_type_block nor norm_type_final is 'layernorm': no affine gamma/beta are created and the toggle is inert. Set a norm seam to 'layernorm' to use the learned affine.
+    model = VFEModel(_full_cfg(
+
+tests/test_gauge_block_mlp_integration.py::test_block_uses_moment_api_and_forwards_canonical_frame
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_gauge_block_mlp_integration.py:117: UserWarning: layernorm_affine=True but neither norm_type_block nor norm_type_final is 'layernorm': no affine gamma/beta are created and the toggle is inert. Set a norm seam to 'layernorm' to use the learned affine.
+    model = VFEModel(cfg)
+
+tests/test_gauge_block_mlp_reporting.py::test_gauge_gate_parameter_accounting_uses_invariant_block_width
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_gauge_block_mlp_reporting.py:66: UserWarning: layernorm_affine=True but neither norm_type_block nor norm_type_final is 'layernorm': no affine gamma/beta are created and the toggle is inert. Set a norm seam to 'layernorm' to use the learned affine.
+    model = VFEModel(cfg)
+
+tests/test_gauge_block_mlp_reporting.py::test_registered_block_mlp_accounting_and_cost_fields_preserve_legacy_parity[passthrough-coordinate]
+tests/test_gauge_block_mlp_reporting.py::test_registered_block_mlp_accounting_and_cost_fields_preserve_legacy_parity[passthrough-gauge_gate]
+tests/test_gauge_block_mlp_reporting.py::test_registered_block_mlp_accounting_and_cost_fields_preserve_legacy_parity[passthrough-canonical_frame]
+tests/test_gauge_block_mlp_reporting.py::test_registered_block_mlp_accounting_and_cost_fields_preserve_legacy_parity[delta_full-coordinate]
+tests/test_gauge_block_mlp_reporting.py::test_registered_block_mlp_accounting_and_cost_fields_preserve_legacy_parity[delta_full-gauge_gate]
+tests/test_gauge_block_mlp_reporting.py::test_registered_block_mlp_accounting_and_cost_fields_preserve_legacy_parity[delta_full-canonical_frame]
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_gauge_block_mlp_reporting.py:88: UserWarning: layernorm_affine=True but neither norm_type_block nor norm_type_final is 'layernorm': no affine gamma/beta are created and the toggle is inert. Set a norm seam to 'layernorm' to use the learned affine.
+    model = VFEModel(cfg)
+
+tests/test_gauge_block_mlp_reporting.py::test_selected_modes_execute_complete_model_forward
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_gauge_block_mlp_reporting.py:133: UserWarning: layernorm_affine=True but neither norm_type_block nor norm_type_final is 'layernorm': no affine gamma/beta are created and the toggle is inert. Set a norm seam to 'layernorm' to use the learned affine.
+    model = VFEModel(_pure_cfg(mode, covariance))
+
+tests/test_gauge_block_mlp_reporting.py::test_canonical_frame_executes_with_right_full_gauge_rope
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_gauge_block_mlp_reporting.py:148: UserWarning: layernorm_affine=True but neither norm_type_block nor norm_type_final is 'layernorm': no affine gamma/beta are created and the toggle is inert. Set a norm seam to 'layernorm' to use the learned affine.
+    logits = VFEModel(cfg)(torch.tensor([[1, 2, 3, 4]]))
+
+tests/test_gauge_groups.py::test_build_group_forwards_cross_couplings
+tests/test_model.py::test_model_runs_under_cross_coupled_block_glk
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: UserWarning: cross_couplings with family='gaussian_diagonal' is an APPROXIMATION: the off-block GL(K) congruence g*Sigma*g^T is not diagonal, so the diagonal readout is not gauge-invariant. family='gaussian_full' (diagonal_covariance=False) is the exact congruence path.
+
+tests/test_gauge_groups.py::test_build_group_forwards_cross_couplings
+tests/test_model.py::test_model_runs_under_cross_coupled_block_glk
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: UserWarning: cross_couplings collapses block_glk to a single irrep block [K]: n_heads=2 no longer sets the attention-head count (runtime is 1 head) and the softmax temperature shifts from kappa*sqrt(d_head) to kappa*sqrt(K). This is the coherent single-block cross-coupled gauge; n_heads only partitions the generators.
+
+tests/test_gauge_groups.py::test_full_model_logits_invariant_under_global_gauge
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_gauge_groups.py:215: UserWarning: layernorm_affine=True but neither norm_type_block nor norm_type_final is 'layernorm': no affine gamma/beta are created and the toggle is inert. Set a norm seam to 'layernorm' to use the learned affine.
+    m = VFEModel(_cfg(**over))
+
+tests/test_gaussian_template_block_mlp.py::test_model_builds_templates_and_every_parameter_gets_finite_gradients[overrides0]
+tests/test_gaussian_template_block_mlp.py::test_model_builds_templates_and_every_parameter_gets_finite_gradients[overrides1]
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_gaussian_template_block_mlp.py:113: UserWarning: layernorm_affine=True but neither norm_type_block nor norm_type_final is 'layernorm': no affine gamma/beta are created and the toggle is inert. Set a norm seam to 'layernorm' to use the learned affine.
+    model = VFEModel(_tiny_cfg(**overrides))
+
+tests/test_gaussian_template_block_mlp.py::test_reported_parameter_count_and_flops_match_the_module
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_gaussian_template_block_mlp.py:128: UserWarning: layernorm_affine=True but neither norm_type_block nor norm_type_final is 'layernorm': no affine gamma/beta are created and the toggle is inert. Set a norm seam to 'layernorm' to use the learned affine.
+    model = VFEModel(cfg)
+
+tests/test_generation_decode_optimizations_20260930.py: 17 warnings
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_generation_decode_optimizations_20260930.py:25: UserWarning: layernorm_affine=True but neither norm_type_block nor norm_type_final is 'layernorm': no affine gamma/beta are created and the toggle is inert. Set a norm seam to 'layernorm' to use the learned affine.
+    return VFEModel(cfg).eval()
+
+tests/test_grad_accum.py::test_train_loop_runs_under_grad_accum
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_grad_accum.py:213: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 5 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    losses = train(model, loader, cfg, n_steps=5)
+
+tests/test_grad_accum.py::test_accumulation_uses_decoder_counts_for_exact_token_level_objective
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_grad_accum.py:308: RuntimeWarning: grad_accum_steps>1 with uneven counted-token microbatches: non-CE regularizers (mass_phi, mstep_self_coupling) are token-weighted by n_mb/n_tot rather than by their own reduction, so their accumulated gradient is an approximation. Use an unpadded/equal-token loader or grad_accum_steps=1 for the exact objective.
+    loss = train_step(
+
+tests/test_head_mixer_isotypic.py::test_mults_one_tower_gives_scalar_gains
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_head_mixer_isotypic.py:63: UserWarning: HeadMixer: every irrep label in this tower is distinct, so the isotypic mixer degenerates to one scalar gain per block (Schur: no linear equivariant map exists between inequivalent irreps). Use multiplicity > 1 (or use_cg_coupling=True for bilinear cross-type flow) if you intended inter-block mixing.
+    m = HeadMixer([1, 3, 5, 7], irrep_labels=["l0", "l1", "l2", "l3"])
+
+tests/test_head_mixer_isotypic.py::test_so_n_mixed_tower_model_constructs_with_mixer_and_trains
+  C:\Users\chris and christine\Desktop\VFE_3.0\vfe3\model\model.py:544: UserWarning: HeadMixer: label(s) ['l0', 'l1'] appear in NON-ADJACENT blocks of the irrep spec, so their copies are mixed per contiguous run only (no cross-copy mixing between the separated runs). List equal-label copies adjacently in irrep_spec to mix them jointly.
+    self.head_mixer = HeadMixer(self.group.irrep_dims, family=cfg.family,
+
+tests/test_model.py::test_detached_e_step_with_phi_runs_and_reaches_decode_priors
+tests/test_multiseed.py::test_main_publishes_nonlayer_channels_when_embeddings_are_disabled
+tests/test_multiseed.py::test_main_withholds_only_partial_optional_per_layer_channel
+tests/test_paper_20260928.py::test_multiseed_analysis_new_scalar_keys_curves_and_token_axis
+tests/test_straight_through.py::test_config_accepts_the_three_modes
+tests/test_straight_through.py::test_config_mode_passthrough_is_canonical
+  <string>:161: UserWarning: e_step_gradient='detach' severs the per-iteration E-step tangent, so a learnable parameter that enters the loss only through it (prior_bank.phi_embed -- the gauge-frame table that generates every transport operator -- whenever mass_phi=0) receives NO gradient and stays frozen. Use e_step_gradient='unroll' (the default) to train these.
+
+tests/test_model.py::test_detached_e_step_with_phi_runs_and_reaches_decode_priors
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_model.py:101: UserWarning: layernorm_affine=True with norm_type_block='layernorm' and the effective E-step estimator 'detach' freezes the BLOCK norm's gamma/beta: 'detach' runs the whole belief stack (including the block norm) under no_grad, so the affine receives no gradient. Use 'unroll' or 'straight_through' (both keep the belief value differentiable), or place the affine layernorm on norm_type_final (post-stack, trains under any estimator).
+    model = VFEModel(cfg)
+
+tests/test_model.py::test_detached_e_step_with_phi_runs_and_reaches_decode_priors
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_model.py:101: UserWarning: pos_phi='learned' with the effective E-step estimator 'detach' freezes pos_phi_free: the positional gauge element enters the loss only through the E-step transport, which the detached / straight-through E-step severs. Use an 'unroll' E-step (e_step_gradient='unroll') to train it.
+    model = VFEModel(cfg)
+
+tests/test_model.py::test_attention_maps_last_layer_matches_diagnostics
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_model.py:305: UserWarning: layernorm_affine=True but neither norm_type_block nor norm_type_final is 'layernorm': no affine gamma/beta are created and the toggle is inert. Set a norm seam to 'layernorm' to use the learned affine.
+    model = VFEModel(cfg)
+
+tests/test_p1_compact_phi_block_transport_20260711.py::test_compact_phi_block_transport_preserves_global_full_frame_clamp_and_dtype_rule[20.0]
+  C:\Users\chris and christine\Desktop\VFE_3.0\vfe3\geometry\transport.py:1631: RuntimeWarning: stable_matrix_exp_pair: Frobenius clamp active on 100.0% of matrices (max_norm=20.0); the returned factor is a SURROGATE exp(M*scale), NOT exp(M). Warned once for this process; set transport_clamp_monitor=True to report every occurrence, or transport_chart_max_norm to fail closed instead.
+    exp_phi, exp_neg_phi = stable_matrix_exp_pair(
+
+tests/test_phi_preconditioner.py::test_pullback_group_strict_preparation_cache_bypasses_requires_grad
+  C:\Users\chris and christine\Desktop\VFE_3.0\vfe3\geometry\phi_preconditioner.py:327: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+  Consider using tensor.detach() first. (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\pytorch\torch\csrc\autograd\generated\python_variable_methods.cpp:837.)
+    if not bool(torch.isfinite(relative).all()) or float(relative.max()) > closure_tol:
+
+tests/test_phi_preconditioner.py::test_pullback_matches_finite_difference_of_exp
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_phi_preconditioner.py:1410: RuntimeWarning: pullback_metric: Psi(ad_phi) series did not converge in series_order=10 (last term 8.61e-09 >= series_tol=1.0e-12); the pullback preconditioner metric may be inaccurate. Raise series_order or reduce ||phi||. Warned once per process.
+    Gclosed = pullback_metric(phi, G, series_order=10)
+
+tests/test_phi_projection_optimization_20260715.py::test_enabled_projection_persists_timing_metrics_in_training_row
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_phi_projection_optimization_20260715.py:453: UserWarning: decode_unigram_prior=True but the training loader exposes no flat token stream (loader.dataset.tokens); the unigram table stays unset (decode warns, value no-op). Call model.prior_bank.set_unigram_log_prior(counts) manually.
+    train(
+
+tests/test_posthoc_gaps_20260928.py::test_run_posthoc_transported_route_records_reasons
+  C:\Users\chris and christine\Desktop\VFE_3.0\vfe3\posthoc\figures.py:87: UserWarning: Attempting to set identical low and high xlims makes transformation singular; automatically expanding.
+    image = ax.imshow(values, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto", interpolation="nearest")
+
+tests/test_posthoc_gaps_20260928.py::test_run_posthoc_transported_route_records_reasons
+  C:\Users\chris and christine\Desktop\VFE_3.0\vfe3\posthoc\figures.py:87: UserWarning: Attempting to set identical low and high ylims makes transformation singular; automatically expanding.
+    image = ax.imshow(values, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto", interpolation="nearest")
+
+tests/test_posthoc_gaps_20260928.py::test_run_posthoc_transported_route_records_reasons
+  C:\Users\chris and christine\Desktop\VFE_3.0\vfe3\posthoc\figures.py:58: UserWarning: constrained_layout not applied because axes sizes collapsed to zero.  Try making figure larger or Axes decorations smaller.
+    fig.savefig(str(temporary), dpi=300, bbox_inches="tight")
+
+tests/test_prior_bank.py::test_family_decode_matches_direct_functional_diagonal_gaussian[1.5]
+  C:\Users\chris and christine\Desktop\VFE_3.0\vfe3\model\prior_bank.py:3213: RuntimeWarning: renyi: alpha=1.5 > 1 (family='DiagonalGaussian') leaves the convex regime; the blend (1-alpha)*Sigma_q + alpha*Sigma_t may be non-positive-definite (diagonal clamps; full may fail Cholesky and return NaN).
+    energy = functional(q, p, alpha=pb.renyi_order,
+
+tests/test_prior_bank.py::test_family_decode_matches_direct_functional_diagonal_gaussian[1.5]
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_prior_bank.py:161: RuntimeWarning: renyi: alpha=1.5 > 1 (family='DiagonalGaussian') leaves the convex regime; the blend (1-alpha)*Sigma_q + alpha*Sigma_t may be non-positive-definite (diagonal clamps; full may fail Cholesky and return NaN).
+    energy = functional(q, p, alpha=pb.renyi_order, kl_max=float("inf"), eps=pb.eps)
+
+tests/test_projected_prior_bank_decode.py::test_projected_predictive_full_chunked_tiny_train_step
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_projected_prior_bank_decode.py:97: UserWarning: layernorm_affine=True but neither norm_type_block nor norm_type_final is 'layernorm': no affine gamma/beta are created and the toggle is inert. Set a norm seam to 'layernorm' to use the learned affine.
+    model = VFEModel(cfg)
+
+tests/test_projected_prior_bank_decode.py::test_projected_filtering_skip_false_does_not_typeerror
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_projected_prior_bank_decode.py:119: UserWarning: layernorm_affine=True but neither norm_type_block nor norm_type_final is 'layernorm': no affine gamma/beta are created and the toggle is inert. Set a norm seam to 'layernorm' to use the learned affine.
+    model = VFEModel(cfg)
+
+tests/test_remediation_20260923_B.py::test_forest_withheld_without_window_and_captioned_by_seed_count
+tests/test_remediation_20260923_B.py::test_forest_withheld_without_window_and_captioned_by_seed_count
+tests/test_remediation_20260923_B.py::test_forest_withheld_without_window_and_captioned_by_seed_count
+tests/test_remediation_20260923_B.py::test_forest_withheld_without_window_and_captioned_by_seed_count
+  C:\anaconda\Lib\site-packages\matplotlib\cbook.py:1719: DeprecationWarning: Conversion of an array with ndim > 0 to a scalar is deprecated, and will error in future. Ensure you extract a single element from your array before performing this operation. (Deprecated NumPy 1.25.)
+    return math.isfinite(val)
+
+tests/test_remediation_20260923_d.py::test_generalization_gap_uses_the_validation_protocol_under_a_sliding_window
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_remediation_20260923_d.py:201: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 2 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    train(model, _sequential_loader(), cfg, n_steps=2, eval_interval=1,
+
+tests/test_remediation_20260923_d.py::test_generalization_gap_is_unchanged_with_disjoint_validation
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_remediation_20260923_d.py:224: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 1 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    train(model, _sequential_loader(), cfg, n_steps=1, eval_interval=1,
+
+tests/test_remediation_20260923_d.py::test_transported_diagnostics_score_the_e_step_state_against_its_live_prior[overrides0]
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_remediation_20260923_d.py:259: UserWarning: layernorm_affine=True but neither norm_type_block nor norm_type_final is 'layernorm': no affine gamma/beta are created and the toggle is inert. Set a norm seam to 'layernorm' to use the learned affine.
+    model = VFEModel(cfg).eval()
+
+tests/test_remediation_20260923_d.py::test_resumed_realized_budget_is_cumulative
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_remediation_20260923_d.py:494: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 2 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    train(partial, _sequential_loader(), cfg, n_steps=2,
+
+tests/test_remediation_20260923_d.py::test_resumed_realized_budget_is_cumulative
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_remediation_20260923_d.py:499: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 2 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    train(resumed, _sequential_loader(), cfg, n_steps=4, resume_from=checkpoint,
+
+tests/test_reporting_additions.py::test_train_logs_held_out_geometry
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_reporting_additions.py:480: UserWarning: decode_unigram_prior=True but the training loader exposes no flat token stream (loader.dataset.tokens); the unigram table stays unset (decode warns, value no-op). Call model.prior_bank.set_unigram_log_prior(counts) manually.
+    train(model, batches, cfg, n_steps=4, log_interval=2, eval_interval=2,
+
+tests/test_retraction.py::test_full_cov_e_step_isotropic_init_finite_backward
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_retraction.py:357: UserWarning: e_step_gradient='unroll' is being served by the autograd ORACLE with oracle_unroll_grad=False: the belief gradient is a detached tangent, so the unrolled-through-inference signal to the prior tables is truncated. Set oracle_unroll_grad=True for the differentiable oracle (or use the kernel route).
+    out = e_step_iteration(belief, mu_p, sigma_p, group,
+
+tests/test_straight_through.py::test_straight_through_forward_byte_identical_to_unroll
+tests/test_straight_through.py::test_straight_through_grad_flows_to_encode_tables
+tests/test_straight_through.py::test_straight_through_grad_differs_from_unroll
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_straight_through.py:29: UserWarning: pos_phi='learned' with the effective E-step estimator 'straight_through' freezes pos_phi_free: the positional gauge element enters the loss only through the E-step transport, which the detached / straight-through E-step severs. Use an 'unroll' E-step (e_step_gradient='unroll') to train it.
+    return VFEModel(test_config(**cfg))
+
+tests/test_train.py::test_scheduler_floors_lr_at_min_lr
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_train.py:110: UserWarning: Detected call of `lr_scheduler.step()` before `optimizer.step()`. In PyTorch 1.1.0 and later, you should call them in the opposite order: `optimizer.step()` before `lr_scheduler.step()`.  Failure to do this will result in PyTorch skipping the first value of the learning rate schedule. See more details at https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate
+    sched.step()
+
+tests/test_train.py::test_scheduler_min_lr_zero_is_pure_cosine
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_train.py:126: UserWarning: Detected call of `lr_scheduler.step()` before `optimizer.step()`. In PyTorch 1.1.0 and later, you should call them in the opposite order: `optimizer.step()` before `lr_scheduler.step()`.  Failure to do this will result in PyTorch skipping the first value of the learning rate schedule. See more details at https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate
+    sched.step()
+
+tests/test_train.py::test_fractional_floor_scales_each_group_to_min_lr_frac_times_base
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_train.py:143: UserWarning: Detected call of `lr_scheduler.step()` before `optimizer.step()`. In PyTorch 1.1.0 and later, you should call them in the opposite order: `optimizer.step()` before `lr_scheduler.step()`.  Failure to do this will result in PyTorch skipping the first value of the learning rate schedule. See more details at https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate
+    sched.step()
+
+tests/test_train.py::test_floor_is_max_of_absolute_min_lr_and_fractional
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_train.py:159: UserWarning: Detected call of `lr_scheduler.step()` before `optimizer.step()`. In PyTorch 1.1.0 and later, you should call them in the opposite order: `optimizer.step()` before `lr_scheduler.step()`.  Failure to do this will result in PyTorch skipping the first value of the learning rate schedule. See more details at https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate
+    sched.step()
+
+tests/test_train.py::test_floor_lambdas_handle_zero_base_lr_without_dividing
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_train.py:176: UserWarning: Detected call of `lr_scheduler.step()` before `optimizer.step()`. In PyTorch 1.1.0 and later, you should call them in the opposite order: `optimizer.step()` before `lr_scheduler.step()`.  Failure to do this will result in PyTorch skipping the first value of the learning rate schedule. See more details at https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate
+    sched.step()
+
+tests/test_train.py::test_training_smoke_on_real_wikitext2_if_present
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_train.py:395: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 30 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    losses = train(model, loader, cfg, n_steps=30)
+
+tests/test_train.py::test_train_periodic_eval_consumes_full_validation_loader
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_train.py:526: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 2 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    train(model, train_loader, cfg, n_steps=2, eval_interval=1, val_loader=val_loader)
+
+tests/test_train.py::test_sample_decode_emits_sample_line_each_eval
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_train.py:539: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 2 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    train(model, _periodic_loader(seed=0), cfg, n_steps=2, eval_interval=1,
+
+tests/test_train.py::test_tiny_vocab_auto_default_stays_silent
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_train.py:554: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 2 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    train(model, _periodic_loader(seed=0), cfg, n_steps=2, eval_interval=1,
+
+tests/test_train.py::test_generate_samples_false_is_silent_at_real_vocab
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_train.py:568: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 1 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    train(model, _periodic_loader(seed=0), cfg, n_steps=1, eval_interval=1,
+
+tests/test_train.py::test_auto_default_sample_decoder_emits_at_gpt2_vocab
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_train.py:582: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 1 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    train(model, _periodic_loader(seed=0), cfg, n_steps=1, eval_interval=1,
+
+tests/test_train.py::test_grad_clip_signature_preserves_terminal_callback
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_train.py:759: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 1 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    train(model, _periodic_loader(seed=0), cfg, n_steps=1,
+
+tests/test_train.py::test_attention_diagnostic_failure_does_not_kill_training
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_train.py:780: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 2 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    losses = train(model, _periodic_loader(seed=0), cfg, n_steps=2, eval_interval=1,
+
+tests/test_train.py::test_val_diagnostics_failure_resets_to_nan
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_train.py:816: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 2 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    train(model, _periodic_loader(seed=0), cfg, n_steps=2, eval_interval=1,
+
+tests/test_train.py::test_train_terminal_callback_receives_resumable_state
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_train.py:927: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 2 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    train(model, loader, cfg, n_steps=cfg.max_steps, terminal_callback=cb)
+
+tests/test_train.py::test_terminal_callback_restores_cpu_and_cuda_rng
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_train.py:1057: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 2 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    train(model, _terminal_loader(), cfg, n_steps=cfg.max_steps, artifacts=art,
+
+tests/test_train.py::test_terminal_checkpoint_resumes_optimizer_rng_and_next_step
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_train.py:1083: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 2 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    train(model, loader, cfg, n_steps=cfg.max_steps, artifacts=art,
+
+tests/test_train.py::test_terminal_checkpoint_resumes_optimizer_rng_and_next_step
+tests/test_train.py::test_terminal_checkpoint_weights_resume_exactly
+  C:\Users\chris and christine\Desktop\VFE_3.0\vfe3\train.py:3084: UserWarning: resume config drift: the checkpoint at step_2.pt was written under a different config for field(s) ['max_steps']; ['max_steps'] use the CURRENT values (weights/optimizer load strictly, but semantic knobs are not restored from the bundle).
+    start_step = load_checkpoint(resume_path, model, optimizer, map_location=device,
+
+tests/test_train.py::test_terminal_checkpoint_resumes_optimizer_rng_and_next_step
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_train.py:1099: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 1 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    losses_resume = train(fresh, _terminal_loader(), cfg_resume, n_steps=cfg.max_steps + 1,
+
+tests/test_train.py::test_terminal_checkpoint_weights_resume_exactly
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_train.py:1113: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 3 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    train(ctrl, _terminal_loader(), cfg_ctrl, n_steps=3, device=torch.device("cpu"))
+
+tests/test_train.py::test_terminal_checkpoint_weights_resume_exactly
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_train.py:1131: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 2 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    train(interrupted, loader, cfg_first, n_steps=2, artifacts=art,
+
+tests/test_train.py::test_terminal_checkpoint_weights_resume_exactly
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_train.py:1145: UserWarning: parameter motion: 2 trainable parameter(s) did not move over 1 step(s) and are frozen for this run: pos_phi_free, prior_bank.phi_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    train(resumed, _terminal_loader(), cfg_res, n_steps=3, resume_from=ckpt, device=torch.device("cpu"))
+
+tests/test_training_counters_20260928.py::test_forced_cap_is_counted_and_matches_the_posthoc_observer
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_training_counters_20260928.py:83: UserWarning: parameter motion: 5 trainable parameter(s) did not move over 4 step(s) and are frozen for this run: relational_operators_extra.0.raw_score_q, relational_operators_extra.0.raw_score_k, relational_operators.raw_score_q, relational_operators.raw_score_k, prior_bank.sigma_log_embed. A parameter can be reported live by the init-time grad probe and still never move -- check its group learning rate and whether it reaches the loss only through a detached E-step tangent.
+    return T.train(model, loaders[0], cfg, n_steps=kwargs.pop("n_steps", cfg.max_steps),
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+- generated xml file: C:\Users\chris and christine\Desktop\VFE_3.0\.test-output\config-isolation\alternate-full.xml -
+=========================== short test summary info ===========================
+FAILED tests/test_canonical_content_gauge.py::test_exact_construction_rejects_overridden_encoder_identity[registration]
+FAILED tests/test_canonical_content_gauge.py::test_exact_construction_rejects_overridden_encoder_identity[callable_map]
+FAILED tests/test_canonical_content_gauge.py::test_exact_construction_rejects_overridden_frame_family_identity
+FAILED tests/test_canonical_content_gauge.py::test_canonical_model_has_no_supervised_phi_gradient_and_emits_one_provenance_notice
+FAILED tests/test_canonical_content_gauge.py::test_canonical_config_accepts_unigram_base_rate_and_names_its_separate_role
+FAILED tests/test_cleanup_geometry.py::test_predictive_gradient_capture_uses_host_nan_and_preserves_real_norms
+FAILED tests/test_cuda_zero_device_gates_20260929.py::test_train_checkpoint_and_finalize_leave_cuda_rng_alone
+FAILED tests/test_decode_nonpd_fallback_20260806.py::test_fused_ce_excludes_the_degenerate_position
+FAILED tests/test_decode_nonpd_fallback_20260806.py::test_nonfinite_rows_are_sanitized_excluded_counted_and_have_zero_gradient
+FAILED tests/test_remediation_20260923_B.py::test_mixed_generation_process_is_not_reported_stable
+10 failed, 3447 passed, 16 skipped, 1 deselected, 555 warnings in 647.38s (0:10:47)

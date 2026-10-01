@@ -1,3 +1,4 @@
+from tests.profiles import test_config
 import logging
 import warnings
 from pathlib import Path
@@ -48,7 +49,6 @@ from vfe3.viz.figures import (
     plot_decode_readout,
     set_publication_style,
 )
-from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 from vfe3.viz import extract
 from vfe3.viz import figures as figures_mod
@@ -638,7 +638,7 @@ def _replay_model(**over):
     )
     base.update(over)
     torch.manual_seed(31)
-    model = VFEModel(VFE3Config(**base))
+    model = VFEModel(test_config(**base))
     model.eval()
     return model
 
@@ -671,7 +671,7 @@ def _vocab_model(**kw):
                 n_e_steps=2, e_q_mu_lr=0.1, e_phi_lr=0.05)
     base.update(kw)
     torch.manual_seed(0)
-    return VFEModel(VFE3Config(**base))
+    return VFEModel(test_config(**base))
 
 
 def _vocab_batches(bs=3, n=8, nb=2):

@@ -1,5 +1,6 @@
 """Tiny executable routing contracts for the optional full-Gaussian scorer."""
 
+from tests.profiles import test_config
 import importlib
 from typing import Any
 
@@ -23,15 +24,14 @@ def _tiny_config(**overrides: Any) -> VFE3Config:
         oracle_unroll_grad=True, compile_pair_kernel=False,
         e_phi_lr=0.005, phi_precond_mode="killing_per_block",
         decode_mode="linear", mu_init_std=0.01, phi_scale=0.01,
+        lambda_alpha_mode="constant",
     )
     values.update(overrides)
-    return VFE3Config(**values)
+    return test_config(**values)
 
 
-def test_backend_default_is_common_frame() -> None:
-    # The default moved from "pairwise" to "common_frame" in f54c756; the round-trip and opt-in
-    # coverage below is what makes either value safe to reach.
-    cfg = _tiny_config()
+def test_selected_backend_reaches_shared_kwargs() -> None:
+    cfg = _tiny_config(full_cov_kl_backend="common_frame")
     assert cfg.full_cov_kl_backend == "common_frame"
     assert e_step_shared_kwargs(cfg, torch.device("cpu"))["full_cov_kl_backend"] == "common_frame"
 

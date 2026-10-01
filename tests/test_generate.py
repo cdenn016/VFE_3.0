@@ -12,12 +12,13 @@ conditions on a longer sequence and has no relation to forward(prompt). Those
 oracles therefore use max_new_tokens=1.
 """
 
+from tests.profiles import test_config
+
 import os
 
 import pytest
 import torch
 
-from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 
 PROJECTED_DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
@@ -29,7 +30,7 @@ def _tiny_model(seed: int = 0, **overrides) -> VFEModel:
     base = dict(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
                 n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0, seed=seed)
     base.update(overrides)
-    cfg = VFE3Config(**base)
+    cfg = test_config(**base)
     torch.manual_seed(seed)
     return VFEModel(cfg)
 
@@ -59,7 +60,7 @@ def _projected_tiny_model(seed: int = 0, **overrides) -> VFEModel:
     )
     base.update(overrides)
     torch.manual_seed(seed)
-    return VFEModel(VFE3Config(**base)).to(PROJECTED_DEVICE)
+    return VFEModel(test_config(**base)).to(PROJECTED_DEVICE)
 
 
 def test_shape_in_vocab_and_prompt_preserved():

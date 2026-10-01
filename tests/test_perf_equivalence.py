@@ -11,6 +11,8 @@ E-step) are GPU memory/throughput gains that CANNOT be measured on CPU at B=1; t
 analyzed by construction in the post-edit doc, not timed here.
 """
 
+from tests.profiles import test_config
+
 import torch
 
 from vfe3.config import VFE3Config
@@ -32,7 +34,9 @@ _CAPTURE_DEFAULTS = dict(
     use_block_mlp=False, norm_type_block="none", layernorm_affine=False,
     skip_belief_sigma_update=False, beta_attention_prior="causal",
     decode_bias=False, untie_decode_bank=False, decode_unigram_prior=False,
-    decode_av_precision="fp32",
+    decode_av_precision="fp32", mu_init_std=0.02, sigma_init=1.0, phi_scale=0.01,
+    lambda_alpha_mode="constant", decode_temperature_learned=True,
+    decode_ce_stable_reduction=False, decode_ranking_refinement="full",
 )
 
 
@@ -41,7 +45,7 @@ def _fwd_cfg(**overrides: object) -> VFE3Config:
     # captured on; the perf refactor this oracle guards (factored transport / per-block exp / batch
     # vectorization) is independent of the pos_phi gauge composition.
     # These checksums were captured on the KL-to-prior decoder that the oracle guards.
-    return VFE3Config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=2,
+    return test_config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=2,
                       n_e_steps=2, e_phi_lr=0.1, pos_phi="none",
                       decode_mode="diagonal_chunked", **overrides)
 

@@ -15,6 +15,7 @@ Every test here is TINY (K < 6, single-digit everything) and CPU-bound per CLAUD
 properties are pinned against a NON-IDENTITY gauge frame on purpose: at ``Omega = I`` the two
 insertions coincide exactly, which is why `tests/test_rope.py` never caught this.
 """
+from tests.profiles import test_config
 
 import pytest
 import torch
@@ -145,12 +146,11 @@ def test_insertion_is_validated() -> None:
 
 
 def test_config_rope_insertion_is_fixed_to_right() -> None:
-    from vfe3.config import VFE3Config
 
-    cfg = VFE3Config(embed_dim=4, n_heads=2, vocab_size=7, max_seq_len=3)
+    cfg = test_config(embed_dim=4, n_heads=2, vocab_size=7, max_seq_len=3)
     assert cfg.rope_insertion == "right"
     with pytest.raises(TypeError, match="rope_insertion"):
-        VFE3Config(rope_insertion="left")
+        test_config(rope_insertion="left")
     with pytest.raises(AttributeError):
         cfg.rope_insertion = "left"
 
@@ -164,11 +164,10 @@ def test_every_rope_insertion_default_agrees(monkeypatch) -> None:
     """
     import inspect
 
-    from vfe3.config import VFE3Config
     from vfe3.geometry import transport as transport_module
     from vfe3.inference import e_step as e_step_module
 
-    declared = [VFE3Config().rope_insertion,
+    declared = [test_config().rope_insertion,
                 inspect.signature(transport_module.RopeTransport).parameters["insertion"].default]
     for name, function in inspect.getmembers(e_step_module, inspect.isfunction):
         parameter = inspect.signature(function).parameters.get("rope_insertion")

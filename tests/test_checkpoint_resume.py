@@ -13,8 +13,10 @@ thing that can make their final weights differ is a missing restore leg -- model
 optimizer momentum (exp_avg/exp_avg_sq), or the scheduler's ``last_epoch``.
 """
 
+from tests.profiles import config_values, test_config
 import copy
 import json
+import inspect
 import math
 from dataclasses import asdict
 from enum import IntEnum
@@ -55,7 +57,7 @@ def _cfg(**kw) -> VFE3Config:
                 n_e_steps=1, e_q_mu_lr=0.1, e_phi_lr=0.0, m_phi_lr=0.0,
                 warmup_steps=1, max_steps=4)
     base.update(kw)
-    return VFE3Config(**base)
+    return test_config(**base)
 
 
 def _params(model: torch.nn.Module):
@@ -109,10 +111,10 @@ class _EnabledScalerStub:
 
 
 def test_config_resume_from_default_none_and_validated():
-    assert VFE3Config().resume_from is None                     # off by default (pure path)
-    assert VFE3Config(resume_from="ckpt.pt").resume_from == "ckpt.pt"
+    assert test_config().resume_from is None                     # off by default (pure path)
+    assert test_config(resume_from="ckpt.pt").resume_from == "ckpt.pt"
     with pytest.raises(ValueError):
-        VFE3Config(resume_from=123)                             # not a str/path
+        test_config(resume_from=123)                             # not a str/path
 
 
 def test_load_checkpoint_restores_model_and_returns_step(tmp_path):
@@ -1485,8 +1487,10 @@ def test_resume_config_drift_reports_grad_clip_change(tmp_path):
 
     # identical config (grad_clip unchanged) -> silent
     import warnings as _w
+    from vfe3.config import ConfigNotice
     with _w.catch_warnings():
         _w.simplefilter("error")
+        _w.simplefilter("ignore", ConfigNotice)
         load_checkpoint(path, model, opt, cfg=cfg)
 
 
@@ -1721,7 +1725,10 @@ def test_finalize_rejects_best_metadata_without_best_weights(tmp_path, monkeypat
         finalize_run(model, art, cfg, test_loader=None)
 
 
-def test_selection_projection_migrates_missing_defaults_and_rejects_unknown_fields():
+def test_selection_projection_migrates_missing_defaults_and_rejects_unknown_fields(monkeypatch):
+    values = config_values()
+    parameters = list(inspect.signature(VFE3Config.__init__).parameters)[1:]
+    monkeypatch.setattr(VFE3Config.__init__, "__defaults__", tuple(values[name] for name in parameters))
     from vfe3.run_artifacts import _selection_semantic_config
 
     cfg = _cfg()
@@ -1775,7 +1782,7 @@ def test_selection_projection_rejects_a_retired_field_payload() -> None:
         _selection_semantic_config(legacy)
 
 
-def test_selection_projection_grad_clip_migrates_to_default_and_differentiates():
+def test_selection_projection_grad_clip_migrates_to_default_and_differentiates(monkeypatch):
     r"""PB-15 cross-plan regression: a raw legacy mapping predating grad_clip (simulated by
     stripping the field from asdict(VFE3Config())) migrates through _selection_semantic_config
     to the CURRENT default (grad_clip=1.0), matching the live default projection exactly -- an
@@ -1785,7 +1792,10 @@ def test_selection_projection_grad_clip_migrates_to_default_and_differentiates()
     unknown field still fails closed rather than being silently ignored by config_from_serialized."""
     from vfe3.run_artifacts import _selection_semantic_config
 
-    legacy = asdict(VFE3Config())
+    values = config_values()
+    parameters = list(inspect.signature(VFE3Config.__init__).parameters)[1:]
+    monkeypatch.setattr(VFE3Config.__init__, "__defaults__", tuple(values[name] for name in parameters))
+    legacy = asdict(test_config())
     assert legacy["grad_clip"] == 1.0
     del legacy["grad_clip"]
     assert "grad_clip" not in legacy
@@ -1794,7 +1804,7 @@ def test_selection_projection_grad_clip_migrates_to_default_and_differentiates()
     assert semantic_config_fingerprint(legacy) == semantic_config_fingerprint(
         dict(reversed(list(legacy.items()))))
 
-    live_default_projection = _selection_semantic_config(VFE3Config())
+    live_default_projection = _selection_semantic_config(test_config())
     assert live_default_projection["grad_clip"] == 1.0
     assert _selection_semantic_config(legacy) == live_default_projection
 

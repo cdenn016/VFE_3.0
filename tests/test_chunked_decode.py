@@ -6,10 +6,10 @@ for several chunk sizes, honor ignore_index identically, and give prior-table gr
 full path. The chunking is a memory reassociation of the SAME CE, never a formula change.
 """
 
+from tests.profiles import test_config
 import torch
 import torch.nn.functional as F
 
-from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 
 
@@ -34,7 +34,7 @@ def _converged(model: VFEModel, tokens: torch.Tensor):
 
 def _model(vocab_size=64, **kw):
     kw.setdefault("decode_mode", "diagonal")
-    cfg = VFE3Config(vocab_size=vocab_size, embed_dim=4, n_heads=2, max_seq_len=6,
+    cfg = test_config(vocab_size=vocab_size, embed_dim=4, n_heads=2, max_seq_len=6,
                      n_layers=1, n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0,
                      _allow_legacy_dense_decode=kw["decode_mode"] == "diagonal", **kw)
     return VFEModel(cfg)
@@ -156,7 +156,7 @@ def test_chunked_inference_targets_none_returns_full_logits():
 
 # --- vram audit 2026-06-10: fused chunked CE for the linear decode ---
 def _linear_model(vocab_size=64, **kw):
-    cfg = VFE3Config(vocab_size=vocab_size, embed_dim=4, n_heads=2, max_seq_len=6,
+    cfg = test_config(vocab_size=vocab_size, embed_dim=4, n_heads=2, max_seq_len=6,
                      n_layers=1, n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0,
                      decode_mode="linear", **kw)
     return VFEModel(cfg)

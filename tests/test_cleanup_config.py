@@ -1,4 +1,5 @@
 """Canonical config policies and structured inactive-sweep regression tests."""
+from tests.profiles import test_config
 from dataclasses import fields
 
 import pytest
@@ -7,7 +8,7 @@ from vfe3.config import VFE3Config, config_from_serialized, serialize_config
 
 
 def _tiny(**overrides: object) -> VFE3Config:
-    return VFE3Config(**dict(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=3,
+    return test_config(**dict(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=3,
                              **overrides))
 
 

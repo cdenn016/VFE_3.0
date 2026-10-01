@@ -16,13 +16,13 @@ Groups, by roadmap item:
       state_dependent alpha at b0=O(1)).
 """
 
+from tests.profiles import test_config
 import warnings
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-from vfe3.config import VFE3Config
 from vfe3.families.base import get_family
 from vfe3.model.model import VFEModel
 
@@ -34,11 +34,11 @@ def test_per_coord_bhattacharyya_and_jeffreys_construct_squared_hellinger_still_
     """state_dependent_per_coord now accepts the divergences that DECOMPOSE coordinate-wise
     (bhattacharyya = 0.5 D_1/2, jeffreys = KL + KL_rev), and still rejects squared_hellinger
     (H^2 = 1 - exp(-D_1/2/2) is a nonlinear transform of the SUMMED divergence)."""
-    VFE3Config(lambda_alpha_mode="state_dependent_per_coord", divergence_family="bhattacharyya")
-    VFE3Config(lambda_alpha_mode="state_dependent_per_coord", divergence_family="jeffreys")
-    VFE3Config(lambda_alpha_mode="state_dependent_per_coord", divergence_family="renyi")
+    test_config(lambda_alpha_mode="state_dependent_per_coord", divergence_family="bhattacharyya")
+    test_config(lambda_alpha_mode="state_dependent_per_coord", divergence_family="jeffreys")
+    test_config(lambda_alpha_mode="state_dependent_per_coord", divergence_family="renyi")
     with pytest.raises(ValueError):
-        VFE3Config(lambda_alpha_mode="state_dependent_per_coord", divergence_family="squared_hellinger")
+        test_config(lambda_alpha_mode="state_dependent_per_coord", divergence_family="squared_hellinger")
 
 
 def test_per_coord_bhattacharyya_jeffreys_sum_to_scalar():
@@ -70,7 +70,7 @@ def test_per_coord_bhattacharyya_jeffreys_sum_to_scalar():
 def test_per_coord_bhattacharyya_forward_backward_runs():
     """A model with state_dependent_per_coord + bhattacharyya runs forward+backward (routes to the
     autograd oracle; the per-coordinate self-divergence shapes a per-coordinate alpha)."""
-    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
+    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                      n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.0,
                      lambda_alpha_mode="state_dependent_per_coord", divergence_family="bhattacharyya")
     model = VFEModel(cfg)
@@ -92,7 +92,8 @@ def _fullcov_model(renyi_order=1.0, oracle_unroll_grad=True, **kw):
     # A noncanonical Renyi order uses the family-consistent chunked decoder; canonical order 1
     # keeps the fast full-covariance chunked kernel.
     decode_mode = kw.pop("decode_mode", "full_chunked" if renyi_order == 1.0 else "family_chunked")
-    cfg = VFE3Config(vocab_size=24, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
+    kw.setdefault("lambda_alpha_mode", "constant")
+    cfg = test_config(vocab_size=24, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                      n_e_steps=2, e_q_mu_lr=0.05, e_q_sigma_lr=0.02, e_phi_lr=0.01,
                      family="gaussian_full", decode_mode=decode_mode,
                      pos_phi="learned",
@@ -190,7 +191,7 @@ def test_state_dependent_envelope_has_no_product_rule_residue(div_name):
 def test_state_dependent_per_position_nonrenyi_forward_backward(div_name):
     """Per-position state_dependent + a non-Renyi divergence constructs and trains (routes to the
     oracle); the prior tables get a finite gradient."""
-    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
+    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                      n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.0,
                      lambda_alpha_mode="state_dependent", divergence_family=div_name, b0=0.3)
     model = VFEModel(cfg)
@@ -217,7 +218,7 @@ def test_state_dependent_per_position_nonrenyi_forward_backward(div_name):
 # ---------------------------------------------------------------------------
 def _full_model(vocab_size=64, **kw):
     decode_mode = kw.pop("decode_mode", "full_chunked")
-    cfg = VFE3Config(vocab_size=vocab_size, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=1,
+    cfg = test_config(vocab_size=vocab_size, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=1,
                      n_e_steps=2, e_q_mu_lr=0.05, e_q_sigma_lr=0.02, e_phi_lr=0.0,
                      family="gaussian_full", decode_mode=decode_mode,
                      _allow_legacy_dense_decode=decode_mode == "full", **kw)
@@ -238,10 +239,10 @@ def _full_converged(model):
 
 
 def test_full_chunked_config_accepts_with_full_family_and_rejects_diagonal():
-    VFE3Config(family="gaussian_full",
+    test_config(family="gaussian_full",
                decode_mode="full_chunked")
     with pytest.raises(ValueError):
-        VFE3Config(family="gaussian_diagonal",
+        test_config(family="gaussian_diagonal",
                    decode_mode="full_chunked")
 
 
@@ -443,7 +444,7 @@ def _warns_matching(substr, **cfg_kw):
     (tolerating other, unrelated warnings -- e.g. the oracle-truncation notice)."""
     with warnings.catch_warnings(record=True) as rec:
         warnings.simplefilter("always")
-        VFE3Config(**cfg_kw)
+        test_config(**cfg_kw)
     return any(substr in str(w.message) for w in rec)
 
 

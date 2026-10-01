@@ -1,3 +1,4 @@
+from tests.profiles import test_config
 import pytest
 import torch
 
@@ -29,7 +30,6 @@ def test_get_pos_phi_unknown_raises_keyerror():
         get_pos_phi("not_a_mode")
 
 
-from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 
 
@@ -38,7 +38,7 @@ def _cfg(**kw):
                 n_e_steps=1, e_q_mu_lr=0.1, e_phi_lr=0.0, m_phi_lr=0.0,
                 warmup_steps=1, max_steps=4)
     base.update(kw)
-    return VFE3Config(**base)
+    return test_config(**base)
 
 
 def test_pos_phi_none_logits_byte_identical_to_no_field():

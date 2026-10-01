@@ -15,10 +15,11 @@ averages it over positions (matching the per-token mean that ``ce`` already is).
 latent at the ``mass_phi = 0.0`` default -- these tests exist because it is a swept axis.
 """
 
+from tests.profiles import test_config
+
 import torch
 
 from vfe3.belief import BeliefState
-from vfe3.config import VFE3Config
 from vfe3.inference.e_step import free_energy_value
 from vfe3.model.model import VFEModel
 
@@ -27,7 +28,7 @@ MASS = 0.25
 
 
 def _tiny_model(**overrides):
-    cfg = VFE3Config(**BASE, **overrides)
+    cfg = test_config(**BASE, **overrides)
     torch.manual_seed(0)
     return cfg, VFEModel(cfg)
 

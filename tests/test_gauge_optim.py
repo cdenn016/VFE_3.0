@@ -1,3 +1,4 @@
+from tests.profiles import test_config
 import hashlib
 from collections.abc import Callable
 
@@ -77,7 +78,6 @@ def test_phi_update_policy_registry_contract_is_exact_and_immutable():
 
 
 def test_default_adamw_one_step_is_byte_identical_to_golden():
-    from vfe3.config import VFE3Config
     from vfe3.model.model import VFEModel
     from vfe3.train import build_optimizer, train_step
 
@@ -86,7 +86,7 @@ def test_default_adamw_one_step_is_byte_identical_to_golden():
     # (docs/audits/audit-2026-09-22.md flip table); pin them so the parameter groups, optimizer
     # state and loss are those of the captured step. The block MLP, decode bias and affine block
     # LayerNorm each add a parameter group under the current defaults.
-    cfg = VFE3Config(
+    cfg = test_config(
         vocab_size=8,
         embed_dim=4,
         n_heads=2,
@@ -101,6 +101,9 @@ def test_default_adamw_one_step_is_byte_identical_to_golden():
         untie_decode_bank=False,
         decode_unigram_prior=False,
         decode_temperature_learned=True,
+        mu_init_std=0.02, sigma_init=1.0, phi_scale=0.01,
+        lambda_alpha_mode="constant",
+        decode_ce_stable_reduction=False, decode_ranking_refinement="full",
         skip_belief_sigma_update=False,
         beta_attention_prior="causal",
         decode_av_precision="fp32",
@@ -145,13 +148,12 @@ def test_default_adamw_one_step_is_byte_identical_to_golden():
 def test_default_adamw_one_step_matches_recompute_dense_low_level_oracle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from vfe3.config import VFE3Config
     from vfe3.model import block as block_module
     from vfe3.model.model import VFEModel
     from vfe3.train import build_optimizer, train_step
 
     torch.manual_seed(0)
-    cfg = VFE3Config(
+    cfg = test_config(
         vocab_size=8,
         embed_dim=4,
         n_heads=2,
@@ -209,13 +211,12 @@ def _pair_route_models(
     recompute oracle: no pair-statistics reuse, no compact/per-head transport, and no model-level
     prebuilt transport (the E-step builds its own). The recorders stay live for the oracle run.
     """
-    from vfe3.config import VFE3Config
     from vfe3.gradients import kernels as kernels_module
     from vfe3.model import block as block_module
     from vfe3.model.model import VFEModel
 
     torch.manual_seed(0)
-    cfg = VFE3Config(
+    cfg = test_config(
         vocab_size=8,
         embed_dim=4,
         n_heads=n_heads,
@@ -381,11 +382,10 @@ def test_pullback_group_step_moves_only_active_rows_and_creates_no_phi_state():
 
 
 def test_build_optimizer_selects_pullback_group_route_and_moves_phi_embed():
-    from vfe3.config import VFE3Config
     from vfe3.model.model import VFEModel
     from vfe3.train import build_optimizer, train_step
 
-    cfg = VFE3Config(
+    cfg = test_config(
         vocab_size=12,
         embed_dim=4,
         n_heads=2,

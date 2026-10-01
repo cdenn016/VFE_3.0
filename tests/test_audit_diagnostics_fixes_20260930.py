@@ -1,5 +1,6 @@
 """Tiny CPU regressions for the September 30 diagnostics remediation."""
 
+from tests.profiles import test_config
 import json
 import logging
 from pathlib import Path
@@ -30,7 +31,7 @@ def _cfg(**overrides: object) -> VFE3Config:
         generate_embedding_figures=False,
     )
     values.update(overrides)
-    return VFE3Config(**values)
+    return test_config(**values)
 
 
 @pytest.mark.parametrize("decode_coordinates", ["local", "reference"])

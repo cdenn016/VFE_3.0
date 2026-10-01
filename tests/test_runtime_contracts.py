@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tests.profiles import tiny_config
+from tests.profiles import config_values, tiny_config
 from vfe3.model.model import VFEModel
 
 
@@ -86,8 +86,12 @@ def test_overflow_backoff_is_independent_of_logging(metrics: bool) -> None:
     assert model.weight.item() == 0.
 
 
-def test_predictive_mean_step_sweep_is_rejected() -> None:
+def test_predictive_mean_step_sweep_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     import ablation
+    monkeypatch.setattr(ablation, "BASELINE_CONFIG", config_values(
+        attention_mode="projected_predictive", e_phi_lr=0.0))
+    monkeypatch.setattr(ablation, "SWEEPS", {"e_q_mu_lr": {
+        "param": "e_q_mu_lr", "values": [0.1, 0.5], "requires": {}}})
     with pytest.raises(ValueError, match='inert|e_q_mu_lr'):
         ablation.validate_sweeps(['e_q_mu_lr'], require_construction=True)
 

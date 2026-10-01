@@ -1,3 +1,4 @@
+from tests.profiles import test_config
 import pytest
 import torch
 
@@ -548,21 +549,19 @@ def test_divergence_functionals_registry_derived():
 
 
 def test_config_accepts_squared_hellinger_and_rejects_unknown():
-    from vfe3.config import VFE3Config
-    VFE3Config(divergence_family="squared_hellinger")     # accepted
-    VFE3Config(divergence_family="renyi")                 # still accepted
+    test_config(divergence_family="squared_hellinger", lambda_alpha_mode="constant")     # accepted
+    test_config(divergence_family="renyi")                 # still accepted
     with pytest.raises(ValueError):
-        VFE3Config(divergence_family="no_such_functional")
+        test_config(divergence_family="no_such_functional")
 
 
 def test_model_forward_under_squared_hellinger():
     """End-to-end: a VFEModel forward + finite loss with the new functional flowing through
     pairwise_energy / self_divergence."""
-    from vfe3.config import VFE3Config
     from vfe3.model.model import VFEModel
-    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=2,
+    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=2,
                      n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0,
-                     divergence_family="squared_hellinger")
+                     divergence_family="squared_hellinger", lambda_alpha_mode="constant")
     model = VFEModel(cfg)
     tokens = torch.randint(0, 20, (3, 5))
     targets = torch.randint(0, 20, (3, 5))
@@ -638,9 +637,8 @@ def test_new_divergence_self_is_zero(name, family):
 def test_model_forward_under_new_divergence(name):
     """End-to-end: a VFEModel forward + finite loss with the new functional flowing through
     pairwise_energy / self_divergence (the autograd-oracle route, as for squared_hellinger)."""
-    from vfe3.config import VFE3Config
     from vfe3.model.model import VFEModel
-    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=2,
+    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=2,
                      n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0, divergence_family=name)
     model = VFEModel(cfg)
     tokens = torch.randint(0, 20, (3, 5))

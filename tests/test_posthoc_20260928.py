@@ -7,6 +7,8 @@ token caches, provenance, summary, metrics, map snapshots) and runs :func:`vfe3.
 
 from __future__ import annotations
 
+from tests.profiles import test_config
+
 import json
 import math
 import warnings
@@ -41,11 +43,12 @@ def _cfg(**over: Any) -> VFE3Config:
     values = dict(vocab_size=V, embed_dim=4, n_heads=2, max_seq_len=8, eval_stride=4, n_layers=2,
                   batch_size=2, attention_mode="projected_predictive", e_phi_lr=0.0, block_mlp_expansion=2,
                   norm_type_block="none", layernorm_affine=False,           # pinned: independent of
-                  skip_belief_sigma_update=False)                           # the config defaults
+                  skip_belief_sigma_update=False, decode_temperature_learned=True,
+                  beta_attention_prior="causal_alibi", relational_output_scope="full")                           # the config defaults
     values.update(over)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        return VFE3Config(**values)
+        return test_config(**values)
 
 
 def _model(cfg: VFE3Config, seed: int = 0) -> VFEModel:

@@ -490,7 +490,15 @@ Run selected files with `python -m pytest tests/<selected_file>.py`. The pytest
 configuration already supplies quiet output. For device-aware CUDA tests, select a
 CUDA-enabled interpreter and set `$env:VFE3_TEST_DEVICE = "cuda"`. Setting that
 variable alone does not make a CPU-only PyTorch installation CUDA-capable.
-CPU model tests should use tiny dimensions.
+CPU model tests should use tiny dimensions. Tests own their configuration through
+`tests.profiles.test_config(**overrides)` or the smaller `tiny_config(**overrides)`
+profile. Both supply every constructor field explicitly from a checked-in test
+mapping, so editing `vfe3/config.py` defaults does not choose test behavior. Set
+any toggle a test depends on in its local overrides. Use `config_values(**overrides)`
+for dictionaries passed to launchers or serialized-config loaders, and monkeypatch
+the launcher dictionary inside the test instead of asserting live experiment settings.
+When adding a config field, add an explicit test baseline value in `tests/profiles.py`;
+the schema coverage check in `tests/test_config_isolation.py` identifies omissions.
 
 ## Outputs and diagnostics
 

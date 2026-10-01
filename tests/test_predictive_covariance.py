@@ -1,7 +1,9 @@
 """Moment-matched predictive covariance (predictive_covariance='moment_matched')."""
+
+from tests.profiles import test_config
 import itertools
 import re
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 
 import pytest
 import torch
@@ -268,15 +270,15 @@ def _cfg(**overrides: object) -> VFE3Config:
                   warmup_steps=0, max_steps=2, log_interval=0, eval_interval=0,
                   attention_mode="projected_predictive", decode_mode="linear")
     values.update(overrides)
-    return VFE3Config(**values)
+    return test_config(**values)
 
 
-def test_config_default_validation_and_serialization() -> None:
-    assert VFE3Config().predictive_covariance == "passthrough"
+def test_config_validation_and_serialization(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert test_config(predictive_covariance="passthrough").predictive_covariance == "passthrough"
     for mode in ("transported", "projected_conditional"):
         with pytest.raises(ValueError, match=re.escape(
                 "predictive_covariance='moment_matched' requires attention_mode='projected_predictive'")):
-            VFE3Config(attention_mode=mode, predictive_covariance="moment_matched")
+            test_config(attention_mode=mode, predictive_covariance="moment_matched")
     with pytest.raises(ValueError, match="predictive_covariance"):
         _cfg(predictive_covariance="full")
     for bad in (0.0, -1e-3, float("inf"), True):
@@ -287,6 +289,12 @@ def test_config_default_validation_and_serialization() -> None:
     legacy = serialize_config(_cfg())
     legacy.pop("predictive_covariance")
     legacy.pop("predictive_covariance_floor")
+    @dataclass
+    class LegacyFixtureConfig(VFE3Config):
+        predictive_covariance: str = "passthrough"
+        predictive_covariance_floor: float = 1e-4
+
+    monkeypatch.setattr("vfe3.config.VFE3Config", LegacyFixtureConfig)
     restored = config_from_serialized(legacy, source="legacy")
     assert (restored.predictive_covariance, restored.predictive_covariance_floor) == ("passthrough", 1e-4)
 

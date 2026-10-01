@@ -11,6 +11,8 @@ non-absorbability: the logit change caused by the table is not in the tangent sp
 
 from __future__ import annotations
 
+from tests.profiles import test_config
+
 import warnings
 from typing import Any, Dict
 
@@ -47,7 +49,7 @@ def _cfg(**over: Any) -> VFE3Config:
     values.update(over)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        return VFE3Config(**values)
+        return test_config(**values)
 
 
 def _build(cfg: VFE3Config, seed: int = 0, *, dtype: torch.dtype = torch.float32) -> VFEModel:

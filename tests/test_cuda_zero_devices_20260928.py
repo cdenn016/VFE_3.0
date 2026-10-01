@@ -5,6 +5,7 @@ while ``torch.cuda.device_count()`` is 0, and ``torch.cuda.get_device_name(0)`` 
 device id'. The provenance and cost-model writers must report the actual CPU model device even when
 CUDA inventory is present. The CUDA queries are monkeypatched, so no device is touched. Tiny CPU models only (K=4, two heads, N=4).
 """
+from tests.profiles import test_config
 import json
 import logging
 from pathlib import Path
@@ -15,14 +16,13 @@ import torch
 
 import vfe3.run_artifacts as ra
 from vfe3.baseline import BaselineConfig, BaselineTransformer
-from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 
 V, K, H, L, N, B = 7, 4, 2, 1, 4, 2
 
 
 def _vfe() -> VFEModel:
-    cfg = VFE3Config(
+    cfg = test_config(
         vocab_size=V, embed_dim=K, n_heads=H, batch_size=B, max_seq_len=N, n_layers=L,
         n_e_steps=1, warmup_steps=0, max_steps=2, log_interval=0, eval_interval=0,
         checkpoint_interval=0, generate_embedding_figures=False)

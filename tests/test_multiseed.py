@@ -3,6 +3,8 @@ r"""Tests for the across-seed aggregator (multiseed_analysis).
 Original EXP-1 scalar aggregator added 2026-06-21; full cross-seed digest (curves, per-layer,
 research scalars, figure set) added 2026-06-22.
 """
+
+from tests.profiles import test_config
 import json
 import math
 from dataclasses import asdict
@@ -12,13 +14,13 @@ import numpy as np
 import pytest
 
 import multiseed_analysis as ms
-from vfe3.config import VFE3Config, serialize_config
+from vfe3.config import serialize_config
 
 
 def _write_run(d, ppl, seed):
     d.mkdir(parents=True, exist_ok=True)
     (d / "summary.json").write_text(json.dumps({"test_ppl": ppl}))
-    (d / "config.json").write_text(json.dumps(serialize_config(VFE3Config(seed=seed))))
+    (d / "config.json").write_text(json.dumps(serialize_config(test_config(seed=seed))))
 
 
 def test_aggregate_seed_metric_mean_sd_and_seeds(tmp_path):
@@ -40,7 +42,7 @@ def test_aggregate_skips_nonfinite_and_unreadable(tmp_path):
     (tmp_path / "c").mkdir()
     (tmp_path / "c" / "summary.json").write_text("{ not json")
     (tmp_path / "c" / "config.json").write_text(json.dumps(
-        serialize_config(VFE3Config(seed=3))))
+        serialize_config(test_config(seed=3))))
     out = ms.aggregate_seed_metric(tmp_path)
     assert out["n"] == 1 and abs(out["mean"] - 10.0) < 1e-9
     assert math.isnan(out["sd"])                            # n<2 -> SD undefined
@@ -65,7 +67,7 @@ def test_flag_noise_dominated():
 def _write_full_run(d, *, ppl, seed, metrics=None, per_layer=None, research=None, config=None):
     d.mkdir(parents=True, exist_ok=True)
     (d / "summary.json").write_text(json.dumps({"test_ppl": ppl}))
-    config = serialize_config(VFE3Config(seed=seed)) if config is None else config
+    config = serialize_config(test_config(seed=seed)) if config is None else config
     (d / "config.json").write_text(json.dumps(config))                    # real seed lives in provenance
     (d / "provenance.json").write_text(json.dumps({
         "seed": seed,
@@ -229,14 +231,14 @@ def test_seed_dirs_reject_mixed_semantic_configs(tmp_path):
         run_a,
         ppl=10.0,
         seed=1,
-        config={"config": serialize_config(VFE3Config(
+        config={"config": serialize_config(test_config(
             seed=1, embed_dim=20, n_heads=4)), "timestamp": "first"},
     )
     _write_full_run(
         run_b,
         ppl=11.0,
         seed=2,
-        config={"config": serialize_config(VFE3Config(
+        config={"config": serialize_config(test_config(
             seed=2, embed_dim=40, n_heads=4)), "timestamp": "second"},
     )
 
@@ -255,8 +257,8 @@ def test_seed_dirs_reject_mixed_semantic_configs(tmp_path):
 def test_seed_dirs_accept_homogeneous_semantic_configs(tmp_path):
     nested = tmp_path / "run_s1"
     flat = tmp_path / "run_s2"
-    cfg_nested = VFE3Config(seed=1, vocab_size=8, embed_dim=4, n_heads=2, max_seq_len=4)
-    cfg_flat = VFE3Config(seed=2, vocab_size=8, embed_dim=4, n_heads=2, max_seq_len=4)
+    cfg_nested = test_config(seed=1, vocab_size=8, embed_dim=4, n_heads=2, max_seq_len=4)
+    cfg_flat = test_config(seed=2, vocab_size=8, embed_dim=4, n_heads=2, max_seq_len=4)
     _write_full_run(
         nested,
         ppl=10.0,
@@ -290,7 +292,7 @@ def test_semantic_config_rejects_retired_legacy_fields(
     nested,
     retired_surface,
 ):
-    payload = asdict(VFE3Config(seed=1, vocab_size=8, embed_dim=4, n_heads=2, max_seq_len=4))
+    payload = asdict(test_config(seed=1, vocab_size=8, embed_dim=4, n_heads=2, max_seq_len=4))
     payload["pos_phi"] = "none"
     if retired_surface == "active_phi":
         payload.pop("m_phi_update_mode")
@@ -335,7 +337,7 @@ def test_requested_panel_reports_unexpected_duplicate_runs_and_withholds_publica
             ppl=ppl,
             seed=seed,
             metrics=f"step,train_ce\n1,{ppl}\n",
-            config={"config": serialize_config(VFE3Config(
+            config={"config": serialize_config(test_config(
                 seed=seed, embed_dim=20, n_heads=4,
                 generate_embedding_figures=False,
             ))},
@@ -393,7 +395,7 @@ def test_requested_panel_classifies_unreadable_extra_before_config_homogeneity(t
         tmp_path / "requested_s8",
         ppl=10.0,
         seed=8,
-        config={"config": serialize_config(VFE3Config(
+        config={"config": serialize_config(test_config(
             seed=8, embed_dim=20, n_heads=4))},
     )
     unidentified = tmp_path / "unidentified"
@@ -426,7 +428,7 @@ def test_manifest_failed_cell_is_excluded_from_accepted_config_homogeneity(
         tmp_path / "requested_s8",
         ppl=10.0,
         seed=8,
-        config={"config": serialize_config(VFE3Config(
+        config={"config": serialize_config(test_config(
             seed=8, embed_dim=20, n_heads=4,
             generate_embedding_figures=False,
         ))},
@@ -435,7 +437,7 @@ def test_manifest_failed_cell_is_excluded_from_accepted_config_homogeneity(
         tmp_path / "failed_s23",
         ppl=99.0,
         seed=23,
-        config={"config": serialize_config(VFE3Config(
+        config={"config": serialize_config(test_config(
             seed=23, embed_dim=40, n_heads=4,
             generate_embedding_figures=False,
         ))},
@@ -656,7 +658,7 @@ def test_main_requires_the_per_layer_channel_even_with_embeddings_disabled(
 ):
     _write_request(tmp_path, [1, 2])
     for seed, ppl, train_ce in ((1, 10.0, 5.0), (2, 12.0, 7.0)):
-        cfg = VFE3Config(seed=seed, generate_embedding_figures=False)
+        cfg = test_config(seed=seed, generate_embedding_figures=False)
         _write_full_run(
             tmp_path / f"run_s{seed}",
             ppl=ppl,

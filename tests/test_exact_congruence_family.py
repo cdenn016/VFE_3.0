@@ -3,6 +3,7 @@ r"""Exact-congruence Gaussian family: registration, exactness, route agreement, 
 Every model here is TINY (K < 6) and CPU-bound per CLAUDE.md.
 """
 
+from tests.profiles import test_config
 import pytest
 import torch
 
@@ -314,13 +315,12 @@ def test_gauge_table_keeps_its_gradient_under_the_exact_family() -> None:
     ``oracle_unroll_grad=True`` for the unrolled E-step tangent to reach the prior tables, so both
     settings are pinned: the toggle is the difference between a live and a frozen gauge here.
     """
-    from vfe3.config import VFE3Config
     from vfe3.model.model import VFEModel
 
     grads = {}
     for family in ("gaussian_diagonal_exact", "gaussian_frame_diagonal"):
         for unroll in (False, True):
-            cfg = VFE3Config(
+            cfg = test_config(
                 embed_dim=4, n_heads=2, vocab_size=11, max_seq_len=6, batch_size=2,
                 n_layers=1, n_e_steps=2, family=family, e_step_update="gradient",
                 lambda_alpha_mode="constant", max_steps=1, oracle_unroll_grad=unroll,

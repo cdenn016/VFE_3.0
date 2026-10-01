@@ -1,4 +1,6 @@
 """Reporting regressions for the executed predictive readout, using tiny CPU models."""
+
+from tests.profiles import test_config
 import math
 import json
 import logging
@@ -8,7 +10,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import (
     collect_beta_channel_decomposition, collect_context_sensitivity, collect_estep_character,
@@ -18,7 +19,7 @@ from vfe3.viz import extract, figures, report
 
 def _model() -> VFEModel:
     torch.manual_seed(71)
-    return VFEModel(VFE3Config(
+    return VFEModel(test_config(
         vocab_size=7, embed_dim=4, n_heads=2, batch_size=1, max_seq_len=4,
         n_layers=1, n_e_steps=1, family="gaussian_diagonal", gauge_group="block_glk",
         skip_belief_sigma_update=True, e_phi_lr=0.0, oracle_unroll_grad=True,
@@ -106,7 +107,7 @@ def test_report_draws_sigma_max_only_where_it_bounds_the_belief(
     # an unclamped readout, so with a token table above the cap every plotted variance exceeds it.
     # N == K == 4 also pins that the guard reads the (N, K) diagonal as variances, not a K x K matrix.
     torch.manual_seed(71)
-    model = VFEModel(VFE3Config(
+    model = VFEModel(test_config(
         vocab_size=7, embed_dim=4, n_heads=2, batch_size=1, max_seq_len=4,
         n_layers=2, family="gaussian_diagonal", gauge_group="block_glk",
         e_phi_lr=0.0, pos_phi="learned", use_block_mlp=True, block_mlp_expansion=1,

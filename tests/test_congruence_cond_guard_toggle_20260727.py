@@ -15,10 +15,10 @@ charging every step for it.
 Everything is tiny and CPU-bound: K = 4, H = 2, d = 2, V = 16, N = 4.
 """
 
+from tests.profiles import test_config
 import pytest
 import torch
 
-from vfe3.config import VFE3Config
 from vfe3.geometry.transport import build_factored_transport, transport_covariance
 from vfe3.model.model import VFEModel
 
@@ -28,7 +28,7 @@ BASE = dict(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
 
 def _model(**overrides) -> VFEModel:
     torch.manual_seed(0)
-    return VFEModel(VFE3Config(**BASE, **overrides))
+    return VFEModel(test_config(**BASE, **overrides))
 
 
 def _count_svdvals(monkeypatch) -> list:
@@ -60,7 +60,7 @@ def _factored(cond_escalation: bool, *, batch: int = 2, n_tok: int = 4):
 
 def test_conditioning_escalation_is_off_by_default():
     r"""The expensive accuracy trigger must be opt-in."""
-    assert VFE3Config(**BASE).congruence_cond_escalation is False
+    assert test_config(**BASE).congruence_cond_escalation is False
 
 
 # --------------------------------------------------------------------------- the transport seam

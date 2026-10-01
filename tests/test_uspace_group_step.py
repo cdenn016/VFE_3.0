@@ -4,6 +4,7 @@ Tiny float64 CPU checks of the matrix-log kernels, the closed-form Frobenius-pul
 the exact right-product retraction and its gates, and the optimizer/config wiring. The chart route
 is covered unchanged by tests/test_gauge_optim.py and tests/test_checkpoint_resume.py.
 """
+from tests.profiles import config_values, test_config
 
 import functools
 import math
@@ -514,7 +515,7 @@ def _group_log_model_cfg(**overrides):
         m_phi_group_retraction="group_log",
     )
     values.update(overrides)
-    return VFE3Config(**values)
+    return test_config(**values)
 
 
 # T15
@@ -572,18 +573,24 @@ def test_group_log_resume_is_step_exact_and_stateless(tmp_path) -> None:
 
 
 # T17
-def test_retraction_config_validation_inactive_marks_and_serialized_default() -> None:
+def test_retraction_config_validation_inactive_marks_and_serialized_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import inspect
     from vfe3.config import VFE3Config, config_from_serialized, serialize_config
 
     with pytest.raises(ValueError, match="m_phi_group_retraction"):
-        VFE3Config(m_phi_group_retraction="bogus")
-    default = VFE3Config()
+        test_config(m_phi_group_retraction="bogus")
+    default = test_config(m_phi_update_mode="adamw", m_phi_group_retraction="chart")
     assert default.m_phi_group_retraction == "chart"
     assert "m_phi_group_retraction" in default.inactive_fields()
     active = _group_log_model_cfg()
     assert "m_phi_group_retraction" not in active.inactive_fields()
     payload = serialize_config(_group_log_model_cfg(m_phi_group_retraction="chart"))
     payload.pop("m_phi_group_retraction")
+    parameters = list(inspect.signature(VFE3Config.__init__).parameters)[1:]
+    values = config_values()
+    monkeypatch.setattr(VFE3Config.__init__, "__defaults__", tuple(values[name] for name in parameters))
     assert config_from_serialized(payload, source="pre-retraction run").m_phi_group_retraction == "chart"
     with pytest.raises(ValueError, match="phi_group_retraction"):
         GaugeManifoldAdamW([nn.Parameter(torch.zeros(1))], get_group("glk")(K=2),

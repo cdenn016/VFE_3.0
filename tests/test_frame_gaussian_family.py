@@ -3,6 +3,7 @@ r"""Frame-intrinsic Gaussian family: registration, transport identities, and the
 Every model here is TINY (K < 6) and CPU-bound per CLAUDE.md.
 """
 
+from tests.profiles import test_config
 import math
 
 import pytest
@@ -157,12 +158,11 @@ def test_frame_family_leaves_the_gauge_table_without_gradient() -> None:
     fixed-basis family does. This is the ablation semantics the toggle exists to expose; if a
     future change reconnects phi, this test fails and the docstring must be revisited.
     """
-    from vfe3.config import VFE3Config
     from vfe3.model.model import VFEModel
 
     grads = {}
     for family in ("gaussian_diagonal", "gaussian_frame_diagonal"):
-        cfg = VFE3Config(
+        cfg = test_config(
             embed_dim=4, n_heads=2, vocab_size=11, max_seq_len=6, batch_size=2,
             n_layers=1, n_e_steps=2, family=family, e_step_update="gradient",
             lambda_alpha_mode="constant", max_steps=1,

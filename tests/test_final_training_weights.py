@@ -1,4 +1,5 @@
 """Small end-to-end checks for final validation, saved weights, and test selection."""
+from tests.profiles import test_config
 import csv
 from dataclasses import asdict
 import importlib
@@ -12,7 +13,6 @@ import torch
 from torch.utils.data import DataLoader
 
 import train_vfe3 as launcher
-from vfe3.config import VFE3Config
 from vfe3.data.datasets import TokenWindows
 from vfe3.model.model import VFEModel
 from vfe3.viz import report
@@ -22,7 +22,7 @@ def test_launcher_saves_and_tests_all_training_without_periodic_checkpoints(
     tmp_path:    Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    cfg = VFE3Config(
+    cfg = test_config(
         vocab_size=7, embed_dim=4, n_heads=2, batch_size=1, max_seq_len=4,
         n_layers=1, n_e_steps=1, max_steps=3, warmup_steps=0,
         eval_interval=2, log_interval=0, checkpoint_interval=0,

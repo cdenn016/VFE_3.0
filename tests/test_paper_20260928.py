@@ -9,6 +9,8 @@ config field) and synthetic counter columns of the training-builder contract.
 
 from __future__ import annotations
 
+from tests.profiles import test_config
+
 import csv
 import json
 import math
@@ -54,7 +56,7 @@ def _cfg(**over: Any) -> VFE3Config:
     values.update(over)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        return VFE3Config(**values)
+        return test_config(**values)
 
 
 @pytest.fixture(scope="module")
@@ -159,7 +161,7 @@ def _write_run(
         (run / "map_snapshots").mkdir()
         maps = {k: v for k, v in trained["state"].items() if k.startswith("relational_operators")}
         for step, scale in ((0, 1.0), (10, 2.0), (20, 3.0)):
-            torch.save({"step": step, "state": {k: v * scale for k, v in maps.items()}},
+            torch.save({"step": step, "state": {k: v.double() * scale for k, v in maps.items()}},
                        run / "map_snapshots" / f"step_{step:07d}.pt")
     if residual:
         (run / "diagnostics").mkdir()

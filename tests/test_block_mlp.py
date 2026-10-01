@@ -1,10 +1,11 @@
+from tests.profiles import test_config
 import re
 
 import pytest
 import torch
 from torch import nn
 
-from vfe3.config import ConfigNotice, VFE3Config
+from vfe3.config import ConfigNotice
 from vfe3.model.block import vfe_block
 from vfe3.model.block_mlp import BlockMLP
 from vfe3.model.model import VFEModel
@@ -52,7 +53,7 @@ def _tiny_cfg(**overrides):
         norm_type_block="none",
     )
     config.update(overrides)
-    return VFE3Config(**config)
+    return test_config(**config)
 
 
 def test_off_mode_registers_no_mlp_state_or_parameters():
@@ -76,6 +77,12 @@ def test_off_mode_warns_when_mlp_only_setting_is_nondefault(setting):
     # CL01: the structured inactive-field notice names each inert field with its value, and the
     # same structural map feeds sweep admission through inactive_fields().
     (name, value), = setting.items()
+    from vfe3.config import VFE3Config
+    default = VFE3Config.__dataclass_fields__[name].default
+    if value == default:
+        value = {"block_mlp_expansion": 3, "block_mlp_activation": "silu",
+                 "block_mlp_dropout": 0.125, "m_block_mlp_lr": 0.0234}[name]
+        setting = {name: value}
     with pytest.warns(ConfigNotice, match=re.escape(f"{name}={value!r}")):
         cfg = _tiny_cfg(use_block_mlp=False, **setting)
     assert name in cfg.inactive_fields()

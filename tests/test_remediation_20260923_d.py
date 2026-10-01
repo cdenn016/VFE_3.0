@@ -2,6 +2,7 @@ r"""Deep-audit 2026-09-23 remediation, group D: model, decode, training, gradien
 
 Each test pins one punch-list item on a tiny CPU model (single-digit dims, one or two layers).
 """
+from tests.profiles import test_config
 
 import csv
 import inspect
@@ -43,7 +44,7 @@ def _tiny(**overrides: object) -> VFE3Config:
                 n_e_steps=1, e_q_mu_lr=0.1, e_phi_lr=0.0, m_phi_lr=0.0,
                 warmup_steps=1, max_steps=4)
     base.update(overrides)
-    return VFE3Config(**base)
+    return test_config(**base)
 
 
 def _sequential_loader(seq_len: int = 8, batch_size: int = 4, n: int = 105,
@@ -73,8 +74,9 @@ def test_decode_temperature_learned_false_freezes_scale_and_keeps_its_name() -> 
     assert float(model.prior_bank._tau_eff()) == pytest.approx(0.5, abs=0.0)
 
 
-def test_decode_temperature_learned_default_keeps_the_learned_scale() -> None:
-    cfg = _tiny(decode_mode="diagonal_chunked", decode_bias=False)
+def test_decode_temperature_learned_true_keeps_the_learned_scale() -> None:
+    cfg = _tiny(decode_mode="diagonal_chunked", decode_bias=False,
+                decode_temperature_learned=True)
     assert cfg.decode_temperature_learned is True
     model = VFEModel(cfg)
     optimizer = build_optimizer(model, cfg)
@@ -252,6 +254,7 @@ def test_transported_diagnostics_score_the_e_step_state_against_its_live_prior(
         overrides: dict) -> None:
     torch.manual_seed(5)
     cfg = _tiny(vocab_size=12, max_seq_len=4, e_q_mu_lr=1.0, mu_init_std=0.5, pos_phi="none",
+                sigma_init=1.0, phi_scale=0.01, lambda_alpha_mode="constant",
                 pos_rotation="none", **overrides)
     model = VFEModel(cfg).eval()
     tokens = torch.tensor([[0, 5, 2, 9]])

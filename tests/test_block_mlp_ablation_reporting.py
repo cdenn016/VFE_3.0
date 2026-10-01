@@ -1,12 +1,13 @@
 """End-to-end ablation disclosure for the optional block MLP."""
 
+from tests.profiles import test_config
 import ablation
 
 from vfe3.config import VFE3Config
 
 
 def _cfg(enabled: bool) -> VFE3Config:
-    return VFE3Config(
+    return test_config(
         vocab_size=17,
         embed_dim=4,
         n_heads=2,

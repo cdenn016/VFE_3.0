@@ -16,6 +16,7 @@ decoder) is covariant under block frame changes :math:`g \in \prod_b GL(d_b)`: t
 
 from __future__ import annotations
 
+from tests.profiles import test_config
 import warnings
 from typing import Any, Dict
 
@@ -52,7 +53,7 @@ def _cfg(**over: Any) -> VFE3Config:
     values.update(over)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        return VFE3Config(**values)
+        return test_config(**values)
 
 
 def _build(cfg: VFE3Config, seed: int = 0, *, dtype: torch.dtype = torch.float32) -> VFEModel:
@@ -228,7 +229,7 @@ def test_dense_training_branch_reads_the_frame() -> None:
     payload.update(decode_mode="full", decode_coordinates="reference")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        cfg = VFE3Config(**payload, _allow_legacy_dense_decode=True)
+        cfg = test_config(**payload, _allow_legacy_dense_decode=True)
     model = _build(cfg)
     tokens, targets = _tokens(), _targets()
     with torch.no_grad():

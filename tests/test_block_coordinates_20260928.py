@@ -14,6 +14,7 @@ parameters and state dicts; fail-closed configuration; row 11 not applicable; a 
 
 from __future__ import annotations
 
+from tests.profiles import test_config
 import warnings
 from typing import Any, Dict
 
@@ -53,7 +54,7 @@ def _cfg(**over: Any) -> VFE3Config:
     values.update(over)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        return VFE3Config(**values)
+        return test_config(**values)
 
 
 def _build(cfg: VFE3Config, seed: int = 0) -> VFEModel:
@@ -127,7 +128,7 @@ VARIANTS = {
 # ----------------------------------------------------------------------------------------------
 
 def test_defaults_are_local_and_add_nothing() -> None:
-    cfg = VFE3Config()
+    cfg = test_config()
     assert cfg.block_coordinates == "local" and cfg.decode_coordinates == "local"
     assert cfg.per_type_hidden_bias is False and cfg.m_per_type_hidden_bias_lr is None
     model = _build(_cfg())

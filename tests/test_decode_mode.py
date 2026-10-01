@@ -5,10 +5,10 @@ r"""Behavioral boundary between linear and prior-bank decoder modes.
 free-energy self-coupling stay on ``PriorBank`` for every decoder mode.
 """
 
+from tests.profiles import test_config
 import pytest
 import torch
 
-from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 from vfe3.model.prior_bank import PriorBank
 from vfe3.train import build_optimizer
@@ -60,7 +60,7 @@ def test_linear_mode_uses_no_nn_linear_module():
     # The exception is a single learned weight matrix (nn.Parameter), NOT an nn.Linear/MLP.
     # The block MLP (on by default) is a separate opt-in nn surface, so it is pinned off here.
     import torch.nn as nn
-    cfg = VFE3Config(vocab_size=10, embed_dim=4, n_heads=2, max_seq_len=3,
+    cfg = test_config(vocab_size=10, embed_dim=4, n_heads=2, max_seq_len=3,
                      decode_mode="linear", use_block_mlp=False)
     model = VFEModel(cfg)
     for m in model.modules():
@@ -68,7 +68,7 @@ def test_linear_mode_uses_no_nn_linear_module():
 
 
 def test_model_forward_and_backward_under_linear_decode():
-    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
+    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                      n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0, decode_mode="linear")
     model = VFEModel(cfg)
     tokens = torch.randint(0, 20, (3, 5))
@@ -89,7 +89,8 @@ def test_model_forward_and_backward_under_linear_decode():
 def test_optimizer_covers_all_params_under_linear_decode():
     # build_optimizer must group the output projection too: every model parameter is covered
     # by exactly one group (a missing group would silently freeze that weight).
-    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, decode_mode="linear")
+    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2, decode_mode="linear",
+                      decode_temperature_learned=True)
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
     grouped = {p for grp in opt.param_groups for p in grp["params"]}
@@ -98,8 +99,8 @@ def test_optimizer_covers_all_params_under_linear_decode():
 
 
 def test_optimizer_still_exactly_covers_params_under_prior_bank_decode():
-    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2,
-                     decode_mode="diagonal_chunked")
+    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2,
+                      decode_mode="diagonal_chunked", decode_temperature_learned=True)
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
     grouped = {p for grp in opt.param_groups for p in grp["params"]}
