@@ -111,8 +111,8 @@ def _enumerated_moments(ops, blocks, mu, sigma, beta, residual, floor):
     return torch.stack(means)[None], torch.stack(covariances)[None]
 
 
-@pytest.mark.parametrize("input_scope", ["head", "full"])
-@pytest.mark.parametrize("output_scope", ["head", "full"])
+@pytest.mark.parametrize("input_scope", ["full"])
+@pytest.mark.parametrize("output_scope", ["full"])
 @pytest.mark.parametrize("residual", [False, True])
 @pytest.mark.parametrize("compact", [True, False])
 def test_covariance_matches_enumerated_predictive_kernel(input_scope, output_scope, residual, compact):
@@ -159,7 +159,7 @@ def test_passive_frame_law() -> None:
 
 @pytest.mark.parametrize("residual", [False, True])
 def test_positive_definite_with_sharp_routing_and_rank_deficient_maps(residual) -> None:
-    ops, blocks, mu, sigma_full, _, _ = _setup("head", "head", residual, seed=5)
+    ops, blocks, mu, sigma_full, _, _ = _setup("full", "full", residual, seed=5)
     with torch.no_grad():
         ops.O.zero_()                           # every content map M_h = 0: Cov(m) is exactly zero
     beta = torch.zeros(1, H, N, N, dtype=torch.float64)
@@ -181,7 +181,7 @@ def test_depth_recursion_stays_well_conditioned_in_float32() -> None:
     """
     torch.manual_seed(0)
     Hq, Dq = 4, 2
-    ops = RelationalOperators([Dq] * Hq, 3, input_scope="head", readout_mode="predictive_content",
+    ops = RelationalOperators([Dq] * Hq, 3, input_scope="full", readout_mode="predictive_content",
                               output_scope="full", predictive_covariance="moment_matched")
     with torch.no_grad():
         ops.O.copy_(torch.randn(Hq, Hq * Dq, 1) @ torch.randn(Hq, 1, Dq))    # rank-one O_h
@@ -201,7 +201,7 @@ def test_depth_recursion_stays_well_conditioned_in_float32() -> None:
 
 
 def test_gradcheck_inputs_and_content_maps() -> None:
-    ops, blocks, mu, _, sigma_diag, beta = _setup("full", "head", True, seed=7)
+    ops, blocks, mu, _, sigma_diag, beta = _setup("full", "full", True, seed=7)
     frame = _frame(blocks, True)
     mu = mu.clone().requires_grad_(True)
     sigma = sigma_diag.clone().requires_grad_(True)

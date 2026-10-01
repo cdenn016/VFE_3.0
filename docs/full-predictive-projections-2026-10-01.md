@@ -1,0 +1,17 @@
+# Fixed full predictive projections, October 1, 2026
+
+Projected predictive attention now always reads and writes all K coordinates while retaining the reduced head dimension. Model construction supplies literal full scopes at every predictive layer. The predictive mean readout no longer contains head-scope branches. Metadata and scaling parameter estimates follow the actual shapes.
+
+Training, ablation, and scaling baselines no longer expose scope choices. The legacy head-input predictive arm was removed. Conditional and transported sweep controls select compatible head output and covariance passthrough. All seven remaining attention arms validated in the initial check. Conditional scope fields remain available. E-step gradients, update-mode rules, and mm_exact were not refactored by this task.
+
+Explicit head predictive scopes are rejected by configurations and direct operator construction. Historical head predictive checkpoints require deliberate architecture conversion; tensor resizing is not automatic. Existing full/full parameter names and initialization are unchanged, covered by a bitwise regression. Direct operator scope arguments now follow the other optional arguments; repository model construction uses keywords.
+
+The training launcher selects projected_predictive and merges only the per-run seed before constructing VFE3Config and VFEModel. Initial preservation validation found all non-scope baseline dictionary entries unchanged against the saved pre-edit snapshot. Subsequent concurrent working edits were preserved. In the final config check, ablation and scaling validated full/full; train_vfe3.py failed the existing canonical_frame/RoPE guard with rope_full_gauge=False. That unrelated working setting was preserved.
+
+The new regression initially recorded six failures and one pass. Focused verification passed 176 cases. One broader pass over 50 dependent files recorded 1,001 cases: 984 passed, 16 failed, one skipped. Legacy predictive fixtures were updated to full/full. Centering-specific covariance fixtures explicitly enable centering. The intervention equivalence check already passed, but seed 0 produced a smaller average loss effect than the existing threshold under full projections. Seed 1 supplies a clear effect for both positional settings, preserving assertions and tolerances.
+
+The affected-file run passed 204 of 205 cases; after the last fixture correction all 15 intervention tests passed. Every failure found in the broader pass was resolved in subsequent runs. The broader pass was not repeated. Tests used C:/anaconda/python.exe on CPU with one thread and tiny models. No GPU workload or environment change was performed. Sixteen selected files passed syntax checks. Exact counts, source hashes, JUnit XML, initial preservation validation, and the pre-edit source snapshot are in docs/test-results/full-predictive-2026-10-01/.
+
+Publication isolation preserves remote constructor defaults: omitted scopes resolve to full/full for predictive and head/head for other modes. Explicit legacy predictive head values remain rejected. Canonical user defaults were preserved.
+
+Publication verification from isolated origin/main baseline: 999 CPU cases passed, 1 skipped, zero failures/errors across 50 dependent test files. Mode-dependent omitted scope defaults also passed a direct smoke check. User configuration WIP and separate E-step work were excluded from the publication.

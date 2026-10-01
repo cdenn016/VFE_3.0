@@ -29,7 +29,7 @@ def test_predictive_spread_survives_common_translation(
     beta = beta.expand(1, 2, 3, 3).clone()
     ops = RelationalOperators([2, 2], 6, input_scope="full", output_scope="full",
                               readout_mode="predictive_content",
-                              predictive_covariance="moment_matched")
+                              predictive_covariance="moment_matched", predictive_covariance_centering=True)
     actual = ops.predictive_covariance_update(mu, sigma, beta, frame)
     expected = torch.tensor([15.0015, 15.2515, 15.689]).reshape(1, 3, 1).expand(1, 3, 4)
     actual_diagonal = actual if diagonal else actual.diagonal(dim1=-2, dim2=-1)
@@ -92,7 +92,7 @@ def test_centered_predictive_covariance_retains_correlations_and_gradients(resid
                              [[-.2, .4, .1], [.5, -.1, .2], [.2, -.4, .5]]]], requires_grad=True)
     ops = RelationalOperators([2, 2], 6, input_scope="full", output_scope="full",
                               readout_mode="predictive_content", attention_residual=residual,
-                              predictive_covariance="moment_matched")
+                              predictive_covariance="moment_matched", predictive_covariance_centering=True)
     with torch.no_grad():
         ops.T.copy_(torch.tensor([[[1., .25, -.5, 0.], [0., .5, .25, 1.]],
                                  [[.5, 0., 1., .25], [-.25, 1., 0., .5]]]))

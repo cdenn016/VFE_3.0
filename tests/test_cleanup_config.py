@@ -42,6 +42,8 @@ def test_historical_attention_pair_migrates(old_readout: str, canonical: str) ->
     payload.update(relational_mode="projected_filtering", relational_readout_mode=old_readout,
                    e_step_update="gradient", e_step_gradient="unroll", oracle_unroll_grad=True,
                    skip_belief_sigma_update=True, decode_mode="linear")
+    if canonical == "projected_predictive":
+        payload.update(relational_input_scope="full", relational_output_scope="full")
     cfg = config_from_serialized(payload, source="legacy attention")
     assert cfg.attention_mode == canonical
     assert cfg.relational_mode == "projected_filtering"

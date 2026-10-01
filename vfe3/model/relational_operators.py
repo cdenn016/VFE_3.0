@@ -15,6 +15,7 @@ class RelationalOperators(nn.Module):
 
     Every rank is the head dimension: S_Q/S_K are ``(H, d, input_dim)`` and T/O are
     ``(H, d, input_dim)`` / ``(H, output_dim, d)``, the untied standard-attention shapes.
+    Predictive content always reads and writes the full state; conditional updates retain their scopes.
     Independent maps are free matrices initialized with orthonormal rows.
     Their projected covariances must remain strictly positive definite.
     ``identity_content`` drops T/O and carries the transported belief unchanged.
@@ -28,9 +29,7 @@ class RelationalOperators(nn.Module):
         self,
         irrep_dims:            List[int],
         seed:                  int,
-        input_scope:           str   = "head",
         readout_mode:          str   = "conditional_update",
-        output_scope:          str   = "head",
         attention_residual:    bool  = False,
         identity_content:      bool  = False,
         output_init_scale:     float = 1.0,
@@ -38,6 +37,8 @@ class RelationalOperators(nn.Module):
         predictive_covariance: str   = "passthrough",
         predictive_covariance_floor: float = 1e-4,
         predictive_covariance_centering: bool = False,
+        input_scope:           Optional[str] = None,
+        output_scope:          Optional[str] = None,
     ) -> None:
         super().__init__()
         if not irrep_dims or any(type(d) is not int or d < 1 for d in irrep_dims) or len(set(irrep_dims)) != 1:
@@ -54,6 +55,11 @@ class RelationalOperators(nn.Module):
         if attention_residual and readout_mode != "predictive_content":
             raise ValueError("attention residual requires predictive_content")
         self.attention_residual = attention_residual
+        default_scope = "full" if readout_mode == "predictive_content" else "head"
+        input_scope = default_scope if input_scope is None else input_scope
+        output_scope = default_scope if output_scope is None else output_scope
+        if readout_mode == "predictive_content" and (input_scope != "full" or output_scope != "full"):
+            raise ValueError("predictive_content fixes input_scope and output_scope to 'full'")
         if input_scope not in ("head", "full"):
             raise ValueError("relational input_scope must be 'head' or 'full'")
         if readout_mode not in ("conditional_update", "predictive_content"):
@@ -133,14 +139,11 @@ class RelationalOperators(nn.Module):
         H, d = len(self.irrep_dims), self.irrep_dims[0]
         dtype = _compute_dtype(mu, self.T, self.O, frame.forward)
         with torch.autocast(device_type=mu.device.type, enabled=False):
-            coordinates = canonical.flatten(-2).unsqueeze(-2) if self.input_scope == "full" else canonical
+            coordinates = canonical.flatten(-2).unsqueeze(-2)              # (..., N, 1, K)
             values = (self.T.to(dtype) @ coordinates.to(dtype).unsqueeze(-1)).squeeze(-1)
             pooled = torch.einsum("...hij,...jhs->...ihs", beta.to(dtype), values)
-            if self.output_scope == "full":
-                # Sum heads inside the contraction, avoiding a (..., N, H, K) result.
-                body = torch.einsum("hks,...nhs->...nk", self.O.to(dtype), pooled)
-            else:
-                body = (self.O.to(dtype) @ pooled.unsqueeze(-1)).squeeze(-1).flatten(-2)
+            # Sum heads inside the contraction, avoiding a (..., N, H, K) result.
+            body = torch.einsum("hks,...nhs->...nk", self.O.to(dtype), pooled)
             if frame.block_diagonal:
                 body = body.reshape(*mu.shape[:-1], H, d)
             result = (frame.forward.to(dtype) @ body.unsqueeze(-1)).squeeze(-1)

@@ -103,7 +103,8 @@ def test_factor_route_config_validated_and_inactive_on_transported() -> None:
     assert "projected_factor_route" in tiny_config(attention_mode="transported", predictive_covariance="passthrough",
                        attention_residual=False, relational_output_scope="head").inactive_fields()
     assert "projected_factor_route" not in _cfg().inactive_fields()
-    assert "projected_factor_route" in _cfg(attention_mode="projected_predictive",
+    assert "projected_factor_route" in _cfg(attention_mode="projected_predictive", relational_input_scope="full",
+                          relational_output_scope="full",
                                                relational_routing="noisy_query").inactive_fields()
 
 

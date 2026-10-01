@@ -176,7 +176,13 @@ _CONFIG_VALUES: dict[str, Any] = {
 
 def config_values(**overrides: Any) -> dict[str, Any]:
     """Return a fresh complete configuration dictionary with local overrides."""
-    return deepcopy({**_CONFIG_VALUES, **overrides})
+    values = deepcopy({**_CONFIG_VALUES, **overrides})
+    if values["attention_mode"] == "projected_predictive":
+        # Fixed predictive architecture; explicit legacy values still exercise rejection.
+        for name in ("relational_input_scope", "relational_output_scope"):
+            if name not in overrides:
+                values[name] = "full"
+    return values
 
 
 def test_config(**overrides: Any) -> VFE3Config:

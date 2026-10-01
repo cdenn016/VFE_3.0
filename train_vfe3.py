@@ -126,9 +126,7 @@ config = dict(
     # Attention execution and projected input/output scopes.
     attention_mode                   = "projected_predictive",  # "transported" | "projected_conditional" | "projected_predictive"
 
-    relational_input_scope           = "full",         # each head reads all K coordinates; "head" is legacy behavior
 
-    relational_output_scope          = "full",                  # transformers: "full": requires predictive_content, legacy: 'head'
     
     attention_residual               = True,   # predictive S/T/O: add the incoming mean
     relational_routing               = "gaussian_kl",  # "gaussian_kl" | "noisy_query": exact posterior N(a_i; b_j, V_Q + V_K), predictive only
