@@ -172,6 +172,8 @@ config = dict(
     encode_mode                       = "per_token",   #"per_token_additive" is ~1.5x faster at K=80 currently unablated
                                                        # "canonical_content_projected" requires gaussian_diagonal input and a full decoder
     decode_chunk_size                 = 8192,
+    decode_ce_checkpoint              = "auto",     # historical gate; "auto_aggregate" saves memory with recompute
+    decode_ce_stable_reduction        = False,      # True avoids large-score CE cancellation; adds tensor passes
     decode_tau                        = 0.008,       #prior_bank = True temperature
     
     unigram_kappa                     = 1.0,         # tempering on log pi_v (1.0 = exact Bayes class prior)
@@ -289,6 +291,8 @@ config = dict(
 
     m_p_mu_lr                 = 0.005,
     m_p_sigma_lr              = 0.001,
+    m_decode_mu_lr            = None,       # None inherits m_p_mu_lr
+    m_decode_sigma_lr         = None,       # None inherits m_p_sigma_lr
     m_phi_lr                  = 0.0015,
     
     m_pos_phi_lr              = 0.001,      # None inherits m_phi_lr; own M-step rate for the LEARNED
@@ -425,7 +429,7 @@ config["kl_max"] = 8 * config["embed_dim"]
 
 def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int,
             train_loader=None, full_corpus_tokens: 'int | None' = None) -> str:
-    from vfe3.train import _fmt_mixer_lr, coverage_lines, parameter_report
+    from vfe3.train import _fmt_decode_lrs, _fmt_mixer_lr, coverage_lines, parameter_report
     rep = parameter_report(model, device=device)
     bar = "=" * 64
     cov = (coverage_lines(train_loader, n_steps, dataset, full_corpus_tokens=full_corpus_tokens)
@@ -451,6 +455,7 @@ def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int,
         *dead_line,
         f" M-LRs: mu={cfg.m_p_mu_lr}  sigma={cfg.m_p_sigma_lr}  "
         f"phi={cfg.m_phi_lr}",
+        f" decoder M-LRs: {_fmt_decode_lrs(cfg)}",
         f" auxiliary M-LRs: head_evidence={head_evidence_lr}  "
         f"head_mixer={_fmt_mixer_lr(cfg.m_head_mixer_lr, cfg.m_p_mu_lr)}  "
         f"block_mlp={_fmt_mixer_lr(cfg.m_block_mlp_lr, cfg.m_p_mu_lr)}",

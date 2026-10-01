@@ -292,7 +292,7 @@ def test_geometry_receives_exact_post_unscale_post_clip_covector(
     reference = VFEModel(cfg)
     actual = copy.deepcopy(reference)
     tokens, targets = _fixed_batch()
-    clip = 0.01
+    clip = 0.001
 
     reference_optimizer = build_optimizer(reference, cfg)
     reference_scaler = torch.amp.GradScaler(device="cpu", enabled=True, init_scale=128.0)

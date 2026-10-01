@@ -1,4 +1,4 @@
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import pytest
 import torch
@@ -11,7 +11,7 @@ from vfe3.run_artifacts import _cost_model_fields, _pure_path_report
 
 def _pure_cfg(mode, covariance="passthrough"):
     return VFE3Config(
-        vocab_size=17,
+        vocab_size=7,
         embed_dim=4,
         n_heads=2,
         max_seq_len=4,
@@ -34,8 +34,14 @@ def _pure_cfg(mode, covariance="passthrough"):
 
 
 def test_pure_path_report_distinguishes_strict_gate_from_frame_fixed_mode():
-    gate = _pure_path_report(_pure_cfg("gauge_gate", "delta_full"), [])
-    canonical = _pure_path_report(_pure_cfg("canonical_frame"), [])
+    reference_kwargs = dict(
+        attention_mode="projected_predictive", decode_coordinates="reference",
+        e_step_gradient="unroll", oracle_unroll_grad=True,
+    )
+    gate = _pure_path_report(
+        replace(_pure_cfg("gauge_gate", "delta_full"), **reference_kwargs), [])
+    canonical = _pure_path_report(
+        replace(_pure_cfg("canonical_frame"), **reference_kwargs), [])
 
     assert gate["config_toggles"]["block_mlp_mode"] == "gauge_gate"
     assert gate["config_toggles"]["block_mlp_structural_mode"] == "invariant_scalar_gate"
@@ -126,7 +132,7 @@ def test_selected_modes_execute_complete_model_forward():
     ):
         model = VFEModel(_pure_cfg(mode, covariance))
         logits = model(tokens)
-        assert logits.shape == (1, 4, 17)
+        assert logits.shape == (1, 4, 7)
         assert torch.isfinite(logits).all()
 
 

@@ -354,15 +354,22 @@ MLP, normalization, and decoder parameters. Optional outer penalties are separat
 choices. This loss is not the same scalar as the variational routing objective.
 
 Prior-bank divergence decoders such as `diagonal_chunked` and `full_chunked` are
-available on the projected route as well as on transported profiles. On a projected
-route the belief covariance is kept at its encode value: the predictive readout replaces
-only the mean, and relational filtering returns no sigma gradient. The covariance terms
-of the KL readout therefore depend on the input token and the vocabulary item alone.
-With frozen $\Sigma_q$ they form a context-free (input token, vocabulary) bias table
-added to every logit at scale $1/\tau_{\mathrm{eff}}$, a lookup channel that bypasses
-attention, normalization, and the MLP. A gain from switching a linear decode to
-`full_chunked` on this route cannot be credited to uncertainty-aware decoding without a
+available on the projected route as well as on transported profiles. With
+`predictive_covariance="passthrough"`, the predictive readout replaces only the mean;
+relational filtering likewise returns no sigma gradient. If no later seam rewrites
+covariance, the belief covariance stays at its encode value, so the covariance terms of
+the KL readout depend on the input token and the vocabulary item alone. With frozen
+$\Sigma_q$ they form a context-free (input token, vocabulary) bias table added to every
+logit at scale $1/\tau_{\mathrm{eff}}$, a lookup channel that bypasses attention,
+normalization, and the MLP. A gain from switching a linear decode to `full_chunked` in
+this passthrough setting cannot be credited to uncertainty-aware decoding without a
 control arm for that channel.
+
+With `predictive_covariance="moment_matched"`, the predictive readout instead replaces
+both the mean and covariance with its kernel's moments. The resulting covariance
+depends on context and does not reduce to the frozen input-token bias table. Context
+dependence alone does not establish calibration quality or predictive benefit; those
+require matched empirical comparisons.
 
 ### Optional belief-revision paths
 
@@ -562,3 +569,5 @@ The `grow_K_mup` scaling route varies `e_q_mu_lr` and requires gradient belief
 updates; it rejects `mm_exact` and `predictive_content`, which do not read that rate.
 Use the standard width/depth/budget grids for predictive content; see
 [scaling settings](docs/scaling-settings.md).
+
+Decoder memory/compute options and independent mean/variance rates are documented in [Decoder controls](docs/decoder-controls.md).

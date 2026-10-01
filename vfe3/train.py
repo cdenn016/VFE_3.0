@@ -273,6 +273,17 @@ class PhiFisherStatisticsProvider:
         raise ValueError("fisher_group statistics exist only for phi_embed and pos_phi_free")
 
 
+def _decode_learning_rates(cfg: VFE3Config) -> tuple[float, float]:
+    """Resolve split decoder rates, then legacy override, then encoder defaults."""
+    mu_lr = cfg.m_p_mu_lr if cfg.m_decode_lr is None else cfg.m_decode_lr
+    sigma_lr = cfg.m_p_sigma_lr if cfg.m_decode_lr is None else cfg.m_decode_lr
+    if cfg.m_decode_mu_lr is not None:
+        mu_lr = cfg.m_decode_mu_lr
+    if cfg.m_decode_sigma_lr is not None:
+        sigma_lr = cfg.m_decode_sigma_lr
+    return mu_lr, sigma_lr
+
+
 def build_optimizer(
     model: VFEModel,
     cfg:   VFE3Config,
@@ -283,7 +294,12 @@ def build_optimizer(
     M-step learning rate: every live mean table at ``m_p_mu_lr``; every live (log) scale
     table and the decode temperature ``decode_log_scale`` together
     at ``m_p_sigma_lr``; the belief gauge-frame coordinates ``phi_embed`` at ``m_phi_lr``.
-    The weight decay ``cfg.weight_decay`` is shared.
+    ``m_decode_mu_lr`` controls separate decode means or linear weight/bias;
+    ``m_decode_sigma_lr`` controls separate decode log variances. Each falls back to the
+    legacy ``m_decode_lr`` override, then the corresponding encoder rate. Learned temperature
+    keeps its legacy rate or ``m_p_sigma_lr``; shared encode/decode tables keep encoder rates.
+    Omitting overrides preserves historical group topology and semantic mu/sigma decays.
+    Head evidence keeps its dedicated ``m_head_evidence_lr``.
 
     Optional parameters are grouped only when their toggle is on: the linear decode weight
     ``output_proj_weight`` (decode_mode='linear') at ``m_p_mu_lr`` (a mean-readout scale); the
@@ -348,25 +364,31 @@ def build_optimizer(
         groups.append({"params": [pb.mu_embed], "lr": cfg.m_p_mu_lr, "role": "mu", **mu_wd})
     # decode_temperature_learned=False freezes decode_log_scale (requires_grad=False in VFEModel), so
     # this filter keeps it out of every optimizer group and the readout temperature stays fixed.
-    sigma_parameters = [parameter for parameter in (pb.sigma_log_embed, pb.decode_log_scale)
-                        if parameter is not None and parameter.requires_grad]
+    decode_mu_lr, decode_sigma_lr = _decode_learning_rates(cfg)
+    # Keep the historical shared sigma/temperature group when the override is omitted.
+    sigma_parameters = [parameter for parameter in (
+        pb.sigma_log_embed, pb.decode_log_scale if cfg.m_decode_lr is None else None)
+        if parameter is not None and parameter.requires_grad]
     if sigma_parameters:
         groups.append({"params": sigma_parameters, "lr": cfg.m_p_sigma_lr,
+                       "role": "sigma", **sigma_wd})
+    if cfg.m_decode_lr is not None and pb.decode_log_scale.requires_grad:
+        groups.append({"params": [pb.decode_log_scale], "lr": cfg.m_decode_lr,
                        "role": "sigma", **sigma_wd})
     if phi_group is not None:
         groups.append(phi_group)
     if getattr(pb, "decode_mu_embed", None) is not None:        # untie_decode_bank=True decode tables
         # Cloned from the encode tables at init (step-0 byte-identical decode), trained separately so
         # the decode direction can decouple from the E-step prior/self-coupling target; grouped like
-        # the tables they were cloned from (mean@m_p_mu_lr, log-scale@m_p_sigma_lr).
-        groups.append({"params": [pb.decode_mu_embed],        "lr": cfg.m_p_mu_lr,    "role": "mu", **mu_wd})
-        groups.append({"params": [pb.decode_sigma_log_embed], "lr": cfg.m_p_sigma_lr, "role": "sigma", **sigma_wd})
+        # the tables they were cloned from unless their decoder rate overrides the fallback.
+        groups.append({"params": [pb.decode_mu_embed],        "lr": decode_mu_lr,    "role": "mu", **mu_wd})
+        groups.append({"params": [pb.decode_sigma_log_embed], "lr": decode_sigma_lr, "role": "sigma", **sigma_wd})
     if pb.output_proj_weight is not None:                       # decode_mode='linear'
-        groups.append({"params": [pb.output_proj_weight], "lr": cfg.m_p_mu_lr, "role": "mu", **mu_wd})
+        groups.append({"params": [pb.output_proj_weight], "lr": decode_mu_lr, "role": "mu", **mu_wd})
     if pb.output_proj_bias is not None:                         # decode_bias: learned log-unigram prior
         # weight_decay=0 -- decaying a unigram prior toward zero biases it to a flat distribution
         # (the same protection phi/Omega carry).
-        groups.append({"params": [pb.output_proj_bias], "lr": cfg.m_p_mu_lr, "weight_decay": 0.0, "role": "mu"})
+        groups.append({"params": [pb.output_proj_bias], "lr": decode_mu_lr, "weight_decay": 0.0, "role": "mu"})
     if getattr(pb, "head_evidence_logits", None) is not None:
         head_evidence_lr = (cfg.m_p_mu_lr if cfg.m_head_evidence_lr is None
                             else cfg.m_head_evidence_lr)
@@ -738,14 +760,18 @@ def _transfer_targets(
     model:   VFEModel,
     device:  torch.device,
 ) -> torch.Tensor:
-    """Validate an owned CPU batch before transfer for the built-in linear fused decoder.
+    """Validate an owned CPU batch before transfer for each built-in fused decoder.
 
     Public/custom decoders and device-origin loaders retain their normal validation. Views made
     later (accumulation or grouped padding) do not inherit the one-use record and revalidate.
     """
+    decode_mode = getattr(getattr(model, "cfg", None), "decode_mode", None)
     if (type(model) is VFEModel and type(model.prior_bank) is PriorBank
-            and model.cfg.decode_mode == "linear"
-            and get_decode_registration("linear").fused_ce is PriorBank.decode_ce_linear_chunked
+            and decode_mode in ("linear", "diagonal_chunked", "full_chunked",
+                                "expected_likelihood_chunked", "family_chunked")
+            and get_decode_registration(decode_mode).fused_ce is getattr(
+                PriorBank, "decode_ce_linear_chunked" if decode_mode == "linear"
+                else f"decode_ce_{decode_mode}")
             and type(targets) is torch.Tensor and targets.device.type == "cpu"
             and targets.dtype == torch.long and targets.layout == torch.strided
             and not torch.is_inference_mode_enabled()):
@@ -4042,6 +4068,16 @@ def _fmt_mixer_lr(configured: Optional[float], mean_lr: float) -> str:
     return f"{mean_lr} (inherit mu)" if configured is None else str(configured)
 
 
+def _fmt_decode_lrs(cfg: VFE3Config) -> str:
+    """Show realized decoder rates, including inactive variance and shared-table cases."""
+    mu_lr, sigma_lr = _decode_learning_rates(cfg)
+    if cfg.decode_mode == "linear":
+        return f"mu={mu_lr}  sigma=inactive"
+    if not cfg.untie_decode_bank:
+        return f"mu={cfg.m_p_mu_lr} (shared)  sigma={cfg.m_p_sigma_lr} (shared)"
+    return f"mu={mu_lr}  sigma={sigma_lr}"
+
+
 def _fmt_tau(cfg: VFE3Config, model: VFEModel) -> str:
     r"""Banner format for the softmax temperature: a scalar kappa -> '1.5000', a per-head
     (list) kappa -> '[t0, t1, ...]' (T1). Converts a list kappa to a tensor first so attention_tau
@@ -4214,6 +4250,7 @@ def _banner(
         *cov,
         *dead_line,
         f" M-LRs: mu={cfg.m_p_mu_lr}  sigma={cfg.m_p_sigma_lr}  phi={cfg.m_phi_lr}",
+        f" decoder M-LRs: {_fmt_decode_lrs(cfg)}",
         f" mixer-LRs: head_evidence={head_evidence_lr}  "
         f"head_mixer={_fmt_mixer_lr(cfg.m_head_mixer_lr, cfg.m_p_mu_lr)}",
         f" VFE: lambda_alpha={cfg.lambda_alpha}  kappa_beta={cfg.kappa_beta}  "

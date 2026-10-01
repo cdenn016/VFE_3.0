@@ -343,15 +343,17 @@ class ExactCongruenceDiagonalGaussian(DiagonalGaussian):
 
         K = mu_q.shape[-1]
         blocks = _blocking(irrep_dims, K)
-        a, s_tilde, log_abs_det = _pullback_query(mu_q, dispersion_q, omega, blocks)
-
         compute_dtype = (torch.float64
                          if torch.float64 in (mu_q.dtype, dispersion_q.dtype,
                                               mu_k.dtype, dispersion_k.dtype)
                          else torch.float32)
-        s_back = s_tilde.to(compute_dtype).clamp(min=eps)                     # (..., N, N, K)
+        # The floor defines the input distributions, before any coordinate change. Flooring
+        # only the pulled-back trace numerator would disagree with its determinant term.
+        s_query = dispersion_q.to(compute_dtype).clamp(min=eps)               # (..., N, K)
+        a, s_tilde, log_abs_det = _pullback_query(mu_q, s_query, omega, blocks)
+        s_back = s_tilde.to(compute_dtype)                                    # (..., N, N, K)
         s_key = dispersion_k.to(compute_dtype).clamp(min=eps).unsqueeze(-3)   # (..., 1, N, K)
-        s_self = dispersion_q.to(compute_dtype).clamp(min=eps).unsqueeze(-2)  # (..., N, 1, K)
+        s_self = s_query.unsqueeze(-2)                                       # (..., N, 1, K)
         delta = mu_k.to(compute_dtype).unsqueeze(-3) - a.to(compute_dtype)    # (..., N, N, K)
         # Per-coordinate terms of 2*KL, less the -K and the determinant of the pulled-back query
         # (both of which are per BLOCK, added after the coordinate reduction below).

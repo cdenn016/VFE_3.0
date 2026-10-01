@@ -302,7 +302,7 @@ def _pure_ns(**over):
     r"""SimpleNamespace with every attribute _pure_path_report reads, at the pure values."""
     base = dict(
         include_attention_entropy=True, transport_mode="flat", lambda_alpha_mode="constant",
-        decode_mode="diagonal_chunked", use_head_mixer=False,
+        decode_mode="diagonal_chunked", decode_coordinates="reference", use_head_mixer=False,
         use_priorbank_head_evidence_mixer=False, encode_mode="per_token",
         lambda_beta=1.0,
         gauge_transport="on", pos_rotation="none", rope_full_gauge=False, rope_on_value=True,

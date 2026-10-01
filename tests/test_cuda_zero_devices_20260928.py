@@ -2,8 +2,8 @@
 
 With ``CUDA_VISIBLE_DEVICES=""`` the cu128 torch build reports ``torch.cuda.is_available()`` True
 while ``torch.cuda.device_count()`` is 0, and ``torch.cuda.get_device_name(0)`` raises 'Invalid
-device id'. The provenance and cost-model writers must treat zero visible devices as CPU. The CUDA
-queries are monkeypatched, so no device is touched. Tiny CPU models only (K=4, two heads, N=4).
+device id'. The provenance and cost-model writers must report the actual CPU model device even when
+CUDA inventory is present. The CUDA queries are monkeypatched, so no device is touched. Tiny CPU models only (K=4, two heads, N=4).
 """
 import json
 import logging
@@ -59,8 +59,8 @@ SITES: Dict[str, Callable[[Path], object]] = {
 
 
 @pytest.mark.parametrize("site", sorted(SITES))
-@pytest.mark.parametrize("n_devices, expected", [(0, "cpu"), (1, "Fake GPU")])
-def test_device_name_treats_zero_visible_cuda_devices_as_cpu(
+@pytest.mark.parametrize("n_devices, expected", [(0, "cpu"), (1, "cpu")])
+def test_device_name_follows_cpu_model_independently_of_cuda_inventory(
         site: str, n_devices: int, expected: str, tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch) -> None:
     def device_name(device: object = None) -> str:

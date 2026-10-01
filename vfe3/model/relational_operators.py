@@ -201,7 +201,10 @@ class RelationalOperators(nn.Module):
             b = beta.to(dtype)                                                     # (..., H, N, N)
             eye_h = torch.eye(H, dtype=dtype, device=mu.device)
 
-            values = torch.einsum("hsk,...nk->...nhs", T_hat, xi)                  # (..., N, H, d)
+            # Covariance is invariant to a shared source shift because each beta row sums to one.
+            # Center before T so the second-moment identity does not subtract squared common offsets.
+            centered_xi = xi - xi[..., :1, :]                                      # (..., N, K)
+            values = torch.einsum("hsk,...nk->...nhs", T_hat, centered_xi)         # (..., N, H, d)
             TC = torch.einsum("hsk,...nkm->...nhsm", T_hat, C)                     # (..., N, H, d, K)
             source = torch.einsum("...nhsm,gtm->...nhgst", TC, T_hat)             # (..., N, H, H, d, d)
             # c^{hh'}_ij: beta^h on the head diagonal, beta^h beta^h' off it.

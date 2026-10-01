@@ -100,6 +100,7 @@ def test_default_adamw_one_step_is_byte_identical_to_golden():
         decode_bias=False,
         untie_decode_bank=False,
         decode_unigram_prior=False,
+        decode_temperature_learned=True,
         skip_belief_sigma_update=False,
         beta_attention_prior="causal",
         decode_av_precision="fp32",

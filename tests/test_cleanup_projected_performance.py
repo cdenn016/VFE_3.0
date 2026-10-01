@@ -137,6 +137,7 @@ def _configuration(**overrides: Any) -> VFE3Config:
                     gauge_group="block_glk", skip_belief_sigma_update=True,
                     e_phi_lr=0.0, oracle_unroll_grad=True, warmup_steps=0,
                     max_steps=2, log_interval=0, eval_interval=0,
+                    decode_temperature_learned=False,
                     use_head_mixer=False, use_block_mlp=False,
                     attention_mode="projected_predictive", relational_input_scope="full",
                     relational_output_scope="full", prior_handoff_rho=.7, prior_handoff_sigma=.4)
@@ -150,6 +151,7 @@ def test_omitted_handoff_preserves_model_outputs_and_gradients(monkeypatch: pyte
                                                              family: str, gradient_mode: str) -> None:
     torch.manual_seed(54)
     model = VFEModel(_configuration(family=family, e_step_gradient=gradient_mode))
+    assert model.prior_bank.decode_log_scale.requires_grad is False
     ids = torch.tensor([[0, 1, 2]])
     targets = torch.tensor([[1, 2, 3]])
     admissions = []
@@ -161,10 +163,11 @@ def test_omitted_handoff_preserves_model_outputs_and_gradients(monkeypatch: pyte
     monkeypatch.setattr(stack_module, "_can_omit_prior_handoff", record)
     actual = model(ids, targets)[1]
     assert admissions == [True]
-    actual_grads = torch.autograd.grad(actual, tuple(model.parameters()), allow_unused=True)
+    parameters = tuple(p for p in model.parameters() if p.requires_grad)
+    actual_grads = torch.autograd.grad(actual, parameters, allow_unused=True)
     monkeypatch.setattr(stack_module, "_can_omit_prior_handoff", lambda *args: False)
     expected = model(ids, targets)[1]
-    expected_grads = torch.autograd.grad(expected, tuple(model.parameters()), allow_unused=True)
+    expected_grads = torch.autograd.grad(expected, parameters, allow_unused=True)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     for a, b in zip(actual_grads, expected_grads):
         assert (a is None) == (b is None)
@@ -222,6 +225,7 @@ def test_captured_stack_retains_handoff_values() -> None:
 
 def test_self_coupling_loss_retains_handoff(monkeypatch: pytest.MonkeyPatch) -> None:
     model = VFEModel(_configuration(mstep_self_coupling_weight=.2))
+    assert model.prior_bank.decode_log_scale.requires_grad is False
     admissions = []
     original = stack_module._can_omit_prior_handoff
     def record(*args: Any) -> bool:
@@ -230,7 +234,8 @@ def test_self_coupling_loss_retains_handoff(monkeypatch: pytest.MonkeyPatch) -> 
         return result
     monkeypatch.setattr(stack_module, "_can_omit_prior_handoff", record)
     loss = model(torch.tensor([[0, 1, 2]]), torch.tensor([[1, 2, 3]]))[1]
-    gradients = torch.autograd.grad(loss, tuple(model.parameters()), allow_unused=True)
+    parameters = tuple(p for p in model.parameters() if p.requires_grad)
+    gradients = torch.autograd.grad(loss, parameters, allow_unused=True)
     assert admissions == [False]
     assert torch.isfinite(loss)
     assert all(g is None or torch.isfinite(g).all() for g in gradients)
