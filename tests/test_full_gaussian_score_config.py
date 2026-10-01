@@ -21,7 +21,7 @@ def _tiny_config(**overrides: Any) -> VFE3Config:
         family="gaussian_full", gauge_group="block_glk", transport_mode="flat",
         cross_couplings=None, pos_phi="none", pos_rotation="none",
         e_step_update="gradient", e_step_gradient="unroll",
-        oracle_unroll_grad=True, compile_pair_kernel=False,
+        oracle_unroll_grad=True,
         e_phi_lr=0.005, phi_precond_mode="killing_per_block",
         decode_mode="linear", mu_init_std=0.01, phi_scale=0.01,
         lambda_alpha_mode="constant",

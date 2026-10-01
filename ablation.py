@@ -583,7 +583,6 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
                                                  
       
     skip_belief_sigma_update             = True,        # skip the belief-channel sigma E-step update
-    compile_pair_kernel                  = False,       # torch.compile the closed-form pair kernel 
     
     transport_clamp_monitor              = True,
     generate_embedding_figures           = False,
@@ -1025,7 +1024,6 @@ _ATTENTION_REQUIRES = {
     "transport_mode": "flat", "gauge_group": "block_glk",
     "gauge_transport": "on", "pos_rotation": "none",
     "encode_mode": "per_token", "decode_mode": "linear",
-    "compile_pair_kernel": False,
     "cross_couplings": None, "use_priorbank_head_evidence_mixer": False,
     "attention_mode": "projected_predictive", "relational_input_scope": "full",
     "relational_output_scope": "head",
