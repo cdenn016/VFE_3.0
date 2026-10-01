@@ -39,6 +39,8 @@ class RelationalOperators(nn.Module):
         predictive_covariance_centering: bool = False,
         input_scope:           Optional[str] = None,
         output_scope:          Optional[str] = None,
+        *,
+        receiver_noise:        float = 1.0,
     ) -> None:
         super().__init__()
         if not irrep_dims or any(type(d) is not int or d < 1 for d in irrep_dims) or len(set(irrep_dims)) != 1:
@@ -55,21 +57,27 @@ class RelationalOperators(nn.Module):
         if attention_residual and readout_mode != "predictive_content":
             raise ValueError("attention residual requires predictive_content")
         self.attention_residual = attention_residual
-        default_scope = "full" if readout_mode == "predictive_content" else "head"
+        default_scope = "full" if readout_mode in ("predictive_content", "full_link_update") else "head"
         input_scope = default_scope if input_scope is None else input_scope
         output_scope = default_scope if output_scope is None else output_scope
         if readout_mode == "predictive_content" and (input_scope != "full" or output_scope != "full"):
             raise ValueError("predictive_content fixes input_scope and output_scope to 'full'")
         if input_scope not in ("head", "full"):
             raise ValueError("relational input_scope must be 'head' or 'full'")
-        if readout_mode not in ("conditional_update", "predictive_content"):
+        if readout_mode not in ("conditional_update", "predictive_content", "full_link_update"):
             raise ValueError("invalid relational readout_mode")
         if output_scope not in ("head", "full"):
             raise ValueError("invalid relational output_scope")
-        if output_scope == "full" and readout_mode != "predictive_content":
+        if output_scope == "full" and readout_mode not in ("predictive_content", "full_link_update"):
             raise ValueError("full output requires predictive_content")
-        if readout_mode == "predictive_content" and identity_content:
+        if readout_mode in ("predictive_content", "full_link_update") and identity_content:
             raise ValueError("predictive_content requires learned content maps")
+        if readout_mode == "full_link_update" and (input_scope != "full" or output_scope != "full"):
+            raise ValueError("full_link_update requires full input and output scopes")
+        if (isinstance(receiver_noise, bool) or not isinstance(receiver_noise, (int, float))
+                or not math.isfinite(receiver_noise) or receiver_noise <= 0.0):
+            raise ValueError("receiver_noise must be a finite positive reference variance")
+        self.receiver_noise = float(receiver_noise)
         self.readout_mode = readout_mode
         if routing not in ("gaussian_kl", "noisy_query"):
             raise ValueError("relational routing must be 'gaussian_kl' or 'noisy_query'")
@@ -125,6 +133,8 @@ class RelationalOperators(nn.Module):
     @property
     def inference_semantics(self) -> str:
         """Name the actual mean update used by this module."""
+        if self.readout_mode == "full_link_update":
+            return "relational_full_link_frozen_filtering"
         return ("relational_predictive_content" if self.readout_mode == "predictive_content"
                 else "relational_projected_conditional_filtering")
 

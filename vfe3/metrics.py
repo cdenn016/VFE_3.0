@@ -673,7 +673,7 @@ def covariance_frozen_at_encode(cfg: object) -> bool:
     CE, not context-dependent belief uncertainty.
     """
     attention_mode = getattr(cfg, "attention_mode", "transported")
-    if attention_mode == "transported":
+    if attention_mode in ("transported", "projected_gradient"):
         e_step_frozen = bool(getattr(cfg, "skip_belief_sigma_update", False))
     elif attention_mode == "projected_predictive":
         # The predictive readout rewrites sigma only under the moment-matched covariance.

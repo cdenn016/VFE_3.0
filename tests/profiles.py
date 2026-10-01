@@ -77,6 +77,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'attention_residual': False,
     'relational_output_init': 'identity',
     'relational_identity_content': False,
+    'relational_receiver_noise': 1.0,
     'relational_routing': 'gaussian_kl',
     'predictive_covariance': 'passthrough',
     'predictive_covariance_centering': False,

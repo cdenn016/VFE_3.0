@@ -1,0 +1,97 @@
+{
+  "captured_utc": "2026-10-01T19:16:27.3541428Z",
+  "head": "3720337f0da6263b8bad4dad8e88c625ba4e8586",
+  "scope": "Source trace only; concurrent predictive full/full edits present; no new execution tests",
+  "sources": [
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\train_vfe3.py",
+      "sha256": "7c857480295845d1356ba03fbab070f11bb036bca8b927c9380d1d374557b895",
+      "bytes": 43740
+    },
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\vfe3\\config.py",
+      "sha256": "3be8d47d268843d89221303858e0c2f10ac9a5c309055a2477e07a44b0c009bf",
+      "bytes": 194431
+    },
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\vfe3\\model\\model.py",
+      "sha256": "706aaddd364920b87c601f6550b403247247e1483c20013edffc3e4edede8fb3",
+      "bytes": 182462
+    },
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\vfe3\\model\\stack.py",
+      "sha256": "77a6f8993ef0ff786b393bbbe19e69d864f4152998d2c43e2be4adabb521a599",
+      "bytes": 12788
+    },
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\vfe3\\model\\block.py",
+      "sha256": "85b8bad20867aca28f0d728c4ec0326d2612d3af086dbc4b3ad3ebfc3ae00da7",
+      "bytes": 18806
+    },
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\vfe3\\model\\relational_operators.py",
+      "sha256": "5bc7f5a70aadf7f6c45082d14bb8c69456b808e589379ad1a0f4bd91f570b720",
+      "bytes": 19447
+    },
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\vfe3\\gradients\\relational.py",
+      "sha256": "d66b6474e6d99ae289783fa8840b178a93660ed61ef9e64552da4594eb197cf7",
+      "bytes": 10521
+    },
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\vfe3\\gradients\\qkv.py",
+      "sha256": "6d259c02f76be26554af3b018065aa61161530bfb8fdd048955474a2cc8744bc",
+      "bytes": 18062
+    },
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\vfe3\\gradients\\oracle.py",
+      "sha256": "976ed4975b02ed259b6a797bc977303961d32cf8b6c25b44e78bc6a8bef8cc0d",
+      "bytes": 15057
+    },
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\vfe3\\gradients\\kernels.py",
+      "sha256": "0a4af926adc30a8cd392bc6af641c35ad04f6a5a1302dbd67ce0af81e836ed45",
+      "bytes": 70061
+    },
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\vfe3\\inference\\e_step.py",
+      "sha256": "d4b2905870b10992ee41e338d6ba70114a328852f4bdc002000b352237896e9f",
+      "bytes": 84329
+    },
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\vfe3\\geometry\\retraction.py",
+      "sha256": "c8dff0e662c21de92f35a5ae03b3295b9ee6af89ac3ed0d79dc56c072bdba8e0",
+      "bytes": 39272
+    },
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\vfe3\\train.py",
+      "sha256": "dc76271ce086147d08b1107c5ed6a4fb95275dc3d7187086bc279301d825cb77",
+      "bytes": 251686
+    },
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\vfe3\\run_artifacts.py",
+      "sha256": "b415ff7917a53b7c6a88f1939719f0d9e7463a4544cf53361b20be422e7ce338",
+      "bytes": 288793
+    },
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\Research\\manuscripts\\Attention\\GL(K)_attention_v2.tex",
+      "sha256": "b162c4eeb38abbdcfec4d7a6a46bd798ffa901465e4a18852f629d915c8f0abd",
+      "bytes": 165005
+    },
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\Research\\manuscripts\\Attention\\GL(K)_gradients.tex",
+      "sha256": "df56fb4e4451f96c5f7ff3b34f748786f6124fde3aa2cce64fc986e007fcb46e",
+      "bytes": 95896
+    },
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\docs\\investigations\\full-relational-2026-10-01\\report.md",
+      "sha256": "268c458a4c669560c52076e4a0ba987a38c013dd3d128f1be5c9d856b0a06bb2",
+      "bytes": 12677
+    },
+    {
+      "path": "C:\\Users\\chris and christine\\Desktop\\VFE_3.0\\docs\\investigations\\full-relational-2026-10-01\\estep-routes.md",
+      "sha256": "47baa92c42ece5fc6a228de30ca341f8459ff49c132e39359171081a2bc10b3e",
+      "bytes": 11860
+    }
+  ]
+}

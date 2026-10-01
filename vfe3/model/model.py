@@ -381,6 +381,7 @@ class VFEModel(nn.Module):
                                     attention_residual=cfg.attention_residual,
                                     identity_content=cfg.relational_identity_content,
                                     output_init_scale=output_init_scale,
+                                    receiver_noise=cfg.relational_receiver_noise,
                                     routing=cfg.relational_routing,
                                     predictive_covariance=cfg.predictive_covariance,
                                     predictive_covariance_centering=cfg.predictive_covariance_centering,
@@ -2020,6 +2021,15 @@ class VFEModel(nn.Module):
         d["relational_conditional_cost_delta"] = (
             d["relational_conditional_cost_after"] - d["relational_conditional_cost_before"])
         d["relational_conditional_cost_tokens"] = float(snapshot.token_ids.numel())
+        if self.cfg.attention_mode == "projected_gradient":
+            # These are the variable terms of the frozen receiver energy; no global-F
+            # or comparison-router stationarity is implied by their difference.
+            for name in ("relational_receiver_cost_before", "relational_receiver_cost_after"):
+                d[name] = float(cap[name])
+            d["relational_receiver_cost_delta"] = (
+                d["relational_receiver_cost_after"] - d["relational_receiver_cost_before"])
+            d["relational_receiver_noise"] = float(self.cfg.relational_receiver_noise)
+            d["relational_attention_capture"] = "episode_initial"
         ops = self.relational_operators_by_layer[layer_index]
         raw_maps = (ops.raw_score_q, ops.raw_score_k)
         minima = []

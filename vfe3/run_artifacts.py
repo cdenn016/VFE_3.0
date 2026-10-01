@@ -108,6 +108,7 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
     H, d = cfg.n_heads, cfg.d_head
     r, s = d, (None if cfg.relational_identity_content else d)
     predictive = cfg.relational_readout_mode == "predictive_content"
+    full_link = cfg.relational_readout_mode == "full_link_update"
     input_scope = "full" if predictive else cfg.relational_input_scope
     output_scope = "full" if predictive else cfg.relational_output_scope
     input_dim = cfg.embed_dim if input_scope == "full" else d
@@ -121,11 +122,13 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "n_layers": cfg.n_layers, "layer_parameter_sharing": "independent",
         "per_layer_parameter_counts": layer_counts,
         "shape_scope": "per_layer",
-        "inference_semantics": ("relational_predictive_content" if predictive
+        "inference_semantics": ("relational_full_link_frozen_filtering" if full_link else
+                                "relational_predictive_content" if predictive
                                 else "relational_projected_conditional_filtering"),
         "readout_mode": cfg.relational_readout_mode,
         "output_scope": output_scope,
-        "mean_update": ("input_plus_predictive_mean" if cfg.attention_residual else
+        "mean_update": ("receiver_fisher_step" if full_link else
+                        "input_plus_predictive_mean" if cfg.attention_residual else
                         "replace_with_predictive_mean" if predictive else "conditional_fisher_step"),
         "mode": cfg.relational_mode,
         "input_scope": input_scope,
@@ -145,9 +148,12 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
                    else getattr(cfg, f"m_relational_{role}_lr")) if counts[role] else None
             for role in counts},
         "score_covariance_contract": "exact_full_reduced_covariance_from_local_gaussian",
-        "covariance_update": (getattr(cfg, "predictive_covariance", "passthrough") if predictive
+        "receiver_noise": cfg.relational_receiver_noise if full_link else None,
+        "covariance_update": (("passthrough" if cfg.skip_belief_sigma_update else "fisher_step") if full_link else
+                              getattr(cfg, "predictive_covariance", "passthrough") if predictive
                               else "not_applicable"),
-        "content_covariance_contract": ("exact_predictive_kernel_moment_match_plus_covariant_floor"
+        "content_covariance_contract": ("full_link_pushforward_plus_positive_reference_noise" if full_link else
+                                        "exact_predictive_kernel_moment_match_plus_covariant_floor"
                                         if predictive and getattr(cfg, "predictive_covariance",
                                                                   "passthrough") == "moment_matched"
                                         else "frozen_receiver_bookkeeping_not_predictive_covariance" if predictive
@@ -161,8 +167,9 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "factorization_policy": "zero_jitter_no_covariance_repairs",
         "factorization_fallback": "failed_entries_source_square_root_qr_fp64",
         "temperature_convention": "kappa_beta_times_sqrt_ambient_head_dim",
-        "routing_state": "pre_update", "state_destination": "receiver_belief_mean",
-        "source_beliefs": "live_pre_update" if predictive else "detached_pre_update",
+        "routing_state": "episode_initial" if full_link else "pre_update",
+        "state_destination": "receiver_belief_mean_and_covariance" if full_link else "receiver_belief_mean",
+        "source_beliefs": "live_episode_initial" if full_link else "live_pre_update" if predictive else "detached_pre_update",
         "outer_operator_and_frame_graph": "live",
         "canonical_shared_objective": False,
         "gradient_clipping": "shares_existing_mu_role_and_global_budgets",
@@ -179,7 +186,9 @@ def _conditional_unavailable_probe(probe: str, cfg: Optional[VFE3Config] = None)
     return {
         "available": False,
         "probe": probe,
-        "inference_semantics": ("relational_predictive_content"
+        "inference_semantics": ("relational_full_link_frozen_filtering"
+                                if cfg is not None and cfg.relational_readout_mode == "full_link_update"
+                                else "relational_predictive_content"
                                 if cfg is not None and cfg.relational_readout_mode == "predictive_content"
                                 else "relational_projected_conditional_filtering"
                                 if cfg is not None and cfg.relational_mode != "off"
@@ -5000,21 +5009,22 @@ def _pure_path_report(
     from vfe3.inference.e_step import canonical_e_step_update
     attention_mode = getattr(cfg, "attention_mode", "transported")
     transported = attention_mode == "transported"
+    receiver_gradient = attention_mode in ("transported", "projected_gradient")
     e_step_updater = canonical_e_step_update(getattr(cfg, "e_step_update", "gradient"))
     predictive_covariance_updated = (
         attention_mode == "projected_predictive"
         and getattr(cfg, "predictive_covariance", "passthrough") == "moment_matched")
-    covariance_updated = (transported and not cfg.skip_belief_sigma_update) or predictive_covariance_updated
+    covariance_updated = (receiver_gradient and not cfg.skip_belief_sigma_update) or predictive_covariance_updated
     gradient_e_step_update: 'bool | str' = (
-        e_step_updater == "gradient" if transported
+        e_step_updater == "gradient" if receiver_gradient
         else True if attention_mode == "projected_conditional"
         else "not_applicable"
     )
-    spd_retraction_applies = (transported and not cfg.skip_belief_sigma_update
+    spd_retraction_applies = (receiver_gradient and not cfg.skip_belief_sigma_update
                               and e_step_updater == "gradient")
 
     sigma_max = getattr(cfg, "sigma_max", 10.0)
-    sigma_cap_consumer_active = transported and not cfg.skip_belief_sigma_update
+    sigma_cap_consumer_active = receiver_gradient and not cfg.skip_belief_sigma_update
     spd_trust_region = getattr(cfg, "e_sigma_q_trust", 5.0)
     spd_retraction_trust_projection_active: 'bool | str' = (
         spd_trust_region is not None and float(spd_trust_region) > 0.0)
