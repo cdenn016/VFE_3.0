@@ -1,9 +1,9 @@
+from tests.profiles import test_config
 import warnings
 
 import pytest
 import torch
 
-from vfe3.config import VFE3Config
 import vfe3.gauge_optim as gauge_optim
 from vfe3.geometry.groups import GaugeGroup, get_group
 from vfe3.model.model import VFEModel
@@ -12,7 +12,7 @@ from vfe3.train import build_optimizer, train
 
 
 def _phi_table_model() -> VFEModel:
-    cfg = VFE3Config(
+    cfg = test_config(
         vocab_size=8,
         embed_dim=4,
         n_heads=1,
@@ -35,7 +35,7 @@ def _dense_norm(phi: torch.Tensor, generators: torch.Tensor) -> torch.Tensor:
 
 
 def _projection_train_case() -> tuple:
-    cfg = VFE3Config(
+    cfg = test_config(
         vocab_size=8,
         embed_dim=4,
         n_heads=1,
@@ -382,16 +382,16 @@ def test_phi_chart_summary_route_is_none_when_disabled_and_named_when_enabled() 
     import vfe3.run_artifacts as run_artifacts
 
     assert hasattr(run_artifacts, "_phi_chart_norm_route")
-    disabled_cfg = VFE3Config(vocab_size=8, embed_dim=4, n_heads=1)
+    disabled_cfg = test_config(vocab_size=8, embed_dim=4, n_heads=1)
     disabled_model = VFEModel(disabled_cfg)
-    enabled_cfg = VFE3Config(
+    enabled_cfg = test_config(
         vocab_size=8,
         embed_dim=4,
         n_heads=1,
         phi_mstep_max_matrix_norm=2.0,
     )
     enabled_model = VFEModel(enabled_cfg)
-    pullback_cfg = VFE3Config(
+    pullback_cfg = test_config(
         vocab_size=8,
         embed_dim=4,
         n_heads=2,
@@ -434,7 +434,7 @@ def test_geometry_health_adds_projection_timing_panel_only_when_present() -> Non
 
 
 def test_enabled_projection_persists_timing_metrics_in_training_row(tmp_path) -> None:
-    cfg = VFE3Config(
+    cfg = test_config(
         vocab_size=8,
         embed_dim=4,
         n_heads=1,

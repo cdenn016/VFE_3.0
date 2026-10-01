@@ -7,6 +7,8 @@ weights at float64 tolerance.
 
 from __future__ import annotations
 
+from tests.profiles import test_config
+
 import math
 import warnings
 from pathlib import Path
@@ -38,7 +40,7 @@ def _cfg(**over: Any) -> VFE3Config:
     values.update(over)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        return VFE3Config(**values)
+        return test_config(**values)
 
 
 def _model(cfg: VFE3Config, *, seed: int = 0, sigma: float = 0.5, frames: float = 0.3,

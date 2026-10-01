@@ -1,11 +1,13 @@
 """Tiny CPU regressions for the September 22 audit remediation."""
+
+from tests.profiles import config_values, test_config
 import json
 import math
 
 import pytest
 import torch
 
-from vfe3.config import VFE3Config, serialize_config, config_from_serialized
+from vfe3.config import serialize_config, config_from_serialized
 from vfe3.families.base import safe_kl_clamp
 from vfe3.families.gaussian import diag_kl_unclamped, diag_kl_unclamped_per_coord
 from vfe3.geometry.groups import get_group
@@ -42,7 +44,7 @@ def test_flat_dense_self_links_preserve_moments_and_have_zero_frame_derivative()
 
 
 def test_unbounded_kl_ceiling_keeps_gradient_and_json_round_trip() -> None:
-    cfg = VFE3Config(kl_max=math.inf)
+    cfg = test_config(kl_max=math.inf)
     payload = json.loads(json.dumps(serialize_config(cfg), allow_nan=False))
     restored = config_from_serialized(payload, source="test")
     assert restored.kl_max == math.inf
@@ -56,7 +58,7 @@ def test_unbounded_kl_ceiling_keeps_gradient_and_json_round_trip() -> None:
 @pytest.mark.parametrize("ceiling", [0., -1., -math.inf, math.nan])
 def test_invalid_kl_ceiling_is_rejected(ceiling: float) -> None:
     with pytest.raises(ValueError, match="kl_max"):
-        VFE3Config(kl_max=ceiling)
+        test_config(kl_max=ceiling)
 
 
 def test_exact_congruence_rejects_dense_cross_head_transport() -> None:
@@ -70,12 +72,12 @@ def test_exact_congruence_rejects_dense_cross_head_transport() -> None:
 
 def test_adamw_reports_nondefault_group_trust_radius() -> None:
     with pytest.warns(UserWarning, match="m_phi_group_trust_radius"):
-        VFE3Config(m_phi_update_mode="adamw", m_phi_group_trust_radius=.2)
+        test_config(m_phi_update_mode="adamw", m_phi_group_trust_radius=.2)
 
 
 def test_scaling_rejects_inert_mup_before_creating_model(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     import scaling
-    baseline = dict(scaling.BASELINE, e_step_update="mm_exact", attention_mode="transported",
+    baseline = config_values(e_step_update="mm_exact", attention_mode="transported",
                     relational_output_scope="head",
                     attention_residual=False, eval_stride=None,
                     embed_dim=4, n_heads=2, vocab_size=7, max_seq_len=3, n_layers=1)

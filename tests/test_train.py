@@ -1,3 +1,4 @@
+from tests.profiles import config_values, test_config
 import csv
 import json
 import logging
@@ -28,10 +29,11 @@ def test_optimizer_groups_priors_by_m_lr():
     # exactly four LR groups (linear decode adds an output-projection group). The block MLP, the
     # untied decode tables and the affine block LayerNorm (all on by default) each add their own
     # group, so they are pinned off to isolate the prior-table grouping.
-    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2,
+    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2,
                      m_p_mu_lr=0.01, m_p_sigma_lr=0.002, m_phi_lr=0.005,
                      decode_mode="diagonal_chunked",
-                     use_block_mlp=False, untie_decode_bank=False,
+                     use_block_mlp=False, untie_decode_bank=False, pos_phi="learned",
+                     decode_temperature_learned=True,
                      norm_type_block="none", layernorm_affine=False)
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
@@ -60,7 +62,7 @@ def test_phi_clamp_monitor_threshold_matches_transport_clamp():
 def test_phi_clamp_monitor_does_not_construct_dense_generator_gram(monkeypatch):
     import vfe3.train as train_module
 
-    cfg = VFE3Config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=4)
+    cfg = test_config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=4)
     model = VFEModel(cfg)
     real_einsum = torch.einsum
 
@@ -78,7 +80,7 @@ def test_phi_clamp_monitor_does_not_construct_dense_generator_gram(monkeypatch):
 def test_parameter_report_leaves_global_rng_untouched():
     # parameter_report's probe forward must preserve the global RNG stream.
     from vfe3.train import parameter_report
-    cfg = VFE3Config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=1, n_e_steps=4)
+    cfg = test_config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=1, n_e_steps=4)
     model = VFEModel(cfg)
     torch.manual_seed(123)
     before = torch.get_rng_state()
@@ -87,7 +89,7 @@ def test_parameter_report_leaves_global_rng_untouched():
 
 
 def test_lr_lambda_warmup_then_cosine():
-    cfg = VFE3Config(warmup_steps=10, max_steps=100)
+    cfg = test_config(warmup_steps=10, max_steps=100)
     assert abs(lr_lambda(0, cfg) - 0.0) < 1e-6
     assert abs(lr_lambda(10, cfg) - 1.0) < 1e-6            # peak at end of warmup
     assert lr_lambda(55, cfg) < 1.0 and lr_lambda(55, cfg) > 0.0
@@ -98,7 +100,7 @@ def test_scheduler_floors_lr_at_min_lr():
     # The cosine multiplier decays to 0 at max_steps; the floored per-group scheduler built in
     # train() must keep EACH group's absolute LR >= cfg.min_lr there (and beyond). Build the real
     # optimizer+scheduler, fast-forward to max_steps, and check every group.
-    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2,
+    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2,
                      warmup_steps=2, max_steps=10, min_lr=1e-5, min_lr_frac=0.0)
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
@@ -114,7 +116,7 @@ def test_scheduler_floors_lr_at_min_lr():
 def test_scheduler_min_lr_zero_is_pure_cosine():
     # min_lr=0.0 is the theoretically pure path: the floor max(0/base, cosine)=cosine, so the LR
     # decays to exactly zero at max_steps, identical to the unfloored half-cosine.
-    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2,
+    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2,
                      warmup_steps=2, max_steps=10, min_lr=0.0, min_lr_frac=0.0)
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
@@ -130,7 +132,7 @@ def test_fractional_floor_scales_each_group_to_min_lr_frac_times_base():
     # Option B: min_lr_frac floors EACH group's absolute LR at min_lr_frac * its own base LR,
     # so the m_mu:m_sigma:m_phi base ratios are preserved into the cosine tail (unlike the shared
     # absolute min_lr, which floors every group at the same value regardless of base).
-    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2,
+    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2,
                      warmup_steps=2, max_steps=10, min_lr=0.0, min_lr_frac=0.01,
                      m_p_mu_lr=0.02, m_p_sigma_lr=0.004, m_phi_lr=0.01)
     model = VFEModel(cfg)
@@ -146,7 +148,7 @@ def test_fractional_floor_scales_each_group_to_min_lr_frac_times_base():
 def test_floor_is_max_of_absolute_min_lr_and_fractional():
     # Both knobs live together: each group floors at max(min_lr, min_lr_frac * base). With
     # min_lr=1e-3, min_lr_frac=0.01: mu(base 0.2)->frac 2e-3 wins; sigma(base 0.05)->abs 1e-3 wins.
-    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2,
+    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2,
                      warmup_steps=2, max_steps=10, min_lr=1e-3, min_lr_frac=0.01,
                      m_p_mu_lr=0.2, m_p_sigma_lr=0.05, m_phi_lr=0.2)
     model = VFEModel(cfg)
@@ -163,7 +165,7 @@ def test_floor_lambdas_handle_zero_base_lr_without_dividing():
     # A deliberately frozen channel (m_phi_lr=0) gives a group with base LR 0. The floor builder
     # must NOT compute min_lr/0 (ZeroDivisionError), and the frozen group must stay at 0 -- an
     # absolute min_lr does not resurrect a channel the user chose to freeze.
-    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2,
+    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2,
                      warmup_steps=2, max_steps=10, min_lr=1e-5, m_phi_lr=0.0)
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
@@ -201,7 +203,7 @@ def test_aux_role_learning_rate_reporting_handles_active_and_inactive_mixers():
 
 @pytest.mark.parametrize("block_mlp_lr, expected_lr", [(None, 0.0123), (0.0456, 0.0456)])
 def test_optimizer_covers_mlp_parameters_once_at_resolved_lr(block_mlp_lr, expected_lr):
-    cfg = VFE3Config(
+    cfg = test_config(
         vocab_size=20,
         embed_dim=4,
         n_heads=2,
@@ -260,7 +262,7 @@ def test_run_training_applies_cfg_seed_and_deterministic_state(
     import vfe3.train as train_module
     from vfe3.runtime import seed_everything
 
-    cfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+    cfg = test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
                      n_e_steps=1, batch_size=2, deterministic=False, seed=37)
     loader = _periodic_loader(V=cfg.vocab_size, n=96, seq_len=cfg.max_seq_len,
                               batch_size=cfg.batch_size, seed=cfg.seed)
@@ -316,7 +318,7 @@ def _structured_cfg() -> VFE3Config:
     # the symmetry and is the ONLY mechanism that drives CE below ln(3). The cutover anchor
     # below therefore gates exactly that sub-marginal (phi) improvement: a future config edit
     # that detunes phi drops CE back to the ln(3) pin and fails the anchor loudly.
-    return VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+    return test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
                       n_e_steps=3, e_q_mu_lr=0.3, e_phi_lr=0.3,
                       m_p_mu_lr=0.05, m_p_sigma_lr=0.01, m_phi_lr=0.05, warmup_steps=5, max_steps=200)
 
@@ -384,7 +386,7 @@ def test_training_smoke_on_real_wikitext2_if_present():
     except FileNotFoundError:
         pytest.skip("wikitext-2 cache absent")
     torch.manual_seed(0)
-    cfg = VFE3Config(vocab_size=50257, embed_dim=4, n_heads=2, max_seq_len=16, n_layers=1,
+    cfg = test_config(vocab_size=50257, embed_dim=4, n_heads=2, max_seq_len=16, n_layers=1,
                      n_e_steps=1, e_q_mu_lr=0.3, e_phi_lr=0.0,
                      m_p_mu_lr=0.05, m_p_sigma_lr=0.01, m_phi_lr=0.0, warmup_steps=3, max_steps=30)
     model = VFEModel(cfg)
@@ -514,7 +516,7 @@ def test_evaluate_max_batches_stops_after_exact_requested_count():
 
 def test_train_periodic_eval_consumes_full_validation_loader():
     # With a five-batch validation loader and two periodic evaluations, every batch is scored.
-    cfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+    cfg = test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
                      n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, warmup_steps=1, max_steps=2)
     torch.manual_seed(0)
     model = VFEModel(cfg)
@@ -528,7 +530,7 @@ def test_train_periodic_eval_consumes_full_validation_loader():
 def test_sample_decode_emits_sample_line_each_eval(caplog):
     # When a decoder is supplied, train() prints a "Sample:" line below the BPC value every eval;
     # when it is None (the default) nothing is generated. A decode/gen error must not raise.
-    cfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+    cfg = test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
                      n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, warmup_steps=1, max_steps=2)
     torch.manual_seed(0)
     model = VFEModel(cfg)
@@ -544,7 +546,7 @@ def test_tiny_vocab_auto_default_stays_silent(caplog):
     # The vocab-gated auto-default decoder is None for a tiny synthetic/test vocab (6 is not a
     # real tokenizer size), so with no explicit decoder no Sample line is emitted -- the pure
     # silent path is preserved with no extra toggle.
-    cfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+    cfg = test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
                      n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, warmup_steps=1, max_steps=2)
     torch.manual_seed(0)
     model = VFEModel(cfg)
@@ -558,7 +560,7 @@ def test_generate_samples_false_is_silent_at_real_vocab(caplog):
     # The pure-path opt-out: generate_samples=False suppresses sampling even at a real gpt2 vocab
     # where the auto-default would otherwise fire (CLAUDE.md: a reachable silent path under a toggle).
     pytest.importorskip("tiktoken")
-    cfg = VFE3Config(vocab_size=50257, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+    cfg = test_config(vocab_size=50257, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
                      n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, warmup_steps=1, max_steps=1)
     torch.manual_seed(0)
     model = VFEModel(cfg)
@@ -572,7 +574,7 @@ def test_auto_default_sample_decoder_emits_at_gpt2_vocab(caplog):
     # At a real gpt2 vocab the auto-default decoder activates with NO explicit decoder and NO
     # entry-file wiring: a Sample line prints below BPC each eval (skip if tiktoken is absent).
     pytest.importorskip("tiktoken")
-    cfg = VFE3Config(vocab_size=50257, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+    cfg = test_config(vocab_size=50257, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
                      n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, warmup_steps=1, max_steps=1)
     torch.manual_seed(0)
     model = VFEModel(cfg)
@@ -582,22 +584,15 @@ def test_auto_default_sample_decoder_emits_at_gpt2_vocab(caplog):
     assert any("Sample:" in r.message for r in caplog.records)
 
 
-def test_train_vfe3_clickrun_importable_and_runs_one_step():
-    from dataclasses import replace
+def test_train_vfe3_clickrun_importable_and_runs_one_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    import train_vfe3
 
-    from train_vfe3 import config as cr_config
-
-    cfg_full = VFE3Config(**cr_config)         # importability: the LIVE click-run config must construct
-    # t2: run the train STEP on a dim-shrunk copy so this CPU test's cost cannot balloon with the user's
-    # live WIP toggles (seq_len=128, batch_size=64, more layers). The gauge/family/decode structural
-    # toggles are preserved -- only the size dims shrink -- so the click-run code path is still exercised.
-    # eval_stride is a size dim too: the live config's 32 exceeds the shrunk max_seq_len=16 and the
-    # exactly-once eval contract rejects that, so clamp it with the other size dims.
-    cfg = replace(
-        cfg_full, max_seq_len=16, batch_size=2, n_layers=1,
-        eval_stride=(None if cfg_full.eval_stride is None
-                     else min(cfg_full.eval_stride, 16)),
-    )
+    # Exercise the launcher's config construction with a complete local operating point.
+    local = config_values(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=4,
+                          batch_size=2, n_layers=1, n_e_steps=1, max_steps=2,
+                          warmup_steps=1, eval_stride=None, e_phi_lr=0.0)
+    monkeypatch.setattr(train_vfe3, "config", local)
+    cfg = train_vfe3.VFE3Config(**train_vfe3.config)
     loader = _periodic_loader(n=cfg.max_seq_len * cfg.batch_size * 4,
                               seq_len=cfg.max_seq_len, batch_size=cfg.batch_size, seed=cfg.seed)
     batch = next(iter(loader))
@@ -609,7 +604,7 @@ def test_train_vfe3_clickrun_importable_and_runs_one_step():
 
 
 def test_build_optimizer_groups_pos_phi_free():
-    cfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+    cfg = test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
                      pos_phi="learned", m_phi_lr=0.009)
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)                      # must NOT raise the coverage AssertionError
@@ -623,7 +618,7 @@ def test_train_step_skips_on_nonfinite_grad_with_finite_loss():
     exp_avg/exp_avg_sq moment buffers are never poisoned. The scheduler is an accepted-update
     transition and must remain unchanged when that update is rejected."""
     torch.manual_seed(0)
-    cfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+    cfg = test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
                      n_e_steps=1, e_q_mu_lr=0.1, e_phi_lr=0.0, m_phi_lr=0.0,
                      warmup_steps=1, max_steps=4)
     model = VFEModel(cfg)
@@ -658,7 +653,7 @@ def test_train_step_skips_on_nonfinite_grad_with_finite_loss():
 # =============================================================================
 
 def _clip_case():
-    cfg = VFE3Config(
+    cfg = test_config(
         vocab_size=8, embed_dim=4, n_heads=2, max_seq_len=4,
     )
     model = VFEModel(cfg)
@@ -751,7 +746,7 @@ def test_grad_clip_signature_preserves_terminal_callback():
     r"""PB-15 seam guard: the clipping annotation/wiring edit must not erase the PB-02
     terminal-callback contract -- train() still invokes it exactly once with a
     TrainingTerminalState, even when grad_clip is threaded through explicitly."""
-    cfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+    cfg = test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
                      n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, warmup_steps=1, max_steps=1)
     torch.manual_seed(0)
     model = VFEModel(cfg)
@@ -771,7 +766,7 @@ def test_grad_clip_signature_preserves_terminal_callback():
 def test_attention_diagnostic_failure_does_not_kill_training(tmp_path, monkeypatch, caplog):
     r"""F11 (audit 2026-07-01): a held-out attention diagnostic failure must be caught by the
     caller-side guard (warn + continue), never abort training."""
-    cfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+    cfg = test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
                      n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, warmup_steps=1, max_steps=2)
     torch.manual_seed(0)
     model = VFEModel(cfg)
@@ -793,7 +788,7 @@ def test_val_diagnostics_failure_resets_to_nan(tmp_path, monkeypatch):
     (blank CSV cells) instead of carrying the previous eval's values forward as if fresh."""
     import vfe3.train as vt
 
-    cfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+    cfg = test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
                      n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, warmup_steps=1, max_steps=2)
     torch.manual_seed(0)
     model = VFEModel(cfg)
@@ -844,7 +839,7 @@ def test_select_loader_is_split_aware(monkeypatch):
         return ("loader", split)
 
     monkeypatch.setattr(train_vfe3, "make_dataloader", fake_make_dataloader)
-    cfg = VFE3Config()
+    cfg = test_config()
     for split in ("train", "validation", "test"):
         train_vfe3._select_loader("wikitext-103", cfg, split=split)
 
@@ -863,7 +858,7 @@ def test_select_loader_raises_on_missing_cache(monkeypatch):
         raise FileNotFoundError("no cache")
 
     monkeypatch.setattr(train_vfe3, "make_dataloader", raise_fnf)
-    cfg = VFE3Config()
+    cfg = test_config()
     for split in ("train", "validation", "test"):
         with pytest.raises(FileNotFoundError):
             train_vfe3._select_loader("wikitext-103", cfg, split=split)
@@ -887,7 +882,7 @@ def _terminal_cfg(**kw):
                 m_p_mu_lr=0.1, m_p_sigma_lr=0.05, m_phi_lr=0.0,
                 warmup_steps=1, max_steps=2, kl_max=32)
     base.update(kw)
-    return VFE3Config(**base)
+    return test_config(**base)
 
 
 def _terminal_loader(seed=7, n=64, seq_len=8, bs=4):

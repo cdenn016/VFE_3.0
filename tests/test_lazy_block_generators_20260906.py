@@ -1,4 +1,6 @@
 """Tiny contract and numerical regressions for lazy elementary block generators."""
+
+from tests.profiles import test_config
 from collections.abc import Iterator
 import copy
 import pickle
@@ -7,7 +9,6 @@ import pytest
 import torch
 
 from vfe3 import metrics
-from vfe3.config import VFE3Config
 from vfe3.gauge_optim import embedded_phi_frobenius_norm, project_phi_parameter_rows_
 from vfe3.geometry import groups
 from vfe3.geometry.generators import generate_glk_multihead
@@ -154,7 +155,7 @@ def test_dense_autograd_and_compact_transport_finite_difference() -> None:
 @pytest.mark.parametrize("layers", [1, 2])
 def test_complete_training_projection_and_reports_remain_lazy(layers: int,
                                                             monkeypatch: pytest.MonkeyPatch) -> None:
-    cfg = VFE3Config(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=4,
+    cfg = test_config(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=4,
                     n_layers=layers, n_e_steps=1, gauge_group="block_glk",
                     decode_mode="linear", pos_phi="learned", e_phi_lr=0.0,
                     phi_mstep_max_matrix_norm=12.0, use_head_mixer=True,

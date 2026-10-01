@@ -1,21 +1,29 @@
 """Tiny controls for standard scaling grids; never launch a real experiment."""
+from tests.profiles import config_values, test_config
 import copy
 
 import pytest
 import torch
 
 import scaling
-from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 
 
 def _baseline() -> dict:
-    return dict(vocab_size=7, embed_dim=4, n_heads=2, n_layers=1, n_e_steps=1,
+    return config_values(vocab_size=7, embed_dim=4, n_heads=2, n_layers=1, n_e_steps=1,
                 max_seq_len=3, batch_size=2, max_steps=12, warmup_steps=1,
                 eval_stride=None, gauge_group="block_glk", pos_phi="none",
                 relational_input_scope="full",
                 attention_mode="projected_predictive", relational_output_scope="full",
                 use_block_mlp=True, block_mlp_expansion=2, kl_max=32.)
+
+
+@pytest.fixture(autouse=True)
+def _local_scaling_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(scaling, "CONFIG", dict(
+        routes=["width"], dry_run=True, seeds=[1, 2], data_seed=3,
+        device="cpu", dataset="fixture", max_tokens=None, max_steps=None,
+        resume=False, output_dir="unused-test-scaling-output"))
 
 
 def _settings() -> dict:
@@ -78,8 +86,8 @@ def test_parameter_estimate_includes_per_layer_relational_maps(monkeypatch: pyte
     base = _baseline()
     # Pin norms off to isolate the per-layer map and MLP parameter increment.
     base.update(norm_type_block="none", norm_type_final="none", layernorm_affine=False)
-    shallow = VFE3Config(**base)
-    deep = VFE3Config(**dict(base, n_layers=2))
+    shallow = test_config(**base)
+    deep = test_config(**dict(base, n_layers=2))
     actual = [sum(p.numel() for p in VFEModel(c).parameters()) for c in (shallow, deep)]
     predicted = [scaling.predict_n_params(c)[0] for c in (shallow, deep)]
     assert predicted[1] - predicted[0] == actual[1] - actual[0]
@@ -103,7 +111,7 @@ def test_plan_records_resolved_config_and_joint_axes(monkeypatch: pytest.MonkeyP
     assert cell["effective_config"]["embed_dim"] == 8
     assert cell["effective_config"]["n_layers"] == 2
     assert cell["effective_config"]["seed"] == 7 and cell["data_seed"] == 3
-    cfg = VFE3Config(**cell["effective_config"])
+    cfg = test_config(**cell["effective_config"])
     assert scaling._scaling_knob_report(cfg, "embed_dim+n_layers")["effective_value"] == {
         "embed_dim": 8, "n_layers": 2}
 

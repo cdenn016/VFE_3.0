@@ -1,3 +1,4 @@
+from tests.profiles import test_config
 import importlib
 
 import pytest
@@ -168,7 +169,6 @@ def test_free_energy_rope_certificate_is_global_only(
     assert certificates == [True, False]
 
 
-from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 
 
@@ -177,7 +177,7 @@ def _rope_cfg(**kw):
                 n_e_steps=1, e_q_mu_lr=0.1, e_phi_lr=0.0, m_phi_lr=0.0, gauge_group="block_glk",
                 warmup_steps=1, max_steps=4)
     base.update(kw)
-    return VFE3Config(**base)
+    return test_config(**base)
 
 
 def test_rope_cache_key_tracks_mutated_rope_base():
@@ -290,7 +290,7 @@ def _full_cov_cfg(**kw):
                 warmup_steps=1, max_steps=4,
                 family="gaussian_full", decode_mode="full_chunked")
     base.update(kw)
-    return VFE3Config(**base)
+    return test_config(**base)
 
 
 def test_rope_means_only_kernel_matches_oracle():
@@ -353,8 +353,8 @@ def test_2x2_positional_ablation_runs():
 
 # --- value-gauge decoupling toggle (rope_on_value) -------------------------
 
-def test_rope_on_value_defaults_true():
-    assert VFE3Config().rope_on_value is True
+def test_rope_on_value_can_be_enabled_explicitly():
+    assert test_config(rope_on_value=True).rope_on_value is True
 
 
 def test_rope_on_value_false_decouples_and_changes_logits():

@@ -1,3 +1,4 @@
+from tests.profiles import test_config
 import pytest
 import torch
 import torch.nn.functional as F
@@ -222,15 +223,14 @@ def test_reference_decode_dispatches_configured_divergence(alpha):
 # --- covariance-kind membership: both diagonal and full configs construct --------------------
 
 def test_family_decode_config_accepts_diagonal_and_full_by_membership():
-    from vfe3.config import VFE3Config
-    dcfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=5,
+    dcfg = test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=5,
                       family="gaussian_diagonal", decode_mode="family_chunked")
     assert dcfg.decode_mode == "family_chunked"
-    fcfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=5,
+    fcfg = test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=5,
                       family="gaussian_full", decode_mode="family_chunked")
     assert fcfg.decode_mode == "family_chunked"
     # the family_chunked rank also accepts both kinds.
-    VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=5,
+    test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=5,
                family="gaussian_full", decode_mode="family_chunked")
 
 

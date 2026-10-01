@@ -7,12 +7,13 @@ preserves the diagonal Laplace exactly; a non-permutation rotation projects the 
 end-to-end reachability through the autograd-of-F oracle and a full model.
 """
 
+from tests.profiles import test_config
+
 import math
 
 import pytest
 import torch
 
-from vfe3.config import VFE3Config
 from vfe3.divergence import (
     bhattacharyya,
     divergence_families,
@@ -66,7 +67,7 @@ def test_laplace_registered_and_config_selectable():
     assert "laplace_diagonal" in divergence_families()
     assert get_family("laplace_diagonal") is DiagonalLaplace
     assert DiagonalLaplace.cov_kind == "diagonal"
-    cfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, family="laplace_diagonal")
+    cfg = test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, family="laplace_diagonal")
     assert cfg.family == "laplace_diagonal" and cfg.diagonal_covariance is True
 
 
@@ -206,7 +207,7 @@ def test_oracle_gradients_finite_for_laplace():
 
 
 def test_laplace_model_trains_end_to_end():
-    cfg = VFE3Config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+    cfg = test_config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
                      n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, family="laplace_diagonal")
     torch.manual_seed(0)
     m = VFEModel(cfg)
@@ -340,7 +341,7 @@ def test_laplace_cuda_matches_cpu():
         assert torch.allclose(cpu, cu.cpu(), atol=1e-5)
     assert torch.allclose(DiagonalLaplace(mu_q, b_q).entropy(),
                           DiagonalLaplace(mu_q.to(dev), b_q.to(dev)).entropy().cpu(), atol=1e-5)
-    cfg = VFE3Config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+    cfg = test_config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
                      n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, family="laplace_diagonal")
     torch.manual_seed(0)
     m = VFEModel(cfg).to(dev)
@@ -409,9 +410,9 @@ def test_laplace_family_decode_ranking_differs_from_gaussian_kl():
 def test_laplace_prior_bank_requires_family_consistent_decode():
     # A Laplace belief with a fast Gaussian kernel is rejected; family_chunked is accepted.
     with pytest.raises(ValueError, match="family-consistent"):
-        VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=5,
+        test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=5,
                    family="laplace_diagonal", decode_mode="diagonal_chunked")
-    cfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
+    cfg = test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                      n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0,
                      family="laplace_diagonal", decode_mode="family_chunked")
     m = VFEModel(cfg)

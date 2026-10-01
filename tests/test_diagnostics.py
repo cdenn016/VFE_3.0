@@ -1,5 +1,6 @@
 r"""One-forward diagnostic snapshots and replay-free evaluation consumers."""
 
+from tests.profiles import test_config
 from dataclasses import FrozenInstanceError
 import math
 
@@ -7,7 +8,6 @@ import pytest
 import torch
 
 from vfe3 import metrics
-from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 from vfe3.train import _val_diagnostics
 from vfe3.viz import extract
@@ -26,7 +26,7 @@ def _model(**overrides) -> VFEModel:
     )
     base.update(overrides)
     torch.manual_seed(17)
-    model = VFEModel(VFE3Config(**base))
+    model = VFEModel(test_config(**base))
     model.eval()
     return model
 

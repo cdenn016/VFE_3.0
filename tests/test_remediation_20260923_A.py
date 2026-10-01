@@ -4,7 +4,8 @@ Every model here is tiny (V=11, K=4, H=2, N=6) and runs on CPU. Inertness claims
 way the audit measured them: the loss and every parameter gradient must stay ``torch.equal`` when
 only the marked knob changes, on a copy of the launcher route shrunk to tiny dimensions.
 """
-import copy
+from tests.profiles import config_values, test_config
+from dataclasses import fields
 import logging
 import math
 import warnings
@@ -26,15 +27,21 @@ V, K, H, N, B = 11, 4, 2, 6, 2
 # tests do not track later edits to the user-editable launcher dict.
 _AUDITED_ROUTE = dict(
     n_layers=2, family="gaussian_full", decode_mode="full_chunked", untie_decode_bank=True,
-    lambda_alpha_mode="constant", decode_av_precision="fp32",
+    attention_mode="projected_predictive", relational_input_scope="full",
+    relational_output_scope="full", attention_residual=True, predictive_covariance="passthrough",
+    gauge_transport="on", pos_phi="learned", use_block_mlp=True,
+    block_mlp_mode="coordinate", block_mlp_covariance="passthrough", block_mlp_expansion=2,
+    decode_coordinates="local", decode_unigram_prior=True, decode_bias=True,
+    decode_tau=0.01, lambda_beta=1.0, lambda_alpha_mode="constant",
+    exp_fp64_norm_threshold=20.0, transport_chart_max_norm=18.0, decode_av_precision="fp32",
     decode_ranking_fp64_escalation=False, full_cov_congruence_certification=False,
     skip_belief_sigma_update=False,
 )
 
 
 def _launcher(**overrides: Any) -> Dict[str, Any]:
-    """The train_vfe3 config dict at tiny width, on the audited route (other launcher values kept)."""
-    cfg = copy.deepcopy(dict(train_vfe3.config))
+    """Explicit tiny operating point for the historical launcher route."""
+    cfg = config_values()
     cfg.update(_AUDITED_ROUTE)
     cfg.update(vocab_size=V, embed_dim=K, n_heads=H, max_seq_len=N, kl_max=8 * K,
                amp_dtype=None, batch_size=B, eval_stride=None, attention_window=N)
@@ -57,7 +64,7 @@ def _transported(**overrides: Any) -> Dict[str, Any]:
 def _cfg(cfg_dict: Dict[str, Any]) -> VFE3Config:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        return VFE3Config(**cfg_dict)
+        return test_config(**cfg_dict)
 
 
 def _loss_and_grads(cfg_dict: Dict[str, Any], dtype: torch.dtype = torch.float32):
@@ -201,15 +208,20 @@ def test_transported_frame_diagonal_drops_positional_channels() -> None:
     _assert_bit_inert(base, {"pos_rotation": "rope", "rope_base": 2.0})
 
 
-def test_decode_notices_are_default_guarded() -> None:
+def test_decode_notices_only_report_active_explicit_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Notice policy compares dataclass declarations, so give this test its own declarations too.
+    values = config_values(untie_decode_bank=False, decode_bias=False)
+    for field in fields(VFE3Config):
+        monkeypatch.setattr(field, "default", values[field.name])
     with warnings.catch_warnings():
         warnings.simplefilter("error", ConfigNotice)
-        VFE3Config()                                                    # untie_decode_bank default
-        VFE3Config(decode_mode="diagonal_chunked")                      # decode_bias default
-    assert "untie_decode_bank" in VFE3Config().inactive_fields()
-    assert "decode_tau" in VFE3Config().inactive_fields()
+        test_config(decode_mode="linear", untie_decode_bank=False, decode_bias=False, decode_tau=1.0)
+        test_config(decode_mode="diagonal_chunked", decode_bias=False, untie_decode_bank=False)
+    inactive = test_config(decode_mode="linear", untie_decode_bank=False).inactive_fields()
+    assert "untie_decode_bank" in inactive
+    assert "decode_tau" in inactive
     with pytest.warns(ConfigNotice, match="decode_tau"):
-        VFE3Config(decode_tau=0.5)
+        test_config(decode_mode="linear", decode_tau=0.5)
 
 
 def test_launcher_route_inactive_report() -> None:
@@ -323,29 +335,29 @@ def test_additive_encoder_admitted_on_projected_routes(route: str) -> None:
     assert all(torch.isfinite(g).all() for g in grads.values() if g is not None)
     assert grads["prior_bank.phi_embed"] is not None                # the table stays trained
     with pytest.raises(ValueError, match="per_token_additive.*positional frame"):
-        VFE3Config(**{**base, "pos_phi": "learned"})
+        test_config(**{**base, "pos_phi": "learned"})
 
 
 def test_additive_encoder_contamination_warns_on_transported() -> None:
     with pytest.warns(UserWarning, match="per_token_additive"):
-        VFE3Config(**_transported(encode_mode="per_token_additive", pos_phi="learned"))
+        test_config(**_transported(encode_mode="per_token_additive", pos_phi="learned"))
 
 
 # --------------------------------------------------------------------------- #26, low validation
 
 def test_legacy_dense_decode_admission_round_trips() -> None:
-    cfg = VFE3Config(decode_mode="full", family="gaussian_full", oracle_unroll_grad=True,
+    cfg = test_config(decode_mode="full", family="gaussian_full", oracle_unroll_grad=True,
                      _allow_legacy_dense_decode=True)
     payload = serialize_config(cfg)
     assert payload["_allow_legacy_dense_decode"] is True
     assert config_from_serialized(payload, source="round trip").decode_mode == "full"
-    assert "_allow_legacy_dense_decode" not in serialize_config(VFE3Config())
+    assert "_allow_legacy_dense_decode" not in serialize_config(test_config())
 
 
 @pytest.mark.parametrize("value", [-1.0, math.nan, math.inf])
 def test_mu_weight_decay_is_validated(value: float) -> None:
     with pytest.raises(ValueError, match="mu_weight_decay"):
-        VFE3Config(mu_weight_decay=value)
+        test_config(mu_weight_decay=value)
 
 
 # --------------------------------------------------------------------------- launcher (#23, #24, low)
@@ -369,7 +381,7 @@ def test_train_loader_always_has_a_resumable_generator(
 
     monkeypatch.setattr(train_vfe3, "make_dataloader", fake_make_dataloader)
     monkeypatch.setattr(train_vfe3, "DATA_SEED", data_seed)
-    cfg = VFE3Config(seed=23)
+    cfg = test_config(seed=23)
     for split in ("train", "validation"):
         train_vfe3._select_loader("wikitext-103", cfg, split=split)
     assert captured["train"].initial_seed() == expected
@@ -398,6 +410,8 @@ def test_run_once_prints_inactive_launcher_settings(
         raise Stop
 
     monkeypatch.setattr(train_vfe3, "config", _launcher())
+    monkeypatch.setattr(train_vfe3, "DEVICE", "cpu")
+    monkeypatch.setattr(train_vfe3, "DATASET", "wikitext-103")
     monkeypatch.setattr(train_vfe3, "seed_everything", stop)       # halt right after the report
     with caplog.at_level(logging.INFO), pytest.raises(Stop):
         train_vfe3._run_once(6, logging.getLogger("inactive-report"))
@@ -416,10 +430,12 @@ def test_inert_sweep_is_rejected_when_selected(monkeypatch: pytest.MonkeyPatch) 
     ablation.validate_sweeps(list(ablation.SWEEPS), require_construction=False)   # registry stays valid
 
 
-def test_lambda_alpha_sweeps_require_two_e_steps() -> None:
-    assert ablation.SWEEPS["lambda_alpha"]["requires"]["n_e_steps"] == 2
-    spec = parameter_optimization.SEARCH_CONFIG["parameters"]["lambda_alpha"]
-    assert spec["requires"]["n_e_steps"] == 2
+def test_lambda_alpha_sweeps_apply_local_two_e_step_requirement(monkeypatch: pytest.MonkeyPatch) -> None:
+    sweep = dict(param="lambda_alpha", values=[0.5, 1.0], requires={"n_e_steps": 2})
+    monkeypatch.setattr(ablation, "SWEEPS", {"lambda_alpha": sweep})
+    monkeypatch.setattr(ablation, "BASELINE_CONFIG", _transported(n_e_steps=1))
+    cells = ablation.make_run_overrides("lambda_alpha")
+    assert all(overrides["n_e_steps"] == 2 for _, overrides in cells)
 
 
 def test_single_seed_arm_has_unknown_spread_and_no_error_bar(

@@ -216,12 +216,15 @@ def test_recovery_is_selected_per_pair_and_leaves_healthy_pairs_bit_identical() 
     torch.testing.assert_close(ill[1, :, :, -1].double(), reference[1, :, :, -1], rtol=1e-5, atol=1e-5)
 
 
-def test_config_default_validation_serialization_and_inactive_mark() -> None:
+def test_config_local_validation_serialization_and_inactive_mark(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import inspect
     from dataclasses import asdict
 
-    from tests.profiles import tiny_config
+    from tests.profiles import config_values, tiny_config
     from tests.test_relational_integration import _cfg
-    from vfe3.config import config_from_serialized, serialize_config
+    from vfe3.config import VFE3Config, config_from_serialized, serialize_config
 
     predictive = dict(relational_input_scope="full", attention_mode="projected_predictive",
                       relational_output_scope="full")
@@ -230,12 +233,17 @@ def test_config_default_validation_serialization_and_inactive_mark() -> None:
     assert asdict(config_from_serialized(serialize_config(cfg), source="noisy query")) == asdict(cfg)
     legacy = serialize_config(_cfg(**predictive))
     legacy.pop("relational_routing")
+    parameters = list(inspect.signature(VFE3Config.__init__).parameters)[1:]
+    values = config_values()
+    monkeypatch.setattr(VFE3Config.__init__, "__defaults__", tuple(values[name] for name in parameters))
     assert config_from_serialized(legacy, source="legacy").relational_routing == "gaussian_kl"
     with pytest.raises(ValueError, match="relational_routing"):
         _cfg(**predictive, relational_routing="dot_product")
     with pytest.raises(ValueError, match="requires attention_mode='projected_predictive'"):
         _cfg(relational_routing="noisy_query")  # _cfg defaults to projected_conditional
-    assert "relational_routing" in tiny_config().inactive_fields()
+    assert "relational_routing" in tiny_config(
+        attention_mode="transported", predictive_covariance="passthrough",
+        relational_output_scope="head", attention_residual=False).inactive_fields()
 
 
 def test_operators_carry_routing_without_new_state() -> None:

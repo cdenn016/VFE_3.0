@@ -24,6 +24,7 @@ from torch.utils.data import DataLoader
 
 import train_vfe3
 import vfe3.geometry.transport as transport
+from tests.profiles import config_values, test_config
 from tests.profiles import tiny_config as _profile_tiny_config
 from tests.test_remediation_20260923_C import _HostReads
 from vfe3.config import VFE3Config
@@ -63,7 +64,12 @@ from vfe3.viz.extract import converged_state
 # Every test here exercises the opt-in escalation, so configs enable it and direct producer calls
 # run with the process switch on; the switch is restored after each test.
 def tiny_config(**overrides: object) -> VFE3Config:
-    return _profile_tiny_config(**{"frame_pair_fp64_escalation": True, **overrides})
+    return _profile_tiny_config(**{
+        "frame_pair_fp64_escalation": True, "attention_mode": "transported",
+        "attention_residual": False, "relational_output_scope": "head",
+        "predictive_covariance": "passthrough", "lambda_alpha_mode": "constant",
+        "mu_init_std": 0.02, "sigma_init": 1.0, "phi_scale": 0.01, **overrides,
+    })
 
 
 @pytest.fixture(autouse=True)
@@ -310,11 +316,19 @@ _LAUNCHER_TINY = dict(
 
 
 def _launcher(**overrides: object) -> VFE3Config:
-    values = dict(train_vfe3.config)
+    values = config_values(
+        attention_mode="projected_predictive", pos_phi="learned", e_phi_lr=0.0,
+        skip_belief_sigma_update=True, oracle_unroll_grad=True,
+        relational_input_scope="full", relational_output_scope="full",
+        use_block_mlp=True, norm_type_block="layernorm", norm_type_final="layernorm",
+        layernorm_affine=True, decode_mode="diagonal_chunked",
+        decode_av_precision="fp32", decode_ranking_fp64_escalation=False,
+        lambda_alpha_mode="constant", mu_init_std=0.02, sigma_init=1.0, phi_scale=0.01,
+    )
     values.update(_LAUNCHER_TINY)
     values["frame_pair_fp64_escalation"] = True
     values.update(overrides)
-    return VFE3Config(**values)
+    return test_config(**values)
 
 
 def _tiny(**overrides: object) -> Callable[[], VFE3Config]:
@@ -703,13 +717,13 @@ def test_escalated_diagnostic_bank_keeps_float64_frames(route: str, monkeypatch)
 # -- the opt-in switch ------------------------------------------------------------------------------
 
 def test_escalation_is_off_by_default_and_installed_from_config() -> None:
-    assert VFE3Config().frame_pair_fp64_escalation is False
+    assert test_config().frame_pair_fp64_escalation is False
     VFEModel(_profile_tiny_config())
     assert transport.frame_pair_fp64_escalation() is False
     VFEModel(tiny_config())
     assert transport.frame_pair_fp64_escalation() is True
     with pytest.raises(ValueError, match="frame_pair_fp64_escalation"):
-        VFE3Config(frame_pair_fp64_escalation=1)
+        test_config(frame_pair_fp64_escalation=1)
 
 
 @pytest.mark.parametrize("kind", ["compact", "dense_full", "dense_equal", "dense_unequal"])

@@ -6,11 +6,11 @@ isolated kernels. The toggles are family='gaussian_full' + decode_mode='full'
 (diagonal_covariance is a derived read-only property of family).
 """
 
+from tests.profiles import test_config
 import pytest
 import torch
 
 from vfe3.belief import BeliefState
-from vfe3.config import VFE3Config
 from vfe3.geometry.groups import get_group
 from vfe3.inference.e_step import e_step_iteration
 from vfe3.model.model import VFEModel
@@ -18,10 +18,10 @@ from vfe3.model.model import VFEModel
 
 def test_full_covariance_config_derives_diagonal_covariance_flag():
     """diagonal_covariance is a derived read-only property of family (single source of truth)."""
-    assert VFE3Config(family="gaussian_diagonal").diagonal_covariance is True
-    assert VFE3Config(family="gaussian_full", decode_mode="full_chunked").diagonal_covariance is False
+    assert test_config(family="gaussian_diagonal").diagonal_covariance is True
+    assert test_config(family="gaussian_full", decode_mode="full_chunked").diagonal_covariance is False
     with pytest.raises(TypeError):
-        VFE3Config(family="gaussian_full", diagonal_covariance=True)    # no longer a settable field
+        test_config(family="gaussian_full", diagonal_covariance=True)    # no longer a settable field
 
 
 def test_full_gaussian_fisher_precision_has_no_ridge_on_valid_spd_input():
@@ -37,7 +37,7 @@ def test_full_gaussian_fisher_precision_has_no_ridge_on_valid_spd_input():
 
 def test_full_covariance_model_runs_end_to_end():
     """The full-covariance pure path runs encode -> E-step -> full decode -> CE, forward+backward."""
-    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
+    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                      n_e_steps=2, e_q_mu_lr=0.05, e_q_sigma_lr=0.01, e_phi_lr=0.0,
                      family="gaussian_full", decode_mode="full_chunked")
     model = VFEModel(cfg)
@@ -201,7 +201,7 @@ def test_family_decode_matches_direct_functional_full_gaussian(alpha):
 
 
 def test_full_family_decode_config_has_no_decode_lower_triangle_keys():
-    cfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
+    cfg = test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                      family="gaussian_full", decode_mode="family_chunked",
                      untie_decode_bank=True)
     model = VFEModel(cfg)

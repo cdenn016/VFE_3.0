@@ -1,5 +1,7 @@
 r"""Isotypic (label-grouped) HeadMixer: the full linear commutant of a mixed irrep tower."""
 
+from tests.profiles import test_config
+
 import math
 
 import pytest
@@ -83,9 +85,8 @@ def test_old_single_component_state_dict_still_loads():
 
 
 def test_so_n_mixed_tower_model_constructs_with_mixer_and_trains():
-    from vfe3.config import VFE3Config
     from vfe3.model.model import VFEModel
-    cfg = VFE3Config(vocab_size=20, embed_dim=8, n_heads=2, max_seq_len=5, n_layers=1,
+    cfg = test_config(vocab_size=20, embed_dim=8, n_heads=2, max_seq_len=5, n_layers=1,
                      n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0,
                      gauge_group="so_n", group_n=3,
                      irrep_spec=[("l0", 1), ("l1", 1), ("l0", 1), ("l1", 1)],

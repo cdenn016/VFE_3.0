@@ -1,5 +1,6 @@
 r"""Numerical Clebsch-Gordan intertwiners over the irrep registry."""
 
+from tests.profiles import test_config
 import pytest
 import torch
 
@@ -259,20 +260,18 @@ def test_cg_forward_selects_passthrough_vs_delta_full():
 
 
 def _e2e_cfg(**kw):
-    from vfe3.config import VFE3Config
     base = dict(vocab_size=20, embed_dim=9, n_heads=3, max_seq_len=5, n_layers=1,
                 n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0,
                 gauge_group="so_n", group_n=3,
                 irrep_spec=[("l0", 1), ("l1", 1), ("l2", 1)],
                 phi_precond_mode="none")
     base.update(kw)
-    return VFE3Config(**base)
+    return test_config(**base)
 
 
 def test_use_cg_coupling_rejected_off_towers():
-    from vfe3.config import VFE3Config
     with pytest.raises(ValueError, match="use_cg_coupling"):
-        VFE3Config(vocab_size=8, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
+        test_config(vocab_size=8, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
                    gauge_group="block_glk", use_cg_coupling=True)
 
 

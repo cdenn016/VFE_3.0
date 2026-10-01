@@ -3,6 +3,7 @@ r"""Core of :mod:`vfe3.semantics`: vocabularies, run loading, table accessors, r
 Every model here is tiny (vocabulary 24, K=4, two heads, one layer) and saved to a temporary run
 directory, so the loader is exercised end to end on CPU without any real checkpoint.
 """
+from tests.profiles import test_config
 
 import json
 import warnings
@@ -53,7 +54,7 @@ def _tiny_model(**over) -> "tuple[VFE3Config, VFEModel]":
     options.update(over)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        cfg = VFE3Config(**options)
+        cfg = test_config(**options)
         torch.manual_seed(0)
         model = VFEModel(cfg).eval()
     with torch.no_grad():                                              # move tables off their init

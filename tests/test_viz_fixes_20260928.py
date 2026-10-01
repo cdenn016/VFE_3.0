@@ -4,6 +4,7 @@ Every new or changed figure is driven from tiny synthetic ``metrics.csv`` / ``di
 tables written here, every route gate is exercised, and each figure is checked against the page
 geometry (at most 7.2 in wide, no text below 6 pt). CPU only, tiny models.
 """
+from tests.profiles import test_config
 import csv
 import json
 import logging
@@ -19,7 +20,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.text import Text
 
-from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 from vfe3.viz import extract, report
 from vfe3.viz import figures as figs
@@ -106,7 +106,7 @@ _SIGMA_FAMILY = {"belief_spectrum", "spd_ellipses", "belief_condition"}
 
 
 def test_route_gates_flat_projected_frozen():
-    cfg = VFE3Config(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
+    cfg = test_config(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
                      attention_mode="projected_predictive", relational_input_scope="full",
                      relational_output_scope="full", gauge_group="block_glk")
     reasons = figs.route_figure_skip_reasons(cfg)
@@ -160,7 +160,7 @@ def test_write_figure_logs_skip_reason_and_writes_nothing(tmp_path, caplog):
 
 def _projected_model() -> VFEModel:
     torch.manual_seed(71)
-    return VFEModel(VFE3Config(
+    return VFEModel(test_config(
         vocab_size=7, embed_dim=4, n_heads=2, batch_size=1, max_seq_len=4,
         n_layers=1, n_e_steps=1, family="gaussian_diagonal", gauge_group="block_glk",
         e_phi_lr=0.0, pos_phi="learned", use_head_mixer=True, use_block_mlp=True,
@@ -411,7 +411,7 @@ def test_guard_denominators_diagonal_and_full():
 
 def _tiny_model(**over) -> VFEModel:
     torch.manual_seed(0)
-    return VFEModel(VFE3Config(vocab_size=9, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
+    return VFEModel(test_config(vocab_size=9, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                                n_e_steps=1, e_q_mu_lr=0.1, e_phi_lr=0.0, **over)).eval()
 
 

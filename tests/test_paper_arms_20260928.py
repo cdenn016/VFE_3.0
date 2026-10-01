@@ -10,6 +10,8 @@ two paired seeds, and ``run_vfe`` reproducing ``train_vfe3._run_once`` bitwise.
 
 from __future__ import annotations
 
+from tests.profiles import test_config
+
 import ast
 import dataclasses
 import json
@@ -56,7 +58,7 @@ def _tiny_cfg(**over: Any) -> VFE3Config:
     values.update(over)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        return VFE3Config(**values)
+        return test_config(**values)
 
 
 @pytest.fixture()

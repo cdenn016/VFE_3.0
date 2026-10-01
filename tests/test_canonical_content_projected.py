@@ -1,5 +1,6 @@
 """Projected canonical-content materialization and realized-frame contracts."""
 
+from tests.profiles import test_config
 import os
 
 import pytest
@@ -40,7 +41,7 @@ def _projected_cfg(**overrides: object) -> VFE3Config:
         max_steps=1,
     )
     values.update(overrides)
-    return VFE3Config(
+    return test_config(
         _allow_legacy_dense_decode=values.get("decode_mode") == "full",
         **values,
     )
@@ -525,7 +526,7 @@ def test_ordinary_full_chunked_runtime_preserves_custom_fused_override() -> None
             can_omit_base_variance=True,
             override=True,
         )(replacement_decode)
-        cfg = VFE3Config(
+        cfg = test_config(
             vocab_size=11,
             embed_dim=4,
             n_heads=2,
@@ -1302,6 +1303,7 @@ def _projected_training_model(decode_mode: str) -> VFEModel:
         decode_chunk_size=4,
         decode_ce_checkpoint=("always" if decode_mode == "full_chunked" else "auto"),
         decode_unigram_prior=True,
+        decode_temperature_learned=True,
         unigram_kappa=0.61,
         use_priorbank_head_evidence_mixer=True,
         pos_phi="learned",

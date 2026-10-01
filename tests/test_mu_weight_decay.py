@@ -12,13 +12,15 @@ The field must leave the shipped default byte-identical (None = inherit), and mu
 mean-role capacity table.
 """
 
+from tests.profiles import test_config
+
 import torch
 
-from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 from vfe3.train import build_optimizer
 
-BASE = dict(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1)
+BASE = dict(vocab_size=8, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
+            weight_decay=0.05, sigma_weight_decay=None)
 
 
 def _group_of(opt, param):
@@ -31,16 +33,16 @@ def _wd(group, opt):
     return group.get("weight_decay", opt.defaults["weight_decay"])
 
 
-def test_mu_weight_decay_defaults_to_none_and_inherits():
-    cfg = VFE3Config(**BASE)
-    assert cfg.mu_weight_decay is None                          # default = inherit, no behavior change
+def test_mu_weight_decay_none_inherits():
+    cfg = test_config(**BASE, mu_weight_decay=None)
+    assert cfg.mu_weight_decay is None
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
     assert _wd(_group_of(opt, model.prior_bank.mu_embed), opt) == cfg.weight_decay
 
 
 def test_mu_weight_decay_zero_exempts_the_mean_sector():
-    cfg = VFE3Config(**BASE, mu_weight_decay=0.0)
+    cfg = test_config(**BASE, mu_weight_decay=0.0)
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
     assert _wd(_group_of(opt, model.prior_bank.mu_embed), opt) == 0.0
@@ -53,8 +55,8 @@ def test_zero_decay_leaves_an_unvisited_row_untouched():
     mu_weight_decay=0.0, while it does shrink when the global decay is inherited."""
     for wd, expect_shrink in ((None, True), (0.0, False)):
         torch.manual_seed(0)
-        kwargs = dict(BASE) if wd is None else dict(BASE, mu_weight_decay=wd)
-        cfg = VFE3Config(**kwargs)
+        kwargs = dict(BASE, mu_weight_decay=wd)
+        cfg = test_config(**kwargs)
         model = VFEModel(cfg)
         opt = build_optimizer(model, cfg)
         table = model.prior_bank.mu_embed

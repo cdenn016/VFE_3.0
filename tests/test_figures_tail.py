@@ -8,6 +8,7 @@ r"""Tests for the 2026-06-22 figures-tail build-out (EXP-1/2/6/9/10/11 auto-disp
 
 Device-agnostic (CPU). Figures use the Agg backend.
 """
+from tests.profiles import test_config
 import csv as _csv
 import hashlib
 import json
@@ -23,7 +24,6 @@ import torch
 
 import ablation
 import scaling_analysis
-from vfe3.config import VFE3Config
 from vfe3.metrics import bootstrap_token_ce_band
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import RunArtifacts
@@ -98,7 +98,7 @@ def test_aggregate_points_carries_embed_dim_and_ppl():
 
 def test_val_builder_resid_logged_with_head_mixer(tmp_path):
     torch.manual_seed(0)
-    cfg = VFE3Config(vocab_size=32, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=4,
+    cfg = test_config(vocab_size=32, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=4,
                      log_interval=2, eval_interval=2, batch_size=2,
                      gauge_group="block_glk", use_head_mixer=True)
     model = VFEModel(cfg).to(DEVICE)

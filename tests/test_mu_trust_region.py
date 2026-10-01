@@ -9,10 +9,11 @@ box  : whitened = delta_mu / sqrt(sigma); clamp to +/-trust; un-whiten -> per-co
 ball : scale the whole whitened vector by min(trust/||whitened||_2, 1) (direction-preserving)
 """
 
+from tests.profiles import test_config
+
 import torch
 
 from vfe3.belief import BeliefState
-from vfe3.config import VFE3Config
 from vfe3.geometry.groups import get_group
 from vfe3.inference.e_step import e_step_iteration
 from vfe3.numerics import apply_mu_trust_region
@@ -68,7 +69,7 @@ def test_no_op_within_trust():
 # --- config + e_step integration ---
 
 def test_config_can_explicitly_disable_mean_trust():
-    cfg = VFE3Config(e_mu_q_trust=None, mu_trust_mode="ball")
+    cfg = test_config(e_mu_q_trust=None, mu_trust_mode="ball")
     assert cfg.e_mu_q_trust is None                                 # explicit unbounded profile
     assert cfg.mu_trust_mode == "ball"
 

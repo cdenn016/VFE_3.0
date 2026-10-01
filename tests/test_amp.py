@@ -7,13 +7,13 @@ island holds). The full suite is the broader default-off byte-identity oracle (e
 test runs amp_dtype=None); these tests pin the AMP wiring specifically.
 """
 
+from tests.profiles import test_config
 from contextlib import nullcontext
 from unittest import mock
 
 import numpy as np
 import torch
 
-from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 from vfe3.train import _val_diagnostics
 from vfe3.belief import BeliefState
@@ -25,9 +25,10 @@ def _tiny_model(**overrides) -> VFEModel:
     base = dict(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                 n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.0,
                 decode_mode="diagonal_chunked", decode_av_precision="fp32",
-                decode_ranking_fp64_escalation=False)
+                decode_ranking_fp64_escalation=False, lambda_alpha_mode="constant",
+                mu_init_std=0.02, sigma_init=1.0, phi_scale=0.01)
     base.update(overrides)
-    return VFEModel(VFE3Config(**base))
+    return VFEModel(test_config(**base))
 
 
 def test_default_off_enters_no_autocast_context():

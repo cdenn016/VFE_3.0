@@ -40,6 +40,9 @@ def zero_devices(monkeypatch: pytest.MonkeyPatch) -> List[str]:
     torch.set_num_threads(1)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)
+    # AdamW also queries graph capture when is_available is mocked true; keep that host query
+    # inside this simulated zero-device environment instead of initializing the real CUDA runtime.
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(torch.cuda, "get_rng_state_all", recorder("get_rng_state_all", []))
     monkeypatch.setattr(torch.cuda, "set_rng_state_all", recorder("set_rng_state_all", None))
     monkeypatch.setattr(T, "_save_eval_attention_maps", lambda *args, **kwargs: None)

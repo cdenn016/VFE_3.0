@@ -6,6 +6,7 @@ facets, #18 scaling testability / lack of fit / non-embedding axis, #19 sequence
 bootstrap, #2 realized decode temperature, #23 resume seed-drift wording, and the Low items
 (mixed-generation provenance, t-based noise band, finalize best-weights guard).
 """
+from tests.profiles import test_config
 
 import json
 import logging
@@ -57,7 +58,7 @@ def _cfg(**overrides: object) -> VFE3Config:
                   n_e_steps=1, e_q_mu_lr=0.1, e_phi_lr=0.0, m_phi_lr=0.0,
                   warmup_steps=1, max_steps=4)
     values.update(overrides)
-    return VFE3Config(**values)
+    return test_config(**values)
 
 
 def _projected_cfg(**overrides: object) -> VFE3Config:
@@ -67,7 +68,7 @@ def _projected_cfg(**overrides: object) -> VFE3Config:
                   warmup_steps=0, max_steps=2, log_interval=0, eval_interval=0,
                   attention_mode="projected_predictive")
     values.update(overrides)
-    return VFE3Config(**values)
+    return test_config(**values)
 
 
 # --------------------------------------------------------------------------- #3(e) inert set
@@ -398,6 +399,10 @@ def test_resume_seed_drift_warning_states_what_happens(tmp_path: Path, monkeypat
 
 def test_mixed_generation_process_is_not_reported_stable(tmp_path: Path, monkeypatch) -> None:
     _no_git(monkeypatch)
+    # Set both generation identities locally so live edits cannot change this comparison.
+    monkeypatch.setattr(run_artifacts, "STRICT_CODE_IDENTITY", False)
+    monkeypatch.setattr(run_artifacts, "_package_code_identity", lambda: "b" * 64)
+    monkeypatch.setattr(run_artifacts, "_PROCESS_PACKAGE_CODE_IDENTITY", "b" * 64)
     cfg = _cfg()
     model = VFEModel(cfg)
     stable = RunArtifacts(tmp_path / "stable", cfg, model, save_model_artifacts=False)

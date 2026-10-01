@@ -1,16 +1,16 @@
+from tests.profiles import test_config
 from dataclasses import asdict, replace
 
 import pytest
 import torch
 
 import scaling
-from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import _cost_model_fields, _pure_path_report
 
 
 def _pure_cfg(mode, covariance="passthrough"):
-    return VFE3Config(
+    return test_config(
         vocab_size=7,
         embed_dim=4,
         n_heads=2,
@@ -139,7 +139,7 @@ def test_selected_modes_execute_complete_model_forward():
 @torch.no_grad()
 def test_canonical_frame_executes_with_right_full_gauge_rope():
     cfg = _pure_cfg("canonical_frame")
-    cfg = VFE3Config(**{
+    cfg = test_config(**{
         **asdict(cfg),
         "pos_rotation": "rope",
         "rope_full_gauge": True,

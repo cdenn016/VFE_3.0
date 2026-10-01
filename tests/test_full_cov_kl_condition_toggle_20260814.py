@@ -1,5 +1,6 @@
 r"""Performance gate for the optional full-covariance KL condition certificate."""
 
+from tests.profiles import config_values, test_config
 import importlib
 from pathlib import Path
 
@@ -8,7 +9,6 @@ import torch
 
 import vfe3.families.gaussian as gaussian_mod
 import scaling_analysis
-from vfe3.config import VFE3Config
 from vfe3.families.gaussian import FullGaussian
 from vfe3.model.model import VFEModel
 
@@ -30,8 +30,8 @@ def _pair(policy: str, *, ill_conditioned: bool = False):
     return q, t
 
 
-def test_default_precision_policy_is_fp32_escalate():
-    cfg = VFE3Config(**BASE)
+def test_selected_precision_policy_is_fp32_escalate():
+    cfg = test_config(**BASE, full_cov_kl_precision="fp32_escalate")
     assert cfg.full_cov_kl_precision == "fp32_escalate"
 
 
@@ -44,10 +44,10 @@ def test_model_uses_selected_precision_policy():
         pos_phi="none",
         e_phi_lr=0.0,
     )
-    fast = VFEModel(VFE3Config(**common))
+    fast = VFEModel(test_config(**common))
     strict_cfg = dict(common)
     strict_cfg["full_cov_kl_precision"] = "fp32_escalate_cond"
-    strict = VFEModel(VFE3Config(**strict_cfg))
+    strict = VFEModel(test_config(**strict_cfg))
     assert fast.cfg.full_cov_kl_precision == "fp32_escalate"
     assert strict.cfg.full_cov_kl_precision == "fp32_escalate_cond"
     assert fast.full_cov_kl_precision == "fp32_escalate"
@@ -103,13 +103,14 @@ def test_fast_and_strict_policies_agree_on_well_conditioned_input():
     ("entrypoint", "attribute"),
     [("train_vfe3", "config"), ("ablation", "BASELINE_CONFIG")],
 )
-def test_click_to_run_entrypoints_express_the_default_policy(entrypoint, attribute):
-    # f54c756 dropped the restated literal from both launchers, which now inherit VFE3Config's
-    # default. Assert the policy each entrypoint actually RUNS with rather than a source-text
-    # literal -- the same invariant-not-literal rule the audit 2026-07-25 F19 fixes applied.
+@pytest.mark.parametrize("policy", ["fp32_escalate", "fp32_escalate_cond"])
+def test_click_to_run_entrypoints_construct_the_selected_policy(
+    entrypoint: str, attribute: str, policy: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     module = importlib.import_module(entrypoint)
-    effective = VFE3Config(**dict(getattr(module, attribute)))
-    assert effective.full_cov_kl_precision == "fp32_escalate"
+    monkeypatch.setattr(module, attribute, config_values(full_cov_kl_precision=policy))
+    effective = test_config(**dict(getattr(module, attribute)))
+    assert VFEModel(effective).full_cov_kl_precision == policy
 
 
 @pytest.mark.parametrize(

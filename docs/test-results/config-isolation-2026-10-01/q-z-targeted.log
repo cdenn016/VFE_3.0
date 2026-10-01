@@ -1,0 +1,1388 @@
+...........................................................              [100%]
+============================== warnings summary ===============================
+tests/test_relational_independent_qk.py::test_optimizer_updates_both_roles_and_reports_counts
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - predictive_covariance='passthrough' (only read by attention_mode='projected_predictive')
+    - skip_belief_sigma_update=True (projected routes run no sigma E-step: predictive_content keeps or moment-matches covariance by predictive_covariance, and relational filtering returns no sigma gradient)
+    - decode_ce_stable_reduction=False (only read by nonlinear fused chunked CE)
+    - m_decode_sigma_lr=None (linear decode has no independent variance table)
+    - decode_temperature_learned=True (read only by the prior-bank KL decode)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_alpha_mode='constant' (the single gradient E-step iteration starts at q = p, where the self-coupling force vanishes)
+
+tests/test_relational_independent_qk.py::test_optimizer_updates_both_roles_and_reports_counts
+  C:\anaconda\Lib\site-packages\triton\knobs.py:212: UserWarning: Failed to find cuobjdump.exe
+    warnings.warn(f"Failed to find {binary}")
+
+tests/test_relational_independent_qk.py::test_optimizer_updates_both_roles_and_reports_counts
+  C:\anaconda\Lib\site-packages\triton\knobs.py:212: UserWarning: Failed to find nvdisasm.exe
+    warnings.warn(f"Failed to find {binary}")
+
+tests/test_relational_independent_qk.py::test_optimizer_updates_both_roles_and_reports_counts
+  C:\Users\chris and christine\Desktop\VFE_3.0\vfe3\model\model.py:1106: UserWarning: decode_unigram_prior=True but the unigram_log_prior table is unset (all-zero): the decode degenerates to the uniform prior. Call PriorBank.set_unigram_log_prior(counts) with the (V,) corpus counts.
+    logits = self.prior_bank.decode(
+
+tests/test_relational_noisy_query.py::test_config_local_validation_serialization_and_inactive_mark
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - skip_belief_sigma_update=True (projected routes run no sigma E-step: predictive_content keeps or moment-matches covariance by predictive_covariance, and relational filtering returns no sigma gradient)
+    - lambda_alpha_mode='constant' (the single gradient E-step iteration starts at q = p, where the self-coupling force vanishes)
+    - decode_ce_stable_reduction=False (only read by nonlinear fused chunked CE)
+    - m_decode_sigma_lr=None (linear decode has no independent variance table)
+    - decode_temperature_learned=True (read only by the prior-bank KL decode)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+
+tests/test_relational_noisy_query.py::test_config_local_validation_serialization_and_inactive_mark
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - m_relational_score_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - m_relational_content_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - predictive_covariance='passthrough' (only read by attention_mode='projected_predictive')
+    - block_mlp_expansion=2 (only read when use_block_mlp=True)
+    - decode_ce_stable_reduction=False (only read by nonlinear fused chunked CE)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - m_decode_sigma_lr=None (linear decode has no independent variance table)
+    - decode_temperature_learned=True (read only by the prior-bank KL decode)
+    - untie_decode_bank=False (read only by the KL-to-bank decode; the linear decode is untied by construction)
+    - lambda_alpha_mode='constant' (the single gradient E-step iteration starts at q = p, where the self-coupling force vanishes)
+
+tests/test_remediation_20260923_A.py::test_decode_notices_only_report_active_explicit_settings
+tests/test_remediation_20260923_A.py::test_legacy_dense_decode_admission_round_trips
+tests/test_remediation_20260923_d.py::test_decode_temperature_learned_true_keeps_the_learned_scale
+tests/test_split_decode_learning_rates_20260930.py::test_split_rates_roundtrip_and_legacy_omission[None-None]
+tests/test_split_decode_learning_rates_20260930.py::test_split_rates_roundtrip_and_legacy_omission[0.0-0.0]
+tests/test_split_decode_learning_rates_20260930.py::test_split_rates_roundtrip_and_legacy_omission[0.137-0.061]
+tests/test_split_decode_learning_rates_20260930.py::test_split_rates_roundtrip_and_legacy_omission[1-2]
+  <string>:161: UserWarning: prior-bank decode with frozen belief sigma (skip_belief_sigma_update=True): the KL decode READS sigma_q, so a frozen sigma changes predictions (sigma stays at encode). skip_belief_sigma_update is meant for configs where q's sigma is dead (linear decode, no norms); projected routes freeze sigma regardless of that flag.
+
+tests/test_remediation_20260923_A.py::test_legacy_dense_decode_admission_round_trips
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - m_relational_score_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - m_relational_content_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - predictive_covariance='passthrough' (only read by attention_mode='projected_predictive')
+    - decode_ce_stable_reduction=False (only read by nonlinear fused chunked CE)
+    - lambda_alpha_mode='constant' (the single gradient E-step iteration starts at q = p, where the self-coupling force vanishes)
+
+tests/test_remediation_20260923_A.py::test_legacy_dense_decode_admission_round_trips
+tests/test_remediation_20260923_A.py::test_train_loader_always_has_a_resumable_generator[None-23]
+tests/test_remediation_20260923_A.py::test_train_loader_always_has_a_resumable_generator[3-3]
+tests/test_uspace_group_step.py::test_retraction_config_validation_inactive_marks_and_serialized_default
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - m_relational_score_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - m_relational_content_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - predictive_covariance='passthrough' (only read by attention_mode='projected_predictive')
+    - decode_ce_stable_reduction=False (only read by nonlinear fused chunked CE)
+    - m_decode_sigma_lr=None (linear decode has no independent variance table)
+    - decode_temperature_learned=True (read only by the prior-bank KL decode)
+    - lambda_alpha_mode='constant' (the single gradient E-step iteration starts at q = p, where the self-coupling force vanishes)
+
+tests/test_remediation_20260923_A.py::test_run_once_prints_inactive_launcher_settings
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_run_once_prints_inactive_launcher_settings
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: UserWarning: prior-bank decode with frozen belief sigma (attention_mode='projected_predictive' (projected routes keep covariance)): the KL decode READS sigma_q, so a frozen sigma changes predictions (sigma stays at encode). skip_belief_sigma_update is meant for configs where q's sigma is dead (linear decode, no norms); projected routes freeze sigma regardless of that flag.
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=0.0 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=0.05 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=0.1 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=0.15 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=0.2 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=0.25 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=0.3 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=0.35 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=0.4 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=0.45 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=0.5 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=0.55 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=0.6 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=0.65 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=0.7 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=0.75 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=0.8 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=0.85 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=0.9 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=0.95 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=1.05 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=1.1 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=1.15 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=1.2 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=1.25 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=1.3 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=1.35 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=1.4 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=1.45 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=1.5 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=1.55 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=1.6 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=1.65 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=1.7 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=1.75 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=1.8 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=1.85 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=1.9 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=1.95 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=2.0 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=2.05 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=2.1 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=2.15 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=2.2 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=2.25 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=2.3 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=2.35 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=2.4 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=2.45 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=2.5 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=2.55 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=2.6 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=2.65 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=2.7 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=2.75 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=2.8 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=2.85 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=2.9 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=2.95 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=3.0 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=3.05 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=3.1 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=3.15 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=3.2 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=3.25 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=3.3 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=3.35 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=3.4 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=3.45 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=3.5 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=3.55 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=3.6 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=3.65 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=3.7 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=3.75 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=3.8 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=3.85 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=3.9 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=3.95 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=4.0 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=4.05 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=4.1 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=4.15 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=4.2 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=4.25 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=4.3 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=4.35 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=4.4 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=4.45 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=4.5 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=4.55 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=4.6 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=4.65 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=4.7 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=4.75 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=4.8 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=4.85 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=4.9 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=4.95 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_beta=5.0 (predictive_content weights no belief-coupling block)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - sigma_max=1 (no sigma E-step runs on projected routes or under skip_belief_sigma_update (a moment-matched predictive covariance is a readout with its own floor), so no sigma step, trust region, or SPD ceiling runs)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - sigma_max=5 (no sigma E-step runs on projected routes or under skip_belief_sigma_update (a moment-matched predictive covariance is a readout with its own floor), so no sigma step, trust region, or SPD ceiling runs)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - sigma_max=10 (no sigma E-step runs on projected routes or under skip_belief_sigma_update (a moment-matched predictive covariance is a readout with its own floor), so no sigma step, trust region, or SPD ceiling runs)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - sigma_max=20 (no sigma E-step runs on projected routes or under skip_belief_sigma_update (a moment-matched predictive covariance is a readout with its own floor), so no sigma step, trust region, or SPD ceiling runs)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - sigma_max=50 (no sigma E-step runs on projected routes or under skip_belief_sigma_update (a moment-matched predictive covariance is a readout with its own floor), so no sigma step, trust region, or SPD ceiling runs)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - e_q_mu_lr=0.8 (predictive_content replaces the mean (and, under predictive_covariance='moment_matched', the covariance) by readout, not a gradient step)
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - e_q_mu_lr=0.9 (predictive_content replaces the mean (and, under predictive_covariance='moment_matched', the covariance) by readout, not a gradient step)
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - e_q_mu_lr=1.0 (predictive_content replaces the mean (and, under predictive_covariance='moment_matched', the covariance) by readout, not a gradient step)
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - e_q_mu_lr=1.1 (predictive_content replaces the mean (and, under predictive_covariance='moment_matched', the covariance) by readout, not a gradient step)
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - e_q_sigma_lr=0.0 (no sigma E-step runs on projected routes or under skip_belief_sigma_update (a moment-matched predictive covariance is a readout with its own floor), so no sigma step, trust region, or SPD ceiling runs)
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - e_q_sigma_lr=0.005 (no sigma E-step runs on projected routes or under skip_belief_sigma_update (a moment-matched predictive covariance is a readout with its own floor), so no sigma step, trust region, or SPD ceiling runs)
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - e_q_sigma_lr=0.01 (no sigma E-step runs on projected routes or under skip_belief_sigma_update (a moment-matched predictive covariance is a readout with its own floor), so no sigma step, trust region, or SPD ceiling runs)
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - e_q_sigma_lr=0.02 (no sigma E-step runs on projected routes or under skip_belief_sigma_update (a moment-matched predictive covariance is a readout with its own floor), so no sigma step, trust region, or SPD ceiling runs)
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - e_q_sigma_lr=0.025 (no sigma E-step runs on projected routes or under skip_belief_sigma_update (a moment-matched predictive covariance is a readout with its own floor), so no sigma step, trust region, or SPD ceiling runs)
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - e_q_sigma_lr=0.03 (no sigma E-step runs on projected routes or under skip_belief_sigma_update (a moment-matched predictive covariance is a readout with its own floor), so no sigma step, trust region, or SPD ceiling runs)
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - e_q_sigma_lr=0.035 (no sigma E-step runs on projected routes or under skip_belief_sigma_update (a moment-matched predictive covariance is a readout with its own floor), so no sigma step, trust region, or SPD ceiling runs)
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - e_q_sigma_lr=0.04 (no sigma E-step runs on projected routes or under skip_belief_sigma_update (a moment-matched predictive covariance is a readout with its own floor), so no sigma step, trust region, or SPD ceiling runs)
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - e_q_sigma_lr=0.045 (no sigma E-step runs on projected routes or under skip_belief_sigma_update (a moment-matched predictive covariance is a readout with its own floor), so no sigma step, trust region, or SPD ceiling runs)
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - e_q_sigma_lr=0.05 (no sigma E-step runs on projected routes or under skip_belief_sigma_update (a moment-matched predictive covariance is a readout with its own floor), so no sigma step, trust region, or SPD ceiling runs)
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - e_q_sigma_lr=0.055 (no sigma E-step runs on projected routes or under skip_belief_sigma_update (a moment-matched predictive covariance is a readout with its own floor), so no sigma step, trust region, or SPD ceiling runs)
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - e_q_sigma_lr=0.06 (no sigma E-step runs on projected routes or under skip_belief_sigma_update (a moment-matched predictive covariance is a readout with its own floor), so no sigma step, trust region, or SPD ceiling runs)
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - e_q_sigma_lr=0.065 (no sigma E-step runs on projected routes or under skip_belief_sigma_update (a moment-matched predictive covariance is a readout with its own floor), so no sigma step, trust region, or SPD ceiling runs)
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - e_q_sigma_lr=0.07 (no sigma E-step runs on projected routes or under skip_belief_sigma_update (a moment-matched predictive covariance is a readout with its own floor), so no sigma step, trust region, or SPD ceiling runs)
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - e_q_sigma_lr=0.075 (no sigma E-step runs on projected routes or under skip_belief_sigma_update (a moment-matched predictive covariance is a readout with its own floor), so no sigma step, trust region, or SPD ceiling runs)
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - e_q_sigma_lr=0.08 (no sigma E-step runs on projected routes or under skip_belief_sigma_update (a moment-matched predictive covariance is a readout with its own floor), so no sigma step, trust region, or SPD ceiling runs)
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - e_q_sigma_lr=0.085 (no sigma E-step runs on projected routes or under skip_belief_sigma_update (a moment-matched predictive covariance is a readout with its own floor), so no sigma step, trust region, or SPD ceiling runs)
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - e_q_sigma_lr=0.09 (no sigma E-step runs on projected routes or under skip_belief_sigma_update (a moment-matched predictive covariance is a readout with its own floor), so no sigma step, trust region, or SPD ceiling runs)
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - e_q_sigma_lr=0.095 (no sigma E-step runs on projected routes or under skip_belief_sigma_update (a moment-matched predictive covariance is a readout with its own floor), so no sigma step, trust region, or SPD ceiling runs)
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - e_q_sigma_lr=0.1 (no sigma E-step runs on projected routes or under skip_belief_sigma_update (a moment-matched predictive covariance is a readout with its own floor), so no sigma step, trust region, or SPD ceiling runs)
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - family='gaussian_full' (value-identical to gaussian_diagonal under the rank-matched decoder on this route: stored covariance is a diagonal token lookup and no seam densifies it; full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, predictive_covariance='moment_matched', or attention_mode='transported')
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - skip_belief_sigma_update=True (projected routes run no sigma E-step: predictive_content keeps or moment-matches covariance by predictive_covariance, and relational filtering returns no sigma gradient)
+    - lambda_alpha_mode='constant' (the single gradient E-step iteration starts at q = p, where the self-coupling force vanishes)
+    - decode_ce_stable_reduction=False (only read by nonlinear fused chunked CE)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - m_decode_sigma_lr=None (linear decode has no independent variance table)
+    - decode_tau=0.01 (read only by the prior-bank KL decode)
+    - decode_temperature_learned=True (read only by the prior-bank KL decode)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - predictive_covariance='passthrough' (only read by attention_mode='projected_predictive')
+    - skip_belief_sigma_update=True (projected routes run no sigma E-step: predictive_content keeps or moment-matches covariance by predictive_covariance, and relational filtering returns no sigma gradient)
+    - decode_ce_stable_reduction=False (only read by nonlinear fused chunked CE)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - m_decode_sigma_lr=None (linear decode has no independent variance table)
+    - decode_tau=0.01 (read only by the prior-bank KL decode)
+    - decode_temperature_learned=True (read only by the prior-bank KL decode)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+    - lambda_alpha_mode='constant' (the single gradient E-step iteration starts at q = p, where the self-coupling force vanishes)
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - m_relational_score_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - m_relational_content_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - predictive_covariance='passthrough' (only read by attention_mode='projected_predictive')
+    - decode_ce_stable_reduction=False (only read by nonlinear fused chunked CE)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - m_decode_sigma_lr=None (linear decode has no independent variance table)
+    - decode_tau=0.01 (read only by the prior-bank KL decode)
+    - decode_temperature_learned=True (read only by the prior-bank KL decode)
+    - attention_window=6 (only the windowed/causal_windowed priors read the band half-width)
+    - lambda_alpha_mode='constant' (the single gradient E-step iteration starts at q = p, where the self-coupling force vanishes)
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: UserWarning: cross_couplings with family='gaussian_diagonal' is an APPROXIMATION: the off-block GL(K) congruence g*Sigma*g^T is not diagonal, so the diagonal readout is not gauge-invariant. family='gaussian_full' (diagonal_covariance=False) is the exact congruence path.
+
+tests/test_remediation_20260923_A.py::test_inert_sweep_is_rejected_when_selected
+  <string>:161: UserWarning: cross_couplings collapses block_glk to a single irrep block [K]: n_heads=2 no longer sets the attention-head count (runtime is 1 head) and the softmax temperature shifts from kappa*sqrt(d_head) to kappa*sqrt(K). This is the coherent single-block cross-coupled gauge; n_heads only partitions the generators.
+
+tests/test_remediation_20260923_A.py::test_single_seed_arm_has_unknown_spread_and_no_error_bar
+  C:\anaconda\Lib\site-packages\jupyter_client\connect.py:22: DeprecationWarning: Jupyter is migrating its paths to use standard platformdirs
+  given by the platformdirs library.  To remove this warning and
+  see the appropriate new directories, set the environment variable
+  `JUPYTER_PLATFORM_DIRS=1` and then run `jupyter --paths`.
+  The use of platformdirs will be the default in `jupyter_core` v6
+    from jupyter_core.paths import jupyter_data_dir, jupyter_runtime_dir, secure_write
+
+tests/test_remediation_20260923_C.py::test_transported_phi_estep_does_not_leak_future_tokens[two_layers]
+tests/test_remediation_20260923_C.py::test_transported_phi_estep_does_not_leak_future_tokens[one_layer_two_steps]
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - m_relational_score_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - m_relational_content_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - predictive_covariance='passthrough' (only read by attention_mode='projected_predictive')
+    - block_mlp_expansion=2 (only read when use_block_mlp=True)
+    - decode_ce_stable_reduction=False (only read by nonlinear fused chunked CE)
+    - decode_ranking_refinement='full' (only read when decode_ranking_fp64_escalation=True)
+    - m_decode_sigma_lr=None (linear decode has no independent variance table)
+    - decode_temperature_learned=True (read only by the prior-bank KL decode)
+    - untie_decode_bank=False (read only by the KL-to-bank decode; the linear decode is untied by construction)
+
+tests/test_remediation_20260923_d.py::test_decode_temperature_learned_true_keeps_the_learned_scale
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - m_relational_score_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - m_relational_content_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - predictive_covariance='passthrough' (only read by attention_mode='projected_predictive')
+    - decode_bias=False (linear decode only; the prior-bank KL decoders create no output bias)
+    - lambda_alpha_mode='constant' (the single gradient E-step iteration starts at q = p, where the self-coupling force vanishes)
+
+tests/test_remediation_20260923_d.py::test_transported_diagnostics_score_the_e_step_state_against_its_live_prior[overrides0]
+tests/test_remediation_20260923_d.py::test_transported_diagnostics_score_the_e_step_state_against_its_live_prior[overrides1]
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - m_relational_score_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - m_relational_content_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - predictive_covariance='passthrough' (only read by attention_mode='projected_predictive')
+    - m_pos_phi_lr=None (only pos_phi='learned' creates the learnable positional table)
+    - decode_ce_stable_reduction=False (only read by nonlinear fused chunked CE)
+    - m_decode_sigma_lr=None (linear decode has no independent variance table)
+    - decode_temperature_learned=True (read only by the prior-bank KL decode)
+
+tests/test_remediation_20260923_d.py::test_transported_diagnostics_score_the_e_step_state_against_its_live_prior[overrides0]
+  C:\Users\chris and christine\Desktop\VFE_3.0\tests\test_remediation_20260923_d.py:259: UserWarning: layernorm_affine=True but neither norm_type_block nor norm_type_final is 'layernorm': no affine gamma/beta are created and the toggle is inert. Set a norm seam to 'layernorm' to use the learned affine.
+    model = VFEModel(cfg).eval()
+
+tests/test_training_diagnostics_20260928.py::test_finalize_best_weights_resources_and_provenance
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - skip_belief_sigma_update=True (projected routes run no sigma E-step: predictive_content keeps or moment-matches covariance by predictive_covariance, and relational filtering returns no sigma gradient)
+    - lambda_alpha_mode='constant' (predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer)
+    - decode_ce_stable_reduction=False (only read by nonlinear fused chunked CE)
+    - m_decode_sigma_lr=None (linear decode has no independent variance table)
+    - decode_temperature_learned=True (read only by the prior-bank KL decode)
+    - full_cov_kl_backend='common_frame' (projected scoring never calls the transported full-covariance pair backend)
+
+tests/test_split_decode_learning_rates_20260930.py::test_split_rates_roundtrip_and_legacy_omission[None-None]
+tests/test_split_decode_learning_rates_20260930.py::test_split_rates_roundtrip_and_legacy_omission[0.0-0.0]
+tests/test_split_decode_learning_rates_20260930.py::test_split_rates_roundtrip_and_legacy_omission[0.137-0.061]
+tests/test_split_decode_learning_rates_20260930.py::test_split_rates_roundtrip_and_legacy_omission[1-2]
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - m_relational_score_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - m_relational_content_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - predictive_covariance='passthrough' (only read by attention_mode='projected_predictive')
+    - m_pos_phi_lr=None (only pos_phi='learned' creates the learnable positional table)
+    - lambda_alpha_mode='constant' (the single gradient E-step iteration starts at q = p, where the self-coupling force vanishes)
+
+tests/test_uspace_group_step.py::test_retraction_config_validation_inactive_marks_and_serialized_default
+  <string>:161: ConfigNotice: inert configuration setting(s) -- these values are read by no active path, so changing them will have no effect:
+    - m_relational_score_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - m_relational_content_lr=None (only read by projected attention; transported attention creates no relational parameters)
+    - predictive_covariance='passthrough' (only read by attention_mode='projected_predictive')
+    - m_pos_phi_lr=None (only pos_phi='learned' creates the learnable positional table)
+    - decode_ce_stable_reduction=False (only read by nonlinear fused chunked CE)
+    - m_decode_sigma_lr=None (linear decode has no independent variance table)
+    - decode_temperature_learned=True (read only by the prior-bank KL decode)
+    - lambda_alpha_mode='constant' (the single gradient E-step iteration starts at q = p, where the self-coupling force vanishes)
+
+tests/test_uspace_group_step.py::test_retraction_config_validation_inactive_marks_and_serialized_default
+  <string>:161: UserWarning: phi_weight_decay=0.065 is OVERRIDDEN to 0.0 by the m_phi_update_mode='pullback_group' policy metadata, for every phi-role group (phi_embed, pos_phi_free). The configured value is what gets persisted, so treat the recorded phi_weight_decay as nominal for this run.
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+- generated xml file: C:\Users\chris and christine\Desktop\VFE_3.0\.test-output\config-isolation\q-z-targeted.xml -

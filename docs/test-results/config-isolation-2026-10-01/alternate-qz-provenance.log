@@ -1,0 +1,20 @@
+..........................                                               [100%]
+============================== warnings summary ===============================
+tests/test_remediation_20260923_B.py::test_frozen_route_relabels_sigma_statistics_and_withholds_gate
+  C:\Users\chris and christine\Desktop\VFE_3.0\vfe3\model\model.py:1106: UserWarning: decode_unigram_prior=True but the unigram_log_prior table is unset (all-zero): the decode degenerates to the uniform prior. Call PriorBank.set_unigram_log_prior(counts) with the (V,) corpus counts.
+    logits = self.prior_bank.decode(
+
+tests/test_remediation_20260923_B.py::test_forest_withheld_without_window_and_captioned_by_seed_count
+tests/test_remediation_20260923_B.py::test_forest_withheld_without_window_and_captioned_by_seed_count
+tests/test_remediation_20260923_B.py::test_forest_withheld_without_window_and_captioned_by_seed_count
+tests/test_remediation_20260923_B.py::test_forest_withheld_without_window_and_captioned_by_seed_count
+  C:\anaconda\Lib\site-packages\matplotlib\cbook.py:1719: DeprecationWarning: Conversion of an array with ndim > 0 to a scalar is deprecated, and will error in future. Ensure you extract a single element from your array before performing this operation. (Deprecated NumPy 1.25.)
+    return math.isfinite(val)
+
+tests/test_remediation_20260923_B.py::test_decode_tau_eff_is_the_realized_temperature
+tests/test_remediation_20260923_B.py::test_finalize_run_persists_decode_tau_eff
+  <string>:161: UserWarning: prior-bank decode with frozen belief sigma (skip_belief_sigma_update=True): the KL decode READS sigma_q, so a frozen sigma changes predictions (sigma stays at encode). skip_belief_sigma_update is meant for configs where q's sigma is dead (linear decode, no norms); projected routes freeze sigma regardless of that flag.
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+- generated xml file: C:\Users\chris and christine\Desktop\VFE_3.0\.test-output\config-isolation\alternate-qz-provenance.xml -
+26 passed, 7 warnings in 5.16s

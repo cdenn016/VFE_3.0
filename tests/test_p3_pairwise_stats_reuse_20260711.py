@@ -1,5 +1,7 @@
 r"""Routing, construction, and consumer tests for diagonal-KL statistics reuse."""
 
+from tests.profiles import test_config
+
 import dataclasses
 import importlib
 from typing import Callable
@@ -34,7 +36,7 @@ def _tiny_config(
     *,
     e_step_update: str = "gradient",
 ) -> VFE3Config:
-    return VFE3Config(
+    return test_config(
         vocab_size=9,
         embed_dim=4,
         n_heads=2,

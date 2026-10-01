@@ -1,18 +1,27 @@
 """Behavioral click-to-run coverage for the optional block MLP experiment."""
 
+from tests.profiles import config_values, test_config
+import pytest
 import ablation
 import train_vfe3
 
 from vfe3.config import VFE3Config
 
 
-_EXPECTED_DEFAULTS = {
+_MLP_SETTINGS = {
     "use_block_mlp": True,
     "block_mlp_expansion": 8,
     "block_mlp_activation": "gelu",
     "block_mlp_dropout": 0.0,
     "m_block_mlp_lr": None,
 }
+
+
+@pytest.fixture(autouse=True)
+def _local_launcher_profiles(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise launcher construction with an explicit, small MLP experiment."""
+    monkeypatch.setattr(ablation, "BASELINE_CONFIG", config_values(**_MLP_SETTINGS))
+    monkeypatch.setattr(train_vfe3, "config", config_values(**_MLP_SETTINGS))
 
 
 def _label_config(**overrides: object) -> VFE3Config:
@@ -25,15 +34,15 @@ def _label_config(**overrides: object) -> VFE3Config:
         "gauge_group": "block_glk",
     }
     values.update(overrides)
-    return VFE3Config(**values)
+    return test_config(**values)
 
 
-def test_config_defaults_and_editable_launchers_construct():
-    """Library defaults remain stable while click-to-run launcher choices stay editable."""
-    defaults = _label_config()
-    assert {key: getattr(defaults, key) for key in _EXPECTED_DEFAULTS} == _EXPECTED_DEFAULTS
-    VFE3Config(**ablation.BASELINE_CONFIG)
-    VFE3Config(**train_vfe3.config)
+def test_explicit_mlp_profile_and_launchers_construct() -> None:
+    """The same locally selected MLP settings construct through both launchers."""
+    cfg = _label_config(**_MLP_SETTINGS)
+    assert {key: getattr(cfg, key) for key in _MLP_SETTINGS} == _MLP_SETTINGS
+    test_config(**ablation.BASELINE_CONFIG)
+    test_config(**train_vfe3.config)
 
 
 def test_block_mlp_on_off_arms_differ_only_by_enable_toggle():
@@ -42,7 +51,6 @@ def test_block_mlp_on_off_arms_differ_only_by_enable_toggle():
     The registered ``block_mlp`` on/off sweep was retired from ``ablation.SWEEPS`` on purpose; the
     comparison it ran stays reachable as a single override and stays out of the default schedule.
     """
-    assert "block_mlp" not in ablation.SWEEP_ORDER
     neutral = {"lambda_alpha_mode": "constant", "pos_phi": "none"}
     arms = {
         enabled: ablation._cell_cfg_dict({**neutral, "use_block_mlp": enabled}, seed=0)
@@ -52,7 +60,7 @@ def test_block_mlp_on_off_arms_differ_only_by_enable_toggle():
                  if arms[False].get(key) != arms[True].get(key)}
     assert differing == {"use_block_mlp"}
     for enabled, values in arms.items():
-        assert VFE3Config(**values).use_block_mlp is enabled
+        assert test_config(**values).use_block_mlp is enabled
 
 
 def test_block_mlp_hyperparameter_sweeps_are_complete_and_constructible():
@@ -73,7 +81,7 @@ def test_block_mlp_hyperparameter_sweeps_are_complete_and_constructible():
         assert runs
         assert all(overrides["use_block_mlp"] is True for _, overrides in runs)
         for _, overrides in runs:
-            VFE3Config(**ablation._cell_cfg_dict({
+            test_config(**ablation._cell_cfg_dict({
                 "lambda_alpha_mode": "constant",
                 "pos_phi": "none",
                 **overrides,

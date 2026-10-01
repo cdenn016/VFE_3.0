@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites><testsuite name="pytest" errors="0" failures="2" skipped="0" tests="2" time="0.126" timestamp="2026-10-01T12:10:42.897338" hostname="DESKTOP-RT15E78"><testcase classname="tests.test_config_isolation" name="test_tiny_profile_ignores_changed_experiment_defaults[changes0]" file="tests\test_config_isolation.py" line="10" time="0.046"><failure message="AssertionError: assert {'alibi_slope...l': True, ...} == {'alibi_slope...l': True, ...}&#10;  Omitting 150 identical items, use -vv to show&#10;  Differing items:&#10;  {'pos_phi': 'none'} != {'pos_phi': 'learned'}&#10;  {'decode_mode': 'full_chunked'} != {'decode_mode': 'linear'}&#10;  {'sigma_init': 0.4} != {'sigma_init': 15}&#10;  {'gauge_transport': 'off'} != {'gauge_transport': 'on'}&#10;  {'m_phi_lr': 0.0} != {'m_phi_lr': 0.015}...&#10;  &#10;  ...Full output truncated (4 lines hidden), use '-vv' to show">tests\test_config_isolation.py:29: in test_tiny_profile_ignores_changed_experiment_defaults
+    assert asdict(tiny_config()) == before
+E   AssertionError: assert {'alibi_slope...l': True, ...} == {'alibi_slope...l': True, ...}
+E     Omitting 150 identical items, use -vv to show
+E     Differing items:
+E     {'pos_phi': 'none'} != {'pos_phi': 'learned'}
+E     {'decode_mode': 'full_chunked'} != {'decode_mode': 'linear'}
+E     {'sigma_init': 0.4} != {'sigma_init': 15}
+E     {'gauge_transport': 'off'} != {'gauge_transport': 'on'}
+E     {'m_phi_lr': 0.0} != {'m_phi_lr': 0.015}...
+E     
+E     ...Full output truncated (4 lines hidden), use '-vv' to show</failure></testcase><testcase classname="tests.test_config_isolation" name="test_tiny_profile_ignores_changed_experiment_defaults[changes1]" file="tests\test_config_isolation.py" line="10" time="0.001"><failure message="ValueError: attention_mode='projected_predictive' has unsupported projected_filtering configuration: e_step_update='mm_exact' (requires 'gradient'); e_step_gradient='detach' (requires 'unroll')">tests\test_config_isolation.py:29: in test_tiny_profile_ignores_changed_experiment_defaults
+    assert asdict(tiny_config()) == before
+tests\profiles.py:18: in tiny_config
+    return VFE3Config(**values)
+&lt;string&gt;:161: in __init__
+    ???
+vfe3\config.py:989: in __post_init__
+    raise ValueError(
+E   ValueError: attention_mode='projected_predictive' has unsupported projected_filtering configuration: e_step_update='mm_exact' (requires 'gradient'); e_step_gradient='detach' (requires 'unroll')</failure></testcase></testsuite></testsuites>

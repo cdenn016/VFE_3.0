@@ -1,4 +1,5 @@
 """Tiny CPU equivalence and memory contracts for projected-path cleanup."""
+from tests.profiles import test_config
 from typing import Any
 
 import pytest
@@ -142,7 +143,7 @@ def _configuration(**overrides: Any) -> VFE3Config:
                     attention_mode="projected_predictive", relational_input_scope="full",
                     relational_output_scope="full", prior_handoff_rho=.7, prior_handoff_sigma=.4)
     settings.update(overrides)
-    return VFE3Config(**settings)
+    return test_config(**settings)
 
 
 @pytest.mark.parametrize("family", ["gaussian_diagonal", "gaussian_full"])

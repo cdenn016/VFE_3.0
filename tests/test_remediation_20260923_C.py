@@ -4,6 +4,7 @@ Every model and tensor here is TINY (single-digit dims) and CPU-bound. Host read
 wrapping the Python-level ``torch.Tensor`` conversions (``bool``/``float``/``int``/``item``/
 ``tolist``), which are exactly the calls that synchronize with a CUDA device.
 """
+from tests.profiles import test_config
 
 import inspect
 import math
@@ -158,7 +159,8 @@ def _max_future_leak(cfg) -> float:
                          ids=["two_layers", "one_layer_two_steps"])
 def test_transported_phi_estep_does_not_leak_future_tokens(depth: dict) -> None:
     cfg = tiny_config(attention_mode="transported", beta_attention_prior="causal",
-                      vocab_size=13, max_seq_len=6, e_phi_lr=0.05, **depth)
+                      predictive_covariance="passthrough", relational_output_scope="head",
+                      attention_residual=False, vocab_size=13, max_seq_len=6, e_phi_lr=0.05, **depth)
     assert cfg.e_phi_lr > 0.0 and cfg.gradient_mode == "filtering"
     # Before the fix this measured 3.0e-3 on this exact configuration.
     assert _max_future_leak(cfg) <= 1e-6
@@ -596,9 +598,8 @@ def test_projected_kl_healthy_path_reads_host_once_even_when_moderately_conditio
 def test_estep_capture_publishes_the_recovery_count(monkeypatch) -> None:
     import itertools
 
-    from vfe3.config import VFE3Config
 
-    cfg = VFE3Config(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
+    cfg = test_config(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
                      n_e_steps=1, family="gaussian_diagonal", gauge_group="block_glk",
                      skip_belief_sigma_update=True, e_phi_lr=0.0, oracle_unroll_grad=True,
                      warmup_steps=0, max_steps=2, log_interval=0, eval_interval=0,

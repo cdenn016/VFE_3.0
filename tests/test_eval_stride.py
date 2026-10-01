@@ -13,6 +13,7 @@ scored targets equals the number of transitions in the stream, each exactly once
 (``eval_stride=None``) must stay byte-identical to the disjoint windows it replaces.
 """
 
+from tests.profiles import test_config
 import pytest
 import torch
 from torch.utils.data import DataLoader
@@ -132,7 +133,7 @@ def _cfg(**kw) -> VFE3Config:
     base = dict(vocab_size=16, embed_dim=4, max_seq_len=8, n_layers=1, n_heads=1,
                 gauge_group="glk", n_e_steps=1)
     base.update(kw)
-    return VFE3Config(**base)
+    return test_config(**base)
 
 
 def test_eval_stride_defaults_to_none():
@@ -160,13 +161,13 @@ def test_select_loader_strides_eval_splits_only(monkeypatch):
         return ("loader", split)
 
     monkeypatch.setattr(train_vfe3, "make_dataloader", fake_make_dataloader)
-    cfg = VFE3Config(eval_stride=64)
+    cfg = test_config(max_seq_len=8, eval_stride=4)
     for split in ("train", "validation", "test"):
         train_vfe3._select_loader("wikitext-103", cfg, split=split)
 
     assert captured["train"]["stride"] is None                   # train never strides
-    assert captured["validation"]["stride"] == 64
-    assert captured["test"]["stride"] == 64
+    assert captured["validation"]["stride"] == 4
+    assert captured["test"]["stride"] == 4
 
 
 def test_select_loader_default_passes_no_stride(monkeypatch):
@@ -178,7 +179,7 @@ def test_select_loader_default_passes_no_stride(monkeypatch):
 
     monkeypatch.setattr(train_vfe3, "make_dataloader", fake_make_dataloader)
     for split in ("train", "validation", "test"):
-        train_vfe3._select_loader("wikitext-103", VFE3Config(), split=split)
+        train_vfe3._select_loader("wikitext-103", test_config(), split=split)
     assert all(captured[split]["stride"] is None for split in captured)
 
 
@@ -228,7 +229,7 @@ def test_strided_eval_removes_the_head_of_window_context_starvation():
     from vfe3.train import evaluate
 
     seq_len = 8
-    cfg = VFE3Config(vocab_size=12, embed_dim=4, max_seq_len=seq_len, n_layers=1, n_heads=1,
+    cfg = test_config(vocab_size=12, embed_dim=4, max_seq_len=seq_len, n_layers=1, n_heads=1,
                      gauge_group="glk", n_e_steps=2, batch_size=8)
     torch.manual_seed(0)
     model = VFEModel(cfg)

@@ -35,6 +35,7 @@ import torch.nn.functional as F
 
 import vfe3.model.prior_bank as prior_bank
 from vfe3.belief import BeliefState
+from vfe3.model.model import VFEModel
 from vfe3.numerics import (
     decode_logdet_fallback_elements,
     reset_decode_logdet_fallback_elements,
@@ -50,20 +51,39 @@ def _reset():
     reset_decode_logdet_fallback_elements()
 
 
-def _bank():
-    model = _tiny_model(gauge_group="block_glk", n_heads=2, family="gaussian_full",
-                        decode_mode="full_chunked")
-    return model, model.prior_bank
+def _bank() -> tuple[VFEModel, prior_bank.PriorBank]:
+    """Use a local decoder policy and exactly representable, nonuniform prior means.
+
+    Excluding rows packs the decoder batch. Random fp32 dot products and loss sums can change by
+    one ULP when that shape changes; dyadic inputs and fp64 reduction keep the bitwise exclusion
+    oracle independent of the process RNG and earlier tests' arithmetic policies.
+    """
+    model = _tiny_model(vocab_size=7, gauge_group="block_glk", n_heads=2,
+                        family="gaussian_full", decode_mode="full_chunked",
+                        decode_av_precision="fp64", decode_ce_stable_reduction=True,
+                        decode_ranking_fp64_escalation=False, decode_ce_checkpoint="never",
+                        fp32_matmul_precision="highest", full_cov_kl_precision="fp32_escalate",
+                        safe_cholesky_jitter_mode="relative")
+    bank = model.prior_bank
+    with torch.no_grad():
+        row = torch.arange(bank.vocab_size) - bank.vocab_size // 2
+        coord = torch.arange(bank.K) + 1
+        bank._decode_mu_table().copy_(row[:, None] * coord[None, :] / 16)  # (V, K)
+        bank._decode_sigma_log_table().zero_()                            # Sigma_v = I
+    return model, bank
 
 
-def _inputs(model, non_pd_at=None):
+def _inputs(
+    model: VFEModel,
+    non_pd_at: tuple[int, int] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, N, K = 2, 5, model.cfg.embed_dim
     g = torch.Generator().manual_seed(0)
-    mu = torch.randn(B, N, K, generator=g)
+    mu = torch.randn(B, N, K, generator=g).mul(4).round().div(4)
     sigma = torch.eye(K).expand(B, N, K, K).clone()
     if non_pd_at is not None:
         sigma[non_pd_at] = -5.0 * torch.eye(K)      # fails every jitter round
-    return mu, sigma, torch.randint(0, 20, (B, N), generator=g)
+    return mu, sigma, torch.randint(0, model.cfg.vocab_size, (B, N), generator=g)
 
 
 # -- (a) the mask no longer manufactures NaN ---------------------------------------------------
@@ -156,7 +176,8 @@ def test_healthy_path_counts_zero_and_stays_finite():
 
 def test_model_forward_is_finite_and_counts_zero():
     model, _ = _bank()
-    loss = model(torch.randint(0, 20, (2, 5)), torch.randint(0, 20, (2, 5)))[1]
+    loss = model(torch.randint(0, model.cfg.vocab_size, (2, 5)),
+                 torch.randint(0, model.cfg.vocab_size, (2, 5)))[1]
     assert torch.isfinite(loss)
     assert decode_logdet_fallback_elements() == 0
 
@@ -185,6 +206,7 @@ def test_nonfinite_rows_are_sanitized_excluded_counted_and_have_zero_gradient():
     assert decode_logdet_fallback_elements() == len(invalid_rows)
     assert torch.isfinite(mu.grad).all()
     assert torch.isfinite(sigma.grad).all()
+    assert mu.grad[1, 0].abs().sum() > 0  # A healthy scored row retains a likelihood gradient.
     for row in invalid_rows:
         assert torch.equal(mu.grad[row], torch.zeros_like(mu.grad[row]))
         assert torch.equal(sigma.grad[row], torch.zeros_like(sigma.grad[row]))
@@ -233,6 +255,7 @@ def test_head_block_only_failure_is_excluded_by_dense_full_consumers(decode_mode
     ``block_ok`` adds information beyond ``spd_ok``.
     """
     model = _tiny_model(
+        vocab_size=7,
         gauge_group="block_glk",
         n_heads=2,
         family="gaussian_full",

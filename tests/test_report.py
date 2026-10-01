@@ -5,6 +5,7 @@ and were unit-tested in isolation, but nothing drove them end-to-end against a r
 trained run produced only one of the publication figures. The proof is PNG files on disk, so the
 integration test asserts the figure set actually appears when the driver runs the real model.
 """
+from tests.profiles import test_config
 
 import json
 import logging
@@ -17,7 +18,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from vfe3 import run_artifacts
-from vfe3.config import VFE3Config, serialize_config
+from vfe3.config import serialize_config
 from vfe3.data.datasets import TokenWindows
 from vfe3.geometry.transport import CompactFactoredTransport
 from vfe3.model.model import VFEModel
@@ -40,7 +41,7 @@ def _cfg(**kw):
     base = dict(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
                 n_e_steps=2, e_q_mu_lr=0.1, e_phi_lr=0.05)
     base.update(kw)
-    return VFE3Config(**base)
+    return test_config(**base)
 
 
 def _model(**kw):

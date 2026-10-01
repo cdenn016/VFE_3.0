@@ -1,11 +1,11 @@
 """Regression tests for E-step naming and fixed-point reporting buildout."""
 
+from tests.profiles import test_config
 import copy
 
 import pytest
 import torch
 
-from vfe3.config import VFE3Config
 from vfe3.inference.e_step import canonical_e_step_update
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import collect_estep_depth_sensitivity
@@ -13,7 +13,7 @@ from vfe3.viz.extract import e_step_belief_trace, e_step_fixed_point_diagnostics
 
 
 def _mm_model(update: str) -> VFEModel:
-    cfg = VFE3Config(
+    cfg = test_config(
         vocab_size=12,
         embed_dim=4,
         n_heads=1,
@@ -32,16 +32,16 @@ def _mm_model(update: str) -> VFEModel:
 
 
 def test_group_product_accepts_the_flat_tied_phi_route() -> None:
-    assert VFE3Config(pos_phi="learned").pos_phi == "learned"
-    assert VFE3Config(pos_phi="learned").transport_mode == "flat"
-    assert VFE3Config(pos_phi="none").pos_phi == "none"
+    assert test_config(pos_phi="learned").pos_phi == "learned"
+    assert test_config(pos_phi="learned").transport_mode == "flat"
+    assert test_config(pos_phi="none").pos_phi == "none"
 
 
 @pytest.mark.parametrize("value", [0.0, -1.0, float("inf"), float("nan")])
 def test_phi_mstep_max_matrix_norm_must_be_positive_or_none(value: float) -> None:
-    assert VFE3Config(phi_mstep_max_matrix_norm=None).phi_mstep_max_matrix_norm is None
+    assert test_config(phi_mstep_max_matrix_norm=None).phi_mstep_max_matrix_norm is None
     with pytest.raises(ValueError, match="phi_mstep_max_matrix_norm"):
-        VFE3Config(phi_mstep_max_matrix_norm=value)
+        test_config(phi_mstep_max_matrix_norm=value)
 
 
 def test_one_step_ahead_residual_is_distinct_from_configured_last_step() -> None:

@@ -1,5 +1,9 @@
 """Tiny depth regressions for projected predictive-content attention."""
+
+from tests.profiles import config_values, test_config
+from dataclasses import asdict
 from pathlib import Path
+import os
 import pytest
 import torch
 from tests.test_relational_integration import _cfg, _tokens
@@ -17,14 +21,12 @@ def _depth_cfg(layers: int, **kwargs) -> VFE3Config:
 
 
 @pytest.mark.parametrize("layers", [2, 3])
-def test_active_launcher_accepts_depth(layers: int) -> None:
-    # Source of truth is the shipped click-to-run launcher dict (the docs/changes copy of this
-    # config was deleted with the docs tree on 2026-09-18).
+def test_launcher_accepts_projected_depth(layers: int, monkeypatch: pytest.MonkeyPatch) -> None:
     import train_vfe3
 
+    monkeypatch.setattr(train_vfe3, "config", config_values(**asdict(_depth_cfg(layers))))
     settings = dict(train_vfe3.config)
-    settings["n_layers"] = layers
-    cfg = VFE3Config(**settings)
+    cfg = test_config(**settings)
     assert cfg.n_layers == layers and cfg.attention_residual
 
 
@@ -80,16 +82,19 @@ def test_depth_checkpoint_and_optimizer(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_scaled_active_config_training_step(device: str) -> None:
+def test_local_projected_config_training_step(device: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    if device == "cuda" and os.environ.get("VFE3_TEST_DEVICE", "cpu").partition(":")[0] != "cuda":
+        pytest.skip("CUDA lane not requested")
     if device == "cuda" and torch.cuda.device_count() == 0:
         pytest.skip("CUDA unavailable")
     import train_vfe3
 
+    monkeypatch.setattr(train_vfe3, "config", config_values(**asdict(_depth_cfg(3))))
     settings = dict(train_vfe3.config)
     settings.update(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=4,
                     attention_window=4, eval_stride=1, batch_size=1,
                     block_mlp_expansion=2, n_layers=3, max_steps=2, warmup_steps=0)
-    cfg = VFE3Config(**settings)
+    cfg = test_config(**settings)
     torch.manual_seed(23)
     model = VFEModel(cfg).to(device)
     optimizer = build_optimizer(model, cfg)

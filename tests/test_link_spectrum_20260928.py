@@ -12,6 +12,8 @@ prior, and that the relational diagnostics emit every key at every layer.
 
 from __future__ import annotations
 
+from tests.profiles import test_config
+
 import math
 import warnings
 from typing import Any, Dict, Tuple
@@ -309,14 +311,14 @@ def _model_cfg(**over: Any) -> VFE3Config:
     values.update(over)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        return VFE3Config(**values)
+        return test_config(**values)
 
 
 def test_relational_diagnostics_emit_link_keys_at_every_layer() -> None:
     torch.manual_seed(0)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        model = VFEModel(_model_cfg()).eval()
+        model = VFEModel(_model_cfg(relational_input_scope="head", relational_output_scope="head")).eval()
     tokens = torch.tensor([[0, 1, 2, 3]])
     d = model.diagnostics(tokens)
     for key in metrics.LINK_SPECTRUM_KEYS:

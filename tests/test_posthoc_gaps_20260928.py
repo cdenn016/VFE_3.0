@@ -377,7 +377,7 @@ def test_run_posthoc_transported_route_records_reasons(tmp_path: Path, monkeypat
     from vfe3.posthoc.report import run_posthoc
 
     def transported_cfg(**over: Any) -> Any:
-        return _cfg(attention_mode="transported")
+        return _cfg(attention_mode="transported", attention_residual=False, relational_output_scope="head")
 
     def transported_model(cfg: Any, seed: int = 0) -> VFEModel:
         torch.manual_seed(seed)

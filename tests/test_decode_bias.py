@@ -6,11 +6,11 @@ distribution). Inert under prior-bank decoder modes, whose per-vocab priors
 already carry the unigram role), where it warns and creates no parameter.
 """
 
+from tests.profiles import test_config
 import pytest
 import torch
 import torch.nn.functional as F
 
-from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 from vfe3.model.prior_bank import PriorBank
 from vfe3.train import build_optimizer
@@ -72,7 +72,7 @@ def test_bias_gradient_descends_toward_log_unigram():
 
 
 def test_bias_in_weight_decay_free_optimizer_group():
-    cfg = VFE3Config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
+    cfg = test_config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
                      decode_mode="linear", decode_bias=True, weight_decay=0.05)
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
@@ -85,7 +85,9 @@ def test_bias_in_weight_decay_free_optimizer_group():
 def test_decode_bias_inert_under_prior_bank_warns():
     # decode_bias is structurally inactive under a prior-bank decoder; the notice shows only a
     # non-default value (the default True is silent), matching every other inactive field.
+    from vfe3.config import VFE3Config
+    selected = not VFE3Config.__dataclass_fields__["decode_bias"].default
     with pytest.warns(UserWarning, match="decode_bias"):
-        cfg = VFE3Config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=4,
-                         decode_mode="diagonal_chunked", decode_bias=False)
+        cfg = test_config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=4,
+                         decode_mode="diagonal_chunked", decode_bias=selected)
     assert "decode_bias" in cfg.inactive_fields()

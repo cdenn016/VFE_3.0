@@ -1,5 +1,6 @@
 """Decoder rate routing and owned CPU fused-target transfer regressions."""
 
+from tests.profiles import test_config
 from dataclasses import replace
 from typing import Any, Optional
 
@@ -21,7 +22,7 @@ def _config(**overrides: Any) -> VFE3Config:
     values.update(overrides)
     if values["decode_mode"] == "full_chunked":
         values["family"] = "gaussian_full"
-    return VFE3Config(**values)
+    return test_config(**values)
 
 
 def _groups(model: VFEModel, optimizer: torch.optim.Optimizer) -> dict[str, dict[str, Any]]:

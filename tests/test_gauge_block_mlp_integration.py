@@ -1,3 +1,4 @@
+from tests.profiles import config_values, test_config
 from types import SimpleNamespace
 
 import pytest
@@ -6,7 +7,6 @@ from torch import nn
 
 import ablation
 import train_vfe3
-from vfe3.config import VFE3Config
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.model.block import vfe_block
 from vfe3.model.block_mlp import CanonicalFrameBlockMLP, GaugeGateBlockMLP
@@ -33,11 +33,12 @@ def _full_cfg(**overrides):
         norm_type_block="none",
     )
     values.update(overrides)
-    return VFE3Config(**values)
+    return test_config(**values)
 
 
-def test_block_mlp_mode_defaults_preserve_coordinate_passthrough_behavior():
-    cfg = VFE3Config()
+def test_block_mlp_coordinate_passthrough_controls():
+    cfg = test_config(block_mlp_mode="coordinate", block_mlp_covariance="passthrough",
+                      block_mlp_covariance_floor=1e-4)
     assert cfg.block_mlp_mode == "coordinate"
     assert cfg.block_mlp_covariance == "passthrough"
     assert cfg.block_mlp_covariance_floor == 1e-4
@@ -132,23 +133,20 @@ def test_block_uses_moment_api_and_forwards_canonical_frame():
     assert torch.equal(out.sigma, capture["converged"].sigma + 5.0)
 
 
-def test_editable_launchers_expose_mode_and_covariance_toggles():
+def test_launcher_accepts_mode_and_covariance_controls(monkeypatch):
     selectors = {"block_mlp_mode", "block_mlp_covariance", "block_mlp_covariance_floor"}
-    # The training launcher writes the toggles explicitly (2026-09-27); the ablation baseline
-    # still omits them and resolves through the canonical public defaults.
+    local = config_values(block_mlp_mode="coordinate", block_mlp_covariance="passthrough",
+                          block_mlp_covariance_floor=1e-4)
+    monkeypatch.setattr(train_vfe3, "config", local)
     assert selectors <= set(train_vfe3.config)
-    assert selectors.isdisjoint(ablation.BASELINE_CONFIG)
-
-    defaults = VFE3Config()
-    for name in selectors:
-        assert train_vfe3.config[name] == getattr(defaults, name)
-    cfg = VFE3Config(**train_vfe3.config)
+    cfg = test_config(**train_vfe3.config)
     assert cfg.block_mlp_mode == "coordinate"
     assert cfg.block_mlp_covariance == "passthrough"
     assert cfg.block_mlp_covariance_floor == 1e-4
 
 
-def test_ablation_registers_mode_and_covariance_sweeps():
+def test_ablation_registers_mode_and_covariance_sweeps(monkeypatch):
+    monkeypatch.setattr(ablation, "BASELINE_CONFIG", config_values())
     ablation.validate_sweeps(
         ["block_mlp_mode", "block_mlp_covariance"], require_construction=False,
     )

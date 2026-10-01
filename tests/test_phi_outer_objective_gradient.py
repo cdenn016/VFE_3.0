@@ -1,5 +1,7 @@
 """Outer-objective covector and training-boundary proofs for phi group descent."""
 
+from tests.profiles import test_config
+
 import copy
 import types
 
@@ -27,9 +29,18 @@ def _outer_cfg(**overrides: object) -> VFE3Config:
         "mstep_self_coupling_weight": 0.0,
         "seed": 19,
         "gradient_mode": "smoothing",
+        "mu_init_std": 0.02,
+        "sigma_init": 1.0,
+        "phi_scale": 0.01,
+        "lambda_alpha_mode": "constant",
+        "norm_type_block": "layernorm",
+        "layernorm_affine": True,
+        "skip_belief_sigma_update": True,
+        "beta_attention_prior": "causal_alibi",
+        "decode_temperature_learned": True,
     }
     values.update(overrides)
-    return VFE3Config(**values)
+    return test_config(**values)
 
 
 def _fixed_batch() -> tuple[torch.Tensor, torch.Tensor]:

@@ -1,5 +1,7 @@
 """Opt-in PriorBank-native head-evidence mixer state and ownership."""
 
+from tests.profiles import test_config
+
 import math
 
 import pytest
@@ -161,13 +163,14 @@ def _enabled_cfg(**overrides: object) -> VFE3Config:
         "divergence_family": "renyi",
         "renyi_order": 1.0,
         "decode_mode": "diagonal_chunked",
+        "lambda_alpha_mode": "constant",
     }
     values.update(overrides)
-    return VFE3Config(**values)
+    return test_config(**values)
 
 
-def test_head_evidence_is_default_off_and_does_not_change_state_dict():
-    assert VFE3Config().use_priorbank_head_evidence_mixer is False
+def test_head_evidence_disabled_does_not_change_state_dict():
+    assert test_config(use_priorbank_head_evidence_mixer=False).use_priorbank_head_evidence_mixer is False
     torch.manual_seed(7)
     base = PriorBank(11, 4, 8, irrep_dims=[2, 2], decode_mode="diagonal_chunked")
     torch.manual_seed(7)

@@ -11,12 +11,13 @@ freeze footgun); as the FINAL norm it is post-stack and trains under any estimat
 All models here are tiny (K = 4, single-digit dims), CPU-bound per the project testing rules.
 """
 
+from tests.profiles import test_config
+
 import warnings
 
 import pytest
 import torch
 
-from vfe3.config import VFE3Config
 from vfe3.geometry.norms import AffineLayerNorm, LayerNorm
 from vfe3.model.model import VFEModel
 
@@ -26,7 +27,7 @@ def _cfg(**kw):
                 n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0,
                 layernorm_affine=False, use_block_mlp=False)
     base.update(kw)
-    return VFE3Config(**base)
+    return test_config(**base)
 
 
 def _batch(seed: int = 0):
@@ -37,10 +38,8 @@ def _batch(seed: int = 0):
 
 # --- defaults / pure path ----------------------------------------------------
 
-def test_layernorm_affine_default_is_on():
-    # The library default is the learned affine (SANCTIONED LEARNED-SCALAR EXCEPTION, default ON);
-    # the parameter-free LayerNorm stays reachable with layernorm_affine=False (next test).
-    assert VFE3Config().layernorm_affine is True
+def test_layernorm_affine_can_be_selected():
+    assert test_config(layernorm_affine=True).layernorm_affine is True
 
 
 def test_param_free_when_affine_off():

@@ -1,0 +1,178 @@
+{
+  "profile-red": {
+    "tests": 2,
+    "failures": 2,
+    "errors": 0,
+    "skipped": 0,
+    "passed": 0,
+    "seconds": 0.126
+  },
+  "profile-green": {
+    "tests": 6,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "passed": 6,
+    "seconds": 0.08
+  },
+  "a-f-final": {
+    "tests": 949,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "passed": 949,
+    "seconds": 144.414
+  },
+  "g-p-targeted": {
+    "tests": 16,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "passed": 16,
+    "seconds": 5.688
+  },
+  "q-z-targeted": {
+    "tests": 59,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "passed": 59,
+    "seconds": 5.607
+  },
+  "a-f-notice-alternate": {
+    "tests": 12,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "passed": 12,
+    "seconds": 3.487
+  },
+  "a-f-route-alternate": {
+    "tests": 22,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "passed": 22,
+    "seconds": 0.506
+  },
+  "alternate-qz-provenance": {
+    "tests": 26,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "passed": 26,
+    "seconds": 5.166
+  },
+  "g-p-followup": {
+    "tests": 21,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "passed": 21,
+    "seconds": 9.945
+  },
+  "alternate-full": {
+    "tests": 3473,
+    "failures": 10,
+    "errors": 0,
+    "skipped": 16,
+    "passed": 3447,
+    "seconds": 647.332
+  },
+  "final-focused": {
+    "tests": 84,
+    "failures": 1,
+    "errors": 0,
+    "skipped": 0,
+    "passed": 83,
+    "seconds": 13.903
+  },
+  "centering-final": {
+    "tests": 9,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "passed": 9,
+    "seconds": 0.4
+  },
+  "original_failures": [
+    {
+      "classname": "tests.test_canonical_content_gauge",
+      "name": "test_exact_construction_rejects_overridden_encoder_identity[registration]",
+      "passed_in_followup": true
+    },
+    {
+      "classname": "tests.test_canonical_content_gauge",
+      "name": "test_exact_construction_rejects_overridden_encoder_identity[callable_map]",
+      "passed_in_followup": true
+    },
+    {
+      "classname": "tests.test_canonical_content_gauge",
+      "name": "test_exact_construction_rejects_overridden_frame_family_identity",
+      "passed_in_followup": true
+    },
+    {
+      "classname": "tests.test_canonical_content_gauge",
+      "name": "test_canonical_model_has_no_supervised_phi_gradient_and_emits_one_provenance_notice",
+      "passed_in_followup": true
+    },
+    {
+      "classname": "tests.test_canonical_content_gauge",
+      "name": "test_canonical_config_accepts_unigram_base_rate_and_names_its_separate_role",
+      "passed_in_followup": true
+    },
+    {
+      "classname": "tests.test_cleanup_geometry",
+      "name": "test_predictive_gradient_capture_uses_host_nan_and_preserves_real_norms",
+      "passed_in_followup": true
+    },
+    {
+      "classname": "tests.test_cuda_zero_device_gates_20260929",
+      "name": "test_train_checkpoint_and_finalize_leave_cuda_rng_alone",
+      "passed_in_followup": true
+    },
+    {
+      "classname": "tests.test_decode_nonpd_fallback_20260806",
+      "name": "test_fused_ce_excludes_the_degenerate_position",
+      "passed_in_followup": true
+    },
+    {
+      "classname": "tests.test_decode_nonpd_fallback_20260806",
+      "name": "test_nonfinite_rows_are_sanitized_excluded_counted_and_have_zero_gradient",
+      "passed_in_followup": true
+    },
+    {
+      "classname": "tests.test_remediation_20260923_B",
+      "name": "test_mixed_generation_process_is_not_reported_stable",
+      "passed_in_followup": true
+    }
+  ],
+  "ast_parsed_test_files": 194,
+  "direct_constructor_calls": [
+    {
+      "file": "tests/profiles.py",
+      "line": 186
+    },
+    {
+      "file": "tests/test_train.py",
+      "line": 595
+    }
+  ],
+  "scope": "CPU only; CUDA and external markers excluded. One whole-suite run followed by focused reruns. Concurrent production changes occurred; no second whole-suite run.",
+  "publication-focused": {
+    "tests": 75,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "passed": 75,
+    "seconds": 7.134
+  },
+  "publication-combined": {
+    "tests": 84,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "passed": 84,
+    "seconds": 6.477
+  }
+}

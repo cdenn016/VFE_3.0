@@ -1,5 +1,6 @@
 """Causal support must exclude Gaussian pairs before numerical certification."""
 
+from tests.profiles import test_config
 import os
 from collections.abc import Iterator
 
@@ -150,11 +151,10 @@ def test_tiny_full_gaussian_forward_backward_and_logger(
 ) -> None:
     import math
 
-    from vfe3.config import VFE3Config
     from vfe3.model.model import VFEModel
 
     torch.manual_seed(23)
-    cfg = VFE3Config(
+    cfg = test_config(
         vocab_size=7, embed_dim=4, n_heads=n_heads, max_seq_len=3, batch_size=1,
         n_layers=1, n_e_steps=1, family="gaussian_full", gauge_group="block_glk",
         encode_mode="per_token", decode_mode="full_chunked",

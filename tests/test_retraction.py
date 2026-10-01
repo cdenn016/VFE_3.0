@@ -1,3 +1,4 @@
+from tests.profiles import test_config
 import pytest
 import torch
 import vfe3.geometry.retraction as retraction_module
@@ -366,10 +367,9 @@ def test_full_cov_model_first_backward_finite_at_default_init():
     (prior sigma = diag_embed(exp(0)) = I, the degenerate spectrum) must produce a finite FIRST
     backward on the default 'unroll' estimator. Pre-fix this NaN-poisoned prior_bank.sigma_log_embed
     on the very first step (the defender's end-to-end repro)."""
-    from vfe3.config import VFE3Config
     from vfe3.model.model import VFEModel
     torch.manual_seed(0)
-    cfg = VFE3Config(vocab_size=8, embed_dim=4, n_heads=2, n_layers=1,
+    cfg = test_config(vocab_size=8, embed_dim=4, n_heads=2, n_layers=1,
                      family="gaussian_full", decode_mode="full_chunked")
     model = VFEModel(cfg)
     x = torch.randint(0, 8, (2, 6))

@@ -1,10 +1,10 @@
+from tests.profiles import test_config
 import math
 
 import torch
 from torch.utils.data import DataLoader
 
 import vfe3.data.datasets as datasets_mod
-from vfe3.config import VFE3Config
 from vfe3.data.datasets import TokenWindows, tokens_per_char
 from vfe3.model.model import VFEModel
 from vfe3.train import evaluate
@@ -12,7 +12,7 @@ from vfe3.train import evaluate
 
 def test_evaluate_applies_tokens_per_char_to_bpc_only():
     # BPC scales linearly with tokens_per_char; CE, PPL, and named BPT are unaffected.
-    cfg = VFE3Config(vocab_size=8, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=1,
+    cfg = test_config(vocab_size=8, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=1,
                      gauge_group="block_glk", pos_phi="none")
     torch.manual_seed(0)
     model = VFEModel(cfg)

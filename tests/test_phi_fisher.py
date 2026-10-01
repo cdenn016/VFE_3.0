@@ -7,6 +7,8 @@ tiny VFEModel against a dense chart-coordinate route, and the optimizer, trainin
 wiring under both retractions.
 """
 
+from tests.profiles import test_config
+
 import math
 import warnings
 
@@ -357,13 +359,12 @@ def _chart_jacobian(X: torch.Tensor) -> torch.Tensor:
 
 # 11
 def test_tiny_model_direction_matches_a_dense_chart_route_and_descends() -> None:
-    from vfe3.config import VFE3Config
     from vfe3.model.model import VFEModel
     from vfe3.train import PhiFisherStatisticsProvider
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        cfg = VFE3Config(**_ACTIVE_ROUTE)
+        cfg = test_config(**_ACTIVE_ROUTE)
         torch.manual_seed(0)
         model = VFEModel(cfg).double()
     pb = model.prior_bank
@@ -483,7 +484,6 @@ def test_fisher_optimizer_moves_only_active_rows_counts_rejections_and_keeps_no_
 
 
 def _fisher_cfg(**overrides):
-    from vfe3.config import VFE3Config
 
     values = dict(
         vocab_size=12, embed_dim=6, n_heads=2, max_seq_len=8, n_layers=1,
@@ -493,7 +493,7 @@ def _fisher_cfg(**overrides):
     values.update(overrides)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        return VFE3Config(**values)
+        return test_config(**values)
 
 
 # 12 (build_optimizer + train_step)
@@ -576,7 +576,6 @@ def test_provider_counts_scored_tokens_and_positional_columns() -> None:
 
 # 13
 def test_fisher_group_policy_config_validation_and_inactive_marks() -> None:
-    from vfe3.config import VFE3Config
 
     policy = get_phi_update_policy("fisher_group")
     assert policy.requires_fisher_statistics and policy.requires_manifold_optimizer
@@ -598,9 +597,9 @@ def test_fisher_group_policy_config_validation_and_inactive_marks() -> None:
             _fisher_cfg(**overrides)
     _fisher_cfg(family="gaussian_diagonal_exact")                       # layer-0 row is diag(s)
     _fisher_cfg(gauge_group="glk", embed_dim=3, n_heads=1)
-    default = VFE3Config()
-    assert default.m_phi_fisher_rotation_weight == 2.0
-    assert "m_phi_fisher_rotation_weight" in default.inactive_fields()
+    inactive = test_config(m_phi_update_mode="adamw", m_phi_fisher_rotation_weight=2.0)
+    assert inactive.m_phi_fisher_rotation_weight == 2.0
+    assert "m_phi_fisher_rotation_weight" in inactive.inactive_fields()
     active = _fisher_cfg()
     for name in ("m_phi_fisher_rotation_weight", "m_phi_group_trust_radius",
                  "m_phi_group_retraction"):

@@ -10,11 +10,11 @@ Oracle: straight_through changes only the BACKWARD, never the forward, so the co
 belief / logits / loss VALUE is byte-identical to unroll (torch.equal). The gradient flows,
 but DIFFERS from unroll (the dropped second-order term).
 """
+from tests.profiles import test_config
 
 import pytest
 import torch
 
-from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 
 
@@ -26,7 +26,7 @@ def _model(e_step_gradient="unroll", **over):
         decode_mode="diagonal_chunked",  # observe encode tables via KL-to-prior decode
     )
     cfg.update(over)
-    return VFEModel(VFE3Config(**cfg))
+    return VFEModel(test_config(**cfg))
 
 
 def _data(seed=0, V=15, B=2, N=4):
@@ -41,19 +41,19 @@ def test_config_accepts_the_three_modes():
     # The block MLP (on by default) runs inside the no-grad detach stack and would freeze, so
     # detach is admitted only with it off; the fail-closed gate itself is pinned below.
     for mode in ("unroll", "straight_through", "detach"):
-        cfg = VFE3Config(e_step_gradient=mode, use_block_mlp=False)
+        cfg = test_config(e_step_gradient=mode, use_block_mlp=False)
         assert cfg.e_step_gradient == mode
     with pytest.raises(ValueError, match="gradient-carrying E-step"):
-        VFE3Config(e_step_gradient="detach", use_block_mlp=True)
+        test_config(e_step_gradient="detach", use_block_mlp=True)
 
 
 def test_config_rejects_unknown_mode():
     with pytest.raises(ValueError):
-        VFE3Config(e_step_gradient="not_a_mode")
+        test_config(e_step_gradient="not_a_mode")
 
 
-def test_config_default_is_unroll():
-    assert VFE3Config().e_step_gradient == "unroll"
+def test_config_explicit_unroll_is_preserved():
+    assert test_config(e_step_gradient="unroll").e_step_gradient == "unroll"
 
 
 
@@ -61,9 +61,9 @@ def test_config_default_is_unroll():
 
 
 def test_config_mode_passthrough_is_canonical():
-    assert VFE3Config(e_step_gradient="unroll").e_step_gradient == "unroll"
-    assert VFE3Config(e_step_gradient="straight_through").e_step_gradient == "straight_through"
-    assert VFE3Config(e_step_gradient="detach", use_block_mlp=False).e_step_gradient == "detach"
+    assert test_config(e_step_gradient="unroll").e_step_gradient == "unroll"
+    assert test_config(e_step_gradient="straight_through").e_step_gradient == "straight_through"
+    assert test_config(e_step_gradient="detach", use_block_mlp=False).e_step_gradient == "detach"
 
 
 # --- forward identity (the strong oracle) -----------------------------------

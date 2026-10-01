@@ -30,6 +30,7 @@ decision is invariant under ``decode_chunk_size``; (d) the workspace estimate co
 buffers; (e) the slice width never reaches zero, however small the budget.
 """
 
+from tests.profiles import test_config
 import warnings
 
 import pytest
@@ -417,13 +418,13 @@ def test_decode_av_precision_is_reported_inert_on_the_family_route():
     from vfe3.config import VFE3Config
 
     base = dict(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                family="gaussian_full", gauge_group="block_glk")
+                family="gaussian_full", gauge_group="block_glk", lambda_alpha_mode="constant")
     non_default = _non_default_decode_av_precision()
 
     def _inert_mentions(mode, **overrides):
         with warnings.catch_warnings(record=True) as record:
             warnings.simplefilter("always")
-            cfg = VFE3Config(**base, decode_mode=mode, decode_av_precision=non_default, **overrides)
+            cfg = test_config(**base, decode_mode=mode, decode_av_precision=non_default, **overrides)
         shown = any("decode_av_precision" in str(r.message) for r in record)
         structural = "decode_av_precision" in cfg.inactive_fields()
         assert shown == structural, f"{mode}: notice {shown} != inactive_fields() {structural}"
@@ -468,7 +469,7 @@ def test_same_name_family_chunked_override_keeps_decode_av_precision_inert():
     )(generic_logits)
     try:
         with pytest.warns(Warning) as record:
-            cfg = VFE3Config(
+            cfg = test_config(
                 vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                 family="gaussian_full", gauge_group="block_glk",
                 decode_mode="family_chunked", renyi_order=1.0,

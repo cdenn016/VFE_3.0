@@ -1,3 +1,4 @@
+from tests.profiles import test_config
 import pytest
 import torch
 
@@ -254,11 +255,10 @@ def test_oracle_unroll_grad_toggle_changes_prior_gradient():
     # oracle_unroll_grad adds the unrolled-through-inference term to the prior gradient, so mu_embed's
     # gradient DIFFERS from the default detached oracle (both finite). gaussian_diagonal keeps the
     # double-backward stable; gaussian_full is intentionally excluded (its eigh double-backward NaNs).
-    from vfe3.config import VFE3Config
     from vfe3.model.model import VFEModel
 
     def grad_of(toggle: bool) -> torch.Tensor:
-        cfg = VFE3Config(vocab_size=12, embed_dim=4, n_heads=1, max_seq_len=5, n_layers=1,
+        cfg = test_config(vocab_size=12, embed_dim=4, n_heads=1, max_seq_len=5, n_layers=1,
                          n_e_steps=3, e_q_mu_lr=0.2, e_q_sigma_lr=0.1, e_phi_lr=0.0,
                          renyi_order=2.0, pos_phi="none", oracle_unroll_grad=toggle, seed=0)
         torch.manual_seed(0)

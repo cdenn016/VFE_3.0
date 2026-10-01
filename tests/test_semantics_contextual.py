@@ -4,6 +4,7 @@ Every model here is tiny (vocabulary 24, K=4, two heads, two layers, context 8),
 temporary run directory and reopened with ``load_semantic_run``; token streams are synthetic and
 injected by replacing ``SemanticRun.token_stream`` on the instance.
 """
+from tests.profiles import test_config
 
 import json
 import re
@@ -17,7 +18,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from vfe3.config import VFE3Config, serialize_config
+from vfe3.config import serialize_config
 from vfe3.model.model import VFEModel
 from vfe3.semantics import contextual as C
 from vfe3.semantics.common import AnalogyQuestion, AnalysisContext, SectionResult, diagonal_redundancy_status, to_jsonable
@@ -57,7 +58,7 @@ def _tiny_model(**over) -> "tuple[VFE3Config, VFEModel]":
     options.update(over)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        cfg = VFE3Config(**options)
+        cfg = test_config(**options)
         torch.manual_seed(0)
         model = VFEModel(cfg).eval()
     with torch.no_grad():                                              # move tables off their init
