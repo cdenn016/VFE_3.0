@@ -133,6 +133,7 @@ config = dict(
     attention_residual               = True,   # predictive S/T/O: add the incoming mean
     relational_routing               = "gaussian_kl",  # "gaussian_kl" | "noisy_query": exact posterior N(a_i; b_j, V_Q + V_K), predictive only
     predictive_covariance            = "passthrough",  # "passthrough" (Sigma kept at encode) | "moment_matched" (exact predictive-kernel covariance), predictive only
+    predictive_covariance_centering  = False,          # False: historical raw moments; True: center source means to reduce covariance cancellation
     predictive_covariance_floor      = 1e-4,           # moment_matched only: covariant floor floor * (tr C_i / K) I in reference coordinates
    
        

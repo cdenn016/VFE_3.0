@@ -317,6 +317,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     relational_input_scope           = "full",         # each head reads all K coordinates; "head" is legacy behavior
 
     relational_output_scope          = "full",                  # transformers: "full": requires predictive_content, legacy: 'head'
+    predictive_covariance_centering  = False,          # False: historical raw moments; True: center source means to reduce covariance cancellation
     attention_residual               = True,   # predictive S/T/O: add the incoming mean
     
     

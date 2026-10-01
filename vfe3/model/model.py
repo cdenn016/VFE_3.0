@@ -380,6 +380,7 @@ class VFEModel(nn.Module):
                                     output_init_scale=output_init_scale,
                                     routing=cfg.relational_routing,
                                     predictive_covariance=cfg.predictive_covariance,
+                                    predictive_covariance_centering=cfg.predictive_covariance_centering,
                                     predictive_covariance_floor=cfg.predictive_covariance_floor)
                 for layer_index in range(cfg.n_layers)
             ]
