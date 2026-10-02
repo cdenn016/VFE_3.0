@@ -7,15 +7,12 @@ gauge group can act on the K-dim embedding through a DIRECT SUM of irreps,
 
 with ONE shared per-token phi -- a TIED gauge: the same group element acts in every
 block through that block's representation, so attention heads can be DIFFERENT irreps
-of one structure group (possibly with unequal dimensions). Registered families:
+of one structure group (possibly with unequal dimensions). Registered family:
 
     so : label 'l<p>'   -- symmetric-traceless rank-p tensors over R^N,
                            dim = C(N+p-1, p) - C(N+p-3, p-2); for N = 3 this is the
                            spin-p tower (dim 2p + 1). Built in real orthonormal bases,
                            so every generator image is exactly skew.
-    sp : label 'sym<p>' -- Sym^p of the defining 2m-dim rep, dim = C(2m+p-1, p).
-                           Irreducible because contraction with the ANTI-symmetric
-                           symplectic form annihilates symmetric tensors. Not skew.
 
 Construction (no per-irrep sign conventions to get wrong): the rank-p tensor power
 carries the Leibniz action
@@ -69,17 +66,17 @@ def _parse_label(algebra: str, label: str) -> Tuple[str, int]:
     if not digits or key not in _IRREPS:
         raise ValueError(
             f"unknown irrep label {label!r} for algebra {algebra!r}; registered families: "
-            f"{sorted(_IRREPS)} (label grammar '<family><rank>', e.g. 'l2', 'sym1')"
+            f"{sorted(_IRREPS)} (label grammar '<family><rank>', e.g. 'l2')"
         )
     return key, int(digits)
 
 
 def irrep_dim(
-    N:       int,                          # defining-rep dimension (N of SO(N); 2m of Sp(2m))
+    N:       int,                          # defining-rep dimension (N of SO(N))
 
     *,
-    algebra: str,                          # 'so' | 'sp'
-    label:   str,                          # e.g. 'l2' (so), 'sym3' (sp)
+    algebra: str,                          # 'so'
+    label:   str,                          # e.g. 'l2'
 ) -> int:
     """Block dimension of ``label`` over the rank-N algebra (closed form, no tensors built)."""
     key, p = _parse_label(algebra, label)
@@ -90,8 +87,8 @@ def irrep_generators(
     G_def:   torch.Tensor,                 # (n_gen, N, N) defining-rep algebra basis (float64)
 
     *,
-    algebra: str,                          # 'so' | 'sp'
-    label:   str,                          # e.g. 'l2' (so), 'sym3' (sp)
+    algebra: str,                          # 'so'
+    label:   str,                          # e.g. 'l2'
 ) -> torch.Tensor:                         # (n_gen, d, d) generator images on the irrep
     """Build one irrep's generator images (the registry's public single-label entry point)."""
     key, p = _parse_label(algebra, label)
@@ -172,7 +169,7 @@ def _tensor_power_irrep(
     p:         int,                        # tensor-power rank (label's trailing integer)
 
     *,
-    traceless: bool,                       # so: True (sym-traceless); sp: False (plain Sym^p)
+    traceless: bool,                       # so: True (sym-traceless)
 ) -> torch.Tensor:                         # (n_gen, d, d) generator images on the irrep
     """Restrict the Leibniz action to the invariant subspace: rho(X) = Q^T rho_p(X) Q."""
     n_gen, N, _ = G_def.shape
@@ -225,7 +222,7 @@ def direct_sum_generators(
     G_def:      torch.Tensor,                       # (n_gen, N, N) defining-rep basis (float64)
 
     *,
-    algebra:    str,                                # registry namespace: 'so' | 'sp'
+    algebra:    str,                                # registry namespace: 'so'
     irrep_spec: Sequence[Tuple[str, int]],          # (label, multiplicity) pairs, in block order
 ) -> Tuple[torch.Tensor, List[int]]:                # ((n_gen, K, K) float64, per-block dims)
     """Assemble blockdiag_b rho_b(X_a) over the spec; each distinct label is built once,
@@ -276,15 +273,4 @@ def _son_sym_traceless_build(G_def: torch.Tensor, p: int) -> torch.Tensor:
     return _tensor_power_irrep(G_def, p, traceless=True)
 
 
-def _sp_sym_dim(N: int, p: int) -> int:
-    r"""dim Sym^p(R^{2m}) = C(2m+p-1, p) (irreducible for sp(2m): the symplectic contraction
-    of a symmetric tensor vanishes)."""
-    return math.comb(N + p - 1, p) if p > 0 else 1
-
-
-def _sp_sym_build(G_def: torch.Tensor, p: int) -> torch.Tensor:
-    return _tensor_power_irrep(G_def, p, traceless=False)
-
-
 register_irrep("so:l",   _son_sym_traceless_dim, _son_sym_traceless_build)
-register_irrep("sp:sym", _sp_sym_dim,            _sp_sym_build)

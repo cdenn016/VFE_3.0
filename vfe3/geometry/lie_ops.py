@@ -36,7 +36,7 @@ def gram_pinv(
     r"""Pseudo-inverse of the Frobenius Gram matrix Gram_ab = <G_a, G_b>_F.
 
     pinv (not inv) so overcomplete / rank-deficient spanning sets (e.g. the
-    sl(K) set from generate_glk(include_identity=False)) are handled. The Gram
+    trace-projected sl(K) spanning set) are handled. The Gram
     and its pinv are formed in float64 because the overcomplete spanning set has
     a true nullspace whose float32 eigenvalue is O(1e-7) -- larger than rcond, so
     a float32 pinv would treat the null direction as invertible and inject noise.
@@ -209,8 +209,8 @@ def warn_if_basis_not_closed(
     Measures the max relative out-of-span residual
     :math:`\max_{a,b} \lVert [G_a,G_b] - \mathrm{embed}(\mathrm{extract}([G_a,G_b]))\rVert_F /
     (\lVert [G_a,G_b]\rVert_F + \epsilon)`. On a closed (default direct-sum) basis this is ~0 and
-    nothing is warned; on a non-closed 3+-head ``cross_couplings`` chain it is O(1) and the span
-    projection in BCH composition / structure-constants silently truncates the out-of-span part.
+    nothing is warned; on a non-closed custom basis it is O(1) and the span projection in BCH
+    composition / structure-constants silently truncates the out-of-span part.
     The result depends only on generator values, so a bounded value-signature cache avoids repeating
     the bracket scan without retaining the caller's tensor storage.
 
@@ -218,17 +218,11 @@ def warn_if_basis_not_closed(
     block_glk at K=140: n_gen=2800 -> ~1.5e11 elements) this would OOM. Such large bases here are the
     direct-sum block groups, which are bracket-closed BY CONSTRUCTION, so when ``n_gen^2 * K^2``
     exceeds ``max_elements`` the scan is skipped and the basis is treated as closed (cached, no
-    warning). Non-closed bases in practice are the small cross_couplings chains, which stay well
-    under the budget and are scanned exactly.
+    warning).
 
     LIMITATION (audit 2026-06-13 L5): the size-skip ASSUMES a too-large basis is closed-by-
-    construction, which holds for the shipped direct-sum / full-algebra groups but is NOT verified for
-    a LARGE ``close_basis=False`` cross_couplings basis (the one case that can be non-closed and also
-    exceed the budget) -- there the scan is silently skipped. A general closed/non-closed test for a
-    large single-block basis needs the O(K^4) scan itself, so distinguishing ``so_k``/``glk`` (large,
-    closed) from a large cross-coupled subset (non-closed) cheaply is not possible. The guaranteed
-    path is to build cross-coupled towers with ``close_basis=True`` (close_under_brackets), which
-    yields a bracket-closed algebra rather than relying on this size-gated diagnostic.
+    construction, which holds for the shipped direct-sum groups (block_glk, so_n) but is NOT verified
+    for a large custom registered basis; there the scan is silently skipped.
     """
     key = _cached_basis_value_signature(generators)
     max_res = _BRACKET_CLOSURE_RES.get(key)
@@ -556,7 +550,7 @@ def compose_bch(
     (bit-identical values). (b) ``block_dims`` (the group's irrep_dims, passed by callers that
     hold the group): when the embedding is block-diagonal with >1 EQUAL blocks -- the same
     invariant the per-block matrix_exp relies on; every multi-entry ``irrep_dims`` basis
-    (block_glk / tied_block_glk / so_n / sp_n towers) embeds block-diagonally for EVERY phi --
+    (block_glk / so_n towers) embeds block-diagonally for EVERY phi --
     each commutator is block-diagonal, so the whole Dynkin cascade runs on the (..., H, d, d)
     diagonal-block stacks and is scattered back once. Identical values (the off-block entries
     are exactly zero throughout), 1/H the bracket memory and H^2 fewer matmul FLOPs. ``None``
@@ -647,7 +641,7 @@ def compose_bch(
     # that part. Closure depends only on the fixed generators and never touches Z's autograd graph;
     # the bounded cache owns only a CPU value signature and scalar residual, not the caller's basis.
     # The scan is size-gated (max_elements): large direct-sum bases (e.g. block_glk K=140, the prior
-    # O(K^4) OOM) are skipped as closed-by-construction; small non-closed cross_couplings chains scan.
+    # O(K^4) OOM) are skipped as closed-by-construction.
     warn_if_basis_not_closed(generators, where="compose_bch",
                              closure_tol=closure_tol, eps=eps, gram_pinv_=gram_pinv_)
     _fail_if_bch_residual_exceeds(
@@ -826,10 +820,10 @@ def project_phi_to_slk(
 
     Orthogonal projection of phi off the span of the per-block trace functionals V_h:
     ``phi <- phi - (phi V^T) (V V^T)^+ V``. The JOINT Gram solve ``(V V^T)^+`` is required:
-    for the tied gauge (``tied_block_glk``) the V_h coincide (generators kron(I_n, E_ij)), so the
+    for a tied basis (one generator acting in every block, kron(I_n, E_ij)) the V_h coincide, so the
     per-block-independent form ``s / ||V_h||^2`` would over-subtract by a factor of n_heads. For an
     untied gauge the V_h have disjoint support, ``V V^T`` is diagonal, and the pseudo-inverse reduces
-    to ``1/||V_h||^2`` (so the untied result is unchanged); a fully traceless basis (so_k) gives
+    to ``1/||V_h||^2`` (so the untied result is unchanged); a fully traceless basis (so_n) gives
     ``V = 0`` and the projection is a no-op.
 
     Runs in an ``autocast(enabled=False)`` island: under AMP the ``V V^T`` matmul would be downcast

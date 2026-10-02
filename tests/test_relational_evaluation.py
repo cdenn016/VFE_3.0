@@ -16,7 +16,7 @@ def test_relational_strided_evaluation_matches_logits(identity_content: bool) ->
     torch.manual_seed(79)
     cfg = test_config(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=4,
         n_layers=1, n_e_steps=1, gauge_group="block_glk", family="gaussian_diagonal",
-        skip_belief_sigma_update=True, e_phi_lr=0.0, oracle_unroll_grad=True,
+        skip_belief_sigma_update=True,
         attention_mode="projected_gradient",
         )
     model = VFEModel(cfg)

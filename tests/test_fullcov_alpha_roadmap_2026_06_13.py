@@ -58,18 +58,12 @@ def test_per_coord_bhattacharyya_jeffreys_sum_to_scalar():
     assert torch.allclose(jf_pc.sum(-1), jf, atol=1e-5)
 
 
-
-
 # ---------------------------------------------------------------------------
 # A3: full-cov unrolled oracle gradient is FINITE (and live) on a single training backward.
 # The config docstring's "expect NaNs there" for gaussian_full + oracle_unroll_grad=True predates
 # the _eigh_damped gap-regularized eigh backward (retraction.py); the single training backward is
 # now finite. This pins that, and contrasts it with the truncated default (oracle_unroll_grad=False).
 # ---------------------------------------------------------------------------
-
-
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -113,8 +107,6 @@ def test_state_dependent_envelope_has_no_product_rule_residue(div_name):
     )
 
 
-
-
 # ---------------------------------------------------------------------------
 # B1: fused chunked full-covariance decode+CE (decode_mode='full_chunked'). The prior table is
 # DIAGONAL (diag_embed of sigma_log_embed), so KL(q_full || pi_v_diag) has a closed form needing
@@ -129,9 +121,9 @@ def test_state_dependent_envelope_has_no_product_rule_residue(div_name):
 def _full_model(vocab_size=64, **kw):
     decode_mode = kw.pop("decode_mode", "full_chunked")
     cfg = test_config(vocab_size=vocab_size, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=1,
-                     n_e_steps=2, e_q_mu_lr=0.05, e_q_sigma_lr=0.02, e_phi_lr=0.0,
+                     n_e_steps=2, e_q_mu_lr=0.05, e_q_sigma_lr=0.02,
                      family="gaussian_full", decode_mode=decode_mode,
-                     _allow_legacy_dense_decode=decode_mode == "full", **kw)
+                     **kw)
     return VFEModel(cfg)
 
 
@@ -154,7 +146,7 @@ def test_full_chunked_ce_matches_dense_full_ce_multiple_chunk_sizes():
     torch.manual_seed(0)
     V = 64
     tokens = torch.randint(0, V, (3, 6)); targets = torch.randint(0, V, (3, 6))
-    ref = _full_model(vocab_size=V, decode_mode="full")
+    ref = _full_model(vocab_size=V, decode_mode="full_chunked")
     mu, sigma = _full_converged(ref)(tokens)
     logits = ref.prior_bank.decode(mu, sigma)                          # (B,N,V) dense full
     full_ce = F.cross_entropy(logits.reshape(-1, V), targets.reshape(-1), ignore_index=-100)
@@ -172,7 +164,7 @@ def test_full_chunked_honors_ignore_index():
     V = 50
     tokens = torch.randint(0, V, (2, 6)); targets = torch.randint(0, V, (2, 6))
     targets[0, 0] = -100; targets[1, 3] = -100
-    ref = _full_model(vocab_size=V, decode_mode="full")
+    ref = _full_model(vocab_size=V, decode_mode="full_chunked")
     mu, sigma = _full_converged(ref)(tokens)
     full_ce = F.cross_entropy(ref.prior_bank.decode(mu, sigma).reshape(-1, V),
                               targets.reshape(-1), ignore_index=-100)
@@ -199,7 +191,7 @@ def test_full_chunked_inference_matches_dense_full_logits():
     torch.manual_seed(3)
     V = 48
     tokens = torch.randint(0, V, (2, 5))
-    ref = _full_model(vocab_size=V, decode_mode="full")
+    ref = _full_model(vocab_size=V, decode_mode="full_chunked")
     logits_full = ref(tokens)
     ch = _full_model(vocab_size=V, decode_mode="full_chunked")
     ch.load_state_dict(ref.state_dict())
@@ -212,7 +204,7 @@ def test_full_chunked_forward_loss_matches_full_forward_loss():
     torch.manual_seed(4)
     V = 40
     tokens = torch.randint(0, V, (3, 6)); targets = torch.randint(0, V, (3, 6))
-    base = _full_model(vocab_size=V, decode_mode="full")
+    base = _full_model(vocab_size=V, decode_mode="full_chunked")
     _, loss_full, ce_full = base(tokens, targets)
     ch = _full_model(vocab_size=V, decode_mode="full_chunked", decode_chunk_size=9)
     ch.load_state_dict(base.state_dict())
@@ -251,7 +243,7 @@ def test_full_cov_chunked_matches_dense_on_non_pd():
     from vfe3.model.prior_bank import _decode_full, _decode_full_chunked
     torch.manual_seed(6)
     V, B, N, K = 32, 2, 4, 4
-    pb = _full_model(vocab_size=V, decode_mode="full").prior_bank
+    pb = _full_model(vocab_size=V, decode_mode="full_chunked").prior_bank
     mu_q = torch.randn(B, N, K)
     A = torch.randn(B, N, K, K)
     sigma_q = A @ A.transpose(-1, -2) + torch.eye(K)                     # all-PD base
@@ -284,7 +276,7 @@ def test_full_cov_query_invariants_all_pd_byte_identical():
     from vfe3.numerics import safe_cholesky
     torch.manual_seed(7)
     V, B, N, K = 32, 2, 4, 4
-    pb = _full_model(vocab_size=V, decode_mode="full").prior_bank
+    pb = _full_model(vocab_size=V, decode_mode="full_chunked").prior_bank
     A = torch.randn(B, N, K, K)
     sigma_q = A @ A.transpose(-1, -2) + torch.eye(K)
     diag_sq, logdet_q, spd_ok = pb._full_cov_query_invariants(sigma_q)
@@ -304,40 +296,6 @@ def test_full_cov_query_invariants_all_pd_byte_identical():
 def _spd_batch(B, N, K, gen):
     A = torch.randn(B, N, K, K, generator=gen)
     return A @ A.transpose(-1, -2) + K * torch.eye(K)
-
-
-def test_factored_full_cov_sandwich_equals_dense():
-    from vfe3.geometry.groups import get_group
-    from vfe3.geometry.transport import (
-        build_factored_transport, transport_covariance, _factored_full_covariance,
-    )
-    g = torch.Generator().manual_seed(0)
-    K, H, N, B = 6, 3, 4, 2                                 # block_glk: 3 heads of d=2
-    grp = get_group("block_glk")(K, H)
-    n_gen = grp.generators.shape[0]
-    phi = 0.2 * torch.randn(B, N, n_gen, generator=g)
-    factored = build_factored_transport(phi, grp)
-    sigma = _spd_batch(B, N, K, g)                          # (B, N, K, K) genuinely non-diagonal SPD
-
-    out_fac = _factored_full_covariance(factored, sigma)    # (B, N, N, K, K)
-    dense = transport_covariance(factored.to_dense_omega(), sigma)
-    assert out_fac.shape == (B, N, N, K, K)
-    assert torch.allclose(out_fac, dense, atol=1e-5), (out_fac - dense).abs().max().item()
-
-
-def test_transport_covariance_routes_full_factored_to_per_head_and_matches_dense():
-    from vfe3.geometry.groups import get_group
-    from vfe3.geometry.transport import build_factored_transport, transport_covariance
-    g = torch.Generator().manual_seed(1)
-    K, H, N, B = 4, 2, 5, 2
-    grp = get_group("block_glk")(K, H)
-    n_gen = grp.generators.shape[0]
-    phi = 0.15 * torch.randn(B, N, n_gen, generator=g)
-    factored = build_factored_transport(phi, grp)
-    sigma = _spd_batch(B, N, K, g)
-    via_factored = transport_covariance(factored, sigma)            # routed (per-head)
-    via_dense = transport_covariance(factored.to_dense_omega(), sigma)
-    assert torch.allclose(via_factored, via_dense, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------

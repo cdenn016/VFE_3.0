@@ -161,12 +161,8 @@ def test_attention_and_trace_reuse_snapshot_without_forward_replay(monkeypatch) 
     monkeypatch.setattr(model, "forward_beliefs", replay_forbidden)
     monkeypatch.setattr(model.prior_bank, "encode", replay_forbidden)
     monkeypatch.setattr(model_module, "vfe_stack", replay_forbidden)
-    monkeypatch.setattr(model_module, "vfe_block", replay_forbidden)
     monkeypatch.setattr(stack_module, "vfe_stack", replay_forbidden)
     monkeypatch.setattr(block_module, "e_step", replay_forbidden)
-    monkeypatch.setattr(extract, "_encode_one", replay_forbidden)
-    monkeypatch.setattr(extract, "e_step_iteration", replay_forbidden)
-    monkeypatch.setattr(extract, "vfe_block", replay_forbidden)
 
     assert model.diagnostics(tokens, snapshot=snapshot)
     assert model.attention_maps(tokens, snapshot=snapshot).shape == (2, 2, 4, 4)
@@ -195,5 +191,3 @@ def test_attention_and_trace_reuse_snapshot_without_forward_replay(monkeypatch) 
     assert extract.across_layer_belief_trace(model, tokens, snapshot=snapshot)["mu"].shape[0] == 2
     assert diagonal_flags == [True]
     assert extract.numerical_health(model, tokens, snapshot=snapshot)
-    with pytest.raises(NotImplementedError, match="unavailable"):
-        extract.converged_state(model, tokens, snapshot=snapshot)

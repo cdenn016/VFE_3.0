@@ -19,10 +19,8 @@ def _canonical_cfg():
         block_mlp_mode="canonical_frame",
         block_mlp_covariance="passthrough",
         gauge_group="block_glk",
-        transport_mode="flat",
         pos_phi="none",
         pos_rotation="none",
-        e_phi_lr=0.0,
     )
 
 

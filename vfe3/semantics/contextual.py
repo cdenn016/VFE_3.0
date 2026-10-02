@@ -9,7 +9,7 @@ literature adapted to Gaussian beliefs:
 
 * the logit lens (nostalgebraist 2020): every layer's belief read out through the model's OWN final
   readout -- ``final_norm`` (when configured), then ``prior_bank.decode`` with the realized
-  canonical frame for ``canonical_content_projected`` and the unigram bias -- exactly the path
+  frame under ``decode_coordinates='reference'`` and the unigram bias -- exactly the path
   ``VFEModel.forward_beliefs(return_logits=True)`` applies after the last block;
 * per-layer geometry (anisotropy, IsoScore, effective rank, TwoNN, rogue dimensions);
 * layer-by-layer linear CKA (Kornblith et al. 2019; debiased HSIC of Song et al. 2012), CKA with the
@@ -291,8 +291,7 @@ def _forward_layers(model: Any, x: torch.Tensor, *, return_logits: bool = False)
     r"""One captured forward: the stack input and every block output (and optionally the logits).
 
     ``layers[0]`` is ``capture["diagnostic"]["initial_belief"]`` -- the belief ``vfe_stack``
-    receives (after the positional right factor and, for ``canonical_content_projected``, the
-    projected canonical content) -- and ``layers[l]`` is ``layer_outputs[l-1]``, the post-block belief
+    receives (after the positional right factor) -- and ``layers[l]`` is ``layer_outputs[l-1]``, the post-block belief
     handed to block ``l+1``; ``layers[L]`` is the raw stack output (pre ``final_norm``).
     """
     capture: Dict[str, Any] = {"diagnostic": {}}
@@ -375,7 +374,7 @@ def _readout(model: Any, mu: torch.Tensor, sigma: torch.Tensor, canonical_frame:
 
     i.e. ``final_norm`` (when ``norm_type_final`` is not ``none``), then
     ``VFEModel._decode_belief_with_context`` -- ``prior_bank.decode`` in the fp32 island with the
-    realized canonical frame ``U`` of the same forward (``canonical_content_projected`` only) and the
+    realized frame ``U`` of the same forward (``decode_coordinates='reference'`` only) and the
     unigram bias :math:`\kappa \log\pi_v`. Returns ``(B, N, V)`` float32 logits.
     """
     with torch.no_grad():

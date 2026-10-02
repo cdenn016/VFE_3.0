@@ -8,10 +8,10 @@ from vfe3.model.prior_bank import (
     DecodeRegistration,
     PriorBank,
     _DECODERS,
-    get_decode,
     get_decode_registration,
     register_decode,
 )
+from vfe3.model.prior_bank import _decode_diagonal, _decode_family
 from vfe3.numerics import bounded_variance_from_log
 
 
@@ -169,18 +169,18 @@ def test_family_decode_matches_direct_functional_diagonal_gaussian(alpha):
     torch.manual_seed(0)
     V, K, n_gen = 7, 3, 4
     pb = PriorBank(V, K, n_gen, decode_tau=1.3, family="gaussian_diagonal",
-                   divergence_family="renyi", renyi_order=alpha, decode_mode="family")
+                   renyi_order=alpha, decode_mode="family_chunked")
     with torch.no_grad():
         pb.mu_embed.normal_(0.0, 0.7)
         pb.sigma_log_embed.normal_(0.0, 0.4)
     mu_q = torch.randn(2, 4, K); sigma_q = torch.rand(2, 4, K) + 0.3
     tau_eff = pb._tau_eff()
-    got = get_decode("family")(pb, mu_q, sigma_q, tau_eff)
+    got = _decode_family(pb, mu_q, sigma_q, tau_eff)
     exp = _family_reference_logits(pb, mu_q, sigma_q, tau_eff)
     assert got.shape == (2, 4, V)
     assert torch.allclose(got, exp, atol=1e-5, rtol=0.0)
     if alpha == 1.0:                                             # canonical: matches the fast diagonal kernel
-        diag = get_decode("diagonal")(pb, mu_q, sigma_q, tau_eff)
+        diag = _decode_diagonal(pb, mu_q, sigma_q, tau_eff)
         assert torch.allclose(got, diag, atol=1e-4)
 
 
@@ -189,8 +189,8 @@ def test_noncanonical_family_decode_ranking_differs_from_gaussian_kl():
     # differently from the alpha=1 KL readout (the alpha blend reweights the tight-vs-loose priors).
     torch.manual_seed(1)
     V, K, n_gen = 7, 3, 4
-    pb_kl = PriorBank(V, K, n_gen, family="gaussian_diagonal", renyi_order=1.0, decode_mode="family")
-    pb_renyi = PriorBank(V, K, n_gen, family="gaussian_diagonal", renyi_order=0.5, decode_mode="family")
+    pb_kl = PriorBank(V, K, n_gen, family="gaussian_diagonal", decode_mode="family_chunked")
+    pb_renyi = PriorBank(V, K, n_gen, family="gaussian_diagonal", renyi_order=0.5, decode_mode="family_chunked")
     with torch.no_grad():
         mu = torch.randn(V, K)
         sig_log = torch.linspace(-3.0, 3.0, V).unsqueeze(-1).expand(V, K).contiguous()
@@ -199,8 +199,8 @@ def test_noncanonical_family_decode_ranking_differs_from_gaussian_kl():
             pb.sigma_log_embed.copy_(sig_log)
     mu_q = torch.randn(1, 6, K); sigma_q = torch.rand(1, 6, K) + 0.3
     tau_eff = pb_kl._tau_eff()
-    kl_logits = get_decode("family")(pb_kl, mu_q, sigma_q, tau_eff)
-    renyi_logits = get_decode("family")(pb_renyi, mu_q, sigma_q, tau_eff)
+    kl_logits = _decode_family(pb_kl, mu_q, sigma_q, tau_eff)
+    renyi_logits = _decode_family(pb_renyi, mu_q, sigma_q, tau_eff)
     assert not torch.equal(kl_logits.argmax(-1), renyi_logits.argmax(-1))   # ranking genuinely flips
 
 
@@ -211,7 +211,7 @@ def test_reference_decode_dispatches_configured_divergence(alpha):
     torch.manual_seed(2)
     V, K, n_gen = 7, 3, 4
     pb = PriorBank(V, K, n_gen, decode_tau=1.1, family="gaussian_diagonal",
-                   renyi_order=alpha, decode_mode="family")
+                   renyi_order=alpha, decode_mode="family_chunked")
     with torch.no_grad():
         pb.mu_embed.normal_(0.0, 0.5)
     mu_q = torch.randn(2, 3, K); sigma_q = torch.rand(2, 3, K) + 0.3
@@ -325,13 +325,13 @@ def test_decode_registration_rejects_noncallable_fused_ce_direct_and_decorator()
 
 
 def test_registered_family_modes_are_family_consistent_dual_rank():
-    for name in ("family", "family_chunked"):
+    for name in ("family_chunked",):
         r = get_decode_registration(name)
         assert r.family_consistent is True
         assert r.covariance_kinds == frozenset({"diagonal", "full"})
     assert get_decode_registration("family_chunked").supports_chunked is True
     # the fast canonical kernels stay single-rank and NOT family-consistent.
-    assert get_decode_registration("diagonal").covariance_kinds == frozenset({"diagonal"})
-    assert get_decode_registration("full").covariance_kinds == frozenset({"full"})
-    assert get_decode_registration("diagonal").family_consistent is False
-    assert get_decode_registration("full").family_consistent is False
+    assert get_decode_registration("diagonal_chunked").covariance_kinds == frozenset({"diagonal"})
+    assert get_decode_registration("full_chunked").covariance_kinds == frozenset({"full"})
+    assert get_decode_registration("diagonal_chunked").family_consistent is False
+    assert get_decode_registration("full_chunked").family_consistent is False

@@ -109,9 +109,7 @@ def load_model(
         eval_cfg = dataclasses.replace(cfg, amp_dtype=amp)
         model_class: Callable[[Any], torch.nn.Module] = BaselineTransformer
     else:
-        eval_cfg = dataclasses.replace(
-            cfg, amp_dtype=amp,
-            _allow_legacy_dense_decode=bool(getattr(cfg, "_allow_legacy_dense_decode", False)))
+        eval_cfg = dataclasses.replace(cfg, amp_dtype=amp)
         model_class = VFEModel
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -207,7 +205,8 @@ def nll_pass(
     """
     cfg = model.cfg
     V = int(cfg.vocab_size)
-    need_frame = getattr(cfg, "encode_mode", None) == "canonical_content_projected"
+    # The reference-coordinate decoder needs the realized frame to find degenerate positions.
+    need_frame = getattr(cfg, "decode_coordinates", "local") == "reference"
     parts: Dict[str, List[np.ndarray]] = {k: [] for k in ("nll", "target_pos", "token", "window", "context")}
     expected = 0
     excluded = 0

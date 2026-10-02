@@ -23,7 +23,6 @@ def _cfg(**overrides: object) -> VFE3Config:
         log_interval=0, eval_interval=0, checkpoint_interval=0,
         family="gaussian_full", gauge_group="block_glk",
         attention_mode="projected_predictive", predictive_covariance="moment_matched",
-        e_step_gradient="unroll", oracle_unroll_grad=True, e_phi_lr=0.0,
         decode_mode="full_chunked", decode_coordinates="reference",
         pos_phi="none", pos_rotation="none", use_block_mlp=False,
         norm_type_block="none", norm_type_final="none", layernorm_affine=False,
@@ -44,26 +43,25 @@ def test_gauge_badge_includes_decoder_coordinate_policy(decode_coordinates: str)
 
 
 @pytest.mark.parametrize(
-    "attention_mode, predictive_covariance, e_step_update, skip_sigma, consumer",
+    "attention_mode, predictive_covariance, skip_sigma, consumer",
     [
-        ("projected_predictive", "moment_matched", "gradient", False, False),
-        ("projected_predictive", "passthrough", "gradient", False, False),
-        ("projected_gradient", "passthrough", "gradient", False, True),
-        ("projected_gradient", "passthrough", "gradient", True, False),
+        ("projected_predictive", "moment_matched", False, False),
+        ("projected_predictive", "passthrough", False, False),
+        ("projected_gradient", "passthrough", False, True),
+        ("projected_gradient", "passthrough", True, False),
     ],
 )
 @pytest.mark.parametrize("sigma_max", [None, 100.0])
 def test_spectral_cap_facet_tracks_the_live_covariance_consumer(
     attention_mode: str,
     predictive_covariance: str,
-    e_step_update: str,
     skip_sigma: bool,
     consumer: bool,
     sigma_max: float | None,
 ) -> None:
     cfg = _cfg(
         attention_mode=attention_mode, predictive_covariance=predictive_covariance,
-        e_step_update=e_step_update, skip_belief_sigma_update=skip_sigma,
+        skip_belief_sigma_update=skip_sigma,
         sigma_max=sigma_max,
         decode_coordinates="reference",
     )

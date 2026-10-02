@@ -265,43 +265,12 @@ def test_config_decode_ce_checkpoint_accepts_valid_values(value):
     test_config(decode_ce_checkpoint=value)
 
 
-def test_config_decode_ce_checkpoint_inert_when_decode_route_has_no_fused_ce():
-    # decode_mode='full' (not 'full_chunked') has no fused_ce registration: the dense
-    # decode() -> F.cross_entropy path has no chunk loop, so decode_ce_checkpoint does nothing.
-    # oracle_unroll_grad=True silences the unrelated (pre-existing, orthogonal) "gaussian_full
-    # routes the belief gradient to the detached oracle" advisory this family/decode_mode pair
-    # also triggers, so pytest.warns below asserts on decode_ce_checkpoint specifically.
-    with pytest.warns(ConfigNotice, match="decode_ce_checkpoint"):
-        test_config(decode_mode="full", family="gaussian_full",
-                   _allow_legacy_dense_decode=True,
-                   oracle_unroll_grad=True, decode_ce_checkpoint="always")
-
-
-def test_config_decode_ce_checkpoint_silent_at_default_even_when_inert():
-    # The silence contract (audit 2026-07-25 F4 family): leaving a field at its dataclass default
-    # must not warn even where it would be inert under this config, matching every sibling
-    # `_changed(...)` guard in the inertness block. oracle_unroll_grad=True silences the unrelated
-    # detached-oracle advisory this family/decode_mode pair also triggers (see test above), and
-    # skip_belief_sigma_update=False silences the frozen-sigma correctness advisory that the
-    # current default skip_belief_sigma_update=True legitimately raises under a prior-bank decode.
-    from vfe3.config import VFE3Config
-    selected = VFE3Config.__dataclass_fields__["decode_ce_checkpoint"].default
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always", ConfigNotice)
-        cfg = test_config(decode_mode="full", family="gaussian_full",
-                          _allow_legacy_dense_decode=True,
-                          oracle_unroll_grad=True, skip_belief_sigma_update=False,
-                          decode_ce_checkpoint=selected)
-    assert "decode_ce_checkpoint" in cfg.inactive_fields()
-    assert not any("decode_ce_checkpoint=" in str(item.message) for item in caught)
-
-
 def test_config_decode_ce_checkpoint_live_under_full_chunked():
     # The dispatched target and the live train_vfe3.py decode_mode: no inert warning here.
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always", ConfigNotice)
         cfg = test_config(decode_mode="full_chunked", family="gaussian_full",
-                          oracle_unroll_grad=True, decode_ce_checkpoint="always")
+                          decode_ce_checkpoint="always")
     assert "decode_ce_checkpoint" not in cfg.inactive_fields()
     assert not any("decode_ce_checkpoint=" in str(item.message) for item in caught)
 
@@ -313,7 +282,7 @@ def test_config_decode_ce_checkpoint_live_under_full_chunked():
 @pytest.mark.parametrize("decode_mode,kwargs", [
     ("diagonal_chunked", {}),
     ("expected_likelihood_chunked", {}),
-    ("family_chunked", {"family": "gaussian_diagonal", "divergence_family": "renyi", "renyi_order": 1.0}),
+    ("family_chunked", {"family": "gaussian_diagonal"}),
 ])
 def test_other_diagonal_chunked_kernels_value_identical_always_vs_never(decode_mode, kwargs):
     torch.manual_seed(0)

@@ -28,7 +28,6 @@ def _outer_cfg(**overrides: object) -> VFE3Config:
         "mass_phi": 0.0,
         "mstep_self_coupling_weight": 0.0,
         "seed": 19,
-        "gradient_mode": "filtering",
         "mu_init_std": 0.02,
         "sigma_init": 1.0,
         "phi_scale": 0.01,

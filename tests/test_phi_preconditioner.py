@@ -6,7 +6,7 @@ import pytest
 import torch
 
 import vfe3.geometry.phi_preconditioner as phi_preconditioner
-from vfe3.geometry.generators import generate_glk, generate_glk_multihead, generate_son
+from vfe3.geometry.generators import generate_glk_multihead, generate_son
 from vfe3.geometry.groups import get_group
 from vfe3.geometry.lie_ops import gram_pinv
 from vfe3.geometry.phi_preconditioner import (
@@ -18,8 +18,14 @@ from vfe3.geometry.phi_preconditioner import (
 )
 
 
+def _pullback_single_block(grad_phi, phi, generators, **kwargs):
+    """Strict pullback direction on one block (the retired ambient 'pullback' mode's live equivalent)."""
+    kwargs.setdefault("irrep_dims", [generators.shape[-1]])
+    return pullback_group_direction(grad_phi, phi, generators, mode="pullback_per_block", **kwargs)
+
+
 def test_pullback_group_registry_is_separate_from_estep_registry():
-    assert set(_PHI_GROUP_DIRECTIONS) == {"pullback", "pullback_per_block"}
+    assert set(_PHI_GROUP_DIRECTIONS) == {"pullback_per_block"}
     assert _PHI_GROUP_DIRECTIONS is not _PRECOND
 
 
@@ -41,7 +47,7 @@ def test_pullback_group_dispatch_preserves_legacy_registered_callable_without_la
     @phi_preconditioner.register_phi_group_direction(name)
     def legacy_direction(grad_phi, phi, generators, *, irrep_dims=None):
         seen["irrep_dims"] = irrep_dims
-        return phi_preconditioner._pullback_group_direction(
+        return phi_preconditioner._pullback_group_direction_per_block(
             grad_phi,
             phi,
             generators,
@@ -52,7 +58,7 @@ def test_pullback_group_dispatch_preserves_legacy_registered_callable_without_la
         result = pullback_group_direction(
             torch.ones(4),
             torch.zeros(4),
-            generate_glk(2),
+            generate_glk_multihead(2, 1),
             mode=name,
             coordinate_layout="block_head_row_major",
             irrep_dims=[2],
@@ -75,7 +81,7 @@ def test_pullback_group_dispatch_forwards_layout_to_kwargs_callable_and_override
     @phi_preconditioner.register_phi_group_direction(name, override=True)
     def kwargs_direction(grad_phi, phi, generators, *, irrep_dims=None, **kwargs):
         seen.append(kwargs.get("coordinate_layout"))
-        return phi_preconditioner._pullback_group_direction(
+        return phi_preconditioner._pullback_group_direction_per_block(
             grad_phi,
             phi,
             generators,
@@ -86,7 +92,7 @@ def test_pullback_group_dispatch_forwards_layout_to_kwargs_callable_and_override
         result = pullback_group_direction(
             torch.ones(4),
             torch.zeros(4),
-            generate_glk(2),
+            generate_glk_multihead(2, 1),
             mode=name,
             coordinate_layout="block_head_row_major",
             irrep_dims=[2],
@@ -113,7 +119,7 @@ def test_pullback_group_dispatch_does_not_keyword_call_positional_only_layout():
         irrep_dims=None,
     ):
         seen.append(coordinate_layout)
-        return phi_preconditioner._pullback_group_direction(
+        return phi_preconditioner._pullback_group_direction_per_block(
             grad_phi,
             phi,
             generators,
@@ -124,7 +130,7 @@ def test_pullback_group_dispatch_does_not_keyword_call_positional_only_layout():
         result = pullback_group_direction(
             torch.ones(4),
             torch.zeros(4),
-            generate_glk(2),
+            generate_glk_multihead(2, 1),
             mode=name,
             coordinate_layout="block_head_row_major",
             irrep_dims=[2],
@@ -137,13 +143,13 @@ def test_pullback_group_dispatch_does_not_keyword_call_positional_only_layout():
 
 
 def test_pullback_group_direction_returns_float64_gram_relative_zero_chart_solution():
-    generators = generate_glk(2)
+    generators = generate_glk_multihead(2, 1)
     generators = generators * torch.tensor([0.5, 1.0, 2.0, 3.0]).view(-1, 1, 1)
     grad = torch.tensor([0.25, -0.5, 0.75, -1.0], dtype=torch.float32)
     phi = torch.zeros(4, dtype=torch.float32)
     input_dtypes = (grad.dtype, phi.dtype, generators.dtype)
 
-    result = pullback_group_direction(grad, phi, generators, mode="pullback")
+    result = _pullback_single_block(grad, phi, generators)
 
     assert isinstance(result, PullbackGroupDirectionResult)
     gram = torch.einsum("aij,bij->ab", generators.double(), generators.double())
@@ -239,7 +245,7 @@ def _gl_chart_fixture(
         X = torch.zeros_like(X)
     else:
         X = X * (norm / torch.linalg.matrix_norm(X))
-    return X.reshape(-1), generate_glk(X.shape[-1]).double()
+    return X.reshape(-1), generate_glk_multihead(X.shape[-1], 1).double()
 
 
 @pytest.mark.parametrize(
@@ -269,11 +275,10 @@ def test_pullback_group_differentials_match_augmented_exp_oracle(kind, norm):
     n_gen = generators.shape[0]
     batched_phi = phi.expand(n_gen, -1).clone()
 
-    inverse_result = pullback_group_direction(
+    inverse_result = _pullback_single_block(
         torch.eye(n_gen, dtype=torch.float64),
         batched_phi,
         generators,
-        mode="pullback",
     )
     recovered_damped = torch.linalg.solve(
         inverse_result.v_phi,
@@ -286,11 +291,10 @@ def test_pullback_group_differentials_match_augmented_exp_oracle(kind, norm):
     )
     assert metric_error <= 1e-9
 
-    differential_result = pullback_group_direction(
+    differential_result = _pullback_single_block(
         damped,
         batched_phi,
         generators,
-        mode="pullback",
     )
     direction_error = torch.linalg.matrix_norm(
         differential_result.v_phi - torch.eye(n_gen, dtype=torch.float64)
@@ -306,11 +310,10 @@ def test_pullback_group_differentials_match_augmented_exp_oracle(kind, norm):
 
 def test_pullback_group_adaptive_series_accepts_traceless_gl5_norm_five():
     phi, generators = _gl_chart_fixture("traceless_diagonal", 5.0)
-    result = pullback_group_direction(
+    result = _pullback_single_block(
         torch.linspace(-0.5, 0.5, generators.shape[0], dtype=torch.float64),
         phi,
         generators,
-        mode="pullback",
     )
     # Candidate grid moved from (40, step 8) to (8, step 4) -- audit 2026-08-07. The certificate
     # that bounds the error is unchanged; only how early it is TESTED moved.
@@ -329,19 +332,18 @@ def test_pullback_group_adaptive_series_accepts_traceless_gl5_norm_five():
 
 
 def test_pullback_group_adaptive_series_rejects_uncertified_chart():
-    generators = generate_glk(2).double()
+    generators = generate_glk_multihead(2, 1).double()
     phi = torch.tensor([100.0, 0.0, 0.0, -100.0], dtype=torch.float64)
     with pytest.raises(ValueError, match="series|certificate|certif"):
-        pullback_group_direction(
+        _pullback_single_block(
             torch.ones(4, dtype=torch.float64),
             phi,
             generators,
-            mode="pullback",
         )
 
 
 def test_pullback_group_direction_matches_cholesky_oracle_and_residual():
-    generators = generate_glk(2).double()
+    generators = generate_glk_multihead(2, 1).double()
     generators = generators * torch.tensor([0.5, 1.0, 1.5, 2.0]).view(-1, 1, 1)
     phi = torch.tensor([0.1, -0.2, 0.15, -0.05], dtype=torch.float64)
     grad = torch.tensor([0.7, -0.3, 0.2, 0.9], dtype=torch.float64)
@@ -352,7 +354,7 @@ def test_pullback_group_direction_matches_cholesky_oracle_and_residual():
     assert not bool((info != 0).any())
     expected = torch.cholesky_solve(grad.unsqueeze(-1), factor).squeeze(-1)
 
-    result = pullback_group_direction(grad, phi, generators, mode="pullback")
+    result = _pullback_single_block(grad, phi, generators)
 
     relative_error = (
         torch.linalg.vector_norm(result.v_phi - expected)
@@ -363,7 +365,7 @@ def test_pullback_group_direction_matches_cholesky_oracle_and_residual():
 
 
 def _gl2_rotation_chart(theta: float) -> tuple[torch.Tensor, torch.Tensor]:
-    generators = generate_glk(2).double()
+    generators = generate_glk_multihead(2, 1).double()
     phi = torch.tensor([0.0, -theta, theta, 0.0], dtype=torch.float64)
     return phi, generators
 
@@ -371,37 +373,34 @@ def _gl2_rotation_chart(theta: float) -> tuple[torch.Tensor, torch.Tensor]:
 def test_pullback_group_rejects_gl2_rotation_pi_singularity_before_ridge():
     phi, generators = _gl2_rotation_chart(math.pi)
     with pytest.raises(ValueError, match="undamped generalized eigenvalue"):
-        pullback_group_direction(
+        _pullback_single_block(
             torch.ones(4, dtype=torch.float64),
             phi,
             generators,
-            mode="pullback",
         )
 
 
 def test_pullback_group_undamped_regularity_threshold_is_stable():
     failing_phi, generators = _gl2_rotation_chart(math.pi - 3e-4)
     with pytest.raises(ValueError, match="undamped generalized eigenvalue"):
-        pullback_group_direction(
+        _pullback_single_block(
             torch.ones(4, dtype=torch.float64),
             failing_phi,
             generators,
-            mode="pullback",
         )
 
     passing_phi, _ = _gl2_rotation_chart(math.pi - 4.5e-4)
-    result = pullback_group_direction(
+    result = _pullback_single_block(
         torch.ones(4, dtype=torch.float64),
         passing_phi,
         generators,
-        mode="pullback",
     )
     assert result.min_undamped_generalized_eigenvalue >= 1e-8
     assert result.damped_generalized_condition <= 1e6
 
 
 def test_pullback_group_direction_rejects_damped_condition_above_limit():
-    generators = generate_glk(2).double()
+    generators = generate_glk_multihead(2, 1).double()
     phi = torch.tensor(
         [5.0 / math.sqrt(2.0), 0.0, 0.0, -5.0 / math.sqrt(2.0)],
         dtype=torch.float64,
@@ -411,11 +410,10 @@ def test_pullback_group_direction_rejects_damped_condition_above_limit():
     assert eigenvalues[0] >= 1e-8
     assert (eigenvalues[-1] + 1e-6) / (eigenvalues[0] + 1e-6) > 1e6
     with pytest.raises(ValueError, match="damped generalized condition"):
-        pullback_group_direction(
+        _pullback_single_block(
             torch.ones(4, dtype=torch.float64),
             phi,
             generators,
-            mode="pullback",
         )
 
 
@@ -433,19 +431,18 @@ def test_pullback_group_direction_rejects_scaled_solve_residual_above_limit(monk
 
     monkeypatch.setattr(torch, "cholesky_solve", inaccurate_solve)
     with pytest.raises(ValueError, match="scaled solve residual"):
-        pullback_group_direction(
+        _pullback_single_block(
             torch.ones(4, dtype=torch.float64),
             torch.zeros(4, dtype=torch.float64),
-            generate_glk(2).double(),
-            mode="pullback",
+            generate_glk_multihead(2, 1).double(),
         )
 
 
 def test_pullback_group_left_trivialization_satisfies_u_xi_equals_dexp_v():
-    generators = generate_glk(2).double()
+    generators = generate_glk_multihead(2, 1).double()
     phi = torch.tensor([0.25, -0.4, 0.15, -0.2], dtype=torch.float64)
     grad = torch.tensor([0.6, -0.2, 0.3, 0.8], dtype=torch.float64)
-    result = pullback_group_direction(grad, phi, generators, mode="pullback")
+    result = _pullback_single_block(grad, phi, generators)
     X = torch.einsum("a,aij->ij", phi, generators)
     H_v = torch.einsum("a,aij->ij", result.v_phi, generators)
     U = torch.linalg.matrix_exp(X)
@@ -471,13 +468,12 @@ def test_pullback_group_per_block_matches_two_independent_gl5_solves_without_ful
     generators = generate_glk_multihead(10, 2).double()
     grad = torch.randn(50, dtype=torch.float64)
     phi = 0.03 * torch.randn(50, dtype=torch.float64)
-    local_generators = generate_glk(5).double()
+    local_generators = generate_glk_multihead(5, 1).double()
     expected = [
-        pullback_group_direction(
+        _pullback_single_block(
             grad[start:start + 25],
             phi[start:start + 25],
             local_generators,
-            mode="pullback",
         )
         for start in (0, 25)
     ]
@@ -542,11 +538,10 @@ def test_pullback_group_rejects_nonclosed_generator_span():
         dtype=torch.float64,
     )
     with pytest.raises(ValueError, match="bracket-closed"):
-        pullback_group_direction(
+        _pullback_single_block(
             torch.ones(2, dtype=torch.float64),
             torch.zeros(2, dtype=torch.float64),
             generators,
-            mode="pullback",
         )
 
 
@@ -561,11 +556,10 @@ def test_pullback_group_direction_disables_autocast_in_strict_float64_island(mon
 
     monkeypatch.setattr(phi_preconditioner, "_strict_structure_constants", record_autocast_state)
     with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
-        result = pullback_group_direction(
+        result = _pullback_single_block(
             torch.ones(4, dtype=torch.float32),
             torch.zeros(4, dtype=torch.float32),
-            generate_glk(2),
-            mode="pullback",
+            generate_glk_multihead(2, 1),
         )
     assert autocast_states == [False]
     assert result.v_phi.dtype == torch.float64
@@ -652,7 +646,7 @@ def test_pullback_group_solve_scale_reuses_eigenvalue_only_for_identity_gram(
     device,
 ):
     phi_preconditioner._STRICT_PULLBACK_PREP_CACHE.clear()
-    generators = generate_glk(2, device=device).double()
+    generators = generate_glk_multihead(2, 1, device=device).double()
     if not orthonormal:
         generators = generators * torch.tensor(
             [0.5, 1.0, 1.5, 2.0],
@@ -688,7 +682,7 @@ def test_pullback_group_solve_scale_reuses_eigenvalue_only_for_identity_gram(
 
     monkeypatch.setattr(torch.linalg, "matrix_norm", count_spectral)
     monkeypatch.setattr(torch, "cholesky_solve", perturb_direction_solve)
-    result = pullback_group_direction(grad, phi, generators, mode="pullback")
+    result = _pullback_single_block(grad, phi, generators)
 
     _, metric = _strict_series_pullback(phi, generators)
     gram = torch.einsum("aij,bij->ab", generators, generators)
@@ -706,7 +700,7 @@ def test_pullback_group_solve_scale_reuses_eigenvalue_only_for_identity_gram(
 
 def test_pullback_group_strict_preparation_cache_hits_and_invalidates_on_mutation(monkeypatch):
     phi_preconditioner._STRICT_PULLBACK_PREP_CACHE.clear()
-    generators = generate_glk(2)
+    generators = generate_glk_multihead(2, 1)
     original = phi_preconditioner._strict_structure_constants
     calls = 0
 
@@ -718,10 +712,10 @@ def test_pullback_group_strict_preparation_cache_hits_and_invalidates_on_mutatio
     monkeypatch.setattr(phi_preconditioner, "_strict_structure_constants", count_builds)
     grad = torch.ones(4)
     phi = torch.zeros(4)
-    pullback_group_direction(grad, phi, generators, mode="pullback")
-    pullback_group_direction(grad, phi, generators, mode="pullback")
+    _pullback_single_block(grad, phi, generators)
+    _pullback_single_block(grad, phi, generators)
     generators.add_(0.0)
-    pullback_group_direction(grad, phi, generators, mode="pullback")
+    _pullback_single_block(grad, phi, generators)
 
     assert calls == 2
 
@@ -729,15 +723,14 @@ def test_pullback_group_strict_preparation_cache_hits_and_invalidates_on_mutatio
 def test_pullback_group_strict_preparation_cache_is_bounded_and_weak():
     phi_preconditioner._STRICT_PULLBACK_PREP_CACHE.clear()
     generators_live = [
-        generate_glk(1)
+        generate_glk_multihead(1, 1)
         for _ in range(phi_preconditioner._STRICT_PULLBACK_PREP_CACHE_MAXSIZE + 3)
     ]
     for generators in generators_live:
-        pullback_group_direction(
+        _pullback_single_block(
             torch.ones(1),
             torch.zeros(1),
             generators,
-            mode="pullback",
         )
     assert len(phi_preconditioner._STRICT_PULLBACK_PREP_CACHE) == (
         phi_preconditioner._STRICT_PULLBACK_PREP_CACHE_MAXSIZE
@@ -759,7 +752,7 @@ def test_pullback_group_strict_preparation_cache_is_bounded_and_weak():
 
 def test_pullback_group_strict_preparation_cache_bypasses_requires_grad(monkeypatch):
     phi_preconditioner._STRICT_PULLBACK_PREP_CACHE.clear()
-    generators = generate_glk(2).requires_grad_()
+    generators = generate_glk_multihead(2, 1).requires_grad_()
     original = phi_preconditioner._strict_structure_constants
     calls = 0
 
@@ -770,11 +763,10 @@ def test_pullback_group_strict_preparation_cache_bypasses_requires_grad(monkeypa
 
     monkeypatch.setattr(phi_preconditioner, "_strict_structure_constants", count_builds)
     for _ in range(2):
-        result = pullback_group_direction(
+        result = _pullback_single_block(
             torch.ones(4),
             torch.tensor([0.1, -0.2, 0.15, -0.05]),
             generators,
-            mode="pullback",
         )
     assert calls == 2
     assert not phi_preconditioner._STRICT_PULLBACK_PREP_CACHE
@@ -1064,34 +1056,6 @@ def test_pullback_group_equal_block_batch_falls_back_for_unmatched_leading_shape
     _assert_pullback_group_result_equal(actual, expected)
 
 
-def test_pullback_group_full_mode_ignores_partition_metadata(device):
-    generators = generate_glk_multihead(4, 2, device=device)
-    grad = torch.linspace(-0.5, 0.5, generators.shape[0], device=device)
-    phi = torch.linspace(-0.1, 0.1, generators.shape[0], device=device)
-    expected = pullback_group_direction(
-        grad,
-        phi,
-        generators,
-        mode="pullback",
-    )
-    actual = pullback_group_direction(
-        grad,
-        phi,
-        generators,
-        mode="pullback",
-        coordinate_layout="block_head_row_major",
-        irrep_dims=[2, 2],
-    )
-    assert torch.equal(actual.v_phi, expected.v_phi)
-    assert torch.equal(actual.xi, expected.xi)
-    assert torch.equal(
-        actual.min_undamped_generalized_eigenvalue,
-        expected.min_undamped_generalized_eigenvalue,
-    )
-    assert torch.equal(actual.scaled_solve_residual, expected.scaled_solve_residual)
-    assert actual.series_order == expected.series_order
-
-
 def _legacy_pullback_metric(
     phi:       torch.Tensor,
     generators: torch.Tensor,
@@ -1200,14 +1164,14 @@ def test_estep_preconditioner_modes_are_byte_identical_to_legacy_goldens():
 
 
 def test_none_is_identity():
-    G = generate_glk(3)
+    G = generate_glk_multihead(3, 1)
     grad = torch.randn(4, 9)
     out = precondition_phi_gradient(grad, torch.zeros(4, 9), G, mode="none")
     assert torch.allclose(out, grad, atol=1e-7)
 
 
 def test_clip_scales_large_gradient_to_c():
-    G = generate_glk(3)
+    G = generate_glk_multihead(3, 1)
     grad = 100.0 * torch.ones(2, 9)                       # norm >> c
     out = precondition_phi_gradient(grad, torch.zeros(2, 9), G, mode="clip", clip_c=10.0)
     assert torch.allclose(out.norm(dim=-1), torch.full((2,), 10.0), atol=1e-3)
@@ -1291,7 +1255,7 @@ def test_pullback_series_warns_on_non_convergence():
 
 
 def test_clip_leaves_small_gradient_unchanged():
-    G = generate_glk(3)
+    G = generate_glk_multihead(3, 1)
     grad = 0.01 * torch.ones(2, 9)                        # norm << c
     out = precondition_phi_gradient(grad, torch.zeros(2, 9), G, mode="clip", clip_c=10.0)
     assert torch.allclose(out, grad, atol=1e-7)
@@ -1304,7 +1268,7 @@ def test_killing_metric_gl2_exact():
     # Cartan-involution form 2K*gram - 2*tr(x)tr(.) on the gl(2) elementary basis
     # (E00,E01,E10,E11), K=2. Bare Killing tr(T_a T_b) would give a DIFFERENT,
     # indefinite matrix; this literal discriminates them.
-    G = generate_glk(2)
+    G = generate_glk_multihead(2, 1)
     M = killing_metric(G)
     expected = torch.tensor([[2., 0., 0., -2.],
                              [0., 4., 0.,  0.],
@@ -1328,7 +1292,7 @@ def test_killing_preconditioner_exact_inverse_on_slk():
     # Center-reg lifts ONLY the numerical nullspace (the center/identity direction);
     # on sl(K) the regularized inverse is the TRUE Killing inverse: g~ @ (Minv @ v) = v
     # for v perpendicular to the center. A ridge center_reg*I would fail this.
-    G = generate_glk(2)
+    G = generate_glk_multihead(2, 1)
     M = killing_metric(G)
     Minv = build_killing_preconditioner(G, center_reg=4.0)
     v = torch.tensor([0., 1.3, -0.7, 0.])                 # in sl(2): E01,E10 dirs (trace-free)
@@ -1339,7 +1303,7 @@ def test_killing_preconditioner_exact_inverse_on_slk():
 
 
 def test_killing_mode_applies_inverse_metric():
-    G = generate_glk(2)
+    G = generate_glk_multihead(2, 1)
     grad = torch.tensor([[0., 2.0, -1.0, 0.]])
     Minv = build_killing_preconditioner(G, center_reg=4.0)
     out = precondition_phi_gradient(grad, torch.zeros(1, 4), G, mode="killing", center_reg=4.0)
@@ -1360,7 +1324,7 @@ def test_per_block_is_block_diagonal_and_matches_local_killing():
     assert torch.allclose(Minv[:4, 4:], torch.zeros(4, 4), atol=1e-6)
     assert torch.allclose(Minv[4:, :4], torch.zeros(4, 4), atol=1e-6)
     # each diagonal block equals the single-head gl(2) Killing inverse
-    head0 = generate_glk(2)
+    head0 = generate_glk_multihead(2, 1)
     Minv_head = build_killing_preconditioner(head0, center_reg=4.0)
     assert torch.allclose(Minv[:4, :4], Minv_head, atol=1e-5)
 
@@ -1395,7 +1359,7 @@ def _fd_dexp_metric(phi_vec, G, eps=1e-4):
 
 def test_pullback_at_zero_is_frobenius_gram():
     # Psi(0) = I, exp(0) = I -> G_ab = tr(G_a^T G_b) = Frobenius Gram.
-    G = generate_glk(2)
+    G = generate_glk_multihead(2, 1)
     Gmetric = pullback_metric(torch.zeros(4), G)
     gram = torch.einsum("aij,bij->ab", G.double(), G.double())
     assert Gmetric.dtype == torch.float64
@@ -1421,7 +1385,7 @@ def test_pullback_matches_fd_noncompact_at_default_order():
     # scale with ||phi||, so a fixed low-order Psi truncation is inaccurate here; the
     # adaptive default must still match the FD-of-exp oracle in the regime the pullback
     # metric exists for. Closed-form (default knobs) must agree with FD to 1e-4.
-    G = generate_glk(2).double()
+    G = generate_glk_multihead(2, 1).double()
     base = torch.tensor([0.6, 0.5, 0.5, -0.6], dtype=torch.float64)   # E00,E01,E10,E11
     phi = base / base.norm() * 2.0                        # ||phi|| = 2.0 (non-compact)
     Gclosed = pullback_metric(phi, G)                     # SHIPPED DEFAULT series knobs
@@ -1435,7 +1399,7 @@ def test_pullback_default_order_no_factorial_overflow():
     # The Psi-series coefficient is a float: an int 1/(k+1)! divisor overflows tensor
     # division past order ~20. The shipped default cap (40) must run to completion
     # without raising on a non-compact phi that drives the series deep.
-    G = generate_glk(2).double()
+    G = generate_glk_multihead(2, 1).double()
     base = torch.tensor([0.6, 0.5, 0.5, -0.6], dtype=torch.float64)
     phi = base / base.norm() * 5.0                        # ||phi|| = 5 (drives series deep)
     Gclosed = pullback_metric(phi, G)                     # default series_order=40
@@ -1444,7 +1408,7 @@ def test_pullback_default_order_no_factorial_overflow():
 
 def test_pullback_k_guard():
     import pytest
-    G = generate_glk(13)                                  # K=13 > max_k
+    G = generate_glk_multihead(13, 1)                                  # K=13 > max_k
     with pytest.raises((ValueError, RuntimeError)):
         pullback_metric(torch.zeros(169), G, max_k=12)
 
@@ -1454,7 +1418,7 @@ from vfe3.geometry.phi_preconditioner import pullback_metric_per_block
 
 def test_pullback_per_block_single_block_matches_full():
     # irrep_dims == [K]: the per-block metric reduces to the full pullback exactly.
-    G = generate_glk(3).double()
+    G = generate_glk_multihead(3, 1).double()
     phi = torch.randn(9, dtype=torch.float64) * 0.3
     a = pullback_metric_per_block(phi, G, [3])
     b = pullback_metric(phi, G)
@@ -1472,7 +1436,7 @@ def test_pullback_per_block_is_block_diagonal_and_fd_per_block():
     Gblk = pullback_metric_per_block(phi, G, irrep)        # (8, 8)
     assert torch.allclose(Gblk[:4, 4:], torch.zeros(4, 4, dtype=torch.float64), atol=1e-6)
     assert torch.allclose(Gblk[4:, :4], torch.zeros(4, 4, dtype=torch.float64), atol=1e-6)
-    local = generate_glk(2).double()                      # the d_h=2 local rep both blocks use
+    local = generate_glk_multihead(2, 1).double()                      # the d_h=2 local rep both blocks use
     assert torch.allclose(Gblk[:4, :4], _fd_dexp_metric(phi[:4], local), atol=1e-4)
     assert torch.allclose(Gblk[4:, 4:], _fd_dexp_metric(phi[4:], local), atol=1e-4)
 

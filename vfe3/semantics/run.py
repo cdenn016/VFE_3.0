@@ -353,9 +353,7 @@ class SemanticRun:
         """
         from vfe3.model.model import VFEModel
 
-        cfg = dataclasses.replace(
-            self.cfg, amp_dtype=None,
-            _allow_legacy_dense_decode=bool(getattr(self.cfg, "_allow_legacy_dense_decode", False)))
+        cfg = dataclasses.replace(self.cfg, amp_dtype=None)
         model = VFEModel(cfg)
         model.load_state_dict(self.state, strict=True)
         model.to(device).eval()
@@ -427,8 +425,8 @@ def _decode_kind(cfg: VFE3Config) -> str:
         return "linear"
     if cfg.decode_mode in _KL_DECODE_MODES:
         return "gaussian"
-    if (cfg.decode_mode in _FAMILY_DECODE_MODES and cfg.family in _GAUSSIAN_KL_FAMILIES
-            and cfg.divergence_family == "renyi" and float(cfg.renyi_order) == 1.0):
+    if cfg.decode_mode in _FAMILY_DECODE_MODES and cfg.family in _GAUSSIAN_KL_FAMILIES:
+        # The family decode scores the KL divergence (Renyi order 1), the only retained divergence.
         return "gaussian"
     return "unsupported"
 

@@ -13,14 +13,12 @@ from __future__ import annotations
 from dataclasses import fields
 from typing import Any, Dict, Mapping, Tuple
 
-from vfe3.config import VFE3Config, config_from_serialized
+from vfe3.config import RETIRED_CONFIG_KEYS, VFE3Config, config_from_serialized
 
-# Keys that are not VFE3Config fields but that config_from_serialized migrates itself.
-MIGRATED_HISTORICAL_KEYS = frozenset({
-    "_allow_legacy_dense_decode", "grad_clip_per_role", "exp_fp64_mode",
-    "relational_mode", "relational_readout_mode",
-    "relational_input_scope", "relational_output_scope", "relational_identity_content",
-})
+# Keys that are not VFE3Config fields but that config_from_serialized migrates itself: it accepts a
+# pinned or inert value silently and refuses any other as retired, so the lenient loader must hand
+# them through instead of dropping them (which would silently reopen a retired run).
+MIGRATED_HISTORICAL_KEYS = RETIRED_CONFIG_KEYS
 
 
 def lenient_config_from_serialized(

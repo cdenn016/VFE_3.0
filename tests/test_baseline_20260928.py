@@ -71,7 +71,7 @@ def _vcfg(**over: Any) -> VFE3Config:
     values: Dict[str, Any] = dict(
         vocab_size=V, embed_dim=K, n_heads=H, batch_size=B, max_seq_len=N, eval_stride=3,
         n_layers=L, n_e_steps=1, warmup_steps=0, max_steps=6, log_interval=0, eval_interval=0,
-        checkpoint_interval=0, e_phi_lr=0.0, oracle_unroll_grad=True,
+        checkpoint_interval=0,
         generate_embedding_figures=False, pos_phi="learned", use_block_mlp=True,
         block_mlp_expansion=E, beta_attention_prior="causal_alibi", family="gaussian_diagonal",
         gauge_group="block_glk", attention_mode="projected_predictive", attention_residual=True,

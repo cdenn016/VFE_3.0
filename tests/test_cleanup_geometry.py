@@ -10,7 +10,7 @@ from vfe3.inference.e_step import _transport, build_belief_transport
 def test_batch_independent_transport_preserves_both_token_axes(monkeypatch: pytest.MonkeyPatch) -> None:
     name = "cleanup_batch_independent"
     monkeypatch.setattr(transport, "_TRANSPORTS", dict(transport._TRANSPORTS))
-    group = get_group("glk")(2)
+    group = get_group("block_glk")(2, 1)
     expected = torch.eye(2).expand(3, 3, 2, 2).clone()
     @transport.register_transport(name, covariance_class="test", batch_independent=True)
     def build(phi: torch.Tensor, group: object, **kwargs: object) -> dict:
@@ -30,7 +30,7 @@ def test_right_phi_cannot_be_a_registered_state_key() -> None:
 def test_overridden_transport_routes_current_registration_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     name = "cleanup_override"
     monkeypatch.setattr(transport, "_TRANSPORTS", dict(transport._TRANSPORTS))
-    group = get_group("glk")(2)
+    group = get_group("block_glk")(2, 1)
     phi = torch.zeros(1, 3, 4)
     mu = torch.randn(1, 3, 2)
     sigma = torch.ones_like(mu)
@@ -72,35 +72,6 @@ def test_norm_precision_preserves_float64_storage_and_explicit_oracle(
         torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
 
-def test_shared_policy_adapter_preserves_exact_family_and_omitted_keywords(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from vfe3.families.gaussian import FullGaussian
-    from vfe3.families.policy import coupling_energy, family_instance
-    mu, sigma = torch.zeros(1, 2), torch.eye(2).unsqueeze(0)
-    seen = []
-    class CustomFull(FullGaussian):
-        def __init__(self, mu: torch.Tensor, sigma: torch.Tensor, **kwargs: object) -> None:
-            seen.append(kwargs)
-        @staticmethod
-        def coupling_energy(*args: object, **kwargs: object) -> torch.Tensor:
-            seen.append(kwargs)
-            return torch.tensor(0.0)
-    prior = torch.tensor([[0.0, -torch.inf]])
-    family_instance(mu, sigma, CustomFull, "fp64")
-    coupling_energy(CustomFull, mu, log_prior=prior, precision_policy="fp64", score_backend="common_frame")
-    assert seen == [{}, {}]
-    assert family_instance(mu, sigma, FullGaussian, "fp64")._precision_policy == "fp64"
-    assert family_instance(mu, sigma, FullGaussian, None)._precision_policy is None
-    monkeypatch.setattr(FullGaussian, "coupling_energy", CustomFull.coupling_energy)
-    coupling_energy(FullGaussian, mu, log_prior=prior, precision_policy="fp64", score_backend="common_frame")
-    assert seen[-1]["precision_policy"] == "fp64"
-    assert seen[-1]["score_backend"] == "common_frame"
-    torch.testing.assert_close(seen[-1]["pair_support"], ~torch.isneginf(prior))
-    coupling_energy(FullGaussian, mu)
-    assert seen[-1] == {"score_backend": "pairwise"}
-
-
 def test_predictive_gradient_capture_uses_host_nan_and_preserves_real_norms(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -119,7 +90,7 @@ def test_predictive_gradient_capture_uses_host_nan_and_preserves_real_norms(
     monkeypatch.setattr(module, "e_step_iteration", recorded)
     cfg = tiny_config(attention_mode="projected_predictive", n_layers=6,
 
-                      skip_belief_sigma_update=True, e_phi_lr=0.0)
+                      skip_belief_sigma_update=True)
     model = VFEModel(cfg)
     out = {}
     model.forward_beliefs(torch.tensor([[0, 1, 2]]), estep_grad_out=out)

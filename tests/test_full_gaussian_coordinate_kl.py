@@ -4,7 +4,6 @@ import pytest
 import torch
 from vfe3.families.gaussian import FullGaussian, DiagonalGaussian
 from vfe3.free_energy import self_divergence_for_alpha
-from tests.test_relational_integration import _cfg
 
 
 def test_correlated_kl_coordinates_match_conditional_reference() -> None:
@@ -50,9 +49,6 @@ def test_full_coordinate_non_kl_renyi_fails_explicitly() -> None:
     q = FullGaussian(torch.zeros(2), torch.eye(2))
     with pytest.raises(ValueError, match=r"KL \(alpha=1\)"):
         q.renyi_per_coord(q, alpha=.5)
-    with pytest.raises(ValueError, match="renyi_order=0.5"):
-        _cfg(family="gaussian_full", attention_mode="projected_predictive", renyi_order=.5,
-             lambda_alpha_mode="state_dependent_per_coord")
 
 
 @pytest.mark.parametrize("policy", ["fp64", "fp32_escalate", "fp32_escalate_cond"])

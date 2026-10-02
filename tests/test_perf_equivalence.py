@@ -17,7 +17,7 @@ import torch
 
 from vfe3.config import VFE3Config
 from vfe3.geometry.groups import get_group
-from vfe3.geometry.transport import compute_transport_operators, transport_covariance, transport_mean
+from vfe3.geometry.transport import compute_transport_operators
 from vfe3.model.model import VFEModel
 
 
@@ -27,23 +27,8 @@ def _fwd_cfg(**overrides: object) -> VFE3Config:
     # vectorization) is independent of the pos_phi gauge composition.
     # These checksums were captured on the KL-to-prior decoder that the oracle guards.
     return test_config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=2,
-                      n_e_steps=2, e_phi_lr=0.0, pos_phi="none",
+                      n_e_steps=2, pos_phi="none",
                       decode_mode="diagonal_chunked", **overrides)
-
-
-def test_beta_to_coordinate_equal_blocks_matches_repeat_interleave():
-    # The equal-block expand/reshape fast path (avoids the repeat_interleave gather) must be
-    # BIT-identical to the repeat_interleave reference: coordinate k carries head h(k)'s beta_ij.
-    from vfe3.gradients.kernels import _beta_to_coordinate
-    torch.manual_seed(0)
-    H, N, d = 3, 5, 4
-    beta = torch.softmax(torch.randn(H, N, N), dim=-1)
-    irrep = [d, d, d]
-    out = _beta_to_coordinate(beta, irrep, H * d)
-    ref = torch.repeat_interleave(beta.movedim(-3, -1), torch.tensor(irrep), dim=-1)
-    assert torch.equal(out, ref)
-    for h in range(H):
-        assert torch.equal(out[..., h * d:(h + 1) * d], beta[h].unsqueeze(-1).expand(N, N, d))
 
 
 def test_batched_forward_equals_per_sample():
@@ -63,12 +48,6 @@ def test_batched_forward_equals_per_sample():
     assert torch.allclose(batched[1].double(), s1[0].double(), atol=1e-5)
 
 
-# --- frozen transport oracle (block_glk K=8 n_heads=2 -> irrep_dims [4,4], seed 0) ---
-_OMEGA_SUM  = 401.9380187988
-_MT_ABS_SUM = 393.5396728516
-_ST_SUM     = 532.2587280273
-
-
 def _transport_inputs():
     torch.manual_seed(0)
     grp = get_group("block_glk")(8, 2)
@@ -77,17 +56,6 @@ def _transport_inputs():
     mu = torch.randn(2, 5, 8)
     sig = torch.rand(2, 5, 8) + 0.5
     return grp, phi, mu, sig
-
-
-def test_transport_matches_frozen_oracle():
-    grp, phi, mu, sig = _transport_inputs()
-    td = compute_transport_operators(phi, grp)
-    omega = td["Omega"]                                    # (B, N, N, K, K)
-    mt = transport_mean(omega, mu)                         # (B, N, N, K)
-    st = transport_covariance(omega, sig)                  # (B, N, N, K) diagonal sandwich
-    assert abs(float(omega.sum()) - _OMEGA_SUM) < 1e-3
-    assert abs(float(mt.abs().sum()) - _MT_ABS_SUM) < 1e-3
-    assert abs(float(st.sum()) - _ST_SUM) < 1e-3
 
 
 def test_block_glk_phi_matrix_is_block_diagonal():
@@ -124,23 +92,11 @@ def test_per_block_exp_is_bit_equivalent_to_full_exp():
 # --- P0 #2: the E-step fused-transport selector (factored on flat+equal-block, dense otherwise) ---
 def test_estep_fuses_flat_block_glk_to_factored_container():
     # block_glk (irrep_dims [4,4], multi equal block, flat) -> the E-step builds the FACTORED
-    # container (no dense (B,N,N,K,K) Omega), which transport_mean/covariance consume on a fast path.
+    # container (no dense (B,N,N,K,K) Omega).
     from vfe3.geometry.transport import FactoredTransport
     from vfe3.inference.e_step import build_belief_transport
     grp, phi, mu, sig = _transport_inputs()
-    out = build_belief_transport(phi, grp, transport_mode="flat")
-    assert isinstance(out, FactoredTransport)
-
-
-def test_estep_fuses_tied_block_glk_to_factored_container():
-    # tied_block_glk is also block-diagonal with equal blocks -> qualifies for the fused route.
-    from vfe3.geometry.transport import FactoredTransport
-    from vfe3.inference.e_step import build_belief_transport
-    grp = get_group("tied_block_glk")(8, 2)
-    n_gen = grp.generators.shape[0]
-    torch.manual_seed(0)
-    phi = 0.2 * torch.randn(2, 5, n_gen)
-    out = build_belief_transport(phi, grp, transport_mode="flat")
+    out = build_belief_transport(phi, grp)
     assert isinstance(out, FactoredTransport)
 
 
@@ -180,59 +136,19 @@ def test_compose_bch_blocked_matches_dense():
         assert torch.allclose(g_dense, g_blocked, atol=1e-6), f"order={order} grad"
 
 
-def test_pair_contract_matches_beta_coord_reference():
-    # _pair_contract (beta in compact per-head form against a head-shaped view of the pair
-    # difference) must reproduce the legacy beta_coord-broadcast einsum on every branch:
-    # per-head equal blocks, single block, and the unequal-tower fallback.
-    from vfe3.gradients.kernels import _beta_to_coordinate, _pair_contract
-    torch.manual_seed(2)
-    B, N, H, d = 2, 5, 3, 4
-    K = H * d
-    diff = torch.randn(B, N, N, K)
-    beta_h = torch.softmax(torch.randn(B, H, N, N), dim=-1)
-    ref = torch.einsum("...ijk,...ijk->...ik",
-                       _beta_to_coordinate(beta_h, [d] * H, K), diff)
-    assert torch.allclose(_pair_contract(beta_h, diff, [d] * H), ref, atol=1e-6)
-
-    beta_1 = torch.softmax(torch.randn(B, N, N), dim=-1)   # single block
-    ref_1 = torch.einsum("...ijk,...ijk->...ik",
-                         beta_1.unsqueeze(-1).expand(B, N, N, K), diff)
-    assert torch.allclose(_pair_contract(beta_1, diff, None), ref_1, atol=1e-6)
-    assert torch.allclose(_pair_contract(beta_1, diff, [K]), ref_1, atol=1e-6)
-
-    irrep_uneq = [3, 9]                                    # unequal blocks -> gather fallback
-    beta_u = torch.softmax(torch.randn(B, 2, N, N), dim=-1)
-    ref_u = torch.einsum("...ijk,...ijk->...ik",
-                         _beta_to_coordinate(beta_u, irrep_uneq, K), diff)
-    assert torch.allclose(_pair_contract(beta_u, diff, irrep_uneq), ref_u, atol=1e-6)
-
-
 def test_estep_single_block_groups_stay_dense():
-    # glk and so_k report irrep_dims [K] (single block) -> the fused route is NOT taken; the
-    # E-step keeps the dense (N,N,K,K)/(B,N,N,K,K) Omega tensor exactly as today.
+    # Single-block groups (block_glk with one head, so_n defining rep) report irrep_dims [K] -> the
+    # fused route is NOT taken; the E-step keeps the dense (N,N,K,K)/(B,N,N,K,K) Omega tensor.
     from vfe3.geometry.transport import FactoredTransport
     from vfe3.inference.e_step import build_belief_transport
     torch.manual_seed(0)
-    for name, ctor in (("glk", lambda: get_group("glk")(8)),
-                       ("so_k", lambda: get_group("so_k")(8))):
+    for name, ctor in (("block_glk_1", lambda: get_group("block_glk")(8, 1)),
+                       ("so_n_l1", lambda: get_group("so_n")(8, group_n=8, irrep_spec=[("l1", 1)]))):
         grp = ctor()
         n_gen = grp.generators.shape[0]
         phi = 0.2 * torch.randn(2, 5, n_gen)
-        out = build_belief_transport(phi, grp, transport_mode="flat")
+        out = build_belief_transport(phi, grp)
         assert not isinstance(out, FactoredTransport), name
         assert torch.is_tensor(out), name
 
 
-def test_estep_cross_coupled_block_glk_stays_dense():
-    # A cross-coupled block_glk reports irrep_dims [K] (its group elements have off-block entries),
-    # so it is NOT block-diagonal with equal blocks -> the fused route is excluded, dense kept.
-    from vfe3.geometry.transport import FactoredTransport
-    from vfe3.inference.e_step import build_belief_transport
-    grp = get_group("block_glk")(8, 2, cross_couplings=[(0, 1)])
-    assert grp.irrep_dims == [8]
-    n_gen = grp.generators.shape[0]
-    torch.manual_seed(0)
-    phi = 0.2 * torch.randn(2, 5, n_gen)
-    out = build_belief_transport(phi, grp, transport_mode="flat")
-    assert not isinstance(out, FactoredTransport)
-    assert torch.is_tensor(out)

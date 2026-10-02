@@ -50,7 +50,7 @@ def _cpu_one_thread(monkeypatch: pytest.MonkeyPatch) -> None:
 def _tiny_cfg(**over: Any) -> VFE3Config:
     values: Dict[str, Any] = dict(
         vocab_size=V_BPE, embed_dim=4, n_heads=2, batch_size=2, max_seq_len=4, eval_stride=2, n_layers=2,
-        max_steps=4, warmup_steps=0, log_interval=0, eval_interval=2, checkpoint_interval=4, e_phi_lr=0.0,
+        max_steps=4, warmup_steps=0, log_interval=0, eval_interval=2, checkpoint_interval=4,
         family="gaussian_diagonal", gauge_group="block_glk", attention_mode="projected_predictive",
         attention_residual=True, decode_mode="linear", use_block_mlp=True, block_mlp_expansion=2,
         generate_embedding_figures=False, sigma_weight_decay=0.2, pos_phi="learned", seed=0,

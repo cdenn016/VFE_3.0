@@ -223,11 +223,6 @@ def test_config_state_and_control_activity_round_trip() -> None:
         {"family": "gaussian_diagonal_exact"},
         {"family": "gaussian_frame_diagonal"},
         {"lambda_alpha_mode": "state_dependent"},
-        {"e_step_update": "mm_exact"},
-        {"gradient_mode": "smoothing"},
-        {"e_step_gradient": "straight_through"},
-        {"oracle_unroll_grad": False},
-        {"e_phi_lr": 0.1},
     ],
 )
 def test_unsupported_gradient_envelopes_are_rejected(overrides: dict[str, Any]) -> None:

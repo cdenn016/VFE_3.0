@@ -69,7 +69,7 @@ def test_linear_mode_uses_no_nn_linear_module():
 
 def test_model_forward_and_backward_under_linear_decode():
     cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                     n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0, decode_mode="linear")
+                     n_e_steps=1, e_q_mu_lr=0.05, decode_mode="linear")
     model = VFEModel(cfg)
     tokens = torch.randint(0, 20, (3, 5))
     targets = torch.randint(0, 20, (3, 5))

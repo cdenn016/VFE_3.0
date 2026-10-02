@@ -191,18 +191,3 @@ def test_bounded_variance_from_log_works_under_inference_mode():
     with torch.inference_mode():
         out = bounded_variance_from_log(torch.zeros(3))
     torch.testing.assert_close(out, torch.ones(3))
-
-
-def test_mm_cholesky_fallback_counter_is_per_device_and_resettable():
-    """MM failure accounting stays on-device until reporting reads it."""
-    from vfe3.numerics import (
-        _count_mm_cholesky_fallback,
-        mm_cholesky_fallback_elements,
-        reset_mm_cholesky_fallback_elements,
-    )
-
-    reset_mm_cholesky_fallback_elements()
-    _count_mm_cholesky_fallback(torch.tensor([True, False, False]))
-    assert mm_cholesky_fallback_elements() == 2
-    reset_mm_cholesky_fallback_elements()
-    assert mm_cholesky_fallback_elements() == 0

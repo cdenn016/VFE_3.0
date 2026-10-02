@@ -15,8 +15,8 @@ from vfe3.model.relational_operators import RelationalOperators
 def _config(**overrides: object) -> VFE3Config:
     # Pin this feature independently of the launcher defaults and the ongoing test overhaul.
     values = dict(attention_mode="projected_predictive", predictive_covariance="moment_matched",
-                  family="gaussian_diagonal", decode_mode="linear", gradient_mode="filtering",
-                  e_step_update="gradient", lambda_alpha_mode="constant", attention_residual=False,
+                  family="gaussian_diagonal", decode_mode="linear",
+                  lambda_alpha_mode="constant", attention_residual=False,
                   )
     values.update(overrides)
     return tiny_config(**values)

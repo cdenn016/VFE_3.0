@@ -272,8 +272,8 @@ class BeliefParams(ABC):
     def stack(cls, parts: List["BeliefParams"], *, dim: int = 0) -> "BeliefParams":
         r"""Stack a list of same-family parts into one ``BeliefParams`` along a NEW axis ``dim``,
         stacking each underlying tensor of the parts. Family-agnostic batching primitive: a single
-        functional call over the stacked axis then computes every part's divergence at once (used by
-        ``pairwise_energy`` to batch the per-irrep-block loop). Not abstract -- a family that never
+        functional call over the stacked axis then computes every part's divergence at once. Not
+        abstract -- a family that never
         takes the batched path need not override it. Overriding is required only to batch."""
         raise NotImplementedError(
             f"{cls.__name__} does not override stack, the family-agnostic batching primitive "
@@ -302,127 +302,6 @@ class BeliefParams(ABC):
             f"{cls.__name__} does not provide from_covariance, the family's readout of a full "
             f"covariance into its stored dispersion. Provide it to extend the executable "
             f"gauge-invariance check to this family."
-        )
-
-    @classmethod
-    def from_transported(
-        cls,
-        mu:                torch.Tensor,         # transported means
-        dispersion:        torch.Tensor,         # transported family dispersion
-        source_dispersion: torch.Tensor,         # pre-transport dispersion and public dtype source
-    ) -> "BeliefParams":
-        r"""Construct a family belief from transported parameters.
-
-        Most families need no provenance beyond the two transported tensors. FullGaussian
-        overrides this seam because its covariance may be retained in a higher internal precision
-        than the public source family.
-        """
-        return cls(mu, dispersion)
-
-    @classmethod
-    def transport_location(
-        cls,
-        mu:    torch.Tensor,              # (..., N, K) source (key, index j) locations
-        omega: object,                    # dense/factored/direct-link/RoPE transport container
-    ) -> torch.Tensor:                    # (..., N, N, K) transported locations
-        r"""Transport the family's location parameter under ``omega``.
-
-        .. math::
-            \mu_t[i, j] = \Omega_{ij}\,\mu_j.
-
-        The location-side twin of :meth:`transport_dispersion`. Families whose stored location
-        lives in the FIXED basis inherit the gauge action unchanged. A family whose location is
-        already expressed in its own fiber frame overrides this seam, because for the pure frame
-        coboundary :math:`\Omega_{ij} = U_i U_j^{-1}` the receiver frame cancels,
-        :math:`U_i^{-1}\Omega_{ij}\mu_j = U_j^{-1}\mu_j`, leaving the transport an identity.
-        The lazy import avoids a module cycle while keeping family selection in the family
-        registry rather than hard-coding family names into geometry or inference call sites.
-        """
-        from vfe3.geometry.transport import transport_mean
-        return transport_mean(omega, mu)
-
-    @classmethod
-    def transport_dispersion(
-        cls,
-        dispersion: torch.Tensor,         # (..., N, K) diagonal or (..., N, K, K) full parameter
-        omega:      object,               # dense/factored/direct-link/RoPE transport container
-
-        *,
-        diagonal_out:    Optional[bool]      = None,
-        marginal_blocks: Optional[List[int]] = None,
-    ) -> torch.Tensor:
-        r"""Transport the family's dispersion parameter under ``omega``.
-
-        Covariance-parameterized families inherit the congruence action. A location-scale family
-        overrides this seam when its stored parameter has a different homogeneity degree. The lazy
-        import avoids a module cycle while keeping family selection in the family registry rather
-        than hard-coding family names into geometry or inference call sites.
-
-        ``marginal_blocks`` declares the irrep partition the CALLER will read as head-diagonal
-        marginals, letting a structured transport skip cross-head output blocks it can prove are
-        never read; see :func:`~vfe3.geometry.transport.transport_covariance`. It is a promise
-        about the read, so only a caller that owns the downstream consumption may set it.
-        """
-        from vfe3.geometry.transport import transport_covariance
-        return transport_covariance(
-            omega, dispersion,
-            diagonal_out=diagonal_out, marginal_blocks=marginal_blocks)
-
-    @classmethod
-    def coupling_energy(
-        cls,
-        mu_q:         torch.Tensor,       # (..., N, K) query locations
-        dispersion_q: torch.Tensor,       # (..., N, K) or (..., N, K, K) query dispersion
-        mu_k:         torch.Tensor,       # (..., N, K) key locations, PRE-transport
-        dispersion_k: torch.Tensor,       # (..., N, K) or (..., N, K, K) key dispersion, PRE-transport
-        omega:        object,             # dense/factored/direct-link/RoPE transport container
-
-        *,
-        alpha:             float = 1.0,
-        kl_max:            float = 100.0,
-        eps:               float = 1e-6,
-        divergence_family: str   = "renyi",
-
-        irrep_dims:       Optional[List[int]] = None,
-        diagonal_out:     Optional[bool]      = None,
-    ) -> torch.Tensor:                    # (..., N, N) or (..., H, N, N)
-        r"""Per-pair belief-coupling energy :math:`E_{ij} = D(q_i \| \Omega_{ij\#} q_j)`.
-
-        The single seam every consumer of the coupling grid dispatches through -- the belief-gradient
-        oracle, the phi E-step objective, the reported free energy, the model channel's gamma
-        coupling, and the attention-map diagnostics -- so a family that computes the transported
-        divergence DIFFERENTLY is honored everywhere by its registration alone.
-
-        The default composes the two transport seams with :func:`~vfe3.free_energy.pairwise_energy`,
-        pushing the KEY forward and evaluating the family divergence against the untransported query.
-        For a diagonal covariance under a general :math:`\mathrm{GL}(K)` congruence that pushforward
-        is TRUNCATED to its diagonal (diagonal covariance is not closed under congruence), so the
-        default energy is the divergence of the projected key, not of the exact pushforward. A family
-        that can evaluate the exact transported divergence overrides this seam; see
-        ``vfe3.families.exact_congruence``.
-
-        ``diagonal_out`` is forwarded to :meth:`transport_dispersion` verbatim so each call site keeps
-        its established diagonal-vs-full resolution.
-
-        ``irrep_dims`` is ALSO forwarded as ``marginal_blocks`` (audit 2026-08-05). This seam is the
-        one place the promise is safe to make: the transported dispersion is a local that never
-        escapes, its single consumer is the ``pairwise_energy`` below, and with more than one irrep
-        block that consumer reads exactly ``block(h*d, (h+1)*d)`` per head and no off-block. A
-        structured transport may therefore skip the cross-head congruence blocks. Callers that
-        instead invoke :meth:`transport_dispersion` DIRECTLY (the gauge-equivariance certificate in
-        ``metrics``, the model's sandwich diagnostic) do not pass it and keep the full congruence,
-        which is why the promise lives here rather than inside the family or the geometry.
-        """
-        from vfe3.free_energy import pairwise_energy
-        mu_t = cls.transport_location(mu_k, omega)
-        dispersion_t = cls.transport_dispersion(
-            dispersion_k, omega,
-            diagonal_out=diagonal_out, marginal_blocks=irrep_dims)
-        return pairwise_energy(
-            cls(mu_q, dispersion_q),
-            cls.from_transported(mu_t, dispersion_t, dispersion_k),
-            alpha=alpha, kl_max=kl_max, eps=eps,
-            divergence_family=divergence_family, irrep_dims=irrep_dims,
         )
 
 

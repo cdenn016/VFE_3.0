@@ -19,22 +19,17 @@ import vfe3.geometry.transport as transport
 import vfe3.relational_scoring as relational_scoring
 from tests.profiles import tiny_config
 from vfe3.belief import BeliefState
-from vfe3.families.exact_congruence import ExactCongruenceDiagonalGaussian
 from vfe3.gauge_optim import GaugeManifoldAdamW, stage_pullback_group_candidate
 from vfe3.geometry.groups import get_group
-from vfe3.geometry.lie_ops import _from_equal_diag_blocks, embed_phi, extract_phi
+from vfe3.geometry.lie_ops import embed_phi, extract_phi
 from vfe3.geometry.phi_preconditioner import _bch_chart_direction, pullback_group_direction
 from vfe3.geometry.retraction import retract_phi
-from vfe3.geometry.rope import build_rope_rotation
 from vfe3.geometry.transport import (
-    CompactFactoredTransport,
-    FactoredTransport,
-    RopeTransport,
     _checked_group_inverse,
     stable_matrix_exp_pair,
 )
 from vfe3.inference import e_step as e_step_module
-from vfe3.inference.e_step import e_step_iteration, free_energy_value, phi_alignment_loss
+from vfe3.inference.e_step import e_step_iteration
 from vfe3.model.model import VFEModel
 from vfe3.numerics import condition_number, floor_eigenvalues
 from vfe3.relational_scoring import (
@@ -42,6 +37,12 @@ from vfe3.relational_scoring import (
     projected_moments,
     source_recovery_counter,
 )
+
+
+def _pullback_single_block(grad_phi, phi, generators, **kwargs):
+    """Strict pullback direction on one block (the retired ambient 'pullback' mode's live equivalent)."""
+    kwargs.setdefault("irrep_dims", [generators.shape[-1]])
+    return pullback_group_direction(grad_phi, phi, generators, mode="pullback_per_block", **kwargs)
 
 
 class _HostReads:
@@ -155,55 +156,13 @@ def _max_future_leak(cfg) -> float:
     return worst
 
 
-def _phi_objective_inputs(seed: int = 0):
-    group = get_group("block_glk")(4, 2)
-    generator = torch.Generator().manual_seed(seed)
-    B, N, K = 1, 5, 4
-    mu = torch.randn(B, N, K, generator=generator)
-    sigma = torch.rand(B, N, K, generator=generator) + 0.5
-    phi = 0.4 * torch.randn(B, N, group.generators.shape[0], generator=generator)
-    log_prior = torch.zeros(N, N).masked_fill(torch.ones(N, N).triu(1).bool(), float("-inf"))
-    return group, mu, sigma, phi, log_prior
-
-
-@pytest.mark.parametrize("family", ["gaussian_diagonal", "gaussian_diagonal_exact"])
-@pytest.mark.parametrize("compact", [False, True])
-def test_filtering_phi_gradient_uses_only_receiver_rows(family: str, compact: bool) -> None:
-    group, mu, sigma, phi, log_prior = _phi_objective_inputs()
-
-    def gradient(detach: bool, mu_, sigma_, phi_) -> torch.Tensor:
-        leaf = phi_.clone().requires_grad_(True)
-        loss = phi_alignment_loss(mu_, sigma_, leaf, group, tau=1.0, log_prior=log_prior,
-                                  family=family, compact_phi_block_transport=compact,
-                                  detach_key_frames=detach)
-        return torch.autograd.grad(loss, leaf)[0]
-
-    mu2, sigma2, phi2 = mu.clone(), sigma.clone(), phi.clone()
-    mu2[:, -1] += 1.0
-    sigma2[:, -1] *= 2.0
-    phi2[:, -1] += 0.3
-    receiver = gradient(True, mu, sigma, phi)
-    receiver_future = gradient(True, mu2, sigma2, phi2)
-    assert torch.isfinite(receiver).all()
-    assert torch.equal(receiver[:, :-1], receiver_future[:, :-1])
-    # Without the detach, earlier frames see the later receiver row: the leak the fix removes.
-    full = gradient(False, mu, sigma, phi)
-    full_future = gradient(False, mu2, sigma2, phi2)
-    assert (full[:, :-1] - full_future[:, :-1]).abs().max() > 1e-4
-    # The objective VALUE is unchanged by the detach.
-    kwargs = dict(tau=1.0, log_prior=log_prior, family=family, compact_phi_block_transport=compact)
-    assert torch.allclose(phi_alignment_loss(mu, sigma, phi, group, detach_key_frames=True, **kwargs),
-                          phi_alignment_loss(mu, sigma, phi, group, **kwargs), rtol=1e-6, atol=1e-6)
-
-
 # -- #7: the E-step phi retraction bounds the step, not the base point ---------------------------
 
-@pytest.mark.parametrize("group_name, mode, compact", [
-    ("glk", "euclidean", False), ("glk", "bch", False), ("block_glk", "bch", True)])
-def test_retract_phi_zero_step_returns_an_exterior_frame(group_name: str, mode: str,
+@pytest.mark.parametrize("n_heads, mode, compact", [
+    (1, "euclidean", False), (1, "bch", False), (2, "bch", True)])
+def test_retract_phi_zero_step_returns_an_exterior_frame(n_heads: int, mode: str,
                                                           compact: bool) -> None:
-    group = (get_group(group_name)(4, 2, dtype=torch.float64) if group_name == "block_glk"
-             else get_group(group_name)(3, dtype=torch.float64))
+    group = get_group("block_glk")(3 if n_heads == 1 else 4, n_heads, dtype=torch.float64)
     torch.manual_seed(0)
     phi = torch.randn(3, group.generators.shape[0], dtype=torch.float64)
     phi = 8.0 * phi / phi.norm(dim=-1, keepdim=True)              # outside the default cap of 5
@@ -215,7 +174,7 @@ def test_retract_phi_zero_step_returns_an_exterior_frame(group_name: str, mode: 
 
 
 def test_retract_phi_keeps_identity_differential_inside_and_bounds_outward_steps() -> None:
-    group = get_group("glk")(3, dtype=torch.float64)
+    group = get_group("block_glk")(3, 1, dtype=torch.float64)
     torch.manual_seed(1)
     inside = torch.randn(2, 9, dtype=torch.float64)
     inside = 1.5 * inside / inside.norm(dim=-1, keepdim=True)
@@ -237,17 +196,17 @@ def test_retract_phi_keeps_identity_differential_inside_and_bounds_outward_steps
 # -- #10: pullback_group rejects ill-conditioned or chart-violating rows individually ------------
 
 def test_pullback_staging_rejects_only_the_ill_conditioned_row(monkeypatch) -> None:
-    group = get_group("glk")(K=2, dtype=torch.float64)
+    group = get_group("block_glk")(n_heads=1, K=2, dtype=torch.float64)
     bad = torch.tensor([5.0 / math.sqrt(2.0), 0.0, 0.0, -5.0 / math.sqrt(2.0)], dtype=torch.float64)
     good = torch.tensor([0.1, 0.05, -0.02, 0.03], dtype=torch.float64)
     phi = torch.stack((bad, good))
     grad = torch.ones_like(phi)
     with pytest.raises(ValueError, match="damped generalized condition"):
-        pullback_group_direction(grad, phi, group.generators, mode="pullback")
+        _pullback_single_block(grad, phi, group.generators)
 
     candidate = stage_pullback_group_candidate(
         grad, phi, group, learning_rate=1e-3, trust_radius=0.1, chart_max_norm=10.0,
-        bch_residual_max=1e-6, phi_precond_mode="pullback")
+        bch_residual_max=1e-6, phi_precond_mode="pullback_per_block")
     assert candidate.rejected_rows.tolist() == [True, False]
     assert torch.equal(candidate.candidate_phi[0], phi[0])
     assert not torch.equal(candidate.candidate_phi[1], phi[1])
@@ -256,7 +215,7 @@ def test_pullback_staging_rejects_only_the_ill_conditioned_row(monkeypatch) -> N
     optimizer = GaugeManifoldAdamW(
         [{"params": [param], "lr": 1e-3, "pullback_group": True, "weight_decay": 0.0}], group,
         phi_group_trust_radius=0.1, phi_chart_max_norm=10.0, phi_bch_residual_max=1e-6,
-        phi_precond_mode="pullback", weight_decay=0.0)
+        phi_precond_mode="pullback_per_block", weight_decay=0.0)
     param.grad = grad.clone()
     optimizer._collect_gauge_diag = True
     optimizer.step()
@@ -270,7 +229,7 @@ def test_pullback_staging_backtracks_or_rejects_chart_bound_rows_per_row(monkeyp
     import vfe3.gauge_optim as gauge_optim
     from vfe3.geometry.phi_preconditioner import PullbackGroupDirectionResult
 
-    group = get_group("glk")(K=2, dtype=torch.float64)
+    group = get_group("block_glk")(n_heads=1, K=2, dtype=torch.float64)
     phi = torch.tensor([[0.99, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]], dtype=torch.float64)
     xi = torch.tensor([[-0.2, 0.0, 0.0, 0.0]] * 2, dtype=torch.float64)
     ones, zeros = torch.ones(2, dtype=torch.float64), torch.zeros(2, dtype=torch.float64)
@@ -281,7 +240,7 @@ def test_pullback_staging_backtracks_or_rejects_chart_bound_rows_per_row(monkeyp
                                      scaled_solve_residual=zeros, series_order=40)))
     candidate = stage_pullback_group_candidate(
         -torch.ones_like(phi), phi, group, learning_rate=1.0, trust_radius=1.0,
-        chart_max_norm=1.0, bch_residual_max=1e-6, phi_precond_mode="pullback")
+        chart_max_norm=1.0, bch_residual_max=1e-6, phi_precond_mode="pullback_per_block")
     # Row 0 starts inside: 0.99 + 0.2 / 2^5 = 0.99625 is the first backtrack inside the chart.
     assert candidate.backtracking_reductions[0].item() == 5
     assert candidate.candidate_phi[0, 0].item() == pytest.approx(0.99625)
@@ -293,14 +252,14 @@ def test_pullback_staging_backtracks_or_rejects_chart_bound_rows_per_row(monkeyp
 
 
 def test_pullback_staging_still_raises_on_nonfinite_state() -> None:
-    group = get_group("glk")(K=2, dtype=torch.float64)
+    group = get_group("block_glk")(n_heads=1, K=2, dtype=torch.float64)
     phi = torch.zeros(2, 4, dtype=torch.float64)
     grad = torch.ones_like(phi)
     grad[0, 0] = float("nan")
     with pytest.raises(FloatingPointError, match="nonfinite grad or chart"):
         stage_pullback_group_candidate(
             grad, phi, group, learning_rate=1e-3, trust_radius=0.1, chart_max_norm=10.0,
-            bch_residual_max=1e-6, phi_precond_mode="pullback")
+            bch_residual_max=1e-6, phi_precond_mode="pullback_per_block")
 
 
 # -- #11: the E-step chart direction uses the exact exponential differential ---------------------
@@ -312,7 +271,7 @@ def _psi(z: torch.Tensor) -> torch.Tensor:
 
 
 def test_bch_chart_direction_is_exact_at_the_spurious_b4_root() -> None:
-    group = get_group("glk")(2)
+    group = get_group("block_glk")(2, 1)
     G = group.generators.double()
     a = 3.879 / 2.0                                               # ad eigenvalues 0, +-3.879
     phi = extract_phi(torch.diag(torch.tensor([a, -a], dtype=torch.float64)), G)
@@ -330,7 +289,7 @@ def test_bch_chart_direction_is_exact_at_the_spurious_b4_root() -> None:
 
 def test_bch_chart_direction_matches_the_exact_group_product_velocity() -> None:
     scipy_linalg = pytest.importorskip("scipy.linalg")
-    group = get_group("glk")(3)
+    group = get_group("block_glk")(3, 1)
     G = group.generators.double()
     generator = torch.Generator().manual_seed(3)
     phi = 0.8 * torch.randn(9, generator=generator, dtype=torch.float64)
@@ -356,73 +315,9 @@ def test_bch_chart_direction_per_block_matches_full_on_block_glk() -> None:
     assert torch.allclose(per_block, full, atol=1e-10)
 
 
-# -- #21: gaussian_diagonal_exact under means-only RoPE is the coherent exact KL -----------------
-
-def _dense_kl(mu_q, sigma_q, mu_p, sigma_p) -> torch.Tensor:
-    precision = torch.linalg.inv(sigma_p)
-    delta = (mu_p - mu_q).unsqueeze(-1)
-    return 0.5 * (torch.trace(precision @ sigma_q) + (delta.T @ precision @ delta).squeeze()
-                  - mu_q.shape[-1] + torch.logdet(sigma_p) - torch.logdet(sigma_q))
-
-
-@pytest.mark.parametrize("representation", ["factored", "compact"])
-def test_exact_family_under_rope_equals_the_dense_rotated_pushforward_kl(
-        representation: str) -> None:
-    torch.manual_seed(0)
-    n, n_blocks, d = 4, 2, 2
-    K = n_blocks * d
-    blocks = torch.linalg.matrix_exp(0.5 * torch.randn(n, n_blocks, d, d, dtype=torch.float64))
-    inv_blocks = torch.linalg.inv(blocks)
-    U, U_inv = _from_equal_diag_blocks(blocks, K), _from_equal_diag_blocks(inv_blocks, K)
-    base = (FactoredTransport(exp_phi=U, exp_neg_phi=U_inv, irrep_dims=[d] * n_blocks,
-                              same_frame_flat_cocycle=True)
-            if representation == "factored"
-            else CompactFactoredTransport(blocks, inv_blocks, K, same_frame_flat_cocycle=True))
-    rope = build_rope_rotation(torch.arange(n), [d] * n_blocks, base=3.0, dtype=torch.float64)
-    omega = RopeTransport(base=base, rope=rope, on_cov=False, insertion="right",
-                          same_frame_flat_cocycle=True)
-    mu = torch.randn(n, K, dtype=torch.float64)
-    sigma = torch.rand(n, K, dtype=torch.float64) + 0.4
-    energy = ExactCongruenceDiagonalGaussian.coupling_energy(
-        mu, sigma, mu, sigma, omega, kl_max=1e9, eps=1e-12, irrep_dims=[d] * n_blocks)
-    V = U @ rope.transpose(-1, -2)                                # folded frame V_i = U_i R_i^T
-    dense = torch.einsum("ikl,jlm->ijkm", V, torch.linalg.inv(V))
-    worst = 0.0
-    for h in range(n_blocks):
-        block = slice(h * d, (h + 1) * d)
-        for i in range(n):
-            for j in range(n):
-                link = dense[i, j][block, block]
-                reference = _dense_kl(mu[i][block], torch.diag(sigma[i][block]),
-                                      link @ mu[j][block],
-                                      link @ torch.diag(sigma[j][block]) @ link.T)
-                worst = max(worst, abs(energy[h, i, j].item() - reference.item()))
-    assert worst <= 1e-10
-
-
-def test_exact_family_left_rope_fails_closed_and_split_frames_use_the_dense_route() -> None:
-    torch.manual_seed(1)
-    n, K = 3, 4
-    U = torch.linalg.matrix_exp(0.3 * torch.randn(n, K, K, dtype=torch.float64))
-    base = FactoredTransport(exp_phi=U, exp_neg_phi=torch.linalg.inv(U), irrep_dims=[K],
-                             same_frame_flat_cocycle=True)
-    rope = build_rope_rotation(torch.arange(n), [K], dtype=torch.float64)
-    mu = torch.randn(n, K, dtype=torch.float64)
-    sigma = torch.rand(n, K, dtype=torch.float64) + 0.4
-    left = RopeTransport(base=base, rope=rope, insertion="left", same_frame_flat_cocycle=True)
-    with pytest.raises(TypeError, match="left-insertion"):
-        ExactCongruenceDiagonalGaussian.coupling_energy(mu, sigma, mu, sigma, left)
-    split = FactoredTransport(exp_phi=U, exp_neg_phi=torch.linalg.inv(U).flip(0), irrep_dims=[K],
-                              same_frame_flat_cocycle=False)
-    energy = ExactCongruenceDiagonalGaussian.coupling_energy(mu, sigma, mu, sigma, split)
-    dense = ExactCongruenceDiagonalGaussian.coupling_energy(mu, sigma, mu, sigma,
-                                                            split.to_dense_omega())
-    assert torch.equal(energy, dense)
-
-
 # -- #27: sigma_max annotations match VFE3Config ------------------------------------------------
 
-@pytest.mark.parametrize("function", [e_step_iteration, free_energy_value])
+@pytest.mark.parametrize("function", [e_step_iteration])
 def test_sigma_max_annotation_matches_config(function) -> None:
     parameter = inspect.signature(function).parameters["sigma_max"]
     assert parameter.annotation == Optional[float]
@@ -538,7 +433,7 @@ def test_estep_capture_publishes_the_recovery_count(monkeypatch) -> None:
 
     cfg = test_config(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
                      n_e_steps=1, family="gaussian_diagonal", gauge_group="block_glk",
-                     skip_belief_sigma_update=True, e_phi_lr=0.0, oracle_unroll_grad=True,
+                     skip_belief_sigma_update=True,
                      warmup_steps=0, max_steps=2, log_interval=0, eval_interval=0,
                      pos_phi="learned", use_head_mixer=True, use_block_mlp=True,
                      block_mlp_expansion=1, attention_mode="projected_gradient")

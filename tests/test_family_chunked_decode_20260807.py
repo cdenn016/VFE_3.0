@@ -103,7 +103,7 @@ def widths_ok(widths, V, chunk):
 
 def test_chunked_logits_match_the_dense_family_kernel():
     r"""The functional is elementwise over the vocabulary axis, so slicing must be exact."""
-    model_d, pb_d = _bank(decode_mode="family")
+    model_d, pb_d = _bank(decode_mode="family_chunked")
     model_c, pb_c = _bank(decode_mode="family_chunked", decode_chunk_size=3)
     pb_c.load_state_dict(pb_d.state_dict())
 
@@ -112,10 +112,12 @@ def test_chunked_logits_match_the_dense_family_kernel():
 
 
 def test_unchunked_family_still_makes_a_single_call(spy):
-    r"""decode_mode='family' must not acquire a loop as a side effect of the shared body."""
-    model, pb = _bank(decode_mode="family", decode_chunk_size=3)
+    r"""The dense ``_decode_family`` oracle must not acquire a loop as a side effect of the shared body."""
+    from vfe3.model.prior_bank import _decode_family
+
+    model, pb = _bank(decode_mode="family_chunked", decode_chunk_size=3)
     mu, sigma, _ = _inputs(model)
-    pb.decode(mu, sigma)
+    _decode_family(pb, mu, sigma, pb._tau_eff())
     assert len(spy) == 1 and spy[0] == pb.vocab_size
 
 

@@ -22,7 +22,7 @@ def _model() -> VFEModel:
     return VFEModel(test_config(
         vocab_size=7, embed_dim=4, n_heads=2, batch_size=1, max_seq_len=4,
         n_layers=1, n_e_steps=1, family="gaussian_diagonal", gauge_group="block_glk",
-        skip_belief_sigma_update=True, e_phi_lr=0.0, oracle_unroll_grad=True,
+        skip_belief_sigma_update=True,
         pos_phi="learned", use_head_mixer=True, use_block_mlp=True, block_mlp_expansion=1,
         attention_mode="projected_predictive",
 
@@ -55,7 +55,7 @@ def test_predictive_mechanism_probes_use_configured_forward() -> None:
     character = collect_estep_character(model, tokens, depths=[1, 2, 4])
     assert character["available"] is True
     assert [p["belief_depth"] for p in character["points"]] == [1]
-    assert character["points"][0]["pair_precision_share"] is None
+    assert "pair_precision_share" not in character["points"][0]
     context = collect_context_sensitivity(model, tokens, n_replicates=2)
     assert context["available"] is True
     assert context["stages"]["raw_prior"] == 0.0
@@ -87,7 +87,8 @@ def test_predictive_report_emits_state_figures_and_finite_readout_panels(tmp_pat
     assert names.isdisjoint({"iterate_trajectory.png", "belief_trajectories.png",
                              "belief_spectrum.png", "spd_ellipses.png",
                              "gauge_head_specialization.png", "holonomy_curvature.png"})
-    assert "gauge_equivariance.png" not in names
+    # The gauge-equivariance figure measures the executed projected score and readout.
+    assert "gauge_equivariance.png" in names
     fig = figures.plot_per_layer_diagnostics(model.diagnostics_per_layer(tokens))
     assert all(any(torch.isfinite(torch.as_tensor(line.get_ydata())).any() for line in ax.lines)
                for ax in fig.axes)
@@ -110,7 +111,7 @@ def test_report_draws_sigma_max_only_where_it_bounds_the_belief(
     model = VFEModel(test_config(
         vocab_size=7, embed_dim=4, n_heads=2, batch_size=1, max_seq_len=4,
         n_layers=2, family="gaussian_diagonal", gauge_group="block_glk",
-        e_phi_lr=0.0, pos_phi="learned", use_block_mlp=True, block_mlp_expansion=1,
+        pos_phi="learned", use_block_mlp=True, block_mlp_expansion=1,
         sigma_init=15.0, sigma_max=2.0, **route,
     )).eval()
     assert ("sigma_max" not in model.cfg.inactive_fields()) is ceiling_binds

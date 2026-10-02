@@ -39,7 +39,7 @@ from vfe3.train import _eval_protocol_train_ce, build_optimizer, train
 
 def _tiny(**overrides: object) -> VFE3Config:
     base = dict(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                n_e_steps=1, e_q_mu_lr=0.1, e_phi_lr=0.0, m_phi_lr=0.0,
+                n_e_steps=1, e_q_mu_lr=0.1, m_phi_lr=0.0,
                 warmup_steps=1, max_steps=4)
     base.update(overrides)
     return test_config(**base)
@@ -234,8 +234,7 @@ def _self_divergence(model: VFEModel, q, prior) -> float:
     return float(self_divergence_for_alpha(
         model._family_instance(fam, q.mu, q.sigma),
         model._family_instance(fam, mu_p, sigma_p),
-        alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
-        divergence_family=cfg.divergence_family, lambda_alpha_mode=cfg.lambda_alpha_mode,
+        kl_max=cfg.kl_max, eps=cfg.eps, lambda_alpha_mode=cfg.lambda_alpha_mode,
     ).sum())
 
 

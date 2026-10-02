@@ -68,7 +68,7 @@ def main() -> None:
     # that profile, so mutable experiment settings cannot change the fingerprint.
     cfg = test_config(
         vocab_size=9, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=2, n_e_steps=2,
-        family="gaussian_diagonal", transport_mode="flat", attention_mode="projected_gradient",
+        family="gaussian_diagonal", attention_mode="projected_gradient",
         predictive_covariance="passthrough", attention_residual=False,
 
         use_block_mlp=False, use_head_mixer=False, use_cg_coupling=False,

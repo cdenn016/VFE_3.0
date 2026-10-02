@@ -12,7 +12,7 @@ from vfe3.viz.extract import (
 
 def _model(n_layers=2, **over):
     cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=n_layers,
-                     n_e_steps=2, e_q_mu_lr=0.1, e_phi_lr=0.0, **over)
+                     n_e_steps=2, e_q_mu_lr=0.1, **over)
     torch.manual_seed(0)
     return VFEModel(cfg)
 

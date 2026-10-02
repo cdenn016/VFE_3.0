@@ -196,25 +196,6 @@ def test_mu_precond_figure_aggregates_seeds(monkeypatch, tmp_path):
     assert abs(by[("raw", 2)]["ppl"] - 41.0) < 1e-9
 
 
-def test_attention_entropy_figure_aggregates_seeds(monkeypatch, tmp_path):
-    # M4(c): the seed cells sharing (include_attention_entropy, kappa) must collapse to one cell at the
-    # mean PPL, not be passed as N per-seed cells (the figure would then plot one arbitrary seed).
-    rows = [
-        {"label": f"ent{e}__s{s}", "primary_val_ppl": str(p), "cov_gap": "inf",
-         "overrides": {"include_attention_entropy": e, "kappa_beta": 1.0}}
-        for (e, base) in ((True, 10.0), (False, 14.0)) for (s, p) in ((6, base), (7, base + 2.0))
-    ]
-    monkeypatch.setattr(ablation, "_collect_sweep_results", lambda d: rows)
-    cap = _capture_ablation_figure(monkeypatch, "plot_entropy_ppl_gap")
-    ablation._plot_attention_entropy(tmp_path, tmp_path)
-    assert "cells" in cap
-    assert len(cap["cells"]) == 2                           # one per include_attention_entropy at kappa=1
-    by = {bool(c["include_attention_entropy"]): c for c in cap["cells"]}
-    assert set(by) == {True, False}
-    assert abs(by[True]["ppl"] - 11.0) < 1e-9              # (10 + 12) / 2
-    assert abs(by[False]["ppl"] - 15.0) < 1e-9            # (14 + 16) / 2
-
-
 def test_offset_power_law_honors_weights():
     # m29: the with_offset (Chinchilla) fit must honor the WLS weights callers pass, not silently
     # run unweighted OLS. Down-weighting a corrupted point must move the fitted exponent.
@@ -307,17 +288,16 @@ def test_cost_model_declares_projected_estep_flops_unavailable():
 def _pure_ns(**over):
     r"""SimpleNamespace with every attribute _pure_path_report reads, at the pure values."""
     base = dict(
-        include_attention_entropy=True, transport_mode="flat", lambda_alpha_mode="constant",
+        lambda_alpha_mode="constant",
         decode_mode="diagonal_chunked", decode_coordinates="reference", use_head_mixer=False,
         use_priorbank_head_evidence_mixer=False, encode_mode="per_token",
         lambda_beta=1.0,
-        gauge_transport="on", pos_rotation="none", rope_full_gauge=False, rope_on_value=True,
+        gauge_transport="on", pos_rotation="none", rope_on_value=True,
         skip_belief_sigma_update=False,
         gauge_group="block_glk", family="gaussian_full",
-        gradient_mode="filtering", attention_mode="projected_gradient",
+        attention_mode="projected_gradient",
         relational_mode="projected_filtering", relational_readout_mode="full_link_update",
         embed_dim=4, n_heads=2, d_head=2,
-        e_step_update="gradient", mm_damping=1.0,
         use_block_mlp=False, block_mlp_mode="coordinate", block_mlp_covariance="passthrough",
         block_mlp_expansion=4, block_mlp_covariance_floor=1e-4,
         block_mlp_activation="gelu", block_mlp_dropout=0.0,
@@ -327,7 +307,6 @@ def _pure_ns(**over):
         norm_type_block="none", norm_type_final="none", layernorm_affine=False,
         m_phi_update_mode="adamw", m_phi_group_trust_radius=0.1,
         phi_mstep_max_matrix_norm=None, transport_chart_max_norm=12.0,
-        e_phi_lr=0.0,
         beta_attention_prior="causal")
     base = {**config_values(), **base}
     base.update(over)
@@ -402,7 +381,7 @@ def test_gauge_purity_axis_is_independent_of_fe_axis():
     assert rep2["on_pure_path"] is False
     assert rep2["gauge_flags"]["positional_rotation_gauge_covariant"] is True
     # the gauge settings are surfaced in config_toggles for transparency
-    for key in ("gauge_transport", "pos_rotation", "rope_full_gauge", "rope_on_value"):
+    for key in ("gauge_transport", "pos_rotation", "rope_on_value"):
         assert key in rep["config_toggles"]
 
 
@@ -429,9 +408,9 @@ def _finalize_ns(**over):
         seed=0, max_steps=2, decode_mode="full_chunked", decode_bias=False,
         use_head_mixer=False,
         min_lr=0.0, min_lr_frac=0.0,
-        include_attention_entropy=True, transport_mode="flat", lambda_alpha_mode="constant",
+        lambda_alpha_mode="constant",
         lambda_beta=1.0,
-        gauge_transport="on", pos_rotation="none", rope_full_gauge=False, rope_on_value=True,
+        gauge_transport="on", pos_rotation="none", rope_on_value=True,
         skip_belief_sigma_update=False,
         embed_dim=4, n_heads=2, n_layers=1, n_e_steps=1, diagonal_covariance=True,
         gauge_group="block_glk", family="gaussian_full",
@@ -1147,7 +1126,7 @@ def test_ablation_renderer_dispatches_registered_figures_by_name_and_keeps_legac
 
     monkeypatch.setattr(ablation, "BASELINE_CONFIG", config_values(
         max_seq_len=8, use_head_mixer=True, attention_mode="projected_predictive",
-        family="gaussian_full", decode_mode="full_chunked", e_phi_lr=0.0,
+        family="gaussian_full", decode_mode="full_chunked",
         max_steps=2, warmup_steps=1))
     monkeypatch.setattr(ablation, "SWEEPS", {"component_ablation_forest": {
         "description": "paired-token component ablation forest",

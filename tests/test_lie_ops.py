@@ -2,7 +2,7 @@ import math
 
 import torch
 
-from vfe3.geometry.generators import generate_glk, generate_son
+from vfe3.geometry.generators import generate_glk_multihead, generate_son
 from vfe3.geometry.lie_ops import (
     embed_phi,
     extract_phi,
@@ -12,16 +12,18 @@ from vfe3.geometry.lie_ops import (
 
 def test_embed_extract_roundtrip_independent_basis():
     # gl(2) elementary basis is orthonormal under Frobenius -> extract(embed(c)) == c.
-    G = generate_glk(2)                                   # (4, 2, 2)
+    G = generate_glk_multihead(2, 1)                                   # (4, 2, 2)
     c = torch.randn(3, 4)
     out = extract_phi(embed_phi(c, G), G)
     assert torch.allclose(out, c, atol=1e-6)
 
 
 def test_embed_extract_projection_overcomplete():
-    # sl(K) spanning set (include_identity=False) is OVERCOMPLETE (rank K^2-1):
+    # The trace-projected gl(K) spanning set for sl(K) is OVERCOMPLETE (rank K^2-1):
     # extract(embed(c)) need NOT equal c, but embed o extract o embed == embed.
-    G = generate_glk(3, include_identity=False)           # (<=9, 3, 3), rank 8
+    G = generate_glk_multihead(3, 1)                      # gl(3) elementary basis (9, 3, 3)
+    trace_dir = torch.eye(3) / math.sqrt(3)
+    G = G - torch.einsum("aij,ij->a", G, trace_dir)[:, None, None] * trace_dir   # sl(3) set, rank 8
     c = torch.randn(2, G.shape[0])
     M = embed_phi(c, G)
     M2 = embed_phi(extract_phi(M, G), G)
@@ -45,14 +47,14 @@ from vfe3.geometry.lie_ops import compose_phi, get_compose
 
 
 def test_compose_euclidean_is_sum():
-    G = generate_glk(2)
+    G = generate_glk_multihead(2, 1)
     a, b = torch.randn(4), torch.randn(4)
     assert torch.allclose(compose_phi(a, b, G, mode="euclidean"), a + b, atol=1e-6)
 
 
 def test_bch_commuting_is_exact():
     # Two diagonal gl(3) elements commute -> BCH == euclidean sum exactly.
-    G = generate_glk(3)
+    G = generate_glk_multihead(3, 1)
     a = torch.zeros(9); a[0] = 0.7          # E00 direction
     b = torch.zeros(9); b[8] = -0.4         # E22 direction
     z = compose_phi(a, b, G, mode="bch", order=4)

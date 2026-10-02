@@ -113,14 +113,11 @@ SINGLE_ATTENTION_config_K100 = dict(
     learned_beta_prior_residual  = False,     # learned bounded B_ij from fixed pair-energy features
     
     #################################
-    # f-divergence and e/m family
+    # belief family
     #################################
 
-    divergence_family         = "renyi",   # "renyi", "squared_hellinger","bhattacharyya", "jeffreys",
-    renyi_order               = 1.0,       # Renyi order (1.0 -> KL)
 
-    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full" | "laplace_diagonal" | "gaussian_frame_diagonal"
-                                                     # | "gaussian_diagonal_exact" (single covariance toggle; diagonal_covariance is derived)
+    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full"
 
     
 
@@ -140,7 +137,7 @@ SINGLE_ATTENTION_config_K100 = dict(
                                               
         
     decode_bias                       = True,     # only if use_prior_bank = False
-    use_head_mixer                    = True,      # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
+    use_head_mixer                    = True,      # opt-in Schur-commutant head mixer (needs >=2 blocks: block_glk heads OR an so_n irrep tower with per-isotypic-component mixing);
     use_priorbank_head_evidence_mixer = False,
                                          
     
@@ -197,25 +194,22 @@ SINGLE_ATTENTION_config_K100 = dict(
     spd_retract_mode          = "spd_affine",         # SPD covariance retraction (registry: "spd_affine" | "log_euclidean")
 
 
-    gauge_group               = "block_glk",    # "glk" | "block_glk" | "tied_block_glk" | "so_k" | "sp" | "so_n" | "sp_n"
+    gauge_group               = "block_glk",    # "block_glk" | "so_n" (so_n awaits reconnection to the projected routes)
 
-    group_n                   = None,                # so_n/sp_n only; must stay None for every other group
-    irrep_spec                = None,                # so_n/sp_n only; must stay None for every other group
+    group_n                   = None,                # so_n only; must stay None for block_glk
+    irrep_spec                = None,                # so_n only; must stay None for block_glk
 
-    use_cg_coupling           = False,               # so_n/sp_n only: CG cross-type coupling
+    use_cg_coupling           = False,               # so_n only: CG cross-type coupling
     cg_covariance_mode        = "passthrough",       # "passthrough" (means-only, pure) | "delta_full"
     cg_energy_weight          = 0.0,                 # CG moment-energy regularizer (0.0 = OFF)
 
     ####################################
     # Non-Flat Connection - Regime II
     ####################################
-    transport_mode            = "flat",     # "flat" | "regime_ii" | "regime_ii_covariant"
-                                            # | "regime_ii_link" | "regime_ii_link_charted"
 
     cocycle_relaxation        = 1.0,        # regime_ii homotopy: 0.0 -> flat, 1.0 -> fully relaxed (ignored by flat)
     link_alpha                = 1.0,        # regime_ii_link only
     link_soft_cap             = 6.0,        # regime_ii_link only
-    cross_couplings           = None,       # off-block GL(K) head pairs e.g. [(0, 1)]; block_glk only
     close_basis               = False,
    
     ####################################
@@ -231,7 +225,6 @@ SINGLE_ATTENTION_config_K100 = dict(
 
     rope_base                 = 100.0,               # rotary frequency base
     rope_insertion            = "right",             # "right" (PURE) | "left" (LEGACY)
-    rope_full_gauge           = False,               # rotate the covariance sandwich too (REQUIRES family="gaussian_full")
     rope_on_value             = False,
 
     ######################################
@@ -286,7 +279,6 @@ SINGLE_ATTENTION_config_K100 = dict(
     alibi_slope                  = 1,
     attention_window             = 128,
     
-    include_attention_entropy    = True,
 
     t5_num_buckets               = 32,
     t5_max_distance              = 128,
@@ -305,7 +297,6 @@ SINGLE_ATTENTION_config_K100 = dict(
     e_q_mu_lr                 = 1,
     e_q_sigma_lr              = 0.001,
     
-    e_phi_lr                  = 0.00,
 
    
     ####################################
@@ -363,7 +354,6 @@ SINGLE_ATTENTION_config_K100 = dict(
 
     e_mu_q_trust               = 2,
     e_sigma_q_trust            = 1.0,
-    mu_trust_mode              = "ball",
     sigma_max                  = 100.0,
 
     #################################
@@ -384,9 +374,6 @@ SINGLE_ATTENTION_config_K100 = dict(
 
 
     # --- E-step update rule ---
-    e_step_update              = "gradient",  # "gradient" (pure current path) | "mm_exact" (closed-form MM
-                                             # coordinate minimizer at frozen beta)
-    mm_damping                 = 1,        # mm_exact damping eta in (0,1]; 1.0 = exact minimizer
 
     # --- randomized-depth E-step (recurrent-depth recipe) ---
     randomize_e_steps          = False,       # training forwards sample T ~ Uniform{e_steps_min..e_steps_max}
@@ -434,14 +421,9 @@ SINGLE_ATTENTION_config_K100 = dict(
                                                 # winner recomputes the complete (B,N,V) decode in
                                                 # differentiable fp64 (~3.1 GiB logits here).
                                               
-     congruence_cond_escalation           = False,                                
      
-     full_cov_congruence_certification    = True,  # False: no per-pair Cholesky certificate or
-                                                 # whole-field fp64 retry. True: strict M13 audit
-                                                 # over ~1.05M 20x20 matrices per call at B64/N128.
 
      full_cov_kl_precision                = "fp32_escalate",  # "fp64" | "fp32_escalate"
-     full_cov_congruence_precision        = "fp32_escalate",  #  "fp64" | "fp32_escalate"
 
      safe_cholesky_jitter_mode            = "relative",  #"absolute" | "relative"
      mu_trust_cholesky_rounds             = 3,           
@@ -486,14 +468,11 @@ SINGLE_ATTN_CONFIG_k20 = dict(
     
        
     #################################
-    # f-divergence and e/m family
+    # belief family
     #################################
 
-    divergence_family         = "renyi",   # "renyi", "squared_hellinger","bhattacharyya", "jeffreys",
-    renyi_order               = 1.0,       # Renyi order (1.0 -> KL)
 
-    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full" | "laplace_diagonal" | "gaussian_frame_diagonal"
-                                                     # | "gaussian_diagonal_exact" (single covariance toggle; diagonal_covariance is derived)
+    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full"
 
     
     #################################
@@ -509,7 +488,7 @@ SINGLE_ATTN_CONFIG_k20 = dict(
     #        Encode/Decode          #
     #################################
     decode_bias                       = True,     # only for decode_mode='linear'
-    use_head_mixer                    = True,      # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
+    use_head_mixer                    = True,      # opt-in Schur-commutant head mixer (needs >=2 blocks: block_glk heads OR an so_n irrep tower with per-isotypic-component mixing);
     use_priorbank_head_evidence_mixer = False,
                                          
     
@@ -572,12 +551,12 @@ SINGLE_ATTN_CONFIG_k20 = dict(
     phi_retract_mode          = "bch", # "euclidean" | "bch"
     pos_phi_project_slk       = False,      # per-block trace projection (det Omega = 1)
     
-    gauge_group               = "block_glk",    # "glk" | "block_glk" | "tied_block_glk" | "so_k" | "sp" | "so_n" | "sp_n"
+    gauge_group               = "block_glk",    # "block_glk" | "so_n" (so_n awaits reconnection to the projected routes)
 
-    group_n                   = None,                # so_n/sp_n only; must stay None for every other group
-    irrep_spec                = None,                # so_n/sp_n only; must stay None for every other group
+    group_n                   = None,                # so_n only; must stay None for block_glk
+    irrep_spec                = None,                # so_n only; must stay None for block_glk
 
-    use_cg_coupling           = False,               # so_n/sp_n only: CG cross-type coupling
+    use_cg_coupling           = False,               # so_n only: CG cross-type coupling
     cg_covariance_mode        = "passthrough",       # "passthrough" (means-only, pure) | "delta_full"
     cg_energy_weight          = 0.0,                 # CG moment-energy regularizer (0.0 = OFF)
 
@@ -586,13 +565,10 @@ SINGLE_ATTN_CONFIG_k20 = dict(
     # Non-Flat Connection - Regime II
     ####################################
    
-    transport_mode            = "flat",     # "flat" | "regime_ii" | "regime_ii_covariant"
-                                            # | "regime_ii_link" | "regime_ii_link_charted"
 
     cocycle_relaxation        = 1.0,        # regime_ii homotopy: 0.0 -> flat, 1.0 -> fully relaxed (ignored by flat)
     link_alpha                = 1.0,        # regime_ii_link only
     link_soft_cap             = 6.0,        # regime_ii_link only
-    cross_couplings           = None,       # off-block GL(K) head pairs e.g. [(0, 1)]; block_glk only
    
     
     ####################################
@@ -606,7 +582,6 @@ SINGLE_ATTN_CONFIG_k20 = dict(
    
     rope_base                 = 100.0,               # rotary frequency base
         
-    rope_full_gauge           = False,               # rotate the covariance sandwich too (REQUIRES family="gaussian_full")
     rope_on_value             = False,
 
 
@@ -666,16 +641,11 @@ SINGLE_ATTN_CONFIG_k20 = dict(
     #         Belief E-step
     #         Learning Rates
     #################################
-    e_step_update             = "gradient",  # "gradient" (pure current path) | "mm_exact" (closed-form MM
-                                            # coordinate minimizer at frozen beta)
-    e_step_mu_precond         = "fisher",  
-    mm_damping                = 1,           # mm_exact damping eta in (0,1]; 1.0 = exact minimizer
     
     
     e_q_mu_lr                 = 1,
     e_q_sigma_lr              = 0.01,
     
-    e_phi_lr                  = 0.00,
 
    
     ####################################
@@ -754,7 +724,6 @@ SINGLE_ATTN_CONFIG_k20 = dict(
     sigma_max                            = 100.0,
     e_mu_q_trust                         = 2,
     e_sigma_q_trust                      = 1.0,
-    mu_trust_mode                        = "ball",
    
    
     amp_dtype                            = 'bf16',        # None=fp32 | 'bf16' , 'fp16'. Sigma must be at least fp32
@@ -767,9 +736,7 @@ SINGLE_ATTN_CONFIG_k20 = dict(
     exp_fp64_norm_threshold              = 20.0,          # "norm" mode threshold
     transport_chart_max_norm             = 20,
 
-    full_cov_kl_backend                  = "common_frame",   # "pairwise" | "common_frame"
     full_cov_kl_precision                = "fp32_escalate",  # "fp64" | "fp32_escalate"
-    full_cov_congruence_precision        = "fp32_escalate",  #  "fp64" | "fp32_escalate"
 
     safe_cholesky_jitter_mode            = "relative",        #"absolute" | "relative"
     mu_trust_cholesky_rounds             = 3,           
@@ -795,24 +762,8 @@ SINGLE_ATTN_CONFIG_k20 = dict(
     # opt-in so the default chunked route remains streamed and bounded.
     decode_ranking_fp64_escalation       = False,             
      
-    # DEFAULT guard is sign-only: recompute in float64 iff the working-dtype congruence went
-    # negative -- one amin reduction the floor needs regardless. Positivity is necessary but not
-    # sufficient (cancellation destroys accuracy before it destroys sign), so this toggle adds the
-    # conditioning proxy cond(exp_phi)^4 * eps > 1e-3, which bounds the quadratic form's backward
-    # error (Higham 2002, 3.1). It is OPT-IN because it is not free: it runs svdvals on the vertex
-    # blocks and then a bool() on the result, i.e. an SVD launch plus a GPU->CPU sync, on the
-    # HEALTHY path of every covariance transport.                                         
-    congruence_cond_escalation           = False, #at K=80 4 heads ~  2x slower                        
      
      
-    # Strict post-congruence certificate (audit remediation M13). When enabled, factor every
-    # transported pair covariance and promote the complete pair field to float64 if any matrix is
-    # uncertified. At B=64, N=128, K=20 this checks 1,048,576 separate 20x20 matrices and the
-    # promoted field is about 3.1 GiB. Keep this opt-in for accuracy investigations; False retains
-    # the selected working precision without the additional certificate or fallback recompute.
-    full_cov_congruence_certification    = False,  # False: no per-pair Cholesky certificate or
-                                                 # whole-field fp64 retry. True: strict M13 audit
-                                                 # over ~1.05M 20x20 matrices per call at B64/N128.
                                                  
       
     skip_belief_sigma_update             = True,        # skip the belief-channel sigma E-step update
@@ -856,14 +807,11 @@ DIAGONAL_Dual_atten_config = dict(
     
     fp32_matmul_precision     = None,       # None (leave as-is) | "highest" | "high" | "medium"
     #################################
-    # f-divergence and e/m family
+    # belief family
     #################################
 
-    divergence_family         = "renyi",   # "renyi", "squared_hellinger","bhattacharyya", "jeffreys",
-    renyi_order               = 1.0,       # Renyi order (1.0 -> KL)
 
-    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full" | "laplace_diagonal" | "gaussian_frame_diagonal"
-                                                     # | "gaussian_diagonal_exact" (single covariance toggle; diagonal_covariance is derived)
+    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full"
 
     
 
@@ -883,7 +831,7 @@ DIAGONAL_Dual_atten_config = dict(
                                               
         
     decode_bias                       = True,     # only if use_prior_bank = False
-    use_head_mixer                    = True,      # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
+    use_head_mixer                    = True,      # opt-in Schur-commutant head mixer (needs >=2 blocks: block_glk heads OR an so_n irrep tower with per-isotypic-component mixing);
     use_priorbank_head_evidence_mixer = False,
                                          
     
@@ -929,25 +877,22 @@ DIAGONAL_Dual_atten_config = dict(
     spd_retract_mode          = "spd_affine",         # SPD covariance retraction (registry: "spd_affine" | "log_euclidean")
 
 
-    gauge_group               = "block_glk",    # "glk" | "block_glk" | "tied_block_glk" | "so_k" | "sp" | "so_n" | "sp_n"
+    gauge_group               = "block_glk",    # "block_glk" | "so_n" (so_n awaits reconnection to the projected routes)
 
-    group_n                   = None,                # so_n/sp_n only; must stay None for every other group
-    irrep_spec                = None,                # so_n/sp_n only; must stay None for every other group
+    group_n                   = None,                # so_n only; must stay None for block_glk
+    irrep_spec                = None,                # so_n only; must stay None for block_glk
 
-    use_cg_coupling           = False,               # so_n/sp_n only: CG cross-type coupling
+    use_cg_coupling           = False,               # so_n only: CG cross-type coupling
     cg_covariance_mode        = "passthrough",       # "passthrough" (means-only, pure) | "delta_full"
     cg_energy_weight          = 0.0,                 # CG moment-energy regularizer (0.0 = OFF)
 
     ####################################
     # Non-Flat Connection - Regime II
     ####################################
-    transport_mode            = "flat",     # "flat" | "regime_ii" | "regime_ii_covariant"
-                                            # | "regime_ii_link" | "regime_ii_link_charted"
 
     cocycle_relaxation        = 1.0,        # regime_ii homotopy: 0.0 -> flat, 1.0 -> fully relaxed (ignored by flat)
     link_alpha                = 1.0,        # regime_ii_link only
     link_soft_cap             = 6.0,        # regime_ii_link only
-    cross_couplings           = None,       # off-block GL(K) head pairs e.g. [(0, 1)]; block_glk only
     close_basis               = False,
    
     ####################################
@@ -963,7 +908,6 @@ DIAGONAL_Dual_atten_config = dict(
 
     rope_base                 = 100.0,               # rotary frequency base
     rope_insertion            = "right",             # "right" (PURE) | "left" (LEGACY)
-    rope_full_gauge           = False,               # rotate the covariance sandwich too (REQUIRES family="gaussian_full")
     rope_on_value             = False,
 
     ######################################
@@ -1016,7 +960,6 @@ DIAGONAL_Dual_atten_config = dict(
     alibi_slope                  = 1,
     attention_window             = 128,
     
-    include_attention_entropy    = True,
 
     t5_num_buckets               = 32,
     t5_max_distance              = 128,
@@ -1032,7 +975,6 @@ DIAGONAL_Dual_atten_config = dict(
     e_q_mu_lr                 = 1,
     e_q_sigma_lr              = 0.001,
     
-    e_phi_lr                  = 0.00,
 
    
     ####################################
@@ -1090,7 +1032,6 @@ DIAGONAL_Dual_atten_config = dict(
 
     e_mu_q_trust               = 1,
     e_sigma_q_trust            = 1.0,
-    mu_trust_mode              = "ball",
     sigma_max                  = 100.0,
 
     #################################
@@ -1111,9 +1052,6 @@ DIAGONAL_Dual_atten_config = dict(
 
 
     # --- E-step update rule ---
-    e_step_update              = "gradient",  # "gradient" (pure current path) | "mm_exact" (closed-form MM
-                                             # coordinate minimizer at frozen beta)
-    mm_damping                 = 1,        # mm_exact damping eta in (0,1]; 1.0 = exact minimizer
 
     # --- randomized-depth E-step (recurrent-depth recipe) ---
     randomize_e_steps          = False,       # training forwards sample T ~ Uniform{e_steps_min..e_steps_max}
@@ -1165,14 +1103,9 @@ DIAGONAL_Dual_atten_config = dict(
                                                 # winner recomputes the complete (B,N,V) decode in
                                                 # differentiable fp64 (~3.1 GiB logits here).
                                               
-     congruence_cond_escalation           = False,                                
      
-     full_cov_congruence_certification    = False,  # False: no per-pair Cholesky certificate or
-                                                 # whole-field fp64 retry. True: strict M13 audit
-                                                 # over ~1.05M 20x20 matrices per call at B64/N128.
 
      full_cov_kl_precision                = "fp32_escalate",  # "fp64" | "fp32_escalate"
-     full_cov_congruence_precision        = "fp32_escalate",  #  "fp64" | "fp32_escalate"
 
      safe_cholesky_jitter_mode            = "relative",  #"absolute" | "relative"
      mu_trust_cholesky_rounds             = 3,           
@@ -1216,14 +1149,11 @@ SO(N)_config = dict(
     warmup_steps              = 100,
     
     #################################
-    # f-divergence and e/m family
+    # belief family
     #################################
     
-    divergence_family         = "renyi",   # "renyi", "squared_hellinger","bhattacharyya", "jeffreys",
-    renyi_order               = 1.0,       # Renyi order (1.0 -> KL)
 
-    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full" | "laplace_diagonal" | "gaussian_frame_diagonal"
-                                                     # | "gaussian_diagonal_exact" (single covariance toggle; diagonal_covariance is derived)
+    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full"
                                                      # "gaussian_frame_diagonal" (default OFF): covariance diagonal in the agent's OWN fiber frame,
                                                      # Sigma_i = U_i diag(sigma_i) U_i^T, which IS closed under GL(K) -- so the pair energy is the EXACT
                                                      # full-covariance divergence at diagonal cost instead of the diagonal-of-sandwich truncation.
@@ -1260,12 +1190,11 @@ SO(N)_config = dict(
     pos_phi_scale             = 0.02,                # learned-table init scale AND frozen per-position step
     
     
-    e_step_mu_precond         = "fisher",       # "fisher" | "raw"
     #################################
     #        Encode/Decode          #
     #################################
     decode_bias               = True,     # only if use_prior_bank = False
-    use_head_mixer            = True,      # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
+    use_head_mixer            = True,      # opt-in Schur-commutant head mixer (needs >=2 blocks: block_glk heads OR an so_n irrep tower with per-isotypic-component mixing);
                                            # breaks strict equivariance under block_glk (exact at init); EXACT under tied_block_glk (full-cov)
     
     use_block_mlp             = True,      # opt-in coordinate mean-only residual MLP; not gauge-pure
@@ -1286,7 +1215,6 @@ SO(N)_config = dict(
     encode_mode               = "per_token",   #"per_token_additive"
     
     
-    oracle_unroll_grad        = True,
     
     #################################
     #          Gauge Group
@@ -1330,7 +1258,7 @@ SO(N)_config = dict(
     spd_retract_mode          = "spd_affine",         # SPD covariance retraction (registry: "spd_affine" | "log_euclidean")
 
     
-    gauge_group               = "so_n",         # "glk" | "block_glk" | "tied_block_glk" | "so_k" | "sp" | "so_n" | "sp_n"
+    gauge_group               = "so_n",         # "block_glk" | "so_n" (so_n awaits reconnection to the projected routes)
                                                      # tied_block_glk: one shared GL(d) frame across heads (kron(I_n, gl(d)))
 
     # so_n / sp_n irrep towers (heads = irreps). Structure group SO(group_n) / Sp(group_n) with
@@ -1365,7 +1293,7 @@ SO(N)_config = dict(
                                                      #   room for lower ranks, so the tower spans a 3x dimension range
                                                      #   under ONE shared tied phi (all four blocks rotate together).
 
-    use_cg_coupling           = False,               # so_n/sp_n only: CG cross-type coupling (bilinear, exactly
+    use_cg_coupling           = False,               # so_n only: CG cross-type coupling (bilinear, exactly
                                                      # equivariant, means-only sigma; zero-init path weights)
     cg_covariance_mode        = "passthrough",       # CG covariance pushforward: "passthrough" (means-only, pure) |
                                                      # "delta_full" (delta-method sigma_out=sym(J Sigma J^T); needs family="gaussian_full")
@@ -1375,15 +1303,8 @@ SO(N)_config = dict(
     ####################################
     # Non-Flat Connection - Regime II
     ####################################
-     transport_mode            = "flat",     # "flat" 
-                                                       # "regime_ii"    
-                                                       #  "regime_ii_covariant" 
-                                                       # "regime_ii_link"   
-                                                       # "regime_ii_link_charted"
                                            
     cocycle_relaxation        =   1.0,        # regime_ii / regime_ii_covariant homotopy: 0.0 -> flat, 1.0 -> fully relaxed (ignored by flat)
-    cross_couplings           =  None, #[(0, 1)],       # off-block GL(K) head pairs e.g. [(0, 1)]; block_glk only (None = block-diagonal gauge)
-                                               #if enabled and head-mixer = True or causal_alibi it will fail
     close_basis               = False,
     ####################################
     #       Positional Encoding
@@ -1404,7 +1325,6 @@ SO(N)_config = dict(
                                                      #   OUTSIDE the content operator, so the transport is conjugated by the query's ABSOLUTE
                                                      #   angle. Measured on the K=20 rope run: 69% of the pair-energy spread is absolute-position
                                                      #   contamination and gauge covariance fails at 5.6. Kept only to reproduce old runs.)
-    rope_full_gauge           = False,               # rotate the covariance sandwich too (REQUIRES family="gaussian_full")
     rope_on_value             = False,
     
     ######################################
@@ -1470,7 +1390,6 @@ SO(N)_config = dict(
     
     e_q_mu_lr                 = 0.9,
     e_q_sigma_lr              = 0.001,
-    e_phi_lr                  = 0.00,     
     
     
     ####################################
@@ -1552,10 +1471,6 @@ SO(N)_config = dict(
 
 
     # --- E-step update rule ---
-    e_step_update             = "gradient",  # "gradient" (pure current path) | "mm_exact" (closed-form MM
-                                             # coordinate minimizer at frozen beta: precision fusion in ONE
-                                             # iteration, same cost; kernel route only)
-    mm_damping                = 0.75,         # mm_exact damping eta in (0,1]; 1.0 = exact minimizer
 
     
 
@@ -1613,12 +1528,10 @@ SO(N)_config = dict(
                                               # cond(Sigma)~1e6, escalates at ~1e9; post-softmax attention moves
                                               # <=2e-4 on adversarial synthetic spectra, 4e-6 on real trained ones.
                                               
-     full_cov_congruence_precision = "fp32_escalate",      # "fp64" | "fp32_escalate"                                        
 
      safe_cholesky_jitter_mode     = "relative",      # "absolute" | "relative"
      mu_trust_cholesky_rounds = 3,
 
-     congruence_cond_escalation           = False,         # True -> slow ...escalate on the conditioning proxy
      emit_expensive_diagnostics           = True,    
      generate_figures                     = True,      # OFF: strict opt-out for all finalization plots, plot-only
                                                        # probes/model replays, and per-eval attention/gamma heatmaps.
@@ -1665,14 +1578,11 @@ FULL_GAUSSIAN_config = dict(
     
        
     #################################
-    # f-divergence and e/m family
+    # belief family
     #################################
 
-    divergence_family         = "renyi",   # "renyi", "squared_hellinger","bhattacharyya", "jeffreys",
-    renyi_order               = 1.0,       # Renyi order (1.0 -> KL)
 
-    family                    = "gaussian_full", # "gaussian_diagonal" | "gaussian_full" | "laplace_diagonal" | "gaussian_frame_diagonal"
-                                                     # | "gaussian_diagonal_exact" (single covariance toggle; diagonal_covariance is derived)
+    family                    = "gaussian_full", # "gaussian_diagonal" | "gaussian_full"
 
     
     #################################
@@ -1688,7 +1598,7 @@ FULL_GAUSSIAN_config = dict(
     #        Encode/Decode          #
     #################################
     decode_bias                       = False,     # only for decode_mode='linear'
-    use_head_mixer                    = False,      # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
+    use_head_mixer                    = False,      # opt-in Schur-commutant head mixer (needs >=2 blocks: block_glk heads OR an so_n irrep tower with per-isotypic-component mixing);
     use_priorbank_head_evidence_mixer = False,
                                          
     
@@ -1751,12 +1661,12 @@ FULL_GAUSSIAN_config = dict(
     phi_retract_mode          = "bch", # "euclidean" | "bch"
     pos_phi_project_slk       = True,      # per-block trace projection (det Omega = 1)
     
-    gauge_group               = "block_glk",    # "glk" | "block_glk" | "tied_block_glk" | "so_k" | "sp" | "so_n" | "sp_n"
+    gauge_group               = "block_glk",    # "block_glk" | "so_n" (so_n awaits reconnection to the projected routes)
 
-    group_n                   = None,                # so_n/sp_n only; must stay None for every other group
-    irrep_spec                = None,                # so_n/sp_n only; must stay None for every other group
+    group_n                   = None,                # so_n only; must stay None for block_glk
+    irrep_spec                = None,                # so_n only; must stay None for block_glk
 
-    use_cg_coupling           = False,               # so_n/sp_n only: CG cross-type coupling
+    use_cg_coupling           = False,               # so_n only: CG cross-type coupling
     cg_covariance_mode        = "passthrough",       # "passthrough" (means-only, pure) | "delta_full"
     cg_energy_weight          = 0.0,                 # CG moment-energy regularizer (0.0 = OFF)
 
@@ -1765,13 +1675,10 @@ FULL_GAUSSIAN_config = dict(
     # Non-Flat Connection - Regime II
     ####################################
    
-    transport_mode            = "flat",     # "flat" | "regime_ii" | "regime_ii_covariant"
-                                            # | "regime_ii_link" | "regime_ii_link_charted"
 
     cocycle_relaxation        = 1.0,        # regime_ii homotopy: 0.0 -> flat, 1.0 -> fully relaxed (ignored by flat)
     link_alpha                = 1.0,        # regime_ii_link only
     link_soft_cap             = 6.0,        # regime_ii_link only
-    cross_couplings           = None,       # off-block GL(K) head pairs e.g. [(0, 1)]; block_glk only
    
     
     ####################################
@@ -1785,7 +1692,6 @@ FULL_GAUSSIAN_config = dict(
    
     rope_base                 = 100.0,               # rotary frequency base
         
-    rope_full_gauge           = False,               # rotate the covariance sandwich too (REQUIRES family="gaussian_full")
     rope_on_value             = False,
 
 
@@ -1845,16 +1751,11 @@ FULL_GAUSSIAN_config = dict(
     #         Belief E-step
     #         Learning Rates
     #################################
-    e_step_update             = "gradient",  # "gradient" (pure current path) | "mm_exact" (closed-form MM
-                                            # coordinate minimizer at frozen beta)
-    e_step_mu_precond         = "fisher",  
-    mm_damping                = 1,           # mm_exact damping eta in (0,1]; 1.0 = exact minimizer
     
     
     e_q_mu_lr                 = 0.3,
     e_q_sigma_lr              = 0.025,
     
-    e_phi_lr                  = 0.00,
 
    
     ####################################
@@ -1933,7 +1834,6 @@ FULL_GAUSSIAN_config = dict(
     sigma_max                            = 100.0,
     e_mu_q_trust                         = 1,
     e_sigma_q_trust                      = 1.0,
-    mu_trust_mode                        = "ball",
    
    
     amp_dtype                            = None,        # None=fp32 | 'bf16' , 'fp16'. Sigma must be at least fp32
@@ -1948,7 +1848,6 @@ FULL_GAUSSIAN_config = dict(
 
    
     full_cov_kl_precision                = "fp32_escalate",  # "fp64" | "fp32_escalate"
-    full_cov_congruence_precision        = "fp32_escalate",  #  "fp64" | "fp32_escalate"
 
     safe_cholesky_jitter_mode            = "relative",        #"absolute" | "relative"
     mu_trust_cholesky_rounds             = 3,           
@@ -1974,24 +1873,7 @@ FULL_GAUSSIAN_config = dict(
     # opt-in so the default chunked route remains streamed and bounded.
     decode_ranking_fp64_escalation       = False,             
      
-    # DEFAULT guard is sign-only: recompute in float64 iff the working-dtype congruence went
-    # negative -- one amin reduction the floor needs regardless. Positivity is necessary but not
-    # sufficient (cancellation destroys accuracy before it destroys sign), so this toggle adds the
-    # conditioning proxy cond(exp_phi)^4 * eps > 1e-3, which bounds the quadratic form's backward
-    # error (Higham 2002, 3.1). It is OPT-IN because it is not free: it runs svdvals on the vertex
-    # blocks and then a bool() on the result, i.e. an SVD launch plus a GPU->CPU sync, on the
-    # HEALTHY path of every covariance transport.                                         
-    congruence_cond_escalation           = False, #at K=80 4 heads ~  2x slower                        
      
-    full_cov_kl_backend                  = "common_frame",   # "pairwise" | "common_frame"
-    # Strict post-congruence certificate (audit remediation M13). When enabled, factor every
-    # transported pair covariance and promote the complete pair field to float64 if any matrix is
-    # uncertified. At B=64, N=128, K=20 this checks 1,048,576 separate 20x20 matrices and the
-    # promoted field is about 3.1 GiB. Keep this opt-in for accuracy investigations; False retains
-    # the selected working precision without the additional certificate or fallback recompute.
-    full_cov_congruence_certification    = False,  # False: no per-pair Cholesky certificate or
-                                                 # whole-field fp64 retry. True: strict M13 audit
-                                                 # over ~1.05M 20x20 matrices per call at B64/N128.
                                                  
       
     skip_belief_sigma_update             = False,        # skip the belief-channel sigma E-step update

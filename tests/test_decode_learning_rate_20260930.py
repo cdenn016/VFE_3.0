@@ -2,16 +2,16 @@
 
 from tests.profiles import test_config
 from dataclasses import replace
-from typing import Any, Optional
+from typing import Any
 
 import pytest
 import torch
 
-from vfe3.config import VFE3Config, config_from_serialized, serialize_config
+from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 from vfe3.model import prior_bank as prior_bank_module
 from vfe3.model.prior_bank import get_decode_registration
-from vfe3.train import _floor_lr_lambdas, _transfer_targets, build_optimizer
+from vfe3.train import _transfer_targets, build_optimizer
 
 
 def _config(**overrides: Any) -> VFE3Config:
@@ -35,22 +35,6 @@ def _groups(model: VFEModel, optimizer: torch.optim.Optimizer) -> dict[str, dict
             for parameter in group["params"]}
 
 
-@pytest.mark.parametrize("rate", [None, 0.0, 0.137])
-def test_decoder_rate_serializes_and_reloads(rate: Optional[float]) -> None:
-    cfg = _config(m_decode_lr=rate)
-    saved = serialize_config(cfg)
-    assert saved["m_decode_lr"] == rate
-    assert config_from_serialized(saved, source="decoder-rate test").m_decode_lr == rate
-    saved.pop("m_decode_lr")
-    assert config_from_serialized(saved, source="historical config").m_decode_lr is None
-
-
-@pytest.mark.parametrize("rate", [-0.1, float("nan"), float("inf"), -float("inf"), True, "0.1"])
-def test_decoder_rate_rejects_invalid_explicit_values(rate: Any) -> None:
-    with pytest.raises(ValueError, match="m_decode_lr"):
-        _config(m_decode_lr=rate)
-
-
 @pytest.mark.parametrize("mode,untied", [("linear", False), ("diagonal_chunked", True)])
 def test_default_preserves_historical_group_topology_and_parameter_bytes(
     mode:   str,
@@ -60,7 +44,7 @@ def test_default_preserves_historical_group_topology_and_parameter_bytes(
     torch.manual_seed(30)
     implicit = VFEModel(_config(**options))
     torch.manual_seed(30)
-    explicit = VFEModel(_config(m_decode_lr=None, **options))
+    explicit = VFEModel(_config(**options))
     optimizer = build_optimizer(implicit, implicit.cfg)
     explicit_optimizer = build_optimizer(explicit, explicit.cfg)
     _groups(implicit, optimizer)
@@ -96,54 +80,9 @@ def test_default_preserves_historical_group_topology_and_parameter_bytes(
         assert torch.equal(parameter, explicit.state_dict()[name])
 
 
-@pytest.mark.parametrize("mode,untied", [("linear", False), ("diagonal_chunked", False),
-                                         ("diagonal_chunked", True)])
-@pytest.mark.parametrize("rate", [0.0, 0.137])
-def test_explicit_decoder_rate_keeps_encoder_rates_roles_decays_and_exact_coverage(
-    rate:   float,
-    mode:   str,
-    untied: bool,
-) -> None:
-    cfg = _config(decode_mode=mode, untie_decode_bank=untied, m_decode_lr=rate,
-                  m_p_mu_lr=0.023, m_p_sigma_lr=0.004, mu_weight_decay=0.07,
-                  sigma_weight_decay=0.09)
-    model = VFEModel(cfg)
-    groups = _groups(model, build_optimizer(model, cfg))
-    assert groups["prior_bank.mu_embed"]["lr"] == 0.023
-    assert groups["prior_bank.sigma_log_embed"]["lr"] == 0.004
-    decoder_names = ["prior_bank.decode_log_scale"]
-    if mode == "linear":
-        decoder_names += ["prior_bank.output_proj_weight", "prior_bank.output_proj_bias"]
-    elif untied:
-        decoder_names += ["prior_bank.decode_mu_embed", "prior_bank.decode_sigma_log_embed"]
-    for name in decoder_names:
-        group = groups[name]
-        assert group["lr"] == rate
-        sigma = name in {"prior_bank.decode_log_scale", "prior_bank.decode_sigma_log_embed"}
-        assert group["role"] == ("sigma" if sigma else "mu")
-        expected_decay = 0.0 if name.endswith("output_proj_bias") else (0.09 if sigma else 0.07)
-        assert group["weight_decay"] == expected_decay
-        assert _floor_lr_lambdas([rate], cfg)[0](cfg.max_steps) * rate == pytest.approx(rate * cfg.min_lr_frac)
-
-
-def test_zero_decoder_rate_freezes_separate_decode_but_not_encoder() -> None:
-    cfg = _config(untie_decode_bank=True, m_decode_lr=0.0, min_lr=0.2)
-    model = VFEModel(cfg)
-    optimizer = build_optimizer(model, cfg)
-    initial = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
-    for parameter in model.parameters():
-        if parameter.requires_grad:
-            parameter.grad = torch.ones_like(parameter)
-    optimizer.step()
-    for name in ("prior_bank.decode_mu_embed", "prior_bank.decode_sigma_log_embed",
-                 "prior_bank.decode_log_scale"):
-        assert torch.equal(dict(model.named_parameters())[name], initial[name])
-    assert not torch.equal(model.prior_bank.mu_embed, initial["prior_bank.mu_embed"])
-    assert _floor_lr_lambdas([0.0], cfg)[0](cfg.max_steps) * 0.0 == 0.0
-
-
 def test_decoder_override_keeps_head_evidence_dedicated_rate_and_temperature_freeze() -> None:
-    cfg = _config(untie_decode_bank=True, m_decode_lr=0.137, m_head_evidence_lr=0.081,
+    cfg = _config(untie_decode_bank=True, m_decode_mu_lr=0.137, m_decode_sigma_lr=0.137,
+                  m_head_evidence_lr=0.081,
                   use_priorbank_head_evidence_mixer=True, decode_temperature_learned=False)
     model = VFEModel(cfg)
     groups = _groups(model, build_optimizer(model, cfg))

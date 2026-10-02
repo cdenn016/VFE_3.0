@@ -245,7 +245,7 @@ def test_decoder_and_model_stats_are_opt_in_without_changing_default_returns():
     assert int(stats_result[2].scored_tokens) == targets.numel() - 1
 
 
-@pytest.mark.parametrize("decode_mode", ("full", "full_chunked"))
+@pytest.mark.parametrize("decode_mode", ("full_chunked",))
 def test_head_block_only_failure_is_excluded_by_dense_full_consumers(decode_mode):
     r"""A decoder-final head-block failure must remain excluded at the later dense CE boundary.
 
@@ -260,7 +260,6 @@ def test_head_block_only_failure_is_excluded_by_dense_full_consumers(decode_mode
         n_heads=2,
         family="gaussian_full",
         decode_mode=decode_mode,
-        _allow_legacy_dense_decode=decode_mode == "full",
         use_priorbank_head_evidence_mixer=True,
         safe_cholesky_jitter_mode="relative",
     )

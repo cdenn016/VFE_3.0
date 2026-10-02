@@ -142,7 +142,6 @@ def _full_gaussian_kl_terms(
     return div, ok_p & ok_q, inv_cond
 
 
-
 def _full_gaussian_kl_coordinate_terms(
     mu_q:    torch.Tensor,
     sigma_q: torch.Tensor,
@@ -184,7 +183,6 @@ def diag_kl_unclamped(
     can inspect it before applying ``safe_kl_clamp``.
     """
     return diag_kl_unclamped_per_coord(mu_q, sigma_q, mu_p, sigma_p, eps=eps).sum(-1)
-
 
 
 def diag_kl_unclamped_per_coord(
@@ -485,9 +483,9 @@ class FullGaussian(BeliefParams):
     Natural theta = (Sigma^{-1} mu, -1/2 Sigma^{-1}); A(theta) = -1/4 t1^T t2^{-1} t1 - 1/2 log|-2 t2|.
 
     External construction retains the any-operand float64 result policy, including mixed public
-    mean/covariance dtypes. ``from_transported`` records the source covariance dtype while the
-    family transport seam retains an internal float64 covariance, so this numerical representation
-    does not promote the public divergence result.
+    mean/covariance dtypes. The private ``_public_dtype`` records a source dtype when an internal
+    float64 covariance is retained, so that representation does not promote the public divergence
+    result.
     """
 
     cov_kind = "full"
@@ -529,22 +527,6 @@ class FullGaussian(BeliefParams):
         )
         self._precision_policy = (
             None if _precision_policy is None else validate_full_cov_kl_precision(_precision_policy)
-        )
-
-    @classmethod
-    def from_transported(
-        cls,
-        mu:                torch.Tensor,         # transported means
-        dispersion:        torch.Tensor,         # retained full covariance
-        source_dispersion: torch.Tensor,         # pre-transport covariance and public dtype source
-        *,
-        _precision_policy: Optional[str] = None,
-    ) -> "FullGaussian":
-        return cls(
-            mu,
-            dispersion,
-            _public_dtype=_full_gaussian_public_dtype(mu.dtype, source_dispersion.dtype),
-            _precision_policy=_precision_policy,
         )
 
     def coordinate_dim(self) -> int:
@@ -647,183 +629,6 @@ class FullGaussian(BeliefParams):
         mixing:    torch.Tensor,                     # (K, K) dense linear map
     ) -> torch.Tensor:
         return mixing @ dispersion @ mixing.transpose(-1, -2)
-
-    @classmethod
-    def transport_dispersion(
-        cls,
-        dispersion: torch.Tensor,         # (..., N, K, K) full covariance
-        omega:      object,               # dense/factored/direct-link/RoPE transport container
-
-        *,
-        diagonal_out:    Optional[bool]      = None,
-        marginal_blocks: Optional[List[int]] = None,
-        precision_policy: Optional[str] = None,
-    ) -> torch.Tensor:
-        r"""Retain the float64 full-covariance congruence through SPD factorization.
-
-        A dense sandwich can be positive definite in float64 but indefinite after float32 storage.
-        The public divergence retains the source-family dtype; only this transported covariance is
-        kept in float64 until the FullGaussian KL/Renyi computation has consumed it.
-
-        Retention is keyed to whether the KL will ACTUALLY consume float64 (audit 2026-08-06 F2).
-        Under ``full_cov_kl_precision="fp32_escalate"`` :meth:`renyi_closed_form` immediately does
-        ``sigma_t.to(compute_dtype)`` with ``compute_dtype = float32``, so retaining produced a
-        float64 pairwise ``(B, N, N, K, K)`` tensor -- 629 MB at the live shape -- and rounded it
-        straight back. Keying off the policy drops that round trip.
-
-        BIT-IDENTICAL under both policies, and the reason is specific: every full-covariance
-        congruence in ``transport.py`` hard-codes float64 ARITHMETIC independently of this flag, so
-        the flag chooses only the OUTPUT dtype, and float32 -> float64 promotion is exact.
-        Round-early vs round-late measured 0/50 mismatches across the compact, blocks-only and dense
-        routes. (Do NOT instead key ``compute_dtype`` on ``other.sigma.dtype`` -- that silently
-        disables the ``full_cov_kl_precision`` knob entirely.)
-
-        This is the family the ``marginal_blocks`` promise pays off in -- the only one whose
-        transported dispersion is a full (K, K) congruence with cross-head blocks to skip.
-        """
-        from vfe3.geometry.transport import transport_covariance
-        policy = full_cov_kl_precision() if precision_policy is None else validate_full_cov_kl_precision(precision_policy)
-        return transport_covariance(
-            omega,
-            dispersion,
-            retain_full_precision=(policy == "fp64"),
-            diagonal_out=diagonal_out,
-            marginal_blocks=marginal_blocks,
-        )
-
-    @classmethod
-    def coupling_energy(
-        cls,
-        mu_q:         torch.Tensor,       # (..., N, K) query locations
-        dispersion_q: torch.Tensor,       # (..., N, K, K) query covariance
-        mu_k:         torch.Tensor,       # (..., N, K) key locations, PRE-transport
-        dispersion_k: torch.Tensor,       # (..., N, K, K) key covariance, PRE-transport
-        omega:        object,             # dense/factored/direct-link/RoPE transport container
-
-        *,
-        alpha:             float = 1.0,
-        kl_max:            float = 100.0,
-        eps:               float = 1e-6,
-        divergence_family: str   = "renyi",
-
-        irrep_dims:       Optional[List[int]]                   = None,
-        diagonal_out:     Optional[bool]                        = None,
-        precision_policy: Optional[str]                         = None,
-        pair_support:     Optional[torch.Tensor]                = None,  # (..., H, Nq, Nk)
-        score_backend:    str                                  = "pairwise",
-    ) -> torch.Tensor:                    # (..., N, N) or (..., H, N, N)
-        r"""Full-covariance coupling energy, taking the head blocks directly when it can.
-
-        Identical in value to :meth:`BeliefParams.coupling_energy`, which it falls back to whenever
-        the fast route does not apply. The fast route exists because this family is the only one
-        whose transported dispersion is a full ``(K, K)`` congruence, and because the base seam's own
-        ``marginal_blocks`` promise means the cross-head output blocks are provably never read:
-        ``transport_covariance`` still has to hand back a dense ``(..., N, N, K, K)`` (every other
-        caller is typed against it), so it scatters the head blocks into a 629 MB zero tensor at the
-        live shape and ``pairwise_energy`` slices them straight back out. Asking the geometry for the
-        ``(..., N, N, H, d, d)`` blocks instead removes that round trip entirely
-        (audit 2026-08-06 B2/F14).
-
-        BIT-IDENTICAL, and the reason is narrow enough to state: the blocks are the SAME einsum on
-        the SAME operands the dense route already runs -- the scatter and the re-slice are pure data
-        movement -- and the ``.contiguous()`` below reproduces the exact strides ``torch.stack``
-        produced, so nothing downstream sees a different memory layout and reassociates.
-
-        The rank guard replicates :func:`~vfe3.free_energy._stackable_for_batching`, which the dense
-        route applies AFTER transport. Checking it here on the pre-transport inputs is equivalent:
-        transport adds one key axis to the mean and one to the covariance, and
-        ``broadcast_over_keys`` adds one to each, so ``sigma.dim() - mu.dim()`` is invariant along
-        the whole chain. Failing it falls back rather than stacking a spurious broadcast.
-
-        For compact equal-head transport, ``pair_support`` restricts the energy read set: excluded
-        head pairs use constant SPD placeholders and return zero energy and gradient. It must include
-        every pair used by the caller, including any two-hop terms. Other structural/projection
-        routes retain their existing complete-grid evaluation.
-        """
-        policy = full_cov_kl_precision() if precision_policy is None else validate_full_cov_kl_precision(precision_policy)
-        if score_backend not in ("pairwise", "common_frame", "common_frame_factored"):
-            raise ValueError(f"Unsupported full covariance score backend: {score_backend!r}")
-        if (score_backend in ("common_frame", "common_frame_factored")
-                and cls is FullGaussian and not diagonal_out):
-            from vfe3.families.base import get_functional, renyi
-            # Registry identity matters: a same-name replacement must keep its own semantics.
-            if alpha == 1.0 and get_functional(divergence_family) is renyi:
-                from vfe3.families.full_gaussian_score import common_frame_kl_energy
-                energy = common_frame_kl_energy(
-                    mu_q, dispersion_q, mu_k, dispersion_k, omega,
-                    kl_max=kl_max, precision_policy=policy, irrep_dims=irrep_dims,
-                    pair_support=pair_support, factored=(score_backend == "common_frame_factored"),
-                )
-                if energy is not None:
-                    return energy
-        # Private provenance kwargs are an implementation detail of the exact built-in class.
-        # Registry replacements and downstream subclasses historically implement the two-argument
-        # constructor / three-argument from_transported contract, so preserve that public surface.
-        def _make(mu: torch.Tensor, dispersion: torch.Tensor) -> "FullGaussian":
-            if cls is FullGaussian:
-                return cls(mu, dispersion, _precision_policy=policy)
-            return cls(mu, dispersion)
-
-        def _from_transported(
-            mu: torch.Tensor, dispersion: torch.Tensor, source: torch.Tensor,
-        ) -> "FullGaussian":
-            if cls is FullGaussian:
-                return cls.from_transported(mu, dispersion, source, _precision_policy=policy)
-            return cls.from_transported(mu, dispersion, source)
-        blocks = None
-        head_support = None
-        if (irrep_dims is not None and len(irrep_dims) > 1
-                and len(set(irrep_dims)) == 1
-                and dispersion_q.dim() == mu_q.dim() + 1
-                and dispersion_k.dim() == mu_k.dim() + 1):
-            from vfe3.geometry.transport import transport_covariance_head_blocks
-            if pair_support is not None:
-                batch_shape = torch.broadcast_shapes(mu_q.shape[:-2], mu_k.shape[:-2])
-                energy_shape = (*batch_shape, len(irrep_dims), mu_q.shape[-2], mu_k.shape[-2])
-                head_support = torch.broadcast_to(pair_support, energy_shape).movedim(-3, -1)
-            blocks = transport_covariance_head_blocks(       # None unless the compact route applies
-                omega, dispersion_k,
-                retain_full_precision=(policy == "fp64"),
-                diagonal_out=diagonal_out,
-                marginal_blocks=irrep_dims,
-                **({"pair_support": head_support} if head_support is not None else {}),
-            )
-        if blocks is None:
-            from vfe3.free_energy import pairwise_energy
-            mu_t = cls.transport_location(mu_k, omega)
-            transport_kwargs = dict(
-                diagonal_out=diagonal_out,
-                marginal_blocks=irrep_dims,
-            )
-            if cls is FullGaussian:
-                transport_kwargs["precision_policy"] = policy
-            dispersion_t = cls.transport_dispersion(dispersion_k, omega, **transport_kwargs)
-            return pairwise_energy(
-                _make(mu_q, dispersion_q),
-                _from_transported(mu_t, dispersion_t, dispersion_k),
-                alpha=alpha, kl_max=kl_max, eps=eps,
-                divergence_family=divergence_family, irrep_dims=irrep_dims,
-            )
-
-        from vfe3.free_energy import head_stacked_energy
-        H, d = len(irrep_dims), irrep_dims[0]
-        mu_t = cls.transport_location(mu_k, omega)                     # (..., N, N, K)
-        mu_blocks = mu_t.reshape(*mu_t.shape[:-1], H, d)
-        if head_support is not None:
-            mu_blocks = torch.where(head_support[..., None], mu_blocks, 0.0)
-        key_stack = _from_transported(
-            mu_blocks.movedim(-2, 0).contiguous(),                         # (H,...,N,N,d)
-            blocks.movedim(-3, 0).contiguous(),                                 # (H,...,N,N,d,d)
-            dispersion_k,
-        )
-        energy = head_stacked_energy(
-            _make(mu_q, dispersion_q).broadcast_over_keys(), key_stack,
-            alpha=alpha, kl_max=kl_max, eps=eps,
-            divergence_family=divergence_family, irrep_dims=irrep_dims,
-        )
-        if head_support is not None:
-            energy = energy.masked_fill(~head_support.movedim(-1, -3), 0.0)
-        return energy
 
     @classmethod
     def diagnostic_labels(cls) -> dict[str, str]:
@@ -949,11 +754,8 @@ class FullGaussian(BeliefParams):
         # unlike DiagonalGaussian.renyi_closed_form, which keys on its operand dtypes. On the live
         # gaussian_full pair grid that meant every cholesky / solve_triangular / logdet ran in
         # float64, measured at 15.7x the float32 cost on a consumer GPU whose float64 throughput is
-        # heavily reduced. The policy is process-global ON PURPOSE: `coupling_energy` has 15 call
-        # sites (oracle, phi objective, reported F, gamma coupling, viz), and threading a kwarg
-        # through them invites exactly the desynchronisation that lost `cond_escalation` in
-        # `_transport_to_float` -- a gradient computed at one precision against an objective
-        # reported at another. One policy, one read site, no way for two paths to disagree.
+        # heavily reduced. The policy is process-global ON PURPOSE: one policy, one read site, so a
+        # gradient cannot be computed at one precision against an objective reported at another.
         if precision_policy is not None:
             policy = validate_full_cov_kl_precision(precision_policy)
         elif (self._precision_policy is not None and other._precision_policy is not None

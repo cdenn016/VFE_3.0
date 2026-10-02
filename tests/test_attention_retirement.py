@@ -19,7 +19,7 @@ def _values(**overrides: Any) -> dict[str, Any]:
                            attention_mode="projected_predictive", attention_residual=False,
                            predictive_covariance="passthrough", lambda_alpha_mode="constant",
                            norm_type_block="none", norm_type_final="none", use_block_mlp=False,
-                           block_mlp_expansion=2, amp_dtype=None, e_phi_lr=0.)
+                           block_mlp_expansion=2, amp_dtype=None)
     for name in ("relational_input_scope", "relational_output_scope", "relational_identity_content"):
         values.pop(name, None)
     values.update(overrides)

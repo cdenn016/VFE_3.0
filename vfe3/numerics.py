@@ -110,28 +110,24 @@ def apply_mu_trust_region(
 
     *,
     trust:       float = 5.0,
-    mode:        str   = "box",
     is_diagonal: bool  = True,
     eps:         float = 1e-8,
     family:      Optional[str] = None,
 ) -> torch.Tensor:                       # (..., K) clamped step, same shape/dtype as delta_mu
-    r"""Whitened E-step mean trust region.
+    r"""Whitened E-step mean trust region: the Mahalanobis ball.
 
-    Bounds the per-iteration mean update in covariance-whitened (Mahalanobis) units so a large
-    VFE mean gradient cannot overshoot the belief by more than ``trust`` standard deviations.
-    Let ``L`` be ``diag(sqrt(sigma_q))`` for diagonal covariance or the round-zero Cholesky factor
-    of a full covariance. Then:
+    Bounds the per-iteration mean update in covariance-whitened units so a large VFE mean gradient
+    cannot overshoot the belief by more than ``trust`` standard deviations. Let ``L`` be
+    ``diag(sqrt(sigma_q))`` for diagonal covariance or the Cholesky factor of a full covariance.
+    Then
 
-        whitened = solve(L, delta_mu)
-        box      : L @ clamp(whitened, -trust, +trust)
-        ball     : L @ (whitened * min(trust / ||whitened||_2, 1))
+    .. math::
+        w = L^{-1}\delta\mu,\qquad
+        \delta\mu' = L\, w \min(\mathrm{trust} / \|w\|_2, 1),
 
-    ``box`` is the recommended mode. This is a step-size guard, OFF by default at the call site
-    (``e_mu_q_trust=None``). A failed full-covariance Cholesky uses the prior marginal-variance
-    path for that batch element only.
+    which is GL-covariant because :math:`\|w\|_2^2 = \delta\mu^\top \Sigma^{-1} \delta\mu`. A failed
+    full-covariance Cholesky uses the marginal-variance path for that batch element only.
     """
-    if mode not in ("box", "ball"):
-        raise ValueError(f"apply_mu_trust_region mode={mode!r}; expected 'box' or 'ball'.")
     # Local import breaks numerics -> families.gaussian -> numerics during a fresh import.
     from vfe3.families.base import get_family
     family_cls = get_family(
@@ -165,10 +161,8 @@ def apply_mu_trust_region(
     if is_diagonal:
         scale = family_cls.trust_region_scale(sigma_q, eps=eps)
         whitened = delta_mu / scale
-        if mode == "ball":
-            norm2 = whitened.norm(dim=-1, keepdim=True)
-            return delta_mu * (trust / norm2.clamp(min=eps)).clamp(max=1.0)
-        return whitened.clamp(-trust, trust) * scale
+        norm2 = whitened.norm(dim=-1, keepdim=True)
+        return delta_mu * (trust / norm2.clamp(min=eps)).clamp(max=1.0)
 
     # rounds is a POLICY, not a constant (audit 2026-08-06 C6/F29). At rounds=0 there is zero
     # jitter escalation, so one marginally non-PD sigma_q routes that element to the diagonal
@@ -194,11 +188,8 @@ def apply_mu_trust_region(
     whitened_finfo = torch.finfo(whitened.dtype)
     whitened = torch.nan_to_num(
         whitened, nan=0.0, posinf=whitened_finfo.max, neginf=-whitened_finfo.max)
-    if mode == "ball":
-        norm2 = whitened.norm(dim=-1, keepdim=True)
-        bounded = whitened * (trust / norm2.clamp(min=eps)).clamp(max=1.0)
-    else:
-        bounded = whitened.clamp(-trust, trust)
+    norm2 = whitened.norm(dim=-1, keepdim=True)
+    bounded = whitened * (trust / norm2.clamp(min=eps)).clamp(max=1.0)
     full_out = (safe_factor @ bounded.unsqueeze(-1)).squeeze(-1)
     # The fallback is computed UNCONDITIONALLY (audit 2026-08-06 B3/F15). It used to sit behind an
     # ``if bool(ok.all()): return full_out`` early exit, which is a device->host sync on every call
@@ -208,12 +199,8 @@ def apply_mu_trust_region(
     # routes grad by SELECTION (the unselected branch receives an exact 0, not 0 * something).
     sigma_diag = family_cls.covariance_diagonal(sigma_q, eps=eps)
     scale = sigma_diag.clamp(min=eps).sqrt()
-    fallback_white = delta_mu / scale
-    if mode == "ball":
-        fallback_norm = fallback_white.norm(dim=-1, keepdim=True)
-        fallback = delta_mu * (trust / fallback_norm.clamp(min=eps)).clamp(max=1.0)
-    else:
-        fallback = fallback_white.clamp(-trust, trust) * scale
+    fallback_norm = (delta_mu / scale).norm(dim=-1, keepdim=True)
+    fallback = delta_mu * (trust / fallback_norm.clamp(min=eps)).clamp(max=1.0)
     return torch.where(ok.unsqueeze(-1), full_out, fallback)
 
 
@@ -254,34 +241,6 @@ def _count_mu_trust_fallback(ok: torch.Tensor) -> None:
 
 
 _DECODE_LOGDET_FALLBACK_COUNTS: Dict[str, torch.Tensor] = {}
-
-
-_MM_CHOLESKY_FALLBACK_COUNTS: Dict[str, torch.Tensor] = {}
-
-
-def _count_mm_cholesky_fallback(ok: torch.Tensor) -> None:
-    r"""Accumulate MM Cholesky fallback rows per device without a host synchronization."""
-    key = str(ok.device)
-    counter = _MM_CHOLESKY_FALLBACK_COUNTS.get(key)
-    if counter is None:
-        counter = torch.zeros((), dtype=torch.int64, device=ok.device)
-        _MM_CHOLESKY_FALLBACK_COUNTS[key] = counter
-    counter += (~ok).sum()
-
-
-def mm_cholesky_fallback_elements() -> int:
-    r"""Return MM rows retained after a failed Cholesky since the last reset.
-
-    Reading the on-device counters synchronizes, so the training loop calls this only when it is
-    already publishing end-of-run artifacts.
-    """
-    return int(sum(int(count) for count in _MM_CHOLESKY_FALLBACK_COUNTS.values()))
-
-
-def reset_mm_cholesky_fallback_elements() -> None:
-    r"""Zero the asynchronous per-device MM Cholesky fallback counters for a new run."""
-    for count in _MM_CHOLESKY_FALLBACK_COUNTS.values():
-        count.zero_()
 
 
 def _count_decode_logdet_fallback(ok: torch.Tensor) -> None:

@@ -1,15 +1,19 @@
 """Configuration for VFE_3.0. Single dataclass, single validation block.
 
 No CLI parsing (project policy: click-to-run). Edit fields directly, then run.
-Every registry-backed seam is selected here by name (divergence, gauge group,
-encode/decode mode, alpha form, attention prior, norm, gradient mode), so a
-variant swaps without editing call sites.
+Every registry-backed seam is selected here by name (belief family, encode/decode mode, alpha
+form, attention prior, norm), so a variant swaps without editing call sites.
+
+The projected routes fix the divergence (KL), the connection (flat), the gradient roles
+(filtering), the E-step estimator (unroll), the E-step update (one Fisher step or the closed-form
+receiver), the mean preconditioner (Fisher) and the mean trust region (Mahalanobis ball). Those
+former selectors are not fields; ``config_from_serialized`` migrates or refuses them on load.
 """
 
 import math
 import os
 import warnings
-from dataclasses import MISSING, InitVar, asdict, dataclass, fields
+from dataclasses import MISSING, asdict, dataclass, fields
 from numbers import Real
 from typing import Any, List, Literal, Mapping, Optional, Tuple
 
@@ -64,22 +68,24 @@ def _apply_config_notice_filter() -> None:
 
 _apply_config_notice_filter()
 
-# Seams with a live registry (gauge_group, lambda_alpha_mode, attention priors, norms; alongside
-# transport/retraction/positional/divergence) are validated against that registry in __post_init__
-# via tuple(sorted(_REGISTRY)), so a newly registered variant is a valid config value WITHOUT
-# editing this validator (the add-by-registering modularity contract). phi_precond_mode is
-# validated against phi_preconditioner._PRECOND. E-step phi always uses BCH; positional phi always uses exact group-product composition.
-# Encode/decode modes likewise use their registries. The linear registration is public; dense
-# decode registrations are retained only for typed legacy replay and private oracles. The static
-# tuples below are the remaining seams WITHOUT a registry.
-_VALID_GRADIENT_MODES      = ("filtering", "smoothing")
-_VALID_E_STEP_GRADIENTS    = ("unroll", "straight_through", "detach")
+# Seams with a live registry (lambda_alpha_mode, attention priors, norms, positional frames) are
+# validated against that registry in __post_init__ via tuple(sorted(_REGISTRY)), so a newly
+# registered variant is a valid config value WITHOUT editing this validator (the add-by-registering
+# modularity contract). phi_precond_mode is validated against phi_preconditioner._PRECOND. Positional
+# phi always uses exact group-product composition. Encode/decode modes likewise use their
+# registries. The static tuples below are the remaining seams WITHOUT a registry.
 _VALID_GAUGE_TRANSPORT     = ("on", "off", "frozen")
-_DENSE_DECODE_MODES        = frozenset({"diagonal", "full", "family"})
+# Supported structure groups on the projected routes: block_glk, and so_n (with group_n and
+# irrep_spec, one equal irrep block per head). The others are retired.
+_SUPPORTED_GAUGE_GROUPS    = ("block_glk", "so_n")
+_RETIRED_GAUGE_GROUPS      = frozenset({"glk", "tied_block_glk", "so_k", "sp", "sp_n"})
 # Decoders decode_coordinates='reference' admits: linear reads xi = U^{-1} mu; the full Gaussian-KL
-# kernels read (xi, C); the diagonal Gaussian-KL kernels read (xi, diag C), exact up to a per-position
+# kernel reads (xi, C); the diagonal Gaussian-KL kernel reads (xi, diag C), exact up to a per-position
 # constant against a diagonal bank.
-_REFERENCE_DECODE_MODES    = ("linear", "diagonal", "diagonal_chunked", "full", "full_chunked")
+_REFERENCE_DECODE_MODES    = ("linear", "diagonal_chunked", "full_chunked")
+# Retired dense decode spellings and the chunked kernels they migrate to on load (same logits; the
+# dense helpers remain private oracles in vfe3.model.prior_bank).
+_DENSE_DECODE_MIGRATIONS   = {"diagonal": "diagonal_chunked", "full": "full_chunked", "family": "family_chunked"}
 
 
 class _ConfigTypeError(TypeError, ValueError):
@@ -90,11 +96,10 @@ class _ConfigTypeError(TypeError, ValueError):
 class VFE3Config:
     """The single authoritative configuration surface for VFE_3.0.
 
-    Fields are grouped: numerics, divergence seam, model structure, gauge seam,
-    belief family, free-energy coupling, attention, E-step, decode/encode, cross-
-    block handoff, normalization, and M-step / training. Each ``*_mode`` /
-    ``*_family`` / ``*_group`` field is a registry key. Validation runs once in
-    ``__post_init__`` in field-declaration order.
+    Fields are grouped: numerics, model structure, gauge seam, belief family,
+    free-energy coupling, attention, E-step, decode/encode, cross-block handoff,
+    normalization, and M-step / training. Each ``*_mode`` / ``*_family`` field is a
+    registry key. Validation runs once in ``__post_init__`` in field-declaration order.
     """
 
     #################################
@@ -136,19 +141,13 @@ class VFE3Config:
     trust_resume_checkpoint:   bool          = False
 
     #################################
-    #   f-divergence and e/m family
+    #         Belief family
     #################################
 
-    # Divergence FUNCTIONAL (registry key). renyi_order selects the member and is IGNORED by
-    # non-alpha functionals (e.g. squared_hellinger).
-    divergence_family:         str   = "renyi"        # "renyi" | "bhattacharyya" | "jeffreys" | "squared_hellinger"
-    renyi_order:               float = 1.0            # Renyi order (alpha = 1 -> KL)
-
     # Belief covariance STRUCTURE (registry key), the single source of truth for diagonal-vs-full.
-    # Read the derived read-only ``diagonal_covariance`` property, never a second flag.
+    # Read the derived read-only ``diagonal_covariance`` property, never a second flag. The
+    # divergence is KL (Renyi order 1) on every projected route.
     family:                    str   = "gaussian_diagonal"   # "gaussian_diagonal" | "gaussian_full"
-                                                             # | "gaussian_diagonal_exact" | "gaussian_frame_diagonal"
-                                                             # | "laplace_diagonal"
 
     #################################
     #         Initialization
@@ -168,15 +167,12 @@ class VFE3Config:
 
     # Encoder (registry key).
     encode_mode:               str   = "per_token"   # "per_token" | "per_token_additive"
-                                                     # | "canonical_content_gauge" | "canonical_content_projected"
 
     # Decoder (registry key). "linear" is the learned (V,K) readout logits = mu_q @ W^T (+ bias),
-    # discarding sigma. Every other mode reads out against the prior bank; 'diagonal'/'full'/'family'
-    # are DENSE legacy/oracle kernels rejected for fresh training (see _allow_legacy_dense_decode) --
-    # use their *_chunked counterparts, which stream the vocabulary and never materialize (B,N,V).
+    # discarding sigma. Every other mode reads out against the prior bank with a chunked kernel that
+    # streams the vocabulary and never materializes (B,N,V) in training.
     decode_mode:               str   = "linear"      # "linear" | "diagonal_chunked" | "full_chunked"
                                                      # | "family_chunked" | "expected_likelihood_chunked"
-                                                     # | (dense legacy, opt-in) "diagonal" | "full" | "family"
 
     # Coordinates the decoder reads. "local" (default) decodes the local moments (mu_i, Sigma_i).
     # "reference" decodes the reference moments xi_i = U_i^{-1} mu_i and C_i = U_i^{-1} Sigma_i U_i^{-T}
@@ -238,56 +234,43 @@ class VFE3Config:
     # non-candidate values left at float32 accuracy. The fused CE never reads the ranking, so under
     # "candidates" it streams in float32 exactly as with the guard off.
     decode_ranking_refinement:                  str  = "full"      # "full" | "candidates"
-    _allow_legacy_dense_decode:        InitVar[bool] = False
 
     #################################
     #          Gauge Group
     #################################
 
-    gauge_group:               str   = "block_glk"   # "block_glk" | "tied_block_glk" | "glk" | "so_k" | "sp"
-                                                     # | "so_n" | "sp_n"
+    # Structure group of the flat phi-cocycle Omega_ij = exp(phi_i) exp(-phi_j). block_glk: one
+    # independent GL(d_head) frame per head. so_n: one shared SO(group_n) element acting through
+    # the irrep blocks of irrep_spec, which on the projected routes must be n_heads equal blocks.
+    gauge_group:               str   = "block_glk"   # "block_glk" | "so_n"
 
-    # Ablation meta-toggle over the GL(K) gauge FRAME. DISTINCT from transport_mode below: that
-    # decides the connection's flatness, this decides whether the per-token frame exists at all.
-    #   "on"     (default, PURE PATH) the frame is whatever phi_scale / e_phi_lr / m_phi_lr / pos_phi
-    #            specify (learned when m_phi_lr > 0); byte-identical to omitting the toggle.
+    # Ablation meta-toggle over the GL(K) gauge FRAME (whether the per-token frame exists at all).
+    #   "on"     (default, PURE PATH) the frame is whatever phi_scale / m_phi_lr / pos_phi specify
+    #            (learned when m_phi_lr > 0); byte-identical to omitting the toggle.
     #   "off"    Omega_ij = exp(phi_i) exp(-phi_j) = I EXACTLY, by coercing phi_scale=0.0,
-    #            pos_phi='none', e_phi_lr=0.0, m_phi_lr=0.0 -- and REQUIRING pos_rotation='none',
-    #            since a positional rotation would make Omega != I (raises).
-    #   "frozen" a RANDOM but FIXED frame: keeps phi_scale>0, coerces e_phi_lr=m_phi_lr=0.0.
+    #            pos_phi='none', m_phi_lr=0.0 -- and REQUIRING pos_rotation='none', since a
+    #            positional rotation would make Omega != I (raises).
+    #   "frozen" a RANDOM but FIXED frame: keeps phi_scale>0, coerces m_phi_lr=0.0.
     # __post_init__ applies the coercion and warns. NB 'off' drops the pos_phi_free table, so to match
     # parameter counts against an 'on' baseline set pos_phi='none' in 'on' too, or compare against the
-    # equal-parameter 'frozen' arm. All three arms are reachable under
-    # relational_mode='projected_filtering', whose conditional path BUILDS its transport from the
-    # frame rather than bypassing it.
+    # equal-parameter 'frozen' arm. The projected routes BUILD their frames from phi, so all three
+    # arms are reachable.
     gauge_transport:           str   = "on"          # "on" | "off" | "frozen"
 
-    # Connection REGIME (registry key). Only the flat phi-cocycle is registered: Omega_ij =
-    # exp(phi_i) exp(-phi_j), a pure no-NN coboundary with no learned edge factor and no stateful
-    # transport parameter.
-    transport_mode:            str   = "flat"        # "flat"
-
-    # Cross-head GL(K) coupling: a list of directed (head_a, head_b) index pairs that add off-block
-    # generators (and a genuinely larger-than-direct-sum subalgebra under the builder's bracket
-    # closure) to the gauge basis. None = the current block-diagonal GL(d_head)^H gauge. Only a
-    # group whose builder accepts the kwarg (block_glk) supports it.
-    cross_couplings: Optional[List[Tuple[int, int]]] = None
-
-    # SO(N)/Sp(2m) irrep-tower groups ('so_n' / 'sp_n') only. The structure group is SO(group_n)
-    # (resp. Sp(group_n), group_n = 2m even) with group_n DECOUPLED from embed_dim. The embedding
-    # carries the direct sum of the irreps in irrep_spec -- (label, multiplicity) pairs laid out
-    # contiguously in order; heads = irrep blocks (possibly UNEQUAL dims). so_n labels 'l<p>' are the
-    # symmetric-traceless rank-p tensor irreps (group_n=3: the spin-p tower, dim 2p+1); sp_n labels
-    # 'sym<p>' are Sym^p of the defining rep (dim C(2m+p-1, p)). sum(mult * dim) must equal embed_dim.
-    # One shared per-token phi (n_gen = dim of the algebra) drives every block -- a TIED gauge. Both
-    # fields are consumed ONLY by these two groups (rejected otherwise).
+    # SO(N) irrep-tower group ('so_n') only. The structure group is SO(group_n) with group_n
+    # DECOUPLED from embed_dim. The embedding carries the direct sum of the irreps in irrep_spec --
+    # (label, multiplicity) pairs laid out contiguously in order; heads = irrep blocks, which the
+    # projected routes require to be n_heads blocks of equal dim d_head. Labels 'l<p>' are the symmetric-traceless rank-p tensor irreps (group_n=3: the
+    # spin-p tower, dim 2p+1). sum(mult * dim) must equal embed_dim. One shared per-token phi
+    # (n_gen = dim of the algebra) drives every block -- a TIED gauge. Both fields are consumed ONLY
+    # by so_n (rejected otherwise).
     group_n:                      Optional[int] = None
 
     # The annotation reflects the POST-coercion type: __post_init__ also accepts the JSON/TOML
     # round-trip list-of-lists form ([["l1", 3], ...]) and coerces each pair to a tuple.
     irrep_spec: Optional[List[Tuple[str, int]]] = None
 
-    # CG cross-type coupling (opt-in, default off; so_n/sp_n only): bilinear Clebsch-Gordan
+    # CG cross-type coupling (opt-in, default off; so_n only): bilinear Clebsch-Gordan
     # between-block update on the means, exactly equivariant for any weights; sigma untouched
     # (means-only phase). NEURAL-NETWORK EXCEPTION (sanctioned, default-off): learned scalar path
     # weights, zero-init (step 0 byte-identical).
@@ -314,10 +297,9 @@ class VFE3Config:
     # Head mixer (opt-in, default off): a learned Schur-commutant matrix mixing the equal-size
     # gauge-irrep blocks (under block_glk: the n_heads heads) of the converged belief. Identity init
     # -> step-0 bit-identical to off. Breaks strict gauge equivariance under block_glk's untied
-    # per-block gauge (exact at init, deviates as the mixer drifts); the tied_block_glk group
-    # restores EXACT equivariance on the full-covariance path. Needs a group with >= 2 blocks
-    # (block_glk / tied_block_glk heads, or an so_n/sp_n tower); a single-block group is rejected at
-    # config validation, and a head-block group with n_heads < 2 auto-disables the mixer with a warning.
+    # per-block gauge (exact at init, deviates as the mixer drifts); an so_n tower mixes per
+    # isotypic component. Needs >= 2 blocks: block_glk with n_heads < 2 auto-disables the mixer with
+    # a warning.
     use_head_mixer:                    bool = False
 
     # PriorBank-native per-gauge-block evidence calibration: one zero-initialized scalar per block,
@@ -346,12 +328,9 @@ class VFE3Config:
 
     # Gauge-RoPE (default-off): a block-diagonal positional rotation R(theta) folded into each
     # realized frame on the right, V_i = U_i R(theta_i)^T, which carries both moments on the
-    # projected routes. rope_full_gauge only affected the retired transported pair energy and is
-    # inert; it still requires full covariance for backward compatibility of saved configs.
+    # projected routes.
     pos_rotation:              str   = "none"      # "none" | "rope"
     rope_base:                 float = 100.0       # rotary frequency base
-
-    rope_full_gauge:           bool  = False       # rotate covariance too (needs family="gaussian_full")
 
     # True (default) = the coherent single-gauge path: the gauge-RoPE rotation feeds BOTH the
     # routing frame and the content/value frame. False keeps routing on U_i R_i^T and moves content
@@ -411,8 +390,7 @@ class VFE3Config:
     # Weight on the ENTIRE belief-coupling block of F -- sum_ij [ beta_ij E_ij +
     # tau beta_ij log(beta_ij/pi_ij) ] -- relative to the alpha self-coupling and the likelihood.
     # 1.0 = the canonical/pure F (byte-identical). It scales the POST-softmax block (NOT the energy
-    # inside the softmax), so beta = softmax(-E/tau) is unchanged and the analytic kernel stays
-    # envelope-consistent with the autograd oracle.
+    # inside the softmax), so beta = softmax(-E/tau) is unchanged.
     lambda_beta:                float = 1.0
     lambda_alpha:               float = 1.0          # constant self-coupling value
     mass_phi:                   float = 0.0          # (mass_phi/2) ||phi||^2 penalty
@@ -517,70 +495,14 @@ class VFE3Config:
     #
     #################################
 
+    # Receiver step sizes of the projected_gradient 'euler' update. The mean step is the Fisher
+    # natural gradient nat_mu = Sigma grad_mu, differentiated through the unrolled receiver with
+    # each source row frozen (filtering). The frame is fixed inside the stack (no E-step phi step).
     e_q_mu_lr:                 float = 0.5
     e_q_sigma_lr:              float = 0.015
-    e_phi_lr:                  float = 0.0
 
-    # E-step MEAN preconditioner. 'fisher' (default, pure) descends the Fisher natural gradient
-    # nat_mu = Sigma*grad_mu; 'raw' descends the raw Euclidean grad_mu. The sigma retraction is
-    # unchanged either way, so this isolates the MEAN preconditioner.
-    e_step_mu_precond:         str   = "fisher"       # "fisher" | "raw"
-
-    # E-step update rule (registry key). 'gradient' (default, pure): one natural-gradient step per
-    # inner iteration. 'mm_exact': the closed-form coordinate minimizer of the beta-frozen,
-    # strict-pair-masked diagonal-KL surrogate F_hat = sum_i a_i KL(q_i||p_i)
-    # + lambda_beta sum_ij beta0_ij KL(q_i||Omega_ij q_j) -- precisions add, means fuse
-    # precision-weighted (harmonic-barycenter sigma*) at the same O(N^2 K) cost. The strict pair mask
-    # excludes the structural E_ii = 0 self-pairs, so the surrogate is NOT a majorizer of the
-    # canonical frozen-attention objective and the update carries NO majorization /
-    # monotone-F-descent / exact self-consistent-argmin guarantee -- it is a one-step fusion toward
-    # the mask-selected target. KERNEL-ROUTE ONLY (filtering + gaussian_diagonal + renyi order 1 +
-    # attention entropy); rejected otherwise in __post_init__.
-    e_step_update:             str   = "gradient"     # "gradient" | "mm_exact"
-
-    # Damped mm_exact step theta <- (1-eta) theta + eta theta* (natural-coordinate mirror descent);
-    # 1.0 = the full exact coordinate minimizer. Read only under e_step_update='mm_exact'.
-    mm_damping:                float = 1.0
-
-    # E-step backward estimator (manuscript Algorithm 1).
-    #   'unroll' (default)  differentiate through the inner trajectory. Keeps the OWN-ROW
-    #                       second-order term d^2F/dq_i^2 but NOT the cross-row d^2F/dq_i dq_j:
-    #                       under the default gradient_mode='filtering' the key slot is a detached
-    #                       copy, so it is absent from the outer backward too. The detach is
-    #                       intended and documented (the mean-field coordinate-ascent default, with
-    #                       'smoothing' the registered alternative).
-    #   'straight_through'  each inner update computes its tangent DETACHED but rebuilds the belief
-    #                       grad-connected to the previous belief (mu_next = mu_prev +
-    #                       delta.detach()), so d belief_next/d belief_prev = I flows WITHOUT the
-    #                       second-order term. Forward VALUE is byte-identical to 'unroll'; only the
-    #                       BACKWARD differs.
-    #   'detach'            the whole E-step under torch.no_grad -- no E-step gradient at all.
-    e_step_gradient:              str   = "unroll"    # "unroll" | "straight_through" | "detach"
     phi_precond_mode:             str   = "none"      # "none" | "clip" | "killing" | "killing_per_block"
                                                       # | "pullback" | "pullback_per_block"
-
-    # Opt-in (default ON here): make the autograd belief-gradient ORACLE -- served for the non-kernel
-    # families: gradient_mode='smoothing', family='gaussian_full', renyi_order != 1 -- return a
-    # create_graph (differentiable) gradient under e_step_gradient='unroll', so the
-    # unrolled-through-inference signal reaches the prior tables, matching the closed-form kernel.
-    # NUMERICS: this builds a SECOND-ORDER graph through the E-step. The SINGLE training backward is
-    # FINITE for all the non-kernel families, full covariance included: the SPD retractions route
-    # their eigendecomposition through the gap-regularized damped eigh (whose Lorentzian-damped
-    # adjoint is finite on the degenerate isotropic Sigma = I default, where stock eigh backward is
-    # 100% NaN), and the full-covariance KL/entropy use safe_cholesky. The residual caveat is HIGHER
-    # order only: a genuine SECOND backward (double-grad / Hessian-vector product) can still NaN at
-    # large Renyi order (renyi_order >= 2), so do not rely on this toggle for > 1st-order autograd.
-    oracle_unroll_grad:        bool  = True
-
-    # Gradient taken through the belief roles.
-    #   filtering   Only each token's query/receiver role: key/source beliefs are detached, so each
-    #               position updates from earlier beliefs without modifying those earlier beliefs
-    #               through its own row (the source beliefs act as a frozen snapshot).
-    #   smoothing   BOTH query and key roles on shared belief tensors: earlier beliefs also receive
-    #               gradients from later positions that use them as keys, i.e. the complete coupled
-    #               scalar is differentiated. Use with oracle_unroll_grad=True.
-    gradient_mode:                str   = "filtering"   # "filtering" | "smoothing"
-    include_attention_entropy:    bool  = True          # canonical (True) vs surrogate (False)
 
     # Skip the belief-channel sigma E-step update (gradient + retraction) entirely. OPT-IN dead-compute
     # ablation for configs where q's sigma has no consumer (linear decode, no norms); NOT coerced from
@@ -596,14 +518,11 @@ class VFE3Config:
     m_phi_lr:                  float = 0.015
 
     # Independent rates for untied decode means (or linear weight/bias) and log variances.
-    # None inherits the corresponding encoder rate, with m_decode_lr as a legacy fallback.
-    # Shared encode/decode tables retain encoder rates. These fields do not change temperature.
+    # None inherits the corresponding encoder rate. Shared encode/decode tables retain encoder
+    # rates. These fields do not change temperature. A historical combined m_decode_lr migrates
+    # into whichever of the two is None on load.
     m_decode_mu_lr:            Optional[float] = None
     m_decode_sigma_lr:         Optional[float] = None
-
-    # Legacy combined override for older configs: fallback mean/variance plus learned temperature.
-    # Explicit split fields take precedence for their own tables. None preserves old grouping.
-    m_decode_lr:               Optional[float] = None
 
     # Optional absolute M-step rate for the LEARNED POSITIONAL frame table (pos_phi='learned'), which
     # otherwise rides m_phi_lr with phi_embed. The two tables compose into ONE clamped frame and so
@@ -628,7 +547,7 @@ class VFE3Config:
     # its product-residual backtracking (the historical route, unchanged). "group_log" is the exact
     # right product phi_new = Log(exp(phi) exp(-eta s xi)) with the closed-form U-space pullback
     # direction (series direction off the principal strip); it halves only on log, residual,
-    # descent or chart-bound failure (derivation 2026-09-28, Track 1). glk / untied block_glk only.
+    # descent or chart-bound failure (derivation 2026-09-28, Track 1). Untied block_glk only.
     m_phi_group_retraction:    str       = "chart"    # "chart" | "group_log"
     # "fisher_group" (derivation 2026-09-28, Track 2) replaces the pullback direction by the belief-
     # Fisher natural gradient: the Fisher-Rao metric of the reference belief U^{-1} q pulled back to
@@ -678,14 +597,12 @@ class VFE3Config:
     kl_max:                    float = 100.0
     sigma_max:       Optional[float] = 100.0
 
-    # E-step MEAN trust region (default OFF = current unbounded update). When set to a float, every
-    # per-iteration mean step delta_mu = e_q_mu_lr*nat_mu is clamped in sigma-whitened units to at
-    # most this many standard deviations (mu_trust_mode='box' per-coord, 'ball' = 2-norm Mahalanobis
-    # ball). None reproduces the bare mu = mu - e_q_mu_lr*nat_mu bit-for-bit.
+    # E-step MEAN trust region. When set to a float, every per-iteration mean step
+    # delta_mu = e_q_mu_lr*nat_mu is projected onto the Mahalanobis ball of this many standard
+    # deviations, delta_mu^T Sigma^{-1} delta_mu <= trust^2. None reproduces the bare
+    # mu = mu - e_q_mu_lr*nat_mu bit-for-bit.
     e_mu_q_trust:    Optional[float] = 2
     e_sigma_q_trust:           float = 5.0       # diag L2 / full Frobenius: one shared whole-tangent ball
-
-    mu_trust_mode:             str   = "ball"          # "ball" | "box" (consulted only when e_mu_q_trust is not None)
 
     # L2 clipping threshold applied independently to each optimizer role after accumulation.
     # None or zero disables clipping.
@@ -716,40 +633,10 @@ class VFE3Config:
     exp_fp64_norm_threshold:   float = 20.0            # upcast when max ||M||_F >= this
     frame_pair_fp64_escalation: bool = False          # opt-in: redo a frame pair (U, U^-1) in float64 when kappa_F(U) eps32 > 1e-4
 
-    # Second trigger for the diagonal-congruence float64 escalation. The DEFAULT guard is sign-only:
-    # recompute in float64 iff the working-dtype congruence went negative -- one amin reduction the
-    # floor needs regardless. Positivity is necessary but not sufficient (cancellation destroys
-    # accuracy before it destroys sign), so this toggle adds the conditioning proxy
-    # cond(exp_phi)^4 * eps > 1e-3, which bounds the quadratic form's backward error (Higham 2002,
-    # 3.1). It is OPT-IN because it is not free: it runs svdvals on the vertex blocks and then a
-    # bool() on the result -- an SVD launch plus a GPU->CPU sync -- on the HEALTHY path of every
-    # covariance transport (measured 85 -> 126 ms/step at K=20, with no value change in the
-    # well-conditioned case). Turn it on where the accuracy actually bites: large K, large ||phi||,
-    # ill-conditioned frames.
-    congruence_cond_escalation: bool = False         # True -> also escalate on the conditioning proxy
-
-    # Working precision of the FULL-covariance pair KL (family="gaussian_full" only; the diagonal
-    # family already keys its island on operand dtypes). "fp64" is the historical unconditional
-    # float64 island, so leaving it alone is byte-identical to the pre-2026-08-05 build.
-    # "fp32_escalate" evaluates the (B,N,N,K,K) grid in float32 and recomputes in float64 only when a
-    # Cholesky actually fails
+    # Working precision of the FULL-covariance pair KL in the family_chunked decoder (family=
+    # "gaussian_full" only). "fp64" is the historical unconditional float64 island.
+    # "fp32_escalate" evaluates in float32 and recomputes in float64 only when a Cholesky fails.
     full_cov_kl_precision:     str   = "fp32_escalate"   # "fp32_escalate" | "fp64" | "fp32_escalate_cond"
-
-    # Working precision of the full-covariance CONGRUENCE Omega Sigma Omega^T. Distinct from
-    # full_cov_kl_precision above: that governs the pair DIVERGENCE, this governs the transport
-    # sandwich that feeds it. At the live shape it is the largest stage in the step -- 1.573 GFLOP of
-    # float64 over ~1.57 GB, 0.83 FLOP/byte, on a card whose float64 rate is ~1/64 of float32.
-    # "fp32_escalate" contracts in float32 and redoes a batch in float64 only if the float32 result
-    # lost finiteness; the congruence SQUARES cond(Omega), so it is a real accuracy trade at high
-    # ||phi||. A float64 SOURCE contracts in float64 under either setting.
-    full_cov_congruence_precision: str = "fp32_escalate"      # "fp32_escalate" | "fp64"
-
-    # Strict post-congruence certificate. When enabled, factor every transported pair covariance and
-    # promote the complete pair field to float64 if any matrix is uncertified. At B=64, N=128, K=20
-    # this checks 1,048,576 separate 20x20 matrices and the promoted field is about 3.1 GiB. Keep
-    # this opt-in for accuracy investigations; False retains the selected working precision without
-    # the additional certificate or fallback recompute.
-    full_cov_congruence_certification: bool = False
 
     # Conditioning-triggered float64 source recovery in the projected attention scorers. A float32
     # projected covariance G whose zero-jitter Cholesky FAILS is always rebuilt from its source
@@ -806,10 +693,9 @@ class VFE3Config:
     # optimizer step. The pullback-group route instead treats this value as an in-optimizer candidate
     # bound and rejects atomically; when None, that route uses the fixed factor radius 5.0.
     #
-    # When this is None under m_phi_update_mode='adamw' with e_phi_lr=0.0, NOTHING bounds ||phi||:
-    # train.py gates the chart projection on this field being set, the 'adamw' phi policy registers
-    # no manifold hook, and retract_phi's own cap (max_norm=5.0) is reachable only from the E-step
-    # phi substep. TRANSPORT_CLAMP_MAX_NORM bounds the EXPONENTIATED operator, not the parameter.
+    # When this is None under m_phi_update_mode='adamw', NOTHING bounds ||phi||: train.py gates the
+    # chart projection on this field being set, and the 'adamw' phi policy registers no manifold
+    # hook. TRANSPORT_CLAMP_MAX_NORM bounds the EXPONENTIATED operator, not the parameter.
     # Archived runs show phi_matrix_norm_median rising 0.86 -> ~7.4 with vertex_cond_max reaching
     # ~4e3, and transport conditioning grows with ||phi||; 5.0 (the GL retraction's own radius) is a
     # reasonable bound. Left at None because it is the shipped default and every value the
@@ -853,29 +739,11 @@ class VFE3Config:
     #                                          0.0 (with min_lr=0) is the pure half-cosine-to-zero path.
 
     generate_embedding_figures:     bool = True
-    # Exact common-frame KL scoring for eligible flat full-Gaussian transports.
-    # Unsupported paths retain the pairwise implementation; default preserves existing runs.
-    # "common_frame_factored" (optimization_plan.md WS3) scores the same pulled-back KL from
-    # square-root CholeskyQR2 factors and certifies those factors (eps kappa_1 <= 3e-4) instead of
-    # admitting only cond(U_i)^2 cond(C_j) <= 1/(64 d eps), which rejected every call on the saved
-    # K=64/K=128 frames (Phase 0, 2026-09-24), so the route fell back to the pairwise congruence.
-    full_cov_kl_backend:           str   = "common_frame"  # "common_frame" | "common_frame_factored" | "pairwise"
-
-    
 
 
-    def __post_init__(
-        self,
-        _allow_legacy_dense_decode: bool,
-    ) -> None:
-        for name, value in (
-            ("_allow_legacy_dense_decode", _allow_legacy_dense_decode),
-        ):
-            if type(value) is not bool:
-                raise _ConfigTypeError(f"{name} must be a plain bool")
-        # An InitVar is not a dataclass field, so keep the admission on the instance for
-        # serialize_config to persist (it shadows the class-level default False).
-        self._allow_legacy_dense_decode = _allow_legacy_dense_decode
+    def __post_init__(self) -> None:
+        # Every plain bool/int field is gated here on its exact type (bool is not an int, and
+        # "False" is not a bool), so the later validators need not repeat the type test.
         for field in fields(self):
             if field.type in (bool, int):
                 value = getattr(self, field.name)
@@ -891,9 +759,11 @@ class VFE3Config:
                 f"retired attention mode {self.attention_mode!r}; full-state architecture "
                 "requires explicit migration to projected_predictive or projected_gradient")
         _require(self.attention_mode, ("projected_predictive", "projected_gradient"), "attention_mode")
+        if self.gauge_group in _RETIRED_GAUGE_GROUPS:
+            raise ValueError(f"gauge_group={self.gauge_group!r} is retired; supported groups are "
+                             f"{_SUPPORTED_GAUGE_GROUPS}")
+        _require(self.gauge_group, _SUPPORTED_GAUGE_GROUPS, "gauge_group")
         full_link = self.attention_mode == "projected_gradient"
-        if type(self.attention_residual) is not bool:
-            raise ValueError("attention_residual must be a bool")
         if self.attention_residual and full_link:
             raise ValueError("attention_residual requires attention_mode='projected_predictive'")
         _require(self.relational_routing, ("gaussian_kl", "noisy_query"), "relational_routing")
@@ -934,81 +804,24 @@ class VFE3Config:
                 and not (isinstance(self.lambda_alpha, Real) and self.lambda_alpha > 0)):
             raise ValueError("relational_receiver_law='channel_likelihood' requires lambda_alpha > 0: "
                              "the prior divergence carries the receiver's only entropy term")
-        for name in ("m_relational_score_lr", "m_relational_content_lr"):
-            rate = getattr(self, name)
-            if rate is not None and (
-                    isinstance(rate, bool) or not isinstance(rate, Real)
-                    or not math.isfinite(rate) or rate < 0.0):
-                raise ValueError(f"{name} must be finite and >= 0 or None, got {rate!r}")
-        requirements = {
-            "divergence_family": "renyi", "renyi_order": 1.0, "include_attention_entropy": True,
-            "gradient_mode": "filtering", "e_step_update": "gradient",
-            "e_step_gradient": "unroll", "oracle_unroll_grad": True, "n_e_steps": 1,
-            "e_phi_lr": 0.0, "transport_mode": "flat", "gauge_group": "block_glk",
-        }
-        if full_link:
-            requirements.pop("n_e_steps")
-            requirements.update(lambda_alpha_mode="constant", e_step_mu_precond="fisher")
-        incompatible = [
-            f"{name}={getattr(self, name)!r} (requires {expected!r})"
-            for name, expected in requirements.items()
-            if getattr(self, name) != expected
-        ]
+        # The projected support envelope. The divergence (KL), connection (flat), gradient roles
+        # (filtering), estimator (unroll) and mean preconditioner (Fisher) are fixed, not fields.
+        incompatible = []
+        if not full_link and self.n_e_steps != 1:
+            incompatible.append(f"n_e_steps={self.n_e_steps!r} (requires 1)")
+        if full_link and self.lambda_alpha_mode != "constant":
+            incompatible.append(f"lambda_alpha_mode={self.lambda_alpha_mode!r} (requires 'constant')")
         if self.encode_mode not in ("per_token", "per_token_additive"):
             incompatible.append(
                 f"encode_mode={self.encode_mode!r} (requires 'per_token' or 'per_token_additive')")
-        if self.family not in ("gaussian_diagonal", "gaussian_full",
-                               "gaussian_diagonal_exact", "gaussian_frame_diagonal"):
-            incompatible.append(f"family={self.family!r} (requires a supported Gaussian family)")
-        if full_link and self.family not in ("gaussian_diagonal", "gaussian_full"):
-            incompatible.append(f"family={self.family!r} (projected_gradient requires gaussian_diagonal or gaussian_full)")
+        if self.family not in ("gaussian_diagonal", "gaussian_full"):
+            incompatible.append(f"family={self.family!r} (requires gaussian_diagonal or gaussian_full)")
         if self.n_heads < 2:
             incompatible.append(f"n_heads={self.n_heads!r} (requires at least 2)")
-        elif self.embed_dim % self.n_heads:
-            incompatible.append(f"embed_dim={self.embed_dim!r} (requires equal heads)")
-        if self.cross_couplings:
-            incompatible.append(f"cross_couplings={self.cross_couplings!r} (requires none)")
         if incompatible:
             raise ValueError(
                 f"attention_mode={self.attention_mode!r} has unsupported projected_filtering configuration: "
                 + "; ".join(incompatible))
-
-        # encode_mode='canonical_content_gauge' stores the token tables as canonical, frame-intrinsic
-        # (a_v, s_v) coordinates; its exactness needs the whole flat-cocycle contract, so reject the
-        # incompatible fields here rather than let a downstream validator report a secondary symptom.
-        if self.encode_mode == "canonical_content_gauge":
-            incompatible = []
-            if self.family != "gaussian_frame_diagonal":
-                incompatible.append(f"family={self.family!r}")
-            if self.decode_mode not in ("diagonal", "diagonal_chunked"):
-                incompatible.append(f"decode_mode={self.decode_mode!r}")
-            if incompatible:
-                raise ValueError(
-                    "encode_mode='canonical_content_gauge' requires "
-                    "family='gaussian_frame_diagonal', "
-                    "decode_mode='diagonal'/'diagonal_chunked'; got "
-                    + ", ".join(incompatible)
-                )
-
-        # Practical canonical-content control: the token tables are intrinsic diagonal moments,
-        # materialized once into the realized token-plus-position frame before the diagonal E-step.
-        # The final query is pulled back to a full canonical covariance at decode, so the otherwise
-        # rank-incompatible full decoder is intentional and mandatory for this one named mode.
-        if self.encode_mode == "canonical_content_projected":
-            incompatible = []
-            if self.family != "gaussian_diagonal":
-                incompatible.append(f"family={self.family!r}")
-            if self.e_phi_lr != 0.0:
-                incompatible.append(f"e_phi_lr={self.e_phi_lr!r}")
-            if self.decode_mode not in ("full", "full_chunked"):
-                incompatible.append(f"decode_mode={self.decode_mode!r}")
-            if incompatible:
-                raise ValueError(
-                    "encode_mode='canonical_content_projected' requires "
-                    "family='gaussian_diagonal', "
-                    "e_phi_lr=0.0, decode_mode='full'/'full_chunked'; got "
-                    + ", ".join(incompatible)
-                )
 
         # numerics
         if not (math.isfinite(self.eps) and self.eps > 0.0):
@@ -1094,12 +907,11 @@ class VFE3Config:
                 )
             self.phi_scale    = 0.0
             self.pos_phi      = "none"
-            self.e_phi_lr     = 0.0
             self.m_phi_lr     = 0.0
             import warnings
             warnings.warn(
                 "gauge_transport='off': forcing the gauge frame to the identity (phi_scale=0.0, "
-                "pos_phi='none', e_phi_lr=0.0, m_phi_lr=0.0), so "
+                "pos_phi='none', m_phi_lr=0.0), so "
                 "the transport is identity and frozen.",
                 UserWarning, stacklevel=2,
             )
@@ -1109,25 +921,13 @@ class VFE3Config:
                     f"gauge_transport='frozen' needs a nonzero random frame (phi_scale>0), got "
                     f"phi_scale={self.phi_scale}; use gauge_transport='off' for the identity frame."
                 )
-            self.e_phi_lr = 0.0
             self.m_phi_lr = 0.0
             import warnings
             warnings.warn(
                 f"gauge_transport='frozen': freezing the random gauge frame at init "
-                f"(phi_scale={self.phi_scale}, e_phi_lr=0.0, m_phi_lr=0.0); "
+                f"(phi_scale={self.phi_scale}, m_phi_lr=0.0); "
                 "the frame is fixed, not learned.",
                 UserWarning, stacklevel=2,
-            )
-
-        # divergence seam: divergence_family is the FUNCTIONAL (f-divergence) registry key, distinct
-        # from `family` (the covariance-structure kernel). renyi_order is IGNORED by non-alpha
-        # functionals (e.g. squared_hellinger). Validated against the functional REGISTRY, not a
-        # hardcoded list, so a newly registered functional is config-selectable without editing here.
-        from vfe3.divergence import divergence_functionals
-        _require(self.divergence_family, divergence_functionals(), "divergence_family")
-        if not (math.isfinite(self.renyi_order) and self.renyi_order > 0.0):
-            raise ValueError(
-                f"renyi_order must be finite and positive, got {self.renyi_order}"
             )
 
         # model structure
@@ -1168,41 +968,23 @@ class VFE3Config:
                 f"embed_dim={self.embed_dim} must be divisible by n_heads={self.n_heads}"
             )
 
-        # gauge seam, validated against the group REGISTRY (not a hardcoded literal) so a newly
-        # registered group is a valid config value without editing this validator.
-        from vfe3.geometry.groups import _GROUPS
-        _require(self.gauge_group, tuple(sorted(_GROUPS)), "gauge_group")
-        # Sp(2m,R) lives in even dimension K = 2m; reject an odd embed_dim here, with a clear
-        # message, rather than letting generate_sp raise mid-build.
-        if self.gauge_group == "sp" and self.embed_dim % 2 != 0:
-            raise ValueError(
-                f"gauge_group='sp' (Sp(2m,R)) requires an EVEN embed_dim (K=2m), got "
-                f"embed_dim={self.embed_dim}"
-            )
-        # so_n / sp_n irrep towers: validate group_n + irrep_spec at construction (labels resolve,
-        # block dims sum to embed_dim) so a bad spec fails here with the computed dims.
-        if self.gauge_group in ("so_n", "sp_n"):
-            _algebra = "so" if self.gauge_group == "so_n" else "sp"
+        # gauge seam. so_n irrep tower: validate group_n + irrep_spec at construction (labels
+        # resolve, block dims sum to embed_dim) so a bad spec fails here with the computed dims.
+        if self.gauge_group == "so_n":
             if self.group_n is None or self.irrep_spec is None:
                 raise ValueError(
                     f"gauge_group={self.gauge_group!r} requires both group_n and irrep_spec "
                     f"([(label, mult), ...]); got group_n={self.group_n}, "
                     f"irrep_spec={self.irrep_spec}"
                 )
-            if not isinstance(self.group_n, int) or self.group_n < 2:
+            if type(self.group_n) is not int or self.group_n < 2:
                 raise ValueError(f"group_n must be an int >= 2, got {self.group_n!r}")
-            if self.gauge_group == "sp_n" and self.group_n % 2 != 0:
-                raise ValueError(
-                    f"gauge_group='sp_n' (Sp(2m,R)) requires an EVEN group_n (= 2m), got "
-                    f"group_n={self.group_n}"
-                )
             if not isinstance(self.irrep_spec, list) or not self.irrep_spec:
                 raise ValueError(
                     f"irrep_spec must be a non-empty list of (label, mult) pairs, got "
                     f"{self.irrep_spec!r}"
                 )
-            # JSON has no tuple type; coerce reloaded list pairs to tuples (the cross_couplings
-            # round-trip pattern above).
+            # JSON has no tuple type; coerce reloaded list pairs to tuples.
             self.irrep_spec = [tuple(p) if isinstance(p, list) else p for p in self.irrep_spec]
             from vfe3.geometry.irreps import irrep_dim
             _block_dims: List[int] = []
@@ -1215,19 +997,28 @@ class VFE3Config:
                         "(label: str, mult: plain int >= 1) pair, "
                         f"got {_entry!r}"
                     )
-                _d = irrep_dim(self.group_n, algebra=_algebra, label=_entry[0])
+                _d = irrep_dim(self.group_n, algebra="so", label=_entry[0])
                 _block_dims.extend([_d] * _entry[1])
             if sum(_block_dims) != self.embed_dim:
                 raise ValueError(
                     f"irrep_spec blocks {_block_dims} sum to {sum(_block_dims)} != "
                     f"embed_dim={self.embed_dim} (group_n={self.group_n})"
                 )
+            # The projected routes read the frame through the operators' head partition: each head
+            # is one gauge block, so the irrep blocks must be n_heads equal blocks of size d_head
+            # (relational_score slices the dense inverse frame into those head blocks).
+            if _block_dims != [self.embed_dim // self.n_heads] * self.n_heads:
+                raise ValueError(
+                    f"gauge_group='so_n' on the projected routes needs n_heads={self.n_heads} equal "
+                    f"irrep blocks of size d_head={self.embed_dim // self.n_heads} (one gauge block "
+                    f"per head); irrep_spec gives blocks {_block_dims}"
+                )
             # One shared phi drives EVERY block, so the generators do not partition per block:
-            # the per-block phi preconditioners are undefined (the tied_block_glk footprint).
+            # the per-block phi preconditioners are undefined.
             if self.phi_precond_mode in ("killing_per_block", "pullback_per_block"):
                 raise ValueError(
                     f"phi_precond_mode={self.phi_precond_mode!r} is incompatible with "
-                    f"gauge_group={self.gauge_group!r}: the shared so/sp generators act in every "
+                    f"gauge_group={self.gauge_group!r}: the shared so generators act in every "
                     f"irrep block, so a per-block metric is undefined. Use 'none', 'clip', or "
                     f"the ambient 'killing'."
                 )
@@ -1244,12 +1035,12 @@ class VFE3Config:
                     )
         elif self.group_n is not None or self.irrep_spec is not None:
             raise ValueError(
-                f"group_n/irrep_spec are consumed only by gauge_group 'so_n'/'sp_n'; got "
+                f"group_n/irrep_spec are consumed only by gauge_group 'so_n'; got "
                 f"gauge_group={self.gauge_group!r}"
             )
-        if self.use_cg_coupling and self.gauge_group not in ("so_n", "sp_n"):
+        if self.use_cg_coupling and self.gauge_group != "so_n":
             raise ValueError(
-                f"use_cg_coupling requires an irrep-labeled tower group ('so_n'/'sp_n'); got "
+                f"use_cg_coupling requires the irrep-labeled tower group 'so_n'; got "
                 f"gauge_group={self.gauge_group!r}"
             )
         # CG moment-closure. 'delta_full' needs a full-covariance Gaussian family (the dense
@@ -1280,14 +1071,11 @@ class VFE3Config:
                 f"cg_energy_weight={self.cg_energy_weight} > 0 requires use_cg_coupling=True "
                 f"(the moment-energy regularizer reads the CG coupling's per-layer pushforward)."
             )
-        # The head mixer needs >= 2 gauge blocks to mix. Two single-block cases differ:
-        #   (1) a head-block group (block_glk/tied_block_glk) with n_heads < 2 is a single-HEAD
-        #       artifact of a head/K sweep -- nothing to mix -- so AUTO-DISABLE and warn, letting
-        #       use_head_mixer=True stay set across a sweep;
-        #   (2) a genuinely single-BLOCK group (glk/so_k/sp) cannot mix regardless of head count, a
-        #       static misconfiguration, so RAISE. so_n/sp_n mix per isotypic component.
+        # The head mixer needs >= 2 gauge blocks to mix. block_glk with n_heads < 2 is a single-HEAD
+        # artifact of a head/K sweep -- nothing to mix -- so AUTO-DISABLE and warn, letting
+        # use_head_mixer=True stay set across a sweep. so_n mixes per isotypic component.
         if (self.use_head_mixer
-                and self.gauge_group in ("block_glk", "tied_block_glk")
+                and self.gauge_group == "block_glk"
                 and self.n_heads < 2):
             import warnings
             warnings.warn(
@@ -1298,154 +1086,31 @@ class VFE3Config:
                 stacklevel=2,
             )
             self.use_head_mixer = False
-        if self.use_head_mixer and self.gauge_group in ("glk", "so_k", "sp"):
-            raise ValueError(
-                f"use_head_mixer=True needs >= 2 gauge blocks to mix, but "
-                f"gauge_group={self.gauge_group!r} is a single-block group. Use "
-                f"block_glk/tied_block_glk with n_heads >= 2, or an so_n/sp_n irrep tower."
-            )
         if self.use_priorbank_head_evidence_mixer:
             if self.decode_mode == "linear":
                 raise ValueError(
                     "use_priorbank_head_evidence_mixer=True requires a prior-bank decode_mode."
                 )
-            if ((self.gauge_group in ("block_glk", "tied_block_glk") and self.n_heads < 2)
-                    or self.gauge_group in ("glk", "so_k", "sp")
-                    or (self.gauge_group in ("so_n", "sp_n") and len(_block_dims) < 2)):
+            if ((self.gauge_group == "block_glk" and self.n_heads < 2)
+                    or (self.gauge_group == "so_n" and len(_block_dims) < 2)):
                 raise ValueError(
                     "use_priorbank_head_evidence_mixer=True requires at least two gauge blocks. "
                     f"gauge_group={self.gauge_group!r} does not provide a multi-block PriorBank."
                 )
-        # transport_mode selects the connection REGIME, validated against the transport REGISTRY so a
-        # newly registered regime is a valid config value without editing this validator.
-        from vfe3.geometry.transport import _TRANSPORTS
-        _require(self.transport_mode, tuple(sorted(_TRANSPORTS)), "transport_mode")
-        # cross_couplings (off-block GL(K) head coupling) is supported only by a group builder that
-        # accepts the kwarg, detected by inspecting the registered builder's signature rather than a
-        # hardcoded name list. Each pair must be a distinct in-range directed head pair.
-        if self.cross_couplings is not None:
-            import inspect
-            from vfe3.geometry.groups import get_group
-            builder = get_group(self.gauge_group)
-            if "cross_couplings" not in inspect.signature(builder).parameters:
-                raise ValueError(
-                    f"cross_couplings is not supported by gauge_group={self.gauge_group!r} (its "
-                    f"builder does not accept the kwarg); use 'block_glk', or leave cross_couplings "
-                    f"None"
-                )
-            if not isinstance(self.cross_couplings, list):
-                raise ValueError(
-                    f"cross_couplings must be a list of (int, int) head pairs, got "
-                    f"{type(self.cross_couplings).__name__}"
-                )
-            # JSON has no tuple type, so a config.json reloaded by viz.report._load_config hands
-            # back list pairs; coerce them to tuples so the round-trip rebuild does not trip the
-            # isinstance(pair, tuple) gate below (and downstream builders see a consistent type).
-            self.cross_couplings = [tuple(p) if isinstance(p, list) else p
-                                    for p in self.cross_couplings]
-            for pair in self.cross_couplings:
-                if (not isinstance(pair, tuple) or len(pair) != 2
-                        or not all(isinstance(x, int) for x in pair)):
-                    raise ValueError(
-                        f"each cross_couplings entry must be an (int, int) head pair, got {pair!r}"
-                    )
-                a, b = pair
-                if a == b:
-                    raise ValueError(f"cross_couplings self-coupling ({a},{a}) not allowed (a != b)")
-                if not (0 <= a < self.n_heads and 0 <= b < self.n_heads):
-                    raise ValueError(
-                        f"cross_couplings head indices ({a},{b}) out of range [0, {self.n_heads})"
-                    )
-            # Cross-coupling's off-block generators destroy the per-head direct sum, so the builder
-            # reports a SINGLE irrep block [K]: n_heads no longer sets the runtime attention-head
-            # count and the energy is one full-K block. Fail FAST on combinations that would otherwise
-            # crash late at model construction, and warn on the semantic shift.
-            import warnings
-            for _pname in ("beta_attention_prior",):
-                if getattr(self, _pname) in ("alibi", "causal_alibi", "causal_alibi_noself"):
-                    raise ValueError(
-                        f"{_pname}={getattr(self, _pname)!r} is incompatible with cross_couplings: an "
-                        f"alibi prior builds an (n_heads, N, N) per-head bias, but cross-coupled "
-                        f"block_glk collapses irrep_dims to a single block [K] (one runtime attention "
-                        f"head). Use a headless prior (uniform/causal/causal_windowed/...) with "
-                        f"cross_couplings."
-                    )
-            if self.use_head_mixer:
-                raise ValueError(
-                    "use_head_mixer=True is incompatible with cross_couplings: cross-coupled block_glk "
-                    "collapses irrep_dims to a single block [K], and the head mixer needs >= 2 blocks "
-                    "to mix. Disable use_head_mixer or remove cross_couplings."
-                )
-            if self.use_priorbank_head_evidence_mixer:
-                raise ValueError(
-                    "use_priorbank_head_evidence_mixer=True is incompatible with cross_couplings: "
-                    "cross-coupled block_glk collapses irrep_dims to a single block [K], but head "
-                    "evidence requires at least two gauge blocks. Disable the mixer or remove "
-                    "cross_couplings."
-                )
-            for _name in ("kappa_beta",):
-                if isinstance(getattr(self, _name), (list, tuple)):
-                    raise ValueError(
-                        f"{_name} per-head list is incompatible with cross_couplings: the cross-coupled "
-                        f"group has a single irrep block [K], not n_heads blocks. Use a scalar {_name}."
-                    )
-            if self.family == "gaussian_diagonal":
-                warnings.warn(
-                    "cross_couplings with family='gaussian_diagonal' is an APPROXIMATION: the off-block "
-                    "GL(K) congruence g*Sigma*g^T is not diagonal, so the diagonal readout is not "
-                    "gauge-invariant. family='gaussian_full' (diagonal_covariance=False) is the exact "
-                    "congruence path.",
-                    UserWarning, stacklevel=2,
-                )
-            if self.n_heads > 1:
-                warnings.warn(
-                    f"cross_couplings collapses block_glk to a single irrep block [K]: n_heads="
-                    f"{self.n_heads} no longer sets the attention-head count (runtime is 1 head) and "
-                    f"the softmax temperature shifts from kappa*sqrt(d_head) to kappa*sqrt(K). This is "
-                    f"the coherent single-block cross-coupled gauge; n_heads only partitions the "
-                    f"generators.",
-                    UserWarning, stacklevel=2,
-                )
-
         # belief family. ``family`` is the SINGLE covariance-structure toggle: a registry key whose
         # declared cov_kind ('diagonal'|'full') is the one source of truth for the diagonal-vs-full
-        # path, exposed read-only as the derived ``diagonal_covariance`` property. ``divergence_family``
-        # is the SEPARATE functional seam and is NOT forced equal to family.
+        # path, exposed read-only as the derived ``diagonal_covariance`` property.
         from vfe3.divergence import divergence_families, family_cov_kind
         _require(self.family, divergence_families(), "family")
         family_is_diagonal = family_cov_kind(self.family) == "diagonal"
-        # Family SCOPE gate: a family whose coupling energy is defined only on part of the config
-        # space declares that scope on its class; reject an unsupported pairing HERE rather than at the
-        # first forward, where ablation.py catches config errors only around VFE3Config(**cfg_dict) and
-        # a mid-forward raise is misfiled as error_kind="train". Both checks read the family and
-        # transport REGISTRIES, so a new registration is covered without editing this validator.
         from vfe3.families.base import get_family
         _family_cls = get_family(self.family)
-        if _family_cls.requires_kl_divergence and (
-                self.divergence_family != "renyi" or self.renyi_order != 1.0):
-            raise ValueError(
-                f"family={self.family!r} implements its coupling energy for KL only "
-                f"(divergence_family='renyi', renyi_order=1.0); got "
-                f"divergence_family={self.divergence_family!r}, renyi_order={self.renyi_order}. "
-                f"Use family='gaussian_diagonal' for a noncanonical divergence."
-            )
-        if _family_cls.transport_requirement != "any":
-            from vfe3.geometry.transport import get_transport_registration
-            _registration = get_transport_registration(self.transport_mode)
-            if not _registration.satisfies(_family_cls.transport_requirement):
-                raise ValueError(
-                    f"family={self.family!r} needs a "
-                    f"{_family_cls.transport_requirement!r} pairwise transport, but "
-                    f"transport_mode={self.transport_mode!r} provides "
-                    f"{_registration.pair_transport_kind!r}. Use a family "
-                    f"whose coupling energy consumes this transport (e.g. 'gaussian_diagonal')."
-                )
 
         # free-energy coupling
         for _name in ("kappa_beta",):
             _v = getattr(self, _name)
             if isinstance(_v, (list, tuple)):
-                if self.gauge_group in ("so_n", "sp_n"):
+                if self.gauge_group == "so_n":
                     # heads = irrep blocks (possibly unequal dims): one kappa entry per block
                     # (irrep_spec already validated/coerced in the gauge seam above).
                     _n_blocks = sum(m for _, m in self.irrep_spec)
@@ -1453,10 +1118,6 @@ class VFE3Config:
                         raise ValueError(
                             f"{_name} list must have one entry per irrep block; gauge_group="
                             f"{self.gauge_group!r} has {_n_blocks} blocks, got {len(_v)}")
-                elif self.gauge_group not in ("block_glk", "tied_block_glk"):
-                    raise ValueError(
-                        f"{_name} list (per-head) requires an equal-block group "
-                        f"(block_glk/tied_block_glk); got gauge_group={self.gauge_group!r}")
                 elif len(_v) != self.n_heads:
                     raise ValueError(
                         f"{_name} list must have length n_heads={self.n_heads}, got {len(_v)}")
@@ -1522,9 +1183,6 @@ class VFE3Config:
         if not math.isfinite(self.sigma_init) or self.sigma_init <= 0.0:
             raise ValueError(
                 f"sigma_init must be positive and finite (log is taken), got {self.sigma_init}")
-        for name in ("mu_init_std", "phi_scale"):
-            if getattr(self, name) < 0.0:
-                raise ValueError(f"{name} must be >= 0, got {getattr(self, name)}")
         # lambda_alpha_mode validated against the alpha-form REGISTRY (add-by-registering).
         from vfe3.alpha_i import _ALPHAS
         _require(self.lambda_alpha_mode, tuple(sorted(_ALPHAS)), "lambda_alpha_mode")
@@ -1534,60 +1192,22 @@ class VFE3Config:
                 f"lambda_alpha must be finite and nonnegative under lambda_alpha_mode='constant', "
                 f"got {self.lambda_alpha}"
             )
-        # Full Gaussians expose an ordered conditional KL decomposition, not a
-        # sum of marginal KLs. General Renyi orders have no such chain rule.
+        # Full Gaussians expose an ordered conditional KL decomposition, not a sum of marginal KLs.
         from vfe3.alpha_i import alpha_is_per_coord
-        if alpha_is_per_coord(self.lambda_alpha_mode) and not family_is_diagonal:
-            conditional_kl = getattr(_family_cls, "conditional_kl_coordinates", False)
-            supported = (self.divergence_family == "jeffreys" or
-                         (self.divergence_family == "renyi" and self.renyi_order == 1.0))
-            if not conditional_kl or not supported:
-                raise ValueError(
-                    "per-coordinate full-covariance self-coupling requires a family with "
-                    "conditional KL coordinates and divergence_family='renyi', renyi_order=1 "
-                    "(KL), or 'jeffreys'")
-        # The per-coordinate self-divergence exists only for a divergence that DECOMPOSES
-        # coordinate-wise on a diagonal Gaussian: Renyi/KL and the two divergences AFFINE in it
-        # (Bhattacharyya = 0.5 D_{1/2}, Jeffreys = KL + KL_rev). squared_hellinger is excluded
-        # (H^2 = 1 - exp(-D_{1/2}/2) is a nonlinear transform of the SUMMED divergence).
-        from vfe3.divergence import has_per_coord_functional, divergence_functionals_per_coord
-        if alpha_is_per_coord(self.lambda_alpha_mode) and not has_per_coord_functional(self.divergence_family):
+        if (alpha_is_per_coord(self.lambda_alpha_mode) and not family_is_diagonal
+                and not getattr(_family_cls, "conditional_kl_coordinates", False)):
             raise ValueError(
-                f"lambda_alpha_mode={self.lambda_alpha_mode!r} needs a per-coordinate self-divergence, which is "
-                f"implemented only for divergences that decompose coordinate-wise on a diagonal "
-                f"Gaussian ({divergence_functionals_per_coord()}); got "
-                f"divergence_family={self.divergence_family!r} (e.g. 'squared_hellinger' does not "
-                f"decompose). Use a decomposable divergence or a per-position lambda_alpha_mode."
-            )
-        # Calibration footgun: the state-dependent envelope alpha* = c0/(b0 + D) is correct for ANY
-        # divergence, but its RANGE collapses when D is BOUNDED. squared_hellinger has D = H^2 in
-        # [0,1), so the alpha* ratio max/min = 1 + 1/b0 -- at the default b0 = 1 only ~2x, versus
-        # ~1 + kl_max/b0 for the unbounded KL, leaving the adaptive coupling nearly inert. Set
-        # b0 ~ Dmax/10 (~0.1) to restore a wide range. Only squared_hellinger is bounded-small.
-        if (self.lambda_alpha_mode in ("state_dependent", "state_dependent_per_coord")
-                and self.divergence_family == "squared_hellinger"):
-            _b0_vals = self.b0 if isinstance(self.b0, (list, tuple)) else [self.b0]
-            if min(_b0_vals) >= 1.0:
-                import warnings
-                warnings.warn(
-                    f"lambda_alpha_mode={self.lambda_alpha_mode!r} with divergence_family='squared_hellinger' and "
-                    f"b0={self.b0}: squared Hellinger is bounded (H^2 in [0,1)), so the state-dependent "
-                    f"alpha* = c0/(b0 + D) spans only a ~{1.0 + 1.0/min(_b0_vals):.1f}x range and the "
-                    f"adaptive self-coupling is nearly constant. Set b0 ~ 0.1 (Dmax/10) for a wide "
-                    f"alpha* range, or use an unbounded divergence (renyi/KL).",
-                    UserWarning,
-                    stacklevel=2,
-                )
+                "per-coordinate full-covariance self-coupling requires a family with "
+                "conditional KL coordinates")
 
         # attention
         _require(self.beta_attention_prior, tuple(sorted(_PRIORS)), "beta_attention_prior")
 
         # E-step
-        for name in ("e_q_mu_lr", "e_q_sigma_lr", "e_phi_lr"):
+        for name in ("e_q_mu_lr", "e_q_sigma_lr"):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be >= 0 and finite, got {value}")
-        _require(self.gradient_mode, _VALID_GRADIENT_MODES, "gradient_mode")
         from vfe3.geometry.phi_preconditioner import _PRECOND
         _require(self.phi_precond_mode, tuple(sorted(_PRECOND)), "phi_precond_mode")
         from vfe3.gauge_optim import _PHI_UPDATE_POLICIES, get_phi_update_policy
@@ -1611,43 +1231,20 @@ class VFE3Config:
             # layer-0 table row (mu_v, diag s_v) in closed form, per head block, so the tables must
             # hold LOCAL moments whose layer-0 covariance is diag(s) exactly: per_token encoding and
             # a Gaussian family that encodes Sigma = diag(bounded_variance(sigma_log)).
-            # gaussian_diagonal_exact is accepted deliberately: it shares DiagonalGaussian's
-            # parameters and the per_token encoder (_encode_prior_sigma), so its layer-0 row is
-            # diag(s) exactly; only its pair coupling energy differs. The whitened closed forms
-            # need glk or untied block_glk (no cross couplings; the metric is block-diagonal
-            # across heads only for block-diagonal local covariance) and the full registered chart.
+            # The whitened closed forms need untied block_glk (the metric is block-diagonal across
+            # heads only for block-diagonal local covariance) and the full registered chart.
             fisher_problems = []
-            if self.gauge_group == "block_glk":
-                if self.cross_couplings is not None:
-                    fisher_problems.append("gauge_group='block_glk' without cross_couplings")
-            elif self.gauge_group != "glk":
-                fisher_problems.append(
-                    f"gauge_group in ('glk', 'block_glk'); got {self.gauge_group!r}")
+            if self.gauge_group != "block_glk":
+                fisher_problems.append(f"gauge_group='block_glk'; got {self.gauge_group!r}")
             if self.encode_mode != "per_token":
                 fisher_problems.append(f"encode_mode='per_token'; got {self.encode_mode!r}")
-            if self.family not in ("gaussian_diagonal", "gaussian_full", "gaussian_diagonal_exact"):
-                fisher_problems.append(
-                    "family in ('gaussian_diagonal', 'gaussian_full', 'gaussian_diagonal_exact'), "
-                    f"whose layer-0 covariance is diag(s); got {self.family!r}")
             if self.pos_phi not in ("none", "learned", "frozen"):
                 fisher_problems.append(f"pos_phi in ('none', 'learned', 'frozen'); got {self.pos_phi!r}")
             if self.pos_phi_project_slk:
                 fisher_problems.append("pos_phi_project_slk=False (the metric uses the full chart)")
-            factor_radius = (
-                self.phi_mstep_max_matrix_norm
-                if self.phi_mstep_max_matrix_norm is not None
-                else 5.0
-            )
-            from vfe3.geometry.transport import TRANSPORT_CLAMP_MAX_NORM
-            if self.transport_chart_max_norm is None or not (
-                factor_radius
-                < self.transport_chart_max_norm
-                < TRANSPORT_CLAMP_MAX_NORM
-            ):
-                fisher_problems.append(
-                    f"an explicit transport_chart_max_norm with {factor_radius} < "
-                    f"transport_chart_max_norm < {TRANSPORT_CLAMP_MAX_NORM}; got "
-                    f"{self.transport_chart_max_norm!r}")
+            chart_problem = self._chart_ordering_problem()
+            if chart_problem is not None:
+                fisher_problems.append(chart_problem)
             if fisher_problems:
                 raise ValueError(
                     "m_phi_update_mode='fisher_group' requires " + "; ".join(fisher_problems))
@@ -1662,48 +1259,24 @@ class VFE3Config:
                     f"{self.phi_precond_mode!r}; phase one requires a built-in bracket-closed "
                     "full/per-block pullback pairing"
                 )
-            if self.gauge_group == "glk":
-                if self.embed_dim > 12:
-                    raise ValueError(
-                        "pullback_group with gauge_group='glk' requires embed_dim <= 12; got "
-                        f"embed_dim={self.embed_dim}"
-                    )
-            elif self.gauge_group == "block_glk":
-                if self.cross_couplings is not None:
-                    raise ValueError(
-                        "pullback_group requires untied block_glk without cross_couplings"
-                    )
-                if self.d_head > 12:
-                    raise ValueError(
-                        "pullback_group with gauge_group='block_glk' requires d_head <= 12; got "
-                        f"d_head={self.d_head}"
-                    )
-            else:
+            if self.gauge_group != "block_glk":
                 raise ValueError(
-                    "pullback_group phase one accepts only built-in glk or untied block_glk; "
+                    "pullback_group phase one accepts only untied block_glk; "
                     f"got gauge_group={self.gauge_group!r}"
+                )
+            if self.d_head > 12:
+                raise ValueError(
+                    "pullback_group with gauge_group='block_glk' requires d_head <= 12; got "
+                    f"d_head={self.d_head}"
                 )
             if self.pos_phi_project_slk:
                 raise ValueError(
                     "pullback_group does not support pos_phi_project_slk=True because the stored "
                     "factor metric is defined on the full registered chart"
                 )
-            factor_radius = (
-                self.phi_mstep_max_matrix_norm
-                if self.phi_mstep_max_matrix_norm is not None
-                else 5.0
-            )
-            from vfe3.geometry.transport import TRANSPORT_CLAMP_MAX_NORM
-            if self.transport_chart_max_norm is None or not (
-                factor_radius
-                < self.transport_chart_max_norm
-                < TRANSPORT_CLAMP_MAX_NORM
-            ):
-                raise ValueError(
-                    "pullback_group requires an explicit transport_chart_max_norm satisfying "
-                    f"{factor_radius} < transport_chart_max_norm < "
-                    f"{TRANSPORT_CLAMP_MAX_NORM}; got {self.transport_chart_max_norm!r}"
-                )
+            chart_problem = self._chart_ordering_problem()
+            if chart_problem is not None:
+                raise ValueError(f"pullback_group requires {chart_problem}")
 
         from vfe3.model.positional_phi import _POS_PHI
         _require(self.pos_phi, tuple(sorted(_POS_PHI)), "pos_phi")
@@ -1714,74 +1287,31 @@ class VFE3Config:
         # V_i -> g_i V_i, the same right-factor structure as pos_phi's exp(Y_i), so routing and
         # content stay exactly covariant (audit 2026-10-01 F11: residual ~6e-16). The former
         # gauge-breaking warning quoted a probe of the retired left insertion and was removed.
-        if self.rope_full_gauge and self.diagonal_covariance:
-            raise ValueError(
-                "rope_full_gauge=True rotates the covariance sandwich (R Sigma R^T), which the "
-                "diagonal-covariance approximation cannot carry; set family='gaussian_full'."
-            )
-        # RoPE rotates ADJACENT coordinate pairs (2k, 2k+1) while Sp(2m) pairs coordinate i with m+i
-        # (J = [[0,I],[-I,0]]), so the rope-wrapped transport R Omega R^T leaves the symplectic group.
-        # R is orthogonal, so each per-pair divergence stays a well-defined GL(K)-congruence value.
-        # Warn (not error): the symplectic property is not consumed downstream.
-        if self.pos_rotation == "rope" and self.gauge_group == "sp":
-            import warnings
-            warnings.warn(
-                "pos_rotation='rope' with gauge_group='sp' leaves the symplectic group: RoPE rotates "
-                "adjacent pairs (2k, 2k+1) while Sp(2m) pairs i with m+i, so R Omega R^T is no longer "
-                "in Sp(2m). The GL(K)-congruence divergence invariance still holds (R is orthogonal), "
-                "so the model runs; only the structure-group claim is dropped.",
-                UserWarning,
-                stacklevel=2,
-            )
-        # Same structural fact for the irrep-tower groups: RoPE's adjacent-pair rotation R is
-        # orthogonal but generally NOT in the irrep image rho(SO(N))/rho(Sp(2m)) inside GL(K), so
-        # R Omega R^T leaves the SELECTED structure group (GL(K)-congruence invariance survives).
-        if self.pos_rotation == "rope" and self.gauge_group in ("so_n", "sp_n"):
+        # RoPE's adjacent-pair rotation R is orthogonal but generally NOT in the irrep image
+        # rho(SO(N)) inside GL(K), so R Omega R^T leaves the SELECTED structure group
+        # (GL(K)-congruence invariance survives).
+        if self.pos_rotation == "rope" and self.gauge_group == "so_n":
             import warnings
             warnings.warn(
                 f"pos_rotation='rope' with gauge_group={self.gauge_group!r} leaves the structure "
                 f"group: the coordinate-pair rotation R(theta) is generally not in the irrep image "
-                f"of SO(N)/Sp(2m), so R Omega R^T is no longer in the selected group. The "
+                f"of SO(N), so R Omega R^T is no longer in the selected group. The "
                 f"GL(K)-congruence divergence invariance still holds (R is orthogonal), so the "
                 f"model runs; only the structure-group claim is dropped.",
                 UserWarning,
                 stacklevel=2,
             )
-        # Means-only RoPE (the default pairing) transports mu under R Omega R^T but Sigma under the
-        # UN-rotated Omega -- an affine-incoherent operator pair that does not preserve the Mahalanobis
-        # form (probe: invariant drift 0.18 -> 0.74, while rope_full_gauge=True preserves it).
-        # Available as a deliberate cheap approximation; warn so the pairing is explicit.
         # The full-covariance KL precision spellings are inlined rather than imported from
         # vfe3.families.gaussian (importing a family module inside __post_init__ perturbs import
         # order). set_full_cov_kl_precision validates the same set.
-        if self.full_cov_kl_backend not in ("pairwise", "common_frame", "common_frame_factored"):
-            raise ValueError(
-                "full_cov_kl_backend must be one of ('pairwise', 'common_frame', 'common_frame_factored'), "
-                f"got {self.full_cov_kl_backend!r}")
         if self.full_cov_kl_precision not in ("fp64", "fp32_escalate", "fp32_escalate_cond"):
             raise ValueError(
                 "full_cov_kl_precision must be one of ('fp64', 'fp32_escalate', "
                 f"'fp32_escalate_cond'), got {self.full_cov_kl_precision!r}")
-        if not isinstance(self.decode_ranking_fp64_escalation, bool):
-            raise ValueError(
-                "decode_ranking_fp64_escalation must be bool, got "
-                f"{self.decode_ranking_fp64_escalation!r}")
         if self.decode_ranking_refinement not in ("full", "candidates"):
             raise ValueError(
                 "decode_ranking_refinement must be one of ('full', 'candidates'), "
                 f"got {self.decode_ranking_refinement!r}")
-        if self.full_cov_congruence_precision not in ("fp64", "fp32_escalate"):
-            raise ValueError(
-                "full_cov_congruence_precision must be one of ('fp64', 'fp32_escalate'), "
-                f"got {self.full_cov_congruence_precision!r}")
-        if not isinstance(self.full_cov_congruence_certification, bool):
-            raise ValueError(
-                "full_cov_congruence_certification must be bool, got "
-                f"{self.full_cov_congruence_certification!r}")
-        if not isinstance(self.projected_cov_condition_recovery, bool):
-            raise ValueError(
-                "projected_cov_condition_recovery must be bool, got "
-                f"{self.projected_cov_condition_recovery!r}")
         if self.projected_factor_route not in ("gram", "cholesky_qr2"):
             raise ValueError(
                 "projected_factor_route must be one of ('gram', 'cholesky_qr2'), "
@@ -1790,15 +1320,11 @@ class VFE3Config:
             raise ValueError(
                 "safe_cholesky_jitter_mode must be one of ('absolute', 'relative'), "
                 f"got {self.safe_cholesky_jitter_mode!r}")
-        if (not isinstance(self.mu_trust_cholesky_rounds, int)
-                or isinstance(self.mu_trust_cholesky_rounds, bool)
-                or self.mu_trust_cholesky_rounds < 0):
+        if self.mu_trust_cholesky_rounds < 0:
             raise ValueError(
                 "mu_trust_cholesky_rounds must be a nonnegative int, got "
                 f"{self.mu_trust_cholesky_rounds!r}")
-        if (not isinstance(self.val_diagnostic_batches, int)
-                or isinstance(self.val_diagnostic_batches, bool)
-                or self.val_diagnostic_batches < 1):
+        if self.val_diagnostic_batches < 1:
             raise ValueError(
                 "val_diagnostic_batches must be an int >= 1, got "
                 f"{self.val_diagnostic_batches!r}")
@@ -1819,140 +1345,45 @@ class VFE3Config:
             from vfe3.geometry.groups import get_group
             _escapes = "Use a group carrying a per-vertex gauge chart."
             # The flat FACTORED builder -- the thing that exposes the vertex frame -- is selected only
-            # for a block-diagonal group with MORE THAN ONE equal block; a single-block group (glk,
-            # so_k) falls to the dense pairwise Omega, so the group alone settles it.
+            # for a block-diagonal group with MORE THAN ONE block, so the group alone settles it.
             _builder = get_group(self.gauge_group)
-            try:                                 # builders differ: only the block groups take n_heads
-                _dims = _builder(K=self.embed_dim, n_heads=self.n_heads).irrep_dims
-            except TypeError:
-                _dims = _builder(K=self.embed_dim).irrep_dims
+            if self.gauge_group == "so_n":       # irrep blocks validated in the gauge seam above
+                _dims = _block_dims
+            else:
+                try:                             # builders differ: only the block groups take n_heads
+                    _dims = _builder(K=self.embed_dim, n_heads=self.n_heads).irrep_dims
+                except TypeError:
+                    _dims = _builder(K=self.embed_dim).irrep_dims
             if len(_dims) < 2:
                 raise ValueError(
                     f"rope_insertion='right' needs a group whose "
                     f"transport factors per block, but gauge_group={self.gauge_group!r} has a "
                     f"single irrep block ({_dims}), so the flat transport is built as a dense "
                     f"pairwise Omega with no per-vertex frame to fold into. {_escapes}")
-        # Projected routing pushes both moments through the realized comparison frame.
-        # Means-only covariance treatment belongs to the transported attention path.
-        # The per-block preconditioners build a per-HEAD metric and need generators that partition per
-        # block (block_glk's independent gl(d_head) per head). The tied gauge's shared generators
-        # kron(I_n, gl(d_head)) each act on EVERY block, so no per-block partition exists; reject BOTH
-        # variants here. The ambient 'killing'/'pullback', 'clip' and 'none' are unaffected.
-        if (self.gauge_group == "tied_block_glk"
-                and self.phi_precond_mode in ("killing_per_block", "pullback_per_block")):
-            raise ValueError(
-                f"phi_precond_mode={self.phi_precond_mode!r} is incompatible with gauge_group="
-                "'tied_block_glk': the shared kron(I_n, gl(d)) generators do not partition per head, "
-                "so the per-block metric is undefined. Use 'none', 'clip', or the ambient "
-                "'killing'/'pullback' (the ambient 'pullback' is feasible only up to K<=12 -- "
-                "its structure-constants build is O(K^6))."
-            )
-
         # decode / encode
         if not math.isfinite(self.decode_tau) or self.decode_tau <= 0.0:
             raise ValueError(f"decode_tau must be finite and positive, got {self.decode_tau}")
         _require(self.relational_output_init, ("identity", "depth_scaled"), "relational_output_init")
         # decode_mode / encode_mode validated against the LIVE decode/encode REGISTRIES (not static
         # literals) so a newly registered kernel is config-selectable without editing this validator.
-        # Dense kernels remain registered as exact legacy/oracle implementations but fresh public
-        # configs reject them; chunked counterparts are the supported training routes.
-        from vfe3.model.prior_bank import (
-            _DECODERS,
-            _ENCODERS,
-            has_builtin_canonical_content_encoder,
-            has_builtin_canonical_content_family,
-            has_builtin_head_evidence_decoder,
-            has_builtin_projected_full_family,
-            has_builtin_projected_full_decoder,
-        )
+        from vfe3.model.prior_bank import _DECODERS, _ENCODERS, has_builtin_head_evidence_decoder
         _require(self.decode_mode, tuple(sorted(_DECODERS)), "decode_mode")
-        if self.decode_mode in _DENSE_DECODE_MODES and not _allow_legacy_dense_decode:
-            raise ValueError(
-                f"decode_mode={self.decode_mode!r} is a dense legacy/oracle decoder and is not "
-                "admitted for fresh training; select its chunked counterpart"
-            )
         # decode_mode sets the covariance RANK(s) the prior-bank kernel accepts, via its resolved
         # DecodeRegistration.covariance_kinds: 'diagonal*' -> {'diagonal'}, 'full*' -> {'full'},
         # 'family*' -> both. The configured family's cov_kind must be a MEMBER of that set, else the
         # mismatch is a shape RuntimeError at the first forward. The linear registration discards
         # sigma, so these rank checks apply only to non-linear registrations.
         decode_registration = _DECODERS[self.decode_mode]
-        if (self.decode_mode != "linear"
-                and decode_registration.family_consistent
-                and self.divergence_family == "renyi"
-                and self.renyi_order > 1.0):
-            raise ValueError(
-                "family-consistent prior-bank Renyi decoding requires renyi_order <= 1 "
-                "because alpha > 1 cannot guarantee a finite score across the entire prior bank; "
-                f"got renyi_order={self.renyi_order}.")
-
-        if (
-            self.encode_mode in ("canonical_content_gauge", "canonical_content_projected")
-            and not has_builtin_canonical_content_encoder(self.encode_mode)
-        ):
-            raise ValueError(
-                f"encode_mode={self.encode_mode!r} requires its built-in encoder registration "
-                "and callable identities; registry overrides are not eligible."
-            )
-        if (
-            self.encode_mode == "canonical_content_gauge"
-            and not has_builtin_canonical_content_family(self.encode_mode)
-        ):
-            raise ValueError(
-                "encode_mode='canonical_content_gauge' requires the import-time "
-                "gaussian_frame_diagonal family identity; registry overrides are not eligible."
-            )
-        if (
-            self.encode_mode == "canonical_content_projected"
-            and not has_builtin_canonical_content_family(self.encode_mode)
-        ):
-            raise ValueError(
-                "encode_mode='canonical_content_projected' requires the import-time "
-                "gaussian_diagonal family identity used by its canonical table; registry "
-                "overrides are not eligible."
-            )
-        if (
-            self.encode_mode == "canonical_content_projected"
-            and not has_builtin_projected_full_family()
-        ):
-            raise ValueError(
-                "encode_mode='canonical_content_projected' requires the import-time "
-                "gaussian_full family identity used by its analytic full decoder; registry "
-                "overrides are not eligible."
-            )
-        if (
-            self.encode_mode == "canonical_content_projected"
-            and not has_builtin_projected_full_decoder(self.decode_mode)
-        ):
-            raise ValueError(
-                "encode_mode='canonical_content_projected' requires the built-in analytic "
-                "'full'/'full_chunked' decode registration and callable identities; "
-                "registry overrides are not eligible."
-            )
         if self.use_priorbank_head_evidence_mixer:
             canonical_modes = {
-                "gaussian_diagonal": ("diagonal", "diagonal_chunked"),
-                "gaussian_full": ("full", "full_chunked"),
+                "gaussian_diagonal": "diagonal_chunked",
+                "gaussian_full": "full_chunked",
             }
-            if self.divergence_family != "renyi" or self.renyi_order != 1.0:
-                raise ValueError(
-                    "use_priorbank_head_evidence_mixer=True requires the built-in canonical KL "
-                    "functional (divergence_family='renyi', renyi_order=1.0)."
-                )
-            allowed_modes = canonical_modes.get(self.family)
-            projected_full_decode = (
-                self.encode_mode == "canonical_content_projected"
-                and self.family == "gaussian_diagonal"
-                and self.decode_mode in ("full", "full_chunked")
-            )
-            if ((allowed_modes is None or self.decode_mode not in allowed_modes)
-                    and not projected_full_decode):
+            if self.decode_mode != canonical_modes.get(self.family):
                 raise ValueError(
                     "use_priorbank_head_evidence_mixer=True requires a built-in canonical KL decode: "
-                    "family='gaussian_diagonal' with decode_mode='diagonal'/'diagonal_chunked', or "
-                    "family='gaussian_full' with decode_mode='full'/'full_chunked'; the sole rank "
-                    "exception is encode_mode='canonical_content_projected', which pulls its "
-                    "gaussian_diagonal query back to full covariance before full decoding. "
+                    "family='gaussian_diagonal' with decode_mode='diagonal_chunked', or "
+                    "family='gaussian_full' with decode_mode='full_chunked'. "
                     f"Got family={self.family!r}, decode_mode={self.decode_mode!r}."
                 )
             from vfe3.families.base import _FAMILIES, _FUNCTIONALS, renyi
@@ -1973,46 +1404,30 @@ class VFE3Config:
                 )
         family_kind = family_cov_kind(self.family)
         if (self.decode_mode != "linear"
-                and self.encode_mode != "canonical_content_projected"
                 and family_kind not in decode_registration.covariance_kinds):
             raise ValueError(
                 f"decode_mode={self.decode_mode!r} is rank-incompatible with family={self.family!r}: "
                 f"it scores covariance kinds {sorted(decode_registration.covariance_kinds)} but the "
-                f"family is {family_kind!r}. Pair a matching decode_mode (a 'full'/'diagonal' kernel "
-                f"with a full/diagonal family, or 'family'/'family_chunked' which score both), or "
+                f"family is {family_kind!r}. Pair a matching decode_mode (a full/diagonal kernel "
+                f"with a full/diagonal family, or 'family_chunked' which scores both), or "
                 f"select decode_mode='linear'."
             )
         if self.decode_chunk_size < 1:
             raise ValueError(f"decode_chunk_size must be >= 1, got {self.decode_chunk_size}")
         _require(self.decode_ce_checkpoint, ("auto", "auto_aggregate", "always", "never"),
                  "decode_ce_checkpoint")
-        if type(self.decode_ce_stable_reduction) is not bool:
-            raise ValueError("decode_ce_stable_reduction must be a bool")
         # decode_bias (linear decode only) and decode_tau (prior-bank decode only) are reported by
         # inactive_fields(), so the default-guarded notice below covers them and untouched
         # defaults stay silent.
-        # Capability validation: the optimized 'diagonal'/'full' kernels hardcode a gaussian alpha=1
-        # KL readout and ignore divergence_family/renyi_order, so a non-Gaussian family or a
-        # noncanonical divergence would read the belief out under the WRONG geometry. Such a config on
-        # a prior-bank route MUST select a family-consistent decode kernel
-        # ('family'/'family_chunked'), which scores logits through the configured family AND
-        # divergence. Canonical gaussian/renyi/alpha=1 configs keep their fast modes.
-        if self.decode_mode != "linear":
-            noncanonical = self.renyi_order != 1.0 or self.divergence_family != "renyi"
-            # What the fast decode kernels assume is the Gaussian POINTWISE readout, which a family
-            # overriding only its coupling/transport seams still satisfies.
-            non_gaussian = not _family_cls.gaussian_pointwise_algebra
-            if (noncanonical or non_gaussian) and not decode_registration.family_consistent:
-                raise ValueError(
-                    f"prior-bank decode with family={self.family!r}/"
-                    f"divergence_family={self.divergence_family!r}/renyi_order={self.renyi_order} "
-                    f"requires a family-consistent decode_mode ('family' or 'family_chunked') that "
-                    f"reads logits out under the configured divergence; decode_mode="
-                    f"{self.decode_mode!r} is a fixed gaussian alpha=1 KL kernel and would project "
-                    f"the belief through the wrong geometry (the argmax can flip). Set "
-                    f"decode_mode='family'/'family_chunked', or decode_mode='linear' (which is "
-                    f"family-agnostic)."
-                )
+        # Capability validation: the fast diagonal/full kernels hardcode the Gaussian KL readout, so a
+        # family without the Gaussian POINTWISE algebra must select the family-consistent
+        # 'family_chunked' decode, which scores logits through the configured family.
+        if (self.decode_mode != "linear" and not _family_cls.gaussian_pointwise_algebra
+                and not decode_registration.family_consistent):
+            raise ValueError(
+                f"prior-bank decode with family={self.family!r} requires a family-consistent "
+                f"decode_mode ('family_chunked'); decode_mode={self.decode_mode!r} is a fixed "
+                f"Gaussian KL kernel. Set decode_mode='family_chunked' or 'linear'.")
         # Full-covariance compute discarded at the decode boundary: linear decode reads out
         # logits = mu_q @ W^T and DISCARDS sigma. The E-step still evolves a (B,N,K,K) covariance (it
         # shapes the mean trajectory, so the result is correct, not wasted) but that covariance never
@@ -2044,21 +1459,6 @@ class VFE3Config:
                 "pos_phi='none' and pos_rotation='none'"
             )
             raise ValueError(detail + " on the projected routes")
-            import warnings
-            warnings.warn(detail + " for a capacity-matched gauge contrast.", UserWarning,
-                          stacklevel=2)
-        if self.encode_mode == "canonical_content_gauge":
-            import warnings
-            warnings.warn(
-                "encode_mode='canonical_content_gauge' is frame-intrinsic: under the exact flat "
-                "cocycle, token phi cancels from the supervised belief/decode path, so its "
-                "Gaussian divergence is exact and phi_embed receives no supervised gradient unless "
-                "another objective explicitly acts on phi. An optional additive unigram base-rate "
-                "bias kappa*log(pi_v) is applied after that divergence and is outside the gauge/"
-                "covariance map.",
-                UserWarning,
-                stacklevel=2,
-            )
         # decode_mode is the single decode gate. Linear selects the learned (V,K) projection and
         # discards sigma; every other admitted mode reads out against the prior bank. Encode and the
         # free-energy self-coupling stay on PriorBank in both cases.
@@ -2075,7 +1475,7 @@ class VFE3Config:
         _require(self.norm_type_block, _valid_norms, "norm_type_block")
         _require(self.norm_type_final, _valid_norms, "norm_type_final")
 
-        if type(self.block_mlp_expansion) is not int or self.block_mlp_expansion < 1:
+        if self.block_mlp_expansion < 1:
             raise ValueError(
                 "block_mlp_expansion must be an integer >= 1, "
                 f"got {self.block_mlp_expansion!r}"
@@ -2114,19 +1514,6 @@ class VFE3Config:
                 "invert exactly (family='gaussian_full', or 'gaussian_diagonal' with "
                 f"block_mlp_covariance='passthrough'); got family={self.family!r}."
             )
-        if self.use_block_mlp and block_mlp_registration.requires_frame_context:
-            incompatible = []
-            if self.e_phi_lr != 0.0:
-                incompatible.append(f"e_phi_lr={self.e_phi_lr!r}")
-            if self.pos_rotation == "rope":
-                if self.rope_insertion != "right":
-                    incompatible.append(f"rope_insertion={self.rope_insertion!r}")
-            if incompatible:
-                raise ValueError(
-                    "block_mlp_mode='canonical_frame' requires a fixed factored flat frame: "
-                    "e_phi_lr=0, and active RoPE must use right insertion; got "
-                    + ", ".join(incompatible)
-                )
         if self.block_mlp_activation not in ("gelu", "silu", "relu"):
             raise ValueError(f"unknown block_mlp_activation {self.block_mlp_activation!r}")
         if (isinstance(self.block_mlp_dropout, bool)
@@ -2140,8 +1527,8 @@ class VFE3Config:
 
         # Reference coordinates (M2 arms: LN and MLP in reference coordinates; the covariant decoder).
         # Both conjugate by the realized relational frame U_i, which is defined, fixed through the
-        # stack, and equal to the content frame only on a projected route (e_phi_lr=0, flat transport)
-        # without RoPE and outside the frame-intrinsic family. Everything else fails closed.
+        # stack, and equal to the content frame on the projected routes without RoPE. Everything else
+        # fails closed.
         _require(self.block_coordinates, ("local", "reference"), "block_coordinates")
         _require(self.decode_coordinates, ("local", "reference"), "decode_coordinates")
         frame_requirements = []
@@ -2149,16 +1536,6 @@ class VFE3Config:
             frame_requirements.append(
                 f"pos_rotation={self.pos_rotation!r} (RoPE folds a rotation into the routing frame, "
                 "so the content/decode frame is not U_i)")
-        if self.family == "gaussian_frame_diagonal":
-            frame_requirements.append(
-                "family='gaussian_frame_diagonal' (beliefs are already frame-intrinsic)")
-        if self.e_phi_lr != 0.0:
-            frame_requirements.append(f"e_phi_lr={self.e_phi_lr!r} (the frame moves inside the stack)")
-        if self.transport_mode != "flat":
-            frame_requirements.append(f"transport_mode={self.transport_mode!r} (requires 'flat')")
-        if self.encode_mode == "canonical_content_projected":
-            frame_requirements.append(
-                "encode_mode='canonical_content_projected' (already decodes through its own frame)")
         if self.block_coordinates == "reference":
             incompatible = list(frame_requirements)
             if self.attention_mode != "projected_predictive":
@@ -2206,134 +1583,26 @@ class VFE3Config:
                     "pre-activation; got " + ", ".join(incompatible))
             if self.m_per_type_hidden_bias_lr is None:
                 self.m_per_type_hidden_bias_lr = declared_m_phi_lr
-        rate = self.m_per_type_hidden_bias_lr
-        if rate is not None and (
-                isinstance(rate, bool) or not isinstance(rate, Real)
-                or not math.isfinite(rate) or rate < 0.0):
-            raise ValueError(f"m_per_type_hidden_bias_lr must be finite and >= 0 or None, got {rate!r}")
 
         # M-step / training
-        # e_step_gradient is the single E-step backward-estimator selector.
-        _require(self.e_step_gradient, _VALID_E_STEP_GRADIENTS, "e_step_gradient")
-        if self.use_block_mlp and self.e_step_gradient == "detach":
-            raise ValueError(
-                "use_block_mlp=True requires a gradient-carrying E-step; "
-                "set e_step_gradient='unroll'."
-            )
-        # Both 'straight_through' and 'detach' sever the per-iteration E-step tangent, so a learnable
-        # parameter whose only loss path IS that tangent receives no gradient and silently freezes.
-        # phi_embed is the primary such parameter: the gauge frame's only loss path is Omega(phi)
-        # inside the E-step tangent whenever mass_phi == 0, so those estimators freeze it (measured
-        # |grad| 8.2e-03 under 'unroll' versus None under 'straight_through'). Warn, non-breaking --
-        # 'unroll' is the default that trains it. pos_phi='learned' also freezes here but is the
-        # DEFAULT and is warned at the MODEL level instead, keeping a default config silent.
-        _phi_frame_is_tangent_only = (self.phi_scale != 0.0 and self.mass_phi == 0.0)
-        if self.e_step_gradient in ("straight_through", "detach") and _phi_frame_is_tangent_only:
-            import warnings
-            warnings.warn(
-                f"e_step_gradient={self.e_step_gradient!r} severs the per-iteration E-step tangent, so a "
-                "learnable parameter that enters the loss only through it (prior_bank.phi_embed -- the "
-                "gauge-frame table that generates every transport "
-                "operator -- whenever mass_phi=0) "
-                "receives NO gradient and stays frozen. Use e_step_gradient='unroll' (the default) to "
-                "train these.",
-                UserWarning,
-                stacklevel=2,
-            )
-        # A SECOND freeze route: under e_step_gradient='unroll' the closed-form kernel keeps the
-        # unrolled E-step signal live to the prior tables, but the autograd ORACLE fallback (served for
-        # every NON-kernel family) returns a DETACHED tangent unless oracle_unroll_grad=True,
-        # truncating it. The kernel covers exactly gradient_mode=='filtering' AND
-        # family=='gaussian_diagonal' AND divergence_family=='renyi' AND renyi_order==1.0 AND
-        # include_attention_entropy; anything else routes to the oracle. The decoupled value gauge
-        # (pos_rotation='rope' + rope_on_value=False) also forces the oracle route, so this warning
-        # must include it or it silently misses a frozen E-step parameter there.
-        from vfe3.gradients.kernels import uses_kernel_route
-        # route="gradient": this predicate asks whether belief_gradients' GRADIENT route serves the
-        # closed-form kernel -- deliberately decoupled from the mm_exact closed-form capability, which a
-        # family can register independently. Registering a family's mm_exact fusion therefore cannot
-        # change any warning gated on _routes_to_oracle below.
-        _routes_to_oracle = not uses_kernel_route(
-            renyi_order=self.renyi_order,
-            gradient_mode=self.gradient_mode,
-            family=self.family,
-            divergence_family=self.divergence_family,
-            include_attention_entropy=self.include_attention_entropy,
-            transport_mode=self.transport_mode,
-            decoupled_value_gauge=(self.pos_rotation == "rope" and not self.rope_on_value),
-            route="gradient",
-        )
-        # Hoisted for the unroll-truncation warning just below: mm_exact_update never calls
-        # belief_gradients/the oracle at all (its own graph stays live under 'unroll' regardless of
-        # oracle_unroll_grad), so that warning's "routes to the DETACHED oracle" claim is a false
-        # positive under e_step_update='mm_exact' and must be excluded from the predicate.
-        from vfe3.inference.e_step import _E_STEP_UPDATE_ALIASES, canonical_e_step_update as _canon
-        _require(self.e_step_update, tuple(sorted(_E_STEP_UPDATE_ALIASES)), "e_step_update")
-        canonical_e_step_update = _canon(self.e_step_update)
-        if (
-            self.e_step_gradient == "unroll"
-            and not self.oracle_unroll_grad
-            and _routes_to_oracle
-            and canonical_e_step_update != "mm_exact"
-            and (
-                self.pos_phi == "learned"
-                # t5_bias's only gradient path is likewise the E-step tangent (audit 2026-07-05 m9);
-                # the predicate mirrors the model's parameter-creation gate (model.py: created only
-                # when a t5_relative_bias channel is active).
-                or (self.t5_learnable_bias
-                    and self.beta_attention_prior == "t5_relative_bias")
-                # phi_embed was missing from this disjunction too (F13): on the oracle route with
-                # oracle_unroll_grad=False the detached tangent severs its only loss path, so with
-                # pos_phi='none' plus a full-covariance or entropy-suppressed config NO config-time
-                # warning fired at all while phi_embed.grad was None.
-                or _phi_frame_is_tangent_only
-            )
-        ):
-            import warnings
-            warnings.warn(
-                "e_step_gradient='unroll' but this family/gradient_mode routes the belief gradient to "
-                "the autograd ORACLE (NOT the closed-form kernel: that covers only "
-                "gradient_mode='filtering' + family='gaussian_diagonal' + divergence_family='renyi' + "
-                "renyi_order=1.0 + include_attention_entropy=True), which returns a DETACHED tangent while "
-                "oracle_unroll_grad=False. A learnable parameter that enters the loss only through the "
-                "E-step tangent (prior_bank.phi_embed -- the gauge-frame table generating every "
-                "transport operator -- whenever mass_phi=0, "
-                "pos_phi_free under pos_phi='learned', "
-                "t5_bias under t5_learnable_bias with an active t5_relative_bias channel, "
-                "therefore receives NO gradient and stays frozen. Set "
-                "oracle_unroll_grad=True to make the oracle return a differentiable (unrolled) gradient.",
-                UserWarning,
-                stacklevel=2,
-            )
         if self.e_mu_q_trust is not None and not (
             math.isfinite(self.e_mu_q_trust) and self.e_mu_q_trust > 0.0
         ):
             raise ValueError(
                 f"e_mu_q_trust must be finite and > 0 or None, got {self.e_mu_q_trust}")
-        if self.mu_trust_mode not in ("box", "ball"):
-            raise ValueError(f"mu_trust_mode must be 'box' or 'ball', got {self.mu_trust_mode!r}")
-        if self.e_step_mu_precond not in ("fisher", "raw"):
-            raise ValueError(f"e_step_mu_precond must be 'fisher' or 'raw', got {self.e_step_mu_precond!r}")
         for name in ("m_p_mu_lr", "m_p_sigma_lr", "m_phi_lr", "weight_decay", "phi_weight_decay", "min_lr", "min_lr_frac"):
             v = getattr(self, name)
             if not math.isfinite(v) or v < 0.0:
                 raise ValueError(f"{name} must be finite and >= 0, got {v}")
-        for name in ("m_head_evidence_lr", "m_head_mixer_lr",
-                     "m_pos_phi_lr", "m_layernorm_lr"):
-            v = getattr(self, name)
-            if v is not None and (not math.isfinite(v) or v < 0.0):
-                raise ValueError(f"{name} must be finite and >= 0 or None, got {v}")
-        for name in ("m_decode_mu_lr", "m_decode_sigma_lr", "m_decode_lr"):
+        # Optional absolute rates: None inherits, otherwise a finite real >= 0 (never a bool).
+        for name in ("m_relational_score_lr", "m_relational_content_lr", "m_head_evidence_lr",
+                     "m_head_mixer_lr", "m_pos_phi_lr", "m_layernorm_lr", "m_decode_mu_lr",
+                     "m_decode_sigma_lr", "m_block_mlp_lr", "m_per_type_hidden_bias_lr"):
             v = getattr(self, name)
             if v is not None and (
                     isinstance(v, bool) or not isinstance(v, Real)
                     or not math.isfinite(v) or v < 0.0):
                 raise ValueError(f"{name} must be finite and >= 0 or None, got {v!r}")
-        v = self.m_block_mlp_lr
-        if v is not None and (
-                isinstance(v, bool) or not isinstance(v, Real)
-                or not math.isfinite(v) or v < 0.0):
-            raise ValueError(f"m_block_mlp_lr must be finite and >= 0 or None, got {v}")
         if self.batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {self.batch_size}")
         if self.grad_accum_steps < 1:
@@ -2344,21 +1613,12 @@ class VFE3Config:
             raise ValueError(f"eval_interval must be >= 0, got {self.eval_interval}")
         if self.checkpoint_interval < 0:
             raise ValueError(f"checkpoint_interval must be >= 0, got {self.checkpoint_interval}")
-        # max_steps / warmup_steps feed range(start_step, n_steps) and the scheduler: a float
-        # TypeErrors late in range(), max_steps=0 is an empty training loop, warmup_steps<0 is
-        # meaningless. `type(...) is not int` rejects float AND bool; warmup_steps=0 stays legal.
-        if type(self.max_steps) is not int or self.max_steps < 1:
+        # max_steps=0 is an empty training loop and warmup_steps<0 is meaningless; warmup_steps=0
+        # stays legal. (The plain-int type is gated at the top of __post_init__.)
+        if self.max_steps < 1:
             raise ValueError(f"max_steps must be an int >= 1, got {self.max_steps!r}")
-        if type(self.warmup_steps) is not int or self.warmup_steps < 0:
+        if self.warmup_steps < 0:
             raise ValueError(f"warmup_steps must be an int >= 0, got {self.warmup_steps!r}")
-        # Security/behavior-relevant bools must be REAL bools, not truthy coercions:
-        # load_checkpoint reads bool(cfg.trust_resume_checkpoint), so the string "False" would coerce to
-        # True and enable the unsafe weights_only=False fallback. `type(x) is not bool` (not isinstance)
-        # rejects the int/str footguns. Deliberately not swept across every bool field.
-        for _bname in ("trust_resume_checkpoint", "generate_embedding_figures"):
-            _bval = getattr(self, _bname)
-            if type(_bval) is not bool:
-                raise ValueError(f"{_bname} must be a bool, got {type(_bval).__name__}: {_bval!r}")
         if self.resume_from is not None and not isinstance(self.resume_from, str):
             raise ValueError(
                 f"resume_from must be None or a path string to a checkpoints/step_<N>.pt, got "
@@ -2370,58 +1630,9 @@ class VFE3Config:
         # tests/test_amp.py pins).
         _require(self.amp_dtype, (None, "bf16", "fp16"), "amp_dtype")
 
-        # Registry-driven, like every other *_mode field in this validator: the key set AND the alias
-        # collapse both live in vfe3/inference/e_step.py. (e_step_update was validated, and
-        # canonical_e_step_update computed, earlier -- ahead of the unroll-truncation warning.)
-        if canonical_e_step_update == "mm_exact":
-            # The closed-form MM minimizer needs a family that registers the mm_exact CAPABILITY --
-            # decoupled from the GRADIENT-kernel capability _routes_to_oracle checks, since a family can
-            # register one closed form without the other (e.g. gaussian_full's mm_exact fusion with no
-            # analytic gradient kernel). Same structural predicate, route="mm_exact".
-            _mm_exact_eligible = uses_kernel_route(
-                renyi_order=self.renyi_order,
-                gradient_mode=self.gradient_mode,
-                family=self.family,
-                divergence_family=self.divergence_family,
-                include_attention_entropy=self.include_attention_entropy,
-                transport_mode=self.transport_mode,
-                decoupled_value_gauge=(self.pos_rotation == "rope" and not self.rope_on_value),
-                route="mm_exact",
-            )
-            if not _mm_exact_eligible:
-                from vfe3.gradients.kernels import mm_exact_families
-                raise ValueError(
-                    "e_step_update='mm_exact' needs a family that registers the mm_exact closed-form "
-                    "capability under gradient_mode='filtering' + divergence_family='renyi' + "
-                    "renyi_order=1.0 + include_attention_entropy=True, belief-independent transport, "
-                    f"coupled value gauge; this config does not qualify (registered mm_exact "
-                    f"families: {mm_exact_families()}); it routes the belief gradient to the "
-                    "autograd oracle (or has no oracle fallback at all for a closed-form minimizer)."
-                )
-            # gaussian_full's fusion decomposes exactly per gauge-irrep block WHENEVER sigma_p is
-            # block-diagonal, which prior_bank._encode_prior_sigma guarantees (torch.diag_embed). The
-            # static check that used to rule out a multi-head config here is retired; kernels.py
-            # verifies the ACTUAL sigma_p tensor on every call.
-            if not (0.0 < self.mm_damping <= 1.0):
-                raise ValueError(f"mm_damping must be in (0, 1], got {self.mm_damping}")
-            if self.lambda_alpha_mode in ("state_dependent", "state_dependent_per_coord"):
-                import warnings
-                warnings.warn(
-                    f"e_step_update='mm_exact' with lambda_alpha_mode={self.lambda_alpha_mode!r} "
-                    "computes the frozen-alpha minimizer of the strict-pair-masked surrogate "
-                    "(NOT a majorizer of the canonical objective; see the e_step_update note); the "
-                    f"iteration takes a step toward it using mm_damping={self.mm_damping} (a damped "
-                    "step for values below 1.0, the full step at 1.0). It is not one-step exact for "
-                    "the profiled state-dependent-alpha objective.",
-                    UserWarning,
-                    stacklevel=2,
-                )
         if not math.isfinite(self.unigram_kappa) or self.unigram_kappa < 0.0:
             raise ValueError(
                 f"unigram_kappa must be finite and >= 0, got {self.unigram_kappa}")
-        if not isinstance(self.frame_pair_fp64_escalation, bool):
-            raise ValueError(
-                f"frame_pair_fp64_escalation must be bool, got {self.frame_pair_fp64_escalation!r}")
         if (not math.isfinite(self.exp_fp64_norm_threshold)
                 or self.exp_fp64_norm_threshold <= 0.0):
             raise ValueError(
@@ -2503,7 +1714,6 @@ class VFE3Config:
         The same structural result drives display notices and sweep admission. Consumers
         must not infer activity from whether a warning happens to be visible.
         """
-        from vfe3.inference.e_step import canonical_e_step_update
         from vfe3.model.prior_bank import PriorBank, _DECODERS, _decode_family_chunked
         from vfe3.divergence import get_functional, renyi
         from vfe3.families.base import get_family
@@ -2535,13 +1745,12 @@ class VFE3Config:
             mark(("relational_receiver_noise", "relational_receiver_law", "relational_receiver_update",
                   "relational_receiver_damping"), "only read by projected_gradient receiving laws")
         elif self.relational_receiver_update == "closed_form":
-            mark(("e_q_mu_lr", "e_q_sigma_lr", "e_mu_q_trust", "mu_trust_mode", "e_sigma_q_trust"),
+            mark(("e_q_mu_lr", "e_q_sigma_lr", "e_mu_q_trust", "e_sigma_q_trust"),
                  "relational_receiver_update='closed_form' applies the exact frozen-context update; "
                  "its step control is relational_receiver_damping")
         else:
             mark(("relational_receiver_damping",), "only read by relational_receiver_update='closed_form'")
-        gradient_controls = ("e_q_mu_lr", "e_q_sigma_lr", "e_step_mu_precond",
-                             "e_mu_q_trust", "mu_trust_mode", "e_sigma_q_trust")
+        gradient_controls = ("e_q_mu_lr", "e_q_sigma_lr", "e_mu_q_trust", "e_sigma_q_trust")
         if self.attention_mode == "projected_predictive":
             mark(("skip_belief_sigma_update",),
                  "projected routes run no sigma E-step: predictive_content keeps or moment-matches "
@@ -2559,14 +1768,12 @@ class VFE3Config:
         elif self.block_mlp_mode == "gaussian_template":
             mark(("block_mlp_activation", "block_mlp_covariance_floor"),
                  "gaussian_template gates by softmax over template KLs and keeps covariance")
-        if canonical_e_step_update(self.e_step_update) == "mm_exact":
-            mark(gradient_controls, "unread under e_step_update='mm_exact'; its step control is mm_damping")
-        else:
-            mark(("mm_damping",), "only read by e_step_update='mm_exact'")
         if not self.use_priorbank_head_evidence_mixer:
             mark(("m_head_evidence_lr",), "only read when use_priorbank_head_evidence_mixer=True")
         if self.pos_phi != "learned":
             mark(("m_pos_phi_lr",), "only pos_phi='learned' creates the learnable positional table")
+        if "layernorm" not in (self.norm_type_block, self.norm_type_final):
+            mark(("layernorm_affine",), "only read by a 'layernorm' block or final norm seam")
         if not (self.layernorm_affine and "layernorm" in (self.norm_type_block, self.norm_type_final)):
             mark(("m_layernorm_lr",), "requires layernorm_affine and a layernorm seam")
         if not self.decode_unigram_prior:
@@ -2574,7 +1781,7 @@ class VFE3Config:
         if self.lambda_alpha_mode == "constant":
             mark(("b0", "c0"), "only read by a state_dependent lambda_alpha_mode")
         if self.pos_rotation == "none":
-            mark(("rope_on_value", "rope_base", "rope_full_gauge"), "only read by pos_rotation='rope'")
+            mark(("rope_on_value", "rope_base"), "only read by pos_rotation='rope'")
         if self.pos_phi == "none":
             mark(("pos_phi_project_slk",), "only read by a non-'none' pos_phi")
         if (self.beta_attention_prior in ("windowed", "causal_windowed")
@@ -2582,8 +1789,8 @@ class VFE3Config:
             mark(("attention_window",), "window covers the context and is identical to plain causal")
         if self.n_layers == 1:
             mark(("prior_handoff_rho", "prior_handoff_sigma"), "no next layer consumes the handoff")
-        if self.e_phi_lr == 0.0 and self.m_phi_update_mode != "pullback_group":
-            mark(("phi_precond_mode",), "reached only by e_phi_lr>0 or m_phi_update_mode='pullback_group'")
+        if self.m_phi_update_mode != "pullback_group":
+            mark(("phi_precond_mode",), "reached only by m_phi_update_mode='pullback_group'")
         registration = _DECODERS[self.decode_mode]
         if not registration.supports_chunked:
             mark(("decode_ce_checkpoint",), "the selected decoder has no checkpointed chunked CE kernel")
@@ -2594,8 +1801,7 @@ class VFE3Config:
             and registration.callable is _decode_family_chunked
             and registration.fused_ce is PriorBank.decode_ce_family_chunked
             and get_family(self.family) is FullGaussian
-            and get_functional(self.divergence_family) is renyi
-            and type(self.renyi_order) in (int, float) and self.renyi_order == 1.0
+            and get_functional("renyi") is renyi
             and self.full_cov_kl_precision == "fp32_escalate"
         )
         if registration.family_consistent and not canonical_family_dispatch:
@@ -2610,6 +1816,8 @@ class VFE3Config:
         # override leaves only a floating-point roundoff residue in the gradients.
         if self.decode_mode == "linear":
             mark(("m_decode_sigma_lr",), "linear decode has no independent variance table")
+            mark(("decode_av_precision", "decode_ranking_fp64_escalation", "decode_ranking_refinement"),
+                 "read only by the prior-bank Gaussian KL decoders and their ranking guard")
             mark(("decode_tau", "decode_temperature_learned"), "read only by the prior-bank KL decode")
             mark(("untie_decode_bank",),
                  "read only by the KL-to-bank decode; the linear decode is untied by construction")
@@ -2620,9 +1828,6 @@ class VFE3Config:
             mark(("decode_bias",), "linear decode only; the prior-bank KL decoders create no output bias")
         if self.beta_attention_prior not in ("windowed", "causal_windowed"):
             mark(("attention_window",), "only the windowed/causal_windowed priors read the band half-width")
-        from vfe3.families.base import bhattacharyya, jeffreys, squared_hellinger
-        if get_functional(self.divergence_family) in (bhattacharyya, jeffreys, squared_hellinger):
-            mark(("renyi_order",), "this order-free divergence functional fixes its own Renyi order")
         if self.gauge_transport in ("off", "frozen"):
             mark(("m_pos_phi_lr", "phi_weight_decay"),
                  f"gauge_transport={self.gauge_transport!r} sets requires_grad=False on the frame "
@@ -2632,44 +1837,27 @@ class VFE3Config:
                  "no sigma E-step runs on projected routes or under skip_belief_sigma_update "
                  "(a moment-matched predictive covariance is a readout with its own floor), so no "
                  "sigma step, trust region, or SPD ceiling runs")
-        mark(("full_cov_kl_backend",),
-             "projected scoring never calls the transported full-covariance pair backend")
         if self.attention_mode == "projected_predictive":
             mark(("lambda_beta",), "predictive_content weights no belief-coupling block")
-        # Both retained projected routes read covariances through U^{-1} frame factors only.
-        mark(("full_cov_congruence_precision", "full_cov_congruence_certification",
-              "congruence_cond_escalation"),
-             "projected routes never transport a covariance by congruence")
-        mark(("rope_full_gauge",),
-             "projected routes fold RoPE into the frame (U_i R_i^T), which already carries both "
-             "moments; only the retired transported pair energy read this toggle")
-        mark(("include_attention_entropy", "oracle_unroll_grad"),
-             "fixed by the projected envelope; no projected route evaluates the global F or the oracle")
         if self.decode_mode != "family_chunked":
             mark(("full_cov_kl_precision",),
                  "projected scoring has its own factor policy; only the family_chunked decoder "
                  "evaluates the pair divergence")
-        if (self.attention_mode == "projected_predictive" and self.family == "gaussian_frame_diagonal"
-                and self.decode_coordinates == "local" and self.block_coordinates == "local"
-                and not (self.use_block_mlp and self.block_mlp_mode == "canonical_frame")):
-            mark(("phi_scale", "pos_phi", "pos_phi_scale", "pos_phi_project_slk", "m_phi_lr",
-                  "m_pos_phi_lr", "phi_weight_decay", "gauge_transport"),
-                 "gaussian_frame_diagonal replaces the relational frame by the identity, so the "
-                 "learned frame tables receive no gradient on this route")
+        if self.diagonal_covariance:
+            mark(("safe_cholesky_jitter_mode",),
+                 "a diagonal family never factors a dense covariance through safe_cholesky")
         if "e_mu_q_trust" in inactive or self.e_mu_q_trust is None or self.diagonal_covariance:
             mark(("mu_trust_cholesky_rounds",),
                  "only an active mean trust region on a full covariance factors sigma_q")
         # stack._can_omit_prior_handoff at config level: predictive_content never reads the prior
         # and no M-step prior consumer is enabled.
         if (self.attention_mode == "projected_predictive" and self.mstep_self_coupling_weight == 0.0
-                and self.cg_energy_weight == 0.0 and self.e_step_update == "gradient"
-                and self.e_phi_lr == 0.0):
+                and self.cg_energy_weight == 0.0):
             mark(("prior_handoff_rho", "prior_handoff_sigma"),
                  "predictive_content never reads the prior and no M-step prior consumer is enabled")
         # The stack enters the E-step with q = p; one gradient iteration in one layer therefore
         # evaluates the self-coupling at D(q||p) = 0, where its force and derivatives vanish.
-        if (canonical_e_step_update(self.e_step_update) == "gradient" and self.n_e_steps == 1
-                and self.n_layers == 1 and self.mstep_self_coupling_weight == 0.0):
+        if (self.n_e_steps == 1 and self.n_layers == 1 and self.mstep_self_coupling_weight == 0.0):
             mark(("lambda_alpha_mode", "lambda_alpha", "b0", "c0"),
                  "the single gradient E-step iteration starts at q = p, where the self-coupling "
                  "force vanishes")
@@ -2680,11 +1868,9 @@ class VFE3Config:
             mark(("exp_fp64_norm_threshold",),
                  "transport_chart_max_norm rejects a frame before any block norm reaches this "
                  "threshold, so the float64 exponential island is unreachable")
-        # Transported gaussian_frame_diagonal is frame-intrinsic: the flat coboundary cancels the
-        # whole vertex frame, including the RoPE fold and the positional right factor.
         if (self.attention_mode == "projected_predictive" and self.family == "gaussian_full"
                 and self.encode_mode in ("per_token", "per_token_additive")
-                and not self.use_head_mixer and not self.rope_full_gauge
+                and not self.use_head_mixer
                 and self.predictive_covariance == "passthrough"
                 and self.block_coordinates == "local" and self.decode_coordinates == "local"
                 and not (self.use_block_mlp and self.block_mlp_covariance != "passthrough")):
@@ -2732,11 +1918,10 @@ class VFE3Config:
 
         NOTE: this is a config-level convenience (used for logging). The ACTIVE attention
         temperature is computed group-aware by ``free_energy.attention_tau(kappa, group.irrep_dims)``,
-        which keys off the dimension the energy accumulates over -- the gauge-irrep BLOCK: sqrt(K)
-        for a single-block group (glk/so_k/sp, irrep_dims=[K]) and sqrt(d_head) for per-head
-        multi-block (block_glk). This property equals the active tau only for an equal-block group
-        whose block size is d_head (the default block_glk); on a single-block group it understates it
-        by sqrt(n_heads). kappa=1 recovers the Vaswani sqrt(d_k) temperature over the energy dimension.
+        which keys off the dimension the energy accumulates over -- the gauge-irrep BLOCK, sqrt(d_head)
+        for block_glk. This property equals the active tau only for an equal-block group whose block
+        size is d_head (block_glk). kappa=1 recovers the Vaswani sqrt(d_k) temperature over the
+        energy dimension.
         When kappa is a per-head list, returns the mean tau (for logging only).
         """
         k = float(sum(self.kappa_beta) / len(self.kappa_beta)) if isinstance(self.kappa_beta, (list, tuple)) else self.kappa_beta
@@ -2760,17 +1945,13 @@ class VFE3Config:
         r"""Whether the selected mixer route is an intertwiner for the selected gauge action.
 
         ``block_glk`` assigns an independent frame to each head, so a trainable cross-head mixer
-        is not in that action's commutant. Tied/isotypic mixing is exact for full covariance;
+        is not in that action's commutant. Isotypic mixing (``so_n``) is exact for full covariance;
         diagonal dispersion projection is exact only for diagonal gauges. This is metadata only:
         the established opt-in ``block_glk`` baseline remains selectable and the default remains
         mixer-off.
         """
         compatibility = VFE3Config.head_mixer_compatibility.fget(self)
-        return compatibility in (
-            "disabled",
-            "tied_intertwiner",
-            "isotypic_intertwiner",
-        )
+        return compatibility in ("disabled", "isotypic_intertwiner")
 
     @property
     def head_mixer_compatibility(self) -> str:
@@ -2781,10 +1962,7 @@ class VFE3Config:
             return "independent_head_nonintertwiner"
         from vfe3.divergence import family_cov_kind
         if family_cov_kind(self.family) == "diagonal":
-            prefix = "tied" if self.gauge_group == "tied_block_glk" else "isotypic"
-            return f"{prefix}_diagonal_projection_nonintertwiner"
-        if self.gauge_group == "tied_block_glk":
-            return "tied_intertwiner"
+            return "isotypic_diagonal_projection_nonintertwiner"
         return "isotypic_intertwiner"
 
     @property
@@ -2802,17 +1980,144 @@ class VFE3Config:
         """Per-head belief dimension K // n_heads."""
         return self.embed_dim // self.n_heads
 
+    def _chart_ordering_problem(self) -> Optional[str]:
+        r"""Describe a violated manifold-phi chart ordering, or return None when it holds.
+
+        The manifold phi policies need an explicit chart bound strictly between the M-step factor
+        radius and the transport clamp,
+        ``phi_mstep_max_matrix_norm (or 5.0) < transport_chart_max_norm < TRANSPORT_CLAMP_MAX_NORM``.
+        """
+        from vfe3.geometry.transport import TRANSPORT_CLAMP_MAX_NORM
+        factor_radius = (self.phi_mstep_max_matrix_norm
+                         if self.phi_mstep_max_matrix_norm is not None else 5.0)
+        if (self.transport_chart_max_norm is not None
+                and factor_radius < self.transport_chart_max_norm < TRANSPORT_CLAMP_MAX_NORM):
+            return None
+        return (f"an explicit transport_chart_max_norm satisfying {factor_radius} < "
+                f"transport_chart_max_norm < {TRANSPORT_CLAMP_MAX_NORM}; got "
+                f"{self.transport_chart_max_norm!r}")
+
 
 def serialize_config(config: VFE3Config) -> dict[str, Any]:
     """Serialize a config to its plain JSON-ready mapping of public fields."""
     payload = asdict(config)
     if math.isinf(config.kl_max):
         payload["kl_max"] = "inf"  # Strict JSON has no Infinity number.
-    # asdict omits the InitVar. Persist it only when set, so every ordinary config serializes and
-    # fingerprints exactly as before while an admitted dense-decode config survives a round trip.
-    if getattr(config, "_allow_legacy_dense_decode", False):
-        payload["_allow_legacy_dense_decode"] = True
     return payload
+
+
+# Retired selectors pinned by the projected envelope: a saved value equal to the pinned one is
+# dropped silently, any other value is refused.
+_RETIRED_PINNED_FIELDS: Mapping[str, object] = {
+    "divergence_family": "renyi", "renyi_order": 1.0, "include_attention_entropy": True,
+    "gradient_mode": "filtering", "e_step_update": "gradient", "e_step_gradient": "unroll",
+    "oracle_unroll_grad": True, "e_phi_lr": 0.0, "transport_mode": "flat",
+}
+# Retired fields no projected route read: any saved value is dropped silently.
+_RETIRED_INERT_FIELDS = frozenset({
+    "mm_damping", "full_cov_kl_backend", "full_cov_congruence_precision",
+    "full_cov_congruence_certification", "congruence_cond_escalation", "rope_full_gauge",
+})
+# Retired fields with a config-dependent rule in _migrate_retired_fields.
+_RETIRED_CONDITIONAL_FIELDS = frozenset({
+    "cross_couplings", "mu_trust_mode", "e_step_mu_precond", "m_decode_lr", "_allow_legacy_dense_decode",
+})
+# Every serialized key config_from_serialized migrates or refuses that is not a VFE3Config field.
+RETIRED_CONFIG_KEYS = frozenset(
+    set(_RETIRED_PINNED_FIELDS) | _RETIRED_INERT_FIELDS | _RETIRED_CONDITIONAL_FIELDS
+    | {"grad_clip_per_role", "exp_fp64_mode", "compile_pair_kernel", "relational_mode",
+       "relational_readout_mode", "relational_input_scope", "relational_output_scope",
+       "relational_identity_content"})
+_RETIRED_FAMILIES = frozenset({"gaussian_frame_diagonal"})
+_MIGRATED_FAMILIES = {"gaussian_diagonal_exact": "gaussian_diagonal"}
+_RETIRED_ENCODE_MODES = frozenset({"canonical_content_gauge", "canonical_content_projected"})
+
+
+def _same_serialized_value(value: object, expected: object) -> bool:
+    """Exact equality for a pinned value, without letting bool stand in for a number."""
+    if isinstance(expected, bool):
+        return type(value) is bool and value is expected
+    if isinstance(expected, float):
+        return type(value) in (int, float) and value == expected
+    return value == expected
+
+
+def _migrate_retired_fields(
+    payload: dict[str, Any],
+
+    *,
+    source: str,
+) -> None:
+    r"""Pop every retired field from ``payload`` in place; migrate it or refuse it.
+
+    A retired selector is accepted silently when its saved value is the one the projected routes
+    pinned, or when the field was inert for this config; any other value changed a forward this
+    build no longer computes and is refused as retired. Value renames (dense decode modes,
+    ``gaussian_diagonal_exact``, ``m_decode_lr``) are rewritten to their surviving equivalents.
+    Must run after the attention selector and receiver-law defaults are resolved.
+    """
+    def refuse(name: str, value: object, detail: str = "") -> None:
+        raise ValueError(f"serialized config from {source} requests retired {name}={value!r}"
+                         f"{detail}; continuation requires explicit migration")
+
+    for name in ("include_attention_entropy", "oracle_unroll_grad"):
+        if name in payload:
+            payload[name] = _normalize_serialized_boolean(payload[name], name, source=source)
+    for name, pinned in _RETIRED_PINNED_FIELDS.items():
+        if name in payload:
+            value = payload.pop(name)
+            if not _same_serialized_value(value, pinned):
+                refuse(name, value, f" (only {pinned!r} survives)")
+    for name in _RETIRED_INERT_FIELDS:
+        payload.pop(name, None)
+    payload.pop("_allow_legacy_dense_decode", None)
+
+    if "cross_couplings" in payload:
+        value = payload.pop("cross_couplings")
+        if value not in (None, []):
+            refuse("cross_couplings", value)
+    attention_mode = payload.get("attention_mode")
+    gradient_route = attention_mode == "projected_gradient"
+    if "mu_trust_mode" in payload:
+        value = payload.pop("mu_trust_mode")
+        trust_read = (gradient_route
+                      and payload.get("relational_receiver_update", "closed_form") == "euler"
+                      and payload.get("e_mu_q_trust", VFE3Config.e_mu_q_trust) is not None)
+        if value != "ball" and trust_read:
+            refuse("mu_trust_mode", value, " (the mean trust region is the Mahalanobis ball)")
+    if "e_step_mu_precond" in payload:
+        value = payload.pop("e_step_mu_precond")
+        if value != "fisher" and gradient_route:
+            refuse("e_step_mu_precond", value, " (the receiver mean step is the Fisher natural gradient)")
+
+    decode_mode = payload.get("decode_mode")
+    if isinstance(decode_mode, str) and decode_mode in _DENSE_DECODE_MIGRATIONS:
+        payload["decode_mode"] = _DENSE_DECODE_MIGRATIONS[decode_mode]
+    if "m_decode_lr" in payload:
+        rate = payload.pop("m_decode_lr")
+        if rate is not None:
+            learned = _normalize_serialized_boolean(
+                payload.get("decode_temperature_learned", VFE3Config.decode_temperature_learned),
+                "decode_temperature_learned", source=source)
+            linear = payload.get("decode_mode", VFE3Config.decode_mode) == "linear"
+            if learned and not linear:
+                refuse("m_decode_lr", rate, " (it also set the learned decode temperature rate)")
+            # Linear decode has no variance table, so only its mean-role rate is migrated.
+            for name in ("m_decode_mu_lr",) if linear else ("m_decode_mu_lr", "m_decode_sigma_lr"):
+                if payload.get(name) is None:
+                    payload[name] = rate
+
+    family = payload.get("family")
+    if isinstance(family, str):
+        if family in _RETIRED_FAMILIES:
+            refuse("family", family)
+        payload["family"] = _MIGRATED_FAMILIES.get(family, family)
+    encode_mode = payload.get("encode_mode")
+    if isinstance(encode_mode, str) and encode_mode in _RETIRED_ENCODE_MODES:
+        refuse("encode_mode", encode_mode)
+    gauge_group = payload.get("gauge_group")
+    if isinstance(gauge_group, str) and gauge_group in _RETIRED_GAUGE_GROUPS:
+        refuse("gauge_group", gauge_group)
 
 
 def config_from_serialized(
@@ -2825,14 +2130,13 @@ def config_from_serialized(
 
     Historical per-role clipping and norm precision migrate without changing behavior.
     Retired global clipping and dimension precision are refused. Historical attention pairs
-    translate to one canonical selector; conflicting old/new selectors are refused.
+    translate to one canonical selector; conflicting old/new selectors are refused. Retired
+    selectors (see :func:`_migrate_retired_fields`) are dropped when pinned or inert and refused
+    otherwise.
     """
     if not isinstance(payload, Mapping):
         raise ValueError(f"serialized config from {source} must be a mapping")
     payload = dict(payload)
-    allow_legacy_dense_decode = _normalize_serialized_boolean(
-        payload.pop("_allow_legacy_dense_decode", False), "_allow_legacy_dense_decode",
-        source=source)
     if "grad_clip_per_role" in payload:
         per_role = _normalize_serialized_boolean(
             payload.pop("grad_clip_per_role"), "grad_clip_per_role", source=source)
@@ -2884,6 +2188,7 @@ def config_from_serialized(
     # Configs saved before the receiver-law fields keep the PR #30 receiver they ran.
     payload.setdefault("relational_receiver_law", "ambient_alignment")
     payload.setdefault("relational_receiver_update", "euler")
+    _migrate_retired_fields(payload, source=source)
     config_fields = {field.name: field for field in fields(VFE3Config)}
     unknown = sorted(str(key) for key in payload if key not in config_fields)
     if unknown:
@@ -2908,7 +2213,7 @@ def config_from_serialized(
     }
     if values.get("kl_max") == "inf":
         values["kl_max"] = math.inf
-    return VFE3Config(**values, _allow_legacy_dense_decode=allow_legacy_dense_decode)
+    return VFE3Config(**values)
 
 
 def _normalize_serialized_boolean(

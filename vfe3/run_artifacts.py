@@ -45,7 +45,6 @@ import torch
 
 from vfe3.contracts import (
     VFE_MODEL_FAMILY,
-    is_conditional_filtering,
     is_vfe_config,
     is_vfe_model,
     model_family_of,
@@ -3251,7 +3250,7 @@ def _cost_model_fields(
     those drivers (order-1 constants; for a calibrated frontier use ``wall_time`` or a profiler).
     ``wall_time`` on a fixed GPU is the empirical ground truth the analytic constants calibrate
     against. ``n_gen`` / ``n_blocks`` are read from the GROUP OBJECT so they track ``cross_couplings``,
-    bracket closure, and the ``so_n``/``sp_n`` decoupling of ``n_gen`` from ``K``.
+    bracket closure, and the ``so_n`` decoupling of ``n_gen`` from ``K``.
     """
     V, K = int(cfg.vocab_size), int(cfg.embed_dim)
     n_gen = int(model.group.generator_shape[0])
@@ -3665,7 +3664,6 @@ def finalize_run(
             _atomic_replace(artifacts.final_path, tmp)
     logger.info("Testing final training weights (step %s)", final_step)
 
-    conditional_enabled = is_conditional_filtering(model)
     # Another model family (the conventional baseline) runs the model-agnostic parts of finalize
     # (test at final and best weights, training sample, provenance, summary, resources) and skips the
     # VFE-only probes, recording why under "skipped_analyses".
@@ -3718,58 +3716,11 @@ def finalize_run(
 
     # Held-out inference-depth counterfactual, always attempted when test metrics are available. This does not replace any selected headline
     # metric: it is published only under the diagnostic namespace after a complete successful probe.
-    if conditional_enabled:
+    if vfe_model:
+        # Projected routes run one configured readout/receiver episode: there is no depth to zero
+        # and no shared stationary free energy, so both records are published as unavailable.
         results["diagnostics"]["zero_e_steps_counterfactual"] = _conditional_unavailable_probe("zero_e_steps_counterfactual", cfg=model.cfg)
         results["diagnostics"]["legacy_reduced_free_energy"] = _conditional_unavailable_probe("legacy_reduced_free_energy", cfg=model.cfg)
-    if (vfe_model and not conditional_enabled and test_loader is not None
-            and results.get("test_ce") is not None):
-        _saved_ne = model.cfg.n_e_steps
-        try:
-            model.cfg.n_e_steps = 0
-            m0 = evaluate(model, test_loader, tokens_per_char=tokens_per_char, device=device)
-            counterfactual_ce = float(m0["ce"])
-            ce_delta = counterfactual_ce - float(results["test_ce"])
-            diagnostics = results["diagnostics"]
-            if not isinstance(diagnostics, dict):
-                raise RuntimeError("finalization diagnostics must be a mapping")
-            diagnostics["zero_e_steps_counterfactual"] = {
-                "kind":                 "held_out_inference_depth_counterfactual",
-                "split":                "test",
-                "configured_depth":     int(_saved_ne),
-                "counterfactual_depth": 0,
-                "counterfactual_ce":    counterfactual_ce,
-                "ce_delta_vs_headline": ce_delta,
-            }
-            logger.info(
-                "Zero-E-step held-out counterfactual (CE@0 - CE@%d): %.4f",
-                _saved_ne,
-                ce_delta,
-            )
-        except Exception as exc:
-            logger.warning("zero-E-step held-out counterfactual failed (%s); skipped", exc)
-        finally:
-            model.cfg.n_e_steps = _saved_ne
-
-    # EXP-5 (C2): the converged final E-step free energy PER TOKEN -- the E-step's OWN target-blind
-    # functional value (free_energy_value sums F over the N tokens; divide by N). Persisted so a
-    # cross-arm reader (scaling_analysis) can describe the final-F/CE relationship across an
-    # n_e_steps sweep -- the structural non-Neal-Hinton EM prediction (the E-step serves a distinct
-    # functional, not the likelihood). Off-graph, best-effort, on a fixed test batch (sequence 0).
-    if vfe_model and test_loader is not None and not conditional_enabled:
-        try:
-            from vfe3.viz.extract import e_step_belief_trace
-            _b = next(iter(test_loader))
-            _tok = (_b[0] if isinstance(_b, (tuple, list)) else _b).to(device)
-            _tr = e_step_belief_trace(model, _tok)              # n_iter defaults to cfg.n_e_steps
-            results["estep_final_iterate_f_per_token"] = float(_tr["free_energy"][-1]) / max(1, int(_tok.shape[1]))
-            results["estep_final_f_per_token"] = results["estep_final_iterate_f_per_token"]  # compatibility alias
-            results["estep_iterate_evidence"] = _estep_iterate_evidence(
-                free_energy=[float(value) for value in _tr["free_energy"]],
-                halted=False, fixed_point_residual=None, fixed_point_tolerance=None,
-            )
-            logger.info("Final E-step iterate F/token: %.4f", results["estep_final_iterate_f_per_token"])
-        except Exception as exc:
-            logger.warning("estep final-F probe failed (%s); skipped", exc)
 
     depth_loader = val_loader if val_loader is not None else test_loader
     # Mechanism records are standard outputs. The sole figure-policy switch controls only the
@@ -3990,73 +3941,13 @@ def collect_estep_depth_sensitivity(
     targets: torch.Tensor,
     depths:  Iterable[int],
 ) -> Dict[str, object]:
-    r"""Evaluate current weights at several inference depths on one fixed batch.
+    r"""Current-weight inference-depth sensitivity, published as an explicit unavailable record.
 
-    This is a sensitivity probe, not a retrained-depth comparison. Model mode, configured depths,
-    and global CPU/CUDA RNG state are restored exactly before return.
-
-    ``cfg.n_e_steps`` is read by the belief E-step (``model/block.py``); ``points`` sweeps that
-    BELIEF loop and records the depth each point ran at.
-
-    ``free_energy_per_token`` comes from ``e_step_belief_trace``, which uses SEQUENCE 0 only, while
-    ``ce`` is over every sequence in ``tokens``; the key is duplicated as
-    ``free_energy_per_token_seq0`` to keep that explicit, and ``n_sequences`` records the CE sample.
+    The projected routes run only their configured readout or receiver episode and define no shared
+    free energy, so no depth sweep is executed; ``tokens``, ``targets`` and ``depths`` are accepted
+    for call-site compatibility.
     """
-    if is_conditional_filtering(model):
-        return _conditional_unavailable_probe("collect_estep_depth_sensitivity", cfg=model.cfg)
-    import torch.nn.functional as F
-    from vfe3.viz.extract import e_step_belief_trace
-
-    requested = list(depths)
-    if any(type(depth) is not int or depth < 0 for depth in requested):
-        raise ValueError(f"depths must contain nonnegative integers, got {requested!r}")
-    ordered = sorted(set(requested))
-    trained_depth = int(model.cfg.n_e_steps)
-    was_training = bool(model.training)
-    cpu_rng = torch.get_rng_state().clone()
-    cuda_rng = ([state.clone() for state in torch.cuda.get_rng_state_all()]
-                if torch.cuda.device_count() > 0 else None)
-
-    def _score(belief_depth: int) -> Dict[str, float | int]:
-        model.cfg.n_e_steps = belief_depth
-        logits = model(tokens)
-        ce = F.cross_entropy(
-            logits.reshape(-1, logits.shape[-1]).float(),
-            targets.reshape(-1),
-            ignore_index=-100,
-        )
-        trace = e_step_belief_trace(model, tokens, n_iter=belief_depth)
-        free_energy = float(trace["free_energy"][-1]) / max(1, int(tokens.shape[1]))
-        return {
-            "depth":                      belief_depth,   # legacy key: the swept axis of `points`
-            "belief_depth":               belief_depth,
-            "ce":                         float(ce),
-            "free_energy_per_token":      free_energy,
-            "free_energy_per_token_seq0": free_energy,
-        }
-
-    points: List[Dict[str, float | int]] = []
-    try:
-        model.eval()
-        # Belief-loop sweep: `n_e_steps` is the depth the weights were trained with.
-        for depth in ordered:
-            points.append(_score(depth))
-    finally:
-        model.cfg.n_e_steps = trained_depth
-        model.train(was_training)
-        torch.set_rng_state(cpu_rng)
-        if cuda_rng is not None:
-            torch.cuda.set_rng_state_all(cuda_rng)
-    return {
-        "trained_depth": trained_depth,
-        "n_sequences": int(tokens.shape[0]),
-        "interpretation": (
-            "current-weight depth sensitivity at fixed weights; no depth other than the trained "
-            "depth was retrained. 'points' varies the BELIEF E-step; free_energy_per_token is "
-            "sequence 0 only; ce is over all n_sequences."
-        ),
-        "points": points,
-    }
+    return _conditional_unavailable_probe("collect_estep_depth_sensitivity", cfg=model.cfg)
 
 
 def _log_mechanism_diagnostics(
@@ -4076,10 +3967,6 @@ def _log_mechanism_diagnostics(
         rows = {int(p["belief_depth"]): p for p in character["points"]}
         at_trained = rows.get(trained) or next(iter(rows.values()))
         deepest = rows[max(rows)]
-        if at_trained.get("pair_precision_share") is not None:
-            logger.info(
-                "E-step fusion at trained depth %d: PAIR (attention) %.3f / PRIOR (residual) %.3f",
-                trained, at_trained["pair_precision_share"], at_trained["prior_precision_share"])
         if at_trained.get("rel_displacement") is not None:
             logger.info(
                 "Belief displacement ||dmu||/||mu_p||: %.4f at depth %d -> %.4f at depth %d",
@@ -4090,11 +3977,6 @@ def _log_mechanism_diagnostics(
                 "Trajectory straightness cos(dir_%d, dir_1) = %+.4f; step 1 takes %.0f%% of it",
                 int(deepest["belief_depth"]), deepest["cos_dir_vs_step1"],
                 100.0 * (deepest.get("step1_share_of_displacement") or 0.0))
-        if float(character.get("recompute_max_abs_err") or 0.0) > 1e-4:
-            logger.warning(
-                "E-step character replica error %.3e is NONZERO -- the probe no longer matches the "
-                "kernel fusion; treat its precision shares as stale",
-                character["recompute_max_abs_err"])
     if beta is not None and beta.get("available"):
         deltas = beta["delta_ce"]
         logger.info(
@@ -4113,292 +3995,29 @@ def collect_estep_character(
     tokens: torch.Tensor,
     depths: Iterable[int],
 ) -> Dict[str, object]:
-    r"""Is the belief E-step convergent inference, or one aggregation with a residual?
+    r"""How far the configured projected readout or receiver episode moves the belief.
 
-    Three questions, one fixed batch, current weights (2026-07-25):
-
-    1. **How far does the belief move?** ``rel_displacement`` is
-       :math:`\lVert\mu^{*}_d-\mu_p\rVert/\lVert\mu_p\rVert` at each depth d. A no-op reads 0.
-    2. **Is the trajectory a straight line?** ``cos_dir_vs_step1`` is the cosine between the total
-       displacement at depth d and the displacement after ONE step. Near +1 means every later step
-       pushes the same way, so depth buys magnitude rather than direction.
-    3. **How is the fixed point weighted?** ``mm_exact`` fuses
-       :math:`\mu^{*}=(a\mu_p/s_p+\sum_j w_{ij}\mu_t/s_t)/P`. ``pair_precision_share`` is the
-       transported-neighbor (ATTENTION) mass of ``P`` and ``prior_precision_share`` its complement
-       (the RESIDUAL). Measured 2026-07-25 at 0.190 (K=20) and 0.298 (K=300), i.e. the converged
-       belief is a convex blend dominated by its own prior, not a deep computation.
-
-    SELF-VALIDATING. The split is recomputed from the same public helpers the kernel uses and then
-    checked against the kernel's own returned ``mu_star``; ``recompute_max_abs_err`` is that residual
-    and is 0.0 when the replica is exact. If the kernel's fusion is ever changed without updating
-    this probe the residual grows, so the number is reported rather than asserted -- a drifted probe
-    is visible in the artifact instead of silently wrong.
-
-    Only the ``mm_exact`` kernel route is decomposed. On any other ``e_step_update`` the displacement
-    and cosine are still reported and the shares are ``None`` (``precision_split_available=False``);
-    nothing is fabricated for a route whose fusion does not exist.
-
-    That last sentence was a docstring CLAIM the code did not honor until 2026-07-26: the displacement
-    window was populated only inside the ``mm_exact`` spy, so a ``e_step_update='gradient'`` checkpoint
-    returned ``None`` for every field, not just the shares. It surfaced while re-measuring the numbers
-    B-01 invalidated -- the surviving K=20 checkpoint runs the gradient route, so the probe reported
-    nothing at all about it. The block-level window below closes that: ``vfe_block`` receives the
-    belief prior and returns the converged belief whatever the inner route is, so displacement and
-    cosine are now genuinely route-independent. The ``mm_exact`` window stays PRIMARY where it exists,
-    because it is what the published mm numbers were measured against; the block window is a fallback
-    used only when no belief fusion was recorded.
-
-    That fallback then read the block's RETURN value, which is post-``head_mixer``/``cg_coupling``/
-    norm, while the ``mm_exact`` window reads ``mu_star`` before them -- so the two windows measured
-    different quantities and the published ``rel_displacement`` was not comparable across routes
-    (audit 2026-07-26 B-11). On the K=20 ``mm_exact`` checkpoint at ``use_head_mixer=True`` the same
-    forward pass reads 0.213 on the mm window and 4.579 on the block's return, because the mixer
-    alone moves the belief 4.43x its own norm -- and 98.5% of that motion is a scalar gain of 5.33
-    (cosine 0.985), i.e. magnitude carrying no inferential content. The block window now ends at
-    ``capture['converged']``, the pre-transform belief ``vfe_block`` already stashes, so both windows
-    measure the E-step and ``displacement_window`` records which one produced each point.
+    ``rel_displacement`` is :math:`\lVert\mu_q-\mu_p\rVert/\lVert\mu_p\rVert` between the first
+    and last captured states of one diagnostic snapshot (pre-transform: before head mixer, CG, norm
+    and MLP). Only the configured depth is measured, so ``depth_sweep_available`` is False and
+    ``cos_dir_vs_step1`` is None; ``depths`` is validated for call-site compatibility.
     """
-    if is_conditional_filtering(model):
-        requested = list(depths)
-        if any(type(depth) is not int or depth < 1 for depth in requested):
-            raise ValueError(f"depths must contain integers >= 1, got {requested!r}")
-        snapshot = model.build_diagnostic_snapshot(tokens)
-        mu_p, mu_q = snapshot.trace_states[0].mu, snapshot.trace_states[-1].mu
-        denominator = float(mu_p.norm())
-        return {
-            "available": True, "inference_semantics": model.conditional_semantics,
-            "trained_depth": len(snapshot.trace_states) - 1, "depth_sweep_available": False,
-            "depth_sweep_reason": ("only the configured receiver episode is supported"
-                                   if model.cfg.relational_readout_mode == "full_link_update"
-                                   else "only the configured single readout is supported"),
-            "precision_split_available": False,
-            "points": [{"belief_depth": len(snapshot.trace_states) - 1, "rel_displacement": (
-                float((mu_q - mu_p).norm()) / denominator if denominator > 0 else None),
-                "pair_precision_share": None, "cos_dir_vs_step1": None,
-                "displacement_window": "captured_pre_transform_readout"}],
-        }
-    from vfe3.alpha_i import alpha_gradient_coefficient, alpha_is_per_coord
-    from vfe3.free_energy import self_divergence_for_alpha
-    from vfe3.gradients import kernels as kernels_module
-    from vfe3.inference import e_step as e_step_module
-    from vfe3.model import stack as stack_module
-
     requested = list(depths)
     if any(type(depth) is not int or depth < 1 for depth in requested):
         raise ValueError(f"depths must contain integers >= 1, got {requested!r}")
-    ordered = sorted(set(requested))
-    trained_depth = int(model.cfg.n_e_steps)
-    was_training = bool(model.training)
-
-    # `inference/e_step.py` binds mm_exact_update at import, so patching `kernels` alone leaves the
-    # live call site pointing at the original and the probe silently records nothing. Patch every
-    # module that holds a reference, and restore each from its own saved value.
-    original_mm = kernels_module.mm_exact_update
-    holders = [module for module in (kernels_module, e_step_module)
-               if getattr(module, "mm_exact_update", None) is original_mm]
-    original_contract = kernels_module._pair_contract
-    contract_out: List[torch.Tensor] = []
-    recorded: List[Dict[str, object]] = []
-
-    # LAYER TAGGING (audit 2026-07-26 B-01): tag every call with the layer it belongs to, then read
-    # LAYER 0 only -- one E-step of one layer is the object this probe is named for.
-    frame = {"layer": 0}
-    original_block = stack_module.vfe_block
-
-    def _block_spy(*args, **kwargs):
-        # Route-independent displacement window. vfe_block(belief, mu_p, sigma_p, ...) takes the
-        # prior positionally at the stack call site, so the ANCHOR exists on every e_step_update --
-        # unlike the mm_exact fusion, which the gradient route never calls.
-        #
-        # The CONVERGED end must be the E-step's own output, NOT the block's return value (audit
-        # 2026-07-26 B-11). vfe_block applies head_mixer / cg_coupling / block_norm AFTER the E-step,
-        # so `out.mu` is post-transform while the mm spy reads mu_star pre-transform: the two windows
-        # then measure different quantities and rel_displacement is silently incomparable across
-        # routes. Measured on the K=20 mm_exact checkpoint at use_head_mixer=True, one batch of 64:
-        # the mm window reads 0.213 and the block's return reads 4.579 for the SAME forward pass,
-        # because the mixer alone moves the belief 4.43x its own norm -- and that motion is 98.5%
-        # a scalar gain (cos 0.985, gain 5.33), so it is magnitude carrying no inferential content.
-        # `capture['converged']` is the pre-transform belief vfe_block already stashes for the M-step
-        # self-coupling, which is exactly the mm window's endpoint; inject a capture when the caller
-        # passed none (an empty mapping selects the same branches None does).
-        record = (frame["layer"] == 0 and len(args) >= 2)
-        if record and kwargs.get("capture") is None:
-            kwargs["capture"] = {}
-        out = original_block(*args, **kwargs)
-        if record:
-            mu_prior = args[1]
-            converged = (kwargs.get("capture") or {}).get("converged")
-            mu_converged = getattr(converged, "mu", None)
-            if isinstance(mu_prior, torch.Tensor) and isinstance(mu_converged, torch.Tensor):
-                block_window["mu_p"] = mu_prior.detach()
-                block_window["mu_star"] = mu_converged.detach()
-        frame["layer"] += 1                              # count layers as they COMPLETE
-        return out
-
-    def _contract_spy(w, x, irrep_dims):
-        out = original_contract(w, x, irrep_dims)
-        contract_out.append(out.detach())
-        return out
-
-    def _mm_spy(mu, sigma, mu_p, sigma_p, omega, **kw):
-        contract_out.clear()
-        # The kernel's reduced-precision island re-enters this same module global with fp32 inputs
-        # (kernels.py:571-573). Recording the OUTER bf16 frame too would double every entry and
-        # recompute the replica from reduced-precision moments against fp32 contractions, tripping
-        # the staleness warning on a correct probe (audit 2026-07-26 B-05). Let only the inner
-        # fp32 invocation record.
-        if torch.is_autocast_enabled(mu.device.type):
-            return original_mm(mu, sigma, mu_p, sigma_p, omega, **kw)
-        mu_star, sigma_star = original_mm(mu, sigma, mu_p, sigma_p, omega, **kw)
-        if len(contract_out) < 2:                      # a route that skipped the pair contraction
-            return mu_star, sigma_star
-        pair_prec, pair_mean = contract_out[0], contract_out[1]
-        eps = kw.get("eps", 1e-6)
-        kl_max = kw.get("kl_max", 100.0)
-        mode = kw.get("lambda_alpha_mode", "constant")
-        family = kernels_module.get_family(kw.get("family", "gaussian_diagonal"))
-        self_divergence = self_divergence_for_alpha(
-            family(mu, sigma), family(mu_p, sigma_p), alpha=1.0, kl_max=kl_max, eps=eps,
-            divergence_family=kw.get("divergence_family", "renyi"), lambda_alpha_mode=mode)
-        coefficient = alpha_gradient_coefficient(
-            self_divergence, value=kw.get("value", 1.0),
-            b0=kw.get("b0", 1.0), c0=kw.get("c0", 1.0), mode=mode)
-        if alpha_is_per_coord(mode):
-            raw_self = kernels_module._raw_diag_kl_per_coord(mu, sigma, mu_p, sigma_p, eps=eps)
-            self_mask = (raw_self < kl_max).to(mu.dtype)
-        else:
-            coefficient = coefficient.unsqueeze(-1)
-            raw_self = kernels_module._raw_diag_kl(mu, sigma, mu_p, sigma_p, eps=eps)
-            self_mask = (raw_self < kl_max).to(mu.dtype).unsqueeze(-1)
-        a = self_mask * coefficient                                    # (..., N, 1) or (..., N, K)
-        sp = sigma_p.clamp(min=eps)
-        prior_prec = a / sp
-        precision = prior_prec + pair_prec
-        replica = torch.where(precision <= eps, mu,
-                              (a * mu_p / sp + pair_mean) / precision.clamp(min=eps))
-        entry: Dict[str, object] = {
-            "layer":      int(frame["layer"]),
-            "prior_mass": float(prior_prec.sum()),
-            "pair_mass":  float(pair_prec.sum()),
-            "err":        float((replica - mu_star).abs().max()),
-        }
-        # Retain the two (B, N, K) tensors ONLY for the window actually read (audit 2026-07-26
-        # B-06). Keeping every call's pair held 2 x n_layers x n_e_steps live device tensors while
-        # two were ever used, which OOMs at production batch size with optimizer state resident --
-        # and the OOM is swallowed by the caller's `except Exception`.
-        if entry["layer"] == 0:
-            if window["first_mu_p"] is None:
-                window["first_mu_p"] = mu_p.detach()
-            window["last_mu_star"] = mu_star.detach()
-        recorded.append(entry)
-        return mu_star, sigma_star
-
-    points: List[Dict[str, object]] = []
-    directions: Dict[int, torch.Tensor] = {}
-    window: Dict[str, Optional[torch.Tensor]] = {"first_mu_p": None, "last_mu_star": None}
-    block_window: Dict[str, Optional[torch.Tensor]] = {"mu_p": None, "mu_star": None}
-    split_available = False
-    max_err = 0.0
-    realized_belief_calls: Dict[int, int] = {}
-    cpu_rng = torch.get_rng_state().clone()
-    cuda_rng = ([state.clone() for state in torch.cuda.get_rng_state_all()]
-                if torch.cuda.device_count() > 0 else None)
-    try:
-        model.eval()
-        for module in holders:
-            module.mm_exact_update = _mm_spy
-        kernels_module._pair_contract = _contract_spy
-        stack_module.vfe_block = _block_spy
-        for depth in ordered:
-            model.cfg.n_e_steps = depth
-            recorded.clear()
-            frame["layer"] = 0
-            window["first_mu_p"] = window["last_mu_star"] = None
-            block_window["mu_p"] = block_window["mu_star"] = None
-            model(tokens)
-            belief0 = [call for call in recorded if call["layer"] == 0]
-            realized_belief_calls[depth] = len(belief0)
-            # The mm_exact fusion window is primary; the block capture covers every other route.
-            # Both now end at the E-step output, so rel_displacement means the same thing on either
-            # (audit 2026-07-26 B-11). The window is published per point rather than assumed.
-            if belief0 and window["first_mu_p"] is not None:
-                anchor, converged = window["first_mu_p"], window["last_mu_star"]
-                measured_window = "mm_exact_fusion"
-            else:
-                anchor, converged = block_window["mu_p"], block_window["mu_star"]
-                measured_window = "block_capture"
-            if anchor is None or converged is None or float(anchor.norm()) == 0.0:
-                points.append({"belief_depth": depth, "n_belief_calls": len(belief0),
-                               "rel_displacement": None, "displacement_window": None,
-                               "pair_precision_share": None, "prior_precision_share": None})
-                continue
-            displacement = converged - anchor
-            directions[depth] = displacement.flatten()
-            point: Dict[str, object] = {
-                "belief_depth":          depth,
-                "n_belief_calls":        len(belief0),
-                "rel_displacement":      float(displacement.norm() / anchor.norm()),
-                "displacement_window":   measured_window,
-                "pair_precision_share":  None,
-                "prior_precision_share": None,
-            }
-            # Shares exist only where the mm_exact fusion does; nothing is fabricated otherwise.
-            if belief0 and window["first_mu_p"] is not None:
-                split_available = True
-                first = belief0[0]
-                max_err = max(max_err, max(float(call["err"]) for call in recorded))
-                prior_mass, pair_mass = float(first["prior_mass"]), float(first["pair_mass"])
-                total = prior_mass + pair_mass
-                if total > 0.0:
-                    point["pair_precision_share"] = pair_mass / total
-                    point["prior_precision_share"] = prior_mass / total
-            points.append(point)
-    finally:
-        for module in holders:
-            module.mm_exact_update = original_mm
-        kernels_module._pair_contract = original_contract
-        stack_module.vfe_block = original_block
-        model.cfg.n_e_steps = trained_depth
-        model.train(was_training)
-        torch.set_rng_state(cpu_rng)                     # audit 2026-07-26 B-09: match the sibling
-        if cuda_rng is not None:                         # probes' RNG contract
-            torch.cuda.set_rng_state_all(cuda_rng)
-
-    step1 = directions.get(min(ordered)) if directions else None
-    for point in points:
-        vector = directions.get(int(point["belief_depth"]))
-        if step1 is None or vector is None:
-            point["cos_dir_vs_step1"] = None
-            point["step1_share_of_displacement"] = None
-            continue
-        point["cos_dir_vs_step1"] = float(
-            torch.nn.functional.cosine_similarity(vector, step1, dim=0))
-        norm = float(vector.norm())
-        point["step1_share_of_displacement"] = (float(step1.norm()) / norm) if norm > 0.0 else None
-
+    snapshot = model.build_diagnostic_snapshot(tokens)
+    mu_p, mu_q = snapshot.trace_states[0].mu, snapshot.trace_states[-1].mu
+    denominator = float(mu_p.norm())
     return {
-        "trained_depth":              trained_depth,
-        "e_step_update":              str(model.cfg.e_step_update),
-        "measured_layer":             0,
-        "n_sequences":                int(tokens.shape[0]),
-        "precision_split_available":  split_available,
-        "recompute_max_abs_err":      max_err,
-        "interpretation": (
-            "current-weight E-step character on one fixed batch, measured on LAYER 0 only (audit "
-            "2026-07-26 B-01 tags every call with its layer so later layers are excluded). "
-            "n_belief_calls is the realized fixed-depth iteration count. rel_displacement is "
-            "||mu*_d - mu_p|| / ||mu_p|| where mu*_d is the E-step output BEFORE the block's "
-            "head_mixer / cg_coupling / norm, on either window -- displacement_window names which "
-            "one produced the point (audit 2026-07-26 B-11; before that fix the non-mm_exact window "
-            "ended at the block's RETURN value, so a post-transform number was published alongside "
-            "pre-transform mm_exact numbers and the routes were not comparable). cos_dir_vs_step1 "
-            "near +1 means depth adds magnitude, not "
-            "direction. pair_precision_share is the transported-neighbor (attention) mass of the "
-            "mm_exact fused precision and prior_precision_share its residual complement; both are "
-            "None off the mm_exact route. recompute_max_abs_err is the probe's replica error against "
-            "the kernel's own mu_star and must stay at 0."
-        ),
-        "points": points,
+        "available": True, "inference_semantics": model.conditional_semantics,
+        "trained_depth": len(snapshot.trace_states) - 1, "depth_sweep_available": False,
+        "depth_sweep_reason": ("only the configured receiver episode is supported"
+                               if model.cfg.relational_readout_mode == "full_link_update"
+                               else "only the configured single readout is supported"),
+        "points": [{"belief_depth": len(snapshot.trace_states) - 1, "rel_displacement": (
+            float((mu_q - mu_p).norm()) / denominator if denominator > 0 else None),
+            "cos_dir_vs_step1": None,
+            "displacement_window": "captured_pre_transform_readout"}],
     }
 
 
@@ -4439,17 +4058,14 @@ def collect_beta_channel_decomposition(
     """
     import torch.nn.functional as F
     from vfe3 import free_energy as free_energy_module
-    from vfe3.gradients import kernels as kernels_module
     from vfe3.gradients import full_link as full_link_module
     from vfe3.inference import e_step as e_step_module
 
     was_training = bool(model.training)
     # Patch EVERY module that binds `attention_weights`, definition site included (audit
-    # 2026-07-26 B-02). Patching only `kernels` left `inference/e_step.py`'s own import live: under
-    # the phi substep called the unablated function, so all three arms ran the true beta while the
-    # record still reported `available: True`.
+    # 2026-07-26 B-02); the predictive readout imports it from the definition site at call time.
     original = free_energy_module.attention_weights
-    binders = [module for module in (free_energy_module, kernels_module, e_step_module, full_link_module)
+    binders = [module for module in (free_energy_module, e_step_module, full_link_module)
                if getattr(module, "attention_weights", None) is original]
     mode = {"arm": "full"}
 
@@ -4496,7 +4112,6 @@ def collect_beta_channel_decomposition(
     baseline = arms.get("full")
     return {
         "available":     available,
-        "e_step_update": str(model.cfg.e_step_update),
         "n_sequences":   int(tokens.shape[0]),
         "ce":            arms if available else {},
         "delta_ce": ({
@@ -4507,8 +4122,7 @@ def collect_beta_channel_decomposition(
             "delta_ce.content_channel is the cost of ablating the belief-coupling energy from beta "
             "(what CONTENT is worth); delta_ce.positional_channel is the cost of flattening the "
             "attention log-prior on its causal support (what POSITION is worth). available=False "
-            "means no live beta softmax was intercepted -- the active e_step_update does not use "
-            "the kernel route, and the arms carry no meaning."
+            "means no live beta softmax was intercepted, and the arms carry no meaning."
         ),
     }
 
@@ -4535,7 +4149,6 @@ def collect_context_sensitivity(
 
     This standard mechanism record costs ``n_replicates`` extra forward passes per stage.
     """
-    conditional = is_conditional_filtering(model)
     from vfe3.viz.extract import e_step_belief_trace
 
     if type(n_replicates) is not int or n_replicates < 1:
@@ -4556,13 +4169,12 @@ def collect_context_sensitivity(
     stages: Dict[str, Optional[float]] = {}
     try:
         model.eval()
-        readout_name = ("predictive_content" if conditional and
-                        model.cfg.relational_readout_mode == "predictive_content" else "belief_estep")
+        readout_name = ("predictive_content"
+                        if model.cfg.relational_readout_mode == "predictive_content" else "belief_estep")
         variants = [("raw_prior", 0), (readout_name, trained_depth)]
         for name, belief_depth in variants:
-            if not conditional:
-                model.cfg.n_e_steps = belief_depth
-            reference = _final_mean(tokens, initial=conditional and belief_depth == 0)
+            # Depth 0 reads the captured initial state of the configured forward (no depth sweep).
+            reference = _final_mean(tokens, initial=belief_depth == 0)
             shifts = []
             for _ in range(n_replicates):
                 perturbed = tokens.clone()
@@ -4570,13 +4182,12 @@ def collect_context_sensitivity(
                     perturbed[:, :-1] = torch.randint(
                         0, vocab, perturbed[:, :-1].shape, generator=generator, dtype=perturbed.dtype
                     ).to(perturbed.device)
-                moved = _final_mean(perturbed, initial=conditional and belief_depth == 0)
+                moved = _final_mean(perturbed, initial=belief_depth == 0)
                 denominator = float(reference.norm())
                 shifts.append(float((moved - reference).norm()) / denominator
                               if denominator > 0.0 else 0.0)
             stages[name] = sum(shifts) / len(shifts)
     finally:
-        model.cfg.n_e_steps = trained_depth
         model.train(was_training)
         torch.set_rng_state(cpu_rng)
         if cuda_rng is not None:
@@ -4634,14 +4245,13 @@ def collect_phi_numerics(
                 model.group,
                 block_dims=block_dims,
             )
-        if model.cfg.transport_mode == "flat":
-            record["flatness"] = metrics.flatness_reference_statistics(
-                phi,
-                model.group,
-                right_phi=belief.right_phi,
-                max_triangles=8,
-                block_dims=block_dims,
-            )
+        record["flatness"] = metrics.flatness_reference_statistics(
+            phi,
+            model.group,
+            right_phi=belief.right_phi,
+            max_triangles=8,
+            block_dims=block_dims,
+        )
         return record
     finally:
         model.train(was_training)
@@ -4940,7 +4550,7 @@ def _pure_path_report(
 
     invariant_families = declared_invariant_families(cfg.gauge_group)
     family_group_invariant = cfg.family in invariant_families
-    transport_registration = get_transport_registration(cfg.transport_mode)
+    transport_registration = get_transport_registration("flat")       # the only projected transport
     priorbank_head_evidence_mixer = bool(
         getattr(cfg, "use_priorbank_head_evidence_mixer", False)
     )
@@ -5019,19 +4629,15 @@ def _pure_path_report(
 
     # Predictive attention assigns its configured readout covariance; projected_gradient
     # executes Fisher receiver updates unless its covariance update is disabled.
-    from vfe3.inference.e_step import canonical_e_step_update
     attention_mode = cfg.attention_mode
     receiver_gradient = attention_mode == "projected_gradient"
-    e_step_updater = canonical_e_step_update(getattr(cfg, "e_step_update", "gradient"))
     predictive_covariance_updated = (
         attention_mode == "projected_predictive"
         and getattr(cfg, "predictive_covariance", "passthrough") == "moment_matched")
     covariance_updated = (receiver_gradient and not cfg.skip_belief_sigma_update) or predictive_covariance_updated
-    gradient_e_step_update: 'bool | str' = (
-        e_step_updater == "gradient" if receiver_gradient else "not_applicable"
-    )
-    spd_retraction_applies = (receiver_gradient and not cfg.skip_belief_sigma_update
-                              and e_step_updater == "gradient")
+    # The receiver always descends its own energy by Fisher steps or the closed-form update.
+    gradient_e_step_update: 'bool | str' = True if receiver_gradient else "not_applicable"
+    spd_retraction_applies = receiver_gradient and not cfg.skip_belief_sigma_update
 
     sigma_max = getattr(cfg, "sigma_max", 10.0)
     sigma_cap_consumer_active = receiver_gradient and not cfg.skip_belief_sigma_update
@@ -5058,7 +4664,7 @@ def _pure_path_report(
     beta_prior = get_prior_registration(getattr(cfg, "beta_attention_prior", "causal"))
     causal_flags = {
         "beta_prior_causal": beta_prior.is_causal_for_next_token_scoring(cfg),
-        "inference_updates_causal": cfg.gradient_mode == "filtering",
+        "inference_updates_causal": True,              # projected inference is filtering-only
     }
     on_causal_lm_path = all(causal_flags.values())
 
@@ -5070,8 +4676,8 @@ def _pure_path_report(
 
     conditional_fields = _conditional_artifact_fields(cfg)
     pure_flags = {
-        "canonical_attention_entropy": bool(cfg.include_attention_entropy) and not conditional_fields,
-        "flat_transport":              cfg.transport_mode == "flat",
+        "canonical_attention_entropy": not conditional_fields,
+        "flat_transport":              True,
         "constant_lambda_alpha":       cfg.lambda_alpha_mode == "constant",
         "prior_bank_decode":           cfg.decode_mode != "linear",
         "no_head_mixer":               not cfg.use_head_mixer,
@@ -5080,20 +4686,14 @@ def _pure_path_report(
         # keeps it at encode unless moment_matched assigns the predictive covariance.
         "full_sigma_update":           covariance_updated,
         "no_block_mlp":                not block_mlp_active,
-        # The E-STEP UPDATE RULE axis (audit 2026-07-26 D-03). 'mm_exact' is the closed-form
-        # minimizer of the STRICT-PAIR-MASKED surrogate, which excludes the structural E_ii = 0
-        # self-pairs and is therefore not a majorizer of the canonical frozen-attention objective
-        # (see the e_step_update note and D-01). Without this key a run whose E-step descends that
-        # surrogate published on_pure_path: True with no record of the substitution anywhere: the
-        # only trace, state_dependent_alpha_majorizer, is False at the pure lambda_alpha_mode=
-        # 'constant', so the ledger asserted purity it had not checked. 'not_applicable' on
-        # projected_predictive, where no E-step descent runs; like any non-False facet it does not
-        # lower on_pure_path (that route is already off it through canonical_attention_entropy).
+        # The E-step update-rule axis (audit 2026-07-26 D-03): True on the receiver route, whose
+        # only updater is gradient descent of its own energy; 'not_applicable' on
+        # projected_predictive, where no E-step descent runs.
         "gradient_e_step_update":      gradient_e_step_update,
     }
     # Second, INDEPENDENT purity axis (audit 2026-07-01 F8): the gauge / model-channel path. Keyed
-    # on pos_rotation itself rather than the RoPE sub-toggles (rope_full_gauge / rope_on_value),
-    # which are inert while RoPE is off -- those are reported in config_toggles for transparency.
+    # on pos_rotation itself rather than the RoPE sub-toggle rope_on_value,
+    # which is inert while RoPE is off -- those are reported in config_toggles for transparency.
     gauge_flags = {
         "learned_gauge_transport":   cfg.gauge_transport == "on",
         "transport_gauge_equivariant": transport_registration.gauge_equivariant,
@@ -5101,14 +4701,6 @@ def _pure_path_report(
         # structure as pos_phi, so both projected routes stay covariant (audit 2026-10-01 F11).
         "positional_rotation_gauge_covariant": (
             cfg.pos_rotation == "none" or getattr(cfg, "rope_insertion", "right") == "right"),
-        # A box clamp in the Cholesky-whitened chart is not GL-covariant for a full-covariance
-        # receiver; a ball, no trust region, a diagonal family, or a closed-form receiver is.
-        "mean_trust_gauge_covariant": (
-            getattr(cfg, "attention_mode", None) != "projected_gradient"
-            or getattr(cfg, "relational_receiver_update", "euler") == "closed_form"
-            or getattr(cfg, "e_mu_q_trust", None) is None
-            or getattr(cfg, "mu_trust_mode", "ball") == "ball"
-            or bool(getattr(cfg, "diagonal_covariance", False))),
         "family_group_invariant":    family_group_invariant,
         "head_mixer_intertwiner_compatible": head_mixer_gauge_compatible,
         "block_mlp_intertwiner_compatible": block_mlp_intertwiner_compatible,
@@ -5123,7 +4715,6 @@ def _pure_path_report(
             transport_chart_max_norm is not None
             and float(transport_chart_max_norm) <= float(TRANSPORT_CLAMP_MAX_NORM)
         ),
-        "no_e_step_phi_retraction_clipping": float(getattr(cfg, "e_phi_lr", 0.0)) == 0.0,
         "no_additive_encoder_control": getattr(cfg, "encode_mode", "per_token") != "per_token_additive",
         "decoder_gauge_compatible": getattr(cfg, "decode_coordinates", "local") == "reference",
     }
@@ -5146,8 +4737,6 @@ def _pure_path_report(
         "theory_flags":       theory_flags,
         "on_theory_pure_path": all(theory_flags.values()),
         "config_toggles": {
-            "include_attention_entropy":    bool(cfg.include_attention_entropy),
-            "transport_mode":               cfg.transport_mode,
             "lambda_alpha_mode":            cfg.lambda_alpha_mode,
             "lambda_beta":                  float(cfg.lambda_beta),
             "decode_mode":                  cfg.decode_mode,
@@ -5175,14 +4764,8 @@ def _pure_path_report(
             "head_mixer_gauge_compatible":   head_mixer_gauge_compatible,
             "gauge_transport":              cfg.gauge_transport,
             "pos_rotation":                 cfg.pos_rotation,
-            "rope_full_gauge":              bool(cfg.rope_full_gauge),
             "rope_on_value":                bool(cfg.rope_on_value),
-            # WHICH RoPE transport regime the pair energy actually used (audit 2026-07-26 A-02),
-            # recorded in the same spirit as the transport exactness block. Means-only rotates the
-            # MEAN by R_i Omega_ij R_j^T while the covariance keeps the bare Omega_ij, so the
-            # transported pair is the pushforward of the key under no single operator and
-            # E_ij = D(q_i || Omega_ij# q_j) does not hold literally -- deliberate (R Sigma R^T is
-            # dense, hence rope_full_gauge=True requiring gaussian_full) but previously unrecorded.
+            # Which RoPE regime the routing score used (audit 2026-07-26 A-02).
             "rope_pair_energy_exactness":   (
                 "not_applicable" if cfg.pos_rotation == "none"
                 else "frame_folded_both_moments"   # projected routes push both moments through U_i R_i^T
@@ -5193,10 +4776,6 @@ def _pure_path_report(
             "gauge_group":                   cfg.gauge_group,
             "family":                        cfg.family,
             "group_invariant_families":      list(invariant_families),
-            # The update rule and its damping, so a reader can tell WHICH objective the E-step
-            # descended and how far it stepped toward the surrogate's minimizer (audit D-03).
-            "e_step_update":                 getattr(cfg, "e_step_update", "gradient"),
-            "mm_damping":                    float(getattr(cfg, "mm_damping", 1.0)),
             # Truthful fixed-surrogate ledger (C6): these derived booleans expose when the run
             # intentionally freezes a state-dependent quantity rather than following its full
             # joint objective. Defaults are False, preserving the pure path. The covariance is
@@ -5204,10 +4783,6 @@ def _pure_path_report(
             # as under skip_belief_sigma_update.
             "fixed_covariance_surrogate":   not covariance_updated,
             "attention_mode":               attention_mode,
-            "state_dependent_alpha_majorizer": (
-                getattr(cfg, "e_step_update", "gradient") == "mm_exact"
-                and cfg.lambda_alpha_mode in ("state_dependent", "state_dependent_per_coord")
-            ),
             # regime_ii_covariant under gaussian_diagonal is a CONTROLLED APPROXIMATION (the
             # diagonal cone is not closed under GL congruence Omega Sigma Omega^T -- audit C5),
             # so a diagonal covariant run is never reported as exact Route B.
@@ -5226,7 +4801,6 @@ def _pure_path_report(
             "m_phi_fisher_rotation_weight":  float(getattr(cfg, "m_phi_fisher_rotation_weight", 2.0)),
             "phi_mstep_max_matrix_norm":     getattr(cfg, "phi_mstep_max_matrix_norm", None),
             "transport_chart_max_norm":      transport_chart_max_norm,
-            "e_phi_lr":                     float(getattr(cfg, "e_phi_lr", 0.0)),
             # Covariance class of the ACTIVE transport (audit C7), owned by its complete registry
             # record. An unregistered mode fails closed instead of inventing report metadata.
             "transport_covariance_class":   transport_registration.covariance_class,
@@ -5383,13 +4957,10 @@ def _save_figures(
         if hy:
             # Heavy-tailed (median ~1e-3, rare spikes ~1e3): log y + a median reference; NOT smoothed,
             # so the roundoff spikes survive.
-            flat_transport = getattr(getattr(artifacts, "cfg", None), "transport_mode", "flat") == "flat"
             fig = figs.plot_trajectory(
                 hy, hx,
-                ylabel=("numerical closure residual" if flat_transport
-                         else r"$\langle\|H_{ijk}-I\|_F\rangle$"),
-                title=("Numerical closure of nominally flat transport" if flat_transport
-                       else "Holonomy curvature (frame-dependent Frobenius)"),
+                ylabel="numerical closure residual",
+                title="Numerical closure of nominally flat transport",
                 color=figs._CB[2],
                 logy=True, median_line=True, annotate="max",
                 path=str(run / "holonomy.png"))
@@ -5471,16 +5042,11 @@ def _save_figures(
                     **{k: [r[k] for r in fe_rows] for k in fe_keys}}
             # Scale the coupling terms by the static config lambda_beta scalar.
             lam = getattr(cfg, "lambda_beta", 1.0)
-            iae = getattr(cfg, "include_attention_entropy", True)
             fig = figs.plot_free_energy_decomposition(
-                hist, lambda_beta=lam, include_attention_entropy=iae,
-                divergence_family=getattr(cfg, "divergence_family", "renyi"),
-                path=str(run / "free_energy_decomposition.png"))
+                hist, lambda_beta=lam, path=str(run / "free_energy_decomposition.png"))
             figs.plt.close(fig)
             fig = figs.plot_free_energy_relationship(
-                hist, lambda_beta=lam, include_attention_entropy=iae,
-                divergence_family=getattr(cfg, "divergence_family", "renyi"),
-                path=str(run / "free_energy_relationship.png"))
+                hist, lambda_beta=lam, path=str(run / "free_energy_relationship.png"))
             figs.plt.close(fig)
         # Geometry / SPD / Fisher health dashboard (history-only): the gauge, belief-spectrum, guard,
         # and numerical-safety scalars diagnostics() logs to metrics.csv but that no standard figure
@@ -5500,7 +5066,6 @@ def _save_figures(
         if hist_geom:
             fig = figs.plot_geometry_health(
                 hist_geom,
-                transport_mode=getattr(getattr(artifacts, "cfg", None), "transport_mode", "flat"),
                 family=getattr(getattr(artifacts, "cfg", None), "family", None),
                 path=str(run / "geometry_health.png"),
             )
@@ -5511,7 +5076,7 @@ def _save_figures(
             "estep_f_drop", "estep_f_nondecreasing_frac",
             "estep_r_mu_last", "estep_r_sigma_last", "estep_r_phi_last",
             "estep_fp_kl", "estep_fp_mu_rms", "estep_fp_sigma_rms", "estep_fp_phi_rms",
-            "estep_target_gap", "estep_beta_js", "estep_alpha_rms_delta"))
+            "estep_beta_js", "estep_alpha_rms_delta"))
         if hist_estep and "estep_quality" not in route_skips:
             fig = figs.plot_estep_quality(hist_estep, path=str(run / "estep_quality.png"))
             figs.plt.close(fig)

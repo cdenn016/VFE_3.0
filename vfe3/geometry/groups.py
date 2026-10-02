@@ -21,15 +21,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
-from vfe3.geometry.closure import close_under_brackets
-from vfe3.geometry.generators import (
-    generate_glk,
-    generate_glk_cross_head,
-    generate_glk_multihead,
-    generate_glk_multihead_tied,
-    generate_son,
-    generate_sp,
-)
+from vfe3.geometry.generators import generate_glk_multihead, generate_son
 from vfe3.geometry.irreps import direct_sum_generators
 
 
@@ -94,7 +86,7 @@ class GaugeGroup:
     pullback_capability:  Optional[str]          = None      # certified strict M-step route, if any
     invariant_families:   Tuple[str, ...]        = ()        # registry-declared exact families; empty fails closed
     irrep_labels:         Optional[List[str]]    = None      # per-block label ('l1', 'sym2', ...); None = label-less
-    algebra:              Optional[str]          = None      # irrep-registry algebra key ('so' | 'sp'); None = label-less
+    algebra:              Optional[str]          = None      # irrep-registry algebra key ('so'); None = label-less
     phi_coordinate_layout: Optional[str]         = None      # explicit packed-coordinate capability; None = unknown
     frobenius_gram_diagonal: bool                = False     # certified <G_a,G_b>_F=0 for a != b
     frobenius_gram_uniform: Optional[float]      = None      # known common diagonal weight; None = nonuniform/unknown
@@ -349,30 +341,6 @@ def get_group(name: str) -> Callable[..., GaugeGroup]:
 
 
 @register_group(
-    "glk",
-    pullback_capability="pullback",
-    invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
-)
-def _build_glk(
-    K:       int,
-
-    *,
-    dtype:   torch.dtype                  = torch.float32,
-    device:  'torch.device | str | None'  = None,
-) -> GaugeGroup:
-    """Full GL(K): single block, full gl(K) generators."""
-    G = generate_glk(K, dtype=dtype, device=device)
-    return GaugeGroup(
-        name="glk",
-        generators=G,
-        irrep_dims=[K],
-        skew_symmetric=False,
-        frobenius_gram_diagonal=True,
-        frobenius_gram_uniform=1.0,
-    )
-
-
-@register_group(
     "block_glk",
     pullback_capability="pullback_per_block",
     invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
@@ -382,104 +350,26 @@ def _build_block_glk(
     n_heads:         int,
 
     *,
-    close_basis:     bool                            = False,
     dtype:           torch.dtype                     = torch.float32,
     device:          'torch.device | str | None'     = None,
-    cross_couplings: Optional[List[Tuple[int, int]]] = None,
 ) -> GaugeGroup:
-    """Block-diagonal GL(K) = GL(d_head)^n_heads, optional cross-head coupling.
+    """Block-diagonal GL(K) = GL(d_head)^n_heads with the row-major elementary basis.
 
-    With ``cross_couplings`` the basis includes off-block generators; with
-    ``close_basis=True`` it is closed under the Lie bracket into a subalgebra
-    of gl(K) (so the exponentiated group is well-defined). A cross-coupled
-    group is NOT block-diagonal with ``d_head`` blocks (its group elements have
-    off-block entries), so ``irrep_dims`` is reported as the single block
-    ``[K]``; the contiguous super-block decomposition (which needs head
-    reordering) is a Phase 2b transport concern.
+    The basis stays lazy (``_ElementaryBlockBasis``); the dense generators are built only when a
+    consumer reads ``group.generators``.
     """
+    if K % n_heads != 0:
+        raise ValueError(f"K={K} must be divisible by n_heads={n_heads}")
     d_head = K // n_heads
-    if cross_couplings:
-        G = generate_glk_cross_head(K, n_heads, cross_couplings, dtype=dtype, device=device)
-        # Every matrix unit is already present when all directed head pairs
-        # are included. [E_ab,E_cd] = delta_bc E_ad - delta_da E_cb stays in
-        # this complete gl(K) basis; preserve its order without a closure search.
-        complete = len(set(cross_couplings)) == n_heads * (n_heads - 1)
-        if close_basis and not complete:
-            G, _ = close_under_brackets(G)
-        irrep_dims = [K]
-    else:
-        if K % n_heads != 0:
-            raise ValueError(f"K={K} must be divisible by n_heads={n_heads}")
-        placement = torch.empty(0, device=device, dtype=dtype)
-        G = _ElementaryBlockBasis(K, n_heads, placement.dtype, placement.device)
-        irrep_dims = [d_head] * n_heads
+    placement = torch.empty(0, device=device, dtype=dtype)
     return GaugeGroup(
         name="block_glk",
-        generators=G,
-        irrep_dims=irrep_dims,
-        skew_symmetric=False,
-        phi_coordinate_layout=("block_head_row_major"
-                               if n_heads > 1 and not cross_couplings else None),
-        frobenius_gram_diagonal=not close_basis,
-        frobenius_gram_uniform=(None if close_basis else 1.0),
-    )
-
-
-@register_group(
-    "tied_block_glk",
-    invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
-)
-def _build_tied_block_glk(
-    K:               int,
-    n_heads:         int,
-
-    *,
-    dtype:           torch.dtype                     = torch.float32,
-    device:          'torch.device | str | None'     = None,
-) -> GaugeGroup:
-    r"""TIED block-diagonal GL(d_head): one shared GL(d_head) frame across all heads.
-
-    Generators ``kron(I_{n_heads}, gl(d_head))`` (n_gen = d_head^2), so one per-token phi drives the
-    SAME GL(d_head) element in every head -- a tied gauge. The group element stays K x K block-
-    diagonal (``irrep_dims = [d_head] * n_heads``), so transport / per-head attention are unchanged;
-    only the gauge is shared rather than per-head independent (``block_glk``). Under this tied gauge
-    the Schur-commutant head mixer is exactly equivariant. NOTE: the per-block Killing preconditioner
-    (``phi_precond_mode='killing_per_block'``) assumes generators that PARTITION per block (one gl
-    per head); the tied generators each act on every block, so that mode does not apply here (config
-    validation warns) -- use ``'none'``, ``'clip'``, or the ambient ``'killing'``.
-    """
-    d_head = K // n_heads
-    G = generate_glk_multihead_tied(K, n_heads, dtype=dtype, device=device)
-    return GaugeGroup(
-        name="tied_block_glk",
-        generators=G,
+        generators=_ElementaryBlockBasis(K, n_heads, placement.dtype, placement.device),
         irrep_dims=[d_head] * n_heads,
         skew_symmetric=False,
+        phi_coordinate_layout="block_head_row_major" if n_heads > 1 else None,
         frobenius_gram_diagonal=True,
-        frobenius_gram_uniform=float(n_heads),
-    )
-
-
-@register_group(
-    "so_k",
-    invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
-)
-def _build_so_k(
-    K:       int,
-
-    *,
-    dtype:   torch.dtype                  = torch.float32,
-    device:  'torch.device | str | None'  = None,
-) -> GaugeGroup:
-    """SO(K): skew-symmetric so(K) generators (single block)."""
-    G = generate_son(K, dtype=dtype, device=device)
-    return GaugeGroup(
-        name="so_k",
-        generators=G,
-        irrep_dims=[K],
-        skew_symmetric=True,
-        frobenius_gram_diagonal=True,
-        frobenius_gram_uniform=2.0,
+        frobenius_gram_uniform=1.0,
     )
 
 
@@ -524,13 +414,8 @@ def check_admissible(
     ``False``, correctly) -- those families are admissible only for the diagonal-scaling subgroup. A
     family with no full-covariance readout raises ``NotImplementedError`` (the extension point).
 
-    Before the hook this branched on three hardcoded family names, of which one (``"gaussian"``) was
-    not even registered, so NEITHER family registered in 2026-07 could be exercised by any invariance
-    test -- which is how ``gaussian_frame_diagonal`` shipped silently discarding its transport (A-01).
     Note the SCOPE this measures: the family's stored-parameter divergence under a global gauge, not
-    the gauge equivariance of its coupling energy. ``gaussian_diagonal_exact``'s coupling energy is the
-    exact congruence divergence, but its self-divergence readout is the diagonal one, so it reports
-    ``False`` here -- correctly for what is being measured, and not a verdict on its coupling seam.
+    the gauge equivariance of its coupling energy.
 
     USAGE (audit 2026-06-13 L6): this is a VERIFICATION TOOL, exercised by the admissibility tests
     (test_admissibility_verifier.py), not a runtime guard wired into model/config construction --
@@ -624,78 +509,4 @@ def _build_so_n(
         skew_symmetric=True,
         irrep_labels=labels,
         algebra="so",
-    )
-
-
-@register_group(
-    "sp_n",
-    invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
-)
-def _build_sp_n(
-    K:          int,
-
-    *,
-    group_n:    Optional[int]                   = None,
-    irrep_spec: Optional[List[Tuple[str, int]]] = None,
-    dtype:      torch.dtype                     = torch.float32,
-    device:     'torch.device | str | None'     = None,
-) -> GaugeGroup:
-    r"""Sp(2m,R) acting on R^K through a DIRECT SUM of Sym^p irreps (tied gauge).
-
-    The structure group is Sp(group_n, R), group_n = 2m even, decoupled from K. Label
-    'sym<p>' is Sym^p of the defining 2m-dim rep, dim C(2m+p-1, p) -- irreducible because
-    contraction with the antisymmetric symplectic form annihilates symmetric tensors.
-    'sym1' is the defining rep itself; 'sym0' is trivial (zero generators). One per-token
-    phi (n_gen = m(2m+1)) drives every block (tied gauge; generators do not partition per
-    block). sp images are NOT skew (skew_symmetric=False: transport pays both matrix
-    exponentials, as for 'sp'/'glk'). Admissible for the Gaussian family via the GL(K)
-    congruence, as every group here.
-    """
-    if group_n is None or irrep_spec is None:
-        raise ValueError(
-            "gauge_group='sp_n' requires group_n (= 2m, even) and irrep_spec "
-            "([(label, mult), ...], labels 'sym<p>'); set both in the config"
-        )
-    G_def = generate_sp(group_n, dtype=torch.float64)
-    G, dims = direct_sum_generators(G_def, algebra="sp", irrep_spec=irrep_spec)
-    if sum(dims) != K:
-        raise ValueError(
-            f"irrep_spec blocks {dims} sum to {sum(dims)} != K={K} (group_n={group_n})"
-        )
-    labels = [lab for lab, mult in irrep_spec for _ in range(int(mult))]
-    return GaugeGroup(
-        name="sp_n",
-        generators=G.to(dtype).to(device),
-        irrep_dims=dims,
-        skew_symmetric=False,
-        irrep_labels=labels,
-        algebra="sp",
-    )
-
-
-@register_group(
-    "sp",
-    invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
-)
-def _build_sp(
-    K:       int,
-
-    *,
-    dtype:   torch.dtype                  = torch.float32,
-    device:  'torch.device | str | None'  = None,
-) -> GaugeGroup:
-    """Sp(2m,R): the real symplectic group (single block, NON-skew sp(2m,R) generators).
-
-    K = 2m. sp(2m,R) = {A : J A + A^T J = 0} with J = [[0, I_m], [-I_m, 0]]; dim m(2m+1).
-    The generators are not skew (skew_symmetric=False), so transport exponentiates them via
-    the general matrix_exp path (as for glk). Admissible for the Gaussian family because the
-    GL(K) congruence action makes the divergence invariant under any g in GL(K) <= Sp(2m,R).
-    """
-    G = generate_sp(K, dtype=dtype, device=device)
-    return GaugeGroup(
-        name="sp",
-        generators=G,
-        irrep_dims=[K],
-        skew_symmetric=False,
-        frobenius_gram_diagonal=True,
     )

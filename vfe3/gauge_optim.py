@@ -559,23 +559,14 @@ GroupLogDirectionFn = Callable[..., GroupLogDirection]
 def group_log_block_shape(group: GaugeGroup) -> Tuple[int, int]:
     r"""``(H, d)`` such that a chart row reshapes exactly to ``H`` blocks ``X_h`` of size ``d x d``.
 
-    Certified for untied block_glk (the built-in row-major elementary basis, any head count) and for
-    glk with the row-major elementary basis ``G_{iK+j} = E_{ij}`` (``H = 1``, ``d = K``). Every other
-    basis raises: the group_log route reads the chart through this reshape.
+    Certified for block_glk with the built-in row-major elementary basis (any head count). Every
+    other basis raises: the group_log route reads the chart through this reshape.
     """
     shape = group.elementary_block_shape
     if shape is not None:
         return shape
-    if group.name == "glk" and len(group.irrep_dims) == 1:
-        K = group.irrep_dims[0]
-        generators = group.generators
-        n_gen = K * K
-        if (tuple(generators.shape) == (n_gen, K, K) and not generators.requires_grad
-                and torch.equal(generators.reshape(n_gen, n_gen),
-                                torch.eye(n_gen, dtype=generators.dtype, device=generators.device))):
-            return 1, K
     raise ValueError(
-        "m_phi_group_retraction='group_log' requires glk or untied block_glk with the built-in "
+        "m_phi_group_retraction='group_log' requires block_glk with the built-in "
         f"row-major elementary basis; got gauge group {group.name!r}"
     )
 

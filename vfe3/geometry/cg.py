@@ -32,7 +32,7 @@ from typing import Dict, List, Tuple
 
 import torch
 
-from vfe3.geometry.generators import generate_son, generate_sp
+from vfe3.geometry.generators import generate_son
 from vfe3.geometry.irreps import irrep_dim, irrep_generators
 
 _CG_CACHE: Dict[Tuple[str, int, str, str, str, float], torch.Tensor] = {}
@@ -47,16 +47,14 @@ def clear_cg_cache() -> None:
 def _defining(N: int, algebra: str) -> torch.Tensor:
     if algebra == "so":
         return generate_son(N, dtype=torch.float64)
-    if algebra == "sp":
-        return generate_sp(N, dtype=torch.float64)
-    raise ValueError(f"unknown algebra {algebra!r}; registered: 'so', 'sp'")
+    raise ValueError(f"unknown algebra {algebra!r}; registered: 'so'")
 
 
 def cg_intertwiners(
-    N:       int,                          # defining-rep dimension (N of SO(N); 2m of Sp(2m))
+    N:       int,                          # defining-rep dimension (N of SO(N))
 
     *,
-    algebra: str,                          # 'so' | 'sp'
+    algebra: str,                          # 'so'
     label_a: str,                          # first source irrep label
     label_b: str,                          # second source irrep label
     label_c: str,                          # target irrep label
@@ -139,7 +137,7 @@ def cg_selection(
     N:       int,                          # defining-rep dimension
 
     *,
-    algebra: str,                          # 'so' | 'sp'
+    algebra: str,                          # 'so'
     labels:  List[str],                    # the spec's irrep labels (duplicates allowed)
     atol:    float = 1e-8,                  # null-space cut; MUST match the buffer build's atol
 ) -> List[Tuple[str, str, str, int]]:      # admissible (a, b, c, n_mult), a <= b, n_mult > 0

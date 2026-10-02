@@ -266,7 +266,7 @@ def test_operator_validation() -> None:
 def _cfg(**overrides: object) -> VFE3Config:
     values = dict(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=2, n_e_steps=1,
                   family="gaussian_diagonal", gauge_group="block_glk",
-                  skip_belief_sigma_update=False, e_phi_lr=0.0, oracle_unroll_grad=True,
+                  skip_belief_sigma_update=False,
                   warmup_steps=0, max_steps=2, log_interval=0, eval_interval=0,
                   attention_mode="projected_predictive", decode_mode="linear")
     values.update(overrides)
@@ -323,8 +323,6 @@ def test_frozen_covariance_label_and_artifact_fields() -> None:
 @pytest.mark.parametrize("family,decode_mode", [
     ("gaussian_diagonal", "linear"),
     ("gaussian_diagonal", "diagonal_chunked"),
-    ("gaussian_diagonal_exact", "linear"),
-    ("gaussian_frame_diagonal", "linear"),
     ("gaussian_full", "linear"),
     ("gaussian_full", "full_chunked"),
 ])

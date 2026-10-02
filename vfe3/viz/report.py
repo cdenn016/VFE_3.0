@@ -31,7 +31,6 @@ from typing import Callable, Dict, List, Mapping, Optional, Sequence
 import torch
 
 from vfe3 import metrics
-from vfe3.contracts import is_conditional_filtering
 from vfe3.config import VFE3Config
 from vfe3.path_utils import prepare_owned_output_child
 from vfe3.run_artifacts import (
@@ -438,11 +437,10 @@ def _prepare_missing_saved_probes(
     depth_path = run_dir / "estep_depth_sensitivity.json"
     phi_path = run_dir / "phi_numerics.json"
     pending = []
-    if is_conditional_filtering(model):
-        for name in ("estep_character", "beta_channel_decomposition", "context_sensitivity"):
-            path = run_dir / f"{name}.json"
-            if not path.is_file() or json.loads(path.read_text(encoding="utf-8")).get("available") is False:
-                pending.append(name)
+    for name in ("estep_character", "beta_channel_decomposition", "context_sensitivity"):
+        path = run_dir / f"{name}.json"
+        if not path.is_file() or json.loads(path.read_text(encoding="utf-8")).get("available") is False:
+            pending.append(name)
     if depth_path.is_file() and phi_path.is_file() and not pending:
         return
     if not report_batches:
@@ -802,11 +800,9 @@ def generate_figures(
         "e_step_belief_trace") if estep_family_live else None
     layer_trace = _safe(lambda: extract.across_layer_belief_trace(
         model, tok, snapshot=snapshot), "across_layer_belief_trace") if estep_family_live else None
-    cstate = (
-        _safe(lambda: extract.converged_state(model, tok, snapshot=snapshot), "converged_state")
-        if not is_conditional_filtering(model)
-        else _safe(lambda: extract.readout_state(model, tok, snapshot=snapshot), "readout_state")
-    )
+    cstate = _safe(lambda: extract.readout_state(model, tok, snapshot=snapshot), "readout_state")
+    equivariance = _safe(lambda: extract.projected_gauge_equivariance(model, tok),
+                         "projected_gauge_equivariance")
     decode_stats = (
         None
         if skip_full_vocab or inference_bank is None
@@ -862,19 +858,16 @@ def generate_figures(
     # S2 panel A: head x frame-block norms of the relational interface maps, from the weights alone.
     # Replaces the retired gauge_head_specialization, which paired frame block h with head h.
     block_norms = None
-    if not is_conditional_filtering(model):
-        skip_reasons.setdefault("head_block_norms", "no relational interface maps on this route")
+    try:
+        from vfe3.posthoc.maps import head_block_norms as _head_block_norms
+    except ImportError as exc:
+        skip_reasons.setdefault(
+            "head_block_norms", f"vfe3.posthoc.maps.head_block_norms unavailable ({exc})")
     else:
-        try:
-            from vfe3.posthoc.maps import head_block_norms as _head_block_norms
-        except ImportError as exc:
-            skip_reasons.setdefault(
-                "head_block_norms", f"vfe3.posthoc.maps.head_block_norms unavailable ({exc})")
-        else:
-            map_state = {key: value.detach().to("cpu", torch.float32)
-                         for key, value in model.state_dict().items()
-                         if key.startswith("relational_operators")}
-            block_norms = _safe(lambda: _head_block_norms(map_state, cfg), "head_block_norms")
+        map_state = {key: value.detach().to("cpu", torch.float32)
+                     for key, value in model.state_dict().items()
+                     if key.startswith("relational_operators")}
+        block_norms = _safe(lambda: _head_block_norms(map_state, cfg), "head_block_norms")
     report_population = (f"{split} split, one {int(tok.shape[-1])}-token sequence")
 
     # gpt2/cl100k decoder for the vocabulary figures' token labels and the confusion figure's category
@@ -914,8 +907,7 @@ def generate_figures(
         "attention_structure":        amaps is not None,
         "per_layer_diagnostics":      per_layer is not None,
         "head_block_norms":           block_norms is not None or "head_block_norms" in skip_reasons,
-        "gauge_equivariance":         cstate is not None and "omega" in cstate
-                                      and not is_conditional_filtering(model),
+        "gauge_equivariance":         equivariance is not None,
         "belief_spectrum":            cstate is not None,
         "spd_ellipses":               cstate is not None,
         "holonomy_curvature":         cstate is not None and "omega" in cstate,
@@ -947,7 +939,7 @@ def generate_figures(
 
     _emit("iterate_trajectory",
           lambda p: figs.plot_iterate_trajectory(trace, diagonal=cfg.diagonal_covariance,
-                                                divergence_family=cfg.divergence_family, path=p),
+                                                path=p),
           "iterate_trajectory.png" in planned_figures)
     _emit("belief_trajectories",
           lambda p: figs.plot_belief_trajectories(trace, layer_trace, path=p),
@@ -970,11 +962,7 @@ def generate_figures(
           lambda p: figs.plot_head_block_norms(block_norms, path=p),
           "head_block_norms.png" in planned_figures)
     _emit("gauge_equivariance",
-          lambda p: figs.plot_gauge_equivariance(metrics.gauge_equivariance_residual(
-              cstate["mu"], cstate["sigma"], cstate["omega"], model.group,
-              kappa=cfg.kappa_beta, renyi_order=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
-              diagonal=cfg.diagonal_covariance, divergence_family=cfg.divergence_family,
-              full_cov_kl_precision=model.full_cov_kl_precision), path=p),
+          lambda p: figs.plot_gauge_equivariance(equivariance, path=p),
           "gauge_equivariance.png" in planned_figures)
     # sigma_max caps only the sigma E-step retraction. Where inactive_fields marks it inert (projected
     # routes, whose moment-matched predictive covariance is an unclamped readout, and

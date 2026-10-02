@@ -1,11 +1,9 @@
-r"""Tiny CPU regressions for predictive spread and exact-congruence input floors."""
+r"""Tiny CPU regressions for predictive spread."""
 
 import pytest
 import torch
 
 from vfe3.contracts import CanonicalFrameContext
-from vfe3.families.exact_congruence import ExactCongruenceDiagonalGaussian
-from vfe3.geometry.transport import CompactFactoredTransport
 from vfe3.gradients.relational import relational_score
 from vfe3.model.relational_operators import RelationalOperators
 
@@ -113,36 +111,3 @@ def test_centered_predictive_covariance_retains_correlations_and_gradients(resid
         torch.testing.assert_close(actual_gradient.double(), expected_gradient, atol=3e-5, rtol=2e-5)
 
 
-@pytest.mark.parametrize("compact", [False, True])
-@pytest.mark.parametrize("scale", [2., 3.])
-@pytest.mark.parametrize("variance_ratio", [.25, 2.])
-def test_exact_congruence_floors_declared_distributions_only(
-    scale:          float,
-    variance_ratio: float,
-    compact:        bool,
-) -> None:
-    eps = 1e-6
-    mu = torch.zeros(1, 2, 2, dtype=torch.float64)
-    sigma = torch.full_like(mu, variance_ratio * eps, requires_grad=True)
-    forward = torch.stack((scale * torch.eye(2, dtype=mu.dtype), torch.eye(2, dtype=mu.dtype)))[None]
-    inverse = torch.linalg.inv(forward)
-    dense = forward[:, :, None] @ inverse[:, None, :]
-    omega = (CompactFactoredTransport(forward.unsqueeze(-3), inverse.unsqueeze(-3), K=2,
-                                     same_frame_flat_cocycle=True) if compact else dense)
-    actual = ExactCongruenceDiagonalGaussian.coupling_energy(mu, sigma, mu, sigma, omega,
-                                                            eps=eps, kl_max=1000.)
-    floored = sigma.clamp(min=eps)
-    rows = []
-    for i in range(2):
-        pairs = []
-        for j in range(2):
-            q = torch.distributions.MultivariateNormal(mu[0, i], covariance_matrix=torch.diag(floored[0, i]))
-            cov = dense[0, i, j] @ torch.diag(floored[0, j]) @ dense[0, i, j].T
-            p = torch.distributions.MultivariateNormal(dense[0, i, j] @ mu[0, j], covariance_matrix=cov)
-            pairs.append(torch.distributions.kl_divergence(q, p))
-        rows.append(torch.stack(pairs))
-    expected = torch.stack(rows).unsqueeze(0)
-    torch.testing.assert_close(actual, expected, atol=1e-12, rtol=1e-12)
-    actual_gradient, = torch.autograd.grad(actual[0, 0, 1], sigma, retain_graph=True)
-    expected_gradient, = torch.autograd.grad(expected[0, 0, 1], sigma)
-    torch.testing.assert_close(actual_gradient, expected_gradient, atol=1e-8, rtol=1e-12)

@@ -47,7 +47,7 @@ def _one_thread() -> None:
 def _cfg(**over: Any) -> VFE3Config:
     values: Dict[str, Any] = dict(
         vocab_size=V, embed_dim=4, n_heads=2, max_seq_len=8, eval_stride=4, n_layers=2, batch_size=2,
-        attention_mode="projected_predictive", e_phi_lr=0.0, block_mlp_expansion=2,
+        attention_mode="projected_predictive", block_mlp_expansion=2,
         attention_residual=True, norm_type_block="layernorm", layernorm_affine=True,   # pinned: independent
         skip_belief_sigma_update=False)                                                # of the WIP defaults
     values.update(over)
@@ -221,15 +221,16 @@ def test_fused_training_ce_equals_dense_ce(name: str) -> None:
                                    rtol=1e-4, atol=2e-6, err_msg=n)
 
 
-def test_dense_training_branch_reads_the_frame() -> None:
-    r"""A decoder without a fused CE (``full``, legacy dense) takes the dense training branch."""
+
+def test_fused_training_loss_matches_dense_logits_under_reference_coordinates() -> None:
+    r"""The fused full_chunked CE equals F.cross_entropy on the dense reference-coordinate logits."""
     from vfe3.config import serialize_config
 
     payload = serialize_config(_cfg(**GAUSSIAN_FULL))
-    payload.update(decode_mode="full", decode_coordinates="reference")
+    payload.update(decode_mode="full_chunked", decode_coordinates="reference")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        cfg = test_config(**payload, _allow_legacy_dense_decode=True)
+        cfg = test_config(**payload)
     model = _build(cfg)
     tokens, targets = _tokens(), _targets()
     with torch.no_grad():

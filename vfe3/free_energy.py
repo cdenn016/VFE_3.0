@@ -100,133 +100,6 @@ def _sqrt_dims(dims: Tuple[int, ...], device: torch.device, dtype: torch.dtype) 
     return t
 
 
-def _stackable_for_batching(
-    q_b: BeliefParams,                     # broadcast query (..., N, 1, K)
-    key: BeliefParams,                     # transported key  (..., N, N, K)
-) -> bool:
-    r"""Whether the equal-block batched path is bit-identical to the per-block loop.
-
-    Stacking the H equal blocks along a NEW LEADING axis is the same arithmetic only when that
-    axis does not perturb the mu/sigma broadcast. For a Gaussian family the canonical layout is
-    sigma rank == mu rank (diagonal) or mu rank + 1 (full); the misclassified case (sigma carries
-    a leading batch dim mu lacks) would make the stacked head axis right-align against sigma's
-    first batch dim and broadcast spuriously. A family that does not expose mu/sigma tensors falls
-    back to the loop. The guard is on q_b AND key, since pairwise_energy slices both.
-    """
-    expected_extra = {"diagonal": 0, "full": 1}.get(getattr(type(q_b), "cov_kind", None))
-    if expected_extra is None:
-        return False
-    for params in (q_b, key):
-        mu = getattr(params, "mu", None)
-        sigma = getattr(params, "sigma", None)
-        if mu is None or sigma is None:
-            return False
-        if sigma.dim() != mu.dim() + expected_extra:
-            return False
-    return True
-
-
-def head_stacked_energy(
-    q_b:               BeliefParams,        # (..., N, 1, K) BROADCAST query (post broadcast_over_keys)
-    key_stack:         BeliefParams,        # (H, ..., N, N, d) key ALREADY stacked on a leading head axis
-
-    *,
-    alpha:             float = 1.0,
-    kl_max:            float = 100.0,
-    eps:               float = 1e-6,
-    divergence_family: str   = "renyi",
-
-    irrep_dims:        List[int],
-) -> torch.Tensor:                          # (..., H, N, N)
-    r"""Per-head energy from a key whose head axis is ALREADY stacked leading.
-
-    The single definition of the equal-block batched contraction and of its output convention: the
-    head axis is created leading (so the H equal blocks ride one functional call) and then moved to
-    -3 to match the per-block loop's ``torch.stack(..., dim=-3)`` layout EXACTLY.
-
-    Factored out of :func:`pairwise_energy` (audit 2026-08-06 B2) so a caller that can produce the
-    stacked key WITHOUT first materializing a dense ``(..., N, N, K, K)`` covariance -- see
-    :func:`~vfe3.geometry.transport.transport_covariance_head_blocks` -- reuses this convention
-    rather than restating it. The query side is sliced here either way: it is ``(..., N, 1, K)``,
-    broadcast over keys, so slicing it is negligible next to the pair grid.
-
-    The caller owns the guard: stacking is bit-identical to the loop only when the new leading axis
-    does not perturb the mu/sigma broadcast (see :func:`_stackable_for_batching`), and this function
-    assumes that has already been established.
-    """
-    functional = get_functional(divergence_family)
-    d = irrep_dims[0]
-    q_parts = [q_b.block(h * d, (h + 1) * d) for h in range(len(irrep_dims))]
-    q_stk = type(q_b).stack(q_parts, dim=0)                            # (H, ..., N, 1, d)
-    e = functional(q_stk, key_stack, alpha=alpha, kl_max=kl_max, eps=eps)   # (H, ..., N, N)
-    return torch.movedim(e, 0, -3)         # (..., H, N, N), matching the loop's stack(dim=-3)
-
-
-def pairwise_energy(
-    q:                 BeliefParams,        # (..., N, K) query belief
-    key:               BeliefParams,        # (..., N, N, K) transported key belief Omega_ij q_j
-
-    *,
-    alpha:             float = 1.0,
-    kl_max:            float = 100.0,
-    eps:               float = 1e-6,
-    divergence_family: str   = "renyi",
-
-    irrep_dims:        Optional[List[int]] = None,
-) -> torch.Tensor:                         # (..., N, N) or (..., H, N, N) E_ij = D(q_i || Omega_ij q_j)
-    r"""Per-pair belief-coupling energy via the divergence seam (KL = Renyi at alpha=1).
-
-    Divergence-agnostic on two orthogonal axes: ``divergence_family`` selects the FUNCTIONAL
-    (renyi, ...) and the BeliefParams subclass of ``q``/``key`` the covariance kernel
-    (gaussian_diagonal/gaussian_full), so a new f-divergence or covariance structure slots in
-    by registration / constructing the right params, without editing here.
-
-    PER-HEAD (GL(K) attention): when ``irrep_dims`` has more than one block the energy is
-    computed PER IRREP BLOCK h -- E_ij^(h) = D(q_i^(h) || Omega_ij^(h) q_j^(h)) over block h's
-    coordinates (the Gaussian MARGINAL d_head x d_head sub-block for the full family) -- and a
-    leading head axis is returned: (..., H, N, N). With ``irrep_dims`` None or a single block
-    the full-K energy (..., N, N) is returned, bit-identical to the legacy single-beta path.
-
-    The query's key axis is inserted by ``broadcast_over_keys`` (the params own their covariance
-    layout), staying correct when sigma_q carries a leading batch dim mu_q lacks.
-    """
-    functional = get_functional(divergence_family)
-    q_b = q.broadcast_over_keys()          # (..., N, 1, K) broadcast query over keys
-
-    if irrep_dims is None or len(irrep_dims) == 1:
-        return functional(q_b, key, alpha=alpha, kl_max=kl_max, eps=eps)
-
-    # EQUAL-size, more-than-one blocks (the default block_glk case): the H per-block divergences
-    # are the SAME functional over H disjoint coordinate slices, so stack the H equal blocks along
-    # a NEW LEADING axis and call the functional ONCE. The leading head axis is then moved to -3 to
-    # match the loop's torch.stack(..., dim=-3) layout (..., H, N, N) EXACTLY. The stacked call is
-    # bit-identical only when stacking does not perturb the mu/sigma broadcast: the misclassified
-    # case where sigma carries a leading batch dim mu lacks would right-align the new head axis
-    # against sigma's first batch dim (a spurious broadcast), so it is excluded by the rank guard
-    # below and falls back to the per-block loop (which broadcasts correctly).
-    H = len(irrep_dims)
-    d = irrep_dims[0]
-    if len(set(irrep_dims)) == 1 and _stackable_for_batching(q_b, key):
-        key_parts = [key.block(h * d, (h + 1) * d) for h in range(H)]      # H x (..., N, N, d)
-        return head_stacked_energy(
-            q_b, type(key).stack(key_parts, dim=0),                        # (H, ..., N, N, d)
-            alpha=alpha, kl_max=kl_max, eps=eps,
-            divergence_family=divergence_family, irrep_dims=irrep_dims,
-        )
-
-    energies = []
-    start = 0
-    for db in irrep_dims:                  # one divergence per irrep block (head)
-        end = start + db
-        e_h = functional(
-            q_b.block(start, end), key.block(start, end),
-            alpha=alpha, kl_max=kl_max, eps=eps,
-        )
-        energies.append(e_h)
-        start = end
-    return torch.stack(energies, dim=-3)   # (..., H, N, N)
-
-
 def self_divergence(
     q:                 BeliefParams,        # (..., N, K) belief
     p:                 BeliefParams,        # (..., N, K) prior
@@ -403,11 +276,8 @@ def free_energy(
     weights and no entropy term (see the guarded block below).
 
     The observation/data term -E_q[log p(o|k)] enters via the optional ``log_likelihood`` arg
-    (subtracted below) but is a GATED STUB: no production caller supplies it, and this is the
-    ORACLE-path mirror only. The default belief descent runs through the analytic kernel
-    (``gradients/kernels.py`` -> ``get_kernel``), which never calls this function, so a live
-    observation pull must ALSO be injected into ``gradients/kernels.py`` and ``gradients/oracle.py``;
-    wiring it here alone is inert. The term is non-vacuous only once the per-token prior is replaced
+    (subtracted below) but is a GATED STUB: no production caller supplies it. The projected
+    belief routes never call this function, so wiring it here alone is inert. The term is non-vacuous only once the per-token prior is replaced
     by a top-down cross-scale shadow prior (PIFB:1233): in the current next-token model the input
     token already sets p_i (encode q=p) and the next token already drives the cross-entropy
     (``metrics.py`` books that CE as the data term), so an observation carries no information distinct

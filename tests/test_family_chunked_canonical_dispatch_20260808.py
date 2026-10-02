@@ -69,8 +69,6 @@ def _bank(*, decode_mode="family_chunked", renyi_order=1.0, divergence_family="r
             full_cov_kl_precision="fp32_escalate",
             decode_mode=decode_mode,
             decode_chunk_size=5,
-            renyi_order=renyi_order,
-            divergence_family=divergence_family,
             untie_decode_bank=untie_decode_bank,
             decode_unigram_prior=decode_unigram_prior,
             unigram_kappa=0.7 if decode_unigram_prior else 1.0,

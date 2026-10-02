@@ -33,7 +33,7 @@ def _model(device: torch.device, **overrides: object) -> VFEModel:
     options = dict(vocab_size=7, embed_dim=4, n_heads=2, batch_size=1,
                    max_seq_len=4, n_layers=2, n_e_steps=1, decode_mode="linear",
                    use_head_mixer=True, use_block_mlp=True, block_mlp_expansion=2,
-                   norm_type_block="none", norm_type_final="none", e_phi_lr=0.0,
+                   norm_type_block="none", norm_type_final="none",
                    amp_dtype=None)
     torch.manual_seed(27)
     model = VFEModel(test_config(**{**options, **overrides})).to(device)
@@ -133,54 +133,3 @@ def test_mixer_mean_gradients_hvp_and_finite_difference(full: bool, device: torc
         minus = mixer(mu - delta * directions[0], sigma, _need_covariance=False)[0].square().sum()
     torch.testing.assert_close((results[1][1] * directions[0]).sum(), (plus - minus) / (2 * delta),
                                rtol=1e-8, atol=1e-8)
-
-
-@pytest.mark.parametrize("per_coordinate", [False, True])
-@pytest.mark.parametrize("kind", ["finite", "tiny", "inf_mu", "inf_sigma", "nan_mu", "nan_sigma", "inf_coefficient"])
-def test_same_tensor_mask_preserves_arithmetic_and_dependencies(per_coordinate: bool, kind: str,
-                                                                 device: torch.device) -> None:
-    from vfe3.gradients.kernels import _diag_kl_filtering_kernel
-    torch.manual_seed(34)
-    mu = torch.randn(1, 3, 4, dtype=torch.float64, device=device)
-    sigma = 1 + torch.rand_like(mu)
-    coefficient = torch.ones(1, 3, 4 if per_coordinate else 1, dtype=mu.dtype, device=device)
-    if kind == "tiny": sigma[0, 0, 0] = 1e-30
-    if kind == "inf_mu": mu[0, 0, 0] = float("inf")
-    if kind == "nan_mu": mu[0, 0, 0] = float("nan")
-    if kind == "inf_sigma": sigma[0, 0, 0] = float("inf")
-    if kind == "nan_sigma": sigma[0, 0, 0] = float("nan")
-    if kind == "inf_coefficient": coefficient[0, 0, 0] = float("inf")
-    leaves = tuple(t.requires_grad_() for t in (mu, sigma, coefficient))
-    mu_t = torch.randn(1, 3, 3, 4, dtype=mu.dtype, device=device)
-    sigma_t = 1 + torch.rand_like(mu_t)
-    beta = torch.softmax(torch.randn(1, 3, 3, dtype=mu.dtype, device=device), dim=-1)
-    results = []
-    for identical in (False, True):
-        # Clones have the SAME tangent but distinct Tensor identity and force the original mask.
-        mu_p, sigma_p = (mu, sigma) if identical else (mu.clone(), sigma.clone())
-        gradients = _diag_kl_filtering_kernel(mu, sigma, mu_p, sigma_p, mu_t, sigma_t, beta, coefficient)
-        derivatives = torch.autograd.grad(sum(g.sum() for g in gradients), leaves, create_graph=True)
-        results.append((*gradients, *derivatives))
-    for a, b in zip(*results):
-        torch.testing.assert_close(a, b, rtol=0, atol=0, equal_nan=True)
-    assert results[1][-1] is not None  # Preserve the separate coefficient's zero gradient.
-
-
-def test_equal_values_with_distinct_leaves_keep_self_mask(device: torch.device,
-                                                         monkeypatch: pytest.MonkeyPatch) -> None:
-    kernels = importlib.import_module("vfe3.gradients.kernels")
-    mu = torch.zeros(1, 3, 4, device=device, requires_grad=True)
-    sigma = torch.ones_like(mu, requires_grad=True)
-    mu_p, sigma_p = mu.detach().clone().requires_grad_(), sigma.detach().clone().requires_grad_()
-    calls = []
-    original = kernels._raw_diag_kl_per_coord
-    def counted(*args: object, **kwargs: object) -> torch.Tensor:
-        calls.append(True)
-        return original(*args, **kwargs)
-    monkeypatch.setattr(kernels, "_raw_diag_kl_per_coord", counted)
-    common = (torch.zeros(1, 3, 3, 4, device=device), torch.ones(1, 3, 3, 4, device=device),
-              torch.ones(1, 3, 3, device=device) / 3, torch.ones_like(mu))
-    kernels._diag_kl_filtering_kernel(mu, sigma, mu_p, sigma_p, *common)
-    assert len(calls) == 1
-    kernels._diag_kl_filtering_kernel(mu, sigma, mu, sigma, *common)
-    assert len(calls) == 1

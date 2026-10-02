@@ -8,7 +8,6 @@ SLOW_TESTS: frozenset[str] = frozenset()
 
 CUDA_TESTS: frozenset[str] = frozenset({
     'test_laplace_family.py::test_laplace_cuda_matches_cpu',
-    'test_p3_pairwise_stats_reuse_20260711.py::test_p3_cuda_filtering_and_mm_reuse_smoke',
 })
 
 CUDA_MIRROR_TESTS: frozenset[str] = frozenset({

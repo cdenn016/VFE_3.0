@@ -55,7 +55,7 @@ def _no_git(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _cfg(**overrides: object) -> VFE3Config:
     values = dict(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                  n_e_steps=1, e_q_mu_lr=0.1, e_phi_lr=0.0, m_phi_lr=0.0,
+                  n_e_steps=1, e_q_mu_lr=0.1, m_phi_lr=0.0,
                   warmup_steps=1, max_steps=4)
     values.update(overrides)
     return test_config(**values)
@@ -64,7 +64,7 @@ def _cfg(**overrides: object) -> VFE3Config:
 def _projected_cfg(**overrides: object) -> VFE3Config:
     values = dict(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1, n_e_steps=1,
                   family="gaussian_diagonal", gauge_group="block_glk",
-                  skip_belief_sigma_update=False, e_phi_lr=0.0, oracle_unroll_grad=True,
+                  skip_belief_sigma_update=False,
                   warmup_steps=0, max_steps=2, log_interval=0, eval_interval=0,
                   attention_mode="projected_predictive")
     values.update(overrides)

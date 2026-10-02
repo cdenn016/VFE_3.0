@@ -28,7 +28,7 @@ def _tiny_model(seed: int = 0, **overrides) -> VFEModel:
     """A tiny fixed-seed VFEModel. vocab_size is kept comfortably larger than any
     top_k used below so torch.topk never sees k > vocab_size."""
     base = dict(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0, seed=seed)
+                n_e_steps=1, e_q_mu_lr=0.05, seed=seed)
     base.update(overrides)
     cfg = test_config(**base)
     torch.manual_seed(seed)
@@ -45,12 +45,8 @@ def _reference_tiny_model(seed: int = 0, **overrides) -> VFEModel:
         batch_size=2,
         n_layers=1,
         n_e_steps=1,
-        e_step_update="gradient",
-        oracle_unroll_grad=True,
         e_q_mu_lr=0.05,
-        e_phi_lr=0.0,
         family="gaussian_full",
-        transport_mode="flat",
         decode_mode="full_chunked",
         encode_mode="per_token",
         decode_coordinates="reference",

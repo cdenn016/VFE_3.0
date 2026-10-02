@@ -30,11 +30,8 @@ from tests.test_remediation_20260923_C import _HostReads
 from vfe3.config import VFE3Config
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.data.datasets import TokenWindows
-from vfe3.geometry.lie_ops import CompactBlockElement
 from vfe3.geometry.rope import build_rope_rotation
 from vfe3.geometry.transport import (
-    CompactFactoredTransport,
-    FactoredTransport,
     RopeTransport,
     _checked_group_inverse_certified,
     _frame_pair_kappa,
@@ -43,11 +40,7 @@ from vfe3.geometry.transport import (
     frame_pair_fp64_escalations,
     reset_frame_pair_fp64_escalations,
     stable_matrix_exp_pair,
-    transport_covariance,
-    transport_mean,
 )
-from vfe3.gradients.oracle import _transport_to_float
-from vfe3.inference.e_step import _transport_qk
 from vfe3 import metrics
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import RunArtifacts
@@ -58,7 +51,6 @@ from vfe3.train import (
     train,
     train_step,
 )
-from vfe3.viz.extract import converged_state
 
 
 # Every test here exercises the opt-in escalation, so configs enable it and direct producer calls
@@ -317,8 +309,8 @@ _LAUNCHER_TINY = dict(
 
 def _launcher(**overrides: object) -> VFE3Config:
     values = config_values(
-        attention_mode="projected_predictive", pos_phi="learned", e_phi_lr=0.0,
-        skip_belief_sigma_update=True, oracle_unroll_grad=True,
+        attention_mode="projected_predictive", pos_phi="learned",
+        skip_belief_sigma_update=True,
 
         use_block_mlp=True, norm_type_block="layernorm", norm_type_final="layernorm",
         layernorm_affine=True, decode_mode="diagonal_chunked",
@@ -448,75 +440,6 @@ def test_ill_conditioned_frames_escalate_from_data(route: str) -> None:
 
 # -- consumers on synthetic float64 containers --------------------------------------------------
 
-def _containers(rope_dtype: torch.dtype = torch.float32) -> Dict[str, object]:
-    g = torch.Generator().manual_seed(11)
-    N, H, d = 3, 2, 2
-    K = H * d
-    U = torch.linalg.matrix_exp(0.5 * torch.randn(N, H, d, d, generator=g, dtype=torch.float64))
-    V = torch.linalg.inv(U)
-    U_dense = CompactBlockElement(U, K).to_dense()
-    V_dense = CompactBlockElement(V, K).to_dense()
-    U_tall = torch.linalg.matrix_exp(0.3 * torch.randn(N, K, K, generator=g, dtype=torch.float64))
-    compact = CompactFactoredTransport(U, V, K, same_frame_flat_cocycle=True)
-    rope = build_rope_rotation(torch.arange(N), [d] * H, dtype=rope_dtype)  # model: generator dtype
-    return {
-        "compact": compact,
-        "factored": FactoredTransport(U_dense, V_dense, [d] * H, same_frame_flat_cocycle=True),
-        "factored_per_head": FactoredTransport(U_dense, V_dense, [d] * H, mean_per_head=True,
-                                               same_frame_flat_cocycle=True),
-        "factored_tall": FactoredTransport(U_tall, torch.linalg.inv(U_tall), [K],
-                                           same_frame_flat_cocycle=True),   # d = 4 > N = 3
-        "dense": FactoredTransport(U_dense, V_dense, [d] * H).to_dense_omega(),
-        "rope_right": RopeTransport(compact, rope, on_cov=True, insertion="right",
-                                    same_frame_flat_cocycle=True),
-        "rope_left": RopeTransport(compact, rope, on_cov=True, insertion="left",
-                                   same_frame_flat_cocycle=True),
-        "rope_left_factored": RopeTransport(
-            FactoredTransport(U_dense, V_dense, [d] * H, same_frame_flat_cocycle=True), rope,
-            on_cov=True, insertion="left", same_frame_flat_cocycle=True),
-    }
-
-
-@pytest.mark.parametrize("name", sorted(_containers()))
-def test_float64_frames_on_float32_beliefs_return_float32(name: str) -> None:
-    omega = _containers()[name]                              # float64 factors, float32 rotation
-    reference = _containers(torch.float64)[name]             # every tensor float64
-    g = torch.Generator().manual_seed(2)
-    mu = torch.randn(3, 4, generator=g)
-    sigma = torch.rand(3, 4, generator=g) + 0.5
-    A = torch.randn(3, 4, 4, generator=g)
-    sigma_full = A @ A.transpose(-1, -2) + torch.eye(4)
-    cases = (
-        (lambda om, x: transport_mean(om, x), mu),
-        (lambda om, x: transport_covariance(om, x, diagonal_out=True), sigma),
-        (lambda om, x: transport_covariance(om, x, diagonal_out=False), sigma_full),
-    )
-    for fn, x in cases:
-        got = fn(omega, x)
-        want = fn(reference, x.double())
-        assert got.dtype == torch.float32
-        torch.testing.assert_close(got.double(), want, rtol=1e-5, atol=1e-5)
-
-
-def test_oracle_island_keeps_escalated_float64_frames() -> None:
-    for omega in _containers().values():
-        kept = _transport_to_float(omega)
-        assert transport._factor_dtype(kept) == torch.float64
-    low = CompactFactoredTransport(torch.eye(2).expand(3, 2, 2, 2).bfloat16(),
-                                   torch.eye(2).expand(3, 2, 2, 2).bfloat16(), 4)
-    assert _transport_to_float(low).exp_blocks.dtype == torch.float32
-
-
-def test_mixed_query_key_frames_promote(monkeypatch) -> None:
-    group = VFEModel(tiny_config()).group
-    query = 0.1 * torch.randn(3, 8, generator=torch.Generator().manual_seed(4))
-    query[0, :4] = _worst_direction(12.0, 2).reshape(-1)
-    key = 0.1 * torch.randn(3, 8, generator=torch.Generator().manual_seed(5))
-    mixed = _transport_qk(query, key, group, preserve_factors=True)
-    assert mixed.exp_phi.dtype == mixed.exp_neg_phi.dtype == torch.float64
-    assert _transport_qk(query, key, group).dtype == torch.float64
-    assert transport_mean(mixed, torch.randn(3, 4)).dtype == torch.float32
-
 
 # -- RoPE meets escalated frames at float64 orthogonality ----------------------------------------
 
@@ -560,26 +483,6 @@ def test_right_fold_of_escalated_frames_passes_the_float64_frame_contract(compac
     assert forward.dtype == inverse.dtype == torch.float64
     CanonicalFrameContext(forward=forward, inverse=inverse, block_diagonal=compact)
     assert _pair_residual(forward, inverse) <= 1e-9
-
-
-def test_left_rotations_of_escalated_frames_stay_mutually_inverse() -> None:
-    compact, rope = _escalated_base(True)
-    rotated = transport._resolve_compact_for_head_blocks(
-        RopeTransport(compact, rope, on_cov=True, insertion="left"))
-    assert rotated.exp_blocks.dtype == torch.float64
-    assert _pair_residual(rotated.exp_blocks, rotated.inv_blocks) <= 1e-9
-    factored, rope = _escalated_base(False)
-
-    def cocycle_defect(rotation: torch.Tensor) -> float:
-        omega = transport._rope_dense_omega(factored, rotation)       # (N, N, K, K) dense operator
-        composed = torch.einsum("ijkl,jmln->ijmkn", omega, omega)       # Omega_ij Omega_jm
-        return float((composed - omega.unsqueeze(1)).abs().amax())      # against Omega_im
-
-    # |Omega| ~ 9e2 here, so float64 rounding alone leaves ~7e-8; the float32 rotation's defect
-    # adds ~3e-5 when merely cast, and nothing measurable once re-orthogonalized.
-    reference = cocycle_defect(build_rope_rotation(torch.arange(3), [2, 2], dtype=torch.float64))
-    assert cocycle_defect(rope) <= 2.0 * reference
-    assert cocycle_defect(rope.double()) > 100.0 * reference
 
 
 # -- counter wiring ------------------------------------------------------------------------------

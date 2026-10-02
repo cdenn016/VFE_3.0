@@ -42,7 +42,6 @@ def _projection_train_case() -> tuple:
         max_seq_len=4,
         n_layers=1,
         n_e_steps=1,
-        e_phi_lr=0.0,
         pos_phi="none",
         phi_mstep_max_matrix_norm=2.0,
     )
@@ -57,16 +56,8 @@ def _projection_train_case() -> tuple:
 @pytest.mark.parametrize(
     "name, kwargs, expected_uniform",
     [
-        ("glk", {}, 1.0),
+        ("block_glk", {"n_heads": 1}, 1.0),
         ("block_glk", {"n_heads": 2}, 1.0),
-        (
-            "block_glk",
-            {"n_heads": 2, "cross_couplings": [(0, 1)]},
-            1.0,
-        ),
-        ("tied_block_glk", {"n_heads": 2}, 2.0),
-        ("so_k", {}, 2.0),
-        ("sp", {}, None),
     ],
 )
 def test_certified_gram_diagonal_matches_dense_gram(
@@ -89,19 +80,6 @@ def test_certified_gram_diagonal_matches_dense_gram(
     assert group.phi_norm_route() == "diagonal_gram"
 
 
-def test_closed_basis_fails_closed_to_dense_route() -> None:
-    group = get_group("block_glk")(
-        K=4,
-        n_heads=2,
-        cross_couplings=[(0, 1)],
-        close_basis=True,
-    )
-
-    assert group.gram_diagonal() is None
-    assert group.gram_diagonal_uniform() is None
-    assert group.phi_norm_route() == "dense_fallback"
-
-
 def test_custom_group_defaults_to_dense_route() -> None:
     generators = torch.tensor(
         [
@@ -122,7 +100,11 @@ def test_custom_group_defaults_to_dense_route() -> None:
 
 
 def test_gram_diagonal_cache_refreshes_after_in_place_generator_change() -> None:
-    group = get_group("glk")(K=2, dtype=torch.float64)
+    # A dense certified basis (the lazy block_glk basis withdraws its certificate on mutation).
+    from vfe3.geometry.generators import generate_glk_multihead
+    group = GaugeGroup(name="dense_elementary", generators=generate_glk_multihead(2, 1, dtype=torch.float64),
+                       irrep_dims=[2], skew_symmetric=False, frobenius_gram_diagonal=True,
+                       frobenius_gram_uniform=1.0)
     first = group.gram_diagonal()
     assert first is group.gram_diagonal()
 
@@ -149,7 +131,12 @@ def test_diagonal_norm_kernel_matches_dense_embedding(dtype: torch.dtype) -> Non
 
 def test_nonuniform_diagonal_norm_kernel_matches_dense_embedding() -> None:
     assert hasattr(gauge_optim, "embedded_phi_frobenius_norm")
-    group = get_group("sp")(K=4, dtype=torch.float64)
+    # A certified-orthogonal basis with unequal generator norms (diagonal but nonuniform Gram).
+    from vfe3.geometry.generators import generate_glk_multihead
+    scales = torch.tensor([0.5, 1.0, 2.0, 3.0], dtype=torch.float64).view(-1, 1, 1)
+    group = GaugeGroup(name="custom_scaled", generators=generate_glk_multihead(2, 1, dtype=torch.float64) * scales,
+                       irrep_dims=[2], skew_symmetric=False, frobenius_gram_diagonal=True)
+    assert group.gram_diagonal_uniform() is None
     phi = torch.randn(11, group.generators.shape[0], dtype=torch.float64)
 
     torch.testing.assert_close(
@@ -441,7 +428,6 @@ def test_enabled_projection_persists_timing_metrics_in_training_row(tmp_path) ->
         max_seq_len=4,
         n_layers=1,
         n_e_steps=1,
-        e_phi_lr=0.0,
         pos_phi="none",
         phi_mstep_max_matrix_norm=2.0,
         max_steps=1,

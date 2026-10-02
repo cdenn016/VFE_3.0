@@ -20,7 +20,6 @@ import torch
 
 from vfe3.geometry.groups import GaugeGroup
 
-from vfe3.geometry.lie_ops import CompactBlockElement
 from vfe3.numerics import safe_eigvalsh
 from vfe3.geometry.transport import CompactFactoredTransport
 
@@ -1013,26 +1012,14 @@ def group_gauge_invariant(
     frame statistic, not a gauge-invariant observable, despite the historical function name.
 
     The logged ``gauge_trace_spread`` (= std of log|det Omega| = tr embed(phi)) is identically 0
-    for the unimodular groups SO(K) and Sp(2m) (traceless generators, det == 1), so it is blind
-    off block_glk. This dispatches the correct invariant: GL volume log|det exp(phi)| for
-    glk / block_glk / tied_block_glk, total rotation angle (1/2) sum_k |arg(eig)| for so_k and
-    the orthogonal so_n irrep towers, and the eigenvalue-modulus squeeze max_k log|lambda_k| -
-    min_k log|lambda_k| for sp / sp_n (whose Sym^p images are traceless, so logdet is blind there
-    too; the eigenvalue moduli are conjugation-invariant, unlike the singular values).
+    for the unimodular SO(N) towers (traceless generators, det == 1), so it is blind off block_glk.
+    This dispatches the correct invariant: GL volume log|det exp(phi)| for block_glk, and total
+    rotation angle (1/2) sum_k |arg(eig)| for the orthogonal so_n irrep towers.
     """
-    name = getattr(group, "name", "glk")
-    if name in ("so_k", "so_n"):
+    name = getattr(group, "name", "block_glk")
+    if name == "so_n":
         ang = torch.angle(torch.linalg.eigvals(exp_phi))         # (..., K) eigenphases
         return 0.5 * ang.abs().sum(dim=-1)
-    if name in ("sp", "sp_n"):
-        # The target symmetry is a GLOBAL conjugation g exp(phi) g^{-1} (see the section note: no
-        # vertex-frame function survives the local left action); the singular-value squeeze
-        # log(s_max/s_min) is invariant only under ORTHOGONAL conjugation, and
-        # Sp(2m,R) is not orthogonal. Use the eigenvalue-MODULUS squeeze instead -- eigenvalues are
-        # conjugation-invariant and symplectic spectra come in reciprocal pairs, so this is the natural
-        # Ad-invariant squeeze (was frame-dependent under svdvals; audit 2026-06-13 review).
-        logmod = torch.log(torch.linalg.eigvals(exp_phi).abs().clamp(min=eps))   # (..., K) log|eig|
-        return logmod.amax(dim=-1) - logmod.amin(dim=-1)
     return torch.linalg.slogdet(exp_phi).logabsdet              # GL volume log|det|
 
 
@@ -1813,155 +1800,6 @@ def bootstrap_token_ce_band(
 
 # --- gauge-equivariance certificate (the symmetry the construction rests on) ---
 
-def gauge_equivariance_residual(
-    mu:                torch.Tensor,     # (N, K) converged belief means
-    sigma:             torch.Tensor,     # (N, K) diagonal OR (N, K, K) full covariances
-    omega:             'torch.Tensor | CompactFactoredTransport',
-    group,                               # GaugeGroup (generators, irrep_dims)
-
-    *,
-    kappa:             float = 1.0,
-    renyi_order:       float = 1.0,
-    kl_max:            float = 100.0,
-    eps:               float = 1e-6,
-    diagonal:          Optional[bool] = None,
-    n_samples:         int   = 8,
-    scale:             float = 0.5,
-    seed:              int   = 0,
-    divergence_family: str   = "renyi",
-    full_cov_kl_precision: Optional[str] = None,
-) -> Dict[str, torch.Tensor]:
-    r"""Empirical gauge-equivariance certificate of the attention energy and weights.
-
-    The construction's central symmetry is D(rho(g) q_i || rho(g) Omega_ij q_j) = D(q_i||Omega_ij q_j)
-    under a GLOBAL structure-group element g (with the transport co-transforming Omega -> g Omega g^{-1}).
-    Applies n_samples random IN-group g = exp(sum_a c_a G_a) and a matched OUT-of-group control
-    g = exp(scale * randn(K, K)) (generic GL(K), which for a block/skew/symplectic group does NOT
-    respect the structure), recomputes E_ij and beta_ij with the FULL Gaussian family (a general g
-    makes a diagonal Sigma full), and returns the relative residuals. In-group residuals cluster at
-    float32 eps; the out-of-group control sits far above. (For glk the group IS all of GL(K), so the
-    control is also invariant -- correct, there is no 'outside'.)
-
-    SCOPE (audit 2026-06-10 F12): this certifies the joint-congruence invariance of the GIVEN
-    operator tensor -- (mu, Sigma, Omega) co-transformed together -- which holds for ANY omega.
-    It is therefore BLIND to a BUILDER-level equivariance break: the residual is computed on the
-    operator it is handed, never on a construction rebuilt from its own inputs. Read
-    the in-group panel as "congruence consistency of the converged operator", NOT as a
-    certificate that the transport construction is equivariant.
-    """
-    from vfe3.families.base import get_family
-    from vfe3.free_energy import attention_tau, attention_weights, pairwise_energy
-    from vfe3.geometry.transport import _factor_dtype, transport_mean
-
-    if _factor_dtype(omega) == torch.float64 and mu.dtype != torch.float64:
-        # Escalated float64 frames (audit 2026-09-23 #12): certify the whole congruence at float64,
-        # so the random group elements g (built at mu.dtype, from generators cast to it) share the
-        # operator's dtype.
-        mu, sigma = mu.double(), sigma.double()
-
-    compact_factors: Optional[
-        Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]
-    ] = None
-    if isinstance(omega, CompactFactoredTransport):
-        # A generic out-of-group control mixes the compact blocks, but it still acts on the two
-        # vertex factors independently. Expanding each vertex to (N,K,K) keeps the exact
-        # A_i B_j action without ever allocating the pairwise (N,N,K,K) transport.
-        compact_factors = (
-            CompactBlockElement(omega.exp_blocks, omega.K).to_dense(),
-            CompactBlockElement(omega.inv_blocks, omega.K).to_dense(),
-            None,
-            None,
-        )
-
-    full = get_family("gaussian_full")
-    from vfe3.families.gaussian import FullGaussian
-    def _instance(mu_: torch.Tensor, sigma_: torch.Tensor):
-        if full is FullGaussian and full_cov_kl_precision is not None:
-            return full(mu_, sigma_, _precision_policy=full_cov_kl_precision)
-        return full(mu_, sigma_)
-    def _transport(sigma_: torch.Tensor, omega_, **kwargs) -> torch.Tensor:
-        if full is FullGaussian and full_cov_kl_precision is not None:
-            kwargs["precision_policy"] = full_cov_kl_precision
-        return full.transport_dispersion(sigma_, omega_, **kwargs)
-    def _from_transported(mu_: torch.Tensor, sigma_: torch.Tensor, source_: torch.Tensor):
-        if full is FullGaussian and full_cov_kl_precision is not None:
-            return full.from_transported(mu_, sigma_, source_, _precision_policy=full_cov_kl_precision)
-        return full.from_transported(mu_, sigma_, source_)
-    is_full = _is_full_cov(sigma, diagonal)
-    sigma0 = sigma if is_full else torch.diag_embed(sigma)                    # (N, K, K)
-    k = mu.shape[-1]
-    _kappa = torch.as_tensor(kappa, dtype=torch.float32, device=mu.device) if isinstance(kappa, (list, tuple)) else kappa
-    tau = attention_tau(_kappa, group.irrep_dims)
-    off = ~torch.eye(mu.shape[0], dtype=torch.bool, device=mu.device)
-    gen = torch.Generator(device=mu.device).manual_seed(int(seed))
-
-    def _energy(
-        mu_q:   torch.Tensor,
-        sig_q:  torch.Tensor,
-        om:     'torch.Tensor | Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]',
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if isinstance(om, tuple):
-            left, right, gauge_left, gauge_right = om
-            mu_rows: List[torch.Tensor] = []
-            sig_rows: List[torch.Tensor] = []
-            for i in range(left.shape[0]):
-                omega_row = torch.einsum(
-                    "ikl,jlm->ijkm", left[i:i + 1], right)                  # (1, N, K, K)
-                if gauge_left is not None and gauge_right is not None:
-                    omega_row = torch.einsum(
-                        "kl,ijlm,mn->ijkn", gauge_left, omega_row, gauge_right)
-                mu_rows.append(transport_mean(omega_row, mu_q)[0])
-                sig_rows.append(_transport(
-                    sig_q,
-                    omega_row,
-                    diagonal_out=sig_q.dim() == mu_q.dim(),
-                )[0])
-            mu_t = torch.stack(mu_rows, dim=0)                              # (N, N, K)
-            sig_t = torch.stack(sig_rows, dim=0)                            # (N, N, K[, K])
-        else:
-            mu_t = transport_mean(om.unsqueeze(0), mu_q.unsqueeze(0))[0]          # (N, N, K)
-            sig_t = _transport(sig_q.unsqueeze(0), om.unsqueeze(0))[0]  # (N, N, K, K)
-        e = pairwise_energy(_instance(mu_q, sig_q), _from_transported(mu_t, sig_t, sig_q),
-                            alpha=renyi_order, kl_max=kl_max, eps=eps,
-                            divergence_family=divergence_family, irrep_dims=group.irrep_dims)
-        return e, attention_weights(e, tau=tau)
-
-    base_transport = compact_factors if compact_factors is not None else omega
-    e0, beta0 = _energy(mu, sigma0, base_transport)
-
-    def _residuals(g: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        g_inv = torch.linalg.inv(g)
-        mu_g = mu @ g.transpose(-1, -2)                                       # (N, K) g mu_i
-        sig_g = g @ sigma0 @ g.transpose(-1, -2)                              # (N, K, K) g Sigma g^T
-        if compact_factors is None:
-            om_g = torch.einsum("kl,ijlm,mn->ijkn", g, omega, g_inv)         # g Omega g^{-1}
-        else:
-            left, right, _, _ = compact_factors
-            om_g = (left, right, g, g_inv)                                    # g (A_i B_j) g^{-1}
-        e, beta = _energy(mu_g, sig_g, om_g)
-        r_e = ((e - e0).abs() / e0.abs().clamp(min=eps))
-        r_b = (beta - beta0).abs()
-        return r_e[..., off].flatten(), r_b.flatten()         # off masks the trailing (N, N) axes
-
-    in_e, in_b, out_e, out_b = [], [], [], []
-    for _ in range(n_samples):
-        c = scale * torch.randn(group.generators.shape[0], generator=gen, device=mu.device, dtype=mu.dtype)
-        g_in = torch.linalg.matrix_exp(torch.einsum("a,aij->ij", c, group.generators.to(c.dtype)))
-        re, rb = _residuals(g_in)
-        in_e.append(re)
-        in_b.append(rb)
-        m = scale * torch.randn(k, k, generator=gen, device=mu.device, dtype=mu.dtype)
-        re2, rb2 = _residuals(torch.linalg.matrix_exp(m))
-        out_e.append(re2)
-        out_b.append(rb2)
-    return {
-        "energy_in_group":  torch.cat(in_e),
-        "energy_out_group": torch.cat(out_e),
-        "beta_in_group":    torch.cat(in_b),
-        "beta_out_group":   torch.cat(out_b),
-    }
-
-
 def head_mixer_gauge_residual(
     mu:        torch.Tensor,             # (N, K) converged belief means
     sigma:     torch.Tensor,             # (N, K) diagonal OR (N, K, K) full covariances
@@ -1984,10 +1822,7 @@ def head_mixer_gauge_residual(
     -- residual at float32 eps -- but NOT with the UNTIED per-head gauge of ``block_glk`` (each
     head its own gl(d)), where the residual grows as A drifts from I during training.
 
-    This is the complement of :func:`gauge_equivariance_residual`, which co-transforms a SUPPLIED
-    Omega (mu, Sigma, Omega together) and is therefore BLIND to a builder-level break: it certifies
-    the converged operator's congruence consistency, not whether the construction is equivariant.
-    Here the operator is REBUILT under g, so the tied-vs-untied distinction is visible -- this is
+    The operator is REBUILT under g, so the tied-vs-untied distinction is visible -- this is
     the instrument the A2/EXP-9 ablation needs. Uses the FULL-covariance mixer path (the diagonal
     closed form sigma'[m] = sum_n A[m,n]^2 sigma[n] is equivariant only under DIAGONAL gauges), so a
     diagonal sigma is promoted to full via ``diag_embed``. Returns relative residuals for the mean

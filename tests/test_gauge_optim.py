@@ -23,7 +23,7 @@ def _make_optimizer(
     trust_radius=0.1,
     chart_max_norm=5.0,
     bch_residual_max=1e-6,
-    phi_precond_mode="pullback",
+    phi_precond_mode="pullback_per_block",
     **kwargs,
 ):
     return GaugeManifoldAdamW(
@@ -118,61 +118,6 @@ def test_default_adamw_one_step_matches_direct_torch_optimizer() -> None:
         assert set(state) == {"step", "exp_avg", "exp_avg_sq"}
 
 
-def test_default_adamw_one_step_matches_recompute_dense_low_level_oracle(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from vfe3.model import block as block_module
-    from vfe3.model.model import VFEModel
-    from vfe3.train import build_optimizer, train_step
-
-    torch.manual_seed(0)
-    cfg = test_config(
-        vocab_size=8,
-        embed_dim=4,
-        n_heads=2,
-        max_seq_len=4,
-        n_layers=1,
-        n_e_steps=1,
-        pos_phi="none",
-    )
-    production = VFEModel(cfg)
-    oracle = VFEModel(cfg)
-    oracle.load_state_dict(production.state_dict())
-    tokens = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]], dtype=torch.long)
-    targets = torch.tensor([[1, 2, 3, 4], [2, 1, 0, 7]], dtype=torch.long)
-
-    def one_step(model: VFEModel) -> tuple[float, dict[str, torch.Tensor]]:
-        optimizer = build_optimizer(model, cfg)
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
-        loss = train_step(model, optimizer, scheduler, tokens, targets, grad_clip=1.0)
-        return loss, {name: value.detach().clone() for name, value in model.named_parameters()}
-
-    production_loss, production_parameters = one_step(production)
-    original_e_step = block_module.e_step
-
-    def recompute_dense_e_step(*args: object, **kwargs: object) -> object:
-        kwargs["reuse_pairwise_kl_stats"] = False
-        kwargs["compact_phi_block_transport"] = False
-        kwargs["transport_mean_per_head"] = False
-        return original_e_step(*args, **kwargs)
-
-    monkeypatch.setattr(block_module, "e_step", recompute_dense_e_step)
-    oracle_loss, oracle_parameters = one_step(oracle)
-
-    assert production_loss == oracle_loss
-    assert production_parameters.keys() == oracle_parameters.keys()
-    for name in production_parameters:
-        torch.testing.assert_close(
-            production_parameters[name],
-            oracle_parameters[name],
-            atol=1e-6,
-            rtol=1e-6,
-            msg=lambda message, name=name: f"{name}: {message}",
-        )
-
-
-
-
 @pytest.mark.parametrize(
     ("name", "value"),
     [
@@ -185,7 +130,7 @@ def test_default_adamw_one_step_matches_recompute_dense_low_level_oracle(
     ],
 )
 def test_direct_optimizer_rejects_invalid_phi_bounds(name, value):
-    group = get_group("glk")(K=2)
+    group = get_group("block_glk")(n_heads=1, K=2)
     phi = nn.Parameter(torch.zeros(1, 4))
     kwargs = {name: value}
     with pytest.raises(ValueError, match="finite and positive"):
@@ -197,7 +142,7 @@ def test_direct_optimizer_rejects_invalid_phi_bounds(name, value):
 
 
 def test_pullback_group_step_moves_only_active_rows_and_creates_no_phi_state():
-    group = get_group("glk")(K=2)
+    group = get_group("block_glk")(n_heads=1, K=2)
     phi = nn.Parameter(torch.zeros(5, 4))
     optimizer = _make_optimizer(
         [{"params": [phi], "lr": 0.05, "pullback_group": True, "weight_decay": 0.0}],
@@ -254,7 +199,7 @@ def test_build_optimizer_selects_pullback_group_route_and_moves_phi_embed():
 def test_pullback_group_trust_scales_the_learning_rate_weighted_right_factor(monkeypatch):
     import vfe3.gauge_optim as gauge_optim
 
-    group = get_group("glk")(K=2, dtype=torch.float64)
+    group = get_group("block_glk")(n_heads=1, K=2, dtype=torch.float64)
     xi = torch.tensor([[4.0, 0.0, 0.0, 0.0]], dtype=torch.float64)
     monkeypatch.setattr(
         gauge_optim,
@@ -270,7 +215,7 @@ def test_pullback_group_trust_scales_the_learning_rate_weighted_right_factor(mon
         trust_radius=0.25,
         chart_max_norm=5.0,
         bch_residual_max=1e-6,
-        phi_precond_mode="pullback",
+        phi_precond_mode="pullback_per_block",
     )
 
     assert candidate.trust_scale.item() == pytest.approx(0.125)
@@ -315,7 +260,7 @@ def test_pullback_group_stage_normalizes_basis_for_registered_extension(device):
     import vfe3.geometry.phi_preconditioner as phi_preconditioner
 
     name = "test_stage_normalized_registered_extension"
-    group = get_group("glk")(K=2, dtype=torch.float32, device=device)
+    group = get_group("block_glk")(n_heads=1, K=2, dtype=torch.float32, device=device)
     seen = {}
 
     @phi_preconditioner.register_phi_group_direction(name)
@@ -357,7 +302,7 @@ def test_pullback_group_chart_retraction_certifies_right_product_order(
 ) -> None:
     r"""A real pullback direction retracts toward exp(phi) exp(-eta xi)."""
     case = _REAL_COMMIT_CASES[chart_norm]
-    group = get_group("glk")(K=2, dtype=torch.float64)
+    group = get_group("block_glk")(n_heads=1, K=2, dtype=torch.float64)
     phi = torch.tensor([case["phi"]], dtype=torch.float64, requires_grad=True)
     objective_weights = torch.tensor(case["delta"], dtype=torch.float64).reshape(2, 2)
     objective = (torch.linalg.matrix_exp(phi.reshape(2, 2)) * objective_weights).sum()
@@ -370,7 +315,7 @@ def test_pullback_group_chart_retraction_certifies_right_product_order(
         trust_radius=1.0,
         chart_max_norm=6.0,
         bch_residual_max=1e-6,
-        phi_precond_mode="pullback",
+        phi_precond_mode="pullback_per_block",
     )
 
     factor_scale = candidate.trust_scale / torch.exp2(candidate.backtracking_reductions.double())
@@ -440,7 +385,7 @@ def _real_optimizer_commit_case(
     import vfe3.gauge_optim as gauge_optim
 
     case = _REAL_COMMIT_CASES[chart_norm]
-    group = get_group("glk")(K=2, dtype=torch.float32)
+    group = get_group("block_glk")(n_heads=1, K=2, dtype=torch.float32)
     initial = torch.zeros(2, 4, dtype=torch.float32)
     initial[0] = torch.tensor(case["phi"], dtype=torch.float32)
     parameter = nn.Parameter(initial.clone())
@@ -519,7 +464,7 @@ def test_optimizer_commit_is_single_float32_cast_with_certified_right_product(
 def test_pullback_group_candidate_rejects_chart_bound(monkeypatch):
     import vfe3.gauge_optim as gauge_optim
 
-    group = get_group("glk")(K=2, dtype=torch.float64)
+    group = get_group("block_glk")(n_heads=1, K=2, dtype=torch.float64)
     phi = torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float64)
     xi = torch.tensor([[-0.2, 0.0, 0.0, 0.0]], dtype=torch.float64)
     monkeypatch.setattr(
@@ -538,7 +483,7 @@ def test_pullback_group_candidate_rejects_chart_bound(monkeypatch):
         trust_radius=1.0,
         chart_max_norm=1.0,
         bch_residual_max=1e-6,
-        phi_precond_mode="pullback",
+        phi_precond_mode="pullback_per_block",
     )
     assert candidate.rejected_rows.tolist() == [True]
     assert torch.equal(candidate.candidate_phi, phi)
@@ -547,7 +492,7 @@ def test_pullback_group_candidate_rejects_chart_bound(monkeypatch):
 def test_pullback_group_step_rejects_two_parameter_groups_atomically(monkeypatch):
     import vfe3.gauge_optim as gauge_optim
 
-    group = get_group("glk")(K=2, dtype=torch.float64)
+    group = get_group("block_glk")(n_heads=1, K=2, dtype=torch.float64)
     good = nn.Parameter(torch.zeros(1, 4, dtype=torch.float64))
     bad = nn.Parameter(torch.tensor([[0.99, 0.0, 0.0, 0.0]], dtype=torch.float64))
     xi = torch.tensor([[-0.2, 0.0, 0.0, 0.0]], dtype=torch.float64)
@@ -592,7 +537,7 @@ def test_pullback_group_step_rejects_nonfinite_covector_before_any_staging_or_mu
 ):
     import vfe3.gauge_optim as gauge_optim
 
-    group = get_group("glk")(K=2, dtype=torch.float64)
+    group = get_group("block_glk")(n_heads=1, K=2, dtype=torch.float64)
     finite = nn.Parameter(torch.zeros(1, 4, dtype=torch.float64))
     mixed = nn.Parameter(torch.zeros(2, 4, dtype=torch.float64))
     optimizer = _make_optimizer(
@@ -641,7 +586,7 @@ def test_pullback_group_step_rejects_nonfinite_covector_before_any_staging_or_mu
 def test_zero_phi_gradient_is_consumed_without_empty_diagnostics():
     from vfe3.geometry.groups import get_group
 
-    group = get_group("glk")(K=2)
+    group = get_group("block_glk")(n_heads=1, K=2)
     phi = nn.Parameter(torch.zeros(5, 4))
     optimizer = _make_optimizer(
         [{"params": [phi], "lr": 0.05, "pullback_group": True, "weight_decay": 0.0}],

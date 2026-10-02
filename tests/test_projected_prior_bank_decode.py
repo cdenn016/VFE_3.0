@@ -35,10 +35,7 @@ def _projected_surface(**overrides: object) -> dict:
         attention_mode="projected_predictive",
 
         attention_residual=True,
-        divergence_family="renyi", renyi_order=1.0, include_attention_entropy=True,
-        gradient_mode="filtering", e_step_update="gradient",
-        e_step_gradient="unroll", oracle_unroll_grad=True,
-        e_phi_lr=0.0, transport_mode="flat", gauge_group="block_glk",
+        gauge_group="block_glk",
         encode_mode="per_token", decode_mode="full_chunked",
         skip_belief_sigma_update=False,
         decode_bias=False, decode_unigram_prior=False, untie_decode_bank=False,
@@ -48,7 +45,6 @@ def _projected_surface(**overrides: object) -> dict:
         fp32_matmul_precision=None, decode_av_precision="fp32",
         decode_ranking_fp64_escalation=False,
         e_mu_q_trust=None, exp_fp64_norm_threshold=15.0,
-        full_cov_congruence_certification=False,
         transport_clamp_monitor=False, generate_embedding_figures=False,
         warmup_steps=0, max_steps=2, log_interval=0, eval_interval=0,
     )

@@ -342,7 +342,7 @@ _ACTIVE_ROUTE = dict(
     vocab_size=16, embed_dim=6, n_heads=2, max_seq_len=6, eval_stride=3, n_layers=2, batch_size=3,
     gauge_group="block_glk", family="gaussian_diagonal", attention_mode="projected_predictive",
 
-    predictive_covariance="moment_matched", pos_phi="learned", e_phi_lr=0.0,
+    predictive_covariance="moment_matched", pos_phi="learned",
     decode_mode="diagonal_chunked", untie_decode_bank=True, decode_coordinates="local",
     block_coordinates="local", norm_type_block="mahalanobis", use_block_mlp=True,
     block_mlp_mode="coordinate", block_mlp_expansion=2, m_phi_update_mode="fisher_group",
@@ -587,7 +587,6 @@ def test_fisher_group_policy_config_validation_and_inactive_marks() -> None:
             (dict(encode_mode="canonical_content_projected"), None),
             (dict(gauge_group="so_k"), "gauge_group"),
             (dict(gauge_group="tied_block_glk"), None),
-            (dict(cross_couplings=[(0, 1)]), None),
             (dict(pos_phi_project_slk=True), "pos_phi_project_slk"),
             (dict(family="gaussian_frame_diagonal"), "diag"),
             (dict(transport_chart_max_norm=None), "transport_chart_max_norm"),
@@ -595,7 +594,7 @@ def test_fisher_group_policy_config_validation_and_inactive_marks() -> None:
             (dict(m_phi_fisher_rotation_weight=float("nan")), "m_phi_fisher_rotation_weight")):
         with pytest.raises(ValueError, match=message):
             _fisher_cfg(**overrides)
-    _fisher_cfg(family="gaussian_diagonal_exact", attention_mode="projected_predictive")                       # layer-0 row is diag(s)
+    _fisher_cfg(family="gaussian_diagonal", attention_mode="projected_predictive")                       # layer-0 row is diag(s)
     with pytest.raises(ValueError, match="gauge_group"):
         _fisher_cfg(gauge_group="glk", embed_dim=3, n_heads=1)
     inactive = test_config(m_phi_update_mode="adamw", m_phi_fisher_rotation_weight=2.0)
@@ -606,12 +605,12 @@ def test_fisher_group_policy_config_validation_and_inactive_marks() -> None:
                  "m_phi_group_retraction"):
         assert name not in active.inactive_fields()
     with pytest.raises(ValueError, match="phi_fisher_rotation_weight"):
-        GaugeManifoldAdamW([nn.Parameter(torch.zeros(1))], get_group("glk")(K=2),
+        GaugeManifoldAdamW([nn.Parameter(torch.zeros(1))], get_group("block_glk")(n_heads=1, K=2),
                            phi_group_trust_radius=0.1, phi_chart_max_norm=5.0,
-                           phi_bch_residual_max=1e-6, phi_precond_mode="pullback",
+                           phi_bch_residual_max=1e-6, phi_precond_mode="pullback_per_block",
                            phi_fisher_rotation_weight=-1.0)
     with pytest.raises(ValueError, match="group_log"):
-        GaugeManifoldAdamW([nn.Parameter(torch.zeros(1))], get_group("so_k")(K=3),
+        GaugeManifoldAdamW([nn.Parameter(torch.zeros(1))], get_group("so_n")(3, group_n=3, irrep_spec=[("l1", 1)]),
                            phi_group_trust_radius=0.1, phi_chart_max_norm=5.0,
-                           phi_bch_residual_max=1e-6, phi_precond_mode="pullback",
+                           phi_bch_residual_max=1e-6, phi_precond_mode="pullback_per_block",
                            phi_statistics_provider=lambda param, rows: None)

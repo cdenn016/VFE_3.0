@@ -121,7 +121,7 @@ def test_diagonal_block_and_broadcast():
 
 
 def test_diagonal_stack_round_trips():
-    # `stack` is the family-agnostic primitive pairwise_energy batches the per-head loop on:
+    # `stack` is the family-agnostic batching primitive:
     # it stacks the underlying tensors along a new axis and the result's block/mu/sigma stay
     # consistent with the part it was built from.
     from vfe3.families.gaussian import DiagonalGaussian
@@ -179,7 +179,6 @@ def test_full_gaussian_policy_propagates_and_conflicts_are_explicit():
 
     assert q64.block(0, 1)._precision_policy == "fp64"
     assert q64.broadcast_over_keys()._precision_policy == "fp64"
-    assert FullGaussian.from_transported(mu, sigma, sigma, _precision_policy="fp64")._precision_policy == "fp64"
     assert FullGaussian.stack([q64, q64])._precision_policy == "fp64"
     with pytest.raises(ValueError, match="conflicting explicit precision policies"):
         FullGaussian.stack([q64, q32])
@@ -196,29 +195,6 @@ def test_full_gaussian_conflicting_operand_policies_require_override():
     with pytest.raises(ValueError, match="conflicting explicit precision policies"):
         q64.renyi_closed_form(q32)
     assert torch.isfinite(q64.renyi_closed_form(q32, precision_policy="fp32_escalate")).all()
-
-
-def test_legacy_full_gaussian_subclass_coupling_keeps_legacy_constructor_api():
-    from vfe3.families.gaussian import FullGaussian
-
-    class LegacyFullGaussian(FullGaussian):
-        def __init__(self, mu, sigma):
-            super().__init__(mu, sigma)
-
-        @classmethod
-        def from_transported(cls, mu, dispersion, source_dispersion):
-            return cls(mu, dispersion)
-
-        @classmethod
-        def transport_dispersion(cls, dispersion, omega, *, diagonal_out=None, marginal_blocks=None):
-            return super().transport_dispersion(
-                dispersion, omega, diagonal_out=diagonal_out, marginal_blocks=marginal_blocks)
-
-    mu = torch.zeros(1, 2, 2)
-    sigma = torch.eye(2).expand(1, 2, 2, 2)
-    omega = torch.eye(2).expand(1, 2, 2, 2, 2)
-    out = LegacyFullGaussian.coupling_energy(mu, sigma, mu, sigma, omega)
-    assert torch.isfinite(out).all()
 
 
 @pytest.mark.parametrize(

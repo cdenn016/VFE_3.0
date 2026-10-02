@@ -55,7 +55,7 @@ class FakeRun:
         self.frames_active = frames_active
         self.phi_frozen = True
         self.cfg = SimpleNamespace(pos_phi="none" if Y is None else "learned",
-                                   max_seq_len=0 if Y is None else Y[0].shape[0], transport_mode="flat",
+                                   max_seq_len=0 if Y is None else Y[0].shape[0],
                                    norm_type_block="none", norm_type_final="none", layernorm_affine=False)
 
     def phi_blocks(self, ids: Sequence[int]) -> List[np.ndarray]:

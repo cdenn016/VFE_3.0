@@ -41,7 +41,7 @@ def _one_thread() -> None:
 
 def _cfg(**over: Any) -> VFE3Config:
     values = dict(vocab_size=V, embed_dim=4, n_heads=2, max_seq_len=8, eval_stride=4, n_layers=2,
-                  batch_size=2, attention_mode="projected_predictive", e_phi_lr=0.0, block_mlp_expansion=2,
+                  batch_size=2, attention_mode="projected_predictive", block_mlp_expansion=2,
                   norm_type_block="none", layernorm_affine=False,           # pinned: independent of
                   skip_belief_sigma_update=False, decode_temperature_learned=True,
                   beta_attention_prior="causal_alibi")                           # the config defaults

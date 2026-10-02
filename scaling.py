@@ -13,8 +13,8 @@ WHY A PARAMETER AXIS IS SUBTLE HERE (read before picking a grid). The token-prio
 (prior_bank.py), so ``N = 2*V*K + V*n_gen + 1`` with ``V=50257``. An untied decoder adds a second
 ``2*V*K`` table pair. ``phi_embed = V*n_gen`` usually DOMINATES. ``n_gen`` is set by the gauge group:
 for ``block_glk`` it is ``K^2/n_heads`` (so FEWER/larger
-blocks = MORE params -- the opposite sign of a standard transformer); ``glk`` is ``K^2``; ``so_k`` is
-``K(K-1)/2``; the ``so_n``/``sp_n`` towers decouple ``n_gen`` from ``K`` entirely. Three consequences:
+blocks = MORE params -- the opposite sign of a standard transformer); the ``so_n`` tower decouples
+``n_gen`` from ``K`` entirely. Three consequences:
 the gauge group / n_heads is a FIRST-CLASS parameter lever; growing ``embed_dim`` moves ``N`` on two
 fronts (linear ``2VK`` + quadratic ``V*n_gen``); and depth adds parameters when
 relational maps or block MLPs are enabled.
@@ -149,7 +149,6 @@ config = dict(
     warmup_steps              = 100,
     deterministic             = True,
 
-    gradient_mode             = "filtering",   #"smoothing"
 
     # Attention execution; all interfaces have full input/output.
     attention_mode                   = "projected_predictive",  # "projected_predictive" | "projected_gradient"
@@ -161,14 +160,11 @@ config = dict(
 
 
     #################################
-    # f-divergence and e/m family
+    # belief family
     #################################
 
-    divergence_family         = "renyi",   # "renyi", "squared_hellinger","bhattacharyya", "jeffreys",
-    renyi_order               = 1.0,       # Renyi order (1.0 -> KL)
 
-    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full" | "laplace_diagonal" | "gaussian_frame_diagonal"
-                                                     # | "gaussian_diagonal_exact" (single covariance toggle; diagonal_covariance is derived)
+    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full"
 
 
     #################################
@@ -187,13 +183,12 @@ config = dict(
     #################################
     decode_bias                       = True,     # only for decode_mode='linear'
 
-    use_head_mixer                    = False,   # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
+    use_head_mixer                    = False,   # opt-in Schur-commutant head mixer (needs >=2 blocks: block_glk heads OR an so_n irrep tower with per-isotypic-component mixing);
     use_priorbank_head_evidence_mixer = False,
 
 
     decode_mode                       = 'linear',  # prior-bank: diagonal_chunked/full_chunked/expected_likelihood_chunked/family_chunked
     encode_mode                       = "per_token",   #"per_token_additive" is ~1.5x faster at K=80 currently unablated
-                                                       # "canonical_content_projected" requires gaussian_diagonal input and a full decoder
     decode_chunk_size                 = 8192,
     decode_tau                        = 0.008,       #prior_bank = True temperature
 
@@ -219,10 +214,10 @@ config = dict(
     gauge_transport           = "on",         # gauge-frame ABLATION (A1/EXP-2): "on" (pure, learned frame)
                                               #   | "off" (Omega=I exactly) | "frozen" (random fixed frame)
 
-    gauge_group               = "block_glk",    # "glk" | "block_glk" | "tied_block_glk" | "so_k" | "sp" | "so_n" | "sp_n"
+    gauge_group               = "block_glk",    # "block_glk" | "so_n" (so_n awaits reconnection to the projected routes)
 
-    group_n                   = None,                # so_n/sp_n only; must stay None for every other group
-    irrep_spec                = None,                # so_n/sp_n only; must stay None for every other group
+    group_n                   = None,                # so_n only; must stay None for block_glk
+    irrep_spec                = None,                # so_n only; must stay None for block_glk
 
     ####################################
     #       Positional Encoding
@@ -235,7 +230,6 @@ config = dict(
 
     rope_base                 = 100.0,               # rotary frequency base
 
-    rope_full_gauge           = False,               # rotate the covariance sandwich too (REQUIRES family="gaussian_full")
     rope_on_value             = False,
 
 
@@ -282,14 +276,11 @@ config = dict(
     #         Belief E-step
     #         Learning Rates
     #################################
-    e_step_update             = "gradient",  # "gradient" (pure current path) | "mm_exact" (closed-form MM
-                                            # coordinate minimizer at frozen beta)
 
 
     e_q_mu_lr                 = 0.9,
     e_q_sigma_lr              = 0.01,
 
-    e_phi_lr                  = 0.00,
 
 
     #################################
@@ -365,7 +356,6 @@ config = dict(
     sigma_max                            = 100.0,
     e_mu_q_trust                         = 2,
     e_sigma_q_trust                      = 1.0,
-    mu_trust_mode                        = "ball",
 
 
     amp_dtype                            = 'bf16',        # None=fp32 | 'bf16' , 'fp16'. Sigma must be at least fp32
@@ -396,24 +386,8 @@ config = dict(
     # opt-in so the default chunked route remains streamed and bounded.
     decode_ranking_fp64_escalation       = True,
 
-    # DEFAULT guard is sign-only: recompute in float64 iff the working-dtype congruence went
-    # negative -- one amin reduction the floor needs regardless. Positivity is necessary but not
-    # sufficient (cancellation destroys accuracy before it destroys sign), so this toggle adds the
-    # conditioning proxy cond(exp_phi)^4 * eps > 1e-3, which bounds the quadratic form's backward
-    # error (Higham 2002, 3.1). It is OPT-IN because it is not free: it runs svdvals on the vertex
-    # blocks and then a bool() on the result, i.e. an SVD launch plus a GPU->CPU sync, on the
-    # HEALTHY path of every covariance transport.
-    congruence_cond_escalation           = False, #at K=80 4 heads ~  2x-3x slower
 
 
-    # Strict post-congruence certificate (audit remediation M13). When enabled, factor every
-    # transported pair covariance and promote the complete pair field to float64 if any matrix is
-    # uncertified. At B=64, N=128, K=20 this checks 1,048,576 separate 20x20 matrices and the
-    # promoted field is about 3.1 GiB. Keep this opt-in for accuracy investigations; False retains
-    # the selected working precision without the additional certificate or fallback recompute.
-    full_cov_congruence_certification    = True,  # False: no per-pair Cholesky certificate or
-                                                 # whole-field fp64 retry. True: strict M13 audit
-                                                 # over ~1.05M 20x20 matrices per call at B64/N128.
 
 
     skip_belief_sigma_update             = True,        # skip the belief-channel sigma E-step update
@@ -561,8 +535,7 @@ def route_vary_block_fixed_k(
     GL(K) frame) drops the head mixer. Each b must divide K; non-divisors are skipped with a warning.
 
     ``gauge_group`` selects the structure group per cell (default ``block_glk``, the untied per-head
-    GL(d_head); pass ``tied_block_glk`` for the tied gauge, n_gen = d_head^2 instead of b*K, under which
-    the Schur-commutant head mixer stays exactly equivariant). ``tag`` overrides the internal cell route
+    GL(d_head)). ``tag`` overrides the internal cell route
     tag (default ``f'blocks_K{embed_dim}'``); give a distinct tag to a variant route (different budget or
     group) so ``scaling_analysis`` keeps its points separate from the base ``blocks_K48`` run."""
     cells: List[Dict[str, Any]] = []
@@ -573,8 +546,6 @@ def route_vary_block_fixed_k(
         h = embed_dim // b
         ov: Dict[str, Any] = {"embed_dim": embed_dim, "n_heads": h, "gauge_group": gauge_group,
                               "kl_max": 8 * embed_dim}
-        if gauge_group == "tied_block_glk":
-            ov["phi_precond_mode"] = "killing"
         if h < 2:
             ov["use_head_mixer"] = False
         if extra_overrides:
@@ -583,28 +554,6 @@ def route_vary_block_fixed_k(
                       "scale_knob": "n_heads", "overrides": ov})
     return cells
 
-
-def route_group(embed_dim: int) -> List[Dict[str, Any]]:
-    r"""Grow/shrink N by changing the gauge GROUP at fixed K (route C): tied_block_glk (tiny n_gen) ->
-    block_glk -> so_k span a wide n_gen range. A headless 'causal' beta prior is used for ALL arms so
-    the attention prior is identical across groups (alibi would otherwise need n_heads == n_blocks,
-    which differs by group); single-block arms also drop the head mixer (nothing to mix). glk (K^2,
-    the largest) is left commented -- at K=64 it is ~212M params, near the single-GPU ceiling once 3x
-    AdamW moments count; uncomment if VRAM allows."""
-    headless = {"beta_attention_prior": "causal"}
-    return [
-        {"label": f"K{embed_dim}_tied_h8", "route": "group", "scale_knob": "gauge_group",
-         "overrides": {"embed_dim": embed_dim, "n_heads": 8, "gauge_group": "tied_block_glk",
-                       "phi_precond_mode": "killing", **headless}},
-        {"label": f"K{embed_dim}_block_h8", "route": "group", "scale_knob": "gauge_group",
-         "overrides": {"embed_dim": embed_dim, "n_heads": 8, "gauge_group": "block_glk", **headless}},
-        {"label": f"K{embed_dim}_so_k", "route": "group", "scale_knob": "gauge_group",
-         "overrides": {"embed_dim": embed_dim, "n_heads": 1, "gauge_group": "so_k",
-                       "use_head_mixer": False, **headless}},
-        # {"label": f"K{embed_dim}_glk", "route": "group", "scale_knob": "gauge_group",
-        #  "overrides": {"embed_dim": embed_dim, "n_heads": 1, "gauge_group": "glk",
-        #                "use_head_mixer": False, **headless}},
-    ]
 
 
 def route_inference_t(n_e_steps_list: List[int]) -> List[Dict[str, Any]]:
@@ -633,7 +582,6 @@ def route_inference_l(n_layers_list: List[int]) -> List[Dict[str, Any]]:
 #     grow_K_mup    grow_K + a muP LR/init-rescaled twin per K (F1/EXP-6 width-stability), kl_max=8*K.
 #     blocksize     FIXED K=64, vary n_heads in {8,4,2} (= block GL(8),GL(16),GL(32)); same idea as
 #                   blocks_K48 but parameterized by n_heads instead of GL(b).
-#     group         FIXED K=64, swap the gauge GROUP: tied_block_glk -> block_glk -> so_k (spans n_gen).
 #   INFERENCE routes (FLAT N -- plotted on a SEPARATE inference-capacity figure, NEVER on L(N)):
 #     infer_T       n_e_steps in {1,2,4,8} at constant params.
 #     infer_L       legacy depth alias; now tagged depth because per-layer modules add parameters.
@@ -649,11 +597,6 @@ ROUTES: Dict[str, List[Dict[str, Any]]] = {
     # Distinct keys/tags so scaling_analysis keeps these points separate from the 245.76M blocks_K48 run.
     "blocks_K48_2x":      route_vary_block_fixed_k(48, [3, 6, 8, 12, 24], tag="blocks_K48_2x"),
     
-    # Arm 3: tied gauge (n_gen = d_head^2 instead of 48*b) at matched budget -- does per-block UNTIED
-    # richness drive the S1 curve, or does the tied variant match it at far fewer params? Under the tied
-    # gauge the head mixer stays exactly equivariant, so this is also the equivariance-clean arm.
-    "blocks_K48_tied_2x": route_vary_block_fixed_k(48, [3, 6, 8, 12, 24],
-                                                   gauge_group="tied_block_glk", tag="blocks_K48_tied_2x"),
     # Arm 2a: the non-gauge capacity control. Keep block_glk so n_gen (= 48*b) matches each gauge cell,
     # but encode NON-structurally (encode_mode='per_token_additive' + pos_phi='none'): the learned
     # (V, n_gen) phi table drives an additive mean shift through a frozen readout, and Omega = I. Tests
@@ -665,7 +608,6 @@ ROUTES: Dict[str, List[Dict[str, Any]]] = {
     "grow_K":        route_grow_k([20, 40, 60, 80, 100, 120], n_heads=4),
     "grow_K_mup":    route_grow_k_mup([20, 40, 60, 80, 100], n_heads=4, anchor_k=20),  # F1/EXP-6 (fixed vs muP)
     "blocksize":     route_blocksize(64, [8, 4, 2]),
-    "group":         route_group(64),
     "infer_T":       route_inference_t([1, 2, 4, 8]),
     "infer_L":       route_inference_l([1, 2, 4, 6]),
 }
@@ -1447,12 +1389,9 @@ def _validate_cell_controls(
     max_steps: Optional[int],
 ) -> None:
     """Reject sweep axes erased by a different active update or global budget."""
-    if cell["route"] == "grow_K_mup" and (
-            cfg.e_step_update == "mm_exact" or
-            (cfg.relational_mode == "projected_filtering" and
-             cfg.relational_readout_mode == "predictive_content")):
+    if cell["route"] == "grow_K_mup" and cfg.relational_readout_mode == "predictive_content":
         raise ValueError("grow_K_mup varies e_q_mu_lr and requires a gradient belief update; "
-                         "mm_exact and predictive_content do not read that learning rate")
+                         "predictive_content does not read that learning rate")
     if cell["scale_knob"] == "max_steps" and max_steps is not None:
         raise ValueError("set CONFIG['max_steps']=None for the train_steps sweep; "
                          "a global override would erase its budget axis")
