@@ -566,8 +566,8 @@ def e_step_belief_trace(
     """
     conditional_enabled = is_conditional_filtering(model)
     if conditional_enabled:
-        if n_iter is not None and n_iter != 1:
-            raise NotImplementedError("Q/K/V diagnostics support the configured single E-step only")
+        if n_iter is not None and n_iter != model.cfg.n_e_steps:
+            raise NotImplementedError("Q/K/V diagnostics support the configured E-step count only")
         if snapshot is None:
             snapshot = model.build_diagnostic_snapshot(token_ids)
         if snapshot.conditional_capture is None:
@@ -590,7 +590,7 @@ def e_step_belief_trace(
                 "free_energy_unavailable_reason": "routing and content use distinct conditional stages",
                 "conditional_cost_available": model.cfg.relational_readout_mode != "predictive_content",
                 **{f"relational_{key}": value
-                   for key in ("conditional_cost_before", "conditional_cost_after")
+                   for key in ("receiver_cost_before", "receiver_cost_after")
                    if (value := snapshot.conditional_capture.get(
                        f"relational_{key}")) is not None},
             } if conditional_enabled else {}),

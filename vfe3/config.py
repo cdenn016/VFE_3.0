@@ -344,20 +344,19 @@ class VFE3Config:
     bch_residual_max:          Optional[float] = None        # fail-closed BCH/group-product relative residual
     pos_phi_project_slk:       bool            = False       # per-block trace projection (det Omega = 1)
 
-    # Gauge-RoPE (default-off): a block-diagonal positional rotation R(theta) folded into the
-    # transport (Omega^RoPE_ij = R(theta_i) Omega_ij R(theta_j)^T). Means-only by default;
-    # rope_full_gauge=True also rotates the covariance sandwich and REQUIRES full covariance.
+    # Gauge-RoPE (default-off): a block-diagonal positional rotation R(theta) folded into each
+    # realized frame on the right, V_i = U_i R(theta_i)^T, which carries both moments on the
+    # projected routes. rope_full_gauge only affected the retired transported pair energy and is
+    # inert; it still requires full covariance for backward compatibility of saved configs.
     pos_rotation:              str   = "none"      # "none" | "rope"
     rope_base:                 float = 100.0       # rotary frequency base
 
     rope_full_gauge:           bool  = False       # rotate covariance too (needs family="gaussian_full")
 
     # True (default) = the coherent single-gauge path: the gauge-RoPE rotation feeds BOTH the
-    # attention score and the value aggregation. False factors the transport into an attention gauge
-    # and a value gauge (GL(K)_attention.tex:1909) -- RoPE's "position-dependent attention,
-    # position-independent values" asymmetry. Decoupled breaks beta's coupling-sum stationarity, so
-    # the belief gradient routes to the autograd oracle (no closed-form kernel). Inert unless
-    # pos_rotation='rope'.
+    # routing frame and the content/value frame. False keeps routing on U_i R_i^T and moves content
+    # on U_i -- RoPE's "position-dependent attention, position-independent values" asymmetry.
+    # Inert unless pos_rotation='rope'.
     rope_on_value:             bool  = True         # False -> value aggregation uses the un-rotated base
 
     #################################
@@ -371,7 +370,15 @@ class VFE3Config:
     attention_residual:                  bool          = False                  # requires predictive_content
     relational_output_init:              str           = "identity"             # "identity" | "depth_scaled" (initial O times 1/sqrt(2 n_layers))
 
-    relational_receiver_noise:           float         = 1.0                   # projected_gradient: Q_h = variance * I in reference coordinates
+    relational_receiver_noise:           float         = 1.0                   # projected_gradient: Q_h = variance * I (K-dim reference law under ambient, d-dim channel floor under channel)
+    # projected_gradient receiver energy and update (projected_gradient.tex). "channel_likelihood" scores
+    # O_h^T xi_i against the d-dim message T_h xi_j as an expected likelihood (entropy counted once, no
+    # complement pinning); "ambient_alignment" is the PR #30 sum of KLs to K-dim noisy laws. "closed_form"
+    # applies the exact frozen-context natural-parameter update with damping rho in (0, 1] (rho = 1 is the
+    # minimizer); "euler" is the PR #30 explicit Fisher step governed by e_q_mu_lr / e_q_sigma_lr and trusts.
+    relational_receiver_law:             str           = "channel_likelihood"  # "channel_likelihood" | "ambient_alignment"
+    relational_receiver_update:          str           = "closed_form"         # "closed_form" | "euler"
+    relational_receiver_damping:         float         = 1.0                   # closed_form only: rho in (0, 1]
     relational_routing:                  str           = "gaussian_kl"          # "gaussian_kl" | "noisy_query" (projected_predictive only)
     # Belief covariance after the predictive readout. "passthrough" keeps the incoming covariance
     # (a per-token-type routing state); "moment_matched" replaces it by the exact moment-matched
@@ -907,6 +914,26 @@ class VFE3Config:
                 or not math.isfinite(float(self.relational_receiver_noise))
                 or self.relational_receiver_noise <= 0.0):
             raise ValueError("relational_receiver_noise must be a finite positive reference variance")
+        _require(self.relational_receiver_law, ("channel_likelihood", "ambient_alignment"),
+                 "relational_receiver_law")
+        _require(self.relational_receiver_update, ("closed_form", "euler"), "relational_receiver_update")
+        if (isinstance(self.relational_receiver_damping, bool)
+                or not isinstance(self.relational_receiver_damping, Real)
+                or not math.isfinite(float(self.relational_receiver_damping))
+                or not 0.0 < self.relational_receiver_damping <= 1.0):
+            raise ValueError("relational_receiver_damping must lie in (0, 1]")
+        if full_link and self.n_e_steps < 1:
+            raise ValueError("attention_mode='projected_gradient' requires n_e_steps >= 1; "
+                             "n_e_steps=0 would remove attention from every layer")
+        if (full_link and self.relational_receiver_law == "ambient_alignment"
+                and isinstance(self.lambda_alpha, Real) and self.lambda_alpha <= 0
+                and isinstance(self.lambda_beta, Real) and self.lambda_beta <= 0):
+            raise ValueError("projected_gradient needs lambda_alpha > 0 or lambda_beta > 0: "
+                             "otherwise the receiver energy has no mass")
+        if (full_link and self.relational_receiver_law == "channel_likelihood"
+                and not (isinstance(self.lambda_alpha, Real) and self.lambda_alpha > 0)):
+            raise ValueError("relational_receiver_law='channel_likelihood' requires lambda_alpha > 0: "
+                             "the prior divergence carries the receiver's only entropy term")
         for name in ("m_relational_score_lr", "m_relational_content_lr"):
             rate = getattr(self, name)
             if rate is not None and (
@@ -1682,22 +1709,11 @@ class VFE3Config:
         _require(self.pos_phi, tuple(sorted(_POS_PHI)), "pos_phi")
         from vfe3.geometry.rope import _POS_ROTATIONS
         _require(self.pos_rotation, tuple(sorted(_POS_ROTATIONS)), "pos_rotation")
-        # Gauge-RoPE breaks GLOBAL gauge equivariance for EVERY group: the position-fixed
-        # R(theta_i) do not commute with a global gauge element g (probe: beta residual 0.44-0.61
-        # under rope vs 7e-6 without), including rope_full_gauge=True. The group-specific warnings
-        # below cover only the structure-group departures and the means-only incoherence, so this one
-        # is unconditional. The equivariant positional path is pos_phi or pos_rotation='none'.
-        if self.pos_rotation == "rope":
-            import warnings
-            warnings.warn(
-                "pos_rotation='rope' is a deliberate residual gauge-FIXING layer: the position-fixed "
-                "rotations R(theta_i) do not commute with a global gauge element, so gauge-RoPE "
-                "breaks the global gauge equivariance of F/beta for every group (probe: beta "
-                "residual 0.44-0.61 under rope vs 7e-6 without). The equivariant positional paths "
-                "are pos_phi='frozen'/'learned' (composed into phi) or pos_rotation='none'.",
-                UserWarning,
-                stacklevel=2,
-            )
+        # The retained projected routes fold RoPE into the realized frame on the right,
+        # V_i = U_i R_i^T (rope_insertion is fixed to "right"). Under U_i -> g_i U_i this gives
+        # V_i -> g_i V_i, the same right-factor structure as pos_phi's exp(Y_i), so routing and
+        # content stay exactly covariant (audit 2026-10-01 F11: residual ~6e-16). The former
+        # gauge-breaking warning quoted a probe of the retired left insertion and was removed.
         if self.rope_full_gauge and self.diagonal_covariance:
             raise ValueError(
                 "rope_full_gauge=True rotates the covariance sandwich (R Sigma R^T), which the "
@@ -2516,7 +2532,14 @@ class VFE3Config:
             mark(("predictive_covariance_floor", "predictive_covariance_centering"),
                  "only read by predictive_covariance='moment_matched'")
         if self.attention_mode != "projected_gradient":
-            mark(("relational_receiver_noise",), "only read by projected_gradient receiving laws")
+            mark(("relational_receiver_noise", "relational_receiver_law", "relational_receiver_update",
+                  "relational_receiver_damping"), "only read by projected_gradient receiving laws")
+        elif self.relational_receiver_update == "closed_form":
+            mark(("e_q_mu_lr", "e_q_sigma_lr", "e_mu_q_trust", "mu_trust_mode", "e_sigma_q_trust"),
+                 "relational_receiver_update='closed_form' applies the exact frozen-context update; "
+                 "its step control is relational_receiver_damping")
+        else:
+            mark(("relational_receiver_damping",), "only read by relational_receiver_update='closed_form'")
         gradient_controls = ("e_q_mu_lr", "e_q_sigma_lr", "e_step_mu_precond",
                              "e_mu_q_trust", "mu_trust_mode", "e_sigma_q_trust")
         if self.attention_mode == "projected_predictive":
@@ -2613,9 +2636,26 @@ class VFE3Config:
              "projected scoring never calls the transported full-covariance pair backend")
         if self.attention_mode == "projected_predictive":
             mark(("lambda_beta",), "predictive_content weights no belief-coupling block")
-            mark(("full_cov_congruence_precision", "full_cov_congruence_certification",
-                  "congruence_cond_escalation"),
-                 "predictive_content never transports a covariance by congruence")
+        # Both retained projected routes read covariances through U^{-1} frame factors only.
+        mark(("full_cov_congruence_precision", "full_cov_congruence_certification",
+              "congruence_cond_escalation"),
+             "projected routes never transport a covariance by congruence")
+        mark(("rope_full_gauge",),
+             "projected routes fold RoPE into the frame (U_i R_i^T), which already carries both "
+             "moments; only the retired transported pair energy read this toggle")
+        mark(("include_attention_entropy", "oracle_unroll_grad"),
+             "fixed by the projected envelope; no projected route evaluates the global F or the oracle")
+        if self.decode_mode != "family_chunked":
+            mark(("full_cov_kl_precision",),
+                 "projected scoring has its own factor policy; only the family_chunked decoder "
+                 "evaluates the pair divergence")
+        if (self.attention_mode == "projected_predictive" and self.family == "gaussian_frame_diagonal"
+                and self.decode_coordinates == "local" and self.block_coordinates == "local"
+                and not (self.use_block_mlp and self.block_mlp_mode == "canonical_frame")):
+            mark(("phi_scale", "pos_phi", "pos_phi_scale", "pos_phi_project_slk", "m_phi_lr",
+                  "m_pos_phi_lr", "phi_weight_decay", "gauge_transport"),
+                 "gaussian_frame_diagonal replaces the relational frame by the identity, so the "
+                 "learned frame tables receive no gradient on this route")
         if "e_mu_q_trust" in inactive or self.e_mu_q_trust is None or self.diagonal_covariance:
             mark(("mu_trust_cholesky_rounds",),
                  "only an active mean trust region on a full covariance factors sigma_q")
@@ -2835,6 +2875,15 @@ def config_from_serialized(
             raise ValueError(
                 f"serialized config from {source} requests retired identity content; "
                 "identity content requires explicit migration")
+    if "attention_mode" not in payload:
+        # A payload with no selector predates the attention-mode field; its historical default was
+        # the retired transported route, so loading it as projected_predictive would silently
+        # change the forward (audit 2026-10-01 F14).
+        raise ValueError(f"serialized config from {source} names no attention selector; it predates "
+                         "the projected routes and requires explicit migration")
+    # Configs saved before the receiver-law fields keep the PR #30 receiver they ran.
+    payload.setdefault("relational_receiver_law", "ambient_alignment")
+    payload.setdefault("relational_receiver_update", "euler")
     config_fields = {field.name: field for field in fields(VFE3Config)}
     unknown = sorted(str(key) for key in payload if key not in config_fields)
     if unknown:

@@ -111,16 +111,12 @@ def test_canonical_rope_split_config_builds_with_visible_caveat(
     )
     VFEModel(cfg)
     output = capsys.readouterr().out
-    if attention_mode != "transported":
-        assert not any("not the covariance sandwich" in str(warning.message) for warning in recwarn)
-    needs_caveat = not rope_on_value or (attention_mode == "transported" and not rope_full_gauge)
-    if needs_caveat:
+    assert not any("not the covariance sandwich" in str(warning.message) for warning in recwarn)
+    if not rope_on_value:
         assert output.count("WARNING: canonical_frame + RoPE") == 1
         lines = output.strip().splitlines()
         assert lines[0] == lines[-1] == "-" * 72
-        assert ("position-dependent MLP" in output) == (not rope_on_value)
-        assert ("transported covariance unrotated" in output) == (
-            attention_mode == "transported" and not rope_full_gauge)
+        assert "position-dependent MLP" in output
     else:
         assert "WARNING: canonical_frame + RoPE" not in output
 

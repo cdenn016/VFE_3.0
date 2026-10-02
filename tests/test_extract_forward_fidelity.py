@@ -93,21 +93,20 @@ def _rope_model() -> VFEModel:
     """The positional-rotation fixture: the extractors must replay a rope forward exactly.
 
     Rope is the residual gauge-FIXING layer, so its transport pair is the least trivial one the
-    extractor replay has to reproduce; construction emits the documented gauge warning.
+    extractor replay has to reproduce.
     """
-    with pytest.warns(UserWarning, match="gauge"):
-        cfg = test_config(
-            vocab_size=16,
-            embed_dim=4,
-            n_heads=2,
-            max_seq_len=8,
-            n_layers=1,
-            n_e_steps=2,
-            e_q_mu_lr=0.2,
-            e_q_sigma_lr=0.1,
-            e_phi_lr=0.0,
-            pos_rotation="rope",
-        )
+    cfg = test_config(
+        vocab_size=16,
+        embed_dim=4,
+        n_heads=2,
+        max_seq_len=8,
+        n_layers=1,
+        n_e_steps=2,
+        e_q_mu_lr=0.2,
+        e_q_sigma_lr=0.1,
+        e_phi_lr=0.0,
+        pos_rotation="rope",
+    )
     torch.manual_seed(23)
     model = VFEModel(cfg).to(DEVICE)
     model.eval()
@@ -293,12 +292,11 @@ def test_projected_converged_state_matches_production_snapshot() -> None:
 
 def test_projected_rope_unrolled_replay_matches_production_snapshot() -> None:
     """Allowed means-only gauge-RoPE and an unrolled E-step share the projected q0 seam."""
-    with pytest.warns(UserWarning, match="gauge"):
-        model, tokens, snapshot = _projected_parity_case(
-            pos_rotation="rope",
-            rope_full_gauge=False,
-            use_block_mlp=False,          # the block MLP requires a gradient-carrying E-step
-        )
+    model, tokens, snapshot = _projected_parity_case(
+        pos_rotation="rope",
+        rope_full_gauge=False,
+        use_block_mlp=False,          # the block MLP requires a gradient-carrying E-step
+    )
 
     belief, _, rope = extract._encode_one(model, tokens)
     assert rope is not None

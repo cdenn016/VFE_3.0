@@ -58,11 +58,18 @@ def _frame_action(
     r"""The map ``(M, x) -> M x`` used for this frame's vertex factors.
 
     An escalated frame applies each factor at float64 and returns ``x.dtype``, so the MLP and every
-    downstream tensor keep their dtypes; any other frame uses the plain contraction unchanged.
+    downstream tensor keep their dtypes. Any other frame contracts with autocast disabled at
+    ``promote_types(x.dtype, float32)``: an ambient bf16 autocast would otherwise store the belief
+    mean in bf16 (the MLP's own residual then adds its bf16 increment to a float32 mean).
     """
     if _escalated_frame(frame, mu):
         return lambda M, x: torch.einsum("...ij,...j->...i", M, x.double()).to(x.dtype)
-    return lambda M, x: torch.einsum("...ij,...j->...i", M, x)
+
+    def apply(M: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        dtype = torch.promote_types(torch.promote_types(x.dtype, M.dtype), torch.float32)
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            return torch.einsum("...ij,...j->...i", M.to(dtype), x.to(dtype))
+    return apply
 
 
 

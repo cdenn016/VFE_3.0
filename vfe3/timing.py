@@ -36,8 +36,11 @@ class TrainingTimer:
         clock:               Optional[Callable[[], float]]              = None,
         cuda_event_factory:  Optional[Callable[..., object]]            = None,
         cuda_stream_factory: Optional[Callable[[torch.device], object]] = None,
+        wall_clock_offset:   float                                      = 0.0,
     ) -> None:
         self._device = device
+        # Seconds already elapsed before this timer started (a resumed run's checkpointed clock).
+        self._wall_clock_offset = float(wall_clock_offset)
         self._clock = time.perf_counter if clock is None else clock
         self._is_cuda = device.type == "cuda"
         self._event_factory: Optional[Callable[..., _TimingEvent]] = None
@@ -115,8 +118,12 @@ class TrainingTimer:
         elapsed = now - self._pipeline_origin
         return PipelineTimingSample(
             pipeline_tokens_per_s=self._pipeline_tokens / max(elapsed, _RATE_FLOOR_S),
-            wall_clock_s=now - self._train_origin,
+            wall_clock_s=self._wall_clock_offset + now - self._train_origin,
         )
+
+    def elapsed_wall_clock_s(self) -> float:
+        """Cumulative wall-clock seconds, including a resumed run's checkpointed elapsed time."""
+        return self._wall_clock_offset + self._clock() - self._train_origin
 
     def reset_pipeline_window(self) -> None:
         self._pipeline_origin = self._clock()

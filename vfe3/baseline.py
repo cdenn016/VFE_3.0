@@ -411,6 +411,9 @@ def _vfe_base_values(base: Any) -> Dict[str, Any]:
             raw.pop("relational_identity_content"), "relational_identity_content", source="matched_to")
         if identity:
             raise ValueError("matched_to: retired identity content requires explicit migration")
+    if "attention_mode" not in raw:
+        raise ValueError("matched_to: base config names no attention selector; it predates the "
+                         "projected routes and requires explicit migration")
     defaults: Dict[str, Any] = {}
     for f in fields(VFE3Config):
         if f.default is not MISSING:

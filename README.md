@@ -279,8 +279,7 @@ Consult the validator for the complete admission rules.
 
 | Setting | Effect on the predictive route |
 |---|---|
-| `projected_filtering` | Selects projected comparison and relational operators. |
-| `predictive_content` | Selects direct content aggregation. |
+| `attention_mode="projected_predictive"` | Selects projected comparison and direct content aggregation (internal read-only views: `relational_mode="projected_filtering"`, `relational_readout_mode="predictive_content"`). |
 | `gradient_mode="filtering"` | Required family selector; does not imply an inner gradient step here. |
 | `e_q_mu_lr`, `e_q_sigma_lr` | Unread by the predictive readout. |
 | `e_phi_lr=0` | No inner frame update; outer frame learning can remain active. |
@@ -300,7 +299,8 @@ the diagonal of a per-token table, the predictive readout keeps it, and under th
 inherited `block_mlp_covariance="passthrough"` no later seam densifies it; a float64
 probe with shared parameters gives identical losses and an exactly zero off-diagonal
 covariance. A genuinely full covariance requires `block_mlp_covariance="delta_full"`,
-`use_head_mixer=True`, or the covariance updates of `attention_mode="projected_gradient"`.
+`use_head_mixer=True`, `predictive_covariance="moment_matched"`, or the covariance updates of
+`attention_mode="projected_gradient"`.
 `VFE3Config.inactive_fields()`
 reports this equivalence, together with every other setting that no active path reads
 (for example `lambda_beta`, `sigma_max`, and the congruence-precision knobs on this
@@ -373,21 +373,37 @@ require matched empirical comparisons.
 
 ### Full-link belief revision
 
-`attention_mode="projected_gradient"` uses full-width comparison and content maps to
-form noisy receiving Gaussian laws, freezes incoming source and routing values for
-an inference episode, and applies Fisher updates to the receiver mean and covariance.
-Multiple E-steps reuse this episode context. Sources and routing retain their outer
-gradient graph. This objective differs from predictive content aggregation.
+`attention_mode="projected_gradient"` uses full-width comparison and content maps,
+freezes incoming source and routing values for an inference episode, and updates the
+receiver mean and covariance against a frozen receiver energy. Multiple E-steps reuse
+this episode context. Sources and routing retain their outer gradient graph. This
+objective differs from predictive content aggregation. The derivations are in
+`Research/manuscripts/Attention/projected_gradient.tex`.
+
+`relational_receiver_law="channel_likelihood"` (default) scores the receiver's partial
+law $O_h^\top\xi_i$ against each sender's $d$-dimensional message $T_h\xi_j$ as an
+expected likelihood with channel floor `relational_receiver_noise`. It counts the
+receiver entropy once, so its minimizer is the exact tempered Gaussian posterior, and
+directions no head observes stay at the prior. `"ambient_alignment"` is the original
+sum of KLs to $K$-dimensional laws with noise $\nu I_K$; it counts the entropy
+$\alpha+\sum_h\lambda_h$ times and pulls each head's unwritten coordinates toward zero.
+`relational_receiver_update="closed_form"` (default) applies the exact frozen-context
+natural-parameter update with damping `relational_receiver_damping` in $(0,1]$
+($1$ is the minimizer; then extra E-steps change nothing). `"euler"` is the explicit
+Fisher step governed by `e_q_mu_lr`, `e_q_sigma_lr` and the trust radii; it is stable
+only for `e_q_mu_lr` below $2/\lambda_{\max}(\Sigma\Lambda)$. Serialized configs that
+predate these fields reload as `ambient_alignment` with `euler`.
 
 Both supported attention modes have fixed full input and output. Every head reads
 and writes all $K$ state coordinates through a reduced $d=K/H$ channel. Q/K/T have
 shape $(H,d,K)$ and O has shape $(H,K,d)$; the maps contribute $4K^2$ parameters per
 layer. There are no configurable input/output scope fields or identity-content arm.
 
-`projected_gradient` requires constant alpha, `predictive_covariance="passthrough"`,
-filtering, and unrolled gradient updates. Its inner mean and covariance learning
-rates are active, so moving from predictive readout requires choosing compatible
-settings and calibrating those rates. Smoothing and `mm_exact` have no supported
+`projected_gradient` requires constant alpha (positive under `channel_likelihood`),
+`predictive_covariance="passthrough"`, `attention_residual=False`, `n_e_steps>=1`,
+`relational_routing="gaussian_kl"`, `family` in {`gaussian_diagonal`, `gaussian_full`},
+filtering, and unrolled updates. Under `euler` its inner mean and covariance learning
+rates are active and need calibration; under `closed_form` they are inert. Smoothing and `mm_exact` have no supported
 executor in the retained architecture.
 
 Serialized retained-mode configurations with historical full/full scopes are accepted
@@ -424,7 +440,8 @@ approximation should remain distinct.
 | Defaults, compatibility, inactive-setting advisories | [`config.py`](vfe3/config.py) |
 | Per-layer interfaces and factorized aggregation | [`relational_operators.py`](vfe3/model/relational_operators.py) |
 | Projected Gaussian scoring | [`relational_scoring.py`](vfe3/relational_scoring.py) |
-| Predictive readout and conditional gradients | [`relational.py`](vfe3/gradients/relational.py) |
+| Projected routing score and predictive readout | [`relational.py`](vfe3/gradients/relational.py) |
+| Full-link receiver laws, gradients and closed-form update | [`full_link.py`](vfe3/gradients/full_link.py) |
 | Gibbs weights and optional objectives | [`free_energy.py`](vfe3/free_energy.py) |
 | Runtime branch selection | [`e_step.py`](vfe3/inference/e_step.py) |
 | Encoding and alternative decoders | [`prior_bank.py`](vfe3/model/prior_bank.py) |
