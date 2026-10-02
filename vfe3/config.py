@@ -184,7 +184,8 @@ class VFE3Config:
     decode_coordinates:        str   = "local"       # "local" | "reference"
 
     decode_tau:                float = 1.0           # KL-to-prior decode temperature; inert under decode_mode="linear"
-    decode_temperature_learned: bool = True          # False freezes decode_log_scale, so tau_eff == decode_tau exactly
+    # decode_log_scale is always frozen, so tau_eff == decode_tau exactly (the learned temperature,
+    # decode_temperature_learned, was retired 2026-10-02).
 
     # Unigram log-prior decode (Bayes-correct class prior): adds kappa*log pi_v to the decode logits,
     # pi_v the corpus unigram frequency -- a fixed DATA statistic, not a learned parameter. train()
@@ -628,10 +629,8 @@ class VFE3Config:
     # permit TF32/bf16x3 reductions.
     fp32_matmul_precision: Optional[str] = "highest"       # None (leave as-is) | "highest" | "high" | "medium"
 
-    # Matrix exponential precision is norm-based. The config threshold is passed explicitly;
-    # low-level geometry helpers retain their separate default threshold of 5.
-    exp_fp64_norm_threshold:   float = 20.0            # upcast when max ||M||_F >= this
-    frame_pair_fp64_escalation: bool = False          # opt-in: redo a frame pair (U, U^-1) in float64 when kappa_F(U) eps32 > 1e-4
+    # Transport matrix-exponential precision is not configurable: every float32 frame pair
+    # (U, U^-1) is certified and redone in float64 when kappa_F(U) eps32 > 1e-4 (2026-10-02).
 
     # Working precision of the FULL-covariance pair KL in the family_chunked decoder (family=
     # "gaussian_full" only). "fp64" is the historical unconditional float64 island.
@@ -662,12 +661,8 @@ class VFE3Config:
     # The noisy-query cost factors per-pair sums G_q + G_k and keeps the Gram route.
     projected_factor_route: str = "gram"     # "gram" | "cholesky_qr2"
 
-    # Scaling of safe_cholesky's jitter ladder. The ridge eps*10^t is ABSOLUTE by default, so at an
-    # eigenvalue on the eps=1e-6 SPD floor the t=0 ridge DOUBLES it and shifts logdet by exactly
-    # log 2 per floored direction, while at sigma_max=100 the same ridge is a 1e-8 relative no-op.
-    # "relative" scales by diagonal_mean(M) so every element gets the same relative perturbation.
-    # The two coincide exactly when diagonal_mean(M) == 1, and the ladder only fires above cond ~1e8.
-    safe_cholesky_jitter_mode: str = "relative"      # "relative" | "absolute"
+    # safe_cholesky's jitter ladder is always RELATIVE (scaled by max(1, |diagonal_mean(M)|)); the
+    # absolute ridge selector safe_cholesky_jitter_mode was retired 2026-10-02.
 
     # Jitter-escalation rounds for the mu-trust-region whitening Cholesky. At 0 (the historical
     # value) one marginally non-PD sigma_q silently drops that belief to a diagonal whitening that is
@@ -684,34 +679,23 @@ class VFE3Config:
     # of magnitude of shrinkage from matter; watch decode_sigma_v_min.
     decode_av_precision: str = "fp64"     # "fp64" | "fp32"
 
-    # Optional fail-closed chart-validity domain for every production transport exponential.
-    # None preserves the existing permissive clamp behavior; a positive finite bound rejects the
-    # raw Lie-algebra matrix before the numerical clamp can silently change the modeled operator.
-    transport_chart_max_norm:  Optional[float] = None
+    # Fail-closed chart radius of every production transport exponential: a raw Lie-algebra matrix
+    # with ||M||_F above it raises ValueError instead of being exponentiated. It is the one domain
+    # radius of the transport; the former surrogate Frobenius clamp (rescale to ||M||_F = 20) is
+    # retired, and 20.0 is that clamp's radius. Applies to every group, so_n included.
+    transport_chart_max_norm:  float = 20.0
 
-    # Optional post-M-step chart guard. AdamW projects rows back along their algebra ray after the
-    # optimizer step. The pullback-group route instead treats this value as an in-optimizer candidate
-    # bound and rejects atomically; when None, that route uses the fixed factor radius 5.0.
+    # Optional post-M-step interior radius, strictly below transport_chart_max_norm when set. AdamW
+    # projects rows back along their algebra ray after the optimizer step. The pullback-group route
+    # instead treats this value as an in-optimizer candidate bound and rejects atomically; when None,
+    # that route uses the fixed factor radius 5.0.
     #
-    # When this is None under m_phi_update_mode='adamw', NOTHING bounds ||phi||: train.py gates the
-    # chart projection on this field being set, and the 'adamw' phi policy registers no manifold
-    # hook. TRANSPORT_CLAMP_MAX_NORM bounds the EXPONENTIATED operator, not the parameter.
-    # Archived runs show phi_matrix_norm_median rising 0.86 -> ~7.4 with vertex_cond_max reaching
-    # ~4e3, and transport conditioning grows with ||phi||; 5.0 (the GL retraction's own radius) is a
-    # reasonable bound. Left at None because it is the shipped default and every value the
-    # pullback_group validator admits (5.0 < bound < 20.0) could hard-abort a run whose observed
-    # ||M||_F already reaches 18. Deliberately NOT a construction warning: the condition is true for
-    # a bare VFE3Config(), and this project keeps a clean config warning-free. Runtime detection
-    # belongs in train.py's _warn_phi_transport_clamp.
+    # When this is None under m_phi_update_mode='adamw', NOTHING bounds ||phi|| in the M-step: train.py
+    # gates the chart projection on this field being set, and the 'adamw' phi policy registers no
+    # manifold hook. A row that drifts past transport_chart_max_norm then aborts the next transport
+    # build (fail-closed). Archived runs show phi_matrix_norm_median rising 0.86 -> ~7.4 with
+    # vertex_cond_max reaching ~4e3, and transport conditioning grows with ||phi||.
     phi_mstep_max_matrix_norm: Optional[float] = None
-
-    # Opt-in transport diagnostic: forward clamp_monitor=True into every production
-    # stable_matrix_exp_pair transport build, emitting a RuntimeWarning EVERY time the hard
-    # Frobenius clamp (TRANSPORT_CLAMP_MAX_NORM = 20.0) fires -- the returned factor is then a
-    # surrogate exp(M*scale), not exp(M). Costs a tensor-reduction host sync per build; keep OFF on
-    # the training hot path. The FIRST occurrence is reported even with this off, so leaving it off
-    # no longer means silence.
-    transport_clamp_monitor:             bool = False
 
     # How many validation batches the held-out val_* probes average over. At 1 -- the historical
     # value, and bit-identical -- EVERY val_* column is a statistic of one fixed 64-token sequence:
@@ -875,13 +859,20 @@ class VFE3Config:
                 "phi_mstep_max_matrix_norm must be None or finite and positive, got "
                 f"{self.phi_mstep_max_matrix_norm}"
             )
-        if self.transport_chart_max_norm is not None and not (
-            math.isfinite(self.transport_chart_max_norm)
-            and self.transport_chart_max_norm > 0.0
-        ):
+        if (isinstance(self.transport_chart_max_norm, bool)
+                or not isinstance(self.transport_chart_max_norm, Real)
+                or not math.isfinite(self.transport_chart_max_norm)
+                or self.transport_chart_max_norm <= 0.0):
             raise ValueError(
-                "transport_chart_max_norm must be None or finite and positive, got "
-                f"{self.transport_chart_max_norm}"
+                "transport_chart_max_norm must be finite and positive, got "
+                f"{self.transport_chart_max_norm!r}"
+            )
+        if (self.phi_mstep_max_matrix_norm is not None
+                and not self.phi_mstep_max_matrix_norm < self.transport_chart_max_norm):
+            raise ValueError(
+                "phi_mstep_max_matrix_norm must be strictly below transport_chart_max_norm (the "
+                "M-step interior radius lies inside the fail-closed transport chart), got "
+                f"{self.phi_mstep_max_matrix_norm} >= {self.transport_chart_max_norm}"
             )
         if self.bch_residual_max is not None and not (
             math.isfinite(self.bch_residual_max) and self.bch_residual_max > 0.0
@@ -1316,10 +1307,6 @@ class VFE3Config:
             raise ValueError(
                 "projected_factor_route must be one of ('gram', 'cholesky_qr2'), "
                 f"got {self.projected_factor_route!r}")
-        if self.safe_cholesky_jitter_mode not in ("absolute", "relative"):
-            raise ValueError(
-                "safe_cholesky_jitter_mode must be one of ('absolute', 'relative'), "
-                f"got {self.safe_cholesky_jitter_mode!r}")
         if self.mu_trust_cholesky_rounds < 0:
             raise ValueError(
                 "mu_trust_cholesky_rounds must be a nonnegative int, got "
@@ -1633,12 +1620,6 @@ class VFE3Config:
         if not math.isfinite(self.unigram_kappa) or self.unigram_kappa < 0.0:
             raise ValueError(
                 f"unigram_kappa must be finite and >= 0, got {self.unigram_kappa}")
-        if (not math.isfinite(self.exp_fp64_norm_threshold)
-                or self.exp_fp64_norm_threshold <= 0.0):
-            raise ValueError(
-                "exp_fp64_norm_threshold must be finite and > 0, got "
-                f"{self.exp_fp64_norm_threshold}"
-            )
         for name in ("sigma_weight_decay", "mu_weight_decay"):
             value = getattr(self, name)
             if value is not None and (not math.isfinite(value) or value < 0.0):
@@ -1818,7 +1799,7 @@ class VFE3Config:
             mark(("m_decode_sigma_lr",), "linear decode has no independent variance table")
             mark(("decode_av_precision", "decode_ranking_fp64_escalation", "decode_ranking_refinement"),
                  "read only by the prior-bank Gaussian KL decoders and their ranking guard")
-            mark(("decode_tau", "decode_temperature_learned"), "read only by the prior-bank KL decode")
+            mark(("decode_tau",), "read only by the prior-bank KL decode")
             mark(("untie_decode_bank",),
                  "read only by the KL-to-bank decode; the linear decode is untied by construction")
         else:
@@ -1843,9 +1824,6 @@ class VFE3Config:
             mark(("full_cov_kl_precision",),
                  "projected scoring has its own factor policy; only the family_chunked decoder "
                  "evaluates the pair divergence")
-        if self.diagonal_covariance:
-            mark(("safe_cholesky_jitter_mode",),
-                 "a diagonal family never factors a dense covariance through safe_cholesky")
         if "e_mu_q_trust" in inactive or self.e_mu_q_trust is None or self.diagonal_covariance:
             mark(("mu_trust_cholesky_rounds",),
                  "only an active mean trust region on a full covariance factors sigma_q")
@@ -1861,13 +1839,6 @@ class VFE3Config:
             mark(("lambda_alpha_mode", "lambda_alpha", "b0", "c0"),
                  "the single gradient E-step iteration starts at q = p, where the self-coupling "
                  "force vanishes")
-        # Every exponentiated block norm is bounded by its frame's chart norm, so the fp64 island
-        # (block norm >= threshold) is unreachable once the threshold exceeds the chart bound.
-        if (self.transport_chart_max_norm is not None
-                and self.exp_fp64_norm_threshold > self.transport_chart_max_norm):
-            mark(("exp_fp64_norm_threshold",),
-                 "transport_chart_max_norm rejects a frame before any block norm reaches this "
-                 "threshold, so the float64 exponential island is unreachable")
         if (self.attention_mode == "projected_predictive" and self.family == "gaussian_full"
                 and self.encode_mode in ("per_token", "per_token_additive")
                 and not self.use_head_mixer
@@ -1983,18 +1954,14 @@ class VFE3Config:
     def _chart_ordering_problem(self) -> Optional[str]:
         r"""Describe a violated manifold-phi chart ordering, or return None when it holds.
 
-        The manifold phi policies need an explicit chart bound strictly between the M-step factor
-        radius and the transport clamp,
-        ``phi_mstep_max_matrix_norm (or 5.0) < transport_chart_max_norm < TRANSPORT_CLAMP_MAX_NORM``.
+        The manifold phi policies need the M-step factor radius strictly inside the transport chart,
+        ``phi_mstep_max_matrix_norm (or 5.0) < transport_chart_max_norm``.
         """
-        from vfe3.geometry.transport import TRANSPORT_CLAMP_MAX_NORM
         factor_radius = (self.phi_mstep_max_matrix_norm
                          if self.phi_mstep_max_matrix_norm is not None else 5.0)
-        if (self.transport_chart_max_norm is not None
-                and factor_radius < self.transport_chart_max_norm < TRANSPORT_CLAMP_MAX_NORM):
+        if factor_radius < self.transport_chart_max_norm:
             return None
-        return (f"an explicit transport_chart_max_norm satisfying {factor_radius} < "
-                f"transport_chart_max_norm < {TRANSPORT_CLAMP_MAX_NORM}; got "
+        return (f"a transport_chart_max_norm above the factor radius {factor_radius}; got "
                 f"{self.transport_chart_max_norm!r}")
 
 
@@ -2017,10 +1984,16 @@ _RETIRED_PINNED_FIELDS: Mapping[str, object] = {
 _RETIRED_INERT_FIELDS = frozenset({
     "mm_damping", "full_cov_kl_backend", "full_cov_congruence_precision",
     "full_cov_congruence_certification", "congruence_cond_escalation", "rope_full_gauge",
+    # 2026-10-02 transport-exponential unification: the clamp monitor watched the retired clamp;
+    # the norm threshold changed only the interior precision of float32-stored exponentials; the
+    # frame-pair escalation is unconditional, and a saved False only lacked the float64 rebuild of
+    # pairs whose float32 certificate failed.
+    "transport_clamp_monitor", "exp_fp64_norm_threshold", "frame_pair_fp64_escalation",
 })
 # Retired fields with a config-dependent rule in _migrate_retired_fields.
 _RETIRED_CONDITIONAL_FIELDS = frozenset({
     "cross_couplings", "mu_trust_mode", "e_step_mu_precond", "m_decode_lr", "_allow_legacy_dense_decode",
+    "decode_temperature_learned", "safe_cholesky_jitter_mode",
 })
 # Every serialized key config_from_serialized migrates or refuses that is not a VFE3Config field.
 RETIRED_CONFIG_KEYS = frozenset(
@@ -2096,8 +2069,9 @@ def _migrate_retired_fields(
     if "m_decode_lr" in payload:
         rate = payload.pop("m_decode_lr")
         if rate is not None:
+            # Historical default: the decode temperature was learned unless the run froze it.
             learned = _normalize_serialized_boolean(
-                payload.get("decode_temperature_learned", VFE3Config.decode_temperature_learned),
+                payload.get("decode_temperature_learned", True),
                 "decode_temperature_learned", source=source)
             linear = payload.get("decode_mode", VFE3Config.decode_mode) == "linear"
             if learned and not linear:
@@ -2107,11 +2081,33 @@ def _migrate_retired_fields(
                 if payload.get(name) is None:
                     payload[name] = rate
 
+    if "transport_chart_max_norm" in payload and payload["transport_chart_max_norm"] is None:
+        # The chart radius is required since 2026-10-02. None meant "no fail-closed bound, only the
+        # surrogate clamp at 20"; it loads as the clamp's radius, so a frame the clamp would have
+        # rescaled now raises instead.
+        payload["transport_chart_max_norm"] = VFE3Config.transport_chart_max_norm
     family = payload.get("family")
     if isinstance(family, str):
         if family in _RETIRED_FAMILIES:
             refuse("family", family)
         payload["family"] = _MIGRATED_FAMILIES.get(family, family)
+    if "decode_temperature_learned" in payload:
+        # Either value loads: decode_log_scale is restored from the weights and then held frozen, so
+        # evaluation replays the saved temperature exactly. Resuming the optimizer of a run that
+        # actually stepped the temperature is refused in run_artifacts.load_checkpoint.
+        _normalize_serialized_boolean(
+            payload.pop("decode_temperature_learned"), "decode_temperature_learned", source=source)
+    if "safe_cholesky_jitter_mode" in payload:
+        value = payload.pop("safe_cholesky_jitter_mode")
+        if value != "relative":
+            from vfe3.divergence import family_cov_kind
+            try:
+                diagonal = family_cov_kind(payload.get("family", VFE3Config.family)) == "diagonal"
+            except Exception:
+                diagonal = False
+            if not diagonal:
+                refuse("safe_cholesky_jitter_mode", value,
+                       " (safe_cholesky's ridge is relative; only a diagonal family was inert to it)")
     encode_mode = payload.get("encode_mode")
     if isinstance(encode_mode, str) and encode_mode in _RETIRED_ENCODE_MODES:
         refuse("encode_mode", encode_mode)

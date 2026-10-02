@@ -80,8 +80,7 @@ class GaugeGroup:
     irrep_dims:           List[int]                          # block sizes; sum == K
     # NOT a transpose-for-inverse fast path: no such path exists (audit 2026-07-25 F21). Every
     # inverse routes through _checked_group_inverse's float64 solve. What this flag actually gates:
-    # max_norm=inf on the exp clamp (exp of a skew matrix is orthogonal at any norm), the
-    # float64-island key, and retraction defaults.
+    # retraction defaults. (The transport chart radius applies to skew groups as well.)
     skew_symmetric:       bool                               # algebra is skew (exp lands in O(K))
     pullback_capability:  Optional[str]          = None      # certified strict M-step route, if any
     invariant_families:   Tuple[str, ...]        = ()        # registry-declared exact families; empty fails closed

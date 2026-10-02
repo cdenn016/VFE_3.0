@@ -17,7 +17,7 @@ from vfe3.model.model import VFEModel
 from vfe3.train import _floor_lr_lambdas, build_optimizer
 
 
-def test_independent_split_rates_keep_encoder_and_temperature_rates() -> None:
+def test_independent_split_rates_keep_encoder_rates_and_leave_temperature_frozen() -> None:
     cfg = _config(untie_decode_bank=True, m_decode_mu_lr=0.137, m_decode_sigma_lr=0.061,
                   m_p_mu_lr=0.023, m_p_sigma_lr=0.004)
     model = VFEModel(cfg)
@@ -26,7 +26,7 @@ def test_independent_split_rates_keep_encoder_and_temperature_rates() -> None:
     assert groups["prior_bank.sigma_log_embed"]["lr"] == 0.004
     assert groups["prior_bank.decode_mu_embed"]["lr"] == 0.137
     assert groups["prior_bank.decode_sigma_log_embed"]["lr"] == 0.061
-    assert groups["prior_bank.decode_log_scale"]["lr"] == 0.004
+    assert "prior_bank.decode_log_scale" not in groups                # frozen, never grouped
 
 
 @pytest.mark.parametrize("mu_rate,sigma_rate", [(None, None), (0.0, 0.0),
@@ -82,8 +82,7 @@ def test_omitted_split_rates_preserve_group_topology_and_parameter_bytes(
                  group["lr"], group["role"], group["weight_decay"], group.get("lr_report_role"))
                 for group in optimizer.param_groups]
     expected = [(("prior_bank.mu_embed",), 0.025, "mu", 0.05, "mu"),
-                (("prior_bank.sigma_log_embed", "prior_bank.decode_log_scale"),
-                 0.0025, "sigma", 0.05, "sigma"),
+                (("prior_bank.sigma_log_embed",), 0.0025, "sigma", 0.05, "sigma"),
                 (("prior_bank.phi_embed",), 0.015, "phi", 0.065, "phi")]
     if mode == "linear":
         expected += [(("prior_bank.output_proj_weight",), 0.025, "mu", 0.05, None),
@@ -109,16 +108,15 @@ def test_omitted_split_rates_preserve_group_topology_and_parameter_bytes(
         assert torch.equal(parameter, explicit.state_dict()[name])
 
 
-@pytest.mark.parametrize("mu_rate,sigma_rate,want_mu,want_sigma,want_temperature", [
-    (0.137, 0.061, 0.137, 0.061, 0.004),
-    (0.137, None, 0.137, 0.004, 0.004),
-    (None, 0.061, 0.023, 0.061, 0.004),
-    (None, None, 0.023, 0.004, 0.004),
+@pytest.mark.parametrize("mu_rate,sigma_rate,want_mu,want_sigma", [
+    (0.137, 0.061, 0.137, 0.061),
+    (0.137, None, 0.137, 0.004),
+    (None, 0.061, 0.023, 0.061),
+    (None, None, 0.023, 0.004),
 ])
 def test_untied_split_rates_follow_independent_precedence_and_preserve_other_roles(
     want_mu:          float,
     want_sigma:       float,
-    want_temperature: float,
     mu_rate:          Optional[float],
     sigma_rate:       Optional[float],
 ) -> None:
@@ -135,12 +133,12 @@ def test_untied_split_rates_follow_independent_precedence_and_preserve_other_rol
         "prior_bank.phi_embed": (0.013, "phi", 0.11),
         "prior_bank.decode_mu_embed": (want_mu, "mu", 0.07),
         "prior_bank.decode_sigma_log_embed": (want_sigma, "sigma", 0.09),
-        "prior_bank.decode_log_scale": (want_temperature, "sigma", 0.09),
         "prior_bank.head_evidence_logits": (0.081, "mu", 0.0),
     }
     for name, values in expected.items():
         group = groups[name]
         assert (group["lr"], group["role"], group["weight_decay"]) == values
+    assert "prior_bank.decode_log_scale" not in groups                # frozen, never grouped
 
 
 @pytest.mark.parametrize("mode", ["diagonal_chunked", "full_chunked"])
@@ -151,7 +149,7 @@ def test_tied_tables_keep_encoder_rates_when_both_split_overrides_are_explicit(m
     groups = _groups(model, build_optimizer(model, cfg))
     assert groups["prior_bank.mu_embed"]["lr"] == 0.023
     assert groups["prior_bank.sigma_log_embed"]["lr"] == 0.004
-    assert groups["prior_bank.decode_log_scale"]["lr"] == 0.004
+    assert "prior_bank.decode_log_scale" not in groups                # frozen, never grouped
     assert "prior_bank.decode_mu_embed" not in groups
     assert "prior_bank.decode_sigma_log_embed" not in groups
 
@@ -168,9 +166,7 @@ def test_linear_readout_uses_mean_override_and_ignores_covariance_override(
     groups = _groups(model, build_optimizer(model, cfg))
     assert groups["prior_bank.mu_embed"]["lr"] == 0.023
     assert groups["prior_bank.sigma_log_embed"]["lr"] == 0.004
-    assert groups["prior_bank.decode_log_scale"]["lr"] == 0.004
-    assert groups["prior_bank.decode_log_scale"]["role"] == "sigma"
-    assert groups["prior_bank.decode_log_scale"]["weight_decay"] == 0.09
+    assert "prior_bank.decode_log_scale" not in groups                # frozen, never grouped
     for name, decay in (("prior_bank.output_proj_weight", 0.07),
                         ("prior_bank.output_proj_bias", 0.0)):
         group = groups[name]
@@ -208,12 +204,11 @@ def test_explicit_zero_split_rate_stays_frozen_under_schedule(
     assert not torch.equal(parameters[live_name], initial[live_name])
     assert not torch.equal(parameters["prior_bank.mu_embed"], initial["prior_bank.mu_embed"])
     assert not torch.equal(parameters["prior_bank.sigma_log_embed"], initial["prior_bank.sigma_log_embed"])
-    assert not torch.equal(parameters["prior_bank.decode_log_scale"], initial["prior_bank.decode_log_scale"])
+    assert torch.equal(parameters["prior_bank.decode_log_scale"], initial["prior_bank.decode_log_scale"])
 
 
 def test_split_rates_keep_frozen_temperature_out_of_optimizer() -> None:
-    cfg = _config(untie_decode_bank=True, m_decode_mu_lr=0.137, m_decode_sigma_lr=0.061,
-                  decode_temperature_learned=False)
+    cfg = _config(untie_decode_bank=True, m_decode_mu_lr=0.137, m_decode_sigma_lr=0.061)
     model = VFEModel(cfg)
     groups = _groups(model, build_optimizer(model, cfg))
     assert groups["prior_bank.decode_mu_embed"]["lr"] == 0.137

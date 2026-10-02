@@ -183,7 +183,6 @@ SINGLE_ATTENTION_config_K100 = dict(
 
     m_phi_update_mode         = "adamw",      # "adamw" | "pullback_group"
     transport_chart_max_norm  = None,
-    transport_clamp_monitor   = False,
     phi_mstep_max_matrix_norm = 12,
 
     m_phi_group_trust_radius  = 0.1,          # embedded Frobenius bound on the group factor
@@ -409,7 +408,6 @@ SINGLE_ATTENTION_config_K100 = dict(
 
      # --- compute reclamation (exactness-preserving perf; default OFF) ---
      exp_fp64_mode             = "norm",       # "dim" | "norm"
-     exp_fp64_norm_threshold   = 15.0,        # "norm" mode threshold
     
      share_refine_s_transport  = True,        # build the flat transport ONCE per forward
      compile_pair_kernel       = False,       # torch.compile the closed-form pair kernel
@@ -425,7 +423,6 @@ SINGLE_ATTENTION_config_K100 = dict(
 
      full_cov_kl_precision                = "fp32_escalate",  # "fp64" | "fp32_escalate"
 
-     safe_cholesky_jitter_mode            = "relative",  #"absolute" | "relative"
      mu_trust_cholesky_rounds             = 3,           
 
      
@@ -733,12 +730,10 @@ SINGLE_ATTN_CONFIG_k20 = dict(
     grad_clip_per_role                   = True,        # clip grads per role (mu/sigma/phi) instead of one global norm
     
     exp_fp64_mode                        = "norm",        # "dim" | "norm" norm ~1.5x faster at K=80
-    exp_fp64_norm_threshold              = 20.0,          # "norm" mode threshold
     transport_chart_max_norm             = 20,
 
     full_cov_kl_precision                = "fp32_escalate",  # "fp64" | "fp32_escalate"
 
-    safe_cholesky_jitter_mode            = "relative",        #"absolute" | "relative"
     mu_trust_cholesky_rounds             = 3,           
 
 
@@ -770,7 +765,6 @@ SINGLE_ATTN_CONFIG_k20 = dict(
     compile_pair_kernel                  = False,       # torch.compile the closed-form pair kernel 
     
     check_parameter_motion               = True,
-    transport_clamp_monitor              = True,
     evaluate_zero_e_steps_counterfactual = True,
     generate_embedding_figures           = False,
 )
@@ -866,7 +860,6 @@ DIAGONAL_Dual_atten_config = dict(
 
     m_phi_update_mode         = "adamw",      # "adamw" | "pullback_group"
     transport_chart_max_norm  = None,
-    transport_clamp_monitor   = False,
     phi_mstep_max_matrix_norm = 12,
 
     m_phi_group_trust_radius  = 0.1,          # embedded Frobenius bound on the group factor
@@ -1087,7 +1080,6 @@ DIAGONAL_Dual_atten_config = dict(
 
      # --- compute reclamation (exactness-preserving perf; default OFF) ---
      exp_fp64_mode             = "dim",       # "dim" | "norm"
-     exp_fp64_norm_threshold   = 15.0,        # "norm" mode threshold
     
      share_refine_s_transport  = True,        # build the flat transport ONCE per forward
      compile_pair_kernel       = False,       # torch.compile the closed-form pair kernel
@@ -1107,7 +1099,6 @@ DIAGONAL_Dual_atten_config = dict(
 
      full_cov_kl_precision                = "fp32_escalate",  # "fp64" | "fp32_escalate"
 
-     safe_cholesky_jitter_mode            = "relative",  #"absolute" | "relative"
      mu_trust_cholesky_rounds             = 3,           
 
      
@@ -1515,7 +1506,6 @@ SO(N)_config = dict(
      exp_fp64_mode             = "dim",       # "dim" (long-standing: fp64 when block dim >= 20) | "norm" (fp64 only
                                               # when clamped ||M||_F >= exp_fp64_norm_threshold; d_head=25 blocks
                                               # currently run fp64 PERMANENTLY under "dim")
-     exp_fp64_norm_threshold   = 15.0,        # "norm" mode threshold
      share_refine_s_transport  = True,        # build the flat transport ONCE per forward, share s-refine + belief
                                               # E-step (+ all layers); valid on flat/e_phi_lr=0/no-rope configs
      compile_pair_kernel       = False,       # torch.compile the closed-form pair kernel (eager fallback + warn)
@@ -1529,7 +1519,6 @@ SO(N)_config = dict(
                                               # <=2e-4 on adversarial synthetic spectra, 4e-6 on real trained ones.
                                               
 
-     safe_cholesky_jitter_mode     = "relative",      # "absolute" | "relative"
      mu_trust_cholesky_rounds = 3,
 
      emit_expensive_diagnostics           = True,    
@@ -1843,13 +1832,11 @@ FULL_GAUSSIAN_config = dict(
     grad_clip_per_role                   = True,        # clip grads per role (mu/sigma/phi) instead of one global norm
     
     exp_fp64_mode                        = "dim",        # "dim" | "norm" norm ~1.5x faster at K=80
-    exp_fp64_norm_threshold              = 15.0,          # "norm" mode threshold
     transport_chart_max_norm             = None,
 
    
     full_cov_kl_precision                = "fp32_escalate",  # "fp64" | "fp32_escalate"
 
-    safe_cholesky_jitter_mode            = "relative",        #"absolute" | "relative"
     mu_trust_cholesky_rounds             = 3,           
 
 
@@ -1880,7 +1867,6 @@ FULL_GAUSSIAN_config = dict(
     compile_pair_kernel                  = False,       # torch.compile the closed-form pair kernel 
     
     check_parameter_motion               = True,
-    transport_clamp_monitor              = True,
     evaluate_zero_e_steps_counterfactual = True,
     generate_embedding_figures           = False,
 )

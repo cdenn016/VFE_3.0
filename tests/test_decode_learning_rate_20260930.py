@@ -18,7 +18,7 @@ def _config(**overrides: Any) -> VFE3Config:
     values = dict(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=3,
                   n_layers=1, n_e_steps=1, use_block_mlp=False, pos_phi="none",
                   norm_type_block="none", norm_type_final="none", layernorm_affine=False,
-                  decode_mode="diagonal_chunked", decode_temperature_learned=True)
+                  decode_mode="diagonal_chunked")
     values.update(overrides)
     if values["decode_mode"] == "full_chunked":
         values["family"] = "gaussian_full"
@@ -53,8 +53,7 @@ def test_default_preserves_historical_group_topology_and_parameter_bytes(
                  group["lr"], group["role"], group["weight_decay"], group.get("lr_report_role"))
                 for group in optimizer.param_groups]
     expected = [(("prior_bank.mu_embed",), 0.025, "mu", 0.05, "mu"),
-                (("prior_bank.sigma_log_embed", "prior_bank.decode_log_scale"),
-                 0.0025, "sigma", 0.05, "sigma"),
+                (("prior_bank.sigma_log_embed",), 0.0025, "sigma", 0.05, "sigma"),
                 (("prior_bank.phi_embed",), 0.015, "phi", 0.065, "phi")]
     expected += ([(("prior_bank.output_proj_weight",), 0.025, "mu", 0.05, None),
                   (("prior_bank.output_proj_bias",), 0.025, "mu", 0.0, None)]
@@ -83,7 +82,7 @@ def test_default_preserves_historical_group_topology_and_parameter_bytes(
 def test_decoder_override_keeps_head_evidence_dedicated_rate_and_temperature_freeze() -> None:
     cfg = _config(untie_decode_bank=True, m_decode_mu_lr=0.137, m_decode_sigma_lr=0.137,
                   m_head_evidence_lr=0.081,
-                  use_priorbank_head_evidence_mixer=True, decode_temperature_learned=False)
+                  use_priorbank_head_evidence_mixer=True)
     model = VFEModel(cfg)
     groups = _groups(model, build_optimizer(model, cfg))
     assert groups["prior_bank.head_evidence_logits"]["lr"] == 0.081

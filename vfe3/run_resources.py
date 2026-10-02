@@ -18,8 +18,8 @@ A conventional-transformer baseline (``cfg.model_family == 'conventional_transfo
 classified by :func:`vfe3.baseline.baseline_parameter_role` into the same sections and role names.
 
 Parameters frozen by design (``requires_grad=False``: the token and positional frames under
-``gauge_transport='off'`` or ``'frozen'``, ``decode_log_scale`` under
-``decode_temperature_learned=False``) are constants of the run, not trained parameters: they are
+``gauge_transport='off'`` or ``'frozen'``, and ``decode_log_scale`` unless a historical run record
+carries ``decode_temperature_learned=True``) are constants of the run, not trained parameters: they are
 listed in the separate ``frozen`` section and excluded from the four sections, ``total`` and the
 parameters read per token (``total_including_frozen`` adds them back).
 
@@ -163,7 +163,8 @@ def frozen_parameter_names(
 
     For a state dict, whose tensors carry no ``requires_grad``, this reproduces what the built model
     freezes: ``prior_bank.phi_embed`` and ``pos_phi_free`` under ``gauge_transport`` ``'off'`` or
-    ``'frozen'``, and ``prior_bank.decode_log_scale`` under ``decode_temperature_learned=False``. The
+    ``'frozen'``, and ``prior_bank.decode_log_scale`` unless ``cfg`` is a historical record carrying the
+    retired ``decode_temperature_learned=True`` (the temperature was trained then). The
     conventional-transformer baseline freezes nothing. ``cfg`` may be a config, a namespace or a
     serialized mapping; returned names are canonical (wrapper prefixes stripped).
     """
@@ -172,7 +173,7 @@ def frozen_parameter_names(
     wanted = set()
     if _cfg_value(cfg, "gauge_transport", "on") in ("off", "frozen"):
         wanted |= {"prior_bank.phi_embed", "pos_phi_free"}
-    if _cfg_value(cfg, "decode_temperature_learned", True) is False:
+    if _cfg_value(cfg, "decode_temperature_learned", False) is not True:
         wanted.add("prior_bank.decode_log_scale")
     return [canonical_name(name) for name in names if canonical_name(name) in wanted]
 

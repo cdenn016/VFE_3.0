@@ -100,19 +100,19 @@ def test_estep_fuses_flat_block_glk_to_factored_container():
     assert isinstance(out, FactoredTransport)
 
 
-def test_flat_builders_forward_norm_threshold_and_block_layout(monkeypatch):
-    # Both flat builders preserve the caller's norm threshold and gauge block layout.
+def test_flat_builders_forward_chart_radius_and_block_layout(monkeypatch):
+    # Both flat builders preserve the caller's chart radius and gauge block layout.
     import vfe3.geometry.transport as T
     calls = []
     orig = T.stable_matrix_exp_pair
     def spy(matrix, **kw):
-        calls.append((kw.get("exp_fp64_norm_threshold"), kw.get("block_dims")))
+        calls.append((kw.get("validity_max_norm"), kw.get("block_dims")))
         return orig(matrix, **kw)
     monkeypatch.setattr(T, "stable_matrix_exp_pair", spy)
     grp, phi, _, _ = _transport_inputs()
-    T.build_factored_transport(phi, grp, exp_fp64_norm_threshold=3.0)
-    compute_transport_operators(phi, grp, exp_fp64_norm_threshold=3.0)
-    assert calls == [(3.0, [4, 4]), (3.0, [4, 4])]
+    T.build_factored_transport(phi, grp, validity_max_norm=13.0)
+    compute_transport_operators(phi, grp, validity_max_norm=13.0)
+    assert calls == [(13.0, [4, 4]), (13.0, [4, 4])]
 
 
 def test_compose_bch_blocked_matches_dense():

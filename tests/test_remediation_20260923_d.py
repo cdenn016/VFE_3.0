@@ -8,7 +8,6 @@ import csv
 import inspect
 import json
 import math
-import warnings
 from pathlib import Path
 
 import pytest
@@ -54,10 +53,9 @@ def _sequential_loader(seq_len: int = 8, batch_size: int = 4, n: int = 105,
 
 # ---- #2 decode temperature ------------------------------------------------------------------
 
-def test_decode_temperature_learned_false_freezes_scale_and_keeps_its_name() -> None:
+def test_decode_temperature_is_always_frozen_and_keeps_its_name() -> None:
     torch.manual_seed(0)
-    cfg = _tiny(decode_mode="diagonal_chunked", decode_bias=False, decode_tau=0.5,
-                decode_temperature_learned=False)
+    cfg = _tiny(decode_mode="diagonal_chunked", decode_bias=False, decode_tau=0.5)
     model = VFEModel(cfg)
     scale = model.prior_bank.decode_log_scale
     assert "prior_bank.decode_log_scale" in model.state_dict()
@@ -70,22 +68,6 @@ def test_decode_temperature_learned_false_freezes_scale_and_keeps_its_name() -> 
     loss.backward()
     assert scale.grad is None
     assert float(model.prior_bank._tau_eff()) == pytest.approx(0.5, abs=0.0)
-
-
-def test_decode_temperature_learned_true_keeps_the_learned_scale() -> None:
-    cfg = _tiny(decode_mode="diagonal_chunked", decode_bias=False,
-                decode_temperature_learned=True)
-    assert cfg.decode_temperature_learned is True
-    model = VFEModel(cfg)
-    optimizer = build_optimizer(model, cfg)
-    sigma_groups = [group for group in optimizer.param_groups if group.get("role") == "sigma"]
-    assert any(parameter is model.prior_bank.decode_log_scale
-               for group in sigma_groups for parameter in group["params"])
-
-
-def test_frozen_decode_temperature_is_inert_under_linear_decode() -> None:
-    cfg = _tiny(decode_mode="linear", decode_temperature_learned=False)
-    assert "decode_temperature_learned" in cfg.inactive_fields()
 
 
 # ---- #4 decode GEMM precision ---------------------------------------------------------------
@@ -430,25 +412,6 @@ def test_module_init_streams_are_distinct_and_deterministic() -> None:
         _derived_seed(6, "relational_operators", 0)))
     replay = six.pos_phi_free.detach().flatten()[:raw.numel()] / six.cfg.pos_phi_scale
     assert not torch.allclose(replay, raw.flatten())
-
-
-# ---- Low: chart-bound early warning on the AdamW route --------------------------------------
-
-def test_phi_clamp_warning_trips_at_the_chart_bound(monkeypatch: pytest.MonkeyPatch) -> None:
-    model = VFEModel(_tiny(transport_chart_max_norm=0.5))
-    with torch.no_grad():
-        model.prior_bank.phi_embed.fill_(0.5)                   # embedded ||M||_F ~ 1.4 < 20
-    monkeypatch.setattr(train_module, "_PHI_CLAMP_WARNED", False)
-    with pytest.warns(RuntimeWarning, match="transport_chart_max_norm=0.5"):
-        train_module._warn_phi_transport_clamp(model)
-
-    unbounded = VFEModel(_tiny())
-    with torch.no_grad():
-        unbounded.prior_bank.phi_embed.fill_(0.5)
-    monkeypatch.setattr(train_module, "_PHI_CLAMP_WARNED", False)
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", RuntimeWarning)
-        train_module._warn_phi_transport_clamp(unbounded)      # below the clamp: silent
 
 
 # ---- Low: cumulative realized budget after a resume -----------------------------------------

@@ -113,7 +113,7 @@ def test_dense_transport_preserves_factor_precision_under_autocast(compact: bool
 def test_repaired_cholesky_has_finite_correct_derivative() -> None:
     from vfe3.numerics import safe_cholesky
     M = torch.tensor([[0., 0.], [0., 1.]], dtype=torch.float64, requires_grad=True)
-    L, ok = safe_cholesky(M, rounds=2, jitter_mode='absolute')
+    L, ok = safe_cholesky(M, rounds=2)
     assert ok
     derivative, = torch.autograd.grad(L.square().sum(), M)
     torch.testing.assert_close(derivative, torch.eye(2, dtype=M.dtype), rtol=1e-8, atol=1e-8)
@@ -131,7 +131,7 @@ def test_cholesky_recovery_directional_derivative_matches_finite_difference() ->
     M = torch.diag(torch.tensor([1., 0.], dtype=torch.float64)).requires_grad_()
     direction = torch.tensor([[0., 1.], [1., 0.]], dtype=M.dtype)
     def value(matrix: torch.Tensor) -> torch.Tensor:
-        return safe_cholesky(matrix, rounds=3, jitter_mode="absolute")[0].sum()
+        return safe_cholesky(matrix, rounds=3)[0].sum()
     gradient, = torch.autograd.grad(value(M), M)
     step = 1e-7
     finite_difference = (value(M.detach()+step*direction)-value(M.detach()-step*direction))/(2*step)

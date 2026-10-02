@@ -44,8 +44,7 @@ def _projected_surface(**overrides: object) -> dict:
         beta_attention_prior="causal",
         fp32_matmul_precision=None, decode_av_precision="fp32",
         decode_ranking_fp64_escalation=False,
-        e_mu_q_trust=None, exp_fp64_norm_threshold=15.0,
-        transport_clamp_monitor=False, generate_embedding_figures=False,
+        e_mu_q_trust=None, generate_embedding_figures=False,
         warmup_steps=0, max_steps=2, log_interval=0, eval_interval=0,
     )
     values.update(overrides)

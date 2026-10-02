@@ -16,7 +16,7 @@ from vfe3.geometry.groups import GaugeGroup, get_group
 from vfe3.geometry.transport import build_factored_transport, CompactFactoredTransport
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import collect_phi_numerics, _cost_model_fields
-from vfe3.train import build_optimizer, lr_lambda, train_step, _warn_phi_transport_clamp
+from vfe3.train import build_optimizer, lr_lambda, train_step
 
 
 @pytest.fixture(autouse=True)
@@ -135,8 +135,7 @@ def test_dense_autograd_and_compact_transport_finite_difference() -> None:
     weights = torch.randn(1, 2, 2, 2, 2, dtype=torch.float64)
     def objective(coords: torch.Tensor) -> torch.Tensor:
         return (build_factored_transport(
-            coords, group, compact_blocks=True,
-            exp_fp64_norm_threshold=0.0).exp_blocks * weights).sum()
+            coords, group, compact_blocks=True).exp_blocks * weights).sum()
     gradient, = torch.autograd.grad(objective(phi), phi)
     direction = torch.randn_like(phi)
     delta = 1e-5
@@ -173,7 +172,6 @@ def test_complete_training_projection_and_reports_remain_lazy(layers: int,
         train_step(model, optimizer, scheduler, tokens, targets, metrics_out={}, status_out=status)
         assert status["did_step"]
     project_phi_parameter_rows_(model, 12.0)
-    _warn_phi_transport_clamp(model)
     diagnostics = model.diagnostics(tokens)
     assert "phi_matrix_norm_max" in diagnostics
     model.diagnostics_per_layer(tokens)

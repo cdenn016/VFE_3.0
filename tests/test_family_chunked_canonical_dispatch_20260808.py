@@ -113,7 +113,6 @@ def _loss_and_grads(pb, mu, sigma, targets):
         sigma.grad.detach().clone(),
         pb.decode_mu_embed.grad.detach().clone(),
         pb.decode_sigma_log_embed.grad.detach().clone(),
-        pb.decode_log_scale.grad.detach().clone(),
     ]
 
 
@@ -135,7 +134,6 @@ def test_canonical_fused_ce_and_all_decode_gradients_are_exactly_full_chunked():
         sigma_full.grad.detach().clone(),
         pb.decode_mu_embed.grad.detach().clone(),
         pb.decode_sigma_log_embed.grad.detach().clone(),
-        pb.decode_log_scale.grad.detach().clone(),
     ]
 
     assert torch.equal(family_loss, full_loss.detach())
@@ -165,7 +163,7 @@ def test_canonical_registered_logits_match_full_once_biased_and_backward():
     assert mu.grad is not None and torch.isfinite(mu.grad).all()
     assert family_pb.decode_mu_embed.grad is not None
     assert family_pb.decode_sigma_log_embed.grad is not None
-    assert family_pb.decode_log_scale.grad is not None
+    assert family_pb.decode_log_scale.grad is None              # VFEModel freezes the temperature
 
 
 def test_canonical_dispatch_has_no_pair_grid_solves_but_generic_renyi_does(monkeypatch):

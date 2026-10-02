@@ -111,7 +111,8 @@ def test_default_adamw_one_step_matches_direct_torch_optimizer() -> None:
     loss = train_step(production, optimizer, scheduler, tokens, targets, grad_clip=1.0)
 
     assert loss == float(reference_loss.detach())
-    assert parameter_names.keys() == {id(p) for g in optimizer.param_groups for p in g["params"]}
+    trainable = {id(p) for p in production.parameters() if p.requires_grad}
+    assert trainable == {id(p) for g in optimizer.param_groups for p in g["params"]}
     for name, value in production.named_parameters():
         torch.testing.assert_close(value, oracle_parameters[name], rtol=0.0, atol=0.0)
     for state in optimizer.state.values():

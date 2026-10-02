@@ -41,10 +41,8 @@ from vfe3.gauge_optim import (
     FISHER_DIAGNOSTIC_KEYS,
     GROUP_LOG_DIAGNOSTIC_KEYS,
     GaugeManifoldAdamW,
-    embedded_phi_frobenius_norm,
     get_phi_update_policy,
     group_log_block_shape,
-    phi_projection_chunk_rows,
     project_phi_parameter_rows_,
 )
 from vfe3.geometry.phi_fisher import FisherRowStatistics, middle_fiber_moments, pooled_pos_operator
@@ -58,7 +56,6 @@ from vfe3.run_artifacts import RunArtifacts          # top-level safe: run_artif
 from vfe3.runtime import seed_everything
 from vfe3.timing import TrainingTimer
 from vfe3.viz.extract import e_step_belief_trace as _snapshot_trace
-from vfe3.geometry.transport import TRANSPORT_CLAMP_MAX_NORM   # single source for the phi-clamp threshold (M2)
 from vfe3.geometry.retraction import (                          # SPD-retraction non-finite tangent guard
     nonfinite_tangent_elements,
     reset_nonfinite_tangent_elements,
@@ -77,7 +74,6 @@ from vfe3.geometry.transport import (                           # float64 frame-
 )
 
 
-_PHI_CLAMP_WARNED:   bool = False
 _SUCCESSFUL_UPDATES_KEY = "successful_updates"
 def _successful_update_count(
     optimizer: torch.optim.Optimizer,
@@ -116,77 +112,6 @@ def _set_successful_update_count(
         raise ValueError("successful-update count must be a non-negative integer")
     for group in optimizer.param_groups:
         group[_SUCCESSFUL_UPDATES_KEY] = count
-
-
-def _warn_phi_transport_clamp(
-    model:    VFEModel,
-
-    max_norm: float = TRANSPORT_CLAMP_MAX_NORM,   # single source: stable_matrix_exp_pair's Frobenius clamp
-) -> None:
-    r"""Warn once per channel when a gauge-frame table exceeds the transport clamp or chart bound.
-
-    ``stable_matrix_exp_pair`` rescales any ``||M||_F > max_norm`` (the shared transport-clamp
-    default) and returns the surrogate ``exp(max_norm * M/||M||_F)``, NOT ``exp(M)``; its per-call
-    monitor is opt-in because
-    it costs a host sync on the E-step hot path. The M-step, however, steps ``phi_embed`` /
-    ``pos_phi_free`` under plain AdamW with no configured projection, so a drifting
-    row silently enters the surrogate regime (audit 2026-07-05 m8). This check runs only on
-    log/eval-cadence steps (off the hot path) and shares the exact norm kernel used by the projected
-    M-step. Certified orthogonal bases use their diagonal Gram; uncertified custom bases use the
-    dense exact fallback in bounded chunks.
-
-    When ``cfg.transport_chart_max_norm`` is set, the transport build RAISES (fail-closed) for any
-    frame above it, which aborts training; the warning therefore trips at
-    :math:`\min(\text{max\_norm}, \text{transport\_chart\_max\_norm})`, the first bound a drifting
-    row actually meets.
-    """
-    global _PHI_CLAMP_WARNED
-    chart_max_norm = getattr(getattr(model, "cfg", None), "transport_chart_max_norm", None)
-    threshold = max_norm if chart_max_norm is None else min(max_norm, float(chart_max_norm))
-    chart_binds = threshold < max_norm
-    tables = [("belief.phi_embed", getattr(model.prior_bank, "phi_embed", None)),
-              ("belief.pos_phi_free", getattr(model, "pos_phi_free", None))]
-    with torch.no_grad():
-        for name, tab in tables:
-            if tab is None:
-                continue
-            if _PHI_CLAMP_WARNED:
-                continue
-            phi = tab.reshape(-1, tab.shape[-1])
-            route = getattr(model.group, "phi_norm_route", lambda: "dense_fallback")()
-            chunk_rows = phi_projection_chunk_rows(
-                phi.shape[-1],
-                model.group.generator_shape[-1],
-                phi.element_size(),
-                dense_fallback=route == "dense_fallback",
-            )
-            norm_max = torch.zeros((), device=phi.device, dtype=phi.dtype)
-            for start in range(0, phi.shape[0], chunk_rows):
-                norm = embedded_phi_frobenius_norm(
-                    phi[start:start + chunk_rows],
-                    model.group,
-                    warn_fallback=False,
-                )
-                norm_max.copy_(torch.maximum(norm_max, norm.max()))
-            if bool(norm_max > threshold):             # host sync: log-cadence only
-                import warnings
-                if chart_binds:
-                    consequence = (
-                        f"exceeds transport_chart_max_norm={threshold}; the fail-closed chart "
-                        "validity check raises ValueError on the next transport build that reads this "
-                        "row, which aborts training. Set phi_mstep_max_matrix_norm below the chart "
-                        "bound (or lower m_phi_lr)")
-                else:
-                    consequence = (
-                        f"exceeds the transport clamp max_norm={threshold}; stable_matrix_exp_pair "
-                        "now returns the clamped surrogate exp(max_norm*M/||M||), not exp(M). Bound "
-                        "the belief frame (mass_phi, lower m_phi_lr) or accept the surrogate transport")
-                warnings.warn(
-                    f"{name}: embedded gauge-frame Frobenius norm {float(norm_max):.2f} "
-                    f"{consequence}. Warned once for this channel; further drift is not re-reported.",
-                    RuntimeWarning, stacklevel=2,
-                )
-                _PHI_CLAMP_WARNED = True
 
 
 class PhiFisherStatisticsProvider:
@@ -282,12 +207,11 @@ def build_optimizer(
 
     The prior-table roles carry distinct natural scales, so each is given its own
     M-step learning rate: every live mean table at ``m_p_mu_lr``; every live (log) scale
-    table and the decode temperature ``decode_log_scale`` together
-    at ``m_p_sigma_lr``; the belief gauge-frame coordinates ``phi_embed`` at ``m_phi_lr``.
+    table at ``m_p_sigma_lr`` (the decode temperature ``decode_log_scale`` is frozen and
+    ungrouped); the belief gauge-frame coordinates ``phi_embed`` at ``m_phi_lr``.
     ``m_decode_mu_lr`` controls separate decode means or linear weight/bias;
     ``m_decode_sigma_lr`` controls separate decode log variances. Each falls back to the
-    corresponding encoder rate. Learned temperature trains at ``m_p_sigma_lr``; shared
-    encode/decode tables keep encoder rates.
+    corresponding encoder rate; shared encode/decode tables keep encoder rates.
     Omitting overrides preserves historical group topology and semantic mu/sigma decays.
     Head evidence keeps its dedicated ``m_head_evidence_lr``.
 
@@ -352,11 +276,10 @@ def build_optimizer(
     groups = []
     if pb.mu_embed is not None:
         groups.append({"params": [pb.mu_embed], "lr": cfg.m_p_mu_lr, "role": "mu", **mu_wd})
-    # decode_temperature_learned=False freezes decode_log_scale (requires_grad=False in VFEModel), so
-    # this filter keeps it out of every optimizer group and the readout temperature stays fixed.
+    # decode_log_scale is always frozen (requires_grad=False in VFEModel; the learned temperature was
+    # retired 2026-10-02), so it joins no optimizer group and the readout temperature stays fixed.
     decode_mu_lr, decode_sigma_lr = _decode_learning_rates(cfg)
-    # The historical shared sigma/temperature group.
-    sigma_parameters = [parameter for parameter in (pb.sigma_log_embed, pb.decode_log_scale)
+    sigma_parameters = [parameter for parameter in (pb.sigma_log_embed,)
                         if parameter is not None and parameter.requires_grad]
     if sigma_parameters:
         groups.append({"params": sigma_parameters, "lr": cfg.m_p_sigma_lr,
@@ -466,9 +389,8 @@ def build_optimizer(
     # added. Non-trainable params (requires_grad=False, e.g. a parameter frozen by design) are
     # intentionally exempt: they are fixed by design and need no optimizer group.
     # NOTE: this guards GROUPING/coverage, not gradient FLOW. A grouped parameter can still receive
-    # a null gradient under specific opt-in toggles, by design: decode_log_scale under
-    # decode_mode='linear' (the readout discards tau_eff). That is an intentional route property,
-    # not a coverage bug.
+    # a null gradient under specific opt-in toggles, by design; that is an intentional route
+    # property, not a coverage bug.
     grouped = {p for g in groups for p in g["params"]}
     missing = {p for p in model.parameters() if p.requires_grad} - grouped   # frozen params are exempt
     if missing:
@@ -484,7 +406,7 @@ def build_optimizer(
         # is NOT the same as off: torch.optim.AdamW defaults `fused=None`, and with both `fused` and
         # `foreach` unresolved `adam()` selects the FOREACH multi-tensor path -- 9 kernel launches
         # per parameter group per step against 1 for the fused kernel. So choosing the manifold
-        # route silently deoptimized every OTHER group (mu_embed, sigma/decode_log_scale,
+        # route silently deoptimized every OTHER group (mu_embed, sigma_log_embed,
         # transport_state, t5_bias, LayerNorm affine), none of which the manifold logic
         # touches. `step()` sets `p.grad = None` on every pullback_group parameter BEFORE
         # the trailing `super().step()`, so base AdamW skips exactly those and the fused kernel only
@@ -1401,9 +1323,8 @@ _VAL_DIAG_KEYS = (
     "val_belief_cond_valid_frac",
     "val_phi_norm_mean", "val_phi_norm_std",
     "val_phi_matrix_norm_p95", "val_phi_matrix_norm_p99", "val_phi_matrix_norm_max",
-    "val_phi_exp_clamp_frac", "val_phi_exp_scale_min", "val_vertex_cond_p99",
+    "val_vertex_cond_p99",
     "val_pos_phi_matrix_norm_p95", "val_pos_phi_matrix_norm_p99", "val_pos_phi_matrix_norm_max",
-    "val_pos_phi_exp_clamp_frac", "val_pos_phi_exp_scale_min",
     "val_guard_sigma_floor_frac", "val_guard_sigma_ceil_frac", "val_guard_energy_klmax_frac",
     "val_guard_energy_klmax_frac_live", "val_live_pair_frac",
     "val_nonfinite_frac",
@@ -3244,8 +3165,6 @@ def train(
                 # health values visible as if they were collected for this attempt.
                 optimizer._gauge_diag = {}
         if do_log or do_csv:                                 # off the hot path (audit 2026-07-05 m8)
-            if vfe_model:
-                _warn_phi_transport_clamp(model)
             # m7: diagnostics on the PRE-step weights so the logged F-decomposition shares the pre-step
             # provenance of train_loss/train_ce (train_ce is captured pre-step inside train_step). Under
             # no_grad, so no weight change,
@@ -3585,7 +3504,7 @@ def train(
             row["generalization_gap"] = (last_val["ce"] - gap_train_side) if do_eval else float("nan")
             if cfg.decode_mode != "linear":
                 # Realized readout temperature tau_eff = decode_tau * exp(-clamp(decode_log_scale,
-                # -3, 3)). While decode_temperature_learned=True, decode_tau is only its init.
+                # -3, 3)); decode_log_scale is frozen, so this is constant over a run.
                 row["decode_tau_eff"] = float(model.prior_bank._tau_eff().detach())
             # Extended per-eval diagnostics (Tier-1/2): already-reduced gauge / geometry / numerical-
             # health scalars from diagnostics() -- NOT per-token sums, so logged RAW (no /n_tok).
@@ -3605,10 +3524,9 @@ def train(
                         "energy_abs_asymmetry", "energy_rel_asymmetry",
                         "gauge_head_aniso_mean", "gauge_head_logdet_spread",
                         "phi_matrix_norm_median", "phi_matrix_norm_p95", "phi_matrix_norm_p99",
-                        "phi_matrix_norm_max", "phi_exp_clamp_frac", "phi_exp_scale_min",
+                        "phi_matrix_norm_max",
                         "vertex_cond_median", "vertex_cond_p95", "vertex_cond_p99",
                         "pos_phi_matrix_norm_p95", "pos_phi_matrix_norm_p99", "pos_phi_matrix_norm_max",
-                        "pos_phi_exp_clamp_frac", "pos_phi_exp_scale_min",
                         "head_mixer_drift",
                         "head_evidence_weights", "head_evidence_entropy",
                         "head_evidence_max_abs_drift"):

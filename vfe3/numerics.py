@@ -276,39 +276,12 @@ def reset_mu_trust_fallback_elements() -> None:
         count.zero_()
 
 
-_SAFE_CHOLESKY_JITTER_MODES = ("absolute", "relative")
-_SAFE_CHOLESKY_JITTER_MODE: str = "absolute"
-
-
-def set_safe_cholesky_jitter_mode(mode: str) -> str:
-    r"""Set the process-wide ``safe_cholesky`` jitter scaling; returns the previous value.
-
-    Process-global for the same reason the KL and congruence precisions are (see
-    ``FullGaussian.renyi_closed_form``): ``safe_cholesky`` has many call sites across families,
-    numerics and the decode, and threading a config value to each invites exactly the
-    desynchronization where one path ridges differently from another. Set in one place
-    (``VFEModel.__init__``)."""
-    global _SAFE_CHOLESKY_JITTER_MODE
-    if mode not in _SAFE_CHOLESKY_JITTER_MODES:
-        raise ValueError(
-            f"safe_cholesky_jitter_mode must be one of {_SAFE_CHOLESKY_JITTER_MODES}, got {mode!r}")
-    previous = _SAFE_CHOLESKY_JITTER_MODE
-    _SAFE_CHOLESKY_JITTER_MODE = mode
-    return previous
-
-
-def safe_cholesky_jitter_mode() -> str:
-    r"""Return the active ``safe_cholesky`` jitter scaling."""
-    return _SAFE_CHOLESKY_JITTER_MODE
-
-
 def safe_cholesky(
     matrix: torch.Tensor,                # (..., K, K) symmetric ~PD (per-element factored)
 
     *,
     eps:    float = 1e-6,
     rounds: int   = 0,
-    jitter_mode: Optional[str] = None,   # None -> the process policy (audit 2026-08-06 C3)
 ) -> Tuple[torch.Tensor, torch.Tensor]:  # (factor (..., K, K), ok mask (...))
     r"""Per-element Cholesky that never raises, with optional per-element jitter escalation.
 
@@ -325,24 +298,13 @@ def safe_cholesky(
     finite-but-wrong value rather than NaN. The mask lets the caller inject NaN for failed
     elements so a ``safe_kl_clamp`` maps them to ``kl_max``.
 
-    JITTER SCALE (audit 2026-08-06 C3/F18). The ridge is ABSOLUTE by default, which makes its
-    meaning depend entirely on where the matrix sits: at an eigenvalue on the ``eps=1e-6`` SPD
-    floor the ``t=0`` ridge DOUBLES it and shifts ``logdet`` by exactly ``log 2 = 0.693`` nats per
-    floored direction, while at ``sigma_max=100`` the same ridge is a 1e-8 relative no-op and at
-    ``sigma_init=4`` it is 2.5e-7. So one ladder is simultaneously an unbounded relative bias where
-    it fires and far too weak to be a conditioning signal anywhere else.
-
-    ``jitter_mode="relative"`` scales the ridge by ``diagonal_mean(M)``, giving every element the
-    same RELATIVE perturbation. It is opt-in and the default stays ``"absolute"`` so every run on
-    disk is bit-reproducible; the two agree exactly when ``diagonal_mean(M) == 1``. Practical
-    severity is capped either way because the ladder only ever fires above cond ~1e8 (measured
-    3000/3000 repaired at t=0 across cond 1e4..1e12), which is why this is a latent-correctness fix
-    rather than a live one.
+    JITTER SCALE (audit 2026-08-06 C3/F18; relative hardcoded 2026-10-02). The ridge is RELATIVE:
+    round ``t`` adds :math:`\epsilon 10^t s(M) I` with :math:`s(M) = \max(1, |\operatorname{tr}(M)/K|)`,
+    so every element receives the same relative perturbation and the ladder is covariant under
+    :math:`M \to c M` for diagonal means above one. An absolute ridge (the retired alternative)
+    doubles an eigenvalue sitting on the ``eps=1e-6`` SPD floor while being a no-op at
+    ``sigma_max=100``. The ladder only fires above cond ~1e8.
     """
-    jitter_mode = _SAFE_CHOLESKY_JITTER_MODE if jitter_mode is None else jitter_mode
-    if jitter_mode not in _SAFE_CHOLESKY_JITTER_MODES:
-        raise ValueError(
-            f"jitter_mode must be one of {_SAFE_CHOLESKY_JITTER_MODES}, got {jitter_mode!r}")
     M = _symmetrize(matrix)
     L, info = torch.linalg.cholesky_ex(M)
     ok = (info == 0) & torch.isfinite(L).all(dim=(-2, -1))
@@ -350,8 +312,7 @@ def safe_cholesky(
         return L, ok
     K = M.shape[-1]
     eye = torch.eye(K, device=M.device, dtype=M.dtype)
-    scale = (M.diagonal(dim1=-2, dim2=-1).mean(-1).abs().clamp_min(1.)
-             if jitter_mode == "relative" else torch.ones_like(ok, dtype=M.dtype))
+    scale = M.diagonal(dim1=-2, dim2=-1).mean(-1).abs().clamp_min(1.)
     # Select a ridge without retaining any failed factorization in autograd.
     ridge = torch.zeros_like(scale)
     with torch.no_grad():

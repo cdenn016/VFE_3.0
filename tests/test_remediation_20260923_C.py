@@ -8,7 +8,6 @@ from tests.profiles import test_config
 
 import inspect
 import math
-import warnings
 from typing import Optional
 
 import pytest
@@ -97,12 +96,9 @@ def test_checked_group_inverse_still_fails_closed_in_order() -> None:
         _checked_group_inverse(drifted, residual_tol=1e-9)
 
 
-# -- Low: the clamp-surrogate latch no longer taxes every well-conditioned build ----------------
+# -- Low: one host read for the pre-exponential chart decisions, one for the strict inverse -------
 
-def test_stable_matrix_exp_pair_reads_host_once_per_decision_and_still_warns_first_clamp(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(transport, "_CLAMP_SURROGATE_WARNED", False)
+def test_stable_matrix_exp_pair_reads_host_once_per_decision(monkeypatch) -> None:
     torch.manual_seed(0)
     small = 0.3 * torch.randn(4, 3, 3)
     reads = _HostReads(monkeypatch)
@@ -111,20 +107,7 @@ def test_stable_matrix_exp_pair_reads_host_once_per_decision_and_still_warns_fir
         reads.count = 0
         stable_matrix_exp_pair(small)
         counts.append(reads.count)
-    # One read for the pre-exponential decisions, one for the strict inverse; never a third.
     assert counts == [2, 2, 2]
-    assert transport._CLAMP_SURROGATE_WARNED is False
-
-    big = 40.0 * torch.eye(3).expand(2, 3, 3)
-    with pytest.warns(RuntimeWarning, match="SURROGATE"):
-        stable_matrix_exp_pair(big)
-    assert transport._CLAMP_SURROGATE_WARNED is True
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        reads.count = 0
-        stable_matrix_exp_pair(big)
-    assert not [w for w in caught if issubclass(w.category, RuntimeWarning)]
-    assert reads.count == 2
 
 
 def test_stable_matrix_exp_pair_validity_bound_still_raises() -> None:

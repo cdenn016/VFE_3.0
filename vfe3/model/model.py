@@ -66,8 +66,7 @@ from vfe3.families.gaussian import (
 )
 from vfe3.families.base import BeliefParams
 from vfe3.families.policy import family_instance
-from vfe3.geometry.transport import set_frame_pair_fp64_escalation
-from vfe3.numerics import safe_eigvalsh, set_mu_trust_cholesky_rounds, set_safe_cholesky_jitter_mode
+from vfe3.numerics import safe_eigvalsh, set_mu_trust_cholesky_rounds
 from vfe3.relational_scoring import set_projected_condition_recovery, set_projected_factor_route
 from vfe3.runtime import set_fp32_matmul_precision
 from vfe3.model.relational_operators import RelationalOperators
@@ -289,15 +288,13 @@ def _numerical_policy_diagnostics(
     *,
     m_phi_group_trust_radius: Optional[float],
     phi_mstep_max_matrix_norm: Optional[float],
-    transport_chart_max_norm: Optional[float],
-    exp_fp64_norm_threshold: Optional[float],
+    transport_chart_max_norm: float,
 ) -> Dict[str, Optional[float]]:
     """Return the exact active production numerical policy, including disabled bounds."""
     return {
         "m_phi_group_trust_radius": m_phi_group_trust_radius,
         "phi_mstep_max_matrix_norm": phi_mstep_max_matrix_norm,
         "transport_chart_max_norm": transport_chart_max_norm,
-        "exp_fp64_norm_threshold": exp_fp64_norm_threshold,
     }
 
 
@@ -318,10 +315,8 @@ class VFEModel(nn.Module):
             cfg.full_cov_kl_precision)
         # Same one-place-set rule for the KL policy itself (audit 2026-08-06 C1).
         set_full_cov_kl_precision(self.full_cov_kl_precision)
-        set_frame_pair_fp64_escalation(cfg.frame_pair_fp64_escalation)
         set_projected_condition_recovery(cfg.projected_cov_condition_recovery)
         set_projected_factor_route(cfg.projected_factor_route)
-        set_safe_cholesky_jitter_mode(cfg.safe_cholesky_jitter_mode)
         set_mu_trust_cholesky_rounds(cfg.mu_trust_cholesky_rounds)
         # ... and the fp32 matmul / TF32 policy (audit 2026-08-06 C7/F25), which is process-global
         # for the same reason and belongs to the same one-place-set rule. It lives here rather than
@@ -397,12 +392,12 @@ class VFEModel(nn.Module):
             gauge_group_name=self.group.name,
             decode_coordinates=cfg.decode_coordinates,
         )
-        if not cfg.decode_temperature_learned:
-            # Fixed Gibbs readout temperature: the parameter keeps its name (checkpoint layout is
-            # unchanged) but leaves autograd and, through build_optimizer's requires_grad filter,
-            # the optimizer, so tau_eff = decode_tau * exp(-clamp(decode_log_scale, -3, 3)) stays at
-            # its initialized (or loaded) value.
-            self.prior_bank.decode_log_scale.requires_grad_(False)
+        # Fixed Gibbs readout temperature (the learned temperature was retired 2026-10-02): the
+        # parameter keeps its name (checkpoint layout is unchanged) but leaves autograd and, through
+        # build_optimizer's requires_grad filter, the optimizer, so
+        # tau_eff = decode_tau * exp(-clamp(decode_log_scale, -3, 3)) stays at its initialized (or
+        # loaded) value.
+        self.prior_bank.decode_log_scale.requires_grad_(False)
         # Norm instances built ONCE (audit 2d/4f). The gauge-pure norms (none/mahalanobis) and the
         # parameter-free layernorm are stateless pure maps (K, eps); layernorm_affine=True makes a
         # "layernorm" seam an AffineLayerNorm nn.Module whose gamma/beta REGISTER as submodule params
@@ -833,10 +828,8 @@ class VFEModel(nn.Module):
             beliefs.phi,
             self.group,
             right_phi=beliefs.right_phi,
-            clamp_monitor=self.cfg.transport_clamp_monitor,
             compact_phi_block_transport=self._compact_phi_blocks_enabled(),
             require_vertex_factors=require_vertex_factors,
-            exp_fp64_norm_threshold=self.cfg.exp_fp64_norm_threshold,
             validity_max_norm=self.cfg.transport_chart_max_norm,
             exactness_out=self._transport_status,
             _content_token_ids=_content_token_ids,
@@ -1502,7 +1495,6 @@ class VFEModel(nn.Module):
         cfg = self.cfg
         kwargs = {
             "transport_state": self.transport_state,
-            "clamp_monitor": cfg.transport_clamp_monitor,
             "validity_max_norm": cfg.transport_chart_max_norm,
             "exactness_out": self._transport_status,
             "right_phi": belief.right_phi,
@@ -1512,7 +1504,6 @@ class VFEModel(nn.Module):
                 belief.phi,
                 self.group,
                 compact_phi_block_transport=True,
-                exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
                 **kwargs,
             )
         return _transport(belief.phi, self.group, **kwargs)
@@ -1680,19 +1671,16 @@ class VFEModel(nn.Module):
         d["relational_covariance_repair_count"] = float(cap.get("relational_covariance_repair_count", 0.0))
         # Frame magnitude and decoder/head-module state remain meaningful on both readouts.
         belief = snapshot.layer_converged[layer_index]
-        from vfe3.geometry.transport import TRANSPORT_CLAMP_MAX_NORM
         phi_norm = torch.linalg.norm(belief.phi, dim=-1)
         d["phi_norm_mean"] = float(phi_norm.mean())
         d["phi_norm_std"] = float(phi_norm.std(unbiased=False))
         matrix_norm = metrics.diagnostic_frame_norm(
-            belief.phi.float(), self.group, max_norm=TRANSPORT_CLAMP_MAX_NORM, eps=self.cfg.eps)
-        exp_scale = (TRANSPORT_CLAMP_MAX_NORM / matrix_norm.clamp(min=self.cfg.eps)).clamp(max=1.0)
+            belief.phi.float(), self.group, max_norm=self.cfg.transport_chart_max_norm,
+            eps=self.cfg.eps)
         d["phi_matrix_norm_median"] = float(matrix_norm.median())
         d["phi_matrix_norm_p95"] = float(torch.quantile(matrix_norm, 0.95))
         d["phi_matrix_norm_p99"] = float(torch.quantile(matrix_norm, 0.99))
         d["phi_matrix_norm_max"] = float(matrix_norm.max())
-        d["phi_exp_clamp_frac"] = float((exp_scale < 1.0).float().mean())
-        d["phi_exp_scale_min"] = float(exp_scale.min())
         if self.head_mixer is not None and hasattr(self.head_mixer, "mixer_deltas"):
             d["head_mixer_drift"] = max(
                 (float(torch.linalg.norm(p.detach())) for p in self.head_mixer.mixer_deltas), default=0.0)

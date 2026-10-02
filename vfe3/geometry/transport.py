@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Mapping, Optional, Tuple
 import torch
 from torch import nn
 
+from vfe3.config import VFE3Config
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.lie_ops import CompactBlockElement
 
@@ -383,8 +384,6 @@ _TRANSPORT_BUILDER_RESERVED_STATE_KEYS = frozenset({
     "mu_key",
     "sigma",
     "sigma_key",
-    "clamp_monitor",
-    "exp_fp64_norm_threshold",
     "materialize",
     "validity_max_norm",
     "exactness_out",
@@ -521,9 +520,7 @@ def _build_flat(
 
     *,
     gauge_mode:              str             = "learned",   # 'learned' (Regime I flat) or 'trivial'
-    exp_fp64_norm_threshold: float           = 5.0,         # 'norm' mode: max clamped block ||M||_F upcast threshold
-    clamp_monitor:           bool            = False,       # opt-in: warn when the exp Frobenius clamp fires
-    validity_max_norm:       Optional[float] = None,        # opt-in fail-closed pre-clamp chart bound
+    validity_max_norm:       Optional[float] = None,        # fail-closed chart radius (None -> default 20.0)
     **kwargs,                             # tolerated (a future non-flat builder shares this shape)
 ) -> TransportDict:
     r"""Flat (Regime I) phi-cocycle transport: the registered default.
@@ -534,50 +531,35 @@ def _build_flat(
     without editing the registry call sites.
     """
     return compute_transport_operators(phi, group, gauge_mode=gauge_mode,
-                                       exp_fp64_norm_threshold=exp_fp64_norm_threshold,
-                                       clamp_monitor=clamp_monitor,
                                        validity_max_norm=validity_max_norm)
 
 
-# Frobenius-norm clamp for stable_matrix_exp_pair: above this the returned factor is the surrogate
-# exp(max_norm*M/||M||_F), NOT exp(M). Exported so the M-step drift monitor
-# (train._warn_phi_transport_clamp) trips at the SAME norm the clamp fires at -- the two cannot
-# diverge (audit 2026-07-06 M2).
-TRANSPORT_CLAMP_MAX_NORM: float = 20.0
+# Fail-closed chart radius of every transport matrix exponential (VFE3Config.transport_chart_max_norm,
+# default 20.0). A raw Lie-algebra matrix with ||M||_F above it is rejected, never rescaled: the
+# former Frobenius clamp substituted the surrogate exp(M*scale) for exp(M) and is retired
+# (2026-10-02). Low-level callers that pass no radius use the config default.
+DEFAULT_TRANSPORT_CHART_MAX_NORM: float = VFE3Config.transport_chart_max_norm
 
 
-# Process-wide "the exponential clamp has fired at least once" latch (audit 2026-07-25 F2). The clamp
-# returns a surrogate operator rather than exp(M), so its first occurrence is reported even when the
-# per-build clamp_monitor is off; the latch keeps the default path from paying a host sync forever.
-_CLAMP_SURROGATE_WARNED: bool = False
-
-
-# Measured-condition escalation of the stored frame pair (audit 2026-09-23 #12). The pair
-# (U, U^-1) is stored in float32. With the opt-in escalation enabled
-# (VFE3Config.frame_pair_fp64_escalation, installed by VFEModel), a producer call whose stored pair
-# cannot stay mutually inverse at float32 is redone in float64 as a whole. Disabled (the default),
-# no condition certificate is formed and every producer behaves exactly as before the escalation
-# existed. The tolerance is the projected scorer's certificate threshold and is read at call time.
-# The counter is a host int incremented from the already-read decision, so it adds no device work
-# and no synchronization.
-_FRAME_PAIR_FP64_ESCALATION: bool = False
+# Measured-condition escalation of the stored frame pair (audit 2026-09-23 #12; unconditional since
+# 2026-10-02). The pair (U, U^-1) is stored in float32; a producer call whose stored pair cannot stay
+# mutually inverse at float32 is redone in float64 as a whole. The tolerance is the projected
+# scorer's certificate threshold. The counter is a host int incremented from the already-read
+# decision, so it adds no device work and no synchronization.
 _FRAME_PAIR_CONDITION_TOL: float = 1e-4
 _FRAME_PAIR_FP64_ESCALATIONS: int = 0
 
 
-def set_frame_pair_fp64_escalation(enabled: bool) -> bool:
-    r"""Enable or disable the condition-keyed float64 frame-pair escalation; returns the previous value."""
-    if not isinstance(enabled, bool):
-        raise ValueError(f"frame-pair float64 escalation must be bool, got {enabled!r}")
-    global _FRAME_PAIR_FP64_ESCALATION
-    previous = _FRAME_PAIR_FP64_ESCALATION
-    _FRAME_PAIR_FP64_ESCALATION = enabled
-    return previous
-
-
-def frame_pair_fp64_escalation() -> bool:
-    r"""Return whether producers certify the float32 frame pair and escalate it to float64."""
-    return _FRAME_PAIR_FP64_ESCALATION
+def _resolve_chart_max_norm(
+    validity_max_norm: Optional[float],   # caller radius; None -> DEFAULT_TRANSPORT_CHART_MAX_NORM
+) -> float:
+    r"""Return the validated fail-closed chart radius (positive and finite)."""
+    radius = DEFAULT_TRANSPORT_CHART_MAX_NORM if validity_max_norm is None else validity_max_norm
+    if (isinstance(radius, bool) or not isinstance(radius, (int, float))
+            or not math.isfinite(radius) or radius <= 0.0):
+        raise ValueError(
+            f"transport chart radius validity_max_norm must be finite and positive, got {radius!r}")
+    return float(radius)
 
 
 def frame_pair_fp64_escalations() -> int:
@@ -636,152 +618,72 @@ def stable_matrix_exp_pair(
     matrix:                  torch.Tensor,       # (..., d, d) Lie-algebra matrices
 
     *,
-    max_norm:                float               = TRANSPORT_CLAMP_MAX_NORM,
-    exp_fp64_norm_threshold: float               = 5.0,      # 'norm' mode: upcast when max clamped block ||M||_F >= this
     only_forward:            bool                = False,
-    clamp_monitor:           bool                = False,    # opt-in: warn when the Frobenius clamp fires (host sync)
     block_dims:              Optional[List[int]] = None,     # per-block sizes (sum==d) for a block-diagonal M
-    validity_max_norm:       Optional[float]     = None,     # opt-in fail-closed pre-clamp chart bound
+    validity_max_norm:       Optional[float]     = None,     # fail-closed chart radius (None -> default 20.0)
     _right_pair:             Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # certify (U E, E^-1 U^-1)
     _force_fp64:             bool                = False,    # skip the float32 attempt (joint escalation)
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    r"""Represented exp(M) and optionally its float64-computed inverse.
+    r"""Exact exp(M) on the transport chart and optionally its float64-computed inverse.
 
-    Frobenius-norm clamp + float64 upcast keep matrix_exp stable for large ||M||.
     The paired negative factor is the inverse of the represented forward factor, not a separately
     rounded evaluation of exp(-M), so the stored pair shares one finite-precision group element.
 
-    SAFEGUARD, NOT THE EXACT OPERATOR: when ``||M||_F > max_norm`` the matrix is rescaled to
-    ``max_norm``, so the returned factor is ``exp(max_norm * M/||M||_F)``, NOT ``exp(M)`` -- the
-    singular values / determinant of the returned operator differ from the true exponential. This
-    is a stability clamp on extreme inputs only; keep ||phi|| below
-    ``max_norm`` to stay exact. The per-call runtime monitor is OFF by default: detecting
-    activation needs a tensor reduction (a host sync) on this hot path, which the perf budget
-    avoids. Pass ``clamp_monitor=True`` (opt-in diagnostic) to accept that sync and emit a
-    RuntimeWarning whenever the clamp fires -- the returned factor is then a surrogate, not exp(M).
+    Domain: the chart radius :math:`r` (``validity_max_norm``, the configured
+    ``transport_chart_max_norm``) is fail-closed. Any raw :math:`\lVert M\rVert_F > r` or a
+    nonfinite norm raises ``ValueError``; the matrix is never rescaled, so the returned factor is
+    always :math:`\exp(M)` itself. The retired Frobenius clamp returned the surrogate
+    :math:`\exp(M \cdot 20/\lVert M\rVert_F)` instead (2026-10-02). The bound applies to every
+    group, including the compact skew-symmetric ``so_n`` towers.
 
     ``block_dims`` (audit 4b): when M is block-diagonal with these blocks (e.g. block_glk's
     GL(d_head)^H), exp(M) is exactly block-diagonal with the per-block exponentials, so each
     d_head x d_head block is exponentiated independently -- an O(H * d_head^3) cost instead of
-    O(K^3) for the full K x K. The global Frobenius clamp is applied to the WHOLE matrix
-    first. All blocks share the dtype selected by their maximum block norm; an unblocked
-    call instead selects its dtype from the full-matrix norm. ``None`` (a single block, a
-    cross-coupled basis, or a skew group) takes the full-matrix path.
+    O(K^3) for the full K x K. ``None`` (a single block, a cross-coupled basis, or a skew group)
+    takes the full-matrix path.
 
-    Precision is selected by the maximum clamped block Frobenius norm. Blocks below
-    ``exp_fp64_norm_threshold`` compute in float32; the remaining calls compute in float64.
-    Float64 inputs retain float64 storage but follow the same interior precision rule. Numerical
-    oracles can pass a float64 input and threshold zero to force float64 computation.
-    The config owns its threshold of 20; low-level callers retain their threshold of 5.
-
-    Storage precision is decided separately, from the stored pair's measured condition (audit
-    2026-09-23 #12): a float32 pair failing :func:`_frame_pair_kappa`'s certificate is returned in
-    float64 for the whole call, recomputed from the same clamped ``M`` and inverted from the float64
-    ``exp(M)``. The verdict rides the inverse's existing host read; ``only_forward`` builds no
-    inverse and is never certified.
+    Precision: the exponential is evaluated at the storage precision (float32, or float64 for a
+    float64 input). A float32 pair failing :func:`_frame_pair_kappa`'s certificate,
+    :math:`\max_b \kappa_F(U_b)\,\varepsilon_{32} > 10^{-4}`, is returned in float64 for the whole
+    call, recomputed from the same ``M`` and inverted from the float64 ``exp(M)`` (audit 2026-09-23
+    #12; unconditional since 2026-10-02). The verdict rides the inverse's existing host read;
+    ``only_forward`` builds no inverse and is never certified.
     """
-    # Global Frobenius clamp on the FULL matrix (one scale for all blocks) -- identical to the
-    # un-blocked path, so block slicing below cannot change the operator. The norm/scale is kept
-    # OUT of the autograd graph (no_grad): the clamp is a numerical SAFEGUARD, not part of the
-    # modeled operator, and differentiating through the rescale (a) biases the gradient toward
-    # the clamped surrogate where the clamp is active and (b) makes the norm's DOUBLE-backward
-    # NaN on exactly-zero matrices (a zero gauge frame, reached by
-    # the unrolled oracle's create_graph path). Where the clamp is inactive (scale == 1.0 --
-    # any ||phi|| < max_norm) multiplying by the detached
-    # constant 1.0 is byte-identical to the previous through-graph multiply.
-    if validity_max_norm is not None and (
-        not math.isfinite(validity_max_norm) or validity_max_norm <= 0.0
-    ):
-        raise ValueError(
-            "validity_max_norm must be None or finite and positive, got "
-            f"{validity_max_norm!r}"
-        )
-
-    # Every pre-exponential scalar decision (chart validity, clamp activation, float64 island) is
-    # reduced on the device and read in ONE host transfer below, mirroring
-    # _stable_compact_glk_exp_pair (audit 2026-09-23 low: the clamp latch used to set only once the
-    # clamp FIRED, so a well-conditioned run paid its extra sync on every build, forever).
-    global _CLAMP_SURROGATE_WARNED
-    decisions = {}
+    validity_max_norm = _resolve_chart_max_norm(validity_max_norm)
+    # Both chart decisions are reduced on the device and read in ONE host transfer.
     with torch.no_grad():
-        raw_mat_norm = matrix.norm(dim=(-2, -1), keepdim=True)
-        if validity_max_norm is not None:
-            decisions["nonfinite"] = (~torch.isfinite(raw_mat_norm)).any()
-            decisions["outside_chart"] = (raw_mat_norm > validity_max_norm).any()
-        mat_norm = raw_mat_norm.clamp(min=1e-8)
-        scale = (max_norm / mat_norm).clamp(max=1.0)
-        # The clamp substitutes exp(M * scale) for exp(M) -- a DIFFERENT operator, not a rounding of
-        # the intended one (measured ~98% relative error at ||M||_F = 30). Before audit 2026-07-25 F2
-        # this was announced only under the opt-in clamp_monitor, so the default configuration could
-        # model a surrogate transport with no signal whatsoever. The verbose per-build report stays
-        # gated on clamp_monitor; the FIRST occurrence is always reported. Its reduction rides along
-        # with the float64-island decision the build already reads, so detection adds no host sync;
-        # after the first report the default path stops computing it. transport_chart_max_norm
-        # remains the fail-closed alternative and its default is deliberately unchanged: every value
-        # the pullback_group validator admits (5.0 < bound < 20.0) would hard-abort runs whose
-        # observed ||M||_F already reaches 18, so failing closed stays the caller's explicit choice.
-        if clamp_monitor or not _CLAMP_SURROGATE_WARNED:
-            decisions["clamp_fraction"] = (scale < 1.0).float().mean()
-    matrix = matrix * scale
+        raw_mat_norm = matrix.norm(dim=(-2, -1))
+        decisions = torch.stack(((~torch.isfinite(raw_mat_norm)).any(),
+                                 (raw_mat_norm > validity_max_norm).any()))
+    nonfinite, outside_chart = decisions.tolist()
+    if nonfinite:
+        raise ValueError(
+            "transport chart validity bound encountered a nonfinite matrix norm"
+        )
+    if outside_chart:
+        observed = float(raw_mat_norm.max())
+        raise ValueError(
+            "transport chart validity bound exceeded before the matrix exponential: "
+            f"observed ||M||_F={observed:.6g} > transport_chart_max_norm={validity_max_norm:.6g}"
+        )
 
     # float32 storage floor, matching _stable_compact_glk_exp_pair (audit 2026-07-25 F2). The dense
     # route reaches here with an autocast-eligible einsum(phi, generators) result, so without this the
     # dense and compact representations would only agree on their (reduced) storage dtype by both
     # being wrong. Parity between the two paths is preserved -- at float32 rather than at bf16.
     orig_dtype = matrix.dtype if matrix.dtype in (torch.float32, torch.float64) else torch.float32
-    # Upcast when the maximum clamped block norm reaches the threshold.
-    # The clamp already ran, so the keying norm is the norm actually exponentiated.
-    # The float64 island stays reachable for large norms.
-    with torch.no_grad():
-        if block_dims is not None and len(block_dims) > 1:
-            start = 0
-            key_norm = matrix.new_zeros(())
-            for blk in block_dims:
-                end = start + blk
-                key_norm = torch.maximum(
-                    key_norm, matrix[..., start:end, start:end].norm(dim=(-2, -1)).max())
-                start = end
-        else:
-            key_norm = (mat_norm * scale).max()      # clamped full-matrix norm (single block)
-        decisions["use_fp64"] = key_norm >= exp_fp64_norm_threshold
-    host = dict(zip(decisions, torch.stack(tuple(decisions.values())).tolist()))
-    # Preserve the original exception/warning precedence after the single read.
-    if host.get("nonfinite", False):
-        raise ValueError(
-            "transport chart validity bound encountered a nonfinite matrix norm"
-        )
-    if host.get("outside_chart", False):
-        observed = float(raw_mat_norm.max())
-        raise ValueError(
-            "transport chart validity bound exceeded before matrix-exponential clamp: "
-            f"observed ||M||_F={observed:.6g} > {validity_max_norm:.6g}"
-        )
-    if host.get("clamp_fraction", 0.0) > 0:
-        import warnings
-        _CLAMP_SURROGATE_WARNED = True
-        once =("" if clamp_monitor else
-                " Warned once for this process; set transport_clamp_monitor=True to report "
-                "every occurrence, or transport_chart_max_norm to fail closed instead.")
-        warnings.warn(
-            f'stable_matrix_exp_pair: Frobenius clamp active on {host["clamp_fraction"]:.1%} of '
-            f'matrices (max_norm={max_norm}); the returned factor is a SURROGATE exp(M*scale), NOT '
-            f'exp(M).{once}',
-            RuntimeWarning, stacklevel=2,
-        )
-    up_dtype = torch.float64 if host["use_fp64"] else torch.float32
 
     # Keyed to the TENSOR's device (audit 2026-07-05 m10): the old 'cuda' literal left the island
     # open under a CPU autocast context (torch.amp.autocast('cpu', bf16)), which _amp_context
     # deliberately supports -- matrix_exp would then run in bf16 on CPU-AMP runs.
     with torch.amp.autocast(matrix.device.type, enabled=False):
-        matrix_up = matrix.to(up_dtype).contiguous()
+        matrix_up = matrix.to(orig_dtype).contiguous()
         blocked = block_dims is not None and len(block_dims) > 1
 
         def _exp(m: torch.Tensor) -> torch.Tensor:
             return _blockwise_matrix_exp(m, block_dims) if blocked else torch.linalg.matrix_exp(m)
 
-        exp_up = _exp(matrix_up)
-        exp_pos = exp_up.to(orig_dtype)
+        exp_pos = _exp(matrix_up)
         if only_forward:
             return exp_pos, None
         if orig_dtype == torch.float64:
@@ -792,14 +694,12 @@ def stable_matrix_exp_pair(
             escalate = True
         elif blocked:
             exp_neg, escalate = _blockwise_group_inverse_certified(
-                exp_pos, block_dims, certify=_FRAME_PAIR_FP64_ESCALATION, right_pair=_right_pair)
+                exp_pos, block_dims, certify=True, right_pair=_right_pair)
         else:
             exp_neg, escalate = _checked_group_inverse_certified(
-                exp_pos, kappa=(_frame_pair_kappa(_right_pair)
-                                if _FRAME_PAIR_FP64_ESCALATION else None))
+                exp_pos, kappa=_frame_pair_kappa(_right_pair))
         if escalate:
-            exp_pos = (exp_up if exp_up.dtype == torch.float64
-                       else _exp(matrix.to(torch.float64).contiguous()))
+            exp_pos = _exp(matrix.to(torch.float64).contiguous())
             exp_neg = (_blockwise_group_inverse(exp_pos, block_dims) if blocked
                        else _checked_group_inverse(exp_pos))
             _count_frame_pair_escalation()
@@ -918,9 +818,7 @@ def compute_transport_operators(
 
     *,
     gauge_mode:              str             = "learned",   # 'learned' (Regime I flat) or 'trivial'
-    exp_fp64_norm_threshold: float           = 5.0,         # 'norm' mode: max clamped block ||M||_F upcast threshold
-    clamp_monitor:           bool            = False,       # opt-in: warn when the exp Frobenius clamp fires
-    validity_max_norm:       Optional[float] = None,        # opt-in fail-closed pre-clamp chart bound
+    validity_max_norm:       Optional[float] = None,        # fail-closed chart radius (None -> default 20.0)
 ) -> TransportDict:
     r"""phi/exp transport Omega_ij = exp(phi_i) @ exp(-phi_j) in GL+(K).
 
@@ -957,16 +855,7 @@ def compute_transport_operators(
     # -> irrep_dims [d_head]*H); single-block ([K]: one-head block_glk, a single so_n irrep) takes the full path.
     block_dims = group.irrep_dims if len(group.irrep_dims) > 1 else None
     exp_phi, exp_neg_phi = stable_matrix_exp_pair(
-        phi_matrix, block_dims=block_dims,
-        exp_fp64_norm_threshold=exp_fp64_norm_threshold,
-        # m16: matrix_exp of a skew matrix is exactly orthogonal at ANY norm, so the Frobenius clamp
-        # only gratuitously shortens the rotation on the pure so_n tower path (whose retraction
-        # caps ||phi|| in COORDINATES, under-bounding the embedded norm). Disable it for skew; the
-        # non-compact groups (block_glk) keep the clamp as a genuine exp-overflow safeguard.
-        max_norm=(float("inf") if group.skew_symmetric else TRANSPORT_CLAMP_MAX_NORM),
-        clamp_monitor=clamp_monitor,
-        validity_max_norm=validity_max_norm,
-    )
+        phi_matrix, block_dims=block_dims, validity_max_norm=validity_max_norm)
     # fp32 island on the pair product (audit 2026-07-26 C-05). The vertex factors above are already
     # pinned to float32 by _embed_algebra_fp32_floor + the exp's own upcasts, but einsum is
     # autocast-eligible, so under AMP the dense Omega was rebuilt in bf16 -- measured
@@ -1113,9 +1002,7 @@ def _stable_compact_glk_exp_pair(
     blocks:                  torch.Tensor,       # (..., H, d, d) block-diagonal gl(d)^H element
 
     *,
-    exp_fp64_norm_threshold: float           = 5.0,
-    clamp_monitor:           bool            = False,
-    validity_max_norm:       Optional[float] = None,
+    validity_max_norm:       Optional[float] = None,     # fail-closed chart radius (None -> default 20.0)
     _content_token_ids:      Optional[torch.Tensor] = None,
     _right_pair:             Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # certify (U E, E^-1 U^-1)
     _force_fp64:             bool            = False,     # skip the float32 attempt (joint escalation)
@@ -1128,56 +1015,32 @@ def _stable_compact_glk_exp_pair(
 
     Float32 storage is certified by :func:`_frame_pair_kappa` inside the inverse's single host
     read (audit 2026-09-23 #12). A call that fails it returns the whole pair in float64:
-    ``U = exp(M)`` recomputed in float64 from the same clamped blocks and ``U^-1`` inverted from
+    ``U = exp(M)`` recomputed in float64 from the same blocks and ``U^-1`` inverted from
     that float64 ``U`` itself, never the float64 inverse of the rounded float32 ``U`` (which is
     no more consistent with a float64 ``U`` than the float32 pair was). ``_right_pair`` certifies
     the composed pair instead, and ``_force_fp64`` goes straight to float64.
     """
-    if validity_max_norm is not None and (
-        not math.isfinite(validity_max_norm) or validity_max_norm <= 0.0
-    ):
-        raise ValueError(
-            "validity_max_norm must be None or finite and positive, got "
-            f"{validity_max_norm!r}"
-        )
-    # Keep the existing scalar predicates and reduction precision, but transfer them together.
-    decisions = {}
+    validity_max_norm = _resolve_chart_max_norm(validity_max_norm)
+    # The chart radius bounds the Frobenius norm of the whole block-diagonal element, as on the
+    # dense route; both decisions share one host read.
     with torch.no_grad():
-        raw_mat_norm = blocks.square().sum(dim=(-3, -2, -1), keepdim=True).sqrt()
-        if validity_max_norm is not None:
-            decisions["nonfinite"] = (~torch.isfinite(raw_mat_norm)).any()
-            decisions["outside_chart"] = (raw_mat_norm > validity_max_norm).any()
-        mat_norm = raw_mat_norm.clamp(min=1e-8)
-        scale = (TRANSPORT_CLAMP_MAX_NORM / mat_norm).clamp(max=1.0)
-        if clamp_monitor:
-            decisions["clamp_fraction"] = (scale < 1.0).float().mean()
-    blocks = blocks * scale
-    with torch.no_grad():
-        key_norm = blocks.norm(dim=(-2, -1)).max()
-        decisions["use_fp64"] = key_norm >= exp_fp64_norm_threshold
-    host = dict(zip(decisions, torch.stack(tuple(decisions.values())).tolist())) if decisions else {}
-    # Preserve the original exception/warning precedence after the single healthy-path read.
-    if host.get("nonfinite", False):
+        raw_mat_norm = blocks.square().sum(dim=(-3, -2, -1)).sqrt()
+        decisions = torch.stack(((~torch.isfinite(raw_mat_norm)).any(),
+                                 (raw_mat_norm > validity_max_norm).any()))
+    nonfinite, outside_chart = decisions.tolist()
+    if nonfinite:
         raise ValueError(
             "transport chart validity bound encountered a nonfinite matrix norm"
         )
-    if host.get("outside_chart", False):
+    if outside_chart:
         observed = float(raw_mat_norm.max())
         raise ValueError(
-            "transport chart validity bound exceeded before matrix-exponential clamp: "
-            f"observed ||M||_F={observed:.6g} > {validity_max_norm:.6g}"
-        )
-    if host.get("clamp_fraction", 0.0) > 0:
-        import warnings
-        warnings.warn(
-            f'stable_matrix_exp_pair: Frobenius clamp active on {host["clamp_fraction"]:.1%} of matrices '
-            f'(max_norm={TRANSPORT_CLAMP_MAX_NORM}); returned factor is a surrogate, not exp(M).',
-            RuntimeWarning, stacklevel=2,
+            "transport chart validity bound exceeded before the matrix exponential: "
+            f"observed ||M||_F={observed:.6g} > transport_chart_max_norm={validity_max_norm:.6g}"
         )
 
-    # Preserve both the represented fp32 storage floor and the configured interior precision.
+    # Represented fp32 storage floor; the exponential is evaluated at the storage precision.
     store_dtype = blocks.dtype if blocks.dtype in (torch.float32, torch.float64) else torch.float32
-    up_dtype = torch.float64 if host["use_fp64"] else torch.float32
 
     inverse_index = None
     occurrence_shape = blocks.shape
@@ -1192,9 +1055,7 @@ def _stable_compact_glk_exp_pair(
         else:
             inverse_index = None
     with torch.amp.autocast(blocks.device.type, enabled=False):
-        blocks_up = blocks.to(up_dtype).contiguous()
-        exp_up = torch.linalg.matrix_exp(blocks_up)
-        exp_pos = exp_up.to(store_dtype)
+        exp_pos = torch.linalg.matrix_exp(blocks.to(store_dtype).contiguous())
         if store_dtype == torch.float64:
             exp_neg, escalate = _checked_group_inverse(exp_pos), False
         elif _force_fp64:
@@ -1207,11 +1068,9 @@ def _stable_compact_glk_exp_pair(
                 def gather(t: torch.Tensor) -> torch.Tensor:
                     return t.index_select(0, index).reshape(shape)
             exp_neg, escalate = _checked_group_inverse_certified(
-                exp_pos, kappa=(_frame_pair_kappa(_right_pair, gather)
-                                if _FRAME_PAIR_FP64_ESCALATION else None))
+                exp_pos, kappa=_frame_pair_kappa(_right_pair, gather))
         if escalate:
-            exp_pos = (exp_up if exp_up.dtype == torch.float64
-                       else torch.linalg.matrix_exp(blocks.to(torch.float64).contiguous()))
+            exp_pos = torch.linalg.matrix_exp(blocks.to(torch.float64).contiguous())
             exp_neg = _checked_group_inverse(exp_pos)
             _count_frame_pair_escalation()
     if inverse_index is not None:
@@ -1226,10 +1085,8 @@ def build_factored_transport(
 
     *,
     gauge_mode:              str                    = "learned",   # 'learned' (Regime I flat) or 'trivial'
-    exp_fp64_norm_threshold: float                  = 5.0,         # 'norm' mode: max clamped block ||M||_F upcast threshold
-    clamp_monitor:           bool                   = False,       # opt-in: warn when the exp Frobenius clamp fires
     compact_blocks:          bool                   = False,       # canonical block_glk: retain (..., N, H, d, d) factors
-    validity_max_norm:       Optional[float]        = None,        # opt-in fail-closed pre-clamp chart bound
+    validity_max_norm:       Optional[float]        = None,        # fail-closed chart radius (None -> default 20.0)
     right_phi:               Optional[torch.Tensor] = None,        # (..., N, n_gen) exact right factor exp(Y)
     _content_token_ids:      Optional[torch.Tensor] = None,        # private certified table-lookup identity
 ) -> 'CompactFactoredTransport | FactoredTransport':
@@ -1292,16 +1149,12 @@ def build_factored_transport(
             def _build_right(force_fp64: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
                 return _stable_compact_glk_exp_pair(
                     right_blocks,
-                    exp_fp64_norm_threshold=exp_fp64_norm_threshold,
-                    clamp_monitor=clamp_monitor,
                     validity_max_norm=validity_max_norm,
                     _force_fp64=force_fp64,
                 )
             right_pair = _build_right()
         exp_blocks, inv_blocks = _stable_compact_glk_exp_pair(
             phi_blocks,
-            exp_fp64_norm_threshold=exp_fp64_norm_threshold,
-            clamp_monitor=clamp_monitor,
             validity_max_norm=validity_max_norm,
             _content_token_ids=_content_token_ids,
             _right_pair=right_pair,
@@ -1328,9 +1181,6 @@ def build_factored_transport(
             return stable_matrix_exp_pair(
                 right_matrix,
                 block_dims=block_dims,
-                exp_fp64_norm_threshold=exp_fp64_norm_threshold,
-                max_norm=(float("inf") if group.skew_symmetric else TRANSPORT_CLAMP_MAX_NORM),
-                clamp_monitor=clamp_monitor,
                 validity_max_norm=validity_max_norm,
                 _force_fp64=force_fp64,
             )
@@ -1338,13 +1188,6 @@ def build_factored_transport(
     phi_matrix = _embed_algebra_fp32_floor(phi, group)
     exp_phi, exp_neg_phi = stable_matrix_exp_pair(
         phi_matrix, block_dims=block_dims,
-        exp_fp64_norm_threshold=exp_fp64_norm_threshold,
-        # m16: matrix_exp of a skew matrix is exactly orthogonal at ANY norm, so the Frobenius clamp
-        # only gratuitously shortens the rotation on the pure so_n tower path (whose retraction
-        # caps ||phi|| in COORDINATES, under-bounding the embedded norm). Disable it for skew; the
-        # non-compact groups (block_glk) keep the clamp as a genuine exp-overflow safeguard.
-        max_norm=(float("inf") if group.skew_symmetric else TRANSPORT_CLAMP_MAX_NORM),
-        clamp_monitor=clamp_monitor,
         validity_max_norm=validity_max_norm,
         _right_pair=right_pair,
         _force_fp64=right_pair is not None and right_pair[0].dtype == torch.float64,

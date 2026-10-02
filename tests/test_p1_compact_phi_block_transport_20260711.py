@@ -152,30 +152,20 @@ def test_compact_phi_block_transport_changes_only_opted_in_block_glk_layout(
     assert compact.inv_blocks.shape == (2, 3, 2, 2, 2)
 
 
-@pytest.mark.parametrize(
-    "threshold",
-    [20.0, 0.0],
-)
-def test_compact_phi_block_transport_preserves_global_full_frame_clamp_and_dtype_rule(
+def test_compact_phi_block_transport_shares_the_global_chart_and_dtype_rule(
     device:         torch.device,
-    threshold:     float,
 ) -> None:
     group = get_group("block_glk")(4, 2, device=device)
     phi = torch.zeros(1, 1, group.generators.shape[0], device=device)
     phi[..., 0] = 15.0
-    phi[..., 4] = 15.0
+    phi[..., 4] = 15.0                                   # each block 15, whole frame 21.2 > 20
+    for compact_route in (False, True):
+        with pytest.raises(ValueError, match="validity bound exceeded"):
+            build_belief_transport(phi, group, compact_phi_block_transport=compact_route)
+    phi[..., 4] = 10.0                                   # whole frame 18.0, inside the chart
 
-    legacy = build_belief_transport(
-        phi,
-        group,
-        exp_fp64_norm_threshold=threshold,
-    )
-    compact = build_belief_transport(
-        phi,
-        group,
-        exp_fp64_norm_threshold=threshold,
-        compact_phi_block_transport=True,
-    )
+    legacy = build_belief_transport(phi, group)
+    compact = build_belief_transport(phi, group, compact_phi_block_transport=True)
 
     legacy_pos = _equal_diag_blocks(legacy.exp_phi, 2, 2)
     legacy_neg = _equal_diag_blocks(legacy.exp_neg_phi, 2, 2)

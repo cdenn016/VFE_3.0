@@ -590,6 +590,7 @@ def test_fisher_group_policy_config_validation_and_inactive_marks() -> None:
             (dict(pos_phi_project_slk=True), "pos_phi_project_slk"),
             (dict(family="gaussian_frame_diagonal"), "diag"),
             (dict(transport_chart_max_norm=None), "transport_chart_max_norm"),
+            (dict(transport_chart_max_norm=4.0), "transport_chart_max_norm"),
             (dict(m_phi_fisher_rotation_weight=0.0), "m_phi_fisher_rotation_weight"),
             (dict(m_phi_fisher_rotation_weight=float("nan")), "m_phi_fisher_rotation_weight")):
         with pytest.raises(ValueError, match=message):

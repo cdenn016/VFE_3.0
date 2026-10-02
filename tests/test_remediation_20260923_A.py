@@ -33,7 +33,7 @@ _AUDITED_ROUTE = dict(
     block_mlp_mode="coordinate", block_mlp_covariance="passthrough", block_mlp_expansion=2,
     decode_coordinates="local", decode_unigram_prior=True, decode_bias=True,
     decode_tau=0.01, lambda_beta=1.0, lambda_alpha_mode="constant",
-    exp_fp64_norm_threshold=20.0, transport_chart_max_norm=18.0, decode_av_precision="fp32",
+    transport_chart_max_norm=18.0, decode_av_precision="fp32",
     decode_ranking_fp64_escalation=False,
     skip_belief_sigma_update=False,
 )
@@ -129,13 +129,6 @@ def test_frozen_frame_optimizer_knobs_are_marked_and_inert(gauge_transport: str)
     assert all(torch.equal(reference[name], changed[name]) for name in reference)
 
 
-def test_fp64_island_unreachable_above_chart_bound() -> None:
-    cfg = _cfg(_launcher())                            # launcher: threshold 20 > chart 18
-    assert "exp_fp64_norm_threshold" in cfg.inactive_fields()
-    assert "exp_fp64_norm_threshold" not in _cfg(
-        _launcher(exp_fp64_norm_threshold=18.0)).inactive_fields()      # equality stays reachable
-
-
 def test_decode_notices_only_report_active_explicit_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     # Notice policy compares dataclass declarations, so give this test its own declarations too.
     values = config_values(untie_decode_bank=False, decode_bias=False)
@@ -156,7 +149,7 @@ def test_launcher_route_inactive_report() -> None:
     inactive = _cfg(_launcher()).inactive_fields()
     for name in ("family", "lambda_beta", "sigma_max",
                  "mu_trust_cholesky_rounds", "attention_window", "prior_handoff_rho",
-                 "prior_handoff_sigma", "decode_bias", "exp_fp64_norm_threshold"):
+                 "prior_handoff_sigma", "decode_bias"):
         assert name in inactive, name
     for name in ("decode_tau", "kappa_beta", "kl_max", "untie_decode_bank"):
         assert name not in inactive, name

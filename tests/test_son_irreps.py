@@ -233,8 +233,8 @@ def test_projected_so_n_gauge_equivariance(route: str) -> None:
 
 @pytest.mark.parametrize("route", ["predictive_diagonal", "gradient_full_closed_form"])
 def test_projected_so_n_phi_gradient_matches_finite_difference(route: str) -> None:
-    # float64 throughout (the fp64 exp island is forced on) so central differences resolve 1e-7.
-    model = _son_model(torch.float64, exp_fp64_norm_threshold=1e-9, **_SON_ROUTES[route]).eval()
+    # float64 throughout (a float64 frame is exponentiated at float64) so central differences resolve 1e-7.
+    model = _son_model(torch.float64, **_SON_ROUTES[route]).eval()
     tokens = torch.tensor([[1, 4, 2]])
     phi = model.prior_bank.phi_embed
     w_mu = torch.randn(1, 3, 6, generator=torch.Generator().manual_seed(3), dtype=torch.float64)
