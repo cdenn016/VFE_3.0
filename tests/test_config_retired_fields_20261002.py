@@ -355,3 +355,8 @@ def test_a_nonzero_absolute_lr_floor_is_refused(value: object) -> None:
 def test_forced_checkpoint_policies_load_as_auto(value: str) -> None:
     assert _load(decode_ce_checkpoint=value) == test_config(decode_ce_checkpoint="auto")
     assert _load(decode_ce_checkpoint="auto_aggregate").decode_ce_checkpoint == "auto_aggregate"
+
+def test_a_saved_none_chart_radius_loads_as_the_historical_clamp_radius(monkeypatch) -> None:
+    from vfe3.config import VFE3Config
+    monkeypatch.setattr(VFE3Config, "transport_chart_max_norm", 50.0)
+    assert _load(transport_chart_max_norm=None).transport_chart_max_norm == 20.0
