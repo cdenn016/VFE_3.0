@@ -2079,7 +2079,9 @@ def _migrate_retired_fields(
         # The chart radius is required since 2026-10-02. None meant "no fail-closed bound, only the
         # surrogate clamp at 20"; it loads as the clamp's radius, so a frame the clamp would have
         # rescaled now raises instead.
-        payload["transport_chart_max_norm"] = VFE3Config.transport_chart_max_norm
+        # A literal, not the class default: the historical clamp radius must not follow later
+        # edits of the default.
+        payload["transport_chart_max_norm"] = 20.0
     family = payload.get("family")
     if isinstance(family, str):
         if family in _RETIRED_FAMILIES:
