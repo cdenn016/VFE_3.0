@@ -2694,11 +2694,6 @@ def plot_geometry_health(
             ("phi_matrix_norm_max", "max", _CB[3]),
             ("pos_phi_matrix_norm_p95", "positional p95", _CB[4]),
             ("pos_phi_matrix_norm_max", "positional max", _CB[5])]},
-        {"title": "Exponential chart guard", "ylabel": "fraction / scale", "series": [
-            ("phi_exp_clamp_frac", "clamped fraction", _CB[1]),
-            ("phi_exp_scale_min", "minimum scale", _CB[2]),
-            ("pos_phi_exp_clamp_frac", "positional clamped", _CB[4]),
-            ("pos_phi_exp_scale_min", "positional minimum", _CB[5])]},
         {"title": "Projected M-step chart", "ylabel": "fraction / scale", "series": [
             ("phi_chart_projected_fraction", "projected fraction", _CB[1]),
             ("phi_chart_projection_scale_min", "minimum scale", _CB[2])]},

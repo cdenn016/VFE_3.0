@@ -529,7 +529,6 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     grad_clip                            = 1.0,         # L2 gradient clip applied independently per optimizer role
     
-    exp_fp64_norm_threshold              = 20.0,          # "norm" mode threshold
     
 
     # Working precision of the decode's a_v reduction. a_v accumulates
@@ -558,7 +557,6 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
       
     skip_belief_sigma_update             = True,        # skip the belief-channel sigma E-step update
     
-    transport_clamp_monitor              = True,
     generate_embedding_figures           = False,
 )
 

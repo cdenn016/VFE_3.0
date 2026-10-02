@@ -28,7 +28,8 @@ from vfe3.posthoc import maps as mp
 from vfe3.posthoc import streams as st
 from vfe3.posthoc.attention import AttentionStatsObserver
 from vfe3.posthoc.klcap import KLCapObserver
-from vfe3.run_resources import optimizer_state_bytes, parameter_breakdown, throughput_summary
+from vfe3.run_resources import (frozen_parameter_names, optimizer_state_bytes, parameter_breakdown,
+                                throughput_summary)
 
 V = 24
 DEVICE = torch.device("cpu")
@@ -43,7 +44,7 @@ def _cfg(**over: Any) -> VFE3Config:
     values = dict(vocab_size=V, embed_dim=4, n_heads=2, max_seq_len=8, eval_stride=4, n_layers=2,
                   batch_size=2, attention_mode="projected_predictive", block_mlp_expansion=2,
                   norm_type_block="none", layernorm_affine=False,           # pinned: independent of
-                  skip_belief_sigma_update=False, decode_temperature_learned=True,
+                  skip_belief_sigma_update=False,
                   beta_attention_prior="causal_alibi")                           # the config defaults
     values.update(over)
     with warnings.catch_warnings():
@@ -80,7 +81,8 @@ def test_parameter_breakdown_partitions_parameters_and_counts_reads() -> None:
     model = _model(cfg)
     named = dict(model.named_parameters())
     out = parameter_breakdown(named, cfg)
-    assert out["total"] == sum(p.numel() for p in named.values())
+    assert out["total"] == sum(p.numel() for p in named.values() if p.requires_grad)
+    assert out["frozen"] == {"prior_bank.decode_log_scale": 1, "total": 1}
     assert sum(out[s]["total"] for s in ("per_type_tables", "positional_frames", "context_processing",
                                           "other")) == out["total"]
     pb = model.prior_bank
@@ -95,7 +97,8 @@ def test_parameter_breakdown_partitions_parameters_and_counts_reads() -> None:
                 + model.pos_phi_free.shape[1] + out["context_processing"]["total"])
     assert out["parameters_read_per_token"] == expected
     # A state dict gives the same counts; its buffers are listed, not counted.
-    from_state = parameter_breakdown(model.state_dict(), cfg)
+    state = model.state_dict()
+    from_state = parameter_breakdown(state, cfg, frozen=frozen_parameter_names(cfg, state))
     assert from_state["total"] == out["total"]
     assert "prior_bank.unigram_log_prior" in from_state["excluded_buffers"]
     wrapped = parameter_breakdown({f"_orig_mod.{n}": p for n, p in named.items()}, cfg)
@@ -117,7 +120,7 @@ def test_optimizer_state_bytes_and_throughput(tmp_path: Path) -> None:
     path = tmp_path / "step_10.pt"
     torch.save(bundle, path)
     out = optimizer_state_bytes(path)
-    n_float = sum(p.numel() for p in model.parameters())
+    n_float = sum(p.numel() for p in model.parameters() if p.requires_grad)   # frozen: no grad, no slot
     assert out["by_slot"]["exp_avg"] == 4 * n_float and out["by_slot"]["exp_avg_sq"] == 4 * n_float
     assert out["optimizer_state_bytes"] == sum(out["by_slot"].values())
     assert out["by_parameter_section"]["per_type_tables"] > 0 and out["by_group_role"] == {
@@ -494,7 +497,7 @@ def test_run_posthoc_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     assert [rows[i.key]["row"] for i in iv.INTERVENTIONS] == list(range(1, 13))
     assert saved["klcap"]["validation"]["summary"]["per_layer"] and saved["attention"]["rows"]
     assert saved["resources"]["parameter_breakdown"]["total"] == sum(
-        p.numel() for p in _model(_cfg()).parameters())
+        p.numel() for p in _model(_cfg()).parameters() if p.requires_grad)
     assert saved["resources"]["optimizer_state"]["optimizer_state_bytes"] > 0
     assert saved["maps"]["snapshot_curves"]["n_snapshots"] == 2
     for name in ("interventions", "relational_run", "resources", "klcap_validation", "attention_stats",

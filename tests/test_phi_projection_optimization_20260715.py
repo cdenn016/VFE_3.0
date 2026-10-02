@@ -261,28 +261,6 @@ def test_projection_deduplicates_aliased_phi_tables() -> None:
     assert stats["phi_chart_total_rows"] == expected_rows
 
 
-def test_transport_clamp_uses_shared_norm_kernel(monkeypatch) -> None:
-    import vfe3.train as train_module
-
-    assert hasattr(train_module, "embedded_phi_frobenius_norm")
-    model = _phi_table_model()
-    calls = []
-    real_norm = gauge_optim.embedded_phi_frobenius_norm
-
-    def _recorded_norm(phi, group, **kwargs):
-        calls.append(tuple(phi.shape))
-        return real_norm(phi, group, **kwargs)
-
-    monkeypatch.setattr(train_module, "embedded_phi_frobenius_norm", _recorded_norm)
-    monkeypatch.setattr(train_module, "_PHI_CLAMP_WARNED", False)
-
-    train_module._warn_phi_transport_clamp(model)
-
-    assert calls
-    assert all(shape[-1] == model.group.generators.shape[0] for shape in calls)
-    assert not hasattr(train_module, "_PHI_CLAMP_GRAM_CACHE")
-
-
 def test_silent_train_step_projects_without_collecting_stats(monkeypatch) -> None:
     import vfe3.train as train_module
 

@@ -138,7 +138,6 @@ def _configuration(**overrides: Any) -> VFE3Config:
                     gauge_group="block_glk", skip_belief_sigma_update=True,
                     warmup_steps=0,
                     max_steps=2, log_interval=0, eval_interval=0,
-                    decode_temperature_learned=False,
                     use_head_mixer=False, use_block_mlp=False,
                     attention_mode="projected_predictive",
                     prior_handoff_rho=.7, prior_handoff_sigma=.4)

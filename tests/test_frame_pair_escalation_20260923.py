@@ -53,11 +53,10 @@ from vfe3.train import (
 )
 
 
-# Every test here exercises the opt-in escalation, so configs enable it and direct producer calls
-# run with the process switch on; the switch is restored after each test.
+# The escalation is unconditional since 2026-10-02; the counter is reset around each test.
 def tiny_config(**overrides: object) -> VFE3Config:
     return _profile_tiny_config(**{
-        "frame_pair_fp64_escalation": True, "attention_mode": "projected_predictive",
+        "attention_mode": "projected_predictive",
         "attention_residual": False,
         "predictive_covariance": "passthrough", "lambda_alpha_mode": "constant",
         "mu_init_std": 0.02, "sigma_init": 1.0, "phi_scale": 0.01, **overrides,
@@ -66,11 +65,9 @@ def tiny_config(**overrides: object) -> VFE3Config:
 
 @pytest.fixture(autouse=True)
 def _fresh_counter():
-    previous = transport.set_frame_pair_fp64_escalation(True)
     reset_frame_pair_fp64_escalations()
     yield
     reset_frame_pair_fp64_escalations()
-    transport.set_frame_pair_fp64_escalation(previous)
 
 
 def _force(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -113,29 +110,28 @@ def _dense_input(r: float, block_dims: Optional[list]) -> torch.Tensor:
     return M
 
 
-def _produce(kind: str, r: float, threshold: float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _produce(kind: str, r: float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if kind == "compact":
         M = _compact_input(r)
-        return (*_stable_compact_glk_exp_pair(M, exp_fp64_norm_threshold=threshold),
+        return (*_stable_compact_glk_exp_pair(M),
                 torch.linalg.matrix_exp(M.double()))
     dims = {"dense_full": None, "dense_equal": [2, 2], "dense_unequal": [2, 3]}[kind]
     M = _dense_input(r, dims)
     reference = (torch.linalg.matrix_exp(M.double()) if dims is None
                  else transport._blockwise_matrix_exp(M.double(), dims))
-    return (*stable_matrix_exp_pair(M, block_dims=dims, exp_fp64_norm_threshold=threshold),
+    return (*stable_matrix_exp_pair(M, block_dims=dims),
             reference)
 
 
-@pytest.mark.parametrize("threshold", [5.0, 20.0])        # norm island on / off
 @pytest.mark.parametrize("kind", ["compact", "dense_full", "dense_equal", "dense_unequal"])
-def test_certificate_boundary_and_exact_float64_recompute(kind: str, threshold: float) -> None:
+def test_certificate_boundary_and_exact_float64_recompute(kind: str) -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("error")                     # escalation is silent
-        U, V, _ = _produce(kind, 4.5, threshold)           # kappa_F eps_32 ~ 7e-5: stays float32
+        U, V, _ = _produce(kind, 4.5)                      # kappa_F eps_32 ~ 7e-5: stays float32
         assert U.dtype == V.dtype == torch.float32
         assert frame_pair_fp64_escalations() == 0
         for count, r in enumerate((5.0, 12.0), start=1):    # kappa_F eps_32 > 1e-4: float64
-            U, V, reference = _produce(kind, r, threshold)
+            U, V, reference = _produce(kind, r)
             assert U.dtype == V.dtype == torch.float64
             assert torch.equal(U, reference)                # exp of the SAME generators, in float64
             assert _pair_residual(U, V) <= 1e-8
@@ -145,9 +141,9 @@ def test_certificate_boundary_and_exact_float64_recompute(kind: str, threshold: 
 @pytest.mark.parametrize("kind", ["compact", "dense_full", "dense_equal"])
 def test_escalated_pair_is_consistent_where_float32_is_not(kind: str, monkeypatch) -> None:
     monkeypatch.setattr(transport, "_FRAME_PAIR_CONDITION_TOL", math.inf)
-    U32, V32, _ = _produce(kind, 10.0, 20.0)                 # the float32 pair, never escalated
+    U32, V32, _ = _produce(kind, 10.0)                       # the float32 pair, never escalated
     monkeypatch.setattr(transport, "_FRAME_PAIR_CONDITION_TOL", 1e-4)
-    U64, V64, _ = _produce(kind, 10.0, 20.0)
+    U64, V64, _ = _produce(kind, 10.0)
     assert U32.dtype == torch.float32 and U64.dtype == torch.float64
     assert _pair_residual(U32, V32) > 5e-3                  # ~2e-2 measured
     assert _pair_residual(U64, V64) <= 1e-10
@@ -157,7 +153,7 @@ def test_failures_still_raise_before_any_escalation(monkeypatch) -> None:
     _force(monkeypatch)
     nan = _compact_input(12.0)
     nan[1, 1, 0, 0] = float("nan")
-    with pytest.raises(FloatingPointError, match="nonfinite values before inversion"):
+    with pytest.raises(ValueError, match="nonfinite matrix norm"):    # the chart check runs first
         _stable_compact_glk_exp_pair(nan)
     with pytest.raises(ValueError, match="nonfinite matrix norm"):
         _stable_compact_glk_exp_pair(nan, validity_max_norm=100.0)
@@ -216,11 +212,10 @@ def test_escalated_gradient_matches_the_float64_reference(kind: str) -> None:
     W = torch.randn(M.shape, generator=torch.Generator().manual_seed(7), dtype=torch.float64)
     leaf = M.clone().requires_grad_(True)
     if kind == "compact":
-        U, V = _stable_compact_glk_exp_pair(leaf, exp_fp64_norm_threshold=20.0)
+        U, V = _stable_compact_glk_exp_pair(leaf)
     else:
         U, V = stable_matrix_exp_pair(
-            leaf, block_dims=[2, 2] if kind == "dense_equal" else None,
-            exp_fp64_norm_threshold=20.0)
+            leaf, block_dims=[2, 2] if kind == "dense_equal" else None)
     assert U.dtype == torch.float64
     ((U * W).sum() + (V * W).sum()).backward()
     assert leaf.grad.dtype == torch.float32
@@ -318,7 +313,6 @@ def _launcher(**overrides: object) -> VFE3Config:
         lambda_alpha_mode="constant", mu_init_std=0.02, sigma_init=1.0, phi_scale=0.01,
     )
     values.update(_LAUNCHER_TINY)
-    values["frame_pair_fp64_escalation"] = True
     values.update(overrides)
     return test_config(**values)
 
@@ -547,36 +541,3 @@ def test_an_escalating_terminal_validation_is_not_handed_off(forced: bool, monke
 
 
 # -- recorded diagnostic bank --------------------------------------------------------------------
-
-
-# -- the opt-in switch ------------------------------------------------------------------------------
-
-def test_escalation_is_off_by_default_and_installed_from_config() -> None:
-    assert test_config().frame_pair_fp64_escalation is False
-    VFEModel(_profile_tiny_config())
-    assert transport.frame_pair_fp64_escalation() is False
-    VFEModel(tiny_config())
-    assert transport.frame_pair_fp64_escalation() is True
-    with pytest.raises(ValueError, match="frame_pair_fp64_escalation"):
-        test_config(frame_pair_fp64_escalation=1)
-
-
-@pytest.mark.parametrize("kind", ["compact", "dense_full", "dense_equal", "dense_unequal"])
-def test_disabled_escalation_forms_no_certificate_and_keeps_float32(kind: str, monkeypatch) -> None:
-    transport.set_frame_pair_fp64_escalation(False)
-    _force(monkeypatch)                                          # would escalate every call if enabled
-
-    def no_certificate(*args: object, **kwargs: object) -> None:
-        raise AssertionError("the condition certificate was formed with the escalation disabled")
-
-    monkeypatch.setattr(transport, "_frame_pair_kappa", no_certificate)
-    U, V, _ = _produce(kind, 12.0, 20.0)
-    assert U.dtype == torch.float32 and V.dtype == torch.float32
-    assert frame_pair_fp64_escalations() == 0
-
-
-def test_disabled_escalation_trains_the_launcher_route_in_float32(monkeypatch) -> None:
-    _force(monkeypatch)
-    result = _run(_launcher(frame_pair_fp64_escalation=False))
-    assert result["escalations"] == 0
-    assert math.isfinite(float(result["loss"])) and result["mu"].dtype == torch.float32

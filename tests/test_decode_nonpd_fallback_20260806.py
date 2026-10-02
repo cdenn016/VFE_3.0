@@ -62,8 +62,7 @@ def _bank() -> tuple[VFEModel, prior_bank.PriorBank]:
                         family="gaussian_full", decode_mode="full_chunked",
                         decode_av_precision="fp64", decode_ce_stable_reduction=True,
                         decode_ranking_fp64_escalation=False, decode_ce_checkpoint="never",
-                        fp32_matmul_precision="highest", full_cov_kl_precision="fp32_escalate",
-                        safe_cholesky_jitter_mode="relative")
+                        fp32_matmul_precision="highest", full_cov_kl_precision="fp32_escalate")
     bank = model.prior_bank
     with torch.no_grad():
         row = torch.arange(bank.vocab_size) - bank.vocab_size // 2
@@ -261,7 +260,6 @@ def test_head_block_only_failure_is_excluded_by_dense_full_consumers(decode_mode
         family="gaussian_full",
         decode_mode=decode_mode,
         use_priorbank_head_evidence_mixer=True,
-        safe_cholesky_jitter_mode="relative",
     )
     bank = model.prior_bank
     mu = torch.tensor(

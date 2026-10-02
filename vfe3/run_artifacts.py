@@ -541,9 +541,10 @@ def _decode_tau_eff(
 
     .. math:: \tau_{\mathrm{eff}} = \tau \exp(-\mathrm{clamp}(s, -3, 3)),
 
-    with ``tau = decode_tau`` and ``s = decode_log_scale``. The scale is trainable unless the run
-    froze it, so the persisted ``decode_tau`` is only the initialization of the temperature the
-    decode ``logits = -KL / tau_eff`` actually used."""
+    with ``tau = decode_tau`` and ``s = decode_log_scale``. The scale is frozen in this build, but a
+    historical run with the retired ``decode_temperature_learned=True`` trained it, so the persisted
+    ``decode_tau`` is only the initialization of the temperature its decode
+    ``logits = -KL / tau_eff`` actually used."""
     prior_bank = getattr(model, "prior_bank", None)
     if prior_bank is None or getattr(cfg, "decode_mode", "linear") == "linear":
         return None
@@ -1376,6 +1377,69 @@ def _validate_serialized_optimizer_parameter_manifest(
                     or any(type(dimension) is not int or dimension < 0 for dimension in shape)):
                 raise RuntimeError("checkpoint optimizer parameter manifest shape is invalid")
     return manifest
+
+
+_RETIRED_DECODE_TEMPERATURE = "prior_bank.decode_log_scale"
+
+
+def _drop_retired_decode_temperature(
+    manifest:        object,
+    optimizer_state: object,
+    optimizer:       torch.optim.Optimizer,
+    model:           torch.nn.Module,
+) -> Tuple[object, object]:
+    r"""Remove a never-stepped retired learned decode temperature from a saved optimizer.
+
+    Runs saved under the retired ``decode_temperature_learned=True`` grouped
+    ``prior_bank.decode_log_scale`` in the optimizer; this build freezes it. When its saved AdamW slot
+    is empty the temperature was never stepped (for example a linear decode, whose readout discards
+    it), so dropping the entry, and any group it leaves empty, reproduces the saved optimizer exactly.
+    A populated slot means the run trained the temperature, and resuming would silently stop
+    training it, so that resume is refused as retired. Malformed inputs are returned unchanged for the
+    strict validators that follow.
+    """
+    if (not isinstance(manifest, Mapping) or not isinstance(optimizer_state, Mapping)
+            or not isinstance(manifest.get("parameter_groups"), list)
+            or not isinstance(optimizer_state.get("param_groups"), list)
+            or not isinstance(optimizer_state.get("state"), Mapping)
+            or len(manifest["parameter_groups"]) != len(optimizer_state["param_groups"])):
+        return manifest, optimizer_state
+    live_names = {name for group in _optimizer_parameter_name_shape_groups(model, optimizer)
+                  for name in (entry["name"] for entry in group)}
+    if _RETIRED_DECODE_TEMPERATURE in live_names:
+        return manifest, optimizer_state
+    retired_ids = [entry.get("parameter_id")
+                   for group in manifest["parameter_groups"] if isinstance(group, list)
+                   for entry in group
+                   if isinstance(entry, Mapping) and entry.get("name") == _RETIRED_DECODE_TEMPERATURE]
+    if not retired_ids:
+        return manifest, optimizer_state
+    slots = optimizer_state["state"]
+    if any(slots.get(parameter_id) for parameter_id in retired_ids):
+        raise RuntimeError(
+            "checkpoint optimizer trained the retired learned decode temperature "
+            "(decode_temperature_learned=True): prior_bank.decode_log_scale is frozen in this build, "
+            "so resuming would silently stop training it. Evaluate the checkpoint (its temperature "
+            "is replayed exactly) or start a fresh optimizer from its weights")
+    retired = set(retired_ids)
+    kept_manifest: List[object] = []
+    kept_groups: List[object] = []
+    for manifest_group, saved_group in zip(manifest["parameter_groups"], optimizer_state["param_groups"]):
+        if not isinstance(manifest_group, list) or not isinstance(saved_group, Mapping):
+            return manifest, optimizer_state
+        entries = [entry for entry in manifest_group
+                   if not (isinstance(entry, Mapping) and entry.get("parameter_id") in retired)]
+        params = saved_group.get("params")
+        if isinstance(params, list):
+            params = [parameter_id for parameter_id in params if parameter_id not in retired]
+        if not entries and manifest_group:
+            continue                                   # the group held only the temperature
+        kept_manifest.append(entries)
+        kept_groups.append({**saved_group, "params": params})
+    manifest = {**manifest, "parameter_groups": kept_manifest}
+    optimizer_state = {**optimizer_state, "param_groups": kept_groups,
+                       "state": {key: value for key, value in slots.items() if key not in retired}}
+    return manifest, optimizer_state
 
 
 def _validate_optimizer_parameter_manifest(
@@ -2334,8 +2398,12 @@ def load_checkpoint(
     if optimizer is not None:
         checkpoint_optimizer_state = ckpt.get("optimizer_state")
         if "optimizer_parameter_manifest" in ckpt:
+            checkpoint_manifest, checkpoint_optimizer_state = _drop_retired_decode_temperature(
+                ckpt.get("optimizer_parameter_manifest"), checkpoint_optimizer_state,
+                optimizer, model,
+            )
             _validate_optimizer_parameter_manifest(
-                ckpt.get("optimizer_parameter_manifest"),
+                checkpoint_manifest,
                 model,
                 optimizer,
             )
@@ -4545,7 +4613,7 @@ def _pure_path_report(
         return None
     from vfe3.geometry.groups import declared_invariant_families
     from vfe3.geometry.norms import get_norm_registration
-    from vfe3.geometry.transport import TRANSPORT_CLAMP_MAX_NORM, get_transport_registration
+    from vfe3.geometry.transport import get_transport_registration
     from vfe3.attention_prior import get_prior_registration
 
     invariant_families = declared_invariant_families(cfg.gauge_group)
@@ -4672,7 +4740,7 @@ def _pure_path_report(
     final_norm_name = getattr(cfg, "norm_type_final", "none")
     block_norm_registration = get_norm_registration(block_norm_name)
     final_norm_registration = get_norm_registration(final_norm_name)
-    transport_chart_max_norm = getattr(cfg, "transport_chart_max_norm", None)
+    transport_chart_max_norm = float(cfg.transport_chart_max_norm)
 
     conditional_fields = _conditional_artifact_fields(cfg)
     pure_flags = {
@@ -4711,10 +4779,8 @@ def _pure_path_report(
         "no_phi_mstep_chart_cap": getattr(cfg, "phi_mstep_max_matrix_norm", None) is None,
         "no_pullback_trust_region": getattr(cfg, "m_phi_update_mode", "adamw") not in (
             "pullback_group", "fisher_group"),
-        "no_transport_exponential_clipping": (
-            transport_chart_max_norm is not None
-            and float(transport_chart_max_norm) <= float(TRANSPORT_CLAMP_MAX_NORM)
-        ),
+        # The transport exponential is never rescaled: its chart radius is fail-closed (2026-10-02).
+        "no_transport_exponential_clipping": True,
         "no_additive_encoder_control": getattr(cfg, "encode_mode", "per_token") != "per_token_additive",
         "decoder_gauge_compatible": getattr(cfg, "decode_coordinates", "local") == "reference",
     }
@@ -5055,7 +5121,6 @@ def _save_figures(
             "holonomy_wilson", "cocycle_residual", "holonomy_deviation",
             "gauge_invariant_spread", "gauge_head_logdet_spread", "phi_norm_mean", "phi_norm_std",
             "phi_matrix_norm_p95", "phi_matrix_norm_p99", "phi_matrix_norm_max",
-            "phi_exp_clamp_frac", "phi_exp_scale_min",
             "vertex_cond_median", "vertex_cond_p95", "vertex_cond_p99",
             "phi_chart_projected_fraction", "phi_chart_projection_scale_min",
             "phi_chart_projection_ms",
@@ -5084,7 +5149,7 @@ def _save_figures(
         # -- generalization gap, positional loss, causal/attention sanity, and the held-out geometry.
         hist_val = _hist_subset(raw_figs.VALIDATION_SANITY_COLUMNS + (
             "val_phi_matrix_norm_p95", "val_phi_matrix_norm_p99", "val_phi_matrix_norm_max",
-            "val_phi_exp_clamp_frac", "val_phi_exp_scale_min", "val_vertex_cond_p99"))
+            "val_vertex_cond_p99"))
         if hist_val:
             fig = figs.plot_validation_sanity(
                 hist_val,

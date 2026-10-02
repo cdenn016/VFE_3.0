@@ -286,13 +286,11 @@ config: Dict[str, Any] = dict(
 
     grad_clip                            = 1.0,         # L2 gradient clip applied independently per optimizer role
 
-    exp_fp64_norm_threshold              = 20.0,          # "norm" mode threshold
     transport_chart_max_norm             = 20,
 
 
     full_cov_kl_precision                = "fp32_escalate",  # "fp64" | "fp32_escalate"
 
-    safe_cholesky_jitter_mode            = "relative",        #"absolute" | "relative"
     mu_trust_cholesky_rounds             = 3,
 
     

@@ -130,54 +130,49 @@ def test_build_factored_transport_does_not_form_dense_omega():
     assert factored.irrep_dims == [4, 4]
 
 
-# --- stable_matrix_exp_pair clamp monitor (audit 2026-07-01 C14 safe variant) ---------------------
+# --- stable_matrix_exp_pair: fail-closed chart radius, never a surrogate (2026-10-02) ----------------
 
-def test_clamp_monitor_warns_when_active():
-    """clamp_monitor=True surfaces the Frobenius-clamp surrogate: a matrix with ||M||_F >> max_norm
-    warns (the returned factor is exp(max_norm*M/||M||_F), not exp(M)); a small-norm matrix with
-    the flag on does NOT warn (the clamp is inactive, the operator exact)."""
-    import warnings
+def test_chart_radius_raises_instead_of_rescaling():
+    """A matrix outside the chart radius (default 20) raises; nothing returns exp(M * scale)."""
     from vfe3.geometry.transport import stable_matrix_exp_pair
 
     big = torch.zeros(2, 3, 3)
-    big[0, 0, 1] = 100.0                                          # ||M||_F = 100 >> max_norm = 15
-    with pytest.warns(RuntimeWarning, match="Frobenius clamp active"):
-        stable_matrix_exp_pair(big, clamp_monitor=True)
+    big[0, 0, 1] = 100.0
+    with pytest.raises(ValueError, match="validity bound exceeded"):
+        stable_matrix_exp_pair(big)
+    with pytest.raises(ValueError, match="must be finite and positive"):
+        stable_matrix_exp_pair(big, validity_max_norm=float("inf"))
+    exp_pos, _ = stable_matrix_exp_pair(big, validity_max_norm=150.0)
+    assert torch.equal(exp_pos, torch.linalg.matrix_exp(big))
 
-    small = 0.1 * torch.eye(3).expand(2, 3, 3).contiguous()       # ||M||_F well below max_norm
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")                            # any warning -> test failure
-        stable_matrix_exp_pair(small, clamp_monitor=True)
 
-
-def test_clamp_monitor_default_off_is_bit_identical():
-    """The default clamp_monitor=False path is bit-identical to an explicit False call and emits
-    no warning even when the clamp is active -- the hot path stays reduction/host-sync free."""
+def test_in_chart_exponential_is_exact():
+    """Inside the chart the factor is exp(M) itself, at the input precision."""
     import warnings
     from vfe3.geometry.transport import stable_matrix_exp_pair
 
     g = torch.Generator().manual_seed(0)
-    m = 30.0 * torch.randn(2, 4, 4, generator=g)                  # clamp active on this input
+    m = 0.5 * torch.randn(2, 4, 4, generator=g)
     with warnings.catch_warnings():
         warnings.simplefilter("error")                            # any warning -> test failure
-        exp_default, neg_default = stable_matrix_exp_pair(m)      # default flag: silent
-        exp_off, neg_off = stable_matrix_exp_pair(m, clamp_monitor=False)
-    assert torch.equal(exp_default, exp_off)
-    assert torch.equal(neg_default, neg_off)
+        exp_pos, exp_neg = stable_matrix_exp_pair(m)
+    assert torch.equal(exp_pos, torch.linalg.matrix_exp(m))
+    assert torch.equal(exp_neg, torch.linalg.inv(exp_pos.double()).float())
 
 
-def test_skew_transport_exp_not_clamped_for_large_phi():
-    # m16: matrix_exp of a SKEW matrix is orthogonal at ANY norm, so the flat transport builder must
-    # NOT apply the Frobenius clamp for skew (so_n/so_k) groups -- else a large ||embed(phi)|| silently
-    # returns exp of the RESCALED matrix (a shorter rotation), not exp(embed(phi)), on the pure path.
+def test_skew_transport_shares_the_chart_radius_and_is_exact_inside_it():
+    # The chart radius applies to so_n as well (fail-closed on runaway coordinates); inside it the
+    # skew exponential is exp(embed(phi)) itself, an exact rotation.
     from vfe3.geometry.transport import compute_transport_operators
     grp = get_group("so_n")(5, group_n=5, irrep_spec=[("l1", 1)])
     assert grp.skew_symmetric
     phi = torch.zeros(1, 1, grp.generators.shape[0])
-    phi[0, 0, 0] = 30.0                                          # ||embed(phi)||_F >> 15 (the clamp threshold)
-    out = compute_transport_operators(phi, grp)
+    phi[0, 0, 0] = 30.0
+    with pytest.raises(ValueError, match="validity bound exceeded"):
+        compute_transport_operators(phi, grp)
+    out = compute_transport_operators(phi, grp, validity_max_norm=60.0)
     phi_mat = torch.einsum("bna,aij->bnij", phi, grp.generators)
     true_exp = torch.linalg.matrix_exp(phi_mat)
-    assert torch.allclose(out["exp_phi"], true_exp, atol=1e-4)   # RED pre-fix: clamped to a shorter rotation
+    assert torch.allclose(out["exp_phi"], true_exp, atol=1e-4)
     eye = torch.eye(5).expand(1, 1, 5, 5)
     assert torch.allclose(torch.matmul(out["exp_phi"], out["exp_phi"].transpose(-1, -2)), eye, atol=1e-4)

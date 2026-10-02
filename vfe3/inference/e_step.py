@@ -15,7 +15,6 @@ if TYPE_CHECKING:
     from vfe3.model.relational_operators import RelationalOperators
 
 from vfe3.belief import BeliefState
-from vfe3.config import VFE3Config
 from vfe3.contracts import CanonicalFrameContext, EStepGradientRecord
 from vfe3.gradients.full_link import (
     FullLinkContext, build_full_link_context, full_link_cost, full_link_cost_parts,
@@ -37,11 +36,6 @@ from vfe3.geometry.transport import (
 )
 
 
-# The configured float64 matrix-exponential threshold (VFE3Config.exp_fp64_norm_threshold). Every
-# production call passes the configured value; this keeps a direct call on the same default.
-_EXP_FP64_NORM_THRESHOLD: float = VFE3Config.exp_fp64_norm_threshold
-
-
 def _transport(
     phi:                torch.Tensor,             # (N, n_gen) or (B, N, n_gen)
     group:              GaugeGroup,
@@ -49,13 +43,9 @@ def _transport(
     *,
     transport_mode:         str   = "flat",     # connection-regime registry key (default = flat)
     gauge_mode:             str   = "learned",  # 'learned' | 'trivial' (forwarded to the builder)
-
-    exp_fp64_norm_threshold: float = _EXP_FP64_NORM_THRESHOLD,   # max clamped block ||M||_F upcast threshold
-
-    clamp_monitor:          bool = False,        # opt-in: warn when the exp Frobenius clamp fires
     materialize:            bool = True,         # compatibility/diagnostic boundary
 
-    validity_max_norm:      Optional[float]          = None,  # fail-closed pre-clamp chart bound
+    validity_max_norm:      Optional[float]          = None,  # fail-closed chart radius (None -> default 20.0)
     mu:                     Optional[torch.Tensor]   = None,  # (N,K) or (B,N,K) means
     sigma:                  Optional[torch.Tensor]   = None,  # variances for covariant features
     transport_state:        Optional[TransportState] = None,  # registry-owned trainable state
@@ -83,8 +73,6 @@ def _transport(
         built = build_factored_transport(
             phi, group,
             gauge_mode=gauge_mode,
-            exp_fp64_norm_threshold=exp_fp64_norm_threshold,
-            clamp_monitor=clamp_monitor,
             validity_max_norm=validity_max_norm,
             right_phi=right_phi,
         )
@@ -99,8 +87,6 @@ def _transport(
         right_b = right_phi.unsqueeze(0) if right_phi is not None else None
         omega = build(phi.unsqueeze(0), group, gauge_mode=gauge_mode, mu=mu_b, mu_key=mu_kb,
                       sigma=sig_b, sigma_key=sig_kb,
-                      clamp_monitor=clamp_monitor,
-                      exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                       materialize=False,
                       validity_max_norm=validity_max_norm, exactness_out=exactness_out,
                       right_phi=right_b,
@@ -111,8 +97,6 @@ def _transport(
     else:
         built = build(phi, group, gauge_mode=gauge_mode, mu=mu, mu_key=mu_key,
                       sigma=sigma, sigma_key=sigma_key,
-                      clamp_monitor=clamp_monitor,
-                      exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                       materialize=False,
                       validity_max_norm=validity_max_norm, exactness_out=exactness_out,
                       right_phi=right_phi,
@@ -143,13 +127,11 @@ def build_belief_transport(
     *,
     transport_mode:              str                                         = "flat",   # connection-regime registry key
     gauge_mode:                  str                                         = "learned", # 'learned' | 'trivial' (forwarded to the builder)
-    clamp_monitor:               bool                                        = False,     # opt-in: warn when the exp Frobenius clamp fires (host sync)
     rope_on_value:               bool                                        = True,      # False -> value aggregation uses the un-rotated base
     rope_insertion:              str = "right",   # "right" (pure, folded frame) | "left" (legacy)
-    exp_fp64_norm_threshold:     float                                       = _EXP_FP64_NORM_THRESHOLD,  # upcast only when max clamped block ||M||_F >= this
     compact_phi_block_transport: bool                                        = False,    # packed phi factors for canonical flat block_glk
     require_vertex_factors:       bool                                        = False,    # exact flat vertex representation even for a single block
-    validity_max_norm:           Optional[float]                             = None,     # opt-in fail-closed pre-clamp chart bound
+    validity_max_norm:           Optional[float]                             = None,     # fail-closed chart radius (None -> default 20.0)
     mu:                          Optional[torch.Tensor]                      = None,     # belief-dependent builder reads these
     sigma:                       Optional[torch.Tensor]                      = None,     # belief-dependent builder reads these
     transport_state:             Optional[TransportState]                    = None,     # registry-owned trainable state mapping
@@ -170,14 +152,13 @@ def build_belief_transport(
     ``needs_mu`` / ``needs_sigma`` flags, never on literal mode names).
 
     When ``rope`` is given the built transport is wrapped in a :class:`RopeTransport` before being
-    returned. ``exp_fp64_norm_threshold`` controls the maximum clamped block norm at which the
-    flat builders compute in float64 on both routes.
+    returned. Every flat build certifies its float32 frame pair and escalates it to float64 when
+    the certificate fails (``stable_matrix_exp_pair``).
     """
     if transport_mode == "flat" and (
         require_vertex_factors or right_phi is not None or _can_fuse_flat(transport_mode, group)
     ):
-        built = build_factored_transport(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor,
-                                         exp_fp64_norm_threshold=exp_fp64_norm_threshold,
+        built = build_factored_transport(phi, group, gauge_mode=gauge_mode,
                                          validity_max_norm=validity_max_norm,
                                          right_phi=right_phi,
                                          _content_token_ids=_content_token_ids,
@@ -193,8 +174,6 @@ def build_belief_transport(
                            sigma=(sigma if registration.needs_sigma else None),
                            sigma_key=(sigma_key if registration.needs_sigma else None),
                            transport_state=transport_state,
-                           clamp_monitor=clamp_monitor,
-                           exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                            materialize=False,
                            validity_max_norm=validity_max_norm, right_phi=right_phi,
                            exactness_out=exactness_out)

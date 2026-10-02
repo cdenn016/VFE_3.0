@@ -33,7 +33,6 @@ def test_optimizer_groups_priors_by_m_lr():
                      m_p_mu_lr=0.01, m_p_sigma_lr=0.002, m_phi_lr=0.005,
                      decode_mode="diagonal_chunked",
                      use_block_mlp=False, untie_decode_bank=False, pos_phi="learned",
-                     decode_temperature_learned=True,
                      norm_type_block="none", layernorm_affine=False)
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
@@ -43,38 +42,7 @@ def test_optimizer_groups_priors_by_m_lr():
     assert lrs == [0.002, 0.005, 0.005, 0.01, 0.01, 0.01]
     # every PriorBank parameter is covered by exactly one group
     n_params = sum(len(g["params"]) for g in opt.param_groups)
-    assert n_params == len(list(model.parameters()))
-
-
-def test_phi_clamp_monitor_threshold_matches_transport_clamp():
-    # M2 (audit 2026-07-06): the M-step drift monitor must trip at the SAME Frobenius norm the
-    # transport clamp actually fires at -- else a phi whose embedded norm lands in (clamp, monitor]
-    # silently receives the surrogate exp(max_norm*M/||M||) transport with no warning. Pin the two
-    # defaults equal so they cannot drift apart again.
-    import inspect
-    from vfe3.train import _warn_phi_transport_clamp
-    from vfe3.geometry.transport import stable_matrix_exp_pair
-    monitor_thr = inspect.signature(_warn_phi_transport_clamp).parameters["max_norm"].default
-    clamp_thr   = inspect.signature(stable_matrix_exp_pair).parameters["max_norm"].default
-    assert monitor_thr == clamp_thr, f"monitor trips at {monitor_thr}, clamp fires at {clamp_thr}"
-
-
-def test_phi_clamp_monitor_does_not_construct_dense_generator_gram(monkeypatch):
-    import vfe3.train as train_module
-
-    cfg = test_config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=4)
-    model = VFEModel(cfg)
-    real_einsum = torch.einsum
-
-    def _reject_dense_gram(equation, *operands, **kwargs):
-        if equation == "aij,bij->ab":
-            raise AssertionError("clamp monitor constructed a dense generator Gram")
-        return real_einsum(equation, *operands, **kwargs)
-
-    train_module._PHI_CLAMP_WARNED = False
-    monkeypatch.setattr(torch, "einsum", _reject_dense_gram)
-
-    train_module._warn_phi_transport_clamp(model)
+    assert n_params == len([p for p in model.parameters() if p.requires_grad])
 
 
 def test_parameter_report_leaves_global_rng_untouched():

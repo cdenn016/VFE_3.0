@@ -599,7 +599,8 @@ def _parameter_cfg_like(run: RunRecord) -> SimpleNamespace:
         vocab_size=run.value("vocab_size"),
         decode_mode=run.value("decode_mode"),
         gauge_transport=run.value("gauge_transport", "on"),
-        decode_temperature_learned=run.value("decode_temperature_learned", True),
+        # Historical key: absent on runs after its 2026-10-02 retirement, which froze the temperature.
+        decode_temperature_learned=run.value("decode_temperature_learned", False),
     )
 
 

@@ -39,7 +39,6 @@ def _cfg(route: str = "conditional", **overrides: Any) -> VFE3Config:
         vocab_size=V, embed_dim=4, n_heads=2, batch_size=B, max_seq_len=N, eval_stride=2,
         n_layers=2, n_e_steps=1, warmup_steps=0, max_steps=12, log_interval=0, eval_interval=0,
         checkpoint_interval=0, skip_belief_sigma_update=True,
-        decode_temperature_learned=True,
         generate_embedding_figures=False, pos_phi="learned",
         use_block_mlp=True, block_mlp_expansion=1, beta_attention_prior="causal_alibi",
         norm_type_block="none", layernorm_affine=False)      # pinned: independent of the config defaults
@@ -297,7 +296,7 @@ def test_finalize_best_weights_resources_and_provenance(tmp_path: Path, early: N
     resources = json.loads((run_dir / "resources.json").read_text())
     assert resources["device_name"] == "cpu" and resources["peak_gpu_memory_mb"] is None
     assert resources["parameter_breakdown"]["total"] == sum(
-        p.numel() for p in model.parameters())
+        p.numel() for p in model.parameters() if p.requires_grad)
     assert resources["optimizer_state_bytes"]["total"] > 0
     assert resources["throughput_tokens_per_s"]["tokens_per_s"]["n"] >= 1
     assert resources["tokens_seen"] == cfg.max_steps * B * N and resources["wall_time_s"] == 2.0

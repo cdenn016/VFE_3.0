@@ -492,19 +492,23 @@ def test_steps_for_device_hours_and_the_width_ladder_rule(tmp_path: Path) -> Non
 # ----------------------------------------------------------------------------------------------
 
 def test_frozen_tables_are_reported_apart_under_identity_frames(tmp_path: Path) -> None:
-    cfg = _vcfg(gauge_transport="off", decode_temperature_learned=True)
+    cfg = _vcfg(gauge_transport="off")
     model = _vmodel(cfg)
     phi = model.prior_bank.phi_embed
     assert not phi.requires_grad and getattr(model, "pos_phi_free", None) is None
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     everything = sum(p.numel() for p in model.parameters())
     out = parameter_breakdown(dict(model.named_parameters()), cfg)
-    assert out["frozen"] == {"prior_bank.phi_embed": phi.numel(), "total": phi.numel()}
+    scale = model.prior_bank.decode_log_scale
+    assert out["frozen"] == {"prior_bank.phi_embed": phi.numel(),
+                             "prior_bank.decode_log_scale": scale.numel(),
+                             "total": phi.numel() + scale.numel()}
     assert out["total"] == trainable and out["total_including_frozen"] == everything
     assert out["per_type_tables"]["phi_embed"] == 0
     assert out["roles_by_name"]["prior_bank.phi_embed"]["frozen"] is True
     state = model.state_dict()
-    assert frozen_parameter_names(cfg, state) == ["prior_bank.phi_embed"]
+    assert sorted(frozen_parameter_names(cfg, state)) == ["prior_bank.decode_log_scale",
+                                                          "prior_bank.phi_embed"]
     from_state = parameter_breakdown(state, cfg, frozen=frozen_parameter_names(cfg, state))
     assert from_state["total"] == trainable and from_state["frozen"] == out["frozen"]
     assert from_state["parameters_read_per_token"] == out["parameters_read_per_token"]

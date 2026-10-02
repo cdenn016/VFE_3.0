@@ -47,9 +47,8 @@ def test_overridden_transport_routes_current_registration_flags(monkeypatch: pyt
 
 
 @pytest.mark.parametrize("compact", [False, True])
-@pytest.mark.parametrize("threshold,expected_dtype", [(5.0, torch.float32), (0.0, torch.float64)])
-def test_norm_precision_preserves_float64_storage_and_explicit_oracle(
-    monkeypatch: pytest.MonkeyPatch, compact: bool, threshold: float, expected_dtype: torch.dtype,
+def test_float64_input_is_exponentiated_and_stored_at_float64(
+    monkeypatch: pytest.MonkeyPatch, compact: bool,
 ) -> None:
     matrix = torch.tensor([[0.04, 0.02], [-0.03, -0.01]], dtype=torch.float64)
     reference = torch.linalg.matrix_exp(matrix)
@@ -60,16 +59,14 @@ def test_norm_precision_preserves_float64_storage_and_explicit_oracle(
         return original(value)
     monkeypatch.setattr(torch.linalg, "matrix_exp", recorded)
     if compact:
-        actual, inverse = transport._stable_compact_glk_exp_pair(
-            matrix.reshape(1, 1, 1, 2, 2), exp_fp64_norm_threshold=threshold)
+        actual, inverse = transport._stable_compact_glk_exp_pair(matrix.reshape(1, 1, 1, 2, 2))
         actual, inverse = actual[0, 0, 0], inverse[0, 0, 0]
     else:
-        actual, inverse = transport.stable_matrix_exp_pair(matrix, exp_fp64_norm_threshold=threshold)
-    assert seen == [expected_dtype]
+        actual, inverse = transport.stable_matrix_exp_pair(matrix)
+    assert seen == [torch.float64]
     assert actual.dtype == inverse.dtype == torch.float64
     torch.testing.assert_close(actual @ inverse, torch.eye(2, dtype=torch.float64), rtol=1e-13, atol=1e-13)
-    if threshold == 0.0:
-        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
 
 def test_predictive_gradient_capture_uses_host_nan_and_preserves_real_norms(

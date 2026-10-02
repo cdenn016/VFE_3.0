@@ -39,7 +39,7 @@ import vfe3.inference.e_step as e_step_mod  # noqa: E402
 from vfe3.config import VFE3Config, config_from_serialized  # noqa: E402
 from vfe3.data.datasets import make_dataloader  # noqa: E402
 from vfe3.geometry.transport import (  # noqa: E402
-    frame_pair_fp64_escalations, reset_frame_pair_fp64_escalations, set_frame_pair_fp64_escalation,
+    frame_pair_fp64_escalations, reset_frame_pair_fp64_escalations,
 )
 from vfe3.model.model import VFEModel  # noqa: E402
 from vfe3.numerics import safe_eigvalsh, triangular_condition_estimate  # noqa: E402
@@ -484,7 +484,6 @@ def main() -> None:
                 break
         settings: List[Tuple[str, Dict[Callable, object]]] = [
             ("projected_cov_condition_recovery=True", {set_projected_condition_recovery: True}),
-            ("frame_pair_fp64_escalation=True", {set_frame_pair_fp64_escalation: True}),
             ("projected_factor_route=cholesky_qr2", {set_projected_factor_route: "cholesky_qr2"}),
             ("projected_factor_route=cholesky_qr2+condition_recovery",
              {set_projected_factor_route: "cholesky_qr2", set_projected_condition_recovery: True})]

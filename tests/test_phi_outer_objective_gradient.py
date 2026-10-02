@@ -36,7 +36,6 @@ def _outer_cfg(**overrides: object) -> VFE3Config:
         "layernorm_affine": True,
         "skip_belief_sigma_update": True,
         "beta_attention_prior": "causal_alibi",
-        "decode_temperature_learned": True,
     }
     values.update(overrides)
     return test_config(**values)

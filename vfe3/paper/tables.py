@@ -74,9 +74,9 @@ PRECISION_KEYS: Tuple[str, ...] = (
     "decode_av_precision", "deterministic",
 )
 FACTORIZATION_KEYS: Tuple[str, ...] = (
-    "projected_factor_route", "projected_cov_condition_recovery", "safe_cholesky_jitter_mode",
+    "projected_factor_route", "projected_cov_condition_recovery",
 )
-EXPONENTIAL_KEYS: Tuple[str, ...] = ("exp_fp64_mode", "exp_fp64_norm_threshold", "transport_chart_max_norm")
+EXPONENTIAL_KEYS: Tuple[str, ...] = ("exp_fp64_mode", "transport_chart_max_norm")
 
 
 # ----------------------------------------------------------------------------------------------

@@ -3,7 +3,6 @@ from tests.profiles import test_config
 from collections.abc import Iterator
 import importlib
 import os
-import warnings
 
 import pytest
 import torch
@@ -79,9 +78,7 @@ def test_norm_fallback_retains_reduction(kind: str, device: torch.device,
 
 
 @pytest.mark.parametrize('dtype', [torch.float32, torch.float64])
-@pytest.mark.parametrize('threshold', [20.0, 0.0])
-def test_unique_factors_values_gradients_hvp(dtype: torch.dtype, threshold: float,
-                                           device: torch.device) -> None:
+def test_unique_factors_values_gradients_hvp(dtype: torch.dtype, device: torch.device) -> None:
     torch.manual_seed(20)
     ids = torch.tensor([[2, 0, 2, 1], [0, 2, 2, 0]], device=device)
     table = (torch.randn(3, 2, 2, 2, dtype=dtype, device=device) * 0.04).requires_grad_()
@@ -93,8 +90,7 @@ def test_unique_factors_values_gradients_hvp(dtype: torch.dtype, threshold: floa
     for reuse in (False, True):
         factors = transport.build_factored_transport(
             table[ids].flatten(-3), group, compact_blocks=True, right_phi=position,
-            exp_fp64_norm_threshold=threshold,
-            _content_token_ids=ids if reuse else None, validity_max_norm=18.0, clamp_monitor=True)
+            _content_token_ids=ids if reuse else None, validity_max_norm=18.0)
         loss = (factors.exp_blocks * weights[0]).sum() + (factors.inv_blocks * weights[1]).sum()
         grads = torch.autograd.grad(loss, (table, position), create_graph=True)
         hvp = torch.autograd.grad(sum((g * d).sum() for g, d in zip(grads, directions)), (table, position))
@@ -103,22 +99,18 @@ def test_unique_factors_values_gradients_hvp(dtype: torch.dtype, threshold: floa
         torch.testing.assert_close(a, b, rtol=3e-5, atol=3e-6)
 
 
-def test_unique_exp_work_and_occurrence_clamp_fraction(device: torch.device,
-                                                      monkeypatch: pytest.MonkeyPatch) -> None:
+def test_unique_exp_work_is_shared(device: torch.device, monkeypatch: pytest.MonkeyPatch) -> None:
     ids = torch.tensor([[0, 0, 1, 0]], device=device)
     table = torch.zeros(2, 2, 2, 2, device=device)
-    table[0, 0, 0, 0] = 21
+    table[0, 0, 0, 0] = 1.5
     shapes = []
     original = torch.linalg.matrix_exp
     def counted(matrix: torch.Tensor) -> torch.Tensor:
         shapes.append(tuple(matrix.shape))
         return original(matrix)
     monkeypatch.setattr(torch.linalg, 'matrix_exp', counted)
-    with warnings.catch_warnings(record=True) as recorded:
-        warnings.simplefilter('always')
-        transport._stable_compact_glk_exp_pair(table[ids], clamp_monitor=True, _content_token_ids=ids)
+    transport._stable_compact_glk_exp_pair(table[ids], _content_token_ids=ids)
     assert shapes == [(2, 2, 2, 2)]
-    assert any('75.0%' in str(w.message) for w in recorded)
 
 
 @pytest.mark.parametrize('kind', ['nonfinite', 'bound'])
@@ -143,7 +135,7 @@ def test_unique_table_directional_finite_difference(device: torch.device) -> Non
     direction = torch.randn_like(table)
     weights = torch.randn(1, 4, 2, 2, 2, dtype=table.dtype, device=device)
     def objective(x: torch.Tensor) -> torch.Tensor:
-        factors = transport._stable_compact_glk_exp_pair(x[ids], exp_fp64_norm_threshold=0.0, _content_token_ids=ids)
+        factors = transport._stable_compact_glk_exp_pair(x[ids], _content_token_ids=ids)
         return (factors[0] * weights).sum()
     gradient, = torch.autograd.grad(objective(table), table)
     delta = 1e-5
@@ -200,4 +192,4 @@ def test_reuse_extreme_token_counts(same_token: bool, device: torch.device,
 
 def test_unique_factors_under_active_bf16_autocast(device: torch.device) -> None:
     with torch.autocast(device.type, dtype=torch.bfloat16):
-        test_unique_factors_values_gradients_hvp(torch.float32, 20.0, device)
+        test_unique_factors_values_gradients_hvp(torch.float32, device)

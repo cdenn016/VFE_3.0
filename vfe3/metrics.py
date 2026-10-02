@@ -158,19 +158,16 @@ def phi_chart_statistics(
     generators: 'torch.Tensor | GaugeGroup',            # (n_gen, K, K)
 
     *,
-    max_norm:   float               = 20.0,
     eps:        float               = 1e-12,
     block_dims: Optional[List[int]] = None,
 ) -> Dict[str, float]:
-    r"""Summarize embedded chart radius, exponential clamp activation, and conditioning."""
+    r"""Summarize the embedded chart radius and the conditioning of the exact vertex exp(M)."""
     matrix = _diagnostic_embed(phi.double(), generators)
     norm = torch.linalg.matrix_norm(matrix, ord="fro", dim=(-2, -1))
-    scale = (max_norm / norm.clamp(min=eps)).clamp(max=1.0)
     from vfe3.geometry.transport import _blockwise_matrix_exp
-    scaled = matrix * scale[..., None, None]
-    exp_matrix = (_blockwise_matrix_exp(scaled, block_dims)
+    exp_matrix = (_blockwise_matrix_exp(matrix, block_dims)
                   if block_dims and len(block_dims) > 1
-                  else torch.linalg.matrix_exp(scaled))
+                  else torch.linalg.matrix_exp(matrix))
     singular = torch.linalg.svdvals(exp_matrix)
     condition = singular[..., 0] / singular[..., -1].clamp(min=eps)
     return {
@@ -178,8 +175,6 @@ def phi_chart_statistics(
         "phi_matrix_norm_p95":    _finite_quantile(norm, 0.95),
         "phi_matrix_norm_p99":    _finite_quantile(norm, 0.99),
         "phi_matrix_norm_max":    float(norm.max()) if norm.numel() else float("nan"),
-        "phi_exp_clamp_frac":     float((scale < 1.0).float().mean()) if scale.numel() else 0.0,
-        "phi_exp_scale_min":      float(scale.min()) if scale.numel() else 1.0,
         "vertex_cond_median":     _finite_quantile(condition, 0.50),
         "vertex_cond_p95":        _finite_quantile(condition, 0.95),
         "vertex_cond_p99":        _finite_quantile(condition, 0.99),
@@ -213,7 +208,6 @@ def flatness_reference_statistics(
 
     *,
     max_triangles: int   = 64,
-    max_norm:      float = 20.0,
     eps:           float = 1e-12,
     block_dims:    Optional[List[int]] = None,
 ) -> Dict[str, float]:
@@ -224,16 +218,10 @@ def flatness_reference_statistics(
     """
     coordinate = phi[0] if phi.dim() == 3 else phi
     matrix64 = _diagnostic_embed(coordinate.double(), generators)
-    norm64 = torch.linalg.matrix_norm(matrix64, ord="fro", dim=(-2, -1))
-    scale64 = (max_norm / norm64.clamp(min=eps)).clamp(max=1.0)
-    matrix64 = matrix64 * scale64[..., None, None]
     right_matrix64 = None
     if right_phi is not None:
         right_coordinate = right_phi[0] if right_phi.dim() == 3 else right_phi
         right_matrix64 = _diagnostic_embed(right_coordinate.double(), generators)
-        right_norm64 = torch.linalg.matrix_norm(right_matrix64, ord="fro", dim=(-2, -1))
-        right_scale64 = (max_norm / right_norm64.clamp(min=eps)).clamp(max=1.0)
-        right_matrix64 = right_matrix64 * right_scale64[..., None, None]
     triples = _deterministic_triples(matrix64.shape[0], max_triangles)
     k_dim = matrix64.shape[-1]
 

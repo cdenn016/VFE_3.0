@@ -89,21 +89,20 @@ def test_model_forward_and_backward_under_linear_decode():
 def test_optimizer_covers_all_params_under_linear_decode():
     # build_optimizer must group the output projection too: every model parameter is covered
     # by exactly one group (a missing group would silently freeze that weight).
-    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2, decode_mode="linear",
-                      decode_temperature_learned=True)
+    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2, decode_mode="linear")
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
     grouped = {p for grp in opt.param_groups for p in grp["params"]}
-    assert grouped == set(model.parameters())
+    assert grouped == {p for p in model.parameters() if p.requires_grad}
     assert model.prior_bank.output_proj_weight in grouped
 
 
 def test_optimizer_still_exactly_covers_params_under_prior_bank_decode():
     cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2,
-                      decode_mode="diagonal_chunked", decode_temperature_learned=True)
+                      decode_mode="diagonal_chunked")
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
     grouped = {p for grp in opt.param_groups for p in grp["params"]}
-    assert grouped == set(model.parameters())
+    assert grouped == {p for p in model.parameters() if p.requires_grad}
 
 

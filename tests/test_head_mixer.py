@@ -127,7 +127,6 @@ def test_optimizer_covers_head_mixer_params():
         embed_dim=4,
         n_heads=2,
         use_head_mixer=True,
-        decode_temperature_learned=True,
         m_p_mu_lr=0.0123,
         m_head_mixer_lr=0.0022,
     )
@@ -138,7 +137,7 @@ def test_optimizer_covers_head_mixer_params():
         group for group in opt.param_groups
         if any(parameter is model.head_mixer.mixer_delta for parameter in group["params"])
     )
-    assert grouped == set(model.parameters())
+    assert grouped == {p for p in model.parameters() if p.requires_grad}
     assert model.head_mixer.mixer_delta in grouped
     assert mixer_group["lr"] == pytest.approx(cfg.m_head_mixer_lr)
     assert mixer_group["weight_decay"] == pytest.approx(cfg.weight_decay)

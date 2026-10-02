@@ -993,9 +993,9 @@ class PriorBank(nn.Module):
     The routed mean/variance tables and ``phi_embed`` (V, n_gen) parameterize
     pi_v = N(mu_v, exp(sigma_log_v)) with gauge frame phi_v. ``mu_embed`` and ``sigma_log_embed``
     are always allocated and are the ONLY belief prior. They are PRIORS (nn.Parameter), not a
-    neural map: there is no nn.Linear/MLP/activation anywhere in this module. The learnable
-    scalar ``decode_log_scale`` tunes the decode temperature; ``VFEModel`` freezes it when
-    ``decode_temperature_learned=False``, fixing tau_eff at its initialized value.
+    neural map: there is no nn.Linear/MLP/activation anywhere in this module. The
+    scalar ``decode_log_scale`` sets the decode temperature; ``VFEModel`` always freezes it,
+    fixing tau_eff at its initialized (or loaded) value.
     """
 
     output_proj_weight: Optional[nn.Parameter]   # (V, K) linear-decode weight; None for prior-bank modes
