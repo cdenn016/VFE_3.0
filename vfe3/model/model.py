@@ -74,7 +74,7 @@ from vfe3.geometry.transport import (
     set_full_cov_congruence_certification,
     set_full_cov_congruence_precision,
 )
-from vfe3.numerics import set_mu_trust_cholesky_rounds, set_safe_cholesky_jitter_mode
+from vfe3.numerics import safe_eigvalsh, set_mu_trust_cholesky_rounds, set_safe_cholesky_jitter_mode
 from vfe3.relational_scoring import set_projected_condition_recovery, set_projected_factor_route
 from vfe3.runtime import set_fp32_matmul_precision
 from vfe3.model.relational_operators import RelationalOperators
@@ -2064,7 +2064,7 @@ class VFEModel(nn.Module):
             residual=ops.attention_residual))
         covariance = torch.stack((cap["projected_covariance_pre"],
                                   cap["projected_key_covariance_pre"])).float()
-        eig = torch.linalg.eigvalsh(covariance)
+        eig = safe_eigvalsh(covariance)
         d["relational_projected_cov_min_eigenvalue"] = float(eig.min())
         d["relational_projected_cov_max_condition"] = float((eig[..., -1]/eig[..., 0]).max())
         d["relational_covariance_repair_count"] = float(cap.get("relational_covariance_repair_count", 0.0))
