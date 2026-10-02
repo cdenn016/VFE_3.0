@@ -43,7 +43,7 @@ FULL_LIKE: Dict[str, Any] = dict(
 def _cfg(**over: Any) -> VFE3Config:
     values: Dict[str, Any] = dict(
         vocab_size=V, embed_dim=4, n_heads=2, max_seq_len=6, eval_stride=3, n_layers=2, batch_size=2,
-        attention_mode="projected_predictive", e_phi_lr=0.0, block_mlp_expansion=2,
+        attention_mode="projected_predictive", block_mlp_expansion=2,
         attention_residual=True, norm_type_block="layernorm", layernorm_affine=True,   # pinned: independent
         skip_belief_sigma_update=False)                                                # of the WIP defaults
     values.update(over)

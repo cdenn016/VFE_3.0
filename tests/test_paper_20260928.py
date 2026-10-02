@@ -50,7 +50,7 @@ def _one_thread() -> None:
 
 def _cfg(**over: Any) -> VFE3Config:
     values = dict(vocab_size=V, embed_dim=K, n_heads=2, max_seq_len=8, eval_stride=4, n_layers=1,
-                  batch_size=2, attention_mode="projected_predictive", e_phi_lr=0.0, block_mlp_expansion=2,
+                  batch_size=2, attention_mode="projected_predictive", block_mlp_expansion=2,
                   max_steps=20, warmup_steps=2, min_lr_frac=0.1, m_p_sigma_lr=0.01, sigma_weight_decay=0.2,
                   sigma_init=2.0, seed=0)
     values.update(over)

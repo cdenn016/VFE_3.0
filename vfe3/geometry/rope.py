@@ -5,8 +5,8 @@ rotary positional structure"): within each irrep block of size d, coordinate pai
 rotate by theta_{n,k} = n * base^{-2k/d}, and transport composes as the outer orthogonal similarity
 Omega_ij = R(theta_i) Omega_ij^learned R(theta_j)^T. R(theta) coincides with a structure-group
 gauge element (the frame U_i = R(theta_i) exp(phi_i)) ONLY on blocks where the irrep image is full
-SO(d) (glk/so_k; the l1 defining rep of SO(3)). On higher so_n/sp_n irrep blocks (dim > N) the
-coordinate-pair rotation is a generic SO(d) element OUTSIDE the irrep image rho(SO(N))/rho(Sp(2m)),
+SO(d) (block_glk heads; the l1 defining rep of SO(3)). On higher so_n irrep blocks (dim > N) the
+coordinate-pair rotation is a generic SO(d) element OUTSIDE the irrep image rho(SO(N)),
 so R Omega R^T leaves the selected structure group (config.py warns at build); the code never
 assumes R in rho(G) -- it enters only as the outer similarity. Block-diagonal on irrep_dims so R is
 orthogonal (the GL(K)-congruence divergence invariance and the block-diagonal exp fast path are

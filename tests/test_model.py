@@ -4,14 +4,12 @@ import pytest
 from types import SimpleNamespace
 
 
-
-
 from vfe3.model.model import VFEModel
 
 
 def test_model_forward_shapes_and_loss():
     cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=2,
-                     n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0)
+                     n_e_steps=1, e_q_mu_lr=0.05)
     model = VFEModel(cfg)
     tokens = torch.randint(0, 20, (3, 5))
     logits = model(tokens)
@@ -25,7 +23,7 @@ def test_loss_backward_reaches_prior_tables():
     # THE crown jewel: the unrolled E-step keeps the training graph connected, so the
     # M-step gradient reaches the encode/phi prior parameters (not just decode).
     cfg = test_config(vocab_size=15, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=2,
-                     n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.0, gradient_mode="filtering")
+                     n_e_steps=2, e_q_mu_lr=0.05)
     model = VFEModel(cfg)
     tokens = torch.randint(0, 15, (2, 4)); targets = torch.randint(0, 15, (2, 4))
     _, loss, _ = model(tokens, targets)
@@ -76,9 +74,9 @@ def test_model_has_no_nn_layers():
 def test_build_group_dispatches_on_arity_for_every_group() -> None:
     from vfe3.model.model import build_group
     # This is a standalone group-builder contract; model inference admits block_glk only.
-    for name in ("glk", "block_glk", "so_k"):
+    for name, group_n, irrep_spec in (("block_glk", None, None), ("so_n", 4, [("l1", 1)])):
         cfg = SimpleNamespace(gauge_group=name, embed_dim=4, n_heads=2,
-                              cross_couplings=None, group_n=None, irrep_spec=None)
+                              group_n=group_n, irrep_spec=irrep_spec)
         group = build_group(cfg)
         assert group.generators.shape[-1] == 4
 
@@ -141,7 +139,7 @@ def test_killing_per_block_precond_runs_through_forward():
     # must not crash the forward. The per-block Killing metric needs the group's irrep_dims,
     # which the E-step must thread into precondition_phi_gradient.
     cfg = test_config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
-                     n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.0,
+                     n_e_steps=2, e_q_mu_lr=0.05,
                      phi_precond_mode="killing_per_block")
     model = VFEModel(cfg)
     tokens = torch.randint(0, 12, (2, 4)); targets = torch.randint(0, 12, (2, 4))
@@ -157,7 +155,7 @@ def test_model_rejects_tied_block_glk() -> None:
 def test_diagnostics_reports_projected_geometry_semantics() -> None:
     import math
     cfg = test_config(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
-                      n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.0)
+                      n_e_steps=2, e_q_mu_lr=0.05)
     d = VFEModel(cfg).diagnostics(torch.randint(0, 7, (2, 4)))
     assert d["relational_semantics"] == "relational_full_link_frozen_filtering"
     assert d["relational_legacy_global_f_available"] == 0.0
@@ -170,7 +168,7 @@ def test_attention_maps_shape_and_row_stochastic():
     # Per-layer, per-head attention: (L, H, N, N) with H = len(irrep_dims) (block_glk K=4 -> 2 heads),
     # and every query row of every head is row-stochastic (softmax over keys -> sums to 1).
     cfg = test_config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=3,
-                     n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0, prior_handoff_rho=0.5)
+                     n_e_steps=1, e_q_mu_lr=0.05, prior_handoff_rho=0.5)
     model = VFEModel(cfg)
     tokens = torch.randint(0, 12, (2, 6))
     maps = model.attention_maps(tokens)
@@ -186,7 +184,7 @@ def test_attention_maps_last_layer_matches_diagnostics():
     # diagnostics' attn_entropy, which guards the block-by-block replay against trajectory drift.
     from vfe3 import metrics
     cfg = test_config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                     n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.0,
+                     n_e_steps=2, e_q_mu_lr=0.05,
                      norm_type_block="none", use_block_mlp=False)
     model = VFEModel(cfg)
     # attention_maps reports sequence 0; projected diagnostics average the batch (audit 2026-10-01
@@ -204,7 +202,7 @@ def test_diagnostics_per_layer_shape_and_finite():
     # Each layer reports available projected diagnostics and explicit unavailable global terms.
     import math
     cfg = test_config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=3,
-                     n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0, prior_handoff_rho=0.5)
+                     n_e_steps=1, e_q_mu_lr=0.05, prior_handoff_rho=0.5)
     model = VFEModel(cfg)
     tokens = torch.randint(0, 12, (2, 6))
     pl = model.diagnostics_per_layer(tokens)
@@ -222,7 +220,7 @@ def test_diagnostics_per_layer_attn_entropy_matches_attention_maps():
     # replay vfe_stack's block loop identically); guards the per-layer diagnostics against drift.
     from vfe3 import metrics
     cfg = test_config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=3,
-                     n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.0, prior_handoff_rho=0.5)
+                     n_e_steps=2, e_q_mu_lr=0.05, prior_handoff_rho=0.5)
     model = VFEModel(cfg)
     tokens = torch.randint(0, 12, (1, 5), generator=torch.Generator().manual_seed(0))   # see F5 note above
     pl = model.diagnostics_per_layer(tokens)
@@ -241,6 +239,3 @@ def test_model_rejects_sp_gauge_group() -> None:
         test_config(gauge_group="sp")
 
 
-def test_model_rejects_cross_coupled_block_glk() -> None:
-    with pytest.raises(ValueError, match="cross_couplings"):
-        test_config(cross_couplings=[(0, 1)])

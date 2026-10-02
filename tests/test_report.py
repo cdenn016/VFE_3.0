@@ -1,4 +1,4 @@
-r"""Single-run publication-figure driver (vfe3.viz.report) + the converged_state extractor.
+r"""Single-run publication-figure driver (vfe3.viz.report) + the readout_state extractor.
 
 These pin the WIRING the user found missing: the figure generators and extract runners existed
 and were unit-tested in isolation, but nothing drove them end-to-end against a real model, so a
@@ -39,7 +39,7 @@ def _loader(seed=0, n=600, seq_len=8, bs=8):
 
 def _cfg(**kw):
     base = dict(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                n_e_steps=2, e_q_mu_lr=0.1, e_phi_lr=0.0)
+                n_e_steps=2, e_q_mu_lr=0.1)
     base.update(kw)
     return test_config(**base)
 
@@ -60,7 +60,7 @@ def _bind_offline_selection_contract(
     })
 
 
-def test_converged_state_shapes_and_finite():
+def test_readout_state_shapes_and_finite():
     model = _model(n_layers=2)
     tok = torch.randint(0, 6, (2, 8))                          # only seq 0 is used
     st = readout_state(model, tok)
@@ -221,34 +221,25 @@ def test_generate_figures_embedding_switch_runs_semantic_analysis(tmp_path, monk
     assert (run_dir / "figures" / "reliability_diagram.png") in paths
 
 
-def test_generate_figures_skips_legacy_gauge_certificate_on_projected_route(tmp_path, monkeypatch):
-    """The report driver forwards the live model policy to its gauge-residual measurement."""
-    from vfe3 import metrics
-    from vfe3.viz import report
+def test_generate_figures_emits_projected_gauge_equivariance(tmp_path, monkeypatch):
+    """The report measures equivariance of the executed projected score, not a retired energy."""
+    from vfe3.viz import extract
 
-    model = _model(
-        family="gaussian_full",
-        full_cov_kl_precision="fp64",
-        full_cov_congruence_precision="fp64",
-        e_phi_lr=0.0,
-        n_e_steps=1,
-    )
-    seen = []
+    model = _model(family="gaussian_full", decode_mode="full_chunked", n_e_steps=1)
+    measured = []
+    real = extract.projected_gauge_equivariance
 
-    def observed_residual(*_args, full_cov_kl_precision, **_kwargs):
-        seen.append(full_cov_kl_precision)
-        return {
-            "energy_in_group": torch.tensor([0.0]),
-            "energy_out_group": torch.tensor([1.0]),
-            "beta_in_group": torch.tensor([0.0]),
-            "beta_out_group": torch.tensor([1.0]),
-        }
+    def observed(*args, **kwargs):
+        result = real(*args, **kwargs)
+        measured.append(result)
+        return result
 
-    monkeypatch.setattr(metrics, "gauge_equivariance_residual", observed_residual)
+    monkeypatch.setattr(extract, "projected_gauge_equivariance", observed)
     paths = generate_figures(tmp_path / "run", model=model, loader=_loader(), max_sequences=1)
 
-    assert seen == []
-    assert (tmp_path / "run" / "figures" / "gauge_equivariance.png") not in paths
+    assert len(measured) == 1
+    assert max(max(values) for values in measured[0]["residuals"].values()) < 1e-10
+    assert (tmp_path / "run" / "figures" / "gauge_equivariance.png") in paths
 
 
 def test_generate_figures_rejects_empty_best_bundle_state(tmp_path):

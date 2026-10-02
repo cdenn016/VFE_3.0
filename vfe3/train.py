@@ -32,7 +32,7 @@ except ImportError:                                 # tqdm optional: absent -> n
     _tqdm = None                                    # log lines still emit at log_interval as before
     _redirect_logging = contextlib.nullcontext
 
-from vfe3.contracts import is_conditional_filtering, is_vfe_model, model_family_of
+from vfe3.contracts import is_vfe_model, model_family_of
 from vfe3.config import VFE3Config
 from vfe3.contracts import DataState, DataStateBuffer
 from vfe3.data.datasets import make_dataloader
@@ -57,11 +57,7 @@ from vfe3.run_artifacts import RunArtifacts          # top-level safe: run_artif
 #                                                      lazily (function-local), so there is no cycle
 from vfe3.runtime import seed_everything
 from vfe3.timing import TrainingTimer
-from vfe3.viz.extract import (
-    e_step_belief_trace as _snapshot_trace,
-    e_step_fixed_point_diagnostics as _snapshot_fixed_point,
-    converged_state as _snapshot_converged,
-)
+from vfe3.viz.extract import e_step_belief_trace as _snapshot_trace
 from vfe3.geometry.transport import TRANSPORT_CLAMP_MAX_NORM   # single source for the phi-clamp threshold (M2)
 from vfe3.geometry.retraction import (                          # SPD-retraction non-finite tangent guard
     nonfinite_tangent_elements,
@@ -69,10 +65,8 @@ from vfe3.geometry.retraction import (                          # SPD-retraction
 )
 from vfe3.numerics import (                    # non-equivariant / non-PD fallback accounting
     decode_logdet_fallback_elements,
-    mm_cholesky_fallback_elements,
     mu_trust_fallback_elements,
     reset_decode_logdet_fallback_elements,
-    reset_mm_cholesky_fallback_elements,
     reset_mu_trust_fallback_elements,
     bounded_variance_from_log,
 )
@@ -274,13 +268,9 @@ class PhiFisherStatisticsProvider:
 
 
 def _decode_learning_rates(cfg: VFE3Config) -> tuple[float, float]:
-    """Resolve split decoder rates, then legacy override, then encoder defaults."""
-    mu_lr = cfg.m_p_mu_lr if cfg.m_decode_lr is None else cfg.m_decode_lr
-    sigma_lr = cfg.m_p_sigma_lr if cfg.m_decode_lr is None else cfg.m_decode_lr
-    if cfg.m_decode_mu_lr is not None:
-        mu_lr = cfg.m_decode_mu_lr
-    if cfg.m_decode_sigma_lr is not None:
-        sigma_lr = cfg.m_decode_sigma_lr
+    """Resolve split decoder rates, falling back to the encoder rates."""
+    mu_lr = cfg.m_p_mu_lr if cfg.m_decode_mu_lr is None else cfg.m_decode_mu_lr
+    sigma_lr = cfg.m_p_sigma_lr if cfg.m_decode_sigma_lr is None else cfg.m_decode_sigma_lr
     return mu_lr, sigma_lr
 
 
@@ -296,8 +286,8 @@ def build_optimizer(
     at ``m_p_sigma_lr``; the belief gauge-frame coordinates ``phi_embed`` at ``m_phi_lr``.
     ``m_decode_mu_lr`` controls separate decode means or linear weight/bias;
     ``m_decode_sigma_lr`` controls separate decode log variances. Each falls back to the
-    legacy ``m_decode_lr`` override, then the corresponding encoder rate. Learned temperature
-    keeps its legacy rate or ``m_p_sigma_lr``; shared encode/decode tables keep encoder rates.
+    corresponding encoder rate. Learned temperature trains at ``m_p_sigma_lr``; shared
+    encode/decode tables keep encoder rates.
     Omitting overrides preserves historical group topology and semantic mu/sigma decays.
     Head evidence keeps its dedicated ``m_head_evidence_lr``.
 
@@ -365,15 +355,11 @@ def build_optimizer(
     # decode_temperature_learned=False freezes decode_log_scale (requires_grad=False in VFEModel), so
     # this filter keeps it out of every optimizer group and the readout temperature stays fixed.
     decode_mu_lr, decode_sigma_lr = _decode_learning_rates(cfg)
-    # Keep the historical shared sigma/temperature group when the override is omitted.
-    sigma_parameters = [parameter for parameter in (
-        pb.sigma_log_embed, pb.decode_log_scale if cfg.m_decode_lr is None else None)
-        if parameter is not None and parameter.requires_grad]
+    # The historical shared sigma/temperature group.
+    sigma_parameters = [parameter for parameter in (pb.sigma_log_embed, pb.decode_log_scale)
+                        if parameter is not None and parameter.requires_grad]
     if sigma_parameters:
         groups.append({"params": sigma_parameters, "lr": cfg.m_p_sigma_lr,
-                       "role": "sigma", **sigma_wd})
-    if cfg.m_decode_lr is not None and pb.decode_log_scale.requires_grad:
-        groups.append({"params": [pb.decode_log_scale], "lr": cfg.m_decode_lr,
                        "role": "sigma", **sigma_wd})
     if phi_group is not None:
         groups.append(phi_group)
@@ -480,13 +466,9 @@ def build_optimizer(
     # added. Non-trainable params (requires_grad=False, e.g. a parameter frozen by design) are
     # intentionally exempt: they are fixed by design and need no optimizer group.
     # NOTE: this guards GROUPING/coverage, not gradient FLOW. A grouped parameter can still receive
-    # a null gradient under specific opt-in toggles, by design: phi_embed under
-    # e_step_gradient='detach'
-    # (the E-step is detached; test-pinned in test_model.py), decode_log_scale under
-    # decode_mode='linear' (the readout discards tau_eff), ALL encode tables under
-    # decode_mode='linear' AND e_step_gradient='detach' (only output_proj_weight reaches the loss; the
-    # model emits a warning for that combination). These are intentional route properties, not
-    # coverage bugs.
+    # a null gradient under specific opt-in toggles, by design: decode_log_scale under
+    # decode_mode='linear' (the readout discards tau_eff). That is an intentional route property,
+    # not a coverage bug.
     grouped = {p for g in groups for p in g["params"]}
     missing = {p for p in model.parameters() if p.requires_grad} - grouped   # frozen params are exempt
     if missing:
@@ -1410,7 +1392,7 @@ _VAL_DIAG_KEYS = (
     "estep_f_drop", "estep_f_nondecreasing_frac", "estep_f_comparisons",
     "estep_r_mu_last", "estep_r_sigma_last",
     "estep_r_phi_last", "estep_fp_kl", "estep_fp_mu_rms", "estep_fp_sigma_rms",
-    "estep_fp_phi_rms", "estep_target_gap", "estep_beta_js", "estep_alpha_rms_delta",
+    "estep_fp_phi_rms", "estep_beta_js", "estep_alpha_rms_delta",
     "pos_loss_first_q", "pos_loss_last_q", "pos_loss_ratio",
     "val_builder_resid",
     # held-out gauge / SPD / Fisher geometry (surfaced from the already-computed val diagnostics dict)
@@ -2086,8 +2068,7 @@ def _residual_update_is_additive(
     the mean by the predictive mean.
     """
     cfg = model.cfg
-    return not (is_conditional_filtering(model)
-                and getattr(cfg, "relational_readout_mode", None) == "predictive_content"
+    return not (getattr(cfg, "relational_readout_mode", None) == "predictive_content"
                 and not getattr(cfg, "attention_residual", False))
 
 
@@ -2122,13 +2103,11 @@ def _residual_and_attention_rows(
     between the E-step and the norm (the norm then does not see :math:`\mu + m`), and for the
     predictive readout without ``attention_residual`` (no residual exists to remove).
 
-    Attention: :math:`\beta` is the router the forward used (``beta_pre`` on the conditional route;
-    the entry-scored map on the legacy route). Over query rows with at least two admissible sources
+    Attention: :math:`\beta` is the router the forward used (the captured ``beta_pre``). Over query rows with at least two admissible sources
     (support of the attention log-prior, or :math:`\beta > 0` without one), per layer and head, the
     means of :math:`H(\beta_{i\cdot})/\log|S_i|`, :math:`\sum_j \beta_{ij}|i-j|`, :math:`\beta_{ii}` and
     :math:`\sum_j \min(\beta_{ij}, \pi_{ij})` with :math:`\pi = \mathrm{softmax}_j(B)` the prior alone.
     """
-    conditional = is_conditional_filtering(model)
     block_norm = model.block_norm
     ln_defined = (block_norm is not None and model.head_mixer is None
                   and model.cg_coupling is None and _residual_update_is_additive(model)
@@ -2144,7 +2123,7 @@ def _residual_and_attention_rows(
             capture: dict = {"diagnostic": {}}
             model.forward_beliefs(ids, capture=capture)
             diagnostic = capture["diagnostic"]
-            if counters_out is not None and conditional and "error" not in counters_out:
+            if counters_out is not None and "error" not in counters_out:
                 try:
                     cap_counts, factorization_counts = _capture_numerics_counts(
                         diagnostic, float(model.cfg.kl_max))
@@ -2171,13 +2150,8 @@ def _residual_and_attention_rows(
                     ln_changes.setdefault(layer, []).append(
                         change[torch.isfinite(change)].reshape(-1).cpu())
             log_prior = diagnostic.get("log_prior")
-            if conditional:
-                betas = [capture_l["beta_pre"].float()
-                         for capture_l in diagnostic["layer_conditional_captures"]]
-            else:
-                per_window = torch.stack([model.attention_maps(ids[b:b + 1], score_at="entry")
-                                          for b in range(ids.shape[0])]).float()  # (B, L, H, N, N)
-                betas = [per_window[:, layer] for layer in range(per_window.shape[1])]
+            betas = [capture_l["beta_pre"].float()
+                     for capture_l in diagnostic["layer_conditional_captures"]]
             for layer, beta in enumerate(betas):
                 if beta.dim() == 3:
                     beta = beta.unsqueeze(1)                                    # (B, 1, N, N)
@@ -2397,7 +2371,6 @@ def _val_diagnostics(
 _SNAPSHOT_FRAME_METHODS = {
     name: getattr(VFEModel, name) for name in (
         "build_diagnostic_snapshot", "forward_beliefs", "diagnostics",
-        "_attention_map_for_belief", "_diagnostic_transport",
         "_validate_diagnostic_snapshot",
     )
 }
@@ -2412,8 +2385,7 @@ def _can_share_snapshot_frames(model: VFEModel) -> bool:
     from vfe3.geometry.transport import _build_flat, get_transport_registration
     from vfe3.model.block_mlp import BlockMLP
 
-    if (type(model) is not VFEModel or model.cfg.transport_mode != "flat"
-            or model.cfg.e_phi_lr != 0.0
+    if (type(model) is not VFEModel
             or get_family(model.cfg.family) is not DiagonalGaussian
             or model.group.elementary_block_shape is None
             or get_transport_registration("flat").callable is not _build_flat
@@ -2423,8 +2395,7 @@ def _can_share_snapshot_frames(model: VFEModel) -> bool:
                 for mlp in model.block_mlps))
             or any(getattr(getattr(model, name), "__func__", None) is not method
                    for name, method in _SNAPSHOT_FRAME_METHODS.items())
-            or (ex.e_step_belief_trace, ex.e_step_fixed_point_diagnostics, ex.converged_state)
-               != (_snapshot_trace, _snapshot_fixed_point, _snapshot_converged)
+            or ex.e_step_belief_trace is not _snapshot_trace
             or hooks._global_forward_hooks or hooks._global_forward_pre_hooks):
         return False
     return not any(module._forward_hooks or module._forward_pre_hooks for module in model.modules())
@@ -2480,8 +2451,7 @@ def _terminal_validation_signature(
          dataset.overlap_prefix, dataset.n, loader.batch_size, loader.drop_last,
          loader.batch_sampler.batch_size, loader.batch_sampler.drop_last),
         (nonfinite_tangent_elements(), mu_trust_fallback_elements(),
-         mm_cholesky_fallback_elements(), decode_logdet_fallback_elements(),
-         frame_pair_fp64_escalations()),
+         decode_logdet_fallback_elements(), frame_pair_fp64_escalations()),
     )
 
 
@@ -2564,10 +2534,9 @@ def _val_diagnostics_one(
 ) -> ValidationDiagnostics:
     r"""Held-out per-eval probes (the train-loop ``diagnostics`` runs on the live TRAIN batch).
 
-    Computes the validation-side F decomposition, attention-map structure across ALL layers/heads
+    Computes the relational validation diagnostics, attention-map structure across ALL layers/heads
     (entropy collapse, causal-mask sanity, positional-vs-content, induction/copy, head redundancy),
-    the E-step F-descent + belief-residual convergence certificate, and the per-position
-    within-sequence loss. Off the graph (no_grad). Best-effort: the CALLER wraps this so a replay
+    and the per-position within-sequence loss. Off the graph (no_grad). Best-effort: the CALLER wraps this so a replay
     error simply leaves the previous values carried forward; the returned subset is ``.update``-d
     into a NaN-initialized dict, so the CSV stays rectangular.
 
@@ -2591,14 +2560,11 @@ def _val_diagnostics_one(
     head-mixer ``val_builder_resid`` stays legacy-route only.
     """
     import torch.nn.functional as F
-    from vfe3 import metrics as M
-    from vfe3.viz import extract as ex
 
     out: Dict[str, float] = {}
     val_tok, val_tgt = (batch if isinstance(batch, (tuple, list)) else (batch, None))
     diagnostic_tokens = val_tok[:1].to(device)
     diagnostic_targets = val_tgt[:1].to(device) if val_tgt is not None else None
-    vn = max(int(diagnostic_tokens.shape[1]), 1)
     # This private validation lifetime only reads frames; public builders retain independent copies.
     snapshot = model.build_diagnostic_snapshot(
         diagnostic_tokens,
@@ -2608,165 +2574,37 @@ def _val_diagnostics_one(
         diagnostic_tokens,
         snapshot=snapshot,
     )
-    if is_conditional_filtering(model):
-        out.update({f"val_{key}": value for key, value in vd.items()
-                    if key.startswith("relational_") and isinstance(value, (int, float))})
-        out["val_attn_entropy"] = vd["attn_entropy"]
-        out["val_attn_entropy_min"] = vd["attn_entropy_min"]
-        out["estep_f_comparisons"] = 0.0
-        out["estep_f_drop"] = float("nan")
+    out.update({f"val_{key}": value for key, value in vd.items()
+                if key.startswith("relational_") and isinstance(value, (int, float))})
+    out["val_attn_entropy"] = vd["attn_entropy"]
+    out["val_attn_entropy_min"] = vd["attn_entropy_min"]
+    out["estep_f_comparisons"] = 0.0
+    out["estep_f_drop"] = float("nan")
+    if diagnostic_targets is not None:
+        out["val_relational_snapshot_ce"] = float(F.cross_entropy(
+            snapshot.logits.reshape(-1, snapshot.logits.shape[-1]).float(),
+            diagnostic_targets.reshape(-1)))
+    # Definitions that carry over from the legacy route, on the same capture (audit
+    # 2026-09-28: the early return left these NaN). Isolated so a failure here keeps the
+    # relational columns above; the whole set is NaN-reset first so a failed evaluation can
+    # never carry a previous evaluation's value forward.
+    out.update({key: float("nan") for key in _CONDITIONAL_STRUCTURE_KEYS})
+    try:
+        structure: Dict[str, float] = {
+            "val_effective_rank": float(vd["effective_rank"]),
+            "val_belief_cond_median": float(vd["belief_cond_median"]),
+        }
+        structure.update(_attention_structure_metrics(snapshot.beta_maps.float()))
         if diagnostic_targets is not None:
-            out["val_relational_snapshot_ce"] = float(F.cross_entropy(
-                snapshot.logits.reshape(-1, snapshot.logits.shape[-1]).float(),
-                diagnostic_targets.reshape(-1)))
-        # Definitions that carry over from the legacy route, on the same capture (audit
-        # 2026-09-28: the early return left these NaN). Isolated so a failure here keeps the
-        # relational columns above; the whole set is NaN-reset first so a failed evaluation can
-        # never carry a previous evaluation's value forward.
-        out.update({key: float("nan") for key in _CONDITIONAL_STRUCTURE_KEYS})
-        try:
-            structure: Dict[str, float] = {
-                "val_effective_rank": float(vd["effective_rank"]),
-                "val_belief_cond_median": float(vd["belief_cond_median"]),
-            }
-            structure.update(_attention_structure_metrics(snapshot.beta_maps.float()))
-            if diagnostic_targets is not None:
-                structure.update(_position_loss_metrics(snapshot.logits, diagnostic_targets))
-            out.update(structure)
-        except Exception as exc:
-            if failures is not None:
-                _record_diagnostic_failure(failures, "conditional_val_structure", exc,
-                                           logging.getLogger(__name__))
-            else:
-                logging.getLogger(__name__).warning(
-                    "conditional-route attention-structure diagnostics failed (%s)", exc)
-        return ValidationDiagnostics(out, diagnostic_tokens, snapshot)
-    out["val_self_coupling"]      = vd["self_coupling"]     / vn
-    out["val_self_divergence"]    = vd["self_divergence"]   / vn
-    out["val_belief_coupling"]    = vd["belief_coupling"]   / vn
-    out["val_attention_entropy"]  = vd["attention_entropy"] / vn
-    out["val_inner_alignment_energy_total"] = vd["total"]   / vn
-    # The "val_free_energy_total" alias is retired (audit 2026-07-25 F7): vd["total"] is assembled
-    # with log_likelihood=None, so it omits -E_q[log p(o|x)] entirely and the name claimed a
-    # quantity it never carried. multiseed_analysis.py still reads the old name when the correct
-    # column is absent, so CSVs written before this change keep working.
-    out["val_attn_entropy"]       = vd["attn_entropy"]
-    out["val_effective_rank"]     = vd["effective_rank"]
-    out["val_belief_cond_median"] = vd["belief_cond_median"]
-    out["val_attn_entropy_min"]   = vd["attn_entropy_min"]
-    # Held-out gauge / SPD / Fisher geometry: vd = model.diagnostics(val_tok) ALREADY computed the full
-    # geometry dict above, so surfacing these is near-free -- the held-out counterpart to the train-batch
-    # geometry-health columns, the more credible evidence for LEARNED geometry vs a train-batch artifact.
-    out["val_holonomy_wilson"]         = vd["holonomy_wilson"]
-    out["val_cocycle_residual"]        = vd["cocycle_residual"]
-    out["val_gauge_invariant_spread"]  = vd["gauge_invariant_spread"]
-    out["val_fisher_trace_mean"]       = vd["fisher_trace_mean"]
-    out["val_belief_cond_p95"]         = vd["belief_cond_p95"]
-    # Raw extremes so the ratio above is interpretable (audit 2026-08-06 F16): once
-    # val_guard_sigma_floor_frac > 0 the condition number is lam_max/eps, a guard readout.
-    out["val_belief_lam_min"]          = vd["belief_lam_min"]
-    out["val_belief_lam_max"]          = vd["belief_lam_max"]
-    # ... and the validity flag on the same row, so val_belief_cond_p95 can be read without
-    # knowing that val_guard_sigma_floor_frac exists and is what invalidates it. 1.0 = the ratio
-    # is a belief property everywhere; anything less and that fraction of tokens reports lam_max/eps.
-    out["val_belief_cond_valid_frac"]  = vd["belief_cond_valid_frac"]
-    out["val_phi_norm_mean"]           = vd["phi_norm_mean"]
-    out["val_phi_norm_std"]            = vd["phi_norm_std"]
-    for _source, _target in (
-        ("phi_matrix_norm_p95", "val_phi_matrix_norm_p95"),
-        ("phi_matrix_norm_p99", "val_phi_matrix_norm_p99"),
-        ("phi_matrix_norm_max", "val_phi_matrix_norm_max"),
-        ("phi_exp_clamp_frac", "val_phi_exp_clamp_frac"),
-        ("phi_exp_scale_min", "val_phi_exp_scale_min"),
-        ("vertex_cond_p99", "val_vertex_cond_p99"),
-        ("pos_phi_matrix_norm_p95", "val_pos_phi_matrix_norm_p95"),
-        ("pos_phi_matrix_norm_p99", "val_pos_phi_matrix_norm_p99"),
-        ("pos_phi_matrix_norm_max", "val_pos_phi_matrix_norm_max"),
-        ("pos_phi_exp_clamp_frac", "val_pos_phi_exp_clamp_frac"),
-        ("pos_phi_exp_scale_min", "val_pos_phi_exp_scale_min"),
-    ):
-        if _source in vd:
-            out[_target] = vd[_source]
-    out["val_guard_sigma_floor_frac"]  = vd["guard_sigma_floor_frac"]
-    out["val_guard_sigma_ceil_frac"]   = vd["guard_sigma_ceil_frac"]
-    out["val_guard_energy_klmax_frac"] = vd["guard_energy_klmax_frac"]
-    # Companion restricted to causally-admissible pairs (audit 2026-08-06 F17). The whole-grid
-    # column above is KEPT as-is: masked pairs are not numerically inert, so their kl_max pin is a
-    # real firewall reading. The pair tells you which triangle is actually saturating.
-    out["val_guard_energy_klmax_frac_live"] = vd.get("guard_energy_klmax_frac_live", float("nan"))
-    out["val_live_pair_frac"]               = vd.get("guard_energy_live_pair_frac", float("nan"))
-    out["val_nonfinite_frac"]          = vd["nonfinite_frac"]
-
-    # score_at="entry" is the beta the FORWARD actually used (audit 2026-08-05: the "converged"
-    # default re-scores the belief AFTER the E-step moved it -- measured TV(forward, converged) up
-    # to 0.96 per row, vs TV(forward, entry) == 0.000000, so every val_attn_* below was a statistic
-    # of a post-hoc re-score rather than of the model). The converged/prior triple is still saved
-    # separately under attention_estep/ for anyone who wants the comparison.
-    # NO snapshot here: a snapshot stores only the CONVERGED maps, so model.py:3281 rejects the
-    # pair outright (audit 2026-08-06 -- passing both raised ValueError at every single validation,
-    # and because _val_diagnostics is called under one try/except at :1710 that NaNs the whole
-    # _VAL_DIAG_KEYS set, it silently cost the free-energy decomposition, guard fractions, phi norms
-    # and E-step certificate too, not just the attention block). Entry scoring must be replayed
-    # from the model, exactly as the attention_estep/ figures at :1140 already do. The replay
-    # re-scores token_ids[:1], which IS diagnostic_tokens (val_tok[:1] at :982), so the sample is
-    # unchanged -- only the scoring point moves.
-    amaps = model.attention_maps(                               # (L, H, N, N) all layers/heads
-        diagnostic_tokens,
-        score_at="entry",
-    )
-    out.update(_attention_structure_metrics(amaps))
-
-    tr = ex.e_step_belief_trace(                                # captured E-step trajectory
-        model,
-        diagnostic_tokens,
-        snapshot=snapshot,
-    )
-    f = tr["free_energy"] / vn                                  # PER-TOKEN (free_energy_value is a per-seq SUM)
-    out["estep_f_drop"] = float(f[-1] - f[0])                   # < 0 = F descended over the inner loop
-    # fraction of inner iterations that did NOT decrease F. EXPECTED to be nonzero for parallel
-    # (Jacobi) mean-field with a finite step (e_step.py: 'not guaranteed monotone per iteration') --
-    # a descent-quality readout, not a convergence-FAILURE flag.
-    out["estep_f_nondecreasing_frac"] = (
-        float((f[1:] > f[:-1] + 1e-9).float().mean()) if f.numel() > 1 else 0.0)
-    # The DENOMINATOR of that fraction, because without it the column is unreadable (audit
-    # 2026-08-06 F6). The trace has n_e_steps+1 entries, so at the live n_e_steps=1 the "fraction"
-    # is a mean over exactly ONE comparison -- a single Bernoulli draw that can only be 0.0 or 1.0,
-    # which is precisely what every run on disk shows (one run all-0.0, five all-1.0). Reporting
-    # "1.0" from one coin flip and "1.0" from twenty is the same number with wildly different
-    # evidential weight; this column is what tells them apart. It also rises with
-    # val_diagnostic_batches, since each batch contributes its own draws to the average.
-    out["estep_f_comparisons"] = float(max(f.numel() - 1, 0))
-    res = M.estep_residuals(                                      # last-iter belief change (SPD metric for sigma)
-        tr["mu"], tr["sigma"], tr["phi"], diagonal=model.cfg.diagonal_covariance)
-    for _nm, _key in (("r_mu", "estep_r_mu_last"), ("r_sigma", "estep_r_sigma_last"),
-                      ("r_phi", "estep_r_phi_last")):
-        out[_key] = float(res[_nm][-1].mean()) if res[_nm].numel() else 0.0
-    out.update(ex.e_step_fixed_point_diagnostics(
-        model,
-        diagnostic_tokens,
-        snapshot=snapshot,
-    ))
-
-    if diagnostic_targets is not None:                          # per-position within-sequence loss
-        # (B, N, V) logits of the same captured inference path
-        out.update(_position_loss_metrics(snapshot.logits, diagnostic_targets))
-
-    # Builder-break gauge-equivariance residual per eval (A2/EXP-9): the head-mixer congruence defect
-    # at the converged belief (~eps under the tied gauge; climbs as the untied block_glk mixer drifts
-    # from identity -> the residual-drift-vs-step series). Only with a head mixer; isolated so a replay
-    # fault drops just this scalar (NaN-rectangular), not the whole val-diag row.
-    if model.head_mixer is not None:
-        try:
-            cst = ex.converged_state(model, diagnostic_tokens, snapshot=snapshot)
-            br = M.head_mixer_gauge_residual(cst["mu"], cst["sigma"], model.head_mixer, model.group,
-                                             diagonal=model.cfg.diagonal_covariance)
-            out["val_builder_resid"] = float(torch.cat([br["mu_residual"], br["sigma_residual"]]).median())
-        except Exception as exc:                                   # leave NaN; never fail the eval
+            structure.update(_position_loss_metrics(snapshot.logits, diagnostic_targets))
+        out.update(structure)
+    except Exception as exc:
+        if failures is not None:
+            _record_diagnostic_failure(failures, "conditional_val_structure", exc,
+                                       logging.getLogger(__name__))
+        else:
             logging.getLogger(__name__).warning(
-                "head-mixer builder-residual diagnostic failed (%s); val_builder_resid remains "
-                "unavailable for this evaluation",
-                exc,
-            )
+                "conditional-route attention-structure diagnostics failed (%s)", exc)
     return ValidationDiagnostics(out, diagnostic_tokens, snapshot)
 
 
@@ -3151,7 +2989,6 @@ def train(
     reset_nonfinite_tangent_elements()   # per-run accounting for the SPD-retraction guard
     reset_mu_trust_fallback_elements()   # ... the mu-trust-region equivariance fallback
     reset_decode_logdet_fallback_elements()   # ... and the decode log-det non-PD fallback
-    reset_mm_cholesky_fallback_elements()   # ... and failed full-Gaussian MM Cholesky rows
     reset_source_recovery_elements()        # ... and projected float64 source-factor recoveries
     reset_frame_pair_fp64_escalations()     # ... and float64 frame-pair escalations
 
@@ -3245,7 +3082,7 @@ def train(
     # skipped for another model family; their columns keep the VFE schema and stay blank.
     vfe_model = is_vfe_model(model)
     val_diag_keys = _VAL_DIAG_KEYS + (
-        _VAL_RELATIONAL_DIAG_KEYS if is_conditional_filtering(model) else ())
+        _VAL_RELATIONAL_DIAG_KEYS if vfe_model else ())
     last_val_diag: Dict[str, float] = {k: float("nan") for k in val_diag_keys}
     # Training-time diagnostic state (audit 2026-09-28). Built only for a persisted run; the silent
     # path and the console-only path allocate nothing here.
@@ -3990,7 +3827,6 @@ def train(
                            dict(sorted(diagnostics_failures.items())))
         neutralized = nonfinite_tangent_elements()
         mu_fallbacks = mu_trust_fallback_elements()
-        mm_fallbacks = mm_cholesky_fallback_elements()
         artifacts.final_step = int(n_steps)
         artifacts.realized_updates = {
             "attempted_steps":      attempted,
@@ -4000,19 +3836,17 @@ def train(
                                      if attempted else float("nan")),
             "nonfinite_tangent_elements": int(neutralized),
             "mu_trust_fallback_elements": int(mu_fallbacks),
-            "mm_cholesky_fallback_elements": int(mm_fallbacks),
             "decode_logdet_fallback_elements": int(decode_logdet_fallback_elements()),
             "frame_pair_fp64_escalations": int(frame_pair_fp64_escalations()),
         }
-        if skipped_total or neutralized or mu_fallbacks or mm_fallbacks:
+        if skipped_total or neutralized or mu_fallbacks:
             logger.warning(
                 " realized budget: %d/%d optimizer updates accepted (%.3f%%); "
                 "%d SPD tangent element(s) neutralized as non-finite; "
-                "%d belief(s) whitened by the non-equivariant mu-trust fallback; "
-                "%d belief row(s) retained after MM Cholesky fallback",
+                "%d belief(s) whitened by the non-equivariant mu-trust fallback",
                 accepted, attempted,
                 100.0 * accepted / max(attempted, 1),
-                neutralized, mu_fallbacks, mm_fallbacks)
+                neutralized, mu_fallbacks)
     if (terminal_validation_signature is not None
             and terminal_validation_metrics is not None
             and all(value is None or math.isfinite(value)
@@ -4108,8 +3942,7 @@ def parameter_report(
     frozen by design). ``live`` is MEASURED, not inferred from
     toggles: one synthetic forward+backward runs and a parameter counts as live only if it receives
     a non-None gradient -- so config-dead tables that remain allocated and grouped
-    (``decode_log_scale`` under ``decode_mode='linear'``, ``phi_embed`` under
-    ``e_step_gradient='detach'``, ...) are counted as
+    (``decode_log_scale`` under ``decode_mode='linear'``, ...) are counted as
     dead REGARDLESS of which toggle silenced them, so the report never drifts from the config as the
     toggles change. The synthetic ids come from a LOCAL generator (the global RNG is untouched) and
     ``.grad`` is cleared afterward, so the probe is side-effect-free. Best-effort: any failure (e.g. a

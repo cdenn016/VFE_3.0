@@ -107,7 +107,7 @@ def test_config_use_head_mixer_toggles():
 
 def test_model_head_mixer_is_noop_at_init_and_trains():
     base = dict(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0)
+                n_e_steps=1, e_q_mu_lr=0.05)
     tok = torch.randint(0, 20, (3, 5))
     torch.manual_seed(0)
     m_off = VFEModel(test_config(**base, use_head_mixer=False))

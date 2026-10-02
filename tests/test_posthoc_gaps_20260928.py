@@ -157,13 +157,7 @@ def test_covariance_is_the_routers_and_logdet_gap_sees_only_the_stored_scale() -
     np.testing.assert_allclose(logdet, np.abs(mean_log_var - math.log(c)), rtol=1e-6, atol=1e-8)
 
 
-def test_covariance_not_applicable_and_temperature_without_table() -> None:
-    transported = types.SimpleNamespace(cfg=types.SimpleNamespace(attention_mode="transported"),
-                                        relational_operators=None)
-    assert "no projected router" in cv.gap_applicability(transported)
-    frame_diag = types.SimpleNamespace(cfg=types.SimpleNamespace(family="gaussian_frame_diagonal"),
-                                       relational_operators=object())
-    assert "intrinsic" in cv.gap_applicability(frame_diag)
+def test_temperature_without_table_is_not_applicable() -> None:
     no_table = types.SimpleNamespace(prior_bank=types.SimpleNamespace(), cfg=types.SimpleNamespace(sigma_init=1.0))
     assert cv.hidden_temperature(no_table)["status"] == "not_applicable"
 

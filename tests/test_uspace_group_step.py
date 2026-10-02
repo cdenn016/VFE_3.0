@@ -133,7 +133,7 @@ def test_frechet_pair_inverts_the_exponential_differential(norm: float) -> None:
 # T4
 @pytest.mark.parametrize("name,kwargs,mode", [
     ("block_glk", {"K": 6, "n_heads": 2}, "pullback_per_block"),
-    ("glk", {"K": 3}, "pullback"),
+    ("block_glk", {"K": 3, "n_heads": 1}, "pullback_per_block"),
 ])
 def test_closed_form_direction_equals_the_series_pullback_direction(
     monkeypatch, name: str, kwargs: dict, mode: str,
@@ -267,7 +267,7 @@ def test_trust_saturated_step_needs_no_truncation_halvings() -> None:
 
 # T9
 def test_off_strip_row_uses_the_series_fallback_and_is_recharted_exactly(monkeypatch) -> None:
-    group = get_group("glk")(K=2, dtype=F64)
+    group = get_group("block_glk")(n_heads=1, K=2, dtype=F64)
     X_off = (math.pi + 0.3) * J2 + 0.1 * I2
     X_in = _blocks(1, 2, 0.2, seed=9)[0]
     phi = torch.stack((X_off.reshape(4), X_in.reshape(4)))
@@ -279,7 +279,7 @@ def test_off_strip_row_uses_the_series_fallback_and_is_recharted_exactly(monkeyp
         return pullback_group_direction(grad_rows, phi_rows, *args, **kwargs)
 
     monkeypatch.setattr(gauge_optim, "pullback_group_direction", spy)
-    candidate = _stage(grad, phi, group, _pullback(group, "pullback"), learning_rate=0.01,
+    candidate = _stage(grad, phi, group, _pullback(group, "pullback_per_block"), learning_rate=0.01,
                        collect=True)
     assert len(seen) == 1 and torch.equal(seen[0], phi[:1])
     assert candidate.fast_rows.tolist() == [False, True]
@@ -292,12 +292,12 @@ def test_off_strip_row_uses_the_series_fallback_and_is_recharted_exactly(monkeyp
 
 
 def test_conditioning_rejected_off_strip_row_keeps_its_chart_without_recharting() -> None:
-    group = get_group("glk")(K=2, dtype=F64)
+    group = get_group("block_glk")(n_heads=1, K=2, dtype=F64)
     # Psi_L(ad_X) is nearly singular (ad eigenvalue 2i(pi + 1e-4)): the series metric fails its
     # conditioning certificate, and Log(U) would re-chart this row by 2 pi if it were retracted.
     phi = torch.stack(((math.pi + 1e-4) * J2, 0.2 * I2)).reshape(2, 4)
     grad = torch.randn(2, 4, generator=torch.Generator().manual_seed(2), dtype=F64)
-    candidate = _stage(grad, phi, group, _pullback(group, "pullback"), learning_rate=0.01)
+    candidate = _stage(grad, phi, group, _pullback(group, "pullback_per_block"), learning_rate=0.01)
     assert candidate.rejected_rows.tolist() == [True, False]
     assert torch.equal(candidate.candidate_phi[0], phi[0])
     assert candidate.recharted_rows.tolist() == [False, False]
@@ -306,7 +306,7 @@ def test_conditioning_rejected_off_strip_row_keeps_its_chart_without_recharting(
 
 # T10
 def test_log_failure_halves_then_accepts_or_rejects_without_raising() -> None:
-    group = get_group("glk")(K=2, dtype=F64)
+    group = get_group("block_glk")(n_heads=1, K=2, dtype=F64)
     phi = ((math.pi - 0.05) * J2 + 0.1 * I2).reshape(1, 4)
     xi = -0.1 * torch.diag(torch.tensor([1.0, -1.0], dtype=F64))    # Z = diag(0.1, -0.1)
     grad = torch.ones(1, 4, dtype=F64)                                  # only its finiteness is read
@@ -325,7 +325,7 @@ def test_log_failure_halves_then_accepts_or_rejects_without_raising() -> None:
 
 # T11
 def test_chart_bound_halves_then_rejects() -> None:
-    group = get_group("glk")(K=2, dtype=F64)
+    group = get_group("block_glk")(n_heads=1, K=2, dtype=F64)
     X = _blocks(1, 2, 0.5, seed=12)[0]
     phi = X.reshape(1, 4)
     xi = -X / torch.linalg.matrix_norm(X)                   # e^X e^{t X/|X|}: chart norm |X| + t
@@ -341,7 +341,7 @@ def test_chart_bound_halves_then_rejects() -> None:
 
 
 def test_ascent_covector_is_rejected_by_the_descent_gate_and_keeps_the_chart() -> None:
-    group = get_group("glk")(K=2, dtype=F64)
+    group = get_group("block_glk")(n_heads=1, K=2, dtype=F64)
     phi = _blocks(3, 2, 0.5, seed=41).reshape(3, 4)
     xi = _blocks(3, 2, 1.0, seed=42).view(3, 1, 2, 2)
 
@@ -356,7 +356,7 @@ def test_ascent_covector_is_rejected_by_the_descent_gate_and_keeps_the_chart() -
 
 
 def test_nonfinite_direction_on_an_accepted_row_raises() -> None:
-    group = get_group("glk")(K=2, dtype=F64)
+    group = get_group("block_glk")(n_heads=1, K=2, dtype=F64)
     phi = _blocks(2, 2, 0.5, seed=43).reshape(2, 4)
     xi = _blocks(2, 2, 1.0, seed=44)
     xi[1, 0, 0] = float("nan")
@@ -365,7 +365,7 @@ def test_nonfinite_direction_on_an_accepted_row_raises() -> None:
 
 
 def test_frechet_failure_and_ill_conditioned_frames_take_the_series_fallback(monkeypatch) -> None:
-    group = get_group("glk")(K=2, dtype=F64)
+    group = get_group("block_glk")(n_heads=1, K=2, dtype=F64)
     X_stretched = torch.diag(torch.tensor([3.6, -3.6], dtype=F64))    # kappa_2(U) = e^{7.2} > 1e3
     phi = torch.stack((_blocks(1, 2, 0.4, seed=45)[0], _blocks(1, 2, 0.4, seed=46)[0],
                        X_stretched)).reshape(3, 4)
@@ -388,12 +388,12 @@ def test_frechet_failure_and_ill_conditioned_frames_take_the_series_fallback(mon
     monkeypatch.setattr(gauge_optim, "pullback_group_direction", spy)
     monkeypatch.setattr(phi_preconditioner, "logm_frechet_pair", fail_first_row)
     proposal = pullback_group_log_direction(grad, phi, U, collect=False, group=group,
-                                            phi_precond_mode="pullback")
+                                            phi_precond_mode="pullback_per_block")
     assert proposal.fast_rows.tolist() == [False, True, False]
     assert float(proposal.frame_condition[2]) > 1e3 >= float(proposal.frame_condition[:2].max())
     assert len(seen) == 1 and torch.equal(seen[0], phi[[0, 2]])
     series = pullback_group_direction(
-        grad[[0, 2]], phi[[0, 2]], group.generators, mode="pullback",
+        grad[[0, 2]], phi[[0, 2]], group.generators, mode="pullback_per_block",
         coordinate_layout=group.phi_coordinate_layout, irrep_dims=[2],
         reject_ill_conditioned_rows=True)
     assert proposal.accepted[[0, 2]].tolist() == series.accepted_rows.reshape(-1).tolist()
@@ -420,7 +420,7 @@ def test_bendixson_certificate_never_certifies_a_block_the_exact_test_rejects(d:
 
 # T13
 def test_positional_model_recovers_both_factor_covectors_and_first_order_velocity() -> None:
-    group = get_group("glk")(K=2, dtype=F64)
+    group = get_group("block_glk")(n_heads=1, K=2, dtype=F64)
     V, N = 3, 4
     tokens = torch.tensor([0, 2, 0, 1])
     X = _blocks(V, 2, 0.6, seed=31)
@@ -454,7 +454,7 @@ def test_positional_model_recovers_both_factor_covectors_and_first_order_velocit
         new = []
         for table, grad in ((X, grad_X), (Y, grad_Y)):
             candidate = _stage(grad.reshape(-1, 4), table.reshape(-1, 4), group,
-                               _pullback(group, "pullback"), learning_rate=eta,
+                               _pullback(group, "pullback_per_block"), learning_rate=eta,
                                trust_radius=1e3)
             new.append(torch.linalg.matrix_exp(candidate.candidate_phi.view(-1, 2, 2)))
         realized = new[0][tokens] @ new[1] - E[tokens] @ F
@@ -465,7 +465,7 @@ def test_positional_model_recovers_both_factor_covectors_and_first_order_velocit
 
 # T14
 def test_group_log_optimizer_moves_only_active_rows_and_equals_the_stager() -> None:
-    group = get_group("glk")(K=2)
+    group = get_group("block_glk")(n_heads=1, K=2)
     torch.manual_seed(0)
     phi = nn.Parameter(0.2 * torch.randn(5, 4))
     optimizer = GaugeManifoldAdamW(
@@ -474,7 +474,7 @@ def test_group_log_optimizer_moves_only_active_rows_and_equals_the_stager() -> N
         phi_group_trust_radius=0.1,
         phi_chart_max_norm=5.0,
         phi_bch_residual_max=1e-6,
-        phi_precond_mode="pullback",
+        phi_precond_mode="pullback_per_block",
         phi_group_retraction="group_log",
         weight_decay=0.0,
     )
@@ -483,7 +483,7 @@ def test_group_log_optimizer_moves_only_active_rows_and_equals_the_stager() -> N
     phi.grad[1] = torch.tensor([1.0, 0.0, -0.5, 0.2])
     phi.grad[3, 3] = -2.0
     expected = stage_group_log_candidate(
-        phi.grad[[1, 3]], before[[1, 3]], group, direction=_pullback(group, "pullback"),
+        phi.grad[[1, 3]], before[[1, 3]], group, direction=_pullback(group, "pullback_per_block"),
         learning_rate=0.05, trust_radius=0.1, chart_max_norm=5.0, bch_residual_max=1e-6,
     ).candidate_phi.to(dtype=phi.dtype)
     optimizer._collect_gauge_diag = True
@@ -593,14 +593,14 @@ def test_retraction_config_validation_inactive_marks_and_serialized_default(
     monkeypatch.setattr(VFE3Config.__init__, "__defaults__", tuple(values[name] for name in parameters))
     assert config_from_serialized(payload, source="pre-retraction run").m_phi_group_retraction == "chart"
     with pytest.raises(ValueError, match="phi_group_retraction"):
-        GaugeManifoldAdamW([nn.Parameter(torch.zeros(1))], get_group("glk")(K=2),
+        GaugeManifoldAdamW([nn.Parameter(torch.zeros(1))], get_group("block_glk")(n_heads=1, K=2),
                            phi_group_trust_radius=0.1, phi_chart_max_norm=5.0,
-                           phi_bch_residual_max=1e-6, phi_precond_mode="pullback",
+                           phi_bch_residual_max=1e-6, phi_precond_mode="pullback_per_block",
                            phi_group_retraction="bogus")
     with pytest.raises(ValueError, match="group_log"):
-        GaugeManifoldAdamW([nn.Parameter(torch.zeros(1))], get_group("so_k")(K=3),
+        GaugeManifoldAdamW([nn.Parameter(torch.zeros(1))], get_group("so_n")(3, group_n=3, irrep_spec=[("l1", 1)]),
                            phi_group_trust_radius=0.1, phi_chart_max_norm=5.0,
-                           phi_bch_residual_max=1e-6, phi_precond_mode="pullback",
+                           phi_bch_residual_max=1e-6, phi_precond_mode="pullback_per_block",
                            phi_group_retraction="group_log")
 
 

@@ -75,11 +75,7 @@ def rename_run_by_test_ppl(
 
 
 def _with_seed(cfg: VFE3Config, seed: int) -> VFE3Config:
-    r"""``cfg`` with ``seed`` replaced, rebuilt through the serialized form.
-
-    The round trip keeps the ``_allow_legacy_dense_decode`` init-only flag, which
-    :func:`dataclasses.replace` would reset to its default.
-    """
+    r"""``cfg`` with ``seed`` replaced, rebuilt through the serialized form."""
     if cfg.seed == seed:
         return cfg
     return config_from_serialized({**serialize_config(cfg), "seed": seed}, source="run_vfe seed override")

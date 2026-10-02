@@ -104,10 +104,10 @@ def patch_bindings(
 
 def _attention_weight_modules() -> List[Any]:
     from vfe3 import free_energy
-    from vfe3.gradients import full_link, kernels
+    from vfe3.gradients import full_link
     from vfe3.inference import e_step
 
-    return [free_energy, kernels, e_step, full_link]
+    return [free_energy, e_step, full_link]
 
 
 def _relational_score_modules() -> List[Any]:
@@ -400,10 +400,6 @@ def _require_normal_form(model: torch.nn.Module) -> None:
         raise NotApplicable(
             f"pos_rotation={cfg.pos_rotation!r} folds a positional rotation into the routing and content "
             "frames, a frame channel outside the four-role normal form")
-    if getattr(cfg, "family", None) == "gaussian_frame_diagonal":
-        raise NotApplicable(
-            "family='gaussian_frame_diagonal' keeps beliefs in frame-intrinsic coordinates (the relational "
-            "frame is the identity), so the four frame roles are not defined")
     if getattr(cfg, "encode_mode", None) != "per_token":
         raise NotApplicable(
             f"encode_mode={getattr(cfg, 'encode_mode', None)!r}: the input-moment role "

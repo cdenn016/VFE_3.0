@@ -296,7 +296,7 @@ def test_run_training_applies_cfg_seed_and_deterministic_state(
 def _structured_cfg() -> VFE3Config:
     """Tiny projected-gradient profile for training-state and accumulation contracts."""
     return test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                      n_e_steps=3, e_q_mu_lr=0.3, e_phi_lr=0.0,
+                      n_e_steps=3, e_q_mu_lr=0.3,
                       m_p_mu_lr=0.05, m_p_sigma_lr=0.01, m_phi_lr=0.05,
                       warmup_steps=5, max_steps=200)
 
@@ -328,7 +328,7 @@ def test_training_smoke_on_real_wikitext2_if_present():
         pytest.skip("wikitext-2 cache absent")
     torch.manual_seed(0)
     cfg = test_config(vocab_size=50257, embed_dim=4, n_heads=2, max_seq_len=16, n_layers=1,
-                     n_e_steps=1, e_q_mu_lr=0.3, e_phi_lr=0.0,
+                     n_e_steps=1, e_q_mu_lr=0.3,
                      m_p_mu_lr=0.05, m_p_sigma_lr=0.01, m_phi_lr=0.0, warmup_steps=3, max_steps=30)
     model = VFEModel(cfg)
     ds = TokenWindows(toks[:4000], 16)
@@ -458,7 +458,7 @@ def test_evaluate_max_batches_stops_after_exact_requested_count():
 def test_train_periodic_eval_consumes_full_validation_loader():
     # With a five-batch validation loader and two periodic evaluations, every batch is scored.
     cfg = test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                     n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, warmup_steps=1, max_steps=2)
+                     n_e_steps=1, m_phi_lr=0.0, warmup_steps=1, max_steps=2)
     torch.manual_seed(0)
     model = VFEModel(cfg)
     train_loader = _periodic_loader(V=6, period=3, seq_len=8, batch_size=4, seed=0)
@@ -472,7 +472,7 @@ def test_sample_decode_emits_sample_line_each_eval(caplog):
     # When a decoder is supplied, train() prints a "Sample:" line below the BPC value every eval;
     # when it is None (the default) nothing is generated. A decode/gen error must not raise.
     cfg = test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                     n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, warmup_steps=1, max_steps=2)
+                     n_e_steps=1, m_phi_lr=0.0, warmup_steps=1, max_steps=2)
     torch.manual_seed(0)
     model = VFEModel(cfg)
     decode = lambda ids: " ".join(str(int(t)) for t in ids)        # trivial token->text decoder
@@ -488,7 +488,7 @@ def test_tiny_vocab_auto_default_stays_silent(caplog):
     # real tokenizer size), so with no explicit decoder no Sample line is emitted -- the pure
     # silent path is preserved with no extra toggle.
     cfg = test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                     n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, warmup_steps=1, max_steps=2)
+                     n_e_steps=1, m_phi_lr=0.0, warmup_steps=1, max_steps=2)
     torch.manual_seed(0)
     model = VFEModel(cfg)
     with caplog.at_level("INFO"):
@@ -502,7 +502,7 @@ def test_generate_samples_false_is_silent_at_real_vocab(caplog):
     # where the auto-default would otherwise fire (CLAUDE.md: a reachable silent path under a toggle).
     pytest.importorskip("tiktoken")
     cfg = test_config(vocab_size=50257, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                     n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, warmup_steps=1, max_steps=1)
+                     n_e_steps=1, m_phi_lr=0.0, warmup_steps=1, max_steps=1)
     torch.manual_seed(0)
     model = VFEModel(cfg)
     with caplog.at_level("INFO"):
@@ -516,7 +516,7 @@ def test_auto_default_sample_decoder_emits_at_gpt2_vocab(caplog):
     # entry-file wiring: a Sample line prints below BPC each eval (skip if tiktoken is absent).
     pytest.importorskip("tiktoken")
     cfg = test_config(vocab_size=50257, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                     n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, warmup_steps=1, max_steps=1)
+                     n_e_steps=1, m_phi_lr=0.0, warmup_steps=1, max_steps=1)
     torch.manual_seed(0)
     model = VFEModel(cfg)
     with caplog.at_level("INFO"):
@@ -531,7 +531,7 @@ def test_train_vfe3_clickrun_importable_and_runs_one_step(monkeypatch: pytest.Mo
     # Exercise the launcher's config construction with a complete local operating point.
     local = config_values(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=4,
                           batch_size=2, n_layers=1, n_e_steps=1, max_steps=2,
-                          warmup_steps=1, eval_stride=None, e_phi_lr=0.0)
+                          warmup_steps=1, eval_stride=None)
     monkeypatch.setattr(train_vfe3, "config", local)
     cfg = train_vfe3.VFE3Config(**train_vfe3.config)
     loader = _periodic_loader(n=cfg.max_seq_len * cfg.batch_size * 4,
@@ -560,7 +560,7 @@ def test_train_step_skips_on_nonfinite_grad_with_finite_loss():
     transition and must remain unchanged when that update is rejected."""
     torch.manual_seed(0)
     cfg = test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                     n_e_steps=1, e_q_mu_lr=0.1, e_phi_lr=0.0, m_phi_lr=0.0,
+                     n_e_steps=1, e_q_mu_lr=0.1, m_phi_lr=0.0,
                      warmup_steps=1, max_steps=4)
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
@@ -688,7 +688,7 @@ def test_grad_clip_signature_preserves_terminal_callback():
     terminal-callback contract -- train() still invokes it exactly once with a
     TrainingTerminalState, even when grad_clip is threaded through explicitly."""
     cfg = test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                     n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, warmup_steps=1, max_steps=1)
+                     n_e_steps=1, m_phi_lr=0.0, warmup_steps=1, max_steps=1)
     torch.manual_seed(0)
     model = VFEModel(cfg)
     captured = {"calls": 0}
@@ -708,7 +708,7 @@ def test_attention_diagnostic_failure_does_not_kill_training(tmp_path, monkeypat
     r"""F11 (audit 2026-07-01): a held-out attention diagnostic failure must be caught by the
     caller-side guard (warn + continue), never abort training."""
     cfg = test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                     n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, warmup_steps=1, max_steps=2)
+                     n_e_steps=1, m_phi_lr=0.0, warmup_steps=1, max_steps=2)
     torch.manual_seed(0)
     model = VFEModel(cfg)
 
@@ -737,7 +737,7 @@ def test_val_diagnostics_failure_resets_to_nan(tmp_path, monkeypatch):
     import vfe3.train as vt
 
     cfg = test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                     n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, warmup_steps=1, max_steps=2)
+                     n_e_steps=1, m_phi_lr=0.0, warmup_steps=1, max_steps=2)
     torch.manual_seed(0)
     model = VFEModel(cfg)
     calls = {"n": 0}
@@ -826,7 +826,7 @@ def test_select_loader_raises_on_missing_cache(monkeypatch):
 def _terminal_cfg(**kw):
     base = dict(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
                 n_e_steps=1, gauge_group="block_glk", use_head_mixer=False,
-                e_q_mu_lr=0.5, e_q_sigma_lr=0.05, e_phi_lr=0.0,
+                e_q_mu_lr=0.5, e_q_sigma_lr=0.05,
                 m_p_mu_lr=0.1, m_p_sigma_lr=0.05, m_phi_lr=0.0,
                 warmup_steps=1, max_steps=2, kl_max=32)
     base.update(kw)

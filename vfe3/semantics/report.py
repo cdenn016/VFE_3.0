@@ -741,7 +741,7 @@ def _run_facts(run: Any, ctx: AnalysisContext) -> Dict[str, Any]:
         "family": getattr(cfg, "family", None), "sigma_init": getattr(cfg, "sigma_init", None),
         "gauge_group": getattr(cfg, "gauge_group", None),
         "gauge_transport": getattr(cfg, "gauge_transport", None),
-        "transport_mode": getattr(cfg, "transport_mode", None),
+        "transport_mode": getattr(cfg, "transport_mode", "flat"),
         "attention_mode": getattr(cfg, "attention_mode", None),
         "encode_mode": getattr(cfg, "encode_mode", None),
         "decode_mode": getattr(cfg, "decode_mode", None), "decode_kind": run.decode_kind,
@@ -1138,7 +1138,7 @@ def _gauge_paragraph(run: Any, chart: Any = None) -> str:
                      "contextual Σ analyses are vacuous")
     if run.phi_frozen:
         extra.append("φ is not updated in context, so the realized frame at position p is e^(X_v) e^(Y_p)")
-    if getattr(cfg, "transport_mode", None) == "flat" and run.frames_active:
+    if getattr(cfg, "transport_mode", "flat") == "flat" and run.frames_active:
         extra.append("with transport_mode='flat' the transport Ω_ij = U_i U_j⁻¹ telescopes, so holonomy is "
                      "identically the identity and is not reported")
     if extra:
@@ -1646,7 +1646,7 @@ def _render_report(run: Any, ctx: AnalysisContext, results: Mapping[str, Section
         ("gauge group", f"{getattr(cfg, 'gauge_group', None)} (n_gen = {run.n_gen}, frames "
                         f"{'active' if run.frames_active else 'inactive'})"),
         ("transport", f"gauge_transport={getattr(cfg, 'gauge_transport', None)}, "
-                      f"transport_mode={getattr(cfg, 'transport_mode', None)}, pos_phi={getattr(cfg, 'pos_phi', None)}"),
+                      f"transport_mode={getattr(cfg, 'transport_mode', 'flat')}, pos_phi={getattr(cfg, 'pos_phi', None)}"),
         ("attention mode", getattr(cfg, "attention_mode", None)),
         ("coordinate normalization", f"block={getattr(cfg, 'norm_type_block', None)}, final="
                                      f"{getattr(cfg, 'norm_type_final', None)}, affine={getattr(cfg, 'layernorm_affine', None)}"),

@@ -23,7 +23,7 @@ from vfe3.train import build_optimizer, lr_lambda, train, train_step
 
 def _cfg(**over) -> VFE3Config:
     base = dict(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                n_e_steps=1, e_q_mu_lr=0.3, e_phi_lr=0.0,
+                n_e_steps=1, e_q_mu_lr=0.3,
                 m_p_mu_lr=0.05, m_p_sigma_lr=0.01, m_phi_lr=0.0, warmup_steps=2, max_steps=20)
     base.update(over)
     return test_config(**base)

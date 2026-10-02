@@ -4,7 +4,7 @@ Pins the closed-form KL/Renyi against deterministic float64 trapezoidal integrat
 axioms (non-negativity, self-divergence=0), the non-EF contract (natural/log_partition_at raise so
 the generic Bregman path is bypassed by renyi_closed_form), gauge-transport honesty (permutation
 preserves the diagonal Laplace exactly; a non-permutation rotation projects the marginal scale), and
-end-to-end reachability through the autograd-of-F oracle and a full model.
+end-to-end reachability through a full model.
 """
 
 from tests.profiles import test_config
@@ -156,131 +156,6 @@ def test_entropy_matches_reference():
 
 # ---- gauge-transport honesty (the corrected boundary) ---------------------
 
-def test_transport_permutation_exact_rotation_projects():
-    K = 2
-    b = torch.tensor([[1.0, 4.0]])                                  # (1, K) diagonal scale
-    perm = torch.tensor([[0.0, 1.0], [1.0, 0.0]]).reshape(1, 1, K, K)   # coord swap (permutation)
-    family = get_family("laplace_diagonal")
-    bt_perm = family.transport_dispersion(b, perm)[0, 0]            # exact |P| b = permuted b
-    assert torch.allclose(bt_perm, torch.tensor([4.0, 1.0]), atol=1e-6)
-    theta = 0.5
-    R = torch.tensor([[math.cos(theta), -math.sin(theta)],
-                      [math.sin(theta), math.cos(theta)]]).reshape(1, 1, K, K)
-    bt_rot = torch.sort(family.transport_dispersion(b, R)[0, 0]).values   # variance-matched scales mix
-    assert not torch.allclose(bt_rot, torch.sort(b[0]).values, atol=1e-3)   # not any permutation of b
-
-
-def test_transport_zero_scale_uses_finite_zero_norm_subgradient():
-    scale = torch.tensor([[0.0, 2.0]], requires_grad=True)
-    omega = torch.eye(2).reshape(1, 1, 2, 2).requires_grad_()
-
-    transported = DiagonalLaplace.transport_dispersion(scale, omega)
-    transported.sum().backward()
-
-    assert torch.equal(transported, torch.tensor([[[0.0, 2.0]]]))
-    assert torch.equal(scale.grad, torch.tensor([[0.0, 1.0]]))
-    assert torch.equal(
-        omega.grad,
-        torch.tensor([[[[0.0, 0.0], [0.0, 2.0]]]]),
-    )
-
-
-# ---- end-to-end reachability ----------------------------------------------
-
-def test_oracle_gradients_finite_for_laplace():
-    from vfe3.geometry.groups import get_group
-    from vfe3.gradients.oracle import belief_gradients_autograd
-    from vfe3.inference.e_step import build_belief_transport
-    torch.manual_seed(0)
-    g = get_group("block_glk")(4, 2)
-    N, K, n_gen = 5, 4, g.generators.shape[0]
-    phi = torch.randn(1, N, n_gen) * 0.1
-    omega = build_belief_transport(phi, g, transport_mode="flat")
-    mu = torch.randn(1, N, K); sigma = torch.rand(1, N, K) + 0.5
-    mu_p = torch.randn(1, N, K); sigma_p = torch.rand(1, N, K) + 0.5
-    kw = dict(tau=1.0, renyi_order=1.0, kl_max=100.0, eps=1e-6, b0=1.0, c0=1.0, value=1.0,
-              include_attention_entropy=True, gradient_mode="filtering", family="laplace_diagonal",
-              divergence_family="renyi", lambda_alpha_mode="constant", irrep_dims=g.irrep_dims, log_prior=None)
-    g_mu, g_sigma = belief_gradients_autograd(mu, sigma, mu_p, sigma_p, omega, **kw)
-    assert torch.isfinite(g_mu).all() and torch.isfinite(g_sigma).all()
-
-
-
-
-# ---- gradient correctness: finite difference of F vs the autograd oracle ----
-# The family's tests above pin divergence VALUES; these pin that the oracle's belief GRADIENTS are
-# correct -- the |x-mu| cusp and the float64 singularity island must differentiate to match a central
-# finite difference of the exact same F (CLAUDE.md: FD checks against the autograd-of-F oracle).
-
-def _oracle_setup(N=3, K=2, seed=3):
-    from vfe3.geometry.groups import get_group
-    from vfe3.geometry.transport import compute_transport_operators
-    g = torch.Generator().manual_seed(seed)
-    grp = get_group("glk")(K)
-    phi = 0.15 * torch.randn(1, N, grp.generators.shape[0], generator=g)
-    omega = compute_transport_operators(phi, grp)["Omega"][0]            # (N, N, K, K)
-    mu = torch.randn(N, K, generator=g)
-    sigma = torch.rand(N, K, generator=g) + 0.5
-    mu_p = torch.randn(N, K, generator=g)
-    sigma_p = torch.rand(N, K, generator=g) + 0.5
-    return mu, sigma, mu_p, sigma_p, omega
-
-
-def _F_laplace_filtering(mu_q, sigma_q, mu_p, sigma_p, mu_t, sigma_t, tau, order):
-    # Mirrors belief_gradients_autograd's F construction EXACTLY for family='laplace_diagonal',
-    # constant alpha, no rope / no omega_builder. Keys (mu_t, sigma_t) frozen -> the filtering F.
-    from vfe3.alpha_i import self_coupling_alpha
-    from vfe3.free_energy import free_energy, pairwise_energy, self_divergence_for_alpha
-    sd = self_divergence_for_alpha(DiagonalLaplace(mu_q, sigma_q), DiagonalLaplace(mu_p, sigma_p),
-                                   alpha=order, kl_max=100.0, eps=1e-6,
-                                   divergence_family="renyi", lambda_alpha_mode="constant")
-    alpha, _reg = self_coupling_alpha(sd, mode="constant", value=1.0, b0=1.0, c0=1.0)
-    energy = pairwise_energy(DiagonalLaplace(mu_q, sigma_q), DiagonalLaplace(mu_t, sigma_t),
-                             alpha=order, kl_max=100.0, eps=1e-6, divergence_family="renyi", irrep_dims=None)
-    return free_energy(sd, energy, alpha, tau=tau, lambda_beta=1.0,
-                       include_attention_entropy=True, log_prior=None, alpha_reg=None, coupling_energy=None)
-
-
-def _check_oracle_fd(order, atol):
-    from vfe3.geometry.transport import transport_mean
-    from vfe3.gradients.oracle import belief_gradients_autograd
-    mu, sigma, mu_p, sigma_p, omega = _oracle_setup()
-    tau = 1.5
-    gmu, gsig = belief_gradients_autograd(mu, sigma, mu_p, sigma_p, omega, tau=tau,
-                                          renyi_order=order, gradient_mode="filtering",
-                                          family="laplace_diagonal")
-    mu_t = transport_mean(omega.unsqueeze(0), mu.unsqueeze(0))[0]          # frozen keys (filtering)
-    family = get_family("laplace_diagonal")
-    sigma_t = family.transport_dispersion(sigma.unsqueeze(0), omega.unsqueeze(0))[0]
-
-    # 4th-order central difference: f'(x) = [f(x-2h) - 8 f(x-h) + 8 f(x+h) - f(x+2h)] / (12 h).
-    # O(h^4) truncation keeps the FD tight even where the Renyi curvature is high near a coordinate's
-    # singular order alpha*_k (a 2-point stencil there leaves ~5e-3 truncation; this stays ~1e-4).
-    h = 1e-3
-    gmu_fd = torch.zeros_like(mu); gsig_fd = torch.zeros_like(sigma)
-    for a in range(mu.shape[0]):
-        for b in range(mu.shape[1]):
-            def fm(t, a=a, b=b):
-                d = torch.zeros_like(mu); d[a, b] = t
-                return _F_laplace_filtering(mu + d, sigma, mu_p, sigma_p, mu_t, sigma_t, tau, order)
-            def fs(t, a=a, b=b):
-                d = torch.zeros_like(sigma); d[a, b] = t
-                return _F_laplace_filtering(mu, sigma + d, mu_p, sigma_p, mu_t, sigma_t, tau, order)
-            gmu_fd[a, b] = (fm(-2 * h) - 8 * fm(-h) + 8 * fm(h) - fm(2 * h)) / (12 * h)
-            gsig_fd[a, b] = (fs(-2 * h) - 8 * fs(-h) + 8 * fs(h) - fs(2 * h)) / (12 * h)
-    assert torch.allclose(gmu, gmu_fd, atol=atol, rtol=atol)
-    assert torch.allclose(gsig, gsig_fd, atol=atol, rtol=atol)
-
-
-def test_laplace_oracle_gradient_matches_fd_kl():
-    _check_oracle_fd(order=1.0, atol=2e-3)
-
-
-def test_laplace_oracle_gradient_matches_fd_renyi():
-    # alpha=0.5 drives the float64 singularity-island branch; autograd through the .double()/.to()
-    # casts and the where-limit must still match a (4th-order) finite difference of F.
-    _check_oracle_fd(order=0.5, atol=2e-3)
-
 
 # ---- alpha>1 (non-convex regime), saturation, cusp, eps floor --------------
 
@@ -334,18 +209,19 @@ def test_laplace_cuda_matches_cpu():
     # Model half retired with transported attention (PR #32): both projected routes reject Laplace.
     with pytest.raises(ValueError, match="laplace_diagonal"):
         test_config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                    n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, family="laplace_diagonal")
+                    n_e_steps=1, m_phi_lr=0.0, family="laplace_diagonal")
 
 
 # ===========================================================================
 # PB-14 (Task 5, 2026-07-12): the family-consistent decode reads a Laplace belief out under
-# the Laplace divergence (not a hardcoded Gaussian KL). decode_mode='family' scores
+# the Laplace divergence (not a hardcoded Gaussian KL). decode_mode='family_chunked' scores
 # logits = -D_configured(q||p_v)/tau_eff through the configured Laplace family + functional,
 # so a non-Gaussian belief has a geometry-matched prior-bank readout.
 # ===========================================================================
 
 from vfe3.divergence import get_functional as _get_functional          # noqa: E402
-from vfe3.model.prior_bank import PriorBank, get_decode                 # noqa: E402
+from vfe3.model.prior_bank import PriorBank                 # noqa: E402
+from vfe3.model.prior_bank import _decode_family
 from vfe3.numerics import bounded_variance_from_log                     # noqa: E402
 
 
@@ -364,13 +240,13 @@ def test_family_decode_matches_direct_functional_laplace(alpha):
     torch.manual_seed(0)
     V, K, n_gen = 7, 3, 4
     pb = PriorBank(V, K, n_gen, decode_tau=1.4, family="laplace_diagonal",
-                   divergence_family="renyi", renyi_order=alpha, decode_mode="family")
+                   renyi_order=alpha, decode_mode="family_chunked")
     with torch.no_grad():
         pb.mu_embed.normal_(0.0, 0.6)
         pb.sigma_log_embed.normal_(0.0, 0.3)
     mu_q = torch.randn(2, 4, K); sigma_q = torch.rand(2, 4, K) + 0.3
     tau_eff = pb._tau_eff()
-    got = get_decode("family")(pb, mu_q, sigma_q, tau_eff)
+    got = _decode_family(pb, mu_q, sigma_q, tau_eff)
     exp = _laplace_reference_logits(pb, mu_q, sigma_q, tau_eff)
     assert got.shape == (2, 4, V)
     assert torch.allclose(got, exp, atol=1e-4, rtol=0.0)
@@ -381,16 +257,16 @@ def test_laplace_family_decode_ranking_differs_from_gaussian_kl():
     # from the Gaussian KL (the L1 vs L2 penalty on |mu_q - mu_v| and the scale term differ).
     torch.manual_seed(3)
     V, K, n_gen = 7, 3, 4
-    lap = PriorBank(V, K, n_gen, family="laplace_diagonal", renyi_order=1.0, decode_mode="family")
-    gauss = PriorBank(V, K, n_gen, family="gaussian_diagonal", renyi_order=1.0, decode_mode="family")
+    lap = PriorBank(V, K, n_gen, family="laplace_diagonal", decode_mode="family_chunked")
+    gauss = PriorBank(V, K, n_gen, family="gaussian_diagonal", decode_mode="family_chunked")
     with torch.no_grad():
         mu = torch.randn(V, K); sig_log = (torch.randn(V, K) * 0.5)
         for pb in (lap, gauss):
             pb.mu_embed.copy_(mu); pb.sigma_log_embed.copy_(sig_log)
     mu_q = torch.randn(1, 6, K); sigma_q = torch.rand(1, 6, K) + 0.3
     tau_eff = lap._tau_eff()
-    lap_logits = get_decode("family")(lap, mu_q, sigma_q, tau_eff)
-    gauss_logits = get_decode("family")(gauss, mu_q, sigma_q, tau_eff)
+    lap_logits = _decode_family(lap, mu_q, sigma_q, tau_eff)
+    gauss_logits = _decode_family(gauss, mu_q, sigma_q, tau_eff)
     assert not torch.equal(lap_logits.argsort(-1), gauss_logits.argsort(-1))   # ranking genuinely differs
 
 

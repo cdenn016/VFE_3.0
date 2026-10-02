@@ -1,4 +1,3 @@
-from tests.profiles import test_config
 import pytest
 import torch
 
@@ -546,14 +545,6 @@ def test_divergence_functionals_registry_derived():
     names = divergence_functionals()
     assert "renyi" in names and "squared_hellinger" in names
     assert names == tuple(sorted(names))
-
-
-@pytest.mark.parametrize("name", ["squared_hellinger", "bhattacharyya", "jeffreys", "no_such_functional"])
-def test_projected_config_rejects_non_kl_functionals(name: str) -> None:
-    with pytest.raises(ValueError, match="divergence_family"):
-        test_config(divergence_family=name, lambda_alpha_mode="constant")
-
-
 
 
 # --- bhattacharyya and jeffreys (added 2026-06-13: extend the f-divergence registry) -----------

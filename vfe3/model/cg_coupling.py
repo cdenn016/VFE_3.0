@@ -78,8 +78,8 @@ class CGCoupling(nn.Module):
 
     def __init__(
         self,
-        group_n:      int,                       # N of SO(N) / 2m of Sp(2m)
-        algebra:      str,                       # 'so' | 'sp'
+        group_n:      int,                       # N of SO(N)
+        algebra:      str,                       # 'so'
         irrep_dims:   List[int],                 # per-block dims
         irrep_labels: Optional[List[str]],       # per-block labels (REQUIRED non-None)
 
@@ -97,7 +97,7 @@ class CGCoupling(nn.Module):
         self.cg_covariance_floor = float(cg_covariance_floor)
         if irrep_labels is None:
             raise ValueError(
-                "CGCoupling requires a labeled irrep tower (gauge_group 'so_n'/'sp_n')"
+                "CGCoupling requires a labeled irrep tower (gauge_group 'so_n')"
             )
         starts = [0]
         for d in irrep_dims:

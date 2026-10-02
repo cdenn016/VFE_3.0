@@ -78,14 +78,6 @@ HEADLINE_SAMPLE: str = "occurrence"
 
 def gap_applicability(model: torch.nn.Module) -> Optional[str]:
     r"""``None`` when the realized-frame routing covariance is defined for ``model``, else the reason."""
-    cfg = model.cfg
-    if getattr(model, "relational_operators", None) is None:
-        return (f"attention_mode={getattr(cfg, 'attention_mode', None)!r} has no projected router: it compares "
-                "transported beliefs, not reference-frame covariances C_i")
-    if getattr(cfg, "family", None) == "gaussian_frame_diagonal":
-        return "family 'gaussian_frame_diagonal' routes in the intrinsic (identity) frame, so C_i is Sigma_i"
-    if getattr(cfg, "transport_mode", "flat") != "flat":
-        return f"transport_mode={cfg.transport_mode!r}: the projected router needs the flat vertex frames"
     if not hasattr(model.prior_bank, "sigma_log_embed"):
         return "the prior bank has no stored log-variance table"
     return None
@@ -99,8 +91,9 @@ def routing_frame_and_covariance(
     r"""``(U^{-1} blocks (B, N, Hb, d, d), Sigma (B, N, K) or (B, N, K, K), block_diagonal)``.
 
     The construction is ``forward_beliefs``' own for the projected routes: encode, positional right
-    factor, projected canonical content (when selected) or the shared flat transport, then the
-    relational frame ``_canonical_frame_context(transport, fold_rope=True, compact=True)``. A dense
+    factor, the shared flat transport, then the relational frame
+    ``_canonical_frame_context(transport, fold_rope=True, compact=True)``
+    (``VFEModel._relational_frames``). A dense
     frame is split into its head blocks, as ``relational_score`` does (which rejects a frame with
     off-block entries). Float32 frames outside autocast, as the model computes them.
     """
@@ -110,11 +103,7 @@ def routing_frame_and_covariance(
         beliefs = beliefs._replace(phi=model._apply_pos_phi(beliefs.phi),
                                    right_phi=model._pos_phi_right(beliefs.phi))
         rope = model._rope_rotation(int(token_ids.shape[1]), device)
-        if model.cfg.encode_mode == "canonical_content_projected":
-            beliefs, transport, _ = model._prepare_projected_canonical_content(beliefs, rope)
-        else:
-            transport = model._build_shared_flat_transport(beliefs, rope, require_vertex_factors=True)
-        frame = model._canonical_frame_context(transport, fold_rope=True, compact=True)
+        _, frame, _ = model._relational_frames(beliefs, rope)
     inverse = frame.inverse
     block_diagonal = bool(frame.block_diagonal)
     if not block_diagonal:                                                    # (B, N, K, K) dense layout

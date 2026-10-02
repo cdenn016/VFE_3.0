@@ -26,7 +26,6 @@ from vfe3.geometry.transport import (
     ROPE_INSERTIONS,
     FactoredTransport,
     RopeTransport,
-    transport_mean,
 )
 
 K, H, N, PERIOD = 4, 2, 12, 4
@@ -46,10 +45,12 @@ def _setup(seed: int = 0):
 
 
 def _dense(omega: RopeTransport) -> torch.Tensor:
-    r"""The effective (N, N, K, K) operator, taken through the public mean seam."""
-    eye = torch.eye(K).unsqueeze(0).expand(N, K, K)             # transport each basis vector
-    cols = [transport_mean(omega, eye[:, :, c]) for c in range(K)]
-    return torch.stack(cols, dim=-1)                            # (N, N, K, K)
+    r"""The effective (N, N, K, K) score operator of either insertion."""
+    folded = omega.score_operator()                             # RIGHT: the folded vertex frame
+    if folded is not None:
+        return folded.to_dense_omega()
+    base = omega.base.to_dense_omega() if hasattr(omega.base, "to_dense_omega") else omega.base
+    return torch.einsum("ikl,ijlm,jnm->ijkn", omega.rope, base, omega.rope)   # R_i Omega_ij R_j^T
 
 
 def test_left_and_right_agree_at_an_identity_frame() -> None:
@@ -134,8 +135,7 @@ def test_right_insertion_rejects_a_base_it_cannot_fold_into() -> None:
     dense_base = torch.eye(K).expand(N, N, K, K).contiguous()
 
     with pytest.raises(ValueError, match="per-vertex frame"):
-        transport_mean(RopeTransport(base=dense_base, rope=rope, insertion="right"),
-                       torch.zeros(N, K))
+        RopeTransport(base=dense_base, rope=rope, insertion="right").score_operator()
 
 
 def test_insertion_is_validated() -> None:

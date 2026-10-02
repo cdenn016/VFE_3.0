@@ -23,7 +23,6 @@ from vfe3.metrics import (
     fisher_trace,
     free_energy_full_decomposition,
     free_energy_terms,
-    gauge_equivariance_residual,
     gauge_trace_spread,
     group_gauge_invariant,
     guard_saturation,
@@ -70,7 +69,7 @@ def test_free_energy_terms_is_registered_metric():
 
 
 def test_holonomy_deviation_zero_for_flat_cocycle():
-    grp = get_group("glk")(3)
+    grp = get_group("block_glk")(3, 1)
     phi = 0.2 * torch.randn(1, 4, grp.generators.shape[0])
     omega = compute_transport_operators(phi, grp)["Omega"][0]      # (4,4,3,3) flat cocycle
     assert float(holonomy_deviation(omega)) < 1e-4                 # every triangle closes (H=I)
@@ -84,7 +83,7 @@ def test_holonomy_deviation_positive_for_non_cocycle():
 
 
 def test_gauge_trace_spread_zero_at_phi_zero():
-    grp = get_group("glk")(3)
+    grp = get_group("block_glk")(3, 1)
     G = grp.generators
     assert float(gauge_trace_spread(torch.zeros(5, G.shape[0]), G)) < 1e-7
     assert float(gauge_trace_spread(torch.randn(5, G.shape[0]), G)) > 0.0
@@ -102,7 +101,7 @@ def test_free_energy_terms_decomposition():
 
 
 def test_compute_metrics_registry_record():
-    grp = get_group("glk")(3)
+    grp = get_group("block_glk")(3, 1)
     phi = 0.1 * torch.randn(1, 4, grp.generators.shape[0])
     omega = compute_transport_operators(phi, grp)["Omega"][0]
     rec = compute_metrics(
@@ -227,7 +226,7 @@ def test_guard_saturation_inert_then_binds():
 # --- gauge invariants ------------------------------------------------------
 
 def test_group_gauge_invariant_glk_volume_and_zero_at_identity():
-    grp = get_group("glk")(3)
+    grp = get_group("block_glk")(3, 1)
     exp0 = compute_transport_operators(torch.zeros(1, 4, grp.generators.shape[0]), grp)["exp_phi"][0]
     assert float(group_gauge_invariant(exp0, grp).abs().max()) < 1e-6      # det I = 1 -> logdet 0
     phi = 0.2 * torch.randn(1, 4, grp.generators.shape[0])
@@ -237,7 +236,7 @@ def test_group_gauge_invariant_glk_volume_and_zero_at_identity():
 
 
 def test_group_gauge_invariant_so_k_rotation_angle():
-    grp = get_group("so_k")(4)
+    grp = get_group("so_n")(4, group_n=4, irrep_spec=[("l1", 1)])
     exp0 = compute_transport_operators(torch.zeros(1, 3, grp.generators.shape[0]), grp)["exp_phi"][0]
     assert float(group_gauge_invariant(exp0, grp).abs().max()) < 1e-6      # no rotation
     phi = 0.3 * torch.randn(1, 3, grp.generators.shape[0])
@@ -297,7 +296,7 @@ def test_per_head_gauge_invariants_are_conjugation_invariant():
 # --- transport / energy directedness --------------------------------------
 
 def test_transport_asymmetry_zero_at_identity_positive_for_gauge():
-    grp = get_group("glk")(3)
+    grp = get_group("block_glk")(3, 1)
     omega0 = compute_transport_operators(torch.zeros(1, 5, grp.generators.shape[0]), grp)["Omega"][0]
     assert float(transport_asymmetry(omega0).abs().max()) < 1e-6  # Omega = I -> symmetric
     omega = compute_transport_operators(0.3 * torch.randn(1, 5, grp.generators.shape[0]), grp)["Omega"][0]
@@ -353,7 +352,7 @@ def test_positional_content_score_distance_driven():
 # --- holonomy / curvature --------------------------------------------------
 
 def test_holonomy_deviation_sampled_flat_vs_random():
-    grp = get_group("glk")(3)
+    grp = get_group("block_glk")(3, 1)
     omega = compute_transport_operators(0.2 * torch.randn(1, 8, grp.generators.shape[0]), grp)["Omega"][0]
     flat = holonomy_deviation_sampled(omega, n_triples=64, seed=0)
     assert float(flat["mean"]) < 1e-3                            # flat cocycle closes
@@ -363,7 +362,7 @@ def test_holonomy_deviation_sampled_flat_vs_random():
 
 
 def test_curvature_field_flat_is_zero():
-    grp = get_group("glk")(3)
+    grp = get_group("block_glk")(3, 1)
     omega = compute_transport_operators(0.2 * torch.randn(1, 6, grp.generators.shape[0]), grp)["Omega"][0]
     assert float(curvature_field(omega, anchor=0).abs().max()) < 1e-3
 
@@ -381,7 +380,7 @@ def test_compact_curvature_field_flat_backward_is_finite():
 
 def test_holonomy_wilson_flat_cocycle_is_unity():
     # Wilson observable W/K = Re Tr(H)/K -> 1 (deviation 1 - W/K -> 0) when every triangle closes.
-    grp = get_group("glk")(3)
+    grp = get_group("block_glk")(3, 1)
     omega = compute_transport_operators(0.2 * torch.randn(1, 8, grp.generators.shape[0]), grp)["Omega"][0]
     out = holonomy_wilson_sampled(omega, n_triples=64, seed=0)
     assert abs(float(out["wilson_mean"]) - 1.0) < 1e-3
@@ -437,7 +436,7 @@ def test_wilson_trace_is_conjugation_invariant():
 def test_holonomy_frobenius_and_wilson_both_flat_zero():
     """C6: both the frame-dependent Frobenius deviation and the gauge-invariant Wilson deviation
     are ~0 on the flat cocycle -- the labeling split changes reporting, not the flatness oracle."""
-    grp = get_group("glk")(3)
+    grp = get_group("block_glk")(3, 1)
     omega = compute_transport_operators(0.2 * torch.randn(1, 8, grp.generators.shape[0]), grp)["Omega"][0]
     assert float(holonomy_deviation_sampled(omega, n_triples=64, seed=0)["mean"]) < 1e-3
     assert float(holonomy_wilson_sampled(omega, n_triples=64, seed=0)["deviation_mean"]) < 1e-3
@@ -542,15 +541,3 @@ def test_bootstrap_token_ce_band_paired_zero_when_equal():
     a = torch.rand(200)
     band = bootstrap_token_ce_band(a, a, n_boot=300, seed=0)
     assert abs(band["delta"]) < 1e-6 and abs(band["lo"]) < 1e-6 and abs(band["hi"]) < 1e-6
-
-
-def test_gauge_equivariance_residual_in_vs_out_group():
-    torch.manual_seed(0)
-    grp = get_group("block_glk")(4, 2)
-    n_gen = grp.generators.shape[0]
-    omega = compute_transport_operators(0.2 * torch.randn(1, 5, n_gen), grp)["Omega"][0]
-    mu = torch.randn(5, 4)
-    sigma = torch.rand(5, 4) + 0.5
-    out = gauge_equivariance_residual(mu, sigma, omega, grp, n_samples=4, scale=0.4, seed=0)
-    assert float(out["energy_in_group"].max()) < 1e-2             # invariant to machine tolerance
-    assert float(out["energy_out_group"].mean()) > 10 * float(out["energy_in_group"].mean() + 1e-12)

@@ -156,7 +156,7 @@ def test_builtin_model_gate(fallback: str, device: torch.device, monkeypatch: py
     prior_bank = importlib.import_module('vfe3.model.prior_bank')
     cfg = test_config(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=4,
                     batch_size=1, n_layers=1, n_e_steps=1, decode_mode='linear',
-                    pos_phi='learned', e_phi_lr=0.0, block_mlp_expansion=2, amp_dtype=None)
+                    pos_phi='learned', block_mlp_expansion=2, amp_dtype=None)
     model = VFEModel(cfg).to(device)
     tokens = torch.tensor([[0, 1, 0, 1]], device=device)
     original = transport._stable_compact_glk_exp_pair

@@ -136,7 +136,7 @@ def _configuration(**overrides: Any) -> VFE3Config:
     settings = dict(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=3,
                     n_layers=2, n_e_steps=1, family="gaussian_diagonal",
                     gauge_group="block_glk", skip_belief_sigma_update=True,
-                    e_phi_lr=0.0, oracle_unroll_grad=True, warmup_steps=0,
+                    warmup_steps=0,
                     max_steps=2, log_interval=0, eval_interval=0,
                     decode_temperature_learned=False,
                     use_head_mixer=False, use_block_mlp=False,
@@ -147,11 +147,10 @@ def _configuration(**overrides: Any) -> VFE3Config:
 
 
 @pytest.mark.parametrize("family", ["gaussian_diagonal", "gaussian_full"])
-@pytest.mark.parametrize("gradient_mode", ["unroll"])
 def test_omitted_handoff_preserves_model_outputs_and_gradients(monkeypatch: pytest.MonkeyPatch,
-                                                             family: str, gradient_mode: str) -> None:
+                                                             family: str) -> None:
     torch.manual_seed(54)
-    model = VFEModel(_configuration(family=family, e_step_gradient=gradient_mode))
+    model = VFEModel(_configuration(family=family))
     assert model.prior_bank.decode_log_scale.requires_grad is False
     ids = torch.tensor([[0, 1, 2]])
     targets = torch.tensor([[1, 2, 3]])

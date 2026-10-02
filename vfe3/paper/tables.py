@@ -70,7 +70,7 @@ SELECTOR_KEYS: Tuple[str, ...] = (
     "covariance_update", "temperature_convention",
 )
 PRECISION_KEYS: Tuple[str, ...] = (
-    "amp_dtype", "fp32_matmul_precision", "full_cov_kl_precision", "full_cov_congruence_precision",
+    "amp_dtype", "fp32_matmul_precision", "full_cov_kl_precision",
     "decode_av_precision", "deterministic",
 )
 FACTORIZATION_KEYS: Tuple[str, ...] = (

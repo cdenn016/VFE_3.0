@@ -18,8 +18,6 @@ from vfe3.geometry.transport import (
     CompactFactoredTransport,
     FactoredTransport,
     _checked_group_inverse,
-    transport_covariance,
-    transport_mean,
 )
 
 
@@ -64,108 +62,6 @@ def test_compact_factored_unsqueeze_negative_alias_and_matrix_rejection():
         positive.unsqueeze(1).exp_blocks, positive.unsqueeze(-5).exp_blocks)
     with pytest.raises(ValueError, match="leading axis"):
         positive.unsqueeze(-4)
-
-
-@pytest.mark.parametrize("L,M,d", [(2, 5, 2), (3, 2, 4)])
-def test_compact_mixed_query_key_transport_matches_dense_oracle(L, M, d, monkeypatch):
-    import vfe3.geometry.transport as transport_module
-
-    H, K = 2, 2 * d
-    gen = torch.Generator().manual_seed(101 + d)
-    exp_blocks = torch.eye(d).expand(1, L, H, d, d).clone()
-    inv_blocks = torch.eye(d).expand(1, M, H, d, d).clone()
-    exp_blocks = exp_blocks + 0.04 * torch.randn(exp_blocks.shape, generator=gen)
-    inv_blocks = inv_blocks + 0.04 * torch.randn(inv_blocks.shape, generator=gen)
-    compact = CompactFactoredTransport(exp_blocks, inv_blocks, K)
-    dense = compact.to_dense_omega()
-    mu = torch.randn(1, M, K, generator=gen)
-    sigma_diag = torch.rand(1, M, K, generator=gen) + 0.5
-    A = torch.randn(1, M, K, K, generator=gen)
-    sigma_full = A @ A.transpose(-1, -2) + 0.5 * torch.eye(K)
-
-    assert torch.allclose(transport_mean(compact, mu), transport_mean(dense, mu), atol=2e-6, rtol=1e-5)
-    original_pairs = transport_module._compact_pair_blocks
-
-    def _forbid_pairs(*args, **kwargs):
-        raise AssertionError("diagonal covariance allocated pair blocks")
-
-    monkeypatch.setattr(transport_module, "_compact_pair_blocks", _forbid_pairs)
-    assert torch.allclose(
-        transport_covariance(compact, sigma_diag),
-        transport_covariance(dense, sigma_diag), atol=2e-6, rtol=1e-5)
-    monkeypatch.setattr(transport_module, "_compact_pair_blocks", original_pairs)
-    assert torch.allclose(
-        transport_covariance(compact, sigma_full),
-        transport_covariance(dense, sigma_full), atol=2e-5, rtol=1e-5)
-
-
-def test_compact_diagonal_covariance_d_greater_than_keys_never_builds_pairs(monkeypatch):
-    import vfe3.geometry.transport as transport_module
-
-    L, M, H, d, K = 3, 2, 2, 4, 8
-    gen = torch.Generator().manual_seed(107)
-    exp_blocks = torch.eye(d).expand(1, L, H, d, d).clone()
-    inv_blocks = torch.eye(d).expand(1, M, H, d, d).clone()
-    exp_blocks += 0.03 * torch.randn(exp_blocks.shape, generator=gen)
-    inv_blocks += 0.03 * torch.randn(inv_blocks.shape, generator=gen)
-    compact = CompactFactoredTransport(exp_blocks, inv_blocks, K)
-    dense = compact.to_dense_omega()
-    sigma = torch.rand(1, M, K, generator=gen) + 0.5
-
-    def _forbid_pairs(*args, **kwargs):
-        raise AssertionError("diagonal covariance allocated pair blocks")
-
-    monkeypatch.setattr(transport_module, "_compact_pair_blocks", _forbid_pairs)
-    got = transport_covariance(compact, sigma)
-    expected = transport_covariance(dense, sigma)
-    assert torch.allclose(got, expected, atol=2e-6, rtol=1e-5)
-
-
-@pytest.mark.parametrize("representation", ["dense_vertex", "compact"])
-def test_uncertified_arbitrary_factored_factors_do_not_overwrite_self_links(
-    representation: str,
-) -> None:
-    N, H, d, K = 3, 2, 2, 4
-    if representation == "compact":
-        exp_blocks = 2.0 * torch.eye(d).expand(N, H, d, d).clone()
-        inv_blocks = 3.0 * torch.eye(d).expand(N, H, d, d).clone()
-        factored = CompactFactoredTransport(exp_blocks, inv_blocks, K)
-    else:
-        exp_phi = 2.0 * torch.eye(K).expand(N, K, K).clone()
-        exp_neg_phi = 3.0 * torch.eye(K).expand(N, K, K).clone()
-        factored = FactoredTransport(exp_phi, exp_neg_phi, irrep_dims=[d] * H)
-    mu = torch.arange(N * K, dtype=torch.float32).reshape(N, K) + 1.0
-    sigma = torch.arange(N * K, dtype=torch.float32).reshape(N, K) + 0.5
-    self_links = torch.arange(N)
-
-    mean = transport_mean(factored, mu)
-    covariance = transport_covariance(factored, sigma, diagonal_out=True)
-
-    assert not factored.same_frame_flat_cocycle
-    assert torch.equal(mean[self_links, self_links], 6.0 * mu)
-    assert torch.equal(covariance[self_links, self_links], 36.0 * sigma)
-
-
-def test_compact_full_gauge_rope_covariance_matches_dense_oracle():
-    N, H, d, K = 3, 2, 2, 4
-    gen = torch.Generator().manual_seed(109)
-    blocks = torch.eye(d).expand(N, H, d, d).clone()
-    blocks += 0.04 * torch.randn(blocks.shape, generator=gen)
-    compact = CompactFactoredTransport(blocks, torch.linalg.inv(blocks.double()).to(blocks.dtype), K)
-    dense = compact.to_dense_omega()
-    angles = torch.tensor([0.1, 0.3, 0.6])
-    rotations = torch.stack([
-        torch.tensor([[torch.cos(a), -torch.sin(a)], [torch.sin(a), torch.cos(a)]])
-        for a in angles
-    ])
-    rope_blocks = rotations.unsqueeze(1).expand(N, H, d, d)
-    rope = CompactBlockElement(rope_blocks, K).to_dense()
-    A = torch.randn(N, K, K, generator=gen)
-    sigma = A @ A.transpose(-1, -2) + 0.5 * torch.eye(K)
-
-    got = transport_covariance(RopeTransport(compact, rope, on_cov=True, insertion="left"), sigma)
-    expected = transport_covariance(RopeTransport(dense, rope, on_cov=True, insertion="left"), sigma)
-    assert torch.allclose(got, expected, atol=2e-5, rtol=1e-5)
 
 
 @pytest.mark.parametrize(

@@ -56,7 +56,7 @@ def test_activity_reports_defaults_independently_of_notice_visibility() -> None:
     cfg = _tiny(use_block_mlp=False)
     assert "block_mlp_expansion" in cfg.inactive_fields()
     assert "block_mlp_expansion" not in _tiny(use_block_mlp=True).inactive_fields()
-    assert "mm_damping" in cfg.inactive_fields()
+    assert "predictive_covariance_floor" in cfg.inactive_fields()
 
 
 def test_disabled_mlp_expansion_sweep_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -90,17 +90,17 @@ def test_parameter_grid_checks_only_selected_contrasts(
     monkeypatch.setitem(ablation.CONFIG, "target_n_params", 10)
     monkeypatch.setitem(ablation.CONFIG, "max_param_relative_deviation", 0.0)
     monkeypatch.setitem(ablation.SWEEPS, "cleanup_matched", {
-        "parameter_grid": {"embed_dim": [2, 4], "mm_damping": [0.2, 0.6]},
+        "parameter_grid": {"embed_dim": [2, 4], "predictive_covariance_floor": [0.2, 0.6]},
         "match_by": "embed_dim",
     })
 
     def parameter_count(arm: dict[str, object]) -> int:
         wanted = 0.6 if selected_inactive_contrast and arm["embed_dim"] == 4 else 0.2
-        return 10 if arm["mm_damping"] == wanted else 20
+        return 10 if arm["predictive_covariance_floor"] == wanted else 20
 
     monkeypatch.setattr(ablation, "_realized_n_params_for_overrides", parameter_count)
     if selected_inactive_contrast:
-        with pytest.raises(ValueError, match="mm_damping.*INERT on EVERY selected arm"):
+        with pytest.raises(ValueError, match="predictive_covariance_floor.*INERT on EVERY selected arm"):
             ablation._parameter_match_selection("cleanup_matched")
     else:
         selected = ablation._parameter_match_selection("cleanup_matched")["selected"]

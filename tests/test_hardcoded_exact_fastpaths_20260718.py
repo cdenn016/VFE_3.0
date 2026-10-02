@@ -7,10 +7,8 @@ from dataclasses import fields
 from pathlib import Path
 
 import pytest
-import torch
 
 from vfe3.config import VFE3Config
-from vfe3.model.block import e_step_shared_kwargs
 from vfe3.model.model import VFEModel
 
 
@@ -25,67 +23,6 @@ PRODUCTION_MODULES = (
     "vfe3/model/model.py",
     "vfe3/viz/extract.py",
 )
-
-
-def _keyword_values(relative: str, keyword_name: str) -> list[ast.expr]:
-    tree = ast.parse((ROOT / relative).read_text(encoding="utf-8"))
-    return [
-        keyword.value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        for keyword in node.keywords
-        if keyword.arg == keyword_name
-    ]
-
-
-def _function_keyword_values(
-    relative:      str,
-    function_name: str,
-    keyword_name:  str,
-) -> list[ast.expr]:
-    tree = ast.parse((ROOT / relative).read_text(encoding="utf-8"))
-    functions = [
-        node for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == function_name
-    ]
-    assert len(functions) == 1, (relative, function_name)
-    return [
-        keyword.value
-        for node in ast.walk(functions[0])
-        if isinstance(node, ast.Call)
-        for keyword in node.keywords
-        if keyword.arg == keyword_name
-    ]
-
-
-def _direct_call_keyword_values(
-    relative:      str,
-    function_name: str,
-    callee_name:   str,
-    keyword_name:  str,
-) -> list[ast.expr]:
-    tree = ast.parse((ROOT / relative).read_text(encoding="utf-8"))
-    functions = [
-        node for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == function_name
-    ]
-    assert len(functions) == 1, (relative, function_name)
-    return [
-        keyword.value
-        for node in ast.walk(functions[0])
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == callee_name
-        for keyword in node.keywords
-        if keyword.arg == keyword_name
-    ]
-
-
-def _literal_true(values: list[ast.expr]) -> bool:
-    return bool(values) and all(
-        isinstance(value, ast.Constant) and value.value is True
-        for value in values
-    )
 
 
 def test_public_configuration_and_drivers_have_no_fastpath_controls() -> None:
@@ -104,29 +41,6 @@ def test_production_does_not_read_removed_fastpath_attributes() -> None:
             if isinstance(node, ast.Attribute) and node.attr in FORMER_CONFIG_FIELDS
         }
         assert reads == set(), relative
-
-
-@pytest.mark.parametrize(
-    ("relative", "keyword_name"),
-    [
-        ("vfe3/model/block.py", "reuse_pairwise_kl_stats"),
-        ("vfe3/model/block.py", "transport_mean_per_head"),
-        ("vfe3/model/model.py", "transport_mean_per_head"),
-        ("vfe3/viz/extract.py", "transport_mean_per_head"),
-    ],
-)
-def test_production_fastpath_requests_are_literal_true(
-    relative:     str,
-    keyword_name: str,
-) -> None:
-    values = _keyword_values(relative, keyword_name)
-    assert values, (relative, keyword_name)
-    assert all(isinstance(value, ast.Constant) and value.value is True for value in values)
-
-
-def test_shared_e_step_kwargs_always_request_pairwise_reuse() -> None:
-    kwargs = e_step_shared_kwargs(test_config(), torch.device("cpu"))
-    assert kwargs["reuse_pairwise_kl_stats"] is True
 
 
 @pytest.mark.parametrize(
@@ -152,9 +66,3 @@ def test_compact_phi_route_is_automatic(
     assert model._compact_phi_blocks_enabled() is expected
 
 
-def test_projected_executor_does_not_report_transported_global_free_energy() -> None:
-    # The generic diagnostic helper retains its geometric transport request.
-    assert _literal_true(_function_keyword_values(
-        "vfe3/viz/extract.py", "_fe_kwargs", "transport_mean_per_head"))
-    assert not _direct_call_keyword_values(
-        "vfe3/inference/e_step.py", "e_step", "free_energy_value", "transport_mean_per_head")

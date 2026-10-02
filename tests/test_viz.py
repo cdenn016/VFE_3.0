@@ -328,7 +328,7 @@ def _fe_hist(n=30):
 def test_plot_free_energy_decomposition_saves(tmp_path):
     p = tmp_path / "decomp.png"
     fig = plot_free_energy_decomposition(
-        _fe_hist(), lambda_beta=1.0, divergence_family="renyi", path=str(p))
+        _fe_hist(), lambda_beta=1.0, path=str(p))
     labels = " ".join(text.get_text() for axis in fig.axes for text in axis.get_yticklabels())
     assert "KL" not in labels
     plt.close(fig)
@@ -344,7 +344,7 @@ def test_plot_free_energy_codescent_saves(tmp_path):
 
 def test_fe_terms_total_sums_components_and_excludes_ce():
     h = _fe_hist(20)
-    step, comps, total, ce = _fe_terms(h, lambda_beta=1.0, include_attention_entropy=True)
+    step, comps, total, ce = _fe_terms(h, lambda_beta=1.0)
     assert [k for k, _ in comps] == ["self", "belief", "attention_entropy"]
     assert np.allclose(total, sum(c for _, c in comps))           # F total is the sum of the shown bars
     assert np.allclose(ce, np.asarray(h["val_ce"], dtype=float))  # CE returned separately, not summed in
@@ -449,8 +449,9 @@ def test_token_category_helpers():
 
 
 def test_plot_gauge_equivariance_saves(tmp_path):
-    resid = {"energy_in_group": torch.rand(50) * 1e-6, "energy_out_group": torch.rand(50) + 0.5,
-             "beta_in_group": torch.rand(50) * 1e-6, "beta_out_group": torch.rand(50) * 0.3}
+    resid = {"residuals": {"routing_score": [1e-14, 3e-14], "routing_weights": [0.0, 1e-16],
+                           "readout_mean": [2e-16, 4e-16], "readout_covariance": [8e-16, 1e-15]},
+             "readout_mode": "predictive_content", "n_draws": 3, "unit_roundoff": 2.2e-16}
     p = tmp_path / "f6.png"
     fig = plot_gauge_equivariance(resid, path=str(p)); plt.close(fig)
     assert _saved_nonempty(p)
@@ -629,12 +630,10 @@ def _replay_model(**over):
         n_e_steps=2,
         gauge_group="block_glk",
         family="gaussian_full",
-        transport_mode="flat",
         pos_rotation="none",
         use_head_mixer=False, use_block_mlp=False, norm_type_block="none",
         decode_mode="full_chunked",
         pos_phi="none",
-        e_phi_lr=0.0,
     )
     base.update(over)
     torch.manual_seed(31)
@@ -675,7 +674,7 @@ def test_phi_extractors_remain_unchanged():
 
 def _vocab_model(**kw):
     base = dict(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                n_e_steps=2, e_q_mu_lr=0.1, e_phi_lr=0.0)
+                n_e_steps=2, e_q_mu_lr=0.1)
     base.update(kw)
     torch.manual_seed(0)
     return VFEModel(test_config(**base))

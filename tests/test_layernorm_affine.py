@@ -23,7 +23,7 @@ from vfe3.model.model import VFEModel
 
 def _cfg(**kw):
     base = dict(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=2,
-                n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0,
+                n_e_steps=1, m_phi_lr=0.0,
                 layernorm_affine=False, use_block_mlp=False)
     base.update(kw)
     return test_config(**base)
@@ -101,7 +101,7 @@ def test_final_affine_trains_under_unroll():
     with warnings.catch_warnings(record=True) as rec:
         warnings.simplefilter("always")
         m = VFEModel(_cfg(norm_type_block="none", norm_type_final="layernorm",
-                          layernorm_affine=True, e_step_gradient="unroll"))
+                          layernorm_affine=True))
     assert not any("freezes the BLOCK" in str(w.message) for w in rec)
     _, loss, _ = m(x, y)
     loss.backward()
@@ -118,11 +118,6 @@ def test_block_affine_trains_under_unroll():
     loss.backward()
     assert m.block_norm.weight.grad is not None and m.block_norm.weight.grad.abs().sum() > 0
     assert m.block_norm.bias.grad is not None
-
-
-def test_block_affine_rejects_retired_detach_estimator() -> None:
-    with pytest.raises(ValueError, match="e_step_gradient"):
-        _cfg(norm_type_block="layernorm", layernorm_affine=True, e_step_gradient="detach")
 
 
 def test_inert_warning_when_no_layernorm_seam():

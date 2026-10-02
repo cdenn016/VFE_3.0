@@ -279,7 +279,7 @@ def test_config_rejects_zero_e_steps_and_invalid_receiver_fields() -> None:
 def test_inactive_fields_follow_the_receiver_update() -> None:
     closed = _cfg(relational_receiver_law="channel_likelihood", relational_receiver_update="closed_form")
     inactive = closed.inactive_fields()
-    assert {"e_q_mu_lr", "e_q_sigma_lr", "e_mu_q_trust", "mu_trust_mode", "e_sigma_q_trust"} <= set(inactive)
+    assert {"e_q_mu_lr", "e_q_sigma_lr", "e_mu_q_trust", "e_sigma_q_trust"} <= set(inactive)
     assert "relational_receiver_damping" not in inactive
     euler = _cfg(relational_receiver_update="euler").inactive_fields()
     assert "relational_receiver_damping" in euler and "e_q_mu_lr" not in euler
@@ -332,10 +332,11 @@ def test_model_channel_closed_form_trains_and_reports(family: str) -> None:
 def test_euler_mean_trust_region_binds_in_whitened_units() -> None:
     belief, free, _ = _episode("ambient_alignment", "euler", e_q_mu_lr=5.0, skip_belief_sigma_update=True)
     _, clipped, _ = _episode("ambient_alignment", "euler", e_q_mu_lr=5.0, skip_belief_sigma_update=True,
-                             e_mu_q_trust=.05, mu_trust_mode="box")
+                             e_mu_q_trust=.05)
+    # Mahalanobis ball: each row's whitened step has 2-norm at most the trust radius.
     whitened = (clipped.mu - belief.mu) / belief.sigma.sqrt()
-    assert float(whitened.abs().max()) <= .05 + 1e-12
-    assert float(((free.mu - belief.mu) / belief.sigma.sqrt()).abs().max()) > .05
+    assert float(whitened.norm(dim=-1).max()) <= .05 + 1e-12
+    assert float(((free.mu - belief.mu) / belief.sigma.sqrt()).norm(dim=-1).max()) > .05
 
 
 def test_euler_zero_rates_freeze_their_components() -> None:

@@ -304,7 +304,7 @@ def test_selfloop_keys_are_nan_without_routing_weights() -> None:
 def _model_cfg(**over: Any) -> VFE3Config:
     values = dict(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=2, n_e_steps=1,
                   family="gaussian_diagonal", gauge_group="block_glk", skip_belief_sigma_update=False,
-                  e_phi_lr=0.0, oracle_unroll_grad=True, warmup_steps=0, max_steps=2, log_interval=0,
+                  warmup_steps=0, max_steps=2, log_interval=0,
                   eval_interval=0, attention_mode="projected_predictive", decode_mode="linear",
 
                   predictive_covariance="moment_matched", beta_attention_prior="causal")

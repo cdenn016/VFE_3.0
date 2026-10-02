@@ -372,7 +372,7 @@ def route_figure_skip_reasons(cfg: object) -> Dict[str, str]:
     source of the route gates of audit k160 Section 4, used by :mod:`vfe3.viz.report` and available to
     the training-time emitters (``attention_estep``, ``estep_*``, ``belief_condition``).
 
-    * ``holonomy_curvature`` when ``transport_mode = 'flat'``: the holonomy of flat transport is the
+    * ``holonomy_curvature`` always: the projected routes run flat transport, whose holonomy is the
       identity by construction, so the figure plots float32 roundoff.
     * The legacy E-step family when :func:`has_estep_iterates` is false: the retained routes use
       predictive readout or a frozen-router receiver objective rather than that shared objective.
@@ -382,10 +382,9 @@ def route_figure_skip_reasons(cfg: object) -> Dict[str, str]:
     """
     from vfe3 import metrics
     reasons: Dict[str, str] = {}
-    if getattr(cfg, "transport_mode", "flat") == "flat":
-        reasons["holonomy_curvature"] = (
-            "transport_mode='flat': holonomy is the identity by construction, so the figure would "
-            "plot float32 roundoff")
+    reasons["holonomy_curvature"] = (
+        "flat transport: holonomy is the identity by construction, so the figure would "
+        "plot float32 roundoff")
     if not has_estep_iterates(cfg):
         reason = (f"attention_mode={getattr(cfg, 'attention_mode', 'projected_predictive')!r}: "
                   "legacy shared-objective E-step probes do not apply")
@@ -1474,7 +1473,6 @@ def get_figure(name: str) -> Callable:
 # composite, registers by name, and returns the Figure.
 # ===========================================================================
 
-_EPS_F32 = 1.1920929e-7                                           # float32 machine epsilon
 
 
 def _median_band(
@@ -2049,11 +2047,10 @@ def plot_estep_character(
     *,
     path:   Optional[str] = None,
 ):
-    r"""Plot what the belief E-step does with depth: how far it moves, and how it is weighted.
+    r"""Plot how far the belief E-step moves the belief with depth.
 
-    Left axis is the relative belief displacement, right axis the PAIR (attention) share of the
-    fused ``mm_exact`` precision, whose complement is the prior residual. A flat displacement curve
-    with a high residual share is one aggregation, not convergent inference.
+    The relative belief displacement per depth, with the direction cosine against the first step
+    in the title. A flat displacement curve is one aggregation, not convergent inference.
 
     Raises :class:`FigureSkipped` when the probe is unavailable or covers only the single configured
     readout (``depth_sweep_available`` false): there are no E-step iterates, and the one point is
@@ -2076,13 +2073,6 @@ def plot_estep_character(
     depths = np.asarray([p["belief_depth"] for p in points], dtype=float)
     displacement = np.asarray([p["rel_displacement"] for p in points], dtype=float)
     ax_move.plot(depths, displacement, "o-", color=_CB[0], label=r"$\|\Delta\mu\|/\|\mu_p\|$")
-    ax_share = ax_move.twinx()
-    shares = np.asarray([p["pair_precision_share"] if p.get("pair_precision_share") is not None
-                         else np.nan for p in points], dtype=float)
-    if np.isfinite(shares).any():
-        ax_share.plot(depths, shares, "s--", color=_CB[1], label="pair (attention) share")
-        ax_share.set_ylim(0.0, 1.0)
-    ax_share.set_ylabel("share of fused precision")
     trained_depth = float(record.get("trained_depth", np.nan))
     if np.isfinite(trained_depth):
         ax_move.axvline(trained_depth, color="#555555", ls=":", lw=1.0, label="trained depth")
@@ -2092,9 +2082,7 @@ def plot_estep_character(
     else:
         ax_move.set_title("E-step character")
     ax_move.set(xlabel="belief E-step iterations", ylabel="relative belief displacement")
-    lines = ax_move.lines + ax_share.lines
-    ax_move.legend(lines, [line.get_label() for line in lines], frameon=False, fontsize=8,
-                   loc="center right")
+    ax_move.legend(frameon=False, fontsize=8, loc="center right")
     fig.tight_layout()
     return _save(fig, path)
 
@@ -3468,28 +3456,58 @@ def _token_category_labels(
     return np.array([cat[int(t)] for t in ids]), names
 
 
+_EQUIVARIANCE_LABELS = {
+    "routing_score":              r"score $D_{ij}^h$",
+    "routing_weights":            r"weights $\beta_{ij}^h$",
+    "readout_mean":               r"mean $U_i^{-1}m_i$",
+    "readout_covariance":         r"cov. $U_i^{-1}\Sigma_i^+U_i^{-\top}$",
+    "receiver_force":             r"force $U_i^\top\nabla_\mu F$",
+    "receiver_update_mean":       r"update $U_i^{-1}\mu_i^+$",
+    "receiver_update_covariance": r"update $U_i^{-1}\Sigma_i^+U_i^{-\top}$",
+    "receiver_energy":            r"energy $F$",
+}
+
+
 @register_figure("gauge_equivariance")
 def plot_gauge_equivariance(
-    resid: Dict,                         # gauge_equivariance_residual output
+    resid: Dict,                         # vfe3.viz.extract.projected_gauge_equivariance output
 
     *,
     path:  Optional[str] = None,
 ):
-    r"""F6: gauge-equivariance certificate -- energy and attention invariant to the structure group.
+    r"""Gauge equivariance of the executed projected routing and readout.
 
-    Log-scale ECDFs of the relative residual of E_ij and beta_ij under random IN-group elements
-    (clustered near float32 eps) vs a matched OUT-of-group control (far right), with a machine-eps
-    reference line. A real symmetry, not a decorative one.
+    One bar per layer and quantity: the maximum relative deviation
+    :math:`\max|x'-x|/\max|x|` under random passive frame actions
+    :math:`(U_i,\mu_i,\Sigma_i)\mapsto(g_iU_i,\,g_i\mu_i,\,g_i\Sigma_ig_i^\top)`, computed in float64,
+    on a log axis with the float64 unit roundoff as a reference line.
     """
-    fig, axes = plt.subplots(1, 2, figsize=(9, 4))
-    for ax, key, title in ((axes[0], "energy", r"energy $E_{ij}$"), (axes[1], "beta", r"attention $\beta_{ij}$")):
-        _ecdf(ax, resid[f"{key}_in_group"], _CB[2], "in-group")
-        _ecdf(ax, resid[f"{key}_out_group"], _CB[1], "out-of-group")
-        ax.axvline(_EPS_F32, color="#444444", ls=":", lw=1, label="float32 eps")
-        ax.set_xscale("log")
-        ax.set(xlabel="relative residual", ylabel="ECDF", title=f"Equivariance of {title}")
-        ax.legend(fontsize=8, frameon=False, loc="lower right")
-    fig.tight_layout()
+    residuals = resid.get("residuals", {})
+    keys = [key for key in _EQUIVARIANCE_LABELS if key in residuals]
+    if not keys:
+        raise FigureSkipped("projected_gauge_equivariance returned no residuals")
+    n_layers = max(len(residuals[key]) for key in keys)
+    width = 0.8 / max(n_layers, 1)
+    floor = float(resid.get("unit_roundoff", 2.220446049250313e-16))
+    with _compact_style():
+        fig, ax = plt.subplots(figsize=(MAX_FIGURE_WIDTH_IN, 2.8))
+        x = np.arange(len(keys))
+        for layer in range(n_layers):
+            values = np.array([residuals[key][layer] if layer < len(residuals[key]) else np.nan
+                               for key in keys], dtype=float)
+            # A bitwise-exact quantity has zero deviation; draw it at the reference floor.
+            shown = np.where(values > 0, values, floor)
+            ax.bar(x + (layer - (n_layers - 1) / 2) * width, shown, width,
+                   color=_CB[layer % len(_CB)], label=f"layer {layer}")
+        ax.axhline(floor, color="#444444", ls=":", lw=1, label="float64 unit roundoff")
+        ax.set_yscale("log")
+        ax.set_xticks(x)
+        ax.set_xticklabels([_EQUIVARIANCE_LABELS[key] for key in keys], rotation=20, ha="right")
+        ax.set_ylabel("max relative deviation")
+        ax.set_title(f"Projected gauge equivariance ({resid.get('readout_mode', '')}, "
+                     f"{resid.get('n_draws', '?')} frame draws, float64)")
+        ax.legend(fontsize=6, frameon=False, ncol=min(n_layers + 1, 4))
+        fig.tight_layout()
     return _save(fig, path)
 
 
@@ -4999,77 +5017,6 @@ def plot_f_ce_relationship(
 
 
 plot_f_ce_decorrelation = plot_f_ce_relationship
-
-
-# ===========================================================================
-# C1 / EXP-4  --  canonical-F vs entropy-suppressed surrogate
-# ===========================================================================
-
-@register_figure("entropy_ppl_gap")
-def plot_entropy_ppl_gap(
-    cells,                               # list of {include_attention_entropy(bool), kappa, ppl}
-
-    *,
-    path: Optional[str] = None,
-):
-    r"""C1/EXP-4: validation-PPL, canonical (entropy ON) vs surrogate (entropy OFF), grouped by kappa.
-
-    The production kernel descends the SURROGATE gradient, so CANON_ORACLE is the only path that ever
-    exercises the canonical -tau^{-1} Cov_beta correction; a positive (surrogate - canonical) PPL gap
-    means the entropy term is empirically load-bearing. Grouped bars per kappa; the gap is annotated."""
-    cells = list(cells)
-    kappas = sorted({float(c["kappa"]) for c in cells})
-
-    def _ppl(k, ent):
-        v = [float(c["ppl"]) for c in cells
-             if abs(float(c["kappa"]) - k) < 1e-9 and bool(c["include_attention_entropy"]) == ent]
-        return v[0] if v else float("nan")
-    canon = [_ppl(k, True) for k in kappas]
-    surr = [_ppl(k, False) for k in kappas]
-    x = np.arange(len(kappas)); w = 0.38
-    fig, ax = plt.subplots(figsize=(6.2, 4.4))
-    ax.bar(x - w / 2, canon, w, color=_CB[0], label="canonical (entropy ON)")
-    ax.bar(x + w / 2, surr, w, color=_CB[1], label="surrogate (entropy OFF)")
-    for i in range(len(kappas)):
-        if np.isfinite(canon[i]) and np.isfinite(surr[i]):
-            ax.annotate(f"Δ={surr[i] - canon[i]:+.2f}", (x[i], max(canon[i], surr[i])),
-                        textcoords="offset points", xytext=(0, 4), ha="center", fontsize=8)
-    ax.set_xticks(x); ax.set_xticklabels([f"κ={k:g}" for k in kappas])
-    _zoom_bar_value_axis(ax, canon + surr, hi_frac=0.20)   # padded window + headroom for the Δ labels
-    ax.set(ylabel="validation PPL")
-    ax.set_title("Canonical-F vs entropy-suppressed surrogate (PPL gap by κ)")
-    ax.legend(fontsize=8, frameon=False)
-    fig.tight_layout()
-    return _save(fig, path)
-
-
-@register_figure("cov_gap_vs_kappa")
-def plot_cov_gap_vs_kappa(
-    cells,                               # list of {include_attention_entropy(bool), kappa, cov_gap}
-
-    *,
-    path: Optional[str] = None,
-):
-    r"""C1/EXP-4: the -tau^{-1} Cov_beta(E, dE) gradient-gap magnitude vs kappa.
-
-    The belief-gradient contribution the canonical entropy term adds and the surrogate drops. Its
-    kappa-dependence trades the 1/tau = 1/(kappa*sqrt(d)) prefactor against the beta diffuseness in
-    Cov_beta, so the sign of the trend is empirical -- the plot measures it. One series per trained
-    arm (the gap is measured on each arm's converged belief)."""
-    cells = list(cells)
-    fig, ax = plt.subplots(figsize=(6.0, 4.4))
-    for ent, lab, col in ((True, "canonical-trained", _CB[0]), (False, "surrogate-trained", _CB[1])):
-        pts = sorted([(float(c["kappa"]), float(c["cov_gap"])) for c in cells
-                      if bool(c["include_attention_entropy"]) == ent
-                      and np.isfinite(float(c["cov_gap"]))], key=lambda t: t[0])
-        if pts:
-            ax.plot([p[0] for p in pts], [p[1] for p in pts], "o-", color=col, lw=1.8, label=lab)
-    ax.set(xlabel=r"$\kappa$ (softmax temperature scale)",
-           ylabel=r"$\|-\tau^{-1}\mathrm{Cov}_\beta(E,\nabla E)\|$ per token")
-    ax.set_title("Attention-entropy gradient gap vs κ")
-    ax.legend(fontsize=8, frameon=False)
-    fig.tight_layout()
-    return _save(fig, path)
 
 
 # ===========================================================================

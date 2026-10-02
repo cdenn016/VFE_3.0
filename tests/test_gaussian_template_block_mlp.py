@@ -93,7 +93,6 @@ def _tiny_cfg(**overrides) -> VFE3Config:
         n_e_steps=1,
         e_q_mu_lr=0.1,
         e_q_sigma_lr=0.02,
-        e_phi_lr=0.0,
         decode_mode="diagonal_chunked",
         norm_type_block="none",
         use_block_mlp=True,

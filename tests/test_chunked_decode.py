@@ -14,11 +14,19 @@ from vfe3.model.model import VFEModel
 
 
 def _full_ce(model: VFEModel, tokens: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    """Reference CE on the full-decode 'diagonal' path: decode -> F.cross_entropy."""
+    """Reference CE on the dense diagonal logits: decode -> F.cross_entropy."""
     logits = model.prior_bank.decode(*_converged(model, tokens))      # (B, N, V)
     flat_logits = logits.reshape(-1, model.cfg.vocab_size)
     flat_targets = targets.reshape(-1)
     return F.cross_entropy(flat_logits, flat_targets, ignore_index=-100)
+
+
+def _dense_forward_ce(model: VFEModel, tokens: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """Reference CE through model.forward: the targets=None logits (the dense diagonal oracle)
+    scored by F.cross_entropy, so positional-phi composition is applied exactly as in training."""
+    logits = model(tokens)                                              # (B, N, V)
+    return F.cross_entropy(logits.reshape(-1, model.cfg.vocab_size).float(), targets.reshape(-1),
+                           ignore_index=-100)
 
 
 def _converged(model: VFEModel, tokens: torch.Tensor):
@@ -28,10 +36,9 @@ def _converged(model: VFEModel, tokens: torch.Tensor):
 
 
 def _model(vocab_size=64, **kw):
-    kw.setdefault("decode_mode", "diagonal")
+    kw.setdefault("decode_mode", "diagonal_chunked")
     cfg = test_config(vocab_size=vocab_size, embed_dim=4, n_heads=2, max_seq_len=6,
-                     n_layers=1, n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0,
-                     _allow_legacy_dense_decode=kw["decode_mode"] == "diagonal", **kw)
+                     n_layers=1, n_e_steps=1, e_q_mu_lr=0.05, **kw)
     return VFEModel(cfg)
 
 
@@ -97,8 +104,8 @@ def test_chunked_ce_grad_matches_full():
     tokens = torch.randint(0, V, (2, 5))
     targets = torch.randint(0, V, (2, 5))
 
-    full = _model(vocab_size=V)                            # decode_mode='diagonal'
-    _, full_loss, _ = full(tokens, targets)                # through forward(): applies pos_phi
+    full = _model(vocab_size=V)
+    full_loss = _dense_forward_ce(full, tokens, targets)   # through forward(): applies pos_phi
     full_loss.backward()
     g_mu_full = full.prior_bank.mu_embed.grad.clone()
     g_sig_full = full.prior_bank.sigma_log_embed.grad.clone()
@@ -121,7 +128,7 @@ def test_chunked_forward_loss_matches_diagonal_forward_loss():
     tokens = torch.randint(0, V, (3, 6))
     targets = torch.randint(0, V, (3, 6))
     base = _model(vocab_size=V)
-    _, loss_full, ce_full = base(tokens, targets)
+    loss_full = ce_full = _dense_forward_ce(base, tokens, targets)
 
     ch = _model(vocab_size=V, decode_mode="diagonal_chunked", decode_chunk_size=9)
     ch.load_state_dict(base.state_dict())
@@ -152,7 +159,7 @@ def test_chunked_inference_targets_none_returns_full_logits():
 # --- vram audit 2026-06-10: fused chunked CE for the linear decode ---
 def _linear_model(vocab_size=64, **kw):
     cfg = test_config(vocab_size=vocab_size, embed_dim=4, n_heads=2, max_seq_len=6,
-                     n_layers=1, n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0,
+                     n_layers=1, n_e_steps=1, e_q_mu_lr=0.05,
                      decode_mode="linear", **kw)
     return VFEModel(cfg)
 

@@ -36,8 +36,8 @@ def _cfg(**overrides: Any) -> VFE3Config:
     values: Dict[str, Any] = dict(
         vocab_size=V, embed_dim=4, n_heads=2, batch_size=B, max_seq_len=N, eval_stride=2,
         n_layers=2, n_e_steps=1, warmup_steps=0, max_steps=12, log_interval=0, eval_interval=0,
-        checkpoint_interval=0, skip_belief_sigma_update=True, e_phi_lr=0.0,
-        oracle_unroll_grad=True, generate_embedding_figures=False, pos_phi="learned",
+        checkpoint_interval=0, skip_belief_sigma_update=True,
+        generate_embedding_figures=False, pos_phi="learned",
         use_block_mlp=True, block_mlp_expansion=1, beta_attention_prior="causal_alibi",
         phi_mstep_max_matrix_norm=RADIUS)
     values.update(family="gaussian_diagonal", gauge_group="block_glk",

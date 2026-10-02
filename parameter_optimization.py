@@ -75,14 +75,11 @@ config: Dict[str, Any] = dict(
    
 
     #################################
-    # f-divergence and e/m family
+    # belief family
     #################################
 
-    divergence_family         = "renyi",   # "renyi", "squared_hellinger","bhattacharyya", "jeffreys",
-    renyi_order               = 1.0,       # Renyi order (1.0 -> KL)
 
-    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full" | "laplace_diagonal" | "gaussian_frame_diagonal"
-                                                     # | "gaussian_diagonal_exact" (single covariance toggle; diagonal_covariance is derived)
+    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full"
     #################################
     #        Initialization
     #################################
@@ -96,13 +93,12 @@ config: Dict[str, Any] = dict(
     #        Encode/Decode          #
     #################################
     decode_bias                       = True,     # only for decode_mode='linear'
-    use_head_mixer                    = True,      # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
+    use_head_mixer                    = True,      # opt-in Schur-commutant head mixer (needs >=2 blocks: block_glk heads OR an so_n irrep tower with per-isotypic-component mixing);
     use_priorbank_head_evidence_mixer = False,
 
 
     decode_mode                       = 'linear',  # prior-bank: diagonal_chunked/full_chunked/expected_likelihood_chunked/family_chunked
     encode_mode                       = "per_token",   #"per_token_additive" is ~1.5x faster at K=80 currently unablated
-                                                       # "canonical_content_projected" requires gaussian_diagonal input and a full decoder
     decode_chunk_size                 = 8192,
     decode_tau                        = 0.008,  #prior_bank = True temperature
     decode_ce_checkpoint              = "auto",  # "auto" | "always" | "never"
@@ -138,12 +134,12 @@ config: Dict[str, Any] = dict(
 
     pos_phi_project_slk       = False,      # per-block trace projection (det Omega = 1)
 
-    gauge_group               = "block_glk",    # "glk" | "block_glk" | "tied_block_glk" | "so_k" | "sp" | "so_n" | "sp_n"
+    gauge_group               = "block_glk",    # "block_glk" | "so_n" (so_n awaits reconnection to the projected routes)
 
-    group_n                   = None,                # so_n/sp_n only; must stay None for every other group
-    irrep_spec                = None,                # so_n/sp_n only; must stay None for every other group
+    group_n                   = None,                # so_n only; must stay None for block_glk
+    irrep_spec                = None,                # so_n only; must stay None for block_glk
 
-    use_cg_coupling           = False,               # so_n/sp_n only: CG cross-type coupling
+    use_cg_coupling           = False,               # so_n only: CG cross-type coupling
     cg_covariance_mode        = "passthrough",       # "passthrough" (means-only, pure) | "delta_full"
     cg_covariance_floor       = 1e-6,
     cg_energy_weight          = 0.0,                 # CG moment-energy regularizer (0.0 = OFF)
@@ -153,9 +149,7 @@ config: Dict[str, Any] = dict(
     # Connection Regime
     ####################################
 
-    transport_mode            = "flat",     # "flat" (the phi-cocycle): the ONLY registered connection regime
 
-    cross_couplings           = None,       # off-block GL(K) head pairs e.g. [(0, 1)]; block_glk only
 
 
     ####################################
@@ -169,7 +163,6 @@ config: Dict[str, Any] = dict(
 
     rope_base                 = 100.0,               # rotary frequency base
 
-    rope_full_gauge           = False,               # rotate the covariance sandwich too (REQUIRES family="gaussian_full")
     rope_on_value             = False,
 
 
@@ -216,20 +209,11 @@ config: Dict[str, Any] = dict(
     #         Belief E-step
     #         Learning Rates
     #################################
-    e_step_update             = "gradient",  # "gradient" (pure current path) | "mm_exact" (closed-form MM
-                                             # coordinate minimizer at frozen beta)
-    gradient_mode             = "filtering",  # "filtering" | "smoothing"
-    include_attention_entropy = True,
-    e_step_gradient           = "unroll",     # "unroll" | "implicit" | "first_order" | "detach"
-    oracle_unroll_grad        = True,
-    e_step_mu_precond         = "fisher",     # "fisher" | "raw"
-    mm_damping                = 1,           # mm_exact damping eta in (0,1]; 1.0 = exact minimizer
    
 
     e_q_mu_lr                 = 1,
     e_q_sigma_lr              = 0.01,
 
-    e_phi_lr                  = 0.00,
 
 
     #################################
@@ -295,7 +279,6 @@ config: Dict[str, Any] = dict(
     e_mu_q_trust                         = 2,
     e_sigma_q_trust                      = 1.0,
     sigma_max                            = 100.0,
-    mu_trust_mode                        = "ball",
 
 
     amp_dtype                            = 'bf16',        # None=fp32 | 'bf16' , 'fp16'. Sigma must be at least fp32
@@ -308,7 +291,6 @@ config: Dict[str, Any] = dict(
 
 
     full_cov_kl_precision                = "fp32_escalate",  # "fp64" | "fp32_escalate"
-    full_cov_congruence_precision        = "fp32_escalate",  #  "fp64" | "fp32_escalate"
 
     safe_cholesky_jitter_mode            = "relative",        #"absolute" | "relative"
     mu_trust_cholesky_rounds             = 3,
@@ -316,8 +298,6 @@ config: Dict[str, Any] = dict(
     
     decode_av_precision                  = "fp64",     #  "fp32" | "fp64"   
     decode_ranking_fp64_escalation       = True, 
-    congruence_cond_escalation           = False, #at K=80 4 heads ~  2x slower
-    full_cov_congruence_certification    = True,  
 
     skip_belief_sigma_update             = True,        # skip the belief-channel sigma E-step update
     
@@ -361,7 +341,7 @@ SEARCH_CONFIG: Dict[str, Any] = {
         
         "e_q_mu_lr": {
             "enabled": True, "bounds": [0.01, 2], "values": None, "scale": "log",
-            "requires": {"e_step_update": "gradient"},
+            "requires": {},
             "description": "E-step natural-gradient step size for mu_q.",
         },
         "m_phi_lr": {
@@ -482,7 +462,7 @@ SEARCH_CONFIG: Dict[str, Any] = {
         
         "e_q_sigma_lr": {
             "enabled": False, "bounds": [0.0, 0.1], "values": None, "scale": "linear",
-            "requires": {"e_step_update": "gradient"},
+            "requires": {},
             "description": "E-step retraction step size for sigma_q.",
         },
         "decode_tau": {
@@ -494,11 +474,6 @@ SEARCH_CONFIG: Dict[str, Any] = {
             "enabled": False, "bounds": [0.1, 5.0], "values": None, "scale": "linear",
             "requires": {},
             "description": "Belief-attention temperature multiplier.",
-        },
-        "mm_damping": {
-            "enabled": False, "bounds": None, "values": [0.5, 0.75, 0.85, 1.0],
-            "scale": "linear", "requires": {"e_step_update": "mm_exact"},
-            "description": "MM-exact E-step damping.",
         },
         # SWEEP_ORDER currently contains this field but ablation.SWEEPS has no range for it.
         # Supply bounds or values here before enabling it; no edit to ablation.py is needed.

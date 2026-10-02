@@ -70,7 +70,7 @@ def _component_runs(
         if len(set(irrep_dims)) != 1:
             raise ValueError(
                 f"HeadMixer needs equal-size blocks for kron(A, I_d), got "
-                f"irrep_dims={list(irrep_dims)}. A labeled irrep tower (so_n/sp_n) mixes per "
+                f"irrep_dims={list(irrep_dims)}. A labeled irrep tower (so_n) mixes per "
                 f"isotypic component instead."
             )
         return [(0, len(irrep_dims))]

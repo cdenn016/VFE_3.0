@@ -47,7 +47,7 @@ def _queries(pb: PriorBank, full: bool) -> tuple:
 
 
 @pytest.mark.parametrize("evidence", [False, True])
-@pytest.mark.parametrize("decode_mode,full", [("diagonal", False), ("full_chunked", True)])
+@pytest.mark.parametrize("decode_mode,full", [("diagonal_chunked", False), ("full_chunked", True)])
 def test_candidate_refinement_reproduces_the_full_promotion_argmax(monkeypatch, decode_mode: str,
                                                                     full: bool, evidence: bool) -> None:
     full_bank = _near_tie_bank(decode_mode, "full", full, evidence)
@@ -74,7 +74,7 @@ def test_candidate_refinement_reproduces_the_full_promotion_argmax(monkeypatch, 
 
 
 def test_candidate_refinement_is_differentiable() -> None:
-    pb = _near_tie_bank("diagonal", "candidates", False)
+    pb = _near_tie_bank("diagonal_chunked", "candidates", False)
     mu_q, sigma_q = _queries(pb, False)
     mu_q.requires_grad_(True)
     torch.log_softmax(pb.decode(mu_q, sigma_q), dim=-1)[..., 0].sum().backward()

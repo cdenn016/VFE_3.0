@@ -9,7 +9,7 @@ from vfe3.model.model import VFEModel
 from vfe3.model.relational_operators import RelationalOperators
 
 
-@pytest.mark.parametrize("family", ["gaussian_full", "gaussian_diagonal_exact", "gaussian_frame_diagonal"])
+@pytest.mark.parametrize("family", ["gaussian_full", "gaussian_diagonal"])
 @pytest.mark.parametrize("readout", ["predictive_content"])
 def test_gaussian_family_live_forward_backward(family: str, readout: str) -> None:
     torch.manual_seed(17)
@@ -60,7 +60,7 @@ def test_full_covariance_score_matches_dense_marginals(scope: str) -> None:
     assert torch.isfinite(torch.autograd.grad(actual.sum(), Sigma)[0]).all()
 
 
-@pytest.mark.parametrize("family", ["gaussian_full", "gaussian_diagonal_exact", "gaussian_frame_diagonal"])
+@pytest.mark.parametrize("family", ["gaussian_full", "gaussian_diagonal"])
 @pytest.mark.parametrize("readout", ["predictive_content"])
 @pytest.mark.parametrize("rope_on_value", [False, True])
 def test_gaussian_rope_autocast_snapshot(family: str, readout: str, rope_on_value: bool) -> None:
@@ -68,8 +68,7 @@ def test_gaussian_rope_autocast_snapshot(family: str, readout: str, rope_on_valu
     model = VFEModel(_cfg(family=family,
                          attention_mode="projected_predictive",
 
-                         pos_rotation="rope", rope_full_gauge=family == "gaussian_full",
-                         rope_on_value=rope_on_value))
+                         pos_rotation="rope", rope_on_value=rope_on_value))
     ids, targets = _tokens()
     with torch.autocast("cpu", dtype=torch.bfloat16):
         _, logits = model.forward_beliefs(ids, return_logits=True)
@@ -79,32 +78,13 @@ def test_gaussian_rope_autocast_snapshot(family: str, readout: str, rope_on_valu
         assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
     with torch.autocast("cpu", dtype=torch.bfloat16):
         snapshot = model.build_diagnostic_snapshot(ids)
-    if readout == "conditional_update" and family == "gaussian_frame_diagonal":
-        context = snapshot.relational_capture["conditional_context"]
-        expected = torch.diag_embed(context.sigma.reshape(*context.sigma.shape[:-1], 2, 2))
-        expected = expected.unsqueeze(-5).expand_as(context.sigma_t)
-        torch.testing.assert_close(context.sigma_t, expected, rtol=0, atol=0)
     diagnostics = model.diagnostics(ids, snapshot=snapshot)
     assert diagnostics["relational_projected_cov_min_eigenvalue"] > 0
     assert 0 < diagnostics["effective_rank"] <= 4.0001
 
 
-@pytest.mark.parametrize("readout", ["predictive_content"])
-def test_intrinsic_family_does_not_pull_back_stored_coordinates_twice(readout: str) -> None:
-    torch.manual_seed(3)
-    model = VFEModel(_cfg(family="gaussian_frame_diagonal",
-                         attention_mode="projected_predictive",
-                          use_head_mixer=False, use_block_mlp=False))
-    ids, _ = _tokens()
-    first = model.forward_beliefs(ids)[0].mu
-    with torch.no_grad():
-        model.prior_bank.phi_embed.add_(.1)
-    second = model.forward_beliefs(ids)[0].mu
-    torch.testing.assert_close(first, second, rtol=0, atol=0)
-
-
 def test_laplace_remains_outside_gaussian_projection_envelope() -> None:
-    with pytest.raises(ValueError, match="Gaussian family"):
+    with pytest.raises(ValueError, match="requires gaussian_diagonal or gaussian_full"):
         _cfg(family="laplace_diagonal")
 
 

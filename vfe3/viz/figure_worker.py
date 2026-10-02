@@ -395,8 +395,6 @@ def _legacy_ablation_scope_files(scope: str) -> set[str]:
         "",
         "_seed_aggregate",
         "_rank_collapse",
-        "_ppl_gap",
-        "_cov_gap",
         "_wallclock_convergence",
         "_gauge_bars",
         "_ppl_equiv",

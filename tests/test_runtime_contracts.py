@@ -89,7 +89,7 @@ def test_overflow_backoff_is_independent_of_logging(metrics: bool) -> None:
 def test_predictive_mean_step_sweep_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     import ablation
     monkeypatch.setattr(ablation, "BASELINE_CONFIG", config_values(
-        attention_mode="projected_predictive", e_phi_lr=0.0))
+        attention_mode="projected_predictive"))
     monkeypatch.setattr(ablation, "SWEEPS", {"e_q_mu_lr": {
         "param": "e_q_mu_lr", "values": [0.1, 0.5], "requires": {}}})
     with pytest.raises(ValueError, match='inert|e_q_mu_lr'):

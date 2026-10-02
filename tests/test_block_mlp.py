@@ -49,7 +49,6 @@ def _tiny_cfg(**overrides):
         n_e_steps=1,
         e_q_mu_lr=0.1,
         e_q_sigma_lr=0.02,
-        e_phi_lr=0.0,
         decode_mode="diagonal_chunked",
         norm_type_block="none",
     )
@@ -166,14 +165,12 @@ def test_coordinate_mlp_preserves_covariance_and_other_belief_fields():
         assert out.right_phi is converged.right_phi
 
 
-@pytest.mark.parametrize("estimator", ["unroll"])
-def test_every_active_mlp_layer_receives_finite_gradients(estimator):
+def test_every_active_mlp_layer_receives_finite_gradients():
     tokens = torch.tensor([[1, 2, 3, 4]])
     targets = torch.tensor([[2, 3, 4, 5]])
     model = VFEModel(_tiny_cfg(
         use_block_mlp=True,
         n_layers=3,
-        e_step_gradient=estimator,
     ))
 
     _, loss, _ = model(tokens, targets)

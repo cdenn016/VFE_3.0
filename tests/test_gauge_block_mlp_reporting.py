@@ -23,13 +23,11 @@ def _pure_cfg(mode, covariance="passthrough"):
         block_mlp_mode=mode,
         block_mlp_covariance=covariance,
         gauge_group="block_glk",
-        transport_mode="flat",
         pos_phi="none",
         pos_rotation="none",
         norm_type_block="none",          # the default "layernorm" is not gauge-equivariant
         sigma_max=None,
         transport_chart_max_norm=12.0,
-        e_phi_lr=0.0,
     )
 
 
@@ -37,7 +35,6 @@ def test_pure_path_report_distinguishes_strict_gate_from_frame_fixed_mode():
     reference_kwargs = dict(
         attention_mode="projected_predictive", decode_coordinates="reference",
 
-        e_step_gradient="unroll", oracle_unroll_grad=True,
     )
     gate = _pure_path_report(
         replace(_pure_cfg("gauge_gate", "delta_full"), **reference_kwargs), [])
@@ -143,7 +140,6 @@ def test_canonical_frame_executes_with_right_full_gauge_rope():
     cfg = test_config(**{
         **asdict(cfg),
         "pos_rotation": "rope",
-        "rope_full_gauge": True,
         "rope_on_value": True,
     })
     logits = VFEModel(cfg)(torch.tensor([[1, 2, 3, 4]]))

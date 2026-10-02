@@ -51,7 +51,7 @@ def _fast_figures(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _seed_run(root: Path, name: str, seed: int, data_seed: Optional[int], **over) -> Path:
     r"""A tiny trained-looking run whose tables are drawn from ``seed`` (and a provenance.json)."""
-    options = dict(vocab_size=V, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=2, e_phi_lr=0.0,
+    options = dict(vocab_size=V, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=2,
                    attention_mode="projected_predictive", seed=seed,
                    norm_type_block="none", layernorm_affine=False,           # pinned: independent of
                    skip_belief_sigma_update=False)                           # the config defaults

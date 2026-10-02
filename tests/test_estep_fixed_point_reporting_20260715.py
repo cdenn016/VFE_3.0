@@ -10,7 +10,6 @@ import pytest
 
 def test_group_product_accepts_the_flat_tied_phi_route() -> None:
     assert test_config(pos_phi="learned").pos_phi == "learned"
-    assert test_config(pos_phi="learned").transport_mode == "flat"
     assert test_config(pos_phi="none").pos_phi == "none"
 
 

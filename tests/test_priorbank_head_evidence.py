@@ -160,8 +160,6 @@ def _enabled_cfg(**overrides: object) -> VFE3Config:
         "gauge_group": "block_glk",
         "use_priorbank_head_evidence_mixer": True,
         "family": "gaussian_diagonal",
-        "divergence_family": "renyi",
-        "renyi_order": 1.0,
         "decode_mode": "diagonal_chunked",
         "lambda_alpha_mode": "constant",
     }
@@ -316,10 +314,8 @@ def test_head_evidence_rejects_replaced_canonical_decoder_callable():
     [
         ({"decode_mode": "linear"}, "prior-bank decode_mode"),
         ({"gauge_group": "glk"}, "gauge_group=.*glk"),
-        ({"renyi_order": 0.5}, "renyi_order=0.5"),
-        ({"divergence_family": "squared_hellinger"}, "divergence_family=.*squared_hellinger"),
         ({"decode_mode": "family_chunked"}, "canonical KL decode"),
-        ({"family": "gaussian_full", "decode_mode": "diagonal_chunked"}, "gaussian_full.*full.*full_chunked"),
+        ({"family": "gaussian_full", "decode_mode": "diagonal_chunked"}, "gaussian_full.*full_chunked"),
     ],
 )
 def test_head_evidence_rejects_invalid_configurations(overrides: dict[str, object], match: str):
@@ -354,8 +350,6 @@ def test_direct_head_evidence_construction_rejects_invalid_contract(
         K=4,
         n_gen=8,
         family="gaussian_diagonal",
-        divergence_family="renyi",
-        renyi_order=1.0,
         decode_mode="diagonal_chunked",
         irrep_dims=[2, 2],
         use_priorbank_head_evidence_mixer=True,
@@ -363,24 +357,6 @@ def test_direct_head_evidence_construction_rejects_invalid_contract(
     values.update(overrides)
     with pytest.raises(ValueError, match=match):
         PriorBank(**values)
-
-
-def test_direct_head_evidence_accepts_precise_projected_rank_exception() -> None:
-    """Only projected diagonal content may feed the built-in full scorer under this mixer."""
-    bank = PriorBank(
-        vocab_size=11,
-        K=4,
-        n_gen=8,
-        family="gaussian_diagonal",
-        divergence_family="renyi",
-        renyi_order=1.0,
-        decode_mode="full_chunked",
-        encode_mode="canonical_content_projected",
-        irrep_dims=[2, 2],
-        use_priorbank_head_evidence_mixer=True,
-    )
-    assert tuple(bank.irrep_dims) == (2, 2)
-    assert bank.head_evidence_logits.shape == (2,)
 
 
 def _group_owning(optimizer, parameter):
@@ -487,7 +463,7 @@ def test_head_mixer_and_head_evidence_are_legal_and_separately_owned():
     assert evidence_groups[0] is not mixer_groups[0]
 
 
-@pytest.mark.parametrize("mode", ["diagonal", "diagonal_chunked"])
+@pytest.mark.parametrize("mode", ["diagonal_chunked"])
 def test_diagonal_reference_matches_nonuniform_unequal_head_blocks_and_gradients(mode: str):
     dims = (2, 3)
     bank = _reference_bank(mode, dims, enabled=True)
@@ -510,7 +486,7 @@ def test_diagonal_reference_matches_nonuniform_unequal_head_blocks_and_gradients
     assert actual_grads[-1].abs().sum() > 0
 
 
-@pytest.mark.parametrize("mode", ["full", "full_chunked"])
+@pytest.mark.parametrize("mode", ["full_chunked"])
 def test_full_reference_retains_unweighted_cross_block_correction_and_gradients(mode: str):
     dims = (2, 3)
     bank = _reference_bank(mode, dims, enabled=True)
@@ -537,7 +513,7 @@ def test_full_reference_retains_unweighted_cross_block_correction_and_gradients(
     assert actual_grads[-1].abs().sum() > 0
 
 
-@pytest.mark.parametrize("mode", ["diagonal", "diagonal_chunked", "full", "full_chunked"])
+@pytest.mark.parametrize("mode", ["diagonal_chunked", "full_chunked"])
 def test_initial_identity_is_bitwise_for_outputs_and_legacy_gradients(mode: str):
     dims = (2, 3)
     disabled = _reference_bank(mode, dims, enabled=False, unigram=True).float()
@@ -774,16 +750,3 @@ def test_fused_fp64_decode_av_island_divides_before_float32_cast_with_gradient_p
         set_decode_av_precision(previous)
 
 
-def test_dense_full_fp64_head_evidence_casts_only_completed_logits_to_query_dtype():
-    bank = _reference_bank("full", (2, 3), enabled=True, unigram=True).float()
-    mu_raw, sigma_raw = _full_query()
-    mu_q = mu_raw.float().detach().requires_grad_()
-    sigma_q = sigma_raw.float().detach().requires_grad_()
-    bank.decode_av_precision = "fp64"
-    previous = set_decode_av_precision("fp64")
-    try:
-        logits = bank.decode(mu_q, sigma_q)
-        assert logits.dtype == mu_q.dtype
-        assert torch.isfinite(logits).all()
-    finally:
-        set_decode_av_precision(previous)

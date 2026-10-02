@@ -17,7 +17,7 @@ def _cfg(**overrides: Any) -> VFE3Config:
     values = dict(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=4,
                   n_layers=1, n_e_steps=1, family="gaussian_diagonal",
                   gauge_group="block_glk", skip_belief_sigma_update=True,
-                  e_phi_lr=0.0, oracle_unroll_grad=True, warmup_steps=0,
+                  warmup_steps=0,
                   max_steps=2, log_interval=0, eval_interval=0,
                   pos_phi="learned", use_head_mixer=True, use_block_mlp=True,
                   block_mlp_expansion=1, attention_mode="projected_gradient",

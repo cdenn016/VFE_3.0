@@ -20,11 +20,8 @@ def _training_cfg(mode, covariance):
         block_mlp_mode=mode,
         block_mlp_covariance=covariance,
         gauge_group="block_glk",
-        transport_mode="flat",
         pos_phi="none",
         pos_rotation="none",
-        e_phi_lr=0.0,
-        oracle_unroll_grad=True,
     )
 
 
@@ -55,7 +52,6 @@ def _diagonal_cfg(mode, **overrides):
         max_seq_len=6,
         n_layers=2,
         n_e_steps=1,
-        e_phi_lr=0.0,
         family="gaussian_diagonal",
         attention_mode="projected_predictive",
         decode_mode="linear",

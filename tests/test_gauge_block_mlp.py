@@ -408,7 +408,7 @@ def test_diagonal_layout_rejects_delta_full_in_the_module_and_the_config():
     with pytest.raises(ValueError, match="delta_full"):
         test_config(
             vocab_size=17, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1, n_e_steps=1,
-            e_phi_lr=0.0, family="gaussian_diagonal", decode_mode="linear",
+            family="gaussian_diagonal", decode_mode="linear",
             use_block_mlp=True, block_mlp_mode="gauge_gate", block_mlp_covariance="delta_full",
             norm_type_block="none", layernorm_affine=False, skip_belief_sigma_update=False,
         )

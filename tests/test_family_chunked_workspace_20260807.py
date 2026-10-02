@@ -262,10 +262,10 @@ def test_registered_chunked_logits_preserve_values_when_workspace_retiles(monkey
 
 
 def test_dense_family_logits_remain_one_full_vocabulary_call_under_workspace_cap(monkeypatch, spy):
-    r"""The dense ``family`` mode intentionally has no workspace-retiling contract."""
+    r"""The dense ``_decode_family`` oracle intentionally has no workspace-retiling contract."""
     pb = prior_bank.PriorBank(
         vocab_size=20, K=4, n_gen=8, family="gaussian_full", diagonal_covariance=False,
-        decode_mode="family", renyi_order=0.5, decode_chunk_size=20,
+        decode_mode="family_chunked", renyi_order=0.5, decode_chunk_size=20,
         decode_av_precision="fp32", untie_decode_bank=True, decode_unigram_prior=True,
         full_cov_precision_policy="fp32_escalate",
     )
@@ -273,7 +273,7 @@ def test_dense_family_logits_remain_one_full_vocabulary_call_under_workspace_cap
     mu, sigma, _ = _inputs(model)
     monkeypatch.setattr(prior_bank, "DECODE_CE_FAMILY_WORKSPACE_BYTES", _one_entry_budget(model))
 
-    logits = pb.decode(mu, sigma)
+    logits = prior_bank._decode_family(pb, mu, sigma, pb._tau_eff())
 
     assert logits.shape[-1] == pb.vocab_size
     assert spy == [pb.vocab_size]
@@ -422,7 +422,7 @@ def test_decode_av_precision_is_reported_inert_on_the_family_route():
 
     Under built-in full Gaussian / built-in Renyi(alpha=1) with ``full_cov_kl_precision='fp32_escalate'``,
     switching ``decode_av_precision`` selects between the analytic and generic family routes, so it
-    must not be reported inert. A noncanonical order remains generic and must retain the warning.
+    must not be reported inert. A noncanonical Renyi order is no longer a configuration (2026-10-02).
     """
     from vfe3.config import VFE3Config
 
@@ -439,9 +439,9 @@ def test_decode_av_precision_is_reported_inert_on_the_family_route():
         assert shown == structural, f"{mode}: notice {shown} != inactive_fields() {structural}"
         return structural
 
-    canonical = dict(renyi_order=1.0, full_cov_kl_precision="fp32_escalate")
+    canonical = dict(full_cov_kl_precision="fp32_escalate")
     assert not _inert_mentions("family_chunked", **canonical)
-    with pytest.raises(ValueError, match="renyi_order=0.5"):
+    with pytest.raises(TypeError, match="renyi_order"):
         _inert_mentions("family_chunked", renyi_order=0.5,
                         full_cov_kl_precision="fp32_escalate")
     # full_chunked genuinely reads it, so it must NOT be reported inert there.
@@ -482,7 +482,7 @@ def test_same_name_family_chunked_override_keeps_decode_av_precision_inert():
             cfg = test_config(
                 vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                 family="gaussian_full", gauge_group="block_glk",
-                decode_mode="family_chunked", renyi_order=1.0,
+                decode_mode="family_chunked",
                 full_cov_kl_precision="fp32_escalate",
                 decode_av_precision=_non_default_decode_av_precision(),
             )

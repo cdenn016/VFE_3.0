@@ -69,9 +69,9 @@ C_i=U_i^{-1}\Sigma_i U_i^{-\top}.
 $$
 
 The full-Gaussian theory assumes $\Sigma_i\succ0$. The current launcher selects
-`gaussian_full`; the projected route also admits `gaussian_diagonal`,
-`gaussian_diagonal_exact`, and `gaussian_frame_diagonal` under its configuration
-guards. A diagonal stored state can yield a dense projected covariance. On the
+`gaussian_full`; the projected route also admits `gaussian_diagonal`. Saved configs
+naming `gaussian_diagonal_exact` load as `gaussian_diagonal` (the same function and
+parameters); `gaussian_frame_diagonal` is retired and refused on load. A diagonal stored state can yield a dense projected covariance. On the
 launcher's route the stored covariance itself stays diagonal, so `gaussian_full` computes
 the same function as `gaussian_diagonal` there (see the configuration table below).
 
@@ -188,8 +188,8 @@ This Gibbs identity holds for any cost placed in a softmax, including the dot-pr
 score of ordinary attention, so it does not by itself distinguish this model. The
 model-specific content is the choice of $D_{ij}^{(h)}$ as a Gaussian KL divergence
 between projected moments, which the construction posits rather than derives.
-`include_attention_entropy=True` is required by the projected route; entropy
-regularization determines the Gibbs weights without an iterative gradient update over
+The projected routes always include the attention entropy; entropy regularization
+determines the Gibbs weights without an iterative gradient update over
 them. The attention-temperature policy uses `kappa_beta` and head dimensions. The
 current launcher selects an unwindowed `causal_alibi` source prior; `attention_window`
 is read only by the windowed priors, so the launcher's value is inactive.
@@ -253,14 +253,8 @@ config.update(
     attention_mode="projected_predictive",
     attention_residual=True,
     relational_routing="gaussian_kl",     # or "noisy_query"
-    gradient_mode="filtering",
-    include_attention_entropy=True,
-    divergence_family="renyi",
-    renyi_order=1.0,                       # Gaussian KL
     gauge_group="block_glk",
-    transport_mode="flat",                # reference frames; links also include O @ T
     n_e_steps=1,
-    e_phi_lr=0.0,
     family="gaussian_full",               # value-identical to gaussian_diagonal on this route
     encode_mode="per_token",
     decode_mode="full_chunked",           # prior-bank KL readout
@@ -271,18 +265,18 @@ config.update(
 )
 ```
 
-The validator also requires `e_step_update="gradient"`,
-`e_step_gradient="unroll"`, and `oracle_unroll_grad=True`. Despite that selector
-name, `predictive_content` dispatches to direct readout before the belief-gradient
-branch. Equal heads, at least two heads, and no cross-couplings are required.
-Consult the validator for the complete admission rules.
+The divergence (Gaussian KL), the flat connection with reference frames (links also
+include O @ T), filtering gradient roles, the unrolled estimator, the Fisher mean step,
+the Mahalanobis-ball mean trust region, and the fixed in-stack frame (no E-step phi
+update) are no longer selectors: they are the only behavior, and
+`config_from_serialized` drops a saved value equal to it (or inert for that config) and
+refuses any other as retired. Equal heads and at least two heads are required. Consult
+the validator for the complete admission rules.
 
 | Setting | Effect on the predictive route |
 |---|---|
 | `attention_mode="projected_predictive"` | Selects projected comparison and direct content aggregation (internal read-only views: `relational_mode="projected_filtering"`, `relational_readout_mode="predictive_content"`). |
-| `gradient_mode="filtering"` | Required family selector; does not imply an inner gradient step here. |
 | `e_q_mu_lr`, `e_q_sigma_lr` | Unread by the predictive readout. |
-| `e_phi_lr=0` | No inner frame update; outer frame learning can remain active. |
 | `lambda_alpha`, `lambda_alpha_mode`, `b0`, `c0` | Unused by predictive readout; may affect separately enabled outer self-coupling. |
 | `m_relational_score_lr` | Outer rate for $S_Q,S_K$ across layers. |
 | `m_relational_content_lr` | Outer rate for $T,O$ across layers. |
@@ -403,8 +397,7 @@ layer. There are no configurable input/output scope fields or identity-content a
 `predictive_covariance="passthrough"`, `attention_residual=False`, `n_e_steps>=1`,
 `relational_routing="gaussian_kl"`, `family` in {`gaussian_diagonal`, `gaussian_full`},
 filtering, and unrolled updates. Under `euler` its inner mean and covariance learning
-rates are active and need calibration; under `closed_form` they are inert. Smoothing and `mm_exact` have no supported
-executor in the retained architecture.
+rates are active and need calibration; under `closed_form` they are inert.
 
 Serialized retained-mode configurations with historical full/full scopes are accepted
 and have those keys removed. Head-scoped configurations, identity content, and the
@@ -602,7 +595,7 @@ formulas and implementation map above describe the architecture without dependin
 on older manuscript copies.
 
 The `grow_K_mup` scaling route varies `e_q_mu_lr` and requires gradient belief
-updates; it rejects `mm_exact` and `predictive_content`, which do not read that rate.
+updates; it rejects `predictive_content`, which does not read that rate.
 Use the standard width/depth/budget grids for predictive content; see
 [scaling settings](docs/scaling-settings.md).
 

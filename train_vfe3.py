@@ -121,7 +121,6 @@ config = dict(
     warmup_steps              = 100,
     deterministic             = True,
     
-    gradient_mode             = "filtering",   #"smoothing"
     
     # Attention execution; all interfaces have full input/output.
     attention_mode                   = "projected_predictive",  # "projected_predictive" | "projected_gradient"
@@ -142,14 +141,11 @@ config = dict(
        
     
     #################################
-    # f-divergence and e/m family
+    # belief family
     #################################
 
-    divergence_family         = "renyi",   # "renyi", "squared_hellinger","bhattacharyya", "jeffreys",
-    renyi_order               = 1.0,       # Renyi order (1.0 -> KL)
 
-    family                    = "gaussian_full", # "gaussian_diagonal" | "gaussian_full" | "laplace_diagonal" | "gaussian_frame_diagonal"
-                                                     # | "gaussian_diagonal_exact" (single covariance toggle; diagonal_covariance is derived)
+    family                    = "gaussian_full", # "gaussian_diagonal" | "gaussian_full"
 
      
     #################################
@@ -168,13 +164,12 @@ config = dict(
     #################################
     decode_bias                       = True,     # only for decode_mode='linear'
     
-    use_head_mixer                    = False,   # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
+    use_head_mixer                    = False,   # opt-in Schur-commutant head mixer (needs >=2 blocks: block_glk heads OR an so_n irrep tower with per-isotypic-component mixing);
     use_priorbank_head_evidence_mixer = False,
                                          
     
     decode_mode                       = 'full_chunked',  # prior-bank: diagonal_chunked/full_chunked/expected_likelihood_chunked/family_chunked
     encode_mode                       = "per_token",   #"per_token_additive" is ~1.5x faster at K=80 currently unablated
-                                                       # canonical_content_* encoders are rejected by both projected routes
     decode_chunk_size                 = 8192,
     decode_ce_checkpoint              = "auto",     # historical gate; "auto_aggregate" saves memory with recompute
     decode_ce_stable_reduction        = False,      # True avoids large-score CE cancellation; adds tensor passes
@@ -206,10 +201,10 @@ config = dict(
     gauge_transport           = "on",         # gauge-frame ABLATION (A1/EXP-2): "on" (pure, learned frame)
                                               #   | "off" (Omega=I exactly) | "frozen" (random fixed frame)
 
-    gauge_group               = "block_glk",    # "glk" | "block_glk" | "tied_block_glk" | "so_k" | "sp" | "so_n" | "sp_n"
+    gauge_group               = "block_glk",    # "block_glk" | "so_n" (so_n awaits reconnection to the projected routes)
 
-    group_n                   = None,                # so_n/sp_n only; must stay None for every other group
-    irrep_spec                = None,                # so_n/sp_n only; must stay None for every other group
+    group_n                   = None,                # so_n only; must stay None for block_glk
+    irrep_spec                = None,                # so_n only; must stay None for block_glk
 
     ####################################
     #       Positional Encoding
@@ -222,7 +217,6 @@ config = dict(
    
     rope_base                 = 100.0,               # rotary frequency base
         
-    rope_full_gauge           = False,               # rotate the covariance sandwich too (REQUIRES family="gaussian_full")
     rope_on_value             = False,
 
 
@@ -269,14 +263,11 @@ config = dict(
     #         Belief E-step
     #         Learning Rates
     #################################
-    e_step_update             = "gradient",  # "gradient" (pure current path) | "mm_exact" (closed-form MM
-                                            # coordinate minimizer at frozen beta)
         
     
     e_q_mu_lr                 = 0.9,
     e_q_sigma_lr              = 0.01,
     
-    e_phi_lr                  = 0.00,
 
    
     #################################
@@ -359,7 +350,6 @@ config = dict(
     sigma_max                            = 100.0,
     e_mu_q_trust                         = 2,
     e_sigma_q_trust                      = 1.0,
-    mu_trust_mode                        = "ball",
    
    
     amp_dtype                            = 'bf16',        # None=fp32 | 'bf16' , 'fp16'. Sigma must be at least fp32
@@ -390,24 +380,8 @@ config = dict(
     # opt-in so the default chunked route remains streamed and bounded.
     decode_ranking_fp64_escalation       = False,             
      
-    # DEFAULT guard is sign-only: recompute in float64 iff the working-dtype congruence went
-    # negative -- one amin reduction the floor needs regardless. Positivity is necessary but not
-    # sufficient (cancellation destroys accuracy before it destroys sign), so this toggle adds the
-    # conditioning proxy cond(exp_phi)^4 * eps > 1e-3, which bounds the quadratic form's backward
-    # error (Higham 2002, 3.1). It is OPT-IN because it is not free: it runs svdvals on the vertex
-    # blocks and then a bool() on the result, i.e. an SVD launch plus a GPU->CPU sync, on the
-    # HEALTHY path of every covariance transport.                                         
-    congruence_cond_escalation           = False, #at K=80 4 heads ~  2x-3x slower                        
      
      
-    # Strict post-congruence certificate (audit remediation M13). When enabled, factor every
-    # transported pair covariance and promote the complete pair field to float64 if any matrix is
-    # uncertified. At B=64, N=128, K=20 this checks 1,048,576 separate 20x20 matrices and the
-    # promoted field is about 3.1 GiB. Keep this opt-in for accuracy investigations; False retains
-    # the selected working precision without the additional certificate or fallback recompute.
-    full_cov_congruence_certification    = False,  # False: no per-pair Cholesky certificate or
-                                                 # whole-field fp64 retry. True: strict M13 audit
-                                                 # over ~1.05M 20x20 matrices per call at B64/N128.
                                                  
       
     skip_belief_sigma_update             = False,        # skip the belief-channel sigma E-step update
@@ -451,7 +425,7 @@ def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int,
         f" Gauge VFE Transformer | {rep['total']:,} params{live_note} | {device}",
         bar,
         f" K={cfg.embed_dim}  N={cfg.max_seq_len}  L={cfg.n_layers}  "
-        f"heads={len(model.group.irrep_dims)}  "  # runtime attention heads = irrep blocks (cross_couplings -> 1)
+        f"heads={len(model.group.irrep_dims)}  "  # runtime attention heads = irrep blocks
         f"group={cfg.gauge_group}  family={cfg.family}",
         f" steps={n_steps}  batch={cfg.batch_size}  dataset={dataset}",
         *cov,
@@ -528,8 +502,7 @@ def _run_label(cfg: VFE3Config, dataset: str) -> str:
     _validate_path_component(dataset, "dataset")
     tags = (("_linear" if cfg.decode_mode == "linear" else "")
             + ("_mix" if cfg.use_head_mixer else "")
-            + ("_mlp" if cfg.use_block_mlp else "")
-            + ("_cross" if cfg.cross_couplings else ""))
+            + ("_mlp" if cfg.use_block_mlp else ""))
     return f"{dataset}_K{cfg.embed_dim}_{cfg.gauge_group}{tags}_s{cfg.seed}"
 
 

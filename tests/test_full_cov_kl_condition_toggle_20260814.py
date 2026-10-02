@@ -40,9 +40,7 @@ def test_model_uses_selected_precision_policy():
         **BASE,
         family="gaussian_full",
         full_cov_kl_precision="fp32_escalate",
-        full_cov_congruence_precision="fp32_escalate",
         pos_phi="none",
-        e_phi_lr=0.0,
     )
     fast = VFEModel(test_config(**common))
     strict_cfg = dict(common)

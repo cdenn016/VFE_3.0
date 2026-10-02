@@ -15,7 +15,7 @@ from vfe3.train import build_optimizer, train, train_step
 def _tiny_cfg(**overrides) -> VFE3Config:
     base = dict(vocab_size=8, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
                 mu_init_std=0.02, sigma_init=1.0, phi_scale=0.01, lambda_alpha_mode="constant",
-                e_q_mu_lr=0.05, e_q_sigma_lr=0.02, e_phi_lr=0.0)
+                e_q_mu_lr=0.05, e_q_sigma_lr=0.02)
     base.update(overrides)
     return test_config(**base)
 

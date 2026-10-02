@@ -206,7 +206,7 @@ def build_full_link_context(
 
     Neither source nor router is detached. Reuse this context with independent
     receiver arguments to get inner partials while preserving the outer graph.
-    relational_score retains its block_glk frame contract.
+    relational_score retains its head-block frame contract (block_glk heads or so_n irrep blocks).
     """
     if operators.input_scope != "full" or operators.output_scope != "full" or operators.T is None:
         raise ValueError("full-link inference requires learned full input/output content maps")

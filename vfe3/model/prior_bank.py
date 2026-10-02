@@ -10,23 +10,20 @@ projection.
 Modularity:
     encode_mode registry -- ``per_token`` (table lookup, default) and implemented
         experimental encoders.
-    decode_mode registry -- ``diagonal`` (fused closed form, default); ``diagonal_chunked``
-        (fused decode+CE, inference delegates to ``diagonal``); ``full`` (exact full-covariance
-        Cholesky decode); ``full_chunked`` (full-cov KL via the diagonal-prior closed form);
-        ``family`` / ``family_chunked`` (family/divergence-consistent decode: logits =
-        -D_configured(q || pi_v)/tau_eff through the CONFIGURED family and divergence functional,
+    decode_mode registry -- ``diagonal_chunked`` (fused decode+CE; inference logits from the
+        dense diagonal closed form); ``full_chunked`` (full-cov KL via the diagonal-prior closed
+        form); ``family_chunked`` (family/divergence-consistent decode: logits =
+        -D_configured(q || pi_v)/tau_eff through the configured family and divergence functional,
         both covariance ranks); ``expected_likelihood_chunked`` (log N(mu_q; mu_v, Sigma_q + Sigma_v)
-        Gaussian-convolution scoring, diagonal only); plus the registered-but-config-excluded
-        ``linear`` readout kernel.
+        Gaussian-convolution scoring, diagonal only); and the ``linear`` readout kernel. The dense
+        ``_decode_diagonal`` / ``_decode_full`` / ``_decode_family`` helpers are unregistered private
+        oracles (historical ``diagonal``/``full``/``family`` configs migrate to the chunked modes).
 
-Decode seam (PB-14): the family-consistent ``family``/``family_chunked`` kernels AND the
-authoritative ``reference_decode`` score logits = -D_configured(q || pi_v)/tau_eff through the
-CONFIGURED family (``self.family``) and divergence functional (``self.divergence_family`` at
-``self.renyi_order``), so the readout matches the E-step geometry. The fast ``diagonal``/``full``
-kernels remain the OPTIMIZED gaussian_* + renyi(alpha=1) implementations (they hardcode gaussian
-alpha=1 KL and ignore divergence_family/renyi_order); config pairs those single-rank kernels only
-with a canonical gaussian/renyi/alpha=1 seam, and REQUIRES a ``family_consistent`` decoder for any
-non-Gaussian family or noncanonical divergence on a prior-bank decoder. The registry seam is
+Decode seam (PB-14): ``family_chunked`` AND the authoritative ``reference_decode`` score logits =
+-D_configured(q || pi_v)/tau_eff through the configured family (``self.family``) and divergence
+functional (``self.divergence_family`` at ``self.renyi_order``). The fast diagonal/full kernels are
+the OPTIMIZED gaussian_* + renyi(alpha=1) implementations; config requires a ``family_consistent``
+decoder for any non-Gaussian family on a prior-bank decoder. The registry seam is
 honored at the COVARIANCE-STRUCTURE granularity (``DecodeRegistration.covariance_kinds``): a new
 covariance structure or a new family-consistent readout is added by writing-and-registering a decode
 kernel, never by editing a call site. The full kernels score a full q against the intentionally
@@ -46,9 +43,8 @@ import torch.utils.checkpoint as _checkpoint
 from torch import nn
 
 from vfe3.model.head_evidence import normalized_head_evidence_weights
-from vfe3.config import _REFERENCE_DECODE_MODES
+from vfe3.config import _REFERENCE_DECODE_MODES, VFE3Config
 from vfe3.contracts import CanonicalFrameContext
-from vfe3.model.canonical_content import pullback_diagonal_query
 from vfe3.model.frame_actions import frame_matvec, reference_covariance, reference_variances
 
 from vfe3.belief import BeliefState
@@ -1026,13 +1022,13 @@ class PriorBank(nn.Module):
         full_cov_precision_policy: Optional[str] = None,
         decode_bias:         bool  = False,
         encode_mode:         str   = "per_token",
-        decode_mode:         str   = "diagonal",
+        decode_mode:         str   = "diagonal_chunked",
         decode_chunk_size:   int   = 8192,
         decode_av_precision: Optional[str] = None,
         decode_ce_checkpoint: str  = "auto",
-        decode_ce_stable_reduction: bool = False,
-        decode_ranking_fp64_escalation: bool = True,
-        decode_ranking_refinement: str = "full",
+        decode_ce_stable_reduction: bool = VFE3Config.decode_ce_stable_reduction,
+        decode_ranking_fp64_escalation: bool = VFE3Config.decode_ranking_fp64_escalation,
+        decode_ranking_refinement: str = VFE3Config.decode_ranking_refinement,
 
         unigram_kappa:        float = 1.0,
         decode_unigram_prior: bool  = False,
@@ -1040,19 +1036,16 @@ class PriorBank(nn.Module):
 
         irrep_dims:             Optional[List[int]] = None,
         use_priorbank_head_evidence_mixer: bool     = False,
-        gauge_group_is_tied:    bool                = False,
         gauge_group_name:       Optional[str]       = None,
         decode_coordinates:     str                 = "local",
     ) -> None:
         super().__init__()
         if decode_coordinates not in ("local", "reference"):
             raise ValueError(f"decode_coordinates must be 'local' or 'reference', got {decode_coordinates!r}")
-        if decode_coordinates == "reference" and (
-                encode_mode == "canonical_content_projected" or decode_mode not in _REFERENCE_DECODE_MODES):
+        if decode_coordinates == "reference" and decode_mode not in _REFERENCE_DECODE_MODES:
             raise ValueError(
-                "decode_coordinates='reference' requires an ordinary local-coordinate encoder and "
-                f"decode_mode in {_REFERENCE_DECODE_MODES}; got encode_mode={encode_mode!r}, "
-                f"decode_mode={decode_mode!r}")
+                f"decode_coordinates='reference' requires decode_mode in {_REFERENCE_DECODE_MODES}; "
+                f"got decode_mode={decode_mode!r}")
         # 'reference' decodes (xi, C) = (U^{-1} mu, U^{-1} Sigma U^{-T}) through the realized frame that
         # every decode boundary receives as ``canonical_frame`` (see ``_reference_query``).
         self.decode_coordinates = decode_coordinates
@@ -1060,65 +1053,6 @@ class PriorBank(nn.Module):
                                     if decode_av_precision is None else decode_av_precision)
         if self.decode_av_precision not in _DECODE_AV_PRECISIONS:
             raise ValueError(f"invalid decode_av_precision {self.decode_av_precision!r}")
-        if encode_mode == "canonical_content_gauge":
-            incompatible = []
-            if family != "gaussian_frame_diagonal":
-                incompatible.append(f"family={family!r}")
-            if decode_mode not in ("diagonal", "diagonal_chunked"):
-                incompatible.append(f"decode_mode={decode_mode!r}")
-            if incompatible:
-                raise ValueError(
-                    "encode_mode='canonical_content_gauge' requires "
-                    "family='gaussian_frame_diagonal', "
-                    "decode_mode='diagonal'/'diagonal_chunked'; "
-                    "got " + ", ".join(incompatible)
-                )
-            if not has_builtin_canonical_content_encoder(encode_mode):
-                raise ValueError(
-                    "encode_mode='canonical_content_gauge' requires its built-in encoder "
-                    "registration and callable identities; registry overrides are not eligible."
-                )
-            if not has_builtin_canonical_content_family(encode_mode):
-                raise ValueError(
-                    "encode_mode='canonical_content_gauge' requires the import-time "
-                    "gaussian_frame_diagonal family identity; registry overrides are not eligible."
-                )
-        if encode_mode == "canonical_content_projected":
-            incompatible = []
-            if family != "gaussian_diagonal":
-                incompatible.append(f"family={family!r}")
-            if decode_mode not in ("full", "full_chunked"):
-                incompatible.append(f"decode_mode={decode_mode!r}")
-            if incompatible:
-                raise ValueError(
-                    "encode_mode='canonical_content_projected' requires "
-                    "family='gaussian_diagonal', "
-                    "decode_mode='full'/'full_chunked'; "
-                    "got " + ", ".join(incompatible)
-                )
-            if not has_builtin_canonical_content_encoder(encode_mode):
-                raise ValueError(
-                    "encode_mode='canonical_content_projected' requires its built-in encoder "
-                    "registration and callable identities; registry overrides are not eligible."
-                )
-            if not has_builtin_canonical_content_family(encode_mode):
-                raise ValueError(
-                    "encode_mode='canonical_content_projected' requires the import-time "
-                    "gaussian_diagonal family identity used by its canonical table; registry "
-                    "overrides are not eligible."
-                )
-            if not has_builtin_projected_full_family():
-                raise ValueError(
-                    "encode_mode='canonical_content_projected' requires the import-time "
-                    "gaussian_full family identity used by its analytic full decoder; registry "
-                    "overrides are not eligible."
-                )
-            if not has_builtin_projected_full_decoder(decode_mode):
-                raise ValueError(
-                    "encode_mode='canonical_content_projected' requires the built-in analytic "
-                    "'full'/'full_chunked' decode registration and callable identities; "
-                    "registry overrides are not eligible."
-                )
         if not isinstance(decode_ranking_fp64_escalation, bool):
             raise ValueError(
                 "decode_ranking_fp64_escalation must be bool, got "
@@ -1135,11 +1069,10 @@ class PriorBank(nn.Module):
         self.diagonal_covariance = diagonal_covariance
         # The vocabulary prior and decode variance tables stay diagonal in EVERY family (PB-11).
         self.family = family
-        # divergence_family / renyi_order drive the family-consistent decode kernels
-        # (decode_mode='family'/'family_chunked'): logits = -D_configured(q||p_v)/tau_eff scored
-        # through get_functional(divergence_family) at alpha=renyi_order. The fast gaussian kernels
-        # (diagonal/full) ignore them (they hardcode gaussian alpha=1 KL); config only pairs those
-        # with a canonical gaussian/renyi/alpha=1 seam. Defaults reproduce the old fixed-KL readout.
+        # divergence_family / renyi_order drive the family-consistent decode kernel
+        # (decode_mode='family_chunked'): logits = -D_configured(q||p_v)/tau_eff scored through
+        # get_functional(divergence_family) at alpha=renyi_order. The fast Gaussian kernels hardcode
+        # alpha=1 KL. The defaults are the KL readout every projected route uses.
         self.divergence_family = divergence_family
         self.renyi_order = renyi_order
         # Default to the VFE3Config spelling rather than snapshotting the process global, so a
@@ -1167,7 +1100,6 @@ class PriorBank(nn.Module):
                 divergence_family=divergence_family,
                 renyi_order=renyi_order,
                 decode_mode=decode_mode,
-                encode_mode=encode_mode,
             )
             self._head_evidence_irrep_dims = tuple(irrep_dims)
             self.head_evidence_logits = nn.Parameter(torch.zeros(len(self._head_evidence_irrep_dims)))
@@ -1480,9 +1412,7 @@ class PriorBank(nn.Module):
     ) -> torch.Tensor:                                           # (..., N, K) xi = U^{-1} mu
         r"""The linear decode's query :math:`\xi_i = U_i^{-1}\mu_i` (``decode_coordinates='reference'``)."""
         if self.decode_coordinates != "reference":
-            raise ValueError(
-                "canonical_frame is only valid for encode_mode='canonical_content_projected' or "
-                "decode_coordinates='reference'")
+            raise ValueError("canonical_frame is only valid for decode_coordinates='reference'")
         return self._reference_query(mu_q, None, canonical_frame)[0]
 
     def _query_in_decode_frame_for_full_decode(
@@ -1509,20 +1439,9 @@ class PriorBank(nn.Module):
             sigma_q = torch.where(ok[..., None, None], sigma_q, eye.expand_as(sigma_q))
             factor_q = torch.where(ok[..., None, None], factor_q, eye.expand_as(factor_q))
             return mu_q, sigma_q, factor_q, ok
-        if sigma_q.dim() >= 4 and sigma_q.shape[-1] == sigma_q.shape[-2]:
-            sigma_q, factor_q, input_ok = self._prepare_full_covariance_for_decode(sigma_q)
-            mu_q, sigma_q = self._query_in_decode_frame(mu_q, sigma_q, canonical_frame)
-            return mu_q, sigma_q, factor_q, input_ok
-        else:
-            input_ok = torch.isfinite(sigma_q).all(dim=-1)
-            sigma_q = torch.where(input_ok[..., None], sigma_q, torch.ones_like(sigma_q))
+        sigma_q, factor_q, input_ok = self._prepare_full_covariance_for_decode(sigma_q)
         mu_q, sigma_q = self._query_in_decode_frame(mu_q, sigma_q, canonical_frame)
-        sigma_q, factor_q, output_ok = self._prepare_full_covariance_for_decode(sigma_q)
-        ok = input_ok & output_ok
-        eye = torch.eye(sigma_q.shape[-1], dtype=sigma_q.dtype, device=sigma_q.device)
-        sigma_q = torch.where(ok[..., None, None], sigma_q, eye.expand_as(sigma_q))
-        factor_q = torch.where(ok[..., None, None], factor_q, eye.expand_as(factor_q))
-        return mu_q, sigma_q, factor_q, ok
+        return mu_q, sigma_q, factor_q, input_ok
 
     @staticmethod
     def _full_cov_query_invariants_from_prepared(
@@ -1543,77 +1462,16 @@ class PriorBank(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""Return the query in the coordinates owned by the active decode bank.
 
-        Ordinary encoders already produce queries in their decode coordinates and reject a frame
-        context so a stale or accidentally threaded frame cannot change their established values.
-        ``canonical_content_projected`` instead materializes a diagonal query in the realized frame;
-        its canonical diagonal vocabulary bank can only score that query after the exact inverse
-        vertex factor from the SAME forward reconstructs a full canonical covariance.
-        ``decode_coordinates='reference'`` requires the realized relational frame and scores the
-        reference moments (``_reference_query``).
+        Local-coordinate decoders score the query as given and reject a frame context, so a stale or
+        accidentally threaded frame cannot change their values. ``decode_coordinates='reference'``
+        requires the realized relational frame and scores the reference moments
+        (``_reference_query``).
         """
-        projected = self.encode_mode == "canonical_content_projected"
-        if not projected:
-            if self.decode_coordinates == "reference":
-                return self._reference_query(mu_q, sigma_q, canonical_frame)
-            if canonical_frame is not None:
-                raise ValueError(
-                    "canonical_frame is only valid for "
-                    "encode_mode='canonical_content_projected'"
-                )
-            return mu_q, sigma_q
-        if canonical_frame is None:
-            raise ValueError(
-                "encode_mode='canonical_content_projected' requires canonical_frame from the "
-                "same forward query at every decode boundary"
-            )
-        if not isinstance(canonical_frame, CanonicalFrameContext):
-            raise ValueError(
-                "canonical_frame must be a CanonicalFrameContext captured from the same forward "
-                f"query, got {type(canonical_frame).__name__}"
-            )
-        if mu_q.shape != sigma_q.shape:
-            raise ValueError(
-                "projected decode requires diagonal query mean/variance with identical shapes, got "
-                f"{tuple(mu_q.shape)} and {tuple(sigma_q.shape)}"
-            )
-        if mu_q.dim() < 1:
-            raise ValueError("projected decode query must have a trailing coordinate axis")
-        expected_frame_shape = (*mu_q.shape[:-1], mu_q.shape[-1], mu_q.shape[-1])
-        if (canonical_frame.forward.shape != expected_frame_shape
-                or canonical_frame.inverse.shape != expected_frame_shape):
-            raise ValueError(
-                "canonical_frame shape must match the projected query exactly, expected "
-                f"{expected_frame_shape}, got forward={tuple(canonical_frame.forward.shape)} and "
-                f"inverse={tuple(canonical_frame.inverse.shape)}"
-            )
-        # Exactly one mismatch is admitted: a float64 frame pair escalated from float32 storage
-        # (audit 2026-09-23 #12) against a same-dtype lower-precision query. It pulls back at
-        # float64 and returns the query's dtype; every other mismatch still fails closed.
-        escalated = (canonical_frame.forward.dtype == torch.float64
-                     and canonical_frame.inverse.dtype == torch.float64
-                     and mu_q.dtype != torch.float64
-                     and sigma_q.dtype == mu_q.dtype)
-        if not escalated and (canonical_frame.forward.dtype != mu_q.dtype
-                or canonical_frame.inverse.dtype != mu_q.dtype
-                or sigma_q.dtype != mu_q.dtype):
-            raise ValueError(
-                "canonical_frame dtype must match the projected query exactly, got "
-                f"query={mu_q.dtype}, variance={sigma_q.dtype}, "
-                f"forward={canonical_frame.forward.dtype}, inverse={canonical_frame.inverse.dtype}"
-            )
-        if (canonical_frame.forward.device != mu_q.device
-                or canonical_frame.inverse.device != mu_q.device
-                or sigma_q.device != mu_q.device):
-            raise ValueError(
-                "canonical_frame device must match the projected query exactly, got "
-                f"query={mu_q.device}, variance={sigma_q.device}, "
-                f"forward={canonical_frame.forward.device}, inverse={canonical_frame.inverse.device}"
-            )
-        if escalated:
-            mu_c, cov_c = pullback_diagonal_query(
-                mu_q.double(), sigma_q.double(), canonical_frame.inverse)
-            return mu_c.to(mu_q.dtype), cov_c.to(mu_q.dtype)
-        return pullback_diagonal_query(mu_q, sigma_q, canonical_frame.inverse)
+        if self.decode_coordinates == "reference":
+            return self._reference_query(mu_q, sigma_q, canonical_frame)
+        if canonical_frame is not None:
+            raise ValueError("canonical_frame is only valid for decode_coordinates='reference'")
+        return mu_q, sigma_q
 
     def decode(
         self,
@@ -1632,22 +1490,7 @@ class PriorBank(nn.Module):
         Under ``decode_unigram_prior=True`` the unigram log-prior bias kappa * log pi_v is added
         HERE, after the registered kernel, so every decode mode (linear included) gets it from
         one seam; toggle off adds nothing (byte-identical)."""
-        registration = get_decode_registration(self.decode_mode)
-        projected_full = (
-            self.encode_mode == "canonical_content_projected"
-            and registration.supports_full
-        )
-        if projected_full:
-            finite = torch.isfinite(sigma_q).all(dim=-1)
-            safe_sigma = torch.where(finite[..., None], sigma_q, torch.ones_like(sigma_q))
-            mu_q, sigma_q = self._query_in_decode_frame(mu_q, safe_sigma, canonical_frame)
-            # Preserve the pre-frame invalidity for the registered built-in kernel while ensuring
-            # the frame multiplication itself never sees NaN/Inf. Its first operation sanitizes
-            # this marker to identity and records the row exactly once.
-            sigma_q = torch.where(
-                finite[..., None, None], sigma_q, torch.full_like(sigma_q, float("nan")))
-        else:
-            mu_q, sigma_q = self._query_in_decode_frame(mu_q, sigma_q, canonical_frame)
+        mu_q, sigma_q = self._query_in_decode_frame(mu_q, sigma_q, canonical_frame)
         logits = get_decode(self.decode_mode)(self, mu_q, sigma_q, self._tau_eff(tau))
         if self.decode_unigram_prior:
             logits = logits + self._unigram_bias()                       # (B, N, V) + (V,)
@@ -2021,14 +1864,8 @@ class PriorBank(nn.Module):
                     torch.zeros_like(sigma_q[..., 0]) if is_full else torch.zeros_like(sigma_q))
                 _, safe_sigma, _, ok = self._query_in_decode_frame_for_full_decode(
                     mu_placeholder, sigma_q, canonical_frame)
-        elif self.encode_mode == "canonical_content_projected" or canonical_frame is not None:
-            if sigma_q.dim() < 1:
-                raise ValueError("decode dispersion must have a trailing coordinate axis")
-            is_full = sigma_q.dim() >= 4 and sigma_q.shape[-1] == sigma_q.shape[-2]
-            mu_placeholder = (
-                torch.zeros_like(sigma_q[..., 0]) if is_full else torch.zeros_like(sigma_q))
-            _, safe_sigma, _, ok = self._query_in_decode_frame_for_full_decode(
-                mu_placeholder, sigma_q, canonical_frame)
+        elif canonical_frame is not None:
+            raise ValueError("canonical_frame is only valid for decode_coordinates='reference'")
         else:
             if sigma_q.dim() < 4 or sigma_q.shape[-1] != sigma_q.shape[-2]:
                 return None                                   # diagonal dispersion: no factorization
@@ -2850,24 +2687,6 @@ def _encode_per_token(
     return BeliefState(mu=mu, sigma=sigma, phi=phi)
 
 
-@register_encode("canonical_content_gauge", can_omit_base_mean=True, can_omit_base_variance=True)
-def _encode_canonical_content_gauge(
-    pb:        PriorBank,
-    token_ids: torch.Tensor,             # (B, N) integer token ids
-) -> BeliefState:
-    r"""Exact frame-intrinsic control: the existing tables are canonical ``(a_v, s_v, phi_v)``."""
-    return _encode_per_token(pb, token_ids)
-
-
-@register_encode("canonical_content_projected", can_omit_base_mean=True, can_omit_base_variance=True)
-def _encode_canonical_content_projected(
-    pb:        PriorBank,
-    token_ids: torch.Tensor,             # (B, N) integer token ids
-) -> BeliefState:
-    r"""Return canonical table coordinates for model-owned realized-frame materialization."""
-    return _encode_per_token(pb, token_ids)
-
-
 @register_encode("per_token_additive", can_omit_base_mean=True, can_omit_base_variance=True)
 def _encode_per_token_additive(
     pb:        PriorBank,
@@ -2891,7 +2710,6 @@ def _encode_per_token_additive(
     return BeliefState(mu=mu, sigma=sigma, phi=phi)
 
 
-@register_decode("diagonal", can_omit_base_mean=True, can_omit_base_variance=True)
 def _decode_diagonal(
     pb:      PriorBank,
     mu_q:    torch.Tensor,               # (B, N, K) posterior means
@@ -2990,18 +2808,12 @@ def _decode_diagonal_chunked(
 
     The chunked mode's training memory win is the FUSED decode+CE in ``decode_ce_diagonal_chunked``
     (it never forms ``(B, N, V)``). When ``decode`` is called for logits (sampling / generation /
-    inference), correctness is what matters, so this delegates to the exact ``diagonal`` kernel --
-    the returned logits are byte-identical to ``decode_mode='diagonal'``.
+    inference), correctness is what matters, so this delegates to the exact dense
+    ``_decode_diagonal`` closed form.
     """
     return _decode_diagonal(pb, mu_q, sigma_q, tau_eff)
 
 
-@register_decode(
-    "full",
-    supports_full=True,
-    can_omit_base_mean=True,
-    can_omit_base_variance=True,
-)
 def _decode_full(
     pb:      PriorBank,
     mu_q:    torch.Tensor,               # (B, N, K) posterior means
@@ -3220,13 +3032,6 @@ def _family_logits(
     return logits
 
 
-@register_decode(
-    "family",
-    covariance_kinds=frozenset({"diagonal", "full"}),
-    family_consistent=True,
-    can_omit_base_mean=True,
-    can_omit_base_variance=True,
-)
 def _decode_family(
     pb:      PriorBank,
     mu_q:    torch.Tensor,               # (B, N, K) posterior means
@@ -3367,9 +3172,7 @@ def _decode_linear(
 # canonical-KL interpretation is valid only for these import-time registrations. Keeping both the
 # registration records and their callables pins an override=True alias/replacement fail-closed.
 _HEAD_EVIDENCE_CANONICAL_DECODERS: Mapping[str, DecodeRegistration] = MappingProxyType({
-    "diagonal": _DECODERS["diagonal"],
     "diagonal_chunked": _DECODERS["diagonal_chunked"],
-    "full": _DECODERS["full"],
     "full_chunked": _DECODERS["full_chunked"],
 })
 _HEAD_EVIDENCE_CANONICAL_DECODER_CALLABLES: Mapping[str, DecodeCallable] = MappingProxyType({
@@ -3392,68 +3195,6 @@ def has_builtin_head_evidence_decoder(name: str) -> bool:
     )
 
 
-# Projected canonical content has a stricter boundary than the general registry: its diagonal query
-# is pulled back to full covariance before these exact analytic scorers, and only full_chunked's
-# import-time fused callable accepts the same-forward canonical_frame keyword. Pin the complete
-# registrations plus both callable identities so an override cannot inherit this private contract by
-# copying metadata or reusing only one of the built-in callables.
-_PROJECTED_FULL_DECODERS: Mapping[str, DecodeRegistration] = MappingProxyType({
-    "full": _HEAD_EVIDENCE_CANONICAL_DECODERS["full"],
-    "full_chunked": _HEAD_EVIDENCE_CANONICAL_DECODERS["full_chunked"],
-})
-_PROJECTED_FULL_DECODER_CALLABLES: Mapping[str, DecodeCallable] = MappingProxyType({
-    name: registration.callable
-    for name, registration in _PROJECTED_FULL_DECODERS.items()
-})
-_PROJECTED_FULL_FUSED_CALLABLES: Mapping[str, Optional[FusedCECallable]] = MappingProxyType({
-    name: registration.fused_ce
-    for name, registration in _PROJECTED_FULL_DECODERS.items()
-})
-
-_CANONICAL_CONTENT_ENCODERS: Mapping[str, EncodeRegistration] = MappingProxyType({
-    "canonical_content_gauge": _ENCODER_REGISTRATIONS["canonical_content_gauge"],
-    "canonical_content_projected": _ENCODER_REGISTRATIONS["canonical_content_projected"],
-})
-_CANONICAL_CONTENT_ENCODER_CALLABLES: Mapping[str, EncodeCallable] = MappingProxyType({
-    name: registration.callable
-    for name, registration in _CANONICAL_CONTENT_ENCODERS.items()
-})
-_CANONICAL_CONTENT_FAMILIES: Mapping[str, type] = MappingProxyType({
-    "canonical_content_gauge": get_family("gaussian_frame_diagonal"),
-    "canonical_content_projected": get_family("gaussian_diagonal"),
-})
-_PROJECTED_FULL_FAMILY: type = get_family("gaussian_full")
-
-
-def has_builtin_canonical_content_encoder(name: str) -> bool:
-    """Whether a canonical encoder still has its complete import-time identity."""
-    registration = _ENCODER_REGISTRATIONS.get(name)
-    builtin = _CANONICAL_CONTENT_ENCODERS.get(name)
-    return (
-        registration is builtin
-        and registration is not None
-        and registration.callable is _CANONICAL_CONTENT_ENCODER_CALLABLES.get(name)
-        and _ENCODERS.get(name) is _CANONICAL_CONTENT_ENCODER_CALLABLES.get(name)
-    )
-
-
-def has_builtin_canonical_content_family(encode_mode: str) -> bool:
-    """Whether a canonical mode still resolves its own import-time table family."""
-    expected = _CANONICAL_CONTENT_FAMILIES.get(encode_mode)
-    if encode_mode == "canonical_content_gauge":
-        family_name = "gaussian_frame_diagonal"
-    elif encode_mode == "canonical_content_projected":
-        family_name = "gaussian_diagonal"
-    else:
-        return False
-    return get_family(family_name) is expected
-
-
-def has_builtin_projected_full_family() -> bool:
-    """Whether projected full decoding still resolves its import-time Gaussian family."""
-    return get_family("gaussian_full") is _PROJECTED_FULL_FAMILY
-
-
 def validate_priorbank_head_evidence_contract(
     *,
     K: int,
@@ -3462,7 +3203,6 @@ def validate_priorbank_head_evidence_contract(
     divergence_family: str,
     renyi_order: float,
     decode_mode: str,
-    encode_mode: str,
 ) -> None:
     """Validate every mixer invariant knowable at direct PriorBank construction."""
     if decode_mode == "linear":
@@ -3485,50 +3225,18 @@ def validate_priorbank_head_evidence_contract(
             "head evidence requires the built-in canonical KL functional "
             "(divergence_family='renyi', renyi_order=1.0)")
     canonical_modes = {
-        "gaussian_diagonal": ("diagonal", "diagonal_chunked"),
-        "gaussian_full": ("full", "full_chunked"),
+        "gaussian_diagonal": "diagonal_chunked",
+        "gaussian_full": "full_chunked",
     }
-    projected_exception = (
-        encode_mode == "canonical_content_projected"
-        and family == "gaussian_diagonal"
-        and decode_mode in ("full", "full_chunked")
-    )
-    if (
-        decode_mode not in canonical_modes.get(family, ())
-        and not projected_exception
-    ):
+    if decode_mode != canonical_modes.get(family):
         raise ValueError(
             "head evidence requires a supported family/decode contract: "
-            "gaussian_diagonal with diagonal/diagonal_chunked or gaussian_full with "
-            "full/full_chunked; only canonical_content_projected may pair gaussian_diagonal "
-            "with full/full_chunked")
-    canonical_family = {
-        "gaussian_diagonal": get_family("gaussian_diagonal"),
-        "gaussian_full": get_family("gaussian_full"),
-    }[family]
-    import_time_family = (
-        _PROJECTED_FULL_FAMILY
-        if family == "gaussian_full"
-        else _HEAD_EVIDENCE_CANONICAL_FAMILIES["gaussian_diagonal"]
-    )
+            "gaussian_diagonal with diagonal_chunked or gaussian_full with full_chunked")
     if (
-        canonical_family is not import_time_family
+        get_family(family) is not _HEAD_EVIDENCE_CANONICAL_FAMILIES[family]
         or get_functional("renyi") is not renyi
         or not has_builtin_head_evidence_decoder(decode_mode)
-        or (projected_exception and not has_builtin_projected_full_family())
     ):
         raise ValueError(
             "head evidence requires built-in canonical family, functional, and decoder "
             "registry identities; registry overrides are not eligible")
-
-
-def has_builtin_projected_full_decoder(name: str) -> bool:
-    """Whether *name* still owns the import-time projected full decode contract exactly."""
-    registration = _DECODERS.get(name)
-    builtin = _PROJECTED_FULL_DECODERS.get(name)
-    return (
-        registration is builtin
-        and registration is not None
-        and registration.callable is _PROJECTED_FULL_DECODER_CALLABLES[name]
-        and registration.fused_ce is _PROJECTED_FULL_FUSED_CALLABLES[name]
-    )

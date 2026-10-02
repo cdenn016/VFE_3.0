@@ -189,11 +189,9 @@ def diagonal_redundancy_status(cfg: Any) -> Tuple[str, str]:
         return "broken", ("a LayerNorm (affine or not) normalizes across coordinates, so "
                           "LN(Dμ) ≠ D LN(μ) for a non-uniform D")
     group = getattr(cfg, "gauge_group", "block_glk")
-    if group not in ("block_glk", "glk"):
+    if group != "block_glk":
         return "broken", f"D e^X leaves the gauge group {group!r}, so the compensated frame is not representable"
     unprobed = []
-    if group != "block_glk":
-        unprobed.append(f"gauge_group={group!r}")
     if getattr(cfg, "attention_mode", None) != "projected_predictive":
         unprobed.append(f"attention_mode={getattr(cfg, 'attention_mode', None)!r}")
     if getattr(cfg, "use_block_mlp", False) and getattr(cfg, "block_mlp_mode", "coordinate") != "coordinate":

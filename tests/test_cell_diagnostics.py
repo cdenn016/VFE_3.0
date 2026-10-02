@@ -26,9 +26,8 @@ from vfe3.geometry.groups import get_group
 DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
 
 
-def _drifted_mixer_model(gauge_group: str) -> SimpleNamespace:
+def _drifted_mixer_model(group) -> SimpleNamespace:
     """Standalone gauge/mixer fixture, independent of attention-mode admission."""
-    group = get_group(gauge_group)(4, 2)
     mixer = HeadMixer(group.irrep_dims, group.irrep_labels, family="gaussian_full").to(DEVICE)
     with torch.no_grad():
         for delta in mixer.mixer_deltas:
@@ -37,16 +36,17 @@ def _drifted_mixer_model(gauge_group: str) -> SimpleNamespace:
 
 
 def test_builder_residual_distinguishes_tied_from_untied_gauge():
-    r"""mix(g.mu, g.Sigma.g^T) == g.mix(.).g^T for IN-group g: holds (eps) under the TIED gauge,
-    breaks under the UNTIED per-head gauge of block_glk once the mixer has drifted from I."""
+    r"""mix(g.mu, g.Sigma.g^T) == g.mix(.).g^T for IN-group g: holds (eps) under the TIED so_n gauge
+    (two copies of the SO(3) defining irrep, isotypic mixer), breaks under the UNTIED per-head gauge
+    of block_glk once the mixer has drifted from I."""
     torch.manual_seed(0)
-    n, k = 5, 4
+    n, k = 5, 6
     mu = torch.randn(n, k, device=DEVICE)
     base = torch.randn(n, k, k, device=DEVICE)
     sigma = base @ base.transpose(-1, -2) + k * torch.eye(k, device=DEVICE)      # SPD full cov
 
-    tied = _drifted_mixer_model("tied_block_glk")
-    untied = _drifted_mixer_model("block_glk")
+    tied = _drifted_mixer_model(get_group("so_n")(6, group_n=3, irrep_spec=[("l1", 2)]))
+    untied = _drifted_mixer_model(get_group("block_glk")(6, 2))
 
     r_tied = head_mixer_gauge_residual(mu, sigma, tied.head_mixer, tied.group, seed=0)
     r_untied = head_mixer_gauge_residual(mu, sigma, untied.head_mixer, untied.group, seed=0)
@@ -104,8 +104,7 @@ def test_gauge_transport_off_yields_identity_frame():
 
 def test_diagnostic_csv_columns_registered():
     r"""S3: the per-cell diagnostic scalars are columns of sweep_results.csv."""
-    needed = {"attn_entropy", "omega_identity_dev", "builder_resid",
-              "gauge_resid_in", "gauge_resid_out"}
+    needed = {"attn_entropy", "omega_identity_dev", "builder_resid", "gauge_resid_in"}
     assert needed.issubset(set(ablation._CSV_COLUMNS))
 
 

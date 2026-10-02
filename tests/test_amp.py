@@ -23,7 +23,7 @@ from vfe3.viz.extract import _cpu_bank_value
 
 def _tiny_model(**overrides) -> VFEModel:
     base = dict(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.0,
+                n_e_steps=2, e_q_mu_lr=0.05,
                 decode_mode="diagonal_chunked", decode_av_precision="fp32",
                 decode_ranking_fp64_escalation=False, lambda_alpha_mode="constant",
                 mu_init_std=0.02, sigma_init=1.0, phi_scale=0.01)
@@ -123,7 +123,7 @@ def test_bf16_backward_reaches_prior_tables():
     # Under bf16 the loss must still backprop through the unrolled E-step to the prior tables
     # (the AMP wrap does not sever the training graph). bf16 needs no GradScaler.
     tok = torch.randint(0, 20, (2, 5)); tgt = torch.randint(0, 20, (2, 5))
-    model = _tiny_model(amp_dtype="bf16", e_phi_lr=0.0)
+    model = _tiny_model(amp_dtype="bf16")
     _, loss, _ = model(tok, tgt)
     loss.backward()
     assert model.prior_bank.mu_embed.grad is not None

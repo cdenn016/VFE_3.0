@@ -17,7 +17,7 @@ import torch
 import ablation
 import parameter_optimization
 import train_vfe3
-from vfe3.config import ConfigNotice, VFE3Config, config_from_serialized, serialize_config
+from vfe3.config import ConfigNotice, VFE3Config, serialize_config
 from vfe3.model.model import VFEModel
 
 V, K, H, N, B = 11, 4, 2, 6, 2
@@ -34,7 +34,7 @@ _AUDITED_ROUTE = dict(
     decode_coordinates="local", decode_unigram_prior=True, decode_bias=True,
     decode_tau=0.01, lambda_beta=1.0, lambda_alpha_mode="constant",
     exp_fp64_norm_threshold=20.0, transport_chart_max_norm=18.0, decode_av_precision="fp32",
-    decode_ranking_fp64_escalation=False, full_cov_congruence_certification=False,
+    decode_ranking_fp64_escalation=False,
     skip_belief_sigma_update=False,
 )
 
@@ -87,10 +87,6 @@ def _assert_bit_inert(base: Dict[str, Any], override: Dict[str, Any]) -> None:
 _PREDICTIVE_INERT = [
     {"lambda_beta": 5.0},
     {"sigma_max": 1e-3},
-    {"full_cov_kl_backend": "pairwise"},
-    {"full_cov_congruence_precision": "fp64"},
-    {"full_cov_congruence_certification": True},
-    {"congruence_cond_escalation": True},
     {"mu_trust_cholesky_rounds": 0},
     {"prior_handoff_rho": 0.0},
     {"prior_handoff_sigma": 1.0},
@@ -158,7 +154,7 @@ def test_decode_notices_only_report_active_explicit_settings(monkeypatch: pytest
 
 def test_launcher_route_inactive_report() -> None:
     inactive = _cfg(_launcher()).inactive_fields()
-    for name in ("family", "lambda_beta", "sigma_max", "full_cov_kl_backend",
+    for name in ("family", "lambda_beta", "sigma_max",
                  "mu_trust_cholesky_rounds", "attention_window", "prior_handoff_rho",
                  "prior_handoff_sigma", "decode_bias", "exp_fp64_norm_threshold"):
         assert name in inactive, name
@@ -256,14 +252,6 @@ def test_delta_full_densifies_the_stored_covariance() -> None:
 
 
 # --------------------------------------------------------------------------- #26, low validation
-
-def test_legacy_dense_decode_admission_round_trips() -> None:
-    cfg = test_config(decode_mode="full", family="gaussian_full", oracle_unroll_grad=True,
-                     _allow_legacy_dense_decode=True)
-    payload = serialize_config(cfg)
-    assert payload["_allow_legacy_dense_decode"] is True
-    assert config_from_serialized(payload, source="round trip").decode_mode == "full"
-    assert "_allow_legacy_dense_decode" not in serialize_config(test_config())
 
 
 @pytest.mark.parametrize("value", [-1.0, math.nan, math.inf])

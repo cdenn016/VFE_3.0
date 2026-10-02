@@ -1,8 +1,8 @@
 r"""Belief / evaluation EXTRACTORS for VFE_3.0 publication figures.
 
-These RUN the model -- reload-and-recompute converged beliefs, loop the E-step capturing the
-belief trajectory, replay the block stack per layer, score a loader per unit, or tally numerical
-health. They have side effects / drive the model, so they live here rather than in
+These RUN the model -- read one diagnostic snapshot of the projected forward (captured receiver
+states, per-layer outputs, routing), score a loader per unit, measure the gauge equivariance of the
+executed projected score and readout, or tally numerical health. They have side effects / drive the model, so they live here rather than in
 ``vfe3.metrics`` (whose contract is pure, side-effect-free measurement). Each returns plain
 tensors / dicts that the pure metrics and the figure functions consume. Everything runs under
 ``torch.no_grad`` and OFF the training hot path.
@@ -14,25 +14,12 @@ import torch
 import torch.nn.functional as F
 
 from vfe3 import metrics
-from vfe3.contracts import is_conditional_filtering
-from vfe3.alpha_i import self_coupling_alpha
 from vfe3.belief import BeliefState
 from vfe3.contracts import CanonicalFrameContext
-from vfe3.families.base import get_family, kl
-from vfe3.model.block import _as_coeff, e_step_shared_kwargs   # shared cfg->kwargs bag (audit 2026-07-12 N5)
+from vfe3.model.block import _as_coeff
 from vfe3.model.model import _block_mlp_diagnostic_eval
-from vfe3.free_energy import (
-    attention_tau,
-    attention_weights,
-    self_divergence_for_alpha,
-)
-from vfe3.inference.e_step import (
-    canonical_e_step_update,
-    e_step_iteration,
-    free_energy_value,
-)
+from vfe3.free_energy import attention_tau
 from vfe3.geometry.lie_ops import CompactBlockElement
-from vfe3.model.block import vfe_block
 
 if TYPE_CHECKING:
     from vfe3.model.model import DiagnosticSnapshot
@@ -40,15 +27,6 @@ if TYPE_CHECKING:
 
 def _model_device(model) -> torch.device:
     return next(model.parameters()).device
-
-
-def _require_legacy_inference_diagnostic(model: torch.nn.Module, diagnostic: str) -> None:
-    """Reject reconstruction probes that assume one stationary shared-Q/K/V objective."""
-    if is_conditional_filtering(model):
-        raise NotImplementedError(
-            f"{diagnostic} is unavailable for relational conditional filtering; "
-            "use the captured pre-update routing and fixed-context conditional diagnostics"
-        )
 
 
 def _cpu_bank_tensor(value: torch.Tensor) -> torch.Tensor:
@@ -164,26 +142,6 @@ def _snapshot_sequence(belief: BeliefState, index: int = 0) -> BeliefState:
     )
 
 
-def _encode_one(model, token_ids: torch.Tensor) -> Tuple[BeliefState, torch.Tensor, Optional[torch.Tensor]]:
-    r"""Encode sequence 0 to the initial belief (pos_phi applied), with its log-prior and RoPE.
-
-    Mirrors ``forward``'s encode seam for the extracted trajectory/figure consumers: the encoded
-    belief is the prior the belief E-step starts from, so every figure describes the model that
-    actually trained."""
-    enc = model.prior_bank.encode(token_ids[:1])                  # (1, N, ...)
-    beliefs = enc._replace(
-        phi=model._apply_pos_phi(enc.phi),
-        right_phi=model._pos_phi_right(enc.phi),
-    )
-    n = beliefs.mu.shape[1]
-    rope = model._rope_rotation(n, token_ids.device)
-    if model.cfg.encode_mode == "canonical_content_projected":
-        beliefs, _, _ = model._prepare_projected_canonical_content(beliefs, rope)
-    belief = _snapshot_sequence(beliefs)
-    log_prior = model._attention_log_prior(n, token_ids.device)
-    return belief, log_prior, rope                                    # forward's beliefs.sigma (model.py:762)
-
-
 @torch.no_grad()
 def collect_inference_bank(
     model,
@@ -290,61 +248,6 @@ def _decode_inference_record(
     return logits
 
 
-def _iter_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor]) -> dict:
-    r"""The full ``e_step_iteration`` knob bag: the production shared cfg bag
-    (``e_step_shared_kwargs``, audit 2026-07-12 N5 -- previously a hand-rolled copy that silently
-    dropped ``e_step_update``/``mm_damping``/``skip_belief_sigma_update``) plus
-    the runtime extras ``vfe_block``/``e_step`` bind per call (tau, step sizes, connections,
-    active per-head transport contraction, log_prior, rope)."""
-    _require_legacy_inference_diagnostic(model, "_iter_kwargs")
-    cfg = model.cfg
-    kw = e_step_shared_kwargs(cfg, _model_device(model))
-    kw.update(
-        tau=attention_tau(
-            _as_coeff(cfg.kappa_beta, _model_device(model)), model._belief_score_irrep_dims()),
-        e_q_mu_lr=cfg.e_q_mu_lr, e_q_sigma_lr=cfg.e_q_sigma_lr, e_phi_lr=cfg.e_phi_lr,
-        lambda_beta=cfg.lambda_beta,
-        transport_state=model.transport_state,
-        compact_phi_block_transport=model._compact_phi_blocks_enabled(),
-        transport_mean_per_head=True,
-        congruence_cond_escalation=cfg.congruence_cond_escalation,
-        exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
-        transport_chart_max_norm=cfg.transport_chart_max_norm,
-        transport_status=model._transport_status,
-        log_prior=log_prior,
-        rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
-        rope_insertion=cfg.rope_insertion,
-    )
-    return kw
-
-
-def _fe_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor] = None) -> dict:
-    r"""The ``free_energy_value`` knob bag: the SAME shared cfg bag production's ``e_step``
-    forwards to its diagnostic F (``free_energy_value`` declares the iteration-only knobs as
-    explicit accept-and-ignore parameters, audit 2026-07-12 N5), plus
-    the runtime extras. ``rope`` is honored (audit PP6): the logged F carries the RoPE-wrapped
-    transport. The step-size knobs (e_q_mu_lr/e_q_sigma_lr/e_phi_lr) stay off this bag --
-    ``free_energy_value`` rejects them, exactly as production binds them on ``e_step`` only."""
-    _require_legacy_inference_diagnostic(model, "_fe_kwargs")
-    cfg = model.cfg
-    kw = e_step_shared_kwargs(cfg, _model_device(model))
-    kw.update(
-        tau=attention_tau(
-            _as_coeff(cfg.kappa_beta, _model_device(model)), model._belief_score_irrep_dims()),
-        lambda_beta=cfg.lambda_beta,
-        transport_state=model.transport_state,
-        compact_phi_block_transport=model._compact_phi_blocks_enabled(),
-        transport_mean_per_head=True,
-        congruence_cond_escalation=cfg.congruence_cond_escalation,
-        transport_chart_max_norm=cfg.transport_chart_max_norm,
-        transport_status=model._transport_status,
-        log_prior=log_prior,
-        rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
-        rope_insertion=cfg.rope_insertion,
-    )
-    return kw
-
-
 @torch.no_grad()
 def per_unit_eval_nats(
     model,
@@ -410,13 +313,10 @@ def belief_ce_bank(
     r"""The Sigma_q <-> CE JOIN for the calibration probe (B1/EXP-3): per-token belief-covariance
     trace tr(Sigma_q) aligned with the decode cross-entropy that same belief produced.
 
-    For each ``(tokens, targets)`` batch this REPLAYS model.forward's belief path EXACTLY
-    (``prior_bank.encode`` -> pos_phi -> the precision-bias fold -> ``vfe_stack`` with the trained
-    head_mixer / cg_coupling / block_norm) for the per-token covariance ``out.sigma``, AND the
-    inference forward ``model(tokens)`` for the decode logits, then reduces the cross-entropy with
-    ``reduction='none'``. The replay is applied here so the traced
-    Sigma_q IS the belief whose mean produced the logits -- otherwise tr(Sigma_q) and CE would come
-    from different beliefs and the calibration headline reads off the wrong covariance. The belief at
+    For each ``(tokens, targets)`` batch this captures the stack output ``out.sigma`` of
+    ``model.forward_beliefs`` and runs the inference forward ``model(tokens)`` for the decode logits,
+    then reduces the cross-entropy with ``reduction='none'``, so the traced Sigma_q IS the belief
+    whose mean produced the logits. The belief at
     position n is the one whose mean produced the logits predicting target n, so tr(Sigma_q)[n] and
     CE[n] are aligned position-by-position; only valid targets (``targets != -100``) are kept.
     Returns the flattened per-token ``tr_sigma`` (M,), ``ce`` (M,) nats, the predicted-token
@@ -473,7 +373,6 @@ def belief_ce_bank(
             "correct": torch.cat(corrects),
         }
 
-    from vfe3.model.stack import vfe_stack
     cfg = model.cfg
     was_training = model.training
     model.eval()
@@ -482,39 +381,16 @@ def belief_ce_bank(
         for i, (tokens, targets) in enumerate(loader):
             tokens = tokens.to(device)
             targets = targets.to(device)
-            n = tokens.shape[1]
             logits = model(tokens)                                # (B, N, V) inference path
             flat_logits = logits.reshape(-1, logits.shape[-1]).float()           # (B*N, V)
             per = F.cross_entropy(flat_logits, targets.reshape(-1),
                                   ignore_index=-100, reduction="none")            # (B*N,)
             conf_flat, pred_flat = flat_logits.softmax(dim=-1).max(dim=-1)        # (B*N,) confidence, argmax
-            beliefs = model.prior_bank.encode(tokens)             # mirror forward so the traced sigma
-            beliefs = beliefs._replace(
-                phi=model._apply_pos_phi(beliefs.phi),
-                right_phi=model._pos_phi_right(beliefs.phi),
-            )                                                       # IS the decode's belief
-            rope = model._rope_rotation(n, device)
-            log_prior = model._attention_log_prior(n, device)
-            block_mlp_transport, block_mlp_frame = model._block_mlp_frame_transport(
-                beliefs, rope)
-            if is_conditional_filtering(model):
-                conditional_capture: dict = {}
-                model.forward_beliefs(tokens, capture=conditional_capture)
-                out = conditional_capture["out"]
-                del conditional_capture
-            else:
-                out = vfe_stack(
-                    beliefs, beliefs.mu, beliefs.sigma, model.group, cfg,
-                    log_prior=log_prior, block_norm=model.block_norm,
-                    block_mlps=model.block_mlps,
-                    block_mlp_frame=block_mlp_frame,
-                    head_mixer=model.head_mixer, cg_coupling=model.cg_coupling,
-                    lambda_beta=cfg.lambda_beta,
-                    transport_state=model.transport_state,
-                    rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
-                    prebuilt_transport=block_mlp_transport,
-                    rope_insertion=cfg.rope_insertion,
-                )
+            # The traced covariance is the stack output of the same inference forward.
+            conditional_capture: dict = {}
+            model.forward_beliefs(tokens, capture=conditional_capture)
+            out = conditional_capture["out"]
+            del conditional_capture
             trs = metrics.sigma_trace(
                 out.sigma,
                 diagonal=cfg.diagonal_covariance,
@@ -529,7 +405,6 @@ def belief_ce_bank(
             corrects.append(_cpu_bank_value((pred_flat[valid] == tgt[valid]).float()))
             stop = max_batches is not None and i + 1 >= max_batches
             del tokens, targets, logits, flat_logits, per, conf_flat, pred_flat
-            del beliefs, rope, log_prior
             del out, trs, tgt, valid
             if stop:
                 break
@@ -554,191 +429,35 @@ def e_step_belief_trace(
     n_iter:    Optional[int] = None,
     snapshot: 'Optional[DiagnosticSnapshot]' = None,
 ) -> Dict[str, object]:
-    r"""Loop the inner E-step capturing the FULL belief (and F) at every iteration for one sequence.
+    r"""The captured receiver states ``q_0, ..., q_T`` of sequence 0 and their fixed-context costs.
 
-    The E-step ``return_trajectory`` yields the free-energy floats only; this captures the belief
-    tuple (mu, sigma, phi) per inner iteration so the belief PATH and the SPD-metric residuals can
-    be drawn. ``n_iter`` defaults to the trained ``cfg.n_e_steps`` (crank it up to show convergence
-    past the trained budget). Returns ``mu`` (T+1, N, K), ``sigma`` (T+1, N, [K]), ``phi``
-    (T+1, N, n_gen), and ``free_energy`` (T+1,) the global F at each iterate.
-    Mean-only Q/K/V returns its captured single-step states and an empty ``free_energy`` tensor,
-    with explicit availability metadata and the before/after costs at fixed conditional context.
+    Projected routes compute routing and content in distinct conditional stages, so no global free
+    energy is defined: ``free_energy`` is the snapshot's (empty) trace and ``free_energy_available``
+    is False. Returns ``mu`` (T+1, N, K), ``sigma`` (T+1, N, [K]), ``phi`` (T+1, N, n_gen), plus the
+    receiver costs before/after the update on the full-link readout. ``n_iter`` must equal the
+    configured ``cfg.n_e_steps``.
     """
-    conditional_enabled = is_conditional_filtering(model)
-    if conditional_enabled:
-        if n_iter is not None and n_iter != model.cfg.n_e_steps:
-            raise NotImplementedError("Q/K/V diagnostics support the configured E-step count only")
-        if snapshot is None:
-            snapshot = model.build_diagnostic_snapshot(token_ids)
-        if snapshot.conditional_capture is None:
-            raise RuntimeError("Q/K/V belief trace requires the executed inference capture")
-    if snapshot is not None:
-        snapshot = model._validate_diagnostic_snapshot(token_ids, snapshot)
-        actual_n_iter = len(snapshot.trace_states) - 1
-        if n_iter is not None and int(n_iter) != actual_n_iter:
-            raise ValueError(
-                f"snapshot contains {actual_n_iter} E-step iterations, requested n_iter={n_iter}")
-        return {
-            "mu": torch.stack([belief.mu[0] for belief in snapshot.trace_states]),
-            "sigma": torch.stack([belief.sigma[0] for belief in snapshot.trace_states]),
-            "phi": torch.stack([belief.phi[0] for belief in snapshot.trace_states]),
-            "free_energy": snapshot.trace_free_energy,
-            "diagonal_covariance": model.cfg.diagonal_covariance,
-            **({
-                "inference_semantics": model.conditional_semantics,
-                "free_energy_available": False,
-                "free_energy_unavailable_reason": "routing and content use distinct conditional stages",
-                "conditional_cost_available": model.cfg.relational_readout_mode != "predictive_content",
-                **{f"relational_{key}": value
-                   for key in ("receiver_cost_before", "receiver_cost_after")
-                   if (value := snapshot.conditional_capture.get(
-                       f"relational_{key}")) is not None},
-            } if conditional_enabled else {}),
-        }
-    n_iter = int(n_iter if n_iter is not None else model.cfg.n_e_steps)
-    belief, log_prior, rope = _encode_one(model, token_ids)
-    mu_p, sigma_p = belief.mu, belief.sigma
-    ikw = _iter_kwargs(model, log_prior, rope)
-    fkw = _fe_kwargs(model, log_prior, rope)
-
-    mus = [belief.mu]
-    sigmas = [belief.sigma]
-    phis = [belief.phi]
-    fs = [free_energy_value(belief, mu_p, sigma_p, model.group, **fkw)]
-    for _ in range(n_iter):
-        belief = e_step_iteration(belief, mu_p, sigma_p, model.group, **ikw)
-        mus.append(belief.mu)
-        sigmas.append(belief.sigma)
-        phis.append(belief.phi)
-        fs.append(free_energy_value(belief, mu_p, sigma_p, model.group, **fkw))
-    return {
-        "mu":           torch.stack(mus),
-        "sigma":        torch.stack(sigmas),
-        "phi":          torch.stack(phis),
-        "free_energy":  torch.stack([f.reshape(()) for f in fs]),
-    }
-
-
-@torch.no_grad()
-def e_step_fixed_point_diagnostics(
-    model,
-    token_ids: torch.Tensor,           # (B, N) token ids; only sequence 0 is used
-
-    *,
-    snapshot: 'Optional[DiagnosticSnapshot]' = None,
-) -> Dict[str, float]:
-    r"""Measure configured movement and the distinct one-step-ahead residual.
-
-    The executable map is replayed for the configured ``T`` iterations and once more when no
-    snapshot is supplied. A diagnostic snapshot reuses its captured ``q_0,...,q_T`` states, where
-    ``T`` is the configured terminal iteration, and executes only the
-    new ``q_T -> q_{T+1}`` step. The
-    ``estep_r_*_last`` fields retain their historical step-length definitions on
-    ``q_{T-1} -> q_T``. The ``estep_fp_*`` fields measure ``q_T -> q_{T+1}``, which is the
-    actual residual of the live state-dependent update map. For the frozen-surrogate updater,
-    ``estep_target_gap`` measures the distance from the damped next iterate to the corresponding
-    undamped frozen-surrogate minimizer.
-    """
-    _require_legacy_inference_diagnostic(model, "e_step_fixed_point_diagnostics")
-    cfg = model.cfg
+    if n_iter is not None and int(n_iter) != model.cfg.n_e_steps:
+        raise NotImplementedError("projected diagnostics support the configured E-step count only")
     if snapshot is None:
-        belief0, log_prior, rope = _encode_one(model, token_ids)
-        states = [belief0]
-        belief = belief0
-        mu_p, sigma_p = belief0.mu, belief0.sigma
-        ikw = _iter_kwargs(model, log_prior, rope)
-        for _ in range(int(cfg.n_e_steps)):
-            belief = e_step_iteration(belief, mu_p, sigma_p, model.group, **ikw)
-            states.append(belief)
-    else:
-        snapshot = model._validate_diagnostic_snapshot(token_ids, snapshot)
-        states = [_snapshot_sequence(state) for state in snapshot.trace_states]
-        if not states:
-            raise ValueError("diagnostic snapshot contains no E-step states")
-        belief0 = states[0]
-        log_prior = model._first_sequence_log_prior(
-            snapshot.log_prior, token_ids.shape[0])
-        rope = snapshot.rope
-    mu_p, sigma_p = belief0.mu, belief0.sigma
-    ikw = _iter_kwargs(model, log_prior, rope)
-    q_t = states[-1]
-    q_next = e_step_iteration(q_t, mu_p, sigma_p, model.group, **ikw)
-    out: Dict[str, float] = {}
-    if len(states) > 1:
-        configured = metrics.estep_residuals(
-            torch.stack([state.mu for state in states]),
-            torch.stack([state.sigma for state in states]),
-            torch.stack([state.phi for state in states]),
-            diagonal=cfg.diagonal_covariance,
-        )
-        for name, key in (
-            ("r_mu", "estep_r_mu_last"),
-            ("r_sigma", "estep_r_sigma_last"),
-            ("r_phi", "estep_r_phi_last"),
-        ):
-            out[key] = float(configured[name][-1].mean())
-    else:
-        out.update({
-            "estep_r_mu_last":    0.0,
-            "estep_r_sigma_last": 0.0,
-            "estep_r_phi_last":   0.0,
-        })
-
-    out["estep_fp_mu_rms"] = float((q_next.mu - q_t.mu).square().mean().sqrt())
-    out["estep_fp_sigma_rms"] = float((q_next.sigma - q_t.sigma).square().mean().sqrt())
-    out["estep_fp_phi_rms"] = float((q_next.phi - q_t.phi).square().mean().sqrt())
-
-    family = get_family(cfg.family)
-    out["estep_fp_kl"] = float(kl(
-        model._family_instance(family, q_next.mu, q_next.sigma),
-        model._family_instance(family, q_t.mu, q_t.sigma),
-        kl_max=cfg.kl_max,
-        eps=cfg.eps,
-    ).mean())
-
-    beta_t = model._attention_map_for_belief(q_t, log_prior, rope).float().clamp(min=cfg.eps)
-    beta_next = model._attention_map_for_belief(q_next, log_prior, rope).float().clamp(min=cfg.eps)
-    beta_mid = 0.5 * (beta_t + beta_next)
-    beta_js = 0.5 * (
-        (beta_t * (beta_t.log() - beta_mid.log())).sum(dim=-1)
-        + (beta_next * (beta_next.log() - beta_mid.log())).sum(dim=-1)
-    )
-    out["estep_beta_js"] = float(beta_js.mean())
-
-    prior = family(mu_p, sigma_p)
-
-    def _alpha(state: BeliefState) -> torch.Tensor:
-        divergence = self_divergence_for_alpha(
-            family(state.mu, state.sigma),
-            prior,
-            alpha=cfg.renyi_order,
-            kl_max=cfg.kl_max,
-            eps=cfg.eps,
-            divergence_family=cfg.divergence_family,
-            lambda_alpha_mode=cfg.lambda_alpha_mode,
-        )
-        return self_coupling_alpha(
-            divergence,
-            mode=cfg.lambda_alpha_mode,
-            value=cfg.lambda_alpha,
-            b0=_as_coeff(cfg.b0, state.mu.device),
-            c0=_as_coeff(cfg.c0, state.mu.device),
-        )[0]
-
-    out["estep_alpha_rms_delta"] = float((_alpha(q_next) - _alpha(q_t)).square().mean().sqrt())
-
-    out["estep_target_gap"] = float("nan")
-    if canonical_e_step_update(cfg.e_step_update) == "mm_exact":
-        target_kwargs = dict(ikw)
-        target_kwargs["mm_damping"] = 1.0
-        q_target = e_step_iteration(q_t, mu_p, sigma_p, model.group, **target_kwargs)
-        target_mse = torch.stack([
-            (q_next.mu - q_target.mu).square().mean(),
-            (q_next.sigma - q_target.sigma).square().mean(),
-            (q_next.phi - q_target.phi).square().mean(),
-        ]).mean()
-        out["estep_target_gap"] = float(target_mse.sqrt())
-    return out
+        snapshot = model.build_diagnostic_snapshot(token_ids)
+    snapshot = model._validate_diagnostic_snapshot(token_ids, snapshot)
+    if snapshot.conditional_capture is None:
+        raise RuntimeError("projected belief trace requires the executed inference capture")
+    return {
+        "mu": torch.stack([belief.mu[0] for belief in snapshot.trace_states]),
+        "sigma": torch.stack([belief.sigma[0] for belief in snapshot.trace_states]),
+        "phi": torch.stack([belief.phi[0] for belief in snapshot.trace_states]),
+        "free_energy": snapshot.trace_free_energy,
+        "diagonal_covariance": model.cfg.diagonal_covariance,
+        "inference_semantics": model.conditional_semantics,
+        "free_energy_available": False,
+        "free_energy_unavailable_reason": "routing and content use distinct conditional stages",
+        "conditional_cost_available": model.cfg.relational_readout_mode != "predictive_content",
+        **{f"relational_{key}": value
+           for key in ("receiver_cost_before", "receiver_cost_after")
+           if (value := snapshot.conditional_capture.get(f"relational_{key}")) is not None},
+    }
 
 
 @torch.no_grad()
@@ -750,42 +469,18 @@ def across_layer_belief_trace(
     *,
     snapshot: 'Optional[DiagnosticSnapshot]' = None,
 ) -> Dict[str, torch.Tensor]:
-    r"""Per-LAYER converged beliefs by replaying the block stack (mirrors vfe_stack's handoff).
+    r"""Per-LAYER output beliefs of sequence 0, read from one diagnostic snapshot.
 
     Returns ``mu`` (L, N, K), ``sigma`` (L, N, [K]), the cumulative affine-invariant SPD geodesic
     distance ``d_ai`` (L,) of each layer's covariance from layer 0, and per-layer mean effective
     rank ``effective_rank`` (L,). Shows how the belief geometry transforms with inference depth.
     """
-    if is_conditional_filtering(model) and snapshot is None:
-        snapshot = model.build_diagnostic_snapshot(token_ids)
     cfg = model.cfg
     if snapshot is None:
-        belief, log_prior, rope = _encode_one(model, token_ids)
-        mu_p, sigma_p = belief.mu, belief.sigma
-        rho, rho_s = cfg.prior_handoff_rho, cfg.prior_handoff_sigma
-        mus, sigmas = [], []
-        block_mlp_transport, block_mlp_frame = model._block_mlp_frame_transport(
-            belief, rope)
-        for layer_index in range(cfg.n_layers):
-            belief = vfe_block(
-                belief, mu_p, sigma_p, model.group, cfg, log_prior=log_prior,
-                block_norm=model.block_norm, head_mixer=model.head_mixer,
-                block_mlp=(model.block_mlps[layer_index] if model.block_mlps is not None else None),
-                block_mlp_frame=block_mlp_frame,
-                cg_coupling=model.cg_coupling,                       # replay the trained model
-                lambda_beta=cfg.lambda_beta, transport_state=model.transport_state,
-                rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
-                prebuilt_transport=block_mlp_transport,
-                rope_insertion=cfg.rope_insertion,
-            )
-            mus.append(belief.mu)
-            sigmas.append(belief.sigma)
-            mu_p = (1.0 - rho) * mu_p + rho * belief.mu
-            sigma_p = (1.0 - rho_s) * sigma_p + rho_s * belief.sigma
-    else:
-        snapshot = model._validate_diagnostic_snapshot(token_ids, snapshot)
-        mus = [belief.mu[0] for belief in snapshot.layer_outputs]
-        sigmas = [belief.sigma[0] for belief in snapshot.layer_outputs]
+        snapshot = model.build_diagnostic_snapshot(token_ids)
+    snapshot = model._validate_diagnostic_snapshot(token_ids, snapshot)
+    mus = [belief.mu[0] for belief in snapshot.layer_outputs]
+    sigmas = [belief.sigma[0] for belief in snapshot.layer_outputs]
     mu_stack = torch.stack(mus)                                   # (L, N, K)
     sig_stack = torch.stack(sigmas)                              # (L, N, [K])
     base = sig_stack[0].unsqueeze(0).expand_as(sig_stack)
@@ -813,9 +508,9 @@ def numerical_health(
     *,
     snapshot: 'Optional[DiagnosticSnapshot]' = None,
 ) -> Dict[str, float]:
-    r"""Non-finite fractions of the converged intermediates + the worst covariance conditioning.
+    r"""Non-finite fractions of the captured intermediates + the worst covariance conditioning.
 
-    Replays the converged belief and its energy / attention (as model.diagnostics does) and
+    Reads the first layer's converged belief and its captured routing score / weights and
     reports ``nan_inf_fraction`` for mu, sigma, phi, energy, and beta (``nan_<x>``) with the entry
     count each fraction is taken over (``numel_<x>``, so a fraction converts to "k of N"), plus the
     maximum spectral condition number of the belief covariances. A near-zero finiteness map certifies stability is
@@ -823,89 +518,27 @@ def numerical_health(
     safe_cholesky jitter rounds, pinv fallbacks -- would require instrumenting numerics and are
     left to a future pass.)
     """
-    if is_conditional_filtering(model):
-        from vfe3.numerics import nan_inf_fraction
-
-        if snapshot is None:
-            snapshot = model.build_diagnostic_snapshot(token_ids)
-        snapshot = model._validate_diagnostic_snapshot(token_ids, snapshot)
-        out = _snapshot_sequence(snapshot.layer_converged[0])
-        capture = snapshot.conditional_capture
-        if capture is None:
-            raise RuntimeError("Q/K/V numerical health requires the executed inference capture")
-        condition = metrics.belief_spectrum(
-            out.sigma, diagonal=True, eps=model.cfg.eps, family=model.cfg.family)["condition"]
-        return {
-            "nan_mu": nan_inf_fraction(out.mu),
-            "nan_sigma": nan_inf_fraction(out.sigma),
-            "nan_phi": nan_inf_fraction(out.phi),
-            "nan_energy": nan_inf_fraction(capture["score_energy_pre"]),
-            "nan_beta": nan_inf_fraction(capture["beta_pre"]),
-            "max_condition": float(condition.max()),
-            **_numel_counts(mu=out.mu, sigma=out.sigma, phi=out.phi,
-                            energy=capture["score_energy_pre"], beta=capture["beta_pre"]),
-        }
     from vfe3.numerics import nan_inf_fraction
-    from vfe3.geometry.transport import RopeTransport   # m5: used below under pos_rotation='rope' (was NameError)
-    cfg = model.cfg
+
     if snapshot is None:
-        belief, log_prior, rope = _encode_one(model, token_ids)
-        ikw = _iter_kwargs(model, log_prior, rope)
-        out = belief
-        for _ in range(cfg.n_e_steps):
-            out = e_step_iteration(out, belief.mu, belief.sigma, model.group, **ikw)
-    else:
-        snapshot = model._validate_diagnostic_snapshot(token_ids, snapshot)
-        out = _snapshot_sequence(snapshot.layer_converged[0])
-        log_prior = model._first_sequence_log_prior(snapshot.log_prior, token_ids.shape[0])
-        rope = snapshot.rope
-    # Build Omega under the ACTIVE connection regime (audit 2026-06-10 F8e): this previously
-    # defaulted to flat transport, so a reported nan/beta/energy fraction could describe a
-    # different belief than the model that trained. Mirrors converged_state.
-    omega = model._diagnostic_transport(out)
-    # Wrap in RopeTransport under pos_rotation='rope' so the reported nan/energy/beta fractions
-    # describe the RoPE-rotated belief the model runs, mirroring converged_state/diagnostics (r2 id11).
-    fam = get_family(cfg.family)
-    if rope is not None:
-        effective = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
-                                  on_value=cfg.rope_on_value, insertion=cfg.rope_insertion,
-                                  same_frame_flat_cocycle=getattr(
-                                      omega, "same_frame_flat_cocycle", False))
-        mu, sigma = out.mu, out.sigma
-        batched = False
-    else:
-        effective = omega.unsqueeze(0)
-        mu, sigma = out.mu.unsqueeze(0), out.sigma.unsqueeze(0)
-        batched = True
-    energy = model._coupling_energy(fam, mu, sigma, mu, sigma, effective,
-                                 alpha=cfg.renyi_order,
-                                 kl_max=cfg.kl_max, eps=cfg.eps,
-                                 divergence_family=cfg.divergence_family,
-                                 irrep_dims=model.group.irrep_dims)
-    if batched:
-        energy = energy[0]
-    beta = attention_weights(
-        energy,
-        tau=attention_tau(
-            _as_coeff(cfg.kappa_beta, out.mu.device), model._belief_score_irrep_dims()),
-        log_prior=log_prior)
+        snapshot = model.build_diagnostic_snapshot(token_ids)
+    snapshot = model._validate_diagnostic_snapshot(token_ids, snapshot)
+    out = _snapshot_sequence(snapshot.layer_converged[0])
+    capture = snapshot.conditional_capture
+    if capture is None:
+        raise RuntimeError("projected numerical health requires the executed inference capture")
     condition = metrics.belief_spectrum(
-        out.sigma,
-        diagonal=(out.sigma.dim() == out.mu.dim()),
-        eps=cfg.eps,
-        family=cfg.family,
-    )["condition"]
-    cond = float(condition.max())
-    health = {
-        "nan_mu":     nan_inf_fraction(out.mu),
-        "nan_sigma":  nan_inf_fraction(out.sigma),
-        "nan_phi":    nan_inf_fraction(out.phi),
-        "nan_energy": nan_inf_fraction(energy),
-        "nan_beta":   nan_inf_fraction(beta),
-        "max_condition": cond,
-        **_numel_counts(mu=out.mu, sigma=out.sigma, phi=out.phi, energy=energy, beta=beta),
+        out.sigma, diagonal=True, eps=model.cfg.eps, family=model.cfg.family)["condition"]
+    return {
+        "nan_mu": nan_inf_fraction(out.mu),
+        "nan_sigma": nan_inf_fraction(out.sigma),
+        "nan_phi": nan_inf_fraction(out.phi),
+        "nan_energy": nan_inf_fraction(capture["score_energy_pre"]),
+        "nan_beta": nan_inf_fraction(capture["beta_pre"]),
+        "max_condition": float(condition.max()),
+        **_numel_counts(mu=out.mu, sigma=out.sigma, phi=out.phi,
+                        energy=capture["score_energy_pre"], beta=capture["beta_pre"]),
     }
-    return health
 
 
 def _numel_counts(**tensors: torch.Tensor) -> Dict[str, int]:
@@ -1013,179 +646,173 @@ def readout_state(
     return state
 
 
+def _dense_frame(frame_tensor: torch.Tensor, block_diagonal: bool) -> torch.Tensor:
+    r"""Expand compact head blocks ``(..., N, H, d, d)`` to the dense ``(..., N, K, K)`` frame."""
+    if not block_diagonal:
+        return frame_tensor
+    H, d = frame_tensor.shape[-3], frame_tensor.shape[-1]
+    eye_h = torch.eye(H, dtype=frame_tensor.dtype, device=frame_tensor.device)
+    return torch.einsum("...hab,hg->...hagb", frame_tensor, eye_h).reshape(
+        *frame_tensor.shape[:-3], H * d, H * d)
+
+
+def _act_on_frame(
+    g:     torch.Tensor,                   # (..., N, H, d, d) per-token head-block group elements
+    frame: CanonicalFrameContext,
+) -> CanonicalFrameContext:
+    r"""Passive frame action :math:`U_i \mapsto g_i U_i`, :math:`U_i^{-1} \mapsto U_i^{-1} g_i^{-1}`."""
+    g_inv = torch.linalg.inv(g)
+    if frame.block_diagonal:
+        return CanonicalFrameContext(g @ frame.forward, frame.inverse @ g_inv, True)
+    G, G_inv = _dense_frame(g, True), _dense_frame(g_inv, True)
+    return CanonicalFrameContext(G @ frame.forward, frame.inverse @ G_inv, False)
+
+
+def _relative_deviation(reference: torch.Tensor, transformed: torch.Tensor) -> float:
+    r"""``max |x' - x| / max |x|`` over entries finite in both (masked routing entries are skipped)."""
+    finite = torch.isfinite(reference) & torch.isfinite(transformed)
+    if not bool(finite.any()):
+        return float("nan")
+    scale = reference[finite].abs().max()
+    delta = (transformed - reference)[finite].abs().max()
+    return float(delta / scale.clamp(min=torch.finfo(reference.dtype).tiny))
+
+
 @torch.no_grad()
-def converged_state(
-    model,
-    token_ids: torch.Tensor,           # (B, N) token ids; only sequence 0 is used
+def projected_gauge_equivariance(
+    model:     torch.nn.Module,
+    token_ids: torch.Tensor,               # (B, N) token ids; only sequence 0 is used
 
     *,
-    snapshot: 'Optional[DiagnosticSnapshot]' = None,
+    n_draws:   int   = 3,
+    scale:     float = 0.5,
+    seed:      int   = 0,
 ) -> Dict[str, object]:
-    r"""The converged-belief diagnostic state of one sequence, as tensors for the figures.
+    r"""Gauge-equivariance residual of the executed projected routing and readout.
 
-    Mirrors :meth:`VFEModel.diagnostics` EXACTLY (same active config: transport mode,
-    connection_W, rope, family, divergence, alpha) but returns the underlying tensors the scalar
-    diagnostics discard. The gauge-equivariance certificate, per-head gauge invariants, belief
-    spectrum / SPD ellipses, and the guard-saturation / causal panels all read from these. Returns
-    the converged ``mu`` (N, K), ``sigma`` (N, K) or (N, K, K), ``phi`` (N, n_gen), the active
-    per-token vertex factor under the compatibility key ``exp_phi`` (N, K, K), and the pre-rope
-    pairwise transport ``omega`` that the equivariance/holonomy metrics consume (compact-factored
-    when the compact phi-block path is active, otherwise dense), the pairwise ``energy`` and
-    attention ``beta`` ((N, N) or (H, N, N)), and the per-token self-divergence ``self_div``
-    (N,) or (N, K).
+    The projected scorers read only the reference moments
+    :math:`\xi_i = U_i^{-1}\mu_i` and :math:`C_i = U_i^{-1}\Sigma_i U_i^{-\top}`. A passive frame
+    action by per-token head-block elements :math:`g_i = \exp(s A_i)`, with :math:`A_i` standard
+    normal in each head block (``block_glk``), or :math:`A_i = \sum_a a_i^a T_a` with standard normal
+    coordinates over the group generators otherwise (``so_n``: :math:`g_i \in \rho(SO(N))`),
+
+    .. math::
+        U_i \mapsto g_i U_i,\qquad \mu_i \mapsto g_i\mu_i,\qquad
+        \Sigma_i \mapsto g_i\Sigma_i g_i^\top,
+
+    leaves :math:`\xi_i` and :math:`C_i` fixed, so the routing score :math:`D_{ij}^h`, the weights
+    :math:`\beta_{ij}^h`, and the readout pulled back to reference coordinates must not change.
+    The layer-0 input of sequence 0 (encode, positional frame, and the realized routing and value
+    frames of :meth:`VFEModel._relational_frames`) is scored through every layer's operators with
+    the live functions: :func:`relational_predictive_readout` for ``predictive_content`` (mean
+    :math:`U_i^{-1}m_i` and covariance :math:`U_i^{-1}\Sigma_i^+U_i^{-\top}`), and
+    :func:`build_full_link_context` for ``full_link_update`` (the receiver force
+    :math:`U_i^\top\nabla_{\mu_i}F`, the closed-form update in reference coordinates, and the
+    receiver energy after adding back its exact shift :math:`\sum_i c_i\log|\det g_i|`, which the
+    term :math:`-\tfrac{c_i}{2}\log\det\Sigma_i` produces). The prior moves with the belief.
+
+    Everything runs in float64 with the covariance lifted to a full matrix, because the diagonal
+    family is closed only under diagonal :math:`g_i`; the residual certifies the
+    reference-coordinate construction, not the diagonal family's local projection. Each entry of
+    ``residuals`` is a per-layer list of the maximum over ``n_draws`` of
+    :math:`\max|x'-x|/\max|x|`, which should sit at float64 roundoff (``unit_roundoff``) times the
+    conditioning of the frames and covariances.
     """
-    _require_legacy_inference_diagnostic(model, "converged_state")
-    from vfe3.model.stack import vfe_stack
-    from vfe3.geometry.transport import RopeTransport, build_factored_transport
+    from vfe3.gradients.full_link import (
+        build_full_link_context, full_link_cost, full_link_gradients, full_link_minimizer)
+    from vfe3.gradients.relational import relational_predictive_readout
 
     cfg = model.cfg
-    was_training = model.training
-    model.eval()
-    try:
-        if snapshot is None:
-            belief, log_prior, rope = _encode_one(model, token_ids)
-            cap: dict = {}                                       # q* capture (F self-term, as diagnostics)
-            block_mlp_transport, block_mlp_frame = model._block_mlp_frame_transport(
-                belief, rope)
-            out = vfe_stack(
-                belief, belief.mu, belief.sigma, model.group, cfg,
-                log_prior=log_prior, block_norm=model.block_norm,
-                block_mlps=model.block_mlps,
-                block_mlp_frame=block_mlp_frame,
-                head_mixer=model.head_mixer, cg_coupling=model.cg_coupling,
-                lambda_beta=cfg.lambda_beta,
-                transport_state=model.transport_state,
-                rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
-                capture=cap,
-                prebuilt_transport=block_mlp_transport,
-                rope_insertion=cfg.rope_insertion,
-            )
+    tokens = token_ids[:1]
+    n = tokens.shape[1]
+    encoded = model.prior_bank.encode(tokens)                                  # (1, N, ...)
+    beliefs = encoded._replace(phi=model._apply_pos_phi(encoded.phi),
+                               right_phi=model._pos_phi_right(encoded.phi))
+    rope = model._rope_rotation(n, tokens.device)
+    _, frame32, value_frame32 = model._relational_frames(beliefs, rope)
+    log_prior = model._attention_log_prior(n, tokens.device)
+    log_prior = None if log_prior is None else log_prior.double()
+    tau = attention_tau(_as_coeff(cfg.kappa_beta, tokens.device), model._belief_score_irrep_dims())
+
+    def as64(frame: CanonicalFrameContext) -> CanonicalFrameContext:
+        # The float64 frame contract needs a float64-exact inverse, not an upcast float32 one.
+        forward = frame.forward.double()
+        return CanonicalFrameContext(forward, torch.linalg.inv(forward), frame.block_diagonal)
+
+    frame, value_frame = as64(frame32), as64(value_frame32)
+    mu = beliefs.mu.double()                                                   # (1, N, K)
+    sigma = beliefs.sigma.double()
+    sigma = torch.diag_embed(sigma) if sigma.dim() == mu.dim() else sigma      # (1, N, K, K)
+    H, d = len(model.group.irrep_dims), model.group.irrep_dims[0]
+
+    def evaluate(ops, mu, sigma, frame, value_frame) -> Dict[str, torch.Tensor]:
+        capture: Dict[str, torch.Tensor] = {}
+        U_v = _dense_frame(value_frame.forward, value_frame.block_diagonal)    # (1, N, K, K)
+        U_v_inv = _dense_frame(value_frame.inverse, value_frame.block_diagonal)
+        if ops.readout_mode == "predictive_content":
+            mean, cov = relational_predictive_readout(
+                mu, sigma, frame, ops, tau=tau, kl_max=cfg.kl_max, log_prior=log_prior,
+                value_frame=value_frame, capture=capture, return_covariance=True)
+            out = {"readout_mean": (U_v_inv @ mean.unsqueeze(-1)).squeeze(-1),
+                   "readout_covariance": U_v_inv @ cov @ U_v_inv.transpose(-1, -2)}
         else:
-            snapshot = model._validate_diagnostic_snapshot(token_ids, snapshot)
-            belief = _snapshot_sequence(snapshot.initial_belief)
-            out = _snapshot_sequence(snapshot.stack_output)
-            log_prior = model._first_sequence_log_prior(snapshot.log_prior, token_ids.shape[0])
-            rope = snapshot.rope
-            cap = {"converged": _snapshot_sequence(snapshot.layer_converged[-1])}
-        rho, rho_s = cfg.prior_handoff_rho, cfg.prior_handoff_sigma     # rebuild last-block prior
-        mu_p, sigma_p = belief.mu, belief.sigma                         # exact iff L==1 or rho==0
-        for _ in range(cfg.n_layers - 1):
-            mu_p = (1.0 - rho) * mu_p + rho * out.mu
-            sigma_p = (1.0 - rho_s) * sigma_p + rho_s * out.sigma
-        omega = model._diagnostic_transport(out)                       # active pre-rope transport
-        fam = get_family(cfg.family)
-        if rope is not None:
-            effective = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
-                                      on_value=cfg.rope_on_value, insertion=cfg.rope_insertion,
-                                      same_frame_flat_cocycle=getattr(
-                                          omega, "same_frame_flat_cocycle", False))
-            mu, sigma = out.mu, out.sigma
-            batched = False
-        else:
-            effective = omega.unsqueeze(0)
-            mu, sigma = out.mu.unsqueeze(0), out.sigma.unsqueeze(0)
-            batched = True
-        energy = model._coupling_energy(fam,
-            mu, sigma, mu, sigma, effective,
-            alpha=cfg.renyi_order,
-            kl_max=cfg.kl_max, eps=cfg.eps, divergence_family=cfg.divergence_family,
-            irrep_dims=model.group.irrep_dims,
-        )
-        if batched:
-            energy = energy[0]
-        if snapshot is None:
-            beta = attention_weights(
-                energy,
-                tau=attention_tau(
-                    _as_coeff(cfg.kappa_beta, out.mu.device), model._belief_score_irrep_dims()),
-                log_prior=log_prior)
-        else:
-            beta = snapshot.beta_maps[-1]
-            if energy.dim() == 2:
-                beta = beta[0]
-        _q_conv = cap["converged"]                           # q*: the F self-term reads the pre-
-        self_div = self_divergence_for_alpha(                # transform converged belief (F19,
-            model._family_instance(fam, _q_conv.mu, _q_conv.sigma),
-            model._family_instance(fam, mu_p, sigma_p), alpha=cfg.renyi_order,   # as diagnostics)
-            kl_max=cfg.kl_max, eps=cfg.eps, divergence_family=cfg.divergence_family,
-            lambda_alpha_mode=cfg.lambda_alpha_mode,
-        )
-        exp_phi = build_factored_transport(
-            out.phi, model.group,
-            exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
-            clamp_monitor=cfg.transport_clamp_monitor,
-            validity_max_norm=cfg.transport_chart_max_norm,
-            right_phi=out.right_phi,
-        ).exp_phi
-    finally:
-        if was_training:
-            model.train()
+            context = build_full_link_context(
+                mu, sigma, mu, sigma, frame, ops, tau=tau, lambda_beta=cfg.lambda_beta,
+                value=float(cfg.lambda_alpha), receiver_noise=ops.receiver_noise,
+                kl_max=cfg.kl_max, log_prior=log_prior, value_frame=value_frame, capture=capture)
+            force, _ = full_link_gradients(mu, sigma, context)                  # (1, N, K)
+            new_mu, new_sigma = full_link_minimizer(
+                mu, sigma, context, damping=ops.receiver_damping, sigma_max=None)
+            out = {"receiver_force": (U_v.transpose(-1, -2) @ force.unsqueeze(-1)).squeeze(-1),
+                   "receiver_update_mean": (U_v_inv @ new_mu.unsqueeze(-1)).squeeze(-1),
+                   "receiver_update_covariance": U_v_inv @ new_sigma @ U_v_inv.transpose(-1, -2),
+                   "receiver_energy": full_link_cost(mu, sigma, context),
+                   "_c": context.c}
+        out["routing_score"] = capture["score_energy_pre"]
+        out["routing_weights"] = capture["beta_pre"]
+        return out
+
+    generator = torch.Generator().manual_seed(int(seed))
+    layers = model.relational_operators_by_layer
+    residuals: Dict[str, List[float]] = {}
+    for layer_index, ops in enumerate(layers):
+        base = evaluate(ops, mu, sigma, frame, value_frame)
+        worst: Dict[str, float] = {}
+        for _ in range(int(n_draws)):
+            if model.group.name == "block_glk":
+                A = torch.randn(1, n, H, d, d, generator=generator, dtype=torch.float64)
+                g = torch.linalg.matrix_exp(float(scale) * A).to(mu.device)    # (1, N, H, d, d)
+            else:
+                # Draw from the selected group, g_i = exp(s a_i . T) with a_i standard normal over
+                # its generators T (so_n: one SO(N) element acting in every irrep block).
+                gens = model.group.generators.to(dtype=torch.float64)          # (n_gen, K, K)
+                a = torch.randn(1, n, gens.shape[0], generator=generator, dtype=torch.float64)
+                g_dense = torch.linalg.matrix_exp(
+                    float(scale) * torch.einsum("...a,akl->...kl", a, gens))   # (1, N, K, K)
+                g = torch.stack([g_dense[..., h*d:(h+1)*d, h*d:(h+1)*d] for h in range(H)],
+                                dim=-3).to(mu.device)                          # (1, N, H, d, d)
+            G = _dense_frame(g, True)                                          # (1, N, K, K)
+            moved = evaluate(
+                ops, (G @ mu.unsqueeze(-1)).squeeze(-1), G @ sigma @ G.transpose(-1, -2),
+                _act_on_frame(g, frame), _act_on_frame(g, value_frame))
+            if "receiver_energy" in base:
+                # -c_i/2 log det(g Sigma g^T) = -c_i/2 log det Sigma - c_i log|det g_i|.
+                shift = (base["_c"] * torch.linalg.slogdet(G)[1]).sum()
+                moved["receiver_energy"] = moved["receiver_energy"] + shift
+            for key, value in base.items():
+                if not key.startswith("_"):
+                    worst[key] = max(worst.get(key, 0.0), _relative_deviation(value, moved[key]))
+        for key, value in worst.items():
+            residuals.setdefault(key, [float("nan")] * len(layers))[layer_index] = value
     return {
-        "mu":       out.mu,
-        "sigma":    out.sigma,
-        "phi":      out.phi,
-        "exp_phi":  exp_phi,
-        "omega":    omega,
-        "energy":   energy,
-        "beta":     beta,
-        "self_div": self_div,
+        "residuals": residuals,
+        "readout_mode": cfg.relational_readout_mode,
+        "n_layers": len(layers),
+        "n_draws": int(n_draws),
+        "scale": float(scale),
+        "dtype": "float64",
+        "unit_roundoff": float(torch.finfo(torch.float64).eps),
     }
-
-
-def attention_entropy_cov_gap(
-    model,
-    token_ids: torch.Tensor,           # (B, N) token ids; only sequence 0 is used
-) -> Dict[str, torch.Tensor]:
-    r"""C1/EXP-4: the attention-entropy gradient gap -tau^{-1} Cov_beta(E, dE) on the converged belief.
-
-    The production closed-form kernel CANNOT compute the attention-entropy term, so it descends the
-    SURROGATE belief gradient; only the autograd ORACLE with ``include_attention_entropy=True``
-    realizes the canonical gradient. Differencing the oracle gradient with the entropy term ON vs OFF
-    on the SAME converged-belief snapshot isolates exactly the entropy term's contribution, which by
-    the envelope identity equals ``lambda_beta * (-tau^{-1} Cov_beta(E, dE))`` (= the bare identity on
-    the pure ``lambda_beta=1`` path; the scalar identity is proven in
-    ``tests/test_free_energy.py::test_gradient_gap_canonical_minus_surrogate_is_neg_cov_over_tau``).
-    Returns the per-token gap magnitude ``cov_gap_per_token`` (N,) = ||g_canon - g_surrogate|| over
-    the (mu, sigma) blocks, and the scalar mean ``cov_gap``. Built for the
-    single-block (L=1) operating point and the flat-transport path (a mu-dependent
-    Omega would need an omega_builder; that is not the EXP-4 operating point).
-    """
-    _require_legacy_inference_diagnostic(model, "attention_entropy_cov_gap")
-    from vfe3.gradients.oracle import belief_gradients_autograd
-    from vfe3.geometry.transport import RopeTransport
-    cfg = model.cfg
-    dev = _model_device(model)
-    with torch.no_grad():                                          # snapshot build is grad-free
-        belief, log_prior, rope = _encode_one(model, token_ids)   # _encode_one folds the precision bias
-        ikw = _iter_kwargs(model, log_prior, rope)
-        mu_p, sigma_p = belief.mu, belief.sigma
-        out = belief
-        for _ in range(cfg.n_e_steps):                            # converge to q* (the operating point)
-            out = e_step_iteration(out, mu_p, sigma_p, model.group, **ikw)
-        omega = model._diagnostic_transport(out)
-        if rope is not None:
-            omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
-                                  on_value=cfg.rope_on_value, insertion=cfg.rope_insertion,
-                                  same_frame_flat_cocycle=getattr(
-                                      omega, "same_frame_flat_cocycle", False))
-    kw = dict(                                                    # the oracle's free-energy knob bag
-        tau=attention_tau(
-            _as_coeff(cfg.kappa_beta, dev), model._belief_score_irrep_dims()),
-        renyi_order=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
-        b0=_as_coeff(cfg.b0, dev), c0=_as_coeff(cfg.c0, dev), value=cfg.lambda_alpha,
-        lambda_beta=cfg.lambda_beta, gradient_mode=cfg.gradient_mode, family=cfg.family,
-        full_cov_kl_backend=model.full_cov_kl_backend,
-        divergence_family=cfg.divergence_family, lambda_alpha_mode=cfg.lambda_alpha_mode,
-        irrep_dims=model.group.irrep_dims, log_prior=log_prior,
-    )                                                             # grad ON here (outside the no_grad block)
-    gc_mu, gc_sig = belief_gradients_autograd(out.mu, out.sigma, mu_p, sigma_p, omega,
-                                              include_attention_entropy=True, **kw)
-    gs_mu, gs_sig = belief_gradients_autograd(out.mu, out.sigma, mu_p, sigma_p, omega,
-                                              include_attention_entropy=False, **kw)
-    n = out.mu.shape[0]
-    per_tok = torch.sqrt((gc_mu - gs_mu).pow(2).reshape(n, -1).sum(dim=-1)
-                         + (gc_sig - gs_sig).pow(2).reshape(n, -1).sum(dim=-1))   # (N,)
-    return {"cov_gap_per_token": per_tok, "cov_gap": per_tok.mean()}
 
 
 def _vocab_display_panel(

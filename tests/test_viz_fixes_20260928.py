@@ -119,7 +119,7 @@ def test_route_gates_flat_projected_frozen():
 
 
 def test_route_gates_gradient_keeps_sigma_but_skips_legacy_objective_figures() -> None:
-    cfg = SimpleNamespace(transport_mode="flat", attention_mode="projected_gradient", n_e_steps=2,
+    cfg = SimpleNamespace(attention_mode="projected_gradient", n_e_steps=2,
                           skip_belief_sigma_update=False)
     reasons = figs.route_figure_skip_reasons(cfg)
     assert _ESTEP_FAMILY <= set(reasons)
@@ -128,7 +128,7 @@ def test_route_gates_gradient_keeps_sigma_but_skips_legacy_objective_figures() -
 
 
 def test_route_gates_zero_estep_and_frozen_gradient() -> None:
-    cfg = SimpleNamespace(transport_mode="flat", attention_mode="projected_gradient", n_e_steps=0,
+    cfg = SimpleNamespace(attention_mode="projected_gradient", n_e_steps=0,
                           skip_belief_sigma_update=True)
     reasons = figs.route_figure_skip_reasons(cfg)
     assert "legacy shared-objective E-step probes do not apply" in reasons["iterate_trajectory"]
@@ -165,7 +165,7 @@ def _projected_model() -> VFEModel:
     return VFEModel(test_config(
         vocab_size=7, embed_dim=4, n_heads=2, batch_size=1, max_seq_len=4,
         n_layers=1, n_e_steps=1, family="gaussian_diagonal", gauge_group="block_glk",
-        e_phi_lr=0.0, pos_phi="learned", use_head_mixer=True, use_block_mlp=True,
+        pos_phi="learned", use_head_mixer=True, use_block_mlp=True,
         block_mlp_expansion=1, attention_mode="projected_predictive",
 
     )).eval()
@@ -190,7 +190,7 @@ def test_report_gates_route_trivial_figures_and_emits_history_figures(tmp_path, 
                  "belief_spectrum", "spd_ellipses"):
         assert f"{name}.png" not in names
         assert f"figure '{name}' skipped (" in caplog.text
-    assert "transport_mode='flat'" in caplog.text
+    assert "flat transport: holonomy is the identity" in caplog.text
     assert "legacy shared-objective E-step probes do not apply" in caplog.text
     assert {"head_block_norms.png", "numerical_trust.png", "per_layer_diagnostics.png",
             "sigma_ce_scatter.png", "reliability_diagram.png"} <= names
@@ -414,7 +414,7 @@ def test_guard_denominators_diagonal_and_full():
 def _tiny_model(**over) -> VFEModel:
     torch.manual_seed(0)
     return VFEModel(test_config(vocab_size=9, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                               n_e_steps=1, e_q_mu_lr=0.1, e_phi_lr=0.0, **over)).eval()
+                               n_e_steps=1, e_q_mu_lr=0.1, **over)).eval()
 
 
 def test_numerical_health_reports_entry_counts_and_vocab_sigma_trace():

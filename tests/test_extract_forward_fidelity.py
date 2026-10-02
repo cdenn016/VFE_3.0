@@ -1,16 +1,8 @@
-r"""C9 forward-fidelity tests for the viz belief extractors (audit 2026-07-01).
+r"""Forward-fidelity tests for the viz belief extractors.
 
-``_encode_one`` must replay model.forward's belief pipeline exactly, so
-every figure describes the model that actually trained. Pins:
-
-  * on the default config the extractors are byte-identical to the pre-fix replay, so the
-    pure path is untouched;
-  * under ``pos_rotation="rope"`` the replay still reproduces the forward belief exactly.
-
-Each fidelity test carries a discrimination guard (the pre-fix replay DIFFERS from forward),
-so the equality assertions cannot pass vacuously. The forward reference is
-``forward_beliefs(capture=...)['out']`` -- the raw pre-final_norm ``vfe_stack`` output, which
-is exactly the tensor the extractors return.
+The extractors read one diagnostic snapshot of the production forward, so every figure describes
+the model that actually trained. The forward reference is ``forward_beliefs(capture=...)['out']``,
+the raw pre-final_norm ``vfe_stack`` output.
 
 Device-agnostic (CPU default; set VFE3_TEST_DEVICE=cuda for the GPU).
 """
@@ -20,48 +12,11 @@ import os
 import pytest
 import torch
 
-from vfe3.belief import BeliefState
-from vfe3.model.canonical_content import CanonicalFrameContext
+from vfe3.contracts import CanonicalFrameContext
 from vfe3.model.model import VFEModel
-from vfe3.model.stack import vfe_stack
 from vfe3.viz import extract
 
 DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
-
-
-def _prefix_encode_one(model, token_ids: torch.Tensor):
-    r"""The pre-C9 ``_encode_one`` replay: encode -> positional phi, without the s-anchor."""
-    enc = model.prior_bank.encode(token_ids[:1])
-    belief = BeliefState(mu=enc.mu[0], sigma=enc.sigma[0], phi=model._apply_pos_phi(enc.phi[0]))
-    n = belief.mu.shape[0]
-    log_prior = model._attention_log_prior(n, token_ids.device)
-    rope = model._rope_rotation(n, token_ids.device)
-    return belief, log_prior, rope
-
-
-def _stack(model, belief, log_prior, rope):
-    r"""The extractors' shared ``vfe_stack`` replay (mirrors converged_state).
-
-    Includes the per-layer block MLPs (on by default) and their frame transport exactly as the
-    extractors and forward pass them; a replay without them no longer describes the trained model.
-    """
-    cfg = model.cfg
-    block_mlp_transport, block_mlp_frame = model._block_mlp_frame_transport(belief, rope)
-    shared = model._build_shared_flat_transport(belief, rope, require_vertex_factors=True)
-    frame = model._canonical_frame_context(shared, fold_rope=True, compact=True)
-    value_frame = (model._canonical_frame_context(shared, compact=True)
-                   if rope is not None and not cfg.rope_on_value else frame)
-    return vfe_stack(
-        belief, belief.mu, belief.sigma, model.group, cfg,
-        log_prior=log_prior, block_norm=model.block_norm,
-        block_mlps=model.block_mlps, block_mlp_frame=block_mlp_frame,
-        head_mixer=model.head_mixer, cg_coupling=model.cg_coupling,
-        lambda_beta=cfg.lambda_beta,
-        transport_state=model.transport_state,
-        rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
-        prebuilt_transport=block_mlp_transport, rope_insertion=model.cfg.rope_insertion,
-        relational_operators_by_layer=model.relational_operators_by_layer,
-        relational_frame=frame, relational_value_frame=value_frame)
 
 
 def _forward_reference(model, tokens: torch.Tensor):
@@ -70,23 +25,6 @@ def _forward_reference(model, tokens: torch.Tensor):
     with torch.no_grad():
         model.forward_beliefs(tokens, capture=cap)
     return cap["out"]
-
-
-def test_extractor_anchor_is_noop_on_default_config():
-    # Regression guard: on the default config the fixed extractors reproduce the pre-fix
-    # replay byte-for-byte.
-    torch.manual_seed(0)
-    cfg = test_config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=8)
-    model = VFEModel(cfg).to(DEVICE)
-    model.eval()
-    tokens = torch.randint(0, 16, (2, 8), device=DEVICE)
-    with torch.no_grad():
-        belief, log_prior, rope = extract._encode_one(model, tokens)
-        belief0, log_prior0, _ = _prefix_encode_one(model, tokens)
-    assert torch.equal(belief.mu,    belief0.mu)
-    assert torch.equal(belief.sigma, belief0.sigma)
-    assert torch.equal(belief.phi,   belief0.phi)
-    assert (log_prior is None and log_prior0 is None) or torch.equal(log_prior, log_prior0)
 
 
 def _rope_model() -> VFEModel:
@@ -104,7 +42,6 @@ def _rope_model() -> VFEModel:
         n_e_steps=2,
         e_q_mu_lr=0.2,
         e_q_sigma_lr=0.1,
-        e_phi_lr=0.0,
         pos_rotation="rope",
     )
     torch.manual_seed(23)
@@ -113,18 +50,6 @@ def _rope_model() -> VFEModel:
     with torch.no_grad():
         model.prior_bank.phi_embed.normal_(mean=0.0, std=0.15)
     return model
-
-
-def test_encode_one_matches_forward_under_rope() -> None:
-    model = _rope_model()
-    tokens = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7]], dtype=torch.long, device=DEVICE)
-    ref = _forward_reference(model, tokens)
-
-    belief, log_prior, rope = extract._encode_one(model, tokens)
-    out = _stack(model, belief, log_prior, rope)
-
-    assert torch.allclose(out.mu, ref.mu[0], atol=1e-5, rtol=1e-5)
-    assert torch.allclose(out.sigma, ref.sigma[0], atol=1e-5, rtol=1e-5)
 
 
 def test_belief_ce_bank_matches_forward_sigma_under_rope() -> None:
@@ -152,12 +77,8 @@ def _projected_extract_model(**overrides: object) -> VFEModel:
         batch_size=1,
         n_layers=1,
         n_e_steps=1,
-        e_step_update="gradient",
-        oracle_unroll_grad=True,
         e_q_mu_lr=0.04,
-        e_phi_lr=0.0,
         family="gaussian_diagonal",
-        transport_mode="flat",
         decode_mode="diagonal_chunked",
         encode_mode="per_token",
         lambda_alpha_mode="constant",
@@ -207,20 +128,6 @@ def _assert_tensor_dict_close(
         torch.testing.assert_close(actual[key], expected[key], atol=1e-5, rtol=1e-5)
 
 
-def test_projected_encode_one_matches_production_initial_snapshot() -> None:
-    """Returning raw canonical table moments instead of materialized q0 breaks this parity."""
-    model, tokens, snapshot = _projected_parity_case()
-
-    belief, _, _ = extract._encode_one(model, tokens)
-
-    torch.testing.assert_close(belief.mu, snapshot.initial_belief.mu[0], atol=1e-6, rtol=1e-6)
-    torch.testing.assert_close(
-        belief.sigma, snapshot.initial_belief.sigma[0], atol=1e-6, rtol=1e-6)
-    # Per-token encoding preserves the prior moments while retaining nonzero local frames.
-    torch.testing.assert_close(model.prior_bank.mu_embed[tokens[0]], snapshot.initial_belief.mu[0])
-    assert bool((snapshot.initial_belief.phi != 0).any())
-
-
 def test_projected_e_step_trajectory_matches_production_snapshot() -> None:
     """The replayed q0..qT trajectory must begin from production's realized-frame q0."""
     model, tokens, snapshot = _projected_parity_case()
@@ -253,7 +160,6 @@ def test_across_layer_trace_with_mlp_dropout_is_rng_neutral_and_restores_mode() 
         max_seq_len=4,
         n_layers=3,
         n_e_steps=1,
-        e_phi_lr=0.0,
         use_block_mlp=True,
         block_mlp_dropout=0.5,
     )
@@ -276,8 +182,8 @@ def test_across_layer_trace_with_mlp_dropout_is_rng_neutral_and_restores_mode() 
         assert torch.equal(actual_next_logits, expected_next_logits)
 
 
-def test_projected_converged_state_matches_production_snapshot() -> None:
-    """Converged diagnostics must not silently replay canonical rather than realized moments."""
+def test_projected_readout_state_matches_production_snapshot() -> None:
+    """The readout state of an independent forward equals the supplied snapshot's."""
     model, tokens, snapshot = _projected_parity_case()
 
     replay = extract.readout_state(model, tokens)
@@ -291,18 +197,9 @@ def test_projected_converged_state_matches_production_snapshot() -> None:
 
 
 def test_projected_rope_unrolled_replay_matches_production_snapshot() -> None:
-    """Allowed means-only gauge-RoPE and an unrolled E-step share the projected q0 seam."""
-    model, tokens, snapshot = _projected_parity_case(
-        pos_rotation="rope",
-        rope_full_gauge=False,
-        use_block_mlp=False,          # the block MLP requires a gradient-carrying E-step
-    )
-
-    belief, _, rope = extract._encode_one(model, tokens)
-    assert rope is not None
-    torch.testing.assert_close(belief.mu, snapshot.initial_belief.mu[0], atol=1e-6, rtol=1e-6)
-    torch.testing.assert_close(
-        belief.sigma, snapshot.initial_belief.sigma[0], atol=1e-6, rtol=1e-6)
+    """Gauge-RoPE readout state of an independent forward equals the supplied snapshot's."""
+    model, tokens, snapshot = _projected_parity_case(pos_rotation="rope", use_block_mlp=False)
+    assert snapshot.rope is not None
     replay = extract.readout_state(model, tokens)
     production = extract.readout_state(model, tokens, snapshot=snapshot)
     _assert_tensor_dict_close(replay, production, ("mu", "sigma", "phi", "energy", "beta"))
@@ -327,9 +224,7 @@ def test_refine_transport_sharing_is_derived_from_exact_eligibility(
         "max_seq_len": 4,
         "n_layers": 1,
         "n_e_steps": 1,
-        "transport_mode": "flat",
         "pos_phi": "none",
-        "e_phi_lr": 0.0,
     }
     values.update(overrides)
     model = VFEModel(test_config(**values)).to(DEVICE).eval()
@@ -397,7 +292,7 @@ def test_active_mlp_extract_replay_matches_forward() -> None:
     """Extractor replay must include every trained, untied post-block MLP."""
     cfg = test_config(
         vocab_size=11, embed_dim=4, n_heads=2, max_seq_len=4,
-        n_layers=2, n_e_steps=1, e_phi_lr=0.0, use_block_mlp=True,
+        n_layers=2, n_e_steps=1, use_block_mlp=True,
     )
     torch.manual_seed(17)
     model = VFEModel(cfg).to(DEVICE).eval()

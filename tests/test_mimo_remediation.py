@@ -10,8 +10,6 @@ import torch
 from vfe3.config import serialize_config, config_from_serialized
 from vfe3.families.base import safe_kl_clamp
 from vfe3.families.gaussian import diag_kl_unclamped, diag_kl_unclamped_per_coord
-from vfe3.geometry.groups import get_group
-from vfe3.geometry.transport import compute_transport_operators, transport_mean, transport_covariance
 
 
 def test_near_equal_diagonal_kl_preserves_small_positive_terms_and_gradients() -> None:
@@ -25,22 +23,6 @@ def test_near_equal_diagonal_kl_preserves_small_positive_terms_and_gradients() -
     torch.testing.assert_close(actual, diag_kl_unclamped_per_coord(mu, sq, mu.detach(), sp).sum(-1))
     assert torch.autograd.gradcheck(lambda a, b: diag_kl_unclamped(a, b, mu.detach(), sp),
                                     (mu, sq), eps=1e-6, atol=1e-7)
-
-
-def test_flat_dense_self_links_preserve_moments_and_have_zero_frame_derivative() -> None:
-    group = get_group("glk")(3)
-    phi = torch.randn(1, 2, 9, generator=torch.Generator().manual_seed(12), requires_grad=True)
-    omega = compute_transport_operators(phi, group)["Omega"]
-    identity = torch.eye(3).expand(1, 2, 3, 3)
-    torch.testing.assert_close(omega[:, torch.arange(2), torch.arange(2)], identity, atol=0, rtol=0)
-    mu = torch.randn(1, 2, 3)
-    sigma = torch.rand_like(mu) + 0.5
-    transported_mu = transport_mean(omega, mu)[:, torch.arange(2), torch.arange(2)]
-    transported_sigma = transport_covariance(omega, sigma, diagonal_out=True)[:, torch.arange(2), torch.arange(2)]
-    torch.testing.assert_close(transported_mu, mu, atol=0, rtol=0)
-    torch.testing.assert_close(transported_sigma, sigma, atol=0, rtol=0)
-    derivative, = torch.autograd.grad(transported_mu.sum() + transported_sigma.sum(), phi)
-    assert torch.count_nonzero(derivative) == 0
 
 
 def test_unbounded_kl_ceiling_keeps_gradient_and_json_round_trip() -> None:
@@ -59,15 +41,6 @@ def test_unbounded_kl_ceiling_keeps_gradient_and_json_round_trip() -> None:
 def test_invalid_kl_ceiling_is_rejected(ceiling: float) -> None:
     with pytest.raises(ValueError, match="kl_max"):
         test_config(kl_max=ceiling)
-
-
-def test_exact_congruence_rejects_dense_cross_head_transport() -> None:
-    from vfe3.families.exact_congruence import _pullback_query
-    mu = torch.zeros(1, 2, 4)
-    omega = torch.eye(4).expand(1, 2, 2, 4, 4).clone()
-    omega[..., 0, 2] = .1
-    with pytest.raises(ValueError, match="block-diagonal"):
-        _pullback_query(mu, torch.ones_like(mu), omega, [2, 2])
 
 
 def test_adamw_reports_nondefault_group_trust_radius() -> None:

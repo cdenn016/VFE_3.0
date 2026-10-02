@@ -1,4 +1,8 @@
-"""Independent decoder mean/covariance rates preserve encoder and legacy behavior."""
+"""Independent decoder mean/covariance rates preserve encoder behavior.
+
+The historical combined ``m_decode_lr`` is no longer a field; its load-time migration into these
+split rates is pinned in tests/test_config_retired_fields_20261002.py.
+"""
 
 import inspect
 from typing import Any, Optional
@@ -27,35 +31,27 @@ def test_independent_split_rates_keep_encoder_and_temperature_rates() -> None:
 
 @pytest.mark.parametrize("mu_rate,sigma_rate", [(None, None), (0.0, 0.0),
                                                (0.137, 0.061), (1, 2)])
-def test_split_rates_roundtrip_and_legacy_omission(
+def test_split_rates_roundtrip_and_omission(
     mu_rate:    Optional[float],
     sigma_rate: Optional[float],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Legacy omissions use a test-owned constructor baseline for this loader call.
+    # Omissions use a test-owned constructor baseline for this loader call.
     parameters = list(inspect.signature(VFE3Config.__init__).parameters)[1:]
     values = config_values()
     monkeypatch.setattr(VFE3Config.__init__, "__defaults__", tuple(values[name] for name in parameters))
-    cfg = _config(m_decode_mu_lr=mu_rate, m_decode_sigma_lr=sigma_rate,
-                  m_decode_lr=0.117)
+    cfg = _config(m_decode_mu_lr=mu_rate, m_decode_sigma_lr=sigma_rate)
     saved = serialize_config(cfg)
     assert saved["m_decode_mu_lr"] == mu_rate
     assert saved["m_decode_sigma_lr"] == sigma_rate
     restored = config_from_serialized(saved, source="split decoder-rate test")
     assert restored.m_decode_mu_lr == mu_rate
     assert restored.m_decode_sigma_lr == sigma_rate
-    assert restored.m_decode_lr == 0.117
     saved.pop("m_decode_mu_lr")
     saved.pop("m_decode_sigma_lr")
-    historical = config_from_serialized(saved, source="legacy combined decoder rate")
-    assert historical.m_decode_mu_lr is None
-    assert historical.m_decode_sigma_lr is None
-    assert historical.m_decode_lr == 0.117
-    saved.pop("m_decode_lr")
     oldest = config_from_serialized(saved, source="historical encoder rates")
     assert oldest.m_decode_mu_lr is None
     assert oldest.m_decode_sigma_lr is None
-    assert oldest.m_decode_lr is None
 
 
 @pytest.mark.parametrize("field", ["m_decode_mu_lr", "m_decode_sigma_lr"])
@@ -68,13 +64,11 @@ def test_split_rates_reject_invalid_explicit_values(field: str, rate: Any) -> No
 
 @pytest.mark.parametrize("mode,untied", [("linear", False), ("diagonal_chunked", False),
                                          ("diagonal_chunked", True)])
-@pytest.mark.parametrize("legacy_rate", [None, 0.117])
 def test_omitted_split_rates_preserve_group_topology_and_parameter_bytes(
     mode:        str,
     untied:      bool,
-    legacy_rate: Optional[float],
 ) -> None:
-    options = dict(decode_mode=mode, untie_decode_bank=untied, m_decode_lr=legacy_rate)
+    options = dict(decode_mode=mode, untie_decode_bank=untied)
     torch.manual_seed(30)
     implicit = VFEModel(_config(**options))
     torch.manual_seed(30)
@@ -87,23 +81,16 @@ def test_omitted_split_rates_preserve_group_topology_and_parameter_bytes(
     topology = [(tuple(names[id(parameter)] for parameter in group["params"]),
                  group["lr"], group["role"], group["weight_decay"], group.get("lr_report_role"))
                 for group in optimizer.param_groups]
-    expected = [(("prior_bank.mu_embed",), 0.025, "mu", 0.05, "mu")]
-    expected += ([(("prior_bank.sigma_log_embed", "prior_bank.decode_log_scale"),
-                   0.0025, "sigma", 0.05, "sigma")]
-                 if legacy_rate is None else
-                 [(("prior_bank.sigma_log_embed",), 0.0025, "sigma", 0.05, "sigma"),
-                  (("prior_bank.decode_log_scale",), 0.117, "sigma", 0.05, None)])
-    expected += [(("prior_bank.phi_embed",), 0.015, "phi", 0.065, "phi")]
+    expected = [(("prior_bank.mu_embed",), 0.025, "mu", 0.05, "mu"),
+                (("prior_bank.sigma_log_embed", "prior_bank.decode_log_scale"),
+                 0.0025, "sigma", 0.05, "sigma"),
+                (("prior_bank.phi_embed",), 0.015, "phi", 0.065, "phi")]
     if mode == "linear":
-        expected += [(("prior_bank.output_proj_weight",),
-                      0.025 if legacy_rate is None else 0.117, "mu", 0.05, None),
-                     (("prior_bank.output_proj_bias",),
-                      0.025 if legacy_rate is None else 0.117, "mu", 0.0, None)]
+        expected += [(("prior_bank.output_proj_weight",), 0.025, "mu", 0.05, None),
+                     (("prior_bank.output_proj_bias",), 0.025, "mu", 0.0, None)]
     elif untied:
-        expected += [(("prior_bank.decode_mu_embed",),
-                      0.025 if legacy_rate is None else 0.117, "mu", 0.05, None),
-                     (("prior_bank.decode_sigma_log_embed",),
-                      0.0025 if legacy_rate is None else 0.117, "sigma", 0.05, None)]
+        expected += [(("prior_bank.decode_mu_embed",), 0.025, "mu", 0.05, None),
+                     (("prior_bank.decode_sigma_log_embed",), 0.0025, "sigma", 0.05, None)]
     expected += [(("relational_operators.raw_score_q", "relational_operators.raw_score_k"),
                   0.025, "mu", 0.0, None),
                  (("relational_operators.T", "relational_operators.O"),
@@ -122,15 +109,11 @@ def test_omitted_split_rates_preserve_group_topology_and_parameter_bytes(
         assert torch.equal(parameter, explicit.state_dict()[name])
 
 
-@pytest.mark.parametrize("mu_rate,sigma_rate,legacy_rate,want_mu,want_sigma,want_temperature", [
-    (0.137, 0.061, None, 0.137, 0.061, 0.004),
-    (0.137, None, None, 0.137, 0.004, 0.004),
-    (None, 0.061, None, 0.023, 0.061, 0.004),
-    (None, None, None, 0.023, 0.004, 0.004),
-    (0.137, 0.061, 0.117, 0.137, 0.061, 0.117),
-    (0.137, None, 0.117, 0.137, 0.117, 0.117),
-    (None, 0.061, 0.117, 0.117, 0.061, 0.117),
-    (None, None, 0.117, 0.117, 0.117, 0.117),
+@pytest.mark.parametrize("mu_rate,sigma_rate,want_mu,want_sigma,want_temperature", [
+    (0.137, 0.061, 0.137, 0.061, 0.004),
+    (0.137, None, 0.137, 0.004, 0.004),
+    (None, 0.061, 0.023, 0.061, 0.004),
+    (None, None, 0.023, 0.004, 0.004),
 ])
 def test_untied_split_rates_follow_independent_precedence_and_preserve_other_roles(
     want_mu:          float,
@@ -138,10 +121,9 @@ def test_untied_split_rates_follow_independent_precedence_and_preserve_other_rol
     want_temperature: float,
     mu_rate:          Optional[float],
     sigma_rate:       Optional[float],
-    legacy_rate:      Optional[float],
 ) -> None:
     cfg = _config(untie_decode_bank=True, m_decode_mu_lr=mu_rate,
-                  m_decode_sigma_lr=sigma_rate, m_decode_lr=legacy_rate,
+                  m_decode_sigma_lr=sigma_rate,
                   m_p_mu_lr=0.023, m_p_sigma_lr=0.004, m_phi_lr=0.013,
                   mu_weight_decay=0.07, sigma_weight_decay=0.09, phi_weight_decay=0.11,
                   m_head_evidence_lr=0.081, use_priorbank_head_evidence_mixer=True)
@@ -161,46 +143,32 @@ def test_untied_split_rates_follow_independent_precedence_and_preserve_other_rol
         assert (group["lr"], group["role"], group["weight_decay"]) == values
 
 
-@pytest.mark.parametrize("legacy_rate,want_temperature", [(None, 0.004), (0.117, 0.117)])
 @pytest.mark.parametrize("mode", ["diagonal_chunked", "full_chunked"])
-def test_tied_tables_keep_encoder_rates_when_both_split_overrides_are_explicit(
-    want_temperature: float,
-    mode:             str,
-    legacy_rate:      Optional[float],
-) -> None:
+def test_tied_tables_keep_encoder_rates_when_both_split_overrides_are_explicit(mode: str) -> None:
     cfg = _config(decode_mode=mode, untie_decode_bank=False, m_decode_mu_lr=0.137,
-                  m_decode_sigma_lr=0.061, m_decode_lr=legacy_rate,
-                  m_p_mu_lr=0.023, m_p_sigma_lr=0.004)
+                  m_decode_sigma_lr=0.061, m_p_mu_lr=0.023, m_p_sigma_lr=0.004)
     model = VFEModel(cfg)
     groups = _groups(model, build_optimizer(model, cfg))
     assert groups["prior_bank.mu_embed"]["lr"] == 0.023
     assert groups["prior_bank.sigma_log_embed"]["lr"] == 0.004
-    assert groups["prior_bank.decode_log_scale"]["lr"] == want_temperature
+    assert groups["prior_bank.decode_log_scale"]["lr"] == 0.004
     assert "prior_bank.decode_mu_embed" not in groups
     assert "prior_bank.decode_sigma_log_embed" not in groups
 
 
-@pytest.mark.parametrize("mu_rate,legacy_rate,want_mu,want_temperature", [
-    (0.137, None, 0.137, 0.004),
-    (None, None, 0.023, 0.004),
-    (0.137, 0.117, 0.137, 0.117),
-    (None, 0.117, 0.117, 0.117),
-    (0.0, 0.117, 0.0, 0.117),
-])
+@pytest.mark.parametrize("mu_rate,want_mu", [(0.137, 0.137), (None, 0.023), (0.0, 0.0)])
 def test_linear_readout_uses_mean_override_and_ignores_covariance_override(
     want_mu:          float,
-    want_temperature: float,
     mu_rate:          Optional[float],
-    legacy_rate:      Optional[float],
 ) -> None:
     cfg = _config(decode_mode="linear", m_decode_mu_lr=mu_rate, m_decode_sigma_lr=0.061,
-                  m_decode_lr=legacy_rate, m_p_mu_lr=0.023, m_p_sigma_lr=0.004,
+                  m_p_mu_lr=0.023, m_p_sigma_lr=0.004,
                   mu_weight_decay=0.07, sigma_weight_decay=0.09)
     model = VFEModel(cfg)
     groups = _groups(model, build_optimizer(model, cfg))
     assert groups["prior_bank.mu_embed"]["lr"] == 0.023
     assert groups["prior_bank.sigma_log_embed"]["lr"] == 0.004
-    assert groups["prior_bank.decode_log_scale"]["lr"] == want_temperature
+    assert groups["prior_bank.decode_log_scale"]["lr"] == 0.004
     assert groups["prior_bank.decode_log_scale"]["role"] == "sigma"
     assert groups["prior_bank.decode_log_scale"]["weight_decay"] == 0.09
     for name, decay in (("prior_bank.output_proj_weight", 0.07),
@@ -219,7 +187,7 @@ def test_explicit_zero_split_rate_stays_frozen_under_schedule(
     live_name:   str,
 ) -> None:
     rates = {"m_decode_mu_lr": 0.137, "m_decode_sigma_lr": 0.061, field: 0.0}
-    cfg = _config(untie_decode_bank=True, m_decode_lr=0.117, min_lr=0.2,
+    cfg = _config(untie_decode_bank=True, min_lr=0.2,
                   warmup_steps=0, max_steps=4, **rates)
     model = VFEModel(cfg)
     optimizer = build_optimizer(model, cfg)
@@ -245,7 +213,7 @@ def test_explicit_zero_split_rate_stays_frozen_under_schedule(
 
 def test_split_rates_keep_frozen_temperature_out_of_optimizer() -> None:
     cfg = _config(untie_decode_bank=True, m_decode_mu_lr=0.137, m_decode_sigma_lr=0.061,
-                  m_decode_lr=0.117, decode_temperature_learned=False)
+                  decode_temperature_learned=False)
     model = VFEModel(cfg)
     groups = _groups(model, build_optimizer(model, cfg))
     assert groups["prior_bank.decode_mu_embed"]["lr"] == 0.137

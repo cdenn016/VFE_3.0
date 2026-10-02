@@ -157,7 +157,7 @@ def test_complete_training_projection_and_reports_remain_lazy(layers: int,
                                                             monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = test_config(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=4,
                     n_layers=layers, n_e_steps=1, gauge_group="block_glk",
-                    decode_mode="linear", pos_phi="learned", e_phi_lr=0.0,
+                    decode_mode="linear", pos_phi="learned",
                     phi_mstep_max_matrix_norm=12.0, use_head_mixer=True,
                     use_block_mlp=True, block_mlp_expansion=2, warmup_steps=1,
                     max_steps=4, batch_size=1, amp_dtype=None)
@@ -187,8 +187,3 @@ def test_complete_training_projection_and_reports_remain_lazy(layers: int,
     assert isinstance(restored.group._generator_source, groups._ElementaryBlockBasis)
 
 
-def test_cross_coupled_basis_keeps_dense_contract() -> None:
-    group = get_group("block_glk")(4, 2, cross_couplings=[(0, 1)])
-    assert isinstance(group._generator_source, torch.Tensor)
-    assert group.generators is group._generator_source
-    assert group.elementary_block_shape is None

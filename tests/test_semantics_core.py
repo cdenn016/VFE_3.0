@@ -52,7 +52,7 @@ def _gpt2_encoding():
 
 
 def _tiny_model(**over) -> "tuple[VFE3Config, VFEModel]":
-    options = dict(vocab_size=V, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=1, e_phi_lr=0.0)
+    options = dict(vocab_size=V, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=1)
     options.update(over)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")

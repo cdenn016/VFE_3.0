@@ -131,11 +131,6 @@ class ExecutableBuildMetadata:
     block_mlp: BlockMLPBuildMetadata
 
 
-def is_conditional_filtering(model: object) -> bool:
-    """Whether a model owns the relational conditional routing/content module."""
-    return getattr(model, "relational_operators", None) is not None
-
-
 # Model families the shared training loop, finalize and the paper assemblers know. A model or config
 # without a ``model_family`` attribute (every VFEModel and VFE3Config) is the VFE family, so the VFE
 # paths never read the tag and stay exactly as they were.
@@ -173,13 +168,10 @@ class MStepCapture(TypedDict, total=False):
     out:                BeliefState
     canonical_frame:    CanonicalFrameContext
     relational_capture: dict
-    # CG moment-energy participation (PB-13). Present ONLY when cfg.cg_energy_weight>0. Attached
-    # E-step estimators append the per-layer D(q_post||q_pre) rows to ``cg_moment_energy_rows``; the
-    # 'detach' estimator instead appends the detached pre-CG (mu, sigma) pairs to ``cg_pre_moments``
-    # for the post-stack ``torch.enable_grad`` re-evaluation. A capture allocated only for M-step
-    # self-coupling never carries either key.
+    # CG moment-energy participation (PB-13). Present ONLY when cfg.cg_energy_weight>0. Each block
+    # appends its D(q_post||q_pre) rows to ``cg_moment_energy_rows``. A capture allocated only for
+    # M-step self-coupling never carries the key.
     cg_moment_energy_rows: List[torch.Tensor]
-    cg_pre_moments:        List[Tuple[torch.Tensor, torch.Tensor]]
 
 
 class EStepGradientRecord(TypedDict, total=False):

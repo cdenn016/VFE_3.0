@@ -26,7 +26,7 @@ def test_launcher_saves_and_tests_all_training_without_periodic_checkpoints(
         vocab_size=7, embed_dim=4, n_heads=2, batch_size=1, max_seq_len=4,
         n_layers=1, n_e_steps=1, max_steps=3, warmup_steps=0,
         eval_interval=2, log_interval=0, checkpoint_interval=0,
-        skip_belief_sigma_update=True, e_phi_lr=0.0, oracle_unroll_grad=True,
+        skip_belief_sigma_update=True,
         generate_embedding_figures=False,
     )
     loader = DataLoader(TokenWindows(torch.tensor([0, 1, 2, 3, 4]), 4), batch_size=1)

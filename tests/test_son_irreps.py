@@ -1,5 +1,5 @@
-r"""SO(N)/Sp(2m) irrep-tower gauge groups ('so_n' / 'sp_n'): irrep construction
-(symmetric-traceless tensor powers / Sym^p), representation property, group builders,
+r"""SO(N) irrep-tower gauge group ('so_n'): irrep construction
+(symmetric-traceless tensor powers), representation property, group builders,
 per-head tau for unequal blocks, config validation, and the end-to-end model smoke.
 """
 from tests.profiles import test_config
@@ -11,7 +11,7 @@ import torch
 
 from vfe3.config import VFE3Config
 from vfe3.free_energy import attention_tau
-from vfe3.geometry.generators import generate_son, generate_sp
+from vfe3.geometry.generators import generate_son
 from vfe3.geometry.groups import check_admissible, get_group
 from vfe3.geometry.irreps import direct_sum_generators, irrep_dim, structure_constants
 from vfe3.model.model import VFEModel
@@ -40,10 +40,6 @@ def test_irrep_dim_closed_forms():
     # general N: C(N+p-1, p) - C(N+p-3, p-2)
     assert irrep_dim(4, algebra="so", label="l2") == 9
     assert irrep_dim(5, algebra="so", label="l2") == 14
-    # Sp(2m): Sym^p of the defining rep, dim C(2m+p-1, p)
-    assert irrep_dim(4, algebra="sp", label="sym0") == 1
-    assert irrep_dim(4, algebra="sp", label="sym1") == 4
-    assert irrep_dim(4, algebra="sp", label="sym2") == 10
 
 
 def test_unknown_irrep_label_raises():
@@ -74,16 +70,6 @@ def test_so3_tower_skew_homomorphic_block_diagonal():
     assert G[:, 0, :].abs().max().item() == 0.0
 
 
-def test_sp_sym_tower_homomorphic():
-    G_def = generate_sp(4, dtype=torch.float64)               # sp(4), m=2, n_gen = 10
-    G, dims = direct_sum_generators(G_def, algebra="sp",
-                                    irrep_spec=[("sym0", 1), ("sym1", 1)])
-    assert dims == [1, 4]
-    assert G.shape == (10, 5, 5)
-    f = structure_constants(G_def)
-    assert _max_bracket_residual(G, f) < 1e-10
-
-
 # ---------------------------------------------------------------- group builders
 
 def test_so_n_group_builder_fields():
@@ -111,14 +97,6 @@ def test_so_n_multiplicity_ties_identical_blocks():
     assert grp.irrep_dims == [3, 3]
     # the SAME irrep image in both blocks: one phi drives identical 3x3 factors (tied gauge)
     assert torch.equal(grp.generators[:, :3, :3], grp.generators[:, 3:, 3:])
-
-
-def test_sp_n_group_builder_fields():
-    grp = get_group("sp_n")(5, group_n=4, irrep_spec=[("sym0", 1), ("sym1", 1)])
-    assert grp.name == "sp_n"
-    assert grp.generators.shape == (10, 5, 5)                 # n_gen = m(2m+1) = 10 for m=2
-    assert grp.irrep_dims == [1, 4]
-    assert grp.skew_symmetric is False
 
 
 def test_so_n_builder_errors():
@@ -156,27 +134,13 @@ def test_attention_tau_equal_blocks_unchanged_scalar():
 # ---------------------------------------------------------------- config validation
 
 
-
-
-
-
-
-
-
 def test_config_irrep_fields_rejected_for_other_groups():
     with pytest.raises(ValueError, match="consumed only by"):
         test_config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
                    gauge_group="block_glk", irrep_spec=[("l1", 1)])
 
 
-
-
-
-
-
-
 # ---------------------------------------------------------------- end-to-end model
-
 
 
 # ---------------------------------------------------------------- irrep_labels field
@@ -186,10 +150,8 @@ def test_groups_expose_irrep_labels():
                             irrep_spec=[("l0", 1), ("l1", 2), ("l3", 1)])
     assert grp.irrep_dims == [1, 3, 3, 7]
     assert grp.irrep_labels == ["l0", "l1", "l1", "l3"]
-    grp2 = get_group("sp_n")(5, group_n=4, irrep_spec=[("sym0", 1), ("sym1", 1)])
-    assert grp2.irrep_labels == ["sym0", "sym1"]
     # legacy groups carry no labels
-    assert get_group("glk")(4).irrep_labels is None
+    assert get_group("block_glk")(4, 1).irrep_labels is None
     assert get_group("block_glk")(6, 3).irrep_labels is None
 
 
@@ -200,8 +162,98 @@ def test_irrep_labels_length_validated():
                    skew_symmetric=True, irrep_labels=["a"])
 
 
+# ---------------------------------------------------------------- projected routes
+
+# SO(3) acting on R^6 = l1 (+) l1: two equal irrep blocks, one per head (d_head = 3).
+_SON_PROJECTED = dict(gauge_group="so_n", group_n=3, irrep_spec=[("l1", 2)], embed_dim=6, n_heads=2)
+_SON_ROUTES = {
+    "predictive_diagonal": dict(),
+    "predictive_full": dict(family="gaussian_full", decode_mode="full_chunked"),
+    "predictive_full_rope": dict(family="gaussian_full", decode_mode="full_chunked",
+                                 pos_rotation="rope", rope_on_value=False, n_layers=2),
+    "gradient_diagonal": dict(attention_mode="projected_gradient",
+                              predictive_covariance="passthrough", attention_residual=False),
+    "gradient_full_closed_form": dict(attention_mode="projected_gradient",
+                                      predictive_covariance="passthrough", attention_residual=False,
+                                      family="gaussian_full", decode_mode="full_chunked",
+                                      relational_receiver_update="closed_form"),
+}
+
+
+def _son_model(dtype: torch.dtype = torch.float32, **overrides: object) -> VFEModel:
+    from tests.profiles import tiny_config
+    import warnings
+    torch.manual_seed(0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")                      # so_n + RoPE structure-group warning
+        model = VFEModel(tiny_config(**{**_SON_PROJECTED, **overrides})).to(dtype)
+    with torch.no_grad():
+        model.prior_bank.phi_embed.normal_(mean=0.0, std=0.3)   # nontrivial SO(3) frames
+    return model
+
+
 @pytest.mark.parametrize("mode", ["projected_predictive", "projected_gradient"])
-def test_projected_model_rejects_so_n_group(mode: str) -> None:
-    with pytest.raises(ValueError, match="gauge_group=.*so_n"):
-        test_config(attention_mode=mode, gauge_group="so_n", group_n=3,
+def test_projected_so_n_requires_one_equal_irrep_block_per_head(mode: str) -> None:
+    with pytest.raises(ValueError, match="one gauge block per head"):
+        test_config(attention_mode=mode, gauge_group="so_n", group_n=3, embed_dim=4, n_heads=2,
                     irrep_spec=[("l0", 1), ("l1", 1)])
+    with pytest.raises(ValueError, match="one gauge block per head"):
+        test_config(attention_mode=mode, gauge_group="so_n", group_n=3, embed_dim=6, n_heads=3,
+                    irrep_spec=[("l1", 2)])
+
+
+@pytest.mark.parametrize("route", sorted(_SON_ROUTES))
+def test_projected_so_n_train_step(route: str) -> None:
+    from vfe3.train import build_optimizer, train_step
+    model = _son_model(**_SON_ROUTES[route])
+    assert model.group.name == "so_n" and model.group.irrep_dims == [3, 3]
+    phi0 = model.prior_bank.phi_embed.detach().clone()
+    optimizer = build_optimizer(model, model.cfg)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
+    tokens, targets = torch.tensor([[1, 4, 2]]), torch.tensor([[4, 2, 3]])
+    loss = train_step(model, optimizer, scheduler, tokens, targets)
+    assert math.isfinite(loss)
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    assert grads and all(bool(torch.isfinite(g).all()) for g in grads)
+    assert model.prior_bank.phi_embed.grad is not None
+    assert float((model.prior_bank.phi_embed.detach() - phi0).abs().max()) > 0.0   # phi M-step moved
+
+
+@pytest.mark.parametrize("route", sorted(_SON_ROUTES))
+def test_projected_so_n_gauge_equivariance(route: str) -> None:
+    from vfe3.viz import extract
+    model = _son_model(**_SON_ROUTES[route]).eval()
+    residuals = extract.projected_gauge_equivariance(
+        model, torch.tensor([[1, 4, 2]]), n_draws=2)["residuals"]
+    assert residuals
+    for key, values in residuals.items():
+        assert len(values) == model.cfg.n_layers
+        assert max(values) < 1e-10, (key, values)
+
+
+@pytest.mark.parametrize("route", ["predictive_diagonal", "gradient_full_closed_form"])
+def test_projected_so_n_phi_gradient_matches_finite_difference(route: str) -> None:
+    # float64 throughout (the fp64 exp island is forced on) so central differences resolve 1e-7.
+    model = _son_model(torch.float64, exp_fp64_norm_threshold=1e-9, **_SON_ROUTES[route]).eval()
+    tokens = torch.tensor([[1, 4, 2]])
+    phi = model.prior_bank.phi_embed
+    w_mu = torch.randn(1, 3, 6, generator=torch.Generator().manual_seed(3), dtype=torch.float64)
+
+    def objective() -> torch.Tensor:
+        belief, _ = model.forward_beliefs(tokens)
+        w_sigma = torch.randn(belief.sigma.shape, generator=torch.Generator().manual_seed(4),
+                              dtype=torch.float64)
+        return (w_mu * belief.mu).sum() + (w_sigma * belief.sigma).sum()
+
+    objective().backward()
+    grad = phi.grad.clone()
+    h = 1e-5
+    for row, col in [(1, 0), (4, 1), (2, 2)]:
+        with torch.no_grad():
+            phi[row, col] += h
+            plus = float(objective())
+            phi[row, col] -= 2 * h
+            minus = float(objective())
+            phi[row, col] += h
+        fd = (plus - minus) / (2 * h)
+        assert abs(fd - float(grad[row, col])) <= 1e-7 * max(1.0, abs(fd)), (row, col, fd, grad[row, col])

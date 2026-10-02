@@ -91,7 +91,7 @@ def test_t5_relative_bias_uses_supplied_learnable_table():
 
 def _model_forward_finite(prior_name: str):
     cfg = test_config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                     n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, beta_attention_prior=prior_name)
+                     n_e_steps=1, m_phi_lr=0.0, beta_attention_prior=prior_name)
     torch.manual_seed(0)
     model = VFEModel(cfg)
     tokens = torch.randint(0, 12, (2, 8))
@@ -114,7 +114,7 @@ def test_model_forward_under_windowed_priors():
 
 def _t5_learnable_cfg(**kw):
     base = dict(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0,
+                n_e_steps=1, m_phi_lr=0.0,
                 beta_attention_prior="t5_relative_bias", t5_learnable_bias=True)
     base.update(kw)
     return test_config(**base)

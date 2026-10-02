@@ -93,8 +93,6 @@ from vfe3.data.datasets import (
 )
 from vfe3.metrics import (
     attention_entropy,
-    gauge_equivariance_residual,
-    guard_saturation,
     head_mixer_gauge_residual,
     rank_one_residual,
 )
@@ -118,9 +116,9 @@ from vfe3.runtime import seed_everything
 from vfe3.train import coverage_lines, evaluate, train
 from vfe3.viz.extract import (
     across_layer_belief_trace,
-    attention_entropy_cov_gap,
-    converged_state,
     per_unit_eval_nats,
+    projected_gauge_equivariance,
+    readout_state,
 )
 logger = logging.getLogger("ablation")
 _ABLATION_FIGURE_TIMEOUT_SECONDS = 2 * 60 * 60
@@ -326,14 +324,11 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     
     #################################
-    # f-divergence and e/m family
+    # belief family
     #################################
 
-    divergence_family         = "renyi",   # "renyi", "squared_hellinger","bhattacharyya", "jeffreys",
-    renyi_order               = 1.0,       # Renyi order (1.0 -> KL)
 
-    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full" | "laplace_diagonal" | "gaussian_frame_diagonal"
-                                                     # | "gaussian_diagonal_exact" (single covariance toggle; diagonal_covariance is derived)
+    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full"
 
     
     #################################
@@ -352,13 +347,12 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #################################
     decode_bias                       = True,     # only for decode_mode='linear'
     
-    use_head_mixer                    = False,   # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
+    use_head_mixer                    = False,   # opt-in Schur-commutant head mixer (needs >=2 blocks: block_glk heads OR an so_n irrep tower with per-isotypic-component mixing);
     use_priorbank_head_evidence_mixer = False,
                                          
     
     decode_mode                       = 'linear',  # prior-bank: diagonal_chunked/full_chunked/expected_likelihood_chunked/family_chunked
     encode_mode                       = "per_token",   #"per_token_additive" is ~1.5x faster at K=80 currently unablated
-                                                       # canonical_content_* encoders are rejected by both projected routes
     decode_chunk_size                 = 8192,
     decode_ce_checkpoint              = "auto",     # historical gate; "auto_aggregate" saves memory with recompute
     decode_ce_stable_reduction        = False,      # True avoids large-score CE cancellation; adds tensor passes
@@ -389,10 +383,10 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     gauge_transport           = "on",         # gauge-frame ABLATION (A1/EXP-2): "on" (pure, learned frame)
                                               #   | "off" (Omega=I exactly) | "frozen" (random fixed frame)
 
-    gauge_group               = "block_glk",    # "glk" | "block_glk" | "tied_block_glk" | "so_k" | "sp" | "so_n" | "sp_n"
+    gauge_group               = "block_glk",    # "block_glk" | "so_n" (so_n awaits reconnection to the projected routes)
 
-    group_n                   = None,                # so_n/sp_n only; must stay None for every other group
-    irrep_spec                = None,                # so_n/sp_n only; must stay None for every other group
+    group_n                   = None,                # so_n only; must stay None for block_glk
+    irrep_spec                = None,                # so_n only; must stay None for block_glk
 
     ####################################
     #       Positional Encoding
@@ -405,7 +399,6 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
    
     rope_base                 = 100.0,               # rotary frequency base
         
-    rope_full_gauge           = False,               # rotate the covariance sandwich too (REQUIRES family="gaussian_full")
     rope_on_value             = False,
 
 
@@ -451,16 +444,11 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #         Belief E-step
     #         Learning Rates
     #################################
-    e_step_update             = "gradient",  # "gradient" (pure current path) | "mm_exact" (closed-form MM
-                                            # coordinate minimizer at frozen beta)
-    e_step_mu_precond         = "fisher",  
-    mm_damping                = 1,           # mm_exact damping eta in (0,1]; 1.0 = exact minimizer
     
     
     e_q_mu_lr                 = 0.9,
     e_q_sigma_lr              = 0.01,
     
-    e_phi_lr                  = 0.00,
 
    
     #################################
@@ -534,7 +522,6 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     sigma_max                            = 100.0,
     e_mu_q_trust                         = 2,
     e_sigma_q_trust                      = 1.0,
-    mu_trust_mode                        = "ball",
    
    
     amp_dtype                            = 'bf16',        # None=fp32 | 'bf16' , 'fp16'. Sigma must be at least fp32
@@ -565,24 +552,8 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     # opt-in so the default chunked route remains streamed and bounded.
     decode_ranking_fp64_escalation       = True,             
      
-    # DEFAULT guard is sign-only: recompute in float64 iff the working-dtype congruence went
-    # negative -- one amin reduction the floor needs regardless. Positivity is necessary but not
-    # sufficient (cancellation destroys accuracy before it destroys sign), so this toggle adds the
-    # conditioning proxy cond(exp_phi)^4 * eps > 1e-3, which bounds the quadratic form's backward
-    # error (Higham 2002, 3.1). It is OPT-IN because it is not free: it runs svdvals on the vertex
-    # blocks and then a bool() on the result, i.e. an SVD launch plus a GPU->CPU sync, on the
-    # HEALTHY path of every covariance transport.                                         
-    congruence_cond_escalation           = False, #at K=80 4 heads ~  2x-3x slower                        
      
      
-    # Strict post-congruence certificate (audit remediation M13). When enabled, factor every
-    # transported pair covariance and promote the complete pair field to float64 if any matrix is
-    # uncertified. At B=64, N=128, K=20 this checks 1,048,576 separate 20x20 matrices and the
-    # promoted field is about 3.1 GiB. Keep this opt-in for accuracy investigations; False retains
-    # the selected working precision without the additional certificate or fallback recompute.
-    full_cov_congruence_certification    = True,  # False: no per-pair Cholesky certificate or
-                                                 # whole-field fp64 retry. True: strict M13 audit
-                                                 # over ~1.05M 20x20 matrices per call at B64/N128.
                                                  
       
     skip_belief_sigma_update             = True,        # skip the belief-channel sigma E-step update
@@ -602,7 +573,6 @@ BASELINE_CONFIG["kl_max"] = 8 * BASELINE_CONFIG["embed_dim"]
 # Fields deliberately NOT swept, with the reason:
 #   vocab_size             fixed by the dataset
 #   encode_mode            only implemented registry entries are selectable
-#   divergence_family      only 'renyi' is registered (renyi_order is its live knob)
 #   seed                   set per run from CONFIG['seed'] (the runner reseeds each cell)
 #   max_steps              cosine horizon, set via CONFIG['max_steps']
 #   stop_after_steps       optional earlier stopping step (runner-only, not swept)
@@ -672,7 +642,6 @@ SWEEP_ORDER: List[str] = [
   #  "kappa_beta",
   #
 
-   # "mm_damping",
 
   # "sigma_max",
       
@@ -688,13 +657,11 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
        "param": "e_q_mu_lr",
        "range": [0.8, 1.1, 0.1],
        "scale": "linear",
-       "requires": {"e_step_update": "gradient"},   
     },
    
     "e_q_sigma_lr": {
        "description": "E-step retraction step size for sigma_q",
        "param": "e_q_sigma_lr", "range": [0.0000, 0.1, 0.005],
-       "requires": {"e_step_update": "gradient"},   
     },
    
 
@@ -952,13 +919,6 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     },
     
     
-    "mm_damping": {  # MM-exact E-step damping eta in (0,1]; 'requires' pins e_step_update='mm_exact' so the
-        # damped coordinate-minimizer step is actually taken every cell (1.0 = full exact minimizer).
-        "description": "MM-exact E-step damping eta in (0,1] (requires mm_exact E-step)",
-        "param": "mm_damping", "values": [0.5, 0.75, 0.85,  1],
-        "requires": {"e_step_update": "mm_exact"},
-    },
-
     
     "warmup_steps": {  # LR warmup length before the cosine decay (0 = no warmup, straight into cosine).
         "description": "LR warmup steps before cosine decay",
@@ -1020,14 +980,12 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
 # Ranks track the declared baseline width; other training/data settings remain live.
 NEW_ATTENTION_SEEDS = [6]  # use [6] for a one-seed screen
 _ATTENTION_REQUIRES = {
-    "family": "gaussian_diagonal", "divergence_family": "renyi", "renyi_order": 1.0,
-    "include_attention_entropy": True, "gradient_mode": "filtering",
-    "e_step_update": "gradient", "e_step_gradient": "unroll", "oracle_unroll_grad": True,
-    "n_layers": 1, "n_e_steps": 1, "skip_belief_sigma_update": True, "e_phi_lr": 0.0,
-    "transport_mode": "flat", "gauge_group": "block_glk",
+    "family": "gaussian_diagonal",
+    "n_layers": 1, "n_e_steps": 1, "skip_belief_sigma_update": True,
+    "gauge_group": "block_glk",
     "gauge_transport": "on", "pos_rotation": "none",
     "encode_mode": "per_token", "decode_mode": "linear",
-    "cross_couplings": None, "use_priorbank_head_evidence_mixer": False,
+    "use_priorbank_head_evidence_mixer": False,
     "attention_mode": "projected_predictive",
     "m_relational_score_lr": None, "m_relational_content_lr": None,
     "use_head_mixer": True,
@@ -1386,9 +1344,7 @@ def validate_sweeps(sweep_names: List[str], *, require_construction: bool = True
     transport), so NO single baseline can construct every registered arm at once. Requiring
     that of the whole registry made an edit to one baseline field abort the session over
     sweeps that were never scheduled -- e.g. ``family='gaussian_full'`` alone invalidates the
-    ``mm_exact`` arms of 'estep_depth_damping'/'mm_damping' (kernel-route only), the diagonal
-    arm of 'covariance', and every off-KL 'renyi_order'
-    arm. Those sweeps each carry the baseline they need; they are reported as a warning here
+    diagonal arm of 'covariance'. Those sweeps each carry the baseline they need; they are reported as a warning here
     and remain runnable on their own once the baseline is set for them.
     """
     portable_names: Dict[str, str] = {}
@@ -1816,8 +1772,8 @@ def _cell_diagnostics(
     r"""Per-cell converged-state diagnostics for the gauge / entropy / equivariance experiments.
 
     OPT-IN: only runs when a sweep declares ``collect_diagnostics: True``, so the default tuning
-    sweeps pay nothing. One faithful converged-state replay of validation sequence 0
-    (``viz.extract.converged_state``) feeds the scalars the experiments read out of
+    sweeps pay nothing. One captured projected readout of validation sequence 0
+    (``viz.extract.readout_state``) feeds the scalars the experiments read out of
     ``sweep_results.csv``:
 
       * ``attn_entropy``        mean attention-row entropy H(beta)                       [C1/EXP-4]
@@ -1825,20 +1781,21 @@ def _cell_diagnostics(
                                 gauge_transport='off' gives Omega = I to float eps)
       * ``builder_resid``       median builder-break gauge residual of the head mixer    [A2/EXP-9]
                                 (eps under the tied gauge, grows under the untied one)
-      * ``gauge_resid_in/out``  median in-/out-of-group congruence residual of the       [A1/EXP-2,
-                                converged attention operator                              A3/EXP-10]
+      * ``gauge_resid_in``      worst relative gauge-equivariance residual of the        [A1/EXP-2,
+                                projected routing and readout over layers (float64)       A3/EXP-10]
+                                (``viz.extract.projected_gauge_equivariance``)
 
     Each probe is isolated: a failure (e.g. OOM on the O(N^2 K^2) Omega at large K) is logged and
-    drops that scalar, never crashing the cell. The dominant cost is building Omega inside
-    ``converged_state``; the experiment sweeps run at the baseline K=20, where it is cheap.
+    drops that scalar, never crashing the cell. The dominant cost is the diagnostic forward inside
+    ``readout_state``; the experiment sweeps run at the baseline K=20, where it is cheap.
     """
     out: Dict[str, Any] = {}
     try:
         batch = next(iter(loader))
         token_ids = (batch[0] if isinstance(batch, (tuple, list)) else batch).to(device)
-        cstate = converged_state(model, token_ids)
-    except Exception as exc:                                  # converged-state replay failed wholesale
-        logger.warning("  [diagnostics: converged_state failed] %s", exc)
+        cstate = readout_state(model, token_ids)
+    except Exception as exc:                                  # readout replay failed wholesale
+        logger.warning("  [diagnostics: readout_state failed] %s", exc)
         return out
 
     def _probe(name: str, fn) -> None:
@@ -1877,15 +1834,10 @@ def _cell_diagnostics(
             return torch.cat([r["mu_residual"], r["sigma_residual"]]).median()
         _probe("builder_resid", _builder_resid)
 
-    try:
-        res = gauge_equivariance_residual(
-            cstate["mu"], cstate["sigma"], cstate["omega"], model.group,
-            kappa=cfg.kappa_beta, renyi_order=cfg.renyi_order, kl_max=cfg.kl_max,
-            eps=cfg.eps, divergence_family=cfg.divergence_family, diagonal=diag)
-        out["gauge_resid_in"]  = float(res["energy_in_group"].median())
-        out["gauge_resid_out"] = float(res["energy_out_group"].median())
-    except Exception as exc:
-        logger.warning("  [diagnostics: gauge_resid skipped] %s", exc)
+    def _gauge_resid() -> float:
+        res = projected_gauge_equivariance(model, token_ids)["residuals"]
+        return max(max(per_layer) for per_layer in res.values())
+    _probe("gauge_resid_in", _gauge_resid)
 
     # Dong rank-one residual r(X) of the converged per-token mean cloud (F2/EXP-7). The final-layer
     # scalar is a CSV column (a cheap rank-collapse readout for every diagnostics sweep); the full
@@ -1898,19 +1850,9 @@ def _cell_diagnostics(
     except Exception as exc:
         logger.warning("  [diagnostics: rank_resid_by_layer skipped] %s", exc)
 
-    # -tau^{-1} Cov_beta(E, dE) attention-entropy gradient gap (C1/EXP-4): the magnitude of the
-    # belief gradient the canonical entropy term adds over the surrogate, on the converged belief.
-    # Gated to L=1: the extractor builds the single-block operating point, so it would report a
-    # misleading layer-1 value on the L>1 cells of other sweeps (gauge_transport L2, rho_handoff L4).
-    if cfg.n_layers == 1:
-        _probe("cov_gap", lambda: attention_entropy_cov_gap(model, token_ids)["cov_gap"])
-
-    # kl_max saturation fraction of the converged pairwise energy (B2/EXP-12): for Renyi alpha>1 the
-    # non-PD blend pins E_ij at kl_max with zero gradient, so this fraction climbs in the alpha>1 tail
-    # and explains a non-monotone H(beta)-vs-alpha curve.
-    _probe("energy_klmax_frac", lambda: guard_saturation(
-        cstate["sigma"], cstate["energy"], cstate["self_div"], diagonal=diag,
-        eps=cfg.eps, sigma_max=cfg.sigma_max, kl_max=cfg.kl_max)["energy_klmax_frac"])
+    # kl_max saturation fraction of the pre-update routing energy (B2/EXP-12), as computed by
+    # readout_state's guard.
+    _probe("energy_klmax_frac", lambda: cstate["guard"]["energy_klmax_frac"])
     return out
 
 
@@ -2213,8 +2155,8 @@ _CSV_COLUMNS = [
     "block_mlp_intertwiner_compatible", "on_gauge_pure_path", "on_causal_lm_path",
     "transport_exactness_status", "on_theory_pure_path",
     # opt-in per-cell converged-state diagnostics (S2; empty unless the sweep sets collect_diagnostics)
-    "attn_entropy", "omega_identity_dev", "builder_resid", "gauge_resid_in", "gauge_resid_out",
-    "rank_resid", "cov_gap", "energy_klmax_frac",
+    "attn_entropy", "omega_identity_dev", "builder_resid", "gauge_resid_in",
+    "rank_resid", "energy_klmax_frac",
     # opt-in paired-token artifact identity (PB-07; empty unless the sweep sets paired_token_bootstrap)
     "paired_token_bootstrap", "val_token_nats_path", "val_token_nats_sha256",
     "val_token_nats_size_bytes", "val_token_nats_numel", "val_token_nats_dtype",
@@ -2222,14 +2164,13 @@ _CSV_COLUMNS = [
 ]
 
 _DIAGNOSTIC_RESULT_KEYS = {
-    "attn_entropy", "omega_identity_dev", "builder_resid", "gauge_resid_in", "gauge_resid_out",
-    "rank_resid", "rank_resid_by_layer", "cov_gap", "energy_klmax_frac",
+    "attn_entropy", "omega_identity_dev", "builder_resid", "gauge_resid_in",
+    "rank_resid", "rank_resid_by_layer", "energy_klmax_frac",
 }
 _BASE_REQUIRED_DIAGNOSTIC_KEYS = {
     "attn_entropy",
     "energy_klmax_frac",
     "gauge_resid_in",
-    "gauge_resid_out",
     "omega_identity_dev",
     "rank_resid",
 }
@@ -4645,48 +4586,6 @@ def _plot_rank_collapse(sweep_dir: Path, fig_dir: Path) -> None:
     print(f"  figure -> {out}")
 
 
-def _plot_attention_entropy(sweep_dir: Path, fig_dir: Path) -> None:
-    r"""Write the C1/EXP-4 figures -- the canonical-vs-surrogate PPL gap (grouped by kappa) and the
-    -tau^{-1} Cov_beta gradient-gap magnitude vs kappa -- from the per-cell ``include_attention_entropy``
-    / ``kappa_beta`` overrides and the ``cov_gap`` diagnostic. A no-op unless >= 2 finished cells carry
-    an ``include_attention_entropy`` override, so it is safe to call after every sweep (only the
-    attention_entropy sweep produces these)."""
-    cells_ppl, cells_gap = [], []
-    for r in _collect_sweep_results(sweep_dir):
-        ov = r.get("overrides", {}) or {}
-        if "include_attention_entropy" not in ov or _as_float(r.get("primary_val_ppl")) >= float("inf"):
-            continue
-        kap = _as_float(ov.get("kappa_beta", BASELINE_CONFIG.get("kappa_beta")))
-        if kap >= float("inf"):                                  # non-scalar kappa (per-head list) -> skip
-            continue
-        ent = bool(ov["include_attention_entropy"])
-        cells_ppl.append({"include_attention_entropy": ent, "kappa": kap,
-                          "ppl": _as_float(r.get("primary_val_ppl"))})
-        if _as_float(r.get("cov_gap")) < float("inf"):
-            cells_gap.append({"include_attention_entropy": ent, "kappa": kap,
-                              "cov_gap": _as_float(r.get("cov_gap"))})
-    cells_ppl = _aggregate_cells(cells_ppl, ("include_attention_entropy", "kappa"), ("ppl",))   # M4
-    cells_gap = _aggregate_cells(cells_gap, ("include_attention_entropy", "kappa"), ("cov_gap",))
-    if len(cells_ppl) < 2:
-        return
-    plt = _plt_or_none()
-    if plt is None:
-        return
-    try:
-        from vfe3.viz.figures import plot_cov_gap_vs_kappa, plot_entropy_ppl_gap
-    except Exception as exc:                                  # plotting is best-effort, never fatal
-        print(f"attention-entropy figures unavailable ({exc}); skipping")
-        return
-    fig_dir.mkdir(exist_ok=True)
-    out = fig_dir / f"{sweep_dir.name}_ppl_gap.png"
-    _save_ablation_figure(plot_entropy_ppl_gap(cells_ppl), out, sweep_dir, plt)
-    print(f"  figure -> {out}")
-    if len(cells_gap) >= 2:
-        out = fig_dir / f"{sweep_dir.name}_cov_gap.png"
-        _save_ablation_figure(plot_cov_gap_vs_kappa(cells_gap), out, sweep_dir, plt)
-        print(f"  figure -> {out}")
-
-
 def _compatible_cell_dirs(sweep_dir: Path) -> List[Path]:
     """Return only cell directories admitted by the persisted aggregation contract."""
     return [
@@ -5116,7 +5015,6 @@ def _render_sweep_figures(sweep_dir: Path, fig_dir: Path) -> None:
     _plot_one_sweep(sweep_dir, fig_dir)
     _plot_seed_aggregate(sweep_dir, fig_dir)
     _plot_rank_collapse(sweep_dir, fig_dir)
-    _plot_attention_entropy(sweep_dir, fig_dir)
     _plot_wallclock_convergence(sweep_dir, fig_dir)
     _plot_gauge_transport(sweep_dir, fig_dir)
     _plot_cg_coupling(sweep_dir, fig_dir)

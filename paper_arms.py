@@ -122,7 +122,7 @@ WIP_FLIPPED_DEFAULTS: Dict[str, Any] = {
 }
 
 # Fields VFE3Config.__post_init__ sets when gauge_transport='off' (identity frame, frozen).
-GAUGE_OFF_COERCED: Tuple[str, ...] = ("phi_scale", "pos_phi", "e_phi_lr", "m_phi_lr")
+GAUGE_OFF_COERCED: Tuple[str, ...] = ("phi_scale", "pos_phi", "m_phi_lr")
 
 
 # ----------------------------------------------------------------------------------------------
