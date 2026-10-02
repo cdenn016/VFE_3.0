@@ -220,7 +220,7 @@ def test_config_state_and_control_activity_round_trip() -> None:
     [
         {"family": "gaussian_diagonal_exact"},
         {"family": "gaussian_frame_diagonal"},
-        {"lambda_alpha_mode": "state_dependent"},
+        {"lambda_alpha_mode": "state_dependent_per_coord", "family": "gaussian_full"},
     ],
 )
 def test_unsupported_gradient_envelopes_are_rejected(overrides: dict[str, Any]) -> None:

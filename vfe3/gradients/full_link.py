@@ -8,6 +8,12 @@ Two receiver laws share one quadratic energy family (projected_gradient.tex, Eq.
 receiver entropy c = alpha + sum_h lambda_h times. ``channel_likelihood`` scores the receiver's
 partial law O_h^T xi_i against the sender's d-dimensional message as an expected likelihood and
 counts it once (c = alpha).
+
+A state-dependent self-coupling alpha*(D) = c0/(b0 + D), D = KL(q_i||p_i) (summed per token, or per
+local coordinate on the diagonal family), is profiled out (projected_gradient.tex, Sec. profiled
+self-coupling): the receiver energy becomes c0 log(b0 + D) + G(q), its exact force is alpha*(q) dD/dq
++ dG/dq, and freezing alpha at the current state gives a majorizer whose exact minimizer is the
+existing closed form.
 """
 
 import math
@@ -16,6 +22,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
+from vfe3.alpha_i import alpha_gradient_coefficient
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.families.base import safe_kl_clamp
 from vfe3.free_energy import attention_weights
@@ -42,6 +49,124 @@ class FullLinkContext:
     c:      torch.Tensor       # (..., N), entropy multiplicity: alpha + sum_h lambda_h (ambient) or alpha (channel)
     beta:   torch.Tensor       # (..., H, N, N), fixed-value projected Q/K routing
     score:  torch.Tensor       # (..., H, N, N), routing cost, distinct from receiving energy
+    profile: Optional["SelfCouplingProfile"] = None   # state-dependent alpha; None = constant alpha
+
+
+@dataclass(frozen=True)
+class SelfCouplingProfile:
+    r"""Coupling-only receiver coefficients and the layer prior for a profiled self-coupling.
+
+    .. math::
+        E_i(q)=c_0\log(b_0+D_i(q))+G_i(q),\qquad D_i=\mathrm{KL}(q_i\|p_i),
+
+    with G the receiver energy at alpha = 0 (coefficients Lambda_c, eta_c and entropy multiplicity
+    m = sum_h lambda_h under ambient_alignment, 0 under channel_likelihood). ``per_coord`` replaces
+    c0 log(b0+D) by sum_k c0_k log(b0_k + D_ik) over local coordinates of the diagonal family.
+    """
+
+    mode:            str                      # 'state_dependent' | 'state_dependent_per_coord'
+    b0:              'float | torch.Tensor'   # scalar, or (K,) per coordinate
+    c0:              'float | torch.Tensor'
+    mu_p:            torch.Tensor             # (..., N, K), layer prior mean (local coordinates)
+    sigma_p:         torch.Tensor             # (..., N, K) or (..., N, K, K)
+    prior_precision: torch.Tensor             # (..., N, K, K)
+    prior_eta:       torch.Tensor             # (..., N, K), Sigma_p^{-1} mu_p
+    prior_logdet:    torch.Tensor             # (..., N), log det Sigma_p
+    Lambda:          torch.Tensor             # (..., N, K, K), coupling-only precision
+    eta:             torch.Tensor             # (..., N, K), coupling-only natural mean
+    mass:            torch.Tensor             # (..., N), coupling-only entropy multiplicity
+
+    @property
+    def per_coord(self) -> bool:
+        return self.mode == "state_dependent_per_coord"
+
+
+_PROFILED_MODES = ("state_dependent", "state_dependent_per_coord")
+FULL_LINK_ALPHA_MODES = ("constant",) + _PROFILED_MODES
+
+
+def self_coupling_divergence(
+    mu:      torch.Tensor,                   # (..., N, K)
+    sigma:   torch.Tensor,                   # (..., N, K) or (..., N, K, K)
+    profile: SelfCouplingProfile,
+) -> torch.Tensor:
+    r"""Exact, unclamped KL(q_i||p_i), per token (..., N) or per local coordinate (..., N, K).
+
+    .. math::
+        D_i=\tfrac12\bigl[\operatorname{tr}(\Sigma_p^{-1}\Sigma)+(\mu-\mu_p)^\top\Sigma_p^{-1}(\mu-\mu_p)
+            -K+\log\det\Sigma_p-\log\det\Sigma\bigr],\qquad
+        D_{ik}=\tfrac12\Bigl[\frac{s_k}{p_k}+\frac{(\mu_k-\mu_{p,k})^2}{p_k}-1-\log\frac{s_k}{p_k}\Bigr].
+
+    No kl_max ceiling: a clamp would zero the force beyond it and break the envelope identity.
+    """
+    dtype = _compute_dtype(mu, sigma, profile.prior_precision)
+    mean, cov = mu.to(dtype), sigma.to(dtype)
+    delta = mean - profile.mu_p.to(dtype)
+    if profile.per_coord:
+        sigma_p = profile.sigma_p.to(dtype)
+        ratio = cov / sigma_p
+        return .5 * (ratio + delta.square() / sigma_p - 1 - ratio.log())
+    P = profile.prior_precision.to(dtype)
+    quadratic = (delta * (P @ delta.unsqueeze(-1)).squeeze(-1)).sum(-1)
+    if cov.ndim == mean.ndim:
+        trace = (P.diagonal(dim1=-2, dim2=-1) * cov).sum(-1)
+        logdet = cov.log().sum(-1)
+    else:
+        trace = (P * cov.transpose(-1, -2)).sum(dim=(-2, -1))
+        logdet = 2 * torch.linalg.cholesky(cov).diagonal(dim1=-2, dim2=-1).log().sum(-1)
+    return .5 * (trace + quadratic - mean.shape[-1] + profile.prior_logdet.to(dtype) - logdet)
+
+
+def _coeff(value: 'float | torch.Tensor', like: torch.Tensor) -> 'float | torch.Tensor':
+    return value.to(device=like.device, dtype=like.dtype) if torch.is_tensor(value) else value
+
+
+def full_link_context_at(
+    context: FullLinkContext,
+    mu:      torch.Tensor,                   # (..., N, K), current receiver state
+    sigma:   torch.Tensor,
+) -> FullLinkContext:
+    r"""Freeze a state-dependent alpha at the current receiver and return the frozen-alpha context.
+
+    .. math::
+        \alpha_i=\frac{c_0}{b_0+D_i(q)},\quad
+        \Lambda_i=\Lambda_{c,i}+\alpha_i\Sigma_{p,i}^{-1},\quad
+        \eta_i=\eta_{c,i}+\alpha_i\Sigma_{p,i}^{-1}\mu_{p,i},\quad c_i=\alpha_i+m_i.
+
+    Per coordinate, alpha_i Sigma_p^{-1} becomes diag(alpha_ik / p_ik) and c_i the vector
+    alpha_ik + m_i. The returned context's force alpha* dD/dq + dG/dq is the exact gradient of the
+    profiled energy (envelope theorem), and its minimizer is the MM step. alpha keeps its graph: the
+    force value is unchanged, and the unrolled outer derivative of the force map needs d alpha*/d theta.
+    A constant-alpha context is returned unchanged.
+    """
+    profile = context.profile
+    if profile is None:
+        return context
+    with torch.autocast(device_type=mu.device.type, enabled=False):
+        D = self_coupling_divergence(mu, sigma, profile)                 # (..., N) or (..., N, K)
+        alpha = alpha_gradient_coefficient(
+            D, b0=_coeff(profile.b0, D), c0=_coeff(profile.c0, D), mode=profile.mode)
+        if profile.per_coord:
+            sigma_p = profile.sigma_p.to(D.dtype)
+            Lambda = profile.Lambda + torch.diag_embed(alpha / sigma_p)
+            eta = profile.eta + alpha * profile.mu_p.to(D.dtype) / sigma_p
+            c = alpha + profile.mass.unsqueeze(-1)                       # (..., N, K)
+        else:
+            Lambda = profile.Lambda + alpha[..., None, None] * profile.prior_precision
+            eta = profile.eta + alpha.unsqueeze(-1) * profile.prior_eta
+            c = alpha + profile.mass                                     # (..., N)
+    return FullLinkContext(Lambda, eta, c, context.beta, context.score, profile)
+
+
+def _diagonal_weight(c: torch.Tensor, mu: torch.Tensor) -> torch.Tensor:
+    r"""Broadcast an entropy multiplicity to diagonal variances: (..., N) -> (..., N, 1); (..., N, K) kept."""
+    return c if c.ndim == mu.ndim else c.unsqueeze(-1)
+
+
+def _scalar_weight(c: torch.Tensor, mu: torch.Tensor) -> torch.Tensor:
+    if c.ndim == mu.ndim:
+        raise ValueError("per-coordinate entropy weights exist only on the diagonal family")
+    return c
 
 
 def _head_weights(
@@ -183,6 +308,9 @@ def build_full_link_context(
     log_prior:      Optional[torch.Tensor] = None,
     value_frame:    Optional[CanonicalFrameContext] = None,
     capture:        Optional[Dict[str, Any]] = None,
+    lambda_alpha_mode: str                = "constant",
+    b0:             'float | torch.Tensor' = 1.0,
+    c0:             'float | torch.Tensor' = 1.0,
 ) -> FullLinkContext:
     r"""Snapshot beta and source laws once for receiver filtering with noisy full L links.
 
@@ -207,7 +335,21 @@ def build_full_link_context(
     Neither source nor router is detached. Reuse this context with independent
     receiver arguments to get inner partials while preserving the outer graph.
     relational_score retains its head-block frame contract (block_glk heads or so_n irrep blocks).
+
+    A state-dependent ``lambda_alpha_mode`` ignores ``value``: the context carries a
+    SelfCouplingProfile (coupling-only coefficients and the layer prior) and is returned frozen at
+    alpha*(q) of the snapshot (mu, sigma), which is the episode's initial receiver state;
+    full_link_context_at refreshes alpha at later states. ``state_dependent_per_coord`` requires the
+    diagonal family with a diagonal prior, where KL(q_i||p_i) separates over local coordinates.
     """
+    if lambda_alpha_mode not in FULL_LINK_ALPHA_MODES:
+        raise ValueError(f"full-link inference supports lambda_alpha_mode in {FULL_LINK_ALPHA_MODES}, "
+                         f"got {lambda_alpha_mode!r}")
+    profiled = lambda_alpha_mode != "constant"
+    if lambda_alpha_mode == "state_dependent_per_coord" and (
+            sigma.ndim != mu.ndim or sigma_p.ndim != mu_p.ndim):
+        raise ValueError("state_dependent_per_coord on the full-link receiver requires the diagonal family "
+                         "and a diagonal prior: KL(q_i||p_i) separates over local coordinates only there")
     if operators.input_scope != "full" or operators.output_scope != "full" or operators.T is None:
         raise ValueError("full-link inference requires learned full input/output content maps")
     if operators.routing != "gaussian_kl":
@@ -217,7 +359,7 @@ def build_full_link_context(
     if not math.isfinite(value) or value < 0:
         raise ValueError("value must be a finite nonnegative prior coefficient")
     channel = operators.receiver_law == "channel_likelihood"
-    if channel and value <= 0:
+    if channel and value <= 0 and not profiled:
         raise ValueError("channel_likelihood requires a positive prior coefficient (its only entropy term)")
     channel_frame = value_frame or frame
     dtype = _compute_dtype(mu, sigma, mu_p, sigma_p, frame.inverse,
@@ -245,6 +387,23 @@ def build_full_link_context(
             prior_precision = torch.diag_embed(sigma_p.to(dtype).reciprocal())
         else:
             prior_precision = torch.cholesky_inverse(torch.linalg.cholesky(sigma_p.to(dtype)))
+        if profiled:
+            mass = weights.sum(dim=(-3, -1))                             # (..., I)
+            if sigma_p.ndim == mu_p.ndim:
+                prior_logdet = sigma_p.to(dtype).log().sum(-1)
+            else:
+                prior_logdet = 2 * torch.linalg.cholesky(sigma_p.to(dtype)).diagonal(
+                    dim1=-2, dim2=-1).log().sum(-1)
+            profile = SelfCouplingProfile(
+                lambda_alpha_mode, b0, c0, mu_p.to(dtype), sigma_p.to(dtype), prior_precision,
+                (prior_precision @ mu_p.to(dtype).unsqueeze(-1)).squeeze(-1), prior_logdet,
+                Lambda, eta, torch.zeros_like(mass) if channel else mass)
+            context = full_link_context_at(
+                FullLinkContext(Lambda, eta, mass, beta, score, profile), mu_work, sigma_work)
+            if capture is not None:
+                capture.update(beta_pre=beta.detach(), score_energy_pre=score.detach(),
+                               full_link_context=context)
+            return context
         Lambda = Lambda + value * prior_precision
         eta = eta + value * (prior_precision @ mu_p.to(dtype).unsqueeze(-1)).squeeze(-1)
         mass = weights.sum(dim=(-3, -1))                                 # (..., I)
@@ -273,18 +432,20 @@ def full_link_gradients(
         G_{\Sigma_i}=\frac{1}{2}(\Lambda_i-c_i\Sigma_i^{-1}).
 
     A diagonal recognition family varies only the diagonal covariance entries,
-    giving G_sigma,k = (Lambda_kk-c/sigma_k)/2. The dense precision still enters
-    the mean force; no head partition or diagonal target projection is applied.
+    giving G_sigma,k = (Lambda_kk-c/sigma_k)/2 (c_k per coordinate under a per-coordinate alpha).
+    The dense precision still enters the mean force; no head partition or diagonal target
+    projection is applied. For a profiled context, pass full_link_context_at(context, mu, sigma):
+    its partials are the exact profiled-energy gradient alpha*(q) dD/dq + dG/dq.
     """
     dtype = _compute_dtype(mu, sigma, context.Lambda)
     with torch.autocast(device_type=mu.device.type, enabled=False):
         Lambda, eta, c = context.Lambda.to(dtype), context.eta.to(dtype), context.c.to(dtype)
         grad_mu = (Lambda @ mu.to(dtype).unsqueeze(-1)).squeeze(-1) - eta
         if sigma.ndim == mu.ndim:
-            grad_sigma = .5 * (Lambda.diagonal(dim1=-2, dim2=-1) - c.unsqueeze(-1) / sigma.to(dtype))
+            grad_sigma = .5 * (Lambda.diagonal(dim1=-2, dim2=-1) - _diagonal_weight(c, mu) / sigma.to(dtype))
         else:
             receiver_precision = torch.cholesky_inverse(torch.linalg.cholesky(sigma.to(dtype)))
-            grad_sigma = .5 * (Lambda - c[..., None, None] * receiver_precision)
+            grad_sigma = .5 * (Lambda - _scalar_weight(c, mu)[..., None, None] * receiver_precision)
     # Never round the float32 force down to a half-precision incoming mean.
     return (grad_mu.to(torch.promote_types(mu.dtype, torch.float32)),
             grad_sigma.to(torch.promote_types(sigma.dtype, torch.float32)))
@@ -304,8 +465,22 @@ def full_link_cost(
 
     Target/prior normalizers and beta entropy are omitted. This scalar checks
     receiver descent with a fixed context; it is not a normalized VFE or the
-    full parameter-dependent training objective.
+    full parameter-dependent training objective. A profiled context returns the profiled energy
+
+    .. math::
+        E=\sum_i\bigl[c_0\log(b_0+D_i)+G_i\bigr]
+
+    (per coordinate: sum_ik c0_k log(b0_k + D_ik)), with G the coupling-only cost; the value does
+    not depend on the alpha snapshot the context was frozen at.
     """
+    if context.profile is not None:
+        profile = context.profile
+        coupling = full_link_cost(mu, sigma, FullLinkContext(
+            profile.Lambda, profile.eta, profile.mass, context.beta, context.score))
+        with torch.autocast(device_type=mu.device.type, enabled=False):
+            D = self_coupling_divergence(mu, sigma, profile)
+            self_term = _coeff(profile.c0, D) * torch.log(_coeff(profile.b0, D) + D)
+        return coupling + self_term.sum()
     dtype = _compute_dtype(mu, sigma, context.Lambda)
     with torch.autocast(device_type=mu.device.type, enabled=False):
         mean, covariance = mu.to(dtype), sigma.to(dtype)
@@ -345,6 +520,11 @@ def full_link_minimizer(
     restricted minimizer s* = c / Lambda_kk at rho = 1 (partial damping is a declared choice).
     With ``update_sigma=False`` the covariance is kept and the mean moves to
     (1 - rho) mu + rho mu*. Autograd through the solves gives the implicit outer derivative.
+
+    A per-coordinate entropy weight c_k (diagonal family, state_dependent_per_coord) gives
+    J*_k = Lambda_kk / c_k: the diagonal-family energy separates its variance terms per coordinate,
+    so this remains the exact restricted minimizer. For a profiled context frozen at alpha*(q), the
+    rho = 1 update is a majorize-minimize step on the profiled energy.
     """
     dtype = _compute_dtype(mu, sigma, context.Lambda)
     with torch.autocast(device_type=mu.device.type, enabled=False):
@@ -357,7 +537,7 @@ def full_link_minimizer(
             new_mu = mu_star if damping == 1.0 else (1 - damping) * mean + damping * mu_star
             return new_mu.to(torch.promote_types(mu.dtype, torch.float32)), sigma
         if diagonal:
-            J_star = Lambda.diagonal(dim1=-2, dim2=-1) / c.unsqueeze(-1)
+            J_star = Lambda.diagonal(dim1=-2, dim2=-1) / _diagonal_weight(c, mu)
             if damping == 1.0:
                 new_mu, new_sigma = mu_star, J_star.reciprocal()
             else:
@@ -366,6 +546,7 @@ def full_link_minimizer(
                 new_mu = new_sigma * ((1 - damping) * mean / cov + damping * J_star * mu_star)
             new_sigma = new_sigma.clamp(min=eps, max=sigma_max) if sigma_max is not None else new_sigma.clamp(min=eps)
         else:
+            c = _scalar_weight(c, mu)
             if damping == 1.0:
                 new_mu = mu_star
                 new_sigma = c[..., None, None] * torch.cholesky_inverse(factor)
@@ -394,7 +575,8 @@ def full_link_cost_parts(
         F_\Sigma=\sum_i\Bigl[\tfrac12\operatorname{tr}(\Lambda_i\Sigma_i)-\tfrac{c_i}{2}\log\det\Sigma_i\Bigr].
 
     F_mu + F_Sigma equals full_link_cost up to a receiver-independent constant. Returns
-    (F_mu, F_Sigma, sum_i ||mu_i - mu_i*||).
+    (F_mu, F_Sigma, sum_i ||mu_i - mu_i*||). For a profiled self-coupling, pass the context frozen at
+    the evaluated state (full_link_context_at); the parts then split that frozen-alpha energy.
     """
     dtype = _compute_dtype(mu, sigma, context.Lambda)
     with torch.autocast(device_type=mu.device.type, enabled=False):
@@ -405,7 +587,10 @@ def full_link_cost_parts(
         mean_part = .5 * (delta * (Lambda @ delta.unsqueeze(-1)).squeeze(-1)).sum()
         if sigma.ndim == mu.ndim:
             trace = (Lambda.diagonal(dim1=-2, dim2=-1) * covariance).sum(-1)
-            logdet = covariance.log().sum(-1)
+            if c.ndim == mu.ndim:                                        # per-coordinate weights
+                logdet, c = (c * covariance.log()).sum(-1), 1.0
+            else:
+                logdet = covariance.log().sum(-1)
         else:
             trace = (Lambda * covariance.transpose(-1, -2)).sum(dim=(-2, -1))
             logdet = torch.logdet(covariance)

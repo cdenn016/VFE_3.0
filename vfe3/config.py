@@ -735,14 +735,12 @@ class VFE3Config:
                              f"{_SUPPORTED_GAUGE_GROUPS}")
         _require(self.gauge_group, _SUPPORTED_GAUGE_GROUPS, "gauge_group")
         full_link = self.attention_mode == "projected_gradient"
-        if self.attention_residual and full_link:
-            raise ValueError("attention_residual requires attention_mode='projected_predictive'")
+        # attention_residual and predictive_covariance are predictive-readout knobs; under
+        # projected_gradient they are inactive (inactive_fields), not errors.
         _require(self.relational_routing, ("gaussian_kl", "noisy_query"), "relational_routing")
         if self.relational_routing == "noisy_query" and full_link:
             raise ValueError("relational_routing='noisy_query' requires attention_mode='projected_predictive'")
         _require(self.predictive_covariance, ("passthrough", "moment_matched"), "predictive_covariance")
-        if self.predictive_covariance == "moment_matched" and full_link:
-            raise ValueError("predictive_covariance='moment_matched' requires attention_mode='projected_predictive'")
         if (isinstance(self.predictive_covariance_floor, bool)
                 or not isinstance(self.predictive_covariance_floor, Real)
                 or not math.isfinite(float(self.predictive_covariance_floor))
@@ -766,12 +764,15 @@ class VFE3Config:
         if full_link and self.n_e_steps < 1:
             raise ValueError("attention_mode='projected_gradient' requires n_e_steps >= 1; "
                              "n_e_steps=0 would remove attention from every layer")
-        if (full_link and self.relational_receiver_law == "ambient_alignment"
+        # A state-dependent alpha* = c0/(b0 + D) is positive (c0 > 0), so only constant alpha can
+        # leave the receiver without mass or the channel law without its entropy term.
+        constant_alpha = self.lambda_alpha_mode == "constant"
+        if (full_link and constant_alpha and self.relational_receiver_law == "ambient_alignment"
                 and isinstance(self.lambda_alpha, Real) and self.lambda_alpha <= 0
                 and isinstance(self.lambda_beta, Real) and self.lambda_beta <= 0):
             raise ValueError("projected_gradient needs lambda_alpha > 0 or lambda_beta > 0: "
                              "otherwise the receiver energy has no mass")
-        if (full_link and self.relational_receiver_law == "channel_likelihood"
+        if (full_link and constant_alpha and self.relational_receiver_law == "channel_likelihood"
                 and not (isinstance(self.lambda_alpha, Real) and self.lambda_alpha > 0)):
             raise ValueError("relational_receiver_law='channel_likelihood' requires lambda_alpha > 0: "
                              "the prior divergence carries the receiver's only entropy term")
@@ -780,8 +781,16 @@ class VFE3Config:
         incompatible = []
         if not full_link and self.n_e_steps != 1:
             incompatible.append(f"n_e_steps={self.n_e_steps!r} (requires 1)")
-        if full_link and self.lambda_alpha_mode != "constant":
-            incompatible.append(f"lambda_alpha_mode={self.lambda_alpha_mode!r} (requires 'constant')")
+        # The receiver profiles the closed-form alpha forms (projected_gradient.tex, profiled
+        # self-coupling); per coordinate, KL(q||p) separates only on the diagonal family.
+        if full_link and self.lambda_alpha_mode not in (
+                "constant", "state_dependent", "state_dependent_per_coord"):
+            incompatible.append(f"lambda_alpha_mode={self.lambda_alpha_mode!r} (requires 'constant', "
+                                "'state_dependent' or 'state_dependent_per_coord')")
+        if (full_link and self.lambda_alpha_mode == "state_dependent_per_coord"
+                and self.family != "gaussian_diagonal"):
+            incompatible.append(f"lambda_alpha_mode='state_dependent_per_coord' with family={self.family!r} "
+                                "(requires gaussian_diagonal)")
         if self.encode_mode not in ("per_token", "per_token_additive"):
             incompatible.append(
                 f"encode_mode={self.encode_mode!r} (requires 'per_token' or 'per_token_additive')")
@@ -1699,8 +1708,10 @@ class VFE3Config:
             mark(("projected_factor_route",),
                  "the noisy-query cost factors per-pair sums G_q + G_k and keeps the Gram route")
         if self.attention_mode != "projected_predictive":
-            mark(("predictive_covariance", "predictive_covariance_floor"),
-                 "only read by attention_mode='projected_predictive'")
+            mark(("predictive_covariance", "predictive_covariance_floor", "attention_residual"),
+                 "only read by attention_mode='projected_predictive': the gradient receiver's covariance "
+                 "comes from its receiver update, and its self-information enters through "
+                 "alpha KL(q||p) and the closed-form damping")
         elif self.predictive_covariance == "passthrough":
             mark(("predictive_covariance_floor",),
                  "only read by predictive_covariance='moment_matched'")
@@ -1743,6 +1754,8 @@ class VFE3Config:
             mark(("unigram_kappa",), "needs decode_unigram_prior=True")
         if self.lambda_alpha_mode == "constant":
             mark(("b0", "c0"), "only read by a state_dependent lambda_alpha_mode")
+        else:
+            mark(("lambda_alpha",), "only read by lambda_alpha_mode='constant'")
         if self.pos_rotation == "none":
             mark(("rope_on_value", "rope_base"), "only read by pos_rotation='rope'")
         if self.pos_phi == "none":

@@ -333,18 +333,23 @@ class VFEModel(nn.Module):
         # stack of near-uniform routing at init does not add a unit-gain token mean per layer.
         output_init_scale = (1.0 / math.sqrt(2.0 * cfg.n_layers)
                              if cfg.relational_output_init == "depth_scaled" else 1.0)
+        # The residual and the moment-matched covariance are predictive-readout knobs; the gradient
+        # receiver ignores them (its covariance comes from the receiver update and its
+        # self-information from alpha KL(q||p)), so they reach only predictive operators.
+        predictive = cfg.relational_readout_mode == "predictive_content"
         layers = [
             RelationalOperators(list(self.group.irrep_dims),
                                 _derived_seed(cfg.seed, "relational_operators", layer_index),
                                 readout_mode=cfg.relational_readout_mode,
-                                attention_residual=cfg.attention_residual,
+                                attention_residual=cfg.attention_residual and predictive,
                                 output_init_scale=output_init_scale,
                                 receiver_noise=cfg.relational_receiver_noise,
                                 receiver_law=cfg.relational_receiver_law,
                                 receiver_update=cfg.relational_receiver_update,
                                 receiver_damping=cfg.relational_receiver_damping,
                                 routing=cfg.relational_routing,
-                                predictive_covariance=cfg.predictive_covariance,
+                                predictive_covariance=(cfg.predictive_covariance if predictive
+                                                       else "passthrough"),
                                 predictive_covariance_floor=cfg.predictive_covariance_floor)
             for layer_index in range(cfg.n_layers)
         ]

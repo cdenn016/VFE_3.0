@@ -2,7 +2,6 @@
 
 from tests.profiles import test_config
 import itertools
-import re
 from dataclasses import asdict, dataclass
 
 import pytest
@@ -275,10 +274,9 @@ def _cfg(**overrides: object) -> VFE3Config:
 
 def test_config_validation_and_serialization(monkeypatch: pytest.MonkeyPatch) -> None:
     assert test_config(predictive_covariance="passthrough").predictive_covariance == "passthrough"
-    for mode in ("projected_gradient",):
-        with pytest.raises(ValueError, match=re.escape(
-                "predictive_covariance='moment_matched' requires attention_mode='projected_predictive'")):
-            test_config(attention_mode=mode, predictive_covariance="moment_matched")
+    # Inactive, not rejected, on the gradient route (its covariance comes from the receiver update).
+    gradient = test_config(attention_mode="projected_gradient", predictive_covariance="moment_matched")
+    assert "predictive_covariance" in gradient.inactive_fields()
     with pytest.raises(ValueError, match="predictive_covariance"):
         _cfg(predictive_covariance="full")
     for bad in (0.0, -1e-3, float("inf"), True):
