@@ -17,8 +17,8 @@ if TYPE_CHECKING:
 from vfe3.belief import BeliefState
 from vfe3.contracts import CanonicalFrameContext, EStepGradientRecord
 from vfe3.gradients.full_link import (
-    FullLinkContext, build_full_link_context, full_link_cost, full_link_cost_parts,
-    full_link_gradients, full_link_minimizer,
+    FULL_LINK_ALPHA_MODES, FullLinkContext, build_full_link_context, full_link_context_at,
+    full_link_cost, full_link_cost_parts, full_link_gradients, full_link_minimizer,
 )
 from vfe3.gradients.relational import relational_predictive_readout
 from vfe3.families.base import get_family
@@ -211,6 +211,8 @@ def e_step_iteration(
     skip_belief_sigma_update:  bool = False,             # freeze the belief sigma through this iteration (no grad, no retraction)
     family:                    str  = "gaussian_diagonal",
     lambda_alpha_mode:         str  = "constant",
+    b0:                        'float | torch.Tensor' = 1.0,   # state-dependent alpha* = c0/(b0 + D)
+    c0:                        'float | torch.Tensor' = 1.0,
 
     log_prior:                 Optional[torch.Tensor]        = None,
     grad_record:               Optional[EStepGradientRecord] = None,   # diag out-param: stashes ||grad_mu/sigma/phi|| (None -> no capture)
@@ -229,7 +231,10 @@ def e_step_iteration(
     :math:`(\Sigma\nabla_\mu F, 2\Sigma\nabla_\Sigma F\Sigma)` through the family Fisher metric
     with an SPD retraction (``'euler'``). The realized frame is fixed throughout the episode, the
     source rows are frozen (filtering), the trajectory is unrolled, and the mean trust region is
-    the Mahalanobis ball.
+    the Mahalanobis ball. A state-dependent ``lambda_alpha_mode`` recomputes alpha*(q) = c0/(b0 + D)
+    from the current receiver and the layer prior at every iteration (full_link_context_at): the
+    Euler force is then the exact gradient of the profiled energy, and the closed form is its
+    majorize-minimize step.
     """
     if (relational_operators is None
             or relational_operators.readout_mode not in ("predictive_content", "full_link_update")):
@@ -240,9 +245,11 @@ def e_step_iteration(
         raise ValueError("projected inference requires the realized forward frame")
     full_link = relational_operators.readout_mode == "full_link_update"
     if full_link and (
-            lambda_alpha_mode != "constant"
-            or family not in ("gaussian_diagonal", "gaussian_full")):
-        raise ValueError("full-link filtering requires Gaussian gradient inference, constant alpha, "
+            lambda_alpha_mode not in FULL_LINK_ALPHA_MODES
+            or family not in ("gaussian_diagonal", "gaussian_full")
+            or (lambda_alpha_mode == "state_dependent_per_coord" and family != "gaussian_diagonal")):
+        raise ValueError("full-link filtering requires Gaussian gradient inference, a constant or "
+                         "state-dependent alpha (per coordinate only on gaussian_diagonal), "
                          "and unrolled Fisher steps")
 
     recovery_before = (source_recovery_counter(belief.mu.device)
@@ -264,12 +271,15 @@ def e_step_iteration(
                 belief.mu, belief.sigma, mu_p, sigma_p, relational_frame, relational_operators,
                 tau=tau, lambda_beta=lambda_beta, value=value,
                 receiver_noise=relational_operators.receiver_noise, kl_max=kl_max,
-                value_frame=relational_value_frame, log_prior=log_prior, capture=relational_capture)
+                value_frame=relational_value_frame, log_prior=log_prior, capture=relational_capture,
+                lambda_alpha_mode=lambda_alpha_mode, b0=b0, c0=c0)
             if relational_capture is not None:
                 with torch.no_grad():
                     relational_capture["relational_receiver_cost_before"] = full_link_cost(
                         belief.mu, belief.sigma, _full_link_context).detach()
-        grad_mu, grad_sigma = full_link_gradients(belief.mu, belief.sigma, _full_link_context)
+        # Constant alpha: the episode context itself. State-dependent: alpha frozen at this iterate.
+        iterate_context = full_link_context_at(_full_link_context, belief.mu, belief.sigma)
+        grad_mu, grad_sigma = full_link_gradients(belief.mu, belief.sigma, iterate_context)
         closed_form = relational_operators.receiver_update == "closed_form"
         if grad_record is not None:
             grad_record["mu"] = grad_mu.detach().pow(2).sum().sqrt()
@@ -278,7 +288,7 @@ def e_step_iteration(
             grad_record["phi"] = grad_mu.new_zeros(())
         if closed_form:
             mu, sigma = full_link_minimizer(
-                belief.mu, belief.sigma, _full_link_context,
+                belief.mu, belief.sigma, iterate_context,
                 damping=relational_operators.receiver_damping,
                 update_sigma=not skip_belief_sigma_update, eps=eps, sigma_max=sigma_max)
         else:
@@ -331,6 +341,8 @@ def e_step(
     skip_belief_sigma_update:  bool = False,
     family:                    str  = "gaussian_diagonal",
     lambda_alpha_mode:         str  = "constant",
+    b0:                        'float | torch.Tensor' = 1.0,   # state-dependent alpha* = c0/(b0 + D)
+    c0:                        'float | torch.Tensor' = 1.0,
 
     grad_record:                 Optional[EStepGradientRecord] = None,   # diag out-param: LAST iteration's belief-grad norms
     state_record:                Optional[dict]                = None,   # diag out-param: every executed receiver iterate
@@ -366,7 +378,8 @@ def e_step(
             belief.mu, belief.sigma, mu_p, sigma_p, relational_frame, relational_operators,
             tau=tau, lambda_beta=lambda_beta, value=value,
             receiver_noise=relational_operators.receiver_noise, kl_max=kl_max,
-            value_frame=relational_value_frame, log_prior=log_prior, capture=relational_capture)
+            value_frame=relational_value_frame, log_prior=log_prior, capture=relational_capture,
+            lambda_alpha_mode=lambda_alpha_mode, b0=b0, c0=c0)
         if relational_capture is not None:
             with torch.no_grad():
                 relational_capture["relational_receiver_cost_before"] = full_link_cost(
@@ -384,7 +397,7 @@ def e_step(
             e_q_mu_lr=e_q_mu_lr, e_q_sigma_lr=e_q_sigma_lr, value=value, lambda_beta=lambda_beta,
             kl_max=kl_max, eps=eps, sigma_max=sigma_max, e_sigma_q_trust=e_sigma_q_trust,
             e_mu_q_trust=e_mu_q_trust, skip_belief_sigma_update=skip_belief_sigma_update,
-            family=family, lambda_alpha_mode=lambda_alpha_mode,
+            family=family, lambda_alpha_mode=lambda_alpha_mode, b0=b0, c0=c0,
             grad_record=grad_record, log_prior=log_prior,
             relational_operators=relational_operators,
             relational_frame=relational_frame,
@@ -405,7 +418,7 @@ def e_step(
                 belief.mu - episode_start.mu).norm().detach()
             for tag, state in (("before", episode_start), ("after", belief)):
                 mean_part, covariance_part, distance = full_link_cost_parts(
-                    state.mu, state.sigma, full_link_context)
+                    state.mu, state.sigma, full_link_context_at(full_link_context, state.mu, state.sigma))
                 relational_capture[f"relational_receiver_mean_cost_{tag}"] = mean_part.detach()
                 relational_capture[f"relational_receiver_covariance_cost_{tag}"] = covariance_part.detach()
                 relational_capture[f"relational_receiver_target_distance_{tag}"] = distance.detach()

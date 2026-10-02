@@ -36,14 +36,15 @@ def e_step_shared_kwargs(
 
     It holds exactly the configuration the projected receiver reads (``e_step`` takes no
     ``**kwargs``, so a stale knob raises ``TypeError``). Runtime objects (tau, lambda_beta,
-    log_prior, relational operators and frames) stay per-call-site. ``device`` is unused (no coefficient tensor is
-    built any more) and kept for the existing call sites.
+    log_prior, relational operators and frames) stay per-call-site. ``device`` places a per-coordinate
+    (list-valued) b0/c0 for the state-dependent self-coupling.
     """
     return dict(
         value=cfg.lambda_alpha, kl_max=cfg.kl_max, eps=cfg.eps,
         sigma_max=cfg.sigma_max, e_sigma_q_trust=cfg.e_sigma_q_trust,
         e_mu_q_trust=cfg.e_mu_q_trust,
         family=cfg.family, lambda_alpha_mode=cfg.lambda_alpha_mode,
+        b0=_as_coeff(cfg.b0, device), c0=_as_coeff(cfg.c0, device),
         skip_belief_sigma_update=cfg.skip_belief_sigma_update,
     )
 

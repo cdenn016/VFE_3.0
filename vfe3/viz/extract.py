@@ -733,6 +733,15 @@ def projected_gauge_equivariance(
     log_prior = model._attention_log_prior(n, tokens.device)
     log_prior = None if log_prior is None else log_prior.double()
     tau = attention_tau(_as_coeff(cfg.kappa_beta, tokens.device), model._belief_score_irrep_dims())
+    # The prior moves with the belief (mu_p = mu, Sigma_p = Sigma), so D(q||p) = 0 and a
+    # state-dependent alpha* = c0/(b0 + D) is the constant c0/b0 at this snapshot.
+    alpha = float(cfg.lambda_alpha)
+    if cfg.lambda_alpha_mode != "constant":
+        ratio = torch.as_tensor(cfg.c0, dtype=torch.float64) / torch.as_tensor(cfg.b0, dtype=torch.float64)
+        if bool((ratio != ratio.flatten()[0]).any()):
+            raise ValueError("the gauge-equivariance witness needs a coordinate-uniform c0/b0: a "
+                             "non-uniform per-coordinate alpha is not frame covariant")
+        alpha = float(ratio.flatten()[0])
 
     def as64(frame: CanonicalFrameContext) -> CanonicalFrameContext:
         # The float64 frame contract needs a float64-exact inverse, not an upcast float32 one.
@@ -758,7 +767,7 @@ def projected_gauge_equivariance(
         else:
             context = build_full_link_context(
                 mu, sigma, mu, sigma, frame, ops, tau=tau, lambda_beta=cfg.lambda_beta,
-                value=float(cfg.lambda_alpha), receiver_noise=ops.receiver_noise,
+                value=alpha, receiver_noise=ops.receiver_noise,
                 kl_max=cfg.kl_max, log_prior=log_prior, value_frame=value_frame, capture=capture)
             force, _ = full_link_gradients(mu, sigma, context)                  # (1, N, K)
             new_mu, new_sigma = full_link_minimizer(
