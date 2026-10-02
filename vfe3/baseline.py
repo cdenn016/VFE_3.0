@@ -82,7 +82,7 @@ MAX_PASSES: float = 16.0
 # Fields that the matched arm copies from the VFE base config (identical names on both sides).
 MATCHED_FIELDS: Tuple[str, ...] = (
     "vocab_size", "embed_dim", "n_heads", "n_layers", "max_seq_len", "batch_size", "eval_stride",
-    "max_steps", "warmup_steps", "min_lr", "min_lr_frac", "grad_clip", "grad_accum_steps",
+    "max_steps", "warmup_steps", "min_lr_frac", "grad_clip", "grad_accum_steps",
     "amp_dtype", "fp32_matmul_precision", "seed", "deterministic", "log_interval", "eval_interval",
     "checkpoint_interval", "val_diagnostic_batches", "beta_attention_prior", "alibi_slope",
     "decode_unigram_prior", "unigram_kappa", "decode_chunk_size", "decode_ce_checkpoint",
@@ -145,7 +145,7 @@ class BaselineConfig:
     adam_beta1:            float         = 0.9
     adam_beta2:            float         = 0.95
     adam_eps:              float         = 1e-8
-    min_lr:                float         = 0.0
+    min_lr:                float         = 0.0         # retired 2026-10-02: only 0 (kept for saved configs)
     min_lr_frac:           float         = 0.01
     grad_clip:             Optional[float] = 1.0
     grad_accum_steps:      int           = 1
@@ -221,8 +221,12 @@ class BaselineConfig:
             raise ValueError(f"grad_accum_steps={self.grad_accum_steps} must divide batch_size={self.batch_size}")
         if self.lr <= 0.0:
             raise ValueError(f"lr must be positive, got {self.lr}")
-        if self.weight_decay < 0.0 or self.min_lr < 0.0 or not 0.0 <= self.min_lr_frac <= 1.0:
-            raise ValueError("weight_decay and min_lr must be >= 0 and min_lr_frac in [0, 1]")
+        if self.weight_decay < 0.0 or not 0.0 <= self.min_lr_frac <= 1.0:
+            raise ValueError("weight_decay must be >= 0 and min_lr_frac in [0, 1]")
+        if self.min_lr != 0.0:
+            # The shared scheduler floor is min_lr_frac * base since 2026-10-02; the absolute
+            # floor is no longer read, so a nonzero value would be silently ignored.
+            raise ValueError(f"min_lr is retired (only 0 is accepted), got {self.min_lr!r}")
         if not (0.0 <= self.adam_beta1 < 1.0 and 0.0 <= self.adam_beta2 < 1.0 and self.adam_eps > 0.0):
             raise ValueError("adam_beta1, adam_beta2 must lie in [0, 1) and adam_eps must be positive")
         if self.grad_clip is not None and self.grad_clip < 0.0:

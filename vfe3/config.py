@@ -215,26 +215,16 @@ class VFE3Config:
     # "auto" keeps historical per-chunk accounting for analytic/expected/linear CE.
     # Generic family CE already uses aggregate retention. "auto_aggregate" explicitly opts
     # into whole-vocabulary accounting, including fp64 scores and expected 2K worksets.
-    # Both automatic policies use a 2 GiB threshold; "always"/"never" force the policy.
-    decode_ce_checkpoint:       str  = "auto"  # "auto" | "auto_aggregate" | "always" | "never"
-
-    # Nonlinear fused CE only: centering avoids large-score fp32 cancellation but adds passes.
-    # False preserves historical loss arithmetic; True selects the numerical correction.
-    decode_ce_stable_reduction: bool = False
+    # Both automatic policies use a 2 GiB threshold. The forced "always"/"never" policies are
+    # PriorBank-internal (tests); a saved config carrying either loads as "auto".
+    decode_ce_checkpoint:       str  = "auto"  # "auto" | "auto_aggregate"
 
     # Strict decoder ranking guard. When enabled, analytic fp32 decoders construct conservative score
-    # intervals and, if ANY row's winning interval overlaps a competitor, recompute the complete
-    # (B,N,V) decode in differentiable float64. That is an accuracy diagnostic, not a production-safe
-    # fallback: at B=64, N=128, V=50257 the promoted logits alone occupy ~3.1 GiB before backward
-    # intermediates. Keep it opt-in so the default chunked route remains streamed and bounded.
+    # intervals for the logits decode. It resolves an uncertain ranking by candidate refinement
+    # (optimization_plan.md WS5): only the candidates whose float32 interval reaches the winner's, in only the uncertain rows,
+    # are recomputed in float64, giving the same argmax as a full float64 recompute at
+    # O(candidates * K). The fused training CE never reads the ranking and streams in float32.
     decode_ranking_fp64_escalation:             bool = True
-    # How that guard resolves an uncertain ranking (optimization_plan.md WS5). "full" recomputes the
-    # whole (B,N,V) decode in float64, as above, and also promotes the fused CE. "candidates"
-    # recomputes in float64 only the candidates whose float32 interval reaches the winner's, in only
-    # the uncertain rows: the same argmax as "full" at O(candidates * K) instead of O(B N V K), with
-    # non-candidate values left at float32 accuracy. The fused CE never reads the ranking, so under
-    # "candidates" it streams in float32 exactly as with the guard off.
-    decode_ranking_refinement:                  str  = "full"      # "full" | "candidates"
 
     #################################
     #          Gauge Group
@@ -367,7 +357,6 @@ class VFE3Config:
     # residual persistence term when attention_residual=True, and the covariant reference floor
     # floor * (tr C_i / K) I (local floor * (tr C_i / K) U_i U_i^T).
     predictive_covariance:               str           = "passthrough"          # "passthrough" | "moment_matched" (projected_predictive only)
-    predictive_covariance_centering:     bool          = False                  # True shifts source means before the covariance spread; False preserves historical arithmetic
     predictive_covariance_floor:         float         = 1e-4                   # Q~_i = floor * (tr C_i / K) I, keeps Sigma^+ positive definite and well conditioned
 
     ######################################
@@ -714,13 +703,11 @@ class VFE3Config:
     # (byte-identical: no chunking, no divide).
     grad_accum_steps:          int   = 1
 
-    # Cosine-decay floors, combined as max(min_lr, min_lr_frac * base).
-    min_lr:                    float = 0       # absolute floor: no group's LR decays below this;
-    #                                          0.0 recovers the pure half-cosine-to-zero.
+    # Cosine-decay floor.
     min_lr_frac:               float = 0.01    # fractional floor: no group's LR decays below
     #                                          min_lr_frac * its OWN base LR, preserving the
     #                                          m_mu : m_sigma : m_phi base ratios into the tail.
-    #                                          0.0 (with min_lr=0) is the pure half-cosine-to-zero path.
+    #                                          0.0 is the pure half-cosine-to-zero path.
 
     generate_embedding_figures:     bool = True
 
@@ -1299,10 +1286,6 @@ class VFE3Config:
             raise ValueError(
                 "full_cov_kl_precision must be one of ('fp64', 'fp32_escalate', "
                 f"'fp32_escalate_cond'), got {self.full_cov_kl_precision!r}")
-        if self.decode_ranking_refinement not in ("full", "candidates"):
-            raise ValueError(
-                "decode_ranking_refinement must be one of ('full', 'candidates'), "
-                f"got {self.decode_ranking_refinement!r}")
         if self.projected_factor_route not in ("gram", "cholesky_qr2"):
             raise ValueError(
                 "projected_factor_route must be one of ('gram', 'cholesky_qr2'), "
@@ -1401,8 +1384,7 @@ class VFE3Config:
             )
         if self.decode_chunk_size < 1:
             raise ValueError(f"decode_chunk_size must be >= 1, got {self.decode_chunk_size}")
-        _require(self.decode_ce_checkpoint, ("auto", "auto_aggregate", "always", "never"),
-                 "decode_ce_checkpoint")
+        _require(self.decode_ce_checkpoint, ("auto", "auto_aggregate"), "decode_ce_checkpoint")
         # decode_bias (linear decode only) and decode_tau (prior-bank decode only) are reported by
         # inactive_fields(), so the default-guarded notice below covers them and untouched
         # defaults stay silent.
@@ -1577,7 +1559,7 @@ class VFE3Config:
         ):
             raise ValueError(
                 f"e_mu_q_trust must be finite and > 0 or None, got {self.e_mu_q_trust}")
-        for name in ("m_p_mu_lr", "m_p_sigma_lr", "m_phi_lr", "weight_decay", "phi_weight_decay", "min_lr", "min_lr_frac"):
+        for name in ("m_p_mu_lr", "m_p_sigma_lr", "m_phi_lr", "weight_decay", "phi_weight_decay", "min_lr_frac"):
             v = getattr(self, name)
             if not math.isfinite(v) or v < 0.0:
                 raise ValueError(f"{name} must be finite and >= 0, got {v}")
@@ -1717,10 +1699,10 @@ class VFE3Config:
             mark(("projected_factor_route",),
                  "the noisy-query cost factors per-pair sums G_q + G_k and keeps the Gram route")
         if self.attention_mode != "projected_predictive":
-            mark(("predictive_covariance", "predictive_covariance_floor", "predictive_covariance_centering"),
+            mark(("predictive_covariance", "predictive_covariance_floor"),
                  "only read by attention_mode='projected_predictive'")
         elif self.predictive_covariance == "passthrough":
-            mark(("predictive_covariance_floor", "predictive_covariance_centering"),
+            mark(("predictive_covariance_floor",),
                  "only read by predictive_covariance='moment_matched'")
         if self.attention_mode != "projected_gradient":
             mark(("relational_receiver_noise", "relational_receiver_law", "relational_receiver_update",
@@ -1775,8 +1757,6 @@ class VFE3Config:
         registration = _DECODERS[self.decode_mode]
         if not registration.supports_chunked:
             mark(("decode_ce_checkpoint",), "the selected decoder has no checkpointed chunked CE kernel")
-        if not registration.supports_chunked or self.decode_mode == "linear":
-            mark(("decode_ce_stable_reduction",), "only read by nonlinear fused chunked CE")
         canonical_family_dispatch = (
             self.decode_mode == "family_chunked"
             and registration.callable is _decode_family_chunked
@@ -1787,8 +1767,6 @@ class VFE3Config:
         )
         if registration.family_consistent and not canonical_family_dispatch:
             mark(("decode_av_precision",), "generic family-consistent decoding does not call _decode_av")
-        if not self.decode_ranking_fp64_escalation:
-            mark(("decode_ranking_refinement",), "only read when decode_ranking_fp64_escalation=True")
 
         # The route-specific rules below were confirmed by tiny launcher-derived CPU probes: loss and
         # every parameter gradient stay torch.equal under an override of the marked knob
@@ -1797,7 +1775,7 @@ class VFE3Config:
         # override leaves only a floating-point roundoff residue in the gradients.
         if self.decode_mode == "linear":
             mark(("m_decode_sigma_lr",), "linear decode has no independent variance table")
-            mark(("decode_av_precision", "decode_ranking_fp64_escalation", "decode_ranking_refinement"),
+            mark(("decode_av_precision", "decode_ranking_fp64_escalation"),
                  "read only by the prior-bank Gaussian KL decoders and their ranking guard")
             mark(("decode_tau",), "read only by the prior-bank KL decode")
             mark(("untie_decode_bank",),
@@ -1994,6 +1972,9 @@ _RETIRED_INERT_FIELDS = frozenset({
 _RETIRED_CONDITIONAL_FIELDS = frozenset({
     "cross_couplings", "mu_trust_mode", "e_step_mu_precond", "m_decode_lr", "_allow_legacy_dense_decode",
     "decode_temperature_learned", "safe_cholesky_jitter_mode",
+    # 2026-10-02 numerical-policy hardcoding.
+    "decode_ce_stable_reduction", "decode_ranking_refinement", "predictive_covariance_centering",
+    "min_lr",
 })
 # Every serialized key config_from_serialized migrates or refuses that is not a VFE3Config field.
 RETIRED_CONFIG_KEYS = frozenset(
@@ -2108,6 +2089,24 @@ def _migrate_retired_fields(
             if not diagonal:
                 refuse("safe_cholesky_jitter_mode", value,
                        " (safe_cholesky's ridge is relative; only a diagonal family was inert to it)")
+    # 2026-10-02 numerical-policy hardcoding. Both values of each of these loaded fields evaluate
+    # the same mathematical quantity; the surviving arithmetic differs from a saved False/"full"
+    # only at rounding level (max-centered CE reduction; float32 CE under the candidate-refined
+    # ranking guard instead of a float64 promotion; mean-shifted predictive spread).
+    for name in ("decode_ce_stable_reduction", "predictive_covariance_centering"):
+        if name in payload:
+            _normalize_serialized_boolean(payload.pop(name), name, source=source)
+    if "decode_ranking_refinement" in payload:
+        value = payload.pop("decode_ranking_refinement")
+        if value not in ("full", "candidates"):
+            refuse("decode_ranking_refinement", value, " (only 'full' or 'candidates' was valid)")
+    if payload.get("decode_ce_checkpoint") in ("always", "never"):
+        # A forced checkpoint policy only traded memory for backward recomputation.
+        payload["decode_ce_checkpoint"] = "auto"
+    if "min_lr" in payload:
+        value = payload.pop("min_lr")
+        if type(value) not in (int, float) or value != 0:
+            refuse("min_lr", value, " (only 0 survives; a nonzero absolute floor changes the LR schedule)")
     encode_mode = payload.get("encode_mode")
     if isinstance(encode_mode, str) and encode_mode in _RETIRED_ENCODE_MODES:
         refuse("encode_mode", encode_mode)

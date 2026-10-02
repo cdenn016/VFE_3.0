@@ -183,7 +183,7 @@ def test_explicit_zero_split_rate_stays_frozen_under_schedule(
     live_name:   str,
 ) -> None:
     rates = {"m_decode_mu_lr": 0.137, "m_decode_sigma_lr": 0.061, field: 0.0}
-    cfg = _config(untie_decode_bank=True, min_lr=0.2,
+    cfg = _config(untie_decode_bank=True, min_lr_frac=0.5,
                   warmup_steps=0, max_steps=4, **rates)
     model = VFEModel(cfg)
     optimizer = build_optimizer(model, cfg)

@@ -101,7 +101,7 @@ config: Dict[str, Any] = dict(
     encode_mode                       = "per_token",   #"per_token_additive" is ~1.5x faster at K=80 currently unablated
     decode_chunk_size                 = 8192,
     decode_tau                        = 0.008,  #prior_bank = True temperature
-    decode_ce_checkpoint              = "auto",  # "auto" | "always" | "never"
+    decode_ce_checkpoint              = "auto",  # "auto" | "auto_aggregate"
 
 
     decode_unigram_prior              = True,       # add kappa*log pi_v (corpus unigram) to decode logits
@@ -247,7 +247,6 @@ config: Dict[str, Any] = dict(
    
 
 
-    min_lr                    = 0,
     min_lr_frac               = 0.01,
 
     #################################

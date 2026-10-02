@@ -171,19 +171,13 @@ def _decode_ce_chunk_summaries(
     logits:       torch.Tensor,          # (B, N, Vc) final scores
     in_chunk:     torch.Tensor,          # (B, N) target-membership mask
     local_idx:    torch.Tensor,          # (B, N) safe chunk-local target indices
-    stable_reduction: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    r"""Return LSE/target summaries, with optional detached-maximum centering.
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Return max-centered LSE/target summaries.
 
-    The default computes logsumexp(logits) and the absolute target directly.
-    Opt-in centering uses m = max_v(logit_v), L = logsumexp_v(logit_v - m)
-    to avoid large absolute-score cancellation. Detaching m retains the CE derivative.
+    With the detached chunk maximum m = max_v(logit_v), returns L = logsumexp_v(logit_v - m), the
+    centered target logit and m, so the CE never subtracts two large absolute scores. Detaching m
+    retains the CE derivative (the CE is invariant to the shift).
     """
-    if not stable_reduction:
-        lse = torch.logsumexp(logits, dim=-1)
-        gathered = logits.gather(-1, local_idx.unsqueeze(-1)).squeeze(-1)
-        target = torch.where(in_chunk > 0, gathered, torch.zeros_like(gathered))
-        return lse, target, None
     maximum = logits.amax(dim=-1).detach()
     center = torch.where(torch.isfinite(maximum), maximum, torch.zeros_like(maximum))
     shifted = logits - center.unsqueeze(-1)
@@ -195,14 +189,11 @@ def _decode_ce_chunk_summaries(
 
 def _decode_ce_combine_summaries(
     lse_chunks:    List[torch.Tensor],
-    max_chunks:    List[Optional[torch.Tensor]],
+    max_chunks:    List[torch.Tensor],
     target_chunks: List[torch.Tensor],
     in_chunks:     List[torch.Tensor],
-    stable_reduction: bool = False,
 ) -> torch.Tensor:                       # (B, N) CE rows
-    r"""Compute logsumexp_c(L_c) - target, optionally relative to M = max_c m_c."""
-    if not stable_reduction:
-        return torch.logsumexp(torch.stack(lse_chunks), dim=0) - sum(target_chunks)
+    r"""Compute logsumexp_c(L_c) - target relative to the global maximum M = max_c m_c."""
     maxima = torch.stack(max_chunks)
     maximum = maxima.amax(dim=0)
     any_finite = torch.isfinite(maximum)
@@ -543,101 +534,6 @@ def _final_ranking_uncertain(logits: torch.Tensor, bounds: torch.Tensor) -> bool
     return bool((winner_lower.double() <= competitor_upper.double()).any())
 
 
-def _chunk_ranking_summary(
-    logits: torch.Tensor, bounds: torch.Tensor,
-) -> 'tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]':
-    r"""Constant-size conservative interval summary for one vocabulary chunk."""
-    winner = logits.argmax(dim=-1, keepdim=True)
-    winner_score = logits.gather(-1, winner).squeeze(-1)
-    winner_bound = bounds.gather(-1, winner).squeeze(-1)
-    upper = _outward_upper(logits, bounds)
-    max_upper = upper.amax(dim=-1)
-    runner_upper = upper.scatter(
-        -1, winner, torch.full_like(winner, float("-inf"), dtype=upper.dtype)
-    ).amax(dim=-1)
-    return winner_score, winner_bound, max_upper, runner_upper
-
-
-def _streamed_final_ranking_uncertain(
-    winner_scores: torch.Tensor,
-    winner_bounds: torch.Tensor,
-    max_uppers: torch.Tensor,
-    runner_uppers: torch.Tensor,
-    *,
-    vocab_size: int,
-) -> bool:
-    r"""Global interval-overlap decision from constant-size per-chunk summaries."""
-    if vocab_size < 2 or winner_scores.dtype is torch.float64:
-        return False
-    winner_chunk = winner_scores.argmax(dim=-1, keepdim=True)
-    winner_score = winner_scores.gather(-1, winner_chunk).squeeze(-1)
-    winner_bound = winner_bounds.gather(-1, winner_chunk).squeeze(-1)
-    winner_lower = _outward_lower(winner_score, winner_bound)
-    chunk_ids = torch.arange(
-        winner_scores.shape[-1], device=winner_scores.device)
-    winning_chunk_mask = chunk_ids.view(
-        *((1,) * (winner_scores.dim() - 1)), -1
-    ) == winner_chunk
-    competitor_upper = torch.where(
-        winning_chunk_mask, runner_uppers, max_uppers).amax(dim=-1)
-    # Reductions happen in fp32; only the two (B,N) summaries promote for comparison.
-    return bool((winner_lower.double() <= competitor_upper.double()).any())
-
-
-# ---------------------------------------------------------------------------
-
-def _promoted_expanded_decode(
-    pb: 'PriorBank',
-    mu_q: torch.Tensor,
-    sigma_q: torch.Tensor,
-    tau_eff: torch.Tensor,
-    *,
-    full_covariance: bool,
-) -> 'tuple[torch.Tensor, torch.Tensor]':
-    r"""Recompute the complete expanded vocabulary decode in float64 after interval overlap."""
-    mu64 = mu_q.double()
-    sigma64 = sigma_q.double()
-    mu_v = pb._decode_mu_table().double()
-    sigma_v = bounded_variance_from_log(
-        pb._decode_sigma_log_table().double(), eps=pb.eps)
-    inv_v = 1.0 / sigma_v
-    c = mu_v.mean(dim=0, keepdim=True)
-    mc_v = mu_v - c
-    mc_q = mu64 - c
-    if full_covariance:
-        sq, logdet, _ = pb._full_cov_query_invariants(sigma64)
-        per_pos = pb.K + logdet.unsqueeze(-1)
-    else:
-        sq = sigma64
-        per_pos = pb.K + torch.log(sigma64.clamp(min=pb.eps)).sum(-1, keepdim=True)
-
-    a_v = _decode_av(
-        sq, mc_q, mc_v, inv_v, torch.log(sigma_v).sum(-1), precision=pb.decode_av_precision)
-    evidence_delta = None
-    if hasattr(pb, "head_evidence_logits"):
-        head_delta, coord_delta = pb._head_evidence_deltas(
-            dtype=torch.float64, device=mu_q.device)
-        if full_covariance:
-            delta_per_pos, _ = pb._head_evidence_full_marginal_invariants(
-                sigma64, head_delta)
-        else:
-            delta_per_pos = (
-                coord_delta * (1.0 + torch.log(sigma64.clamp(min=pb.eps)))
-            ).sum(-1, keepdim=True)
-        evidence_delta = _decode_head_evidence_kl_delta(
-            sq, mc_q, mc_v, inv_v, torch.log(sigma_v),
-            coord_delta, delta_per_pos, precision=pb.decode_av_precision)
-    kernel_logits = _decode_analytic_kl_logits(
-        a_v, per_pos, tau_eff.double(), torch.float64,
-        evidence_delta=evidence_delta)
-    final_logits = kernel_logits
-    if pb.decode_unigram_prior:
-        final_logits = final_logits + pb._unigram_bias().double()
-    return kernel_logits, final_logits
-
-_DECODE_RANKING_REFINEMENTS = ("full", "candidates")
-
-
 def _pairwise_decode_av(
     sq:          torch.Tensor,                   # (P, K) query variances
     mc_q:        torch.Tensor,                   # (P, K) centered query means
@@ -675,7 +571,7 @@ def _refined_candidate_decode(
     float64 candidate values resolve it as the full float64 recompute would. The returned kernel
     logits are the float32 values upcast (exact) with the candidates of uncertain rows replaced by
     float64 values. The unigram bias added by :meth:`PriorBank.decode` in float64 keeps every
-    non-candidate inside its certified interval, so the final argmax matches the full promotion.
+    non-candidate inside its certified interval, so the final argmax matches a complete float64 recompute.
     Non-candidate VALUES keep float32 accuracy, exactly as when no row is uncertain; only the
     ranking is certified. Cost O(P K) float64 for P candidates, instead of the O(B N V K)
     recompute. The row and candidate selection reads one host index list, on the escalation path.
@@ -1026,9 +922,7 @@ class PriorBank(nn.Module):
         decode_chunk_size:   int   = 8192,
         decode_av_precision: Optional[str] = None,
         decode_ce_checkpoint: str  = "auto",
-        decode_ce_stable_reduction: bool = VFE3Config.decode_ce_stable_reduction,
         decode_ranking_fp64_escalation: bool = VFE3Config.decode_ranking_fp64_escalation,
-        decode_ranking_refinement: str = VFE3Config.decode_ranking_refinement,
 
         unigram_kappa:        float = 1.0,
         decode_unigram_prior: bool  = False,
@@ -1057,10 +951,6 @@ class PriorBank(nn.Module):
             raise ValueError(
                 "decode_ranking_fp64_escalation must be bool, got "
                 f"{decode_ranking_fp64_escalation!r}")
-        if decode_ranking_refinement not in _DECODE_RANKING_REFINEMENTS:
-            raise ValueError(
-                f"decode ranking refinement must be one of {_DECODE_RANKING_REFINEMENTS}, "
-                f"got {decode_ranking_refinement!r}")
         self.vocab_size = vocab_size
         self.K = K
         self.n_gen = n_gen
@@ -1084,9 +974,7 @@ class PriorBank(nn.Module):
         self.decode_mode = decode_mode
         self.decode_chunk_size = decode_chunk_size
         self.decode_ce_checkpoint = decode_ce_checkpoint
-        self.decode_ce_stable_reduction = decode_ce_stable_reduction
         self.decode_ranking_fp64_escalation = decode_ranking_fp64_escalation
-        self.decode_ranking_refinement = decode_ranking_refinement
         self.unigram_kappa = unigram_kappa
         self.decode_unigram_prior = decode_unigram_prior
         self.gauge_group_name = gauge_group_name
@@ -1636,7 +1524,6 @@ class PriorBank(nn.Module):
         Under ``decode_coordinates='reference'`` the query is first mapped to
         :math:`(\xi_i, \operatorname{diag}C_i)` through ``canonical_frame`` (``_reference_query``).
         """
-        stable_reduction = self.decode_ce_stable_reduction
         if canonical_frame is not None or self.decode_coordinates == "reference":
             mu_q, sigma_q = self._query_in_decode_frame(mu_q, sigma_q, canonical_frame)
         has_ignored = self._validate_fused_ce_targets(
@@ -1648,8 +1535,6 @@ class PriorBank(nn.Module):
             sigma_q = sigma_q[original_valid].unsqueeze(0) # (1, S, K[, K])
             targets = targets[original_valid].unsqueeze(0)
 
-        # Only "full" refinement reads the ranking certificate to promote the CE.
-        ranking_guard = self.decode_ranking_fp64_escalation and self.decode_ranking_refinement == "full"
         tau_eff = self._tau_eff(tau)
         chunk = self.decode_chunk_size if chunk_size is None else chunk_size
         V = self.vocab_size
@@ -1699,44 +1584,20 @@ class PriorBank(nn.Module):
             a_v form can difference before squaring (audit 2026-08-06 F32); the default expanded
             form uses ``lhs_`` and ignores them.
             """
-            if not ranking_guard:
-                a_v = _decode_av(
-                    sq_, mc_q_, mu_v_c, inv_v_c, lsum_c, lhs=lhs_, precision=self.decode_av_precision)
-                evidence_delta = None
-                if coord_delta_ is not None and delta_per_pos_ is not None:
-                    evidence_delta = _decode_head_evidence_kl_delta(
-                        sq_, mc_q_, mu_v_c, inv_v_c, log_v_c,
-                        coord_delta_, delta_per_pos_, evidence_lhs_,
-                        precision=self.decode_av_precision)
-                logit_chunk = _decode_analytic_kl_logits(
-                    a_v, per_pos_, tau_eff, lhs_.dtype,
-                    evidence_delta=evidence_delta)
-                if u_c is not None:
-                    logit_chunk = logit_chunk + u_c.to(logit_chunk.dtype)
-                return _decode_ce_chunk_summaries(logit_chunk, in_chunk_f, local_idx, stable_reduction)
-            a_v, a_bound = _decode_av(
-                sq_, mc_q_, mu_v_c, inv_v_c, lsum_c, lhs=lhs_, return_error_bound=True, precision=self.decode_av_precision)
+            a_v = _decode_av(
+                sq_, mc_q_, mu_v_c, inv_v_c, lsum_c, lhs=lhs_, precision=self.decode_av_precision)
             evidence_delta = None
-            evidence_bound = None
             if coord_delta_ is not None and delta_per_pos_ is not None:
-                evidence_delta, evidence_bound = _decode_head_evidence_kl_delta(
+                evidence_delta = _decode_head_evidence_kl_delta(
                     sq_, mc_q_, mu_v_c, inv_v_c, log_v_c,
                     coord_delta_, delta_per_pos_, evidence_lhs_,
-                    return_error_bound=True,
-                 precision=self.decode_av_precision)
-            logit_chunk, error_chunk = _decode_analytic_kl_logits(
-                a_v, per_pos_, tau_eff, lhs_.dtype, evidence_delta=evidence_delta,
-                a_error_bound=a_bound, evidence_error_bound=evidence_bound,
-                unigram_bias=u_c, return_error_bound=True)
-            lse_chunk, contrib, maximum = _decode_ce_chunk_summaries(
-                logit_chunk, in_chunk_f, local_idx, stable_reduction)
-            ranking, ranking_bound, max_upper, runner_upper = (
-                _chunk_ranking_summary(logit_chunk, error_chunk))
-            return (
-                lse_chunk,
-                contrib, maximum,
-                ranking, ranking_bound, max_upper, runner_upper,
-            )
+                    precision=self.decode_av_precision)
+            logit_chunk = _decode_analytic_kl_logits(
+                a_v, per_pos_, tau_eff, lhs_.dtype,
+                evidence_delta=evidence_delta)
+            if u_c is not None:
+                logit_chunk = logit_chunk + u_c.to(logit_chunk.dtype)
+            return _decode_ce_chunk_summaries(logit_chunk, in_chunk_f, local_idx)
 
         valid = targets != ignore_index                                    # (B, N) bool
         scored_valid = original_valid
@@ -1744,10 +1605,6 @@ class PriorBank(nn.Module):
         max_chunks = []
         target_chunks = []
         in_chunks = []
-        ranking_chunks = []
-        bound_chunks = []
-        max_upper_chunks = []
-        runner_upper_chunks = []
 
         for v0 in range(0, V, chunk):
             v1 = min(v0 + chunk, V)
@@ -1787,40 +1644,8 @@ class PriorBank(nn.Module):
             target_chunks.append(contrib)
             in_chunks.append(in_chunk)
 
-            if ranking_guard:
-                ranking_chunk, bound_chunk, max_upper, runner_upper = chunk_result[3:]
-                ranking_chunks.append(ranking_chunk)
-                bound_chunks.append(bound_chunk)
-                max_upper_chunks.append(max_upper)
-                runner_upper_chunks.append(runner_upper)
-        # Combine (n_chunks, B, N) summaries; centering is an explicit numerical option.
-        global_ranking = (
-            torch.stack(ranking_chunks, dim=-1) if ranking_guard else None)
-        global_bounds = (
-            torch.stack(bound_chunks, dim=-1) if ranking_guard else None)
-        max_uppers = (
-            torch.stack(max_upper_chunks, dim=-1) if ranking_guard else None)
-        runner_uppers = (
-            torch.stack(runner_upper_chunks, dim=-1) if ranking_guard else None)
-        # The CE never reads the ranking; only the "full" refinement promotes it (see
-        # _refined_candidate_decode for the "candidates" contract).
-        if (ranking_guard
-                and _streamed_final_ranking_uncertain(
-                    global_ranking, global_bounds, max_uppers, runner_uppers,
-                    vocab_size=V,
-                )):
-            _, promoted_logits = _promoted_expanded_decode(
-                self, mu_q, sigma_q, tau_eff, full_covariance=False)
-            safe_targets = targets.clamp(min=0, max=V - 1)
-            promoted_lse, promoted_target, _ = _decode_ce_chunk_summaries(
-                promoted_logits, valid, safe_targets, stable_reduction)
-            promoted_ce_per_pos = promoted_lse - promoted_target
-            ce = (
-                promoted_ce_per_pos * valid
-            ).sum() / valid.sum().clamp_min(1)
-            return _decode_ce_result(ce, scored_valid, return_stats)
         ce_per_pos = _decode_ce_combine_summaries(
-            lse_chunks, max_chunks, target_chunks, in_chunks, stable_reduction)                           # (B, N) = -log-softmax at target
+            lse_chunks, max_chunks, target_chunks, in_chunks)                           # (B, N) = -log-softmax at target
         # Device-side masked mean: clamp the denominator so an all-ignore microbatch yields a finite
         # grad-connected 0 (the numerator is then 0) without a host sync to branch on valid.sum() == 0.
         # (Matches the full path, whose F.cross_entropy mean over zero counted tokens would be NaN.)
@@ -1967,7 +1792,6 @@ class PriorBank(nn.Module):
         decode's atol-1e-3 (tests/test_fullcov_alpha_roadmap_2026_06_13.py). The unigram-prior
         chunk-slice add follows ``decode_ce_diagonal_chunked`` exactly.
         """
-        stable_reduction = self.decode_ce_stable_reduction
         mu_q, sigma_q, factor_q, spd_ok = self._query_in_decode_frame_for_full_decode(
             mu_q, sigma_q, canonical_frame)
         has_ignored = self._validate_fused_ce_targets(
@@ -1981,9 +1805,6 @@ class PriorBank(nn.Module):
             spd_ok = spd_ok[original_valid].unsqueeze(0)
             targets = targets[original_valid].unsqueeze(0)
 
-        # Only the "full" refinement promotes the CE on an uncertain ranking; the CE never reads the
-        # ranking itself, so "candidates" streams exactly as with the guard off.
-        ranking_guard = self.decode_ranking_fp64_escalation and self.decode_ranking_refinement == "full"
         tau_eff = self._tau_eff(tau)
         chunk = self.decode_chunk_size if chunk_size is None else chunk_size
         V = self.vocab_size
@@ -2038,53 +1859,21 @@ class PriorBank(nn.Module):
             ``sq_``/``mc_q_`` carry the UNEXPANDED query pieces alongside ``lhs_`` so the "exact"
             a_v form can difference before squaring (audit 2026-08-06 F32).
             """
-            if not ranking_guard:
-                a_v = _decode_av(
-                    sq_, mc_q_, mu_v_c, inv_v_c, lsum_c, lhs=lhs_, precision=self.decode_av_precision)
-                evidence_delta = None
-                if coord_delta_ is not None and delta_per_pos_ is not None:
-                    evidence_delta = _decode_head_evidence_kl_delta(
-                        sq_, mc_q_, mu_v_c, inv_v_c, log_v_c,
-                        coord_delta_, delta_per_pos_, evidence_lhs_,
-                     precision=self.decode_av_precision)
-                logit_chunk = _decode_analytic_kl_logits(
-                    a_v, per_pos_, tau_eff, lhs_.dtype,
-                    evidence_delta=evidence_delta)
-                if u_c is not None:
-                    logit_chunk = logit_chunk + u_c.to(logit_chunk.dtype)
-                return _decode_ce_chunk_summaries(logit_chunk, in_chunk_f, local_idx, stable_reduction)
-            a_v, a_bound = _decode_av(
-                sq_, mc_q_, mu_v_c, inv_v_c, lsum_c, lhs=lhs_,
-                return_error_bound=True, precision=self.decode_av_precision)                                   # (B, N, Vc)
+            a_v = _decode_av(
+                sq_, mc_q_, mu_v_c, inv_v_c, lsum_c, lhs=lhs_, precision=self.decode_av_precision)
             evidence_delta = None
-            evidence_bound = None
             if coord_delta_ is not None and delta_per_pos_ is not None:
-                evidence_delta, evidence_bound = _decode_head_evidence_kl_delta(
+                evidence_delta = _decode_head_evidence_kl_delta(
                     sq_, mc_q_, mu_v_c, inv_v_c, log_v_c,
                     coord_delta_, delta_per_pos_, evidence_lhs_,
-                    return_error_bound=True,
-                 precision=self.decode_av_precision)
-            logit_chunk, error_chunk = _decode_analytic_kl_logits(
+                    precision=self.decode_av_precision)
+            logit_chunk = _decode_analytic_kl_logits(
                 a_v, per_pos_, tau_eff, lhs_.dtype,
-                evidence_delta=evidence_delta,
-                a_error_bound=a_bound,
-                evidence_error_bound=evidence_bound,
-                unigram_bias=u_c,
-                return_error_bound=True)
-            lse_chunk, contrib, maximum = _decode_ce_chunk_summaries(
-                logit_chunk, in_chunk_f, local_idx, stable_reduction)
-            ranking, ranking_bound, max_upper, runner_upper = (
-                _chunk_ranking_summary(logit_chunk, error_chunk))
-            return (
-                lse_chunk,
-                contrib, maximum,
-                ranking, ranking_bound, max_upper, runner_upper,
-            )
+                evidence_delta=evidence_delta)
+            if u_c is not None:
+                logit_chunk = logit_chunk + u_c.to(logit_chunk.dtype)
+            return _decode_ce_chunk_summaries(logit_chunk, in_chunk_f, local_idx)
 
-        ranking_chunks = []
-        bound_chunks = []
-        max_upper_chunks = []
-        runner_upper_chunks = []
         # A position whose Sigma_q is not PD is EXCLUDED, exactly like an ignore_index token, rather
         # than scored (audit 2026-08-06 F31); it leaves both the numerator and the denominator, and
         # _count_decode_logdet_fallback has already recorded it. The dense path drops the same
@@ -2134,37 +1923,9 @@ class PriorBank(nn.Module):
             max_chunks.append(maximum)
             target_chunks.append(contrib)
             in_chunks.append(in_chunk)
-            if ranking_guard:
-                ranking_chunk, bound_chunk, max_upper, runner_upper = chunk_result[3:]
-                ranking_chunks.append(ranking_chunk)
-                bound_chunks.append(bound_chunk)
-                max_upper_chunks.append(max_upper)
-                runner_upper_chunks.append(runner_upper)
 
-        global_ranking = (
-            torch.stack(ranking_chunks, dim=-1) if ranking_guard else None)
-        global_bounds = (
-            torch.stack(bound_chunks, dim=-1) if ranking_guard else None)
-        max_uppers = (
-            torch.stack(max_upper_chunks, dim=-1) if ranking_guard else None)
-        runner_uppers = (
-            torch.stack(runner_upper_chunks, dim=-1) if ranking_guard else None)
-        if (ranking_guard and _streamed_final_ranking_uncertain(
-            global_ranking, global_bounds, max_uppers, runner_uppers,
-            vocab_size=V,
-        )):
-            _, promoted_logits = _promoted_expanded_decode(
-                self, mu_q, sigma_q, tau_eff, full_covariance=True)
-            safe_targets = targets.clamp(min=0, max=V - 1)
-            promoted_lse, promoted_target, _ = _decode_ce_chunk_summaries(
-                promoted_logits, valid, safe_targets, stable_reduction)
-            promoted_ce_per_pos = promoted_lse - promoted_target
-            ce = (
-                promoted_ce_per_pos * valid
-            ).sum() / valid.sum().clamp_min(1)
-            return _decode_ce_result(ce, scored_valid, return_stats)
         ce_per_pos = _decode_ce_combine_summaries(
-            lse_chunks, max_chunks, target_chunks, in_chunks, stable_reduction)                            # (B, N) = -log-softmax at target
+            lse_chunks, max_chunks, target_chunks, in_chunks)                            # (B, N) = -log-softmax at target
         # Device-side masked mean: clamp the denominator so an all-ignore microbatch yields a finite
         # grad-connected 0 (the numerator is then 0) without a host sync to branch on valid.sum() == 0.
         ce = (ce_per_pos * valid).sum() / valid.sum().clamp_min(1)
@@ -2289,7 +2050,6 @@ class PriorBank(nn.Module):
         workspace instead (bounded by the chunk width; freed by the checkpoint). The unigram-prior
         chunk-slice add follows ``decode_ce_diagonal_chunked``.
         """
-        stable_reduction = self.decode_ce_stable_reduction
         has_ignored = self._validate_fused_ce_targets(
             targets, ignore_index=ignore_index, expected_shape=mu_q.shape[:-1])
         original_valid = targets != ignore_index
@@ -2319,7 +2079,7 @@ class PriorBank(nn.Module):
             logit_chunk = -0.5 * (d ** 2 / s + torch.log(s)).sum(-1) / tau_eff   # (B, N, Vc)
             if u_c is not None:
                 logit_chunk = logit_chunk + u_c                            # unigram log-prior chunk slice
-            return _decode_ce_chunk_summaries(logit_chunk, in_chunk_f, local_idx, stable_reduction)
+            return _decode_ce_chunk_summaries(logit_chunk, in_chunk_f, local_idx)
 
         valid = targets != ignore_index                                    # (B, N) bool
         scored_valid = original_valid
@@ -2359,7 +2119,7 @@ class PriorBank(nn.Module):
             in_chunks.append(in_chunk)
 
         ce_per_pos = _decode_ce_combine_summaries(
-            lse_chunks, max_chunks, target_chunks, in_chunks, stable_reduction)                           # (B, N) = -log-softmax at target
+            lse_chunks, max_chunks, target_chunks, in_chunks)                           # (B, N) = -log-softmax at target
         # Device-side masked mean: clamp the denominator so an all-ignore microbatch yields a finite
         # grad-connected 0 (the numerator is then 0) without a host sync to branch on valid.sum() == 0.
         ce = (ce_per_pos * valid).sum() / valid.sum().clamp_min(1)
@@ -2390,7 +2150,6 @@ class PriorBank(nn.Module):
         ``family`` decode -> cross-entropy. The unigram-prior chunk-slice add follows
         ``decode_ce_diagonal_chunked``.
         """
-        stable_reduction = self.decode_ce_stable_reduction
         if _uses_canonical_full_family_decode(self, mu_q, sigma_q):
             return self.decode_ce_full_chunked(
                 mu_q,
@@ -2479,12 +2238,11 @@ class PriorBank(nn.Module):
             safe_logits = torch.where(
                 row_finite.unsqueeze(-1), safe_logits, torch.zeros_like(safe_logits))
             lse_chunk, contrib, maximum = _decode_ce_chunk_summaries(
-                safe_logits, in_chunk_f, local_idx, stable_reduction)
+                safe_logits, in_chunk_f, local_idx)
             lse_chunk = torch.where(
                 row_finite, lse_chunk, lse_chunk.new_tensor(float("-inf")))
-            if maximum is not None:
-                maximum = torch.where(
-                    row_finite, maximum, maximum.new_tensor(float("-inf")))
+            maximum = torch.where(
+                row_finite, maximum, maximum.new_tensor(float("-inf")))
             gathered = logit_chunk.gather(-1, local_idx.unsqueeze(-1)).squeeze(-1)
             target_finite = torch.isfinite(gathered) & (in_chunk_f > 0)
             contrib = torch.where(target_finite, contrib, torch.zeros_like(contrib))
@@ -2578,11 +2336,8 @@ class PriorBank(nn.Module):
             scored_valid[original_valid] = valid.flatten()
         else:
             scored_valid = valid
-        if not stable_reduction:
-            # Excluded rows must not differentiate an all-negative-infinity normalizer.
-            lse_chunks = [torch.where(valid, value, torch.zeros_like(value)) for value in lse_chunks]
         ce_per_pos = _decode_ce_combine_summaries(
-            lse_chunks, max_chunks, target_chunks, in_chunks, stable_reduction)                            # (B, N) = -log-softmax at target
+            lse_chunks, max_chunks, target_chunks, in_chunks)                            # (B, N) = -log-softmax at target
         ce_per_pos = torch.where(valid, ce_per_pos, torch.zeros_like(ce_per_pos))
         # Device-side masked mean: clamp the denominator so an all-ignore microbatch yields a finite
         # grad-connected 0 (the numerator is then 0) without a host sync to branch on valid.sum() == 0.
@@ -2777,15 +2532,11 @@ def _decode_diagonal(
             a_error_bound=a_bound, evidence_error_bound=evidence_bound,
             unigram_bias=unigram, return_error_bound=True)
         if _final_ranking_uncertain(ranking_logits, ranking_bound):
-            if pb.decode_ranking_refinement == "candidates":
-                return _refined_candidate_decode(
-                    pb, mu_q, sigma_q, tau_eff, ranking_logits, ranking_bound,
-                    _decode_analytic_kl_logits(a_v, per_pos, tau_eff, mu_q.dtype,
-                                               evidence_delta=evidence_delta),
-                    full_covariance=False)
-            kernel_logits, _ = _promoted_expanded_decode(
-                pb, mu_q, sigma_q, tau_eff, full_covariance=False)
-            return kernel_logits
+            return _refined_candidate_decode(
+                pb, mu_q, sigma_q, tau_eff, ranking_logits, ranking_bound,
+                _decode_analytic_kl_logits(a_v, per_pos, tau_eff, mu_q.dtype,
+                                           evidence_delta=evidence_delta),
+                full_covariance=False)
     return _decode_analytic_kl_logits(
         a_v, per_pos, tau_eff, mu_q.dtype, evidence_delta=evidence_delta)
 
@@ -2935,15 +2686,11 @@ def _decode_full_chunked(
             a_error_bound=a_bound, evidence_error_bound=evidence_bound,
             unigram_bias=unigram, return_error_bound=True)
         if _final_ranking_uncertain(ranking_logits, ranking_bound):
-            if pb.decode_ranking_refinement == "candidates":
-                logits = _refined_candidate_decode(
-                    pb, mu_q, sigma_q, tau_eff, ranking_logits, ranking_bound,
-                    _decode_analytic_kl_logits(a_v, per_pos, tau_eff, mu_q.dtype,
-                                               evidence_delta=evidence_delta),
-                    full_covariance=True)
-            else:
-                logits, _ = _promoted_expanded_decode(
-                    pb, mu_q, sigma_q, tau_eff, full_covariance=True)
+            logits = _refined_candidate_decode(
+                pb, mu_q, sigma_q, tau_eff, ranking_logits, ranking_bound,
+                _decode_analytic_kl_logits(a_v, per_pos, tau_eff, mu_q.dtype,
+                                           evidence_delta=evidence_delta),
+                full_covariance=True)
         else:
             logits = _decode_analytic_kl_logits(
                 a_v, per_pos, tau_eff, mu_q.dtype, evidence_delta=evidence_delta)

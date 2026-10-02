@@ -407,7 +407,7 @@ def _finalize_ns(**over):
         # numeric-path attrs (summary / provenance / cost model / pure-path report)
         seed=0, max_steps=2, decode_mode="full_chunked", decode_bias=False,
         use_head_mixer=False,
-        min_lr=0.0, min_lr_frac=0.0,
+        min_lr_frac=0.0,
         lambda_alpha_mode="constant",
         lambda_beta=1.0,
         gauge_transport="on", pos_rotation="none", rope_on_value=True,

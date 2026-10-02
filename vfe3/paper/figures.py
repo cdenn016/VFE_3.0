@@ -374,7 +374,7 @@ def sigma_schedule(run: RunRecord, n_updates: int) -> Tuple[Optional[np.ndarray]
     try:
         from vfe3.train import _floor_lr_lambdas
         cfg_like = run.cfg if run.cfg is not None else SimpleNamespace(
-            **{key: run.raw(key) for key in ("warmup_steps", "max_steps", "min_lr", "min_lr_frac")})
+            **{key: run.raw(key) for key in ("warmup_steps", "max_steps", "min_lr_frac")})
         multiplier = _floor_lr_lambdas([base], cfg_like)[0]
         lrs = np.array([base * multiplier(int(i)) for i in k], dtype=np.float64)
         info["lr_source"] = "reconstructed schedule (vfe3.train._floor_lr_lambdas)"

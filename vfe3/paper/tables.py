@@ -674,7 +674,7 @@ def _optimization_items(run: RunRecord) -> List[Item]:
             items.append(("per-table learning rates", NOT_RECORDED))
     kind = (run.summary.get("scheduler") or {}).get("kind")
     items.append(("schedule", Code(kind) if kind else NOT_RECORDED))
-    items += _raw_items(run, ("warmup_steps", "max_steps", "min_lr", "min_lr_frac", "grad_clip",
+    items += _raw_items(run, ("warmup_steps", "max_steps", "min_lr_frac", "grad_clip",
                               "grad_clip_per_role", "m_phi_update_mode", "phi_mstep_max_matrix_norm"))
     ops = run.config_record.get("relational_operators")
     if isinstance(ops, Mapping) and ops.get("gradient_clipping"):

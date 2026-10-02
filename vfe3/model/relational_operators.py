@@ -35,7 +35,6 @@ class RelationalOperators(nn.Module):
         routing:               str   = "gaussian_kl",
         predictive_covariance: str   = "passthrough",
         predictive_covariance_floor: float = 1e-4,
-        predictive_covariance_centering: bool = False,
         *,
         receiver_noise:        float = 1.0,
         receiver_law:          str   = "ambient_alignment",
@@ -87,9 +86,6 @@ class RelationalOperators(nn.Module):
                 or not math.isfinite(predictive_covariance_floor) or predictive_covariance_floor <= 0.0):
             raise ValueError(
                 f"predictive_covariance_floor must be finite and positive, got {predictive_covariance_floor!r}")
-        if type(predictive_covariance_centering) is not bool:
-            raise ValueError("predictive_covariance_centering must be a bool")
-        self.predictive_covariance_centering = predictive_covariance_centering
         self.predictive_covariance = predictive_covariance
         self.predictive_covariance_floor = float(predictive_covariance_floor)
         self.input_dim = H * d
@@ -196,9 +192,11 @@ class RelationalOperators(nn.Module):
             b = beta.to(dtype)                                                     # (..., H, N, N)
             eye_h = torch.eye(H, dtype=dtype, device=mu.device)
 
-            if self.predictive_covariance_centering:
-                # A shared shift preserves covariance for normalized beta and reduces cancellation.
-                xi = xi - xi[..., :1, :]                                          # (..., N, K)
+            # Shift every source mean by token 0's. Each beta row sums to 1, so the spread
+            # sum_j beta_ij v_j v_j^T - m_i m_i^T is invariant under a common shift of the v_j, and
+            # the shift is causal because token 0 lies in every row's support. It removes the
+            # common offset that would otherwise cancel between the two terms.
+            xi = xi - xi[..., :1, :]                                              # (..., N, K)
             values = torch.einsum("hsk,...nk->...nhs", T_hat, xi)                  # (..., N, H, d)
             TC = torch.einsum("hsk,...nkm->...nhsm", T_hat, C)                     # (..., N, H, d, K)
             source = torch.einsum("...nhsm,gtm->...nhgst", TC, T_hat)             # (..., N, H, H, d, d)

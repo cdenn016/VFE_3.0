@@ -20,7 +20,6 @@ def _bank(mode: str, checkpoint: str = "never", precision: str = "fp32") -> Prio
         diagonal_covariance=not full, decode_mode=mode, decode_chunk_size=4,
         decode_tau=1.0,
         decode_ce_checkpoint=checkpoint, decode_av_precision=precision,
-        decode_ce_stable_reduction=True,
         decode_ranking_fp64_escalation=False,
     )
 

@@ -32,7 +32,6 @@ def _cfg(**overrides: Any) -> VFE3Config:
 
         attention_residual=False,
         predictive_covariance="passthrough",
-        predictive_covariance_centering=False,
         n_e_steps=3,
         mu_init_std=0.3,
         sigma_init=0.8,
@@ -204,8 +203,7 @@ def test_config_state_and_control_activity_round_trip() -> None:
     assert "e_q_mu_lr" not in inactive
     assert "e_q_sigma_lr" not in inactive
     assert "relational_receiver_noise" not in inactive
-    for field in ("predictive_covariance", "predictive_covariance_centering"):
-        assert field in inactive
+    assert "predictive_covariance" in inactive
     model = VFEModel(cfg)
     restored = VFEModel(restored_cfg)
     restored.load_state_dict(model.state_dict(), strict=True)
