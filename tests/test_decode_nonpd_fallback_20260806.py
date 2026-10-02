@@ -60,8 +60,8 @@ def _bank() -> tuple[VFEModel, prior_bank.PriorBank]:
     """
     model = _tiny_model(vocab_size=7, gauge_group="block_glk", n_heads=2,
                         family="gaussian_full", decode_mode="full_chunked",
-                        decode_av_precision="fp64", decode_ce_stable_reduction=True,
-                        decode_ranking_fp64_escalation=False, decode_ce_checkpoint="never",
+                        decode_av_precision="fp64",
+                        decode_ranking_fp64_escalation=False, decode_ce_checkpoint="auto",
                         fp32_matmul_precision="highest", full_cov_kl_precision="fp32_escalate")
     bank = model.prior_bank
     with torch.no_grad():

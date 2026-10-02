@@ -425,7 +425,6 @@ def test_mixer_learning_rate_scheduler_preserves_zero_and_independent_floor():
         m_head_mixer_lr=0.0022,
         warmup_steps=2,
         max_steps=10,
-        min_lr=1e-5,
         min_lr_frac=0.01,
     )
     model = VFEModel(cfg)
@@ -441,7 +440,7 @@ def test_mixer_learning_rate_scheduler_preserves_zero_and_independent_floor():
     evidence = _group_owning(optimizer, model.prior_bank.head_evidence_logits)
     legacy = _group_owning(optimizer, model.head_mixer.mixer_delta)
     assert evidence["lr"] == 0.0
-    assert legacy["lr"] == pytest.approx(max(cfg.min_lr, cfg.min_lr_frac * 0.0022))
+    assert legacy["lr"] == pytest.approx(cfg.min_lr_frac * 0.0022)
 
 
 def test_head_mixer_and_head_evidence_are_legal_and_separately_owned():

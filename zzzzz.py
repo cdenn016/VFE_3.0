@@ -1424,8 +1424,7 @@ SO(N)_config = dict(
                                              # count 1-15 BELOW init). 0.0 exempts the mean sector; set None to
                                              # restore the pre-2026-07-26 inherit-the-global behavior.
 
-    min_lr                    = 0,       # absolute cosine-decay LR floor (0.0 = pure cosine)
-    min_lr_frac               = 0.01,    # proportional LR floor, max(min_lr, frac*base); OFF
+    min_lr_frac               = 0.01,    # proportional LR floor, frac*base; OFF
     
     #################################
     #     Layer Normalization 

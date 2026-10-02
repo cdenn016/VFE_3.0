@@ -6,12 +6,8 @@ Nonlinear chunked decoders expose memory/compute and numerical-accuracy choices.
 |---|---|
 | decode_ce_checkpoint="auto" | Historical per-chunk estimate for analytic diagonal/full, expected-likelihood, and linear CE; generic family retains its existing aggregate estimate. |
 | decode_ce_checkpoint="auto_aggregate" | Whole-vocabulary estimate including analytic fp64 storage and expected-likelihood worksets; may recompute in backward to save memory. |
-| decode_ce_checkpoint="always" | Checkpoint every chunk with live gradients. |
-| decode_ce_checkpoint="never" | Retain activations for backward without recomputation. |
-| decode_ce_stable_reduction=False | Historical absolute log-sum-exp minus target arithmetic. |
-| decode_ce_stable_reduction=True | Center nonlinear fused CE scores to avoid large-score cancellation, at the cost of extra tensor passes. |
 
-The default is auto/False. Both automatic policies use a 2 GiB estimate threshold. Evaluation never checkpoints. Dense and linear routes ignore stable reduction. Public target validation, ignored-row handling, covariance exclusions, and their gradient contracts remain active. Centering follows the configured score clamp, temperature, head evidence, and class prior.
+The default is auto. Both automatic policies use a 2 GiB estimate threshold. Evaluation never checkpoints. The forced policies "always" (checkpoint every chunk with live gradients) and "never" (retain activations without recomputation) remain on `PriorBank` for tests only; a saved config carrying either loads as "auto" (2026-10-02). Nonlinear fused CE always centers each chunk's scores on their detached maximum, which avoids large-score cancellation; the retired `decode_ce_stable_reduction` selector loads with either value and is dropped. Linear CE keeps its own reduction. Public target validation, ignored-row handling, covariance exclusions, and their gradient contracts remain active. Centering follows the configured score clamp, temperature, head evidence, and class prior.
 
 At B=64, N=128, V=50257, chunk=8192, fp32, the analytic estimate is 0.5 GiB per chunk versus about 3.07 GiB across the vocabulary. Only the latter crosses the threshold. These are heuristic estimates, not measured peak GPU memory. A tiny CPU trace records nine versus twelve forward/backward GEMMs when aggregate checkpointing activates, with identical loss. Production CUDA throughput was not measured.
 

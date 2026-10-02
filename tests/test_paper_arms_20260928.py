@@ -183,7 +183,7 @@ def test_vfe_arms_differ_from_the_base_only_in_declared_fields(tmp_path: Path, c
     assert plans["Learned frames, stored covariance without decay"].diff == {"sigma_weight_decay": (0.2, 0.0)}
     word = plans["Gaussian attention"]
     assert word.dataset == WORD and set(word.diff) == {"vocab_size", "decode_ce_checkpoint"}
-    assert word.cfg.vocab_size == V_WORD and word.cfg.decode_ce_checkpoint == "always"
+    assert word.cfg.vocab_size == V_WORD and word.cfg.decode_ce_checkpoint == "auto_aggregate"
     assert word.cfg.max_steps == math.ceil(N_TOKENS["train"] / (2 * 4))
     evaluated = plans[pa.EVALUATED].cfg
     assert (evaluated.max_steps, evaluated.eval_interval, evaluated.checkpoint_interval) == (12, 1, 12)
@@ -263,7 +263,7 @@ def test_baseline_arms_match_the_protocol_when_the_baseline_exists(tmp_path: Pat
     table = plans["Per-type table of the frame table's size"]
     assert table.cfg.per_type_table == "block_read"
     word = plans["Conventional transformer, matched"]
-    assert word.cfg.vocab_size == V_WORD and word.cfg.decode_ce_checkpoint == "always"
+    assert word.cfg.vocab_size == V_WORD and word.cfg.decode_ce_checkpoint == "auto_aggregate"
     # The read map has the size of the VFE token-frame table.
     assert table.params["per_type_tables"] - matched.params["per_type_tables"] == V_BPE * 4 * 2
     rejected = dataclasses.replace(matched.cfg, eval_stride=4)

@@ -260,9 +260,16 @@ def test_config_decode_ce_checkpoint_rejects_invalid_value():
         test_config(decode_ce_checkpoint="sometimes")
 
 
-@pytest.mark.parametrize("value", ["auto", "always", "never"])
+@pytest.mark.parametrize("value", ["auto", "auto_aggregate"])
 def test_config_decode_ce_checkpoint_accepts_valid_values(value):
     test_config(decode_ce_checkpoint=value)
+
+
+@pytest.mark.parametrize("value", ["always", "never"])
+def test_config_refuses_the_private_forced_policies(value):
+    # The forced policies remain on PriorBank for these tests; a config cannot select them.
+    with pytest.raises(ValueError, match="decode_ce_checkpoint"):
+        test_config(decode_ce_checkpoint=value)
 
 
 def test_config_decode_ce_checkpoint_live_under_full_chunked():
@@ -270,7 +277,7 @@ def test_config_decode_ce_checkpoint_live_under_full_chunked():
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always", ConfigNotice)
         cfg = test_config(decode_mode="full_chunked", family="gaussian_full",
-                          decode_ce_checkpoint="always")
+                          decode_ce_checkpoint="auto_aggregate")
     assert "decode_ce_checkpoint" not in cfg.inactive_fields()
     assert not any("decode_ce_checkpoint=" in str(item.message) for item in caught)
 

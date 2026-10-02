@@ -52,21 +52,21 @@ def test_aggregate_recomputation_requires_explicit_policy(mode: str) -> None:
 
 @pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("checkpoint", ["always", "never"])
-def test_stable_toggle_preserves_ordinary_loss_and_gradients(mode: str, checkpoint: str) -> None:
+def test_centered_reduction_matches_the_dense_ce(mode: str, checkpoint: str) -> None:
     pb = _bank(mode, decode_ce_checkpoint=checkpoint)
     mu_q, sigma_q, targets = _query(mode)
-    fn = getattr(pb, "decode_ce_" + mode)
-    ordinary = fn(mu_q, sigma_q, targets)
-    pb.decode_ce_stable_reduction = True
-    stable = fn(mu_q, sigma_q, targets)
-    torch.testing.assert_close(stable, ordinary, atol=3e-6, rtol=3e-6)
+    fused = getattr(pb, "decode_ce_" + mode)(mu_q, sigma_q, targets)
+    dense = torch.nn.functional.cross_entropy(pb.decode(mu_q, sigma_q).reshape(-1, 7), targets.reshape(-1))
+    torch.testing.assert_close(fused, dense, atol=3e-6, rtol=3e-6)
     inputs = (mu_q, sigma_q, pb.mu_embed, pb.sigma_log_embed)
-    for actual, expected in zip(torch.autograd.grad(stable, inputs), torch.autograd.grad(ordinary, inputs)):
+    for actual, expected in zip(torch.autograd.grad(fused, inputs), torch.autograd.grad(dense, inputs)):
         torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
 
 
 @pytest.mark.parametrize("mode", MODES)
-def test_default_reduction_uses_legacy_arithmetic_at_large_scores(mode: str) -> None:
+def test_centered_reduction_is_exact_at_large_scores(mode: str) -> None:
+    # Absolute scores of order 1e11 cancel in an uncentered logsumexp - target; the identical
+    # vocabulary rows give exactly log V.
     pb = _bank(mode, decode_ce_checkpoint="never")
     with torch.no_grad():
         pb.mu_embed.zero_()
@@ -74,40 +74,23 @@ def test_default_reduction_uses_legacy_arithmetic_at_large_scores(mode: str) -> 
     mu_q, sigma_q, targets = _query(mode)
     with torch.no_grad():
         mu_q.fill_(3000.0)
-    logits = pb.decode(mu_q, sigma_q)
-    expected = torch.logsumexp(logits, dim=-1) - logits.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
     loss = getattr(pb, "decode_ce_" + mode)(mu_q, sigma_q, targets)
-    torch.testing.assert_close(loss, expected.mean(), atol=0, rtol=0)
-    pb.decode_ce_stable_reduction = True
-    corrected = getattr(pb, "decode_ce_" + mode)(mu_q, sigma_q, targets)
-    torch.testing.assert_close(corrected, corrected.new_tensor(math.log(7)), atol=3e-7, rtol=0)
+    torch.testing.assert_close(loss, loss.new_tensor(math.log(7)), atol=3e-7, rtol=0)
 
 
-@pytest.mark.parametrize("stable", [False, True])
-def test_config_roundtrip_reaches_model_and_matched_baseline(stable: bool) -> None:
-    cfg = _config(decode_ce_checkpoint="auto_aggregate", decode_ce_stable_reduction=stable)
+def test_config_roundtrip_reaches_model_and_matched_baseline() -> None:
+    cfg = _config(decode_ce_checkpoint="auto_aggregate")
     restored = config_from_serialized(serialize_config(cfg), source="decoder tradeoff test")
     model = VFEModel(restored)
     assert model.prior_bank.decode_ce_checkpoint == "auto_aggregate"
-    assert model.prior_bank.decode_ce_stable_reduction is stable
     baseline = BaselineConfig(vocab_size=7, embed_dim=2, n_heads=1, n_layers=1,
                               max_seq_len=3, batch_size=1, decode_ce_checkpoint="auto_aggregate")
     assert baseline.decode_ce_checkpoint == "auto_aggregate"
 
 
-@pytest.mark.parametrize("value", [0, 1, "False", None])
-def test_stable_toggle_rejects_non_boolean_config(value: object) -> None:
-    with pytest.raises(ValueError, match="decode_ce_stable_reduction"):
-        _config(decode_ce_stable_reduction=value)
-
-
 @pytest.mark.parametrize("policy", ["auto", "auto_aggregate"])
-@pytest.mark.parametrize("stable", [False, True])
-def test_generic_family_keeps_aggregate_policy_and_excluded_row_gradients(
-    policy: str,
-    stable: bool,
-) -> None:
-    pb = _bank("full_chunked", decode_ce_checkpoint=policy, decode_ce_stable_reduction=stable)
+def test_generic_family_keeps_aggregate_policy_and_excluded_row_gradients(policy: str) -> None:
+    pb = _bank("full_chunked", decode_ce_checkpoint=policy)
     pb.decode_mode = "family_chunked"
     pb.renyi_order = 0.5  # Exercise the generic full-family route rather than the analytic delegate.
     mu_q, sigma_q, targets = _query("full_chunked")

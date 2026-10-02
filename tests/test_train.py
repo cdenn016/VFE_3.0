@@ -64,28 +64,11 @@ def test_lr_lambda_warmup_then_cosine():
     assert abs(lr_lambda(100, cfg) - 0.0) < 1e-3           # ~0 at max_steps
 
 
-def test_scheduler_floors_lr_at_min_lr():
-    # The cosine multiplier decays to 0 at max_steps; the floored per-group scheduler built in
-    # train() must keep EACH group's absolute LR >= cfg.min_lr there (and beyond). Build the real
-    # optimizer+scheduler, fast-forward to max_steps, and check every group.
-    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2,
-                     warmup_steps=2, max_steps=10, min_lr=1e-5, min_lr_frac=0.0)
-    model = VFEModel(cfg)
-    opt = build_optimizer(model, cfg)
-    base_lrs = [g["lr"] for g in opt.param_groups]
-    sched = torch.optim.lr_scheduler.LambdaLR(opt, _floor_lr_lambdas(base_lrs, cfg))
-    for _ in range(cfg.max_steps + 5):                     # step past max_steps into the clamped tail
-        sched.step()
-    for lr in sched.get_last_lr():
-        assert lr >= cfg.min_lr - 1e-12                    # floored, never decays to zero
-        assert math.isclose(lr, cfg.min_lr, rel_tol=1e-9)  # at the tail every group sits exactly on the floor
-
-
-def test_scheduler_min_lr_zero_is_pure_cosine():
-    # min_lr=0.0 is the theoretically pure path: the floor max(0/base, cosine)=cosine, so the LR
+def test_scheduler_min_lr_frac_zero_is_pure_cosine():
+    # min_lr_frac=0.0 is the theoretically pure path: the floor max(0, cosine)=cosine, so the LR
     # decays to exactly zero at max_steps, identical to the unfloored half-cosine.
     cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2,
-                     warmup_steps=2, max_steps=10, min_lr=0.0, min_lr_frac=0.0)
+                     warmup_steps=2, max_steps=10, min_lr_frac=0.0)
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
     base_lrs = [g["lr"] for g in opt.param_groups]
@@ -98,10 +81,9 @@ def test_scheduler_min_lr_zero_is_pure_cosine():
 
 def test_fractional_floor_scales_each_group_to_min_lr_frac_times_base():
     # Option B: min_lr_frac floors EACH group's absolute LR at min_lr_frac * its own base LR,
-    # so the m_mu:m_sigma:m_phi base ratios are preserved into the cosine tail (unlike the shared
-    # absolute min_lr, which floors every group at the same value regardless of base).
+    # so the m_mu:m_sigma:m_phi base ratios are preserved into the cosine tail.
     cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2,
-                     warmup_steps=2, max_steps=10, min_lr=0.0, min_lr_frac=0.01,
+                     warmup_steps=2, max_steps=10, min_lr_frac=0.01,
                      m_p_mu_lr=0.02, m_p_sigma_lr=0.004, m_phi_lr=0.01)
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
@@ -113,28 +95,11 @@ def test_fractional_floor_scales_each_group_to_min_lr_frac_times_base():
         assert math.isclose(lr, cfg.min_lr_frac * base, rel_tol=1e-9)
 
 
-def test_floor_is_max_of_absolute_min_lr_and_fractional():
-    # Both knobs live together: each group floors at max(min_lr, min_lr_frac * base). With
-    # min_lr=1e-3, min_lr_frac=0.01: mu(base 0.2)->frac 2e-3 wins; sigma(base 0.05)->abs 1e-3 wins.
-    cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2,
-                     warmup_steps=2, max_steps=10, min_lr=1e-3, min_lr_frac=0.01,
-                     m_p_mu_lr=0.2, m_p_sigma_lr=0.05, m_phi_lr=0.2)
-    model = VFEModel(cfg)
-    opt = build_optimizer(model, cfg)
-    base_lrs = [g["lr"] for g in opt.param_groups]
-    sched = torch.optim.lr_scheduler.LambdaLR(opt, _floor_lr_lambdas(base_lrs, cfg))
-    for _ in range(cfg.max_steps + 5):
-        sched.step()
-    for base, lr in zip(base_lrs, sched.get_last_lr()):
-        assert math.isclose(lr, max(cfg.min_lr, cfg.min_lr_frac * base), rel_tol=1e-9)
-
-
 def test_floor_lambdas_handle_zero_base_lr_without_dividing():
-    # A deliberately frozen channel (m_phi_lr=0) gives a group with base LR 0. The floor builder
-    # must NOT compute min_lr/0 (ZeroDivisionError), and the frozen group must stay at 0 -- an
-    # absolute min_lr does not resurrect a channel the user chose to freeze.
+    # A deliberately frozen channel (m_phi_lr=0) gives a group with base LR 0; the fractional
+    # floor min_lr_frac * 0 keeps it frozen.
     cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2,
-                     warmup_steps=2, max_steps=10, min_lr=1e-5, m_phi_lr=0.0)
+                     warmup_steps=2, max_steps=10, min_lr_frac=0.01, m_phi_lr=0.0)
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
     base_lrs = [g["lr"] for g in opt.param_groups]
@@ -146,7 +111,7 @@ def test_floor_lambdas_handle_zero_base_lr_without_dividing():
         if base == 0.0:
             assert lr == 0.0                               # frozen stays frozen
         else:
-            assert lr >= cfg.min_lr - 1e-12
+            assert lr >= cfg.min_lr_frac * base - 1e-12
 
 
 def test_aux_role_learning_rate_reporting_handles_active_and_inactive_mixers():

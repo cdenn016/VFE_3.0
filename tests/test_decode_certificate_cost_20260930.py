@@ -88,17 +88,13 @@ def test_decode_av_only_computes_a_bound_when_requested(
 
 
 @pytest.mark.parametrize("checkpoint", ["auto", "always", "never"])
-@pytest.mark.parametrize("escalation,refinement", [
-    (False, "full"), (False, "candidates"), (True, "candidates"),
-])
+@pytest.mark.parametrize("escalation", [False, True])
 def test_diagonal_ce_skips_unused_ranking_work(
     checkpoint: str,
-    refinement: str,
     escalation: bool,
 ) -> None:
     pb = _bank(checkpoint)
     pb.decode_ranking_fp64_escalation = escalation
-    pb.decode_ranking_refinement = refinement
     mu_q = torch.full((1, 2, 4), 0.1, requires_grad=True)
     sigma_q = torch.ones_like(mu_q, requires_grad=True)
     with _OperationCounts() as operations:
@@ -156,10 +152,10 @@ def test_diagonal_ce_query_gradient_matches_finite_difference(query_channel: str
 
 
 @pytest.mark.parametrize("checkpoint", ["always", "never"])
-def test_full_refinement_still_certifies_and_promotes_near_ties(checkpoint: str) -> None:
+def test_near_ties_keep_the_streamed_float32_ce(checkpoint: str) -> None:
+    # The candidate-refined guard certifies only the logits ranking; the training CE never reads it.
     pb = _bank(checkpoint)
     pb.decode_ranking_fp64_escalation = True
-    pb.decode_ranking_refinement = "full"
     with torch.no_grad():
         pb.mu_embed.zero_()
         pb.sigma_log_embed.zero_()
@@ -168,14 +164,10 @@ def test_full_refinement_still_certifies_and_promotes_near_ties(checkpoint: str)
     targets = torch.tensor([[0, 6]])
     with _OperationCounts() as operations:
         ce = pb.decode_ce_diagonal_chunked(mu_q, sigma_q, targets)
-    assert operations.counts["aten.argmax.default"] > 0
-    assert operations.counts["aten.nextafter.default"] > 0
-    assert ce.dtype == torch.float64
-    torch.testing.assert_close(ce, torch.tensor(7.0, dtype=torch.float64).log())
-    dense_ce = F.cross_entropy(pb.decode(mu_q, sigma_q).reshape(-1, 7), targets.reshape(-1))
-    inputs = (mu_q, sigma_q, pb.mu_embed, pb.sigma_log_embed, pb.decode_log_scale)
-    for fused, dense in zip(torch.autograd.grad(ce, inputs), torch.autograd.grad(dense_ce, inputs)):
-        torch.testing.assert_close(fused, dense, rtol=1e-12, atol=1e-12)
+    assert operations.counts["aten.argmax.default"] == 0
+    assert operations.counts["aten.nextafter.default"] == 0
+    assert ce.dtype == torch.float32
+    torch.testing.assert_close(ce, torch.tensor(7.0).log())
 
 
 @pytest.mark.parametrize("checkpoint", ["always", "never"])

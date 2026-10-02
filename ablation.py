@@ -313,7 +313,6 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     attention_mode                   = "projected_predictive",  # "projected_predictive" | "projected_gradient"
 
 
-    predictive_covariance_centering  = False,          # False: historical raw moments; True: center source means to reduce covariance cancellation
     attention_residual               = True,   # predictive S/T/O: add the incoming mean
     # projected_gradient receiver (projected_gradient.tex); inert under projected_predictive
     relational_receiver_law          = "channel_likelihood",  # "channel_likelihood" (entropy once, unobserved directions keep the prior) | "ambient_alignment" (PR #30)
@@ -355,7 +354,6 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     encode_mode                       = "per_token",   #"per_token_additive" is ~1.5x faster at K=80 currently unablated
     decode_chunk_size                 = 8192,
     decode_ce_checkpoint              = "auto",     # historical gate; "auto_aggregate" saves memory with recompute
-    decode_ce_stable_reduction        = False,      # True avoids large-score CE cancellation; adds tensor passes
     decode_tau                        = 0.008,       #prior_bank = True temperature
     
     unigram_kappa                     = 1.0,         # tempering on log pi_v (1.0 = exact Bayes class prior)

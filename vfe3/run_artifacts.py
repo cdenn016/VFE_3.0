@@ -3457,7 +3457,6 @@ def _estep_endpoint_artifact(evidence: Mapping[str, object]) -> Dict[str, str]:
 
 def _scheduler_metadata(
     *,
-    min_lr: float,
     min_lr_frac: float,
     base_lrs: Iterable[float] = (),
     group_roles: Iterable[str] = (),
@@ -3479,18 +3478,16 @@ def _scheduler_metadata(
             "role": role,
             "base_lr": base,
             "frozen": frozen,
-            "absolute_floor": 0.0 if frozen else float(min_lr),
             "fractional_floor": 0.0 if frozen else float(min_lr_frac) * base,
-            "effective_floor": (0.0 if frozen else max(float(min_lr), float(min_lr_frac) * base)),
+            "effective_floor": 0.0 if frozen else float(min_lr_frac) * base,
         })
     return {
         "kind": "warmup_half_cosine_with_floor",
-        "absolute_floor": float(min_lr),
         "fractional_floor": float(min_lr_frac),
         "zero_base_groups_remain_frozen": True,
         "floor_description": (
             "0 for group_base_lr == 0; otherwise "
-            "max(absolute_floor, fractional_floor * group_base_lr)"
+            "fractional_floor * group_base_lr"
         ),
         "groups": groups,
     }
@@ -3928,7 +3925,6 @@ def finalize_run(
         "estep_final_f_per_token": results.get("estep_final_f_per_token"),
         "estep_iterate_evidence": results.get("estep_iterate_evidence"),
         "scheduler": _scheduler_metadata(
-            min_lr=cfg.min_lr,
             min_lr_frac=cfg.min_lr_frac,
             base_lrs=getattr(artifacts, "scheduler_base_lrs", ()),
             group_roles=getattr(artifacts, "scheduler_group_roles", ()),

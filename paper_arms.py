@@ -43,7 +43,7 @@ base's except where declared. Rules:
   replaced by ``'mahalanobis'`` where the base has one (``'none'`` stays), and
   ``decode_coordinates='reference'``.
 * Word level: dataset ``wikitext-103-word-eos`` (the published stream, one ``<eos>`` per line), the
-  vocabulary size from its sidecar, ``decode_ce_checkpoint='always'``, and the one-epoch budget over
+  vocabulary size from its sidecar, ``decode_ce_checkpoint='auto_aggregate'``, and the one-epoch budget over
   the word training split. The conventional word arm is matched to the Gaussian word arm.
 * Matched measured compute: at run time the target is the mean measured train-only device-hours of
   the retrained evaluated arm's complete runs; every width of the pre-declared ladder
@@ -246,7 +246,7 @@ ARMS: Dict[str, Dict[str, Any]] = {
         "group": _BASELINES, "slug": "tf_type_table", "baseline": {"per_type_table": "block_read"}},
     "Gaussian attention": {
         "group": _WORD_LEVEL, "slug": "word_gaussian", "dataset": WORD_DATASET,
-        "vfe": {"vocab_size": _word_vocab_size, "decode_ce_checkpoint": "always"}},
+        "vfe": {"vocab_size": _word_vocab_size, "decode_ce_checkpoint": "auto_aggregate"}},
     "Conventional transformer, matched": {
         "group": _WORD_LEVEL, "slug": "word_tf_matched", "dataset": WORD_DATASET,
         "baseline": {"per_type_table": "none"}, "matched_to_arm": "Gaussian attention"},
@@ -261,7 +261,7 @@ BASELINE_PROTOCOL_FIELDS: Dict[str, str] = {
     "embed_dim": "embed_dim", "n_heads": "n_heads", "n_layers": "n_layers",
     "mlp_expansion": "block_mlp_expansion", "seed": "seed", "deterministic": "deterministic",
     "amp_dtype": "amp_dtype", "fp32_matmul_precision": "fp32_matmul_precision",
-    "warmup_steps": "warmup_steps", "min_lr": "min_lr", "min_lr_frac": "min_lr_frac",
+    "warmup_steps": "warmup_steps", "min_lr_frac": "min_lr_frac",
     "grad_clip": "grad_clip", "beta_attention_prior": "beta_attention_prior",
     "alibi_slope": "alibi_slope", "decode_bias": "decode_bias",
     "decode_unigram_prior": "decode_unigram_prior", "unigram_kappa": "unigram_kappa",

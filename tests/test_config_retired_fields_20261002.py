@@ -154,7 +154,9 @@ def test_retired_gauge_groups_are_refused_on_load_and_construction(group: str) -
 def test_retired_fields_are_not_constructor_arguments() -> None:
     for key in ("e_step_update", "mu_trust_mode", "renyi_order", "transport_mode", "m_decode_lr",
                 "_allow_legacy_dense_decode", "decode_temperature_learned", "safe_cholesky_jitter_mode",
-                "exp_fp64_norm_threshold", "frame_pair_fp64_escalation", "transport_clamp_monitor"):
+                "exp_fp64_norm_threshold", "frame_pair_fp64_escalation", "transport_clamp_monitor",
+                "decode_ce_stable_reduction", "decode_ranking_refinement",
+                "predictive_covariance_centering", "min_lr"):
         with pytest.raises(TypeError):
             test_config(**{key: None})
 
@@ -319,3 +321,37 @@ def test_a_frame_outside_the_chart_raises_instead_of_being_rescaled() -> None:
     tokens = torch.tensor([[0, 1, 2]])
     with pytest.raises(ValueError, match="transport chart validity bound exceeded"):
         model(tokens, tokens)
+
+
+# ---- numerical-policy hardcoding (retired later on 2026-10-02) -----------------------------------
+
+@pytest.mark.parametrize(("key", "value"), [
+    ("decode_ce_stable_reduction", True), ("decode_ce_stable_reduction", False),
+    ("decode_ranking_refinement", "candidates"), ("decode_ranking_refinement", "full"),
+    ("predictive_covariance_centering", True), ("predictive_covariance_centering", False),
+    ("min_lr", 0), ("min_lr", 0.0),
+])
+def test_rounding_level_policy_keys_load_and_drop(key: str, value: object) -> None:
+    assert _load(**{key: value}) == test_config()
+    assert key in RETIRED_CONFIG_KEYS
+
+
+@pytest.mark.parametrize(("key", "value"), [
+    ("decode_ce_stable_reduction", "yes"), ("predictive_covariance_centering", 1),
+    ("decode_ranking_refinement", "some"),
+])
+def test_rounding_level_policy_keys_refuse_an_invalid_value(key: str, value: object) -> None:
+    with pytest.raises(ValueError, match=key):
+        _load(**{key: value})
+
+
+@pytest.mark.parametrize("value", [1e-5, 0.2, True])
+def test_a_nonzero_absolute_lr_floor_is_refused(value: object) -> None:
+    with pytest.raises(ValueError, match="retired min_lr="):
+        _load(min_lr=value)
+
+
+@pytest.mark.parametrize("value", ["always", "never"])
+def test_forced_checkpoint_policies_load_as_auto(value: str) -> None:
+    assert _load(decode_ce_checkpoint=value) == test_config(decode_ce_checkpoint="auto")
+    assert _load(decode_ce_checkpoint="auto_aggregate").decode_ce_checkpoint == "auto_aggregate"

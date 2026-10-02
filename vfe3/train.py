@@ -530,23 +530,20 @@ def _floor_lr_lambdas(
     cfg:      VFE3Config,
 ) -> List[Callable[[int], float]]:
     r"""Per-group ``LambdaLR`` multipliers that floor each group's ABSOLUTE LR at
-    ``max(cfg.min_lr, cfg.min_lr_frac * base)``.
+    ``cfg.min_lr_frac * base``.
 
     A ``LambdaLR`` scales each group's base LR by its multiplier, so flooring the
-    *multiplier* at ``max(min_lr/base, min_lr_frac)`` floors the *product*::
+    *multiplier* at ``min_lr_frac`` floors the *product*::
 
-        base * max(min_lr/base, min_lr_frac, cosine) = max(min_lr, min_lr_frac*base, base*cosine).
+        base * max(min_lr_frac, cosine) = max(min_lr_frac*base, base*cosine).
 
-    The absolute floor ``min_lr`` is shared across groups; the fractional floor
-    ``min_lr_frac`` scales with each group's own base, preserving the m_mu:m_sigma:m_phi
-    ratios into the cosine tail. A group whose base LR is 0 (a deliberately frozen
-    channel, e.g. ``m_phi_lr=0``) drops the ``min_lr/base`` term (no division by zero)
-    and stays frozen: ``min_lr`` does not resurrect it. With ``min_lr=min_lr_frac=0``
-    this is the pure half-cosine-to-zero.
+    The fractional floor scales with each group's own base, preserving the m_mu:m_sigma:m_phi
+    ratios into the cosine tail; a group whose base LR is 0 (a deliberately frozen channel,
+    e.g. ``m_phi_lr=0``) stays frozen. With ``min_lr_frac=0`` this is the pure
+    half-cosine-to-zero.
     """
     def make(base: float) -> Callable[[int], float]:
-        abs_mult = cfg.min_lr / base if base > 0.0 else 0.0     # shared absolute floor (skip if frozen)
-        floor    = max(abs_mult, cfg.min_lr_frac)               # combined per-group multiplier floor
+        floor = cfg.min_lr_frac                                 # per-group multiplier floor
         return lambda s: max(floor, lr_lambda(s, cfg))
     return [make(b) for b in base_lrs]
 
@@ -2750,7 +2747,7 @@ def train(
     terminal_validation_metrics = None
     optimizer = build_optimizer(model, cfg)
     # Warmup/cosine multiplier, floored per group so each group's ABSOLUTE LR never decays below
-    # max(cfg.min_lr, cfg.min_lr_frac * base) -- see _floor_lr_lambdas. With cfg.min_lr=cfg.min_lr_frac=0
+    # cfg.min_lr_frac * base -- see _floor_lr_lambdas. With cfg.min_lr_frac=0
     # this is exactly the pure half-cosine-to-zero (the theoretically pure path). base_lrs are the
     # CONFIGURED per-group LRs, captured before any scheduler multiplier or resume-load mutates group['lr'].
     base_lrs = [g["lr"] for g in optimizer.param_groups]
