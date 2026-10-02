@@ -1,6 +1,7 @@
 r"""Role-specific comparison and content operators in realized canonical frames."""
 
 import math
+from numbers import Real
 from typing import List, Tuple
 
 import torch
@@ -37,6 +38,9 @@ class RelationalOperators(nn.Module):
         predictive_covariance_centering: bool = False,
         *,
         receiver_noise:        float = 1.0,
+        receiver_law:          str   = "ambient_alignment",
+        receiver_update:       str   = "euler",
+        receiver_damping:      float = 1.0,
     ) -> None:
         super().__init__()
         if not irrep_dims or any(type(d) is not int or d < 1 for d in irrep_dims) or len(set(irrep_dims)) != 1:
@@ -53,10 +57,21 @@ class RelationalOperators(nn.Module):
         self.attention_residual = attention_residual
         if readout_mode not in ("predictive_content", "full_link_update"):
             raise ValueError("relational readout_mode must be predictive_content or full_link_update")
-        if (isinstance(receiver_noise, bool) or not isinstance(receiver_noise, (int, float))
+        if (isinstance(receiver_noise, bool) or not isinstance(receiver_noise, Real)
                 or not math.isfinite(receiver_noise) or receiver_noise <= 0.0):
             raise ValueError("receiver_noise must be a finite positive reference variance")
         self.receiver_noise = float(receiver_noise)
+        if receiver_law not in ("ambient_alignment", "channel_likelihood"):
+            raise ValueError("receiver_law must be 'ambient_alignment' or 'channel_likelihood'")
+        if receiver_update not in ("euler", "closed_form"):
+            raise ValueError("receiver_update must be 'euler' or 'closed_form'")
+        if (isinstance(receiver_damping, bool) or not isinstance(receiver_damping, Real)
+                or not math.isfinite(receiver_damping) or not 0.0 < receiver_damping <= 1.0):
+            raise ValueError("receiver_damping must lie in (0, 1]")
+        # Full-link receiver law and update (projected_gradient.tex); inert under predictive_content.
+        self.receiver_law = receiver_law
+        self.receiver_update = receiver_update
+        self.receiver_damping = float(receiver_damping)
         self.readout_mode = readout_mode
         if routing not in ("gaussian_kl", "noisy_query"):
             raise ValueError("relational routing must be 'gaussian_kl' or 'noisy_query'")

@@ -626,6 +626,7 @@ def test_main_publishes_nonlayer_channels_when_embeddings_are_disabled(
             seed=seed,
             metrics=f"step,train_ce\n100,{train_ce}\n",
             config={"config": {
+                "attention_mode": "projected_predictive",
                 "seed": seed,
                 "pos_phi": "none",
                 "generate_embedding_figures": False,
@@ -690,6 +691,7 @@ def test_main_withholds_only_partial_optional_per_layer_channel(tmp_path, monkey
             metrics=f"step,train_ce\n100,{train_ce}\n",
             per_layer="layer,self_coupling\n0,1\n" if seed == 1 else None,
             config={"config": {
+                "attention_mode": "projected_predictive",
                 "seed": seed,
                 "pos_phi": "none",
                 "generate_embedding_figures": False,

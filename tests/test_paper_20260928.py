@@ -225,7 +225,7 @@ def test_multiseed_analysis_new_scalar_keys_curves_and_token_axis(tmp_path: Path
     for seed, best in ((1, 1.5), (2, 1.7)):
         run = tmp_path / f"run_s{seed}"
         run.mkdir()
-        (run / "config.json").write_text(json.dumps({"config": {"seed": seed}}))
+        (run / "config.json").write_text(json.dumps({"config": {"attention_mode": "projected_predictive", "seed": seed}}))
         (run / "summary.json").write_text(json.dumps({"test_ppl": 5.0, "test_best_ce": best}))
         (run / "provenance.json").write_text(json.dumps({
             "seed": seed, "git_sha": "a" * 40, "git_dirty": False, "git_dirty_fingerprint": None,

@@ -129,6 +129,11 @@ config = dict(
 
     
     attention_residual               = True,   # predictive S/T/O: add the incoming mean
+    # projected_gradient receiver (projected_gradient.tex); inert under projected_predictive
+    relational_receiver_law          = "channel_likelihood",  # "channel_likelihood" (entropy once, unobserved directions keep the prior) | "ambient_alignment" (PR #30)
+    relational_receiver_update       = "closed_form",         # "closed_form" (exact frozen-context update) | "euler" (Fisher step; reads e_q_mu_lr / e_q_sigma_lr / trusts)
+    relational_receiver_damping      = 1.0,                   # closed_form only: rho in (0, 1]; 1 = the frozen minimizer
+    relational_receiver_noise        = 1.0,                   # channel floor nu I_d (channel_likelihood) | K-dim reference noise (ambient_alignment)
     relational_routing               = "gaussian_kl",  # "gaussian_kl" | "noisy_query": exact posterior N(a_i; b_j, V_Q + V_K), predictive only
     predictive_covariance            = "passthrough",  # "passthrough" (Sigma kept at encode) | "moment_matched" (exact predictive-kernel covariance), predictive only
     predictive_covariance_centering  = False,          # False: historical raw moments; True: center source means to reduce covariance cancellation
@@ -169,7 +174,7 @@ config = dict(
     
     decode_mode                       = 'full_chunked',  # prior-bank: diagonal_chunked/full_chunked/expected_likelihood_chunked/family_chunked
     encode_mode                       = "per_token",   #"per_token_additive" is ~1.5x faster at K=80 currently unablated
-                                                       # "canonical_content_projected" requires gaussian_diagonal input and a full decoder
+                                                       # canonical_content_* encoders are rejected by both projected routes
     decode_chunk_size                 = 8192,
     decode_ce_checkpoint              = "auto",     # historical gate; "auto_aggregate" saves memory with recompute
     decode_ce_stable_reduction        = False,      # True avoids large-score CE cancellation; adds tensor passes

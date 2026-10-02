@@ -117,7 +117,9 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
                                 else "relational_predictive_content"),
         "readout_mode": cfg.relational_readout_mode,
         "output_scope": "full",
-        "mean_update": ("receiver_fisher_step" if full_link else
+        "mean_update": (("receiver_closed_form_natural_parameter_update"
+                         if cfg.relational_receiver_update == "closed_form" else "receiver_fisher_step")
+                        if full_link else
                         "input_plus_predictive_mean" if cfg.attention_residual else
                         "replace_with_predictive_mean"),
         "mode": cfg.relational_mode,
@@ -139,9 +141,16 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
             for role in counts},
         "score_covariance_contract": "exact_full_reduced_covariance_from_local_gaussian",
         "receiver_noise": cfg.relational_receiver_noise if full_link else None,
-        "covariance_update": (("passthrough" if cfg.skip_belief_sigma_update else "fisher_step") if full_link
-                              else getattr(cfg, "predictive_covariance", "passthrough")),
-        "content_covariance_contract": ("full_link_pushforward_plus_positive_reference_noise" if full_link else
+        "receiver_law": cfg.relational_receiver_law if full_link else None,
+        "receiver_update": cfg.relational_receiver_update if full_link else None,
+        "receiver_damping": (cfg.relational_receiver_damping
+                             if full_link and cfg.relational_receiver_update == "closed_form" else None),
+        "covariance_update": (("passthrough" if cfg.skip_belief_sigma_update else
+                               "closed_form" if cfg.relational_receiver_update == "closed_form" else "fisher_step")
+                              if full_link else getattr(cfg, "predictive_covariance", "passthrough")),
+        "content_covariance_contract": (("value_space_channel_likelihood_plus_channel_noise"
+                                         if cfg.relational_receiver_law == "channel_likelihood" else
+                                         "full_link_pushforward_plus_positive_reference_noise") if full_link else
                                         "exact_predictive_kernel_moment_match_plus_covariant_floor"
                                         if getattr(cfg, "predictive_covariance", "passthrough") == "moment_matched"
                                         else "frozen_receiver_bookkeeping_not_predictive_covariance"),
@@ -153,7 +162,11 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "factorization_fallback": "failed_entries_source_square_root_qr_fp64",
         "temperature_convention": "kappa_beta_times_sqrt_ambient_head_dim",
         "routing_state": "episode_initial" if full_link else "pre_update",
-        "state_destination": "receiver_belief_mean_and_covariance" if full_link else "receiver_belief_mean",
+        "state_destination": (
+            "receiver_belief_mean_and_covariance"
+            if (full_link and not getattr(cfg, "skip_belief_sigma_update", False))
+            or (not full_link and getattr(cfg, "predictive_covariance", "passthrough") == "moment_matched")
+            else "receiver_belief_mean"),
         "source_beliefs": "live_episode_initial" if full_link else "live_pre_update",
         "outer_operator_and_frame_graph": "live",
         "canonical_shared_objective": False,
@@ -176,7 +189,9 @@ def _conditional_unavailable_probe(probe: str, cfg: Optional[VFE3Config] = None)
                                 else "relational_predictive_content"
                                 if cfg is not None and cfg.relational_readout_mode == "predictive_content"
                                 else "projected_attention"),
-        "reason": ("only the configured single readout is supported; inference-depth sweeps are unavailable"
+        "reason": (("only the configured receiver episode is supported; inference-depth sweeps are unavailable"
+                    if cfg is not None and cfg.relational_readout_mode == "full_link_update"
+                    else "only the configured single readout is supported; inference-depth sweeps are unavailable")
                    if "depth" in probe or probe == "zero_e_steps_counterfactual"
                    else "routing and readout do not define the legacy shared stationary free-energy objective"),
         "points": [],
@@ -489,6 +504,17 @@ def semantic_config_fingerprint(
     """Return the stable SHA-256 fingerprint of a normalized semantic config mapping."""
     normalized = json.dumps(dict(config), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _migrated_config_fingerprint(
+    config: Mapping[str, Any],
+) -> str:
+    """Fingerprint a saved config in current serialized form, or raw when it no longer loads."""
+    try:
+        return semantic_config_fingerprint(_serialize_run_config(
+            _config_from_run_serialized(config, source="resume provenance fingerprint")))
+    except (TypeError, ValueError):
+        return semantic_config_fingerprint(config)
 
 
 def _phi_chart_norm_route(
@@ -1686,6 +1712,10 @@ class RunArtifacts:
         self.numerics_counters: Optional[Dict[str, object]] = None
         self.numerics_counters_state: Optional[Dict[str, int]] = None
         self.resumed_numerics_counters: Optional[Dict[str, int]] = None
+        # Cumulative wall clock a checkpoint carries (set by train()) and the value a resumed
+        # checkpoint carried in (set by load_checkpoint), so metrics.csv wall_clock_s continues.
+        self.wall_clock_state: Optional[float] = None
+        self.resumed_wall_clock_s: Optional[float] = None
         # Source bytes at run start: vfe3/**/*.py, root *.py drivers and pyproject.toml, zipped with
         # their hash, the Git HEAD and the dirty-file list. Best-effort: a failure is recorded in
         # the returned mapping (and later in provenance.json), never raised.
@@ -1978,6 +2008,7 @@ class RunArtifacts:
                 # diagnostic, never read by the resume contract itself.
                 "numerics_counters": _checkpoint_numerics_counters(
                     getattr(self, "numerics_counters_state", None)),
+                "wall_clock_s":    getattr(self, "wall_clock_state", None),
             }, tmp)
             _atomic_replace(path, tmp)
         return path
@@ -2421,6 +2452,10 @@ def load_checkpoint(
         # continues counting from them so a resumed run's columns stay cumulative since step 0.
         artifacts.resumed_numerics_counters = _checkpoint_numerics_counters(
             ckpt.get("numerics_counters"))
+        saved_wall_clock = ckpt.get("wall_clock_s")
+        artifacts.resumed_wall_clock_s = (
+            float(saved_wall_clock) if isinstance(saved_wall_clock, (int, float))
+            and not isinstance(saved_wall_clock, bool) and math.isfinite(saved_wall_clock) else None)
         saved_code_identity = ckpt.get("code_identity_sha256")
         code_identity_match = (
             saved_code_identity == expected_code_identity
@@ -2445,8 +2480,10 @@ def load_checkpoint(
             "saved_step":                      saved_step,
             "config_restore_policy":           "current_config_authoritative",
             "config_drift_fields":             list(config_drift),
+            # Fingerprint the saved mapping after loader migration, so a pre-migration checkpoint
+            # (e.g. relational_mode/scope keys before PR #32) with no semantic drift matches.
             "saved_config_fingerprint":        (
-                semantic_config_fingerprint(saved_config)
+                _migrated_config_fingerprint(saved_config)
                 if isinstance(saved_config, Mapping) else None
             ),
             "current_config_fingerprint":      (
@@ -4130,10 +4167,12 @@ def collect_estep_character(
         denominator = float(mu_p.norm())
         return {
             "available": True, "inference_semantics": model.conditional_semantics,
-            "trained_depth": 1, "depth_sweep_available": False,
-            "depth_sweep_reason": "only the configured single readout is supported",
+            "trained_depth": len(snapshot.trace_states) - 1, "depth_sweep_available": False,
+            "depth_sweep_reason": ("only the configured receiver episode is supported"
+                                   if model.cfg.relational_readout_mode == "full_link_update"
+                                   else "only the configured single readout is supported"),
             "precision_split_available": False,
-            "points": [{"belief_depth": 1, "rel_displacement": (
+            "points": [{"belief_depth": len(snapshot.trace_states) - 1, "rel_displacement": (
                 float((mu_q - mu_p).norm()) / denominator if denominator > 0 else None),
                 "pair_precision_share": None, "cos_dir_vs_step1": None,
                 "displacement_window": "captured_pre_transform_readout"}],
@@ -5058,7 +5097,18 @@ def _pure_path_report(
     gauge_flags = {
         "learned_gauge_transport":   cfg.gauge_transport == "on",
         "transport_gauge_equivariant": transport_registration.gauge_equivariant,
-        "no_positional_rotation":    cfg.pos_rotation == "none",
+        # RoPE is folded on the right of the realized frame (U_i R_i^T), the same right-factor
+        # structure as pos_phi, so both projected routes stay covariant (audit 2026-10-01 F11).
+        "positional_rotation_gauge_covariant": (
+            cfg.pos_rotation == "none" or getattr(cfg, "rope_insertion", "right") == "right"),
+        # A box clamp in the Cholesky-whitened chart is not GL-covariant for a full-covariance
+        # receiver; a ball, no trust region, a diagonal family, or a closed-form receiver is.
+        "mean_trust_gauge_covariant": (
+            getattr(cfg, "attention_mode", None) != "projected_gradient"
+            or getattr(cfg, "relational_receiver_update", "euler") == "closed_form"
+            or getattr(cfg, "e_mu_q_trust", None) is None
+            or getattr(cfg, "mu_trust_mode", "ball") == "ball"
+            or bool(getattr(cfg, "diagonal_covariance", False))),
         "family_group_invariant":    family_group_invariant,
         "head_mixer_intertwiner_compatible": head_mixer_gauge_compatible,
         "block_mlp_intertwiner_compatible": block_mlp_intertwiner_compatible,
@@ -5135,8 +5185,7 @@ def _pure_path_report(
             # dense, hence rope_full_gauge=True requiring gaussian_full) but previously unrecorded.
             "rope_pair_energy_exactness":   (
                 "not_applicable" if cfg.pos_rotation == "none"
-                else "exact_rope_congruence" if cfg.rope_full_gauge
-                else "means_only_unrotated_covariance"
+                else "frame_folded_both_moments"   # projected routes push both moments through U_i R_i^T
             ),
             "skip_belief_sigma_update":      bool(cfg.skip_belief_sigma_update),
             "predictive_covariance":         getattr(cfg, "predictive_covariance", "passthrough"),

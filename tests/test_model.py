@@ -189,10 +189,15 @@ def test_attention_maps_last_layer_matches_diagnostics():
                      n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.0,
                      norm_type_block="none", use_block_mlp=False)
     model = VFEModel(cfg)
-    tokens = torch.randint(0, 12, (2, 5))
+    # attention_maps reports sequence 0; projected diagnostics average the batch (audit 2026-10-01
+    # F5), so the contract is checked on a single-sequence batch with seeded tokens.
+    tokens = torch.randint(0, 12, (1, 5), generator=torch.Generator().manual_seed(0))
     maps = model.attention_maps(tokens)
     ent = float(metrics.attention_entropy(maps[-1]))
     assert abs(ent - model.diagnostics(tokens)["attn_entropy"]) < 1e-6
+    # A multi-sequence batch still reports sequence 0's maps.
+    batch = torch.cat((tokens, torch.randint(0, 12, (1, 5), generator=torch.Generator().manual_seed(1))))
+    torch.testing.assert_close(model.attention_maps(batch), maps)
 
 
 def test_diagnostics_per_layer_shape_and_finite():
@@ -219,7 +224,7 @@ def test_diagnostics_per_layer_attn_entropy_matches_attention_maps():
     cfg = test_config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=3,
                      n_e_steps=2, e_q_mu_lr=0.05, e_phi_lr=0.0, prior_handoff_rho=0.5)
     model = VFEModel(cfg)
-    tokens = torch.randint(0, 12, (2, 5))
+    tokens = torch.randint(0, 12, (1, 5), generator=torch.Generator().manual_seed(0))   # see F5 note above
     pl = model.diagnostics_per_layer(tokens)
     maps = model.attention_maps(tokens)
     for li in range(3):

@@ -18,7 +18,8 @@ from vfe3.alpha_i import self_coupling_alpha
 from vfe3.belief import BeliefState
 from vfe3.contracts import CanonicalFrameContext, EStepGradientRecord
 from vfe3.gradients.full_link import (
-    FullLinkContext, build_full_link_context, full_link_cost, full_link_gradients,
+    FullLinkContext, build_full_link_context, full_link_cost, full_link_cost_parts,
+    full_link_gradients, full_link_minimizer,
 )
 from vfe3.gradients.relational import relational_predictive_readout
 from vfe3.families.base import get_family
@@ -704,9 +705,10 @@ def e_step_iteration(
     r"""Update a projected receiver while retaining its incoming outer graph.
 
     Predictive content assigns its mean and optional moment-matched covariance.
-    Full-link inference applies :math:`(\Sigma\nabla_\mu F,
-    2\Sigma\nabla_\Sigma F\Sigma)` through the family Fisher metric and retracts
-    the covariance on SPD. The realized frame is fixed throughout the episode.
+    Full-link inference either applies the exact frozen-context natural-parameter update
+    (``receiver_update='closed_form'``, damping rho) or the explicit step
+    :math:`(\Sigma\nabla_\mu F, 2\Sigma\nabla_\Sigma F\Sigma)` through the family Fisher metric
+    with an SPD retraction (``'euler'``). The realized frame is fixed throughout the episode.
     """
     e_step_update = canonical_e_step_update(e_step_update)
     if (relational_operators is None
@@ -751,26 +753,33 @@ def e_step_iteration(
                     relational_capture["relational_receiver_cost_before"] = full_link_cost(
                         belief.mu, belief.sigma, _full_link_context).detach()
         grad_mu, grad_sigma = full_link_gradients(belief.mu, belief.sigma, _full_link_context)
+        closed_form = relational_operators.receiver_update == "closed_form"
         if grad_record is not None:
             grad_record["mu"] = grad_mu.detach().pow(2).sum().sqrt()
             grad_record["sigma"] = (grad_sigma.detach().pow(2).sum().sqrt()
                                     if grad_sigma is not None else grad_mu.new_zeros(()))
             grad_record["phi"] = grad_mu.new_zeros(())
-        nat_mu, nat_sigma = get_family(family)(belief.mu, belief.sigma).natural_gradient(
-            grad_mu, grad_sigma, eps=eps)
-        delta_mu = e_q_mu_lr * nat_mu
-        if e_mu_q_trust is not None:
-            delta_mu = apply_mu_trust_region(
-                delta_mu, belief.sigma, trust=e_mu_q_trust, mode=mu_trust_mode,
-                is_diagonal=(belief.sigma.dim() == belief.mu.dim()), eps=eps,
-                family=family)
-        mu = belief.mu - delta_mu
-        if skip_belief_sigma_update or nat_sigma is None:
-            sigma = belief.sigma
+        if closed_form:
+            mu, sigma = full_link_minimizer(
+                belief.mu, belief.sigma, _full_link_context,
+                damping=relational_operators.receiver_damping,
+                update_sigma=not skip_belief_sigma_update, eps=eps, sigma_max=sigma_max)
         else:
-            sigma = retract_spd_affine(
-                belief.sigma, -e_q_sigma_lr * nat_sigma, belief.mu.dim(),
-                trust_region=e_sigma_q_trust, eps=eps, sigma_max=sigma_max)
+            nat_mu, nat_sigma = get_family(family)(belief.mu, belief.sigma).natural_gradient(
+                grad_mu, grad_sigma, eps=eps)
+            delta_mu = e_q_mu_lr * nat_mu
+            if e_mu_q_trust is not None:
+                delta_mu = apply_mu_trust_region(
+                    delta_mu, belief.sigma, trust=e_mu_q_trust, mode=mu_trust_mode,
+                    is_diagonal=(belief.sigma.dim() == belief.mu.dim()), eps=eps,
+                    family=family)
+            mu = belief.mu - delta_mu
+            if skip_belief_sigma_update or nat_sigma is None:
+                sigma = belief.sigma
+            else:
+                sigma = retract_spd_affine(
+                    belief.sigma, -e_q_sigma_lr * nat_sigma, belief.mu.dim(),
+                    trust_region=e_sigma_q_trust, eps=eps, sigma_max=sigma_max)
 
     if recovery_before is not None:
         relational_capture["relational_covariance_repair_count"] = (
@@ -844,7 +853,12 @@ def e_step(
         raise ValueError("projected inference requires the realized forward frame")
 
     full_link_context = None
+    episode_start = belief
+    episode_recovery = None
     if relational_operators.readout_mode == "full_link_update":
+        if relational_capture is not None:
+            # Open the repair window before the context build, which runs the routing score.
+            episode_recovery = source_recovery_counter(belief.mu.device)
         full_link_context = build_full_link_context(
             belief.mu, belief.sigma, mu_p, sigma_p, relational_frame, relational_operators,
             tau=tau, lambda_beta=kwargs.get("lambda_beta", 1.0), value=kwargs.get("value", 1.0),
@@ -883,4 +897,20 @@ def e_step(
             **kwargs)
         if state_record is not None:
             state_record["beliefs"].append(belief)
+    if full_link_context is not None and relational_capture is not None:
+        # Episode-level records: they hold for any n_iter, including zero iterations.
+        with torch.no_grad():
+            relational_capture["full_link_context"] = full_link_context
+            relational_capture["relational_receiver_cost_after"] = full_link_cost(
+                belief.mu, belief.sigma, full_link_context).detach()
+            relational_capture["relational_covariance_repair_count"] = (
+                source_recovery_counter(belief.mu.device) - episode_recovery)
+            relational_capture["relational_mean_displacement_norm"] = (
+                belief.mu - episode_start.mu).norm().detach()
+            for tag, state in (("before", episode_start), ("after", belief)):
+                mean_part, covariance_part, distance = full_link_cost_parts(
+                    state.mu, state.sigma, full_link_context)
+                relational_capture[f"relational_receiver_mean_cost_{tag}"] = mean_part.detach()
+                relational_capture[f"relational_receiver_covariance_cost_{tag}"] = covariance_part.detach()
+                relational_capture[f"relational_receiver_target_distance_{tag}"] = distance.detach()
     return belief

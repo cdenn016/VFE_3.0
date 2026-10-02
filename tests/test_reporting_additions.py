@@ -397,9 +397,10 @@ def test_gauge_purity_axis_is_independent_of_fe_axis():
     rep = _pure_path_report(_pure_ns(gauge_transport="off"), history)
     assert rep["on_pure_path"] is False and rep["on_gauge_pure_path"] is False
     assert rep["gauge_flags"]["learned_gauge_transport"] is False
+    # Right-folded RoPE (U_i R_i^T) is covariant on the projected routes (audit 2026-10-01 F11).
     rep2 = _pure_path_report(_pure_ns(pos_rotation="rope"), history)
-    assert rep2["on_pure_path"] is False and rep2["on_gauge_pure_path"] is False
-    assert rep2["gauge_flags"]["no_positional_rotation"] is False
+    assert rep2["on_pure_path"] is False
+    assert rep2["gauge_flags"]["positional_rotation_gauge_covariant"] is True
     # the gauge settings are surfaced in config_toggles for transparency
     for key in ("gauge_transport", "pos_rotation", "rope_full_gauge", "rope_on_value"):
         assert key in rep["config_toggles"]

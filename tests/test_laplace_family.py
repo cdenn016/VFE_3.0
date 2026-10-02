@@ -24,7 +24,6 @@ from vfe3.divergence import (
     squared_hellinger,
 )
 from vfe3.families.laplace import DiagonalLaplace
-from vfe3.model.model import VFEModel
 
 
 # ---- deterministic 1-D references (float64 trapezoid) -----------------------
@@ -332,13 +331,10 @@ def test_laplace_cuda_matches_cpu():
         assert torch.allclose(cpu, cu.cpu(), atol=1e-5)
     assert torch.allclose(DiagonalLaplace(mu_q, b_q).entropy(),
                           DiagonalLaplace(mu_q.to(dev), b_q.to(dev)).entropy().cpu(), atol=1e-5)
-    cfg = test_config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                     n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, family="laplace_diagonal")
-    torch.manual_seed(0)
-    m = VFEModel(cfg).to(dev)
-    x = torch.randint(0, 12, (2, 8), device=dev); y = torch.randint(0, 12, (2, 8), device=dev)
-    _, loss, _ = m(x, y); loss.backward()
-    assert torch.isfinite(loss)
+    # Model half retired with transported attention (PR #32): both projected routes reject Laplace.
+    with pytest.raises(ValueError, match="laplace_diagonal"):
+        test_config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+                    n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, family="laplace_diagonal")
 
 
 # ===========================================================================

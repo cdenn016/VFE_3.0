@@ -1432,12 +1432,12 @@ _VAL_DIAG_KEYS = (
 # the first validation and stay present (blank) between evaluations or after a failed replay.
 _VAL_RELATIONAL_DIAG_KEYS = (
     "val_relational_legacy_global_f_available",
-    "val_relational_score_klmax_frac", "val_relational_value_klmax_frac",
-    "val_relational_conditional_cost_before", "val_relational_conditional_cost_after",
-    "val_relational_conditional_cost_delta", "val_relational_conditional_cost_tokens",
+    "val_relational_score_klmax_frac",
     "val_relational_mean_displacement_norm", "val_relational_snapshot_ce",
     "val_relational_receiver_cost_before", "val_relational_receiver_cost_after",
     "val_relational_receiver_cost_delta", "val_relational_receiver_noise",
+    "val_relational_receiver_mean_cost_delta", "val_relational_receiver_covariance_cost_delta",
+    "val_relational_receiver_target_distance_ratio",
 ) + tuple("val_relational_" + key for key in (
     "score_raw_min_singular_value", "score_q_raw_min_singular_value",
     "score_k_raw_min_singular_value", "score_rank_per_head", "content_rank_per_head",
@@ -3237,7 +3237,9 @@ def train(
         artifacts is not None and val_loader is not None and bool(eval_interval)
         and n_steps // eval_interval > start_step // eval_interval
     ) or bool(early_eval_steps)
-    timer = TrainingTimer(device) if timing_enabled else None
+    resumed_wall_clock = getattr(artifacts, "resumed_wall_clock_s", None) if start_step > 0 else None
+    timer = (TrainingTimer(device, wall_clock_offset=resumed_wall_clock or 0.0)
+             if timing_enabled else None)
     last_val: Dict[str, Optional[float]] = {}        # most recent validation, carried into each CSV row
     # VFE-only diagnostics (held-out probes, residual/attention capture, frame-clamp warning) are
     # skipped for another model family; their columns keep the VFE schema and stay blank.
@@ -3591,6 +3593,7 @@ def train(
                 except Exception as exc:
                     terminal_validation_signature = None
                     logger.warning("       (validation diagnostics failed: %s); continuing", exc)
+                    _record_diagnostic_failure(diagnostics_failures, "val_diagnostics", exc, logger)
                     last_val_diag.update({k: float("nan") for k in val_diag_keys})
                 try:
                     artifacts.maybe_save_best(step + 1, model, m["ppl"])
@@ -3652,6 +3655,7 @@ def train(
                 _record_diagnostic_failure(diagnostics_failures, "numerics_checkpoint_state",
                                            exc, logger)
                 artifacts.numerics_counters_state = None
+            artifacts.wall_clock_state = timer.elapsed_wall_clock_s() if timer is not None else None
             try:
                 artifacts.save_checkpoint(step + 1, model, optimizer, cfg, scaler=scaler,
                                           data_state=checkpoint_data_state)

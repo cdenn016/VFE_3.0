@@ -188,7 +188,7 @@ class DiagnosticSnapshot:
     layer_block_mlp_outputs: 'Tuple[BeliefState, ...]'
     stack_output:      BeliefState
     final_belief:      BeliefState
-    logits:            torch.Tensor
+    logits:            Optional[torch.Tensor]   # None when built with return_logits=False
     beta_maps:         torch.Tensor
     trace_states:      'Tuple[BeliefState, ...]'
     trace_free_energy: torch.Tensor
@@ -376,6 +376,9 @@ class VFEModel(nn.Module):
                                 attention_residual=cfg.attention_residual,
                                 output_init_scale=output_init_scale,
                                 receiver_noise=cfg.relational_receiver_noise,
+                                receiver_law=cfg.relational_receiver_law,
+                                receiver_update=cfg.relational_receiver_update,
+                                receiver_damping=cfg.relational_receiver_damping,
                                 routing=cfg.relational_routing,
                                 predictive_covariance=cfg.predictive_covariance,
                                 predictive_covariance_centering=cfg.predictive_covariance_centering,
@@ -507,8 +510,10 @@ class VFEModel(nn.Module):
                 and cfg.pos_rotation == "rope"):
             rope_caveats = []
             if not cfg.rope_on_value:
+                # gaussian_frame_diagonal replaces the relational value frame by the identity.
+                value_frame = "I" if cfg.family == "gaussian_frame_diagonal" else "U_i"
                 rope_caveats.append(
-                    "Values use U_i; the MLP uses U_i R_i^T (position-dependent MLP).")
+                    f"Values use {value_frame}; the MLP uses U_i R_i^T (position-dependent MLP).")
             if rope_caveats:
                 # A build banner remains visible even when Python warnings are filtered.
                 print("\n" + "-" * 72 + "\n"
@@ -1180,8 +1185,6 @@ class VFEModel(nn.Module):
         and a no-grad inference caller both get the identical forward value. The no-grad property used by
         generation comes from the caller's ``@torch.no_grad`` scope, not from this method.
         """
-        if self.conditional_filtering_enabled and torch.is_inference_mode_enabled():
-            raise RuntimeError("conditional filtering requires local autograd; use torch.no_grad() instead of inference_mode()")
         B, N = token_ids.shape
         if decode_last and N <= 0:
             raise ValueError("decode_last=True requires a nonempty token context")
@@ -1915,6 +1918,7 @@ class VFEModel(nn.Module):
         token_ids: torch.Tensor,                 # (B, N) integer token ids
         *,
         _share_frame_copies: bool = False,        # private read-only validation consumers only
+        return_logits:       bool = True,         # False skips the (B, N, V) decode (logits is None)
     ) -> DiagnosticSnapshot:
         r"""Capture one detached evaluation snapshot from exactly one belief forward.
 
@@ -1929,8 +1933,8 @@ class VFEModel(nn.Module):
         diagnostic: dict = {}
         capture = {"diagnostic": diagnostic}
         final_belief, logits = self.forward_beliefs(
-            token_ids, return_logits=True, capture=capture)
-        if logits is None:
+            token_ids, return_logits=return_logits, capture=capture)
+        if return_logits and logits is None:
             raise RuntimeError("diagnostic snapshot requested logits but the decoder returned None")
 
         log_prior = diagnostic["log_prior"]
@@ -1973,7 +1977,7 @@ class VFEModel(nn.Module):
                 _freeze_belief(layer, _frame_cache=frame_cache) for layer in diagnostic["layer_block_mlp_outputs"]),
             stack_output=stack_output,
             final_belief=_freeze_belief(final_belief, _frame_cache=frame_cache),
-            logits=_freeze_tensor(logits),
+            logits=_freeze_tensor(logits) if logits is not None else None,
             beta_maps=_freeze_tensor(beta_maps),
             trace_states=tuple(_freeze_belief(belief, _frame_cache=frame_cache) for belief in trace["beliefs"]),
             trace_free_energy=_freeze_tensor(trace_free_energy),
@@ -1995,7 +1999,6 @@ class VFEModel(nn.Module):
         if cap is None:
             raise ValueError("relational diagnostic snapshot is missing its forward capture")
         beta, score = cap["beta_pre"], cap["score_energy_pre"]
-        value_energy = cap.get("value_energy_pre")
         entropy = -torch.special.xlogy(beta, beta).sum(-1)
         scorable = (beta > 0).sum(-1) >= 2
         d = {key: float("nan") for key in (
@@ -2007,9 +2010,9 @@ class VFEModel(nn.Module):
             relational_legacy_global_f_available=0.0,
             attn_entropy=float(entropy.mean()),
             attn_entropy_min=(float(entropy[scorable].min()) if scorable.any() else float("nan")),
-            relational_score_klmax_frac=float((score >= self.cfg.kl_max).float().mean()),
-            relational_value_klmax_frac=(float((value_energy >= self.cfg.kl_max).float().mean())
-                                          if value_energy is not None else float("nan")),
+            # Capped fraction over the routable support (beta > 0), not over masked pairs.
+            relational_score_klmax_frac=float(
+                ((score >= self.cfg.kl_max) & (beta > 0)).sum() / (beta > 0).sum().clamp(min=1)),
         )
         from vfe3 import metrics
         d["covariance_available"] = 1.0
@@ -2019,19 +2022,25 @@ class VFEModel(nn.Module):
             eps=self.cfg.eps, family=self.cfg.family)
         d["effective_rank"] = float(spectrum["effective_rank"].mean())
         d["belief_cond_median"] = float(spectrum["condition"].median())
-        for name in ("relational_conditional_cost_before", "relational_conditional_cost_after",
-                     "relational_mean_displacement_norm"):
-            d[name] = float(cap.get(name, float("nan")))
-        d["relational_conditional_cost_delta"] = (
-            d["relational_conditional_cost_after"] - d["relational_conditional_cost_before"])
-        d["relational_conditional_cost_tokens"] = float(snapshot.token_ids.numel())
+        d["relational_mean_displacement_norm"] = float(
+            cap.get("relational_mean_displacement_norm", float("nan")))
         if self.cfg.attention_mode == "projected_gradient":
             # These are the variable terms of the frozen receiver energy; no global-F
             # or comparison-router stationarity is implied by their difference.
             for name in ("relational_receiver_cost_before", "relational_receiver_cost_after"):
-                d[name] = float(cap[name])
+                d[name] = float(cap.get(name, float("nan")))
             d["relational_receiver_cost_delta"] = (
                 d["relational_receiver_cost_after"] - d["relational_receiver_cost_before"])
+            # The total delta can fall while the mean moves away from its minimizer; report the
+            # mean and covariance parts and the distance to mu* = Lambda^{-1} eta separately.
+            for part in ("mean", "covariance"):
+                before = float(cap.get(f"relational_receiver_{part}_cost_before", float("nan")))
+                after = float(cap.get(f"relational_receiver_{part}_cost_after", float("nan")))
+                d[f"relational_receiver_{part}_cost_delta"] = after - before
+            distance_before = float(cap.get("relational_receiver_target_distance_before", float("nan")))
+            distance_after = float(cap.get("relational_receiver_target_distance_after", float("nan")))
+            d["relational_receiver_target_distance_ratio"] = (
+                distance_after / distance_before if distance_before > 0 else float("nan"))
             d["relational_receiver_noise"] = float(self.cfg.relational_receiver_noise)
             d["relational_attention_capture"] = "episode_initial"
         ops = self.relational_operators_by_layer[layer_index]
@@ -2152,7 +2161,7 @@ class VFEModel(nn.Module):
         belief-variance spectrum effective rank, not an attention rank).
         """
         if self.conditional_filtering_enabled:
-            snapshot = (self.build_diagnostic_snapshot(token_ids) if snapshot is None
+            snapshot = (self.build_diagnostic_snapshot(token_ids, return_logits=False) if snapshot is None
                         else self._validate_diagnostic_snapshot(token_ids, snapshot))
             return self._relational_diagnostics(snapshot)
         from vfe3.geometry.transport import build_factored_transport
@@ -2736,6 +2745,9 @@ class VFEModel(nn.Module):
         converged belief of the final block.
         """
         if self.conditional_filtering_enabled:
+            # Projected routes return the captured router of sequence 0. diagnostics() and
+            # diagnostics_per_layer() average over the whole batch, so the two agree for a
+            # single-sequence batch (audit 2026-10-01 F5).
             if score_at not in ("converged", "entry", "prior"):
                 raise ValueError(f"unsupported conditional attention score_at={score_at!r}")
             snapshot = (self.build_diagnostic_snapshot(token_ids[:1]) if snapshot is None
@@ -2866,7 +2878,7 @@ class VFEModel(nn.Module):
         ``phi_norm_mean``.
         """
         if self.conditional_filtering_enabled:
-            snapshot = (self.build_diagnostic_snapshot(token_ids) if snapshot is None
+            snapshot = (self.build_diagnostic_snapshot(token_ids, return_logits=False) if snapshot is None
                         else self._validate_diagnostic_snapshot(token_ids, snapshot))
             rows = [self._relational_diagnostics(snapshot, layer_index)
                     for layer_index in range(self.cfg.n_layers)]
