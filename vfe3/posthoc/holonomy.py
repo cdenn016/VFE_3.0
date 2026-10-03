@@ -61,7 +61,7 @@ def curvature_size(lam: torch.Tensor, scale_free: bool = False) -> torch.Tensor:
 def layer_content_maps(state: Mapping[str, torch.Tensor], cfg: Any) -> Dict[int, tuple]:
     r"""``{layer: (T_hat (H, d, K), O_hat (H, K, d))}`` float64, for layers with content maps."""
     out: Dict[int, tuple] = {}
-    for layer, maps in relational_maps(state).items():
+    for layer, maps in relational_maps(state, cfg).items():
         if "T" in maps and "O" in maps:
             _, d, B = _frame_geometry(maps, cfg)
             out[layer] = _ambient_content(maps["T"], maps["O"], d, B)

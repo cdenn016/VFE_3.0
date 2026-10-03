@@ -66,6 +66,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'attention_mode': 'projected_gradient',
     'attention_residual': False,
     'relational_output_init': 'identity',
+    'content_link_chart': 'affine',
     'relational_receiver_noise': 1.0,
     'relational_receiver_law': 'ambient_alignment',
     'relational_receiver_update': 'euler',

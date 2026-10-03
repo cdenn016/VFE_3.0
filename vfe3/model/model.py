@@ -347,6 +347,7 @@ class VFEModel(nn.Module):
                                 receiver_law=cfg.relational_receiver_law,
                                 receiver_update=cfg.relational_receiver_update,
                                 receiver_damping=cfg.relational_receiver_damping,
+                                content_link_chart=cfg.content_link_chart,
                                 routing=cfg.relational_routing,
                                 predictive_covariance=(cfg.predictive_covariance if predictive
                                                        else "passthrough"),
@@ -1655,6 +1656,9 @@ class VFEModel(nn.Module):
         d["relational_content_max_singular_value"] = float(singular.max())
         d["relational_content_effective_rank"] = float(
             torch.linalg.matrix_rank(O.float() @ T.float()).float().mean())
+        # Conditioning of the stacked sending map, which the first_order and exponential charts invert.
+        d["relational_content_T_min_singular_value"] = float(
+            torch.linalg.svdvals(T.float().reshape(-1, T.shape[-1])).min())
         # Similarity invariants of the content links L_ij^h = U_i M_h U_j^{-1}, M_h = O_hat_h T_hat_h:
         # unchanged by the frames, by (T_h, O_h) -> (B T_h, O_h B^{-1}) and by (T, O) -> (T a, a^{-1} O).
         # relational_content_max_singular_value above is not invariant under the reference change.

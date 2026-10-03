@@ -314,6 +314,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
 
 
     attention_residual               = True,   # predictive S/T/O: add the incoming mean
+    content_link_chart               = "affine",        # "affine" O'=O | "first_order" O'=T^-1+O | "exponential" O'=T^-1+O phi_1(TO)=e^{OT}T^-1 (Option A)
     # projected_gradient receiver (projected_gradient.tex); inert under projected_predictive
     relational_receiver_law          = "channel_likelihood",  # "channel_likelihood" (entropy once, unobserved directions keep the prior) | "ambient_alignment" (PR #30)
     relational_receiver_update       = "closed_form",         # "closed_form" (exact frozen-context update) | "euler" (Fisher step; reads e_q_mu_lr / e_q_sigma_lr / trusts)
@@ -935,6 +936,22 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     # === free-energy coupling ==============================================
     
     
+
+    "content_link_chart": {
+        "description": "receiving-map chart of the content link: affine head sum, flat + head sum, exponential (Option A)",
+        "param": "content_link_chart",
+        "values": ["affine", "first_order", "exponential"],
+    },
+
+    "content_link_chart_x_residual": {
+        "description": "content-link chart crossed with the additive attention residual (predictive route)",
+        "configs": [
+            {"label": f"content_link_chart={chart},attention_residual={residual}",
+             "content_link_chart": chart, "attention_residual": residual}
+            for chart in ("affine", "first_order", "exponential") for residual in (True, False)
+        ],
+        "requires": {"attention_mode": "projected_predictive"},
+    },
 
     "block_mlp_mode": {
         "description": "post-block residual structure: coordinate, strict invariant gate, or frame-fixed",

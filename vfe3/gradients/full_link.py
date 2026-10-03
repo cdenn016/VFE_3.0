@@ -220,6 +220,7 @@ def _source_channel(
     operators: RelationalOperators,
     noise:     float,
     dtype:     torch.dtype,
+    content:   Optional[Tuple[torch.Tensor, torch.Tensor]] = None,   # precomputed (T, O'); None evaluates
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Return per-source, per-head precisions and natural means.
 
@@ -238,7 +239,7 @@ def _source_channel(
     """
     H, d = len(operators.irrep_dims), operators.irrep_dims[0]
     K = H * d
-    T, O = operators.T.to(dtype), operators.O.to(dtype)
+    T, O = (factor.to(dtype) for factor in (content or operators.content_factors()))   # O' of the chart
     inverse = frame.inverse.to(dtype)
     if frame.block_diagonal:
         # Each full T reads all compact gauge blocks, (..., N, H, d, K).
@@ -371,12 +372,13 @@ def build_full_link_context(
         beta = attention_weights(score, tau=tau, log_prior=(
             None if log_prior is None else log_prior.to(dtype)))
         weights = _head_weights(beta, lambda_beta)                       # (..., H, I, J)
+        content = operators.content_factors()                      # (T, O') once per context build
         source_precision, source_eta = _source_channel(
-            mu_work, sigma_work, channel_frame, operators, receiver_noise, dtype)
+            mu_work, sigma_work, channel_frame, operators, receiver_noise, dtype, content)
         if channel:
             pooled_W = torch.einsum("...hij,...jhst->...ihst", weights, source_precision)  # (..., I, H, d, d)
             pooled_w = torch.einsum("...hij,...jhs->...ihs", weights, source_eta)          # (..., I, H, d)
-            O = operators.O.to(dtype)
+            O = content[1].to(dtype)                                          # O' of content_link_chart
             pooled_precision = torch.einsum("hks,...ihst,hmt->...ikm", O, pooled_W, O)    # (..., I, K, K)
             pooled_eta = torch.einsum("hks,...ihs->...ik", O, pooled_w)                   # (..., I, K)
         else:
