@@ -47,7 +47,7 @@ from vfe3.gauge_optim import (
 )
 from vfe3.geometry.phi_fisher import FisherRowStatistics, middle_fiber_moments, pooled_pos_operator
 from vfe3.metric_contracts import perplexity_from_ce
-from vfe3.metrics import LINK_SPECTRUM_KEYS
+from vfe3.metrics import LINK_SPECTRUM_KEYS, routing_triangle_defect_sums
 from vfe3.model.block import _as_coeff
 from vfe3.model.model import DiagnosticSnapshot, VFEModel
 from vfe3.model.prior_bank import PriorBank, get_decode_registration
@@ -216,7 +216,7 @@ def build_optimizer(
     Head evidence keeps its dedicated ``m_head_evidence_lr``.
 
     Optional parameters are grouped only when their toggle is on: the linear decode weight
-    ``output_proj_weight`` (decode_mode='linear') at ``m_p_mu_lr`` (a mean-readout scale); the
+    ``output_proj_weight`` and bias (decode_mode='linear') at ``m_decode_mu_lr`` (``m_p_mu_lr`` when None); the
     PriorBank ``head_evidence_logits`` at ``m_head_evidence_lr`` and the post-belief head-mixer
     ``mixer_delta`` (use_head_mixer=True) at ``m_head_mixer_lr`` (each inherits ``m_p_mu_lr`` when
     its dedicated setting is None).
@@ -1408,6 +1408,13 @@ RESIDUAL_RATIO_FIELDS: Tuple[str, ...] = (
     "step", "layer", "q10", "q50", "q90", "ln_rel_change_q50")
 ATTENTION_STATS_FIELDS: Tuple[str, ...] = (
     "step", "layer", "head", "entropy_norm", "distance_mean", "self_weight", "prior_overlap", "n_rows")
+# Head-sum link curvature of the routing (vfe3.metrics.routing_triangle_defect_sums): path-weighted
+# mean and RMS of log rho_ijk = log(beta_ij beta_jk / beta_ik) over strict triangles, for the learned
+# router and for its prior alone (zero for flat routing beta_ij = c_i / c_j); path_mass is the mean
+# two-step path weight per query row.
+ROUTING_HOLONOMY_FIELDS: Tuple[str, ...] = (
+    "step", "layer", "head", "path_mass", "log_defect_mean", "log_defect_rms",
+    "prior_log_defect_mean", "prior_log_defect_rms", "n_rows")
 
 # S1 panel D numerical-event counters (GL(K)_attention_v2 fig:placeholder_numerics, 2026-09-28).
 # Every count is an integer with its denominator beside it. NUMERICS_EVAL_COLUMNS are measured at
@@ -1999,8 +2006,15 @@ def _residual_and_attention_rows(
 
     *,
     counters_out: Optional[Dict[str, Any]] = None,
+    holonomy_out: Optional[Dict[Any, Any]] = None,
 ) -> Tuple[List[Dict[str, float]], List[Dict[str, float]]]:
     r"""Per-layer residual-ratio quantiles and per-head attention statistics on fixed windows.
+
+    ``holonomy_out``: when a dict is given, per (layer, head) the path-weighted triangle-defect sums
+    of :func:`vfe3.metrics.routing_triangle_defect_sums` for the router and for its prior are
+    accumulated into it (``[mass, sum x, sum x^2, prior mass, prior sum x, prior sum x^2, rows]``),
+    for :func:`_routing_holonomy_rows`. An error is stored under ``"error"`` and stops the
+    accumulation without disturbing the other rows.
 
     ``counters_out`` (projected routes): when a dict is given, the S1 panel D per-evaluation counts
     of the same captures (:func:`_capture_numerics_counts`) are accumulated into it, so the counters
@@ -2104,6 +2118,20 @@ def _residual_and_attention_rows(
                     total = sums.setdefault((layer, head), [0.0] * 5)
                     for slot, value in enumerate(values):
                         total[slot] += value
+                if holonomy_out is not None and "error" not in holonomy_out:
+                    try:
+                        baseline = torch.where(support, prior, torch.zeros_like(prior))
+                        baseline = baseline / baseline.sum(dim=-1, keepdim=True).clamp_min(1e-30)
+                        learned = routing_triangle_defect_sums(beta, support)           # (H, 3)
+                        reference = routing_triangle_defect_sums(baseline, support)     # (H, 3)
+                        n_rows = float(beta.shape[0] * n)
+                        for head in range(learned.shape[0]):
+                            values = learned[head].tolist() + reference[head].tolist() + [n_rows]
+                            total = holonomy_out.setdefault((layer, head), [0.0] * 7)
+                            for slot, value in enumerate(values):
+                                total[slot] += value
+                    except Exception as exc:              # noqa: BLE001 - reported by the caller
+                        holonomy_out["error"] = exc
     finally:
         for module, was_training in modes:
             module.training = was_training
@@ -2129,6 +2157,31 @@ def _residual_and_attention_rows(
             "n_rows": int(count),
         })
     return residual_rows, attention_rows
+
+
+def _routing_holonomy_rows(
+    sums: Mapping[Any, Any],
+    step: int,
+) -> List[Dict[str, float]]:
+    r"""``diagnostics/routing_holonomy.csv`` rows from the sums of ``_residual_and_attention_rows``.
+
+    Mean :math:`\sum wx/\sum w` and RMS :math:`(\sum wx^2/\sum w)^{1/2}` of
+    :math:`x=\log\rho_{ijk}` (NaN without strict triangles), and the mean path mass per query row.
+    """
+    nan = float("nan")
+    rows: List[Dict[str, float]] = []
+    for key in sorted(k for k in sums if k != "error"):
+        mass, s1, s2, p_mass, p1, p2, n_rows = sums[key]
+        rows.append({
+            "step": int(step), "layer": int(key[0]), "head": int(key[1]),
+            "path_mass": mass / n_rows if n_rows else nan,
+            "log_defect_mean": s1 / mass if mass > 0 else nan,
+            "log_defect_rms": math.sqrt(s2 / mass) if mass > 0 else nan,
+            "prior_log_defect_mean": p1 / p_mass if p_mass > 0 else nan,
+            "prior_log_defect_rms": math.sqrt(p2 / p_mass) if p_mass > 0 else nan,
+            "n_rows": int(n_rows),
+        })
+    return rows
 
 
 def _eval_cadence_diagnostics(
@@ -2172,13 +2225,23 @@ def _eval_cadence_diagnostics(
                 _record_diagnostic_failure(failures, "train_sample", exc, logger)
         if windows is not None:
             counters: Optional[Dict[str, Any]] = {} if count_numerics else None
+            holonomy: Optional[Dict[Any, Any]] = {}
             try:
                 residual_rows, attention_rows = _residual_and_attention_rows(
-                    model, windows, step, device, counters_out=counters)
+                    model, windows, step, device, counters_out=counters, holonomy_out=holonomy)
             except Exception as exc:
                 _record_diagnostic_failure(failures, "residual_attention", exc, logger)
                 residual_rows = attention_rows = None
-                counters = None                   # its capture pass failed; counted once above
+                counters = holonomy = None        # their capture pass failed; counted once above
+            if holonomy is not None:
+                try:
+                    if "error" in holonomy:
+                        raise holonomy["error"]
+                    artifacts.append_diagnostic_rows(
+                        "routing_holonomy.csv", ROUTING_HOLONOMY_FIELDS,
+                        _routing_holonomy_rows(holonomy, step))
+                except Exception as exc:
+                    _record_diagnostic_failure(failures, "routing_holonomy", exc, logger)
             if residual_rows is not None:
                 try:
                     artifacts.append_diagnostic_rows(

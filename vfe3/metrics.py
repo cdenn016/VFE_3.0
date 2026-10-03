@@ -1587,6 +1587,72 @@ def content_link_head_invariants(
     return rows
 
 
+def routing_triangle_defect_sums(
+    beta:    torch.Tensor,                    # (B, H, N, N) or (B, N, N) row-stochastic routing
+    support: Optional[torch.Tensor] = None,   # bool, broadcastable to beta; None -> causal support
+) -> torch.Tensor:                            # (H, 3) float64 [path mass, sum w x, sum w x^2]
+    r"""Path-weighted moments of the head-sum link curvature :math:`x_{ijk}=\log\rho_{ijk}` per head.
+
+    For the head-sum link :math:`L_{ij}=U_i\hat O B_{ij}\hat T U_j^{-1}`,
+    :math:`B_{ij}=\bigoplus_h\beta^h_{ij}I_d`, the triangle holonomy
+    :math:`F_{ijk}=L_{ik}^{-1}L_{ij}L_{jk}` (:math:`Hd=K`, invertible maps) is conjugate to
+    :math:`R_{ijk}G` with :math:`G=\hat T\hat O` and :math:`R_{ijk}=\bigoplus_h\rho^h_{ijk}I_d`,
+
+    .. math::
+        \rho^h_{ijk}=\frac{\beta^h_{ij}\beta^h_{jk}}{\beta^h_{ik}},\qquad
+        \log\rho^h_{ijk}=-\frac{D_{ij}+D_{jk}-D_{ik}}{\tau_h}
+        +\log\frac{\pi_{ij}\pi_{jk}}{\pi_{ik}}-\log Z_j .
+
+    The routing is flat on strict triangles exactly when every :math:`x_{ijk}=0`
+    (:math:`\beta_{ij}=c_i/c_j`). Over strict triangles :math:`k<j<i` with :math:`j\in\mathcal S_i`,
+    :math:`k\in\mathcal S_j\cap\mathcal S_i` and :math:`\beta_{ik}>0`, with the two-step path weight
+    :math:`w_{ijk}=\beta_{ij}\beta_{jk}`, returns per head (summed over batch and rows)
+    :math:`\sum w`, :math:`\sum w x` and :math:`\sum w x^2`, exactly, by six matrix products
+    (no :math:`N^3` tensor): with :math:`A=\log\beta` on the strict support,
+    :math:`\sum_j w x=(\beta A)\beta+\beta(\beta A)-A_{ik}\,\beta\beta` and similarly for :math:`x^2`.
+    """
+    b = beta.double()
+    if b.dim() == 3:
+        b = b.unsqueeze(1)                                                    # (B, 1, N, N)
+    N = b.shape[-1]
+    strict = torch.ones(N, N, dtype=torch.bool, device=b.device).tril(-1)    # j < i
+    edge = strict if support is None else (support.to(b.device) & strict)
+    edge = edge.expand_as(b) & (b > 0.0)                                      # (B, H, N, N)
+    Bs = torch.where(edge, b, torch.zeros_like(b))
+    A = torch.where(edge, torch.log(torch.where(edge, b, torch.ones_like(b))), torch.zeros_like(b))
+    BA = Bs * A
+    BA2 = BA * A
+    S0 = Bs @ Bs                                                              # (B, H, N, N) sum_j w
+    Sa = BA @ Bs                                                              # sum_j w log b_ij
+    Sb = Bs @ BA                                                              # sum_j w log b_jk
+    s1 = Sa + Sb - A * S0
+    s2 = BA2 @ Bs + Bs @ BA2 + 2.0 * (BA @ BA) + A * A * S0 - 2.0 * A * (Sa + Sb)
+    keep = edge.to(b.dtype)                                                   # (i, k) needs beta_ik > 0
+    out = torch.stack([(S0 * keep).sum(dim=(0, 2, 3)),
+                       (s1 * keep).sum(dim=(0, 2, 3)),
+                       (s2.clamp_min(0.0) * keep).sum(dim=(0, 2, 3))], dim=-1)
+    return out.cpu()                                                          # (H, 3)
+
+
+def triangle_holonomy_eigenvalues(
+    T_hat: torch.Tensor,                  # (H, d, K) ambient sending maps, Hd = K
+    O_hat: torch.Tensor,                  # (H, K, d) ambient receiving maps
+    rho:   torch.Tensor,                  # (S, H) per-head defects rho^h_ijk of S triangles (rho = 1: G alone)
+) -> torch.Tensor:                        # (S, K) complex128
+    r"""Spectra of :math:`R_{ijk}G`, the conjugacy class of the head-sum triangle holonomy.
+
+    :math:`G=[\hat T_h\hat O_g]_{hg}` is the :math:`K\times K` head-transfer matrix and
+    :math:`R=\bigoplus_h\rho^hI_d` (see :func:`routing_triangle_defect_sums`). Frames drop out.
+    """
+    W = _head_transfer(T_hat, O_hat)                                          # (H, H, d, d)
+    H, d = W.shape[0], W.shape[-1]
+    if H * d != T_hat.shape[-1]:
+        raise ValueError(f"holonomy needs tiled heads H*d = K, got H*d={H * d}, K={T_hat.shape[-1]}")
+    G = W.permute(0, 2, 1, 3).reshape(H * d, H * d)                           # (K, K)
+    scale = rho.to(torch.float64).repeat_interleave(d, dim=-1)                # (S, K)
+    return torch.linalg.eigvals(scale.unsqueeze(-1) * G)                      # (S, K)
+
+
 def content_link_spectrum(
     T_hat:     torch.Tensor,                    # (H, d, K)
     O_hat:     torch.Tensor,                    # (H, K, d)

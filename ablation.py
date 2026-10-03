@@ -653,11 +653,14 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
        "param": "e_q_mu_lr",
        "range": [0.8, 1.1, 0.1],
        "scale": "linear",
+       "requires": {"attention_mode": "projected_gradient", "relational_receiver_update": "euler"},
     },
    
     "e_q_sigma_lr": {
        "description": "E-step retraction step size for sigma_q",
        "param": "e_q_sigma_lr", "range": [0.0000, 0.1, 0.005],
+       "requires": {"attention_mode": "projected_gradient", "relational_receiver_update": "euler",
+                    "skip_belief_sigma_update": False},
     },
    
 
@@ -714,7 +717,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "param": "m_decode_sigma_lr",
         "values": [0.0005, 0.00075, 0.001, 0.0025],
         "scale": "linear",
-        "requires": {"untie_decode_bank": True},
+        "requires": {"decode_mode": "diagonal_chunked", "untie_decode_bank": True},   # live only with an untied prior-bank decoder
     },
     
     
