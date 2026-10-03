@@ -108,11 +108,13 @@ def relational_predictive_readout(
             mu_work, sigma_work, mu_work, sigma_work, frame, operators, capture), kl_max=kl_max)
         beta = attention_weights(score, tau=tau,
                                  log_prior=None if log_prior is None else log_prior.to(dtype))
-        result = operators.predictive_content(mu_work, beta, value_frame or frame).to(mu.dtype)
+        _, receive = operators.content_factors()             # O' once per layer for mean and covariance
+        result = operators.predictive_content(mu_work, beta, value_frame or frame, receive).to(mu.dtype)
         if operators.attention_residual:
             result = mu + result
-        sigma_plus = (operators.predictive_covariance_update(mu_work, sigma_work, beta, value_frame or frame)
-                      .to(sigma.dtype) if return_covariance else None)
+        sigma_plus = (operators.predictive_covariance_update(mu_work, sigma_work, beta, value_frame or frame,
+                                                             receive).to(sigma.dtype)
+                      if return_covariance else None)
     if capture is not None:
         capture.update(beta_pre=beta.detach(), score_energy_pre=score.detach(),
                        relational_mean_displacement_norm=(result-mu).norm().detach())

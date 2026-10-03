@@ -2,13 +2,81 @@ r"""Role-specific comparison and content operators in realized canonical frames.
 
 import math
 from numbers import Real
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from torch import nn
 
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.relational_scoring import _compute_dtype
+
+# Receiving-map charts of the content link on the stored factors (O, T) (attention_unified.tex,
+# "The tiled message order by order"). A later truncation such as "second_order" adds one branch
+# to ``chart_receive_map`` and one initial value to ``_chart_initial_output``.
+CONTENT_LINK_CHARTS: Tuple[str, ...] = ("affine", "first_order", "exponential")
+
+
+def _phi1(A: torch.Tensor) -> torch.Tensor:          # (n, n) -> (n, n)
+    r"""Return :math:`\varphi_1(A)=\sum_{n\ge1}A^{n-1}/n!` without inverting :math:`A`.
+
+    .. math::
+        \exp\begin{pmatrix}A & I\\ 0 & 0\end{pmatrix}
+        =\begin{pmatrix}e^A & \varphi_1(A)\\ 0 & I\end{pmatrix},
+
+    because the block matrix has :math:`n`-th power :math:`\begin{pmatrix}A^n & A^{n-1}\\ 0 & 0\end{pmatrix}`
+    for :math:`n\ge1`.
+    """
+    n = A.shape[-1]
+    eye = torch.eye(n, dtype=A.dtype, device=A.device)
+    augmented = torch.cat([torch.cat([A, eye], dim=-1),
+                           torch.zeros(n, 2 * n, dtype=A.dtype, device=A.device)], dim=-2)   # (2n, 2n)
+    return torch.linalg.matrix_exp(augmented)[:n, n:]
+
+
+def chart_receive_map(
+    T:     torch.Tensor,                # (H, d, K) stored sending maps, H*d = K
+    O:     torch.Tensor,                # (H, K, d) stored receiving factors
+    chart: str,
+) -> torch.Tensor:                      # (H, K, d) effective receiving maps O'_h
+    r"""Effective receiving maps :math:`O'` of the tiled content link in the chosen chart.
+
+    With the stacked :math:`T` (:math:`Hd\times K`) and :math:`O` (:math:`K\times Hd`) square, the
+    predictive message is :math:`U_i\sum_jO'B_{ij}T\xi_j` with :math:`B_{ij}=\bigoplus_h\beta^h_{ij}I_d` and
+
+    .. math::
+        O'_{\mathrm{affine}}=O,\qquad
+        O'_{\mathrm{first\ order}}=T^{-1}+O,\qquad
+        O'_{\mathrm{exponential}}=T^{-1}+O\,\varphi_1(TO)=e^{OT}T^{-1}.
+
+    The exponential chart is the shared-generator exponential link :math:`X=OT` with routing outside
+    the exponent (:math:`O'T=e^{OT}`, so the effective transfer :math:`TO'=e^{TO}` has positive
+    determinant); its order-:math:`n` term is :math:`O(TO)^{n-1}/n!` and order zero is
+    :math:`T^{-1}B_{ij}T=\sum_h\beta^h_{ij}P_h`, the head-routed flat transport. The first-order chart
+    keeps orders zero and one. Non-affine charts invert :math:`T` and are evaluated in float64.
+    """
+    if chart == "affine":
+        return O
+    if chart not in CONTENT_LINK_CHARTS:
+        raise ValueError(f"content_link_chart must be one of {CONTENT_LINK_CHARTS}, got {chart!r}")
+    H, d, K = T.shape
+    if H * d != K or tuple(O.shape) != (H, K, d):
+        raise ValueError(f"content link charts need tiled square stacked maps, got T {tuple(T.shape)}, "
+                         f"O {tuple(O.shape)}")
+    with torch.autocast(device_type=T.device.type, enabled=False):
+        T_stack = T.to(torch.float64).reshape(H * d, K)                           # (Hd, K) rows by head
+        O_stack = O.to(torch.float64).permute(1, 0, 2).reshape(K, H * d)          # (K, Hd) columns by head
+        # inv_ex: no host sync (linalg.inv checks info on the host); a singular T yields non-finite maps.
+        receive = torch.linalg.inv_ex(T_stack).inverse                            # (K, Hd) order zero
+        if chart == "first_order":
+            receive = receive + O_stack
+        else:
+            receive = receive + O_stack @ _phi1(T_stack @ O_stack)                # all orders
+    return receive.reshape(K, H, d).permute(1, 0, 2)                              # (H, K, d)
+
+
+def _chart_initial_output(chart: str, scale: float) -> float:
+    r"""Initial :math:`O=cI` (with :math:`T=I`) giving the content :math:`sB_{ij}` in every chart."""
+    return {"affine": scale, "first_order": scale - 1.0, "exponential": math.log(scale)}[chart]
 
 
 class RelationalOperators(nn.Module):
@@ -19,8 +87,11 @@ class RelationalOperators(nn.Module):
     Every head reads and writes the full state while retaining its reduced channel rank.
     Independent maps are free matrices initialized with orthonormal rows.
     Their projected covariances must remain strictly positive definite.
-    ``output_init_scale`` multiplies the initial output map, :math:`O_h(0) = s\,I_d` (placed on its
-    head block under full output scope); ``s = 1`` is the identity start.
+    ``output_init_scale`` sets the initial content :math:`sB_{ij}` (placed on the head blocks under full
+    output scope); ``s = 1`` is the identity start. ``content_link_chart`` selects the effective
+    receiving maps built from the stored (O, T) (:func:`chart_receive_map`); the stored O starts at
+    :math:`sI`, :math:`(s-1)I` or :math:`(\log s)I` per chart so every chart starts at :math:`sB_{ij}`.
+    Every consumer reads the content maps through :meth:`content_factors`.
     ``routing`` selects the projected routing cost: Gaussian KL, or the noisy-query cost
     N(a_i; b_j, V_Q + V_K) of the expected likelihood kernel (predictive_content only).
     """
@@ -40,6 +111,7 @@ class RelationalOperators(nn.Module):
         receiver_law:          str   = "ambient_alignment",
         receiver_update:       str   = "euler",
         receiver_damping:      float = 1.0,
+        content_link_chart:    str   = "affine",
     ) -> None:
         super().__init__()
         if not irrep_dims or any(type(d) is not int or d < 1 for d in irrep_dims) or len(set(irrep_dims)) != 1:
@@ -88,6 +160,10 @@ class RelationalOperators(nn.Module):
                 f"predictive_covariance_floor must be finite and positive, got {predictive_covariance_floor!r}")
         self.predictive_covariance = predictive_covariance
         self.predictive_covariance_floor = float(predictive_covariance_floor)
+        if content_link_chart not in CONTENT_LINK_CHARTS:
+            raise ValueError(
+                f"content_link_chart must be one of {CONTENT_LINK_CHARTS}, got {content_link_chart!r}")
+        self.content_link_chart = content_link_chart
         self.input_dim = H * d
         self.irrep_dims = list(irrep_dims)
         self.score_rank_per_head = d
@@ -101,9 +177,10 @@ class RelationalOperators(nn.Module):
         # Preserve the released block-projector initialization and parameter names.
         T_full = eye.new_zeros(H, d, H * d)
         O_full = eye.new_zeros(H, H * d, d)
+        initial_output = _chart_initial_output(content_link_chart, float(output_init_scale))
         for h in range(H):
             T_full[h, :, h*d:(h+1)*d] = eye[h]
-            O_full[h, h*d:(h+1)*d] = eye[h] * float(output_init_scale)
+            O_full[h, h*d:(h+1)*d] = eye[h] * initial_output
         self.T = nn.Parameter(T_full)
         self.O = nn.Parameter(O_full)
 
@@ -128,25 +205,34 @@ class RelationalOperators(nn.Module):
         mu:    torch.Tensor,  # (..., N, K), source means with live gradients
         beta:  torch.Tensor,  # (..., H, N, N)
         frame: CanonicalFrameContext,
+        receive: Optional[torch.Tensor] = None,   # (H, K, d) precomputed O'_h; None evaluates the chart
     ) -> torch.Tensor:
-        r"""Compute m_i = A_i sum_h O_h sum_j beta_ij^h T_h B_j^{-1} mu_j."""
+        r"""Compute m_i = A_i sum_h O'_h sum_j beta_ij^h T_h B_j^{-1} mu_j (O' of content_link_chart)."""
         canonical = self.canonical_mean(mu, frame)
         H, d = len(self.irrep_dims), self.irrep_dims[0]
         dtype = _compute_dtype(mu, self.T, self.O, frame.forward)
+        if receive is None:
+            _, receive = self.content_factors()                            # (H, K, d) O'_h
         with torch.autocast(device_type=mu.device.type, enabled=False):
             coordinates = canonical.flatten(-2).unsqueeze(-2)              # (..., N, 1, K)
             values = (self.T.to(dtype) @ coordinates.to(dtype).unsqueeze(-1)).squeeze(-1)
             pooled = torch.einsum("...hij,...jhs->...ihs", beta.to(dtype), values)
             # Sum heads inside the contraction, avoiding a (..., N, H, K) result.
-            body = torch.einsum("hks,...nhs->...nk", self.O.to(dtype), pooled)
+            body = torch.einsum("hks,...nhs->...nk", receive.to(dtype), pooled)
             if frame.block_diagonal:
                 body = body.reshape(*mu.shape[:-1], H, d)
             result = (frame.forward.to(dtype) @ body.unsqueeze(-1)).squeeze(-1)
         return result.reshape_as(mu).to(mu.dtype)
 
-    def _ambient_content_maps(self, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
-        r"""Return full-state T_h and O_h of shapes (H,d,K) and (H,K,d)."""
-        return self.T.to(dtype), self.O.to(dtype)
+    def _ambient_content_maps(
+        self,
+        dtype:   torch.dtype,
+        receive: Optional[torch.Tensor] = None,   # (H, K, d) precomputed O'_h; None evaluates the chart
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""Return full-state T_h and effective O'_h of shapes (H,d,K) and (H,K,d)."""
+        if receive is None:
+            _, receive = self.content_factors()
+        return self.T.to(dtype), receive.to(dtype)
 
     def predictive_covariance_update(
         self,
@@ -154,6 +240,7 @@ class RelationalOperators(nn.Module):
         sigma: torch.Tensor,  # (..., N, K) diagonal or (..., N, K, K) full local covariance
         beta:  torch.Tensor,  # (..., H, N, N) routing weights, rows sum to one
         frame: CanonicalFrameContext,
+        receive: Optional[torch.Tensor] = None,   # (H, K, d) precomputed O'_h; None evaluates the chart
     ) -> torch.Tensor:        # same layout as sigma: the moment-matched covariance Sigma_i^+
         r"""Moment-matched covariance of the predictive kernel (GL(K) v2, Theorem thm:probabilistic_status (2)).
 
@@ -188,7 +275,7 @@ class RelationalOperators(nn.Module):
             C = inverse @ local @ inverse.transpose(-1, -2)                        # (..., N, K, K)
             C = 0.5 * (C + C.transpose(-1, -2))
             xi = (inverse @ mu.to(dtype).unsqueeze(-1)).squeeze(-1)                # (..., N, K)
-            T_hat, O_hat = self._ambient_content_maps(dtype)                       # (H,d,K), (H,K,d)
+            T_hat, O_hat = self._ambient_content_maps(dtype, receive)              # (H,d,K), (H,K,d)
             b = beta.to(dtype)                                                     # (..., H, N, N)
             eye_h = torch.eye(H, dtype=dtype, device=mu.device)
 
@@ -249,8 +336,8 @@ class RelationalOperators(nn.Module):
         return self.raw_score_q, self.raw_score_k
 
     def content_factors(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        r"""Return full-state (T,O) for B_h=O_h T_h."""
-        return self.T, self.O
+        r"""Return full-state (T, O') for M_h=O'_h T_h; O' = O in the affine chart (the stored parameter)."""
+        return self.T, chart_receive_map(self.T, self.O, self.content_link_chart)
 
     def canonical_mean(
         self,

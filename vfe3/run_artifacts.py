@@ -131,6 +131,7 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "score_rank_per_head": d, "content_rank_per_head": d,
         "identity_content": False,
         "content_mode": "full_width",
+        "content_link_chart": cfg.content_link_chart,
         "score_shape": [H, d, K],
         "content_shapes": [[H, d, K], [H, K, d]],
         "parameter_counts": counts, "total_parameters": sum(counts.values()),

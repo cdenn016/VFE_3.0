@@ -1342,6 +1342,7 @@ _VAL_RELATIONAL_DIAG_KEYS = (
     "score_raw_min_singular_value", "score_q_raw_min_singular_value",
     "score_k_raw_min_singular_value", "score_rank_per_head", "content_rank_per_head",
     "parameter_count", "content_max_singular_value", "content_effective_rank",
+    "content_T_min_singular_value",
     "projected_cov_min_eigenvalue", "projected_cov_max_condition", "covariance_repair_count")
 ) + tuple(f"val_{key}" for key in LINK_SPECTRUM_KEYS)
 

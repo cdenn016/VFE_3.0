@@ -84,12 +84,17 @@ def load_map_state(source: Union[str, Path, Mapping[str, Any]]) -> Tuple[Mapping
     return unwrap_state(source)
 
 
-def relational_maps(state: Mapping[str, torch.Tensor]) -> Dict[int, Dict[str, torch.Tensor]]:
+def relational_maps(
+    state: Mapping[str, torch.Tensor],
+    cfg:   Any = None,
+) -> Dict[int, Dict[str, torch.Tensor]]:
     r"""``{layer: {"S_Q", "S_K", "T", "O"}}`` float64 CPU tensors from the relational state keys.
 
     Layer 0 is ``relational_operators.*`` and layer :math:`\ell \ge 1` is
     ``relational_operators_extra.{l-1}.*``. Layers without content maps (identity content) omit
-    ``T`` and ``O``.
+    ``T`` and ``O``. With a ``cfg`` whose ``content_link_chart`` is not ``"affine"``, ``"O"`` is the
+    effective receiving map :math:`O'` of that chart (:func:`vfe3.model.relational_operators.chart_receive_map`)
+    and ``"O_stored"`` the stored factor.
     """
     layers: Dict[int, Dict[str, torch.Tensor]] = {}
     inverse = {leaf: name for name, leaf in _LEAF_BY_MAP.items()}
@@ -104,6 +109,14 @@ def relational_maps(state: Mapping[str, torch.Tensor]) -> Dict[int, Dict[str, to
     for layer, maps in layers.items():
         if "S_Q" not in maps or "S_K" not in maps:
             raise ValueError(f"layer {layer} lacks a comparison map")
+    chart = getattr(cfg, "content_link_chart", "affine")
+    if chart != "affine":
+        from vfe3.model.relational_operators import chart_receive_map
+
+        for maps in layers.values():
+            if "T" in maps and "O" in maps:
+                maps["O_stored"] = maps["O"]
+                maps["O"] = chart_receive_map(maps["T"], maps["O"], chart)
     return dict(sorted(layers.items()))
 
 
@@ -163,7 +176,7 @@ def head_block_norms(
     """
     state, _ = unwrap_state(state)
     out: Dict[int, Dict[str, np.ndarray]] = {}
-    for layer, maps in relational_maps(state).items():
+    for layer, maps in relational_maps(state, cfg).items():
         H, d, B = _frame_geometry(maps, cfg)
         norms = {name: _block_norms_input(maps[name], d, B) for name in ("S_Q", "S_K", "T") if name in maps}
         if "O" in maps:
@@ -263,7 +276,7 @@ def map_invariants(
     s0 = _output_init_scale(cfg)
     rows: List[Dict[str, float]] = []
     norms_by_layer = head_block_norms(state, cfg)
-    for layer, maps in relational_maps(state).items():
+    for layer, maps in relational_maps(state, cfg).items():
         H, d, B = _frame_geometry(maps, cfg)
         shares = {name: block_energy_shares(norms) for name, norms in norms_by_layer[layer].items()}
         link_rows = (content_link_head_invariants(*_ambient_content(maps["T"], maps["O"], d, B))
@@ -293,8 +306,10 @@ def map_invariants(
                 row.update({
                     "T_fro": float(T.norm()), "O_fro": float(O.norm()),
                     "M_sigma_max": float(torch.linalg.svdvals(M).max()), "M_fro": float(M.norm()),
-                    "conserved_TO_drift": float(
-                        (T @ T.T - O.T @ O - (1.0 - s0 * s0) * torch.eye(s, dtype=torch.float64)).norm()),
+                    # The balancedness T T^T - O^T O of the affine factor flow; undefined in other charts.
+                    "conserved_TO_drift": (float(
+                        (T @ T.T - O.T @ O - (1.0 - s0 * s0) * torch.eye(s, dtype=torch.float64)).norm())
+                        if "O_stored" not in maps else float("nan")),
                 })
             else:
                 row.update({"T_fro": float("nan"), "O_fro": float("nan"), "M_sigma_max": float("nan"),
@@ -318,7 +333,7 @@ def link_eigenvalue_rows(state: Mapping[str, torch.Tensor], cfg: Any) -> List[Di
     similarity invariants of the content links. Layers without content maps are skipped."""
     state, _ = unwrap_state(state)
     rows: List[Dict[str, float]] = []
-    for layer, maps in relational_maps(state).items():
+    for layer, maps in relational_maps(state, cfg).items():
         if "T" not in maps or "O" not in maps:
             continue
         H, d, B = _frame_geometry(maps, cfg)

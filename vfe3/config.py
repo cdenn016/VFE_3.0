@@ -340,6 +340,13 @@ class VFE3Config:
     attention_residual:                  bool          = False                  # requires predictive_content
     relational_output_init:              str           = "identity"             # "identity" | "depth_scaled" (initial O times 1/sqrt(2 n_layers))
 
+    # Receiving-map chart of the content link on the stored (O, T) (attention_unified.tex, "The tiled
+    # message order by order"): "affine" O' = O (current head sum); "first_order" O' = T^{-1} + O (flat
+    # head-routed transport plus the head sum); "exponential" O' = T^{-1} + O phi_1(TO) = e^{OT} T^{-1}
+    # (Option A shared-generator exponential link, O'T = e^{OT}). Every chart starts at the same content
+    # s B_ij (s from relational_output_init). O = 0 means zero content (affine) or flat transport
+    # (first_order, exponential); the content group has no weight decay. Both projected routes read O'.
+    content_link_chart:                  str           = "affine"              # "affine" | "first_order" | "exponential"
     relational_receiver_noise:           float         = 1.0                   # projected_gradient: Q_h = variance * I (K-dim reference law under ambient, d-dim channel floor under channel)
     # projected_gradient receiver energy and update (projected_gradient.tex). "channel_likelihood" scores
     # O_h^T xi_i against the d-dim message T_h xi_j as an expected likelihood (entropy counted once, no
@@ -1343,6 +1350,8 @@ class VFE3Config:
         if not math.isfinite(self.decode_tau) or self.decode_tau <= 0.0:
             raise ValueError(f"decode_tau must be finite and positive, got {self.decode_tau}")
         _require(self.relational_output_init, ("identity", "depth_scaled"), "relational_output_init")
+        from vfe3.model.relational_operators import CONTENT_LINK_CHARTS
+        _require(self.content_link_chart, CONTENT_LINK_CHARTS, "content_link_chart")
         # decode_mode / encode_mode validated against the LIVE decode/encode REGISTRIES (not static
         # literals) so a newly registered kernel is config-selectable without editing this validator.
         from vfe3.model.prior_bank import _DECODERS, _ENCODERS, has_builtin_head_evidence_decoder

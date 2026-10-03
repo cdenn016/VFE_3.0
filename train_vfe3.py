@@ -128,6 +128,7 @@ config = dict(
 
     
     attention_residual               = True,   # predictive S/T/O: add the incoming mean
+    content_link_chart               = "affine",        # "affine" O'=O | "first_order" O'=T^-1+O | "exponential" O'=T^-1+O phi_1(TO)=e^{OT}T^-1 (Option A)
     # projected_gradient receiver (projected_gradient.tex); inert under projected_predictive
     relational_receiver_law          = "channel_likelihood",  # "channel_likelihood" (entropy once, unobserved directions keep the prior) | "ambient_alignment" (PR #30)
     relational_receiver_update       = "closed_form",         # "closed_form" (exact frozen-context update) | "euler" (Fisher step; reads e_q_mu_lr / e_q_sigma_lr / trusts)
