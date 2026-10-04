@@ -1350,23 +1350,14 @@ _VAL_RELATIONAL_DIAG_KEYS = (
 # =============================================================================
 # Training-time diagnostics for the multi-seed runs (audit 2026-09-28, Section 2).
 #
-# Every quantity below is computed only on a log/eval-cadence step (or at step 0 of an evaluated
-# run), off the training graph, with the CPU and CUDA RNG streams restored. None of it runs on the
-# silent path (log_interval and eval_interval falsy), and none of it feeds back into the optimizer,
-# so the training trajectory is unchanged. A failure is logged once per diagnostic name, counted in
+# Every quantity below is computed only on a log/eval-cadence step, off the training graph, with the
+# CPU and CUDA RNG streams restored. None of it runs on the silent path (log_interval and
+# eval_interval falsy), and none of it feeds back into the optimizer, so the training trajectory is
+# unchanged. A failure is logged once per diagnostic name, counted in
 # ``RunArtifacts.diagnostics_failures`` (summary.json) and in the cumulative ``diagnostics_failures``
-# metrics column, and training continues.
+# metrics column, and training continues. Evaluations run only every ``eval_interval`` completed
+# steps: there is no step-0 evaluation and no fixed early schedule.
 # =============================================================================
-
-# Log-spaced evaluations below the first regular evaluation, in completed optimizer steps. Step 0
-# is evaluated before the first update. Only steps below ``eval_interval`` are used, and only when
-# evaluation is enabled with a run directory (``artifacts``) and ``eval_interval >=
-# EARLY_EVAL_MIN_INTERVAL``: a shorter cadence already samples the start of training, and the gate
-# keeps the metrics.csv schedule of short debug/test runs unchanged. The step-0 evaluation does not
-# take part in best-model selection (the untrained initialization is never a selection candidate);
-# the positive early steps are ordinary evaluations and do.
-EARLY_EVAL_STEPS:        Tuple[int, ...] = (0, 1000, 3000, 8000)
-EARLY_EVAL_MIN_INTERVAL: int             = 1000
 
 # Fixed training sample for the generalization gap: windows of the TRAIN split drawn by a generator
 # with this fixed seed (independent of cfg.seed and the data seed, so every seed of a multi-seed
@@ -1419,7 +1410,7 @@ ROUTING_HOLONOMY_FIELDS: Tuple[str, ...] = (
 
 # S1 panel D numerical-event counters (GL(K)_attention_v2 fig:placeholder_numerics, 2026-09-28).
 # Every count is an integer with its denominator beside it. NUMERICS_EVAL_COLUMNS are measured at
-# every evaluation (and at step 0) on the DIAGNOSTIC_WINDOWS fixed validation windows inside the
+# every evaluation on the DIAGNOSTIC_WINDOWS fixed validation windows inside the
 # residual-ratio capture pass (no extra forward), with one diagnostics/cap_activation.csv row per
 # (layer, head); they are NaN on rows without an evaluation, when the run
 # has no diagnostic windows, and when their capture pass fails. NUMERICS_CUMULATIVE_COLUMNS are on
@@ -1811,22 +1802,6 @@ def _group_update_statistics(
         out[f"update_ratio_group_{group}"] = (
             math.sqrt(delta_sq[group]) / weight if weight > 0.0 else float("nan"))
     return out
-
-
-@torch.no_grad()
-def _group_parameter_norms(
-    model: torch.nn.Module,
-) -> Dict[str, float]:
-    r"""``param_norm_group_<g>`` alone (no step): the step-0 reference norms."""
-    norm_sq: Dict[str, float] = {}
-    for name, parameter in model.named_parameters():
-        if parameter.requires_grad:
-            group = _parameter_group(name)
-            norm_sq[group] = norm_sq.get(group, 0.0) + float(
-                torch.linalg.vector_norm(parameter.detach()).to(torch.float64).square())
-    return {f"param_norm_group_{group}": (math.sqrt(norm_sq[group]) if group in norm_sq
-                                          else float("nan"))
-            for group in PARAMETER_GROUPS}
 
 
 @torch.no_grad()
@@ -3039,23 +3014,13 @@ def train(
     finally:
         if replay_cpu_rng is not None:
             torch.set_rng_state(replay_cpu_rng)
-    # Early evaluations (audit 2026-09-28): log-spaced completed-step counts below the first regular
-    # evaluation, gated by EARLY_EVAL_MIN_INTERVAL and a run directory. Empty on the silent path.
-    early_eval_enabled = bool(
-        eval_interval and val_loader is not None and artifacts is not None
-        and eval_interval >= EARLY_EVAL_MIN_INTERVAL)
-    early_eval_steps = frozenset(
-        int(s) for s in EARLY_EVAL_STEPS
-        if early_eval_enabled and 0 < int(s) < eval_interval and start_step < int(s) <= n_steps)
-    run_step_zero = bool(early_eval_enabled and 0 in EARLY_EVAL_STEPS
-                         and start_step == 0 and n_steps > 0)
     # A timer is useful only if its absolute execution interval reaches a reporting step.
     timing_enabled = (
         bool(log_interval) and n_steps // log_interval > start_step // log_interval
     ) or (
         artifacts is not None and val_loader is not None and bool(eval_interval)
         and n_steps // eval_interval > start_step // eval_interval
-    ) or bool(early_eval_steps)
+    )
     resumed_wall_clock = getattr(artifacts, "resumed_wall_clock_s", None) if start_step > 0 else None
     timer = (TrainingTimer(device, wall_clock_offset=resumed_wall_clock or 0.0)
              if timing_enabled else None)
@@ -3072,7 +3037,6 @@ def train(
     fixed_train_sample: Optional[FixedTrainSample] = None
     diagnostic_windows: Optional[torch.Tensor] = None
     last_train_sample: Dict[str, float] = {column: float("nan") for column in _EVAL_CADENCE_COLUMNS}
-    pending_step_zero_row: Optional[Dict[str, float]] = None
     tokens_seen = int(start_step) * int(cfg.batch_size) * int(cfg.max_seq_len)   # resume: nominal B*N per step
     # S1 panel D counters (2026-09-28). The frame-projection counter is a (2,) int64 device tensor
     # that project_phi_parameter_rows_ adds to on every accepted step (no host sync); it exists only
@@ -3148,54 +3112,6 @@ def train(
                     logger.info(" residual-ratio and attention-statistics captures skipped "
                                 "(model_family=%r: they read the VFE belief capture)",
                                 model_family_of(model))
-    if run_step_zero:
-        # Step-0 evaluation before the first update (M3 curves need a beginning). Everything here
-        # runs under a forked CPU/CUDA RNG, so the training stream is untouched. Its row is held
-        # until the first regular metrics row fixes the CSV schema, then written first.
-        with torch.random.fork_rng(devices=([device] if device.type == "cuda" else [])):
-            try:
-                zero = evaluate(model, val_loader, tokens_per_char=tokens_per_char, device=device)
-                logger.info(" \n Validation @ step 0 (before the first update): CE %.4f | PPL %.1f",
-                            zero["ce"], zero["ppl"])
-                zero_diag: Dict[str, float] = {k: float("nan") for k in val_diag_keys}
-                try:
-                    if vfe_model:
-                        zero_diag.update(_val_diagnostics(
-                            model, val_loader, device,
-                            batches=getattr(cfg, "val_diagnostic_batches", 1),
-                            failures=diagnostics_failures).metrics)
-                except Exception as exc:
-                    _record_diagnostic_failure(diagnostics_failures, "step0_val_diagnostics",
-                                               exc, logger)
-                zero_extra = _eval_cadence_diagnostics(
-                    model, artifacts, logger, step=0, val_ce=float(zero["ce"]),
-                    train_sample=fixed_train_sample, windows=diagnostic_windows,
-                    device=device, failures=diagnostics_failures,
-                    count_numerics=numerics_reasons.get("cap_activation", "unset") is None)
-                _note_numerics_eval(numerics_last_eval, 0, zero_extra)
-                zero_cumulative = {column: float("nan") for column in NUMERICS_CUMULATIVE_COLUMNS}
-                try:
-                    zero_cumulative = _cumulative_counter_columns(
-                        0, optimizer, frame_projection_counter, frame_projection_base)
-                except Exception as exc:
-                    _record_diagnostic_failure(diagnostics_failures, "numerics_cumulative",
-                                               exc, logger)
-                pending_step_zero_row = {
-                    **zero_cumulative,
-                    "step": 0,
-                    "val_ce": zero["ce"], "val_ppl": zero["ppl"],
-                    "val_bits_per_token": zero["bits_per_token"],
-                    "val_bpc": (zero["bpc"] if zero["bpc"] is not None else float("nan")),
-                    "val_expected_targets": zero["expected_targets"],
-                    "val_scored_targets": zero["scored_targets"],
-                    "val_excluded_targets": zero["excluded_targets"],
-                    **zero_diag, **zero_extra,
-                    **_group_parameter_norms(model), **_sigma_log_statistics(model),
-                    "tokens_seen": 0,
-                    "diagnostics_failures": int(sum(diagnostics_failures.values())),
-                }
-            except Exception as exc:
-                _record_diagnostic_failure(diagnostics_failures, "step0_evaluation", exc, logger)
     for step in _step_indices():
         try:
             tokens, targets = next(it)
@@ -3212,8 +3128,7 @@ def train(
         tokens = tokens.to(device, non_blocking=True)
         targets = _transfer_targets(targets, model, device)
         do_log  = bool(log_interval) and (step + 1) % log_interval == 0
-        do_eval = bool(eval_interval) and val_loader is not None and (
-            (step + 1) % eval_interval == 0 or (step + 1) in early_eval_steps)
+        do_eval = bool(eval_interval) and val_loader is not None and (step + 1) % eval_interval == 0
         do_csv  = artifacts is not None and (do_log or do_eval)
         # Capture pre-clip gradient health only on a step that will log or persist. A silent step
         # performs no exact-count host materialization, extra unscale_, or grad-norm pass; its
@@ -3693,15 +3608,6 @@ def train(
             row["pipeline_tokens_per_s"]   = pipeline_timing.pipeline_tokens_per_s
             row["tokens_per_s"]            = pipeline_timing.pipeline_tokens_per_s
             row["wall_clock_s"]            = pipeline_timing.wall_clock_s
-            if pending_step_zero_row is not None:
-                # The step-0 evaluation row goes first, on this row's key set (NaN where step 0 has
-                # no value: no training step, no timing window).
-                zero_row = {key: pending_step_zero_row.get(key, float("nan")) for key in row}
-                pending_step_zero_row = None
-                try:
-                    artifacts.log_metrics(zero_row)
-                except Exception as exc:
-                    _record_diagnostic_failure(diagnostics_failures, "step0_row", exc, logger)
             artifacts.log_metrics(row)
             timer.reset_pipeline_window()
     # S1 panel D handoff (2026-09-28), before the terminal callback so its checkpoint and summary see
@@ -3787,15 +3693,8 @@ def train(
     accepted = _successful_update_count(optimizer)
     skipped_total = attempted - accepted
     if artifacts is not None:
-        # Training-time diagnostic handoff to finalize_run (audit 2026-09-28): a step-0 row that no
-        # later metrics row flushed (no log/eval row in the run), the optimizer-state footprint for
-        # resources.json, and the per-name diagnostic failure counts for summary.json.
-        if pending_step_zero_row is not None:
-            try:
-                artifacts.log_metrics(pending_step_zero_row)
-            except Exception as exc:
-                _record_diagnostic_failure(diagnostics_failures, "step0_row", exc, logger)
-            pending_step_zero_row = None
+        # Training-time diagnostic handoff to finalize_run (audit 2026-09-28): the optimizer-state
+        # footprint for resources.json and the per-name diagnostic failure counts for summary.json.
         try:
             artifacts.optimizer_state_bytes = _optimizer_state_bytes(optimizer)
         except Exception as exc:

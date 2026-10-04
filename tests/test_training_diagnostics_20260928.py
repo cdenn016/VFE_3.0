@@ -1,10 +1,10 @@
 """Training-time diagnostics, finalize additions and run archive (audit 2026-09-28, Section 2).
 
 Tiny CPU models only (K=4, two heads, N=4, vocab 7). Covers: the fixed training-sample columns, the
-early evaluations, per-named-group gradient/parameter/update norms, the residual-ratio and
-attention-statistics CSVs, map snapshots, the conditional-route structure columns, exception
-isolation of every new diagnostic, finalize's best-weight test and resources.json, the corrected
-active-parameter count, the source archive and the tokenizer manifest.
+eval_interval-only evaluation schedule, per-named-group gradient/parameter/update norms, the
+residual-ratio and attention-statistics CSVs, map snapshots, the conditional-route structure
+columns, exception isolation of every new diagnostic, finalize's best-weight test and
+resources.json, the corrected active-parameter count, the source archive and the tokenizer manifest.
 """
 from tests.profiles import test_config
 import copy
@@ -91,12 +91,6 @@ def _no_heatmap_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
     torch.set_num_threads(1)
 
 
-@pytest.fixture
-def early(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(T, "EARLY_EVAL_STEPS", (0, 1, 3))
-    monkeypatch.setattr(T, "EARLY_EVAL_MIN_INTERVAL", 1)
-
-
 def test_parameter_groups_by_name() -> None:
     expected = {
         "prior_bank.mu_embed": "mu_embed", "prior_bank.sigma_log_embed": "sigma_log_embed",
@@ -116,8 +110,7 @@ def test_parameter_groups_by_name() -> None:
     assert "other" not in groups and {"relational_score", "norm", "pos_phi"} <= groups
 
 
-def test_diagnostics_do_not_change_the_training_trajectory(
-        tmp_path: Path, early: None) -> None:
+def test_diagnostics_do_not_change_the_training_trajectory(tmp_path: Path) -> None:
     cfg = _cfg()
     silent_model = _model(cfg)
     silent = _train(silent_model, cfg, _loaders(cfg))
@@ -132,7 +125,7 @@ def test_diagnostics_do_not_change_the_training_trajectory(
     assert artifacts.diagnostics_failures == {}
 
 
-def test_conditional_route_columns_files_and_early_evals(tmp_path: Path, early: None) -> None:
+def test_conditional_route_columns_and_files(tmp_path: Path) -> None:
     cfg = _cfg()
     model = _model(cfg)
     run_dir = tmp_path / "run"
@@ -142,8 +135,8 @@ def test_conditional_route_columns_files_and_early_evals(tmp_path: Path, early: 
     assert len(losses) == cfg.max_steps
     rows = _rows(run_dir / "metrics.csv")
     steps = [int(row["step"]) for row in rows]
-    assert steps == [0, 1, 2, 3, 4, 6, 8, 10, 12]
-    evals = {0, 1, 3, 4, 8, 12}
+    assert steps == [2, 4, 6, 8, 10, 12]
+    evals = {4, 8, 12}
     for column in (*T._TRAIN_SAMPLE_COLUMNS, *T._GROUP_COLUMNS, "sigma_log_mean",
                    "sigma_log_sd", "tokens_seen", "diagnostics_failures", "generalization_gap"):
         assert column in rows[0], column
@@ -157,18 +150,14 @@ def test_conditional_route_columns_files_and_early_evals(tmp_path: Path, early: 
         for group in present:
             assert math.isfinite(_num(row[f"param_norm_group_{group}"])), (step, group)
         assert math.isnan(_num(row["param_norm_group_other"]))
-        if step == 0:                                    # before the first update: no gradient
-            assert all(math.isnan(_num(row[f"grad_norm_group_{g}"])) for g in present)
-            assert all(math.isnan(_num(row[f"update_ratio_group_{g}"])) for g in present)
-        else:
-            for group in present:
-                assert math.isfinite(_num(row[f"grad_norm_group_{group}"])), (step, group)
-                ratio = _num(row[f"update_ratio_group_{group}"])
-                if _num(row[f"param_norm_group_{group}"]) > 0.0:
-                    assert ratio >= 0.0, (step, group)
-                else:                              # zero-initialized table: ratio undefined
-                    assert math.isnan(ratio), (step, group)
-            assert _num(row["update_ratio_group_relational_score"]) > 0.0
+        for group in present:
+            assert math.isfinite(_num(row[f"grad_norm_group_{group}"])), (step, group)
+            ratio = _num(row[f"update_ratio_group_{group}"])
+            if _num(row[f"param_norm_group_{group}"]) > 0.0:
+                assert ratio >= 0.0, (step, group)
+            else:                              # zero-initialized table: ratio undefined
+                assert math.isnan(ratio), (step, group)
+        assert _num(row["update_ratio_group_relational_score"]) > 0.0
         if step in evals:
             val_ce, sample_ce = _num(row["val_ce"]), _num(row["train_sample_ce"])
             assert math.isfinite(val_ce) and math.isfinite(sample_ce)
@@ -213,14 +202,14 @@ def test_conditional_route_columns_files_and_early_evals(tmp_path: Path, early: 
         torch.testing.assert_close(tensor, model.state_dict()[name].float(), rtol=0, atol=0)
 
 
-def test_legacy_route_and_default_early_eval_gate(tmp_path: Path) -> None:
+def test_legacy_route_residual_and_attention_files(tmp_path: Path) -> None:
     cfg = _cfg("legacy", max_steps=6)
     model = _model(cfg)
     run_dir = tmp_path / "run"
     artifacts = ra.RunArtifacts(run_dir, cfg, model, save_model_artifacts=False)
     _train(model, cfg, _loaders(cfg), artifacts=artifacts, eval_interval=3)
     rows = _rows(run_dir / "metrics.csv")
-    assert [int(row["step"]) for row in rows] == [3, 6]       # eval_interval < EARLY_EVAL_MIN_INTERVAL
+    assert [int(row["step"]) for row in rows] == [3, 6]
     assert all(math.isfinite(_num(row["train_sample_ce"])) for row in rows)
     residual = _rows(run_dir / "diagnostics" / "residual_ratio.csv")
     assert len(residual) == 2 * cfg.n_layers
@@ -228,6 +217,41 @@ def test_legacy_route_and_default_early_eval_gate(tmp_path: Path) -> None:
     attention = _rows(run_dir / "diagnostics" / "attention_stats.csv")
     assert len(attention) == 2 * cfg.n_layers * cfg.n_heads
     assert all(0.0 <= _num(a["prior_overlap"]) <= 1.0 + 1e-6 for a in attention)
+
+
+def test_no_validation_before_the_first_eval_interval_step(tmp_path: Path) -> None:
+    cfg = _cfg(max_steps=4)
+    model = _model(cfg)
+    run_dir = tmp_path / "run"
+    artifacts = ra.RunArtifacts(run_dir, cfg, model, save_model_artifacts=False)
+    _train(model, cfg, _loaders(cfg), artifacts=artifacts, log_interval=2, eval_interval=1000)
+    rows = _rows(run_dir / "metrics.csv")
+    assert [int(row["step"]) for row in rows] == [2, 4]            # log rows only, no step-0 row
+    assert all(math.isnan(_num(row["val_ce"])) for row in rows)
+    assert artifacts.train_sample_by_step == {}
+    assert not (run_dir / "map_snapshots").exists()
+
+
+def test_long_run_evaluates_only_on_eval_interval_multiples(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 1500 real optimizer steps take ~15 s on CPU; the schedule is decided by the loop, not the
+    # step, so the update is replaced by a no-op that reports an accepted step (status_out's only key).
+    def no_update(model: Any, optimizer: Any, scheduler: Any, tokens: torch.Tensor,
+                  targets: torch.Tensor, *, grad_clip: Any, grad_accum_steps: int, scaler: Any,
+                  metrics_out: Any, status_out: Dict[str, bool], **kwargs: Any) -> float:
+        status_out["did_step"] = True
+        return 0.0
+
+    monkeypatch.setattr(T, "train_step", no_update)
+    cfg = _cfg(max_steps=1500)
+    model = _model(cfg)
+    run_dir = tmp_path / "run"
+    artifacts = ra.RunArtifacts(run_dir, cfg, model, save_model_artifacts=False)
+    _train(model, cfg, _loaders(cfg), artifacts=artifacts, eval_interval=1500)
+    assert [int(row["step"]) for row in _rows(run_dir / "metrics.csv")] == [1500]
+    assert [p.name for p in sorted((run_dir / "map_snapshots").glob("step_*.pt"))] == [
+        "step_0001500.pt"]
+    assert set(artifacts.train_sample_by_step) == {1500}
 
 
 def test_failing_diagnostics_are_counted_and_training_continues(
@@ -259,7 +283,7 @@ def test_failing_diagnostics_are_counted_and_training_continues(
     assert not (run_dir / "diagnostics").exists() and not (run_dir / "map_snapshots").exists()
 
 
-def test_finalize_best_weights_resources_and_provenance(tmp_path: Path, early: None) -> None:
+def test_finalize_best_weights_resources_and_provenance(tmp_path: Path) -> None:
     cfg = _cfg()
     loaders = _loaders(cfg)
     model = _model(cfg)

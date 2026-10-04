@@ -28,7 +28,7 @@ from vfe3.paper.runs import (
     SCALING_AXIS_FIELD, Arm, Manifest, RunRecord, finite_float, optimizer_groups, select_checkpoint,
 )
 
-M3_LOG_X: bool = True                 # token and device-hour axes on a log scale (early evaluations)
+M3_LOG_X: bool = True                 # token and device-hour axes on a log scale
 DECAY_CURVE_POINTS: int = 2000        # samples of the decay-only curve drawn over training
 LR_CROSSCHECK_RTOL: float = 1e-4      # reconstructed vs logged sigma learning rate, relative tolerance
 COUNTER_SYMLOG_LINTHRESH: float = 1e-8

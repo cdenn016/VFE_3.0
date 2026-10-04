@@ -115,9 +115,7 @@ def test_periodic_generation_leaves_cuda_rng_alone(zero_devices: List[str]) -> N
 
 
 def test_train_checkpoint_and_finalize_leave_cuda_rng_alone(
-        zero_devices: List[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(T, "EARLY_EVAL_STEPS", (0, 1, 3))
-    monkeypatch.setattr(T, "EARLY_EVAL_MIN_INTERVAL", 1)
+        zero_devices: List[str], tmp_path: Path) -> None:
     cfg = _cfg(checkpoint_interval=2, max_steps=4)
     loaders = _loaders(cfg)
     loaders = (DataLoader(loaders[0].dataset, batch_size=loaders[0].batch_size, shuffle=True,

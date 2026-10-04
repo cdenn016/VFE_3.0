@@ -98,12 +98,6 @@ def _cpu_one_thread(monkeypatch: pytest.MonkeyPatch) -> None:
     torch.set_num_threads(1)
 
 
-@pytest.fixture
-def early(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(T, "EARLY_EVAL_STEPS", (0, 1, 3))
-    monkeypatch.setattr(T, "EARLY_EVAL_MIN_INTERVAL", 1)
-
-
 def test_projection_counter_is_an_exact_no_op_and_matches_the_stats() -> None:
     model = _model(_cfg())
     with torch.no_grad():
@@ -137,7 +131,7 @@ def test_projection_counter_is_an_exact_no_op_and_matches_the_stats() -> None:
 
 
 def test_projected_route_counters_columns_files_and_summary(
-        tmp_path: Path, early: None, monkeypatch: pytest.MonkeyPatch) -> None:
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg()
     model = _model(cfg)
     loaders = _loaders(cfg)
@@ -158,8 +152,8 @@ def test_projected_route_counters_columns_files_and_summary(
     monkeypatch.setattr(T, "project_phi_parameter_rows_", spy)
     _train(model, cfg, loaders, artifacts=artifacts, log_interval=2, eval_interval=4)
     rows = _rows(run_dir / "metrics.csv")
-    assert [int(row["step"]) for row in rows] == [0, 1, 2, 3, 4, 6, 8, 10, 12]
-    evals = {0, 1, 3, 4, 8, 12}
+    assert [int(row["step"]) for row in rows] == [2, 4, 6, 8, 10, 12]
+    evals = {4, 8, 12}
     windows = T._diagnostic_windows(loaders[1])
     W, L, H = int(windows.shape[0]), cfg.n_layers, cfg.n_heads
     n_rows = _phi_rows(model)
@@ -294,7 +288,7 @@ def test_factorization_fallback_is_counted(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 
-def test_counters_do_not_change_the_training_trajectory(tmp_path: Path, early: None) -> None:
+def test_counters_do_not_change_the_training_trajectory(tmp_path: Path) -> None:
     cfg = _cfg()
     silent_model = _model(cfg)
     silent = _train(silent_model, cfg, _loaders(cfg))
