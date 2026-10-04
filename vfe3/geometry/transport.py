@@ -16,6 +16,7 @@ from torch import nn
 from vfe3.config import VFE3Config
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.lie_ops import CompactBlockElement
+from vfe3.runtime import ieee_fp32_matmul
 
 if TYPE_CHECKING:
     from vfe3.config import VFE3Config
@@ -247,6 +248,7 @@ class RopeTransport:
 ROPE_INSERTIONS: Tuple[str, ...] = ("right", "left")
 
 
+@ieee_fp32_matmul()
 def fold_rope_into_frame(
     base: 'FactoredTransport | CompactFactoredTransport',
     rope: torch.Tensor,                   # (..., N, K, K) block-diagonal orthogonal rotation
@@ -271,7 +273,9 @@ def fold_rope_into_frame(
 
     An escalated float64 base (audit 2026-09-23 #12) folds in the rotation re-orthogonalized at
     float64 (:func:`_rope_at_frame_precision`), so the folded pair stays one float64 group-inverse
-    pair.
+    pair. The two fold products run at IEEE fp32 whatever ``fp32_matmul_precision`` is
+    (:func:`vfe3.runtime.ieee_fp32_matmul`): each is rounded on its own, so TF32 would leave the
+    pair inverse only to :math:`2^{-10}\kappa`.
     """
     rope = _rope_at_frame_precision(rope, _factor_dtype(base))
     rope_t = rope.transpose(-1, -2)
@@ -1115,6 +1119,7 @@ def _stable_compact_glk_exp_pair(
     return exp_pos, exp_neg
 
 
+@ieee_fp32_matmul()
 def build_factored_transport(
     phi:        torch.Tensor,             # (..., N, n_gen) gauge frames (optional leading batch axis)
     group:      GaugeGroup,               # block-diagonal with equal blocks (len(irrep_dims) > 1)
@@ -1137,6 +1142,12 @@ def build_factored_transport(
     block-diagonal exp machinery already produces. Rank-agnostic
     via the leading ellipsis: a (B, N, n_gen) frame (batched forward) and a (N, n_gen) frame (the
     unbatched block / diagnostics path) both flow through.
+
+    The exponentials and the composition :math:`(U E, E^{-1} U^{-1})` run at IEEE fp32 whatever
+    ``fp32_matmul_precision`` is (:func:`vfe3.runtime.ieee_fp32_matmul`). The two composition
+    products are rounded independently, so under TF32 the stored pair would be inverse only to
+    :math:`2^{-10}\kappa`, which breaks the ``CanonicalFrameContext`` contract for ill-conditioned
+    frames. These are small block GEMMs; the caller's policy still governs every consumer.
     """
     block_dims = group.irrep_dims if len(group.irrep_dims) > 1 else None
     compact = (

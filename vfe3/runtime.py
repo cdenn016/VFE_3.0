@@ -1,7 +1,8 @@
 """Shared runtime-state setup and reporting for click-to-run entry points."""
 
 import os
-from typing import Dict, Optional
+from contextlib import contextmanager
+from typing import Dict, Iterator, Optional
 
 import torch
 
@@ -36,6 +37,27 @@ def set_fp32_matmul_precision(policy: Optional[str]) -> None:
     # provenance this finding is about. Measured on torch 2.9 / py3.14. The legacy booleans remain
     # readable and stay in agreement on their own, because they are views of this same setting.
     torch.set_float32_matmul_precision(policy)
+
+
+@contextmanager
+def ieee_fp32_matmul() -> Iterator[None]:
+    r"""Run the enclosed fp32 GEMMs under IEEE fp32 (``"highest"``), then restore the process policy.
+
+    For code whose accuracy contract assumes IEEE fp32 multiplication, unit roundoff
+    :math:`u = 2^{-23}`: TF32 (``"high"``) or bf16 (``"medium"``) inputs round to :math:`2^{-10}` or
+    :math:`2^{-7}` and void it. The policy is restored on every exit path, including exceptions, and
+    the context also works as a function decorator. Only the forward GEMMs inside it are pinned;
+    their backward runs later under the caller's policy.
+    """
+    previous = torch.get_float32_matmul_precision()
+    if previous == "highest":
+        yield
+        return
+    torch.set_float32_matmul_precision("highest")
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(previous)
 
 
 def set_fill_uninitialized_memory(enabled: bool) -> None:

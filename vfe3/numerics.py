@@ -19,6 +19,8 @@ from typing import Callable, Dict, List, Literal, NamedTuple, Optional, Tuple
 
 import torch
 
+from vfe3.runtime import ieee_fp32_matmul
+
 
 def _symmetrize(matrix: torch.Tensor) -> torch.Tensor:
     """Average a matrix with its transpose (kills asymmetric round-off)."""
@@ -472,6 +474,7 @@ def _recheck_spd_condition_on_cpu(
     return result.reshape(condition.shape)
 
 
+@ieee_fp32_matmul()
 def validated_cholesky_solve(
     matrix: torch.Tensor,                 # (..., K, K) candidate SPD system
     rhs: Optional[torch.Tensor] = None,   # (..., K, R), when a checked solve is required
@@ -618,6 +621,7 @@ def guarded_cholesky(
     return torch.linalg.cholesky_ex(torch.where(failed[..., None, None], eye, W))[0], failed
 
 
+@ieee_fp32_matmul()
 def cholesky_qr2(
     X: torch.Tensor,   # (..., r, m) source root with r <= m
 
