@@ -21,12 +21,15 @@ from typing import Any
 
 import torch
 
+from vfe3.runtime import ieee_fp32_matmul
+
 
 def _work_dtype(*tensors: torch.Tensor) -> torch.dtype:
     r"""float64 when any operand is float64 (an escalated frame), else float32."""
     return torch.float64 if any(t.dtype == torch.float64 for t in tensors) else torch.float32
 
 
+@ieee_fp32_matmul()
 def frame_matvec(
     matrix:         torch.Tensor,                  # (..., N, G, d, d) compact blocks or (..., N, K, K) dense
     x:              torch.Tensor,                  # (..., N, K)
@@ -48,6 +51,7 @@ def frame_matvec(
     return out.to(x.dtype)
 
 
+@ieee_fp32_matmul()
 def reference_variances(
     mu:    torch.Tensor,                           # (..., N, K) local means (layout reference only)
     sigma: torch.Tensor,                           # (..., N, K) diagonal or (..., N, K, K) full local covariance
@@ -79,6 +83,7 @@ def reference_variances(
     return out.to(sigma.dtype)
 
 
+@ieee_fp32_matmul()
 def reference_covariance(
     mu:    torch.Tensor,                           # (..., N, K) local means (layout reference only)
     sigma: torch.Tensor,                           # (..., N, K) diagonal or (..., N, K, K) full local covariance

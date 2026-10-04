@@ -10,6 +10,7 @@ from torch.utils.checkpoint import checkpoint
 
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.relational_scoring import _compute_dtype
+from vfe3.runtime import ieee_fp32_matmul
 
 # Receiving-map charts of the content link on the stored factors (O, T) (attention_unified.tex,
 # "The tiled message order by order"). A later truncation such as "second_order" adds one branch
@@ -230,7 +231,8 @@ class RelationalOperators(nn.Module):
             body = torch.einsum("hks,...nhs->...nk", receive.to(dtype), pooled)
             if frame.block_diagonal:
                 body = body.reshape(*mu.shape[:-1], H, d)
-            result = (frame.forward.to(dtype) @ body.unsqueeze(-1)).squeeze(-1)
+            with ieee_fp32_matmul():                                       # U_i body_i, kappa(U)-sensitive
+                result = (frame.forward.to(dtype) @ body.unsqueeze(-1)).squeeze(-1)
         return result.reshape_as(mu).to(mu.dtype)
 
     def _ambient_content_maps(
@@ -277,6 +279,7 @@ class RelationalOperators(nn.Module):
                               use_reentrant=False, preserve_rng_state=False)
         return self._predictive_covariance_update(mu, sigma, beta, frame, receive)
 
+    @ieee_fp32_matmul()
     def _predictive_covariance_update(
         self,
         mu:    torch.Tensor,  # (..., N, K)
@@ -285,7 +288,14 @@ class RelationalOperators(nn.Module):
         frame: CanonicalFrameContext,
         receive: Optional[torch.Tensor] = None,   # (H, K, d)
     ) -> torch.Tensor:
-        r"""Body of :meth:`predictive_covariance_update`: blockwise for diagonal beliefs on block frames."""
+        r"""Body of :meth:`predictive_covariance_update`: blockwise for diagonal beliefs on block frames.
+
+        Runs at IEEE fp32 whatever ``fp32_matmul_precision`` is (:func:`vfe3.runtime.ieee_fp32_matmul`),
+        also when the checkpoint recomputes it. :math:`\mathrm{diag}(U C^{\mathrm{att}} U^\top)` with
+        :math:`C = U^{-1}\Sigma U^{-\top}` passes through :math:`U^{-1}` and back through :math:`U`, so
+        its rounding is amplified by about :math:`\kappa(U)^2`; at TF32's :math:`2^{-10}` small output
+        variances came out nonpositive on ill-conditioned frames.
+        """
         if frame.block_diagonal and sigma.dim() == mu.dim():
             return self._predictive_covariance_update_blockwise(mu, sigma, beta, frame, receive)
         return self._predictive_covariance_update_dense(mu, sigma, beta, frame, receive)
@@ -452,6 +462,7 @@ class RelationalOperators(nn.Module):
         r"""Return full-state (T, O') for M_h=O'_h T_h; O' = O in the affine chart (the stored parameter)."""
         return self.T, chart_receive_map(self.T, self.O, self.content_link_chart)
 
+    @ieee_fp32_matmul()
     def canonical_mean(
         self,
         mu:    torch.Tensor,  # (..., N, K)

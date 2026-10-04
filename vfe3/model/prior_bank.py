@@ -50,6 +50,7 @@ from vfe3.model.frame_actions import frame_matvec, reference_covariance, referen
 from vfe3.belief import BeliefState
 from vfe3.divergence import get_family, get_functional, kl, renyi
 from vfe3.families.base import _logdet_chol
+from vfe3.runtime import ieee_fp32_matmul
 from vfe3.families.gaussian import (
     FullGaussian,
     full_cov_kl_precision,
@@ -347,26 +348,10 @@ def _decode_av_lhs(
     ], dim=-1)
 
 
-@contextmanager
-def _ieee_fp32_matmul() -> Iterator[None]:
-    r"""Run the enclosed fp32 GEMMs under IEEE fp32 (``"highest"``), then restore the process policy.
-
-    The a_v interval certificate bounds the fp32 inner product of length :math:`n = 2K` by
-    :math:`\gamma = (2n + 4)\,u\,\sum |l_k r_k|` with :math:`u` = ``torch.finfo(float32).eps``. That
-    bound holds only for IEEE fp32 multiplication; TF32 (``"high"``) or bf16 (``"medium"``) inputs
-    round to :math:`u = 2^{-10}` or :math:`2^{-7}` and void it, so the global
-    ``fp32_matmul_precision`` is pinned to ``"highest"`` here and restored on every exit path,
-    including exceptions.
-    """
-    previous = torch.get_float32_matmul_precision()
-    if previous == "highest":
-        yield
-        return
-    torch.set_float32_matmul_precision("highest")
-    try:
-        yield
-    finally:
-        torch.set_float32_matmul_precision(previous)
+# The a_v interval certificate bounds the fp32 inner product of length n = 2K by
+# gamma = (2n + 4) u sum |l_k r_k| with u = torch.finfo(float32).eps. That bound holds only for IEEE
+# fp32 multiplication, so the a_v GEMM runs under the shared IEEE fp32 pin.
+_ieee_fp32_matmul = ieee_fp32_matmul
 
 
 def _decode_av(

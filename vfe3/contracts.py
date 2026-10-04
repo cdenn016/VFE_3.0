@@ -94,9 +94,14 @@ class CanonicalFrameContext:
             )
         tolerance = torch.clamp(unbounded_tolerance, max=1e-2)
         if not bool(torch.all(residual <= tolerance)):
-            hint = ("; a float32 frame this ill-conditioned needs "
-                    "VFE3Config.frame_pair_fp64_escalation=True"
-                    if self.forward.dtype == torch.float32 else "")
+            hint = ""
+            if self.forward.dtype == torch.float32:
+                policy = torch.get_float32_matmul_precision()
+                hint = (f"; fp32_matmul_precision is {policy!r}, so a producer that composed this "
+                        "pair outside vfe3.runtime.ieee_fp32_matmul rounded it at TF32/bf16 "
+                        "precision" if policy != "highest" else
+                        "; a float32 frame this ill-conditioned needs "
+                        "VFE3Config.frame_pair_fp64_escalation=True")
             raise ValueError(
                 "canonical forward and inverse factors must be mutual inverses within a "
                 "dtype-scaled residual; got max residual "

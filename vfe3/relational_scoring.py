@@ -11,6 +11,7 @@ from typing import Dict, Optional, Tuple
 import torch
 from torch.utils.checkpoint import checkpoint
 
+from vfe3.runtime import ieee_fp32_matmul
 from vfe3.numerics import (
     FACTOR_CONDITION_TOL, cholesky_qr2, guarded_cholesky, triangular_condition_estimate,
 )
@@ -178,6 +179,7 @@ def _projected_linear_map(
                         S.reshape(*S.shape[:-1], G, d), inverse_blocks).flatten(-2)
 
 
+@ieee_fp32_matmul()
 def projected_moments(
     mu_h:           torch.Tensor,  # (..., N, H, d)
     Sigma_h:        torch.Tensor,  # (..., N, H, d) or (..., N, H, d, d)
@@ -282,6 +284,7 @@ def _projected_moments_tile(
     return a, G
 
 
+@ieee_fp32_matmul()
 def _cholesky_status(G: torch.Tensor) -> Tuple[torch.Tensor, ...]:
     r"""Factor G and certify eps ||G||_F ||G^{-1}||_F <= tol for every float32 entry on device.
 
@@ -383,6 +386,7 @@ def _projected_root_factor(
     return torch.cat(factors, dim=-4), torch.cat(failures, dim=-2)
 
 
+@ieee_fp32_matmul()
 def _factor_status(
     G:          torch.Tensor,                # (..., N, H, r, r) explicit Gram, working dtype
     projection: Tuple[torch.Tensor, ...],
@@ -432,6 +436,7 @@ def _source_qr_factor(root: torch.Tensor) -> torch.Tensor:
     return R.transpose(-1, -2) * signs.unsqueeze(-2)
 
 
+@ieee_fp32_matmul()
 def _source_root(
     G:          torch.Tensor,                # (..., r, r) working-dtype projected covariance
     projection: Tuple[torch.Tensor, ...],    # (Sigma_h, U^{-1} blocks, S[, mu_h])
@@ -466,6 +471,7 @@ def _source_root(
     return root
 
 
+@ieee_fp32_matmul()
 def _strict_cholesky(
     G:          torch.Tensor,
     projection: Optional[Tuple[torch.Tensor, ...]] = None,
@@ -658,7 +664,8 @@ def projected_gaussian_kl(
                 aq, ak = aq.double(), ak.double()
             q_factor, k_factor = chol_q, chol_k                 # float64 where recovered under "fp64"
             q_cov_healthy = Gq                                  # working dtype
-            k_prec_healthy = torch.cholesky_inverse(chol_k.to(dtype))
+            with ieee_fp32_matmul():                            # token-linear key precision
+                k_prec_healthy = torch.cholesky_inverse(chol_k.to(dtype))
             # Fold token-level recover flags into one host transfer, recovery path only.
             def _token_recover_flags(mask: torch.Tensor, n_tokens: int) -> torch.Tensor:
                 return mask.movedim(-2, 0).reshape(n_tokens, -1).any(dim=-1)
@@ -670,7 +677,8 @@ def projected_gaussian_kl(
             flags = torch.cat((q_tok, k_tok)).tolist()
             q_needs, k_needs = flags[:nq_flags], flags[nq_flags:]
         else:
-            q_cov_healthy, k_prec_healthy = Gq, torch.cholesky_inverse(chol_k)
+            with ieee_fp32_matmul():                            # token-linear key precision
+                q_cov_healthy, k_prec_healthy = Gq, torch.cholesky_inverse(chol_k)
             q_needs = k_needs = None
         aq, ak = aq.movedim(-2, -3), ak.movedim(-2, -3)  # (..., H, N, r)
         q_cov_healthy = q_cov_healthy.movedim(-3, -4)   # (..., H, Nq, r, r)
