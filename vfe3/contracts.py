@@ -94,11 +94,14 @@ class CanonicalFrameContext:
             )
         tolerance = torch.clamp(unbounded_tolerance, max=1e-2)
         if not bool(torch.all(residual <= tolerance)):
+            hint = ("; a float32 frame this ill-conditioned needs "
+                    "VFE3Config.frame_pair_fp64_escalation=True"
+                    if self.forward.dtype == torch.float32 else "")
             raise ValueError(
                 "canonical forward and inverse factors must be mutual inverses within a "
                 "dtype-scaled residual; got max residual "
                 f"{float(residual.max().detach().cpu()):.6g} and tolerance "
-                f"{float(tolerance.max().detach().cpu()):.6g}"
+                f"{float(tolerance.max().detach().cpu()):.6g}{hint}"
             )
 
 

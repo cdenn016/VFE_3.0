@@ -41,6 +41,8 @@ from vfe3.geometry.transport import (
     RopeTransport,
     TransportState,
     get_transport_registration,
+    set_frame_pair_condition_tol,
+    set_frame_pair_fp64_escalation,
     _build_flat,
 )
 from vfe3.model.head_mixer import HeadMixer
@@ -67,8 +69,14 @@ from vfe3.families.gaussian import (
 from vfe3.families.base import BeliefParams
 from vfe3.families.policy import family_instance
 from vfe3.numerics import safe_eigvalsh, set_mu_trust_cholesky_rounds
-from vfe3.relational_scoring import set_projected_condition_recovery, set_projected_factor_route
-from vfe3.runtime import set_fp32_matmul_precision
+from vfe3.relational_scoring import (
+    set_projected_condition_recovery,
+    set_projected_factor_condition_tol,
+    set_projected_factor_route,
+    set_projected_gram_condition_tol,
+    set_projected_recovery_precision,
+)
+from vfe3.runtime import set_fill_uninitialized_memory, set_fp32_matmul_precision
 from vfe3.model.relational_operators import RelationalOperators
 
 
@@ -317,6 +325,11 @@ class VFEModel(nn.Module):
         set_full_cov_kl_precision(self.full_cov_kl_precision)
         set_projected_condition_recovery(cfg.projected_cov_condition_recovery)
         set_projected_factor_route(cfg.projected_factor_route)
+        set_projected_gram_condition_tol(cfg.projected_gram_condition_tol)
+        set_projected_factor_condition_tol(cfg.projected_factor_condition_tol)
+        set_projected_recovery_precision(cfg.projected_cov_recovery_precision)
+        set_frame_pair_fp64_escalation(cfg.frame_pair_fp64_escalation)
+        set_frame_pair_condition_tol(cfg.frame_pair_condition_tol)
         set_mu_trust_cholesky_rounds(cfg.mu_trust_cholesky_rounds)
         # ... and the fp32 matmul / TF32 policy (audit 2026-08-06 C7/F25), which is process-global
         # for the same reason and belongs to the same one-place-set rule. It lives here rather than
@@ -325,6 +338,8 @@ class VFEModel(nn.Module):
         # not others, which is the exact failure C7 exists to close. None (the default) leaves the
         # card untouched, so this line changes nothing unless a config asks for it.
         set_fp32_matmul_precision(cfg.fp32_matmul_precision)
+        # Process-global like the matmul policy; torch reads it only under deterministic algorithms.
+        set_fill_uninitialized_memory(cfg.fill_uninitialized_memory)
         self._transport_status: Dict[str, bool] = {}
         self.group = build_group(cfg)
         # Keep layer zero's state-dict prefix for existing single-layer checkpoints.
@@ -351,7 +366,8 @@ class VFEModel(nn.Module):
                                 routing=cfg.relational_routing,
                                 predictive_covariance=(cfg.predictive_covariance if predictive
                                                        else "passthrough"),
-                                predictive_covariance_floor=cfg.predictive_covariance_floor)
+                                predictive_covariance_floor=cfg.predictive_covariance_floor,
+                                predictive_covariance_checkpoint=cfg.predictive_covariance_checkpoint)
             for layer_index in range(cfg.n_layers)
         ]
         self.relational_operators = layers[0]

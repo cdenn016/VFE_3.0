@@ -154,7 +154,7 @@ def test_retired_gauge_groups_are_refused_on_load_and_construction(group: str) -
 def test_retired_fields_are_not_constructor_arguments() -> None:
     for key in ("e_step_update", "mu_trust_mode", "renyi_order", "transport_mode", "m_decode_lr",
                 "_allow_legacy_dense_decode", "decode_temperature_learned", "safe_cholesky_jitter_mode",
-                "exp_fp64_norm_threshold", "frame_pair_fp64_escalation", "transport_clamp_monitor",
+                "exp_fp64_norm_threshold", "transport_clamp_monitor",
                 "decode_ce_stable_reduction", "decode_ranking_refinement",
                 "predictive_covariance_centering", "min_lr"):
         with pytest.raises(TypeError):
@@ -285,10 +285,19 @@ def test_resume_drops_a_never_stepped_retired_temperature_exactly(tmp_path: Path
 @pytest.mark.parametrize(("key", "value"), [
     ("transport_clamp_monitor", True), ("transport_clamp_monitor", False),
     ("exp_fp64_norm_threshold", 20.0), ("exp_fp64_norm_threshold", 5.0),
-    ("frame_pair_fp64_escalation", True), ("frame_pair_fp64_escalation", False),
 ])
 def test_retired_exponential_policy_keys_load_with_any_value(key: str, value: object) -> None:
     assert _load(**{key: value}) == test_config()
+
+
+# frame_pair_fp64_escalation was retired on 2026-10-02 and is a live opt-in field again since
+# 2026-10-04: a saved value loads as saved, and a config without it loads the default False.
+@pytest.mark.parametrize("value", [True, False])
+def test_reinstated_frame_pair_escalation_loads_its_saved_value(value: bool) -> None:
+    assert _load(frame_pair_fp64_escalation=value).frame_pair_fp64_escalation is value
+    payload = _payload()
+    del payload["frame_pair_fp64_escalation"]
+    assert config_from_serialized(payload, source="test").frame_pair_fp64_escalation is False
 
 
 def test_a_missing_chart_radius_loads_as_the_retired_clamp_radius() -> None:

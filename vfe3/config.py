@@ -124,6 +124,11 @@ class VFE3Config:
 
     seed:                      int   = 6
     deterministic:             bool  = True         # pins torch/cuDNN determinism; does NOT pin TF32 (see fp32_matmul_precision)
+    # Under deterministic=True torch fills every uninitialized allocation with NaN (or the integer
+    # maximum) so a read of uninitialized memory is visible and reproducible. False skips those fill
+    # kernels: about 2,800 fewer kernels and 13.5 ms per K=64 step on the RTX 5090, with bit-identical
+    # loss and gradients, at the cost of that guard. Inactive when deterministic=False.
+    fill_uninitialized_memory: bool  = True
 
     log_interval:              int   = 100          # console log every N steps (0 = off)
     eval_interval:             int   = 1500         # periodic validation every N steps (0 = off)
@@ -365,6 +370,12 @@ class VFE3Config:
     # floor * (tr C_i / K) I (local floor * (tr C_i / K) U_i U_i^T).
     predictive_covariance:               str           = "passthrough"          # "passthrough" | "moment_matched" (projected_predictive only)
     predictive_covariance_floor:         float         = 1e-4                   # Q~_i = floor * (tr C_i / K) I, keeps Sigma^+ positive definite and well conditioned
+    # Recompute the moment-matched covariance update in backward instead of saving its dense
+    # (B, N, K, K) intermediates. Values and gradients are bit-identical. At K=256, H=8, B=16 it
+    # took peak memory from 46.3 to 23.0 GB and the step from 12.0 s (the Windows driver silently
+    # spilling to shared system memory instead of raising OOM) to 0.83 s, measured on the dense
+    # update before the blockwise route (2026-10-04) removed its K x K intermediates. Worth it at large K.
+    predictive_covariance_checkpoint:    bool          = False
 
     ######################################
     #                Self Energy:
@@ -625,8 +636,17 @@ class VFE3Config:
     # permit TF32/bf16x3 reductions.
     fp32_matmul_precision: Optional[str] = "highest"       # None (leave as-is) | "highest" | "high" | "medium"
 
-    # Transport matrix-exponential precision is not configurable: every float32 frame pair
-    # (U, U^-1) is certified and redone in float64 when kappa_F(U) eps32 > 1e-4 (2026-10-02).
+    # Float64 escalation of the stored frame pair (U, U^-1) (audit 2026-09-23 #12). On, a producer
+    # call whose float32 pair has max_b kappa_F(U_b) eps_32 > frame_pair_condition_tol is redone in
+    # float64 as a whole, and every relational consumer of that frame (projected scorer, predictive
+    # content, moment-matched covariance) then runs in float64, forward and backward. OPT-IN: it was
+    # unconditional from 2026-10-02 to 2026-10-04 and measured ~7x per escalated step on the RTX 5090
+    # (1.53 s vs 0.21 s at K=64, B=32; seed 54, where the learned position-0 frame drifted to
+    # kappa_F ~ 445, escalated on 61 of 64 batches by step 8000). Off, the stored pair keeps its
+    # inverse residual <= eps_32 kappa_F(U) (about 2e-4 there) and the loss moved by <= 9e-5 nats;
+    # CanonicalFrameContext still fails closed above min(64 K eps kappa_inf, 1e-2).
+    frame_pair_fp64_escalation: bool  = False
+    frame_pair_condition_tol:   float = 1e-4        # escalate when eps_32 max kappa_F > tol, i.e. kappa_F > 838.9
 
     # Working precision of the FULL-covariance pair KL in the family_chunked decoder (family=
     # "gaussian_full" only). "fp64" is the historical unconditional float64 island.
@@ -643,6 +663,22 @@ class VFE3Config:
     # from 0.11 s to 0.60-0.79 s. Off, a flagged entry keeps its float32 factor (relative error
     # O(kappa eps_32) in its scores) and the certificate's two batched inverses are skipped.
     projected_cov_condition_recovery: bool = False
+
+    # Certificate thresholds of that recovery (read only with projected_cov_condition_recovery=True).
+    # Gram route: eps_32 ||G||_F ||G^-1||_F > tol (kappa_F(G) > 838.9 at 1e-4). Factor route
+    # ("cholesky_qr2"): eps_32 kappa_1-estimate(C) > tol on the CholeskyQR2 factor (> 2517 at 3e-4).
+    projected_gram_condition_tol:   float = 1e-4
+    projected_factor_condition_tol: float = 3e-4
+
+    # Working precision of the projected source recovery (failed float32 Cholesky factors, plus the
+    # certificate-flagged ones above). "fp64" rebuilds them by float64 QR, promotes the factor tensor
+    # to float64 and evaluates every pair touching a recovered entry in float64 triangular-solve tiles;
+    # those tiles, not the QR, cost ~230 ms per recovering step at K=64 (seed 54). "fp32" rebuilds
+    # them by float32 shifted CholeskyQR3 of the source root and keeps factor and tiles in the
+    # working dtype: whitened factor error <= c eps_32 kappa_2(X) (measured <= 9.1e-4 on every
+    # seed-54 failure, all at position 0), the same as float32 Householder QR of the same root. A
+    # call whose float32 retry fails (kappa_2(X) beyond ~1/eps_32) takes the "fp64" path.
+    projected_cov_recovery_precision: str = "fp64"      # "fp64" | "fp32"
 
     # Factor route of the projected Gaussian-KL scorer (optimization_plan.md WS1). "gram" factors the
     # rounded float32 Gram G = fl(X X^T), X = S U^-1 Sigma^1/2, so its factor, precision and
@@ -1306,6 +1342,14 @@ class VFE3Config:
             raise ValueError(
                 "projected_factor_route must be one of ('gram', 'cholesky_qr2'), "
                 f"got {self.projected_factor_route!r}")
+        _require(self.projected_cov_recovery_precision, ("fp64", "fp32"),
+                 "projected_cov_recovery_precision")
+        for name in ("frame_pair_condition_tol", "projected_gram_condition_tol",
+                     "projected_factor_condition_tol"):
+            value = getattr(self, name)
+            if (isinstance(value, bool) or not isinstance(value, Real)
+                    or not math.isfinite(value) or not 0.0 < value < 1.0):
+                raise ValueError(f"{name} must be a finite number in (0, 1), got {value!r}")
         if self.mu_trust_cholesky_rounds < 0:
             raise ValueError(
                 "mu_trust_cholesky_rounds must be a nonnegative int, got "
@@ -1716,13 +1760,31 @@ class VFE3Config:
         if self.relational_routing == "noisy_query":
             mark(("projected_factor_route",),
                  "the noisy-query cost factors per-pair sums G_q + G_k and keeps the Gram route")
+        if not self.deterministic:
+            mark(("fill_uninitialized_memory",),
+                 "torch fills uninitialized memory only under deterministic algorithms")
+        gram_status = (self.projected_factor_route == "gram"
+                       or self.relational_routing == "noisy_query")
+        if not (self.projected_cov_condition_recovery and gram_status):
+            mark(("projected_gram_condition_tol",),
+                 "only read by the Gram-route certificate under projected_cov_condition_recovery=True")
+        if not (self.projected_cov_condition_recovery and not gram_status):
+            mark(("projected_factor_condition_tol",),
+                 "only read by the cholesky_qr2 certificate under projected_cov_condition_recovery=True")
+        if self.gauge_transport == "off":
+            mark(("frame_pair_fp64_escalation", "frame_pair_condition_tol"),
+                 "gauge_transport='off' fixes every frame to the identity (kappa_F = d), so the "
+                 "certificate cannot trip")
+        elif not self.frame_pair_fp64_escalation:
+            mark(("frame_pair_condition_tol",), "only read when frame_pair_fp64_escalation=True")
         if self.attention_mode != "projected_predictive":
-            mark(("predictive_covariance", "predictive_covariance_floor", "attention_residual"),
+            mark(("predictive_covariance", "predictive_covariance_floor", "attention_residual",
+                  "predictive_covariance_checkpoint"),
                  "only read by attention_mode='projected_predictive': the gradient receiver's covariance "
                  "comes from its receiver update, and its self-information enters through "
                  "alpha KL(q||p) and the closed-form damping")
         elif self.predictive_covariance == "passthrough":
-            mark(("predictive_covariance_floor",),
+            mark(("predictive_covariance_floor", "predictive_covariance_checkpoint"),
                  "only read by predictive_covariance='moment_matched'")
         if self.attention_mode != "projected_gradient":
             mark(("relational_receiver_noise", "relational_receiver_law", "relational_receiver_update",
@@ -1985,10 +2047,10 @@ _RETIRED_INERT_FIELDS = frozenset({
     "mm_damping", "full_cov_kl_backend", "full_cov_congruence_precision",
     "full_cov_congruence_certification", "congruence_cond_escalation", "rope_full_gauge",
     # 2026-10-02 transport-exponential unification: the clamp monitor watched the retired clamp;
-    # the norm threshold changed only the interior precision of float32-stored exponentials; the
-    # frame-pair escalation is unconditional, and a saved False only lacked the float64 rebuild of
-    # pairs whose float32 certificate failed.
-    "transport_clamp_monitor", "exp_fp64_norm_threshold", "frame_pair_fp64_escalation",
+    # the norm threshold changed only the interior precision of float32-stored exponentials.
+    # (frame_pair_fp64_escalation, retired the same day, is a live opt-in field again since
+    # 2026-10-04; a saved value loads as saved, and a config without it loads the default False.)
+    "transport_clamp_monitor", "exp_fp64_norm_threshold",
 })
 # Retired fields with a config-dependent rule in _migrate_retired_fields.
 _RETIRED_CONDITIONAL_FIELDS = frozenset({

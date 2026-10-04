@@ -20,8 +20,9 @@ from vfe3.numerics import (
 _PROJECTION_TILE_BYTES = 32 * 1024 ** 2
 
 # Cumulative (token, head) covariance entries whose Cholesky factor was rebuilt from source by the
-# recovery path (float64 QR, or float32 shifted CholeskyQR3 on the "cholesky_qr2" factor route), per device. Updated asynchronously on the recovery path only, so the
-# healthy path pays nothing (audit 2026-09-23 low: the recovery had no activation counter).
+# recovery path (float64 QR, or float32 shifted CholeskyQR3 on the "cholesky_qr2" factor route or
+# under projected_cov_recovery_precision="fp32"), per device. Updated asynchronously on the recovery
+# path only, so the healthy path pays nothing (audit 2026-09-23 low: the recovery had no activation counter).
 _SOURCE_RECOVERY_COUNTS: Dict[str, torch.Tensor] = {}
 
 
@@ -59,9 +60,52 @@ def reset_source_recovery_elements() -> None:
 
 # Conditioning-triggered float64 source recovery (config ``projected_cov_condition_recovery``,
 # installed by VFEModel). Off, only entries whose zero-jitter float32 Cholesky FAILS are rebuilt
-# from source; entries that factor but fail the certificate eps_32 ||G||_F ||G^{-1}||_F <= 1e-4
-# keep their float32 factor, and the certificate itself is not evaluated.
+# from source; entries that factor but fail the certificate eps_32 ||G||_F ||G^{-1}||_F <= tol
+# keep their float32 factor, and the certificate itself is not evaluated. The Gram-route tolerance
+# is ``projected_gram_condition_tol`` (default 1e-4, i.e. kappa_F(G) > 838.9 in float32).
 _CONDITION_RECOVERY: bool = False
+_GRAM_CONDITION_TOL: float = 1e-4
+
+# Working precision of a source recovery (config ``projected_cov_recovery_precision``, installed by
+# VFEModel). "fp64" rebuilds the flagged factors by float64 QR, promotes the factor tensor to float64
+# and routes every pair touching a recovered entry through float64 triangular-solve tiles. "fp32"
+# rebuilds them by float32 shifted CholeskyQR3 of the source root (backward stable for
+# kappa_2(X) <~ 1/eps_32; Fukaya et al., SIAM J. Sci. Comput. 42 (2020) A477), keeps the factor in
+# the working dtype, and evaluates the touched pairs by the same triangular-solve tiles in the working
+# dtype. A call whose float32 retry fails falls back to "fp64" for that call.
+_RECOVERY_PRECISIONS = ("fp64", "fp32")
+_RECOVERY_PRECISION: str = "fp64"
+
+
+def _validated_tolerance(tol: float, name: str) -> float:
+    if (isinstance(tol, bool) or not isinstance(tol, (int, float))
+            or not math.isfinite(tol) or not 0.0 < tol < 1.0):
+        raise ValueError(f"{name} must lie in (0, 1), got {tol!r}")
+    return float(tol)
+
+
+def set_projected_gram_condition_tol(tol: float) -> float:
+    r"""Set the Gram-route certificate tolerance eps ||G||_F ||G^{-1}||_F > tol; returns the previous value."""
+    global _GRAM_CONDITION_TOL
+    previous = _GRAM_CONDITION_TOL
+    _GRAM_CONDITION_TOL = _validated_tolerance(tol, "projected Gram condition tolerance")
+    return previous
+
+
+def set_projected_recovery_precision(precision: str) -> str:
+    r"""Set the projected source-recovery working precision ("fp64" | "fp32"); returns the previous value."""
+    if precision not in _RECOVERY_PRECISIONS:
+        raise ValueError(
+            f"projected recovery precision must be one of {_RECOVERY_PRECISIONS}, got {precision!r}")
+    global _RECOVERY_PRECISION
+    previous = _RECOVERY_PRECISION
+    _RECOVERY_PRECISION = precision
+    return previous
+
+
+def projected_recovery_precision() -> str:
+    r"""Return the projected source-recovery working precision."""
+    return _RECOVERY_PRECISION
 
 
 def set_projected_condition_recovery(enabled: bool) -> bool:
@@ -102,6 +146,18 @@ def set_projected_factor_route(route: str) -> str:
 def projected_factor_route() -> str:
     r"""Return the active projected Gaussian-KL factor route."""
     return _FACTOR_ROUTE
+
+
+def set_projected_factor_condition_tol(tol: float) -> float:
+    r"""Set the factor-route certificate tolerance eps kappa_1-estimate(C) > tol; returns the previous value.
+
+    Writes this module's ``_FACTOR_CONDITION_TOL``, the value the factor route reads at call time
+    (``numerics.FACTOR_CONDITION_TOL`` is only its import-time default).
+    """
+    global _FACTOR_CONDITION_TOL
+    previous = _FACTOR_CONDITION_TOL
+    _FACTOR_CONDITION_TOL = _validated_tolerance(tol, "projected factor condition tolerance")
+    return previous
 
 
 def _compute_dtype(*tensors: torch.Tensor) -> torch.dtype:
@@ -227,7 +283,9 @@ def _projected_moments_tile(
 
 
 def _cholesky_status(G: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-    r"""Factor G and certify eps ||G||_F ||G^{-1}||_F <= 1e-4 for every float32 entry on device.
+    r"""Factor G and certify eps ||G||_F ||G^{-1}||_F <= tol for every float32 entry on device.
+
+    ``tol`` is ``projected_gram_condition_tol`` (``_GRAM_CONDITION_TOL``, default 1e-4).
 
     The certificate is evaluated EXACTLY for every successfully factored float32 entry from its
     own factor (``cholesky_inverse``), so ``screen`` marks exactly the ill-conditioned entries and
@@ -250,7 +308,8 @@ def _cholesky_status(G: torch.Tensor) -> Tuple[torch.Tensor, ...]:
             eye = torch.eye(r, device=G.device, dtype=G.dtype)
             safe_factor = torch.where(failed[..., None, None], eye, chol)
             inverse_norm = torch.cholesky_inverse(safe_factor).norm(dim=(-2, -1))
-            certificate = torch.finfo(G.dtype).eps * G.norm(dim=(-2, -1)) * inverse_norm > 1e-4
+            certificate = (torch.finfo(G.dtype).eps * G.norm(dim=(-2, -1)) * inverse_norm
+                           > _GRAM_CONDITION_TOL)
             screen = (~failed) & certificate
         tolerance = 32 * torch.finfo(G.dtype).eps
         status = torch.stack((torch.isfinite(G).all(),
@@ -373,6 +432,40 @@ def _source_qr_factor(root: torch.Tensor) -> torch.Tensor:
     return R.transpose(-1, -2) * signs.unsqueeze(-2)
 
 
+def _source_root(
+    G:          torch.Tensor,                # (..., r, r) working-dtype projected covariance
+    projection: Tuple[torch.Tensor, ...],    # (Sigma_h, U^{-1} blocks, S[, mu_h])
+    mask:       torch.Tensor,                # (...) entries whose source square root is rebuilt
+) -> torch.Tensor:                           # (n, r, d) float64 roots of the masked entries
+    r"""Float64 source square root X = S U^{-1} Sigma^{1/2} of the masked entries (G = X X^T).
+
+    Index before promotion: only the flagged source square roots are formed.
+    """
+    Sigma, inverse, S = projection[:3]
+    batch, r, d = G.shape[:-2], G.shape[-1], S.shape[-1]
+    with torch.autocast(device_type=G.device.type, enabled=False):
+        selected_S = S.expand(*batch, r, d)[mask].double()
+        if inverse.shape[-2:] == (d, d):
+            L = selected_S @ inverse.expand(*batch, d, d)[mask].double()
+        else:
+            G_blocks, d_block, _ = inverse.shape[-3:]
+            selected_inverse = inverse.unsqueeze(-4).expand(
+                *batch, G_blocks, d_block, d_block)[mask].double()
+            L = _projected_linear_map(selected_S.unsqueeze(-3), selected_inverse).squeeze(-3)
+        if Sigma.shape == (*batch, d):
+            variance = Sigma[mask].double()
+            if not bool(torch.isfinite(variance).all()) or bool((variance <= 0).any()):
+                raise ValueError("source covariance must be finite and positive for projected factorization")
+            root = L * variance.sqrt().unsqueeze(-2)
+        elif Sigma.shape == (*batch, d, d):
+            root = L @ _strict_cholesky(Sigma[mask].double())[0]
+        else:
+            raise ValueError("source covariance shape does not match projected token/head dimensions")
+        if not bool(torch.isfinite(root).all()):
+            raise ValueError("projected source square root must be finite")
+    return root
+
+
 def _strict_cholesky(
     G:          torch.Tensor,
     projection: Optional[Tuple[torch.Tensor, ...]] = None,
@@ -391,8 +484,16 @@ def _strict_cholesky(
     root). Its outright failures first retry shifted CholeskyQR3 in the working dtype, and its
     healthy entries keep their prepared factor on the recovery path.
 
+    Under :func:`projected_recovery_precision` ``"fp32"`` the rebuilt entries are factored instead by
+    shifted CholeskyQR3 of the rounded source root in the working dtype, whose factor C satisfies
+    C C^T = (X + dX)(X + dX)^T with ||dX|| <= c eps ||X|| for kappa_2(X) <~ 1/eps (Fukaya et al.
+    2020), and the factor tensor stays in the working dtype. The factor route's certificate-flagged
+    entries keep their CholeskyQR2 factor there, since a working-dtype redo cannot improve on it, and
+    without source tuples no rebuild is possible, so flagged entries keep their factor. A failed
+    working-dtype retry takes the float64 recovery for the whole call.
+
     Returns ``(chol, recover_mask)``. ``chol`` stays in ``G.dtype`` on the healthy
-    path. When source recovery is applied the whole factor tensor is promoted to
+    path. When float64 source recovery is applied the whole factor tensor is promoted to
     float64 so the rebuilt entries keep their QR accuracy, and ``recover_mask``
     marks exactly those entries so the pair path can escalate only the tiles that
     touch them. ``recover_mask`` is ``None`` on the healthy path.
@@ -412,38 +513,38 @@ def _strict_cholesky(
     if not symmetric:
         raise ValueError("projected covariance must be symmetric for zero-jitter Cholesky")
     if recover_any:
+        working_recovery = _RECOVERY_PRECISION == "fp32" and G.dtype != torch.float64
+        r = G.shape[-1]
         if projection is None:
             if failed_any:
                 raise ValueError("projected covariance is not positive definite: zero-jitter Cholesky failed; no repair applied")
+            if working_recovery:
+                return chol, None
             chol64, _ = _strict_cholesky(G.double())
             # Whole-tensor float64 refactor: every entry takes the factor route.
             recovered_all = torch.ones_like(failed)
             _count_source_recovery(recovered_all)
             return chol64, recovered_all
+        if working_recovery:
+            if factored and not failed_any:
+                return chol, None
+            rebuild = failed if factored else failed | ill_conditioned
+            root = _source_root(G, projection, rebuild)
+            with torch.autocast(device_type=G.device.type, enabled=False):
+                shifted, shifted_failed = cholesky_qr2(root.to(G.dtype), shift=True)
+            if not bool(shifted_failed.any()):
+                if factored:
+                    base = chol         # failed CholeskyQR2 entries already factor the identity
+                else:
+                    # Never backpropagate through a failed Cholesky, even with zero cotangent.
+                    safe = torch.where(rebuild[..., None, None],
+                                       torch.eye(r, device=G.device, dtype=G.dtype), G)
+                    base = _strict_cholesky(safe)[0]
+                _count_source_recovery(rebuild)
+                return base.index_put((rebuild,), shifted.to(base.dtype)), rebuild
         failed = failed | ill_conditioned
-        Sigma, inverse, S = projection[:3]
-        batch, r, d = G.shape[:-2], G.shape[-1], S.shape[-1]
-        # Index before promotion: rebuild only the flagged source square roots.
+        root = _source_root(G, projection, failed)
         with torch.autocast(device_type=G.device.type, enabled=False):
-            selected_S = S.expand(*batch, r, d)[failed].double()
-            if inverse.shape[-2:] == (d, d):
-                L = selected_S @ inverse.expand(*batch, d, d)[failed].double()
-            else:
-                G_blocks, d_block, _ = inverse.shape[-3:]
-                selected_inverse = inverse.unsqueeze(-4).expand(
-                    *batch, G_blocks, d_block, d_block)[failed].double()
-                L = _projected_linear_map(selected_S.unsqueeze(-3), selected_inverse).squeeze(-3)
-            if Sigma.shape == (*batch, d):
-                variance = Sigma[failed].double()
-                if not bool(torch.isfinite(variance).all()) or bool((variance <= 0).any()):
-                    raise ValueError("source covariance must be finite and positive for projected factorization")
-                root = L * variance.sqrt().unsqueeze(-2)
-            elif Sigma.shape == (*batch, d, d):
-                root = L @ _strict_cholesky(Sigma[failed].double())[0]
-            else:
-                raise ValueError("source covariance shape does not match projected token/head dimensions")
-            if not bool(torch.isfinite(root).all()):
-                raise ValueError("projected source square root must be finite")
             if factored:
                 # Outright CholeskyQR2 failures retry shifted CholeskyQR3 in the working dtype
                 # (valid to kappa(X) ~ 1/eps); certificate-flagged entries, whose float32 error is
@@ -490,8 +591,9 @@ def projected_gaussian_kl(
 
     Cholesky factors and inverses have only one token axis. Bounded pair tiles
     preserve direct differences without a full vector pair grid. Checkpointed
-    tiles also bound saved backward intermediates. Poorly conditioned factors
-    use float64 triangular solves instead of cancelling covariance/precision products. No floor, cap,
+    tiles also bound saved backward intermediates. Recovered factors use triangular solves
+    instead of cancelling covariance/precision products, in float64 under
+    :func:`projected_recovery_precision` ``"fp64"`` and in the working dtype under ``"fp32"``. No floor, cap,
     symmetrization, jitter, or repair is applied. Optional (Sigma,U^-1,S[,mu])
     source tuples allow inaccurate rounded covariances and projected means to
     be recomputed from their original sources; covariance-only non-SPD inputs fail explicitly.
@@ -502,7 +604,7 @@ def projected_gaussian_kl(
     log-determinants read those factors, and the query trace product still reads the explicit G_q,
     whose pair-stage cancellation sum |P_ab G_ab| / tr(P G) measured at most 18 on the saved runs.
 
-    The float64 factor route is selected PER PAIR (audit 2026-09-23 low): a pair (b, h, i, j) takes
+    The factor route is selected PER PAIR (audit 2026-09-23 low): a pair (b, h, i, j) takes
     it only when its own query entry (b, i, h) or key entry (b, j, h) was recovered. Every other
     pair is the working-dtype value from the healthy tile geometry, bit-identical to the call in
     which no entry anywhere in the batch needed recovery, so an ill-conditioned token in another
@@ -533,25 +635,28 @@ def projected_gaussian_kl(
             raise ValueError("projected means must contain only finite values")
         chol_q, rec_q = _strict_cholesky(Gq, projection_q, (*q_status[:3], decisions[1:5]), factored)
         chol_k, rec_k = _strict_cholesky(Gk, projection_k, (*k_status[:3], decisions[5:9]), factored)
-        # Only tiles that touch a recovered query or key entry need the float64
-        # triangular solves. Healthy-healthy tiles keep the cheap einsum path in the
-        # working dtype; the healthy factors round-trip bit-exactly through the cast.
+        # Only tiles that touch a recovered query or key entry need the factor-route
+        # triangular solves (float64 under "fp64" recovery). Healthy-healthy tiles keep the cheap
+        # einsum path in the working dtype; the healthy factors round-trip bit-exactly through the cast.
         factor_trace_any = rec_q is not None or rec_k is not None
-        # Healthy tiles read the working-dtype means; only factor-route tiles use float64 means.
+        # "fp32" recovery keeps both factors in the working dtype, so its factor tiles do too.
+        factor_fp64 = chol_q.dtype == torch.float64 or chol_k.dtype == torch.float64
+        # Healthy tiles read the working-dtype means; only float64 factor-route tiles use float64 means.
         aq_healthy, ak_healthy = aq.movedim(-2, -3), ak.movedim(-2, -3)  # (..., H, N, r)
         if factor_trace_any:
-            # Preserve source accuracy through means, triangular solves and the final scalar.
-            for role, projection in enumerate((projection_q, projection_k)):
-                if projection is not None and len(projection) == 4:
-                    _, inverse, S, mu = projection
-                    mean = (_projected_linear_map(S.double(), inverse.double())
-                            @ mu.double().unsqueeze(-1)).squeeze(-1)
-                    if role == 0:
-                        aq = mean
-                    else:
-                        ak = mean
-            aq, ak = aq.double(), ak.double()
-            q_factor, k_factor = chol_q, chol_k                 # float64 where recovered
+            if factor_fp64:
+                # Preserve source accuracy through means, triangular solves and the final scalar.
+                for role, projection in enumerate((projection_q, projection_k)):
+                    if projection is not None and len(projection) == 4:
+                        _, inverse, S, mu = projection
+                        mean = (_projected_linear_map(S.double(), inverse.double())
+                                @ mu.double().unsqueeze(-1)).squeeze(-1)
+                        if role == 0:
+                            aq = mean
+                        else:
+                            ak = mean
+                aq, ak = aq.double(), ak.double()
+            q_factor, k_factor = chol_q, chol_k                 # float64 where recovered under "fp64"
             q_cov_healthy = Gq                                  # working dtype
             k_prec_healthy = torch.cholesky_inverse(chol_k.to(dtype))
             # Fold token-level recover flags into one host transfer, recovery path only.
@@ -571,7 +676,7 @@ def projected_gaussian_kl(
         q_cov_healthy = q_cov_healthy.movedim(-3, -4)   # (..., H, Nq, r, r)
         k_prec_healthy = k_prec_healthy.movedim(-3, -4)  # (..., H, Nk, r, r)
         if factor_trace_any:
-            q_factor = q_factor.movedim(-3, -4)           # (..., H, Nq, r, r) float64
+            q_factor = q_factor.movedim(-3, -4)           # (..., H, Nq, r, r)
             k_factor = k_factor.movedim(-3, -4)
         logdet_q = 2 * chol_q.diagonal(dim1=-2, dim2=-1).log().sum(-1).transpose(-1, -2)
         logdet_k = 2 * chol_k.diagonal(dim1=-2, dim2=-1).log().sum(-1).transpose(-1, -2)
@@ -686,7 +791,9 @@ def projected_noisy_query_cost(
 
     Factorization and recovery follow projected_gaussian_kl: zero jitter, no covariance repair,
     float64 source recovery for flagged entries, bounded checkpointed pair tiles, and the float64
-    route selected per pair, so healthy pairs are bit-identical to a call without recovery.
+    route selected per pair, so healthy pairs are bit-identical to a call without recovery. Under
+    ``projected_cov_recovery_precision="fp32"`` the recovered factors come from float32 shifted
+    CholeskyQR3, and these pair tiles still run in float64.
     Recovered entries enter the working-dtype grid as identity placeholders, so no factorization
     of a numerically non-SPD sum runs even for a pair whose value the factor route replaces.
     """

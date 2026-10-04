@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.relational_scoring import _compute_dtype
@@ -94,6 +95,9 @@ class RelationalOperators(nn.Module):
     Every consumer reads the content maps through :meth:`content_factors`.
     ``routing`` selects the projected routing cost: Gaussian KL, or the noisy-query cost
     N(a_i; b_j, V_Q + V_K) of the expected likelihood kernel (predictive_content only).
+    ``predictive_covariance_checkpoint`` recomputes the moment-matched covariance update in backward
+    instead of saving its (..., N, K, K) intermediates: the same values and gradients bit for bit,
+    for about half the activation memory of a large-K step.
     """
 
     def __init__(
@@ -112,6 +116,7 @@ class RelationalOperators(nn.Module):
         receiver_update:       str   = "euler",
         receiver_damping:      float = 1.0,
         content_link_chart:    str   = "affine",
+        predictive_covariance_checkpoint: bool = False,
     ) -> None:
         super().__init__()
         if not irrep_dims or any(type(d) is not int or d < 1 for d in irrep_dims) or len(set(irrep_dims)) != 1:
@@ -160,6 +165,10 @@ class RelationalOperators(nn.Module):
                 f"predictive_covariance_floor must be finite and positive, got {predictive_covariance_floor!r}")
         self.predictive_covariance = predictive_covariance
         self.predictive_covariance_floor = float(predictive_covariance_floor)
+        if not isinstance(predictive_covariance_checkpoint, bool):
+            raise ValueError("predictive_covariance_checkpoint must be bool, got "
+                             f"{predictive_covariance_checkpoint!r}")
+        self.predictive_covariance_checkpoint = predictive_covariance_checkpoint
         if content_link_chart not in CONTENT_LINK_CHARTS:
             raise ValueError(
                 f"content_link_chart must be one of {CONTENT_LINK_CHARTS}, got {content_link_chart!r}")
@@ -260,7 +269,111 @@ class RelationalOperators(nn.Module):
         The result is Sigma_i^+ = U_i C_i^att U_i^T in the frame the mean content uses. A diagonal
         input returns diag(Sigma_i^+), the KL(p || q) moment projection onto the diagonal family.
         Head-space pooling keeps the cost at an attention with d x d values per head pair.
+        Under ``predictive_covariance_checkpoint`` the update is recomputed in backward (non-reentrant
+        checkpoint; the update draws no random numbers), so values and gradients are unchanged.
         """
+        if self.predictive_covariance_checkpoint and torch.is_grad_enabled():
+            return checkpoint(self._predictive_covariance_update, mu, sigma, beta, frame, receive,
+                              use_reentrant=False, preserve_rng_state=False)
+        return self._predictive_covariance_update(mu, sigma, beta, frame, receive)
+
+    def _predictive_covariance_update(
+        self,
+        mu:    torch.Tensor,  # (..., N, K)
+        sigma: torch.Tensor,  # (..., N, K) or (..., N, K, K)
+        beta:  torch.Tensor,  # (..., H, N, N)
+        frame: CanonicalFrameContext,
+        receive: Optional[torch.Tensor] = None,   # (H, K, d)
+    ) -> torch.Tensor:
+        r"""Body of :meth:`predictive_covariance_update`: blockwise for diagonal beliefs on block frames."""
+        if frame.block_diagonal and sigma.dim() == mu.dim():
+            return self._predictive_covariance_update_blockwise(mu, sigma, beta, frame, receive)
+        return self._predictive_covariance_update_dense(mu, sigma, beta, frame, receive)
+
+    def _predictive_covariance_update_blockwise(
+        self,
+        mu:    torch.Tensor,  # (..., N, K) source means
+        sigma: torch.Tensor,  # (..., N, K) diagonal local covariance
+        beta:  torch.Tensor,  # (..., H, N, N) routing weights, rows sum to one
+        frame: CanonicalFrameContext,             # block_diagonal: (..., N, H, d, d) blocks U_{i,m}
+        receive: Optional[torch.Tensor] = None,   # (H, K, d) precomputed O'_h; None evaluates the chart
+    ) -> torch.Tensor:        # (..., N, K) diag(Sigma_i^+)
+        r"""Diagonal of the moment-matched covariance for diagonal beliefs on block-diagonal frames.
+
+        With :math:`U_i=\bigoplus_m U_{i,m}` and :math:`\Sigma_i=\mathrm{diag}(\sigma_i)` the reference
+        covariance is block diagonal, :math:`C_i=\bigoplus_m C_{i,m}` with
+        :math:`C_{i,m}=U_{i,m}^{-1}\mathrm{diag}(\sigma_{i,m})U_{i,m}^{-\top}`. Writing
+        :math:`T_h^{(m)}` and :math:`O_h^{(l)}` for the :math:`d\times d` column and row blocks of
+        :math:`T_h` and :math:`O'_h`,
+
+        .. math::
+            T_h C_i T_g^\top = \sum_m T_h^{(m)} C_{i,m} T_g^{(m)\top},
+
+        and because :math:`U_i` is block diagonal,
+        :math:`\mathrm{diag}(\Sigma_i^+)=\mathrm{diag}(U_i C_i^{\mathrm{att}} U_i^\top)` reads only the
+        diagonal blocks
+
+        .. math::
+            [C_i^{\mathrm{att}}]_{ll} = \sum_{h,g} O_h^{(l)} P_{i,hg} O_g^{(l)\top}
+              + r\bigl[C_{i,l} + X_{i,l} + X_{i,l}^\top\bigr] + \tilde q_i I_d,
+            \qquad X_{i,l} = \sum_h \beta_{ii}^h O_h^{(l)} T_h^{(l)} C_{i,l},
+
+        with :math:`P_{i,hg}` the head-pair pooled covariance of
+        :meth:`_predictive_covariance_update_dense` and :math:`\tilde q_i = f\,\mathrm{tr}(C_i)/K`. It is the
+        dense update reassociated, equal up to rounding, at about :math:`2K^3 + NK^2` multiply-adds per
+        token instead of about :math:`9.5K^3 + NK^2`, with no :math:`K \times K` intermediate.
+        """
+        H, d = len(self.irrep_dims), self.irrep_dims[0]
+        dtype = _compute_dtype(mu, sigma, self.T, self.O, frame.forward)
+        with torch.autocast(device_type=mu.device.type, enabled=False):
+            forward, inverse = frame.forward.to(dtype), frame.inverse.to(dtype)        # (..., N, H, d, d)
+            sigma_h = sigma.to(dtype).reshape(*sigma.shape[:-1], H, d)                 # (..., N, H, d)
+            C = (inverse * sigma_h.unsqueeze(-2)) @ inverse.transpose(-1, -2)          # (..., N, H, d, d) C_{i,m}
+            C = 0.5 * (C + C.transpose(-1, -2))
+            mu_h = mu.to(dtype).reshape(*mu.shape[:-1], H, d)
+            xi = (inverse @ mu_h.unsqueeze(-1)).squeeze(-1).flatten(-2)                # (..., N, K)
+            T_hat, O_hat = self._ambient_content_maps(dtype, receive)                  # (H,d,K), (H,K,d)
+            T_blocks = T_hat.reshape(H, d, H, d)                                       # [h, s, m, k] = T_h^{(m)}[s, k]
+            O_blocks = O_hat.reshape(H, H, d, d)                                       # [h, l, k, s] = O_h^{(l)}[k, s]
+            b = beta.to(dtype)                                                         # (..., H, N, N)
+            eye_h = torch.eye(H, dtype=dtype, device=mu.device)
+
+            # Common shift by token 0, exactly as on the dense route.
+            xi = xi - xi[..., :1, :]                                                   # (..., N, K)
+            values = torch.einsum("hsk,...nk->...nhs", T_hat, xi)                      # (..., N, H, d)
+            TC = torch.einsum("hsmk,...nmkt->...nhmst", T_blocks, C)                  # (..., N, H, H, d, d) T_h^{(m)} C_{i,m}
+            source = torch.einsum("...nhmsk,gtmk->...nhgst", TC, T_blocks)            # (..., N, H, H, d, d) T_h C_i T_g^T
+            c = torch.einsum("...hij,...gij->...hgij", b, b)
+            c = c * (1.0 - eye_h)[..., None, None] + torch.einsum("...hij,hg->...hgij", b, eye_h)
+            pooled = torch.einsum("...hgij,...jhgst->...ihgst", c, source)            # (..., N, H, H, d, d)
+            second = torch.einsum("...hij,...jhst->...ihst",
+                                  b, values.unsqueeze(-1) * values.unsqueeze(-2))      # (..., N, H, d, d)
+            mean = torch.einsum("...hij,...jhs->...ihs", b, values)                    # (..., N, H, d)
+            spread = second - mean.unsqueeze(-1) * mean.unsqueeze(-2)
+            pooled = pooled + torch.einsum("...ihst,hg->...ihgst", spread, eye_h)
+            lifted = torch.einsum("hks,...nhgst->...ngkt", O_hat, pooled)             # (..., N, H, K, d) sum_h O'_h P_hg
+            lifted = lifted.reshape(*lifted.shape[:-2], H, d, d)                       # (..., N, g, l, k, t)
+            C_att = torch.einsum("...nglkt,glmt->...nlkm", lifted, O_blocks)          # (..., N, H, d, d) blocks [ll]
+            if self.attention_residual:
+                self_weight = b.diagonal(dim1=-2, dim2=-1).transpose(-1, -2)          # (..., N, H) beta_ii^h
+                cross = torch.einsum("hlks,...nhlsm->...nlkm", O_blocks,
+                                     TC * self_weight[..., None, None, None])          # (..., N, H, d, d) X_{i,l}
+                C_att = C_att + C + cross + cross.transpose(-1, -2)
+            scale = torch.diagonal(C, dim1=-2, dim2=-1).flatten(-2).mean(dim=-1)      # (..., N) tr(C_i)/K
+            C_att = C_att + (self.predictive_covariance_floor * scale)[..., None, None, None] * torch.eye(
+                d, dtype=dtype, device=mu.device)
+            result = ((forward @ C_att) * forward).sum(dim=-1)                         # (..., N, H, d) diag(U C U^T)
+        return result.flatten(-2).to(sigma.dtype)
+
+    def _predictive_covariance_update_dense(
+        self,
+        mu:    torch.Tensor,  # (..., N, K)
+        sigma: torch.Tensor,  # (..., N, K) or (..., N, K, K)
+        beta:  torch.Tensor,  # (..., H, N, N)
+        frame: CanonicalFrameContext,
+        receive: Optional[torch.Tensor] = None,   # (H, K, d)
+    ) -> torch.Tensor:
+        r"""Dense K x K evaluation of :meth:`predictive_covariance_update` (full family or dense frames)."""
         H, d = len(self.irrep_dims), self.irrep_dims[0]
         K = H * d
         diagonal = sigma.dim() == mu.dim()
