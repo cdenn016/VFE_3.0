@@ -38,6 +38,18 @@ def set_fp32_matmul_precision(policy: Optional[str]) -> None:
     torch.set_float32_matmul_precision(policy)
 
 
+def set_fill_uninitialized_memory(enabled: bool) -> None:
+    r"""Set ``torch.utils.deterministic.fill_uninitialized_memory`` (read only under deterministic algorithms).
+
+    True (the torch default) fills every uninitialized allocation with NaN, or the integer maximum, while
+    ``torch.use_deterministic_algorithms(True)`` is on, so a read of uninitialized memory is visible and
+    reproducible. False skips those fill kernels; results are unchanged unless such a read exists.
+    """
+    if not isinstance(enabled, bool):
+        raise ValueError(f"fill_uninitialized_memory must be bool, got {enabled!r}")
+    torch.utils.deterministic.fill_uninitialized_memory = enabled
+
+
 def seed_everything(
     seed: int,
 
@@ -100,5 +112,6 @@ def deterministic_state() -> Dict[str, object]:
         "cudnn_deterministic":     bool(torch.backends.cudnn.deterministic),
         "cudnn_benchmark":         bool(torch.backends.cudnn.benchmark),
         "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+        "fill_uninitialized_memory": bool(torch.utils.deterministic.fill_uninitialized_memory),
         **_fp32_matmul_precision(),
     }

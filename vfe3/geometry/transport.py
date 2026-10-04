@@ -541,11 +541,17 @@ def _build_flat(
 DEFAULT_TRANSPORT_CHART_MAX_NORM: float = VFE3Config.transport_chart_max_norm
 
 
-# Measured-condition escalation of the stored frame pair (audit 2026-09-23 #12; unconditional since
-# 2026-10-02). The pair (U, U^-1) is stored in float32; a producer call whose stored pair cannot stay
-# mutually inverse at float32 is redone in float64 as a whole. The tolerance is the projected
-# scorer's certificate threshold. The counter is a host int incremented from the already-read
-# decision, so it adds no device work and no synchronization.
+# Measured-condition escalation of the stored frame pair (audit 2026-09-23 #12). The pair (U, U^-1)
+# is stored in float32. With the escalation enabled (VFE3Config.frame_pair_fp64_escalation, installed
+# by VFEModel), a producer call whose stored pair cannot stay mutually inverse at float32 is redone in
+# float64 as a whole, and every relational consumer of that frame then runs in float64. It was
+# unconditional from 2026-10-02 to 2026-10-04 and is opt-in again: one escalated call costs about
+# 7x a float32 step on the RTX 5090 (FP64 at 1/64 rate). Disabled, no certificate is formed and the
+# stored pair keeps the inverse residual <= eps_32 kappa_F(U); CanonicalFrameContext still fails
+# closed far above that. The tolerance (VFE3Config.frame_pair_condition_tol) is read at call time.
+# The counter is a host int incremented from the already-read decision, so it adds no device work
+# and no synchronization.
+_FRAME_PAIR_FP64_ESCALATION: bool = False
 _FRAME_PAIR_CONDITION_TOL: float = 1e-4
 _FRAME_PAIR_FP64_ESCALATIONS: int = 0
 
@@ -560,6 +566,32 @@ def _resolve_chart_max_norm(
         raise ValueError(
             f"transport chart radius validity_max_norm must be finite and positive, got {radius!r}")
     return float(radius)
+
+
+def set_frame_pair_fp64_escalation(enabled: bool) -> bool:
+    r"""Enable or disable the condition-keyed float64 frame-pair escalation; returns the previous value."""
+    if not isinstance(enabled, bool):
+        raise ValueError(f"frame-pair float64 escalation must be bool, got {enabled!r}")
+    global _FRAME_PAIR_FP64_ESCALATION
+    previous = _FRAME_PAIR_FP64_ESCALATION
+    _FRAME_PAIR_FP64_ESCALATION = enabled
+    return previous
+
+
+def frame_pair_fp64_escalation() -> bool:
+    r"""Return whether producers certify the float32 frame pair and escalate it to float64."""
+    return _FRAME_PAIR_FP64_ESCALATION
+
+
+def set_frame_pair_condition_tol(tol: float) -> float:
+    r"""Set the escalation tolerance :math:`\tau` of :func:`_frame_pair_kappa`; returns the previous value."""
+    if (isinstance(tol, bool) or not isinstance(tol, (int, float))
+            or not math.isfinite(tol) or not 0.0 < tol < 1.0):
+        raise ValueError(f"frame-pair condition tolerance must lie in (0, 1), got {tol!r}")
+    global _FRAME_PAIR_CONDITION_TOL
+    previous = _FRAME_PAIR_CONDITION_TOL
+    _FRAME_PAIR_CONDITION_TOL = float(tol)
+    return previous
 
 
 def frame_pair_fp64_escalations() -> int:
@@ -643,11 +675,12 @@ def stable_matrix_exp_pair(
     takes the full-matrix path.
 
     Precision: the exponential is evaluated at the storage precision (float32, or float64 for a
-    float64 input). A float32 pair failing :func:`_frame_pair_kappa`'s certificate,
-    :math:`\max_b \kappa_F(U_b)\,\varepsilon_{32} > 10^{-4}`, is returned in float64 for the whole
+    float64 input). Under :func:`frame_pair_fp64_escalation`, a float32 pair failing
+    :func:`_frame_pair_kappa`'s certificate, :math:`\max_b \kappa_F(U_b)\,\varepsilon_{32} > \tau`
+    (``frame_pair_condition_tol``, default :math:`10^{-4}`), is returned in float64 for the whole
     call, recomputed from the same ``M`` and inverted from the float64 ``exp(M)`` (audit 2026-09-23
-    #12; unconditional since 2026-10-02). The verdict rides the inverse's existing host read;
-    ``only_forward`` builds no inverse and is never certified.
+    #12). The verdict rides the inverse's existing host read; ``only_forward`` builds no inverse and
+    is never certified. With the escalation disabled no certificate is formed.
     """
     validity_max_norm = _resolve_chart_max_norm(validity_max_norm)
     # Both chart decisions are reduced on the device and read in ONE host transfer.
@@ -694,10 +727,11 @@ def stable_matrix_exp_pair(
             escalate = True
         elif blocked:
             exp_neg, escalate = _blockwise_group_inverse_certified(
-                exp_pos, block_dims, certify=True, right_pair=_right_pair)
+                exp_pos, block_dims, certify=_FRAME_PAIR_FP64_ESCALATION, right_pair=_right_pair)
         else:
             exp_neg, escalate = _checked_group_inverse_certified(
-                exp_pos, kappa=_frame_pair_kappa(_right_pair))
+                exp_pos, kappa=(_frame_pair_kappa(_right_pair)
+                                if _FRAME_PAIR_FP64_ESCALATION else None))
         if escalate:
             exp_pos = _exp(matrix.to(torch.float64).contiguous())
             exp_neg = (_blockwise_group_inverse(exp_pos, block_dims) if blocked
@@ -1013,8 +1047,9 @@ def _stable_compact_glk_exp_pair(
     occurrence; only exp/inverse work is shared, then gathered before composition. The
     table gradient is equivalent in real arithmetic, with a different reduction order.
 
-    Float32 storage is certified by :func:`_frame_pair_kappa` inside the inverse's single host
-    read (audit 2026-09-23 #12). A call that fails it returns the whole pair in float64:
+    Under :func:`frame_pair_fp64_escalation`, float32 storage is certified by
+    :func:`_frame_pair_kappa` inside the inverse's single host read (audit 2026-09-23 #12); with the
+    escalation disabled no certificate is formed. A call that fails it returns the whole pair in float64:
     ``U = exp(M)`` recomputed in float64 from the same blocks and ``U^-1`` inverted from
     that float64 ``U`` itself, never the float64 inverse of the rounded float32 ``U`` (which is
     no more consistent with a float64 ``U`` than the float32 pair was). ``_right_pair`` certifies
@@ -1068,7 +1103,8 @@ def _stable_compact_glk_exp_pair(
                 def gather(t: torch.Tensor) -> torch.Tensor:
                     return t.index_select(0, index).reshape(shape)
             exp_neg, escalate = _checked_group_inverse_certified(
-                exp_pos, kappa=_frame_pair_kappa(_right_pair, gather))
+                exp_pos, kappa=(_frame_pair_kappa(_right_pair, gather)
+                                if _FRAME_PAIR_FP64_ESCALATION else None))
         if escalate:
             exp_pos = torch.linalg.matrix_exp(blocks.to(torch.float64).contiguous())
             exp_neg = _checked_group_inverse(exp_pos)
