@@ -102,9 +102,20 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
     """Describe full-width projected routing and its configured receiver update."""
     if not is_vfe_config(cfg):                        # another model family has no relational route
         return {}
-    H, d, K = cfg.n_heads, cfg.d_head, cfg.embed_dim
+    H, K = cfg.n_heads, cfg.embed_dim
+    dims = cfg.head_dims
     full_link = cfg.attention_mode == "projected_gradient"
-    layer_counts = {"score": 2*H*K*d, "content": 2*H*K*d}
+    # Every head reads and writes the full state: sum_h d_h K = K^2 per map whatever the partition.
+    layer_counts = {"score": 2*K*K, "content": 2*K*K}
+    if len(set(dims)) == 1:                       # equal heads: (H, d, K) stacks
+        d = dims[0]
+        rank: object = d
+        score_shape: object = [H, d, K]
+        content_shapes: object = [[H, d, K], [H, K, d]]
+    else:                                         # mixed so_n tower: one (d_h, K) map per head
+        rank = list(dims)
+        score_shape = [[d, K] for d in dims]
+        content_shapes = [[[d, K] for d in dims], [[K, d] for d in dims]]
     counts = {role: count * cfg.n_layers for role, count in layer_counts.items()}
     return {"relational_operators": {
         "attention_mode": cfg.attention_mode,
@@ -127,13 +138,13 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "head_output_dimension": K,
         "score_parameterization": "free_full_row_rank",
         "score_initialization": "independent_orthonormal_rows",
-        "score_role_parameter_counts": {"q": cfg.n_layers*H*K*d, "k": cfg.n_layers*H*K*d},
-        "score_rank_per_head": d, "content_rank_per_head": d,
+        "score_role_parameter_counts": {"q": cfg.n_layers*K*K, "k": cfg.n_layers*K*K},
+        "score_rank_per_head": rank, "content_rank_per_head": rank,
         "identity_content": False,
         "content_mode": "full_width",
         "content_link_chart": cfg.content_link_chart,
-        "score_shape": [H, d, K],
-        "content_shapes": [[H, d, K], [H, K, d]],
+        "score_shape": score_shape,
+        "content_shapes": content_shapes,
         "parameter_counts": counts, "total_parameters": sum(counts.values()),
         "learning_rates": {
             role: (cfg.m_p_mu_lr if getattr(cfg, f"m_relational_{role}_lr") is None
@@ -3324,7 +3335,8 @@ def _cost_model_fields(
     V, K = int(cfg.vocab_size), int(cfg.embed_dim)
     n_gen = int(model.group.generator_shape[0])
     n_blocks = max(1, len(model.group.irrep_dims))
-    d_head = K / n_blocks                                        # representative block dim
+    # Mean squared block dim: d_head^2 = (K / B)^2 for equal blocks, sum_b d_b^2 / B for a mixed irrep tower.
+    block_dim_sq = sum(int(d) * int(d) for d in model.group.irrep_dims) / n_blocks
     # ACTIVE params per token: the executable encoder looks up one routed mean/variance row plus its
     # phi row. The decoder then reads EITHER its routed prior-bank rows (2VK) OR the linear output
     # matrix (VK) and optional bias. Base token priors and every decode vocabulary prior are
@@ -3373,10 +3385,10 @@ def _cost_model_fields(
     active += sum(norm_parameters.values())
     # Transparent analytic FLOP proxy. Per token: decode over all V (2VK) and L*T belief E-step
     # iterations. Each E-step iteration has O(N) attention energy (2NK) plus O(N) transport
-    # application (2N*d_head^2). Constants are O(1); this is a proxy, not a calibrated count.
+    # application (2N times the mean squared block dim, d_head^2 for equal blocks). Constants are O(1); this is a proxy, not a calibrated count.
     L, T, N = int(cfg.n_layers), int(cfg.n_e_steps), int(cfg.max_seq_len)
     fpt_decode         = 2.0 * V * K
-    estep_kernel       = 2.0 * N * K + 2.0 * N * d_head * d_head
+    estep_kernel       = 2.0 * N * K + 2.0 * N * block_dim_sq
     belief_estep       = L * T * estep_kernel
     fpt_estep          = belief_estep
     fpt_block_mlp = block_mlp_build.flops_per_token if block_mlp_active else 0.0

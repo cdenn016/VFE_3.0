@@ -132,9 +132,11 @@ def parameter_role(
     if leaf == "pos_phi_free":
         return "positional_frames", "pos_phi"
     if name.startswith("relational_operators"):
-        if leaf in ("raw_score_q", "raw_score_k"):
+        # Mixed head sizes store per-run lists: the attribute is the segment before the run index.
+        attribute = name.rsplit(".", 2)[-2] if leaf.isdigit() else leaf
+        if attribute in ("raw_score_q", "raw_score_k"):
             return "context_processing", "relational_score"
-        if leaf in ("T", "O"):
+        if attribute in ("T", "O"):
             return "context_processing", "relational_content"
         return "other", leaf
     if name.startswith("block_mlps."):

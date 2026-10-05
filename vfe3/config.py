@@ -978,7 +978,8 @@ class VFE3Config:
             raise ValueError(
                 f"eval_stride must be None (disjoint windows) or an int in [1, max_seq_len="
                 f"{self.max_seq_len}], got {self.eval_stride!r}")
-        if self.embed_dim % self.n_heads != 0:
+        # so_n heads are its irrep blocks, which may differ in size; the seam below checks them.
+        if self.gauge_group != "so_n" and self.embed_dim % self.n_heads != 0:
             raise ValueError(
                 f"embed_dim={self.embed_dim} must be divisible by n_heads={self.n_heads}"
             )
@@ -1023,13 +1024,13 @@ class VFE3Config:
                     f"embed_dim={self.embed_dim} (group_n={self.group_n})"
                 )
             # The projected routes read the frame through the operators' head partition: each head
-            # is one gauge block, so the irrep blocks must be n_heads equal blocks of size d_head
-            # (relational_score slices the dense inverse frame into those head blocks).
-            if _block_dims != [self.embed_dim // self.n_heads] * self.n_heads:
+            # is one gauge block (relational_score slices the dense inverse frame into those head
+            # blocks), so n_heads is the number of irrep blocks. Blocks may differ in size.
+            if len(_block_dims) != self.n_heads:
                 raise ValueError(
-                    f"gauge_group='so_n' on the projected routes needs n_heads={self.n_heads} equal "
-                    f"irrep blocks of size d_head={self.embed_dim // self.n_heads} (one gauge block "
-                    f"per head); irrep_spec gives blocks {_block_dims}"
+                    f"gauge_group='so_n' needs n_heads equal to the number of irrep blocks (one gauge "
+                    f"block per head): irrep_spec gives {len(_block_dims)} blocks {_block_dims}, "
+                    f"n_heads={self.n_heads}"
                 )
             # One shared phi drives EVERY block, so the generators do not partition per block:
             # the per-block phi preconditioners are undefined.
@@ -1040,17 +1041,6 @@ class VFE3Config:
                     f"irrep block, so a per-block metric is undefined. Use 'none', 'clip', or "
                     f"the ambient 'killing'."
                 )
-            # ALiBi-family priors are built with H = n_heads while the energy head axis is the number
-            # of irrep blocks; require they agree so the (H,N,N) prior aligns with the energy.
-            for _pname in ("beta_attention_prior",):
-                if (getattr(self, _pname) in ("alibi", "causal_alibi", "causal_alibi_noself")
-                        and self.n_heads != len(_block_dims)):
-                    raise ValueError(
-                        f"{_pname}={getattr(self, _pname)!r} builds an (n_heads, N, N) prior but "
-                        f"gauge_group={self.gauge_group!r} has {len(_block_dims)} irrep blocks; "
-                        f"set n_heads={len(_block_dims)} or use a headless prior "
-                        f"(uniform/causal/...)."
-                    )
         elif self.group_n is not None or self.irrep_spec is not None:
             raise ValueError(
                 f"group_n/irrep_spec are consumed only by gauge_group 'so_n'; got "
@@ -1888,6 +1878,11 @@ class VFE3Config:
         energy dimension.
         When kappa is a per-head list, returns the mean tau (for logging only).
         """
+        dims = self.head_dims
+        if len(set(dims)) > 1:                       # mixed so_n tower: mean of kappa_h sqrt(d_h)
+            kappas = (list(self.kappa_beta) if isinstance(self.kappa_beta, (list, tuple))
+                      else [self.kappa_beta] * len(dims))
+            return sum(k * d ** 0.5 for k, d in zip(kappas, dims)) / len(dims)
         k = float(sum(self.kappa_beta) / len(self.kappa_beta)) if isinstance(self.kappa_beta, (list, tuple)) else self.kappa_beta
         dimension = self.d_head
         return k * (dimension ** 0.5)
@@ -1915,8 +1910,28 @@ class VFE3Config:
         return "right"
 
     @property
+    def head_dims(self) -> List[int]:
+        """Per-head belief dimensions: the irrep block sizes for so_n, ``[K // n_heads] * n_heads`` otherwise."""
+        if self.gauge_group == "so_n":
+            from vfe3.geometry.irreps import irrep_dim
+            return [irrep_dim(self.group_n, algebra="so", label=label)
+                    for label, mult in self.irrep_spec for _ in range(mult)]
+        return [self.embed_dim // self.n_heads] * self.n_heads
+
+    @property
+    def head_offsets(self) -> List[int]:
+        """First coordinate of each head, ``[0, d_0, d_0 + d_1, ...]`` (length n_heads)."""
+        offsets = [0]
+        for d in self.head_dims[:-1]:
+            offsets.append(offsets[-1] + d)
+        return offsets
+
+    @property
     def d_head(self) -> int:
-        """Per-head belief dimension K // n_heads."""
+        """Per-head belief dimension K // n_heads; raises for a mixed so_n tower (read ``head_dims``)."""
+        if self.gauge_group == "so_n" and len(set(self.head_dims)) > 1:
+            raise ValueError(f"d_head is undefined for heads of different sizes {self.head_dims}; "
+                             f"read head_dims")
         return self.embed_dim // self.n_heads
 
     def _chart_ordering_problem(self) -> Optional[str]:

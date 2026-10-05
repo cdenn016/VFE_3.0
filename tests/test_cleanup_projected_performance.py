@@ -121,7 +121,7 @@ def test_full_output_contraction_matches_expanded_reference(compact: bool, input
     frame = CanonicalFrameContext(frames.expand(shape), frames.expand(shape), compact)
     actual = operators.predictive_content(mu, beta, frame)
     canonical = operators.canonical_mean(mu, frame)
-    coordinates = canonical.flatten(-2).unsqueeze(-2) if input_scope == "full" else canonical
+    coordinates = canonical.unsqueeze(-2)                                     # (..., N, 1, K)
     values = (operators.T @ coordinates.unsqueeze(-1)).squeeze(-1)
     pooled = torch.einsum("...hij,...jhs->...ihs", beta, values)
     expected = (operators.O @ pooled.unsqueeze(-1)).squeeze(-1).sum(-2)

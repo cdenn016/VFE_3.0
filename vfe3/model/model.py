@@ -1663,41 +1663,47 @@ class VFEModel(nn.Module):
             d["relational_receiver_noise"] = float(self.cfg.relational_receiver_noise)
             d["relational_attention_capture"] = "episode_initial"
         ops = self.relational_operators_by_layer[layer_index]
-        raw_maps = (ops.raw_score_q, ops.raw_score_k)
+        comparison_runs = ops.comparison_runs()                            # per run (S_Q, S_K)
         minima = []
-        for role, raw in zip(("q", "k"), raw_maps):
-            minimum = 1.0 if raw is None else float(torch.linalg.svdvals(raw.float()).min())
+        for role_index, role in enumerate(("q", "k")):
+            minimum = min(float(torch.linalg.svdvals(pair[role_index].float()).min()) for pair in comparison_runs)
             d[f"relational_score_{role}_raw_min_singular_value"] = minimum
             minima.append(minimum)
         d["relational_score_raw_min_singular_value"] = min(minima)
-        d["relational_score_rank_per_head"] = float(self.cfg.d_head)
-        d["relational_content_rank_per_head"] = float(self.cfg.d_head)
+        # Mean head rank: d_head for equal heads, K / H for a mixed irrep tower.
+        mean_rank = float(ops.input_dim) / len(ops.irrep_dims)
+        d["relational_score_rank_per_head"] = mean_rank
+        d["relational_content_rank_per_head"] = mean_rank
         d["relational_parameter_count"] = float(sum(
             p.numel() for layer in self.relational_operators_by_layer for p in layer.parameters()))
-        T, O = ops.content_factors()
+        T_runs, O_runs = ops.content_factor_runs()
         # sigma_max(M_h) is basis-dependent (changes under (T, O) -> (T a, a^{-1} O)); rho = inf of sigma_max over similarity.
-        singular = torch.linalg.svdvals(O.float() @ T.float())
-        d["relational_content_max_singular_value"] = float(singular.max())
+        M_runs = [O.float() @ T.float() for T, O in zip(T_runs, O_runs)]   # per run (n_r, K, K) M_h
+        d["relational_content_max_singular_value"] = max(
+            float(torch.linalg.svdvals(M).max()) for M in M_runs)
         d["relational_content_effective_rank"] = float(
-            torch.linalg.matrix_rank(O.float() @ T.float()).float().mean())
+            torch.cat([torch.linalg.matrix_rank(M) for M in M_runs]).float().mean())
         # Conditioning of the stacked sending map, which the first_order and exponential charts invert.
-        d["relational_content_T_min_singular_value"] = float(
-            torch.linalg.svdvals(T.float().reshape(-1, T.shape[-1])).min())
+        d["relational_content_T_min_singular_value"] = float(torch.linalg.svdvals(
+            torch.cat([T.float().reshape(-1, T.shape[-1]) for T in T_runs])).min())
         # Similarity invariants of the content links L_ij^h = U_i M_h U_j^{-1}, M_h = O_hat_h T_hat_h:
         # unchanged by the frames, by (T_h, O_h) -> (B T_h, O_h B^{-1}) and by (T, O) -> (T a, a^{-1} O).
         # relational_content_max_singular_value above is not invariant under the reference change.
-        with torch.autocast(device_type=ops.T.device.type, enabled=False):
-            T_hat, O_hat = ops._ambient_content_maps(torch.float64)          # (H, d, K), (H, K, d)
+        with torch.autocast(device_type=T_runs[0].device.type, enabled=False):
+            T_hat, O_hat = ops._ambient_content_maps(torch.float64)          # (H, d, K), (H, K, d); per run if mixed
         d.update(metrics.content_link_spectrum(
             T_hat, O_hat,
             beta_self=(beta.diagonal(dim1=-2, dim2=-1)                      # (B, H, N) beta_ii^h
                        if ops.readout_mode == "predictive_content" else None),
             residual=ops.attention_residual))
-        covariance = torch.stack((cap["projected_covariance_pre"],
-                                  cap["projected_key_covariance_pre"])).float()
-        eig = safe_eigvalsh(covariance)
-        d["relational_projected_cov_min_eigenvalue"] = float(eig.min())
-        d["relational_projected_cov_max_condition"] = float((eig[..., -1]/eig[..., 0]).max())
+        query_cov, key_cov = cap["projected_covariance_pre"], cap["projected_key_covariance_pre"]
+        if torch.is_tensor(query_cov):                                       # equal heads: one tensor
+            query_cov, key_cov = [query_cov], [key_cov]
+        eigs = [safe_eigvalsh(torch.stack((q_cov, k_cov)).float())           # per run (2, B, N, n_r, d_r)
+                for q_cov, k_cov in zip(query_cov, key_cov)]
+        d["relational_projected_cov_min_eigenvalue"] = min(float(eig.min()) for eig in eigs)
+        d["relational_projected_cov_max_condition"] = max(
+            float((eig[..., -1]/eig[..., 0]).max()) for eig in eigs)
         d["relational_covariance_repair_count"] = float(cap.get("relational_covariance_repair_count", 0.0))
         # Frame magnitude and decoder/head-module state remain meaningful on both readouts.
         belief = snapshot.layer_converged[layer_index]

@@ -657,13 +657,15 @@ def _dense_frame(frame_tensor: torch.Tensor, block_diagonal: bool) -> torch.Tens
 
 
 def _act_on_frame(
-    g:     torch.Tensor,                   # (..., N, H, d, d) per-token head-block group elements
+    g:     torch.Tensor,                   # (..., N, H, d, d) head-block or (..., N, K, K) dense group elements
     frame: CanonicalFrameContext,
 ) -> CanonicalFrameContext:
     r"""Passive frame action :math:`U_i \mapsto g_i U_i`, :math:`U_i^{-1} \mapsto U_i^{-1} g_i^{-1}`."""
     g_inv = torch.linalg.inv(g)
     if frame.block_diagonal:
         return CanonicalFrameContext(g @ frame.forward, frame.inverse @ g_inv, True)
+    if g.dim() == frame.forward.dim():                                         # dense g on a dense frame
+        return CanonicalFrameContext(g @ frame.forward, frame.inverse @ g_inv, False)
     G, G_inv = _dense_frame(g, True), _dense_frame(g_inv, True)
     return CanonicalFrameContext(G @ frame.forward, frame.inverse @ G_inv, False)
 
@@ -732,7 +734,8 @@ def projected_gauge_equivariance(
     _, frame32, value_frame32 = model._relational_frames(beliefs, rope)
     log_prior = model._attention_log_prior(n, tokens.device)
     log_prior = None if log_prior is None else log_prior.double()
-    tau = attention_tau(_as_coeff(cfg.kappa_beta, tokens.device), model._belief_score_irrep_dims())
+    tau = attention_tau(_as_coeff(cfg.kappa_beta, tokens.device), model._belief_score_irrep_dims(),
+                        device=tokens.device)
     # The prior moves with the belief (mu_p = mu, Sigma_p = Sigma), so D(q||p) = 0 and a
     # state-dependent alpha* = c0/(b0 + D) is the constant c0/b0 at this snapshot.
     alpha = float(cfg.lambda_alpha)
@@ -796,11 +799,10 @@ def projected_gauge_equivariance(
                 # its generators T (so_n: one SO(N) element acting in every irrep block).
                 gens = model.group.generators.to(dtype=torch.float64)          # (n_gen, K, K)
                 a = torch.randn(1, n, gens.shape[0], generator=generator, dtype=torch.float64)
-                g_dense = torch.linalg.matrix_exp(
-                    float(scale) * torch.einsum("...a,akl->...kl", a, gens))   # (1, N, K, K)
-                g = torch.stack([g_dense[..., h*d:(h+1)*d, h*d:(h+1)*d] for h in range(H)],
-                                dim=-3).to(mu.device)                          # (1, N, H, d, d)
-            G = _dense_frame(g, True)                                          # (1, N, K, K)
+                # Kept dense: its irrep blocks may differ in size, and the dense frame takes it whole.
+                g = torch.linalg.matrix_exp(
+                    float(scale) * torch.einsum("...a,akl->...kl", a, gens)).to(mu.device)   # (1, N, K, K)
+            G = _dense_frame(g, True) if g.dim() == mu.dim() + 2 else g        # (1, N, K, K)
             moved = evaluate(
                 ops, (G @ mu.unsqueeze(-1)).squeeze(-1), G @ sigma @ G.transpose(-1, -2),
                 _act_on_frame(g, frame), _act_on_frame(g, value_frame))

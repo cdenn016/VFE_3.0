@@ -247,6 +247,8 @@ def _identity_covariance_score(
     from vfe3.relational_scoring import (
         _compute_dtype, projected_gaussian_kl, projected_moments, projected_noisy_query_cost)
 
+    if operators.mixed_heads:
+        raise NotApplicable(f"{operators.irrep_dims}: heads of different sizes (a mixed so_n irrep tower) are not supported by this analysis yet")
     H, d = len(operators.irrep_dims), operators.irrep_dims[0]
     inverse = frame.inverse
     if not frame.block_diagonal:
@@ -506,6 +508,8 @@ def _frame_free_covariance_score(
     from vfe3.relational_scoring import (
         _compute_dtype, projected_gaussian_kl, projected_moments, projected_noisy_query_cost)
 
+    if operators.mixed_heads:
+        raise NotApplicable(f"{operators.irrep_dims}: heads of different sizes (a mixed so_n irrep tower) are not supported by this analysis yet")
     H, d = len(operators.irrep_dims), operators.irrep_dims[0]
     inverse = frame.inverse
     if not frame.block_diagonal:

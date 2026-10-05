@@ -2,7 +2,7 @@ r"""Role-specific comparison and content operators in realized canonical frames.
 
 import math
 from numbers import Real
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import nn
@@ -35,15 +35,35 @@ def _phi1(A: torch.Tensor) -> torch.Tensor:          # (n, n) -> (n, n)
     return torch.linalg.matrix_exp(augmented)[:n, n:]
 
 
-def chart_receive_map(
-    T:     torch.Tensor,                # (H, d, K) stored sending maps, H*d = K
-    O:     torch.Tensor,                # (H, K, d) stored receiving factors
-    chart: str,
-) -> torch.Tensor:                      # (H, K, d) effective receiving maps O'_h
+def head_runs(head_dims: Sequence[int]) -> List[Tuple[int, int, int, int]]:
+    r"""Maximal runs of contiguous equal-size heads as ``(first_head, n_heads, d, first_coordinate)``.
+
+    Heads keep their order: concatenating per-run outputs along the head axis restores it, so
+    head-indexed quantities (ALiBi slopes, per-head kappa and lambda) need no scatter.
+    """
+    runs: List[Tuple[int, int, int, int]] = []
+    head = coordinate = 0
+    for d in head_dims:
+        if runs and runs[-1][2] == d:
+            first, n, _, start = runs[-1]
+            runs[-1] = (first, n + 1, d, start)
+        else:
+            runs.append((head, 1, d, coordinate))
+        head += 1
+        coordinate += d
+    return runs
+
+
+def chart_receive_runs(
+    T_runs: Sequence[torch.Tensor],     # per run (n_r, d_r, K) stored sending maps, sum_r n_r d_r = K
+    O_runs: Sequence[torch.Tensor],     # per run (n_r, K, d_r) stored receiving factors
+    chart:  str,
+) -> List[torch.Tensor]:                # per run (n_r, K, d_r) effective receiving maps O'_h
     r"""Effective receiving maps :math:`O'` of the tiled content link in the chosen chart.
 
-    With the stacked :math:`T` (:math:`Hd\times K`) and :math:`O` (:math:`K\times Hd`) square, the
-    predictive message is :math:`U_i\sum_jO'B_{ij}T\xi_j` with :math:`B_{ij}=\bigoplus_h\beta^h_{ij}I_d` and
+    With the row stack :math:`T=[T_1;\dots;T_H]` and the column stack :math:`O=[O_1,\dots,O_H]`
+    square (:math:`\sum_hd_h=K`), the predictive message is :math:`U_i\sum_jO'B_{ij}T\xi_j` with
+    :math:`B_{ij}=\bigoplus_h\beta^h_{ij}I_{d_h}` and
 
     .. math::
         O'_{\mathrm{affine}}=O,\qquad
@@ -55,25 +75,42 @@ def chart_receive_map(
     determinant); its order-:math:`n` term is :math:`O(TO)^{n-1}/n!` and order zero is
     :math:`T^{-1}B_{ij}T=\sum_h\beta^h_{ij}P_h`, the head-routed flat transport. The first-order chart
     keeps orders zero and one. Non-affine charts invert :math:`T` and are evaluated in float64.
+    Heads of different sizes enter only through the stacks, which are K x K whatever the partition.
     """
     if chart == "affine":
-        return O
+        return list(O_runs)
     if chart not in CONTENT_LINK_CHARTS:
         raise ValueError(f"content_link_chart must be one of {CONTENT_LINK_CHARTS}, got {chart!r}")
-    H, d, K = T.shape
-    if H * d != K or tuple(O.shape) != (H, K, d):
-        raise ValueError(f"content link charts need tiled square stacked maps, got T {tuple(T.shape)}, "
-                         f"O {tuple(O.shape)}")
-    with torch.autocast(device_type=T.device.type, enabled=False):
-        T_stack = T.to(torch.float64).reshape(H * d, K)                           # (Hd, K) rows by head
-        O_stack = O.to(torch.float64).permute(1, 0, 2).reshape(K, H * d)          # (K, Hd) columns by head
+    K = T_runs[0].shape[-1]
+    if (sum(T.shape[0] * T.shape[1] for T in T_runs) != K
+            or any(tuple(O.shape) != (T.shape[0], K, T.shape[1]) for T, O in zip(T_runs, O_runs))):
+        raise ValueError(f"content link charts need tiled square stacked maps, got T "
+                         f"{[tuple(T.shape) for T in T_runs]}, O {[tuple(O.shape) for O in O_runs]}")
+    with torch.autocast(device_type=T_runs[0].device.type, enabled=False):
+        T_stack = torch.cat([T.to(torch.float64).reshape(-1, K) for T in T_runs], dim=0)   # (K, K) rows by head
+        O_stack = torch.cat([O.to(torch.float64).permute(1, 0, 2).reshape(K, -1)
+                             for O in O_runs], dim=1)                                    # (K, K) columns by head
         # inv_ex: no host sync (linalg.inv checks info on the host); a singular T yields non-finite maps.
-        receive = torch.linalg.inv_ex(T_stack).inverse                            # (K, Hd) order zero
+        receive = torch.linalg.inv_ex(T_stack).inverse                                  # (K, K) order zero
         if chart == "first_order":
             receive = receive + O_stack
         else:
-            receive = receive + O_stack @ _phi1(T_stack @ O_stack)                # all orders
-    return receive.reshape(K, H, d).permute(1, 0, 2)                              # (H, K, d)
+            receive = receive + O_stack @ _phi1(T_stack @ O_stack)                      # all orders
+    out, start = [], 0
+    for T in T_runs:
+        n, d = T.shape[0], T.shape[1]
+        out.append(receive[:, start:start + n * d].reshape(K, n, d).permute(1, 0, 2))   # (n_r, K, d_r)
+        start += n * d
+    return out
+
+
+def chart_receive_map(
+    T:     torch.Tensor,                # (H, d, K) stored sending maps, H*d = K
+    O:     torch.Tensor,                # (H, K, d) stored receiving factors
+    chart: str,
+) -> torch.Tensor:                      # (H, K, d) effective receiving maps O'_h
+    r"""Equal-head form of :func:`chart_receive_runs` (one run)."""
+    return chart_receive_runs([T], [O], chart)[0]
 
 
 def _chart_initial_output(chart: str, scale: float) -> float:
@@ -87,6 +124,10 @@ class RelationalOperators(nn.Module):
     Every rank is the head dimension: S_Q/S_K are ``(H, d, input_dim)`` and T/O are
     ``(H, d, input_dim)`` / ``(H, output_dim, d)``, the untied standard-attention shapes.
     Every head reads and writes the full state while retaining its reduced channel rank.
+    Heads may differ in size (an ``so_n`` irrep tower): the maps are then stored per run of
+    contiguous equal-size heads (:func:`head_runs`), run r as ``(n_r, d_r, K)`` / ``(n_r, K, d_r)``
+    in a ``ParameterList`` under the same four names (state-dict keys ``T.0``, ``T.1``, ...). One run,
+    which includes every equal-head partition, stores today's single tensors.
     Independent maps are free matrices initialized with orthonormal rows.
     Their projected covariances must remain strictly positive definite.
     ``output_init_scale`` sets the initial content :math:`sB_{ij}` (placed on the head blocks under full
@@ -120,9 +161,8 @@ class RelationalOperators(nn.Module):
         predictive_covariance_checkpoint: bool = False,
     ) -> None:
         super().__init__()
-        if not irrep_dims or any(type(d) is not int or d < 1 for d in irrep_dims) or len(set(irrep_dims)) != 1:
-            raise ValueError("relational operators require positive equal-sized integer heads")
-        d, H = irrep_dims[0], len(irrep_dims)
+        if not irrep_dims or any(type(d) is not int or d < 1 for d in irrep_dims):
+            raise ValueError("relational operators require positive integer head sizes")
         if type(seed) is not int:
             raise ValueError("relational seed must be an integer")
         if (isinstance(output_init_scale, bool) or not isinstance(output_init_scale, (int, float))
@@ -174,25 +214,51 @@ class RelationalOperators(nn.Module):
             raise ValueError(
                 f"content_link_chart must be one of {CONTENT_LINK_CHARTS}, got {content_link_chart!r}")
         self.content_link_chart = content_link_chart
-        self.input_dim = H * d
+        K = sum(irrep_dims)
+        self.input_dim = K
         self.irrep_dims = list(irrep_dims)
-        self.score_rank_per_head = d
-        self.content_rank_per_head = d
+        self.runs = head_runs(self.irrep_dims)
+        equal = len(self.runs) == 1
+        self.score_rank_per_head = irrep_dims[0] if equal else list(irrep_dims)
+        self.content_rank_per_head = irrep_dims[0] if equal else list(irrep_dims)
         generator = torch.Generator().manual_seed(seed)
-        eye = torch.eye(d).expand(H, d, d).clone()
+        stored = {}
         for role in ("q", "k"):
-            raw = torch.randn(H, self.input_dim, d, generator=generator)
-            rows = self._orthonormal_columns(raw).transpose(-1, -2).contiguous()
-            setattr(self, f"raw_score_{role}", nn.Parameter(rows))
+            stored[f"raw_score_{role}"] = [
+                self._orthonormal_columns(torch.randn(n, K, d, generator=generator)).transpose(-1, -2).contiguous()
+                for _, n, d, _ in self.runs]
         # Preserve the released block-projector initialization and parameter names.
-        T_full = eye.new_zeros(H, d, H * d)
-        O_full = eye.new_zeros(H, H * d, d)
         initial_output = _chart_initial_output(content_link_chart, float(output_init_scale))
-        for h in range(H):
-            T_full[h, :, h*d:(h+1)*d] = eye[h]
-            O_full[h, h*d:(h+1)*d] = eye[h] * initial_output
-        self.T = nn.Parameter(T_full)
-        self.O = nn.Parameter(O_full)
+        stored["T"], stored["O"] = [], []
+        for _, n, d, start in self.runs:
+            eye = torch.eye(d).expand(n, d, d).clone()
+            T_full = eye.new_zeros(n, d, K)
+            O_full = eye.new_zeros(n, K, d)
+            for h in range(n):
+                T_full[h, :, start+h*d:start+(h+1)*d] = eye[h]
+                O_full[h, start+h*d:start+(h+1)*d] = eye[h] * initial_output
+            stored["T"].append(T_full)
+            stored["O"].append(O_full)
+        for name, tensors in stored.items():
+            setattr(self, name, nn.Parameter(tensors[0]) if equal
+                    else nn.ParameterList(nn.Parameter(t) for t in tensors))
+
+    def _stored_runs(self, name: str) -> List[torch.Tensor]:
+        r"""The per-run tensors stored under ``name`` (one entry for an equal-head partition)."""
+        value = getattr(self, name)
+        return list(value) if isinstance(value, nn.ParameterList) else [value]
+
+    @property
+    def mixed_heads(self) -> bool:
+        r"""Whether the heads differ in size (more than one run)."""
+        return len(self.runs) > 1
+
+    def _head_slice(self, x: torch.Tensor, run: int, dim: int) -> torch.Tensor:
+        r"""Run ``run``'s heads of a head-indexed tensor (the tensor itself for one run)."""
+        if not self.mixed_heads:
+            return x
+        first, n = self.runs[run][0], self.runs[run][1]
+        return x.narrow(dim, first, n)
 
     @property
     def inference_semantics(self) -> str:
@@ -215,35 +281,59 @@ class RelationalOperators(nn.Module):
         mu:    torch.Tensor,  # (..., N, K), source means with live gradients
         beta:  torch.Tensor,  # (..., H, N, N)
         frame: CanonicalFrameContext,
-        receive: Optional[torch.Tensor] = None,   # (H, K, d) precomputed O'_h; None evaluates the chart
+        receive: 'Optional[torch.Tensor | Sequence[torch.Tensor]]' = None,   # O'_h, (H, K, d) or per run
     ) -> torch.Tensor:
         r"""Compute m_i = A_i sum_h O'_h sum_j beta_ij^h T_h B_j^{-1} mu_j (O' of content_link_chart)."""
-        canonical = self.canonical_mean(mu, frame)
-        H, d = len(self.irrep_dims), self.irrep_dims[0]
-        dtype = _compute_dtype(mu, self.T, self.O, frame.forward)
-        if receive is None:
-            _, receive = self.content_factors()                            # (H, K, d) O'_h
+        canonical = self.canonical_mean(mu, frame)                          # (..., N, K)
+        T_runs = self._stored_runs("T")
+        dtype = _compute_dtype(mu, *self._content_parameters(), frame.forward)
+        receive = self._receive_runs(receive)
         with torch.autocast(device_type=mu.device.type, enabled=False):
-            coordinates = canonical.flatten(-2).unsqueeze(-2)              # (..., N, 1, K)
-            values = (self.T.to(dtype) @ coordinates.to(dtype).unsqueeze(-1)).squeeze(-1)
-            pooled = torch.einsum("...hij,...jhs->...ihs", beta.to(dtype), values)
-            # Sum heads inside the contraction, avoiding a (..., N, H, K) result.
-            body = torch.einsum("hks,...nhs->...nk", receive.to(dtype), pooled)
+            coordinates = canonical.unsqueeze(-2).to(dtype)                 # (..., N, 1, K)
+            body = None
+            for run, (T, O) in enumerate(zip(T_runs, receive)):
+                values = (T.to(dtype) @ coordinates.unsqueeze(-1)).squeeze(-1)     # (..., N, n_r, d_r)
+                pooled = torch.einsum("...hij,...jhs->...ihs",
+                                      self._head_slice(beta, run, -3).to(dtype), values)
+                # Sum heads inside the contraction, avoiding a (..., N, H, K) result.
+                term = torch.einsum("hks,...nhs->...nk", O.to(dtype), pooled)     # (..., N, K)
+                body = term if body is None else body + term
             if frame.block_diagonal:
-                body = body.reshape(*mu.shape[:-1], H, d)
+                body = body.reshape(*mu.shape[:-1], len(self.irrep_dims), self.irrep_dims[0])
             with ieee_fp32_matmul():                                       # U_i body_i, kappa(U)-sensitive
                 result = (frame.forward.to(dtype) @ body.unsqueeze(-1)).squeeze(-1)
         return result.reshape_as(mu).to(mu.dtype)
+
+    def _content_parameters(self) -> List[torch.Tensor]:
+        r"""Every stored content tensor (T and O of every run), for dtype resolution."""
+        return self._stored_runs("T") + self._stored_runs("O")
+
+    def _receive_runs(
+        self,
+        receive: 'Optional[torch.Tensor | Sequence[torch.Tensor]]',
+    ) -> List[torch.Tensor]:
+        r"""Per-run O'_h: the chart evaluated when ``receive`` is None; a lone tensor is one run."""
+        if receive is None:
+            return self.content_factor_runs()[1]
+        return [receive] if torch.is_tensor(receive) else list(receive)
+
+    def _ambient_content_runs(
+        self,
+        dtype:   torch.dtype,
+        receive: 'Optional[torch.Tensor | Sequence[torch.Tensor]]' = None,
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        r"""Per-run full-state T_h (n_r, d_r, K) and effective O'_h (n_r, K, d_r)."""
+        return ([T.to(dtype) for T in self._stored_runs("T")],
+                [O.to(dtype) for O in self._receive_runs(receive)])
 
     def _ambient_content_maps(
         self,
         dtype:   torch.dtype,
         receive: Optional[torch.Tensor] = None,   # (H, K, d) precomputed O'_h; None evaluates the chart
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        r"""Return full-state T_h and effective O'_h of shapes (H,d,K) and (H,K,d)."""
-        if receive is None:
-            _, receive = self.content_factors()
-        return self.T.to(dtype), receive.to(dtype)
+    ) -> 'Tuple[torch.Tensor, torch.Tensor] | Tuple[List[torch.Tensor], List[torch.Tensor]]':
+        r"""Return full-state T_h and effective O'_h of shapes (H,d,K) and (H,K,d); per-run lists for mixed heads."""
+        T_runs, O_runs = self._ambient_content_runs(dtype, receive)
+        return (T_runs, O_runs) if self.mixed_heads else (T_runs[0], O_runs[0])
 
     def predictive_covariance_update(
         self,
@@ -383,11 +473,16 @@ class RelationalOperators(nn.Module):
         frame: CanonicalFrameContext,
         receive: Optional[torch.Tensor] = None,   # (H, K, d)
     ) -> torch.Tensor:
-        r"""Dense K x K evaluation of :meth:`predictive_covariance_update` (full family or dense frames)."""
-        H, d = len(self.irrep_dims), self.irrep_dims[0]
-        K = H * d
+        r"""Dense K x K evaluation of :meth:`predictive_covariance_update` (full family or dense frames).
+
+        With heads of different sizes the head-pair terms run over pairs of runs (r, g): the
+        coefficients :math:`c^{hh'}` act on :math:`d_r\times d_g` blocks
+        :math:`T_hC_jT_{h'}^\top`, one batched contraction per run pair, and the spread and the
+        self-coupling :math:`c^{hh}=\beta^h` live on the diagonal pairs r = g.
+        """
+        H, K = len(self.irrep_dims), self.input_dim
         diagonal = sigma.dim() == mu.dim()
-        dtype = _compute_dtype(mu, sigma, self.T, self.O, frame.forward)
+        dtype = _compute_dtype(mu, sigma, *self._content_parameters(), frame.forward)
         with torch.autocast(device_type=mu.device.type, enabled=False):
             forward, inverse = frame.forward.to(dtype), frame.inverse.to(dtype)
             if frame.block_diagonal:                            # (..., N, H, d, d) -> (..., N, K, K)
@@ -398,33 +493,44 @@ class RelationalOperators(nn.Module):
             C = inverse @ local @ inverse.transpose(-1, -2)                        # (..., N, K, K)
             C = 0.5 * (C + C.transpose(-1, -2))
             xi = (inverse @ mu.to(dtype).unsqueeze(-1)).squeeze(-1)                # (..., N, K)
-            T_hat, O_hat = self._ambient_content_maps(dtype, receive)              # (H,d,K), (H,K,d)
+            T_runs, O_runs = self._ambient_content_runs(dtype, receive)            # (n_r,d_r,K), (n_r,K,d_r)
             b = beta.to(dtype)                                                     # (..., H, N, N)
-            eye_h = torch.eye(H, dtype=dtype, device=mu.device)
 
             # Shift every source mean by token 0's. Each beta row sums to 1, so the spread
             # sum_j beta_ij v_j v_j^T - m_i m_i^T is invariant under a common shift of the v_j, and
             # the shift is causal because token 0 lies in every row's support. It removes the
             # common offset that would otherwise cancel between the two terms.
             xi = xi - xi[..., :1, :]                                              # (..., N, K)
-            values = torch.einsum("hsk,...nk->...nhs", T_hat, xi)                  # (..., N, H, d)
-            TC = torch.einsum("hsk,...nkm->...nhsm", T_hat, C)                     # (..., N, H, d, K)
-            source = torch.einsum("...nhsm,gtm->...nhgst", TC, T_hat)             # (..., N, H, H, d, d)
-            # c^{hh'}_ij: beta^h on the head diagonal, beta^h beta^h' off it.
-            c = torch.einsum("...hij,...gij->...hgij", b, b)
-            c = c * (1.0 - eye_h)[..., None, None] + torch.einsum("...hij,hg->...hgij", b, eye_h)
-            pooled = torch.einsum("...hgij,...jhgst->...ihgst", c, source)        # (..., N, H, H, d, d)
-            second = torch.einsum("...hij,...jhst->...ihst",
-                                  b, values.unsqueeze(-1) * values.unsqueeze(-2))  # (..., N, H, d, d)
-            mean = torch.einsum("...hij,...jhs->...ihs", b, values)                # (..., N, H, d)
-            spread = second - mean.unsqueeze(-1) * mean.unsqueeze(-2)
-            pooled = pooled + torch.einsum("...ihst,hg->...ihgst", spread, eye_h)
-            lifted = torch.einsum("hks,...nhgst->...ngkt", O_hat, pooled)         # (..., N, H, K, d)
-            C_att = torch.einsum("...ngkt,gmt->...nkm", lifted, O_hat)             # (..., N, K, K)
+            b_runs = [self._head_slice(b, run, -3) for run in range(len(self.runs))]   # (..., n_r, N, N)
+            TC_runs = [torch.einsum("hsk,...nkm->...nhsm", T_hat, C)               # (..., N, n_r, d_r, K)
+                       for T_hat in T_runs]
+            C_att = None
+            for r, (T_r, O_r, b_r, TC) in enumerate(zip(T_runs, O_runs, b_runs, TC_runs)):
+                for g, (T_g, O_g, b_g) in enumerate(zip(T_runs, O_runs, b_runs)):
+                    source = torch.einsum("...nhsm,gtm->...nhgst", TC, T_g)       # (..., N, n_r, n_g, d_r, d_g)
+                    c = torch.einsum("...hij,...gij->...hgij", b_r, b_g)
+                    if r == g:
+                        # c^{hh'}_ij: beta^h on the head diagonal, beta^h beta^h' off it.
+                        eye_h = torch.eye(b_r.shape[-3], dtype=dtype, device=mu.device)
+                        c = c * (1.0 - eye_h)[..., None, None] + torch.einsum("...hij,hg->...hgij", b_r, eye_h)
+                    pooled = torch.einsum("...hgij,...jhgst->...ihgst", c, source)
+                    if r == g:
+                        values = torch.einsum("hsk,...nk->...nhs", T_r, xi)        # (..., N, n_r, d_r)
+                        second = torch.einsum("...hij,...jhst->...ihst",
+                                              b_r, values.unsqueeze(-1) * values.unsqueeze(-2))
+                        mean = torch.einsum("...hij,...jhs->...ihs", b_r, values)  # (..., N, n_r, d_r)
+                        spread = second - mean.unsqueeze(-1) * mean.unsqueeze(-2)
+                        pooled = pooled + torch.einsum("...ihst,hg->...ihgst", spread, eye_h)
+                    lifted = torch.einsum("hks,...nhgst->...ngkt", O_r, pooled)   # (..., N, n_g, K, d_g)
+                    term = torch.einsum("...ngkt,gmt->...nkm", lifted, O_g)        # (..., N, K, K)
+                    C_att = term if C_att is None else C_att + term
             if self.attention_residual:
-                self_weight = b.diagonal(dim1=-2, dim2=-1).transpose(-1, -2)       # (..., N, H) beta_ii^h
-                cross = torch.einsum("hks,...nhsm->...nkm", O_hat,
-                                     TC * self_weight[..., None, None])            # sum_h beta_ii M_h C_i
+                cross = None
+                for O_r, b_r, TC in zip(O_runs, b_runs, TC_runs):
+                    self_weight = b_r.diagonal(dim1=-2, dim2=-1).transpose(-1, -2)   # (..., N, n_r) beta_ii^h
+                    term = torch.einsum("hks,...nhsm->...nkm", O_r,
+                                        TC * self_weight[..., None, None])        # sum_h beta_ii M_h C_i
+                    cross = term if cross is None else cross + term
                 C_att = C_att + C + cross + cross.transpose(-1, -2)
             # Isotropic reference floor scaled by the invariant tr(C_i)/K: a relative floor
             # floor * C_i compounds as floor**depth along a residual-free stack and loses float32
@@ -454,30 +560,48 @@ class RelationalOperators(nn.Module):
             signs = torch.where(pivots < 0., -torch.ones_like(pivots), torch.ones_like(pivots))
             return Q * signs.unsqueeze(-2)
 
+    def _require_equal_heads(self, what: str) -> None:
+        if self.mixed_heads:
+            raise ValueError(f"{what} stacks equal heads; this partition has head sizes {self.irrep_dims} "
+                             f"(use the per-run accessor)")
+
     def comparison_pair(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        r"""Return (S_Q,S_K), each (H,r,input_dim), with live role graphs."""
+        r"""Return (S_Q,S_K), each (H,r,input_dim), with live role graphs (equal heads)."""
+        self._require_equal_heads("comparison_pair")
         return self.raw_score_q, self.raw_score_k
+
+    def comparison_runs(self) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        r"""Per-run (S_Q, S_K), each (n_r, d_r, input_dim), with live role graphs."""
+        return list(zip(self._stored_runs("raw_score_q"), self._stored_runs("raw_score_k")))
 
     def content_factors(self) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""Return full-state (T, O') for M_h=O'_h T_h; O' = O in the affine chart (the stored parameter)."""
+        self._require_equal_heads("content_factors")
         return self.T, chart_receive_map(self.T, self.O, self.content_link_chart)
+
+    def content_factor_runs(self) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        r"""Per-run (T, O'): T (n_r, d_r, K) and O' (n_r, K, d_r) of the content link's chart."""
+        T_runs = self._stored_runs("T")
+        return T_runs, chart_receive_runs(T_runs, self._stored_runs("O"), self.content_link_chart)
 
     @ieee_fp32_matmul()
     def canonical_mean(
         self,
         mu:    torch.Tensor,  # (..., N, K)
         frame: CanonicalFrameContext,
-    ) -> torch.Tensor:        # (..., N, H, d)
+    ) -> torch.Tensor:        # (..., N, K)
         r"""Compute xi_i=U_i^{-1}mu_i using the supplied realized ordered frame."""
-        H, d = len(self.irrep_dims), self.irrep_dims[0]
-        if mu.shape[-1] != H * d:
+        K = self.input_dim
+        if mu.shape[-1] != K:
             raise ValueError("relational mean dimension does not match its head partition")
-        if frame.block_diagonal and frame.inverse.shape[-3:] != (H, d, d):
+        if frame.block_diagonal and (self.mixed_heads or frame.inverse.shape[-3:] != (
+                len(self.irrep_dims), self.irrep_dims[0], self.irrep_dims[0])):
             raise ValueError("relational compact frame blocks do not match its head partition")
-        if not frame.block_diagonal and frame.inverse.shape[-2:] != (H * d, H * d):
+        if not frame.block_diagonal and frame.inverse.shape[-2:] != (K, K):
             raise ValueError("relational dense frame dimension does not match the mean")
         dtype = _compute_dtype(mu, frame.inverse)
         with torch.autocast(device_type=mu.device.type, enabled=False):
-            coordinates = mu.to(dtype).reshape(*mu.shape[:-1], H, d) if frame.block_diagonal else mu.to(dtype)
+            coordinates = (mu.to(dtype).reshape(*mu.shape[:-1], len(self.irrep_dims), self.irrep_dims[0])
+                           if frame.block_diagonal else mu.to(dtype))
             canonical = (frame.inverse.to(dtype) @ coordinates.unsqueeze(-1)).squeeze(-1)
-        return canonical.reshape(*mu.shape[:-1], H, d)
+        return canonical.reshape(*mu.shape[:-1], K)

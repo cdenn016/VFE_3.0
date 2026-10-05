@@ -167,6 +167,8 @@ def not_applicable_reason(model: torch.nn.Module) -> Optional[str]:
         return f"readout_mode={readouts}: routing is not the predictive-content readout"
     if int(getattr(cfg, "n_e_steps", 1)) < 1:
         return "n_e_steps=0: no E-step iteration, so the router is never evaluated"
+    if any(getattr(op, "mixed_heads", False) for op in operators):
+        return "heads of different sizes (a mixed so_n irrep tower) are not supported by this analysis yet"
     return None
 
 
@@ -499,7 +501,7 @@ def _head_temperatures(model: torch.nn.Module, H: int, device: torch.device) -> 
     from vfe3.free_energy import attention_tau
     from vfe3.model.block import _as_coeff
 
-    tau = attention_tau(_as_coeff(model.cfg.kappa_beta, device), model.group.irrep_dims)
+    tau = attention_tau(_as_coeff(model.cfg.kappa_beta, device), model.group.irrep_dims, device=device)
     tau = torch.as_tensor(tau, dtype=torch.float64, device=device).reshape(-1)
     return tau.expand(H).clone() if tau.numel() == 1 else tau
 

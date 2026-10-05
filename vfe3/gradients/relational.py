@@ -30,51 +30,72 @@ def relational_score(
     represent the same block-diagonal structure; cross-head frame coupling is
     outside the supported projected architecture.
     """
-    H, d = len(operators.irrep_dims), operators.irrep_dims[0]
+    dims = operators.irrep_dims
     inverse = frame.inverse
     if not frame.block_diagonal:
-        if H > 1:
+        if len(dims) > 1:
             with torch.no_grad():
                 block_mask = torch.block_diag(
-                    *(torch.ones(d, d, dtype=torch.bool, device=inverse.device) for _ in range(H)))
+                    *(torch.ones(d, d, dtype=torch.bool, device=inverse.device) for d in dims))
                 if bool((inverse.detach()[..., ~block_mask] != 0).any()):       # one host sync
                     raise ValueError(
                         "relational_score requires a head-block-diagonal frame: the dense frame "
                         "inverse couples gauge heads, and scoring its diagonal blocks would disagree "
                         "with the full-inverse content readout")
-        inverse = torch.stack(
-            [inverse[..., h*d:(h+1)*d, h*d:(h+1)*d] for h in range(H)], dim=-3)     # (..., N, H, d, d)
-    # Both roles read the one shared frame: there is no separate key-side inverse.
-    key_inverse = inverse
-    # Each head reads the whole belief; gauge blocks stay compact.
-    mu_h, source_mu_h = (                                                       # (..., N, H, K)
-        x.unsqueeze(-2).expand(*x.shape[:-1], H, H*d) for x in (mu, source_mu))
-    sigma_h, source_sigma_h = (                                                 # (..., N, H, K[, K])
-        x.unsqueeze(-3).expand(*x.shape[:-2], H, H*d, H*d)
-        if x.ndim == mu.ndim + 1 else x.unsqueeze(-2).expand(*x.shape[:-1], H, H*d)
-        for x in (sigma, source_sigma))
-    S_q, S_k = operators.comparison_pair()                                     # each (H, d, K)
-    if mu is source_mu and sigma is source_sigma and inverse is key_inverse:
-        # Predictive readout scores a belief against itself: one batched projection over both
-        # comparison maps. S_q and S_k still differ, so two L = S U^-1 maps are formed, but the
-        # covariance contraction G = L Sigma L^T is batched across the role axis.
-        a, G = projected_moments(mu_h, sigma_h, inverse, torch.stack((S_q, S_k)))
-        a_q, G_q = a[0], G[0]
-        a_k, G_k = a[1], G[1]
+        if operators.mixed_heads:
+            # Every head reads the whole belief through the whole frame, L_h = S_h U^{-1}. Blocks of
+            # different sizes have no compact stack, so each run reads the dense inverse as one
+            # full-width block, (..., N, 1, K, K).
+            inverse_runs = [inverse.unsqueeze(-3)] * len(operators.runs)
+        else:
+            d = dims[0]
+            inverse_runs = [torch.stack(                                       # (..., N, H, d, d)
+                [inverse[..., h*d:(h+1)*d, h*d:(h+1)*d] for h in range(len(dims))], dim=-3)]
+    elif operators.mixed_heads:
+        raise ValueError("a compact (..., N, H, d, d) frame cannot carry heads of different sizes")
     else:
-        a_q, G_q = projected_moments(mu_h, sigma_h, inverse, S_q)              # (..., N, H, d), (..., N, H, d, d)
-        a_k, G_k = projected_moments(source_mu_h, source_sigma_h, key_inverse, S_k)
+        inverse_runs = [inverse]
+    comparison = operators.comparison_runs()                                   # per run (n_r, d_r, K) pairs
     # An escalated float64 frame (audit 2026-09-23 #12) runs the whole projection and score in
     # float64; the results are returned at the dtype a lower-precision frame would have produced.
-    public = _compute_dtype(mu, sigma, source_mu, source_sigma, S_q, S_k)
-    if capture is not None:
-        capture["projected_covariance_pre"] = G_q.detach().to(public)
-        capture["projected_key_covariance_pre"] = G_k.detach().to(public)
+    public = _compute_dtype(mu, sigma, source_mu, source_sigma, *(S for pair in comparison for S in pair))
     score = projected_noisy_query_cost if operators.routing == "noisy_query" else projected_gaussian_kl
-    return score(
-        a_q, G_q, a_k, G_k,
-        projection_q=(sigma_h, inverse, S_q, mu_h),
-        projection_k=(source_sigma_h, key_inverse, S_k, source_mu_h)).to(public)
+    scores, captured_q, captured_k = [], [], []
+    # One scoring call per run: the heads of a run share their rank d_r. Each call ends in its own
+    # host transfer, so a tower of R runs pays R of them per call (one for equal heads).
+    for (S_q, S_k), inverse in zip(comparison, inverse_runs):
+        H, K = S_q.shape[0], S_q.shape[-1]
+        # Both roles read the one shared frame: there is no separate key-side inverse.
+        key_inverse = inverse
+        # Each head reads the whole belief; gauge blocks stay compact.
+        mu_h, source_mu_h = (                                                   # (..., N, H, K)
+            x.unsqueeze(-2).expand(*x.shape[:-1], H, K) for x in (mu, source_mu))
+        sigma_h, source_sigma_h = (                                             # (..., N, H, K[, K])
+            x.unsqueeze(-3).expand(*x.shape[:-2], H, K, K)
+            if x.ndim == mu.ndim + 1 else x.unsqueeze(-2).expand(*x.shape[:-1], H, K)
+            for x in (sigma, source_sigma))
+        if mu is source_mu and sigma is source_sigma and inverse is key_inverse:
+            # Predictive readout scores a belief against itself: one batched projection over both
+            # comparison maps. S_q and S_k still differ, so two L = S U^-1 maps are formed, but the
+            # covariance contraction G = L Sigma L^T is batched across the role axis.
+            a, G = projected_moments(mu_h, sigma_h, inverse, torch.stack((S_q, S_k)))
+            a_q, G_q = a[0], G[0]
+            a_k, G_k = a[1], G[1]
+        else:
+            a_q, G_q = projected_moments(mu_h, sigma_h, inverse, S_q)          # (..., N, H, d), (..., N, H, d, d)
+            a_k, G_k = projected_moments(source_mu_h, source_sigma_h, key_inverse, S_k)
+        if capture is not None:
+            captured_q.append(G_q.detach().to(public))
+            captured_k.append(G_k.detach().to(public))
+        scores.append(score(
+            a_q, G_q, a_k, G_k,
+            projection_q=(sigma_h, inverse, S_q, mu_h),
+            projection_k=(source_sigma_h, key_inverse, S_k, source_mu_h)).to(public))
+    if capture is not None:
+        # One (..., N, H, r, r) tensor for equal heads; a list with one per run for mixed head sizes.
+        capture["projected_covariance_pre"] = captured_q[0] if len(captured_q) == 1 else captured_q
+        capture["projected_key_covariance_pre"] = captured_k[0] if len(captured_k) == 1 else captured_k
+    return scores[0] if len(scores) == 1 else torch.cat(scores, dim=-3)      # (..., H, N, N)
 
 
 def relational_predictive_readout(
@@ -108,7 +129,7 @@ def relational_predictive_readout(
             mu_work, sigma_work, mu_work, sigma_work, frame, operators, capture), kl_max=kl_max)
         beta = attention_weights(score, tau=tau,
                                  log_prior=None if log_prior is None else log_prior.to(dtype))
-        _, receive = operators.content_factors()             # O' once per layer for mean and covariance
+        _, receive = operators.content_factor_runs()         # O' once per layer for mean and covariance
         result = operators.predictive_content(mu_work, beta, value_frame or frame, receive).to(mu.dtype)
         if operators.attention_residual:
             result = mu + result

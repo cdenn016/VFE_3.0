@@ -164,8 +164,8 @@ def test_operator_initialization_and_compact_frames() -> None:
 def test_operator_rejects_rank_loss_and_invalid_heads() -> None:
     from vfe3.model.relational_operators import RelationalOperators
 
-    with pytest.raises(ValueError, match="equal-sized"):
-        RelationalOperators([3, 2], seed=1)
+    with pytest.raises(ValueError, match="positive integer head sizes"):
+        RelationalOperators([3, 0], seed=1)
     with pytest.raises(TypeError, match="identity_content"):
         RelationalOperators([3], seed=1, identity_content=True)
     degenerate = torch.ones(1, 3, 2)

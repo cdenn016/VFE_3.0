@@ -958,6 +958,8 @@ def _maps(run_dir: Path, checkpoints: Sequence[str], cfg: Any, out: Path, figure
     from vfe3.posthoc import maps as mp
     from vfe3.posthoc import figures as fg
 
+    if getattr(cfg, "gauge_group", None) == "so_n" and len(set(cfg.head_dims)) > 1:
+        return {"status": "not_applicable", "reason": "heads of different sizes (a mixed so_n irrep tower) are not supported by this analysis yet"}
     result: Dict[str, Any] = {}
     for checkpoint in checkpoints:
         path = run_dir / checkpoint

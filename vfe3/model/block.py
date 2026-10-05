@@ -89,7 +89,8 @@ def vfe_block(
     if hidden_bias is not None and block_mlp is None:
         raise ValueError("hidden_bias (per_type_hidden_bias) needs a block MLP")
     if tau is None:
-        tau = attention_tau(_as_coeff(cfg.kappa_beta, belief.mu.device), group.irrep_dims)
+        tau = attention_tau(_as_coeff(cfg.kappa_beta, belief.mu.device), group.irrep_dims,
+                            device=belief.mu.device)
     out = e_step(
         belief, mu_p, sigma_p, group,
         n_iter=cfg.n_e_steps, tau=tau,
