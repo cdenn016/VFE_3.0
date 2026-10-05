@@ -304,8 +304,10 @@ def build_optimizer(
         layers = model.relational_operators_by_layer
         for role, names in (("score", ("raw_score_q", "raw_score_k")),
                             ("content", ("T", "O"))):
-            parameters = [getattr(ops, name) for ops in layers for name in names]
-            parameters = [p for p in parameters if p is not None and p.requires_grad]
+            # Mixed head sizes store a ParameterList per name (one tensor per run of equal heads).
+            parameters = [p for ops in layers for name in names
+                          for p in (ops._stored_runs(name) if getattr(ops, name) is not None else [])]
+            parameters = [p for p in parameters if p.requires_grad]
             if parameters:
                 rate = getattr(cfg, f"m_relational_{role}_lr")
                 groups.append({"params": parameters, "lr": cfg.m_p_mu_lr if rate is None else rate,
@@ -1499,10 +1501,10 @@ def _capture_numerics_counts(
         rows = support.sum(dim=-1, keepdim=True) >= 2                       # (B, H, N, 1)
         entries = support & rows                                            # (B, H, N, N)
         capped = entries & (score >= kl_max)                                # (B, H, N, N)
-        G_q = capture["projected_covariance_pre"]                           # (B, N, H, r, r)
-        G_k = capture["projected_key_covariance_pre"]                       # (B, N, H, r, r)
-        attempted.append(int(G_q.numel() // (G_q.shape[-1] ** 2)
-                             + G_k.numel() // (G_k.shape[-1] ** 2)))
+        G_q = capture["projected_covariance_pre"]                           # (B, N, H, r, r); per run if mixed
+        G_k = capture["projected_key_covariance_pre"]                       # (B, N, H, r, r); per run if mixed
+        attempted.append(sum(int(G.numel() // (G.shape[-1] ** 2))
+                             for G in ([G_q, G_k] if torch.is_tensor(G_q) else [*G_q, *G_k])))
         recovered = torch.as_tensor(capture["relational_covariance_repair_count"]).reshape(1)
         heads.append(int(beta.shape[1]))
         device_counts.append(torch.cat((
@@ -1691,9 +1693,11 @@ def _parameter_group(
     if name.startswith("prior_bank.") and leaf.startswith(("output_proj", "decode_")):
         return "decode"
     if name.startswith("relational_operators"):
-        if leaf in ("raw_score_q", "raw_score_k"):
+        # Mixed head sizes store per-run lists: the attribute is the segment before the run index.
+        attribute = name.rsplit(".", 2)[-2] if leaf.isdigit() else leaf
+        if attribute in ("raw_score_q", "raw_score_k"):
             return "relational_score"
-        if leaf in ("T", "O"):
+        if attribute in ("T", "O"):
             return "relational_content"
         return "other"
     if name.startswith("block_mlps."):
@@ -3777,7 +3781,7 @@ def _fmt_tau(cfg: VFE3Config, model: VFEModel) -> str:
     (list) kappa -> '[t0, t1, ...]' (T1). Converts a list kappa to a tensor first so attention_tau
     does not choke on a raw list."""
     dev = next(model.parameters()).device
-    tau = attention_tau(_as_coeff(cfg.kappa_beta, dev), model.group.irrep_dims)
+    tau = attention_tau(_as_coeff(cfg.kappa_beta, dev), model.group.irrep_dims, device=dev)
     if isinstance(tau, torch.Tensor) and tau.dim() >= 1:
         return "[" + ", ".join(f"{x:.4f}" for x in tau.tolist()) + "]"
     return f"{float(tau):.4f}"

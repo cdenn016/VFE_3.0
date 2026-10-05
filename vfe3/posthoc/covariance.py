@@ -80,6 +80,8 @@ def gap_applicability(model: torch.nn.Module) -> Optional[str]:
     r"""``None`` when the realized-frame routing covariance is defined for ``model``, else the reason."""
     if not hasattr(model.prior_bank, "sigma_log_embed"):
         return "the prior bank has no stored log-variance table"
+    if any(getattr(op, "mixed_heads", False) for op in getattr(model, "relational_operators_by_layer", ()) or ()):
+        return "heads of different sizes (a mixed so_n irrep tower) are not supported by this analysis yet"
     return None
 
 

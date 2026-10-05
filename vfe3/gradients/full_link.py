@@ -236,12 +236,32 @@ def _source_channel(
         R_{hj}=T_hC_jT_h^\top+\nu I_d,\qquad v_{hj}=T_h\xi_j,
 
     returning (..., N, H, d, d) and (..., N, H, d); there nu is a declared channel floor.
+
+    Both are returned as lists with one entry per run of equal-size heads (``operators.runs``),
+    the run's heads in place of H and its size in place of d; one entry for equal heads.
     """
-    H, d = len(operators.irrep_dims), operators.irrep_dims[0]
-    K = H * d
-    T, O = (factor.to(dtype) for factor in (content or operators.content_factors()))   # O' of the chart
+    T_runs, O_runs = content or operators.content_factor_runs()            # O' of the chart
     inverse = frame.inverse.to(dtype)
-    if frame.block_diagonal:
+    channels = [_source_channel_run(mu, sigma, inverse, frame.block_diagonal, T.to(dtype), O.to(dtype),
+                                    operators.receiver_law, noise, dtype)
+                for T, O in zip(T_runs, O_runs)]
+    return [precision for precision, _ in channels], [eta for _, eta in channels]
+
+
+def _source_channel_run(
+    mu:             torch.Tensor,           # (..., N, K)
+    sigma:          torch.Tensor,           # (..., N, K) or (..., N, K, K)
+    inverse:        torch.Tensor,           # (..., N, H, d, d) compact or (..., N, K, K) dense
+    block_diagonal: bool,
+    T:              torch.Tensor,           # (H, d, K) one run's sending maps
+    O:              torch.Tensor,           # (H, K, d) one run's effective receiving maps
+    receiver_law:   str,
+    noise:          float,
+    dtype:          torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""One run of :func:`_source_channel` (heads of a common size d)."""
+    H, d, K = T.shape
+    if block_diagonal:
         # Each full T reads all compact gauge blocks, (..., N, H, d, K).
         action = torch.einsum(
             "hsgu,...nguv->...nhsgv", T.reshape(H, d, H, d), inverse)
@@ -254,7 +274,7 @@ def _source_channel(
             "...nhsk,...nk,...nhtk->...nhst", action, sigma.to(dtype), action)
     else:
         reduced = action @ sigma.to(dtype).unsqueeze(-3) @ action.transpose(-1, -2)
-    if operators.receiver_law == "channel_likelihood":
+    if receiver_law == "channel_likelihood":
         target = .5 * (reduced + reduced.transpose(-1, -2))
         target = target + noise * torch.eye(d, dtype=dtype, device=mu.device)
         precision = _spd_precision(target)                                 # (..., N, H, d, d)
@@ -364,7 +384,7 @@ def build_full_link_context(
         raise ValueError("channel_likelihood requires a positive prior coefficient (its only entropy term)")
     channel_frame = value_frame or frame
     dtype = _compute_dtype(mu, sigma, mu_p, sigma_p, frame.inverse,
-                           channel_frame.inverse, operators.T, operators.O)
+                           channel_frame.inverse, *operators._content_parameters())
     with torch.autocast(device_type=mu.device.type, enabled=False):
         mu_work, sigma_work = mu.to(dtype), sigma.to(dtype)
         score = safe_kl_clamp(relational_score(
@@ -372,18 +392,24 @@ def build_full_link_context(
         beta = attention_weights(score, tau=tau, log_prior=(
             None if log_prior is None else log_prior.to(dtype)))
         weights = _head_weights(beta, lambda_beta)                       # (..., H, I, J)
-        content = operators.content_factors()                      # (T, O') once per context build
+        content = operators.content_factor_runs()                  # per-run (T, O') once per context build
         source_precision, source_eta = _source_channel(
             mu_work, sigma_work, channel_frame, operators, receiver_noise, dtype, content)
-        if channel:
-            pooled_W = torch.einsum("...hij,...jhst->...ihst", weights, source_precision)  # (..., I, H, d, d)
-            pooled_w = torch.einsum("...hij,...jhs->...ihs", weights, source_eta)          # (..., I, H, d)
-            O = content[1].to(dtype)                                          # O' of content_link_chart
-            pooled_precision = torch.einsum("hks,...ihst,hmt->...ikm", O, pooled_W, O)    # (..., I, K, K)
-            pooled_eta = torch.einsum("hks,...ihs->...ik", O, pooled_w)                   # (..., I, K)
-        else:
-            pooled_precision = torch.einsum("...hij,...jhkm->...ikm", weights, source_precision)
-            pooled_eta = torch.einsum("...hij,...jhk->...ik", weights, source_eta)
+        # Heads pool run by run (one run for equal heads); the pooled K x K precision and K-vector sum.
+        pooled_precision = pooled_eta = None
+        for run, (precision_r, eta_r, O) in enumerate(zip(source_precision, source_eta, content[1])):
+            weights_r = operators._head_slice(weights, run, -3)                 # (..., n_r, I, J)
+            if channel:
+                pooled_W = torch.einsum("...hij,...jhst->...ihst", weights_r, precision_r)  # (..., I, n_r, d_r, d_r)
+                pooled_w = torch.einsum("...hij,...jhs->...ihs", weights_r, eta_r)          # (..., I, n_r, d_r)
+                O = O.to(dtype)                                                  # O' of content_link_chart
+                precision_term = torch.einsum("hks,...ihst,hmt->...ikm", O, pooled_W, O)    # (..., I, K, K)
+                eta_term = torch.einsum("hks,...ihs->...ik", O, pooled_w)                   # (..., I, K)
+            else:
+                precision_term = torch.einsum("...hij,...jhkm->...ikm", weights_r, precision_r)
+                eta_term = torch.einsum("...hij,...jhk->...ik", weights_r, eta_r)
+            pooled_precision = precision_term if pooled_precision is None else pooled_precision + precision_term
+            pooled_eta = eta_term if pooled_eta is None else pooled_eta + eta_term
         Lambda, eta = _local_pullback(pooled_precision, pooled_eta, channel_frame)
         if sigma_p.ndim == mu_p.ndim:
             prior_precision = torch.diag_embed(sigma_p.to(dtype).reciprocal())

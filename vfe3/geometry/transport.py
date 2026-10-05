@@ -780,7 +780,7 @@ def _blockwise_matrix_exp(
     launch-bound pattern a GPU is starved by); ``matrix_exp`` evaluates each (d, d) block
     independently, so this is bit-identical to the per-block loop (pinned at 1e-12 by
     tests/test_perf_equivalence.py::test_per_block_exp_is_bit_equivalent_to_full_exp). Unequal
-    block sizes (a general block-diagonal M) fall back to the per-block loop.
+    block sizes (a mixed so_n irrep tower) take one batched call per run of contiguous equal blocks.
     """
     out = torch.zeros_like(matrix)
     if len(set(block_dims)) == 1 and len(block_dims) > 1:
@@ -798,13 +798,25 @@ def _blockwise_matrix_exp(
         out5 = out.reshape(*batch, H, d, H, d)
         torch.diagonal(out5, dim1=-4, dim2=-2).copy_(exps.movedim(0, -1))
         return out
+    for start, n, dim in _block_runs(block_dims):
+        end = start + n * dim
+        blk = matrix[..., start:end, start:end]
+        out[..., start:end, start:end] = (torch.linalg.matrix_exp(blk.contiguous()) if n == 1
+                                          else _blockwise_matrix_exp(blk, [dim] * n))
+    return out
+
+
+def _block_runs(block_dims: List[int]) -> List[Tuple[int, int, int]]:
+    r"""Maximal runs of contiguous equal blocks as ``(first_coordinate, n_blocks, d)``."""
+    runs: List[Tuple[int, int, int]] = []
     start = 0
     for dim in block_dims:
-        end = start + dim
-        blk = matrix[..., start:end, start:end].contiguous()
-        out[..., start:end, start:end] = torch.linalg.matrix_exp(blk)
-        start = end
-    return out
+        if runs and runs[-1][2] == dim:
+            runs[-1] = (runs[-1][0], runs[-1][1] + 1, dim)
+        else:
+            runs.append((start, 1, dim))
+        start += dim
+    return runs
 
 
 def _blockwise_group_inverse(
@@ -826,8 +838,9 @@ def _blockwise_group_inverse_certified(
     r""":func:`_blockwise_group_inverse` plus the per-block frame-pair verdict (audit 2026-09-23 #12).
 
     Equal blocks certify the stacked ``(..., H, d, d)`` blocks inside their one inverse read;
-    unequal blocks OR the verdicts of their existing per-block reads. A block-diagonal right factor
-    composes block by block, so the certificate uses its matching diagonal blocks.
+    unequal blocks OR the verdicts of one stacked read per run of contiguous equal blocks. A
+    block-diagonal right factor composes block by block, so the certificate uses its matching
+    diagonal blocks.
     """
     out = torch.zeros_like(matrix)
     escalate = False
@@ -853,20 +866,19 @@ def _blockwise_group_inverse_certified(
         torch.diagonal(out_view, dim1=-4, dim2=-2).copy_(inverses.movedim(-3, -1))
         return out, escalate
 
-    start = 0
-    for dim in block_dims:
-        end = start + dim
-        block = matrix[..., start:end, start:end].contiguous()
-        kappa = None
-        if certify:
-            right = (None if right_pair is None
-                     else (right_pair[0][..., start:end, start:end],
-                           right_pair[1][..., start:end, start:end]))
-            kappa = _frame_pair_kappa(right)
-        inverse, block_escalate = _checked_group_inverse_certified(block, kappa=kappa)
+    for start, n, dim in _block_runs(block_dims):
+        end = start + n * dim
+        right = (None if right_pair is None
+                 else (right_pair[0][..., start:end, start:end], right_pair[1][..., start:end, start:end]))
+        if n > 1:
+            inverse, run_escalate = _blockwise_group_inverse_certified(
+                matrix[..., start:end, start:end], [dim] * n, certify=certify, right_pair=right)
+        else:
+            kappa = _frame_pair_kappa(right) if certify else None
+            inverse, run_escalate = _checked_group_inverse_certified(
+                matrix[..., start:end, start:end].contiguous(), kappa=kappa)
         out[..., start:end, start:end] = inverse
-        escalate = escalate or block_escalate
-        start = end
+        escalate = escalate or run_escalate
     return out, escalate
 
 

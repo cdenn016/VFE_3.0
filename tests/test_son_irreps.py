@@ -193,10 +193,11 @@ def _son_model(dtype: torch.dtype = torch.float32, **overrides: object) -> VFEMo
 
 
 @pytest.mark.parametrize("mode", ["projected_predictive", "projected_gradient"])
-def test_projected_so_n_requires_one_equal_irrep_block_per_head(mode: str) -> None:
-    with pytest.raises(ValueError, match="one gauge block per head"):
-        test_config(attention_mode=mode, gauge_group="so_n", group_n=3, embed_dim=4, n_heads=2,
-                    irrep_spec=[("l0", 1), ("l1", 1)])
+def test_projected_so_n_requires_one_irrep_block_per_head(mode: str) -> None:
+    # Blocks may differ in size (Phase 1 of the 2026-10-05 SO(N) plan); n_heads must count them.
+    cfg = test_config(attention_mode=mode, gauge_group="so_n", group_n=3, embed_dim=4, n_heads=2,
+                      irrep_spec=[("l0", 1), ("l1", 1)])
+    assert cfg.head_dims == [1, 3]
     with pytest.raises(ValueError, match="one gauge block per head"):
         test_config(attention_mode=mode, gauge_group="so_n", group_n=3, embed_dim=6, n_heads=3,
                     irrep_spec=[("l1", 2)])

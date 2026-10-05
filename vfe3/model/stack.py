@@ -102,7 +102,8 @@ def vfe_stack(
     # Hoist the loop-invariant temperature computation out of the per-layer vfe_block call.
     # attention_tau depends only on the kappa, group.irrep_dims, and device -- all constant across
     # layers -- so computing it once here and passing it as tau avoids L redundant calls.
-    tau = attention_tau(_as_coeff(cfg.kappa_beta, belief.mu.device), group.irrep_dims)
+    tau = attention_tau(_as_coeff(cfg.kappa_beta, belief.mu.device), group.irrep_dims,
+                        device=belief.mu.device)
     for layer_index in range(cfg.n_layers):
         if diagnostic_capture is not None:
             diagnostic_capture["layer_priors"].append((mu_p, sigma_p))

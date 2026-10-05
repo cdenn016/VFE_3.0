@@ -14,7 +14,8 @@ curvature), gauge_trace_spread (spread of log|det Omega| = tr embed(phi)), free_
 content maps M_h = O_h T_h).
 """
 
-from typing import Any, Callable, Dict, List, Optional, Tuple
+import math
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -1526,6 +1527,56 @@ def _head_transfer(
     return torch.einsum("hsk,gkt->hgst", T_hat, O_hat)
 
 
+def _head_transfer_full(
+    T_runs: Sequence[torch.Tensor],       # per run (n_r, d_r, K) ambient sending maps
+    O_runs: Sequence[torch.Tensor],       # per run (n_r, K, d_r) ambient receiving maps
+) -> Tuple[torch.Tensor, List[int]]:      # (K, K) W = T O with blocks W_hg = T_hat_h O_hat_g, head sizes
+    r"""The K x K head-transfer matrix :math:`\mathsf W=\hat T\hat O` of a mixed-size head partition.
+
+    :math:`\hat T` is the row stack of the :math:`\hat T_h` and :math:`\hat O` the column stack of the
+    :math:`\hat O_h`, so the :math:`(h,g)` block of :math:`\mathsf W` is :math:`W_{hg}`, of size
+    :math:`d_h\times d_g`, and :math:`W_{hh}` carries the nonzero spectrum of :math:`M_h`.
+    """
+    K = T_runs[0].shape[-1]
+    T_stack = torch.cat([T.detach().to("cpu", torch.float64).reshape(-1, K) for T in T_runs])          # (K, K)
+    O_stack = torch.cat([O.detach().to("cpu", torch.float64).permute(1, 0, 2).reshape(K, -1)
+                         for O in O_runs], dim=1)                                                       # (K, K)
+    dims = [int(T.shape[1]) for T in T_runs for _ in range(T.shape[0])]
+    return T_stack @ O_stack, dims
+
+
+def _mixed_head_invariants(
+    W:    torch.Tensor,                   # (K, K) head-transfer matrix
+    dims: List[int],                      # head sizes, sum = K
+) -> List[Dict[str, float]]:
+    r""":func:`content_link_head_invariants` for heads of different sizes, by slicing :math:`\mathsf W`."""
+    offsets = [0]
+    for d in dims:
+        offsets.append(offsets[-1] + d)
+    blocks = [slice(offsets[h], offsets[h + 1]) for h in range(len(dims))]
+    sum_rho = float(torch.linalg.eigvals(W).abs().max())
+    rows = []
+    for h, (rows_h, d) in enumerate(zip(blocks, dims)):
+        W_head = W[rows_h, rows_h]                                            # (d_h, d_h)
+        lam, vec = torch.linalg.eig(W_head)
+        vec = vec / torch.linalg.vector_norm(vec, dim=-2, keepdim=True)
+        pair = [float((W[rows_h, cols] * W[cols, rows_h].T).sum()) for cols in blocks]   # Tr(W_hg W_gh)
+        logdet = float(torch.linalg.slogdet(W_head).logabsdet)
+        rows.append({
+            "link_spectral_radius": float(lam.abs().max()),
+            "link_min_abs_eigenvalue": float(lam.abs().min()),
+            "link_mean_log_abs_eigenvalue": logdet / d if math.isfinite(logdet) else float("nan"),
+            "link_unit_distance": float((lam - 1.0).abs().max()),
+            "link_idempotency_defect": float((lam * (lam - 1.0)).abs().max()),
+            "link_trace": float(torch.diagonal(W_head).sum()),
+            "link_trace_sq": pair[h],
+            "link_cross_trace": sum(pair) - pair[h],
+            "link_sum_spectral_radius": sum_rho,
+            "link_eigvec_condition": float(torch.linalg.cond(vec)),
+        })
+    return rows
+
+
 def content_link_eigenvalues(
     T_hat: torch.Tensor,                  # (H, d, K)
     O_hat: torch.Tensor,                  # (H, K, d)
@@ -1560,6 +1611,8 @@ def content_link_head_invariants(
     NOT invariant (it depends on the stored per-head basis, and is infinite or huge for a defective
     :math:`W_h`).
     """
+    if not torch.is_tensor(T_hat):
+        return _mixed_head_invariants(*_head_transfer_full(T_hat, O_hat))
     W = _head_transfer(T_hat, O_hat)                                          # (H, H, d, d)
     H, d = W.shape[0], W.shape[-1]
     W_head = torch.diagonal(W, dim1=0, dim2=1).permute(2, 0, 1)               # (H, d, d)
@@ -1680,12 +1733,17 @@ def content_link_spectrum(
         "relational_link_selfloop_spectral_radius_mean": float("nan"),
     }
     if beta_self is not None:
-        W = _head_transfer(T_hat, O_hat)
-        H, d = W.shape[0], W.shape[-1]
-        W_full = W.permute(0, 2, 1, 3).reshape(H * d, H * d)                  # (Hd, Hd)
+        if torch.is_tensor(T_hat):
+            W = _head_transfer(T_hat, O_hat)
+            H, d = W.shape[0], W.shape[-1]
+            W_full = W.permute(0, 2, 1, 3).reshape(H * d, H * d)              # (Hd, Hd)
+            repeats: 'int | torch.Tensor' = d
+        else:                                                                 # mixed head sizes
+            W_full, dims = _head_transfer_full(T_hat, O_hat)                  # (K, K)
+            H, repeats = len(dims), torch.tensor(dims)
         b = beta_self.detach().to("cpu", torch.float64)
         b = b.reshape(-1, H, b.shape[-1]).transpose(-1, -2).reshape(-1, H)    # (B N, H)
-        A = b.repeat_interleave(d, dim=-1).unsqueeze(-1) * W_full             # (B N, Hd, Hd) = D_i W
+        A = b.repeat_interleave(repeats, dim=-1).unsqueeze(-1) * W_full       # (B N, K, K) = D_i W
         rho = (torch.linalg.eigvals(A) + (1.0 if residual else 0.0)).abs().amax(dim=-1)   # (B N,)
         out["relational_link_selfloop_spectral_radius_max"] = float(rho.max())
         out["relational_link_selfloop_spectral_radius_mean"] = float(rho.mean())

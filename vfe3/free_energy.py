@@ -50,6 +50,7 @@ def _broadcast_tau(tau: 'float | torch.Tensor', energy: torch.Tensor) -> 'float 
 def attention_tau(
     kappa:      'float | torch.Tensor',   # sharpness scalar or (H,) per-head (kappa=1 -> Vaswani recovery)
     irrep_dims: List[int],                # gauge-irrep block sizes; sum == K
+    device:     'torch.device | None' = None,   # where a scalar kappa's per-block tau lives (unequal blocks)
 ) -> 'float | torch.Tensor':
     r"""Softmax temperature tau = kappa * sqrt(d_energy), where d_energy is the dimension the
     per-pair energy E_ij = D(q_i || Omega_ij q_j) accumulates over -- the gauge-irrep BLOCK size.
@@ -79,7 +80,7 @@ def attention_tau(
         return kappa * (irrep_dims[0] ** 0.5)
     sqrt_d = _sqrt_dims(                                           # (H,) per-block sqrt(d_h), cached
         tuple(irrep_dims),
-        kappa.device if isinstance(kappa, torch.Tensor) else torch.device("cpu"),
+        kappa.device if isinstance(kappa, torch.Tensor) else (device or torch.device("cpu")),
         kappa.dtype if isinstance(kappa, torch.Tensor) else torch.float32,
     )
     return kappa * sqrt_d
