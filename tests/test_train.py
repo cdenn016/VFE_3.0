@@ -114,22 +114,21 @@ def test_floor_lambdas_handle_zero_base_lr_without_dividing():
             assert lr >= cfg.min_lr_frac * base - 1e-12
 
 
-def test_aux_role_learning_rate_reporting_handles_active_and_inactive_mixers():
+def test_aux_role_learning_rate_reporting_handles_active_and_inactive_roles():
     from vfe3.train import _learning_rates_by_aux_role
 
     groups = [
-        {"lr_aux_role": "head_evidence"},
+        {"lr_aux_role": "layernorm"},
         {"role": "mu"},
     ]
     reported = _learning_rates_by_aux_role(groups, [0.0011, 0.0123])
 
-    assert reported["head_evidence"] == pytest.approx(0.0011)
-    assert math.isnan(reported["head_mixer"])
+    assert reported["layernorm"] == pytest.approx(0.0011)
     assert math.isnan(reported["block_mlp"])
 
     with pytest.raises(RuntimeError, match="duplicate optimizer learning-rate auxiliary role"):
         _learning_rates_by_aux_role(
-            [{"lr_aux_role": "head_mixer"}, {"lr_aux_role": "head_mixer"}],
+            [{"lr_aux_role": "block_mlp"}, {"lr_aux_role": "block_mlp"}],
             [0.0022, 0.0033],
         )
 
@@ -758,7 +757,7 @@ def test_select_loader_raises_on_missing_cache(monkeypatch):
 
 def _terminal_cfg(**kw):
     base = dict(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-                n_e_steps=1, gauge_group="block_glk", use_head_mixer=False,
+                n_e_steps=1, gauge_group="block_glk",
                 e_q_mu_lr=0.5, e_q_sigma_lr=0.05,
                 m_p_mu_lr=0.1, m_p_sigma_lr=0.05, m_phi_lr=0.0,
                 warmup_steps=1, max_steps=2, kl_max=32)

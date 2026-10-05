@@ -31,7 +31,7 @@ from tests.test_relational_integration import _cfg
 # Both seams live on this config: pos_phi='learned' creates pos_phi_free, and layernorm_affine=True
 # on a 'layernorm' block seam creates the affine gamma/beta. That is also the shipped baseline in
 # train_vfe3.py and ablation.py, so these tests exercise the real configuration, not a corner.
-_LIVE = dict(use_head_mixer=False, use_block_mlp=False,
+_LIVE = dict(use_block_mlp=False,
              pos_phi="learned", layernorm_affine=True,
              norm_type_block="layernorm", norm_type_final="layernorm", phi_weight_decay=0.065)
 
@@ -86,7 +86,7 @@ def test_layernorm_affine_takes_its_own_rate_when_set() -> None:
 
 def test_layernorm_group_reports_its_own_auxiliary_rate() -> None:
     """The affine carries lr_aux_role='layernorm', so its scheduled rate reaches the CSV the way
-    head_mixer/block_mlp do rather than being invisible."""
+    block_mlp does rather than being invisible."""
     optimizer, groups = _groups(m_p_mu_lr=0.009, m_layernorm_lr=0.03)
     assert groups["block_norm.weight"]["lr_aux_role"] == "layernorm"
     resolved = _learning_rates_by_aux_role(

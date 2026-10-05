@@ -2,7 +2,7 @@ r"""Training (M-step) for VFE_3.0: AdamW per-group learning rates + warmup/cosin
 
 The model has no neural layers (no nn.Linear/MLP/activation). The trainable parameters are the
 PriorBank prior tables plus the model-owned tables their toggles create -- the default
-``pos_phi='learned'`` positional table, and the default-OFF exceptions (head mixer,
+``pos_phi='learned'`` positional table, and the default-OFF exceptions (CG coupling,
 learnable T5 bias, linear decode).
 ``loss.backward()`` flows through the unrolled E-step to those tables; AdamW updates
 them. The M-step minimizes the cross-entropy of the decode boundary over the prior
@@ -213,13 +213,9 @@ def build_optimizer(
     ``m_decode_sigma_lr`` controls separate decode log variances. Each falls back to the
     corresponding encoder rate; shared encode/decode tables keep encoder rates.
     Omitting overrides preserves historical group topology and semantic mu/sigma decays.
-    Head evidence keeps its dedicated ``m_head_evidence_lr``.
 
     Optional parameters are grouped only when their toggle is on: the linear decode weight
-    ``output_proj_weight`` and bias (decode_mode='linear') at ``m_decode_mu_lr`` (``m_p_mu_lr`` when None); the
-    PriorBank ``head_evidence_logits`` at ``m_head_evidence_lr`` and the post-belief head-mixer
-    ``mixer_delta`` (use_head_mixer=True) at ``m_head_mixer_lr`` (each inherits ``m_p_mu_lr`` when
-    its dedicated setting is None).
+    ``output_proj_weight`` and bias (decode_mode='linear') at ``m_decode_mu_lr`` (``m_p_mu_lr`` when None).
     A final assertion pins that the groups cover ``model.parameters()`` EXACTLY -- a new
     parameter that is forgotten here would otherwise silently never receive a gradient.
     Registry-owned trainable transport state is grouped at ``m_phi_lr`` (a gauge-connection scale),
@@ -298,17 +294,6 @@ def build_optimizer(
         # weight_decay=0 -- decaying a unigram prior toward zero biases it to a flat distribution
         # (the same protection phi/Omega carry).
         groups.append({"params": [pb.output_proj_bias], "lr": decode_mu_lr, "weight_decay": 0.0, "role": "mu"})
-    if getattr(pb, "head_evidence_logits", None) is not None:
-        head_evidence_lr = (cfg.m_p_mu_lr if cfg.m_head_evidence_lr is None
-                            else cfg.m_head_evidence_lr)
-        groups.append({"params": [pb.head_evidence_logits], "lr": head_evidence_lr,
-                       "weight_decay": 0.0, "role": "mu",
-                       "lr_aux_role": "head_evidence"})
-    if getattr(model, "head_mixer", None) is not None:          # use_head_mixer=True Schur mixer
-        head_mixer_lr = (cfg.m_p_mu_lr if cfg.m_head_mixer_lr is None
-                         else cfg.m_head_mixer_lr)
-        groups.append({"params": list(model.head_mixer.parameters()), "lr": head_mixer_lr,
-                       "role": "mu", "lr_aux_role": "head_mixer"})
     if getattr(model, "block_mlps", None) is not None:         # use_block_mlp=True coordinate MLPs
         block_mlp_lr = (cfg.m_p_mu_lr if cfg.m_block_mlp_lr is None
                         else cfg.m_block_mlp_lr)
@@ -353,7 +338,7 @@ def build_optimizer(
         # weight_decay=0: the per-bucket T5 bias b_{i-j} is a relative-position PRIOR shaping the
         # attention pi, not capacity; L2-decaying it toward zero biases the prior toward a flat/uniform
         # relative-position distribution (the same exemption output_proj_bias / r / the gauge frame
-        # carry). role='mu' is the catch-all for learned non-variance/non-gauge tables (head_mixer,
+        # carry). role='mu' is the catch-all for learned non-variance/non-gauge tables (block_mlp,
         # ...); the bias is not a gauge frame, so it steps under the mean LR, not m_phi_lr.
         groups.append({"params": [model.t5_bias], "lr": cfg.m_p_mu_lr, "weight_decay": 0.0, "role": "mu"})
     # LayerNorm affine (layernorm_affine=True on a "layernorm" seam): learned per-feature gamma/beta
@@ -369,7 +354,7 @@ def build_optimizer(
     if ln_affine:
         # Normalization calibration, not prior-table capacity, so it carries its own optional rate
         # (m_layernorm_lr=None inherits m_p_mu_lr, the historical behavior) and its own aux role, the
-        # way head_mixer/block_mlp do. Both seams' gamma/beta share this ONE group.
+        # way block_mlp does. Both seams' gamma/beta share this ONE group.
         layernorm_lr = cfg.m_p_mu_lr if cfg.m_layernorm_lr is None else cfg.m_layernorm_lr
         groups.append({"params": ln_affine, "lr": layernorm_lr, "weight_decay": 0.0,
                        "role": "mu", "lr_aux_role": "layernorm"})
@@ -385,7 +370,7 @@ def build_optimizer(
 
     # Exact-coverage guard: every TRAINABLE model parameter (requires_grad=True) must land in exactly
     # one group. A missing group would leave that weight frozen (no AdamW update) with no error -- the
-    # bug class the optimizer is most prone to as new learnable seams (output_proj, head mixer, ...) are
+    # bug class the optimizer is most prone to as new learnable seams (output_proj, block MLP, ...) are
     # added. Non-trainable params (requires_grad=False, e.g. a parameter frozen by design) are
     # intentionally exempt: they are fixed by design and need no optimizer group.
     # NOTE: this guards GROUPING/coverage, not gradient FLOW. A grouped parameter can still receive
@@ -487,8 +472,7 @@ def _learning_rates_by_aux_role(
     """
     if len(param_groups) != len(lrs):
         raise RuntimeError("optimizer parameter groups and scheduler learning rates differ in length")
-    allowed = {"head_evidence", "head_mixer", "block_mlp", "relational_score", "relational_content",
-               "layernorm"}
+    allowed = {"block_mlp", "relational_score", "relational_content", "layernorm"}
     resolved = {role: float("nan") for role in allowed}
     seen = set()
     for group, lr in zip(param_groups, lrs):
@@ -1313,7 +1297,6 @@ _VAL_DIAG_KEYS = (
     "estep_r_phi_last", "estep_fp_kl", "estep_fp_mu_rms", "estep_fp_sigma_rms",
     "estep_fp_phi_rms", "estep_beta_js", "estep_alpha_rms_delta",
     "pos_loss_first_q", "pos_loss_last_q", "pos_loss_ratio",
-    "val_builder_resid",
     # held-out gauge / SPD / Fisher geometry (surfaced from the already-computed val diagnostics dict)
     "val_holonomy_wilson", "val_cocycle_residual", "val_gauge_invariant_spread",
     "val_fisher_trace_mean", "val_belief_cond_p95", "val_belief_lam_min", "val_belief_lam_max",
@@ -2007,7 +1990,7 @@ def _residual_and_attention_rows(
         \delta_i = \frac{\|\mathrm{LN}(\mu_i + m_i) - \mathrm{LN}(m_i)\|}{\|\mathrm{LN}(\mu_i + m_i)\|},
 
     reporting the 10/50/90% quantiles of :math:`\rho` and the median of :math:`\delta`.
-    :math:`\delta` is NaN when the block has no normalization, when a head mixer or CG coupling sits
+    :math:`\delta` is NaN when the block has no normalization, when a CG coupling sits
     between the E-step and the norm (the norm then does not see :math:`\mu + m`), and for the
     predictive readout without ``attention_residual`` (no residual exists to remove).
 
@@ -2017,7 +2000,7 @@ def _residual_and_attention_rows(
     :math:`\sum_j \min(\beta_{ij}, \pi_{ij})` with :math:`\pi = \mathrm{softmax}_j(B)` the prior alone.
     """
     block_norm = model.block_norm
-    ln_defined = (block_norm is not None and model.head_mixer is None
+    ln_defined = (block_norm is not None
                   and model.cg_coupling is None and _residual_update_is_additive(model)
                   and getattr(model.cfg, "block_coordinates", "local") == "local")
     ratios: Dict[int, List[torch.Tensor]] = {}
@@ -2513,8 +2496,7 @@ def _val_diagnostics_one(
     ``val_gauge_invariant_spread``, ``val_fisher_trace_mean``, ``val_belief_cond_p95``,
     ``val_belief_lam_*``, ``val_belief_cond_valid_frac``, ``val_phi_*``, ``val_vertex_cond_p99``,
     ``val_pos_phi_*``, ``val_guard_*``, ``val_live_pair_frac``, ``val_nonfinite_frac``), which come from
-    the legacy ``diagnostics`` geometry pass that the relational diagnostics do not run. The
-    head-mixer ``val_builder_resid`` stays legacy-route only.
+    the legacy ``diagnostics`` geometry pass that the relational diagnostics do not run.
     """
     import torch.nn.functional as F
 
@@ -3421,8 +3403,6 @@ def train(
                 "lr_mu":             lrs["mu"],
                 "lr_sigma":          lrs["sigma"],
                 "lr_phi":            lrs["phi"],
-                "lr_head_evidence":  aux_lrs["head_evidence"],
-                "lr_head_mixer":     aux_lrs["head_mixer"],
                 "lr_relational_score":   aux_lrs["relational_score"],
                 "lr_relational_content": aux_lrs["relational_content"],
                 "val_ce":            last_val["ce"]  if do_eval else float("nan"),  # eval-cadence: fresh on
@@ -3502,10 +3482,7 @@ def train(
                         "phi_matrix_norm_median", "phi_matrix_norm_p95", "phi_matrix_norm_p99",
                         "phi_matrix_norm_max",
                         "vertex_cond_median", "vertex_cond_p95", "vertex_cond_p99",
-                        "pos_phi_matrix_norm_p95", "pos_phi_matrix_norm_p99", "pos_phi_matrix_norm_max",
-                        "head_mixer_drift",
-                        "head_evidence_weights", "head_evidence_entropy",
-                        "head_evidence_max_abs_drift"):
+                        "pos_phi_matrix_norm_p95", "pos_phi_matrix_norm_p99", "pos_phi_matrix_norm_max"):
                 if _dk in d:
                     row[_dk] = d[_dk]
             # Gradient health (Tier-1/2): global + per-group (mu/sigma/phi) grad AND weight norms (so
@@ -3781,7 +3758,7 @@ def coverage_lines(
 
 
 def _fmt_mixer_lr(configured: Optional[float], mean_lr: float) -> str:
-    """Format a dedicated mixer LR while making ``None`` inheritance explicit."""
+    """Format a dedicated auxiliary LR while making ``None`` inheritance explicit."""
     return f"{mean_lr} (inherit mu)" if configured is None else str(configured)
 
 
@@ -3952,10 +3929,6 @@ def _banner(
     dead_line = ([" dead under config (no grad): "
                   + ", ".join(n.replace("prior_bank.", "") for n in rep["dead_names"])]
                  if rep["probed"] and rep["dead_names"] else [])
-    head_evidence_lr = (
-        _fmt_mixer_lr(cfg.m_head_evidence_lr, cfg.m_p_mu_lr)
-        if cfg.use_priorbank_head_evidence_mixer else "inactive"
-    )
     return "\n".join([
         bar,
         f" Gauge VFE Transformer | {rep['total']:,} params{live_note}{probe_note} | {device}",
@@ -3967,8 +3940,6 @@ def _banner(
         *dead_line,
         f" M-LRs: mu={cfg.m_p_mu_lr}  sigma={cfg.m_p_sigma_lr}  phi={cfg.m_phi_lr}",
         f" decoder M-LRs: {_fmt_decode_lrs(cfg)}",
-        f" mixer-LRs: head_evidence={head_evidence_lr}  "
-        f"head_mixer={_fmt_mixer_lr(cfg.m_head_mixer_lr, cfg.m_p_mu_lr)}",
         f" VFE: lambda_alpha={cfg.lambda_alpha}  kappa_beta={cfg.kappa_beta}  "
         f"tau={_fmt_tau(cfg, model)}  mass_phi={cfg.mass_phi}",
         f" seed={cfg.seed}",

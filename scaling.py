@@ -59,7 +59,6 @@ from vfe3.data.datasets import (
 )
 from vfe3.metric_contracts import perplexity_matches_ce
 from vfe3.model.block_mlp import get_block_mlp_registration
-from vfe3.model.head_mixer import HeadMixer
 from vfe3.model.model import VFEModel, build_group
 from vfe3.path_utils import portable_path_component_key
 from vfe3.run_artifacts import RunArtifacts, _git_code_identity, _write_json_atomic, finalize_run
@@ -183,8 +182,6 @@ config = dict(
     #################################
     decode_bias                       = True,     # only for decode_mode='linear'
 
-    use_head_mixer                    = False,   # opt-in Schur-commutant head mixer (needs >=2 blocks: block_glk heads OR an so_n irrep tower with per-isotypic-component mixing);
-    use_priorbank_head_evidence_mixer = False,
 
 
     decode_mode                       = 'linear',  # prior-bank: diagonal_chunked/full_chunked/expected_likelihood_chunked/family_chunked
@@ -323,8 +320,6 @@ config = dict(
 
 
 
-    m_head_mixer_lr           = 0.025,     #  post-belief Schur HeadMixer parameters
-    m_head_evidence_lr        = None,      # active only with use_priorbank_head_evidence_mixer
 
 
     min_lr_frac               = 0.01,
@@ -405,7 +400,7 @@ BASELINE: Dict[str, Any] = config
 # ROUTE BUILDERS  -- each returns a list of cells; a cell is
 #   {"label", "route", "scale_knob", "overrides": {VFE3Config field: value, ...}}.
 # Every cell's overrides must independently satisfy VFE3Config.__post_init__ (n_heads | embed_dim,
-# use_head_mixer needs >= 2 equal blocks, alibi priors need n_heads == n_blocks, ...); a cell that
+# alibi priors need n_heads == n_blocks, ...); a cell that
 # violates a cross-field constraint is caught at construction and recorded as a config-error point
 # (never crashes the grid), but the defaults below are pre-satisfied so they construct cleanly.
 # =============================================================================
@@ -441,7 +436,7 @@ def build_standard_routes(settings: Dict[str, List[int]]) -> Dict[str, List[Dict
 def route_grow_k(embed_dims: List[int], n_heads: int = 4) -> List[Dict[str, Any]]:
     r"""Grow N by widening embed_dim at a FIXED block_glk head count (route A). Mixed linear+quadratic
     token-prior route: 2VK grows linearly, phi_embed = V*K^2/n_heads quadratically. n_heads stays equal to the
-    block count so the baseline causal_alibi prior and the head mixer remain valid."""
+    block count so the baseline causal_alibi prior remains valid."""
     # kl_max scales WITH k (audit 2026-07-27). BASELINE freezes it at 8*train_K once, so route A
     # inherited 8*20 = 160 at every width while its three siblings (route_grow_k_mup,
     # route_grow_k_fixed_block, route_vary_block_fixed_k) each set 8*k per cell. Route A's divergence
@@ -490,7 +485,7 @@ def route_grow_k_mup(embed_dims: List[int], n_heads: int = 4, anchor_k: int = 20
 
 def route_blocksize(embed_dim: int, n_heads_list: List[int]) -> List[Dict[str, Any]]:
     r"""Grow N by SHRINKING the head count at fixed K (route B): block_glk n_gen = K^2/n_heads, so
-    fewer/larger blocks -> more params. n_heads == n_blocks keeps causal_alibi + the mixer valid."""
+    fewer/larger blocks -> more params. n_heads == n_blocks keeps causal_alibi valid."""
     return [{"label": f"K{embed_dim}_h{h}", "route": "blocksize", "scale_knob": "n_heads",
              "overrides": {"embed_dim": embed_dim, "n_heads": h, "gauge_group": "block_glk"}}
             for h in n_heads_list]
@@ -500,8 +495,7 @@ def route_grow_k_fixed_block(embed_dims: List[int], block: int) -> List[Dict[str
     r"""Grow N by widening K at a FIXED gauge block size GL(``block``): n_heads = K/block scales WITH K
     (every head is one GL(block) frame). Because block_glk has n_gen = K^2/n_heads = block*K, phi_embed
     = V*block*K grows LINEARLY in K here -- contrast ``route_grow_k`` (fixed n_heads, so the block grows
-    and n_gen ~ K^2). kl_max = 8*K per cell (avoids the frozen-kl_max width confound). The single-block
-    K=block cell drops the head mixer (the Schur-commutant mixer needs >=2 equal blocks). K must be a
+    and n_gen ~ K^2). kl_max = 8*K per cell (avoids the frozen-kl_max width confound). K must be a
     positive multiple of ``block``; non-multiples are skipped with a warning."""
     cells: List[Dict[str, Any]] = []
     for k in embed_dims:
@@ -510,8 +504,6 @@ def route_grow_k_fixed_block(embed_dims: List[int], block: int) -> List[Dict[str
             continue
         h = k // block
         ov: Dict[str, Any] = {"embed_dim": k, "n_heads": h, "gauge_group": "block_glk", "kl_max": 8 * k}
-        if h < 2:
-            ov["use_head_mixer"] = False                     # 1 block: nothing for the head mixer to mix
         cells.append({"label": f"K{k}_GL{block}", "route": f"grow_K_GL{block}",
                       "scale_knob": "embed_dim", "overrides": ov})
     return cells
@@ -529,8 +521,7 @@ def route_vary_block_fixed_k(
     r"""Fixed K, vary the gauge block size GL(``b``): n_heads = K/b, so block_glk n_gen = K^2/n_heads =
     b*K. FEWER/LARGER blocks (bigger b) = MORE params (n_gen up) -- the opposite sign of a standard
     transformer, and the parameter axis here. This is the ``route_blocksize`` idea written in GL(b) terms
-    (b=K/n_heads). kl_max = 8*K (constant; K is fixed across the route). The single-block b=K cell (one
-    GL(K) frame) drops the head mixer. Each b must divide K; non-divisors are skipped with a warning.
+    (b=K/n_heads). kl_max = 8*K (constant; K is fixed across the route). Each b must divide K; non-divisors are skipped with a warning.
 
     ``gauge_group`` selects the structure group per cell (default ``block_glk``, the untied per-head
     GL(d_head)). ``tag`` overrides the internal cell route
@@ -544,8 +535,6 @@ def route_vary_block_fixed_k(
         h = embed_dim // b
         ov: Dict[str, Any] = {"embed_dim": embed_dim, "n_heads": h, "gauge_group": gauge_group,
                               "kl_max": 8 * embed_dim}
-        if h < 2:
-            ov["use_head_mixer"] = False
         if extra_overrides:
             ov.update(extra_overrides)
         cells.append({"label": f"K{embed_dim}_GL{b}", "route": tag or f"blocks_K{embed_dim}",
@@ -638,8 +627,7 @@ def _scaling_knob_report(cfg: VFE3Config, name: str) -> Dict[str, object]:
 
 def predict_n_params(cfg: VFE3Config) -> Tuple[int, int]:
     r"""Predicted total ``n_params`` and ``n_gen`` for ``cfg``, by building only the (cheap) gauge group
-    and summing the prior-table sizes per ``PriorBank`` (prior_bank.py). Exact on the pure path and for
-    the active head mixer; CG / learnable-scalar tables remain outside this sizing model."""
+    and summing the prior-table sizes per ``PriorBank`` (prior_bank.py). Exact on the pure path; CG / learnable-scalar tables remain outside this sizing model."""
     group = build_group(cfg)
     n_gen = int(group.generators.shape[0])
     V, K = int(cfg.vocab_size), int(cfg.embed_dim)
@@ -654,8 +642,6 @@ def predict_n_params(cfg: VFE3Config) -> Tuple[int, int]:
         n += 2 * V * K                                      # independent routed decode tables
     if cfg.pos_phi == "learned":
         n += int(cfg.max_seq_len) * n_gen                   # pos_phi_free
-    if cfg.use_head_mixer:
-        n += HeadMixer.parameter_count(group.irrep_dims, group.irrep_labels)
     if cfg.use_block_mlp:
         registration = get_block_mlp_registration(cfg.block_mlp_mode)
         n += registration.parameter_count(

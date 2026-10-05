@@ -416,11 +416,6 @@ def build_views(run: Any, ctx: AnalysisContext) -> Dict[str, VectorView]:
                   "the global diagonal rescaling m → Dm.")))
 
         def natural_causal() -> Optional[VectorView]:
-            if getattr(run.cfg, "use_priorbank_head_evidence_mixer", False):
-                notes.append("view decode_natural_causal skipped: with use_priorbank_head_evidence_mixer=True the "
-                             "KL decode weights coordinate k by (1 + head-evidence delta_k), which "
-                             "η_v = (m_v/t_v, −1/(2 t_v))/τ_eff omits, so η_v is not the decode unembedding")
-                return None
             eta = _natural_parameters(run, ids)                             # (n, 2K)
             Z, rank = _causal_rows(eta)
             return VectorView(
@@ -1082,7 +1077,7 @@ def _headline_tables(res: SectionResult, ctx: AnalysisContext) -> str:
             + markdown_table(rows_b, cols_b))
 
 
-_PROBED_CLASS = ("projected-predictive block-GL runs with a coordinate MLP and no head mixer, CG coupling, RoPE or "
+_PROBED_CLASS = ("projected-predictive block-GL runs with a coordinate MLP and no CG coupling, RoPE or "
                  "coordinate normalization")
 _REDUNDANCIES = ("(i) the split e^(X_v) → e^(X_v) k, e^(Y_p) → k⁻¹ e^(Y_p) with one global gauge-group element "
                  "k; (ii) a global right action h on e^(Y_p) compensated in the relational operators; and (iii) a "

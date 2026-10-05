@@ -125,7 +125,7 @@ def test_retired_identity_content_option_is_rejected() -> None:
 
 def test_predictive_bypasses_fisher_step_and_uses_source_content_graph() -> None:
     settings = dict(attention_mode="projected_predictive",
-                    use_block_mlp=False, use_head_mixer=False)
+                    use_block_mlp=False)
     first = VFEModel(_cfg(**settings, e_q_mu_lr=0.0))
     second = VFEModel(_cfg(**settings, e_q_mu_lr=9.0))
     second.load_state_dict(first.state_dict())

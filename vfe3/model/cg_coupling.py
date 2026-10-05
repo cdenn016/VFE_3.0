@@ -11,8 +11,7 @@ zero-initialized so step 0 is byte-identical to the coupling-off path. Equivaria
 for ANY weights because the weights multiply intertwiners. Covariance either passes through
 untouched or uses the explicitly approximate first-order delta closure
 sym(J Sigma J^T) + floor Sigma; a bilinear map of Gaussians has no exact Gaussian pushforward.
-NEURAL-NETWORK EXCEPTION (sanctioned, default-off), the
-use_head_mixer family.
+NEURAL-NETWORK EXCEPTION (sanctioned, default-off).
 """
 
 import math

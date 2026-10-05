@@ -123,8 +123,7 @@ def test_untied_split_rates_follow_independent_precedence_and_preserve_other_rol
     cfg = _config(untie_decode_bank=True, m_decode_mu_lr=mu_rate,
                   m_decode_sigma_lr=sigma_rate,
                   m_p_mu_lr=0.023, m_p_sigma_lr=0.004, m_phi_lr=0.013,
-                  mu_weight_decay=0.07, sigma_weight_decay=0.09, phi_weight_decay=0.11,
-                  m_head_evidence_lr=0.081, use_priorbank_head_evidence_mixer=True)
+                  mu_weight_decay=0.07, sigma_weight_decay=0.09, phi_weight_decay=0.11)
     model = VFEModel(cfg)
     groups = _groups(model, build_optimizer(model, cfg))
     expected = {
@@ -133,7 +132,6 @@ def test_untied_split_rates_follow_independent_precedence_and_preserve_other_rol
         "prior_bank.phi_embed": (0.013, "phi", 0.11),
         "prior_bank.decode_mu_embed": (want_mu, "mu", 0.07),
         "prior_bank.decode_sigma_log_embed": (want_sigma, "sigma", 0.09),
-        "prior_bank.head_evidence_logits": (0.081, "mu", 0.0),
     }
     for name, values in expected.items():
         group = groups[name]

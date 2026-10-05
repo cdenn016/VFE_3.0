@@ -286,28 +286,6 @@ class VFE3Config:
     # that never reweights the canonical q/p/s/h hierarchy. Requires use_cg_coupling=True.
     cg_energy_weight:          float            = 0.0
 
-    #################################
-    #          Head Mixers
-    #################################
-
-    # Head mixer (opt-in, default off): a learned Schur-commutant matrix mixing the equal-size
-    # gauge-irrep blocks (under block_glk: the n_heads heads) of the converged belief. Identity init
-    # -> step-0 bit-identical to off. Breaks strict gauge equivariance under block_glk's untied
-    # per-block gauge (exact at init, deviates as the mixer drifts); an so_n tower mixes per
-    # isotypic component. Needs >= 2 blocks: block_glk with n_heads < 2 auto-disables the mixer with
-    # a warning.
-    use_head_mixer:                    bool = False
-
-    # PriorBank-native per-gauge-block evidence calibration: one zero-initialized scalar per block,
-    # restricted to the built-in canonical KL decode, where its evidence interpretation is fixed.
-    # A separate opt-in from the Schur-commutant post-E-step head mixer above.
-    use_priorbank_head_evidence_mixer: bool = False
-
-    # Optional absolute M-step rates for the two semantically distinct mixer parameter families.
-    # None preserves the historical behavior by inheriting m_p_mu_lr at optimizer construction.
-    m_head_evidence_lr:        Optional[float] = None
-    m_head_mixer_lr:           Optional[float] = None
-
     ####################################
     #       Positional Encoding
     #    BCH gauge-frame PE (pos_phi)
@@ -1101,32 +1079,6 @@ class VFE3Config:
                 f"cg_energy_weight={self.cg_energy_weight} > 0 requires use_cg_coupling=True "
                 f"(the moment-energy regularizer reads the CG coupling's per-layer pushforward)."
             )
-        # The head mixer needs >= 2 gauge blocks to mix. block_glk with n_heads < 2 is a single-HEAD
-        # artifact of a head/K sweep -- nothing to mix -- so AUTO-DISABLE and warn, letting
-        # use_head_mixer=True stay set across a sweep. so_n mixes per isotypic component.
-        if (self.use_head_mixer
-                and self.gauge_group == "block_glk"
-                and self.n_heads < 2):
-            import warnings
-            warnings.warn(
-                f"use_head_mixer=True with gauge_group={self.gauge_group!r} and n_heads={self.n_heads} "
-                f"yields a single gauge block (nothing to mix); auto-disabling use_head_mixer. Set "
-                f"n_heads >= 2 to use the head mixer.",
-                UserWarning,
-                stacklevel=2,
-            )
-            self.use_head_mixer = False
-        if self.use_priorbank_head_evidence_mixer:
-            if self.decode_mode == "linear":
-                raise ValueError(
-                    "use_priorbank_head_evidence_mixer=True requires a prior-bank decode_mode."
-                )
-            if ((self.gauge_group == "block_glk" and self.n_heads < 2)
-                    or (self.gauge_group == "so_n" and len(_block_dims) < 2)):
-                raise ValueError(
-                    "use_priorbank_head_evidence_mixer=True requires at least two gauge blocks. "
-                    f"gauge_group={self.gauge_group!r} does not provide a multi-block PriorBank."
-                )
         # belief family. ``family`` is the SINGLE covariance-structure toggle: a registry key whose
         # declared cov_kind ('diagonal'|'full') is the one source of truth for the diagonal-vs-full
         # path, exposed read-only as the derived ``diagonal_covariance`` property.
@@ -1398,7 +1350,7 @@ class VFE3Config:
         _require(self.content_link_chart, CONTENT_LINK_CHARTS, "content_link_chart")
         # decode_mode / encode_mode validated against the LIVE decode/encode REGISTRIES (not static
         # literals) so a newly registered kernel is config-selectable without editing this validator.
-        from vfe3.model.prior_bank import _DECODERS, _ENCODERS, has_builtin_head_evidence_decoder
+        from vfe3.model.prior_bank import _DECODERS, _ENCODERS
         _require(self.decode_mode, tuple(sorted(_DECODERS)), "decode_mode")
         # decode_mode sets the covariance RANK(s) the prior-bank kernel accepts, via its resolved
         # DecodeRegistration.covariance_kinds: 'diagonal*' -> {'diagonal'}, 'full*' -> {'full'},
@@ -1406,34 +1358,6 @@ class VFE3Config:
         # mismatch is a shape RuntimeError at the first forward. The linear registration discards
         # sigma, so these rank checks apply only to non-linear registrations.
         decode_registration = _DECODERS[self.decode_mode]
-        if self.use_priorbank_head_evidence_mixer:
-            canonical_modes = {
-                "gaussian_diagonal": "diagonal_chunked",
-                "gaussian_full": "full_chunked",
-            }
-            if self.decode_mode != canonical_modes.get(self.family):
-                raise ValueError(
-                    "use_priorbank_head_evidence_mixer=True requires a built-in canonical KL decode: "
-                    "family='gaussian_diagonal' with decode_mode='diagonal_chunked', or "
-                    "family='gaussian_full' with decode_mode='full_chunked'. "
-                    f"Got family={self.family!r}, decode_mode={self.decode_mode!r}."
-                )
-            from vfe3.families.base import _FAMILIES, _FUNCTIONALS, renyi
-            from vfe3.families.gaussian import DiagonalGaussian, FullGaussian
-            canonical_families = {
-                "gaussian_diagonal": DiagonalGaussian,
-                "gaussian_full": FullGaussian,
-            }
-            if (
-                _FAMILIES.get(self.family) is not canonical_families[self.family]
-                or _FUNCTIONALS.get("renyi") is not renyi
-                or not has_builtin_head_evidence_decoder(self.decode_mode)
-            ):
-                raise ValueError(
-                    "use_priorbank_head_evidence_mixer=True requires built-in canonical registry "
-                    "identities for its Gaussian family, the renyi functional, and its KL decoder; "
-                    "registry overrides are not eligible."
-                )
         family_kind = family_cov_kind(self.family)
         if (self.decode_mode != "linear"
                 and family_kind not in decode_registration.covariance_kinds):
@@ -1574,8 +1498,6 @@ class VFE3Config:
             for name in ("norm_type_block", "norm_type_final"):
                 if getattr(self, name) not in ("none", "layernorm"):
                     incompatible.append(f"{name}={getattr(self, name)!r} (requires 'none' or 'layernorm')")
-            if self.use_head_mixer:
-                incompatible.append("use_head_mixer=True (acts in local coordinates before the norm)")
             if self.use_cg_coupling:
                 incompatible.append("use_cg_coupling=True (acts in local coordinates before the norm)")
             if self.use_block_mlp and self.block_mlp_mode not in ("coordinate", "gaussian_template"):
@@ -1626,8 +1548,8 @@ class VFE3Config:
             if not math.isfinite(v) or v < 0.0:
                 raise ValueError(f"{name} must be finite and >= 0, got {v}")
         # Optional absolute rates: None inherits, otherwise a finite real >= 0 (never a bool).
-        for name in ("m_relational_score_lr", "m_relational_content_lr", "m_head_evidence_lr",
-                     "m_head_mixer_lr", "m_pos_phi_lr", "m_layernorm_lr", "m_decode_mu_lr",
+        for name in ("m_relational_score_lr", "m_relational_content_lr",
+                     "m_pos_phi_lr", "m_layernorm_lr", "m_decode_mu_lr",
                      "m_decode_sigma_lr", "m_block_mlp_lr", "m_per_type_hidden_bias_lr"):
             v = getattr(self, name)
             if v is not None and (
@@ -1813,8 +1735,6 @@ class VFE3Config:
         elif self.block_mlp_mode == "gaussian_template":
             mark(("block_mlp_activation", "block_mlp_covariance_floor"),
                  "gaussian_template gates by softmax over template KLs and keeps covariance")
-        if not self.use_priorbank_head_evidence_mixer:
-            mark(("m_head_evidence_lr",), "only read when use_priorbank_head_evidence_mixer=True")
         if self.pos_phi != "learned":
             mark(("m_pos_phi_lr",), "only pos_phi='learned' creates the learnable positional table")
         if "layernorm" not in (self.norm_type_block, self.norm_type_final):
@@ -1903,7 +1823,6 @@ class VFE3Config:
                  "force vanishes")
         if (self.attention_mode == "projected_predictive" and self.family == "gaussian_full"
                 and self.encode_mode in ("per_token", "per_token_additive")
-                and not self.use_head_mixer
                 and self.predictive_covariance == "passthrough"
                 and self.block_coordinates == "local" and self.decode_coordinates == "local"
                 and not (self.use_block_mlp and self.block_mlp_covariance != "passthrough")):
@@ -1912,7 +1831,7 @@ class VFE3Config:
             mark(("family",),
                  "value-identical to gaussian_diagonal under the rank-matched decoder on this "
                  "route: stored covariance is a diagonal token lookup and no seam densifies it; "
-                 "full covariance requires block_mlp_covariance='delta_full', use_head_mixer=True, "
+                 "full covariance requires block_mlp_covariance='delta_full', "
                  "predictive_covariance='moment_matched', or attention_mode='projected_gradient'")
         # Reference coordinates. With identically-I frames xi = mu and C = Sigma exactly, so both
         # selectors are no-ops; without a block norm, final norm or block MLP nothing is conjugated.
@@ -1974,31 +1893,6 @@ class VFE3Config:
         return family_cov_kind(self.family) == "diagonal"
 
     @property
-    def head_mixer_gauge_compatible(self) -> bool:
-        r"""Whether the selected mixer route is an intertwiner for the selected gauge action.
-
-        ``block_glk`` assigns an independent frame to each head, so a trainable cross-head mixer
-        is not in that action's commutant. Isotypic mixing (``so_n``) is exact for full covariance;
-        diagonal dispersion projection is exact only for diagonal gauges. This is metadata only:
-        the established opt-in ``block_glk`` baseline remains selectable and the default remains
-        mixer-off.
-        """
-        compatibility = VFE3Config.head_mixer_compatibility.fget(self)
-        return compatibility in ("disabled", "isotypic_intertwiner")
-
-    @property
-    def head_mixer_compatibility(self) -> str:
-        r"""Truthful label for artifact/config reporting of the selected mixer route."""
-        if not self.use_head_mixer:
-            return "disabled"
-        if self.gauge_group == "block_glk":
-            return "independent_head_nonintertwiner"
-        from vfe3.divergence import family_cov_kind
-        if family_cov_kind(self.family) == "diagonal":
-            return "isotypic_diagonal_projection_nonintertwiner"
-        return "isotypic_intertwiner"
-
-    @property
     def phi_retract_mode(self) -> Literal["bch"]:
         """Fixed E-step phi composition, excluded from serialized configuration."""
         return "bch"
@@ -2051,6 +1945,8 @@ _RETIRED_INERT_FIELDS = frozenset({
     # (frame_pair_fp64_escalation, retired the same day, is a live opt-in field again since
     # 2026-10-04; a saved value loads as saved, and a config without it loads the default False.)
     "transport_clamp_monitor", "exp_fp64_norm_threshold",
+    # 2026-10-05 head-mixer removal: the two mixer rates were read only by the retired mixers.
+    "m_head_mixer_lr", "m_head_evidence_lr",
 })
 # Retired fields with a config-dependent rule in _migrate_retired_fields.
 _RETIRED_CONDITIONAL_FIELDS = frozenset({
@@ -2059,6 +1955,8 @@ _RETIRED_CONDITIONAL_FIELDS = frozenset({
     # 2026-10-02 numerical-policy hardcoding.
     "decode_ce_stable_reduction", "decode_ranking_refinement", "predictive_covariance_centering",
     "min_lr",
+    # 2026-10-05: the Schur head mixer and the PriorBank head-evidence mixer were removed.
+    "use_head_mixer", "use_priorbank_head_evidence_mixer",
 })
 # Every serialized key config_from_serialized migrates or refuses that is not a VFE3Config field.
 RETIRED_CONFIG_KEYS = frozenset(
@@ -2127,6 +2025,11 @@ def _migrate_retired_fields(
         value = payload.pop("e_step_mu_precond")
         if value != "fisher" and gradient_route:
             refuse("e_step_mu_precond", value, " (the receiver mean step is the Fisher natural gradient)")
+
+    for name in ("use_head_mixer", "use_priorbank_head_evidence_mixer"):
+        if name in payload:
+            if _normalize_serialized_boolean(payload.pop(name), name, source=source):
+                refuse(name, True, " (the head mixers were removed 2026-10-05)")
 
     decode_mode = payload.get("decode_mode")
     if isinstance(decode_mode, str) and decode_mode in _DENSE_DECODE_MIGRATIONS:

@@ -633,11 +633,11 @@ def test_diagonal_note_follows_the_shared_redundancy_status() -> None:
     exact = diagonal_redundancy_status(SimpleNamespace(**base))
     ln = diagonal_redundancy_status(SimpleNamespace(**{**base, "norm_type_block": "layernorm",
                                                        "layernorm_affine": False}))
-    mixer = diagonal_redundancy_status(SimpleNamespace(**{**base, "use_head_mixer": True}))
-    assert (exact[0], ln[0], mixer[0]) == ("exact", "broken", "assumed")
+    coupled = diagonal_redundancy_status(SimpleNamespace(**{**base, "use_cg_coupling": True}))
+    assert (exact[0], ln[0], coupled[0]) == ("exact", "broken", "assumed")
     assert "so D0 is a gauge fixing" in F._diagonal_note(*exact)
     assert "not a gauge fixing" in F._diagonal_note(*ln) and "LayerNorm" in F._diagonal_note(*ln)
-    assert "assumed, not verified" in F._diagonal_note(*mixer) and "use_head_mixer" in F._diagonal_note(*mixer)
+    assert "assumed, not verified" in F._diagonal_note(*coupled) and "use_cg_coupling" in F._diagonal_note(*coupled)
 
 
 def test_run_phi_section_qualifies_invariance_when_barycenter_is_unconverged(tmp_path: Path,

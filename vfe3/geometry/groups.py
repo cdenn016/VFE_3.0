@@ -485,9 +485,7 @@ def _build_so_n(
     'l0' (trivial) blocks carry ZERO generators: those coordinates are gauge-invariant by
     construction. Unequal block dims are supported end-to-end (per-block energy loop,
     per-head tau = kappa_h sqrt(d_h)); equal-dims specs (one label, mult > 1) additionally
-    keep the fused factored-transport fast path and the Schur-commutant head mixer (kron(A, I_d)
-    IS the commutant of mult copies of one irrep, and the tied gauge keeps it exactly
-    equivariant).
+    keep the fused factored-transport fast path.
     """
     if group_n is None or irrep_spec is None:
         raise ValueError(

@@ -93,7 +93,6 @@ from vfe3.data.datasets import (
 )
 from vfe3.metrics import (
     attention_entropy,
-    head_mixer_gauge_residual,
     rank_one_residual,
 )
 from vfe3.model.model import VFEModel
@@ -241,9 +240,9 @@ CONFIG: Dict[str, Any] = {
     "list_only":   False,
 
     # One sweep name, or None -> every sweep in SWEEP_ORDER.
-    # New attention suite: "new_attention_features" (4 arms x NEW_ATTENTION_SEEDS).
+    # New attention suite: "new_attention_features" (3 arms x NEW_ATTENTION_SEEDS).
     # Smaller subset: "relational_features".
-    "sweep":       None,   #"new_attention_features" 4-arms; "relational_features" is the same subset
+    "sweep":       None,   #"new_attention_features" 3-arms; "relational_features" is the same subset
 
 
     # 'auto' picks CUDA when present (the RTX 5090), else CPU.
@@ -347,8 +346,6 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #################################
     decode_bias                       = True,     # only for decode_mode='linear'
     
-    use_head_mixer                    = False,   # opt-in Schur-commutant head mixer (needs >=2 blocks: block_glk heads OR an so_n irrep tower with per-isotypic-component mixing);
-    use_priorbank_head_evidence_mixer = False,
                                          
     
     decode_mode                       = 'linear',  # prior-bank: diagonal_chunked/full_chunked/expected_likelihood_chunked/family_chunked
@@ -486,8 +483,6 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
    
     m_block_mlp_lr            = 0.001,
     
-    m_head_mixer_lr           = 0.025,     #  post-belief Schur HeadMixer parameters
-    m_head_evidence_lr        = None,      # active only with use_priorbank_head_evidence_mixer
 
     
     m_per_type_hidden_bias_lr = None,      # None inherits the declared m_phi_lr; active only with per_type_hidden_bias
@@ -626,7 +621,6 @@ SWEEP_ORDER: List[str] = [
   # "block_mlp_dropout",
  
    
- #   "m_head_mixer_lr",
    #"unigram_kappa",
    
  
@@ -764,12 +758,6 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
      },
 
 
-    "m_head_mixer_lr": {
-        "description": "M-step LR for the head mixer",
-        "param": "m_head_mixer_lr", 
-        "log_range": [0.001, 0.1, 10],  
-        "scale": "log",
-    },
     
     
     "weight_decay": {
@@ -1001,17 +989,14 @@ _ATTENTION_REQUIRES = {
     "gauge_group": "block_glk",
     "gauge_transport": "on", "pos_rotation": "none",
     "encode_mode": "per_token", "decode_mode": "linear",
-    "use_priorbank_head_evidence_mixer": False,
     "attention_mode": "projected_predictive",
     "m_relational_score_lr": None, "m_relational_content_lr": None,
-    "use_head_mixer": True,
 }
 # Conditional identity-content and transported cross-block controls were retired with
 # their architectures. They cannot be replaced by a projected-gradient label.
 _ATTENTION_ARMS = {
     "relational_features": [
         {"label": "relational_reference"},
-        {"label": "relational_no_head_mixer", "use_head_mixer": False},
         {"label": "relational_frozen_score", "m_relational_score_lr": 0.0},
         {"label": "relational_frozen_content", "m_relational_content_lr": 0.0},
     ],
@@ -1025,7 +1010,7 @@ for _attention_name, _attention_arms in _ATTENTION_ARMS.items():
         "configs": _attention_arms,
     }
 SWEEPS["new_attention_features"] = {
-    "description": "Four full-width projected attention feature controls",
+    "description": "Three full-width projected attention feature controls",
     "requires": _ATTENTION_REQUIRES,
     "seeds": NEW_ATTENTION_SEEDS,
     "schedule_seed": 20260913,
@@ -1037,7 +1022,7 @@ SWEEPS["component_ablation_forest"] = {
     "description": "paired-token component ablation forest",
     "configs": [
         {"label": "baseline"},
-        {"label": "head_mixer_off", "use_head_mixer": False},
+        # The head_mixer_off arm was removed with the head mixer (2026-10-05); add component arms here.
     ],
     "paired_token_bootstrap": True,
     "forest_baseline_label": "baseline",
@@ -1733,8 +1718,6 @@ def _gauge_reporting_fields(
     toggles = report["config_toggles"]
     gauge_flags = report["gauge_flags"]
     return {
-        "head_mixer_compatibility":          cfg.head_mixer_compatibility,
-        "head_mixer_gauge_compatible":       bool(cfg.head_mixer_gauge_compatible),
         "block_mlp_structural_mode":         str(toggles["block_mlp_structural_mode"]),
         "block_mlp_covariance_contract":     str(toggles["block_mlp_covariance_contract"]),
         "block_mlp_intertwiner_compatible":  bool(gauge_flags["block_mlp_intertwiner_compatible"]),
@@ -1795,8 +1778,6 @@ def _cell_diagnostics(
       * ``attn_entropy``        mean attention-row entropy H(beta)                       [C1/EXP-4]
       * ``omega_identity_dev``  max |Omega_ij - I| over off-diagonal pairs (confirms     [A1/EXP-2]
                                 gauge_transport='off' gives Omega = I to float eps)
-      * ``builder_resid``       median builder-break gauge residual of the head mixer    [A2/EXP-9]
-                                (eps under the tied gauge, grows under the untied one)
       * ``gauge_resid_in``      worst relative gauge-equivariance residual of the        [A1/EXP-2,
                                 projected routing and readout over layers (float64)       A3/EXP-10]
                                 (``viz.extract.projected_gauge_equivariance``)
@@ -1838,17 +1819,6 @@ def _cell_diagnostics(
         eye = torch.eye(k, device=omega.device, dtype=omega.dtype)
         return (omega[off] - eye).abs().max()
     _probe("omega_identity_dev", _omega_identity_dev)
-
-    # Pass the diagonal/full flag explicitly (cfg.diagonal_covariance) rather than letting the
-    # metrics infer it from shape -- a diagonal sigma is (N, K), which is ambiguous with a full
-    # (N, K, K) whenever the sequence length N happens to equal K.
-    diag = cfg.diagonal_covariance
-    if model.head_mixer is not None:
-        def _builder_resid() -> torch.Tensor:
-            r = head_mixer_gauge_residual(cstate["mu"], cstate["sigma"], model.head_mixer, model.group,
-                                          diagonal=diag)
-            return torch.cat([r["mu_residual"], r["sigma_residual"]]).median()
-        _probe("builder_resid", _builder_resid)
 
     def _gauge_resid() -> float:
         res = projected_gauge_equivariance(model, token_ids)["residuals"]
@@ -2166,12 +2136,11 @@ _CSV_COLUMNS = [
     "final_val_ce", "final_val_bits_per_token", "final_val_bpc", "best_val_ppl", "final_train_loss",
     "n_params", "target_n_params", "param_difference", "param_relative_deviation",
     "n_steps", "max_steps", "stop_after_steps",
-    "head_mixer_compatibility", "head_mixer_gauge_compatible",
     "block_mlp_structural_mode", "block_mlp_covariance_contract",
     "block_mlp_intertwiner_compatible", "on_gauge_pure_path", "on_causal_lm_path",
     "transport_exactness_status", "on_theory_pure_path",
     # opt-in per-cell converged-state diagnostics (S2; empty unless the sweep sets collect_diagnostics)
-    "attn_entropy", "omega_identity_dev", "builder_resid", "gauge_resid_in",
+    "attn_entropy", "omega_identity_dev", "gauge_resid_in",
     "rank_resid", "energy_klmax_frac",
     # opt-in paired-token artifact identity (PB-07; empty unless the sweep sets paired_token_bootstrap)
     "paired_token_bootstrap", "val_token_nats_path", "val_token_nats_sha256",
@@ -2180,7 +2149,7 @@ _CSV_COLUMNS = [
 ]
 
 _DIAGNOSTIC_RESULT_KEYS = {
-    "attn_entropy", "omega_identity_dev", "builder_resid", "gauge_resid_in",
+    "attn_entropy", "omega_identity_dev", "gauge_resid_in",
     "rank_resid", "rank_resid_by_layer", "energy_klmax_frac",
 }
 _BASE_REQUIRED_DIAGNOSTIC_KEYS = {
@@ -2924,10 +2893,6 @@ def _expected_cell_contract_from_aggregation(
 
 def _gauge_purity_summary(results: List[Dict[str, Any]]) -> Dict[str, object]:
     """Summarize row-level gauge classifications without collapsing mixed sweeps into a pure claim."""
-    classifications = {
-        str(result["label"]): str(result["head_mixer_compatibility"])
-        for result in results
-    }
     mlp_modes = {
         str(result["label"]): str(result.get("block_mlp_structural_mode", "unavailable"))
         for result in results
@@ -2941,14 +2906,9 @@ def _gauge_purity_summary(results: List[Dict[str, Any]]) -> Dict[str, object]:
         for result in results
     }
     return {
-        "classifications_by_label": classifications,
         "block_mlp_structural_modes_by_label": mlp_modes,
         "block_mlp_covariance_contracts_by_label": mlp_covariance,
         "block_mlp_intertwiner_compatible_by_label": mlp_intertwiner_compatible,
-        "contains_independent_head_nonintertwiner": any(
-            value == "independent_head_nonintertwiner"
-            for value in classifications.values()
-        ),
         "contains_coordinate_mean_only_nonintertwiner": any(
             value == "coordinate_mean_only_nonintertwiner"
             for value in mlp_modes.values()
@@ -3979,8 +3939,6 @@ def run_sweep(
                 "param_relative_deviation": parameter_record["param_relative_deviation"],
             })
         reporting_fields = expected_gauge_fields or {
-            "head_mixer_compatibility":         "unavailable",
-            "head_mixer_gauge_compatible":      False,
             "block_mlp_structural_mode":        "unavailable",
             "block_mlp_covariance_contract":    "unavailable",
             "block_mlp_intertwiner_compatible": False,
@@ -4413,26 +4371,15 @@ def _gauge_disclosure_text(gauge_purity: object) -> str:
     """Return the explicit gauge/structural disclosure printed on every ablation figure."""
     if not isinstance(gauge_purity, Mapping):
         return "Gauge classification: unavailable"
-    classifications = gauge_purity.get("classifications_by_label")
-    values = (
-        sorted({str(value) for value in classifications.values()})
-        if isinstance(classifications, Mapping) else []
-    )
-    value_text = ", ".join(values) if values else "unavailable"
     if gauge_purity.get("contains_coordinate_mean_only_nonintertwiner") is True:
         return (
             "Gauge classification: coordinate_mean_only_nonintertwiner present; "
             "block MLP is mean-only with covariance passthrough, not a Gaussian pushforward; "
             "this figure is not gauge-pure"
         )
-    if gauge_purity.get("contains_independent_head_nonintertwiner") is True:
-        return (
-            "Gauge classification: independent_head_nonintertwiner present; "
-            "this figure is not gauge-pure"
-        )
     if gauge_purity.get("all_rows_on_gauge_pure_path") is True:
-        return f"Gauge classification: all rows gauge-pure; head mixer(s): {value_text}"
-    return f"Gauge classification: not all rows are gauge-pure; head mixer(s): {value_text}"
+        return "Gauge classification: all rows gauge-pure"
+    return "Gauge classification: not all rows are gauge-pure"
 
 
 def _sweep_gauge_purity(sweep_dir: Path) -> object:
@@ -4741,42 +4688,6 @@ def _plot_kappa_dispersion(sweep_dir: Path, fig_dir: Path) -> None:
     print(f"  figure -> {out}")
 
 
-def _plot_gauge_residual_drift(sweep_dir: Path, fig_dir: Path) -> None:
-    r"""A2/EXP-9 builder-break gauge residual vs step (tied vs untied) from each cell's metrics.csv
-    ``val_builder_resid`` eval series. No-op unless >= 2 cells carry >= 2 eval points."""
-    arms: List[Dict[str, Any]] = []
-    for run_dir in _compatible_cell_dirs(sweep_dir):
-        cell = run_dir / "metrics.csv"
-        if not cell.is_file():
-            continue
-        steps, res = [], []
-        try:
-            with open(cell, newline="", encoding="utf-8") as fh:
-                for row in csv.DictReader(fh):
-                    rv = _as_float(row.get("val_builder_resid"))
-                    if rv < float("inf"):                              # eval rows carry the residual
-                        steps.append(_as_float(row.get("step")))
-                        res.append(rv)
-        except Exception:                                             # unreadable metrics.csv -> skip
-            continue
-        if len(res) >= 2:
-            arms.append({"label": cell.parent.name, "step": steps, "resid": res})
-    if len(arms) < 2:
-        return
-    plt = _plt_or_none()
-    if plt is None:
-        return
-    try:
-        from vfe3.viz.figures import plot_gauge_residual_drift
-    except Exception as exc:
-        print(f"gauge-residual-drift figure unavailable ({exc}); skipping")
-        return
-    fig_dir.mkdir(exist_ok=True)
-    out = fig_dir / f"{sweep_dir.name}_residual_drift.png"
-    _save_ablation_figure(plot_gauge_residual_drift(arms), out, sweep_dir, plt)
-    print(f"  figure -> {out}")
-
-
 def _plot_mu_precond(sweep_dir: Path, fig_dir: Path) -> None:
     r"""B3/EXP-14 PPL-vs-n_e_steps figure, Fisher vs raw mean preconditioner, from the
     fisher_mu_precond cells (label '<precond>_T<n_e_steps>'). No-op unless >= 2 such cells finished."""
@@ -4875,9 +4786,8 @@ def _plot_pos_extrapolation(sweep_dir: Path, fig_dir: Path) -> None:
 
 def _sensitivity_gauge_label(row: Mapping[str, object]) -> str:
     """Return the complete structural gauge label used by cross-sweep bars."""
-    head_mixer = str(row.get("head_mixer_compatibility") or "unavailable")
     block_mlp = str(row.get("block_mlp_structural_mode") or "unavailable")
-    return f"head_mixer={head_mixer}; block_mlp={block_mlp}"
+    return f"block_mlp={block_mlp}"
 
 
 def _plot_sensitivity(
@@ -4933,20 +4843,7 @@ def _plot_sensitivity(
     ax.set_xlabel("validation PPL range (worst - best)")
     ax.set_title("hyperparameter sensitivity")
     fig.tight_layout()
-    classifications = {
-        f"{index}:{label}": value
-        for index, summary in enumerate(gauge_summaries)
-        for label, value in (
-            summary.get("classifications_by_label", {}).items()
-            if isinstance(summary.get("classifications_by_label"), Mapping) else ()
-        )
-    }
     _annotate_gauge_disclosure(fig, {
-        "classifications_by_label": classifications,
-        "contains_independent_head_nonintertwiner": any(
-            summary.get("contains_independent_head_nonintertwiner") is True
-            for summary in gauge_summaries
-        ),
         "contains_coordinate_mean_only_nonintertwiner": any(
             summary.get("contains_coordinate_mean_only_nonintertwiner") is True
             for summary in gauge_summaries
@@ -5035,7 +4932,6 @@ def _render_sweep_figures(sweep_dir: Path, fig_dir: Path) -> None:
     _plot_gauge_transport(sweep_dir, fig_dir)
     _plot_cg_coupling(sweep_dir, fig_dir)
     _plot_kappa_dispersion(sweep_dir, fig_dir)
-    _plot_gauge_residual_drift(sweep_dir, fig_dir)
     _plot_pos_extrapolation(sweep_dir, fig_dir)
     _plot_renyi_saturation(sweep_dir, fig_dir)
     _plot_mu_precond(sweep_dir, fig_dir)

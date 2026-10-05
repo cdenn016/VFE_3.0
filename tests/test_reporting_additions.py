@@ -289,8 +289,7 @@ def _pure_ns(**over):
     r"""SimpleNamespace with every attribute _pure_path_report reads, at the pure values."""
     base = dict(
         lambda_alpha_mode="constant",
-        decode_mode="diagonal_chunked", decode_coordinates="reference", use_head_mixer=False,
-        use_priorbank_head_evidence_mixer=False, encode_mode="per_token",
+        decode_mode="diagonal_chunked", decode_coordinates="reference", encode_mode="per_token",
         lambda_beta=1.0,
         gauge_transport="on", pos_rotation="none", rope_on_value=True,
         skip_belief_sigma_update=False,
@@ -302,7 +301,6 @@ def _pure_ns(**over):
         block_mlp_expansion=4, block_mlp_covariance_floor=1e-4,
         block_mlp_activation="gelu", block_mlp_dropout=0.0,
         m_block_mlp_lr=None, m_p_mu_lr=1e-3,
-        head_mixer_compatibility="disabled", head_mixer_gauge_compatible=True,
         sigma_max=None,
         norm_type_block="none", norm_type_final="none", layernorm_affine=False,
         m_phi_update_mode="adamw", m_phi_group_trust_radius=0.1,
@@ -336,37 +334,9 @@ def test_pure_path_report_structure_and_flags():
     assert rep["converged_stress"]["cocycle_residual"] == 1e-7
     assert rep["pure_flags"]["canonical_attention_entropy"] is False
     # Optional components retain independent flags despite the unavailable shared objective.
-    impure = types.SimpleNamespace(**{**pure.__dict__, "use_head_mixer": True})
+    impure = types.SimpleNamespace(**{**pure.__dict__, "use_block_mlp": True})
     rep2 = _pure_path_report(impure, history)
-    assert rep2["on_pure_path"] is False and rep2["pure_flags"]["no_head_mixer"] is False
-
-
-def test_pure_path_report_marks_priorbank_head_evidence_mixer_as_opt_in():
-    rep = _pure_path_report(_pure_ns(
-        use_priorbank_head_evidence_mixer=True,
-        encode_mode="canonical_content_projected",
-    ), [])
-
-    assert rep["on_pure_path"] is False
-    assert rep["pure_flags"]["no_priorbank_head_evidence_mixer"] is False
-    assert rep["config_toggles"]["use_priorbank_head_evidence_mixer"] is True
-    assert rep["config_toggles"]["encode_mode"] == "canonical_content_projected"
-    assert rep["config_toggles"]["priorbank_head_evidence_role"] == "decoder_kl_irrep_weights"
-
-
-def test_pure_path_report_keeps_priorbank_evidence_role_separate_from_head_mixer():
-    rep = _pure_path_report(_pure_ns(
-        use_head_mixer=True,
-        use_priorbank_head_evidence_mixer=False,
-        encode_mode="canonical_content_gauge",
-    ), [])
-
-    assert rep["pure_flags"]["no_head_mixer"] is False
-    assert rep["pure_flags"]["no_priorbank_head_evidence_mixer"] is True
-    assert rep["config_toggles"]["use_head_mixer"] is True
-    assert rep["config_toggles"]["use_priorbank_head_evidence_mixer"] is False
-    assert rep["config_toggles"]["encode_mode"] == "canonical_content_gauge"
-    assert rep["config_toggles"]["priorbank_head_evidence_role"] == "inactive"
+    assert rep2["on_pure_path"] is False and rep2["pure_flags"]["no_block_mlp"] is False
 
 
 def test_gauge_purity_axis_is_independent_of_fe_axis():
@@ -406,7 +376,6 @@ def _finalize_ns(**over):
 
         # numeric-path attrs (summary / provenance / cost model / pure-path report)
         seed=0, max_steps=2, decode_mode="full_chunked", decode_bias=False,
-        use_head_mixer=False,
         min_lr_frac=0.0,
         lambda_alpha_mode="constant",
         lambda_beta=1.0,
@@ -1125,12 +1094,12 @@ def test_ablation_renderer_dispatches_registered_figures_by_name_and_keeps_legac
     monkeypatch.setattr(ablation, "_cleanup", lambda: None)
 
     monkeypatch.setattr(ablation, "BASELINE_CONFIG", config_values(
-        max_seq_len=8, use_head_mixer=True, attention_mode="projected_predictive",
+        max_seq_len=8, attention_mode="projected_predictive",
         family="gaussian_full", decode_mode="full_chunked",
         max_steps=2, warmup_steps=1))
     monkeypatch.setattr(ablation, "SWEEPS", {"component_ablation_forest": {
         "description": "paired-token component ablation forest",
-        "configs": [{"label": "baseline"}, {"label": "head_mixer_off", "use_head_mixer": False}],
+        "configs": [{"label": "baseline"}, {"label": "lambda_beta_half", "lambda_beta": 0.5}],
         "paired_token_bootstrap": True, "forest_baseline_label": "baseline"}})
     monkeypatch.setattr(ablation, "CONFIG", dict(
         list_only=False, sweep="component_ablation_forest", device="cpu",
@@ -1139,7 +1108,7 @@ def test_ablation_renderer_dispatches_registered_figures_by_name_and_keeps_legac
         max_param_relative_deviation=0.02, resume=False, output_dir=str(tmp_path)))
     monkeypatch.setattr(ablation, "DATA_SEED", 3)
 
-    forest_offsets = {"baseline": 0.0, "head_mixer_off": 0.4}
+    forest_offsets = {"baseline": 0.0, "lambda_beta_half": 0.4}
 
     def fake_run_single(label, overrides, run_dir, **kwargs):
         run_dir.mkdir(parents=True, exist_ok=True)

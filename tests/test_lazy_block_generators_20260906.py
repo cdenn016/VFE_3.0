@@ -157,7 +157,7 @@ def test_complete_training_projection_and_reports_remain_lazy(layers: int,
     cfg = test_config(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=4,
                     n_layers=layers, n_e_steps=1, gauge_group="block_glk",
                     decode_mode="linear", pos_phi="learned",
-                    phi_mstep_max_matrix_norm=12.0, use_head_mixer=True,
+                    phi_mstep_max_matrix_norm=12.0,
                     use_block_mlp=True, block_mlp_expansion=2, warmup_steps=1,
                     max_steps=4, batch_size=1, amp_dtype=None)
     monkeypatch.setattr(groups, "generate_glk_multihead", _forbid_dense)

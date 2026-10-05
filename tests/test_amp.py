@@ -130,12 +130,11 @@ def test_bf16_backward_reaches_prior_tables():
     assert model.prior_bank.mu_embed.grad.abs().sum() > 0
 
 
-def test_bf16_head_mixer_validation_diagnostics_run_in_fp32():
-    r"""A bf16 head-mixer forward must leave the off-graph diagnostic replay in fp32."""
+def test_bf16_validation_diagnostics_run_in_fp32():
+    r"""A bf16 forward must leave the off-graph diagnostic replay in fp32."""
     model = _tiny_model(
         amp_dtype="bf16",
         gauge_group="block_glk",
-        use_head_mixer=True,
     )
     tok = torch.randint(0, 20, (2, 5))
     tgt = torch.randint(0, 20, (2, 5))

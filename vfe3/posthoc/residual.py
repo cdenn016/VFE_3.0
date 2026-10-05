@@ -11,7 +11,7 @@ converged mean), every scored target position :math:`i` of an evaluation pass co
 These are the definitions of the in-training probe (``vfe3.train._residual_and_attention_rows``, which
 writes ``diagnostics/residual_ratio.csv``): :func:`residual_token_values` evaluates them on the same
 diagnostic capture fields, and :func:`ln_change_applicability` uses the training probe's own conditions
-(``vfe3.train._residual_update_is_additive``, the block norm, no head mixer or CG coupling between the
+(``vfe3.train._residual_update_is_additive``, the block norm, no CG coupling between the
 E-step and the norm). The training probe covers every position of 8 fixed validation windows at eval
 cadence; here the population is the scored targets of the evaluation protocol, so every position of a
 split counts exactly once. Quantiles use linear interpolation in float64 over the float32 per-token
@@ -53,8 +53,6 @@ def ln_change_applicability(model: torch.nn.Module) -> Tuple[bool, Optional[str]
 
     if getattr(model, "block_norm", None) is None:
         return False, "the block has no normalization (norm_type_block='none')"
-    if getattr(model, "head_mixer", None) is not None:
-        return False, "a head mixer sits between the E-step and the norm, which then does not see mu + m"
     if getattr(model, "cg_coupling", None) is not None:
         return False, "a CG coupling sits between the E-step and the norm, which then does not see mu + m"
     if not _residual_update_is_additive(model):

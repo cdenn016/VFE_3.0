@@ -5,15 +5,14 @@ mu_p_next = (1 - rho) mu_p + rho mu_q (rho = prior_handoff_rho); sigma_p frozen 
 embedding by default; phi flows through the belief, not the prior. Uncaptured
 all-predictive stacks omit this arithmetic when no prior consumer is enabled.
 
-Placement note (audit 2026-06-09 overnight F23): the opt-in head_mixer / cg_coupling run
+Placement note (audit 2026-06-09 overnight F23): the opt-in cg_coupling runs
 inside each block after its E-step and before its norm; the opt-in block MLP runs after
-that norm. All three transforms precede handoff, so the belief
+that norm. Both transforms precede handoff, so the belief
 handed off above is the POST-transform belief — at n_layers > 1 the transforms recurse
-into every subsequent block's prior. The manuscript places the mixer in the single
-W_O-readout slot (Manuscripts-Theory/GL(K)_attention.tex) and concedes genuine
-cross-head capacity at depth > 1, but does not state this per-block prior-handoff
-recursion; the pre-transform converged belief and the live prior entering the final
-block stay available via the ``capture`` out-param (the M-step self-coupling reads
+into every subsequent block's prior. The manuscript places head mixing in the single
+W_O-readout slot (Manuscripts-Theory/GL(K)_attention.tex); the head mixer was removed
+2026-10-05, since the learned relational maps T and O already read and write across heads.
+The pre-transform converged belief and the live prior entering the final block stay available via the ``capture`` out-param (the M-step self-coupling reads
 them from there).
 """
 
@@ -65,10 +64,8 @@ def vfe_stack(
     block_norm:      Optional[Callable[..., torch.Tensor]]   = None,      # cached norm instance (None -> off)
     block_mlps:      Optional[Sequence[Callable]]            = None,      # one selected residual transform per block
     block_mlp_frame: Optional[CanonicalFrameContext]         = None,      # shared fixed vertex frame for canonical mode
-    head_mixer:      Optional[Callable[..., 'tuple']]        = None,      # opt-in Schur head mixer (None -> off)
     cg_coupling:     Optional[Callable[..., 'tuple']]        = None,      # opt-in CG cross-type coupling (None -> off)
     lambda_beta:     'float | torch.Tensor'                  = 1.0,       # belief-coupling weight (cfg.lambda_beta)
-    _need_final_covariance: bool                             = True,      # private ordinary loss; earlier handoffs need sigma
 
     capture:         Optional[MStepCapture]        = None,   # out-param: LAST block's converged belief + live prior
     grad_record:     Optional[EStepGradientRecord] = None,   # diag out-param: LAST block's E-step belief-grad norms (None -> no capture)
@@ -119,7 +116,7 @@ def vfe_stack(
                        if block_mlp_hidden_biases is not None else None)
         block_extra = {} if hidden_bias is None else {"hidden_bias": hidden_bias}
         belief = vfe_block(belief, mu_p, sigma_p, group, cfg, log_prior=log_prior,
-                           block_norm=block_norm, head_mixer=head_mixer, cg_coupling=cg_coupling,
+                           block_norm=block_norm, cg_coupling=cg_coupling,
                            block_mlp=(block_mlps[layer_index] if block_mlps is not None else None),
                            block_mlp_frame=block_mlp_frame,
                            lambda_beta=lambda_beta,
@@ -130,8 +127,6 @@ def vfe_stack(
                            relational_value_frame=relational_value_frame,
                            relational_capture=relational_capture,
                            tau=tau_b,
-                           _need_mixer_covariance=(
-                               _need_final_covariance or layer_index < cfg.n_layers - 1),
                            capture=capture, grad_record=grad_record,   # each block overwrites; last wins
                            state_record=(diagnostic_capture.setdefault(
                                "e_step_trace", {"sequence_index": 0})

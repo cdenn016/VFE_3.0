@@ -510,8 +510,6 @@ def channel_rows(channel: str, run: Any, ids: np.ndarray, *, frame_ref_count: in
             Z, rank = _causal_rows(run.decode_W(ids))
             return ids, Z, {"view": "decode_W_causal", "rank": int(rank)}
         if run.decode_kind == "gaussian":
-            if getattr(run.cfg, "use_priorbank_head_evidence_mixer", False):
-                raise _ChannelSkipped("the head-evidence mixer reweights the KL decode, so η_v is not its unembedding")
             Z, rank = _causal_rows(_natural_parameters(run, ids))
             return ids, Z, {"view": "decode_natural_causal", "rank": int(rank)}
         raise _ChannelSkipped(f"decode kind {run.decode_kind!r} has no causal decode view")

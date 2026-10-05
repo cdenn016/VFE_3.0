@@ -71,7 +71,7 @@ def main() -> None:
         family="gaussian_diagonal", attention_mode="projected_gradient",
         predictive_covariance="passthrough", attention_residual=False,
 
-        use_block_mlp=False, use_head_mixer=False, use_cg_coupling=False,
+        use_block_mlp=False, use_cg_coupling=False,
         norm_type_block="none", norm_type_final="none", layernorm_affine=False,
         decode_mode="diagonal_chunked", decode_bias=False, decode_unigram_prior=False,
         untie_decode_bank=False, pos_phi="none",
