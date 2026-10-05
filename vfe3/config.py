@@ -237,8 +237,19 @@ class VFE3Config:
 
     # Structure group of the flat phi-cocycle Omega_ij = exp(phi_i) exp(-phi_j). block_glk: one
     # independent GL(d_head) frame per head. so_n: one shared SO(group_n) element acting through
-    # the irrep blocks of irrep_spec, which on the projected routes must be n_heads equal blocks.
+    # the irrep blocks of irrep_spec, one block per head (blocks may differ in size).
     gauge_group:               str   = "block_glk"   # "block_glk" | "so_n"
+
+    # Frame tying across heads. "per_head": an independent group element per head block;
+    # "shared": one element acting on every head. None resolves to the group's native tying
+    # (block_glk "per_head", so_n "shared"), so a saved config without the key loads unchanged.
+    #   block_glk "shared": U = I_H (x) g, g in GL(d_head), n_gen = d_head^2 (the diagonal subgroup).
+    #     No generator lives on one head, so the per-block metrics, pullback_group, fisher_group and
+    #     the group_log retraction are refused; frames take the dense transport route.
+    #   so_n "per_head": block b carries rho_b(g_b) for its own g_b in SO(group_n), n_gen =
+    #     dim so(group_n) per nontrivial block. CG coupling is refused: an intertwiner commutes
+    #     only with the diagonal action of one shared element.
+    gauge_tying:               Optional[str] = None  # None | "per_head" | "shared"
 
     # Ablation meta-toggle over the GL(K) gauge FRAME (whether the per-token frame exists at all).
     #   "on"     (default, PURE PATH) the frame is whatever phi_scale / m_phi_lr / pos_phi specify
@@ -984,6 +995,19 @@ class VFE3Config:
                 f"embed_dim={self.embed_dim} must be divisible by n_heads={self.n_heads}"
             )
 
+        # Frame tying resolves to the group's native value when unset.
+        from vfe3.geometry.groups import GAUGE_TYINGS
+        if self.gauge_tying is None:
+            self.gauge_tying = "shared" if self.gauge_group == "so_n" else "per_head"
+        _require(self.gauge_tying, GAUGE_TYINGS, "gauge_tying")
+        if (self.gauge_group == "block_glk" and self.gauge_tying == "shared"
+                and self.phi_precond_mode in ("killing_per_block", "pullback_per_block")):
+            raise ValueError(
+                f"phi_precond_mode={self.phi_precond_mode!r} is incompatible with gauge_group="
+                f"'block_glk' and gauge_tying='shared': every generator I_H (x) E_ab acts on all "
+                f"heads, so a per-block metric is undefined. Use 'none', 'clip', or 'killing'."
+            )
+
         # gauge seam. so_n irrep tower: validate group_n + irrep_spec at construction (labels
         # resolve, block dims sum to embed_dim) so a bad spec fails here with the computed dims.
         if self.gauge_group == "so_n":
@@ -1033,8 +1057,9 @@ class VFE3Config:
                     f"n_heads={self.n_heads}"
                 )
             # One shared phi drives EVERY block, so the generators do not partition per block:
-            # the per-block phi preconditioners are undefined.
-            if self.phi_precond_mode in ("killing_per_block", "pullback_per_block"):
+            # the per-block phi preconditioners are undefined (untied so_n partitions them).
+            if (self.gauge_tying == "shared"
+                    and self.phi_precond_mode in ("killing_per_block", "pullback_per_block")):
                 raise ValueError(
                     f"phi_precond_mode={self.phi_precond_mode!r} is incompatible with "
                     f"gauge_group={self.gauge_group!r}: the shared so generators act in every "
@@ -1050,6 +1075,12 @@ class VFE3Config:
             raise ValueError(
                 f"use_cg_coupling requires the irrep-labeled tower group 'so_n'; got "
                 f"gauge_group={self.gauge_group!r}"
+            )
+        if self.use_cg_coupling and self.gauge_tying != "shared":
+            raise ValueError(
+                "use_cg_coupling requires gauge_tying='shared': a Clebsch-Gordan intertwiner commutes "
+                "with the diagonal action of ONE group element on the coupled blocks, and an untied "
+                "so_n acts on each block by its own element"
             )
         # CG moment-closure. 'delta_full' needs a full-covariance Gaussian family (the dense
         # J Sigma J^T cannot be stored diagonally). The q-only moment regularizer weight must be a
@@ -1218,6 +1249,8 @@ class VFE3Config:
             fisher_problems = []
             if self.gauge_group != "block_glk":
                 fisher_problems.append(f"gauge_group='block_glk'; got {self.gauge_group!r}")
+            elif self.gauge_tying != "per_head":
+                fisher_problems.append(f"gauge_tying='per_head'; got {self.gauge_tying!r}")
             if self.encode_mode != "per_token":
                 fisher_problems.append(f"encode_mode='per_token'; got {self.encode_mode!r}")
             if self.pos_phi not in ("none", "learned", "frozen"):
@@ -1241,11 +1274,18 @@ class VFE3Config:
                     f"{self.phi_precond_mode!r}; phase one requires a built-in bracket-closed "
                     "full/per-block pullback pairing"
                 )
-            if self.gauge_group != "block_glk":
+            if self.gauge_group != "block_glk" or self.gauge_tying != "per_head":
                 raise ValueError(
                     "pullback_group phase one accepts only untied block_glk; "
-                    f"got gauge_group={self.gauge_group!r}"
+                    f"got gauge_group={self.gauge_group!r}, gauge_tying={self.gauge_tying!r}"
                 )
+        if (phi_update_policy.requires_manifold_optimizer and self.m_phi_group_retraction == "group_log"
+                and (self.gauge_group != "block_glk" or self.gauge_tying != "per_head")):
+            raise ValueError(
+                "m_phi_group_retraction='group_log' reads the chart as per-head d x d blocks and "
+                "requires untied block_glk; "
+                f"got gauge_group={self.gauge_group!r}, gauge_tying={self.gauge_tying!r}"
+            )
             if self.d_head > 12:
                 raise ValueError(
                     "pullback_group with gauge_group='block_glk' requires d_head <= 12; got "

@@ -51,6 +51,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'group_n': None,
     'irrep_spec': None,
     'irrep_basis': 'canonical',
+    'gauge_tying': None,
     'use_cg_coupling': False,
     'cg_covariance_mode': 'passthrough',
     'cg_covariance_floor': 1e-06,

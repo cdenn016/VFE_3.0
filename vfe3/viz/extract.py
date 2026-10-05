@@ -791,12 +791,13 @@ def projected_gauge_equivariance(
         base = evaluate(ops, mu, sigma, frame, value_frame)
         worst: Dict[str, float] = {}
         for _ in range(int(n_draws)):
-            if model.group.name == "block_glk":
+            if model.group.name == "block_glk" and model.group.tying == "per_head":
                 A = torch.randn(1, n, H, d, d, generator=generator, dtype=torch.float64)
                 g = torch.linalg.matrix_exp(float(scale) * A).to(mu.device)    # (1, N, H, d, d)
             else:
                 # Draw from the selected group, g_i = exp(s a_i . T) with a_i standard normal over
-                # its generators T (so_n: one SO(N) element acting in every irrep block).
+                # its generators T (shared tying: one element acting in every block; untied so_n:
+                # one element per block).
                 gens = model.group.generators.to(dtype=torch.float64)          # (n_gen, K, K)
                 a = torch.randn(1, n, gens.shape[0], generator=generator, dtype=torch.float64)
                 # Kept dense: its irrep blocks may differ in size, and the dense frame takes it whole.

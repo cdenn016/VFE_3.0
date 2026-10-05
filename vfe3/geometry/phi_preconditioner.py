@@ -1420,6 +1420,9 @@ def build_killing_preconditioner_per_block(
     start = 0
     for h, d in enumerate(irrep_dims):
         idx     = (block_of == h).nonzero(as_tuple=True)[0]
+        if idx.numel() == 0:                       # a block without generators (untied so_n 'l0')
+            start += d
+            continue
         sub     = generators[idx][:, start:start + d, start:start + d].contiguous()   # local d_h rep
         sub_inv = _build_killing_preconditioner_uncached(sub, center_reg=center_reg, tol=tol)
         Minv[idx.unsqueeze(-1), idx.unsqueeze(0)] = sub_inv
@@ -1596,6 +1599,9 @@ def pullback_metric_per_block(
     start = 0
     for h, d in enumerate(irrep_dims):
         idx     = (block_of == h).nonzero(as_tuple=True)[0]
+        if idx.numel() == 0:                       # a block without generators (untied so_n 'l0')
+            start += d
+            continue
         sub     = generators[idx][:, start:start + d, start:start + d].contiguous()   # (n_h, d, d) local rep
         phi_blk = phi[..., idx]                                                        # (..., n_h)
         Gb      = pullback_metric(phi_blk, sub, series_tol=series_tol,
