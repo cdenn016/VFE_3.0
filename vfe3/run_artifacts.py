@@ -103,7 +103,8 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
     if not is_vfe_config(cfg):                        # another model family has no relational route
         return {}
     H, K = cfg.n_heads, cfg.embed_dim
-    dims = cfg.head_dims
+    # Namespace configs without the property (tests, old records) have equal heads.
+    dims = getattr(cfg, "head_dims", None) or [K // H] * H
     full_link = cfg.attention_mode == "projected_gradient"
     # Every head reads and writes the full state: sum_h d_h K = K^2 per map whatever the partition.
     layer_counts = {"score": 2*K*K, "content": 2*K*K}
