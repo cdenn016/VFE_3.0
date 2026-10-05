@@ -140,10 +140,13 @@ def test_chart_radius_raises_instead_of_rescaling():
     big[0, 0, 1] = 100.0
     with pytest.raises(ValueError, match="validity bound exceeded"):
         stable_matrix_exp_pair(big)
-    with pytest.raises(ValueError, match="must be finite and positive"):
-        stable_matrix_exp_pair(big, validity_max_norm=float("inf"))
+    with pytest.raises(ValueError, match="must be positive"):
+        stable_matrix_exp_pair(big, validity_max_norm=float("nan"))
     exp_pos, _ = stable_matrix_exp_pair(big, validity_max_norm=150.0)
     assert torch.equal(exp_pos, torch.linalg.matrix_exp(big))
+    # +inf means no bound (the radius skew-symmetric groups receive).
+    exp_inf, _ = stable_matrix_exp_pair(big, validity_max_norm=float("inf"))
+    assert torch.equal(exp_inf, torch.linalg.matrix_exp(big))
 
 
 def test_in_chart_exponential_is_exact():
@@ -160,17 +163,15 @@ def test_in_chart_exponential_is_exact():
     assert torch.equal(exp_neg, torch.linalg.inv(exp_pos.double()).float())
 
 
-def test_skew_transport_shares_the_chart_radius_and_is_exact_inside_it():
-    # The chart radius applies to so_n as well (fail-closed on runaway coordinates); inside it the
-    # skew exponential is exp(embed(phi)) itself, an exact rotation.
+def test_skew_transport_has_no_chart_radius_and_is_exact():
+    # A skew-symmetric group is exempt from the fail-closed radius (plan decision D1, 2026-10-05):
+    # its exponential is orthogonal at any norm, so ||M||_F = 30 sqrt 2 > 20 exponentiates as is.
     from vfe3.geometry.transport import compute_transport_operators
     grp = get_group("so_n")(5, group_n=5, irrep_spec=[("l1", 1)])
     assert grp.skew_symmetric
     phi = torch.zeros(1, 1, grp.generators.shape[0])
     phi[0, 0, 0] = 30.0
-    with pytest.raises(ValueError, match="validity bound exceeded"):
-        compute_transport_operators(phi, grp)
-    out = compute_transport_operators(phi, grp, validity_max_norm=60.0)
+    out = compute_transport_operators(phi, grp)
     phi_mat = torch.einsum("bna,aij->bnij", phi, grp.generators)
     true_exp = torch.linalg.matrix_exp(phi_mat)
     assert torch.allclose(out["exp_phi"], true_exp, atol=1e-4)

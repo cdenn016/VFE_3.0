@@ -154,6 +154,8 @@ def build_group(cfg: VFE3Config) -> GaugeGroup:
         kwargs["group_n"] = cfg.group_n
     if cfg.irrep_spec is not None and "irrep_spec" in params:
         kwargs["irrep_spec"] = cfg.irrep_spec
+    if getattr(cfg, "irrep_basis", None) is not None and "irrep_basis" in params:
+        kwargs["irrep_basis"] = cfg.irrep_basis
     if arity == 1:
         return builder(cfg.embed_dim, **kwargs)
     if arity == 2:
@@ -341,6 +343,11 @@ class VFEModel(nn.Module):
         set_fill_uninitialized_memory(cfg.fill_uninitialized_memory)
         self._transport_status: Dict[str, bool] = {}
         self.group = build_group(cfg)
+        if self.group.basis_fingerprint is not None:
+            # The irrep basis is rebuilt at every load; the persisted digest lets load_state_dict
+            # refuse a checkpoint whose learned tables were trained in a different basis.
+            self.register_buffer("gauge_basis_fingerprint", torch.tensor(
+                list(bytes.fromhex(self.group.basis_fingerprint)), dtype=torch.uint8))
         # Keep layer zero's state-dict prefix for existing single-layer checkpoints.
         self.relational_operators_extra = nn.ModuleList()
         # 'depth_scaled' starts the residual-branch writer O at 1/sqrt(2 L) so the L-layer
@@ -514,7 +521,8 @@ class VFEModel(nn.Module):
                 cfg.group_n, self.group.algebra,
                 self.group.irrep_dims, self.group.irrep_labels,
                 cg_covariance_mode=cfg.cg_covariance_mode,
-                cg_covariance_floor=cfg.cg_covariance_floor)
+                cg_covariance_floor=cfg.cg_covariance_floor,
+                irrep_basis=cfg.irrep_basis)
         else:
             self.cg_coupling = None
         # The projected routes run on the flat connection, whose registration has no trainable
@@ -613,7 +621,30 @@ class VFEModel(nn.Module):
         strict:     bool = True,
         assign:     bool = False,
     ):
-        """Strictly load current state."""
+        """Strictly load current state, refusing a checkpoint built in a different irrep basis.
+
+        ``gauge_basis_fingerprint`` (so_n only) is the sha256 of the float64 generators this
+        model rebuilt. A checkpoint whose digest differs was trained in another basis, so its
+        tables would load against the wrong frames; it is refused. A checkpoint saved before the
+        digest existed carries none: it loads with this model's digest and a warning, since its
+        basis cannot be verified.
+        """
+        if hasattr(self, "gauge_basis_fingerprint"):
+            key = "gauge_basis_fingerprint"
+            saved = state_dict.get(key)
+            if saved is None:
+                import warnings
+                warnings.warn(
+                    "checkpoint predates the irrep-basis fingerprint; its so_n basis cannot be "
+                    "verified against this build (irrep_basis="
+                    f"{self.cfg.irrep_basis!r})", UserWarning, stacklevel=2)
+                state_dict = {**state_dict, key: self.gauge_basis_fingerprint.detach().clone()}
+            elif not torch.equal(saved.detach().to(device="cpu", dtype=torch.uint8),
+                                 self.gauge_basis_fingerprint.detach().cpu()):
+                raise ValueError(
+                    "checkpoint was trained in a different so_n irrep basis than this build "
+                    f"(irrep_basis={self.cfg.irrep_basis!r}); its learned tables would load "
+                    "against the wrong frames. A config saved before 2026-10-05 loads as 'eigh'.")
         return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
     def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True) -> "VFEModel":

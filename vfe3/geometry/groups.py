@@ -22,7 +22,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 
 from vfe3.geometry.generators import generate_glk_multihead, generate_son
-from vfe3.geometry.irreps import direct_sum_generators
+from vfe3.geometry.irreps import DEFAULT_IRREP_BASIS, direct_sum_generators
 
 
 @dataclass(frozen=True)
@@ -89,6 +89,7 @@ class GaugeGroup:
     phi_coordinate_layout: Optional[str]         = None      # explicit packed-coordinate capability; None = unknown
     frobenius_gram_diagonal: bool                = False     # certified <G_a,G_b>_F=0 for a != b
     frobenius_gram_uniform: Optional[float]      = None      # known common diagonal weight; None = nonuniform/unknown
+    basis_fingerprint:    Optional[str]          = None      # sha256 of a rebuilt-at-load float64 basis; None = deterministic
 
     # Cached pseudo-inverse of the generator Frobenius Gram (computed once, off __init__/eq/repr).
     _gram_pinv_cache:     Optional[torch.Tensor] = field(default=None, init=False, repr=False, compare=False)
@@ -468,6 +469,7 @@ def _build_so_n(
     *,
     group_n:    Optional[int]                   = None,
     irrep_spec: Optional[List[Tuple[str, int]]] = None,
+    irrep_basis: str                            = DEFAULT_IRREP_BASIS,
     dtype:      torch.dtype                     = torch.float32,
     device:     'torch.device | str | None'     = None,
 ) -> GaugeGroup:
@@ -486,6 +488,15 @@ def _build_so_n(
     construction. Unequal block dims are supported end-to-end (per-block energy loop,
     per-head tau = kappa_h sqrt(d_h)); equal-dims specs (one label, mult > 1) additionally
     keep the fused factored-transport fast path.
+
+    ``irrep_basis`` selects the block bases (:mod:`vfe3.geometry.irreps`): 'canonical' is
+    deterministic and builds SO(3) spins of any order; 'eigh' is the original construction, kept
+    for checkpoints trained in it. The basis is rebuilt at every load, so the builder records a
+    sha256 ``basis_fingerprint`` of the float64 generators for the checkpoint loader to compare.
+    The generator Frobenius Gram is certified diagonal with one common weight: in the orthogonal
+    L_jk basis the trace form of any representation of the simple algebra so(N) (N >= 3) is a
+    multiple of the Killing form, so <G_a, G_b>_F = (sum_b ||rho_b(L)||_F^2) delta_ab; the build
+    verifies this numerically and leaves the certificate off if it fails.
     """
     if group_n is None or irrep_spec is None:
         raise ValueError(
@@ -493,12 +504,17 @@ def _build_so_n(
             "([(label, mult), ...], labels 'l<p>'); set both in the config"
         )
     G_def = generate_son(group_n, dtype=torch.float64)
-    G, dims = direct_sum_generators(G_def, algebra="so", irrep_spec=irrep_spec)
+    G, dims = direct_sum_generators(G_def, algebra="so", irrep_spec=irrep_spec, basis=irrep_basis)
     if sum(dims) != K:
         raise ValueError(
             f"irrep_spec blocks {dims} sum to {sum(dims)} != K={K} (group_n={group_n})"
         )
     labels = [lab for lab, mult in irrep_spec for _ in range(int(mult))]
+    gram = torch.einsum("aij,bij->ab", G, G)                          # (n_gen, n_gen) float64
+    diag = gram.diagonal()
+    scale = max(float(diag.abs().max()), 1.0)
+    certified = (float((gram - torch.diag(diag)).abs().max()) <= 1e-12 * scale
+                 and float((diag - diag.mean()).abs().max()) <= 1e-12 * scale)
     return GaugeGroup(
         name="so_n",
         generators=G.to(dtype).to(device),
@@ -506,4 +522,18 @@ def _build_so_n(
         skew_symmetric=True,
         irrep_labels=labels,
         algebra="so",
+        frobenius_gram_diagonal=certified,
+        frobenius_gram_uniform=float(diag.mean()) if certified else None,
+        basis_fingerprint=generator_fingerprint(G),
     )
+
+
+def generator_fingerprint(
+    generators: torch.Tensor,              # (n_gen, K, K) float64 construction-precision basis
+) -> str:
+    """sha256 hex digest of a float64 generator basis (shape and bytes)."""
+    import hashlib
+    G = generators.detach().to(device="cpu", dtype=torch.float64).contiguous()
+    digest = hashlib.sha256(str(tuple(G.shape)).encode("utf-8"))
+    digest.update(G.numpy().tobytes())
+    return digest.hexdigest()

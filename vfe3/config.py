@@ -266,6 +266,13 @@ class VFE3Config:
     # round-trip list-of-lists form ([["l1", 3], ...]) and coerces each pair to a tuple.
     irrep_spec: Optional[List[Tuple[str, int]]] = None
 
+    # Basis of each so_n irrep block (vfe3/geometry/irreps.py). "canonical" is deterministic and, for
+    # group_n=3, builds spins of any order in closed form (the real spherical-harmonic basis; l1 is
+    # the defining representation). "eigh" is the original tensor-power construction (rank <= 6),
+    # whose basis is whatever eigh picks in a degenerate eigenspace; a saved so_n config without
+    # this key loads as "eigh", the basis its checkpoint was trained in. Read only by so_n.
+    irrep_basis:                  str = "canonical"   # "canonical" | "eigh"
+
     # CG cross-type coupling (opt-in, default off; so_n only): bilinear Clebsch-Gordan
     # between-block update on the means, exactly equivariant for any weights; sigma untouched
     # (means-only phase). NEURAL-NETWORK EXCEPTION (sanctioned, default-off): learned scalar path
@@ -994,7 +1001,8 @@ class VFE3Config:
                 )
             # JSON has no tuple type; coerce reloaded list pairs to tuples.
             self.irrep_spec = [tuple(p) if isinstance(p, list) else p for p in self.irrep_spec]
-            from vfe3.geometry.irreps import irrep_dim
+            from vfe3.geometry.irreps import IRREP_BASES, check_irrep_constructible, irrep_dim
+            _require(self.irrep_basis, IRREP_BASES, "irrep_basis")
             _block_dims: List[int] = []
             for _entry in self.irrep_spec:
                 if (not isinstance(_entry, tuple) or len(_entry) != 2
@@ -1006,6 +1014,8 @@ class VFE3Config:
                         f"got {_entry!r}"
                     )
                 _d = irrep_dim(self.group_n, algebra="so", label=_entry[0])
+                check_irrep_constructible(self.group_n, algebra="so", label=_entry[0],
+                                          basis=self.irrep_basis)
                 _block_dims.extend([_d] * _entry[1])
             if sum(_block_dims) != self.embed_dim:
                 raise ValueError(
@@ -1671,6 +1681,8 @@ class VFE3Config:
         def mark(names: tuple[str, ...], reason: str) -> None:
             inactive.update(dict.fromkeys(names, reason))
 
+        if self.gauge_group != "so_n":
+            mark(("irrep_basis",), "only read by gauge_group='so_n'")
         from vfe3.gauge_optim import get_phi_update_policy
         phi_update_policy = get_phi_update_policy(self.m_phi_update_mode)
         if not phi_update_policy.requires_manifold_optimizer:
@@ -2133,6 +2145,10 @@ def config_from_serialized(
     # compile_pair_kernel was a pure wall-clock toggle: the eager and compiled pair kernels are
     # value-identical, so a recorded value cannot change a continuation's math. Drop it silently.
     payload.pop("compile_pair_kernel", None)
+    # so_n configs saved before irrep_basis existed were built in the eigh basis (2026-10-05); the
+    # learned tables live in that basis, so the reload must rebuild it rather than the new default.
+    if payload.get("gauge_group") == "so_n" and "irrep_basis" not in payload:
+        payload["irrep_basis"] = "eigh"
     if "relational_mode" in payload or "relational_readout_mode" in payload:
         mode = payload.pop("relational_mode", "off")
         readout = payload.pop("relational_readout_mode", "conditional_update")

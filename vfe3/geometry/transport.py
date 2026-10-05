@@ -563,13 +563,33 @@ _FRAME_PAIR_FP64_ESCALATIONS: int = 0
 def _resolve_chart_max_norm(
     validity_max_norm: Optional[float],   # caller radius; None -> DEFAULT_TRANSPORT_CHART_MAX_NORM
 ) -> float:
-    r"""Return the validated fail-closed chart radius (positive and finite)."""
+    r"""Return the validated fail-closed chart radius (positive; ``+inf`` means no bound).
+
+    The radius exists for conditioning: the exponential of a large general matrix can be badly
+    conditioned, which degrades the float32 frame pair. ``VFEModel`` passes ``+inf`` for a
+    skew-symmetric group, whose exponential is orthogonal (condition number 1) at any norm; the
+    nonfinite-norm check still applies.
+    """
     radius = DEFAULT_TRANSPORT_CHART_MAX_NORM if validity_max_norm is None else validity_max_norm
     if (isinstance(radius, bool) or not isinstance(radius, (int, float))
-            or not math.isfinite(radius) or radius <= 0.0):
+            or math.isnan(radius) or radius <= 0.0):
         raise ValueError(
-            f"transport chart radius validity_max_norm must be finite and positive, got {radius!r}")
+            f"transport chart radius validity_max_norm must be positive, got {radius!r}")
     return float(radius)
+
+
+def _group_chart_radius(
+    group:             GaugeGroup,
+    validity_max_norm: Optional[float],   # caller radius; None -> default
+) -> Optional[float]:
+    r"""The fail-closed radius for ``group``: none (``+inf``) for a skew-symmetric group.
+
+    Decision D1 of docs/implementation/so-n-mixed-towers-and-frame-tying-plan-2026-10-05.md: a
+    compact group's exponential is orthogonal at any norm, so an embedded-norm radius would only
+    raise without a numerical reason, and in a mixed irrep tower it would be set by the
+    highest-spin block (||M||_F^2 = ||phi||^2 sum_b l_b(l_b+1)(2l_b+1)/3 for SO(3)).
+    """
+    return math.inf if getattr(group, "skew_symmetric", False) else validity_max_norm
 
 
 def set_frame_pair_fp64_escalation(enabled: bool) -> bool:
@@ -893,7 +913,8 @@ def compute_transport_operators(
     # -> irrep_dims [d_head]*H); single-block ([K]: one-head block_glk, a single so_n irrep) takes the full path.
     block_dims = group.irrep_dims if len(group.irrep_dims) > 1 else None
     exp_phi, exp_neg_phi = stable_matrix_exp_pair(
-        phi_matrix, block_dims=block_dims, validity_max_norm=validity_max_norm)
+        phi_matrix, block_dims=block_dims,
+        validity_max_norm=_group_chart_radius(group, validity_max_norm))
     # fp32 island on the pair product (audit 2026-07-26 C-05). The vertex factors above are already
     # pinned to float32 by _embed_algebra_fp32_floor + the exp's own upcasts, but einsum is
     # autocast-eligible, so under AMP the dense Omega was rebuilt in bf16 -- measured
@@ -1149,6 +1170,7 @@ def build_factored_transport(
     :math:`2^{-10}\kappa`, which breaks the ``CanonicalFrameContext`` contract for ill-conditioned
     frames. These are small block GEMMs; the caller's policy still governs every consumer.
     """
+    validity_max_norm = _group_chart_radius(group, validity_max_norm)
     block_dims = group.irrep_dims if len(group.irrep_dims) > 1 else None
     compact = (
         compact_blocks

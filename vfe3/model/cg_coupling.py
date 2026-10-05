@@ -86,6 +86,7 @@ class CGCoupling(nn.Module):
         atol:               float = 1e-8,        # CG null-space solve tolerance (shared with the prune)
         cg_covariance_mode: str   = "passthrough",  # 'passthrough' | 'delta_full' (delta-method J Sigma J^T)
         cg_covariance_floor: float = 1e-6,       # positive covariant floor: floor * input Sigma
+        irrep_basis:        str   = "canonical", # block basis of the group the coupling acts in
     ) -> None:
         super().__init__()
         if not (math.isfinite(cg_covariance_floor) and cg_covariance_floor > 0.0):
@@ -104,12 +105,15 @@ class CGCoupling(nn.Module):
         blocks = list(zip(irrep_labels, starts[:-1], irrep_dims))     # (label, start, d)
 
         # one stacked intertwiner buffer per admissible type triple
-        triples = cg_selection(group_n, algebra=algebra, labels=irrep_labels, atol=atol)
+        self._group_n, self._algebra, self._irrep_basis, self._atol = (
+            group_n, algebra, irrep_basis, atol)
+        triples = cg_selection(group_n, algebra=algebra, labels=irrep_labels, atol=atol,
+                               basis=irrep_basis)
         self._triple_index = {}
         for t, (a, b, c, _n) in enumerate(triples):
             C = cg_intertwiners(group_n, algebra=algebra,
                                 label_a=a, label_b=b, label_c=c,
-                                atol=atol)                            # (n_mult, dc, da*db)
+                                atol=atol, basis=irrep_basis)         # (n_mult, dc, da*db)
             # Stored float64 (the solver's construction precision). A model-wide .float()/
             # .double() converts buffers like everything else; forward re-casts to mu's dtype
             # from the cast cache either way, so numerics follow the RUNTIME dtype -- float64
@@ -174,6 +178,46 @@ class CGCoupling(nn.Module):
         for (t, m, sc, dc), idxs in grouped.items():
             srcs = [self.paths[p][:4] for p in idxs]                  # (sa, da, sb, db) per path
             self._groups.append((t, m, sc, dc, idxs, srcs))
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs) -> None:
+        r"""Load the persisted intertwiners, then re-verify them against this build's irreps.
+
+        The block bases are rebuilt at every load while the ``cg_*`` buffers come from the
+        checkpoint, so a basis that changed since the save would pair old intertwiners with new
+        generators. The build-time equivariance check ran on the rebuilt buffers; this repeats it
+        on the loaded ones, C (rho_a (x) rho_b)(X) = rho_c(X) C for every generator X.
+        """
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                      missing_keys, unexpected_keys, error_msgs)
+        from vfe3.geometry.cg import _defining
+        from vfe3.geometry.irreps import irrep_generators
+        G_def = _defining(self._group_n, self._algebra)
+        reps: dict = {}
+
+        def rho(label: str) -> torch.Tensor:
+            if label not in reps:
+                reps[label] = irrep_generators(G_def, algebra=self._algebra, label=label,
+                                               basis=self._irrep_basis)
+            return reps[label]
+
+        gate = max(1e-6, 10.0 * float(self._atol))
+        for (a, b, c), t in self._triple_index.items():
+            C = getattr(self, f"cg_{t}").detach().to(device="cpu", dtype=torch.float64)
+            if C.shape[0] == 0:
+                continue
+            ra, rb, rc = rho(a), rho(b), rho(c)
+            I_a = torch.eye(ra.shape[-1], dtype=torch.float64)
+            I_b = torch.eye(rb.shape[-1], dtype=torch.float64)
+            for k in range(G_def.shape[0]):
+                rab = torch.kron(ra[k], I_b) + torch.kron(I_a, rb[k])
+                residual = float((C @ rab - torch.einsum("ij,mjk->mik", rc[k], C)).abs().max())
+                if residual > gate:
+                    error_msgs.append(
+                        f"{prefix}cg_{t}: the loaded ({a}, {b}) -> {c} intertwiner is not equivariant "
+                        f"for this build's irrep basis (residual {residual:.3e} > {gate:.1e}); the "
+                        f"checkpoint was saved in a different basis (irrep_basis={self._irrep_basis!r})")
+                    break
 
     def _apply(self, fn, recurse=True):
         # .to()/.float()/.cuda() move or convert the buffers; drop the stale cast cache.

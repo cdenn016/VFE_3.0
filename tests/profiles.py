@@ -50,6 +50,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'gauge_transport': 'on',
     'group_n': None,
     'irrep_spec': None,
+    'irrep_basis': 'canonical',
     'use_cg_coupling': False,
     'cg_covariance_mode': 'passthrough',
     'cg_covariance_floor': 1e-06,
