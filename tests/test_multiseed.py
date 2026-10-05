@@ -477,6 +477,34 @@ def test_manifest_failed_cell_is_excluded_from_accepted_config_homogeneity(
     assert emitted == []
 
 
+def test_mixed_code_identity_is_rejected_by_default_and_accepted_on_opt_in(tmp_path, monkeypatch):
+    for seed in (1, 2):
+        _write_full_run(tmp_path / f"run_s{seed}", ppl=10.0 + seed, seed=seed)
+    prov_path = tmp_path / "run_s2" / "provenance.json"
+    prov = json.loads(prov_path.read_text())
+    prov.update(git_sha="e" * 40, git_dirty=True, git_dirty_fingerprint="f" * 64)
+    prov_path.write_text(json.dumps(prov))
+    _write_request(tmp_path, [1, 2])
+
+    design = ms._requested_seed_design(tmp_path)
+    assert design["complete"] is False
+    assert design["accepted_seeds"] == []
+    assert design["code_identity"]["mixed"] is True
+
+    monkeypatch.setitem(ms.CONFIG, "allow_mixed_code_identity", True)
+    design = ms._requested_seed_design(tmp_path)
+    assert design["complete"] is True
+    assert design["accepted_seeds"] == [1, 2]
+    assert design["code_identity"]["mixed_allowed"] is True
+    assert design["code_identity"]["n_distinct"] == 2
+    assert design["code_identity"]["per_seed"]["2"]["git_sha"] == "e" * 40
+
+    # Data identity remains enforced under the opt-in.
+    prov.update(test_data_sha256="0" * 64)
+    prov_path.write_text(json.dumps(prov))
+    assert ms._requested_seed_design(tmp_path)["complete"] is False
+
+
 def test_duplicate_observation_for_requested_seed_is_runtime_cohort_invalid(tmp_path):
     _write_request(tmp_path, [8])
     for dirname, ppl in (("requested_s8", 10.0), ("requested_retry_s8_2", 11.0)):

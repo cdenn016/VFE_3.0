@@ -425,6 +425,17 @@ def _requested_seeds(root: Path, observed: List[int]) -> tuple[List[int], bool]:
     return manifest["requested_seeds"], manifest["request_verified"]
 
 
+_CODE_IDENTITY_KEYS = ("git_sha", "git_dirty", "git_dirty_fingerprint")
+
+
+def _mixed_code_identity_allowed() -> bool:
+    r"""``CONFIG["allow_mixed_code_identity"]`` (default False), validated as a bool."""
+    allowed = CONFIG.get("allow_mixed_code_identity", False)
+    if type(allowed) is not bool:
+        raise ValueError(f"CONFIG['allow_mixed_code_identity']={allowed!r}; expected a bool")
+    return allowed
+
+
 def _requested_seed_design(
     root: Path,
 
@@ -477,8 +488,20 @@ def _requested_seed_design(
             else:
                 provenance_contracts[seed] = contract
                 cells.append({"seed": seed, "status": "complete", "run_dir": str(matches[0])})
+    mixed_code_allowed = _mixed_code_identity_allowed()
+    code_identities = {
+        seed: {key: contract[key] for key in _CODE_IDENTITY_KEYS}
+        for seed, contract in provenance_contracts.items()
+    }
+    n_code_identities = len({
+        json.dumps(identity, sort_keys=True) for identity in code_identities.values()
+    })
     fingerprints = {
-        json.dumps(contract, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        json.dumps(
+            {key: value for key, value in contract.items()
+             if not (mixed_code_allowed and key in _CODE_IDENTITY_KEYS)},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        )
         for contract in provenance_contracts.values()
     }
     data_order = _data_order_status([
@@ -532,6 +555,12 @@ def _requested_seed_design(
         "manifest_status": manifest["manifest_status"],
         "provenance_verified": provenance_verified,
         "data_order": data_order,
+        "code_identity": {
+            "mixed_allowed": mixed_code_allowed,
+            "n_distinct": n_code_identities,
+            "mixed": n_code_identities > 1,
+            "per_seed": {str(seed): identity for seed, identity in sorted(code_identities.items())},
+        },
         "status": "complete" if complete else "incomplete",
         "complete": complete,
         "cells": cells,
@@ -810,6 +839,10 @@ CONFIG: Dict[str, Any] = {
     "run_root": "K=60_GL(10)",   # run folder (bare name resolves under vfe3_runs/) OR a path
     "key":      "best_val_ppl",  # exploratory selection/noise metric; test remains final endpoint
     "curve_x":  "step",          # x axis of the per-step curves: "step" or "tokens_seen" (CURVE_X_OPTIONS)
+    # Opt-in: accept seeds whose code identity (git_sha / dirty-tree fingerprint) differs. Data,
+    # tokenizer and data-order identity must still match. The across-seed SD then also contains any
+    # effect of the code differences; every output records the per-seed code identity.
+    "allow_mixed_code_identity": False,
 }
 
 # metrics.csv columns accepted as the curve x axis, with their axis labels. ``tokens_seen`` (training
@@ -935,12 +968,21 @@ def _write_csv(path: Path, scalars: Dict[str, Any]) -> None:
             w.writerow(row)
 
 
-def _write_md(path: Path, root: Path, seeds, scalars, per_layer) -> None:
+def _write_md(path: Path, root: Path, seeds, scalars, per_layer, *,
+              code_identity: Optional[Mapping[str, Any]] = None) -> None:
     L: List[str] = [f"# Multi-seed digest: {root.name}", "",
-                    f"Across {len(seeds)} seeds: {seeds}.", "",
-                    "## Headline scalars (across-seed)", "",
-                    "| metric | n | mean | SD (ddof=1) | 2*SD | CV% |",
-                    "|---|---|---|---|---|---|"]
+                    f"Across {len(seeds)} seeds: {seeds}.", ""]
+    if code_identity is not None and code_identity.get("mixed"):
+        L += [f"**Mixed code identity:** {code_identity['n_distinct']} distinct git_sha / "
+              "dirty-tree fingerprints across seeds, accepted by `allow_mixed_code_identity=True`. "
+              "The across-seed SD includes any effect of those code differences.", ""]
+        for seed, ident in code_identity["per_seed"].items():
+            L.append(f"- seed {seed}: `{ident['git_sha'][:10]}` dirty={ident['git_dirty']} "
+                     f"fingerprint=`{(ident['git_dirty_fingerprint'] or '-')[:12]}`")
+        L.append("")
+    L += ["## Headline scalars (across-seed)", "",
+          "| metric | n | mean | SD (ddof=1) | 2*SD | CV% |",
+          "|---|---|---|---|---|---|"]
     for k, v in scalars.items():
         cvpct = 100 * v["cv"] if math.isfinite(v["cv"]) else float("nan")
         L.append(f"| {k} | {v['n']} | {_fnum(v['mean'])} | {_fnum(v['sd'])} | "
@@ -1107,6 +1149,10 @@ def main() -> int:
         curves = {}
         per_layer = {}
         print("requested multi-seed design is incomplete; aggregate values and figures withheld")
+    code_identity = request_design["code_identity"]
+    if code_identity["mixed"] and code_identity["mixed_allowed"]:
+        print(f"WARNING: {code_identity['n_distinct']} distinct code identities accepted "
+              f"(allow_mixed_code_identity=True); the across-seed SD includes any code effect")
     print(f"\nNOTE: {CAVEAT}\n")
 
     accepted_config_dirs = [
@@ -1137,6 +1183,7 @@ def main() -> int:
             "request_verified": request_design["request_verified"],
             "manifest_status": request_design["manifest_status"],
             "data_order": request_design["data_order"],
+            "code_identity": request_design["code_identity"],
             "status": "complete" if publication_complete else "incomplete",
             "complete": publication_complete,
             "cells": headline["cells"],
@@ -1164,7 +1211,8 @@ def main() -> int:
     }
     _write_json_atomic(root / "multiseed_summary.json", _json_clean(manifest))
     _write_csv(root / "multiseed_summary.csv", scalars)
-    _write_md(root / "MULTISEED_ANALYSIS.md", root, seeds, scalars, per_layer)
+    _write_md(root / "MULTISEED_ANALYSIS.md", root, seeds, scalars, per_layer,
+              code_identity=request_design["code_identity"])
     for name in ("multiseed_summary.json", "multiseed_summary.csv", "MULTISEED_ANALYSIS.md"):
         print(f"  data    -> {root / name}")
 
