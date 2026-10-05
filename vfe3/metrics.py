@@ -1004,8 +1004,7 @@ def group_gauge_invariant(
     This dispatches the correct invariant: GL volume log|det exp(phi)| for block_glk, and total
     rotation angle (1/2) sum_k |arg(eig)| for the orthogonal so_n irrep towers.
     """
-    name = getattr(group, "name", "block_glk")
-    if name == "so_n":
+    if getattr(group, "skew_symmetric", False):                  # so_n, tied or untied
         ang = torch.angle(torch.linalg.eigvals(exp_phi))         # (..., K) eigenphases
         return 0.5 * ang.abs().sum(dim=-1)
     return torch.linalg.slogdet(exp_phi).logabsdet              # GL volume log|det|

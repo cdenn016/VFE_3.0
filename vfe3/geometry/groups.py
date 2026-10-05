@@ -90,6 +90,9 @@ class GaugeGroup:
     frobenius_gram_diagonal: bool                = False     # certified <G_a,G_b>_F=0 for a != b
     frobenius_gram_uniform: Optional[float]      = None      # known common diagonal weight; None = nonuniform/unknown
     basis_fingerprint:    Optional[str]          = None      # sha256 of a rebuilt-at-load float64 basis; None = deterministic
+    # Frame tying across heads: 'per_head' (an independent element per head block) or 'shared'
+    # (one element acting on every block); None = a group without head structure or tying axis.
+    tying:                Optional[str]          = None
 
     # Cached pseudo-inverse of the generator Frobenius Gram (computed once, off __init__/eq/repr).
     _gram_pinv_cache:     Optional[torch.Tensor] = field(default=None, init=False, repr=False, compare=False)
@@ -279,6 +282,8 @@ class GaugeGroup:
 
 
 _GROUPS: Dict[str, Callable[..., GaugeGroup]] = {}
+# Frame tying across heads (config field gauge_tying): one element per head block, or one shared.
+GAUGE_TYINGS: Tuple[str, ...] = ("per_head", "shared")
 # Registered family names whose stored-parameter divergence is exactly GL(K)-congruence invariant.
 # The legacy "gaussian" key was DEAD DATA (audit 2026-07-26 E-05): no such family is registered, so it
 # could never match `cfg.family` at the one production consumer (`run_artifacts._pure_path_report`)
@@ -297,11 +302,14 @@ def register_group(
     invariant_families:   Tuple[str, ...]        = (),
 
     pullback_capability:  Optional[str]          = None,
+    pullback_tying:       Optional[str]          = None,
 ) -> Callable:
     """Decorator registering a GaugeGroup builder under ``name``.
 
     ``pullback_capability`` names
-    a certified strict M-step implementation; omission fails closed. ``invariant_families`` declares
+    a certified strict M-step implementation; omission fails closed. With ``pullback_tying`` set the
+    capability is certified only for groups built with that frame tying, and other tyings carry
+    None. ``invariant_families`` declares
     exact divergence invariance. The wrapper writes every declaration onto itself and each returned
     :class:`GaugeGroup`, so an override replaces the callable and metadata atomically.
 
@@ -320,11 +328,14 @@ def register_group(
                 raise TypeError(
                     f"gauge group builder {name!r} returned {type(group).__name__}, expected GaugeGroup"
                 )
-            group.pullback_capability = pullback_capability
+            group.pullback_capability = (pullback_capability
+                                         if pullback_tying is None or group.tying == pullback_tying
+                                         else None)
             group.invariant_families = families
             return group
 
         setattr(_coherent_builder, "pullback_capability", pullback_capability)
+        setattr(_coherent_builder, "pullback_tying", pullback_tying)
         setattr(_coherent_builder, "invariant_families", families)
         _GROUPS[name] = _coherent_builder
         return _coherent_builder
@@ -343,6 +354,7 @@ def get_group(name: str) -> Callable[..., GaugeGroup]:
 @register_group(
     "block_glk",
     pullback_capability="pullback_per_block",
+    pullback_tying="per_head",
     invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
 )
 def _build_block_glk(
@@ -350,18 +362,40 @@ def _build_block_glk(
     n_heads:         int,
 
     *,
+    tying:           str                             = "per_head",
     dtype:           torch.dtype                     = torch.float32,
     device:          'torch.device | str | None'     = None,
 ) -> GaugeGroup:
-    """Block-diagonal GL(K) = GL(d_head)^n_heads with the row-major elementary basis.
+    r"""Block-diagonal GL(K) = GL(d_head)^n_heads with the row-major elementary basis.
 
     The basis stays lazy (``_ElementaryBlockBasis``); the dense generators are built only when a
     consumer reads ``group.generators``.
+
+    ``tying='shared'`` builds the diagonal subgroup :math:`\{I_H\otimes g : g\in GL(d)\}`, one
+    GL(d_head) element acting identically on every head: generators :math:`I_H\otimes E_{ab}` in
+    row-major (a, b) order, n_gen = d_head^2, Frobenius Gram :math:`H\,I`. No generator lives on
+    one block, so the per-block metrics and the per-head compact fast paths do not apply; the
+    group carries no ``phi_coordinate_layout`` and takes the dense transport route.
     """
     if K % n_heads != 0:
         raise ValueError(f"K={K} must be divisible by n_heads={n_heads}")
+    if tying not in GAUGE_TYINGS:
+        raise ValueError(f"block_glk tying must be one of {GAUGE_TYINGS}, got {tying!r}")
     d_head = K // n_heads
     placement = torch.empty(0, device=device, dtype=dtype)
+    if tying == "shared":
+        elementary = torch.eye(d_head * d_head, dtype=placement.dtype).reshape(d_head * d_head, d_head, d_head)
+        eye_h = torch.eye(n_heads, dtype=placement.dtype)
+        generators = torch.stack([torch.kron(eye_h, E) for E in elementary]).to(placement.device)
+        return GaugeGroup(
+            name="block_glk",
+            generators=generators,                                  # (d^2, K, K) I_H (x) E_ab
+            irrep_dims=[d_head] * n_heads,
+            skew_symmetric=False,
+            frobenius_gram_diagonal=True,
+            frobenius_gram_uniform=float(n_heads),
+            tying="shared",
+        )
     return GaugeGroup(
         name="block_glk",
         generators=_ElementaryBlockBasis(K, n_heads, placement.dtype, placement.device),
@@ -370,6 +404,7 @@ def _build_block_glk(
         phi_coordinate_layout="block_head_row_major" if n_heads > 1 else None,
         frobenius_gram_diagonal=True,
         frobenius_gram_uniform=1.0,
+        tying="per_head",
     )
 
 
@@ -470,10 +505,11 @@ def _build_so_n(
     group_n:    Optional[int]                   = None,
     irrep_spec: Optional[List[Tuple[str, int]]] = None,
     irrep_basis: str                            = DEFAULT_IRREP_BASIS,
+    tying:      str                             = "shared",
     dtype:      torch.dtype                     = torch.float32,
     device:     'torch.device | str | None'     = None,
 ) -> GaugeGroup:
-    r"""SO(N) acting on R^K through a DIRECT SUM of irreps (tied gauge; heads = irreps).
+    r"""SO(N) acting on R^K through a DIRECT SUM of irreps (tied gauge by default; heads = irreps).
 
     The structure group is SO(N) with N = ``group_n`` DECOUPLED from K. ``irrep_spec`` lists
     (label, multiplicity) pairs; label 'l<p>' is the symmetric-traceless rank-p tensor irrep
@@ -497,7 +533,16 @@ def _build_so_n(
     L_jk basis the trace form of any representation of the simple algebra so(N) (N >= 3) is a
     multiple of the Killing form, so <G_a, G_b>_F = (sum_b ||rho_b(L)||_F^2) delta_ab; the build
     verifies this numerically and leaves the certificate off if it fails.
+
+    ``tying='per_head'`` (untied) gives every block its own SO(N) element: block b carries its own
+    copy of the generators :math:`\rho_b(L_a)`, supported on that block alone, in block-major
+    order, so n_gen = dim so(N) times the number of nontrivial blocks ('l0' blocks carry none).
+    Each head's frame is then :math:`\rho_b(g_b)` for an independent :math:`g_b`. The Gram stays
+    diagonal, with weight :math:`\|\rho_b(L)\|_F^2` on block b's coordinates, so it is uniform
+    only when every block has the same spin.
     """
+    if tying not in GAUGE_TYINGS:
+        raise ValueError(f"so_n tying must be one of {GAUGE_TYINGS}, got {tying!r}")
     if group_n is None or irrep_spec is None:
         raise ValueError(
             "gauge_group='so_n' requires group_n (the N of SO(N)) and irrep_spec "
@@ -510,11 +555,22 @@ def _build_so_n(
             f"irrep_spec blocks {dims} sum to {sum(dims)} != K={K} (group_n={group_n})"
         )
     labels = [lab for lab, mult in irrep_spec for _ in range(int(mult))]
+    if tying == "per_head":
+        untied, start = [], 0
+        for d in dims:
+            block = torch.zeros_like(G)
+            block[:, start:start + d, start:start + d] = G[:, start:start + d, start:start + d]
+            if bool(block.abs().amax() > 0):                          # 'l0' blocks carry no generators
+                untied.append(block)
+            start += d
+        if not untied:
+            raise ValueError("an untied so_n tower needs at least one nontrivial irrep block")
+        G = torch.cat(untied)                                         # (n_blocks' * dim so(N), K, K)
     gram = torch.einsum("aij,bij->ab", G, G)                          # (n_gen, n_gen) float64
     diag = gram.diagonal()
     scale = max(float(diag.abs().max()), 1.0)
-    certified = (float((gram - torch.diag(diag)).abs().max()) <= 1e-12 * scale
-                 and float((diag - diag.mean()).abs().max()) <= 1e-12 * scale)
+    diagonal = float((gram - torch.diag(diag)).abs().max()) <= 1e-12 * scale
+    uniform = diagonal and float((diag - diag.mean()).abs().max()) <= 1e-12 * scale
     return GaugeGroup(
         name="so_n",
         generators=G.to(dtype).to(device),
@@ -522,9 +578,10 @@ def _build_so_n(
         skew_symmetric=True,
         irrep_labels=labels,
         algebra="so",
-        frobenius_gram_diagonal=certified,
-        frobenius_gram_uniform=float(diag.mean()) if certified else None,
+        frobenius_gram_diagonal=diagonal,
+        frobenius_gram_uniform=float(diag.mean()) if uniform else None,
         basis_fingerprint=generator_fingerprint(G),
+        tying=tying,
     )
 
 

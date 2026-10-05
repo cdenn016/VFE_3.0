@@ -191,6 +191,9 @@ def diagonal_redundancy_status(cfg: Any) -> Tuple[str, str]:
     group = getattr(cfg, "gauge_group", "block_glk")
     if group != "block_glk":
         return "broken", f"D e^X leaves the gauge group {group!r}, so the compensated frame is not representable"
+    if getattr(cfg, "gauge_tying", None) == "shared":
+        return "broken", ("D e^X leaves the tied block_glk group I_H (x) GL(d) unless D repeats across heads, "
+                          "so the compensated frame is not representable")
     unprobed = []
     if getattr(cfg, "attention_mode", None) != "projected_predictive":
         unprobed.append(f"attention_mode={getattr(cfg, 'attention_mode', None)!r}")

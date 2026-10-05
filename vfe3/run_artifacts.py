@@ -3405,6 +3405,7 @@ def _cost_model_fields(
         "batch_size":              int(cfg.batch_size),
         "diagonal_covariance":     bool(cfg.diagonal_covariance),
         "gauge_group":             cfg.gauge_group,
+        "gauge_tying":             getattr(model.group, "tying", None),
         "decode_mode":             cfg.decode_mode,
         "vocab_size":              V,
         "n_learnable_params":      int(sum(p.numel() for p in model.parameters() if p.requires_grad)),
@@ -4830,6 +4831,7 @@ def _pure_path_report(
             "predictive_covariance":         getattr(cfg, "predictive_covariance", "passthrough"),
             "predictive_covariance_floor":   float(getattr(cfg, "predictive_covariance_floor", 1e-4)),
             "gauge_group":                   cfg.gauge_group,
+            "gauge_tying":                   getattr(cfg, "gauge_tying", None),
             "family":                        cfg.family,
             "group_invariant_families":      list(invariant_families),
             # Truthful fixed-surrogate ledger (C6): these derived booleans expose when the run
