@@ -36,7 +36,7 @@ def _cfg(**over):
                 gauge_group="block_glk", skip_belief_sigma_update=True,
                 e_phi_lr=0.0, oracle_unroll_grad=True, warmup_steps=0,
                 max_steps=2, log_interval=0, eval_interval=0,
-                pos_phi="learned", use_head_mixer=False, use_block_mlp=False,
+                pos_phi="learned", use_block_mlp=False,
                 relational_mode="projected_filtering",
                 relational_input_scope="full",
                 relational_readout_mode="predictive_content",

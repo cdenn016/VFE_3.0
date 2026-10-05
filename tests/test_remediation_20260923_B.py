@@ -326,7 +326,7 @@ def test_forest_withheld_without_window_and_captioned_by_seed_count(tmp_path: Pa
     sweep = tmp_path / "component_ablation_forest"
     baseline = torch.rand(32, dtype=torch.float32)
     cell, _ = _write_forest_cell(sweep, "baseline", baseline)
-    _write_forest_cell(sweep, "head_mixer_off", baseline + 0.1)
+    _write_forest_cell(sweep, "component_off", baseline + 0.1)
     assert ablation_forest_kwargs(sweep, "baseline")["n_seeds"] == 1
     (cell / "config.json").unlink()
     assert ablation_forest_kwargs(sweep, "baseline") is None

@@ -165,7 +165,7 @@ def _projected_model() -> VFEModel:
     return VFEModel(test_config(
         vocab_size=7, embed_dim=4, n_heads=2, batch_size=1, max_seq_len=4,
         n_layers=1, n_e_steps=1, family="gaussian_diagonal", gauge_group="block_glk",
-        pos_phi="learned", use_head_mixer=True, use_block_mlp=True,
+        pos_phi="learned", use_block_mlp=True,
         block_mlp_expansion=1, attention_mode="projected_predictive",
 
     )).eval()

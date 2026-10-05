@@ -196,7 +196,7 @@ def test_full_family_is_value_identical_to_diagonal_on_launcher_route() -> None:
 
 @pytest.mark.parametrize("override", [
     {"block_mlp_covariance": "delta_full"},
-    {"use_head_mixer": True},
+    {"predictive_covariance": "moment_matched"},
 ], ids=lambda o: next(iter(o)))
 def test_family_stays_live_where_a_seam_densifies_or_diagonal_is_not_admitted(
     override: Dict[str, Any],

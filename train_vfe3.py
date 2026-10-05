@@ -164,8 +164,6 @@ config = dict(
     #################################
     decode_bias                       = True,     # only for decode_mode='linear'
     
-    use_head_mixer                    = False,   # opt-in Schur-commutant head mixer (needs >=2 blocks: block_glk heads OR an so_n irrep tower with per-isotypic-component mixing);
-    use_priorbank_head_evidence_mixer = False,
                                          
     
     decode_mode                       = 'full_chunked',  # prior-bank: diagonal_chunked/full_chunked/expected_likelihood_chunked/family_chunked
@@ -315,8 +313,6 @@ config = dict(
                                            
 
 
-    m_head_mixer_lr           = 0.025,     #  post-belief Schur HeadMixer parameters
-    m_head_evidence_lr        = None,      # active only with use_priorbank_head_evidence_mixer
 
     
     min_lr_frac               = 0.01,
@@ -413,10 +409,6 @@ def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int,
     dead_line = ([" dead under config (no grad): "
                   + ", ".join(n.replace("prior_bank.", "") for n in rep["dead_names"])]
                  if rep["probed"] and rep["dead_names"] else [])
-    head_evidence_lr = (
-        _fmt_mixer_lr(cfg.m_head_evidence_lr, cfg.m_p_mu_lr)
-        if cfg.use_priorbank_head_evidence_mixer else "inactive"
-    )
     return "\n".join([
         bar,
         f" Gauge VFE Transformer | {rep['total']:,} params{live_note} | {device}",
@@ -430,8 +422,7 @@ def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int,
         f" M-LRs: mu={cfg.m_p_mu_lr}  sigma={cfg.m_p_sigma_lr}  "
         f"phi={cfg.m_phi_lr}",
         f" decoder M-LRs: {_fmt_decode_lrs(cfg)}",
-        f" auxiliary M-LRs: head_evidence={head_evidence_lr}  "
-        f"head_mixer={_fmt_mixer_lr(cfg.m_head_mixer_lr, cfg.m_p_mu_lr)}  "
+        f" auxiliary M-LRs: "
         f"block_mlp={_fmt_mixer_lr(cfg.m_block_mlp_lr, cfg.m_p_mu_lr)}",
         f" VFE: lambda_alpha={cfg.lambda_alpha}  kappa_beta={cfg.kappa_beta}  "
         f"tau={_fmt_tau(cfg, model)}  mass_phi={cfg.mass_phi}",
@@ -498,7 +489,6 @@ def _run_label(cfg: VFE3Config, dataset: str) -> str:
     """
     _validate_path_component(dataset, "dataset")
     tags = (("_linear" if cfg.decode_mode == "linear" else "")
-            + ("_mix" if cfg.use_head_mixer else "")
             + ("_mlp" if cfg.use_block_mlp else ""))
     return f"{dataset}_K{cfg.embed_dim}_{cfg.gauge_group}{tags}_s{cfg.seed}"
 

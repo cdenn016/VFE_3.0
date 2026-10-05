@@ -1,9 +1,9 @@
 r"""Tests for the 2026-06-22 figures-tail build-out (EXP-1/2/6/9/10/11 auto-dispatched figures):
 
-  * the six new registered figures render from synthetic inputs;
+  * the registered figures render from synthetic inputs;
   * the EXP-11 kappa_beta_per_head sweep carries the geo-mean-tau confound-control arms;
   * scaling_analysis.aggregate_points carries embed_dim + test PPL (the EXP-6 muP K axis);
-  * train() logs the EXP-9 builder-break residual per eval (val_builder_resid) under a head mixer;
+  * train() logs the projected receiver cost per eval;
   * the EXP-2 / EXP-11 ablation drivers read per-cell JSON and emit a PNG (no-op safe).
 
 Device-agnostic (CPU). Figures use the Agg backend.
@@ -50,12 +50,6 @@ def test_gauge_transport_bars_renders():
     fig = figs.plot_gauge_transport_bars(cells); assert fig is not None; plt.close(fig)
 
 
-def test_gauge_residual_drift_renders():
-    arms = [{"label": "tied", "step": [10, 20, 30], "resid": [1e-7, 1e-7, 1e-7]},
-            {"label": "untied", "step": [10, 20, 30], "resid": [1e-7, 1e-3, 1e-1]}]
-    fig = figs.plot_gauge_residual_drift(arms); assert fig is not None; plt.close(fig)
-
-
 def test_ppl_equivariance_bars_renders():
     cells = [{"label": "cg_off", "ppl": 31.0, "resid": 1e-7},
              {"label": "cg_on", "ppl": 29.5, "resid": 1e-7}]
@@ -94,13 +88,13 @@ def test_aggregate_points_carries_embed_dim_and_ppl():
     assert p["embed_dim"] == 20.0 and abs(p["ppl_mean"] - 20.0) < 1e-9
 
 
-# --------------------------------------------------------------------------- EXP-9 per-eval residual
+# --------------------------------------------------------------------------- per-eval receiver cost
 
-def test_val_builder_resid_logged_with_head_mixer(tmp_path):
+def test_val_receiver_cost_logged_per_eval(tmp_path):
     torch.manual_seed(0)
     cfg = test_config(vocab_size=32, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=4,
                      log_interval=2, eval_interval=2, batch_size=2,
-                     gauge_group="block_glk", use_head_mixer=True)
+                     gauge_group="block_glk")
     model = VFEModel(cfg).to(DEVICE)
     batches = [(torch.randint(0, 32, (2, 8), device=DEVICE),
                 torch.randint(0, 32, (2, 8), device=DEVICE)) for _ in range(4)]
@@ -109,9 +103,7 @@ def test_val_builder_resid_logged_with_head_mixer(tmp_path):
           val_loader=batches, artifacts=art, device=DEVICE, generate_samples=False)
     with open(tmp_path / "metrics.csv", newline="", encoding="utf-8") as fh:
         rows = list(_csv.DictReader(fh))
-    assert rows and "val_builder_resid" in rows[0]
-    finite = [r for r in rows if r["val_builder_resid"] not in ("", "nan", None)]
-    assert not finite, "the legacy builder certificate is unavailable on projected attention"
+    assert rows
     assert any(r["val_relational_receiver_cost_after"] not in ("", "nan", None) for r in rows)
 
 
@@ -162,24 +154,6 @@ def test_plot_cg_coupling_driver(tmp_path, monkeypatch):
     monkeypatch.setattr(ablation, "_collect_sweep_results", _raw_fixture_rows)
     ablation._plot_cg_coupling(sweep, figdir)
     assert (figdir / "cg_coupling_ppl_equiv.png").exists()
-
-
-def test_plot_gauge_residual_drift_driver(tmp_path, monkeypatch):
-    sweep = tmp_path / "gauge_equivariance"; figdir = tmp_path / "figures"
-    for lab, climb in [("tied_block_glk", 1e-7), ("untied_block_glk", 1e-2)]:
-        d = sweep / lab; d.mkdir(parents=True)
-        with open(d / "metrics.csv", "w", newline="", encoding="utf-8") as fh:
-            w = _csv.DictWriter(fh, fieldnames=["step", "val_builder_resid"])
-            w.writeheader()
-            for st, r in [(10, 1e-7), (20, climb)]:
-                w.writerow({"step": st, "val_builder_resid": r})
-    monkeypatch.setattr(
-        ablation,
-        "_compatible_cell_dirs",
-        lambda _sweep_dir: sorted(path for path in sweep.iterdir() if path.is_dir()),
-    )
-    ablation._plot_gauge_residual_drift(sweep, figdir)
-    assert (figdir / "gauge_equivariance_residual_drift.png").exists()
 
 
 def test_kmup_series_splits_fixed_and_mup_arms():
@@ -440,7 +414,7 @@ def test_ablation_forest_kwargs_rows_match_paired_bootstrap_oracle(tmp_path):
     sweep = tmp_path / "component_ablation_forest"
     baseline = torch.rand(64, dtype=torch.float32)
     arms = {"baseline": baseline,
-            "head_mixer_off": baseline + 0.1 * torch.rand(64),
+            "component_off": baseline + 0.1 * torch.rand(64),
             "precision_attention_off": baseline + 0.2 * torch.rand(64)}
     for label, arm in arms.items():
         _write_forest_cell(sweep, label, arm)
@@ -460,14 +434,14 @@ def test_ablation_forest_kwargs_rows_match_paired_bootstrap_oracle(tmp_path):
 
 def test_ablation_forest_kwargs_none_without_baseline_marker(tmp_path):
     sweep = tmp_path / "component_ablation_forest"
-    _write_forest_cell(sweep, "head_mixer_off", torch.rand(32, dtype=torch.float32))
+    _write_forest_cell(sweep, "component_off", torch.rand(32, dtype=torch.float32))
     assert ablation_forest_kwargs(sweep, "baseline") is None
 
 
 def test_ablation_forest_kwargs_none_on_shape_mismatch(tmp_path):
     sweep = tmp_path / "component_ablation_forest"
     _write_forest_cell(sweep, "baseline", torch.rand(64, dtype=torch.float32))
-    _write_forest_cell(sweep, "head_mixer_off", torch.rand(32, dtype=torch.float32))  # length differs
+    _write_forest_cell(sweep, "component_off", torch.rand(32, dtype=torch.float32))  # length differs
     assert ablation_forest_kwargs(sweep, "baseline") is None
 
 
@@ -519,7 +493,7 @@ def test_emit_registered_ablation_forest_and_lr_grid_figures(tmp_path):
     sweep = tmp_path / "component_ablation_forest"
     baseline = torch.rand(64, dtype=torch.float32)
     _write_forest_cell(sweep, "baseline", baseline)
-    _write_forest_cell(sweep, "head_mixer_off", baseline + 0.1 * torch.rand(64))
+    _write_forest_cell(sweep, "component_off", baseline + 0.1 * torch.rand(64))
     xs, ys = [0.5, 0.9], [0.0, 0.001]
     ctx = {"sweep_dir": sweep, "rows": _complete_grid_rows(xs, ys), "baseline_label": "baseline",
            "grid_x": "e_q_mu_lr", "grid_y": "e_q_sigma_lr",
@@ -539,7 +513,7 @@ def test_emit_registered_ablation_forest_and_lr_grid_figures(tmp_path):
 def test_emit_ablation_forest_skipped_when_baseline_absent(tmp_path):
     fig_dir = tmp_path / "figures"
     sweep = tmp_path / "component_ablation_forest"
-    _write_forest_cell(sweep, "head_mixer_off", torch.rand(16, dtype=torch.float32))  # no baseline arm
+    _write_forest_cell(sweep, "component_off", torch.rand(16, dtype=torch.float32))  # no baseline arm
     specs = [FigureSpec("ablation_forest", "ablation_forest.png",
                         lambda c: ablation_forest_kwargs(c["sweep_dir"], c["baseline_label"]))]
     emit_registered_figures(specs, {"sweep_dir": sweep, "baseline_label": "baseline"}, fig_dir)

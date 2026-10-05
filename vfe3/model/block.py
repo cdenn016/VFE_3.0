@@ -2,7 +2,7 @@ r"""A single VFE block for VFE_3.0: E-step belief inference + optional norm.
 
 Parameter-free (the block owns no nn.Parameters): on the pure default path the learnable capacity
 is the PriorBank's prior tables, but the block also receives the opt-in learned exceptions
-(head mixer, CG coupling) as arguments and applies them; the block
+(CG coupling) as arguments and applies them; the block
 runs the iterative E-step (Phase 6) and an optional gauge-equivariant norm on the
 mean. The belief handoff across blocks lives in stack.py.
 """
@@ -49,27 +49,6 @@ def e_step_shared_kwargs(
     )
 
 
-def _can_omit_mixer_covariance(mixer: object, block_mlp: Optional[Callable]) -> bool:
-    """Admit only the built-in unobserved mixer followed by a mean-only MLP."""
-    from torch.nn.modules import module as module_hooks
-    from vfe3.families.gaussian import DiagonalGaussian
-    from vfe3.model.head_mixer import HeadMixer
-    from vfe3.model.block_mlp import BlockMLP
-
-    if (type(mixer) is not HeadMixer or mixer._family is not DiagonalGaussian
-            or getattr(mixer.forward, "__func__", None) is not HeadMixer.forward
-            or mixer._forward_hooks or mixer._forward_pre_hooks or mixer._backward_hooks
-            or mixer._backward_pre_hooks
-            or module_hooks._global_forward_hooks or module_hooks._global_forward_pre_hooks
-            or module_hooks._global_backward_hooks or module_hooks._global_backward_pre_hooks):
-        return False
-    return block_mlp is None or (
-        type(block_mlp) is BlockMLP
-        and block_mlp.covariance_contract == "passthrough"
-        and getattr(block_mlp.forward_moments, "__func__", None) is BlockMLP.forward_moments
-    )
-
-
 def vfe_block(
     belief:     BeliefState,
     mu_p:       torch.Tensor,             # (N, K) prior means
@@ -82,10 +61,8 @@ def vfe_block(
     block_norm:      Optional[Callable[..., torch.Tensor]]   = None,      # cached norm instance (None -> off)
     block_mlp:       Optional[Callable]                      = None,      # selected residual moment transform (None -> off)
     block_mlp_frame: Optional[CanonicalFrameContext]         = None,      # realized frame for canonical_frame mode
-    head_mixer:      Optional[Callable[..., 'tuple']]        = None,      # opt-in Schur head mixer (None -> off)
     cg_coupling:     Optional[Callable[..., 'tuple']]        = None,      # opt-in CG cross-type coupling (None -> off)
     lambda_beta:     'float | torch.Tensor'                  = 1.0,       # belief-coupling weight (cfg.lambda_beta)
-    _need_mixer_covariance: bool                             = True,      # private final-loss consumer contract
     tau:             'Optional[float | torch.Tensor]'        = None,      # softmax temperature
 
     capture:         Optional[MStepCapture]        = None,   # out-param: stashes the CONVERGED (pre-transform) belief under 'converged'
@@ -133,15 +110,7 @@ def vfe_block(
         # M-step regularizer and the diagnostics F self-term read it from here. With the
         # transforms off (the pure path) it is the SAME object the block returns.
         capture["converged"] = out
-    if head_mixer is not None:               # opt-in head mixing: after the E-step, BEFORE the norm
-        if (not _need_mixer_covariance and capture is None and state_record is None
-                and block_norm is None and cg_coupling is None
-                and _can_omit_mixer_covariance(head_mixer, block_mlp)):
-            mu_mixed, sigma_mixed = head_mixer(out.mu, out.sigma, _need_covariance=False)
-        else:
-            mu_mixed, sigma_mixed = head_mixer(out.mu, out.sigma)   # full public belief / downstream consumer
-        out = out._replace(mu=mu_mixed, sigma=sigma_mixed)   # (per-block apply order); _replace preserves phi/reflection
-    if cg_coupling is not None:              # opt-in CG cross-type coupling: after mixing, before norm
+    if cg_coupling is not None:              # opt-in CG cross-type coupling: after the E-step, before norm
         # CG moment-energy participation (PB-13): the CG lists live in ``capture`` ONLY when
         # cfg.cg_energy_weight>0, so their presence is the sole trigger. A capture allocated only for
         # M-step self-coupling (no lists) or a captureless scorer/diagnostics call falls to the plain
@@ -165,7 +134,7 @@ def vfe_block(
     if block_norm is not None:               # cached parameter-free norm (audit 2d/4f)
         out = out._replace(mu=block_norm(out.mu, out.sigma))   # _replace preserves phi/reflection
     if capture is not None:
-        capture["block_mlp_input"] = out     # exact immediate seam after mixer/CG/norm
+        capture["block_mlp_input"] = out     # exact immediate seam after CG/norm
     if block_mlp is not None:                # default-off residual moment transform, after norm before handoff
         if hasattr(block_mlp, "forward_moments"):
             extra = {} if hidden_bias is None else {"hidden_bias": hidden_bias}

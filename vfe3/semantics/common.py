@@ -172,7 +172,7 @@ def diagonal_redundancy_status(cfg: Any) -> Tuple[str, str]:
     $e^{X_v} \mapsto D e^{X_v}$ with compensating changes of the coordinate MLP and the decoder. It
     was measured to leave the logits unchanged (to fp32 round-off) only for the probed class:
     ``gauge_group="block_glk"``, ``attention_mode="projected_predictive"``, the coordinate block MLP
-    (or none), no head mixer, no CG coupling, no RoPE, and no coordinate normalization.
+    (or none), no CG coupling, no RoPE, and no coordinate normalization.
 
     Returns ``(status, reason)`` with ``status`` one of
 
@@ -182,7 +182,7 @@ def diagonal_redundancy_status(cfg: Any) -> Tuple[str, str]:
       gauge group (compact/symplectic groups, tied or traceless variants), so the compensated frame
       is not representable by ``phi_embed``;
     * ``"assumed"`` -- nothing rules it out but the configuration was not probed (e.g. a
-      Mahalanobis norm, which is equivariant, or a head mixer / CG coupling / RoPE / other block MLP).
+      Mahalanobis norm, which is equivariant, or a CG coupling / RoPE / other block MLP).
     """
     norms = (getattr(cfg, "norm_type_block", "none"), getattr(cfg, "norm_type_final", "none"))
     if "layernorm" in norms:
@@ -196,9 +196,8 @@ def diagonal_redundancy_status(cfg: Any) -> Tuple[str, str]:
         unprobed.append(f"attention_mode={getattr(cfg, 'attention_mode', None)!r}")
     if getattr(cfg, "use_block_mlp", False) and getattr(cfg, "block_mlp_mode", "coordinate") != "coordinate":
         unprobed.append(f"block_mlp_mode={cfg.block_mlp_mode!r}")
-    for flag in ("use_head_mixer", "use_cg_coupling", "use_priorbank_head_evidence_mixer"):
-        if getattr(cfg, flag, False):
-            unprobed.append(f"{flag}=True")
+    if getattr(cfg, "use_cg_coupling", False):
+        unprobed.append("use_cg_coupling=True")
     if getattr(cfg, "pos_rotation", "none") != "none":
         unprobed.append(f"pos_rotation={cfg.pos_rotation!r}")
     if "mahalanobis" in norms:

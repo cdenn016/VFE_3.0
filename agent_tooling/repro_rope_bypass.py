@@ -31,7 +31,7 @@ BASE = dict(
     e_step_gradient="unroll", oracle_unroll_grad=True, skip_belief_sigma_update=True,
     e_phi_lr=0.0, transport_mode="flat", gauge_group="block_glk", gauge_transport="on",
     encode_mode="per_token", decode_mode="linear",
-    pos_phi="none", use_block_mlp=True, block_mlp_expansion=1, use_head_mixer=False,
+    pos_phi="none", use_block_mlp=True, block_mlp_expansion=1, 
     relational_mode="projected_filtering", relational_input_scope="full",
     relational_readout_mode="predictive_content", relational_output_scope="full",
     relational_identity_content=False, attention_residual=True,

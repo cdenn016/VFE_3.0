@@ -10,7 +10,7 @@ r"""Parameter, optimizer-state and throughput accounting of a vfe3 run, by param
 * ``positional_frames``: the positional frame generators ``pos_phi_free``;
 * ``context_processing``: the relational comparison maps ``raw_score_q``/``raw_score_k``
   (``relational_score``), the content maps ``T``/``O`` (``relational_content``), the block MLPs
-  (``block_mlp``), the block and final normalizations (``norm``), and the opt-in head mixer and CG
+  (``block_mlp``), the block and final normalizations (``norm``), and the opt-in CG
   coupling when present;
 * ``other``: everything else (for example the scalar ``decode_log_scale``).
 
@@ -141,8 +141,6 @@ def parameter_role(
         return "context_processing", "block_mlp"
     if name.startswith(("block_norm.", "final_norm.")):
         return "context_processing", "norm"
-    if name.startswith("head_mixer."):
-        return "context_processing", "head_mixer"
     if name.startswith("cg_coupling."):
         return "context_processing", "cg_coupling"
     return "other", leaf

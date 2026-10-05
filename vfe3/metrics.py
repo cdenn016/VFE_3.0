@@ -653,8 +653,7 @@ def covariance_frozen_at_encode(cfg: object) -> bool:
     assigns its context-dependent kernel covariance. Projected gradient updates sigma unless
     ``skip_belief_sigma_update=True``. Later mean-dependent delta-method seams can also rewrite
     sigma: a block MLP with ``block_mlp_covariance='delta_full'`` or CG coupling with
-    ``cg_covariance_mode='delta_full'``. The head mixer is a fixed per-token congruence and
-    normalization acts on the mean alone. Without those updates, tr Sigma_q(x_i) depends only
+    ``cg_covariance_mode='delta_full'``. Normalization acts on the mean alone. Without those updates, tr Sigma_q(x_i) depends only
     on the input token, so B1/EXP-3 measures input-token variance against next-token CE.
     """
     attention_mode = getattr(cfg, "attention_mode", "projected_predictive")
@@ -1850,55 +1849,6 @@ def bootstrap_token_ce_band(
         idx = torch.randint(0, s, (n_boot, s), generator=gen, device=paired.device)
         delta = block_sums[idx].sum(dim=1) / block_sizes[idx].sum(dim=1)
     return {"delta": point, "lo": float(torch.quantile(delta, q_lo)), "hi": float(torch.quantile(delta, q_hi))}
-
-
-# --- gauge-equivariance certificate (the symmetry the construction rests on) ---
-
-def head_mixer_gauge_residual(
-    mu:        torch.Tensor,             # (N, K) converged belief means
-    sigma:     torch.Tensor,             # (N, K) diagonal OR (N, K, K) full covariances
-    head_mixer,                          # HeadMixer module (the trained Schur-commutant mixer)
-    group,                               # GaugeGroup (generators, irrep_dims)
-
-    *,
-    n_samples: int            = 8,
-    scale:     float          = 0.5,
-    seed:      int            = 0,
-    eps:       float          = 1e-6,
-    diagonal:  Optional[bool] = None,
-) -> Dict[str, torch.Tensor]:
-    r"""BUILDER-level gauge-equivariance residual of the head mixer (tied vs untied).
-
-    Certifies whether the mixer operation commutes with an IN-group gauge action, i.e.
-    mix(g mu, g Sigma g^T) == g mix(mu, Sigma) g^T for g = exp(sum_a c_a G_a) drawn from the
-    GROUP's OWN generators. The Schur-commutant mixer M = blockdiag_t(A_t kron I_d) commutes
-    with a TIED gauge Omega = kron(I_n, h) (group ``tied_block_glk``, generators kron(I_n, gl(d)))
-    -- residual at float32 eps -- but NOT with the UNTIED per-head gauge of ``block_glk`` (each
-    head its own gl(d)), where the residual grows as A drifts from I during training.
-
-    The operator is REBUILT under g, so the tied-vs-untied distinction is visible -- this is
-    the instrument the A2/EXP-9 ablation needs. Uses the FULL-covariance mixer path (the diagonal
-    closed form sigma'[m] = sum_n A[m,n]^2 sigma[n] is equivariant only under DIAGONAL gauges), so a
-    diagonal sigma is promoted to full via ``diag_embed``. Returns relative residuals for the mean
-    (per token) and the covariance (Frobenius, per token); in-group they cluster at eps for a tied
-    gauge and rise with mixer drift for an untied one.
-    """
-    is_full = _is_full_cov(sigma, diagonal)
-    sigma0 = sigma if is_full else torch.diag_embed(sigma)                    # (N, K, K)
-    mu_m, sig_m = head_mixer(mu, sigma0)                                      # mix(mu, Sigma)
-    gen = torch.Generator(device=mu.device).manual_seed(int(seed))
-    r_mu, r_sig = [], []
-    for _ in range(n_samples):
-        c = scale * torch.randn(group.generators.shape[0], generator=gen, device=mu.device, dtype=mu.dtype)
-        g = torch.linalg.matrix_exp(torch.einsum("a,aij->ij", c, group.generators))   # in-group g
-        mu_g  = mu @ g.transpose(-1, -2)                                      # (N, K)    g mu_i
-        sig_g = torch.einsum("kl,nlm,jm->nkj", g, sigma0, g)                  # (N, K, K) g Sigma g^T
-        mu_L, sig_L = head_mixer(mu_g, sig_g)                                 # mix(g .)
-        mu_R  = mu_m @ g.transpose(-1, -2)                                    # g . mix (mean)
-        sig_R = torch.einsum("kl,nlm,jm->nkj", g, sig_m, g)                   # g . mix (cov)
-        r_mu.append((mu_L - mu_R).norm(dim=-1) / mu_R.norm(dim=-1).clamp(min=eps))
-        r_sig.append((sig_L - sig_R).flatten(1).norm(dim=-1) / sig_R.flatten(1).norm(dim=-1).clamp(min=eps))
-    return {"mu_residual": torch.cat(r_mu), "sigma_residual": torch.cat(r_sig)}
 
 
 # ---------------------------------------------------------------------------

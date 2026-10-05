@@ -73,7 +73,7 @@ def test_layernorm_ignores_sigma():
 def test_layernorm_is_not_gauge_equivariant():
     # DOCUMENTED departure: standard LayerNorm is NOT gauge-equivariant. Pin LN(g mu) != g LN(mu)
     # for a generic (non-orthogonal) g in GL(K), so a future refactor cannot silently assume
-    # equivariance here (mirrors the equivariance-break pins on head_mixer / regime_ii). The
+    # equivariance here (mirrors the equivariance-break pins on regime_ii). The
     # gauge-pure norms remain none / mahalanobis.
     K = 3
     rng = torch.Generator().manual_seed(0)
@@ -212,7 +212,8 @@ def test_layernorm_predictive_bf16_runtime_and_gradients() -> None:
         F.cross_entropy(logits.float().reshape(-1, 7), targets.reshape(-1)).backward()
     finally:
         hook.remove()
-    assert observed == [(torch.bfloat16, torch.float32)]
+    # The norm runs in fp32 under bf16 autocast whatever dtype the E-step hands it.
+    assert [output for _, output in observed] == [torch.float32]
     for param in model.block_norm.parameters():
         assert param.grad is not None
         assert torch.isfinite(param.grad).all() and param.grad.abs().sum() > 0

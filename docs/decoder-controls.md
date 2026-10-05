@@ -29,8 +29,6 @@ Both launchers expose None defaults. Independent split-rate sweep entries are op
 | Untied decoder means / linear projection | `m_decode_mu_lr` -> legacy `m_decode_lr` -> `m_p_mu_lr` |
 | Untied decoder log variances | `m_decode_sigma_lr` -> legacy `m_decode_lr` -> `m_p_sigma_lr` |
 | Learned decoder temperature | Legacy `m_decode_lr` -> `m_p_sigma_lr`; absent when fixed |
-| Head evidence | `m_head_evidence_lr=None` inherits `m_p_mu_lr` |
-| Post-belief head mixer | `m_head_mixer_lr=None` inherits `m_p_mu_lr` |
 | Block MLP | `m_block_mlp_lr=None` inherits `m_p_mu_lr`; layers share the chosen rate |
 | LayerNorm affine | `m_layernorm_lr=None` inherits `m_p_mu_lr`; both seams share the chosen rate |
 | Relational Q/K | `m_relational_score_lr=None` inherits `m_p_mu_lr`; Q and K share the chosen rate |

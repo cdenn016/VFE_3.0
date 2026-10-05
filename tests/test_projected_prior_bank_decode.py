@@ -39,7 +39,7 @@ def _projected_surface(**overrides: object) -> dict:
         encode_mode="per_token", decode_mode="full_chunked",
         skip_belief_sigma_update=False,
         decode_bias=False, decode_unigram_prior=False, untie_decode_bank=False,
-        use_block_mlp=False, use_head_mixer=False,
+        use_block_mlp=False,
         norm_type_block="none", norm_type_final="none",
         beta_attention_prior="causal",
         fp32_matmul_precision=None, decode_av_precision="fp32",

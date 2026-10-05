@@ -58,9 +58,6 @@ def test_ablation_summary_and_figure_disclose_nonpushforward_mlp():
 
 def test_cross_sweep_bar_label_includes_active_mlp_classification():
     label = ablation._sensitivity_gauge_label({
-        "head_mixer_compatibility": "disabled",
         "block_mlp_structural_mode": "coordinate_mean_only_nonintertwiner",
     })
-    assert label == (
-        "head_mixer=disabled; block_mlp=coordinate_mean_only_nonintertwiner"
-    )
+    assert label == "block_mlp=coordinate_mean_only_nonintertwiner"

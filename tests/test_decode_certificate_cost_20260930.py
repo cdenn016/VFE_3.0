@@ -36,21 +36,19 @@ class _OperationCounts(TorchDispatchMode):
 def _bank(
     checkpoint: str,
     precision:  str  = "fp32",
-    evidence:   bool = False,
+    unigram:    bool = False,
 ) -> PriorBank:
     torch.manual_seed(30)
     pb = PriorBank(
         7, 4, 4, decode_mode="diagonal_chunked", decode_chunk_size=3,
         decode_av_precision=precision, decode_ce_checkpoint=checkpoint,
         decode_ranking_fp64_escalation=False, irrep_dims=[2, 2],
-        use_priorbank_head_evidence_mixer=evidence,
-        decode_unigram_prior=evidence,
+        decode_unigram_prior=unigram,
     )
     with torch.no_grad():
         pb.mu_embed.copy_(torch.randn_like(pb.mu_embed) * 0.3)
         pb.sigma_log_embed.copy_(torch.randn_like(pb.sigma_log_embed) * 0.2)
-        if evidence:
-            pb.head_evidence_logits.copy_(torch.tensor([0.4, -0.3]))
+        if unigram:
             pb.set_unigram_log_prior(torch.arange(7, dtype=torch.float32) * 3.0)
     return pb
 
@@ -111,13 +109,13 @@ def test_diagonal_ce_skips_unused_ranking_work(
 
 @pytest.mark.parametrize("checkpoint", ["always", "never"])
 @pytest.mark.parametrize("precision", ["fp32", "fp64"])
-@pytest.mark.parametrize("evidence", [False, True])
+@pytest.mark.parametrize("unigram", [False, True])
 def test_diagonal_ce_value_and_gradients_match_dense_decode(
     checkpoint: str,
     precision:  str,
-    evidence:   bool,
+    unigram:    bool,
 ) -> None:
-    pb = _bank(checkpoint, precision, evidence)
+    pb = _bank(checkpoint, precision, unigram)
     mu_q = torch.full((1, 3, 4), 0.1, requires_grad=True)
     sigma_q = torch.full_like(mu_q, 0.8, requires_grad=True)
     targets = torch.tensor([[0, -100, 6]])
@@ -125,8 +123,6 @@ def test_diagonal_ce_value_and_gradients_match_dense_decode(
     dense_ce = F.cross_entropy(logits.reshape(-1, 7), targets.reshape(-1))
     fused_ce = pb.decode_ce_diagonal_chunked(mu_q, sigma_q, targets)
     inputs = (mu_q, sigma_q, pb.mu_embed, pb.sigma_log_embed, pb.decode_log_scale)
-    if evidence:
-        inputs += (pb.head_evidence_logits,)
     dense_gradients = torch.autograd.grad(dense_ce, inputs)
     fused_gradients = torch.autograd.grad(fused_ce, inputs)
     torch.testing.assert_close(fused_ce, dense_ce, rtol=2e-6, atol=2e-6)
@@ -172,7 +168,7 @@ def test_near_ties_keep_the_streamed_float32_ce(checkpoint: str) -> None:
 
 @pytest.mark.parametrize("checkpoint", ["always", "never"])
 def test_diagonal_fast_ce_all_ignored_is_a_grad_connected_zero(checkpoint: str) -> None:
-    pb = _bank(checkpoint, evidence=True)
+    pb = _bank(checkpoint, unigram=True)
     mu_q = torch.full((1, 2, 4), 0.1, requires_grad=True)
     sigma_q = torch.full_like(mu_q, 0.8, requires_grad=True)
     ce = pb.decode_ce_diagonal_chunked(mu_q, sigma_q, torch.full((1, 2), -100))

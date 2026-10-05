@@ -2668,8 +2668,7 @@ def plot_geometry_health(
     Surfaces the converged-state geometry scalars ``diagnostics()`` already logs to ``metrics.csv`` but
     that no standard figure plotted: holonomy / cocycle flatness, gauge-frame magnitude and spread,
     belief-covariance conditioning and effective rank, belief Fisher precision, numerical-guard
-    saturation, attention-entropy collapse, and head-mixer trainability (the drift of the opt-in
-    head mixer from identity -- audit 2026-07-01 round-3). Together they say whether the learned geometry
+    saturation, and attention-entropy collapse. Together they say whether the learned geometry
     stays meaningful rather than degenerating to a flat cocycle (phi -> 0, an UNGAUGED transformer) or
     a guard-pinned fixed point. Each panel self-gates on column presence."""
     flat = transport_mode == "flat"
@@ -2724,8 +2723,6 @@ def plot_geometry_health(
         {"title": "Attention-entropy collapse", "ylabel": "count / nats", "series": [
             ("attn_entropy_collapsed_heads", "collapsed heads", _CB[0]),
             ("attn_entropy_min", "min row entropy", _CB[3])]},
-        {"title": "Head-mixer trainability", "ylabel": "drift", "logy": True, "series": [
-            ("head_mixer_drift", "head-mixer drift", _CB[5])]},
     ]
     return _history_dashboard(history, panels, "Gauge / SPD / Fisher geometry health", path)
 
@@ -5101,34 +5098,6 @@ def plot_gauge_transport_bars(
     ax.set(xlabel="depth", ylabel="validation PPL")
     ax.set_title("GL(K) gauge transport: ON vs frozen vs OFF (Ω=I)")
     ax.legend(fontsize=8, frameon=False, title="gauge")
-    fig.tight_layout()
-    return _save(fig, path)
-
-
-@register_figure("gauge_residual_drift")
-def plot_gauge_residual_drift(
-    arms,                                # list of {label, step:[...], resid:[...]}
-
-    *,
-    path: Optional[str] = None,
-):
-    r"""A2/EXP-9: builder-break gauge residual vs training step, tied (exact) vs untied (mixer drift).
-
-    Step 0 is byte-identical (~eps) for both arms (identity-init mixer); only the untied block_glk arm
-    climbs as the head mixer drifts from the identity and breaks equivariance. log-y so the climb from
-    float-eps is legible."""
-    arms = [a for a in arms if len(a.get("resid", [])) >= 1]
-    fig, ax = plt.subplots(figsize=(6.6, 4.6))
-    for j, a in enumerate(arms):
-        s = np.asarray(a["step"], float)
-        r = np.clip(np.asarray(a["resid"], float), 1e-12, None)
-        order = np.argsort(s)
-        ax.plot(s[order], r[order], "o-", color=_CB[j % len(_CB)], lw=1.6, ms=4, label=str(a.get("label", j)))
-    ax.set_yscale("log")
-    ax.set(xlabel="training step", ylabel="builder-break gauge residual (log)")
-    ax.set_title("Tied (exact) vs untied (mixer drift) gauge equivariance")
-    if arms:
-        ax.legend(fontsize=8, frameon=False)
     fig.tight_layout()
     return _save(fig, path)
 

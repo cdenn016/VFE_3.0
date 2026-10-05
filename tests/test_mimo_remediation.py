@@ -50,10 +50,18 @@ def test_adamw_reports_nondefault_group_trust_radius() -> None:
 
 @pytest.mark.parametrize("mode", ["diagonal_chunked", "full_chunked"])
 def test_fp64_decode_policy_preserves_completed_logits(mode: str) -> None:
-    from tests.test_priorbank_head_evidence import _reference_bank, _full_query, _diagonal_query
-    bank = _reference_bank(mode, (2, 3), enabled=True, unigram=True).float()
+    from vfe3.model.prior_bank import PriorBank
+    full = mode == "full_chunked"
+    torch.manual_seed(711)
+    bank = PriorBank(5, 5, 9, decode_tau=1.7, diagonal_covariance=not full,
+                     family="gaussian_full" if full else "gaussian_diagonal", decode_mode=mode,
+                     decode_chunk_size=2, decode_ce_checkpoint="off", decode_unigram_prior=True,
+                     unigram_kappa=0.37, irrep_dims=[2, 3])
+    bank.set_unigram_log_prior(torch.tensor([2, 11, 5, 3, 17]))
     bank.decode_av_precision = "fp64"
-    mu, sigma = _full_query() if mode == "full_chunked" else _diagonal_query()
-    logits = bank.decode(mu.float(), sigma.float())
+    mu = torch.randn(2, 2, 5)
+    factor = torch.randn(2, 2, 5, 5) * 0.3 + torch.eye(5)
+    sigma = factor @ factor.transpose(-1, -2) if full else torch.rand(2, 2, 5) + 0.5
+    logits = bank.decode(mu, sigma)
     assert logits.dtype == torch.float64
     assert torch.isfinite(logits).all()

@@ -631,7 +631,7 @@ def _replay_model(**over):
         gauge_group="block_glk",
         family="gaussian_full",
         pos_rotation="none",
-        use_head_mixer=False, use_block_mlp=False, norm_type_block="none",
+        use_block_mlp=False, norm_type_block="none",
         decode_mode="full_chunked",
         pos_phi="none",
     )

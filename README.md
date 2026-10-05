@@ -293,7 +293,7 @@ the diagonal of a per-token table, the predictive readout keeps it, and under th
 inherited `block_mlp_covariance="passthrough"` no later seam densifies it; a float64
 probe with shared parameters gives identical losses and an exactly zero off-diagonal
 covariance. A genuinely full covariance requires `block_mlp_covariance="delta_full"`,
-`use_head_mixer=True`, `predictive_covariance="moment_matched"`, or the covariance updates of
+`predictive_covariance="moment_matched"`, or the covariance updates of
 `attention_mode="projected_gradient"`.
 `VFE3Config.inactive_fields()`
 reports this equivalence, together with every other setting that no active path reads

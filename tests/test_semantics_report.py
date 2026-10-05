@@ -197,17 +197,6 @@ def test_natural_parameters_linearize_the_kl_decode(tmp_path):
     assert not {"decode_W", "decode_W_causal"} & set(views)
 
 
-def test_head_evidence_mixer_skips_the_natural_parameter_view(tmp_path):
-    run_dir, _ = _tiny_run(tmp_path, decode_mode="diagonal_chunked", untie_decode_bank=True,
-                           use_priorbank_head_evidence_mixer=True)
-    run = _load(run_dir)
-    ctx = _context(run, tmp_path / "out", views=("decode_mu", "decode_natural_causal"))
-    views = R.build_views(run, ctx)
-    assert set(views) == {"decode_mu"}
-    assert any("decode_natural_causal skipped" in n and "head-evidence" in n for n in ctx.cache["view_notes"])
-    assert not ctx.cache["view_errors"]
-
-
 def test_empty_candidates_build_no_view(tmp_path):
     run_dir, _ = _tiny_run(tmp_path)
     run = _load(run_dir)
@@ -257,8 +246,8 @@ def test_gauge_paragraph_states_measured_only_for_the_probed_class():
     assert "(iii) is not an exact symmetry here because a LayerNorm" in broken
     group = R._gauge_paragraph(_fake_run(gauge_group="so_n"))
     assert "not an exact symmetry here because D e^X leaves the gauge group" in group
-    assumed = R._gauge_paragraph(_fake_run(use_head_mixer=True))
-    assert "(iii) is assumed, not verified (not probed for use_head_mixer=True)" in assumed
+    assumed = R._gauge_paragraph(_fake_run(use_cg_coupling=True))
+    assert "(iii) is assumed, not verified (not probed for use_cg_coupling=True)" in assumed
     assert "for the configuration class of this run" not in assumed
     chart = {"barycenter_converged_all": False, "blocks": [{"barycenter": {"residual": 2.5e-3}}]}
     assert "only up to O(r), r = 2.5e-03" in R._gauge_paragraph(_fake_run(), chart)

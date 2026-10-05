@@ -347,7 +347,6 @@ def test_capture_keeps_local_coordinates() -> None:
      "block_mlp_covariance"),
     (dict(norm_type_block="mahalanobis"), "norm_type_block"),
     (dict(norm_type_final="mahalanobis"), "norm_type_final"),
-    (dict(use_head_mixer=True), "use_head_mixer"),
 ])
 def test_config_fails_closed_outside_the_frame_envelope(over: Dict[str, Any], message: str) -> None:
     with pytest.raises(ValueError, match=message):

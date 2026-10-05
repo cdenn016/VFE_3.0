@@ -22,7 +22,7 @@ RUN_KEYS = ("pos_phi", "rope_base", "rope_full_gauge", "rope_on_value",
             "gauge_transport", "transport_mode", "family", "divergence_family",
             "renyi_order", "gradient_mode", "e_step_update", "n_e_steps",
             "skip_belief_sigma_update", "e_phi_lr", "encode_mode", "decode_mode",
-            "m_phi_lr", "m_pos_phi_lr", "phi_scale", "use_head_mixer", "use_block_mlp",
+            "m_phi_lr", "m_pos_phi_lr", "phi_scale", "use_block_mlp",
             "block_mlp_mode", "lambda_beta", "beta_attention_prior")
 TINY = {k: LIVE.get(k, "<ABSENT>") for k in RUN_KEYS}
 print("=== live-config keys used (unchanged from train_vfe3.py) ===")

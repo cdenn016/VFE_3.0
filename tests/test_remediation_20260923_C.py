@@ -418,7 +418,7 @@ def test_estep_capture_publishes_the_recovery_count(monkeypatch) -> None:
                      n_e_steps=1, family="gaussian_diagonal", gauge_group="block_glk",
                      skip_belief_sigma_update=True,
                      warmup_steps=0, max_steps=2, log_interval=0, eval_interval=0,
-                     pos_phi="learned", use_head_mixer=True, use_block_mlp=True,
+                     pos_phi="learned", use_block_mlp=True,
                      block_mlp_expansion=1, attention_mode="projected_gradient")
     torch.manual_seed(0)
     model = VFEModel(cfg)

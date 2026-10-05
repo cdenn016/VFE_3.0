@@ -79,14 +79,10 @@ def test_default_preserves_historical_group_topology_and_parameter_bytes(
         assert torch.equal(parameter, explicit.state_dict()[name])
 
 
-def test_decoder_override_keeps_head_evidence_dedicated_rate_and_temperature_freeze() -> None:
-    cfg = _config(untie_decode_bank=True, m_decode_mu_lr=0.137, m_decode_sigma_lr=0.137,
-                  m_head_evidence_lr=0.081,
-                  use_priorbank_head_evidence_mixer=True)
+def test_decoder_override_keeps_temperature_freeze() -> None:
+    cfg = _config(untie_decode_bank=True, m_decode_mu_lr=0.137, m_decode_sigma_lr=0.137)
     model = VFEModel(cfg)
     groups = _groups(model, build_optimizer(model, cfg))
-    assert groups["prior_bank.head_evidence_logits"]["lr"] == 0.081
-    assert groups["prior_bank.head_evidence_logits"]["weight_decay"] == 0.0
     assert "prior_bank.decode_log_scale" not in groups
 
 

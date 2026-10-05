@@ -93,8 +93,6 @@ config: Dict[str, Any] = dict(
     #        Encode/Decode          #
     #################################
     decode_bias                       = True,     # only for decode_mode='linear'
-    use_head_mixer                    = True,      # opt-in Schur-commutant head mixer (needs >=2 blocks: block_glk heads OR an so_n irrep tower with per-isotypic-component mixing);
-    use_priorbank_head_evidence_mixer = False,
 
 
     decode_mode                       = 'linear',  # prior-bank: diagonal_chunked/full_chunked/expected_likelihood_chunked/family_chunked
@@ -240,10 +238,8 @@ config: Dict[str, Any] = dict(
 
     
 
-    m_head_mixer_lr           = 0.075,     #  post-belief Schur HeadMixer parameters
     m_block_mlp_lr            = 0.001,
     
-    m_head_evidence_lr        = None,      # active only with use_priorbank_head_evidence_mixer
    
 
 
@@ -364,11 +360,6 @@ SEARCH_CONFIG: Dict[str, Any] = {
             "requires": {"use_block_mlp": True},
             "description": "M-step learning rate for block-MLP parameters.",
         },
-        "m_head_mixer_lr": {
-            "enabled": False, "bounds": [0.0005, 0.2], "values": None, "scale": "log",
-            "requires": {},
-            "description": "M-step learning rate for the post-belief head mixer.",
-        },
         
         
         
@@ -471,13 +462,6 @@ SEARCH_CONFIG: Dict[str, Any] = {
             "enabled": False, "bounds": [0.1, 5.0], "values": None, "scale": "linear",
             "requires": {},
             "description": "Belief-attention temperature multiplier.",
-        },
-        # SWEEP_ORDER currently contains this field but ablation.SWEEPS has no range for it.
-        # Supply bounds or values here before enabling it; no edit to ablation.py is needed.
-        "m_head_evidence_lr": {
-            "enabled": False, "bounds": None, "values": None, "scale": "log",
-            "requires": {"use_priorbank_head_evidence_mixer": True},
-            "description": "M-step learning rate for prior-bank head-evidence logits.",
         },
         
         

@@ -2,7 +2,7 @@ r"""The full VFE_3.0 model: encode -> E-step inference -> decode -> cross-entrop
 
 On the pure default path there are no neural layers (no nn.Linear/MLP/activation): the parameters are the
 PriorBank's prior tables, plus the model-owned learned tables their toggles create -- the default
-pos_phi='learned' positional table, and the default-OFF head mixer, CG coupling,
+pos_phi='learned' positional table, and the default-OFF CG coupling
 and learnable T5-bias scalar. The E-step
 is unrolled into the training graph (the differentiable filtering kernel), so the CE
 loss backpropagates through inference to the encode/phi priors. Batching loops over
@@ -45,7 +45,6 @@ from vfe3.geometry.transport import (
     set_frame_pair_fp64_escalation,
     _build_flat,
 )
-from vfe3.model.head_mixer import HeadMixer
 from vfe3.model.block_mlp import (
     block_mlp_build_metadata,
     build_block_mlp,
@@ -407,7 +406,6 @@ class VFEModel(nn.Module):
             decode_unigram_prior=cfg.decode_unigram_prior,
             untie_decode_bank=cfg.untie_decode_bank and cfg.decode_mode != "linear",
             irrep_dims=list(self.group.irrep_dims),
-            use_priorbank_head_evidence_mixer=cfg.use_priorbank_head_evidence_mixer,
             gauge_group_name=self.group.name,
             decode_coordinates=cfg.decode_coordinates,
         )
@@ -505,14 +503,6 @@ class VFEModel(nn.Module):
                     "norm seam to 'layernorm' to use the learned affine.",
                     UserWarning, stacklevel=2,
                 )
-        # Opt-in Schur-commutant head mixer (default off). Built ONCE from the gauge group's
-        # irrep blocks. Label-less groups need >= 2 EQUAL blocks (block_glk);
-        # labeled irrep towers (so_n) mix per isotypic component (mults-one towers get
-        # per-head scalar gains -- the entire linear commutant there). Bad pairings fail here,
-        # not at forward.
-        self.head_mixer = HeadMixer(self.group.irrep_dims, family=cfg.family,
-                                     irrep_labels=self.group.irrep_labels) \
-            if cfg.use_head_mixer else None
         # Opt-in CG cross-type coupling (default off; so_n only). Built ONCE from the
         # group's labels; CGCoupling raises at construction when no admissible paths exist.
         # The algebra key comes from the GROUP OBJECT (set by the so_n builder), not a
@@ -917,7 +907,6 @@ class VFEModel(nn.Module):
         return_logits:  bool           = False,          # also decode logits; else logits is None
         decode_last:    bool           = False,          # decode only the last position as (B, 1, V)
         _reuse_content_factors: bool   = False,          # private loss path; public beliefs retain occurrence gradients
-        _mean_only_loss: bool          = False,          # private linear-loss path; public beliefs retain full covariance
         capture:        Optional[MStepCapture]       = None,   # out-param: M-step intermediates (q*, final-block prior, raw out)
         estep_grad_out: Optional[EStepGradientOutput] = None,   # diag out-param: E-step belief-grad norms (forwarded)
         _decode_frame_out: Optional[dict]            = None,   # private out-param: the reference decode frame
@@ -1052,28 +1041,20 @@ class VFEModel(nn.Module):
                 log_prior=log_prior, block_norm=self.block_norm,
                 block_mlps=self.block_mlps,
                 block_mlp_frame=block_mlp_frame,
-                head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
+                cg_coupling=self.cg_coupling,
                 lambda_beta=lambda_beta,
                 relational_operators=self.relational_operators,
                 relational_operators_by_layer=self.relational_operators_by_layer or None,
                 relational_frame=relational_frame,
                 relational_value_frame=relational_value_frame,
                 relational_capture=relational_capture,
-                _need_final_covariance=not (
-                    _mean_only_loss and capture is None and not return_logits
-                    and type(self) is VFEModel and type(self.prior_bank) is PriorBank
-                    and self.final_norm is None and self.cfg.decode_mode == "linear"
-                    and get_decode_registration("linear").supports_chunked
-                    and get_decode_registration("linear").fused_ce is PriorBank.decode_ce_linear_chunked
-                    and getattr(self.forward_beliefs, "__func__", None) is VFEModel.forward_beliefs
-                ),
                 capture=capture, grad_record=grad_rec,
                 **stack_extra)
         if estep_grad_out is not None:                           # real tensor norms read only when requested
             for _gk in ("mu", "sigma", "phi"):
                 _gv = grad_rec.get(_gk, 0.0) if grad_rec is not None else 0.0
                 estep_grad_out[_gk] = float(_gv) if _gv is not None else float("nan")
-        mu_final = out.mu                                        # (B, N, K); head mixer (if any) applied PER BLOCK
+        mu_final = out.mu                                        # (B, N, K); CG coupling (if any) applied PER BLOCK
         sigma_final = out.sigma                                  # inside vfe_stack now, not post-stack
 
         if self.final_norm is not None:                          # config-selected final norm (cached)
@@ -1088,9 +1069,6 @@ class VFEModel(nn.Module):
 
         belief = BeliefState(mu=mu_final, sigma=sigma_final, phi=out.phi,
                              right_phi=out.right_phi)   # carry the exact positional right factor
-        # TODO(frame-conjugated-head-mixer): thread the realized query frame through this boundary
-        # before implementing M_i = U_i (A kron I) U_i^{-1}; do not co-transform q and every
-        # vocabulary prior by the same M, because that is a KL-invariant no-op.
         if capture is not None:
             # M-step out-param enrichment: vfe_stack already wrote capture['converged'] (q*); add the
             # encode-time prior p (post s-refine) and the raw pre-final_norm stack output for callers
@@ -1161,7 +1139,6 @@ class VFEModel(nn.Module):
             capture=cap,
             estep_grad_out=estep_grad_out,
             _reuse_content_factors=True,
-            _mean_only_loss=True,
             **({} if decode_frame_out is None else {"_decode_frame_out": decode_frame_out}),
         )
         mu_final, sigma_final = belief.mu, belief.sigma          # (B, N, K) post final_norm; sigma = out.sigma
@@ -1279,7 +1256,7 @@ class VFEModel(nn.Module):
         if self.cfg.mstep_self_coupling_weight > 0.0:
             # M-step self-coupling regularizer (manuscript Algorithm 1, GL(K)_attention.tex:2111):
             # L += alpha_hat * sum_i alpha_i D(q_i*||p_i), the alpha-weighted self-coupling of the
-            # CONVERGED variational belief q* (captured by vfe_block BEFORE head_mixer /
+            # CONVERGED variational belief q* (captured by vfe_block BEFORE
             # cg_coupling / block_norm -- the belief the E-step's F was actually minimized over,
             # which the manuscript pins the self-term to) against the live prior captured immediately
             # before the final block. With the three transform toggles
@@ -1554,7 +1531,7 @@ class VFEModel(nn.Module):
             raise RuntimeError("diagnostic snapshot requested logits but the decoder returned None")
 
         log_prior = diagnostic["log_prior"]
-        # Autocast can leave captured head-mixer outputs in bf16/fp16. Diagnostic transport is
+        # Autocast can leave captured block outputs in bf16/fp16. Diagnostic transport is
         # intentionally rebuilt outside autocast so matrix factorizations and condition-number
         # probes remain fp32. Freeze and upcast the captured boundary before any replay contraction;
         # otherwise compact transport combines fp32 frame factors with a low-precision belief.
@@ -1703,17 +1680,6 @@ class VFEModel(nn.Module):
         d["phi_matrix_norm_p95"] = float(torch.quantile(matrix_norm, 0.95))
         d["phi_matrix_norm_p99"] = float(torch.quantile(matrix_norm, 0.99))
         d["phi_matrix_norm_max"] = float(matrix_norm.max())
-        if self.head_mixer is not None and hasattr(self.head_mixer, "mixer_deltas"):
-            d["head_mixer_drift"] = max(
-                (float(torch.linalg.norm(p.detach())) for p in self.head_mixer.mixer_deltas), default=0.0)
-        if hasattr(self.prior_bank, "head_evidence_logits"):
-            weights, _ = self.prior_bank.head_evidence_weights(
-                dtype=self.prior_bank.head_evidence_logits.dtype,
-                device=self.prior_bank.head_evidence_logits.device)
-            probabilities = weights / weights.numel()
-            d["head_evidence_weights"] = weights.detach().cpu().tolist()
-            d["head_evidence_entropy"] = float(torch.special.entr(probabilities).sum())
-            d["head_evidence_max_abs_drift"] = float((weights - 1.0).abs().max())
         return d
 
     @torch.no_grad()

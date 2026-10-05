@@ -404,10 +404,9 @@ def _require_normal_form(model: torch.nn.Module) -> None:
         raise NotApplicable(
             f"encode_mode={getattr(cfg, 'encode_mode', None)!r}: the input-moment role "
             "xi^(0) = U^{-1} mu_p is defined for local-coordinate token tables (encode_mode='per_token')")
-    extra = [name for name in ("head_mixer", "cg_coupling") if getattr(model, name, None) is not None]
-    if extra:
+    if getattr(model, "cg_coupling", None) is not None:
         raise NotApplicable(
-            f"{' and '.join(extra)} act(s) in local coordinates between attention and normalization, a frame "
+            "cg_coupling acts in local coordinates between attention and normalization, a frame "
             "channel outside the four-role normal form")
 
 

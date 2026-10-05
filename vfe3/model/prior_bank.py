@@ -35,14 +35,12 @@ to EXACTLY (and under ``log_softmax``) on the canonical path.
 import warnings
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from types import MappingProxyType
-from typing import Callable, Dict, FrozenSet, Iterator, List, Mapping, Optional, Protocol, Tuple
+from typing import Callable, Dict, FrozenSet, Iterator, List, Optional, Protocol, Tuple
 
 import torch
 import torch.utils.checkpoint as _checkpoint
 from torch import nn
 
-from vfe3.model.head_evidence import normalized_head_evidence_weights
 from vfe3.config import _REFERENCE_DECODE_MODES, VFE3Config
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.model.frame_actions import frame_matvec, reference_covariance, reference_variances
@@ -335,17 +333,9 @@ def _family_with_precision_policy(
 def _decode_av_lhs(
     sq:          torch.Tensor,                   # (..., N, K) query variances
     mc_q:        torch.Tensor,                   # (..., N, K) centered query means
-    coord_delta: Optional[torch.Tensor] = None,  # (K,) optional head-evidence coefficients w_h - 1
 ) -> torch.Tensor:                        # (..., N, 2K)
     r"""The v-independent left factor, hoisted out of the chunk loop."""
-    quadratic = sq + mc_q ** 2
-    linear = -2.0 * mc_q
-    if coord_delta is None:
-        return torch.cat([quadratic, linear], dim=-1)
-    return torch.cat([
-        quadratic * coord_delta,
-        linear * coord_delta,
-    ], dim=-1)
+    return torch.cat([sq + mc_q ** 2, -2.0 * mc_q], dim=-1)
 
 
 # The a_v interval certificate bounds the fp32 inner product of length n = 2K by
@@ -363,7 +353,6 @@ def _decode_av(
 
     *,
     lhs:         Optional[torch.Tensor] = None,  # (..., N, 2K) precomputed _decode_av_lhs
-    coord_delta: Optional[torch.Tensor] = None,  # (K,) optional head-evidence coefficients w_h - 1
     return_error_bound: bool = False,
     precision: Optional[str] = None,
     bank_factors: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
@@ -381,18 +370,14 @@ def _decode_av(
         return _decode_av(
             sq.double(), mc_q.double(), mc_v.double(), inv_v.double(), lsum.double(),
             lhs=None,
-            coord_delta=None if coord_delta is None else coord_delta.double(),
             return_error_bound=return_error_bound, precision=precision, bank_factors=bank_factors)
     if lhs is None or lhs.dtype is not sq.dtype:
-        lhs = _decode_av_lhs(sq, mc_q, coord_delta)
-    if bank_factors is not None and bank_factors[0].dtype == lhs.dtype and coord_delta is None:
+        lhs = _decode_av_lhs(sq, mc_q)
+    if bank_factors is not None and bank_factors[0].dtype == lhs.dtype:
         rhs, bias = bank_factors
     else:
         rhs = torch.cat([inv_v, mc_v * inv_v], dim=-1)             # (Vc, 2K)
-        if coord_delta is None:
-            bias = (mc_v ** 2 * inv_v).sum(-1) + lsum
-        else:
-            bias = (mc_v ** 2 * inv_v * coord_delta).sum(-1) + lsum
+        bias = (mc_v ** 2 * inv_v).sum(-1) + lsum
     # The fp32 GEMMs run under IEEE fp32 whatever the process-global matmul policy, so the eps-based
     # certificate below describes the arithmetic that actually ran. fp64 GEMMs ignore the policy.
     with (_ieee_fp32_matmul() if lhs.dtype is torch.float32 else nullcontext()):
@@ -409,51 +394,19 @@ def _decode_av(
     return out, error_bound
 
 
-def _decode_head_evidence_kl_delta(
-    sq:             torch.Tensor,
-    mc_q:           torch.Tensor,
-    mc_v:           torch.Tensor,
-    inv_v:          torch.Tensor,
-    log_sigma_v:    torch.Tensor,
-    coord_delta:    torch.Tensor,
-    delta_per_pos:  torch.Tensor,
-    evidence_lhs:   Optional[torch.Tensor] = None,
-    return_error_bound: bool = False,
-    precision: Optional[str] = None,
-) -> 'torch.Tensor | tuple[torch.Tensor, torch.Tensor]':
-    r"""Canonical baseline-plus-delta head-evidence KL contribution for one vocab slice."""
-    delta_result = _decode_av(
-        sq, mc_q, mc_v, inv_v, (log_sigma_v * coord_delta).sum(-1),
-        lhs=evidence_lhs, coord_delta=coord_delta,
-        return_error_bound=return_error_bound, precision=precision)
-    if not return_error_bound:
-        return 0.5 * (delta_result - delta_per_pos)
-    delta_a_v, delta_a_bound = delta_result
-    eps = torch.finfo(delta_a_v.dtype).eps
-    delta = 0.5 * (delta_a_v - delta_per_pos)
-    per_pos_bound = 8.0 * eps * (delta_per_pos.abs() + 1.0)
-    bound = 0.5 * (delta_a_bound + per_pos_bound) + eps * (
-        delta_a_v.abs() + delta_per_pos.abs())
-    return delta, bound
-
-
 def _decode_analytic_kl_logits(
     a_v:          torch.Tensor,
     per_pos:      torch.Tensor,
     tau_eff:      torch.Tensor,
     output_dtype: torch.dtype,
     *,
-    evidence_delta: Optional[torch.Tensor] = None,
     a_error_bound: Optional[torch.Tensor] = None,
-    evidence_error_bound: Optional[torch.Tensor] = None,
     unigram_bias: Optional[torch.Tensor] = None,
     return_error_bound: bool = False,
 ) -> 'torch.Tensor | tuple[torch.Tensor, torch.Tensor]':
     r"""Apply every final-score transform and propagate a conservative absolute error interval."""
     centered = 0.5 * (a_v - per_pos)
     kl_v = centered.clamp(min=0.0)
-    if evidence_delta is not None:
-        kl_v = kl_v + evidence_delta
     # A final fp32 cast can collapse distinct near-tie scores after escalation.
     result_dtype = torch.float64 if kl_v.dtype is torch.float64 else output_dtype
     logits = (-kl_v / tau_eff).to(result_dtype)
@@ -465,12 +418,6 @@ def _decode_analytic_kl_logits(
     per_bound = 8.0 * eps * (per_pos.abs() + 1.0)
     # clamp is 1-Lipschitz, so the input interval remains conservative through max(x, 0).
     bound = 0.5 * (av_bound + per_bound) + eps * (a_v.abs() + per_pos.abs())
-    if evidence_delta is not None:
-        evidence_bound = (
-            torch.zeros_like(evidence_delta)
-            if evidence_error_bound is None else evidence_error_bound)
-        bound = bound + evidence_bound + eps * (
-            centered.clamp(min=0.0).abs() + evidence_delta.abs())
     tau_abs = tau_eff.abs().clamp_min(torch.finfo(tau_eff.dtype).tiny)
     tau_bound = 4.0 * eps * (tau_abs + 1.0)
     bound = (
@@ -524,17 +471,15 @@ def _pairwise_decode_av(
     mc_q:        torch.Tensor,                   # (P, K) centered query means
     mc_v:        torch.Tensor,                   # (P, K) centered prior means
     inv_v:       torch.Tensor,                   # (P, K) 1/sigma_v
-    lsum:        torch.Tensor,                   # (P,)   sum_k log sigma_v (times coord_delta)
-    coord_delta: Optional[torch.Tensor] = None,  # (K,) head-evidence coefficients w_h - 1
+    lsum:        torch.Tensor,                   # (P,)   sum_k log sigma_v
 ) -> torch.Tensor:                               # (P,)
     r"""The expanded-form ``a_v`` of :func:`_decode_av` for P explicit (query, prior) pairs.
 
     Same algebra, one prior per query row instead of a shared vocabulary table:
-    :math:`a = \sum_k w_k [(s_k + m_k^2) / \sigma_k - 2 m_k \bar m_k / \sigma_k
-    + \bar m_k^2 / \sigma_k] + \ell`, with :math:`w = 1` or the head-evidence coefficients.
+    :math:`a = \sum_k [(s_k + m_k^2) / \sigma_k - 2 m_k \bar m_k / \sigma_k
+    + \bar m_k^2 / \sigma_k] + \ell`.
     """
-    weight = 1. if coord_delta is None else coord_delta
-    return (((sq + mc_q ** 2) - 2. * mc_q * mc_v + mc_v ** 2) * inv_v * weight).sum(-1) + lsum
+    return (((sq + mc_q ** 2) - 2. * mc_q * mc_v + mc_v ** 2) * inv_v).sum(-1) + lsum
 
 
 def _refined_candidate_decode(
@@ -582,20 +527,8 @@ def _refined_candidate_decode(
         sq = sigma
         per_pos = pb.K + torch.log(sigma.clamp(min=pb.eps)).sum(-1)
     a_v = _pairwise_decode_av(sq, mc_q, mc_v, inv_v, torch.log(sigma_v).sum(-1))
-    evidence_delta = None
-    if hasattr(pb, "head_evidence_logits"):
-        head_delta, coord_delta = pb._head_evidence_deltas(dtype=torch.float64, device=mu_q.device)
-        if full_covariance:
-            delta_per_pos = pb._head_evidence_full_marginal_invariants(
-                sigma.unsqueeze(0), head_delta)[0][0].squeeze(-1)
-        else:
-            delta_per_pos = (coord_delta * (1.0 + torch.log(sigma.clamp(min=pb.eps)))).sum(-1)
-        delta_a_v = _pairwise_decode_av(sq, mc_q, mc_v, inv_v,
-                                        (torch.log(sigma_v) * coord_delta).sum(-1), coord_delta)
-        evidence_delta = 0.5 * (delta_a_v - delta_per_pos)
     refined = kernel_logits.double()
-    refined[b, n, v] = _decode_analytic_kl_logits(
-        a_v, per_pos, tau_eff.double(), torch.float64, evidence_delta=evidence_delta)
+    refined[b, n, v] = _decode_analytic_kl_logits(a_v, per_pos, tau_eff.double(), torch.float64)
     return refined
 
 
@@ -914,7 +847,6 @@ class PriorBank(nn.Module):
         untie_decode_bank:    bool  = False,
 
         irrep_dims:             Optional[List[int]] = None,
-        use_priorbank_head_evidence_mixer: bool     = False,
         gauge_group_name:       Optional[str]       = None,
         decode_coordinates:     str                 = "local",
     ) -> None:
@@ -965,17 +897,6 @@ class PriorBank(nn.Module):
         self.gauge_group_name = gauge_group_name
         self.irrep_dims = irrep_dims
         self.n_gen = n_gen
-        if use_priorbank_head_evidence_mixer:
-            validate_priorbank_head_evidence_contract(
-                K=K,
-                irrep_dims=irrep_dims,
-                family=family,
-                divergence_family=divergence_family,
-                renyi_order=renyi_order,
-                decode_mode=decode_mode,
-            )
-            self._head_evidence_irrep_dims = tuple(irrep_dims)
-            self.head_evidence_logits = nn.Parameter(torch.zeros(len(self._head_evidence_irrep_dims)))
         # Untying applies only to prior-bank decoders; linear is already independent.
         self.untie_decode_bank = untie_decode_bank and decode_mode != "linear"
 
@@ -1052,38 +973,6 @@ class PriorBank(nn.Module):
         if self.untie_decode_bank:
             self.decode_mu_embed        = nn.Parameter(self._prior_mu_table().clone().detach())
             self.decode_sigma_log_embed = nn.Parameter(self._prior_sigma_log_table().clone().detach())
-
-    def head_evidence_weights(
-        self,
-        *,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return normalized gauge-block and coordinate evidence weights when enabled."""
-        if not hasattr(self, "head_evidence_logits"):
-            raise RuntimeError("head evidence weights require use_priorbank_head_evidence_mixer=True")
-        weights = normalized_head_evidence_weights(
-            self.head_evidence_logits,
-            self._head_evidence_irrep_dims,
-            dtype=dtype,
-            device=device,
-        )
-        return weights.head, weights.coordinate
-
-    def _head_evidence_deltas(
-        self,
-        *,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return exact ``w_h - 1`` coefficients for baseline-plus-delta scoring."""
-        weights = normalized_head_evidence_weights(
-            self.head_evidence_logits,
-            self._head_evidence_irrep_dims,
-            dtype=dtype,
-            device=device,
-        ).minus_identity()
-        return weights.head, weights.coordinate
 
     def encode(
         self,
@@ -1407,14 +1296,13 @@ class PriorBank(nn.Module):
         inv_v = 1.0 / sigma_v
         c = mu_v.mean(dim=0, keepdim=True)
         mc_v = mu_v - c
-        log_v = torch.log(sigma_v)
-        lsum = log_v.sum(-1)
+        lsum = torch.log(sigma_v).sum(-1)
         work_mc_v, work_inv_v, work_lsum = mc_v, inv_v, lsum
         if self.decode_av_precision == "fp64":
             work_mc_v, work_inv_v, work_lsum = mc_v.double(), inv_v.double(), lsum.double()
         rhs = torch.cat([work_inv_v, work_mc_v * work_inv_v], dim=-1)
         bias = (work_mc_v.square() * work_inv_v).sum(-1) + work_lsum
-        return dict(c=c, mc_v=mc_v, inv_v=inv_v, log_v=log_v, lsum=lsum, rhs=rhs, bias=bias)
+        return dict(c=c, mc_v=mc_v, inv_v=inv_v, lsum=lsum, rhs=rhs, bias=bias)
 
     def _decode_bank_factors(self) -> Dict[str, torch.Tensor]:
         """Read a scoped fixed bank, or prepare fresh differentiable training factors."""
@@ -1536,29 +1424,15 @@ class PriorBank(nn.Module):
         # Per-position, v-INDEPENDENT term of -KL/tau_eff: it cancels in the CE difference
         # (logsumexp - target_logit) but is carried so each chunk's logits equal _decode_diagonal's.
         per_pos = self.K + torch.log(sigma_q.clamp(min=self.eps)).sum(-1, keepdim=True)  # (B, N, 1)
-        coord_delta = None
-        delta_per_pos = None
-        evidence_lhs = None
-        if hasattr(self, "head_evidence_logits"):
-            _, coord_delta = self._head_evidence_deltas(dtype=mu_q.dtype, device=mu_q.device)
-            delta_per_pos = (
-                coord_delta * (1.0 + torch.log(sigma_q.clamp(min=self.eps)))
-            ).sum(-1, keepdim=True)
-            evidence_lhs = _decode_av_lhs(sigma_q, mc_q, coord_delta)
-            if self.decode_av_precision == "fp64" and evidence_lhs.dtype is not torch.float64:
-                evidence_lhs = evidence_lhs.double()
 
         def _chunk_summaries(lhs_:    torch.Tensor, per_pos_:        torch.Tensor,
                              mu_v_c:  torch.Tensor, inv_v_c:         torch.Tensor,
-                             log_v_c: torch.Tensor, lsum_c:          torch.Tensor,
+                             lsum_c:  torch.Tensor,
                              in_chunk_f: torch.Tensor,
                              local_idx: torch.Tensor,
                              u_c:     Optional[torch.Tensor],
                              sq_:     torch.Tensor,
-                             mc_q_:   torch.Tensor,
-                             coord_delta_: Optional[torch.Tensor],
-                             delta_per_pos_: Optional[torch.Tensor],
-                             evidence_lhs_: Optional[torch.Tensor]) -> 'tuple[Optional[torch.Tensor], ...]':
+                             mc_q_:   torch.Tensor) -> 'tuple[Optional[torch.Tensor], ...]':
             r"""Reduce final scores to centered LSE/target/max summaries, each (B, N).
 
             logit_{i,v} = -0.5(a_v - per_pos)/tau_eff over the chunk (see _decode_diagonal). The
@@ -1571,15 +1445,7 @@ class PriorBank(nn.Module):
             """
             a_v = _decode_av(
                 sq_, mc_q_, mu_v_c, inv_v_c, lsum_c, lhs=lhs_, precision=self.decode_av_precision)
-            evidence_delta = None
-            if coord_delta_ is not None and delta_per_pos_ is not None:
-                evidence_delta = _decode_head_evidence_kl_delta(
-                    sq_, mc_q_, mu_v_c, inv_v_c, log_v_c,
-                    coord_delta_, delta_per_pos_, evidence_lhs_,
-                    precision=self.decode_av_precision)
-            logit_chunk = _decode_analytic_kl_logits(
-                a_v, per_pos_, tau_eff, lhs_.dtype,
-                evidence_delta=evidence_delta)
+            logit_chunk = _decode_analytic_kl_logits(a_v, per_pos_, tau_eff, lhs_.dtype)
             if u_c is not None:
                 logit_chunk = logit_chunk + u_c.to(logit_chunk.dtype)
             return _decode_ce_chunk_summaries(logit_chunk, in_chunk_f, local_idx)
@@ -1595,8 +1461,7 @@ class PriorBank(nn.Module):
             v1 = min(v0 + chunk, V)
             mc_v_c = (mu_v_all[v0:v1] - c)                                  # (Vc, K) centered prior means
             inv_v_c = 1.0 / sigma_v_all[v0:v1]                             # (Vc, K)
-            log_v_c = torch.log(sigma_v_all[v0:v1])                        # (Vc, K)
-            lsum_c = log_v_c.sum(-1)                                      # (Vc,)
+            lsum_c = torch.log(sigma_v_all[v0:v1]).sum(-1)                 # (Vc,)
             u_c = u_all[v0:v1] if u_all is not None else None              # (Vc,) or None
             # Target gather indices: positions whose target lands in [v0, v1). Ignored positions have
             # target < 0 < v0, so they never match -> target_logit stays 0 for them and `valid` excludes
@@ -1606,22 +1471,22 @@ class PriorBank(nn.Module):
             local_idx = (targets - v0).clamp(min=0, max=v1 - v0 - 1)       # (B, N) safe gather index
             grad_active = torch.is_grad_enabled() and any(
                 value is not None and value.requires_grad for value in
-                (lhs, per_pos, mu_v_all, sigma_v_all, tau_eff, coord_delta))
+                (lhs, per_pos, mu_v_all, sigma_v_all, tau_eff))
             activation_bytes = _decode_ce_chunk_activation_bytes(
                 lhs, V if self.decode_ce_checkpoint == "auto_aggregate" else v1 - v0, inner=2,
                 workspace_bytes_per_scalar=(8 if self.decode_ce_checkpoint == "auto_aggregate"
                                              and self.decode_av_precision == "fp64" else None))
             if _decode_ce_should_checkpoint(self.decode_ce_checkpoint, grad_active, activation_bytes):
                 chunk_result = _checkpoint.checkpoint(
-                    _chunk_summaries, lhs, per_pos, mc_v_c, inv_v_c, log_v_c, lsum_c,
+                    _chunk_summaries, lhs, per_pos, mc_v_c, inv_v_c, lsum_c,
                     in_chunk_f, local_idx,
-                    u_c, sigma_q, mc_q, coord_delta, delta_per_pos, evidence_lhs,
+                    u_c, sigma_q, mc_q,
                     use_reentrant=False,
                 )
             else:
                 chunk_result = _chunk_summaries(
-                    lhs, per_pos, mc_v_c, inv_v_c, log_v_c, lsum_c, in_chunk_f, local_idx, u_c,
-                    sigma_q, mc_q, coord_delta, delta_per_pos, evidence_lhs,
+                    lhs, per_pos, mc_v_c, inv_v_c, lsum_c, in_chunk_f, local_idx, u_c,
+                    sigma_q, mc_q,
                 )
             lse_chunk, contrib, maximum = chunk_result[:3]
             lse_chunks.append(lse_chunk)
@@ -1680,12 +1545,6 @@ class PriorBank(nn.Module):
             if sigma_q.dim() < 4 or sigma_q.shape[-1] != sigma_q.shape[-2]:
                 return None                                   # diagonal dispersion: no factorization
             safe_sigma, _, ok = self._prepare_full_covariance_for_decode(sigma_q)
-        if hasattr(self, "head_evidence_logits"):
-            head_delta, _ = self._head_evidence_deltas(
-                dtype=safe_sigma.dtype, device=safe_sigma.device)
-            _, block_ok = self._head_evidence_full_marginal_invariants(
-                safe_sigma, head_delta)
-            ok = ok & block_ok
         return ~ok
 
     def _full_cov_query_invariants(
@@ -1729,26 +1588,6 @@ class PriorBank(nn.Module):
         safe_sigma, safe_factor, ok = self._prepare_full_covariance_for_decode(sigma_q)
         return self._full_cov_query_invariants_from_prepared(
             safe_sigma, safe_factor, ok)
-
-    def _head_evidence_full_marginal_invariants(
-        self,
-        sigma_q: torch.Tensor,           # (B, N, K, K) posterior covariances
-        head_delta: torch.Tensor,        # (H,) exact head-evidence coefficients w_h - 1
-    ) -> Tuple[torch.Tensor, torch.Tensor]:  # weighted (d_h + logdet marginal), all-block-ok
-        """Compute the query-only marginal entropy delta under the safe-Cholesky policy."""
-        per_pos = torch.zeros(sigma_q.shape[:-2], dtype=sigma_q.dtype, device=sigma_q.device)
-        all_ok = torch.ones(sigma_q.shape[:-2], dtype=torch.bool, device=sigma_q.device)
-        start = 0
-        for delta_h, dim in zip(head_delta, self._head_evidence_irrep_dims):
-            stop = start + dim
-            marginal = sigma_q[..., start:stop, start:stop]
-            L_h, ok_h = safe_cholesky(marginal, eps=self.eps, rounds=5)
-            eye_h = torch.eye(dim, dtype=L_h.dtype, device=L_h.device)
-            logdet_h = _logdet_chol(torch.where(ok_h[..., None, None], L_h, eye_h))
-            per_pos = per_pos + delta_h * (dim + logdet_h)
-            all_ok = all_ok & ok_h
-            start = stop
-        return per_pos.unsqueeze(-1), all_ok
 
     def decode_ce_full_chunked(
         self,
@@ -1808,32 +1647,17 @@ class PriorBank(nn.Module):
         # v-INDEPENDENT term of -KL/tau_eff (cancels in the CE difference, carried so each chunk's
         # logits equal _decode_full's): K + log|Sigma_q| (the full-cov analogue of K + sum_k log sigma_q).
         per_pos = self.K + logdet_q.unsqueeze(-1)                          # (B, N, 1)
-        coord_delta = None
-        delta_per_pos = None
-        evidence_lhs = None
-        block_ok = torch.ones_like(spd_ok)
-        if hasattr(self, "head_evidence_logits"):
-            head_delta, coord_delta = self._head_evidence_deltas(
-                dtype=mu_q.dtype, device=mu_q.device)
-            delta_per_pos, block_ok = self._head_evidence_full_marginal_invariants(
-                sigma_q, head_delta)
-            evidence_lhs = _decode_av_lhs(diag_sq, mc_q, coord_delta)
-            if self.decode_av_precision == "fp64" and evidence_lhs.dtype is not torch.float64:
-                evidence_lhs = evidence_lhs.double()
-        final_ok = spd_ok & block_ok
+        final_ok = spd_ok
         _count_decode_logdet_fallback(final_ok)
 
         def _chunk_summaries(lhs_:    torch.Tensor, per_pos_:        torch.Tensor,
                              mu_v_c:  torch.Tensor, inv_v_c:         torch.Tensor,
-                             log_v_c: torch.Tensor, lsum_c:          torch.Tensor,
+                             lsum_c:  torch.Tensor,
                              in_chunk_f: torch.Tensor,
                              local_idx: torch.Tensor,
                              u_c:     Optional[torch.Tensor],
                              sq_:     torch.Tensor,
-                             mc_q_:   torch.Tensor,
-                             coord_delta_: Optional[torch.Tensor],
-                             delta_per_pos_: Optional[torch.Tensor],
-                             evidence_lhs_: Optional[torch.Tensor]) -> 'tuple[Optional[torch.Tensor], ...]':
+                             mc_q_:   torch.Tensor) -> 'tuple[Optional[torch.Tensor], ...]':
             r"""Reduce final scores to centered LSE/target/max summaries, each (B, N).
 
             a_v = sum_k[(diag(Sigma_q) + (mc_q-mc_v)^2)/sigma_v] + sum_k log sigma_v
@@ -1846,15 +1670,7 @@ class PriorBank(nn.Module):
             """
             a_v = _decode_av(
                 sq_, mc_q_, mu_v_c, inv_v_c, lsum_c, lhs=lhs_, precision=self.decode_av_precision)
-            evidence_delta = None
-            if coord_delta_ is not None and delta_per_pos_ is not None:
-                evidence_delta = _decode_head_evidence_kl_delta(
-                    sq_, mc_q_, mu_v_c, inv_v_c, log_v_c,
-                    coord_delta_, delta_per_pos_, evidence_lhs_,
-                    precision=self.decode_av_precision)
-            logit_chunk = _decode_analytic_kl_logits(
-                a_v, per_pos_, tau_eff, lhs_.dtype,
-                evidence_delta=evidence_delta)
+            logit_chunk = _decode_analytic_kl_logits(a_v, per_pos_, tau_eff, lhs_.dtype)
             if u_c is not None:
                 logit_chunk = logit_chunk + u_c.to(logit_chunk.dtype)
             return _decode_ce_chunk_summaries(logit_chunk, in_chunk_f, local_idx)
@@ -1878,30 +1694,28 @@ class PriorBank(nn.Module):
             v1 = min(v0 + chunk, V)
             mc_v_c = (mu_v_all[v0:v1] - c)                                  # (Vc, K) centered prior means
             inv_v_c = 1.0 / sigma_v_all[v0:v1]                             # (Vc, K) = 1/sigma_v
-            log_v_c = torch.log(sigma_v_all[v0:v1])                        # (Vc, K)
-            lsum_c = log_v_c.sum(-1)                                      # (Vc,) = sum_k log sigma_v
+            lsum_c = torch.log(sigma_v_all[v0:v1]).sum(-1)                 # (Vc,) = sum_k log sigma_v
             u_c = u_all[v0:v1] if u_all is not None else None              # (Vc,) or None
             in_chunk = (targets >= v0) & (targets < v1)                    # (B, N) bool
             in_chunk_f = in_chunk.to(mu_q.dtype)                           # (B, N) 0/1, carried into the checkpoint
             local_idx = (targets - v0).clamp(min=0, max=v1 - v0 - 1)       # (B, N) safe gather index
             grad_active = torch.is_grad_enabled() and any(
                 value is not None and value.requires_grad for value in
-                (lhs, per_pos, mu_v_all, sigma_v_all, tau_eff, coord_delta))
+                (lhs, per_pos, mu_v_all, sigma_v_all, tau_eff))
             activation_bytes = _decode_ce_chunk_activation_bytes(
                 lhs, V if self.decode_ce_checkpoint == "auto_aggregate" else v1 - v0, inner=2,
                 workspace_bytes_per_scalar=(8 if self.decode_ce_checkpoint == "auto_aggregate"
                                              and self.decode_av_precision == "fp64" else None))
             if _decode_ce_should_checkpoint(self.decode_ce_checkpoint, grad_active, activation_bytes):
                 chunk_result = _checkpoint.checkpoint(
-                    _chunk_summaries, lhs, per_pos, mc_v_c, inv_v_c, log_v_c, lsum_c,
-                    in_chunk_f, local_idx, u_c, diag_sq, mc_q, coord_delta, delta_per_pos,
-                    evidence_lhs,
+                    _chunk_summaries, lhs, per_pos, mc_v_c, inv_v_c, lsum_c,
+                    in_chunk_f, local_idx, u_c, diag_sq, mc_q,
                     use_reentrant=False,
                 )
             else:
                 chunk_result = _chunk_summaries(
-                    lhs, per_pos, mc_v_c, inv_v_c, log_v_c, lsum_c, in_chunk_f, local_idx, u_c,
-                    diag_sq, mc_q, coord_delta, delta_per_pos, evidence_lhs,
+                    lhs, per_pos, mc_v_c, inv_v_c, lsum_c, in_chunk_f, local_idx, u_c,
+                    diag_sq, mc_q,
                 )
             lse_chunk, contrib, maximum = chunk_result[:3]
             lse_chunks.append(lse_chunk)
@@ -2496,34 +2310,17 @@ def _decode_diagonal(
     per_pos = pb.K + torch.log(sigma_q.clamp(min=pb.eps)).sum(-1, keepdim=True)   # (B, N, 1) = K + sum_k log sigma_q
     # .to() after the clamp keeps the fp64 a_v island open through the subtraction (F32); it is an
     # identity no-op under the default fp32 policy.
-    evidence_delta = None
-    evidence_bound = None
-    if hasattr(pb, "head_evidence_logits"):
-        _, coord_delta = pb._head_evidence_deltas(dtype=mu_q.dtype, device=mu_q.device)
-        delta_per_pos = (
-            coord_delta * (1.0 + torch.log(sigma_q.clamp(min=pb.eps)))
-        ).sum(-1, keepdim=True)
-        evidence_result = _decode_head_evidence_kl_delta(
-            sigma_q, mc_q, mc_v, inv_v, factors["log_v"], coord_delta, delta_per_pos,
-            return_error_bound=ranking_guard, precision=pb.decode_av_precision)
-        if ranking_guard:
-            evidence_delta, evidence_bound = evidence_result
-        else:
-            evidence_delta = evidence_result
     if ranking_guard:
         unigram = pb._unigram_bias() if pb.decode_unigram_prior else None
         ranking_logits, ranking_bound = _decode_analytic_kl_logits(
-            a_v, per_pos, tau_eff, mu_q.dtype, evidence_delta=evidence_delta,
-            a_error_bound=a_bound, evidence_error_bound=evidence_bound,
+            a_v, per_pos, tau_eff, mu_q.dtype, a_error_bound=a_bound,
             unigram_bias=unigram, return_error_bound=True)
         if _final_ranking_uncertain(ranking_logits, ranking_bound):
             return _refined_candidate_decode(
                 pb, mu_q, sigma_q, tau_eff, ranking_logits, ranking_bound,
-                _decode_analytic_kl_logits(a_v, per_pos, tau_eff, mu_q.dtype,
-                                           evidence_delta=evidence_delta),
+                _decode_analytic_kl_logits(a_v, per_pos, tau_eff, mu_q.dtype),
                 full_covariance=False)
-    return _decode_analytic_kl_logits(
-        a_v, per_pos, tau_eff, mu_q.dtype, evidence_delta=evidence_delta)
+    return _decode_analytic_kl_logits(a_v, per_pos, tau_eff, mu_q.dtype)
 
 
 @register_decode(
@@ -2582,20 +2379,7 @@ def _decode_full(
     )                                                                       # (B, N, V)
     diag_sq, _, spd_ok = pb._full_cov_query_invariants_from_prepared(
         sigma_q, factor_q, spd_ok)
-    block_ok = torch.ones_like(spd_ok)
-    if hasattr(pb, "head_evidence_logits"):
-        head_delta, coord_delta = pb._head_evidence_deltas(
-            dtype=mu_q.dtype, device=mu_q.device)
-        delta_per_pos, block_ok = pb._head_evidence_full_marginal_invariants(
-            sigma_q, head_delta)
-        c = mu_v.mean(dim=0, keepdim=True)
-        mc_v = mu_v - c
-        mc_q = mu_q - c
-        inv_v = 1.0 / torch.diagonal(sigma_v, dim1=-2, dim2=-1)
-        kl_v = kl_v + _decode_head_evidence_kl_delta(
-            diag_sq, mc_q, mc_v, inv_v, torch.log(1.0 / inv_v), coord_delta,
-            delta_per_pos, precision=pb.decode_av_precision)
-    final_ok = spd_ok & block_ok
+    final_ok = spd_ok
     _count_decode_logdet_fallback(final_ok)
     # Same exclusion contract as the chunked twin (audit 2026-08-06 F31). Here the -inf arrived
     # indirectly -- the family seam maps a failed Cholesky to NaN and ``kl_max=inf`` maps that to
@@ -2647,41 +2431,22 @@ def _decode_full_chunked(
     per_pos = pb.K + logdet_q.unsqueeze(-1)                              # (B, N, 1) = K + log|Sigma_q|
     # .to() after the clamp keeps the fp64 a_v island open through the subtraction (F32); it is an
     # identity no-op under the default fp32 policy.
-    evidence_delta = None
-    evidence_bound = None
-    block_ok = torch.ones_like(spd_ok)
-    if hasattr(pb, "head_evidence_logits"):
-        head_delta, coord_delta = pb._head_evidence_deltas(
-            dtype=mu_q.dtype, device=mu_q.device)
-        delta_per_pos, block_ok = pb._head_evidence_full_marginal_invariants(
-            sigma_q, head_delta)
-        evidence_result = _decode_head_evidence_kl_delta(
-            diag_sq, mc_q, mc_v, inv_v, factors["log_v"], coord_delta, delta_per_pos,
-            return_error_bound=ranking_guard, precision=pb.decode_av_precision)
-        if ranking_guard:
-            evidence_delta, evidence_bound = evidence_result
-        else:
-            evidence_delta = evidence_result
-    final_ok = spd_ok & block_ok
+    final_ok = spd_ok
     _count_decode_logdet_fallback(final_ok)
     if ranking_guard:
         unigram = pb._unigram_bias() if pb.decode_unigram_prior else None
         ranking_logits, ranking_bound = _decode_analytic_kl_logits(
-            a_v, per_pos, tau_eff, mu_q.dtype, evidence_delta=evidence_delta,
-            a_error_bound=a_bound, evidence_error_bound=evidence_bound,
+            a_v, per_pos, tau_eff, mu_q.dtype, a_error_bound=a_bound,
             unigram_bias=unigram, return_error_bound=True)
         if _final_ranking_uncertain(ranking_logits, ranking_bound):
             logits = _refined_candidate_decode(
                 pb, mu_q, sigma_q, tau_eff, ranking_logits, ranking_bound,
-                _decode_analytic_kl_logits(a_v, per_pos, tau_eff, mu_q.dtype,
-                                           evidence_delta=evidence_delta),
+                _decode_analytic_kl_logits(a_v, per_pos, tau_eff, mu_q.dtype),
                 full_covariance=True)
         else:
-            logits = _decode_analytic_kl_logits(
-                a_v, per_pos, tau_eff, mu_q.dtype, evidence_delta=evidence_delta)
+            logits = _decode_analytic_kl_logits(a_v, per_pos, tau_eff, mu_q.dtype)
     else:
-        logits = _decode_analytic_kl_logits(
-            a_v, per_pos, tau_eff, mu_q.dtype, evidence_delta=evidence_delta)
+        logits = _decode_analytic_kl_logits(a_v, per_pos, tau_eff, mu_q.dtype)
     # A non-PD Sigma_q has no valid likelihood: emit an INFORMATIONLESS uniform row rather than a
     # score built on a placeholder log-det (audit 2026-08-06 F31). log_softmax of a uniform row is
     # -log V, finite; the all--inf row this used to produce maps to NaN. The CE seams exclude the
@@ -2898,77 +2663,3 @@ def _decode_linear(
     if pb.output_proj_bias is not None:
         logits = logits + pb.output_proj_bias                           # learned log-unigram prior
     return logits
-
-
-# The evidence mixer has a deliberately narrower contract than the general decode registry: its
-# canonical-KL interpretation is valid only for these import-time registrations. Keeping both the
-# registration records and their callables pins an override=True alias/replacement fail-closed.
-_HEAD_EVIDENCE_CANONICAL_DECODERS: Mapping[str, DecodeRegistration] = MappingProxyType({
-    "diagonal_chunked": _DECODERS["diagonal_chunked"],
-    "full_chunked": _DECODERS["full_chunked"],
-})
-_HEAD_EVIDENCE_CANONICAL_DECODER_CALLABLES: Mapping[str, DecodeCallable] = MappingProxyType({
-    name: registration.callable
-    for name, registration in _HEAD_EVIDENCE_CANONICAL_DECODERS.items()
-})
-_HEAD_EVIDENCE_CANONICAL_FAMILIES: Mapping[str, type] = MappingProxyType({
-    "gaussian_diagonal": get_family("gaussian_diagonal"),
-    "gaussian_full": get_family("gaussian_full"),
-})
-
-
-def has_builtin_head_evidence_decoder(name: str) -> bool:
-    """Whether *name* still resolves to its import-time canonical KL decoder exactly."""
-    registration = _DECODERS.get(name)
-    return (
-        registration is _HEAD_EVIDENCE_CANONICAL_DECODERS.get(name)
-        and registration is not None
-        and registration.callable is _HEAD_EVIDENCE_CANONICAL_DECODER_CALLABLES[name]
-    )
-
-
-def validate_priorbank_head_evidence_contract(
-    *,
-    K: int,
-    irrep_dims: Optional[List[int]],
-    family: str,
-    divergence_family: str,
-    renyi_order: float,
-    decode_mode: str,
-) -> None:
-    """Validate every mixer invariant knowable at direct PriorBank construction."""
-    if decode_mode == "linear":
-        raise ValueError("head evidence requires a prior-bank decode_mode")
-    if irrep_dims is None:
-        raise ValueError("head evidence requires explicit gauge-block dimensions")
-    if any(type(dim) is not int or dim <= 0 for dim in irrep_dims):
-        raise ValueError("head evidence irrep_dims must contain plain positive integers")
-    if len(irrep_dims) < 2:
-        raise ValueError("head evidence requires at least two positive gauge blocks")
-    if sum(irrep_dims) != K:
-        raise ValueError(
-            f"head evidence requires sum(irrep_dims)==K; got sum={sum(irrep_dims)}, K={K}")
-    if (
-        divergence_family != "renyi"
-        or type(renyi_order) not in (int, float)
-        or renyi_order != 1.0
-    ):
-        raise ValueError(
-            "head evidence requires the built-in canonical KL functional "
-            "(divergence_family='renyi', renyi_order=1.0)")
-    canonical_modes = {
-        "gaussian_diagonal": "diagonal_chunked",
-        "gaussian_full": "full_chunked",
-    }
-    if decode_mode != canonical_modes.get(family):
-        raise ValueError(
-            "head evidence requires a supported family/decode contract: "
-            "gaussian_diagonal with diagonal_chunked or gaussian_full with full_chunked")
-    if (
-        get_family(family) is not _HEAD_EVIDENCE_CANONICAL_FAMILIES[family]
-        or get_functional("renyi") is not renyi
-        or not has_builtin_head_evidence_decoder(decode_mode)
-    ):
-        raise ValueError(
-            "head evidence requires built-in canonical family, functional, and decoder "
-            "registry identities; registry overrides are not eligible")

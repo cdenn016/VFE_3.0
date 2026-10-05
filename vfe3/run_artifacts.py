@@ -1949,7 +1949,7 @@ class RunArtifacts:
         ``|i - j|``, with the converged re-score and the attention prior overlaid on the same axes.
 
         The shipped ``attention/`` heatmaps score at each block's OUTPUT belief, after the E-step
-        has moved it and after ``head_mixer``/``block_norm`` -- a post-hoc re-score, not the
+        has moved it and after ``cg_coupling``/``block_norm`` -- a post-hoc re-score, not the
         pattern that produced the aggregation (audit 2026-07-26 R-3, measured max row difference
         1.0 on a trained checkpoint). Both are kept: the converged map is what ``diagnostics``
         reports, so it stays the reference, and this is the mechanism.
@@ -3934,7 +3934,6 @@ def finalize_run(
         "wall_time_s":  wall_time,
         "decode_mode":     cfg.decode_mode,
         "decode_tau_eff":  decode_tau_eff,
-        "use_head_mixer":  getattr(cfg, "use_head_mixer", None),
         "phi_chart_norm_route": _phi_chart_norm_route(model, cfg),
         "scaling_point":   scaling_point,
         # Audit 2026-09-28: test at the validation-selected weights beside the final-weight
@@ -3961,7 +3960,7 @@ def finalize_run(
         return results
 
     # Pure-path certificate: the config toggles for the principal gauge / decode / free-energy purity
-    # axes (flat gauge, canonical F, prior-bank decode, no head mixer, ...), plus the converged-state
+    # axes (flat gauge, canonical F, prior-bank decode, ...), plus the converged-state
     # stress metrics that say whether the numerical guards stayed inert. A REPORT of where the run sits,
     # not a judgment that any toggle is wrong (toggles are changed intentionally). Best-effort.
     try:
@@ -4063,7 +4062,7 @@ def collect_estep_character(
     r"""How far the configured projected readout or receiver episode moves the belief.
 
     ``rel_displacement`` is :math:`\lVert\mu_q-\mu_p\rVert/\lVert\mu_p\rVert` between the first
-    and last captured states of one diagnostic snapshot (pre-transform: before head mixer, CG, norm
+    and last captured states of one diagnostic snapshot (pre-transform: before CG, norm
     and MLP). Only the configured depth is measured, so ``depth_sweep_available`` is False and
     ``cos_dir_vs_step1`` is None; ``depths`` is validated for call-site compatibility.
     """
@@ -4591,7 +4590,7 @@ def _pure_path_report(
     remain executable and are labeled by independent certificate facets. ``on_pure_path`` preserves
     the legacy free-energy/decode schema. ``on_gauge_pure_path`` is the executable gauge facet and
     includes the active transport, norm, parameterization, clipping, temperature, encoder,
-    decoder coordinate, HeadMixer, and immutable BlockMLP seams. ``on_causal_lm_path`` comes
+    decoder coordinate, and immutable BlockMLP seams. ``on_causal_lm_path`` comes
     independently from both active attention-prior registrations. ``transport_exactness_status`` is affirmative only when
     complete runtime evidence warrants it; absent evidence is ``unknown``. The conjunctive
     ``on_theory_pure_path`` combines the explicitly enumerated ``theory_flags``.
@@ -4616,15 +4615,6 @@ def _pure_path_report(
     invariant_families = declared_invariant_families(cfg.gauge_group)
     family_group_invariant = cfg.family in invariant_families
     transport_registration = get_transport_registration("flat")       # the only projected transport
-    priorbank_head_evidence_mixer = bool(
-        getattr(cfg, "use_priorbank_head_evidence_mixer", False)
-    )
-    head_mixer_compatibility = getattr(cfg, "head_mixer_compatibility", None)
-    if head_mixer_compatibility is None:
-        head_mixer_compatibility = VFE3Config.head_mixer_compatibility.fget(cfg)
-    head_mixer_gauge_compatible = getattr(cfg, "head_mixer_gauge_compatible", None)
-    if head_mixer_gauge_compatible is None:
-        head_mixer_gauge_compatible = VFE3Config.head_mixer_gauge_compatible.fget(cfg)
     if executable_build is not None:
         block_mlp_build = executable_build.block_mlp
         block_mlp_active = block_mlp_build.enabled
@@ -4745,8 +4735,6 @@ def _pure_path_report(
         "flat_transport":              True,
         "constant_lambda_alpha":       cfg.lambda_alpha_mode == "constant",
         "prior_bank_decode":           cfg.decode_mode != "linear",
-        "no_head_mixer":               not cfg.use_head_mixer,
-        "no_priorbank_head_evidence_mixer": not priorbank_head_evidence_mixer,
         # Executed-route facet: gradient updates sigma unless skipped; predictive readout
         # keeps it at encode unless moment_matched assigns the predictive covariance.
         "full_sigma_update":           covariance_updated,
@@ -4767,7 +4755,6 @@ def _pure_path_report(
         "positional_rotation_gauge_covariant": (
             cfg.pos_rotation == "none" or getattr(cfg, "rope_insertion", "right") == "right"),
         "family_group_invariant":    family_group_invariant,
-        "head_mixer_intertwiner_compatible": head_mixer_gauge_compatible,
         "block_mlp_intertwiner_compatible": block_mlp_intertwiner_compatible,
         "block_norm_gauge_equivariant": block_norm_registration.gauge_equivariant,
         "final_norm_gauge_equivariant": final_norm_registration.gauge_equivariant,
@@ -4804,8 +4791,6 @@ def _pure_path_report(
             "lambda_beta":                  float(cfg.lambda_beta),
             "decode_mode":                  cfg.decode_mode,
             "decode_coordinates":           getattr(cfg, "decode_coordinates", "local"),
-            "use_head_mixer":               bool(cfg.use_head_mixer),
-            "use_priorbank_head_evidence_mixer": priorbank_head_evidence_mixer,
             "encode_mode":                  getattr(cfg, "encode_mode", "per_token"),
             "beta_attention_prior":         getattr(cfg, "beta_attention_prior", "causal"),
             "use_block_mlp":                block_mlp_active,
@@ -4820,11 +4805,6 @@ def _pure_path_report(
                 if getattr(cfg, "m_block_mlp_lr", None) is not None else getattr(cfg, "m_p_mu_lr", 0.0)),
             "block_mlp_structural_mode":    block_mlp_structural_mode,
             "block_mlp_covariance_contract": block_mlp_covariance_contract,
-            "priorbank_head_evidence_role": (
-                "decoder_kl_irrep_weights" if priorbank_head_evidence_mixer else "inactive"
-            ),
-            "head_mixer_compatibility":      head_mixer_compatibility,
-            "head_mixer_gauge_compatible":   head_mixer_gauge_compatible,
             "gauge_transport":              cfg.gauge_transport,
             "pos_rotation":                 cfg.pos_rotation,
             "rope_on_value":                bool(cfg.rope_on_value),

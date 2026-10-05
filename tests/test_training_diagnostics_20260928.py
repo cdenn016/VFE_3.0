@@ -102,7 +102,7 @@ def test_parameter_groups_by_name() -> None:
         "relational_operators.T": "relational_content",
         "relational_operators_extra.0.O": "relational_content",
         "block_mlps.2.fc1.weight": "block_mlp", "block_norm.weight": "norm",
-        "final_norm.bias": "norm", "_orig_mod.block_norm.bias": "norm", "head_mixer.W": "other",
+        "final_norm.bias": "norm", "_orig_mod.block_norm.bias": "norm", "retired_module.W": "other",
     }
     assert {name: T._parameter_group(name) for name in expected} == expected
     model = _model(_cfg())
