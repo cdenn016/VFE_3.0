@@ -42,21 +42,10 @@ for the simplified configuration and compatibility boundaries.
 
 ## Architecture
 
-```mermaid
-flowchart TD
-    Tokens["Token IDs: one agent per position"] --> Bank["PriorBank: each agent's initial belief and frame"]
-    Bank --> State["Agents' Gaussian beliefs in their own frames"]
-    State --> Compare["Receiver query S_Q against sender key S_K"]
-    Compare --> Router["Whom to listen to: Gaussian KL + causal source prior"]
-    State --> Send["Sender content T in reference coordinates"]
-    Router --> Pool["Routed messages"]
-    Send --> Pool
-    Pool --> Receive["Receiving map (content-link chart) into the receiver's frame"]
-    Receive --> Residual["Belief revision: residual, moment-matched covariance, block LayerNorm and MLP"]
-    Residual --> Next["Next round of communication (next layer)"]
-    Next --> Decode["Linear decoder with unigram prior (or a prior-bank KL readout)"]
-    Decode --> Loss["Next-token cross-entropy"]
-```
+![Tokens as communicating agents: (a) one round of communication between a sender agent and a receiver agent through the key, query, sending, and receiving maps; (b) the language model built from L such rounds](assets/agent_round.svg)
+
+The figure is drawn in TikZ ([`assets/agent_round.tex`](assets/agent_round.tex), build
+commands in its header) and committed as an SVG with its glyphs converted to paths.
 
 Every layer is one round of communication with its own query, key, sending, and receiving
 maps. The current launcher also enables a block MLP and block LayerNorm, which act on each
