@@ -1,8 +1,8 @@
 % Architecture figure for README.md: tokens as communicating agents.
 % Build (TeX Live 2025, from this directory):
 %   pdflatex -interaction=nonstopmode agent_round.tex
-%   pdftocairo -svg agent_round.pdf agent_round.svg
-% The SVG carries glyphs as paths, so it renders identically on GitHub in every browser.
+%   pdftoppm -r 220 -png -singlefile agent_round.pdf agent_round
+% The README embeds the PNG: GitHub does not render TikZ, and it rejected the SVG export.
 \documentclass[border=0pt]{standalone}
 \usepackage[T1]{fontenc}
 \usepackage{lmodern}
