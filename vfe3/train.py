@@ -49,6 +49,7 @@ from vfe3.geometry.phi_fisher import FisherRowStatistics, middle_fiber_moments, 
 from vfe3.metric_contracts import perplexity_from_ce
 from vfe3.metrics import LINK_SPECTRUM_KEYS, routing_triangle_defect_sums
 from vfe3.model.block import _as_coeff
+from vfe3.model.block_mlp import PrototypeAgentBlockMLP
 from vfe3.model.model import DiagnosticSnapshot, VFEModel
 from vfe3.model.prior_bank import PriorBank, get_decode_registration
 from vfe3.run_artifacts import RunArtifacts          # top-level safe: run_artifacts imports evaluate
@@ -297,16 +298,26 @@ def build_optimizer(
     if getattr(model, "block_mlps", None) is not None:         # use_block_mlp=True coordinate MLPs
         block_mlp_lr = (cfg.m_p_mu_lr if cfg.m_block_mlp_lr is None
                         else cfg.m_block_mlp_lr)
-        groups.append({"params": list(model.block_mlps.parameters()), "lr": block_mlp_lr,
-                       "weight_decay": cfg.weight_decay,
+        # weight_decay=0 on the prototype_agents template log-variances log(lambda) and log-weights log(pi):
+        # decaying them pulls lambda toward 1 and pi toward uniform, a prior on the templates rather than a
+        # capacity penalty. The template means nu keep the global decay.
+        template_priors = [p for mlp in model.block_mlps if isinstance(mlp, PrototypeAgentBlockMLP)
+                           for p in (mlp.log_lambda, mlp.log_pi)]
+        exempt = {id(p) for p in template_priors}
+        groups.append({"params": [p for p in model.block_mlps.parameters() if id(p) not in exempt],
+                       "lr": block_mlp_lr, "weight_decay": cfg.weight_decay,
                        "role": "mu", "lr_aux_role": "block_mlp"})
+        if template_priors:
+            groups.append({"params": template_priors, "lr": block_mlp_lr, "weight_decay": 0.0, "role": "mu"})
     if getattr(model, "relational_operators", None) is not None:
         layers = model.relational_operators_by_layer
-        for role, names in (("score", ("raw_score_q", "raw_score_k")),
+        # channel_log_noise (predictive_readout='minimal_agent') is a score-side parameter: it enters the routing
+        # through the record covariance. raw_score_k and O are None there (tied key, derived receiving map).
+        for role, names in (("score", ("raw_score_q", "raw_score_k", "channel_log_noise")),
                             ("content", ("T", "O"))):
             # Mixed head sizes store a ParameterList per name (one tensor per run of equal heads).
             parameters = [p for ops in layers for name in names
-                          for p in (ops._stored_runs(name) if getattr(ops, name) is not None else [])]
+                          for p in (ops._stored_runs(name) if getattr(ops, name, None) is not None else [])]
             if role == "content":
                 # content_link_edges: the edge factor maps are content-link parameters (absent when off).
                 parameters += [p for ops in layers for p in getattr(ops, "edge_parameters", list)()]
@@ -1345,6 +1356,12 @@ _VAL_EDGE_DIAG_KEYS = tuple("val_relational_edge_" + key for key in (
 # at A^0 and at A^(T), the loop energy (NaN with the loop prior off) and ||A^(T) - A^0|| / ||A^0||, receiver means.
 _VAL_LATENT_DIAG_KEYS = tuple("val_relational_latent_" + key for key in (
     "energy_initial", "energy_final", "loop_energy", "receiver_shift"))
+# Minimal-agent readout (predictive_readout='minimal_agent' only; vfe3.model.minimal_agent): the head-mean gain
+# fraction tr(A Lambda_bar)/d (mean field tr(A M)/d at the input moments), the head-mean channel noise n_h and the
+# head-max coupling ||S_h C S_g^T||_F / (||S_h C S_h^T||_F ||S_g C S_g^T||_F)^{1/2} at the input moments (0: ADF is
+# exact).
+_VAL_MINIMAL_AGENT_DIAG_KEYS = tuple("val_relational_minimal_agent_" + key for key in (
+    "gain_fraction", "channel_noise", "head_coupling"))
 
 
 # =============================================================================
@@ -1480,7 +1497,8 @@ def _capture_numerics_counts(
     single-source row puts all its weight on itself whatever its cost, so the cap cannot act on it),
     in every window, layer and head. An entry is capped when :math:`\bar D_{ij} \ge \kappa`. This is
     the ``computed`` population of :class:`vfe3.posthoc.klcap.KLCapObserver` on unpadded windows.
-    With ``kl_max = inf`` only non-finite costs count as capped.
+    With ``kl_max = inf`` only non-finite costs count as capped; a minimal-agent layer (``predictive_readout``,
+    whose posterior applies no clamp) is counted under that rule.
 
     Factorizations. Each layer factors its reduced query and key covariances
     :math:`G = L \Sigma L^\top` (:math:`L = S U^{-1}`, comparison rank :math:`r`) once per (window,
@@ -1493,7 +1511,11 @@ def _capture_numerics_counts(
     ``projected_cov_condition_recovery``. The numerator is the layer's recovered-entry count
     ``relational_covariance_repair_count``, a subset of the same entries. The pair-level factorizations
     of :math:`G_{q,i} + G_{k,j}` on the noisy-query route have no fallback (a failure raises) and are
-    not counted.
+    not counted. The minimal agent's fallback is the float64 recomputation of a whole float32 layer call
+    whose factorizations failed (or whose ADF query covariance failed the certificate under
+    ``projected_cov_condition_recovery``); it counts every recorded query and key entry of that call, so
+    there the ratio is the share of recomputed layer calls (plus, for the mean field under the certificate,
+    the KL factors it refactors in calls that were not recomputed).
 
     Returns ``(cap, factorization)`` with ``cap[l][h] = (capped, entries)`` and
     ``factorization[l] = (recovered, attempted)``, all Python ints, after one host transfer.
@@ -1515,7 +1537,9 @@ def _capture_numerics_counts(
         support = causal_support(beta, log_prior)                           # (B, H, N, N) bool
         rows = support.sum(dim=-1, keepdim=True) >= 2                       # (B, H, N, 1)
         entries = support & rows                                            # (B, H, N, N)
-        capped = entries & (score >= kl_max)                                # (B, H, N, N)
+        # The minimal-agent posterior applies no clamp: the kl_max = inf rule (only a non-finite cost counts).
+        cap_level = math.inf if "relational_minimal_agent_channel_noise" in capture else kl_max
+        capped = entries & (score >= cap_level)                             # (B, H, N, N)
         G_q = capture["projected_covariance_pre"]                           # (B, N, H, r, r); per run if mixed
         G_k = capture["projected_key_covariance_pre"]                       # (B, N, H, r, r); per run if mixed
         attempted.append(sum(int(G.numel() // (G.shape[-1] ** 2))
@@ -1710,7 +1734,7 @@ def _parameter_group(
     if name.startswith("relational_operators"):
         # Mixed head sizes store per-run lists: the attribute is the segment before the run index.
         attribute = name.rsplit(".", 2)[-2] if leaf.isdigit() else leaf
-        if attribute in ("raw_score_q", "raw_score_k"):
+        if attribute in ("raw_score_q", "raw_score_k", "channel_log_noise"):   # channel_log_noise: minimal agent
             return "relational_score"
         if attribute in ("T", "O"):
             return "relational_content"
@@ -1969,11 +1993,13 @@ def _residual_update_is_additive(
 ) -> bool:
     r"""Whether the layer's mean update has the residual form ``mu + m`` (so removing ``mu`` is defined).
 
-    False only for the predictive-content readout with ``attention_residual=False``, which replaces
-    the mean by the predictive mean.
+    False only for the predictive-content kernel readout with ``attention_residual=False``, which replaces
+    the mean by the predictive mean. The minimal-agent readout is additive whatever ``attention_residual`` (inert
+    there) says: its posterior mean is the prior mean plus the gain correction, :math:`\xi_i + \sum_h\mathsf K_i^hu_i^h`.
     """
     cfg = model.cfg
     return not (getattr(cfg, "relational_readout_mode", None) == "predictive_content"
+                and getattr(cfg, "predictive_readout", "kernel") == "kernel"
                 and not getattr(cfg, "attention_residual", False))
 
 
@@ -3037,6 +3063,8 @@ def train(
         val_diag_keys = val_diag_keys + _VAL_EDGE_DIAG_KEYS
         if getattr(cfg, "content_link_latent", False):
             val_diag_keys = val_diag_keys + _VAL_LATENT_DIAG_KEYS
+    if vfe_model and getattr(cfg, "predictive_readout", "kernel") == "minimal_agent":
+        val_diag_keys = val_diag_keys + _VAL_MINIMAL_AGENT_DIAG_KEYS
     last_val_diag: Dict[str, float] = {k: float("nan") for k in val_diag_keys}
     # Training-time diagnostic state (audit 2026-09-28). Built only for a persisted run; the silent
     # path and the console-only path allocate nothing here.

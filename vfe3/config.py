@@ -382,6 +382,20 @@ class VFE3Config:
     relational_receiver_update:          str           = "closed_form"         # "closed_form" | "euler"
     relational_receiver_damping:         float         = 1.0                   # closed_form only: rho in (0, 1]
     relational_routing:                  str           = "gaussian_kl"          # "gaussian_kl" | "noisy_query" (projected_predictive only)
+    # Predictive readout of projected_predictive (docs/implementation/minimal-agent-plan-2026-10-06.md,
+    # vfe3/model/minimal_agent.py). "kernel" is the predictive-kernel content U_i sum_h O'_h sum_j beta_ij^h T_h xi_j.
+    # "minimal_agent" conditions every receiver exactly on a noisy comparison record (minimal_agent_model.tex): the
+    # key is tied to the content (S_K = T), the receiving map C_i S_h^T (S_h C_i S_h^T + T_h C_j T_h^T + n_h I)^{-1}
+    # and the precision-weighted residual are derived (no O, no raw_score_k), and the routing is the exact source
+    # posterior at temperature 1 (relational_routing, kappa_beta and the kl_max clamp are not read). Requires equal
+    # heads, content_link_edges='off' and one frame for key and content (not pos_rotation='rope' with
+    # rope_on_value=False).
+    predictive_readout:                  str           = "kernel"               # "kernel" | "minimal_agent"
+    # "exact": every head's exact posterior (one d x d factor per pair), heads by assumed-density filtering in index
+    # order (exact when S_h C_i S_g^T = 0); "mean_field": KL labels at the input moments and the information-form
+    # fusion of the power posterior (its covariance omits the between-source spread). minimal_agent only.
+    minimal_agent_inference:             str           = "exact"                # "exact" | "mean_field"
+    minimal_agent_channel_noise:         float         = 1.0                    # initial channel noise n_h of every head (learned as channel_log_noise), > 0
     # Belief covariance after the predictive readout. "passthrough" keeps the incoming covariance
     # (a per-token-type routing state); "moment_matched" replaces it by the exact moment-matched
     # covariance of the predictive kernel (GL(K) v2 Theorem thm:probabilistic_status (2)): source
@@ -469,7 +483,9 @@ class VFE3Config:
     # diag C_i, C_i = U_i^{-1} Sigma_i U_i^{-T}. This is the training counterpart of M5 row 11. Frame
     # actions run with autocast off (float32, float64 for an escalated frame); the MLP keeps the
     # ambient autocast. Requires attention_mode='projected_predictive', pos_rotation='none', a
-    # 'none'/'layernorm' norm, and a passthrough 'coordinate'/'gaussian_template' MLP.
+    # 'none'/'layernorm' norm, and a passthrough 'coordinate'/'gaussian_template' MLP or a
+    # 'prototype_agents' MLP, which reads the whole C_i and maps a 'posterior' covariance back as
+    # U_i C_i^+ U_i^T.
     block_coordinates:          str   = "local"       # "local" | "reference"
 
     # Cross-block belief handoff (mu_q -> mu_p). Both blends must be convex so the prior stays on the
@@ -479,12 +495,21 @@ class VFE3Config:
 
     # Optional residual feed-forward unit applied after each belief block.
     use_block_mlp:              bool  = True
-    block_mlp_mode:             str   = "coordinate"  # "coordinate" | "gauge_gate" | "canonical_frame" | "gaussian_template" (passthrough only)
-    block_mlp_covariance:       str   = "passthrough" # "passthrough" | "delta_full"
+    block_mlp_mode:             str   = "coordinate"  # "coordinate" | "gauge_gate" | "canonical_frame" | "gaussian_template" (passthrough only) | "prototype_agents"
+    block_mlp_covariance:       str   = "passthrough" # "passthrough" | "delta_full" | "posterior" (prototype_agents only)
     block_mlp_activation:       str   = "gelu"        # "gelu" | "silu" | "relu"
 
     block_mlp_covariance_floor: float = 1e-4         # covariant SPD floor: Sigma+ = J Sigma J^T + floor Sigma
     block_mlp_expansion:        int   = 8
+    # prototype_agents: the block is the minimal agent model with M = block_mlp_expansion * K template
+    # agents N(nu_a, diag lambda_a). "mean_field" is the KL-label step (the gaussian_template
+    # responsibilities) and the power posterior; "exact" is the exact mixture posterior, whose block or
+    # dense working covariance (reference coordinates, gaussian_full) needs one Cholesky factor per
+    # (token, template, block), an extreme opt-in cost.
+    block_mlp_inference:        str   = "mean_field"  # "mean_field" | "exact"; read only by prototype_agents
+    # Initial template variance lambda_a of prototype_agents (finite, > 0). At 10 and token variances
+    # near 1 the initial pull toward the templates is c / (c + lambda) ~ 9 percent per layer.
+    block_mlp_template_init_variance: float = 10.0
     block_mlp_dropout:          float = 0.0
 
     m_block_mlp_lr:   Optional[float] = None
@@ -682,6 +707,9 @@ class VFE3Config:
     # ~550 ms per scorer call forward+backward against 11 ms without it, taking the RTX 5090 step
     # from 0.11 s to 0.60-0.79 s. Off, a flagged entry keeps its float32 factor (relative error
     # O(kappa eps_32) in its scores) and the certificate's two batched inverses are skipped.
+    # Under predictive_readout='minimal_agent' it also screens every float32 ADF query covariance A^h
+    # (eps_32 ||S_h C S_h^T||_F ||(A^h)^-1||_F > projected_gram_condition_tol) and recomputes a flagged layer
+    # call in float64, as a failed float32 factorization always is (vfe3/model/minimal_agent.py).
     projected_cov_condition_recovery: bool = False
 
     # Certificate thresholds of that recovery (read only with projected_cov_condition_recovery=True).
@@ -803,6 +831,15 @@ class VFE3Config:
         _require(self.relational_routing, ("gaussian_kl", "noisy_query"), "relational_routing")
         if self.relational_routing == "noisy_query" and full_link:
             raise ValueError("relational_routing='noisy_query' requires attention_mode='projected_predictive'")
+        from vfe3.model.minimal_agent import MINIMAL_AGENT_INFERENCE, PREDICTIVE_READOUTS
+        _require(self.predictive_readout, PREDICTIVE_READOUTS, "predictive_readout")
+        _require(self.minimal_agent_inference, MINIMAL_AGENT_INFERENCE, "minimal_agent_inference")
+        if (isinstance(self.minimal_agent_channel_noise, bool)
+                or not isinstance(self.minimal_agent_channel_noise, Real)
+                or not math.isfinite(float(self.minimal_agent_channel_noise))
+                or float(self.minimal_agent_channel_noise) <= 0.0):
+            raise ValueError("minimal_agent_channel_noise must be a finite real value > 0, "
+                             f"got {self.minimal_agent_channel_noise!r}")
         _require(self.predictive_covariance, ("passthrough", "moment_matched"), "predictive_covariance")
         if (isinstance(self.predictive_covariance_floor, bool)
                 or not isinstance(self.predictive_covariance_floor, Real)
@@ -1436,6 +1473,23 @@ class VFE3Config:
         _validate_latent_links(self.content_link_edges, self.content_link_latent, self.content_link_latent_steps,
                                self.content_link_latent_sigma, self.content_link_latent_damping,
                                self.content_link_loop_weight, self.content_link_loop_window)
+        # The minimal-agent readout (plan Section 2.1); the same checks as RelationalOperators where it can see them.
+        if self.predictive_readout == "minimal_agent":
+            agent_problems = []
+            if self.attention_mode != "projected_predictive":
+                agent_problems.append(f"attention_mode={self.attention_mode!r} (requires 'projected_predictive': the "
+                                      "projected_gradient receiver reads the content maps O)")
+            if len(set(self.head_dims)) > 1:
+                agent_problems.append(f"head sizes {self.head_dims} (requires equal heads; a mixed so_n irrep tower is "
+                                      "not supported)")
+            if self.content_link_edges != "off":
+                agent_problems.append(f"content_link_edges={self.content_link_edges!r} (requires 'off': the edge links "
+                                      "multiply the content factors O, which the minimal agent derives)")
+            if self.pos_rotation == "rope" and not self.rope_on_value:
+                agent_problems.append("pos_rotation='rope' with rope_on_value=False (the tied key is the content, so "
+                                      "both are read in one frame)")
+            if agent_problems:
+                raise ValueError("predictive_readout='minimal_agent' is unsupported here: " + "; ".join(agent_problems))
         # decode_mode / encode_mode validated against the LIVE decode/encode REGISTRIES (not static
         # literals) so a newly registered kernel is config-selectable without editing this validator.
         from vfe3.model.prior_bank import _DECODERS, _ENCODERS
@@ -1567,6 +1621,16 @@ class VFE3Config:
                 "block_mlp_dropout must be a finite real value in [0, 1), "
                 f"got {self.block_mlp_dropout!r}"
             )
+        # prototype_agents knobs (validated in every mode; inactive_fields reports them off that mode).
+        _require(self.block_mlp_inference, ("mean_field", "exact"), "block_mlp_inference")
+        if (isinstance(self.block_mlp_template_init_variance, bool)
+                or not isinstance(self.block_mlp_template_init_variance, Real)
+                or not math.isfinite(float(self.block_mlp_template_init_variance))
+                or float(self.block_mlp_template_init_variance) <= 0.0):
+            raise ValueError(
+                "block_mlp_template_init_variance must be a finite real value > 0, "
+                f"got {self.block_mlp_template_init_variance!r}"
+            )
 
         # Reference coordinates (M2 arms: LN and MLP in reference coordinates; the covariant decoder).
         # Both conjugate by the realized relational frame U_i, which is defined, fixed through the
@@ -1588,12 +1652,16 @@ class VFE3Config:
                     incompatible.append(f"{name}={getattr(self, name)!r} (requires 'none' or 'layernorm')")
             if self.use_cg_coupling:
                 incompatible.append("use_cg_coupling=True (acts in local coordinates before the norm)")
-            if self.use_block_mlp and self.block_mlp_mode not in ("coordinate", "gaussian_template"):
+            if self.use_block_mlp and self.block_mlp_mode not in ("coordinate", "gaussian_template",
+                                                                  "prototype_agents"):
                 incompatible.append(
-                    f"block_mlp_mode={self.block_mlp_mode!r} (requires 'coordinate' or 'gaussian_template'; "
-                    "canonical_frame is already conjugated and gauge_gate is already covariant)")
-            if self.use_block_mlp and self.block_mlp_covariance != "passthrough":
-                incompatible.append(f"block_mlp_covariance={self.block_mlp_covariance!r} (requires 'passthrough')")
+                    f"block_mlp_mode={self.block_mlp_mode!r} (requires 'coordinate', 'gaussian_template' or "
+                    "'prototype_agents'; canonical_frame is already conjugated and gauge_gate is already "
+                    "covariant)")
+            # 'posterior' (prototype_agents only, by the registry) maps C^+ back as U C^+ U^T.
+            if self.use_block_mlp and self.block_mlp_covariance not in ("passthrough", "posterior"):
+                incompatible.append(f"block_mlp_covariance={self.block_mlp_covariance!r} (requires "
+                                    "'passthrough', or 'posterior' with prototype_agents)")
             if incompatible:
                 raise ValueError(
                     "block_coordinates='reference' conjugates the block by the realized relational frame "
@@ -1769,14 +1837,19 @@ class VFE3Config:
                  "(m_phi_update_mode='pullback_group' or 'fisher_group')")
         if not phi_update_policy.requires_fisher_statistics:
             mark(("m_phi_fisher_rotation_weight",), "only read by m_phi_update_mode='fisher_group'")
-        if self.relational_routing == "noisy_query":
+        minimal_agent = self.predictive_readout == "minimal_agent"
+        if minimal_agent:
+            mark(("projected_factor_route",),
+                 "predictive_readout='minimal_agent' passes no source tuples to its factorizations, so the "
+                 "cholesky_qr2 factor route is never selected")
+        elif self.relational_routing == "noisy_query":
             mark(("projected_factor_route",),
                  "the noisy-query cost factors per-pair sums G_q + G_k and keeps the Gram route")
         if not self.deterministic:
             mark(("fill_uninitialized_memory",),
                  "torch fills uninitialized memory only under deterministic algorithms")
         gram_status = (self.projected_factor_route == "gram"
-                       or self.relational_routing == "noisy_query")
+                       or self.relational_routing == "noisy_query" or minimal_agent)
         if not (self.projected_cov_condition_recovery and gram_status):
             mark(("projected_gram_condition_tol",),
                  "only read by the Gram-route certificate under projected_cov_condition_recovery=True")
@@ -1796,8 +1869,21 @@ class VFE3Config:
                  "comes from its receiver update, and its self-information enters through "
                  "alpha KL(q||p) and the closed-form damping")
         elif self.predictive_covariance == "passthrough":
-            mark(("predictive_covariance_floor", "predictive_covariance_checkpoint"),
+            # The minimal agent checkpoints its whole readout (mean included), so only the floor is inert there.
+            mark(("predictive_covariance_floor",) if minimal_agent
+                 else ("predictive_covariance_floor", "predictive_covariance_checkpoint"),
                  "only read by predictive_covariance='moment_matched'")
+        if self.attention_mode != "projected_predictive":
+            mark(("predictive_readout",), "only read by attention_mode='projected_predictive'")
+        if minimal_agent:
+            mark(("relational_routing", "content_link_chart", "attention_residual", "relational_output_init",
+                  "kappa_beta"),
+                 "predictive_readout='minimal_agent' routes by the exact source posterior at temperature 1 (no "
+                 "routing-cost selector, no kappa_beta temperature) and derives the receiving map and the "
+                 "precision-weighted residual (no content factor O, so no chart, initial output scale or residual flag)")
+        else:
+            mark(("minimal_agent_inference", "minimal_agent_channel_noise"),
+                 "only read by predictive_readout='minimal_agent'")
         if self.content_link_edges == "off":
             mark(("content_link_edge_rank",), "only read when content_link_edges is 'lowrank' or 'pure_gauge'")
         if self.content_link_edges != "lowrank":
@@ -1834,6 +1920,13 @@ class VFE3Config:
         elif self.block_mlp_mode == "gaussian_template":
             mark(("block_mlp_activation", "block_mlp_covariance_floor"),
                  "gaussian_template gates by softmax over template KLs and keeps covariance")
+        elif self.block_mlp_mode == "prototype_agents":
+            mark(("block_mlp_activation", "block_mlp_covariance_floor"),
+                 "prototype_agents has no hidden activation, and its posterior covariance is exact, "
+                 "with no floor")
+        if not (self.use_block_mlp and self.block_mlp_mode == "prototype_agents"):
+            mark(("block_mlp_inference", "block_mlp_template_init_variance"),
+                 "only read by block_mlp_mode='prototype_agents' with use_block_mlp=True")
         if self.pos_phi != "learned":
             mark(("m_pos_phi_lr",), "only pos_phi='learned' creates the learnable positional table")
         if "layernorm" not in (self.norm_type_block, self.norm_type_final):

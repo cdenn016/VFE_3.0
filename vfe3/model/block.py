@@ -174,14 +174,19 @@ def _reference_coordinate_block(
         \mu_i^{(\ell+1)} = U_i\xi_i^+,\qquad \Sigma_i^{(\ell+1)} = \Sigma_i^{\mathrm{att}},
 
     and a Gaussian-template MLP reads the reference variances :math:`c_i = \operatorname{diag}C_i`,
-    :math:`C_i = U_i^{-1}\Sigma_i U_i^{-\top}`. Under the passive action
-    :math:`(\mu, \Sigma, U) \to (g\mu, g\Sigma g^\top, gU)` the pair :math:`(\xi, C)` is invariant and
-    :math:`\mu^{(\ell+1)} \to g\mu^{(\ell+1)}`. The frame actions run with autocast off (float32, float64
+    :math:`C_i = U_i^{-1}\Sigma_i U_i^{-\top}`. A prototype-agent MLP reads the whole :math:`C_i`
+    (blocks ``(B, N, G, d, d)`` for diagonal beliefs on a block frame, else dense ``(B, N, K, K)``,
+    :func:`vfe3.model.frame_actions.reference_covariance_compact`), and under
+    ``block_mlp_covariance='posterior'`` its :math:`C_i^+` returns as :math:`\Sigma_i^{(\ell+1)} = U_iC_i^+U_i^\top`
+    (its diagonal for diagonal beliefs), so that block is invariant under the passive action. Under the
+    passive action :math:`(\mu, \Sigma, U) \to (g\mu, g\Sigma g^\top, gU)` the pair :math:`(\xi, C)` is invariant
+    and :math:`\mu^{(\ell+1)} \to g\mu^{(\ell+1)}`. The frame actions run with autocast off (float32, float64
     for an escalated frame); the norm and MLP keep the ambient autocast. The captured
     ``block_mlp_input``/``block_mlp_output`` stay in local coordinates (:math:`U_iv_i`, :math:`U_i\xi_i^+`).
     """
-    from vfe3.model.block_mlp import GaussianTemplateBlockMLP
-    from vfe3.model.frame_actions import frame_matvec, reference_variances
+    from vfe3.model.block_mlp import GaussianTemplateBlockMLP, PrototypeAgentBlockMLP
+    from vfe3.model.frame_actions import (frame_matvec, local_covariance, reference_covariance_compact,
+                                          reference_variances)
 
     if frame is None:
         raise RuntimeError(
@@ -190,20 +195,28 @@ def _reference_coordinate_block(
     bd = frame.block_diagonal
     xi = frame_matvec(frame.inverse, out.mu, bd)                             # (B, N, K) xi = U^{-1} mu
     template = isinstance(block_mlp, GaussianTemplateBlockMLP)
-    c = reference_variances(out.mu, out.sigma, frame) if template else out.sigma   # diag C, or unread
+    prototype = isinstance(block_mlp, PrototypeAgentBlockMLP)
+    c = (reference_variances(out.mu, out.sigma, frame) if template           # diag C
+         else reference_covariance_compact(out.mu, out.sigma, frame) if prototype   # C blocks or dense
+         else out.sigma)                                                     # unread
     if block_norm is not None:
         xi = block_norm(xi, c)                                               # LN acts on xi only
     if capture is not None:
         capture["block_mlp_input"] = out._replace(mu=frame_matvec(frame.forward, xi, bd))
+    sigma = out.sigma
     if block_mlp is not None:
         if hasattr(block_mlp, "forward_moments"):
             extra = {} if hidden_bias is None else {"hidden_bias": hidden_bias}
-            xi = block_mlp.forward_moments(xi, c, **extra).mu                # passthrough: covariance kept
+            result = block_mlp.forward_moments(xi, c, **extra)
+            xi = result.mu                                                   # passthrough: covariance kept
+            if prototype and block_mlp.covariance_contract == "posterior":
+                sigma = local_covariance(out.mu, result.sigma, frame,         # Sigma^+ = U C^+ U^T
+                                         diagonal=out.sigma.dim() == out.mu.dim()).to(out.sigma.dtype)
         else:
             if hidden_bias is not None:
                 raise TypeError("a legacy block-MLP callable cannot take hidden_bias")
             xi = block_mlp(xi)
-    out = out._replace(mu=frame_matvec(frame.forward, xi, bd))               # (B, N, K) mu = U xi^+
+    out = out._replace(mu=frame_matvec(frame.forward, xi, bd), sigma=sigma)  # (B, N, K) mu = U xi^+
     if capture is not None:
         capture["block_mlp_output"] = out
     return out

@@ -120,3 +120,82 @@ def reference_covariance(
             out = inv @ s @ inv.transpose(-1, -2)                                      # (..., N, K, K)
         out = 0.5 * (out + out.transpose(-1, -2))
     return out.to(sigma.dtype)
+
+
+@ieee_fp32_matmul()
+def reference_covariance_compact(
+    mu:    torch.Tensor,                           # (..., N, K) local means (layout reference only)
+    sigma: torch.Tensor,                           # (..., N, K) diagonal or (..., N, K, K) full local covariance
+    frame: Any,                                    # CanonicalFrameContext of U_i
+) -> torch.Tensor:                                 # (..., N, G, d, d) blocks, or (..., N, K, K)
+    r"""Reference covariance :math:`C_i = U_i^{-1}\Sigma_i U_i^{-\top}` in its most compact exact layout.
+
+    For a diagonal :math:`\Sigma_i` on a compact block-diagonal frame :math:`U_i^{-1} = \bigoplus_g A_g`,
+    :math:`C_i` is block diagonal and is returned as its blocks
+    :math:`(C_i)_{gg} = A_g\operatorname{diag}(\sigma_g)A_g^\top`, ``(..., N, G, d, d)``; otherwise as the dense
+    :func:`reference_covariance`. Symmetrized, in ``sigma``'s dtype. This is the layout the prototype-agent
+    block MLP reads under ``block_coordinates='reference'``, the construction of
+    ``RelationalOperators._reference_covariance`` with the block shape taken from the frame.
+    """
+    if not (frame.block_diagonal and sigma.dim() == mu.dim()):
+        return reference_covariance(mu, sigma, frame)
+    dtype = _work_dtype(frame.inverse, sigma)
+    with torch.autocast(device_type=sigma.device.type, enabled=False):
+        inv, s = frame.inverse.to(dtype), sigma.to(dtype)
+        G, d = inv.shape[-3], inv.shape[-1]
+        s_b = s.reshape(*s.shape[:-1], G, d)                                           # (..., N, G, d)
+        blocks = (inv * s_b.unsqueeze(-2)) @ inv.transpose(-1, -2)                     # (..., N, G, d, d)
+        blocks = 0.5 * (blocks + blocks.transpose(-1, -2))
+    return blocks.to(sigma.dtype)
+
+
+@ieee_fp32_matmul()
+def local_covariance(
+    mu:       torch.Tensor,                        # (..., N, K) local means (layout reference only)
+    C:        torch.Tensor,                        # (..., N, G, d, d) blocks or (..., N, K, K) reference covariance
+    frame:    Any,                                 # CanonicalFrameContext of U_i
+    *,
+    diagonal: bool,                                # True: return diag Sigma_i, (..., N, K)
+) -> torch.Tensor:                                 # (..., N, K) or (..., N, K, K)
+    r"""Local covariance :math:`\Sigma_i = U_iC_iU_i^\top` of a reference covariance in either compact layout.
+
+    Blocks ``(..., N, G, d, d)`` need a compact block-diagonal frame of the same block shape and give
+    :math:`(\Sigma_i)_{gg} = U_g(C_i)_{gg}U_g^\top`; a dense :math:`C_i` gives the dense product (blockwise
+    :math:`U_g(C_i)_{gh}U_h^\top` for a compact frame). With ``diagonal`` only
+    :math:`\operatorname{diag}\Sigma_i` is formed, :math:`(\Sigma_i)_{kk} = \sum_{mn}U_{km}(C_i)_{mn}U_{kn}`,
+    the moment-matched diagonal; it reads only the diagonal blocks of :math:`C_i` on a block frame. Inverse
+    of :func:`reference_covariance_compact` for a diagonal :math:`\Sigma_i` and of :func:`reference_covariance`
+    for a full one. Returned in ``C``'s dtype.
+    """
+    K = mu.shape[-1]
+    blocks = C.dim() == mu.dim() + 2
+    if blocks and not frame.block_diagonal:
+        raise ValueError("a block reference covariance (..., N, G, d, d) needs a compact block-diagonal frame")
+    dtype = _work_dtype(frame.forward, C)
+    with torch.autocast(device_type=C.device.type, enabled=False):
+        U, c = frame.forward.to(dtype), C.to(dtype)
+        if blocks:
+            if U.shape[-3:] != c.shape[-3:]:
+                raise ValueError(f"reference covariance blocks {tuple(c.shape[-3:])} do not match the frame "
+                                 f"blocks {tuple(U.shape[-3:])}")
+            if diagonal:
+                out = ((U @ c) * U).sum(dim=-1).flatten(-2)                            # (..., N, K)
+            else:
+                S = U @ c @ U.transpose(-1, -2)                                        # (..., N, G, d, d)
+                eye_g = torch.eye(S.shape[-3], dtype=dtype, device=S.device)
+                out = torch.einsum("...gij,gh->...gihj", S, eye_g).reshape(*S.shape[:-3], K, K)
+        elif frame.block_diagonal:
+            G, d = U.shape[-3], U.shape[-1]
+            c_b = c.reshape(*c.shape[:-2], G, d, G, d)                                 # (..., N, G, d, G, d)
+            if diagonal:
+                diag_blocks = torch.diagonal(c_b, dim1=-4, dim2=-2).movedim(-1, -3)    # (..., N, G, d, d)
+                out = ((U @ diag_blocks) * U).sum(dim=-1).flatten(-2)                  # (..., N, K)
+            else:
+                out = torch.einsum("...gij,...gjhk,...hlk->...gihl", U, c_b, U).reshape(*c.shape[:-2], K, K)
+        elif diagonal:
+            out = ((U @ c) * U).sum(dim=-1)                                            # (..., N, K)
+        else:
+            out = U @ c @ U.transpose(-1, -2)                                          # (..., N, K, K)
+        if not diagonal:
+            out = 0.5 * (out + out.transpose(-1, -2))
+    return out.to(C.dtype)

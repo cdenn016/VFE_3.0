@@ -129,20 +129,34 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
             edge_fields.update({name: getattr(cfg, name) for name in (
                 "content_link_latent", "content_link_latent_steps", "content_link_latent_sigma",
                 "content_link_latent_damping", "content_link_loop_weight", "content_link_loop_window")})
+    # predictive_readout='minimal_agent' (vfe3/model/minimal_agent.py): S_Q (K^2) and channel_log_noise (H) score,
+    # T (K^2) is both the content and the tied key; no raw_score_k and no O (the receiving map is derived).
+    minimal_agent = getattr(cfg, "predictive_readout", "kernel") == "minimal_agent"
+    agent_fields: Dict[str, object] = {}
+    if minimal_agent:
+        layer_counts = {"score": K*K + H, "content": K*K}
+        content_shapes = [[H, dims[0], K]]
+        agent_fields = {"predictive_readout": "minimal_agent",
+                        "minimal_agent_inference": cfg.minimal_agent_inference,
+                        "minimal_agent_channel_noise_init": float(cfg.minimal_agent_channel_noise),
+                        "key_tied_to_content": True}
     counts = {role: count * cfg.n_layers for role, count in layer_counts.items()}
     return {"relational_operators": {
         "attention_mode": cfg.attention_mode,
-        "routing": cfg.relational_routing,
+        "routing": ((f"minimal_agent_{cfg.minimal_agent_inference}_source_posterior" if minimal_agent
+                     else cfg.relational_routing)),
         "n_layers": cfg.n_layers, "layer_parameter_sharing": "independent",
         "per_layer_parameter_counts": layer_counts,
         "shape_scope": "per_layer",
         "inference_semantics": ("relational_full_link_frozen_filtering" if full_link
+                                else f"relational_minimal_agent_{cfg.minimal_agent_inference}" if minimal_agent
                                 else "relational_predictive_content"),
         "readout_mode": cfg.relational_readout_mode,
         "output_scope": "full",
         "mean_update": (("receiver_closed_form_natural_parameter_update"
                          if cfg.relational_receiver_update == "closed_form" else "receiver_fisher_step")
                         if full_link else
+                        "minimal_agent_posterior_mean" if minimal_agent else
                         "input_plus_predictive_mean" if cfg.attention_residual else
                         "replace_with_predictive_mean"),
         "mode": cfg.relational_mode,
@@ -150,13 +164,16 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "input_dimension": K,
         "head_output_dimension": K,
         "score_parameterization": "free_full_row_rank",
-        "score_initialization": "independent_orthonormal_rows",
-        "score_role_parameter_counts": {"q": cfg.n_layers*K*K, "k": cfg.n_layers*K*K},
+        "score_initialization": ("query_equal_to_sending_block_projector" if minimal_agent
+                                 else "independent_orthonormal_rows"),
+        "score_role_parameter_counts": ({"q": cfg.n_layers*K*K, "k": 0, "channel_log_noise": cfg.n_layers*H}
+                                        if minimal_agent else {"q": cfg.n_layers*K*K, "k": cfg.n_layers*K*K}),
         "score_rank_per_head": rank, "content_rank_per_head": rank,
         "identity_content": False,
         "content_mode": "full_width",
-        "content_link_chart": cfg.content_link_chart,
+        "content_link_chart": None if minimal_agent else cfg.content_link_chart,
         **edge_fields,
+        **agent_fields,
         "score_shape": score_shape,
         "content_shapes": content_shapes,
         "parameter_counts": counts, "total_parameters": sum(counts.values()),
@@ -164,7 +181,8 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
             role: (cfg.m_p_mu_lr if getattr(cfg, f"m_relational_{role}_lr") is None
                    else getattr(cfg, f"m_relational_{role}_lr"))
             for role in counts},
-        "score_covariance_contract": "exact_full_reduced_covariance_from_local_gaussian",
+        "score_covariance_contract": ("exact_full_reduced_covariance_from_local_gaussian_plus_channel_noise"
+                                      if minimal_agent else "exact_full_reduced_covariance_from_local_gaussian"),
         "receiver_noise": cfg.relational_receiver_noise if full_link else None,
         "receiver_law": cfg.relational_receiver_law if full_link else None,
         "receiver_update": cfg.relational_receiver_update if full_link else None,
@@ -176,7 +194,8 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "content_covariance_contract": (("value_space_channel_likelihood_plus_channel_noise"
                                          if cfg.relational_receiver_law == "channel_likelihood" else
                                          "full_link_pushforward_plus_positive_reference_noise") if full_link else
-                                        "exact_predictive_kernel_moment_match_plus_covariant_floor"
+                                        ("minimal_agent_posterior_moment_match_plus_covariant_floor" if minimal_agent
+                                         else "exact_predictive_kernel_moment_match_plus_covariant_floor")
                                         if getattr(cfg, "predictive_covariance", "passthrough") == "moment_matched"
                                         else "frozen_receiver_bookkeeping_not_predictive_covariance"),
         "self_coupling_coordinate_contract": (
@@ -184,9 +203,20 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
             if cfg.family == "gaussian_full" and cfg.lambda_alpha_mode == "state_dependent_per_coord"
             else "family_default"),
         "factorization_policy": "zero_jitter_no_covariance_repairs",
-        "factorization_fallback": "failed_entries_source_square_root_qr_fp64",
-        "temperature_convention": "kappa_beta_times_sqrt_ambient_head_dim",
-        "routing_state": "episode_initial" if full_link else "pre_update",
+        # The minimal agent passes no source tuples, so no source-root recovery exists. A float32 layer call with a
+        # failed factorization (or, under projected_cov_condition_recovery, an ADF query covariance that fails the
+        # certificate) is recomputed whole in float64; a float64 failure raises. Its mean field also keeps the
+        # Gram-route certificate of projected_gaussian_kl (a whole-tensor float64 refactor of the KL factors).
+        "factorization_fallback": (("fp32_failure_or_certificate_layer_fp64_recompute"
+                                    + ("" if cfg.minimal_agent_inference == "exact"
+                                       else "_kl_certificate_fp64_refactor")) if minimal_agent
+                                   else "failed_entries_source_square_root_qr_fp64"),
+        "temperature_convention": ("unit_temperature_exact_posterior_no_clamp" if minimal_agent
+                                   else "kappa_beta_times_sqrt_ambient_head_dim"),
+        # Exact minimal agent: head h routes on the receiver moments left by heads 1..h-1 (ADF), sources pre-update.
+        "routing_state": ("episode_initial" if full_link
+                          else "pre_update_sources_adf_receiver"
+                          if minimal_agent and cfg.minimal_agent_inference == "exact" else "pre_update"),
         "state_destination": (
             "receiver_belief_mean_and_covariance"
             if (full_link and not getattr(cfg, "skip_belief_sigma_update", False))
@@ -211,6 +241,8 @@ def _conditional_unavailable_probe(probe: str, cfg: Optional[VFE3Config] = None)
         "probe": probe,
         "inference_semantics": ("relational_full_link_frozen_filtering"
                                 if cfg is not None and cfg.relational_readout_mode == "full_link_update"
+                                else f"relational_minimal_agent_{cfg.minimal_agent_inference}"
+                                if cfg is not None and getattr(cfg, "predictive_readout", "kernel") == "minimal_agent"
                                 else "relational_predictive_content"
                                 if cfg is not None and cfg.relational_readout_mode == "predictive_content"
                                 else "projected_attention"),

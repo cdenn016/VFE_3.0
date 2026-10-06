@@ -125,7 +125,24 @@ def relational_predictive_readout(
     Under ``content_link_latent`` its receiver factors are inferred from the source covariances of
     ``sigma`` (whatever ``predictive_covariance`` is), and a positive loop weight reads and writes
     ``link_state`` (``{"previous": ..., "current": ...}``, threaded across layers by ``vfe_stack``).
+
+    Under ``predictive_readout='minimal_agent'`` the routing, the content and the residual are replaced by the
+    exact Gaussian conditioning of :meth:`RelationalOperators.minimal_agent_update`, which reads the ROUTING frame
+    for query, key, content and write-back (a distinct ``value_frame`` with different matrices is refused: the tied
+    key is the content). ``tau`` and ``kl_max`` are not read (the posterior has temperature 1 and no clamp); the
+    result is the posterior mean, with no residual added, and ``return_covariance`` gives the posterior covariance
+    plus the covariant floor.
     """
+    if getattr(operators, "predictive_readout", "kernel") == "minimal_agent":
+        if value_frame is not None and value_frame is not frame and not (
+                value_frame.block_diagonal == frame.block_diagonal
+                and torch.equal(value_frame.forward, frame.forward)
+                and torch.equal(value_frame.inverse, frame.inverse)):
+            raise ValueError("predictive_readout='minimal_agent' reads key and content in one frame; the value frame "
+                             "differs from the routing frame (pos_rotation='rope' with rope_on_value=False)")
+        mean, sigma_plus = operators.minimal_agent_update(
+            mu, sigma, frame, log_prior, return_covariance=return_covariance, capture=capture)
+        return (mean, sigma_plus) if return_covariance else mean
     from vfe3.families.base import safe_kl_clamp
     from vfe3.free_energy import attention_weights
     dtype = torch.float64 if mu.dtype == torch.float64 else torch.float32

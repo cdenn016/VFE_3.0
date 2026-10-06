@@ -8,8 +8,9 @@ r"""Parameter, optimizer-state and throughput accounting of a vfe3 run, by param
   parameter whose leading axis is the vocabulary), and the per-type block-MLP hidden bias
   ``per_type_hidden_bias`` when present;
 * ``positional_frames``: the positional frame generators ``pos_phi_free``;
-* ``context_processing``: the relational comparison maps ``raw_score_q``/``raw_score_k``
-  (``relational_score``), the content maps ``T``/``O`` and the ``edge_*`` factor maps of
+* ``context_processing``: the relational comparison maps ``raw_score_q``/``raw_score_k`` and the
+  minimal-agent channel noise ``channel_log_noise`` (``relational_score``), the content maps ``T``/``O`` and the
+  ``edge_*`` factor maps of
   ``content_link_edges`` (``relational_content``), the block MLPs
   (``block_mlp``), the block and final normalizations (``norm``), and the opt-in CG
   coupling when present;
@@ -135,7 +136,7 @@ def parameter_role(
     if name.startswith("relational_operators"):
         # Mixed head sizes store per-run lists: the attribute is the segment before the run index.
         attribute = name.rsplit(".", 2)[-2] if leaf.isdigit() else leaf
-        if attribute in ("raw_score_q", "raw_score_k"):
+        if attribute in ("raw_score_q", "raw_score_k", "channel_log_noise"):   # channel_log_noise: minimal agent
             return "context_processing", "relational_score"
         if attribute in ("T", "O") or attribute.startswith("edge_"):   # edge_*: content_link_edges factor maps
             return "context_processing", "relational_content"

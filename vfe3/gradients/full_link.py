@@ -376,6 +376,10 @@ def build_full_link_context(
     if getattr(operators, "content_link_edges", "off") != "off":
         raise ValueError("full-link inference reads the shared content maps; content_link_edges operators "
                          "(edge links G_ij = g_i e^L E_ij) are supported by the predictive_content readout only")
+    if getattr(operators, "predictive_readout", "kernel") != "kernel":
+        raise ValueError("full-link inference reads the content maps (T, O); predictive_readout='minimal_agent' "
+                         "operators store no O (their receiving map is derived) and run only through "
+                         "relational_predictive_readout")
     if operators.routing != "gaussian_kl":
         raise ValueError("full-link inference requires gaussian_kl routing")
     if not math.isfinite(receiver_noise) or receiver_noise <= 0:

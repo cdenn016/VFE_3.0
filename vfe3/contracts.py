@@ -112,7 +112,12 @@ class CanonicalFrameContext:
 
 @dataclass(frozen=True)
 class BlockMLPBuildMetadata:
-    """Immutable executable BlockMLP structure captured when a model is built."""
+    """Immutable executable BlockMLP structure captured when a model is built.
+
+    ``flops_per_token`` is the registry's analytic per-token proxy in local coordinates; for
+    ``prototype_agents`` it is the mean-field cost and does not represent ``block_mlp_inference='exact'``
+    or ``block_coordinates='reference'``.
+    """
 
     enabled: bool
     mode: str
