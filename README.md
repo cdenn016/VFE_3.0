@@ -31,10 +31,10 @@ flowchart TD
     State --> Send["T: extract content in reference coordinates"]
     Router --> Pool["Weighted source aggregation"]
     Send --> Pool
-    Pool --> Receive["O: write full reference state; apply receiver frame"]
-    Receive --> Residual["Attention residual + configured block transforms"]
+    Pool --> Receive["Receiving map in the selected content-link chart; apply receiver frame"]
+    Receive --> Residual["Attention residual, moment-matched covariance, block LayerNorm and MLP"]
     Residual --> Next["Repeat through the layer stack"]
-    Next --> Decode["Prior-bank KL readout with unigram prior"]
+    Next --> Decode["Linear decoder with unigram prior (or a prior-bank KL readout)"]
     Decode --> Loss["Next-token cross-entropy"]
 ```
 
@@ -69,11 +69,14 @@ C_i=U_i^{-1}\Sigma_i U_i^{-\top}.
 $$
 
 The full-Gaussian theory assumes $\Sigma_i\succ0$. The current launcher selects
-`gaussian_full`; the projected route also admits `gaussian_diagonal`. Saved configs
+`gaussian_diagonal`; the projected route also admits `gaussian_full`. Saved configs
 naming `gaussian_diagonal_exact` load as `gaussian_diagonal` (the same function and
-parameters); `gaussian_frame_diagonal` is retired and refused on load. A diagonal stored state can yield a dense projected covariance. On the
-launcher's route the stored covariance itself stays diagonal, so `gaussian_full` computes
-the same function as `gaussian_diagonal` there (see the configuration table below).
+parameters); `gaussian_frame_diagonal` is retired and refused on load. A diagonal stored
+state still yields dense projected covariances through the frames. Under the launcher's
+moment-matched predictive covariance, the diagonal family keeps the diagonal of the local
+moment-matched covariance (the moment projection onto diagonal Gaussians) while
+`gaussian_full` keeps it dense, so the two families compute different functions; they
+coincide only when no seam densifies the covariance (see the configuration section below).
 
 ### Comparison interfaces
 
@@ -190,9 +193,11 @@ model-specific content is the choice of $D_{ij}^{(h)}$ as a Gaussian KL divergen
 between projected moments, which the construction posits rather than derives.
 The projected routes always include the attention entropy; entropy regularization
 determines the Gibbs weights without an iterative gradient update over
-them. The attention-temperature policy uses `kappa_beta` and head dimensions. The
-current launcher selects an unwindowed `causal_alibi` source prior; `attention_window`
-is read only by the windowed priors, so the launcher's value is inactive.
+them. The attention-temperature policy uses `kappa_beta` and head dimensions
+($\tau_h=\kappa\sqrt{d}$; the launcher's `kappa_beta=1` gives $\tau_h=\sqrt d$). The
+current launcher selects the uniform `causal` source prior; positions enter through
+learned positional frames (`pos_phi="learned"`) rather than an ALiBi bias.
+`attention_window` is read only by the windowed priors, so the launcher's value is inactive.
 
 Runtime numerical KL bounds apply before softmax. Finite `kl_max` clips large
 energies; `float("inf")` removes the upper ceiling while retaining the nonnegative
@@ -215,11 +220,16 @@ These formulas use a common score/value frame, as in the current launcher's
 `pos_rotation="none"` setting; optional rotary-position policies can give
 comparison and content distinct realized frames.
 
-`predictive_content` leaves covariance unchanged **within this attention step**.
-It does not compute the covariance of a Gaussian mixture or a routed population
-joint law. Subsequent block transforms and stack handoff have separate covariance
-policies. Mean aggregation alone is not exact Gaussian propagation through an
-entire nonlinear layer.
+Under `predictive_covariance="passthrough"`, `predictive_content` leaves covariance
+unchanged **within this attention step**. Under `predictive_covariance="moment_matched"`
+it replaces the covariance by the exact moment-matched covariance of the predictive
+kernel (Theorem `thm:probabilistic_status` (2) of the v2 manuscript): source covariances
+pushed through the head maps, cross-head terms, the between-source spread, the residual
+persistence term, and the covariant floor $f(\operatorname{tr}C_i/K)I$ in reference
+coordinates, with $f$ = `predictive_covariance_floor`. Neither is a routed population
+joint law. Subsequent block transforms and
+stack handoff have separate covariance policies, and neither contract is exact Gaussian
+propagation through an entire nonlinear layer.
 
 **There is no gradient-based inner belief E-step on this branch.** Source means,
 routing scores, frames, and content maps retain their outer training graphs.
@@ -242,6 +252,123 @@ routing additionally requires the bias to be constant or canceled by a specified
 source prior, with appropriate temperature scaling. Varying key covariances retain
 further uncertainty-dependent terms. The current model does not impose this limit.
 
+## Content-link charts and edge-dependent links
+
+### Content-link charts
+
+`content_link_chart` selects the effective receiving map built from the stored
+factors $(O,T)$. With the row stack $T=[T_1;\cdots;T_H]$ square and invertible (tiled
+heads, $Hd=K$) and $L=OT$,
+
+$$
+\widetilde O_{\text{affine}}=O,\qquad
+\widetilde O_{\text{first-order}}=T^{-1}+O,\qquad
+\widetilde O_{\text{exponential}}=T^{-1}+O\varphi_1(TO)=e^{L}T^{-1},
+$$
+
+with $\varphi_1(Z)=\sum_{n\ge1}Z^{n-1}/n!$. Writing $\Pi_h=T^{-1}\Delta_hT$ for the
+oblique projector onto head $h$'s block ($\Delta_h$ selects that block) and
+$\Pi(\beta_{ij})=\sum_h\beta_{ij}^{(h)}\Pi_h$, the exponential-chart message is
+
+$$
+m_i=U_i\sum_je^{L}\Pi(\beta_{ij})\xi_j ,
+$$
+
+so each head keeps the oblique component of the source that no other head reads, and one
+group element $e^{L}\in\mathrm{GL}^+(K)$ transports the routed components into the
+receiver: the shared-generator link $\Theta_{ij}=U_ie^{L}U_j^{-1}$ of the v2 manuscript
+(Theorem `thm:routed_transport`). The affine chart is the standard value/output path, and
+stored $O=0$ means zero content there but the head-routed flat transport in the other two
+charts. The non-affine charts invert $T$ and evaluate $\varphi_1$ once per layer in float64.
+
+### Edge-dependent links
+
+With one generator per layer, every triangle holonomy $\Theta_{ik}^{-1}\Theta_{ij}\Theta_{jk}$
+is conjugate to $e^{L}$, so a layer's link field has a single holonomy class.
+`content_link_edges` gives every edge $j\to i$ its own reference link
+
+$$
+G_{ij}=g_ie^{L}E_{ij},\qquad E_{ij}=I_K+A_i\Phi_{ij}B_j^\top,\qquad
+\hat x_i=\frac{\xi_i}{(K^{-1}\lVert\xi_i\rVert^2+10^{-12})^{1/2}},
+$$
+
+with rank-$r$ factors $A_i,B_j\in\mathbb R^{K\times r}$ read by learned linear maps from the
+RMS-normalized reference mean $\hat x$, which is invariant under the passive frame action.
+
+| Mode | Factors | Link | Holonomy |
+|---|---|---|---|
+| `"lowrank"` (curved) | $A_i=a(\hat x_i)$, $B_j=b(\hat x_j)$, $g_i=I$, $\Phi_{ij}=\varphi_1(B_j^\top A_i)$ | $G_{ij}=e^{L}\exp(A_iB_j^\top)$ | varies from triangle to triangle |
+| `"pure_gauge"` (flat control) | shared basis $A$, $B_j=b(\hat x_j)$, $g_i=\exp(AB_i^\top)$, $\Phi_{ij}=-\varphi_1(-B_j^\top A)$ | $G_{ij}=g_ie^{L}g_j^{-1}$ | every triangle conjugate to $e^{L}$ |
+
+Both follow from $\exp(AB^\top)=I+A\varphi_1(B^\top A)B^\top$. The pure-gauge arm has the same
+kind of content dependence and no holonomy beyond the shared class, so it is the control
+that separates curvature from content-dependent transport; it is not parameter-matched
+($K^2r+Kr$ against $2K^2r$ parameters per layer). The sender map $b$ starts at zero, so both
+modes start exactly at the exponential chart. The message factors as
+$m_i=U_ig_i\widetilde O(z_i+TA_iy_i)$, where $z_i$ stacks the pooled head values
+$\sum_j\beta_{ij}^{(h)}T_h\xi_j$, $y_i=\sum_j\Phi_{ij}c_{ij}$, and
+$c_{ij}=\sum_h\beta_{ij}^{(h)}(T^{-\top}B_j)_h^\top T_h\xi_j$, so the curved mode needs one
+$r\times r$ matrix function per causal edge and the control two per token, and the
+moment-matched covariance gains rank-$r$ corrections. The argument of $\varphi_1$ is zeroed
+on masked pairs before evaluation, so large factors on future pairs cannot produce
+non-finite values. Edge links require `content_link_chart="exponential"`,
+`attention_mode="projected_predictive"` and equal heads; the post-hoc holonomy analysis and
+the full-link gradient path refuse edge-enabled models.
+
+### Latent receiver factors
+
+`content_link_latent=True` (curved mode only) treats the receiver factor $A_i$ as a latent
+variable with prior $\mathcal N(a(\hat x_i),\sigma_L^2I)$ and estimates it per context.
+Only the receiver factor is inferred: a sender factor $B_j$ enters every later receiver's
+links, so inferring it would leak future tokens into position $j$. Profiling out the
+receiver's next-layer state reduces the link energy to the dimensionless predictive variance
+$\operatorname{tr}C_i^{\mathrm{att}}/(2\operatorname{tr}C_i/K)$ (the moment-matched covariance
+without its floor), so the per-receiver energy is
+
+$$
+\mathcal F_i(A_i)=\frac{\operatorname{tr}C_i^{\mathrm{att}}(A_i)}{2\operatorname{tr}C_i/K}
++\frac{\lVert A_i-a(\hat x_i)\rVert_F^2}{2\sigma_L^2}
++\lambda_W\sum_{i-w\le k<j\le i}w_{ijk}\tfrac12\lVert W_{ijk}-I\rVert_F^2 ,
+$$
+
+where the optional loop prior compares two-step routes across layers through
+$W_{ijk}=(G_{ik}^{\ell+1}G_{kk}^{\ell})^{-1}G_{ij}^{\ell+1}G_{jk}^{\ell}$ with weights from
+the routing prior. The upper layer's shared generator cancels in $W_{ijk}$, so the
+shared-generator model is loop-flat. The estimate is $T$ damped steps
+$A\leftarrow(1-\rho)A+\rho(A-\sigma_L^2\nabla_A\mathcal F_i(A))$; the inner step is the unit
+natural-gradient step in the prior's Fisher metric, and its fixed points are the stationary
+points of $\mathcal F_i$. The steps are unrolled for the outer gradient, and $\sigma_L\to0$
+returns the amortized curved mode. The undamped step converges locally only while $\sigma_L^2$ times the
+curvature of the energy stays below 1, and no safeguard is implemented, so compare
+`val_relational_latent_energy_final` with `val_relational_latent_energy_initial` before
+long runs.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `content_link_edges` | `"off"` | `"off"`, `"lowrank"`, or `"pure_gauge"` |
+| `content_link_edge_rank` | `4` | factor rank $r$, $1\le r\le K$ |
+| `content_link_latent` | `False` | latent receiver factors (requires `"lowrank"`) |
+| `content_link_latent_steps` | `1` | fixed-point steps $T$ |
+| `content_link_latent_sigma` | `0.1` | prior width $\sigma_L$ |
+| `content_link_latent_damping` | `1.0` | damping $\rho\in(0,1]$ |
+| `content_link_loop_weight` | `0.0` | loop-prior weight $\lambda_W$ (requires latent factors) |
+| `content_link_loop_window` | `1` | loop window $w$, or `None` for every loop |
+
+Measured on the CPU (one thread), $\varphi_1$ forward and backward costs about 11.6, 42, 193
+and 961 ms per thousand edges at $r=$ 4, 8, 16 and 32, and the curved mode adds $2K^2r$
+parameters per layer (524,288 at $K=128$, four layers, $r=4$, about 40 percent of that model's
+context-processing parameters). One readout layer at $K=192$, $N=256$, batch 1 took 0.42 s
+without gradients and 1.35 s with them for the exponential chart, 0.83 s and 2.74 s curved,
+0.54 s and 1.83 s pure gauge, and 1.95 s and 6.76 s with latent factors at $T=1$. At batch 8
+over six layers the latent readouts keep about 62 GB of saved tensors (37 GB with
+`predictive_covariance_checkpoint`), so latent arms at that shape need the checkpoint and
+`grad_accum_steps` of 4 or more; GPU cost was not measured. The tests are
+`tests/test_edge_links_20261005.py`, `tests/test_latent_links_20261005.py` and their
+independent brute-force references `tests/test_edge_links_reference_20261005.py` and
+`tests/test_latent_links_reference_20261005.py`. The derivations are in
+`Research/manuscripts/Attention/edge_latent_links.tex`; the implementation record is in
+[docs/2026-10-05.md](docs/2026-10-05.md).
+
 ## Configuration and training
 
 The editable launcher dictionary is distinct from the defaults in
@@ -252,18 +379,33 @@ rather than a complete standalone configuration:
 config.update(
     attention_mode="projected_predictive",
     attention_residual=True,
-    relational_routing="gaussian_kl",     # or "noisy_query"
+    relational_routing="gaussian_kl",       # or "noisy_query"
+    content_link_chart="exponential",       # "affine" | "first_order" | "exponential"
+    content_link_edges="off",               # "lowrank" | "pure_gauge": edge-dependent links
+    predictive_covariance="moment_matched", # or "passthrough"
     gauge_group="block_glk",
+    gauge_transport="on",
     n_e_steps=1,
-    family="gaussian_full",               # value-identical to gaussian_diagonal on this route
+    family="gaussian_diagonal",
     encode_mode="per_token",
-    decode_mode="full_chunked",           # prior-bank KL readout
+    pos_phi="learned",                      # learned positional frames
+    pos_rotation="none",
+    beta_attention_prior="causal",          # uniform causal source prior
+    kappa_beta=1,                           # tau_h = sqrt(d)
+    norm_type_block="layernorm",
+    use_block_mlp=True,
+    block_mlp_mode="coordinate",            # GELU MLP, covariance passthrough
+    decode_mode="linear",                   # prior-bank KL readouts: "diagonal_chunked", "full_chunked"
     decode_unigram_prior=True,
     untie_decode_bank=True,
-    beta_attention_prior="causal_alibi",
-    fp32_matmul_precision="highest",      # TF32 is not enabled
+    m_phi_update_mode="adamw",              # frame updates
+    amp_dtype="bf16",
+    fp32_matmul_precision="highest",        # TF32 is not enabled
 )
 ```
+
+These are the method selections of the runs reported under [Results](#results); widths,
+depths, and rates change from run to run and are recorded in each run's `config.json`.
 
 The divergence (Gaussian KL), the flat connection with reference frames (links also
 include O @ T), filtering gradient roles, the unrolled estimator, the Fisher mean step,
@@ -279,24 +421,29 @@ the validator for the complete admission rules.
 | `e_q_mu_lr`, `e_q_sigma_lr` | Unread by the predictive readout. |
 | `lambda_alpha`, `lambda_alpha_mode`, `b0`, `c0` | Unused by predictive readout; may affect separately enabled outer self-coupling. |
 | `m_relational_score_lr` | Outer rate for $S_Q,S_K$ across layers. |
-| `m_relational_content_lr` | Outer rate for $T,O$ across layers. |
-| `family="gaussian_full"` | Value-identical to `gaussian_diagonal` here; see below. |
+| `m_relational_content_lr` | Outer rate for $T,O$ (and edge-link factor maps) across layers. |
+| `content_link_chart="exponential"` | Receiving map $e^{OT}T^{-1}$; see [Content-link charts](#content-link-charts). |
+| `predictive_covariance="moment_matched"` | Replaces the covariance by the predictive kernel's moment-matched covariance plus a covariant floor. |
+| `family="gaussian_diagonal"` | Keeps the diagonal of the local moment-matched covariance; `gaussian_full` keeps it dense, so the two differ on this route; see below. |
 | `encode_mode="per_token_additive"` | Capacity-matched $\Omega=I$ control; requires `pos_phi="none"` and `pos_rotation="none"`. |
 
 Relational rates of `None` inherit `m_p_mu_lr`; `0.0` freezes that role's
 parameters while retaining its forward operation. Score and content groups have
 zero weight decay.
 
-On this route `family="gaussian_full"` computes the same function as
-`gaussian_diagonal` with the rank-matched decoder. The encoder stores the covariance as
-the diagonal of a per-token table, the predictive readout keeps it, and under the
-inherited `block_mlp_covariance="passthrough"` no later seam densifies it; a float64
-probe with shared parameters gives identical losses and an exactly zero off-diagonal
-covariance. A genuinely full covariance requires `block_mlp_covariance="delta_full"`,
-`predictive_covariance="moment_matched"`, or the covariance updates of
-`attention_mode="projected_gradient"`.
+When both covariance contracts pass the covariance through
+(`predictive_covariance="passthrough"` and `block_mlp_covariance="passthrough"`),
+`family="gaussian_full"` computes the same function as `gaussian_diagonal` with the
+rank-matched decoder: the encoder stores the covariance as the diagonal of a per-token
+table and no seam densifies it, and a float64 probe with shared parameters gives identical
+losses and an exactly zero off-diagonal covariance. The current launcher's
+`predictive_covariance="moment_matched"` densifies it, so on the launcher's route the
+diagonal family keeps only the diagonal of the local moment-matched covariance and the two
+families differ. A genuinely full covariance requires `gaussian_full` together with
+`block_mlp_covariance="delta_full"`, `predictive_covariance="moment_matched"`, or the
+covariance updates of `attention_mode="projected_gradient"`.
 `VFE3Config.inactive_fields()`
-reports this equivalence, together with every other setting that no active path reads
+reports this equivalence when it holds, together with every other setting that no active path reads
 (for example `lambda_beta`, `sigma_max`, and the congruence-precision knobs on this
 route), and `train_vfe3.py` prints the inactive settings it names explicitly at every
 launch.
@@ -322,9 +469,12 @@ fixed architectural constants.
 configured positional components form the frames. The input bank is present under
 every decoder; there is no `use_prior_bank` switch.
 
-The launcher decodes with `decode_mode="full_chunked"`: each vocabulary item $v$ owns a
-Gaussian $p_v$ (an untied copy of the token tables under `untie_decode_bank=True`), and
-the logits combine the divergence to it with the corpus unigram log-prior,
+The current launcher decodes with `decode_mode="linear"`,
+$z_{iv}=(W\mu_i+b)_v+\kappa\log u_v$, read from the final mean (the unigram term under
+`decode_unigram_prior=True`), which discards the covariance. The prior-bank decoder
+`decode_mode="full_chunked"` instead gives each vocabulary item $v$ a Gaussian $p_v$ (an
+untied copy of the token tables under `untie_decode_bank=True`) and combines the divergence
+to it with the corpus unigram log-prior,
 
 $$
 z_{iv}=-\frac{D_{\mathrm{KL}}(q_i\Vert p_v)}{\tau_{\mathrm{eff}}}+\kappa\log u_v,
@@ -341,8 +491,7 @@ p_\theta(x_{i+1}\mid x_{\le i})=\mathrm{softmax}(z_i)_{x_{i+1}},\qquad
 \log p_\theta(x_{i+1}\mid x_{\le i}).
 $$
 
-`decode_mode="linear"` instead reads out $z_i=W\mu_i(+b)$ from the final mean and
-discards the covariance. Outer backpropagation trains enabled prior, frame, interface,
+Under either decoder, outer backpropagation trains enabled prior, frame, interface,
 MLP, normalization, and decoder parameters. Optional outer penalties are separate
 choices. This loss is not the same scalar as the variational routing objective.
 
@@ -426,12 +575,88 @@ LayerNorm, nonlinear MLPs, numerical clipping, and a fixed vocabulary decoder
 each require their own analysis. Full-Gaussian theory and the selected executable
 approximation should remain distinct.
 
+## Results
+
+Every result below is a single-seed run on WikiText-103 with the GPT-2 BPE tokenizer
+(50,257 types), context 128, and the evaluation of `vfe3.train.evaluate` (windows of 128
+tokens at stride 32; 280,541 scored test targets). Perplexities are per BPE token, on the
+held-out test split, at the final training weights.
+
+### K = 128 against a parameter-matched conventional transformer
+
+| | VFE | Conventional transformer |
+|---|---|---|
+| Run | `34.48_wikitext-103_K128_block_glk_linear_mlp_s6` | `55.10_wikitext-103_K128_baseline_block_read_s6` |
+| **Test perplexity** | **34.48** (CE 3.540 nats) | 55.10 (CE 4.009 nats) |
+| Best validation perplexity | 32.94 (step 140,000) | 53.65 (step 150,000) |
+| Width, heads, layers, context | 128, 4 of width 32, 4, 128 | same |
+| Updates and tokens | 150,000 at batch 32 (614.4M tokens, 5.26 epochs) | same |
+| Model seed, data seed | 6, 3 | same |
+| Context-processing parameters | 1,315,584 | 1,317,632 |
+| Per-type tables | 225,201,617 (frames 205,852,672) | 218,768,721 (read maps 205,852,672) |
+| Parameters read per token | 7,807,185 | 7,805,009 |
+| Total parameters | 227,041,489 | 220,086,353 |
+| Optimizer | per-group AdamW rates (score 0.01, content 0.0025, MLP 0.005, prior means 0.005, frames 0.003), weight decay 0.01 | AdamW 3e-3 (best of a 6,000-step sweep over 3e-4 to 3e-3), weight decay 0.1 |
+| Positions | learned positional frames, uniform causal prior | ALiBi |
+| Wall time, RTX 5090 | 58,897 s | 5,238 s |
+
+The VFE model is the projected-predictive route with Gaussian-KL routing between full
+$32\times32$ projected covariances at $\tau=\sqrt{32}$, the exponential content chart,
+attention residual, moment-matched predictive covariance (floor $10^{-4}$), the diagonal
+Gaussian family on four $\mathrm{GL}(32)$ frame blocks, one shared LayerNorm, a
+$128\to1024\to128$ GELU MLP, and an untied linear decoder with a unigram prior. The
+conventional model is `vfe3/baseline.py` (built by `train_baseline.py` with
+`BaselineConfig.matched_to` from the VFE run) with `per_type_table="block_read"`: a
+per-type, head-block-diagonal read map, shared by every layer and applied to the attention
+input, whose table has exactly the size of the VFE token-frame table. The two models
+therefore match in context-processing parameters (to 0.16 percent), in per-type table size
+(exactly), and in parameters read per token (to 0.03 percent), and they see the same tokens
+in the same order. The test gap is 0.469 nats per token, a perplexity ratio of 1.60.
+Earlier protocol-matched pairs without the per-type table (39.77 against 90.15 at $K=128$,
+52.91 against 117.63 at $K=64$, at a different token budget) matched non-embedding parameters
+but differed 16- to 17-fold in total parameters; this comparison removes that confound.
+
+What it does not establish: (1) compute is not matched; the VFE run took 11.2 times the
+baseline's wall time on the same GPU, and a compute-matched baseline has not been trained;
+(2) each arm has one seed (the nearest measured seed spread is about 0.6 perplexity at
+$K=30$); (3) the baseline's learning rate is the largest value of its sweep, so its optimum
+may lie higher, and the VFE rates were not swept either; (4) the frames act on both sides
+of every link ($U_j^{-1}$ to read, $U_i$ to write) while the read map acts on one side, and
+the VFE model also stores per-type variances (6.4M parameters, 3 percent of the total) and
+positional frames (524,288 parameters) where the baseline uses parameter-free ALiBi. The
+comparison isolates the construction as a whole against a conventional transformer with an
+equally large per-type table; it does not identify which ingredient (two-sided frames,
+divergence routing, propagated covariance, the exponential chart) produces the gap.
+
+### Edge-dependent links at K = 20
+
+| Arm (`content_link_edges`, $r=4$) | Test perplexity | Best validation perplexity | Wall time |
+|---|---|---|---|
+| `"pure_gauge"` | 116.88 | 117.50 | 5,684 s |
+| `"lowrank"` | 116.94 | 117.46 | 12,059 s |
+| `"off"` (exponential chart) | pending | pending | |
+
+Both runs use $K=20$ (two heads of width 10), four layers, 30,000 updates at batch 32,
+seed 6, the exponential chart and the coordinate MLP (`vfe3_runs/edge-links-ablations/`).
+The two arms differ by 0.0005 nats per token, far below the seed spread, so at this size and
+seed the extra holonomy of the curved mode has no measurable effect. Both models depend on
+their edges: zeroing the edge sender map of the trained models (which returns every link to
+$e^{L}$ while keeping the trained $T$ and $O$) raises the cross-entropy on 16 validation
+windows by 1.22 nats for the pure-gauge model and 10.2 nats for the curved one. The curved
+model's last layer reaches edge parts $\lVert E_{ij}-I\rVert_F$ of order $10^3$ on average and
+above $10^5$ at most in the logged diagnostics, a numerical risk at larger width. Whether edge dependence helps at all
+is decided by the edges-off arm at the same configuration, which was still training when
+this section was written. Small-width results validate the implementation and do not settle
+behavior at $K\ge128$.
+
 ## Implementation map
 
 | Responsibility | Source |
 |---|---|
 | Defaults, compatibility, inactive-setting advisories | [`config.py`](vfe3/config.py) |
 | Per-layer interfaces and factorized aggregation | [`relational_operators.py`](vfe3/model/relational_operators.py) |
+| Edge-dependent links, latent receiver factors, loop prior | [`edge_links.py`](vfe3/model/edge_links.py) |
+| Conventional-transformer baseline and its launcher | [`baseline.py`](vfe3/baseline.py), [`train_baseline.py`](train_baseline.py) |
 | Projected Gaussian scoring | [`relational_scoring.py`](vfe3/relational_scoring.py) |
 | Projected routing score and predictive readout | [`relational.py`](vfe3/gradients/relational.py) |
 | Full-link receiver laws, gradients and closed-form update | [`full_link.py`](vfe3/gradients/full_link.py) |
@@ -588,6 +813,7 @@ maintained outside this checkout in the author's `Research/manuscripts/` directo
 | `GL(K)_attention_v2.tex` | Principal/associated bundles, comparison interfaces, matrix links, token priors, predictive composition, and transformer correspondence. |
 | `GL(K)_supplementary_v2.tex` | Supporting probabilistic, covariance, nonlinear-closure, and causal-prediction results. |
 | `GL(K)_gradients.tex` | Optional variational belief objectives, derivatives, and gradient updates. |
+| `Attention/edge_latent_links.tex` | Edge-dependent links (curved and pure-gauge modes), their message and covariance, latent receiver factors, and the loop prior. |
 | `PIFB2.tex` | Broader contextual bundle/variational framework; not an implemented multiscale language-model specification. |
 
 The current v2 set is maintained in that external manuscript directory. The
