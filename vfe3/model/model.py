@@ -371,6 +371,14 @@ class VFEModel(nn.Module):
                                 receiver_update=cfg.relational_receiver_update,
                                 receiver_damping=cfg.relational_receiver_damping,
                                 content_link_chart=cfg.content_link_chart,
+                                content_link_edges=cfg.content_link_edges,
+                                content_link_edge_rank=cfg.content_link_edge_rank,
+                                content_link_latent=cfg.content_link_latent,
+                                content_link_latent_steps=cfg.content_link_latent_steps,
+                                content_link_latent_sigma=cfg.content_link_latent_sigma,
+                                content_link_latent_damping=cfg.content_link_latent_damping,
+                                content_link_loop_weight=cfg.content_link_loop_weight,
+                                content_link_loop_window=cfg.content_link_loop_window,
                                 routing=cfg.relational_routing,
                                 predictive_covariance=(cfg.predictive_covariance if predictive
                                                        else "passthrough"),
@@ -1613,6 +1621,50 @@ class VFEModel(nn.Module):
             log_prior=_freeze_tensor(log_prior),
         )
 
+    @staticmethod
+    def _edge_link_diagnostics(
+        ops:  RelationalOperators,
+        cap:  dict,                            # one layer's relational capture (edge_diagnostic_capture keys)
+        beta: torch.Tensor,                    # (B, H, N, N) or (H, N, N) captured router
+    ) -> dict:
+        r"""Edge-link statistics of one layer and the edge-aware self-loop spectral radius.
+
+        The self-loop map :math:`rI + \sum_h\beta_{ii}^hG_{ii}\Pi_h` is similar to
+        :math:`rI + D_iW_i` with :math:`W_i = TG_{ii}R` and :math:`D_i = \bigoplus_h\beta_{ii}^hI_d`
+        (:func:`vfe3.model.edge_links.edge_self_transfer`); float64, eigenvalues per token.
+        ``relational_edge_link_spectrum_shared_generator = 1.0`` marks the row: its other
+        ``relational_link_*`` and ``relational_content_*`` values describe the shared generator
+        :math:`e^{L}` (the :math:`B = 0` link), not the context-dependent links :math:`G_{ij}`.
+        Under ``content_link_latent`` the captured receiver factors are the inferred :math:`A^{(T)}`, and the
+        ``relational_latent_*`` statistics (:data:`vfe3.model.edge_links.LATENT_DIAGNOSTIC_KEYS`) are added.
+        """
+        from vfe3.model.edge_links import LATENT_DIAGNOSTIC_KEYS, edge_self_transfer
+        from vfe3.model.relational_operators import chart_stacks
+
+        latent_keys = LATENT_DIAGNOSTIC_KEYS if getattr(ops, "content_link_latent", False) else ()
+        d = {key: float(cap[key]) if key in cap else float("nan") for key in (
+            "relational_edge_part_norm_mean", "relational_edge_part_norm_max",
+            "relational_edge_sender_norm_mean", "relational_edge_sender_norm_max",
+            "relational_edge_receiver_norm_mean") + latent_keys}
+        d["relational_edge_link_spectrum_shared_generator"] = 1.0
+        if "edge_sender_factors" not in cap:
+            return d
+        with torch.autocast(device_type=beta.device.type, enabled=False):
+            T64, R64, O64 = chart_stacks([ops.T.detach()], [ops.O.detach()], ops.content_link_chart)
+            outer = cap.get("edge_outer_coefficients")
+            W = edge_self_transfer(
+                T64, R64, O64 @ T64, cap["edge_receiver_factors"].double(),
+                cap["edge_sender_factors"].double(), cap["edge_self_coefficients"].double(),
+                None if outer is None else outer.double())                     # (B, N, K, K)
+            H, K = len(ops.irrep_dims), ops.input_dim
+            b = beta.diagonal(dim1=-2, dim2=-1).to(torch.float64)              # (B, H, N) beta_ii^h
+            b = b.reshape(-1, H, b.shape[-1]).transpose(-1, -2).reshape(-1, H)  # (B N, H)
+            A = b.repeat_interleave(K // H, dim=-1).unsqueeze(-1) * W.reshape(-1, K, K)   # (B N, K, K) D_i W_i
+            rho = (torch.linalg.eigvals(A) + (1.0 if ops.attention_residual else 0.0)).abs().amax(dim=-1)
+        d["relational_link_selfloop_spectral_radius_max"] = float(rho.max())
+        d["relational_link_selfloop_spectral_radius_mean"] = float(rho.mean())
+        return d
+
     def _relational_diagnostics(self, snapshot: DiagnosticSnapshot, layer_index: int = -1) -> dict:
         """Report the actual relational router and fixed-context cost; legacy global-F fields are unavailable."""
         cap = (snapshot.layer_conditional_captures[layer_index]
@@ -1698,6 +1750,12 @@ class VFEModel(nn.Module):
             beta_self=(beta.diagonal(dim1=-2, dim2=-1)                      # (B, H, N) beta_ii^h
                        if ops.readout_mode == "predictive_content" else None),
             residual=ops.attention_residual))
+        if getattr(ops, "content_link_edges", "off") != "off":
+            # Edge links (vfe3/model/edge_links.py): the relational_content_* and relational_link_* values
+            # above are those of the shared generator e^{L} (the B = 0 link). The self-loop map is
+            # edge-dependent, r I + sum_h beta_ii^h G_ii Pi_h, so its spectral radius is replaced by the
+            # edge-aware one; the edge part ||A_i Phi_ij B_j^T||_F and the factor norms come from the capture.
+            d.update(self._edge_link_diagnostics(ops, cap, beta))
         query_cov, key_cov = cap["projected_covariance_pre"], cap["projected_key_covariance_pre"]
         if torch.is_tensor(query_cov):                                       # equal heads: one tensor
             query_cov, key_cov = [query_cov], [key_cov]

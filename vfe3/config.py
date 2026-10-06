@@ -348,6 +348,30 @@ class VFE3Config:
     # s B_ij (s from relational_output_init). O = 0 means zero content (affine) or flat transport
     # (first_order, exponential); the content group has no weight decay. Both projected routes read O'.
     content_link_chart:                  str           = "affine"              # "affine" | "first_order" | "exponential"
+    # Edge-dependent content links (GL(K)_attention_v2 Section 3, lem:lie_lowrank; vfe3/model/edge_links.py):
+    # every edge j -> i carries G_ij = g_i e^{L} E_ij, E_ij = I + A_i Phi_ij B_j^T, from rank-r factor maps of
+    # the RMS-normalized reference means. "off" keeps the shared exponential link; "lowrank" (curved)
+    # E_ij = exp(A_i B_j^T) with A_i = a(xi_i), B_j = b(xi_j); "pure_gauge" (flat control, same content
+    # dependence) G_ij = g_i e^{L} g_j^{-1}, g_i = exp(A B_i^T), one shared basis A. The sender map starts at
+    # zero, so both modes start at the exponential chart; their parameters join the relational content
+    # group. Requires content_link_chart='exponential', attention_mode='projected_predictive' and equal heads.
+    content_link_edges:                  str           = "off"                 # "off" | "lowrank" | "pure_gauge"
+    content_link_edge_rank:              int           = 4                     # factor rank r, 1 <= r <= embed_dim (read when edges are on)
+    # Latent receiver factors (GL(K)_supplementary_v2 S6; plan Section 3): with content_link_edges='lowrank' the
+    # receiver factor A_i becomes a per-context MAP estimate with prior N(a(xi_i), sigma_L^2 I). Its energy is
+    # tr C_i^att / (2 tr(C_i)/K) (the moment-matched predictive covariance without the floor, computed whatever
+    # predictive_covariance is) plus the prior, minimized by `steps` damped fixed-point steps
+    # A <- (1 - rho) A + rho (A^0 - sigma_L^2 grad E), unrolled with create_graph while training. sigma_L -> 0 is
+    # the amortized Level 1 model. The unit step has no safeguard: it is stable only while sigma_L^2 times the
+    # curvature of E_i (+ lambda_W Loop_i) stays below about 1; watch val_relational_latent_energy_final against
+    # val_relational_latent_energy_initial (docs/2026-10-05.md, Stability). The optional loop prior adds lambda_W sum w_ijk ||W_ijk - I||_F^2 / 2 over the
+    # loops of layer l+1's links with layer l's (i - window <= k < j <= i; None = every loop, O(N^3) per layer).
+    content_link_latent:                 bool          = False                 # requires content_link_edges='lowrank'
+    content_link_latent_steps:           int           = 1                     # fixed-point steps T >= 1
+    content_link_latent_sigma:           float         = 0.1                   # prior scale sigma_L > 0
+    content_link_latent_damping:         float         = 1.0                   # damping rho in (0, 1]
+    content_link_loop_weight:            float         = 0.0                   # lambda_W >= 0 (> 0 needs content_link_latent)
+    content_link_loop_window:            Optional[int] = 1                     # loop window w >= 1, or None (every loop)
     relational_receiver_noise:           float         = 1.0                   # projected_gradient: Q_h = variance * I (K-dim reference law under ambient, d-dim channel floor under channel)
     # projected_gradient receiver energy and update (projected_gradient.tex). "channel_likelihood" scores
     # O_h^T xi_i against the d-dim message T_h xi_j as an expected likelihood (entropy counted once, no
@@ -1388,6 +1412,30 @@ class VFE3Config:
         _require(self.relational_output_init, ("identity", "depth_scaled"), "relational_output_init")
         from vfe3.model.relational_operators import CONTENT_LINK_CHARTS
         _require(self.content_link_chart, CONTENT_LINK_CHARTS, "content_link_chart")
+        from vfe3.model.edge_links import EDGE_MODES
+        _require(self.content_link_edges, EDGE_MODES, "content_link_edges")
+        if self.content_link_edges != "off":
+            edge_problems = []
+            if not 1 <= self.content_link_edge_rank <= self.embed_dim:
+                edge_problems.append(f"content_link_edge_rank={self.content_link_edge_rank!r} "
+                                     f"(requires 1 <= rank <= embed_dim={self.embed_dim})")
+            if self.content_link_chart != "exponential":
+                edge_problems.append(f"content_link_chart={self.content_link_chart!r} (requires 'exponential': "
+                                     "the edge links multiply the shared exponential link)")
+            if self.attention_mode != "projected_predictive":
+                edge_problems.append(f"attention_mode={self.attention_mode!r} (requires 'projected_predictive': "
+                                     "the projected_gradient receiver reads the shared content maps only)")
+            if len(set(self.head_dims)) > 1:
+                edge_problems.append(f"head sizes {self.head_dims} (requires equal heads; a mixed so_n irrep "
+                                     "tower is not supported)")
+            if edge_problems:
+                raise ValueError(f"content_link_edges={self.content_link_edges!r} is unsupported here: "
+                                 + "; ".join(edge_problems))
+        # Latent receiver factors and their loop prior (plan Section 3.4); the same checks as RelationalOperators.
+        from vfe3.model.relational_operators import _validate_latent_links
+        _validate_latent_links(self.content_link_edges, self.content_link_latent, self.content_link_latent_steps,
+                               self.content_link_latent_sigma, self.content_link_latent_damping,
+                               self.content_link_loop_weight, self.content_link_loop_window)
         # decode_mode / encode_mode validated against the LIVE decode/encode REGISTRIES (not static
         # literals) so a newly registered kernel is config-selectable without editing this validator.
         from vfe3.model.prior_bank import _DECODERS, _ENCODERS
@@ -1750,6 +1798,15 @@ class VFE3Config:
         elif self.predictive_covariance == "passthrough":
             mark(("predictive_covariance_floor", "predictive_covariance_checkpoint"),
                  "only read by predictive_covariance='moment_matched'")
+        if self.content_link_edges == "off":
+            mark(("content_link_edge_rank",), "only read when content_link_edges is 'lowrank' or 'pure_gauge'")
+        if self.content_link_edges != "lowrank":
+            mark(("content_link_latent",), "only read when content_link_edges='lowrank'")
+        if not self.content_link_latent:
+            mark(("content_link_latent_steps", "content_link_latent_sigma", "content_link_latent_damping",
+                  "content_link_loop_weight"), "only read when content_link_latent=True")
+        if self.content_link_loop_weight == 0.0:
+            mark(("content_link_loop_window",), "only read when content_link_loop_weight > 0")
         if self.attention_mode != "projected_gradient":
             mark(("relational_receiver_noise", "relational_receiver_law", "relational_receiver_update",
                   "relational_receiver_damping"), "only read by projected_gradient receiving laws")

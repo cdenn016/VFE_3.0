@@ -9,7 +9,8 @@ r"""Parameter, optimizer-state and throughput accounting of a vfe3 run, by param
   ``per_type_hidden_bias`` when present;
 * ``positional_frames``: the positional frame generators ``pos_phi_free``;
 * ``context_processing``: the relational comparison maps ``raw_score_q``/``raw_score_k``
-  (``relational_score``), the content maps ``T``/``O`` (``relational_content``), the block MLPs
+  (``relational_score``), the content maps ``T``/``O`` and the ``edge_*`` factor maps of
+  ``content_link_edges`` (``relational_content``), the block MLPs
   (``block_mlp``), the block and final normalizations (``norm``), and the opt-in CG
   coupling when present;
 * ``other``: everything else (for example the scalar ``decode_log_scale``).
@@ -136,7 +137,7 @@ def parameter_role(
         attribute = name.rsplit(".", 2)[-2] if leaf.isdigit() else leaf
         if attribute in ("raw_score_q", "raw_score_k"):
             return "context_processing", "relational_score"
-        if attribute in ("T", "O"):
+        if attribute in ("T", "O") or attribute.startswith("edge_"):   # edge_*: content_link_edges factor maps
             return "context_processing", "relational_content"
         return "other", leaf
     if name.startswith("block_mlps."):

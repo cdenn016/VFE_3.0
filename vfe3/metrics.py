@@ -1500,6 +1500,11 @@ def cocycle_residual_sampled(
 #
 # A rank-deficient head (singular W_h) has min|lambda| = 0, which is the expected value, and log|det W_h| = -inf;
 # the mean log-modulus is then written as NaN rather than -inf so that metrics.csv never carries an infinity.
+#
+# With content_link_edges on, the link of edge j -> i is G_ij Pi_h = g_i e^{L} E_ij Pi_h (vfe3/model/edge_links.py),
+# context dependent. The keys below are then computed from the shared generator e^{L} (the B = 0 link), except
+# the two selfloop keys, which the model replaces by the edge-aware radius of r I + sum_h beta_ii^h G_ii Pi_h; such
+# rows carry relational_edge_link_spectrum_shared_generator = 1.0 (posthoc map rows: link_shared_generator_only).
 
 LINK_SPECTRUM_KEYS: Tuple[str, ...] = (
     "relational_link_spectral_radius_max",

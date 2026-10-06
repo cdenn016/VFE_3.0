@@ -220,6 +220,7 @@ def e_step_iteration(
     relational_frame:         Optional[CanonicalFrameContext] = None,
     relational_value_frame:   Optional[CanonicalFrameContext] = None,
     relational_capture:       Optional[dict] = None,
+    link_state:               Optional[dict] = None,   # content_link_loop_weight > 0: cross-layer link state
 
     _full_link_context:         Optional[FullLinkContext] = None,
 ) -> BeliefState:
@@ -260,7 +261,8 @@ def e_step_iteration(
             belief.mu, belief.sigma, relational_frame, relational_operators,
             tau=tau, kl_max=kl_max, log_prior=log_prior,
             value_frame=relational_value_frame, capture=relational_capture,
-            **({"return_covariance": True} if moment_matched else {}))
+            **({"return_covariance": True} if moment_matched else {}),
+            **({"link_state": link_state} if link_state is not None else {}))
         mu, sigma = readout if moment_matched else (readout, belief.sigma)
         if grad_record is not None:
             for role in ("mu", "sigma", "phi"):
@@ -351,6 +353,7 @@ def e_step(
     relational_frame:         Optional[CanonicalFrameContext] = None,
     relational_value_frame:   Optional[CanonicalFrameContext] = None,
     relational_capture:       Optional[dict] = None,
+    link_state:               Optional[dict] = None,   # content_link_loop_weight > 0: cross-layer link state
 ) -> BeliefState:
     r"""Run projected receiver inference for one incoming-state episode.
 
@@ -403,7 +406,8 @@ def e_step(
             relational_frame=relational_frame,
             relational_value_frame=relational_value_frame,
             relational_capture=relational_capture,
-            _full_link_context=full_link_context)
+            _full_link_context=full_link_context,
+            **({"link_state": link_state} if link_state is not None else {}))
         if state_record is not None:
             state_record["beliefs"].append(belief)
     if full_link_context is not None and relational_capture is not None:

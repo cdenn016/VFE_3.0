@@ -55,7 +55,10 @@ LINK_COLUMNS: Tuple[str, ...] = (
     "link_idempotency_defect", "link_trace", "link_trace_sq", "link_cross_trace", "link_sum_spectral_radius",
     "link_eigvec_condition")
 _LEAF_BY_MAP = {"S_Q": "raw_score_q", "S_K": "raw_score_k", "T": "T", "O": "O"}
-_LAYER_KEY = re.compile(r"^relational_operators(?:_extra\.(\d+))?\.(raw_score_q|raw_score_k|T|O)$")
+# content_link_edges factor maps (vfe3/model/edge_links.py), read under their own names.
+EDGE_MAP_NAMES: Tuple[str, ...] = ("edge_receiver_map", "edge_site_basis", "edge_sender_map")
+_LAYER_KEY = re.compile(r"^relational_operators(?:_extra\.(\d+))?\."
+                        r"(raw_score_q|raw_score_k|T|O|edge_receiver_map|edge_site_basis|edge_sender_map)$")
 _SNAPSHOT_FILE = re.compile(r"^step_(\d+)\.pt$")
 
 
@@ -94,10 +97,12 @@ def relational_maps(
     ``relational_operators_extra.{l-1}.*``. Layers without content maps (identity content) omit
     ``T`` and ``O``. With a ``cfg`` whose ``content_link_chart`` is not ``"affine"``, ``"O"`` is the
     effective receiving map :math:`O'` of that chart (:func:`vfe3.model.relational_operators.chart_receive_map`)
-    and ``"O_stored"`` the stored factor.
+    and ``"O_stored"`` the stored factor. The ``content_link_edges`` factor maps, when stored, appear
+    under their parameter names (:data:`EDGE_MAP_NAMES`).
     """
     layers: Dict[int, Dict[str, torch.Tensor]] = {}
     inverse = {leaf: name for name, leaf in _LEAF_BY_MAP.items()}
+    inverse.update({name: name for name in EDGE_MAP_NAMES})
     for key, value in state.items():
         match = _LAYER_KEY.match(key)
         if match is None:
@@ -271,6 +276,13 @@ def map_invariants(
     :math:`\operatorname{Tr} M_h`, :math:`\operatorname{Tr} M_h^2`, :math:`\sum_{g \ne h} \operatorname{Tr} M_h M_g`,
     the per-layer :math:`\rho(\sum_g M_g)`, and the basis-dependent numerics certificate
     ``link_eigvec_condition`` :math:`\kappa_2(V_h)`. All ``link_*`` columns are NaN without content maps.
+
+    A layer with ``content_link_edges`` (edge maps in the state) links edge :math:`j \to i` by
+    :math:`G_{ij}\Pi_h = g_ie^{L}E_{ij}\Pi_h`, which depends on the context. Its content-map and ``link_*``
+    columns are those of the shared generator :math:`e^{L}` (the :math:`B = 0` link), marked by the column
+    ``link_shared_generator_only = 1.0``, and its rows add the
+    Frobenius norms ``{edge map}_fro`` of the stored factor maps; the per-edge links themselves are
+    data-dependent and are reported by the model diagnostics (``relational_edge_*``), not here.
     """
     state, _ = unwrap_state(state)
     s0 = _output_init_scale(cfg)
@@ -323,6 +335,9 @@ def map_invariants(
                     row[f"{name}_own_block_share"] = float("nan")
                     row[f"{name}_max_block_share"] = float("nan")
             row.update(link_rows[h] if link_rows is not None else {c: float("nan") for c in LINK_COLUMNS})
+            if "edge_sender_map" in maps:
+                row["link_shared_generator_only"] = 1.0
+            row.update({f"{name}_fro": float(maps[name].norm()) for name in EDGE_MAP_NAMES if name in maps})
             rows.append(row)
     return rows
 
@@ -330,7 +345,10 @@ def map_invariants(
 def link_eigenvalue_rows(state: Mapping[str, torch.Tensor], cfg: Any) -> List[Dict[str, float]]:
     r"""Long rows (layer, head, k, re, im, abs): eigenvalues of :math:`\hat T_h \hat O_h`, the nonzero spectrum
     of :math:`M_h = \hat O_h \hat T_h`, per head in the order :math:`(-|\lambda|, -\mathrm{Re}, -\mathrm{Im})`;
-    similarity invariants of the content links. Layers without content maps are skipped."""
+    similarity invariants of the content links. Layers without content maps are skipped. On a
+    ``content_link_edges`` layer these are the eigenvalues of the shared generator's factor (the
+    :math:`B = 0` link), and the rows carry ``link_shared_generator_only = 1.0``; the edge links are context
+    dependent (see :func:`map_invariants`)."""
     state, _ = unwrap_state(state)
     rows: List[Dict[str, float]] = []
     for layer, maps in relational_maps(state, cfg).items():
@@ -338,11 +356,12 @@ def link_eigenvalue_rows(state: Mapping[str, torch.Tensor], cfg: Any) -> List[Di
             continue
         H, d, B = _frame_geometry(maps, cfg)
         lam = content_link_eigenvalues(*_ambient_content(maps["T"], maps["O"], d, B))   # (H, d) complex128
+        marker = {"link_shared_generator_only": 1.0} if "edge_sender_map" in maps else {}
         for h in range(H):
             for k in range(d):
                 z = complex(lam[h, k])
                 rows.append({"layer": int(layer), "head": int(h), "k": int(k),
-                             "re": z.real, "im": z.imag, "abs": abs(z)})
+                             "re": z.real, "im": z.imag, "abs": abs(z), **marker})
     return rows
 
 

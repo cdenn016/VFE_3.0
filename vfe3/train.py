@@ -307,6 +307,9 @@ def build_optimizer(
             # Mixed head sizes store a ParameterList per name (one tensor per run of equal heads).
             parameters = [p for ops in layers for name in names
                           for p in (ops._stored_runs(name) if getattr(ops, name) is not None else [])]
+            if role == "content":
+                # content_link_edges: the edge factor maps are content-link parameters (absent when off).
+                parameters += [p for ops in layers for p in getattr(ops, "edge_parameters", list)()]
             parameters = [p for p in parameters if p.requires_grad]
             if parameters:
                 rate = getattr(cfg, f"m_relational_{role}_lr")
@@ -1331,6 +1334,18 @@ _VAL_RELATIONAL_DIAG_KEYS = (
     "projected_cov_min_eigenvalue", "projected_cov_max_condition", "covariance_repair_count")
 ) + tuple(f"val_{key}" for key in LINK_SPECTRUM_KEYS)
 
+# Edge-link probes (content_link_edges != 'off' only; edge_links.edge_diagnostic_capture), appended to the
+# relational columns of an edge-enabled run so the metrics schema of every other run is unchanged.
+_VAL_EDGE_DIAG_KEYS = tuple("val_relational_edge_" + key for key in (
+    "part_norm_mean", "part_norm_max", "sender_norm_mean", "sender_norm_max", "receiver_norm_mean",
+    # 1.0: the val_relational_content_* and val_relational_link_* columns of this run (except the edge-aware
+    # self-loop radius) describe the shared generator e^{L}, not the context-dependent links.
+    "link_spectrum_shared_generator"))
+# Latent receiver-factor inference (content_link_latent only; edge_links.LATENT_DIAGNOSTIC_KEYS): the MAP energy
+# at A^0 and at A^(T), the loop energy (NaN with the loop prior off) and ||A^(T) - A^0|| / ||A^0||, receiver means.
+_VAL_LATENT_DIAG_KEYS = tuple("val_relational_latent_" + key for key in (
+    "energy_initial", "energy_final", "loop_energy", "receiver_shift"))
+
 
 # =============================================================================
 # Training-time diagnostics for the multi-seed runs (audit 2026-09-28, Section 2).
@@ -1698,6 +1713,8 @@ def _parameter_group(
         if attribute in ("raw_score_q", "raw_score_k"):
             return "relational_score"
         if attribute in ("T", "O"):
+            return "relational_content"
+        if attribute.startswith("edge_"):                     # content_link_edges factor maps
             return "relational_content"
         return "other"
     if name.startswith("block_mlps."):
@@ -3016,6 +3033,10 @@ def train(
     vfe_model = is_vfe_model(model)
     val_diag_keys = _VAL_DIAG_KEYS + (
         _VAL_RELATIONAL_DIAG_KEYS if vfe_model else ())
+    if vfe_model and getattr(cfg, "content_link_edges", "off") != "off":
+        val_diag_keys = val_diag_keys + _VAL_EDGE_DIAG_KEYS
+        if getattr(cfg, "content_link_latent", False):
+            val_diag_keys = val_diag_keys + _VAL_LATENT_DIAG_KEYS
     last_val_diag: Dict[str, float] = {k: float("nan") for k in val_diag_keys}
     # Training-time diagnostic state (audit 2026-09-28). Built only for a persisted run; the silent
     # path and the console-only path allocate nothing here.

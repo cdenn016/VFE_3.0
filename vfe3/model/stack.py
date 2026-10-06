@@ -82,7 +82,10 @@ def vfe_stack(
     The realized frames (with any RoPE fold) reach every block through ``relational_frame`` and
     ``relational_value_frame``.
     ``block_mlp_hidden_biases`` (``per_type_hidden_bias``) holds one ``(B, N, w_l)`` slice of the
-    per-type table per layer, added to that layer's block-MLP hidden pre-activation."""
+    per-type table per layer, added to that layer's block-MLP hidden pre-activation.
+    When any layer's operators carry a positive ``content_link_loop_weight``, one ``link_state`` dict is
+    threaded through the blocks: a layer's readout reads ``"previous"`` (absent at layer 0, which has no
+    loops) and writes ``"current"``, promoted to ``"previous"`` after the block. Otherwise nothing is threaded."""
     if block_mlp_hidden_biases is not None and len(block_mlp_hidden_biases) != cfg.n_layers:
         raise ValueError(
             f"block_mlp_hidden_biases needs one entry per layer ({cfg.n_layers}), "
@@ -104,6 +107,11 @@ def vfe_stack(
     # layers -- so computing it once here and passing it as tau avoids L redundant calls.
     tau = attention_tau(_as_coeff(cfg.kappa_beta, belief.mu.device), group.irrep_dims,
                         device=belief.mu.device)
+    # Loop prior of the latent content links (content_link_loop_weight > 0): layer l+1 reads layer l's links.
+    layer_operators = (relational_operators_by_layer if relational_operators_by_layer is not None
+                       else (relational_operators,))
+    link_state = ({} if any(getattr(operator, "content_link_loop_weight", 0.0) > 0.0
+                            for operator in layer_operators) else None)
     for layer_index in range(cfg.n_layers):
         if diagnostic_capture is not None:
             diagnostic_capture["layer_priors"].append((mu_p, sigma_p))
@@ -116,6 +124,8 @@ def vfe_stack(
         hidden_bias = (block_mlp_hidden_biases[layer_index]
                        if block_mlp_hidden_biases is not None else None)
         block_extra = {} if hidden_bias is None else {"hidden_bias": hidden_bias}
+        if link_state is not None:
+            block_extra["link_state"] = link_state
         belief = vfe_block(belief, mu_p, sigma_p, group, cfg, log_prior=log_prior,
                            block_norm=block_norm, cg_coupling=cg_coupling,
                            block_mlp=(block_mlps[layer_index] if block_mlps is not None else None),
@@ -133,6 +143,8 @@ def vfe_stack(
                                "e_step_trace", {"sequence_index": 0})
                                          if diagnostic_capture is not None and layer_index == 0 else None),
                            **block_extra)
+        if link_state is not None:
+            link_state["previous"] = link_state.pop("current", None)
         if diagnostic_capture is not None:
             if relational_capture is not None:
                 # The shared capture is overwritten by the next block. Preserve each
