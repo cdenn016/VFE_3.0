@@ -1050,17 +1050,26 @@ class VFE3Config:
             raise ValueError(
                 f"eval_stride must be None (disjoint windows) or an int in [1, max_seq_len="
                 f"{self.max_seq_len}], got {self.eval_stride!r}")
-        # so_n heads are its irrep blocks, which may differ in size; the seam below checks them.
-        if self.gauge_group != "so_n" and self.embed_dim % self.n_heads != 0:
+        # Registration traits of the group (vfe3.geometry.groups.GroupTraits): an irrep-tower group
+        # (algebra set, e.g. so_n) takes its heads from irrep_spec, possibly of different sizes;
+        # every other group splits embed_dim into n_heads equal blocks.
+        from vfe3.geometry.groups import group_traits
+        _traits = group_traits(self.gauge_group)
+        _tower = _traits.algebra is not None
+        if not _tower and self.embed_dim % self.n_heads != 0:
             raise ValueError(
                 f"embed_dim={self.embed_dim} must be divisible by n_heads={self.n_heads}"
             )
+        if not _tower and self.embed_dim // self.n_heads < _traits.min_head_dim:
+            raise ValueError(
+                f"gauge_group={self.gauge_group!r} needs head blocks of size >= {_traits.min_head_dim}; "
+                f"embed_dim={self.embed_dim}, n_heads={self.n_heads} gives {self.embed_dim // self.n_heads}"
+            )
 
         # Frame tying resolves to the group's native value when unset.
-        from vfe3.geometry.groups import GAUGE_TYINGS
         if self.gauge_tying is None:
-            self.gauge_tying = "shared" if self.gauge_group == "so_n" else "per_head"
-        _require(self.gauge_tying, GAUGE_TYINGS, "gauge_tying")
+            self.gauge_tying = _traits.native_tying
+        _require(self.gauge_tying, _traits.tyings, "gauge_tying")
         if (self.gauge_group == "block_glk" and self.gauge_tying == "shared"
                 and self.phi_precond_mode in ("killing_per_block", "pullback_per_block")):
             raise ValueError(
@@ -1069,9 +1078,9 @@ class VFE3Config:
                 f"heads, so a per-block metric is undefined. Use 'none', 'clip', or 'killing'."
             )
 
-        # gauge seam. so_n irrep tower: validate group_n + irrep_spec at construction (labels
+        # gauge seam. Irrep tower: validate group_n + irrep_spec at construction (labels
         # resolve, block dims sum to embed_dim) so a bad spec fails here with the computed dims.
-        if self.gauge_group == "so_n":
+        if _tower:
             if self.group_n is None or self.irrep_spec is None:
                 raise ValueError(
                     f"gauge_group={self.gauge_group!r} requires both group_n and irrep_spec "
@@ -1099,8 +1108,8 @@ class VFE3Config:
                         "(label: str, mult: plain int >= 1) pair, "
                         f"got {_entry!r}"
                     )
-                _d = irrep_dim(self.group_n, algebra="so", label=_entry[0])
-                check_irrep_constructible(self.group_n, algebra="so", label=_entry[0],
+                _d = irrep_dim(self.group_n, algebra=_traits.algebra, label=_entry[0])
+                check_irrep_constructible(self.group_n, algebra=_traits.algebra, label=_entry[0],
                                           basis=self.irrep_basis)
                 _block_dims.extend([_d] * _entry[1])
             if sum(_block_dims) != self.embed_dim:
@@ -1113,7 +1122,7 @@ class VFE3Config:
             # blocks), so n_heads is the number of irrep blocks. Blocks may differ in size.
             if len(_block_dims) != self.n_heads:
                 raise ValueError(
-                    f"gauge_group='so_n' needs n_heads equal to the number of irrep blocks (one gauge "
+                    f"gauge_group={self.gauge_group!r} needs n_heads equal to the number of irrep blocks (one gauge "
                     f"block per head): irrep_spec gives {len(_block_dims)} blocks {_block_dims}, "
                     f"n_heads={self.n_heads}"
                 )
@@ -1123,18 +1132,18 @@ class VFE3Config:
                     and self.phi_precond_mode in ("killing_per_block", "pullback_per_block")):
                 raise ValueError(
                     f"phi_precond_mode={self.phi_precond_mode!r} is incompatible with "
-                    f"gauge_group={self.gauge_group!r}: the shared so generators act in every "
+                    f"gauge_group={self.gauge_group!r}: the shared generators act in every "
                     f"irrep block, so a per-block metric is undefined. Use 'none', 'clip', or "
                     f"the ambient 'killing'."
                 )
         elif self.group_n is not None or self.irrep_spec is not None:
             raise ValueError(
-                f"group_n/irrep_spec are consumed only by gauge_group 'so_n'; got "
+                f"group_n/irrep_spec are consumed only by irrep-tower groups (e.g. 'so_n'); got "
                 f"gauge_group={self.gauge_group!r}"
             )
-        if self.use_cg_coupling and self.gauge_group != "so_n":
+        if self.use_cg_coupling and not _tower:
             raise ValueError(
-                f"use_cg_coupling requires the irrep-labeled tower group 'so_n'; got "
+                f"use_cg_coupling requires an irrep-labeled tower group (e.g. 'so_n'); got "
                 f"gauge_group={self.gauge_group!r}"
             )
         if self.use_cg_coupling and self.gauge_tying != "shared":
@@ -1184,7 +1193,7 @@ class VFE3Config:
         for _name in ("kappa_beta",):
             _v = getattr(self, _name)
             if isinstance(_v, (list, tuple)):
-                if self.gauge_group == "so_n":
+                if _tower:
                     # heads = irrep blocks (possibly unequal dims): one kappa entry per block
                     # (irrep_spec already validated/coerced in the gauge seam above).
                     _n_blocks = sum(m for _, m in self.irrep_spec)
@@ -1373,12 +1382,12 @@ class VFE3Config:
         # RoPE's adjacent-pair rotation R is orthogonal but generally NOT in the irrep image
         # rho(SO(N)) inside GL(K), so R Omega R^T leaves the SELECTED structure group
         # (GL(K)-congruence invariance survives).
-        if self.pos_rotation == "rope" and self.gauge_group == "so_n":
+        if self.pos_rotation == "rope" and not _traits.contains_pair_rotations:
             import warnings
             warnings.warn(
                 f"pos_rotation='rope' with gauge_group={self.gauge_group!r} leaves the structure "
-                f"group: the coordinate-pair rotation R(theta) is generally not in the irrep image "
-                f"of SO(N), so R Omega R^T is no longer in the selected group. The "
+                f"group: the coordinate-pair rotation R(theta) is generally not in the group's "
+                f"image in GL(K), so R Omega R^T is no longer in the selected group. The "
                 f"GL(K)-congruence divergence invariance still holds (R is orthogonal), so the "
                 f"model runs; only the structure-group claim is dropped.",
                 UserWarning,
@@ -1430,7 +1439,7 @@ class VFE3Config:
             # The flat FACTORED builder -- the thing that exposes the vertex frame -- is selected only
             # for a block-diagonal group with MORE THAN ONE block, so the group alone settles it.
             _builder = get_group(self.gauge_group)
-            if self.gauge_group == "so_n":       # irrep blocks validated in the gauge seam above
+            if _tower:                           # irrep blocks validated in the gauge seam above
                 _dims = _block_dims
             else:
                 try:                             # builders differ: only the block groups take n_heads
@@ -1827,8 +1836,9 @@ class VFE3Config:
         def mark(names: tuple[str, ...], reason: str) -> None:
             inactive.update(dict.fromkeys(names, reason))
 
-        if self.gauge_group != "so_n":
-            mark(("irrep_basis",), "only read by gauge_group='so_n'")
+        from vfe3.geometry.groups import group_traits
+        if group_traits(self.gauge_group).algebra is None:
+            mark(("irrep_basis",), "only read by irrep-tower groups (gauge_group='so_n')")
         from vfe3.gauge_optim import get_phi_update_policy
         phi_update_policy = get_phi_update_policy(self.m_phi_update_mode)
         if not phi_update_policy.requires_manifold_optimizer:
@@ -2101,10 +2111,12 @@ class VFE3Config:
 
     @property
     def head_dims(self) -> List[int]:
-        """Per-head belief dimensions: the irrep block sizes for so_n, ``[K // n_heads] * n_heads`` otherwise."""
-        if self.gauge_group == "so_n":
+        """Per-head belief dimensions: the irrep block sizes for an irrep tower (so_n), ``[K // n_heads] * n_heads`` otherwise."""
+        from vfe3.geometry.groups import group_traits
+        algebra = group_traits(self.gauge_group).algebra
+        if algebra is not None:
             from vfe3.geometry.irreps import irrep_dim
-            return [irrep_dim(self.group_n, algebra="so", label=label)
+            return [irrep_dim(self.group_n, algebra=algebra, label=label)
                     for label, mult in self.irrep_spec for _ in range(mult)]
         return [self.embed_dim // self.n_heads] * self.n_heads
 
@@ -2118,8 +2130,8 @@ class VFE3Config:
 
     @property
     def d_head(self) -> int:
-        """Per-head belief dimension K // n_heads; raises for a mixed so_n tower (read ``head_dims``)."""
-        if self.gauge_group == "so_n" and len(set(self.head_dims)) > 1:
+        """Per-head belief dimension K // n_heads; raises for a mixed irrep tower (read ``head_dims``)."""
+        if len(set(self.head_dims)) > 1:
             raise ValueError(f"d_head is undefined for heads of different sizes {self.head_dims}; "
                              f"read head_dims")
         return self.embed_dim // self.n_heads

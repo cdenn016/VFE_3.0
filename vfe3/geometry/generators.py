@@ -67,3 +67,88 @@ def generate_son(
     return G.to(dtype).to(device)
 
 
+
+
+# ---------------------------------------------------------------- block-local bases
+#
+# A block-local group acts on each head's d-dimensional block by its own element of one local
+# Lie subgroup of GL(d). Its basis is a Frobenius-orthonormal basis of the local algebra, copied
+# into every head block (generate_block_local). Every local basis below is built in float64 in a
+# fixed order, so the assembled generators are deterministic and their Gram is the identity.
+
+def local_basis_so(d: int) -> torch.Tensor:
+    r"""Orthonormal so(d): :math:`(E_{ij}-E_{ji})/\sqrt2` for :math:`i<j`. Returns (d(d-1)/2, d, d) float64."""
+    if d < 2:
+        raise ValueError(f"so(d) needs d >= 2, got d={d}")
+    return generate_son(d, dtype=torch.float64) / 2.0 ** 0.5
+
+
+def local_basis_co(d: int) -> torch.Tensor:
+    r"""Orthonormal co(d) = so(d) + R I: the so(d) basis, then :math:`I/\sqrt d`. Returns (d(d-1)/2 + 1, d, d)."""
+    if d < 1:
+        raise ValueError(f"co(d) needs d >= 1, got d={d}")
+    scale = (torch.eye(d, dtype=torch.float64) / d ** 0.5).unsqueeze(0)
+    return scale if d == 1 else torch.cat([local_basis_so(d), scale])
+
+
+def local_basis_sl(d: int) -> torch.Tensor:
+    r"""Orthonormal sl(d): off-diagonal :math:`E_{ij}` row-major, then the Helmert traceless diagonals.
+
+    The k-th Helmert element is :math:`\mathrm{diag}(1,\dots,1,-k,0,\dots,0)/\sqrt{k(k+1)}` with k ones,
+    k = 1, ..., d - 1. Returns (d^2 - 1, d, d) float64.
+    """
+    if d < 2:
+        raise ValueError(f"sl(d) needs d >= 2, got d={d}")
+    basis = []
+    for i in range(d):
+        for j in range(d):
+            if i != j:
+                E = torch.zeros(d, d, dtype=torch.float64)
+                E[i, j] = 1.0
+                basis.append(E)
+    for k in range(1, d):
+        diagonal = torch.zeros(d, dtype=torch.float64)
+        diagonal[:k] = 1.0
+        diagonal[k] = -float(k)
+        basis.append(torch.diag(diagonal) / (k * (k + 1)) ** 0.5)
+    return torch.stack(basis)
+
+
+def local_basis_borel(d: int) -> torch.Tensor:
+    r"""Orthonormal upper-triangular algebra b+(d): :math:`E_{ij}` for :math:`i\le j`, row-major. Returns (d(d+1)/2, d, d)."""
+    if d < 1:
+        raise ValueError(f"b+(d) needs d >= 1, got d={d}")
+    basis = []
+    for i in range(d):
+        for j in range(i, d):
+            E = torch.zeros(d, d, dtype=torch.float64)
+            E[i, j] = 1.0
+            basis.append(E)
+    return torch.stack(basis)
+
+
+def generate_block_local(
+    K:                int,
+    n_heads:          int,
+    local:            torch.Tensor,                    # (m, d, d) local algebra basis, d = K // n_heads
+
+    *,
+    device:           'torch.device | str | None'     = None,
+    dtype:            torch.dtype                      = torch.float32,
+) -> torch.Tensor:
+    r"""Copy a local basis into every head block: generator (h, a) is ``local[a]`` on block h.
+
+    Head-major order (all m local generators of head 0, then head 1, ...), with heads laid out
+    contiguously, block h covering coordinates [h d, (h + 1) d). Returns (n_heads * m, K, K).
+    """
+    if K % n_heads != 0:
+        raise ValueError(f"K={K} must be divisible by n_heads={n_heads}")
+    d = K // n_heads
+    if local.ndim != 3 or tuple(local.shape[1:]) != (d, d):
+        raise ValueError(f"local basis must have shape (m, {d}, {d}) for K={K}, n_heads={n_heads}; "
+                         f"got {tuple(local.shape)}")
+    m = local.shape[0]
+    G = torch.zeros(n_heads * m, K, K, dtype=torch.float64)
+    for h in range(n_heads):
+        G[h * m:(h + 1) * m, h * d:(h + 1) * d, h * d:(h + 1) * d] = local.to(torch.float64)
+    return G.to(device=device, dtype=dtype)

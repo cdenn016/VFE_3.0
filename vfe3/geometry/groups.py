@@ -21,7 +21,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
-from vfe3.geometry.generators import generate_glk_multihead, generate_son
+from vfe3.geometry.generators import generate_block_local, generate_glk_multihead, generate_son
 from vfe3.geometry.irreps import DEFAULT_IRREP_BASIS, direct_sum_generators
 
 
@@ -93,6 +93,9 @@ class GaugeGroup:
     # Frame tying across heads: 'per_head' (an independent element per head block) or 'shared'
     # (one element acting on every block); None = a group without head structure or tying axis.
     tying:                Optional[str]          = None
+    # The (m, d, d) local algebra basis of a block-local group (copied into every head block);
+    # None for every other group.
+    block_local_basis:    Optional[torch.Tensor] = field(default=None, repr=False, compare=False)
 
     # Cached pseudo-inverse of the generator Frobenius Gram (computed once, off __init__/eq/repr).
     _gram_pinv_cache:     Optional[torch.Tensor] = field(default=None, init=False, repr=False, compare=False)
@@ -282,6 +285,26 @@ class GaugeGroup:
 
 
 _GROUPS: Dict[str, Callable[..., GaugeGroup]] = {}
+
+
+@dataclass(frozen=True)
+class GroupTraits:
+    r"""Registration-time facts about a group, readable without building it (:func:`group_traits`).
+
+    ``algebra`` names the irrep registry of an irrep-tower group (``"so"`` for ``so_n``): heads are
+    labeled irrep blocks from ``group_n``/``irrep_spec``, possibly of different sizes. ``None`` means
+    heads are the ``n_heads`` equal blocks of ``embed_dim``. ``tyings`` are the supported
+    ``gauge_tying`` values and ``native_tying`` the one an unset field resolves to.
+    ``contains_pair_rotations`` says whether every adjacent-pair rotation of a head block lies in
+    the group, which is what keeps ``pos_rotation='rope'`` inside it. ``min_head_dim`` is the
+    smallest head block the builder accepts.
+    """
+
+    algebra:                 Optional[str]   = None
+    tyings:                  Tuple[str, ...] = ("per_head",)
+    native_tying:            str             = "per_head"
+    contains_pair_rotations: bool            = True
+    min_head_dim:            int             = 1
 # Frame tying across heads (config field gauge_tying): one element per head block, or one shared.
 GAUGE_TYINGS: Tuple[str, ...] = ("per_head", "shared")
 # Registered family names whose stored-parameter divergence is exactly GL(K)-congruence invariant.
@@ -303,13 +326,15 @@ def register_group(
 
     pullback_capability:  Optional[str]          = None,
     pullback_tying:       Optional[str]          = None,
+    traits:               GroupTraits            = GroupTraits(),
 ) -> Callable:
     """Decorator registering a GaugeGroup builder under ``name``.
 
     ``pullback_capability`` names
     a certified strict M-step implementation; omission fails closed. With ``pullback_tying`` set the
     capability is certified only for groups built with that frame tying, and other tyings carry
-    None. ``invariant_families`` declares
+    None. ``traits`` (:class:`GroupTraits`) is attached to the builder for config validation.
+    ``invariant_families`` declares
     exact divergence invariance. The wrapper writes every declaration onto itself and each returned
     :class:`GaugeGroup`, so an override replaces the callable and metadata atomically.
 
@@ -319,6 +344,9 @@ def register_group(
     def _wrap(fn: Callable[..., GaugeGroup]) -> Callable[..., GaugeGroup]:
         if name in _GROUPS and not override:
             raise KeyError(f"gauge group {name!r} already registered; pass override=True to replace")
+        if traits.native_tying not in traits.tyings or not set(traits.tyings) <= set(GAUGE_TYINGS):
+            raise ValueError(f"gauge group {name!r}: native_tying {traits.native_tying!r} must be one of "
+                             f"its tyings {traits.tyings}, a subset of {GAUGE_TYINGS}")
         families = tuple(invariant_families)
 
         @wraps(fn)
@@ -336,10 +364,16 @@ def register_group(
 
         setattr(_coherent_builder, "pullback_capability", pullback_capability)
         setattr(_coherent_builder, "pullback_tying", pullback_tying)
+        setattr(_coherent_builder, "traits", traits)
         setattr(_coherent_builder, "invariant_families", families)
         _GROUPS[name] = _coherent_builder
         return _coherent_builder
     return _wrap
+
+
+def group_traits(name: str) -> GroupTraits:
+    r"""The :class:`GroupTraits` declared when ``name`` was registered (KeyError if absent)."""
+    return getattr(get_group(name), "traits", GroupTraits())
 
 
 def get_group(name: str) -> Callable[..., GaugeGroup]:
@@ -356,6 +390,7 @@ def get_group(name: str) -> Callable[..., GaugeGroup]:
     pullback_capability="pullback_per_block",
     pullback_tying="per_head",
     invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
+    traits=GroupTraits(tyings=GAUGE_TYINGS),
 )
 def _build_block_glk(
     K:               int,
@@ -497,6 +532,9 @@ def check_admissible(
 @register_group(
     "so_n",
     invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
+    # RoPE's coordinate-pair rotation is generally not in the irrep image rho(SO(N)).
+    traits=GroupTraits(algebra="so", tyings=GAUGE_TYINGS, native_tying="shared",
+                       contains_pair_rotations=False),
 )
 def _build_so_n(
     K:          int,
@@ -582,6 +620,46 @@ def _build_so_n(
         frobenius_gram_uniform=float(diag.mean()) if uniform else None,
         basis_fingerprint=generator_fingerprint(G),
         tying=tying,
+    )
+
+
+def _build_block_local(
+    name:    str,
+    K:       int,
+    n_heads: int,
+    local:   torch.Tensor,                   # (m, d, d) Frobenius-orthonormal local algebra basis
+
+    *,
+    skew:    bool,                           # every local generator is skew (local group compact)
+    dtype:   torch.dtype                 = torch.float32,
+    device:  'torch.device | str | None' = None,
+) -> GaugeGroup:
+    r"""A block-local group :math:`G_{\mathrm{loc}}^H`: an independent element of one local subgroup of
+    GL(d) on each of the ``n_heads`` equal head blocks.
+
+    The generators are ``local`` copied into every block in head-major order
+    (:func:`vfe3.geometry.generators.generate_block_local`), built in float64 and cast. ``local``
+    must be Frobenius-orthonormal, which the build verifies, so the generator Gram is the identity.
+    The group carries no ``phi_coordinate_layout`` and takes the dense transport route; registered
+    block-local groups use :func:`_build_block_local` from their own builder.
+    """
+    local = local.to(torch.float64)
+    m = local.shape[0]
+    gram = torch.einsum("aij,bij->ab", local, local)
+    if float((gram - torch.eye(m, dtype=torch.float64)).abs().max()) > 1e-12:
+        raise ValueError(f"{name}: the local basis must be Frobenius-orthonormal")
+    if skew and float((local + local.transpose(-1, -2)).abs().max()) > 0.0:
+        raise ValueError(f"{name}: skew=True needs an exactly skew local basis")
+    generators = generate_block_local(K, n_heads, local, dtype=torch.float64)
+    return GaugeGroup(
+        name=name,
+        generators=generators.to(device=device, dtype=dtype),
+        irrep_dims=[K // n_heads] * n_heads,
+        skew_symmetric=skew,
+        frobenius_gram_diagonal=True,
+        frobenius_gram_uniform=1.0,
+        tying="per_head",
+        block_local_basis=local,
     )
 
 
