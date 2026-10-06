@@ -362,7 +362,7 @@ without its floor), so the per-receiver energy is
 $$
 \mathcal F_i(A_i)=\frac{\mathrm{tr}C_i^{\mathrm{att}}(A_i)}{2\mathrm{tr}C_i/K}
 +\frac{\lVert A_i-a(\hat x_i)\rVert_F^2}{2\sigma_L^2}
-+\lambda_W\sum_{i-w\le k<j\le i}w_{ijk}\tfrac12\lVert W_{ijk}-I\rVert_F^2 ,
++\lambda_W\sum_{i-w\le k\lt j\le i}w_{ijk}\tfrac12\lVert W_{ijk}-I\rVert_F^2 ,
 $$
 
 where the optional loop prior compares two-step routes across layers through
