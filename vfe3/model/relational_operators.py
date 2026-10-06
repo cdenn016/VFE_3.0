@@ -9,6 +9,8 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from vfe3.contracts import CanonicalFrameContext
+from vfe3.model import edge_links
+from vfe3.model.edge_links import EDGE_MODES, EdgeContext
 from vfe3.relational_scoring import _compute_dtype
 from vfe3.runtime import ieee_fp32_matmul
 
@@ -18,7 +20,7 @@ from vfe3.runtime import ieee_fp32_matmul
 CONTENT_LINK_CHARTS: Tuple[str, ...] = ("affine", "first_order", "exponential")
 
 
-def _phi1(A: torch.Tensor) -> torch.Tensor:          # (n, n) -> (n, n)
+def _phi1(A: torch.Tensor) -> torch.Tensor:          # (..., n, n) -> (..., n, n)
     r"""Return :math:`\varphi_1(A)=\sum_{n\ge1}A^{n-1}/n!` without inverting :math:`A`.
 
     .. math::
@@ -26,13 +28,14 @@ def _phi1(A: torch.Tensor) -> torch.Tensor:          # (n, n) -> (n, n)
         =\begin{pmatrix}e^A & \varphi_1(A)\\ 0 & I\end{pmatrix},
 
     because the block matrix has :math:`n`-th power :math:`\begin{pmatrix}A^n & A^{n-1}\\ 0 & 0\end{pmatrix}`
-    for :math:`n\ge1`.
+    for :math:`n\ge1`. Leading batch axes are evaluated matrix by matrix (one batched ``matrix_exp``).
     """
     n = A.shape[-1]
-    eye = torch.eye(n, dtype=A.dtype, device=A.device)
+    eye = torch.eye(n, dtype=A.dtype, device=A.device).expand(*A.shape[:-2], n, n)
     augmented = torch.cat([torch.cat([A, eye], dim=-1),
-                           torch.zeros(n, 2 * n, dtype=A.dtype, device=A.device)], dim=-2)   # (2n, 2n)
-    return torch.linalg.matrix_exp(augmented)[:n, n:]
+                           torch.zeros(*A.shape[:-2], n, 2 * n, dtype=A.dtype, device=A.device)],
+                          dim=-2)                                                       # (..., 2n, 2n)
+    return torch.linalg.matrix_exp(augmented)[..., :n, n:]
 
 
 def head_runs(head_dims: Sequence[int]) -> List[Tuple[int, int, int, int]]:
@@ -52,6 +55,37 @@ def head_runs(head_dims: Sequence[int]) -> List[Tuple[int, int, int, int]]:
         head += 1
         coordinate += d
     return runs
+
+
+def chart_stacks(
+    T_runs: Sequence[torch.Tensor],     # per run (n_r, d_r, K) stored sending maps, sum_r n_r d_r = K
+    O_runs: Sequence[torch.Tensor],     # per run (n_r, K, d_r) stored receiving factors
+    chart:  str,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:   # float64 (K, K) stacks T, T^{-1}, O'
+    r"""Float64 stacks :math:`(T, T^{-1}, O')` of a non-affine chart, from one inversion of :math:`T`.
+
+    :math:`T` stacks the sending maps by rows and :math:`O'` the effective receiving maps by columns
+    (:func:`chart_receive_runs` splits :math:`O'` into heads). The edge links
+    (:mod:`vfe3.model.edge_links`) read all three, with :math:`F = O'T = e^{OT}` in the exponential chart.
+    """
+    if chart not in ("first_order", "exponential"):
+        raise ValueError(f"chart_stacks evaluates the first_order and exponential charts, got {chart!r}")
+    K = T_runs[0].shape[-1]
+    if (sum(T.shape[0] * T.shape[1] for T in T_runs) != K
+            or any(tuple(O.shape) != (T.shape[0], K, T.shape[1]) for T, O in zip(T_runs, O_runs))):
+        raise ValueError(f"content link charts need tiled square stacked maps, got T "
+                         f"{[tuple(T.shape) for T in T_runs]}, O {[tuple(O.shape) for O in O_runs]}")
+    with torch.autocast(device_type=T_runs[0].device.type, enabled=False):
+        T_stack = torch.cat([T.to(torch.float64).reshape(-1, K) for T in T_runs], dim=0)   # (K, K) rows by head
+        O_stack = torch.cat([O.to(torch.float64).permute(1, 0, 2).reshape(K, -1)
+                             for O in O_runs], dim=1)                                    # (K, K) columns by head
+        # inv_ex: no host sync (linalg.inv checks info on the host); a singular T yields non-finite maps.
+        inverse = torch.linalg.inv_ex(T_stack).inverse                                  # (K, K) order zero
+        if chart == "first_order":
+            receive = inverse + O_stack
+        else:
+            receive = inverse + O_stack @ _phi1(T_stack @ O_stack)                      # all orders
+    return T_stack, inverse, receive
 
 
 def chart_receive_runs(
@@ -82,20 +116,7 @@ def chart_receive_runs(
     if chart not in CONTENT_LINK_CHARTS:
         raise ValueError(f"content_link_chart must be one of {CONTENT_LINK_CHARTS}, got {chart!r}")
     K = T_runs[0].shape[-1]
-    if (sum(T.shape[0] * T.shape[1] for T in T_runs) != K
-            or any(tuple(O.shape) != (T.shape[0], K, T.shape[1]) for T, O in zip(T_runs, O_runs))):
-        raise ValueError(f"content link charts need tiled square stacked maps, got T "
-                         f"{[tuple(T.shape) for T in T_runs]}, O {[tuple(O.shape) for O in O_runs]}")
-    with torch.autocast(device_type=T_runs[0].device.type, enabled=False):
-        T_stack = torch.cat([T.to(torch.float64).reshape(-1, K) for T in T_runs], dim=0)   # (K, K) rows by head
-        O_stack = torch.cat([O.to(torch.float64).permute(1, 0, 2).reshape(K, -1)
-                             for O in O_runs], dim=1)                                    # (K, K) columns by head
-        # inv_ex: no host sync (linalg.inv checks info on the host); a singular T yields non-finite maps.
-        receive = torch.linalg.inv_ex(T_stack).inverse                                  # (K, K) order zero
-        if chart == "first_order":
-            receive = receive + O_stack
-        else:
-            receive = receive + O_stack @ _phi1(T_stack @ O_stack)                      # all orders
+    _, _, receive = chart_stacks(T_runs, O_runs, chart)                                 # (K, K) float64
     out, start = [], 0
     for T in T_runs:
         n, d = T.shape[0], T.shape[1]
@@ -116,6 +137,37 @@ def chart_receive_map(
 def _chart_initial_output(chart: str, scale: float) -> float:
     r"""Initial :math:`O=cI` (with :math:`T=I`) giving the content :math:`sB_{ij}` in every chart."""
     return {"affine": scale, "first_order": scale - 1.0, "exponential": math.log(scale)}[chart]
+
+
+def _validate_latent_links(
+    edges:   str,
+    latent:  bool,
+    steps:   int,
+    sigma:   float,
+    damping: float,
+    weight:  float,
+    window:  Optional[int],
+) -> None:
+    r"""Refuse an invalid latent receiver-factor or loop-prior setting (plan Section 3.4)."""
+    finite = lambda x: (not isinstance(x, bool) and isinstance(x, Real) and math.isfinite(float(x)))
+    if not isinstance(latent, bool):
+        raise ValueError(f"content_link_latent must be bool, got {latent!r}")
+    if latent and edges != "lowrank":
+        raise ValueError("content_link_latent requires content_link_edges='lowrank' (the latent variable is the "
+                         f"receiver factor A_i of the low-rank edge links), got {edges!r}")
+    if type(steps) is not int or steps < 1:
+        raise ValueError(f"content_link_latent_steps must be an int >= 1, got {steps!r}")
+    if not finite(sigma) or sigma <= 0.0:
+        raise ValueError(f"content_link_latent_sigma must be finite and positive, got {sigma!r}")
+    if not finite(damping) or not 0.0 < damping <= 1.0:
+        raise ValueError(f"content_link_latent_damping must lie in (0, 1], got {damping!r}")
+    if not finite(weight) or weight < 0.0:
+        raise ValueError(f"content_link_loop_weight must be finite and >= 0, got {weight!r}")
+    if weight > 0.0 and not latent:
+        raise ValueError("content_link_loop_weight > 0 requires content_link_latent=True (the loop prior acts "
+                         "on the latent receiver factors)")
+    if window is not None and (type(window) is not int or window < 1):
+        raise ValueError(f"content_link_loop_window must be None or an int >= 1, got {window!r}")
 
 
 class RelationalOperators(nn.Module):
@@ -140,6 +192,16 @@ class RelationalOperators(nn.Module):
     ``predictive_covariance_checkpoint`` recomputes the moment-matched covariance update in backward
     instead of saving its (..., N, K, K) intermediates: the same values and gradients bit for bit,
     for about half the activation memory of a large-K step.
+    ``content_link_edges`` ("lowrank" or "pure_gauge", exponential chart, equal heads, predictive
+    content only) gives every edge the link :math:`G_{ij} = g_ie^{L}E_{ij}` of :mod:`vfe3.model.edge_links`,
+    with rank-``content_link_edge_rank`` factor maps stored as ``edge_receiver_map`` (lowrank) or
+    ``edge_site_basis`` (pure gauge) and ``edge_sender_map`` (zero at initialization, so the edge links
+    start at the exponential chart). With the edges off no edge parameter exists.
+    ``content_link_latent`` (lowrank only) replaces the amortized receiver factors by their per-context MAP
+    estimate (:func:`vfe3.model.edge_links.infer_latent_receivers`: ``content_link_latent_steps`` damped
+    fixed-point steps with prior scale ``content_link_latent_sigma`` and damping ``content_link_latent_damping``),
+    optionally with the loop prior of weight ``content_link_loop_weight`` over ``content_link_loop_window``
+    against the previous layer's links. It adds no parameter.
     """
 
     def __init__(
@@ -159,6 +221,14 @@ class RelationalOperators(nn.Module):
         receiver_damping:      float = 1.0,
         content_link_chart:    str   = "affine",
         predictive_covariance_checkpoint: bool = False,
+        content_link_edges:    str   = "off",
+        content_link_edge_rank: int  = 4,
+        content_link_latent:   bool  = False,
+        content_link_latent_steps: int = 1,
+        content_link_latent_sigma: float = 0.1,
+        content_link_latent_damping: float = 1.0,
+        content_link_loop_weight: float = 0.0,
+        content_link_loop_window: Optional[int] = 1,
     ) -> None:
         super().__init__()
         if not irrep_dims or any(type(d) is not int or d < 1 for d in irrep_dims):
@@ -219,6 +289,32 @@ class RelationalOperators(nn.Module):
         self.irrep_dims = list(irrep_dims)
         self.runs = head_runs(self.irrep_dims)
         equal = len(self.runs) == 1
+        if content_link_edges not in EDGE_MODES:
+            raise ValueError(f"content_link_edges must be one of {EDGE_MODES}, got {content_link_edges!r}")
+        if content_link_edges != "off":
+            if type(content_link_edge_rank) is not int or not 1 <= content_link_edge_rank <= K:
+                raise ValueError(f"content_link_edge_rank must be an int in [1, {K}], got {content_link_edge_rank!r}")
+            if content_link_chart != "exponential":
+                raise ValueError("content_link_edges requires content_link_chart='exponential' (the edge links "
+                                 f"multiply the shared exponential link), got {content_link_chart!r}")
+            if readout_mode != "predictive_content":
+                raise ValueError("content_link_edges requires the predictive_content readout "
+                                 "(attention_mode='projected_predictive'); the projected_gradient receiver "
+                                 "reads the shared content maps only")
+            if not equal:
+                raise ValueError("content_link_edges requires equal heads (one head run); this partition has "
+                                 f"head sizes {self.irrep_dims} (a mixed so_n irrep tower)")
+        self.content_link_edges = content_link_edges
+        self.content_link_edge_rank = content_link_edge_rank
+        _validate_latent_links(content_link_edges, content_link_latent, content_link_latent_steps,
+                               content_link_latent_sigma, content_link_latent_damping,
+                               content_link_loop_weight, content_link_loop_window)
+        self.content_link_latent = content_link_latent
+        self.content_link_latent_steps = content_link_latent_steps
+        self.content_link_latent_sigma = float(content_link_latent_sigma)
+        self.content_link_latent_damping = float(content_link_latent_damping)
+        self.content_link_loop_weight = float(content_link_loop_weight)
+        self.content_link_loop_window = content_link_loop_window
         self.score_rank_per_head = irrep_dims[0] if equal else list(irrep_dims)
         self.content_rank_per_head = irrep_dims[0] if equal else list(irrep_dims)
         generator = torch.Generator().manual_seed(seed)
@@ -242,6 +338,16 @@ class RelationalOperators(nn.Module):
         for name, tensors in stored.items():
             setattr(self, name, nn.Parameter(tensors[0]) if equal
                     else nn.ParameterList(nn.Parameter(t) for t in tensors))
+        if content_link_edges != "off":
+            # Drawn after every existing initialization, so the shared maps are unchanged by the edges.
+            r = content_link_edge_rank
+            if content_link_edges == "lowrank":
+                # W_A ~ N(0, K^{-2}): A_i = reshape(W_A xi^_i) has columns of expected unit norm.
+                self.edge_receiver_map = nn.Parameter(torch.randn(K * r, K, generator=generator) / K)
+            else:
+                self.edge_site_basis = nn.Parameter(
+                    self._orthonormal_columns(torch.randn(K, r, generator=generator)).contiguous())
+            self.edge_sender_map = nn.Parameter(torch.zeros(K * r, K))    # B = 0: the exponential chart
 
     def _stored_runs(self, name: str) -> List[torch.Tensor]:
         r"""The per-run tensors stored under ``name`` (one entry for an equal-head partition)."""
@@ -282,12 +388,22 @@ class RelationalOperators(nn.Module):
         beta:  torch.Tensor,  # (..., H, N, N)
         frame: CanonicalFrameContext,
         receive: 'Optional[torch.Tensor | Sequence[torch.Tensor]]' = None,   # O'_h, (H, K, d) or per run
+        *,
+        edges: Optional[EdgeContext] = None,   # content_link_edges: the layer's edge context (built when None)
     ) -> torch.Tensor:
-        r"""Compute m_i = A_i sum_h O'_h sum_j beta_ij^h T_h B_j^{-1} mu_j (O' of content_link_chart)."""
+        r"""Compute m_i = A_i sum_h O'_h sum_j beta_ij^h T_h B_j^{-1} mu_j (O' of content_link_chart).
+
+        Under ``content_link_edges`` the message is :math:`m_i = U_i\sum_jG_{ij}\Pi(\beta_{ij})\xi_j`
+        (:func:`vfe3.model.edge_links.edge_reference_message`), read from ``edges`` when given. Under
+        ``content_link_latent`` the context must be given (its inference reads the source covariances).
+        """
         canonical = self.canonical_mean(mu, frame)                          # (..., N, K)
         T_runs = self._stored_runs("T")
         dtype = _compute_dtype(mu, *self._content_parameters(), frame.forward)
-        receive = self._receive_runs(receive)
+        if edges is None and self.content_link_edges != "off":
+            edges = self.edge_context(mu, beta, frame, receive)
+        receive = (self._receive_runs(receive) if edges is None
+                   else [edge_links.receive_heads(edges, len(self.irrep_dims))])
         with torch.autocast(device_type=mu.device.type, enabled=False):
             coordinates = canonical.unsqueeze(-2).to(dtype)                 # (..., N, 1, K)
             body = None
@@ -295,6 +411,10 @@ class RelationalOperators(nn.Module):
                 values = (T.to(dtype) @ coordinates.unsqueeze(-1)).squeeze(-1)     # (..., N, n_r, d_r)
                 pooled = torch.einsum("...hij,...jhs->...ihs",
                                       self._head_slice(beta, run, -3).to(dtype), values)
+                if edges is not None:                                       # one run (equal heads)
+                    body = edge_links.edge_reference_message(
+                        edge_links.cast_context(edges, dtype), beta.to(dtype), pooled.flatten(-2))
+                    continue
                 # Sum heads inside the contraction, avoiding a (..., N, H, K) result.
                 term = torch.einsum("hks,...nhs->...nk", O.to(dtype), pooled)     # (..., N, K)
                 body = term if body is None else body + term
@@ -307,6 +427,107 @@ class RelationalOperators(nn.Module):
     def _content_parameters(self) -> List[torch.Tensor]:
         r"""Every stored content tensor (T and O of every run), for dtype resolution."""
         return self._stored_runs("T") + self._stored_runs("O")
+
+    def edge_parameters(self) -> List[torch.Tensor]:
+        r"""The edge-link parameters (``edge_receiver_map`` or ``edge_site_basis``, then ``edge_sender_map``); empty when off."""
+        return [getattr(self, name) for name in edge_links.EDGE_PARAMETER_NAMES if hasattr(self, name)]
+
+    def edge_context(
+        self,
+        mu:      torch.Tensor,        # (..., N, K) source means (local coordinates)
+        beta:    torch.Tensor,        # (..., H, N, N) routing weights
+        frame:   CanonicalFrameContext,   # the value frame the content reads
+        receive: 'Optional[torch.Tensor | Sequence[torch.Tensor]]' = None,   # (H, K, d) O'_h; None evaluates the chart
+        *,
+        sigma:      Optional[torch.Tensor] = None,   # (..., N, K) or (..., N, K, K): content_link_latent reads it
+        log_prior:  Optional[torch.Tensor] = None,   # (N, N) or (H, N, N) routing log-prior (loop weights)
+        link_state: Optional[dict] = None,           # loop prior: {"previous": LinkState}; "current" is written
+        latent_out: Optional[dict] = None,           # out-param: edge_links.LATENT_DIAGNOSTIC_KEYS
+    ) -> EdgeContext:
+        r"""The layer's :class:`vfe3.model.edge_links.EdgeContext`, computed once and shared by mean, covariance and diagnostics.
+
+        :math:`(T, R = T^{-1}, O', F = O'T)` come from one float64 chart evaluation
+        (:func:`chart_stacks`; a supplied ``receive`` replaces :math:`O'` and costs a separate inversion)
+        and are cast with the factors and :math:`\Phi_{ij}` to the readout compute dtype (float64 under
+        an escalated frame), with autocast off and IEEE fp32 GEMMs.
+
+        Under ``content_link_latent`` the receiver factors are the MAP estimates
+        :func:`vfe3.model.edge_links.infer_latent_receivers` returns, from the reference covariances
+        :math:`C_j = U_j^{-1}\Sigma_jU_j^{-\top}` of ``sigma`` in ``frame``. With a positive loop weight
+        ``link_state`` is required (an empty dict at layer 0, where there are no loops); its ``"previous"``
+        entry (the previous layer's :class:`vfe3.model.edge_links.LinkState`) feeds the loop prior with weights
+        from ``log_prior``, and this layer's state is written to ``"current"``.
+        """
+        if self.content_link_edges == "off":
+            raise ValueError("edge_context needs content_link_edges 'lowrank' or 'pure_gauge'")
+        if self.content_link_latent and sigma is None:
+            raise ValueError("content_link_latent infers the receiver factors from the source covariances; pass "
+                             "sigma, or the edge context relational_predictive_readout builds")
+        loops = self.content_link_latent and self.content_link_loop_weight > 0.0
+        if loops and link_state is None:
+            raise ValueError("content_link_loop_weight > 0 reads the previous layer's links; pass link_state "
+                             "(an empty dict at layer 0), as vfe_stack does")
+        K = self.input_dim
+        dtype = _compute_dtype(mu, *self._content_parameters(), *self.edge_parameters(), frame.forward)
+        receiver = (self.edge_receiver_map if self.content_link_edges == "lowrank" else self.edge_site_basis)
+        with torch.autocast(device_type=mu.device.type, enabled=False), ieee_fp32_matmul():
+            if receive is None:
+                T64, R64, O64 = chart_stacks([self.T], [self.O], self.content_link_chart)
+            else:
+                O_heads = receive if torch.is_tensor(receive) else list(receive)[0]       # (H, K, d)
+                T64 = self.T.to(torch.float64).reshape(K, K)
+                R64 = torch.linalg.inv_ex(T64).inverse
+                O64 = O_heads.to(torch.float64).permute(1, 0, 2).reshape(K, K)
+            F64 = O64 @ T64                                                                # (K, K) e^{L}
+            xi = self.canonical_mean(mu, frame).to(dtype)                                  # (..., N, K)
+            b = beta.to(dtype)
+            ctx = edge_links.build_edge_context(
+                xi, b, T64.to(dtype), R64.to(dtype), O64.to(dtype), F64.to(dtype),
+                self.content_link_edges, self.edge_sender_map.to(dtype), receiver.to(dtype))
+            if not self.content_link_latent:
+                return ctx
+            previous = link_state.get("previous") if loops else None
+            loop = (None if previous is None else edge_links.LoopInputs(
+                previous, edge_links.prior_routing_weights(log_prior, mu.shape[-2], dtype=torch.float64,
+                                                           device=mu.device),
+                self.content_link_loop_window))
+            C = self._reference_covariance(sigma, frame, dtype, diagonal=sigma.dim() == mu.dim())
+            sources = edge_links.latent_sources(ctx, b, xi, C, self.attention_residual)
+            A = edge_links.infer_latent_receivers(
+                ctx, b, sources, sigma=self.content_link_latent_sigma, steps=self.content_link_latent_steps,
+                damping=self.content_link_latent_damping, loop_weight=self.content_link_loop_weight,
+                loop=loop, stats=latent_out)
+            ctx = edge_links.with_receiver_factors(ctx, A, b)
+            if loops:
+                L64 = self.O.to(torch.float64).permute(1, 0, 2).reshape(K, K) @ self.T.to(torch.float64).reshape(K, K)
+                link_state["current"] = edge_links.LinkState(F64, torch.linalg.matrix_exp(-L64), A, ctx.B)
+            return ctx
+
+    def _reference_covariance(
+        self,
+        sigma:    torch.Tensor,        # (..., N, K) diagonal or (..., N, K, K) full local covariance
+        frame:    CanonicalFrameContext,
+        dtype:    torch.dtype,
+        *,
+        diagonal: bool,
+    ) -> torch.Tensor:                 # (..., N, H, d, d) blocks, or (..., N, K, K)
+        r""":math:`C_i = U_i^{-1}\Sigma_iU_i^{-\top}`: diagonal blocks for diagonal beliefs on block frames, else dense.
+
+        The same construction as the covariance bodies (:meth:`_predictive_covariance_update_blockwise`,
+        :meth:`_predictive_covariance_update_dense`), symmetrized.
+        """
+        H, d, K = len(self.irrep_dims), self.irrep_dims[0], self.input_dim
+        inverse = frame.inverse.to(dtype)
+        if frame.block_diagonal and diagonal:
+            sigma_h = sigma.to(dtype).reshape(*sigma.shape[:-1], H, d)                     # (..., N, H, d)
+            C = (inverse * sigma_h.unsqueeze(-2)) @ inverse.transpose(-1, -2)              # (..., N, H, d, d)
+        else:
+            if frame.block_diagonal:                                                       # (..., N, H, d, d) -> (..., N, K, K)
+                eye_h = torch.eye(H, dtype=dtype, device=sigma.device)
+                inverse = torch.einsum("...hab,hg->...hagb", inverse, eye_h).reshape(*inverse.shape[:-3], K, K)
+            local = torch.diag_embed(sigma.to(dtype)) if diagonal else sigma.to(dtype)
+            C = inverse @ local @ inverse.transpose(-1, -2)                                # (..., N, K, K)
+        return 0.5 * (C + C.transpose(-1, -2))
 
     def _receive_runs(
         self,
@@ -342,6 +563,8 @@ class RelationalOperators(nn.Module):
         beta:  torch.Tensor,  # (..., H, N, N) routing weights, rows sum to one
         frame: CanonicalFrameContext,
         receive: Optional[torch.Tensor] = None,   # (H, K, d) precomputed O'_h; None evaluates the chart
+        *,
+        edges: Optional[EdgeContext] = None,      # content_link_edges: the layer's edge context (built when None)
     ) -> torch.Tensor:        # same layout as sigma: the moment-matched covariance Sigma_i^+
         r"""Moment-matched covariance of the predictive kernel (GL(K) v2, Theorem thm:probabilistic_status (2)).
 
@@ -363,11 +586,27 @@ class RelationalOperators(nn.Module):
         Head-space pooling keeps the cost at an attention with d x d values per head pair.
         Under ``predictive_covariance_checkpoint`` the update is recomputed in backward (non-reentrant
         checkpoint; the update draws no random numbers), so values and gradients are unchanged.
+
+        Under ``content_link_edges`` the kernel is the same with :math:`M_h \to M_h^{ij} = G_{ij}\Pi_h`:
+
+        .. math::
+            C_i^{\mathrm{att}} = g_iF\Bigl(\hat P_i + \sum_hR_h\tilde\Sigma_i^hR_h^\top
+              + A_iX_i + X_i^\top A_i^\top + A_iY_iA_i^\top\Bigr)F^\top g_i^\top
+              + r\bigl[C_i + \mathrm{cross}_i + \mathrm{cross}_i^\top\bigr] + \tilde Q_i,
+            \qquad \mathrm{cross}_i = \sum_h\beta_{ii}^h\,g_iF(I + A_i\Phi_{ii}B_i^\top)\Pi_hC_i,
+
+        with :math:`X_i, Y_i` of :func:`vfe3.model.edge_links.edge_covariance_factors`; the edge context is
+        computed outside the checkpointed region and enters it as an input.
         """
+        if edges is None and self.content_link_edges != "off":
+            edges = self.edge_context(mu, beta, frame, receive, sigma=sigma)
+        if edges is not None:
+            receive = edge_links.receive_heads(edges, len(self.irrep_dims))
+        extra = () if edges is None else (edges,)
         if self.predictive_covariance_checkpoint and torch.is_grad_enabled():
-            return checkpoint(self._predictive_covariance_update, mu, sigma, beta, frame, receive,
+            return checkpoint(self._predictive_covariance_update, mu, sigma, beta, frame, receive, *extra,
                               use_reentrant=False, preserve_rng_state=False)
-        return self._predictive_covariance_update(mu, sigma, beta, frame, receive)
+        return self._predictive_covariance_update(mu, sigma, beta, frame, receive, *extra)
 
     @ieee_fp32_matmul()
     def _predictive_covariance_update(
@@ -377,6 +616,7 @@ class RelationalOperators(nn.Module):
         beta:  torch.Tensor,  # (..., H, N, N)
         frame: CanonicalFrameContext,
         receive: Optional[torch.Tensor] = None,   # (H, K, d)
+        edges: Optional[EdgeContext] = None,
     ) -> torch.Tensor:
         r"""Body of :meth:`predictive_covariance_update`: blockwise for diagonal beliefs on block frames.
 
@@ -387,8 +627,8 @@ class RelationalOperators(nn.Module):
         variances came out nonpositive on ill-conditioned frames.
         """
         if frame.block_diagonal and sigma.dim() == mu.dim():
-            return self._predictive_covariance_update_blockwise(mu, sigma, beta, frame, receive)
-        return self._predictive_covariance_update_dense(mu, sigma, beta, frame, receive)
+            return self._predictive_covariance_update_blockwise(mu, sigma, beta, frame, receive, edges)
+        return self._predictive_covariance_update_dense(mu, sigma, beta, frame, receive, edges)
 
     def _predictive_covariance_update_blockwise(
         self,
@@ -397,6 +637,7 @@ class RelationalOperators(nn.Module):
         beta:  torch.Tensor,  # (..., H, N, N) routing weights, rows sum to one
         frame: CanonicalFrameContext,             # block_diagonal: (..., N, H, d, d) blocks U_{i,m}
         receive: Optional[torch.Tensor] = None,   # (H, K, d) precomputed O'_h; None evaluates the chart
+        edges: Optional[EdgeContext] = None,      # content_link_edges: the layer's edge context
     ) -> torch.Tensor:        # (..., N, K) diag(Sigma_i^+)
         r"""Diagonal of the moment-matched covariance for diagonal beliefs on block-diagonal frames.
 
@@ -425,6 +666,11 @@ class RelationalOperators(nn.Module):
         """
         H, d = len(self.irrep_dims), self.irrep_dims[0]
         dtype = _compute_dtype(mu, sigma, self.T, self.O, frame.forward)
+        if edges is None and self.content_link_edges != "off":
+            edges = self.edge_context(mu, beta, frame, receive, sigma=sigma)
+        if edges is not None:
+            edges = edge_links.cast_context(edges, dtype)
+            receive = edge_links.receive_heads(edges, H)
         with torch.autocast(device_type=mu.device.type, enabled=False):
             forward, inverse = frame.forward.to(dtype), frame.inverse.to(dtype)        # (..., N, H, d, d)
             sigma_h = sigma.to(dtype).reshape(*sigma.shape[:-1], H, d)                 # (..., N, H, d)
@@ -454,10 +700,19 @@ class RelationalOperators(nn.Module):
             lifted = torch.einsum("hks,...nhgst->...ngkt", O_hat, pooled)             # (..., N, H, K, d) sum_h O'_h P_hg
             lifted = lifted.reshape(*lifted.shape[:-2], H, d, d)                       # (..., N, g, l, k, t)
             C_att = torch.einsum("...nglkt,glmt->...nlkm", lifted, O_blocks)          # (..., N, H, d, d) blocks [ll]
+            if edges is not None:
+                # [g_i F (P^ + R Sigma~ R^T + A X + X^T A^T + A Y A^T) F^T g_i^T]_ll (edge_links).
+                A_hat, X_hat, Y = edge_links.edge_covariance_factors(edges, b, c, source, values, mean)
+                inner = C_att + edge_links.edge_correction_blocks(A_hat, X_hat, Y, H)
+                C_att = (edge_links.outer_gauge_blocks(
+                    edges, inner, edge_links.edge_inner_rows(edges, pooled, A_hat, X_hat, Y))
+                    if edges.mode == "pure_gauge" else inner)
             if self.attention_residual:
                 self_weight = b.diagonal(dim1=-2, dim2=-1).transpose(-1, -2)          # (..., N, H) beta_ii^h
                 cross = torch.einsum("hlks,...nhlsm->...nlkm", O_blocks,
                                      TC * self_weight[..., None, None, None])          # (..., N, H, d, d) X_{i,l}
+                if edges is not None:                                                  # blocks of sum_h beta_ii M_h^{ii} C_i
+                    cross = edge_links.edge_residual_cross_blocks(edges, A_hat, self_weight, TC, cross)
                 C_att = C_att + C + cross + cross.transpose(-1, -2)
             scale = torch.diagonal(C, dim1=-2, dim2=-1).flatten(-2).mean(dim=-1)      # (..., N) tr(C_i)/K
             C_att = C_att + (self.predictive_covariance_floor * scale)[..., None, None, None] * torch.eye(
@@ -472,6 +727,7 @@ class RelationalOperators(nn.Module):
         beta:  torch.Tensor,  # (..., H, N, N)
         frame: CanonicalFrameContext,
         receive: Optional[torch.Tensor] = None,   # (H, K, d)
+        edges: Optional[EdgeContext] = None,      # content_link_edges: the layer's edge context
     ) -> torch.Tensor:
         r"""Dense K x K evaluation of :meth:`predictive_covariance_update` (full family or dense frames).
 
@@ -483,6 +739,11 @@ class RelationalOperators(nn.Module):
         H, K = len(self.irrep_dims), self.input_dim
         diagonal = sigma.dim() == mu.dim()
         dtype = _compute_dtype(mu, sigma, *self._content_parameters(), frame.forward)
+        if edges is None and self.content_link_edges != "off":
+            edges = self.edge_context(mu, beta, frame, receive, sigma=sigma)
+        if edges is not None:
+            edges = edge_links.cast_context(edges, dtype)
+            receive = edge_links.receive_heads(edges, H)
         with torch.autocast(device_type=mu.device.type, enabled=False):
             forward, inverse = frame.forward.to(dtype), frame.inverse.to(dtype)
             if frame.block_diagonal:                            # (..., N, H, d, d) -> (..., N, K, K)
@@ -524,6 +785,12 @@ class RelationalOperators(nn.Module):
                     lifted = torch.einsum("hks,...nhgst->...ngkt", O_r, pooled)   # (..., N, n_g, K, d_g)
                     term = torch.einsum("...ngkt,gmt->...nkm", lifted, O_g)        # (..., N, K, K)
                     C_att = term if C_att is None else C_att + term
+            if edges is not None:
+                # One run (equal heads): source, c, values and mean are the head-pair pieces above.
+                # g_i F (P^ + R Sigma~ R^T + A X + X^T A^T + A Y A^T) F^T g_i^T (edge_links).
+                A_hat, X_hat, Y = edge_links.edge_covariance_factors(edges, b, c, source, values, mean)
+                C_att = edge_links.outer_gauge_sandwich(
+                    edges, C_att + edge_links.edge_correction_dense(A_hat, X_hat, Y))
             if self.attention_residual:
                 cross = None
                 for O_r, b_r, TC in zip(O_runs, b_runs, TC_runs):
@@ -531,6 +798,9 @@ class RelationalOperators(nn.Module):
                     term = torch.einsum("hks,...nhsm->...nkm", O_r,
                                         TC * self_weight[..., None, None])        # sum_h beta_ii M_h C_i
                     cross = term if cross is None else cross + term
+                if edges is not None:                                              # sum_h beta_ii M_h^{ii} C_i
+                    cross = edge_links.outer_gauge_left(edges, cross + edge_links.edge_residual_cross_dense(
+                        edges, A_hat, self_weight, TC_runs[0]))
                 C_att = C_att + C + cross + cross.transpose(-1, -2)
             # Isotropic reference floor scaled by the invariant tr(C_i)/K: a relative floor
             # floor * C_i compounds as floor**depth along a residual-free stack and loses float32

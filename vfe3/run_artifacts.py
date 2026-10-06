@@ -117,6 +117,18 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         rank = list(dims)
         score_shape = [[d, K] for d in dims]
         content_shapes = [[[d, K] for d in dims], [[K, d] for d in dims]]
+    edges = getattr(cfg, "content_link_edges", "off")
+    edge_fields: Dict[str, object] = {}
+    if edges != "off":
+        # Edge factor maps (content_link_edges): W_B (K r x K) and W_A (K r x K) or the shared basis A (K x r).
+        r = cfg.content_link_edge_rank
+        layer_counts["content"] += K * r * K + (K * r * K if edges == "lowrank" else K * r)
+        edge_fields = {"content_link_edges": edges, "content_link_edge_rank": r}
+        if getattr(cfg, "content_link_latent", False):
+            # Latent receiver factors (MAP inference per context): no parameters, only the inference settings.
+            edge_fields.update({name: getattr(cfg, name) for name in (
+                "content_link_latent", "content_link_latent_steps", "content_link_latent_sigma",
+                "content_link_latent_damping", "content_link_loop_weight", "content_link_loop_window")})
     counts = {role: count * cfg.n_layers for role, count in layer_counts.items()}
     return {"relational_operators": {
         "attention_mode": cfg.attention_mode,
@@ -144,6 +156,7 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "identity_content": False,
         "content_mode": "full_width",
         "content_link_chart": cfg.content_link_chart,
+        **edge_fields,
         "score_shape": score_shape,
         "content_shapes": content_shapes,
         "parameter_counts": counts, "total_parameters": sum(counts.values()),

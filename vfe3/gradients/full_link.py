@@ -373,6 +373,9 @@ def build_full_link_context(
                          "and a diagonal prior: KL(q_i||p_i) separates over local coordinates only there")
     if operators.input_scope != "full" or operators.output_scope != "full" or operators.T is None:
         raise ValueError("full-link inference requires learned full input/output content maps")
+    if getattr(operators, "content_link_edges", "off") != "off":
+        raise ValueError("full-link inference reads the shared content maps; content_link_edges operators "
+                         "(edge links G_ij = g_i e^L E_ij) are supported by the predictive_content readout only")
     if operators.routing != "gaussian_kl":
         raise ValueError("full-link inference requires gaussian_kl routing")
     if not math.isfinite(receiver_noise) or receiver_noise <= 0:

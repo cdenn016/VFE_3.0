@@ -40,7 +40,8 @@ import numpy as np
 import torch
 
 from vfe3.metrics import routing_triangle_defect_sums, triangle_holonomy_eigenvalues
-from vfe3.posthoc.maps import _ambient_content, _frame_geometry, load_map_state, relational_maps, snapshot_files
+from vfe3.posthoc.maps import (EDGE_MAP_NAMES, _ambient_content, _frame_geometry, load_map_state,
+                               relational_maps, snapshot_files)
 
 QUANTILES = (0.1, 0.5, 0.9)
 
@@ -58,10 +59,27 @@ def curvature_size(lam: torch.Tensor, scale_free: bool = False) -> torch.Tensor:
     return torch.sqrt((log_abs.square() + torch.angle(lam).square()).mean(dim=-1))
 
 
+def _refuse_edge_links() -> None:
+    raise NotImplementedError(
+        "triangle holonomy of content_link_edges models is not implemented: the edge links "
+        "G_ij = g_i e^L E_ij are context dependent, so the holonomy is not R_ijk G of the shared maps")
+
+
 def layer_content_maps(state: Mapping[str, torch.Tensor], cfg: Any) -> Dict[int, tuple]:
-    r"""``{layer: (T_hat (H, d, K), O_hat (H, K, d))}`` float64, for layers with content maps."""
+    r"""``{layer: (T_hat (H, d, K), O_hat (H, K, d))}`` float64, for layers with content maps.
+
+    Raises ``NotImplementedError`` for ``content_link_edges``: the edge links
+    :math:`G_{ij} = g_ie^{L}E_{ij}` make the triangle holonomy context dependent, so it is not
+    :math:`R_{ijk}G` of the shared maps, and the measurements of this module would describe a link
+    field the model does not use.
+    """
     out: Dict[int, tuple] = {}
-    for layer, maps in relational_maps(state, cfg).items():
+    if getattr(cfg, "content_link_edges", "off") != "off":
+        _refuse_edge_links()
+    layers = relational_maps(state, cfg)
+    if any(name in maps for maps in layers.values() for name in EDGE_MAP_NAMES):
+        _refuse_edge_links()
+    for layer, maps in layers.items():
         if "T" in maps and "O" in maps:
             _, d, B = _frame_geometry(maps, cfg)
             out[layer] = _ambient_content(maps["T"], maps["O"], d, B)
@@ -165,6 +183,8 @@ def checkpoint_holonomy(
 
     run_dir = Path(run_dir)
     loaded = ev.load_model(run_dir, checkpoint, device=ev.resolve_device(device))
+    if getattr(loaded.cfg, "content_link_edges", "off") != "off":
+        _refuse_edge_links()
     info = st.load_run_info(run_dir, checkpoint)
     tokens, record = st.resolve_stream(info, "validation")
     dataset = st.eval_windows(tokens, info.seq_len, info.eval_stride)

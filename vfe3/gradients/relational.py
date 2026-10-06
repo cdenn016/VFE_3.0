@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 
 from vfe3.contracts import CanonicalFrameContext
+from vfe3.model.edge_links import edge_diagnostic_capture, receive_heads as edge_receive_heads
 from vfe3.model.relational_operators import RelationalOperators
 from vfe3.relational_scoring import (
     _compute_dtype, projected_moments, projected_gaussian_kl, projected_noisy_query_cost,
@@ -110,6 +111,7 @@ def relational_predictive_readout(
     value_frame: Optional[CanonicalFrameContext] = None,
     capture:     Optional[Dict[str, Any]] = None,
     return_covariance: bool = False,
+    link_state:  Optional[dict] = None,
 ) -> 'torch.Tensor | Tuple[torch.Tensor, torch.Tensor]':
     r"""Return the conditional predictive mean with the configured projected routing cost and live source graphs.
 
@@ -118,10 +120,18 @@ def relational_predictive_readout(
     moment-matched covariance of the same predictive kernel
     (``RelationalOperators.predictive_covariance_update``), computed from the same routing weights
     and value frame as the mean. No source, router, or map is detached.
+    Under ``content_link_edges`` the edge context (factors, :math:`\Phi_{ij}` and the float64 chart
+    stacks) is computed once per layer and shared by the mean, the covariance and the capture.
+    Under ``content_link_latent`` its receiver factors are inferred from the source covariances of
+    ``sigma`` (whatever ``predictive_covariance`` is), and a positive loop weight reads and writes
+    ``link_state`` (``{"previous": ..., "current": ...}``, threaded across layers by ``vfe_stack``).
     """
     from vfe3.families.base import safe_kl_clamp
     from vfe3.free_energy import attention_weights
     dtype = torch.float64 if mu.dtype == torch.float64 else torch.float32
+    edges = None
+    latent = getattr(operators, "content_link_latent", False)
+    latent_out: Optional[Dict[str, Any]] = {} if (latent and capture is not None) else None
     with torch.autocast(device_type=mu.device.type, enabled=False):
         mu_work = mu.to(dtype)
         sigma_work = sigma.to(dtype)
@@ -129,16 +139,29 @@ def relational_predictive_readout(
             mu_work, sigma_work, mu_work, sigma_work, frame, operators, capture), kl_max=kl_max)
         beta = attention_weights(score, tau=tau,
                                  log_prior=None if log_prior is None else log_prior.to(dtype))
-        _, receive = operators.content_factor_runs()         # O' once per layer for mean and covariance
-        result = operators.predictive_content(mu_work, beta, value_frame or frame, receive).to(mu.dtype)
+        if getattr(operators, "content_link_edges", "off") != "off":
+            inference = ({} if not latent else dict(
+                sigma=sigma_work, log_prior=None if log_prior is None else log_prior.to(dtype),
+                link_state=link_state, latent_out=latent_out))
+            edges = operators.edge_context(mu_work, beta, value_frame or frame, **inference)
+            receive = [edge_receive_heads(edges, len(operators.irrep_dims))]
+        else:
+            _, receive = operators.content_factor_runs()         # O' once per layer for mean and covariance
+        shared = {} if edges is None else {"edges": edges}
+        result = operators.predictive_content(mu_work, beta, value_frame or frame, receive,
+                                              **shared).to(mu.dtype)
         if operators.attention_residual:
             result = mu + result
         sigma_plus = (operators.predictive_covariance_update(mu_work, sigma_work, beta, value_frame or frame,
-                                                             receive).to(sigma.dtype)
+                                                             receive, **shared).to(sigma.dtype)
                       if return_covariance else None)
     if capture is not None:
         capture.update(beta_pre=beta.detach(), score_energy_pre=score.detach(),
                        relational_mean_displacement_norm=(result-mu).norm().detach())
+        if edges is not None:
+            capture.update(edge_diagnostic_capture(edges, beta))
+        if latent_out is not None:
+            capture.update(latent_out)
     if return_covariance:
         return result, sigma_plus
     return result

@@ -74,6 +74,7 @@ def vfe_block(
     relational_value_frame: Optional[CanonicalFrameContext] = None,
     relational_capture: Optional[dict] = None,
     hidden_bias:     Optional[torch.Tensor]                  = None,      # (B, N, w) per-type hidden bias (None -> off)
+    link_state:      Optional[dict]                          = None,      # content_link_loop_weight > 0: cross-layer link state
 ) -> BeliefState:
     r"""Run n_e_steps of the E-step from ``belief`` toward the prior, then optional norm.
 
@@ -85,7 +86,8 @@ def vfe_block(
     ``hidden_bias`` (``per_type_hidden_bias``) is this layer's ``(B, N, w)`` slice of the per-type table,
     handed to the block MLP's ``forward_moments(..., hidden_bias=...)``. Under
     ``cfg.block_coordinates='reference'`` the norm and MLP act in reference coordinates through
-    ``relational_frame`` (:func:`_reference_coordinate_block`)."""
+    ``relational_frame`` (:func:`_reference_coordinate_block`). ``link_state`` carries the previous
+    layer's inferred links to the loop prior of ``content_link_loop_weight`` (passed only when it is on)."""
     if hidden_bias is not None and block_mlp is None:
         raise ValueError("hidden_bias (per_type_hidden_bias) needs a block MLP")
     if tau is None:
@@ -103,6 +105,7 @@ def vfe_block(
         grad_record=grad_record, state_record=state_record,
         log_prior=log_prior,
         **e_step_shared_kwargs(cfg, belief.mu.device),
+        **({"link_state": link_state} if link_state is not None else {}),
     )
     if capture is not None:
         # The CONVERGED variational belief q* -- what the E-step's F was minimized over,

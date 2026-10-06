@@ -757,14 +757,15 @@ def projected_gauge_equivariance(
     sigma = torch.diag_embed(sigma) if sigma.dim() == mu.dim() else sigma      # (1, N, K, K)
     H, d = len(model.group.irrep_dims), model.group.irrep_dims[0]
 
-    def evaluate(ops, mu, sigma, frame, value_frame) -> Dict[str, torch.Tensor]:
+    def evaluate(ops, mu, sigma, frame, value_frame, link_state=None) -> Dict[str, torch.Tensor]:
         capture: Dict[str, torch.Tensor] = {}
         U_v = _dense_frame(value_frame.forward, value_frame.block_diagonal)    # (1, N, K, K)
         U_v_inv = _dense_frame(value_frame.inverse, value_frame.block_diagonal)
         if ops.readout_mode == "predictive_content":
             mean, cov = relational_predictive_readout(
                 mu, sigma, frame, ops, tau=tau, kl_max=cfg.kl_max, log_prior=log_prior,
-                value_frame=value_frame, capture=capture, return_covariance=True)
+                value_frame=value_frame, capture=capture, return_covariance=True,
+                **({"link_state": link_state} if link_state is not None else {}))
             out = {"readout_mean": (U_v_inv @ mean.unsqueeze(-1)).squeeze(-1),
                    "readout_covariance": U_v_inv @ cov @ U_v_inv.transpose(-1, -2)}
         else:
@@ -787,8 +788,14 @@ def projected_gauge_equivariance(
     generator = torch.Generator().manual_seed(int(seed))
     layers = model.relational_operators_by_layer
     residuals: Dict[str, List[float]] = {}
+    # Latent loop prior (content_link_loop_weight > 0): layer l reads layer l-1's inferred links, evaluated on the
+    # same input. Those links are reference data (fixed by the passive action), so the moved evaluations reuse them.
+    loops = any(getattr(ops, "content_link_loop_weight", 0.0) > 0.0 for ops in layers)
+    previous_links = None
+    links = lambda: (None if not loops else {} if previous_links is None else {"previous": previous_links})
     for layer_index, ops in enumerate(layers):
-        base = evaluate(ops, mu, sigma, frame, value_frame)
+        base_links = links()
+        base = evaluate(ops, mu, sigma, frame, value_frame, base_links)
         worst: Dict[str, float] = {}
         for _ in range(int(n_draws)):
             if model.group.name == "block_glk" and model.group.tying == "per_head":
@@ -806,7 +813,7 @@ def projected_gauge_equivariance(
             G = _dense_frame(g, True) if g.dim() == mu.dim() + 2 else g        # (1, N, K, K)
             moved = evaluate(
                 ops, (G @ mu.unsqueeze(-1)).squeeze(-1), G @ sigma @ G.transpose(-1, -2),
-                _act_on_frame(g, frame), _act_on_frame(g, value_frame))
+                _act_on_frame(g, frame), _act_on_frame(g, value_frame), links())
             if "receiver_energy" in base:
                 # -c_i/2 log det(g Sigma g^T) = -c_i/2 log det Sigma - c_i log|det g_i|.
                 shift = (base["_c"] * torch.linalg.slogdet(G)[1]).sum()
@@ -816,6 +823,8 @@ def projected_gauge_equivariance(
                     worst[key] = max(worst.get(key, 0.0), _relative_deviation(value, moved[key]))
         for key, value in worst.items():
             residuals.setdefault(key, [float("nan")] * len(layers))[layer_index] = value
+        if loops:
+            previous_links = base_links.get("current")
     return {
         "residuals": residuals,
         "readout_mode": cfg.relational_readout_mode,
