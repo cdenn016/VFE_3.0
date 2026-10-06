@@ -319,6 +319,12 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     relational_receiver_update       = "closed_form",         # "closed_form" (exact frozen-context update) | "euler" (Fisher step; reads e_q_mu_lr / e_q_sigma_lr / trusts)
     relational_receiver_damping      = 1.0,                   # closed_form only: rho in (0, 1]; 1 = the frozen minimizer
     relational_receiver_noise        = 1.0,                   # channel floor nu I_d (channel_likelihood) | K-dim reference noise (ambient_alignment)
+    # predictive_readout="minimal_agent": exact record conditioning, key tied to the content (needs content_link_edges="off").
+    # It routes at temperature 1 and derives the residual: relational_routing, content_link_chart, attention_residual,
+    # relational_output_init and kappa_beta are not read.
+    predictive_readout               = "kernel",       # "kernel" | "minimal_agent"
+    minimal_agent_inference          = "exact",        # minimal_agent only: "exact" (per-pair posterior, heads by ADF) | "mean_field" (KL labels, cheaper)
+    minimal_agent_channel_noise      = 1.0,            # minimal_agent only: initial channel noise n_h (learned)
     
     
     
@@ -368,6 +374,10 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #################################
     use_block_mlp             = True,      
     block_mlp_expansion       = 8,
+    # block_mlp_mode="prototype_agents": the minimal agent model against M = block_mlp_expansion * K static templates
+    # (block_mlp_covariance "passthrough" | "posterior"; block_mlp_activation and block_mlp_covariance_floor are not read)
+    block_mlp_inference       = "mean_field",   # prototype_agents only: "mean_field" (KL responsibilities, power posterior) | "exact" (mixture posterior)
+    block_mlp_template_init_variance = 10.0,    # prototype_agents only: initial template variance lambda_0 > 0
     block_mlp_activation      = "gelu",
     block_mlp_dropout         = 0.00,
     per_type_hidden_bias      = False,          # per-type (V x n_gen) bias on the MLP hidden layer; coordinate MLP, projected route

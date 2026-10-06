@@ -9,9 +9,12 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from vfe3.contracts import CanonicalFrameContext
-from vfe3.model import edge_links
+from vfe3.model import edge_links, minimal_agent
 from vfe3.model.edge_links import EDGE_MODES, EdgeContext
-from vfe3.relational_scoring import _compute_dtype
+from vfe3.model.frame_actions import frame_matvec
+from vfe3.relational_scoring import (
+    _compute_dtype, _count_source_recovery, projected_condition_recovery, source_recovery_counter,
+)
 from vfe3.runtime import ieee_fp32_matmul
 
 # Receiving-map charts of the content link on the stored factors (O, T) (attention_unified.tex,
@@ -202,6 +205,14 @@ class RelationalOperators(nn.Module):
     fixed-point steps with prior scale ``content_link_latent_sigma`` and damping ``content_link_latent_damping``),
     optionally with the loop prior of weight ``content_link_loop_weight`` over ``content_link_loop_window``
     against the previous layer's links. It adds no parameter.
+    ``predictive_readout="minimal_agent"`` (predictive content, equal heads, edges off, no residual flag) replaces the
+    content readout by exact Gaussian conditioning on a noisy comparison record (:mod:`vfe3.model.minimal_agent`,
+    :meth:`minimal_agent_update`): ``raw_score_q`` is the query map :math:`S_h`, ``T`` is both the sending map and the
+    key (tied), and ``channel_log_noise`` ``(H,)`` holds :math:`\log n_h` of the channel noise :math:`n_hI_d`
+    (initialized to ``log(minimal_agent_channel_noise)``). ``raw_score_k`` and ``O`` are not created (registered as
+    None: the key is tied and the receiving map is derived), so the chart, the initial output scale and
+    ``routing`` are unused, and every O-reading method raises. ``minimal_agent_inference`` selects the exact
+    ADF posterior or the mean-field step.
     """
 
     def __init__(
@@ -229,6 +240,9 @@ class RelationalOperators(nn.Module):
         content_link_latent_damping: float = 1.0,
         content_link_loop_weight: float = 0.0,
         content_link_loop_window: Optional[int] = 1,
+        predictive_readout:    str   = "kernel",
+        minimal_agent_inference: str = "exact",
+        minimal_agent_channel_noise: float = 1.0,
     ) -> None:
         super().__init__()
         if not irrep_dims or any(type(d) is not int or d < 1 for d in irrep_dims):
@@ -315,8 +329,50 @@ class RelationalOperators(nn.Module):
         self.content_link_latent_damping = float(content_link_latent_damping)
         self.content_link_loop_weight = float(content_link_loop_weight)
         self.content_link_loop_window = content_link_loop_window
+        if predictive_readout not in minimal_agent.PREDICTIVE_READOUTS:
+            raise ValueError(f"predictive_readout must be one of {minimal_agent.PREDICTIVE_READOUTS}, "
+                             f"got {predictive_readout!r}")
+        if minimal_agent_inference not in minimal_agent.MINIMAL_AGENT_INFERENCE:
+            raise ValueError(f"minimal_agent_inference must be one of {minimal_agent.MINIMAL_AGENT_INFERENCE}, "
+                             f"got {minimal_agent_inference!r}")
+        if (isinstance(minimal_agent_channel_noise, bool) or not isinstance(minimal_agent_channel_noise, Real)
+                or not math.isfinite(minimal_agent_channel_noise) or minimal_agent_channel_noise <= 0.0):
+            raise ValueError("minimal_agent_channel_noise must be finite and positive, "
+                             f"got {minimal_agent_channel_noise!r}")
+        minimal = predictive_readout == "minimal_agent"
+        if minimal:
+            if readout_mode != "predictive_content":
+                raise ValueError("predictive_readout='minimal_agent' requires the predictive_content readout "
+                                 "(attention_mode='projected_predictive')")
+            if not equal:
+                raise ValueError("predictive_readout='minimal_agent' requires equal heads (one head run); this "
+                                 f"partition has head sizes {self.irrep_dims} (a mixed so_n irrep tower)")
+            if content_link_edges != "off":
+                raise ValueError("predictive_readout='minimal_agent' requires content_link_edges='off' (the edge "
+                                 "links multiply the content factors O, which the minimal agent derives)")
+            if attention_residual:
+                raise ValueError("predictive_readout='minimal_agent' derives a precision-weighted residual; "
+                                 "attention_residual must be False")
+        self.predictive_readout = predictive_readout
+        self.minimal_agent_inference = minimal_agent_inference
+        self.minimal_agent_channel_noise = float(minimal_agent_channel_noise)
         self.score_rank_per_head = irrep_dims[0] if equal else list(irrep_dims)
         self.content_rank_per_head = irrep_dims[0] if equal else list(irrep_dims)
+        if minimal:
+            _, n, d, start = self.runs[0]
+            T_full = torch.zeros(n, d, K)
+            for h in range(n):
+                T_full[h, :, start+h*d:start+(h+1)*d] = torch.eye(d)
+            # S_Q starts EQUAL to T's block projector (S_Q = T at step 0): the record S_Q X_i - T X_j then compares
+            # like coordinates, so the initial routing is the overlap of the same observable of receiver and source
+            # and the derived gain C_i S^T (...)^{-1} writes the heard utterance back into the coordinates it was
+            # read from. Independent random query rows would compare unrelated coordinates of receiver and source.
+            self.raw_score_q = nn.Parameter(T_full.clone())
+            self.register_parameter("raw_score_k", None)                   # tied key: S_K = T
+            self.T = nn.Parameter(T_full)                                  # block-projector initialization
+            self.register_parameter("O", None)                             # derived receiving map
+            self.channel_log_noise = nn.Parameter(torch.full((n,), math.log(float(minimal_agent_channel_noise))))
+            return
         generator = torch.Generator().manual_seed(seed)
         stored = {}
         for role in ("q", "k"):
@@ -369,8 +425,17 @@ class RelationalOperators(nn.Module):
     @property
     def inference_semantics(self) -> str:
         """Name the actual mean update used by this module."""
+        if self.predictive_readout == "minimal_agent":
+            return f"relational_minimal_agent_{self.minimal_agent_inference}"
         return ("relational_full_link_frozen_filtering" if self.readout_mode == "full_link_update"
                 else "relational_predictive_content")
+
+    def _require_kernel_readout(self, what: str) -> None:
+        r"""Refuse an O-reading method under ``predictive_readout='minimal_agent'``, which stores no content factor O."""
+        if self.predictive_readout != "kernel":
+            raise ValueError(f"{what} reads the content factor O, which predictive_readout='minimal_agent' does not "
+                             "store (its receiving map is derived from the receiver covariance); use "
+                             "minimal_agent_update")
 
     @property
     def input_scope(self) -> str:
@@ -397,6 +462,7 @@ class RelationalOperators(nn.Module):
         (:func:`vfe3.model.edge_links.edge_reference_message`), read from ``edges`` when given. Under
         ``content_link_latent`` the context must be given (its inference reads the source covariances).
         """
+        self._require_kernel_readout("predictive_content")
         canonical = self.canonical_mean(mu, frame)                          # (..., N, K)
         T_runs = self._stored_runs("T")
         dtype = _compute_dtype(mu, *self._content_parameters(), frame.forward)
@@ -426,6 +492,7 @@ class RelationalOperators(nn.Module):
 
     def _content_parameters(self) -> List[torch.Tensor]:
         r"""Every stored content tensor (T and O of every run), for dtype resolution."""
+        self._require_kernel_readout("the content-parameter list")
         return self._stored_runs("T") + self._stored_runs("O")
 
     def edge_parameters(self) -> List[torch.Tensor]:
@@ -458,6 +525,7 @@ class RelationalOperators(nn.Module):
         entry (the previous layer's :class:`vfe3.model.edge_links.LinkState`) feeds the loop prior with weights
         from ``log_prior``, and this layer's state is written to ``"current"``.
         """
+        self._require_kernel_readout("edge_context")
         if self.content_link_edges == "off":
             raise ValueError("edge_context needs content_link_edges 'lowrank' or 'pure_gauge'")
         if self.content_link_latent and sigma is None:
@@ -529,11 +597,146 @@ class RelationalOperators(nn.Module):
             C = inverse @ local @ inverse.transpose(-1, -2)                                # (..., N, K, K)
         return 0.5 * (C + C.transpose(-1, -2))
 
+    def minimal_agent_update(
+        self,
+        mu:        torch.Tensor,                    # (..., N, K) local means
+        sigma:     torch.Tensor,                    # (..., N, K) diagonal or (..., N, K, K) full local covariance
+        frame:     CanonicalFrameContext,           # the routing frame: query, key, content and write-back
+        log_prior: Optional[torch.Tensor] = None,   # (N, N) or (H, N, N) routing log-prior, the label prior pi
+        *,
+        return_covariance: bool = False,
+        capture:   Optional[dict] = None,           # out-param: router, costs and minimal-agent diagnostics
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:  # local (mu_plus, sigma_plus or None), input layout
+        r"""Minimal-agent posterior of every receiver in local coordinates (:mod:`vfe3.model.minimal_agent`).
+
+        With :math:`\xi_i = U_i^{-1}\mu_i` and :math:`C_i = U_i^{-1}\Sigma_iU_i^{-\top}` (diagonal blocks for diagonal
+        beliefs on block frames, else dense), :func:`vfe3.model.minimal_agent.minimal_agent_readout` gives
+        :math:`(\xi_i^+, \mathsf K_i^h, M_i^h)` and
+
+        .. math::
+            \mu_i^+ = U_i\xi_i^+,\qquad
+            \Sigma_i^+ = \Sigma_i - \sum_hZ_i^hM_i^hZ_i^{h\top} + f\,\tfrac{\operatorname{tr}C_i}{K}U_iU_i^\top,
+            \qquad Z_i^h = U_i\mathsf K_i^h,
+
+        the posterior mean (no residual is added: the residual is the precision-weighted part of the gain update)
+        and, with ``return_covariance``, the posterior covariance plus the covariant floor
+        :math:`f = ` ``predictive_covariance_floor`` (tr of the input :math:`C_i`), in the input layout (a diagonal
+        input returns the diagonal). ``predictive_covariance='passthrough'`` is applied by the caller, which keeps
+        the incoming covariance and does not request it; the mean uses :math:`C_i` in its gain either way. Under
+        ``predictive_covariance_checkpoint`` the whole readout is a non-reentrant checkpoint (it draws no random
+        numbers), so values and gradients equal the plain call. ``capture`` receives ``beta_pre`` (the labels each
+        head used, ``(..., H, N, N)``), ``score_energy_pre`` (their per-pair costs),
+        ``projected_covariance_pre`` (:math:`S_hC_iS_h^\top` at the input), ``projected_key_covariance_pre``
+        (:math:`T_hC_jT_h^\top`, the noise-free key law), ``relational_mean_displacement_norm`` and the per-head
+        :data:`vfe3.model.minimal_agent.MINIMAL_AGENT_DIAGNOSTIC_KEYS` ``(H,)``: gain fraction and head coupling
+        (means over receivers) and :math:`n_h`.
+
+        One host check covers the call. A float32 call that reports a failed factorization (an ADF query covariance
+        :math:`A^h` that lost positive definiteness by cancellation, a record covariance, ...) or, under
+        ``projected_cov_condition_recovery``, a query certificate (module docstring of
+        :mod:`vfe3.model.minimal_agent`) is recomputed whole in float64 from the local beliefs, frame and prior, and
+        its outputs and capture are cast back to the input dtypes. The float32 attempt is discarded, so backward
+        never runs through its failed factorizations. Every query and key entry of the call (:math:`2BNH`) is then
+        counted as recovered in the source-recovery counter that the training loop reads
+        (``relational_covariance_repair_count``). A float64 failure raises ``ValueError``; nothing is repaired.
+        """
+        if self.predictive_readout != "minimal_agent":
+            raise ValueError("minimal_agent_update needs predictive_readout='minimal_agent'")
+        dtype = _compute_dtype(mu, sigma, self.raw_score_q, self.T, self.channel_log_noise, frame.forward)
+        # A float32 mean-field KL may refactor its factors in float64 under the certificate and count them; an
+        # escalated call then adds only the rest of its entries below, so no entry is counted twice.
+        before = (source_recovery_counter(mu.device) if dtype != torch.float64
+                  and self.minimal_agent_inference == "mean_field" and projected_condition_recovery() else None)
+        mu_plus, sigma_plus, record, status = self._minimal_agent_call(
+            mu, sigma, frame, log_prior, return_covariance, capture is not None)
+        failed, ill_conditioned = status.tolist()                       # the one host check of a healthy call
+        if failed and dtype == torch.float64:
+            raise ValueError(minimal_agent.readout_failure_message(dtype))
+        if failed or ill_conditioned:
+            # float64 beliefs make the body compute in float64; it casts the frame factors itself, so the float32
+            # frame is passed unchanged (a float64 CanonicalFrameContext would re-validate a float32 inverse pair
+            # against the float64 residual tolerance).
+            mu_plus, sigma_plus, record, status = self._minimal_agent_call(
+                mu.double(), sigma.double(), frame, None if log_prior is None else log_prior.double(),
+                return_covariance, capture is not None)
+            if bool(status[0]):
+                raise ValueError(minimal_agent.readout_failure_message(torch.float64)
+                                 + "; the float32 call failed first and was recomputed in float64")
+            mu_plus = mu_plus.to(mu.dtype)
+            sigma_plus = None if sigma_plus is None else sigma_plus.to(sigma.dtype)
+            record = {key: (value.to(mu.dtype) if torch.is_tensor(value) and value.is_floating_point() else value)
+                      for key, value in record.items()}
+            entries = torch.full((), 2 * math.prod(mu.shape[:-1]) * len(self.irrep_dims), dtype=torch.long,
+                                 device=mu.device)                     # every query and key entry, 2 B N H
+            if before is not None:
+                entries = entries - (source_recovery_counter(mu.device) - before)
+            _count_source_recovery(entries)
+        if capture is not None:
+            capture.update(record)
+            capture["relational_mean_displacement_norm"] = (mu_plus - mu).norm().detach()
+        return mu_plus, sigma_plus
+
+    def _minimal_agent_call(
+        self,
+        *args: object,                              # the arguments of _minimal_agent_body
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], dict, torch.Tensor]:
+        r""":meth:`_minimal_agent_body`, as one non-reentrant checkpoint under ``predictive_covariance_checkpoint``."""
+        if self.predictive_covariance_checkpoint and torch.is_grad_enabled():
+            return checkpoint(self._minimal_agent_body, *args, use_reentrant=False, preserve_rng_state=False)
+        return self._minimal_agent_body(*args)
+
+    def _minimal_agent_body(
+        self,
+        mu:                torch.Tensor,            # (..., N, K)
+        sigma:             torch.Tensor,            # (..., N, K) or (..., N, K, K)
+        frame:             CanonicalFrameContext,
+        log_prior:         Optional[torch.Tensor],
+        return_covariance: bool,
+        diagnostics:       bool,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], dict, torch.Tensor]:
+        r"""Body of :meth:`minimal_agent_update`: autocast off, IEEE fp32 GEMMs, float64 under an escalated frame.
+
+        Returns the local outputs, the capture record and the readout's status ``(failed, ill_conditioned)``
+        ``(2,)`` bool, unchecked (the caller makes the host check)."""
+        H, K = len(self.irrep_dims), self.input_dim
+        S, T, log_noise = self.raw_score_q, self.T, self.channel_log_noise
+        dtype = _compute_dtype(mu, sigma, S, T, log_noise, frame.forward)
+        with torch.autocast(device_type=mu.device.type, enabled=False), ieee_fp32_matmul():
+            xi = self.canonical_mean(mu.to(dtype), frame).to(dtype)                       # (..., N, K) U_i^{-1} mu_i
+            C = self._reference_covariance(sigma, frame, dtype, diagonal=sigma.dim() == mu.dim())
+            result = minimal_agent.minimal_agent_readout(
+                xi, C, S, T, log_noise, log_prior, self.minimal_agent_inference, diagnostics=diagnostics,
+                check=False)
+            forward = frame.forward.to(dtype)
+            mu_plus = frame_matvec(forward, result.xi, frame.block_diagonal)              # (..., N, K) U_i xi_i^+
+            sigma_plus = None
+            if return_covariance:
+                trace = (torch.diagonal(C, dim1=-2, dim2=-1).sum(dim=(-2, -1)) if C.dim() == mu.dim() + 2
+                         else torch.diagonal(C, dim1=-2, dim2=-1).sum(dim=-1))           # (..., N) tr C_i
+                sigma_plus = minimal_agent.local_posterior_covariance(
+                    sigma.to(dtype), forward, frame.block_diagonal, result.gains, result.M,
+                    self.predictive_covariance_floor * trace / K)
+        record: dict = {}
+        if diagnostics:
+            with torch.no_grad():
+                record = {
+                    "beta_pre": result.weights.detach(),                                 # (..., H, N, N)
+                    "score_energy_pre": result.cost.detach(),                            # (..., H, N, N)
+                    "projected_covariance_pre": result.query_covariance.detach(),        # (..., N, H, d, d)
+                    "projected_key_covariance_pre": result.key_covariance.detach(),      # (..., N, H, d, d)
+                    "relational_minimal_agent_gain_fraction": result.gain_fraction.detach().reshape(-1, H).mean(0),
+                    "relational_minimal_agent_channel_noise": log_noise.detach().to(dtype).exp(),
+                    "relational_minimal_agent_head_coupling": result.head_coupling.reshape(-1, H).mean(0),
+                }
+        status = torch.stack((result.failed, result.ill_conditioned))                         # (2,) bool
+        return (mu_plus.to(mu.dtype), None if sigma_plus is None else sigma_plus.to(sigma.dtype), record, status)
+
     def _receive_runs(
         self,
         receive: 'Optional[torch.Tensor | Sequence[torch.Tensor]]',
     ) -> List[torch.Tensor]:
         r"""Per-run O'_h: the chart evaluated when ``receive`` is None; a lone tensor is one run."""
+        self._require_kernel_readout("the effective receiving maps O'")
         if receive is None:
             return self.content_factor_runs()[1]
         return [receive] if torch.is_tensor(receive) else list(receive)
@@ -544,6 +747,7 @@ class RelationalOperators(nn.Module):
         receive: 'Optional[torch.Tensor | Sequence[torch.Tensor]]' = None,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         r"""Per-run full-state T_h (n_r, d_r, K) and effective O'_h (n_r, K, d_r)."""
+        self._require_kernel_readout("the ambient content maps")
         return ([T.to(dtype) for T in self._stored_runs("T")],
                 [O.to(dtype) for O in self._receive_runs(receive)])
 
@@ -598,6 +802,7 @@ class RelationalOperators(nn.Module):
         with :math:`X_i, Y_i` of :func:`vfe3.model.edge_links.edge_covariance_factors`; the edge context is
         computed outside the checkpointed region and enters it as an input.
         """
+        self._require_kernel_readout("predictive_covariance_update")
         if edges is None and self.content_link_edges != "off":
             edges = self.edge_context(mu, beta, frame, receive, sigma=sigma)
         if edges is not None:
@@ -836,21 +1041,24 @@ class RelationalOperators(nn.Module):
                              f"(use the per-run accessor)")
 
     def comparison_pair(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        r"""Return (S_Q,S_K), each (H,r,input_dim), with live role graphs (equal heads)."""
+        r"""Return (S_Q,S_K), each (H,r,input_dim), with live role graphs (equal heads); S_K = T under the minimal agent."""
         self._require_equal_heads("comparison_pair")
-        return self.raw_score_q, self.raw_score_k
+        return self.raw_score_q, (self.T if self.predictive_readout == "minimal_agent" else self.raw_score_k)
 
     def comparison_runs(self) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-        r"""Per-run (S_Q, S_K), each (n_r, d_r, input_dim), with live role graphs."""
-        return list(zip(self._stored_runs("raw_score_q"), self._stored_runs("raw_score_k")))
+        r"""Per-run (S_Q, S_K), each (n_r, d_r, input_dim), with live role graphs; the tied S_K = T under the minimal agent."""
+        key = "T" if self.predictive_readout == "minimal_agent" else "raw_score_k"
+        return list(zip(self._stored_runs("raw_score_q"), self._stored_runs(key)))
 
     def content_factors(self) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""Return full-state (T, O') for M_h=O'_h T_h; O' = O in the affine chart (the stored parameter)."""
+        self._require_kernel_readout("content_factors")
         self._require_equal_heads("content_factors")
         return self.T, chart_receive_map(self.T, self.O, self.content_link_chart)
 
     def content_factor_runs(self) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         r"""Per-run (T, O'): T (n_r, d_r, K) and O' (n_r, K, d_r) of the content link's chart."""
+        self._require_kernel_readout("content_factor_runs")
         T_runs = self._stored_runs("T")
         return T_runs, chart_receive_runs(T_runs, self._stored_runs("O"), self.content_link_chart)
 

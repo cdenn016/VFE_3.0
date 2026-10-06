@@ -8,6 +8,7 @@ tensors / dicts that the pure metrics and the figure functions consume. Everythi
 ``torch.no_grad`` and OFF the training hot path.
 """
 
+import math
 from typing import TYPE_CHECKING, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import torch
@@ -619,9 +620,12 @@ def readout_state(
     cap = snapshot.conditional_capture
     if cap is None:
         raise ValueError("readout_state requires a conditional forward capture")
+    # The minimal-agent posterior applies no cost clamp, so only a non-finite cost reads as saturated.
+    kl_max = (math.inf if getattr(model.cfg, "predictive_readout", "kernel") == "minimal_agent"
+              else model.cfg.kl_max)
     guard = metrics.guard_saturation(
         out.sigma, cap["score_energy_pre"], out.mu.new_empty(0), diagonal=True,
-        eps=model.cfg.eps, sigma_max=model.cfg.sigma_max, kl_max=model.cfg.kl_max,
+        eps=model.cfg.eps, sigma_max=model.cfg.sigma_max, kl_max=kl_max,
     )
     guard.pop("selfdiv_klmax_frac", None)  # no self-energy was evaluated by this diagnostic
     state = {

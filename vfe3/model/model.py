@@ -360,11 +360,13 @@ class VFEModel(nn.Module):
         # receiver ignores them (its covariance comes from the receiver update and its
         # self-information from alpha KL(q||p)), so they reach only predictive operators.
         predictive = cfg.relational_readout_mode == "predictive_content"
+        # The minimal agent derives a precision-weighted residual, so its operators carry no residual flag.
+        minimal_agent = cfg.predictive_readout == "minimal_agent"
         layers = [
             RelationalOperators(list(self.group.irrep_dims),
                                 _derived_seed(cfg.seed, "relational_operators", layer_index),
                                 readout_mode=cfg.relational_readout_mode,
-                                attention_residual=cfg.attention_residual and predictive,
+                                attention_residual=cfg.attention_residual and predictive and not minimal_agent,
                                 output_init_scale=output_init_scale,
                                 receiver_noise=cfg.relational_receiver_noise,
                                 receiver_law=cfg.relational_receiver_law,
@@ -383,7 +385,10 @@ class VFEModel(nn.Module):
                                 predictive_covariance=(cfg.predictive_covariance if predictive
                                                        else "passthrough"),
                                 predictive_covariance_floor=cfg.predictive_covariance_floor,
-                                predictive_covariance_checkpoint=cfg.predictive_covariance_checkpoint)
+                                predictive_covariance_checkpoint=cfg.predictive_covariance_checkpoint,
+                                predictive_readout=cfg.predictive_readout,
+                                minimal_agent_inference=cfg.minimal_agent_inference,
+                                minimal_agent_channel_noise=cfg.minimal_agent_channel_noise)
             for layer_index in range(cfg.n_layers)
         ]
         self.relational_operators = layers[0]
@@ -455,6 +460,8 @@ class VFEModel(nn.Module):
                     activation=cfg.block_mlp_activation,
                     dropout=cfg.block_mlp_dropout,
                     covariance_contract=cfg.block_mlp_covariance,
+                    inference=cfg.block_mlp_inference,                    # read by prototype_agents only
+                    template_init_variance=cfg.block_mlp_template_init_variance,
                 )
                 for _ in range(cfg.n_layers)
             ]) if cfg.use_block_mlp else None
@@ -1672,6 +1679,11 @@ class VFEModel(nn.Module):
         if cap is None:
             raise ValueError("relational diagnostic snapshot is missing its forward capture")
         beta, score = cap["beta_pre"], cap["score_energy_pre"]
+        ops = self.relational_operators_by_layer[layer_index]
+        # The minimal agent's posterior has no cost clamp, so only a non-finite cost would count as capped
+        # (the kl_max = inf rule of the training cap counters).
+        minimal_agent = getattr(ops, "predictive_readout", "kernel") == "minimal_agent"
+        cap_level = math.inf if minimal_agent else self.cfg.kl_max
         entropy = -torch.special.xlogy(beta, beta).sum(-1)
         scorable = (beta > 0).sum(-1) >= 2
         d = {key: float("nan") for key in (
@@ -1685,7 +1697,7 @@ class VFEModel(nn.Module):
             attn_entropy_min=(float(entropy[scorable].min()) if scorable.any() else float("nan")),
             # Capped fraction over the routable support (beta > 0), not over masked pairs.
             relational_score_klmax_frac=float(
-                ((score >= self.cfg.kl_max) & (beta > 0)).sum() / (beta > 0).sum().clamp(min=1)),
+                ((score >= cap_level) & (beta > 0)).sum() / (beta > 0).sum().clamp(min=1)),
         )
         from vfe3 import metrics
         d["covariance_available"] = 1.0
@@ -1716,8 +1728,7 @@ class VFEModel(nn.Module):
                 distance_after / distance_before if distance_before > 0 else float("nan"))
             d["relational_receiver_noise"] = float(self.cfg.relational_receiver_noise)
             d["relational_attention_capture"] = "episode_initial"
-        ops = self.relational_operators_by_layer[layer_index]
-        comparison_runs = ops.comparison_runs()                            # per run (S_Q, S_K)
+        comparison_runs = ops.comparison_runs()                            # per run (S_Q, S_K); S_K = T if tied
         minima = []
         for role_index, role in enumerate(("q", "k")):
             minimum = min(float(torch.linalg.svdvals(pair[role_index].float()).min()) for pair in comparison_runs)
@@ -1730,6 +1741,16 @@ class VFEModel(nn.Module):
         d["relational_content_rank_per_head"] = mean_rank
         d["relational_parameter_count"] = float(sum(
             p.numel() for layer in self.relational_operators_by_layer for p in layer.parameters()))
+        if minimal_agent:
+            # No content factor O: the receiving map C_i S_h^T (...)^{-1} is state dependent, so the content-link
+            # columns are NaN and the minimal-agent statistics of the capture take their place.
+            d["relational_content_max_singular_value"] = float("nan")
+            d["relational_content_effective_rank"] = float("nan")
+            d["relational_content_T_min_singular_value"] = float(torch.linalg.svdvals(
+                ops.T.detach().float().reshape(-1, ops.input_dim)).min())
+            d.update({key: float("nan") for key in metrics.LINK_SPECTRUM_KEYS})
+            d.update(self._minimal_agent_diagnostics(cap))
+            return self._projected_covariance_and_frame_diagnostics(d, cap, snapshot, layer_index)
         T_runs, O_runs = ops.content_factor_runs()
         # sigma_max(M_h) is basis-dependent (changes under (T, O) -> (T a, a^{-1} O)); rho = inf of sigma_max over similarity.
         M_runs = [O.float() @ T.float() for T, O in zip(T_runs, O_runs)]   # per run (n_r, K, K) M_h
@@ -1756,6 +1777,32 @@ class VFEModel(nn.Module):
             # edge-dependent, r I + sum_h beta_ii^h G_ii Pi_h, so its spectral radius is replaced by the
             # edge-aware one; the edge part ||A_i Phi_ij B_j^T||_F and the factor norms come from the capture.
             d.update(self._edge_link_diagnostics(ops, cap, beta))
+        return self._projected_covariance_and_frame_diagnostics(d, cap, snapshot, layer_index)
+
+    @staticmethod
+    def _minimal_agent_diagnostics(cap: dict) -> dict:
+        r"""Per-layer minimal-agent statistics from the capture (:data:`vfe3.model.minimal_agent.MINIMAL_AGENT_DIAGNOSTIC_KEYS`).
+
+        The capture holds per-head ``(H,)`` values (receiver means); the row reports the head mean of the gain
+        fraction and of the channel noise :math:`n_h`, and the head maximum of the head coupling (0 means ADF is
+        exact at the input moments).
+        """
+        gain, noise, coupling = (cap[key] for key in (
+            "relational_minimal_agent_gain_fraction", "relational_minimal_agent_channel_noise",
+            "relational_minimal_agent_head_coupling"))
+        return {"relational_minimal_agent_gain_fraction": float(gain.mean()),
+                "relational_minimal_agent_channel_noise": float(noise.mean()),
+                "relational_minimal_agent_head_coupling": float(coupling.max())}
+
+    def _projected_covariance_and_frame_diagnostics(
+        self,
+        d:           dict,
+        cap:         dict,
+        snapshot:    DiagnosticSnapshot,
+        layer_index: int,
+    ) -> dict:
+        r"""The projected-covariance spectrum, the repair count and the frame magnitudes, shared by both readouts."""
+        from vfe3 import metrics
         query_cov, key_cov = cap["projected_covariance_pre"], cap["projected_key_covariance_pre"]
         if torch.is_tensor(query_cov):                                       # equal heads: one tensor
             query_cov, key_cov = [query_cov], [key_cov]

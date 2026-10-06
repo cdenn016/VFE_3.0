@@ -1,11 +1,23 @@
+import math
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Callable, Mapping, NamedTuple, Optional, Sequence
+from typing import Callable, Dict, Mapping, NamedTuple, Optional, Sequence
 
 import torch
 from torch import nn
 
 from vfe3.contracts import BlockMLPBuildMetadata, CanonicalFrameContext
+from vfe3.model.prototype_agents import (
+    PROTOTYPE_COVARIANCE_CONTRACTS,
+    PROTOTYPE_INFERENCE_MODES,
+    PROTOTYPE_TILE_BYTES,
+    ExactPrototypePosterior,
+    MeanFieldPrototypePosterior,
+    covariance_diagonal,
+    covariance_layout,
+    prototype_exact_posterior,
+    prototype_mean_field_posterior,
+)
 from vfe3.numerics import validated_cholesky_solve
 
 
@@ -609,6 +621,168 @@ class GaussianTemplateBlockMLP(nn.Module):
         return BlockMLPMomentResult(self.mean_update(mu, sigma), sigma, None)
 
 
+class PrototypeAgentBlockMLP(nn.Module):
+    r"""Residual block as the minimal agent model with :math:`M = eK` static prototype agents (``prototype_agents``).
+
+    Template :math:`a` carries the belief :math:`p_a = \mathcal N(\nu_a, \Lambda_a)`,
+    :math:`\Lambda_a = \operatorname{diag}\lambda_a`, :math:`\lambda_a = e^{\log\lambda_a}`, and the prior weight
+    :math:`\pi_a = \operatorname{softmax}(\log\pi)_a`; the token's working belief :math:`\mathcal N(\xi_i, C_i)` is
+    the receiver. Query and sending maps are the identity (:math:`S = T = I`, full rank) and the channel noise
+    is absorbed into :math:`\Lambda_a`, so the record covariance is :math:`W_{ia} = C_i + \Lambda_a`
+    (``minimal_agent_model.tex``, Definition ma:def:model, Proposition ma:prop:minimal (a), (d)). ``inference``:
+
+    * ``"exact"``: :math:`w_{ia} \propto \pi_a\mathcal N(\nu_a;\xi_i, C_i + \Lambda_a)`,
+      :math:`\xi_i^+ = \xi_i + C_iu_i`, :math:`C_i^+ = C_i - C_i(\bar\Lambda_i - R_i)C_i`, the moments of the exact
+      mixture posterior (:func:`vfe3.model.prototype_agents.prototype_exact_posterior`).
+    * ``"mean_field"``: the first structured-mean-field step of the same record model started at the token's
+      prior (Proposition ma:prop:mean_field). Its label step
+      :math:`r_{ia} \propto \pi_a\exp(-D_{\mathrm{KL}}(\mathcal N(\xi_i, C_i)\,\|\,p_a))` is exactly
+      :meth:`GaussianTemplateBlockMLP.responsibilities`; its receiver step is the power posterior
+      :math:`P_i = (C_i^{-1} + \operatorname{diag}D_i)^{-1}`, :math:`D_i = \sum_a r_{ia}/\lambda_a`,
+      :math:`\xi_i^+ = P_i(C_i^{-1}\xi_i + \sum_a r_{ia}\nu_a/\lambda_a)`, :math:`C_i^+ = P_i`, which omits the
+      between-template spread (:func:`vfe3.model.prototype_agents.prototype_mean_field_posterior`).
+
+    The update is a precision-weighted combination of the token's own mean and the template means: the
+    values are tied to the template means (there is no free value matrix) and the residual is derived, the
+    coefficient of :math:`\xi_i` being :math:`I - C_i\bar\Lambda_i` (exact) or :math:`P_iC_i^{-1}` (mean field),
+    not the identity. It is a precision-weighted modern-Hopfield-type retrieval with tied keys and values: for
+    shared isotropic :math:`C_i = cI` and :math:`\Lambda_a = \lambda I` the exact weights are
+    :math:`\operatorname{softmax}_a(\beta\nu_a^\top\xi_i - \beta|\nu_a|^2/2 + \log\pi_a)`, :math:`\beta = 1/(c + \lambda)`,
+    and :math:`\xi_i^+ = (\lambda\xi_i + c\sum_aw_{ia}\nu_a)/(c + \lambda)`, which at :math:`\lambda \to 0` is the
+    retrieval :math:`\xi^{\mathrm{new}} = \sum_a\operatorname{softmax}_a(\beta\nu_a^\top\xi + b_a)\nu_a` of Ramsauer
+    et al. (2020, arXiv:2008.02217) with stored patterns :math:`\nu_a` as both keys and values. Dropout (the
+    block's ``dropout``) applies to the mean increment :math:`\xi^+ - \xi` only.
+
+    Coordinates and layouts: ``sigma`` may be diagonal ``(..., K)`` or dense ``(..., K, K)`` (local coordinates,
+    like the coordinate MLP), or compact blocks ``(..., G, d, d)`` (the reference covariance of diagonal beliefs
+    on a block frame, passed by ``block_coordinates='reference'``); the covariance is returned in the same
+    layout. ``"passthrough"`` returns the input covariance object; ``"posterior"`` returns :math:`C^+`, whose
+    diagonal (diagonal blocks) is the moment-matched member of a diagonal (block) family. The exact path on a
+    block or dense layout factors one :math:`b \times b` matrix per (token, template, block): an extreme
+    opt-in path (cost in ``docs/implementation/prototype-agents-results-2026-10-06.md``); ``tile_bytes`` bounds
+    its pair tensors.
+
+    Initialization mirrors :class:`GaussianTemplateBlockMLP`'s template means,
+    :math:`\nu \sim U(-K^{-1/2}, K^{-1/2})` from the global stream, with :math:`\log\lambda = \log\lambda_0`
+    (``template_init_variance``) and :math:`\log\pi = 0`. At :math:`\lambda_0 = 10` and token variances near 1
+    the initial pull toward the templates is :math:`c/(c + \lambda_0) \approx 9` percent per layer. The
+    template means :math:`\nu` train in the block-MLP optimizer group under the global ``weight_decay``;
+    :math:`\log\lambda` and :math:`\log\pi` train at the same rate with ``weight_decay=0``
+    (:func:`vfe3.train.build_optimizer`), because decoupled decay would pull :math:`\lambda` toward 1 and
+    :math:`\pi` toward uniform.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        expansion: int,
+        dropout: float,
+        *,
+        covariance_contract: str = "passthrough",
+        inference: str = "mean_field",
+        template_init_variance: float = 10.0,
+    ) -> None:
+        super().__init__()
+        if covariance_contract not in PROTOTYPE_COVARIANCE_CONTRACTS:
+            raise ValueError(
+                f"prototype_agents block MLP supports covariance_contract in {PROTOTYPE_COVARIANCE_CONTRACTS}, "
+                f"got {covariance_contract!r}")
+        if inference not in PROTOTYPE_INFERENCE_MODES:
+            raise ValueError(
+                f"prototype_agents inference must be one of {PROTOTYPE_INFERENCE_MODES}, got {inference!r}")
+        if (isinstance(template_init_variance, bool) or not isinstance(template_init_variance, (int, float))
+                or not math.isfinite(float(template_init_variance)) or float(template_init_variance) <= 0.0):
+            raise ValueError(
+                f"template_init_variance must be a finite real value > 0, got {template_init_variance!r}")
+        n_templates = embed_dim * expansion
+        self.covariance_contract = covariance_contract
+        self.inference = inference
+        self.tile_bytes = PROTOTYPE_TILE_BYTES                       # exact-path pair-tile budget (not state)
+        bound_in = embed_dim ** -0.5
+        self.nu = nn.Parameter(torch.empty(n_templates, embed_dim).uniform_(-bound_in, bound_in))   # (M, K)
+        self.log_lambda = nn.Parameter(
+            torch.full((n_templates, embed_dim), math.log(float(template_init_variance))))       # (M, K)
+        self.log_pi = nn.Parameter(torch.zeros(n_templates))                                       # (M,)
+        self.dropout = nn.Dropout(dropout)
+
+    def posterior(
+        self,
+        mu:    torch.Tensor,                          # (..., K) working means
+        sigma: torch.Tensor,                          # (..., K), (..., K, K) or (..., G, d, d)
+        *,
+        need_covariance: Optional[bool] = None,       # None: as the covariance contract requires
+        need_precision:  bool = False,
+    ) -> 'ExactPrototypePosterior | MeanFieldPrototypePosterior':
+        r"""The template posterior of the selected ``inference`` at the working belief ``(mu, sigma)``."""
+        if need_covariance is None:
+            need_covariance = self.covariance_contract == "posterior"
+        if self.inference == "exact":
+            return prototype_exact_posterior(
+                mu, sigma, self.nu, self.log_lambda, self.log_pi, need_covariance=need_covariance,
+                need_precision=need_precision, tile_bytes=self.tile_bytes)
+        return prototype_mean_field_posterior(
+            mu, sigma, self.nu, self.log_lambda, self.log_pi, need_covariance=need_covariance)
+
+    def forward_moments(
+        self,
+        mu: torch.Tensor,
+        sigma: torch.Tensor,
+        *,
+        frame_context: Optional[CanonicalFrameContext] = None,
+        hidden_bias: Optional[torch.Tensor] = None,
+    ) -> BlockMLPMomentResult:
+        r""":math:`\mu \mapsto \mu + \mathrm{dropout}(\xi^+ - \mu)`; the covariance is passed through or replaced by :math:`C^+`."""
+        del frame_context
+        _reject_hidden_bias(
+            hidden_bias,
+            "the prototype_agents block conditions the belief on template agents and has no fc1 hidden layer")
+        posterior = self.posterior(mu, sigma)
+        mu_out = mu + self.dropout(posterior.delta_xi.to(mu.dtype))
+        if self.covariance_contract == "passthrough":
+            return BlockMLPMomentResult(mu_out, sigma, None)
+        return BlockMLPMomentResult(mu_out, posterior.C_plus.to(sigma.dtype), None)
+
+    def forward(self, mu: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        return self.forward_moments(mu, sigma).mu
+
+    @torch.no_grad()
+    def statistics(
+        self,
+        mu:    torch.Tensor,                          # (..., K) working means
+        sigma: torch.Tensor,                          # (..., K), (..., K, K) or (..., G, d, d)
+    ) -> Dict[str, float]:
+        r"""Detached token means of the template posterior at ``(mu, sigma)`` (not wired into the metrics CSV).
+
+        ``prototype_weight_entropy``: :math:`H(w_i) = -\sum_aw_{ia}\log w_{ia}` (nats; responsibilities under
+        mean field) and ``prototype_effective_templates`` its exponential. ``prototype_gain_fraction``: the share
+        of the working variance the block removes, :math:`\operatorname{tr}(C_i\bar\Lambda_i)/K` (exact, before the
+        spread is added back) or :math:`\operatorname{tr}(P_i\operatorname{diag}D_i)/K = 1 - \operatorname{tr}(P_iC_i^{-1})/K`
+        (mean field), both in :math:`[0, 1)`; about 0.09 at initialization (:math:`\lambda = 10`, unit
+        variances). ``prototype_template_variance``: the geometric mean of :math:`\lambda`.
+        ``prototype_prior_entropy``: :math:`H(\pi)`.
+        """
+        layout = covariance_layout(mu, sigma)
+        K = mu.shape[-1]
+        if self.inference == "exact":
+            posterior = self.posterior(mu, sigma, need_covariance=False, need_precision=True)
+            weights, Lambda_bar = posterior.weights, posterior.Lambda_bar
+            axes = {"diagonal": 1, "dense": 2, "blocks": 3}[layout]
+            gain = (sigma.to(Lambda_bar.dtype) * Lambda_bar).sum(dim=tuple(range(-axes, 0)))   # tr(C Lambda_bar)
+        else:
+            posterior = self.posterior(mu, sigma, need_covariance=True)
+            weights = posterior.responsibilities
+            gain = (covariance_diagonal(posterior.C_plus, layout) * posterior.D).sum(dim=-1)  # tr(P diag D)
+        entropy = -torch.special.xlogy(weights, weights).sum(dim=-1)
+        prior = torch.softmax(self.log_pi.double(), dim=-1)
+        return {
+            "prototype_weight_entropy": float(entropy.mean()),
+            "prototype_effective_templates": float(entropy.exp().mean()),
+            "prototype_gain_fraction": float((gain / K).mean()),
+            "prototype_template_variance": float(self.log_lambda.double().mean().exp()),
+            "prototype_prior_entropy": float(-torch.special.xlogy(prior, prior).sum()),
+        }
+
+
 BlockMLPFactory = Callable[..., nn.Module]
 BlockMLPReportLabel = Callable[[str], str]
 BlockMLPWidth = Callable[[int, Sequence[int]], int]
@@ -634,6 +808,9 @@ class BlockMLPRegistration:
     # extra_flops_per_layer for the diagonal covariance layout (..., K), for modes whose extra cost
     # depends on the layout; None means the layout does not change the cost.
     diagonal_extra_flops_per_layer: Optional[BlockMLPExtraFlops] = None
+    # Keyword options beyond the shared construction arguments that this mode's factory reads;
+    # build_block_mlp forwards only these, so every other factory is called exactly as before.
+    factory_options: frozenset[str] = frozenset()
 
     def parameter_count(
         self,
@@ -665,13 +842,18 @@ class BlockMLPRegistration:
             if self.matmul_flops_per_layer is not None
             else 4.0 * expansion * width * width
         )
+        layout = _validate_covariance_layout(covariance_layout)
         extra_flops = self.extra_flops_per_layer
-        if _validate_covariance_layout(covariance_layout) == "diagonal" \
-                and self.diagonal_extra_flops_per_layer is not None:
+        if layout == "diagonal" and self.diagonal_extra_flops_per_layer is not None:
             extra_flops = self.diagonal_extra_flops_per_layer
         per_layer +=extra_flops(embed_dim, irrep_dims)
         if covariance_contract == "delta_full":
             per_layer += 4.0 * embed_dim ** 3
+        elif covariance_contract == "posterior" and layout == "full":
+            # prototype_agents, the only mode admitting 'posterior': P = D^{-1/2} B^{-1} D^{1/2} C is a
+            # Cholesky solve with K right-hand sides (2 K^3) plus two diagonal scalings and the
+            # symmetrization (4 K^2). On the diagonal layout P is already formed for the mean update.
+            per_layer += 2.0 * embed_dim ** 3 + 4.0 * embed_dim ** 2
         return float(n_layers) * per_layer
 
 
@@ -696,11 +878,25 @@ def _gaussian_template_factory(**kwargs) -> nn.Module:
     return GaussianTemplateBlockMLP(**kwargs)
 
 
+def _prototype_agents_factory(**kwargs) -> nn.Module:
+    for unused in ("irrep_dims", "activation", "covariance_floor"):
+        kwargs.pop(unused)
+    return PrototypeAgentBlockMLP(**kwargs)
+
+
 def _coordinate_report_label(covariance: str) -> str:
     return (
         "coordinate_mean_only_nonintertwiner"
         if covariance == "passthrough"
         else "coordinate_delta_full_covariant_floor_nonintertwiner"
+    )
+
+
+def _prototype_agents_report_label(covariance: str) -> str:
+    return (
+        "prototype_agents_mean_only_nonintertwiner"
+        if covariance == "passthrough"
+        else "prototype_agents_posterior_covariance_nonintertwiner"
     )
 
 
@@ -753,6 +949,27 @@ BLOCK_MLP_REGISTRATIONS: Mapping[str, BlockMLPRegistration] = MappingProxyType({
         parameter_count_per_layer=lambda width, expansion: (
             3 * expansion * width * width + expansion * width),
         matmul_flops_per_layer=lambda width, expansion: 6.0 * expansion * width * width,
+    ),
+    # nu, log_lambda: (M, K) each; log_pi: (M,); M = expansion * K. The FLOP metadata is the mean-field
+    # path in local coordinates: four (K x M) matmuls (two for the label logits, D and eta), plus a dense
+    # K x K Cholesky and three K^2 products per token on the full layout, or about 7 K elementwise
+    # operations on the diagonal layout; flops_per_token adds 2 K^3 + 4 K^2 for the posterior covariance on
+    # the full layout. It does not cover the exact path or reference coordinates (block or dense working
+    # covariance on a diagonal family).
+    "prototype_agents": BlockMLPRegistration(
+        factory=_prototype_agents_factory,
+        requires_frame_context=False,
+        covariance_kinds=frozenset(PROTOTYPE_COVARIANCE_CONTRACTS),
+        gauge_class="coordinate_nonintertwiner",
+        intertwiner_compatible=False,
+        width=lambda embed_dim, _irrep_dims: embed_dim,
+        extra_flops_per_layer=lambda embed_dim, _irrep_dims: embed_dim ** 3 / 3.0 + 6.0 * embed_dim ** 2,
+        report_label=_prototype_agents_report_label,
+        parameter_count_per_layer=lambda width, expansion: (
+            2 * expansion * width * width + expansion * width),
+        matmul_flops_per_layer=lambda width, expansion: 8.0 * expansion * width * width,
+        diagonal_extra_flops_per_layer=lambda embed_dim, _irrep_dims: 7.0 * embed_dim,
+        factory_options=frozenset({"inference", "template_init_variance"}),
     ),
 })
 
@@ -833,10 +1050,14 @@ def build_block_mlp(
     dropout: float,
     covariance_contract: str,
     covariance_floor: float,
+    inference: str = "mean_field",
+    template_init_variance: float = 10.0,
 ) -> nn.Module:
+    r"""Build one block MLP; ``inference`` and ``template_init_variance`` reach only the modes that read them."""
     registration = get_block_mlp_registration(mode)
     if covariance_contract not in registration.covariance_kinds:
         raise ValueError(f"unknown BlockMLP covariance contract {covariance_contract!r}")
+    options = {"inference": inference, "template_init_variance": template_init_variance}
     return registration.factory(
         embed_dim=embed_dim,
         irrep_dims=irrep_dims,
@@ -845,4 +1066,5 @@ def build_block_mlp(
         dropout=dropout,
         covariance_contract=covariance_contract,
         covariance_floor=covariance_floor,
+        **{name: value for name, value in options.items() if name in registration.factory_options},
     )

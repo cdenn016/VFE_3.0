@@ -158,6 +158,10 @@ def not_applicable_reason(model: torch.nn.Module) -> Optional[str]:
     operators = [op for op in (getattr(model, "relational_operators_by_layer", None) or ()) if op is not None]
     if not operators:
         return "the model has no relational operators, so no projected Gaussian routing is run"
+    if any(getattr(op, "predictive_readout", "kernel") == "minimal_agent" for op in operators):
+        return ("predictive_readout='minimal_agent': the router is the exact source posterior "
+                "softmax_j(log pi_ij + log N(T xi_j; S xi_i, W_ij)) at temperature 1 with no clamp (or its KL label "
+                "step), not the clamped Gaussian KL of Eq. (projected_full_kl)")
     routes = sorted({str(getattr(op, "routing", "gaussian_kl")) for op in operators})
     if routes != ["gaussian_kl"]:
         return (f"relational_routing={routes}: the noisy-query cost -log N(a_i; b_j, V_Q + V_K) is not the "

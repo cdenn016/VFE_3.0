@@ -93,6 +93,11 @@ def set_projected_gram_condition_tol(tol: float) -> float:
     return previous
 
 
+def projected_gram_condition_tol() -> float:
+    r"""Return the Gram-route certificate tolerance (config ``projected_gram_condition_tol``)."""
+    return _GRAM_CONDITION_TOL
+
+
 def set_projected_recovery_precision(precision: str) -> str:
     r"""Set the projected source-recovery working precision ("fp64" | "fp32"); returns the previous value."""
     if precision not in _RECOVERY_PRECISIONS:

@@ -57,8 +57,11 @@ LINK_COLUMNS: Tuple[str, ...] = (
 _LEAF_BY_MAP = {"S_Q": "raw_score_q", "S_K": "raw_score_k", "T": "T", "O": "O"}
 # content_link_edges factor maps (vfe3/model/edge_links.py), read under their own names.
 EDGE_MAP_NAMES: Tuple[str, ...] = ("edge_receiver_map", "edge_site_basis", "edge_sender_map")
+# predictive_readout='minimal_agent' (vfe3/model/minimal_agent.py): the channel log-noise, read under its own name.
+MINIMAL_AGENT_NAMES: Tuple[str, ...] = ("channel_log_noise",)
 _LAYER_KEY = re.compile(r"^relational_operators(?:_extra\.(\d+))?\."
-                        r"(raw_score_q|raw_score_k|T|O|edge_receiver_map|edge_site_basis|edge_sender_map)$")
+                        r"(raw_score_q|raw_score_k|T|O|edge_receiver_map|edge_site_basis|edge_sender_map"
+                        r"|channel_log_noise)$")
 _SNAPSHOT_FILE = re.compile(r"^step_(\d+)\.pt$")
 
 
@@ -98,11 +101,13 @@ def relational_maps(
     ``T`` and ``O``. With a ``cfg`` whose ``content_link_chart`` is not ``"affine"``, ``"O"`` is the
     effective receiving map :math:`O'` of that chart (:func:`vfe3.model.relational_operators.chart_receive_map`)
     and ``"O_stored"`` the stored factor. The ``content_link_edges`` factor maps, when stored, appear
-    under their parameter names (:data:`EDGE_MAP_NAMES`).
+    under their parameter names (:data:`EDGE_MAP_NAMES`). A minimal-agent layer (``channel_log_noise`` stored, no
+    ``raw_score_k`` and no ``O``) ties the key to the content, so ``"S_K"`` is its ``T``; it has no ``"O"`` (the
+    receiving map is derived from the receiver covariance) and carries ``"channel_log_noise"``.
     """
     layers: Dict[int, Dict[str, torch.Tensor]] = {}
     inverse = {leaf: name for name, leaf in _LEAF_BY_MAP.items()}
-    inverse.update({name: name for name in EDGE_MAP_NAMES})
+    inverse.update({name: name for name in EDGE_MAP_NAMES + MINIMAL_AGENT_NAMES})
     for key, value in state.items():
         match = _LAYER_KEY.match(key)
         if match is None:
@@ -112,6 +117,8 @@ def relational_maps(
     if not layers:
         raise ValueError("state holds no relational_operators maps")
     for layer, maps in layers.items():
+        if "channel_log_noise" in maps and "S_K" not in maps and "T" in maps:
+            maps["S_K"] = maps["T"]                                     # minimal agent: tied key S_K = T
         if "S_Q" not in maps or "S_K" not in maps:
             raise ValueError(f"layer {layer} lacks a comparison map")
     chart = getattr(cfg, "content_link_chart", "affine")
@@ -335,6 +342,9 @@ def map_invariants(
                     row[f"{name}_own_block_share"] = float("nan")
                     row[f"{name}_max_block_share"] = float("nan")
             row.update(link_rows[h] if link_rows is not None else {c: float("nan") for c in LINK_COLUMNS})
+            if "channel_log_noise" in maps:                           # minimal agent: S_K columns describe T
+                row["key_tied_to_content"] = 1.0
+                row["channel_noise"] = float(maps["channel_log_noise"][h].exp())
             if "edge_sender_map" in maps:
                 row["link_shared_generator_only"] = 1.0
             row.update({f"{name}_fro": float(maps[name].norm()) for name in EDGE_MAP_NAMES if name in maps})

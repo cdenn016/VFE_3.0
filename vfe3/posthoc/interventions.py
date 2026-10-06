@@ -446,7 +446,8 @@ def _norm_plan(model: torch.nn.Module, norm: Any, norm_type: str) -> str:
 
 def _mlp_plan(mlp: torch.nn.Module) -> str:
     r"""``"conjugated"``, ``"conjugated_template"`` or ``"covariant"`` (already :math:`U_i G(U_i^{-1}\cdot)`)."""
-    from vfe3.model.block_mlp import BlockMLP, CanonicalFrameBlockMLP, GaussianTemplateBlockMLP
+    from vfe3.model.block_mlp import (BlockMLP, CanonicalFrameBlockMLP, GaussianTemplateBlockMLP,
+                                      PrototypeAgentBlockMLP)
 
     if isinstance(mlp, CanonicalFrameBlockMLP):
         return "covariant"
@@ -454,6 +455,11 @@ def _mlp_plan(mlp: torch.nn.Module) -> str:
         return "conjugated"
     if type(mlp) is GaussianTemplateBlockMLP:
         return "conjugated_template"
+    if isinstance(mlp, PrototypeAgentBlockMLP):
+        raise NotApplicable(
+            "block_mlp_mode='prototype_agents' reads the whole working covariance (and under 'posterior' "
+            "rewrites it), so its reference conjugate U_i F(U_i^{-1} mu, C_i) is not a mean-only patch; it "
+            "is trained by block_coordinates='reference' and is not patched here")
     raise NotApplicable(
         f"block MLP {type(mlp).__name__} (covariance_contract={getattr(mlp, 'covariance_contract', None)!r}) "
         "has no mean-only reference conjugate here")

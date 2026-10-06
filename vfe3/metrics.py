@@ -652,9 +652,9 @@ def covariance_frozen_at_encode(cfg: object) -> bool:
 
     Predictive attention preserves sigma unless ``predictive_covariance='moment_matched'``
     assigns its context-dependent kernel covariance. Projected gradient updates sigma unless
-    ``skip_belief_sigma_update=True``. Later mean-dependent delta-method seams can also rewrite
-    sigma: a block MLP with ``block_mlp_covariance='delta_full'`` or CG coupling with
-    ``cg_covariance_mode='delta_full'``. Normalization acts on the mean alone. Without those updates, tr Sigma_q(x_i) depends only
+    ``skip_belief_sigma_update=True``. Later seams can also rewrite sigma: a block MLP with any
+    non-passthrough ``block_mlp_covariance`` (the delta-method ``'delta_full'`` or the prototype-agent
+    ``'posterior'``) or CG coupling with ``cg_covariance_mode='delta_full'``. Normalization acts on the mean alone. Without those updates, tr Sigma_q(x_i) depends only
     on the input token, so B1/EXP-3 measures input-token variance against next-token CE.
     """
     attention_mode = getattr(cfg, "attention_mode", "projected_predictive")
@@ -663,7 +663,7 @@ def covariance_frozen_at_encode(cfg: object) -> bool:
     else:
         e_step_frozen = getattr(cfg, "predictive_covariance", "passthrough") != "moment_matched"
     mlp_rewrites_sigma = (bool(getattr(cfg, "use_block_mlp", False))
-                          and getattr(cfg, "block_mlp_covariance", "passthrough") == "delta_full")
+                          and getattr(cfg, "block_mlp_covariance", "passthrough") != "passthrough")
     cg_rewrites_sigma = (bool(getattr(cfg, "use_cg_coupling", False))
                          and getattr(cfg, "cg_covariance_mode", "passthrough") == "delta_full")
     return e_step_frozen and not (mlp_rewrites_sigma or cg_rewrites_sigma)

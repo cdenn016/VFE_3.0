@@ -65,6 +65,13 @@ def _refuse_edge_links() -> None:
         "G_ij = g_i e^L E_ij are context dependent, so the holonomy is not R_ijk G of the shared maps")
 
 
+def _refuse_minimal_agent() -> None:
+    raise NotImplementedError(
+        "triangle holonomy of predictive_readout='minimal_agent' models is not implemented: the receiving map "
+        "C_i S_h^T (S_h C_i S_h^T + T_h C_j T_h^T + n_h I)^{-1} depends on the receiver and source covariances, "
+        "so no shared content maps (T, O) define the link field")
+
+
 def layer_content_maps(state: Mapping[str, torch.Tensor], cfg: Any) -> Dict[int, tuple]:
     r"""``{layer: (T_hat (H, d, K), O_hat (H, K, d))}`` float64, for layers with content maps.
 
@@ -79,6 +86,9 @@ def layer_content_maps(state: Mapping[str, torch.Tensor], cfg: Any) -> Dict[int,
     layers = relational_maps(state, cfg)
     if any(name in maps for maps in layers.values() for name in EDGE_MAP_NAMES):
         _refuse_edge_links()
+    if (getattr(cfg, "predictive_readout", "kernel") == "minimal_agent"
+            or any("channel_log_noise" in maps for maps in layers.values())):
+        _refuse_minimal_agent()
     for layer, maps in layers.items():
         if "T" in maps and "O" in maps:
             _, d, B = _frame_geometry(maps, cfg)
@@ -185,6 +195,8 @@ def checkpoint_holonomy(
     loaded = ev.load_model(run_dir, checkpoint, device=ev.resolve_device(device))
     if getattr(loaded.cfg, "content_link_edges", "off") != "off":
         _refuse_edge_links()
+    if getattr(loaded.cfg, "predictive_readout", "kernel") == "minimal_agent":
+        _refuse_minimal_agent()                                    # before the validation pass, not after it
     info = st.load_run_info(run_dir, checkpoint)
     tokens, record = st.resolve_stream(info, "validation")
     dataset = st.eval_windows(tokens, info.seq_len, info.eval_stride)
