@@ -42,10 +42,12 @@ for the simplified configuration and compatibility boundaries.
 
 ## Architecture
 
-![Tokens as communicating agents: (a) one round of communication between a sender agent and a receiver agent through the key, query, sending, and receiving maps; (b) the language model built from L such rounds](assets/agent_round.svg)
+<p align="center">
+  <img src="assets/agent_round.png" width="860" alt="Tokens as communicating agents: (a) one round of communication between a sender agent and a receiver agent through the key, query, sending, and receiving maps; (b) the language model built from L such rounds">
+</p>
 
 The figure is drawn in TikZ ([`assets/agent_round.tex`](assets/agent_round.tex), build
-commands in its header) and committed as an SVG with its glyphs converted to paths.
+commands in its header).
 
 Every layer is one round of communication with its own query, key, sending, and receiving
 maps. The current launcher also enables a block MLP and block LayerNorm, which act on each
@@ -71,6 +73,19 @@ with structure group $G=\mathrm{GL}(K,\mathbb R)$ and its associated vector and 
 bundles, and a frame section and a belief section are distinct objects. The finite token
 model uses token-indexed fibers and a reference trivialization; it does not require a smooth
 contextual base or discretize a continuum connection.
+
+<p align="center">
+  <img src="assets/bundle_geometry.png" width="560" alt="Statistical sections of two agents over a contextual base, their frames at the shared context, and a group link between them">
+</p>
+
+*Statistical sections, frames, and a group link (Figure 1 of the v2 manuscript; TikZ source
+[`assets/bundle_geometry.tex`](assets/bundle_geometry.tex)).* Over a general contextual base
+$\mathcal C$, the curves are the beliefs $q_i$, $q_j$ of two agents, sections of the
+statistical bundle over their overlapping domains. The token model keeps only the fiber over
+the single context $`c_*`$ (solid line), where the glyphs carry the frames $U_i$, $U_j$. The
+green arrow applies the group link $\Theta_{ij}=U_ie^{L_{ij}}U_j^{-1}$, the dotted contour is
+the pushforward $`(\Theta_{ij})_*q_j`$, which the receiver's belief need not equal, and the gray
+arrow is the contribution $\beta_{ij}\Theta_{ij}\mu_j$ to the receiver's mean.
 
 Write an agent's belief and its moments in reference coordinates as
 
