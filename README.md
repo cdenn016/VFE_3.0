@@ -1,9 +1,9 @@
 # VFE_3.0
 
 VFE_3.0 is an experimental language model built as a population of communicating
-agents. Every token position is an agent. Each agent holds a Gaussian belief, a mean and a
-covariance, expressed in its own coordinate frame, and one attention layer is one round
-of communication among the agents of a context: every agent decides whom to listen to,
+agents. Every token is modeled as an agent. Each agent holds a Gaussian belief (a mean and a
+covariance) expressed in its own internal coordinate frame. One attention layer is one round
+of communication among the agents: every agent decides whom to listen to,
 every sender transmits a low-rank part of what it believes, and every receiver brings what
 it hears back into its own frame and revises its belief. The decision of whom to hear and
 the content that is heard pass through separate learned interfaces, one set per head:
@@ -33,12 +33,7 @@ specific to this model is the cost itself, a Gaussian KL divergence between proj
 moments. A single latent variational free energy for the complete language model
 is not established; the predictor trains on supervised next-token cross-entropy.
 
-This is an independent local copy of `V3_Transformer`. Its source, tests, and
-launcher edits were copied before cleanup; training output, caches, environments,
-and the source repository's Git metadata were not copied. The Python package
-remains `vfe3` to preserve imports and checkpoint parameter names. See
-[cleanup and migration notes](docs/implementation/cleanup-migration-2026-09-22.md)
-for the simplified configuration and compatibility boundaries.
+This is a refactored and extended version of an earlier iteration `V3_Transformer' (see repo). 
 
 ## Architecture
 
@@ -49,10 +44,10 @@ for the simplified configuration and compatibility boundaries.
 The figure is drawn in TikZ ([`assets/agent_round.tex`](assets/agent_round.tex), build
 commands in its header).
 
-Every layer is one round of communication with its own query, key, sending, and receiving
-maps. The current launcher also enables a block MLP and block LayerNorm, which act on each
-agent separately between rounds. Communication is causal: an agent hears only agents at
-earlier or equal positions, and next-token targets enter the training loss.
+The current launcher also enables a block MLP and block LayerNorm, which act on each
+agent separately between rounds (although these features are not theoretically principled 
+under the current gauge theoretic construction). Communication is causal: an agent hears 
+only agents at earlier or equal positions, and next-token targets enter the training loss.
 
 | Symbol | Meaning |
 |---|---|
