@@ -74,20 +74,34 @@ BASE_PRESETS: Dict[str, str] = {
     "diag_K128": "D:/DATA_KEEP/39.77_wikitext-103_K128_n=128",
     "diag_K64":  "D:/DATA_KEEP/52.91_wikitext-103_K64_n=128",
     "full_K64":  "vfe3_runs/Full_Gaussian_mom-match_Template_routing/55.07_wikitext-103_K64_moment_matched_noAtnnRes",
+    # 34.48 test PPL: K=128, 4 heads of 32, 4 layers, exponential content chart, 150,000 steps (614.4M
+    # tokens), context 128, stride 32, batch 32, model seed 6, data seed 3, bf16, fp32 matmul "highest".
+    "k128_exp":  "vfe3_runs/34.48_wikitext-103_K128_block_glk_linear_mlp_s6",
 }
-BASE = "diag_K128"                  # a preset name or a run directory
+BASE = "k128_exp"                   # a preset name or a run directory
 DATASET = "wikitext-103"
 OUT_ROOT = "vfe3_runs/baselines"
 SEEDS: Sequence[int] = (6,)
-DATA_SEED: Optional[int] = None     # None -> data-order seed = model seed (pairs with the VFE arms)
+DATA_SEED: Optional[int] = 3        # the data-order seed of the base run (3 for k128_exp); None -> model seed
 MAX_TOKENS: Optional[int] = None    # cap the training stream (smoke runs only)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 PER_TYPE_TABLE = "none"             # "none" | "block_read" (Table M2, per-type table of the frame table's size)
-OVERRIDES: Dict[str, Any] = {}      # any BaselineConfig field, e.g. {"lr": 6e-4, "max_steps": 60000}
+# Everything in MATCHED_FIELDS is copied from the base run (K, H, L, context, batch, stride, 150,000 steps,
+# warmup, LR floor, clip, bf16, "highest" matmul precision, cadence, unigram decode prior). The base's
+# attention prior is the uniform causal one, with position carried by learned frames, so a copied prior
+# would leave the baseline with no positional signal at all (NoPE); ALiBi is the standard
+# zero-parameter choice and what the earlier 90.15 baseline used. For the strict prior copy use
+# {"beta_attention_prior": "causal"}. Weight decay stays at the baseline default 0.1 on every matrix and
+# table (the base run decays only the frames, 0.1, and the MLPs, 0.01) and is not swept.
+OVERRIDES: Dict[str, Any] = {"beta_attention_prior": "causal_alibi"}   # any BaselineConfig field
 LABEL: Optional[str] = None         # stable run-folder label; None -> <dataset>_K<K>_baseline[_block_read]_s<seed>
 
-LR_SWEEP: Sequence[float] = ()      # e.g. (3e-4, 6e-4, 1e-3, 2e-3); validation-only selection
-LR_SWEEP_STEPS = 2000
+# The baseline's peak lr (6e-4) was set for a 30,000-step run; the budget here is five times longer, so
+# select it on validation. Each launch sweeps its own arm (with PER_TYPE_TABLE="block_read" the read-map
+# lr follows the swept lr) and trains the winner. A short schedule favors larger lr, so a winner at the
+# top of the grid (3e-3) means the grid should be extended, not trusted. Set () to skip the sweep.
+LR_SWEEP: Sequence[float] = (3e-4, 6e-4, 1e-3, 2e-3, 3e-3)    # validation-only selection
+LR_SWEEP_STEPS = 6000
 
 CALIBRATE_WIDTHS: Sequence[int] = ()   # e.g. (128, 256, 384, 512, 768); training-only throughput runs
 CALIBRATION_STEPS = 2000
