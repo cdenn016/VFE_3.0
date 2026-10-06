@@ -1,9 +1,29 @@
 # VFE_3.0
 
-VFE_3.0 is an experimental language model built from Gaussian attention and
-learned matrix-valued communication links. Each token carries a mean, covariance, and
-local frame. Query and key projections compare Gaussian observables; value and output
-maps determine what content is sent and how it enters the receiver's state.
+VFE_3.0 is an experimental language model built as a population of communicating
+agents. Every token position is an agent. Each agent holds a Gaussian belief, a mean and a
+covariance, expressed in its own coordinate frame, and one attention layer is one round
+of communication among the agents of a context: every agent decides whom to listen to,
+every sender transmits a low-rank part of what it believes, and every receiver brings what
+it hears back into its own frame and revises its belief. The decision of whom to hear and
+the content that is heard pass through separate learned interfaces, one set per head:
+
+| Interface | Belongs to | Role in the exchange |
+|---|---|---|
+| Query map $S_{Q,h}$ | receiver | what the receiver asks about; it is compared, never transmitted |
+| Key map $S_{K,h}$ | sender | how the sender can be found |
+| Sending map $T_h$ | sender | what the sender says: the transmitted content |
+| Receiving map $O_h$ (or $\widetilde O_h$ in a content-link chart) | receiver | how the receiver absorbs what it heard into its full state |
+| Frame $U_i$ | each agent | the agent's private coordinate system |
+
+The routing weights are each receiver's distribution over whom to hear, computed from a
+Gaussian divergence between the receiver's query law and each sender's key law under a
+causal prior over sources; under a declared compatibility record they are the exact
+posterior of the source label (v2 manuscript, Theorem `thm:probabilistic_status`). Every
+interface acts on reference coordinates, so an agent's private change of frame changes
+nothing that any other agent computes, and the messages transform covariantly.
+Coordination among the agents is therefore expressed as inference: whom to trust, how much
+to absorb, and how uncertain each agent remains after the exchange.
 
 The primary configuration in `train_vfe3.py` uses **full-input/full-output projected
 attention with predictive-content readout**. Its attention step directly aggregates
@@ -24,43 +44,46 @@ for the simplified configuration and compatibility boundaries.
 
 ```mermaid
 flowchart TD
-    Tokens["Token IDs"] --> Bank["PriorBank: means, covariances, frames"]
-    Bank --> State["Current Gaussian states and realized frames"]
-    State --> Compare["S_Q / S_K: projected Gaussian comparison"]
-    Compare --> Router["Gaussian KL + causal source prior: routing weights"]
-    State --> Send["T: extract content in reference coordinates"]
-    Router --> Pool["Weighted source aggregation"]
+    Tokens["Token IDs: one agent per position"] --> Bank["PriorBank: each agent's initial belief and frame"]
+    Bank --> State["Agents' Gaussian beliefs in their own frames"]
+    State --> Compare["Receiver query S_Q against sender key S_K"]
+    Compare --> Router["Whom to listen to: Gaussian KL + causal source prior"]
+    State --> Send["Sender content T in reference coordinates"]
+    Router --> Pool["Routed messages"]
     Send --> Pool
-    Pool --> Receive["Receiving map in the selected content-link chart; apply receiver frame"]
-    Receive --> Residual["Attention residual, moment-matched covariance, block LayerNorm and MLP"]
-    Residual --> Next["Repeat through the layer stack"]
+    Pool --> Receive["Receiving map (content-link chart) into the receiver's frame"]
+    Receive --> Residual["Belief revision: residual, moment-matched covariance, block LayerNorm and MLP"]
+    Residual --> Next["Next round of communication (next layer)"]
     Next --> Decode["Linear decoder with unigram prior (or a prior-bank KL readout)"]
     Decode --> Loss["Next-token cross-entropy"]
 ```
 
-Every layer has its own query, key, value, and output maps. The current launcher
-also enables a block MLP and block LayerNorm. Forward computations use the available
-prefix; next-token targets enter the training loss.
+Every layer is one round of communication with its own query, key, sending, and receiving
+maps. The current launcher also enables a block MLP and block LayerNorm, which act on each
+agent separately between rounds. Communication is causal: an agent hears only agents at
+earlier or equal positions, and next-token targets enter the training loss.
 
 | Symbol | Meaning |
 |---|---|
-| $K$ | Total state dimension (`embed_dim`). |
-| $H$ | Communication-head count (`n_heads`). |
-| $d=K/H$ | Comparison and value dimension per head in the equal-head implementation. |
-| $\ell$ | Layer index, suppressed below for one layer. |
-| $U_i$ | Invertible realized frame at token $i$. |
-| $(\mu_i,\Sigma_i)$ | Gaussian mean and covariance at that token. |
-| $\beta_{ij}^{(h)}$ | Receiver $i$'s routing weight for sender $j$ in head $h$. |
+| $K$ | Dimension of every agent's belief state (`embed_dim`). |
+| $H$ | Number of communication heads, or channels (`n_heads`). |
+| $d=K/H$ | Comparison and content dimension per head in the equal-head implementation. |
+| $\ell$ | Layer index, one round of communication; suppressed below. |
+| $U_i$ | Invertible realized frame of agent $i$. |
+| $(\mu_i,\Sigma_i)$ | Gaussian mean and covariance of agent $i$'s belief. |
+| $\beta_{ij}^{(h)}$ | Receiver $i$'s weight on sender $j$ in head $h$. |
 
-## States, frames, and matrix links
+## Agents: beliefs, frames, and links
 
-The theory starts from a principal bundle of frames with structure group
-$G=\mathrm{GL}(K,\mathbb R)$ and its associated vector and Gaussian-state bundles.
-A frame section and a belief section are distinct objects. The finite token model
-uses token-indexed fibers and a reference trivialization; it does not require a
-smooth contextual base or discretize a continuum connection.
+Agent $i$ carries a belief $q_i$, a prior $p_i$ from the token's prior bank, and a frame
+$U_i$, its private coordinate system. Geometrically the agents are sections of bundles over
+a single base point, the shared context: the theory starts from a principal bundle of frames
+with structure group $G=\mathrm{GL}(K,\mathbb R)$ and its associated vector and Gaussian-state
+bundles, and a frame section and a belief section are distinct objects. The finite token
+model uses token-indexed fibers and a reference trivialization; it does not require a smooth
+contextual base or discretize a continuum connection.
 
-Write the state and its moments in reference coordinates as
+Write an agent's belief and its moments in reference coordinates as
 
 $$
 q_i=\mathcal N(\mu_i,\Sigma_i),\qquad
@@ -78,16 +101,18 @@ moment-matched covariance (the moment projection onto diagonal Gaussians) while
 `gaussian_full` keeps it dense, so the two families compute different functions; they
 coincide only when no seam densifies the covariance (see the configuration section below).
 
-### Comparison interfaces
+### Whom to listen to: query and key
 
-Each head reads all $K$ reference coordinates through
+A receiving agent decides whom to hear by comparing what it asks with how each sender
+presents itself. Each head reads all $K$ reference coordinates through
 
 $$
 S_{Q,h},S_{K,h}\in\mathbb R^{d\times K}.
 $$
 
 The query measures the receiver and the key measures the sender in a common
-$d$-dimensional comparison space:
+$d$-dimensional comparison space. The query is the receiver's own question and is never
+transmitted; the key is the part of the sender's belief that makes it findable:
 
 $$
 Q_{i,h}=\mathcal N(S_{Q,h}\xi_i,S_{Q,h}C_iS_{Q,h}^{\top}),\qquad
@@ -126,16 +151,19 @@ The two measurement maps $S_{Q,h}U_i^{-1}$ and $S_{K,h}U_j^{-1}$ do not uniquely
 specify a map back into the receiver's full state. Content transmission supplies
 that additional choice.
 
-### Sending and receiving interfaces
+### What is said and how it is heard: sending and receiving maps
 
-The full-width sending and receiving maps have shapes
+A sender transmits only a $d$-dimensional part of its $K$-dimensional belief, and the
+receiver must decide how that partial message enters its full state. The full-width sending
+and receiving maps have shapes
 
 $$
 T_h\in\mathbb R^{d\times K},\qquad O_h\in\mathbb R^{K\times d}.
 $$
 
-The sender extracts content through $T_hU_j^{-1}$; the receiver places it through
-$U_iO_h$. Their composition is the matrix link
+The sender extracts content through $T_hU_j^{-1}$ from its own frame; the receiver places it
+through $U_iO_h$ into its own frame. Their composition is the matrix link from agent $j$ to
+agent $i$,
 
 $$
 L_{ij}^{(h)}=(U_iO_h)(T_hU_j^{-1}).
@@ -159,18 +187,20 @@ is recovered when the intervening processing map is the identity. Generally,
 $O_hT_h\ne I_K$ and $L_{ij}L_{jk}\ne L_{ik}$. Such processing effects do not imply
 curvature of the flat reference connection.
 
-### Heads and frame blocks
+### Heads as communication channels
 
-The current `block_glk` implementation couples the number of equal frame blocks
-to the number of heads. The theory distinguishes them: a full-input/output head
+Each head is a separate low-rank channel with its own query, key, sending, and receiving
+maps, and each receiver routes every channel independently. The current `block_glk`
+implementation couples the number of equal frame blocks to the number of heads. The theory distinguishes them: a full-input/output head
 can access several frame blocks. Calling each such head an irreducible
 representation requires additional restrictions on its interface maps.
 Block-diagonal frames alone also do not imply statistical independence of
 Gaussian blocks.
 
-## Routing and predictive content
+## Routing and message passing
 
-Let $\pi_{ij}^{(h)}$ be a normalized prior on the permitted sources, with zero
+Each receiving agent spreads its attention over the agents it may hear. Let
+$\pi_{ij}^{(h)}$ be a normalized prior on the permitted sources, with zero
 mass outside causal support, and let $\tau_h>0$. At fixed states, minimizing
 
 $$
@@ -203,7 +233,7 @@ Runtime numerical KL bounds apply before softmax. Finite `kl_max` clips large
 energies; `float("inf")` removes the upper ceiling while retaining the nonnegative
 floor. The implemented energy can therefore differ from the unmodified KL above.
 
-The predictive message and attention output are
+The message a receiver assembles from what it heard, and its revised mean, are
 
 $$
 m_i=\sum_h\sum_j\beta_{ij}^{(h)}L_{ij}^{(h)}\mu_j,\qquad
@@ -225,7 +255,7 @@ unchanged **within this attention step**. Under `predictive_covariance="moment_m
 it replaces the covariance by the exact moment-matched covariance of the predictive
 kernel (Theorem `thm:probabilistic_status` (2) of the v2 manuscript): source covariances
 pushed through the head maps, cross-head terms, the between-source spread, the residual
-persistence term, and the covariant floor $f(\operatorname{tr}C_i/K)I$ in reference
+persistence term, and the covariant floor $f(\mathrm{tr}C_i/K)I$ in reference
 coordinates, with $f$ = `predictive_covariance_floor`. Neither is a routed population
 joint law. Subsequent block transforms and
 stack handoff have separate covariance policies, and neither contract is exact Gaussian
@@ -253,6 +283,10 @@ source prior, with appropriate temperature scaling. Varying key covariances reta
 further uncertainty-dependent terms. The current model does not impose this limit.
 
 ## Content-link charts and edge-dependent links
+
+A message travels from the sender's frame to the receiver's frame through a link. This
+section concerns how that link is parameterized: one shared group element per layer, or a
+link that depends on the pair of agents that communicate.
 
 ### Content-link charts
 
@@ -322,11 +356,11 @@ variable with prior $\mathcal N(a(\hat x_i),\sigma_L^2I)$ and estimates it per c
 Only the receiver factor is inferred: a sender factor $B_j$ enters every later receiver's
 links, so inferring it would leak future tokens into position $j$. Profiling out the
 receiver's next-layer state reduces the link energy to the dimensionless predictive variance
-$\operatorname{tr}C_i^{\mathrm{att}}/(2\operatorname{tr}C_i/K)$ (the moment-matched covariance
+$\mathrm{tr}C_i^{\mathrm{att}}/(2\mathrm{tr}C_i/K)$ (the moment-matched covariance
 without its floor), so the per-receiver energy is
 
 $$
-\mathcal F_i(A_i)=\frac{\operatorname{tr}C_i^{\mathrm{att}}(A_i)}{2\operatorname{tr}C_i/K}
+\mathcal F_i(A_i)=\frac{\mathrm{tr}C_i^{\mathrm{att}}(A_i)}{2\mathrm{tr}C_i/K}
 +\frac{\lVert A_i-a(\hat x_i)\rVert_F^2}{2\sigma_L^2}
 +\lambda_W\sum_{i-w\le k<j\le i}w_{ijk}\tfrac12\lVert W_{ijk}-I\rVert_F^2 ,
 $$
@@ -819,6 +853,15 @@ maintained outside this checkout in the author's `Research/manuscripts/` directo
 The current v2 set is maintained in that external manuscript directory. The
 formulas and implementation map above describe the architecture without depending
 on older manuscript copies.
+
+The same agent model is developed beyond language as a multi-agent variational
+free-energy theory in the companion `MultiAgentELBO` repository, with continuous-time
+belief dynamics, latent Lie-algebra links between agents, and coarse-graining of agent
+populations. This repository is its language-model instantiation: the agents are token
+positions, and the base of the bundles is a single point, one context. Replacing that point
+by a base of positive dimension with an induced connection would make the construction a
+field of such agent populations; the theory admits that extension, and this repository does
+not implement it.
 
 The `grow_K_mup` scaling route varies `e_q_mu_lr` and requires gradient belief
 updates; it rejects `predictive_content`, which does not read that rate.
