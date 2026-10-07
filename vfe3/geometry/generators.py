@@ -127,6 +127,30 @@ def local_basis_borel(d: int) -> torch.Tensor:
     return torch.stack(basis)
 
 
+def local_basis_glc(d: int) -> torch.Tensor:
+    r"""Realified gl(m, C) on R^{2m}, d = 2m: :math:`E_{ij}\otimes I_2` (row-major), then :math:`E_{ij}\otimes J`.
+
+    Complex coordinate k is the real pair (2k, 2k + 1) and :math:`J = [[0, -1], [1, 0]]` on each pair,
+    so :math:`A + iB\in\mathfrak{gl}(m,\mathbb{C})` realifies to
+    :math:`\sum_{ij} A_{ij} E_{ij}\otimes I_2 + B_{ij} E_{ij}\otimes J`: the coordinates are exactly
+    (Re, Im) of the complex matrix, in (re/im, i, j) order. Entries are 0 and +-1, every generator
+    commutes with :math:`I_m\otimes J`, and the Frobenius Gram is :math:`2I`. Returns (2 m^2, d, d) float64.
+    """
+    if d < 2 or d % 2 != 0:
+        raise ValueError(f"gl(m, C) realified needs an even d = 2m >= 2, got d={d}")
+    m = d // 2
+    eye2 = torch.eye(2, dtype=torch.float64)
+    J = torch.tensor([[0.0, -1.0], [1.0, 0.0]], dtype=torch.float64)
+    basis = []
+    for unit in (eye2, J):
+        for i in range(m):
+            for j in range(m):
+                E = torch.zeros(m, m, dtype=torch.float64)
+                E[i, j] = 1.0
+                basis.append(torch.kron(E, unit))
+    return torch.stack(basis)
+
+
 def generate_block_local(
     K:                int,
     n_heads:          int,

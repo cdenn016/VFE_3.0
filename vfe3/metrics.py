@@ -1058,6 +1058,72 @@ def per_head_gauge_invariants(
     }
 
 
+def _complex_structure(d: int, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    r"""The (d, d) complex structure :math:`J = I_{d/2}\otimes[[0,-1],[1,0]]` of the interleaved layout."""
+    J = torch.zeros(d, d, dtype=dtype, device=device)
+    J[1::2, 0::2] = torch.eye(d // 2, dtype=dtype, device=device)
+    J[0::2, 1::2] = -torch.eye(d // 2, dtype=dtype, device=device)
+    return J
+
+
+def per_head_circularity(
+    sigma:      torch.Tensor,            # (..., K, K) SPD covariance
+    irrep_dims: List[int],               # even head-block sizes; sum == K
+) -> torch.Tensor:                       # (..., H, d_max) singular values, descending, NaN-padded
+    r"""Per-head impropriety of a covariance against the complex structure J of ``block_glmc``.
+
+    On head block :math:`\Sigma_h` split :math:`R = (\Sigma + J^\top\Sigma J)/2` (commutes with J)
+    and :math:`P = (\Sigma - J^\top\Sigma J)/2` (anticommutes). Returns the singular values of
+    :math:`R^{-1/2}PR^{-1/2}`, i.e. :math:`|\mathrm{eig}(R^{-1}P)|`. Under
+    :math:`\Sigma\to g\Sigma g^\top` with g in GL(m, C) (g and g^T commute with J) R and P move by
+    the same congruence, so these are GL(m, C)-invariant per agent. Both :math:`R\pm P` are SPD, so
+    they lie in [0, 1); they vanish exactly for proper (circular) :math:`\Sigma`. For diagonal
+    :math:`\Sigma` they are :math:`|s_{2k}-s_{2k+1}|/(s_{2k}+s_{2k+1})`, each twice. Float64.
+    """
+    if any(d % 2 for d in irrep_dims):
+        raise ValueError(f"per_head_circularity needs even head blocks; got {irrep_dims}")
+    d_max = max(irrep_dims)
+    out = []
+    start = 0
+    for d in irrep_dims:
+        S = sigma[..., start:start + d, start:start + d].to(torch.float64)        # (..., d, d)
+        J = _complex_structure(d, dtype=torch.float64, device=S.device)
+        S_J = J.T @ S @ J
+        R, P = 0.5 * (S + S_J), 0.5 * (S - S_J)
+        L = torch.linalg.cholesky(R)
+        W = torch.linalg.solve_triangular(L, P, upper=False)                      # L^{-1} P
+        W = torch.linalg.solve_triangular(L, W.transpose(-1, -2), upper=False)    # L^{-1} P L^{-T}
+        sv = torch.linalg.eigvalsh(0.5 * (W + W.transpose(-1, -2))).abs()
+        sv = sv.sort(dim=-1, descending=True).values
+        out.append(torch.nn.functional.pad(sv, (0, d_max - d), value=float("nan")))
+        start += d
+    return torch.stack(out, dim=-2)
+
+
+def per_head_complex_phase(
+    exp_phi:    torch.Tensor,            # (..., K, K) realified GL(m, C)^H frame
+    irrep_dims: List[int],               # even head-block sizes; sum == K
+) -> torch.Tensor:                       # (..., H) arg det_C in (-pi, pi]
+    r"""Per-head :math:`\arg\det_{\mathbb{C}}` of a realified complex frame, the U(1) class function
+    that :math:`\log|\det|` cannot see (:math:`\det_{\mathbb{R}} = |\det_{\mathbb{C}}|^2`).
+
+    The complex block is :math:`Z = A + iB` with :math:`A = (X_{00} + X_{11})/2` and
+    :math:`B = (X_{10} - X_{01})/2` over the pair sub-blocks :math:`X_{ab}` = ``X[a::2, b::2]``, which is
+    exact on the image of GL(m, C). Invariant under a global GL(m, C) conjugation. Complex128.
+    """
+    if any(d % 2 for d in irrep_dims):
+        raise ValueError(f"per_head_complex_phase needs even head blocks; got {irrep_dims}")
+    phases = []
+    start = 0
+    for d in irrep_dims:
+        X = exp_phi[..., start:start + d, start:start + d].to(torch.float64)
+        A = 0.5 * (X[..., 0::2, 0::2] + X[..., 1::2, 1::2])
+        B = 0.5 * (X[..., 1::2, 0::2] - X[..., 0::2, 1::2])
+        phases.append(torch.angle(torch.linalg.det(torch.complex(A, B))))
+        start += d
+    return torch.stack(phases, dim=-1)
+
+
 # --- transport / energy directedness (the ln(3) symmetry-breaking signal) ---
 
 def _require_square_token_transport(
