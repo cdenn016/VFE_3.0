@@ -615,3 +615,12 @@ def test_vfe_path_is_unchanged_by_the_family_gates(tmp_path: Path) -> None:
     for name, tensor in grabbed["state"].items():
         assert tensor.device.type == "cpu" and torch.equal(tensor, live[name]), name
         assert tensor.data_ptr() != live[name].data_ptr(), name
+
+
+def test_run_baseline_takes_score_test_as_a_keyword() -> None:
+    r"""``score_test`` is a parameter of ``run_baseline`` (the LR sweep passes ``score_test=False``), not a
+    body statement; misplaced after ``-> Path:`` it bound the tuple ``(True,)`` and the sweep raised."""
+    import inspect
+
+    parameter = inspect.signature(tb.run_baseline).parameters.get("score_test")
+    assert parameter is not None and parameter.default is True
