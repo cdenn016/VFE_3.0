@@ -1829,7 +1829,48 @@ class VFEModel(nn.Module):
         d["phi_matrix_norm_p95"] = float(torch.quantile(matrix_norm, 0.95))
         d["phi_matrix_norm_p99"] = float(torch.quantile(matrix_norm, 0.99))
         d["phi_matrix_norm_max"] = float(matrix_norm.max())
+        d.update(self._frame_class_diagnostics(belief))
         return d
+
+    def _frame_class_diagnostics(self, belief: BeliefState) -> dict:
+        r"""Conjugation-class functions of the realized frames :math:`U_i = e^{\phi_i\cdot G}e^{Y_i\cdot G}`.
+
+        Rebuilt in float64 from the converged layer belief (Y the exact positional right factor, if any).
+        ``gauge_invariant_mean`` / ``_spread`` reduce :func:`vfe3.metrics.group_gauge_invariant`;
+        ``gauge_head_aniso_mean`` and
+        ``gauge_head_logdet_spread`` reduce :func:`vfe3.metrics.per_head_gauge_invariants` (head-block
+        eigenvalue-modulus squeeze, and the spread of the head log-volumes). For ``block_glmc``,
+        ``gauge_head_phase_abs_mean`` is the mean :math:`|\arg\det_{\mathbb{C}}|` of the head frames and
+        ``belief_circularity_mean`` the mean leading :func:`vfe3.metrics.per_head_circularity` of the
+        converged covariance (GL(m, C)-invariant, so the frame does not enter). These are statistics
+        in the reference trivialization (invariant under a global conjugation, not under the local
+        action; see the metrics section note).
+        """
+        from vfe3 import metrics
+        group = self.group
+        with torch.autocast(device_type=belief.phi.device.type, enabled=False):
+            U = torch.linalg.matrix_exp(group.embed_algebra(belief.phi.double(), dtype=torch.float64))
+            if belief.right_phi is not None:
+                U = U @ torch.linalg.matrix_exp(
+                    group.embed_algebra(belief.right_phi.double(), dtype=torch.float64))
+            U = U.reshape(-1, *U.shape[-2:])                                     # (B N, K, K)
+            out = {}
+            invariant = metrics.group_gauge_invariant(U, group)
+            out["gauge_invariant_mean"] = float(invariant.mean())
+            out["gauge_invariant_spread"] = float(invariant.std(unbiased=False))
+            heads = metrics.per_head_gauge_invariants(U, group.irrep_dims)
+            out["gauge_head_aniso_mean"] = float(heads["anisotropy"].mean())
+            out["gauge_head_logdet_spread"] = float(heads["logdet"].std(unbiased=False))
+            if group.name == "block_glmc":
+                out["gauge_head_phase_abs_mean"] = float(
+                    metrics.per_head_complex_phase(U, group.irrep_dims).abs().mean())
+                sigma = belief.sigma.double()
+                if sigma.dim() == belief.mu.dim():                               # diagonal (..., N, K)
+                    sigma = torch.diag_embed(sigma)
+                circularity = metrics.per_head_circularity(
+                    sigma.reshape(-1, *sigma.shape[-2:]), group.irrep_dims)      # (B N, H, d)
+                out["belief_circularity_mean"] = float(circularity[..., 0].mean())
+        return out
 
     @torch.no_grad()
     @_block_mlp_diagnostic_eval

@@ -1409,7 +1409,7 @@ _GROUP_GRAD_ERROR_KEY = "_group_gradient_norm_error"     # private train_step ->
 
 # Held-out columns the conditional route now fills from its own capture (all members of _VAL_DIAG_KEYS).
 _CONDITIONAL_STRUCTURE_KEYS: Tuple[str, ...] = (
-    "val_effective_rank", "val_belief_cond_median",
+    "val_effective_rank", "val_belief_cond_median", "val_gauge_invariant_spread",
     "val_attn_entropy_min_all", "val_attn_entropy_min_norm", "val_attn_collapsed_heads",
     "val_future_leakage", "val_row_sum_error", "val_pos_content_r2", "val_prev_token_mass",
     "val_period_match_mass", "val_head_redundancy_js",
@@ -2710,6 +2710,7 @@ def _val_diagnostics_one(
         structure: Dict[str, float] = {
             "val_effective_rank": float(vd["effective_rank"]),
             "val_belief_cond_median": float(vd["belief_cond_median"]),
+            "val_gauge_invariant_spread": float(vd["gauge_invariant_spread"]),
         }
         structure.update(_attention_structure_metrics(snapshot.beta_maps.float()))
         if diagnostic_targets is not None:
@@ -3663,6 +3664,7 @@ def train(
                         "cocycle_residual", "vertex_cond_max", "sandwich_absmax", "transport_asymmetry",
                         "energy_abs_asymmetry", "energy_rel_asymmetry",
                         "gauge_head_aniso_mean", "gauge_head_logdet_spread",
+                        "gauge_head_phase_abs_mean", "belief_circularity_mean",
                         "phi_matrix_norm_median", "phi_matrix_norm_p95", "phi_matrix_norm_p99",
                         "phi_matrix_norm_max",
                         "vertex_cond_median", "vertex_cond_p95", "vertex_cond_p99",
