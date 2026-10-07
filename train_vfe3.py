@@ -547,6 +547,10 @@ def _run_once(
         from datetime import datetime
         artifacts = RunArtifacts(run_dir, cfg, model, dataset=DATASET, device=DEVICE,
                                  timestamp=datetime.now().isoformat(timespec="seconds"))
+        # config.md: the config dict above, verbatim, plus the values it does not show as literals.
+        from vfe3.config_markdown import write_config_markdown
+        write_config_markdown(run_dir, __file__, {key: getattr(cfg, key) for key in [*config, "seed"]},
+                              header={"DATASET": DATASET, "data seed": _effective_data_seed(cfg)})
         logger.info("Saving run artifacts to %s", run_dir)
 
     # Full uncapped corpus size for the "stream is X% of full" banner line -- only computed when
