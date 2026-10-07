@@ -189,3 +189,22 @@ def test_probe_and_history_figures_are_written_and_umap_is_gated(tmp_path: Path)
                 handle.write("\n".join(lines) + "\n")
     history = {p.name for p in report.generate_history_figures(tmp_path, cfg=model.cfg)}
     assert {"minimal_agent_heads.png", "prototype_templates.png"} <= history
+
+
+def test_template_codebook_decodes_tokens_with_the_sequence_decoder(tmp_path) -> None:
+    r"""The dataset decoder takes a list of ids; the codebook labels must be the decoded words, one panel per layer."""
+    from vfe3.viz import feature_figures
+    calls = []
+
+    def decode(ids):
+        calls.append(ids)
+        return {7: " cat", 9: ","}[ids[0]]
+
+    probe = {"layers": [{"layer": layer, "codebook": [
+        {"template": 3, "usage": 0.5, "top_tokens": [[7, 4], [9, 1]]},
+        {"template": 1, "usage": 0.1, "top_tokens": []}]} for layer in range(3)]}
+    fig = feature_figures.plot_template_codebook(probe, decode=decode, path=str(tmp_path / "codebook.png"))
+    assert calls and all(isinstance(ids, list) for ids in calls)
+    labels = {t.get_text() for ax in fig.axes for t in ax.get_yticklabels()}
+    assert "\u2018cat\u2019  \u2018,\u2019" in labels and "(none)" in labels and "#3" in labels
+    assert sum(ax.get_visible() for ax in fig.axes if ax.get_title()) == 3

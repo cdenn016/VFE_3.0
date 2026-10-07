@@ -14,6 +14,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 import numpy as np
 
 from vfe3.viz.figures import MAX_FIGURE_WIDTH_IN, FigureSkipped, _compact_style, _layer_colors, _np, _save, plt
+from vfe3.viz.text import token_label
 
 _HEAD_PANELS = (
     ("gain_fraction", "gain fraction", False),
@@ -182,40 +183,48 @@ def plot_template_usage(
         return _save(fig, path)
 
 
-def _token_label(decode: Optional[Callable[[int], str]], token: int) -> str:
-    if decode is None:
-        return str(token)
-    try:
-        text = decode(int(token))
-    except Exception:                                                           # noqa: BLE001 - label by id
-        return str(token)
-    return repr(text)[1:-1][:12] or str(token)
-
-
 def plot_template_codebook(
     probe:  Mapping[str, Any],           # vfe3.posthoc.feature_probes.prototype_probe
     *,
-    decode: Optional[Callable[[int], str]] = None,
-    top:    int = 16,
+    decode: Optional[Callable[[Sequence[int]], str]] = None,
+    top:    int = 12,
+    n_tokens: int = 4,
     path:   Optional[str] = None,
 ):
-    r"""The ``top`` most-used templates of each layer with their usage and the tokens they win most often (top-1
-    assignment over the report tokens)."""
+    r"""The ``top`` most-used templates of each layer: one panel per layer (two columns), a horizontal bar of each
+    template's mean weight (%) labeled by template index on the left, and on the right the ``n_tokens`` tokens it
+    wins most often (top-1 assignment over the report tokens), each in quotes, decoded to text when ``decode`` is
+    given (leading spaces dropped). A template that wins no report token shows "(none)"."""
     rows = probe.get("layers") or []
     if not rows:
         raise FigureSkipped("no prototype_agents layer")
+    n_cols = 2 if len(rows) > 1 else 1
+    n_rows = (len(rows) + n_cols - 1) // n_cols
+    k = max(1, min(top, max(len(row["codebook"]) for row in rows)))
     with _compact_style():
-        fig, axes = plt.subplots(1, len(rows), squeeze=False,
-                                 figsize=(MAX_FIGURE_WIDTH_IN, 0.1 * top + 0.5))
-        for ax, row in zip(axes[0], rows):
-            lines = []
-            for item in row["codebook"][:top]:
-                tokens = ", ".join(_token_label(decode, token) for token, _ in item["top_tokens"][:5])
-                lines.append(f"#{item['template']:<5d} {100 * item['usage']:5.2f}%  {tokens}")
-            ax.text(0.0, 1.0, "\n".join(lines), family="monospace", fontsize=6, va="top", ha="left",
-                    transform=ax.transAxes)
+        fig, axes = plt.subplots(n_rows, n_cols, squeeze=False, constrained_layout=True,
+                                 figsize=(MAX_FIGURE_WIDTH_IN, n_rows * (0.16 * k + 0.6)))
+        for extra in range(len(rows), n_rows * n_cols):
+            axes[extra // n_cols][extra % n_cols].set_visible(False)
+        for index, row in enumerate(rows):
+            ax = axes[index // n_cols][index % n_cols]
+            items = row["codebook"][:k]
+            usage = [100.0 * item["usage"] for item in items]
+            y = np.arange(len(items))
+            ax.barh(y, usage, height=0.7, color=_layer_colors(1)[0])
+            ax.set_yticks(y, [f"#{item['template']}" for item in items])
+            ax.set_ylim(len(items) - 0.5, -0.5)                             # most used on top
+            ax.set_xlabel("mean weight (%)")
             ax.set_title(f"layer {row['layer']}")
-            ax.axis("off")
+            words = ax.twinx()
+            words.set_ylim(ax.get_ylim())
+            words.set_yticks(y, ["  ".join(f"‘{token_label(token, decode=decode).strip() or token_label(token, decode=decode)}’"
+                                           for token, _ in item["top_tokens"][:n_tokens])
+                                 or "(none)" for item in items])
+            words.tick_params(axis="y", length=0, labelsize=6)
+            for side in ("top", "right"):
+                ax.spines[side].set_visible(False)
+                words.spines[side].set_visible(False)
         fig.suptitle("prototype templates: usage and most frequent tokens")
         return _save(fig, path)
 
@@ -223,7 +232,7 @@ def plot_template_codebook(
 def plot_template_umap(
     probe:  Mapping[str, Any],           # vfe3.posthoc.feature_probes.prototype_probe
     *,
-    decode: Optional[Callable[[int], str]] = None,
+    decode: Optional[Callable[[Sequence[int]], str]] = None,
     label_top: int = 12,
     seed:   int = 0,
     path:   Optional[str] = None,
@@ -247,7 +256,7 @@ def plot_template_umap(
             for item in row["codebook"][:label_top]:
                 if item["top_tokens"]:
                     a = item["template"]
-                    ax.annotate(_token_label(decode, item["top_tokens"][0][0]), xy[a], fontsize=5.5)
+                    ax.annotate(token_label(item["top_tokens"][0][0], decode=decode), xy[a], fontsize=5.5)
             ax.set_title(f"layer {row['layer']}")
             ax.set_xticks([])
             ax.set_yticks([])
