@@ -1380,13 +1380,6 @@ class VFE3Config:
                     "pullback_group phase one accepts only untied block_glk; "
                     f"got gauge_group={self.gauge_group!r}, gauge_tying={self.gauge_tying!r}"
                 )
-        if (phi_update_policy.requires_manifold_optimizer and self.m_phi_group_retraction == "group_log"
-                and (self.gauge_group != "block_glk" or self.gauge_tying != "per_head")):
-            raise ValueError(
-                "m_phi_group_retraction='group_log' reads the chart as per-head d x d blocks and "
-                "requires untied block_glk; "
-                f"got gauge_group={self.gauge_group!r}, gauge_tying={self.gauge_tying!r}"
-            )
             if self.d_head > 12:
                 raise ValueError(
                     "pullback_group with gauge_group='block_glk' requires d_head <= 12; got "
@@ -1400,6 +1393,13 @@ class VFE3Config:
             chart_problem = self._chart_ordering_problem()
             if chart_problem is not None:
                 raise ValueError(f"pullback_group requires {chart_problem}")
+        if (phi_update_policy.requires_manifold_optimizer and self.m_phi_group_retraction == "group_log"
+                and (self.gauge_group != "block_glk" or self.gauge_tying != "per_head")):
+            raise ValueError(
+                "m_phi_group_retraction='group_log' reads the chart as per-head d x d blocks and "
+                "requires untied block_glk; "
+                f"got gauge_group={self.gauge_group!r}, gauge_tying={self.gauge_tying!r}"
+            )
 
         from vfe3.model.positional_phi import _POS_PHI
         _require(self.pos_phi, tuple(sorted(_POS_PHI)), "pos_phi")
