@@ -73,19 +73,19 @@ MAX_TOKENS = None
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Multi-seed training: launch NUM_RUNS independent runs back-to-back on click-to-run, run i using
-# SEEDS[i]. Each run is fully independent (its own model, RNG, and artifacts dir -- the seed is in the
-# run-folder label so they never collide). NUM_RUNS=1 with SEEDS=[] keeps the single-run path on the
-# config `seed` above, unchanged. Example: NUM_RUNS=3, SEEDS=[3, 64, 23] trains all three seeds.
+# Seeds: the only place the model seed is set (the config dictionary carries none). Click-to-run
+# launches NUM_RUNS independent runs back-to-back, run i using SEEDS[i]; each run is fully independent
+# (its own model, RNG, and artifacts dir -- the seed is in the run-folder label so they never collide).
+# NUM_RUNS=1 runs SEEDS[0]. Example: NUM_RUNS=3, SEEDS=[3, 64, 23] trains all three seeds.
 NUM_RUNS = 1
-SEEDS    = 6,#[6,23,54,66,122]        # 54 is best seed so far; must list at least NUM_RUNS seeds when NUM_RUNS > 1
+SEEDS    = [6, 54, 271]       # 54 is best seed so far; must list at least NUM_RUNS seeds
 
 # DATA_SEED (EXP-1 variance floor): when set to an int, the TRAIN loader's shuffle order is fixed to
 # this seed via an explicit generator, INDEPENDENT of the per-run model seed -- so a multi-seed run
 # shares ONE batch order across seeds and the measured across-seed SD is init+optimization variance,
 # NOT data-order noise. None seeds the train generator from each run's cfg.seed instead (a per-seed
 # batch order with a resumable cursor, mirroring ablation._effective_data_seed).
-DATA_SEED = 3
+DATA_SEED = 3    #TODO need data order variance for pub - set to None
 
 # Where each run's artifacts go: vfe3_runs/<timestamp>_<label>/ while training (config.json,
 # metrics.csv, checkpoints/, best_model.pt, test_results.json, summary.json, *.png), renamed to
@@ -99,12 +99,9 @@ config = dict(
     #################################
     #            Training
     #################################
-
    
-    vocab_size                = _tokenizer_vocab_size(DATASET),   # follows DATASET's tokenizer
-                                                                  # (gpt2 50257 / cl100k 100277 /
-                                                                  #  word 267735); override to narrow
-
+    vocab_size                = _tokenizer_vocab_size(DATASET),   # follows DATASET's tokenizer (gpt2 50257 / cl100k 100277 / word 267735)
+                                                                  
     embed_dim                 = 20,                  # K, total belief dim (must be divisible by n_heads)
     n_heads                   = 2,                   # = number of irrep blocks (alibi priors require this)
 
@@ -114,278 +111,220 @@ config = dict(
     batch_size                = 32,
     max_steps                 = 30000,
 
-    n_layers                  = 2,                   # L, number of blocks
+    n_layers                  = 4,                   # L, number of blocks
     n_e_steps                 = 1,                   # T, E-step inner iterations
 
-    seed                      = 6,
-    warmup_steps              = 100,
-    deterministic             = True,
-    
-    
-    # Attention execution; all interfaces have full input/output.
-    attention_mode                   = "projected_predictive",  # "projected_predictive" | "projected_gradient"
-
-
-    
-    attention_residual               = True,   # predictive S/T/O: add the incoming mean
-    content_link_chart               = "affine",        # "affine" O'=O | "first_order" O'=T^-1+O | "exponential" O'=T^-1+O phi_1(TO)=e^{OT}T^-1 (Option A)
-    # projected_gradient receiver (projected_gradient.tex); inert under projected_predictive
-    relational_receiver_law          = "channel_likelihood",  # "channel_likelihood" (entropy once, unobserved directions keep the prior) | "ambient_alignment" (PR #30)
-    relational_receiver_update       = "closed_form",         # "closed_form" (exact frozen-context update) | "euler" (Fisher step; reads e_q_mu_lr / e_q_sigma_lr / trusts)
-    relational_receiver_damping      = 1.0,                   # closed_form only: rho in (0, 1]; 1 = the frozen minimizer
-    relational_receiver_noise        = 1.0,                   # channel floor nu I_d (channel_likelihood) | K-dim reference noise (ambient_alignment)
-    relational_routing               = "gaussian_kl",  # "gaussian_kl" | "noisy_query": exact posterior N(a_i; b_j, V_Q + V_K), predictive only
-    predictive_readout               = "kernel",       # "kernel" | "minimal_agent"
-    minimal_agent_inference          = "exact",        # "exact" | "mean_field"
-    minimal_agent_channel_noise      = 1.0,            # initial channel noise n_h > 0
-    predictive_covariance            = "passthrough",  # "passthrough" (Sigma kept at encode) | "moment_matched" (exact predictive-kernel covariance), predictive only
-    predictive_covariance_floor      = 1e-4,           # moment_matched only: covariant floor floor * (tr C_i / K) I in reference coordinates
-   
-       
-    
-    #################################
-    # belief family
-    #################################
-
-
-    family                    = "gaussian_full", # "gaussian_diagonal" | "gaussian_full"
-
-     
-    #################################
-    #        Initialization
-    #################################
-    mu_init_std               = 0.065,     # std of the random mean table mu_embed
-    sigma_init                = 15,         # constant initial coordinate variance (sigma_log = log of this)
-    phi_scale                 = 0.035,      # std
-    pos_phi_scale             = 0.02,      # learned-table init scale AND frozen per-position step
-
-    pos_phi_project_slk       = False,      # per-block trace projection (det Omega = 1)
-    
-    
-    #################################
-    #        Encode/Decode          #
-    #################################
-    decode_bias                       = True,     # only for decode_mode='linear'
-    
-                                         
-    
-    decode_mode                       = 'full_chunked',  # prior-bank: diagonal_chunked/full_chunked/expected_likelihood_chunked/family_chunked
-    encode_mode                       = "per_token",   #"per_token_additive" is ~1.5x faster at K=80 currently unablated
-    decode_chunk_size                 = 8192,
-    decode_ce_checkpoint              = "auto",     # historical gate; "auto_aggregate" saves memory with recompute
-    decode_tau                        = 0.008,       #prior_bank = True temperature
-    
-    unigram_kappa                     = 1.0,         # tempering on log pi_v (1.0 = exact Bayes class prior)
-
-    
-    decode_unigram_prior              = True,       # add kappa*log pi_v (corpus unigram) to decode logits    
-    untie_decode_bank                 = True,       # prior-bank modes only: decode reads its OWN cloned (V,K) tables
-    
-    decode_coordinates                = "local",       # "local" | "reference"
-    #################################
-    #     Optional Block MLP        #
-    #################################
-    use_block_mlp             = True,      
-    block_mlp_mode            = "coordinate",   # "coordinate" | "gauge_gate" | "canonical_frame" | "gaussian_template" (template routing, passthrough covariance) | "prototype_agents"
-    block_mlp_covariance      = "passthrough",  # "passthrough" | "delta_full" (needs gaussian_full; not for gaussian_template) | "posterior" (prototype_agents only)
-    block_mlp_inference       = "mean_field",   # "mean_field" | "exact"
-    block_mlp_template_init_variance = 10.0,    # initial template variance lambda_0 > 0
-    block_mlp_covariance_floor = 1e-4,          # delta_full only: Sigma+ = J Sigma J^T + floor Sigma
-    block_mlp_expansion       = 8,
-    block_mlp_activation      = "gelu",
-    block_mlp_dropout         = 0.00,
-    per_type_hidden_bias      = False,          # per-type (V x n_gen) bias on the MLP hidden layer; coordinate MLP, projected route
-
-
-    #################################
-    #          Gauge Group
-    #################################
-    gauge_transport           = "on",         # gauge-frame ABLATION (A1/EXP-2): "on" (pure, learned frame)
-                                              #   | "off" (Omega=I exactly) | "frozen" (random fixed frame)
-
-    gauge_group               = "block_glk",    # "block_glk" | "so_n" (so_n awaits reconnection to the projected routes)
-
-    group_n                   = None,                # so_n only; must stay None for block_glk
-    irrep_spec                = None,                # so_n only; must stay None for block_glk
-
-    ####################################
-    #       Positional Encoding
-    #    BCH gauge-frame PE (pos_phi)
-    #     gauge-RoPE (pos_rotation)
-    ####################################
-
-    pos_phi                   = "learned",           # "none" (pure path) | "learned" | "frozen"
-    pos_rotation              = "none",              # "none" | "rope"
-   
-    rope_base                 = 100.0,               # rotary frequency base
-        
-    rope_on_value             = False,
-
-
-    ######################################
-    #                Self Energy:
-    #        Sum_i alpha_i * KL(q_i||p_i)
-    ######################################
-    lambda_alpha_mode          = "constant",  # "constant" | "state_dependent" | "state_dependent_per_coord"
-
-    b0   = 1.0,                                # state-dependent alpha shape: alpha* = c0/(b0 + D)
-    c0   = 1.0,                                 # state-dependent alpha shape (numerator)
-
-    ########################################
-    #     Attention Belief/Model Settings
-    #            & Temperatures
-    ########################################
-    
-    kappa_beta                   = 1,        # tau = kappa * sqrt(d_head)
-
-    beta_attention_prior         = "causal_alibi",
-
-
-    alibi_slope                  = 1,
-    attention_window             = 128,
-
-  
-    
-    ##########################################################
-    #              VFE Hyper-parameters
-    #  Sum_i alpha_i * KL(q_i||p_i) + 
-    #  lambda_beta*Sum_i beta_ij * KL(q_i||Omega_ij q_j) + ...
-    ##########################################################
-
-    lambda_alpha               = 1,          # constant self-coupling value
-    lambda_beta                = 1.0,        # belief-coupling block weight (1.0 = pure F)
-
-
-    # Further Regularizers
-    mass_phi                   = 0.0,       # (mass_phi/2) ||phi||^2 penalty
-    mstep_self_coupling_weight = 0.0,       # alpha_hat * sum_i KL(q_i*||p_i) M-step term (0 = OFF)
-   
-    
-    #################################
-    #         Belief E-step
-    #         Learning Rates
-    #################################
-        
-    
-    e_q_mu_lr                 = 0.9,
-    e_q_sigma_lr              = 0.01,
-    
-
-   
-    #################################
-    #    Embedding/Priors M-step
-    #        Learning Rates
-    #################################
-    m_phi_update_mode         = "adamw",      # "adamw" | "pullback_group" | "fisher_group" (belief-Fisher natural gradient)
-    phi_precond_mode          = "pullback_per_block",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback" | "pullback_per_block"
-
-    transport_chart_max_norm  = 18,
-    phi_mstep_max_matrix_norm = 12,
-    m_phi_group_trust_radius  = 0.1,         
-    m_phi_group_retraction    = "chart",      # "chart" | "group_log" (exact Log(U e^{-eta xi}); pullback_group/fisher_group only)
-    m_phi_fisher_rotation_weight = 2.0,       # fisher_group only: completion weight on belief-invisible rotations
-
-
-    m_p_mu_lr                 = 0.005,
-    m_p_sigma_lr              = 0.001,
-    m_decode_mu_lr            = None,       # None inherits m_p_mu_lr
-    m_decode_sigma_lr         = None,       # None inherits m_p_sigma_lr
-    m_phi_lr                  = 0.0015,
-    
-    m_pos_phi_lr              = 0.001,      # None inherits m_phi_lr; own M-step rate for the LEARNED
-                                           # positional frame table (active only at pos_phi='learned')
-
-
-    #################################
-    #        
-    #        Weight Decays
-    #        
-    #################################
-    weight_decay              = 0.01,
-    phi_weight_decay          = 0.05,    
-    sigma_weight_decay        = 0.04,      
-    mu_weight_decay           = 0.025,     
-
-
-    m_relational_score_lr     = 0.01,   # None inherits m_p_mu_lr; 0 freezes both query/key score maps
-    m_relational_content_lr   = 0.0025,   # None inherits m_p_mu_lr; 0 freezes T/O
-    
-
-    
-    m_block_mlp_lr            = 0.001,
-    m_per_type_hidden_bias_lr = None,      # None inherits the declared m_phi_lr; active only with per_type_hidden_bias
-    m_layernorm_lr            = 0.05,      # None inherits m_p_mu_lr; own M-step rate for the
-                                           
-
-
-
-    
-    min_lr_frac               = 0.01,
-   
-    
-    #################################
-    #     Layer Normalization
-    #        and Hand-Off
-    #################################
-
-    layernorm_affine          = True,
-    norm_type_block           = "layernorm",        # "none" | "mahalanobis" |"layernorm"
-    norm_type_final           = "none",             # "none" | "mahalanobis" |"layernorm"
-    block_coordinates         = "local",            # "local" | "reference" (LN and MLP applied as U Phi(U^-1 .))
-    
-   
     #################################
     #         Misc/Logging
     #################################
 
     log_interval               = 100,       # console log every N steps (0 = off)
     eval_interval              = 1500,      # periodic validation every N steps (0 = off)
-    checkpoint_interval        = 15000,     # save a resumable checkpoint every N steps (0 = off)
-
-
+    checkpoint_interval        = 15000,     # save a resumable checkpoint every N steps (0 = off)   
+    
     #################################
-    #        Numerics
+    #           Modes               #
+    #################################
+    family                           = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full"
+    encode_mode                      = "per_token",   #"per_token_additive" only when no position in phi 
+    decode_mode                      = 'linear',  # prior-bank: diagonal_chunked/full_chunked/expected_likelihood_chunked/family_chunked
+                                                    # use 'expected_likelihood_chunked' above with diagonal exact minimal_agent
+        
+    attention_mode                   = "projected_predictive",  # "projected_predictive" | "projected_gradient"
+    predictive_covariance            = 'moment_matched',  # "passthrough"| "moment_matched" (exact predictive-kernel covariance)
+    content_link_chart               = "exponential",        # "affine" Oh'=Oh | "first_order" Oh'=T^-1+Oh | "exponential" Oh'=T^-1+Oh phi_1(TOh)=e^{OhT}T^-1 
+        
+    relational_routing               = "gaussian_kl",           # "gaussian_kl" | "noisy_query"
+    relational_receiver_law          = "channel_likelihood",  # "channel_likelihood"  | "ambient_alignment"  - projected_gradient mode
+    relational_receiver_update       = "closed_form",         # "closed_form" (exact frozen-context update) | "euler" (Fisher step; reads e_q_mu_lr / e_q_sigma_lr / trusts)
+    relational_output_init           = "identity",      # "identity" | "depth_scaled" (initial "Oh" times 1/sqrt(2 n_layers))   
+       
+    predictive_readout               = "minimal_agent",     # "kernel" | "minimal_agent"
+    minimal_agent_inference          = "mean_field",         # "exact" | "mean_field"
+   
+    block_coordinates                = "local",       # "local" | "reference" (LN and MLP applied as U Phi(U^-1 .))
+    decode_coordinates               = "local",       # "local" | "reference"
+    
+           
+    minimal_agent_channel_noise      = 1.0,                # initial channel noise n_h > 0
+    predictive_covariance_floor      = 1e-4,        # moment_matched only: covariant floor floor * (tr C_i / K) I in reference coordinates
+    relational_receiver_damping      = 1.0,         # closed_form only: rho in (0, 1]; 1 = the frozen minimizer    
+    relational_receiver_noise        = 1.0,         # channel floor nu I_d (channel_likelihood) | K-dim reference noise (ambient_alignment)
+     
+    #################################
+    #     Optional Block MLP        #
     #################################
     
-    sigma_max                            = 100.0,
-    e_mu_q_trust                         = 2,
-    e_sigma_q_trust                      = 1.0,
+    use_block_mlp                    = True,
+    per_type_hidden_bias             = False,       # per-type (V x n_gen) bias on the MLP hidden layer; coordinate MLP, projected route
+    
+    block_mlp_activation             = "gelu",
+    
+    block_mlp_mode                   = "prototype_agents",   # "coordinate" | "prototype_agents" | "canonical_frame" | "gaussian_template" | "gauge_gate" 
+    block_mlp_covariance             = "passthrough",  # "passthrough" | "delta_full" | "posterior" 
+    
+    block_mlp_inference              = "mean_field",   # "mean_field" | "exact"
+    
+    block_mlp_expansion              = 8,    #K*block_mlp_expansion = number of templates
+    
+    block_mlp_template_init_variance = 10.0,    # initial template variance lambda_0 > 0
+    block_mlp_dropout                = 0.00,
+    block_mlp_covariance_floor       = 1e-4,          # delta_full only: Sigma+ = J Sigma J^T + floor Sigma
+    
+  
+    #################################
+    #     Layer Normalization
+    #        and Hand-Off
+    #################################
+
+    layernorm_affine           = True,
+    norm_type_block            = "layernorm",        # "none" | "mahalanobis" |"layernorm" - often useful
+    norm_type_final            = "none",             # "none" | "mahalanobis" |"layernorm" - performs worse generally
+
+    #################################
+    #        Initialization
+    #################################
+       
+    mu_init_std                = 0.065,     # std of the random mean table mu_embed
+    sigma_init                 = 15,         # constant initial coordinate variance (sigma_log = log of this)
+    phi_scale                  = 0.035,      # std
+    pos_phi_scale              = 0.02,      # learned-table init scale AND frozen per-position step
+    sigma_max                  = 100.0,
+
+    decode_tau                 = 1,       #tau =1 principled bayes
+    unigram_kappa              = 1,         # tempering on log pi_v (1.0 = exact Bayes class prior)
+    decode_chunk_size          = 8192,
+        
+    pos_phi_project_slk        = False,      # per-block trace projection (det Omega = 1)    
+    attention_residual         = False,        #ignored with minimal_agent
+    
+    decode_unigram_prior       = True,       # add kappa*log pi_v (corpus unigram) to decode logits    
+    untie_decode_bank          = True,       # prior-bank modes only: decode reads its OWN cloned (V,K) tables
+    decode_bias                = True,     # only for decode_mode='linear'
+    
+    deterministic              = True,
+    generate_embedding_figures = False,
+    
+
+    #################################
+    #          Gauge Group
+    #################################
+    gauge_transport            = "on",           #  "on" | "off"  | "frozen" (random fixed frame)
+    gauge_group                = "block_glk",    # "block_glk" | "so_n" (so_n: one equal irrep block per head)
+    gauge_tying                = "per_head",     # None | "per_head" | "shared"
+    
+    group_n                    = None,                # so_n only; must stay None for block_glk
+    irrep_spec                 = None,                # so_n only; must stay None for block_glk "random"
    
-   
+    ####################################
+    #       Positional Encoding
+    #    BCH gauge-frame PE (pos_phi)
+    #     gauge-RoPE (pos_rotation)
+    ####################################
+
+    pos_phi                    = "learned",           # "none" | "learned" | "frozen"
+    pos_rotation               = "none",              # "none" | "rope"
+         
+    rope_on_value              = False,
+
+    ######################################
+    #                Self Energy:
+    #        Sum_i alpha_i * KL(q_i||p_i)
+    ######################################
+    
+    lambda_alpha_mode          = "state_dependent_per_coord",  # "constant" | "state_dependent" | "state_dependent_per_coord"
+    
+    lambda_alpha               = 1,          # constant self-coupling value
+    
+    b0   = 1.0,                                # state-dependent alpha shape: alpha* = c0/(b0 + D)
+    c0   = 1.0,                                 
+
+    ########################################
+    #     Attention Belief/Model Settings
+    #            & Temperatures
+    ########################################
+    lambda_beta                = 1.0,        # belief-coupling block weight (1.0 = pure F)
+
+    kappa_beta                 = 1,        # tau = kappa * sqrt(d_head)
+    beta_attention_prior       = 'causal',    
+
+    
+    #################################
+    #         Belief E-step
+    #################################    
+    
+    e_q_mu_lr                  = 0.2,
+    e_q_sigma_lr               = 0.01,
+     
+    e_mu_q_trust               = 2,
+    e_sigma_q_trust            = 1.0,
+    
+    #################################
+    #        M-step Settings  
+    #################################
+    
+    m_phi_update_mode          = "adamw",        # "adamw" | "pullback_group" | "fisher_group" (belief-Fisher natural gradient)
+    phi_precond_mode           = "none",         # "none" | "clip" | "killing" | "killing_per_block" | "pullback" | "pullback_per_block"
+    m_phi_group_retraction     = "chart",        # "chart" | "group_log" (exact Log(U e^{-eta xi}); pullback_group/fisher_group only)
+        
+    m_phi_group_trust_radius      = 0.1,
+    m_phi_fisher_rotation_weight  = 2.0,       # fisher_group only: completion weight on belief-invisible rotations
+
+    #################################
+    #    Embedding/Priors M-step
+    #        Learning Rates
+    #################################
+
+    m_p_mu_lr                  = 0.005,     #0.005
+    m_p_sigma_lr               = 0.001,       
+    m_phi_lr                   = 0.003,     #0.003
+    
+    
+    #################################
+    #      Other M-Step LR's
+    #################################
+      
+    m_pos_phi_lr               = 0.003,      #0.001?
+     
+    m_decode_mu_lr             = 0.005,       # 0.025?
+    m_decode_sigma_lr          = 0.001,       # 0.001
+      
+    m_relational_score_lr      = 0.01,        # 0.005 0.01
+    m_relational_content_lr    = 0.0025,      # 0.005   0.0025
+      
+    m_block_mlp_lr             = 0.005,      #0.0075?
+    m_layernorm_lr             = 0.005,      # 0.005
+    
+    m_per_type_hidden_bias_lr  = 0.0025,    
+    
+    #################################
+    #        Weight Decays
+    #################################
+    weight_decay               = 0.01,
+    phi_weight_decay           = 0.1,    
+    sigma_weight_decay         = 0,      
+    mu_weight_decay            = 0,       
+
+    #################################
+    #   Numerics/Speed
+    #################################
+  
     amp_dtype                            = 'bf16',        # None=fp32 | 'bf16' , 'fp16'. Sigma must be at least fp32
     fp32_matmul_precision                = "highest",          # None (leave as-is) | "highest" | "high" | "medium" ("high" permits TF32 on the decode/energy GEMMs)
+        
+    decode_ce_checkpoint                 = "auto",     # "auto" | "auto_aggregate" (saves memory with recompute)
+    projected_cov_recovery_precision     = "fp32",     # "fp64" | "fp32"
+    projected_factor_route               = "gram",     # "gram" | "cholesky_qr2 (slower unless recovery actually trips)"    
+   
+    frame_pair_fp64_escalation           = False,
+    projected_cov_condition_recovery     = False,
+    predictive_covariance_checkpoint     = False,       # moment_matched only: recompute the (B,N,K,K) update in backward; bit-identical.
+        
+    projected_gram_condition_tol         = 1e-4,
+    projected_factor_condition_tol       = 3e-4,
+    frame_pair_condition_tol             = 1e-4,       # inactive while the escalation is off
+   
     
-    grad_clip                            = 1.0,         # L2 gradient clip applied independently per optimizer role
-    
-    
-
-    # Working precision of the decode's a_v reduction. a_v accumulates
-    # terms of size 1/sigma_v and the result is divided by 2*tau (0.016 live), so the fp32 error is
-    # amplified twice. Measured max |a_v - fp64| at K=20: 5.2e-6 at sigma_v=4, 2.5e-3 at 1e-2,
-    # 2.2e-1 at 1e-4 -- the last being ~12 logits. NOTE the audit filed this as a cancellation
-    # defect in the expanded square and proposed differencing before squaring; that was measured and
-    # buys only ~1.8x, while the SAME algebra in float64 buys nine decades. It is a precision
-    # problem, not a factorization problem. sigma_log_embed trains freely against only the eps=1e-6
-    # floor, so this is harmless at init and about one order of magnitude of shrinkage from
-    # material; watch decode_sigma_v_min. Default "fp32" is bit-identical to every run on disk.
-    decode_av_precision                  = "fp32",     #  "fp32" | "fp64"
-
-
-    # Strict decoder ranking guard. When enabled, analytic
-    # fp32 decoders construct conservative score intervals and, if ANY row's winning interval
-    # overlaps a competitor, recompute the complete (B,N,V) decode in differentiable float64.
-    # That is an accuracy diagnostic, not a production-safe fallback: at B=64, N=128, V=50,257
-    # the promoted logits alone occupy about 3.1 GiB before backward intermediates. Keep it
-    # opt-in so the default chunked route remains streamed and bounded.
-    decode_ranking_fp64_escalation       = False,             
-     
-     
-     
-                                                 
-      
-    skip_belief_sigma_update             = False,        # skip the belief-channel sigma E-step update
-    
-    generate_embedding_figures           = True,
 )
 
 # kl_max is the numerical safety-net clamp on EVERY divergence (KL(q||p), pairwise energy),
@@ -394,11 +333,6 @@ config = dict(
 # so it binds only on genuine NaN/inf/Cholesky blowups; F is provably kl_max-independent below the
 # ceiling (safe_kl_clamp is the identity there). See docs/2026-06-21-edits.md.
 config["kl_max"] = 8 * config["embed_dim"]
-
-
-
-
-
 
 
 
@@ -595,7 +529,7 @@ def _run_once(
     from vfe3.model.model import VFEModel
     from vfe3.run_artifacts import RunArtifacts, finalize_run
 
-    cfg = VFE3Config(**{**config, "seed": seed})         # per-run seed override (config `seed` is the default)
+    cfg = VFE3Config(**{**config, "seed": seed})         # the run's seed, from SEEDS
     # Always shown, unlike the env-gated ConfigNotice: every setting this launcher names explicitly
     # that no active path reads under the resolved config, with the structural reason.
     inert = {name: reason for name, reason in cfg.inactive_fields().items() if name in config}
@@ -706,12 +640,11 @@ def _resolve_seeds(
     seeds:      Sequence[int],
     num_runs:   int,
 ) -> List[int]:
-    """Resolve click-to-run seeds without silently overriding a one-run config seed."""
+    """Return the first ``num_runs`` entries of ``SEEDS``, the single source of the model seed."""
     if isinstance(num_runs, bool) or not isinstance(num_runs, int) or num_runs <= 0:
         raise ValueError(f"NUM_RUNS must be a positive integer, got {num_runs!r}")
-    config_seed = run_config.get("seed")
-    if type(config_seed) is not int or config_seed < 0:
-        raise ValueError(f"config seed must be an exact non-negative integer, got {config_seed!r}")
+    if "seed" in run_config:
+        raise ValueError("the config dictionary must not set 'seed'; list the run seeds in SEEDS")
     # A resumed run restores the checkpoint's weights, optimizer, RNG and data cursor, so every
     # seed would continue the SAME run while its folder carries a different seed label. The
     # resolved list always has NUM_RUNS entries.
@@ -719,30 +652,19 @@ def _resolve_seeds(
         raise ValueError(
             "resume_from continues one checkpointed run and cannot be combined with more than one "
             f"seed (NUM_RUNS={num_runs}); set NUM_RUNS=1")
-    if seeds:
-        if any(type(seed) is not int or seed < 0 for seed in seeds):
-            raise ValueError("SEEDS must contain exact non-negative integers")
-        if len(set(seeds)) != len(seeds):
-            raise ValueError(f"SEEDS must be unique, got {list(seeds)!r}")
-        if len(seeds) < num_runs:
-            raise ValueError(
-                f"SEEDS lists {len(seeds)} seed(s) but NUM_RUNS={num_runs}; "
-                "provide at least NUM_RUNS seeds"
-            )
-        if num_runs == 1 and seeds[0] != config_seed:
-            raise ValueError(
-                f"SEEDS[0]={seeds[0]} conflicts with config seed={config_seed}; "
-                "make the one-run seed values agree"
-            )
-        return list(seeds[:num_runs])
-    if num_runs != 1:
-        raise ValueError(f"NUM_RUNS={num_runs} > 1 but SEEDS is empty; list one seed per run in SEEDS")
-    return [config_seed]
+    if any(type(seed) is not int or seed < 0 for seed in seeds):
+        raise ValueError("SEEDS must contain exact non-negative integers")
+    if len(set(seeds)) != len(seeds):
+        raise ValueError(f"SEEDS must be unique, got {list(seeds)!r}")
+    if len(seeds) < num_runs:
+        raise ValueError(
+            f"SEEDS lists {len(seeds)} seed(s) but NUM_RUNS={num_runs}; provide at least NUM_RUNS seeds")
+    return list(seeds[:num_runs])
 
 
 def main() -> None:
-    r"""Click-to-run entry: train ``NUM_RUNS`` independent seeds back-to-back (default: one run on the
-    config ``seed``). Run i uses ``SEEDS[i]``; each run is fully independent with its own seed-labeled
+    r"""Click-to-run entry: train ``NUM_RUNS`` independent seeds back-to-back (default: one run on
+    ``SEEDS[0]``). Run i uses ``SEEDS[i]``; each run is fully independent with its own seed-labeled
     artifacts directory. A multi-seed launch owns one atomically reserved group containing its request
     manifest and one comparable run folder per seed.
     """

@@ -257,9 +257,17 @@ def test_mu_weight_decay_is_validated(value: float) -> None:
 
 def test_resume_from_rejected_with_more_than_one_seed() -> None:
     with pytest.raises(ValueError, match="resume_from"):
-        train_vfe3._resolve_seeds({"seed": 6, "resume_from": "ckpt.pt"}, seeds=[6, 7], num_runs=2)
-    assert train_vfe3._resolve_seeds({"seed": 6, "resume_from": "ckpt.pt"},
-                                     seeds=[6], num_runs=1) == [6]
+        train_vfe3._resolve_seeds({"resume_from": "ckpt.pt"}, seeds=[6, 7], num_runs=2)
+    assert train_vfe3._resolve_seeds({"resume_from": "ckpt.pt"}, seeds=[6, 7], num_runs=1) == [6]
+
+
+def test_seeds_come_only_from_SEEDS() -> None:
+    assert "seed" not in train_vfe3.config and "seed" not in ablation.BASELINE_CONFIG
+    assert train_vfe3._resolve_seeds({}, seeds=[6, 54, 271], num_runs=2) == [6, 54]
+    with pytest.raises(ValueError, match="must not set 'seed'"):
+        train_vfe3._resolve_seeds({"seed": 6}, seeds=[6], num_runs=1)
+    with pytest.raises(ValueError, match="at least NUM_RUNS"):
+        train_vfe3._resolve_seeds({}, seeds=[], num_runs=1)
 
 
 @pytest.mark.parametrize("data_seed,expected", [(None, 23), (3, 3)])
