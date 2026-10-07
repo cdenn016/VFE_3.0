@@ -449,3 +449,27 @@ def test_diagnostic_rows_reject_a_changed_header(tmp_path: Path) -> None:
     assert list(csv.reader(io.StringIO(text))) == [["step", "v"], ["1", ""], ["2", "0.5"]]
     with pytest.raises(ValueError):
         artifacts.append_diagnostic_rows("x.csv", ("step", "w"), [{"step": 3, "w": 1.0}])
+
+
+def test_log_and_eval_phase_timings_are_columns_of_every_row(tmp_path: Path) -> None:
+    r"""LOG_TIMING_COLUMNS ride every metrics.csv row: log phases on log rows, eval phases on eval rows."""
+    cfg = _cfg(max_steps=4)
+    model = _model(cfg)
+    artifacts = ra.RunArtifacts(tmp_path / "run", cfg, model, save_model_artifacts=False)
+    _train(model, cfg, _loaders(cfg), artifacts=artifacts, log_interval=2, eval_interval=4)
+    rows = _rows(tmp_path / "run" / "metrics.csv")
+    assert [int(_num(row["step"])) for row in rows] == [2, 4]
+    for row in rows:
+        for column in ("log_diagnostics_ms", "log_group_stats_ms", "log_row_ms"):
+            assert math.isfinite(_num(row[column])) and _num(row[column]) >= 0.0
+    assert not math.isfinite(_num(rows[0]["eval_validation_ms"]))
+    for column in ("eval_validation_ms", "eval_val_diagnostics_ms", "eval_best_and_maps_ms",
+                   "eval_cadence_ms", "eval_gap_train_ms"):
+        assert math.isfinite(_num(rows[1][column])), column
+
+
+def test_host_eigvals_match_the_device_call() -> None:
+    from vfe3.metrics import eigvals_on_host
+
+    X = torch.randn(5, 3, 4, 4, dtype=torch.float64)
+    torch.testing.assert_close(eigvals_on_host(X), torch.linalg.eigvals(X), rtol=0, atol=0)

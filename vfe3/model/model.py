@@ -1645,7 +1645,8 @@ class VFEModel(nn.Module):
             b = beta.diagonal(dim1=-2, dim2=-1).to(torch.float64)              # (B, H, N) beta_ii^h
             b = b.reshape(-1, H, b.shape[-1]).transpose(-1, -2).reshape(-1, H)  # (B N, H)
             A = b.repeat_interleave(K // H, dim=-1).unsqueeze(-1) * W.reshape(-1, K, K)   # (B N, K, K) D_i W_i
-            rho = (torch.linalg.eigvals(A) + (1.0 if ops.attention_residual else 0.0)).abs().amax(dim=-1)
+            from vfe3.metrics import eigvals_on_host as _eigvals_on_host
+            rho = (_eigvals_on_host(A) + (1.0 if ops.attention_residual else 0.0)).abs().amax(dim=-1)
         d["relational_link_selfloop_spectral_radius_max"] = float(rho.max())
         d["relational_link_selfloop_spectral_radius_mean"] = float(rho.mean())
         return d
