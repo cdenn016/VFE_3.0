@@ -13,7 +13,9 @@ listed; the three fields whose defaults the working-tree ``vfe3/config.py`` flip
 a record lacks one), so the arms never inherit a default flip. Every base is its own experiment with
 its own directory and manifest.
 
-BUDGET. ``one_epoch``: ``max_steps = ceil(train tokens / (batch_size x max_seq_len))`` on the arm's
+BUDGET. ``base_protocol``: the base run's own ``max_steps`` and ``eval_interval`` (the 34.48 run:
+150,000 updates, 614.4M token presentations), with ``checkpoint_interval = max_steps``. ``one_epoch``:
+``max_steps = ceil(train tokens / (batch_size x max_seq_len))`` on the arm's
 dataset, ``eval_interval = max(1, max_steps // 20)`` (at least 20 validation points for Figure M3
 once ``max_steps >= 20``; every evaluation also writes the map snapshot of Figure S1) and
 ``checkpoint_interval = max_steps`` (one training checkpoint at the end, which holds the optimizer
@@ -52,13 +54,28 @@ base's except where declared. Rules:
   ``vfe3.baseline.width_ladder_rule``, which picks the width and ``max_steps``; the rule's record is
   written to ``<arm dir>/width_rule.json``. The table reads the best-validation checkpoint.
 
+* Confound controls (October 7, 2026 review of the 34.48 against 55.10 comparison). A baseline arm
+  may declare ``overrides`` (``BaselineConfig`` fields applied after ``baseline_overrides``); a
+  protocol field among them is a declared difference. "Per-type read table, ALiBi (as run)" repeats
+  the 55.10 configuration (``block_read``, ALiBi); the existing "Per-type table of the frame table's
+  size" row, matched to a causal-prior base, is the same table under the realization's uniform causal
+  prior. From the as-run arm, one change each: the realization's optimizer (Adam ``beta_2 = 0.999``,
+  no decay on matrices, decay 0.1 on the table as on the frames; the realization's 0.01 MLP decay and
+  per-role clipping remain different), a read-and-write table (``block_rw``), and the shared post-norm
+  layout (``norm_placement='post_shared'``). VFE arms: the realization with the ALiBi prior, and the
+  covariance-blind routing cost ``relational_routing='mean_distance'``. :data:`TIER_A` lists the
+  baseline controls and :data:`TIER_B` the VFE retraining controls.
+
 An arm whose code is not in this build (a missing config field or ``vfe3.baseline`` /
 ``train_baseline``) is reported as unavailable with the reason; an arm that does not apply to the
 base as inapplicable; an arm whose config the validator rejects as invalid (a training launch
 refuses to start while a selected arm is invalid).
 
 SEEDS: ``seeds`` lists ints (``data_seed = seed``) or explicit ``(seed, data_seed)`` pairs, shared
-by every arm so replicates are paired across arms.
+by every arm so replicates are paired across arms. Under the ``base_protocol`` budget the evaluated
+arm's replicate whose pair equals the base run's own ``(seed, data_seed)`` is the base run itself: it is
+reused (skipped in training, listed in the manifest, and read by the compute-matched rule) rather than
+retrained.
 
 LAYOUT: ``<out_root>/<base>/<budget>/<arm slug>/<test PPL>_<slug>_s<seed>_d<data seed>/``. An (arm,
 seed) pair whose run directory already holds a complete ``summary.json`` (finite ``test_ce``) is
@@ -84,20 +101,24 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 ROOT = Path(__file__).resolve().parent
 
 CONFIG: Dict[str, Any] = {
-    "bases":             ["diag_K128", "diag_K64", "full_K64"],   # keys of BASES
-    "arms":              None,             # None: every row of ARMS in table order; or a list of labels
-    "budget":            "one_epoch",      # key of BUDGETS
-    "seeds":             [6, 23, 54],      # int -> data_seed = seed; (seed, data_seed) pairs allowed
+    "bases":             ["k128_exp"],     # keys of BASES
+    "arms":              "TIER_A",         # None: every row of ARMS in table order; a list of labels;
+                                           # or "TIER_A" / "TIER_B" (the confound controls)
+    "budget":            "base_protocol",  # key of BUDGETS
+    "seeds":             [(6, 3), (23, 23), (54, 54)],   # (seed, data_seed); (6, 3) is the 34.48 run's
     "out_root":          "vfe3_runs/paper_arms",
     "dry_run":           True,             # True: resolve, validate and print the plan; train nothing
     "device":            None,             # None -> cuda when available
     "calibration_steps": 200,              # matched-compute baseline: steps of each width's calibration run
     "width_ladder":      (1, 1.5, 2, 3, 4, 6, 8),   # matched-compute ladder, multiples of the matched width
-    "baseline_overrides": {},              # BaselineConfig optimizer fields for every baseline arm,
-                                           # e.g. {"lr": 1e-3} from train_baseline's validation lr sweep
+    "baseline_overrides": {"lr": 3e-3},    # BaselineConfig optimizer fields for every baseline arm:
+                                           # 3e-3 is the validation choice of the October 6 sweep
 }
 
 BASES: Dict[str, str] = {
+    # The evaluated K=128 exponential-chart run of the paper (34.48 test PPL).
+    "k128_exp":  "vfe3_runs/34.48_wikitext-103_K128_block_glk_linear_mlp_s6",
+    # Bases of the earlier study (not paper results).
     "diag_K128": "D:/DATA_KEEP/39.77_wikitext-103_K128_n=128",
     "diag_K64":  "D:/DATA_KEEP/52.91_wikitext-103_K64_n=128",
     "full_K64":  "vfe3_runs/Full_Gaussian_mom-match_Template_routing/"
@@ -108,6 +129,7 @@ BASES: Dict[str, str] = {
 _RETRAINING = "Retraining arms at the evaluated configuration and token budget"
 _BASELINES = "Conventional transformers: same tokenizer, context, stride, and budget"
 _WORD_LEVEL = "Word-level protocol, every target scored"
+_CONFOUNDS = "Confound controls for the per-type read-table comparison"
 
 WORD_DATASET = "wikitext-103-word-eos"
 EVALUATED = "Evaluated: learned frames, decayed stored covariance"
@@ -199,6 +221,27 @@ def _word_level_base(base_dataset: str) -> Optional[str]:
 #   baseline              vfe3.baseline spec: {"per_type_table": ..., "compute_matched": bool}
 #   dataset               dataset override (word level)
 #   matched_to_arm        baseline matched to another arm's resolved config instead of the base
+def _alibi_already(cfg: Any) -> Optional[str]:
+    if getattr(cfg, "beta_attention_prior", None) == "causal_alibi":
+        return "the base already uses the ALiBi prior"
+    return None
+
+
+def _no_kernel_routing(cfg: Any) -> Optional[str]:
+    if getattr(cfg, "attention_mode", None) != "projected_predictive":
+        return "mean_distance routing requires attention_mode='projected_predictive'"
+    if getattr(cfg, "predictive_readout", "kernel") != "kernel":
+        return "mean_distance routing requires predictive_readout='kernel'"
+    if getattr(cfg, "relational_routing", "gaussian_kl") != "gaussian_kl":
+        return "the base does not route by the Gaussian KL"
+    return None
+
+
+_ALIBI = {"beta_attention_prior": "causal_alibi"}
+# The realization's optimizer on the baseline: Adam beta_2 0.999 and no decay on matrices (the prior
+# means, comparison/content maps and decoder are undecayed), decay 0.1 on the table as on the frames.
+_REALIZATION_OPTIMIZER = {"adam_beta2": 0.999, "weight_decay": 0.0, "per_type_table_weight_decay": 0.1}
+
 ARMS: Dict[str, Dict[str, Any]] = {
     EVALUATED: {
         "group": _RETRAINING, "slug": "evaluated", "vfe": {}},
@@ -244,6 +287,23 @@ ARMS: Dict[str, Dict[str, Any]] = {
         "baseline": {"per_type_table": "none", "compute_matched": True}},
     "Per-type table of the frame table's size": {
         "group": _BASELINES, "slug": "tf_type_table", "baseline": {"per_type_table": "block_read"}},
+    "Learned frames, ALiBi prior": {
+        "group": _CONFOUNDS, "slug": "alibi_prior", "vfe": dict(_ALIBI), "inapplicable": _alibi_already},
+    "Covariance-blind routing (mean distance)": {
+        "group": _CONFOUNDS, "slug": "mean_distance", "vfe": {"relational_routing": "mean_distance"},
+        "requires": ("relational_routing",), "inapplicable": _no_kernel_routing},
+    "Per-type read table, ALiBi (as run)": {
+        "group": _CONFOUNDS, "slug": "tf_type_table_alibi",
+        "baseline": {"per_type_table": "block_read", "overrides": dict(_ALIBI)}},
+    "Per-type read table, ALiBi, realization optimizer": {
+        "group": _CONFOUNDS, "slug": "tf_type_table_alibi_opt",
+        "baseline": {"per_type_table": "block_read", "overrides": {**_ALIBI, **_REALIZATION_OPTIMIZER}}},
+    "Per-type read-and-write table, ALiBi": {
+        "group": _CONFOUNDS, "slug": "tf_type_table_rw_alibi",
+        "baseline": {"per_type_table": "block_rw", "overrides": dict(_ALIBI)}},
+    "Per-type read table, ALiBi, shared post-norm": {
+        "group": _CONFOUNDS, "slug": "tf_type_table_alibi_postnorm",
+        "baseline": {"per_type_table": "block_read", "overrides": {**_ALIBI, "norm_placement": "post_shared"}}},
     "Gaussian attention": {
         "group": _WORD_LEVEL, "slug": "word_gaussian", "dataset": WORD_DATASET,
         "vfe": {"vocab_size": _word_vocab_size, "decode_ce_checkpoint": "auto_aggregate"}},
@@ -266,6 +326,25 @@ BASELINE_PROTOCOL_FIELDS: Dict[str, str] = {
     "alibi_slope": "alibi_slope", "decode_bias": "decode_bias",
     "decode_unigram_prior": "decode_unigram_prior", "unigram_kappa": "unigram_kappa",
 }
+# Confound controls for the 34.48 against 55.10 comparison (October 7, 2026). TIER_A: conventional
+# baselines (about 1.5 GPU-hours each at the base protocol, the compute-matched arm about as long as
+# the evaluated run). TIER_B: VFE retraining arms (about 16 GPU-hours each).
+TIER_A: Tuple[str, ...] = (
+    "Per-type read table, ALiBi (as run)",
+    "Per-type table of the frame table's size",
+    "Per-type read table, ALiBi, realization optimizer",
+    "Per-type read-and-write table, ALiBi",
+    "Per-type read table, ALiBi, shared post-norm",
+    "Matched measured compute",
+)
+TIER_B: Tuple[str, ...] = (
+    EVALUATED,
+    "Identity frames, stored covariance without decay",
+    "Identity frames, per-type additive table of equal size",
+    "Learned frames, ALiBi prior",
+    "Covariance-blind routing (mean distance)",
+)
+
 # Fields the compute-matched baseline changes by construction (width rule, calibrated steps, cadence).
 COMPUTE_MATCHED_FIELDS: Tuple[str, ...] = (
     "embed_dim", "n_heads", "max_steps", "eval_interval", "checkpoint_interval")
@@ -293,6 +372,7 @@ class Base:
     recorded_params:  Optional[int] = None                           # config.json n_params
     tokens_per_s:     Optional[float] = None                         # measured wall-clock throughput
     throughput_source: Optional[str] = None
+    data_seed:        Optional[int] = None                           # provenance.json data-order seed
 
 
 def _quiet_config(build: Callable[[], Any]) -> Any:
@@ -325,6 +405,12 @@ def load_base(name: str, path: Union[str, Path]) -> Base:
     base = Base(name=name, run_dir=run_dir, cfg=cfg, dataset=dataset, dropped=dict(dropped),
                 pinned=pinned, defaulted=defaulted,
                 recorded_params=record.get("n_params") if isinstance(record.get("n_params"), int) else None)
+    provenance_path = run_dir / "provenance.json"
+    if provenance_path.is_file():
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        seed_value = provenance.get("data_seed") if isinstance(provenance, dict) else None
+        if isinstance(seed_value, int) and not isinstance(seed_value, bool):
+            base.data_seed = seed_value
     summary_path = run_dir / "summary.json"
     if summary_path.is_file():
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -350,7 +436,13 @@ def one_epoch(cfg: Any, dataset: str) -> Dict[str, int]:
             "checkpoint_interval": max_steps}
 
 
-BUDGETS: Dict[str, Callable[[Any, str], Dict[str, int]]] = {"one_epoch": one_epoch}
+def base_protocol(cfg: Any, dataset: str) -> Dict[str, int]:
+    r"""The base run's own step budget and validation cadence, one checkpoint at the end."""
+    max_steps = int(cfg.max_steps)
+    return {"max_steps": max_steps, "eval_interval": int(cfg.eval_interval), "checkpoint_interval": max_steps}
+
+
+BUDGETS: Dict[str, Callable[[Any, str], Dict[str, int]]] = {"one_epoch": one_epoch, "base_protocol": base_protocol}
 
 
 def rebuild(cfg: Any, overrides: Mapping[str, Any], source: str) -> Any:
@@ -505,6 +597,7 @@ class ArmPlan:
     tokens:       Optional[int] = None                  # training-token presentations per run
     est_hours:    Optional[float] = None
     notes:        List[str] = field(default_factory=list)
+    reused:       List[Tuple[int, int]] = field(default_factory=list)   # seed pairs served by the base run
 
 
 def seed_pairs(seeds: Sequence[Union[int, Sequence[int]]]) -> List[Tuple[int, int]]:
@@ -640,14 +733,16 @@ def _resolve_baseline(
             return
         matched = other.cfg
     options = spec["baseline"]
+    arm_overrides = dict(options.get("overrides", {}))
     try:
         plan.cfg = api.BaselineConfig.matched_to(matched, per_type_table=options.get("per_type_table", "none"),
-                                                 **dict(baseline_overrides or {}))
+                                                 **{**dict(baseline_overrides or {}), **arm_overrides})
     except (ValueError, TypeError) as exc:
         plan.status, plan.reason = "invalid", f"BaselineConfig.matched_to rejected the base: {exc}"
         return
     plan.matched_cfg = matched
-    plan.diff = check_baseline_arm(matched, plan.cfg)
+    # A protocol field set by the arm's own overrides is a declared difference.
+    plan.diff = check_baseline_arm(matched, plan.cfg, declared=tuple(arm_overrides))
     for seed, _ in plan.seeds:
         _with_seed(plan.cfg, seed)
     if options.get("compute_matched"):
@@ -693,6 +788,11 @@ def build_plan(
         evaluated.notes.append(
             f"total parameters {total:,} equal the base record" if total == base.recorded_params
             else f"total parameters {total:,} differ from the base record {base.recorded_params:,}")
+    if (evaluated is not None and budget == "base_protocol" and base.data_seed is not None
+            and (int(base.cfg.seed), base.data_seed) in evaluated.seeds and is_complete(base.run_dir)):
+        evaluated.reused = [(int(base.cfg.seed), base.data_seed)]
+        evaluated.notes.append(f"seed pair {evaluated.reused[0]} is the base run itself and is reused, "
+                               "not retrained")
     for plan in plans:
         if plan.status == "deferred" and evaluated is not None:
             plan.est_hours = evaluated.est_hours
@@ -746,7 +846,7 @@ def format_plan(base: Base, plans: Sequence[ArmPlan], *, budget: str) -> str:
         disk = (state + 8 * params["stored"] / 1e9) if state is not None else None
         hours = plan.est_hours
         if hours is not None and plan.status in ("ready", "deferred"):
-            total_hours += hours * len(plan.seeds)
+            total_hours += hours * (len(plan.seeds) - len(plan.reused))
         if disk is not None and plan.status in ("ready", "deferred"):
             total_disk += disk * len(plan.seeds)
         lines.append(
@@ -800,6 +900,34 @@ def find_complete_run(arm_dir: Path, label: str) -> Optional[Path]:
     return None
 
 
+def completed_run(
+    exp_dir:   Path,
+    label:     str,
+    seed:      int,
+    data_seed: int,
+
+    *,
+    base:      Optional[Base] = None,
+    budget:    Optional[str] = None,
+    arms:      Optional[Mapping[str, Mapping[str, Any]]] = None,
+) -> Optional[Path]:
+    r"""The complete run of arm ``label`` at ``(seed, data_seed)``, or None.
+
+    A run in the experiment directory wins. Otherwise, under the ``base_protocol`` budget, the
+    evaluated arm at the base run's own ``(seed, data_seed)`` is the base run itself when it is
+    complete: the same configuration, budget, and seeds.
+    """
+    slug = (ARMS if arms is None else arms)[label]["slug"]
+    found = find_complete_run(exp_dir / slug, run_label(slug, seed, data_seed))
+    if found is not None:
+        return found
+    if (base is not None and budget == "base_protocol" and label == EVALUATED
+            and base.data_seed is not None and (int(base.cfg.seed), base.data_seed) == (seed, data_seed)
+            and is_complete(base.run_dir)):
+        return base.run_dir
+    return None
+
+
 def experiment_dir(out_root: Union[str, Path], base: str, budget: str) -> Path:
     root = Path(out_root)
     return (root if root.is_absolute() else ROOT / root) / base / budget
@@ -824,7 +952,7 @@ def build_manifest(
     for label, spec in arms.items():
         runs = []
         for seed, data_seed in seeds:
-            found = find_complete_run(exp_dir / spec["slug"], run_label(spec["slug"], seed, data_seed))
+            found = completed_run(exp_dir, label, seed, data_seed, base=base, budget=budget, arms=arms)
             if found is not None:
                 runs.append(str(found))
         manifest_arms[label] = {"group": spec["group"], "runs": runs}
@@ -895,6 +1023,8 @@ def compute_matched_config(
     width_ladder:      Sequence[float],
     device:            Optional[str] = None,
     logger:            logging.Logger,
+    base:              Optional[Base] = None,
+    budget:            Optional[str] = None,
 ) -> Optional[Any]:
     r"""The compute-matched baseline config, or None while the evaluated arm has no complete run.
 
@@ -912,8 +1042,7 @@ def compute_matched_config(
     from vfe3.data.datasets import cached_token_count
 
     api = _baseline_api()
-    slug = ARMS[EVALUATED]["slug"]
-    runs = [find_complete_run(exp_dir / slug, run_label(slug, s, d)) for s, d in plan.seeds]
+    runs = [completed_run(exp_dir, EVALUATED, s, d, base=base, budget=budget) for s, d in plan.seeds]
     runs = [run for run in runs if run is not None]
     if not runs:
         logger.warning("%s deferred: the evaluated arm has no complete run yet", plan.label)
@@ -991,13 +1120,14 @@ def run_plan(
         cfg = plan.cfg
         if plan.status == "deferred":
             cfg = compute_matched_config(plan, exp_dir, calibration_steps=calibration_steps,
-                                         width_ladder=width_ladder, device=device, logger=logger)
+                                         width_ladder=width_ladder, device=device, logger=logger,
+                                         base=base, budget=budget)
             if cfg is None:
                 continue
         arm_dir = exp_dir / plan.slug
         for seed, data_seed in plan.seeds:
             label = run_label(plan.slug, seed, data_seed)
-            done = find_complete_run(arm_dir, label)
+            done = completed_run(exp_dir, plan.label, seed, data_seed, base=base, budget=budget, arms=arms)
             if done is not None:
                 logger.info("complete, skipped: %s", done)
                 continue
@@ -1022,11 +1152,17 @@ def main(config: Optional[Mapping[str, Any]] = None, bases: Optional[Mapping[str
     if budget not in BUDGETS:
         raise SystemExit(f"budget {budget!r} is not one of {sorted(BUDGETS)}")
     seeds = seed_pairs(config["seeds"])
+    labels = config.get("arms")
+    if isinstance(labels, str):
+        tiers = {"TIER_A": TIER_A, "TIER_B": TIER_B}
+        if labels not in tiers:
+            raise SystemExit(f"arms {labels!r} is not None, a list of labels, or one of {sorted(tiers)}")
+        labels = list(tiers[labels])
     status = 0
     for name in config["bases"]:
         started = time.perf_counter()
         base = load_base(name, bases[name])
-        plans = build_plan(base, budget=budget, seeds=seeds, labels=config.get("arms"),
+        plans = build_plan(base, budget=budget, seeds=seeds, labels=labels,
                            baseline_overrides=config.get("baseline_overrides"))
         print(format_plan(base, plans, budget=budget), flush=True)
         print(f"(resolved in {time.perf_counter() - started:.1f}s)", flush=True)

@@ -122,7 +122,8 @@ def _paper_artifacts_rows() -> Dict[str, str]:
 def test_arm_labels_and_groups_are_the_manuscript_rows() -> None:
     rows = _paper_artifacts_rows()
     assert list(pa.ARMS) == list(rows)
-    groups = {"_RETRAINING": pa._RETRAINING, "_BASELINES": pa._BASELINES, "_WORD_LEVEL": pa._WORD_LEVEL}
+    groups = {"_RETRAINING": pa._RETRAINING, "_BASELINES": pa._BASELINES, "_WORD_LEVEL": pa._WORD_LEVEL,
+              "_CONFOUNDS": pa._CONFOUNDS}
     assert [spec["group"] for spec in pa.ARMS.values()] == [groups[rows[label]] for label in rows]
     assert len({spec["slug"] for spec in pa.ARMS.values()}) == len(pa.ARMS)
 
@@ -172,6 +173,9 @@ def test_vfe_arms_differ_from_the_base_only_in_declared_fields(tmp_path: Path, c
             continue
         if any(name not in known for name in spec.get("requires", ())):
             assert plan.status == "unavailable", label
+            continue
+        if spec.get("inapplicable") is pa._alibi_already and base.cfg.beta_attention_prior == "causal_alibi":
+            assert plan.status == "inapplicable", label        # the tiny base already uses ALiBi
             continue
         assert plan.status == "ready", (label, plan.reason)
         declared = set(spec["vfe"]) | set(spec.get("coerced", ()))
@@ -336,7 +340,8 @@ def test_dry_run_prints_the_plan_and_trains_nothing(tmp_path: Path, caches: Path
     monkeypatch.setattr(experiment, "run_vfe", refuse)
     run = _write_base(tmp_path, _tiny_cfg())
     out = tmp_path / "out"
-    config = {**pa.CONFIG, "bases": ["tiny"], "seeds": [1, (2, 5)], "out_root": str(out), "dry_run": True}
+    config = {**pa.CONFIG, "bases": ["tiny"], "arms": None, "budget": "one_epoch", "seeds": [1, (2, 5)],
+              "out_root": str(out), "dry_run": True}
     assert pa.main(config, bases={"tiny": str(run)}) == 0
     printed = capsys.readouterr().out
     for label in pa.ARMS:

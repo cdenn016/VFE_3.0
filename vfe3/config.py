@@ -339,10 +339,11 @@ class VFE3Config:
     t5_max_distance:                  int             = 128          # t5_relative_bias only: log-bucketing horizon
     t5_learnable_bias:                bool            = False        # t5_relative_bias only: learn the bucket table
 
-    # "gaussian_kl" | "noisy_query"
+    # "gaussian_kl" | "noisy_query" | "mean_distance"
     # projected_predictive with predictive_readout="kernel" only: routing cost.
-    #   gaussian_kl  KL between the projected query and key Gaussians
-    #   noisy_query  the query mean treated as a noisy measurement (GL(K) v2, Remark 9)
+    #   gaussian_kl    KL between the projected query and key Gaussians
+    #   noisy_query    the query mean treated as a noisy measurement (GL(K) v2, Remark 9)
+    #   mean_distance  ||a_i - b_j||^2 / 2 of the projected means: the covariance-blind control
     relational_routing:               str             = "gaussian_kl"
 
     ##################################################
@@ -656,9 +657,9 @@ class VFE3Config:
         full_link = self.attention_mode == "projected_gradient"
         # attention_residual and predictive_covariance are predictive-readout knobs; under
         # projected_gradient they are inactive (inactive_fields), not errors.
-        _require(self.relational_routing, ("gaussian_kl", "noisy_query"), "relational_routing")
-        if self.relational_routing == "noisy_query" and full_link:
-            raise ValueError("relational_routing='noisy_query' requires attention_mode='projected_predictive'")
+        _require(self.relational_routing, ("gaussian_kl", "noisy_query", "mean_distance"), "relational_routing")
+        if self.relational_routing != "gaussian_kl" and full_link:
+            raise ValueError(f"relational_routing={self.relational_routing!r} requires attention_mode='projected_predictive'")
         from vfe3.model.minimal_agent import MINIMAL_AGENT_INFERENCE, PREDICTIVE_READOUTS
         _require(self.predictive_readout, PREDICTIVE_READOUTS, "predictive_readout")
         _require(self.minimal_agent_inference, MINIMAL_AGENT_INFERENCE, "minimal_agent_inference")

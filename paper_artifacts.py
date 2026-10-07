@@ -35,6 +35,7 @@ from pathlib import Path
 _RETRAINING = "Retraining arms at the evaluated configuration and token budget"
 _BASELINES = "Conventional transformers: same tokenizer, context, stride, and budget"
 _WORD_LEVEL = "Word-level protocol, every target scored"
+_CONFOUNDS = "Confound controls for the per-type read-table comparison"
 
 CONFIG = {
     "arms": {
@@ -53,6 +54,12 @@ CONFIG = {
         "Matched context-processing parameters": {"group": _BASELINES, "runs": []},
         "Matched measured compute": {"group": _BASELINES, "runs": []},
         "Per-type table of the frame table's size": {"group": _BASELINES, "runs": []},
+        "Learned frames, ALiBi prior": {"group": _CONFOUNDS, "runs": []},
+        "Covariance-blind routing (mean distance)": {"group": _CONFOUNDS, "runs": []},
+        "Per-type read table, ALiBi (as run)": {"group": _CONFOUNDS, "runs": []},
+        "Per-type read table, ALiBi, realization optimizer": {"group": _CONFOUNDS, "runs": []},
+        "Per-type read-and-write table, ALiBi": {"group": _CONFOUNDS, "runs": []},
+        "Per-type read table, ALiBi, shared post-norm": {"group": _CONFOUNDS, "runs": []},
         "Gaussian attention": {"group": _WORD_LEVEL, "runs": []},
         "Conventional transformer, matched": {"group": _WORD_LEVEL, "runs": []},
     },
