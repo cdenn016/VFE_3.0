@@ -1385,9 +1385,14 @@ _VAL_MINIMAL_AGENT_DIAG_KEYS = tuple("val_relational_minimal_agent_" + key for k
 # Fixed training sample for the generalization gap: windows of the TRAIN split drawn by a generator
 # with this fixed seed (independent of cfg.seed and the data seed, so every seed of a multi-seed
 # study scores the same windows), scored under the validation protocol, and sized to the validation
-# split's scored-target count, capped here.
+# split's scored-target count, capped here. The cap (32,768 targets, 1,024 windows at stride 32)
+# binds on WikiText-103, so the sample costs about an eighth of a validation pass per evaluation
+# instead of a second full pass (2026-10-07). Estimated, not measured: with a per-token CE spread of
+# about 2.5 nats and tokens correlated within a window, its mean CE has a standard error of a few
+# hundredths of a nat. The post-hoc evaluator keeps its own larger cap
+# (vfe3.posthoc.streams.TRAIN_SAMPLE_MAX_TARGETS).
 TRAIN_SAMPLE_SEED:        int = 0
-TRAIN_SAMPLE_MAX_TARGETS: int = 262_144
+TRAIN_SAMPLE_MAX_TARGETS: int = 32_768
 
 # Fixed validation windows for the per-layer residual ratio and per-head attention statistics.
 DIAGNOSTIC_WINDOWS:       int = 8
@@ -2924,6 +2929,22 @@ def _training_cursor_fields(
 
 _MATMUL_PRECISION_LADDER: Tuple[str, ...] = ("medium", "high", "highest")
 
+# Wall-clock cost of the work a logging or evaluation step adds outside the timed train step, one
+# metrics.csv column each (NaN when that phase did not run on the row). Each phase is bracketed by a
+# device synchronization, so queued GPU work is charged to the phase that issued it.
+LOG_TIMING_COLUMNS: Tuple[str, ...] = (
+    "log_diagnostics_ms", "log_group_stats_ms", "log_row_ms",
+    "eval_validation_ms", "eval_sample_ms", "eval_val_diagnostics_ms", "eval_best_and_maps_ms",
+    "eval_cadence_ms", "eval_gap_train_ms",
+)
+
+
+def _synced_ms(device: torch.device) -> float:
+    r"""Milliseconds on the host clock after the device has drained its queued work."""
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    return time.perf_counter() * 1000.0
+
 
 @contextlib.contextmanager
 def _float32_matmul_precision(policy: str) -> Iterator[None]:
@@ -3425,6 +3446,7 @@ def train(
         # performs no exact-count host materialization, extra unscale_, or grad-norm pass; its
         # device-side partition/zero-count predicates ride the existing scalar barrier.
         step_metrics: Optional[Dict[str, float]] = {} if (do_log or do_csv) else None
+        phase_ms: Dict[str, float] = {}                       # LOG_TIMING_COLUMNS of this step
         if hasattr(optimizer, "_collect_gauge_diag"):        # D1/EXP-8: sparse log/eval diagnostics
             optimizer._collect_gauge_diag = bool(do_log or do_csv or do_eval)
             if optimizer._collect_gauge_diag:
@@ -3436,6 +3458,7 @@ def train(
             # provenance of train_loss/train_ce (train_ce is captured pre-step inside train_step). Under
             # no_grad, so no weight change,
             # leaving the train_step RNG stream and weights byte-identical.
+            _t0 = _synced_ms(device)
             try:
                 d = model.diagnostics(tokens)
             except Exception as exc:                         # optional probes cannot stop training
@@ -3445,22 +3468,27 @@ def train(
                     "attention_entropy", "total", "effective_rank", "holonomy_deviation",
                     "gauge_trace_spread",
                 )}
+            phase_ms["log_diagnostics_ms"] = _synced_ms(device) - _t0
         # generalization_gap's train side under the validation protocol when that protocol is the
         # sliding window (eval_stride < max_seq_len); pre-step, like train_ce. None keeps train_ce.
         gap_train_ce: Optional[float] = None
         if (do_eval and do_csv and cfg.eval_stride is not None
                 and cfg.eval_stride < cfg.max_seq_len):
+            _t0 = _synced_ms(device)
             gap_train_ce = _eval_protocol_train_ce(model, tokens, targets, cfg.eval_stride)
+            phase_ms["eval_gap_train_ms"] = _synced_ms(device) - _t0
         # Named-group update ratios (audit 2026-09-28): host copies of the pre-step parameters on a
         # persisted log/eval row only, outside the timed train step. Reading parameters does not
         # change the step.
         update_before: Optional[Dict[str, torch.Tensor]] = None
         group_stats: Dict[str, float] = {}
         if do_csv:
+            _t0 = _synced_ms(device)
             try:
                 update_before = _parameter_snapshot(model)
             except Exception as exc:
                 _record_diagnostic_failure(diagnostics_failures, "parameter_snapshot", exc, logger)
+            phase_ms["log_group_stats_ms"] = _synced_ms(device) - _t0
         step_status: Dict[str, bool] = {}
         if timer is not None:
             timer.start_step()
@@ -3475,11 +3503,14 @@ def train(
         if timer is not None:
             timer.finish_step(n_tokens=tokens.numel())
         if update_before is not None:
+            _t0 = _synced_ms(device)
             try:
                 group_stats = _group_update_statistics(model, update_before)
             except Exception as exc:
                 _record_diagnostic_failure(diagnostics_failures, "group_update_statistics", exc, logger)
             update_before = None                              # release the host copy immediately
+            phase_ms["log_group_stats_ms"] = (phase_ms.get("log_group_stats_ms", 0.0)
+                                              + _synced_ms(device) - _t0)
         if step_metrics is not None and _GROUP_GRAD_ERROR_KEY in step_metrics:
             _record_diagnostic_failure(diagnostics_failures, "group_gradient_norms",
                                        RuntimeError(step_metrics.pop(_GROUP_GRAD_ERROR_KEY)), logger)
@@ -3561,7 +3592,9 @@ def train(
             if (_final_validation_out is not None and terminal_callback is None
                     and step + 1 == n_steps):
                 terminal_validation_signature = _terminal_validation_signature(model, val_loader)
+            _t0 = _synced_ms(device)
             m = evaluate(model, val_loader, tokens_per_char=tokens_per_char, device=device)
+            phase_ms["eval_validation_ms"] = _synced_ms(device) - _t0
             if terminal_validation_signature is not None:
                 terminal_validation_metrics = dict(m)
             logger.info(" \n Validation @ step %d:", step + 1)
@@ -3583,6 +3616,7 @@ def train(
                 else _default_sample_decoder(cfg, dataset=sample_dataset,
                      cache_dir=getattr(getattr(loader, "dataset", None), "cache_dir", None)))
             if decode is not None:
+                _t0 = _synced_ms(device)
                 try:
                     prompt = tokens[:1, :sample_prompt_len]                       # (1, P) seq-0 prompt
                     p_txt, c_txt = _periodic_generation(
@@ -3593,6 +3627,7 @@ def train(
                     raise
                 except Exception as exc:                                          # never let sampling kill training
                     logger.warning("       (sample generation failed: %s)", exc)
+                phase_ms["eval_sample_ms"] = _synced_ms(device) - _t0
             last_val = {
                 "ce":             m["ce"],
                 "ppl":            m["ppl"],
@@ -3609,6 +3644,7 @@ def train(
                 # carried forward as if fresh (audit 2026-07-01 F11), and a viz/replay fault never
                 # kills training.
                 validation_diagnostics: Optional[ValidationDiagnostics] = None
+                _t0 = _synced_ms(device)
                 try:
                     if vfe_model:
                         validation_diagnostics = _val_diagnostics(
@@ -3621,6 +3657,8 @@ def train(
                     logger.warning("       (validation diagnostics failed: %s); continuing", exc)
                     _record_diagnostic_failure(diagnostics_failures, "val_diagnostics", exc, logger)
                     last_val_diag.update({k: float("nan") for k in val_diag_keys})
+                phase_ms["eval_val_diagnostics_ms"] = _synced_ms(device) - _t0
+                _t0 = _synced_ms(device)
                 try:
                     artifacts.maybe_save_best(step + 1, model, m["ppl"])
                     # Per-layer/per-head attention heatmap grid for this eval (off the graph, seq 0
@@ -3643,8 +3681,10 @@ def train(
                     # until the next evaluation overwrites it. Release after the final consumer on
                     # enabled, disabled, and failed-map branches before training resumes.
                     validation_diagnostics = None
+                    phase_ms["eval_best_and_maps_ms"] = _synced_ms(device) - _t0
                 # Fixed training-sample CE, residual/attention CSVs and the map snapshot (audit
                 # 2026-09-28). Each part is exception-isolated and counted; RNG is forked inside.
+                _t0 = _synced_ms(device)
                 try:
                     last_train_sample = _eval_cadence_diagnostics(
                         model, artifacts, logger, step=step + 1, val_ce=float(m["ce"]),
@@ -3655,6 +3695,7 @@ def train(
                 except Exception as exc:
                     _record_diagnostic_failure(diagnostics_failures, "eval_cadence", exc, logger)
                     last_train_sample = {column: float("nan") for column in _EVAL_CADENCE_COLUMNS}
+                phase_ms["eval_cadence_ms"] = _synced_ms(device) - _t0
             torch.set_rng_state(eval_cpu_rng)            # F30: hand the training stream back untouched
 
         # Periodic resumable checkpoint (opt-in; needs the artifacts dir and the optimizer state).
@@ -3700,6 +3741,7 @@ def train(
         # diagnostics are per-sequence SUMS over seq 0, normalized to PER TOKEN so they are
         # commensurate with val_ce, a token-weighted mean (nats/token; see audit-2026-06-05 Finding 2).
         if do_csv:
+            _row_t0 = _synced_ms(device)
             n_tok = max(int(tokens.shape[1]), 1)
             raw_lrs = scheduler.get_last_lr()
             lrs = (_learning_rates_by_role(optimizer.param_groups, raw_lrs) if vfe_model
@@ -3900,6 +3942,8 @@ def train(
             row["pipeline_tokens_per_s"]   = pipeline_timing.pipeline_tokens_per_s
             row["tokens_per_s"]            = pipeline_timing.pipeline_tokens_per_s
             row["wall_clock_s"]            = pipeline_timing.wall_clock_s
+            phase_ms["log_row_ms"] = _synced_ms(device) - _row_t0
+            row.update({column: phase_ms.get(column, float("nan")) for column in LOG_TIMING_COLUMNS})
             artifacts.log_metrics(row)
             timer.reset_pipeline_window()
     # S1 panel D handoff (2026-09-28), before the terminal callback so its checkpoint and summary see

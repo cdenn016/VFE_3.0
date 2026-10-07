@@ -25,6 +25,19 @@ from vfe3.numerics import safe_eigvalsh
 from vfe3.geometry.transport import CompactFactoredTransport
 
 
+def eigvals_on_host(
+    matrix: torch.Tensor,                # (..., n, n) real or complex, any device
+) -> torch.Tensor:                       # (..., n) complex eigenvalues, on ``matrix``'s device
+    r"""``torch.linalg.eigvals`` computed by LAPACK on the CPU and returned to the input's device.
+
+    On CUDA, PyTorch evaluates the non-symmetric eigenproblem through MAGMA's hybrid ``geev`` one
+    matrix of the batch at a time, with host-device traffic per matrix; for the per-token frame
+    batches of the diagnostics (B N matrices) that dominates a logging step. The CPU LAPACK path
+    computes the same eigenvalues on the detached matrix (diagnostics only; no gradient).
+    """
+    return torch.linalg.eigvals(matrix.detach().cpu()).to(matrix.device)
+
+
 def effective_rank(
     spectrum: torch.Tensor,              # (..., K) non-negative spectrum (diagonal variances or eigenvalues)
 
@@ -1023,7 +1036,7 @@ def group_gauge_invariant(
     rotation angle (1/2) sum_k |arg(eig)| for the orthogonal so_n irrep towers.
     """
     if getattr(group, "skew_symmetric", False):                  # so_n, tied or untied
-        ang = torch.angle(torch.linalg.eigvals(exp_phi))         # (..., K) eigenphases
+        ang = torch.angle(eigvals_on_host(exp_phi))              # (..., K) eigenphases
         return 0.5 * ang.abs().sum(dim=-1)
     return torch.linalg.slogdet(exp_phi).logabsdet              # GL volume log|det|
 
@@ -1067,7 +1080,7 @@ def per_head_gauge_invariants(
     for d in irrep_dims:
         blk = exp_phi[..., start:start + d, start:start + d]      # (..., d, d) head block
         logdets.append(torch.linalg.slogdet(blk).logabsdet)
-        logmod = torch.log(torch.linalg.eigvals(blk).abs().clamp(min=eps))   # (..., d) log|eig|
+        logmod = torch.log(eigvals_on_host(blk).abs().clamp(min=eps))        # (..., d) log|eig|
         anisos.append(logmod.amax(dim=-1) - logmod.amin(dim=-1))
         start += d
     return {
@@ -1794,7 +1807,7 @@ def triangle_holonomy_eigenvalues(
         raise ValueError(f"holonomy needs tiled heads H*d = K, got H*d={H * d}, K={T_hat.shape[-1]}")
     G = W.permute(0, 2, 1, 3).reshape(H * d, H * d)                           # (K, K)
     scale = rho.to(torch.float64).repeat_interleave(d, dim=-1)                # (S, K)
-    return torch.linalg.eigvals(scale.unsqueeze(-1) * G)                      # (S, K)
+    return eigvals_on_host(scale.unsqueeze(-1) * G)                           # (S, K)
 
 
 def content_link_spectrum(
@@ -1836,7 +1849,7 @@ def content_link_spectrum(
         b = beta_self.detach().to("cpu", torch.float64)
         b = b.reshape(-1, H, b.shape[-1]).transpose(-1, -2).reshape(-1, H)    # (B N, H)
         A = b.repeat_interleave(repeats, dim=-1).unsqueeze(-1) * W_full       # (B N, K, K) = D_i W
-        rho = (torch.linalg.eigvals(A) + (1.0 if residual else 0.0)).abs().amax(dim=-1)   # (B N,)
+        rho = (eigvals_on_host(A) + (1.0 if residual else 0.0)).abs().amax(dim=-1)   # (B N,)
         out["relational_link_selfloop_spectral_radius_max"] = float(rho.max())
         out["relational_link_selfloop_spectral_radius_mean"] = float(rho.mean())
     return out
