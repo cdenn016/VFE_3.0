@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from tests.profiles import test_config, tiny_config
+from vfe3.config import ConfigNotice
 from vfe3.geometry.groups import check_admissible, get_group, group_traits
 from vfe3.model.model import VFEModel
 
@@ -98,6 +99,7 @@ def test_config_accepts_and_refuses() -> None:
             test_config(gauge_group=name, embed_dim=6, n_heads=2, use_cg_coupling=True)
         with warnings.catch_warnings():
             warnings.simplefilter("error")                    # RoPE stays inside the group: no warning
+            warnings.simplefilter("ignore", ConfigNotice)              # inert-setting advisories are not the subject
             test_config(gauge_group=name, embed_dim=6, n_heads=2, pos_rotation="rope")
     with pytest.raises(ValueError, match="head blocks of size >= 2"):
         test_config(gauge_group="block_so", embed_dim=4, n_heads=4)

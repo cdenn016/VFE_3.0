@@ -145,21 +145,19 @@ class CompactFactoredTransport:
 class RopeTransport:
     r"""A built transport wrapped with a gauge-RoPE positional rotation R(theta).
 
-    ``base`` is the un-rotated transport (a dense (N,N,K,K) Omega OR a FactoredTransport). The
-    effective operator is Omega^RoPE_ij = R(theta_i) Omega_ij R(theta_j)^T.
-
-    ``on_value`` (default True = the coherent single-gauge path) factors the transport into an
-    ATTENTION gauge and a VALUE gauge (GL(K)_attention.tex:1909): the attention score
-    D_KL(q_i || R_i Omega_ij R_j^T q_j) always carries the rotation, but with ``on_value=False`` the
-    value aggregation mu_hat_i = sum_j beta_ij Omega_ij mu_j uses the UN-rotated base transport --
-    exactly RoPE's "position-dependent attention, position-independent values" asymmetry.
+    ``base`` is the un-rotated transport (a FactoredTransport, or a dense (N,N,K,K) Omega for the
+    test-only ``"left"`` reference). Every model route uses ``insertion="right"``, which folds the
+    rotation into the vertex frame, V_i = U_i R_i^T. ``"left"``, the retired
+    Omega^RoPE_ij = R(theta_i) Omega_ij R(theta_j)^T, is kept only so the regression tests can
+    reproduce its absolute-position and gauge-breaking defect; no configuration selects it, and its
+    ``score_operator`` is None. Whether the value path rotates is decided by the model
+    (``rope_on_value``), not by this wrapper.
     """
 
     base:                    'torch.Tensor | FactoredTransport | CompactFactoredTransport'
     rope:                    torch.Tensor  # (N, K, K) block-diagonal orthogonal rotation
-    on_value:                bool = True   # False -> value aggregation uses the UN-rotated base (RoPE Q/K only)
     same_frame_flat_cocycle: bool = False  # trusted same-table RoPE around an already certified base
-    insertion:               str  = "right"  # "right": V_i = U_i R_i^T (pure) | "left": R_i Omega R_j^T (legacy)
+    insertion:               str  = "right"  # "right": V_i = U_i R_i^T | "left": R_i Omega R_j^T (test-only reference)
 
     def score_operator(self):
         r"""The operator the ATTENTION SCORE transports under, per ``insertion``.
@@ -178,10 +176,10 @@ class RopeTransport:
             if not isinstance(self.base,
                               (FactoredTransport, CompactFactoredTransport)):
                 raise ValueError(
-                    "rope_insertion='right' folds the rotation into the vertex frame, which needs a "
-                    f"base that carries one; got {type(self.base).__name__}. A dense Omega exposes "
-                    "only the composed operator, from which the per-vertex frame cannot be "
-                    "recovered. Use rope_insertion='left' for those transports.")
+                    "RoPE folds the rotation into the vertex frame, which needs a base that carries "
+                    f"one; got {type(self.base).__name__}. A dense Omega exposes only the composed "
+                    "operator, from which the per-vertex frame cannot be recovered; build a "
+                    "vertex-factor (factored or compact) transport.")
             cached = fold_rope_into_frame(self.base, self.rope)
             object.__setattr__(self, "_folded", cached)
         return cached
@@ -524,7 +522,7 @@ def _build_flat(
 
     *,
     gauge_mode:              str             = "learned",   # 'learned' (Regime I flat) or 'trivial'
-    validity_max_norm:       Optional[float] = None,        # fail-closed chart radius (None -> default 20.0)
+    validity_max_norm:       Optional[float] = None,        # fail-closed chart radius (None -> VFE3Config.transport_chart_max_norm default)
     **kwargs,                             # tolerated (a future non-flat builder shares this shape)
 ) -> TransportDict:
     r"""Flat (Regime I) phi-cocycle transport: the registered default.
@@ -676,7 +674,7 @@ def stable_matrix_exp_pair(
     *,
     only_forward:            bool                = False,
     block_dims:              Optional[List[int]] = None,     # per-block sizes (sum==d) for a block-diagonal M
-    validity_max_norm:       Optional[float]     = None,     # fail-closed chart radius (None -> default 20.0)
+    validity_max_norm:       Optional[float]     = None,     # fail-closed chart radius (None -> VFE3Config.transport_chart_max_norm default)
     _right_pair:             Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # certify (U E, E^-1 U^-1)
     _force_fp64:             bool                = False,    # skip the float32 attempt (joint escalation)
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -888,7 +886,7 @@ def compute_transport_operators(
 
     *,
     gauge_mode:              str             = "learned",   # 'learned' (Regime I flat) or 'trivial'
-    validity_max_norm:       Optional[float] = None,        # fail-closed chart radius (None -> default 20.0)
+    validity_max_norm:       Optional[float] = None,        # fail-closed chart radius (None -> VFE3Config.transport_chart_max_norm default)
 ) -> TransportDict:
     r"""phi/exp transport Omega_ij = exp(phi_i) @ exp(-phi_j) in GL+(K).
 
@@ -1073,7 +1071,7 @@ def _stable_compact_glk_exp_pair(
     blocks:                  torch.Tensor,       # (..., H, d, d) block-diagonal gl(d)^H element
 
     *,
-    validity_max_norm:       Optional[float] = None,     # fail-closed chart radius (None -> default 20.0)
+    validity_max_norm:       Optional[float] = None,     # fail-closed chart radius (None -> VFE3Config.transport_chart_max_norm default)
     _content_token_ids:      Optional[torch.Tensor] = None,
     _right_pair:             Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # certify (U E, E^-1 U^-1)
     _force_fp64:             bool            = False,     # skip the float32 attempt (joint escalation)
@@ -1160,7 +1158,7 @@ def build_factored_transport(
     *,
     gauge_mode:              str                    = "learned",   # 'learned' (Regime I flat) or 'trivial'
     compact_blocks:          bool                   = False,       # canonical block_glk: retain (..., N, H, d, d) factors
-    validity_max_norm:       Optional[float]        = None,        # fail-closed chart radius (None -> default 20.0)
+    validity_max_norm:       Optional[float]        = None,        # fail-closed chart radius (None -> VFE3Config.transport_chart_max_norm default)
     right_phi:               Optional[torch.Tensor] = None,        # (..., N, n_gen) exact right factor exp(Y)
     _content_token_ids:      Optional[torch.Tensor] = None,        # private certified table-lookup identity
 ) -> 'CompactFactoredTransport | FactoredTransport':

@@ -1035,7 +1035,7 @@ def train_step(
     _cfg = model.cfg
     if (
         did_step
-        and getattr(_cfg, "m_phi_update_mode", "adamw") == "adamw"
+        and not get_phi_update_policy(getattr(_cfg, "m_phi_update_mode", "adamw")).requires_manifold_optimizer
         and getattr(_cfg, "phi_mstep_max_matrix_norm", None) is not None
     ):
         collect_projection_stats = metrics_out is not None
@@ -1490,7 +1490,7 @@ def _numerics_counter_skip_reasons(
     reasons: Dict[str, Optional[str]] = {
         "cap_activation": None, "factorization": None, "frame_projection": None}
     mode = getattr(cfg, "m_phi_update_mode", "adamw")
-    if mode != "adamw":
+    if get_phi_update_policy(mode).requires_manifold_optimizer:
         reasons["frame_projection"] = (
             f"m_phi_update_mode={mode!r}: no post-update frame projection (the pullback-group step "
             "rejects rows outside the chart bound instead of projecting them)")
@@ -2583,13 +2583,26 @@ def _terminal_validation_signature(
     )
 
 
+def _snapshot_key_support(
+    log_prior: Optional[torch.Tensor],        # (N, N), (H, N, N) or (1, H, N, N) for one sequence
+) -> Optional[torch.Tensor]:                  # bool, broadcastable to (L, H, N, N); None if absent
+    r"""Admissible-key mask ``isfinite(log_prior)`` of one diagnostic sequence (audit 2026-10-07 F14)."""
+    if not isinstance(log_prior, torch.Tensor):
+        return None
+    if log_prior.dim() == 4:
+        log_prior = log_prior[0]
+    return torch.isfinite(log_prior)
+
+
 def _attention_structure_metrics(
     amaps: torch.Tensor,                      # (L, H, N, N) all layers/heads, one sequence
+    support: Optional[torch.Tensor] = None,   # bool, broadcastable to amaps: admissible keys
 ) -> Dict[str, float]:
     r"""Held-out attention-map structure: entropy collapse, causal sanity, positional/content, redundancy.
 
     Shared by both routes of :func:`_val_diagnostics_one`; the legacy route passes the entry-scored
-    replay, the conditional route the actual pre-update router ``snapshot.beta_maps``.
+    replay, the conditional route the actual pre-update router ``snapshot.beta_maps``. ``support``
+    is the prior's admissible-key mask; without it row support is read from ``amaps > 0``.
     """
     from vfe3 import metrics as M
 
@@ -2605,12 +2618,13 @@ def _attention_structure_metrics(
     # so the strict `<` was decided by float noise -- measured 2 of 2 heads flagged on an untrained
     # model whose attention is as uniform as the causal mask permits. See metrics.attention_head_collapse.
     ent_rows = M.attention_entropy_rows(amaps)                  # (L, H, N)
-    scorable = (amaps > 0.0).sum(dim=-1) >= 2                   # rows with >=2 admissible keys
+    admitted = (amaps > 0.0) if support is None else support.expand_as(amaps)
+    scorable = admitted.sum(dim=-1) >= 2                        # rows with >=2 admissible keys
     hmin = ent_rows.masked_fill(~scorable, float("inf")).min(dim=-1).values   # (L, H)
     finite_hmin = hmin[torch.isfinite(hmin)]
     out["val_attn_entropy_min_all"] = (float(finite_hmin.min()) if finite_hmin.numel()
                                        else float("nan"))
-    worst_norm, collapsed = M.attention_head_collapse(amaps)    # (L, H) each
+    worst_norm, collapsed = M.attention_head_collapse(amaps, support=support)    # (L, H) each
     finite_norm = worst_norm[torch.isfinite(worst_norm)]
     out["val_attn_entropy_min_norm"] = (float(finite_norm.min()) if finite_norm.numel()
                                         else float("nan"))
@@ -2618,7 +2632,7 @@ def _attention_structure_metrics(
     cs = M.causal_sanity(amaps)
     out["val_future_leakage"] = float(cs["future_leakage"].max())   # soft causal prior can leak silently
     out["val_row_sum_error"]  = float(cs["row_sum_error"].max())
-    out["val_pos_content_r2"] = float(M.positional_content_score(amaps).mean())
+    out["val_pos_content_r2"] = float(M.positional_content_score(amaps, support=support).mean())
     sh = M.structured_head_scores(amaps)
     out["val_prev_token_mass"]   = float(sh["prev_token"].mean())
     out["val_period_match_mass"] = float(sh["period_match"].mean())
@@ -2722,7 +2736,8 @@ def _val_diagnostics_one(
             "val_belief_cond_median": float(vd["belief_cond_median"]),
             "val_gauge_invariant_spread": float(vd["gauge_invariant_spread"]),
         }
-        structure.update(_attention_structure_metrics(snapshot.beta_maps.float()))
+        structure.update(_attention_structure_metrics(
+            snapshot.beta_maps.float(), _snapshot_key_support(snapshot.log_prior)))
         if diagnostic_targets is not None:
             structure.update(_position_loss_metrics(snapshot.logits, diagnostic_targets))
         out.update(structure)
@@ -3989,7 +4004,11 @@ def _fmt_decode_lrs(cfg: VFE3Config) -> str:
 def _fmt_tau(cfg: VFE3Config, model: VFEModel) -> str:
     r"""Banner format for the softmax temperature: a scalar kappa -> '1.5000', a per-head
     (list) kappa -> '[t0, t1, ...]' (T1). Converts a list kappa to a tensor first so attention_tau
-    does not choke on a raw list."""
+    does not choke on a raw list. The minimal-agent readout routes at temperature 1 and never reads
+    kappa_beta, so its banner prints that temperature instead (audit 2026-10-07 F30)."""
+    if (getattr(cfg, "attention_mode", None) == "projected_predictive"
+            and getattr(cfg, "predictive_readout", "kernel") == "minimal_agent"):
+        return "1 (minimal_agent posterior; kappa_beta unused)"
     dev = next(model.parameters()).device
     tau = attention_tau(_as_coeff(cfg.kappa_beta, dev), model.group.irrep_dims, device=dev)
     if isinstance(tau, torch.Tensor) and tau.dim() >= 1:

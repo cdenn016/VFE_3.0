@@ -486,6 +486,8 @@ def test_mixed_code_identity_is_rejected_by_default_and_accepted_on_opt_in(tmp_p
     prov_path.write_text(json.dumps(prov))
     _write_request(tmp_path, [1, 2])
 
+    # Pin the default: the launcher's CONFIG is a user-edited click-to-run dict.
+    monkeypatch.setitem(ms.CONFIG, "allow_mixed_code_identity", False)
     design = ms._requested_seed_design(tmp_path)
     assert design["complete"] is False
     assert design["accepted_seeds"] == []

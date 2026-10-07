@@ -1738,9 +1738,8 @@ def run_phi_section(run: Any, ctx: AnalysisContext) -> SectionResult:
                              "log (eigenvalue on the closed negative real axis) and are excluded from log-chart "
                              "statistics.")
     res.notes.append(_diagonal_note(d_status, d_reason))
-    if getattr(cfg, "transport_mode", "flat") == "flat":
-        res.notes.append("transport_mode='flat': Omega_ij = U_i U_j^-1 telescopes, so loop holonomy is "
-                         "identically the identity; no holonomy is computed or plotted.")
+    res.notes.append("flat transport (the only connection): Omega_ij = U_i U_j^-1 telescopes, so loop "
+                     "holonomy is identically the identity; no holonomy is computed or plotted.")
     if getattr(run, "phi_frozen", False):
         res.notes.append("phi is not updated in context: each realized frame is the token's lookup frame "
                          "times the positional right factor e^{Y_p}.")

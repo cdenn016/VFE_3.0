@@ -720,6 +720,9 @@ def get_loader(
 # SINGLE-CELL EXECUTOR  -- one independent (size, seed) run (replicates _run_once's body).
 # =============================================================================
 
+_EMBEDDING_FIGURE_OVERRIDE_LOGGED: List[bool] = []
+
+
 def _cell_cfg_dict(overrides: Dict[str, Any], seed: int, max_steps: Optional[int]) -> Dict[str, Any]:
     r"""The exact kwargs a cell's VFE3Config is built from: baseline + overrides + run knobs. Single
     source of truth, shared by ``run_cell`` and the resume staleness check."""
@@ -727,7 +730,15 @@ def _cell_cfg_dict(overrides: Dict[str, Any], seed: int, max_steps: Optional[int
     d.update(overrides)
     d["seed"] = _require_scaling_seed(seed)
     d["checkpoint_interval"] = 0                             # no per-cell step_N.pt blowup
-    d["generate_embedding_figures"] = False                 # skip only the slow semantic-geometry analysis
+    # Skip only the slow semantic-geometry analysis. A per-cell override is honored; the launcher's
+    # BASELINE value is not, which is logged once per process (audit 2026-10-07 F42).
+    if "generate_embedding_figures" not in overrides:
+        if d.get("generate_embedding_figures") and not _EMBEDDING_FIGURE_OVERRIDE_LOGGED:
+            _EMBEDDING_FIGURE_OVERRIDE_LOGGED.append(True)
+            logging.getLogger(__name__).warning(
+                "scaling cells skip the semantic-geometry analysis: generate_embedding_figures=True "
+                "in BASELINE is set to False per cell (override it per cell to keep it)")
+        d["generate_embedding_figures"] = False
     if max_steps is not None:
         d["max_steps"] = int(max_steps)
     return d

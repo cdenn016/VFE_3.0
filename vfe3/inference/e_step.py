@@ -45,7 +45,7 @@ def _transport(
     gauge_mode:             str   = "learned",  # 'learned' | 'trivial' (forwarded to the builder)
     materialize:            bool = True,         # compatibility/diagnostic boundary
 
-    validity_max_norm:      Optional[float]          = None,  # fail-closed chart radius (None -> default 20.0)
+    validity_max_norm:      Optional[float]          = None,  # fail-closed chart radius (None -> VFE3Config.transport_chart_max_norm default)
     mu:                     Optional[torch.Tensor]   = None,  # (N,K) or (B,N,K) means
     sigma:                  Optional[torch.Tensor]   = None,  # variances for covariant features
     transport_state:        Optional[TransportState] = None,  # registry-owned trainable state
@@ -127,11 +127,10 @@ def build_belief_transport(
     *,
     transport_mode:              str                                         = "flat",   # connection-regime registry key
     gauge_mode:                  str                                         = "learned", # 'learned' | 'trivial' (forwarded to the builder)
-    rope_on_value:               bool                                        = True,      # False -> value aggregation uses the un-rotated base
     rope_insertion:              str = "right",   # "right" (pure, folded frame) | "left" (legacy)
     compact_phi_block_transport: bool                                        = False,    # packed phi factors for canonical flat block_glk
     require_vertex_factors:       bool                                        = False,    # exact flat vertex representation even for a single block
-    validity_max_norm:           Optional[float]                             = None,     # fail-closed chart radius (None -> default 20.0)
+    validity_max_norm:           Optional[float]                             = None,     # fail-closed chart radius (None -> VFE3Config.transport_chart_max_norm default)
     mu:                          Optional[torch.Tensor]                      = None,     # belief-dependent builder reads these
     sigma:                       Optional[torch.Tensor]                      = None,     # belief-dependent builder reads these
     transport_state:             Optional[TransportState]                    = None,     # registry-owned trainable state mapping
@@ -182,7 +181,6 @@ def build_belief_transport(
     return RopeTransport(
         base=built,
         rope=rope,
-        on_value=rope_on_value,
         insertion=rope_insertion,
         same_frame_flat_cocycle=(
             isinstance(built, (CompactFactoredTransport, FactoredTransport))

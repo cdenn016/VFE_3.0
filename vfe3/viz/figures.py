@@ -2659,7 +2659,6 @@ def plot_geometry_health(
     history: Dict,                       # step + gauge/SPD/Fisher/guard health columns (any subset)
 
     *,
-    transport_mode: str           = "flat",
     family:         Optional[str] = None,
     path:           Optional[str] = None,
 ):
@@ -2671,11 +2670,11 @@ def plot_geometry_health(
     saturation, and attention-entropy collapse. Together they say whether the learned geometry
     stays meaningful rather than degenerating to a flat cocycle (phi -> 0, an UNGAUGED transformer) or
     a guard-pinned fixed point. Each panel self-gates on column presence."""
-    flat = transport_mode == "flat"
     fisher_label = pub_label("fisher_trace_mean", family=family)
     panels = [
-        {"title": ("Numerical closure of flat transport" if flat else "Holonomy / cocycle curvature"),
-         "ylabel": ("numerical closure residual" if flat else "curvature"),
+        # The projected routes run only the flat connection, so these columns measure closure roundoff.
+        {"title": "Numerical closure of flat transport",
+         "ylabel": "numerical closure residual",
          "logy": True, "series": [
             ("holonomy_wilson", r"Wilson $1-\mathrm{Re}\,\mathrm{Tr}(H)/K$ (gauge-invariant)", _CB[0]),
             ("cocycle_residual", "cocycle residual", _CB[1]),

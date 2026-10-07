@@ -176,40 +176,6 @@ def learning_curve_series(run: RunRecord) -> Dict[str, Any]:
     if out["gap"] is not None:
         out["gap_tokens"] = tokens_at(out["gap_step"])
     return out
-    step, val = metrics["step"], metrics["val_ce"]
-    rows = np.isfinite(step) & np.isfinite(val)
-    if not rows.any():
-        out["status"] = "skipped"
-        out["reason"] = "metrics.csv has no finite val_ce"
-        return out
-    out["status"] = "ok"
-    out["step"], out["val_ce"] = step[rows], val[rows]
-    tokens_col = metrics.get("tokens_seen")
-    if tokens_col is not None and np.isfinite(tokens_col).any():
-        out["tokens"], out["tokens_source"] = _interp(step, tokens_col, step[rows]), "metrics.csv tokens_seen"
-    elif run.tokens_per_step():
-        out["tokens"] = step[rows] * float(run.tokens_per_step())
-        out["tokens_source"] = "step x batch_size x max_seq_len (config.json)"
-    else:
-        out["tokens"], out["tokens_source"] = None, None
-        out["reasons"]["tokens"] = "no tokens_seen column and no batch geometry in config.json"
-    wall = metrics.get("wall_clock_s")
-    if wall is not None and np.isfinite(wall).any():
-        out["hours"] = _interp(step, wall, step[rows]) / 3600.0
-    else:
-        out["hours"] = None
-        out["reasons"]["hours"] = "no wall_clock_s column in metrics.csv"
-    gap = metrics.get("generalization_gap_fixed")
-    if gap is not None and np.isfinite(gap).any():
-        grow = np.isfinite(step) & np.isfinite(gap)
-        out["gap_step"], out["gap"] = step[grow], gap[grow]
-        out["gap_tokens"] = (_interp(step, tokens_col, step[grow])
-                             if out.get("tokens_source") == "metrics.csv tokens_seen"
-                             else (step[grow] * float(run.tokens_per_step()) if run.tokens_per_step() else None))
-    else:
-        out["gap"] = None
-        out["reasons"]["gap"] = "no generalization_gap_fixed column (runs before 2026-09-28)"
-    return out
 
 
 def plot_learning_curves(manifest: Manifest, out_dir: Path, *, stem: str = "m3_learning_curves") -> Dict[str, Any]:

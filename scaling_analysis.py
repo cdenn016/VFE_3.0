@@ -91,7 +91,7 @@ CONFIG: Dict[str, Any] = {
 _CSV_COLUMNS = [
     "route", "scale_knob", "label", "seed", "n_params", "n_learnable_params",
     "n_non_embedding_params", "embed_dim", "n_heads",
-    "n_gen", "gauge_group", "n_layers", "n_e_steps", "family", "divergence_family",
+    "n_gen", "gauge_group", "n_layers", "n_e_steps", "family",
     "full_cov_kl_precision",
     "use_block_mlp", "block_mlp_mode", "block_mlp_covariance", "block_mlp_expansion",
     "block_mlp_activation", "block_mlp_dropout", "block_mlp_covariance_floor",
@@ -115,7 +115,7 @@ _SCALING_SUMMARY_DIGEST_FIELD = "scaling_reuse_contract_sha256"
 _SCALING_SOURCE_SPLITS = ("train", "validation", "test")
 _SCALING_STRUCTURAL_FIELDS = (
     "n_params", "scale_knob", "embed_dim", "n_heads", "n_layers", "n_e_steps",
-    "n_gen", "gauge_group", "family", "divergence_family", "tokens_seen",
+    "n_gen", "gauge_group", "family", "tokens_seen",
     "full_cov_kl_precision",
     "use_block_mlp", "block_mlp_mode", "block_mlp_covariance",
     "block_mlp_expansion", "block_mlp_activation", "block_mlp_dropout",
@@ -476,7 +476,6 @@ def harvest(
             "n_layers":    effective_cfg.get("n_layers"),
             "n_e_steps":   effective_cfg.get("n_e_steps"),
             "family":      effective_cfg.get("family"),
-            "divergence_family": effective_cfg.get("divergence_family"),
             "full_cov_kl_precision": effective_cfg.get("full_cov_kl_precision"),
             **block_mlp_structure,
             "tokens_seen": sp.get("tokens_seen"),
@@ -1012,7 +1011,6 @@ def aggregate_points(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "est_flops_analytic": _as_float(grp[0].get("est_flops_analytic")),
             "n_e_steps": _as_float(grp[0].get("n_e_steps")),
             "n_layers": _as_float(grp[0].get("n_layers")),
-            "divergence_family": str(grp[0].get("divergence_family", "renyi")),
             "ce_seeds": ce, "n_seeds": len(ce),
             "ce_mean": float(np.mean(ce)),
             "ce_sem": float(np.std(ce, ddof=1) / np.sqrt(len(ce))) if len(ce) > 1 else 0.0,
@@ -1734,7 +1732,9 @@ def _make_figures(
         if len(estep) >= 2:
             arms = [{"n_e_steps": p["n_e_steps"], "final_f": p["f_mean"], "ce": p["ce_mean"]}
                     for p in estep]
-            divergence_family = str(estep[0].get("divergence_family", "renyi"))
+            # The projected routes fix the divergence to KL, the registered "renyi" functional at
+            # order 1; the retired divergence_family field is no longer serialized (audit 2026-10-07 F16).
+            divergence_family = "renyi"
             _try(F_CE_RELATIONSHIP_FILENAME, lambda: figs.plot_f_ce_relationship(
                 arms, divergence_family=divergence_family,
                 path=str(fig_dir / F_CE_RELATIONSHIP_FILENAME)))

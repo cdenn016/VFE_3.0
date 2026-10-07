@@ -10,7 +10,6 @@ determinant control. Pure: operates on a generator TENSOR, not a GaugeGroup.
 
 import hashlib
 import math
-import warnings
 import weakref
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -136,7 +135,6 @@ def compose_euclidean(
 _BRACKET_CLOSURE_CACHE_MAXSIZE: int = 32
 _BRACKET_CLOSURE_IDENTITIES: OrderedDict = OrderedDict()  # identity/version -> (weak ref, value signature)
 _BRACKET_CLOSURE_RES: OrderedDict = OrderedDict()       # value signature -> max residual
-_BRACKET_CLOSURE_WARNED: OrderedDict = OrderedDict()    # (value signature, where) -> None
 
 
 def _basis_value_signature(
@@ -194,23 +192,23 @@ def _cached_basis_value_signature(
     return value_signature
 
 
-def warn_if_basis_not_closed(
+def require_basis_closed(
     generators:  torch.Tensor,            # (n_gen, K, K) fixed gauge generator basis
 
     *,
-    where:        str,                     # call-site label (also the per-site warn-once key)
+    where:        str,                     # call-site label for the error message
     closure_tol:  float                  = 1e-4,
     eps:          float                  = 1e-12,
     max_elements: int                    = 50_000_000,  # skip the O(n_gen^2 K^2) scan above this
     gram_pinv_:   Optional[torch.Tensor] = None,
 ) -> None:
-    r"""Warn once (per call site) if ``generators`` is not closed under the Lie bracket.
+    r"""Raise if ``generators`` is not closed under the Lie bracket (fail closed; audit 2026-10-07 F20).
 
     Measures the max relative out-of-span residual
     :math:`\max_{a,b} \lVert [G_a,G_b] - \mathrm{embed}(\mathrm{extract}([G_a,G_b]))\rVert_F /
-    (\lVert [G_a,G_b]\rVert_F + \epsilon)`. On a closed (default direct-sum) basis this is ~0 and
-    nothing is warned; on a non-closed custom basis it is O(1) and the span projection in BCH
-    composition / structure-constants silently truncates the out-of-span part.
+    (\lVert [G_a,G_b]\rVert_F + \epsilon)`. On a closed (default direct-sum) basis this is ~0; on a
+    non-closed custom basis it is O(1), the span projection in BCH composition would silently
+    truncate the out-of-span part, and this raises instead.
     The result depends only on generator values, so a bounded value-signature cache avoids repeating
     the bracket scan without retaining the caller's tensor storage.
 
@@ -241,17 +239,11 @@ def warn_if_basis_not_closed(
         _bounded_lru_store(_BRACKET_CLOSURE_RES, key, max_res)
     else:
         _BRACKET_CLOSURE_RES.move_to_end(key)
-    wkey = (key, where)
-    if max_res > closure_tol and wkey not in _BRACKET_CLOSURE_WARNED:
-        _bounded_lru_store(_BRACKET_CLOSURE_WARNED, wkey, None)
-        warnings.warn(
+    if max_res > closure_tol:
+        raise ValueError(
             f"{where}: gauge generator basis is not closed under the Lie bracket (max relative "
-            f"out-of-span residual {max_res:.3e} > {closure_tol:.1e}); BCH composition / structure "
-            f"constants truncate the out-of-span [G_a,G_b] terms. Build the group with "
-            f"close_basis=True for cross-coupled (3+-head chain) bases.",
-            UserWarning,
-            stacklevel=3,
-        )
+            f"out-of-span residual {max_res:.3e} > {closure_tol:.1e}); BCH composition would "
+            f"truncate the out-of-span [G_a,G_b] terms. Use a bracket-closed basis.")
 
 
 def _bch_dynkin_correction(
@@ -636,13 +628,12 @@ def compose_bch(
         Z = Z + _bch_dynkin_correction(X, Y, order)
     phi = extract_phi(Z, generators, gram_pinv_=gram_pinv_)
 
-    # Diagnostic (cached, phi-independent): warn once if the generator basis is not bracket-closed,
-    # in which case the Dynkin commutators leave span{G_a} and the extract_phi projection above drops
-    # that part. Closure depends only on the fixed generators and never touches Z's autograd graph;
+    # Guard (cached, phi-independent): refuse a basis that is not bracket-closed, in which case the
+    # Dynkin commutators leave span{G_a} and the extract_phi projection above would drop that part. Closure depends only on the fixed generators and never touches Z's autograd graph;
     # the bounded cache owns only a CPU value signature and scalar residual, not the caller's basis.
     # The scan is size-gated (max_elements): large direct-sum bases (e.g. block_glk K=140, the prior
     # O(K^4) OOM) are skipped as closed-by-construction.
-    warn_if_basis_not_closed(generators, where="compose_bch",
+    require_basis_closed(generators, where="compose_bch",
                              closure_tol=closure_tol, eps=eps, gram_pinv_=gram_pinv_)
     _fail_if_bch_residual_exceeds(
         phi1, phi2, phi, generators, residual_max=residual_max, eps=eps,

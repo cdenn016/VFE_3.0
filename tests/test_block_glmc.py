@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from tests.profiles import test_config, tiny_config
+from vfe3.config import ConfigNotice
 from vfe3.geometry.groups import check_admissible, get_group, group_traits
 from vfe3.geometry.lie_ops import project_phi_to_slk
 from vfe3.geometry.rope import build_rope_rotation
@@ -117,6 +118,7 @@ def test_config_accepts_and_refuses() -> None:
         test_config(gauge_group="block_glmc", embed_dim=8, n_heads=2, m_phi_update_mode="fisher_group")
     with warnings.catch_warnings():
         warnings.simplefilter("error")                                   # RoPE stays inside the group
+        warnings.simplefilter("ignore", ConfigNotice)              # inert-setting advisories are not the subject
         test_config(gauge_group="block_glmc", embed_dim=8, n_heads=2, pos_rotation="rope")
     with pytest.raises(ValueError, match="even head size"):
         get_group("block_glmc")(6, 2)

@@ -1977,6 +1977,13 @@ def run_single(
         raise ValueError("extrapolation_lengths needs collect_extrapolation=True")
 
     cfg_dict = _cell_cfg_dict(overrides, seed=seed, max_steps=max_steps)
+    # _cell_cfg_dict drops a stride longer than the context to the disjoint default; say so and
+    # record it in the cell result (audit 2026-10-07 F42).
+    requested_stride = {**_resolved_sweep_baseline(), **overrides}.get("eval_stride")
+    stride_rewritten = requested_stride is not None and cfg_dict.get("eval_stride") is None
+    if stride_rewritten:
+        logger.warning("  [eval_stride] %s: eval_stride=%s exceeds max_seq_len=%s; evaluating disjoint "
+                       "windows (eval_stride=None)", label, requested_stride, cfg_dict.get("max_seq_len"))
     try:
         cfg = VFE3Config(**cfg_dict)
         stop_after_steps = _validated_stop_after_steps(stop_after_steps)
@@ -2090,6 +2097,8 @@ def run_single(
         "_loaded_data_sources": loaded_data_sources,
         "save_model_artifacts": save_model_artifacts,
     }
+    if stride_rewritten:
+        result["eval_stride_requested"] = requested_stride
     result.update(_gauge_reporting_fields(
         cfg, history=artifacts.history, executable_build=model.executable_build,
     ))

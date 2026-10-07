@@ -77,7 +77,6 @@ _apply_config_notice_filter()
 _VALID_GAUGE_TRANSPORT     = ("on", "off", "frozen")
 # Supported structure groups on the projected routes (so_n takes group_n and irrep_spec, one irrep
 # block per head, blocks may differ in size). The retired names are refused.
-_SUPPORTED_GAUGE_GROUPS    = ("block_glk", "so_n", "block_so", "block_co", "block_glmc")
 _RETIRED_GAUGE_GROUPS      = frozenset({"glk", "tied_block_glk", "so_k", "sp", "sp_n"})
 # Decoders decode_coordinates='reference' admits: linear reads xi = U^{-1} mu; the full Gaussian-KL
 # kernel reads (xi, C); the diagonal Gaussian-KL kernel reads (xi, diag C), exact up to a per-position
@@ -306,7 +305,7 @@ class VFE3Config:
                                                                      # into each frame on the right, V_i = U_i R_i^T.
     rope_on_value:                    bool            = False        # rope only: rotate the content frame too (False: routing only)
     pos_phi_project_slk:              bool            = False        # pos_phi only: per-block trace projection (det = 1)
-    bch_residual_max:                 Optional[float] = None         # fail-closed group-product relative residual; None = off
+    bch_residual_max:                 Optional[float] = None         # manifold phi M-step only: group-product residual gate, min(1e-6, value); None = 1e-6 (tightens only)
     
     rope_base:                        float           = 100.0        # rope only: frequency base
     # "frame" | "comparison"
@@ -564,7 +563,7 @@ class VFE3Config:
     phi_mstep_max_matrix_norm:        Optional[float] = None
     
     m_phi_group_trust_radius:         float           = 0.1          # pullback_group / fisher_group only: step bound
-    m_phi_fisher_rotation_weight:     float           = 2.0          # fisher_group only: weight on belief-invisible rotations
+    m_phi_fisher_rotation_weight:     float           = 2.0          # fisher_group only: completion weight lambda on every rotation; raises Fisher-visible rotation metrics a -> a + 2 lambda
     
     ##################################################
     #   17. Learning rates (M-step)
@@ -666,10 +665,14 @@ class VFE3Config:
                 f"retired attention mode {self.attention_mode!r}; full-state architecture "
                 "requires explicit migration to projected_predictive or projected_gradient")
         _require(self.attention_mode, ("projected_predictive", "projected_gradient"), "attention_mode")
+        # Validated against the group registry, so a newly registered group needs no edit here
+        # (audit 2026-10-07 F39).
+        from vfe3.geometry.groups import _GROUPS as _registered_groups
+        _supported_groups = tuple(sorted(set(_registered_groups) - _RETIRED_GAUGE_GROUPS))
         if self.gauge_group in _RETIRED_GAUGE_GROUPS:
             raise ValueError(f"gauge_group={self.gauge_group!r} is retired; supported groups are "
-                             f"{_SUPPORTED_GAUGE_GROUPS}")
-        _require(self.gauge_group, _SUPPORTED_GAUGE_GROUPS, "gauge_group")
+                             f"{_supported_groups}")
+        _require(self.gauge_group, _supported_groups, "gauge_group")
         full_link = self.attention_mode == "projected_gradient"
         # attention_residual and predictive_covariance are predictive-readout knobs; under
         # projected_gradient they are inactive (inactive_fields), not errors.
@@ -1114,8 +1117,7 @@ class VFE3Config:
         # lambda_alpha_mode validated against the alpha-form REGISTRY (add-by-registering).
         from vfe3.alpha_i import _ALPHAS
         _require(self.lambda_alpha_mode, tuple(sorted(_ALPHAS)), "lambda_alpha_mode")
-        if (self.lambda_alpha_mode == "constant"
-                and not (math.isfinite(self.lambda_alpha) and self.lambda_alpha >= 0.0)):
+        if not (math.isfinite(self.lambda_alpha) and self.lambda_alpha >= 0.0):
             raise ValueError(
                 f"lambda_alpha must be finite and nonnegative under lambda_alpha_mode='constant', "
                 f"got {self.lambda_alpha}"
@@ -1277,29 +1279,6 @@ class VFE3Config:
             raise ValueError(
                 "fp32_matmul_precision must be None (leave the card as-is) or one of "
                 f"('highest', 'high', 'medium'), got {self.fp32_matmul_precision!r}")
-        # FAIL CLOSED rather than falling back. The right insertion folds R into the VERTEX frame, so
-        # it needs a transport that carries one; a dense Omega exposes only the composed operator.
-        # Silently reverting to 'left' there would put the defective composition (69% absolute-position
-        # contamination, broken gauge covariance) on a config that asked for the pure path.
-        if self.pos_rotation == "rope":
-            from vfe3.geometry.groups import get_group
-            _escapes = "Use a group carrying a per-vertex gauge chart."
-            # The flat FACTORED builder -- the thing that exposes the vertex frame -- is selected only
-            # for a block-diagonal group with MORE THAN ONE block, so the group alone settles it.
-            _builder = get_group(self.gauge_group)
-            if _tower:                           # irrep blocks validated in the gauge seam above
-                _dims = _block_dims
-            else:
-                try:                             # builders differ: only the block groups take n_heads
-                    _dims = _builder(K=self.embed_dim, n_heads=self.n_heads).irrep_dims
-                except TypeError:
-                    _dims = _builder(K=self.embed_dim).irrep_dims
-            if len(_dims) < 2 and self.rope_space == "frame":
-                raise ValueError(
-                    f"rope_insertion='right' needs a group whose "
-                    f"transport factors per block, but gauge_group={self.gauge_group!r} has a "
-                    f"single irrep block ({_dims}), so the flat transport is built as a dense "
-                    f"pairwise Omega with no per-vertex frame to fold into. {_escapes}")
         # decode / encode
         if not math.isfinite(self.decode_tau) or self.decode_tau <= 0.0:
             raise ValueError(f"decode_tau must be finite and positive, got {self.decode_tau}")
@@ -1701,6 +1680,19 @@ class VFE3Config:
             mark(("m_phi_group_trust_radius", "m_phi_group_retraction"),
                  "only read by the manifold phi optimizer "
                  "(m_phi_update_mode='pullback_group' or 'fisher_group')")
+        if not phi_update_policy.requires_manifold_optimizer:
+            mark(("bch_residual_max",),
+                 "only read by the manifold phi optimizer's group-product gate")
+        if self.beta_attention_prior not in ("alibi", "causal_alibi", "causal_alibi_noself"):
+            mark(("alibi_slope",), "only read by an alibi attention prior")
+        if self.beta_attention_prior != "t5_relative_bias":
+            mark(("t5_num_buckets", "t5_max_distance", "t5_learnable_bias"),
+                 "only read by beta_attention_prior='t5_relative_bias'")
+        if not self.use_cg_coupling:
+            mark(("cg_covariance_mode", "cg_covariance_floor", "cg_energy_weight"),
+                 "only read when use_cg_coupling=True")
+        elif self.cg_covariance_mode == "passthrough":
+            mark(("cg_covariance_floor",), "only read by cg_covariance_mode='delta_full'")
         if not phi_update_policy.requires_fisher_statistics:
             mark(("m_phi_fisher_rotation_weight",), "only read by m_phi_update_mode='fisher_group'")
         minimal_agent = self.predictive_readout == "minimal_agent"
@@ -1889,9 +1881,15 @@ class VFE3Config:
                  "no sigma E-step runs on projected routes or under skip_belief_sigma_update "
                  "(a moment-matched predictive covariance is a readout with its own floor), so no "
                  "sigma step, trust region, or SPD ceiling runs")
+        elif (self.relational_receiver_update == "closed_form" and self.family == "gaussian_full"):
+            mark(("sigma_max",),
+                 "the closed-form full-covariance receiver sets Sigma = c Lambda^{-1} with no SPD ceiling "
+                 "(only the diagonal family clamps at sigma_max)")
         if self.attention_mode == "projected_predictive":
             mark(("lambda_beta",), "predictive_content weights no belief-coupling block")
-        if self.decode_mode != "family_chunked":
+        if self.decode_mode != "family_chunked" and not (
+                self.family == "gaussian_full"
+                and (self.mstep_self_coupling_weight != 0.0 or self.cg_energy_weight != 0.0)):
             mark(("full_cov_kl_precision",),
                  "projected scoring has its own factor policy; only the family_chunked decoder "
                  "evaluates the pair divergence")
@@ -1906,7 +1904,11 @@ class VFE3Config:
                  "predictive_content never reads the prior and no M-step prior consumer is enabled")
         # The stack enters the E-step with q = p; one gradient iteration in one layer therefore
         # evaluates the self-coupling at D(q||p) = 0, where its force and derivatives vanish.
-        if (self.n_e_steps == 1 and self.n_layers == 1 and self.mstep_self_coupling_weight == 0.0):
+        # The closed-form receiver jumps to the frozen minimizer, which alpha sets, so the rule holds
+        # only for a gradient step (audit 2026-10-07 F08/F23/F25/F71).
+        if (self.n_e_steps == 1 and self.n_layers == 1 and self.mstep_self_coupling_weight == 0.0
+                and not (self.attention_mode == "projected_gradient"
+                         and self.relational_receiver_update == "closed_form")):
             mark(("lambda_alpha_mode", "lambda_alpha", "b0", "c0"),
                  "the single gradient E-step iteration starts at q = p, where the self-coupling "
                  "force vanishes")
@@ -1914,7 +1916,8 @@ class VFE3Config:
                 and self.encode_mode in ("per_token", "per_token_additive")
                 and self.predictive_covariance == "passthrough"
                 and self.block_coordinates == "local" and self.decode_coordinates == "local"
-                and not (self.use_block_mlp and self.block_mlp_covariance != "passthrough")):
+                and not (self.use_block_mlp and self.block_mlp_covariance != "passthrough")
+                and not (self.use_cg_coupling and self.cg_covariance_mode == "delta_full")):
             # A passthrough gauge gate no longer distinguishes the families: the diagonal gate on
             # (mu, sigma) is the full gate on (mu, diag_embed sigma), and nothing densifies sigma.
             mark(("family",),
@@ -1985,11 +1988,6 @@ class VFE3Config:
         """
         from vfe3.divergence import family_cov_kind
         return family_cov_kind(self.family) == "diagonal"
-
-    @property
-    def phi_retract_mode(self) -> Literal["bch"]:
-        """Fixed E-step phi composition, excluded from serialized configuration."""
-        return "bch"
 
     @property
     def rope_insertion(self) -> Literal["right"]:

@@ -40,7 +40,7 @@ import json
 import logging
 import math
 import time
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence
 
@@ -175,14 +175,14 @@ def _reserve_directory(root: Path, base: str) -> Path:
 
 
 def _rename_by_test_ppl(run_dir: Path, label: str, test_ppl: Optional[float],
-                        logger: logging.Logger) -> Path:
-    r"""Rename ``run_dir`` to ``<test_ppl:.2f>_<label>`` (unchanged when the PPL is missing or the OS refuses)."""
+                        logger: logging.Logger, *, prefix: str = "") -> Path:
+    r"""Rename ``run_dir`` to ``<prefix><ppl:.2f>_<label>`` (unchanged when the PPL is missing or the OS refuses)."""
     if test_ppl is None or not math.isfinite(float(test_ppl)) or not run_dir.exists():
         return run_dir
-    target = run_dir.parent / f"{float(test_ppl):.2f}_{label}"
+    target = run_dir.parent / f"{prefix}{float(test_ppl):.2f}_{label}"
     index = 2
     while target.exists():
-        target = run_dir.parent / f"{float(test_ppl):.2f}_{label}_{index}"
+        target = run_dir.parent / f"{prefix}{float(test_ppl):.2f}_{label}_{index}"
         index += 1
     try:
         run_dir.rename(target)
@@ -206,9 +206,14 @@ def run_baseline(
     logger:    Optional[logging.Logger] = None,
     generate_samples: bool = True,
 ) -> Path:
+    score_test: bool = True,
     r"""Train and finalize one baseline run; return its final run directory.
 
     ``cfg`` with ``seed`` applied is built into :class:`vfe3.baseline.BaselineTransformer`, trained by
+    With ``score_test=False`` (learning-rate sweep arms) the run is finalized without the test
+    split and named ``val<best_val_ppl>_<label>``, so selection never sees a test number
+    (audit 2026-10-07 F12/F83).
+
     :func:`vfe3.train.train` on the ``train_vfe3`` loaders (data order from ``data_seed``, the model
     seed when None), validated, and finalized by :func:`vfe3.run_artifacts.finalize_run` (test at the
     final and at the validation-selected weights, training-sample CE, provenance, summary,
@@ -250,13 +255,17 @@ def run_baseline(
     else:
         metrics = evaluate(model, val_loader, tokens_per_char=val_tpc, device=device)
     logger.info("Final (val) | CE: %.4f | PPL: %.2f", metrics["ce"], metrics["ppl"])
-    test_loader = _select_loader(dataset, cfg, split="test", data_seed=data_seed)
+    test_loader = (_select_loader(dataset, cfg, split="test", data_seed=data_seed) if score_test
+                   else None)
     results = finalize_run(
         model, artifacts, cfg, final_validation=metrics, tokens_per_char=_tokens_per_char(dataset, "test"),
         train_loader=train_loader, val_loader=val_loader, test_loader=test_loader, losses=losses,
         data_seed=data_seed, max_tokens=max_tokens, tokenizer_tag=_tokenizer_tag(dataset),
         device=device, wall_time=wall, logger=logger)
-    final_dir = _rename_by_test_ppl(run_dir, run_label, results.get("test_ppl"), logger)
+    if score_test:
+        final_dir = _rename_by_test_ppl(run_dir, run_label, results.get("test_ppl"), logger)
+    else:
+        final_dir = _rename_by_test_ppl(run_dir, run_label, results.get("best_val_ppl"), logger, prefix="val")
     logger.info("Artifacts written to %s", final_dir)
     return final_dir
 
@@ -285,7 +294,7 @@ def lr_sweep(
                         eval_interval=min(cfg.eval_interval, int(max_steps)) or int(max_steps),
                         checkpoint_interval=0)
         run_dir = run_baseline(swept, dataset=dataset, out_root=out_root, seed=seed, data_seed=data_seed,
-                               label=f"lr_sweep_{lr:g}_s{seed}", **run_kwargs)
+                               label=f"lr_sweep_{lr:g}_s{seed}", score_test=False, **run_kwargs)
         summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
         rows.append({"lr": float(lr), "best_val_ppl": summary.get("best_val_ppl"), "run_dir": str(run_dir)})
     finite = [row for row in rows if isinstance(row["best_val_ppl"], (int, float))
@@ -352,9 +361,29 @@ def compute_matched_config(
     calibration_runs:    Mapping[int, "str | Path"],
     unique_train_tokens: int,
 ) -> Dict[str, Any]:
-    r"""The compute-matched arm: measured budget, calibrated throughputs, the pre-declared width rule."""
+    r"""The compute-matched arm: measured budget, calibrated throughputs, the pre-declared width rule.
+
+    Each calibration run must carry ``cfg.with_width(w)`` up to the calibration protocol fields, and
+    must have run on the budget run's device; a mismatch raises (audit 2026-10-07 F84).
+    """
     budget = measured_train_device_hours(evaluated_run)
-    throughput = {int(w): calibrated_tokens_per_s(path)["tokens_per_s"] for w, path in calibration_runs.items()}
+    protocol = {"seed", "max_steps", "warmup_steps", "log_interval", "eval_interval",
+                "checkpoint_interval", "resume_from"}
+    calibrated: Dict[int, Dict[str, Any]] = {}
+    for w, path in calibration_runs.items():
+        record = json.loads((Path(path) / "config.json").read_text(encoding="utf-8"))
+        calib = BaselineConfig.from_serialized(record["config"], source=f"{path}/config.json")
+        expected = cfg.with_width(int(w))
+        mismatched = [f.name for f in fields(BaselineConfig)
+                      if f.name not in protocol and getattr(calib, f.name) != getattr(expected, f.name)]
+        if mismatched:
+            raise ValueError(f"calibration run {path} (K={w}) differs from the matched arm in {mismatched}")
+        calibrated[int(w)] = calibrated_tokens_per_s(path)
+        if (budget.get("device_name") is None
+                or calibrated[int(w)].get("device_name") != budget.get("device_name")):
+            raise ValueError(f"calibration run {path} ran on {calibrated[int(w)].get('device_name')!r}, the "
+                             f"evaluated run on {budget.get('device_name')!r}; throughput must share a device")
+    throughput = {w: row["tokens_per_s"] for w, row in calibrated.items()}
     rule = width_ladder_rule(cfg, hours=budget["train_hours"], tokens_per_s=throughput,
                              unique_train_tokens=int(unique_train_tokens))
     rule["budget"] = budget
