@@ -77,7 +77,7 @@ _apply_config_notice_filter()
 _VALID_GAUGE_TRANSPORT     = ("on", "off", "frozen")
 # Supported structure groups on the projected routes: block_glk, and so_n (with group_n and
 # irrep_spec, one equal irrep block per head). The others are retired.
-_SUPPORTED_GAUGE_GROUPS    = ("block_glk", "so_n", "block_so", "block_co")
+_SUPPORTED_GAUGE_GROUPS    = ("block_glk", "so_n", "block_so", "block_co", "block_glmc")
 _RETIRED_GAUGE_GROUPS      = frozenset({"glk", "tied_block_glk", "so_k", "sp", "sp_n"})
 # Decoders decode_coordinates='reference' admits: linear reads xi = U^{-1} mu; the full Gaussian-KL
 # kernel reads (xi, C); the diagonal Gaussian-KL kernel reads (xi, diag C), exact up to a per-position
@@ -239,8 +239,9 @@ class VFE3Config:
     # independent GL(d_head) frame per head. so_n: one shared SO(group_n) element acting through
     # the irrep blocks of irrep_spec, one block per head (blocks may differ in size). block_so /
     # block_co: an independent SO(d_head) / CO(d_head) = R+ x SO(d_head) element per head (untied
-    # rotations, and rotations with a per-head positive gain).
-    gauge_group:               str   = "block_glk"   # "block_glk" | "so_n" | "block_so" | "block_co"
+    # rotations, and rotations with a per-head positive gain). block_glmc: an independent GL(m, C)
+    # element per head, realified on d_head = 2m (even), complex coordinate k = real pair (2k, 2k+1).
+    gauge_group:               str   = "block_glk"   # "block_glk" | "so_n" | "block_so" | "block_co" | "block_glmc"
 
     # Frame tying across heads. "per_head": an independent group element per head block;
     # "shared": one element acting on every head. None resolves to the group's native tying
@@ -1077,6 +1078,12 @@ class VFE3Config:
             raise ValueError(
                 f"gauge_group={self.gauge_group!r} needs head blocks of size >= {_traits.min_head_dim}; "
                 f"embed_dim={self.embed_dim}, n_heads={self.n_heads} gives {self.embed_dim // self.n_heads}"
+            )
+        if not _tower and (self.embed_dim // self.n_heads) % _traits.head_dim_multiple != 0:
+            raise ValueError(
+                f"gauge_group={self.gauge_group!r} needs head blocks whose size is a multiple of "
+                f"{_traits.head_dim_multiple}; embed_dim={self.embed_dim}, n_heads={self.n_heads} gives "
+                f"{self.embed_dim // self.n_heads}"
             )
 
         # Frame tying resolves to the group's native value when unset.

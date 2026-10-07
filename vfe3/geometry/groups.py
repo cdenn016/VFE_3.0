@@ -22,7 +22,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 
 from vfe3.geometry.generators import (
-    generate_block_local, generate_glk_multihead, generate_son, local_basis_co, local_basis_so,
+    generate_block_local, generate_glk_multihead, generate_son, local_basis_co, local_basis_glc,
+    local_basis_so,
 )
 from vfe3.geometry.irreps import DEFAULT_IRREP_BASIS, direct_sum_generators
 
@@ -299,7 +300,8 @@ class GroupTraits:
     ``gauge_tying`` values and ``native_tying`` the one an unset field resolves to.
     ``contains_pair_rotations`` says whether every adjacent-pair rotation of a head block lies in
     the group, which is what keeps ``pos_rotation='rope'`` inside it. ``min_head_dim`` is the
-    smallest head block the builder accepts.
+    smallest head block the builder accepts, and every head block must be a multiple of
+    ``head_dim_multiple``.
     """
 
     algebra:                 Optional[str]   = None
@@ -307,6 +309,7 @@ class GroupTraits:
     native_tying:            str             = "per_head"
     contains_pair_rotations: bool            = True
     min_head_dim:            int             = 1
+    head_dim_multiple:       int             = 1
 # Frame tying across heads (config field gauge_tying): one element per head block, or one shared.
 GAUGE_TYINGS: Tuple[str, ...] = ("per_head", "shared")
 # Registered family names whose stored-parameter divergence is exactly GL(K)-congruence invariant.
@@ -629,10 +632,11 @@ def _build_block_local(
     name:    str,
     K:       int,
     n_heads: int,
-    local:   torch.Tensor,                   # (m, d, d) Frobenius-orthonormal local algebra basis
+    local:   torch.Tensor,                   # (m, d, d) local algebra basis, Gram = gram_weight * I
 
     *,
     skew:    bool,                           # every local generator is skew (local group compact)
+    gram_weight: float                   = 1.0,
     dtype:   torch.dtype                 = torch.float32,
     device:  'torch.device | str | None' = None,
 ) -> GaugeGroup:
@@ -641,15 +645,16 @@ def _build_block_local(
 
     The generators are ``local`` copied into every block in head-major order
     (:func:`vfe3.geometry.generators.generate_block_local`), built in float64 and cast. ``local``
-    must be Frobenius-orthonormal, which the build verifies, so the generator Gram is the identity.
+    must have Frobenius Gram ``gram_weight`` times the identity (orthonormal by default), which the
+    build verifies, so the generator Gram is ``gram_weight * I``.
     The group carries no ``phi_coordinate_layout`` and takes the dense transport route; registered
     block-local groups use :func:`_build_block_local` from their own builder.
     """
     local = local.to(torch.float64)
     m = local.shape[0]
     gram = torch.einsum("aij,bij->ab", local, local)
-    if float((gram - torch.eye(m, dtype=torch.float64)).abs().max()) > 1e-12:
-        raise ValueError(f"{name}: the local basis must be Frobenius-orthonormal")
+    if float((gram - gram_weight * torch.eye(m, dtype=torch.float64)).abs().max()) > 1e-12:
+        raise ValueError(f"{name}: the local basis must have Frobenius Gram {gram_weight} * I (orthonormal at 1)")
     if skew and float((local + local.transpose(-1, -2)).abs().max()) > 0.0:
         raise ValueError(f"{name}: skew=True needs an exactly skew local basis")
     generators = generate_block_local(K, n_heads, local, dtype=torch.float64)
@@ -659,7 +664,7 @@ def _build_block_local(
         irrep_dims=[K // n_heads] * n_heads,
         skew_symmetric=skew,
         frobenius_gram_diagonal=True,
-        frobenius_gram_uniform=1.0,
+        frobenius_gram_uniform=float(gram_weight),
         tying="per_head",
         block_local_basis=local,
     )
@@ -717,6 +722,44 @@ def _build_block_co(
         raise ValueError(f"K={K} must be divisible by n_heads={n_heads}")
     return _build_block_local("block_co", K, n_heads, local_basis_co(K // n_heads), skew=False,
                               dtype=dtype, device=device)
+
+
+@register_group(
+    "block_glmc",
+    invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
+    traits=GroupTraits(min_head_dim=2, head_dim_multiple=2),
+)
+def _build_block_glmc(
+    K:       int,
+    n_heads: int,
+
+    *,
+    dtype:   torch.dtype                 = torch.float32,
+    device:  'torch.device | str | None' = None,
+) -> GaugeGroup:
+    r"""Complex frames GL(m, C)^H, realified: an independent GL(m, C) element per head, d_head = 2m.
+
+    Complex coordinate k of a head is the real pair (2k, 2k + 1), with the complex structure
+    :math:`J = I_m\otimes[[0,-1],[1,0]]` on each head block. Generators
+    :math:`E_{ij}\otimes I_2` then :math:`E_{ij}\otimes J` per head (head-major; the coordinates
+    are (Re, Im) of the complex algebra element), entries +-1, Frobenius Gram :math:`2I`, n_gen =
+    2 H m^2: a real subgroup of ``block_glk`` at the same d_head with half its generators. The
+    exponential is the real ``matrix_exp`` of the realified block, which equals the realification of
+    the complex exponential. RoPE rotates exactly the pairs (2k, 2k + 1), so each RoPE block is
+    :math:`\mathrm{diag}(e^{i\theta_k})\in U(1)^m\subset GL(m,\mathbb{C})` and stays inside the group.
+
+    Scale: with +-1 entries a coordinate norm corresponds to a :math:`\sqrt2` larger matrix norm
+    than in ``block_glk``, and the initial matrix energy at equal coordinate scale matches
+    ``block_glk`` (half the coordinates, each of weight 2). The trace functionals of the realified
+    blocks see only Re tr, so ``pos_phi_project_slk`` / the trace clamp remove the R+ scale and fix
+    :math:`|\det_{\mathbb{C}}| = 1` while keeping the U(1) phase.
+    """
+    if K % n_heads != 0:
+        raise ValueError(f"K={K} must be divisible by n_heads={n_heads}")
+    if (K // n_heads) % 2 != 0:
+        raise ValueError(f"block_glmc needs an even head size d_head = 2m; got d_head={K // n_heads}")
+    return _build_block_local("block_glmc", K, n_heads, local_basis_glc(K // n_heads), skew=False,
+                              gram_weight=2.0, dtype=dtype, device=device)
 
 
 def generator_fingerprint(
