@@ -277,7 +277,18 @@ class VFE3Config:
 
     # The annotation reflects the POST-coercion type: __post_init__ also accepts the JSON/TOML
     # round-trip list-of-lists form ([["l1", 3], ...]) and coerces each pair to a tuple.
-    irrep_spec: Optional[List[Tuple[str, int]]] = None
+    # irrep_spec="random" draws a tower of exactly n_heads irreps of SO(group_n) whose dimensions sum
+    # to embed_dim, uniformly over the multisets of candidate irreps, and replaces the string with
+    # the drawn list at construction, so the saved config (and every reload) carries the concrete
+    # spec. Candidates: the symmetric-traceless 'l<p>' and wedge 'w<p>' / 'wp<p>' / 'wm<p>'
+    # families with rank in [irrep_min_rank, irrep_max_rank] (None: every rank that fits and is
+    # constructible). irrep_spec_seed fixes the draw independently of `seed`, so a multi-seed sweep
+    # keeps one architecture. An infeasible (embed_dim, n_heads) raises with the nearest feasible
+    # embed_dim. The three irrep_* draw fields are read only by irrep_spec="random".
+    irrep_spec: 'Optional[List[Tuple[str, int]] | str]' = None
+    irrep_spec_seed:              int           = 0
+    irrep_min_rank:               int           = 1     # 1 skips the gauge-invariant trivial irrep 'l0'
+    irrep_max_rank:               Optional[int] = None
 
     # Basis of each so_n irrep block (vfe3/geometry/irreps.py). "canonical" is deterministic and, for
     # group_n=3, builds spins of any order in closed form (the real spherical-harmonic basis; l1 is
@@ -1091,6 +1102,19 @@ class VFE3Config:
                 )
             if type(self.group_n) is not int or self.group_n < 2:
                 raise ValueError(f"group_n must be an int >= 2, got {self.group_n!r}")
+            from vfe3.geometry.irreps import IRREP_BASES, check_irrep_constructible, irrep_dim
+            _require(self.irrep_basis, IRREP_BASES, "irrep_basis")
+            if isinstance(self.irrep_spec, str):
+                if self.irrep_spec != "random":
+                    raise ValueError(f"irrep_spec must be a list of (label, mult) pairs or 'random', "
+                                     f"got {self.irrep_spec!r}")
+                if type(self.irrep_spec_seed) is not int:
+                    raise ValueError(f"irrep_spec_seed must be an int, got {self.irrep_spec_seed!r}")
+                from vfe3.geometry.irreps import random_irrep_spec
+                self.irrep_spec = random_irrep_spec(
+                    self.group_n, self.embed_dim, self.n_heads, algebra=_traits.algebra,
+                    basis=self.irrep_basis, seed=self.irrep_spec_seed,
+                    min_rank=self.irrep_min_rank, max_rank=self.irrep_max_rank)
             if not isinstance(self.irrep_spec, list) or not self.irrep_spec:
                 raise ValueError(
                     f"irrep_spec must be a non-empty list of (label, mult) pairs, got "
@@ -1098,8 +1122,6 @@ class VFE3Config:
                 )
             # JSON has no tuple type; coerce reloaded list pairs to tuples.
             self.irrep_spec = [tuple(p) if isinstance(p, list) else p for p in self.irrep_spec]
-            from vfe3.geometry.irreps import IRREP_BASES, check_irrep_constructible, irrep_dim
-            _require(self.irrep_basis, IRREP_BASES, "irrep_basis")
             _block_dims: List[int] = []
             for _entry in self.irrep_spec:
                 if (not isinstance(_entry, tuple) or len(_entry) != 2
@@ -1840,7 +1862,8 @@ class VFE3Config:
 
         from vfe3.geometry.groups import group_traits
         if group_traits(self.gauge_group).algebra is None:
-            mark(("irrep_basis",), "only read by irrep-tower groups (gauge_group='so_n')")
+            mark(("irrep_basis", "irrep_spec_seed", "irrep_min_rank", "irrep_max_rank"),
+                 "only read by irrep-tower groups (gauge_group='so_n')")
         from vfe3.gauge_optim import get_phi_update_policy
         phi_update_policy = get_phi_update_policy(self.m_phi_update_mode)
         if not phi_update_policy.requires_manifold_optimizer:

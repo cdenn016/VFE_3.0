@@ -43,7 +43,7 @@ A new irrep family (Young-tableau highest-weight reps, spinors, ...) slots in by
 
 import itertools
 import math
-from typing import Callable, Dict, List, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -128,7 +128,10 @@ def check_irrep_constructible(
     basis:   str = DEFAULT_IRREP_BASIS,
 ) -> None:
     """Raise, before any tensor is built, if ``label`` cannot be constructed in ``basis``."""
-    _, p = _parse_label(algebra, label)
+    key, p = _parse_label(algebra, label)
+    _IRREPS[key][0](N, p)                  # the family's dimension formula refuses an undefined (N, rank)
+    if key in _WEDGE_FAMILIES:
+        return                             # direct construction on the p-vector basis: no tensor power
     if algebra == "so" and N == 3 and _check_basis(basis) == "canonical":
         return                             # closed-form ladder construction: any rank
     if p >= 2:
@@ -445,3 +448,228 @@ def _son_sym_traceless_build(G_def: torch.Tensor, p: int, basis: str) -> torch.T
 
 
 register_irrep("so:l",   _son_sym_traceless_dim, _son_sym_traceless_build)
+
+
+# ---------------------------------------------------------------- exterior powers (wedge tensors)
+#
+# Lambda^p R^N under SO(N). For 2 <= p < N/2 it is irreducible over R, dim C(N, p). Lambda^0 and
+# Lambda^1 are 'l0' and 'l1', and Lambda^p = Lambda^{N-p} by the Hodge star, so the 'w' family takes
+# 2 <= p <= N/2 only. At p = m = N/2 the Hodge star commutes with SO(N) and squares to (-1)^m:
+#   m odd  (N = 2 mod 4): no real eigenspaces; Lambda^m is irreducible over R (complex type), 'w<m>';
+#   m even (N = 0 mod 4): Lambda^m = Lambda^m_+ (+) Lambda^m_-, the self-dual 'wp<m>' and
+#                         anti-self-dual 'wm<m>' irreps, each of dim C(N, m)/2; 'w<m>' is refused.
+# Every construction is a fixed integer recipe on the orthonormal basis e_I (I an increasing p-tuple
+# in lexicographic order), so the basis is deterministic and the same for 'canonical' and 'eigh'.
+
+_WEDGE_FAMILIES = ("so:w", "so:wp", "so:wm")
+
+
+def _wedge_dim(N: int, p: int) -> int:
+    r"""dim Lambda^p = C(N, p) for the 'w' family: 2 <= p < N/2, or p = N/2 with N = 2 mod 4."""
+    if p < 2 or 2 * p > N:
+        raise ValueError(
+            f"wedge irrep 'w{p}' over R^{N} needs 2 <= p <= N/2 (Lambda^0, Lambda^1 are 'l0', 'l1'; "
+            f"Lambda^p = Lambda^(N-p) by the Hodge star)")
+    if 2 * p == N and p % 2 == 0:
+        raise ValueError(
+            f"Lambda^{p} over R^{N} splits into self-dual and anti-self-dual irreps; use 'wp{p}' and 'wm{p}'")
+    return math.comb(N, p)
+
+
+def _wedge_half_dim(N: int, p: int) -> int:
+    r"""dim Lambda^m_(+/-) = C(N, m)/2 for m = N/2 even ('wp' / 'wm')."""
+    if 2 * p != N or p % 2 != 0 or p < 2:
+        raise ValueError(
+            f"self-dual wedge irreps 'wp{p}' / 'wm{p}' need p = N/2 even (N = 0 mod 4), got N={N}, p={p}")
+    return math.comb(N, p) // 2
+
+
+def _wedge_action(G_def: torch.Tensor, p: int) -> Tuple[torch.Tensor, List[Tuple[int, ...]]]:
+    r"""rho(X) on Lambda^p as the derivation X(e_I) = sum_k e_{i_1} ^ ... ^ X e_{i_k} ^ ... ^ e_{i_p}.
+
+    Returns the (n_gen, C(N, p), C(N, p)) float64 images on the orthonormal basis e_I and the basis
+    tuples I. Skew X gives skew images (the induced inner product is SO(N)-invariant).
+    """
+    import itertools
+
+    N = G_def.shape[-1]
+    tuples = list(itertools.combinations(range(N), p))
+    index = {I: n for n, I in enumerate(tuples)}
+    rho = torch.zeros(G_def.shape[0], len(tuples), len(tuples), dtype=torch.float64)
+    G = G_def.to(torch.float64)
+    for a in range(G.shape[0]):
+        rows, cols = torch.nonzero(G[a], as_tuple=True)                # X e_i = sum_j X[j, i] e_j
+        entries = [(int(j), int(i), float(G[a, j, i])) for j, i in zip(rows, cols)]
+        for col, I in enumerate(tuples):
+            for k, i in enumerate(I):
+                for j, i_src, value in entries:
+                    if i_src != i or (j in I and j != i):
+                        continue
+                    J = list(I)
+                    J[k] = j
+                    # Sign of the permutation sorting J (one entry moved): count the entries it passes.
+                    sign = (-1) ** sum(1 for m, other in enumerate(J) if m != k and (other < j) != (m < k))
+                    rho[a, index[tuple(sorted(J))], col] += sign * value
+    return rho, tuples
+
+
+def _wedge_build(G_def: torch.Tensor, p: int, basis: str) -> torch.Tensor:
+    _wedge_dim(G_def.shape[-1], p)
+    return _wedge_action(G_def, p)[0]
+
+
+def _hodge_half(G_def: torch.Tensor, p: int, sign: int) -> torch.Tensor:
+    r"""rho on Lambda^m_(sign) for m = N/2 even: the basis (e_I + sign * star e_I)/sqrt 2 over I containing 0.
+
+    star e_I = eps(I, I^c) e_{I^c}, with eps the sign of the permutation (I, I^c) of (0, ..., N-1).
+    Every pair {I, I^c} has exactly one member containing 0, so these vectors are an orthonormal
+    basis of the (sign)-eigenspace of star.
+    """
+    N = G_def.shape[-1]
+    _wedge_half_dim(N, p)
+    rho, tuples = _wedge_action(G_def, p)
+    index = {I: n for n, I in enumerate(tuples)}
+    columns = []
+    for I in tuples:
+        if 0 not in I:
+            continue
+        complement = tuple(i for i in range(N) if i not in I)
+        order = list(I) + list(complement)
+        inversions = sum(1 for x in range(N) for y in range(x + 1, N) if order[x] > order[y])
+        v = torch.zeros(len(tuples), dtype=torch.float64)
+        v[index[I]] = 1.0
+        v[index[complement]] += sign * (-1) ** inversions
+        columns.append(v / 2.0 ** 0.5)
+    P = torch.stack(columns, dim=1)                                    # (C(N, m), C(N, m)/2)
+    return P.T @ rho @ P
+
+
+def _wedge_plus_build(G_def: torch.Tensor, p: int, basis: str) -> torch.Tensor:
+    return _hodge_half(G_def, p, +1)
+
+
+def _wedge_minus_build(G_def: torch.Tensor, p: int, basis: str) -> torch.Tensor:
+    return _hodge_half(G_def, p, -1)
+
+
+register_irrep("so:w",   _wedge_dim,      _wedge_build)
+register_irrep("so:wp",  _wedge_half_dim, _wedge_plus_build)
+register_irrep("so:wm",  _wedge_half_dim, _wedge_minus_build)
+
+
+def _multiset_counts(
+    dims:    List[int],                    # candidate block dimensions, one per label
+    n_heads: int,
+    K:       int,
+) -> List[List[List[int]]]:                # count[i][h][k]
+    r"""count[i][h][k]: multisets of h labels from dims[i:] with total dimension k (exact integers)."""
+    m = len(dims)
+    count = [[[0] * (K + 1) for _ in range(n_heads + 1)] for _ in range(m + 1)]
+    count[m][0][0] = 1
+    for i in range(m - 1, -1, -1):
+        d = dims[i]
+        for h in range(n_heads + 1):
+            for k in range(K + 1):
+                total = 0
+                for t in range(h + 1):
+                    if t * d > k:
+                        break
+                    total += count[i + 1][h - t][k - t * d]
+                count[i][h][k] = total
+    return count
+
+
+def random_irrep_spec(
+    N:        int,                         # defining-rep dimension (N of SO(N))
+    K:        int,                         # embed_dim: the block dimensions must sum to K
+    n_heads:  int,                         # number of irrep blocks (one per head)
+
+    *,
+    algebra:  str           = "so",
+    basis:    str           = DEFAULT_IRREP_BASIS,
+    seed:     int           = 0,
+    min_rank: int           = 1,           # 1 skips the trivial rank-0 block (no generators)
+    max_rank: Optional[int] = None,        # None: every rank whose block fits and is constructible
+) -> List[Tuple[str, int]]:
+    r"""Draw an irrep tower of exactly ``n_heads`` blocks whose dimensions sum to ``K``.
+
+    The candidates are the labels of every family registered for ``algebra`` with rank in
+    [``min_rank``, ``max_rank``] that fit in K and are constructible in ``basis``. The draw is
+    uniform over the multisets of candidate labels with ``n_heads`` elements and total dimension
+    K, sampled exactly from the counts by dynamic programming with ``random.Random(seed)``. The
+    result is in ascending (family, rank) order with multiplicities, so equal blocks are
+    contiguous and the operator storage has the fewest runs. When no such multiset exists the
+    error lists the candidate dimensions (for SO(3) every block is odd, so K and n_heads must have
+    the same parity; when K / n_heads equals the smallest candidate dimension the draw is forced).
+    """
+    import random
+
+    if type(n_heads) is not int or n_heads < 1 or type(K) is not int or K < n_heads:
+        raise ValueError(f"random irrep spec needs integers K >= n_heads >= 1, got K={K!r}, n_heads={n_heads!r}")
+    if (type(min_rank) is not int or min_rank < 0
+            or (max_rank is not None and (type(max_rank) is not int or max_rank < min_rank))):
+        raise ValueError(f"irrep rank bounds need integers 0 <= min_rank <= max_rank, got "
+                         f"min_rank={min_rank!r}, max_rank={max_rank!r}")
+    top = K if max_rank is None else max_rank
+    candidates: List[Tuple[str, int]] = []                     # (label, dim) in draw order
+    for key in sorted(k for k in _IRREPS if k.startswith(f"{algebra}:")):
+        prefix = key.split(":", 1)[1]
+        for p in range(min_rank, top + 1):
+            label = f"{prefix}{p}"
+            try:
+                d = irrep_dim(N, algebra=algebra, label=label)
+            except ValueError:
+                continue                                       # the family is undefined at this (N, rank)
+            if d > K:
+                if N >= 3:                                     # dims grow with rank for N >= 3
+                    break
+                continue
+            try:
+                check_irrep_constructible(N, algebra=algebra, label=label, basis=basis)
+            except ValueError:
+                break                                          # higher ranks cost more still
+            candidates.append((label, d))
+    if not candidates:
+        raise ValueError(f"no {algebra}({N}) irrep with rank in [{min_rank}, {top}] fits K={K} "
+                         f"in basis {basis!r}")
+
+    count = _multiset_counts([d for _, d in candidates], n_heads, K)
+    if count[0][n_heads][K] == 0:
+        dims = sorted({d for _, d in candidates})
+        # Nearest feasible totals for the same head count, over every rank that fits in 2K.
+        wide = []
+        for key in sorted(k for k in _IRREPS if k.startswith(f"{algebra}:")):
+            prefix = key.split(":", 1)[1]
+            for p in range(min_rank, (2 * K if max_rank is None else max_rank) + 1):
+                try:
+                    d = irrep_dim(N, algebra=algebra, label=f"{prefix}{p}")
+                    check_irrep_constructible(N, algebra=algebra, label=f"{prefix}{p}", basis=basis)
+                except ValueError:
+                    continue
+                if d <= 2 * K:
+                    wide.append(d)
+        reach = _multiset_counts(sorted(wide), n_heads, 2 * K)[0][n_heads] if wide else []
+        below = max((k for k in range(K) if reach[k]), default=None)
+        above = min((k for k in range(K + 1, len(reach)) if reach[k]), default=None)
+        raise ValueError(
+            f"no {n_heads} {algebra}({N}) irreps with rank in [{min_rank}, {top}] have dimensions "
+            f"summing to K={K}: the candidate block dimensions are {dims} (labels "
+            f"{[label for label, _ in candidates]}). Nearest feasible embed_dim for n_heads={n_heads}: "
+            f"{below} below, {above} above (None: none up to 2K). Change K, n_heads or the rank bounds.")
+
+    rng = random.Random(seed)
+    spec: List[Tuple[str, int]] = []
+    h, k = n_heads, K
+    for i, (label, d) in enumerate(candidates):
+        r = rng.randrange(count[i][h][k])                      # index of the multiset still to draw
+        t = 0
+        while True:
+            ways = count[i + 1][h - t][k - t * d]
+            if r < ways:
+                break
+            r -= ways
+            t += 1
+        if t > 0:
+            spec.append((label, t))
+        h, k = h - t, k - t * d
+    return spec
