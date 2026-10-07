@@ -10,10 +10,19 @@ For the projected routes the reference-coordinate edge operator is
     \rho^h_{ijk}=\frac{\beta^h_{ij}\beta^h_{jk}}{\beta^h_{ik}},
 
 so its spectrum is a gauge invariant and the frames drop out. :math:`G` is the routing-independent
-factor (the constant-link curvature, readable from every map snapshot) and :math:`R` the routing factor
+factor (the constant link factor, readable from every map snapshot) and :math:`R` the routing factor
 (flat exactly for :math:`\beta_{ij}=c_i/c_j`). The curvature size of a matrix with eigenvalues
 :math:`\lambda_k` is :math:`\kappa=(\tfrac1K\sum_k|\mathrm{Log}\,\lambda_k|^2)^{1/2}` (principal complex
 logarithm), zero exactly when every eigenvalue is 1 (for a diagonalizable matrix, the identity).
+
+Reading :math:`\kappa(G)`. It is the holonomy size of the learned link field, but as a statistic it is the
+log-spectral departure of :math:`\hat T\hat O` from the identity, and any value/output product off the scalar
+line gives :math:`\kappa(G)>0`; a conventional transformer's :math:`W_VW_O` would read nonzero by the same
+measure. The zero at step 0 follows from the initialization :math:`T=I`, :math:`O=sI` (scale-free
+:math:`\kappa` of a scalar matrix). A rise in :math:`\kappa(G)` during training therefore does not by itself
+show curvature beyond an ordinary learned value/output factorization; compare it with the same statistic on
+a conventional baseline before reading it geometrically. Likewise :math:`\kappa(R)` is nonzero for any softmax
+whose weights are not of the form :math:`c_i/c_j`. The flat reference connection is unaffected either way.
 
 Two measurements:
 

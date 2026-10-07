@@ -18,12 +18,23 @@ the content that is heard pass through separate learned interfaces, one set per 
 
 The routing weights are each receiver's distribution over whom to hear, computed from a
 Gaussian divergence between the receiver's query law and each sender's key law under a
-causal prior over sources; under a declared compatibility record they are the exact
-posterior of the source label (v2 manuscript, Theorem `thm:probabilistic_status`). Every
-interface acts on reference coordinates, so an agent's private change of frame changes
-nothing that any other agent computes, and the messages transform covariantly.
-Coordination among the agents is therefore expressed as inference: whom to trust, how much
-to absorb, and how uncertain each agent remains after the exchange.
+causal prior over sources. Under a declared binary compatibility record these weights are
+the exact posterior of the source label (v2 manuscript, Theorem `thm:probabilistic_status`),
+as they would be for any nonnegative routing cost, so this posterior reading does not by
+itself distinguish the model from a conventional softmax router; what distinguishes it is
+the cost, a Gaussian divergence between belief laws. Within one attention step on
+full-covariance states, every interface acts on reference coordinates, so an agent's private
+change of frame changes nothing that any other agent computes, and the messages transform
+covariantly. The default and launcher configurations do not keep this property across the
+whole model: the diagonal family cannot represent $g\Sigma g^\top$, and local
+`block_coordinates` and `decode_coordinates` apply the block norm, the block MLP and the
+decoder to frame-dependent coordinates. Setting `family="gaussian_full"` with
+`block_coordinates="reference"` and `decode_coordinates="reference"` on the
+projected-predictive route without RoPE (these admit a `none` or `layernorm` norm and the
+coordinate, Gaussian-template or prototype block MLP, all conjugated by the realized frame)
+gives the frame-covariant path.
+In this sense the model expresses coordination among agents as inference: whom to trust, how
+much to absorb, and how uncertain each agent remains after the exchange.
 
 The primary configuration in `train_vfe3.py` uses **full-input/full-output projected
 attention with predictive-content readout**. Its attention step directly aggregates
@@ -613,7 +624,10 @@ approximation should remain distinct.
 Every result below is a single-seed run on WikiText-103 with the GPT-2 BPE tokenizer
 (50,257 types), context 128, and the evaluation of `vfe3.train.evaluate` (windows of 128
 tokens at stride 32; 280,541 scored test targets). Perplexities are per BPE token, on the
-held-out test split, at the final training weights.
+test split, at the final training weights. Within a run nothing is selected on the test
+split, but run directories are named by test perplexity and the recipes compared here were
+chosen across runs by those names, so the test perplexities are not untouched held-out
+estimates; the validation perplexities are reported beside them.
 
 ### K = 128 against a parameter-matched conventional transformer
 
@@ -629,7 +643,8 @@ held-out test split, at the final training weights.
 | Per-type tables | 225,201,617 (frames 205,852,672) | 218,768,721 (read maps 205,852,672) |
 | Parameters read per token | 7,807,185 | 7,805,009 |
 | Total parameters | 227,041,489 | 220,086,353 |
-| Optimizer | per-group AdamW rates (score 0.01, content 0.0025, MLP 0.005, prior means 0.005, frames 0.003), weight decay 0.01 | AdamW 3e-3 (best of a 6,000-step sweep over 3e-4 to 3e-3), weight decay 0.1 |
+| Optimizer | per-group AdamW rates (score 0.01, content 0.0025, MLP 0.005, prior means 0.005, frames 0.003), Adam betas (0.9, 0.999) | AdamW 3e-3 (best of a 6,000-step sweep over 3e-4 to 3e-3), Adam betas (0.9, 0.95) |
+| Weight decay | 0.1 on the frame and positional-frame tables, 0.01 on the block MLP, 0 on the mean and decode tables, the attention maps and the LayerNorm affine | 0.1 on every matrix and table (embedding, attention, MLP, decoder, read-map table), 0 on gains and biases |
 | Positions | learned positional frames, uniform causal prior | ALiBi |
 | Wall time, RTX 5090 | 58,897 s | 5,238 s |
 
@@ -647,19 +662,31 @@ therefore match in context-processing parameters (to 0.16 percent), in per-type 
 in the same order. The test gap is 0.469 nats per token, a perplexity ratio of 1.60.
 Earlier protocol-matched pairs without the per-type table (39.77 against 90.15 at $K=128$,
 52.91 against 117.63 at $K=64$, at a different token budget) matched non-embedding parameters
-but differed 16- to 17-fold in total parameters; this comparison removes that confound.
+but differed 16- to 17-fold in total parameters, and their baselines ran at a learning rate of
+6e-4, which the later 6,000-step sweep places well below its optimum; this comparison removes
+the parameter confound.
 
 What it does not establish: (1) compute is not matched; the VFE run took 11.2 times the
 baseline's wall time on the same GPU, and a compute-matched baseline has not been trained;
 (2) each arm has one seed (the nearest measured seed spread is about 0.6 perplexity at
-$K=30$); (3) the baseline's learning rate is the largest value of its sweep, so its optimum
-may lie higher, and the VFE rates were not swept either; (4) the frames act on both sides
+$K=30$); (3) the baseline's learning rate was chosen by a 6,000-step sweep, and the choice
+does not carry to the full horizon: an extended sweep (4e-3, 5e-3, 7e-3;
+`vfe3_runs/baselines/lr_sweep.json`) selected 5e-3 on validation, but the 150,000-step run at
+5e-3 reached 56.58 test perplexity
+(`vfe3_runs/baselines/56.58_wikitext-103_K128_baseline_block_read_s6`), worse than the
+55.10 at 3e-3; the VFE rates were not swept; (4) the optimizers differ beyond the learning
+rate: the baseline decays every matrix and table at 0.1 with Adam $\beta_2=0.95$, while the
+VFE run decays only its frame tables (0.1) and block MLP (0.01), leaves its mean and decode
+tables and attention maps undecayed, and uses $\beta_2=0.999$; no baseline with the VFE decay
+allocation and $\beta_2$ has been trained; (5) the frames act on both sides
 of every link ($U_j^{-1}$ to read, $U_i$ to write) while the read map acts on one side, and
 the VFE model also stores per-type variances (6.4M parameters, 3 percent of the total) and
 positional frames (524,288 parameters) where the baseline uses parameter-free ALiBi. The
-comparison isolates the construction as a whole against a conventional transformer with an
-equally large per-type table; it does not identify which ingredient (two-sided frames,
-divergence routing, propagated covariance, the exponential chart) produces the gap.
+comparison therefore sets the construction together with its optimizer configuration against
+a conventional transformer with an equally large per-type table and its own conventional
+optimizer configuration; it does not separate the two, and it does not identify which
+ingredient (two-sided frames, divergence routing, propagated covariance, the exponential
+chart) produces the gap.
 
 ### Edge-dependent links at K = 20
 
@@ -667,20 +694,23 @@ divergence routing, propagated covariance, the exponential chart) produces the g
 |---|---|---|---|
 | `"pure_gauge"` | 116.88 | 117.50 | 5,684 s |
 | `"lowrank"` | 116.94 | 117.46 | 12,059 s |
-| `"off"` (exponential chart) | pending | pending | |
+| `"off"` (exponential chart) | 116.46 | 116.15 | 3,424 s |
 
-Both runs use $K=20$ (two heads of width 10), four layers, 30,000 updates at batch 32,
-seed 6, the exponential chart and the coordinate MLP (`vfe3_runs/edge-links-ablations/`).
-The two arms differ by 0.0005 nats per token, far below the seed spread, so at this size and
-seed the extra holonomy of the curved mode has no measurable effect. Both models depend on
-their edges: zeroing the edge sender map of the trained models (which returns every link to
-$e^{L}$ while keeping the trained $T$ and $O$) raises the cross-entropy on 16 validation
-windows by 1.22 nats for the pure-gauge model and 10.2 nats for the curved one. The curved
-model's last layer reaches edge parts $\lVert E_{ij}-I\rVert_F$ of order $10^3$ on average and
-above $10^5$ at most in the logged diagnostics, a numerical risk at larger width. Whether edge dependence helps at all
-is decided by the edges-off arm at the same configuration, which was still training when
-this section was written. Small-width results validate the implementation and do not settle
-behavior at $K\ge128$.
+All three runs use $K=20$ (two heads of width 10), four layers, 30,000 updates at batch 32,
+seed 6, the exponential chart and the coordinate MLP (`vfe3_runs/edge-links-ablations/`);
+their configs differ only in `content_link_edges`. Neither edge mode improves on the
+edges-off chart: the off arm is 0.0036 nats per token better than pure-gauge and 0.0041
+better than lowrank, and the two edge arms differ by 0.0005 nats, all far below the seed
+spread, so at this size and seed edge dependence has no measurable effect, while costing
+1.7 times (pure-gauge) and 3.5 times (lowrank) the wall time. Zeroing the edge sender map
+of the trained edge models (which returns every link to $e^{L}$ while keeping the trained
+$T$ and $O$) raises the cross-entropy on 16 validation windows by 1.22 nats for the
+pure-gauge model and 10.2 nats for the curved one (an unsaved probe, with no run artifact);
+since the rest of each model co-adapted to its edges, this shows co-adaptation, not that the
+edges carry useful structure. The curved model's last layer reaches edge parts
+$\lVert E_{ij}-I\rVert_F$ of order $10^3$ on average and above $10^5$ at most in the logged
+diagnostics, a numerical risk at larger width. Small-width results validate the
+implementation and do not settle behavior at $K\ge128$.
 
 ## Implementation map
 

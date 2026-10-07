@@ -723,6 +723,44 @@ class PrototypeAgentBlockMLP(nn.Module):
         return prototype_mean_field_posterior(
             mu, sigma, self.nu, self.log_lambda, self.log_pi, need_covariance=need_covariance)
 
+    @torch.no_grad()
+    def calibrate_templates(
+        self,
+        mu:        torch.Tensor,                      # (..., K) working means this block receives
+        sigma:     torch.Tensor,                      # (..., K), (..., K, K) or (..., G, d, d)
+        *,
+        pull:      float,                             # target initial pull p in (0, 1)
+        generator: torch.Generator,                   # CPU generator for the template draw
+    ) -> Dict[str, float]:
+        r"""Data-dependent template initialization (``block_mlp_template_init='working_variance'``).
+
+        With :math:`\bar c` the mean diagonal working variance of the inputs, every template variance is set to
+        :math:`\lambda_0 = \bar c(1 - p)/p`, so that at uniform routing the gain :math:`\bar c/(\bar c + \lambda_0)`
+        is the target pull :math:`p`, and the template means are :math:`M` input means drawn without replacement
+        (with replacement when there are fewer than :math:`M`), so they sit at the scale of the block input. The
+        absolute default placed :math:`\nu` at scale :math:`K^{-1/2}` and used a fixed :math:`\lambda_0`, which gave
+        a 12 to 44 percent initial pull and near-uniform routing at ``sigma_init=15`` (audit 2026-10-07, F77/F78).
+        :math:`\lambda` sets both the pull and the routing temperature, so a small pull still implies soft initial
+        routing unless the spread of the inputs exceeds :math:`\lambda_0`. Returns the measured
+        :math:`\bar c` and the chosen :math:`\lambda_0`.
+        """
+        K = self.nu.shape[-1]
+        if sigma.dim() == mu.dim():
+            diag = sigma
+        elif sigma.dim() == mu.dim() + 1:
+            diag = sigma.diagonal(dim1=-2, dim2=-1)
+        else:
+            diag = sigma.diagonal(dim1=-2, dim2=-1).reshape(*sigma.shape[:-3], K)
+        c_bar = float(diag.double().mean())
+        lam0 = c_bar * (1.0 - pull) / pull
+        rows = mu.reshape(-1, K)
+        M, n = self.nu.shape[0], rows.shape[0]
+        index = (torch.randperm(n, generator=generator)[:M] if n >= M
+                 else torch.randint(0, n, (M,), generator=generator))
+        self.nu.copy_(rows[index.to(rows.device)].to(self.nu.dtype))
+        self.log_lambda.fill_(math.log(lam0))
+        return {"working_variance": c_bar, "lambda0": lam0}
+
     def forward_moments(
         self,
         mu: torch.Tensor,

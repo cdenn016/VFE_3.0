@@ -53,7 +53,8 @@ def test_generator_entries_order_and_complex_structure() -> None:
     group = get_group("block_glmc")(8, 2, dtype=F64)
     G = group.generators
     assert G.shape == (2 * 2 * 2 ** 2, 8, 8) and group.irrep_dims == [4, 4] and group.tying == "per_head"
-    assert not group.skew_symmetric and group.pullback_capability is None and group.algebra is None
+    # 2026-10-07 (audit F47): every registered group carries the pullback_per_block frame M-step.
+    assert not group.skew_symmetric and group.pullback_capability == "pullback_per_block" and group.algebra is None
     assert set(G.unique().tolist()) <= {-1.0, 0.0, 1.0}
     J = _J(8)
     assert float((G @ J - J @ G).abs().max()) == 0.0                     # [G_a, J] = 0
@@ -110,8 +111,8 @@ def test_config_accepts_and_refuses() -> None:
         test_config(gauge_group="block_glmc", embed_dim=8, n_heads=2, group_n=3)
     with pytest.raises(ValueError, match="irrep-labeled tower"):
         test_config(gauge_group="block_glmc", embed_dim=8, n_heads=2, use_cg_coupling=True)
-    with pytest.raises(ValueError, match="registers no pullback capability"):
-        test_config(gauge_group="block_glmc", embed_dim=8, n_heads=2, m_phi_update_mode="pullback_group")
+    # The pullback frame M-step reaches block_glmc since 2026-10-07 (audit F47).
+    test_config(gauge_group="block_glmc", embed_dim=8, n_heads=2, m_phi_update_mode="pullback_group")
     with pytest.raises(ValueError, match="block_glk"):
         test_config(gauge_group="block_glmc", embed_dim=8, n_heads=2, m_phi_update_mode="fisher_group")
     with warnings.catch_warnings():

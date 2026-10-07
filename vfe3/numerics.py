@@ -12,6 +12,7 @@ A theoretically pure path is always available (the unregularized op); the fallba
 guards that activate only when the pure path fails, and they are documented as such.
 """
 
+import contextlib
 import math
 import weakref
 from collections import OrderedDict
@@ -20,6 +21,21 @@ from typing import Callable, Dict, List, Literal, NamedTuple, Optional, Tuple
 import torch
 
 from vfe3.runtime import ieee_fp32_matmul
+
+
+@contextlib.contextmanager
+def _autocast_disabled():
+    r"""Disable any active autocast for the enclosed region (also usable as a decorator).
+
+    ``ieee_fp32_matmul`` pins the float32 matmul policy but not autocast, which still lowers the
+    enclosed GEMMs to bf16/fp16 under ``amp_dtype``. The certified routines below assume IEEE fp32
+    products, so they run with autocast off as well (audit 2026-10-07, F32).
+    """
+    with contextlib.ExitStack() as stack:
+        for device_type in ("cpu", "cuda"):
+            if torch.is_autocast_enabled(device_type):
+                stack.enter_context(torch.autocast(device_type=device_type, enabled=False))
+        yield
 
 
 def _symmetrize(matrix: torch.Tensor) -> torch.Tensor:
@@ -106,6 +122,17 @@ def bounded_variance_from_log(
     return torch.exp(log_sigma.clamp(max=max_log)).clamp(min=eps)
 
 
+def _overflow_safe_norm(x: torch.Tensor) -> torch.Tensor:   # (..., K) -> (..., 1)
+    r"""Euclidean norm over the last axis; where the plain norm overflows, the max-scaled form
+    :math:`m\|x/m\|_2` with :math:`m = \max_k|x_k|` (detached; the value is :math:`\|x\|_2` exactly in
+    real arithmetic). Finite norms are returned unchanged, so the healthy path is bit-identical."""
+    plain = x.norm(dim=-1, keepdim=True)
+    scale = x.detach().abs().amax(dim=-1, keepdim=True)
+    scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+    return torch.where(torch.isfinite(plain), plain, scale * (x / scale).norm(dim=-1, keepdim=True))
+
+
+@_autocast_disabled()
 def apply_mu_trust_region(
     delta_mu: torch.Tensor,              # (..., K) proposed mean step (e_q_mu_lr * nat_grad_mu)
     sigma_q:  torch.Tensor,              # (..., K) diagonal variances OR (..., K, K) covariance
@@ -163,7 +190,12 @@ def apply_mu_trust_region(
     if is_diagonal:
         scale = family_cls.trust_region_scale(sigma_q, eps=eps)
         whitened = delta_mu / scale
-        norm2 = whitened.norm(dim=-1, keepdim=True)
+        # A saturated coordinate over a small variance overflows on whitening; clamp it to the largest
+        # finite value and take an overflow-safe norm, so the step pins at the trust radius instead of
+        # vanishing (audit 2026-10-07, F35).
+        finfo_w = torch.finfo(whitened.dtype)
+        whitened = torch.nan_to_num(whitened, nan=0.0, posinf=finfo_w.max, neginf=-finfo_w.max)
+        norm2 = _overflow_safe_norm(whitened)
         return delta_mu * (trust / norm2.clamp(min=eps)).clamp(max=1.0)
 
     # rounds is a POLICY, not a constant (audit 2026-08-06 C6/F29). At rounds=0 there is zero
@@ -190,7 +222,7 @@ def apply_mu_trust_region(
     whitened_finfo = torch.finfo(whitened.dtype)
     whitened = torch.nan_to_num(
         whitened, nan=0.0, posinf=whitened_finfo.max, neginf=-whitened_finfo.max)
-    norm2 = whitened.norm(dim=-1, keepdim=True)
+    norm2 = _overflow_safe_norm(whitened)                   # finite even when whitened holds finfo.max
     bounded = whitened * (trust / norm2.clamp(min=eps)).clamp(max=1.0)
     full_out = (safe_factor @ bounded.unsqueeze(-1)).squeeze(-1)
     # The fallback is computed UNCONDITIONALLY (audit 2026-08-06 B3/F15). It used to sit behind an
@@ -201,7 +233,8 @@ def apply_mu_trust_region(
     # routes grad by SELECTION (the unselected branch receives an exact 0, not 0 * something).
     sigma_diag = family_cls.covariance_diagonal(sigma_q, eps=eps)
     scale = sigma_diag.clamp(min=eps).sqrt()
-    fallback_norm = (delta_mu / scale).norm(dim=-1, keepdim=True)
+    fallback_norm = _overflow_safe_norm(torch.nan_to_num(
+        delta_mu / scale, nan=0.0, posinf=whitened_finfo.max, neginf=-whitened_finfo.max))
     fallback = delta_mu * (trust / fallback_norm.clamp(min=eps)).clamp(max=1.0)
     return torch.where(ok.unsqueeze(-1), full_out, fallback)
 
@@ -474,6 +507,7 @@ def _recheck_spd_condition_on_cpu(
     return result.reshape(condition.shape)
 
 
+@_autocast_disabled()
 @ieee_fp32_matmul()
 def validated_cholesky_solve(
     matrix: torch.Tensor,                 # (..., K, K) candidate SPD system
@@ -621,6 +655,7 @@ def guarded_cholesky(
     return torch.linalg.cholesky_ex(torch.where(failed[..., None, None], eye, W))[0], failed
 
 
+@_autocast_disabled()
 @ieee_fp32_matmul()
 def cholesky_qr2(
     X: torch.Tensor,   # (..., r, m) source root with r <= m

@@ -247,6 +247,9 @@ def _identity_covariance_score(
     from vfe3.relational_scoring import (
         _compute_dtype, projected_moments, routing_cost)
 
+    if getattr(operators, "comparison_rope_base", None) is not None:
+        raise NotApplicable("rope_space='comparison': this counterfactual scorer does not apply the comparison-space "
+                            "rotation, so it would not match the trained router")
     if operators.mixed_heads:
         raise NotApplicable(f"{operators.irrep_dims}: heads of different sizes (a mixed so_n irrep tower) are not supported by this analysis yet")
     H, d = len(operators.irrep_dims), operators.irrep_dims[0]
@@ -514,6 +517,9 @@ def _frame_free_covariance_score(
     from vfe3.relational_scoring import (
         _compute_dtype, projected_moments, routing_cost)
 
+    if getattr(operators, "comparison_rope_base", None) is not None:
+        raise NotApplicable("rope_space='comparison': this counterfactual scorer does not apply the comparison-space "
+                            "rotation, so it would not match the trained router")
     if operators.mixed_heads:
         raise NotApplicable(f"{operators.irrep_dims}: heads of different sizes (a mixed so_n irrep tower) are not supported by this analysis yet")
     H, d = len(operators.irrep_dims), operators.irrep_dims[0]

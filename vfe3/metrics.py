@@ -214,8 +214,12 @@ def flatness_reference_statistics(
 ) -> Dict[str, float]:
     r"""Compare fp32 and rebuilt-fp64 numerical closure of a flat vertex cocycle.
 
-    With ``right_phi=Y``, the measured vertex and inverse are the actual exact-composition
-    operators ``U=exp(X) exp(Y)`` and ``U^{-1}=exp(-Y) exp(-X)``.
+    With ``right_phi=Y``, the measured vertex and inverse are the exact-composition operators
+    ``U=exp(X) exp(Y)`` and ``U^{-1}=exp(Y)^{-1} exp(X)^{-1}``. The fp32 inverse of each factor is formed as
+    the live producer stores it (``_checked_group_inverse_certified``): the float64 inverse of the float32
+    exponential, cast to float32, not a separately rounded ``exp(-M)``, which overstated the live residuals
+    5 to 26 times (audit 2026-10-07, F65). A frame pair the live certificate escalates to float64 is
+    measured here in float32 all the same.
     """
     coordinate = phi[0] if phi.dim() == 3 else phi
     matrix64 = _diagnostic_embed(coordinate.double(), generators)
@@ -229,6 +233,7 @@ def flatness_reference_statistics(
     def _measure(
         matrix:       torch.Tensor,
         right_matrix: Optional[torch.Tensor],
+        live_inverse: bool = False,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -243,14 +248,19 @@ def flatness_reference_statistics(
                     if block_dims and len(block_dims) > 1
                     else torch.linalg.matrix_exp(value))
 
+        def _inverse(value: torch.Tensor, positive: torch.Tensor) -> torch.Tensor:
+            return (torch.linalg.inv(positive.double()).to(positive.dtype) if live_inverse
+                    else _exp(-value))
+
         left_pos = _exp(matrix)
-        left_neg = _exp(-matrix)
+        left_neg = _inverse(matrix, left_pos)
         if right_matrix is None:
             exp_pos = left_pos
             exp_neg = left_neg
         else:
-            exp_pos = left_pos @ _exp(right_matrix)
-            exp_neg = _exp(-right_matrix) @ left_neg
+            right_pos = _exp(right_matrix)
+            exp_pos = left_pos @ right_pos
+            exp_neg = _inverse(right_matrix, right_pos) @ left_neg
         eye = torch.eye(k_dim, device=matrix.device, dtype=matrix.dtype)
         inverse = torch.linalg.matrix_norm(exp_pos @ exp_neg - eye, ord="fro", dim=(-2, -1))
         inverse_rel = inverse / torch.linalg.matrix_norm(eye, ord="fro").clamp(min=eps)
@@ -281,7 +291,7 @@ def flatness_reference_statistics(
         )
 
     ha32, hr32, ca32, cr32, ia32, ir32 = _measure(
-        matrix64.float(), None if right_matrix64 is None else right_matrix64.float(),
+        matrix64.float(), None if right_matrix64 is None else right_matrix64.float(), live_inverse=True,
     )
     ha64, hr64, ca64, cr64, ia64, ir64 = _measure(matrix64, right_matrix64)
     return {

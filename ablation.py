@@ -101,6 +101,7 @@ from vfe3.process_utils import run_process_tree
 from vfe3.run_artifacts import (
     RunArtifacts,
     _atomic_replace,
+    _config_from_run_serialized,
     _pure_path_report,
     _package_code_identity,
     _PROCESS_PACKAGE_CODE_IDENTITY,
@@ -3088,6 +3089,34 @@ def _model_artifacts_are_current(
     return True
 
 
+def _schema_migrated_contract(
+    run_dir:           Path,
+    loaded:            Mapping[str, object],
+    expected_contract: Mapping[str, object],
+) -> Optional[Dict[str, object]]:
+    r"""The stored contract with its config fingerprint re-derived under the current config schema.
+
+    A schema-only edit (a retired field the loader drops or migrates, or a new field at its default)
+    changes ``asdict(cfg)`` and so the stored ``semantic_config_fingerprint`` while the effective config
+    is unchanged. Loading the cell's own ``config.json`` through the run-config loader (which refuses a
+    retired field whose saved value changed the forward) and fingerprinting the result recovers that
+    case (audit 2026-10-07, F07). Returns the stored contract with the re-derived fingerprint when it
+    equals the expected one, else None.
+    """
+    if loaded.get("semantic_config_fingerprint") == expected_contract.get("semantic_config_fingerprint"):
+        return None
+    try:
+        raw = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
+        payload = raw.get("config", raw) if isinstance(raw, Mapping) else raw   # RunArtifacts wraps it
+        cfg = _config_from_run_serialized(payload, source=f"ablation cell {run_dir.name}")
+        migrated = semantic_config_fingerprint(asdict(cfg))
+    except Exception:                                        # unreadable or refused -> no migration
+        return None
+    if migrated != expected_contract.get("semantic_config_fingerprint"):
+        return None
+    return {**dict(loaded), "semantic_config_fingerprint": migrated}
+
+
 def _cell_is_current(
     run_dir:           Path,
     expected_contract: Mapping[str, object],
@@ -3123,8 +3152,8 @@ def _cell_is_current(
     if marker_diagnostic_flags != expected_diagnostic_flags:
         return False
     expected_fingerprint = semantic_config_fingerprint(dict(expected_contract))
-    if marker.get("cell_contract_fingerprint") != expected_fingerprint:
-        return False
+    # A marker bound to an older config schema is checked against its own stored contract below.
+    schema_only = marker.get("cell_contract_fingerprint") != expected_fingerprint
     try:
         terminal_ppl = float(marker["final_val_ppl"])
     except (KeyError, TypeError, ValueError):
@@ -3165,6 +3194,13 @@ def _cell_is_current(
         return False
     if loaded.get("schema_version") != _CELL_CONTRACT_SCHEMA_VERSION:
         return False
+    if schema_only:
+        if marker.get("cell_contract_fingerprint") != semantic_config_fingerprint(dict(loaded)):
+            return False
+        migrated = _schema_migrated_contract(run_dir, loaded, expected_contract)
+        if migrated is None:
+            return False
+        loaded = migrated
     return (dict(loaded) == dict(expected_contract)
             and semantic_config_fingerprint(dict(loaded)) == expected_fingerprint)
 

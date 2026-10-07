@@ -43,7 +43,7 @@ def test_structure_and_bracket_closure(name: str) -> None:
     G = group.generators
     m = N_GEN[name](3)
     assert G.shape == (2 * m, 6, 6) and group.irrep_dims == [3, 3] and group.tying == "per_head"
-    assert group.skew_symmetric == (name == "block_so") and group.pullback_capability is None
+    assert group.skew_symmetric == (name == "block_so") and group.pullback_capability == "pullback_per_block"
     torch.testing.assert_close(torch.einsum("aij,bij->ab", G, G), torch.eye(2 * m, dtype=torch.float64))
     for a in range(2 * m):                                   # each generator lives on one head block
         assert (float(G[a, :3, :3].abs().sum()) > 0) != (float(G[a, 3:, 3:].abs().sum()) > 0)

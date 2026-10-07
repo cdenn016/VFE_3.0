@@ -393,7 +393,6 @@ def get_group(name: str) -> Callable[..., GaugeGroup]:
 @register_group(
     "block_glk",
     pullback_capability="pullback_per_block",
-    pullback_tying="per_head",
     invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
     traits=GroupTraits(tyings=GAUGE_TYINGS),
 )
@@ -536,6 +535,7 @@ def check_admissible(
 
 @register_group(
     "so_n",
+    pullback_capability="pullback_per_block",
     invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
     # RoPE's coordinate-pair rotation is generally not in the irrep image rho(SO(N)).
     traits=GroupTraits(algebra="so", tyings=GAUGE_TYINGS, native_tying="shared",
@@ -672,6 +672,7 @@ def _build_block_local(
 
 @register_group(
     "block_so",
+    pullback_capability="pullback_per_block",
     invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
     traits=GroupTraits(min_head_dim=2),
 )
@@ -699,6 +700,7 @@ def _build_block_so(
 
 @register_group(
     "block_co",
+    pullback_capability="pullback_per_block",
     invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
     traits=GroupTraits(),
 )
@@ -726,6 +728,7 @@ def _build_block_co(
 
 @register_group(
     "block_glmc",
+    pullback_capability="pullback_per_block",
     invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
     traits=GroupTraits(min_head_dim=2, head_dim_multiple=2),
 )

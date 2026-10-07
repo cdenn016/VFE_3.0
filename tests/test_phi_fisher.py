@@ -262,15 +262,18 @@ def test_direction_identities_off_strip_rejection_and_descent_pairing() -> None:
     direction = belief_fisher_group_direction(
         grad.reshape(rows, -1), X.reshape(rows, -1), U, collect=True, statistics=statistics,
         rotation_weight=2.0, chart_velocity=True, diagnostics_out=diagnostics)
-    assert direction.accepted.tolist() == [True, True, False]
-    assert float(direction.xi[2].abs().max()) == 0.0 and float(direction.v_phi[2].abs().max()) == 0.0
+    # Row 2 is off the strip; since 2026-10-07 (audit F21) its covector and chart velocity come from the
+    # eigenbasis Psi inversion and satisfy the same identities as the on-strip rows.
+    assert direction.accepted.tolist() == [True, True, True]
     assert float(torch.cat(diagnostics["offstrip_rows"]).sum()) == 1.0
-    for r in range(2):
+    for r in range(3):
         W = U[r, 0] @ direction.xi[r, 0] @ torch.linalg.inv(U[r, 0])   # spatial direction
         v = direction.v_phi[r].reshape(d, d)
         for t in (1e-4, 1e-5):                                         # chart velocity is dexp^{-1}
             gap = torch.linalg.matrix_exp(X[r, 0] + t * v) - torch.linalg.matrix_exp(t * W) @ U[r, 0]
-            assert float(gap.norm()) <= 50 * t * t
+            # Second order in t with constant ~ |v|^2: the off-strip row sits near the exp singularity
+            # (eigenvalue difference 6.4i, |Psi_R| ~ 0.018), so its chart velocity is large.
+            assert float(gap.norm()) <= 50 * t * t * (1.0 + float(v.norm()) ** 2)
         pairing = (grad[r, 0] * v).sum()
         assert float(pairing) > 0.0
         G_bar = direction.covector[r, 0]
@@ -466,11 +469,13 @@ def test_fisher_optimizer_moves_only_active_rows_counts_rejections_and_keeps_no_
     optimizer.step()
 
     after = phi.detach()
-    assert torch.equal(after[[1, 3, 4]], before[[1, 3, 4]])           # inactive, and rejected
-    assert not torch.equal(after[0], before[0]) and not torch.equal(after[2], before[2])
-    assert optimizer.phi_rejected_rows == 1
+    assert torch.equal(after[[1, 3]], before[[1, 3]])                 # inactive
+    # Row 4 is off the strip and moves (audit 2026-10-07, F21: no longer a permanent zero step).
+    for r in (0, 2, 4):
+        assert not torch.equal(after[r], before[r])
+    assert optimizer.phi_rejected_rows == 0
     assert phi.grad is None and optimizer.state_dict()["state"] == {}
-    for r in (0, 2):                                                   # trust radius on the right factor
+    for r in (0, 2, 4):                                                # trust radius on the right factor
         X_old = before[r].double().view(2, 3, 3)
         X_new = after[r].double().view(2, 3, 3)
         right = logm_principal(torch.linalg.matrix_exp(-X_old) @ torch.linalg.matrix_exp(X_new))[0]
@@ -478,7 +483,7 @@ def test_fisher_optimizer_moves_only_active_rows_counts_rejections_and_keeps_no_
     diagnostics = optimizer._gauge_diag
     assert set(FISHER_DIAGNOSTIC_KEYS) <= set(diagnostics)
     assert diagnostics["phi_fisher_offstrip_rows"] == 1.0
-    assert diagnostics["phi_group_rejected_rows"] == 1.0
+    assert diagnostics["phi_group_rejected_rows"] == 0.0              # the off-strip row is solved, not rejected
     assert math.isnan(diagnostics["phi_fisher_pos_lambda_min"])      # no positional table here
     assert math.isfinite(diagnostics["phi_ridge_direction_cosine_mean"])
 

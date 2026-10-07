@@ -91,10 +91,34 @@ def relational_score(
         if capture is not None:
             captured_q.append(G_q.detach().to(public))
             captured_k.append(G_k.detach().to(public))
+        projection_q = (sigma_h, inverse, S_q, mu_h)
+        projection_k = (source_sigma_h, key_inverse, S_k, source_mu_h)
+        rope_base = getattr(operators, "comparison_rope_base", None)
+        if rope_base is not None:
+            # rope_space='comparison' (audit 2026-10-07, F28): rotate token i's projected moments by R_i in the
+            # r-dimensional comparison space, a -> R_i a, G -> R_i G R_i^T, for query and key alike. A Gaussian KL
+            # (and the noisy-query and mean-distance costs) is invariant under a common orthogonal map, so the
+            # pair (i, j) cost equals the cost of (a_i, G_i) against (R_{j-i} b_j, R_{j-i} G_j R_{j-i}^T): a function
+            # of positions only through j - i. The source-root recovery assumes G = L Sigma L^T with the
+            # unrotated L, so it is disabled here; a failed or ill-conditioned factor then takes the whole-tensor
+            # float64 refactor of the rotated G.
+            r = S_q.shape[-2]
+            from vfe3.geometry.rope import build_rope_rotation
+            R_q = build_rope_rotation(torch.arange(a_q.shape[-3], device=a_q.device), [r],
+                                      base=rope_base, device=a_q.device, dtype=a_q.dtype)      # (N, r, r)
+            R_k = R_q if a_k.shape[-3] == a_q.shape[-3] else build_rope_rotation(
+                torch.arange(a_k.shape[-3], device=a_k.device), [r], base=rope_base, device=a_k.device,
+                dtype=a_k.dtype)
+            a_q = torch.einsum("nst,...nht->...nhs", R_q, a_q)
+            a_k = torch.einsum("nst,...nht->...nhs", R_k, a_k)
+            G_q = torch.einsum("nst,...nhtu,nvu->...nhsv", R_q, G_q, R_q)
+            G_k = torch.einsum("nst,...nhtu,nvu->...nhsv", R_k, G_k, R_k)
+            G_q, G_k = 0.5 * (G_q + G_q.transpose(-1, -2)), 0.5 * (G_k + G_k.transpose(-1, -2))
+            projection_q = projection_k = None
         scores.append(score(
             a_q, G_q, a_k, G_k,
-            projection_q=(sigma_h, inverse, S_q, mu_h),
-            projection_k=(source_sigma_h, key_inverse, S_k, source_mu_h)).to(public))
+            projection_q=projection_q,
+            projection_k=projection_k).to(public))
     if capture is not None:
         # One (..., N, H, r, r) tensor for equal heads; a list with one per run for mixed head sizes.
         capture["projected_covariance_pre"] = captured_q[0] if len(captured_q) == 1 else captured_q

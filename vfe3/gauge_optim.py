@@ -262,6 +262,24 @@ def _pullback_group_current_element(
     return torch.linalg.matrix_exp(torch.einsum("...a,aij->...ij", phi, generators))
 
 
+def _dense_group_element(
+    element: torch.Tensor,                   # (..., K, K) dense, or (..., H, d, d) equal direct-sum blocks
+    K:       int,
+) -> torch.Tensor:                           # (..., K, K)
+    r"""A dense group element, assembling direct-sum blocks when the per-block direction reported them.
+
+    A group whose basis is not the elementary block basis (block_so, block_co, block_glmc) is staged densely
+    while its per-block direction reports :math:`\exp(\varphi)` as blocks (audit 2026-10-07, F47).
+    """
+    if element.shape[-1] == K and element.shape[-2] == K:
+        return element
+    dense = element.new_zeros(*element.shape[:-3], K, K)
+    d = element.shape[-1]
+    for h in range(element.shape[-3]):
+        dense[..., h * d:(h + 1) * d, h * d:(h + 1) * d] = element[..., h, :, :]
+    return dense
+
+
 def _pullback_group_product_residual(
     candidate_phi:   torch.Tensor,           # (active, n_gen) stored-precision chart candidate
     current_element: torch.Tensor,           # exp(phi) from _pullback_group_current_element
@@ -292,6 +310,7 @@ def _pullback_group_product_residual(
 
     candidate_element = torch.linalg.matrix_exp(_embedded(candidate_phi))
     right_element = torch.linalg.matrix_exp(_embedded(delta))
+    current_element = _dense_group_element(current_element, candidate_element.shape[-1])
     reference = current_element @ right_element
     error = torch.linalg.matrix_norm(candidate_element - reference, dim=(-2, -1))
     scale = torch.linalg.matrix_norm(reference, dim=(-2, -1))
@@ -691,8 +710,10 @@ def belief_fisher_group_direction(
     :math:`\langle \bar G, U\xi \rangle_F = \langle G_W, W \rangle_F > 0`. The covector for the
     descent gate is :math:`\bar G`.
 
-    Rows with any block off the strip are rejected (zero step): no exact off-strip chart map is
-    implemented. Rows whose positional solve fails its residual gate, whose count is zero, or
+    A block off the strip (within the 0.25 margin, or beyond |Im lambda| = pi) recovers its covector and chart
+    velocity by inverting Psi in the eigenbasis of its chart block, exact wherever Psi is invertible; it is
+    rejected only when that solve fails its conditioning gate (audit 2026-10-07, F21). Rows whose positional
+    solve fails its residual gate, whose count is zero, or
     whose outputs are nonfinite are rejected as well. With ``chart_velocity`` (the chart
     retraction) the chart velocity :math:`v = L_{\log}(U, W U) = \Psi_R(\mathrm{ad}_X)^{-1} W` is the
     step and a failure rejects the row; with only ``collect`` it feeds the cosine diagnostic and a
@@ -709,7 +730,7 @@ def belief_fisher_group_direction(
     M = grad_phi.view(rows, n_blocks, block_dim, block_dim)              # (A, H, d, d), Gram B = I
     U = current_blocks
     certified, _ = principal_strip_certificate(X, margin=_UGROUP_STRIP_MARGIN)   # (A, H)
-    G_bar, covector_ok = uspace_ambient_gradient(X, M, U=U, certified=certified)
+    G_bar, covector_ok = uspace_ambient_gradient(X, M, U=U, certified=certified, offstrip=True)
     G_W = G_bar @ U.transpose(-1, -2)                                    # (A, H, d, d) spatial covector
     count = statistics.count.to(dtype=torch.float64)
     scale = statistics.total.to(dtype=torch.float64) / count.clamp_min(1.0)      # (A,) N / n
@@ -737,7 +758,7 @@ def belief_fisher_group_direction(
                 & torch.isfinite(xi).flatten(1).all(dim=-1))
     v_phi = None
     if chart_velocity or collect:
-        v, velocity_ok = uspace_chart_velocity(X, W, U=U, certified=certified)
+        v, velocity_ok = uspace_chart_velocity(X, W, U=U, certified=certified, offstrip=True)
         velocity_ok = velocity_ok.all(dim=-1)
         if chart_velocity:
             accepted = accepted & velocity_ok
@@ -1220,6 +1241,25 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                 "consumed before super().step(), so a closure that re-backpropagates would "
                 "double-step the frame. Call step() with no closure."
             )
+        # Fused AdamW sets _step_supports_amp_scaling, so GradScaler.step skips unscale_ and instead
+        # attaches grad_scale (the loss scale) and found_inf, which only the fused kernel in
+        # super().step() reads. The manifold phi step is built from p.grad here, so it must apply the
+        # same contract itself: skip the commit on an overflow step, else divide out the loss scale
+        # (audit 2026-10-07, F43). grad_scale is None when the caller already unscaled.
+        grad_scale = getattr(self, "grad_scale", None)
+        found_inf = getattr(self, "found_inf", None)
+        if grad_scale is not None or found_inf is not None:
+            manifold_params = [p for group in self.param_groups if group.get("pullback_group", False)
+                               for p in group["params"] if p.grad is not None]
+            if found_inf is not None and bool(found_inf):              # fp16 path only; GradScaler skips the step
+                for p in manifold_params:
+                    p.grad = None
+                if self._collect_gauge_diag:
+                    self._gauge_diag = {}
+                return super().step()
+            if grad_scale is not None:
+                for p in manifold_params:
+                    p.grad.div_(grad_scale.to(device=p.grad.device, dtype=p.grad.dtype))
         collect = self._collect_gauge_diag                             # gated: True only on log/eval steps
         if collect:
             self._gauge_diag = {}                                      # never expose a prior attempted step
@@ -1357,6 +1397,10 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                         current_element = _pullback_group_current_element(previous, self._group)
                     committed_element = _pullback_group_current_element(
                         candidate.candidate_phi, self._group)
+                    if committed_element.shape != current_element.shape:
+                        K = self._group.generators.shape[-1]
+                        current_element = _dense_group_element(current_element, K)
+                        committed_element = _dense_group_element(committed_element, K)
                     frame_displacement_acc.append(torch.linalg.vector_norm(
                         (committed_element - current_element).reshape(previous.shape[0], -1), dim=-1))
                     covector_norm_acc.append(torch.linalg.vector_norm(

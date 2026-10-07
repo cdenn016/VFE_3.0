@@ -252,27 +252,37 @@ def _loewner_adjoint(
         lower,
         upper,
     )
+    # Where both eigenvalues lie on the active (unclamped) interval, the divided difference has a
+    # cancellation-free closed form; forming it as value_gap / gap instead loses about
+    # eps * f / (f' * gap) relative accuracy, which grows as the tangent shrinks (audit 2026-10-07,
+    # F33/F67). A pair with a clamped member keeps the generic quotient (the clamp makes the two
+    # values differ by a non-cancelling amount), and an unresolved pair keeps the midpoint limit.
+    #   sqrt:     (sqrt a - sqrt b)/(a - b) = 1/(sqrt a + sqrt b)
+    #   inv_sqrt: (a^-1/2 - b^-1/2)/(a - b) = -1/(sqrt a sqrt b (sqrt a + sqrt b))
+    #   exp:      (e^a - e^b)/(a - b) = e^b expm1(a - b)/(a - b)
+    #   log:      (log a - log b)/(a - b) = log1p((a - b)/b)/(a - b)
+    active_i = lambda_i >= lower
+    active_j = lambda_j >= lower
+    if upper is not None and kind in ("exp_bounded", "project"):
+        active_i = active_i & (lambda_i <= upper)
+        active_j = active_j & (lambda_j <= upper)
+    both_active = active_i & active_j & ~repeated
+    if kind in ("sqrt_floor", "inv_sqrt_floor", "exp_bounded", "log_floor"):
+        # Placeholders off the active pairs keep every branch finite (torch.where differentiates both).
+        safe_i = torch.where(both_active, lambda_i, torch.ones_like(gap))
+        safe_j = torch.where(both_active, lambda_j, torch.ones_like(gap))
+        safe_gap_active = torch.where(both_active, gap, torch.ones_like(gap))
+        if kind == "sqrt_floor":
+            closed = (safe_i.sqrt() + safe_j.sqrt()).reciprocal()
+        elif kind == "inv_sqrt_floor":
+            root_i, root_j = safe_i.sqrt(), safe_j.sqrt()
+            closed = -(root_i * root_j * (root_i + root_j)).reciprocal()
+        elif kind == "exp_bounded":
+            closed = torch.exp(safe_j) * torch.expm1(safe_gap_active) / safe_gap_active
+        else:
+            closed = torch.log1p(safe_gap_active / safe_j) / safe_gap_active
+        divided_difference = torch.where(both_active, closed, divided_difference)
     divided_difference = torch.where(repeated, repeated_limit, divided_difference)
-    if kind == "exp_bounded":
-        assert upper is not None
-        # Distinct fp32 eigenvalues can remain resolvable while their exponentials round to the
-        # same value, making the ordinary output divided difference spuriously zero. ``expm1``
-        # retains the active-interval Fréchet derivative without changing any forward value.
-        active = (
-            (lambda_i >= lower)
-            & (lambda_i <= upper)
-            & (lambda_j >= lower)
-            & (lambda_j <= upper)
-        )
-        rounded_gap_zero = value_gap == 0
-        nonzero_gap = gap != 0
-        stable_difference = torch.exp(lambda_j) * torch.expm1(gap) / gap
-        use_stable_difference = active & rounded_gap_zero & nonzero_gap
-        divided_difference = torch.where(
-            use_stable_difference,
-            stable_difference,
-            divided_difference,
-        )
 
     eigenvectors_t = eigenvectors.transpose(-1, -2)
     symmetric_grad = 0.5 * (grad_output + grad_output.transpose(-1, -2))
@@ -440,6 +450,9 @@ def _certify_public_spd(
     if not bool(failed.any()):
         return symmetric
 
+    # Count the repaired rows (audit 2026-10-07, F34/F64): a repair lifts lambda_min to eps plus the
+    # public-dtype clearance, so R_Sigma(0) != Sigma for such a row; the count makes that visible.
+    _count_public_spd_repairs(failed)
     repair_input = certificate[failed]
     eigenvalues, eigenvectors = _eigh_damped(repair_input, _rel_gap_eps(repair_input))
     scale = repair_input.abs().amax(dim=(-2, -1), keepdim=True).clamp_min(1.0)
@@ -510,6 +523,29 @@ def _certify_public_spd(
 
 
 _NONFINITE_TANGENT_COUNTS: Dict[str, torch.Tensor] = {}
+# Covariance rows rebuilt by _certify_public_spd, per device (async add on the repair path only).
+_PUBLIC_SPD_REPAIR_COUNTS: Dict[str, torch.Tensor] = {}
+
+
+def _count_public_spd_repairs(failed: torch.Tensor) -> None:
+    r"""Accumulate the rows :func:`_certify_public_spd` repaired, per device (async add, no host sync)."""
+    key = str(failed.device)
+    counter = _PUBLIC_SPD_REPAIR_COUNTS.get(key)
+    if counter is None:
+        counter = torch.zeros((), dtype=torch.int64, device=failed.device)
+        _PUBLIC_SPD_REPAIR_COUNTS[key] = counter
+    counter += failed.sum()
+
+
+def public_spd_repair_elements() -> int:
+    r"""Covariance rows repaired by the SPD certificate since the last reset. Host-syncs."""
+    return int(sum(int(count) for count in _PUBLIC_SPD_REPAIR_COUNTS.values()))
+
+
+def reset_public_spd_repair_elements() -> None:
+    r"""Zero the SPD-certificate repair counters."""
+    for count in _PUBLIC_SPD_REPAIR_COUNTS.values():
+        count.zero_()
 
 
 def _neutralize_nonfinite_tangent(
