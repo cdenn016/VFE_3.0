@@ -890,6 +890,9 @@ class PriorBank(nn.Module):
         self.encode_mode = encode_mode
         self.decode_mode = decode_mode
         self.decode_chunk_size = decode_chunk_size
+        # Autocast dtype for the linear decode's logits matmul (VFE3Config.decode_logits_amp); None
+        # keeps it in the fp32 decode island. Set by the model after construction.
+        self.decode_logits_amp_dtype: Optional[torch.dtype] = None
         self.decode_ce_checkpoint = decode_ce_checkpoint
         self.decode_ranking_fp64_escalation = decode_ranking_fp64_escalation
         self.unigram_kappa = unigram_kappa
@@ -1775,7 +1778,7 @@ class PriorBank(nn.Module):
                              b_c:     Optional[torch.Tensor],
                              u_c:     Optional[torch.Tensor]) -> 'tuple[torch.Tensor, torch.Tensor]':
             r"""Reduce one vocab chunk to (lse_chunk, target_contrib), both (B, N), on the inside."""
-            logit_chunk = mu_ @ w_c.transpose(-1, -2)                      # (B, N, Vc)
+            logit_chunk = _linear_logits(self, mu_, w_c)                   # (B, N, Vc)
             if b_c is not None:
                 if torch.promote_types(logit_chunk.dtype, b_c.dtype) == logit_chunk.dtype:
                     logit_chunk.add_(b_c)  # fresh logits; the bias slice cannot expand shape
@@ -2636,6 +2639,25 @@ def _decode_expected_likelihood_chunked(
     return torch.cat(logit_chunks, dim=-1)                               # (B, N, V)
 
 
+def _linear_logits(
+    pb: PriorBank,
+    x:  torch.Tensor,                    # (..., K) decode input
+    W:  torch.Tensor,                    # (V, K) output weight (or a vocab chunk of it)
+) -> torch.Tensor:                       # (..., V) logits x W^T, fp32 when autocast ran
+    r"""The linear decode's logits matmul :math:`x W^\top`.
+
+    With ``pb.decode_logits_amp_dtype`` set it runs under that autocast dtype (low-precision
+    operands, fp32 accumulation) and is returned as fp32, so the bias, logsumexp and cross-entropy
+    that follow stay in fp32; otherwise it is the plain matmul in the caller's precision.
+    """
+    dtype = getattr(pb, "decode_logits_amp_dtype", None)
+    if dtype is None:
+        return x @ W.transpose(-1, -2)
+    with torch.autocast(device_type=x.device.type, dtype=dtype):
+        logits = x @ W.transpose(-1, -2)
+    return logits.float()
+
+
 @register_decode(
     "linear",
     supports_chunked=True,
@@ -2660,7 +2682,7 @@ def _decode_linear(
     the opt-in ablation the user uses to compare with/without the prior-bank decode.
     """
     x = mu_q                                                           # bare converged mean
-    logits = x @ pb.output_proj_weight.transpose(-1, -2)               # (B, N, V)
+    logits = _linear_logits(pb, x, pb.output_proj_weight)              # (B, N, V)
     if pb.output_proj_bias is not None:
         logits = logits + pb.output_proj_bias                           # learned log-unigram prior
     return logits

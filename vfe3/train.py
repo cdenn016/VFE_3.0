@@ -20,7 +20,7 @@ import math
 import time
 from numbers import Real
 from pathlib import Path
-from typing import (Any, Callable, Collection, Dict, Iterable, List, Mapping, NamedTuple, Optional,
+from typing import (Any, Callable, Collection, Dict, Iterable, Iterator, List, Mapping, NamedTuple, Optional,
                     Sequence, Tuple)
 
 import torch
@@ -2922,6 +2922,87 @@ def _training_cursor_fields(
     }
 
 
+_MATMUL_PRECISION_LADDER: Tuple[str, ...] = ("medium", "high", "highest")
+
+
+@contextlib.contextmanager
+def _float32_matmul_precision(policy: str) -> Iterator[None]:
+    r"""Set the process fp32 matmul policy for the enclosed forward and backward, then restore it."""
+    previous = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision(policy)
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(previous)
+
+
+def _train_step_with_precision_retry(
+    model:     VFEModel,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LambdaLR,
+    tokens:    torch.Tensor,             # (B, N) input token ids
+    targets:   torch.Tensor,             # (B, N) next-token ids
+
+    *,
+    logger:    logging.Logger,
+    step:      int,
+    **step_kwargs: Any,
+) -> Tuple[float, int]:                  # (loss, number of escalated replays the step needed)
+    r"""Run :func:`train_step`; under ``cfg.matmul_precision_retry`` replay a failed step at a stricter policy.
+
+    Under a reduced ``fp32_matmul_precision`` the GEMM rounding is about :math:`2^{-10}` (TF32,
+    ``"high"``) or :math:`2^{-7}` (bf16, ``"medium"``) instead of :math:`2^{-23}`, enough to trip a
+    fail-closed certificate (frame-pair inverse residual, positive source variance, factorization)
+    on an ill-conditioned frame. When the step raises before the optimizer has updated (a step
+    pre-hook records any update), the gradients are dropped, the CPU and CUDA RNG states are
+    restored, and the same step runs again, forward and backward, one rung stricter on the ladder
+    ``"medium" -> "high" -> "highest"``. A failure that persists at ``"highest"`` is raised with the
+    earlier failures attached as notes, so a genuine defect still stops the run. Out-of-memory errors
+    and failures after an update are never replayed. Not used with an enabled GradScaler (fp16),
+    whose per-step unscale state a replay would violate. Module-level numerics counters may count
+    the abandoned attempts.
+    """
+    scaler = step_kwargs.get("scaler")
+    current = torch.get_float32_matmul_precision()
+    if (not getattr(model.cfg, "matmul_precision_retry", False)
+            or current == "highest"
+            or (scaler is not None and scaler.is_enabled())):
+        return train_step(model, optimizer, scheduler, tokens, targets, **step_kwargs), 0
+    rungs = _MATMUL_PRECISION_LADDER[_MATMUL_PRECISION_LADDER.index(current) + 1:]
+    cpu_rng = torch.get_rng_state().clone()
+    cuda_rng = ([state.clone() for state in torch.cuda.get_rng_state_all()]
+                if torch.cuda.is_available() and torch.cuda.is_initialized() else None)
+    failures: List[str] = []
+    for replays, policy in enumerate((current, *rungs)):
+        if replays:
+            optimizer.zero_grad(set_to_none=True)
+            for out in (step_kwargs.get("metrics_out"), step_kwargs.get("status_out")):
+                if out is not None:
+                    out.clear()
+            torch.set_rng_state(cpu_rng)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state_all(cuda_rng)
+            logger.warning("step %d raised under fp32_matmul_precision=%r (%s); replaying it at %r",
+                           step, (current, *rungs)[replays - 1], failures[-1], policy)
+        updated: List[bool] = []
+        handle = optimizer.register_step_pre_hook(lambda *_args: updated.append(True))
+        try:
+            with _float32_matmul_precision(policy):
+                loss = train_step(model, optimizer, scheduler, tokens, targets, **step_kwargs)
+            return loss, replays
+        except torch.OutOfMemoryError:
+            raise
+        except Exception as exc:
+            if updated or policy == "highest":
+                for note in failures:
+                    exc.add_note(f"earlier attempt of this step failed: {note}")
+                raise
+            failures.append(f"{type(exc).__name__}: {exc} [at {policy!r}]")
+        finally:
+            handle.remove()
+    raise AssertionError("unreachable: the ladder ends at 'highest'")
+
+
 def train(
     model:  VFEModel,
     loader: Iterable[Tuple[torch.Tensor, torch.Tensor]],   # yields (tokens, targets) batches
@@ -3144,6 +3225,7 @@ def train(
     motion_known_dead: Tuple[str, ...] = ()
     motion_dead_captured = False
     skipped_steps = 0                 # cumulative REJECTED optimizer updates (audit 2026-08-06 F5)
+    precision_replays = 0             # steps replayed at "highest" under cfg.matmul_precision_retry
     consecutive_skips = 0
     reset_nonfinite_tangent_elements()   # per-run accounting for the SPD-retraction guard
     reset_public_spd_repair_elements()   # ... and its certificate repairs
@@ -3382,11 +3464,14 @@ def train(
         step_status: Dict[str, bool] = {}
         if timer is not None:
             timer.start_step()
-        losses.append(train_step(model, optimizer, scheduler, tokens, targets,
-                                  grad_clip=grad_clip, grad_accum_steps=cfg.grad_accum_steps,
-                                  scaler=scaler, metrics_out=step_metrics, status_out=step_status,
-                                  **({"frame_projection_out": frame_projection_counter}
-                                     if frame_projection_counter is not None else {})))
+        step_loss, replays = _train_step_with_precision_retry(
+            model, optimizer, scheduler, tokens, targets, logger=logger, step=step,
+            grad_clip=grad_clip, grad_accum_steps=cfg.grad_accum_steps,
+            scaler=scaler, metrics_out=step_metrics, status_out=step_status,
+            **({"frame_projection_out": frame_projection_counter}
+               if frame_projection_counter is not None else {}))
+        losses.append(step_loss)
+        precision_replays += int(replays > 0)
         if timer is not None:
             timer.finish_step(n_tokens=tokens.numel())
         if update_before is not None:
@@ -3729,6 +3814,8 @@ def train(
                             "expected_targets", "scored_targets", "excluded_targets"):
                     if _gk in step_metrics:
                         row[_gk] = step_metrics[_gk]
+            if getattr(cfg, "matmul_precision_retry", False):
+                row["matmul_precision_replays"] = float(precision_replays)
             if getattr(cfg, "phi_mstep_max_matrix_norm", None) is not None:
                 for _pk in (
                     "phi_chart_projected_rows",
@@ -3922,6 +4009,8 @@ def train(
             "decode_logdet_fallback_elements": int(decode_logdet_fallback_elements()),
             "frame_pair_fp64_escalations": int(frame_pair_fp64_escalations()),
             "public_spd_repair_elements": int(public_spd_repair_elements()),
+            **({"matmul_precision_replays": int(precision_replays)}
+               if getattr(cfg, "matmul_precision_retry", False) else {}),
         }
         if skipped_total or neutralized or mu_fallbacks:
             logger.warning(

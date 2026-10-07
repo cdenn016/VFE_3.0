@@ -363,6 +363,9 @@ class VFEModel(nn.Module):
             gauge_group_name=self.group.name,
             decode_coordinates=cfg.decode_coordinates,
         )
+        if cfg.decode_logits_amp and cfg.decode_mode == "linear" and cfg.amp_dtype is not None:
+            self.prior_bank.decode_logits_amp_dtype = (
+                torch.bfloat16 if cfg.amp_dtype == "bf16" else torch.float16)
         # Fixed Gibbs readout temperature (the learned temperature was retired 2026-10-02): the
         # parameter keeps its name (checkpoint layout is unchanged) but leaves autograd and, through
         # build_optimizer's requires_grad filter, the optimizer, so
