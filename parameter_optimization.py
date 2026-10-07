@@ -219,7 +219,6 @@ config: Dict[str, Any] = dict(
     #        Learning Rates
     #################################
     m_phi_update_mode         = "adamw",      # "adamw" | "pullback_group"
-    phi_precond_mode          = "pullback_per_block",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback" | "pullback_per_block"
 
     phi_mstep_max_matrix_norm = 12,
     

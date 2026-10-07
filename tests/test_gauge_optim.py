@@ -23,7 +23,6 @@ def _make_optimizer(
     trust_radius=0.1,
     chart_max_norm=5.0,
     bch_residual_max=1e-6,
-    phi_precond_mode="pullback_per_block",
     **kwargs,
 ):
     return GaugeManifoldAdamW(
@@ -32,7 +31,6 @@ def _make_optimizer(
         phi_group_trust_radius=trust_radius,
         phi_chart_max_norm=chart_max_norm,
         phi_bch_residual_max=bch_residual_max,
-        phi_precond_mode=phi_precond_mode,
         weight_decay=0.0,
         **kwargs,
     )
@@ -177,7 +175,6 @@ def test_build_optimizer_selects_pullback_group_route_and_moves_phi_embed():
         gauge_group="block_glk",
         pos_phi="none",
         m_phi_update_mode="pullback_group",
-        phi_precond_mode="pullback_per_block",
         transport_chart_max_norm=6.0,
         m_phi_lr=0.1,
     )
@@ -216,7 +213,6 @@ def test_pullback_group_trust_scales_the_learning_rate_weighted_right_factor(mon
         trust_radius=0.25,
         chart_max_norm=5.0,
         bch_residual_max=1e-6,
-        phi_precond_mode="pullback_per_block",
     )
 
     assert candidate.trust_scale.item() == pytest.approx(0.125)
@@ -250,7 +246,6 @@ def test_pullback_group_stage_passes_source_basis_and_registered_coordinate_layo
         trust_radius=0.25,
         chart_max_norm=5.0,
         bch_residual_max=1e-6,
-        phi_precond_mode="pullback_per_block",
     )
 
     assert seen["generators"] is group.generators
@@ -262,6 +257,7 @@ def test_pullback_group_stage_normalizes_basis_for_registered_extension(device):
 
     name = "test_stage_normalized_registered_extension"
     group = get_group("block_glk")(n_heads=1, K=2, dtype=torch.float32, device=device)
+    group.pullback_capability = name
     seen = {}
 
     @phi_preconditioner.register_phi_group_direction(name)
@@ -279,7 +275,6 @@ def test_pullback_group_stage_normalizes_basis_for_registered_extension(device):
             trust_radius=0.25,
             chart_max_norm=5.0,
             bch_residual_max=1e-6,
-            phi_precond_mode=name,
         )
     finally:
         for support_name in (
@@ -316,7 +311,6 @@ def test_pullback_group_chart_retraction_certifies_right_product_order(
         trust_radius=1.0,
         chart_max_norm=6.0,
         bch_residual_max=1e-6,
-        phi_precond_mode="pullback_per_block",
     )
 
     factor_scale = candidate.trust_scale / torch.exp2(candidate.backtracking_reductions.double())
@@ -484,7 +478,6 @@ def test_pullback_group_candidate_rejects_chart_bound(monkeypatch):
         trust_radius=1.0,
         chart_max_norm=1.0,
         bch_residual_max=1e-6,
-        phi_precond_mode="pullback_per_block",
     )
     assert candidate.rejected_rows.tolist() == [True]
     assert torch.equal(candidate.candidate_phi, phi)
@@ -612,7 +605,6 @@ def test_attempted_diagnostic_step_clears_stale_gauge_health():
     opt = _make_optimizer(
         [{"params": [phi], "lr": 0.0, "pullback_group": True, "weight_decay": 0.0}],
         group,
-        phi_precond_mode="pullback_per_block",
     )
     opt._collect_gauge_diag = True
     opt._gauge_diag = {"phi_pullback_damped_gen_cond_max": 123.0}

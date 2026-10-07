@@ -693,7 +693,6 @@ def _pullback_resume_cfg(**overrides) -> VFE3Config:
         "checkpoint_interval": 2,
         "m_phi_lr": 0.05,
         "m_phi_update_mode": "pullback_group",
-        "phi_precond_mode": "pullback_per_block",
         "transport_chart_max_norm": 6.0,
         "pos_phi": "none",
     }

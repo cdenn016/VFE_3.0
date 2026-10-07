@@ -362,7 +362,6 @@ def test_phi_chart_summary_route_is_none_when_disabled_and_named_when_enabled() 
         n_heads=2,
         gauge_group="block_glk",
         m_phi_update_mode="pullback_group",
-        phi_precond_mode="pullback_per_block",
         transport_chart_max_norm=6.0,
     )
     pullback_model = VFEModel(pullback_cfg)
