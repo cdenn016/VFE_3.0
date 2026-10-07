@@ -123,12 +123,14 @@ class VFE3Config:
     n_heads:                   int   = 2
 
     seed:                      int   = 6
-    deterministic:             bool  = True         # pins torch/cuDNN determinism; does NOT pin TF32 (see fp32_matmul_precision)
+    deterministic:             bool  = True         # pins torch/cuDNN determinism; does NOT pin TF32 (see fp32_matmul_precision
+                                                   
     # Under deterministic=True torch fills every uninitialized allocation with NaN (or the integer
     # maximum) so a read of uninitialized memory is visible and reproducible. False skips those fill
     # kernels: about 2,800 fewer kernels and 13.5 ms per K=64 step on the RTX 5090, with bit-identical
     # loss and gradients, at the cost of that guard. Inactive when deterministic=False.
     fill_uninitialized_memory: bool  = True
+
 
     log_interval:              int   = 100          # console log every N steps (0 = off)
     eval_interval:             int   = 1500         # periodic validation every N steps (0 = off)
@@ -137,7 +139,7 @@ class VFE3Config:
     # Opt-in resume (default None = OFF = the pure from-scratch path). Set to a checkpoints/step_<N>.pt
     # to restore weights, AdamW state, RNG and the per-group cosine LambdaLR at step N, then continue.
     # An explicit train(resume_from=...) argument takes precedence over this field.
-    resume_from:               Optional[str] = None
+    resume_from:               Optional[str] = None 
 
     # Resume bundles load with torch.load(weights_only=True). If that safe load fails on a (e.g.
     # legacy-format) bundle, resume RAISES unless this is True, permitting the legacy
@@ -161,9 +163,9 @@ class VFE3Config:
     # Belief-table init (PriorBank.__init__): mu_v ~ N(0, mu_init_std^2); every coordinate variance is
     # the constant sigma_init (stored as log(sigma_init), not randomly spread); phi_v ~ N(0, phi_scale^2).
     # mu_init_std and phi_scale may be 0; sigma_init must be > 0 (the log is taken).
-    mu_init_std:               float = 0.02         # std of the random mean table mu_embed
-    sigma_init:                float = 1.0          # constant initial coordinate variance (sigma_log = log of this)
-    phi_scale:                 float = 0.01         # std of the random gauge-frame table phi_embed
+    mu_init_std:               float = 0.065         # std of the random mean table mu_embed
+    sigma_init:                float = 15         # constant initial coordinate variance (sigma_log = log of this)
+    phi_scale:                 float = 0.035         # std of the random gauge-frame table phi_embed
     pos_phi_scale:             float = 0.02         # learned-table init scale AND frozen per-position step
 
     #################################
@@ -342,7 +344,9 @@ class VFE3Config:
     # routing frame and the content/value frame. False keeps routing on U_i R_i^T and moves content
     # on U_i -- RoPE's "position-dependent attention, position-independent values" asymmetry.
     # Inert unless pos_rotation='rope'.
-    rope_on_value:             bool  = True         # False -> value aggregation uses the un-rotated base
+    rope_on_value:             bool  = False         # False -> value aggregation uses the un-rotated base
+                        
+
 
     #################################
     #          Methods
@@ -351,10 +355,9 @@ class VFE3Config:
     # Full-state projected attention uses predictive content or frozen-receiver gradients.
     # Projection ranks still follow the gauge block dimensions.
     # Projected attention requires the explicit support envelope validated below.
-    attention_mode:                      str           = "projected_predictive" # "projected_predictive" | "projected_gradient"
-    attention_residual:                  bool          = False                  # requires predictive_content
-    relational_output_init:              str           = "identity"             # "identity" | "depth_scaled" (initial O times 1/sqrt(2 n_layers))
-
+    attention_mode:                      str           = "projected_predictive"  # "projected_predictive" | "projected_gradient"
+    relational_output_init:              str           = "identity"            # "identity" | "depth_scaled" (initial O times 1/sqrt(2 n_layers))    
+   
     # Receiving-map chart of the content link on the stored (O, T) (attention_unified.tex, "The tiled
     # message order by order"): "affine" O' = O (current head sum); "first_order" O' = T^{-1} + O (flat
     # head-routed transport plus the head sum); "exponential" O' = T^{-1} + O phi_1(TO) = e^{OT} T^{-1}
@@ -362,6 +365,7 @@ class VFE3Config:
     # s B_ij (s from relational_output_init). O = 0 means zero content (affine) or flat transport
     # (first_order, exponential); the content group has no weight decay. Both projected routes read O'.
     content_link_chart:                  str           = "affine"              # "affine" | "first_order" | "exponential"
+    
     # Edge-dependent content links (GL(K)_attention_v2 Section 3, lem:lie_lowrank; vfe3/model/edge_links.py):
     # every edge j -> i carries G_ij = g_i e^{L} E_ij, E_ij = I + A_i Phi_ij B_j^T, from rank-r factor maps of
     # the RMS-normalized reference means. "off" keeps the shared exponential link; "lowrank" (curved)
@@ -369,8 +373,9 @@ class VFE3Config:
     # dependence) G_ij = g_i e^{L} g_j^{-1}, g_i = exp(A B_i^T), one shared basis A. The sender map starts at
     # zero, so both modes start at the exponential chart; their parameters join the relational content
     # group. Requires content_link_chart='exponential', attention_mode='projected_predictive' and equal heads.
-    content_link_edges:                  str           = "off"                 # "off" | "lowrank" | "pure_gauge"
-    content_link_edge_rank:              int           = 4                     # factor rank r, 1 <= r <= embed_dim (read when edges are on)
+    content_link_edges:                  str           = "off"        # "off" | "lowrank" | "pure_gauge"
+    content_link_edge_rank:              int           = 4        # factor rank r, 1 <= r <= embed_dim (read when edges are on)
+    
     # Latent receiver factors (GL(K)_supplementary_v2 S6; plan Section 3): with content_link_edges='lowrank' the
     # receiver factor A_i becomes a per-context MAP estimate with prior N(a(xi_i), sigma_L^2 I). Its energy is
     # tr C_i^att / (2 tr(C_i)/K) (the moment-matched predictive covariance without the floor, computed whatever
@@ -387,6 +392,7 @@ class VFE3Config:
     content_link_loop_weight:            float         = 0.0                   # lambda_W >= 0 (> 0 needs content_link_latent)
     content_link_loop_window:            Optional[int] = 1                     # loop window w >= 1, or None (every loop)
     relational_receiver_noise:           float         = 1.0                   # projected_gradient: Q_h = variance * I (K-dim reference law under ambient, d-dim channel floor under channel)
+    
     # projected_gradient receiver energy and update (projected_gradient.tex). "channel_likelihood" scores
     # O_h^T xi_i against the d-dim message T_h xi_j as an expected likelihood (entropy counted once, no
     # complement pinning); "ambient_alignment" is the PR #30 sum of KLs to K-dim noisy laws. "closed_form"
@@ -395,7 +401,8 @@ class VFE3Config:
     relational_receiver_law:             str           = "channel_likelihood"  # "channel_likelihood" | "ambient_alignment"
     relational_receiver_update:          str           = "closed_form"         # "closed_form" | "euler"
     relational_receiver_damping:         float         = 1.0                   # closed_form only: rho in (0, 1]
-    relational_routing:                  str           = "gaussian_kl"          # "gaussian_kl" | "noisy_query" (projected_predictive only)
+    relational_routing:                  str           = "gaussian_kl"         # "gaussian_kl" | "noisy_query" (projected_predictive only)
+    
     # Predictive readout of projected_predictive (docs/implementation/minimal-agent-plan-2026-10-06.md,
     # vfe3/model/minimal_agent.py). "kernel" is the predictive-kernel content U_i sum_h O'_h sum_j beta_ij^h T_h xi_j.
     # "minimal_agent" conditions every receiver exactly on a noisy comparison record (minimal_agent_model.tex): the
@@ -410,21 +417,26 @@ class VFE3Config:
     # fusion of the power posterior (its covariance omits the between-source spread). minimal_agent only.
     minimal_agent_inference:             str           = "exact"                # "exact" | "mean_field"
     minimal_agent_channel_noise:         float         = 1.0                    # initial channel noise n_h of every head (learned as channel_log_noise), > 0
+    
+    attention_residual:                  bool          = True                  # requires predictive_content
+    
     # Belief covariance after the predictive readout. "passthrough" keeps the incoming covariance
     # (a per-token-type routing state); "moment_matched" replaces it by the exact moment-matched
     # covariance of the predictive kernel (GL(K) v2 Theorem thm:probabilistic_status (2)): source
     # covariances pushed through M_h = O_h T_h, cross-head terms, between-source spread, the
     # residual persistence term when attention_residual=True, and the covariant reference floor
     # floor * (tr C_i / K) I (local floor * (tr C_i / K) U_i U_i^T).
-    predictive_covariance:               str           = "passthrough"          # "passthrough" | "moment_matched" (projected_predictive only)
+    predictive_covariance:               str           = "moment_matched"          # "passthrough" | "moment_matched" (projected_predictive only)
     predictive_covariance_floor:         float         = 1e-4                   # Q~_i = floor * (tr C_i / K) I, keeps Sigma^+ positive definite and well conditioned
+    
     # Recompute the moment-matched covariance update in backward instead of saving its dense
     # (B, N, K, K) intermediates. Values and gradients are bit-identical. At K=256, H=8, B=16 it
     # took peak memory from 46.3 to 23.0 GB and the step from 12.0 s (the Windows driver silently
     # spilling to shared system memory instead of raising OOM) to 0.83 s, measured on the dense
     # update before the blockwise route (2026-10-04) removed its K x K intermediates. Worth it at large K.
     predictive_covariance_checkpoint:    bool          = False
-
+    
+    
     ######################################
     #                Self Energy:
     #        Sum_i alpha_i * KL(q_i||p_i)
@@ -432,7 +444,7 @@ class VFE3Config:
 
     # Self-coupling form (registry key). The default-and-pure no-NN forms are closed-form functions
     # of the self-divergence D, with no learned parameters.
-    lambda_alpha_mode:         str   = "constant"   # "constant" | "state_dependent" | "state_dependent_per_coord"
+    lambda_alpha_mode:         str   = "state_dependent_per_coord"   # "constant" | "state_dependent" | "state_dependent_per_coord"
 
     b0:                        'float | List[float]' = 1.0   # state-dependent alpha shape: alpha* = c0/(b0 + D); list -> (K,) per-coord
     c0:                        'float | List[float]' = 1.0   # state-dependent alpha shape (numerator); list -> (K,) per-coord
@@ -449,6 +461,7 @@ class VFE3Config:
     # inside the softmax), so beta = softmax(-E/tau) is unchanged.
     lambda_beta:                float = 1.0
     lambda_alpha:               float = 1.0          # constant self-coupling value
+    
     mass_phi:                   float = 0.0          # (mass_phi/2) ||phi||^2 penalty
     mstep_self_coupling_weight: float = 0.0          # M-step sum_i alpha_i D(q_i*||p_i) (0 = OFF)
 
@@ -459,7 +472,7 @@ class VFE3Config:
 
     kappa_beta: 'float | List[float]' = 1.0   # sharpness; list (len n_heads, or n irrep blocks) -> per-head tau
 
-    beta_attention_prior:      str   = "causal_alibi"  # "causal_alibi" | "causal_alibi_noself" | "alibi" | "causal"
+    beta_attention_prior:      str   = "causal"  # "causal_alibi" | "causal_alibi_noself" | "alibi" | "causal"
                                                        # | "causal_noself" | "causal_windowed" | "windowed"
                                                        # | "uniform" | "t5_relative_bias"
 
@@ -487,8 +500,8 @@ class VFE3Config:
     # in the fixed basis do not commute with g in GL(K): LN(g mu) != g LN(mu). Set
     # layernorm_affine=True for the learned gamma/beta variant. 'block' runs per block inside the
     # E-step; 'final' runs once post-stack before decode.
-    norm_type_block:            str   = "layernorm"   # "layernorm" | "mahalanobis" | "none"
-    norm_type_final:            str   = "none"        # "layernorm" | "mahalanobis" | "none"
+    norm_type_block:            str   = "mahalanobis"   # "layernorm" | "mahalanobis" | "none"
+    norm_type_final:            str   = "none"        # "layernorm" | "mahalanobis" | "none"  
 
     # Coordinates the block norm, the block MLP and the final norm act in. "local" (default) applies
     # them to the local mean mu_i. "reference" applies them to the reference mean xi_i = U_i^{-1} mu_i
@@ -500,7 +513,7 @@ class VFE3Config:
     # 'none'/'layernorm' norm, and a passthrough 'coordinate'/'gaussian_template' MLP or a
     # 'prototype_agents' MLP, which reads the whole C_i and maps a 'posterior' covariance back as
     # U_i C_i^+ U_i^T.
-    block_coordinates:          str   = "local"       # "local" | "reference"
+    block_coordinates:          str   = "local"       # "local" | "reference"   
 
     # Cross-block belief handoff (mu_q -> mu_p). Both blends must be convex so the prior stays on the
     # SPD cone: sigma_p_next = (1-rho_s) sigma_p + rho_s sigma_q stays > 0 iff rho_s in [0,1].
@@ -515,12 +528,14 @@ class VFE3Config:
 
     block_mlp_covariance_floor: float = 1e-4         # covariant SPD floor: Sigma+ = J Sigma J^T + floor Sigma
     block_mlp_expansion:        int   = 8
+    
     # prototype_agents: the block is the minimal agent model with M = block_mlp_expansion * K template
     # agents N(nu_a, diag lambda_a). "mean_field" is the KL-label step (the gaussian_template
     # responsibilities) and the power posterior; "exact" is the exact mixture posterior, whose block or
     # dense working covariance (reference coordinates, gaussian_full) needs one Cholesky factor per
     # (token, template, block), an extreme opt-in cost.
     block_mlp_inference:        str   = "mean_field"  # "mean_field" | "exact"; read only by prototype_agents
+    
     # Initial template variance lambda_a of prototype_agents (finite, > 0). At 10 and token variances
     # near 1 the initial pull toward the templates is c / (c + lambda) ~ 9 percent per layer.
     block_mlp_template_init_variance: float = 10.0
@@ -536,7 +551,8 @@ class VFE3Config:
     # after the norm and inside the nonlinearity at every layer, so it is not absorbable into mu_v.
     # Requires a projected attention_mode, use_block_mlp with a 'coordinate' or 'canonical_frame' MLP,
     # and w_l <= its hidden width.
-    per_type_hidden_bias:       bool  = False
+    per_type_hidden_bias:       bool  = False   #TODO ablate then remove
+    
     # Step size of that table; None resolves to the DECLARED m_phi_lr (read before gauge_transport
     # 'off'/'frozen' coerces m_phi_lr to 0), the phi-table hyperparameter it mirrors. Its decay is
     # phi_weight_decay.
@@ -553,7 +569,7 @@ class VFE3Config:
     # inside the stack, so it trains under 'unroll' AND 'straight_through' and is frozen only by the
     # fully-detached E-step; as the FINAL norm it is post-stack and trains under any estimator.
     # Grouped in build_optimizer at m_p_mu_lr, weight_decay=0, role='mu'.
-    layernorm_affine:          bool  = True
+    layernorm_affine:          bool  = False        #TODO - uneccessary with mahalanobis?  remove?
     m_layernorm_lr:  Optional[float] = None
 
     #################################
@@ -568,13 +584,13 @@ class VFE3Config:
     e_q_mu_lr:                 float = 0.5
     e_q_sigma_lr:              float = 0.015
 
-    phi_precond_mode:             str   = "none"      # "none" | "clip" | "killing" | "killing_per_block"
+    phi_precond_mode:          str   = "none"      # "none" | "clip" | "killing" | "killing_per_block"
                                                       # | "pullback" | "pullback_per_block"
 
     # Skip the belief-channel sigma E-step update (gradient + retraction) entirely. OPT-IN dead-compute
     # ablation for configs where q's sigma has no consumer (linear decode, no norms); NOT coerced from
     # the config -- the user asserts deadness. Warns under a prior-bank decode, which reads sigma_q.
-    skip_belief_sigma_update:  bool  = True
+    skip_belief_sigma_update:  bool  = False
 
     #################################
     #             M-step
@@ -588,8 +604,8 @@ class VFE3Config:
     # None inherits the corresponding encoder rate. Shared encode/decode tables retain encoder
     # rates. These fields do not change temperature. A historical combined m_decode_lr migrates
     # into whichever of the two is None on load.
-    m_decode_mu_lr:            Optional[float] = None
-    m_decode_sigma_lr:         Optional[float] = None
+    m_decode_mu_lr:            Optional[float] = 0.025
+    m_decode_sigma_lr:         Optional[float] = 0.001
 
     # Optional absolute M-step rate for the LEARNED POSITIONAL frame table (pos_phi='learned'), which
     # otherwise rides m_phi_lr with phi_embed. The two tables compose into ONE clamped frame and so
@@ -598,10 +614,10 @@ class VFE3Config:
     # n_gen) with every row live every step -- their per-row gradient magnitudes are not comparable.
     # Their init scales are already separate (phi_scale vs pos_phi_scale), so the step size need not
     # coincide either. None inherits m_phi_lr, reproducing the historical yoked behavior byte-for-byte.
-    m_pos_phi_lr:               Optional[float] = None
+    m_pos_phi_lr:               Optional[float] = 0.0035
 
-    m_relational_score_lr:      Optional[float] = None  # None inherits m_p_mu_lr.
-    m_relational_content_lr:    Optional[float] = None  # None inherits m_p_mu_lr.
+    m_relational_score_lr:      Optional[float] = 0.005  # None inherits m_p_mu_lr.
+    m_relational_content_lr:    Optional[float] = 0.005  # None inherits m_p_mu_lr.
 
     # Stored phi-factor M-step policy (registry key). "adamw" is the default and preserves the
     # established optimizer topology. "pullback_group" opts into a stateless strict pullback
@@ -610,12 +626,14 @@ class VFE3Config:
     # intentionally limited by validation below.
     m_phi_update_mode:         str       = "adamw"    # "adamw" | "pullback_group" | "fisher_group"
     m_phi_group_trust_radius:  float     = 0.1
+    
     # Retraction of the manifold phi step. "chart" is the additive chart step phi - eta v_phi with
     # its product-residual backtracking (the historical route, unchanged). "group_log" is the exact
     # right product phi_new = Log(exp(phi) exp(-eta s xi)) with the closed-form U-space pullback
     # direction (series direction off the principal strip); it halves only on log, residual,
     # descent or chart-bound failure (derivation 2026-09-28, Track 1). Untied block_glk only.
     m_phi_group_retraction:    str       = "chart"    # "chart" | "group_log"
+    
     # "fisher_group" (derivation 2026-09-28, Track 2) replaces the pullback direction by the belief-
     # Fisher natural gradient: the Fisher-Rao metric of the reference belief U^{-1} q pulled back to
     # the frame, at the layer-0 table rows, count-normalized (N_scored / n_v), and completed on its
@@ -635,7 +653,7 @@ class VFE3Config:
     # decode_log_scale). None = inherit the global weight_decay -- the long-standing behavior, which
     # decays log sigma toward 0, i.e. an unintended lognormal prior pinning sigma to 1 against the
     # configured sigma_init. Set 0.0 to exempt the sigma sector.
-    sigma_weight_decay:        Optional[float] = None
+    sigma_weight_decay:        Optional[float] = 0
 
     # SEPARATE AdamW weight decay for the MEAN-role capacity tables (mu_embed, s_mu_embed,
     # decode_mu_embed, output_proj_weight) -- the exact mirror of sigma_weight_decay above. None =
@@ -646,7 +664,7 @@ class VFE3Config:
     # drives the zero-count rows of the mean tables to norm 0.000 and the count-1..15 rows BELOW
     # random initialization. Set 0.0 to exempt the mean sector; the frequent rows keep their dense
     # likelihood gradient either way.
-    mu_weight_decay:           Optional[float] = None
+    mu_weight_decay:           Optional[float] = 0
 
     # SEPARATE AdamW weight decay for the gauge-frame coordinate tables (phi_embed, learned
     # pos_phi_free), default 0.065. Decoupled decay on phi sets an LR-invariant frame-norm ceiling
@@ -692,7 +710,7 @@ class VFE3Config:
     # logged. RECORDING is unconditional and already live; SETTING is this knob, and None means
     # "leave the card as it is" (the historical behavior), so no run changes unless you ask.
     # "highest" disables TF32 (full fp32 mantissa, slowest, most reproducible); "high"/"medium"
-    # permit TF32/bf16x3 reductions.
+    # permit TF32/bf16x3 reductions. 
     fp32_matmul_precision: Optional[str] = "highest"       # None (leave as-is) | "highest" | "high" | "medium"
 
     # Float64 escalation of the stored frame pair (U, U^-1) (audit 2026-09-23 #12). On, a producer
@@ -710,7 +728,7 @@ class VFE3Config:
     # Working precision of the FULL-covariance pair KL in the family_chunked decoder (family=
     # "gaussian_full" only). "fp64" is the historical unconditional float64 island.
     # "fp32_escalate" evaluates in float32 and recomputes in float64 only when a Cholesky fails.
-    full_cov_kl_precision:     str   = "fp32_escalate"   # "fp32_escalate" | "fp64" | "fp32_escalate_cond"
+    full_cov_kl_precision:     str   = "fp32_escalate_cond"   # "fp32_escalate" | "fp64" | "fp32_escalate_cond"
 
     # Conditioning-triggered float64 source recovery in the projected attention scorers. A float32
     # projected covariance G whose zero-jitter Cholesky FAILS is always rebuilt from its source
@@ -771,13 +789,13 @@ class VFE3Config:
     # squaring buys only ~1.8x, while the same algebra in float64 buys nine decades). sigma_log_embed
     # trains freely against only the eps=1e-6 floor, so this is harmless at init and about one order
     # of magnitude of shrinkage from matter; watch decode_sigma_v_min.
-    decode_av_precision: str = "fp64"     # "fp64" | "fp32"
+    decode_av_precision: str = "fp32"     # "fp64" | "fp32"
 
     # Fail-closed chart radius of every production transport exponential: a raw Lie-algebra matrix
     # with ||M||_F above it raises ValueError instead of being exponentiated. It is the one domain
     # radius of the transport; the former surrogate Frobenius clamp (rescale to ||M||_F = 20) is
     # retired, and 20.0 is that clamp's radius. Applies to every group, so_n included.
-    transport_chart_max_norm:  float = 20.0
+    transport_chart_max_norm:  float = 50.0
 
     # Optional post-M-step interior radius, strictly below transport_chart_max_norm when set. AdamW
     # projects rows back along their algebra ray after the optimizer step. The pullback-group route
@@ -799,7 +817,7 @@ class VFE3Config:
     # single Bernoulli draw. Raising this costs one extra held-out forward per batch per eval and is
     # the cheapest way to make the val_* columns mean what they appear to mean; the attention FIGURES
     # still come from the first sequence either way.
-    val_diagnostic_batches:               int = 1  # try 64
+    val_diagnostic_batches:               int = 1  #TODO - whats standard?  needed?
 
     # Accumulate gradients over N microbatches before an optimizer step, for a larger effective batch
     # without the memory of one big forward. Each pulled batch is split into N equal chunks along the
@@ -814,7 +832,7 @@ class VFE3Config:
     #                                          m_mu : m_sigma : m_phi base ratios into the tail.
     #                                          0.0 is the pure half-cosine-to-zero path.
 
-    generate_embedding_figures:     bool = True
+    generate_embedding_figures:     bool = False
 
 
     def __post_init__(self) -> None:
@@ -2407,7 +2425,7 @@ def config_from_serialized(
             ("projected_filtering", "predictive_content"): "projected_predictive",
         }
         try:
-            attention_mode = legacy_modes[(mode, readout)]
+            attention_mode = legacy_modes[(mode, readout)]  # "projected_predictive" | "projected_gradient"
         except (KeyError, TypeError):
             raise ValueError(f"serialized config from {source} has an invalid historical attention pair "
                              f"({mode!r}, {readout!r})") from None
