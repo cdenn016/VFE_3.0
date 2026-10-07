@@ -134,19 +134,6 @@ def test_manual_seed_makes_model_init_reproducible():
     assert not torch.equal(m1.prior_bank.mu_embed, m3.prior_bank.mu_embed)
 
 
-def test_killing_per_block_precond_runs_through_forward():
-    # phi_precond_mode='killing_per_block' is a validated config seam; with e_phi_lr>0 it
-    # must not crash the forward. The per-block Killing metric needs the group's irrep_dims,
-    # which the E-step must thread into precondition_phi_gradient.
-    cfg = test_config(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
-                     n_e_steps=2, e_q_mu_lr=0.05,
-                     phi_precond_mode="killing_per_block")
-    model = VFEModel(cfg)
-    tokens = torch.randint(0, 12, (2, 4)); targets = torch.randint(0, 12, (2, 4))
-    _, loss, _ = model(tokens, targets)
-    assert torch.isfinite(loss)
-
-
 def test_model_rejects_tied_block_glk() -> None:
     with pytest.raises(ValueError, match="gauge_group"):
         test_config(gauge_group="tied_block_glk")

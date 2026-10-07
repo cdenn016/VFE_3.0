@@ -70,8 +70,8 @@ def _chart_covector(X: torch.Tensor, G_bar: torch.Tensor) -> torch.Tensor:
     return grad
 
 
-def _pullback(group, mode: str):
-    return functools.partial(pullback_group_log_direction, group=group, phi_precond_mode=mode)
+def _pullback(group):
+    return functools.partial(pullback_group_log_direction, group=group)
 
 
 def _fixed_direction(xi_blocks: torch.Tensor):
@@ -147,8 +147,7 @@ def test_closed_form_direction_equals_the_series_pullback_direction(
     U = torch.linalg.matrix_exp(phi.view(5, H, d, d))
 
     def compare() -> tuple[float, float]:
-        closed = pullback_group_log_direction(grad, phi, U, collect=True, group=group,
-                                              phi_precond_mode=mode)
+        closed = pullback_group_log_direction(grad, phi, U, collect=True, group=group)
         series = pullback_group_direction(
             grad, phi, group.generators, mode=mode,
             coordinate_layout=group.phi_coordinate_layout, irrep_dims=list(group.irrep_dims),
@@ -220,14 +219,14 @@ def test_group_log_candidate_is_the_exact_right_product_with_second_order_chart_
     h = 1e-3
     second = (W(h) - 2.0 * phi + W(-h)) / h**2                  # W''(0), central difference
     for eta in (1e-3, 1e-2):
-        candidate = _stage(grad, phi, group, _pullback(group, mode), learning_rate=eta,
+        candidate = _stage(grad, phi, group, _pullback(group), learning_rate=eta,
                            trust_radius=1e3)
         assert float(candidate.group_product_residual.max()) <= 1e-12
         assert int(candidate.backtracking_reductions.max()) == 0
         gap = candidate.candidate_phi - (phi - eta * series.v_phi)
         ratio = gap.norm(dim=-1) / (0.5 * eta**2 * second.norm(dim=-1))
         assert float((ratio - 1.0).abs().max()) <= 1e-2
-    stored = _stage(grad, phi.float(), group, _pullback(group, mode), learning_rate=1e-2)
+    stored = _stage(grad, phi.float(), group, _pullback(group), learning_rate=1e-2)
     assert float(stored.group_product_residual.max()) <= 1e-6
 
 
@@ -239,7 +238,7 @@ def test_trust_scale_bounds_the_learning_rate_weighted_right_factor() -> None:
     grad = torch.randn(4, 8, generator=generator, dtype=F64) * torch.tensor(
         [[0.01], [0.1], [1.0], [10.0]], dtype=F64)
     lr, radius = 0.5, 0.05
-    candidate = _stage(grad, phi, group, _pullback(group, "pullback_per_block"),
+    candidate = _stage(grad, phi, group, _pullback(group),
                        learning_rate=lr, trust_radius=radius)
     right = lr * candidate.direction.xi.norm(dim=-1)
     torch.testing.assert_close(candidate.trust_scale, (radius / right).clamp(max=1.0))
@@ -250,15 +249,14 @@ def test_trust_scale_bounds_the_learning_rate_weighted_right_factor() -> None:
 # T8
 def test_trust_saturated_step_needs_no_truncation_halvings() -> None:
     group = get_group("block_glk")(K=6, n_heads=2, dtype=F64)
-    mode = "pullback_per_block"
     generator = torch.Generator().manual_seed(8)
     phi = torch.randn(4, 18, generator=generator, dtype=F64) / 3.0     # ||X_h||_F ~ 1
     grad = torch.randn(4, 18, generator=generator, dtype=F64)
     options = dict(learning_rate=10.0, trust_radius=0.1, chart_max_norm=20.0,
                    bch_residual_max=1e-6)
-    group_log = stage_group_log_candidate(grad, phi, group, direction=_pullback(group, mode),
+    group_log = stage_group_log_candidate(grad, phi, group, direction=_pullback(group),
                                           **options)
-    chart = stage_pullback_group_candidate(grad, phi, group, phi_precond_mode=mode, **options)
+    chart = stage_pullback_group_candidate(grad, phi, group, **options)
     assert bool((group_log.trust_scale < 1.0).all())
     assert int(group_log.backtracking_reductions.max()) == 0
     assert not bool(group_log.rejected_rows.any())
@@ -279,7 +277,7 @@ def test_off_strip_row_uses_the_series_fallback_and_is_recharted_exactly(monkeyp
         return pullback_group_direction(grad_rows, phi_rows, *args, **kwargs)
 
     monkeypatch.setattr(gauge_optim, "pullback_group_direction", spy)
-    candidate = _stage(grad, phi, group, _pullback(group, "pullback_per_block"), learning_rate=0.01,
+    candidate = _stage(grad, phi, group, _pullback(group), learning_rate=0.01,
                        collect=True)
     assert len(seen) == 1 and torch.equal(seen[0], phi[:1])
     assert candidate.fast_rows.tolist() == [False, True]
@@ -297,7 +295,7 @@ def test_conditioning_rejected_off_strip_row_keeps_its_chart_without_recharting(
     # conditioning certificate, and Log(U) would re-chart this row by 2 pi if it were retracted.
     phi = torch.stack(((math.pi + 1e-4) * J2, 0.2 * I2)).reshape(2, 4)
     grad = torch.randn(2, 4, generator=torch.Generator().manual_seed(2), dtype=F64)
-    candidate = _stage(grad, phi, group, _pullback(group, "pullback_per_block"), learning_rate=0.01)
+    candidate = _stage(grad, phi, group, _pullback(group), learning_rate=0.01)
     assert candidate.rejected_rows.tolist() == [True, False]
     assert torch.equal(candidate.candidate_phi[0], phi[0])
     assert candidate.recharted_rows.tolist() == [False, False]
@@ -387,8 +385,7 @@ def test_frechet_failure_and_ill_conditioned_frames_take_the_series_fallback(mon
 
     monkeypatch.setattr(gauge_optim, "pullback_group_direction", spy)
     monkeypatch.setattr(phi_preconditioner, "logm_frechet_pair", fail_first_row)
-    proposal = pullback_group_log_direction(grad, phi, U, collect=False, group=group,
-                                            phi_precond_mode="pullback_per_block")
+    proposal = pullback_group_log_direction(grad, phi, U, collect=False, group=group)
     assert proposal.fast_rows.tolist() == [False, True, False]
     assert float(proposal.frame_condition[2]) > 1e3 >= float(proposal.frame_condition[:2].max())
     assert len(seen) == 1 and torch.equal(seen[0], phi[[0, 2]])
@@ -454,7 +451,7 @@ def test_positional_model_recovers_both_factor_covectors_and_first_order_velocit
         new = []
         for table, grad in ((X, grad_X), (Y, grad_Y)):
             candidate = _stage(grad.reshape(-1, 4), table.reshape(-1, 4), group,
-                               _pullback(group, "pullback_per_block"), learning_rate=eta,
+                               _pullback(group), learning_rate=eta,
                                trust_radius=1e3)
             new.append(torch.linalg.matrix_exp(candidate.candidate_phi.view(-1, 2, 2)))
         realized = new[0][tokens] @ new[1] - E[tokens] @ F
@@ -474,7 +471,6 @@ def test_group_log_optimizer_moves_only_active_rows_and_equals_the_stager() -> N
         phi_group_trust_radius=0.1,
         phi_chart_max_norm=5.0,
         phi_bch_residual_max=1e-6,
-        phi_precond_mode="pullback_per_block",
         phi_group_retraction="group_log",
         weight_decay=0.0,
     )
@@ -483,7 +479,7 @@ def test_group_log_optimizer_moves_only_active_rows_and_equals_the_stager() -> N
     phi.grad[1] = torch.tensor([1.0, 0.0, -0.5, 0.2])
     phi.grad[3, 3] = -2.0
     expected = stage_group_log_candidate(
-        phi.grad[[1, 3]], before[[1, 3]], group, direction=_pullback(group, "pullback_per_block"),
+        phi.grad[[1, 3]], before[[1, 3]], group, direction=_pullback(group),
         learning_rate=0.05, trust_radius=0.1, chart_max_norm=5.0, bch_residual_max=1e-6,
     ).candidate_phi.to(dtype=phi.dtype)
     optimizer._collect_gauge_diag = True
@@ -511,7 +507,7 @@ def _group_log_model_cfg(**overrides):
     values = dict(
         vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
         gauge_group="block_glk", pos_phi="none", m_phi_update_mode="pullback_group",
-        phi_precond_mode="pullback_per_block", transport_chart_max_norm=6.0, m_phi_lr=0.1,
+        transport_chart_max_norm=6.0, m_phi_lr=0.1,
         m_phi_group_retraction="group_log",
     )
     values.update(overrides)
@@ -595,12 +591,12 @@ def test_retraction_config_validation_inactive_marks_and_serialized_default(
     with pytest.raises(ValueError, match="phi_group_retraction"):
         GaugeManifoldAdamW([nn.Parameter(torch.zeros(1))], get_group("block_glk")(n_heads=1, K=2),
                            phi_group_trust_radius=0.1, phi_chart_max_norm=5.0,
-                           phi_bch_residual_max=1e-6, phi_precond_mode="pullback_per_block",
+                           phi_bch_residual_max=1e-6, 
                            phi_group_retraction="bogus")
     with pytest.raises(ValueError, match="group_log"):
         GaugeManifoldAdamW([nn.Parameter(torch.zeros(1))], get_group("so_n")(3, group_n=3, irrep_spec=[("l1", 1)]),
                            phi_group_trust_radius=0.1, phi_chart_max_norm=5.0,
-                           phi_bch_residual_max=1e-6, phi_precond_mode="pullback_per_block",
+                           phi_bch_residual_max=1e-6, 
                            phi_group_retraction="group_log")
 
 

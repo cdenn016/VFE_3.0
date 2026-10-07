@@ -355,7 +355,6 @@ def stage_pullback_group_candidate(
     trust_radius:     float,
     chart_max_norm:   float,
     bch_residual_max: float,
-    phi_precond_mode: str,
     max_backtracks:   int = 10,
     differential_mode: Optional[str] = None,
     direction_fn:     Optional[Callable[[torch.Tensor, torch.Tensor],
@@ -404,7 +403,7 @@ def stage_pullback_group_candidate(
             grad64,
             phi64,
             group.generators,
-            mode=phi_precond_mode,
+            mode=group.pullback_capability,
             differential_mode=differential_mode,
             coordinate_layout=group.phi_coordinate_layout,
             irrep_dims=list(group.irrep_dims),
@@ -580,7 +579,6 @@ def pullback_group_log_direction(
     *,
     collect:           bool,
     group:             GaugeGroup,
-    phi_precond_mode:  str,
     differential_mode: Optional[str] = None,
 ) -> GroupLogDirection:
     r"""Closed-form Frobenius-pullback body direction with the series direction off the strip.
@@ -624,7 +622,7 @@ def pullback_group_log_direction(
             grad_phi[fallback_index],
             phi[fallback_index],
             group.generators,
-            mode=phi_precond_mode,
+            mode=group.pullback_capability,
             differential_mode=differential_mode,
             coordinate_layout=group.phi_coordinate_layout,
             irrep_dims=list(group.irrep_dims),
@@ -1111,7 +1109,6 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
         phi_group_trust_radius: float,
         phi_chart_max_norm:     float,
         phi_bch_residual_max:   float,
-        phi_precond_mode:       str,
         phi_group_retraction:   str = "chart",
         phi_statistics_provider:    Optional[PhiStatisticsProvider] = None,
         phi_fisher_rotation_weight: float = 2.0,
@@ -1145,7 +1142,6 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
         super().__init__(params, **kwargs)
         self._group                  = group
         self._generators             = group.generators
-        self._precond_mode           = phi_precond_mode
         self._phi_group_differential_mode = phi_group_differential_mode()
         self._phi_group_trust_radius = phi_group_trust_radius
         self._phi_chart_max_norm     = phi_chart_max_norm
@@ -1300,7 +1296,6 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                         direction=fisher if fisher is not None else functools.partial(
                             pullback_group_log_direction,
                             group=self._group,
-                            phi_precond_mode=self._precond_mode,
                             differential_mode=self._phi_group_differential_mode,
                         ),
                         learning_rate=phi_group["lr"],
@@ -1318,7 +1313,6 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                         trust_radius=self._phi_group_trust_radius,
                         chart_max_norm=self._phi_chart_max_norm,
                         bch_residual_max=self._phi_bch_residual_max,
-                        phi_precond_mode=self._precond_mode,
                         differential_mode=self._phi_group_differential_mode,
                         direction_fn=None if fisher is None else functools.partial(
                             _fisher_chart_direction,

@@ -98,19 +98,19 @@ config = dict(
     #            Training
     #################################
    
-    vocab_size                = _tokenizer_vocab_size(DATASET),   # follows DATASET's tokenizer (gpt2 50257 / cl100k 100277 / word 267735)
+    vocab_size                       = _tokenizer_vocab_size(DATASET),   # follows DATASET's tokenizer (gpt2 50257 / cl100k 100277 / word 267735)
                                                                   
-    embed_dim                 = 20,                  # K, total belief dim (must be divisible by n_heads)
-    n_heads                   = 2,                   # = number of irrep blocks (alibi priors require this)
+    embed_dim                        = 20,                  # K, total belief dim (must be divisible by n_heads)
+    n_heads                          = 2,                   # = number of irrep blocks (alibi priors require this)
 
-    max_seq_len               = 128,                 # N, context length
-    eval_stride               = 32,
+    max_seq_len                      = 128,                 # N, context length
+    eval_stride                      = 32,
 
-    batch_size                = 32,
-    max_steps                 = 30000,
+    batch_size                       = 32,
+    max_steps                        = 30000,
 
-    n_layers                  = 4,                   # L, number of blocks
-    n_e_steps                 = 1,                   # T, E-step inner iterations
+    n_layers                         = 4,                   # L, number of blocks
+    n_e_steps                        = 1,                   # T, E-step inner iterations
 
     #################################
     #         Misc/Logging
@@ -142,7 +142,7 @@ config = dict(
     block_coordinates                = "local",       # "local" | "reference" (LN and MLP applied as U Phi(U^-1 .))
     decode_coordinates               = "local",       # "local" | "reference" (reference: decode_mode "linear" | "diagonal_chunked" | "full_chunked")
               
-    minimal_agent_channel_noise      = 1.0,                # initial channel noise n_h > 0
+    minimal_agent_channel_noise      = 1.0,         # initial channel noise n_h > 0
     predictive_covariance_floor      = 1e-4,        # moment_matched only: covariant floor floor * (tr C_i / K) I in reference coordinates
     relational_receiver_damping      = 1.0,         # closed_form only: rho in (0, 1]; 1 = the frozen minimizer    
     relational_receiver_noise        = 1.0,         # channel floor nu I_d (channel_likelihood) | K-dim reference noise (ambient_alignment)
@@ -173,44 +173,44 @@ config = dict(
     #        and Hand-Off
     #################################
 
-    layernorm_affine              = True,
-    norm_type_block               = "layernorm",        # "none" | "layernorm" | "mahalanobis" - often useful
-    norm_type_final               = "none",             # "none" | "layernorm" | "mahalanobis" - performs worse generally
+    layernorm_affine                 = True,
+    norm_type_block                  = "layernorm",        # "none" | "layernorm" | "mahalanobis" - often useful
+    norm_type_final                  = "none",             # "none" | "layernorm" | "mahalanobis" - performs worse generally
 
     #################################
     #        Initialization
     #################################
        
-    mu_init_std                   = 0.065,     # std of the random mean table mu_embed
-    sigma_init                    = 15,         # constant initial coordinate variance (sigma_log = log of this)
-    phi_scale                     = 0.035,      # std
-    pos_phi_scale                 = 0.02,      # learned-table init scale AND frozen per-position step
-    sigma_max                     = 100.0,
+    mu_init_std                      = 0.065,     # std of the random mean table mu_embed
+    sigma_init                       = 15,         # constant initial coordinate variance (sigma_log = log of this)
+    phi_scale                        = 0.035,      # std
+    pos_phi_scale                    = 0.02,      # learned-table init scale AND frozen per-position step
+    sigma_max                        = 100.0,
 
-    decode_tau                    = 1,       #tau =1 principled bayes
-    unigram_kappa                 = 1,         # tempering on log pi_v (1.0 = exact Bayes class prior)
-    decode_chunk_size             = 8192,
+    decode_tau                       = 1,       #tau =1 principled bayes
+    unigram_kappa                    = 1,         # tempering on log pi_v (1.0 = exact Bayes class prior)
+    decode_chunk_size                = 8192,
         
-    pos_phi_project_slk           = False,      # per-block trace projection (det Omega = 1)    
-    attention_residual            = False,        #ignored with minimal_agent
+    pos_phi_project_slk              = False,      # per-block trace projection (det Omega = 1)    
+    attention_residual               = False,        #ignored with minimal_agent
     
-    decode_unigram_prior          = True,       # add kappa*log pi_v (corpus unigram) to decode logits    
-    untie_decode_bank             = True,       # prior-bank modes only: decode reads its OWN cloned (V,K) tables
-    decode_bias                   = True,     # only for decode_mode='linear'
-    
-    deterministic                 = True,
-    generate_embedding_figures    = False,
+    decode_unigram_prior             = True,       # add kappa*log pi_v (corpus unigram) to decode logits    
+    untie_decode_bank                = True,       # prior-bank modes only: decode reads its OWN cloned (V,K) tables
+    decode_bias                      = True,     # only for decode_mode='linear'
+      
+    deterministic                    = True,
+    generate_embedding_figures       = False,
     
 
     #################################
     #          Gauge Group
     #################################
-    gauge_transport               = "on",           # "on" | "off" | "frozen" (random fixed frame)
-    gauge_group                   = "block_glk",    # "block_glk" | "so_n" | "block_so" | "block_co" | "block_glmc" (block_glmc: even d_head)
-    gauge_tying                   = "per_head",     # None (group default) | "per_head" | "shared" (shared: block_glk, so_n only)
+    gauge_transport                  = "on",           # "on" | "off" | "frozen" (random fixed frame)
+    gauge_group                      = "block_glk",    # "block_glk" | "so_n" | "block_so" | "block_co" | "block_glmc" (block_glmc: even d_head)
+    gauge_tying                      = "per_head",     # None (group default) | "per_head" | "shared" (shared: block_glk, so_n only)
     
-    group_n                       = None,                # so_n only: the N of SO(N), int >= 2; None for every other group
-    irrep_spec                    = None,                # so_n only: [(label, mult), ...] (labels "l<p>", "w<p>", "wp<m>", "wm<m>") | "random"; None for every other group
+    group_n                          = None,                # so_n only: the N of SO(N), int >= 2; None for every other group
+    irrep_spec                       = None,                # so_n only: [(label, mult), ...] (labels "l<p>", "w<p>", "wp<m>", "wm<m>") | "random"; None for every other group
    
     ####################################
     #       Positional Encoding
@@ -218,102 +218,101 @@ config = dict(
     #     gauge-RoPE (pos_rotation)
     ####################################
 
-    pos_phi                       = "learned",           # "none" | "learned" | "frozen"
-    pos_rotation                  = "none",              # "none" | "rope"
+    pos_phi                          = "learned",           # "none" | "learned" | "frozen"
+    pos_rotation                     = "none",              # "none" | "rope"
          
-    rope_on_value                 = False,
+    rope_on_value                    = False,
 
     ######################################
     #                Self Energy:
     #        Sum_i alpha_i * KL(q_i||p_i)
     ######################################
     
-    lambda_alpha_mode             = "state_dependent_per_coord",  # "constant" | "state_dependent" | "state_dependent_per_coord"
-    lambda_alpha                  = 1,          # constant self-coupling value
+    lambda_alpha_mode                = "state_dependent_per_coord",  # "constant" | "state_dependent" | "state_dependent_per_coord"
+    lambda_alpha                     = 1,          # constant self-coupling value
   
     ########################################
     #     Attention Belief/Model Settings
     #            & Temperatures
     ########################################
-    lambda_beta                   = 1.0,        # belief-coupling block weight (1.0 = pure F)
-    kappa_beta                    = 1,        # tau = kappa * sqrt(d_head)
+    lambda_beta                      = 1.0,        # belief-coupling block weight (1.0 = pure F)
+    kappa_beta                       = 1,        # tau = kappa * sqrt(d_head)
     
-    beta_attention_prior          = 'causal',    # "causal" | "causal_noself" | "causal_alibi" | "causal_alibi_noself" | "causal_windowed" | "t5_relative_bias" | "uniform" | "alibi" | "windowed" (the last three are not causal)
+    beta_attention_prior             = 'causal',    # "causal" | "causal_noself" | "causal_alibi" | "causal_alibi_noself" | "causal_windowed" | "t5_relative_bias" | "uniform" | "alibi" | "windowed" (the last three are not causal)
     
     #################################
     #         Belief E-step
     #################################    
     
-    e_q_mu_lr                     = 0.2,
-    e_q_sigma_lr                  = 0.01,
+    e_q_mu_lr                        = 0.2,
+    e_q_sigma_lr                     = 0.01,
      
-    e_mu_q_trust                  = 2,
-    e_sigma_q_trust               = 1.0,
+    e_mu_q_trust                     = 2,
+    e_sigma_q_trust                  = 1.0,
     
     #################################
     #        M-step Settings  
     #################################
     
-    m_phi_update_mode             = "adamw",        # "adamw" | "pullback_group" | "fisher_group" (belief-Fisher natural gradient)
-    phi_precond_mode              = "none",         # "none" | "clip" | "killing" | "killing_per_block" | "pullback" | "pullback_per_block"
-    m_phi_group_retraction        = "chart",        # "chart" | "group_log" (exact Log(U e^{-eta xi}); pullback_group/fisher_group only)
+    m_phi_update_mode                = "adamw",        # "adamw" | "pullback_group" | "fisher_group" (belief-Fisher natural gradient)
+    m_phi_group_retraction           = "chart",        # "chart" | "group_log" (exact Log(U e^{-eta xi}); pullback_group/fisher_group only)
         
-    m_phi_group_trust_radius      = 0.1,
-    m_phi_fisher_rotation_weight  = 2.0,       # fisher_group only: completion weight on belief-invisible rotations
+    m_phi_group_trust_radius         = 0.1,
+    m_phi_fisher_rotation_weight     = 2.0,       # fisher_group only: completion weight on belief-invisible rotations
 
     #################################
     #    Embedding/Priors M-step
     #        Learning Rates
     #################################
 
-    m_p_mu_lr                     = 0.005,     #0.005
-    m_p_sigma_lr                  = 0.001,       
-    m_phi_lr                      = 0.003,     #0.003
+    m_p_mu_lr                        = 0.005,     #0.005
+    m_p_sigma_lr                     = 0.001,       
+    m_phi_lr                         = 0.003,     #0.003
     
     
     #################################
     #      Other M-Step LR's
     #################################
       
-    m_pos_phi_lr                  = 0.003,      #0.001?
+    m_pos_phi_lr                     = 0.003,      #0.001?
      
-    m_decode_mu_lr                = 0.005,       # 0.025?
-    m_decode_sigma_lr             = 0.001,       # 0.001
+    m_decode_mu_lr                   = 0.005,       # 0.025?
+    m_decode_sigma_lr                = 0.001,       # 0.001
       
-    m_relational_score_lr         = 0.01,        # 0.005 0.01
-    m_relational_content_lr       = 0.0025,      # 0.005   0.0025
+    m_relational_score_lr            = 0.01,        # 0.005 0.01
+    m_relational_content_lr          = 0.0025,      # 0.005   0.0025
       
-    m_block_mlp_lr                = 0.005,      #0.0075?
-    m_layernorm_lr                = 0.005,      # 0.005
+    m_block_mlp_lr                   = 0.005,      #0.0075?
+    m_layernorm_lr                   = 0.005,      # 0.005
     
-    m_per_type_hidden_bias_lr     = 0.0025,    
+    m_per_type_hidden_bias_lr        = 0.0025,    
     
     #################################
     #        Weight Decays
     #################################
-    weight_decay                  = 0.01,
-    phi_weight_decay              = 0.1,    
-    sigma_weight_decay            = 0,      
-    mu_weight_decay               = 0,       
+    weight_decay                     = 0.01,
+    phi_weight_decay                 = 0.1,    
+    sigma_weight_decay               = 0,      
+    mu_weight_decay                  = 0,       
 
     #################################
     #   Numerics/Speed
     #################################
   
-    amp_dtype                            = 'bf16',        # None (fp32) | "bf16" | "fp16". Sigma must be at least fp32
-    fp32_matmul_precision                = "highest",          # None (leave as-is) | "highest" | "high" | "medium" ("high" permits TF32 on the decode/energy GEMMs)
+    amp_dtype                        = 'bf16',        # None (fp32) | "bf16" | "fp16". Sigma must be at least fp32
+    fp32_matmul_precision            = "highest",          # None (leave as-is) | "highest" | "high" | "medium" ("high" permits TF32 on the decode/energy GEMMs)
         
-    decode_ce_checkpoint                 = "auto",     # "auto" | "auto_aggregate" (saves memory with recompute)
-    projected_cov_recovery_precision     = "fp32",     # "fp64" | "fp32"
-    projected_factor_route               = "gram",     # "gram" | "cholesky_qr2" (slower unless recovery actually trips)
+    decode_ce_checkpoint             = "auto",     # "auto" | "auto_aggregate" (saves memory with recompute)
+    projected_cov_recovery_precision = "fp32",     # "fp64" | "fp32"
+    projected_factor_route           = "gram",     # "gram" | "cholesky_qr2" (slower unless recovery actually trips)
    
-    frame_pair_fp64_escalation           = False,
-    projected_cov_condition_recovery     = False,
-    predictive_covariance_checkpoint     = False,       # moment_matched only: recompute the (B,N,K,K) update in backward; bit-identical.
+    frame_pair_fp64_escalation       = False,
+    projected_cov_condition_recovery = False,
+    predictive_covariance_checkpoint = False,       # moment_matched only: recompute the (B,N,K,K) update in backward; bit-identical.
         
-    projected_gram_condition_tol         = 1e-4,
-    projected_factor_condition_tol       = 3e-4,
-    frame_pair_condition_tol             = 1e-4,       # inactive while the escalation is off
+    projected_gram_condition_tol     = 1e-4,
+    projected_factor_condition_tol   = 3e-4,
+    frame_pair_condition_tol         = 1e-4,       # inactive while the escalation is off
    
     
 )

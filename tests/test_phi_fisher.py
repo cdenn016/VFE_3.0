@@ -456,7 +456,7 @@ def test_fisher_optimizer_moves_only_active_rows_counts_rejections_and_keeps_no_
     optimizer = GaugeManifoldAdamW(
         [{"params": [phi], "lr": 0.05, "pullback_group": True, "weight_decay": 0.0}],
         group, phi_group_trust_radius=1e-3, phi_chart_max_norm=5.0, phi_bch_residual_max=1e-6,
-        phi_precond_mode="pullback_per_block", phi_group_retraction=retraction,
+        phi_group_retraction=retraction,
         phi_statistics_provider=_stub_provider(mu, s, counts), weight_decay=0.0)
     before = phi.detach().clone()
     phi.grad = torch.zeros_like(phi)
@@ -608,10 +608,10 @@ def test_fisher_group_policy_config_validation_and_inactive_marks() -> None:
     with pytest.raises(ValueError, match="phi_fisher_rotation_weight"):
         GaugeManifoldAdamW([nn.Parameter(torch.zeros(1))], get_group("block_glk")(n_heads=1, K=2),
                            phi_group_trust_radius=0.1, phi_chart_max_norm=5.0,
-                           phi_bch_residual_max=1e-6, phi_precond_mode="pullback_per_block",
+                           phi_bch_residual_max=1e-6, 
                            phi_fisher_rotation_weight=-1.0)
     with pytest.raises(ValueError, match="group_log"):
         GaugeManifoldAdamW([nn.Parameter(torch.zeros(1))], get_group("so_n")(3, group_n=3, irrep_spec=[("l1", 1)]),
                            phi_group_trust_radius=0.1, phi_chart_max_norm=5.0,
-                           phi_bch_residual_max=1e-6, phi_precond_mode="pullback_per_block",
+                           phi_bch_residual_max=1e-6, 
                            phi_statistics_provider=lambda param, rows: None)

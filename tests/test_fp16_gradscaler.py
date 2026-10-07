@@ -94,7 +94,6 @@ def test_fp16_with_pullback_group_steps_the_k10_two_gl5_frame(monkeypatch):
         n_heads=2,
         gauge_group="block_glk",
         m_phi_update_mode="pullback_group",
-        phi_precond_mode="pullback_per_block",
         transport_chart_max_norm=6.0,
         pos_phi="learned",
     )
@@ -128,7 +127,6 @@ def test_fp16_pullback_overflow_preserves_all_phi_factors_and_clock(monkeypatch)
         gauge_group="block_glk",
         m_phi_update_mode="pullback_group",
         n_heads=2,
-        phi_precond_mode="pullback_per_block",
         transport_chart_max_norm=6.0,
         pos_phi="none",
     )

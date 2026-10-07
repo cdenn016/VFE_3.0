@@ -429,7 +429,6 @@ def build_optimizer(
                 if cfg.bch_residual_max is not None
                 else 1e-6
             ),
-            phi_precond_mode=cfg.phi_precond_mode,
             phi_group_retraction=cfg.m_phi_group_retraction,
             phi_statistics_provider=(
                 PhiFisherStatisticsProvider(model, cfg.m_phi_fisher_rotation_weight)

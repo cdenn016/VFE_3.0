@@ -110,9 +110,8 @@ def test_config_accepts_and_refuses() -> None:
         test_config(gauge_group="block_glmc", embed_dim=8, n_heads=2, group_n=3)
     with pytest.raises(ValueError, match="irrep-labeled tower"):
         test_config(gauge_group="block_glmc", embed_dim=8, n_heads=2, use_cg_coupling=True)
-    with pytest.raises(ValueError, match="pullback capability None"):
-        test_config(gauge_group="block_glmc", embed_dim=8, n_heads=2, m_phi_update_mode="pullback_group",
-                    phi_precond_mode="pullback_per_block")
+    with pytest.raises(ValueError, match="registers no pullback capability"):
+        test_config(gauge_group="block_glmc", embed_dim=8, n_heads=2, m_phi_update_mode="pullback_group")
     with pytest.raises(ValueError, match="block_glk"):
         test_config(gauge_group="block_glmc", embed_dim=8, n_heads=2, m_phi_update_mode="fisher_group")
     with warnings.catch_warnings():

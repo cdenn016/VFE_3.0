@@ -71,7 +71,7 @@ _apply_config_notice_filter()
 # Seams with a live registry (lambda_alpha_mode, attention priors, norms, positional frames) are
 # validated against that registry in __post_init__ via tuple(sorted(_REGISTRY)), so a newly
 # registered variant is a valid config value WITHOUT editing this validator (the add-by-registering
-# modularity contract). phi_precond_mode is validated against phi_preconditioner._PRECOND. Positional
+# modularity contract). Positional
 # phi always uses exact group-product composition. Encode/decode modes likewise use their
 # registries. The static tuples below are the remaining seams WITHOUT a registry.
 _VALID_GAUGE_TRANSPORT     = ("on", "off", "frozen")
@@ -112,20 +112,25 @@ class VFE3Config:
     ##################################################
 
     vocab_size:                       int             = 50257
+    
     max_seq_len:                      int             = 128          # N, context length
     batch_size:                       int             = 64
+    
     max_steps:                        int             = 15000        # cosine-schedule horizon
     warmup_steps:                     int             = 100
+   
     min_lr_frac:                      float           = 0.01         # LR floor as a fraction of each group's base LR (0 = decay to 0)
+    
     grad_accum_steps:                 int             = 1            # microbatches per optimizer step (1 = no accumulation)
     grad_clip:                        Optional[float] = 1.0          # per-role L2 clip after accumulation; None or 0 = off
 
     seed:                             int             = 6
-    deterministic:                    bool            = True         # torch/cuDNN determinism (TF32: see fp32_matmul_precision)
+    
     # deterministic only: fill uninitialized allocations with NaN so stray reads are visible. False
     # skips the fill kernels (about 13.5 ms per K=64 step on the RTX 5090; loss and gradients identical).
     fill_uninitialized_memory:        bool            = True
-
+    deterministic:                    bool            = True         # torch/cuDNN determinism (TF32: see fp32_matmul_precision)
+    
     ##################################################
     #   2. Logging, evaluation and checkpoints
     ##################################################
@@ -133,13 +138,16 @@ class VFE3Config:
     log_interval:                     int             = 100          # console log every N steps (0 = off)
     eval_interval:                    int             = 1500         # validation every N steps (0 = off)
     checkpoint_interval:              int             = 15000        # resumable checkpoint every N steps (0 = off)
+    val_diagnostic_batches:           int             = 1             # validation batches the val_* probes average over
+    
     eval_stride:                      Optional[int]   = None         # held-out window stride <= max_seq_len; None = disjoint windows
-    val_diagnostic_batches:           int             = 1            # validation batches the val_* probes average over
+               
     generate_embedding_figures:       bool            = False        # slow semantic-geometry figures at finalize
 
     # Resume from a checkpoints/step_<N>.pt (weights, optimizer, RNG, schedule). None = train from scratch.
     # An explicit train(resume_from=...) argument takes precedence.
     resume_from:                      Optional[str]   = None
+    
     # Allow the unsafe weights_only=False load when the safe load of a (legacy) bundle fails. Only for
     # checkpoints you trust: that path can execute code embedded in the pickle.
     trust_resume_checkpoint:          bool            = False
@@ -158,8 +166,7 @@ class VFE3Config:
     ##################################################
 
     # "gaussian_diagonal" | "gaussian_full" | "laplace_diagonal"
-    # The belief covariance structure (read diagonal_covariance, never a second flag). The divergence is
-    # KL on every projected route.
+    # The belief covariance structure (read diagonal_covariance, never a second flag). 
     family:                           str             = "gaussian_diagonal"
 
     # Token tables: mu_v ~ N(0, mu_init_std^2), every variance = sigma_init (> 0), phi_v ~ N(0, phi_scale^2).
@@ -193,12 +200,13 @@ class VFE3Config:
     #              "diagonal_chunked" | "full_chunked"
     decode_coordinates:               str             = "local"
 
-    decode_tau:                       float           = 1.0          # prior-bank decode temperature (1 = Bayes); not read by linear
     decode_unigram_prior:             bool            = True         # add unigram_kappa * log pi_v (corpus unigram) to the logits
-    unigram_kappa:                    float           = 1.0          # tempering of log pi_v (1 = exact Bayes class prior)
     decode_bias:                      bool            = True         # linear only: learned per-vocab bias (zero init, no decay)
     untie_decode_bank:                bool            = True         # prior-bank only: decode reads its own copy of the (V, K) tables
 
+    decode_tau:                       float           = 1.0          # prior-bank decode temperature (1 = Bayes); not read by linear
+    unigram_kappa:                    float           = 1.0          # tempering of log pi_v (1 = exact Bayes class prior)
+    
     # Vocabulary entries per chunk of the fused CE kernels. The family_chunked full-covariance route
     # narrows its slice to a fixed byte budget and treats this as an upper bound. Values are unchanged.
     decode_chunk_size:                int             = 8192
@@ -206,11 +214,7 @@ class VFE3Config:
     # "auto" | "auto_aggregate"
     #   auto            checkpoint the decoder by per-chunk memory accounting (2 GiB threshold)
     #   auto_aggregate  account the whole vocabulary, including fp64 scores (saves more memory)
-    decode_ce_checkpoint:             str             = "auto"
-
-    # Prior-bank Gaussian decoders only: recompute an uncertain float32 decode argmax in float64 for the
-    # candidates whose score interval reaches the winner's (the fused training CE is unaffected).
-    decode_ranking_fp64_escalation:   bool            = False
+    decode_ce_checkpoint:             str             = "auto"  
 
     # "fp64" | "fp32"
     # Prior-bank Gaussian decoders only: precision of the a_v reduction (sum of 1/sigma_v terms). fp32 loses digits once
@@ -223,7 +227,11 @@ class VFE3Config:
     #   fp32_escalate       float32, recomputed in float64 when the Cholesky certificate fails
     #   fp32_escalate_cond  fp32_escalate plus a pivot-ratio conditioning trigger
     full_cov_kl_precision:            str             = "fp32_escalate_cond"
-
+    
+    # Prior-bank Gaussian decoders only: recompute an uncertain float32 decode argmax in float64 for the
+    # candidates whose score interval reaches the winner's (the fused training CE is unaffected).
+    decode_ranking_fp64_escalation:   bool            = False
+    
     ##################################################
     #   6. Gauge group
     ##################################################
@@ -239,8 +247,8 @@ class VFE3Config:
     # None | "per_head" | "shared"
     #   None      the group's native tying (block_glk "per_head", so_n "shared")
     #   per_head  an independent group element per head
-    #   shared    one element acting on every head. only: block_glk, so_n. block_glk "shared" refuses the
-    #             per-block metrics, pullback_group, fisher_group and group_log; so_n "per_head" refuses
+    #   shared    one element acting on every head. only: block_glk, so_n. block_glk "shared" refuses
+    #             pullback_group, fisher_group and group_log; so_n "per_head" refuses
     #             use_cg_coupling
     gauge_tying:                      Optional[str]   = None
 
@@ -257,12 +265,13 @@ class VFE3Config:
     # "random" draws exactly n_heads irreps summing to embed_dim (ranks in [irrep_min_rank,
     # irrep_max_rank], None = all that fit) with irrep_spec_seed, and the saved config keeps the drawn list.
     # JSON list-of-lists pairs are accepted and coerced to tuples.
-    group_n:                          Optional[int]   = None
-    irrep_spec:                       'Optional[List[Tuple[str, int]] | str]' = None
-    irrep_spec_seed:                  int             = 0
-    irrep_min_rank:                   int             = 1            # 1 skips the gauge-invariant trivial irrep l0
-    irrep_max_rank:                   Optional[int]   = None
-
+    group_n:                            Optional[int]   = None
+    irrep_spec: 'Optional[List[Tuple[str, int]] | str]' = None 
+    irrep_max_rank:                     Optional[int]   = None
+    
+    irrep_spec_seed:                    int             = 0
+    irrep_min_rank:                     int             = 1            # 1 skips the gauge-invariant trivial irrep l0
+    
     # "canonical" | "eigh"
     # so_n only: basis of each irrep block.
     #   canonical  deterministic; for group_n=3 any spin in closed form
@@ -272,6 +281,7 @@ class VFE3Config:
     # so_n with gauge_tying="shared" only: Clebsch-Gordan coupling between irrep blocks on the means
     # (exactly equivariant; learned scalar path weights, zero init).
     use_cg_coupling:                  bool            = False
+    
     # "passthrough" | "delta_full"
     # use_cg_coupling only: covariance after the CG update.
     #   passthrough  covariance untouched
@@ -290,15 +300,14 @@ class VFE3Config:
     #   learned  learned (max_seq_len, n_gen) table
     #   frozen   parameter-free i * pos_phi_scale on one generator axis
     pos_phi:                          str             = "learned"
+    pos_rotation:                     str             = "none"       # "none" | "rope" block-diagonal rotation R(theta) folded 
+                                                                     # into each frame on the right, V_i = U_i R_i^T.
+    rope_on_value:                    bool            = False        # rope only: rotate the content frame too (False: routing only)
     pos_phi_project_slk:              bool            = False        # pos_phi only: per-block trace projection (det = 1)
     bch_residual_max:                 Optional[float] = None         # fail-closed group-product relative residual; None = off
-
-    # "none" | "rope"
-    # rope: block-diagonal rotation R(theta) folded into each frame on the right, V_i = U_i R_i^T.
-    pos_rotation:                     str             = "none"
+    
     rope_base:                        float           = 100.0        # rope only: frequency base
-    rope_on_value:                    bool            = False        # rope only: rotate the content frame too (False: routing only)
-
+    
     ##################################################
     #   8. Attention routing
     ##################################################
@@ -310,7 +319,7 @@ class VFE3Config:
 
     # Temperature scale: tau_h = kappa_beta * sqrt(d_h); a list (one per head) gives per-head temperatures.
     # Not read by predictive_readout="minimal_agent".
-    kappa_beta:                       'float | List[float]' = 1.0
+    kappa_beta:                 'float | List[float]' = 1.0
 
     # "causal" | "causal_noself" | "causal_alibi" | "causal_alibi_noself" | "causal_windowed"
     # | "t5_relative_bias" | "uniform" | "alibi" | "windowed"
@@ -321,6 +330,7 @@ class VFE3Config:
     #   t5_relative_bias   T5 bucketed relative-position bias
     #   uniform            zero log-bias
     beta_attention_prior:             str             = "causal"
+    
     # alibi priors only: BASE multiplier; the realized head slopes are alibi_slope * 2^(-8h/H), so an
     # n_heads sweep at fixed alibi_slope rescales the prior.
     alibi_slope:                      float           = 1.0
@@ -351,19 +361,20 @@ class VFE3Config:
     # minimal_agent only.
     #   exact       each head's exact posterior; heads combined by assumed-density filtering
     #   mean_field  KL labels at the input moments and an information-form fusion (no between-source spread)
-    minimal_agent_inference:          str             = "exact"
-    minimal_agent_channel_noise:      float           = 1.0          # minimal_agent only: initial channel noise n_h > 0 (learned)
-
-    attention_residual:               bool            = True         # kernel only: new mean = mu_i + content (False: content only)
-
+    minimal_agent_inference:          str             = "mean_field"
+    
     # "passthrough" | "moment_matched"
     #   passthrough     keep the incoming covariance
     #   moment_matched  the exact moment-matched covariance of the readout
     predictive_covariance:            str             = "moment_matched"
+    
     predictive_covariance_floor:      float           = 1e-4         # moment_matched with kernel only: floor * (tr C_i / K) I
+    minimal_agent_channel_noise:      float           = 1.0          # minimal_agent only: initial channel noise n_h > 0 (learned)
+   
     # moment_matched only: recompute the covariance update in backward instead of storing its
     # intermediates (identical values and gradients; saves memory at large K).
     predictive_covariance_checkpoint: bool            = False
+    attention_residual:               bool            = True      # kernel only: new mean = mu_i + content (False: content only)
 
     ##################################################
     #   10. Content links (O, T)
@@ -380,19 +391,19 @@ class VFE3Config:
     #   affine       O' = O (O = 0 is zero content)
     #   first_order  O' = T^-1 + O (O = 0 is flat transport)
     #   exponential  O' = T^-1 + O phi_1(T O) = e^{O T} T^-1 (O = 0 is flat transport)
-    content_link_chart:               str             = "affine"
+    content_link_chart:               str             = "exponential"
 
     # "off" | "lowrank" | "pure_gauge"
     # Edge-dependent links G_ij (only: content_link_chart="exponential", projected_predictive, equal heads).
     #   off         one shared exponential link
-    #   lowrank     curved: G_ij = g_i e^L exp(A_i B_j^T), rank content_link_edge_rank
+    #   lowrank     curved: G_ij = g_i e^L exp(A_i B_j^T), rank content_link_edge_rank - EXPENSIVE
     #   pure_gauge  flat control: G_ij = g_i e^L g_j^-1, g_i = exp(A B_i^T)
     content_link_edges:               str             = "off"
     content_link_edge_rank:           int             = 4            # edges on only: factor rank r, 1 <= r <= embed_dim
 
     # content_link_edges="lowrank" only: the receiver factor A_i becomes a per-context MAP estimate with
     # prior N(a(xi_i), sigma_L^2 I), found by damped fixed-point steps. Stable while sigma_L^2 times the
-    # curvature stays below about 1; watch val_relational_latent_energy_final.
+    # curvature stays below about 1; watch val_relational_latent_energy_final. EXPENSIVE
     content_link_latent:              bool            = False
     content_link_latent_steps:        int             = 1            # fixed-point steps >= 1
     content_link_latent_sigma:        float           = 0.1          # prior scale sigma_L > 0
@@ -425,14 +436,15 @@ class VFE3Config:
     #   constant                   alpha = lambda_alpha
     #   state_dependent            alpha_i = c0 / (b0 + D(q_i || p_i))
     #   state_dependent_per_coord  the same per coordinate (b0, c0 may be K-lists)
-    lambda_alpha_mode:                str             = "state_dependent_per_coord"
-    lambda_alpha:                     float           = 1.0          # constant only
+    lambda_alpha_mode:                str                   = "state_dependent_per_coord"
+    lambda_alpha:                     float                 = 1.0          # constant only
     b0:                               'float | List[float]' = 1.0
     c0:                               'float | List[float]' = 1.0
 
-    lambda_beta:                      float           = 1.0          # weight of the whole belief-coupling block (1 = pure F)
-    mass_phi:                         float           = 0.0          # (mass_phi / 2) ||phi||^2 penalty
-    mstep_self_coupling_weight:       float           = 0.0          # M-step sum_i alpha_i D(q_i* || p_i); 0 = off
+    lambda_beta:                      float                 = 1.0          # weight of the whole belief-coupling block (1 = pure F)
+    
+    mass_phi:                         float                 = 0.0          # (mass_phi / 2) ||phi||^2 penalty
+    mstep_self_coupling_weight:       float                 = 0.0          # M-step sum_i alpha_i D(q_i* || p_i); 0 = off
 
     ##################################################
     #   13. Normalization and block handoff
@@ -443,7 +455,7 @@ class VFE3Config:
     #   layernorm    standard LayerNorm over the belief dim (not gauge-equivariant)
     #   mahalanobis  gauge-invariant rescale
     # norm_type_block runs inside every block; norm_type_final once before decode.
-    norm_type_block:                  str             = "mahalanobis"
+    norm_type_block:                  str             = "layernorm"
     norm_type_final:                  str             = "none"
     layernorm_affine:                 bool            = False        # layernorm only: learned gamma/beta (init 1/0)
 
@@ -477,24 +489,25 @@ class VFE3Config:
     #   delta_full   J Sigma J^T + block_mlp_covariance_floor * Sigma (coordinate, gauge_gate, canonical_frame)
     #   posterior    the template posterior covariance (prototype_agents)
     block_mlp_covariance:             str             = "passthrough"
-    block_mlp_covariance_floor:       float           = 1e-4         # delta_full only
-
+   
     # "gelu" | "silu" | "relu"
     # Hidden activation; not read by gaussian_template or prototype_agents.
     block_mlp_activation:             str             = "gelu"
-    block_mlp_expansion:              int             = 8            # hidden width (or template count) = expansion * K
-    block_mlp_dropout:                float           = 0.0
-
+       
     # "mean_field" | "exact"
     # prototype_agents only: template posterior.
     #   mean_field  KL-label responsibilities and the power posterior
     #   exact       exact mixture posterior (dense or block covariance needs a Cholesky per token/template)
     block_mlp_inference:              str             = "mean_field"
-    block_mlp_template_init_variance: float           = 10.0         # prototype_agents only: initial template variance > 0
-
+    
     # Per-type (V, n_gen) table added to the first hidden pre-activations of each layer's MLP (zero init).
     # only: projected attention, use_block_mlp with a coordinate or canonical_frame MLP.
     per_type_hidden_bias:             bool            = False        # TODO ablate then remove
+    
+    block_mlp_expansion:              int             = 8            # hidden width (or template count) = expansion * K
+    block_mlp_dropout:                float           = 0.0
+    block_mlp_covariance_floor:       float           = 1e-4         # delta_full only
+    block_mlp_template_init_variance: float           = 10.0         # prototype_agents only: initial template variance > 0
 
     ##################################################
     #   15. E-step (belief updates)
@@ -504,11 +517,13 @@ class VFE3Config:
     # Fisher step sizes:
     e_q_mu_lr:                        float           = 0.5
     e_q_sigma_lr:                     float           = 0.015
+    
     # Trust regions: the mean step is projected onto the Mahalanobis ball of this many standard
     # deviations (None = no projection); the sigma step onto one shared tangent ball.
     e_mu_q_trust:                     Optional[float] = 2
     e_sigma_q_trust:                  float           = 5.0
     mu_trust_cholesky_rounds:         int             = 3            # jitter rounds before the mean trust whitening falls back to diagonal
+    
     skip_belief_sigma_update:         bool            = False        # projected_gradient only: skip the sigma E-step
 
     ##################################################
@@ -521,27 +536,19 @@ class VFE3Config:
     #   fisher_group    belief-Fisher natural gradient on the frame (untied block_glk, per_token)
     m_phi_update_mode:                str             = "adamw"
 
-    # "none" | "clip" | "killing" | "killing_per_block" | "pullback" | "pullback_per_block"
-    # pullback_group only: metric of the phi direction (pullback_group requires "pullback_per_block").
-    #   none                identity
-    #   clip                norm clip
-    #   killing             Killing-form metric (center-regularized)
-    #   killing_per_block   per-block Killing metric
-    #   pullback            Frobenius-pullback metric
-    #   pullback_per_block  per-block Frobenius-pullback metric
-    phi_precond_mode:                 str             = "none"
-
     # "chart" | "group_log"
     # pullback_group / fisher_group only: retraction of the phi step.
     #   chart      additive chart step with product-residual backtracking
     #   group_log  exact right product Log(exp(phi) exp(-eta s xi)) (untied block_glk)
     m_phi_group_retraction:           str             = "chart"
-    m_phi_group_trust_radius:         float           = 0.1          # pullback_group / fisher_group only: step bound
-    m_phi_fisher_rotation_weight:     float           = 2.0          # fisher_group only: weight on belief-invisible rotations
+        
     # Interior radius for phi after each M-step, < transport_chart_max_norm (AdamW projects rows back;
     # pullback_group rejects the step). None: nothing bounds ||phi|| under adamw.
     phi_mstep_max_matrix_norm:        Optional[float] = None
-
+    
+    m_phi_group_trust_radius:         float           = 0.1          # pullback_group / fisher_group only: step bound
+    m_phi_fisher_rotation_weight:     float           = 2.0          # fisher_group only: weight on belief-invisible rotations
+    
     ##################################################
     #   17. Learning rates (M-step)
     ##################################################
@@ -549,11 +556,15 @@ class VFE3Config:
     m_p_mu_lr:                        float           = 0.025        # mean tables
     m_p_sigma_lr:                     float           = 0.0025       # log-variance tables
     m_phi_lr:                         float           = 0.015        # frame table phi_embed
+    
     m_pos_phi_lr:                     Optional[float] = 0.0035       # learned positional frame; None = m_phi_lr
+    
     m_decode_mu_lr:                   Optional[float] = 0.025        # untied decode means / linear readout; None = m_p_mu_lr
     m_decode_sigma_lr:                Optional[float] = 0.001        # untied decode log variances (not linear); None = m_p_sigma_lr
+    
     m_relational_score_lr:            Optional[float] = 0.005        # query/key maps; None = m_p_mu_lr
     m_relational_content_lr:          Optional[float] = 0.005        # content maps (O, T); None = m_p_mu_lr
+    
     m_block_mlp_lr:                   Optional[float] = None         # block MLP; None = m_p_mu_lr
     m_layernorm_lr:                   Optional[float] = None         # layernorm affine; None = m_p_mu_lr
     m_per_type_hidden_bias_lr:        Optional[float] = None         # per_type_hidden_bias; None = the declared m_phi_lr
@@ -563,11 +574,14 @@ class VFE3Config:
     ##################################################
 
     weight_decay:                     float           = 0.05         # AdamW default for every group without its own value
+    
     # Mean tables (mu_embed, decode means, linear readout). Decay reaches every row every step, rare
     # tokens included. None = weight_decay; 0 = exempt.
     mu_weight_decay:                  Optional[float] = 0
+    
     # Log-variance tables. Decay pulls sigma toward 1 against sigma_init. None = weight_decay; 0 = exempt.
     sigma_weight_decay:               Optional[float] = 0
+    
     # Frame tables (phi_embed, pos_phi_free) under adamw; sets a frame-norm ceiling (0 = none).
     phi_weight_decay:                 float           = 0.065
 
@@ -583,7 +597,7 @@ class VFE3Config:
     # None | "bf16" | "fp16"
     # Mixed precision on CUDA. None = full fp32 (no autocast). Decode, CE and matrix functions stay fp32.
     # bf16 needs no GradScaler; fp16 training does.
-    amp_dtype:                        Optional[str]   = None
+    amp_dtype:                        Optional[str]   = "bf16"
 
     # None | "highest" | "high" | "medium"
     #   None     leave the card's TF32 policy as is
@@ -595,27 +609,28 @@ class VFE3Config:
     # Redo a frame producer call in float64 when its float32 frame pair is ill-conditioned
     # (eps_32 kappa_F(U) > frame_pair_condition_tol). Costly (about 7x per escalated step).
     frame_pair_fp64_escalation:       bool            = False
-    frame_pair_condition_tol:         float           = 1e-4         # escalation only: kappa_F > 838.9 at 1e-4
-
+    
     # Also rebuild projected covariances that factor in float32 but fail eps_32 ||G||_F ||G^-1||_F <= tol
     # (failed factorizations are always rebuilt). Costly on CUDA; with minimal_agent it also screens the
     # ADF query covariances.
     projected_cov_condition_recovery: bool            = False
-    projected_gram_condition_tol:     float           = 1e-4         # recovery only, gram route
-    projected_factor_condition_tol:   float           = 3e-4         # recovery only, cholesky_qr2 route
-
+       
     # "fp64" | "fp32"
     # Precision of the projected source recovery.
     #   fp64  float64 QR, and float64 for every pair touching a recovered entry
     #   fp32  float32 shifted CholeskyQR3 (falls back to fp64 when that fails)
-    projected_cov_recovery_precision: str             = "fp64"
+    projected_cov_recovery_precision: str             = "fp32"
 
     # "gram" | "cholesky_qr2"
     # Factor route of the projected Gaussian-KL scorer.
     #   gram          factor the float32 Gram X X^T (error O(eps kappa^2))
     #   cholesky_qr2  factor X by CholeskyQR2 (error O(eps kappa); slower unless recovery trips)
     projected_factor_route:           str             = "gram"
-
+    
+    projected_gram_condition_tol:     float           = 1e-4         # recovery only, gram route
+    projected_factor_condition_tol:   float           = 3e-4         # recovery only, cholesky_qr2 route
+    frame_pair_condition_tol:         float           = 1e-4         # escalation only: kappa_F > 838.9 at 1e-4
+    
     def __post_init__(self) -> None:
         # Every plain bool/int field is gated here on its exact type (bool is not an int, and
         # "False" is not a bool), so the later validators need not repeat the type test.
@@ -889,13 +904,6 @@ class VFE3Config:
         if self.gauge_tying is None:
             self.gauge_tying = _traits.native_tying
         _require(self.gauge_tying, _traits.tyings, "gauge_tying")
-        if (self.gauge_group == "block_glk" and self.gauge_tying == "shared"
-                and self.phi_precond_mode in ("killing_per_block", "pullback_per_block")):
-            raise ValueError(
-                f"phi_precond_mode={self.phi_precond_mode!r} is incompatible with gauge_group="
-                f"'block_glk' and gauge_tying='shared': every generator I_H (x) E_ab acts on all "
-                f"heads, so a per-block metric is undefined. Use 'none', 'clip', or 'killing'."
-            )
 
         # gauge seam. Irrep tower: validate group_n + irrep_spec at construction (labels
         # resolve, block dims sum to embed_dim) so a bad spec fails here with the computed dims.
@@ -955,16 +963,6 @@ class VFE3Config:
                     f"gauge_group={self.gauge_group!r} needs n_heads equal to the number of irrep blocks (one gauge "
                     f"block per head): irrep_spec gives {len(_block_dims)} blocks {_block_dims}, "
                     f"n_heads={self.n_heads}"
-                )
-            # One shared phi drives EVERY block, so the generators do not partition per block:
-            # the per-block phi preconditioners are undefined (untied so_n partitions them).
-            if (self.gauge_tying == "shared"
-                    and self.phi_precond_mode in ("killing_per_block", "pullback_per_block")):
-                raise ValueError(
-                    f"phi_precond_mode={self.phi_precond_mode!r} is incompatible with "
-                    f"gauge_group={self.gauge_group!r}: the shared generators act in every "
-                    f"irrep block, so a per-block metric is undefined. Use 'none', 'clip', or "
-                    f"the ambient 'killing'."
                 )
         elif self.group_n is not None or self.irrep_spec is not None:
             raise ValueError(
@@ -1121,8 +1119,6 @@ class VFE3Config:
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be >= 0 and finite, got {value}")
-        from vfe3.geometry.phi_preconditioner import _PRECOND
-        _require(self.phi_precond_mode, tuple(sorted(_PRECOND)), "phi_precond_mode")
         from vfe3.gauge_optim import _PHI_UPDATE_POLICIES, get_phi_update_policy
         _require(
             self.m_phi_update_mode,
@@ -1167,12 +1163,10 @@ class VFE3Config:
             from vfe3.geometry.groups import get_group
             group_builder = get_group(self.gauge_group)
             capability = getattr(group_builder, "pullback_capability", None)
-            if capability != self.phi_precond_mode:
+            if capability is None:
                 raise ValueError(
-                    f"gauge_group={self.gauge_group!r} has registered pullback capability "
-                    f"{capability!r}, which does not certify phi_precond_mode="
-                    f"{self.phi_precond_mode!r}; phase one requires a built-in bracket-closed "
-                    "full/per-block pullback pairing"
+                    f"gauge_group={self.gauge_group!r} registers no pullback capability; phase one "
+                    "requires a built-in bracket-closed per-block pullback direction"
                 )
             if self.gauge_group != "block_glk" or self.gauge_tying != "per_head":
                 raise ValueError(
@@ -1789,8 +1783,6 @@ class VFE3Config:
             mark(("attention_window",), "window covers the context and is identical to plain causal")
         if self.n_layers == 1:
             mark(("prior_handoff_rho", "prior_handoff_sigma"), "no next layer consumes the handoff")
-        if self.m_phi_update_mode != "pullback_group":
-            mark(("phi_precond_mode",), "reached only by m_phi_update_mode='pullback_group'")
         registration = _DECODERS[self.decode_mode]
         if not registration.supports_chunked:
             mark(("decode_ce_checkpoint",), "the selected decoder has no checkpointed chunked CE kernel")

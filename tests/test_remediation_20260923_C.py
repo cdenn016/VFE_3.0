@@ -20,8 +20,7 @@ from tests.profiles import tiny_config
 from vfe3.belief import BeliefState
 from vfe3.gauge_optim import GaugeManifoldAdamW, stage_pullback_group_candidate
 from vfe3.geometry.groups import get_group
-from vfe3.geometry.lie_ops import embed_phi, extract_phi
-from vfe3.geometry.phi_preconditioner import _bch_chart_direction, pullback_group_direction
+from vfe3.geometry.phi_preconditioner import pullback_group_direction
 from vfe3.geometry.retraction import retract_phi
 from vfe3.geometry.transport import (
     _checked_group_inverse,
@@ -189,7 +188,7 @@ def test_pullback_staging_rejects_only_the_ill_conditioned_row(monkeypatch) -> N
 
     candidate = stage_pullback_group_candidate(
         grad, phi, group, learning_rate=1e-3, trust_radius=0.1, chart_max_norm=10.0,
-        bch_residual_max=1e-6, phi_precond_mode="pullback_per_block")
+        bch_residual_max=1e-6)
     assert candidate.rejected_rows.tolist() == [True, False]
     assert torch.equal(candidate.candidate_phi[0], phi[0])
     assert not torch.equal(candidate.candidate_phi[1], phi[1])
@@ -198,7 +197,7 @@ def test_pullback_staging_rejects_only_the_ill_conditioned_row(monkeypatch) -> N
     optimizer = GaugeManifoldAdamW(
         [{"params": [param], "lr": 1e-3, "pullback_group": True, "weight_decay": 0.0}], group,
         phi_group_trust_radius=0.1, phi_chart_max_norm=10.0, phi_bch_residual_max=1e-6,
-        phi_precond_mode="pullback_per_block", weight_decay=0.0)
+        weight_decay=0.0)
     param.grad = grad.clone()
     optimizer._collect_gauge_diag = True
     optimizer.step()
@@ -223,7 +222,7 @@ def test_pullback_staging_backtracks_or_rejects_chart_bound_rows_per_row(monkeyp
                                      scaled_solve_residual=zeros, series_order=40)))
     candidate = stage_pullback_group_candidate(
         -torch.ones_like(phi), phi, group, learning_rate=1.0, trust_radius=1.0,
-        chart_max_norm=1.0, bch_residual_max=1e-6, phi_precond_mode="pullback_per_block")
+        chart_max_norm=1.0, bch_residual_max=1e-6)
     # Row 0 starts inside: 0.99 + 0.2 / 2^5 = 0.99625 is the first backtrack inside the chart.
     assert candidate.backtracking_reductions[0].item() == 5
     assert candidate.candidate_phi[0, 0].item() == pytest.approx(0.99625)
@@ -242,60 +241,7 @@ def test_pullback_staging_still_raises_on_nonfinite_state() -> None:
     with pytest.raises(FloatingPointError, match="nonfinite grad or chart"):
         stage_pullback_group_candidate(
             grad, phi, group, learning_rate=1e-3, trust_radius=0.1, chart_max_norm=10.0,
-            bch_residual_max=1e-6, phi_precond_mode="pullback_per_block")
-
-
-# -- #11: the E-step chart direction uses the exact exponential differential ---------------------
-
-def _psi(z: torch.Tensor) -> torch.Tensor:
-    r"""psi(z) = z / (1 - e^{-z}), continued to psi(0) = 1."""
-    safe = torch.where(z.abs() < 1e-12, torch.ones_like(z), z)
-    return torch.where(z.abs() < 1e-12, torch.ones_like(z), safe / (-torch.expm1(-safe)))
-
-
-def test_bch_chart_direction_is_exact_at_the_spurious_b4_root() -> None:
-    group = get_group("block_glk")(2, 1)
-    G = group.generators.double()
-    a = 3.879 / 2.0                                               # ad eigenvalues 0, +-3.879
-    phi = extract_phi(torch.diag(torch.tensor([a, -a], dtype=torch.float64)), G)
-    delta = torch.tensor([0.3, -0.7, 0.4, 0.2], dtype=torch.float64)
-    v = _bch_chart_direction(delta, phi, G)
-    assert torch.isfinite(v).all()
-    lam = torch.tensor([a, -a], dtype=torch.float64)
-    z = lam.unsqueeze(-1) - lam.unsqueeze(-2)                     # ad eigenvalue on E_ij
-    V, D = embed_phi(v, G), embed_phi(delta, G)
-    # Exact: psi(ad_X) v = delta entrywise in the eigenbasis of the diagonal X.
-    assert torch.allclose(_psi(z) * V, D, rtol=0.0, atol=1e-12)
-    # The retired B4 truncation is (nearly) singular here; the exact direction stays O(delta).
-    assert v.norm() < 20.0 * delta.norm()
-
-
-def test_bch_chart_direction_matches_the_exact_group_product_velocity() -> None:
-    scipy_linalg = pytest.importorskip("scipy.linalg")
-    group = get_group("block_glk")(3, 1)
-    G = group.generators.double()
-    generator = torch.Generator().manual_seed(3)
-    phi = 0.8 * torch.randn(9, generator=generator, dtype=torch.float64)
-    delta = torch.randn(9, generator=generator, dtype=torch.float64)
-    v = _bch_chart_direction(delta, phi, G)
-    X = embed_phi(phi, G).numpy()
-    V = embed_phi(v, G).numpy()
-    t = 1e-5
-    forward = scipy_linalg.logm(scipy_linalg.expm(X) @ scipy_linalg.expm(t * V))
-    backward = scipy_linalg.logm(scipy_linalg.expm(X) @ scipy_linalg.expm(-t * V))
-    velocity = torch.from_numpy(((forward - backward) / (2 * t)).real)
-    assert torch.allclose(velocity, embed_phi(delta, G), atol=1e-6)
-
-
-def test_bch_chart_direction_per_block_matches_full_on_block_glk() -> None:
-    group = get_group("block_glk")(4, 2)
-    G = group.generators.double()
-    generator = torch.Generator().manual_seed(4)
-    phi = torch.randn(3, G.shape[0], generator=generator, dtype=torch.float64)
-    delta = torch.randn(3, G.shape[0], generator=generator, dtype=torch.float64)
-    per_block = _bch_chart_direction(delta, phi, G, irrep_dims=group.irrep_dims)
-    full = _bch_chart_direction(delta, phi, G)
-    assert torch.allclose(per_block, full, atol=1e-10)
+            bch_residual_max=1e-6)
 
 
 # -- #27: sigma_max annotations match VFE3Config ------------------------------------------------
@@ -305,17 +251,6 @@ def test_sigma_max_annotation_matches_config(function) -> None:
     parameter = inspect.signature(function).parameters["sigma_max"]
     assert parameter.annotation == Optional[float]
     assert parameter.default == tiny_config().sigma_max == 100.0
-
-
-# -- Low: preconditioner labels ----------------------------------------------------------------
-
-def test_pullback_and_killing_preconditioners_are_not_labeled_natural_gradient() -> None:
-    import vfe3.geometry.phi_preconditioner as pp
-
-    for function in (pp.pullback_metric, pp._precond_pullback, pp._precond_pullback_per_block,
-                     pp.pullback_metric_per_block, pp._precond_killing,
-                     pp._precond_killing_per_block):
-        assert "natural" not in (function.__doc__ or "").lower()
 
 
 # -- Low: numerics keep float64 in float64 -------------------------------------------------------

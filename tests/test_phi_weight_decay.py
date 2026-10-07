@@ -61,7 +61,7 @@ def test_pos_phi_free_uses_phi_weight_decay():
 
 def test_pullback_group_forces_phi_decay_zero_regardless_of_field():
     cfg = test_config(**BASE, gauge_group="block_glk", m_phi_update_mode="pullback_group",
-                     phi_precond_mode="pullback_per_block", transport_chart_max_norm=6.0,
+                     transport_chart_max_norm=6.0,
                      phi_weight_decay=0.065)
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)

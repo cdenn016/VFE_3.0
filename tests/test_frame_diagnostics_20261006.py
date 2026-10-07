@@ -105,7 +105,7 @@ def test_frame_keys_reach_the_training_metrics_row(tmp_path, monkeypatch) -> Non
 ])
 def test_pullback_group_checks_now_fire(bad: dict, match: str) -> None:
     base = dict(embed_dim=4, n_heads=2, gauge_group="block_glk", pos_phi="none",
-                m_phi_update_mode="pullback_group", phi_precond_mode="pullback_per_block",
+                m_phi_update_mode="pullback_group", 
                 transport_chart_max_norm=6.0)
     test_config(**base)                                      # the reference config is accepted
     with pytest.raises(ValueError, match=match):

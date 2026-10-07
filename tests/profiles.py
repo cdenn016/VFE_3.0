@@ -123,7 +123,6 @@ _CONFIG_VALUES: dict[str, Any] = {
     'm_layernorm_lr': None,
     'e_q_mu_lr': 0.5,
     'e_q_sigma_lr': 0.015,
-    'phi_precond_mode': 'none',
     'skip_belief_sigma_update': True,
     'm_p_mu_lr': 0.025,
     'm_p_sigma_lr': 0.0025,

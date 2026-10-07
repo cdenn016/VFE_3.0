@@ -283,7 +283,6 @@ def test_train_step_consumes_completed_regularized_loss_covector_at_geometry_sea
 def _pullback_cfg(**overrides: object) -> VFE3Config:
     values: dict[str, object] = {
         "m_phi_update_mode": "pullback_group",
-        "phi_precond_mode": "pullback_per_block",
         "m_phi_group_trust_radius": 0.1,
         "transport_chart_max_norm": 6.0,
         "m_phi_lr": 0.02,

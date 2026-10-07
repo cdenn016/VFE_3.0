@@ -92,25 +92,15 @@ def test_tied_block_glk_frames_are_identical_across_heads() -> None:
                                atol=1e-12, rtol=0)
 
 
-@pytest.mark.parametrize("overrides,match", [
-    (dict(phi_precond_mode="killing_per_block"), "per-block metric is undefined"),
-    (dict(phi_precond_mode="pullback_per_block"), "per-block metric is undefined"),
-])
-def test_tied_block_glk_refuses_per_block_metrics(overrides: dict, match: str) -> None:
-    test_config(embed_dim=6, n_heads=2, **overrides)                     # untied: accepted
-    with pytest.raises(ValueError, match=match):
-        test_config(**TIED_GLK, **overrides)
-
-
 def test_tied_block_glk_refuses_pullback_fisher_and_group_log() -> None:
     from tests.test_phi_fisher import _ACTIVE_ROUTE
     pullback = dict(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1, pos_phi="none",
-                    m_phi_update_mode="pullback_group", phi_precond_mode="pullback_per_block",
+                    m_phi_update_mode="pullback_group",
                     transport_chart_max_norm=6.0, m_phi_lr=0.1)
     test_config(**pullback)
     test_config(**pullback, m_phi_group_retraction="group_log")
     test_config(**_ACTIVE_ROUTE)
-    with pytest.raises(ValueError, match="incompatible with gauge_group='block_glk' and gauge_tying='shared'"):
+    with pytest.raises(ValueError, match="accepts only untied block_glk"):
         test_config(**pullback, gauge_tying="shared")
     with pytest.raises(ValueError, match="gauge_tying='per_head'"):
         test_config(**_ACTIVE_ROUTE, gauge_tying="shared")
@@ -159,22 +149,9 @@ def test_untied_so_n_frames_are_independent_per_block() -> None:
         torch.testing.assert_close(_blocks(U, [3, 5])[b], expected, atol=1e-12, rtol=1e-12)
 
 
-def test_untied_so_n_refuses_cg_and_accepts_per_block_killing() -> None:
+def test_untied_so_n_refuses_cg() -> None:
     with pytest.raises(ValueError, match="gauge_tying='shared'"):
         test_config(**UNTIED_SON, use_cg_coupling=True)
-    assert test_config(**UNTIED_SON, phi_precond_mode="killing_per_block").phi_precond_mode == "killing_per_block"
-    tied = {**UNTIED_SON, "gauge_tying": "shared"}
-    with pytest.raises(ValueError, match="per-block metric is undefined"):
-        test_config(**tied, phi_precond_mode="killing_per_block")
-
-
-def test_per_block_killing_on_an_untied_tower_with_a_trivial_block() -> None:
-    from vfe3.geometry.phi_preconditioner import build_killing_preconditioner_per_block
-    spec = [("l0", 1), ("l1", 1), ("l2", 1)]
-    group = get_group("so_n")(9, group_n=3, irrep_spec=spec, tying="per_head", dtype=torch.float64)
-    Minv = build_killing_preconditioner_per_block(group.generators, [1, 3, 5])
-    assert Minv.shape == (6, 6) and bool(torch.isfinite(Minv).all())
-    assert float(Minv[:3, 3:].abs().max()) == 0.0                        # no cross-block coupling
 
 
 # ---------------------------------------------------------------- model routes
@@ -198,15 +175,6 @@ def test_train_step_and_gauge_equivariance(group: str, route: str) -> None:
     loss = train_step(model, optimizer, scheduler, torch.tensor([[1, 4, 2]]), torch.tensor([[4, 2, 3]]))
     assert math.isfinite(loss)
     assert float((model.prior_bank.phi_embed.detach() - phi0).abs().max()) > 0.0
-
-
-def test_untied_so_n_killing_per_block_trains() -> None:
-    from vfe3.train import build_optimizer, train_step
-    model = _model(**UNTIED_SON, phi_precond_mode="killing_per_block")
-    optimizer = build_optimizer(model, model.cfg)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
-    assert math.isfinite(train_step(model, optimizer, scheduler, torch.tensor([[1, 4, 2]]),
-                                    torch.tensor([[4, 2, 3]])))
 
 
 def test_run_record_carries_the_tying() -> None:
