@@ -100,6 +100,12 @@ _ENGLISH_ONLY_SINGLE_RUN_FIGURES = frozenset({
 # Figures of the run's eval-cadence tables, written by :func:`generate_history_figures` from
 # ``metrics.csv`` and ``diagnostics/*.csv`` without a model replay.
 HISTORY_FIGURES = ("learning_curves", "attention_stats", "attention_stats_training", "residual_ratio")
+# History figures of opt-in features, drawn only when their eval-cadence table exists (vfe3.viz.feature_figures).
+FEATURE_HISTORY_FIGURES = ("minimal_agent_heads", "prototype_templates")
+# Report tokens the end-of-run feature probes replay (vfe3.posthoc.feature_probes); the prototype gap reruns the
+# block in the other inference mode on at most FEATURE_GAP_TOKENS of them.
+FEATURE_PROBE_TOKENS = 4096
+FEATURE_GAP_TOKENS = 2048
 
 
 def plan_single_run_figures(
@@ -576,6 +582,8 @@ def generate_history_figures(
     against ``tokens_seen`` and ``wall_clock_s``, and ``generalization_gap_fixed``.
     ``attention_stats`` (final evaluation) and ``attention_stats_training`` read
     ``diagnostics/attention_stats.csv``; ``residual_ratio`` reads ``diagnostics/residual_ratio.csv``.
+    :data:`FEATURE_HISTORY_FIGURES` (``minimal_agent_heads``, ``prototype_templates``) are drawn only when their
+    tables exist.
     Each figure is written only when its table exists and holds data; otherwise the skip reason is
     logged. ``cfg`` supplies the token axis of runs without ``tokens_seen`` (default: the run's
     ``config.json``). Returns the figure paths written.
@@ -600,7 +608,15 @@ def generate_history_figures(
             residual_table, "diagnostics/residual_ratio.csv",
             lambda p: figs.plot_residual_ratio(residual_table, path=p)),
     }
-    if all(table is None for table, _, _ in jobs.values()):
+    from vfe3.viz import feature_figures
+    feature_jobs = {
+        "minimal_agent_heads": (figs.read_long_table(run_dir / "diagnostics" / "minimal_agent_heads.csv"),
+                                feature_figures.plot_minimal_agent_heads),
+        "prototype_templates": (figs.read_long_table(run_dir / "diagnostics" / "prototype_templates.csv"),
+                                feature_figures.plot_prototype_templates),
+    }
+    if (all(table is None for table, _, _ in jobs.values())
+            and all(table is None for table, _ in feature_jobs.values())):
         logger.info("history figures skipped: no metrics.csv or diagnostics tables in %s", run_dir)
         return []
     figdir = prepare_owned_output_child(run_dir, "figures", role="single-run figure")
@@ -611,6 +627,81 @@ def generate_history_figures(
         if table is None:
             logger.info("figure %r skipped (%s absent or empty)", name, source)
             continue
+        path = _write_figure(figdir, name, thunk, logger)
+        if path is not None:
+            written.append(path)
+    for name in FEATURE_HISTORY_FIGURES:
+        table, builder = feature_jobs[name]
+        if table is not None:
+            path = _write_figure(figdir, name, lambda p, b=builder, tab=table: b(tab, path=p), logger)
+            if path is not None:
+                written.append(path)
+    return written
+
+
+def generate_feature_probe_figures(
+    model:         torch.nn.Module,
+    token_batches: Sequence[torch.Tensor],
+    run_dir:       Path,
+    figdir:        Path,
+    device:        torch.device,
+
+    *,
+    decode:                     Optional[Callable[[int], str]] = None,
+    generate_embedding_figures: bool                           = False,
+    logger:                     Optional[logging.Logger]       = None,
+) -> List[Path]:
+    r"""End-of-run probes and figures of the minimal-agent readout and the prototype-agent block MLP.
+
+    Replays at most :data:`FEATURE_PROBE_TOKENS` report tokens through :func:`vfe3.posthoc.feature_probes.minimal_agent_gap`
+    and :func:`vfe3.posthoc.feature_probes.prototype_probe`, writes their results to ``run_dir/feature_probes.json``
+    and draws ``minimal_agent_gap``, ``template_usage`` and ``template_codebook``; ``template_umap`` only under
+    ``generate_embedding_figures``. A model with neither feature writes nothing. Best-effort: a failure is logged.
+    """
+    from vfe3.posthoc import feature_probes
+    from vfe3.viz import feature_figures
+    logger = logger or logging.getLogger(__name__)
+    batches: List[torch.Tensor] = []
+    seen = 0
+    for ids in token_batches:
+        if seen >= FEATURE_PROBE_TOKENS:
+            break
+        batches.append(ids)
+        seen += int(ids.numel())
+    results: Dict[str, object] = {}
+    for key, probe in (("minimal_agent_gap", lambda: feature_probes.minimal_agent_gap(model, batches, device)),
+                       ("prototype", lambda: feature_probes.prototype_probe(
+                           model, batches, device, gap_tokens=FEATURE_GAP_TOKENS))):
+        try:
+            value = probe()
+        except Exception as exc:
+            logger.warning("feature probe %r failed (%s); its figures skipped", key, exc)
+            continue
+        if value is not None:
+            results[key] = value
+    if not results:
+        return []
+    written: List[Path] = []
+    try:
+        summary = dict(results)
+        if "prototype" in summary:                       # the template means stay out of the JSON summary
+            summary["prototype"] = {**summary["prototype"], "layers": [
+                {k: v for k, v in row.items() if k != "nu"} for row in summary["prototype"]["layers"]]}
+        written.append(_write_json_atomic(run_dir / "feature_probes.json", summary))
+    except Exception as exc:
+        logger.warning("feature_probes.json failed (%s); continuing", exc)
+    jobs = []
+    if "minimal_agent_gap" in results:
+        jobs.append(("minimal_agent_gap",
+                     lambda p: feature_figures.plot_minimal_agent_gap(results["minimal_agent_gap"], path=p)))
+    if "prototype" in results:
+        jobs.append(("template_usage", lambda p: feature_figures.plot_template_usage(results["prototype"], path=p)))
+        jobs.append(("template_codebook", lambda p: feature_figures.plot_template_codebook(
+            results["prototype"], decode=decode, path=p)))
+        if generate_embedding_figures:
+            jobs.append(("template_umap", lambda p: feature_figures.plot_template_umap(
+                results["prototype"], decode=decode, path=p)))
+    for name, thunk in jobs:
         path = _write_figure(figdir, name, thunk, logger)
         if path is not None:
             written.append(path)
@@ -1067,6 +1158,11 @@ def generate_figures(
 
     if prepare_saved_probes:
         _prepare_missing_saved_probes(model, report_batches, run_dir, device, logger, split=split)
+
+    # Opt-in feature probes (minimal-agent readout, prototype-agent block MLP): one short replay each.
+    written.extend(generate_feature_probe_figures(
+        model, token_batches, run_dir, figdir, device, decode=decode,
+        generate_embedding_figures=generate_embedding_figures, logger=logger))
 
     # Eval-cadence history figures (metrics.csv, diagnostics/*.csv): no model replay.
     written.extend(generate_history_figures(run_dir, cfg=cfg, logger=logger))

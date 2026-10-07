@@ -628,8 +628,11 @@ class RelationalOperators(nn.Module):
         head used, ``(..., H, N, N)``), ``score_energy_pre`` (their per-pair costs),
         ``projected_covariance_pre`` (:math:`S_hC_iS_h^\top` at the input), ``projected_key_covariance_pre``
         (:math:`T_hC_jT_h^\top`, the noise-free key law), ``relational_mean_displacement_norm`` and the per-head
-        :data:`vfe3.model.minimal_agent.MINIMAL_AGENT_DIAGNOSTIC_KEYS` ``(H,)``: gain fraction and head coupling
-        (means over receivers) and :math:`n_h`.
+        :data:`vfe3.model.minimal_agent.MINIMAL_AGENT_DIAGNOSTIC_KEYS`: per head ``(H,)`` the gain fraction, head
+        coupling, mean-field label staleness and exact spread share (means over receivers; each NaN in the other
+        mode) and
+        :math:`n_h`, and the layer's covariance contraction :math:`\operatorname{tr}C^+/\operatorname{tr}C` (repeated
+        per head).
 
         One host check covers the call. A float32 call that reports a failed factorization (an ADF query covariance
         :math:`A^h` that lost positive definiteness by cancellation, a record covariance, ...) or, under
@@ -727,6 +730,10 @@ class RelationalOperators(nn.Module):
                     "relational_minimal_agent_gain_fraction": result.gain_fraction.detach().reshape(-1, H).mean(0),
                     "relational_minimal_agent_channel_noise": log_noise.detach().to(dtype).exp(),
                     "relational_minimal_agent_head_coupling": result.head_coupling.reshape(-1, H).mean(0),
+                    "relational_minimal_agent_label_staleness": result.label_staleness.reshape(-1, H).nanmean(0),
+                    "relational_minimal_agent_covariance_contraction":                     # layer value per head
+                        result.covariance_contraction.mean().expand(H),
+                    "relational_minimal_agent_spread_share": result.spread_share.reshape(-1, H).nanmean(0),
                 }
         status = torch.stack((result.failed, result.ill_conditioned))                         # (2,) bool
         return (mu_plus.to(mu.dtype), None if sigma_plus is None else sigma_plus.to(sigma.dtype), record, status)

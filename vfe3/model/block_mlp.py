@@ -1,7 +1,7 @@
 import math
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Callable, Dict, Mapping, NamedTuple, Optional, Sequence
+from typing import Callable, Dict, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -746,12 +746,32 @@ class PrototypeAgentBlockMLP(nn.Module):
         return self.forward_moments(mu, sigma).mu
 
     @torch.no_grad()
+    @torch.no_grad()
+    def weights_and_gain(
+        self,
+        mu:    torch.Tensor,                          # (..., K) working means
+        sigma: torch.Tensor,                          # (..., K), (..., K, K) or (..., G, d, d)
+    ) -> Tuple[torch.Tensor, torch.Tensor]:           # (..., M) template weights, (...) removed variance
+        r"""Template weights (exact :math:`w_{ia}`, mean-field responsibilities :math:`r_{ia}`) and the removed
+        working variance :math:`\operatorname{tr}(C_i\bar\Lambda_i)` (exact) or :math:`\operatorname{tr}(P_i\operatorname{diag}D_i)`
+        (mean field), detached; :meth:`statistics` divides it by :math:`K`."""
+        layout = covariance_layout(mu, sigma)
+        if self.inference == "exact":
+            posterior = self.posterior(mu, sigma, need_covariance=False, need_precision=True)
+            Lambda_bar = posterior.Lambda_bar
+            axes = {"diagonal": 1, "dense": 2, "blocks": 3}[layout]
+            gain = (sigma.to(Lambda_bar.dtype) * Lambda_bar).sum(dim=tuple(range(-axes, 0)))   # tr(C Lambda_bar)
+            return posterior.weights, gain
+        posterior = self.posterior(mu, sigma, need_covariance=True)
+        gain = (covariance_diagonal(posterior.C_plus, layout) * posterior.D).sum(dim=-1)      # tr(P diag D)
+        return posterior.responsibilities, gain
+
     def statistics(
         self,
         mu:    torch.Tensor,                          # (..., K) working means
         sigma: torch.Tensor,                          # (..., K), (..., K, K) or (..., G, d, d)
     ) -> Dict[str, float]:
-        r"""Detached token means of the template posterior at ``(mu, sigma)`` (not wired into the metrics CSV).
+        r"""Detached token means of the template posterior at ``(mu, sigma)``.
 
         ``prototype_weight_entropy``: :math:`H(w_i) = -\sum_aw_{ia}\log w_{ia}` (nats; responsibilities under
         mean field) and ``prototype_effective_templates`` its exponential. ``prototype_gain_fraction``: the share
@@ -761,17 +781,8 @@ class PrototypeAgentBlockMLP(nn.Module):
         variances). ``prototype_template_variance``: the geometric mean of :math:`\lambda`.
         ``prototype_prior_entropy``: :math:`H(\pi)`.
         """
-        layout = covariance_layout(mu, sigma)
         K = mu.shape[-1]
-        if self.inference == "exact":
-            posterior = self.posterior(mu, sigma, need_covariance=False, need_precision=True)
-            weights, Lambda_bar = posterior.weights, posterior.Lambda_bar
-            axes = {"diagonal": 1, "dense": 2, "blocks": 3}[layout]
-            gain = (sigma.to(Lambda_bar.dtype) * Lambda_bar).sum(dim=tuple(range(-axes, 0)))   # tr(C Lambda_bar)
-        else:
-            posterior = self.posterior(mu, sigma, need_covariance=True)
-            weights = posterior.responsibilities
-            gain = (covariance_diagonal(posterior.C_plus, layout) * posterior.D).sum(dim=-1)  # tr(P diag D)
+        weights, gain = self.weights_and_gain(mu, sigma)
         entropy = -torch.special.xlogy(weights, weights).sum(dim=-1)
         prior = torch.softmax(self.log_pi.double(), dim=-1)
         return {

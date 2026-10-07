@@ -1147,7 +1147,8 @@ def test_model_diagnostics_and_captures(inference: str) -> None:
     ids = torch.tensor([[1, 2, 3, 4]])
     rows = model.diagnostics_per_layer(ids)
     for key in ma.MINIMAL_AGENT_DIAGNOSTIC_KEYS:
-        assert len(rows[key]) == 2 and all(math.isfinite(v) for v in rows[key]), key
+        defined = ma.MINIMAL_AGENT_MODE_ONLY_KEYS.get(key, inference) == inference   # else NaN by design
+        assert len(rows[key]) == 2 and all(math.isfinite(v) == defined for v in rows[key]), key
     assert all(0.0 < v < 1.0 for v in rows["relational_minimal_agent_gain_fraction"])
     assert rows["relational_minimal_agent_channel_noise"] == [1.0, 1.0]
     assert all(v >= 0.0 for v in rows["relational_minimal_agent_head_coupling"])
