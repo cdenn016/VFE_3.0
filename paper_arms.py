@@ -187,6 +187,18 @@ def _no_mlp(base: Any) -> Optional[str]:
     return None if base.use_block_mlp else "the base has no block MLP"
 
 
+def _no_mlp_or_reference_decode(base: Any) -> Optional[str]:
+    r"""The intertwiner arm decodes in reference coordinates, exact only for the Gaussian-KL decoders."""
+    from vfe3.config import _REFERENCE_DECODE_MODES
+
+    if not base.use_block_mlp:
+        return "the base has no block MLP"
+    if base.decode_mode not in _REFERENCE_DECODE_MODES:
+        return (f"decode_mode={base.decode_mode!r} has no reference-coordinate decode (the reduction to "
+                f"(xi, C) is exact only for {_REFERENCE_DECODE_MODES})")
+    return None
+
+
 def _no_coordinate_mlp(base: Any) -> Optional[str]:
     if not base.use_block_mlp or base.block_mlp_mode != "coordinate":
         return "the per-type hidden bias needs the base's coordinate block MLP"
@@ -237,7 +249,9 @@ def _no_kernel_routing(cfg: Any) -> Optional[str]:
     return None
 
 
-_ALIBI = {"beta_attention_prior": "causal_alibi"}
+# The ALiBi confound swaps the positional scheme: on a RoPE base the rotation is removed with it, so the
+# arm is ALiBi instead of RoPE, not ALiBi on top of RoPE (a no-op change on a base without RoPE).
+_ALIBI = {"beta_attention_prior": "causal_alibi", "pos_rotation": "none"}
 # The realization's optimizer on the baseline: Adam beta_2 0.999 and no decay on matrices (the prior
 # means, comparison/content maps and decoder are undecayed), decay 0.1 on the table as on the frames.
 _REALIZATION_OPTIMIZER = {"adam_beta2": 0.999, "weight_decay": 0.0, "per_type_table_weight_decay": 0.1}
@@ -273,7 +287,7 @@ ARMS: Dict[str, Dict[str, Any]] = {
                 "norm_type_block": _covariant_norm("norm_type_block"),
                 "norm_type_final": _covariant_norm("norm_type_final"),
                 "decode_coordinates": "reference"},
-        "requires": ("decode_coordinates",), "inapplicable": _no_mlp},
+        "requires": ("decode_coordinates",), "inapplicable": _no_mlp_or_reference_decode},
     "MLP removed": {
         "group": _RETRAINING, "slug": "no_mlp", "vfe": {"use_block_mlp": False},
         "inapplicable": _no_mlp},
@@ -323,7 +337,8 @@ BASELINE_PROTOCOL_FIELDS: Dict[str, str] = {
     "amp_dtype": "amp_dtype", "fp32_matmul_precision": "fp32_matmul_precision",
     "warmup_steps": "warmup_steps", "min_lr_frac": "min_lr_frac",
     "grad_clip": "grad_clip", "beta_attention_prior": "beta_attention_prior",
-    "alibi_slope": "alibi_slope", "decode_bias": "decode_bias",
+    "alibi_slope": "alibi_slope", "pos_rotation": "pos_rotation", "rope_base": "rope_base",
+    "decode_bias": "decode_bias",
     "decode_unigram_prior": "decode_unigram_prior", "unigram_kappa": "unigram_kappa",
 }
 # Confound controls for the 34.48 against 55.10 comparison (October 7, 2026). TIER_A: conventional

@@ -258,6 +258,7 @@ class VFE3Config:
     # "on" | "off" | "frozen"
     #   on      the frame is learned as phi_scale / m_phi_lr / pos_phi specify (pure path)
     #   off     Omega = I exactly: coerces phi_scale=0, pos_phi="none", m_phi_lr=0; needs pos_rotation="none"
+    #           or rope_space="comparison" (which rotates the routing moments, never the frame)
     #   frozen  a random fixed frame: keeps phi_scale, coerces m_phi_lr=0 (same parameter count as "on")
     gauge_transport:                  str             = "on"
 
@@ -843,8 +844,9 @@ class VFE3Config:
         _require(self.gauge_transport, _VALID_GAUGE_TRANSPORT, "gauge_transport")
         if self.gauge_transport == "off":
             # Omega = exp(phi_i) exp(-phi_j) = I needs a ZERO frame AND no other transport modifier, so
-            # the positional rotation must also be off (else Omega != I and the cell is mislabeled).
-            if self.pos_rotation != "none":
+            # a frame-space positional rotation must also be off (else Omega != I and the cell is mislabeled).
+            # Comparison-space RoPE rotates the projected routing moments after the maps and leaves Omega = I.
+            if self.pos_rotation != "none" and self.rope_space != "comparison":
                 raise ValueError(
                     f"gauge_transport='off' requires Omega=I, but pos_rotation={self.pos_rotation!r} folds "
                     f"a positional rotation into the transport. Set pos_rotation='none'."
@@ -1391,9 +1393,11 @@ class VFE3Config:
         # 'per_token_additive' is the Omega = I capacity control: the token frame is zero, but a
         # positional frame (pos_phi's right factor, or the gauge-RoPE fold) still composes into
         # U_i, so Omega_ij = U_i U_j^{-1} != I and the control is contaminated. Checked after the
-        # gauge_transport coercion, which supplies pos_phi='none' under 'off'.
+        # gauge_transport coercion, which supplies pos_phi='none' under 'off'. Comparison-space RoPE does
+        # not compose into U_i.
         if (self.encode_mode == "per_token_additive"
-                and (self.pos_phi != "none" or self.pos_rotation != "none")):
+                and (self.pos_phi != "none"
+                     or (self.pos_rotation != "none" and self.rope_space != "comparison"))):
             detail = (
                 f"encode_mode='per_token_additive' with pos_phi={self.pos_phi!r}, "
                 f"pos_rotation={self.pos_rotation!r}: the positional frame keeps Omega_ij != I, "
@@ -1486,12 +1490,12 @@ class VFE3Config:
 
         # Reference coordinates (M2 arms: LN and MLP in reference coordinates; the covariant decoder).
         # Both conjugate by the realized relational frame U_i, which is defined, fixed through the
-        # stack, and equal to the content frame on the projected routes without RoPE. Everything else
-        # fails closed.
+        # stack, and equal to the content frame on the projected routes without frame-space RoPE
+        # (comparison-space RoPE rotates only the routing moments). Everything else fails closed.
         _require(self.block_coordinates, ("local", "reference"), "block_coordinates")
         _require(self.decode_coordinates, ("local", "reference"), "decode_coordinates")
         frame_requirements = []
-        if self.pos_rotation != "none":
+        if self.pos_rotation != "none" and self.rope_space != "comparison":
             frame_requirements.append(
                 f"pos_rotation={self.pos_rotation!r} (RoPE folds a rotation into the routing frame, "
                 "so the content/decode frame is not U_i)")
