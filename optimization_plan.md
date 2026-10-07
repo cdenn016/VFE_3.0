@@ -5,11 +5,19 @@ Date: 2026-09-24. Scope: the float64 escalation paths (`projected_cov_condition_
 full-covariance congruence certificate) and the pure-path `"fp64"` precision settings. Target shape:
 K >= 128, head/irrep block d = 32 (H = K/32), comparison rank r = 32, B = 64, N = 128, L = 4.
 
-Status: plan only. No code has changed. No GPU measurement was possible: during this investigation
-the RTX 5090 was at 90% utilization under another `python.exe` process, and `AGENTS.md` forbids GPU
-workloads during the cleanup. Every cost figure below is an estimate from FLOP and byte counts
-against spec-sheet rates (about 105 TFLOP/s float32 and 1.6 TFLOP/s float64). Phase 0 replaces them
-with measurements.
+Status (updated 2026-10-07): this is the historical plan; `docs/2026-09-24.md` records what was built.
+WS1 and WS2 shipped as `projected_factor_route="cholesky_qr2"` with its certificate (default `"gram"`),
+and WS5 shipped as the decode ranking guard by candidate refinement. WS3 targeted the transported
+route, which has since been retired together with `congruence_cond_escalation` and the full-covariance
+congruence certificate, so those selectors no longer exist and `config_from_serialized` migrates or
+refuses them. WS4 was not started; the parked and dropped options stand. Phase 0 measurements are in
+`docs/2026-09-24.md`. The text below is the plan as written on 2026-09-24 and is not updated.
+
+Original status (2026-09-24): plan only. No code had changed. No GPU measurement was possible: during
+this investigation the RTX 5090 was at 90% utilization under another `python.exe` process, and
+`AGENTS.md` forbids GPU workloads during the cleanup. Every cost figure below is an estimate from FLOP
+and byte counts against spec-sheet rates (about 105 TFLOP/s float32 and 1.6 TFLOP/s float64). Phase 0
+replaces them with measurements.
 
 ## 1. Thesis
 

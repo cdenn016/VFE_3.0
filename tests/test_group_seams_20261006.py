@@ -12,9 +12,9 @@ import warnings
 import pytest
 import torch
 
-import vfe3.config as config_module
 import vfe3.geometry.groups as groups
 from tests.profiles import test_config, tiny_config
+from vfe3.config import ConfigNotice
 from vfe3.geometry.generators import (
     generate_block_local, local_basis_borel, local_basis_co, local_basis_sl, local_basis_so,
 )
@@ -106,8 +106,6 @@ def test_block_local_builder_metadata_and_group_membership() -> None:
 def block_co(monkeypatch: pytest.MonkeyPatch) -> str:
     name = "test_block_co"
     monkeypatch.setattr(groups, "_GROUPS", dict(groups._GROUPS))           # restored after the test
-    monkeypatch.setattr(config_module, "_SUPPORTED_GAUGE_GROUPS",
-                        (*config_module._SUPPORTED_GAUGE_GROUPS, name))
 
     @register_group(name, invariant_families=("gaussian_full",), traits=GroupTraits(min_head_dim=2))
     def _build(K: int, n_heads: int, *, dtype: torch.dtype = torch.float32,
@@ -130,6 +128,7 @@ def test_config_seam_reads_the_traits_of_a_new_group(block_co: str) -> None:
         test_config(gauge_group=block_co, embed_dim=6, n_heads=2, use_cg_coupling=True)
     with warnings.catch_warnings():
         warnings.simplefilter("error")                                       # no structure-group warning
+        warnings.simplefilter("ignore", ConfigNotice)              # inert-setting advisories are not the subject
         test_config(gauge_group=block_co, embed_dim=6, n_heads=2, pos_rotation="rope")
     with pytest.warns(UserWarning, match="leaves the structure"):
         test_config(gauge_group="so_n", group_n=3, irrep_spec=[("l1", 2)], embed_dim=6, n_heads=2,

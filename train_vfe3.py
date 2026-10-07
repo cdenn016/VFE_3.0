@@ -158,12 +158,14 @@ config = dict(
     
     block_mlp_mode                   = "prototype_agents",   # "coordinate" | "prototype_agents" | "canonical_frame" | "gaussian_template" | "gauge_gate"
     block_mlp_covariance             = "passthrough",  # "passthrough" | "delta_full" (coordinate, canonical_frame, gauge_gate) | "posterior" (prototype_agents); gaussian_template: "passthrough" only
+    block_mlp_template_init          = "absolute",   # "absolute" | "working_variance" (lambda_0, nu from one batch; prototype_agents only)
     
     block_mlp_inference              = "mean_field",   # "mean_field" | "exact" (prototype_agents only)
     
     block_mlp_expansion              = 8,    #K*block_mlp_expansion = number of templates
     
-    block_mlp_template_init_variance = 10.0,    # initial template variance lambda_0 > 0
+    block_mlp_template_init_variance = 10.0,    # initial template variance lambda_0 > 0 (absolute init only)
+    block_mlp_template_init_pull     = 0.09,         # working_variance only: initial pull p in (0, 1)
     block_mlp_dropout                = 0.00,
     block_mlp_covariance_floor       = 1e-4,          # delta_full only: Sigma+ = J Sigma J^T + floor Sigma
     
@@ -222,6 +224,7 @@ config = dict(
     pos_rotation                     = "none",              # "none" | "rope"
          
     rope_on_value                    = False,
+    rope_space                       = "frame",       # "frame" (folded into U_i, absolute) | "comparison" (relative, kernel readout only)
 
     ######################################
     #                Self Energy:
@@ -258,7 +261,7 @@ config = dict(
     m_phi_group_retraction           = "chart",        # "chart" | "group_log" (exact Log(U e^{-eta xi}); pullback_group/fisher_group only)
         
     m_phi_group_trust_radius         = 0.1,
-    m_phi_fisher_rotation_weight     = 2.0,       # fisher_group only: completion weight on belief-invisible rotations
+    m_phi_fisher_rotation_weight     = 2.0,       # fisher_group only: completion weight on every rotation (also damps Fisher-visible ones)
 
     #################################
     #    Embedding/Priors M-step

@@ -102,6 +102,7 @@ def bounded_variance_from_log(
     *,
     eps:     float = 1e-6,
     max_log: float = 80.0,
+    index:   Optional[torch.Tensor] = None,   # integer ids: exponentiate only rows log_sigma[index]
 ) -> torch.Tensor:
     r"""Exponentiate a trainable log-variance without overflowing float32.
 
@@ -110,7 +111,9 @@ def bounded_variance_from_log(
     ``sigma_max`` is a separate belief-state retraction policy and is deliberately not used here.
     The overflow check is identity/version-cached (audit 2026-07-12 N13): one device->host sync
     per table mutation instead of per call; the warning still fires on every call while the table
-    stays above ``max_log`` (from the cached host bool).
+    stays above ``max_log`` (from the cached host bool). With ``index`` the check runs on the whole
+    (cached) table and only the gathered rows are exponentiated, so a per-forward gather does not
+    defeat the cache (audit 2026-10-07 F03/F61); the values equal those for ``log_sigma[index]``.
     """
     if _cached_max_log_exceeded(log_sigma, max_log):
         import warnings
@@ -119,6 +122,8 @@ def bounded_variance_from_log(
             RuntimeWarning,
             stacklevel=2,
         )
+    if index is not None:
+        log_sigma = log_sigma[index]
     return torch.exp(log_sigma.clamp(max=max_log)).clamp(min=eps)
 
 

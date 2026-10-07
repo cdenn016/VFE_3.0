@@ -239,77 +239,6 @@ def _freeze_belief(
     )
 
 
-def _belief_states_mechanically_equal(left: BeliefState, right: BeliefState) -> bool:
-    """Prove exact state equality from the actual belief seam, not derived mappings."""
-    if left is right:
-        return True
-    for name in left._fields:
-        lhs, rhs = getattr(left, name), getattr(right, name)
-        if lhs is rhs:
-            continue
-        if lhs is None or rhs is None:
-            return False
-        if isinstance(lhs, CompactBlockElement) and isinstance(rhs, CompactBlockElement):
-            if lhs.K != rhs.K or lhs.tied != rhs.tied or not torch.equal(lhs.blocks, rhs.blocks):
-                return False
-        elif isinstance(lhs, torch.Tensor) and isinstance(rhs, torch.Tensor):
-            if not torch.equal(lhs, rhs):
-                return False
-        elif lhs != rhs:
-            return False
-    return True
-
-
-def _state_specific_free_energy_diagnostics(
-    pre_block_mlp: Mapping[str, float],
-    post_block_mlp: Mapping[str, float],
-    *,
-    states_equal_proven: bool = False,
-) -> Dict[str, float]:
-    """Serialize separately evaluated states; reject an accidental same-object alias.
-
-    Only ``pre_block_mlp_*`` / ``post_block_mlp_*`` keys are emitted. The unqualified ``total`` is
-    the caller's headline F at the converged E-step state and is never overwritten here.
-    """
-    if pre_block_mlp is post_block_mlp and not states_equal_proven:
-        raise RuntimeError(
-            "pre/post BlockMLP diagnostics require separate component evaluations unless "
-            "state equality is mechanically established")
-    components = (
-        "self_coupling", "belief_coupling", "attention_entropy",
-        "observation_nll",
-    )
-    raw_components = (
-        "self_divergence", "observation_likelihood",
-    )
-
-    def normalized(source: Mapping[str, float]) -> Dict[str, float]:
-        values = {name: float(source.get(name, 0.0)) for name in components}
-        values.update({name: float(source.get(name, 0.0)) for name in raw_components})
-        values["total"] = float(sum(values[name] for name in components))
-        return values
-
-    pre = normalized(pre_block_mlp)
-    post = normalized(post_block_mlp)
-    out = {f"pre_block_mlp_{name}": value for name, value in pre.items()}
-    out.update({f"post_block_mlp_{name}": value for name, value in post.items()})
-    return out
-
-
-def _numerical_policy_diagnostics(
-    *,
-    m_phi_group_trust_radius: Optional[float],
-    phi_mstep_max_matrix_norm: Optional[float],
-    transport_chart_max_norm: float,
-) -> Dict[str, Optional[float]]:
-    """Return the exact active production numerical policy, including disabled bounds."""
-    return {
-        "m_phi_group_trust_radius": m_phi_group_trust_radius,
-        "phi_mstep_max_matrix_norm": phi_mstep_max_matrix_norm,
-        "transport_chart_max_norm": transport_chart_max_norm,
-    }
-
-
 class VFEModel(nn.Module):
     """encode -> E-step stack -> decode -> CE; default-off MLP preserves the existing topology."""
 
@@ -549,9 +478,18 @@ class VFEModel(nn.Module):
         # transport state; the registry keys are kept so ``transport_state`` stays the one seam.
         transport_registration = get_transport_registration("flat")
         self._transport_state_keys = transport_registration.serialization_keys
-        self._transport_offdiag_state_keys = transport_registration.offdiag_serialization_keys
         if transport_registration.state_builder is not None:
             raise ValueError("the flat transport registration must not build trainable state")
+        # Fail closed on the registry's declared requirements (audit 2026-10-07 F69): the family's
+        # transport requirement, and a right-foldable vertex factor for RoPE.
+        from vfe3.families.base import get_family
+        requirement = get_family(cfg.family).transport_requirement
+        if not transport_registration.satisfies(requirement):
+            raise ValueError(f"family={cfg.family!r} requires a {requirement!r} transport; the flat "
+                             f"registration is {transport_registration.pair_transport_kind!r}")
+        if cfg.pos_rotation == "rope" and not transport_registration.rope_right_foldable:
+            raise ValueError("pos_rotation='rope' folds R into the vertex frame, which the flat "
+                             "registration does not declare rope_right_foldable")
         # Causal/attention log-prior is loop-invariant for fixed (N, device, dtype); cache it
         # (audit 4e) keyed on those so it is built once, not every forward. Not an nn.buffer
         # because it depends on the runtime N (sequence length), which varies across calls.
@@ -898,7 +836,6 @@ class VFEModel(nn.Module):
             exactness_out=self._transport_status,
             _content_token_ids=_content_token_ids,
             rope=rope,
-            rope_on_value=self.cfg.rope_on_value,
             rope_insertion=self.cfg.rope_insertion,
         )
         return transport
@@ -1554,19 +1491,6 @@ class VFEModel(nn.Module):
                 seq = torch.cat([seq, next_token], dim=-1)
         return seq
 
-
-    def _first_sequence_log_prior(
-        self,
-        log_prior: Optional[torch.Tensor],
-        batch_size: int,
-    ) -> Optional[torch.Tensor]:
-        r"""Drop a captured batch axis while preserving the optional attention-head axis."""
-        if log_prior is None:
-            return None
-        unbatched_rank = 2 if len(self.group.irrep_dims) == 1 else 3
-        if log_prior.dim() == unbatched_rank + 1 and log_prior.shape[0] == batch_size:
-            return log_prior[0]
-        return log_prior
 
     def _validate_diagnostic_snapshot(
         self,

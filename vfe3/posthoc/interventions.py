@@ -116,6 +116,20 @@ def _relational_score_modules() -> List[Any]:
     return [relational, full_link]
 
 
+def _refuse_minimal_agent(model: torch.nn.Module, row: str) -> None:
+    r"""Raise :class:`NotApplicable` before any pass when the router is the minimal-agent posterior.
+
+    The minimal agent routes through its own label posterior, not ``attention_weights`` or
+    ``relational_score``, so rows 2, 3 and 6 would intercept nothing and refuse only after a full
+    split pass (audit 2026-10-07 F15).
+    """
+    operators = getattr(model, "relational_operators_by_layer", None) or ()
+    if any(getattr(op, "predictive_readout", "kernel") == "minimal_agent"
+           for op in operators if op is not None):
+        raise NotApplicable(f"predictive_readout='minimal_agent': {row} patches a routing seam the "
+                            "minimal-agent label posterior does not call")
+
+
 # ----------------------------------------------------------------------------------------------
 # Rows 2 and 3: the routing softmax
 # ----------------------------------------------------------------------------------------------
@@ -135,6 +149,7 @@ def _routing_arm(model: torch.nn.Module, arm: str) -> Iterator[Dict[str, Any]]:
             torch.isneginf(log_prior), log_prior, torch.zeros_like(log_prior))
         return original(energy, tau=tau, log_prior=keep)
 
+    _refuse_minimal_agent(model, "the routing-softmax arm")
     if arm == "no_prior" and getattr(model.cfg, "beta_attention_prior", None) in (None, "uniform"):
         raise NotApplicable("the model has no attention log-prior to flatten")
     with patch_bindings(_attention_weight_modules(), "attention_weights", patched):
@@ -282,6 +297,7 @@ def _identity_covariance_score(
 @contextmanager
 def routing_covariances_identity(model: torch.nn.Module) -> Iterator[Dict[str, Any]]:
     r"""Row 6: every routing covariance :math:`C_i \to I` (projected covariances :math:`S S^\top`)."""
+    _refuse_minimal_agent(model, "the routing-covariance arm")
     record: Dict[str, Any] = {"intercepted_calls": 0}
 
     def patched(*args: Any, **kwargs: Any) -> torch.Tensor:

@@ -854,6 +854,7 @@ def attention_head_collapse(
     *,
     eps:      float = 1e-12,
     fraction: float = COLLAPSE_ENTROPY_FRACTION,
+    support:  Optional[torch.Tensor] = None,   # bool, broadcastable to beta: admissible keys
 ) -> Tuple[torch.Tensor, torch.Tensor]:  # (..., ) min normalized row entropy, (...) collapsed flag
     r"""Per-head minimum row entropy as a FRACTION of that row's achievable maximum.
 
@@ -874,8 +875,15 @@ def attention_head_collapse(
     Returns ``(min_normalized_entropy, collapsed)`` with the row axis reduced. A leading axis with
     no scorable row at all yields NaN and False, so ``N == 1`` and fully one-hot maps abstain
     instead of raising a false alarm.
+
+    ``support`` is the prior's admissible-key mask (``isfinite(log_prior)``). Without it the
+    support is inferred from ``beta > 0``, which miscounts a key whose weight underflowed to
+    exactly zero as masked: an fp32 router with a cost gap above about 103 nats then shrinks the
+    row's ceiling, and a fully collapsed head reads as uniform over a one-key row (audit
+    2026-10-07 F14).
     """
-    support = (beta > 0.0).sum(dim=-1)                       # (..., N) admissible keys per row
+    admitted = (beta > 0.0) if support is None else support.expand_as(beta)
+    support = admitted.sum(dim=-1)                           # (..., N) admissible keys per row
     scorable = support >= 2
     rows = attention_entropy_rows(beta, eps=eps)             # (..., N) raw nats
     ceiling = torch.log(support.clamp(min=2).to(rows.dtype))
@@ -1311,7 +1319,8 @@ def positional_content_score(
     beta: torch.Tensor,                  # (..., N, N) attention weights
 
     *,
-    eps:  float = 1e-12,
+    eps:     float = 1e-12,
+    support: Optional[torch.Tensor] = None,   # bool, broadcastable to beta: admissible keys
 ) -> torch.Tensor:                       # (...) per-head R^2 of log beta vs offset |i - j|
     r"""Per-head positional<->content score: R^2 of the OLS fit log(beta_ij) ~ a + b |i - j|.
 
@@ -1326,12 +1335,15 @@ def positional_content_score(
     64 masked diagonal entries are 3% of the 2080 causal points but carry 91-96% of ss_tot, and a
     PURE positional prior (R^2 = 1 by construction) scores 1.26e-05 / 0.0315 per head instead of
     0.962 / 0.310. The support is a property of the prior, not of a head, so it is intersected
-    across the leading dims to keep the (N, N) mask shape the fit's indexing relies on.
+    across the leading dims to keep the (N, N) mask shape the fit's indexing relies on. Pass the
+    prior's ``support`` mask when it is available; ``beta > 0`` also drops keys whose weight
+    underflowed to zero (audit 2026-10-07 F14).
     """
     n = beta.shape[-1]
     ii = torch.arange(n, device=beta.device).unsqueeze(-1)
     jj = torch.arange(n, device=beta.device).unsqueeze(0)
-    admitted = (beta > 0).reshape(-1, n, n).all(dim=0)           # prior support, shared (N, N)
+    live = (beta > 0) if support is None else support.expand_as(beta)
+    admitted = live.reshape(-1, n, n).all(dim=0)                 # prior support, shared (N, N)
     mask = (ii >= jj) & admitted                                 # causal AND not masked out
     if int(mask.sum()) < 2:                                      # degenerate: no slope is defined
         return beta.new_full(beta.shape[:-2], float("nan"))

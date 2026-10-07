@@ -332,8 +332,10 @@ SEARCH_CONFIG: Dict[str, Any] = {
         
         
         "e_q_mu_lr": {
-            "enabled": True, "bounds": [0.01, 2], "values": None, "scale": "log",
-            "requires": {},
+            # Read only by the projected_gradient Euler receiver (ablation.py carries the same
+            # requirement); enabling it switches the whole search to that route.
+            "enabled": False, "bounds": [0.01, 2], "values": None, "scale": "log",
+            "requires": {"attention_mode": "projected_gradient", "relational_receiver_update": "euler"},
             "description": "E-step natural-gradient step size for mu_q.",
         },
         "m_phi_lr": {
@@ -719,6 +721,28 @@ def _candidate_fingerprint(
     )
 
 
+def _refuse_inert_parameters(
+    enabled_specs:        Sequence[tuple[str, Mapping[str, Any]]],
+    model_config:         Mapping[str, Any],
+    changed_requirements: Mapping[str, Any],
+) -> None:
+    """Refuse enabled parameters that ``inactive_fields`` reports unread on the search baseline.
+
+    Runs before ``optimization_manifest.json`` is written, so an inert entry fails at once instead
+    of after the manifest (audit 2026-10-07 F41).
+    """
+    resolved = dict(model_config)
+    resolved.update(changed_requirements)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        inactive = VFE3Config(**resolved).inactive_fields()
+    inert = {name: inactive[name] for name, _spec in enabled_specs if name in inactive}
+    if inert:
+        details = "; ".join(f"{name}: {reason}" for name, reason in inert.items())
+        raise ValueError(f"enabled search parameter(s) are inert on the search baseline -- {details}. "
+                         "Disable them or add the 'requires' that makes them live")
+
+
 def generate_candidates(
     search_config: Mapping[str, Any],
     model_config:  Optional[Mapping[str, Any]] = None,
@@ -747,6 +771,7 @@ def generate_candidates(
         for field, value in requirements.items()
         if local_model_config.get(field) != value
     }
+    _refuse_inert_parameters(enabled_specs, local_model_config, changed_requirements)
     anchors: List[Dict[str, Any]] = [{"label": "baseline", "overrides": {}}]
     if changed_requirements:
         anchors.append({

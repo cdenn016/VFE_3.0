@@ -45,9 +45,8 @@ class CanonicalFrameContext:
         # while attempting a data-dependent finiteness/inverse check here.
         if self.forward.device.type == "meta":
             return
-        if not torch.isfinite(self.forward).all() or not torch.isfinite(self.inverse).all():
-            raise ValueError("canonical frame factors must contain only finite values")
-
+        # Every verdict is computed on device and read back in ONE host transfer (audit 2026-10-07
+        # F02/F60); the checks still fail closed in their original order with their original messages.
         validation_dtype = torch.float64
         validation_forward = self.forward.to(dtype=validation_dtype)
         validation_inverse = self.inverse.to(dtype=validation_dtype)
@@ -60,11 +59,6 @@ class CanonicalFrameContext:
         )
         forward_inverse = validation_forward @ validation_inverse
         inverse_forward = validation_inverse @ validation_forward
-        if (
-            not torch.isfinite(forward_inverse).all()
-            or not torch.isfinite(inverse_forward).all()
-        ):
-            raise ValueError("canonical frame factors must produce finite products")
         residual = torch.maximum(
             (forward_inverse - identity).abs().amax(dim=(-2, -1)),
             (inverse_forward - identity).abs().amax(dim=(-2, -1)),
@@ -84,16 +78,23 @@ class CanonicalFrameContext:
             * torch.finfo(self.forward.dtype).eps
             * conditioning_scale
         )
-        if (
-            not torch.isfinite(residual).all()
-            or not torch.isfinite(conditioning_scale).all()
-            or not torch.isfinite(unbounded_tolerance).all()
-        ):
+        tolerance = torch.clamp(unbounded_tolerance, max=1e-2)
+        finite_factors, finite_products, finite_validation, within_tolerance = torch.stack((
+            torch.isfinite(self.forward).all() & torch.isfinite(self.inverse).all(),
+            torch.isfinite(forward_inverse).all() & torch.isfinite(inverse_forward).all(),
+            (torch.isfinite(residual).all() & torch.isfinite(conditioning_scale).all()
+             & torch.isfinite(unbounded_tolerance).all()),
+            torch.all(residual <= tolerance),
+        )).tolist()
+        if not finite_factors:
+            raise ValueError("canonical frame factors must contain only finite values")
+        if not finite_products:
+            raise ValueError("canonical frame factors must produce finite products")
+        if not finite_validation:
             raise ValueError(
                 "canonical frame inverse validation must have finite residuals and tolerances"
             )
-        tolerance = torch.clamp(unbounded_tolerance, max=1e-2)
-        if not bool(torch.all(residual <= tolerance)):
+        if not within_tolerance:
             hint = ""
             if self.forward.dtype == torch.float32:
                 policy = torch.get_float32_matmul_precision()

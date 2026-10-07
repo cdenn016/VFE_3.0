@@ -4379,8 +4379,11 @@ def collect_phi_numerics(
             block_dims=block_dims,
         )
         if belief.right_phi is not None:
+            # right_phi is (N, n_gen) for one sequence; only a batched (B, N, n_gen) chart takes [0]
+            # (audit 2026-10-07 F66).
+            right_chart = belief.right_phi[0] if belief.right_phi.dim() == 3 else belief.right_phi
             record["right_chart"] = metrics.phi_chart_statistics(
-                belief.right_phi[0],
+                right_chart,
                 model.group,
                 block_dims=block_dims,
             )
@@ -4767,10 +4770,15 @@ def _pure_path_report(
     covariance_updated = (receiver_gradient and not cfg.skip_belief_sigma_update) or predictive_covariance_updated
     # The receiver always descends its own energy by Fisher steps or the closed-form update.
     gradient_e_step_update: 'bool | str' = True if receiver_gradient else "not_applicable"
-    spd_retraction_applies = receiver_gradient and not cfg.skip_belief_sigma_update
+    # The closed-form receiver sets the covariance from natural parameters, Sigma = c Lambda^{-1}; it
+    # runs no AIRM retraction, trust projection or exponential, and only its diagonal branch clamps
+    # at sigma_max (audit 2026-10-07 F72).
+    closed_form_receiver = getattr(cfg, "relational_receiver_update", "closed_form") == "closed_form"
+    sigma_step = receiver_gradient and not cfg.skip_belief_sigma_update
+    spd_retraction_applies = sigma_step and not closed_form_receiver
 
     sigma_max = getattr(cfg, "sigma_max", 10.0)
-    sigma_cap_consumer_active = receiver_gradient and not cfg.skip_belief_sigma_update
+    sigma_cap_consumer_active = sigma_step and (not closed_form_receiver or cfg.diagonal_covariance)
     spd_trust_region = getattr(cfg, "e_sigma_q_trust", 5.0)
     spd_retraction_trust_projection_active: 'bool | str' = (
         spd_trust_region is not None and float(spd_trust_region) > 0.0)
@@ -4785,7 +4793,14 @@ def _pure_path_report(
         spd_route_parts.append("spectral_cap")
     spd_retraction_route = "_".join(spd_route_parts)
     spd_retraction_exact: 'bool | str' = len(spd_route_parts) == 1
-    if not spd_retraction_applies:
+    if sigma_step and closed_form_receiver:
+        spd_retraction_route = ("closed_form_natural_parameter_spectral_cap"
+                                if sigma_cap_consumer_active and sigma_max is not None
+                                else "closed_form_natural_parameter")
+        spd_retraction_exact = spd_retraction_route == "closed_form_natural_parameter"
+        spd_retraction_trust_projection_active = "not_applicable"
+        spd_retraction_exponential_clipping_active = "not_applicable"
+    elif not spd_retraction_applies:
         spd_retraction_route = "not_applicable"
         spd_retraction_exact = "not_applicable"
         spd_retraction_trust_projection_active = "not_applicable"
@@ -4803,6 +4818,7 @@ def _pure_path_report(
     block_norm_registration = get_norm_registration(block_norm_name)
     final_norm_registration = get_norm_registration(final_norm_name)
     transport_chart_max_norm = float(cfg.transport_chart_max_norm)
+    reference_blocks = getattr(cfg, "block_coordinates", "local") == "reference"
 
     conditional_fields = _conditional_artifact_fields(cfg)
     pure_flags = {
@@ -4830,9 +4846,12 @@ def _pure_path_report(
         "positional_rotation_gauge_covariant": (
             cfg.pos_rotation == "none" or getattr(cfg, "rope_insertion", "right") == "right"),
         "family_group_invariant":    family_group_invariant,
-        "block_mlp_intertwiner_compatible": block_mlp_intertwiner_compatible,
-        "block_norm_gauge_equivariant": block_norm_registration.gauge_equivariant,
-        "final_norm_gauge_equivariant": final_norm_registration.gauge_equivariant,
+        # block_coordinates='reference' conjugates the block norm, final norm and block MLP by the
+        # realized frame, x -> U_i N(U_i^{-1} x), which is covariant for any registered map
+        # (audit 2026-10-07 F18).
+        "block_mlp_intertwiner_compatible": block_mlp_intertwiner_compatible or reference_blocks,
+        "block_norm_gauge_equivariant": block_norm_registration.gauge_equivariant or reference_blocks,
+        "final_norm_gauge_equivariant": final_norm_registration.gauge_equivariant or reference_blocks,
         "no_fixed_coordinate_spectral_cap": (
             sigma_max is None if sigma_cap_consumer_active else "not_applicable"),
         "no_phi_mstep_chart_cap": getattr(cfg, "phi_mstep_max_matrix_norm", None) is None,
@@ -4866,6 +4885,7 @@ def _pure_path_report(
             "lambda_beta":                  float(cfg.lambda_beta),
             "decode_mode":                  cfg.decode_mode,
             "decode_coordinates":           getattr(cfg, "decode_coordinates", "local"),
+            "block_coordinates":            getattr(cfg, "block_coordinates", "local"),
             "encode_mode":                  getattr(cfg, "encode_mode", "per_token"),
             "beta_attention_prior":         getattr(cfg, "beta_attention_prior", "causal"),
             "use_block_mlp":                block_mlp_active,

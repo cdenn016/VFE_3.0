@@ -2219,10 +2219,11 @@ def _encode_prior_sigma(
     token_ids: torch.Tensor,             # (B, N) integer token ids
 ) -> torch.Tensor:
     """Look up the token-table belief prior covariance at the configured family rank."""
-    log_diag = pb._prior_sigma_log_table()[token_ids]                    # (B, N, K)
+    variance = bounded_variance_from_log(pb._prior_sigma_log_table(), eps=pb.eps,
+                                         index=token_ids)                 # (B, N, K)
     if pb.diagonal_covariance:
-        return bounded_variance_from_log(log_diag, eps=pb.eps)
-    return torch.diag_embed(bounded_variance_from_log(log_diag, eps=pb.eps))
+        return variance
+    return torch.diag_embed(variance)
 
 
 @register_encode("per_token", can_omit_base_mean=True, can_omit_base_variance=True)

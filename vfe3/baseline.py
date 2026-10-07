@@ -99,7 +99,8 @@ MAX_PASSES: float = 16.0
 MATCHED_FIELDS: Tuple[str, ...] = (
     "vocab_size", "embed_dim", "n_heads", "n_layers", "max_seq_len", "batch_size", "eval_stride",
     "max_steps", "warmup_steps", "min_lr_frac", "grad_clip", "grad_accum_steps",
-    "amp_dtype", "fp32_matmul_precision", "seed", "deterministic", "log_interval", "eval_interval",
+    "amp_dtype", "fp32_matmul_precision", "seed", "deterministic", "fill_uninitialized_memory",
+    "log_interval", "eval_interval",
     "checkpoint_interval", "val_diagnostic_batches", "beta_attention_prior", "alibi_slope",
     "decode_unigram_prior", "unigram_kappa", "decode_chunk_size", "decode_ce_checkpoint",
 )
@@ -115,7 +116,8 @@ _FLOAT_FIELDS: Tuple[str, ...] = (
 )
 _OPTIONAL_FLOAT_FIELDS: Tuple[str, ...] = ("grad_clip", "per_type_table_lr", "per_type_table_weight_decay")
 _BOOL_FIELDS: Tuple[str, ...] = (
-    "deterministic", "trust_resume_checkpoint", "generate_embedding_figures", "decode_bias",
+    "deterministic", "fill_uninitialized_memory", "trust_resume_checkpoint", "generate_embedding_figures",
+    "decode_bias",
     "decode_unigram_prior",
 )
 _WRAPPER_PREFIXES: Tuple[str, ...] = ("_orig_mod.", "module.")
@@ -172,6 +174,7 @@ class BaselineConfig:
     fp32_matmul_precision: Optional[str] = "highest"
     seed:                  int           = 6
     deterministic:         bool          = True
+    fill_uninitialized_memory: bool      = True        # read only under deterministic algorithms; matched
     # Cadence and resume.
     log_interval:          int           = 100
     eval_interval:         int           = 1500
@@ -390,6 +393,23 @@ class BaselineConfig:
                 raise ValueError(f"matched_to: {field}={values[field]!r}: head architecture requires explicit migration")
         if values["attention_mode"] not in ("projected_predictive", "projected_gradient"):
             raise ValueError(f"matched_to: retired attention mode {values['attention_mode']!r} requires explicit migration")
+        # Dense equivalence (audit 2026-10-07 F79): the minimal-agent readout, content-link edges and a
+        # missing block MLP each change the context-processing parameter count, so the matched arm
+        # would silently differ from the base in size.
+        if values["predictive_readout"] != "kernel":
+            raise ValueError(f"matched_to: predictive_readout={values['predictive_readout']!r} is not "
+                             "dense-equivalent; only the kernel readout has the dense attention parameter count")
+        if values["content_link_edges"] != "off":
+            raise ValueError(f"matched_to: content_link_edges={values['content_link_edges']!r} adds edge-link "
+                             "parameters that dense attention does not have")
+        if not values["use_block_mlp"]:
+            raise ValueError("matched_to: the base has no block MLP, while the matched arm always builds one")
+        # The per-type map is V*K*d, the frame-table size of untied block_glk only (F81).
+        if per_type_table != "none" and (values["gauge_group"] != "block_glk"
+                                         or values["gauge_tying"] not in (None, "per_head")):
+            raise ValueError(f"matched_to: per_type_table={per_type_table!r} is sized V*K*d, which equals the "
+                             "base's frame table only for gauge_group='block_glk' with gauge_tying='per_head'; got "
+                             f"{values['gauge_group']!r}/{values['gauge_tying']!r}")
         derived: Dict[str, Any] = {name: values[name] for name in MATCHED_FIELDS}
         derived["mlp_expansion"] = int(values["block_mlp_expansion"])
         derived["decode_bias"] = (bool(values["decode_bias"]) if values["decode_mode"] == "linear" else True)
@@ -723,9 +743,10 @@ class BaselineTransformer(nn.Module):
         super().__init__()
         if not isinstance(cfg, BaselineConfig):
             raise TypeError(f"BaselineTransformer needs a BaselineConfig, got {type(cfg).__name__}")
-        from vfe3.runtime import set_fp32_matmul_precision
+        from vfe3.runtime import set_fill_uninitialized_memory, set_fp32_matmul_precision
 
         set_fp32_matmul_precision(cfg.fp32_matmul_precision)
+        set_fill_uninitialized_memory(cfg.fill_uninitialized_memory)
         self.cfg = cfg
         V, K, H, d = cfg.vocab_size, cfg.embed_dim, cfg.n_heads, cfg.d_head
         self.tok_embed = nn.Parameter(torch.empty(V, K))                                   # (V, K) E

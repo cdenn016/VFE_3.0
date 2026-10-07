@@ -1,4 +1,9 @@
-r"""The single authoritative scalar free energy F = sum_i F_i for VFE_3.0.
+r"""Reference implementation of the scalar free energy F = sum_i F_i for VFE_3.0.
+
+The supported projected routes neither evaluate nor minimize this scalar: they train on the
+decoder cross-entropy plus optional M-step terms, and their diagnostics report the global free energy as NaN. The scalar
+evaluators below serve as test oracles and as the definition the routes' local updates refer to;
+the Gibbs weights ``attention_weights`` are live.
 
 F is divergence-agnostic: it assembles the scalar from per-pair energies E_ij and
 self-divergences D(q_i||p_i) supplied by the `divergence` registry, so a new
@@ -261,7 +266,7 @@ def free_energy(
     coupling_energy:           Optional[torch.Tensor] = None,   # (..., N, N) VALUE-gauge energy for the coupling sum (None -> energy)
     log_likelihood:            Optional[torch.Tensor] = None,   # (..., N) E_q[log p(o|k)] observation term; GATED STUB (see docstring)
 ) -> torch.Tensor:                                  # scalar F = sum_i F_i
-    r"""Single authoritative scalar free energy.
+    r"""Reference scalar free energy (test oracle; no supported route evaluates it).
 
         F = sum_i [ alpha_i . D(q_i||p_i)            (+ R(alpha_i) if state-dependent)
                   + lambda_beta . ( sum_j beta_ij E_ij
@@ -383,7 +388,7 @@ def hierarchical_free_energy_terms(
     *,
     q_reduction:     str = "sum",
 ) -> HierarchicalFreeEnergyTerms:
-    r"""The single authoritative scalar evaluator over four already-signed, already-weighted rows.
+    r"""Reference scalar evaluator over four already-signed, already-weighted rows (test oracle).
 
     Every row reduces with ``q_reduction``, which is ``"sum"`` or ``"mean"`` applied directly to every
     batch/query entry after the caller has already collapsed the structural (coordinate/key/head)

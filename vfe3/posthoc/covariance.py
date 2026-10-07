@@ -363,6 +363,12 @@ def hidden_temperature(
     r"""The v2:872 factor :math:`\kappa = \sigma^2_{\rm init}/\overline{\sigma^2}` and its distribution."""
     from vfe3.numerics import bounded_variance_from_log
 
+    if getattr(model.cfg, "predictive_readout", "kernel") == "minimal_agent":
+        # The factor is the kernel route's 1/c Mahalanobis scaling; the minimal agent's learned
+        # channel noise n_h breaks that scaling (audit 2026-10-07 F85).
+        return {"status": "not_applicable",
+                "reason": "predictive_readout='minimal_agent': the learned channel noise n_h breaks the kernel "
+                          "route's 1/c scaling that defines the hidden temperature"}
     pb = model.prior_bank
     if not hasattr(pb, "sigma_log_embed"):
         return {"status": "not_applicable", "reason": "the prior bank has no stored log-variance table"}
