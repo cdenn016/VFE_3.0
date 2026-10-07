@@ -172,3 +172,94 @@ def test_parameter_search_refuses_an_inert_enabled_parameter() -> None:
     specs = [("e_q_mu_lr", {"requires": {}})]
     with pytest.raises(ValueError, match="inert"):
         po._refuse_inert_parameters(specs, dict(vars(_cfg(attention_mode="projected_predictive"))), {})
+
+
+# ---------------------------------------------------------------- reduced-precision replay ladder
+
+def _ladder_fixture(monkeypatch: pytest.MonkeyPatch, behavior):
+    import logging
+
+    from vfe3 import train as train_module
+
+    seen = []
+
+    def fake_step(model, optimizer, scheduler, tokens, targets, **kwargs):
+        policy = torch.get_float32_matmul_precision()
+        seen.append((policy, float(torch.rand(()))))
+        return behavior(policy, optimizer)
+
+    monkeypatch.setattr(train_module, "train_step", fake_step)
+    parameter = torch.nn.Parameter(torch.zeros(1))
+    optimizer = torch.optim.SGD([parameter], lr=0.1)
+    model = types.SimpleNamespace(cfg=types.SimpleNamespace(matmul_precision_retry=True))
+
+    def run(policy: str):
+        previous = torch.get_float32_matmul_precision()
+        torch.set_float32_matmul_precision(policy)
+        try:
+            return train_module._train_step_with_precision_retry(
+                model, optimizer, None, None, None, logger=logging.getLogger("t"), step=3, scaler=None)
+        finally:
+            assert torch.get_float32_matmul_precision() == policy        # restored after every rung
+            torch.set_float32_matmul_precision(previous)
+    return run, seen
+
+
+def test_failed_step_escalates_medium_to_high_to_highest_with_the_same_rng(monkeypatch) -> None:
+    def behavior(policy, optimizer):
+        if policy != "highest":
+            raise ValueError("canonical forward and inverse factors must be mutual inverses")
+        return 1.5
+    run, seen = _ladder_fixture(monkeypatch, behavior)
+    torch.manual_seed(0)
+    assert run("medium") == (1.5, 2)
+    assert [policy for policy, _ in seen] == ["medium", "high", "highest"]
+    assert len({draw for _, draw in seen}) == 1                          # every replay sees the same RNG
+
+
+def test_failure_at_highest_and_failure_after_an_update_are_raised(monkeypatch) -> None:
+    run, seen = _ladder_fixture(monkeypatch, lambda policy, optimizer: (_ for _ in ()).throw(ValueError("bug")))
+    with pytest.raises(ValueError, match="bug") as info:
+        run("high")
+    assert [policy for policy, _ in seen] == ["high", "highest"]
+    assert any("earlier attempt" in note for note in info.value.__notes__)
+
+    def after_update(policy, optimizer):
+        optimizer.step()
+        raise ValueError("post-update failure")
+    run, seen = _ladder_fixture(monkeypatch, after_update)
+    with pytest.raises(ValueError, match="post-update"):
+        run("high")
+    assert len(seen) == 1                                                # never replayed after an update
+
+
+# ---------------------------------------------------------------- linear decode logits under autocast
+
+def test_decode_logits_amp_runs_the_logits_matmul_in_bf16_and_returns_fp32() -> None:
+    from vfe3.model.prior_bank import _linear_logits
+
+    pb = types.SimpleNamespace(decode_logits_amp_dtype=torch.bfloat16)
+    x, W = torch.randn(2, 3, 8), torch.randn(11, 8)
+    logits = _linear_logits(pb, x, W)
+    assert logits.dtype == torch.float32
+    torch.testing.assert_close(logits, (x.bfloat16() @ W.bfloat16().T).float(), rtol=0, atol=0)
+    assert torch.equal(_linear_logits(types.SimpleNamespace(decode_logits_amp_dtype=None), x, W), x @ W.T)
+
+
+def test_decode_logits_amp_trains_a_tiny_linear_model_close_to_fp32() -> None:
+    from vfe3.model.model import VFEModel
+
+    losses = {}
+    for flag in (False, True):
+        cfg = _cfg(attention_mode="projected_predictive", decode_mode="linear", amp_dtype="bf16",
+                   decode_logits_amp=flag)
+        torch.manual_seed(0)
+        model = VFEModel(cfg)
+        ids = torch.randint(0, cfg.vocab_size, (2, cfg.max_seq_len))
+        out = model(ids, ids)
+        loss = out[1] if isinstance(out, tuple) else out
+        loss.backward()
+        losses[flag] = float(loss)
+        assert model.prior_bank.decode_logits_amp_dtype == (torch.bfloat16 if flag else None)
+    assert math.isfinite(losses[True]) and abs(losses[True] - losses[False]) < 5e-2
+    assert "decode_logits_amp" in _cfg(decode_mode="linear", amp_dtype=None).inactive_fields()

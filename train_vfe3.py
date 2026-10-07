@@ -304,8 +304,10 @@ config = dict(
   
     amp_dtype                        = 'bf16',        # None (fp32) | "bf16" | "fp16". Sigma must be at least fp32
     fp32_matmul_precision            = "highest",          # None (leave as-is) | "highest" | "high" | "medium" ("high" permits TF32 on the decode/energy GEMMs)
+    matmul_precision_retry           = False,      # on a step error under "medium"/"high", replay it one rung stricter (-> "highest")
         
     decode_ce_checkpoint             = "auto",     # "auto" | "auto_aggregate" (saves memory with recompute)
+    decode_logits_amp                = False,      # linear decode only: logits matmul under amp_dtype; CE stays fp32
     projected_cov_recovery_precision = "fp32",     # "fp64" | "fp32"
     projected_factor_route           = "gram",     # "gram" | "cholesky_qr2" (slower unless recovery actually trips)
    

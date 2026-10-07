@@ -215,6 +215,10 @@ class VFE3Config:
     #   auto_aggregate  account the whole vocabulary, including fp64 scores (saves more memory)
     decode_ce_checkpoint:             str             = "auto"  
 
+    # decode_mode="linear" with amp_dtype set only: run the logits matmul x W^T under amp_dtype
+    # autocast (bf16/fp16 operands, fp32 accumulate); bias, logsumexp and the cross-entropy stay fp32.
+    decode_logits_amp:                bool            = False
+
     # "fp64" | "fp32"
     # Prior-bank Gaussian decoders only: precision of the a_v reduction (sum of 1/sigma_v terms). fp32 loses digits once
     # sigma_v falls far below 1; watch decode_sigma_v_min.
@@ -621,6 +625,11 @@ class VFE3Config:
     #   high     TF32 (or bf16x3) allowed
     #   medium   bf16 allowed
     fp32_matmul_precision:            Optional[str]   = "highest"
+    # Under a reduced fp32_matmul_precision ("medium"/"high"): when a training step raises before its
+    # optimizer update, replay it one rung stricter, "medium" -> "high" -> "highest" (IEEE fp32),
+    # instead of stopping the run. A failure that persists at "highest" is raised as before.
+    # Not used with fp16 (GradScaler state).
+    matmul_precision_retry:           bool            = False
 
     # Redo a frame producer call in float64 when its float32 frame pair is ill-conditioned
     # (eps_32 kappa_F(U) > frame_pair_condition_tol). Costly (about 7x per escalated step).
@@ -1703,6 +1712,11 @@ class VFE3Config:
         elif self.relational_routing == "noisy_query":
             mark(("projected_factor_route",),
                  "the noisy-query cost factors per-pair sums G_q + G_k and keeps the Gram route")
+        if self.decode_mode != "linear" or self.amp_dtype is None:
+            mark(("decode_logits_amp",), "only read by decode_mode='linear' with amp_dtype set")
+        if self.fp32_matmul_precision == "highest" or self.amp_dtype == "fp16":
+            mark(("matmul_precision_retry",),
+                 "only read under a reduced fp32_matmul_precision and without the fp16 GradScaler")
         if not self.deterministic:
             mark(("fill_uninitialized_memory",),
                  "torch fills uninitialized memory only under deterministic algorithms")
@@ -1761,7 +1775,8 @@ class VFE3Config:
                     and (not self.use_block_mlp or self.block_mlp_mode == "prototype_agents")
                     and self.norm_type_block in ("none", "layernorm")
                     and self.norm_type_final in ("none", "layernorm")
-                    and self.mstep_self_coupling_weight == 0.0 and not self.use_cg_coupling):
+                    and self.mstep_self_coupling_weight == 0.0 and not self.use_cg_coupling
+                    and not self.decode_logits_amp):
                 mark(("amp_dtype",),
                      "effective precision float32: on minimal_agent with a prototype_agents or absent block "
                      "MLP, a none/layernorm norm and linear decode, every contraction runs with autocast "
