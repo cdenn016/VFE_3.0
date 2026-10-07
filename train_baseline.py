@@ -208,15 +208,15 @@ def run_baseline(
     device:    "str | torch.device | None" = None,
     logger:    Optional[logging.Logger] = None,
     generate_samples: bool = True,
-) -> Path:
     score_test: bool = True,
+) -> Path:
     r"""Train and finalize one baseline run; return its final run directory.
 
-    ``cfg`` with ``seed`` applied is built into :class:`vfe3.baseline.BaselineTransformer`, trained by
     With ``score_test=False`` (learning-rate sweep arms) the run is finalized without the test
     split and named ``val<best_val_ppl>_<label>``, so selection never sees a test number
     (audit 2026-10-07 F12/F83).
 
+    ``cfg`` with ``seed`` applied is built into :class:`vfe3.baseline.BaselineTransformer`, trained by
     :func:`vfe3.train.train` on the ``train_vfe3`` loaders (data order from ``data_seed``, the model
     seed when None), validated, and finalized by :func:`vfe3.run_artifacts.finalize_run` (test at the
     final and at the validation-selected weights, training-sample CE, provenance, summary,
