@@ -74,7 +74,8 @@ def test_tied_block_glk_basis_and_gram() -> None:
     torch.testing.assert_close(G, torch.stack([torch.kron(torch.eye(2, dtype=torch.float64), e) for e in E]))
     torch.testing.assert_close(torch.einsum("aij,bij->ab", G, G), 2.0 * torch.eye(9, dtype=torch.float64))
     assert group.frobenius_gram_uniform == 2.0 and group.phi_coordinate_layout is None
-    assert group.elementary_block_shape is None and group.pullback_capability is None
+    # Since 2026-10-07 (audit F47) a shared-tied frame takes the pullback M-step as one full block.
+    assert group.elementary_block_shape is None and group.pullback_capability == "pullback_per_block"
     assert get_group("block_glk")(6, 2).pullback_capability == "pullback_per_block"
 
 
@@ -100,8 +101,9 @@ def test_tied_block_glk_refuses_pullback_fisher_and_group_log() -> None:
     test_config(**pullback)
     test_config(**pullback, m_phi_group_retraction="group_log")
     test_config(**_ACTIVE_ROUTE)
-    with pytest.raises(ValueError, match="accepts only untied block_glk"):
-        test_config(**pullback, gauge_tying="shared")
+    test_config(**pullback, gauge_tying="shared")                     # chart retraction (audit 2026-10-07, F47)
+    with pytest.raises(ValueError, match="requires untied block_glk"):
+        test_config(**pullback, gauge_tying="shared", m_phi_group_retraction="group_log")
     with pytest.raises(ValueError, match="gauge_tying='per_head'"):
         test_config(**_ACTIVE_ROUTE, gauge_tying="shared")
     fisher_group_log = {**_ACTIVE_ROUTE, "m_phi_group_retraction": "group_log"}

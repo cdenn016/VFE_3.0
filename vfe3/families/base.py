@@ -18,6 +18,47 @@ import torch
 
 from vfe3.numerics import safe_eigvalsh
 
+def x_minus_log1p(x: torch.Tensor) -> torch.Tensor:
+    r"""Cancellation-free :math:`x - \log(1 + x)` for :math:`x > -1`.
+
+    A Taylor series for :math:`|x| < 10^{-3}` (truncation below :math:`x^6/6`), else ``x - log1p(x)``, whose
+    absolute error is about :math:`\varepsilon|x|` against a value near :math:`x^2/2`. The two-log form
+    :math:`(1 + x) - 1 - \log(1 + x)` loses about :math:`\varepsilon/x^2` relative accuracy instead (audit
+    2026-10-07, F36).
+    """
+    near = x.abs() < 1e-3
+    small = torch.where(near, x, torch.zeros_like(x))
+    series = small.square() * (0.5 + small * (-1.0 / 3.0 + small * (0.25 - small / 5.0)))
+    wide = torch.where(near, torch.zeros_like(x), x)
+    return torch.where(near, series, wide - torch.log1p(wide))
+
+
+def ratio_minus_one_minus_log(num: torch.Tensor, den: torch.Tensor) -> torch.Tensor:
+    r"""Cancellation-free :math:`r - 1 - \log r` for :math:`r = \text{num}/\text{den} > 0`.
+
+    Near equality (:math:`|x| < 1/2`, :math:`x = (\text{num} - \text{den})/\text{den}`) it is
+    :func:`x_minus_log1p`; farther out the value is at least about 0.1 and the two-log form
+    :math:`r - 1 + \log\text{den} - \log\text{num}` has no cancellation, and it stays finite when :math:`x` rounds
+    to :math:`-1` (a ratio below float32 resolution). Each branch sees placeholder inputs off its own region, so
+    neither the value nor the gradient carries a non-finite term from the unselected branch.
+    """
+    x = (num - den) / den
+    near = x.abs() < 0.5
+    ones = torch.ones_like(x)
+    small = x_minus_log1p(torch.where(near, x, torch.zeros_like(x)))
+    far_num, far_den = torch.where(near, ones, num), torch.where(near, ones, den)
+    far = far_num / far_den - 1.0 + torch.log(far_den) - torch.log(far_num)
+    return torch.where(near, small, far)
+
+
+def expm1_neg_plus(u: torch.Tensor) -> torch.Tensor:
+    r"""Cancellation-free :math:`e^{-u} - 1 + u` for :math:`u \ge 0` (series for :math:`u < 10^{-3}`)."""
+    near = u.abs() < 1e-3
+    small = torch.where(near, u, torch.zeros_like(u))
+    series = small.square() * (0.5 + small * (-1.0 / 6.0 + small * (1.0 / 24.0 - small / 120.0)))
+    return torch.where(near, series, torch.expm1(-u) + u)
+
+
 def safe_kl_clamp(
     kl:     torch.Tensor,
 

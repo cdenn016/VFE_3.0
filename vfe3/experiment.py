@@ -54,8 +54,9 @@ def rename_run_by_test_ppl(
 ) -> Path:
     r"""Rename ``run_dir`` to ``<parent>/<test_ppl:.2f>_<label>`` (``_2``, ... on a clash).
 
-    Model selection is validation-only; the name is a sorting convenience applied after the test
-    evaluation. The directory keeps its timestamped name when the perplexity is missing or not
+    Nothing within the run is selected on test; the name is a sorting convenience applied after
+    the test evaluation. Across runs the name exposes the test perplexity, so recipes chosen by
+    comparing run names were chosen on the test split. The directory keeps its timestamped name when the perplexity is missing or not
     finite, or when the operating system refuses the move (the results are already on disk).
     """
     if test_ppl is None or not math.isfinite(test_ppl) or not run_dir.exists():

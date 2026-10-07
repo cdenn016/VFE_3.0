@@ -1,14 +1,16 @@
 r"""Training (M-step) for VFE_3.0: AdamW per-group learning rates + warmup/cosine.
 
-The model has no neural layers (no nn.Linear/MLP/activation). The trainable parameters are the
-PriorBank prior tables plus the model-owned tables their toggles create -- the default
-``pos_phi='learned'`` positional table, and the default-OFF exceptions (CG coupling,
-learnable T5 bias, linear decode).
-``loss.backward()`` flows through the unrolled E-step to those tables; AdamW updates
-them. The M-step minimizes the cross-entropy of the decode boundary over the prior
-tables, with the E-step (the differentiable filtering kernel) unrolled into the graph,
-so a gradient step on the priors improves inference end to end. Click-to-run: edit a
-``VFE3Config`` and call ``run_training`` (no CLI).
+The trainable parameters are the PriorBank prior tables (means, variances, frames), the learned
+comparison and content maps of every attention layer (4K^2 parameters per layer on the kernel
+readout, the count of dense W_Q, W_K, W_V, W_O; 2K^2 + H on the minimal agent), the default linear decoder (``decode_mode='linear'``), the default
+coordinate block MLP (``block_mlp_mode='coordinate'``: nn.Linear fc1/fc2 with a pointwise
+activation), the default ``pos_phi='learned'`` positional table, and the tables of opt-in toggles
+(CG coupling, T5 bias, LayerNorm affine). These are learned linear and neural maps trained by
+backpropagation. No nn.Linear module is built only with ``use_block_mlp=False`` or a
+``prototype_agents`` / ``gaussian_template`` block MLP together with a prior-bank decoder, and the
+attention maps remain learned linear maps there. The M-step minimizes the decode cross-entropy;
+``projected_predictive`` takes one differentiable readout step per layer, and ``projected_gradient``
+unrolls its ``n_e_steps`` receiver updates into the graph. Click-to-run: edit a ``VFE3Config`` and call ``run_training`` (no CLI).
 """
 
 import contextlib
@@ -59,7 +61,9 @@ from vfe3.timing import TrainingTimer
 from vfe3.viz.extract import e_step_belief_trace as _snapshot_trace
 from vfe3.geometry.retraction import (                          # SPD-retraction non-finite tangent guard
     nonfinite_tangent_elements,
+    public_spd_repair_elements,
     reset_nonfinite_tangent_elements,
+    reset_public_spd_repair_elements,
 )
 from vfe3.numerics import (                    # non-equivariant / non-PD fallback accounting
     decode_logdet_fallback_elements,
@@ -1403,7 +1407,7 @@ _GROUP_COLUMNS: Tuple[str, ...] = tuple(
     for kind in ("grad_norm", "param_norm", "update_ratio") for group in PARAMETER_GROUPS)
 _GRAD_GROUP_COLUMNS: Tuple[str, ...] = tuple(f"grad_norm_group_{group}" for group in PARAMETER_GROUPS)
 _TRAIN_SAMPLE_COLUMNS: Tuple[str, ...] = (
-    "train_sample_ce", "train_sample_ppl", "generalization_gap_fixed")
+    "train_sample_ce", "train_sample_ppl", "generalization_gap_fixed", "train_sample_seen_fraction")
 _GROUP_GRAD_ERROR_KEY = "_group_gradient_norm_error"     # private train_step -> train handoff
 
 # Held-out columns the conditional route now fills from its own capture (all members of _VAL_DIAG_KEYS).
@@ -2325,7 +2329,11 @@ def _eval_cadence_diagnostics(
 
     (1) CE of the fixed training sample under the validation protocol, and
     ``generalization_gap_fixed = val_ce - train_sample_ce`` (positive = the model fits its training
-    windows better than held-out text); (2) ``diagnostics/residual_ratio.csv`` and
+    windows better than held-out text), with ``train_sample_seen_fraction``
+    :math:`= \min(1, sB/W)` after :math:`s` steps of batch :math:`B` over :math:`W` training windows: the
+    expected fraction of the fixed sample the shuffled training stream has already served, since the
+    sample is drawn independently of the epoch permutation. Before one pass the gap therefore compares
+    validation with mostly unseen training text (audit 2026-10-07, F46); (2) ``diagnostics/residual_ratio.csv`` and
     ``diagnostics/attention_stats.csv`` rows on the fixed validation windows; (3) with
     ``count_numerics`` (projected routes), the S1 panel D per-evaluation counters of the same
     capture pass (``NUMERICS_EVAL_COLUMNS``, see :func:`_capture_numerics_counts`) and their
@@ -2343,6 +2351,9 @@ def _eval_cadence_diagnostics(
                 out["train_sample_ce"] = float(sample["ce"])
                 out["train_sample_ppl"] = float(sample["ppl"])
                 out["generalization_gap_fixed"] = float(val_ce) - float(sample["ce"])
+                n_windows_total = int(len(train_sample.dataset))
+                out["train_sample_seen_fraction"] = min(
+                    1.0, int(step) * int(model.cfg.batch_size) / max(n_windows_total, 1))
                 artifacts.train_sample_by_step[int(step)] = float(sample["ce"])
             except Exception as exc:
                 _record_diagnostic_failure(failures, "train_sample", exc, logger)
@@ -2568,7 +2579,7 @@ def _terminal_validation_signature(
          dataset.overlap_prefix, dataset.n, loader.batch_size, loader.drop_last,
          loader.batch_sampler.batch_size, loader.batch_sampler.drop_last),
         (nonfinite_tangent_elements(), mu_trust_fallback_elements(),
-         decode_logdet_fallback_elements(), frame_pair_fp64_escalations()),
+         decode_logdet_fallback_elements(), frame_pair_fp64_escalations(), public_spd_repair_elements()),
     )
 
 
@@ -3079,6 +3090,22 @@ def train(
     losses: List[float] = []
     model.train()
     logger = logger or logging.getLogger(__name__)
+    # Data-dependent prototype template initialization (block_mlp_template_init='working_variance'): a fresh
+    # start only, on cfg.batch_size training windows drawn by a private generator, so the data order and the
+    # global RNG streams are unchanged (audit 2026-10-07, F77/F78).
+    if (resume_path is None and getattr(cfg, "block_mlp_template_init", "absolute") == "working_variance"
+            and getattr(cfg, "use_block_mlp", False) and getattr(cfg, "block_mlp_mode", None) == "prototype_agents"):
+        dataset = getattr(loader, "dataset", None)
+        if dataset is None or not hasattr(dataset, "__getitem__"):
+            raise RuntimeError("block_mlp_template_init='working_variance' needs a window dataset on the loader")
+        count = min(int(cfg.batch_size), len(dataset))
+        picks = torch.randperm(len(dataset), generator=torch.Generator().manual_seed(int(cfg.seed)))[:count]
+        windows = torch.stack([dataset[int(i)][0] for i in picks]).to(device)
+        calibration = model.calibrate_prototype_templates(
+            windows, pull=float(cfg.block_mlp_template_init_pull), seed=int(cfg.seed))
+        for layer, stats in enumerate(calibration):
+            logger.info(" prototype templates, layer %d: working variance %.4g, lambda_0 %.4g",
+                        layer, stats["working_variance"], stats["lambda0"])
     # Live per-step it/s: iterate the step loop through a tqdm bar whose built-in rate readout
     # refreshes every step. Gated on log_interval so the documented silent path (log_interval
     # falsy) stays bitwise-identical -- no bar, no redirect, nothing printed. The generator holds
@@ -3104,6 +3131,7 @@ def train(
     skipped_steps = 0                 # cumulative REJECTED optimizer updates (audit 2026-08-06 F5)
     consecutive_skips = 0
     reset_nonfinite_tangent_elements()   # per-run accounting for the SPD-retraction guard
+    reset_public_spd_repair_elements()   # ... and its certificate repairs
     reset_mu_trust_fallback_elements()   # ... the mu-trust-region equivariance fallback
     reset_decode_logdet_fallback_elements()   # ... and the decode log-det non-PD fallback
     reset_source_recovery_elements()        # ... and projected float64 source-factor recoveries
@@ -3878,6 +3906,7 @@ def train(
             "mu_trust_fallback_elements": int(mu_fallbacks),
             "decode_logdet_fallback_elements": int(decode_logdet_fallback_elements()),
             "frame_pair_fp64_escalations": int(frame_pair_fp64_escalations()),
+            "public_spd_repair_elements": int(public_spd_repair_elements()),
         }
         if skipped_total or neutralized or mu_fallbacks:
             logger.warning(

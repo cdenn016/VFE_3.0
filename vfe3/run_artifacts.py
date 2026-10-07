@@ -211,7 +211,8 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
                                     + ("" if cfg.minimal_agent_inference == "exact"
                                        else "_kl_certificate_fp64_refactor")) if minimal_agent
                                    else "failed_entries_source_square_root_qr_fp64"),
-        "temperature_convention": ("unit_temperature_exact_posterior_no_clamp" if minimal_agent
+        "temperature_convention": ((f"unit_temperature_{'exact' if cfg.minimal_agent_inference == 'exact' else 'mean_field'}"
+                                    "_posterior_no_clamp") if minimal_agent
                                    else "kappa_beta_times_sqrt_ambient_head_dim"),
         # Exact minimal agent: head h routes on the receiver moments left by heads 1..h-1 (ADF), sources pre-update.
         "routing_state": ("episode_initial" if full_link
@@ -3202,25 +3203,39 @@ def _fd_gradient_check(
     *,
     n_coords:    int   = 4,
     fd_eps:      float = 1e-3,
+    record:      Optional[Dict[str, Any]] = None,
 ) -> float:
     r"""Worst relative error between autograd-of-CE and a central finite difference on a few DECODE
-    coordinates (``output_proj_weight``, else the decode log-scale) -- a parameter whose gradient does
-    NOT pass through the E-step belief adjoint (which the default kernel/oracle route detaches), so a
-    healthy model reads ~1e-4 and a broken decode adjoint spikes far above it. (Probing ``mu_embed``
-    instead would sit at the detached-oracle's ~10-25% plateau with no headroom to flag a real bug.)
-    The CLAUDE.md-mandated FD-vs-autograd check. Best-effort on one tiny batch; restores every coord."""
+    coordinates: ``output_proj_weight`` under linear decode, else the untied decode tables
+    ``decode_mu_embed`` / ``decode_sigma_log_embed`` of a prior-bank decode, whose gradient reaches the
+    loss only through the decode, so a healthy model reads ~1e-4 and a broken decode adjoint spikes far
+    above it. A tied prior-bank decode has no decode-only trainable table (``decode_log_scale`` is frozen),
+    so the check returns NaN there. The probed parameter, or the reason for a NaN, is written to ``record``
+    (``fd_gradient_probe``, ``fd_gradient_nan_reason``; audit 2026-10-07, F86). Best-effort on one tiny
+    batch; restores every coord."""
+    if record is None:
+        record = {}
     with _diagnostic_eval_mode(model):
         batch = next(iter(test_loader))
         tok, tgt = (batch if isinstance(batch, (tuple, list)) else (batch, None))
         tok = tok[:2].to(device)
         tgt = tgt[:2].to(device)
         pb = model.prior_bank
-        p = pb.output_proj_weight if getattr(pb, "output_proj_weight", None) is not None else pb.decode_log_scale
+        candidates = [(name, getattr(pb, name, None)) for name in
+                      ("output_proj_weight", "decode_mu_embed", "decode_sigma_log_embed")]
+        candidates = [(name, q) for name, q in candidates if q is not None and q.requires_grad]
+        if not candidates:
+            record["fd_gradient_nan_reason"] = ("no decode-only trainable parameter (tied prior-bank decode; "
+                                                "decode_log_scale is frozen)")
+            return float("nan")
+        name, p = candidates[0]
+        record["fd_gradient_probe"] = f"prior_bank.{name}"
         model.zero_grad(set_to_none=True)
         _, loss, _ = model(tok, tgt)
         loss.backward()
         if p.grad is None:                                          # decode param severed under this config
             model.zero_grad(set_to_none=True)
+            record["fd_gradient_nan_reason"] = f"prior_bank.{name} received no gradient"
             return float("nan")
         flat, gflat = p.detach().view(-1), p.grad.detach().view(-1).clone()
         # Probe the LARGEST-gradient coords, not random ones: a random coord usually has near-zero
@@ -3245,6 +3260,7 @@ def _fd_gradient_check(
                 ana = float(gflat[j])
                 if not math.isfinite(fd) or not math.isfinite(ana):
                     model.zero_grad(set_to_none=True)
+                    record["fd_gradient_nan_reason"] = "non-finite finite difference or autograd value"
                     return float("nan")
                 worst = max(worst, abs(fd - ana) / max(abs(fd), abs(ana), 1e-8))
         model.zero_grad(set_to_none=True)
@@ -3280,7 +3296,7 @@ def _write_research_artifacts(
     except Exception as exc:
         logger.warning("calibration/strata probe failed (%s); skipped", exc)
     try:
-        out["fd_gradient_worst_rel_error"] = _fd_gradient_check(model, test_loader, device)
+        out["fd_gradient_worst_rel_error"] = _fd_gradient_check(model, test_loader, device, record=out)
         logger.info("FD gradient-check worst rel error: %.2e", out["fd_gradient_worst_rel_error"])
     except Exception as exc:
         logger.warning("FD gradient-check failed (%s); skipped", exc)

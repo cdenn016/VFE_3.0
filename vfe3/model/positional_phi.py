@@ -88,7 +88,13 @@ def _pos_phi_frozen(
     dtype:       torch.dtype = torch.float32,
     **kwargs,
 ) -> torch.Tensor:
-    r"""Parameter-free Lie-algebra ALiBi: pos_phi_i = (i * scale) on one generator axis."""
+    r"""Parameter-free Lie-algebra ALiBi: pos_phi_i = (i * scale) on one generator axis.
+
+    On the projected routes this element is composed into the frame, before the learned comparison maps, and the
+    generator's exponential is not orthogonal in general, so neither it nor its relative products commute with
+    those maps: the routing cost depends on absolute position (audit 2026-10-07, F31). The relative alternative is
+    ``pos_rotation='rope'`` with ``rope_space='comparison'``, which rotates the projected moments after the maps.
+    """
     coords = torch.zeros(n, n_gen, device=device, dtype=dtype)
     coords[:, frozen_axis] = torch.arange(n, device=device, dtype=dtype) * scale
     return coords

@@ -11,7 +11,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from vfe3.families.base import (
-    BeliefParams, register_family, safe_kl_clamp, _logdet_chol,
+    BeliefParams, register_family, safe_kl_clamp, _logdet_chol, ratio_minus_one_minus_log,
 )
 from vfe3.numerics import safe_cholesky, validated_cholesky_solve
 
@@ -201,12 +201,8 @@ def diag_kl_unclamped_per_coord(
     """
     sq = sigma_q.clamp(min=eps)
     sp = sigma_p.clamp(min=eps)
-    delta = (sq - sp) / sp
-    # Near equality, evaluate x-log(1+x) without subtracting its linear term.
-    near = delta.abs() < 1e-3
-    x = torch.where(near, delta, torch.zeros_like(delta))
-    series = x.square() * (0.5 + x * (-1.0 / 3.0 + x * (0.25 - x / 5.0)))
-    covariance = torch.where(near, series, sq / sp - 1.0 + torch.log(sp) - torch.log(sq))
+    # s/t - 1 - log(s/t), cancellation-free near equality (x - log1p(x)) and finite far from it.
+    covariance = ratio_minus_one_minus_log(sq, sp)
     return 0.5 * (covariance + ((mu_p - mu_q) ** 2) / sp)
 
 

@@ -343,8 +343,22 @@ def map_invariants(
                     row[f"{name}_max_block_share"] = float("nan")
             row.update(link_rows[h] if link_rows is not None else {c: float("nan") for c in LINK_COLUMNS})
             if "channel_log_noise" in maps:                           # minimal agent: S_K columns describe T
+                # B = T C T^T + n_h I: (S_Q, T) -> (A S_Q, A T) is a symmetry only for orthogonal A, and a common
+                # scale c only together with n_h -> c^2 n_h. The gains and angles (GL(r)-invariant, hence
+                # O(r)-invariant) stay; the common scale is a signal-to-noise coordinate and S S^T + T T^T
+                # has no conservation law, so those two columns are replaced by noise-unit singular values.
+                n_h = float(maps["channel_log_noise"][h].exp())
+                unit = math.sqrt(n_h)
                 row["key_tied_to_content"] = 1.0
-                row["channel_noise"] = float(maps["channel_log_noise"][h].exp())
+                row["channel_noise"] = n_h
+                row["scale_rms"] = float("nan")
+                row["conserved_S_drift"] = float("nan")
+                row["scale_rms_noise_units"] = float(math.sqrt(float(
+                    (S_Q.square().sum() + S_K.square().sum()) / (2 * r)))) / unit
+                for name, mat in (("S_Q", S_Q), ("T", S_K)):
+                    sv = torch.linalg.svdvals(mat) / unit
+                    row[f"{name}_sv_noise_units_min"] = float(sv.min())
+                    row[f"{name}_sv_noise_units_max"] = float(sv.max())
             if "edge_sender_map" in maps:
                 row["link_shared_generator_only"] = 1.0
             row.update({f"{name}_fro": float(maps[name].norm()) for name in EDGE_MAP_NAMES if name in maps})

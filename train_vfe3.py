@@ -89,7 +89,7 @@ DATA_SEED = 3    #TODO need data order variance for pub - set to None
 
 # Where each run's artifacts go: vfe3_runs/<timestamp>_<label>/ while training (config.json,
 # metrics.csv, checkpoints/, best_model.pt, test_results.json, summary.json, *.png), renamed to
-# vfe3_runs/<val_ppl>_<label>/ (timestamp dropped) at finalize. None disables persistence.
+# vfe3_runs/<test_ppl>_<label>/ (timestamp dropped) at finalize. None disables persistence.
 RUN_ROOT = "vfe3_runs"
 
 config = dict(
@@ -466,8 +466,9 @@ def _rename_run_by_test_ppl(
 ) -> str:
     r"""Rename ``run_dir`` to ``vfe3_runs/<test_ppl:.2f>_<label>/`` so runs sort by held-out test perplexity.
 
-    Model selection remains validation-only; this is a naming convenience applied AFTER the held-out
-    test evaluation of the reloaded best-val checkpoint, so no test metric enters selection. The
+    Within a run nothing is selected on test: the test evaluation scores the final training weights
+    (no best-val reload), and the name is applied after it. Across runs the name exposes the test
+    perplexity, so any recipe chosen by comparing run names was chosen on the test split. The
     folder is created with a timestamp prefix because the test PPL is unavailable before
     finalization; finalization swaps that prefix for the test PPL and drops the timestamp. Returns the
     new path -- or the original unchanged when the PPL is missing/non-finite (the timestamped name is

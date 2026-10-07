@@ -243,8 +243,12 @@ class RelationalOperators(nn.Module):
         predictive_readout:    str   = "kernel",
         minimal_agent_inference: str = "exact",
         minimal_agent_channel_noise: float = 1.0,
+        comparison_rope_base: Optional[float] = None,
     ) -> None:
         super().__init__()
+        # rope_space='comparison': the RoPE frequency base of the rotation applied to each head's projected
+        # routing moments after the learned maps (relational_score); None leaves routing un-rotated here.
+        self.comparison_rope_base = None if comparison_rope_base is None else float(comparison_rope_base)
         if not irrep_dims or any(type(d) is not int or d < 1 for d in irrep_dims):
             raise ValueError("relational operators require positive integer head sizes")
         if type(seed) is not int:

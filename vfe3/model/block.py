@@ -3,8 +3,8 @@ r"""A single VFE block for VFE_3.0: E-step belief inference + optional norm.
 Parameter-free (the block owns no nn.Parameters): on the pure default path the learnable capacity
 is the PriorBank's prior tables, but the block also receives the opt-in learned exceptions
 (CG coupling) as arguments and applies them; the block
-runs the iterative E-step (Phase 6) and an optional gauge-equivariant norm on the
-mean. The belief handoff across blocks lives in stack.py.
+runs the attention step and the configured block norm (the default ``layernorm`` is not
+gauge-equivariant; ``none`` and ``mahalanobis`` are) on the mean. The belief handoff across blocks lives in stack.py.
 """
 
 from typing import TYPE_CHECKING, Callable, Optional

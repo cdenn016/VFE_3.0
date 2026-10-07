@@ -298,7 +298,9 @@ class VFE3Config:
     # Positional Lie-algebra element composed into the token frame (exact group product).
     #   none     no positional frame (pure path)
     #   learned  learned (max_seq_len, n_gen) table
-    #   frozen   parameter-free i * pos_phi_scale on one generator axis
+    #   frozen   parameter-free i * pos_phi_scale on one generator axis; on the projected routes it is folded into
+    #            the frame before the learned maps, so routing is not relative (relative: pos_rotation='rope' with
+    #            rope_space='comparison')
     pos_phi:                          str             = "learned"
     pos_rotation:                     str             = "none"       # "none" | "rope" block-diagonal rotation R(theta) folded 
                                                                      # into each frame on the right, V_i = U_i R_i^T.
@@ -307,6 +309,12 @@ class VFE3Config:
     bch_residual_max:                 Optional[float] = None         # fail-closed group-product relative residual; None = off
     
     rope_base:                        float           = 100.0        # rope only: frequency base
+    # "frame" | "comparison"
+    # rope only: where the rotation acts.
+    #   frame       folded into each frame, V_i = U_i R_i^T, before the learned maps (absolute-position routing)
+    #   comparison  applied to each head's projected query and key moments after the learned maps, so the
+    #               routing cost depends on positions only through i - j (kernel readout, routing only)
+    rope_space:                       str             = "frame"
     
     ##################################################
     #   8. Attention routing
@@ -509,6 +517,13 @@ class VFE3Config:
     block_mlp_dropout:                float           = 0.0
     block_mlp_covariance_floor:       float           = 1e-4         # delta_full only
     block_mlp_template_init_variance: float           = 10.0         # prototype_agents only: initial template variance > 0
+    # "absolute" | "working_variance"
+    # prototype_agents only: template initialization.
+    #   absolute          nu ~ U(+-K^-1/2), lambda = block_mlp_template_init_variance (the absolute variance)
+    #   working_variance  at a fresh start, per layer from one training batch: nu = sampled block-input means,
+    #                     lambda_0 = c (1 - p)/p with c the mean working variance there and p the target pull
+    block_mlp_template_init:          str             = "absolute"
+    block_mlp_template_init_pull:     float           = 0.09         # working_variance only: initial pull p in (0, 1)
 
     ##################################################
     #   15. E-step (belief updates)
@@ -533,7 +548,8 @@ class VFE3Config:
 
     # "adamw" | "pullback_group" | "fisher_group"
     #   adamw           AdamW on the stored phi tables
-    #   pullback_group  stateless pullback direction plus a right-group retraction (untied block_glk)
+    #   pullback_group  stateless Frobenius-pullback direction plus a right-group retraction (every registered group;
+    #                   block-separable generators per block, shared-tied or so_n frames as one full block)
     #   fisher_group    belief-Fisher natural gradient on the frame (untied block_glk, per_token)
     m_phi_update_mode:                str             = "adamw"
 
@@ -1169,12 +1185,7 @@ class VFE3Config:
                     f"gauge_group={self.gauge_group!r} registers no pullback capability; phase one "
                     "requires a built-in bracket-closed per-block pullback direction"
                 )
-            if self.gauge_group != "block_glk" or self.gauge_tying != "per_head":
-                raise ValueError(
-                    "pullback_group phase one accepts only untied block_glk; "
-                    f"got gauge_group={self.gauge_group!r}, gauge_tying={self.gauge_tying!r}"
-                )
-            if self.d_head > 12:
+            if self.gauge_group == "block_glk" and self.d_head > 12:
                 raise ValueError(
                     "pullback_group with gauge_group='block_glk' requires d_head <= 12; got "
                     f"d_head={self.d_head}"
@@ -1207,7 +1218,19 @@ class VFE3Config:
         # RoPE's adjacent-pair rotation R is orthogonal but generally NOT in the irrep image
         # rho(SO(N)) inside GL(K), so R Omega R^T leaves the SELECTED structure group
         # (GL(K)-congruence invariance survives).
-        if self.pos_rotation == "rope" and not _traits.contains_pair_rotations:
+        _require(self.rope_space, ("frame", "comparison"), "rope_space")
+        if self.pos_rotation == "rope" and self.rope_space == "comparison":
+            problems = []
+            if self.attention_mode != "projected_predictive":
+                problems.append(f"attention_mode={self.attention_mode!r} (requires 'projected_predictive')")
+            if self.predictive_readout != "kernel":
+                problems.append(f"predictive_readout={self.predictive_readout!r} (requires 'kernel')")
+            if self.rope_on_value:
+                problems.append("rope_on_value=True (the comparison-space rotation acts on routing only)")
+            if problems:
+                raise ValueError("rope_space='comparison' rotates the projected routing moments after the learned "
+                                 "maps; got " + "; ".join(problems))
+        if self.pos_rotation == "rope" and self.rope_space == "frame" and not _traits.contains_pair_rotations:
             import warnings
             warnings.warn(
                 f"pos_rotation='rope' with gauge_group={self.gauge_group!r} leaves the structure "
@@ -1271,7 +1294,7 @@ class VFE3Config:
                     _dims = _builder(K=self.embed_dim, n_heads=self.n_heads).irrep_dims
                 except TypeError:
                     _dims = _builder(K=self.embed_dim).irrep_dims
-            if len(_dims) < 2:
+            if len(_dims) < 2 and self.rope_space == "frame":
                 raise ValueError(
                     f"rope_insertion='right' needs a group whose "
                     f"transport factors per block, but gauge_group={self.gauge_group!r} has a "
@@ -1465,6 +1488,13 @@ class VFE3Config:
                 "block_mlp_template_init_variance must be a finite real value > 0, "
                 f"got {self.block_mlp_template_init_variance!r}"
             )
+        _require(self.block_mlp_template_init, ("absolute", "working_variance"), "block_mlp_template_init")
+        if (isinstance(self.block_mlp_template_init_pull, bool)
+                or not isinstance(self.block_mlp_template_init_pull, Real)
+                or not 0.0 < float(self.block_mlp_template_init_pull) < 1.0):
+            raise ValueError(
+                "block_mlp_template_init_pull must be a real value in (0, 1), "
+                f"got {self.block_mlp_template_init_pull!r}")
 
         # Reference coordinates (M2 arms: LN and MLP in reference coordinates; the covariant decoder).
         # Both conjugate by the realized relational frame U_i, which is defined, fixed through the
@@ -1712,11 +1742,38 @@ class VFE3Config:
         if self.attention_mode != "projected_predictive":
             mark(("predictive_readout",), "only read by attention_mode='projected_predictive'")
         if minimal_agent:
+            posterior = ("exact source posterior" if self.minimal_agent_inference == "exact"
+                         else "mean-field source posterior")
             mark(("relational_routing", "content_link_chart", "attention_residual", "relational_output_init",
                   "kappa_beta"),
-                 "predictive_readout='minimal_agent' routes by the exact source posterior at temperature 1 (no "
+                 f"predictive_readout='minimal_agent' routes by the {posterior} at temperature 1 (no "
                  "routing-cost selector, no kappa_beta temperature) and derives the receiving map and the "
                  "precision-weighted residual (no content factor O, so no chart, initial output scale or residual flag)")
+            # The readout applies no clamp (relational.py returns before safe_kl_clamp); the remaining
+            # readers are the M-step self-coupling and the CG moment energy.
+            if self.mstep_self_coupling_weight == 0.0 and self.cg_energy_weight == 0.0:
+                mark(("kl_max",),
+                     "the minimal-agent posterior applies no divergence clamp, decoders use kl_max=inf, and "
+                     "no M-step self-coupling or CG energy term is enabled")
+            # Without the certificate the minimal agent pre-replaces failed factors before projected
+            # scoring, so no source recovery (the only reader of the recovery precision) can occur.
+            if not self.projected_cov_condition_recovery:
+                mark(("projected_cov_recovery_precision",),
+                     "the minimal agent recomputes failed layers itself; without "
+                     "projected_cov_condition_recovery no source recovery runs")
+            # Every contraction on this combination runs in an autocast-disabled island (the minimal-agent
+            # update, the prototype posteriors, LayerNorm, the transport exponentials and the linear
+            # decode/CE) or is elementwise, so the forward computes in float32 whatever amp_dtype says.
+            # Checked bit-for-bit on CPU autocast (tests/test_audit_20261007_opus_fixes.py); not run on CUDA.
+            if (self.amp_dtype is not None and self.decode_mode == "linear"
+                    and (not self.use_block_mlp or self.block_mlp_mode == "prototype_agents")
+                    and self.norm_type_block in ("none", "layernorm")
+                    and self.norm_type_final in ("none", "layernorm")
+                    and self.mstep_self_coupling_weight == 0.0 and not self.use_cg_coupling):
+                mark(("amp_dtype",),
+                     "effective precision float32: on minimal_agent with a prototype_agents or absent block "
+                     "MLP, a none/layernorm norm and linear decode, every contraction runs with autocast "
+                     "disabled")
         else:
             mark(("minimal_agent_inference", "minimal_agent_channel_noise"),
                  "only read by predictive_readout='minimal_agent'")
@@ -1761,8 +1818,14 @@ class VFE3Config:
                  "prototype_agents has no hidden activation, and its posterior covariance is exact, "
                  "with no floor")
         if not (self.use_block_mlp and self.block_mlp_mode == "prototype_agents"):
-            mark(("block_mlp_inference", "block_mlp_template_init_variance"),
+            mark(("block_mlp_inference", "block_mlp_template_init_variance", "block_mlp_template_init",
+                  "block_mlp_template_init_pull"),
                  "only read by block_mlp_mode='prototype_agents' with use_block_mlp=True")
+        elif self.block_mlp_template_init == "working_variance":
+            mark(("block_mlp_template_init_variance",),
+                 "block_mlp_template_init='working_variance' sets lambda_0 from the measured working variance")
+        else:
+            mark(("block_mlp_template_init_pull",), "only read by block_mlp_template_init='working_variance'")
         if self.pos_phi != "learned":
             mark(("m_pos_phi_lr",), "only pos_phi='learned' creates the learnable positional table")
         if "layernorm" not in (self.norm_type_block, self.norm_type_final):
@@ -1776,7 +1839,7 @@ class VFE3Config:
         else:
             mark(("lambda_alpha",), "only read by lambda_alpha_mode='constant'")
         if self.pos_rotation == "none":
-            mark(("rope_on_value", "rope_base"), "only read by pos_rotation='rope'")
+            mark(("rope_on_value", "rope_base", "rope_space"), "only read by pos_rotation='rope'")
         if self.pos_phi == "none":
             mark(("pos_phi_project_slk",), "only read by a non-'none' pos_phi")
         if (self.beta_attention_prior in ("windowed", "causal_windowed")
@@ -2000,6 +2063,9 @@ _RETIRED_INERT_FIELDS = frozenset({
     "transport_clamp_monitor", "exp_fp64_norm_threshold",
     # 2026-10-05 head-mixer removal: the two mixer rates were read only by the retired mixers.
     "m_head_mixer_lr", "m_head_evidence_lr",
+    # 2026-10-07 (PR #69): pullback_group was the only reader, and it required the group's registered
+    # pullback_capability, which the M-step now dispatches directly; every other value was ignored or refused.
+    "phi_precond_mode",
 })
 # Retired fields with a config-dependent rule in _migrate_retired_fields.
 _RETIRED_CONDITIONAL_FIELDS = frozenset({

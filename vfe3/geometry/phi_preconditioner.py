@@ -959,13 +959,28 @@ def _pullback_group_direction_per_block(
     """
     if irrep_dims is None:
         raise ValueError("pullback_per_block requires irrep_dims")
-    preparations = _strict_block_preparations(
-        generators,
-        irrep_dims,
-        coordinate_layout,
-        target_device=phi.device,
-        target_dtype=torch.float64,
-    )
+    try:
+        preparations = _strict_block_preparations(
+            generators,
+            irrep_dims,
+            coordinate_layout,
+            target_device=phi.device,
+            target_dtype=torch.float64,
+        )
+    except ValueError as exc:
+        if "not supported in a single irrep block" not in str(exc):
+            raise
+        # A generator acting on several blocks at once (a shared-tied frame, or so_n's one algebra represented
+        # across its irrep blocks) makes the metric dense across blocks: solve it as one full block, which is
+        # the exact Frobenius pullback of the whole representation (audit 2026-10-07, F47).
+        irrep_dims = [int(sum(irrep_dims))]
+        preparations = _strict_block_preparations(
+            generators,
+            irrep_dims,
+            coordinate_layout,
+            target_device=phi.device,
+            target_dtype=torch.float64,
+        )
     if len(irrep_dims) == 1:
         return _full_pullback_group_direction(
             grad_phi,
@@ -1187,6 +1202,57 @@ def _generator_block_index(
 # series direction ``pullback_group_direction``).
 
 
+# Off-strip Psi inversion gate (audit 2026-10-07, F21): eigenvector condition, eigen-residual and the smallest
+# |Psi(lambda_i - lambda_j)| of an accepted row.
+_SPECTRAL_PSI_COND_MAX = 1e8
+_SPECTRAL_PSI_RESIDUAL_MAX = 1e-10
+_SPECTRAL_PSI_MIN = 1e-8
+
+
+def _spectral_psi_inverse(
+    A:    torch.Tensor,                                  # (n, d, d) float64 chart block
+    Y:    torch.Tensor,                                  # (n, d, d) float64 right-hand side
+    left: bool,                                          # True: Psi_L(ad_A), False: Psi_R(ad_A)
+) -> tuple[torch.Tensor, torch.Tensor]:                  # (n, d, d) Z, (n,) ok
+    r"""Solve :math:`\Psi(\mathrm{ad}_A)(Z) = Y` in the eigenbasis of :math:`A`, valid off the principal strip.
+
+    With :math:`A = V\Lambda V^{-1}`, :math:`\mathrm{ad}_A(VE_{ij}V^{-1}) = (\lambda_i - \lambda_j)VE_{ij}V^{-1}`, so
+
+    .. math::
+        Z = V\bigl[(V^{-1}YV)_{ij} / \Psi(\lambda_i - \lambda_j)\bigr]V^{-1},\qquad
+        \Psi_R(z) = e^{z/2}\operatorname{sinhc}(z/2),\quad \Psi_L(z) = e^{-z/2}\operatorname{sinhc}(z/2).
+
+    This is exact whenever :math:`\Psi(\mathrm{ad}_A)` is invertible, i.e. no eigenvalue difference lies in
+    :math:`2\pi i\mathbb Z\setminus\{0\}`, whether or not :math:`A` is on the principal strip. A row is accepted
+    only if its eigenvectors are well conditioned, its eigen-residual is small, every :math:`|\Psi|` is bounded
+    away from zero, and :math:`Z` is real to roundoff; otherwise it is rejected with a zero solution.
+    """
+    lam, V = torch.linalg.eig(A)                                          # (n, d), (n, d, d) complex
+    V_inv, info = torch.linalg.inv_ex(V)
+    u = 0.5 * (lam[..., :, None] - lam[..., None, :])                     # (n, d, d)
+    psi = (torch.exp(-u) if left else torch.exp(u)) * _sinhc(u)
+    psi_abs = psi.abs()
+    safe_psi = torch.where(psi_abs > 0, psi, torch.ones_like(psi))
+    Z_complex = V @ ((V_inv @ Y.to(V.dtype) @ V) / safe_psi) @ V_inv
+    Z = Z_complex.real
+    norm = lambda t: torch.linalg.matrix_norm(t, dim=(-2, -1))           # noqa: E731
+    kappa = norm(V) * norm(V_inv)
+    residual = norm(A.to(V.dtype) @ V - V * lam[..., None, :]) / (norm(A).clamp_min(1e-300) * norm(V))
+    imaginary = norm(Z_complex.imag) / norm(Z).clamp_min(1e-300)
+    ok = ((info == 0) & (kappa < _SPECTRAL_PSI_COND_MAX) & (residual < _SPECTRAL_PSI_RESIDUAL_MAX)
+          & (psi_abs.amin(dim=(-2, -1)) > _SPECTRAL_PSI_MIN) & (imaginary < 1e-8)
+          & torch.isfinite(Z).all(dim=-1).all(dim=-1))
+    return torch.where(ok[..., None, None], Z, torch.zeros_like(Z)), ok
+
+
+def _offstrip_rows(certified: torch.Tensor) -> Optional[torch.Tensor]:
+    r"""Flat indices of the blocks that failed the strip certificate, or None (one host read)."""
+    flat = (~certified).reshape(-1)
+    if not bool(flat.any()):
+        return None
+    return flat.nonzero(as_tuple=True)[0]
+
+
 def uspace_ambient_gradient(
     X: torch.Tensor,                                     # (..., d, d) chart block
     M: torch.Tensor,                                     # (..., d, d) chart covector block
@@ -1194,6 +1260,7 @@ def uspace_ambient_gradient(
     *,
     U:         Optional[torch.Tensor] = None,            # (..., d, d) exp(X), if already formed
     certified: Optional[torch.Tensor] = None,            # (...) strip certificate, if already formed
+    offstrip:  bool = False,                             # solve off-strip blocks in the eigenbasis
 ) -> tuple[torch.Tensor, torch.Tensor]:                  # (..., d, d) G_bar, (...) ok
     r"""Recover the ambient covector :math:`\bar G = \nabla_U L` from the chart covector.
 
@@ -1216,7 +1283,21 @@ def uspace_ambient_gradient(
         certified, _ = principal_strip_certificate(X)
     _, G_bar, failed = logm_frechet_pair(U.transpose(-1, -2), M)
     ok = certified & ~failed & torch.isfinite(G_bar).all(dim=-1).all(dim=-1)
-    return torch.where(ok[..., None, None], G_bar, torch.zeros_like(G_bar)), ok
+    G_bar = torch.where(ok[..., None, None], G_bar, torch.zeros_like(G_bar))
+    # Off the strip the logarithm route does not apply, but Psi_L(ad_{X^T}) is still invertible: solve it in
+    # the eigenbasis, then G_bar = U^{-T} Z (audit 2026-10-07, F21).
+    rows = _offstrip_rows(certified) if offstrip else None
+    if rows is not None:
+        d = X.shape[-1]
+        X_f, M_f, U_f = (t.reshape(-1, d, d)[rows].to(torch.float64) for t in (X, M, U))
+        Z, z_ok = _spectral_psi_inverse(X_f.transpose(-1, -2), M_f, left=True)
+        G_off = torch.linalg.solve(U_f.transpose(-1, -2), Z)
+        z_ok = z_ok & torch.isfinite(G_off).all(dim=-1).all(dim=-1)
+        G_flat, ok_flat = G_bar.reshape(-1, d, d).clone(), ok.reshape(-1).clone()
+        G_flat[rows] = torch.where(z_ok[:, None, None], G_off, torch.zeros_like(G_off)).to(G_flat.dtype)
+        ok_flat[rows] = z_ok
+        G_bar, ok = G_flat.reshape(G_bar.shape), ok_flat.reshape(ok.shape)
+    return G_bar, ok
 
 
 def uspace_spatial_covector(
@@ -1245,6 +1326,7 @@ def uspace_chart_velocity(
     *,
     U:         Optional[torch.Tensor] = None,
     certified: Optional[torch.Tensor] = None,
+    offstrip:  bool = False,                             # solve off-strip blocks in the eigenbasis
 ) -> tuple[torch.Tensor, torch.Tensor]:                  # (..., d, d) v, (...) ok
     r"""Chart velocity :math:`v = \Psi_R(\mathrm{ad}_X)^{-1}(W) = L_{\log}(U, W U)`.
 
@@ -1258,7 +1340,17 @@ def uspace_chart_velocity(
         certified, _ = principal_strip_certificate(X)
     _, v, failed = logm_frechet_pair(U, W @ U)
     ok = certified & ~failed & torch.isfinite(v).all(dim=-1).all(dim=-1)
-    return torch.where(ok[..., None, None], v, torch.zeros_like(v)), ok
+    v = torch.where(ok[..., None, None], v, torch.zeros_like(v))
+    rows = _offstrip_rows(certified) if offstrip else None
+    if rows is not None:                                 # off-strip: v = Psi_R(ad_X)^{-1} W in the eigenbasis
+        d = X.shape[-1]
+        X_f, W_f = (t.reshape(-1, d, d)[rows].to(torch.float64) for t in (X, W))
+        v_off, v_ok = _spectral_psi_inverse(X_f, W_f, left=False)
+        v_flat, ok_flat = v.reshape(-1, d, d).clone(), ok.reshape(-1).clone()
+        v_flat[rows] = v_off.to(v_flat.dtype)
+        ok_flat[rows] = v_ok
+        v, ok = v_flat.reshape(v.shape), ok_flat.reshape(ok.shape)
+    return v, ok
 
 
 def uspace_pullback_body_direction(

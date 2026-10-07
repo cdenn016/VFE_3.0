@@ -219,11 +219,14 @@ def _exact_tile(
         c_{ij} = \tfrac12\|z_{ij}\|^2 + \sum_k\log(L_{ij})_{kk} = -\log N(b_j; a_i, W_{ij}) - \tfrac r2\log 2\pi,
         \qquad \ell_{ij} = \log\pi_{ij} - c_{ij},
 
-    and with the tile's row maximum :math:`t_i = \max_j\ell_{ij}` (detached) the sums
-    :math:`\sum_je^{\ell_{ij} - t_i}(1, r_{ij}, W_{ij}^{-1}, r_{ij}r_{ij}^\top)` over the tile's sources. The caller
-    combines tiles by an online log-sum-exp outside any checkpoint, so a checkpointed tile saves only its input
-    slices. A masked pair (:math:`\log\pi_{ij} = -\infty`) contributes exactly 0; its :math:`W_{ij}` is still positive
-    definite. Returns ``(cost, t, s, U, Lam, Q, failed)``.
+    and with the tile's row maximum :math:`t_i = \max_j\ell_{ij}` (detached) and :math:`e_{ij} = e^{\ell_{ij} - t_i}`
+    the tile's weight :math:`s_i = \sum_je_{ij}`, weighted mean :math:`\bar r_i = \sum_je_{ij}r_{ij}/s_i`, information
+    sum :math:`\sum_je_{ij}W_{ij}^{-1}` and centered spread
+    :math:`M_{2,i} = \sum_je_{ij}(r_{ij} - \bar r_i)(r_{ij} - \bar r_i)^\top` (two-pass, so a common offset of the
+    :math:`r_{ij}` does not cancel in finite precision). The caller combines tiles by an online log-sum-exp with Chan's
+    pairwise update outside any checkpoint, so a checkpointed tile saves only its input slices. A masked pair
+    (:math:`\log\pi_{ij} = -\infty`) contributes exactly 0; its :math:`W_{ij}` is still positive definite. A row with no
+    live pair has :math:`s_i = 0` and mean 0. Returns ``(cost, t, s, mean, Lam, M2, failed)``.
     """
     delta = b.unsqueeze(-3) - a.unsqueeze(-2)                                   # (..., Iq, Jk, r) b_j - a_i
     W = A.unsqueeze(-3) + B.unsqueeze(-4)                                       # (..., Iq, Jk, r, r), exactly symmetric
@@ -237,11 +240,13 @@ def _exact_tile(
     shift = torch.where(torch.isfinite(t), t, torch.zeros_like(t))              # a fully masked tile row: 0
     e = torch.exp(logits - shift.unsqueeze(-1))                                 # (..., Iq, Jk), 0 on masked pairs
     s = e.sum(dim=-1)
-    U = torch.einsum("...ij,...ijr->...ir", e, r_ij)
+    s_safe = torch.where(s > 0, s, torch.ones_like(s))                          # a fully masked row: mean 0
+    mean = torch.einsum("...ij,...ijr->...ir", e, r_ij) / s_safe.unsqueeze(-1)  # (..., Iq, r)
     Lam = torch.einsum("...ij,...ijrs->...irs", e, W_inv)
-    Q = torch.einsum("...ij,...ijr,...ijs->...irs", e, r_ij, r_ij)
+    centered = r_ij - mean.unsqueeze(-2)                                        # (..., Iq, Jk, r)
+    M2 = torch.einsum("...ij,...ijr,...ijs->...irs", e, centered, centered)
     failed = (info != 0).any() | ~torch.isfinite(cost).all()
-    return cost, t, s, U, Lam, Q, failed
+    return cost, t, s, mean, Lam, M2, failed
 
 
 def exact_record_posterior(
@@ -308,9 +313,11 @@ def exact_record_posterior(
         rows, U_rows, Lam_rows, Q_rows, s_rows, flags = [], [], [], [], [], []
         for i in range(0, I, q_step):
             n_i = min(q_step, I - i)
-            # Online log-sum-exp over the source tiles: the accumulators hold sum_j exp(l_ij - m_i)(1, r, W^-1, r r^T)
-            # at the running row maximum m_i. The scales are detached (the moments do not depend on m), so the
-            # products below save only the (..., n_i) scales for backward, never an accumulator.
+            # Online log-sum-exp over the source tiles with Chan's pairwise update. At the running row maximum m_i
+            # the accumulators hold the weight s = sum_j exp(l_ij - m_i), the weighted mean U of r_ij, the weighted
+            # sum Lam of W^-1, and the CENTERED spread Q = sum_j exp(l_ij - m_i)(r_ij - U)(r_ij - U)^T, so R never
+            # forms as a difference of large second moments (audit 2026-10-07, F01/F58). The scales are detached
+            # (the moments do not depend on m).
             m = torch.full((*batch, n_i), -math.inf, dtype=dtype, device=a.device)
             s = torch.zeros((*batch, n_i), dtype=dtype, device=a.device)
             U = torch.zeros((*batch, n_i, r), dtype=dtype, device=a.device)
@@ -327,14 +334,19 @@ def exact_record_posterior(
                     out = checkpoint(_exact_tile, *args, use_reentrant=False, preserve_rng_state=False)
                 else:
                     out = _exact_tile(*args)
-                cost, t, s_t, U_t, Lam_t, Q_t, failed = out
+                cost, t, s_t, U_t, Lam_t, Q_t, failed = out                   # U_t tile mean, Q_t centered spread
                 m_new = torch.maximum(m, t)
                 shift = torch.where(torch.isfinite(m_new), m_new, torch.zeros_like(m_new))
                 old, new = torch.exp(m - shift), torch.exp(t - shift)          # (..., n_i), 0 where -inf
-                s = old * s + new * s_t
-                U = old.unsqueeze(-1) * U + new.unsqueeze(-1) * U_t
+                S_a, S_b = old * s, new * s_t
+                S = S_a + S_b
+                S_safe = torch.where(S > 0, S, torch.ones_like(S))
+                delta = U_t - U                                                # (..., n_i, r)
+                U = U + delta * (S_b / S_safe).unsqueeze(-1)
                 Lam = old[..., None, None] * Lam + new[..., None, None] * Lam_t
-                Q = old[..., None, None] * Q + new[..., None, None] * Q_t
+                Q = (old[..., None, None] * Q + new[..., None, None] * Q_t
+                     + (S_a * S_b / S_safe)[..., None, None] * (delta.unsqueeze(-1) * delta.unsqueeze(-2)))
+                s = S
                 m = m_new
                 columns.append(cost)
                 flags.append(failed)
@@ -345,10 +357,9 @@ def exact_record_posterior(
             Q_rows.append(Q)
         cost = torch.cat(rows, dim=-2)                                          # (..., I, J)
         s = torch.cat(s_rows, dim=-1)                                           # (..., I)
-        u = torch.cat(U_rows, dim=-2) / s.unsqueeze(-1)                         # (..., I, r)
+        u = torch.cat(U_rows, dim=-2)                                           # (..., I, r) sum_j w_ij r_ij
         Lambda_bar = _symmetrize(torch.cat(Lam_rows, dim=-3) / s[..., None, None])
-        second = torch.cat(Q_rows, dim=-3) / s[..., None, None]                 # sum_j w_ij r_ij r_ij^T
-        R = _symmetrize(second - u.unsqueeze(-1) * u.unsqueeze(-2))
+        R = _symmetrize(torch.cat(Q_rows, dim=-3) / s[..., None, None])         # sum_j w_ij (r_ij - u_i)(r_ij - u_i)^T
         weights = torch.softmax(lp - cost, dim=-1)                              # (..., I, J)
         failed = torch.stack(flags).any()
     if check:
@@ -554,19 +565,28 @@ def _label_staleness(
     :math:`(S_h\xi_i^+, S_hC_i^+S_h^\top)`, with
     :math:`S_hC^+S_h^\top = S_hCS_h^\top - \sum_gY_{hg}M^gY_{hg}^\top`, :math:`Y_{hg} = S_h\mathsf K^g`: one further
     coordinate-ascent label step. Near 0 means a second mean-field step would not move the labels. Computed in
-    float64; a receiver whose posterior query covariance does not factor reads NaN.
+    float64; a receiver whose posterior query covariance does not factor or whose posterior mean is not finite reads
+    NaN, and every receiver of a head with an utterance covariance that does not factor reads NaN. These inputs are
+    replaced by placeholders before the KL, so a float32 attempt that failed (and that the caller recomputes in
+    float64) never raises here.
     """
     f64 = torch.float64
     Y = torch.einsum("hsk,...ngkt->...nhgst", S.to(f64), gains.to(f64))        # (..., N, H, H, d, d) S_h K^g
     A_plus = _symmetrize(V_Q.to(f64) - torch.einsum("...nhgst,...ngtu,...nhgvu->...nhsv", Y, M.to(f64), Y))
     a_plus = torch.einsum("hsk,...nk->...nhs", S.to(f64), xi_plus.to(f64))     # (..., N, H, d)
-    bad = torch.linalg.cholesky_ex(A_plus)[1] != 0                              # (..., N, H)
     eye = torch.eye(A_plus.shape[-1], dtype=f64, device=A_plus.device)
+    bad = ((torch.linalg.cholesky_ex(torch.nan_to_num(A_plus))[1] != 0)
+           | ~torch.isfinite(A_plus).all(dim=(-2, -1)) | ~torch.isfinite(a_plus).all(dim=-1))   # (..., N, H)
     A_plus = torch.where(bad[..., None, None], eye, A_plus)                     # (..., N, H, d, d)
+    a_plus = torch.where(bad[..., None], torch.zeros((), dtype=f64, device=a_plus.device), a_plus)
+    B64 = B.to(f64)
+    bad_B = torch.linalg.cholesky_ex(B64)[1] != 0                               # (..., H, N)
+    B64 = torch.where(bad_B[..., None, None], eye, B64)
     cost = projected_gaussian_kl(a_plus, A_plus, b.to(f64).movedim(-3, -2),
-                                 B.to(f64).movedim(-4, -3))                     # (..., H, N, N)
+                                 B64.movedim(-4, -3))                           # (..., H, N, N)
     relabeled = torch.softmax(lp.to(f64) - cost, dim=-1)
     tv = 0.5 * (relabeled - weights.to(f64)).abs().sum(dim=-1)                  # (..., H, N)
+    tv = tv.masked_fill(bad_B.any(dim=-1, keepdim=True), math.nan)              # a failed utterance spoils its head
     return tv.movedim(-1, -2).masked_fill(bad, math.nan)                        # (..., N, H)
 
 
@@ -639,6 +659,15 @@ def minimal_agent_readout(
         if lp.dim() == 2:
             lp = lp.unsqueeze(-3)                                               # (1, N, N): one prior for every head
         lp = torch.broadcast_to(lp, (*lp.shape[:-3], H, N, N))
+        # A self-masking prior (causal_noself, causal_alibi_noself) keeps entry (0, 0) only so that row 0 is not
+        # all -inf. Under the minimal agent that entry would be a record of the receiver's own snapshot, so a
+        # receiver whose only admissible source is itself, under a prior that masks self elsewhere, receives no
+        # record: its head updates are zero (audit 2026-10-07, F29). Plain causal priors are unaffected.
+        with torch.no_grad():
+            admissible = torch.isfinite(lp)                                     # (..., H, N, N)
+            self_admissible = admissible.diagonal(dim1=-2, dim2=-1)             # (..., H, N)
+            no_record = (self_admissible & (admissible.sum(dim=-1) == 1)
+                         & (~self_admissible).any(dim=-1, keepdim=True))        # (..., H, N)
         weights: List[torch.Tensor] = []
         costs: List[torch.Tensor] = []
         fractions: List[torch.Tensor] = []
@@ -699,6 +728,14 @@ def minimal_agent_readout(
                 u, M, failed = information_step(a, A, labels.Lambda[..., h, :, :, :], labels.eta[..., h, :, :])
                 flags.append(failed)
                 return u, M
+        route_update = head_update
+
+        def head_update(h: int, a: torch.Tensor, A: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+            u, M_h = route_update(h, a, A)
+            skip = no_record[..., h, :]                                         # (..., N)
+            zero = torch.zeros((), dtype=u.dtype, device=u.device)
+            return torch.where(skip[..., None], zero, u), torch.where(skip[..., None, None], zero, M_h)
+
         xi_plus, gains, M, _ = sequential_head_assembly(xi, X0, S, head_update)
         weights_out = torch.stack(weights, dim=-3) if inference == "exact" else weights[0]   # (..., H, N, N)
         cost_out = torch.stack(costs, dim=-3) if inference == "exact" else costs[0]

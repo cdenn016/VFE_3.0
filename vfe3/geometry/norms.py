@@ -6,7 +6,7 @@ MahalanobisNorm rescales mu by the gauge-invariant Mahalanobis length:
 Since mu^T Sigma^-1 mu is invariant under mu->g mu, Sigma->g Sigma g^T, the scale is
 gauge-invariant and mu_norm transforms as a vector. Pure math, no parameters.
 
-``layernorm`` is an OPT-IN, NON-gauge-equivariant baseline: standard transformer LayerNorm
+``layernorm`` (the ``norm_type_block`` default) is a NON-gauge-equivariant baseline: standard transformer LayerNorm
 standardization of the mean over the belief dimension (see LayerNorm). With ``layernorm_affine=True``
 the builder returns the AffineLayerNorm variant, which adds a learned per-feature affine (gamma/beta)
 on top of the standardization -- a SANCTIONED learned-scalar exception (t5_bias / learnable_kappa

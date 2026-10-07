@@ -1,12 +1,13 @@
 r"""The full VFE_3.0 model: encode -> E-step inference -> decode -> cross-entropy.
 
-On the pure default path there are no neural layers (no nn.Linear/MLP/activation): the parameters are the
-PriorBank's prior tables, plus the model-owned learned tables their toggles create -- the default
-pos_phi='learned' positional table, and the default-OFF CG coupling
-and learnable T5-bias scalar. The E-step
-is unrolled into the training graph (the differentiable filtering kernel), so the CE
-loss backpropagates through inference to the encode/phi priors. Batching loops over
-the batch around the (unbatched) E-step; decode and CE are batched.
+The parameters are the PriorBank's prior tables, the learned comparison and content maps of each
+attention layer (4K^2 per layer on the kernel readout, 2K^2 + H on the minimal agent), the default linear decoder, the default coordinate block MLP
+(nn.Linear layers with a pointwise activation), the default pos_phi='learned' positional table, and
+the tables of opt-in toggles (CG coupling, T5 bias, LayerNorm affine). No nn.Linear module is
+built only with use_block_mlp=False or a prototype_agents / gaussian_template block MLP together
+with a prior-bank decoder. Each layer's attention is one readout step (projected_predictive) or
+n_e_steps unrolled receiver updates (projected_gradient), and the CE loss backpropagates through it
+to every table and map; encode, attention, decode and CE are batched.
 """
 
 import hashlib
@@ -15,7 +16,7 @@ import math
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import wraps
-from typing import Any, Callable, Mapping, Optional, Sequence, Tuple, Dict
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -388,7 +389,9 @@ class VFEModel(nn.Module):
                                 predictive_covariance_checkpoint=cfg.predictive_covariance_checkpoint,
                                 predictive_readout=cfg.predictive_readout,
                                 minimal_agent_inference=cfg.minimal_agent_inference,
-                                minimal_agent_channel_noise=cfg.minimal_agent_channel_noise)
+                                minimal_agent_channel_noise=cfg.minimal_agent_channel_noise,
+                                comparison_rope_base=(cfg.rope_base if cfg.pos_rotation == "rope"
+                                                      and cfg.rope_space == "comparison" else None))
             for layer_index in range(cfg.n_layers)
         ]
         self.relational_operators = layers[0]
@@ -736,8 +739,12 @@ class VFEModel(nn.Module):
         n:      int,                          # sequence length N (varies across calls)
         device: torch.device,
     ) -> Optional[torch.Tensor]:
-        r"""Cached gauge-RoPE rotation R(theta) for length n (None when pos_rotation='none')."""
-        if self.cfg.pos_rotation == "none":
+        r"""Cached gauge-RoPE rotation R(theta) for length n (None when pos_rotation='none').
+
+        Also None under ``rope_space='comparison'``: the rotation is then not folded into any frame but applied to
+        the projected routing moments inside :func:`vfe3.gradients.relational.relational_score`.
+        """
+        if self.cfg.pos_rotation == "none" or getattr(self.cfg, "rope_space", "frame") == "comparison":
             return None
         dtype = self.group.generator_dtype
         key = (n, device, dtype, self.cfg.pos_rotation, self.cfg.rope_base)
@@ -946,6 +953,50 @@ class VFEModel(nn.Module):
         the model moves across devices or dtypes.
         """
         return {key: getattr(self, key) for key in self._transport_state_keys}
+
+    @torch.no_grad()
+    def calibrate_prototype_templates(
+        self,
+        token_ids: torch.Tensor,                  # (B, N) integer token ids of one training batch
+        *,
+        pull:      float,                         # target initial pull p in (0, 1)
+        seed:      int,                           # seeds the template draw (a private CPU generator)
+    ) -> List[Dict[str, float]]:
+        r"""Initialize every prototype-agent block MLP from the working beliefs it receives, layer by layer.
+
+        Layer :math:`\ell` is calibrated on a forward through the already-calibrated layers :math:`< \ell`
+        (:meth:`PrototypeAgentBlockMLP.calibrate_templates`), in eval mode, with the global RNG streams restored
+        afterwards. Run once at a fresh start (``block_mlp_template_init='working_variance'``); it rewrites
+        ``nu`` and ``log_lambda`` in place, so it must not run on a resumed model.
+        """
+        from vfe3.model.block_mlp import PrototypeAgentBlockMLP
+
+        targets = [mlp for mlp in (self.block_mlps or []) if isinstance(mlp, PrototypeAgentBlockMLP)]
+        generator = torch.Generator().manual_seed(int(seed))
+        results: List[Dict[str, float]] = []
+        was_training = self.training
+        rng_devices = [token_ids.device] if token_ids.device.type == "cuda" else []
+        with torch.random.fork_rng(devices=rng_devices):
+            self.eval()
+            try:
+                for target in targets:
+                    recorded: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+                    original = target.forward_moments
+
+                    def recording(mu, sigma, *args, _original=original, _recorded=recorded, **kwargs):
+                        _recorded.setdefault("input", (mu.detach(), sigma.detach()))
+                        return _original(mu, sigma, *args, **kwargs)
+
+                    target.forward_moments = recording
+                    try:
+                        self.forward_beliefs(token_ids, return_logits=False)
+                    finally:
+                        del target.forward_moments
+                    mu, sigma = recorded["input"]
+                    results.append(target.calibrate_templates(mu, sigma, pull=pull, generator=generator))
+            finally:
+                self.train(was_training)
+        return results
 
     def forward_beliefs(
         self,
