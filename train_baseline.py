@@ -87,13 +87,16 @@ MAX_TOKENS: Optional[int] = None    # cap the training stream (smoke runs only)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 PER_TYPE_TABLE = "none"             # "none" | "block_read" (Table M2, per-type table of the frame table's size)
 # Everything in MATCHED_FIELDS is copied from the base run (K, H, L, context, batch, stride, 150,000 steps,
-# warmup, LR floor, clip, bf16, "highest" matmul precision, cadence, unigram decode prior). The base's
-# attention prior is the uniform causal one, with position carried by learned frames, so a copied prior
-# would leave the baseline with no positional signal at all (NoPE); ALiBi is the standard
-# zero-parameter choice and what the earlier 90.15 baseline used. For the strict prior copy use
-# {"beta_attention_prior": "causal"}. Weight decay stays at the baseline default 0.1 on every matrix and
-# table (the base run decays only the frames, 0.1, and the MLPs, 0.01) and is not swept.
-OVERRIDES: Dict[str, Any] = {"beta_attention_prior": "causal_alibi"}   # any BaselineConfig field
+# warmup, LR floor, clip, bf16, "highest" matmul precision, cadence, unigram decode prior), and a base with
+# pos_rotation="rope" also gives the baseline rotary query/key positions at the base's rope_base (the
+# VFE's comparison-space RoPE). A base whose position is carried by learned frames (pos_phi) has a uniform
+# causal prior and no RoPE, so the copy would leave the baseline with no positional signal at all (NoPE);
+# such a base gets ALiBi (POSITION_FALLBACK), the standard zero-parameter choice and what the earlier 90.15
+# baseline used. OVERRIDES set last and win, e.g. {"beta_attention_prior": "causal"} for the strict copy.
+# Weight decay stays at the baseline default 0.1 on every matrix and table (the base run decays only
+# the frames, 0.1, and the MLPs, 0.01) and is not swept.
+POSITION_FALLBACK: Dict[str, Any] = {"beta_attention_prior": "causal_alibi"}   # only for a base without RoPE
+OVERRIDES: Dict[str, Any] = {}      # any BaselineConfig field
 LABEL: Optional[str] = None         # stable run-folder label; None -> <dataset>_K<K>_baseline[_block_read]_s<seed>
 
 # The baseline's peak lr (6e-4) was set for a 30,000-step run; the budget here is five times longer, so
@@ -395,7 +398,10 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     logger = logging.getLogger("train_baseline")
     base = load_base_config(BASE)
-    cfg = BaselineConfig.matched_to(base, per_type_table=PER_TYPE_TABLE, **OVERRIDES)
+    fallback = {} if getattr(base, "pos_rotation", "none") == "rope" else dict(POSITION_FALLBACK)
+    cfg = BaselineConfig.matched_to(base, per_type_table=PER_TYPE_TABLE, **{**fallback, **OVERRIDES})
+    logger.info("baseline position: prior=%s, pos_rotation=%s (rope_base %g)",
+                cfg.beta_attention_prior, cfg.pos_rotation, cfg.rope_base)
     out_root = Path(OUT_ROOT)
     run_kwargs = dict(max_tokens=MAX_TOKENS, device=DEVICE, logger=logger)
     if CALIBRATE_WIDTHS:

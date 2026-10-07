@@ -16,13 +16,19 @@ Architecture. With token ids :math:`x_i`, width :math:`K`, :math:`H` heads of wi
     \tilde u_i = A_{x_i} u_i,\quad A_v = I + X_v = \bigoplus_{h=1}^{H} (I_d + X_{v,h}),
 
     \beta^h_{ij} = \operatorname{softmax}_j\Big(
-        \frac{(W_Q \tilde u_i)_h^\top (W_K \tilde u_j)_h}{\sqrt d} + B_{h,ij}\Big),\qquad
+        \frac{(R_i W_Q \tilde u_i)_h^\top (R_j W_K \tilde u_j)_h}{\sqrt d} + B_{h,ij}\Big),\qquad
     h_i \leftarrow h_i + W_O \bigoplus_h \sum_j \beta^h_{ij} (W_V \tilde u_j)_h,
 
     h_i \leftarrow h_i + W_2\, \mathrm{GELU}(W_1 \mathrm{LN}_2(h_i) + b_1) + b_2,
 
 with :math:`h^{(0)}_i = E_{x_i}` (untied token table), :math:`B` the VFE's own attention log-prior
-(:func:`vfe3.attention_prior.attention_log_prior`, causal ALiBi by default), exact (erf) GELU, no
+(:func:`vfe3.attention_prior.attention_log_prior`, causal ALiBi by default), :math:`R_i` the identity, or
+under ``pos_rotation='rope'`` the per-head rotary map :math:`R_i = \bigoplus_h R(i\theta)` of
+:func:`vfe3.geometry.rope.build_rope_rotation` (pairs :math:`(2k, 2k+1)` of each head rotate by
+:math:`i\,b^{-2k/d}`, base :math:`b` = ``rope_base``), so that
+:math:`(R_i q)^\top R_j k = q^\top R_{j-i} k` depends on position only through :math:`j - i`. These are
+the VFE's comparison-space RoPE frequencies (``rope_space='comparison'``), which rotate the projected
+query and key moments of each head by the same :math:`R_i`. Exact (erf) GELU, no
 dropout and bias-free attention maps. The per-type read map :math:`A_v` exists only with
 ``per_type_table='block_read'``; it is one ``(V, H, d, d)`` table shared by every layer, applied to the
 attention input, block-diagonal on the heads, so it has exactly the size of the VFE token-frame table
@@ -59,7 +65,8 @@ Parameter counts. Context processing (every attention, MLP and normalization par
 which is the VFE count :math:`L(4K^2 + 2eK^2 + eK + K) + 2K` plus :math:`4KL` (per-sublayer
 normalizations; the VFE shares one), and exactly the VFE count under ``norm_placement='post_shared'``.
 Per-type tables: :math:`2VK + V` (:math:`E`, :math:`W_{\rm out}`,
-:math:`b_{\rm out}`), plus :math:`VKd` with the read map. No positional parameters (ALiBi).
+:math:`b_{\rm out}`), plus :math:`VKd` with the read map. No positional parameters (ALiBi and RoPE
+are both parameter-free).
 """
 
 from __future__ import annotations
@@ -83,6 +90,7 @@ PER_TYPE_TABLES: Tuple[str, ...] = ("none", "block_read", "block_rw")
 NORM_PLACEMENTS: Tuple[str, ...] = ("pre", "post_shared")
 PER_TYPE_TABLE_INITS: Tuple[str, ...] = ("zero", "phi_like")
 ATTENTION_PRIORS: Tuple[str, ...] = ("causal_alibi", "causal")
+POS_ROTATIONS: Tuple[str, ...] = ("none", "rope")
 AMP_DTYPES: Tuple[Optional[str], ...] = (None, "bf16", "fp16")
 FP32_MATMUL_PRECISIONS: Tuple[Optional[str], ...] = (None, "highest", "high", "medium")
 DECODE_CE_CHECKPOINTS: Tuple[str, ...] = ("auto", "auto_aggregate", "always", "never")
@@ -112,7 +120,7 @@ _INT_FIELDS: Tuple[str, ...] = (
 )
 _FLOAT_FIELDS: Tuple[str, ...] = (
     "lr", "weight_decay", "adam_beta1", "adam_beta2", "adam_eps", "min_lr", "min_lr_frac",
-    "init_std", "layernorm_eps", "alibi_slope", "unigram_kappa", "per_type_table_init_scale",
+    "init_std", "layernorm_eps", "alibi_slope", "rope_base", "unigram_kappa", "per_type_table_init_scale",
 )
 _OPTIONAL_FLOAT_FIELDS: Tuple[str, ...] = ("grad_clip", "per_type_table_lr", "per_type_table_weight_decay")
 _BOOL_FIELDS: Tuple[str, ...] = (
@@ -189,6 +197,9 @@ class BaselineConfig:
     # Attention prior (the VFE's registry).
     beta_attention_prior:  str           = "causal_alibi"
     alibi_slope:           float         = 1.0
+    # "none" | "rope": rotary query/key positions per head (the VFE's comparison-space RoPE).
+    pos_rotation:          str           = "none"
+    rope_base:             float         = 100.0       # rope only: frequency base
     # Decode (the VFE linear decoder).
     decode_mode:           str           = "linear"
     decode_bias:           bool          = True
@@ -264,6 +275,10 @@ class BaselineConfig:
         if self.beta_attention_prior not in ATTENTION_PRIORS:
             raise ValueError(f"beta_attention_prior must be one of {ATTENTION_PRIORS} (a causal prior "
                              f"with a self key), got {self.beta_attention_prior!r}")
+        if self.pos_rotation not in POS_ROTATIONS:
+            raise ValueError(f"pos_rotation must be one of {POS_ROTATIONS}, got {self.pos_rotation!r}")
+        if not (math.isfinite(self.rope_base) and self.rope_base > 1.0):
+            raise ValueError(f"rope_base must be a finite value > 1, got {self.rope_base!r}")
         if self.decode_mode != "linear":
             raise ValueError(f"the baseline decodes linearly; decode_mode must be 'linear', got {self.decode_mode!r}")
         if self.decode_ce_checkpoint not in DECODE_CE_CHECKPOINTS:
@@ -356,6 +371,8 @@ class BaselineConfig:
             out["eval_stride"] = "validation and test use disjoint max_seq_len windows"
         if not self.decode_unigram_prior:
             out["unigram_kappa"] = "decode_unigram_prior=False adds no unigram prior"
+        if self.pos_rotation == "none":
+            out["rope_base"] = "only read by pos_rotation='rope'"
         return out
 
     # -- matched arm ---------------------------------------------------------------------------
@@ -375,7 +392,10 @@ class BaselineConfig:
         :math:`d = K/H`, the VFE block size), depth :math:`L`, context, batch, evaluation stride, step
         budget, warmup and learning-rate floors, gradient clip and accumulation, precision, seed,
         cadence, the attention log-prior and its slope, and the unigram decode prior
-        (:data:`MATCHED_FIELDS`). The MLP width is the base's ``block_mlp_expansion`` times :math:`K`
+        (:data:`MATCHED_FIELDS`). A base with ``pos_rotation='rope'`` gives the arm rotary query/key
+        positions at the base's ``rope_base``; for ``rope_space='comparison'`` this is the rotation the base
+        applies to its projected routing moments, while frame-space RoPE (absolute, folded into the frame)
+        has no exact dense counterpart and is matched by the same relative rotation. The MLP width is the base's ``block_mlp_expansion`` times :math:`K`
         (the template router's template count :math:`eK` when the base uses one). The decode is the
         linear decoder with bias; a base with a Gaussian decode keeps its unigram prior. The per-type
         read map, when requested, has the base's token-frame size :math:`V K d`, and its ``phi_like``
@@ -413,6 +433,8 @@ class BaselineConfig:
         derived: Dict[str, Any] = {name: values[name] for name in MATCHED_FIELDS}
         derived["mlp_expansion"] = int(values["block_mlp_expansion"])
         derived["decode_bias"] = (bool(values["decode_bias"]) if values["decode_mode"] == "linear" else True)
+        derived["pos_rotation"] = "rope" if values.get("pos_rotation") == "rope" else "none"
+        derived["rope_base"] = float(values.get("rope_base", 100.0))
         derived["per_type_table"] = per_type_table
         phi_scale = values.get("phi_scale")
         if isinstance(phi_scale, (int, float)) and not isinstance(phi_scale, bool) and phi_scale > 0:
@@ -631,6 +653,7 @@ class BaselineAttention(nn.Module):
         self,
         u:     torch.Tensor,                 # (B, N, K) read attention input
         prior: torch.Tensor,                 # (H, N, N) fp32 log-prior (-inf off the causal support)
+        rope:  Optional[torch.Tensor] = None,  # (N, d, d) per-head rotary map R_i, or None
 
         *,
         weights_out: Optional[List[torch.Tensor]] = None,
@@ -639,6 +662,10 @@ class BaselineAttention(nn.Module):
         H, d = self.n_heads, self.d_head
         q = (u @ self.w_q.transpose(0, 1)).view(B, N, H, d).transpose(1, 2)                # (B, H, N, d)
         k = (u @ self.w_k.transpose(0, 1)).view(B, N, H, d).transpose(1, 2)                # (B, H, N, d)
+        if rope is not None:
+            # q_i -> R_i q_i, k_j -> R_j k_j, so q_i^T k_j -> q_i^T R_{j-i} k_j.
+            q = torch.einsum("nst,bhnt->bhns", rope.to(q.dtype), q)                        # (B, H, N, d)
+            k = torch.einsum("nst,bhnt->bhns", rope.to(k.dtype), k)                        # (B, H, N, d)
         v = (u @ self.w_v.transpose(0, 1)).view(B, N, H, d).transpose(1, 2)                # (B, H, N, d)
         scores = (q @ k.transpose(-1, -2)).float() * (1.0 / math.sqrt(d)) + prior          # (B, H, N, N) fp32
         beta = torch.softmax(scores, dim=-1)                                                # (B, H, N, N) fp32
@@ -705,11 +732,12 @@ class BaselineBlock(nn.Module):
         *,
         weights_out: Optional[List[torch.Tensor]] = None,
         shared_norm: Optional[nn.LayerNorm] = None,
+        rope:        Optional[torch.Tensor] = None,  # (N, d, d) per-head rotary map, or None
     ) -> torch.Tensor:                       # (B, N, K)
         u = _fp32_layer_norm(self.ln1, h) if self.pre_ln else h                             # (B, N, K)
         if read is not None:
             u = self._apply_blocks(read, u, self.read_is_increment)                         # (B, N, K)
-        a = self.attn(u, prior, weights_out=weights_out)                                    # (B, N, K)
+        a = self.attn(u, prior, rope, weights_out=weights_out)                              # (B, N, K)
         if write is not None:
             a = self._apply_blocks(write, a, False)                                         # (B, N, K)
         if self.pre_ln:
@@ -804,6 +832,20 @@ class BaselineTransformer(nn.Module):
             self._log_prior_cache[key] = cached
         return cached
 
+    def _rope_rotation(self, n: int, device: torch.device) -> Optional[torch.Tensor]:
+        r"""The ``(N, d, d)`` fp32 per-head rotary map :math:`R_i` under ``pos_rotation='rope'``, else None."""
+        if self.cfg.pos_rotation != "rope":
+            return None
+        from vfe3.geometry.rope import build_rope_rotation
+
+        key = ("rope", self.cfg.rope_base, int(n), str(device), self.cfg.d_head)
+        cached = self._log_prior_cache.get(key)
+        if cached is None:
+            cached = build_rope_rotation(torch.arange(int(n), device=device), [self.cfg.d_head],
+                                         base=self.cfg.rope_base, device=device, dtype=torch.float32)
+            self._log_prior_cache[key] = cached
+        return cached
+
     def hidden(
         self,
         token_ids: torch.Tensor,             # (B, N) token ids
@@ -816,6 +858,7 @@ class BaselineTransformer(nn.Module):
             raise ValueError(f"token_ids must be (B, N), got {tuple(token_ids.shape)}")
         device = token_ids.device
         prior = self._attention_log_prior(token_ids.shape[1], device)                      # (H, N, N)
+        rope = self._rope_rotation(token_ids.shape[1], device)                              # (N, d, d) or None
         h = self.tok_embed[token_ids]                                                       # (B, N, K)
         read, write = None, None
         if self.type_table is not None:
@@ -828,7 +871,8 @@ class BaselineTransformer(nn.Module):
                 read = X
         with self._amp_context(device):
             for block in self.blocks:
-                h = block(h, prior, read, write, weights_out=weights_out, shared_norm=self.shared_norm)
+                h = block(h, prior, read, write, weights_out=weights_out, shared_norm=self.shared_norm,
+                          rope=rope)
         if self.final_norm is None:
             return h.float()                                                                # (B, N, K) fp32
         return _fp32_layer_norm(self.final_norm, h)                                         # (B, N, K) fp32
