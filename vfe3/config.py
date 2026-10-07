@@ -77,7 +77,7 @@ _apply_config_notice_filter()
 _VALID_GAUGE_TRANSPORT     = ("on", "off", "frozen")
 # Supported structure groups on the projected routes: block_glk, and so_n (with group_n and
 # irrep_spec, one equal irrep block per head). The others are retired.
-_SUPPORTED_GAUGE_GROUPS    = ("block_glk", "so_n")
+_SUPPORTED_GAUGE_GROUPS    = ("block_glk", "so_n", "block_so", "block_co")
 _RETIRED_GAUGE_GROUPS      = frozenset({"glk", "tied_block_glk", "so_k", "sp", "sp_n"})
 # Decoders decode_coordinates='reference' admits: linear reads xi = U^{-1} mu; the full Gaussian-KL
 # kernel reads (xi, C); the diagonal Gaussian-KL kernel reads (xi, diag C), exact up to a per-position
@@ -237,8 +237,10 @@ class VFE3Config:
 
     # Structure group of the flat phi-cocycle Omega_ij = exp(phi_i) exp(-phi_j). block_glk: one
     # independent GL(d_head) frame per head. so_n: one shared SO(group_n) element acting through
-    # the irrep blocks of irrep_spec, one block per head (blocks may differ in size).
-    gauge_group:               str   = "block_glk"   # "block_glk" | "so_n"
+    # the irrep blocks of irrep_spec, one block per head (blocks may differ in size). block_so /
+    # block_co: an independent SO(d_head) / CO(d_head) = R+ x SO(d_head) element per head (untied
+    # rotations, and rotations with a per-head positive gain).
+    gauge_group:               str   = "block_glk"   # "block_glk" | "so_n" | "block_so" | "block_co"
 
     # Frame tying across heads. "per_head": an independent group element per head block;
     # "shared": one element acting on every head. None resolves to the group's native tying

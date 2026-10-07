@@ -21,7 +21,9 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
-from vfe3.geometry.generators import generate_block_local, generate_glk_multihead, generate_son
+from vfe3.geometry.generators import (
+    generate_block_local, generate_glk_multihead, generate_son, local_basis_co, local_basis_so,
+)
 from vfe3.geometry.irreps import DEFAULT_IRREP_BASIS, direct_sum_generators
 
 
@@ -661,6 +663,60 @@ def _build_block_local(
         tying="per_head",
         block_local_basis=local,
     )
+
+
+@register_group(
+    "block_so",
+    invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
+    traits=GroupTraits(min_head_dim=2),
+)
+def _build_block_so(
+    K:       int,
+    n_heads: int,
+
+    *,
+    dtype:   torch.dtype                 = torch.float32,
+    device:  'torch.device | str | None' = None,
+) -> GaugeGroup:
+    r"""Untied rotations SO(d)^H: an independent SO(d_head) element on each head block.
+
+    Generators :math:`(E_{ij}-E_{ji})/\sqrt2` (i < j) per head, head-major, Frobenius-orthonormal,
+    n_gen = H d(d-1)/2. Compact with det = 1 per head: the "rotations only" rung below
+    ``block_co`` and ``block_glk``. The same group as untied ``so_n`` with ``[("l1", H)]``
+    (``group_n = d_head``) in a basis scaled by :math:`1/\sqrt2`, with equal-head layout
+    validation and RoPE inside the group (pair rotations lie in each head's SO(d)).
+    """
+    if K % n_heads != 0:
+        raise ValueError(f"K={K} must be divisible by n_heads={n_heads}")
+    return _build_block_local("block_so", K, n_heads, local_basis_so(K // n_heads), skew=True,
+                              dtype=dtype, device=device)
+
+
+@register_group(
+    "block_co",
+    invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
+    traits=GroupTraits(),
+)
+def _build_block_co(
+    K:       int,
+    n_heads: int,
+
+    *,
+    dtype:   torch.dtype                 = torch.float32,
+    device:  'torch.device | str | None' = None,
+) -> GaugeGroup:
+    r"""Conformal rotations CO(d)^H = (R+ x SO(d))^H: on each head a positive scale times a rotation.
+
+    Generators: the ``block_so`` basis, then :math:`I_d/\sqrt{d}`, per head (head-major,
+    Frobenius-orthonormal, n_gen = H (d(d-1)/2 + 1)). Every head frame is :math:`\lambda R` with
+    :math:`\lambda>0`, :math:`R\in SO(d)`, so cond(U_h) = 1 although the group is non-compact; it
+    keeps angles and eigenvalue ratios and adds one per-token, per-head gain. exp is surjective onto
+    the identity component, which is the whole group.
+    """
+    if K % n_heads != 0:
+        raise ValueError(f"K={K} must be divisible by n_heads={n_heads}")
+    return _build_block_local("block_co", K, n_heads, local_basis_co(K // n_heads), skew=False,
+                              dtype=dtype, device=device)
 
 
 def generator_fingerprint(
