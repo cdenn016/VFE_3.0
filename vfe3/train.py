@@ -1359,9 +1359,12 @@ _VAL_LATENT_DIAG_KEYS = tuple("val_relational_latent_" + key for key in (
 # Minimal-agent readout (predictive_readout='minimal_agent' only; vfe3.model.minimal_agent): the head-mean gain
 # fraction tr(A Lambda_bar)/d (mean field tr(A M)/d at the input moments), the head-mean channel noise n_h and the
 # head-max coupling ||S_h C S_g^T||_F / (||S_h C S_h^T||_F ||S_g C S_g^T||_F)^{1/2} at the input moments (0: ADF is
-# exact).
+# exact), the head-mean mean-field label staleness (TV of one relabeling at the posterior; NaN under 'exact') and the
+# covariance contraction tr C^+ / tr C and the head-mean exact spread share tr(A R) / tr(A Lambda_bar) (NaN under
+# 'mean_field').
 _VAL_MINIMAL_AGENT_DIAG_KEYS = tuple("val_relational_minimal_agent_" + key for key in (
-    "gain_fraction", "channel_noise", "head_coupling"))
+    "gain_fraction", "channel_noise", "head_coupling", "label_staleness", "covariance_contraction",
+    "spread_share"))
 
 
 # =============================================================================
@@ -1424,6 +1427,21 @@ ATTENTION_STATS_FIELDS: Tuple[str, ...] = (
 ROUTING_HOLONOMY_FIELDS: Tuple[str, ...] = (
     "step", "layer", "head", "path_mass", "log_defect_mean", "log_defect_rms",
     "prior_log_defect_mean", "prior_log_defect_rms", "n_rows")
+# Minimal-agent readout per (layer, head) (predictive_readout='minimal_agent'; vfe3.model.minimal_agent), means over
+# the fixed validation windows: gain fraction, channel noise n_h, head coupling, mean-field label staleness (TV of one
+# relabeling at the posterior; NaN under 'exact'), the layer's covariance contraction tr C^+ / tr C and the exact
+# spread share tr(A R) / tr(A Lambda_bar) (the part of the removed variance the mean field drops; NaN under the mean field).
+MINIMAL_AGENT_HEAD_FIELDS: Tuple[str, ...] = (
+    "step", "layer", "head", "gain_fraction", "channel_noise", "head_coupling", "label_staleness",
+    "covariance_contraction", "spread_share")
+_MINIMAL_AGENT_HEAD_CAPTURE = tuple("relational_minimal_agent_" + key for key in MINIMAL_AGENT_HEAD_FIELDS[3:])
+# Prototype-agent block MLP per layer (block_mlp_mode='prototype_agents'), over the tokens of the fixed validation
+# windows: effective templates in use exp(H(mean_t w_t)), the token-mean weight entropy, the fraction of templates
+# whose mean weight is below 1/(10 M), log lambda quantiles over all template coordinates, H(pi) and the gain
+# fraction (share of the working variance the block removes).
+PROTOTYPE_TEMPLATE_FIELDS: Tuple[str, ...] = (
+    "step", "layer", "effective_templates", "weight_entropy", "dead_fraction", "log_lambda_min",
+    "log_lambda_median", "log_lambda_max", "prior_entropy", "gain_fraction", "n_tokens")
 
 # S1 panel D numerical-event counters (GL(K)_attention_v2 fig:placeholder_numerics, 2026-09-28).
 # Every count is an integer with its denominator beside it. NUMERICS_EVAL_COLUMNS are measured at
@@ -2013,8 +2031,14 @@ def _residual_and_attention_rows(
     *,
     counters_out: Optional[Dict[str, Any]] = None,
     holonomy_out: Optional[Dict[Any, Any]] = None,
+    features_out: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Dict[str, float]], List[Dict[str, float]]]:
     r"""Per-layer residual-ratio quantiles and per-head attention statistics on fixed windows.
+
+    ``features_out``: when a dict is given, the minimal-agent captures are summed per (layer, head) under
+    ``"minimal_agent"`` and, for ``prototype_agents`` block MLPs, the template weights and removed variance of the
+    block inputs are summed per layer under ``"prototype"`` (the block's ``forward_moments`` is wrapped on the
+    instance for this pass only), for :func:`_feature_rows`.
 
     ``holonomy_out``: when a dict is given, per (layer, head) the path-weighted triangle-defect sums
     of :func:`vfe3.metrics.routing_triangle_defect_sums` for the router and for its prior are
@@ -2055,12 +2079,15 @@ def _residual_and_attention_rows(
     sums: Dict[Tuple[int, int], List[float]] = {}          # (layer, head) -> [H_norm, dist, self, overlap, n]
     modes = [(module, module.training) for module in model.modules()]
     model.eval()
+    wrapped = _wrap_prototype_blocks(model, features_out) if features_out is not None else []
     try:
         for chunk in windows.split(max(1, DIAGNOSTIC_CHUNK_WINDOWS)):
             ids = chunk.to(device)                                              # (B, N)
             capture: dict = {"diagnostic": {}}
             model.forward_beliefs(ids, capture=capture)
             diagnostic = capture["diagnostic"]
+            if features_out is not None:
+                _accumulate_minimal_agent(features_out, diagnostic)
             if counters_out is not None and "error" not in counters_out:
                 try:
                     cap_counts, factorization_counts = _capture_numerics_counts(
@@ -2141,6 +2168,8 @@ def _residual_and_attention_rows(
     finally:
         for module, was_training in modes:
             module.training = was_training
+        for mlp in wrapped:
+            del mlp.forward_moments                                            # back to the class method
     nan = float("nan")
     residual_rows: List[Dict[str, float]] = []
     for layer in sorted(ratios):
@@ -2163,6 +2192,95 @@ def _residual_and_attention_rows(
             "n_rows": int(count),
         })
     return residual_rows, attention_rows
+
+
+def _wrap_prototype_blocks(
+    model:        VFEModel,
+    features_out: Dict[str, Any],
+) -> List[torch.nn.Module]:
+    r"""Wrap ``forward_moments`` of every ``prototype_agents`` block on the instance so the eval pass sums, per
+    layer, the template weights ``(M,)``, the weight entropy, the removed variance and the token count of its inputs
+    into ``features_out["prototype"][layer]``; returns the wrapped blocks (the caller deletes the wrappers)."""
+    blocks = getattr(model, "block_mlps", None)
+    wrapped: List[torch.nn.Module] = []
+    if blocks is None:
+        return wrapped
+    sums = features_out.setdefault("prototype", {})
+    for layer, mlp in enumerate(blocks):
+        if not isinstance(mlp, PrototypeAgentBlockMLP):
+            continue
+        original = mlp.forward_moments
+
+        def recording(mu, sigma, *args, _layer=layer, _mlp=mlp, _original=original, **kwargs):
+            weights, gain = _mlp.weights_and_gain(mu, sigma)                    # (..., M), (...)
+            weights = weights.double().reshape(-1, weights.shape[-1])            # (T, M)
+            entry = sums.setdefault(_layer, {"weights": torch.zeros_like(weights[0]), "entropy": 0.0,
+                                             "gain": 0.0, "tokens": 0, "K": int(mu.shape[-1])})
+            entry["weights"] += weights.sum(dim=0)
+            entry["entropy"] += float(-torch.special.xlogy(weights, weights).sum())
+            entry["gain"] += float(gain.double().sum())
+            entry["tokens"] += int(weights.shape[0])
+            return _original(mu, sigma, *args, **kwargs)
+
+        mlp.forward_moments = recording
+        wrapped.append(mlp)
+    return wrapped
+
+
+def _accumulate_minimal_agent(
+    features_out: Dict[str, Any],
+    diagnostic:   Mapping[str, Any],
+) -> None:
+    r"""Sum the per-head minimal-agent captures of one chunk into ``features_out["minimal_agent"][layer]``."""
+    for layer, capture in enumerate(diagnostic.get("layer_conditional_captures") or []):
+        if _MINIMAL_AGENT_HEAD_CAPTURE[0] not in capture:
+            continue
+        values = []
+        for key in _MINIMAL_AGENT_HEAD_CAPTURE:
+            value = capture[key].detach().double().cpu().reshape(-1)             # (H,) or (1,) for the layer scalar
+            values.append(value)
+        H = values[0].numel()
+        stacked = torch.stack([v.expand(H) if v.numel() == 1 else v for v in values])   # (F, H)
+        entry = features_out.setdefault("minimal_agent", {}).setdefault(layer, [torch.zeros_like(stacked), 0])
+        entry[0] += stacked
+        entry[1] += 1
+
+
+def _feature_rows(
+    model:    VFEModel,
+    features: Mapping[str, Any],
+    step:     int,
+) -> Tuple[List[Dict[str, float]], List[Dict[str, float]]]:
+    r"""``diagnostics/minimal_agent_heads.csv`` and ``diagnostics/prototype_templates.csv`` rows from the sums of
+    :func:`_residual_and_attention_rows` (``features_out``); empty lists for a feature the model does not use."""
+    head_rows: List[Dict[str, float]] = []
+    for layer, (total, count) in sorted(features.get("minimal_agent", {}).items()):
+        mean = (total / count).tolist()                                         # (F, H)
+        for head in range(len(mean[0])):
+            row = {"step": int(step), "layer": int(layer), "head": int(head)}
+            row.update({name: float(mean[f][head]) for f, name in enumerate(MINIMAL_AGENT_HEAD_FIELDS[3:])})
+            head_rows.append(row)
+    template_rows: List[Dict[str, float]] = []
+    for layer, entry in sorted(features.get("prototype", {}).items()):
+        mlp = model.block_mlps[layer]
+        tokens = max(1, entry["tokens"])
+        usage = entry["weights"] / tokens                                       # (M,) mean template weight
+        M = usage.numel()
+        log_lambda = mlp.log_lambda.detach().double().reshape(-1)
+        prior = torch.softmax(mlp.log_pi.detach().double(), dim=-1)
+        template_rows.append({
+            "step": int(step), "layer": int(layer),
+            "effective_templates": float(torch.exp(-torch.special.xlogy(usage, usage).sum())),
+            "weight_entropy": entry["entropy"] / tokens,
+            "dead_fraction": float((usage < 1.0 / (10 * M)).double().mean()),
+            "log_lambda_min": float(log_lambda.min()),
+            "log_lambda_median": float(log_lambda.median()),
+            "log_lambda_max": float(log_lambda.max()),
+            "prior_entropy": float(-torch.special.xlogy(prior, prior).sum()),
+            "gain_fraction": entry["gain"] / tokens / entry["K"],
+            "n_tokens": int(entry["tokens"]),
+        })
+    return head_rows, template_rows
 
 
 def _routing_holonomy_rows(
@@ -2232,13 +2350,26 @@ def _eval_cadence_diagnostics(
         if windows is not None:
             counters: Optional[Dict[str, Any]] = {} if count_numerics else None
             holonomy: Optional[Dict[Any, Any]] = {}
+            features: Optional[Dict[str, Any]] = {}
             try:
                 residual_rows, attention_rows = _residual_and_attention_rows(
-                    model, windows, step, device, counters_out=counters, holonomy_out=holonomy)
+                    model, windows, step, device, counters_out=counters, holonomy_out=holonomy,
+                    features_out=features)
             except Exception as exc:
                 _record_diagnostic_failure(failures, "residual_attention", exc, logger)
                 residual_rows = attention_rows = None
-                counters = holonomy = None        # their capture pass failed; counted once above
+                counters = holonomy = features = None   # their capture pass failed; counted once above
+            if features:
+                try:
+                    head_rows, template_rows = _feature_rows(model, features, step)
+                    if head_rows:
+                        artifacts.append_diagnostic_rows(
+                            "minimal_agent_heads.csv", MINIMAL_AGENT_HEAD_FIELDS, head_rows)
+                    if template_rows:
+                        artifacts.append_diagnostic_rows(
+                            "prototype_templates.csv", PROTOTYPE_TEMPLATE_FIELDS, template_rows)
+                except Exception as exc:
+                    _record_diagnostic_failure(failures, "feature_diagnostics", exc, logger)
             if holonomy is not None:
                 try:
                     if "error" in holonomy:

@@ -992,7 +992,8 @@ def test_diagnostics_and_consumers(inference: str) -> None:
     ids = torch.tensor([[1, 2, 3, 4]])
     rows = model.diagnostics_per_layer(ids)
     for key in ma.MINIMAL_AGENT_DIAGNOSTIC_KEYS:
-        assert all(math.isfinite(v) for v in rows[key]), key
+        defined = ma.MINIMAL_AGENT_MODE_ONLY_KEYS.get(key, inference) == inference   # else NaN by design
+        assert all(math.isfinite(v) == defined for v in rows[key]), key
     assert all(0.0 < v < 1.0 for v in rows["relational_minimal_agent_gain_fraction"])
     assert rows["relational_minimal_agent_channel_noise"] == [1.0, 1.0]
     assert all(math.isnan(v) for v in rows["relational_content_max_singular_value"])
@@ -1073,4 +1074,7 @@ def test_persisted_run_logs_the_minimal_agent_columns(tmp_path) -> None:
         assert int(row["diagnostics_failures"]) == 0
         assert row["param_norm_group_other"] == ""                    # channel_log_noise is relational_score
         for key in T._VAL_MINIMAL_AGENT_DIAG_KEYS:
-            assert math.isfinite(float(row[key])), key
+            if ma.MINIMAL_AGENT_MODE_ONLY_KEYS.get(key[len("val_"):], "exact") != "exact":
+                assert row[key] == "", key                            # mean-field-only: blank (NaN) here
+            else:
+                assert math.isfinite(float(row[key])), key

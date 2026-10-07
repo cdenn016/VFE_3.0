@@ -100,7 +100,7 @@ reported to the caller.
 """
 
 import math
-from typing import Callable, List, NamedTuple, Optional, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 from torch.utils.checkpoint import checkpoint
@@ -118,7 +118,13 @@ PAIR_TILE_BYTES: int = 32 * 1024 ** 2
 # Per-layer, per-head diagnostics written to the relational capture (means over receivers).
 MINIMAL_AGENT_DIAGNOSTIC_KEYS: Tuple[str, ...] = (
     "relational_minimal_agent_gain_fraction", "relational_minimal_agent_channel_noise",
-    "relational_minimal_agent_head_coupling")
+    "relational_minimal_agent_head_coupling", "relational_minimal_agent_label_staleness",
+    "relational_minimal_agent_covariance_contraction", "relational_minimal_agent_spread_share")
+# Diagnostics defined in one inference mode only (NaN in the other).
+MINIMAL_AGENT_MODE_ONLY_KEYS: Dict[str, str] = {
+    "relational_minimal_agent_label_staleness": "mean_field",
+    "relational_minimal_agent_spread_share": "exact",
+}
 
 
 class RecordPosterior(NamedTuple):
@@ -146,7 +152,10 @@ class MinimalAgentResult(NamedTuple):
     r"""Posterior reference moments of every receiver, in the factored form of the head assembly.
 
     :math:`C_i^+ = C_i - \sum_h\mathsf K_i^hM_i^h\mathsf K_i^{h\top}` (``gains``, ``M``). The two covariances at the
-    input moments are always returned; ``gain_fraction`` and ``head_coupling`` only with ``diagnostics=True``.
+    input moments are always returned; ``gain_fraction``, ``head_coupling``, ``covariance_contraction``,
+    ``label_staleness`` (mean field) and ``spread_share`` (exact: the share :math:`\operatorname{tr}(AR)/\operatorname{tr}(A\bar\Lambda)`
+    of the removed probed variance that the between-source spread gives back, the part the mean field drops) only
+    with ``diagnostics=True``.
     ``failed`` reports a failed
     zero-jitter factorization or a non-finite cost anywhere in the call; ``ill_conditioned`` reports a float32 ADF
     query covariance that failed the certificate (only under ``projected_cov_condition_recovery``, else False).
@@ -163,6 +172,9 @@ class MinimalAgentResult(NamedTuple):
     head_coupling:    Optional[torch.Tensor]   # (..., N, H) max_{g != h} normalized ||S_h C_i S_g^T||_F
     failed:           torch.Tensor             # () bool: a factorization failed or a cost is not finite
     ill_conditioned:  torch.Tensor             # () bool: a float32 A_i^h failed the certificate (no failure)
+    covariance_contraction: Optional[torch.Tensor] = None   # (..., N) tr C_i^+ / tr C_i (diagnostics only)
+    label_staleness:  Optional[torch.Tensor] = None         # (..., N, H) mean field: TV of one relabeling (diagnostics)
+    spread_share:     Optional[torch.Tensor] = None         # (..., N, H) exact: tr(A R) / tr(A Lambda_bar) (diagnostics)
 
 
 def _symmetrize(X: torch.Tensor) -> torch.Tensor:          # (..., r, r) -> (..., r, r)
@@ -514,6 +526,50 @@ def _head_coupling(
     return ratio.masked_fill(diagonal, -math.inf).amax(dim=-1)
 
 
+def _covariance_contraction(
+    C:      torch.Tensor,                       # (..., N, K, K) dense or (..., N, G, g, g) blocks
+    gains:  torch.Tensor,                       # (..., N, H, K, d)
+    M:      torch.Tensor,                       # (..., N, H, d, d)
+    blocks: bool,
+) -> torch.Tensor:                              # (..., N)
+    r""":math:`\operatorname{tr}C_i^+/\operatorname{tr}C_i = 1 - \sum_h\operatorname{tr}(\mathsf K_i^hM_i^h\mathsf K_i^{h\top})/\operatorname{tr}C_i`."""
+    trace = torch.diagonal(C, dim1=-2, dim2=-1).sum(dim=(-2, -1) if blocks else -1)
+    removed = torch.einsum("...nhks,...nhst,...nhkt->...n", gains, M, gains)
+    return 1.0 - removed / trace
+
+
+def _label_staleness(
+    xi_plus: torch.Tensor,                      # (..., N, K) posterior reference means
+    V_Q:     torch.Tensor,                      # (..., N, H, d, d) S_h C S_h^T at the input moments
+    S:       torch.Tensor,                      # (H, d, K)
+    gains:   torch.Tensor,                      # (..., N, H, K, d)
+    M:       torch.Tensor,                      # (..., N, H, d, d)
+    b:       torch.Tensor,                      # (..., H, N, d)
+    B:       torch.Tensor,                      # (..., H, N, d, d)
+    lp:      torch.Tensor,                      # (..., H, N, N)
+    weights: torch.Tensor,                      # (..., H, N, N) labels used (input moments)
+) -> torch.Tensor:                              # (..., N, H)
+    r"""Total variation :math:`\tfrac12\sum_j|\beta^+_{ij} - \beta_{ij}|` between the mean-field labels at the input
+    moments and the same KL labels recomputed at the posterior query moments
+    :math:`(S_h\xi_i^+, S_hC_i^+S_h^\top)`, with
+    :math:`S_hC^+S_h^\top = S_hCS_h^\top - \sum_gY_{hg}M^gY_{hg}^\top`, :math:`Y_{hg} = S_h\mathsf K^g`: one further
+    coordinate-ascent label step. Near 0 means a second mean-field step would not move the labels. Computed in
+    float64; a receiver whose posterior query covariance does not factor reads NaN.
+    """
+    f64 = torch.float64
+    Y = torch.einsum("hsk,...ngkt->...nhgst", S.to(f64), gains.to(f64))        # (..., N, H, H, d, d) S_h K^g
+    A_plus = _symmetrize(V_Q.to(f64) - torch.einsum("...nhgst,...ngtu,...nhgvu->...nhsv", Y, M.to(f64), Y))
+    a_plus = torch.einsum("hsk,...nk->...nhs", S.to(f64), xi_plus.to(f64))     # (..., N, H, d)
+    bad = torch.linalg.cholesky_ex(A_plus)[1] != 0                              # (..., N, H)
+    eye = torch.eye(A_plus.shape[-1], dtype=f64, device=A_plus.device)
+    A_plus = torch.where(bad[..., None, None], eye, A_plus)                     # (..., N, H, d, d)
+    cost = projected_gaussian_kl(a_plus, A_plus, b.to(f64).movedim(-3, -2),
+                                 B.to(f64).movedim(-4, -3))                     # (..., H, N, N)
+    relabeled = torch.softmax(lp.to(f64) - cost, dim=-1)
+    tv = 0.5 * (relabeled - weights.to(f64)).abs().sum(dim=-1)                  # (..., H, N)
+    return tv.movedim(-1, -2).masked_fill(bad, math.nan)                        # (..., N, H)
+
+
 def minimal_agent_readout(
     xi:          torch.Tensor,                  # (..., N, K) reference means xi_i
     C:           torch.Tensor,                  # (..., N, K, K) dense or (..., N, G, g, g) block-diagonal C_i
@@ -586,6 +642,7 @@ def minimal_agent_readout(
         weights: List[torch.Tensor] = []
         costs: List[torch.Tensor] = []
         fractions: List[torch.Tensor] = []
+        spreads: List[torch.Tensor] = []                                        # exact: tr(A R) / tr(A Lambda_bar)
         flags: List[torch.Tensor] = []                                          # failed factorizations
         screens: List[torch.Tensor] = []                                        # certificate flags (certify only)
 
@@ -610,7 +667,9 @@ def minimal_agent_readout(
                 costs.append(post.cost)
                 if diagnostics:
                     with torch.no_grad():
-                        fractions.append(torch.diagonal(A @ post.Lambda_bar, dim1=-2, dim2=-1).sum(-1) / d)
+                        removed = torch.diagonal(A @ post.Lambda_bar, dim1=-2, dim2=-1).sum(-1)
+                        fractions.append(removed / d)
+                        spreads.append(torch.diagonal(A @ post.R, dim1=-2, dim2=-1).sum(-1) / removed)
                 flags.append(post.failed)
                 return post.u, _symmetrize(post.Lambda_bar - post.R)
         else:
@@ -643,18 +702,24 @@ def minimal_agent_readout(
         xi_plus, gains, M, _ = sequential_head_assembly(xi, X0, S, head_update)
         weights_out = torch.stack(weights, dim=-3) if inference == "exact" else weights[0]   # (..., H, N, N)
         cost_out = torch.stack(costs, dim=-3) if inference == "exact" else costs[0]
-        gain_fraction = coupling = None
+        gain_fraction = coupling = contraction = staleness = spread = None
         if diagnostics:
             gain_fraction = torch.stack(fractions, dim=-1) if inference == "exact" else fractions[0]   # (..., N, H)
             with torch.no_grad():
                 coupling = _head_coupling(S, X0)
+                contraction = _covariance_contraction(C, gains, M, blocks)       # (..., N)
+                staleness = (_label_staleness(xi_plus, V_Q, S, gains, M, b, B, lp, weights_out)
+                             if inference == "mean_field"
+                             else torch.full_like(coupling, math.nan))           # (..., N, H)
+                spread = (torch.stack(spreads, dim=-1) if inference == "exact"
+                          else torch.full_like(coupling, math.nan))              # (..., N, H)
         failed = torch.stack([flag.reshape(()) for flag in flags]).any()
         ill_conditioned = (torch.stack([screen.reshape(()) for screen in screens]).any() if screens
                            else torch.zeros((), dtype=torch.bool, device=xi.device))
     if check and bool(failed):                                                  # the one host check
         raise ValueError(readout_failure_message(dtype))
     return MinimalAgentResult(xi_plus, gains, M, weights_out, cost_out, gain_fraction, V_Q, V_K, coupling,
-                              failed, ill_conditioned)
+                              failed, ill_conditioned, contraction, staleness, spread)
 
 
 # ----------------------------------------------------------------------------------------------
