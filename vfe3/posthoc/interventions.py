@@ -245,7 +245,7 @@ def _identity_covariance_score(
     covariances (:math:`X = S \cdot I \cdot 1^{1/2}`) and never re-projects the means.
     """
     from vfe3.relational_scoring import (
-        _compute_dtype, projected_gaussian_kl, projected_moments, projected_noisy_query_cost)
+        _compute_dtype, projected_moments, routing_cost)
 
     if operators.mixed_heads:
         raise NotApplicable(f"{operators.irrep_dims}: heads of different sizes (a mixed so_n irrep tower) are not supported by this analysis yet")
@@ -271,7 +271,7 @@ def _identity_covariance_score(
     if capture is not None:
         capture["projected_covariance_pre"] = G_q.detach().to(public)
         capture["projected_key_covariance_pre"] = G_k.detach().to(public)
-    score = projected_noisy_query_cost if operators.routing == "noisy_query" else projected_gaussian_kl
+    score = routing_cost(operators.routing)
     return score(a[0], G_q, a[1], G_k,
                  projection_q=(ones, eye, S_q), projection_k=(ones, eye, S_k)).to(public)
 
@@ -512,7 +512,7 @@ def _frame_free_covariance_score(
     re-projects the means (a recovered pair reads the working-precision means, as in row 6).
     """
     from vfe3.relational_scoring import (
-        _compute_dtype, projected_gaussian_kl, projected_moments, projected_noisy_query_cost)
+        _compute_dtype, projected_moments, routing_cost)
 
     if operators.mixed_heads:
         raise NotApplicable(f"{operators.irrep_dims}: heads of different sizes (a mixed so_n irrep tower) are not supported by this analysis yet")
@@ -547,7 +547,7 @@ def _frame_free_covariance_score(
     if capture is not None:
         capture["projected_covariance_pre"] = G_q.detach().to(public)
         capture["projected_key_covariance_pre"] = G_k.detach().to(public)
-    score = projected_noisy_query_cost if operators.routing == "noisy_query" else projected_gaussian_kl
+    score = routing_cost(operators.routing)
     return score(a_q, G_q, a_k, G_k,
                  projection_q=(sigma_h, eye, S_q), projection_k=(source_sigma_h, eye, S_k)).to(public)
 

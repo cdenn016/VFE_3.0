@@ -274,10 +274,10 @@ class RelationalOperators(nn.Module):
         self.receiver_update = receiver_update
         self.receiver_damping = float(receiver_damping)
         self.readout_mode = readout_mode
-        if routing not in ("gaussian_kl", "noisy_query"):
-            raise ValueError("relational routing must be 'gaussian_kl' or 'noisy_query'")
-        if routing == "noisy_query" and readout_mode != "predictive_content":
-            raise ValueError("noisy_query routing requires predictive_content")
+        if routing not in ("gaussian_kl", "noisy_query", "mean_distance"):
+            raise ValueError("relational routing must be 'gaussian_kl', 'noisy_query' or 'mean_distance'")
+        if routing != "gaussian_kl" and readout_mode != "predictive_content":
+            raise ValueError(f"{routing} routing requires predictive_content")
         self.routing = routing
         if predictive_covariance not in ("passthrough", "moment_matched"):
             raise ValueError("predictive_covariance must be 'passthrough' or 'moment_matched'")

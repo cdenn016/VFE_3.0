@@ -8,7 +8,8 @@ from vfe3.contracts import CanonicalFrameContext
 from vfe3.model.edge_links import edge_diagnostic_capture, receive_heads as edge_receive_heads
 from vfe3.model.relational_operators import RelationalOperators
 from vfe3.relational_scoring import (
-    _compute_dtype, projected_moments, projected_gaussian_kl, projected_noisy_query_cost,
+    _compute_dtype, projected_moments, projected_gaussian_kl, projected_mean_distance_cost,
+    projected_noisy_query_cost,
 )
 
 
@@ -24,7 +25,8 @@ def relational_score(
     r"""Compute KL(S_Q U_i^{-1} q_i || S_K U_j^{-1} q_j) or the noisy-query cost, retaining full reduced covariance.
 
     ``operators.routing`` selects the cost: ``"gaussian_kl"`` (projected_gaussian_kl) or
-    ``"noisy_query"`` (projected_noisy_query_cost, the expected-likelihood source posterior).
+    ``"noisy_query"`` (projected_noisy_query_cost, the expected-likelihood source posterior), or
+    ``"mean_distance"`` (projected_mean_distance_cost, the covariance-blind control).
 
     Every head projects the full canonical state through its own Q/K maps. The
     inverse frame retains its compact gauge blocks. A dense-layout frame must
@@ -60,7 +62,8 @@ def relational_score(
     # An escalated float64 frame (audit 2026-09-23 #12) runs the whole projection and score in
     # float64; the results are returned at the dtype a lower-precision frame would have produced.
     public = _compute_dtype(mu, sigma, source_mu, source_sigma, *(S for pair in comparison for S in pair))
-    score = projected_noisy_query_cost if operators.routing == "noisy_query" else projected_gaussian_kl
+    score = {"noisy_query": projected_noisy_query_cost,
+             "mean_distance": projected_mean_distance_cost}.get(operators.routing, projected_gaussian_kl)
     scores, captured_q, captured_k = [], [], []
     # One scoring call per run: the heads of a run share their rank d_r. Each call ends in its own
     # host transfer, so a tower of R runs pays R of them per call (one for equal heads).

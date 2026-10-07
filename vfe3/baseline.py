@@ -27,7 +27,21 @@ dropout and bias-free attention maps. The per-type read map :math:`A_v` exists o
 ``per_type_table='block_read'``; it is one ``(V, H, d, d)`` table shared by every layer, applied to the
 attention input, block-diagonal on the heads, so it has exactly the size of the VFE token-frame table
 :math:`V n_{\mathrm{gen}} = V K d` and acts on context-dependent state (it cannot be absorbed into
-:math:`E`). The decoder is the VFE linear decoder,
+:math:`E`). ``per_type_table='block_rw'`` uses the same table the way the VFE uses its token frames, on
+both sides of attention: with :math:`A_v = \exp(X_v)` blockwise, the attention input is read through
+:math:`A_{x_i}^{-1}` and the attention output is written through :math:`A_{x_i}` before the residual
+add, the analogue of :math:`U_i^{-1}` before the comparison and content maps and :math:`U_i` after the
+receiving map; zero initialization gives the plain baseline at step 0.
+
+``norm_placement='post_shared'`` replaces the pre-LN layout by the realization's: one LayerNorm shared
+by every layer, applied after the attention residual and before the MLP residual,
+
+.. math::
+    h_i \leftarrow \mathrm{LN}\big(h_i + \mathrm{Attn}(h)_i\big),\qquad
+    h_i \leftarrow h_i + W_2\, \mathrm{GELU}(W_1 h_i + b_1) + b_2,
+
+with no final normalization (the VFE's ``norm_type_final='none'``); the context-processing count is then
+exactly the VFE's. The decoder is the VFE linear decoder,
 
 .. math::
     \mathrm{logits}_i = W_{\mathrm{out}} \mathrm{LN}_f(h^{(L)}_i) + b_{\mathrm{out}} + \kappa \log\pi,
@@ -43,7 +57,8 @@ Parameter counts. Context processing (every attention, MLP and normalization par
     P_{\mathrm{ctx}} = L\,(4K^2 + 2eK^2 + eK + K + 4K) + 2K,
 
 which is the VFE count :math:`L(4K^2 + 2eK^2 + eK + K) + 2K` plus :math:`4KL` (per-sublayer
-normalizations; the VFE shares one). Per-type tables: :math:`2VK + V` (:math:`E`, :math:`W_{\rm out}`,
+normalizations; the VFE shares one), and exactly the VFE count under ``norm_placement='post_shared'``.
+Per-type tables: :math:`2VK + V` (:math:`E`, :math:`W_{\rm out}`,
 :math:`b_{\rm out}`), plus :math:`VKd` with the read map. No positional parameters (ALiBi).
 """
 
@@ -64,7 +79,8 @@ from vfe3.contracts import VFE_MODEL_FAMILY, model_family_of
 from vfe3.model.prior_bank import DecodeCEResult, PriorBank
 
 MODEL_FAMILY: str = "conventional_transformer"
-PER_TYPE_TABLES: Tuple[str, ...] = ("none", "block_read")
+PER_TYPE_TABLES: Tuple[str, ...] = ("none", "block_read", "block_rw")
+NORM_PLACEMENTS: Tuple[str, ...] = ("pre", "post_shared")
 PER_TYPE_TABLE_INITS: Tuple[str, ...] = ("zero", "phi_like")
 ATTENTION_PRIORS: Tuple[str, ...] = ("causal_alibi", "causal")
 AMP_DTYPES: Tuple[Optional[str], ...] = (None, "bf16", "fp16")
@@ -164,6 +180,9 @@ class BaselineConfig:
     resume_from:           Optional[str] = None
     trust_resume_checkpoint: bool        = False
     generate_embedding_figures: bool     = False       # the VFE embedding figures do not apply
+    # Normalization layout: "pre" (per-sublayer pre-LN plus a final LN) | "post_shared" (the VFE's one
+    # shared LayerNorm after the attention residual, no final LN).
+    norm_placement:        str           = "pre"
     # Attention prior (the VFE's registry).
     beta_attention_prior:  str           = "causal_alibi"
     alibi_slope:           float         = 1.0
@@ -174,8 +193,9 @@ class BaselineConfig:
     unigram_kappa:         float         = 1.0
     decode_chunk_size:     int           = 8192
     decode_ce_checkpoint:  str           = "auto"
-    # Per-type read map A_v = I + X_v (Table M2, "per-type table of the frame table's size").
-    per_type_table:        str           = "none"      # "none" | "block_read"
+    # Per-type table of the frame table's size (Table M2): "block_read" reads through A_v = I + X_v;
+    # "block_rw" reads through exp(-X_v) and writes the attention output through exp(X_v).
+    per_type_table:        str           = "none"      # "none" | "block_read" | "block_rw"
     per_type_table_init:   str           = "zero"      # "zero" (step 0 = the plain baseline) | "phi_like"
     per_type_table_init_scale: float     = 0.01        # std of X under "phi_like" (the VFE phi_scale)
     per_type_table_lr:     Optional[float] = None      # None -> lr
@@ -246,6 +266,8 @@ class BaselineConfig:
         if self.decode_ce_checkpoint not in DECODE_CE_CHECKPOINTS:
             raise ValueError(f"decode_ce_checkpoint must be one of {DECODE_CE_CHECKPOINTS}, "
                              f"got {self.decode_ce_checkpoint!r}")
+        if self.norm_placement not in NORM_PLACEMENTS:
+            raise ValueError(f"norm_placement must be one of {NORM_PLACEMENTS}, got {self.norm_placement!r}")
         if self.per_type_table not in PER_TYPE_TABLES:
             raise ValueError(f"per_type_table must be one of {PER_TYPE_TABLES}, got {self.per_type_table!r}")
         if self.per_type_table_init not in PER_TYPE_TABLE_INITS:
@@ -268,9 +290,11 @@ class BaselineConfig:
         return self.embed_dim // self.n_heads
 
     def context_processing_parameters(self) -> int:
-        r"""Analytic :math:`P_{\mathrm{ctx}} = L(4K^2 + 2eK^2 + eK + K + 4K) + 2K`."""
+        r"""Analytic :math:`P_{\mathrm{ctx}} = L(4K^2 + 2eK^2 + eK + K + 4K) + 2K` (pre-LN), or the VFE
+        count :math:`L(4K^2 + 2eK^2 + eK + K) + 2K` under ``norm_placement='post_shared'``."""
         K, e, L = self.embed_dim, self.mlp_expansion, self.n_layers
-        return L * (4 * K * K + 2 * e * K * K + e * K + K + 4 * K) + 2 * K
+        norms = 4 * K if self.norm_placement == "pre" else 0
+        return L * (4 * K * K + 2 * e * K * K + e * K + K + norms) + 2 * K
 
     def per_type_parameters(self) -> Dict[str, int]:
         r"""Per-type table sizes: token table :math:`VK`, decoder :math:`VK (+V)`, read map :math:`VKd`."""
@@ -278,7 +302,7 @@ class BaselineConfig:
         return {
             "token_embed": V * K,
             "decode": V * K + (V if self.decode_bias else 0),
-            "type_table": (V * K * self.d_head) if self.per_type_table == "block_read" else 0,
+            "type_table": (V * K * self.d_head) if self.per_type_table != "none" else 0,
         }
 
     def total_parameters(self) -> int:
@@ -496,7 +520,7 @@ def baseline_parameter_role(name: str) -> Tuple[str, str]:
             return "context_processing", "block_mlp"
         if ".ln1." in name or ".ln2." in name:
             return "context_processing", "norm"
-    if name.startswith("final_norm."):
+    if name.startswith(("final_norm.", "shared_norm.")):
         return "context_processing", "norm"
     return "other", leaf
 
@@ -622,34 +646,59 @@ class BaselineMLP(nn.Module):
 
 
 class BaselineBlock(nn.Module):
-    r"""One pre-LN layer: attention on the (optionally read-mapped) normalized state, then the MLP."""
+    r"""One layer: attention on the (optionally read-mapped) state, then the MLP, pre-LN or post-shared.
+
+    ``read`` and ``write`` are per-token head-block maps gathered once per forward. Under
+    ``per_type_table='block_read'`` ``read`` holds :math:`X_{x_i}` (applied as :math:`I + X`) and
+    ``write`` is None; under ``'block_rw'`` they hold :math:`\exp(-X_{x_i})` and :math:`\exp(X_{x_i})`.
+    Under ``norm_placement='post_shared'`` the block owns no normalization and applies ``shared_norm``.
+    """
 
     def __init__(self, cfg: BaselineConfig) -> None:
         super().__init__()
         K = cfg.embed_dim
         out_std = cfg.init_std / math.sqrt(2.0 * cfg.n_layers)
-        self.ln1 = nn.LayerNorm(K, eps=cfg.layernorm_eps)
+        self.pre_ln = cfg.norm_placement == "pre"
+        self.read_is_increment = cfg.per_type_table == "block_read"
+        if self.pre_ln:
+            self.ln1 = nn.LayerNorm(K, eps=cfg.layernorm_eps)
         self.attn = BaselineAttention(K, cfg.n_heads, cfg.init_std, out_std)
-        self.ln2 = nn.LayerNorm(K, eps=cfg.layernorm_eps)
+        if self.pre_ln:
+            self.ln2 = nn.LayerNorm(K, eps=cfg.layernorm_eps)
         self.mlp = BaselineMLP(K, cfg.mlp_expansion, cfg.init_std, out_std)
+
+    @staticmethod
+    def _apply_blocks(maps: torch.Tensor, x: torch.Tensor, increment: bool) -> torch.Tensor:
+        B, N, K = x.shape
+        x_h = x.view(B, N, maps.shape[2], maps.shape[3])                                    # (B, N, H, d)
+        y = torch.einsum("bnhij,bnhj->bnhi", maps.to(x_h.dtype), x_h)                     # (B, N, H, d)
+        # block_read: A u = u + X u, exactly u when X = 0; block_rw: the map is the whole block.
+        return (x_h + y if increment else y).reshape(B, N, K)                               # (B, N, K)
 
     def forward(
         self,
         h:     torch.Tensor,                 # (B, N, K) residual stream (fp32)
         prior: torch.Tensor,                 # (H, N, N) fp32 log-prior
-        read:  Optional[torch.Tensor],       # (B, N, H, d, d) gathered X_{x_i}, or None
+        read:  Optional[torch.Tensor],       # (B, N, H, d, d) gathered read map, or None
+        write: Optional[torch.Tensor] = None,  # (B, N, H, d, d) gathered write map, or None
 
         *,
         weights_out: Optional[List[torch.Tensor]] = None,
+        shared_norm: Optional[nn.LayerNorm] = None,
     ) -> torch.Tensor:                       # (B, N, K)
-        u = _fp32_layer_norm(self.ln1, h)                                                   # (B, N, K) fp32
+        u = _fp32_layer_norm(self.ln1, h) if self.pre_ln else h                             # (B, N, K)
         if read is not None:
-            B, N, K = u.shape
-            u_h = u.view(B, N, read.shape[2], read.shape[3])                                # (B, N, H, d)
-            # A_{x_i} u_i = u_i + X_{x_i} u_i per head block; exactly u_i when X = 0.
-            u = (u_h + torch.einsum("bnhij,bnhj->bnhi", read, u_h)).reshape(B, N, K)      # (B, N, K)
-        h = h + self.attn(u, prior, weights_out=weights_out)
-        return h + self.mlp(_fp32_layer_norm(self.ln2, h))
+            u = self._apply_blocks(read, u, self.read_is_increment)                         # (B, N, K)
+        a = self.attn(u, prior, weights_out=weights_out)                                    # (B, N, K)
+        if write is not None:
+            a = self._apply_blocks(write, a, False)                                         # (B, N, K)
+        if self.pre_ln:
+            h = h + a
+            return h + self.mlp(_fp32_layer_norm(self.ln2, h))
+        if shared_norm is None:
+            raise ValueError("norm_placement='post_shared' needs the model's shared_norm")
+        h = _fp32_layer_norm(shared_norm, h + a)                                            # (B, N, K) fp32
+        return h + self.mlp(h)
 
 
 def _fp32_layer_norm(norm: nn.LayerNorm, x: torch.Tensor) -> torch.Tensor:
@@ -682,14 +731,19 @@ class BaselineTransformer(nn.Module):
         self.tok_embed = nn.Parameter(torch.empty(V, K))                                   # (V, K) E
         nn.init.normal_(self.tok_embed, 0.0, cfg.init_std)
         self.blocks = nn.ModuleList([BaselineBlock(cfg) for _ in range(cfg.n_layers)])
-        self.final_norm = nn.LayerNorm(K, eps=cfg.layernorm_eps)
+        if cfg.norm_placement == "pre":
+            self.final_norm = nn.LayerNorm(K, eps=cfg.layernorm_eps)
+            self.shared_norm = None
+        else:
+            self.final_norm = None
+            self.shared_norm = nn.LayerNorm(K, eps=cfg.layernorm_eps)
         self.decoder = LinearUnigramDecoder(
             V, K, bias=cfg.decode_bias, unigram_prior=cfg.decode_unigram_prior,
             unigram_kappa=cfg.unigram_kappa, chunk_size=cfg.decode_chunk_size,
             checkpoint=cfg.decode_ce_checkpoint)
         # The read map draws from its own generator (or none at zero init), so every other
         # parameter is initialized identically with and without it at the same seed.
-        if cfg.per_type_table == "block_read":
+        if cfg.per_type_table != "none":
             table = torch.zeros(V, H, d, d)                                                 # (V, H, d, d) X
             if cfg.per_type_table_init == "phi_like" and cfg.per_type_table_init_scale > 0.0:
                 generator = torch.Generator().manual_seed(_derived_seed(cfg.seed, "type_table"))
@@ -742,10 +796,20 @@ class BaselineTransformer(nn.Module):
         device = token_ids.device
         prior = self._attention_log_prior(token_ids.shape[1], device)                      # (H, N, N)
         h = self.tok_embed[token_ids]                                                       # (B, N, K)
-        read = self.type_table[token_ids] if self.type_table is not None else None         # (B, N, H, d, d)
+        read, write = None, None
+        if self.type_table is not None:
+            X = self.type_table[token_ids]                                                  # (B, N, H, d, d)
+            if self.cfg.per_type_table == "block_rw":
+                with torch.autocast(device_type=device.type, enabled=False):
+                    X = X.float()
+                    read, write = torch.linalg.matrix_exp(-X), torch.linalg.matrix_exp(X)  # (B, N, H, d, d)
+            else:
+                read = X
         with self._amp_context(device):
             for block in self.blocks:
-                h = block(h, prior, read, weights_out=weights_out)
+                h = block(h, prior, read, write, weights_out=weights_out, shared_norm=self.shared_norm)
+        if self.final_norm is None:
+            return h.float()                                                                # (B, N, K) fp32
         return _fp32_layer_norm(self.final_norm, h)                                         # (B, N, K) fp32
 
     def forward(
@@ -892,7 +956,8 @@ class BaselineTransformer(nn.Module):
         cfg = self.cfg
         K, L, N, V, e, d = (cfg.embed_dim, cfg.n_layers, cfg.max_seq_len, cfg.vocab_size,
                             cfg.mlp_expansion, cfg.d_head)
-        matmul = L * (4 * K * K + 2 * e * K * K) + (L * K * d if self.type_table is not None else 0)
+        table_mm = {"none": 0, "block_read": L * K * d, "block_rw": 2 * L * K * d}[cfg.per_type_table]
+        matmul = L * (4 * K * K + 2 * e * K * K) + table_mm
         forward_per_token = 2.0 * (matmul + V * K) + 2.0 * L * N * K
         out: Dict[str, object] = {
             "model_family":            MODEL_FAMILY,

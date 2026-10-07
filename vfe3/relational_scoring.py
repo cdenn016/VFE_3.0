@@ -955,3 +955,49 @@ def relational_mixture_mean(
         mixed = torch.einsum("...hij,...jhs->...ihs", beta.to(dtype), content)
         body = torch.einsum("hds,...ihs->...ihd", O.to(dtype), mixed)
         return (forward_blocks.to(dtype) @ body.unsqueeze(-1)).squeeze(-1)
+
+
+def projected_mean_distance_cost(
+    a_q: torch.Tensor,  # (..., Nq, H, r)
+    G_q: torch.Tensor,  # (..., Nq, H, r, r)
+    a_k: torch.Tensor,  # (..., Nk, H, r)
+    G_k: torch.Tensor,  # (..., Nk, H, r, r)
+
+    *,
+    projection_q: Optional[Tuple[torch.Tensor, ...]] = None,
+    projection_k: Optional[Tuple[torch.Tensor, ...]] = None,
+) -> torch.Tensor:      # (..., H, Nq, Nk)
+    r"""Covariance-blind control cost D_ij = ||a_i - b_j||^2 / 2 of the projected means.
+
+    This is the Gaussian KL of Eq. (projected_full_kl) with both projected covariances replaced by
+    I_r, equivalently dot-product attention a_i^T b_j with the key-norm bias -||b_j||^2/2 (the row
+    constant ||a_i||^2/2 drops out of the softmax). It is the mean-only retraining control that
+    isolates covariance-aware routing: the projected covariances are accepted for signature parity
+    with projected_gaussian_kl and are not read, so they receive no gradient through routing.
+    D_ij >= 0, so the [0, kl_max] cost bound applies unchanged.
+    """
+    if a_q.ndim < 3 or a_k.ndim < 3 or a_q.shape[-2:] != a_k.shape[-2:]:
+        raise ValueError("projected means must have matching head and comparison dimensions")
+    dtype = _compute_dtype(a_q, a_k)
+    with torch.autocast(device_type=a_q.device.type, enabled=False):
+        aq = a_q.to(dtype).movedim(-2, -3)                                     # (..., H, Nq, r)
+        ak = a_k.to(dtype).movedim(-2, -3)                                     # (..., H, Nk, r)
+        delta = aq.unsqueeze(-2) - ak.unsqueeze(-3)                            # (..., H, Nq, Nk, r)
+        return 0.5 * delta.pow(2).sum(-1)                                      # (..., H, Nq, Nk)
+
+
+# Routing cost per relational_routing value; every cost takes (a_q, G_q, a_k, G_k, *, projection_q,
+# projection_k) and returns (..., H, Nq, Nk) nonnegative costs.
+ROUTING_COSTS = {
+    "gaussian_kl":   projected_gaussian_kl,
+    "noisy_query":   projected_noisy_query_cost,
+    "mean_distance": projected_mean_distance_cost,
+}
+
+
+def routing_cost(routing: str):
+    r"""The projected routing-cost function selected by ``routing`` (a key of :data:`ROUTING_COSTS`)."""
+    try:
+        return ROUTING_COSTS[routing]
+    except KeyError:
+        raise ValueError(f"relational routing must be one of {tuple(ROUTING_COSTS)}, got {routing!r}") from None
