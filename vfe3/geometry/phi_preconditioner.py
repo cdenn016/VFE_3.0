@@ -252,12 +252,26 @@ def pullback_group_direction(
         return direction(grad_phi, phi, direction_generators, **kwargs)
 
 
+# Dense float64 budget of one strict basis preparation's structure constants (audit 2026-10-08,
+# geometer#2). It replaces a flat K <= 12 cap: GL(16) blocks fit, GL(17) and wider do not.
+STRICT_STRUCTURE_BYTES: int = 512 * 2**20
+
+
+def strict_structure_bytes(n_gen: int, K: int) -> int:
+    r"""Float64 bytes of the structure-constant workspaces of ``n_gen`` generators on a ``K`` x ``K`` block.
+
+    The bracket :math:`[G_a, G_b]`, its reconstruction from the coordinates and one einsum temporary
+    are each ``(n_gen, n_gen, K, K)``: :math:`3 \cdot 8\, n_{\rm gen}^2 K^2` bytes.
+    """
+    return 3 * 8 * n_gen * n_gen * K * K
+
+
 def _strict_structure_constants(
     generators: torch.Tensor,             # (n_gen, K, K)
 
     *,
-    closure_tol: float = 1e-4,
-    max_k:       int   = 12,
+    closure_tol:     float = 1e-4,
+    structure_bytes: int   = STRICT_STRUCTURE_BYTES,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""Return certified bracket coordinates and the generator Gram in float64.
 
@@ -265,9 +279,12 @@ def _strict_structure_constants(
     solve ``B_cd f_ab^d = <G_c, [G_a, G_b]>_F`` through the Cholesky factor of
     ``B``. Reconstruction of every bracket certifies closure of the span.
     """
-    K = generators.shape[-1]
-    if K > max_k:
-        raise ValueError(f"strict phi group direction: K={K} exceeds max_k={max_k}")
+    n_gen, K = generators.shape[0], generators.shape[-1]
+    if strict_structure_bytes(n_gen, K) > structure_bytes:
+        raise ValueError(
+            f"strict phi group direction: {n_gen} generators on a {K} x {K} block need "
+            f"{strict_structure_bytes(n_gen, K) / 2**20:.0f} MiB of structure-constant workspace; "
+            f"the budget is {structure_bytes / 2**20:.0f} MiB")
     basis = generators.to(dtype=torch.float64)
     gram = torch.einsum("aij,bij->ab", basis, basis)
     gram_factor, info = torch.linalg.cholesky_ex(gram)
@@ -723,9 +740,14 @@ def _strict_block_preparations(
     return preparations
 
 
-def _phi_group_rows_per_chunk(n_gen: int) -> int:
-    """Bound twelve dense float64 coordinate workspaces to the staging budget."""
-    return max(1, _PHI_GROUP_WORKSPACE_BYTES // (_PHI_GROUP_DENSE_WORKSPACES * 8 * n_gen * n_gen))
+def _phi_group_rows_per_chunk(n_gen: int, K: int = 0) -> int:
+    """Bound the dense float64 coordinate workspaces and the per-row K x K matrices to the staging budget.
+
+    Per row: twelve (n_gen, n_gen) coordinate workspaces and four (n_gen, K, K) complex128 matrix
+    stacks of the spectral route (pushed matrices, their conjugates and the embedded basis).
+    """
+    per_row = 8 * (_PHI_GROUP_DENSE_WORKSPACES * n_gen * n_gen + 4 * 2 * n_gen * K * K)
+    return max(1, _PHI_GROUP_WORKSPACE_BYTES // per_row)
 
 
 def _chunked_pullback_group_direction(
@@ -816,7 +838,7 @@ def _full_pullback_group_direction(
                        if differential_mode is None else differential_mode)
     if evaluation_mode not in _PHI_GROUP_DIFFERENTIAL_MODES:
         raise ValueError(f"invalid phi group differential mode {evaluation_mode!r}")
-    rows_per_chunk = _phi_group_rows_per_chunk(phi_64.shape[-1])
+    rows_per_chunk = _phi_group_rows_per_chunk(phi_64.shape[-1], preparation.basis.shape[-1])
     if phi_64.shape == grad_64.shape and phi_64.numel() // phi_64.shape[-1] > rows_per_chunk:
         if require_uniform_series_order:
             raise _MixedPhiDifferentialOrder("large strict blocks require independent chunk staging")
@@ -1017,7 +1039,8 @@ def _pullback_group_direction_per_block(
     batch_equal_blocks = (
         equal_blocks_compatible
         and phi_64.numel() // preparations[0].basis.basis.shape[0]
-            <= _phi_group_rows_per_chunk(preparations[0].basis.basis.shape[0])
+            <= _phi_group_rows_per_chunk(preparations[0].basis.basis.shape[0],
+                                         preparations[0].basis.basis.shape[-1])
     )
     if batch_equal_blocks:
         batched_grad = torch.stack(

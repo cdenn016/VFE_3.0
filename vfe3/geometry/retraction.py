@@ -434,8 +434,9 @@ def _certify_public_spd(
 
     Cholesky tests of ``Sigma - eps I`` and, when bounded, ``sigma_max I - Sigma`` certify strict
     represented-value headroom at both ends. The ordinary interior path performs no extra
-    eigendecomposition and is byte-identical. A failing row alone is spectrally rebuilt with
-    public-dtype roundoff clearance; a second certificate has an interior isotropic fallback.
+    eigendecomposition and is byte-identical. A failing row alone is spectrally rebuilt with the
+    smallest clearance of a ladder ending at the worst-case public-dtype roundoff bound that passes the
+    certificates again; a row no rung certifies takes an interior isotropic fallback.
     """
     fallback_value, _public_upper = _public_spd_bounds(matrix.dtype, eps, sigma_max)
     symmetric = 0.5 * (matrix + matrix.transpose(-1, -2))
@@ -471,38 +472,43 @@ def _certify_public_spd(
     scale = repair_input.abs().amax(dim=(-2, -1), keepdim=True).clamp_min(1.0)
     margin = scale * (8.0 * dimension * torch.finfo(symmetric.dtype).eps)
     margin_scalar = margin.squeeze(-1).squeeze(-1).unsqueeze(-1)
-    if sigma_max is None:
-        lower = torch.full_like(eigenvalues, float(eps)) + margin_scalar
-        repaired_eigenvalues = torch.maximum(eigenvalues, lower)
-        fallback_scale = torch.full_like(margin, fallback_value)
-    else:
-        interval = float(sigma_max) - float(eps)
-        clearance = torch.minimum(
-            margin_scalar,
-            torch.full_like(margin_scalar, interval / 4.0),
-        )
-        lower = torch.full_like(eigenvalues, float(eps)) + clearance
-        upper = torch.full_like(eigenvalues, float(sigma_max)) - clearance
-        repaired_eigenvalues = torch.minimum(torch.maximum(eigenvalues, lower), upper)
-        fallback_scale = torch.full_like(margin, fallback_value)
-    repaired_check = (
-        eigenvectors * repaired_eigenvalues.unsqueeze(-2)
-        @ eigenvectors.transpose(-1, -2)
-    )
-    repaired = repaired_check.to(symmetric.dtype)
-    repaired = 0.5 * (repaired + repaired.transpose(-1, -2))
-    represented = repaired.to(check_dtype)
-    _, repair_lower_info = torch.linalg.cholesky_ex(
-        represented - float(eps) * eye_check,
-        check_errors=False,
-    )
-    repair_failed = repair_lower_info.ne(0)
     if sigma_max is not None:
-        _, repair_upper_info = torch.linalg.cholesky_ex(
-            float(sigma_max) * eye_check - represented,
-            check_errors=False,
+        margin_scalar = torch.minimum(
+            margin_scalar,
+            torch.full_like(margin_scalar, (float(sigma_max) - float(eps)) / 4.0),
         )
-        repair_failed = repair_failed | repair_upper_info.ne(0)
+    fallback_scale = torch.full_like(margin, fallback_value)
+
+    def rebuild(clearance: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""Clip the spectrum to [eps + c, sigma_max - c], rebuild in the public dtype, and certify it."""
+        lower = torch.full_like(eigenvalues, float(eps)) + clearance
+        clipped = torch.maximum(eigenvalues, lower)
+        if sigma_max is not None:
+            clipped = torch.minimum(clipped, torch.full_like(eigenvalues, float(sigma_max)) - clearance)
+        rebuilt = (eigenvectors * clipped.unsqueeze(-2) @ eigenvectors.transpose(-1, -2)).to(symmetric.dtype)
+        rebuilt = 0.5 * (rebuilt + rebuilt.transpose(-1, -2))
+        represented = rebuilt.to(check_dtype)
+        _, lower_info = torch.linalg.cholesky_ex(represented - float(eps) * eye_check, check_errors=False)
+        bad = lower_info.ne(0)
+        if sigma_max is not None:
+            _, upper_info = torch.linalg.cholesky_ex(float(sigma_max) * eye_check - represented,
+                                                     check_errors=False)
+            bad = bad | upper_info.ne(0)
+        return rebuilt, bad
+
+    # Measured clearance (audit 2026-10-08 P2-25): the bound c = 8 K eps_dtype max(1, max|Sigma_ij|) covers
+    # the worst-case roundoff of the public-dtype rebuild, but lifted lambda_min up to 568 times eps on
+    # measured rows. Each row takes the smallest clearance of the ladder c 2^-10, c 2^-6, c 2^-3, c whose
+    # rebuild passes the same certificates; the last rung is the previous clearance, so a row the old
+    # repair certified is still certified, and only rows failing every rung reach the fallback below.
+    repaired, repair_failed = rebuild(margin_scalar * 2.0 ** -10)
+    for factor in (2.0 ** -6, 2.0 ** -3, 1.0):
+        if not bool(repair_failed.any()):
+            break
+        retry, retry_failed = rebuild(margin_scalar * factor)
+        take = repair_failed & ~retry_failed
+        repaired = torch.where(take[:, None, None], retry, repaired)
+        repair_failed = repair_failed & retry_failed
     fallback = fallback_scale.to(symmetric.dtype) * torch.eye(
         dimension,
         device=symmetric.device,

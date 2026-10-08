@@ -29,7 +29,7 @@ Blocks are ``(..., d, d)`` head blocks; matrices are vectorized row-major,
 """
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Iterator, Optional, Tuple
 
 import torch
 
@@ -39,7 +39,9 @@ class FisherRowStatistics:
     r"""Belief statistics that define the Fisher metric of ``R`` active rows of one frame table.
 
     ``kind='type'`` rows carry the layer-0 table row :math:`(\mu_v, s_v)` per head block;
-    ``kind='pos'`` rows carry the pooled operator of their batch column. ``count`` is
+    ``kind='pos'`` rows carry the pooled operator of their batch column, either dense
+    (``pooled_operator``) or as the compact moments it is built from (``pooled_moments``), from which
+    :func:`pooled_operator_chunks` forms it a row chunk at a time. ``count`` is
     :math:`n_v` (type) or :math:`B_{\rm tot}` (pos) and ``total`` the scored-token count
     :math:`N`, so the count-normalized direction carries :math:`N/\mathrm{count}`.
     """
@@ -49,6 +51,14 @@ class FisherRowStatistics:
     local_mean:      Optional[torch.Tensor] = None         # (R, H, d) type only
     local_var:       Optional[torch.Tensor] = None         # (R, H, d) type only
     pooled_operator: Optional[torch.Tensor] = None         # (R, H, d*d, d*d) pos only
+    # pos only: (xi0 (T, H, d), C0 (T, H, d, d), C0_inv (T, H, d, d), gather (R, B)) of the T distinct
+    # column types; row r's operator pools the types gather[r].
+    pooled_moments:  Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None
+
+
+# Byte budget of one chunk of dense positional operators (and their pooling intermediates). The full
+# (R, H, d^2, d^2) float64 stack is 4 GiB per table at R = 128, H = 4, d = 32 (audit 2026-10-08 P2-22).
+POOLED_OPERATOR_CHUNK_BYTES: int = 256 * 2**20
 
 
 def completion_coefficients(rotation_weight: float) -> Tuple[float, float]:
@@ -199,6 +209,42 @@ def pooled_pos_operator(
         commutation = torch.einsum("il,jk->ijkl", eye, eye).reshape(d * d, d * d)
         M = M + c2 * commutation
     return M
+
+
+def pooled_operator_chunks(
+    statistics: FisherRowStatistics,
+
+    *,
+    rotation_weight: float,
+    chunk_bytes:     Optional[int] = None,             # None: POOLED_OPERATOR_CHUNK_BYTES
+) -> Iterator[Tuple[int, int, torch.Tensor]]:             # (start, stop, (stop-start, H, d*d, d*d))
+    r"""Yield the positional operators of ``statistics`` in row chunks of at most ``chunk_bytes``.
+
+    A dense ``pooled_operator`` is sliced. From ``pooled_moments`` each chunk is formed by
+    :func:`pooled_pos_operator` on its own rows only, so peak memory is one chunk's operators and
+    pooling intermediates instead of the whole table's; the operators are bitwise those of a single
+    call, because each row's operator depends only on its own batch column.
+    """
+    chunk_bytes = POOLED_OPERATOR_CHUNK_BYTES if chunk_bytes is None else int(chunk_bytes)
+    if statistics.pooled_operator is not None:
+        operator = statistics.pooled_operator
+        rows, n_blocks, n, _ = operator.shape
+        step = max(1, chunk_bytes // max(1, n_blocks * n * n * operator.element_size()))
+        for start in range(0, rows, step):
+            yield start, min(rows, start + step), operator[start:start + step]
+        return
+    if statistics.pooled_moments is None:
+        raise ValueError("positional Fisher statistics need pooled_operator or pooled_moments")
+    xi0, C0, C0_inv, gather = statistics.pooled_moments
+    rows, batch = gather.shape
+    n_blocks, d = xi0.shape[-2:]
+    # Per row: the (H, d^2, d^2) operator and its einsum output, plus three gathered (B, H, d, d) inputs.
+    per_row = (2 * n_blocks * d ** 4 + 3 * batch * n_blocks * d * d) * C0.element_size()
+    step = max(1, chunk_bytes // per_row)
+    for start in range(0, rows, step):
+        index = gather[start:start + step]                                  # (r, B)
+        yield start, min(rows, start + step), pooled_pos_operator(
+            xi0[index], C0[index], C0_inv[index], rotation_weight=rotation_weight)
 
 
 def jacobi_cholesky_solve(

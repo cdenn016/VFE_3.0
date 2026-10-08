@@ -99,7 +99,7 @@ def test_frame_keys_reach_the_training_metrics_row(tmp_path, monkeypatch) -> Non
 
 
 @pytest.mark.parametrize("bad, match", [
-    (dict(embed_dim=26, n_heads=2), "d_head <= 12"),
+    (dict(embed_dim=34, n_heads=2), "structure-constant workspace"),
     (dict(pos_phi="learned", pos_phi_project_slk=True), "pos_phi_project_slk"),
     (dict(transport_chart_max_norm=4.0), "transport_chart_max_norm"),
 ])

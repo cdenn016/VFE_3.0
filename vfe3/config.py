@@ -1216,11 +1216,9 @@ class VFE3Config:
                     f"gauge_group={self.gauge_group!r} registers no pullback capability; phase one "
                     "requires a built-in bracket-closed per-block pullback direction"
                 )
-            if self.gauge_group == "block_glk" and self.d_head > 12:
-                raise ValueError(
-                    "pullback_group with gauge_group='block_glk' requires d_head <= 12; got "
-                    f"d_head={self.d_head}"
-                )
+            structure_problem = self._pullback_structure_problem()
+            if structure_problem is not None:
+                raise ValueError(f"pullback_group {structure_problem}")
             if self.pos_phi_project_slk:
                 raise ValueError(
                     "pullback_group does not support pos_phi_project_slk=True because the stored "
@@ -2067,6 +2065,34 @@ class VFE3Config:
     def rope_insertion(self) -> Literal["right"]:
         """Fixed positional composition in the vertex frame."""
         return "right"
+
+    def _pullback_structure_problem(self) -> Optional[str]:
+        r"""Why the strict pullback M-step cannot build this group's structure constants, or None.
+
+        Mirrors the runtime budget of :func:`vfe3.geometry.phi_preconditioner._strict_structure_constants`
+        (audit 2026-10-08, geometer#2). A group whose generators each act on one block prepares one
+        (n_gen_b, d_b) basis per block; a tied group (``gauge_tying='shared'``) prepares one
+        (n_gen, K) basis over the full width.
+        """
+        from vfe3.geometry.phi_preconditioner import STRICT_STRUCTURE_BYTES, strict_structure_bytes
+        local_algebra = {"block_glk": lambda d: d * d, "block_so": lambda d: d * (d - 1) // 2,
+                         "block_co": lambda d: d * (d - 1) // 2 + 1, "block_glmc": lambda d: d * d // 2}
+        if self.gauge_group == "so_n":
+            n_alg = int(self.group_n) * (int(self.group_n) - 1) // 2
+            shapes = ([(n_alg, self.embed_dim)] if self.gauge_tying == "shared"
+                      else [(n_alg, d) for d in sorted(set(self.head_dims)) if d > 1])   # 'l0' blocks carry none
+        elif self.gauge_group in local_algebra:
+            n_alg = local_algebra[self.gauge_group](self.d_head)
+            shapes = [(n_alg, self.embed_dim if self.gauge_tying == "shared" else self.d_head)]
+        else:
+            return None
+        for n_gen, K in shapes:
+            need = strict_structure_bytes(n_gen, K)
+            if need > STRICT_STRUCTURE_BYTES:
+                return (f"needs {need / 2**20:.0f} MiB of structure-constant workspace for {n_gen} generators "
+                        f"on a {K} x {K} block (gauge_group={self.gauge_group!r}, gauge_tying="
+                        f"{self.gauge_tying!r}); the budget is {STRICT_STRUCTURE_BYTES / 2**20:.0f} MiB")
+        return None
 
     @property
     def head_dims(self) -> List[int]:
