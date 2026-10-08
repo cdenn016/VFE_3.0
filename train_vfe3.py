@@ -225,6 +225,7 @@ config = dict(
          
     rope_on_value                    = False,
     rope_space                       = "frame",       # "frame" (folded into U_i, absolute) | "comparison" (relative, kernel readout only)
+    rope_fraction                    = 1.0,       # p-RoPE: fraction of each head's pairs rotated (fastest first); 1.0 = RoPE
 
     ######################################
     #                Self Energy:

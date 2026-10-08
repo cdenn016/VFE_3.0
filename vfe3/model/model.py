@@ -320,7 +320,8 @@ class VFEModel(nn.Module):
                                 minimal_agent_inference=cfg.minimal_agent_inference,
                                 minimal_agent_channel_noise=cfg.minimal_agent_channel_noise,
                                 comparison_rope_base=(cfg.rope_base if cfg.pos_rotation == "rope"
-                                                      and cfg.rope_space == "comparison" else None))
+                                                      and cfg.rope_space == "comparison" else None),
+                                comparison_rope_fraction=cfg.rope_fraction)
             for layer_index in range(cfg.n_layers)
         ]
         self.relational_operators = layers[0]
@@ -688,12 +689,14 @@ class VFEModel(nn.Module):
         if self.cfg.pos_rotation == "none" or getattr(self.cfg, "rope_space", "frame") == "comparison":
             return None
         dtype = self.group.generator_dtype
-        key = (n, device, dtype, self.cfg.pos_rotation, self.cfg.rope_base)
+        key = (n, device, dtype, self.cfg.pos_rotation, self.cfg.rope_base, self.cfg.rope_fraction)
         cached = self._rope_cache.get(key)
         if cached is None:
+            # p-RoPE fraction only when set: registered builders predating it keep their signature.
+            extra = {} if self.cfg.rope_fraction == 1.0 else {"fraction": self.cfg.rope_fraction}
             cached = get_pos_rotation(self.cfg.pos_rotation)(
                 torch.arange(n, device=device), self.group.irrep_dims,
-                base=self.cfg.rope_base, device=device, dtype=dtype)
+                base=self.cfg.rope_base, device=device, dtype=dtype, **extra)
             self._rope_cache.clear()
             self._rope_cache[key] = cached
         return cached

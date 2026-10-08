@@ -47,9 +47,10 @@ def _pos_rotation_none(
     irrep_dims: List[int],
 
     *,
-    base:   float = 100.0,
-    device: Optional[torch.device] = None,
-    dtype:  torch.dtype  = torch.float32,
+    base:     float = 100.0,
+    fraction: float = 1.0,
+    device:   Optional[torch.device] = None,
+    dtype:    torch.dtype  = torch.float32,
 ) -> Optional[torch.Tensor]:
     r"""No rotation: returns None (the transport is left un-rotated)."""
     return None
@@ -61,14 +62,18 @@ def build_rope_rotation(
     irrep_dims: List[int],                # block sizes; sum == K
 
     *,
-    base:   float = 100.0,
-    device: Optional[torch.device] = None,
-    dtype:  torch.dtype  = torch.float32,
+    base:     float = 100.0,
+    fraction: float = 1.0,
+    device:   Optional[torch.device] = None,
+    dtype:    torch.dtype  = torch.float32,
 ) -> torch.Tensor:                        # (N, K, K) block-diagonal orthogonal rotation
     r"""Per-position block-diagonal rotation R(theta) on ``irrep_dims``.
 
     Within a block of size d at offset s, pairs (s+2k, s+2k+1) rotate by
-    theta_{n,k} = n * base^{-2k/d}; an odd-dim block's leftover last coordinate stays identity and is
+    theta_{n,k} = n * base^{-2k/d}. With ``fraction`` p < 1 (p-RoPE, Barbero et al., ICLR 2025,
+    arXiv:2410.06205) only the floor(p d / 2) fastest pairs k < floor(p d / 2) rotate, at their full-RoPE
+    frequencies; the slower pairs are left unrotated (theta = 0), a position-free subspace. p = 1 is RoPE.
+    An odd-dim block's leftover last coordinate stays identity and is
     therefore POSITIONALLY INERT (it carries zero positional content) -- a future un-gating of rope
     onto an odd-dim block must not assume full positional coverage (audit 2026-06-13 L21). The result
     is orthogonal and block-diagonal, so it preserves the block-diagonal exp fast path.
@@ -78,8 +83,12 @@ def build_rope_rotation(
     N = pos.shape[0]
     R = torch.eye(K, device=device, dtype=dtype).expand(N, K, K).clone()
     start = 0
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError(f"rope fraction must be in (0, 1], got {fraction!r}")
     for d in irrep_dims:
-        n_pairs = d // 2
+        n_pairs = int(fraction * d // 2)                           # rotated pairs (all of them at p = 1)
+        if d >= 2 and n_pairs == 0:
+            raise ValueError(f"rope fraction {fraction} rotates no pair of a block of size {d}")
         for k in range(n_pairs):
             freq = base ** (-2.0 * k / d)
             theta = pos * freq                                     # (N,)

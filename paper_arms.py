@@ -338,6 +338,7 @@ BASELINE_PROTOCOL_FIELDS: Dict[str, str] = {
     "warmup_steps": "warmup_steps", "min_lr_frac": "min_lr_frac",
     "grad_clip": "grad_clip", "beta_attention_prior": "beta_attention_prior",
     "alibi_slope": "alibi_slope", "pos_rotation": "pos_rotation", "rope_base": "rope_base",
+    "rope_fraction": "rope_fraction",
     "decode_bias": "decode_bias",
     "decode_unigram_prior": "decode_unigram_prior", "unigram_kappa": "unigram_kappa",
 }
