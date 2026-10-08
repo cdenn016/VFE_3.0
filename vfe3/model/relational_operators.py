@@ -713,9 +713,16 @@ class RelationalOperators(nn.Module):
         with torch.autocast(device_type=mu.device.type, enabled=False), ieee_fp32_matmul():
             xi = self.canonical_mean(mu.to(dtype), frame).to(dtype)                       # (..., N, K) U_i^{-1} mu_i
             C = self._reference_covariance(sigma, frame, dtype, diagonal=sigma.dim() == mu.dim())
+            rope = None
+            if self.comparison_rope_base is not None:
+                # rope_space='comparison': the record of a source at offset j - i arrives through R_{j-i}.
+                from vfe3.geometry.rope import build_rope_rotation
+                rope = build_rope_rotation(torch.arange(xi.shape[-2], device=xi.device), [S.shape[1]],
+                                           base=self.comparison_rope_base, fraction=self.comparison_rope_fraction,
+                                           device=xi.device, dtype=dtype)                  # (N, d, d)
             result = minimal_agent.minimal_agent_readout(
                 xi, C, S, T, log_noise, log_prior, self.minimal_agent_inference, diagnostics=diagnostics,
-                check=False)
+                check=False, rope=rope)
             forward = frame.forward.to(dtype)
             mu_plus = frame_matvec(forward, result.xi, frame.block_diagonal)              # (..., N, K) U_i xi_i^+
             sigma_plus = None

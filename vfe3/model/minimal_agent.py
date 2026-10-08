@@ -93,6 +93,18 @@ earlier inverses. :meth:`RelationalOperators.minimal_agent_update` recomputes a 
 float32 layer call in float64 (the whole call, from the local beliefs) and raises only if the float64 call fails
 too.
 
+Comparison-space RoPE (``rope_space='comparison'``). With the per-position rotation :math:`R_i` of
+:func:`vfe3.geometry.rope.build_rope_rotation` (orthogonal, :math:`d\times d`), head :math:`h`'s record is
+:math:`o_h = R_iS_hX_i - R_jT_hX_{J^h} + \varepsilon_h`; the noise :math:`n_hI_d` is rotation invariant, so this is the
+record :math:`S_hX_i - R_{j-i}T_hX_{J^h} + \varepsilon'_h` of a source whose utterance reaches receiver :math:`i` through the
+known channel :math:`R_{j-i} = R_i^\top R_j`. Every cost (exact and mean field) is computed on the rotated moments
+:math:`(R_ia_i, R_iA_iR_i^\top)` and :math:`(R_jb_j, R_jB_jR_j^\top)`, so the labels depend on position only through
+:math:`j - i`, and the receiver statistics are rotated back into the receiver's record frame,
+:math:`u_i \to R_i^\top u_i`, :math:`\bar\Lambda_i, R_i^{\rm spread}, \Lambda_i \to R_i^\top(\cdot)R_i`,
+:math:`\eta_i \to R_i^\top\eta_i`. This is the exact posterior of the rotated record: the gain
+:math:`\mathsf K_i = C_iS^\top` is unchanged and the received content arrives through :math:`R_{j-i}` and is decoded by it,
+so routing and content stay in one frame (no ``rope_on_value`` split). :math:`R = I` is the unrotated model.
+
 Pure functions with shape comments; :class:`vfe3.model.relational_operators.RelationalOperators` owns the parameters
 (``raw_score_q``, ``T``, ``channel_log_noise``) and calls these. Factorizations use zero jitter and no covariance
 repair, and a failed factorization is never repaired: it raises ``ValueError`` or, with ``check=False``, is
@@ -559,6 +571,7 @@ def _label_staleness(
     B:       torch.Tensor,                      # (..., H, N, d, d)
     lp:      torch.Tensor,                      # (..., H, N, N)
     weights: torch.Tensor,                      # (..., H, N, N) labels used (input moments)
+    rope:    Optional[torch.Tensor] = None,     # (N, d, d) comparison rotation R_i; b, B already rotated by R_j
 ) -> torch.Tensor:                              # (..., N, H)
     r"""Total variation :math:`\tfrac12\sum_j|\beta^+_{ij} - \beta_{ij}|` between the mean-field labels at the input
     moments and the same KL labels recomputed at the posterior query moments
@@ -574,6 +587,10 @@ def _label_staleness(
     Y = torch.einsum("hsk,...ngkt->...nhgst", S.to(f64), gains.to(f64))        # (..., N, H, H, d, d) S_h K^g
     A_plus = _symmetrize(V_Q.to(f64) - torch.einsum("...nhgst,...ngtu,...nhgvu->...nhsv", Y, M.to(f64), Y))
     a_plus = torch.einsum("hsk,...nk->...nhs", S.to(f64), xi_plus.to(f64))     # (..., N, H, d)
+    if rope is not None:
+        R64 = rope.to(f64)                                                      # (N, d, d)
+        a_plus = torch.einsum("nst,...nht->...nhs", R64, a_plus)
+        A_plus = _symmetrize(torch.einsum("nst,...nhtu,nvu->...nhsv", R64, A_plus, R64))
     eye = torch.eye(A_plus.shape[-1], dtype=f64, device=A_plus.device)
     bad = ((torch.linalg.cholesky_ex(torch.nan_to_num(A_plus))[1] != 0)
            | ~torch.isfinite(A_plus).all(dim=(-2, -1)) | ~torch.isfinite(a_plus).all(dim=-1))   # (..., N, H)
@@ -601,6 +618,7 @@ def minimal_agent_readout(
     *,
     diagnostics: bool = False,
     check:       bool = True,
+    rope:        Optional[torch.Tensor] = None,  # (N, d, d) comparison-space rotation R_i, or None
 ) -> MinimalAgentResult:
     r"""Posterior reference moments of every receiver under the minimal agent model.
 
@@ -632,7 +650,8 @@ def minimal_agent_readout(
     a failure (a certificate alone does not raise); ``check=False`` returns both flags for the caller's single
     check. The mean field's input covariances are factored here first, so ``projected_gaussian_kl`` (which keeps its
     own host transfer) never receives a failed one. Requires :math:`n_h > 0`, every :math:`S_h` of full row rank and
-    :math:`C_i\succ 0`.
+    :math:`C_i\succ 0`. ``rope`` applies the comparison-space rotation of the module docstring (labels depend on
+    position only through :math:`j - i`; ``query_covariance`` and ``key_covariance`` stay unrotated).
     """
     if inference not in MINIMAL_AGENT_INFERENCE:
         raise ValueError(f"minimal_agent_inference must be one of {MINIMAL_AGENT_INFERENCE}, got {inference!r}")
@@ -642,6 +661,8 @@ def minimal_agent_readout(
     N = xi.shape[-2]
     if xi.shape[-1] != K:
         raise ValueError(f"reference means of width {xi.shape[-1]} do not match the map width {K}")
+    if rope is not None and rope.shape != (N, d, d):
+        raise ValueError(f"rope must be (N, d, d) = {(N, d, d)}, got {tuple(rope.shape)}")
     blocks = C.dim() == xi.dim() + 2                                            # (..., N, G, g, g) diagonal blocks
     dtype = _compute_dtype(xi, C, S, T, log_noise)
     certify = dtype == torch.float32 and projected_condition_recovery()          # the A^h certificate is opt-in
@@ -654,6 +675,26 @@ def minimal_agent_readout(
         V_K = _symmetrize(torch.einsum("hsk,...nhkt->...nhst", T, gain_basis(C, T, blocks)))   # T_h C T_h^T
         b = torch.einsum("hsk,...nk->...hns", T, xi)                            # (..., H, N, d) b_j^h
         B = V_K.movedim(-3, -4) + noise[:, None, None, None] * eye              # (..., H, N, d, d) B_j^h
+        Rot = None if rope is None else rope.to(dtype)                          # (N, d, d) R_i
+        if Rot is not None:
+            # Sources in the absolute comparison frame: b_j -> R_j b_j, B_j -> R_j B_j R_j^T (n I is invariant).
+            b = torch.einsum("nst,...hnt->...hns", Rot, b)
+            B = _symmetrize(torch.einsum("nst,...hntu,nvu->...hnsv", Rot, B, Rot))
+
+        def rotate_in(a: torch.Tensor, A: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+            r"""Receiver query moments in the absolute frame, :math:`(R_ia_i, R_iA_iR_i^\top)`; identity without RoPE."""
+            if Rot is None:
+                return a, A
+            return (torch.einsum("nst,...nt->...ns", Rot, a),
+                    _symmetrize(torch.einsum("nst,...ntu,nvu->...nsv", Rot, A, Rot)))
+
+        def rotate_back(v: Optional[torch.Tensor], X: Optional[torch.Tensor]):
+            r"""Receiver statistics back to the record frame, :math:`R_i^\top v_i` and :math:`R_i^\top X_iR_i`."""
+            if Rot is None:
+                return v, X
+            v = None if v is None else torch.einsum("nts,...nt->...ns", Rot, v)
+            X = None if X is None else _symmetrize(torch.einsum("nts,...ntu,nuv->...nsv", Rot, X, Rot))
+            return v, X
         lp = (torch.zeros(N, N, dtype=dtype, device=xi.device) if log_prior is None
               else log_prior.to(dtype))
         if lp.dim() == 2:
@@ -690,17 +731,20 @@ def minimal_agent_readout(
         if inference == "exact":
             def head_update(h: int, a: torch.Tensor, A: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
                 check_query(h, A)
-                post = exact_record_posterior(a, A, b[..., h, :, :], B[..., h, :, :, :], lp[..., h, :, :],
+                a_r, A_r = rotate_in(a, A)
+                post = exact_record_posterior(a_r, A_r, b[..., h, :, :], B[..., h, :, :, :], lp[..., h, :, :],
                                               check=False)
                 weights.append(post.weights)
                 costs.append(post.cost)
+                u, Lambda_bar = rotate_back(post.u, post.Lambda_bar)
+                _, spread = rotate_back(None, post.R)
                 if diagnostics:
                     with torch.no_grad():
-                        removed = torch.diagonal(A @ post.Lambda_bar, dim1=-2, dim2=-1).sum(-1)
+                        removed = torch.diagonal(A @ Lambda_bar, dim1=-2, dim2=-1).sum(-1)
                         fractions.append(removed / d)
-                        spreads.append(torch.diagonal(A @ post.R, dim1=-2, dim2=-1).sum(-1) / removed)
+                        spreads.append(torch.diagonal(A @ spread, dim1=-2, dim2=-1).sum(-1) / removed)
                 flags.append(post.failed)
-                return post.u, _symmetrize(post.Lambda_bar - post.R)
+                return u, _symmetrize(Lambda_bar - spread)
         else:
             a0 = torch.einsum("hsk,...nk->...hns", S, xi)                       # (..., H, N, d) input query means
             # projected_gaussian_kl raises on a failed factorization, so the input query and utterance covariances
@@ -712,7 +756,16 @@ def minimal_agent_readout(
             flags += [bad_Q.any(), bad_B.any()]
             V_Q_kl = torch.where(bad_Q[..., None, None], eye, V_Q)
             B_kl = torch.where(bad_B[..., None, None], eye, B)
-            labels = mean_field_record_posterior(a0, V_Q_kl.movedim(-3, -4), b, B_kl, lp, check=False)
+            a0_r, V_Q_r = a0, V_Q_kl.movedim(-3, -4)                            # (..., H, N, d), (..., H, N, d, d)
+            if Rot is not None:
+                a0_r = torch.einsum("nst,...hnt->...hns", Rot, a0_r)
+                V_Q_r = _symmetrize(torch.einsum("nst,...hntu,nvu->...hnsv", Rot, V_Q_r, Rot))
+            labels = mean_field_record_posterior(a0_r, V_Q_r, b, B_kl, lp, check=False)
+            if Rot is not None:
+                # Label information back to receiver i's record frame: Lambda -> R_i^T Lambda R_i, eta -> R_i^T eta.
+                labels = labels._replace(
+                    Lambda=_symmetrize(torch.einsum("nts,...hntu,nuv->...hnsv", Rot, labels.Lambda, Rot)),
+                    eta=torch.einsum("nts,...hnt->...hns", Rot, labels.eta))
             weights.append(labels.weights)
             costs.append(labels.cost)
             flags.append(labels.failed)
@@ -745,7 +798,7 @@ def minimal_agent_readout(
             with torch.no_grad():
                 coupling = _head_coupling(S, X0)
                 contraction = _covariance_contraction(C, gains, M, blocks)       # (..., N)
-                staleness = (_label_staleness(xi_plus, V_Q, S, gains, M, b, B, lp, weights_out)
+                staleness = (_label_staleness(xi_plus, V_Q, S, gains, M, b, B, lp, weights_out, rope=Rot)
                              if inference == "mean_field"
                              else torch.full_like(coupling, math.nan))           # (..., N, H)
                 spread = (torch.stack(spreads, dim=-1) if inference == "exact"
