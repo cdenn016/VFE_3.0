@@ -551,11 +551,12 @@ def compose_bch(
     On a basis NOT closed under the Lie bracket the Dynkin commutator terms push
     :math:`Z` out of :math:`\mathrm{span}\{G_a\}`, and the final
     :math:`\mathrm{extract\_phi}(Z)` least-squares projection silently discards that
-    out-of-span component. A diagnostic guard measures the max relative residual
-    :math:`\max \lVert Z - \mathrm{embed}(\mathrm{extract}(Z))\rVert_F /
-    (\lVert Z\rVert_F + \epsilon)` and warns once if it exceeds ``closure_tol``; on a
-    closed (default direct-sum) basis the residual is ~0 so the guard is silent and the
-    returned phi is unchanged.
+    out-of-span component. The guard :func:`require_basis_closed` therefore measures the max
+    relative bracket residual
+    :math:`\max_{a,b} \lVert [G_a,G_b] - \mathrm{embed}(\mathrm{extract}([G_a,G_b]))\rVert_F /
+    (\lVert [G_a,G_b]\rVert_F + \epsilon)` and raises ``ValueError`` if it exceeds
+    ``closure_tol`` (fail closed, audit 2026-10-07 F20); on a closed (default direct-sum) basis the
+    residual is ~0, so the guard passes and the returned phi is unchanged.
     """
     if residual_max is not None and (
         not math.isfinite(residual_max) or residual_max <= 0.0

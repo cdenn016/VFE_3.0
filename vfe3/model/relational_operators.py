@@ -13,9 +13,12 @@ from vfe3.model import edge_links, minimal_agent
 from vfe3.model.edge_links import EDGE_MODES, EdgeContext
 from vfe3.model.frame_actions import frame_matvec
 from vfe3.relational_scoring import (
-    _compute_dtype, _count_source_recovery, projected_condition_recovery, source_recovery_counter,
+    ROUTING_COSTS, _compute_dtype, _count_source_recovery, projected_condition_recovery, source_recovery_counter,
 )
 from vfe3.runtime import ieee_fp32_matmul
+
+# Byte budget of one query-row tile of the centered predictive spread (the (rows, N, H, d) differences).
+_SPREAD_TILE_BYTES = 32 * 1024 ** 2
 
 # Receiving-map charts of the content link on the stored factors (O, T) (attention_unified.tex,
 # "The tiled message order by order"). A later truncation such as "second_order" adds one branch
@@ -39,6 +42,50 @@ def _phi1(A: torch.Tensor) -> torch.Tensor:          # (..., n, n) -> (..., n, n
                            torch.zeros(*A.shape[:-2], n, 2 * n, dtype=A.dtype, device=A.device)],
                           dim=-2)                                                       # (..., 2n, 2n)
     return torch.linalg.matrix_exp(augmented)[..., :n, n:]
+
+
+def _centered_spread_tile(
+    b:      torch.Tensor,  # (..., H, I, N) routing rows of the tile
+    values: torch.Tensor,  # (..., N, H, d) source values
+    mean:   torch.Tensor,  # (..., I, H, d) routed means of the tile's rows
+) -> torch.Tensor:         # (..., I, H, d, d)
+    r"""One query-row tile of :func:`_centered_spread`."""
+    diff = values.unsqueeze(-4) - mean.unsqueeze(-3)                          # (..., I, N, H, d) v_j - m_i
+    weighted = b.movedim(-3, -1).unsqueeze(-1) * diff                          # (..., I, N, H, d)
+    spread = torch.einsum("...ijhs,...ijht->...ihst", weighted, diff)         # (..., I, H, d, d)
+    residual = weighted.sum(dim=-3)                                            # (..., I, H, d) sum_j b (v_j - m_i)
+    return spread - residual.unsqueeze(-1) * residual.unsqueeze(-2)
+
+
+def _centered_spread(
+    b:      torch.Tensor,  # (..., H, N, N) routing weights, rows sum to one
+    values: torch.Tensor,  # (..., N, H, d) source values v_j^h
+    mean:   torch.Tensor,  # (..., N, H, d) routed means m_i^h = sum_j beta_ij^h v_j^h
+) -> torch.Tensor:         # (..., N, H, d, d)
+    r"""Routed spread accumulated about each row's own routed mean (audit 2026-10-08 P2-20).
+
+    .. math::
+        S_i=\sum_j\beta_{ij}(v_j-\hat m_i)(v_j-\hat m_i)^\top-\delta_i\delta_i^\top,
+        \qquad \delta_i=\sum_j\beta_{ij}(v_j-\hat m_i),
+
+    which equals :math:`\sum_j\beta_{ij}v_jv_j^\top-m_im_i^\top` in exact arithmetic for any center
+    :math:`\hat m_i` when the row sums to one; :math:`\delta_i` is the rounding error of the computed
+    mean, a second-order correction. The one-pass uncentered form cancels :math:`m_im_i^\top` against the
+    second moment, so its error grows with the routed sources' offset from the common shift and returned
+    nonpositive variances in fp32 under sharp routing. Query rows are tiled to a fixed byte budget and
+    each tile is checkpointed under autograd, so the saved differences stay bounded.
+    """
+    N = b.shape[-2]
+    per_row = values[..., 0, :, :].numel() * values.element_size() * max(1, values.shape[-3])
+    step = max(1, min(N, _SPREAD_TILE_BYTES // max(1, per_row)))
+    tiles = []
+    for i in range(0, N, step):
+        args = (b[..., i:i + step, :], values, mean[..., i:i + step, :, :])
+        if torch.is_grad_enabled() and step < N and any(x.requires_grad for x in args):
+            tiles.append(checkpoint(_centered_spread_tile, *args, use_reentrant=False, preserve_rng_state=False))
+        else:
+            tiles.append(_centered_spread_tile(*args))
+    return tiles[0] if len(tiles) == 1 else torch.cat(tiles, dim=-4)
 
 
 def head_runs(head_dims: Sequence[int]) -> List[Tuple[int, int, int, int]]:
@@ -282,8 +329,8 @@ class RelationalOperators(nn.Module):
         self.receiver_update = receiver_update
         self.receiver_damping = float(receiver_damping)
         self.readout_mode = readout_mode
-        if routing not in ("gaussian_kl", "noisy_query", "mean_distance"):
-            raise ValueError("relational routing must be 'gaussian_kl', 'noisy_query' or 'mean_distance'")
+        if routing not in ROUTING_COSTS:
+            raise ValueError(f"relational routing must be one of {tuple(ROUTING_COSTS)}, got {routing!r}")
         if routing != "gaussian_kl" and readout_mode != "predictive_content":
             raise ValueError(f"{routing} routing requires predictive_content")
         self.routing = routing
@@ -718,10 +765,7 @@ class RelationalOperators(nn.Module):
             rope = None
             if self.comparison_rope_base is not None:
                 # rope_space='comparison': the record of a source at offset j - i arrives through R_{j-i}.
-                from vfe3.geometry.rope import build_rope_rotation
-                rope = build_rope_rotation(torch.arange(xi.shape[-2], device=xi.device), [S.shape[1]],
-                                           base=self.comparison_rope_base, fraction=self.comparison_rope_fraction,
-                                           device=xi.device, dtype=dtype)                  # (N, d, d)
+                rope = self.comparison_rope_rotation(xi.shape[-2], S.shape[1], xi.device, dtype)  # (N, d, d)
             result = minimal_agent.minimal_agent_readout(
                 xi, C, S, T, log_noise, log_prior, self.minimal_agent_inference, diagnostics=diagnostics,
                 check=False, rope=rope)
@@ -919,10 +963,8 @@ class RelationalOperators(nn.Module):
             c = torch.einsum("...hij,...gij->...hgij", b, b)
             c = c * (1.0 - eye_h)[..., None, None] + torch.einsum("...hij,hg->...hgij", b, eye_h)
             pooled = torch.einsum("...hgij,...jhgst->...ihgst", c, source)            # (..., N, H, H, d, d)
-            second = torch.einsum("...hij,...jhst->...ihst",
-                                  b, values.unsqueeze(-1) * values.unsqueeze(-2))      # (..., N, H, d, d)
             mean = torch.einsum("...hij,...jhs->...ihs", b, values)                    # (..., N, H, d)
-            spread = second - mean.unsqueeze(-1) * mean.unsqueeze(-2)
+            spread = _centered_spread(b, values, mean)                                 # (..., N, H, d, d)
             pooled = pooled + torch.einsum("...ihst,hg->...ihgst", spread, eye_h)
             lifted = torch.einsum("hks,...nhgst->...ngkt", O_hat, pooled)             # (..., N, H, K, d) sum_h O'_h P_hg
             lifted = lifted.reshape(*lifted.shape[:-2], H, d, d)                       # (..., N, g, l, k, t)
@@ -986,8 +1028,8 @@ class RelationalOperators(nn.Module):
 
             # Shift every source mean by token 0's. Each beta row sums to 1, so the spread
             # sum_j beta_ij v_j v_j^T - m_i m_i^T is invariant under a common shift of the v_j, and
-            # the shift is causal because token 0 lies in every row's support. It removes the
-            # common offset that would otherwise cancel between the two terms.
+            # the shift is causal because token 0 lies in every row's support. The spread itself is
+            # accumulated about each row's routed mean (_centered_spread), so no offset cancels there.
             xi = xi - xi[..., :1, :]                                              # (..., N, K)
             b_runs = [self._head_slice(b, run, -3) for run in range(len(self.runs))]   # (..., n_r, N, N)
             TC_runs = [torch.einsum("hsk,...nkm->...nhsm", T_hat, C)               # (..., N, n_r, d_r, K)
@@ -1004,10 +1046,8 @@ class RelationalOperators(nn.Module):
                     pooled = torch.einsum("...hgij,...jhgst->...ihgst", c, source)
                     if r == g:
                         values = torch.einsum("hsk,...nk->...nhs", T_r, xi)        # (..., N, n_r, d_r)
-                        second = torch.einsum("...hij,...jhst->...ihst",
-                                              b_r, values.unsqueeze(-1) * values.unsqueeze(-2))
                         mean = torch.einsum("...hij,...jhs->...ihs", b_r, values)  # (..., N, n_r, d_r)
-                        spread = second - mean.unsqueeze(-1) * mean.unsqueeze(-2)
+                        spread = _centered_spread(b_r, values, mean)               # (..., N, n_r, d_r, d_r)
                         pooled = pooled + torch.einsum("...ihst,hg->...ihgst", spread, eye_h)
                     lifted = torch.einsum("hks,...nhgst->...ngkt", O_r, pooled)   # (..., N, n_g, K, d_g)
                     term = torch.einsum("...ngkt,gmt->...nkm", lifted, O_g)        # (..., N, K, K)
@@ -1071,6 +1111,32 @@ class RelationalOperators(nn.Module):
         r"""Per-run (S_Q, S_K), each (n_r, d_r, input_dim), with live role graphs; the tied S_K = T under the minimal agent."""
         key = "T" if self.predictive_readout == "minimal_agent" else "raw_score_k"
         return list(zip(self._stored_runs("raw_score_q"), self._stored_runs(key)))
+
+    def comparison_rope_rotation(
+        self,
+        n:      int,                   # sequence length N
+        r:      int,                   # comparison rank of the rotated run
+        device: torch.device,
+        dtype:  torch.dtype,
+    ) -> torch.Tensor:                 # (N, r, r) R_i, positions 0..N-1
+        r"""Cached comparison-space RoPE rotation :math:`R_i` under ``rope_space='comparison'``.
+
+        The rotation is a constant of (N, r, base, fraction, device, dtype) with no graph, so one build
+        serves every layer and forward. A build under ``torch.inference_mode`` is not cached, since an
+        inference tensor cannot later be saved for backward.
+        """
+        from vfe3.geometry.rope import build_rope_rotation
+        key = (n, r, self.comparison_rope_base, self.comparison_rope_fraction, str(device), dtype)
+        cache = self.__dict__.setdefault("_comparison_rope_cache", {})
+        rotation = cache.get(key)
+        if rotation is None:
+            rotation = build_rope_rotation(torch.arange(n, device=device), [r], base=self.comparison_rope_base,
+                                           fraction=self.comparison_rope_fraction, device=device, dtype=dtype)
+            if not torch.is_inference_mode_enabled():
+                if len(cache) >= 8:
+                    cache.clear()
+                cache[key] = rotation
+        return rotation
 
     def content_factors(self) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""Return full-state (T, O') for M_h=O'_h T_h; O' = O in the affine chart (the stored parameter)."""

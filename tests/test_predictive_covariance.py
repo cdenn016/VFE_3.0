@@ -314,7 +314,8 @@ def test_frozen_covariance_label_and_artifact_fields() -> None:
     assert not metrics.covariance_frozen_at_encode(live)
     fields = _relational_artifact_fields(live)["relational_operators"]
     assert fields["covariance_update"] == "moment_matched"
-    assert fields["content_covariance_contract"] == "exact_predictive_kernel_moment_match_plus_covariant_floor"
+    assert fields["content_covariance_contract"] == ("diagonal_local_moment_projection_of_predictive_kernel"
+                                                     "_plus_floor")
     assert _relational_artifact_fields(_cfg())["relational_operators"]["covariance_update"] == "passthrough"
 
 

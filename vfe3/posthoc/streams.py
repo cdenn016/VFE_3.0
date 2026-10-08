@@ -8,7 +8,8 @@ load for ``(dataset, split)`` and checks it against what the run recorded:
   identity the best-checkpoint selection was made on), and the canonical int64 CONTENT SHA-256 and
   token count against ``provenance.json`` (``val_data_sha256``, ``val_data_n_tokens``);
 * test and train: the content SHA-256 and token count against ``provenance.json``
-  (``test_data_*``, ``train_data_*``).
+  (``test_data_*``, ``train_data_*``). The train stream is loaded with the run's recorded
+  ``max_tokens`` cap (the cap applies to the train split only), as the training loader loaded it.
 
 A mismatch raises :class:`StreamIdentityError` unless ``allow_mismatch`` is set, in which case the
 record says so. A stream with no recorded identity is used and marked ``unverified``.
@@ -18,7 +19,10 @@ windows of ``seq_len`` tokens starting at multiples of ``stride`` whose last ``s
 scored (every target has at least ``seq_len - stride`` tokens of context), drawn without replacement
 by a generator with the fixed seed :data:`TRAIN_SAMPLE_SEED` (independent of the model and data
 seeds), with as many scored targets as the validation split, capped at
-:data:`TRAIN_SAMPLE_MAX_TARGETS`.
+:data:`TRAIN_SAMPLE_MAX_TARGETS`. The training loop scores a smaller sample under its own cap
+(:data:`vfe3.train.TRAIN_SAMPLE_MAX_TARGETS`); both are prefixes of the same seeded permutation, so the
+training sample is a subset of the post-hoc one (:func:`training_loop_sample_windows`), and the
+reproduction of the logged ``train_sample_ce`` is checked on that subset only.
 
 WikiText articles begin at level-1 headings, lines of the form ``" = Title = "``;
 :func:`article_ids` finds them in the decoded byte stream and assigns every token the index of the
@@ -179,7 +183,9 @@ def resolve_stream(
     if split not in _PROVENANCE_PREFIX:
         raise ValueError(f"split must be one of {sorted(_PROVENANCE_PREFIX)}, got {split!r}")
     source = cache_source_identity(info.dataset, split, cache_dir=cache_dir)
-    tokens = load_cached_tokens(info.dataset, split, cache_dir=cache_dir)
+    max_tokens = info.provenance.get("max_tokens") if split == "train" else None
+    limit = int(max_tokens) if max_tokens is not None else None   # the run capped its train stream only
+    tokens = load_cached_tokens(info.dataset, split, cache_dir=cache_dir, limit=limit)
     suffix = "pt" if source["format"] == "pt" else "bin"
     record: Dict[str, Any] = {
         "split":          split,
@@ -189,6 +195,7 @@ def resolve_stream(
         "file_sha256":    source["sha256"],
         "content_sha256": token_content_sha256(tokens),
         "n_tokens":       int(tokens.numel()),
+        "max_tokens":     limit,
         "tokenizer_provenance_status": source.get("tokenizer_provenance_status"),
     }
     expected: Dict[str, Any] = {}
@@ -287,8 +294,9 @@ def fixed_train_sample(
     :math:`k = 0, \dots, \lfloor (T - L - 1)/L \rfloor`; the sample is the first
     :math:`\lceil \min(n, n_{\max}) / \mathrm{stride} \rceil` entries of a ``randperm`` drawn by a
     generator seeded with ``seed``, sorted, and each window scores its last ``stride`` targets.
-    This is the sample ``vfe3.train`` scores during training (``_build_fixed_train_sample``), so
-    the post-hoc value reproduces the logged ``train_sample_ce``.
+    With ``max_targets = vfe3.train.TRAIN_SAMPLE_MAX_TARGETS`` this is the sample ``vfe3.train``
+    scores during training (``_build_fixed_train_sample``); the default post-hoc cap is larger, and
+    :func:`training_loop_sample_windows` locates the training sample inside it.
     """
     n_candidates = (int(train_tokens.numel()) - seq_len - 1) // seq_len + 1
     if n_candidates <= 0:
@@ -297,6 +305,31 @@ def fixed_train_sample(
     generator = torch.Generator().manual_seed(int(seed))
     chosen = torch.randperm(n_candidates, generator=generator)[:n_windows].sort().values
     return ScoredTailWindows(train_tokens, (chosen * seq_len).numpy(), seq_len, stride)
+
+
+def training_loop_sample_windows(
+    sample:       ScoredTailWindows,
+    train_tokens: torch.Tensor,
+    n_targets:    int,
+
+    *,
+    seed: int = TRAIN_SAMPLE_SEED,
+) -> Tuple[np.ndarray, int]:
+    r"""``(indices into sample, max_targets)`` of the windows the training loop scored as its fixed sample.
+
+    The training loop draws the first :math:`\lceil \min(n, n^{\rm train}_{\max}) / \mathrm{stride} \rceil`
+    entries of the same seeded permutation (:data:`vfe3.train.TRAIN_SAMPLE_MAX_TARGETS`), a prefix of
+    the post-hoc draw whenever the post-hoc cap is at least as large. Raises ``ValueError`` when the
+    training windows are not all in ``sample`` (a post-hoc cap below the training cap).
+    """
+    from vfe3.train import TRAIN_SAMPLE_MAX_TARGETS as training_max_targets
+
+    training = fixed_train_sample(train_tokens, sample.seq_len, sample.stride, n_targets,
+                                  max_targets=training_max_targets, seed=seed)
+    inside = np.isin(sample.starts, training.starts)
+    if int(inside.sum()) != len(training):
+        raise ValueError("the training loop's fixed sample is not contained in the post-hoc sample")
+    return np.flatnonzero(inside).astype(np.int64), int(training_max_targets)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -322,7 +355,8 @@ def article_ids(
     The stream is decoded to bytes; each match of ``^ = Title = $`` (a line whose first character
     after ``" = "`` is not ``"="``) starts an article at the token containing the heading's first
     byte. Tokens before the first heading join article 0. Returns ``(ids (T,) int64, titles, info)``,
-    or ``None`` when no byte decoder exists for the dataset or no heading is found.
+    or ``None`` when no byte decoder exists for the dataset or no heading is found. ``vocab_size``,
+    when given, bounds the ids (``ValueError`` otherwise); only the ids present are decoded.
     """
     if decode_bytes is None:
         if dataset is None:
@@ -333,9 +367,15 @@ def article_ids(
     ids = tokens.reshape(-1).to(torch.long).numpy()
     if ids.size == 0:
         return None
-    V = int(vocab_size) if vocab_size is not None else int(ids.max()) + 1
-    lengths = np.fromiter((len(decode_bytes([v])) for v in range(V)), dtype=np.int64, count=V)   # (V,)
-    ends = np.cumsum(lengths[ids])                                                    # (T,) exclusive end byte
+    if vocab_size is not None and (int(ids.min()) < 0 or int(ids.max()) >= int(vocab_size)):
+        raise ValueError(f"token ids span [{int(ids.min())}, {int(ids.max())}], outside the vocabulary "
+                         f"[0, {int(vocab_size)})")
+    # Byte lengths of the ids that occur only: a tokenizer may leave ids below its vocabulary size
+    # unassigned (cl100k_base), and decoding those raises.
+    present, inverse = np.unique(ids, return_inverse=True)                            # (U,), (T,)
+    lengths = np.fromiter((len(decode_bytes([int(v)])) for v in present), dtype=np.int64,
+                          count=present.size)                                         # (U,)
+    ends = np.cumsum(lengths[inverse.reshape(-1)])                                    # (T,) exclusive end byte
     text = decode_bytes(ids.tolist())
     if len(text) != int(ends[-1]):
         raise ValueError("per-token byte lengths do not add up to the decoded stream")

@@ -203,8 +203,11 @@ def test_template_codebook_decodes_tokens_with_the_sequence_decoder(tmp_path) ->
     probe = {"layers": [{"layer": layer, "codebook": [
         {"template": 3, "usage": 0.5, "top_tokens": [[7, 4], [9, 1]]},
         {"template": 1, "usage": 0.1, "top_tokens": []}]} for layer in range(3)]}
+    import matplotlib.pyplot as plt
     fig = feature_figures.plot_template_codebook(probe, decode=decode, path=str(tmp_path / "codebook.png"))
-    assert calls and all(isinstance(ids, list) for ids in calls)
     labels = {t.get_text() for ax in fig.axes for t in ax.get_yticklabels()}
+    titled_visible = sum(ax.get_visible() for ax in fig.axes if ax.get_title())
+    plt.close(fig)                                  # the plotting call leaves the figure open
+    assert calls and all(isinstance(ids, list) for ids in calls)
     assert "\u2018cat\u2019  \u2018,\u2019" in labels and "(none)" in labels and "#3" in labels
-    assert sum(ax.get_visible() for ax in fig.axes if ax.get_title()) == 3
+    assert titled_visible == 3

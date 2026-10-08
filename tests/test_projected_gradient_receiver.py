@@ -235,9 +235,13 @@ def test_spd_precision_retries_float32_failures_in_float64() -> None:
     B = torch.randn(6, 5, generator=generator, dtype=torch.float64)
     target = (B @ B.T + 1e-7 * torch.eye(6, dtype=torch.float64)).float()
     assert int(torch.linalg.cholesky_ex(target)[1]) != 0, "precondition: float32 factorization fails"
-    before = source_recovery_counter(target.device)
+    from vfe3.gradients.full_link import receiver_law_retry_counter
+    before = receiver_law_retry_counter(target.device)
+    recovery_before = source_recovery_counter(target.device)
     precision = _spd_precision(target)
-    assert int(source_recovery_counter(target.device) - before) == 1
+    # Receiving-law retries have their own counter; the projected-covariance recovery count is untouched.
+    assert int(receiver_law_retry_counter(target.device) - before) == 1
+    assert int(source_recovery_counter(target.device) - recovery_before) == 0
     assert precision.dtype == torch.float32 and bool(torch.isfinite(precision).all())
     torch.testing.assert_close(precision.double(), torch.linalg.inv(target.double()).float().double(),
                                rtol=1e-4, atol=1e-2)

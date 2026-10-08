@@ -522,7 +522,8 @@ def _batch_masks(
     stream = getattr(dataset, "tokens", None)
     if stream is None:
         return torch.ones(len(windows), N, dtype=torch.bool, device=device)
-    return torch.as_tensor(starts[:, None] + np.arange(N)[None, :] < int(stream.numel()), device=device)
+    # The last stream token is only a target, never an input.
+    return torch.as_tensor(starts[:, None] + np.arange(N)[None, :] < int(stream.numel()) - 1, device=device)
 
 
 def _support(log_prior: Optional[torch.Tensor], beta: torch.Tensor) -> torch.Tensor:   # (B, H, N, N) bool

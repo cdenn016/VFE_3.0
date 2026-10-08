@@ -61,6 +61,7 @@ from vfe3.timing import TrainingTimer
 from vfe3.viz.extract import e_step_belief_trace as _snapshot_trace
 from vfe3.geometry.retraction import (                          # SPD-retraction non-finite tangent guard
     nonfinite_tangent_elements,
+    public_spd_ceiling_contact_elements,
     public_spd_repair_elements,
     reset_nonfinite_tangent_elements,
     reset_public_spd_repair_elements,
@@ -1468,6 +1469,9 @@ NUMERICS_EVAL_COLUMNS: Tuple[str, ...] = (
 NUMERICS_CUMULATIVE_COLUMNS: Tuple[str, ...] = (
     "frame_projection_count", "frame_projection_total", "skipped_updates", "attempted_updates")
 CAP_ACTIVATION_FIELDS: Tuple[str, ...] = ("step", "layer", "head", "capped", "entries")
+# diagnostics/cap_clamped_rows.csv: per (layer, head), query rows (|S_i| >= 2) whose every source cost is
+# capped, the only case in which the clamp changes beta (audit 2026-10-08 critic-gapfill-2#3).
+CAP_CLAMPED_ROW_FIELDS: Tuple[str, ...] = ("step", "layer", "head", "clamped_rows", "rows")
 _EVAL_CADENCE_COLUMNS: Tuple[str, ...] = _TRAIN_SAMPLE_COLUMNS + NUMERICS_EVAL_COLUMNS
 
 
@@ -1511,6 +1515,9 @@ def _numerics_counter_skip_reasons(
 def _capture_numerics_counts(
     diagnostic: Mapping[str, Any],
     kl_max:     float,
+
+    *,
+    rows_out:   Optional[List[List[Tuple[int, int]]]] = None,
 ) -> Tuple[List[List[Tuple[int, int]]], List[Tuple[int, int]]]:
     r"""Cost-cap activations per (layer, head) and reduced-covariance factorizations per layer.
 
@@ -1527,6 +1534,12 @@ def _capture_numerics_counts(
     the ``computed`` population of :class:`vfe3.posthoc.klcap.KLCapObserver` on unpadded windows.
     With ``kl_max = inf`` only non-finite costs count as capped; a minimal-agent layer (``predictive_readout``,
     whose posterior applies no clamp) is counted under that rule.
+
+    Fully clamped rows. A capped entry changes :math:`\beta` only when its row's smallest cost reaches
+    :math:`\kappa`; a row with :math:`|S_i| \ge 2` whose every entry is capped routes uniformly with zero
+    routing gradient. When ``rows_out`` is given, one list per layer of ``(clamped_rows, rows)`` per head
+    is appended to it, with ``rows`` the number of query rows with :math:`|S_i| \ge 2` (audit 2026-10-08
+    critic-gapfill-2#3). The entry counts above are unchanged.
 
     Factorizations. Each layer factors its reduced query and key covariances
     :math:`G = L \Sigma L^\top` (:math:`L = S U^{-1}`, comparison rank :math:`r`) once per (window,
@@ -1568,6 +1581,8 @@ def _capture_numerics_counts(
         # The minimal-agent posterior applies no clamp: the kl_max = inf rule (only a non-finite cost counts).
         cap_level = math.inf if "relational_minimal_agent_channel_noise" in capture else kl_max
         capped = entries & (score >= cap_level)                             # (B, H, N, N)
+        rows_h = rows.squeeze(-1)                                           # (B, H, N)
+        clamped_rows = rows_h & (capped.sum(dim=-1) == entries.sum(dim=-1))  # (B, H, N) every entry capped
         G_q = capture["projected_covariance_pre"]                           # (B, N, H, r, r); per run if mixed
         G_k = capture["projected_key_covariance_pre"]                       # (B, N, H, r, r); per run if mixed
         attempted.append(sum(int(G.numel() // (G.shape[-1] ** 2))
@@ -1576,6 +1591,7 @@ def _capture_numerics_counts(
         heads.append(int(beta.shape[1]))
         device_counts.append(torch.cat((
             capped.sum(dim=(0, 2, 3)), entries.sum(dim=(0, 2, 3)),          # (H,), (H,)
+            clamped_rows.sum(dim=(0, 2)), rows_h.sum(dim=(0, 2)),           # (H,), (H,)
             recovered.to(device=beta.device, dtype=torch.long))))          # (1,)
     values = torch.cat(device_counts).cpu().tolist()                         # one host transfer
     cap: List[List[Tuple[int, int]]] = []
@@ -1584,9 +1600,13 @@ def _capture_numerics_counts(
     for n_heads, n_attempted in zip(heads, attempted):
         capped_h = values[offset:offset + n_heads]
         entries_h = values[offset + n_heads:offset + 2 * n_heads]
+        clamped_h = values[offset + 2 * n_heads:offset + 3 * n_heads]
+        rows_total_h = values[offset + 3 * n_heads:offset + 4 * n_heads]
         cap.append([(int(c), int(e)) for c, e in zip(capped_h, entries_h)])
-        factorization.append((int(values[offset + 2 * n_heads]), n_attempted))
-        offset += 2 * n_heads + 1
+        if rows_out is not None:
+            rows_out.append([(int(c), int(r)) for c, r in zip(clamped_h, rows_total_h)])
+        factorization.append((int(values[offset + 4 * n_heads]), n_attempted))
+        offset += 4 * n_heads + 1
     return cap, factorization
 
 
@@ -1594,8 +1614,16 @@ def _merge_numerics_counts(
     accumulator:   Dict[str, Any],
     cap:           List[List[Tuple[int, int]]],
     factorization: List[Tuple[int, int]],
+    clamped_rows:  Optional[List[List[Tuple[int, int]]]] = None,
 ) -> None:
-    r"""Add one chunk's counts to the per-evaluation accumulator (keys ``cap`` and ``factorization``)."""
+    r"""Add one chunk's counts to the per-evaluation accumulator (keys ``cap``, ``factorization``, ``clamped_rows``)."""
+    if clamped_rows is not None:
+        per_row = accumulator.setdefault("clamped_rows", {})
+        for layer, layer_counts in enumerate(clamped_rows):
+            for head, (clamped, rows) in enumerate(layer_counts):
+                total = per_row.setdefault((layer, head), [0, 0])
+                total[0] += clamped
+                total[1] += rows
     per_head = accumulator.setdefault("cap", {})
     for layer, layer_counts in enumerate(cap):
         for head, (capped, entries) in enumerate(layer_counts):
@@ -1634,6 +1662,16 @@ def _numerics_eval_columns(
         "factorization_count": int(fact[1]),
     }
     return columns, rows
+
+
+def _cap_clamped_row_rows(
+    accumulator: Mapping[str, Any],
+    step:        int,
+) -> List[Dict[str, int]]:
+    r"""``cap_clamped_rows.csv`` rows (``CAP_CLAMPED_ROW_FIELDS``) from one evaluation's accumulator."""
+    return [{"step": int(step), "layer": int(layer), "head": int(head),
+             "clamped_rows": int(clamped), "rows": int(rows)}
+            for (layer, head), (clamped, rows) in sorted((accumulator.get("clamped_rows") or {}).items())]
 
 
 def _note_numerics_eval(
@@ -2100,9 +2138,10 @@ def _residual_and_attention_rows(
                 _accumulate_minimal_agent(features_out, diagnostic)
             if counters_out is not None and "error" not in counters_out:
                 try:
+                    clamped_counts: List[List[Tuple[int, int]]] = []
                     cap_counts, factorization_counts = _capture_numerics_counts(
-                        diagnostic, float(model.cfg.kl_max))
-                    _merge_numerics_counts(counters_out, cap_counts, factorization_counts)
+                        diagnostic, float(model.cfg.kl_max), rows_out=clamped_counts)
+                    _merge_numerics_counts(counters_out, cap_counts, factorization_counts, clamped_counts)
                 except Exception as exc:                  # noqa: BLE001 - reported by the caller
                     counters_out["error"] = exc
             n_layers = len(diagnostic["layer_converged"])
@@ -2410,6 +2449,8 @@ def _eval_cadence_diagnostics(
                     out.update(columns)
                     artifacts.append_diagnostic_rows(
                         "cap_activation.csv", CAP_ACTIVATION_FIELDS, cap_rows)
+                    artifacts.append_diagnostic_rows(
+                        "cap_clamped_rows.csv", CAP_CLAMPED_ROW_FIELDS, _cap_clamped_row_rows(counters, step))
                 except Exception as exc:
                     _record_diagnostic_failure(failures, "numerics_counters", exc, logger)
         try:
@@ -2586,7 +2627,8 @@ def _terminal_validation_signature(
          dataset.overlap_prefix, dataset.n, loader.batch_size, loader.drop_last,
          loader.batch_sampler.batch_size, loader.batch_sampler.drop_last),
         (nonfinite_tangent_elements(), mu_trust_fallback_elements(),
-         decode_logdet_fallback_elements(), frame_pair_fp64_escalations(), public_spd_repair_elements()),
+         decode_logdet_fallback_elements(), frame_pair_fp64_escalations(), public_spd_repair_elements(),
+         public_spd_ceiling_contact_elements()),
     )
 
 
@@ -3004,6 +3046,7 @@ def _train_step_with_precision_retry(
     logger:    logging.Logger,
     step:      int,
     quiet:     bool = False,             # log the replay at DEBUG (the caller already reported one)
+    replay_log: Optional[List[Dict[str, object]]] = None,   # one record appended per failed attempt
     **step_kwargs: Any,
 ) -> Tuple[float, int]:                  # (loss, number of escalated replays the step needed)
     r"""Run :func:`train_step`; under ``cfg.matmul_precision_retry`` replay a failed step at a stricter policy.
@@ -3018,7 +3061,9 @@ def _train_step_with_precision_retry(
     earlier failures attached as notes, so a genuine defect still stops the run. Out-of-memory errors
     and failures after an update are never replayed. Not used with an enabled GradScaler (fp16),
     whose per-step unscale state a replay would violate. Module-level numerics counters may count
-    the abandoned attempts.
+    the abandoned attempts. Each failed attempt that is replayed appends ``{step, policy, replay_policy,
+    exception, message}`` to ``replay_log`` when given, so the reasons survive the DEBUG-level logging
+    of later replays (audit 2026-10-08 critic-gapfill-1#4).
     """
     scaler = step_kwargs.get("scaler")
     current = torch.get_float32_matmul_precision()
@@ -3059,9 +3104,30 @@ def _train_step_with_precision_retry(
                     exc.add_note(f"earlier attempt of this step failed: {note}")
                 raise
             failures.append(f"{type(exc).__name__}: {exc} [at {policy!r}]")
+            if replay_log is not None:
+                replay_log.append({"step": int(step), "policy": policy,
+                                   "replay_policy": (current, *rungs)[replays + 1],
+                                   "exception": type(exc).__name__, "message": str(exc)})
         finally:
             handle.remove()
     raise AssertionError("unreachable: the ladder ends at 'highest'")
+
+
+MATMUL_PRECISION_REPLAY_LOG = "matmul_precision_replays.jsonl"
+
+
+def _append_replay_records(
+    run_dir: Path,
+    records: Sequence[Mapping[str, object]],
+) -> Path:
+    r"""Append one JSON line per replayed attempt to ``run_dir/diagnostics/matmul_precision_replays.jsonl``."""
+    directory = Path(run_dir) / "diagnostics"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / MATMUL_PRECISION_REPLAY_LOG
+    with path.open("a", encoding="utf-8", newline="\n") as handle:
+        for record in records:
+            handle.write(json.dumps(dict(record), sort_keys=True) + "\n")
+    return path
 
 
 def train(
@@ -3533,14 +3599,21 @@ def train(
         step_status: Dict[str, bool] = {}
         if timer is not None:
             timer.start_step()
+        replay_records: List[Dict[str, object]] = []
         step_loss, replays = _train_step_with_precision_retry(
             model, optimizer, scheduler, tokens, targets, logger=logger, step=step,
-            quiet=precision_replays > 0, grad_clip=grad_clip, grad_accum_steps=cfg.grad_accum_steps,
+            quiet=precision_replays > 0, replay_log=replay_records, grad_clip=grad_clip,
+            grad_accum_steps=cfg.grad_accum_steps,
             scaler=scaler, metrics_out=step_metrics, status_out=step_status,
             **({"frame_projection_out": frame_projection_counter}
                if frame_projection_counter is not None else {}))
         losses.append(step_loss)
         precision_replays += int(replays > 0)
+        if replay_records and artifacts is not None:
+            try:
+                _append_replay_records(artifacts.run_dir, replay_records)
+            except Exception as exc:
+                _record_diagnostic_failure(diagnostics_failures, "matmul_precision_replay_log", exc, logger)
         if timer is not None:
             timer.finish_step(n_tokens=tokens.numel())
         if update_before is not None:
@@ -4099,6 +4172,7 @@ def train(
             "decode_logdet_fallback_elements": int(decode_logdet_fallback_elements()),
             "frame_pair_fp64_escalations": int(frame_pair_fp64_escalations()),
             "public_spd_repair_elements": int(public_spd_repair_elements()),
+            "public_spd_ceiling_contact_elements": int(public_spd_ceiling_contact_elements()),
             **({"matmul_precision_replays": int(precision_replays)}
                if getattr(cfg, "matmul_precision_retry", False) else {}),
         }

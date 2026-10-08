@@ -28,6 +28,7 @@ import json
 import math
 import os
 import re
+import typing
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
@@ -100,7 +101,29 @@ def _semantic_config(config_path: Path) -> Dict[str, Any]:
         )
     except ValueError as exc:
         raise ValueError(f"cannot aggregate {config_path.parent}: {exc}") from exc
-    return _strip_seed_keys(asdict(migration))
+    return _strip_seed_keys(_float_fields_as_float(migration))
+
+
+def _float_fields_as_float(config: Any) -> Dict[str, Any]:
+    """``asdict(config)`` with exact-``int`` values of float-annotated fields coerced to ``float``.
+
+    ``VFE3Config`` accepts any ``Real`` for its float fields without coercion, so ``rope_fraction=1``
+    and ``rope_fraction=1.0`` serialize as ``1`` and ``1.0`` and would otherwise give one semantic
+    config two fingerprints. Only fields annotated ``float`` or ``Optional[float]`` are touched;
+    ``bool`` values and fields annotated as ``int`` keep their type.
+    """
+    payload = asdict(config)
+    hints = typing.get_type_hints(type(config))
+    for name, value in payload.items():
+        if type(value) is not int:
+            continue
+        hint = hints.get(name)
+        if hint is float or (
+                typing.get_origin(hint) is typing.Union
+                and float in typing.get_args(hint)
+                and int not in typing.get_args(hint)):
+            payload[name] = float(value)
+    return payload
 
 
 def _config_requires_per_layer(config_path: Path) -> bool:
@@ -426,6 +449,10 @@ def _requested_seeds(root: Path, observed: List[int]) -> tuple[List[int], bool]:
 
 
 _CODE_IDENTITY_KEYS = ("git_sha", "git_dirty", "git_dirty_fingerprint")
+# The data-order seed is reported through ``_data_order_status`` and the noise-band caption; it is
+# not a comparability key, so a per-seed data order (``DATA_SEED=None``, data_seed == seed) still
+# aggregates, with the 'nonshared_or_mixed' status recorded.
+_DATA_ORDER_KEYS = ("data_seed",)
 
 
 def _mixed_code_identity_allowed() -> bool:
@@ -499,7 +526,8 @@ def _requested_seed_design(
     fingerprints = {
         json.dumps(
             {key: value for key, value in contract.items()
-             if not (mixed_code_allowed and key in _CODE_IDENTITY_KEYS)},
+             if key not in _DATA_ORDER_KEYS
+             and not (mixed_code_allowed and key in _CODE_IDENTITY_KEYS)},
             sort_keys=True, separators=(",", ":"), ensure_ascii=False,
         )
         for contract in provenance_contracts.values()
@@ -697,6 +725,7 @@ def aggregate_seed_curves(
     columns:  Optional[List[str]] = None,
     filename: str = "metrics.csv",
     x:        str = "step",
+    withheld: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Dict[str, np.ndarray]]:
     r"""Across-seed per-step curves from each seed's ``metrics.csv``.
 
@@ -705,6 +734,10 @@ def aggregate_seed_curves(
     observation at each such point or the curve set is withheld. This excludes rows that are
     structurally blank for every seed at another metric's cadence. ``columns=None`` selects every
     supported numeric column except ``x`` and ignores columns that are blank for all seeds.
+
+    ``withheld`` (a dict the caller owns) switches to per-column withholding: a column that is
+    absent for every seed, or not finite for every seed at its active steps, is left out and
+    recorded as ``withheld[column] = reason`` instead of emptying the whole curve set.
     """
     root = _resolve_run_root(run_root)
     design = _requested_seed_design(root)
@@ -750,11 +783,20 @@ def aggregate_seed_curves(
         matrix = np.vstack(stack)
         active = np.any(np.isfinite(matrix), axis=0)
         if not np.any(active):
+            if withheld is not None:
+                if columns is not None:
+                    withheld[c] = "absent or blank for every seed"
+                continue
             if columns is not None:
                 return {}
             continue
         matrix = matrix[:, active]
         if not np.all(np.isfinite(matrix)):
+            if withheld is not None:
+                n_bad = int(np.sum(~np.all(np.isfinite(matrix), axis=0)))
+                withheld[c] = (f"missing or non-finite for at least one seed at {n_bad} of "
+                               f"{matrix.shape[1]} logged {x} values")
+                continue
             return {}
         mean, sd, n = _nan_mean_sd(matrix)
         out[c] = {"steps": grid[active], "mean": mean, "sd": sd, "n": n}
@@ -820,16 +862,40 @@ def flag_noise_dominated(
     sd:          float,
 
     *,
-    k:           float = 2.0,
+    baseline:    Optional[float] = None,
+    n_sd_seeds:  Optional[int] = None,
+    k:           Optional[float] = None,
 ) -> List[str]:
-    r"""Labels of single-seed ablation cells within ``k`` SD of the best cell -- i.e. plausibly seed
-    noise rather than a real win. ``cell_metric`` maps label -> the cell's (single-seed) metric.
+    r"""Labels of single-seed ablation cells whose difference from ``baseline`` is within seed noise.
+
+    ``cell_metric`` maps label -> the cell's single-seed metric, ``baseline`` is the single-seed
+    reference value, and ``sd`` is the across-seed SD of one run estimated from ``n_sd_seeds`` seeds.
+    The difference of two independent single-seed values has SD :math:`\sqrt{2} \sigma`, and
+    :math:`\sigma` is estimated on :math:`n-1` degrees of freedom, so a cell is noise-dominated when
+
+    .. math::
+        |v - v_{\mathrm{baseline}}| < t_{n-1, 0.975} \sqrt{2} s,
+
+    the two-sided 95% band for a difference of two independent normal observations with a pooled
+    SD estimate (Student 1908; Hahn and Meeker 1991, *Statistical Intervals*). Comparing
+    against a fixed baseline avoids the winner's-curse bias of measuring from the best cell.
+
+    Legacy mode: an explicit ``k`` reproduces the historic rule ``v - min(cells) < k * sd`` (no
+    sqrt(2), no t quantile, best-cell reference), which flags too few cells as noise.
     """
-    finite = {lab: v for lab, v in cell_metric.items() if _as_finite_float(v) is not None}
+    finite = {lab: float(v) for lab, v in cell_metric.items() if _as_finite_float(v) is not None}
     if not finite or not math.isfinite(sd):
         return []
-    best = min(finite.values())
-    return [lab for lab, v in finite.items() if (v - best) < k * sd]
+    if k is not None:
+        best = min(finite.values())
+        return [lab for lab, v in finite.items() if (v - best) < k * sd]
+    if _as_finite_float(baseline) is None:
+        raise ValueError("flag_noise_dominated needs a finite single-seed baseline value")
+    if type(n_sd_seeds) is not int or n_sd_seeds < 2:
+        raise ValueError("flag_noise_dominated needs n_sd_seeds >= 2 (the seeds behind sd)")
+    from scipy.stats import t as t_dist
+    half_width = float(t_dist.ppf(0.975, n_sd_seeds - 1)) * math.sqrt(2.0) * sd
+    return [lab for lab, v in finite.items() if abs(v - float(baseline)) < half_width]
 
 
 # =============================================================================
@@ -887,6 +953,36 @@ CURVE_SPECS: List[tuple] = [
     ("train_sample_ce",    False),                     # fixed training sample, evaluation protocol
     ("generalization_gap_fixed", False),               # val_ce - train_sample_ce
 ]
+
+# Scalars on a positive ratio scale (losses, perplexities, bits, wall time), the only ones whose
+# coefficient of variation SD/|mean| is a seed-stability measure. Signed or near-zero quantities
+# (a CE delta, a correlation, a gradient-check error, a step index, ECE) keep their SD on their own
+# scale but get no CV and are left out of the seed-stability ranking.
+CV_RATIO_SCALE_KEYS = frozenset({
+    "test_ppl", "best_val_ppl", "test_ce", "test_bits_per_token", "test_bpc",
+    "test_best_ce", "test_best_ppl", "train_sample_ce_final", "train_sample_ce_best",
+    "diagnostics.zero_e_steps_counterfactual.counterfactual_ce",
+    "wall_time_s", "overall_ce",
+    "corpus_freq_strata_ce.rare", "corpus_freq_strata_ce.mid", "corpus_freq_strata_ce.frequent",
+})
+
+
+def _ratio_scale_cv(key: str, aggregate: Dict[str, Any]) -> Dict[str, Any]:
+    r"""Return ``aggregate`` with ``cv`` kept only for a positive ratio-scale metric.
+
+    The CV :math:`s/|\bar x|` is scale-free only when every value is positive on a ratio scale;
+    for a signed or near-zero metric it measures the distance of the mean from zero, not the
+    across-seed spread, so ``cv`` is set to NaN and ``cv_withheld`` records why.
+    """
+    out = dict(aggregate)
+    if key not in CV_RATIO_SCALE_KEYS:
+        out["cv"] = math.nan
+        out["cv_withheld"] = "not a positive ratio-scale metric; SD is reported on its own scale"
+    elif not all(float(v) > 0.0 for v in out.get("values", [])):
+        out["cv"] = math.nan
+        out["cv_withheld"] = "a seed value is not positive"
+    return out
+
 
 GRID_COLS: List[str] = [                                          # overview-grid subset
     "train_ce", "val_ppl", "inner_alignment_energy_total", "grad_norm", "holonomy_deviation",
@@ -997,8 +1093,10 @@ def _write_md(path: Path, root: Path, seeds, scalars, per_layer, *,
             vals = [round(x, 3) for x in t["values"]]
             L.append(f"- test PPL = {_fnum(t['mean'], '.3f')} +/- {_fnum(t['sd'], '.3f')} "
                      f"(2*SD = {_fnum(t['two_sd'], '.3f')}); per-seed {vals}.")
-        L.append(f"- Most seed-stable: `{most[0]}` (CV {100 * most[1]['cv']:.3f}%).")
-        L.append(f"- Least seed-stable: `{least[0]}` (CV {100 * least[1]['cv']:.3f}%).")
+        L.append(f"- Most seed-stable ratio-scale metric: `{most[0]}` (CV {100 * most[1]['cv']:.3f}%).")
+        L.append(f"- Least seed-stable ratio-scale metric: `{least[0]}` "
+                 f"(CV {100 * least[1]['cv']:.3f}%). Signed or near-zero metrics carry no CV; "
+                 "read their SD on their own scale.")
     if per_layer:
         L += ["", f"## Per-layer ({len(per_layer)} layer(s))", "",
               "See `figures/per_layer__*.png` for across-seed per-layer bars."]
@@ -1101,7 +1199,8 @@ def main() -> int:
     }
     headline = scalar_candidates[CONFIG["key"]]
     curve_x = _curve_x()
-    curves = aggregate_seed_curves(root, x=curve_x)
+    withheld_curves: Dict[str, str] = {}
+    curves = aggregate_seed_curves(root, x=curve_x, withheld=withheld_curves)
     per_layer = aggregate_per_layer(root)
     per_layer_requested = False
     for cell in request_design["cells"]:
@@ -1124,15 +1223,13 @@ def main() -> int:
         key for key, aggregate in scalar_candidates.items()
         if aggregate["n"] > 0 and not aggregate["complete"]
     ]
-    publication_complete = (
-        request_design["complete"]
-        and headline["complete"]
-        and not partial_scalars
-        and bool(curves)
-    )
+    # Scalar publication depends only on the requested design and the headline metric. A scalar
+    # that is partial across seeds, or a curve column that one seed leaves blank or non-finite, is
+    # withheld on its own and listed with its reason; it never withholds the rest of the digest.
+    publication_complete = request_design["complete"] and headline["complete"]
     if publication_complete:
         scalars = {
-            key: aggregate for key, aggregate in scalar_candidates.items()
+            key: _ratio_scale_cv(key, aggregate) for key, aggregate in scalar_candidates.items()
             if aggregate["n"] > 0 and aggregate["complete"]
         }
         print(f"{'metric':<28}{'n':>3}{'mean':>14}{'sd':>13}{'2sd':>12}{'cv%':>9}")
@@ -1144,6 +1241,11 @@ def main() -> int:
                   f"{_fnum(cvpct, '.3f'):>9}")
         if not per_layer_complete:
             print("optional per-layer diagnostics are incomplete; that channel is withheld")
+        if partial_scalars:
+            print(f"withheld scalars (not complete across the accepted seeds): {partial_scalars}")
+        if withheld_curves:
+            print(f"withheld {len(withheld_curves)} curve column(s); reasons in "
+                  "multiseed_summary.json diagnostics.withheld_curves")
     else:
         scalars = {}
         curves = {}
@@ -1190,14 +1292,15 @@ def main() -> int:
         },
         "withheld": {
             "scalars": not publication_complete,
-            "curves": not publication_complete,
+            "curves": not publication_complete or not curves,
             "per_layer": not publication_complete or not per_layer_complete,
             "figures": not publication_complete,
         },
         "diagnostics": {
             "headline": headline,
             "partial_scalars": partial_scalars,
-            "curves_complete": bool(curves),
+            "curves_complete": bool(curves) and not withheld_curves,
+            "withheld_curves": withheld_curves,
             "per_layer_requested": per_layer_requested,
             "per_layer_complete": per_layer_complete,
         },

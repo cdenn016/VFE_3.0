@@ -28,7 +28,31 @@ from vfe3.families.base import safe_kl_clamp
 from vfe3.free_energy import attention_weights
 from vfe3.gradients.relational import relational_score
 from vfe3.model.relational_operators import RelationalOperators
-from vfe3.relational_scoring import _compute_dtype, _count_source_recovery
+from vfe3.relational_scoring import _compute_dtype
+from vfe3.runtime import ieee_fp32_matmul
+
+# Receiving-law float64 retries of _spd_precision, per device. They are kept apart from the
+# projected-covariance source-recovery counter, whose window the training loop reads as the
+# G_q/G_k recovery numerator (audit 2026-10-08).
+_RECEIVER_LAW_RETRIES: Dict[str, torch.Tensor] = {}
+
+
+def _count_receiver_law_retry(failed: torch.Tensor) -> None:
+    r"""Accumulate retried receiving-law entries per device (async add, no host sync)."""
+    key = str(failed.device)
+    counter = _RECEIVER_LAW_RETRIES.get(key)
+    if counter is None:
+        counter = torch.zeros((), dtype=torch.int64, device=failed.device)
+        _RECEIVER_LAW_RETRIES[key] = counter
+    counter += failed.sum()
+
+
+def receiver_law_retry_counter(device: torch.device) -> torch.Tensor:
+    r"""On-device snapshot of the cumulative receiving-law retry count; differences count a window."""
+    counter = _RECEIVER_LAW_RETRIES.get(str(device))
+    if counter is None:
+        return torch.zeros((), dtype=torch.int64, device=device)
+    return counter.clone()
 
 
 @dataclass(frozen=True)
@@ -197,15 +221,16 @@ def _spd_precision(target: torch.Tensor) -> torch.Tensor:
     r"""Return target^{-1} from a zero-jitter Cholesky factor, retrying a failed batch in float64.
 
     A float32 factorization fails near cond(target) ~ 1/eps_32. The retry recomputes the batch in
-    float64 (one host sync on the info tensor), counts the failed entries in the shared
-    source-recovery counter, and raises only if float64 also fails.
+    float64 (one host sync on the info tensor), counts the failed entries in the receiving-law
+    retry counter (:func:`receiver_law_retry_counter`, not the projected-covariance recovery
+    counter), and raises only if float64 also fails.
     """
     factor, info = torch.linalg.cholesky_ex(target)
     failed = info != 0
     if bool(failed.any()):                                                  # one host sync
         if target.dtype == torch.float64:
             raise torch.linalg.LinAlgError("receiving-law covariance is not positive definite")
-        _count_source_recovery(failed)
+        _count_receiver_law_retry(failed)
         factor64, info64 = torch.linalg.cholesky_ex(target.to(torch.float64))
         if bool((info64 != 0).any()):
             raise torch.linalg.LinAlgError("receiving-law covariance is not positive definite in float64")
@@ -248,6 +273,7 @@ def _source_channel(
     return [precision for precision, _ in channels], [eta for _, eta in channels]
 
 
+@ieee_fp32_matmul()
 def _source_channel_run(
     mu:             torch.Tensor,           # (..., N, K)
     sigma:          torch.Tensor,           # (..., N, K) or (..., N, K, K)
@@ -259,7 +285,11 @@ def _source_channel_run(
     noise:          float,
     dtype:          torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""One run of :func:`_source_channel` (heads of a common size d)."""
+    r"""One run of :func:`_source_channel` (heads of a common size d).
+
+    Runs at IEEE fp32 whatever ``fp32_matmul_precision`` is: the products :math:`T_hU_j^{-1}` and
+    :math:`T_hC_jT_h^\top` are :math:`\kappa(U)`-sensitive, as on the predictive route.
+    """
     H, d, K = T.shape
     if block_diagonal:
         # Each full T reads all compact gauge blocks, (..., N, H, d, K).
@@ -288,6 +318,7 @@ def _source_channel_run(
     return precision, natural_mean
 
 
+@ieee_fp32_matmul()
 def _local_pullback(
     precision: torch.Tensor,                # (..., N, K, K), pooled reference precision
     eta:       torch.Tensor,                # (..., N, K), pooled reference natural mean
@@ -298,6 +329,8 @@ def _local_pullback(
     .. math::
         \Lambda_i=U_i^{-\top}P_iU_i^{-1},
         \eta_i=U_i^{-\top}b_i.
+
+    Pinned to IEEE fp32: the sandwich amplifies TF32 rounding by about :math:`\kappa(U)^2`.
     """
     inverse = frame.inverse.to(precision.dtype)
     if frame.block_diagonal:
@@ -455,6 +488,7 @@ def build_full_link_context(
     return context
 
 
+@ieee_fp32_matmul()                       # receiver force and solves at IEEE fp32
 def full_link_gradients(
     mu:      torch.Tensor,                   # (..., N, K), fast receiver means
     sigma:   torch.Tensor,                   # (..., N, K) or (..., N, K, K), receiver covariance
@@ -486,6 +520,7 @@ def full_link_gradients(
             grad_sigma.to(torch.promote_types(sigma.dtype, torch.float32)))
 
 
+@ieee_fp32_matmul()                       # receiver force and solves at IEEE fp32
 def full_link_cost(
     mu:      torch.Tensor,
     sigma:   torch.Tensor,
@@ -532,6 +567,7 @@ def full_link_cost(
         return (.5 * quadratic - linear + .5 * trace - .5 * c * logdet).sum()
 
 
+@ieee_fp32_matmul()                       # receiver force and solves at IEEE fp32
 def full_link_minimizer(
     mu:      torch.Tensor,                   # (..., N, K), current receiver means
     sigma:   torch.Tensor,                   # (..., N, K) or (..., N, K, K)
@@ -552,7 +588,10 @@ def full_link_minimizer(
     For gaussian_full this is the exact Fisher flow at rho = 1 - exp(-c t): SPD and non-increasing
     in the frozen energy for every rho in (0, 1], and the minimizer at rho = 1. A diagonal family
     uses the same interpolation with J = diag(1/s) and J* = diag(Lambda)/c, which reaches the
-    restricted minimizer s* = c / Lambda_kk at rho = 1 (partial damping is a declared choice).
+    restricted minimizer s* = c / Lambda_kk at rho = 1 (partial damping is a declared choice). For
+    rho < 1 that diagonal step is not a descent step: its mean moves to mu* + W (mu - mu*) with the
+    diagonal weight W_k = ((1 - rho)/s_k) / J_k, which need not contract the Lambda-norm when Lambda
+    is dense and the variances are anisotropic, so the frozen energy can rise.
     With ``update_sigma=False`` the covariance is kept and the mean moves to
     (1 - rho) mu + rho mu*. Autograd through the solves gives the implicit outer derivative.
 
@@ -598,6 +637,7 @@ def full_link_minimizer(
             new_sigma.to(torch.promote_types(sigma.dtype, torch.float32)))
 
 
+@ieee_fp32_matmul()                       # receiver force and solves at IEEE fp32
 def full_link_cost_parts(
     mu:      torch.Tensor,
     sigma:   torch.Tensor,

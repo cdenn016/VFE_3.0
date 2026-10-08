@@ -233,13 +233,18 @@ def _require_positive_finite(value: float, name: str) -> float:
     return converted
 
 
-def _pullback_group_compact_blocks(group: GaugeGroup, generators: torch.Tensor) -> bool:
-    r"""Whether the residual check can read the chart as stacked equal square blocks."""
+def _pullback_group_compact_blocks(group: GaugeGroup) -> bool:
+    r"""Whether the residual check can read the chart as stacked equal square blocks.
+
+    Reads the basis size from ``group.generator_shape``, so the lazy elementary basis is never
+    materialized (audit 2026-10-08, hotspot-4#5: a float64 copy of the dense basis was built on every
+    backtracking attempt only to read its first dimension).
+    """
     return (
         group.name == "block_glk"
         and len(group.irrep_dims) > 1
         and len(set(group.irrep_dims)) == 1
-        and generators.shape[0]
+        and group.generator_shape[0]
         == len(group.irrep_dims) * group.irrep_dims[0] * group.irrep_dims[0]
     )
 
@@ -255,10 +260,10 @@ def _pullback_group_current_element(
     this exponential inside the residual check cost up to ``max_backtracks`` redundant
     ``matrix_exp`` calls on the whole active batch per M-step.
     """
-    generators = group.generators.to(device=phi.device, dtype=torch.float64)
-    if _pullback_group_compact_blocks(group, generators):
+    if _pullback_group_compact_blocks(group):
         n_blocks, block_dim = len(group.irrep_dims), group.irrep_dims[0]
         return torch.linalg.matrix_exp(phi.reshape(-1, n_blocks, block_dim, block_dim))
+    generators = group.generators.to(device=phi.device, dtype=torch.float64)
     return torch.linalg.matrix_exp(torch.einsum("...a,aij->...ij", phi, generators))
 
 
@@ -291,8 +296,7 @@ def _pullback_group_product_residual(
     ``current_element`` is supplied by the caller rather than recomputed, so a backtracking loop
     pays one ``exp(phi)`` instead of one per attempt (audit 2026-08-07). Value-identical.
     """
-    generators = group.generators.to(device=candidate_phi.device, dtype=torch.float64)
-    if _pullback_group_compact_blocks(group, generators):
+    if _pullback_group_compact_blocks(group):
         n_blocks, block_dim = len(group.irrep_dims), group.irrep_dims[0]
 
         def _blocks(coordinates: torch.Tensor) -> torch.Tensor:
@@ -304,6 +308,8 @@ def _pullback_group_product_residual(
         error_sq = (candidate_element - reference).square().sum(dim=(-3, -2, -1))
         reference_sq = reference.square().sum(dim=(-3, -2, -1))
         return error_sq.sqrt() / reference_sq.sqrt().clamp_min(torch.finfo(torch.float64).tiny)
+
+    generators = group.generators.to(device=candidate_phi.device, dtype=torch.float64)
 
     def _embedded(coordinates: torch.Tensor) -> torch.Tensor:
         return torch.einsum("...a,aij->...ij", coordinates, generators)
@@ -397,7 +403,9 @@ def stage_pullback_group_candidate(
     residual failure; if no backtracked step returns inside the chart, that row alone keeps its
     current chart. Both are marked in ``rejected_rows``. Nonfinite inputs, candidates, residuals
     and certificates of accepted rows still raise, as does a product-residual or descent failure
-    that survives every backtrack.
+    that survives every backtrack, except on rows the direction marks ``soft_reject_rows`` (the
+    fisher_group chart route's off-strip rows), which keep their current chart and are counted in
+    ``rejected_rows``.
     """
     learning_rate, trust_radius, chart_max_norm, bch_residual_max = _validated_staging_scalars(
         grad_phi, phi, group,
@@ -516,13 +524,19 @@ def stage_pullback_group_candidate(
                 )
             if attempt == max_backtracks:
                 if bool(retraction_failed.any()):
-                    raise FloatingPointError(
-                        "pullback group stored chart retraction failed its product residual "
-                        f"({float(residual.max()):.3e} versus {residual_limit:.1e}) or descent "
-                        f"check after {max_backtracks} reductions"
-                    )
-                # Only chart-bound failures remain: those rows keep their current chart.
-                stuck = remaining[outside_chart]
+                    # Rows the direction marked soft (off-strip fisher_group chart rows) are rejected
+                    # per row; any other surviving failure still raises for the whole step.
+                    soft = (direction.soft_reject_rows.reshape(-1)[remaining]
+                            if direction.soft_reject_rows is not None
+                            else torch.zeros_like(retraction_failed))
+                    if bool((retraction_failed & ~soft).any()):
+                        raise FloatingPointError(
+                            "pullback group stored chart retraction failed its product residual "
+                            f"({float(residual.max()):.3e} versus {residual_limit:.1e}) or descent "
+                            f"check after {max_backtracks} reductions"
+                        )
+                # Chart-bound and soft-rejected failures remain: those rows keep their current chart.
+                stuck = remaining[failures]
                 candidate_phi[stuck] = phi64[stuck]
                 candidate_chart_norm[stuck] = embedded_phi_frobenius_norm(
                     phi64[stuck], group, warn_fallback=False)
@@ -568,6 +582,7 @@ class GroupLogDirection:
     series_order: int = 0
     fast_rows:    Optional[torch.Tensor] = None        # (A,) bool rows served by a closed form
     frame_condition: Optional[torch.Tensor] = None     # (A,) max_h kappa_2(U_h)
+    offstrip_rows: Optional[torch.Tensor] = None       # (A,) bool rows with a block off the principal strip
 
 
 # direction(grad_phi (A, n_gen) f64, phi (A, n_gen) f64, current_blocks (A, H, d, d) f64, *, collect)
@@ -786,6 +801,7 @@ def belief_fisher_group_direction(
         undamped_generalized_condition=cond.amax(dim=-1),
         damped_generalized_condition=cond.amax(dim=-1),
         scaled_solve_residual=residual,
+        offstrip_rows=~certified.all(dim=-1),
     )
 
 
@@ -803,7 +819,10 @@ def _fisher_chart_direction(
     :math:`\varphi - \eta v_\varphi` with :math:`v_\varphi = \Psi_R(\mathrm{ad}_\varphi)^{-1} W`.
     That route's :math:`10^{-6}` product-residual certificate is quadratic in the step and caps
     chart steps near :math:`7\times10^{-3}` per block at trained norms (measured at d=6), so
-    ``group_log`` is the recommended retraction.
+    ``group_log`` is the recommended retraction. Rows with a block off the principal strip are marked
+    ``soft_reject_rows``: near the exp singularity their velocity grows like :math:`1/|\Psi_R|`, so a
+    product-residual failure that survives backtracking rejects that row instead of the whole step
+    (audit 2026-10-08, geometer#1).
     """
     rows, n_gen = grad_phi.shape
     n_blocks, block_dim = group_log_block_shape(group)
@@ -819,6 +838,7 @@ def _fisher_chart_direction(
         series_order=proposal.series_order,
         current_element=U if n_blocks > 1 else U.reshape(rows, block_dim, block_dim),
         accepted_rows=proposal.accepted,
+        soft_reject_rows=proposal.offstrip_rows,
     )
 
 
@@ -1162,7 +1182,6 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
         )
         super().__init__(params, **kwargs)
         self._group                  = group
-        self._generators             = group.generators
         self._phi_group_differential_mode = phi_group_differential_mode()
         self._phi_group_trust_radius = phi_group_trust_radius
         self._phi_chart_max_norm     = phi_chart_max_norm

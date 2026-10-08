@@ -7,7 +7,10 @@ carries the same cells plus the source of every number; ``rows`` is the machine-
 
 * :func:`main_results_table`: ``tab:placeholder_main_results`` (M2). Per arm: the number of seeds
   with a selected test value, context-processing and total parameters, test CE and PPL as mean
-  :math:`\pm` SD over seeds (ddof = 1), and device-hours per run.
+  :math:`\pm` SD over seeds (ddof = 1), and training-only device-hours per run (the quantity the
+  compute-matched arm matches; wall time beside it in the markdown).
+* :func:`decision_rule_table`: the registered decision rule of the frame claim, from seed-paired
+  test-CE differences (mean, paired standard error and the margin :math:`\max(2\,\mathrm{SE}, 0.03)`).
 * :func:`per_seed_table`: ``tab:placeholder_per_seed``. Per run: model and data-order seed, selected
   step, validation CE, test CE and PPL under the declared selection rule.
 * :func:`relational_run_table`: ``tab:relational_run`` for the evaluated run.
@@ -15,8 +18,9 @@ carries the same cells plus the source of every number; ``rows`` is the machine-
 * :func:`methods_contract_table`: ``tab:placeholder_methods_contract`` from the final run's saved
   artifacts; a field the run does not record reads ``not recorded``.
 
-A cell whose value does not exist yet reads ``pending`` (the manuscript convention). Arm labels are
-written verbatim (they are manuscript row text and may contain LaTeX).
+A cell whose value does not exist yet reads ``pending`` (the manuscript convention); a row the
+manifest marks inapplicable to its base reads ``n/a``. Arm labels are written verbatim (they are
+manuscript row text and may contain LaTeX).
 """
 
 from __future__ import annotations
@@ -27,10 +31,11 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from vfe3.paper.runs import (
     Arm, Manifest, RunRecord, device_hours, finite_float, optimizer_groups, parameter_counts,
-    posthoc_pass, select_checkpoint,
+    posthoc_pass, select_checkpoint, train_device_hours,
 )
 
 PENDING = "pending"
+NOT_APPLICABLE = "n/a"
 NOT_RECORDED = "not recorded"
 CE_DIGITS = 4            # test / validation CE decimals
 PPL_DIGITS_MAIN = 2      # PPL decimals in M2 and the per-seed table
@@ -70,8 +75,8 @@ SELECTOR_KEYS: Tuple[str, ...] = (
     "covariance_update", "temperature_convention",
 )
 PRECISION_KEYS: Tuple[str, ...] = (
-    "amp_dtype", "fp32_matmul_precision", "full_cov_kl_precision",
-    "decode_av_precision", "deterministic",
+    "amp_dtype", "fp32_matmul_precision", "matmul_precision_retry", "full_cov_kl_precision",
+    "decode_av_precision", "decode_logits_amp", "deterministic",
 )
 FACTORIZATION_KEYS: Tuple[str, ...] = (
     "projected_factor_route", "projected_cov_condition_recovery", "projected_cov_recovery_precision",
@@ -197,8 +202,10 @@ def _arm_record(arm: Arm, rule: str, *, read_checkpoints: bool) -> Dict[str, Any
     runs = []
     for run in arm.runs:
         selection = select_checkpoint(run, rule)
-        hours, hours_source = device_hours(run)
+        hours, hours_source = train_device_hours(run)
+        wall, wall_source = device_hours(run)
         runs.append({"run": run, "selection": selection, "hours": hours, "hours_source": hours_source,
+                     "wall_hours": wall, "wall_hours_source": wall_source,
                      "params": parameter_counts(run, read_checkpoints=read_checkpoints)})
     return {"arm": arm, "runs": runs}
 
@@ -223,13 +230,15 @@ def main_results_table(
 
     Test CE and PPL are the mean :math:`\pm` SD (ddof = 1) over the runs whose selected test value
     exists, with :math:`\mathrm{PPL}_s = e^{\mathrm{CE}_s}` per seed; one run shows the value alone.
-    Parameters are context-processing / total (``count_short``); GPU-hours are the mean device-hours
-    per run. A config difference within an arm is written as a LaTeX comment above its row and listed
-    in the markdown.
+    Parameters are context-processing / total (``count_short``); GPU-hours are the mean training-only
+    device-hours per run (:func:`vfe3.paper.runs.train_device_hours`, evaluation excluded, the quantity
+    the compute-matched arm matches), with the mean wall time beside them in the markdown. A config
+    difference within an arm is written as a LaTeX comment above its row and listed in the markdown.
+    An arm the manifest marks inapplicable and that has no runs reads ``n/a``.
     """
     body: List[str] = []
     md = [_md_row(["Model arm", "Seeds", "Parameters (context / total)", "Test CE", "Test PPL",
-                   "GPU-hours per run", "Notes"]), _md_row(["---"] * 7)]
+                   "GPU-hours per run (train / wall)", "Notes"]), _md_row(["---"] * 7)]
     rows: List[Dict[str, Any]] = []
     current_group: Optional[str] = None
     for index, arm in enumerate(manifest.arms):
@@ -239,11 +248,18 @@ def main_results_table(
             body.append(r"\multicolumn{6}{@{}l}{\emph{" + arm.group + r"}}\\")
             md.append(_md_row([f"*{arm.group}*", "", "", "", "", "", ""]))
             current_group = arm.group
+        if arm.inapplicable and not arm.runs:
+            body.append(" & ".join([arm.label] + [NOT_APPLICABLE] * 5) + r" \\")
+            md.append(_md_row([arm.label] + [NOT_APPLICABLE] * 5 + [f"inapplicable: {arm.inapplicable}"]))
+            rows.append({"arm": arm.label, "group": arm.group, "n_runs": 0, "n_selected": 0,
+                         "inapplicable": arm.inapplicable, "test_ce": [], "test_ppl": [], "runs": []})
+            continue
         record = _arm_record(arm, manifest.selection, read_checkpoints=read_checkpoints)
         ok = [r for r in record["runs"] if r["selection"]["status"] == "ok"]
         ces = [r["selection"]["test_ce"] for r in ok]
         ppls = [r["selection"]["test_ppl"] for r in ok]
         hours = [r["hours"] for r in record["runs"] if r["hours"] is not None]
+        walls = [r["wall_hours"] for r in record["runs"] if r["wall_hours"] is not None]
         params = next((r["params"] for r in record["runs"] if r["params"].get("total") is not None), {})
         totals = {r["params"].get("total") for r in record["runs"] if r["params"].get("total") is not None}
         notes: List[str] = []
@@ -260,9 +276,14 @@ def main_results_table(
             notes.append("config differs across runs in: " + ", ".join(v["field"] for v in violations))
         if arm.homogeneity.get("duplicate_seed_pairs"):
             notes.append(f"duplicate (seed, data seed): {arm.homogeneity['duplicate_seed_pairs']}")
+        wall_fallback = [r["run"].name for r in record["runs"]
+                         if r["hours"] is not None and "wall time" in str(r["hours_source"])]
+        if wall_fallback:
+            notes.append("GPU-hours are wall time (no training-step timing) for: " + ", ".join(wall_fallback))
         seeds = (str(len(ok)) if len(ok) == len(arm.runs) else f"{len(ok)} of {len(arm.runs)}") \
             if arm.runs else PENDING
         hours_mean = sum(hours) / len(hours) if hours else None
+        wall_mean = sum(walls) / len(walls) if walls else None
         if violations:
             body.append("% " + arm.label.replace("\n", " ") + ": config differs across runs in "
                         + ", ".join(v["field"] for v in violations))
@@ -273,21 +294,26 @@ def main_results_table(
         ]) + r" \\")
         md.append(_md_row([arm.label, seeds, _param_cell(params, False) if params else PENDING,
                            md_mean_sd(ces, CE_DIGITS), md_mean_sd(ppls, PPL_DIGITS_MAIN),
-                           f"{hours_mean:.2f}" if hours_mean is not None else PENDING,
+                           (f"{hours_mean:.2f}" if hours_mean is not None else PENDING) + " / "
+                           + (f"{wall_mean:.2f}" if wall_mean is not None else PENDING),
                            "; ".join(notes)]))
         rows.append({
             "arm": arm.label, "group": arm.group, "n_runs": len(arm.runs), "n_selected": len(ok),
             "test_ce": ces, "test_ppl": ppls, "test_ce_mean_sd": mean_sd(ces),
-            "test_ppl_mean_sd": mean_sd(ppls), "device_hours": hours, "parameters": params,
+            "test_ppl_mean_sd": mean_sd(ppls), "device_hours": hours, "wall_device_hours": walls,
+            "parameters": params,
             "notes": notes, "homogeneity": arm.homogeneity,
             "runs": [{"run_dir": str(r["run"].run_dir), "seed": r["run"].seed,
                       "data_seed": r["run"].data_seed, "selection": r["selection"],
                       "device_hours": r["hours"], "device_hours_source": r["hours_source"],
+                      "wall_device_hours": r["wall_hours"], "wall_device_hours_source": r["wall_hours_source"],
                       "parameters_source": r["params"].get("source")} for r in record["runs"]],
         })
     caption = (f"\nSelection rule: '{manifest.selection}'. Test CE/PPL: mean ± SD (ddof = 1) over seeds; "
                "PPL is exp(CE) per seed. Parameters: context-processing / total. GPU-hours: mean "
-               "device-hours per run (one device).\n")
+               "training-only device-hours per run (one device; logged optimizer-step time, evaluation "
+               "excluded), the quantity the compute-matched arm matches; the LaTeX column carries it, and "
+               "the mean wall time including evaluation follows the slash here.\n")
     return _tabular(MAIN_RESULTS_SPEC, MAIN_RESULTS_HEADER, body), "\n".join(md) + "\n" + caption, rows
 
 
@@ -308,8 +334,9 @@ def per_seed_table(manifest: Manifest) -> Tuple[str, str, List[Dict[str, Any]]]:
     rows: List[Dict[str, Any]] = []
     for arm in manifest.arms:
         if not arm.runs:
-            body.append(" & ".join([arm.label] + [PENDING] * 5) + r" \\")
-            md.append(_md_row([arm.label] + [PENDING] * 5 + ["", ""]))
+            cell = NOT_APPLICABLE if arm.inapplicable else PENDING
+            body.append(" & ".join([arm.label] + [cell] * 5) + r" \\")
+            md.append(_md_row([arm.label] + [cell] * 5 + ["", arm.inapplicable or ""]))
             continue
         for position, run in enumerate(arm.runs):
             sel = select_checkpoint(run, manifest.selection)
@@ -330,6 +357,146 @@ def per_seed_table(manifest: Manifest) -> Tuple[str, str, List[Dict[str, Any]]]:
                          "data_seed": run.data_seed, **sel})
     note = f"\nSelection rule: '{manifest.selection}', applied identically to every run.\n"
     return _tabular(PER_SEED_SPEC, PER_SEED_HEADER, body), "\n".join(md) + "\n" + note, rows
+
+
+# ----------------------------------------------------------------------------------------------
+# The registered decision rule
+# ----------------------------------------------------------------------------------------------
+
+def _selected_by_pair(arm: Arm, rule: str) -> Tuple[Dict[Tuple[int, int], float], List[str]]:
+    r"""``({(seed, data_seed): test CE}, unpaired run names)`` of one arm under ``rule``."""
+    out: Dict[Tuple[int, int], float] = {}
+    unpaired: List[str] = []
+    for run in arm.runs:
+        sel = select_checkpoint(run, rule)
+        if sel["status"] != "ok" or run.seed is None or run.data_seed is None:
+            unpaired.append(run.name)
+        elif (run.seed, run.data_seed) in out:
+            unpaired.append(f"{run.name} (duplicate seed pair)")
+        else:
+            out[(run.seed, run.data_seed)] = float(sel["test_ce"])
+    return out, unpaired
+
+
+def paired_difference(evaluated: Arm, other: Arm, rule: str) -> Dict[str, Any]:
+    r"""Seed-paired test-CE differences :math:`d_s = \mathrm{CE}^{\rm other}_s - \mathrm{CE}^{\rm eval}_s`.
+
+    Runs pair on the identical ``(seed, data_seed)``. With :math:`n` pairs, :math:`\bar d` is their
+    mean, :math:`\mathrm{SE} = s_d / \sqrt n` the paired standard error (:math:`s_d` with ddof = 1, None
+    for :math:`n < 2`), and the registered margin is
+    :math:`m = \max(2\,\mathrm{SE}, 0.03\ \mathrm{nats})` (None without an SE). A positive
+    :math:`\bar d` means the evaluated arm has the lower test CE.
+    """
+    a, unpaired_a = _selected_by_pair(evaluated, rule)
+    b, unpaired_b = _selected_by_pair(other, rule)
+    pairs = sorted(set(a) & set(b))
+    diffs = [b[pair] - a[pair] for pair in pairs]
+    mean, sd = mean_sd(diffs)
+    se = sd / math.sqrt(len(diffs)) if sd is not None else None
+    margin = max(DECISION_SE_MULTIPLE * se, DECISION_MARGIN_NATS) if se is not None else None
+    unmatched = sorted(set(a) ^ set(b))
+    return {"pairs": [list(p) for p in pairs], "differences": diffs, "n": len(diffs), "mean": mean,
+            "sd": sd, "se": se, "margin": margin, "unmatched_seed_pairs": [list(p) for p in unmatched],
+            "unpaired_runs": unpaired_a + unpaired_b}
+
+
+# The registered rule (GL(K)_attention_v2.tex, "We fix in advance that the frame claim is retracted if
+# the realization does not beat the per-type read-table transformer by more than the larger of two
+# paired standard errors and 0.03 nats at K=128, or if freezing the frames at initialization costs less
+# than that margin"). Its comparator is the per-type read-table run of sec:param_accounting, which used
+# ALiBi; paper_arms.py repeats it as "Per-type read table, ALiBi (as run)".
+DECISION_MARGIN_NATS: float = 0.03
+DECISION_SE_MULTIPLE: float = 2.0
+DECISION_COMPARATOR: str = "Per-type read table, ALiBi (as run)"
+DECISION_FROZEN: str = "Frames frozen at their random initialization"
+DECISION_EVALUATED_PREFIX: str = "Evaluated"
+DECISION_SPEC = r"\begin{tabular}{lccccc}"
+DECISION_HEADER = r"Clause & Pairs & Mean paired difference & Paired SE & Margin & Verdict \\"
+
+
+def decision_rule(manifest: Manifest) -> Dict[str, Any]:
+    r"""Apply the registered decision rule of the frame claim to the manifest's arms.
+
+    Clause (a): the comparator's paired excess test CE over the evaluated arm must exceed its margin
+    :math:`\max(2\,\mathrm{SE}, 0.03)`. Clause (b): freezing the frames at initialization must cost at
+    least its own margin. The claim is retracted if either clause fails, stands if both hold, and is
+    undetermined while a clause lacks two paired seeds (unless the other clause already retracts it).
+    Arm labels come from ``manifest.decision`` (keys ``evaluated``, ``comparator``, ``frozen``); the
+    evaluated arm defaults to the first label starting with ``"Evaluated"``. Every other per-type
+    read-table arm is listed under ``other_read_table_arms``: the rule names one comparator, and these
+    are reported, not decided on.
+    """
+    by_label = {arm.label: arm for arm in manifest.arms}
+    evaluated_label = manifest.decision.get("evaluated") or next(
+        (arm.label for arm in manifest.arms if arm.label.startswith(DECISION_EVALUATED_PREFIX)), None)
+    labels = {"evaluated": evaluated_label,
+              "comparator": manifest.decision.get("comparator", DECISION_COMPARATOR),
+              "frozen": manifest.decision.get("frozen", DECISION_FROZEN)}
+    out: Dict[str, Any] = {"labels": labels, "selection": manifest.selection,
+                           "margin_nats": DECISION_MARGIN_NATS, "se_multiple": DECISION_SE_MULTIPLE,
+                           "clauses": {}, "problems": []}
+    out["other_read_table_arms"] = [
+        arm.label for arm in manifest.arms
+        if arm.label != labels["comparator"] and "per-type" in arm.label.lower() and "table" in arm.label.lower()
+        and arm.group != (by_label[labels["evaluated"]].group if labels["evaluated"] in by_label else None)]
+    evaluated = by_label.get(labels["evaluated"]) if labels["evaluated"] else None
+    if evaluated is None:
+        out["problems"].append(f"evaluated arm {labels['evaluated']!r} is not in the manifest")
+    for clause, key in (("a", "comparator"), ("b", "frozen")):
+        other = by_label.get(labels[key])
+        if other is None or evaluated is None:
+            if other is None:
+                out["problems"].append(f"{key} arm {labels[key]!r} is not in the manifest")
+            out["clauses"][clause] = {"arm": labels[key], "n": 0, "holds": None}
+            continue
+        stats = paired_difference(evaluated, other, manifest.selection)
+        holds = None if stats["margin"] is None else (
+            stats["mean"] > stats["margin"] if clause == "a" else stats["mean"] >= stats["margin"])
+        out["clauses"][clause] = {"arm": labels[key], **stats, "holds": holds}
+    held = [c["holds"] for c in out["clauses"].values()]
+    out["verdict"] = ("retracted" if any(h is False for h in held)
+                      else "stands" if held and all(h is True for h in held) else "undetermined")
+    return out
+
+
+def decision_rule_table(manifest: Manifest) -> Tuple[str, str, Dict[str, Any]]:
+    r"""The registered decision rule (:func:`decision_rule`) as a tabular, a markdown report and its record."""
+    record = decision_rule(manifest)
+
+    def verdict(c: Mapping[str, Any]) -> str:
+        if c.get("holds") is None:
+            return PENDING
+        return "holds" if c["holds"] else "fails"
+
+    def num(value: Optional[float], latex: bool) -> str:
+        if value is None:
+            return PENDING
+        return f"${value:.4f}$" if latex else f"{value:.4f}"
+
+    names = {"a": "Realization beats the per-type read-table transformer",
+             "b": "Freezing the frames at initialization costs at least the margin"}
+    body, md = [], [_md_row(["Clause", "Arm", "Pairs", "Mean paired difference (nats)", "Paired SE",
+                             "Margin", "Verdict"]), _md_row(["---"] * 7)]
+    for clause, c in record["clauses"].items():
+        body.append(" & ".join([f"({clause}) {names[clause]}", str(c.get("n", 0)),
+                                num(c.get("mean"), True), num(c.get("se"), True),
+                                num(c.get("margin"), True), verdict(c)]) + r" \\")
+        md.append(_md_row([f"({clause}) {names[clause]}", c["arm"], c.get("n", 0), num(c.get("mean"), False),
+                           num(c.get("se"), False), num(c.get("margin"), False), verdict(c)]))
+    lines = ["\n".join(md), "",
+             f"Claim: **{record['verdict']}**. Selection rule '{record['selection']}'. Differences are "
+             f"comparator (or frozen-frame) test CE minus evaluated test CE on runs sharing (seed, data seed); "
+             f"margin = max({record['se_multiple']:g} x paired SE, {record['margin_nats']:g} nats). Evaluated "
+             f"arm: {record['labels']['evaluated']!r}."]
+    for clause, c in record["clauses"].items():
+        if c.get("unmatched_seed_pairs") or c.get("unpaired_runs"):
+            lines.append(f"Clause ({clause}): seed pairs present in one arm only {c['unmatched_seed_pairs']}; "
+                         f"runs without a selected test value or seed pair {c['unpaired_runs']}.")
+    if record["other_read_table_arms"]:
+        lines.append("Other per-type read-table arms (reported in M2, not the registered comparator): "
+                     + "; ".join(record["other_read_table_arms"]) + ".")
+    lines += [f"Problem: {p}" for p in record["problems"]]
+    return _tabular(DECISION_SPEC, DECISION_HEADER, body), "\n".join(lines) + "\n", record
 
 
 # ----------------------------------------------------------------------------------------------
@@ -676,7 +843,14 @@ def _optimization_items(run: RunRecord) -> List[Item]:
     kind = (run.summary.get("scheduler") or {}).get("kind")
     items.append(("schedule", Code(kind) if kind else NOT_RECORDED))
     items += _raw_items(run, ("warmup_steps", "max_steps", "min_lr_frac", "grad_clip",
-                              "grad_clip_per_role", "m_phi_update_mode", "phi_mstep_max_matrix_norm"))
+                              "m_phi_update_mode", "phi_mstep_max_matrix_norm"))
+    # vfe3.train.train_step bounds each optimizer role's gradient L2 norm by grad_clip separately (the
+    # global clip was retired with grad_clip_per_role).
+    clip = finite_float(run.raw("grad_clip"))
+    if clip is not None and clip > 0:
+        roles = sorted({str(g.get("role") or "other") for g in (groups or {}).get("groups") or []})
+        items.append(("gradient clipping", "per optimizer role, each role's L2 norm bounded by grad_clip"
+                      + (f" (roles: {', '.join(roles)})" if roles else "")))
     ops = run.config_record.get("relational_operators")
     if isinstance(ops, Mapping) and ops.get("gradient_clipping"):
         items.append(("relational clipping", Code(str(ops["gradient_clipping"]))))
@@ -685,6 +859,12 @@ def _optimization_items(run: RunRecord) -> List[Item]:
 
 def _numerics_items(run: RunRecord) -> List[Item]:
     items = _raw_items(run, PRECISION_KEYS)
+    if run.raw("matmul_precision_retry") is True:
+        # A step that raises under a reduced fp32 matmul policy is replayed one rung stricter, ending at
+        # "highest" (vfe3.train); the count is the run's realized_updates record in summary.json.
+        replays = run.summary.get("matmul_precision_replays")
+        items.append(("steps replayed at a stricter matmul precision (up to highest)",
+                      f"{replays:,}" if isinstance(replays, int) else NOT_RECORDED))
     state = run.provenance.get("deterministic_state") or {}
     if "matmul_allow_tf32" in state:
         items.append(("TF32 matmul allowed", str(state["matmul_allow_tf32"])))
@@ -731,7 +911,25 @@ def _evaluation_items(run: RunRecord, rule: str) -> List[Item]:
                              f"excluded)" if isinstance(expected, int) and isinstance(excluded, int) else "")))
         else:
             items.append((f"{label} scored targets", NOT_RECORDED))
+    items.append(("training-split sample", _train_sample_cap_text()))
     return items
+
+
+def _train_sample_cap_text() -> str:
+    r"""The two caps of the fixed training-split sample (code constants; no run records its cap).
+
+    Training scores the sample at every evaluation with ``vfe3.train.TRAIN_SAMPLE_MAX_TARGETS``
+    (32,768 targets since commit 3118acd, 2026-10-07; 262,144 before), and ``posthoc_eval.py`` keeps
+    ``vfe3.posthoc.streams.TRAIN_SAMPLE_MAX_TARGETS``. Both draw windows with the same fixed seed and
+    are sized to the validation split's scored targets, capped.
+    """
+    from vfe3.posthoc.streams import TRAIN_SAMPLE_MAX_TARGETS as posthoc_cap
+    from vfe3.train import TRAIN_SAMPLE_MAX_TARGETS as training_cap
+
+    return (f"in-training cap {training_cap:,} targets (this code; 262,144 for code before commit 3118acd, "
+            f"2026-10-07; the run does not record its cap), post-hoc cap {posthoc_cap:,} targets; "
+            "summary.json train_sample_ce_* come from the in-training sample, posthoc.json train_sample "
+            "passes from the post-hoc one")
 
 
 def methods_contract_items(run: RunRecord, rule: str) -> Dict[str, List[Item]]:

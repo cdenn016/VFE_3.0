@@ -669,7 +669,10 @@ def projected_gaussian_kl(
                         else:
                             ak = mean
                 aq, ak = aq.double(), ak.double()
-            q_factor, k_factor = chol_q, chol_k                 # float64 where recovered under "fp64"
+                # Both factors at float64, so the tile's triangular solves (which take the
+                # triangular operand's dtype) run in float64 also when only one role was recovered.
+                chol_q, chol_k = chol_q.double(), chol_k.double()
+            q_factor, k_factor = chol_q, chol_k                 # float64 under "fp64" recovery
             q_cov_healthy = Gq                                  # working dtype
             with ieee_fp32_matmul():                            # token-linear key precision
                 k_prec_healthy = torch.cholesky_inverse(chol_k.to(dtype))
@@ -977,6 +980,10 @@ def projected_mean_distance_cost(
     isolates covariance-aware routing: the projected covariances are accepted for signature parity
     with projected_gaussian_kl and are not read, so they receive no gradient through routing.
     D_ij >= 0, so the [0, kl_max] cost bound applies unchanged.
+
+    The direct differences are kept (no |a|^2 + |b|^2 - 2 a.b expansion, which cancels for nearby
+    means); query rows are tiled to the projection byte budget and checkpointed under autograd, so
+    the (..., H, Nq, Nk, r) difference grid is never materialized or saved whole.
     """
     if a_q.ndim < 3 or a_k.ndim < 3 or a_q.shape[-2:] != a_k.shape[-2:]:
         raise ValueError("projected means must have matching head and comparison dimensions")
@@ -984,8 +991,26 @@ def projected_mean_distance_cost(
     with torch.autocast(device_type=a_q.device.type, enabled=False):
         aq = a_q.to(dtype).movedim(-2, -3)                                     # (..., H, Nq, r)
         ak = a_k.to(dtype).movedim(-2, -3)                                     # (..., H, Nk, r)
-        delta = aq.unsqueeze(-2) - ak.unsqueeze(-3)                            # (..., H, Nq, Nk, r)
-        return 0.5 * delta.pow(2).sum(-1)                                      # (..., H, Nq, Nk)
+        nq = aq.shape[-2]
+        per_row = ak.numel() * ak.element_size()                              # one query row's (..., H, Nk, r)
+        step = max(1, min(nq, _PROJECTION_TILE_BYTES // max(1, per_row)))
+        rows = []
+        for i in range(0, nq, step):
+            tile = aq[..., i:i + step, :]
+            if torch.is_grad_enabled() and step < nq and (tile.requires_grad or ak.requires_grad):
+                rows.append(checkpoint(_mean_distance_tile, tile, ak, use_reentrant=False, preserve_rng_state=False))
+            else:
+                rows.append(_mean_distance_tile(tile, ak))
+        return rows[0] if len(rows) == 1 else torch.cat(rows, dim=-2)          # (..., H, Nq, Nk)
+
+
+def _mean_distance_tile(
+    aq: torch.Tensor,  # (..., H, I, r)
+    ak: torch.Tensor,  # (..., H, Nk, r)
+) -> torch.Tensor:     # (..., H, I, Nk)
+    r"""One query-row tile of :func:`projected_mean_distance_cost`, :math:`\|a_i-b_j\|^2/2`."""
+    delta = aq.unsqueeze(-2) - ak.unsqueeze(-3)                                # (..., H, I, Nk, r)
+    return 0.5 * delta.pow(2).sum(-1)
 
 
 # Routing cost per relational_routing value; every cost takes (a_q, G_q, a_k, G_k, *, projection_q,

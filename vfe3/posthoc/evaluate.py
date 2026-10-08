@@ -79,7 +79,8 @@ def load_model(
 ) -> LoadedModel:
     r"""Build the model of ``<run_dir>/<checkpoint>`` and load its state strictly (either family).
 
-    ``precision="fp32"`` replays in float32 with autocast off. ``precision="run"`` keeps the run's
+    ``precision="fp32"`` replays in float32 with autocast off and ``fp32_matmul_precision='highest'``
+    (IEEE fp32 matmuls, no TF32). ``precision="run"`` keeps the run's
     ``amp_dtype`` on CUDA (the arithmetic the run was evaluated in); on the CPU it falls back to
     float32, recorded in ``notes``. ``drop_unknown_config_fields`` ignores config fields this build
     no longer declares (see :func:`vfe3.posthoc.streams.config_from_bundle`); they are returned in
@@ -103,13 +104,19 @@ def load_model(
                      f"amp_dtype={cfg.amp_dtype!r})")
     elif amp is None and cfg.amp_dtype is not None:
         notes.append(f"replayed in float32 with autocast off (trained with amp_dtype={cfg.amp_dtype!r})")
+    # An fp32 replay is IEEE fp32: the model constructor pins the process matmul policy from its
+    # config, so the run's reduced policy (TF32 under 'high') is replaced by 'highest' here.
+    matmul = "highest" if precision == "fp32" else cfg.fp32_matmul_precision
+    if matmul != cfg.fp32_matmul_precision:
+        notes.append(f"replayed with fp32_matmul_precision='highest' (trained with "
+                     f"fp32_matmul_precision={cfg.fp32_matmul_precision!r})")
     if not is_vfe_config(cfg):
         from vfe3.baseline import BaselineTransformer
 
-        eval_cfg = dataclasses.replace(cfg, amp_dtype=amp)
+        eval_cfg = dataclasses.replace(cfg, amp_dtype=amp, fp32_matmul_precision=matmul)
         model_class: Callable[[Any], torch.nn.Module] = BaselineTransformer
     else:
-        eval_cfg = dataclasses.replace(cfg, amp_dtype=amp)
+        eval_cfg = dataclasses.replace(cfg, amp_dtype=amp, fp32_matmul_precision=matmul)
         model_class = VFEModel
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -238,8 +245,9 @@ def nll_pass(
             if observers:
                 stream = getattr(dataset, "tokens", None)
                 input_valid = (torch.ones_like(valid) if stream is None else
-                               torch.as_tensor(starts[:, None] + np.arange(N)[None, :] < int(stream.numel()),
+                               torch.as_tensor(starts[:, None] + np.arange(N)[None, :] < int(stream.numel()) - 1,
                                                device=valid.device))                 # (B, N) real input tokens
+                # (the last stream token is never an input: it is only the final target)
                 meta = {"windows": windows, "starts": starts, "input_valid": input_valid}
                 for observer in observers:
                     observer.update(capture["diagnostic"], valid, meta)

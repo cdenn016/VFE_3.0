@@ -13,9 +13,11 @@ and the message is :math:`\tilde m_i = \sum_j G_{ij}\Pi(\beta_{ij})\xi_j`, :math
 * ``"lowrank"`` (curved): :math:`g_i = I`, :math:`A_i = a(\hat\xi_i)`, :math:`B_j = b(\hat\xi_j)` and
   :math:`\Phi_{ij} = \varphi_1(B_j^\top A_i)`, so :math:`E_{ij} = \exp(A_iB_j^\top)` by
   :math:`\exp(AB^\top) = I + A\varphi_1(B^\top A)B^\top`.
-* ``"pure_gauge"`` (flat control): one shared basis :math:`A`, :math:`g_i = \exp(AB_i^\top)` and
+* ``"pure_gauge"`` (pure-gauge control, no edge curvature): one shared basis :math:`A`, :math:`g_i = \exp(AB_i^\top)` and
   :math:`\Phi_{ij} = -\varphi_1(-B_j^\top A)`, so :math:`E_{ij} = g_j^{-1}` and
-  :math:`G_{ij} = g_i F g_j^{-1}`: every triangle holonomy :math:`G_{ik}^{-1}G_{ij}G_{jk} = g_kFg_k^{-1}`.
+  :math:`G_{ij} = g_i F g_j^{-1}`: every triangle holonomy :math:`G_{ik}^{-1}G_{ij}G_{jk} = g_kFg_k^{-1}` is
+  conjugate to :math:`F`, so the edge factors add no curvature, though the holonomy is the identity only when
+  :math:`F = I`.
 
 The factor maps read the RMS-normalized reference mean :math:`\hat\xi_i = \xi_i/(\overline{\xi_i^2} + 10^{-12})^{1/2}`,
 which the passive action :math:`\mu\to g\mu`, :math:`U\to gU` leaves fixed, so :math:`G_{ij}` is reference data.

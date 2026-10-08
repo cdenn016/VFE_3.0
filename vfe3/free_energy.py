@@ -278,8 +278,8 @@ def free_energy(
     the scaled block and the envelope identity d/dtheta[lambda_beta (coupling+entropy)] =
     lambda_beta sum_j beta* dE/dtheta still holds -- keeping the analytic kernel (which scales its
     pair term by lambda_beta) in agreement with autograd of this F.
-    adds the two-hop coupling block F_2 = lambda_2 sum_ik (beta beta)_ik E_ik with DETACHED hop
-    weights and no entropy term (see the guarded block below).
+    These four terms are the whole assembly: there is no two-hop block. No supported training route
+    evaluates or minimizes this scalar; it is the reference oracle the tests check against.
 
     The observation/data term -E_q[log p(o|k)] enters via the optional ``log_likelihood`` arg
     (subtracted below) but is a GATED STUB: no production caller supplies it. The projected
@@ -443,12 +443,11 @@ def _belief_free_energy_rows(
     scalar -- a NEW hierarchical/diagnostic path, NOT the scalar's reduction order.
 
     It collapses the coordinate, key, and optional head axes while preserving the batch/query axes.
-    The five returned rows are already SIGNED and WEIGHTED (lambda_beta in both beta rows,
-    ``observation_nll = -log_likelihood`` when present); the
-    attention-entropy row is an exact zero when the entropy is gated off, and the two-hop and
-    observation rows are exact zeros when absent. ``beta_override`` supplies a captured beta so
-    diagnostic weights are not recomputed. The ONLY detach here forms the fixed two-hop weights
-    W2 = beta.detach() @ beta.detach()."""
+    The four returned rows (:class:`BeliefFreeEnergyRows`) are already SIGNED and WEIGHTED
+    (lambda_beta in both beta rows, ``observation_nll = -log_likelihood`` when present); the
+    attention-entropy row is an exact zero when the entropy is gated off, and the observation row is
+    an exact zero when absent. ``beta_override`` supplies a captured beta so diagnostic weights are
+    not recomputed. Nothing here is detached."""
     beta = (beta_override if beta_override is not None
             else attention_weights(energy, tau=tau, log_prior=log_prior))
     value_energy = energy if coupling_energy is None else coupling_energy

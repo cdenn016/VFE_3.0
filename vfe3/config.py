@@ -386,7 +386,7 @@ class VFE3Config:
     #   moment_matched  the exact moment-matched covariance of the readout
     predictive_covariance:            str             = "moment_matched"
     
-    predictive_covariance_floor:      float           = 1e-4         # moment_matched with kernel only: floor * (tr C_i / K) I
+    predictive_covariance_floor:      float           = 1e-4         # moment_matched only (kernel and minimal_agent readouts): floor * (tr C_i / K) I
     minimal_agent_channel_noise:      float           = 1.0          # minimal_agent only: initial channel noise n_h > 0 (learned)
    
     # moment_matched only: recompute the covariance update in backward instead of storing its
@@ -415,7 +415,8 @@ class VFE3Config:
     # Edge-dependent links G_ij (only: content_link_chart="exponential", projected_predictive, equal heads).
     #   off         one shared exponential link
     #   lowrank     curved: G_ij = g_i e^L exp(A_i B_j^T), rank content_link_edge_rank - EXPENSIVE
-    #   pure_gauge  flat control: G_ij = g_i e^L g_j^-1, g_i = exp(A B_i^T)
+    #   pure_gauge  coboundary control: G_ij = g_i e^L g_j^-1, g_i = exp(A B_i^T); not flat unless e^{3L} = I
+    #               (the triangle holonomy G_ij G_jk G_ki = g_i e^{3L} g_i^-1 conjugates the shared link)
     content_link_edges:               str             = "off"
     content_link_edge_rank:           int             = 4            # edges on only: factor rank r, 1 <= r <= embed_dim
 
@@ -699,7 +700,8 @@ class VFE3Config:
         full_link = self.attention_mode == "projected_gradient"
         # attention_residual and predictive_covariance are predictive-readout knobs; under
         # projected_gradient they are inactive (inactive_fields), not errors.
-        _require(self.relational_routing, ("gaussian_kl", "noisy_query", "mean_distance"), "relational_routing")
+        from vfe3.relational_scoring import ROUTING_COSTS as _routing_costs   # the registry, as for groups
+        _require(self.relational_routing, tuple(_routing_costs), "relational_routing")
         if self.relational_routing != "gaussian_kl" and full_link:
             raise ValueError(f"relational_routing={self.relational_routing!r} requires attention_mode='projected_predictive'")
         from vfe3.model.minimal_agent import MINIMAL_AGENT_INFERENCE, PREDICTIVE_READOUTS
@@ -1427,6 +1429,13 @@ class VFE3Config:
                 "pos_phi='none' and pos_rotation='none'"
             )
             raise ValueError(detail + " on the projected routes")
+        # The additive encoder's learned capacity is the phi table itself, which gauge_transport 'off'
+        # zeroes and freezes and 'frozen' freezes at its random init (audit 2026-10-08 hotspot-3#5).
+        if self.encode_mode == "per_token_additive" and self.gauge_transport != "on":
+            raise ValueError(
+                f"encode_mode='per_token_additive' with gauge_transport={self.gauge_transport!r}: the "
+                "additive encoder trains the phi table, which this setting freezes ('off' also zeroes it); "
+                "use gauge_transport='on'")
         # decode_mode is the single decode gate. Linear selects the learned (V,K) projection and
         # discards sigma; every other admitted mode reads out against the prior bank. Encode and the
         # free-energy self-coupling stay on PriorBank in both cases.
@@ -1761,6 +1770,16 @@ class VFE3Config:
         if not (self.projected_cov_condition_recovery and not gram_status):
             mark(("projected_factor_condition_tol",),
                  "only read by the cholesky_qr2 certificate under projected_cov_condition_recovery=True")
+        if (self.attention_mode == "projected_predictive" and not minimal_agent
+                and self.relational_routing == "mean_distance"):
+            # The covariance-blind cost reads neither the projected covariances nor the source tuples,
+            # so no factorization, certificate or source recovery runs on the routing path (audit
+            # 2026-10-08 implementation-engineer#4).
+            mark(("projected_factor_route", "projected_cov_condition_recovery",
+                  "projected_cov_recovery_precision", "projected_gram_condition_tol",
+                  "projected_factor_condition_tol"),
+                 "relational_routing='mean_distance' scores ||a_i - b_j||^2 / 2 and factors no projected "
+                 "covariance")
         if self.gauge_transport == "off":
             mark(("frame_pair_fp64_escalation", "frame_pair_condition_tol"),
                  "gauge_transport='off' fixes every frame to the identity (kappa_F = d), so the "
@@ -1857,6 +1876,8 @@ class VFE3Config:
             mark(("block_mlp_activation", "block_mlp_covariance_floor"),
                  "prototype_agents has no hidden activation, and its posterior covariance is exact, "
                  "with no floor")
+        elif self.block_mlp_covariance != "delta_full":
+            mark(("block_mlp_covariance_floor",), "only read by block_mlp_covariance='delta_full'")
         if not (self.use_block_mlp and self.block_mlp_mode == "prototype_agents"):
             mark(("block_mlp_inference", "block_mlp_template_init_variance", "block_mlp_template_init",
                   "block_mlp_template_init_pull"),
@@ -1883,7 +1904,7 @@ class VFE3Config:
         if self.attention_mode != "projected_predictive" or self.predictive_readout != "kernel":
             mark(("routing_kl_max_reference",), "only read by the projected predictive kernel router")
         if self.pos_phi == "none":
-            mark(("pos_phi_project_slk",), "only read by a non-'none' pos_phi")
+            mark(("pos_phi_project_slk", "pos_phi_scale"), "only read by a non-'none' pos_phi")
         if (self.beta_attention_prior in ("windowed", "causal_windowed")
                 and self.attention_window >= self.max_seq_len - 1):
             mark(("attention_window",), "window covers the context and is identical to plain causal")
@@ -1985,7 +2006,10 @@ class VFE3Config:
                  "without positional frames), so reference and local coordinates coincide")
         elif (self.norm_type_block == "none" and self.norm_type_final == "none"
               and not self.use_block_mlp):
-            mark(("block_coordinates",), "no block norm, final norm or block MLP to conjugate")
+            mark(("block_coordinates",),
+                 "no block norm, final norm or block MLP to conjugate: reference and local coordinates "
+                 "agree in exact arithmetic, but the reference block still runs the U(U^{-1} mu) round "
+                 "trip, so the two differ at roundoff (not bit-identical)")
         if not self.per_type_hidden_bias:
             mark(("m_per_type_hidden_bias_lr",), "only read when per_type_hidden_bias=True")
         else:
@@ -2271,6 +2295,21 @@ def _migrate_retired_fields(
         refuse("gauge_group", gauge_group)
 
 
+# Introduction-time values of fields whose default was later flipped, applied by config_from_serialized
+# only when a serialized config lacks the field (it predates it). Add a row whenever a default flips.
+#   content_link_chart                "affine" at 6e54aee (2026-10-03), now "exponential"
+#   predictive_covariance             "passthrough" at 8b398f3 (2026-09-27), now "moment_matched"
+#   m_decode_mu_lr, m_decode_sigma_lr None (inherit) at d04dfc4 (2026-09-30), now 0.025 / 0.001
+#   projected_cov_recovery_precision  "fp64" at fed4164 (2026-10-04), now "fp32"
+_HISTORICAL_DEFAULT_PINS: dict[str, Any] = {
+    "content_link_chart":               "affine",
+    "predictive_covariance":            "passthrough",
+    "m_decode_mu_lr":                   None,
+    "m_decode_sigma_lr":                None,
+    "projected_cov_recovery_precision": "fp64",
+}
+
+
 def config_from_serialized(
     payload: Mapping[str, Any],
 
@@ -2343,6 +2382,10 @@ def config_from_serialized(
     # Configs saved before the receiver-law fields keep the PR #30 receiver they ran.
     payload.setdefault("relational_receiver_law", "ambient_alignment")
     payload.setdefault("relational_receiver_update", "euler")
+    # Fields whose default changed after they were introduced: a config saved before the field existed
+    # ran the introduction-time value, not today's default (audit 2026-10-08 P2-3).
+    for name, historical in _HISTORICAL_DEFAULT_PINS.items():
+        payload.setdefault(name, historical)
     _migrate_retired_fields(payload, source=source)
     config_fields = {field.name: field for field in fields(VFE3Config)}
     unknown = sorted(str(key) for key in payload if key not in config_fields)

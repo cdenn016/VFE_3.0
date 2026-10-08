@@ -19,6 +19,7 @@ from vfe3.model.prototype_agents import (
     prototype_mean_field_posterior,
 )
 from vfe3.numerics import validated_cholesky_solve
+from vfe3.runtime import ieee_fp32_matmul
 
 
 _ACTIVATIONS = {
@@ -72,14 +73,17 @@ def _frame_action(
     An escalated frame applies each factor at float64 and returns ``x.dtype``, so the MLP and every
     downstream tensor keep their dtypes. Any other frame contracts with autocast disabled at
     ``promote_types(x.dtype, float32)``: an ambient bf16 autocast would otherwise store the belief
-    mean in bf16 (the MLP's own residual then adds its bf16 increment to a float32 mean).
+    mean in bf16 (the MLP's own residual then adds its bf16 increment to a float32 mean). The
+    contraction is pinned to IEEE fp32 (:func:`vfe3.runtime.ieee_fp32_matmul`), as
+    :func:`vfe3.model.frame_actions.frame_matvec` is: the round trip U F(U^{-1} mu) amplifies
+    TF32 rounding by about kappa(U).
     """
     if _escalated_frame(frame, mu):
         return lambda M, x: torch.einsum("...ij,...j->...i", M, x.double()).to(x.dtype)
 
     def apply(M: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         dtype = torch.promote_types(torch.promote_types(x.dtype, M.dtype), torch.float32)
-        with torch.autocast(device_type=x.device.type, enabled=False):
+        with torch.autocast(device_type=x.device.type, enabled=False), ieee_fp32_matmul():
             return torch.einsum("...ij,...j->...i", M.to(dtype), x.to(dtype))
     return apply
 
@@ -511,9 +515,10 @@ class CanonicalFrameBlockMLP(BlockMLP):
             canonical_mu, hidden_bias)
         mu_out = apply(frame_context.forward, canonical_out)
         if not _escalated_frame(frame_context, mu):
-            realized_jacobian = (
-                frame_context.forward @ canonical_jacobian @ frame_context.inverse
-            )
+            with ieee_fp32_matmul():                    # kappa(U)-sensitive conjugation U J U^{-1}
+                realized_jacobian = (
+                    frame_context.forward @ canonical_jacobian @ frame_context.inverse
+                )
         else:
             realized_jacobian = (
                 frame_context.forward @ canonical_jacobian.double() @ frame_context.inverse

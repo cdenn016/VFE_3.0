@@ -370,22 +370,21 @@ def free_energy_terms(
     ``belief_coupling``, ``attention_entropy``, and the conditionally present
     ``observation_likelihood`` are RAW (unweighted) block values, so each
     stays individually interpretable; ``total`` is the runtime-realized SCALED free energy
-    self_coupling + lambda_beta (belief_coupling + attention_entropy), matching what the E-step
-    actually minimizes. At lambda_beta = 1.0 total is byte-identical to the
-    unscaled sum.
+    self_coupling + lambda_beta (belief_coupling + attention_entropy), the reference scalar of
+    ``free_energy``; the projected training routes neither evaluate nor minimize it. At
+    lambda_beta = 1.0 total is byte-identical to the unscaled sum.
 
     ``alpha_reg`` is the per-position regularizer R(alpha_i) (b0 alpha - c0 log alpha under
     ``state_dependent_per_coord``); when supplied it is added elementwise into the self-coupling
     term (and so into ``total``), matching ``free_energy``. Default None leaves the result
     byte-identical to the unregularized path. ``include_attention_entropy`` gates the entropy
     contribution to ``total`` exactly as ``free_energy`` does -- when False the surrogate objective
-    the E-step descends omits the entropy term, but its value is still reported under
+    omits the entropy term, but its value is still reported under
     ``attention_entropy`` for diagnostics.
 
-    ``coupling_energy`` selects the VALUE-gauge energy for both the one-hop and two-hop coupling
-    sums while ``energy`` remains the score energy that produced ``beta``.
-    raw detached ``beta @ beta`` weights, matching the scalar objective, and ``log_likelihood`` is
-    subtracted from ``total`` when the gated observation seam supplies it. Their defaults preserve
+    ``coupling_energy`` selects the VALUE-gauge energy for the coupling sum while ``energy`` remains
+    the score energy that produced ``beta``, and ``log_likelihood`` is subtracted from ``total``
+    when the gated observation seam supplies it. Their defaults preserve
     the original four-term result exactly.
     """
     # RAW public fields (unchanged, unweighted, positive-likelihood): kept byte-for-byte for their

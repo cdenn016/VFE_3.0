@@ -224,8 +224,8 @@ def _git_code_identity() -> Dict[str, object]:
 
 # DATA_SEED (EXP-1 variance floor), mirroring train_vfe3.DATA_SEED: when set to an int, the TRAIN
 # loader's shuffle order is fixed to this seed via an explicit generator, INDEPENDENT of the
-# per-cell model seed. None keeps the legacy behavior (shuffle drawn from the global RNG, which
-# run_single's post-build reseed pins to cfg.seed). Keep this EQUAL to train_vfe3.DATA_SEED so the
+# per-cell model seed. None gives each cell its own order: the train generator is re-pinned to the
+# cell's cfg.seed in run_single, as train_vfe3 does. Keep this EQUAL to train_vfe3.DATA_SEED so the
 # two entry points train on the same batch order and reproduce each other under an identical config.
 DATA_SEED: Optional[int] = 3
 
@@ -1676,13 +1676,14 @@ def get_loader(
     # Split-aware loader semantics, mirroring train_vfe3._select_loader: only the train stream is
     # shuffled and tail-dropped; validation/test read the WHOLE split in a stable order so the
     # held-out PPL is a full-corpus measurement (make_dataloader defaults to the train regime, so
-    # the eval flags must be passed explicitly here). The TRAIN shuffle order is fixed to DATA_SEED
-    # when set (an explicit generator, as in train_vfe3._select_loader); None -> no generator ->
-    # legacy global-RNG shuffle, pinned to cfg.seed by run_single's post-build reseed. The cached
-    # generator's state advances across cells; run_single re-pins it to DATA_SEED per cell.
+    # the eval flags must be passed explicitly here). The TRAIN loader always carries an explicit
+    # generator, as in train_vfe3._select_loader: train() needs one to record an exact data cursor,
+    # and the terminal callback every cell passes requests that cursor (audit 2026-10-08 P2-7). The
+    # cached generator's state advances across cells; run_single re-pins it per cell to DATA_SEED,
+    # or to the cell's cfg.seed when DATA_SEED is None.
     gen = (
-        torch.Generator().manual_seed(data_seed_override)
-        if split == "train" and data_seed_override is not None else None
+        torch.Generator().manual_seed(0 if data_seed_override is None else data_seed_override)
+        if split == "train" else None
     )
     loader = make_dataloader(dataset, split, seq_len, batch_size,
                              shuffle=(split == "train"), drop_last=(split == "train"),

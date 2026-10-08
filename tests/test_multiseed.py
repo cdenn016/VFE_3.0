@@ -791,11 +791,16 @@ def test_aggregate_seed_curves_withholds_partial_seed_points_and_main_figures(
 
     ms.main()
 
+    # Audit 2026-10-08 general-C#5 / gap-stats#6: the partial column is withheld on its own with a
+    # reason; the complete design still publishes its scalars and figures.
     summary = json.loads((tmp_path / "multiseed_summary.json").read_text(encoding="utf-8"))
-    assert summary["design"]["complete"] is False
+    assert summary["design"]["complete"] is True
     assert summary["diagnostics"]["curves_complete"] is False
-    assert summary["withheld"]["figures"] is True
-    assert emitted == []
+    assert "x" in summary["diagnostics"]["withheld_curves"]
+    assert "x" not in summary["curves_final_step"]
+    assert summary["scalars"]["test_ppl"]["n"] == 2
+    assert summary["withheld"]["figures"] is False
+    assert len(emitted) == 1
 
 
 def test_aggregate_per_layer(tmp_path):

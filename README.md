@@ -234,9 +234,14 @@ between projected moments, which the construction posits rather than derives.
 The projected routes always include the attention entropy; entropy regularization
 determines the Gibbs weights without an iterative gradient update over
 them. The attention-temperature policy uses `kappa_beta` and head dimensions
-($\tau_h=\kappa\sqrt{d}$; the launcher's `kappa_beta=1` gives $\tau_h=\sqrt d$). The
-current launcher selects the uniform `causal` source prior; positions enter through
-learned positional frames (`pos_phi="learned"`) rather than an ALiBi bias.
+($\tau_h=\kappa\sqrt{d}$; the launcher's `kappa_beta=1` gives $\tau_h=\sqrt d$). Position
+can enter through learned positional frames (`pos_phi="learned"`), through rotary positions
+(`pos_rotation="rope"`, folded into the frame under `rope_space="frame"` or applied to the
+projected comparison moments under `rope_space="comparison"`), or through an ALiBi source
+prior (`beta_attention_prior="causal_alibi"`). The launcher dictionary in `train_vfe3.py`
+holds the current choice and each run records its own in `config.json`; the reported K = 128
+run (34.48 test perplexity) used the uniform `causal` prior with learned positional frames and
+no rotation.
 `attention_window` is read only by the windowed priors, so the launcher's value is inactive.
 
 Runtime numerical KL bounds apply before softmax. Finite `kl_max` clips large
@@ -256,9 +261,8 @@ $$
 
 The code extracts values, pools sources, applies output maps, sums heads, and
 applies the receiver frame. It need not materialize every $K\times K$ pair link.
-These formulas use a common score/value frame, as in the current launcher's
-`pos_rotation="none"` setting; optional rotary-position policies can give
-comparison and content distinct realized frames.
+These formulas use a common score/value frame, as under `pos_rotation="none"`; the
+rotary-position policies can give comparison and content distinct realized frames.
 
 Under `predictive_covariance="passthrough"`, `predictive_content` leaves covariance
 unchanged **within this attention step**. Under `predictive_covariance="moment_matched"`
@@ -342,7 +346,7 @@ RMS-normalized reference mean $\hat x$, which is invariant under the passive fra
 | Mode | Factors | Link | Holonomy |
 |---|---|---|---|
 | `"lowrank"` (curved) | $A_i=a(\hat x_i)$, $B_j=b(\hat x_j)$, $g_i=I$, $\Phi_{ij}=\varphi_1(B_j^\top A_i)$ | $G_{ij}=e^{L}\exp(A_iB_j^\top)$ | varies from triangle to triangle |
-| `"pure_gauge"` (flat control) | shared basis $A$, $B_j=b(\hat x_j)$, $g_i=\exp(AB_i^\top)$, $\Phi_{ij}=-\varphi_1(-B_j^\top A)$ | $G_{ij}=g_ie^{L}g_j^{-1}$ | every triangle conjugate to $e^{L}$ |
+| `"pure_gauge"` (pure-gauge control, holonomy conjugate to $e^{L}$) | shared basis $A$, $B_j=b(\hat x_j)$, $g_i=\exp(AB_i^\top)$, $\Phi_{ij}=-\varphi_1(-B_j^\top A)$ | $G_{ij}=g_ie^{L}g_j^{-1}$ | every triangle conjugate to $e^{L}$ |
 
 Both follow from $\exp(AB^\top)=I+A\varphi_1(B^\top A)B^\top$. The pure-gauge arm has the same
 kind of content dependence and no holonomy beyond the shared class, so it is the control
@@ -364,10 +368,13 @@ the full-link gradient path refuse edge-enabled models.
 `content_link_latent=True` (curved mode only) treats the receiver factor $A_i$ as a latent
 variable with prior $\mathcal N(a(\hat x_i),\sigma_L^2I)$ and estimates it per context.
 Only the receiver factor is inferred: a sender factor $B_j$ enters every later receiver's
-links, so inferring it would leak future tokens into position $j$. Profiling out the
-receiver's next-layer state reduces the link energy to the dimensionless predictive variance
-$\mathrm{tr}C_i^{\mathrm{att}}/(2\mathrm{tr}C_i/K)$ (the moment-matched covariance
-without its floor), so the per-receiver energy is
+links, so inferring it would leak future tokens into position $j$. The link energy is a
+modeling choice, not the layer free energy restricted to $A_i$. With the transport covariance
+fixed by choice at $Q_i=(\mathrm{tr}C_i/K)I$, which makes the energy scale-free, profiling out
+the receiver's next-layer mean in a one-transition filtering approximation reduces it to the
+dimensionless predictive variance $\mathrm{tr}C_i^{\mathrm{att}}/(2\mathrm{tr}C_i/K)$ (the
+moment-matched covariance without its floor). Nothing in this term rewards a link for carrying
+content; it penalizes predictive spread. The per-receiver energy is
 
 $$
 \mathcal F_i(A_i)=\frac{\mathrm{tr}C_i^{\mathrm{att}}(A_i)}{2\mathrm{tr}C_i/K}
@@ -469,7 +476,9 @@ the validator for the complete admission rules.
 | `content_link_chart="exponential"` | Receiving map $e^{OT}T^{-1}$; see [Content-link charts](#content-link-charts). |
 | `predictive_covariance="moment_matched"` | Replaces the covariance by the predictive kernel's moment-matched covariance plus a covariant floor. |
 | `family="gaussian_diagonal"` | Keeps the diagonal of the local moment-matched covariance; `gaussian_full` keeps it dense, so the two differ on this route; see below. |
-| `encode_mode="per_token_additive"` | Capacity-matched $\Omega=I$ control; requires `pos_phi="none"` and `pos_rotation="none"`. |
+| `encode_mode="per_token_additive"` | Capacity-matched $\Omega=I$ control; requires `pos_phi="none"`, and either `pos_rotation="none"` or comparison-space RoPE (`rope_space="comparison"`). |
+| `routing_kl_max_reference` | Projected kernel router only. `"absolute"` (default) clamps $D_{ij}$ at `kl_max`; `"row_min"` clamps the detached row gap $D_{ij}-\min_{j\,\mathrm{admissible}}D_{ij}$, which leaves $\beta$ the exact softmax wherever no gap reaches `kl_max` and keeps the cost order of a row whose every cost exceeds it. |
+| `block_mlp_post_norm` | Default `False`. `True` reapplies the block norm to the post-MLP mean, so the next router reads a normalized mean; requires `block_coordinates="local"`, a block norm and a block MLP. |
 
 Relational rates of `None` inherit `m_p_mu_lr`; `0.0` freezes that role's
 parameters while retaining its forward operation. Score and content groups have
@@ -497,8 +506,10 @@ the per-token frame table and the positional table together with the group struc
 so on its own it cannot separate frame structure from lookup capacity. The
 `per_token_additive` encoder keeps the same learned $(V,n_{\mathrm{gen}})$ table but
 applies it as an additive mean shift with $\Omega_{ij}=I$; it is admitted on the projected
-routes only with `pos_phi="none"` and `pos_rotation="none"`, since a positional frame
-would reintroduce a non-identity transport. A gauge on/off result on this route should
+routes only with `pos_phi="none"`, and with either `pos_rotation="none"` or comparison-space
+RoPE, since a positional frame (or RoPE folded into the frame) would reintroduce a
+non-identity transport, while comparison-space RoPE rotates only the projected comparison
+moments and does not enter $U_i$. A gauge on/off result on this route should
 be reported against that arm.
 
 The launcher constructs `VFE3Config` from its dictionary with a per-run seed
@@ -513,9 +524,10 @@ fixed architectural constants.
 configured positional components form the frames. The input bank is present under
 every decoder; there is no `use_prior_bank` switch.
 
-The current launcher decodes with `decode_mode="linear"`,
-$z_{iv}=(W\mu_i+b)_v+\kappa\log u_v$, read from the final mean (the unigram term under
-`decode_unigram_prior=True`), which discards the covariance. The prior-bank decoder
+The linear decoder `decode_mode="linear"` reads
+$z_{iv}=(W\mu_i+b)_v+\kappa\log u_v$ from the final mean (the unigram term under
+`decode_unigram_prior=True`), which discards the covariance; the reported K = 128 run decoded
+this way. The prior-bank decoder
 `decode_mode="full_chunked"` instead gives each vocabulary item $v$ a Gaussian $p_v$ (an
 untied copy of the token tables under `untie_decode_bank=True`) and combines the divergence
 to it with the corpus unigram log-prior,
@@ -699,10 +711,14 @@ chart) produces the gap.
 All three runs use $K=20$ (two heads of width 10), four layers, 30,000 updates at batch 32,
 seed 6, the exponential chart and the coordinate MLP (`vfe3_runs/edge-links-ablations/`);
 their configs differ only in `content_link_edges`. Neither edge mode improves on the
-edges-off chart: the off arm is 0.0036 nats per token better than pure-gauge and 0.0041
-better than lowrank, and the two edge arms differ by 0.0005 nats, all far below the seed
-spread, so at this size and seed edge dependence has no measurable effect, while costing
-1.7 times (pure-gauge) and 3.5 times (lowrank) the wall time. Zeroing the edge sender map
+edges-off chart: on test the off arm is 0.0036 nats per token better than pure-gauge and
+0.0041 better than lowrank, and the two edge arms differ by 0.0005 nats. These test gaps are
+below one two-run-difference standard deviation (about 0.0053 nats, measured at $K=30$ over
+three seeds sharing one data order, and assumed to transfer to $K=20$), and the final
+validation gaps (0.0116 and 0.0112 nats, also in favor of edges off) sit at its two-SD
+threshold. One seed at this size cannot resolve effects below about 0.01 nats, so the result
+is a null of low severity rather than evidence of no effect; the edge modes cost 1.7 times
+(pure-gauge) and 3.5 times (lowrank) the wall time. Zeroing the edge sender map
 of the trained edge models (which returns every link to $e^{L}$ while keeping the trained
 $T$ and $O$) raises the cross-entropy on 16 validation windows by 1.22 nats for the
 pure-gauge model and 10.2 nats for the curved one (an unsaved probe, with no run artifact);

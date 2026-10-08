@@ -40,7 +40,7 @@ import json
 import logging
 import math
 import time
-from dataclasses import fields, replace
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence
 
@@ -48,9 +48,11 @@ import torch
 from torch.utils.data import DataLoader
 
 from vfe3.baseline import (
+    CALIBRATION_RECORD,
     BaselineConfig,
     BaselineTransformer,
     calibrated_tokens_per_s,
+    calibration_mismatch,
     measured_train_device_hours,
     width_ladder_rule,
 )
@@ -324,8 +326,10 @@ def calibrate_widths(
 ) -> Dict[int, Dict[str, Any]]:
     r"""Training-only throughput runs at each width (no evaluation, no finalize, no model files).
 
-    Each run writes ``metrics.csv`` with the per-window ``train_step_tokens_per_s``; the returned
-    mapping holds :func:`vfe3.baseline.calibrated_tokens_per_s` of each run (the median window).
+    Each run writes ``metrics.csv`` with the per-window ``train_step_tokens_per_s`` and
+    :data:`vfe3.baseline.CALIBRATION_RECORD` with the device it ran on (a calibration run is not
+    finalized, so it has no ``provenance.json``); the returned mapping holds
+    :func:`vfe3.baseline.calibrated_tokens_per_s` of each run (the median window).
     """
     from vfe3.run_artifacts import RunArtifacts
 
@@ -347,6 +351,11 @@ def calibrate_widths(
         train(model, loader, wide, n_steps=wide.max_steps, grad_clip=wide.grad_clip,
               log_interval=wide.log_interval, eval_interval=0, device=device, logger=logger,
               artifacts=artifacts, generate_samples=False)
+        device_name = torch.cuda.get_device_name(device) if device.type == "cuda" else device.type
+        (run_dir / CALIBRATION_RECORD).write_text(json.dumps(
+            {"device_name": device_name, "device": str(device), "torch_version": torch.__version__,
+             "width": int(width), "steps": int(steps), "dataset": dataset, "data_seed": data_seed},
+            indent=1), encoding="utf-8")
         out[int(width)] = calibrated_tokens_per_s(run_dir)
         logger.info("calibration K=%d: %.0f training tokens/s (%s)", width, out[int(width)]["tokens_per_s"],
                     run_dir)
@@ -370,15 +379,9 @@ def compute_matched_config(
     must have run on the budget run's device; a mismatch raises (audit 2026-10-07 F84).
     """
     budget = measured_train_device_hours(evaluated_run)
-    protocol = {"seed", "max_steps", "warmup_steps", "log_interval", "eval_interval",
-                "checkpoint_interval", "resume_from"}
     calibrated: Dict[int, Dict[str, Any]] = {}
     for w, path in calibration_runs.items():
-        record = json.loads((Path(path) / "config.json").read_text(encoding="utf-8"))
-        calib = BaselineConfig.from_serialized(record["config"], source=f"{path}/config.json")
-        expected = cfg.with_width(int(w))
-        mismatched = [f.name for f in fields(BaselineConfig)
-                      if f.name not in protocol and getattr(calib, f.name) != getattr(expected, f.name)]
+        mismatched = calibration_mismatch(cfg, path, int(w))
         if mismatched:
             raise ValueError(f"calibration run {path} (K={w}) differs from the matched arm in {mismatched}")
         calibrated[int(w)] = calibrated_tokens_per_s(path)

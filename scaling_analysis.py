@@ -29,6 +29,7 @@ import json
 import logging
 import math
 import os
+import typing
 import warnings
 from dataclasses import asdict
 from pathlib import Path
@@ -56,7 +57,7 @@ if os.environ.get(_CHILD_SENTINEL) == "1":
 import numpy as np
 
 from vfe3.artifact_utils import canonical_json_sha256 as _canonical_json_sha256
-from vfe3.config import config_from_serialized
+from vfe3.config import config_from_serialized, serialize_config
 from vfe3.metric_contracts import (  # noqa: E402
     SCALING_MIN_TESTABLE_SIZES,
     perplexity_matches_ce,
@@ -78,7 +79,16 @@ INFERENCE_ROUTE = "inference"                                # flat-N routes, pl
 # points/param_points/infer_points used above. The route each axis reads is defined once here; the
 # FigureSpec pair itself is built lazily inside _make_figures (behind the same guarded viz import the
 # figure pass already uses) so `import scaling_analysis` never requires the matplotlib stack.
-AXIS_ROUTES: Dict[str, str] = {"embed_dim": "grow_K", "n_heads": "blocksize", "n_layers": INFERENCE_ROUTE}
+# Each capacity axis is the scale knob a route grows; the route is derived from the harvested
+# validation points (``_axis_routes``), preferring the standard routes when several share a knob.
+AXIS_ROUTE_PREFERENCE: Dict[str, Tuple[str, ...]] = {
+    "embed_dim": ("width", "grow_K"),
+    "n_heads":   ("blocksize",),
+    "n_layers":  ("depth",),
+}
+# Scale knobs that change the training budget rather than the parameter count. Their cells are
+# fixed-N points and never enter the L(N) fit; they feed only the tokens-axis figure.
+NON_PARAMETER_KNOBS = frozenset({"max_steps"})
 
 CONFIG: Dict[str, Any] = {
     "input_dir":                       "vfe3_scaling_results",  # scaling.py output root and design
@@ -221,7 +231,10 @@ def _validated_bound_scaling_run(
                 source=str(run / "config.json"),
             )
         effective_config = asdict(migrated)
-        expected_config_sha256 = _canonical_json_sha256(effective_config)
+        # Digest the strict-JSON serialized form exactly as scaling.run_cell and
+        # _cell_resume_status do; raw asdict carries kl_max=inf, which strict JSON refuses.
+        expected_config_sha256 = _canonical_json_sha256(
+            json.loads(json.dumps(serialize_config(migrated), default=str)))
         saved_digest = cell.get(_SCALING_REUSE_DIGEST_FIELD)
     except (TypeError, ValueError):
         return None
@@ -316,9 +329,19 @@ def _validated_bound_scaling_run(
     metrics = _validated_scaling_metrics(summary)
     if metrics is None:
         return None
+    effective_run_key = _canonical_json_sha256({
+        "config": _float_fields_as_float(
+            json.loads(json.dumps(serialize_config(migrated), default=str)), migrated),
+        "dataset": dataset,
+        "data_seed": cell.get("data_seed"),
+        "max_tokens": cell.get("max_tokens"),
+        "sources": source_identities,
+        "code_identity": [git_sha, git_dirty, dirty_fingerprint],
+    })
     return {
         **metrics,
         "effective_config": effective_config,
+        "effective_run_key": effective_run_key,
         "seed": seeds[0],
         "git_sha": git_sha,
         "git_dirty": git_dirty,
@@ -333,6 +356,24 @@ def _validated_bound_scaling_run(
             for split in _SCALING_SOURCE_SPLITS
         },
     }
+
+
+def _float_fields_as_float(payload: Dict[str, Any], config: Any) -> Dict[str, Any]:
+    """Coerce exact-``int`` values of ``config``'s float-annotated fields to ``float`` in ``payload``.
+
+    ``VFE3Config`` keeps an ``int`` passed to a float field (``kl_max=160`` versus the width route's
+    ``160 * k / k = 160.0``), so two identical runs would otherwise get different identities.
+    """
+    out = dict(payload)
+    hints = typing.get_type_hints(type(config))
+    for name, value in out.items():
+        hint = hints.get(name)
+        if type(value) is int and (
+                hint is float
+                or (typing.get_origin(hint) is typing.Union
+                    and float in typing.get_args(hint) and int not in typing.get_args(hint))):
+            out[name] = float(value)
+    return out
 
 
 _BLOCK_MLP_STRUCTURAL_METADATA_FIELDS = {
@@ -453,6 +494,10 @@ def harvest(
             force_accept_code_identity_drift=force_accept_code_identity_drift,
         )
         if verified is None or not isinstance(sp, Mapping) or not isinstance(cfg, Mapping):
+            logger.warning(
+                "scaling_analysis: run %s failed generation-contract validation and is not harvested",
+                run,
+            )
             continue
         effective_cfg = verified.get("effective_config")
         if not isinstance(effective_cfg, Mapping):
@@ -460,6 +505,7 @@ def harvest(
         block_mlp_structure = _block_mlp_structural_values(cfgj, effective_cfg)
         rows.append({
             "run_dir":     str(run.resolve()),
+            "effective_run_key": verified["effective_run_key"],
             "route":       cell["route"],
             "scale_knob":  cell["scale_knob"],
             "label":       cell["label"],
@@ -1012,6 +1058,9 @@ def aggregate_points(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "n_e_steps": _as_float(grp[0].get("n_e_steps")),
             "n_layers": _as_float(grp[0].get("n_layers")),
             "ce_seeds": ce, "n_seeds": len(ce),
+            # one entry per seed run; identical tuples mark the same training runs under two routes
+            "effective_run_keys": tuple(sorted(
+                str(g["effective_run_key"]) for g in grp if g.get("effective_run_key"))),
             "ce_mean": float(np.mean(ce)),
             "ce_sem": float(np.std(ce, ddof=1) / np.sqrt(len(ce))) if len(ce) > 1 else 0.0,
             "f_seeds": f_seeds,
@@ -1025,6 +1074,60 @@ def aggregate_points(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "ppl_sem": float(np.std(ppl, ddof=1) / np.sqrt(len(ppl))) if len(ppl) > 1 else 0.0,
         })
     return points
+
+
+def _collapse_identical_points(
+    points: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    r"""Keep one point per set of identical training runs before pooling.
+
+    The standard routes share cells: ``width`` K{k} is ``width_depth`` K{k}_L6 and ``depth`` L{d}
+    is ``width_depth`` K160_L{d}, trained with the same seeds, data order and deterministic kernels.
+    Two points whose per-seed effective-run identities (config with float fields normalized,
+    dataset, data seed, token cap, source and code identity) coincide are one set of observations,
+    so the pooled fit, the lack-of-fit test and the bootstrap must count them once. Returns the
+    retained points (first in (route, label) order) and a report of every collapsed group.
+    Points without a recorded identity are kept as they are, and points must also record the same
+    parameter count to collapse.
+    """
+    kept: List[Dict[str, Any]] = []
+    groups: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
+    for p in points:
+        keys = tuple(p.get("effective_run_keys") or ())
+        if not keys:
+            kept.append(p)
+            continue
+        group_key = (keys, _as_float(p.get("n_params")))
+        if group_key not in groups:
+            kept.append(p)
+        groups.setdefault(group_key, []).append(p)
+    collapsed = [
+        {"kept": f"{grp[0]['route']}/{grp[0]['label']}",
+         "dropped_as_identical": [f"{q['route']}/{q['label']}" for q in grp[1:]],
+         "n_seed_runs": len(grp[0].get("effective_run_keys") or ())}
+        for grp in groups.values() if len(grp) > 1
+    ]
+    return kept, collapsed
+
+
+def _axis_routes(points: Sequence[Mapping[str, Any]]) -> Dict[str, str]:
+    r"""Map each capacity axis to the route that grows it, read from the points' ``scale_knob``.
+
+    A route is a candidate for axis ``a`` when one of its points has ``scale_knob == a``. With
+    several candidates the first in ``AXIS_ROUTE_PREFERENCE[a]`` wins (else the first by name), and
+    the choice is logged; an axis no route grows is omitted.
+    """
+    out: Dict[str, str] = {}
+    for axis, preference in AXIS_ROUTE_PREFERENCE.items():
+        candidates = sorted({str(p["route"]) for p in points if p.get("scale_knob") == axis})
+        if not candidates:
+            continue
+        preferred = [route for route in preference if route in candidates]
+        out[axis] = preferred[0] if preferred else candidates[0]
+        if len(candidates) > 1:
+            logger.info("capacity axis %s drawn from route %s (candidates: %s)",
+                        axis, out[axis], ", ".join(candidates))
+    return out
 
 
 def _kmup_series(param_points: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
@@ -1067,10 +1170,25 @@ def bootstrap_exponent_ci(
     r"""Bootstrap the power-law exponent with the same estimator form as the point estimate.
 
     Ordinary power-law replicates resample size clusters and their seed CEs. A successful offset-law
-    fit keeps the distinct-size design fixed and resamples only seed CEs because cluster resampling
-    usually makes that three-parameter fit underdetermined. Replicates whose realized fit form differs
-    from the point estimate are rejected. Returns (alpha_hat, lo2.5, hi97.5). Needs >= 2 points;
-    degenerate or no same-form replicates -> NaNs.
+    fit keeps the distinct-size design fixed (cluster resampling usually makes that three-parameter
+    fit underdetermined) and draws the size means from the pooled pure-error model in log-CE space,
+    the same model the lack-of-fit test uses. With :math:`y_{ij} = \log \mathrm{CE}_{ij}` (seed j of
+    size i, :math:`n_i` seeds, m sizes, n runs) and
+    :math:`s^2 = \sum_{ij} (y_{ij} - \bar y_i)^2 / (n - m)`, each replicate draws
+
+    .. math::
+        \sigma^{*2} = s^2 (n - m) / \chi^2_{n-m}, \quad
+        \bar y_i^* = \bar y_i + (\sigma^* / \sqrt{n_i}) z_i, \quad z_i \sim N(0, 1),
+
+    the posterior of the size means under the noninformative prior for a normal model with a
+    common variance (Gelman et al. 2013, *Bayesian Data Analysis*, 3rd ed., Sec. 3.2). For
+    any linear functional of the means this reproduces the Student-t interval on n - m degrees of
+    freedom exactly, so the interval carries the uncertainty of the estimated seed variance. The
+    previous seed-only resampling had variance :math:`(n_i - 1)/n_i` of :math:`s_i^2/n_i` and no
+    small-df correction; at 4 sizes x 3 seeds its nominal 95% interval covered the true exponent
+    in 0.73 to 0.78 of replicates in two 200-replicate checks (audit 2026-10-08 gap-stats#1).
+    Replicates whose realized fit form differs from the point estimate are rejected. Returns (alpha_hat, lo2.5, hi97.5). Needs >= 2 points; degenerate or no
+    same-form replicates -> NaNs.
 
     ``weights`` (per-point, same order as ``points``) MUST match the headline fit's weighting so the
     point estimate and the CI come from ONE estimator -- otherwise a weighted headline alpha can sit
@@ -1089,14 +1207,30 @@ def bootstrap_exponent_ci(
     rng = np.random.default_rng(0)                           # fixed -> reproducible CI
     boot: List[float] = []
     n = len(points)
+    if point_form == "offset_power_law":
+        if np.any(np.concatenate(seed_arrays) <= 0.0):
+            return alpha_hat, float("nan"), float("nan")
+        log_seeds = [np.log(a) for a in seed_arrays]
+        n_i = np.array([a.size for a in log_seeds], dtype=float)
+        df_pe = int(n_i.sum()) - n
+        ss_pe = float(sum(np.sum((a - a.mean()) ** 2) for a in log_seeds))
+        if df_pe < 1 or not ss_pe > 0.0:
+            return alpha_hat, float("nan"), float("nan")
+        log_means = np.log(means)
+        s2_pe = ss_pe / df_pe
     for _ in range(n_boot):
-        # The offset estimator needs four distinct sizes. Resampling size clusters silently turns
-        # most replicates into the no-offset fallback, so keep the fitted design fixed and resample
-        # only seed observations. The ordinary power-law fit retains the cluster bootstrap.
-        idx = np.arange(n) if point_form == "offset_power_law" else rng.integers(0, n, n)
-        bx = xs[idx]
-        by = np.array([float(rng.choice(seed_arrays[i], size=seed_arrays[i].size).mean()) for i in idx])
-        bw = weights[idx] if weights is not None else None
+        if point_form == "offset_power_law":
+            # Fixed design; size means from the pooled pure-error posterior (see the docstring).
+            sigma2 = s2_pe * df_pe / rng.chisquare(df_pe)
+            bx = xs
+            by = np.exp(log_means + np.sqrt(sigma2 / n_i) * rng.standard_normal(n))
+            bw = weights
+        else:
+            idx = rng.integers(0, n, n)
+            bx = xs[idx]
+            by = np.array([float(rng.choice(seed_arrays[i], size=seed_arrays[i].size).mean())
+                           for i in idx])
+            bw = weights[idx] if weights is not None else None
         fit = _fit_power_law(bx, by, weights=bw, with_offset=with_offset)
         a = fit["alpha"]
         if np.isfinite(a) and fit.get("form") == point_form:
@@ -1117,12 +1251,47 @@ def _loglog_rss(x: np.ndarray, y: np.ndarray) -> float:
     return float(np.sum((y - (b * x + a)) ** 2))
 
 
-def ancova_frontier_collapse(points: List[Dict[str, Any]], min_points: int = 2) -> Dict[str, Any]:
-    r"""F-test for whether the routes share ONE log-log L(N) line. Pooled model (1 line, 2 params) vs
-    full model (a separate slope+intercept per route, 2R params); a significant F means the routes do
-    NOT collapse (route-specific slope and/or intercept). Uses only routes with >= ``min_points`` sizes
-    and a total dof margin (n > 2R). Non-rejection does not establish equivalence.
-    Returns the F statistic, dof, p-value, rejection status, and per-route point counts."""
+def _offset_rss(x: np.ndarray, y: np.ndarray, w: np.ndarray) -> Tuple[float, str]:
+    r"""Weighted RSS of the offset law :math:`E + A N^{-\alpha}` and the realized fit form.
+
+    The fit is the headline estimator (``_fit_power_law(with_offset=True)`` with the SEM weights
+    ``w``, i.e. ``curve_fit`` with :math:`\sigma_i = y_i / \sqrt{w_i}`), and the RSS is that fit's
+    own objective :math:`\sum_i ((y_i - \hat y_i) / \sigma_i)^2`. A solver fallback to the log-log
+    form is reported through the returned form string."""
+    from vfe3.viz.figures import _fit_power_law
+    fit = _fit_power_law(x, y, weights=w, with_offset=True)
+    if fit.get("form") != "offset_power_law":
+        return float("nan"), str(fit.get("form"))
+    yhat = float(fit["E"]) + float(fit["A"]) * np.power(x, -float(fit["alpha"]))
+    return float(np.sum(((y - yhat) * np.sqrt(w) / y) ** 2)), "offset_power_law"
+
+
+def ancova_frontier_collapse(
+    points:      List[Dict[str, Any]],
+    min_points:  int = 2,
+
+    *,
+    with_offset: bool = False,
+) -> Dict[str, Any]:
+    r"""F-test for whether the routes share ONE L(N) curve of the headline form.
+
+    ``with_offset=False``: pooled log-log line (2 params) vs a separate slope+intercept per route
+    (2R params). ``with_offset=True``: the extra-sum-of-squares F test for the offset law
+    :math:`L = E + A N^{-\alpha}`, pooled (3 params) vs one offset law per route (3R params),
+
+    .. math::
+        F = \frac{(RSS_{pooled} - RSS_{full}) / (3R - 3)}{RSS_{full} / (n - 3R)}
+        \sim F_{3R-3, n-3R},
+
+    on the residuals of the headline SEM-weighted fit (Bates and Watts 1988, *Nonlinear Regression Analysis
+    and Its Applications*; Seber and Wild 1989, *Nonlinear Regression*; the F
+    law is asymptotic for a nonlinear model). A log-log line is not the headline curve: the local
+    log-log slope of :math:`E + A N^{-\alpha}` changes with N, so routes sampling one offset law
+    over different N ranges would otherwise be reported as diverging. The offset test needs four
+    distinct sizes per route and a converged offset fit for every route and for the pool;
+    otherwise it is not testable. A significant F means the routes do NOT collapse. Non-rejection
+    does not establish equivalence. Returns the F statistic, dof, p-value, rejection status, and
+    per-route point counts."""
     by_route: Dict[str, List[Dict[str, Any]]] = {}
     for p in points:
         n_params = _as_float(p.get("n_params"))
@@ -1139,6 +1308,9 @@ def ancova_frontier_collapse(points: List[Dict[str, Any]], min_points: int = 2) 
     if len(routes) < 2:
         out["reason"] = "need >= 2 routes with enough sizes"
         return out
+    out["form"] = "offset_power_law" if with_offset else "loglog_line"
+    if with_offset:
+        return _offset_frontier_collapse(routes, out)
     x_all, y_all = [], []
     rss_full, n_total, R = 0.0, 0, len(routes)
     for r, ps in routes.items():
@@ -1153,6 +1325,54 @@ def ancova_frontier_collapse(points: List[Dict[str, Any]], min_points: int = 2) 
         out["reason"] = "insufficient dof for the F-test"
         return out
     F = ((rss_pooled - rss_full) / df1) / (rss_full / df2)
+    try:
+        from scipy.stats import f as f_dist
+        p_value = float(f_dist.sf(F, df1, df2))
+    except Exception:
+        p_value = float("nan")
+    out.update({"testable": True, "F": float(F), "df1": int(df1), "df2": int(df2),
+                "p_value": p_value, "rss_pooled": rss_pooled, "rss_full": rss_full,
+                "null_rejected": (p_value <= 0.05) if np.isfinite(p_value) else None,
+                "collapses": False if np.isfinite(p_value) and p_value <= 0.05 else None})
+    return out
+
+
+def _offset_frontier_collapse(
+    routes: Mapping[str, List[Dict[str, Any]]],
+    out:    Dict[str, Any],
+) -> Dict[str, Any]:
+    r"""Extra-sum-of-squares F test of one pooled offset law against one offset law per route."""
+    n_law_params = 3
+    short = sorted(r for r, ps in routes.items() if len({float(p["n_params"]) for p in ps}) < 4)
+    if short:
+        out["reason"] = ("offset-law collapse test needs >= 4 distinct sizes per route; "
+                         f"{', '.join(short)} has fewer")
+        return out
+    from vfe3.viz.figures import _scaling_sem_weights
+    x_all, y_all, w_all = [], [], []
+    rss_full, n_total, R = 0.0, 0, len(routes)
+    for r, ps in routes.items():
+        x = np.array([p["n_params"] for p in ps], dtype=float)
+        y = np.array([p["ce_mean"] for p in ps], dtype=float)
+        w = _scaling_sem_weights(y, np.array([_as_float(p.get("ce_sem")) for p in ps], dtype=float))
+        rss, form = _offset_rss(x, y, w)
+        if not np.isfinite(rss):
+            out["reason"] = f"route {r}: offset fit did not converge ({form})"
+            return out
+        x_all.append(x); y_all.append(y); w_all.append(w)
+        rss_full += rss
+        n_total += x.size
+    rss_pooled, form = _offset_rss(np.concatenate(x_all), np.concatenate(y_all),
+                                   np.concatenate(w_all))
+    if not np.isfinite(rss_pooled):
+        out["reason"] = f"pooled offset fit did not converge ({form})"
+        return out
+    df1, df2 = n_law_params * R - n_law_params, n_total - n_law_params * R
+    if df2 <= 0 or not np.isfinite(rss_full) or rss_full <= 0:
+        out["reason"] = "insufficient dof for the F-test"
+        return out
+    # The pooled law is a constrained per-route law, so RSS_pooled >= RSS_full up to solver tolerance.
+    F = (max(rss_pooled - rss_full, 0.0) / df1) / (rss_full / df2)
     try:
         from scipy.stats import f as f_dist
         p_value = float(f_dist.sf(F, df1, df2))
@@ -1236,8 +1456,12 @@ def analyze() -> None:
             validation_points = None
     else:
         validation_points = None
-    param_points = [p for p in points if p["route"] != INFERENCE_ROUTE]
+    param_points = [p for p in points
+                    if p["route"] != INFERENCE_ROUTE and p["scale_knob"] not in NON_PARAMETER_KNOBS]
     infer_points = [p for p in points if p["route"] == INFERENCE_ROUTE]
+    # Fixed-N training-budget cells (scale_knob max_steps): tokens-axis figure only, never L(N).
+    budget_points = [p for p in points
+                     if p["route"] != INFERENCE_ROUTE and p["scale_knob"] in NON_PARAMETER_KNOBS]
     fit_infer_points = infer_points if allow_parameter_fit else []
     fit_param_mask = np.array([
         allow_parameter_fit
@@ -1268,8 +1492,16 @@ def analyze() -> None:
         logger.warning("harvested parameter runs span multiple token budgets -- data budget confounds the fit")
 
     routes = sorted({p["route"] for p in fit_param_points})
+    # Identical training runs reached through two routes enter the pooled estimators once.
+    pooled_param_points, collapsed_cells = _collapse_identical_points(fit_param_points)
+    pooled_ids = {id(p) for p in pooled_param_points}
+    pooled_mask = np.array([id(p) in pooled_ids for p in fit_param_points], dtype=bool)
+    for group in collapsed_cells:
+        logger.warning("identical training runs %s counted once in the pooled fit (kept %s)",
+                       ", ".join(group["dropped_as_identical"]), group["kept"])
     frontier = (
-        ancova_frontier_collapse(fit_param_points, min_points=CONFIG["min_points"])
+        ancova_frontier_collapse(fit_param_points, min_points=CONFIG["min_points"],
+                                 with_offset=CONFIG["with_offset"])
         if allow_parameter_fit
         else {"testable": False, "collapses": None, "reason": "incomplete_design"}
     )
@@ -1282,6 +1514,10 @@ def analyze() -> None:
         "input_dir": str(input_dir), "n_runs": len(rows), "with_offset": CONFIG["with_offset"],
         "n_param_points": len(param_points), "n_inference_points": len(infer_points),
         "n_fitted_param_points": len(fit_param_points),
+        "n_pooled_param_points": len(pooled_param_points),
+        "collapsed_identical_cells": collapsed_cells,
+        "n_budget_points": len(budget_points),
+        "budget_points_excluded_from_fit": sorted(f"{p['route']}/{p['label']}" for p in budget_points),
         "design": design,
         "provenance": provenance, "pooled_fit": None, "pooled_fit_status": "not_fitted",
         "pooled_fit_confounds": [], "pooled_fit_lack_of_fit": None,
@@ -1306,6 +1542,7 @@ def analyze() -> None:
     else:
         all_weights = np.array([], dtype=float)
         fit_weights = np.array([], dtype=float)
+    pooled_weights = fit_weights[pooled_mask] if fit_weights.size else fit_weights
 
     # ---- L(N) power law + bootstrap exponent CI (pooled over the parameter routes) ----
     n_harvested_param_sizes = len({float(p["n_params"]) for p in param_points})
@@ -1319,21 +1556,21 @@ def analyze() -> None:
     lack_of_fit: Optional[Dict[str, Any]] = None
     if n_fit_param_sizes >= 2:
         from vfe3.viz.figures import _fit_power_law
-        xs = np.array([p["n_params"] for p in fit_param_points], dtype=float)
-        ys = np.array([p["ce_mean"] for p in fit_param_points], dtype=float)
-        fit = _fit_power_law(xs, ys, weights=fit_weights, with_offset=CONFIG["with_offset"])
+        xs = np.array([p["n_params"] for p in pooled_param_points], dtype=float)
+        ys = np.array([p["ce_mean"] for p in pooled_param_points], dtype=float)
+        fit = _fit_power_law(xs, ys, weights=pooled_weights, with_offset=CONFIG["with_offset"])
         lo = hi = None
         if fit_testable:
             _a_hat, lo, hi = bootstrap_exponent_ci(
-                fit_param_points,
-                weights=fit_weights,
+                pooled_param_points,
+                weights=pooled_weights,
                 n_boot=CONFIG["n_bootstrap"],
                 with_offset=CONFIG["with_offset"],
             )
         if np.isfinite(_as_float(fit.get("alpha"))):
             n_fit_parameters = 3 if fit["form"] == "offset_power_law" else 2
             if fit_testable:
-                lack_of_fit = _lack_of_fit_test(fit_param_points, fit)
+                lack_of_fit = _lack_of_fit_test(pooled_param_points, fit)
                 print(f"\nPOOLED L(N) fit ({fit['form']}):  alpha = {fit['alpha']:.4f}  "
                       f"[95% CI {lo:.4f}, {hi:.4f}]   A = {fit['A']:.4g}   "
                       + (f"E = {fit['E']:.4f}   " if fit["form"] == "offset_power_law" else "")
@@ -1362,10 +1599,10 @@ def analyze() -> None:
         # ---- the same law against NON-EMBEDDING parameters (total minus per-token / positional
         # lookup tables, which are ~99% of N at the scaling widths; Kaplan et al. 2020) ----
         non_embedding = np.array([_as_float(p.get("n_non_embedding_params"))
-                                  for p in fit_param_points], dtype=float)
+                                  for p in pooled_param_points], dtype=float)
         if (non_embedding.size and np.all(np.isfinite(non_embedding)) and np.all(non_embedding > 0.0)
                 and np.unique(non_embedding).size >= 2):
-            ne_fit = _fit_power_law(non_embedding, ys, weights=fit_weights,
+            ne_fit = _fit_power_law(non_embedding, ys, weights=pooled_weights,
                                     with_offset=CONFIG["with_offset"])
             ne_testable = int(ne_fit["n_distinct_sizes"]) >= SCALING_MIN_TESTABLE_SIZES
             if np.isfinite(_as_float(ne_fit.get("alpha"))):
@@ -1479,7 +1716,9 @@ def analyze() -> None:
     # ---- figures (best-effort, never fatal) ----
     figure_param_points = param_points if allow_parameter_fit else []
     _make_figures(figure_param_points, fit_infer_points, fig_dir, weights_by_route=weights_by_route,
-                  validation_points=validation_points, axis_routes=AXIS_ROUTES)
+                  validation_points=validation_points,
+                  axis_routes=_axis_routes(validation_points or []),
+                  budget_points=budget_points if allow_parameter_fit else [])
     print(f"\nfigures -> {fig_dir}")
 
 
@@ -1601,10 +1840,20 @@ def _write_scaling_md(path: Path, summary: Dict[str, Any]) -> None:
     if anc and anc.get("testable"):
         verdict = _frontier_verdict(anc)
         L += ["## Frontier-collapse F-test", "",
-              f"- F({anc['df1']},{anc['df2']}) = {anc['F']:.3f}, p = {anc['p_value']:.4g}",
+              f"- F({anc['df1']},{anc['df2']}) = {anc['F']:.3f}, p = {anc['p_value']:.4g} "
+              f"(per-route curve: {anc.get('form', 'loglog_line')})",
               f"- verdict: {verdict}", ""]
     elif anc:
         L += ["## Frontier-collapse F-test", "", f"- not testable ({anc.get('reason')})", ""]
+    collapsed = summary.get("collapsed_identical_cells") or []
+    budget = summary.get("budget_points_excluded_from_fit") or []
+    if collapsed or budget:
+        L += ["## Points not counted separately in the pooled fit", ""]
+        L += [f"- identical runs: kept `{group['kept']}`, counted once with "
+              f"{', '.join(f'`{label}`' for label in group['dropped_as_identical'])}"
+              for group in collapsed]
+        L += [f"- training-budget cell (fixed N; tokens axis only): `{label}`" for label in budget]
+        L.append("")
     es = summary.get("estep_structural")
     if es:
         L += ["## E-step structural-EM check", "",
@@ -1624,6 +1873,7 @@ def _make_figures(
     weights_by_route:  Optional[Mapping[str, np.ndarray]]       = None,
     validation_points: Optional[List[Dict[str, Any]]]           = None,
     axis_routes:       Optional[Mapping[str, str]]              = None,
+    budget_points:     Optional[List[Dict[str, Any]]]           = None,
 ) -> None:
     try:
         from vfe3.viz import figures as figs
@@ -1687,11 +1937,13 @@ def _make_figures(
                 param_points, x_key="est_flops_6ND", xlabel="est FLOPs (6ND proxy)",
                 with_offset=CONFIG["with_offset"], title="Scaling vs compute (6ND proxy)",
                 path=str(fig_dir / "scaling_ce_vs_flops.png")))
-        # data axis: only meaningful if tokens_seen actually varies (add a data route to populate it).
-        toks = {p["tokens_seen"] for p in param_points if np.isfinite(p["tokens_seen"])}
+        # data axis: only meaningful if tokens_seen actually varies (the fixed-N budget cells
+        # of a max_steps route, when present, are the data axis; they never enter L(N)).
+        data_points = budget_points if budget_points else param_points
+        toks = {p["tokens_seen"] for p in data_points if np.isfinite(p["tokens_seen"])}
         if len(toks) > 1:
             _try("scaling_ce_vs_tokens.png", lambda: figs.plot_scaling_law(
-                param_points, x_key="tokens_seen", xlabel="tokens seen (data)",
+                data_points, x_key="tokens_seen", xlabel="tokens seen (data)",
                 with_offset=CONFIG["with_offset"], title="Scaling vs data",
                 path=str(fig_dir / "scaling_ce_vs_tokens.png")))
         # Pooled PPL offset law vs width (the June-27 headline result): PPL = E + A K^{-b} over ALL

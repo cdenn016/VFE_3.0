@@ -439,8 +439,9 @@ class VFEModel(nn.Module):
                 covariance_layout=("full" if cfg.family == "gaussian_full" else "diagonal"),
             )
         )
+        # Under rope_space='comparison' no frame carries R_i: the MLP and the values both read U_i.
         if (cfg.use_block_mlp and self._block_mlp_registration.requires_frame_context
-                and cfg.pos_rotation == "rope"):
+                and cfg.pos_rotation == "rope" and getattr(cfg, "rope_space", "frame") == "frame"):
             rope_caveats = []
             if not cfg.rope_on_value:
                 rope_caveats.append(
@@ -1668,7 +1669,14 @@ class VFEModel(nn.Module):
         minimal_agent = getattr(ops, "predictive_readout", "kernel") == "minimal_agent"
         cap_level = math.inf if minimal_agent else self.cfg.kl_max
         entropy = -torch.special.xlogy(beta, beta).sum(-1)
-        scorable = (beta > 0).sum(-1) >= 2
+        # Routing support is the finite causal prior, not beta > 0: at large kl_max / tau a capped
+        # admissible key underflows to beta = 0 in float32 and would drop out of both statistics
+        # (audit 2026-10-08 P2-19). This is the support rule of the training cap counters.
+        from vfe3.posthoc.klcap import causal_support
+        if beta.dim() == 3:
+            beta, score, entropy = beta.unsqueeze(1), score.unsqueeze(1), entropy.unsqueeze(1)
+        support = causal_support(beta, snapshot.log_prior)                     # (B, H, N, N) bool
+        scorable = support.sum(-1) >= 2                                       # (B, H, N)
         d = {key: float("nan") for key in (
             "self_coupling", "self_divergence", "belief_coupling", "attention_entropy",
             "total", "effective_rank", "holonomy_deviation", "gauge_trace_spread")}
@@ -1678,9 +1686,9 @@ class VFEModel(nn.Module):
             relational_legacy_global_f_available=0.0,
             attn_entropy=float(entropy.mean()),
             attn_entropy_min=(float(entropy[scorable].min()) if scorable.any() else float("nan")),
-            # Capped fraction over the routable support (beta > 0), not over masked pairs.
+            # Capped fraction over the causal support, not over masked pairs.
             relational_score_klmax_frac=float(
-                ((score >= cap_level) & (beta > 0)).sum() / (beta > 0).sum().clamp(min=1)),
+                ((score >= cap_level) & support).sum() / support.sum().clamp(min=1)),
         )
         from vfe3 import metrics
         d["covariance_available"] = 1.0
@@ -1700,7 +1708,9 @@ class VFEModel(nn.Module):
             d["relational_receiver_cost_delta"] = (
                 d["relational_receiver_cost_after"] - d["relational_receiver_cost_before"])
             # The total delta can fall while the mean moves away from its minimizer; report the
-            # mean and covariance parts and the distance to mu* = Lambda^{-1} eta separately.
+            # mean and covariance parts and the distance to mu* = Lambda^{-1} eta separately. Both
+            # parts are evaluated in the episode-initial frozen context, so under a state-dependent
+            # alpha they split the majorizer's delta, an upper bound on the profiled cost delta.
             for part in ("mean", "covariance"):
                 before = float(cap.get(f"relational_receiver_{part}_cost_before", float("nan")))
                 after = float(cap.get(f"relational_receiver_{part}_cost_after", float("nan")))

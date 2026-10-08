@@ -214,6 +214,30 @@ def _reproduction(
             "arithmetic": "matched" if matched else "fp32 replay", "scored_targets_ok": targets_ok}
 
 
+def _subsample_reproduction(
+    result:    ev.TargetNLL,
+    indices:   np.ndarray,
+    windows:   np.ndarray,
+    reference: Optional[Dict[str, Any]],
+    *,
+    matched:   bool,
+) -> Dict[str, Any]:
+    r"""The reproduction check restricted to the windows ``windows`` (the population the run logged).
+
+    The reported pass statistic keeps every window of the larger post-hoc sample; the check compares
+    the logged value with the mean NLL of the targets in ``windows`` only, and is ``"subset"`` unless
+    every one of those windows was evaluated.
+    """
+    keep = np.isin(result.window, windows)
+    n_scored = int(keep.sum())
+    ce = float(result.nll[keep].mean()) if n_scored else float("nan")
+    out = _reproduction({"ce": ce, "n_scored": n_scored}, reference,
+                        full=bool(np.isin(windows, indices).all()), matched=matched)
+    out.update(ce=ce, n_scored=n_scored, n_windows=int(windows.size),
+               sample="the training loop's fixed sample (a subset of the windows of this pass)")
+    return out
+
+
 def _units_for(result: ev.TargetNLL, split: str, stream_units: Optional[np.ndarray]) -> np.ndarray:
     r"""Resampling unit of every scored target: its article (validation/test), else its window."""
     if split != "train_sample" and stream_units is not None:
@@ -422,13 +446,20 @@ def _datasets(
     info:     st.RunInfo,
     options:  PosthocOptions,
     log:      Callable[[str], None],
-) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]], Dict[str, Optional[np.ndarray]], Dict[str, torch.Tensor]]:
-    r"""``(datasets, stream records, per-position units, tokens)`` of the requested splits."""
+) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]], Dict[str, Optional[np.ndarray]], Dict[str, torch.Tensor],
+           Dict[str, np.ndarray]]:
+    r"""``(datasets, stream records, per-position units, tokens, reproduction windows)`` of the requested splits.
+
+    The reproduction windows of ``train_sample`` index the windows of the post-hoc sample that the
+    training loop scored as its own (smaller) fixed sample, the population of the logged
+    ``train_sample_ce``.
+    """
     cache_dir = Path(options.cache_dir) if options.cache_dir else None
     datasets: Dict[str, Any] = {}
     records: Dict[str, Dict[str, Any]] = {}
     units: Dict[str, Optional[np.ndarray]] = {}
     tokens_by_split: Dict[str, torch.Tensor] = {}
+    reproduction_windows: Dict[str, np.ndarray] = {}
     needed = set(options.splits)
     if "train_sample" in needed:
         needed.add("validation")                     # the sample is sized to the validation targets
@@ -463,16 +494,27 @@ def _datasets(
                                            allow_mismatch=options.allow_stream_mismatch)
         n_val = int(datasets["validation"].tokens.numel()) - 1 if "validation" in datasets else st.TRAIN_SAMPLE_MAX_TARGETS
         sample = st.fixed_train_sample(tokens, info.seq_len, info.eval_stride, n_val)
+        training_windows, training_max_targets = st.training_loop_sample_windows(sample, tokens, n_val)
+        reproduction_windows["train_sample"] = training_windows
         record["protocol"] = {"seq_len": info.seq_len, "stride": info.eval_stride, "n_windows": len(sample),
                               "seed": st.TRAIN_SAMPLE_SEED, "max_targets": st.TRAIN_SAMPLE_MAX_TARGETS,
                               "requested_targets": n_val, "scored_targets": len(sample) * info.eval_stride,
                               "window_starts_sha256": hashlib.sha256(
-                                  np.asarray(sample.starts, dtype=np.int64).tobytes()).hexdigest()}
+                                  np.asarray(sample.starts, dtype=np.int64).tobytes()).hexdigest(),
+                              "reproduction_sample": {
+                                  "rule": "the windows the training loop scored (vfe3.train."
+                                          "TRAIN_SAMPLE_MAX_TARGETS cap, a prefix of the same seeded "
+                                          "permutation); the logged train_sample_ce is checked on these only",
+                                  "max_targets": training_max_targets,
+                                  "n_windows": int(training_windows.size),
+                                  "scored_targets": int(training_windows.size) * info.eval_stride,
+                                  "window_starts_sha256": hashlib.sha256(np.asarray(
+                                      sample.starts[training_windows], dtype=np.int64).tobytes()).hexdigest()}}
         record["units"] = {"unit": "window", "rule": "each sampled training window is one resampling unit"}
         datasets["train_sample"], records["train_sample"], units["train_sample"] = sample, record, None
         log(f"[posthoc] train sample: {len(sample)} windows of the {record['n_tokens']:,}-token train "
-            f"stream, identity {record['status']}")
-    return datasets, records, units, tokens_by_split
+            f"stream ({training_windows.size} of them the training loop's sample), identity {record['status']}")
+    return datasets, records, units, tokens_by_split, reproduction_windows
 
 
 def _indices(split: str, dataset: Any, options: PosthocOptions) -> np.ndarray:
@@ -540,7 +582,7 @@ def run_posthoc(
         report["model_family"] = model_family_of(cfg)
         report["skipped_analyses"] = skipped_analyses
 
-    datasets, records, stream_units, tokens_by_split = _datasets(info, options, log)
+    datasets, records, stream_units, tokens_by_split, reproduction_windows = _datasets(info, options, log)
     report["streams"] = records
 
     intervention_rows: List[Dict[str, Any]] = []
@@ -607,7 +649,8 @@ def run_posthoc(
             log(f"[posthoc] {checkpoint} / {split}: {indices.size} of {len(dataset)} windows")
             entry: Dict[str, Any] = {"checkpoint": checkpoint, "step": step, "split": split,
                                      "n_windows": int(indices.size), "n_windows_total": len(dataset),
-                                     "subset": not full, "precision": loaded.amp_dtype or "fp32"}
+                                     "subset": not full, "precision": loaded.amp_dtype or "fp32",
+                                     "fp32_matmul_precision": torch.get_float32_matmul_precision()}
             try:
                 result = ev.nll_pass(model, dataset, indices, batch_size=batch_size, device=device,
                                      observers=observers)
@@ -643,8 +686,12 @@ def run_posthoc(
                                         "delta_ce": delta, "tolerance": ev.CROSS_CHECK_TOL,
                                         "ok": abs(delta) <= ev.CROSS_CHECK_TOL
                                         and int(protocol.get("scored_targets") or -1) == result.n}
-            entry["reproduction"] = _reproduction(entry, _recorded_reference(info, checkpoint, split),
-                                                  full=full, matched=matched)
+            reference = _recorded_reference(info, checkpoint, split)
+            if split in reproduction_windows:
+                entry["reproduction"] = _subsample_reproduction(
+                    result, indices, reproduction_windows[split], reference, matched=matched)
+            else:
+                entry["reproduction"] = _reproduction(entry, reference, full=full, matched=matched)
             if options.save_nll:
                 path = out / "nll" / f"{_stem(checkpoint)}_{split}.npz"
                 ev.save_nll(path, result, units)
@@ -871,8 +918,11 @@ def _routing(
     log(f"[posthoc] M4 routing decomposition written ({len(paths)} files)")
     status = result.get("status", "ok") if isinstance(result, Mapping) else "ok"
     reason = result.get("reason") if isinstance(result, Mapping) else None
-    return {**base, "status": status, "reason": reason, "result": _plain(result), "outputs": paths,
-            "seconds": time.perf_counter() - started}
+    # The per-row samples live in m4_routing_samples.npz (write_routing_outputs), not in posthoc.json.
+    summary = {k: v for k, v in result.items() if k != "samples"} if isinstance(result, Mapping) else result
+    samples_file = next((p for p in paths if p.endswith("m4_routing_samples.npz")), None)
+    return {**base, "status": status, "reason": reason, "result": _plain(summary), "outputs": paths,
+            "samples_file": samples_file, "seconds": time.perf_counter() - started}
 
 
 def _covariance(
@@ -943,7 +993,7 @@ def _reproduction_summary(report: Mapping[str, Any], info: st.RunInfo) -> Dict[s
         rep = p.get("reproduction") or {}
         if rep.get("status") in ("ok", "mismatch"):
             checks.append({"checkpoint": p["checkpoint"], "split": p["split"], "status": rep["status"],
-                           "ce": p["ce"], "reference": rep["reference"], "delta_ce": rep["delta_ce"],
+                           "ce": rep.get("ce", p["ce"]), "reference": rep["reference"], "delta_ce": rep["delta_ce"],
                            "tolerance": rep["tolerance"], "arithmetic": rep["arithmetic"]})
     final_checks = [c for c in checks if c["checkpoint"].startswith("final")]
     return {

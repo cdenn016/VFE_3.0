@@ -4,7 +4,8 @@ r"""Assemble every manuscript table and figure of a declared experiment manifest
 
 * ``tables/<name>.tex`` (the tabular environment with the manuscript's column layout) and
   ``tables/<name>.md`` (the same cells with sources) for ``main_results``, ``per_seed``,
-  ``relational_run``, ``resources`` and ``methods_contract``;
+  ``decision_rule`` (the registered seed-paired decision rule of the frame claim), ``relational_run``,
+  ``resources`` and ``methods_contract``;
 * ``figures/m3_learning_curves``, ``figures/s1_numerics`` and ``figures/s3_scaling`` (PNG + PDF);
 * ``paper_artifacts.json`` (the resolved manifest, homogeneity reports, the selection record of every
   run, sources, skip reasons, and the notes of every run) and ``PAPER_ARTIFACTS.md`` (an index).
@@ -140,6 +141,7 @@ def assemble(
     builders = {
         "main_results": lambda: pt.main_results_table(manifest, read_checkpoints=read_checkpoints),
         "per_seed": lambda: pt.per_seed_table(manifest),
+        "decision_rule": lambda: pt.decision_rule_table(manifest),
         "relational_run": lambda: pt.relational_run_table(manifest.evaluated),
         "resources": lambda: pt.resources_table(manifest.evaluated, manifest.final,
                                                 read_checkpoints=read_checkpoints),

@@ -112,17 +112,20 @@ def newest_run_dir(root: 'str | Path') -> Path:
 
     ``train_vfe3.py`` reserves ``<root>/<timestamp>_<label>/`` while a run trains and renames it to
     ``<root>/<ppl>_<label>/`` at finalization, and a multi-seed launch can nest runs one level deeper,
-    so every directory below ``root`` holding both ``config.json`` and ``best_model.pt`` is a
-    candidate, ranked by the newest modification time of those two files (ties by path).
+    so every directory below ``root`` holding ``config.json``, ``best_model.pt`` and ``summary.json``
+    is a candidate, ranked by the newest modification time of those three files (ties by path).
+    ``summary.json`` is written only by finalization, so a run still training, or one that crashed
+    after its first validation best, is never selected.
     """
+    names = ("config.json", "best_model.pt", "summary.json")
     candidates = [path.parent for path in Path(root).rglob("best_model.pt")
-                  if path.is_file() and (path.parent / "config.json").is_file()]
+                  if all((path.parent / name).is_file() for name in names)]
     if not candidates:
         raise FileNotFoundError(
-            f"no run with config.json and best_model.pt under {str(root)!r}; set RUN_DIR or train "
-            "a run first")
+            f"no finalized run (config.json, best_model.pt and summary.json) under {str(root)!r}; set "
+            "RUN_DIR or train a run first")
     return max(candidates, key=lambda run: (
-        max((run / name).stat().st_mtime_ns for name in ("config.json", "best_model.pt")),
+        max((run / name).stat().st_mtime_ns for name in names),
         str(run)))
 
 

@@ -17,7 +17,8 @@ row   key                                    modification
 6     ``routing_covariances_identity``       :math:`C_i \to I` for every query and key: projected covariances
                                              :math:`S C_i S^\top \to S S^\top`, projected means unchanged
 7     ``token_frames_identity``              :math:`\exp(X_v) \to I` (``phi_embed`` :math:`\to 0`), in every role
-8     ``positional_frames_identity``         :math:`\exp(Y_i) \to I` (``pos_phi_free`` :math:`\to 0`), in every role
+8     ``positional_frames_identity``         :math:`\exp(Y_i) \to I` (``pos_phi_free`` :math:`\to 0`, and a
+                                             frame-space RoPE fold removed), in every role
 9     ``frames_removed_input_moments``       :math:`\xi_i^{(0)} = U_i^{-1}\mu_{p,x_i} \to \mu_{p,x_i}` only
 10    ``frames_removed_routing_covariance``  :math:`C_i = U_i^{-1}\Sigma_{p,x_i}U_i^{-\top} \to \Sigma_{p,x_i}` only
 11    ``frames_removed_norm_mlp``            :math:`U_i^{-1}\Phi^{(\ell)}(U_i\,\cdot) \to \Phi^{(\ell)}` only
@@ -37,6 +38,7 @@ reporting a number that describes no intervention.
 
 from __future__ import annotations
 
+import math
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
@@ -134,6 +136,28 @@ def _refuse_minimal_agent(model: torch.nn.Module, row: str) -> None:
 # Rows 2 and 3: the routing softmax
 # ----------------------------------------------------------------------------------------------
 
+@torch.no_grad()
+def _log_prior_row_constant(model: torch.nn.Module) -> bool:
+    r"""True when the finite entries of :math:`\log\pi_{ij}` are equal within every row :math:`i`.
+
+    The softmax is invariant to a per-row constant, so row 3's map
+    :math:`\log\pi_{ij} \to 0` on the support then changes no routing weight (causal, causal_noself,
+    windowed and causal_windowed masks). Checked at the model's ``max_seq_len``.
+    """
+    build = getattr(model, "_attention_log_prior", None)
+    if build is None:
+        return False
+    n = max(2, int(getattr(model.cfg, "max_seq_len", 2)))
+    prior = build(n, next(model.parameters()).device)
+    if prior is None:
+        return True
+    finite = torch.isfinite(prior)                                                    # (..., N, N)
+    hi = torch.where(finite, prior, torch.full_like(prior, -math.inf)).amax(-1)       # (..., N)
+    lo = torch.where(finite, prior, torch.full_like(prior, math.inf)).amin(-1)        # (..., N)
+    rows = finite.any(-1)
+    return bool((hi[rows] == lo[rows]).all())
+
+
 @contextmanager
 def _routing_arm(model: torch.nn.Module, arm: str) -> Iterator[Dict[str, Any]]:
     from vfe3 import free_energy
@@ -152,6 +176,10 @@ def _routing_arm(model: torch.nn.Module, arm: str) -> Iterator[Dict[str, Any]]:
     _refuse_minimal_agent(model, "the routing-softmax arm")
     if arm == "no_prior" and getattr(model.cfg, "beta_attention_prior", None) in (None, "uniform"):
         raise NotApplicable("the model has no attention log-prior to flatten")
+    if arm == "no_prior" and _log_prior_row_constant(model):
+        raise NotApplicable(
+            f"beta_attention_prior={model.cfg.beta_attention_prior!r} is constant on the support of every row "
+            "(a pure mask), so flattening it leaves every routing softmax unchanged")
     with patch_bindings(_attention_weight_modules(), "attention_weights", patched):
         yield record
     if record["intercepted_calls"] == 0:
@@ -217,26 +245,38 @@ def positional_frames_identity(model: torch.nn.Module) -> Iterator[Dict[str, Any
     r"""Row 8: positional generators :math:`\to 0`, so :math:`\exp(Y_i) = I` in every role.
 
     A learned table (``pos_phi_free``) is zeroed; a fixed positional chart is replaced by zero
-    coordinates through an instance override of ``_pos_phi_right``.
+    coordinates through an instance override of ``_pos_phi_right``. Under ``rope_space='frame'`` the
+    RoPE rotation is folded into the frames as a positional factor, and an instance override of
+    ``_rope_rotation`` removes it too. A comparison-space RoPE (``rope_space='comparison'``) rotates
+    the projected routing moments, not a frame, and is kept.
     """
+    cfg = model.cfg
     table = getattr(model, "pos_phi_free", None)
-    if table is not None:
-        with swap_parameter_data(table, zeros_view(table)):
-            yield {"table": "pos_phi_free"}
-        return
-    if getattr(model.cfg, "pos_phi", "none") == "none":
-        raise NotApplicable("the model has no positional frames")
-    bound = model._pos_phi_right
+    chart = table is None and getattr(cfg, "pos_phi", "none") != "none"
+    rope_fold = (getattr(cfg, "pos_rotation", "none") != "none"
+                 and getattr(cfg, "rope_space", "frame") != "comparison")
+    if table is None and not chart and not rope_fold:
+        raise NotApplicable("the model has no positional frames (no pos_phi chart and no frame-space RoPE fold)")
+    removed: List[str] = []
+    with ExitStack() as stack:
+        if table is not None:
+            stack.enter_context(swap_parameter_data(table, zeros_view(table)))
+            removed.append("pos_phi_free")
+        elif chart:
+            bound = model._pos_phi_right
 
-    def zero_right(phi: torch.Tensor) -> Optional[torch.Tensor]:
-        coords = bound(phi)
-        return None if coords is None else torch.zeros_like(coords)
+            def zero_right(phi: torch.Tensor) -> Optional[torch.Tensor]:
+                coords = bound(phi)
+                return None if coords is None else torch.zeros_like(coords)
 
-    model._pos_phi_right = zero_right
-    try:
-        yield {"table": f"pos_phi={model.cfg.pos_phi!r} coordinates"}
-    finally:
-        del model._pos_phi_right
+            model._pos_phi_right = zero_right
+            stack.callback(delattr, model, "_pos_phi_right")
+            removed.append(f"pos_phi={cfg.pos_phi!r} coordinates")
+        if rope_fold:
+            model._rope_rotation = lambda n, device: None
+            stack.callback(delattr, model, "_rope_rotation")
+            removed.append(f"pos_rotation={cfg.pos_rotation!r} frame fold")
+        yield {"table": ", ".join(removed)}
 
 
 # ----------------------------------------------------------------------------------------------
@@ -417,10 +457,12 @@ def _require_normal_form(model: torch.nn.Module) -> None:
             "the frame roles are the channels of the reference normal form (Corollary cor:normal_form) of the "
             "projected predictive route; this model has attention_mode="
             f"{getattr(cfg, 'attention_mode', None)!r} without relational predictive content on every layer")
-    if getattr(cfg, "pos_rotation", "none") != "none":
+    # Only a frame-space RoPE is folded into the frames; rope_space='comparison' rotates the projected
+    # routing moments and leaves every frame role as the normal form describes (row 10 refuses it itself).
+    if getattr(cfg, "pos_rotation", "none") != "none" and getattr(cfg, "rope_space", "frame") != "comparison":
         raise NotApplicable(
-            f"pos_rotation={cfg.pos_rotation!r} folds a positional rotation into the routing and content "
-            "frames, a frame channel outside the four-role normal form")
+            f"pos_rotation={cfg.pos_rotation!r} with rope_space='frame' folds a positional rotation into the "
+            "routing and content frames, a frame channel outside the four-role normal form")
     if getattr(cfg, "encode_mode", None) != "per_token":
         raise NotApplicable(
             f"encode_mode={getattr(cfg, 'encode_mode', None)!r}: the input-moment role "
@@ -656,7 +698,8 @@ def frames_removed(model: torch.nn.Module, roles: Sequence[str]) -> Iterator[Dic
     factors across all roles.
 
     **Scope.** Outside the normal form each row raises :class:`NotApplicable` with the reason: no relational
-    predictive content on every layer, RoPE, frame-intrinsic beliefs, a non-``per_token`` encoder, a head
+    predictive content on every layer, frame-space RoPE (``rope_space='frame'``; a comparison-space RoPE
+    leaves the frames alone, and row 10's scorer refuses it), frame-intrinsic beliefs, a non-``per_token`` encoder, a head
     mixer or CG coupling; row 10 also needs covariance passthrough in attention and MLP, row 11 a mean-only
     normalization or MLP acting in local coordinates, row 12 the linear decoder. A model trained with
     ``block_coordinates='reference'`` (row 11) or ``decode_coordinates='reference'`` (row 12) carries no

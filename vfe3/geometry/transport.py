@@ -536,8 +536,9 @@ def _build_flat(
                                        validity_max_norm=validity_max_norm)
 
 
-# Fail-closed chart radius of every transport matrix exponential (VFE3Config.transport_chart_max_norm,
-# default 20.0). A raw Lie-algebra matrix with ||M||_F above it is rejected, never rescaled: the
+# Fail-closed chart radius of every transport matrix exponential of a non-skew group
+# (VFE3Config.transport_chart_max_norm, default 50.0; skew-symmetric groups carry none, see
+# _group_chart_radius). A raw Lie-algebra matrix with ||M||_F above it is rejected, never rescaled: the
 # former Frobenius clamp substituted the surrogate exp(M*scale) for exp(M) and is retired
 # (2026-10-02). Low-level callers that pass no radius use the config default.
 DEFAULT_TRANSPORT_CHART_MAX_NORM: float = VFE3Config.transport_chart_max_norm
@@ -687,8 +688,10 @@ def stable_matrix_exp_pair(
     ``transport_chart_max_norm``) is fail-closed. Any raw :math:`\lVert M\rVert_F > r` or a
     nonfinite norm raises ``ValueError``; the matrix is never rescaled, so the returned factor is
     always :math:`\exp(M)` itself. The retired Frobenius clamp returned the surrogate
-    :math:`\exp(M \cdot 20/\lVert M\rVert_F)` instead (2026-10-02). The bound applies to every
-    group, including the compact skew-symmetric ``so_n`` towers.
+    :math:`\exp(M \cdot 20/\lVert M\rVert_F)` instead (2026-10-02). The bound is whatever radius the
+    caller passes. The transport builders pass :func:`_group_chart_radius`, which is :math:`+\infty`
+    for a skew-symmetric group (``so_n``, ``block_so``): a compact exponential is orthogonal at any
+    norm, so those frames carry no chart bound.
 
     ``block_dims`` (audit 4b): when M is block-diagonal with these blocks (e.g. block_glk's
     GL(d_head)^H), exp(M) is exactly block-diagonal with the per-block exponentials, so each
