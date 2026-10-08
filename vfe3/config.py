@@ -320,7 +320,8 @@ class VFE3Config:
     # rope only: where the rotation acts.
     #   frame       folded into each frame, V_i = U_i R_i^T, before the learned maps (absolute-position routing)
     #   comparison  applied to each head's projected query and key moments after the learned maps, so the
-    #               routing cost depends on positions only through i - j (kernel readout, routing only)
+    #               routing cost depends on positions only through i - j (kernel readout: routing only;
+    #               minimal_agent: the record channel R_{j-i}, routing and content by exact conditioning)
     rope_space:                       str             = "frame"
     
     ##################################################
@@ -370,7 +371,8 @@ class VFE3Config:
     #   minimal_agent  each receiver conditions exactly on a noisy comparison record with the key tied to
     #                  the content (S_K = T); no O, routing is the exact source posterior (temperature 1;
     #                  relational_routing, kappa_beta and kl_max are not read). Needs equal heads,
-    #                  content_link_edges="off" and not (pos_rotation="rope" with rope_on_value=False).
+    #                  content_link_edges="off" and not (frame-space pos_rotation="rope" with rope_on_value=False);
+    #                  comparison-space RoPE is the known record channel R_{j-i} (exact conditioning).
     predictive_readout:               str             = "kernel"
 
     # "exact" | "mean_field"
@@ -1249,10 +1251,9 @@ class VFE3Config:
             problems = []
             if self.attention_mode != "projected_predictive":
                 problems.append(f"attention_mode={self.attention_mode!r} (requires 'projected_predictive')")
-            if self.predictive_readout != "kernel":
-                problems.append(f"predictive_readout={self.predictive_readout!r} (requires 'kernel')")
+            # minimal_agent: the rotation is a known record channel R_{j-i}, applied by exact conditioning.
             if self.rope_on_value:
-                problems.append("rope_on_value=True (the comparison-space rotation acts on routing only)")
+                problems.append("rope_on_value=True (the comparison-space rotation is not a frame rotation)")
             if problems:
                 raise ValueError("rope_space='comparison' rotates the projected routing moments after the learned "
                                  "maps; got " + "; ".join(problems))
@@ -1345,9 +1346,9 @@ class VFE3Config:
             if self.content_link_edges != "off":
                 agent_problems.append(f"content_link_edges={self.content_link_edges!r} (requires 'off': the edge links "
                                       "multiply the content factors O, which the minimal agent derives)")
-            if self.pos_rotation == "rope" and not self.rope_on_value:
-                agent_problems.append("pos_rotation='rope' with rope_on_value=False (the tied key is the content, so "
-                                      "both are read in one frame)")
+            if self.pos_rotation == "rope" and self.rope_space == "frame" and not self.rope_on_value:
+                agent_problems.append("frame-space pos_rotation='rope' with rope_on_value=False (the tied key is "
+                                      "the content, so both are read in one frame; or use rope_space='comparison')")
             if agent_problems:
                 raise ValueError("predictive_readout='minimal_agent' is unsupported here: " + "; ".join(agent_problems))
         # decode_mode / encode_mode validated against the LIVE decode/encode REGISTRIES (not static
