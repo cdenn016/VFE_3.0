@@ -245,8 +245,10 @@ class RelationalOperators(nn.Module):
         minimal_agent_channel_noise: float = 1.0,
         comparison_rope_base: Optional[float] = None,
         comparison_rope_fraction: float = 1.0,
+        kl_max_reference:      str   = "absolute",
     ) -> None:
         super().__init__()
+        self.kl_max_reference = kl_max_reference      # "absolute" | "row_min" kernel-router clamp reference
         # rope_space='comparison': the RoPE frequency base of the rotation applied to each head's projected
         # routing moments after the learned maps (relational_score); None leaves routing un-rotated here.
         self.comparison_rope_base = None if comparison_rope_base is None else float(comparison_rope_base)

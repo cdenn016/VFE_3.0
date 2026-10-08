@@ -1225,8 +1225,8 @@ def evaluate(
                     rows = valid_lengths == length
                     group_tokens = tokens[rows, :length]
                     group_targets = targets[rows, :length]
-                    _, _, decode_stats = model(
-                        group_tokens, group_targets, return_decode_stats=True)
+                    _, _, decode_stats = _eval_forward_with_precision_retry(
+                        model, group_tokens, group_targets, return_decode_stats=True)
                     n_b = decode_stats.scored_tokens
                     total_nats.add_(decode_stats.ce.to(dtype=torch.float64) * n_b)
                     total_tok.add_(n_b)
@@ -1234,7 +1234,8 @@ def evaluate(
                         decode_stats, group_targets.numel()))
                     total_excluded.add_(rows.sum() * (targets.shape[1] - length))
             else:
-                _, _, decode_stats = model(tokens, targets, return_decode_stats=True)
+                _, _, decode_stats = _eval_forward_with_precision_retry(
+                    model, tokens, targets, return_decode_stats=True)
                 n_b = decode_stats.scored_tokens
                 total_nats.add_(decode_stats.ce.to(dtype=torch.float64) * n_b)
                 total_tok.add_(n_b)
@@ -1293,7 +1294,8 @@ def _eval_protocol_train_ce(
     with torch.random.fork_rng(devices=([device] if device.type == "cuda" else [])):
         model.eval()
         try:
-            _, _, decode_stats = model(tokens, masked, return_decode_stats=True)
+            _, _, decode_stats = _eval_forward_with_precision_retry(
+                model, tokens, masked, return_decode_stats=True)
         finally:
             if was_training:
                 model.train()
@@ -2955,6 +2957,40 @@ def _float32_matmul_precision(policy: str) -> Iterator[None]:
         yield
     finally:
         torch.set_float32_matmul_precision(previous)
+
+
+def _eval_forward_with_precision_retry(model: VFEModel, *args: Any, **kwargs: Any) -> Any:
+    r"""Run a no-update evaluation forward ``model(*args, **kwargs)`` on the replay ladder of training.
+
+    Under ``cfg.matmul_precision_retry`` a forward that raises at a reduced ``fp32_matmul_precision``
+    (a fail-closed certificate tripped by TF32 or bf16 GEMM rounding) is run again one rung stricter,
+    ``"medium" -> "high" -> "highest"``, as :func:`_train_step_with_precision_retry` does for the train
+    step (audit 2026-10-08 P0-1). An evaluation forward updates nothing, so a replay needs no gradient
+    or optimizer rollback. A failure that persists at ``"highest"`` is raised with the earlier failures
+    attached as notes; out-of-memory errors are never replayed.
+    """
+    current = torch.get_float32_matmul_precision()
+    if not getattr(getattr(model, "cfg", None), "matmul_precision_retry", False) or current == "highest":
+        return model(*args, **kwargs)
+    failures: List[str] = []
+    for policy in (current, *_MATMUL_PRECISION_LADDER[_MATMUL_PRECISION_LADDER.index(current) + 1:]):
+        try:
+            with _float32_matmul_precision(policy):
+                out = model(*args, **kwargs)
+            if failures:
+                logging.getLogger(__name__).warning(
+                    "evaluation forward raised under fp32_matmul_precision=%r (%s); it completed at %r",
+                    current, failures[0], policy)
+            return out
+        except torch.OutOfMemoryError:
+            raise
+        except Exception as exc:
+            if policy == "highest":
+                for note in failures:
+                    exc.add_note(f"earlier attempt of this forward failed: {note}")
+                raise
+            failures.append(f"{type(exc).__name__}: {exc} [at {policy!r}]")
+    raise AssertionError("unreachable: the ladder ends at 'highest'")
 
 
 def _train_step_with_precision_retry(

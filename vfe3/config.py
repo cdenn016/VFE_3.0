@@ -511,6 +511,10 @@ class VFE3Config:
     # "gelu" | "silu" | "relu"
     # Hidden activation; not read by gaussian_template or prototype_agents.
     block_mlp_activation:             str             = "gelu"
+
+    # Block norm reapplied to the post-MLP mean, so the next router reads a normalized mean (audit
+    # 2026-10-08 P1-5). False keeps norm -> MLP. only: block_coordinates="local", a block norm, a block MLP
+    block_mlp_post_norm:              bool            = False
        
     # "mean_field" | "exact"
     # prototype_agents only: template posterior.
@@ -617,6 +621,10 @@ class VFE3Config:
 
     eps:                              float           = 1e-6
     kl_max:                           float           = 100.0        # safety clamp on every divergence (launchers scale it with K)
+    # "absolute" | "row_min": what kl_max clamps in the projected kernel router (audit 2026-10-08 P1-4)
+    #   absolute  D_ij; a row whose every admissible cost exceeds kl_max routes uniformly with zero gradient
+    #   row_min   D_ij - min_{j admissible} D_ij; beta is the exact softmax wherever no gap exceeds kl_max
+    routing_kl_max_reference:         str             = "absolute"
     sigma_max:                        Optional[float] = 100.0        # variance ceiling; None = none
     transport_chart_max_norm:         float           = 50.0         # fail-closed ||M||_F radius of every transport exponential
 
@@ -1434,6 +1442,13 @@ class VFE3Config:
         _valid_norms = tuple(sorted(_NORMS))
         _require(self.norm_type_block, _valid_norms, "norm_type_block")
         _require(self.norm_type_final, _valid_norms, "norm_type_final")
+        _require(self.routing_kl_max_reference, ("absolute", "row_min"), "routing_kl_max_reference")
+        if not isinstance(self.block_mlp_post_norm, bool):
+            raise ValueError(f"block_mlp_post_norm must be a bool, got {self.block_mlp_post_norm!r}")
+        if self.block_mlp_post_norm and (self.block_coordinates != "local" or self.norm_type_block == "none"
+                                         or not self.use_block_mlp):
+            raise ValueError("block_mlp_post_norm=True needs block_coordinates='local', a block norm "
+                             "(norm_type_block != 'none') and use_block_mlp=True")
 
         if self.block_mlp_expansion < 1:
             raise ValueError(
@@ -1865,6 +1880,8 @@ class VFE3Config:
             mark(("lambda_alpha",), "only read by lambda_alpha_mode='constant'")
         if self.pos_rotation == "none":
             mark(("rope_on_value", "rope_base", "rope_space", "rope_fraction"), "only read by pos_rotation='rope'")
+        if self.attention_mode != "projected_predictive" or self.predictive_readout != "kernel":
+            mark(("routing_kl_max_reference",), "only read by the projected predictive kernel router")
         if self.pos_phi == "none":
             mark(("pos_phi_project_slk",), "only read by a non-'none' pos_phi")
         if (self.beta_attention_prior in ("windowed", "causal_windowed")

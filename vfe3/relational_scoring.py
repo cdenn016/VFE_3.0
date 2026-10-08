@@ -329,7 +329,7 @@ def _cholesky_status(G: torch.Tensor) -> Tuple[torch.Tensor, ...]:
 def _projected_root_factor_tile(
     Sigma:    torch.Tensor,   # (..., n, H, d) diagonal or (..., n, H, d, d) full
     inverse:  torch.Tensor,   # (..., n, H, d_b, d_b) compact or full-width inverse frame blocks
-    S:        torch.Tensor,   # (H, r, d)
+    S:        torch.Tensor,   # (H, r, d), or (n, H, r, d) per token
     dtype:    torch.dtype,
     diagonal: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -380,7 +380,9 @@ def _projected_root_factor(
                  else Sigma[..., start:start+step, :, :, :])
         tile_inverse = (inverse[..., start:start+step, :, :, :]
                         if inverse.ndim >= 4 and inverse.shape[-4] == tokens else inverse)
-        args = (sigma, tile_inverse, S)
+        # A per-token comparison map (N, H, r, d) (comparison-space RoPE, R_i S) is tiled with the tokens.
+        tile_S = S[start:start+step] if S.ndim == 4 else S
+        args = (sigma, tile_inverse, tile_S)
         if torch.is_grad_enabled() and any(x.requires_grad for x in args):
             C, failed = checkpoint(_projected_root_factor_tile, *args, dtype, diagonal,
                                    use_reentrant=False, preserve_rng_state=False)
