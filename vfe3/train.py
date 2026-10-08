@@ -2967,6 +2967,7 @@ def _train_step_with_precision_retry(
     *,
     logger:    logging.Logger,
     step:      int,
+    quiet:     bool = False,             # log the replay at DEBUG (the caller already reported one)
     **step_kwargs: Any,
 ) -> Tuple[float, int]:                  # (loss, number of escalated replays the step needed)
     r"""Run :func:`train_step`; under ``cfg.matmul_precision_retry`` replay a failed step at a stricter policy.
@@ -3003,8 +3004,11 @@ def _train_step_with_precision_retry(
             torch.set_rng_state(cpu_rng)
             if cuda_rng is not None:
                 torch.cuda.set_rng_state_all(cuda_rng)
-            logger.warning("step %d raised under fp32_matmul_precision=%r (%s); replaying it at %r",
-                           step, (current, *rungs)[replays - 1], failures[-1], policy)
+            logger.log(logging.DEBUG if quiet else logging.WARNING,
+                       "step %d raised under fp32_matmul_precision=%r (%s); replaying it at %r%s",
+                       step, (current, *rungs)[replays - 1], failures[-1], policy,
+                       "" if quiet else ("; further replays are logged at DEBUG, counted in metrics.csv "
+                                         "matmul_precision_replays and summarized at each log step"))
         updated: List[bool] = []
         handle = optimizer.register_step_pre_hook(lambda *_args: updated.append(True))
         try:
@@ -3247,6 +3251,7 @@ def train(
     motion_dead_captured = False
     skipped_steps = 0                 # cumulative REJECTED optimizer updates (audit 2026-08-06 F5)
     precision_replays = 0             # steps replayed at "highest" under cfg.matmul_precision_retry
+    precision_replays_logged = 0      # precision_replays at the last log-step summary
     consecutive_skips = 0
     reset_nonfinite_tangent_elements()   # per-run accounting for the SPD-retraction guard
     reset_public_spd_repair_elements()   # ... and its certificate repairs
@@ -3494,7 +3499,7 @@ def train(
             timer.start_step()
         step_loss, replays = _train_step_with_precision_retry(
             model, optimizer, scheduler, tokens, targets, logger=logger, step=step,
-            grad_clip=grad_clip, grad_accum_steps=cfg.grad_accum_steps,
+            quiet=precision_replays > 0, grad_clip=grad_clip, grad_accum_steps=cfg.grad_accum_steps,
             scaler=scaler, metrics_out=step_metrics, status_out=step_status,
             **({"frame_projection_out": frame_projection_counter}
                if frame_projection_counter is not None else {}))
@@ -3858,6 +3863,11 @@ def train(
                         row[_gk] = step_metrics[_gk]
             if getattr(cfg, "matmul_precision_retry", False):
                 row["matmul_precision_replays"] = float(precision_replays)
+                if precision_replays > precision_replays_logged:
+                    logger.info("matmul precision: %d step(s) replayed at a stricter policy since the last log "
+                                "step (%d in total)", precision_replays - precision_replays_logged,
+                                precision_replays)
+                    precision_replays_logged = precision_replays
             if getattr(cfg, "phi_mstep_max_matrix_norm", None) is not None:
                 for _pk in (
                     "phi_chart_projected_rows",
