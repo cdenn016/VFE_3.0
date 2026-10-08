@@ -574,7 +574,11 @@ def test_provider_counts_scored_tokens_and_positional_columns() -> None:
                                     eps=pb.eps).view(2, 2, 3)
     xi0, C0, C0_inv = middle_fiber_moments(X, mu, var)
     expected = pooled_pos_operator(xi0[None], C0[None], C0_inv[None], rotation_weight=2.0)[0]
-    torch.testing.assert_close(pos_statistics.pooled_operator[0], expected)
+    assert pos_statistics.pooled_operator is None                        # formed per row chunk by the consumer
+    from vfe3.geometry.phi_fisher import pooled_operator_chunks
+    start, stop, operator = next(pooled_operator_chunks(pos_statistics, rotation_weight=2.0))
+    assert (start, stop) == (0, 2)
+    torch.testing.assert_close(operator[0], expected)
     with pytest.raises(ValueError, match="phi_embed and pos_phi_free"):
         provider(nn.Parameter(torch.zeros(2, 18)), torch.tensor([0]))
 

@@ -59,11 +59,16 @@ import numpy as np
 from vfe3.artifact_utils import canonical_json_sha256 as _canonical_json_sha256
 from vfe3.config import config_from_serialized, serialize_config
 from vfe3.metric_contracts import (  # noqa: E402
-    SCALING_MIN_TESTABLE_SIZES,
+    scaling_min_testable_sizes,
     perplexity_matches_ce,
     target_blind_objective_interpretation,
 )
 from vfe3.path_utils import portable_path_component_key
+
+
+def _min_testable_sizes() -> int:
+    r"""Distinct sizes the configured fit form needs for R^2, the CI and lack of fit (5 offset law, 4 plain)."""
+    return scaling_min_testable_sizes(bool(CONFIG["with_offset"]))
 from vfe3.viz.sweep_adapters import aggregate_validation_points, capacity_scaling_kwargs, pareto_frontier_kwargs
 from vfe3.run_artifacts import _write_json_atomic
 
@@ -896,7 +901,7 @@ def _pooled_status(
 ) -> Tuple[str, List[str]]:
     r"""Classify the pooled L(N) fit: provenance confounds first, then testability, then form.
 
-    ``not_testable`` below ``SCALING_MIN_TESTABLE_SIZES`` distinct sizes (R^2 and the CI are
+    ``not_testable`` below :func:`_min_testable_sizes` distinct sizes (R^2 and the CI are
     withheld there); ``lack_of_fit`` when the pure-error F-test rejects the fitted law; ``clean``
     only when the design is testable, the lack-of-fit test ran and did not reject, and the frontier
     question is settled or moot."""
@@ -919,7 +924,7 @@ def _pooled_status(
         reasons.append("routes_diverge")
     if reasons:
         return "confounded", reasons
-    if n_distinct_sizes < SCALING_MIN_TESTABLE_SIZES:
+    if n_distinct_sizes < _min_testable_sizes():
         return "not_testable", []
     if lack_of_fit is not None and lack_of_fit.get("rejected") is True:
         return "lack_of_fit", []
@@ -1550,9 +1555,9 @@ def analyze() -> None:
     summary["n_harvested_param_sizes"] = n_harvested_param_sizes
     summary["n_fit_param_sizes"] = n_fit_param_sizes
     summary["n_distinct_param_sizes"] = n_fit_param_sizes
-    # Below SCALING_MIN_TESTABLE_SIZES the law is still fit (alpha is a descriptive slope), but R^2
+    # Below _min_testable_sizes() the law is still fit (alpha is a descriptive slope), but R^2
     # and the CI are withheld and the status reads 'not_testable' (two sizes give R^2 = 1 exactly).
-    fit_testable = n_fit_param_sizes >= SCALING_MIN_TESTABLE_SIZES
+    fit_testable = n_fit_param_sizes >= _min_testable_sizes()
     lack_of_fit: Optional[Dict[str, Any]] = None
     if n_fit_param_sizes >= 2:
         from vfe3.viz.figures import _fit_power_law
@@ -1583,7 +1588,7 @@ def analyze() -> None:
             else:
                 print(f"\nPOOLED L(N) fit ({fit['form']}):  alpha = {fit['alpha']:.4f}   "
                       f"A = {fit['A']:.4g}   over {fit['n_distinct_sizes']} distinct sizes -- "
-                      f"NOT TESTABLE (< {SCALING_MIN_TESTABLE_SIZES} sizes): R^2 and CI withheld")
+                      f"NOT TESTABLE (< {_min_testable_sizes()} sizes): R^2 and CI withheld")
             summary["pooled_fit"] = {
                 "form": fit["form"], "alpha": fit["alpha"],
                 "alpha_ci": [lo, hi] if fit_testable else None,
@@ -1604,11 +1609,11 @@ def analyze() -> None:
                 and np.unique(non_embedding).size >= 2):
             ne_fit = _fit_power_law(non_embedding, ys, weights=pooled_weights,
                                     with_offset=CONFIG["with_offset"])
-            ne_testable = int(ne_fit["n_distinct_sizes"]) >= SCALING_MIN_TESTABLE_SIZES
+            ne_testable = int(ne_fit["n_distinct_sizes"]) >= _min_testable_sizes()
             if np.isfinite(_as_float(ne_fit.get("alpha"))):
                 print(f"NON-EMBEDDING L(N) fit ({ne_fit['form']}):  alpha = {ne_fit['alpha']:.4f}   "
                       + (f"R^2 = {ne_fit['r2']:.4f}   " if ne_testable
-                         else f"R^2 withheld (< {SCALING_MIN_TESTABLE_SIZES} sizes)   ")
+                         else f"R^2 withheld (< {_min_testable_sizes()} sizes)   ")
                       + f"over {ne_fit['n_distinct_sizes']} distinct sizes")
                 summary["pooled_fit_non_embedding"] = {
                     "x_axis": "n_non_embedding_params", "form": ne_fit["form"],
@@ -1633,9 +1638,9 @@ def analyze() -> None:
                         print(f"  {r:<14} (estimator returned no finite exponent; no estimate persisted)")
                         continue
                     display = f"{r} [structural ablation]" if r in route_notes else r
-                    route_testable = int(fr["n_distinct_sizes"]) >= SCALING_MIN_TESTABLE_SIZES
+                    route_testable = int(fr["n_distinct_sizes"]) >= _min_testable_sizes()
                     r2_text = (f"R^2={fr['r2']:.4f}" if route_testable
-                               else f"R^2 not testable (< {SCALING_MIN_TESTABLE_SIZES} sizes)")
+                               else f"R^2 not testable (< {_min_testable_sizes()} sizes)")
                     print(f"  {display:<36} alpha={fr['alpha']:.4f}  {r2_text}  "
                           f"({fr['n_distinct_sizes']} distinct sizes; {fr['form']})")
                     summary["per_route"][r] = {
@@ -1792,9 +1797,9 @@ def _write_scaling_md(path: Path, summary: Dict[str, Any]) -> None:
         alpha_ci = pf.get("alpha_ci")
         ci_text = (f"95% CI [{alpha_ci[0]:.4f}, {alpha_ci[1]:.4f}]"
                    if alpha_ci is not None and None not in alpha_ci
-                   else f"CI withheld: not testable below {SCALING_MIN_TESTABLE_SIZES} distinct sizes")
+                   else f"CI withheld: not testable below {_min_testable_sizes()} distinct sizes")
         r2_text = (f"R^2 = {pf['r2']:.4f}" if pf.get("r2") is not None
-                   else f"R^2 withheld (not testable below {SCALING_MIN_TESTABLE_SIZES} distinct sizes)")
+                   else f"R^2 withheld (not testable below {_min_testable_sizes()} distinct sizes)")
         L += ["## Pooled L(N) power law", "",
               status_line,
               f"- realized fit form: `{pf.get('form', 'unknown')}`",

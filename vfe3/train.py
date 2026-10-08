@@ -47,7 +47,7 @@ from vfe3.gauge_optim import (
     group_log_block_shape,
     project_phi_parameter_rows_,
 )
-from vfe3.geometry.phi_fisher import FisherRowStatistics, middle_fiber_moments, pooled_pos_operator
+from vfe3.geometry.phi_fisher import FisherRowStatistics, middle_fiber_moments
 from vfe3.metric_contracts import perplexity_from_ce
 from vfe3.metrics import LINK_SPECTRUM_KEYS, routing_triangle_defect_sums
 from vfe3.model.block import _as_coeff
@@ -131,9 +131,10 @@ class PhiFisherStatisticsProvider:
 
     For ``phi_embed`` rows :math:`v` it returns the table row :math:`(\mu_v, s_v)` and
     :math:`n_v`, the occurrences of :math:`v` among the input tokens. For ``pos_phi_free`` rows
-    :math:`p` it returns the pooled operator of the batch column ``tokens[:, p]`` over the
-    middle-fiber beliefs :math:`E_{v_b}^{-1}\cdot q_{v_b}`, and :math:`B_{\rm tot}`. Everything is
-    float64, detached, on the table's device.
+    :math:`p` it returns the middle-fiber moments :math:`E_{v}^{-1}\cdot q_{v}` of the distinct column
+    types and the gather index of each batch column ``tokens[:, p]``, from which the consumer forms the
+    pooled operators a row chunk at a time (:func:`~vfe3.geometry.phi_fisher.pooled_operator_chunks`),
+    and :math:`B_{\rm tot}`. Everything is float64, detached, on the table's device.
     """
 
     def __init__(self, model: VFEModel, rotation_weight: float) -> None:
@@ -188,13 +189,10 @@ class PhiFisherStatisticsProvider:
             X = pb.phi_embed[types].detach().to(dtype=torch.float64).view(-1, H, d, d)
             xi0, C0, C0_inv = middle_fiber_moments(X, *self._type_moments(types))   # (T, H, ...)
             gather = inverse.transpose(0, 1)                                  # (R, B_tot)
-            operator = pooled_pos_operator(
-                xi0[gather], C0[gather], C0_inv[gather],
-                rotation_weight=self._rotation_weight)                        # (R, H, d*d, d*d)
             count = torch.full((rows.shape[0],), float(tokens.shape[0]),
                                dtype=torch.float64, device=rows.device)
             return FisherRowStatistics(kind="pos", count=count, total=total,
-                                       pooled_operator=operator)
+                                       pooled_moments=(xi0, C0, C0_inv, gather))
         raise ValueError("fisher_group statistics exist only for phi_embed and pos_phi_free")
 
 

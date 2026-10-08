@@ -8,6 +8,14 @@ from numbers import Real
 # many distinct sizes. Two sizes give R^2 = 1 exactly, and three leave at most one residual degree of
 # freedom for the two-parameter law (none for the offset law), so any monotone curve passes.
 SCALING_MIN_TESTABLE_SIZES = 4
+# The offset law E + A N^-alpha has three parameters, so it needs one more size than the plain law to
+# keep two residual degrees of freedom (audit 2026-10-08 gap-stats: four sizes leave it one).
+SCALING_MIN_TESTABLE_SIZES_OFFSET = 5
+
+
+def scaling_min_testable_sizes(with_offset: bool) -> int:
+    r"""Distinct sizes a scaling fit needs to be reported as testable: 5 for the offset law, 4 otherwise."""
+    return SCALING_MIN_TESTABLE_SIZES_OFFSET if with_offset else SCALING_MIN_TESTABLE_SIZES
 
 
 def perplexity_from_ce(ce: float) -> float:

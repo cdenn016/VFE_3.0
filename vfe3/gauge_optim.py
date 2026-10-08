@@ -30,6 +30,7 @@ from vfe3.geometry.phi_fisher import (
     FisherRowStatistics,
     fisher_type_solve,
     jacobi_cholesky_solve,
+    pooled_operator_chunks,
     stabilizer_leak,
     type_metric_residual,
     type_row_spectrum,
@@ -756,15 +757,22 @@ def belief_fisher_group_direction(
         a, lam_min, cond = type_row_spectrum(mu, s, rotation_weight=rotation_weight)   # (A, H)
         residual = type_metric_residual(W, G_W, mu, s, scale, rotation_weight=rotation_weight)
     elif statistics.kind == "pos":
-        operator = statistics.pooled_operator                            # (A, H, d*d, d*d)
-        solution, solved, solve_residual = jacobi_cholesky_solve(
-            operator, G_W.reshape(rows, n_blocks, block_dim * block_dim))
-        W = scale[:, None, None, None] * solution.view(rows, n_blocks, block_dim, block_dim)
-        accepted = accepted & solved.all(dim=-1)
+        # The (A, H, d*d, d*d) operators are formed and solved a row chunk at a time under a byte
+        # budget (audit 2026-10-08 P2-22); every row's solve is independent, so this is exact.
+        g = G_W.reshape(rows, n_blocks, block_dim * block_dim)
+        solution = torch.zeros_like(g)
+        solved = torch.zeros(rows, n_blocks, dtype=torch.bool, device=g.device)
+        solve_residual = torch.zeros(rows, n_blocks, dtype=g.dtype, device=g.device)
         # The spectrum is diagnostic only: one eigvalsh per block on collect steps, zeros otherwise
         # (the chart stager reads these fields only for finiteness).
-        lam_min, cond = (whitened_condition(operator) if collect
-                         else (G_W.new_zeros(rows, n_blocks),) * 2)      # (A, H)
+        lam_min, cond = G_W.new_zeros(rows, n_blocks), G_W.new_zeros(rows, n_blocks)   # (A, H)
+        for start, stop, operator in pooled_operator_chunks(statistics, rotation_weight=rotation_weight):
+            solution[start:stop], solved[start:stop], solve_residual[start:stop] = jacobi_cholesky_solve(
+                operator, g[start:stop])
+            if collect:
+                lam_min[start:stop], cond[start:stop] = whitened_condition(operator)
+        W = scale[:, None, None, None] * solution.view(rows, n_blocks, block_dim, block_dim)
+        accepted = accepted & solved.all(dim=-1)
         residual = solve_residual.amax(dim=-1)
     else:
         raise ValueError(f"unknown Fisher statistics kind {statistics.kind!r}")
