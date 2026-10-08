@@ -321,7 +321,8 @@ class VFEModel(nn.Module):
                                 minimal_agent_channel_noise=cfg.minimal_agent_channel_noise,
                                 comparison_rope_base=(cfg.rope_base if cfg.pos_rotation == "rope"
                                                       and cfg.rope_space == "comparison" else None),
-                                comparison_rope_fraction=cfg.rope_fraction)
+                                comparison_rope_fraction=cfg.rope_fraction,
+                                kl_max_reference=cfg.routing_kl_max_reference)
             for layer_index in range(cfg.n_layers)
         ]
         self.relational_operators = layers[0]

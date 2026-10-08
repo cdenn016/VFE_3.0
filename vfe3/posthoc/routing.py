@@ -171,6 +171,9 @@ def not_applicable_reason(model: torch.nn.Module) -> Optional[str]:
         return f"readout_mode={readouts}: routing is not the predictive-content readout"
     if int(getattr(cfg, "n_e_steps", 1)) < 1:
         return "n_e_steps=0: no E-step iteration, so the router is never evaluated"
+    if any(getattr(op, "comparison_rope_base", None) is not None for op in operators):
+        return ("rope_space='comparison': the router scores the R_i-rotated projected moments, which this "
+                "decomposition does not rebuild (it would decompose the unrotated cost)")
     if any(getattr(op, "mixed_heads", False) for op in operators):
         return "heads of different sizes (a mixed so_n irrep tower) are not supported by this analysis yet"
     return None

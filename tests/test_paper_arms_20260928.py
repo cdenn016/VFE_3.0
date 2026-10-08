@@ -177,6 +177,9 @@ def test_vfe_arms_differ_from_the_base_only_in_declared_fields(tmp_path: Path, c
         if spec.get("inapplicable") is pa._alibi_already and base.cfg.beta_attention_prior == "causal_alibi":
             assert plan.status == "inapplicable", label        # the tiny base already uses ALiBi
             continue
+        if spec["vfe"] and all(not callable(v) and getattr(base.cfg, k) == v for k, v in spec["vfe"].items()):
+            assert plan.status == "inapplicable", label        # the tiny base already is this row (affine chart)
+            continue
         assert plan.status == "ready", (label, plan.reason)
         declared = set(spec["vfe"]) | set(spec.get("coerced", ()))
         assert set(plan.diff) <= declared, label

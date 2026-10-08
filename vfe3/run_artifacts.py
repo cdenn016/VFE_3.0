@@ -1934,18 +1934,25 @@ class RunArtifacts:
                 f"metrics row field set changed (missing={missing}, extra={extra})"
             )
         candidate_history = [*self.history, dict(row)]
-        with _unique_sibling_temp(self.csv_path) as tmp:
-            with tmp.open("w", newline="", encoding="utf-8") as handle:
-                writer = csv.DictWriter(handle, fieldnames=fieldnames)
-                writer.writeheader()
-                for history_row in candidate_history:
-                    writer.writerow({
-                        key: ("" if isinstance(value, float) and math.isnan(value) else value)
-                        for key, value in history_row.items()
-                    })
-            _atomic_replace(self.csv_path, tmp)
+        try:
+            with _unique_sibling_temp(self.csv_path) as tmp:
+                with tmp.open("w", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                    writer.writeheader()
+                    for history_row in candidate_history:
+                        writer.writerow({
+                            key: ("" if isinstance(value, float) and math.isnan(value) else value)
+                            for key, value in history_row.items()
+                        })
+                _atomic_replace(self.csv_path, tmp)
+        except PermissionError as exc:
+            # A reader holding metrics.csv open on Windows blocks the replace past its retries (audit
+            # 2026-10-08 P1-6). Every publish rewrites the whole history, so the row is kept in memory
+            # and reaches the file at the next publish that is not blocked; the run continues.
+            logging.getLogger(__name__).warning(
+                "metrics.csv publish blocked (%s); the row is kept and published with the next one", exc)
         self._fieldnames = fieldnames
-        self.history.append(dict(row))                          # update only after durable publication
+        self.history.append(dict(row))
 
     def maybe_save_best(self, step: int, model: torch.nn.Module, val_ppl: float) -> bool:
         r"""Record a new minimum and, when enabled, save its config-bound weights.
@@ -1953,9 +1960,9 @@ class RunArtifacts:
         Atomic (same-dir tmp + ``os.replace``): a crash or Windows lock mid-save can never leave a
         corrupt/unreadable ``best_model.pt`` where a good one stood."""
         if val_ppl < self.best_val_ppl:
-            self.best_val_ppl = float(val_ppl)
-            self.best_step = int(step)
             if not self.save_model_artifacts:
+                self.best_val_ppl = float(val_ppl)
+                self.best_step = int(step)
                 return True
             config = _serialize_run_config(self.cfg)
             bundle = {
@@ -1965,9 +1972,19 @@ class RunArtifacts:
                 "code_identity_sha256": self.code_identity_sha256,
                 "selection_data_identity": self.selection_data_identity,
             }
-            with _unique_sibling_temp(self.best_path) as tmp:
-                torch.save(bundle, tmp)
-                _atomic_replace(self.best_path, tmp)
+            try:
+                with _unique_sibling_temp(self.best_path) as tmp:
+                    torch.save(bundle, tmp)
+                    _atomic_replace(self.best_path, tmp)
+            except PermissionError as exc:
+                # A reader holding best_model.pt open on Windows (audit 2026-10-08 P1-6): the record is
+                # not advanced, so best_model.pt and best_val_ppl stay consistent and the next eval
+                # that beats the published best retries the save.
+                logging.getLogger(__name__).warning(
+                    "best_model.pt publish at step %d blocked (%s); the previous best is kept", step, exc)
+                return False
+            self.best_val_ppl = float(val_ppl)
+            self.best_step = int(step)
             return True
         return False
 

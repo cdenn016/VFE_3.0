@@ -183,6 +183,15 @@ def _no_residual(base: Any) -> Optional[str]:
     return None if base.attention_residual else "the base has no attention residual"
 
 
+def _already(field: str, value: Any) -> Callable[[Any], Optional[str]]:
+    r"""Inapplicable when the base already has ``field == value`` (the arm would repeat the evaluated run)."""
+    def reason(base: Any) -> Optional[str]:
+        if getattr(base, field, None) == value:
+            return f"the base already has {field}={value!r}"
+        return None
+    return reason
+
+
 def _no_mlp(base: Any) -> Optional[str]:
     return None if base.use_block_mlp else "the base has no block MLP"
 
@@ -278,6 +287,20 @@ ARMS: Dict[str, Dict[str, Any]] = {
     "Attention residual removed": {
         "group": _RETRAINING, "slug": "no_residual", "vfe": {"attention_residual": False},
         "inapplicable": _no_residual},
+    # Manuscript M2 rows (audit 2026-10-08 P1-8). "Exponential chart with the channel receiver" has no
+    # single-change arm yet.
+    "Affine content chart": {
+        "group": _RETRAINING, "slug": "affine_chart", "vfe": {"content_link_chart": "affine"},
+        "inapplicable": _already("content_link_chart", "affine")},
+    "First-order content chart": {
+        "group": _RETRAINING, "slug": "first_order_chart", "vfe": {"content_link_chart": "first_order"},
+        "inapplicable": _already("content_link_chart", "first_order")},
+    "Covariance passthrough instead of moment matching": {
+        "group": _RETRAINING, "slug": "covariance_passthrough", "vfe": {"predictive_covariance": "passthrough"},
+        "inapplicable": _already("predictive_covariance", "passthrough")},
+    "Frames frozen at their random initialization": {
+        "group": _RETRAINING, "slug": "frozen_frames", "vfe": {"gauge_transport": "frozen"},
+        "coerced": ("m_phi_lr",), "inapplicable": _already("gauge_transport", "frozen")},
     "LayerNorm and MLP in reference coordinates": {
         "group": _RETRAINING, "slug": "reference_block", "vfe": {"block_coordinates": "reference"},
         "requires": ("block_coordinates",), "inapplicable": _no_ln_or_mlp},

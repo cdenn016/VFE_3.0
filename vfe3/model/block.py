@@ -151,6 +151,10 @@ def vfe_block(
             out = out._replace(mu=block_mlp(out.mu))
     if capture is not None:
         capture["block_mlp_output"] = out
+    if block_mlp is not None and block_norm is not None and getattr(cfg, "block_mlp_post_norm", False):
+        # Opt-in post-MLP norm (audit 2026-10-08 P1-5): the next router reads a normalized mean instead
+        # of the MLP residual's token-common offset.
+        out = out._replace(mu=block_norm(out.mu, out.sigma))
     return out
 
 

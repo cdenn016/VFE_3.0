@@ -11,6 +11,7 @@ from vfe3.relational_scoring import (
     _compute_dtype, projected_moments, projected_gaussian_kl, projected_mean_distance_cost,
     projected_noisy_query_cost,
 )
+from vfe3.runtime import ieee_fp32_matmul
 
 
 def relational_score(
@@ -99,9 +100,10 @@ def relational_score(
             # r-dimensional comparison space, a -> R_i a, G -> R_i G R_i^T, for query and key alike. A Gaussian KL
             # (and the noisy-query and mean-distance costs) is invariant under a common orthogonal map, so the
             # pair (i, j) cost equals the cost of (a_i, G_i) against (R_{j-i} b_j, R_{j-i} G_j R_{j-i}^T): a function
-            # of positions only through j - i. The source-root recovery assumes G = L Sigma L^T with the
-            # unrotated L, so it is disabled here; a failed or ill-conditioned factor then takes the whole-tensor
-            # float64 refactor of the rotated G.
+            # of positions only through j - i. The rotated moments are those of the per-token comparison map
+            # R_i S, so the source tuples carry R_i S and the source-root recovery and factor route factor
+            # X_i = R_i S U_i^{-1} Sigma_i^{1/2} exactly as on the unrotated route (audit 2026-10-08 P1-2).
+            # The rotation runs under the same IEEE-fp32 pin as the moments it rotates (P1-1).
             r = S_q.shape[-2]
             fraction = getattr(operators, "comparison_rope_fraction", 1.0)
             from vfe3.geometry.rope import build_rope_rotation
@@ -110,12 +112,16 @@ def relational_score(
             R_k = R_q if a_k.shape[-3] == a_q.shape[-3] else build_rope_rotation(
                 torch.arange(a_k.shape[-3], device=a_k.device), [r], base=rope_base, fraction=fraction,
                 device=a_k.device, dtype=a_k.dtype)
-            a_q = torch.einsum("nst,...nht->...nhs", R_q, a_q)
-            a_k = torch.einsum("nst,...nht->...nhs", R_k, a_k)
-            G_q = torch.einsum("nst,...nhtu,nvu->...nhsv", R_q, G_q, R_q)
-            G_k = torch.einsum("nst,...nhtu,nvu->...nhsv", R_k, G_k, R_k)
+            with ieee_fp32_matmul():
+                a_q = torch.einsum("nst,...nht->...nhs", R_q, a_q)
+                a_k = torch.einsum("nst,...nht->...nhs", R_k, a_k)
+                G_q = torch.einsum("nst,...nhtu,nvu->...nhsv", R_q, G_q, R_q)
+                G_k = torch.einsum("nst,...nhtu,nvu->...nhsv", R_k, G_k, R_k)
+                S_q_rot = torch.einsum("nst,htk->nhsk", R_q.to(S_q.dtype), S_q)   # (N, H, r, K)
+                S_k_rot = torch.einsum("nst,htk->nhsk", R_k.to(S_k.dtype), S_k)
             G_q, G_k = 0.5 * (G_q + G_q.transpose(-1, -2)), 0.5 * (G_k + G_k.transpose(-1, -2))
-            projection_q = projection_k = None
+            projection_q = (sigma_h, inverse, S_q_rot, mu_h)
+            projection_k = (source_sigma_h, key_inverse, S_k_rot, source_mu_h)
         scores.append(score(
             a_q, G_q, a_k, G_k,
             projection_q=projection_q,
@@ -180,8 +186,19 @@ def relational_predictive_readout(
     with torch.autocast(device_type=mu.device.type, enabled=False):
         mu_work = mu.to(dtype)
         sigma_work = sigma.to(dtype)
-        score = safe_kl_clamp(relational_score(
-            mu_work, sigma_work, mu_work, sigma_work, frame, operators, capture), kl_max=kl_max)
+        score = relational_score(mu_work, sigma_work, mu_work, sigma_work, frame, operators, capture)
+        if getattr(operators, "kl_max_reference", "absolute") == "row_min":
+            # Clamp the gap to the row's smallest admissible finite cost (audit 2026-10-08 P1-4). The
+            # softmax is row-shift invariant, so beta is unchanged wherever a row keeps an entry below
+            # the cap, and a row whose every cost exceeds kl_max still routes by its cost order.
+            with torch.no_grad():
+                admissible = torch.isfinite(score)
+                if log_prior is not None:
+                    admissible = admissible & torch.isfinite(log_prior.to(dtype))
+                row_min = score.masked_fill(~admissible, float("inf")).amin(dim=-1, keepdim=True)
+                row_min = torch.where(torch.isfinite(row_min), row_min, torch.zeros_like(row_min))
+            score = score - row_min                                             # (..., H, N, N)
+        score = safe_kl_clamp(score, kl_max=kl_max)
         beta = attention_weights(score, tau=tau,
                                  log_prior=None if log_prior is None else log_prior.to(dtype))
         if getattr(operators, "content_link_edges", "off") != "off":
