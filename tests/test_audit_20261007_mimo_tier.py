@@ -233,6 +233,34 @@ def test_failure_at_highest_and_failure_after_an_update_are_raised(monkeypatch) 
     assert len(seen) == 1                                                # never replayed after an update
 
 
+def test_only_the_first_replay_warns(monkeypatch, caplog) -> None:
+    import logging
+
+    from vfe3 import train as train_module
+
+    def flaky(policy, optimizer):
+        if policy != "highest":
+            raise ValueError("projected covariance is not positive definite")
+        return 1.0
+
+    _ladder_fixture(monkeypatch, flaky)
+    optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1)
+    model = types.SimpleNamespace(cfg=types.SimpleNamespace(matmul_precision_retry=True))
+    previous = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("high")
+    try:
+        with caplog.at_level(logging.DEBUG, logger="t"):
+            for quiet in (False, True, True):
+                assert train_module._train_step_with_precision_retry(
+                    model, optimizer, None, None, None, logger=logging.getLogger("t"), step=3, quiet=quiet,
+                    scaler=None) == (1.0, 1)
+    finally:
+        torch.set_float32_matmul_precision(previous)
+    levels = [record.levelno for record in caplog.records if "replaying it at" in record.getMessage()]
+    assert levels == [logging.WARNING, logging.DEBUG, logging.DEBUG]
+    assert "summarized at each log step" in caplog.records[0].getMessage()
+
+
 # ---------------------------------------------------------------- linear decode logits under autocast
 
 def test_decode_logits_amp_runs_the_logits_matmul_in_bf16_and_returns_fp32() -> None:
