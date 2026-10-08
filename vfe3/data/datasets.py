@@ -379,6 +379,12 @@ def load_cached_tokens(
     )
 
 
+def word_vocabulary_sha256(words: Sequence[str]) -> str:
+    r"""SHA-256 of a word table in id order (UTF-8 JSON list), binding a word cache to its exact id map."""
+    return hashlib.sha256(json.dumps(list(words), ensure_ascii=False, separators=(",", ":"))
+                          .encode("utf-8")).hexdigest()
+
+
 def _require_word_cache_matches_vocabulary(
     dataset:   str,
     split:     str,
@@ -420,6 +426,11 @@ def _require_word_cache_matches_vocabulary(
             "absent; rebuild the word cache")
     actual = {"vocab_size": vocabulary.vocab_size, "min_count": vocabulary.min_count,
               "eos": vocabulary.eos}
+    # A cache whose metadata records the table digest is bound to the exact id order, which catches a
+    # same-size reordered table (audit 2026-10-08 gap-data-lifecycle#6). Older metadata lacks the key.
+    if "vocabulary_sha256" in meta:
+        recorded["vocabulary_sha256"] = meta["vocabulary_sha256"]
+        actual["vocabulary_sha256"] = word_vocabulary_sha256(vocabulary.words)
     differing = sorted(key for key in recorded if recorded[key] != actual[key])
     if differing:
         encoded_with = {key: recorded[key] for key in differing}

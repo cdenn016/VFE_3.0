@@ -82,6 +82,20 @@ def _with_seed(cfg: VFE3Config, seed: int) -> VFE3Config:
     return config_from_serialized({**serialize_config(cfg), "seed": seed}, source="run_vfe seed override")
 
 
+def _without_resume(cfg: VFE3Config, label: str, logger: logging.Logger) -> VFE3Config:
+    r"""``cfg`` with ``resume_from`` and ``trust_resume_checkpoint`` cleared: :func:`run_vfe` trains from step 0.
+
+    A config resolved from a resumed base record still carries that record's ``resume_from``, which
+    ``train()`` would otherwise follow into the base's checkpoint (audit 2026-10-08 P2-9).
+    """
+    if cfg.resume_from is None and not cfg.trust_resume_checkpoint:
+        return cfg
+    logger.warning("run %s: clearing resume_from=%r inherited from the base config; run_vfe trains "
+                   "from step 0", label, cfg.resume_from)
+    return config_from_serialized({**serialize_config(cfg), "resume_from": None,
+                                   "trust_resume_checkpoint": False}, source="run_vfe resume reset")
+
+
 def _loader(
     dataset:   str,
     cfg:       VFE3Config,
@@ -136,6 +150,7 @@ def run_vfe(
     logger = logger or logging.getLogger("vfe3.experiment")
     device = torch.device(device if device is not None else ("cuda" if torch.cuda.device_count() > 0 else "cpu"))
     cfg = _with_seed(cfg, seed)
+    cfg = _without_resume(cfg, label, logger)
 
     seed_everything(cfg.seed, deterministic=cfg.deterministic)
     model = VFEModel(cfg).to(device)

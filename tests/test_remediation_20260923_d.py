@@ -302,7 +302,7 @@ def test_generate_text_defaults_to_the_newest_launcher_run(tmp_path: Path) -> No
     def _run(name: str, stamp: int) -> Path:
         run = tmp_path / name
         run.mkdir(parents=True)
-        for artifact in ("config.json", "best_model.pt"):
+        for artifact in ("config.json", "best_model.pt", "summary.json"):
             (run / artifact).write_text("x", encoding="utf-8")
             os.utime(run / artifact, ns=(stamp, stamp))
         return run

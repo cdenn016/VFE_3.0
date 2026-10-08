@@ -83,7 +83,8 @@ class GaugeGroup:
     irrep_dims:           List[int]                          # block sizes; sum == K
     # NOT a transpose-for-inverse fast path: no such path exists (audit 2026-07-25 F21). Every
     # inverse routes through _checked_group_inverse's float64 solve. What this flag actually gates:
-    # retraction defaults. (The transport chart radius applies to skew groups as well.)
+    # retraction defaults, and the transport chart radius, which is +inf for a skew group
+    # (transport._group_chart_radius: a compact exponential is orthogonal at any norm).
     skew_symmetric:       bool                               # algebra is skew (exp lands in O(K))
     pullback_capability:  Optional[str]          = None      # certified strict M-step route, if any
     invariant_families:   Tuple[str, ...]        = ()        # registry-declared exact families; empty fails closed
@@ -559,10 +560,13 @@ def _build_so_n(
     (for N = 3 the spin-p block, dim 2p + 1), laid out contiguously in spec order with
     sum(mult * dim) == K. One per-token phi coordinate vector (n_gen = N(N-1)/2) drives EVERY
     block through that block's irrep image -- the SAME group element in different irreps, a
-    TIED gauge -- so the embedded generators are block-diagonal but do NOT partition per block
-    (per-block phi preconditioners are undefined; config rejects them). All blocks are built
+    TIED gauge -- so the embedded generators are block-diagonal but do NOT partition per block.
+    The registered ``pullback_per_block`` capability therefore solves a tied tower as ONE full
+    block (the exact Frobenius pullback of the whole representation, audit 2026-10-07 F47); an
+    untied tower is solved per block, skipping generator-free 'l0' blocks. All blocks are built
     in real orthonormal bases, so every embedded generator is exactly skew
-    (skew_symmetric=True: exp(-M) = exp(M)^T transport fast path; det Omega = 1 structurally).
+    (skew_symmetric=True: det Omega = 1 structurally; inverses still route through the float64
+    group-inverse solve, there is no transpose fast path).
     'l0' (trivial) blocks carry ZERO generators: those coordinates are gauge-invariant by
     construction. Unequal block dims are supported end-to-end (per-block energy loop,
     per-head tau = kappa_h sqrt(d_h)); equal-dims specs (one label, mult > 1) additionally
@@ -572,10 +576,15 @@ def _build_so_n(
     deterministic and builds SO(3) spins of any order; 'eigh' is the original construction, kept
     for checkpoints trained in it. The basis is rebuilt at every load, so the builder records a
     sha256 ``basis_fingerprint`` of the float64 generators for the checkpoint loader to compare.
-    The generator Frobenius Gram is certified diagonal with one common weight: in the orthogonal
-    L_jk basis the trace form of any representation of the simple algebra so(N) (N >= 3) is a
-    multiple of the Killing form, so <G_a, G_b>_F = (sum_b ||rho_b(L)||_F^2) delta_ab; the build
-    verifies this numerically and leaves the certificate off if it fails.
+    The generator Frobenius Gram is certified diagonal with one common weight when the build
+    verifies it numerically: for SIMPLE so(N) (N = 3 or N >= 5), in the orthogonal L_jk basis the
+    trace form of any representation is a multiple of the Killing form, so
+    <G_a, G_b>_F = (sum_b ||rho_b(L)||_F^2) delta_ab. so(4) = so(3) + so(3) is not simple: an SO(4)
+    tower whose chiral blocks ('wp2' and 'wm2', each of which kills one so(3) factor) are not
+    balanced by their partners under the tied gauge, or that has any chiral block under
+    tying='per_head', has a non-diagonal Gram (singular when a factor is killed outright, as for a
+    lone 'wp2' or any untied chiral block), and the build leaves the certificate off; such towers
+    run without it.
 
     ``tying='per_head'`` (untied) gives every block its own SO(N) element: block b carries its own
     copy of the generators :math:`\rho_b(L_a)`, supported on that block alone, in block-major

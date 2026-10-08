@@ -557,9 +557,14 @@ def _run_once(
         artifacts = RunArtifacts(run_dir, cfg, model, dataset=DATASET, device=DEVICE,
                                  timestamp=datetime.now().isoformat(timespec="seconds"))
         # config.md: the config dict above, verbatim, plus the values it does not show as literals.
-        from vfe3.config_markdown import write_config_markdown
-        write_config_markdown(run_dir, __file__, {key: getattr(cfg, key) for key in [*config, "seed"]},
-                              header={"DATASET": DATASET, "data seed": _effective_data_seed(cfg)})
+        # Best effort: it re-reads this file from disk, which a later seed of a multi-seed launch may
+        # find mid-edit, so a failure is logged and the run continues (audit 2026-10-08).
+        try:
+            from vfe3.config_markdown import write_config_markdown
+            write_config_markdown(run_dir, __file__, {key: getattr(cfg, key) for key in [*config, "seed"]},
+                                  header={"DATASET": DATASET, "data seed": _effective_data_seed(cfg)})
+        except Exception as exc:
+            logger.warning("config.md was not written (%s: %s); the run continues", type(exc).__name__, exc)
         logger.info("Saving run artifacts to %s", run_dir)
 
     # Full uncapped corpus size for the "stream is X% of full" banner line -- only computed when

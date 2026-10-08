@@ -7,10 +7,7 @@ import torch
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.model.edge_links import edge_diagnostic_capture, receive_heads as edge_receive_heads
 from vfe3.model.relational_operators import RelationalOperators
-from vfe3.relational_scoring import (
-    _compute_dtype, projected_moments, projected_gaussian_kl, projected_mean_distance_cost,
-    projected_noisy_query_cost,
-)
+from vfe3.relational_scoring import _compute_dtype, projected_moments, routing_cost
 from vfe3.runtime import ieee_fp32_matmul
 
 
@@ -63,8 +60,7 @@ def relational_score(
     # An escalated float64 frame (audit 2026-09-23 #12) runs the whole projection and score in
     # float64; the results are returned at the dtype a lower-precision frame would have produced.
     public = _compute_dtype(mu, sigma, source_mu, source_sigma, *(S for pair in comparison for S in pair))
-    score = {"noisy_query": projected_noisy_query_cost,
-             "mean_distance": projected_mean_distance_cost}.get(operators.routing, projected_gaussian_kl)
+    score = routing_cost(operators.routing)                                  # ROUTING_COSTS registry
     scores, captured_q, captured_k = [], [], []
     # One scoring call per run: the heads of a run share their rank d_r. Each call ends in its own
     # host transfer, so a tower of R runs pays R of them per call (one for equal heads).
@@ -105,13 +101,9 @@ def relational_score(
             # X_i = R_i S U_i^{-1} Sigma_i^{1/2} exactly as on the unrotated route (audit 2026-10-08 P1-2).
             # The rotation runs under the same IEEE-fp32 pin as the moments it rotates (P1-1).
             r = S_q.shape[-2]
-            fraction = getattr(operators, "comparison_rope_fraction", 1.0)
-            from vfe3.geometry.rope import build_rope_rotation
-            R_q = build_rope_rotation(torch.arange(a_q.shape[-3], device=a_q.device), [r], base=rope_base,
-                                      fraction=fraction, device=a_q.device, dtype=a_q.dtype)  # (N, r, r)
-            R_k = R_q if a_k.shape[-3] == a_q.shape[-3] else build_rope_rotation(
-                torch.arange(a_k.shape[-3], device=a_k.device), [r], base=rope_base, fraction=fraction,
-                device=a_k.device, dtype=a_k.dtype)
+            R_q = operators.comparison_rope_rotation(a_q.shape[-3], r, a_q.device, a_q.dtype)  # (N, r, r)
+            R_k = R_q if a_k.shape[-3] == a_q.shape[-3] else operators.comparison_rope_rotation(
+                a_k.shape[-3], r, a_k.device, a_k.dtype)
             with ieee_fp32_matmul():
                 a_q = torch.einsum("nst,...nht->...nhs", R_q, a_q)
                 a_k = torch.einsum("nst,...nht->...nhs", R_k, a_k)

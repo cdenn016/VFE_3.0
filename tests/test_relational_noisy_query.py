@@ -264,10 +264,10 @@ def test_relational_score_dispatches_on_the_operator_routing(monkeypatch: pytest
 
     mu, sigma, _, frame, _, _ = _fixture()
     called = []
-    monkeypatch.setattr(relational, "projected_noisy_query_cost",
-                        lambda *args, **kwargs: called.append("noisy_query") or torch.zeros(()))
-    monkeypatch.setattr(relational, "projected_gaussian_kl",
-                        lambda *args, **kwargs: called.append("gaussian_kl") or torch.zeros(()))
+    import vfe3.relational_scoring as scoring
+    for name in ("noisy_query", "gaussian_kl"):
+        monkeypatch.setitem(scoring.ROUTING_COSTS, name,
+                            lambda *args, _name=name, **kwargs: called.append(_name) or torch.zeros(()))
     for routing in ("gaussian_kl", "noisy_query"):
         ops = RelationalOperators([2, 2], 11, readout_mode="predictive_content",
                                   routing=routing).double()

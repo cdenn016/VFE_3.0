@@ -183,6 +183,10 @@ def run_lane(
             print(f"{lane}: pytest subprocess failed: {exc}", file=sys.stderr)
             return 1
 
+        if lane == "slow" and completed.returncode == 5:
+            # pytest exit 5: no test carries the slow marker, so the lane has nothing to run.
+            print(f"{lane}: no tests selected")
+            return 0
         try:
             counts = _read_junit_counts(junit_path)
         except (OSError, ElementTree.ParseError, ValueError) as exc:

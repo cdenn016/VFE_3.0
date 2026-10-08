@@ -14,7 +14,12 @@ is built. A manifest declares
 * ``scaling``: ``{"K": runs, "depth": runs}`` for Figure S3, each optionally
   ``{"runs": [...], "vary": [config fields allowed to differ]}``;
 * ``selection``: the checkpoint-selection rule, ``"best"`` (best recorded validation, the default)
-  or ``"final"`` (final weights), applied identically to every run.
+  or ``"final"`` (final weights), applied identically to every run;
+* ``decision``: optional ``{"evaluated", "comparator", "frozen"}`` arm labels of the registered
+  decision rule (:func:`vfe3.paper.tables.decision_rule_table`); absent labels take its defaults.
+
+An arm mapping may also carry ``"inapplicable": "<reason>"`` (written by ``paper_arms.py`` for a row
+that does not apply to its base); the tables then print ``n/a`` for it instead of ``pending``.
 
 :func:`load_run` reads ``config.json`` (strictly, then, for configs written by older code lines,
 through :func:`vfe3.legacy_config.lenient_config_from_serialized`, recording the dropped retired
@@ -22,7 +27,8 @@ fields), ``summary.json``, ``provenance.json``, ``resources.json`` and ``posthoc
 present. Every quantity is read from these files or derived from the saved config; nothing is
 assumed about the run's size, route or history. :func:`check_homogeneity` compares the configs of
 the runs of one arm on every field except the model seed (the data-order seed lives in
-``provenance.json`` and is not compared) and reports each differing field. :func:`select_checkpoint`
+``provenance.json`` and is not compared), the data and tokenizer identity, and the code identity
+(:func:`code_identity`), and reports each differing field. :func:`select_checkpoint`
 applies the selection rule to one run and names the source of every number it returns.
 """
 
@@ -49,6 +55,9 @@ HOMOGENEITY_PROVENANCE_FIELDS: Tuple[str, ...] = (
     "val_data_sha256", "val_data_n_tokens",
     "test_data_sha256", "test_data_n_tokens",
 )
+
+# Provenance fields that identify the code a run trained on (as multiseed_analysis._CODE_IDENTITY_KEYS).
+CODE_IDENTITY_FIELDS: Tuple[str, ...] = ("git_sha", "git_dirty", "git_dirty_fingerprint")
 
 # Config fields a scaling grid may vary besides the seed, by grid axis (overridable per grid).
 SCALING_VARIED_FIELDS: Dict[str, Tuple[str, ...]] = {
@@ -149,6 +158,7 @@ class Arm:
     unresolved:  List[str] = field(default_factory=list)       # declared entries that matched no run
     homogeneity: Dict[str, Any] = field(default_factory=dict)
     vary:        Tuple[str, ...] = ()
+    inapplicable: Optional[str] = None                         # reason the row does not apply (n/a)
 
 
 @dataclass
@@ -162,6 +172,7 @@ class Manifest:
     scaling:   Dict[str, Arm] = field(default_factory=dict)
     selection: str = "best"
     problems:  List[str] = field(default_factory=list)
+    decision:  Dict[str, str] = field(default_factory=dict)    # registered decision-rule arm labels
 
 
 # ----------------------------------------------------------------------------------------------
@@ -377,6 +388,8 @@ def resolve_manifest(
         paths, unresolved = resolve_run_paths(entries)
         arm = Arm(label=str(label), group=group, runs=[cache.get(p) for p in paths],
                   unresolved=unresolved)
+        if isinstance(spec, Mapping) and isinstance(spec.get("inapplicable"), str):
+            arm.inapplicable = spec["inapplicable"]
         arm.homogeneity = check_homogeneity(arm.runs)
         for entry in unresolved:
             out.problems.append(f"arm {label!r}: {entry!r} matched no run directory")
@@ -393,6 +406,10 @@ def resolve_manifest(
             return None
         return cache.get(paths[0])
 
+    decision = manifest.get("decision") or {}
+    if not isinstance(decision, Mapping):
+        raise ValueError("manifest['decision'] must be a mapping of decision-rule arm labels")
+    out.decision = {str(key): str(value) for key, value in decision.items() if value is not None}
     out.evaluated = single("evaluated_run")
     out.final = single("final_run")
     out.numerics = single("numerics_run") or out.evaluated
@@ -415,9 +432,22 @@ def resolve_manifest(
 # Homogeneity
 # ----------------------------------------------------------------------------------------------
 
+def code_identity(run: RunRecord) -> Dict[str, Any]:
+    r"""The code a run trained on: the source archive's content hash when recorded, else the git triple.
+
+    ``{"source_tree_sha256": ...}`` when ``provenance.json`` holds an available source archive (a
+    content hash of the archived files, insensitive to commits that change no archived file), else
+    ``{"git_sha", "git_dirty", "git_dirty_fingerprint"}`` (None where unrecorded).
+    """
+    archive = run.provenance.get("source_archive")
+    if isinstance(archive, Mapping) and archive.get("available") and isinstance(archive.get("tree_sha256"), str):
+        return {"source_tree_sha256": archive["tree_sha256"]}
+    return {key: run.provenance.get(key) for key in CODE_IDENTITY_FIELDS}
+
+
 def _comparable_fields(run: RunRecord) -> Dict[str, Any]:
     r"""Every config field (normalized through the loaded config when possible), the retired fields
-    dropped on reload, the dataset, and the provenance data and tokenizer identity."""
+    dropped on reload, the dataset, the provenance data and tokenizer identity, and the code identity."""
     if run.cfg is not None:
         values: Dict[str, Any] = {f.name: getattr(run.cfg, f.name) for f in dataclasses.fields(run.cfg)}
         values.update({f"retired:{key}": value for key, value in run.dropped_config_fields.items()})
@@ -426,11 +456,23 @@ def _comparable_fields(run: RunRecord) -> Dict[str, Any]:
     values["config.json:dataset"] = run.dataset
     for key in HOMOGENEITY_PROVENANCE_FIELDS:
         values[f"provenance:{key}"] = run.provenance.get(key)
+    values["provenance:code_identity"] = code_identity(run)
     return values
 
 
+def _integral_floats_as_int(value: Any) -> Any:
+    r"""Integral finite floats as ints, recursively, so ``1`` and ``1.0`` compare equal (audit 2026-10-08 general-C#7)."""
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return int(value)
+    if isinstance(value, Mapping):
+        return {key: _integral_floats_as_int(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_integral_floats_as_int(item) for item in value]
+    return value
+
+
 def _canonical(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, default=str, allow_nan=True)
+    return json.dumps(_integral_floats_as_int(value), sort_keys=True, default=str, allow_nan=True)
 
 
 def check_homogeneity(
@@ -580,6 +622,31 @@ def device_hours(run: RunRecord) -> Tuple[Optional[float], Optional[str]]:
         if finite:
             return max(finite) / 3600.0, "metrics.csv wall_clock_s (training loop only)"
     return None, None
+
+
+def train_device_hours(run: RunRecord) -> Tuple[Optional[float], Optional[str]]:
+    r"""Training-only device-hours: :math:`\sum_r \bar t_r \Delta s_r / 3600` over the logging windows.
+
+    The logged mean optimizer-step time times the steps of each window
+    (:func:`vfe3.run_resources.throughput_summary`), which excludes evaluation and artifact writing;
+    this is the quantity the compute-matched arm matches (:func:`vfe3.baseline.measured_train_device_hours`).
+    Falls back to :func:`device_hours` (wall time, evaluation included) with its source when
+    ``metrics.csv`` records no step time.
+    """
+    if "train_device_hours" not in run._cache:
+        value = None
+        try:
+            from vfe3.run_resources import throughput_summary
+            value = finite_float(throughput_summary(run.run_dir).get("train_only_hours_estimate"))
+        except Exception as exc:                              # noqa: BLE001 - recorded, not raised
+            run.notes.append(f"training-only device-hours unavailable: {exc!r}")
+        if value is not None and value > 0:
+            run._cache["train_device_hours"] = (value, "metrics.csv train_step_ms_mean x steps (training only)")
+        else:
+            hours, source = device_hours(run)
+            run._cache["train_device_hours"] = (
+                hours, f"{source} (wall time incl. evaluation; no training-step timing)" if source else None)
+    return run._cache["train_device_hours"]
 
 
 def latest_training_checkpoint(run: RunRecord) -> Optional[Path]:

@@ -1318,8 +1318,12 @@ def _sigma_dynamics(bank: ContextualBank, lens: Optional[Dict[str, Any]], ctx: A
         if logdet_L.size != n:
             raise RuntimeError(f"lens tokens ({n}) and bank rows ({logdet_L.size}) are not aligned")
         if n >= 3:
-            out["spearman_entropy"] = stats.spearman_ci(logdet_L, lens["arrays"]["entropy"][-1], rng)
-            out["spearman_surprisal"] = stats.spearman_ci(logdet_L, lens["arrays"]["ce"][-1], rng)
+            # Tokens of one window are dependent: resample whole windows (audit 2026-10-08 gap-stats#7).
+            windows = bank.seq_index[rows]
+            out["spearman_entropy"] = stats.spearman_ci(logdet_L, lens["arrays"]["entropy"][-1], rng,
+                                                        groups=windows)
+            out["spearman_surprisal"] = stats.spearman_ci(logdet_L, lens["arrays"]["ce"][-1], rng,
+                                                          groups=windows)
     return out
 
 

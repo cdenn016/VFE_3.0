@@ -23,13 +23,16 @@ is best-effort (a plotting/dependency error is logged, never fatal) so the numer
 survive a viz problem.
 """
 
+import ast
 import copy
 import csv
+import functools
 import hashlib
 import json
 import logging
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -195,6 +198,10 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
                                          if cfg.relational_receiver_law == "channel_likelihood" else
                                          "full_link_pushforward_plus_positive_reference_noise") if full_link else
                                         ("minimal_agent_posterior_moment_match_plus_covariant_floor" if minimal_agent
+                                         # The diagonal family stores diag of U_i(C^att + f I)U_i^T in local
+                                         # coordinates: a moment projection, neither exact nor covariant.
+                                         else "diagonal_local_moment_projection_of_predictive_kernel_plus_floor"
+                                         if cfg.family != "gaussian_full"
                                          else "exact_predictive_kernel_moment_match_plus_covariant_floor")
                                         if getattr(cfg, "predictive_covariance", "passthrough") == "moment_matched"
                                         else "frozen_receiver_bookkeeping_not_predictive_covariance"),
@@ -334,13 +341,56 @@ def _require_identity_sha256(value: object, field: str) -> str:
     return value
 
 
+_DECLARATIVE_DRIVER_NAME = re.compile(r"^(?:config|[A-Z][A-Z0-9_]*)$")
+
+
+def _is_declarative_driver_statement(statement: ast.stmt) -> bool:
+    r"""Whether a top-level driver statement only assigns click-to-run settings.
+
+    The launchers keep their live settings in a top-level ``config`` dictionary and public UPPER_CASE
+    names (``CONFIG``, ``SWEEPS``, ``DATA_SEED``, ``RUN_DIR`` ...), including ``config[...] = ...``
+    item assignments. Those values are bound by the run's own config fingerprint and contracts, not by
+    the executable-code identity, so editing them (for example adding ``resume_from``) is not code drift.
+    """
+    if not isinstance(statement, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+        return False
+    targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+
+    def _root(target: ast.expr) -> Optional[str]:
+        while isinstance(target, (ast.Subscript, ast.Attribute)):
+            target = target.value
+        return target.id if isinstance(target, ast.Name) else None
+
+    roots = [_root(target) for target in targets]
+    return bool(roots) and all(root is not None and _DECLARATIVE_DRIVER_NAME.match(root) for root in roots)
+
+
+def _driver_logic_bytes(source: bytes) -> bytes:
+    r"""Executable logic of a root driver: its AST without top-level declarative settings.
+
+    A driver that does not parse (a half-saved edit) falls back to its newline-normalized bytes, so
+    the identity still changes with it.
+    """
+    normalized = source.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    try:
+        tree = ast.parse(normalized.decode("utf-8"))
+    except (SyntaxError, UnicodeDecodeError, ValueError):
+        return normalized
+    tree.body = [statement for statement in tree.body if not _is_declarative_driver_statement(statement)]
+    return ast.dump(tree, annotate_fields=True, include_attributes=False).encode("utf-8")
+
+
 def _package_code_identity() -> str:
     r"""Return the current content identity for the package and supported root execution drivers.
 
     A run captures this digest once when its artifact owner is constructed. Generated files, tests,
     documentation, Git metadata, and output directories are excluded, so artifact publication cannot
     change the identity. Recomputing at each run boundary is required for long-lived Spyder kernels:
-    editing a source file must not reuse the previous run's identity.
+    editing a source file must not reuse the previous run's identity. Package sources are hashed
+    byte for byte (newline-normalized); root drivers contribute only their executable logic
+    (:func:`_driver_logic_bytes`), so a resume or sweep edit of a launcher's settings does not discard
+    the checkpoint's best-model selection (audit 2026-10-08 P2-2). The drivers that train runs,
+    ``train_baseline.py`` and ``paper_arms.py`` included, are all listed (gap-data-lifecycle#8).
     """
     root = Path(__file__).resolve().parent
     repository = root.parent
@@ -359,6 +409,8 @@ def _package_code_identity() -> str:
             "scaling.py",
             "scaling_analysis.py",
             "train_vfe3.py",
+            "train_baseline.py",
+            "paper_arms.py",
         )
         if (repository / name).is_file()
     }
@@ -368,10 +420,12 @@ def _package_code_identity() -> str:
     for path in sources:
         relative = path.relative_to(repository).as_posix().encode("utf-8")
         try:
-            content = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+            content = path.read_bytes()
         except OSError as exc:
             raise RuntimeError(
                 f"training code identity cannot read {path.relative_to(root.parent)!s}") from exc
+        content = (_driver_logic_bytes(content) if path in root_drivers
+                   else content.replace(b"\r\n", b"\n").replace(b"\r", b"\n"))
         for payload in (relative, content):
             digest.update(len(payload).to_bytes(8, "big"))
             digest.update(payload)
@@ -556,11 +610,37 @@ def _normalized_data_identity(
     return normalized
 
 
+# A float field is annotated float, Optional[float], or the string annotation 'float | List[float]'.
+_FLOAT_FIELD_TYPES: Tuple[object, ...] = (float, Optional[float], "float | List[float]")
+_FLOAT_CONFIG_FIELDS: Optional[frozenset] = None
+
+
+def _float_config_fields() -> frozenset:
+    r"""Names of the ``VFE3Config`` fields whose scalar value is a float (cached)."""
+    global _FLOAT_CONFIG_FIELDS
+    if _FLOAT_CONFIG_FIELDS is None:
+        from dataclasses import fields as dataclass_fields
+        _FLOAT_CONFIG_FIELDS = frozenset(
+            field.name for field in dataclass_fields(VFE3Config)
+            if field.type in _FLOAT_FIELD_TYPES)
+    return _FLOAT_CONFIG_FIELDS
+
+
 def semantic_config_fingerprint(
     config: Mapping[str, Any],
 ) -> str:
-    """Return the stable SHA-256 fingerprint of a normalized semantic config mapping."""
-    normalized = json.dumps(dict(config), sort_keys=True, separators=(",", ":"))
+    """Return the stable SHA-256 fingerprint of a normalized semantic config mapping.
+
+    A top-level key that names a float-typed ``VFE3Config`` field hashes an integer value as the
+    equal float, so ``rope_fraction=1`` and ``rope_fraction=1.0`` fingerprint alike (audit 2026-10-08
+    P2-4). Records that spelled such a field as a float keep their fingerprint.
+    """
+    float_fields = _float_config_fields()
+    normalized = json.dumps(
+        {key: (float(value) if key in float_fields and isinstance(value, int) and not isinstance(value, bool)
+               else value)
+         for key, value in dict(config).items()},
+        sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
@@ -2661,7 +2741,44 @@ def _git_environment(
         value = os.environ.get(name)
         if value is not None:
             env[name] = value
+    # The probe ignores the system and global config files, but the checkout's line-ending policy
+    # lives there (Git for Windows sets core.autocrlf=true system-wide). Without it every CRLF working
+    # file reads as modified until an ordinary `git status` refreshes the index, so git_dirty and the
+    # fingerprint would track index stat freshness instead of content (audit 2026-10-08 P2-28).
+    for index, (key, value) in enumerate(_git_line_ending_config(git_executable)):
+        env[f"GIT_CONFIG_KEY_{index}"] = key
+        env[f"GIT_CONFIG_VALUE_{index}"] = value
+        env["GIT_CONFIG_COUNT"] = str(index + 1)
     return env
+
+
+_GIT_LINE_ENDING_KEYS: Tuple[str, ...] = ("core.autocrlf", "core.eol")
+
+
+@functools.lru_cache(maxsize=None)
+def _git_line_ending_config(
+    git_executable: str,
+) -> Tuple[Tuple[str, str], ...]:
+    r"""Effective system/global ``core.autocrlf`` and ``core.eol`` (global wins), read once per process.
+
+    Repository-local values still apply inside the probe, which disables only the system and global
+    files. A failed read contributes nothing, which is the previous probe behavior.
+    """
+    environment = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    found: Dict[str, str] = {}
+    for scope in ("--system", "--global"):
+        for key in _GIT_LINE_ENDING_KEYS:
+            try:
+                completed = subprocess.run(
+                    [git_executable, "config", scope, "--get", key],
+                    env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, timeout=5, check=False)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            value = completed.stdout.decode("utf-8", "replace").strip()
+            if completed.returncode == 0 and value:
+                found[key] = value
+    return tuple((key, found[key]) for key in _GIT_LINE_ENDING_KEYS if key in found)
 
 
 def _git_code_identity(
@@ -3627,12 +3744,17 @@ def _best_weight_and_train_sample_evaluation(
     model, and the final state is restored bitwise from a host copy in a ``finally`` block. CPU and
     CUDA RNG are forked, so later finalize probes draw the same numbers as before.
     """
-    from vfe3.train import _build_fixed_train_sample, evaluate
+    from vfe3.train import TRAIN_SAMPLE_MAX_TARGETS, TRAIN_SAMPLE_SEED, _build_fixed_train_sample, evaluate
 
     out: Dict[str, object] = {
         "test_best_ce": None, "test_best_ppl": None, "test_best_step": artifacts.best_step,
         "test_best_status": None,
         "train_sample_ce_final": None, "train_sample_ce_best": None,
+        # The training-time sample is capped at TRAIN_SAMPLE_MAX_TARGETS scored targets (32,768 since PR #75);
+        # the post-hoc evaluator keeps its own larger cap, so the two train_sample CEs need not agree.
+        "train_sample_max_targets": int(TRAIN_SAMPLE_MAX_TARGETS),
+        "train_sample_seed": int(TRAIN_SAMPLE_SEED),
+        "train_sample_scored_targets": None,
     }
     by_step = getattr(artifacts, "train_sample_by_step", None) or {}
     rng_devices = [device] if device.type == "cuda" else []
@@ -3643,6 +3765,9 @@ def _best_weight_and_train_sample_evaluation(
                 sample, reason = _build_fixed_train_sample(train_loader, val_loader, cfg)
                 if sample is None:
                     out["train_sample_unavailable_reason"] = reason
+                else:
+                    out["train_sample_scored_targets"] = (
+                        len(sample.indices) * int(sample.scored_targets_per_window))
             except Exception as exc:
                 out["train_sample_unavailable_reason"] = repr(exc)
         if final_step is not None and final_step in by_step:
@@ -4920,11 +5045,21 @@ def _pure_path_report(
             "gauge_transport":              cfg.gauge_transport,
             "pos_rotation":                 cfg.pos_rotation,
             "rope_on_value":                bool(cfg.rope_on_value),
-            # Which RoPE regime the routing score used (audit 2026-07-26 A-02).
+            # Which RoPE regime the routing score used (audit 2026-07-26 A-02). rope_space='comparison'
+            # folds nothing into the frame: it rotates the projected moments by R_i after the comparison
+            # map, so the pair cost depends on positions through j - i (audit 2026-10-08 C#6).
             "rope_pair_energy_exactness":   (
                 "not_applicable" if cfg.pos_rotation == "none"
+                else "comparison_space_rotated_projected_moments"
+                if getattr(cfg, "rope_space", "frame") == "comparison"
                 else "frame_folded_both_moments"   # projected routes push both moments through U_i R_i^T
             ),
+            "rope_space":                   (None if cfg.pos_rotation == "none"
+                                             else getattr(cfg, "rope_space", "frame")),
+            "rope_fraction":                (None if cfg.pos_rotation == "none"
+                                             else float(cfg.rope_fraction)),
+            "rope_base":                    (None if cfg.pos_rotation == "none"
+                                             else float(cfg.rope_base)),
             "skip_belief_sigma_update":      bool(cfg.skip_belief_sigma_update),
             "predictive_covariance":         getattr(cfg, "predictive_covariance", "passthrough"),
             "predictive_covariance_floor":   float(getattr(cfg, "predictive_covariance_floor", 1e-4)),

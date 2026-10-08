@@ -1,7 +1,12 @@
+"""Collection policy for the test lanes: --runslow and the slow, cuda, external and xdist_group markers.
+
+Registered as a pytest plugin by the repository-root ``conftest.py`` (``pytest_plugins``), so its
+hooks run for every invocation. It must not import torch: it loads before ``tests/conftest.py`` sets
+the CUDA workspace environment that has to precede the first torch import.
+"""
 import os
 
 import pytest
-import torch
 
 
 SLOW_TESTS: frozenset[str] = frozenset()
@@ -42,7 +47,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     run_slow = config.getoption("--runslow")
     skip_slow = pytest.mark.skip(reason="slow integration test; pass --runslow to run it")
-    mirror_cuda = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu")).type == "cuda"
+    mirror_cuda = os.environ.get("VFE3_TEST_DEVICE", "cpu").partition(":")[0].strip().lower() == "cuda"
 
     for item in items:
         key = node_key(item.nodeid)

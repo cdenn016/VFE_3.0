@@ -2643,12 +2643,15 @@ def _linear_logits(
     pb: PriorBank,
     x:  torch.Tensor,                    # (..., K) decode input
     W:  torch.Tensor,                    # (V, K) output weight (or a vocab chunk of it)
-) -> torch.Tensor:                       # (..., V) logits x W^T, fp32 when autocast ran
+) -> torch.Tensor:                       # (..., V) logits x W^T, fp32 dtype when autocast ran
     r"""The linear decode's logits matmul :math:`x W^\top`.
 
     With ``pb.decode_logits_amp_dtype`` set it runs under that autocast dtype (low-precision
-    operands, fp32 accumulation) and is returned as fp32, so the bias, logsumexp and cross-entropy
-    that follow stay in fp32; otherwise it is the plain matmul in the caller's precision.
+    operands, fp32 accumulation) and is cast to fp32, so the bias, logsumexp and cross-entropy
+    that follow run in fp32; otherwise it is the plain matmul in the caller's precision. The
+    autocast GEMM stores its output in the autocast dtype, so the returned logits carry that dtype's
+    precision (bf16: unit roundoff :math:`2^{-8}`, a rounding error up to 0.125 for logits between 32 and 64); the fp32 cast
+    restores no bits, and per-token cross-entropy and ranking metrics see the rounded values.
     """
     dtype = getattr(pb, "decode_logits_amp_dtype", None)
     if dtype is None:

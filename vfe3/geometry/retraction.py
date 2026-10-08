@@ -259,14 +259,21 @@ def _loewner_adjoint(
     # values differ by a non-cancelling amount), and an unresolved pair keeps the midpoint limit.
     #   sqrt:     (sqrt a - sqrt b)/(a - b) = 1/(sqrt a + sqrt b)
     #   inv_sqrt: (a^-1/2 - b^-1/2)/(a - b) = -1/(sqrt a sqrt b (sqrt a + sqrt b))
-    #   exp:      (e^a - e^b)/(a - b) = e^b expm1(a - b)/(a - b)
-    #   log:      (log a - log b)/(a - b) = log1p((a - b)/b)/(a - b)
+    #   exp:      (e^a - e^b)/(a - b) = e^max(a,b) (-expm1(-|a - b|))/|a - b|
+    #   log:      (log a - log b)/(a - b) = log1p((a - b)/b)/(a - b)   (close pairs only)
+    # The exp form factors out the LARGER exponent, so it is finite wherever the plain quotient is
+    # (e^b expm1(a - b) overflowed float32 for a - b > 88.7 inside the [-50, 50] clamp). The log form
+    # is used only for |a - b| <= max(a, b)/2: for a wide pair (a - b)/b rounds to -1 in float32 and
+    # log1p returns -inf, while the generic quotient has no cancellation there (audit 2026-10-08,
+    # general-A-core-math#3, geometer#3).
     active_i = lambda_i >= lower
     active_j = lambda_j >= lower
     if upper is not None and kind in ("exp_bounded", "project"):
         active_i = active_i & (lambda_i <= upper)
         active_j = active_j & (lambda_j <= upper)
     both_active = active_i & active_j & ~repeated
+    if kind == "log_floor":
+        both_active = both_active & (gap.abs() <= 0.5 * scale)
     if kind in ("sqrt_floor", "inv_sqrt_floor", "exp_bounded", "log_floor"):
         # Placeholders off the active pairs keep every branch finite (torch.where differentiates both).
         safe_i = torch.where(both_active, lambda_i, torch.ones_like(gap))
@@ -278,7 +285,8 @@ def _loewner_adjoint(
             root_i, root_j = safe_i.sqrt(), safe_j.sqrt()
             closed = -(root_i * root_j * (root_i + root_j)).reciprocal()
         elif kind == "exp_bounded":
-            closed = torch.exp(safe_j) * torch.expm1(safe_gap_active) / safe_gap_active
+            abs_gap = safe_gap_active.abs()
+            closed = torch.exp(torch.maximum(safe_i, safe_j)) * (-torch.expm1(-abs_gap)) / abs_gap
         else:
             closed = torch.log1p(safe_gap_active / safe_j) / safe_gap_active
         divided_difference = torch.where(both_active, closed, divided_difference)
@@ -440,19 +448,24 @@ def _certify_public_spd(
         certificate - float(eps) * eye_check,
         check_errors=False,
     )
-    failed = lower_info.ne(0)
+    floor_failed = lower_info.ne(0)
+    ceiling_failed = torch.zeros_like(floor_failed)
     if sigma_max is not None:
         _, upper_info = torch.linalg.cholesky_ex(
             float(sigma_max) * eye_check - certificate,
             check_errors=False,
         )
-        failed = failed | upper_info.ne(0)
+        ceiling_failed = upper_info.ne(0)
+    failed = floor_failed | ceiling_failed
     if not bool(failed.any()):
         return symmetric
 
-    # Count the repaired rows (audit 2026-10-07, F34/F64): a repair lifts lambda_min to eps plus the
-    # public-dtype clearance, so R_Sigma(0) != Sigma for such a row; the count makes that visible.
-    _count_public_spd_repairs(failed)
+    # Count the repaired rows (audit 2026-10-07, F34/F64): a floor repair lifts lambda_min to eps plus
+    # the public-dtype clearance, so R_Sigma(0) != Sigma for such a row; the count makes that visible.
+    # Ceiling contacts are counted separately (audit 2026-10-08, geometer#4): the 'project' clamp leaves
+    # eigenvalues exactly at sigma_max, so the strict sigma_max I - Sigma certificate fails on every
+    # row that touched the ceiling, and pooling those rows hid the floor lift the counter exposes.
+    _count_public_spd_repairs(floor_failed, ceiling_failed & ~floor_failed)
     repair_input = certificate[failed]
     eigenvalues, eigenvectors = _eigh_damped(repair_input, _rel_gap_eps(repair_input))
     scale = repair_input.abs().amax(dim=(-2, -1), keepdim=True).clamp_min(1.0)
@@ -523,29 +536,48 @@ def _certify_public_spd(
 
 
 _NONFINITE_TANGENT_COUNTS: Dict[str, torch.Tensor] = {}
-# Covariance rows rebuilt by _certify_public_spd, per device (async add on the repair path only).
+# Covariance rows rebuilt by _certify_public_spd because they failed the eps-floor certificate, per
+# device (async add on the repair path only).
 _PUBLIC_SPD_REPAIR_COUNTS: Dict[str, torch.Tensor] = {}
+# Rows rebuilt ONLY because they failed the strict sigma_max ceiling certificate (ceiling contacts).
+_PUBLIC_SPD_CEILING_COUNTS: Dict[str, torch.Tensor] = {}
 
 
-def _count_public_spd_repairs(failed: torch.Tensor) -> None:
-    r"""Accumulate the rows :func:`_certify_public_spd` repaired, per device (async add, no host sync)."""
-    key = str(failed.device)
-    counter = _PUBLIC_SPD_REPAIR_COUNTS.get(key)
+def _accumulate_device_count(store: Dict[str, torch.Tensor], mask: torch.Tensor) -> None:
+    r"""Add ``mask.sum()`` to the per-device counter in ``store`` (async add, no host sync)."""
+    key = str(mask.device)
+    counter = store.get(key)
     if counter is None:
-        counter = torch.zeros((), dtype=torch.int64, device=failed.device)
-        _PUBLIC_SPD_REPAIR_COUNTS[key] = counter
-    counter += failed.sum()
+        counter = torch.zeros((), dtype=torch.int64, device=mask.device)
+        store[key] = counter
+    counter += mask.sum()
+
+
+def _count_public_spd_repairs(floor_failed: torch.Tensor, ceiling_only: torch.Tensor) -> None:
+    r"""Accumulate the floor repairs and the ceiling-only contacts of :func:`_certify_public_spd`."""
+    _accumulate_device_count(_PUBLIC_SPD_REPAIR_COUNTS, floor_failed)
+    _accumulate_device_count(_PUBLIC_SPD_CEILING_COUNTS, ceiling_only)
 
 
 def public_spd_repair_elements() -> int:
-    r"""Covariance rows repaired by the SPD certificate since the last reset. Host-syncs."""
+    r"""Covariance rows the SPD certificate repaired at the eps FLOOR since the last reset. Host-syncs.
+
+    These are the rows whose :math:`\lambda_{\min}` the repair lifts; rows that failed only the
+    ceiling certificate are reported by :func:`public_spd_ceiling_contact_elements`.
+    """
     return int(sum(int(count) for count in _PUBLIC_SPD_REPAIR_COUNTS.values()))
 
 
+def public_spd_ceiling_contact_elements() -> int:
+    r"""Covariance rows rebuilt only for failing the strict ``sigma_max`` ceiling certificate. Host-syncs."""
+    return int(sum(int(count) for count in _PUBLIC_SPD_CEILING_COUNTS.values()))
+
+
 def reset_public_spd_repair_elements() -> None:
-    r"""Zero the SPD-certificate repair counters."""
-    for count in _PUBLIC_SPD_REPAIR_COUNTS.values():
-        count.zero_()
+    r"""Zero the SPD-certificate floor-repair and ceiling-contact counters."""
+    for store in (_PUBLIC_SPD_REPAIR_COUNTS, _PUBLIC_SPD_CEILING_COUNTS):
+        for count in store.values():
+            count.zero_()
 
 
 def _neutralize_nonfinite_tangent(

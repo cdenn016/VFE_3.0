@@ -290,9 +290,18 @@ def map_invariants(
     ``link_shared_generator_only = 1.0``, and its rows add the
     Frobenius norms ``{edge map}_fro`` of the stored factor maps; the per-edge links themselves are
     data-dependent and are reported by the model diagnostics (``relational_edge_*``), not here.
+
+    Under comparison-space RoPE (``pos_rotation='rope'``, ``rope_space='comparison'``) the routing cost
+    is :math:`\mathrm{KL}(R_i A a_i \Vert R_j A b_j)`, invariant only under the commutant of the
+    rotations, so the comparison-pair charge :math:`S_Q S_Q^\top + S_K S_K^\top` is not conserved by
+    gradient flow. ``conserved_S_drift`` is then NaN and the row carries ``comparison_rope = 1.0``;
+    ``scale_rms`` (the trace charge, which survives) is kept, and the gains and angles are invariants
+    of the larger GL(r) group, not of the model's symmetry (audit 2026-10-08, transformer-ml#5).
     """
     state, _ = unwrap_state(state)
     s0 = _output_init_scale(cfg)
+    comparison_rope = (getattr(cfg, "pos_rotation", "none") == "rope"
+                       and getattr(cfg, "rope_space", "frame") == "comparison")
     rows: List[Dict[str, float]] = []
     norms_by_layer = head_block_norms(state, cfg)
     for layer, maps in relational_maps(state, cfg).items():
@@ -359,6 +368,9 @@ def map_invariants(
                     sv = torch.linalg.svdvals(mat) / unit
                     row[f"{name}_sv_noise_units_min"] = float(sv.min())
                     row[f"{name}_sv_noise_units_max"] = float(sv.max())
+            if comparison_rope:                                       # RoPE breaks GL(r) to its commutant
+                row["comparison_rope"] = 1.0
+                row["conserved_S_drift"] = float("nan")
             if "edge_sender_map" in maps:
                 row["link_shared_generator_only"] = 1.0
             row.update({f"{name}_fro": float(maps[name].norm()) for name in EDGE_MAP_NAMES if name in maps})

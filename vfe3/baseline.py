@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import math
 from dataclasses import asdict, dataclass, fields, is_dataclass, replace
 from pathlib import Path
@@ -1225,9 +1226,39 @@ def calibrated_tokens_per_s(
     value = quantiles.get(statistic)
     if not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value <= 0:
         raise ValueError(f"{run_dir}: no finite {statistic} of {column!r} in metrics.csv")
+    device_name = summary.get("device_name")
+    if device_name is None:                       # a calibration run writes no provenance.json
+        record = Path(run_dir) / CALIBRATION_RECORD
+        if record.is_file():
+            device_name = json.loads(record.read_text(encoding="utf-8")).get("device_name")
     return {"tokens_per_s": float(value), "column": column, "statistic": statistic,
-            "n_windows": quantiles.get("n"), "device_name": summary.get("device_name"),
+            "n_windows": quantiles.get("n"), "device_name": device_name,
             "run_dir": str(run_dir)}
+
+
+# The calibration run's device record (train_baseline.calibrate_widths writes it; a calibration run is
+# not finalized, so it has no provenance.json).
+CALIBRATION_RECORD: str = "calibration.json"
+# Fields a calibration run sets by its own protocol; every other field must equal the matched arm's.
+CALIBRATION_PROTOCOL_FIELDS: Tuple[str, ...] = (
+    "seed", "max_steps", "warmup_steps", "log_interval", "eval_interval", "checkpoint_interval",
+    "resume_from")
+
+
+def calibration_mismatch(cfg: BaselineConfig, run_dir: Union[str, Path], width: int) -> List[str]:
+    r"""Fields in which the calibration run ``run_dir`` differs from ``cfg.with_width(width)``.
+
+    :data:`CALIBRATION_PROTOCOL_FIELDS` are excluded. An empty list means the run measured the
+    throughput of the configuration the width rule will train; a config that cannot be read raises
+    ``ValueError``.
+    """
+    path = Path(run_dir) / "config.json"
+    record = json.loads(path.read_text(encoding="utf-8"))
+    calibrated = BaselineConfig.from_serialized(record.get("config", record), source=str(path))
+    expected = cfg.with_width(int(width))
+    return [f.name for f in fields(BaselineConfig)
+            if f.name not in CALIBRATION_PROTOCOL_FIELDS
+            and getattr(calibrated, f.name) != getattr(expected, f.name)]
 
 
 def measured_train_device_hours(run_dir: Union[str, Path]) -> Dict[str, Any]:

@@ -18,7 +18,7 @@ from vfe3.belief import BeliefState
 from vfe3.contracts import CanonicalFrameContext, EStepGradientRecord
 from vfe3.gradients.full_link import (
     FULL_LINK_ALPHA_MODES, FullLinkContext, build_full_link_context, full_link_context_at,
-    full_link_cost, full_link_cost_parts, full_link_gradients, full_link_minimizer,
+    full_link_cost, full_link_cost_parts, full_link_gradients, full_link_minimizer, receiver_law_retry_counter,
 )
 from vfe3.gradients.relational import relational_predictive_readout
 from vfe3.families.base import get_family
@@ -232,8 +232,9 @@ def e_step_iteration(
     source rows are frozen (filtering), the trajectory is unrolled, and the mean trust region is
     the Mahalanobis ball. A state-dependent ``lambda_alpha_mode`` recomputes alpha*(q) = c0/(b0 + D)
     from the current receiver and the layer prior at every iteration (full_link_context_at): the
-    Euler force is then the exact gradient of the profiled energy, and the closed form is its
-    majorize-minimize step.
+    Euler force is then the exact gradient of the profiled energy, and the undamped closed form
+    (rho = 1) is its majorize-minimize step; a damped diagonal-family closed form is not guaranteed
+    to descend (see full_link_minimizer).
     """
     if (relational_operators is None
             or relational_operators.readout_mode not in ("predictive_content", "full_link_update")):
@@ -375,6 +376,7 @@ def e_step(
         if relational_capture is not None:
             # Open the repair window before the context build, which runs the routing score.
             episode_recovery = source_recovery_counter(belief.mu.device)
+            episode_law_retry = receiver_law_retry_counter(belief.mu.device)
         full_link_context = build_full_link_context(
             belief.mu, belief.sigma, mu_p, sigma_p, relational_frame, relational_operators,
             tau=tau, lambda_beta=lambda_beta, value=value,
@@ -416,11 +418,16 @@ def e_step(
                 belief.mu, belief.sigma, full_link_context).detach()
             relational_capture["relational_covariance_repair_count"] = (
                 source_recovery_counter(belief.mu.device) - episode_recovery)
+            relational_capture["relational_receiver_law_retry_count"] = (
+                receiver_law_retry_counter(belief.mu.device) - episode_law_retry)
             relational_capture["relational_mean_displacement_norm"] = (
                 belief.mu - episode_start.mu).norm().detach()
+            # Both tags read the one context frozen at the episode-initial alpha (the built context),
+            # so the part deltas are deltas of a single functional and the distances share one mu*.
+            # Under a state-dependent alpha that functional is the episode-initial majorizer.
             for tag, state in (("before", episode_start), ("after", belief)):
                 mean_part, covariance_part, distance = full_link_cost_parts(
-                    state.mu, state.sigma, full_link_context_at(full_link_context, state.mu, state.sigma))
+                    state.mu, state.sigma, full_link_context)
                 relational_capture[f"relational_receiver_mean_cost_{tag}"] = mean_part.detach()
                 relational_capture[f"relational_receiver_covariance_cost_{tag}"] = covariance_part.detach()
                 relational_capture[f"relational_receiver_target_distance_{tag}"] = distance.detach()

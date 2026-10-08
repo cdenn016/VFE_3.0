@@ -486,8 +486,16 @@ def linear_cka(X: Any, Y: Any, debiased: bool = False, *, device: Any = None) ->
 # Resampling statistics
 # ----------------------------------------------------------------------------------------------
 
-def spearman_ci(x: Any, y: Any, rng: np.random.Generator, n_boot: int = 1000) -> Dict[str, Any]:
-    r"""Spearman ``rho`` with its two-sided p-value and a percentile bootstrap 95% CI over pairs."""
+def spearman_ci(
+    x: Any, y: Any, rng: np.random.Generator, n_boot: int = 1000, groups: Optional[Any] = None,
+) -> Dict[str, Any]:
+    r"""Spearman ``rho`` with its two-sided p-value and a percentile bootstrap 95% CI over pairs.
+
+    With ``groups`` (one label per pair, e.g. the context window of each token) the bootstrap resamples
+    whole groups with replacement, the cluster bootstrap of Davison and Hinkley (1997, Sec. 3.8), because
+    pairs from one group are not independent. The i.i.d. p-value is then invalid and is returned as
+    ``None``; ``n_groups`` records the number of resampled units.
+    """
     from scipy import stats as sps
 
     x = np.asarray(x, dtype=np.float64).reshape(-1)
@@ -501,8 +509,24 @@ def spearman_ci(x: Any, y: Any, rng: np.random.Generator, n_boot: int = 1000) ->
         raise ValueError(f"Spearman needs at least 3 pairs, got {n}")
     result = sps.spearmanr(x, y)
     rho, p = float(result.statistic), float(result.pvalue)
+    members: Optional[list] = None
+    if groups is not None:
+        labels = np.asarray(groups).reshape(-1)
+        if labels.shape != x.shape:
+            raise ValueError(f"groups shape {labels.shape} does not match the pairs {x.shape}")
+        _, inverse = np.unique(labels, return_inverse=True)
+        members = [np.flatnonzero(inverse == g) for g in range(int(inverse.max()) + 1)]
+        p = None
     boots = []
-    for start in range(0, n_boot, 200):
+    if members is not None:
+        for _ in range(n_boot):
+            idx = np.concatenate([members[g] for g in rng.integers(0, len(members), size=len(members))])
+            rx, ry = sps.rankdata(x[idx]), sps.rankdata(y[idx])
+            rx -= rx.mean()
+            ry -= ry.mean()
+            den = math.sqrt(float((rx * rx).sum() * (ry * ry).sum()))
+            boots.append(np.array([(rx * ry).sum() / den if den > 0.0 else np.nan]))
+    for start in range(0, n_boot if members is None else 0, 200):
         b = min(200, n_boot - start)
         idx = rng.integers(0, n, size=(b, n))
         rx = sps.rankdata(x[idx], axis=1)
@@ -515,8 +539,11 @@ def spearman_ci(x: Any, y: Any, rng: np.random.Generator, n_boot: int = 1000) ->
     boot = np.concatenate(boots)
     valid = boot[np.isfinite(boot)]
     lo, hi = (np.percentile(valid, [2.5, 97.5]) if valid.size else (np.nan, np.nan))
-    return {"rho": rho, "p": p, "ci_lo": float(lo), "ci_hi": float(hi), "n": int(n),
-            "n_boot_valid": int(valid.size)}
+    out = {"rho": rho, "p": p, "ci_lo": float(lo), "ci_hi": float(hi), "n": int(n),
+           "n_boot_valid": int(valid.size)}
+    if members is not None:
+        out["n_groups"] = len(members)
+    return out
 
 
 def bootstrap_mean_ci(values: Any, rng: np.random.Generator, n_boot: int = 1000) -> Dict[str, Any]:

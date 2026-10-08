@@ -118,7 +118,7 @@ def vfe_stack(
         tau_b = tau
         if capture is not None and layer_index == cfg.n_layers - 1:
             capture["final_block_prior"] = (mu_p.clone(), sigma_p.clone())
-            # Capture the exact base temperature used by the final block so reflection/two-hop
+            # Capture the exact base temperature used by the final block so reflection
             # scoring reuses the forward value. The scorer reads it under no_grad.
             capture["final_block_tau"] = tau_b
         hidden_bias = (block_mlp_hidden_biases[layer_index]

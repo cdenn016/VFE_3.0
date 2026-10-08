@@ -760,6 +760,12 @@ def minimal_agent_readout(
             if Rot is not None:
                 a0_r = torch.einsum("nst,...hnt->...hns", Rot, a0_r)
                 V_Q_r = _symmetrize(torch.einsum("nst,...hntu,nvu->...hnsv", Rot, V_Q_r, Rot))
+                # The rotation rounds, so the rotated covariance is factored again: a failure is a flag
+                # with the identity placeholder, as for the unrotated one (audit 2026-10-08).
+                with torch.no_grad():
+                    bad_Q_r = torch.linalg.cholesky_ex(V_Q_r)[1] != 0            # (..., H, N)
+                flags.append(bad_Q_r.any())
+                V_Q_r = torch.where(bad_Q_r[..., None, None], eye, V_Q_r)
             labels = mean_field_record_posterior(a0_r, V_Q_r, b, B_kl, lp, check=False)
             if Rot is not None:
                 # Label information back to receiver i's record frame: Lambda -> R_i^T Lambda R_i, eta -> R_i^T eta.

@@ -42,6 +42,11 @@ class PullbackGroupDirectionResult:
     # (...) bool, set only under reject_ill_conditioned_rows: rows whose metric passed the
     # undamped-eigenvalue floor and the damped-condition gate. Rejected rows carry v_phi = xi = 0.
     accepted_rows:                       Optional[torch.Tensor] = None
+    # (...) bool, optional: rows whose chart-retraction product-residual or descent failure that
+    # survives every backtrack is a per-row rejection (the row keeps its chart) rather than a raise.
+    # Set by the fisher_group chart route for rows with a block off the principal strip, where the
+    # chart velocity grows like 1/|Psi_R| near the exp singularity (audit 2026-10-08, geometer#1).
+    soft_reject_rows:                    Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -632,7 +637,12 @@ def _build_strict_block_preparations(
     for block, dimension in enumerate(irrep_dims):
         index = indices[block]
         if index.numel() == 0:
-            raise ValueError(f"pullback_per_block block {block} has no generators")
+            # A generator-free block (an untied so_n 'l0' trivial irrep) carries no phi coordinates and
+            # the group acts on it as the identity: it contributes nothing to the metric, so it is
+            # skipped exactly (audit 2026-10-08, hotspot-4#1). Callers detect the skip from
+            # len(preparations) < len(irrep_dims).
+            matrix_start += dimension
+            continue
         local_basis = basis[index][
             :,
             matrix_start:matrix_start + dimension,
@@ -1000,6 +1010,7 @@ def _pullback_group_direction_per_block(
         and grad_64.shape[:-1] == phi_64.shape[:-1]
         and not generators.requires_grad
         and len(preparations) > 1
+        and len(preparations) == len(irrep_dims)
         and len(set(irrep_dims)) == 1
         and all(preparation.matches_first_basis for preparation in preparations)
     )
@@ -1096,9 +1107,10 @@ def _pullback_group_direction_per_block(
             dim=0,
         )
         series_order = max(result.series_order for result in local_results)
+        # A skipped generator-free block has no local exp(phi), so the stager rebuilds the dense one.
         current_element = (
             torch.stack([result.current_element for result in local_results], dim=-3)
-            if len(set(irrep_dims)) == 1 else None
+            if len(set(irrep_dims)) == 1 and len(preparations) == len(irrep_dims) else None
         )
     min_undamped = local_min_undamped.amin(dim=0)
     max_undamped = local_max_undamped.amax(dim=0)
@@ -1203,7 +1215,10 @@ def _generator_block_index(
 
 
 # Off-strip Psi inversion gate (audit 2026-10-07, F21): eigenvector condition, eigen-residual and the smallest
-# |Psi(lambda_i - lambda_j)| of an accepted row.
+# |Psi(lambda_i - lambda_j)| of an accepted row. The accuracy gate is the module's own spectral budget
+# gamma_(8d) kappa_F(V)^2 + kappa_F(V)^2 * eig_residual <= _PHI_GROUP_SPECTRAL_ROUNDOFF_BUDGET, as in
+# _spectral_phi_differentials (audit 2026-10-08, hotspot-4#3): the condition cap alone admitted kappa
+# up to 1e8, where accepted rows lost up to ~1e-4 relative accuracy; the cap is kept as a backstop.
 _SPECTRAL_PSI_COND_MAX = 1e8
 _SPECTRAL_PSI_RESIDUAL_MAX = 1e-10
 _SPECTRAL_PSI_MIN = 1e-8
@@ -1224,8 +1239,10 @@ def _spectral_psi_inverse(
 
     This is exact whenever :math:`\Psi(\mathrm{ad}_A)` is invertible, i.e. no eigenvalue difference lies in
     :math:`2\pi i\mathbb Z\setminus\{0\}`, whether or not :math:`A` is on the principal strip. A row is accepted
-    only if its eigenvectors are well conditioned, its eigen-residual is small, every :math:`|\Psi|` is bounded
-    away from zero, and :math:`Z` is real to roundoff; otherwise it is rejected with a zero solution.
+    only if its eigenvector condition and eigen-residual meet the module's spectral budget,
+    :math:`\kappa_F(V)^2(\gamma_{8d} + r_{\mathrm{eig}}) \le 10^{-10}` (the screen of
+    :func:`_spectral_phi_differentials`), every :math:`|\Psi|` is bounded away from zero, and :math:`Z` is
+    real to roundoff; otherwise it is rejected with a zero solution.
     """
     lam, V = torch.linalg.eig(A)                                          # (n, d), (n, d, d) complex
     V_inv, info = torch.linalg.inv_ex(V)
@@ -1239,7 +1256,12 @@ def _spectral_psi_inverse(
     kappa = norm(V) * norm(V_inv)
     residual = norm(A.to(V.dtype) @ V - V * lam[..., None, :]) / (norm(A).clamp_min(1e-300) * norm(V))
     imaginary = norm(Z_complex.imag) / norm(Z).clamp_min(1e-300)
+    unit_roundoff = torch.finfo(A.dtype).eps / 2.0
+    operations = 8 * A.shape[-1]
+    gamma = operations * unit_roundoff / (1.0 - operations * unit_roundoff)
+    spectral_error = kappa.square() * (gamma + residual)                  # (n,) roundoff + eig error
     ok = ((info == 0) & (kappa < _SPECTRAL_PSI_COND_MAX) & (residual < _SPECTRAL_PSI_RESIDUAL_MAX)
+          & (spectral_error <= _PHI_GROUP_SPECTRAL_ROUNDOFF_BUDGET)
           & (psi_abs.amin(dim=(-2, -1)) > _SPECTRAL_PSI_MIN) & (imaginary < 1e-8)
           & torch.isfinite(Z).all(dim=-1).all(dim=-1))
     return torch.where(ok[..., None, None], Z, torch.zeros_like(Z)), ok

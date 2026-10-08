@@ -82,7 +82,14 @@ def gap_applicability(model: torch.nn.Module) -> Optional[str]:
         return "the prior bank has no stored log-variance table"
     if any(getattr(op, "mixed_heads", False) for op in getattr(model, "relational_operators_by_layer", ()) or ()):
         return "heads of different sizes (a mixed so_n irrep tower) are not supported by this analysis yet"
+    if getattr(model.cfg, "relational_routing", "gaussian_kl") == "mean_distance":
+        return _MEAN_DISTANCE_REASON
     return None
+
+
+# relational_routing='mean_distance' scores 0.5 ||a_i - b_j||^2 and reads no projected covariance.
+_MEAN_DISTANCE_REASON = ("relational_routing='mean_distance': the routing cost reads only the projected means, "
+                         "so C_i is not a routing covariance on this route")
 
 
 @torch.no_grad()
@@ -217,7 +224,7 @@ def _window_batches(dataset: Any, indices: np.ndarray, batch: int) -> "Any":
         N = inputs.shape[1]
         starts = np.array([window_start(dataset, int(w)) for w in windows], dtype=np.int64)
         keep = (torch.ones(inputs.shape, dtype=torch.bool) if stream is None else
-                torch.as_tensor(starts[:, None] + np.arange(N)[None, :] < int(stream.numel())))   # (B, N)
+                torch.as_tensor(starts[:, None] + np.arange(N)[None, :] < int(stream.numel()) - 1))   # (B, N)
         yield inputs, keep
 
 
@@ -369,6 +376,9 @@ def hidden_temperature(
         return {"status": "not_applicable",
                 "reason": "predictive_readout='minimal_agent': the learned channel noise n_h breaks the kernel "
                           "route's 1/c scaling that defines the hidden temperature"}
+    if getattr(model.cfg, "relational_routing", "gaussian_kl") == "mean_distance":
+        return {"status": "not_applicable",
+                "reason": _MEAN_DISTANCE_REASON + "; it has no Mahalanobis term for Sigma -> c Sigma to rescale"}
     pb = model.prior_bank
     if not hasattr(pb, "sigma_log_embed"):
         return {"status": "not_applicable", "reason": "the prior bank has no stored log-variance table"}
