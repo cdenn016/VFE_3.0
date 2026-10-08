@@ -313,6 +313,9 @@ class VFE3Config:
     bch_residual_max:                 Optional[float] = None         # manifold phi M-step only: group-product residual gate, min(1e-6, value); None = 1e-6 (tightens only)
     
     rope_base:                        float           = 100.0        # rope only: frequency base
+    # rope only: p-RoPE fraction p in (0, 1] (Barbero et al., ICLR 2025): only the floor(p d / 2) fastest
+    # pairs of each block rotate, at their full-RoPE frequencies; the slower pairs stay position-free. 1.0 = RoPE.
+    rope_fraction:                    float           = 1.0
     # "frame" | "comparison"
     # rope only: where the rotation acts.
     #   frame       folded into each frame, V_i = U_i R_i^T, before the learned maps (absolute-position routing)
@@ -768,6 +771,9 @@ class VFE3Config:
             raise ValueError(f"kl_max must be positive (infinity disables the ceiling), got {self.kl_max}")
         if not (math.isfinite(self.rope_base) and self.rope_base > 0.0):
             raise ValueError(f"rope_base must be finite and positive, got {self.rope_base}")
+        if (isinstance(self.rope_fraction, bool) or not isinstance(self.rope_fraction, Real)
+                or not 0.0 < float(self.rope_fraction) <= 1.0):
+            raise ValueError(f"rope_fraction must be a real value in (0, 1], got {self.rope_fraction!r}")
         if not (math.isfinite(self.alibi_slope) and self.alibi_slope >= 0.0):
             raise ValueError(f"alibi_slope must be finite and nonnegative, got {self.alibi_slope}")
         for name in ("mu_init_std", "phi_scale"):
@@ -1232,6 +1238,13 @@ class VFE3Config:
         # rho(SO(N)) inside GL(K), so R Omega R^T leaves the SELECTED structure group
         # (GL(K)-congruence invariance survives).
         _require(self.rope_space, ("frame", "comparison"), "rope_space")
+        if self.pos_rotation == "rope":
+            # p-RoPE rotates floor(p d / 2) pairs of each block (frame space: each irrep block; comparison
+            # space: each head's comparison block, also of the head size); none rotated is NoPE, not p-RoPE.
+            empty = sorted({d for d in self.head_dims if d >= 2 and int(float(self.rope_fraction) * d // 2) == 0})
+            if empty:
+                raise ValueError(f"rope_fraction={self.rope_fraction} rotates no pair of blocks of size {empty}; "
+                                 "raise it or use pos_rotation='none'")
         if self.pos_rotation == "rope" and self.rope_space == "comparison":
             problems = []
             if self.attention_mode != "projected_predictive":
@@ -1850,7 +1863,7 @@ class VFE3Config:
         else:
             mark(("lambda_alpha",), "only read by lambda_alpha_mode='constant'")
         if self.pos_rotation == "none":
-            mark(("rope_on_value", "rope_base", "rope_space"), "only read by pos_rotation='rope'")
+            mark(("rope_on_value", "rope_base", "rope_space", "rope_fraction"), "only read by pos_rotation='rope'")
         if self.pos_phi == "none":
             mark(("pos_phi_project_slk",), "only read by a non-'none' pos_phi")
         if (self.beta_attention_prior in ("windowed", "causal_windowed")

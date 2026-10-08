@@ -120,7 +120,8 @@ _INT_FIELDS: Tuple[str, ...] = (
 )
 _FLOAT_FIELDS: Tuple[str, ...] = (
     "lr", "weight_decay", "adam_beta1", "adam_beta2", "adam_eps", "min_lr", "min_lr_frac",
-    "init_std", "layernorm_eps", "alibi_slope", "rope_base", "unigram_kappa", "per_type_table_init_scale",
+    "init_std", "layernorm_eps", "alibi_slope", "rope_base", "rope_fraction", "unigram_kappa",
+    "per_type_table_init_scale",
 )
 _OPTIONAL_FLOAT_FIELDS: Tuple[str, ...] = ("grad_clip", "per_type_table_lr", "per_type_table_weight_decay")
 _BOOL_FIELDS: Tuple[str, ...] = (
@@ -200,6 +201,7 @@ class BaselineConfig:
     # "none" | "rope": rotary query/key positions per head (the VFE's comparison-space RoPE).
     pos_rotation:          str           = "none"
     rope_base:             float         = 100.0       # rope only: frequency base
+    rope_fraction:         float         = 1.0         # rope only: p-RoPE fraction of rotated pairs per head
     # Decode (the VFE linear decoder).
     decode_mode:           str           = "linear"
     decode_bias:           bool          = True
@@ -279,6 +281,8 @@ class BaselineConfig:
             raise ValueError(f"pos_rotation must be one of {POS_ROTATIONS}, got {self.pos_rotation!r}")
         if not (math.isfinite(self.rope_base) and self.rope_base > 1.0):
             raise ValueError(f"rope_base must be a finite value > 1, got {self.rope_base!r}")
+        if not 0.0 < self.rope_fraction <= 1.0:
+            raise ValueError(f"rope_fraction must be in (0, 1], got {self.rope_fraction!r}")
         if self.decode_mode != "linear":
             raise ValueError(f"the baseline decodes linearly; decode_mode must be 'linear', got {self.decode_mode!r}")
         if self.decode_ce_checkpoint not in DECODE_CE_CHECKPOINTS:
@@ -373,6 +377,7 @@ class BaselineConfig:
             out["unigram_kappa"] = "decode_unigram_prior=False adds no unigram prior"
         if self.pos_rotation == "none":
             out["rope_base"] = "only read by pos_rotation='rope'"
+            out["rope_fraction"] = "only read by pos_rotation='rope'"
         return out
 
     # -- matched arm ---------------------------------------------------------------------------
@@ -435,6 +440,7 @@ class BaselineConfig:
         derived["decode_bias"] = (bool(values["decode_bias"]) if values["decode_mode"] == "linear" else True)
         derived["pos_rotation"] = "rope" if values.get("pos_rotation") == "rope" else "none"
         derived["rope_base"] = float(values.get("rope_base", 100.0))
+        derived["rope_fraction"] = float(values.get("rope_fraction", 1.0))
         derived["per_type_table"] = per_type_table
         phi_scale = values.get("phi_scale")
         if isinstance(phi_scale, (int, float)) and not isinstance(phi_scale, bool) and phi_scale > 0:
@@ -838,11 +844,12 @@ class BaselineTransformer(nn.Module):
             return None
         from vfe3.geometry.rope import build_rope_rotation
 
-        key = ("rope", self.cfg.rope_base, int(n), str(device), self.cfg.d_head)
+        key = ("rope", self.cfg.rope_base, self.cfg.rope_fraction, int(n), str(device), self.cfg.d_head)
         cached = self._log_prior_cache.get(key)
         if cached is None:
             cached = build_rope_rotation(torch.arange(int(n), device=device), [self.cfg.d_head],
-                                         base=self.cfg.rope_base, device=device, dtype=torch.float32)
+                                         base=self.cfg.rope_base, fraction=self.cfg.rope_fraction,
+                                         device=device, dtype=torch.float32)
             self._log_prior_cache[key] = cached
         return cached
 

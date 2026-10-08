@@ -65,6 +65,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'pos_phi_project_slk': False,
     'pos_rotation': 'none',
     'rope_base': 100.0,
+    'rope_fraction': 1.0,
     'rope_space': 'frame',
     'rope_on_value': True,
     'attention_mode': 'projected_gradient',

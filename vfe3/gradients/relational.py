@@ -103,12 +103,13 @@ def relational_score(
             # unrotated L, so it is disabled here; a failed or ill-conditioned factor then takes the whole-tensor
             # float64 refactor of the rotated G.
             r = S_q.shape[-2]
+            fraction = getattr(operators, "comparison_rope_fraction", 1.0)
             from vfe3.geometry.rope import build_rope_rotation
-            R_q = build_rope_rotation(torch.arange(a_q.shape[-3], device=a_q.device), [r],
-                                      base=rope_base, device=a_q.device, dtype=a_q.dtype)      # (N, r, r)
+            R_q = build_rope_rotation(torch.arange(a_q.shape[-3], device=a_q.device), [r], base=rope_base,
+                                      fraction=fraction, device=a_q.device, dtype=a_q.dtype)  # (N, r, r)
             R_k = R_q if a_k.shape[-3] == a_q.shape[-3] else build_rope_rotation(
-                torch.arange(a_k.shape[-3], device=a_k.device), [r], base=rope_base, device=a_k.device,
-                dtype=a_k.dtype)
+                torch.arange(a_k.shape[-3], device=a_k.device), [r], base=rope_base, fraction=fraction,
+                device=a_k.device, dtype=a_k.dtype)
             a_q = torch.einsum("nst,...nht->...nhs", R_q, a_q)
             a_k = torch.einsum("nst,...nht->...nhs", R_k, a_k)
             G_q = torch.einsum("nst,...nhtu,nvu->...nhsv", R_q, G_q, R_q)
