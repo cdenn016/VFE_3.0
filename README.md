@@ -111,6 +111,20 @@ moment-matched covariance (the moment projection onto diagonal Gaussians) while
 `gaussian_full` keeps it dense, so the two families compute different functions; they
 coincide only when no seam densifies the covariance (see the configuration section below).
 
+`family="gaussian_block"` keeps one SPD $d\times d$ covariance block per head, the smallest
+SPD family closed under the block_glk congruence. It is stored in the dense $(K, K)$ layout
+with zero off-head blocks, and the moment-matched update returns the head blocks
+$U_{i,h}[C_i^{\mathrm{att}}]_{hh}U_{i,h}^\top$, the moment projection onto the family, which
+does not depend on the frame. It is defined on the kernel predictive readout with per-head
+block_glk frames, edge links off, a passthrough block MLP, and the `linear`,
+`diagonal_chunked` or `full_chunked` decoders (the diagonal decoder reads
+$\operatorname{diag}\Sigma_i$, exact up to a per-position constant). With identity frames
+(`gauge_transport="off"`), `prior_covariance_table="block_cholesky"` replaces the diagonal
+variance table by per-type head blocks $C_{vh}=L_{vh}L_{vh}^\top$ (log-diagonal Cholesky,
+`sigma_chol_embed`), so that `mu_embed` and the blocks hold $(\xi_v, C_v)$ and the model
+represents what the learned-frame reference arm represents without a frame table; it
+needs a full-layout family and an untied decode bank (or the linear decoder).
+
 ### Whom to listen to: query and key
 
 A receiving agent decides whom to hear by comparing what it asks with how each sender
@@ -478,6 +492,8 @@ the validator for the complete admission rules.
 | `family="gaussian_diagonal"` | Keeps the diagonal of the local moment-matched covariance; `gaussian_full` keeps it dense, so the two differ on this route; see below. |
 | `encode_mode="per_token_additive"` | Capacity-matched $\Omega=I$ control; requires `pos_phi="none"`, and either `pos_rotation="none"` or comparison-space RoPE (`rope_space="comparison"`). |
 | `routing_kl_max_reference` | Projected kernel router only. `"absolute"` (default) clamps $D_{ij}$ at `kl_max`; `"row_min"` clamps the detached row gap $D_{ij}-\min_{j\,\mathrm{admissible}}D_{ij}$, which leaves $\beta$ the exact softmax wherever no gap reaches `kl_max` and keeps the cost order of a row whose every cost exceeds it. |
+| `learn_attention_temperature` | Default `False`. `True` learns $\tau_{\ell,h}=\kappa_h\sqrt{d_h}\exp(\mathrm{clamp}(\delta_{\ell,h},-3,3))$ per layer and head (`routing_log_temperature`, zero at initialization, no weight decay, score learning rate) on both projected routes. It acts after the `kl_max` clamp, so a fully capped absolute-reference row stays uniform. Not with `predictive_readout="minimal_agent"`. |
+| `tie_comparison_maps` | Default `False`. `True` sets $S_K:=S_Q$ (no `raw_score_k`) on the `projected_predictive` kernel readout, so $D_{ii}=0$ and the flat-alignment case $D_{ij}=D_{\mathrm{KL}}(q_i\Vert(\Omega_{ij})_*q_j)$ under one map is testable. |
 | `block_mlp_post_norm` | Default `False`. `True` reapplies the block norm to the post-MLP mean, so the next router reads a normalized mean; requires `block_coordinates="local"`, a block norm and a block MLP. |
 
 Relational rates of `None` inherit `m_p_mu_lr`; `0.0` freezes that role's

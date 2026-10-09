@@ -277,7 +277,8 @@ def test_evaluate_returns_finite_ppl_bpc_consistent_with_ce():
     loader = _periodic_loader(seed=0)
     m = evaluate(model, loader, tokens_per_char=1.0)
     assert set(m.keys()) == {"ce", "ppl", "bits_per_token", "bpc",
-                                  "expected_targets", "scored_targets", "excluded_targets"}
+                                  "expected_targets", "scored_targets", "excluded_targets",
+                                  "overlap_context_targets", "padding_targets"}
     assert all(math.isfinite(v) for v in m.values())
     assert m["expected_targets"] == m["scored_targets"] + m["excluded_targets"]
     assert m["ppl"] == pytest.approx(math.exp(m["ce"]))
@@ -317,7 +318,8 @@ def test_evaluate_weights_by_decoder_scored_tokens_and_preserves_result_keys():
     ]
     result = evaluate(model, loader)
     assert set(result) == {"ce", "ppl", "bits_per_token", "bpc",
-                                  "expected_targets", "scored_targets", "excluded_targets"}
+                                  "expected_targets", "scored_targets", "excluded_targets",
+                                  "overlap_context_targets", "padding_targets"}
     assert result["ce"] == pytest.approx(3.5)
     assert result["expected_targets"] == 8
     assert result["scored_targets"] == 4
@@ -545,9 +547,9 @@ def _install_clip_spy(monkeypatch):
     def spy(parameters, max_norm, *args, **kwargs):
         params = list(parameters)
         calls.append(({id(p) for p in params}, float(max_norm)))
-        return torch.tensor(0.0)
 
-    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", spy)
+    # train_step clips by get_total_norm (before its fused host transfer) + clip_grads_with_norm_.
+    monkeypatch.setattr(torch.nn.utils, "clip_grads_with_norm_", spy)
     return calls
 
 
@@ -598,7 +600,7 @@ def test_omitted_grad_clip_matches_explicit_one(monkeypatch):
     right.load_state_dict(left.state_dict())
     right_opt.load_state_dict(left_opt.state_dict())
     right_sched.load_state_dict(left_sched.state_dict())
-    original = torch.nn.utils.clip_grad_norm_
+    original = torch.nn.utils.clip_grads_with_norm_
     calls = []
 
     def tracked(parameters, max_norm, *args, **kwargs):
@@ -606,7 +608,7 @@ def test_omitted_grad_clip_matches_explicit_one(monkeypatch):
         calls.append((len(params), float(max_norm)))
         return original(params, max_norm, *args, **kwargs)
 
-    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", tracked)
+    monkeypatch.setattr(torch.nn.utils, "clip_grads_with_norm_", tracked)
     train_step(left, left_opt, left_sched, tokens, targets)
     split = len(calls)
     train_step(right, right_opt, right_sched, tokens, targets, grad_clip=1.0)

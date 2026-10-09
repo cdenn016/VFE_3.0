@@ -780,7 +780,7 @@ def retract_spd_affine(
     eps:          float          = 1e-6,
     sigma_max:    Optional[float] = 10.0,   # matches VFE3Config.sigma_max
 ) -> torch.Tensor:                          # (...) same rank as sigma
-    r"""Affine-invariant SPD retraction (the manuscript-canonical default, GL(K)_supplementary.tex:640-645).
+    r"""Affine-invariant SPD retraction (the default; Pennec, Fillard and Ayache, Int. J. Comput. Vision 66(1), 2006, Sec. 3.3).
 
     The single registered home for the rank dispatch the E-step used to perform inline: a full
     covariance (sigma.dim() == mean_ndim + 1) steps along the affine-invariant geodesic via

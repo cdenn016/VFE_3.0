@@ -161,6 +161,74 @@ class BlockMLPMomentResult(NamedTuple):
     jacobian: Optional[torch.Tensor]
 
 
+def layernorm_jacobian(
+    mu:     torch.Tensor,                             # (..., K) pre-norm means
+    *,
+    eps:    float,
+    weight: Optional[torch.Tensor] = None,            # (K,) affine gamma, or None for the plain norm
+) -> torch.Tensor:                                    # (..., K, K) d LN(mu) / d mu
+    r"""Exact Jacobian of the block LayerNorm :math:`y = \gamma\odot z + b` at ``mu``.
+
+    With :math:`\bar u = \tfrac1K\sum_k u_k`, the biased variance :math:`v = \tfrac1K\sum_k(u_k-\bar u)^2`,
+    :math:`s = \sqrt{v+\epsilon}` and :math:`z = (u - \bar u\mathbf 1)/s` (the standardization of
+    :func:`vfe3.geometry.norms._ln_standardize`, eps inside the square root),
+    :math:`\partial s/\partial u_j = (u_j - \bar u)/(Ks)`, so
+
+    .. math::
+        J = \operatorname{diag}(\gamma)\,\frac{1}{s}\Bigl(I - \tfrac1K\mathbf 1\mathbf 1^\top - \tfrac1K zz^\top\Bigr),
+
+    exact for every :math:`\epsilon` (:math:`z^\top z = Kv/(v+\epsilon) < K`). The shift :math:`b` does not enter.
+    Evaluated with autocast off at ``promote_types(mu.dtype, float32)``, the precision the norm itself runs at.
+    """
+    dtype = torch.promote_types(mu.dtype, torch.float32)
+    K = mu.shape[-1]
+    with torch.autocast(device_type=mu.device.type, enabled=False):
+        work = mu.to(dtype)
+        centered = work - work.mean(dim=-1, keepdim=True)                         # (..., K)
+        s = (centered.square().mean(dim=-1, keepdim=True) + eps).sqrt()         # (..., 1)
+        z = centered / s                                                        # (..., K)
+        eye = torch.eye(K, dtype=dtype, device=mu.device)
+        J = (eye - 1.0 / K - z.unsqueeze(-1) * z.unsqueeze(-2) / K) / s.unsqueeze(-1)   # (..., K, K)
+        if weight is not None:
+            J = weight.to(dtype).unsqueeze(-1) * J                              # diag(gamma) J
+    return J
+
+
+def block_norm_jacobian(
+    norm: Callable[..., torch.Tensor],
+    mu:   torch.Tensor,                               # (..., K) pre-norm means
+) -> torch.Tensor:                                    # (..., K, K)
+    r"""Jacobian of a block LayerNorm seam (plain or affine) at ``mu``; see :func:`layernorm_jacobian`.
+
+    Only the LayerNorm seams have this closed form here; the Mahalanobis norm reads the covariance and is
+    refused, so ``block_mlp_covariance='delta_full'`` never pushes a covariance through a norm whose
+    Jacobian it omits.
+    """
+    from vfe3.geometry.norms import AffineLayerNorm, LayerNorm
+    if isinstance(norm, AffineLayerNorm):
+        return layernorm_jacobian(mu, eps=norm.eps, weight=norm.weight)
+    if isinstance(norm, LayerNorm):
+        return layernorm_jacobian(mu, eps=norm.eps)
+    raise ValueError(f"the delta_full block pushforward has the norm Jacobian of the LayerNorm seams only, "
+                     f"got {type(norm).__name__}")
+
+
+def _compose_input_jacobian(
+    jacobian:       torch.Tensor,                     # (..., K, K) J of the MLP at its input
+    input_jacobian: Optional[torch.Tensor],           # (..., K, K) J of the map feeding the MLP, or None
+) -> torch.Tensor:                                    # (..., K, K) chain rule J J_in
+    r"""Chain rule :math:`J_{\mathrm{MLP}}J_{\mathrm{in}}` for a map (the block norm) applied before the MLP."""
+    if input_jacobian is None:
+        return jacobian
+    return torch.einsum("...ij,...jk->...ik", jacobian, input_jacobian.to(jacobian.dtype))
+
+
+def _reject_input_jacobian(input_jacobian: Optional[torch.Tensor], contract: str) -> None:
+    if input_jacobian is not None:
+        raise ValueError(f"input_jacobian composes the delta_full pushforward; covariance contract "
+                         f"{contract!r} pushes no covariance")
+
+
 def _delta_covariance(
     jacobian: torch.Tensor,
     sigma: torch.Tensor,
@@ -240,11 +308,20 @@ class BlockMLP(nn.Module):
         *,
         frame_context: Optional[CanonicalFrameContext] = None,
         hidden_bias: Optional[torch.Tensor] = None,    # (..., w), w <= H: per-token fc1 bias
+        input_jacobian: Optional[torch.Tensor] = None, # (..., K, K) Jacobian of the block norm before the MLP
     ) -> BlockMLPMomentResult:
+        r"""Mean update and covariance under the contract; ``delta_full`` gives :math:`J\Sigma J^\top + f\Sigma`.
+
+        With ``input_jacobian`` :math:`J_{\mathrm{in}}` (the block norm's Jacobian at the pre-norm mean) the
+        Jacobian is the composite :math:`J = J_{\mathrm{MLP}}J_{\mathrm{in}}` and ``sigma`` is the pre-norm
+        covariance, so the pushforward is that of MLP∘norm.
+        """
         del frame_context
         if self.covariance_contract == "passthrough":
+            _reject_input_jacobian(input_jacobian, self.covariance_contract)
             return BlockMLPMomentResult(self.forward(mu, hidden_bias=hidden_bias), sigma, None)
         mu_out, jacobian = self._coordinate_update_with_jacobian(mu, hidden_bias)
+        jacobian = _compose_input_jacobian(jacobian, input_jacobian)
         return BlockMLPMomentResult(
             mu_out, _delta_covariance(jacobian, sigma, self.covariance_floor), jacobian)
 
@@ -419,6 +496,7 @@ class GaugeGateBlockMLP(nn.Module):
         *,
         frame_context: Optional[CanonicalFrameContext] = None,
         hidden_bias: Optional[torch.Tensor] = None,
+        input_jacobian: Optional[torch.Tensor] = None,  # (..., K, K) block-norm Jacobian (delta_full only)
     ) -> BlockMLPMomentResult:
         del frame_context
         _reject_hidden_bias(
@@ -426,6 +504,8 @@ class GaugeGateBlockMLP(nn.Module):
             "the gauge_gate fc1 acts on the per-block Mahalanobis invariants, not on a coordinate "
             "hidden layer")
         need_jacobian = self.covariance_contract == "delta_full"
+        if not need_jacobian:
+            _reject_input_jacobian(input_jacobian, self.covariance_contract)
         if need_jacobian and _is_diagonal_layout(mu, sigma):
             raise ValueError(
                 "gauge_gate covariance_contract='delta_full' needs the full (..., K, K) covariance "
@@ -463,6 +543,8 @@ class GaugeGateBlockMLP(nn.Module):
                     jacobian[..., row_start:row_stop, col_start:col_stop] + cross
                 col_start = col_stop
             row_start = row_stop
+        # The gate reads sigma as a fixed parameter of its invariants; the chain rule covers the mean map only.
+        jacobian = _compose_input_jacobian(jacobian, input_jacobian)
         return BlockMLPMomentResult(
             mu_out,
             _delta_covariance(jacobian, sigma.to(jacobian.dtype), self.covariance_floor),
@@ -503,11 +585,13 @@ class CanonicalFrameBlockMLP(BlockMLP):
         *,
         frame_context: Optional[CanonicalFrameContext] = None,
         hidden_bias: Optional[torch.Tensor] = None,
+        input_jacobian: Optional[torch.Tensor] = None,  # (..., K, K) block-norm Jacobian (delta_full only)
     ) -> BlockMLPMomentResult:
         frame_context = _require_canonical_frame_context(frame_context)
         apply = _frame_action(frame_context, mu)
         canonical_mu = apply(frame_context.inverse, mu)
         if self.covariance_contract == "passthrough":
+            _reject_input_jacobian(input_jacobian, self.covariance_contract)
             canonical_out = super().forward(canonical_mu, hidden_bias=hidden_bias)
             mu_out = apply(frame_context.forward, canonical_out)
             return BlockMLPMomentResult(mu_out, sigma, None)
@@ -523,6 +607,7 @@ class CanonicalFrameBlockMLP(BlockMLP):
             realized_jacobian = (
                 frame_context.forward @ canonical_jacobian.double() @ frame_context.inverse
             ).to(canonical_jacobian.dtype)
+        realized_jacobian = _compose_input_jacobian(realized_jacobian, input_jacobian)
         return BlockMLPMomentResult(
             mu_out,
             _delta_covariance(realized_jacobian, sigma, self.covariance_floor),

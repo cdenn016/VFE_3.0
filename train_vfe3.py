@@ -105,6 +105,7 @@ config = dict(
 
     max_seq_len                      = 128,                 # N, context length
     eval_stride                      = 32,
+    train_window_offset              = "fixed",     # "fixed" | "per_epoch_random" (a new window origin in [0, N) each epoch; resume-exact)
 
     batch_size                       = 32,
     max_steps                        = 30000,
@@ -123,13 +124,16 @@ config = dict(
     #################################
     #           Modes               #
     #################################
-    family                           = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full" | "laplace_diagonal"
+    family                           = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full" | "gaussian_block" (per-head SPD blocks; block_glk, kernel readout) | "laplace_diagonal"
+    prior_covariance_table           = "diagonal",  # "diagonal" | "block_cholesky" (frame-free (xi, C) table: gaussian_block/full, gauge_transport="off", untie_decode_bank)
     encode_mode                      = "per_token",   # "per_token" | "per_token_additive" (additive only when phi carries no position)
     decode_mode                      = 'linear',  # "linear" | "diagonal_chunked" | "full_chunked" | "expected_likelihood_chunked" | "family_chunked" (the *_chunked modes decode through the prior bank)
         
     attention_mode                   = "projected_predictive",  # "projected_predictive" | "projected_gradient"
     predictive_covariance            = 'moment_matched',  # "passthrough"| "moment_matched" (exact predictive-kernel covariance)
     content_link_chart               = "exponential",        # "affine" Oh'=Oh | "first_order" Oh'=T^-1+Oh | "exponential" Oh'=T^-1+Oh phi_1(TOh)=e^{OhT}T^-1 
+        
+    tie_comparison_maps              = False,           # S_K := S_Q (kernel readout): D_ii = 0, flat-alignment routing
         
     relational_routing               = "gaussian_kl",           # "gaussian_kl" | "noisy_query" (noisy_query: projected_predictive only)
     relational_receiver_law          = "channel_likelihood",  # "channel_likelihood" | "ambient_alignment" (projected_gradient only)
@@ -242,6 +246,7 @@ config = dict(
     ########################################
     lambda_beta                      = 1.0,        # belief-coupling block weight (1.0 = pure F)
     kappa_beta                       = 1,        # tau = kappa * sqrt(d_head)
+    learn_attention_temperature      = False,    # learn a per-layer, per-head log-temperature offset (starts at tau above)
     
     beta_attention_prior             = 'causal',    # "causal" | "causal_noself" | "causal_alibi" | "causal_alibi_noself" | "causal_windowed" | "t5_relative_bias" | "uniform" | "alibi" | "windowed" (the last three are not causal)
     

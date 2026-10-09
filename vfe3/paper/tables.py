@@ -10,7 +10,10 @@ carries the same cells plus the source of every number; ``rows`` is the machine-
   :math:`\pm` SD over seeds (ddof = 1), and training-only device-hours per run (the quantity the
   compute-matched arm matches; wall time beside it in the markdown).
 * :func:`decision_rule_table`: the registered decision rule of the frame claim, from seed-paired
-  test-CE differences (mean, paired standard error and the margin :math:`\max(2\,\mathrm{SE}, 0.03)`).
+  test-CE differences (mean, paired standard error and the margin :math:`\max(2\,\mathrm{SE}, 0.03)`,
+  with the one-sided paired-t p-value and the t-based 95% interval reported beside it); a clause whose
+  arms the manifest flags (unverified, stale, non-homogeneous, other code) is undetermined. Clause (c),
+  the equal-size per-type table, is the dated amendment of October 9, 2026.
 * :func:`per_seed_table`: ``tab:placeholder_per_seed``. Per run: model and data-order seed, selected
   step, validation CE, test CE and PPL under the declared selection rule.
 * :func:`relational_run_table`: ``tab:relational_run`` for the evaluated run.
@@ -386,6 +389,11 @@ def paired_difference(evaluated: Arm, other: Arm, rule: str) -> Dict[str, Any]:
     for :math:`n < 2`), and the registered margin is
     :math:`m = \max(2\,\mathrm{SE}, 0.03\ \mathrm{nats})` (None without an SE). A positive
     :math:`\bar d` means the evaluated arm has the lower test CE.
+
+    Reported beside the margin (the rule is unchanged): the paired-t statistic
+    :math:`t = \bar d / \mathrm{SE}` on :math:`n - 1` degrees of freedom, its one-sided p-value
+    :math:`p = P(T_{n-1} \ge t)` against :math:`H_0: \mathbb{E} d \le 0`, and the 95% interval
+    :math:`\bar d \pm t_{0.975,\,n-1}\,\mathrm{SE}` (None while :math:`\mathrm{SE}` is None or zero).
     """
     a, unpaired_a = _selected_by_pair(evaluated, rule)
     b, unpaired_b = _selected_by_pair(other, rule)
@@ -394,24 +402,68 @@ def paired_difference(evaluated: Arm, other: Arm, rule: str) -> Dict[str, Any]:
     mean, sd = mean_sd(diffs)
     se = sd / math.sqrt(len(diffs)) if sd is not None else None
     margin = max(DECISION_SE_MULTIPLE * se, DECISION_MARGIN_NATS) if se is not None else None
+    t_stat = p_one_sided = ci95 = None
+    if se is not None and se > 0:
+        from scipy.stats import t as student_t
+
+        dof = len(diffs) - 1
+        t_stat = mean / se
+        p_one_sided = float(student_t.sf(t_stat, dof))
+        half = float(student_t.ppf(0.975, dof)) * se
+        ci95 = [mean - half, mean + half]
     unmatched = sorted(set(a) ^ set(b))
     return {"pairs": [list(p) for p in pairs], "differences": diffs, "n": len(diffs), "mean": mean,
-            "sd": sd, "se": se, "margin": margin, "unmatched_seed_pairs": [list(p) for p in unmatched],
-            "unpaired_runs": unpaired_a + unpaired_b}
+            "sd": sd, "se": se, "margin": margin, "t": t_stat, "p_one_sided": p_one_sided, "ci95": ci95,
+            "unmatched_seed_pairs": [list(p) for p in unmatched], "unpaired_runs": unpaired_a + unpaired_b}
 
 
 # The registered rule (GL(K)_attention_v2.tex, "We fix in advance that the frame claim is retracted if
 # the realization does not beat the per-type read-table transformer by more than the larger of two
 # paired standard errors and 0.03 nats at K=128, or if freezing the frames at initialization costs less
-# than that margin"). Its comparator is the per-type read-table run of sec:param_accounting, which used
-# ALiBi; paper_arms.py repeats it as "Per-type read table, ALiBi (as run)".
+# than that margin"). paper_arms.py resolves the comparator from the base's positional scheme and writes
+# it into the manifest's decision record; DECISION_COMPARATOR (the per-type read-table run of
+# sec:param_accounting, which used ALiBi) is the fallback for manifests without one.
+# Amendment of October 9, 2026, registered before any arm result: clause (c) also retracts the claim
+# unless the evaluated arm beats the capacity control DECISION_CAPACITY (identity frames with a trainable
+# per-type additive table of the frame table's size) by the same margin, strictly as clause (a). The
+# manifest's decision record names the arm ("capacity"); DECISION_CAPACITY is the fallback.
 DECISION_MARGIN_NATS: float = 0.03
 DECISION_SE_MULTIPLE: float = 2.0
 DECISION_COMPARATOR: str = "Per-type read table, ALiBi (as run)"
 DECISION_FROZEN: str = "Frames frozen at their random initialization"
+DECISION_CAPACITY: str = "Identity frames, per-type additive table of equal size"
+DECISION_AMENDMENT_DATE: str = "October 9, 2026"
 DECISION_EVALUATED_PREFIX: str = "Evaluated"
 DECISION_SPEC = r"\begin{tabular}{lccccc}"
 DECISION_HEADER = r"Clause & Pairs & Mean paired difference & Paired SE & Margin & Verdict \\"
+
+
+def _unverified_reasons(arm: Arm) -> List[str]:
+    r"""Why ``arm``'s runs cannot decide a clause (empty when nothing is flagged)."""
+    reasons: List[str] = []
+    if arm.reuse_verified is False:
+        reasons.append(f"{arm.label!r}: runs listed without a check against the plan's config "
+                       "(reuse_verified false)")
+    if arm.stale:
+        reasons.append(f"{arm.label!r}: {len(arm.stale)} stale complete run(s) whose config is not the plan's")
+    if arm.homogeneity and not arm.homogeneity.get("homogeneous", True):
+        fields = [v["field"] for v in arm.homogeneity.get("violations") or []]
+        duplicates = arm.homogeneity.get("duplicate_seed_pairs") or []
+        reasons.append(f"{arm.label!r}: runs are not homogeneous (config differs in {fields}"
+                       + (f"; duplicate seed pairs {duplicates}" if duplicates else "") + ")")
+    return reasons
+
+
+def _code_identity_notes(arm: Arm) -> List[str]:
+    r"""Runs of ``arm`` trained on code other than the current tree: reported, never decisive.
+
+    Every edit to a tracked root script after a run trains changes the identity, so a mismatch alone
+    does not make a clause undetermined; the note lets a reader check the diff between the code lines.
+    """
+    if not arm.code_identity_mismatch:
+        return []
+    return [f"{arm.label!r}: {len(arm.code_identity_mismatch)} run(s) trained on code other than the "
+            "current tree (code_identity_mismatch)"]
 
 
 def decision_rule(manifest: Manifest) -> Dict[str, Any]:
@@ -419,19 +471,32 @@ def decision_rule(manifest: Manifest) -> Dict[str, Any]:
 
     Clause (a): the comparator's paired excess test CE over the evaluated arm must exceed its margin
     :math:`\max(2\,\mathrm{SE}, 0.03)`. Clause (b): freezing the frames at initialization must cost at
-    least its own margin. The claim is retracted if either clause fails, stands if both hold, and is
-    undetermined while a clause lacks two paired seeds (unless the other clause already retracts it).
-    Arm labels come from ``manifest.decision`` (keys ``evaluated``, ``comparator``, ``frozen``); the
-    evaluated arm defaults to the first label starting with ``"Evaluated"``. Every other per-type
+    least its own margin. Clause (c), a dated amendment (October 9, 2026, registered before any arm
+    result): the capacity control (identity frames with a trainable per-type additive table of equal
+    size) must exceed the evaluated arm's test CE by more than its own margin, strictly as in (a). When
+    the manifest marks the capacity arm inapplicable to the base, clause (c) is ``n/a`` (``inapplicable``
+    holds the reason) and does not enter the verdict; inapplicability never excuses (a) or (b). The
+    claim is retracted if any applicable clause fails, stands if every applicable clause holds, and is
+    undetermined otherwise (a clause lacking two paired seeds, flagged, or absent from the manifest).
+    Arm labels come from ``manifest.decision`` (keys ``evaluated``, ``comparator``, ``frozen``,
+    ``capacity``, each falling back to its constant); the evaluated arm defaults to the first label
+    starting with ``"Evaluated"``. Every other per-type
     read-table arm is listed under ``other_read_table_arms``: the rule names one comparator, and these
     are reported, not decided on.
+
+    A clause is undetermined (``holds`` None, the reasons under ``undetermined``) when an arm it reads
+    has runs listed without a config check (``reuse_verified`` False), stale complete runs, runs
+    whose configs differ (``homogeneity``); its statistics are still reported. Runs trained on code other
+    than the tree that wrote the manifest (``code_identity_mismatch``) are listed under
+    ``code_identity_notes`` without changing the verdict.
     """
     by_label = {arm.label: arm for arm in manifest.arms}
     evaluated_label = manifest.decision.get("evaluated") or next(
         (arm.label for arm in manifest.arms if arm.label.startswith(DECISION_EVALUATED_PREFIX)), None)
     labels = {"evaluated": evaluated_label,
               "comparator": manifest.decision.get("comparator", DECISION_COMPARATOR),
-              "frozen": manifest.decision.get("frozen", DECISION_FROZEN)}
+              "frozen": manifest.decision.get("frozen", DECISION_FROZEN),
+              "capacity": manifest.decision.get("capacity", DECISION_CAPACITY)}
     out: Dict[str, Any] = {"labels": labels, "selection": manifest.selection,
                            "margin_nats": DECISION_MARGIN_NATS, "se_multiple": DECISION_SE_MULTIPLE,
                            "clauses": {}, "problems": []}
@@ -442,18 +507,25 @@ def decision_rule(manifest: Manifest) -> Dict[str, Any]:
     evaluated = by_label.get(labels["evaluated"]) if labels["evaluated"] else None
     if evaluated is None:
         out["problems"].append(f"evaluated arm {labels['evaluated']!r} is not in the manifest")
-    for clause, key in (("a", "comparator"), ("b", "frozen")):
+    for clause, key in (("a", "comparator"), ("b", "frozen"), ("c", "capacity")):
         other = by_label.get(labels[key])
+        if clause == "c" and other is not None and other.inapplicable:
+            out["clauses"][clause] = {"arm": labels[key], "n": 0, "holds": None,
+                                      "inapplicable": other.inapplicable}
+            continue
         if other is None or evaluated is None:
             if other is None:
                 out["problems"].append(f"{key} arm {labels[key]!r} is not in the manifest")
             out["clauses"][clause] = {"arm": labels[key], "n": 0, "holds": None}
             continue
         stats = paired_difference(evaluated, other, manifest.selection)
-        holds = None if stats["margin"] is None else (
-            stats["mean"] > stats["margin"] if clause == "a" else stats["mean"] >= stats["margin"])
-        out["clauses"][clause] = {"arm": labels[key], **stats, "holds": holds}
-    held = [c["holds"] for c in out["clauses"].values()]
+        undetermined = [reason for arm in (evaluated, other) for reason in _unverified_reasons(arm)]
+        code_notes = [note for arm in (evaluated, other) for note in _code_identity_notes(arm)]
+        holds = None if stats["margin"] is None or undetermined else (
+            stats["mean"] >= stats["margin"] if clause == "b" else stats["mean"] > stats["margin"])
+        out["clauses"][clause] = {"arm": labels[key], **stats, "holds": holds, "undetermined": undetermined,
+                                  "code_identity_notes": code_notes}
+    held = [c["holds"] for c in out["clauses"].values() if not c.get("inapplicable")]
     out["verdict"] = ("retracted" if any(h is False for h in held)
                       else "stands" if held and all(h is True for h in held) else "undetermined")
     return out
@@ -464,6 +536,10 @@ def decision_rule_table(manifest: Manifest) -> Tuple[str, str, Dict[str, Any]]:
     record = decision_rule(manifest)
 
     def verdict(c: Mapping[str, Any]) -> str:
+        if c.get("inapplicable"):
+            return NOT_APPLICABLE
+        if c.get("undetermined"):
+            return "undetermined"
         if c.get("holds") is None:
             return PENDING
         return "holds" if c["holds"] else "fails"
@@ -473,25 +549,43 @@ def decision_rule_table(manifest: Manifest) -> Tuple[str, str, Dict[str, Any]]:
             return PENDING
         return f"${value:.4f}$" if latex else f"{value:.4f}"
 
+    def interval(c: Mapping[str, Any]) -> str:
+        ci = c.get("ci95")
+        return f"[{ci[0]:.4f}, {ci[1]:.4f}]" if ci else PENDING
+
     names = {"a": "Realization beats the per-type read-table transformer",
-             "b": "Freezing the frames at initialization costs at least the margin"}
+             "b": "Freezing the frames at initialization costs at least the margin",
+             "c": "Realization beats the equal-size per-type additive table"}
     body, md = [], [_md_row(["Clause", "Arm", "Pairs", "Mean paired difference (nats)", "Paired SE",
-                             "Margin", "Verdict"]), _md_row(["---"] * 7)]
+                             "Margin", "One-sided paired-t p", "t-based 95% CI (n - 1 df)", "Verdict"]),
+                    _md_row(["---"] * 9)]
     for clause, c in record["clauses"].items():
         body.append(" & ".join([f"({clause}) {names[clause]}", str(c.get("n", 0)),
                                 num(c.get("mean"), True), num(c.get("se"), True),
                                 num(c.get("margin"), True), verdict(c)]) + r" \\")
         md.append(_md_row([f"({clause}) {names[clause]}", c["arm"], c.get("n", 0), num(c.get("mean"), False),
-                           num(c.get("se"), False), num(c.get("margin"), False), verdict(c)]))
+                           num(c.get("se"), False), num(c.get("margin"), False),
+                           num(c.get("p_one_sided"), False), interval(c), verdict(c)]))
     lines = ["\n".join(md), "",
              f"Claim: **{record['verdict']}**. Selection rule '{record['selection']}'. Differences are "
-             f"comparator (or frozen-frame) test CE minus evaluated test CE on runs sharing (seed, data seed); "
-             f"margin = max({record['se_multiple']:g} x paired SE, {record['margin_nats']:g} nats). Evaluated "
-             f"arm: {record['labels']['evaluated']!r}."]
+             f"comparator (frozen-frame, capacity) test CE minus evaluated test CE on runs sharing "
+             f"(seed, data seed); margin = max({record['se_multiple']:g} x paired SE, {record['margin_nats']:g} nats), the "
+             f"registered rule. The paired-t p-value (H0: mean difference <= 0) and the t-based 95% interval "
+             f"on n - 1 degrees of freedom are reported beside it and do not enter the verdict. Evaluated "
+             f"arm: {record['labels']['evaluated']!r}; comparator: {record['labels']['comparator']!r}; "
+             f"capacity control: {record['labels']['capacity']!r}. Clause (c) is the amendment of "
+             f"{DECISION_AMENDMENT_DATE}, registered before any arm result; an inapplicable clause (c) "
+             f"does not enter the verdict."]
     for clause, c in record["clauses"].items():
+        if c.get("inapplicable"):
+            lines.append(f"Clause ({clause}) not applicable: {c['inapplicable']}.")
         if c.get("unmatched_seed_pairs") or c.get("unpaired_runs"):
             lines.append(f"Clause ({clause}): seed pairs present in one arm only {c['unmatched_seed_pairs']}; "
                          f"runs without a selected test value or seed pair {c['unpaired_runs']}.")
+        for reason in c.get("undetermined") or []:
+            lines.append(f"Clause ({clause}) undetermined: {reason}.")
+        for note in c.get("code_identity_notes") or []:
+            lines.append(f"Clause ({clause}) note: {note}.")
     if record["other_read_table_arms"]:
         lines.append("Other per-type read-table arms (reported in M2, not the registered comparator): "
                      + "; ".join(record["other_read_table_arms"]) + ".")
@@ -637,7 +731,8 @@ def _resource_cells(record: Optional[Mapping[str, Any]], latex: bool) -> List[st
                         f"peak {peak / 1e3:.2f} GB" if peak else f"peak {NOT_RECORDED}"])
     tps, hours = record["tokens_per_s_median"], record["device_hours"]
     throughput = "; ".join([f"median {tps:,.0f} tokens/s" if tps else f"throughput {NOT_RECORDED}",
-                            f"{hours:.2f} device-hours" if hours is not None else f"device-hours {NOT_RECORDED}"])
+                            f"{hours:.2f} wall-clock device-hours (evaluation included)" if hours is not None
+                            else f"device-hours {NOT_RECORDED}"])
     lat = record["latency"]
     latency = (f"{1000 * lat['seconds_per_batch_median']:.1f} ms per batch of {lat['batch_size']} x "
                f"{lat['context']} ({lat.get('precision')})" if lat else NOT_RECORDED)

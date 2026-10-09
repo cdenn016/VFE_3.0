@@ -39,6 +39,7 @@ The mean is :math:`E X = r\mu_i+\sum_h\sum_j\beta^h_{ij}n^h_{ij}`. A second, lab
 computation of the same kernel checks this derivation against itself. Pairs with zero routing weight
 in every head are never visited, so the reference stays finite where the implementation must mask.
 """
+from tests.profiles import make_relational_operators
 import itertools
 from typing import Dict, List, Optional, Tuple
 
@@ -76,7 +77,7 @@ def _make_ops(
     seed:     int = 11,
 ) -> RelationalOperators:
     r"""An edge-enabled (or "off") exponential-chart operator in float64."""
-    return RelationalOperators(
+    return make_relational_operators(
         [d] * H, seed, readout_mode="predictive_content", attention_residual=residual,
         predictive_covariance="moment_matched", predictive_covariance_floor=FLOOR,
         content_link_chart="exponential", content_link_edges=mode, content_link_edge_rank=rank,

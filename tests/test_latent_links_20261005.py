@@ -11,6 +11,7 @@ finite-difference gradient of F_i, causality, gauge covariance, outer gradients 
 no_grad evaluation, the loop prior (brute force, identity, windows, layer 0, lambda_W = 0), config validation and
 short training with latent factors and loops.
 """
+from tests.profiles import make_relational_operators
 import logging
 import math
 from typing import Dict, Tuple
@@ -67,7 +68,7 @@ def _latent_ops(
 
 def _level_one(ops: RelationalOperators) -> RelationalOperators:
     r"""The same maps with the latent inference off (Level 1, amortized receiver factors)."""
-    twin = RelationalOperators(ops.irrep_dims, 11, attention_residual=ops.attention_residual,
+    twin = make_relational_operators(ops.irrep_dims, 11, attention_residual=ops.attention_residual,
                                predictive_covariance="moment_matched", predictive_covariance_floor=FLOOR,
                                content_link_chart="exponential", content_link_edges="lowrank",
                                content_link_edge_rank=ops.content_link_edge_rank).double()
@@ -613,11 +614,11 @@ def test_config_validation_and_inactive_fields() -> None:
 def test_operator_and_inference_refusals() -> None:
     kwargs = dict(content_link_chart="exponential", content_link_edges="lowrank", content_link_edge_rank=2)
     with pytest.raises(ValueError, match="lowrank"):
-        RelationalOperators([2, 2], 1, **{**kwargs, "content_link_edges": "pure_gauge"}, content_link_latent=True)
+        make_relational_operators([2, 2], 1, **{**kwargs, "content_link_edges": "pure_gauge"}, content_link_latent=True)
     with pytest.raises(ValueError, match="content_link_latent=True"):
-        RelationalOperators([2, 2], 1, **kwargs, content_link_loop_weight=1.0)
+        make_relational_operators([2, 2], 1, **kwargs, content_link_loop_weight=1.0)
     with pytest.raises(ValueError, match="content_link_latent_damping"):
-        RelationalOperators([2, 2], 1, **kwargs, content_link_latent=True, content_link_latent_damping=0.0)
+        make_relational_operators([2, 2], 1, **kwargs, content_link_latent=True, content_link_latent_damping=0.0)
     ops = _latent_ops(True, seed=25, content_link_loop_weight=1.0)
     data = _inputs(seed=26)
     mu, beta, frame, sigma = data["mu"], data["beta"], data["compact"], data["sigma_diag"]

@@ -1,8 +1,9 @@
 r"""Role-specific comparison and content operators in realized canonical frames."""
 
 import math
+from contextlib import contextmanager
 from numbers import Real
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import nn
@@ -88,6 +89,22 @@ def _centered_spread(
     return tiles[0] if len(tiles) == 1 else torch.cat(tiles, dim=-4)
 
 
+def _per_block_bmm(
+    left:  torch.Tensor,  # (H, a, k)
+    right: torch.Tensor,  # (H, k, c)
+) -> torch.Tensor:        # (H, a, c)
+    r"""``torch.bmm`` over the H head blocks of the blockwise covariance update; one GEMM per block on CUDA.
+
+    In backward the weight gradient of a block is an :math:`a\times k` or :math:`k\times c` matrix reduced over
+    every token. Batched over H = 4 heads that is a handful of output tiles on CUDA (3.6 ms per GEMM at the live
+    width and B = 32), while one GEMM per block gets a split reduction (0.6 ms). Each block keeps the reduction
+    order of the batched call. On CPU the batched kernel has no such cost, so it runs unchanged.
+    """
+    if left.device.type != "cuda":
+        return torch.bmm(left, right)
+    return torch.stack([torch.bmm(x[None], y[None])[0] for x, y in zip(left.unbind(0), right.unbind(0))])
+
+
 def head_runs(head_dims: Sequence[int]) -> List[Tuple[int, int, int, int]]:
     r"""Maximal runs of contiguous equal-size heads as ``(first_head, n_heads, d, first_coordinate)``.
 
@@ -120,22 +137,59 @@ def chart_stacks(
     """
     if chart not in ("first_order", "exponential"):
         raise ValueError(f"chart_stacks evaluates the first_order and exponential charts, got {chart!r}")
+    with torch.autocast(device_type=T_runs[0].device.type, enabled=False):
+        T_stack, O_stack = _chart_operands(T_runs, O_runs)
+        inverse, receive = _chart_receive(T_stack, O_stack, chart)
+    return T_stack, inverse, receive
+
+
+def _chart_operands(
+    T_runs: Sequence[torch.Tensor],     # per run (n_r, d_r, K)
+    O_runs: Sequence[torch.Tensor],     # per run (n_r, K, d_r)
+) -> Tuple[torch.Tensor, torch.Tensor]:  # float64 (K, K) row stack T and column stack O
+    r"""Validated float64 stacks :math:`T` (rows by head) and :math:`O` (columns by head)."""
     K = T_runs[0].shape[-1]
     if (sum(T.shape[0] * T.shape[1] for T in T_runs) != K
             or any(tuple(O.shape) != (T.shape[0], K, T.shape[1]) for T, O in zip(T_runs, O_runs))):
         raise ValueError(f"content link charts need tiled square stacked maps, got T "
                          f"{[tuple(T.shape) for T in T_runs]}, O {[tuple(O.shape) for O in O_runs]}")
-    with torch.autocast(device_type=T_runs[0].device.type, enabled=False):
-        T_stack = torch.cat([T.to(torch.float64).reshape(-1, K) for T in T_runs], dim=0)   # (K, K) rows by head
-        O_stack = torch.cat([O.to(torch.float64).permute(1, 0, 2).reshape(K, -1)
-                             for O in O_runs], dim=1)                                    # (K, K) columns by head
-        # inv_ex: no host sync (linalg.inv checks info on the host); a singular T yields non-finite maps.
-        inverse = torch.linalg.inv_ex(T_stack).inverse                                  # (K, K) order zero
-        if chart == "first_order":
-            receive = inverse + O_stack
-        else:
-            receive = inverse + O_stack @ _phi1(T_stack @ O_stack)                      # all orders
-    return T_stack, inverse, receive
+    T_stack = torch.cat([T.to(torch.float64).reshape(-1, K) for T in T_runs], dim=0)       # (K, K) rows by head
+    O_stack = torch.cat([O.to(torch.float64).permute(1, 0, 2).reshape(K, -1)
+                         for O in O_runs], dim=1)                                        # (K, K) columns by head
+    return T_stack, O_stack
+
+
+def _chart_receive(
+    T_stack: torch.Tensor,              # (..., K, K) float64 row stacks
+    O_stack: torch.Tensor,              # (..., K, K) float64 column stacks
+    chart:   str,
+) -> Tuple[torch.Tensor, torch.Tensor]:  # (..., K, K) T^{-1} and O'
+    r""":math:`(T^{-1}, O')` of a non-affine chart; leading axes (a layer stack) are one batched call each.
+
+    :math:`O'_{\mathrm{exponential}} = T^{-1} + O\varphi_1(TO)`, which equals :math:`e^{OT}T^{-1}`. Against a
+    60-digit reference (K = 6, cond(T) up to 1e9) the product form had the same relative error as this
+    one, but it differed from this form by up to 3.5e-12 in absolute value at :math:`\|O'\|\approx 7\times10^2`
+    (cond(T) = 1e3), so the evaluated form is kept and only batched (audit 2026-10-09).
+    """
+    # inv_ex: no host sync (linalg.inv checks info on the host); a singular T yields non-finite maps.
+    inverse = torch.linalg.inv_ex(T_stack).inverse                                      # (..., K, K) order zero
+    if chart == "first_order":
+        return inverse, inverse + O_stack
+    return inverse, inverse + O_stack @ _phi1(T_stack @ O_stack)                        # all orders
+
+
+def _split_receive(
+    receive: torch.Tensor,              # (K, K) float64 O' with columns by head
+    T_runs:  Sequence[torch.Tensor],    # per run (n_r, d_r, K)
+) -> List[torch.Tensor]:                # per run (n_r, K, d_r)
+    r"""Split the column stack :math:`O'` into its per-run head maps."""
+    K = receive.shape[-1]
+    out, start = [], 0
+    for T in T_runs:
+        n, d = T.shape[0], T.shape[1]
+        out.append(receive[:, start:start + n * d].reshape(K, n, d).permute(1, 0, 2))   # (n_r, K, d_r)
+        start += n * d
+    return out
 
 
 def chart_receive_runs(
@@ -165,14 +219,45 @@ def chart_receive_runs(
         return list(O_runs)
     if chart not in CONTENT_LINK_CHARTS:
         raise ValueError(f"content_link_chart must be one of {CONTENT_LINK_CHARTS}, got {chart!r}")
-    K = T_runs[0].shape[-1]
     _, _, receive = chart_stacks(T_runs, O_runs, chart)                                 # (K, K) float64
-    out, start = [], 0
-    for T in T_runs:
-        n, d = T.shape[0], T.shape[1]
-        out.append(receive[:, start:start + n * d].reshape(K, n, d).permute(1, 0, 2))   # (n_r, K, d_r)
-        start += n * d
-    return out
+    return _split_receive(receive, T_runs)
+
+
+@contextmanager
+def shared_content_charts(operators: Sequence["RelationalOperators"]) -> Iterator[None]:
+    r"""Evaluate every layer's :math:`O'` once, in one batched float64 call per chart, for the enclosed forward.
+
+    Each distinct operator that stores O, uses a non-affine chart and has the edge links off (the edge
+    links evaluate their own chart stacks) receives its slice of one ``(L, K, K)`` evaluation of
+    :func:`_chart_receive`, which :meth:`RelationalOperators.content_factor_runs` returns until the
+    context exits. This replaces one :math:`2K \times 2K` ``matrix_exp`` per layer per forward, whose host
+    synchronizations dominated the exponential chart's cost (audit 2026-10-09). On the CPU the batched
+    values equal the per-layer ones bit for bit; on CUDA the batched GEMMs may round differently.
+    """
+    groups: Dict[Tuple[str, int, torch.device], List["RelationalOperators"]] = {}
+    seen = set()
+    for ops in operators:
+        if (id(ops) in seen or getattr(ops, "O", None) is None or ops.content_link_chart == "affine"
+                or ops.content_link_edges != "off"):
+            continue
+        seen.add(id(ops))
+        T0 = ops._stored_runs("T")[0]
+        groups.setdefault((ops.content_link_chart, T0.shape[-1], T0.device), []).append(ops)
+    installed = []
+    try:
+        for (chart, _, device), members in groups.items():
+            runs = [(ops._stored_runs("T"), ops._stored_runs("O")) for ops in members]
+            with torch.autocast(device_type=device.type, enabled=False):
+                stacks = [_chart_operands(T_runs, O_runs) for T_runs, O_runs in runs]
+                _, receive = _chart_receive(torch.stack([T for T, _ in stacks]),
+                                            torch.stack([O for _, O in stacks]), chart)    # (L, K, K)
+            for index, (ops, (T_runs, _)) in enumerate(zip(members, runs)):
+                installed.append((ops, ops.__dict__.get("_shared_receive_runs")))
+                ops.__dict__["_shared_receive_runs"] = _split_receive(receive[index], T_runs)
+        yield
+    finally:
+        for ops, previous in reversed(installed):
+            ops.__dict__["_shared_receive_runs"] = previous
 
 
 def chart_receive_map(
@@ -242,6 +327,9 @@ class RelationalOperators(nn.Module):
     ``predictive_covariance_checkpoint`` recomputes the moment-matched covariance update in backward
     instead of saving its (..., N, K, K) intermediates: the same values and gradients bit for bit,
     for about half the activation memory of a large-K step.
+    ``block_covariance`` (family ``gaussian_block``; equal heads, the kernel predictive readout, edges off) makes
+    the moment-matched update return the head-block M-projection of :math:`\Sigma_i^+` in the dense layout,
+    one SPD :math:`d\times d` block per head (:meth:`_predictive_covariance_update_blockwise`).
     ``content_link_edges`` ("lowrank" or "pure_gauge", exponential chart, equal heads, predictive
     content only) gives every edge the link :math:`G_{ij} = g_ie^{L}E_{ij}` of :mod:`vfe3.model.edge_links`,
     with rank-``content_link_edge_rank`` factor maps stored as ``edge_receiver_map`` (lowrank) or
@@ -260,6 +348,12 @@ class RelationalOperators(nn.Module):
     None: the key is tied and the receiving map is derived), so the chart, the initial output scale and
     ``routing`` are unused, and every O-reading method raises. ``minimal_agent_inference`` selects the exact
     ADF posterior or the mean-field step.
+    ``tie_comparison_maps`` (kernel predictive readout) stores no ``raw_score_k``: the key map is the query map,
+    :math:`S_K := S_Q`. ``learn_attention_temperature`` adds ``routing_log_temperature`` ``(H,)``, the offset of
+    the log routing temperature (:meth:`routing_temperature`); with it off no such parameter exists.
+    ``attention_residual``, ``predictive_covariance``, ``receiver_law``, ``receiver_update``,
+    ``content_link_chart`` and ``minimal_agent_inference`` are keyword-only without defaults, so no
+    constructor default can drift from :class:`vfe3.config.VFE3Config` (audit 2026-10-09).
     """
 
     def __init__(
@@ -267,17 +361,17 @@ class RelationalOperators(nn.Module):
         irrep_dims:            List[int],
         seed:                  int,
         readout_mode:          str   = "predictive_content",
-        attention_residual:    bool  = False,
+        *,
+        attention_residual:    bool,
         output_init_scale:     float = 1.0,
         routing:               str   = "gaussian_kl",
-        predictive_covariance: str   = "passthrough",
+        predictive_covariance: str,
         predictive_covariance_floor: float = 1e-4,
-        *,
         receiver_noise:        float = 1.0,
-        receiver_law:          str   = "ambient_alignment",
-        receiver_update:       str   = "euler",
+        receiver_law:          str,
+        receiver_update:       str,
         receiver_damping:      float = 1.0,
-        content_link_chart:    str   = "affine",
+        content_link_chart:    str,
         predictive_covariance_checkpoint: bool = False,
         content_link_edges:    str   = "off",
         content_link_edge_rank: int  = 4,
@@ -288,11 +382,14 @@ class RelationalOperators(nn.Module):
         content_link_loop_weight: float = 0.0,
         content_link_loop_window: Optional[int] = 1,
         predictive_readout:    str   = "kernel",
-        minimal_agent_inference: str = "exact",
+        minimal_agent_inference: str,
         minimal_agent_channel_noise: float = 1.0,
         comparison_rope_base: Optional[float] = None,
         comparison_rope_fraction: float = 1.0,
         kl_max_reference:      str   = "absolute",
+        learn_attention_temperature: bool = False,
+        tie_comparison_maps:   bool  = False,
+        block_covariance:      bool  = False,
     ) -> None:
         super().__init__()
         self.kl_max_reference = kl_max_reference      # "absolute" | "row_min" kernel-router clamp reference
@@ -411,6 +508,34 @@ class RelationalOperators(nn.Module):
         self.predictive_readout = predictive_readout
         self.minimal_agent_inference = minimal_agent_inference
         self.minimal_agent_channel_noise = float(minimal_agent_channel_noise)
+        if not isinstance(block_covariance, bool):
+            raise ValueError(f"block_covariance must be bool, got {block_covariance!r}")
+        if block_covariance:
+            block_problems = []
+            if not equal:
+                block_problems.append(f"equal heads (head sizes {self.irrep_dims})")
+            if readout_mode != "predictive_content" or minimal:
+                block_problems.append("the kernel predictive readout (predictive_content, predictive_readout='kernel')")
+            if content_link_edges != "off":
+                block_problems.append("content_link_edges='off'")
+            if block_problems:
+                raise ValueError("block_covariance (the gaussian_block head-block covariance update) requires "
+                                 + ", ".join(block_problems))
+        # gaussian_block: the moment-matched update returns the head-block M-projection (one SPD block per head).
+        self.block_covariance = block_covariance
+        if not isinstance(learn_attention_temperature, bool) or not isinstance(tie_comparison_maps, bool):
+            raise ValueError("learn_attention_temperature and tie_comparison_maps must be bool")
+        if minimal and (learn_attention_temperature or tie_comparison_maps):
+            raise ValueError("predictive_readout='minimal_agent' routes at temperature 1 with the key tied to T; "
+                             "learn_attention_temperature and tie_comparison_maps need the kernel readout")
+        if tie_comparison_maps and readout_mode != "predictive_content":
+            raise ValueError("tie_comparison_maps requires the predictive_content readout")
+        self.tie_comparison_maps = tie_comparison_maps
+        # delta_{l,h} of tau_{l,h} = tau_h exp(clamp(delta_{l,h}, -3, 3)); absent (no state-dict key) when off.
+        if learn_attention_temperature:
+            self.routing_log_temperature = nn.Parameter(torch.zeros(len(self.irrep_dims)))   # (H,)
+        else:
+            self.register_parameter("routing_log_temperature", None)
         self.score_rank_per_head = irrep_dims[0] if equal else list(irrep_dims)
         self.content_rank_per_head = irrep_dims[0] if equal else list(irrep_dims)
         if minimal:
@@ -434,6 +559,10 @@ class RelationalOperators(nn.Module):
             stored[f"raw_score_{role}"] = [
                 self._orthonormal_columns(torch.randn(n, K, d, generator=generator)).transpose(-1, -2).contiguous()
                 for _, n, d, _ in self.runs]
+        if tie_comparison_maps:
+            # S_K := S_Q. The key draw above still runs, so T, O and the edge maps match the untied model.
+            del stored["raw_score_k"]
+            self.register_parameter("raw_score_k", None)
         # Preserve the released block-projector initialization and parameter names.
         initial_output = _chart_initial_output(content_link_chart, float(output_init_scale))
         stored["T"], stored["O"] = [], []
@@ -896,21 +1025,27 @@ class RelationalOperators(nn.Module):
         :math:`C = U^{-1}\Sigma U^{-\top}` passes through :math:`U^{-1}` and back through :math:`U`, so
         its rounding is amplified by about :math:`\kappa(U)^2`; at TF32's :math:`2^{-10}` small output
         variances came out nonpositive on ill-conditioned frames.
+
+        Under ``block_covariance`` (``gaussian_block``) the head-block covariance always takes the blockwise
+        route, which returns the head-block M-projection; it needs the compact block frame.
         """
-        if frame.block_diagonal and sigma.dim() == mu.dim():
+        if self.block_covariance and not frame.block_diagonal:
+            raise ValueError("block_covariance (gaussian_block) reads the compact (..., N, H, d, d) block frame; "
+                             "a dense frame was supplied")
+        if frame.block_diagonal and (sigma.dim() == mu.dim() or self.block_covariance):
             return self._predictive_covariance_update_blockwise(mu, sigma, beta, frame, receive, edges)
         return self._predictive_covariance_update_dense(mu, sigma, beta, frame, receive, edges)
 
     def _predictive_covariance_update_blockwise(
         self,
         mu:    torch.Tensor,  # (..., N, K) source means
-        sigma: torch.Tensor,  # (..., N, K) diagonal local covariance
+        sigma: torch.Tensor,  # (..., N, K) diagonal, or (..., N, K, K) head-block diagonal (block_covariance)
         beta:  torch.Tensor,  # (..., H, N, N) routing weights, rows sum to one
         frame: CanonicalFrameContext,             # block_diagonal: (..., N, H, d, d) blocks U_{i,m}
         receive: Optional[torch.Tensor] = None,   # (H, K, d) precomputed O'_h; None evaluates the chart
         edges: Optional[EdgeContext] = None,      # content_link_edges: the layer's edge context
-    ) -> torch.Tensor:        # (..., N, K) diag(Sigma_i^+)
-        r"""Diagonal of the moment-matched covariance for diagonal beliefs on block-diagonal frames.
+    ) -> torch.Tensor:        # (..., N, K) diag(Sigma_i^+), or (..., N, K, K) its head blocks
+        r"""Diagonal (or head blocks) of the moment-matched covariance on block-diagonal frames.
 
         With :math:`U_i=\bigoplus_m U_{i,m}` and :math:`\Sigma_i=\mathrm{diag}(\sigma_i)` the reference
         covariance is block diagonal, :math:`C_i=\bigoplus_m C_{i,m}` with
@@ -934,8 +1069,22 @@ class RelationalOperators(nn.Module):
         :meth:`_predictive_covariance_update_dense` and :math:`\tilde q_i = f\,\mathrm{tr}(C_i)/K`. It is the
         dense update reassociated, equal up to rounding, at about :math:`2K^3 + NK^2` multiply-adds per
         token instead of about :math:`9.5K^3 + NK^2`, with no :math:`K \times K` intermediate.
+
+        Head-block family (``block_covariance``, ``gaussian_block``). The input
+        :math:`\Sigma_i=\bigoplus_m\Sigma_{i,m}` (dense storage, zero off-head blocks) gives
+        :math:`C_{i,m}=U_{i,m}^{-1}\Sigma_{i,m}U_{i,m}^{-\top}`, the same block-diagonal :math:`C_i` the formulas
+        above take, and the result is the head-block M-projection of :math:`\Sigma_i^+=U_iC_i^{\mathrm{att}}U_i^\top`,
+
+        .. math::
+            \Sigma_i^{+} \mapsto \bigoplus_l U_{i,l}\,[C_i^{\mathrm{att}}]_{ll}\,U_{i,l}^\top,
+
+        returned in the dense layout. :math:`\arg\min_q\mathrm{KL}(p\|q)` over block-diagonal Gaussians keeps the
+        marginal blocks, and under the passive action :math:`U_i\to g_iU_i` (:math:`g_i\in\prod_hGL(d)`) the
+        reference blocks :math:`[C_i^{\mathrm{att}}]_{ll}` are unchanged, so the projection is frame-independent;
+        the diagonal projection :math:`\mathrm{diag}(U_iC_i^{\mathrm{att}}U_i^\top)` is not.
         """
         H, d = len(self.irrep_dims), self.irrep_dims[0]
+        block = sigma.dim() == mu.dim() + 1                                            # head-block family
         dtype = _compute_dtype(mu, sigma, self.T, self.O, frame.forward)
         if edges is None and self.content_link_edges != "off":
             edges = self.edge_context(mu, beta, frame, receive, sigma=sigma)
@@ -944,8 +1093,13 @@ class RelationalOperators(nn.Module):
             receive = edge_links.receive_heads(edges, H)
         with torch.autocast(device_type=mu.device.type, enabled=False):
             forward, inverse = frame.forward.to(dtype), frame.inverse.to(dtype)        # (..., N, H, d, d)
-            sigma_h = sigma.to(dtype).reshape(*sigma.shape[:-1], H, d)                 # (..., N, H, d)
-            C = (inverse * sigma_h.unsqueeze(-2)) @ inverse.transpose(-1, -2)          # (..., N, H, d, d) C_{i,m}
+            if block:
+                S = sigma.to(dtype).reshape(*sigma.shape[:-2], H, d, H, d)            # (..., N, H, d, H, d)
+                sigma_blocks = torch.diagonal(S, dim1=-4, dim2=-2).movedim(-1, -3)    # (..., N, H, d, d) Sigma_{i,m}
+                C = inverse @ sigma_blocks @ inverse.transpose(-1, -2)                 # (..., N, H, d, d) C_{i,m}
+            else:
+                sigma_h = sigma.to(dtype).reshape(*sigma.shape[:-1], H, d)             # (..., N, H, d)
+                C = (inverse * sigma_h.unsqueeze(-2)) @ inverse.transpose(-1, -2)      # (..., N, H, d, d) C_{i,m}
             C = 0.5 * (C + C.transpose(-1, -2))
             mu_h = mu.to(dtype).reshape(*mu.shape[:-1], H, d)
             xi = (inverse @ mu_h.unsqueeze(-1)).squeeze(-1).flatten(-2)                # (..., N, K)
@@ -958,17 +1112,24 @@ class RelationalOperators(nn.Module):
             # Common shift by token 0, exactly as on the dense route.
             xi = xi - xi[..., :1, :]                                                   # (..., N, K)
             values = torch.einsum("hsk,...nk->...nhs", T_hat, xi)                      # (..., N, H, d)
-            TC = torch.einsum("hsmk,...nmkt->...nhmst", T_blocks, C)                  # (..., N, H, H, d, d) T_h^{(m)} C_{i,m}
+            nl = C.dim() - 4                                                           # leading batch dims
+            C_cols = C.movedim(-3, 0).movedim(-2, 1).reshape(H, d, -1)                # (m, k, [..., n, t])
+            T_rows = T_blocks.permute(2, 0, 1, 3).reshape(H, H * d, d)                # (m, [h, s], k)
+            TC = _per_block_bmm(T_rows, C_cols).view(H, H, d, *C.shape[:-3], d)       # (m, h, s, ..., n, t)
+            TC = TC.permute(*range(3, nl + 4), 1, 0, 2, nl + 4)                        # (..., N, H, H, d, d) T_h^{(m)} C_{i,m}
             source = torch.einsum("...nhmsk,gtmk->...nhgst", TC, T_blocks)            # (..., N, H, H, d, d) T_h C_i T_g^T
             c = torch.einsum("...hij,...gij->...hgij", b, b)
             c = c * (1.0 - eye_h)[..., None, None] + torch.einsum("...hij,hg->...hgij", b, eye_h)
             pooled = torch.einsum("...hgij,...jhgst->...ihgst", c, source)            # (..., N, H, H, d, d)
             mean = torch.einsum("...hij,...jhs->...ihs", b, values)                    # (..., N, H, d)
             spread = _centered_spread(b, values, mean)                                 # (..., N, H, d, d)
-            pooled = pooled + torch.einsum("...ihst,hg->...ihgst", spread, eye_h)
+            pooled.diagonal(dim1=-4, dim2=-3).add_(spread.movedim(-3, -1))            # P_hh += S^h, in place
             lifted = torch.einsum("hks,...nhgst->...ngkt", O_hat, pooled)             # (..., N, H, K, d) sum_h O'_h P_hg
             lifted = lifted.reshape(*lifted.shape[:-2], H, d, d)                       # (..., N, g, l, k, t)
-            C_att = torch.einsum("...nglkt,glmt->...nlkm", lifted, O_blocks)          # (..., N, H, d, d) blocks [ll]
+            rows = lifted.permute(nl + 2, *range(nl + 1), nl + 3, nl + 1, nl + 4)      # (l, ..., n, k, g, t)
+            O_cols = O_blocks.permute(1, 0, 3, 2).reshape(H, H * d, d)                # (l, [g, t], m)
+            C_att = _per_block_bmm(rows.reshape(H, -1, H * d), O_cols)                 # (l, [..., n, k], m)
+            C_att = C_att.view(H, *C.shape[:-3], d, d).movedim(0, -3)                  # (..., N, H, d, d) blocks [ll]
             if edges is not None:
                 # [g_i F (P^ + R Sigma~ R^T + A X + X^T A^T + A Y A^T) F^T g_i^T]_ll (edge_links).
                 A_hat, X_hat, Y = edge_links.edge_covariance_factors(edges, b, c, source, values, mean)
@@ -978,14 +1139,22 @@ class RelationalOperators(nn.Module):
                     if edges.mode == "pure_gauge" else inner)
             if self.attention_residual:
                 self_weight = b.diagonal(dim1=-2, dim2=-1).transpose(-1, -2)          # (..., N, H) beta_ii^h
-                cross = torch.einsum("hlks,...nhlsm->...nlkm", O_blocks,
-                                     TC * self_weight[..., None, None, None])          # (..., N, H, d, d) X_{i,l}
+                weighted = TC * self_weight[..., None, None, None]                    # (..., N, H, H, d, d)
+                weighted = weighted.permute(nl + 2, nl + 1, nl + 3, *range(nl + 1), nl + 4)   # (l, h, s, ..., n, m)
+                O_rows = O_blocks.permute(1, 2, 0, 3).reshape(H, d, H * d)            # (l, k, [h, s])
+                cross = _per_block_bmm(O_rows, weighted.reshape(H, H * d, -1))         # (l, k, [..., n, m])
+                cross = cross.view(H, d, *C.shape[:-3], d).movedim((0, 1), (-3, -2))   # (..., N, H, d, d) X_{i,l}
                 if edges is not None:                                                  # blocks of sum_h beta_ii M_h^{ii} C_i
                     cross = edge_links.edge_residual_cross_blocks(edges, A_hat, self_weight, TC, cross)
                 C_att = C_att + C + cross + cross.transpose(-1, -2)
             scale = torch.diagonal(C, dim1=-2, dim2=-1).flatten(-2).mean(dim=-1)      # (..., N) tr(C_i)/K
             C_att = C_att + (self.predictive_covariance_floor * scale)[..., None, None, None] * torch.eye(
                 d, dtype=dtype, device=mu.device)
+            if block:
+                blocks = forward @ C_att @ forward.transpose(-1, -2)                   # (..., N, H, d, d) U_l [C_att]_ll U_l^T
+                blocks = 0.5 * (blocks + blocks.transpose(-1, -2))
+                result = torch.einsum("...hab,hg->...hagb", blocks, eye_h).reshape(*sigma.shape)   # (..., N, K, K)
+                return result.to(sigma.dtype)
             result = ((forward @ C_att) * forward).sum(dim=-1)                         # (..., N, H, d) diag(U C U^T)
         return result.flatten(-2).to(sigma.dtype)
 
@@ -1105,12 +1274,40 @@ class RelationalOperators(nn.Module):
     def comparison_pair(self) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""Return (S_Q,S_K), each (H,r,input_dim), with live role graphs (equal heads); S_K = T under the minimal agent."""
         self._require_equal_heads("comparison_pair")
+        if self.tie_comparison_maps:
+            return self.raw_score_q, self.raw_score_q                                     # S_K := S_Q
         return self.raw_score_q, (self.T if self.predictive_readout == "minimal_agent" else self.raw_score_k)
 
     def comparison_runs(self) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         r"""Per-run (S_Q, S_K), each (n_r, d_r, input_dim), with live role graphs; the tied S_K = T under the minimal agent."""
-        key = "T" if self.predictive_readout == "minimal_agent" else "raw_score_k"
+        key = ("T" if self.predictive_readout == "minimal_agent"
+               else "raw_score_q" if self.tie_comparison_maps else "raw_score_k")
         return list(zip(self._stored_runs("raw_score_q"), self._stored_runs(key)))
+
+    def routing_temperature(
+        self,
+        tau:   'float | torch.Tensor',          # configured tau_h = kappa_h sqrt(d_h): scalar or (H,)
+        dtype: torch.dtype,                     # working dtype of the routing cost
+    ) -> 'float | torch.Tensor':                # tau unchanged, or the learned (H,) tau_{l,h}
+        r"""Gibbs routing temperature of this layer.
+
+        Without ``learn_attention_temperature`` the configured temperature is returned unchanged. With it,
+
+        .. math::
+            \tau_{\ell,h} = \kappa_h\sqrt{d_h}\exp(\mathrm{clamp}(\delta_{\ell,h}, -3, 3)),
+
+        so the log-temperature is :math:`s_{\ell,h} = \log\kappa_h + \delta_{\ell,h}` with
+        :math:`\delta = 0` at initialization (the configured temperature exactly) and the same
+        :math:`\pm 3` window as the decoder's ``decode_log_scale``. The product is formed in float64 and
+        returned at ``dtype``. The temperature acts after the ``kl_max`` clamp, so it sharpens or flattens
+        only costs below the cap.
+        """
+        delta = self.routing_log_temperature
+        if delta is None:
+            return tau
+        scale = torch.exp(delta.to(torch.float64).clamp(-3.0, 3.0))                      # (H,)
+        base = torch.as_tensor(tau, dtype=torch.float64, device=scale.device)            # () or (H,)
+        return (base * scale).to(dtype)                                                  # (H,)
 
     def comparison_rope_rotation(
         self,
@@ -1148,6 +1345,9 @@ class RelationalOperators(nn.Module):
         r"""Per-run (T, O'): T (n_r, d_r, K) and O' (n_r, K, d_r) of the content link's chart."""
         self._require_kernel_readout("content_factor_runs")
         T_runs = self._stored_runs("T")
+        shared = self.__dict__.get("_shared_receive_runs")          # installed by shared_content_charts
+        if shared is not None:
+            return T_runs, shared
         return T_runs, chart_receive_runs(T_runs, self._stored_runs("O"), self.content_link_chart)
 
     @ieee_fp32_matmul()

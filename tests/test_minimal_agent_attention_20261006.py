@@ -10,6 +10,7 @@ ma:prop:mean_field (iii), passive gauge covariance, causality, blockwise against
 and tile boundaries, config/optimizer/resource/state-dict wiring, short training and the checkpointed readout) and
 the consumer audit (diagnostics, posthoc refusals, the full-link refusal, the persisted metrics columns).
 """
+from tests.profiles import make_relational_operators
 import itertools
 import logging
 import math
@@ -98,7 +99,7 @@ def _close(got: torch.Tensor, want: torch.Tensor, tol: float) -> None:
 def _ops(inference: str, H: int = 2, d: int = 2, seed: int = 0, **kwargs: object) -> RelationalOperators:
     r"""Float64 minimal-agent operators with generic S, T and channel noises."""
     K = H * d
-    ops = RelationalOperators([d] * H, 11, predictive_covariance="moment_matched", predictive_covariance_floor=FLOOR,
+    ops = make_relational_operators([d] * H, 11, predictive_covariance="moment_matched", predictive_covariance_floor=FLOOR,
                               predictive_readout="minimal_agent", minimal_agent_inference=inference,
                               **kwargs).double()
     g = _gen(100 + seed)
@@ -681,7 +682,7 @@ def _k32_case(kind: str) -> Tuple[CanonicalFrameContext, torch.Tensor, torch.Ten
 
 
 def _k32_operators(inference: str, S: torch.Tensor, T_: torch.Tensor, dtype: torch.dtype) -> RelationalOperators:
-    ops = RelationalOperators([_D32] * _H32, 3, predictive_covariance="moment_matched", predictive_covariance_floor=1e-4,
+    ops = make_relational_operators([_D32] * _H32, 3, predictive_covariance="moment_matched", predictive_covariance_floor=1e-4,
                               predictive_readout="minimal_agent", minimal_agent_inference=inference).to(dtype)
     with torch.no_grad():
         ops.raw_score_q.copy_(S.to(dtype))
@@ -829,21 +830,21 @@ def test_config_validation_and_inactive_fields() -> None:
 def test_operator_constructor_refusals_parameters_and_refusing_methods() -> None:
     kwargs = dict(predictive_readout="minimal_agent")
     with pytest.raises(ValueError, match="predictive_content"):
-        RelationalOperators([2, 2], 1, readout_mode="full_link_update", **kwargs)
+        make_relational_operators([2, 2], 1, readout_mode="full_link_update", **kwargs)
     with pytest.raises(ValueError, match="equal heads"):
-        RelationalOperators([3, 3, 5], 1, **kwargs)
+        make_relational_operators([3, 3, 5], 1, **kwargs)
     with pytest.raises(ValueError, match="content_link_edges"):
-        RelationalOperators([2, 2], 1, content_link_chart="exponential", content_link_edges="lowrank",
+        make_relational_operators([2, 2], 1, content_link_chart="exponential", content_link_edges="lowrank",
                             content_link_edge_rank=2, **kwargs)
     with pytest.raises(ValueError, match="attention_residual"):
-        RelationalOperators([2, 2], 1, attention_residual=True, **kwargs)
+        make_relational_operators([2, 2], 1, attention_residual=True, **kwargs)
     with pytest.raises(ValueError, match="predictive_readout"):
-        RelationalOperators([2, 2], 1, predictive_readout="dense")
+        make_relational_operators([2, 2], 1, predictive_readout="dense")
     with pytest.raises(ValueError, match="minimal_agent_inference"):
-        RelationalOperators([2, 2], 1, minimal_agent_inference="laplace", **kwargs)
+        make_relational_operators([2, 2], 1, minimal_agent_inference="laplace", **kwargs)
     with pytest.raises(ValueError, match="minimal_agent_channel_noise"):
-        RelationalOperators([2, 2], 1, minimal_agent_channel_noise=0.0, **kwargs)
-    ops = RelationalOperators([2, 2], 1, minimal_agent_channel_noise=0.5, **kwargs)
+        make_relational_operators([2, 2], 1, minimal_agent_channel_noise=0.0, **kwargs)
+    ops = make_relational_operators([2, 2], 1, minimal_agent_channel_noise=0.5, **kwargs)
     assert set(ops.state_dict()) == {"raw_score_q", "T", "channel_log_noise"}
     assert ops.raw_score_k is None and ops.O is None
     assert torch.equal(ops.raw_score_q, ops.T)                        # S_Q = T's block projector at step 0
@@ -861,7 +862,7 @@ def test_operator_constructor_refusals_parameters_and_refusing_methods() -> None
                  lambda: ops.predictive_covariance_update(mu, torch.ones(1, 3, 4), beta, frame)):
         with pytest.raises(ValueError, match="minimal_agent"):
             call()
-    kernel = RelationalOperators([2, 2], 1)
+    kernel = make_relational_operators([2, 2], 1)
     assert set(kernel.state_dict()) == {"raw_score_q", "raw_score_k", "T", "O"}
     assert not hasattr(kernel, "channel_log_noise")
     with pytest.raises(ValueError, match="minimal_agent"):

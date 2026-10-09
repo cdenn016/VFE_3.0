@@ -1,11 +1,76 @@
 """Shared type contracts for mutable runtime dictionaries."""
 
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Dict, List, Mapping, Optional, Tuple, TypedDict
+from typing import Callable, Dict, Iterator, List, Mapping, Optional, Tuple, TypedDict
 
 import torch
 
 from vfe3.belief import BeliefState
+
+
+# Raise-only on-device verdicts waiting for the next mandatory host read; None outside a deferral scope.
+_DEFERRED_CHECKS: Optional[List[Tuple[torch.Tensor, Callable[[List[bool]], None]]]] = None
+
+
+@contextmanager
+def deferred_host_checks() -> Iterator[None]:
+    r"""Defer raise-only device verdicts to the next mandatory host read inside this scope.
+
+    A check registered through :func:`host_check` whose verdict can only raise (it selects no
+    computation) is queued instead of synchronizing. :func:`host_read` (the projected scorer's
+    per-layer recovery decision) resolves every queued verdict in its own transfer, in registration
+    order and before its own values, so each check raises its original exception before any later
+    check or computation reads its result. Whatever is still queued at a normal scope exit is resolved
+    there in one transfer, so the scope must close before anything consumes the scoped computation
+    (``train_step`` closes it after the forward and before ``backward``). An exception leaving the
+    scope discards the queue. Nested scopes join the outer one; outside any scope checks run at once.
+    """
+    global _DEFERRED_CHECKS
+    if _DEFERRED_CHECKS is not None:
+        yield
+        return
+    _DEFERRED_CHECKS = []
+    try:
+        yield
+        host_read(None)
+    finally:
+        _DEFERRED_CHECKS = None
+
+
+def host_check(flags: torch.Tensor, verdict: Callable[[List[bool]], None]) -> None:
+    r"""Run ``verdict(flags.tolist())`` now, or queue it inside :func:`deferred_host_checks`.
+
+    ``flags`` is a 1-D boolean tensor and ``verdict`` may only raise; a check whose result selects
+    later computation must read its flags itself.
+    """
+    if _DEFERRED_CHECKS is None:
+        verdict(flags.tolist())
+        return
+    _DEFERRED_CHECKS.append((flags, verdict))
+
+
+def host_read(values: Optional[torch.Tensor]) -> Optional[list]:
+    r"""``values.tolist()`` (a 1-D boolean tensor) in one transfer that also resolves every queued check.
+
+    Queued :func:`host_check` verdicts run first, in registration order, so a deferred check raises
+    before the caller acts on its own values. Queued flags on another device take their own transfer.
+    """
+    pending = _DEFERRED_CHECKS[:] if _DEFERRED_CHECKS else []
+    if not pending:
+        return None if values is None else values.tolist()
+    _DEFERRED_CHECKS.clear()
+    device = pending[0][0].device if values is None else values.device
+    joined = [flags for flags, _ in pending if flags.device == device]
+    host = torch.cat([*joined, *(() if values is None else (values,))]).tolist()
+    offset = 0
+    for flags, verdict in pending:
+        if flags.device == device:
+            verdict(host[offset:offset + flags.numel()])
+            offset += flags.numel()
+        else:
+            verdict(flags.tolist())
+    return None if values is None else host[offset:]
 
 
 @dataclass(frozen=True)
@@ -79,13 +144,21 @@ class CanonicalFrameContext:
             * conditioning_scale
         )
         tolerance = torch.clamp(unbounded_tolerance, max=1e-2)
-        finite_factors, finite_products, finite_validation, within_tolerance = torch.stack((
+        flags = torch.stack((
             torch.isfinite(self.forward).all() & torch.isfinite(self.inverse).all(),
             torch.isfinite(forward_inverse).all() & torch.isfinite(inverse_forward).all(),
             (torch.isfinite(residual).all() & torch.isfinite(conditioning_scale).all()
              & torch.isfinite(unbounded_tolerance).all()),
             torch.all(residual <= tolerance),
-        )).tolist()
+        ))
+        # The verdict only raises, so inside deferred_host_checks it joins the next mandatory host read.
+        policy = torch.get_float32_matmul_precision()
+        host_check(flags, lambda host: self._frame_verdict(host, residual, tolerance, policy))
+
+    def _frame_verdict(self, host: List[bool], residual: torch.Tensor, tolerance: torch.Tensor,
+                       policy: str) -> None:
+        """Raise the first failed frame contract of ``__post_init__`` from its host-side flags."""
+        finite_factors, finite_products, finite_validation, within_tolerance = host
         if not finite_factors:
             raise ValueError("canonical frame factors must contain only finite values")
         if not finite_products:
@@ -97,7 +170,6 @@ class CanonicalFrameContext:
         if not within_tolerance:
             hint = ""
             if self.forward.dtype == torch.float32:
-                policy = torch.get_float32_matmul_precision()
                 hint = (f"; fp32_matmul_precision is {policy!r}, so a producer that composed this "
                         "pair outside vfe3.runtime.ieee_fp32_matmul rounded it at TF32/bf16 "
                         "precision" if policy != "highest" else
@@ -215,6 +287,7 @@ class DataStateBuffer(TypedDict, total=False):
     batches_consumed:            int
     epoch:                       int
     data_identity:               Dict[str, object]
+    window_offset:               int        # train_window_offset='per_epoch_random': the epoch's origin
 
 
 class DataState(TypedDict):

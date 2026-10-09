@@ -39,6 +39,7 @@ second independent route, by autograd through these explicit formulas; the dampe
 here on the reference energy. The implementation is compared on the energy, the gradient, the inferred
 factors, the final mean and covariance (local coordinates, floor included) and the recorded statistics.
 """
+from tests.profiles import make_relational_operators
 import math
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
@@ -88,7 +89,7 @@ def _make_ops(
     seed:        int = 11,
 ) -> RelationalOperators:
     r"""A low-rank edge operator in float64, with or without latent inference."""
-    return RelationalOperators(
+    return make_relational_operators(
         [d] * H, seed, readout_mode="predictive_content", attention_residual=residual,
         predictive_covariance="moment_matched", predictive_covariance_floor=FLOOR,
         content_link_chart="exponential", content_link_edges="lowrank", content_link_edge_rank=rank,

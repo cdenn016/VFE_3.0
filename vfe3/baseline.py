@@ -47,7 +47,9 @@ by every layer, applied after the attention residual and before the MLP residual
     h_i \leftarrow h_i + W_2\, \mathrm{GELU}(W_1 h_i + b_1) + b_2,
 
 with no final normalization (the VFE's ``norm_type_final='none'``); the context-processing count is then
-exactly the VFE's. The decoder is the VFE linear decoder,
+exactly the VFE's. With ``attention_residual=False`` (copied by :meth:`BaselineConfig.matched_to` from a
+VFE base without an attention residual) the first update is
+:math:`h_i \leftarrow \mathrm{LN}(\mathrm{Attn}(h)_i)`, as that base computes. The decoder is the VFE linear decoder,
 
 .. math::
     \mathrm{logits}_i = W_{\mathrm{out}} \mathrm{LN}_f(h^{(L)}_i) + b_{\mathrm{out}} + \kappa \log\pi,
@@ -107,7 +109,7 @@ MAX_PASSES: float = 16.0
 # Fields that the matched arm copies from the VFE base config (identical names on both sides).
 MATCHED_FIELDS: Tuple[str, ...] = (
     "vocab_size", "embed_dim", "n_heads", "n_layers", "max_seq_len", "batch_size", "eval_stride",
-    "max_steps", "warmup_steps", "min_lr_frac", "grad_clip", "grad_accum_steps",
+    "max_steps", "warmup_steps", "min_lr_frac", "grad_clip", "grad_accum_steps", "train_window_offset",
     "amp_dtype", "fp32_matmul_precision", "seed", "deterministic", "fill_uninitialized_memory",
     "log_interval", "eval_interval",
     "checkpoint_interval", "val_diagnostic_batches", "beta_attention_prior", "alibi_slope",
@@ -128,7 +130,7 @@ _OPTIONAL_FLOAT_FIELDS: Tuple[str, ...] = ("grad_clip", "per_type_table_lr", "pe
 _BOOL_FIELDS: Tuple[str, ...] = (
     "deterministic", "fill_uninitialized_memory", "trust_resume_checkpoint", "generate_embedding_figures",
     "decode_bias",
-    "decode_unigram_prior",
+    "decode_unigram_prior", "attention_residual",
 )
 _WRAPPER_PREFIXES: Tuple[str, ...] = ("_orig_mod.", "module.")
 
@@ -165,6 +167,7 @@ class BaselineConfig:
     # Data protocol.
     batch_size:            int           = 64
     eval_stride:           Optional[int] = None        # validation/test sliding-window stride
+    train_window_offset:   str           = "fixed"     # "fixed" | "per_epoch_random" (VFE3Config's)
     # Optimization (AdamW; warmup then half-cosine, floored as in vfe3.train._floor_lr_lambdas).
     max_steps:             int           = 15000
     warmup_steps:          int           = 100
@@ -196,6 +199,9 @@ class BaselineConfig:
     # Normalization layout: "pre" (per-sublayer pre-LN plus a final LN) | "post_shared" (the VFE's one
     # shared LayerNorm after the attention residual, no final LN).
     norm_placement:        str           = "pre"
+    # post_shared only: False drops the attention residual, LN(Attn(h)) instead of LN(h + Attn(h)), as a
+    # VFE base with attention_residual=False computes.
+    attention_residual:    bool          = True
     # Attention prior (the VFE's registry).
     beta_attention_prior:  str           = "causal_alibi"
     alibi_slope:           float         = 1.0
@@ -254,6 +260,10 @@ class BaselineConfig:
         if self.eval_stride is not None and (type(self.eval_stride) is not int
                                              or not 1 <= self.eval_stride <= self.max_seq_len):
             raise ValueError(f"eval_stride must be None or an int in [1, max_seq_len], got {self.eval_stride!r}")
+        from vfe3.data.datasets import WINDOW_OFFSET_MODES
+        if self.train_window_offset not in WINDOW_OFFSET_MODES:
+            raise ValueError(f"train_window_offset must be one of {WINDOW_OFFSET_MODES}, "
+                             f"got {self.train_window_offset!r}")
         if self.batch_size % self.grad_accum_steps:
             raise ValueError(f"grad_accum_steps={self.grad_accum_steps} must divide batch_size={self.batch_size}")
         if self.lr <= 0.0:
@@ -291,6 +301,8 @@ class BaselineConfig:
                              f"got {self.decode_ce_checkpoint!r}")
         if self.norm_placement not in NORM_PLACEMENTS:
             raise ValueError(f"norm_placement must be one of {NORM_PLACEMENTS}, got {self.norm_placement!r}")
+        if not self.attention_residual and self.norm_placement != "post_shared":
+            raise ValueError("attention_residual=False is defined only for norm_placement='post_shared'")
         if self.per_type_table not in PER_TYPE_TABLES:
             raise ValueError(f"per_type_table must be one of {PER_TYPE_TABLES}, got {self.per_type_table!r}")
         if self.per_type_table_init not in PER_TYPE_TABLE_INITS:
@@ -379,6 +391,8 @@ class BaselineConfig:
         if self.pos_rotation == "none":
             out["rope_base"] = "only read by pos_rotation='rope'"
             out["rope_fraction"] = "only read by pos_rotation='rope'"
+        if self.norm_placement == "pre":
+            out["attention_residual"] = "only read by norm_placement='post_shared'"
         return out
 
     # -- matched arm ---------------------------------------------------------------------------
@@ -396,7 +410,8 @@ class BaselineConfig:
 
         Copied from the base: tokenizer size, width :math:`K`, heads :math:`H` (head width
         :math:`d = K/H`, the VFE block size), depth :math:`L`, context, batch, evaluation stride, step
-        budget, warmup and learning-rate floors, gradient clip and accumulation, precision, seed,
+        budget, warmup and learning-rate floors, gradient clip and accumulation, the training-window
+        origin (``train_window_offset``), precision, seed,
         cadence, the attention log-prior and its slope, and the unigram decode prior
         (:data:`MATCHED_FIELDS`). A base with ``pos_rotation='rope'`` gives the arm rotary query/key
         positions at the base's ``rope_base``; for ``rope_space='comparison'`` this is the rotation the base
@@ -407,7 +422,8 @@ class BaselineConfig:
         read map, when requested, has the base's token-frame size :math:`V K d`, and its ``phi_like``
         initialization scale is the base's ``phi_scale``. The peak learning rate, weight decay and
         Adam moments are baseline fields (tune them on validation); ``overrides`` sets any field
-        last. A mapping may be the whole ``config.json`` record (its ``"config"`` entry is used);
+        last. Under ``norm_placement='post_shared'`` the arm copies the base's ``attention_residual``
+        unless ``overrides`` sets it. A mapping may be the whole ``config.json`` record (its ``"config"`` entry is used);
         fields absent from an older mapping take the current ``VFE3Config`` defaults. The base must
         use the current full-width projected attention architecture, whose comparison and content
         maps have the same :math:`4K^2` parameters per layer as dense attention. Historical mappings
@@ -447,6 +463,8 @@ class BaselineConfig:
         if isinstance(phi_scale, (int, float)) and not isinstance(phi_scale, bool) and phi_scale > 0:
             derived["per_type_table_init_scale"] = float(phi_scale)
         derived.update(overrides)
+        if derived.get("norm_placement") == "post_shared" and "attention_residual" not in overrides:
+            derived["attention_residual"] = bool(values["attention_residual"])
         derived["model_family"] = MODEL_FAMILY
         return cls(**derived)
 
@@ -714,6 +732,7 @@ class BaselineBlock(nn.Module):
         out_std = cfg.init_std / math.sqrt(2.0 * cfg.n_layers)
         self.pre_ln = cfg.norm_placement == "pre"
         self.read_is_increment = cfg.per_type_table == "block_read"
+        self.attention_residual = cfg.attention_residual
         if self.pre_ln:
             self.ln1 = nn.LayerNorm(K, eps=cfg.layernorm_eps)
         self.attn = BaselineAttention(K, cfg.n_heads, cfg.init_std, out_std)
@@ -752,7 +771,7 @@ class BaselineBlock(nn.Module):
             return h + self.mlp(_fp32_layer_norm(self.ln2, h))
         if shared_norm is None:
             raise ValueError("norm_placement='post_shared' needs the model's shared_norm")
-        h = _fp32_layer_norm(shared_norm, h + a)                                            # (B, N, K) fp32
+        h = _fp32_layer_norm(shared_norm, h + a if self.attention_residual else a)          # (B, N, K) fp32
         return h + self.mlp(h)
 
 
@@ -1204,6 +1223,43 @@ def width_ladder_rule(
         "chosen_fits": bool(chosen["fits"]), "cap_binds": bool(chosen["cap_binds"]),
         "max_steps": chosen["max_steps"], "config": config,
     }
+
+
+def total_parameter_width(
+    base:         BaselineConfig,
+    target_total: int,
+
+    *,
+    head_dim:     Optional[int] = None,
+) -> Dict[str, Any]:
+    r"""The width whose total parameter count is nearest ``target_total`` (Table M2, "Matched total parameters").
+
+    Every field of ``base`` except the width and head count is kept (depth, MLP expansion, protocol,
+    optimizer). Over widths :math:`K = m d` in whole heads of :math:`d` = ``head_dim`` (default: the
+    base's head width), :math:`m \ge 1`, the total count of :meth:`BaselineConfig.total_parameters`,
+
+    .. math::
+        P(K) = L\,(4K^2 + 2eK^2 + eK + K + n_{\rm LN} K) + 2K + 2VK + b V + t\,VKd,
+
+    with :math:`n_{\rm LN} = 4` under pre-LN (0 under ``post_shared``), :math:`b = 1` with a decoder
+    bias and :math:`t = 1` with a per-type read map, is strictly increasing in :math:`K`. The chosen
+    width minimizes :math:`|P(K) - P^\star|`, the smaller width on a tie, so the rule is deterministic.
+    Returns the chosen config, ``width``, ``head_dim``, ``total_parameters``, ``target_total`` and
+    ``relative_error`` :math:`= (P(K) - P^\star) / P^\star`.
+    """
+    if type(target_total) is not int or target_total < 1:
+        raise ValueError(f"target_total must be a positive int, got {target_total!r}")
+    d = base.d_head if head_dim is None else int(head_dim)
+    if d < 1:
+        raise ValueError(f"head_dim must be >= 1, got {d}")
+    m = 1
+    while base.with_width(m * d, head_dim=d).total_parameters() < target_total:
+        m += 1
+    candidates = [base.with_width(k * d, head_dim=d) for k in ((m - 1, m) if m > 1 else (m,))]
+    chosen = min(candidates, key=lambda cfg: (abs(cfg.total_parameters() - target_total), cfg.embed_dim))
+    total = chosen.total_parameters()
+    return {"config": chosen, "width": chosen.embed_dim, "head_dim": d, "total_parameters": total,
+            "target_total": target_total, "relative_error": (total - target_total) / target_total}
 
 
 def calibrated_tokens_per_s(

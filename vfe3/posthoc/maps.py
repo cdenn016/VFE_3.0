@@ -104,6 +104,7 @@ def relational_maps(
     under their parameter names (:data:`EDGE_MAP_NAMES`). A minimal-agent layer (``channel_log_noise`` stored, no
     ``raw_score_k`` and no ``O``) ties the key to the content, so ``"S_K"`` is its ``T``; it has no ``"O"`` (the
     receiving map is derived from the receiver covariance) and carries ``"channel_log_noise"``.
+    A kernel layer stored without ``raw_score_k`` (``tie_comparison_maps``) reports ``"S_K"`` as its ``"S_Q"``.
     """
     layers: Dict[int, Dict[str, torch.Tensor]] = {}
     inverse = {leaf: name for name, leaf in _LEAF_BY_MAP.items()}
@@ -119,6 +120,8 @@ def relational_maps(
     for layer, maps in layers.items():
         if "channel_log_noise" in maps and "S_K" not in maps and "T" in maps:
             maps["S_K"] = maps["T"]                                     # minimal agent: tied key S_K = T
+        elif "S_K" not in maps and "S_Q" in maps and "channel_log_noise" not in maps:
+            maps["S_K"] = maps["S_Q"]                                   # tie_comparison_maps: S_K := S_Q
         if "S_Q" not in maps or "S_K" not in maps:
             raise ValueError(f"layer {layer} lacks a comparison map")
     chart = getattr(cfg, "content_link_chart", "affine")

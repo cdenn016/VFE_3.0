@@ -25,6 +25,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -56,6 +57,8 @@ import numpy as np
 
 from vfe3.config import config_from_serialized
 from vfe3.run_artifacts import _write_json_atomic
+
+logger = logging.getLogger(__name__)
 
 
 def _read_json(path: Path) -> Dict[str, Any]:
@@ -767,6 +770,10 @@ def aggregate_seed_curves(
                 continue
             cols[c] = np.array([np.nan if v is None else v for v in vals], float)[keep]
             all_cols.add(c)
+        n_repeated = int(steps.size - np.unique(steps).size)
+        if n_repeated:
+            logger.warning("%s has %d repeated %s value(s); keeping the last finite value per column",
+                           f, n_repeated, x)
         per_seed.append((steps, cols))
     if not per_seed:
         return {}
@@ -778,7 +785,10 @@ def aggregate_seed_curves(
         for steps, cols in per_seed:
             row = np.full(grid.shape, np.nan)
             if c in cols:
-                row[np.searchsorted(grid, steps)] = cols[c]
+                # Finite values only, in file order, so a repeated step keeps its last finite value.
+                finite = np.isfinite(cols[c])
+                for idx, value in zip(np.searchsorted(grid, steps[finite]), cols[c][finite]):
+                    row[idx] = value
             stack.append(row)
         matrix = np.vstack(stack)
         active = np.any(np.isfinite(matrix), axis=0)

@@ -291,6 +291,9 @@ def _identity_covariance_score(
     frame:        Any,
     operators:    Any,
     capture:      Optional[Dict[str, Any]] = None,
+
+    *,
+    row_invariant: bool = False,                     # relational_score's autograd hint; values do not depend on it
 ) -> torch.Tensor:                                   # (..., H, N, N)
     r"""``relational_score`` with every reference covariance :math:`C_i` replaced by :math:`I`.
 
@@ -562,6 +565,9 @@ def _frame_free_covariance_score(
     frame:        Any,
     operators:    Any,
     capture:      Optional[Dict[str, Any]] = None,
+
+    *,
+    row_invariant: bool = False,                     # relational_score's autograd hint; values do not depend on it
 ) -> torch.Tensor:                                   # (..., H, N, N)
     r"""``relational_score`` with the frame removed from the routing covariance only (row 10).
 

@@ -19,6 +19,8 @@ def _training_cfg(mode, covariance):
         use_block_mlp=True,
         block_mlp_mode=mode,
         block_mlp_covariance=covariance,
+        # delta_full omits the block-norm Jacobian, so the config admits it only without a block norm.
+        norm_type_block="none" if covariance == "delta_full" else "layernorm",
         gauge_group="block_glk",
         pos_phi="none",
         pos_rotation="none",

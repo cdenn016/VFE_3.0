@@ -63,7 +63,7 @@ from vfe3.model.block_mlp import (
     get_block_mlp_registration,
 )
 from vfe3.process_utils import run_process_tree
-from vfe3.runtime import deterministic_state
+from vfe3.runtime import deterministic_state, ieee_fp32_matmul
 
 if TYPE_CHECKING:                                        # forward ref only: train imports RunArtifacts
     from vfe3.train import TrainingTerminalState         # at top level, so a runtime import here cycles
@@ -143,6 +143,11 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
                         "minimal_agent_inference": cfg.minimal_agent_inference,
                         "minimal_agent_channel_noise_init": float(cfg.minimal_agent_channel_noise),
                         "key_tied_to_content": True}
+    tied = getattr(cfg, "tie_comparison_maps", False)      # S_K := S_Q: no raw_score_k
+    if tied:
+        layer_counts["score"] -= K*K
+    if getattr(cfg, "learn_attention_temperature", False):  # routing_log_temperature (H,) per layer
+        layer_counts["score"] += H
     counts = {role: count * cfg.n_layers for role, count in layer_counts.items()}
     return {"relational_operators": {
         "attention_mode": cfg.attention_mode,
@@ -168,9 +173,10 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "head_output_dimension": K,
         "score_parameterization": "free_full_row_rank",
         "score_initialization": ("query_equal_to_sending_block_projector" if minimal_agent
+                                 else "tied_orthonormal_rows_key_equals_query" if tied
                                  else "independent_orthonormal_rows"),
         "score_role_parameter_counts": ({"q": cfg.n_layers*K*K, "k": 0, "channel_log_noise": cfg.n_layers*H}
-                                        if minimal_agent else {"q": cfg.n_layers*K*K, "k": cfg.n_layers*K*K}),
+                                        if minimal_agent else {"q": cfg.n_layers*K*K, "k": 0 if tied else cfg.n_layers*K*K}),
         "score_rank_per_head": rank, "content_rank_per_head": rank,
         "identity_content": False,
         "content_mode": "full_width",
@@ -2178,6 +2184,9 @@ class RunArtifacts:
                 "epoch":                       epoch,
                 "data_identity":               data_identity,
             }
+            if "window_offset" in data_state:            # train_window_offset='per_epoch_random' only
+                saved_data_state["window_offset"] = _require_nonnegative_int(
+                    data_state["window_offset"], "window_offset")
         # Portable best-model selection state (PB-03): a finite best_val_ppl means best_model.pt IS the
         # selected checkpoint, so its validated bundle is embedded here and travels with the checkpoint
         # across a cross-run-directory resume (older bundles carried only the scalar, whose file was left
@@ -2670,6 +2679,9 @@ def load_checkpoint(
                 "epoch":                       saved_epoch,
                 "data_identity":               saved_data_identity,
             })
+            if saved_data_state.get("window_offset") is not None:
+                data_state["window_offset"] = _require_nonnegative_int(
+                    saved_data_state["window_offset"], "window_offset")
     if artifacts is not None:
         # Cumulative S1 panel D frame-projection counts (None for an older checkpoint); train()
         # continues counting from them so a resumed run's columns stay cumulative since step 0.
@@ -3479,6 +3491,7 @@ def _write_research_artifacts(
 _TOKEN_TABLE_PARAMETERS: Tuple[Tuple[str, str], ...] = (
     ("prior_bank", "mu_embed"),
     ("prior_bank", "sigma_log_embed"),
+    ("prior_bank", "sigma_chol_embed"),                 # prior_covariance_table='block_cholesky'
     ("prior_bank", "phi_embed"),
     ("prior_bank", "output_proj_weight"),
     ("prior_bank", "output_proj_bias"),
@@ -3958,6 +3971,11 @@ def finalize_run(
     }                                                          # mixes scalar headlines and nested diagnostics
     if test_loader is not None:
         m = evaluate(model, test_loader, tokens_per_char=tokens_per_char, device=device)
+        # A padded evaluation stream of T tokens holds T - 1 transitions, each scored exactly once,
+        # so test_scored_targets == test_stream_transitions checks the window protocol.
+        test_dataset = getattr(test_loader, "dataset", None)
+        stream_transitions = (int(test_dataset.tokens.numel()) - 1
+                              if getattr(test_dataset, "pad_final", False) else None)
         results.update({
             "test_ce":             m["ce"],
             "test_ppl":            m["ppl"],
@@ -3969,6 +3987,9 @@ def finalize_run(
             "test_expected_targets": m["expected_targets"],
             "test_scored_targets":   m["scored_targets"],
             "test_excluded_targets": m["excluded_targets"],
+            "test_overlap_context_targets": m["overlap_context_targets"],
+            "test_padding_targets":         m["padding_targets"],
+            "test_stream_transitions":      stream_transitions,
         })
         logger.info(
             "Test (held-out) | CE: %.4f | PPL: %.2f | BPT: %.4f | BPC: %s",
@@ -4138,6 +4159,9 @@ def finalize_run(
         "test_expected_targets": results.get("test_expected_targets"),
         "test_scored_targets": results.get("test_scored_targets"),
         "test_excluded_targets": results.get("test_excluded_targets"),
+        "test_overlap_context_targets": results.get("test_overlap_context_targets"),
+        "test_padding_targets": results.get("test_padding_targets"),
+        "test_stream_transitions": results.get("test_stream_transitions"),
         "diagnostics":  results["diagnostics"],
         "estep_final_iterate_f_per_token": results.get("estep_final_iterate_f_per_token"),
         "estep_final_f_per_token": results.get("estep_final_f_per_token"),
@@ -4529,13 +4553,18 @@ def collect_phi_numerics(
                 model.group,
                 block_dims=block_dims,
             )
-        record["flatness"] = metrics.flatness_reference_statistics(
-            phi,
-            model.group,
-            right_phi=belief.right_phi,
-            max_triangles=8,
-            block_dims=block_dims,
-        )
+        # The fp32 leg runs under IEEE fp32 GEMMs so "fp32" names the arithmetic, not a TF32 policy
+        # (audit 2026-10-09); the fp64 leg is unaffected by the fp32 matmul policy.
+        record["process_fp32_matmul_precision"] = torch.get_float32_matmul_precision()
+        with ieee_fp32_matmul():
+            record["flatness_fp32_matmul_precision"] = torch.get_float32_matmul_precision()
+            record["flatness"] = metrics.flatness_reference_statistics(
+                phi,
+                model.group,
+                right_phi=belief.right_phi,
+                max_triangles=8,
+                block_dims=block_dims,
+            )
         return record
     finally:
         model.train(was_training)

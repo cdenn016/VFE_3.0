@@ -1,5 +1,6 @@
 """Tiny exact Gaussian and gradient oracles for relational S/T/O operators."""
 
+from tests.profiles import make_relational_operators
 import importlib.util
 
 import pytest
@@ -142,7 +143,7 @@ def test_operator_initialization_and_compact_frames() -> None:
     from vfe3.model.relational_operators import RelationalOperators
 
     rng_before = torch.random.get_rng_state().clone()
-    content = RelationalOperators([3, 3], seed=7).double()
+    content = make_relational_operators([3, 3], seed=7).double()
     assert torch.equal(rng_before, torch.random.get_rng_state())
     identity = torch.eye(3, dtype=torch.float64).expand(2, 3, 3)
     S_q, S_k = content.comparison_pair()
@@ -165,9 +166,9 @@ def test_operator_rejects_rank_loss_and_invalid_heads() -> None:
     from vfe3.model.relational_operators import RelationalOperators
 
     with pytest.raises(ValueError, match="positive integer head sizes"):
-        RelationalOperators([3, 0], seed=1)
+        make_relational_operators([3, 0], seed=1)
     with pytest.raises(TypeError, match="identity_content"):
-        RelationalOperators([3], seed=1, identity_content=True)
+        make_relational_operators([3], seed=1, identity_content=True)
     degenerate = torch.ones(1, 3, 2)
     degenerate[..., 1] = degenerate[..., 0]
     with pytest.raises(ValueError, match="rank"):
@@ -210,7 +211,7 @@ def test_ill_conditioned_source_maps_preserve_projected_kl(smallest: float) -> N
     mu = torch.tensor([[[.2, .3, .7, .2, .3, .7], [.1, -.2, .4, .1, -.2, .4]]])
     inverse = torch.eye(3).expand(1, 2, 2, 3, 3)
     frame = CanonicalFrameContext(inverse, inverse, block_diagonal=True)
-    ops = RelationalOperators([3, 3], 0, readout_mode='predictive_content')
+    ops = make_relational_operators([3, 3], 0, readout_mode='predictive_content')
     with torch.no_grad():
         maps = torch.zeros(2, 3, 6)
         maps[0, :, :3] = S; maps[1, :, 3:] = S

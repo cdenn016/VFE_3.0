@@ -1,4 +1,5 @@
 """Tiny CPU equivalence and memory contracts for projected-path cleanup."""
+from tests.profiles import make_relational_operators
 from tests.profiles import test_config
 from typing import Any
 
@@ -110,7 +111,7 @@ def test_tiled_projection_keeps_source_factor_recovery(monkeypatch: pytest.Monke
 @pytest.mark.parametrize("input_scope", ["full"])
 def test_full_output_contraction_matches_expanded_reference(compact: bool, input_scope: str) -> None:
     torch.manual_seed(83)
-    operators = RelationalOperators([2, 2], 9,
+    operators = make_relational_operators([2, 2], 9,
                                     readout_mode="predictive_content").double()
     with torch.no_grad():
         operators.O.add_(torch.randn_like(operators.O) * .1)
@@ -176,8 +177,8 @@ def test_omitted_handoff_preserves_model_outputs_and_gradients(monkeypatch: pyte
 
 def test_handoff_guard_requires_unobserved_all_predictive_layers() -> None:
     cfg = _configuration()
-    predictive = RelationalOperators([2, 2], 2, readout_mode="predictive_content")
-    gradient = RelationalOperators([2, 2], 2, readout_mode="full_link_update")
+    predictive = make_relational_operators([2, 2], 2, readout_mode="predictive_content")
+    gradient = make_relational_operators([2, 2], 2, readout_mode="full_link_update")
     admit = stack_module._can_omit_prior_handoff
     assert admit(cfg, None, None, None, predictive, None)
     assert admit(cfg, None, None, None, None, [predictive, predictive])
@@ -248,7 +249,7 @@ def test_full_input_router_tiling_autocast_and_recomputed_gradients(
 ) -> None:
     from vfe3.gradients.relational import relational_score
     torch.manual_seed(37)
-    operators = RelationalOperators([2, 2], 9)
+    operators = make_relational_operators([2, 2], 9)
     mu = torch.randn(1, 3, 4) * .1
     sigma = torch.rand(1, 3, 4) + 1.
     if full:

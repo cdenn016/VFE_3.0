@@ -16,6 +16,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'embed_dim': 4,
     'max_seq_len': 3,
     'eval_stride': None,
+    'train_window_offset': 'fixed',
     'batch_size': 2,
     'max_steps': 15000,
     'warmup_steps': 100,
@@ -31,6 +32,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'resume_from': None,
     'trust_resume_checkpoint': False,
     'family': 'gaussian_diagonal',
+    'prior_covariance_table': 'diagonal',
     'mu_init_std': 0.02,
     'sigma_init': 1.0,
     'phi_scale': 0.01,
@@ -85,6 +87,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'relational_receiver_update': 'euler',
     'relational_receiver_damping': 1.0,
     'relational_routing': 'gaussian_kl',
+    'tie_comparison_maps': False,
     'predictive_readout': 'kernel',
     'minimal_agent_inference': 'exact',
     'minimal_agent_channel_noise': 1.0,
@@ -99,6 +102,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'mass_phi': 0.0,
     'mstep_self_coupling_weight': 0.0,
     'kappa_beta': 1.0,
+    'learn_attention_temperature': False,
     'beta_attention_prior': 'causal_alibi',
     'alibi_slope': 1.0,
     'attention_window': 128,
@@ -205,3 +209,21 @@ def tiny_config(**overrides: Any) -> VFE3Config:
                   skip_belief_sigma_update=False)
     values.update(overrides)
     return test_config(**values)
+
+
+def make_relational_operators(*args: Any, **overrides: Any) -> Any:
+    """RelationalOperators whose six required config-mirroring keywords come from the test baseline.
+
+    ``attention_residual``, ``predictive_covariance``, ``receiver_law``, ``receiver_update``,
+    ``content_link_chart`` and ``minimal_agent_inference`` have no constructor default; explicit
+    keyword arguments override the baseline values.
+    """
+    from vfe3.model.relational_operators import RelationalOperators
+    values = _CONFIG_VALUES
+    baseline = dict(attention_residual=values['attention_residual'],
+                    predictive_covariance=values['predictive_covariance'],
+                    receiver_law=values['relational_receiver_law'],
+                    receiver_update=values['relational_receiver_update'],
+                    content_link_chart=values['content_link_chart'],
+                    minimal_agent_inference=values['minimal_agent_inference'])
+    return RelationalOperators(*args, **{**baseline, **overrides})

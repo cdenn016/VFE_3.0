@@ -6,23 +6,15 @@ maps are added so the generic Bregman/Renyi-from-A path can be pinned against th
 """
 
 import math
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 
 from vfe3.families.base import (
     BeliefParams, register_family, safe_kl_clamp, _logdet_chol, ratio_minus_one_minus_log,
+    _KL_ALPHA_SWITCH, _RENYI_KL_BAND,
 )
 from vfe3.numerics import safe_cholesky, validated_cholesky_solve
-
-
-# fp32 catastrophic-cancellation band around the alpha->1 (KL) limit of the Renyi logdet term.
-# The |alpha-1| < 1e-6 KL switch in each kernel is exact in float64, but in float32 the three
-# nearly-equal logs in the logdet term cancel and are divided by a tiny (alpha-1), losing ~1%
-# accuracy out to roughly |alpha-1| ~ 1e-3. Inside this band the closed forms evaluate the logdet
-# term in float64 (the same dtype-guarded headroom the geometry Gram pseudo-inverse already uses)
-# and cast back; outside it the float32 quotient is accurate and used verbatim (byte-identical).
-_RENYI_KL_BAND: float = 1e-2
 
 
 def _full_gaussian_public_dtype(*dtypes: torch.dtype) -> torch.dtype:
@@ -368,7 +360,7 @@ class DiagonalGaussian(BeliefParams):
         sigma_q = self.sigma.to(compute_dtype).clamp(min=eps)
         mu_t = other.mu.to(compute_dtype)
         sigma_t = other.sigma.to(compute_dtype).clamp(min=eps)
-        if abs(alpha - 1.0) < 1e-6:
+        if abs(alpha - 1.0) < _KL_ALPHA_SWITCH:
             div = diag_kl_unclamped(mu_q, sigma_q, mu_t, sigma_t, eps=eps)
         else:
             # alpha in (0,1): the blend is a convex combination of positive variances, so it is
@@ -426,7 +418,7 @@ class DiagonalGaussian(BeliefParams):
         mu_t = other.mu.to(compute_dtype)
         sigma_t = other.sigma.to(compute_dtype).clamp(min=eps)
         delta = mu_t - mu_q
-        if abs(alpha - 1.0) < 1e-6:
+        if abs(alpha - 1.0) < _KL_ALPHA_SWITCH:
             per_coord = diag_kl_unclamped_per_coord(mu_q, sigma_q, mu_t, sigma_t, eps=eps)
         else:
             # See renyi_closed_form: alpha in (0,1) blend is always > 0 (mask inert, byte-identical);
@@ -771,7 +763,7 @@ class FullGaussian(BeliefParams):
         # safe_cholesky below: round 0 adds ZERO jitter (valid-SPD inputs are byte-identical to
         # torch.linalg.cholesky), failures get an escalating eps ridge, and a pair failing every
         # round -> NaN -> safe_kl_clamp -> kl_max.
-        if abs(alpha - 1.0) < 1e-6:
+        if abs(alpha - 1.0) < _KL_ALPHA_SWITCH:
             # safe_cholesky (jittered cholesky_ex, never raises) hardens the KL against a
             # numerically non-PD prior/posterior covariance -- reachable once training shifts the
             # prior, and routed here for any full-cov / non-kernel config via the E-step oracle.
@@ -887,3 +879,75 @@ class FullGaussian(BeliefParams):
                 ok = ok_q & ok_t                   # convex blend of SPD is SPD; only factors can fail
             div = torch.where(ok, div, div.new_tensor(float("nan")))
         return safe_kl_clamp(div, kl_max=kl_max).to(return_dtype)
+
+
+def head_block_projection(
+    covariance: torch.Tensor,           # (..., K, K) symmetric matrix
+    head_dims:  Sequence[int],          # head block sizes, sum = K
+) -> torch.Tensor:                      # (..., K, K) with every off-head block zero
+    r"""The head-block-diagonal part :math:`\bigoplus_h\Sigma_{hh}` of ``covariance``.
+
+    For a Gaussian :math:`p = \mathcal N(\mu, \Sigma)` this is the M-projection onto the block family:
+    :math:`\arg\min_q \mathrm{KL}(p\|q)` over block-diagonal :math:`q` matches the marginal of every head block.
+    """
+    if sum(head_dims) != covariance.shape[-1] or covariance.shape[-1] != covariance.shape[-2]:
+        raise ValueError(f"head_dims {list(head_dims)} must tile the covariance axes {tuple(covariance.shape[-2:])}")
+    mask = torch.block_diag(*(torch.ones(d, d, dtype=torch.bool, device=covariance.device) for d in head_dims))
+    return torch.where(mask, covariance, torch.zeros_like(covariance))
+
+
+@register_family("gaussian_block")
+class BlockGaussian(FullGaussian):
+    r"""Head-block-diagonal Gaussian: mu (..., K), sigma (..., K, K) SPD with zero off-head blocks.
+
+    The covariance is :math:`\Sigma = \bigoplus_h\Sigma_h`, one SPD :math:`d_h\times d_h` block per gauge head.
+    Block-diagonal SPD matrices are the smallest SPD family closed under the congruence of block_glk's
+    :math:`\prod_h GL(d_h)`; the diagonal family is closed only under monomial elements. Storage is the full
+    family's dense ``(..., K, K)`` layout (``cov_kind='full'``), so every full-covariance consumer (projected
+    routing, Mahalanobis norm, the full decoders) reads it unchanged and exactly; the block constraint is
+    maintained by the producers, which the configuration scopes to: the diagonal prior table embedded as
+    :math:`\mathrm{diag}(\sigma_v)` (a block-diagonal matrix), mean-only block maps, and the moment-matched
+    predictive update returning its head-block M-projection
+    (:meth:`vfe3.model.relational_operators.RelationalOperators.predictive_covariance_update`). The divergence,
+    entropy and natural-parameter maps are the full family's, exact on block-diagonal arguments.
+    """
+
+    head_block_covariance = True
+
+    @classmethod
+    def from_covariance(
+        cls,
+        mu:         torch.Tensor,                      # (..., K)
+        covariance: torch.Tensor,                      # (..., K, K)
+        *,
+        head_dims:  Optional[Sequence[int]] = None,    # head block sizes; required
+    ) -> "BlockGaussian":
+        r"""The family's readout of a full covariance: its head-block M-projection (:func:`head_block_projection`).
+
+        The head partition is a property of the gauge group, not of the family, so it must be given.
+        """
+        if head_dims is None:
+            raise ValueError("gaussian_block reads a full covariance through its head partition; pass head_dims")
+        return cls(mu, head_block_projection(covariance, head_dims))
+
+    def block(self, start: int, end: int) -> "BlockGaussian":
+        return BlockGaussian(
+            self.mu[..., start:end],
+            self.sigma[..., start:end, start:end],
+            _public_dtype=self._public_dtype,
+            _precision_policy=self._precision_policy,
+        )
+
+    def broadcast_over_keys(self) -> "BlockGaussian":
+        return BlockGaussian(
+            self.mu.unsqueeze(-2),
+            self.sigma.unsqueeze(-3),
+            _public_dtype=self._public_dtype,
+            _precision_policy=self._precision_policy,
+        )
+
+    @classmethod
+    def stack(cls, parts: List["FullGaussian"], *, dim: int = 0) -> "BlockGaussian":
+        stacked = FullGaussian.stack(parts, dim=dim)
+        return BlockGaussian(stacked.mu, stacked.sigma, _public_dtype=stacked._public_dtype,
+                             _precision_policy=stacked._precision_policy)

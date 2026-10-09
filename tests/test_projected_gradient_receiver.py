@@ -1,5 +1,6 @@
 """Tiny CPU checks for the projected_gradient receiver laws and updates (projected_gradient.tex)."""
 
+from tests.profiles import make_relational_operators
 from typing import Any
 
 import pytest
@@ -162,7 +163,7 @@ def test_channel_predictive_limit() -> None:
     sigma = torch.full((1, 3, 4), .9, dtype=torch.float64)
     eye = torch.eye(2, dtype=mu.dtype).expand(1, 3, 2, 2, 2).clone()
     frame = CanonicalFrameContext(eye, eye, block_diagonal=True)
-    ops = RelationalOperators([2, 2], 5, readout_mode="full_link_update",
+    ops = make_relational_operators([2, 2], 5, readout_mode="full_link_update",
                               receiver_law="channel_likelihood").double()
     prior = torch.tensor([[0., -torch.inf, -torch.inf], [0., 0., -torch.inf], [0., 0., 0.]], dtype=mu.dtype)
     ctx = build_full_link_context(mu, sigma, mu, sigma * 1e12, frame, ops, value=1e-12, log_prior=prior)

@@ -174,6 +174,9 @@ def not_applicable_reason(model: torch.nn.Module) -> Optional[str]:
     if any(getattr(op, "comparison_rope_base", None) is not None for op in operators):
         return ("rope_space='comparison': the router scores the R_i-rotated projected moments, which this "
                 "decomposition does not rebuild (it would decompose the unrotated cost)")
+    if any(getattr(op, "routing_log_temperature", None) is not None for op in operators):
+        return ("learn_attention_temperature=True: the routing temperature is learned per layer, and this "
+                "decomposition uses one configured temperature per head for every layer")
     if any(getattr(op, "mixed_heads", False) for op in operators):
         return "heads of different sizes (a mixed so_n irrep tower) are not supported by this analysis yet"
     return None

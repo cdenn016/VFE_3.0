@@ -439,7 +439,7 @@ def test_resources_table_sources_and_pending_column(tmp_path: Path, trained) -> 
     _header_ok(latex, "resources")
     assert r"$900$ ($90.00\%$) & pending" in latex
     assert "2.00 GB optimizer state; peak 1.50 GB & pending" in latex
-    assert "median 4,321 tokens/s; 3.50 device-hours" in latex
+    assert "median 4,321 tokens/s; 3.50 wall-clock device-hours (evaluation included)" in latex
     assert "Inference latency at declared batch and context & not recorded & pending" in latex
     bare = pr.load_run(_write_run(tmp_path, "bare", trained, weights=True, checkpoint=True))
     record = pt.resource_record(bare)

@@ -1,5 +1,6 @@
 """Moment-matched predictive covariance (predictive_covariance='moment_matched')."""
 
+from tests.profiles import make_relational_operators
 from tests.profiles import test_config
 import itertools
 from dataclasses import asdict, dataclass
@@ -32,7 +33,7 @@ def _block_dense(blocks: torch.Tensor) -> torch.Tensor:
 def _setup(input_scope: str, output_scope: str, residual: bool, seed: int = 0):
     generator = torch.Generator().manual_seed(seed)
     randn = lambda *shape: torch.randn(*shape, generator=generator, dtype=torch.float64)
-    ops = RelationalOperators([D] * H, 11,  readout_mode="predictive_content",
+    ops = make_relational_operators([D] * H, 11,  readout_mode="predictive_content",
                                attention_residual=residual,
                               predictive_covariance="moment_matched",
                               predictive_covariance_floor=1e-3).double()
@@ -180,7 +181,7 @@ def test_depth_recursion_stays_well_conditioned_in_float32() -> None:
     """
     torch.manual_seed(0)
     Hq, Dq = 4, 2
-    ops = RelationalOperators([Dq] * Hq, 3, readout_mode="predictive_content",
+    ops = make_relational_operators([Dq] * Hq, 3, readout_mode="predictive_content",
                               predictive_covariance="moment_matched")
     with torch.no_grad():
         ops.O.copy_(torch.randn(Hq, Hq * Dq, 1) @ torch.randn(Hq, 1, Dq))    # rank-one O_h
@@ -236,7 +237,7 @@ def _readout_fixture():
 
 def test_readout_returns_the_same_mean_and_the_operator_covariance() -> None:
     mu, sigma, frame, prior = _readout_fixture()
-    ops = RelationalOperators([2, 2], 11, readout_mode="predictive_content",
+    ops = make_relational_operators([2, 2], 11, readout_mode="predictive_content",
                               attention_residual=True,
                               predictive_covariance="moment_matched").double()
     capture = {}
@@ -253,12 +254,12 @@ def test_readout_returns_the_same_mean_and_the_operator_covariance() -> None:
 
 def test_operator_validation() -> None:
     with pytest.raises(ValueError, match="predictive_covariance must be"):
-        RelationalOperators([2, 2], 1, readout_mode="predictive_content", predictive_covariance="full")
+        make_relational_operators([2, 2], 1, readout_mode="predictive_content", predictive_covariance="full")
     with pytest.raises(ValueError, match="requires predictive_content"):
-        RelationalOperators([2, 2], 1, readout_mode="full_link_update", predictive_covariance="moment_matched")
+        make_relational_operators([2, 2], 1, readout_mode="full_link_update", predictive_covariance="moment_matched")
     for bad in (0.0, -1.0, float("nan"), True):
         with pytest.raises(ValueError, match="predictive_covariance_floor"):
-            RelationalOperators([2, 2], 1, readout_mode="predictive_content",
+            make_relational_operators([2, 2], 1, readout_mode="predictive_content",
                                 predictive_covariance="moment_matched", predictive_covariance_floor=bad)
 
 

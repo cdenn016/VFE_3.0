@@ -11,6 +11,7 @@ from typing import Dict, Optional, Tuple
 import torch
 from torch.utils.checkpoint import checkpoint
 
+from vfe3.contracts import host_read
 from vfe3.runtime import ieee_fp32_matmul
 from vfe3.numerics import (
     FACTOR_CONDITION_TOL, cholesky_qr2, guarded_cholesky, triangular_condition_estimate,
@@ -290,8 +291,11 @@ def _projected_moments_tile(
 
 
 @ieee_fp32_matmul()
-def _cholesky_status(G: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+def _cholesky_status(G: torch.Tensor, symmetric: bool = False) -> Tuple[torch.Tensor, ...]:
     r"""Factor G and certify eps ||G||_F ||G^{-1}||_F <= tol for every float32 entry on device.
+
+    ``symmetric=True`` is the caller's certificate that G is bitwise symmetric (built as
+    0.5 (G + G^T)), and skips the elementwise symmetry check; externally supplied G keeps it.
 
     ``tol`` is ``projected_gram_condition_tol`` (``_GRAM_CONDITION_TOL``, default 1e-4).
 
@@ -319,11 +323,17 @@ def _cholesky_status(G: torch.Tensor) -> Tuple[torch.Tensor, ...]:
             certificate = (torch.finfo(G.dtype).eps * G.norm(dim=(-2, -1)) * inverse_norm
                            > _GRAM_CONDITION_TOL)
             screen = (~failed) & certificate
-        tolerance = 32 * torch.finfo(G.dtype).eps
-        status = torch.stack((torch.isfinite(G).all(),
-                              torch.isclose(G, G.transpose(-1, -2), rtol=tolerance, atol=0.).all(),
+        status = torch.stack((torch.isfinite(G).all(), _symmetry_status(G, symmetric),
                               (failed | screen).any(), failed.any()))
     return chol, failed, screen, status
+
+
+def _symmetry_status(G: torch.Tensor, symmetric: bool) -> torch.Tensor:
+    r"""On-device symmetry verdict: G^T = G to 32 eps relative, or True when the caller certifies it."""
+    if symmetric:
+        return torch.ones((), dtype=torch.bool, device=G.device)
+    tolerance = 32 * torch.finfo(G.dtype).eps
+    return torch.isclose(G, G.transpose(-1, -2), rtol=tolerance, atol=0.).all()
 
 
 def _projected_root_factor_tile(
@@ -397,6 +407,7 @@ def _projected_root_factor(
 def _factor_status(
     G:          torch.Tensor,                # (..., N, H, r, r) explicit Gram, working dtype
     projection: Tuple[torch.Tensor, ...],
+    symmetric:  bool = False,                # caller certifies G bitwise symmetric
 ) -> Tuple[torch.Tensor, ...]:
     r"""Factor-route analogue of :func:`_cholesky_status`: (chol, failed, screen, status).
 
@@ -424,9 +435,7 @@ def _factor_status(
         if G.dtype == torch.float32 and G.shape[-1] > 1 and _CONDITION_RECOVERY:
             estimate = triangular_condition_estimate(chol)
             screen = (~failed) & (torch.finfo(G.dtype).eps * estimate > _FACTOR_CONDITION_TOL)
-        tolerance = 32 * torch.finfo(G.dtype).eps
-        status = torch.stack((torch.isfinite(G).all(),
-                              torch.isclose(G, G.transpose(-1, -2), rtol=tolerance, atol=0.).all(),
+        status = torch.stack((torch.isfinite(G).all(), _symmetry_status(G, symmetric),
                               (failed | screen).any(), failed.any()))
     return chol, failed, screen, status
 
@@ -513,7 +522,7 @@ def _strict_cholesky(
     """
     if prepared is None:
         chol, failed, screen, status = _cholesky_status(G)
-        decisions = status.tolist()
+        decisions = host_read(status)
     else:
         chol, failed, screen, decisions = prepared
     finite, symmetric, suspicious_any, failed_any = decisions
@@ -599,12 +608,15 @@ def projected_gaussian_kl(
     *,
     projection_q: Optional[Tuple[torch.Tensor, ...]] = None,
     projection_k: Optional[Tuple[torch.Tensor, ...]] = None,
+    symmetric_inputs: bool = False,
+    query_row_constant_grad: bool = True,
 ) -> torch.Tensor:      # (..., H, Nq, Nk)
     r"""Compute raw KL(q_i || k_j) = (tr(G_j^{-1}G_i) + delta^T G_j^{-1}delta - r + logdet(G_j/G_i))/2.
 
-    Cholesky factors and inverses have only one token axis. Bounded pair tiles
-    preserve direct differences without a full vector pair grid. Checkpointed
-    tiles also bound saved backward intermediates. Recovered factors use triangular solves
+    Cholesky factors and inverses have only one token axis. Healthy pairs are one centered
+    expanded GEMM per (batch, head) at IEEE fp32 (:func:`_projected_kl_gemm`), with no pair
+    difference grid; above the projection byte budget it is checkpointed, so only its token-linear
+    inputs are saved for backward. Recovered factors use bounded checkpointed pair tiles of triangular solves
     instead of cancelling covariance/precision products, in float64 under
     :func:`projected_recovery_precision` ``"fp64"`` and in the working dtype under ``"fp32"``. No floor, cap,
     symmetrization, jitter, or repair is applied. Optional (Sigma,U^-1,S[,mu])
@@ -619,10 +631,23 @@ def projected_gaussian_kl(
 
     The factor route is selected PER PAIR (audit 2026-09-23 low): a pair (b, h, i, j) takes
     it only when its own query entry (b, i, h) or key entry (b, j, h) was recovered. Every other
-    pair is the working-dtype value from the healthy tile geometry, bit-identical to the call in
+    pair is the working-dtype value of the healthy GEMM, bit-identical to the call in
     which no entry anywhere in the batch needed recovery, so an ill-conditioned token in another
     sequence or at a later position cannot change a healthy pair's arithmetic. The selection uses
     the recovery masks already on the device and the host flags the recovery path already reads.
+
+    ``symmetric_inputs=True`` certifies that G_q and G_k are bitwise symmetric (the output of
+    :func:`projected_moments`, or a rotated covariance re-symmetrized as 0.5 (G + G^T)) and skips
+    the elementwise symmetry check; the default keeps it for externally supplied covariances.
+
+    ``query_row_constant_grad=False`` is the caller's declaration that its use of the cost is invariant
+    to a constant added to each query row (the kernel router under ``routing_kl_max_reference='row_min'``,
+    whose clamp and softmax read only the gaps :math:`D_{ij} - \min_{j'} D_{ij'}`). On the healthy path
+    the query factor then feeds only :math:`-\tfrac12 \log\det G_i`, a row constant whose exact derivative
+    through that use is zero, so the query factorization and its certificate run without autograd. The
+    returned values, the certificate and the recovery decision are bitwise those of the default. When
+    either role needs recovery, the query factor also enters the factor-route trace
+    :math:`\lVert L_j^{-1} L_i \rVert_F^2`, so it is recomputed with autograd before recovery.
     """
     if a_q.ndim < 3 or a_k.ndim < 3 or a_q.shape[-2:] != a_k.shape[-2:]:
         raise ValueError("projected means must have matching head and comparison dimensions")
@@ -637,20 +662,28 @@ def projected_gaussian_kl(
         # factor and the Gram route runs.
         factored = (_FACTOR_ROUTE == "cholesky_qr2"
                     and projection_q is not None and projection_k is not None)
-        if factored:
-            q_status, k_status = _factor_status(Gq, projection_q), _factor_status(Gk, projection_k)
-        else:
-            q_status, k_status = _cholesky_status(Gq), _cholesky_status(Gk)
+        def _status(G: torch.Tensor, projection: Optional[Tuple[torch.Tensor, ...]]) -> Tuple[torch.Tensor, ...]:
+            return (_factor_status(G, projection, symmetric_inputs) if factored
+                    else _cholesky_status(G, symmetric_inputs))
+
+        with torch.set_grad_enabled(torch.is_grad_enabled() and query_row_constant_grad):
+            q_status = _status(Gq, projection_q)
+        k_status = _status(Gk, projection_k)
         # One host transfer for both roles and the means on the healthy path.
-        decisions = torch.cat(((torch.isfinite(aq).all() & torch.isfinite(ak).all()).reshape(1),
-                               q_status[-1], k_status[-1])).tolist()
+        # host_read also resolves raise-only checks deferred by vfe3.contracts.deferred_host_checks.
+        decisions = host_read(torch.cat(((torch.isfinite(aq).all() & torch.isfinite(ak).all()).reshape(1),
+                                         q_status[-1], k_status[-1])))
         if not decisions[0]:
             raise ValueError("projected means must contain only finite values")
+        if not query_row_constant_grad and torch.is_grad_enabled() and (decisions[3] or decisions[7]):
+            # Recovery reads the query factor beyond its log-determinant: refactor it with autograd.
+            # The factorization is deterministic, so the factor, masks and decisions are unchanged.
+            q_status = _status(Gq, projection_q)
         chol_q, rec_q = _strict_cholesky(Gq, projection_q, (*q_status[:3], decisions[1:5]), factored)
         chol_k, rec_k = _strict_cholesky(Gk, projection_k, (*k_status[:3], decisions[5:9]), factored)
         # Only tiles that touch a recovered query or key entry need the factor-route
-        # triangular solves (float64 under "fp64" recovery). Healthy-healthy tiles keep the cheap
-        # einsum path in the working dtype; the healthy factors round-trip bit-exactly through the cast.
+        # triangular solves (float64 under "fp64" recovery). Healthy pairs keep the centered GEMM
+        # in the working dtype; the healthy factors round-trip bit-exactly through the cast.
         factor_trace_any = rec_q is not None or rec_k is not None
         # "fp32" recovery keeps both factors in the working dtype, so its factor tiles do too.
         factor_fp64 = chol_q.dtype == torch.float64 or chol_k.dtype == torch.float64
@@ -721,18 +754,15 @@ def projected_gaussian_kl(
                                   use_reentrant=False, preserve_rng_state=False)
             return _projected_kl_tile(*args, ft)
 
-        # Working-dtype grid in the healthy tile geometry: exactly the no-recovery computation.
-        q_step, k_step = _tile_steps(aq_healthy.element_size(), r)
-        rows = []
-        for i in range(0, nq, q_step):
-            columns = []
-            for j in range(0, nk, k_step):
-                args = (aq_healthy[..., i:i+q_step, :], ak_healthy[..., j:j+k_step, :],
-                        q_cov_healthy[..., i:i+q_step, :, :], k_prec_healthy[..., j:j+k_step, :, :],
-                        logdet_q_healthy[..., i:i+q_step], logdet_k_healthy[..., j:j+k_step])
-                columns.append(_tile(args, False, q_step, k_step))
-            rows.append(torch.cat(columns, dim=-1))
-        healthy = torch.cat(rows, dim=-2)
+        # Working-dtype grid by one centered GEMM per (batch, head): exactly the no-recovery computation.
+        args = (aq_healthy, ak_healthy, q_cov_healthy, k_prec_healthy, logdet_q_healthy, logdet_k_healthy)
+        operand_bytes = batch_heads * (nq + nk) * (r * r + r) * aq_healthy.element_size()
+        if (torch.is_grad_enabled() and operand_bytes > _PROJECTION_TILE_BYTES
+                and any(x.requires_grad for x in args)):
+            # Save only the token-linear inputs; the expanded operands are rebuilt in backward.
+            healthy = checkpoint(_projected_kl_gemm, *args, use_reentrant=False, preserve_rng_state=False)
+        else:
+            healthy = _projected_kl_gemm(*args)
         if not factor_trace_any:
             return healthy.to(dtype)
         # Factor route only for pairs that touch a recovered entry, selected per (b, h, i, j).
@@ -759,6 +789,45 @@ def projected_gaussian_kl(
                 columns.append(value)
             rows.append(torch.cat(columns, dim=-1))
         return torch.cat(rows, dim=-2).to(dtype)
+
+
+@ieee_fp32_matmul()
+def _projected_kl_gemm(
+    aq:       torch.Tensor,  # (..., H, Nq, r) query means
+    ak:       torch.Tensor,  # (..., H, Nk, r) key means
+    q_cov:    torch.Tensor,  # (..., H, Nq, r, r) query covariances G_i
+    k_prec:   torch.Tensor,  # (..., H, Nk, r, r) key precisions P_j = G_j^{-1}
+    logdet_q: torch.Tensor,  # (..., H, Nq)
+    logdet_k: torch.Tensor,  # (..., H, Nk)
+) -> torch.Tensor:           # (..., H, Nq, Nk)
+    r"""Healthy pair KL grid as one centered expanded GEMM per (batch, head), at IEEE fp32.
+
+    With a common shift :math:`c`, :math:`\alpha_i = a_i - c` and :math:`b_j = a_{k,j} - c`,
+
+    .. math::
+        2\,\mathrm{KL}_{ij} = \langle G_i + \alpha_i\alpha_i^\top, P_j\rangle_F
+        - \alpha_i^\top (P_j + P_j^\top) b_j + b_j^\top P_j b_j + \log\det G_j - r - \log\det G_i,
+
+    which is :math:`\operatorname{tr}(P_jG_i) + \delta_{ij}^\top P_j\delta_{ij} - r + \log\det(G_j/G_i)`
+    for every :math:`c` (the :math:`(P_j + P_j^\top)` form does not assume a bitwise-symmetric precision).
+    The first two terms are one ``(Nq, r^2 + r) @ (r^2 + r, Nk)`` product. The shift is the first key
+    mean, detached (the value is independent of :math:`c`, so its gradient is zero), which keeps
+    :math:`\alpha` and :math:`b` at the scale of the means' spread instead of their offset and bounds
+    the expansion's cancellation; a first-key shift also keeps every row independent of later keys.
+    The forward GEMMs run at IEEE fp32 (``vfe3.runtime.ieee_fp32_matmul``); TF32 would round the
+    operands to :math:`2^{-10}`. Their backward runs under the caller's policy.
+    """
+    r = aq.shape[-1]
+    c = ak[..., :1, :].detach()                                                  # (..., H, 1, r)
+    alpha, b = aq - c, ak - c                                                    # (..., H, N, r)
+    Pb = (k_prec @ b.unsqueeze(-1)).squeeze(-1)                                  # (..., H, Nk, r)
+    PTb = (k_prec.transpose(-1, -2) @ b.unsqueeze(-1)).squeeze(-1)               # (..., H, Nk, r)
+    second = q_cov + alpha.unsqueeze(-1) * alpha.unsqueeze(-2)                   # (..., H, Nq, r, r)
+    query = torch.cat((second.flatten(-2), alpha), dim=-1)                       # (..., H, Nq, r^2 + r)
+    key = torch.cat((k_prec.flatten(-2), -(Pb + PTb)), dim=-1)                   # (..., H, Nk, r^2 + r)
+    cross = query @ key.transpose(-1, -2)                                        # (..., H, Nq, Nk)
+    key_constant = (b * Pb).sum(-1) + logdet_k                                   # (..., H, Nk)
+    return .5 * (cross + key_constant.unsqueeze(-2) - r - logdet_q.unsqueeze(-1))
 
 
 def _projected_kl_tile(
@@ -794,6 +863,7 @@ def projected_noisy_query_cost(
     *,
     projection_q: Optional[Tuple[torch.Tensor, ...]] = None,
     projection_k: Optional[Tuple[torch.Tensor, ...]] = None,
+    symmetric_inputs: bool = False,
 ) -> torch.Tensor:      # (..., H, Nq, Nk)
     r"""Compute D_ij = -log N(a_i; b_j, W_ij) - log det(2 pi G_q,i)/2 with W_ij = G_q,i + G_k,j.
 
@@ -814,6 +884,7 @@ def projected_noisy_query_cost(
     CholeskyQR3, and these pair tiles still run in float64.
     Recovered entries enter the working-dtype grid as identity placeholders, so no factorization
     of a numerically non-SPD sum runs even for a pair whose value the factor route replaces.
+    ``symmetric_inputs`` is the bitwise-symmetry certificate of :func:`projected_gaussian_kl`.
     """
     if a_q.ndim < 3 or a_k.ndim < 3 or a_q.shape[-2:] != a_k.shape[-2:]:
         raise ValueError("projected means must have matching head and comparison dimensions")
@@ -824,10 +895,11 @@ def projected_noisy_query_cost(
     with torch.autocast(device_type=a_q.device.type, enabled=False):
         aq, ak = a_q.to(dtype), a_k.to(dtype)
         Gq, Gk = G_q.to(dtype), G_k.to(dtype)
-        q_status, k_status = _cholesky_status(Gq), _cholesky_status(Gk)
+        q_status, k_status = _cholesky_status(Gq, symmetric_inputs), _cholesky_status(Gk, symmetric_inputs)
         # One host transfer for both roles and the means on the healthy path.
-        decisions = torch.cat(((torch.isfinite(aq).all() & torch.isfinite(ak).all()).reshape(1),
-                               q_status[-1], k_status[-1])).tolist()
+        # host_read also resolves raise-only checks deferred by vfe3.contracts.deferred_host_checks.
+        decisions = host_read(torch.cat(((torch.isfinite(aq).all() & torch.isfinite(ak).all()).reshape(1),
+                                         q_status[-1], k_status[-1])))
         if not decisions[0]:
             raise ValueError("projected means must contain only finite values")
         chol_q, rec_q = _strict_cholesky(Gq, projection_q, (*q_status[:3], decisions[1:5]))
@@ -971,6 +1043,7 @@ def projected_mean_distance_cost(
     *,
     projection_q: Optional[Tuple[torch.Tensor, ...]] = None,
     projection_k: Optional[Tuple[torch.Tensor, ...]] = None,
+    symmetric_inputs: bool = False,
 ) -> torch.Tensor:      # (..., H, Nq, Nk)
     r"""Covariance-blind control cost D_ij = ||a_i - b_j||^2 / 2 of the projected means.
 
@@ -978,7 +1051,8 @@ def projected_mean_distance_cost(
     I_r, equivalently dot-product attention a_i^T b_j with the key-norm bias -||b_j||^2/2 (the row
     constant ||a_i||^2/2 drops out of the softmax). It is the mean-only retraining control that
     isolates covariance-aware routing: the projected covariances are accepted for signature parity
-    with projected_gaussian_kl and are not read, so they receive no gradient through routing.
+    with projected_gaussian_kl (as is ``symmetric_inputs``) and are not read, so they receive no
+    gradient through routing.
     D_ij >= 0, so the [0, kl_max] cost bound applies unchanged.
 
     The direct differences are kept (no |a|^2 + |b|^2 - 2 a.b expansion, which cancels for nearby
@@ -1014,7 +1088,7 @@ def _mean_distance_tile(
 
 
 # Routing cost per relational_routing value; every cost takes (a_q, G_q, a_k, G_k, *, projection_q,
-# projection_k) and returns (..., H, Nq, Nk) nonnegative costs.
+# projection_k, symmetric_inputs) and returns (..., H, Nq, Nk) nonnegative costs.
 ROUTING_COSTS = {
     "gaussian_kl":   projected_gaussian_kl,
     "noisy_query":   projected_noisy_query_cost,

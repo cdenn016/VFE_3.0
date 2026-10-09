@@ -2,6 +2,7 @@
 
 Tiny CPU fixtures only (V=11, K=4, H=2, N=6 models; d <= 4 direct calls).
 """
+from tests.profiles import make_relational_operators
 from typing import Any, Iterator, List
 
 import pytest
@@ -133,11 +134,11 @@ def test_relational_score_dispatches_through_the_routing_registry(monkeypatch: p
     frame = CanonicalFrameContext(forward=eye, inverse=eye.clone(), block_diagonal=True)
     mu, sigma = torch.zeros(1, 3, 4, dtype=torch.float64), torch.ones(1, 3, 4, dtype=torch.float64)
     for routing in ("gaussian_kl", "noisy_query"):
-        ops = RelationalOperators([2, 2], 11, readout_mode="predictive_content", routing=routing).double()
+        ops = make_relational_operators([2, 2], 11, readout_mode="predictive_content", routing=routing).double()
         rel.relational_score(mu, sigma, mu, sigma, frame, ops)
     assert called == ["gaussian_kl", "noisy_query"]
     with pytest.raises(ValueError, match="routing"):
-        RelationalOperators([2, 2], 11, readout_mode="predictive_content", routing="dot_product")
+        make_relational_operators([2, 2], 11, readout_mode="predictive_content", routing="dot_product")
 
 
 # -- general-A#5 / hotspot-4#4: cached comparison RoPE ---------------------------------------------

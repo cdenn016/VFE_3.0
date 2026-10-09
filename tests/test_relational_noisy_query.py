@@ -1,4 +1,5 @@
 """Noisy-query routing: the exact expected-likelihood source posterior on projected moments."""
+from tests.profiles import make_relational_operators
 import math
 
 import pytest
@@ -246,15 +247,15 @@ def test_config_local_validation_serialization_and_inactive_mark(
 def test_operators_carry_routing_without_new_state() -> None:
     from vfe3.model.relational_operators import RelationalOperators
 
-    default = RelationalOperators([2, 2], 11, readout_mode="predictive_content")
-    noisy = RelationalOperators([2, 2], 11, readout_mode="predictive_content",
+    default = make_relational_operators([2, 2], 11, readout_mode="predictive_content")
+    noisy = make_relational_operators([2, 2], 11, readout_mode="predictive_content",
                                 routing="noisy_query")
     assert (default.routing, noisy.routing) == ("gaussian_kl", "noisy_query")
     assert set(noisy.state_dict()) == set(default.state_dict())
     with pytest.raises(ValueError, match="predictive_content"):
-        RelationalOperators([2, 2], 11, readout_mode="full_link_update", routing="noisy_query")
+        make_relational_operators([2, 2], 11, readout_mode="full_link_update", routing="noisy_query")
     with pytest.raises(ValueError, match="routing"):
-        RelationalOperators([2, 2], 11, readout_mode="predictive_content", routing="dot_product")
+        make_relational_operators([2, 2], 11, readout_mode="predictive_content", routing="dot_product")
 
 
 def test_relational_score_dispatches_on_the_operator_routing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -269,7 +270,7 @@ def test_relational_score_dispatches_on_the_operator_routing(monkeypatch: pytest
         monkeypatch.setitem(scoring.ROUTING_COSTS, name,
                             lambda *args, _name=name, **kwargs: called.append(_name) or torch.zeros(()))
     for routing in ("gaussian_kl", "noisy_query"):
-        ops = RelationalOperators([2, 2], 11, readout_mode="predictive_content",
+        ops = make_relational_operators([2, 2], 11, readout_mode="predictive_content",
                                   routing=routing).double()
         relational.relational_score(mu, sigma, mu, sigma, frame, ops)
     assert called == ["gaussian_kl", "noisy_query"]

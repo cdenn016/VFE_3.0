@@ -1,4 +1,5 @@
 """Tiny family-aware projected routing and conditional filtering contracts."""
+from tests.profiles import make_relational_operators
 import pytest
 import torch
 
@@ -38,7 +39,7 @@ def test_full_covariance_score_matches_dense_marginals(scope: str) -> None:
     root = torch.tensor([[1., .2, .3, 0.], [0., .9, .2, .1],
                          [.1, 0., 1.1, .2], [0., .1, 0., .8]], dtype=mu.dtype)
     Sigma = (root @ root.T).expand(1, 3, 4, 4).clone().requires_grad_()
-    ops = RelationalOperators([2, 2], 11).double()
+    ops = make_relational_operators([2, 2], 11).double()
     with torch.no_grad():
         ops.raw_score_q.add_(.08)
         ops.raw_score_k.sub_(.03)
@@ -84,7 +85,7 @@ def test_gaussian_rope_autocast_snapshot(family: str, readout: str, rope_on_valu
 
 
 def test_laplace_remains_outside_gaussian_projection_envelope() -> None:
-    with pytest.raises(ValueError, match="requires gaussian_diagonal or gaussian_full"):
+    with pytest.raises(ValueError, match="requires gaussian_diagonal, gaussian_full or gaussian_block"):
         _cfg(family="laplace_diagonal")
 
 
