@@ -135,13 +135,21 @@ def vfe_block(
         return _reference_coordinate_block(
             out, block_norm=block_norm, block_mlp=block_mlp, frame=relational_frame,
             capture=capture, hidden_bias=hidden_bias)
+    norm_jacobian = None
     if block_norm is not None:               # cached parameter-free norm (audit 2d/4f)
+        if getattr(block_mlp, "covariance_contract", None) == "delta_full":
+            # The norm maps the mean only; the delta_full pushforward composes its Jacobian at the pre-norm
+            # mean, J = J_mlp J_LN, against the pre-norm covariance (audit 2026-10-09, variational).
+            from vfe3.model.block_mlp import block_norm_jacobian
+            norm_jacobian = block_norm_jacobian(block_norm, out.mu)        # (B, N, K, K)
         out = out._replace(mu=block_norm(out.mu, out.sigma))   # _replace preserves phi/reflection
     if capture is not None:
         capture["block_mlp_input"] = out     # exact immediate seam after CG/norm
     if block_mlp is not None:                # default-off residual moment transform, after norm before handoff
         if hasattr(block_mlp, "forward_moments"):
             extra = {} if hidden_bias is None else {"hidden_bias": hidden_bias}
+            if norm_jacobian is not None:
+                extra["input_jacobian"] = norm_jacobian
             result = block_mlp.forward_moments(
                 out.mu, out.sigma, frame_context=block_mlp_frame, **extra)
             out = out._replace(mu=result.mu, sigma=result.sigma)

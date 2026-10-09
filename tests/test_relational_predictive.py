@@ -1,4 +1,5 @@
 """Tiny predictive mixture references and live outer-gradient contracts."""
+from tests.profiles import make_relational_operators
 from dataclasses import asdict
 
 import pytest
@@ -16,7 +17,7 @@ from tests.test_relational_integration import _cfg, _tokens
 @pytest.mark.parametrize("output_scope", ["full"])
 def test_predictive_dense_reference_and_source_gradients(output_scope: str) -> None:
     mu, sigma, _, frame, _, prior = _fixture()
-    ops = RelationalOperators([2, 2], 11,
+    ops = make_relational_operators([2, 2], 11,
                               readout_mode="predictive_content").double()
     with torch.no_grad():
         ops.T.copy_(torch.arange(16, dtype=mu.dtype).reshape(2, 2, 4) / 9 + .1)
@@ -42,7 +43,7 @@ def test_predictive_dense_reference_and_source_gradients(output_scope: str) -> N
 
 def test_predictive_readout_uses_a_separate_value_frame() -> None:
     mu, sigma, _, score_frame, _, prior = _fixture()
-    ops = RelationalOperators([2, 2], 11,
+    ops = make_relational_operators([2, 2], 11,
                               readout_mode="predictive_content").double()
     with torch.no_grad():
         ops.T.copy_(torch.arange(16, dtype=mu.dtype).reshape(2, 2, 4) / 9 + .1)
@@ -59,7 +60,7 @@ def test_predictive_readout_uses_a_separate_value_frame() -> None:
 @pytest.mark.parametrize("name", ["raw_score_q", "raw_score_k", "T", "O"])
 def test_predictive_finite_difference(name: str) -> None:
     mu, sigma, _, frame, _, prior = _fixture()
-    ops = RelationalOperators([2, 2], 11,
+    ops = make_relational_operators([2, 2], 11,
                               readout_mode="predictive_content").double()
     parameter = getattr(ops, name)
     def objective() -> torch.Tensor:
@@ -135,7 +136,7 @@ def test_predictive_bypasses_fisher_step_and_uses_source_content_graph() -> None
     torch.testing.assert_close(one.mu, two.mu, rtol=0, atol=0)
     torch.testing.assert_close(one.sigma, two.sigma, rtol=0, atol=0)
     mu, _, _, frame, _, _ = _fixture()
-    ops = RelationalOperators([2, 2], 11,
+    ops = make_relational_operators([2, 2], 11,
                               readout_mode="predictive_content").double()
     beta = torch.zeros(1, 2, 3, 3, dtype=mu.dtype)
     beta[..., 2, 0] = 1.

@@ -7,14 +7,14 @@ hours at the base run's measured throughput, estimated disk and training state).
 
 BASES. Each arm is a declared change of one base configuration, read from the base run's
 ``config.json`` with :func:`vfe3.legacy_config.lenient_config_from_serialized`. Fields a newer code
-line retired are dropped and recorded; fields the record lacks take the current defaults and are
-listed; the three fields whose defaults the working-tree ``vfe3/config.py`` flips
-(:data:`WIP_FLIPPED_DEFAULTS`) are pinned to the run's recorded values (to the pre-flip defaults when
-a record lacks one), so the arms never inherit a default flip. Every base is its own experiment with
-its own directory and manifest.
+line retired are dropped and recorded; a field the record lacks whose default was flipped after it
+was introduced takes its introduction-time value from the loader
+(``vfe3.config._HISTORICAL_DEFAULT_PINS``, listed as pinned), so the arms never inherit a default
+flip; every other field the record lacks takes the current default and is listed. Every base is its
+own experiment with its own directory and manifest.
 
-BUDGET. ``base_protocol``: the base run's own ``max_steps`` and ``eval_interval`` (the 34.48 run:
-150,000 updates, 614.4M token presentations), with ``checkpoint_interval = max_steps``. ``one_epoch``:
+BUDGET. ``base_protocol``: the base run's own ``max_steps`` and ``eval_interval``, with
+``checkpoint_interval = max_steps``. ``one_epoch``:
 ``max_steps = ceil(train tokens / (batch_size x max_seq_len))`` on the arm's
 dataset, ``eval_interval = max(1, max_steps // 20)`` (at least 20 validation points for Figure M3
 once ``max_steps >= 20``; every evaluation also writes the map snapshot of Figure S1) and
@@ -49,8 +49,11 @@ base's except where declared. Rules:
 * Word level: dataset ``wikitext-103-word-eos`` (the published stream, one ``<eos>`` per line), the
   vocabulary size from its sidecar, ``decode_ce_checkpoint='auto_aggregate'``, and the one-epoch budget over
   the word training split under either selected budget (:data:`WORD_LEVEL_BUDGET`). The conventional word arm is matched to the Gaussian word arm.
-* Matched measured compute: at run time the target is the mean measured train-only device-hours of
-  the retrained evaluated arm's complete runs; every width of the pre-declared ladder
+* Linear decoder: ``decode_mode='linear'`` (the baseline's decoder family); inapplicable on a base
+  that already decodes linearly.
+* Matched measured compute: deferred until every planned seed pair of the evaluated arm has a
+  complete run whose config is the plan's (:func:`reuse_mismatch`); the target is then the mean
+  measured train-only device-hours of those runs; every width of the pre-declared ladder
   (``width_ladder`` multiples of the matched width, whole 32-dim heads) gets a
   ``calibration_steps`` calibration run whose median train-step throughput feeds
   ``vfe3.baseline.width_ladder_rule``, which picks the width and ``max_steps``; the rule's record is
@@ -62,14 +65,28 @@ base's except where declared. Rules:
 * Confound controls (October 7, 2026 review of the 34.48 against 55.10 comparison). A baseline arm
   may declare ``overrides`` (``BaselineConfig`` fields applied after ``baseline_overrides``); a
   protocol field among them is a declared difference. "Per-type read table, ALiBi (as run)" repeats
-  the 55.10 configuration (``block_read``, ALiBi); the existing "Per-type table of the frame table's
-  size" row, matched to a causal-prior base, is the same table under the realization's uniform causal
-  prior. From the as-run arm, one change each: the realization's optimizer (Adam ``beta_2 = 0.999``,
-  no decay on matrices, decay 0.1 on the table as on the frames; the realization's 0.01 MLP decay and
-  per-role clipping remain different), a read-and-write table (``block_rw``), and the shared post-norm
-  layout (``norm_placement='post_shared'``). VFE arms: the realization with the ALiBi prior, and the
+  the 55.10 configuration (``block_read``, ALiBi, no RoPE); the "Per-type table of the frame table's
+  size" row is the same table under the base's own positional scheme. On a base with
+  ``beta_attention_prior='causal_alibi'`` and ``pos_rotation='none'`` the two configs are identical,
+  so the latter row is inapplicable. From the as-run arm, one change each: the realization's
+  optimizer (Adam ``beta_2 = 0.999``, no decay on matrices, decay 0.1 on the table as on the frames;
+  the realization's 0.01 MLP decay and per-role clipping remain different), a read-and-write table
+  (``block_rw``), and the shared post-norm layout (``norm_placement='post_shared'``, without the
+  attention residual when the base has none). VFE arms: the realization with the ALiBi prior, and the
   covariance-blind routing cost ``relational_routing='mean_distance'``. :data:`TIER_A` lists the
   baseline controls and :data:`TIER_B` the VFE retraining controls.
+
+* Registered decision rule (:func:`vfe3.paper.tables.decision_rule`). The comparator is resolved
+  from the base's positional scheme (:func:`decision_comparator`): the as-run ALiBi arm on an ALiBi
+  base without RoPE, the per-type table of the frame table's size on any other base. Clause (c), a
+  dated amendment of October 9, 2026 registered before any arm result, reads the capacity control
+  :data:`DECISION_CAPACITY` (identity frames with an equal-size trainable per-type additive table);
+  on a base where that arm is inapplicable the clause is ``n/a``. The resolved labels are written
+  into the manifest's ``decision`` record.
+* Matched total parameters: the conventional transformer of the base's depth and protocol whose
+  total parameter count (context processing plus per-type tables) is nearest the base's exact total,
+  widened in whole heads by :func:`vfe3.baseline.total_parameter_width`; its declared changes are
+  :data:`TOTAL_MATCHED_FIELDS`. It is in neither tier.
 
 An arm whose code is not in this build (a missing config field or ``vfe3.baseline`` /
 ``train_baseline``) is reported as unavailable with the reason; an arm that does not apply to the
@@ -79,15 +96,19 @@ refuses to start while a selected arm is invalid).
 SEEDS: ``seeds`` lists ints (``data_seed = seed``) or explicit ``(seed, data_seed)`` pairs, shared
 by every arm so replicates are paired across arms. Under the ``base_protocol`` budget the evaluated
 arm's replicate whose pair equals the base run's own ``(seed, data_seed)`` is the base run itself: it is
-reused (skipped in training, listed in the manifest, and read by the compute-matched rule) rather than
-retrained.
+reused (skipped in training, listed in the manifest, and read by the compute-matched rule when its
+config passes :func:`reuse_mismatch`) rather than retrained; the plan notes when its recorded code
+identity is not the current tree's.
 
 LAYOUT: ``<out_root>/<base>/<budget>/<arm slug>/<test PPL>_<slug>_s<seed>_d<data seed>/``. An (arm,
 seed) pair whose run directory already holds a complete ``summary.json`` (finite ``test_ce``) and
 whose saved config, dataset and seeds are the plan's (:func:`reuse_mismatch`) is skipped; a complete
 run that differs is reported as stale, and a launch refuses to train while one blocks a pair. After every run the manifest ``<out_root>/<base>/<budget>/m2_manifest.json`` is rewritten
 with every row of the table (rows without complete runs stay pending); pass it to
-``python paper_artifacts.py <manifest>``.
+``python paper_artifacts.py <manifest>``. A listed run whose recorded code identity is not the
+current tree's (:func:`vfe3.paper.runs.code_identity_mismatch`) is kept, not rejected, and flagged
+under ``paper_arms.rows[label]["code_identity_mismatch"]``; the decision rule reports it beside the
+clause without changing the verdict.
 """
 
 from __future__ import annotations
@@ -147,17 +168,12 @@ EVALUATED = "Evaluated: learned frames, decayed stored covariance"
 EVALUATED_NO_DECAY = "Evaluated: learned frames, stored covariance without decay"
 M3_POINTS = 20
 # Registered decision rule of the frame claim (vfe3.paper.tables.decision_rule): its comparator, the
-# per-type read-table transformer of sec:param_accounting, and the frozen-frame clause.
-DECISION_COMPARATOR = "Per-type read table, ALiBi (as run)"
+# per-type read-table transformer (resolved per base by decision_comparator), and the frozen-frame clause.
+DECISION_COMPARATOR_ALIBI = "Per-type read table, ALiBi (as run)"
+DECISION_COMPARATOR_MATCHED = "Per-type table of the frame table's size"
 DECISION_FROZEN = "Frames frozen at their random initialization"
-
-# Fields whose dataclass defaults the working-tree vfe3/config.py flips, with the defaults they had
-# before the flip (used only when a base record lacks the field).
-WIP_FLIPPED_DEFAULTS: Dict[str, Any] = {
-    "norm_type_block": "layernorm",
-    "layernorm_affine": True,
-    "skip_belief_sigma_update": True,
-}
+# Clause (c), the amendment of October 9, 2026: the capacity control of equal table size, no frames.
+DECISION_CAPACITY = "Identity frames, per-type additive table of equal size"
 
 # Fields VFE3Config.__post_init__ sets when gauge_transport='off' (identity frame, frozen).
 GAUGE_OFF_COERCED: Tuple[str, ...] = ("phi_scale", "pos_phi", "m_phi_lr")
@@ -255,12 +271,36 @@ def _word_level_base(base_dataset: str) -> Optional[str]:
 #   coerced               fields the config sets as a documented consequence of the overrides
 #   requires              VFE3Config fields the arm needs (unavailable when this build lacks one)
 #   inapplicable          function(base cfg) -> reason, or None when the arm applies
-#   baseline              vfe3.baseline spec: {"per_type_table": ..., "compute_matched": bool}
+#   baseline              vfe3.baseline spec: {"per_type_table": ..., "compute_matched": bool,
+#                         "total_matched": bool, "overrides": {...}}
 #   dataset               dataset override (word level)
 #   matched_to_arm        baseline matched to another arm's resolved config instead of the base
 def _alibi_already(cfg: Any) -> Optional[str]:
     if getattr(cfg, "beta_attention_prior", None) == "causal_alibi":
         return "the base already uses the ALiBi prior"
+    return None
+
+
+def _alibi_without_rope(cfg: Any) -> bool:
+    r"""Whether ``cfg`` positions by the ALiBi prior alone (the as-run 55.10 scheme)."""
+    return (getattr(cfg, "beta_attention_prior", None) == "causal_alibi"
+            and getattr(cfg, "pos_rotation", "none") == "none")
+
+
+def decision_comparator(base_cfg: Any) -> str:
+    r"""The registered comparator's arm label on ``base_cfg``.
+
+    On an ALiBi base without RoPE the as-run ALiBi table (:data:`DECISION_COMPARATOR_ALIBI`) is the
+    per-type table under the base's own positional scheme; on any other base the comparator is the
+    table under the base's scheme, :data:`DECISION_COMPARATOR_MATCHED`.
+    """
+    return DECISION_COMPARATOR_ALIBI if _alibi_without_rope(base_cfg) else DECISION_COMPARATOR_MATCHED
+
+
+def _same_as_alibi_as_run(cfg: Any) -> Optional[str]:
+    if _alibi_without_rope(cfg):
+        return (f"the base has beta_attention_prior='causal_alibi' and pos_rotation='none', so this row's "
+                f"config is {DECISION_COMPARATOR_ALIBI!r}'s")
     return None
 
 
@@ -293,10 +333,12 @@ ARMS: Dict[str, Dict[str, Any]] = {
     "Identity frames, stored covariance without decay": {
         "group": _RETRAINING, "slug": "identity_frames_no_decay",
         "vfe": {"gauge_transport": "off", "sigma_weight_decay": 0.0}, "coerced": GAUGE_OFF_COERCED},
-    "Identity frames, per-type additive table of equal size": {
+    DECISION_CAPACITY: {
         "group": _RETRAINING, "slug": "identity_frames_type_bias",
         "vfe": {"gauge_transport": "off", "per_type_hidden_bias": True},
-        # m_per_type_hidden_bias_lr None resolves to the declared m_phi_lr (read before the coercion).
+        # A recorded m_per_type_hidden_bias_lr, inert on the base, becomes the table's live rate (the
+        # plan notes its value); only a recorded None resolves to the declared m_phi_lr (read before
+        # the coercion), which is the coerced case.
         "coerced": (*GAUGE_OFF_COERCED, "m_per_type_hidden_bias_lr"),
         "requires": ("per_type_hidden_bias", "m_per_type_hidden_bias_lr"),
         "inapplicable": _no_coordinate_mlp},
@@ -333,13 +375,22 @@ ARMS: Dict[str, Dict[str, Any]] = {
     "MLP replaced by Gaussian template routing": {
         "group": _RETRAINING, "slug": "template_mlp", "vfe": {"block_mlp_mode": "gaussian_template"},
         "inapplicable": _template_already},
+    # Decoder confound (audit 2026-10-09): the baseline decodes linearly from K features.
+    "Linear decoder": {
+        "group": _RETRAINING, "slug": "linear_decoder", "vfe": {"decode_mode": "linear"},
+        "inapplicable": _already("decode_mode", "linear")},
     "Matched context-processing parameters": {
         "group": _BASELINES, "slug": "tf_matched_params", "baseline": {"per_type_table": "none"}},
     "Matched measured compute": {
         "group": _BASELINES, "slug": "tf_matched_compute",
         "baseline": {"per_type_table": "none", "compute_matched": True}},
+    # The manuscript's "total-parameter-matched transformer reported alongside" (GL(K)_attention_v2.tex:1307).
+    "Matched total parameters": {
+        "group": _BASELINES, "slug": "tf_matched_total",
+        "baseline": {"per_type_table": "none", "total_matched": True}},
     "Per-type table of the frame table's size": {
-        "group": _BASELINES, "slug": "tf_type_table", "baseline": {"per_type_table": "block_read"}},
+        "group": _BASELINES, "slug": "tf_type_table", "baseline": {"per_type_table": "block_read"},
+        "inapplicable": _same_as_alibi_as_run},
     "Learned frames, ALiBi prior": {
         "group": _CONFOUNDS, "slug": "alibi_prior", "vfe": dict(_ALIBI), "inapplicable": _alibi_already},
     "Covariance-blind routing (mean distance)": {
@@ -369,6 +420,7 @@ ARMS: Dict[str, Dict[str, Any]] = {
 # name); only fields present on both are compared.
 BASELINE_PROTOCOL_FIELDS: Dict[str, str] = {
     "vocab_size": "vocab_size", "max_seq_len": "max_seq_len", "eval_stride": "eval_stride",
+    "train_window_offset": "train_window_offset",
     "batch_size": "batch_size", "max_steps": "max_steps", "eval_interval": "eval_interval",
     "checkpoint_interval": "checkpoint_interval", "grad_accum_steps": "grad_accum_steps",
     "embed_dim": "embed_dim", "n_heads": "n_heads", "n_layers": "n_layers",
@@ -381,21 +433,25 @@ BASELINE_PROTOCOL_FIELDS: Dict[str, str] = {
     "decode_bias": "decode_bias",
     "decode_unigram_prior": "decode_unigram_prior", "unigram_kappa": "unigram_kappa",
 }
-# Confound controls for the 34.48 against 55.10 comparison (October 7, 2026). TIER_A: conventional
-# baselines (about 1.5 GPU-hours each at the base protocol, the compute-matched arm about as long as
-# the evaluated run). TIER_B: VFE retraining arms (about 16 GPU-hours each).
+# Confound controls for the 34.48 against 55.10 comparison (October 7, 2026), with the plain
+# matched-parameter baseline and the frozen-frame clause of the registered decision rule (audit
+# 2026-10-09). TIER_A: conventional baselines (about 1.5 GPU-hours each at the base protocol, the
+# compute-matched arm about as long as the evaluated run). TIER_B: VFE retraining arms (about 16
+# GPU-hours each).
 TIER_A: Tuple[str, ...] = (
     "Per-type read table, ALiBi (as run)",
     "Per-type table of the frame table's size",
     "Per-type read table, ALiBi, realization optimizer",
     "Per-type read-and-write table, ALiBi",
     "Per-type read table, ALiBi, shared post-norm",
+    "Matched context-processing parameters",
     "Matched measured compute",
 )
 TIER_B: Tuple[str, ...] = (
     EVALUATED,
     "Identity frames, stored covariance without decay",
-    "Identity frames, per-type additive table of equal size",
+    DECISION_CAPACITY,
+    DECISION_FROZEN,
     "Learned frames, ALiBi prior",
     "Covariance-blind routing (mean distance)",
 )
@@ -403,6 +459,8 @@ TIER_B: Tuple[str, ...] = (
 # Fields the compute-matched baseline changes by construction (width rule, calibrated steps, cadence).
 COMPUTE_MATCHED_FIELDS: Tuple[str, ...] = (
     "embed_dim", "n_heads", "max_steps", "eval_interval", "checkpoint_interval")
+# Fields the total-parameter-matched baseline changes by construction (vfe3.baseline.total_parameter_width).
+TOTAL_MATCHED_FIELDS: Tuple[str, ...] = ("embed_dim", "n_heads")
 # The compute-matched arm's rule record, written once in its arm directory and reused by later launches.
 WIDTH_RULE_FILE = "width_rule.json"
 
@@ -424,7 +482,7 @@ class Base:
     cfg:              Any                               # VFE3Config
     dataset:          str
     dropped:          Dict[str, Any] = field(default_factory=dict)   # retired fields dropped on load
-    pinned:           Dict[str, Any] = field(default_factory=dict)   # WIP-flipped fields -> value used
+    pinned:           Dict[str, Any] = field(default_factory=dict)   # absent fields the loader pins -> value
     defaulted:        List[str] = field(default_factory=list)        # fields the record lacks
     recorded_params:  Optional[int] = None                           # config.json n_params
     tokens_per_s:     Optional[float] = None                         # measured wall-clock throughput
@@ -439,8 +497,13 @@ def _quiet_config(build: Callable[[], Any]) -> Any:
 
 
 def load_base(name: str, path: Union[str, Path]) -> Base:
-    r"""Load a base run's config (lenient, WIP-flipped fields pinned) and its measured throughput."""
-    from vfe3.config import VFE3Config
+    r"""Load a base run's config (lenient) and its measured throughput.
+
+    A field the record lacks whose default was flipped after its introduction is pinned by the loader
+    (``vfe3.config._HISTORICAL_DEFAULT_PINS``, applied by ``config_from_serialized``) and listed in
+    ``pinned`` with its pinned value; every other absent field is listed in ``defaulted``.
+    """
+    from vfe3.config import _HISTORICAL_DEFAULT_PINS, VFE3Config
     from vfe3.legacy_config import lenient_config_from_serialized
 
     run_dir = Path(path)
@@ -448,11 +511,10 @@ def load_base(name: str, path: Union[str, Path]) -> Base:
         run_dir = ROOT / run_dir
     record = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
     raw = dict(record.get("config", record))
-    pinned = {key: raw.get(key, default) for key, default in WIP_FLIPPED_DEFAULTS.items()}
-    payload = {**raw, **pinned}
     cfg, dropped = _quiet_config(
-        lambda: lenient_config_from_serialized(payload, source=str(run_dir / "config.json")))
-    present = set(payload)
+        lambda: lenient_config_from_serialized(raw, source=str(run_dir / "config.json")))
+    pinned = {key: value for key, value in _HISTORICAL_DEFAULT_PINS.items() if key not in raw}
+    present = set(raw) | set(pinned)
     if present & {"relational_mode", "relational_readout_mode"}:
         present.add("attention_mode")                     # migrated from the historical pair
     defaulted = sorted(f.name for f in dataclasses.fields(VFE3Config) if f.name not in present)
@@ -691,6 +753,7 @@ def _evaluate(value: Any, base_cfg: Any) -> Any:
 def _baseline_api() -> Any:
     import vfe3.baseline as api
     for name in ("BaselineConfig", "BaselineTransformer", "steps_for_device_hours", "width_ladder_rule",
+                 "total_parameter_width",
                  "calibrated_tokens_per_s", "measured_train_device_hours"):
         if not hasattr(api, name):
             raise ImportError(f"vfe3.baseline has no {name}")
@@ -761,6 +824,9 @@ def resolve_arm(
         inert = plan.cfg.inactive_fields()
         plan.notes.extend(f"declared {key}={declared[key]!r} is inert here: {inert[key]}"
                           for key in declared if key in inert and key in plan.diff)
+        # A base value no path read becomes live under the arm (e.g. a recorded hidden-bias rate).
+        plan.notes.extend(f"{key}={getattr(plan.cfg, key)!r} is inert on the base and live in this arm"
+                          for key in sorted(set(base_cfg.inactive_fields()) - set(inert)))
         for seed, _ in seeds:
             _with_seed(plan.cfg, seed)                      # validates every seed's config
         if counts:
@@ -812,8 +878,21 @@ def _resolve_baseline(
         plan.status, plan.reason = "invalid", f"BaselineConfig.matched_to rejected the base: {exc}"
         return
     plan.matched_cfg = matched
+    declared = tuple(arm_overrides)
+    if options.get("total_matched"):
+        # Exact base total (two small-vocabulary builds), whether or not the plan reports counts.
+        target = _vfe_counts(matched)["total"]
+        rule = api.total_parameter_width(plan.cfg, target)
+        plan.cfg = rule["config"]
+        declared += TOTAL_MATCHED_FIELDS
+        plan.notes.append(f"total parameters {rule['total_parameters']:,} at width {rule['width']} "
+                          f"({rule['config'].n_heads} heads of {rule['head_dim']}) against the base's "
+                          f"{target:,} ({100 * rule['relative_error']:+.2f}%)")
     # A protocol field set by the arm's own overrides is a declared difference.
-    plan.diff = check_baseline_arm(matched, plan.cfg, declared=tuple(arm_overrides))
+    plan.diff = check_baseline_arm(matched, plan.cfg, declared=declared)
+    if plan.cfg.norm_placement == "post_shared" and not plan.cfg.attention_residual:
+        plan.notes.append("shared post-norm without the attention residual, LN(Attn(h)), as the matched base "
+                          "(attention_residual=False) computes; BaselineConfig.attention_residual=False")
     for seed, _ in plan.seeds:
         _with_seed(plan.cfg, seed)
     if options.get("compute_matched"):
@@ -861,9 +940,15 @@ def build_plan(
             else f"total parameters {total:,} differ from the base record {base.recorded_params:,}")
     if (evaluated is not None and budget == "base_protocol" and base.data_seed is not None
             and (int(base.cfg.seed), base.data_seed) in evaluated.seeds and is_complete(base.run_dir)):
+        from vfe3.paper.runs import code_identity_mismatch, load_run
+
         evaluated.reused = [(int(base.cfg.seed), base.data_seed)]
         evaluated.notes.append(f"seed pair {evaluated.reused[0]} is the base run itself and is reused, "
                                "not retrained")
+        mismatch = code_identity_mismatch(load_run(base.run_dir))
+        if mismatch is not None:
+            evaluated.notes.append(f"the reused base run's code identity is not the current tree's ({mismatch}); "
+                                   "it is kept and flagged in the manifest")
     for plan in plans:
         if plan.status == "deferred" and evaluated is not None:
             plan.est_hours = evaluated.est_hours
@@ -893,7 +978,7 @@ def format_plan(base: Base, plans: Sequence[ArmPlan], *, budget: str) -> str:
         f"norm={cfg.norm_type_block}/{cfg.norm_type_final} affine={cfg.layernorm_affine} "
         f"mlp={cfg.block_mlp_mode if cfg.use_block_mlp else 'none'}x{cfg.block_mlp_expansion} "
         f"decode={cfg.decode_mode} batch={cfg.batch_size}x{cfg.max_seq_len} sigma_wd={cfg.sigma_weight_decay}",
-        f"  pinned (WIP-flipped defaults): {base.pinned}",
+        f"  pinned (historical defaults the loader applies to absent fields): {base.pinned}",
         f"  dropped retired fields: {sorted(base.dropped)}",
         f"  fields filled by current defaults: {base.defaulted}",
         f"  recorded n_params={base.recorded_params:,}" if base.recorded_params else "  recorded n_params=-",
@@ -1047,8 +1132,8 @@ def completed_run(
     ``stale`` with its reason, so a changed arm, ``baseline_overrides`` value or base is reported
     rather than silently reused. Without ``cfg`` the first complete run is returned unchecked.
     Otherwise, under the ``base_protocol`` budget, the evaluated arm at the base run's own
-    ``(seed, data_seed)`` is the base run itself when it is complete: the same configuration
-    (``check_vfe_arm`` asserts the evaluated arm equals the resolved base), budget and seeds.
+    ``(seed, data_seed)`` is the base run itself when it is complete and, with ``cfg`` given,
+    :func:`reuse_mismatch` accepts it (a base recorded with another budget or cadence is stale).
     """
     slug = (ARMS if arms is None else arms)[label]["slug"]
     for found in complete_runs(exp_dir / slug, run_label(slug, seed, data_seed)):
@@ -1061,7 +1146,12 @@ def completed_run(
     if (base is not None and budget == "base_protocol" and label == EVALUATED
             and base.data_seed is not None and (int(base.cfg.seed), base.data_seed) == (seed, data_seed)
             and is_complete(base.run_dir)):
-        return base.run_dir
+        reason = (None if cfg is None else
+                  reuse_mismatch(base.run_dir, cfg, dataset=str(dataset), seed=seed, data_seed=data_seed))
+        if reason is None:
+            return base.run_dir
+        if stale is not None:
+            stale.append({"run": str(base.run_dir), "reason": reason})
     return None
 
 
@@ -1086,11 +1176,14 @@ def build_manifest(
     rejected complete run is listed under ``paper_arms.rows[label]["stale"]`` with its reason. Runs of an
     arm this launch did not resolve (``"not selected"``), or of the compute-matched arm before its width
     rule exists, are listed unchecked and flagged ``reuse_verified: false``. Every listed run's code
-    identity (:func:`vfe3.paper.runs.code_identity`) is recorded. The evaluated row is written under
-    :func:`evaluated_label` of the base; an inapplicable row carries its reason, which the tables print
-    as ``n/a``; ``decision`` names the arms of the registered decision rule.
+    identity (:func:`vfe3.paper.runs.code_identity`) is recorded, and a run whose identity is not the
+    current tree's is listed under ``code_identity_mismatch`` with the reason (kept, not rejected).
+    The evaluated row is written under :func:`evaluated_label` of the base; an inapplicable row carries
+    its reason, which the tables print as ``n/a``; ``decision`` names the arms of the registered
+    decision rule (evaluated, comparator, frozen, and the capacity control of the October 9, 2026
+    amendment), with the comparator resolved by :func:`decision_comparator`.
     """
-    from vfe3.paper.runs import code_identity, load_run
+    from vfe3.paper.runs import code_identity, code_identity_mismatch, load_run
 
     arms = ARMS if arms is None else arms
     by_label = {plan.label: plan for plan in plans}
@@ -1098,6 +1191,7 @@ def build_manifest(
     rows: Dict[str, Any] = {}
     evaluated_run = None
     shown_evaluated = evaluated_label(base.cfg)
+    current: Dict[str, Dict[str, Any]] = {}              # the working tree's identity, computed once per kind
     for label, spec in arms.items():
         plan = by_label.get(label)
         expected = _expected_cfg(exp_dir, plan) if plan is not None else None
@@ -1120,15 +1214,21 @@ def build_manifest(
                        "complete": len(runs),
                        "reuse_verified": expected is not None,
                        "stale": stale,
-                       "code_identity": {run: code_identity(load_run(run)) for run in runs}}
+                       "code_identity": {}, "code_identity_mismatch": []}
+        for run in runs:
+            record = load_run(run)
+            rows[shown]["code_identity"][run] = code_identity(record)
+            reason = code_identity_mismatch(record, current=current)
+            if reason is not None:
+                rows[shown]["code_identity_mismatch"].append({"run": run, "reason": reason})
         if label == EVALUATED and runs:
             evaluated_run = runs[0]
     return {
         "arms": manifest_arms,
         "evaluated_run": evaluated_run,
         "selection": "best",
-        "decision": {"evaluated": shown_evaluated, "comparator": DECISION_COMPARATOR,
-                     "frozen": DECISION_FROZEN},
+        "decision": {"evaluated": shown_evaluated, "comparator": decision_comparator(base.cfg),
+                     "frozen": DECISION_FROZEN, "capacity": DECISION_CAPACITY},
         "out_dir": str(exp_dir / "paper_artifacts"),
         "paper_arms": {"base": base.name, "base_run": str(base.run_dir), "budget": budget,
                        "seeds": [list(pair) for pair in seeds], "rows": rows,
@@ -1251,11 +1351,12 @@ def compute_matched_config(
     base:              Optional[Base] = None,
     budget:            Optional[str] = None,
 ) -> Optional[Any]:
-    r"""The compute-matched baseline config, or None while the evaluated arm has no complete run.
+    r"""The compute-matched baseline config, or None (deferred, logged with the reason).
 
-    Target :math:`h`: the mean measured train-only device-hours
-    (:func:`vfe3.baseline.measured_train_device_hours`) of the evaluated arm's complete runs of the
-    plan's seeds (runs whose config is the matched VFE config, :func:`reuse_mismatch`). Every ladder
+    Deferred until every planned seed pair of the evaluated arm has a complete run whose config is
+    the matched VFE config (:func:`reuse_mismatch`, applied to the reused base run too). Target
+    :math:`h`: the mean measured train-only device-hours
+    (:func:`vfe3.baseline.measured_train_device_hours`) of those runs. Every ladder
     width gets a training-only calibration run of ``calibration_steps`` steps
     (``train_baseline.calibrate_widths``; kept runs of the same width, length and configuration are
     reused), whose median train-step throughput (:func:`vfe3.baseline.calibrated_tokens_per_s`) feeds
@@ -1270,14 +1371,24 @@ def compute_matched_config(
     from vfe3.data.datasets import cached_token_count
 
     api = _baseline_api()
-    runs = [completed_run(exp_dir, EVALUATED, s, d, base=base, budget=budget, cfg=plan.matched_cfg,
-                          dataset=plan.dataset) for s, d in plan.seeds]
-    runs = [run for run in runs if run is not None]
+    runs: List[Path] = []
+    missing_pairs: List[str] = []
+    for s, d in plan.seeds:
+        found = completed_run(exp_dir, EVALUATED, s, d, base=base, budget=budget, cfg=plan.matched_cfg,
+                              dataset=plan.dataset)
+        # The base-run fallback of completed_run is not config-checked; check every run here.
+        reason = ("no complete run" if found is None else
+                  reuse_mismatch(found, plan.matched_cfg, dataset=str(plan.dataset), seed=s, data_seed=d))
+        if reason is None:
+            runs.append(found)
+        else:
+            missing_pairs.append(f"({s}, {d}): {reason}")
     rule_path = exp_dir / plan.slug / WIDTH_RULE_FILE
     if rule_path.is_file():
         return _frozen_width_rule(plan, rule_path, runs, logger)
-    if not runs:
-        logger.warning("%s deferred: the evaluated arm has no complete run yet", plan.label)
+    if missing_pairs:
+        logger.warning("%s deferred: the width rule waits for a complete evaluated run of every planned seed "
+                       "pair whose config is the plan's; missing %s", plan.label, "; ".join(missing_pairs))
         return None
     budgets = [api.measured_train_device_hours(run) for run in runs]
     devices = {entry.get("device_name") for entry in budgets}
@@ -1425,6 +1536,13 @@ def main(config: Optional[Mapping[str, Any]] = None, bases: Optional[Mapping[str
         if labels not in tiers:
             raise SystemExit(f"arms {labels!r} is not None, a list of labels, or one of {sorted(tiers)}")
         labels = list(tiers[labels])
+    if not config.get("dry_run", True) and config.get("device") is None:
+        import torch
+
+        if not torch.cuda.is_available():
+            raise SystemExit("dry_run=False with device=None, but CUDA is not available to this interpreter "
+                             f"({sys.executable}); run under the CUDA interpreter, or set CONFIG['device']='cpu' "
+                             "to train on the CPU deliberately")
     status = 0
     for name in config["bases"]:
         started = time.perf_counter()

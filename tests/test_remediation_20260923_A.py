@@ -195,7 +195,7 @@ def test_full_family_is_value_identical_to_diagonal_on_launcher_route() -> None:
 
 
 @pytest.mark.parametrize("override", [
-    {"block_mlp_covariance": "delta_full"},
+    {"block_mlp_covariance": "delta_full", "norm_type_block": "none"},
     {"predictive_covariance": "moment_matched"},
 ], ids=lambda o: next(iter(o)))
 def test_family_stays_live_where_a_seam_densifies_or_diagonal_is_not_admitted(
@@ -229,7 +229,7 @@ def test_passthrough_gauge_gate_keeps_family_value_identical() -> None:
 
 
 def test_delta_full_densifies_the_stored_covariance() -> None:
-    cfg = _cfg(_launcher(block_mlp_covariance="delta_full"))
+    cfg = _cfg(_launcher(block_mlp_covariance="delta_full", norm_type_block="none"))
     torch.manual_seed(0)
     model = VFEModel(cfg).double()
     g = torch.Generator().manual_seed(5)

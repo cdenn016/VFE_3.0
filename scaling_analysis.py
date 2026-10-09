@@ -213,21 +213,31 @@ def _validated_bound_scaling_run(
 
     *,
     force_accept_code_identity_drift: bool = False,
+    rejection: Optional[List[str]] = None,
 ) -> Optional[Dict[str, object]]:
-    """Validate the schema-2 generation contract that binds one scaling cell to its summary."""
-    if (run / "scaling_failure.json").exists():
+    """Validate the schema-2 generation contract that binds one scaling cell to its summary.
+
+    On failure returns ``None`` and, when ``rejection`` (a list the caller owns) is given, appends
+    the name of the failed check to it.
+    """
+    def reject(reason: str) -> None:
+        if rejection is not None:
+            rejection.append(reason)
         return None
+
+    if (run / "scaling_failure.json").exists():
+        return reject("scaling_failure.json present")
     if not all(isinstance(value, Mapping) for value in (
             summary, config_json, provenance, cell)):
-        return None
+        return reject("summary, config.json, provenance or scaling_cell.json is not a mapping")
     config = config_json.get("config")
     if not isinstance(config, Mapping):
-        return None
+        return reject("config.json has no config mapping")
     if cell.get("schema_version") != _SCALING_CELL_SCHEMA_VERSION:
-        return None
+        return reject("scaling_cell schema_version mismatch")
     dataset = cell.get("dataset")
     if not isinstance(dataset, str) or not dataset or config_json.get("dataset") != dataset:
-        return None
+        return reject("dataset missing or differs between scaling_cell and config.json")
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -242,25 +252,25 @@ def _validated_bound_scaling_run(
             json.loads(json.dumps(serialize_config(migrated), default=str)))
         saved_digest = cell.get(_SCALING_REUSE_DIGEST_FIELD)
     except (TypeError, ValueError):
-        return None
+        return reject("config could not be migrated or digested")
     if (not isinstance(saved_digest, str)
             or len(saved_digest) != 64
             or summary.get(_SCALING_SUMMARY_DIGEST_FIELD) != saved_digest
             or cell.get("config_sha256") != expected_config_sha256):
-        return None
+        return reject("reuse digest or config_sha256 mismatch")
     scaling_point = summary.get("scaling_point")
     if not isinstance(scaling_point, Mapping):
-        return None
+        return reject("summary has no scaling_point mapping")
     for field in ("embed_dim", "n_heads", "gauge_group", "n_layers", "n_e_steps"):
         if field in scaling_point:
             observed = scaling_point[field]
             expected = effective_config[field]
             if type(observed) is not type(expected) or observed != expected:
-                return None
+                return reject("scaling_point structural field differs from the effective config")
 
     code_identity = cell.get("code_identity")
     if not isinstance(code_identity, Mapping):
-        return None
+        return reject("scaling_cell has no code_identity mapping")
     git_sha = code_identity.get("git_sha")
     git_dirty = code_identity.get("git_dirty")
     dirty_fingerprint = code_identity.get("git_dirty_fingerprint")
@@ -290,21 +300,21 @@ def _validated_bound_scaling_run(
     if (not cell_identity_valid
             or not provenance_identity_valid
             or provenance_git_sha != git_sha):
-        return None
+        return reject("invalid code identity, or git_sha differs between scaling_cell and provenance")
     code_identity_forced = (
         provenance_git_dirty != git_dirty
         or provenance_dirty_fingerprint != dirty_fingerprint
     )
     if code_identity_forced and not force_accept_code_identity_drift:
-        return None
+        return reject("dirty-tree code identity differs between scaling_cell and provenance")
     if (code_identity_forced
             and not all(_is_sha256(provenance.get(field)) for field in (
                 "train_data_sha256", "val_data_sha256", "test_data_sha256"))):
-        return None
+        return reject("forced code identity without train/val/test data sha256")
 
     sources = cell.get("data_sources")
     if not isinstance(sources, Mapping) or set(sources) != set(_SCALING_SOURCE_SPLITS):
-        return None
+        return reject("data_sources missing or incomplete")
     source_identities: Dict[str, str] = {}
     for split in _SCALING_SOURCE_SPLITS:
         source = sources[split]
@@ -315,7 +325,7 @@ def _validated_bound_scaling_run(
                 or source["size_bytes"] < 0
                 or not isinstance(source.get("sha256"), str)
                 or not source["sha256"]):
-            return None
+            return reject("malformed data source record")
         source_identities[split] = json.dumps(
             dict(source),
             sort_keys=True,
@@ -327,13 +337,13 @@ def _validated_bound_scaling_run(
     seeds = (cell.get("seed"), effective_config.get("seed"), provenance.get("seed"))
     if (not all(_is_exact_nonnegative_seed(seed) for seed in seeds)
             or len(set(seeds)) != 1):
-        return None
+        return reject("seed missing, invalid or inconsistent across scaling_cell, config and provenance")
     for field in ("route", "label", "scale_knob"):
         if type(cell.get(field)) is not str or not cell[field]:
-            return None
+            return reject("route, label or scale_knob missing")
     metrics = _validated_scaling_metrics(summary)
     if metrics is None:
-        return None
+        return reject("invalid test metrics in summary")
     effective_run_key = _canonical_json_sha256({
         "config": _float_fields_as_float(
             json.loads(json.dumps(serialize_config(migrated), default=str)), migrated),
@@ -490,6 +500,7 @@ def harvest(
         cfg = cfgj.get("config", {}) if isinstance(cfgj, Mapping) else {}
         prov = _read_json(run / "provenance.json")
         cell = _read_json(run / "scaling_cell.json")
+        rejection: List[str] = []
         verified = _validated_bound_scaling_run(
             run,
             summ,
@@ -497,11 +508,15 @@ def harvest(
             prov,
             cell,
             force_accept_code_identity_drift=force_accept_code_identity_drift,
+            rejection=rejection,
         )
         if verified is None or not isinstance(sp, Mapping) or not isinstance(cfg, Mapping):
+            if not rejection:
+                rejection.append("scaling_point or config is not a mapping")
             logger.warning(
-                "scaling_analysis: run %s failed generation-contract validation and is not harvested",
+                "scaling_analysis: run %s failed generation-contract validation (%s) and is not harvested",
                 run,
+                rejection[0],
             )
             continue
         effective_cfg = verified.get("effective_config")

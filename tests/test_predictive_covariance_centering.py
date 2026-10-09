@@ -1,5 +1,6 @@
 """Centering of the predictive covariance's between-source spread (always on since 2026-10-02)."""
 
+from tests.profiles import make_relational_operators
 import torch
 
 from vfe3.contracts import CanonicalFrameContext
@@ -7,7 +8,7 @@ from vfe3.model.relational_operators import RelationalOperators
 
 
 def _operator() -> RelationalOperators:
-    ops = RelationalOperators([2], 3, readout_mode="predictive_content", predictive_covariance="moment_matched")
+    ops = make_relational_operators([2], 3, readout_mode="predictive_content", predictive_covariance="moment_matched")
     with torch.no_grad():
         ops.T.copy_(torch.eye(2).unsqueeze(0))
         ops.O.copy_(torch.eye(2).unsqueeze(0))

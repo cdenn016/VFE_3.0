@@ -192,6 +192,74 @@ def _cached_basis_value_signature(
     return value_signature
 
 
+def _bracket_closure_residual(
+    G:          torch.Tensor,             # (n_gen, K, K)
+    eps:        float,
+    gram_pinv_: Optional[torch.Tensor],
+) -> float:
+    r"""Max relative out-of-span residual of the brackets :math:`[G_a, G_b]` (see :func:`require_basis_closed`)."""
+    brak = torch.einsum("aij,bjk->abik", G, G) - torch.einsum("bij,ajk->abik", G, G)  # (n_gen, n_gen, K, K) [G_a,G_b]
+    proj = embed_phi(extract_phi(brak, G, gram_pinv_=gram_pinv_), G)         # span projection of each bracket
+    res  = (brak - proj).norm(dim=(-2, -1))                                 # (n_gen, n_gen)
+    den  = brak.norm(dim=(-2, -1)) + eps                                    # (n_gen, n_gen)
+    return float((res / den).max())
+
+
+def _spans_matrix_algebra(G: torch.Tensor) -> bool:
+    r"""Whether the ``(K^2, K, K)`` basis ``G`` spans all of :math:`\mathfrak{gl}(K)` (full-rank flattened Gram)."""
+    flat = G.reshape(G.shape[0], -1).double()                               # (K^2, K^2)
+    singular = torch.linalg.svdvals(flat)
+    return bool(singular.min() > flat.shape[-1] * torch.finfo(torch.float64).eps * singular.max())
+
+
+def _direct_sum_blocks(
+    generators: torch.Tensor,             # (n_gen, K, K)
+) -> Optional[List[torch.Tensor]]:        # distinct per-block sub-bases (n_b, d_b, d_b), or None
+    r"""Distinct block sub-bases of a block-diagonal direct-sum basis; None for one block or a shared generator.
+
+    The blocks are the connected components of the union support of all generators. The decomposition
+    applies when every nonzero generator is supported on one block; generators that are zero carry no
+    bracket and are dropped. Blocks whose restricted sub-bases are equal are returned once.
+    """
+    K = generators.shape[-1]
+    nonzero = generators != 0                                               # (n_gen, K, K)
+    coupled = nonzero.any(0)
+    coupled = (coupled | coupled.transpose(0, 1)).cpu()                     # (K, K) symmetric support
+    label = list(range(K))
+
+    def root(i: int) -> int:
+        while label[i] != i:
+            label[i] = label[label[i]]
+            i = label[i]
+        return i
+
+    for i, j in coupled.nonzero().tolist():
+        a, b = root(i), root(j)
+        if a != b:
+            label[max(a, b)] = min(a, b)
+    components = torch.tensor([root(i) for i in range(K)])                  # (K,) block label per coordinate
+    roots = torch.unique(components)
+    if roots.numel() < 2:
+        return None
+    support = (nonzero.any(-1) | nonzero.any(-2)).cpu()                     # (n_gen, K)
+    active = support.any(-1)                                                # (n_gen,) nonzero generators
+    blocks: List[torch.Tensor] = []
+    owned = torch.zeros_like(active)
+    for r in roots.tolist():
+        inside = components == r                                            # (K,)
+        members = active & ~(support & ~inside).any(-1)                     # generators within this block
+        owned |= members
+        if not bool(members.any()):
+            continue
+        index = inside.nonzero().squeeze(-1).to(generators.device)
+        sub = generators[members.to(generators.device)].index_select(-2, index).index_select(-1, index)
+        if not any(sub.shape == seen.shape and torch.equal(sub, seen) for seen in blocks):
+            blocks.append(sub)
+    if not bool(owned[active].all()):
+        return None                                                         # a generator spans several blocks
+    return blocks
+
+
 def require_basis_closed(
     generators:  torch.Tensor,            # (n_gen, K, K) fixed gauge generator basis
 
@@ -213,29 +281,35 @@ def require_basis_closed(
     the bracket scan without retaining the caller's tensor storage.
 
     The bracket scan materializes an ``(n_gen, n_gen, K, K)`` tensor; for large bases (e.g.
-    block_glk at K=140: n_gen=2800 -> ~1.5e11 elements) this would OOM. Such large bases here are the
-    direct-sum block groups, which are bracket-closed BY CONSTRUCTION, so when ``n_gen^2 * K^2``
-    exceeds ``max_elements`` the scan is skipped and the basis is treated as closed (cached, no
-    warning).
+    block_glk at K=140: n_gen=2800 -> ~1.5e11 elements) this would OOM. A block-diagonal direct-sum
+    basis (every generator supported on one diagonal block, as :func:`vfe3.geometry.groups._build_block_local`,
+    block_glk and untied so_n build them) is closed iff each block's sub-basis is, because brackets of
+    generators on different blocks vanish and the blocks' spans are Frobenius-orthogonal; so such a basis
+    is scanned on its distinct per-block local generators (one scan for H identical head blocks,
+    audit 2026-10-09).
 
-    LIMITATION (audit 2026-06-13 L5): the size-skip ASSUMES a too-large basis is closed-by-
-    construction, which holds for the shipped direct-sum groups (block_glk, so_n) but is NOT verified
-    for a large custom registered basis; there the scan is silently skipped.
+    LIMITATION (audit 2026-06-13 L5): when the scan that remains (the whole basis, or one distinct
+    block) still exceeds ``max_elements``, it is skipped and the basis is treated as closed (cached, no
+    warning). That ASSUMES closure by construction and is NOT verified for a large custom basis that is
+    not block-diagonal.
     """
     key = _cached_basis_value_signature(generators)
     max_res = _BRACKET_CLOSURE_RES.get(key)
     if max_res is None:
-        n_gen, K = generators.shape[0], generators.shape[-1]
-        if n_gen * n_gen * K * K > max_elements:                  # too large to scan; closed by construction
-            _bounded_lru_store(_BRACKET_CLOSURE_RES, key, 0.0)
-            return
         with torch.no_grad():
-            G    = generators                                                   # (n_gen, K, K)
-            brak = torch.einsum("aij,bjk->abik", G, G) - torch.einsum("bij,ajk->abik", G, G)  # [G_a,G_b]
-            proj = embed_phi(extract_phi(brak, G, gram_pinv_=gram_pinv_), G)     # span projection of each bracket
-            res  = (brak - proj).norm(dim=(-2, -1))                             # (n_gen, n_gen)
-            den  = brak.norm(dim=(-2, -1)) + eps                                # (n_gen, n_gen)
-            max_res = float((res / den).max())
+            blocks = _direct_sum_blocks(generators)
+            if blocks is None:
+                blocks, gram = [generators], gram_pinv_
+            else:
+                gram = None                       # the caller's pseudo-inverse is for the whole basis
+            max_res = 0.0
+            for G in blocks:                                                    # (n_b, d_b, d_b)
+                n_gen, K = G.shape[0], G.shape[-1]
+                if n_gen == K * K and _spans_matrix_algebra(G):
+                    continue                              # span is all of gl(d_b): every bracket is in it
+                if n_gen * n_gen * K * K > max_elements:          # too large to scan; closed by construction
+                    continue
+                max_res = max(max_res, _bracket_closure_residual(G, eps, gram))
         _bounded_lru_store(_BRACKET_CLOSURE_RES, key, max_res)
     else:
         _BRACKET_CLOSURE_RES.move_to_end(key)
@@ -632,8 +706,8 @@ def compose_bch(
     # Guard (cached, phi-independent): refuse a basis that is not bracket-closed, in which case the
     # Dynkin commutators leave span{G_a} and the extract_phi projection above would drop that part. Closure depends only on the fixed generators and never touches Z's autograd graph;
     # the bounded cache owns only a CPU value signature and scalar residual, not the caller's basis.
-    # The scan is size-gated (max_elements): large direct-sum bases (e.g. block_glk K=140, the prior
-    # O(K^4) OOM) are skipped as closed-by-construction.
+    # Direct-sum bases are scanned per distinct block (block_glk's gl(d) blocks by their full span); a scan
+    # that still exceeds max_elements is skipped as closed-by-construction (see require_basis_closed).
     require_basis_closed(generators, where="compose_bch",
                              closure_tol=closure_tol, eps=eps, gram_pinv_=gram_pinv_)
     _fail_if_bch_residual_exceeds(

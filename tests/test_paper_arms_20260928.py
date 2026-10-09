@@ -2,7 +2,7 @@ r"""Main-results arms (``paper_arms.py``) and the library training run (:func:`v
 
 Everything runs on tiny synthetic bases (K = 4, two heads, two layers, vocabulary 7) and tiny token
 caches written by the test into a temporary cache directory. Covered: the arm labels against the
-manuscript rows, base loading (legacy fields dropped, the working-tree default flips pinned), arm
+manuscript rows, base loading (legacy fields dropped, the loader's historical pins reported), arm
 resolution with the difference assertion, inapplicable and unavailable arms, the one-epoch budget,
 skip-completed, the manifest read back by :mod:`vfe3.paper`, the dry run, an end-to-end launch of
 two paired seeds, and ``run_vfe`` reproducing ``train_vfe3._run_once`` bitwise.
@@ -130,18 +130,22 @@ def test_arm_labels_and_groups_are_the_manuscript_rows() -> None:
 
 # ---- bases and budgets -------------------------------------------------------------------------
 
-def test_load_base_pins_wip_flipped_fields_and_records_legacy_fields(tmp_path: Path) -> None:
-    run = _write_base(tmp_path, _tiny_cfg(), extra={"mean_only": False}, drop=tuple(PINNED))
+def test_load_base_reports_loader_pins_and_records_legacy_fields(tmp_path: Path) -> None:
+    from vfe3.config import _HISTORICAL_DEFAULT_PINS
+
+    pin = "projected_cov_recovery_precision"
+    run = _write_base(tmp_path, _tiny_cfg(), extra={"mean_only": False}, drop=(pin, "rope_fraction"))
     base = pa.load_base("tiny", run)
-    assert base.pinned == pa.WIP_FLIPPED_DEFAULTS == PINNED
-    assert {key: getattr(base.cfg, key) for key in PINNED} == PINNED
+    # The loader (config_from_serialized) applies the historical pin; load_base reports it.
+    assert base.pinned == {pin: _HISTORICAL_DEFAULT_PINS[pin]}
+    assert getattr(base.cfg, pin) == _HISTORICAL_DEFAULT_PINS[pin]
     assert base.dropped == {"mean_only": False}
-    assert not set(PINNED) & set(base.defaulted)
+    assert pin not in base.defaulted and "rope_fraction" in base.defaulted
     assert base.tokens_per_s == pytest.approx(100 * 2 * 4 / 20.0)
-    # A recorded value wins over the pre-flip default.
+    # A recorded value wins over the pin and is not reported as pinned.
     other = tmp_path / "other"
-    recorded = pa.load_base("tiny", _write_base(other, _tiny_cfg(norm_type_block="none", layernorm_affine=False)))
-    assert recorded.pinned["norm_type_block"] == "none" and recorded.cfg.norm_type_block == "none"
+    recorded = pa.load_base("tiny", _write_base(other, _tiny_cfg(**{pin: "fp32"})))
+    assert recorded.pinned == {} and getattr(recorded.cfg, pin) == "fp32"
 
 
 def test_one_epoch_budget_gives_twenty_evaluations_and_one_checkpoint(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -267,8 +271,10 @@ def test_baseline_arms_match_the_protocol_when_the_baseline_exists(tmp_path: Pat
     assert matched.cfg.model_family == "conventional_transformer"
     assert (matched.cfg.embed_dim, matched.cfg.max_steps, matched.cfg.eval_stride) == (4, 12, 2)
     assert plans["Matched measured compute"].status == "deferred"
-    table = plans["Per-type table of the frame table's size"]
-    assert table.cfg.per_type_table == "block_read"
+    # On this ALiBi base without RoPE the frame-size table is the as-run ALiBi table (audit 2026-10-09).
+    assert plans["Per-type table of the frame table's size"].status == "inapplicable"
+    table = plans["Per-type read table, ALiBi (as run)"]
+    assert table.cfg.per_type_table == "block_read" and table.diff == {}
     word = plans["Conventional transformer, matched"]
     assert word.cfg.vocab_size == V_WORD and word.cfg.decode_ce_checkpoint == "auto_aggregate"
     # The read map has the size of the VFE token-frame table.

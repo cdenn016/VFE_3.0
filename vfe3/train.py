@@ -21,7 +21,7 @@ import time
 from numbers import Real
 from pathlib import Path
 from typing import (Any, Callable, Collection, Dict, Iterable, Iterator, List, Mapping, NamedTuple, Optional,
-                    Sequence, Tuple)
+                    Sequence, Set, Tuple)
 
 import torch
 
@@ -34,7 +34,7 @@ except ImportError:                                 # tqdm optional: absent -> n
     _tqdm = None                                    # log lines still emit at log_interval as before
     _redirect_logging = contextlib.nullcontext
 
-from vfe3.contracts import is_vfe_model, model_family_of
+from vfe3.contracts import deferred_host_checks, is_vfe_model, model_family_of
 from vfe3.config import VFE3Config
 from vfe3.contracts import DataState, DataStateBuffer
 from vfe3.data.datasets import make_dataloader
@@ -73,7 +73,8 @@ from vfe3.numerics import (                    # non-equivariant / non-PD fallba
     reset_mu_trust_fallback_elements,
     bounded_variance_from_log,
 )
-from vfe3.relational_scoring import reset_source_recovery_elements   # projected float64 source-factor recovery count
+from vfe3.relational_scoring import (                                # projected float64 source-factor recovery count
+    reset_source_recovery_elements, source_recovery_elements)
 from vfe3.geometry.transport import (                           # float64 frame-pair escalation count
     frame_pair_fp64_escalations,
     reset_frame_pair_fp64_escalations,
@@ -279,7 +280,8 @@ def build_optimizer(
     # decode_log_scale is always frozen (requires_grad=False in VFEModel; the learned temperature was
     # retired 2026-10-02), so it joins no optimizer group and the readout temperature stays fixed.
     decode_mu_lr, decode_sigma_lr = _decode_learning_rates(cfg)
-    sigma_parameters = [parameter for parameter in (pb.sigma_log_embed,)
+    # prior_covariance_table='block_cholesky' replaces sigma_log_embed by the Cholesky table sigma_chol_embed.
+    sigma_parameters = [parameter for parameter in (pb.sigma_log_embed, getattr(pb, "sigma_chol_embed", None))
                         if parameter is not None and parameter.requires_grad]
     if sigma_parameters:
         groups.append({"params": sigma_parameters, "lr": cfg.m_p_sigma_lr,
@@ -316,7 +318,7 @@ def build_optimizer(
         layers = model.relational_operators_by_layer
         # channel_log_noise (predictive_readout='minimal_agent') is a score-side parameter: it enters the routing
         # through the record covariance. raw_score_k and O are None there (tied key, derived receiving map).
-        for role, names in (("score", ("raw_score_q", "raw_score_k", "channel_log_noise")),
+        for role, names in (("score", ("raw_score_q", "raw_score_k", "channel_log_noise", "routing_log_temperature")),
                             ("content", ("T", "O"))):
             # Mixed head sizes store a ParameterList per name (one tensor per run of equal heads).
             parameters = [p for ops in layers for name in names
@@ -756,8 +758,11 @@ def train_step(
     _egrad_sums: Dict[str, float] = {}
     _egrad_counts: Dict[str, int] = {}
     if grad_accum_steps == 1:                                   # default path: byte-identical to the single-step loop
-        _, loss, decode_stats = model(
-            tokens, targets, estep_grad_out=_egrad, return_decode_stats=True)
+        # Raise-only frame certificates join the forward's next mandatory host read; the scope closes
+        # (resolving anything still queued) before backward, so no uncertified value reaches a gradient.
+        with deferred_host_checks():
+            _, loss, decode_stats = model(
+                tokens, targets, estep_grad_out=_egrad, return_decode_stats=True)
         ce = decode_stats.ce
         _scored_det = decode_stats.scored_tokens.detach()
         _excluded_det = _excluded_token_count(decode_stats, targets.numel()).detach()
@@ -784,8 +789,9 @@ def train_step(
         ce_numerator = torch.zeros((), dtype=torch.float64, device=tokens.device)
         for tok_mb, tgt_mb in zip(tok_chunks, tgt_chunks):
             _egrad_mb = {} if metrics_out is not None else None
-            _, loss_mb, decode_stats_mb = model(
-                tok_mb, tgt_mb, estep_grad_out=_egrad_mb, return_decode_stats=True)
+            with deferred_host_checks():
+                _, loss_mb, decode_stats_mb = model(
+                    tok_mb, tgt_mb, estep_grad_out=_egrad_mb, return_decode_stats=True)
             ce_mb = decode_stats_mb.ce
             count_mb = decode_stats_mb.scored_tokens.detach()
             count_tensors.append(count_mb)
@@ -889,17 +895,36 @@ def train_step(
          for p in g["params"] if p.grad is not None]
         if explicit_grad_check else []
     )
+    # Optimizer groups partition parameters into roles; each role gets one L2 bound.
+    clip_roles: List[list] = []
+    if grad_clip is not None and grad_clip > 0:
+        role_params: dict = {}
+        for group in optimizer.param_groups:
+            role_params.setdefault(group.get("role", "other"), []).extend(group["params"])
+        clip_roles = [parameters for parameters in role_params.values() if parameters]
+    clip_norms: Optional[List[torch.Tensor]] = None
+    clip_finite: Optional[bool] = None
     if not _scaler_enabled and _flags and step_loss is None:    # fuse default-path loss + grad flag
+        if clip_roles:
+            # Per-role L2 norms of the unscaled, accumulated gradients, exactly those clip_grad_norm_
+            # would compute after this barrier (nothing below changes a gradient before the clip), so
+            # their finiteness joins this one transfer instead of a second synchronization.
+            clip_norms = [torch.nn.utils.get_total_norm([p.grad for p in parameters if p.grad is not None])
+                          for parameters in clip_roles]
         _values = torch.stack((
             _loss_det.to(dtype=torch.float64),
             torch.stack(_flags).all().to(dtype=torch.float64),
             _target_partition_valid_det.to(dtype=torch.float64),
             _zero_scored_det.to(dtype=torch.float64),
+            *((torch.isfinite(torch.stack([norm.to(tokens.device) for norm in clip_norms])).all()
+               .to(dtype=torch.float64),) if clip_norms is not None else ()),
         )).tolist()
         step_loss = _values[0]
         grad_finite = bool(_values[1])
         target_partition_valid = bool(_values[2])
         zero_scored_targets = bool(_values[3])
+        if clip_norms is not None:
+            clip_finite = bool(_values[4])
     elif _flags:
         grad_finite = bool(torch.stack(_flags).all())
     if step_loss is None:                                       # fp16 / no-grads fallback: one plain loss sync
@@ -988,15 +1013,13 @@ def train_step(
     if metrics_out is not None:
         metrics_out["grad_finite"] = float(grad_finite)
     if grad_clip is not None and grad_clip > 0 and not skip_step:
-        clip_norms = []
-        # Optimizer groups partition parameters into roles; each role gets one L2 bound.
-        role_params: dict = {}
-        for group in optimizer.param_groups:
-            role_params.setdefault(group.get("role", "other"), []).extend(group["params"])
-        for parameters in role_params.values():
-            if parameters:
-                clip_norms.append(torch.nn.utils.clip_grad_norm_(parameters, grad_clip))
-        clip_finite = bool(torch.isfinite(torch.stack([norm.to(tokens.device) for norm in clip_norms])).all())
+        if clip_norms is None:                                  # scaler / fallback routes: own transfer
+            clip_norms = [torch.nn.utils.get_total_norm([p.grad for p in parameters if p.grad is not None])
+                          for parameters in clip_roles]
+            clip_finite = bool(torch.isfinite(torch.stack([norm.to(tokens.device) for norm in clip_norms])).all())
+        # clip_grad_norm_ is get_total_norm followed by clip_grads_with_norm_; the split keeps its values.
+        for parameters, norm in zip(clip_roles, clip_norms):
+            torch.nn.utils.clip_grads_with_norm_(parameters, grad_clip, norm)
         skip_step = not clip_finite
         if metrics_out is not None:
             metrics_out["grad_clip_finite"] = float(clip_finite)
@@ -1188,6 +1211,11 @@ def evaluate(
     :func:`vfe3.data.datasets.tokens_per_char`). ``bits_per_token`` is always published under its
     own name. When character normalization is unavailable, ``tokens_per_char=None`` leaves ``bpc``
     null rather than silently relabeling bits per token as bits per character.
+
+    The ignored targets are also split by position within each window row: ``overlap_context_targets``
+    counts the leading run (the sliding-window context prefix) of rows that score at least one target,
+    and ``padding_targets`` counts the trailing run (the padded final window) plus every target of a
+    row that scores none. Ignored targets between scored ones fall in neither count.
     """
     if device is None:
         device = next(model.parameters()).device
@@ -1198,10 +1226,17 @@ def evaluate(
         total_tok = torch.zeros((), dtype=torch.int64, device=device)
         total_expected = torch.zeros((), dtype=torch.int64, device=device)
         total_excluded = torch.zeros((), dtype=torch.int64, device=device)
+        total_overlap = torch.zeros((), dtype=torch.int64, device=device)
+        total_padding = torch.zeros((), dtype=torch.int64, device=device)
         for i, (tokens, targets) in enumerate(loader):
             # Inspect CPU-loader padding before transfer; device-origin loaders retain checks.
             total_expected.add_(targets.numel())
             valid = targets != -100
+            row_scores = valid.any(dim=-1, keepdim=True)
+            leading = valid.cumsum(dim=-1) == 0                                 # (..., N) before the first scored target
+            trailing = valid.flip(-1).cumsum(dim=-1) == 0                       # (..., N) after the last, reversed
+            total_overlap.add_((leading & row_scores).sum().to(device, non_blocking=True))
+            total_padding.add_(trailing.sum().to(device, non_blocking=True))
             has_ignored = bool((~valid).any())
             grouped_trailing_padding = False
             if (has_ignored and tokens.ndim == 2 and targets.ndim == 2
@@ -1243,6 +1278,7 @@ def evaluate(
                 break               # draw exactly max_batches (process-then-break; no extra pull)
         total_nats_value, accounting = _evaluation_totals_from_device(
             total_nats, total_expected, total_tok, total_excluded)
+        overlap_value, padding_value = torch.stack((total_overlap, total_padding)).cpu().tolist()
         total_tok_value = accounting["scored_targets"]
         if total_tok_value == 0:
             raise ValueError(
@@ -1261,6 +1297,8 @@ def evaluate(
         "bpc":            (bits_per_token * tokens_per_char
                            if tokens_per_char is not None else None),
         **accounting,
+        "overlap_context_targets": int(overlap_value),
+        "padding_targets":         int(padding_value),
     }
 
 
@@ -1336,6 +1374,8 @@ _VAL_DIAG_KEYS = (
 _VAL_RELATIONAL_DIAG_KEYS = (
     "val_relational_legacy_global_f_available",
     "val_relational_score_klmax_frac",
+    # the per-layer maximum and its layer (the headline column above reduces only the last layer)
+    "val_relational_score_klmax_frac_layer_max", "val_relational_score_klmax_frac_argmax_layer",
     "val_relational_mean_displacement_norm", "val_relational_snapshot_ce",
     "val_relational_receiver_cost_before", "val_relational_receiver_cost_after",
     "val_relational_receiver_cost_delta", "val_relational_receiver_noise",
@@ -1346,7 +1386,8 @@ _VAL_RELATIONAL_DIAG_KEYS = (
     "score_k_raw_min_singular_value", "score_rank_per_head", "content_rank_per_head",
     "parameter_count", "content_max_singular_value", "content_effective_rank",
     "content_T_min_singular_value",
-    "projected_cov_min_eigenvalue", "projected_cov_max_condition", "covariance_repair_count")
+    "projected_cov_min_eigenvalue", "projected_cov_max_condition", "covariance_repair_count",
+    "projected_cov_max_condition_layer_max")
 ) + tuple(f"val_{key}" for key in LINK_SPECTRUM_KEYS)
 
 # Edge-link probes (content_link_edges != 'off' only; edge_links.edge_diagnostic_capture), appended to the
@@ -1471,6 +1512,36 @@ CAP_ACTIVATION_FIELDS: Tuple[str, ...] = ("step", "layer", "head", "capped", "en
 # capped, the only case in which the clamp changes beta (audit 2026-10-08 critic-gapfill-2#3).
 CAP_CLAMPED_ROW_FIELDS: Tuple[str, ...] = ("step", "layer", "head", "clamped_rows", "rows")
 _EVAL_CADENCE_COLUMNS: Tuple[str, ...] = _TRAIN_SAMPLE_COLUMNS + NUMERICS_EVAL_COLUMNS
+
+
+# A layer whose router has more than this fraction of its capped costs at kl_max routes almost
+# uniformly with almost no router gradient (audit 2026-10-09, layer 1 of the 32.65 run).
+DEAD_ROUTER_KLMAX_FRAC: float = 0.5
+
+
+def _warn_dead_router(
+    diagnostics: Mapping[str, Any],
+    warned:      Set[int],                  # layers already reported this run; updated in place
+    logger:      logging.Logger,
+) -> None:
+    r"""Warn once per layer when the largest per-layer router cap fraction exceeds ``DEAD_ROUTER_KLMAX_FRAC``.
+
+    Reads ``relational_score_klmax_frac_layer_max`` (the maximum over layers of the fraction of
+    routing costs clamped at ``kl_max``) and ``relational_score_klmax_frac_argmax_layer``; a model
+    that does not report them is skipped.
+    """
+    frac = diagnostics.get("relational_score_klmax_frac_layer_max")
+    if frac is None or not math.isfinite(float(frac)) or float(frac) <= DEAD_ROUTER_KLMAX_FRAC:
+        return
+    layer = diagnostics.get("relational_score_klmax_frac_argmax_layer")
+    layer = int(layer) if layer is not None and math.isfinite(float(layer)) else -1
+    if layer in warned:
+        return
+    warned.add(layer)
+    logger.warning(
+        " router layer %s: %.3f of its routing costs are clamped at kl_max (> %.2f); the layer routes "
+        "nearly uniformly with nearly zero router gradient (consider routing_kl_max_reference='row_min')",
+        layer if layer >= 0 else "unknown", float(frac), DEAD_ROUTER_KLMAX_FRAC)
 
 
 def _numerics_counter_skip_reasons(
@@ -1798,8 +1869,8 @@ def _parameter_group(
     if name.startswith("relational_operators"):
         # Mixed head sizes store per-run lists: the attribute is the segment before the run index.
         attribute = name.rsplit(".", 2)[-2] if leaf.isdigit() else leaf
-        if attribute in ("raw_score_q", "raw_score_k", "channel_log_noise"):   # channel_log_noise: minimal agent
-            return "relational_score"
+        if attribute in ("raw_score_q", "raw_score_k", "channel_log_noise", "routing_log_temperature"):
+            return "relational_score"                         # channel_log_noise: minimal agent
         if attribute in ("T", "O"):
             return "relational_content"
         if attribute.startswith("edge_"):                     # content_link_edges factor maps
@@ -2008,6 +2079,8 @@ def _build_fixed_train_sample(
     chosen = torch.randperm(n_windows_total, generator=generator)[:n_windows]
     indices = sorted(int(index) for index in chosen.tolist())
     batch_size = int(getattr(val_loader, "batch_size", None) or cfg.batch_size)
+    if getattr(dataset, "window_offset_mode", "fixed") != "fixed":
+        dataset = dataset.at_origin()               # fixed windows, whatever this epoch's origin
     return FixedTrainSample(dataset, indices, batch_size, stride), None
 
 
@@ -2948,7 +3021,37 @@ def _loader_data_identity(
         "sampler_replacement": sampler_replacement,
         "sampler_num_samples": int(len(sampler)),
     }
+    if getattr(dataset, "window_offset_mode", "fixed") != "fixed":
+        normalized["iterator"]["window_offset"] = str(dataset.window_offset_mode)
     return normalized
+
+
+def _configure_train_window_offset(
+    loader: object,
+    mode:   str,
+) -> Optional[object]:
+    r"""Put the train loader's windows in ``mode`` (``cfg.train_window_offset``); return the dataset to draw on.
+
+    ``'fixed'`` resets a window dataset that a previous call (a loader shared across cells) left in
+    another mode and returns None: nothing is drawn. ``'per_epoch_random'`` needs a
+    :class:`~vfe3.data.datasets.TokenWindows` dataset, a ``torch.Generator`` on the loader (the
+    origin of each epoch is drawn from it just before the epoch's iterator, so the saved epoch-start
+    generator state replays origin and permutation on resume) and in-process loading
+    (``num_workers=0``, so the dataset the workers read is the one whose origin was set).
+    """
+    dataset = getattr(loader, "dataset", None)
+    if mode == "fixed":
+        if hasattr(dataset, "set_window_offset_mode"):
+            dataset.set_window_offset_mode("fixed")
+        return None
+    if not hasattr(dataset, "draw_window_offset"):
+        raise ValueError(f"train_window_offset={mode!r} needs a TokenWindows train dataset")
+    if not isinstance(getattr(loader, "generator", None), torch.Generator):
+        raise ValueError(f"train_window_offset={mode!r} needs a seeded torch.Generator on the train loader")
+    if getattr(loader, "num_workers", 0) != 0:
+        raise ValueError(f"train_window_offset={mode!r} needs num_workers=0")
+    dataset.set_window_offset_mode(mode)
+    return dataset
 
 
 def _training_cursor_fields(
@@ -3201,6 +3304,7 @@ def train(
     loader_sampler = getattr(loader, "sampler", None)
     shuffled_loader = isinstance(loader_sampler, torch.utils.data.RandomSampler)
     loader_generator = getattr(loader, "generator", None)
+    offset_windows = _configure_train_window_offset(loader, getattr(cfg, "train_window_offset", "fixed"))
     try:
         steps_per_epoch = int(len(loader))  # type: ignore[arg-type]
     except (TypeError, AttributeError):
@@ -3363,6 +3467,7 @@ def train(
     reset_decode_logdet_fallback_elements()   # ... and the decode log-det non-PD fallback
     reset_source_recovery_elements()        # ... and projected float64 source-factor recoveries
     reset_frame_pair_fp64_escalations()     # ... and float64 frame-pair escalations
+    dead_router_warned: Set[int] = set()    # layers already reported by _warn_dead_router
 
     def _step_indices() -> Iterable[int]:
         if not show_bar:
@@ -3416,6 +3521,12 @@ def train(
     # with num_workers=0; that draw already happened at the saved epoch start. Preserve the restored
     # stream around resume-only reconstruction/skip so stochastic model behavior continues exactly.
     replay_cpu_rng = torch.get_rng_state().clone() if resume_data_state else None
+    if offset_windows is not None:
+        drawn_offset = offset_windows.draw_window_offset(loader_generator)
+        saved_offset = resume_data_state.get("window_offset") if resume_data_state else None
+        if saved_offset is not None and saved_offset != drawn_offset:
+            raise RuntimeError(f"checkpoint data_state window_offset {saved_offset} is not the replayed "
+                               f"origin {drawn_offset}")
     try:
         it = iter(loader)
         for _ in range(saved_batches_consumed):
@@ -3542,6 +3653,8 @@ def train(
             epoch_start_generator_state = (
                 loader_generator.get_state().clone()
                 if shuffled_loader and isinstance(loader_generator, torch.Generator) else None)
+            if offset_windows is not None:
+                offset_windows.draw_window_offset(loader_generator)
             it = iter(loader)
             tokens, targets = next(it)
         batches_consumed += 1
@@ -3840,6 +3953,7 @@ def train(
                 "batches_consumed":            batches_consumed,
                 "epoch":                       epoch,
                 "data_identity":               loader_data_identity,
+                **({"window_offset": offset_windows.window_offset} if offset_windows is not None else {}),
             } if loader_data_identity is not None else None)
             # Best-effort, like every other periodic side effect above (audit 2026-07-27). A
             # checkpoint is a convenience for RESUMING, not a correctness requirement of the step
@@ -3918,6 +4032,7 @@ def train(
                 "gauge_trace_spread": d["gauge_trace_spread"],
             }
             row.update({key: value for key, value in d.items() if key.startswith(("qkv_", "relational_"))})
+            _warn_dead_router(d, dead_router_warned, logger)
             if steps_per_epoch:
                 row.update(_training_cursor_fields(step + 1, steps_per_epoch))
             else:
@@ -4073,6 +4188,9 @@ def train(
             except Exception as exc:
                 _record_diagnostic_failure(diagnostics_failures, "numerics_cumulative", exc, logger)
                 row.update({column: float("nan") for column in NUMERICS_CUMULATIVE_COLUMNS})
+            # Cumulative projected source-factor recoveries since step 0 (diagnostic and evaluation
+            # forwards included); a rise localizes fp64 promotions in the step time (audit 2026-10-09).
+            row["source_recovery_elements"] = source_recovery_elements()
             row["tokens_seen"] = tokens_seen
             row["diagnostics_failures"] = int(sum(diagnostics_failures.values()))
             pipeline_timing = timer.sample_pipeline_window()
@@ -4119,6 +4237,7 @@ def train(
             "batches_consumed":            batches_consumed,
             "epoch":                       epoch,
             "data_identity":               loader_data_identity,
+            **({"window_offset": offset_windows.window_offset} if offset_windows is not None else {}),
         } if loader_data_identity is not None else None)
         terminal_callback(
             TrainingTerminalState(
@@ -4193,6 +4312,7 @@ def train(
             "frame_pair_fp64_escalations": int(frame_pair_fp64_escalations()),
             "public_spd_repair_elements": int(public_spd_repair_elements()),
             "public_spd_ceiling_contact_elements": int(public_spd_ceiling_contact_elements()),
+            "source_recovery_elements": int(source_recovery_elements()),
             **({"matmul_precision_replays": int(precision_replays)}
                if getattr(cfg, "matmul_precision_retry", False) else {}),
         }

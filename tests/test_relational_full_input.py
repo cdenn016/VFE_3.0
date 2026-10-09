@@ -1,4 +1,5 @@
 """Whole-belief readouts with independently realized compact gauge blocks."""
+from tests.profiles import make_relational_operators
 from dataclasses import asdict
 
 import pytest
@@ -18,7 +19,7 @@ from tests.test_relational_source_factorization import _inputs
 
 def test_full_input_matches_dense_distribution_oracle() -> None:
     mu, sigma, _, frame, _, _ = _fixture()
-    ops = RelationalOperators([2, 2], 11).double()
+    ops = make_relational_operators([2, 2], 11).double()
     compact = CanonicalFrameContext(
         torch.stack([frame.forward[..., :2, :2], frame.forward[..., 2:, 2:]], -3),
         torch.stack([frame.inverse[..., :2, :2], frame.inverse[..., 2:, 2:]], -3),

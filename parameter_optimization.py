@@ -1004,7 +1004,8 @@ def _interaction_rows(
     row_by_label = {
         str(row["label"]): row
         for row in rows
-        if _is_finite_number(row.get("mean_primary_val_ppl"))
+        if row.get("status") == "complete"
+        and _is_finite_number(row.get("mean_primary_val_ppl"))
         and math.isfinite(float(row["mean_primary_val_ppl"]))
     }
     sampled: List[tuple[Dict[str, int], float]] = []
@@ -1183,11 +1184,14 @@ def _write_sweep_figures(
     row_by_label = {
         str(row["label"]): row
         for row in rows
-        if _is_finite_number(row.get("mean_primary_val_ppl"))
+        if row.get("status") == "complete"
+        and _is_finite_number(row.get("mean_primary_val_ppl"))
         and math.isfinite(float(row["mean_primary_val_ppl"]))
     }
     if not row_by_label:
-        raise ValueError("cannot generate sweep figures without finite validation perplexities")
+        raise ValueError(
+            "cannot generate sweep figures without complete candidates with finite validation "
+            "perplexities")
 
     parameters = search_config["parameters"]
     enabled_names = [name for name, spec in parameters.items() if spec["enabled"]]

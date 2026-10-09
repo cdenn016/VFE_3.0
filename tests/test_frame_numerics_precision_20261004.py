@@ -1,8 +1,9 @@
-"""Frame applications and projected factorizations run at IEEE fp32; pair tiles keep the caller's policy.
+"""Frame applications, projected factorizations and the healthy pair-KL GEMM run at IEEE fp32.
 
 U^{-1} and U round trips amplify rounding by kappa(U) (means) or kappa(U)^2 (covariances, Gram
 matrices), and the factorization certificates use the fp32 epsilon. Under fp32_matmul_precision="high"
-these token-linear pieces are pinned to "highest" while the N^2 pair tiles keep TF32. TF32 does not
+these token-linear pieces are pinned to "highest". The healthy pair KL, one centered GEMM per (batch,
+head) since the 2026-10-09 audit, is pinned too; the recovery-path factor tiles keep TF32. TF32 does not
 exist on the CPU, so these tests record the policy each operation sees and check the restore.
 Tiny CPU shapes only.
 """
@@ -77,7 +78,7 @@ def test_cholesky_helpers_run_ieee_fp32(high_precision_policy: None) -> None:
     assert torch.get_float32_matmul_precision() == "high"
 
 
-def test_projected_moments_and_factors_pin_while_pair_tiles_keep_the_policy(
+def test_projected_moments_factors_and_pair_gemm_run_ieee_fp32(
         high_precision_policy: None) -> None:
     generator = torch.Generator().manual_seed(2)
     blocks = _blocks(3)
@@ -94,5 +95,5 @@ def test_projected_moments_and_factors_pin_while_pair_tiles_keep_the_policy(
     factor_ops = set().union(*(kl.seen.get(n, set()) for n in
                                ("linalg_cholesky_ex", "cholesky_ex", "cholesky_inverse")))
     assert factor_ops == {"highest"}
-    assert "high" in kl.seen.get("einsum", set())               # the pair tiles keep TF32
+    assert _matmul_policies(kl) == {"highest"}                  # the healthy pair GEMM is pinned
     assert torch.get_float32_matmul_precision() == "high"

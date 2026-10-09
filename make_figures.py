@@ -1,10 +1,12 @@
 r"""Click-to-run: generate the single-run publication figures for a trained run.
 
 Edit ``CONFIG`` below and run. Points at a run directory written by ``train_vfe3.py``
-(``config.json`` + ``best_model.pt``), rebuilds the trained model, drives the
+(``config.json`` + ``summary.json`` + ``best_model.pt``), rebuilds the trained model from the final
+weights (``final_model.pt``, or ``best_model.pt`` for older runs without one), drives the
 :mod:`vfe3.viz.extract` runners + :mod:`vfe3.metrics` measurements, writes model-replay figures to
 ``<run_dir>/figures/``, and rebuilds persisted-data history/probe figures at ``<run_dir>/``. With
-``run_dir=None`` the most recent run under ``RUN_ROOT`` is used.
+``run_dir=None`` the most recent run under ``RUN_ROOT`` is used. Run selection checks the files
+only; the figure worker performs the full checkpoint validation when it loads the weights.
 
 Training's ``finalize_run`` already auto-runs the publication set. This driver re-runs the
 model-replay set and every history/probe figure supported by the saved run. The single
@@ -32,11 +34,6 @@ import torch
 
 from vfe3.process_utils import run_process_tree
 from vfe3.run_artifacts import _unique_sibling_temp
-from vfe3.viz.run_loading import (
-    load_best_model_state,
-    load_run_config,
-    load_run_selection_contract,
-)
 
 RUN_ROOT = "vfe3_runs"
 _FIGURE_TIMEOUT_SECONDS = 2 * 60 * 60
@@ -59,8 +56,19 @@ def _validated_run_dir(path: Path) -> Path:
         raise FileNotFoundError(
             f"run directory {path} is incomplete; missing {', '.join(missing)}"
         )
-    if (path / "best_model.pt").stat().st_size == 0:
-        raise ValueError(f"run directory {path} has an empty best_model.pt")
+    # The figure worker replays final_model.pt when present (vfe3.viz.report.generate_figures);
+    # check that file, plus best_model.pt, which the semantic analysis reads.
+    checkpoints = ["best_model.pt"]
+    if (path / "final_model.pt").is_file():
+        checkpoints.append("final_model.pt")
+    for name in checkpoints:
+        try:
+            with open(path / name, "rb") as handle:
+                readable = bool(handle.read(1))
+        except OSError as exc:
+            raise ValueError(f"run directory {path} has unreadable {name}") from exc
+        if not readable:
+            raise ValueError(f"run directory {path} has an empty {name}")
     config_payload = None
     summary_payload = None
     for name in ("config.json", "summary.json"):
@@ -94,25 +102,6 @@ def _validated_run_dir(path: Path) -> Path:
             and math.isfinite(float(value))
             for value in completion_values):
         raise ValueError(f"run directory {path} summary.json has no finite completion metric")
-    try:
-        from vfe3.model.model import VFEModel
-
-        cfg, _dataset = load_run_config(path)
-        expected_code_identity, expected_selection_data_identity = (
-            load_run_selection_contract(path))
-        with torch.random.fork_rng(devices=[]):
-            validation_model = VFEModel(cfg)
-            model_state = load_best_model_state(
-                path / "best_model.pt",
-                cfg,
-                validation_model.state_dict(),
-                expected_code_identity,
-                expected_selection_data_identity,
-                map_location="cpu",
-            )
-            validation_model.load_state_dict(model_state, strict=True)
-    except Exception as exc:
-        raise ValueError(f"run directory {path} has an invalid best_model.pt") from exc
     return path
 
 

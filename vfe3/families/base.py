@@ -74,8 +74,9 @@ def _warn_alpha_gt_one(alpha: float, family: str) -> None:
     r"""Warn that alpha > 1 leaves the convex regime of the Renyi blend."""
     warnings.warn(
         f"renyi: alpha={alpha} > 1 (family={family!r}) leaves the convex regime; "
-        f"the blend (1-alpha)*Sigma_q + alpha*Sigma_t may be non-positive-definite "
-        f"(diagonal clamps; full may fail Cholesky and return NaN).",
+        f"the blend (1-alpha)*Sigma_q + alpha*Sigma_t may be non-positive-definite, where the "
+        f"divergence is undefined and the pair is returned at kl_max (diagonal: any non-positive "
+        f"coordinate; full: an indefinite blend, whatever the Cholesky ridge).",
         RuntimeWarning,
         stacklevel=3,
     )
@@ -135,6 +136,12 @@ class BeliefParams(ABC):
     #   'pair_inverse' -- needs Omega_ij^{-1} (a certified cocycle, or a dense operator to invert),
     #   'coboundary'   -- needs Omega_ij = U_i U_j^{-1} exactly (frame cancellation).
     transport_requirement: ClassVar[str] = "any"
+
+    # Whether the stored full-layout covariance is constrained to one SPD block per gauge head (zero
+    # off-head blocks): the block-diagonal subfamily closed under the block_glk congruence. Such a family
+    # keeps ``cov_kind='full'`` (the dense (..., K, K) storage); the moment-matched predictive update
+    # returns its head-block M-projection, and config validation scopes it to the routes that preserve it.
+    head_block_covariance: ClassVar[bool] = False
 
     @abstractmethod
     def coordinate_dim(self) -> int:
@@ -376,7 +383,7 @@ def family_cov_kind(name: str) -> str:
 
 
 def divergence_families() -> Tuple[str, ...]:
-    r"""Registered family names (the valid ``family`` config values)."""
+    r"""Registered family names (``cfg.family`` values; the divergence is pinned, see :func:`divergence_functionals`)."""
     return tuple(sorted(_FAMILIES))
 
 
@@ -435,7 +442,11 @@ def get_functional_display(name: str) -> FunctionalDisplayMetadata:
 
 
 def divergence_functionals() -> Tuple[str, ...]:
-    r"""Registered functional names (the valid ``divergence_family`` config values)."""
+    r"""Registered functional names, the divergences reachable from tests and post-hoc analysis.
+
+    ``divergence_family`` (and the Renyi order) is pinned by ``VFE3Config`` validation, so training
+    runs use only the pinned functional; the other members are not configuration values.
+    """
     return tuple(sorted(_FUNCTIONALS))
 
 
@@ -483,11 +494,15 @@ def divergence_functionals_per_coord() -> Tuple[str, ...]:
     return tuple(sorted(_FUNCTIONALS_PER_COORD))
 
 
-# fp32 catastrophic-cancellation band around the alpha->1 (KL) limit of the generic Renyi A-form:
-# outside the |alpha-1| < 1e-6 KL switch but inside this band the three nearly-equal log-partition
-# values cancel before the /(alpha-1) divide, losing ~1% accuracy in float32 out to ~|alpha-1| ~ 1e-3.
-# Inside the band the A-form is evaluated in float64 and cast back. Kept as a separate constant from
-# gaussian._RENYI_KL_BAND because base.py cannot import gaussian (gaussian imports base).
+# Renyi orders with |alpha - 1| < _KL_ALPHA_SWITCH are evaluated as the KL (alpha = 1) limit.
+_KL_ALPHA_SWITCH: float = 1e-6
+
+# fp32 catastrophic-cancellation band around the alpha->1 (KL) limit of the Renyi forms: outside the
+# |alpha-1| < _KL_ALPHA_SWITCH KL switch but inside this band the three nearly-equal log terms (the
+# log-partition values of the generic A-form, the logdets of the Gaussian closed forms) cancel before
+# the /(alpha-1) divide, losing ~1% accuracy in float32 out to ~|alpha-1| ~ 1e-3. Inside the band the
+# term is evaluated in float64 and cast back. Both constants are defined once here; the family modules
+# import them (they already import base, which imports no family module).
 _RENYI_KL_BAND: float = 1e-2
 
 
@@ -511,7 +526,7 @@ def _renyi_from_log_partition(
     cls = type(q)
     tq = q.natural()
     tp = p.natural()
-    if abs(alpha - 1.0) < 1e-6:
+    if abs(alpha - 1.0) < _KL_ALPHA_SWITCH:
         grad = q.expected_statistic()                       # E_q[T] = gradA(theta_q)
         A_q = cls.log_partition_at(tq)                       # batch-shaped (parameter axes summed)
         batch_ndim = A_q.dim()
@@ -563,8 +578,8 @@ def renyi(
     """
     if alpha <= 0.0:
         raise ValueError(f"alpha must be positive, got {alpha}")
-    if alpha > 1.0 + 1e-6:                              # only when the closed form takes the blend
-        _warn_alpha_gt_one(alpha, type(q).__name__)     # branch; alpha in (1, 1+1e-6] is plain KL
+    if alpha > 1.0 + _KL_ALPHA_SWITCH:                  # only when the closed form takes the blend
+        _warn_alpha_gt_one(alpha, type(q).__name__)     # branch; alpha in (1, 1+switch] is plain KL
     closed = getattr(q, "renyi_closed_form", None)
     if closed is not None:
         return closed(p, alpha=alpha, kl_max=kl_max, eps=eps)

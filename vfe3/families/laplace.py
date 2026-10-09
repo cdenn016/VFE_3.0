@@ -55,7 +55,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from vfe3.families.base import (BeliefParams, expm1_neg_plus, ratio_minus_one_minus_log, register_family,
-                                safe_kl_clamp)
+                                safe_kl_clamp, _KL_ALPHA_SWITCH)
 
 
 @register_family("laplace_diagonal")
@@ -231,7 +231,7 @@ class DiagonalLaplace(BeliefParams):
         mu_p = other.mu.to(compute_dtype)
         b_p = other.sigma.to(compute_dtype).clamp(min=eps)
         s = (mu_q - mu_p).abs()
-        if abs(alpha - 1.0) < 1e-6:
+        if abs(alpha - 1.0) < _KL_ALPHA_SWITCH:
             # D = log(b_p/b_q) + s/b_p + rho exp(-s/b_q) - 1 with rho = b_q/b_p, regrouped exactly as
             # [rho - 1 - log rho] + rho [exp(-u) - 1 + u], u = s/b_q, so neither bracket cancels near q = p.
             rho = b_q / b_p

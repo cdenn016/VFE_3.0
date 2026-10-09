@@ -23,6 +23,7 @@ from vfe3.config import serialize_config
 from vfe3.model.model import VFEModel
 from vfe3.semantics import multiseed as M
 from vfe3.semantics import report as R
+from vfe3.semantics import resources
 from vfe3.semantics import stats
 from vfe3.semantics.vocab import custom_vocab
 
@@ -239,8 +240,11 @@ def test_aggregate_seeds_end_to_end(tmp_path):
     assert payload["config_homogeneity"]["homogeneous"] is True
     assert payload["data_order"]["status"] == "shared"
     assert any("seed_9_not_analyzed" in n for n in payload["notes"])
-    acc = payload["metrics"]["view/decode_W_causal/google_3cosadd"]
-    assert set(acc["values"]) == {"seed 0", "seed 1", "seed 2"} and acc["summary"]["n"] == 3
+    # The Google analogy benchmark ships with gensim's test data; without gensim it is not built.
+    gensim_data = resources.gensim_test_data_dir()
+    if gensim_data is not None and (gensim_data / resources.GOOGLE_ANALOGY_FILE).is_file():
+        acc = payload["metrics"]["view/decode_W_causal/google_3cosadd"]
+        assert set(acc["values"]) == {"seed 0", "seed 1", "seed 2"} and acc["summary"]["n"] == 3
     assert "view/xi_ref/google_3cosadd" not in payload["metrics"]      # views were restricted
     stab = payload["stability"]
     assert all(src.startswith(R.CANDIDATE_IDS_FILE) for src in stab["candidate_sources"].values())

@@ -140,6 +140,9 @@ class VFE3Config:
     val_diagnostic_batches:           int             = 1             # validation batches the val_* probes average over
     
     eval_stride:                      Optional[int]   = None         # held-out window stride <= max_seq_len; None = disjoint windows
+    # Training-window origin: "fixed" (window i starts at i*max_seq_len every epoch) | "per_epoch_random"
+    # (each epoch draws an origin in [0, max_seq_len) from the train loader's generator; vfe3.train.train).
+    train_window_offset:              str             = "fixed"
                
     generate_embedding_figures:       bool            = False        # slow semantic-geometry figures at finalize
 
@@ -164,9 +167,20 @@ class VFE3Config:
     #   4. Belief family and table initialization
     ##################################################
 
-    # "gaussian_diagonal" | "gaussian_full" | "laplace_diagonal"
-    # The belief covariance structure (read diagonal_covariance, never a second flag). 
+    # "gaussian_diagonal" | "gaussian_full" | "laplace_diagonal" | "gaussian_block"
+    # The belief covariance structure (read diagonal_covariance, never a second flag).
+    #   gaussian_block  one SPD d_head x d_head block per head, stored in the dense (K, K) layout. only:
+    #                   projected_predictive, predictive_readout="kernel", block_glk per_head, content_link_edges
+    #                   "off", decode_mode "linear" | "diagonal_chunked" | "full_chunked", a passthrough block MLP
     family:                           str             = "gaussian_diagonal"
+
+    # "diagonal" | "block_cholesky"
+    #   diagonal        per-type log variances (V, K)
+    #   block_cholesky  frame-free per-type head blocks C_v = L_v L_v^T, (V, H, d(d+1)/2) log-diagonal Cholesky
+    #                   entries; with mu_embed as xi_v it is the learned-frame reference arm without frames.
+    #                   only: family "gaussian_block" | "gaussian_full", gauge_transport="off", block_glk,
+    #                   projected_predictive, content_link_edges="off", untie_decode_bank=True or a linear decode
+    prior_covariance_table:           str             = "diagonal"
 
     # Token tables: mu_v ~ N(0, mu_init_std^2), every variance = sigma_init (> 0), phi_v ~ N(0, phi_scale^2).
     mu_init_std:                      float           = 0.065
@@ -336,6 +350,11 @@ class VFE3Config:
     # Temperature scale: tau_h = kappa_beta * sqrt(d_h); a list (one per head) gives per-head temperatures.
     # Not read by predictive_readout="minimal_agent".
     kappa_beta:                 'float | List[float]' = 1.0
+    # Learn the routing temperature per layer and head: tau_{l,h} = kappa_h sqrt(d_h) exp(clamp(delta_{l,h}, -3, 3))
+    # with delta = 0 at init (routing_log_temperature, (H,) per layer; no weight decay, score learning rate).
+    # The KL cost is invariant under (S_Q, S_K) -> (A S_Q, A S_K), so no map can set the sharpness. Cools only
+    # below the kl_max cap: a fully capped absolute-reference row stays uniform. Not with minimal_agent.
+    learn_attention_temperature:      bool            = False
 
     # "causal" | "causal_noself" | "causal_alibi" | "causal_alibi_noself" | "causal_windowed"
     # | "t5_relative_bias" | "uniform" | "alibi" | "windowed"
@@ -361,6 +380,9 @@ class VFE3Config:
     #   noisy_query    the query mean treated as a noisy measurement (GL(K) v2, Remark 9)
     #   mean_distance  ||a_i - b_j||^2 / 2 of the projected means: the covariance-blind control
     relational_routing:               str             = "gaussian_kl"
+    # projected_predictive kernel only: tie the key comparison map to the query map, S_K := S_Q (no raw_score_k),
+    # so D_ii = 0 and D_ij = KL(q_i || (Omega_ij)_* q_j) under one map (GL(K) v2, flat alignment).
+    tie_comparison_maps:              bool            = False
 
     ##################################################
     #   9. Predictive readout (projected_predictive)
@@ -622,7 +644,8 @@ class VFE3Config:
 
     eps:                              float           = 1e-6
     kl_max:                           float           = 100.0        # safety clamp on every divergence (launchers scale it with K)
-    # "absolute" | "row_min": what kl_max clamps in the projected kernel router (audit 2026-10-08 P1-4)
+    # "absolute" | "row_min": what kl_max clamps in the kernel router, projected_predictive and
+    # projected_gradient (audit 2026-10-08 P1-4)
     #   absolute  D_ij; a row whose every admissible cost exceeds kl_max routes uniformly with zero gradient
     #   row_min   D_ij - min_{j admissible} D_ij; beta is the exact softmax wherever no gap exceeds kl_max
     routing_kl_max_reference:         str             = "absolute"
@@ -767,8 +790,9 @@ class VFE3Config:
         if self.encode_mode not in ("per_token", "per_token_additive"):
             incompatible.append(
                 f"encode_mode={self.encode_mode!r} (requires 'per_token' or 'per_token_additive')")
-        if self.family not in ("gaussian_diagonal", "gaussian_full"):
-            incompatible.append(f"family={self.family!r} (requires gaussian_diagonal or gaussian_full)")
+        if self.family not in ("gaussian_diagonal", "gaussian_full", "gaussian_block"):
+            incompatible.append(f"family={self.family!r} (requires gaussian_diagonal, gaussian_full or "
+                                "gaussian_block)")
         if self.n_heads < 2:
             incompatible.append(f"n_heads={self.n_heads!r} (requires at least 2)")
         if incompatible:
@@ -917,6 +941,10 @@ class VFE3Config:
                 UserWarning,
                 stacklevel=2,
             )
+        from vfe3.data.datasets import WINDOW_OFFSET_MODES
+        if self.train_window_offset not in WINDOW_OFFSET_MODES:
+            raise ValueError(f"train_window_offset must be one of {WINDOW_OFFSET_MODES}, "
+                             f"got {self.train_window_offset!r}")
         # eval_stride above max_seq_len would skip transitions between consecutive held-out windows,
         # which no target mask can recover, so the exactly-once eval contract rejects it. Equal to
         # max_seq_len is the disjoint default spelled out.
@@ -1065,6 +1093,57 @@ class VFE3Config:
         family_is_diagonal = family_cov_kind(self.family) == "diagonal"
         from vfe3.families.base import get_family
         _family_cls = get_family(self.family)
+        # Head-block family (gaussian_block): exact only where every producer keeps one SPD block per head --
+        # the kernel predictive readout's moment-matched head-block projection (or passthrough), mean-only
+        # block maps, compact per-head block_glk frames, and decoders that score a full-layout covariance
+        # against the diagonal bank exactly (full_chunked) or up to a per-position constant (diagonal_chunked).
+        if _family_cls.head_block_covariance:
+            block_problems = []
+            if self.attention_mode != "projected_predictive":
+                block_problems.append(f"attention_mode={self.attention_mode!r} (requires 'projected_predictive')")
+            if self.predictive_readout != "kernel":
+                block_problems.append(f"predictive_readout={self.predictive_readout!r} (requires 'kernel')")
+            if self.gauge_group != "block_glk" or self.gauge_tying not in (None, "per_head"):
+                block_problems.append(f"gauge_group={self.gauge_group!r}, gauge_tying={self.gauge_tying!r} "
+                                      "(requires block_glk with per-head frames)")
+            if self.content_link_edges != "off":
+                block_problems.append(f"content_link_edges={self.content_link_edges!r} (requires 'off')")
+            if self.decode_mode not in ("linear", "diagonal_chunked", "full_chunked"):
+                block_problems.append(f"decode_mode={self.decode_mode!r} (requires 'linear', 'diagonal_chunked' "
+                                      "or 'full_chunked')")
+            if self.use_block_mlp and self.block_mlp_covariance != "passthrough":
+                block_problems.append(f"block_mlp_covariance={self.block_mlp_covariance!r} (requires "
+                                      "'passthrough': the block MLP must not leave the head-block family)")
+            if self.use_cg_coupling:
+                block_problems.append("use_cg_coupling=True")
+            if block_problems:
+                raise ValueError(f"family={self.family!r} keeps one SPD covariance block per head and is defined "
+                                 "only where every covariance producer preserves that; got " + "; ".join(block_problems))
+        _require(self.prior_covariance_table, ("diagonal", "block_cholesky"), "prior_covariance_table")
+        # Frame-free (xi, C) prior table: with identity frames (gauge_transport='off') it represents exactly what
+        # the learned-frame reference arm reads, C_v = U_v^-1 diag(sigma_v) U_v^-T as one SPD block per head.
+        if self.prior_covariance_table == "block_cholesky":
+            table_problems = []
+            if self.family not in ("gaussian_block", "gaussian_full"):
+                table_problems.append(f"family={self.family!r} (requires 'gaussian_block' or 'gaussian_full': a full "
+                                      "SPD block per head)")
+            if self.gauge_transport != "off":
+                table_problems.append(f"gauge_transport={self.gauge_transport!r} (requires 'off': the table "
+                                      "replaces the frames)")
+            if self.gauge_group != "block_glk":
+                table_problems.append(f"gauge_group={self.gauge_group!r} (requires 'block_glk')")
+            if self.attention_mode != "projected_predictive":
+                table_problems.append(f"attention_mode={self.attention_mode!r} (requires 'projected_predictive')")
+            if self.content_link_edges != "off":
+                table_problems.append(f"content_link_edges={self.content_link_edges!r} (requires 'off')")
+            if self.encode_mode != "per_token":
+                table_problems.append(f"encode_mode={self.encode_mode!r} (requires 'per_token')")
+            if self.decode_mode != "linear" and not self.untie_decode_bank:
+                table_problems.append("untie_decode_bank=False with a prior-bank decode (the decode bank keeps "
+                                      "its own diagonal tables; requires untie_decode_bank=True)")
+            if table_problems:
+                raise ValueError("prior_covariance_table='block_cholesky' is the frame-free reference-arm table and "
+                                 "is defined only there; got " + "; ".join(table_problems))
 
         # free-energy coupling
         for _name in ("kappa_beta",):
@@ -1359,6 +1438,16 @@ class VFE3Config:
                                       "the content, so both are read in one frame; or use rope_space='comparison')")
             if agent_problems:
                 raise ValueError("predictive_readout='minimal_agent' is unsupported here: " + "; ".join(agent_problems))
+        for _name in ("learn_attention_temperature", "tie_comparison_maps"):
+            if not isinstance(getattr(self, _name), bool):
+                raise ValueError(f"{_name} must be a bool, got {getattr(self, _name)!r}")
+        if self.learn_attention_temperature and self.predictive_readout == "minimal_agent":
+            raise ValueError("learn_attention_temperature=True needs a kernel router: predictive_readout='minimal_agent' "
+                             "routes by the source posterior at temperature 1")
+        if self.tie_comparison_maps and (self.attention_mode != "projected_predictive"
+                                         or self.predictive_readout != "kernel"):
+            raise ValueError("tie_comparison_maps=True requires attention_mode='projected_predictive' with "
+                             f"predictive_readout='kernel' (got {self.attention_mode!r}, {self.predictive_readout!r})")
         # decode_mode / encode_mode validated against the LIVE decode/encode REGISTRIES (not static
         # literals) so a newly registered kernel is config-selectable without editing this validator.
         from vfe3.model.prior_bank import _DECODERS, _ENCODERS
@@ -1370,8 +1459,11 @@ class VFE3Config:
         # sigma, so these rank checks apply only to non-linear registrations.
         decode_registration = _DECODERS[self.decode_mode]
         family_kind = family_cov_kind(self.family)
+        # gaussian_block + diagonal_chunked is admitted above: the bank reads diag(Sigma_q), exact up to a
+        # per-position constant (PriorBank._diagonal_decoder_dispersion).
         if (self.decode_mode != "linear"
-                and family_kind not in decode_registration.covariance_kinds):
+                and family_kind not in decode_registration.covariance_kinds
+                and not (_family_cls.head_block_covariance and self.decode_mode == "diagonal_chunked")):
             raise ValueError(
                 f"decode_mode={self.decode_mode!r} is rank-incompatible with family={self.family!r}: "
                 f"it scores covariance kinds {sorted(decode_registration.covariance_kinds)} but the "
@@ -1484,6 +1576,21 @@ class VFE3Config:
                 "(family='gaussian_full'): the dense J Sigma J^T cannot be represented by a "
                 f"diagonal/non-Gaussian family (got family={self.family!r})."
             )
+        # In local coordinates the block norm maps the mean only and passes Sigma through, so the
+        # pushforward must compose the norm Jacobian, J = J_mlp J_norm (vfe3.model.block_mlp.
+        # block_norm_jacobian). That closed form exists for 'layernorm' (plain or affine); 'mahalanobis'
+        # reads Sigma and has none here. A post-MLP norm would act on the mean after the pushforward.
+        if self.use_block_mlp and self.block_mlp_covariance == "delta_full" and self.norm_type_block not in (
+                "none", "layernorm"):
+            raise ValueError(
+                "block_mlp_covariance='delta_full' needs norm_type_block 'none' or 'layernorm': the "
+                "pushforward composes the norm Jacobian, which is implemented for LayerNorm only "
+                f"(got norm_type_block={self.norm_type_block!r})."
+            )
+        if self.use_block_mlp and self.block_mlp_covariance == "delta_full" and self.block_mlp_post_norm:
+            raise ValueError(
+                "block_mlp_covariance='delta_full' with block_mlp_post_norm=True: the post-MLP norm acts on "
+                "the mean only, so the pushforward would omit its Jacobian")
         # The invariant Mahalanobis gate reads s_b = mu_b^T Sigma_bb^{-1} mu_b per irrep block. With a
         # passthrough covariance it is exact on the diagonal family (Sigma_bb = diag sigma_b gives
         # s_b = sum_k mu_k^2 / sigma_k), where it equals the full-family gate on diag_embed(sigma);
@@ -1899,8 +2006,8 @@ class VFE3Config:
             mark(("lambda_alpha",), "only read by lambda_alpha_mode='constant'")
         if self.pos_rotation == "none":
             mark(("rope_on_value", "rope_base", "rope_space", "rope_fraction"), "only read by pos_rotation='rope'")
-        if self.attention_mode != "projected_predictive" or self.predictive_readout != "kernel":
-            mark(("routing_kl_max_reference",), "only read by the projected predictive kernel router")
+        if self.attention_mode == "projected_predictive" and self.predictive_readout != "kernel":
+            mark(("routing_kl_max_reference",), "only read by the kernel router (minimal_agent applies no clamp)")
         if self.pos_phi == "none":
             mark(("pos_phi_project_slk", "pos_phi_scale"), "only read by a non-'none' pos_phi")
         if (self.beta_attention_prior in ("windowed", "causal_windowed")
@@ -2327,12 +2434,14 @@ def _migrate_retired_fields(
 #   predictive_covariance             "passthrough" at 8b398f3 (2026-09-27), now "moment_matched"
 #   m_decode_mu_lr, m_decode_sigma_lr None (inherit) at d04dfc4 (2026-09-30), now 0.025 / 0.001
 #   projected_cov_recovery_precision  "fp64" at fed4164 (2026-10-04), now "fp32"
+#   rope_space                        "frame" from eaa3a21 (2026-10-07)
 _HISTORICAL_DEFAULT_PINS: dict[str, Any] = {
     "content_link_chart":               "affine",
     "predictive_covariance":            "passthrough",
     "m_decode_mu_lr":                   None,
     "m_decode_sigma_lr":                None,
     "projected_cov_recovery_precision": "fp64",
+    "rope_space":                       "frame",
 }
 
 

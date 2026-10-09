@@ -6,6 +6,7 @@ blocks of C_i and C_i^att alone. The blockwise route must equal the dense K x K 
 full family and dense frames) to rounding, in value and in gradient. The independent enumerated
 kernel of ``tests/test_predictive_covariance.py`` checks both against the declared law.
 """
+from tests.profiles import make_relational_operators
 from typing import Tuple
 
 import pytest
@@ -26,7 +27,7 @@ def _case(
     generator = torch.Generator().manual_seed(seed)
     randn = lambda *shape: torch.randn(*shape, generator=generator, dtype=torch.float64)
     K, N = H * d, 5
-    ops = RelationalOperators([d] * H, 11, readout_mode="predictive_content", attention_residual=residual,
+    ops = make_relational_operators([d] * H, 11, readout_mode="predictive_content", attention_residual=residual,
                               predictive_covariance="moment_matched", predictive_covariance_floor=1e-3)
     ops = ops.to(dtype)
     with torch.no_grad():

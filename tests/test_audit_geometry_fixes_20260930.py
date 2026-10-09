@@ -1,5 +1,6 @@
 r"""Tiny CPU regressions for predictive spread."""
 
+from tests.profiles import make_relational_operators
 import pytest
 import torch
 
@@ -25,7 +26,7 @@ def test_predictive_spread_survives_common_translation(
     frame = CanonicalFrameContext(eye, eye, block_diagonal=compact_frame)
     beta = torch.tensor([[1., 0., 0.], [.5, .5, 0.], [.25, .25, .5]])
     beta = beta.expand(1, 2, 3, 3).clone()
-    ops = RelationalOperators([2, 2], 6,
+    ops = make_relational_operators([2, 2], 6,
                               readout_mode="predictive_content",
                               predictive_covariance="moment_matched")
     actual = ops.predictive_covariance_update(mu, sigma, beta, frame)
@@ -88,7 +89,7 @@ def test_centered_predictive_covariance_retains_correlations_and_gradients(resid
     sigma = (forward @ C @ forward.transpose(-1, -2)).requires_grad_()
     logits = torch.tensor([[[[.1, -.2, .3], [.4, .2, -.5], [-.3, .5, .1]],
                              [[-.2, .4, .1], [.5, -.1, .2], [.2, -.4, .5]]]], requires_grad=True)
-    ops = RelationalOperators([2, 2], 6,
+    ops = make_relational_operators([2, 2], 6,
                               readout_mode="predictive_content", attention_residual=residual,
                               predictive_covariance="moment_matched")
     with torch.no_grad():

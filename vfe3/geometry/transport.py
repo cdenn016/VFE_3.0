@@ -16,6 +16,7 @@ from torch import nn
 from vfe3.config import VFE3Config
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.lie_ops import CompactBlockElement
+from vfe3.contracts import host_check
 from vfe3.runtime import ieee_fp32_matmul
 
 if TYPE_CHECKING:
@@ -1042,11 +1043,29 @@ def _checked_group_inverse_certified(
         if kappa is not None:
             flags.append(kappa(omega64, inverse64) * torch.finfo(omega.dtype).eps
                          > _FRAME_PAIR_CONDITION_TOL)
-        # The single host read for the whole strict certificate.
-        host = torch.stack(flags).tolist()
+        flags = torch.stack(flags)
+    if kappa is None:
+        # Without the escalation certificate the verdict only raises, so inside
+        # vfe3.contracts.deferred_host_checks it joins the next mandatory host read.
+        host_check(flags, lambda host: _group_inverse_verdict(host, False, omega.dtype, residual, residual_tol))
+        return inverse, False
+    # The single host read for the whole strict certificate.
+    host = flags.tolist()
+    escalate = bool(host[-1])
+    _group_inverse_verdict(host, escalate, omega.dtype, residual, residual_tol)
+    return inverse, escalate
+
+
+def _group_inverse_verdict(
+    host:         List[bool],               # [nonfinite omega, singular, nonfinite 64, nonfinite cast, (residual)]
+    escalate:     bool,
+    dtype:        torch.dtype,
+    residual:     Optional[torch.Tensor],
+    residual_tol: Optional[float],
+) -> None:
+    """Raise the first failed check of :func:`_checked_group_inverse_certified` from its host flags."""
     nonfinite_omega, singular, nonfinite_64, nonfinite_cast = host[:4]
     residual_bad = residual_tol is not None and host[4]
-    escalate = kappa is not None and bool(host[-1])
     if nonfinite_omega:
         raise FloatingPointError(
             "omega group element contains nonfinite values before inversion")
@@ -1058,16 +1077,15 @@ def _checked_group_inverse_certified(
             "numerically unrepresentable")
     if nonfinite_cast and not escalate:
         raise FloatingPointError(
-            f"omega group-element inverse is nonfinite after conversion to {omega.dtype}")
+            f"omega group-element inverse is nonfinite after conversion to {dtype}")
     if residual_bad:
         raise FloatingPointError(
             "stored omega group-element pair violates the inverse identity: "
             f"||U U^-1 - I||_inf={float(residual):.6g} > residual_tol={residual_tol:.6g} "
-            f"(storage dtype {omega.dtype}); the represented element and its stored "
+            f"(storage dtype {dtype}); the represented element and its stored "
             "inverse no longer form a group-inverse pair, so the transport cocycle is "
             "not exact"
         )
-    return inverse, escalate
 
 
 def _stable_compact_glk_exp_pair(

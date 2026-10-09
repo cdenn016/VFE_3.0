@@ -24,9 +24,8 @@ import torch
 
 from vfe3.alpha_i import alpha_gradient_coefficient
 from vfe3.contracts import CanonicalFrameContext
-from vfe3.families.base import safe_kl_clamp
 from vfe3.free_energy import attention_weights
-from vfe3.gradients.relational import relational_score
+from vfe3.gradients.relational import clamped_routing_cost, relational_score
 from vfe3.model.relational_operators import RelationalOperators
 from vfe3.relational_scoring import _compute_dtype
 from vfe3.runtime import ieee_fp32_matmul
@@ -427,9 +426,10 @@ def build_full_link_context(
                            channel_frame.inverse, *operators._content_parameters())
     with torch.autocast(device_type=mu.device.type, enabled=False):
         mu_work, sigma_work = mu.to(dtype), sigma.to(dtype)
-        score = safe_kl_clamp(relational_score(
-            mu_work, sigma_work, mu_work, sigma_work, frame, operators, capture), kl_max=kl_max)
-        beta = attention_weights(score, tau=tau, log_prior=(
+        score = clamped_routing_cost(relational_score(
+            mu_work, sigma_work, mu_work, sigma_work, frame, operators, capture), operators,
+            kl_max=kl_max, log_prior=None if log_prior is None else log_prior.to(dtype))
+        beta = attention_weights(score, tau=operators.routing_temperature(tau, dtype), log_prior=(
             None if log_prior is None else log_prior.to(dtype)))
         weights = _head_weights(beta, lambda_beta)                       # (..., H, I, J)
         content = operators.content_factor_runs()                  # per-run (T, O') once per context build

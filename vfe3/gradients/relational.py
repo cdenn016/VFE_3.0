@@ -19,6 +19,9 @@ def relational_score(
     frame:        CanonicalFrameContext,               # (..., N, H, d, d) compact or (..., N, K, K) dense
     operators:    RelationalOperators,
     capture:      Optional[Dict[str, Any]] = None,     # out-param: pre-update projected covariances
+
+    *,
+    row_invariant: bool = False,
 ) -> torch.Tensor:                                     # (..., H, N, N) projected routing costs
     r"""Compute KL(S_Q U_i^{-1} q_i || S_K U_j^{-1} q_j) or the noisy-query cost, retaining full reduced covariance.
 
@@ -30,6 +33,11 @@ def relational_score(
     inverse frame retains its compact gauge blocks. A dense-layout frame must
     represent the same block-diagonal structure; cross-head frame coupling is
     outside the supported projected architecture.
+
+    ``row_invariant=True`` declares that the caller reads the cost only through quantities invariant
+    to a per-query-row constant (the kernel router under ``routing_kl_max_reference='row_min'``). The
+    Gaussian KL then computes its query log-determinant without autograd (``query_row_constant_grad``
+    of :func:`vfe3.relational_scoring.projected_gaussian_kl`); the returned values are unchanged.
     """
     dims = operators.irrep_dims
     inverse = frame.inverse
@@ -61,6 +69,8 @@ def relational_score(
     # float64; the results are returned at the dtype a lower-precision frame would have produced.
     public = _compute_dtype(mu, sigma, source_mu, source_sigma, *(S for pair in comparison for S in pair))
     score = routing_cost(operators.routing)                                  # ROUTING_COSTS registry
+    row_constant = ({"query_row_constant_grad": False}
+                    if row_invariant and operators.routing == "gaussian_kl" else {})
     scores, captured_q, captured_k = [], [], []
     # One scoring call per run: the heads of a run share their rank d_r. Each call ends in its own
     # host transfer, so a tower of R runs pays R of them per call (one for equal heads).
@@ -114,15 +124,47 @@ def relational_score(
             G_q, G_k = 0.5 * (G_q + G_q.transpose(-1, -2)), 0.5 * (G_k + G_k.transpose(-1, -2))
             projection_q = (sigma_h, inverse, S_q_rot, mu_h)
             projection_k = (source_sigma_h, key_inverse, S_k_rot, source_mu_h)
+        # G_q, G_k are bitwise symmetric here (projected_moments and the RoPE branch both end in a
+        # symmetrization), so the scorer skips its isclose symmetry check.
         scores.append(score(
             a_q, G_q, a_k, G_k,
             projection_q=projection_q,
-            projection_k=projection_k).to(public))
+            projection_k=projection_k,
+            symmetric_inputs=True,
+            **row_constant).to(public))
     if capture is not None:
         # One (..., N, H, r, r) tensor for equal heads; a list with one per run for mixed head sizes.
         capture["projected_covariance_pre"] = captured_q[0] if len(captured_q) == 1 else captured_q
         capture["projected_key_covariance_pre"] = captured_k[0] if len(captured_k) == 1 else captured_k
     return scores[0] if len(scores) == 1 else torch.cat(scores, dim=-3)      # (..., H, N, N)
+
+
+def clamped_routing_cost(
+    score:     torch.Tensor,                     # (..., H, N, N) routing cost D_ij
+    operators: RelationalOperators,
+    *,
+    kl_max:    float,
+    log_prior: Optional[torch.Tensor] = None,    # (..., N, N) or (..., H, N, N), -inf = inadmissible
+) -> torch.Tensor:
+    r"""Clamp the kernel-router cost at ``kl_max`` relative to ``operators.kl_max_reference``.
+
+    ``absolute`` clamps :math:`D_{ij}`. ``row_min`` clamps the gap
+    :math:`D_{ij}-\min_{j' \in \mathcal{A}_i}D_{ij'}` over the admissible sources :math:`\mathcal{A}_i`
+    (audit 2026-10-08 P1-4): the softmax is
+    row-shift invariant, so beta is unchanged wherever a row keeps an entry below the cap, and a row
+    whose every cost exceeds ``kl_max`` still routes by its cost order. The row minimum is a constant
+    (no gradient); a row with no admissible finite cost is not shifted.
+    """
+    from vfe3.families.base import safe_kl_clamp
+    if getattr(operators, "kl_max_reference", "absolute") == "row_min":
+        with torch.no_grad():
+            admissible = torch.isfinite(score)
+            if log_prior is not None:
+                admissible = admissible & torch.isfinite(log_prior)
+            row_min = score.masked_fill(~admissible, float("inf")).amin(dim=-1, keepdim=True)
+            row_min = torch.where(torch.isfinite(row_min), row_min, torch.zeros_like(row_min))
+        score = score - row_min                                                 # (..., H, N, N)
+    return safe_kl_clamp(score, kl_max=kl_max)
 
 
 def relational_predictive_readout(
@@ -145,7 +187,9 @@ def relational_predictive_readout(
     ``return_covariance`` it also returns ``(mean, sigma_plus)``, where sigma_plus is the
     moment-matched covariance of the same predictive kernel
     (``RelationalOperators.predictive_covariance_update``), computed from the same routing weights
-    and value frame as the mean. No source, router, or map is detached.
+    and value frame as the mean. No source, router, or map is detached. ``tau`` is the configured
+    temperature; under ``learn_attention_temperature`` the routing uses
+    :meth:`RelationalOperators.routing_temperature` of this layer.
     Under ``content_link_edges`` the edge context (factors, :math:`\Phi_{ij}` and the float64 chart
     stacks) is computed once per layer and shared by the mean, the covariance and the capture.
     Under ``content_link_latent`` its receiver factors are inferred from the source covariances of
@@ -169,7 +213,6 @@ def relational_predictive_readout(
         mean, sigma_plus = operators.minimal_agent_update(
             mu, sigma, frame, log_prior, return_covariance=return_covariance, capture=capture)
         return (mean, sigma_plus) if return_covariance else mean
-    from vfe3.families.base import safe_kl_clamp
     from vfe3.free_energy import attention_weights
     dtype = torch.float64 if mu.dtype == torch.float64 else torch.float32
     edges = None
@@ -178,20 +221,14 @@ def relational_predictive_readout(
     with torch.autocast(device_type=mu.device.type, enabled=False):
         mu_work = mu.to(dtype)
         sigma_work = sigma.to(dtype)
-        score = relational_score(mu_work, sigma_work, mu_work, sigma_work, frame, operators, capture)
-        if getattr(operators, "kl_max_reference", "absolute") == "row_min":
-            # Clamp the gap to the row's smallest admissible finite cost (audit 2026-10-08 P1-4). The
-            # softmax is row-shift invariant, so beta is unchanged wherever a row keeps an entry below
-            # the cap, and a row whose every cost exceeds kl_max still routes by its cost order.
-            with torch.no_grad():
-                admissible = torch.isfinite(score)
-                if log_prior is not None:
-                    admissible = admissible & torch.isfinite(log_prior.to(dtype))
-                row_min = score.masked_fill(~admissible, float("inf")).amin(dim=-1, keepdim=True)
-                row_min = torch.where(torch.isfinite(row_min), row_min, torch.zeros_like(row_min))
-            score = score - row_min                                             # (..., H, N, N)
-        score = safe_kl_clamp(score, kl_max=kl_max)
-        beta = attention_weights(score, tau=tau,
+        # Under the row_min reference the clamp and softmax read only row gaps, so the query
+        # log-determinant (a row constant of the Gaussian KL) needs no autograd.
+        row_invariant = getattr(operators, "kl_max_reference", "absolute") == "row_min"
+        score = clamped_routing_cost(
+            relational_score(mu_work, sigma_work, mu_work, sigma_work, frame, operators, capture,
+                             **({"row_invariant": True} if row_invariant else {})),
+            operators, kl_max=kl_max, log_prior=None if log_prior is None else log_prior.to(dtype))
+        beta = attention_weights(score, tau=operators.routing_temperature(tau, dtype),
                                  log_prior=None if log_prior is None else log_prior.to(dtype))
         if getattr(operators, "content_link_edges", "off") != "off":
             inference = ({} if not latent else dict(

@@ -5,6 +5,7 @@ Tiny CPU tensors and models only (K=4, two heads, N=4, vocab 7). Covers the char
 phi_1 against its series, equal initial content in every chart, gradient checks of the chart maps,
 short training runs on both projected routes, the post-hoc map readers, and config validation.
 """
+from tests.profiles import make_relational_operators
 from tests.profiles import test_config
 import logging
 import math
@@ -87,7 +88,7 @@ def test_exponential_transfer_stays_positive_where_affine_flips_sign() -> None:
 def test_every_chart_starts_at_the_same_content(scale: float) -> None:
     maps = {}
     for chart in CONTENT_LINK_CHARTS:
-        ops = RelationalOperators([D] * H, seed=3, output_init_scale=scale, content_link_chart=chart)
+        ops = make_relational_operators([D] * H, seed=3, output_init_scale=scale, content_link_chart=chart)
         T_, receive = ops.content_factors()
         maps[chart] = (_stack_O(receive.double()) @ _stack_T(T_.double()), ops.raw_score_q.detach().clone())
     for chart in CONTENT_LINK_CHARTS:

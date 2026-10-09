@@ -11,6 +11,7 @@ prior, and that the relational diagnostics emit every key at every layer.
 """
 
 from __future__ import annotations
+from tests.profiles import make_relational_operators
 
 from tests.profiles import test_config
 
@@ -42,7 +43,7 @@ def _one_thread() -> None:
 
 def _ops(input_scope: str, output_scope: str, residual: bool = False, scale: float = 1.0,
          perturb: bool = True, seed: int = 0) -> RelationalOperators:
-    ops = RelationalOperators([D] * H, 3,  readout_mode="predictive_content",
+    ops = make_relational_operators([D] * H, 3,  readout_mode="predictive_content",
                                attention_residual=residual,
                               output_init_scale=scale).double()
     if perturb:

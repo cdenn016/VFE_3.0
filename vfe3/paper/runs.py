@@ -15,11 +15,14 @@ is built. A manifest declares
   ``{"runs": [...], "vary": [config fields allowed to differ]}``;
 * ``selection``: the checkpoint-selection rule, ``"best"`` (best recorded validation, the default)
   or ``"final"`` (final weights), applied identically to every run;
-* ``decision``: optional ``{"evaluated", "comparator", "frozen"}`` arm labels of the registered
-  decision rule (:func:`vfe3.paper.tables.decision_rule_table`); absent labels take its defaults.
+* ``decision``: optional ``{"evaluated", "comparator", "frozen", "capacity"}`` arm labels of the
+  registered decision rule (:func:`vfe3.paper.tables.decision_rule_table`); absent labels take its
+  defaults.
 
 An arm mapping may also carry ``"inapplicable": "<reason>"`` (written by ``paper_arms.py`` for a row
-that does not apply to its base); the tables then print ``n/a`` for it instead of ``pending``.
+that does not apply to its base); the tables then print ``n/a`` for it instead of ``pending``. A
+``paper_arms.py`` manifest also holds ``paper_arms.rows[label]``; its ``reuse_verified``, ``stale`` and
+``code_identity_mismatch`` records are carried onto the :class:`Arm` (the decision rule reads them).
 
 :func:`load_run` reads ``config.json`` (strictly, then, for configs written by older code lines,
 through :func:`vfe3.legacy_config.lenient_config_from_serialized`, recording the dropped retired
@@ -159,6 +162,10 @@ class Arm:
     homogeneity: Dict[str, Any] = field(default_factory=dict)
     vary:        Tuple[str, ...] = ()
     inapplicable: Optional[str] = None                         # reason the row does not apply (n/a)
+    # paper_arms manifest records (paper_arms.rows[label]); None / empty when the manifest has none.
+    reuse_verified: Optional[bool] = None                      # False: runs listed without a config check
+    stale:        List[Dict[str, Any]] = field(default_factory=list)          # rejected complete runs
+    code_identity_mismatch: List[Dict[str, Any]] = field(default_factory=list)   # runs on other code
 
 
 @dataclass
@@ -383,6 +390,7 @@ def resolve_manifest(
     arms = manifest.get("arms") or {}
     if not isinstance(arms, Mapping):
         raise ValueError("manifest['arms'] must be an ordered mapping {arm label: runs}")
+    rows = (manifest.get("paper_arms") or {}).get("rows") or {}
     for label, spec in arms.items():
         entries, group, _ = _spec_entries(spec)
         paths, unresolved = resolve_run_paths(entries)
@@ -390,6 +398,12 @@ def resolve_manifest(
                   unresolved=unresolved)
         if isinstance(spec, Mapping) and isinstance(spec.get("inapplicable"), str):
             arm.inapplicable = spec["inapplicable"]
+        row = rows.get(label)
+        if isinstance(row, Mapping):
+            if isinstance(row.get("reuse_verified"), bool):
+                arm.reuse_verified = row["reuse_verified"]
+            arm.stale = list(row.get("stale") or [])
+            arm.code_identity_mismatch = list(row.get("code_identity_mismatch") or [])
         arm.homogeneity = check_homogeneity(arm.runs)
         for entry in unresolved:
             out.problems.append(f"arm {label!r}: {entry!r} matched no run directory")
@@ -443,6 +457,49 @@ def code_identity(run: RunRecord) -> Dict[str, Any]:
     if isinstance(archive, Mapping) and archive.get("available") and isinstance(archive.get("tree_sha256"), str):
         return {"source_tree_sha256": archive["tree_sha256"]}
     return {key: run.provenance.get(key) for key in CODE_IDENTITY_FIELDS}
+
+
+def current_code_identity(kind: str) -> Dict[str, Any]:
+    r"""The working tree's code identity in the form :func:`code_identity` records.
+
+    ``kind="source_tree_sha256"``: the content hash of the files a source archive would hold
+    (:func:`vfe3.run_archive.source_tree_sha256`); any other kind: the git triple of
+    ``vfe3.run_artifacts._git_code_identity`` (None where the probe fails).
+    """
+    if kind == "source_tree_sha256":
+        from vfe3.run_archive import source_tree_sha256
+        return {"source_tree_sha256": source_tree_sha256()[0]}
+    from vfe3.run_artifacts import _git_code_identity
+    identity = _git_code_identity()
+    return {key: identity.get(key) for key in CODE_IDENTITY_FIELDS}
+
+
+def code_identity_mismatch(
+    run: RunRecord,
+
+    *,
+    current: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Optional[str]:
+    r"""Why ``run``'s recorded code identity is not the working tree's, or None when it is.
+
+    The run's :func:`code_identity` is compared with :func:`current_code_identity` of the same kind
+    (the source-archive content hash when the run recorded one, else the git triple). A run that
+    records no identity, or a tree whose identity cannot be probed, is a mismatch with that reason.
+    ``current`` caches the tree's identity by kind across calls.
+    """
+    recorded = code_identity(run)
+    if all(value is None for value in recorded.values()):
+        return "the run records no code identity"
+    kind = "source_tree_sha256" if "source_tree_sha256" in recorded else "git"
+    cache = {} if current is None else current
+    if kind not in cache:
+        cache[kind] = current_code_identity(kind)
+    now = cache[kind]
+    if all(value is None for value in now.values()):
+        return f"the current tree's code identity could not be determined ({now})"
+    if _canonical(recorded) != _canonical(now):
+        return f"trained on {recorded}, the current tree is {now}"
+    return None
 
 
 def _comparable_fields(run: RunRecord) -> Dict[str, Any]:

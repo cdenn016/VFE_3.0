@@ -90,6 +90,39 @@ from vfe3.numerics import (
 _DECODE_AV_PRECISIONS = ("fp32", "fp64")
 _DECODE_AV_PRECISION: str = "fp32"
 
+# Prior covariance table layouts (VFE3Config.prior_covariance_table): the (V, K) log-variance table, or the
+# frame-free per-head Cholesky table (V, H, d(d+1)/2) of PriorBank._prior_covariance_blocks.
+PRIOR_COVARIANCE_TABLES = ("diagonal", "block_cholesky")
+
+
+def packed_cholesky_covariance(
+    packed: torch.Tensor,                # (..., d(d+1)/2) lower triangle, tril_indices order, log diagonal
+    d:      int,
+) -> torch.Tensor:                       # (..., d, d) C = L L^T
+    r"""SPD block :math:`C = LL^\top` from its packed log-diagonal Cholesky factor.
+
+    ``packed`` holds the lower triangle of :math:`L` in ``torch.tril_indices(d, d)`` order, with the diagonal
+    stored as :math:`\ell_k = \log L_{kk}`, so
+
+    .. math::
+        C = LL^\top,\qquad L_{kk} = e^{\ell_k} > 0,
+
+    is SPD for every parameter value, with :math:`d(d+1)/2` parameters (the dimension of SPD(d)), and the map
+    is a bijection onto SPD(d). The log entry is clamped at 40 before exponentiation (the log-variance table's
+    80, halved), only to keep float32 finite. Off-diagonal entries are never exponentiated, so no masked
+    branch carries an overflow into the gradient.
+    """
+    rows, cols = torch.tril_indices(d, d, device=packed.device)
+    if packed.shape[-1] != rows.numel():
+        raise ValueError(f"packed Cholesky entries must have d(d+1)/2 = {rows.numel()} entries, "
+                         f"got {packed.shape[-1]}")
+    on_diagonal = rows == cols                                                       # (P,)
+    log_diagonal = torch.where(on_diagonal, packed, torch.zeros_like(packed)).clamp(max=40.0)
+    entries = torch.where(on_diagonal, torch.exp(log_diagonal), packed)              # (..., P)
+    factor = packed.new_zeros(*packed.shape[:-1], d * d).index_copy(
+        -1, rows * d + cols, entries).reshape(*packed.shape[:-1], d, d)              # (..., d, d) L
+    return factor @ factor.transpose(-1, -2)
+
 
 def set_decode_av_precision(precision: str) -> str:
     r"""Set the process-wide decode ``a_v`` working precision; returns the previous value."""
@@ -815,7 +848,7 @@ class PriorBank(nn.Module):
     output_proj_weight: Optional[nn.Parameter]   # (V, K) linear-decode weight; None for prior-bank modes
     output_proj_bias:   Optional[nn.Parameter]   # (V,) optional linear-decode log-unigram bias
     mu_embed:           nn.Parameter             # (V, K) token-prior mean
-    sigma_log_embed:    nn.Parameter             # (V, K) token-prior log variance
+    sigma_log_embed:    Optional[nn.Parameter]   # (V, K) token-prior log variance; None under 'block_cholesky'
 
     def __init__(
         self,
@@ -849,8 +882,24 @@ class PriorBank(nn.Module):
         irrep_dims:             Optional[List[int]] = None,
         gauge_group_name:       Optional[str]       = None,
         decode_coordinates:     str                 = "local",
+        prior_covariance_table: str                 = "diagonal",
     ) -> None:
         super().__init__()
+        if prior_covariance_table not in PRIOR_COVARIANCE_TABLES:
+            raise ValueError(f"prior_covariance_table must be one of {PRIOR_COVARIANCE_TABLES}, "
+                             f"got {prior_covariance_table!r}")
+        if prior_covariance_table == "block_cholesky":
+            problems = []
+            if not irrep_dims or len(set(irrep_dims)) != 1:
+                problems.append(f"equal head blocks (irrep_dims={irrep_dims})")
+            if diagonal_covariance:
+                problems.append("a full-layout family (gaussian_block or gaussian_full)")
+            if decode_mode != "linear" and not untie_decode_bank:
+                problems.append("untie_decode_bank=True (the decode bank keeps its own diagonal tables)")
+            if problems:
+                raise ValueError("prior_covariance_table='block_cholesky' requires " + ", ".join(problems))
+        # 'block_cholesky' replaces the (V, K) log-variance table by per-head Cholesky factors (sigma_chol_embed).
+        self.prior_covariance_table = prior_covariance_table
         if decode_coordinates not in ("local", "reference"):
             raise ValueError(f"decode_coordinates must be 'local' or 'reference', got {decode_coordinates!r}")
         if decode_coordinates == "reference" and decode_mode not in _REFERENCE_DECODE_MODES:
@@ -910,8 +959,18 @@ class PriorBank(nn.Module):
         get_decode_registration(decode_mode)
         # The routed token-prior tables ARE the belief prior, so both are always live Parameters.
         self.mu_embed = nn.Parameter(mu_init_std * torch.randn(vocab_size, K))
-        self.sigma_log_embed = nn.Parameter(
-            torch.full((vocab_size, K), sigma_log_init), requires_grad=True)
+        if prior_covariance_table == "block_cholesky":
+            # Frame-free per-type covariance C_v = blockdiag_h(L_vh L_vh^T): packed lower triangles
+            # (V, H, d(d+1)/2) in torch.tril_indices(d, d) order, diagonal entries stored as log L_kk.
+            # Initialized at L = sqrt(sigma_init) I, the covariance the diagonal table starts at; no RNG draw.
+            n_heads, d = len(irrep_dims), irrep_dims[0]
+            rows, cols = torch.tril_indices(d, d)
+            packed = torch.where(rows == cols, torch.tensor(0.5 * sigma_log_init), torch.tensor(0.0))
+            self.register_parameter("sigma_log_embed", None)
+            self.sigma_chol_embed = nn.Parameter(packed.expand(vocab_size, n_heads, packed.numel()).clone())
+        else:
+            self.sigma_log_embed = nn.Parameter(
+                torch.full((vocab_size, K), sigma_log_init), requires_grad=True)
         # Draw the historical phi initialization so every later RNG-owned table keeps the same seed
         # position.
         initial_phi = phi_scale * torch.randn(vocab_size, n_gen)
@@ -975,7 +1034,11 @@ class PriorBank(nn.Module):
         # the original tables. Cloning draws no RNG, so the default path's table init is byte-unchanged.
         if self.untie_decode_bank:
             self.decode_mu_embed        = nn.Parameter(self._prior_mu_table().clone().detach())
-            self.decode_sigma_log_embed = nn.Parameter(self._prior_sigma_log_table().clone().detach())
+            # Under 'block_cholesky' there is no diagonal prior table to clone; the decode bank starts at the
+            # value that table would have held (sigma_init everywhere).
+            decode_sigma_log = (torch.full((vocab_size, K), sigma_log_init) if self.sigma_log_embed is None
+                                else self._prior_sigma_log_table())
+            self.decode_sigma_log_embed = nn.Parameter(decode_sigma_log.clone().detach())
 
     def encode(
         self,
@@ -995,8 +1058,42 @@ class PriorBank(nn.Module):
 
     def _prior_sigma_log_table(self) -> torch.Tensor:
         r"""The (V, K) log-variance prior table feeding p_i; the sigma sibling of
-        ``_prior_mu_table`` (see there): the token table ``sigma_log_embed``."""
+        ``_prior_mu_table`` (see there): the token table ``sigma_log_embed`` (None under
+        ``prior_covariance_table='block_cholesky'``, whose prior covariance is :meth:`_prior_covariance_blocks`)."""
         return self.sigma_log_embed
+
+    def _prior_covariance_blocks(
+        self,
+        index: Optional[torch.Tensor] = None,    # (...) integer token ids; None reads every type
+    ) -> torch.Tensor:                           # (..., H, d, d) C_v = L_v L_v^T per head
+        r"""Per-head prior covariance blocks of ``prior_covariance_table='block_cholesky'``
+        (:func:`packed_cholesky_covariance` of the gathered ``sigma_chol_embed`` rows)."""
+        packed = self.sigma_chol_embed if index is None else self.sigma_chol_embed[index]   # (..., H, P)
+        return packed_cholesky_covariance(packed, self.irrep_dims[0])
+
+    def _diagonal_decoder_dispersion(
+        self,
+        mu_q:    torch.Tensor,                   # (..., N, K)
+        sigma_q: Optional[torch.Tensor],         # (..., N, K) or (..., N, K, K)
+    ) -> Optional[torch.Tensor]:
+        r""":math:`\mathrm{diag}\,\Sigma_q` when a diagonal-bank Gaussian decoder receives a full-layout covariance.
+
+        Reached by ``gaussian_block`` with ``decode_mode='diagonal_chunked'``. Against a diagonal bank
+        :math:`p_v = \mathcal N(\mu_v, \mathrm{diag}\,s_v)`,
+
+        .. math::
+            2\,\mathrm{KL}(q\|p_v) = \sum_k\frac{\Sigma_{kk} + (\mu_k-\mu_{vk})^2}{s_{vk}} - K + \sum_k\log s_{vk}
+              - \log\det\Sigma,
+
+        so the vocabulary-dependent part reads only :math:`\mathrm{diag}\,\Sigma`, and the diagonal kernel's
+        logits differ from :math:`-\mathrm{KL}/\tau` by the per-position constant
+        :math:`\tfrac{1}{2\tau}(\log\det\Sigma - \sum_k\log\Sigma_{kk})`: the softmax and cross-entropy are exact.
+        Every other decoder, and every diagonal covariance, is returned unchanged.
+        """
+        if (sigma_q is not None and sigma_q.dim() == mu_q.dim() + 1 and self.decode_mode != "linear"
+                and not get_decode_registration(self.decode_mode).supports_full):
+            return torch.diagonal(sigma_q, dim1=-2, dim2=-1)
+        return sigma_q
 
     def _decode_mu_table(self) -> torch.Tensor:
         r"""The (V, K) mean table the DECODE boundary scores against: the untied decode table
@@ -1236,7 +1333,7 @@ class PriorBank(nn.Module):
             return self._reference_query(mu_q, sigma_q, canonical_frame)
         if canonical_frame is not None:
             raise ValueError("canonical_frame is only valid for decode_coordinates='reference'")
-        return mu_q, sigma_q
+        return mu_q, self._diagonal_decoder_dispersion(mu_q, sigma_q)
 
     def decode(
         self,
@@ -1398,10 +1495,10 @@ class PriorBank(nn.Module):
         shifted logits.
 
         Under ``decode_coordinates='reference'`` the query is first mapped to
-        :math:`(\xi_i, \operatorname{diag}C_i)` through ``canonical_frame`` (``_reference_query``).
+        :math:`(\xi_i, \operatorname{diag}C_i)` through ``canonical_frame`` (``_reference_query``). A full-layout
+        covariance (``gaussian_block``) is read as its diagonal (``_diagonal_decoder_dispersion``).
         """
-        if canonical_frame is not None or self.decode_coordinates == "reference":
-            mu_q, sigma_q = self._query_in_decode_frame(mu_q, sigma_q, canonical_frame)
+        mu_q, sigma_q = self._query_in_decode_frame(mu_q, sigma_q, canonical_frame)
         has_ignored = self._validate_fused_ce_targets(
             targets, ignore_index=ignore_index, expected_shape=mu_q.shape[:-1])
         original_valid = targets != ignore_index
@@ -1545,6 +1642,8 @@ class PriorBank(nn.Module):
         elif canonical_frame is not None:
             raise ValueError("canonical_frame is only valid for decode_coordinates='reference'")
         else:
+            if not get_decode_registration(self.decode_mode).supports_full:
+                return None                                   # diag Sigma: no factorization
             if sigma_q.dim() < 4 or sigma_q.shape[-1] != sigma_q.shape[-2]:
                 return None                                   # diagonal dispersion: no factorization
             safe_sigma, _, ok = self._prepare_full_covariance_for_decode(sigma_q)
@@ -2222,6 +2321,11 @@ def _encode_prior_sigma(
     token_ids: torch.Tensor,             # (B, N) integer token ids
 ) -> torch.Tensor:
     """Look up the token-table belief prior covariance at the configured family rank."""
+    if pb.prior_covariance_table == "block_cholesky":
+        blocks = pb._prior_covariance_blocks(token_ids)                      # (B, N, H, d, d)
+        eye_h = torch.eye(blocks.shape[-3], dtype=blocks.dtype, device=blocks.device)
+        return torch.einsum("...hab,hg->...hagb", blocks, eye_h).reshape(
+            *token_ids.shape, pb.K, pb.K)                                    # (B, N, K, K) head-block diagonal
     variance = bounded_variance_from_log(pb._prior_sigma_log_table(), eps=pb.eps,
                                          index=token_ids)                 # (B, N, K)
     if pb.diagonal_covariance:

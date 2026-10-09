@@ -1,4 +1,5 @@
 """Independent Gaussian Q/K routing and optimization contracts."""
+from tests.profiles import make_relational_operators
 import pytest
 import torch
 
@@ -13,7 +14,7 @@ from tests.test_relational_integration import _cfg, _tokens
 
 def test_separate_maps_match_distribution_oracle_and_have_free_scales() -> None:
     mu, sigma, _, frame, _, _ = _fixture()
-    ops = RelationalOperators([2, 2], 11).double()
+    ops = make_relational_operators([2, 2], 11).double()
     S_q, S_k = ops.comparison_pair()
     assert S_q.data_ptr() != S_k.data_ptr()
     assert not torch.equal(S_q, S_k)

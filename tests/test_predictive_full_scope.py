@@ -1,4 +1,5 @@
 """All supported attention projections have fixed full input and output."""
+from tests.profiles import make_relational_operators
 from dataclasses import asdict
 
 import pytest
@@ -54,4 +55,4 @@ def test_old_head_serialized_scopes_are_rejected(field: str) -> None:
 @pytest.mark.parametrize("field", ["input_scope", "output_scope", "identity_content"])
 def test_operator_does_not_accept_removed_architecture_options(field: str) -> None:
     with pytest.raises(TypeError, match=field):
-        RelationalOperators([2, 2], 11, **{field: "head"})
+        make_relational_operators([2, 2], 11, **{field: "head"})

@@ -8,6 +8,7 @@ a brute-force reference built from explicit matrix exponentials (unshifted sprea
 blockwise against dense, passive gauge covariance, triangle holonomies, causality under large factors,
 finite-difference gradients, config/optimizer/resource/state-dict wiring and short model training.
 """
+from tests.profiles import make_relational_operators
 import itertools
 import logging
 import math
@@ -57,7 +58,7 @@ def _ops(
 ) -> RelationalOperators:
     r"""Float64 edge operators with generic T, O, W_A (or A) and W_B (``sender`` scales W_B; 0 keeps B = 0)."""
     K = H * d
-    ops = RelationalOperators([d] * H, 11, attention_residual=residual, predictive_covariance="moment_matched",
+    ops = make_relational_operators([d] * H, 11, attention_residual=residual, predictive_covariance="moment_matched",
                               predictive_covariance_floor=FLOOR, content_link_chart="exponential",
                               content_link_edges=mode, content_link_edge_rank=r, **kwargs).double()
     g = torch.Generator().manual_seed(100 + seed)
@@ -73,7 +74,7 @@ def _ops(
 
 def _chart_twin(ops: RelationalOperators) -> RelationalOperators:
     r"""The same shared maps with the edges off (the exponential chart)."""
-    twin = RelationalOperators(ops.irrep_dims, 11, attention_residual=ops.attention_residual,
+    twin = make_relational_operators(ops.irrep_dims, 11, attention_residual=ops.attention_residual,
                                predictive_covariance="moment_matched", predictive_covariance_floor=FLOOR,
                                content_link_chart="exponential").double()
     with torch.no_grad():
@@ -503,16 +504,16 @@ def test_config_validation_and_inactive_fields() -> None:
 def test_operator_constructor_refusals() -> None:
     kwargs = dict(content_link_chart="exponential", content_link_edges="lowrank", content_link_edge_rank=2)
     with pytest.raises(ValueError, match="exponential"):
-        RelationalOperators([2, 2], 1, **{**kwargs, "content_link_chart": "first_order"})
+        make_relational_operators([2, 2], 1, **{**kwargs, "content_link_chart": "first_order"})
     with pytest.raises(ValueError, match="predictive_content"):
-        RelationalOperators([2, 2], 1, readout_mode="full_link_update", **kwargs)
+        make_relational_operators([2, 2], 1, readout_mode="full_link_update", **kwargs)
     with pytest.raises(ValueError, match="equal heads"):
-        RelationalOperators([3, 3, 5], 1, **kwargs)
+        make_relational_operators([3, 3, 5], 1, **kwargs)
     with pytest.raises(ValueError, match="content_link_edge_rank"):
-        RelationalOperators([2, 2], 1, **{**kwargs, "content_link_edge_rank": 5})
+        make_relational_operators([2, 2], 1, **{**kwargs, "content_link_edge_rank": 5})
     with pytest.raises(ValueError, match="content_link_edges"):
-        RelationalOperators([2, 2], 1, **{**kwargs, "content_link_edges": "curved"})
-    off = RelationalOperators([2, 2], 1, content_link_chart="exponential")
+        make_relational_operators([2, 2], 1, **{**kwargs, "content_link_edges": "curved"})
+    off = make_relational_operators([2, 2], 1, content_link_chart="exponential")
     assert off.edge_parameters() == [] and not any("edge" in k for k in off.state_dict())
 
 

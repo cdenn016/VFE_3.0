@@ -9,6 +9,7 @@ projected-gradient receiver against brute-force dense float64 references; the pe
 temperatures; train steps, gauge equivariance and a finite-difference phi gradient on the five so_n
 routes; the run record; the content-link diagnostics; and a checkpoint/config round trip.
 """
+from tests.profiles import make_relational_operators
 import math
 import warnings
 from typing import Dict, List, Tuple
@@ -50,7 +51,7 @@ def _per_head(runs: List[torch.Tensor]) -> List[torch.Tensor]:
 
 
 def _operators(dims: List[int], **kwargs: object) -> RelationalOperators:
-    ops = RelationalOperators(dims, seed=5, **kwargs).double()
+    ops = make_relational_operators(dims, seed=5, **kwargs).double()
     with torch.no_grad():                                        # move off the identity start
         g = torch.Generator().manual_seed(7)
         for p in ops.parameters():
@@ -88,7 +89,7 @@ def test_head_runs_are_maximal_contiguous_equal_size_runs() -> None:
 
 
 def test_single_run_storage_is_unchanged() -> None:
-    ops = RelationalOperators([3, 3], seed=1)
+    ops = make_relational_operators([3, 3], seed=1)
     for name, shape in (("raw_score_q", (2, 3, 6)), ("raw_score_k", (2, 3, 6)), ("T", (2, 3, 6)), ("O", (2, 6, 3))):
         assert isinstance(getattr(ops, name), torch.nn.Parameter) and tuple(getattr(ops, name).shape) == shape
     assert list(ops.state_dict()) == ["raw_score_q", "raw_score_k", "T", "O"]
@@ -96,7 +97,7 @@ def test_single_run_storage_is_unchanged() -> None:
 
 
 def test_mixed_run_storage_keys_shapes_and_initialization() -> None:
-    ops = RelationalOperators([3, 3, 5], seed=1, output_init_scale=2.0)
+    ops = make_relational_operators([3, 3, 5], seed=1, output_init_scale=2.0)
     assert list(ops.state_dict()) == [f"{n}.{r}" for n in ("raw_score_q", "raw_score_k", "T", "O") for r in (0, 1)]
     assert tuple(ops.T[0].shape) == (2, 3, 11) and tuple(ops.T[1].shape) == (1, 5, 11)
     assert tuple(ops.O[0].shape) == (2, 11, 3) and tuple(ops.O[1].shape) == (1, 11, 5)
@@ -182,7 +183,7 @@ def test_routing_score_matches_per_head_reference_in_head_order(spec: list, dims
 def test_routing_score_float64_recovery_path_agrees_on_a_mixed_tower() -> None:
     import vfe3.relational_scoring as rs
     from vfe3.gradients.relational import relational_score
-    ops = RelationalOperators([3, 3, 5], seed=5)
+    ops = make_relational_operators([3, 3, 5], seed=5)
     U = _frames(SPEC, 11).float()
     frame = CanonicalFrameContext(U, torch.linalg.inv(U))
     g = torch.Generator().manual_seed(2)

@@ -66,7 +66,7 @@ from vfe3.families.gaussian import (
     set_full_cov_kl_precision,
     validate_full_cov_kl_precision,
 )
-from vfe3.families.base import BeliefParams
+from vfe3.families.base import BeliefParams, get_family as _get_family
 from vfe3.families.policy import family_instance
 from vfe3.numerics import safe_eigvalsh, set_mu_trust_cholesky_rounds
 from vfe3.relational_scoring import (
@@ -77,7 +77,7 @@ from vfe3.relational_scoring import (
     set_projected_recovery_precision,
 )
 from vfe3.runtime import set_fill_uninitialized_memory, set_fp32_matmul_precision
-from vfe3.model.relational_operators import RelationalOperators
+from vfe3.model.relational_operators import RelationalOperators, shared_content_charts
 
 
 def _block_mlp_diagnostic_eval(method: Callable) -> Callable:
@@ -322,7 +322,10 @@ class VFEModel(nn.Module):
                                 comparison_rope_base=(cfg.rope_base if cfg.pos_rotation == "rope"
                                                       and cfg.rope_space == "comparison" else None),
                                 comparison_rope_fraction=cfg.rope_fraction,
-                                kl_max_reference=cfg.routing_kl_max_reference)
+                                kl_max_reference=cfg.routing_kl_max_reference,
+                                learn_attention_temperature=cfg.learn_attention_temperature,
+                                tie_comparison_maps=cfg.tie_comparison_maps,
+                                block_covariance=_get_family(cfg.family).head_block_covariance)
             for layer_index in range(cfg.n_layers)
         ]
         self.relational_operators = layers[0]
@@ -364,6 +367,7 @@ class VFEModel(nn.Module):
             irrep_dims=list(self.group.irrep_dims),
             gauge_group_name=self.group.name,
             decode_coordinates=cfg.decode_coordinates,
+            prior_covariance_table=cfg.prior_covariance_table,
         )
         if cfg.decode_logits_amp and cfg.decode_mode == "linear" and cfg.amp_dtype is not None:
             self.prior_bank.decode_logits_amp_dtype = (
@@ -1080,20 +1084,22 @@ class VFEModel(nn.Module):
                 stack_extra["block_mlp_hidden_biases"] = [
                     part if part.shape[-1] > 0 else None
                     for part in torch.split(table, list(self._per_type_hidden_widths), dim=-1)]
-            out = vfe_stack(
-                beliefs, beliefs.mu, beliefs.sigma, self.group, self.cfg,
-                log_prior=log_prior, block_norm=self.block_norm,
-                block_mlps=self.block_mlps,
-                block_mlp_frame=block_mlp_frame,
-                cg_coupling=self.cg_coupling,
-                lambda_beta=lambda_beta,
-                relational_operators=self.relational_operators,
-                relational_operators_by_layer=self.relational_operators_by_layer or None,
-                relational_frame=relational_frame,
-                relational_value_frame=relational_value_frame,
-                relational_capture=relational_capture,
-                capture=capture, grad_record=grad_rec,
-                **stack_extra)
+            # Every layer's content-link chart O' in one batched float64 evaluation (audit 2026-10-09).
+            with shared_content_charts(self.relational_operators_by_layer):
+                out = vfe_stack(
+                    beliefs, beliefs.mu, beliefs.sigma, self.group, self.cfg,
+                    log_prior=log_prior, block_norm=self.block_norm,
+                    block_mlps=self.block_mlps,
+                    block_mlp_frame=block_mlp_frame,
+                    cg_coupling=self.cg_coupling,
+                    lambda_beta=lambda_beta,
+                    relational_operators=self.relational_operators,
+                    relational_operators_by_layer=self.relational_operators_by_layer or None,
+                    relational_frame=relational_frame,
+                    relational_value_frame=relational_value_frame,
+                    relational_capture=relational_capture,
+                    capture=capture, grad_record=grad_rec,
+                    **stack_extra)
         if estep_grad_out is not None:                           # real tensor norms read only when requested
             for _gk in ("mu", "sigma", "phi"):
                 _gv = grad_rec.get(_gk, 0.0) if grad_rec is not None else 0.0
@@ -1656,12 +1662,71 @@ class VFEModel(nn.Module):
         d["relational_link_selfloop_spectral_radius_mean"] = float(rho.mean())
         return d
 
-    def _relational_diagnostics(self, snapshot: DiagnosticSnapshot, layer_index: int = -1) -> dict:
-        """Report the actual relational router and fixed-context cost; legacy global-F fields are unavailable."""
+    @staticmethod
+    def _layer_capture(snapshot: DiagnosticSnapshot, layer_index: int) -> dict:
+        r"""The forward capture of layer ``layer_index`` (the single capture of a one-capture snapshot)."""
         cap = (snapshot.layer_conditional_captures[layer_index]
                if snapshot.layer_conditional_captures else snapshot.conditional_capture)
         if cap is None:
             raise ValueError("relational diagnostic snapshot is missing its forward capture")
+        return cap
+
+    @staticmethod
+    def _klmax_frac(score: torch.Tensor, support: torch.Tensor, cap_level: float) -> float:
+        r"""Capped fraction over the causal support, not over masked pairs."""
+        return float(((score >= cap_level) & support).sum() / support.sum().clamp(min=1))
+
+    def _belief_spectrum(self, snapshot: DiagnosticSnapshot, layer_index: int) -> dict:
+        r"""Spectrum statistics of layer ``layer_index``'s converged belief covariance."""
+        from vfe3 import metrics
+        return metrics.belief_spectrum(
+            snapshot.layer_converged[layer_index].sigma, diagonal=self.cfg.diagonal_covariance,
+            eps=self.cfg.eps, family=self.cfg.family)
+
+    @staticmethod
+    def _projected_cov_extremes(cap: dict) -> Tuple[float, float]:
+        r"""Minimum eigenvalue and maximum condition of a layer's captured query and key projected covariances."""
+        query_cov, key_cov = cap["projected_covariance_pre"], cap["projected_key_covariance_pre"]
+        if torch.is_tensor(query_cov):                                       # equal heads: one tensor
+            query_cov, key_cov = [query_cov], [key_cov]
+        eigs = [safe_eigvalsh(torch.stack((q_cov, k_cov)).float())           # per run (2, B, N, n_r, d_r)
+                for q_cov, k_cov in zip(query_cov, key_cov)]
+        return (min(float(eig.min()) for eig in eigs),
+                max(float((eig[..., -1]/eig[..., 0]).max()) for eig in eigs))
+
+    def _layer_guard_maxima(self, snapshot: DiagnosticSnapshot, last: dict) -> dict:
+        r"""Layer maxima of the guard columns that :meth:`diagnostics` reports at the last layer (audit 2026-10-09).
+
+        ``relational_score_klmax_frac_layer_max`` and its ``_argmax_layer`` (the first layer attaining it),
+        ``relational_projected_cov_max_condition_layer_max`` and ``belief_cond_median_layer_max``. The last
+        layer's values are read from ``last``; the other layers are evaluated with the same helpers.
+        """
+        from vfe3.posthoc.klcap import causal_support
+        n_layers = self.cfg.n_layers
+        frac, condition, median = [], [], []
+        for layer_index in range(n_layers - 1):
+            cap = self._layer_capture(snapshot, layer_index)
+            beta, score = cap["beta_pre"], cap["score_energy_pre"]
+            minimal_agent = getattr(self.relational_operators_by_layer[layer_index],
+                                    "predictive_readout", "kernel") == "minimal_agent"
+            if beta.dim() == 3:
+                beta, score = beta.unsqueeze(1), score.unsqueeze(1)
+            support = causal_support(beta, snapshot.log_prior)                 # (B, H, N, N) bool
+            frac.append(self._klmax_frac(score, support, math.inf if minimal_agent else self.cfg.kl_max))
+            condition.append(self._projected_cov_extremes(cap)[1])
+            median.append(float(self._belief_spectrum(snapshot, layer_index)["condition"].median()))
+        frac.append(last["relational_score_klmax_frac"])
+        condition.append(last["relational_projected_cov_max_condition"])
+        median.append(last["belief_cond_median"])
+        top = max(range(n_layers), key=lambda layer: (frac[layer], -layer))
+        return {"relational_score_klmax_frac_layer_max": frac[top],
+                "relational_score_klmax_frac_argmax_layer": float(top),
+                "relational_projected_cov_max_condition_layer_max": max(condition),
+                "belief_cond_median_layer_max": max(median)}
+
+    def _relational_diagnostics(self, snapshot: DiagnosticSnapshot, layer_index: int = -1) -> dict:
+        """Report the actual relational router and fixed-context cost; legacy global-F fields are unavailable."""
+        cap = self._layer_capture(snapshot, layer_index)
         beta, score = cap["beta_pre"], cap["score_energy_pre"]
         ops = self.relational_operators_by_layer[layer_index]
         # The minimal agent's posterior has no cost clamp, so only a non-finite cost would count as capped
@@ -1686,16 +1751,12 @@ class VFEModel(nn.Module):
             relational_legacy_global_f_available=0.0,
             attn_entropy=float(entropy.mean()),
             attn_entropy_min=(float(entropy[scorable].min()) if scorable.any() else float("nan")),
-            # Capped fraction over the causal support, not over masked pairs.
-            relational_score_klmax_frac=float(
-                ((score >= cap_level) & support).sum() / support.sum().clamp(min=1)),
+            relational_score_klmax_frac=self._klmax_frac(score, support, cap_level),
         )
         from vfe3 import metrics
         d["covariance_available"] = 1.0
         d["belief_cond_median"] = float("nan")
-        spectrum = metrics.belief_spectrum(
-            snapshot.layer_converged[layer_index].sigma, diagonal=self.cfg.diagonal_covariance,
-            eps=self.cfg.eps, family=self.cfg.family)
+        spectrum = self._belief_spectrum(snapshot, layer_index)
         d["effective_rank"] = float(spectrum["effective_rank"].mean())
         d["belief_cond_median"] = float(spectrum["condition"].median())
         d["relational_mean_displacement_norm"] = float(
@@ -1801,14 +1862,8 @@ class VFEModel(nn.Module):
     ) -> dict:
         r"""The projected-covariance spectrum, the repair count and the frame magnitudes, shared by both readouts."""
         from vfe3 import metrics
-        query_cov, key_cov = cap["projected_covariance_pre"], cap["projected_key_covariance_pre"]
-        if torch.is_tensor(query_cov):                                       # equal heads: one tensor
-            query_cov, key_cov = [query_cov], [key_cov]
-        eigs = [safe_eigvalsh(torch.stack((q_cov, k_cov)).float())           # per run (2, B, N, n_r, d_r)
-                for q_cov, k_cov in zip(query_cov, key_cov)]
-        d["relational_projected_cov_min_eigenvalue"] = min(float(eig.min()) for eig in eigs)
-        d["relational_projected_cov_max_condition"] = max(
-            float((eig[..., -1]/eig[..., 0]).max()) for eig in eigs)
+        (d["relational_projected_cov_min_eigenvalue"],
+         d["relational_projected_cov_max_condition"]) = self._projected_cov_extremes(cap)
         d["relational_covariance_repair_count"] = float(cap.get("relational_covariance_repair_count", 0.0))
         # Frame magnitude and decoder/head-module state remain meaningful on both readouts.
         belief = snapshot.layer_converged[layer_index]
@@ -1878,14 +1933,17 @@ class VFEModel(nn.Module):
         r"""Report the captured projected routing, receiver costs, and state diagnostics (no_grad).
 
         Reads one diagnostic snapshot (built here unless supplied) and reduces the captured batch
-        through :meth:`_relational_diagnostics` at the last layer. Routing and readout do not
+        through :meth:`_relational_diagnostics` at the last layer, plus the layer maxima of its guard
+        columns (:meth:`_layer_guard_maxima`, keys ending ``_layer_max``). Routing and readout do not
         define one shared stationary objective, so the legacy global free-energy fields
         (``self_coupling``, ``belief_coupling``, ``attention_entropy``, ``total``, ...) are NaN.
         ``log_likelihood`` is accepted for call-site compatibility and unused.
         """
         snapshot = (self.build_diagnostic_snapshot(token_ids, return_logits=False) if snapshot is None
                     else self._validate_diagnostic_snapshot(token_ids, snapshot))
-        return self._relational_diagnostics(snapshot)
+        d = self._relational_diagnostics(snapshot)
+        d.update(self._layer_guard_maxima(snapshot, d))
+        return d
 
     @torch.no_grad()
     @_block_mlp_diagnostic_eval

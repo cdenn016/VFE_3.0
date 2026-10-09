@@ -1,4 +1,5 @@
 """Shared tiny full-state Gaussian and canonical-frame fixture."""
+from tests.profiles import make_relational_operators
 import torch
 
 from vfe3.contracts import CanonicalFrameContext
@@ -17,7 +18,7 @@ def _fixture() -> tuple:
     V = torch.linalg.inv(U)
     frame = CanonicalFrameContext(U, V)
     omega = FactoredTransport(U, V, [2, 2], same_frame_flat_cocycle=True)
-    ops = RelationalOperators([2, 2], 11).double()
+    ops = make_relational_operators([2, 2], 11).double()
     prior = torch.tensor([[0., -torch.inf, -torch.inf], [0., 0., -torch.inf],
                           [0., 0., 0.]], dtype=mu.dtype)
     return mu, sigma, omega, frame, ops, prior

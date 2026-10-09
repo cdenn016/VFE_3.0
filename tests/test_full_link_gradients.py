@@ -1,5 +1,6 @@
 """Tiny CPU checks against literal full-link Gaussian receiving laws."""
 
+from tests.profiles import make_relational_operators
 import pytest
 import torch
 
@@ -30,7 +31,7 @@ def _fixture(full: bool = False, compact: bool = False) -> tuple:
         U = torch.stack((U[..., :2, :2], U[..., 2:, 2:]), dim=-3)
         V = torch.stack((V[..., :2, :2], V[..., 2:, 2:]), dim=-3)
     frame = CanonicalFrameContext(U, V, block_diagonal=compact)
-    ops = RelationalOperators(
+    ops = make_relational_operators(
         [2, 2], 11,
         readout_mode="predictive_content", predictive_covariance="passthrough").double()
     with torch.no_grad():

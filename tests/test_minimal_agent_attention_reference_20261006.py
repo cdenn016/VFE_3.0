@@ -25,6 +25,7 @@ Every expected value here is derived from the model DEFINITION, not from the clo
 Tiny float64 CPU instances (:math:`K\le 6`, :math:`N\le 4`, :math:`H\le 2`, batch :math:`\le 2`), one thread. Tolerances
 are :math:`10^{-10}` relative (scale-aware) unless a test explains a looser one.
 """
+from tests.profiles import make_relational_operators
 import itertools
 import math
 from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
@@ -124,7 +125,7 @@ def _operators(inference: str, H: int, d: int, seed: int, *, checkpoint: bool = 
                noise_init: float = 1.0) -> RelationalOperators:
     r"""Float64 minimal-agent operators with generic full-row-rank :math:`S_h`, :math:`T_h` and channel noises."""
     K = H * d
-    ops = RelationalOperators([d] * H, 11, predictive_covariance="moment_matched", predictive_covariance_floor=FLOOR,
+    ops = make_relational_operators([d] * H, 11, predictive_covariance="moment_matched", predictive_covariance_floor=FLOOR,
                               predictive_covariance_checkpoint=checkpoint, predictive_readout="minimal_agent",
                               minimal_agent_inference=inference, minimal_agent_channel_noise=noise_init).double()
     g = _gen(1000 + seed)
@@ -1034,18 +1035,18 @@ def test_config_validation_and_inactive_fields() -> None:
 def test_operator_construction_parameters_and_refusals() -> None:
     kwargs = dict(predictive_readout="minimal_agent")
     with pytest.raises(ValueError, match="predictive_content"):
-        RelationalOperators([2, 2], 1, readout_mode="full_link_update", **kwargs)
+        make_relational_operators([2, 2], 1, readout_mode="full_link_update", **kwargs)
     with pytest.raises(ValueError, match="equal heads"):
-        RelationalOperators([3, 3, 5], 1, **kwargs)
+        make_relational_operators([3, 3, 5], 1, **kwargs)
     with pytest.raises(ValueError, match="content_link_edges"):
-        RelationalOperators([2, 2], 1, content_link_chart="exponential", content_link_edges="lowrank",
+        make_relational_operators([2, 2], 1, content_link_chart="exponential", content_link_edges="lowrank",
                             content_link_edge_rank=2, **kwargs)
     with pytest.raises(ValueError, match="attention_residual"):
-        RelationalOperators([2, 2], 1, attention_residual=True, **kwargs)
+        make_relational_operators([2, 2], 1, attention_residual=True, **kwargs)
     for bad in (0.0, -1.0, math.inf, True, "1.0"):
         with pytest.raises(ValueError, match="minimal_agent_channel_noise"):
-            RelationalOperators([2, 2], 1, minimal_agent_channel_noise=bad, **kwargs)
-    ops = RelationalOperators([2, 2], 1, minimal_agent_channel_noise=0.5, minimal_agent_inference="mean_field",
+            make_relational_operators([2, 2], 1, minimal_agent_channel_noise=bad, **kwargs)
+    ops = make_relational_operators([2, 2], 1, minimal_agent_channel_noise=0.5, minimal_agent_inference="mean_field",
                               **kwargs)
     assert set(ops.state_dict()) == {"raw_score_q", "T", "channel_log_noise"}
     assert ops.raw_score_k is None and ops.O is None
@@ -1061,7 +1062,7 @@ def test_operator_construction_parameters_and_refusals() -> None:
                  lambda: ops.predictive_covariance_update(mu, torch.ones(1, 3, 4), beta, frame)):
         with pytest.raises(ValueError, match="minimal_agent"):
             call()
-    kernel = RelationalOperators([2, 2], 1)
+    kernel = make_relational_operators([2, 2], 1)
     assert set(kernel.state_dict()) == {"raw_score_q", "raw_score_k", "T", "O"}
     with pytest.raises(ValueError, match="minimal_agent"):
         kernel.minimal_agent_update(mu, torch.ones(1, 3, 4), frame)
