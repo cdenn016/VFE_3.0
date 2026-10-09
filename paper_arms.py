@@ -107,11 +107,11 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 ROOT = Path(__file__).resolve().parent
 
 CONFIG: Dict[str, Any] = {
-    "bases":             ["k128_exp"],     # keys of BASES
+    "bases":             ["k128_diag_chunked"],   # keys of BASES
     "arms":              "TIER_A",         # None: every row of ARMS in table order; a list of labels;
                                            # or "TIER_A" / "TIER_B" (the confound controls)
     "budget":            "base_protocol",  # key of BUDGETS
-    "seeds":             [(6, 3), (23, 23), (54, 54)],   # (seed, data_seed); (6, 3) is the 34.48 run's
+    "seeds":             [(6, 3), (23, 23), (54, 54)],   # (seed, data_seed); (6, 3) is the 32.65 and 34.48 runs'
     "out_root":          "vfe3_runs/paper_arms",
     "dry_run":           True,             # True: resolve, validate and print the plan; train nothing
     "device":            None,             # None -> cuda when available
@@ -122,8 +122,11 @@ CONFIG: Dict[str, Any] = {
 }
 
 BASES: Dict[str, str] = {
-    # The evaluated K=128 exponential-chart run of the paper (34.48 test PPL).
-    "k128_exp":  "vfe3_runs/34.48_wikitext-103_K128_block_glk_linear_mlp_s6",
+    # K=128 exponential chart, 6 layers, RoPE, chunked diagonal decoder, no attention residual,
+    # 120,000 steps (32.65 test PPL).
+    "k128_diag_chunked": "vfe3_runs/32.65_wikitext-103_K128_diag-chunked_exp",
+    # The earlier evaluated K=128 exponential-chart run (34.48 test PPL, linear decoder, 4 layers).
+    "k128_exp":  "vfe3_runs/34.48_wikitext-103_K128_linear-exp",
     # Bases of the earlier study (not paper results).
     "diag_K128": "D:/DATA_KEEP/39.77_wikitext-103_K128_n=128",
     "diag_K64":  "D:/DATA_KEEP/52.91_wikitext-103_K64_n=128",
