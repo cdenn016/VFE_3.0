@@ -1,7 +1,8 @@
 r"""Figures of the minimal-agent attention readout and the prototype-agent block MLP.
 
 History figures read the eval-cadence tables ``diagnostics/minimal_agent_heads.csv`` and
-``diagnostics/prototype_templates.csv`` (:func:`vfe3.train._feature_rows`). Probe figures read the dictionaries of
+``diagnostics/prototype_templates.csv`` and the log-cadence ``diagnostics/prototype_templates_train.csv``
+(:func:`vfe3.train._feature_rows`). Probe figures read the dictionaries of
 :mod:`vfe3.posthoc.feature_probes`. :func:`plot_template_umap` is the only expensive one; the report runs it only
 under ``generate_embedding_figures``. Every builder raises :class:`vfe3.viz.figures.FigureSkipped` when it has no
 data to show.
@@ -85,36 +86,52 @@ def plot_minimal_agent_heads(
 
 
 def plot_prototype_templates(
-    table: Mapping[str, Any],            # diagnostics/prototype_templates.csv columns
+    table:       Optional[Mapping[str, Any]],            # diagnostics/prototype_templates.csv columns
     *,
-    path:  Optional[str] = None,
+    train_table: Optional[Mapping[str, Any]] = None,     # diagnostics/prototype_templates_train.csv columns
+    path:        Optional[str] = None,
 ):
-    r"""Template health over training, one line per layer: templates in use, dead fraction, the band of
+    r"""Template health over training, one color per layer: templates in use, dead fraction, the band of
     :math:`\log\lambda` (min to max, line at the median), :math:`H(\pi)`, gain fraction and token weight entropy.
-    Raises :class:`FigureSkipped` with fewer than two evaluation steps."""
-    steps = _np(table["step"]).astype(float)
-    if np.unique(steps[np.isfinite(steps)]).size < 2:
-        raise FigureSkipped("prototype_templates.csv has fewer than two evaluation steps")
-    layers = _np(table["layer"]).astype(int)
-    colors = _layer_colors(int(layers.max()) + 1)
+    Log-step rows on the training batch (``train_table``) are drawn as lines; eval rows on the fixed validation
+    windows (``table``) as markers. Raises :class:`FigureSkipped` when neither table has two distinct steps."""
+    sources = []
+    for source, style in ((train_table, {"lw": 1.0, "alpha": 0.85}),
+                          (table, {"ls": "none", "marker": "o", "ms": 2.5})):
+        if source is None:
+            continue
+        steps = _np(source["step"]).astype(float)
+        if np.unique(steps[np.isfinite(steps)]).size >= 2:
+            sources.append((source, steps, _np(source["layer"]).astype(int), style))
+    if not sources:
+        raise FigureSkipped("prototype template tables have fewer than two steps")
+    colors = _layer_colors(max(int(layers.max()) for _, _, layers, _ in sources) + 1)
     with _compact_style():
         fig, axes, n_cols = _panel_grid(len(_TEMPLATE_PANELS))
         for index, (name, label) in enumerate(_TEMPLATE_PANELS):
             ax = axes[index // n_cols][index % n_cols]
-            for layer in np.unique(layers):
-                mask = layers == layer
-                order = np.argsort(steps[mask])
-                x = steps[mask][order]
-                if name == "log_lambda":
-                    lo, mid, hi = (_np(table[f"log_lambda_{k}"]).astype(float)[mask][order]
-                                   for k in ("min", "median", "max"))
-                    ax.fill_between(x, lo, hi, color=colors[layer], alpha=0.18, lw=0)
-                    ax.plot(x, mid, lw=1.1, color=colors[layer], label=f"layer {layer}")
-                else:
-                    ax.plot(x, _np(table[name]).astype(float)[mask][order], "o-", ms=2, lw=1.1,
-                            color=colors[layer], label=f"layer {layer}")
+            for source, steps, layers, style in sources:
+                for layer in np.unique(layers):
+                    mask = layers == layer
+                    order = np.argsort(steps[mask])
+                    x = steps[mask][order]
+                    if name == "log_lambda":
+                        lo, mid, hi = (_np(source[f"log_lambda_{k}"]).astype(float)[mask][order]
+                                       for k in ("min", "median", "max"))
+                        if source is train_table or train_table is None:
+                            ax.fill_between(x, lo, hi, color=colors[layer], alpha=0.18, lw=0)
+                        y = mid
+                    else:
+                        y = _np(source[name]).astype(float)[mask][order]
+                    ax.plot(x, y, color=colors[layer], **style)
             ax.set(xlabel="training step", title=label)
-        axes[0][0].legend(frameon=False)
+        handles = [plt.Line2D([], [], color=colors[layer], lw=1.1, label=f"layer {layer}")
+                   for layer in range(len(colors))]
+        if len(sources) == 2:
+            handles += [plt.Line2D([], [], color="0.4", lw=1.0, label="training batch (log steps)"),
+                        plt.Line2D([], [], color="0.4", ls="none", marker="o", ms=2.5,
+                                   label="validation windows (eval)")]
+        axes[0][0].legend(handles=handles, frameon=False)
         fig.tight_layout()
         return _save(fig, path)
 

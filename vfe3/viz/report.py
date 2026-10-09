@@ -583,7 +583,7 @@ def generate_history_figures(
     ``attention_stats`` (final evaluation) and ``attention_stats_training`` read
     ``diagnostics/attention_stats.csv``; ``residual_ratio`` reads ``diagnostics/residual_ratio.csv``.
     :data:`FEATURE_HISTORY_FIGURES` (``minimal_agent_heads``, ``prototype_templates``) are drawn only when their
-    tables exist.
+    tables exist; ``prototype_templates`` also overlays the log-cadence ``diagnostics/prototype_templates_train.csv``.
     Each figure is written only when its table exists and holds data; otherwise the skip reason is
     logged. ``cfg`` supplies the token axis of runs without ``tokens_seen`` (default: the run's
     ``config.json``). Returns the figure paths written.
@@ -615,6 +615,12 @@ def generate_history_figures(
         "prototype_templates": (figs.read_long_table(run_dir / "diagnostics" / "prototype_templates.csv"),
                                 feature_figures.plot_prototype_templates),
     }
+    template_train_table = figs.read_long_table(run_dir / "diagnostics" / "prototype_templates_train.csv")
+    if template_train_table is not None:
+        feature_jobs["prototype_templates"] = (
+            feature_jobs["prototype_templates"][0] or {},
+            lambda tab, path, _train=template_train_table: feature_figures.plot_prototype_templates(
+                tab or None, train_table=_train, path=path))
     if (all(table is None for table, _, _ in jobs.values())
             and all(table is None for table, _ in feature_jobs.values())):
         logger.info("history figures skipped: no metrics.csv or diagnostics tables in %s", run_dir)

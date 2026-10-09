@@ -3327,6 +3327,10 @@ def train(
         for layer, stats in enumerate(calibration):
             logger.info(" prototype templates, layer %d: working variance %.4g, lambda_0 %.4g",
                         layer, stats["working_variance"], stats["lambda0"])
+        if artifacts is not None:
+            artifacts.save_json("prototype_calibration.json", {
+                "pull": float(cfg.block_mlp_template_init_pull), "n_windows": int(count),
+                "layers": [dict(stats, layer=layer) for layer, stats in enumerate(calibration)]})
     # Live per-step it/s: iterate the step loop through a tqdm bar whose built-in rate readout
     # refreshes every step. Gated on log_interval so the documented silent path (log_interval
     # falsy) stays bitwise-identical -- no bar, no redirect, nothing printed. The generator holds
@@ -3564,6 +3568,12 @@ def train(
             # no_grad, so no weight change,
             # leaving the train_step RNG stream and weights byte-identical.
             _t0 = _synced_ms(device)
+            # Prototype-template statistics of the same diagnostic forward on the training batch
+            # (diagnostics/prototype_templates_train.csv); the eval-cadence file alone missed a collapse
+            # that finished inside the first eval interval (docs/experiments/2026-10-09).
+            train_features: Optional[Dict[str, Any]] = {} if do_csv else None
+            wrapped_templates = (_wrap_prototype_blocks(model, train_features)
+                                 if train_features is not None else [])
             try:
                 d = model.diagnostics(tokens)
             except Exception as exc:                         # optional probes cannot stop training
@@ -3573,6 +3583,18 @@ def train(
                     "attention_entropy", "total", "effective_rank", "holonomy_deviation",
                     "gauge_trace_spread",
                 )}
+                train_features = None
+            finally:
+                for mlp in wrapped_templates:
+                    del mlp.forward_moments                  # back to the class method
+            if train_features:
+                try:
+                    _, template_rows = _feature_rows(model, train_features, step + 1)
+                    if template_rows:
+                        artifacts.append_diagnostic_rows(
+                            "prototype_templates_train.csv", PROTOTYPE_TEMPLATE_FIELDS, template_rows)
+                except Exception as exc:
+                    _record_diagnostic_failure(diagnostics_failures, "prototype_templates_train", exc, logger)
             phase_ms["log_diagnostics_ms"] = _synced_ms(device) - _t0
         # generalization_gap's train side under the validation protocol when that protocol is the
         # sliding window (eval_stride < max_seq_len); pre-step, like train_ce. None keeps train_ce.
