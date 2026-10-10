@@ -230,6 +230,7 @@ config = dict(
          
     rope_on_value                    = False,
     rope_space                       = "frame",       # "frame" (folded into U_i, absolute) | "comparison" (relative, kernel readout only)
+    rope_comparison_covariance       = "full",     # "full" | "rotation_invariant" (comparison RoPE: project G onto the rotation commutant; prevents self-lock)
     rope_fraction                    = 1.0,       # p-RoPE: fraction of each head's pairs rotated (fastest first); 1.0 = RoPE
 
     ######################################
@@ -313,6 +314,7 @@ config = dict(
     fp32_matmul_precision            = "highest",          # None (leave as-is) | "highest" | "high" | "medium" ("high" permits TF32 on the decode/energy GEMMs)
     matmul_precision_retry           = False,      # on a step error under "medium"/"high", replay it one rung stricter (-> "highest")
     routing_kl_max_reference         = "absolute",  # "absolute" | "row_min" (kernel router: kl_max caps D_ij, or the gap D_ij - min_j D_ij)
+    pair_kl_gemm_tol                 = None,       # None (off) | nats, e.g. 1e-3: rescore pair-KL GEMM slices whose error estimate exceeds it (~+45% step at K=128)
         
     decode_ce_checkpoint             = "auto",     # "auto" | "auto_aggregate" (saves memory with recompute)
     decode_logits_amp                = False,      # linear decode only: logits matmul under amp_dtype; CE stays fp32

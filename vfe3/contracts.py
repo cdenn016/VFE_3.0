@@ -73,6 +73,42 @@ def host_read(values: Optional[torch.Tensor]) -> Optional[list]:
     return None if values is None else host[offset:]
 
 
+# Attribute naming the unique-row source of a gathered frame pair (see mark_gathered_frame_pair).
+_GATHER_SOURCE = "_vfe3_frame_gather_source"
+
+
+def mark_gathered_frame_pair(
+    forward:        torch.Tensor,  # (n, H, d, d) occurrence rows, (U, H, d, d) gathered by a row index
+    inverse:        torch.Tensor,  # (n, H, d, d)
+    unique_forward: torch.Tensor,  # (U, H, d, d) every unique row, each gathered at least once
+    unique_inverse: torch.Tensor,  # (U, H, d, d)
+) -> None:
+    r"""Record that a producer built ``(forward, inverse)`` by gathering rows of a unique pair.
+
+    The producer certifies that every occurrence row is a bitwise copy of a unique row and that every
+    unique row occurs, so every maximum and every finiteness verdict of the
+    :class:`CanonicalFrameContext` residual check is the same over the unique rows as over the
+    occurrences. The record holds only for these exact tensor objects at their current version: any
+    view, slice, product or in-place write produces a tensor the context validates in full.
+    """
+    record = (unique_forward, unique_inverse, forward._version, inverse._version)
+    setattr(forward, _GATHER_SOURCE, record)
+    setattr(inverse, _GATHER_SOURCE, record)
+
+
+def _gathered_source(forward: torch.Tensor, inverse: torch.Tensor) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    r"""The unique-row pair recorded by :func:`mark_gathered_frame_pair`, if it still describes this pair."""
+    record = getattr(forward, _GATHER_SOURCE, None)
+    if record is None or getattr(inverse, _GATHER_SOURCE, None) is not record:
+        return None
+    unique_forward, unique_inverse, forward_version, inverse_version = record
+    if (forward._version != forward_version or inverse._version != inverse_version
+            or unique_forward.shape[1:] != forward.shape[-3:] or unique_forward.dtype != forward.dtype
+            or unique_inverse.shape != unique_forward.shape or unique_inverse.dtype != inverse.dtype):
+        return None
+    return unique_forward, unique_inverse
+
+
 @dataclass(frozen=True)
 class CanonicalFrameContext:
     """Realized vertex factors: (..., K, K), or (..., H, d, d) when block_diagonal."""
@@ -113,8 +149,13 @@ class CanonicalFrameContext:
         # Every verdict is computed on device and read back in ONE host transfer (audit 2026-10-07
         # F02/F60); the checks still fail closed in their original order with their original messages.
         validation_dtype = torch.float64
-        validation_forward = self.forward.to(dtype=validation_dtype)
-        validation_inverse = self.inverse.to(dtype=validation_dtype)
+        # A pair its producer gathered from unique token rows (mark_gathered_frame_pair) is validated
+        # on those rows: the residual and scale maxima and the product finiteness are the same values,
+        # at the unique-token instead of the occurrence count (audit 2026-10-09 #41).
+        source = _gathered_source(self.forward, self.inverse) if self.block_diagonal else None
+        validated_forward, validated_inverse = (self.forward, self.inverse) if source is None else source
+        validation_forward = validated_forward.to(dtype=validation_dtype)
+        validation_inverse = validated_inverse.to(dtype=validation_dtype)
         block_dim = self.forward.shape[-1]
         dimension = block_dim * self.forward.shape[-3] if self.block_diagonal else block_dim
         identity = torch.eye(

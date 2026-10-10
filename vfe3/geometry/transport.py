@@ -16,7 +16,7 @@ from torch import nn
 from vfe3.config import VFE3Config
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.lie_ops import CompactBlockElement
-from vfe3.contracts import host_check
+from vfe3.contracts import host_check, mark_gathered_frame_pair
 from vfe3.runtime import ieee_fp32_matmul
 
 if TYPE_CHECKING:
@@ -1166,8 +1166,12 @@ def _stable_compact_glk_exp_pair(
             exp_neg = _checked_group_inverse(exp_pos)
             _count_frame_pair_escalation()
     if inverse_index is not None:
+        unique_pos, unique_neg = exp_pos, exp_neg                    # (U, H, d, d)
         exp_pos = exp_pos.index_select(0, inverse_index).reshape(occurrence_shape)
         exp_neg = exp_neg.index_select(0, inverse_index).reshape(occurrence_shape)
+        # Every occurrence copies a unique row and every unique row occurs, so a frame context built
+        # from this exact pair validates its residual on the unique rows.
+        mark_gathered_frame_pair(exp_pos, exp_neg, unique_pos, unique_neg)
     return exp_pos, exp_neg
 
 

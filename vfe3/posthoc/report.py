@@ -629,7 +629,8 @@ def run_posthoc(
             if is_final and split in options.klcap_splits:
                 # The minimal-agent posterior applies no cost clamp: only a non-finite cost counts (kl_max = inf).
                 klcap_observer = KLCapObserver(math.inf if getattr(cfg, "predictive_readout", "kernel")
-                                               == "minimal_agent" else float(cfg.kl_max))
+                                               == "minimal_agent" else float(cfg.kl_max),
+                                               getattr(cfg, "routing_kl_max_reference", "absolute"))
                 observers.append(klcap_observer)
             if is_final and split == options.attention_split:
                 attention_observer = AttentionStatsObserver(stream_units.get(split))

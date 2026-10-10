@@ -1721,13 +1721,15 @@ def _grad_norm_decomp_fig(
 # Named parameter groups of the per-group optimizer columns (implementation contract 2026-09-28):
 # ``grad_norm_group_<g>``, ``param_norm_group_<g>`` and ``update_ratio_group_<g>`` on log rows,
 # assigned by parameter NAME, so the per-type tables and the context-processing maps are separate.
+# "sigma_log_embed" also holds the block_cholesky table sigma_chol_embed, and "per_type_table" the
+# equal-size capacity-control table (vfe3.train.PARAMETER_GROUPS).
 PARAMETER_GROUPS = ("mu_embed", "sigma_log_embed", "phi_embed", "pos_phi", "decode",
-                    "relational_score", "relational_content", "block_mlp", "norm", "other")
-_TABLE_GROUPS = ("mu_embed", "sigma_log_embed", "phi_embed", "pos_phi", "decode")
+                    "relational_score", "relational_content", "block_mlp", "norm", "per_type_table", "other")
+_TABLE_GROUPS = ("mu_embed", "sigma_log_embed", "phi_embed", "pos_phi", "decode", "per_type_table")
 _CONTEXT_GROUPS = ("relational_score", "relational_content", "block_mlp", "norm", "other")
 _GROUP_LABELS = {
     "mu_embed":           r"$\mu$ table",
-    "sigma_log_embed":    r"$\log\sigma^2$ table",
+    "sigma_log_embed":    r"$\Sigma$ table ($\log\sigma^2$ or Cholesky)",
     "phi_embed":          r"$\phi$ table",
     "pos_phi":            "positional frames",
     "decode":             r"decode ($W_{\mathrm{out}}$, $b_{\mathrm{out}}$)",
@@ -1735,12 +1737,13 @@ _GROUP_LABELS = {
     "relational_content": r"content maps $T,O$",
     "block_mlp":          "block MLP",
     "norm":               "normalization",
+    "per_type_table":     "per-type capacity table",
     "other":              "other",
 }
 _GROUP_COLORS = {
     "mu_embed": _CB[0], "sigma_log_embed": _CB[1], "phi_embed": _CB[2], "pos_phi": _CB[4],
     "decode": _CB[3], "relational_score": _CB[0], "relational_content": _CB[1],
-    "block_mlp": _CB[2], "norm": _CB[3], "other": _CB[7],
+    "block_mlp": _CB[2], "norm": _CB[3], "per_type_table": _CB[5], "other": _CB[7],
 }
 # The legacy per-ROLE columns (grad_norm_mu / _sigma / _phi, weight_norm_*) aggregate optimizer groups
 # by their build_optimizer role tag. The 'mu' role is everything outside the Sigma and phi tables.
@@ -2586,14 +2589,21 @@ def _residual_ratio_training_panel(table: Mapping[str, object]) -> Optional[Dict
 def _readout_panels(
     covariance_frozen: bool,
     residual_panel:    Optional[Dict[str, object]],
+
+    *,
+    by_layer:          bool = False,         # x axis is the layer (per-layer figure), not the step
 ) -> List[Dict[str, object]]:
     r"""Panels shared by :func:`plot_readout_diagnostics` and the conditional per-layer figure.
 
     The normalized residual-ratio panel replaces the unnormalized displacement
     :math:`\lVert \mathrm{result}-\mu\rVert_F` when ``diagnostics/residual_ratio.csv`` exists; the
     receiver-covariance panels are dropped when the covariance is frozen at encode (they would plot
-    the constant token-table row).
+    the constant token-table row). Over training the headline columns read the last layer, so each is
+    drawn beside its ``_layer_max`` column; the routing-cap panels add the per-(layer, head) maxima of
+    the capped fraction, the fully clamped rows and the self weight, and the layers attaining them
+    (audit 2026-10-09 round 2, item 23). On the per-layer figure the headline columns are that layer's.
     """
+    last = "" if by_layer else ", last layer"
     panels: List[Dict[str, object]] = [
         {"title": "Pre-update routing entropy", "ylabel": "nats", "series": [
             ("attn_entropy", "mean row entropy", _CB[0]),
@@ -2610,11 +2620,24 @@ def _readout_panels(
             {"title": "Receiver covariance rank", "ylabel": "effective rank", "series": [
                 ("effective_rank", "receiver bookkeeping", _CB[2])]},
             {"title": "Receiver covariance conditioning", "ylabel": "condition number", "series": [
-                ("belief_cond_median", "median", _CB[3])]},
+                ("belief_cond_median", f"median{last}", _CB[3]),
+                ("belief_cond_median_layer_max", "median, layer max", _CB[1])]},
         ]
     panels += [
         {"title": "Comparison covariance conditioning", "ylabel": "condition number", "logy": True,
-         "series": [("relational_projected_cov_max_condition", "maximum over Q and K", _CB[1])]},
+         "series": [("relational_projected_cov_max_condition", f"maximum over Q and K{last}", _CB[1]),
+                    ("relational_projected_cov_max_condition_layer_max", "maximum, layer max", _CB[3])]},
+        {"title": "Routing cap", "ylabel": "fraction", "series": [
+            ("relational_score_klmax_frac", f"capped entries{last}", _CB[0]),
+            ("relational_score_klmax_frac_layer_max", "capped entries, layer max", _CB[5]),
+            ("relational_score_klmax_frac_head_max", "capped entries, head max", _CB[4]),
+            ("relational_clamped_row_frac_head_max", "fully clamped rows, head max", _CB[1]),
+            ("relational_self_weight_head_max", r"mean self weight $\beta_{ii}$, head max", _CB[3]),
+            ("relational_self_argmax_frac_head_max", "self-argmax rows, head max", _CB[2])]},
+        {"title": "Routing cap location", "ylabel": "layer", "series": [
+            ("relational_score_klmax_frac_argmax_layer", "capped entries", _CB[0]),
+            ("relational_clamped_row_frac_argmax_layer", "fully clamped rows", _CB[1]),
+            ("relational_self_lock_argmax_layer", "self weight", _CB[3])]},
         {"title": "Comparison map smallest singular value", "ylabel": "singular value", "series": [
             ("relational_score_q_raw_min_singular_value", "Q", _CB[0]),
             ("relational_score_k_raw_min_singular_value", "K", _CB[1])]},
@@ -3687,7 +3710,7 @@ def plot_per_layer_diagnostics(
                         ("residual_ratio_q50", "median", _CB[0]),
                         ("residual_ratio_q10", "10th percentile", _CB[5])]}
         fig = _history_dashboard({**per_layer, "step": np.arange(n_layers)},
-                                 _readout_panels(covariance_frozen, residual_panel),
+                                 _readout_panels(covariance_frozen, residual_panel, by_layer=True),
                                  "Captured routing and readout by layer", None, ncols=2)
         with _compact_style():
             for ax in fig.axes:

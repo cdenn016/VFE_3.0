@@ -1376,6 +1376,13 @@ _VAL_RELATIONAL_DIAG_KEYS = (
     "val_relational_score_klmax_frac",
     # the per-layer maximum and its layer (the headline column above reduces only the last layer)
     "val_relational_score_klmax_frac_layer_max", "val_relational_score_klmax_frac_argmax_layer",
+    # per-(layer, head) router saturation, maxima over layers and heads (VFEModel._layer_guard_maxima)
+    "val_relational_score_klmax_frac_head_max",
+    "val_relational_clamped_row_frac_head_max", "val_relational_clamped_row_frac_argmax_layer",
+    "val_relational_clamped_row_frac_argmax_head",
+    "val_relational_self_weight_head_max", "val_relational_self_argmax_frac_head_max",
+    "val_relational_self_lock_argmax_layer", "val_relational_self_lock_argmax_head",
+    "val_belief_cond_median_layer_max",
     "val_relational_mean_displacement_norm", "val_relational_snapshot_ce",
     "val_relational_receiver_cost_before", "val_relational_receiver_cost_after",
     "val_relational_receiver_cost_delta", "val_relational_receiver_noise",
@@ -1453,6 +1460,11 @@ _GROUP_COLUMNS: Tuple[str, ...] = tuple(
     f"{kind}_group_{group}"
     for kind in ("grad_norm", "param_norm", "update_ratio") for group in PARAMETER_GROUPS)
 _GRAD_GROUP_COLUMNS: Tuple[str, ...] = tuple(f"grad_norm_group_{group}" for group in PARAMETER_GROUPS)
+# Per-element RMS realized step in units of the learning rate for the prior tables (audit 2026-10-09 round 2,
+# item 26): update_ratio_group_* of a log-scale table divides by a norm dominated by the log(sigma_init)
+# offset, so it is not a trainability measure; this column is O(1) for an AdamW table whose elements move.
+_STEP_LR_GROUPS: Tuple[str, ...] = ("mu_embed", "sigma_log_embed")
+_STEP_LR_COLUMNS: Tuple[str, ...] = tuple(f"update_rms_per_lr_group_{group}" for group in _STEP_LR_GROUPS)
 _TRAIN_SAMPLE_COLUMNS: Tuple[str, ...] = (
     "train_sample_ce", "train_sample_ppl", "generalization_gap_fixed", "train_sample_seen_fraction")
 _GROUP_GRAD_ERROR_KEY = "_group_gradient_norm_error"     # private train_step -> train handoff
@@ -1514,34 +1526,67 @@ CAP_CLAMPED_ROW_FIELDS: Tuple[str, ...] = ("step", "layer", "head", "clamped_row
 _EVAL_CADENCE_COLUMNS: Tuple[str, ...] = _TRAIN_SAMPLE_COLUMNS + NUMERICS_EVAL_COLUMNS
 
 
-# A layer whose router has more than this fraction of its capped costs at kl_max routes almost
-# uniformly with almost no router gradient (audit 2026-10-09, layer 1 of the 32.65 run).
-DEAD_ROUTER_KLMAX_FRAC: float = 0.5
+# Dead-router thresholds (audit 2026-10-09, round 2, item 9), read per (layer, head). Under the absolute
+# clamp reference a head with more than DEAD_ROUTER_CLAMPED_ROW_FRAC of its scored rows fully clamped at
+# kl_max routes those rows uniformly with zero router gradient (layer 1 of the 32.65 run). Under 'row_min'
+# (and under tie_comparison_maps, where D_ii = 0 is every row's minimum) no row can be fully clamped; the
+# failure is a one-hot self-route instead, flagged when a head's mean self weight beta_ii exceeds
+# DEAD_ROUTER_SELF_WEIGHT (layer 1 head 0 of the 99.68 run).
+DEAD_ROUTER_CLAMPED_ROW_FRAC: float = 0.5
+DEAD_ROUTER_SELF_WEIGHT:      float = 0.9
+
+
+def _finite_or_none(value: Any) -> Optional[float]:
+    r"""``float(value)`` when it is present and finite, else None."""
+    if value is None:
+        return None
+    value = float(value)
+    return value if math.isfinite(value) else None
 
 
 def _warn_dead_router(
     diagnostics: Mapping[str, Any],
-    warned:      Set[int],                  # layers already reported this run; updated in place
+    warned:      Set[Tuple[str, int, int]],   # (kind, layer, head) already reported; updated in place
     logger:      logging.Logger,
-) -> None:
-    r"""Warn once per layer when the largest per-layer router cap fraction exceeds ``DEAD_ROUTER_KLMAX_FRAC``.
 
-    Reads ``relational_score_klmax_frac_layer_max`` (the maximum over layers of the fraction of
-    routing costs clamped at ``kl_max``) and ``relational_score_klmax_frac_argmax_layer``; a model
-    that does not report them is skipped.
+    *,
+    reference:   str  = "absolute",           # cfg.routing_kl_max_reference
+    tied:        bool = False,                # cfg.tie_comparison_maps
+) -> None:
+    r"""Warn once per (layer, head) when a router head is dead, by the signal its clamp reference allows.
+
+    Under ``reference='absolute'`` without the tie, reads ``relational_clamped_row_frac_head_max`` and its
+    ``_argmax_{layer,head}``: a fully clamped row routes uniformly with zero router gradient. Under
+    ``'row_min'`` or ``tied``, reads ``relational_self_weight_head_max`` and
+    ``relational_self_lock_argmax_{layer,head}``: the head routes one-hot to self and the capped keys get no
+    gradient. A model that does not report the keys is skipped.
     """
-    frac = diagnostics.get("relational_score_klmax_frac_layer_max")
-    if frac is None or not math.isfinite(float(frac)) or float(frac) <= DEAD_ROUTER_KLMAX_FRAC:
+    self_lock = reference == "row_min" or tied
+    if self_lock:
+        value = _finite_or_none(diagnostics.get("relational_self_weight_head_max"))
+        prefix, threshold = "relational_self_lock", DEAD_ROUTER_SELF_WEIGHT
+    else:
+        value = _finite_or_none(diagnostics.get("relational_clamped_row_frac_head_max"))
+        prefix, threshold = "relational_clamped_row_frac", DEAD_ROUTER_CLAMPED_ROW_FRAC
+    if value is None or value <= threshold:
         return
-    layer = diagnostics.get("relational_score_klmax_frac_argmax_layer")
-    layer = int(layer) if layer is not None and math.isfinite(float(layer)) else -1
-    if layer in warned:
+    layer, head = (_finite_or_none(diagnostics.get(f"{prefix}_argmax_{axis}")) for axis in ("layer", "head"))
+    layer, head = (-1 if layer is None else int(layer)), (-1 if head is None else int(head))
+    key = ("self_lock" if self_lock else "clamped", layer, head)
+    if key in warned:
         return
-    warned.add(layer)
-    logger.warning(
-        " router layer %s: %.3f of its routing costs are clamped at kl_max (> %.2f); the layer routes "
-        "nearly uniformly with nearly zero router gradient (consider routing_kl_max_reference='row_min')",
-        layer if layer >= 0 else "unknown", float(frac), DEAD_ROUTER_KLMAX_FRAC)
+    warned.add(key)
+    where = (layer if layer >= 0 else "unknown", head if head >= 0 else "unknown")
+    if self_lock:
+        logger.warning(
+            " router layer %s head %s: mean self weight beta_ii %.3f (> %.2f) under %s; the head routes one-hot "
+            "to self and its capped keys get no router gradient", *where, value, threshold,
+            "tie_comparison_maps" if tied else "routing_kl_max_reference='row_min'")
+    else:
+        logger.warning(
+            " router layer %s head %s: %.3f of its scored rows are fully clamped at kl_max (> %.2f); those rows "
+            "route uniformly with zero router gradient (consider routing_kl_max_reference='row_min')",
+            *where, value, threshold)
 
 
 def _numerics_counter_skip_reasons(
@@ -1769,6 +1814,58 @@ def _frame_projection_state(
             "frame_projection_since_step": int(since_step or 0)}
 
 
+# Run-total numerical-event counters (audit 2026-10-09 round 2, item 35). The process-wide element
+# counters reset at the start of train(); a resumed run adds the totals its checkpoint carried in
+# numerics_counters_state, so metrics.csv and summary.json realized_updates stay whole-run totals.
+RUN_TOTAL_COUNTER_KEYS: Tuple[str, ...] = (
+    "nonfinite_tangent_elements", "mu_trust_fallback_elements", "decode_logdet_fallback_elements",
+    "frame_pair_fp64_escalations", "public_spd_repair_elements", "public_spd_ceiling_contact_elements",
+    "source_recovery_elements", "matmul_precision_replays")
+
+
+def _process_counter_values() -> Dict[str, int]:
+    r"""Current values of the process-wide element counters since their last reset (no precision replays)."""
+    return {"nonfinite_tangent_elements": int(nonfinite_tangent_elements()),
+            "mu_trust_fallback_elements": int(mu_trust_fallback_elements()),
+            "decode_logdet_fallback_elements": int(decode_logdet_fallback_elements()),
+            "frame_pair_fp64_escalations": int(frame_pair_fp64_escalations()),
+            "public_spd_repair_elements": int(public_spd_repair_elements()),
+            "public_spd_ceiling_contact_elements": int(public_spd_ceiling_contact_elements()),
+            "source_recovery_elements": int(source_recovery_elements())}
+
+
+def _resumed_run_totals(
+    resumed:    Optional[Mapping[str, Any]],   # artifacts.resumed_numerics_counters
+    start_step: int,
+    logger:     logging.Logger,
+) -> Dict[str, int]:
+    r"""Run totals a resumed checkpoint carried (0 for a fresh run, and for a key the checkpoint lacks)."""
+    base = {key: 0 for key in RUN_TOTAL_COUNTER_KEYS}
+    if start_step <= 0:
+        return base
+    carried = resumed if isinstance(resumed, Mapping) else {}
+    missing = [key for key in RUN_TOTAL_COUNTER_KEYS
+               if not (type(carried.get(key)) is int and carried[key] >= 0)]
+    for key in RUN_TOTAL_COUNTER_KEYS:
+        if key not in missing:
+            base[key] = int(carried[key])
+    if missing:
+        logger.info(" resumed checkpoint carries no run total for %s; those counters count from step %d",
+                    ", ".join(missing), start_step)
+    return base
+
+
+def _run_total_counters(
+    base:               Mapping[str, int],     # _resumed_run_totals
+    precision_replays:  int,                   # whole-run count (already includes its base)
+) -> Dict[str, int]:
+    r"""Whole-run values of ``RUN_TOTAL_COUNTER_KEYS``: the resumed base plus this process's counts."""
+    current = _process_counter_values()
+    out = {key: int(base[key]) + current[key] for key in current}
+    out["matmul_precision_replays"] = int(precision_replays)
+    return out
+
+
 def _numerics_counters_summary(
     completed_steps: int,
     optimizer:       torch.optim.Optimizer,
@@ -1842,6 +1939,8 @@ def _parameter_group(
 ) -> str:
     r"""Named group of one model parameter (see ``PARAMETER_GROUPS``).
 
+    ``sigma_log_embed`` holds the token-prior covariance table, ``sigma_log_embed`` or (under
+    ``prior_covariance_table='block_cholesky'``) ``sigma_chol_embed``;
     ``decode`` holds the linear readout ``output_proj_*``, the untied decode tables ``decode_*``
     and ``decode_log_scale``; ``norm`` holds the block and final normalization affines;
     ``per_type_table`` holds the per-type block-MLP hidden bias ``per_type_hidden_bias``; anything
@@ -1858,8 +1957,8 @@ def _parameter_group(
         return "per_type_table"
     if name == "prior_bank.mu_embed":
         return "mu_embed"
-    if name == "prior_bank.sigma_log_embed":
-        return "sigma_log_embed"
+    if name in ("prior_bank.sigma_log_embed", "prior_bank.sigma_chol_embed"):
+        return "sigma_log_embed"                  # sigma_chol_embed: the block_cholesky prior covariance table
     if name == "prior_bank.phi_embed":
         return "phi_embed"
     if name == "pos_phi_free":
@@ -1922,10 +2021,23 @@ def _parameter_snapshot(
             for name, parameter in model.named_parameters() if parameter.requires_grad}
 
 
+def _parameter_learning_rates(
+    model:     torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> Dict[str, float]:
+    r"""Current learning rate of every optimized parameter, by parameter name (read before the step)."""
+    by_id = {id(parameter): float(group["lr"]) for group in optimizer.param_groups
+             for parameter in group["params"]}
+    return {name: by_id[id(parameter)] for name, parameter in model.named_parameters() if id(parameter) in by_id}
+
+
 @torch.no_grad()
 def _group_update_statistics(
     model:  torch.nn.Module,
     before: Mapping[str, torch.Tensor],       # _parameter_snapshot taken before the step
+
+    *,
+    learning_rates: Optional[Mapping[str, float]] = None,   # _parameter_learning_rates before the step
 ) -> Dict[str, float]:
     r"""Parameter norm and realized update ratio of each named group across one training step.
 
@@ -1936,9 +2048,19 @@ def _group_update_statistics(
     with :math:`p_t` the pre-step value and :math:`p_{t+1}` the value after the optimizer step and any
     post-step projection (the realized update, including weight decay). A rejected step gives
     :math:`r_G = 0`. The difference is formed in float64 on the parameter's device in bounded chunks.
+
+    With ``learning_rates``, the groups of ``_STEP_LR_GROUPS`` also report the per-element RMS step in
+    learning-rate units,
+
+    .. math::
+        s_G = \Big(\frac{1}{n_G}\sum_{p \in G} \frac{\|p_{t+1} - p_t\|_2^2}{\eta_p^2}\Big)^{1/2},
+
+    with :math:`n_G` the group's element count and :math:`\eta_p` the step's learning rate (NaN if any is 0).
     """
     delta_sq: Dict[str, float] = {}
     norm_sq: Dict[str, float] = {}
+    step_sq: Dict[str, float] = {}
+    step_numel: Dict[str, int] = {}
     for name, parameter in model.named_parameters():
         previous = before.get(name)
         if previous is None:
@@ -1954,7 +2076,14 @@ def _group_update_statistics(
         delta_sq[group] = delta_sq.get(group, 0.0) + float(delta)
         norm_sq[group] = norm_sq.get(group, 0.0) + float(
             torch.linalg.vector_norm(prior, dtype=torch.float64).square())   # host tensor
-    out: Dict[str, float] = {}
+        if learning_rates is not None and group in _STEP_LR_GROUPS:
+            rate = float(learning_rates.get(name, 0.0))
+            step_sq[group] = step_sq.get(group, 0.0) + (float(delta) / rate ** 2 if rate > 0.0 else math.nan)
+            step_numel[group] = step_numel.get(group, 0) + current.numel()
+    out: Dict[str, float] = {
+        f"update_rms_per_lr_group_{group}": (math.sqrt(step_sq[group] / step_numel[group])
+                                            if step_numel.get(group) else float("nan"))
+        for group in _STEP_LR_GROUPS}
     for group in PARAMETER_GROUPS:
         if group not in norm_sq:
             out[f"param_norm_group_{group}"] = float("nan")
@@ -1976,8 +2105,16 @@ def _sigma_log_statistics(
     Reported instead of its norm: the norm decays toward 0 under weight decay, so a
     gradient-to-weight ratio built on it rises for a trivial reason. Population statistics
     (``correction=0``) in the table's own precision, with no full-size float64 copy on the device.
+
+    Under ``prior_covariance_table='block_cholesky'`` (no ``sigma_log_embed``) the same statistics are
+    taken over the prior log-variances :math:`\log (C_v)_{kk}`, read through the
+    ``PriorBank._prior_covariance_blocks`` accessor in vocabulary chunks, so they do not depend on how
+    the Cholesky table is parameterized (audit 2026-10-09 round 2, item 25).
     """
-    table = getattr(getattr(model, "prior_bank", None), "sigma_log_embed", None)
+    bank = getattr(model, "prior_bank", None)
+    table = getattr(bank, "sigma_log_embed", None)
+    if table is None and isinstance(getattr(bank, "sigma_chol_embed", None), torch.Tensor):
+        return _block_cholesky_log_variance_statistics(bank)
     if not isinstance(table, torch.Tensor) or table.numel() == 0:
         return {"sigma_log_mean": float("nan"), "sigma_log_sd": float("nan")}
     values = table.detach()
@@ -1985,6 +2122,35 @@ def _sigma_log_statistics(
         values = values.float()
     sd, mean = torch.std_mean(values, correction=0)
     return {"sigma_log_mean": float(mean), "sigma_log_sd": float(sd)}
+
+
+SIGMA_LOG_CHUNK_TYPES: int = 4096          # vocabulary rows per block_cholesky covariance chunk
+
+
+@torch.no_grad()
+def _block_cholesky_log_variance_statistics(
+    bank: torch.nn.Module,                 # PriorBank with prior_covariance_table='block_cholesky'
+) -> Dict[str, float]:
+    r"""Population mean and standard deviation of :math:`\log (C_v)_{kk}` over every type :math:`v` and
+    coordinate :math:`k` of the per-head prior blocks, accumulated in float64 over vocabulary chunks."""
+    n_types = int(bank.sigma_chol_embed.shape[0])
+    total = torch.zeros((), dtype=torch.float64, device=bank.sigma_chol_embed.device)
+    square = torch.zeros_like(total)
+    count = 0
+    with torch.autocast(device_type=bank.sigma_chol_embed.device.type, enabled=False):
+        for start in range(0, n_types, SIGMA_LOG_CHUNK_TYPES):
+            index = torch.arange(start, min(start + SIGMA_LOG_CHUNK_TYPES, n_types),
+                                 device=bank.sigma_chol_embed.device)
+            blocks = bank._prior_covariance_blocks(index)                     # (V_c, H, d, d) C_v per head
+            log_variance = blocks.diagonal(dim1=-2, dim2=-1).double().log()   # (V_c, H, d)
+            total += log_variance.sum()
+            square += log_variance.square().sum()
+            count += log_variance.numel()
+    if count == 0:
+        return {"sigma_log_mean": float("nan"), "sigma_log_sd": float("nan")}
+    mean = total / count
+    return {"sigma_log_mean": float(mean),
+            "sigma_log_sd": float((square / count - mean.square()).clamp(min=0.0).sqrt())}
 
 
 def _record_diagnostic_failure(
@@ -2062,6 +2228,10 @@ def _build_fixed_train_sample(
     dataset = getattr(train_loader, "dataset", None)
     if dataset is None or not isinstance(getattr(dataset, "tokens", None), torch.Tensor):
         return None, "train loader exposes no token-window dataset"
+    if getattr(dataset, "window_offset_mode", "fixed") != "fixed":
+        # Fixed windows and the fixed mode's window count, whatever this epoch's origin, so the sample
+        # draws the same indices as under 'fixed' (audit 2026-10-09 round 2, item 34).
+        dataset = dataset.at_origin()
     try:
         n_windows_total = int(len(dataset))
         seq_len = int(dataset.seq_len)
@@ -2079,8 +2249,6 @@ def _build_fixed_train_sample(
     chosen = torch.randperm(n_windows_total, generator=generator)[:n_windows]
     indices = sorted(int(index) for index in chosen.tolist())
     batch_size = int(getattr(val_loader, "batch_size", None) or cfg.batch_size)
-    if getattr(dataset, "window_offset_mode", "fixed") != "fixed":
-        dataset = dataset.at_origin()               # fixed windows, whatever this epoch's origin
     return FixedTrainSample(dataset, indices, batch_size, stride), None
 
 
@@ -2839,6 +3007,7 @@ def _val_diagnostics_one(
                 if key.startswith("relational_") and isinstance(value, (int, float))})
     out["val_attn_entropy"] = vd["attn_entropy"]
     out["val_attn_entropy_min"] = vd["attn_entropy_min"]
+    out["val_belief_cond_median_layer_max"] = float(vd.get("belief_cond_median_layer_max", float("nan")))
     out["estep_f_comparisons"] = 0.0
     out["estep_f_drop"] = float("nan")
     if diagnostic_targets is not None:
@@ -3163,8 +3332,11 @@ def _train_step_with_precision_retry(
     and failures after an update are never replayed. Not used with an enabled GradScaler (fp16),
     whose per-step unscale state a replay would violate. Module-level numerics counters may count
     the abandoned attempts. Each failed attempt that is replayed appends ``{step, policy, replay_policy,
-    exception, message}`` to ``replay_log`` when given, so the reasons survive the DEBUG-level logging
-    of later replays (audit 2026-10-08 critic-gapfill-1#4).
+    exception, message, amp_dtype, autocast_active}`` to ``replay_log`` when given, so the reasons survive
+    the DEBUG-level logging of later replays (audit 2026-10-08 critic-gapfill-1#4). ``autocast_active``
+    is true when ``cfg.amp_dtype`` is set and not marked inert; such a record also carries
+    ``autocast_note``: the ladder changes only the fp32 matmul policy, so a failure caused by the
+    autocast dtype's rounding is not repaired by the replay (audit 2026-10-09 round 2, item 40).
     """
     scaler = step_kwargs.get("scaler")
     current = torch.get_float32_matmul_precision()
@@ -3177,6 +3349,7 @@ def _train_step_with_precision_retry(
     cuda_rng = ([state.clone() for state in torch.cuda.get_rng_state_all()]
                 if torch.cuda.is_available() and torch.cuda.is_initialized() else None)
     failures: List[str] = []
+    amp_dtype = getattr(model.cfg, "amp_dtype", None)
     for replays, policy in enumerate((current, *rungs)):
         if replays:
             optimizer.zero_grad(set_to_none=True)
@@ -3206,9 +3379,16 @@ def _train_step_with_precision_retry(
                 raise
             failures.append(f"{type(exc).__name__}: {exc} [at {policy!r}]")
             if replay_log is not None:
-                replay_log.append({"step": int(step), "policy": policy,
-                                   "replay_policy": (current, *rungs)[replays + 1],
-                                   "exception": type(exc).__name__, "message": str(exc)})
+                autocast_active = amp_dtype is not None and "amp_dtype" not in model.cfg.inactive_fields()
+                record: Dict[str, object] = {
+                    "step": int(step), "policy": policy, "replay_policy": (current, *rungs)[replays + 1],
+                    "exception": type(exc).__name__, "message": str(exc),
+                    "amp_dtype": amp_dtype, "autocast_active": autocast_active}
+                if autocast_active:
+                    record["autocast_note"] = (
+                        f"{amp_dtype} autocast was active; the replay ladder changes only "
+                        "fp32_matmul_precision, so a failure caused by autocast rounding is not repaired")
+                replay_log.append(record)
         finally:
             handle.remove()
     raise AssertionError("unreachable: the ladder ends at 'highest'")
@@ -3458,8 +3638,6 @@ def train(
     motion_known_dead: Tuple[str, ...] = ()
     motion_dead_captured = False
     skipped_steps = 0                 # cumulative REJECTED optimizer updates (audit 2026-08-06 F5)
-    precision_replays = 0             # steps replayed at "highest" under cfg.matmul_precision_retry
-    precision_replays_logged = 0      # precision_replays at the last log-step summary
     consecutive_skips = 0
     reset_nonfinite_tangent_elements()   # per-run accounting for the SPD-retraction guard
     reset_public_spd_repair_elements()   # ... and its certificate repairs
@@ -3467,7 +3645,11 @@ def train(
     reset_decode_logdet_fallback_elements()   # ... and the decode log-det non-PD fallback
     reset_source_recovery_elements()        # ... and projected float64 source-factor recoveries
     reset_frame_pair_fp64_escalations()     # ... and float64 frame-pair escalations
-    dead_router_warned: Set[int] = set()    # layers already reported by _warn_dead_router
+    run_total_base = _resumed_run_totals(getattr(artifacts, "resumed_numerics_counters", None),
+                                         start_step, logger)
+    # steps replayed at "highest" under cfg.matmul_precision_retry (whole run), and its value at the last log step
+    precision_replays = precision_replays_logged = run_total_base["matmul_precision_replays"]
+    dead_router_warned: Set[Tuple[str, int, int]] = set()    # (kind, layer, head) reported by _warn_dead_router
 
     def _step_indices() -> Iterable[int]:
         if not show_bar:
@@ -3721,11 +3903,13 @@ def train(
         # persisted log/eval row only, outside the timed train step. Reading parameters does not
         # change the step.
         update_before: Optional[Dict[str, torch.Tensor]] = None
+        update_rates: Optional[Dict[str, float]] = None
         group_stats: Dict[str, float] = {}
         if do_csv:
             _t0 = _synced_ms(device)
             try:
                 update_before = _parameter_snapshot(model)
+                update_rates = _parameter_learning_rates(model, optimizer)
             except Exception as exc:
                 _record_diagnostic_failure(diagnostics_failures, "parameter_snapshot", exc, logger)
             phase_ms["log_group_stats_ms"] = _synced_ms(device) - _t0
@@ -3752,7 +3936,7 @@ def train(
         if update_before is not None:
             _t0 = _synced_ms(device)
             try:
-                group_stats = _group_update_statistics(model, update_before)
+                group_stats = _group_update_statistics(model, update_before, learning_rates=update_rates)
             except Exception as exc:
                 _record_diagnostic_failure(diagnostics_failures, "group_update_statistics", exc, logger)
             update_before = None                              # release the host copy immediately
@@ -3964,8 +4148,10 @@ def train(
             # The cumulative frame-projection counts travel with the checkpoint (one host read at
             # checkpoint cadence), so a resumed run keeps counting from step 0.
             try:
-                artifacts.numerics_counters_state = _frame_projection_state(
-                    frame_projection_counter, frame_projection_base, frame_projection_since)
+                artifacts.numerics_counters_state = {
+                    **(_frame_projection_state(frame_projection_counter, frame_projection_base,
+                                               frame_projection_since) or {}),
+                    **_run_total_counters(run_total_base, precision_replays)}
             except Exception as exc:
                 _record_diagnostic_failure(diagnostics_failures, "numerics_checkpoint_state",
                                            exc, logger)
@@ -4032,7 +4218,9 @@ def train(
                 "gauge_trace_spread": d["gauge_trace_spread"],
             }
             row.update({key: value for key, value in d.items() if key.startswith(("qkv_", "relational_"))})
-            _warn_dead_router(d, dead_router_warned, logger)
+            _warn_dead_router(d, dead_router_warned, logger,
+                              reference=getattr(cfg, "routing_kl_max_reference", "absolute"),
+                              tied=bool(getattr(cfg, "tie_comparison_maps", False)))
             if steps_per_epoch:
                 row.update(_training_cursor_fields(step + 1, steps_per_epoch))
             else:
@@ -4073,6 +4261,7 @@ def train(
                         "gauge_invariant_mean", "gauge_invariant_spread",
                         "phi_norm_mean", "phi_norm_std",
                         "belief_cond_median", "belief_cond_p95", "belief_cond_max", "belief_pd_margin",
+                        "belief_cond_median_layer_max",
                         "eff_rank_p5", "eff_rank_median", "eff_rank_p95",
                         "fisher_trace_mean", "fisher_trace_median",
                         "guard_sigma_floor_frac", "guard_sigma_ceil_frac",
@@ -4174,7 +4363,7 @@ def train(
             row.update(last_train_sample if do_eval
                        else {column: float("nan") for column in _EVAL_CADENCE_COLUMNS})
             group_values = {**(step_metrics or {}), **group_stats}
-            for column in _GROUP_COLUMNS:
+            for column in _GROUP_COLUMNS + _STEP_LR_COLUMNS:
                 row[column] = float(group_values.get(column, float("nan")))
             try:
                 row.update(_sigma_log_statistics(model))
@@ -4190,7 +4379,8 @@ def train(
                 row.update({column: float("nan") for column in NUMERICS_CUMULATIVE_COLUMNS})
             # Cumulative projected source-factor recoveries since step 0 (diagnostic and evaluation
             # forwards included); a rise localizes fp64 promotions in the step time (audit 2026-10-09).
-            row["source_recovery_elements"] = source_recovery_elements()
+            row["source_recovery_elements"] = (run_total_base["source_recovery_elements"]
+                                               + source_recovery_elements())
             row["tokens_seen"] = tokens_seen
             row["diagnostics_failures"] = int(sum(diagnostics_failures.values()))
             pipeline_timing = timer.sample_pipeline_window()
@@ -4208,8 +4398,10 @@ def train(
     # "numerics_counters" (final cumulative counts, last measured per-evaluation counts, skip reasons).
     if artifacts is not None:
         try:
-            artifacts.numerics_counters_state = _frame_projection_state(
-                frame_projection_counter, frame_projection_base, frame_projection_since)
+            artifacts.numerics_counters_state = {
+                **(_frame_projection_state(frame_projection_counter, frame_projection_base,
+                                           frame_projection_since) or {}),
+                **_run_total_counters(run_total_base, precision_replays)}
             artifacts.numerics_counters = _numerics_counters_summary(
                 n_steps, optimizer, artifacts.numerics_counters_state, numerics_last_eval,
                 numerics_reasons, diagnostic_windows)
@@ -4297,8 +4489,9 @@ def train(
         if diagnostics_failures:
             logger.warning(" diagnostic failures during training (counted, training unaffected): %s",
                            dict(sorted(diagnostics_failures.items())))
-        neutralized = nonfinite_tangent_elements()
-        mu_fallbacks = mu_trust_fallback_elements()
+        run_totals = _run_total_counters(run_total_base, precision_replays)   # whole run across resumes
+        neutralized = run_totals["nonfinite_tangent_elements"]
+        mu_fallbacks = run_totals["mu_trust_fallback_elements"]
         artifacts.final_step = int(n_steps)
         artifacts.realized_updates = {
             "attempted_steps":      attempted,
@@ -4306,14 +4499,8 @@ def train(
             "skipped_steps":        int(skipped_total),
             "accepted_update_frac": (float(accepted) / attempted
                                      if attempted else float("nan")),
-            "nonfinite_tangent_elements": int(neutralized),
-            "mu_trust_fallback_elements": int(mu_fallbacks),
-            "decode_logdet_fallback_elements": int(decode_logdet_fallback_elements()),
-            "frame_pair_fp64_escalations": int(frame_pair_fp64_escalations()),
-            "public_spd_repair_elements": int(public_spd_repair_elements()),
-            "public_spd_ceiling_contact_elements": int(public_spd_ceiling_contact_elements()),
-            "source_recovery_elements": int(source_recovery_elements()),
-            **({"matmul_precision_replays": int(precision_replays)}
+            **{key: run_totals[key] for key in RUN_TOTAL_COUNTER_KEYS if key != "matmul_precision_replays"},
+            **({"matmul_precision_replays": run_totals["matmul_precision_replays"]}
                if getattr(cfg, "matmul_precision_retry", False) else {}),
         }
         if skipped_total or neutralized or mu_fallbacks:

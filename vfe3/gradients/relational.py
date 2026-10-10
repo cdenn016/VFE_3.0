@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 
 from vfe3.contracts import CanonicalFrameContext
+from vfe3.geometry.rope import rope_commutant_projection, rope_rotated_pairs
 from vfe3.model.edge_links import edge_diagnostic_capture, receive_heads as edge_receive_heads
 from vfe3.model.relational_operators import RelationalOperators
 from vfe3.relational_scoring import _compute_dtype, projected_moments, routing_cost
@@ -38,6 +39,13 @@ def relational_score(
     to a per-query-row constant (the kernel router under ``routing_kl_max_reference='row_min'``). The
     Gaussian KL then computes its query log-determinant without autograd (``query_row_constant_grad``
     of :func:`vfe3.relational_scoring.projected_gaussian_kl`); the returned values are unchanged.
+
+    Under comparison-space RoPE with ``operators.rope_comparison_covariance == 'rotation_invariant'`` each
+    comparison covariance is replaced by its projection :math:`P(G)` onto the commutant of the RoPE torus
+    (:func:`vfe3.geometry.rope.rope_commutant_projection`) before the rotation, so the trace and log-determinant
+    terms are position-free and only the mean term reads :math:`j - i`. The capture then records
+    :math:`P(G)`, the covariance the router scores, and the scorer takes its Gram route (no source tuples).
+    Under ``tie_comparison_maps`` a belief scored against itself is projected once and both roles share it.
     """
     dims = operators.irrep_dims
     inverse = frame.inverse
@@ -69,8 +77,10 @@ def relational_score(
     # float64; the results are returned at the dtype a lower-precision frame would have produced.
     public = _compute_dtype(mu, sigma, source_mu, source_sigma, *(S for pair in comparison for S in pair))
     score = routing_cost(operators.routing)                                  # ROUTING_COSTS registry
-    row_constant = ({"query_row_constant_grad": False}
+    cost_options = ({"query_row_constant_grad": False}
                     if row_invariant and operators.routing == "gaussian_kl" else {})
+    if operators.routing == "gaussian_kl" and operators.pair_kl_gemm_tol is not None:
+        cost_options["gemm_expansion_tol"] = operators.pair_kl_gemm_tol
     scores, captured_q, captured_k = [], [], []
     # One scoring call per run: the heads of a run share their rank d_r. Each call ends in its own
     # host transfer, so a tower of R runs pays R of them per call (one for equal heads).
@@ -85,22 +95,41 @@ def relational_score(
             x.unsqueeze(-3).expand(*x.shape[:-2], H, K, K)
             if x.ndim == mu.ndim + 1 else x.unsqueeze(-2).expand(*x.shape[:-1], H, K)
             for x in (sigma, source_sigma))
-        if mu is source_mu and sigma is source_sigma and inverse is key_inverse:
+        self_scored = mu is source_mu and sigma is source_sigma and inverse is key_inverse
+        # tie_comparison_maps scoring a belief against itself: S_K is S_Q, so both roles are one projection.
+        tied = self_scored and S_q is S_k
+        # gaussian_block: Sigma is head-block diagonal, so G = L Sigma L^T reads only the diagonal blocks.
+        head_dims = tuple(operators.irrep_dims) if operators.block_covariance else None
+        if tied:
+            a_q, G_q = projected_moments(mu_h, sigma_h, inverse, S_q, head_dims=head_dims)  # (..., N, H, d), (..., N, H, d, d)
+            a_k, G_k = a_q, G_q
+        elif self_scored:
             # Predictive readout scores a belief against itself: one batched projection over both
             # comparison maps. S_q and S_k still differ, so two L = S U^-1 maps are formed, but the
             # covariance contraction G = L Sigma L^T is batched across the role axis.
-            a, G = projected_moments(mu_h, sigma_h, inverse, torch.stack((S_q, S_k)))
+            a, G = projected_moments(mu_h, sigma_h, inverse, torch.stack((S_q, S_k)),
+                                     head_dims=head_dims)
             a_q, G_q = a[0], G[0]
             a_k, G_k = a[1], G[1]
         else:
-            a_q, G_q = projected_moments(mu_h, sigma_h, inverse, S_q)          # (..., N, H, d), (..., N, H, d, d)
-            a_k, G_k = projected_moments(source_mu_h, source_sigma_h, key_inverse, S_k)
+            a_q, G_q = projected_moments(mu_h, sigma_h, inverse, S_q, head_dims=head_dims)  # (..., N, H, d), (..., N, H, d, d)
+            a_k, G_k = projected_moments(source_mu_h, source_sigma_h, key_inverse, S_k,
+                                         head_dims=head_dims)
+        rope_base = getattr(operators, "comparison_rope_base", None)
+        invariant = rope_base is not None and operators.rope_comparison_covariance == "rotation_invariant"
+        if invariant:
+            # rope_comparison_covariance='rotation_invariant' (audit 2026-10-09 round 2, comparison-space RoPE
+            # self-lock): project G onto the commutant of the RoPE torus, one isotropic variance per rotating
+            # plane and the full non-rotating block, so R_i P(G) R_i^T = P(G) and only the mean term of the
+            # pair cost carries the relative position j - i.
+            n_pairs = rope_rotated_pairs(S_q.shape[-2], operators.comparison_rope_fraction)
+            G_q = rope_commutant_projection(G_q, n_pairs)                       # (..., N, H, r, r)
+            G_k = G_q if tied else rope_commutant_projection(G_k, n_pairs)
         if capture is not None:
             captured_q.append(G_q.detach().to(public))
             captured_k.append(G_k.detach().to(public))
         projection_q = (sigma_h, inverse, S_q, mu_h)
         projection_k = (source_sigma_h, key_inverse, S_k, source_mu_h)
-        rope_base = getattr(operators, "comparison_rope_base", None)
         if rope_base is not None:
             # rope_space='comparison' (audit 2026-10-07, F28): rotate token i's projected moments by R_i in the
             # r-dimensional comparison space, a -> R_i a, G -> R_i G R_i^T, for query and key alike. A Gaussian KL
@@ -110,20 +139,30 @@ def relational_score(
             # R_i S, so the source tuples carry R_i S and the source-root recovery and factor route factor
             # X_i = R_i S U_i^{-1} Sigma_i^{1/2} exactly as on the unrotated route (audit 2026-10-08 P1-2).
             # The rotation runs under the same IEEE-fp32 pin as the moments it rotates (P1-1).
+            # Under rope_comparison_covariance='rotation_invariant' only the means rotate: R_i P(G) R_i^T = P(G)
+            # exactly, so G is left as projected (no rounding from a rotation). The projected covariance has
+            # no source root of the form R_i S U_i^{-1} Sigma_i^{1/2}, so no source tuples are passed: the scorer
+            # factors the projected Gram itself (the matrix the healthy path scores), and any recovery refactors
+            # that same matrix in float64.
             r = S_q.shape[-2]
             R_q = operators.comparison_rope_rotation(a_q.shape[-3], r, a_q.device, a_q.dtype)  # (N, r, r)
             R_k = R_q if a_k.shape[-3] == a_q.shape[-3] else operators.comparison_rope_rotation(
                 a_k.shape[-3], r, a_k.device, a_k.dtype)
             with ieee_fp32_matmul():
                 a_q = torch.einsum("nst,...nht->...nhs", R_q, a_q)
-                a_k = torch.einsum("nst,...nht->...nhs", R_k, a_k)
-                G_q = torch.einsum("nst,...nhtu,nvu->...nhsv", R_q, G_q, R_q)
-                G_k = torch.einsum("nst,...nhtu,nvu->...nhsv", R_k, G_k, R_k)
-                S_q_rot = torch.einsum("nst,htk->nhsk", R_q.to(S_q.dtype), S_q)   # (N, H, r, K)
-                S_k_rot = torch.einsum("nst,htk->nhsk", R_k.to(S_k.dtype), S_k)
-            G_q, G_k = 0.5 * (G_q + G_q.transpose(-1, -2)), 0.5 * (G_k + G_k.transpose(-1, -2))
-            projection_q = (sigma_h, inverse, S_q_rot, mu_h)
-            projection_k = (source_sigma_h, key_inverse, S_k_rot, source_mu_h)
+                a_k = a_q if tied else torch.einsum("nst,...nht->...nhs", R_k, a_k)
+                if not invariant:
+                    G_q = torch.einsum("nst,...nhtu,nvu->...nhsv", R_q, G_q, R_q)
+                    G_k = G_q if tied else torch.einsum("nst,...nhtu,nvu->...nhsv", R_k, G_k, R_k)
+                    S_q_rot = torch.einsum("nst,htk->nhsk", R_q.to(S_q.dtype), S_q)   # (N, H, r, K)
+                    S_k_rot = S_q_rot if tied else torch.einsum("nst,htk->nhsk", R_k.to(S_k.dtype), S_k)
+            if invariant:
+                projection_q = projection_k = None
+            else:
+                G_q = 0.5 * (G_q + G_q.transpose(-1, -2))
+                G_k = G_q if tied else 0.5 * (G_k + G_k.transpose(-1, -2))
+                projection_q = (sigma_h, inverse, S_q_rot, mu_h)
+                projection_k = (source_sigma_h, key_inverse, S_k_rot, source_mu_h)
         # G_q, G_k are bitwise symmetric here (projected_moments and the RoPE branch both end in a
         # symmetrization), so the scorer skips its isclose symmetry check.
         scores.append(score(
@@ -131,7 +170,7 @@ def relational_score(
             projection_q=projection_q,
             projection_k=projection_k,
             symmetric_inputs=True,
-            **row_constant).to(public))
+            **cost_options).to(public))
     if capture is not None:
         # One (..., N, H, r, r) tensor for equal heads; a list with one per run for mixed head sizes.
         capture["projected_covariance_pre"] = captured_q[0] if len(captured_q) == 1 else captured_q
@@ -152,17 +191,24 @@ def clamped_routing_cost(
     :math:`D_{ij}-\min_{j' \in \mathcal{A}_i}D_{ij'}` over the admissible sources :math:`\mathcal{A}_i`
     (audit 2026-10-08 P1-4): the softmax is
     row-shift invariant, so beta is unchanged wherever a row keeps an entry below the cap, and a row
-    whose every cost exceeds ``kl_max`` still routes by its cost order. The row minimum is a constant
-    (no gradient); a row with no admissible finite cost is not shifted.
+    whose every cost exceeds ``kl_max`` still routes by its cost order. A row with no admissible finite
+    cost is not shifted.
+
+    The row minimum carries gradient (audit 2026-10-09 round 2): ``amin``'s subgradient, which sends
+    :math:`-\sum_{j'} \partial L/\partial \tilde D_{ij'}` to the argmin entry and is the exact derivative of the
+    clamped cost wherever the argmin is unique (``amin`` splits it evenly over tied minima). A detached minimum
+    gave the wrong router gradient once the cap binds. Every row of the cost gradient now sums to zero, so the
+    row-constant query log-determinant skip (``row_invariant``) is exact also when the cap binds. Where no gap
+    exceeds the cap the softmax gradient already sums to zero over the row, and the added term vanishes up to
+    roundoff.
     """
     from vfe3.families.base import safe_kl_clamp
-    if getattr(operators, "kl_max_reference", "absolute") == "row_min":
-        with torch.no_grad():
-            admissible = torch.isfinite(score)
-            if log_prior is not None:
-                admissible = admissible & torch.isfinite(log_prior)
-            row_min = score.masked_fill(~admissible, float("inf")).amin(dim=-1, keepdim=True)
-            row_min = torch.where(torch.isfinite(row_min), row_min, torch.zeros_like(row_min))
+    if operators.kl_max_reference == "row_min":
+        admissible = torch.isfinite(score)
+        if log_prior is not None:
+            admissible = admissible & torch.isfinite(log_prior)
+        row_min = score.masked_fill(~admissible, float("inf")).amin(dim=-1, keepdim=True)   # (..., H, N, 1)
+        row_min = torch.where(torch.isfinite(row_min), row_min, torch.zeros_like(row_min))
         score = score - row_min                                                 # (..., H, N, N)
     return safe_kl_clamp(score, kl_max=kl_max)
 
@@ -223,7 +269,7 @@ def relational_predictive_readout(
         sigma_work = sigma.to(dtype)
         # Under the row_min reference the clamp and softmax read only row gaps, so the query
         # log-determinant (a row constant of the Gaussian KL) needs no autograd.
-        row_invariant = getattr(operators, "kl_max_reference", "absolute") == "row_min"
+        row_invariant = operators.kl_max_reference == "row_min"
         score = clamped_routing_cost(
             relational_score(mu_work, sigma_work, mu_work, sigma_work, frame, operators, capture,
                              **({"row_invariant": True} if row_invariant else {})),

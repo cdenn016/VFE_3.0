@@ -69,6 +69,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'rope_base': 100.0,
     'rope_fraction': 1.0,
     'rope_space': 'frame',
+    'rope_comparison_covariance': 'full',
     'rope_on_value': True,
     'attention_mode': 'projected_gradient',
     'attention_residual': False,
@@ -153,6 +154,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'eps': 1e-06,
     'kl_max': 100.0,
     'routing_kl_max_reference': 'absolute',
+    'pair_kl_gemm_tol': None,
     'sigma_max': 100.0,
     'e_mu_q_trust': 2,
     'e_sigma_q_trust': 5.0,
@@ -212,11 +214,12 @@ def tiny_config(**overrides: Any) -> VFE3Config:
 
 
 def make_relational_operators(*args: Any, **overrides: Any) -> Any:
-    """RelationalOperators whose six required config-mirroring keywords come from the test baseline.
+    """RelationalOperators whose eight required config-mirroring keywords come from the test baseline.
 
     ``attention_residual``, ``predictive_covariance``, ``receiver_law``, ``receiver_update``,
-    ``content_link_chart`` and ``minimal_agent_inference`` have no constructor default; explicit
-    keyword arguments override the baseline values.
+    ``content_link_chart``, ``minimal_agent_inference``, ``kl_max_reference`` and
+    ``rope_comparison_covariance`` have no constructor default; explicit keyword arguments override the
+    baseline values.
     """
     from vfe3.model.relational_operators import RelationalOperators
     values = _CONFIG_VALUES
@@ -225,5 +228,7 @@ def make_relational_operators(*args: Any, **overrides: Any) -> Any:
                     receiver_law=values['relational_receiver_law'],
                     receiver_update=values['relational_receiver_update'],
                     content_link_chart=values['content_link_chart'],
-                    minimal_agent_inference=values['minimal_agent_inference'])
+                    minimal_agent_inference=values['minimal_agent_inference'],
+                    kl_max_reference=values['routing_kl_max_reference'],
+                    rope_comparison_covariance=values['rope_comparison_covariance'])
     return RelationalOperators(*args, **{**baseline, **overrides})

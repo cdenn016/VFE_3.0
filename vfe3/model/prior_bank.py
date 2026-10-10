@@ -96,32 +96,43 @@ PRIOR_COVARIANCE_TABLES = ("diagonal", "block_cholesky")
 
 
 def packed_cholesky_covariance(
-    packed: torch.Tensor,                # (..., d(d+1)/2) lower triangle, tril_indices order, log diagonal
+    packed: torch.Tensor,                # (..., d(d+1)/2) tril_indices order: l on the diagonal, N below
     d:      int,
-) -> torch.Tensor:                       # (..., d, d) C = L L^T
-    r"""SPD block :math:`C = LL^\top` from its packed log-diagonal Cholesky factor.
+    *,
+    eps:    float,                       # eigenvalue floor, the prior bank's eps
+) -> torch.Tensor:                       # (..., d, d) C = L L^T + eps I
+    r"""SPD block from its packed row-scaled Cholesky factor (``prior_covariance_table='block_cholesky'``).
 
-    ``packed`` holds the lower triangle of :math:`L` in ``torch.tril_indices(d, d)`` order, with the diagonal
-    stored as :math:`\ell_k = \log L_{kk}`, so
+    ``packed`` holds, in ``torch.tril_indices(d, d)`` order, a log-variance :math:`\ell_k` in each diagonal slot and
+    the strictly lower unit-triangular part :math:`N` below it:
 
     .. math::
-        C = LL^\top,\qquad L_{kk} = e^{\ell_k} > 0,
+        L = \operatorname{diag}(e^{\ell/2})(I + N),\qquad C = LL^\top + \epsilon I,\qquad
+        C_{kk} = e^{\ell_k}\Bigl(1 + \sum_{j<k}N_{kj}^2\Bigr) + \epsilon.
 
-    is SPD for every parameter value, with :math:`d(d+1)/2` parameters (the dimension of SPD(d)), and the map
-    is a bijection onto SPD(d). The log entry is clamped at 40 before exponentiation (the log-variance table's
-    80, halved), only to keep float32 finite. Off-diagonal entries are never exponentiated, so no masked
-    branch carries an overflow into the gradient.
+    The factor is a bijection of :math:`(\ell, N)` onto lower-triangular matrices with positive diagonal, so
+    :math:`LL^\top` ranges over SPD(d) with :math:`d(d+1)/2` parameters. The coordinates match the diagonal table's
+    optimizer meaning (audit 2026-10-09 round 2, #17): :math:`\ell_k` is in log-variance units (a unit step moves
+    :math:`\log C_{kk}` by one unit, as on ``sigma_log_embed``; the previous :math:`\log L_{kk}` moved it by two),
+    and :math:`N` is dimensionless, so the correlations of :math:`LL^\top` depend on :math:`N` only and a step on
+    :math:`N` has the same effect at every variance scale (the previous absolute off-diagonal entries of :math:`L`
+    stepped correlations as :math:`1/\sqrt{\sigma}`). :math:`\epsilon I` is the eigenvalue floor matching the diagonal
+    table's ``eps`` (:func:`vfe3.numerics.bounded_variance_from_log` clamps each variance at :math:`\epsilon`; here
+    the floor is added, which keeps the map smooth). :math:`\ell` is clamped at 80 before exponentiation, the
+    log-variance table's ``max_log``, only to keep float32 finite.
     """
     rows, cols = torch.tril_indices(d, d, device=packed.device)
     if packed.shape[-1] != rows.numel():
         raise ValueError(f"packed Cholesky entries must have d(d+1)/2 = {rows.numel()} entries, "
                          f"got {packed.shape[-1]}")
     on_diagonal = rows == cols                                                       # (P,)
-    log_diagonal = torch.where(on_diagonal, packed, torch.zeros_like(packed)).clamp(max=40.0)
-    entries = torch.where(on_diagonal, torch.exp(log_diagonal), packed)              # (..., P)
+    unit = torch.where(on_diagonal, torch.ones_like(packed), packed)                 # (..., P) I + N entries
     factor = packed.new_zeros(*packed.shape[:-1], d * d).index_copy(
-        -1, rows * d + cols, entries).reshape(*packed.shape[:-1], d, d)              # (..., d, d) L
-    return factor @ factor.transpose(-1, -2)
+        -1, rows * d + cols, unit).reshape(*packed.shape[:-1], d, d)                 # (..., d, d) I + N
+    log_variance = packed[..., on_diagonal].clamp(max=80.0)                          # (..., d) l, diag slots in row order
+    factor = torch.exp(0.5 * log_variance).unsqueeze(-1) * factor                    # diag(e^{l/2}) (I + N)
+    eye = torch.eye(d, dtype=packed.dtype, device=packed.device)
+    return factor @ factor.transpose(-1, -2) + eps * eye
 
 
 def set_decode_av_precision(precision: str) -> str:
@@ -960,12 +971,13 @@ class PriorBank(nn.Module):
         # The routed token-prior tables ARE the belief prior, so both are always live Parameters.
         self.mu_embed = nn.Parameter(mu_init_std * torch.randn(vocab_size, K))
         if prior_covariance_table == "block_cholesky":
-            # Frame-free per-type covariance C_v = blockdiag_h(L_vh L_vh^T): packed lower triangles
-            # (V, H, d(d+1)/2) in torch.tril_indices(d, d) order, diagonal entries stored as log L_kk.
-            # Initialized at L = sqrt(sigma_init) I, the covariance the diagonal table starts at; no RNG draw.
+            # Frame-free per-type covariance C_v = blockdiag_h(L_vh L_vh^T + eps I), L = diag(e^{l/2})(I + N):
+            # packed (V, H, d(d+1)/2) in torch.tril_indices(d, d) order, l (log-variance units) on the diagonal
+            # slots and N below (packed_cholesky_covariance). Initialized at l = log sigma_init, N = 0, i.e.
+            # L = sqrt(sigma_init) I, the covariance the diagonal table starts at (plus the eps floor); no RNG draw.
             n_heads, d = len(irrep_dims), irrep_dims[0]
             rows, cols = torch.tril_indices(d, d)
-            packed = torch.where(rows == cols, torch.tensor(0.5 * sigma_log_init), torch.tensor(0.0))
+            packed = torch.where(rows == cols, torch.tensor(sigma_log_init), torch.tensor(0.0))
             self.register_parameter("sigma_log_embed", None)
             self.sigma_chol_embed = nn.Parameter(packed.expand(vocab_size, n_heads, packed.numel()).clone())
         else:
@@ -1067,9 +1079,9 @@ class PriorBank(nn.Module):
         index: Optional[torch.Tensor] = None,    # (...) integer token ids; None reads every type
     ) -> torch.Tensor:                           # (..., H, d, d) C_v = L_v L_v^T per head
         r"""Per-head prior covariance blocks of ``prior_covariance_table='block_cholesky'``
-        (:func:`packed_cholesky_covariance` of the gathered ``sigma_chol_embed`` rows)."""
+        (:func:`packed_cholesky_covariance` of the gathered ``sigma_chol_embed`` rows, eigenvalue floor ``eps``)."""
         packed = self.sigma_chol_embed if index is None else self.sigma_chol_embed[index]   # (..., H, P)
-        return packed_cholesky_covariance(packed, self.irrep_dims[0])
+        return packed_cholesky_covariance(packed, self.irrep_dims[0], eps=self.eps)
 
     def _diagonal_decoder_dispersion(
         self,

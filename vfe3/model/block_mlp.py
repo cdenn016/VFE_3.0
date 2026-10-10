@@ -194,6 +194,45 @@ def layernorm_jacobian(
     return J
 
 
+def layernorm_scale(
+    mu:     torch.Tensor,                             # (..., K) pre-norm means
+    *,
+    eps:    float,
+    weight: Optional[torch.Tensor] = None,            # (K,) affine gamma, or None for the plain norm
+) -> torch.Tensor:                                    # (..., K) gamma / s
+    r"""The scale part :math:`D = \operatorname{diag}(\gamma)/s` of the LayerNorm Jacobian of :func:`layernorm_jacobian`.
+
+    :math:`J_{\mathrm{LN}} = D(I - \tfrac1K\mathbf 1\mathbf 1^\top - \tfrac1K zz^\top)`; ``delta_full`` expresses its
+    covariance floor in post-norm units through :math:`D` (:func:`_delta_covariance`). Same precision as the Jacobian.
+    """
+    dtype = torch.promote_types(mu.dtype, torch.float32)
+    with torch.autocast(device_type=mu.device.type, enabled=False):
+        work = mu.to(dtype)
+        centered = work - work.mean(dim=-1, keepdim=True)                         # (..., K)
+        s = (centered.square().mean(dim=-1, keepdim=True) + eps).sqrt()         # (..., 1)
+        scale = (1.0 / s).expand_as(work)                                       # (..., K)
+        if weight is not None:
+            scale = weight.to(dtype) * scale
+    return scale
+
+
+class BlockNormLinearization(NamedTuple):
+    r"""The block norm's Jacobian :math:`J_{\mathrm{LN}}` at the pre-norm mean and its scale :math:`D = \operatorname{diag}(\gamma)/s`."""
+
+    jacobian: torch.Tensor                            # (..., K, K)
+    scale: torch.Tensor                               # (..., K)
+
+
+def _layernorm_arguments(norm: Callable[..., torch.Tensor]) -> 'tuple[float, Optional[torch.Tensor]]':
+    from vfe3.geometry.norms import AffineLayerNorm, LayerNorm
+    if isinstance(norm, AffineLayerNorm):
+        return norm.eps, norm.weight
+    if isinstance(norm, LayerNorm):
+        return norm.eps, None
+    raise ValueError(f"the delta_full block pushforward has the norm Jacobian of the LayerNorm seams only, "
+                     f"got {type(norm).__name__}")
+
+
 def block_norm_jacobian(
     norm: Callable[..., torch.Tensor],
     mu:   torch.Tensor,                               # (..., K) pre-norm means
@@ -204,23 +243,41 @@ def block_norm_jacobian(
     refused, so ``block_mlp_covariance='delta_full'`` never pushes a covariance through a norm whose
     Jacobian it omits.
     """
-    from vfe3.geometry.norms import AffineLayerNorm, LayerNorm
-    if isinstance(norm, AffineLayerNorm):
-        return layernorm_jacobian(mu, eps=norm.eps, weight=norm.weight)
-    if isinstance(norm, LayerNorm):
-        return layernorm_jacobian(mu, eps=norm.eps)
-    raise ValueError(f"the delta_full block pushforward has the norm Jacobian of the LayerNorm seams only, "
-                     f"got {type(norm).__name__}")
+    eps, weight = _layernorm_arguments(norm)
+    return layernorm_jacobian(mu, eps=eps, weight=weight)
+
+
+def block_norm_linearization(
+    norm: Callable[..., torch.Tensor],
+    mu:   torch.Tensor,                               # (..., K) pre-norm means
+) -> BlockNormLinearization:
+    r"""Jacobian and scale :math:`D` of a block LayerNorm seam at ``mu`` (:func:`block_norm_jacobian`, :func:`layernorm_scale`)."""
+    eps, weight = _layernorm_arguments(norm)
+    return BlockNormLinearization(layernorm_jacobian(mu, eps=eps, weight=weight),
+                                  layernorm_scale(mu, eps=eps, weight=weight))
+
+
+def _pushforward_dtype(*tensors: torch.Tensor) -> torch.dtype:
+    dtype = torch.float32
+    for tensor in tensors:
+        dtype = torch.promote_types(dtype, tensor.dtype)
+    return dtype
 
 
 def _compose_input_jacobian(
     jacobian:       torch.Tensor,                     # (..., K, K) J of the MLP at its input
     input_jacobian: Optional[torch.Tensor],           # (..., K, K) J of the map feeding the MLP, or None
 ) -> torch.Tensor:                                    # (..., K, K) chain rule J J_in
-    r"""Chain rule :math:`J_{\mathrm{MLP}}J_{\mathrm{in}}` for a map (the block norm) applied before the MLP."""
+    r"""Chain rule :math:`J_{\mathrm{MLP}}J_{\mathrm{in}}` for a map (the block norm) applied before the MLP.
+
+    Evaluated with autocast off and IEEE fp32 GEMMs at ``promote_types(dtype, float32)``: :math:`J_{\mathrm{LN}}` has
+    rank :math:`K - 1`, and a bf16 or TF32 product leaks rounding into its null direction (audit 2026-10-09 round 2, #2).
+    """
     if input_jacobian is None:
         return jacobian
-    return torch.einsum("...ij,...jk->...ik", jacobian, input_jacobian.to(jacobian.dtype))
+    dtype = _pushforward_dtype(jacobian, input_jacobian)
+    with torch.autocast(device_type=jacobian.device.type, enabled=False), ieee_fp32_matmul():
+        return torch.einsum("...ij,...jk->...ik", jacobian.to(dtype), input_jacobian.to(dtype))
 
 
 def _reject_input_jacobian(input_jacobian: Optional[torch.Tensor], contract: str) -> None:
@@ -229,14 +286,85 @@ def _reject_input_jacobian(input_jacobian: Optional[torch.Tensor], contract: str
                          f"{contract!r} pushes no covariance")
 
 
+def _check_input_linearization(input_jacobian: Optional[torch.Tensor], input_scale: Optional[torch.Tensor]) -> None:
+    if (input_jacobian is None) != (input_scale is None):
+        raise ValueError("input_jacobian and input_scale come together from block_norm_linearization: the floor "
+                         "of a pushforward through the block norm is expressed in post-norm units")
+
+
+def _covariance_cholesky(sigma: torch.Tensor) -> torch.Tensor:   # (..., K, K) SPD -> lower factor L
+    r"""Lower Cholesky factor :math:`L` of the SPD belief covariance, :math:`\Sigma = LL^\top`.
+
+    No jitter. Matrices whose factor fails at the working precision are refactored in float64; a float64 failure
+    raises, because :math:`\Sigma` is then not numerically SPD and the pushforward has no Gram factor.
+    """
+    factor, info = torch.linalg.cholesky_ex(sigma)
+    failed = info != 0
+    if bool(failed.any()):
+        if sigma.dtype == torch.float64:
+            raise FloatingPointError("delta_full: the belief covariance is not numerically SPD (float64 Cholesky failed)")
+        high, high_info = torch.linalg.cholesky_ex(sigma.double())
+        if bool((high_info[failed] != 0).any()):
+            raise FloatingPointError("delta_full: the belief covariance is not numerically SPD after float64 escalation")
+        factor = torch.where(failed.unsqueeze(-1).unsqueeze(-1), high.to(sigma.dtype), factor)
+    return factor
+
+
 def _delta_covariance(
-    jacobian: torch.Tensor,
-    sigma: torch.Tensor,
+    jacobian:         torch.Tensor,                   # (..., K, K) J of the (composite) mean map
+    sigma:            torch.Tensor,                   # (..., K, K) SPD input covariance
     covariance_floor: float,
-) -> torch.Tensor:
-    js = torch.einsum("...ij,...jk->...ik", jacobian, sigma)
-    jsj = torch.einsum("...ik,...lk->...il", js, jacobian)
-    pushed = jsj + covariance_floor * sigma
+    floor_scale:      Optional[torch.Tensor] = None,  # (..., K) D = diag(gamma)/s of a block norm, or None
+) -> torch.Tensor:                                    # (..., K, K)
+    r"""Delta-method pushforward :math:`(JL)(JL)^\top + fD\Sigma D` with :math:`\Sigma = LL^\top`.
+
+    The first term is formed as a Gram matrix of the factor :math:`JL` rather than as the triple product
+    :math:`J\Sigma J^\top`, so it is positive semidefinite up to the rounding of one GEMM, relative to
+    :math:`\lVert JL\rVert^2` rather than :math:`\lVert J\rVert^2\lVert\Sigma\rVert`; the floor makes it definite. Below
+    float64 the result is certified by a Cholesky factorization and failed matrices are recomputed in float64.
+    Without a block norm (``floor_scale=None``) :math:`D = I` and the floor is :math:`f\Sigma`, the covariant floor.
+    Through the block LayerNorm, :math:`J = J_{\mathrm{MLP}}J_{\mathrm{LN}}` with
+    :math:`J_{\mathrm{LN}} = D(I - \tfrac1K\mathbf 1\mathbf 1^\top - \tfrac1K zz^\top)` and :math:`D = \operatorname{diag}(\gamma)/s`,
+    and the floor :math:`fD\Sigma D` is the input covariance carried to post-norm units by the scale part of the
+    norm. :math:`J\Sigma J^\top` scales as :math:`1/s^2`, and so does this floor, so its share of the pushforward is
+    independent of :math:`s` (the pre-norm floor :math:`f\Sigma` had a share growing as :math:`s^2`; audit 2026-10-09
+    round 2, #13). Everything runs with autocast off and IEEE fp32 GEMMs at ``promote_types(dtype, float32)``: under
+    bf16 autocast the rank-deficient :math:`J_{\mathrm{LN}}` product returned indefinite covariances (#2).
+    """
+    dtype = _pushforward_dtype(jacobian, sigma)
+    with torch.autocast(device_type=jacobian.device.type, enabled=False), ieee_fp32_matmul():
+        pushed = _gram_pushforward(jacobian.to(dtype), sigma.to(dtype), covariance_floor,
+                                   None if floor_scale is None else floor_scale.to(dtype))
+        if dtype == torch.float64:
+            return pushed
+        # The GEMM rounding of the Gram is bounded by about K u ||J L||^2, which exceeds the floor's smallest
+        # eigenvalue f lambda_min(D Sigma D) once cond(Sigma) passes about f / (K u) (u the working roundoff). The
+        # result is therefore certified by a Cholesky factorization at the working precision, and matrices that
+        # fail it are recomputed in float64 and rounded back (still indefinite only if the float64 result itself
+        # cannot be represented as SPD at the working precision).
+        _, info = torch.linalg.cholesky_ex(pushed)
+        failed = info != 0
+        if bool(failed.any()):
+            high = _gram_pushforward(jacobian.double(), sigma.double(), covariance_floor,
+                                     None if floor_scale is None else floor_scale.double())
+            pushed = torch.where(failed.unsqueeze(-1).unsqueeze(-1), high.to(dtype), pushed)
+        return pushed
+
+
+def _gram_pushforward(
+    J:                torch.Tensor,                   # (..., K, K)
+    S:                torch.Tensor,                   # (..., K, K) SPD
+    covariance_floor: float,
+    d:                Optional[torch.Tensor],         # (..., K) floor scale D, or None for D = I
+) -> torch.Tensor:                                    # (..., K, K) symmetrized (JL)(JL)^T + f D S D
+    L = _covariance_cholesky(S)                                                     # (..., K, K)
+    JL = torch.einsum("...ij,...jk->...ik", J, L)                                   # (..., K, K)
+    gram = torch.einsum("...ik,...lk->...il", JL, JL)                               # (JL)(JL)^T
+    if d is None:
+        floor = covariance_floor * S
+    else:
+        floor = covariance_floor * (d.unsqueeze(-1) * S * d.unsqueeze(-2))          # f D Sigma D
+    pushed = gram + floor
     return 0.5 * (pushed + pushed.transpose(-1, -2))
 
 
@@ -291,15 +419,19 @@ class BlockMLP(nn.Module):
         residual = self.fc2(self.activation(hidden_pre))
         dropout_scale = _dropout_scale(self.dropout, residual)
         mu_out = mu + dropout_scale * residual
-        residual_jacobian = torch.einsum(
-            "oh,...h,hi->...oi",
-            self.fc2.weight,
-            _activation_derivative(self.activation_name, hidden_pre),
-            self.fc1.weight,
-        )
-        residual_jacobian = dropout_scale.unsqueeze(-1) * residual_jacobian
-        identity = torch.eye(mu.shape[-1], dtype=mu.dtype, device=mu.device)
-        return mu_out, identity + residual_jacobian
+        # The Jacobian feeds the covariance pushforward, which runs at promote_types(dtype, float32) with
+        # autocast off (see _delta_covariance); the mean path keeps the ambient autocast.
+        dtype = _pushforward_dtype(mu, hidden_pre, self.fc1.weight)
+        with torch.autocast(device_type=mu.device.type, enabled=False), ieee_fp32_matmul():
+            residual_jacobian = torch.einsum(
+                "oh,...h,hi->...oi",
+                self.fc2.weight.to(dtype),
+                _activation_derivative(self.activation_name, hidden_pre.to(dtype)),
+                self.fc1.weight.to(dtype),
+            )                                                                       # (..., K, K)
+            residual_jacobian = dropout_scale.to(dtype).unsqueeze(-1) * residual_jacobian
+            identity = torch.eye(mu.shape[-1], dtype=dtype, device=mu.device)
+            return mu_out, identity + residual_jacobian
 
     def forward_moments(
         self,
@@ -309,21 +441,24 @@ class BlockMLP(nn.Module):
         frame_context: Optional[CanonicalFrameContext] = None,
         hidden_bias: Optional[torch.Tensor] = None,    # (..., w), w <= H: per-token fc1 bias
         input_jacobian: Optional[torch.Tensor] = None, # (..., K, K) Jacobian of the block norm before the MLP
+        input_scale: Optional[torch.Tensor] = None,    # (..., K) its scale D = diag(gamma)/s (with input_jacobian)
     ) -> BlockMLPMomentResult:
         r"""Mean update and covariance under the contract; ``delta_full`` gives :math:`J\Sigma J^\top + f\Sigma`.
 
         With ``input_jacobian`` :math:`J_{\mathrm{in}}` (the block norm's Jacobian at the pre-norm mean) the
         Jacobian is the composite :math:`J = J_{\mathrm{MLP}}J_{\mathrm{in}}` and ``sigma`` is the pre-norm
-        covariance, so the pushforward is that of MLP∘norm.
+        covariance, so the pushforward is that of MLP∘norm, with the floor :math:`fD\Sigma D` in post-norm units
+        (:func:`_delta_covariance`).
         """
         del frame_context
+        _check_input_linearization(input_jacobian, input_scale)
         if self.covariance_contract == "passthrough":
             _reject_input_jacobian(input_jacobian, self.covariance_contract)
             return BlockMLPMomentResult(self.forward(mu, hidden_bias=hidden_bias), sigma, None)
         mu_out, jacobian = self._coordinate_update_with_jacobian(mu, hidden_bias)
         jacobian = _compose_input_jacobian(jacobian, input_jacobian)
         return BlockMLPMomentResult(
-            mu_out, _delta_covariance(jacobian, sigma, self.covariance_floor), jacobian)
+            mu_out, _delta_covariance(jacobian, sigma, self.covariance_floor, input_scale), jacobian)
 
 
 class GaugeGateBlockMLP(nn.Module):
@@ -497,8 +632,10 @@ class GaugeGateBlockMLP(nn.Module):
         frame_context: Optional[CanonicalFrameContext] = None,
         hidden_bias: Optional[torch.Tensor] = None,
         input_jacobian: Optional[torch.Tensor] = None,  # (..., K, K) block-norm Jacobian (delta_full only)
+        input_scale: Optional[torch.Tensor] = None,     # (..., K) its scale D = diag(gamma)/s
     ) -> BlockMLPMomentResult:
         del frame_context
+        _check_input_linearization(input_jacobian, input_scale)
         _reject_hidden_bias(
             hidden_bias,
             "the gauge_gate fc1 acts on the per-block Mahalanobis invariants, not on a coordinate "
@@ -547,7 +684,7 @@ class GaugeGateBlockMLP(nn.Module):
         jacobian = _compose_input_jacobian(jacobian, input_jacobian)
         return BlockMLPMomentResult(
             mu_out,
-            _delta_covariance(jacobian, sigma.to(jacobian.dtype), self.covariance_floor),
+            _delta_covariance(jacobian, sigma, self.covariance_floor, input_scale),
             jacobian,
         )
 
@@ -586,8 +723,10 @@ class CanonicalFrameBlockMLP(BlockMLP):
         frame_context: Optional[CanonicalFrameContext] = None,
         hidden_bias: Optional[torch.Tensor] = None,
         input_jacobian: Optional[torch.Tensor] = None,  # (..., K, K) block-norm Jacobian (delta_full only)
+        input_scale: Optional[torch.Tensor] = None,     # (..., K) its scale D = diag(gamma)/s
     ) -> BlockMLPMomentResult:
         frame_context = _require_canonical_frame_context(frame_context)
+        _check_input_linearization(input_jacobian, input_scale)
         apply = _frame_action(frame_context, mu)
         canonical_mu = apply(frame_context.inverse, mu)
         if self.covariance_contract == "passthrough":
@@ -599,9 +738,12 @@ class CanonicalFrameBlockMLP(BlockMLP):
             canonical_mu, hidden_bias)
         mu_out = apply(frame_context.forward, canonical_out)
         if not _escalated_frame(frame_context, mu):
-            with ieee_fp32_matmul():                    # kappa(U)-sensitive conjugation U J U^{-1}
+            dtype = _pushforward_dtype(canonical_jacobian, frame_context.forward)
+            # kappa(U)-sensitive conjugation U J U^{-1}: IEEE fp32 with autocast off, as the pushforward
+            with torch.autocast(device_type=mu.device.type, enabled=False), ieee_fp32_matmul():
                 realized_jacobian = (
-                    frame_context.forward @ canonical_jacobian @ frame_context.inverse
+                    frame_context.forward.to(dtype) @ canonical_jacobian.to(dtype)
+                    @ frame_context.inverse.to(dtype)
                 )
         else:
             realized_jacobian = (
@@ -610,7 +752,7 @@ class CanonicalFrameBlockMLP(BlockMLP):
         realized_jacobian = _compose_input_jacobian(realized_jacobian, input_jacobian)
         return BlockMLPMomentResult(
             mu_out,
-            _delta_covariance(realized_jacobian, sigma, self.covariance_floor),
+            _delta_covariance(realized_jacobian, sigma, self.covariance_floor, input_scale),
             realized_jacobian,
         )
 
@@ -987,7 +1129,9 @@ class BlockMLPRegistration:
             extra_flops = self.diagonal_extra_flops_per_layer
         per_layer +=extra_flops(embed_dim, irrep_dims)
         if covariance_contract == "delta_full":
-            per_layer += 4.0 * embed_dim ** 3
+            # Cholesky of Sigma (K^3/3), the factor J L (2 K^3), its Gram (J L)(J L)^T (2 K^3) and the
+            # certifying Cholesky of the result (K^3/3); a float64 recompute of failed matrices is not booked.
+            per_layer += (4.0 + 2.0 / 3.0) * embed_dim ** 3
         elif covariance_contract == "posterior" and layout == "full":
             # prototype_agents, the only mode admitting 'posterior': P = D^{-1/2} B^{-1} D^{1/2} C is a
             # Cholesky solve with K right-hand sides (2 K^3) plus two diagonal scalings and the

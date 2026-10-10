@@ -101,7 +101,7 @@ def test_registered_block_mlp_accounting_and_cost_fields_preserve_legacy_parity(
     elif mode == "canonical_frame":
         expected_flops += 4.0 * cfg.n_layers * cfg.embed_dim ** 2
     if covariance == "delta_full":
-        expected_flops += 4.0 * cfg.n_layers * cfg.embed_dim ** 3
+        expected_flops += (4.0 + 2.0 / 3.0) * cfg.n_layers * cfg.embed_dim ** 3   # two Cholesky, J L, Gram
 
     realized_params = sum(
         parameter.numel() for parameter in model.block_mlps.parameters()

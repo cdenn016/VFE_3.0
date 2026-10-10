@@ -204,6 +204,11 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
                                          if cfg.relational_receiver_law == "channel_likelihood" else
                                          "full_link_pushforward_plus_positive_reference_noise") if full_link else
                                         ("minimal_agent_posterior_moment_match_plus_covariant_floor" if minimal_agent
+                                         # The head-block family stores the head blocks of U_i(C^att + f I)U_i^T: the
+                                         # exact M-projection onto block-diagonal Gaussians, covariant under the
+                                         # per-head block group (audit 2026-10-09 round 2, #10).
+                                         else "head_block_moment_projection_of_predictive_kernel_plus_covariant_floor"
+                                         if cfg.family == "gaussian_block"
                                          # The diagonal family stores diag of U_i(C^att + f I)U_i^T in local
                                          # coordinates: a moment projection, neither exact nor covariant.
                                          else "diagonal_local_moment_projection_of_predictive_kernel_plus_floor"
@@ -1828,20 +1833,24 @@ _CHECKPOINT_NUMERICS_KEYS: Tuple[str, ...] = (
 def _checkpoint_numerics_counters(
     value: object,
 ) -> Optional[Dict[str, int]]:
-    r"""The checkpoint's cumulative frame-projection counts as ``{key: int >= 0}``, or None.
+    r"""The checkpoint's cumulative numerics counts as ``{key: int >= 0}``, or None.
 
-    Tolerant by design: these are diagnostics, so a missing or malformed record (an older
-    checkpoint, a hand-edited file) yields None rather than failing a save or a resume.
+    The frame-projection counts are kept all or none; each run total of
+    ``vfe3.train.RUN_TOTAL_COUNTER_KEYS`` is kept when it is a non-negative int, so a resumed run's
+    summary and metrics report whole-run totals. Tolerant by design: these are diagnostics, so a
+    missing or malformed record (an older checkpoint, a hand-edited file) yields None rather than
+    failing a save or a resume.
     """
+    from vfe3.train import RUN_TOTAL_COUNTER_KEYS
+
     if not isinstance(value, Mapping):
         return None
-    out: Dict[str, int] = {}
-    for key in _CHECKPOINT_NUMERICS_KEYS:
-        count = value.get(key)
-        if type(count) is not int or count < 0:
-            return None
-        out[key] = count
-    return out
+    frame = {key: value.get(key) for key in _CHECKPOINT_NUMERICS_KEYS}
+    out: Dict[str, int] = (dict(frame) if all(type(count) is int and count >= 0 for count in frame.values())
+                           else {})
+    out.update({key: value[key] for key in RUN_TOTAL_COUNTER_KEYS
+                if type(value.get(key)) is int and value[key] >= 0})
+    return out or None
 
 
 class RunArtifacts:
@@ -3566,7 +3575,8 @@ def _cost_model_fields(
             embed_dim=K,
             irrep_dims=model.group.irrep_dims,
             n_layers=int(cfg.n_layers),
-            covariance_layout=("full" if getattr(cfg, "family", None) == "gaussian_full" else "diagonal"),
+            covariance_layout=("full" if getattr(cfg, "family", None) in ("gaussian_full", "gaussian_block")
+                               else "diagonal"),                                   # head blocks: dense storage
         )
     )
     block_mlp_active = block_mlp_build.enabled
@@ -4897,6 +4907,15 @@ def _pure_path_report(
         block_mlp_intertwiner_compatible = (
             registration.intertwiner_compatible if block_mlp_active else True
         )
+    if block_mlp_active and block_mlp_covariance == "delta_full" and (
+            getattr(cfg, "norm_type_block", "none") == "layernorm"
+            and getattr(cfg, "block_coordinates", "local") == "local"):
+        # Through the local block LayerNorm the floor is f D Sigma D, D = diag(gamma)/s: post-norm units, not
+        # the covariant f Sigma (audit 2026-10-09 round 2, #13).
+        block_mlp_covariance_contract = "delta_full_through_layernorm_plus_post_norm_scaled_floor"
+    if block_mlp_active and block_mlp_covariance != "passthrough" and cfg.family == "gaussian_block":
+        # The block's covariance is read through the head-block M-projection (vfe3.model.block._head_block_readout).
+        block_mlp_covariance_contract = f"head_block_projection_of_{block_mlp_covariance_contract}"
     runtime_exactness_key = transport_registration.runtime_exactness_key
     if runtime_exactness_key is None:
         # No runtime exactness certificate is registered for this transport: the flat cocycle is
@@ -5228,7 +5247,8 @@ def _save_figures(
                               if key.startswith("relational_")})
         if readout_keys:
             readout_history = _hist_subset(readout_keys + (
-                "attn_entropy", "attn_entropy_min", "effective_rank", "belief_cond_median"))
+                "attn_entropy", "attn_entropy_min", "effective_rank", "belief_cond_median",
+                "belief_cond_median_layer_max"))
             if readout_history is not None:
                 try:
                     from vfe3.metrics import covariance_frozen_at_encode

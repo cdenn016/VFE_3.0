@@ -323,6 +323,8 @@ class VFEModel(nn.Module):
                                                       and cfg.rope_space == "comparison" else None),
                                 comparison_rope_fraction=cfg.rope_fraction,
                                 kl_max_reference=cfg.routing_kl_max_reference,
+                                pair_kl_gemm_tol=cfg.pair_kl_gemm_tol,
+                                rope_comparison_covariance=cfg.rope_comparison_covariance,
                                 learn_attention_temperature=cfg.learn_attention_temperature,
                                 tie_comparison_maps=cfg.tie_comparison_maps,
                                 block_covariance=_get_family(cfg.family).head_block_covariance)
@@ -440,7 +442,7 @@ class VFEModel(nn.Module):
                 embed_dim=cfg.embed_dim,
                 irrep_dims=self.group.irrep_dims,
                 n_layers=cfg.n_layers,
-                covariance_layout=("full" if cfg.family == "gaussian_full" else "diagonal"),
+                covariance_layout=_get_family(cfg.family).cov_kind,     # 'full' also for the dense head-block storage
             )
         )
         # Under rope_space='comparison' no frame carries R_i: the MLP and the values both read U_i.
@@ -1676,6 +1678,43 @@ class VFEModel(nn.Module):
         r"""Capped fraction over the causal support, not over masked pairs."""
         return float(((score >= cap_level) & support).sum() / support.sum().clamp(min=1))
 
+    @staticmethod
+    def _router_head_statistics(
+        score:     torch.Tensor,               # (B, H, N, N) clamped routing cost as captured
+        beta:      torch.Tensor,               # (B, H, N, N) router
+        support:   torch.Tensor,               # (B, H, N, N) bool causal support
+        cap_level: float,
+    ) -> Dict[str, torch.Tensor]:              # each (H,) float64
+        r"""Per-head router-saturation statistics of one layer (audit 2026-10-09 round 2, item 9).
+
+        With :math:`S_i` the causal sources of query :math:`i` and the scored rows :math:`|S_i| \ge 2`:
+        ``klmax_frac`` is the capped share of the support (the per-head :meth:`_klmax_frac`);
+        ``clamped_row_frac`` the share of scored rows whose every entry is capped (the
+        ``_capture_numerics_counts`` rule: such a row routes uniformly with zero router gradient, which
+        happens only under the absolute reference); ``self_weight`` the mean :math:`\beta_{ii}` and
+        ``self_argmax_frac`` the share of rows with :math:`\beta_{ii} = \max_{j \in S_i}\beta_{ij}`, both
+        over scored rows that admit self (NaN for a head with none, e.g. a ``*_noself`` prior).
+        """
+        rows = support.sum(dim=-1) >= 2                                       # (B, H, N)
+        entries = support & rows.unsqueeze(-1)                                # (B, H, N, N)
+        capped = entries & (score >= cap_level)                               # (B, H, N, N)
+        clamped = rows & (capped.sum(dim=-1) == entries.sum(dim=-1))          # (B, H, N)
+        self_rows = rows & support.diagonal(dim1=-2, dim2=-1)                 # (B, H, N)
+        beta_ii = beta.diagonal(dim1=-2, dim2=-1).double()                    # (B, H, N)
+        row_max = beta.masked_fill(~support, float("-inf")).amax(dim=-1).double()   # (B, H, N)
+        n_self = self_rows.sum(dim=(0, 2)).double()                           # (H,)
+        nan = torch.full_like(n_self, float("nan"))
+        return {
+            "klmax_frac": ((score >= cap_level) & support).sum(dim=(0, 2, 3)).double()
+                          / support.sum(dim=(0, 2, 3)).clamp(min=1).double(),
+            "clamped_row_frac": clamped.sum(dim=(0, 2)).double() / rows.sum(dim=(0, 2)).clamp(min=1).double(),
+            "self_weight": torch.where(n_self > 0, (beta_ii * self_rows).sum(dim=(0, 2)) / n_self.clamp(min=1),
+                                       nan),
+            "self_argmax_frac": torch.where(
+                n_self > 0, ((beta_ii >= row_max) & self_rows).sum(dim=(0, 2)).double() / n_self.clamp(min=1),
+                nan),
+        }
+
     def _belief_spectrum(self, snapshot: DiagnosticSnapshot, layer_index: int) -> dict:
         r"""Spectrum statistics of layer ``layer_index``'s converged belief covariance."""
         from vfe3 import metrics
@@ -1700,11 +1739,21 @@ class VFEModel(nn.Module):
         ``relational_score_klmax_frac_layer_max`` and its ``_argmax_layer`` (the first layer attaining it),
         ``relational_projected_cov_max_condition_layer_max`` and ``belief_cond_median_layer_max``. The last
         layer's values are read from ``last``; the other layers are evaluated with the same helpers.
+
+        Per-head router saturation (round 2, item 9; :meth:`_router_head_statistics` at every layer and
+        head): ``relational_score_klmax_frac_head_max``, ``relational_clamped_row_frac_head_max`` and
+        ``relational_self_weight_head_max`` / ``relational_self_argmax_frac_head_max`` are maxima over
+        (layer, head), with the first (layer, head) attaining the clamped-row and the self-weight maxima in
+        ``relational_clamped_row_frac_argmax_{layer,head}`` and ``relational_self_lock_argmax_{layer,head}``.
+        A pooled head average hides one dead head of several, and under ``row_min`` a capped entry marks a
+        concentrated row rather than a uniform one, so the reference decides which of these signals a dead
+        router (``vfe3.train._warn_dead_router``).
         """
         from vfe3.posthoc.klcap import causal_support
         n_layers = self.cfg.n_layers
         frac, condition, median = [], [], []
-        for layer_index in range(n_layers - 1):
+        heads: Dict[str, List[torch.Tensor]] = {}
+        for layer_index in range(n_layers):
             cap = self._layer_capture(snapshot, layer_index)
             beta, score = cap["beta_pre"], cap["score_energy_pre"]
             minimal_agent = getattr(self.relational_operators_by_layer[layer_index],
@@ -1712,17 +1761,42 @@ class VFEModel(nn.Module):
             if beta.dim() == 3:
                 beta, score = beta.unsqueeze(1), score.unsqueeze(1)
             support = causal_support(beta, snapshot.log_prior)                 # (B, H, N, N) bool
-            frac.append(self._klmax_frac(score, support, math.inf if minimal_agent else self.cfg.kl_max))
+            cap_level = math.inf if minimal_agent else self.cfg.kl_max
+            for key, value in self._router_head_statistics(score, beta, support, cap_level).items():
+                heads.setdefault(key, []).append(value)                        # per layer (H,)
+            if layer_index == n_layers - 1:
+                break
+            frac.append(self._klmax_frac(score, support, cap_level))
             condition.append(self._projected_cov_extremes(cap)[1])
             median.append(float(self._belief_spectrum(snapshot, layer_index)["condition"].median()))
         frac.append(last["relational_score_klmax_frac"])
         condition.append(last["relational_projected_cov_max_condition"])
         median.append(last["belief_cond_median"])
         top = max(range(n_layers), key=lambda layer: (frac[layer], -layer))
+
+        def head_max(key: str) -> Tuple[float, float, float]:
+            r"""Maximum over (layer, head) and the first (layer, head) attaining it; NaN if all NaN."""
+            table = torch.nn.utils.rnn.pad_sequence(heads[key], batch_first=True,
+                                                    padding_value=float("nan")).cpu()   # (L, H_max)
+            if not bool(torch.isfinite(table).any()):
+                return float("nan"), float("nan"), float("nan")
+            flat = int(torch.nan_to_num(table, nan=float("-inf")).reshape(-1).argmax())
+            return float(table.reshape(-1)[flat]), float(flat // table.shape[1]), float(flat % table.shape[1])
+
+        clamped, clamped_layer, clamped_head = head_max("clamped_row_frac")
+        self_weight, self_layer, self_head = head_max("self_weight")
         return {"relational_score_klmax_frac_layer_max": frac[top],
                 "relational_score_klmax_frac_argmax_layer": float(top),
                 "relational_projected_cov_max_condition_layer_max": max(condition),
-                "belief_cond_median_layer_max": max(median)}
+                "belief_cond_median_layer_max": max(median),
+                "relational_score_klmax_frac_head_max": head_max("klmax_frac")[0],
+                "relational_clamped_row_frac_head_max": clamped,
+                "relational_clamped_row_frac_argmax_layer": clamped_layer,
+                "relational_clamped_row_frac_argmax_head": clamped_head,
+                "relational_self_weight_head_max": self_weight,
+                "relational_self_argmax_frac_head_max": head_max("self_argmax_frac")[0],
+                "relational_self_lock_argmax_layer": self_layer,
+                "relational_self_lock_argmax_head": self_head}
 
     def _relational_diagnostics(self, snapshot: DiagnosticSnapshot, layer_index: int = -1) -> dict:
         """Report the actual relational router and fixed-context cost; legacy global-F fields are unavailable."""

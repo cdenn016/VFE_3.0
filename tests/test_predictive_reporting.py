@@ -91,7 +91,7 @@ def test_predictive_report_emits_state_figures_and_finite_readout_panels(tmp_pat
     assert "gauge_equivariance.png" in names
     fig = figures.plot_per_layer_diagnostics(model.diagnostics_per_layer(tokens))
     assert all(any(torch.isfinite(torch.as_tensor(line.get_ydata())).any() for line in ax.lines)
-               for ax in fig.axes)
+               for ax in fig.axes if ax.axison)                      # an odd panel count leaves one cell off
     assert not any("Free-energy budget" in ax.get_title() for ax in fig.axes)
     figures.plt.close(fig)
 

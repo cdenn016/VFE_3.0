@@ -321,6 +321,10 @@ GAUGE_TYINGS: Tuple[str, ...] = ("per_head", "shared")
 # admissible only for the diagonal-scaling subgroup. `check_admissible` verifies this list executably,
 # and `test_admissibility_verifier` pins declaration against verifier for every registered pair.
 _GAUSSIAN_INVARIANT_FAMILIES = ("gaussian_full",)
+# Groups whose every element is block-diagonal over ``irrep_dims`` (one block per head or irrep, any tying)
+# also preserve the head-block family: g (+)_h Sigma_hh g^T = (+)_h g_h Sigma_hh g_h^T, and its divergence is
+# the full Gaussian's on block-diagonal arguments (audit 2026-10-09 round 2, #10).
+_HEAD_BLOCK_INVARIANT_FAMILIES = _GAUSSIAN_INVARIANT_FAMILIES + ("gaussian_block",)
 
 
 def register_group(
@@ -394,7 +398,7 @@ def get_group(name: str) -> Callable[..., GaugeGroup]:
 @register_group(
     "block_glk",
     pullback_capability="pullback_per_block",
-    invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
+    invariant_families=_HEAD_BLOCK_INVARIANT_FAMILIES,
     traits=GroupTraits(tyings=GAUGE_TYINGS),
 )
 def _build_block_glk(
@@ -509,9 +513,12 @@ def check_admissible(
     gen = torch.Generator(device=dev).manual_seed(seed)
     eye = torch.eye(K, device=dev, dtype=dt)
 
+    # A head-block family reads a full second moment through its head partition, which is the group's.
+    readout = ({"head_dims": list(group.irrep_dims)} if getattr(fam, "head_block_covariance", False) else {})
+
     def _div(mu_q, S_q, mu_p, S_p):
         # The family's own readout of the full second moment; kl_max high so no clamp masks invariance.
-        return fn(fam.from_covariance(mu_q, S_q), fam.from_covariance(mu_p, S_p),
+        return fn(fam.from_covariance(mu_q, S_q, **readout), fam.from_covariance(mu_p, S_p, **readout),
                   alpha=alpha, kl_max=1e12)
 
     for _ in range(n_samples):
@@ -537,7 +544,7 @@ def check_admissible(
 @register_group(
     "so_n",
     pullback_capability="pullback_per_block",
-    invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
+    invariant_families=_HEAD_BLOCK_INVARIANT_FAMILIES,
     # RoPE's coordinate-pair rotation is generally not in the irrep image rho(SO(N)).
     traits=GroupTraits(algebra="so", tyings=GAUGE_TYINGS, native_tying="shared",
                        contains_pair_rotations=False),
@@ -682,7 +689,7 @@ def _build_block_local(
 @register_group(
     "block_so",
     pullback_capability="pullback_per_block",
-    invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
+    invariant_families=_HEAD_BLOCK_INVARIANT_FAMILIES,
     traits=GroupTraits(min_head_dim=2),
 )
 def _build_block_so(
@@ -710,7 +717,7 @@ def _build_block_so(
 @register_group(
     "block_co",
     pullback_capability="pullback_per_block",
-    invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
+    invariant_families=_HEAD_BLOCK_INVARIANT_FAMILIES,
     traits=GroupTraits(),
 )
 def _build_block_co(
@@ -738,7 +745,7 @@ def _build_block_co(
 @register_group(
     "block_glmc",
     pullback_capability="pullback_per_block",
-    invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
+    invariant_families=_HEAD_BLOCK_INVARIANT_FAMILIES,
     traits=GroupTraits(min_head_dim=2, head_dim_multiple=2),
 )
 def _build_block_glmc(

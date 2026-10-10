@@ -134,25 +134,28 @@ def vfe_block(
     if getattr(cfg, "block_coordinates", "local") == "reference":
         return _reference_coordinate_block(
             out, block_norm=block_norm, block_mlp=block_mlp, frame=relational_frame,
-            capture=capture, hidden_bias=hidden_bias)
-    norm_jacobian = None
+            capture=capture, hidden_bias=hidden_bias,
+            readout=lambda pushed: _head_block_readout(pushed, out.sigma, group, cfg))
+    norm_linearization = None
     if block_norm is not None:               # cached parameter-free norm (audit 2d/4f)
         if getattr(block_mlp, "covariance_contract", None) == "delta_full":
             # The norm maps the mean only; the delta_full pushforward composes its Jacobian at the pre-norm
-            # mean, J = J_mlp J_LN, against the pre-norm covariance (audit 2026-10-09, variational).
-            from vfe3.model.block_mlp import block_norm_jacobian
-            norm_jacobian = block_norm_jacobian(block_norm, out.mu)        # (B, N, K, K)
+            # mean, J = J_mlp J_LN, against the pre-norm covariance (audit 2026-10-09, variational), with the
+            # floor in post-norm units through the norm's scale D = diag(gamma)/s (round 2, #13).
+            from vfe3.model.block_mlp import block_norm_linearization
+            norm_linearization = block_norm_linearization(block_norm, out.mu)   # (B, N, K, K), (B, N, K)
         out = out._replace(mu=block_norm(out.mu, out.sigma))   # _replace preserves phi/reflection
     if capture is not None:
         capture["block_mlp_input"] = out     # exact immediate seam after CG/norm
     if block_mlp is not None:                # default-off residual moment transform, after norm before handoff
         if hasattr(block_mlp, "forward_moments"):
             extra = {} if hidden_bias is None else {"hidden_bias": hidden_bias}
-            if norm_jacobian is not None:
-                extra["input_jacobian"] = norm_jacobian
+            if norm_linearization is not None:
+                extra["input_jacobian"] = norm_linearization.jacobian
+                extra["input_scale"] = norm_linearization.scale
             result = block_mlp.forward_moments(
                 out.mu, out.sigma, frame_context=block_mlp_frame, **extra)
-            out = out._replace(mu=result.mu, sigma=result.sigma)
+            out = out._replace(mu=result.mu, sigma=_head_block_readout(result.sigma, out.sigma, group, cfg))
         else:                                # legacy callable compatibility: coordinate mean only
             if hidden_bias is not None:
                 raise TypeError("a legacy block-MLP callable cannot take hidden_bias")
@@ -166,6 +169,29 @@ def vfe_block(
     return out
 
 
+def _head_block_readout(
+    pushed: torch.Tensor,                     # (B, N, K, K) covariance returned by the block MLP
+    sigma:  torch.Tensor,                     # its input covariance
+    group:  GaugeGroup,
+    cfg:    VFE3Config,
+) -> torch.Tensor:
+    r"""The family's readout of a covariance the block MLP produced.
+
+    For a head-block family (``gaussian_block``) a new covariance :math:`\Sigma'` (``delta_full`` or the
+    prototype ``posterior``) is read through :func:`vfe3.families.gaussian.head_block_projection`,
+    :math:`\bigoplus_h\Sigma'_{hh}`, the exact M-projection :math:`\arg\min_q\mathrm{KL}(\mathcal N(\mu,\Sigma')\|q)` onto
+    the family over the heads ``group.irrep_dims``. Its head blocks are principal submatrices of an SPD matrix, so
+    they stay SPD. A passthrough covariance (the same object) and every other family return ``pushed`` unchanged.
+    """
+    if pushed is sigma or pushed.dim() != sigma.dim() or pushed.dim() < 2 or pushed.shape[-1] != pushed.shape[-2]:
+        return pushed
+    from vfe3.families.base import get_family
+    if not get_family(cfg.family).head_block_covariance:
+        return pushed
+    from vfe3.families.gaussian import head_block_projection
+    return head_block_projection(pushed, group.irrep_dims)
+
+
 def _reference_coordinate_block(
     out:         BeliefState,                              # post-attention belief, local coordinates
     *,
@@ -174,6 +200,7 @@ def _reference_coordinate_block(
     frame:       Optional[CanonicalFrameContext],          # realized U_i: (B, N, K, K) or (B, N, G, d, d)
     capture:     Optional[MStepCapture],
     hidden_bias: Optional[torch.Tensor],                   # (B, N, w) or None
+    readout:     Callable[[torch.Tensor], torch.Tensor] = lambda pushed: pushed,   # the family's covariance readout
 ) -> BeliefState:
     r"""Norm and MLP in reference coordinates, one conjugation per block (``block_coordinates='reference'``).
 
@@ -222,8 +249,8 @@ def _reference_coordinate_block(
             result = block_mlp.forward_moments(xi, c, **extra)
             xi = result.mu                                                   # passthrough: covariance kept
             if prototype and block_mlp.covariance_contract == "posterior":
-                sigma = local_covariance(out.mu, result.sigma, frame,         # Sigma^+ = U C^+ U^T
-                                         diagonal=out.sigma.dim() == out.mu.dim()).to(out.sigma.dtype)
+                sigma = readout(local_covariance(out.mu, result.sigma, frame,  # Sigma^+ = U C^+ U^T
+                                                 diagonal=out.sigma.dim() == out.mu.dim()).to(out.sigma.dtype))
         else:
             if hidden_bias is not None:
                 raise TypeError("a legacy block-MLP callable cannot take hidden_bias")
