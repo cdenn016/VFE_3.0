@@ -433,6 +433,7 @@ DECISION_COMPARATOR: str = "Per-type read table, ALiBi (as run)"
 DECISION_FROZEN: str = "Frames frozen at their random initialization"
 DECISION_CAPACITY: str = "Identity frames, per-type additive table of equal size"
 DECISION_AMENDMENT_DATE: str = "October 9, 2026"
+DECISION_NO_CAPACITY_VERDICT: str = "undetermined (no capacity control on this base)"
 DECISION_EVALUATED_PREFIX: str = "Evaluated"
 DECISION_SPEC = r"\begin{tabular}{lccccc}"
 DECISION_HEADER = r"Clause & Pairs & Mean paired difference & Paired SE & Margin & Verdict \\"
@@ -475,8 +476,9 @@ def decision_rule(manifest: Manifest) -> Dict[str, Any]:
     result): the capacity control (identity frames with a trainable per-type additive table of equal
     size) must exceed the evaluated arm's test CE by more than its own margin, strictly as in (a). When
     the manifest marks the capacity arm inapplicable to the base, clause (c) is ``n/a`` (``inapplicable``
-    holds the reason) and does not enter the verdict; inapplicability never excuses (a) or (b). The
-    claim is retracted if any applicable clause fails, stands if every applicable clause holds, and is
+    holds the reason); inapplicability never excuses (a) or (b), and (a) and (b) alone cannot make the
+    claim stand: where both hold the verdict is :data:`DECISION_NO_CAPACITY_VERDICT`. The
+    claim is retracted if any applicable clause fails, stands if every clause holds, and is
     undetermined otherwise (a clause lacking two paired seeds, flagged, or absent from the manifest).
     Arm labels come from ``manifest.decision`` (keys ``evaluated``, ``comparator``, ``frozen``,
     ``capacity``, each falling back to its constant); the evaluated arm defaults to the first label
@@ -528,6 +530,10 @@ def decision_rule(manifest: Manifest) -> Dict[str, Any]:
     held = [c["holds"] for c in out["clauses"].values() if not c.get("inapplicable")]
     out["verdict"] = ("retracted" if any(h is False for h in held)
                       else "stands" if held and all(h is True for h in held) else "undetermined")
+    # Clauses (a) and (b) alone are not severe against per-type covariance storage (audit 2026-10-09 round 2
+    # item 27): without the capacity control the claim cannot stand, only be retracted or stay undetermined.
+    if out["verdict"] == "stands" and out["clauses"]["c"].get("inapplicable"):
+        out["verdict"] = DECISION_NO_CAPACITY_VERDICT
     return out
 
 
@@ -574,8 +580,8 @@ def decision_rule_table(manifest: Manifest) -> Tuple[str, str, Dict[str, Any]]:
              f"on n - 1 degrees of freedom are reported beside it and do not enter the verdict. Evaluated "
              f"arm: {record['labels']['evaluated']!r}; comparator: {record['labels']['comparator']!r}; "
              f"capacity control: {record['labels']['capacity']!r}. Clause (c) is the amendment of "
-             f"{DECISION_AMENDMENT_DATE}, registered before any arm result; an inapplicable clause (c) "
-             f"does not enter the verdict."]
+             f"{DECISION_AMENDMENT_DATE}, registered before any arm result; without an applicable "
+             f"clause (c) the claim can be retracted but not stand."]
     for clause, c in record["clauses"].items():
         if c.get("inapplicable"):
             lines.append(f"Clause ({clause}) not applicable: {c['inapplicable']}.")
@@ -1000,10 +1006,15 @@ def _evaluation_items(run: RunRecord, rule: str) -> List[Item]:
     for prefix, label in (("test_", "test"), ("final_val_", "validation")):
         scored, expected = s.get(f"{prefix}scored_targets"), s.get(f"{prefix}expected_targets")
         excluded = s.get(f"{prefix}excluded_targets")
+        overlap, padding = s.get(f"{prefix}overlap_context_targets"), s.get(f"{prefix}padding_targets")
+        # Excluded positions are overlap context and final-window padding; split them where the run records both.
+        split = (f"{overlap:,} overlapping-context and {padding:,} padding positions excluded"
+                 if isinstance(overlap, int) and isinstance(padding, int)
+                 else f"{excluded:,} excluded positions" if isinstance(excluded, int) else "")
         if isinstance(scored, int):
             items.append((f"{label} scored targets", f"{scored:,}"
-                          + (f" of {expected:,} window positions ({excluded:,} overlapping positions "
-                             f"excluded)" if isinstance(expected, int) and isinstance(excluded, int) else "")))
+                          + (f" of {expected:,} window positions ({split})"
+                             if isinstance(expected, int) and isinstance(excluded, int) else "")))
         else:
             items.append((f"{label} scored targets", NOT_RECORDED))
     items.append(("training-split sample", _train_sample_cap_text()))

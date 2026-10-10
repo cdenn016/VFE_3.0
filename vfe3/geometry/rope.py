@@ -93,7 +93,7 @@ def build_rope_rotation(
     if not 0.0 < fraction <= 1.0:
         raise ValueError(f"rope fraction must be in (0, 1], got {fraction!r}")
     for d in irrep_dims:
-        n_pairs = int(fraction * d // 2)                           # rotated pairs (all of them at p = 1)
+        n_pairs = rope_rotated_pairs(d, fraction)                  # rotated pairs (all of them at p = 1)
         if d >= 2 and n_pairs == 0:
             raise ValueError(f"rope fraction {fraction} rotates no pair of a block of size {d}")
         for k in range(n_pairs):
@@ -105,3 +105,52 @@ def build_rope_rotation(
             R[:, b, a] = s;  R[:, b, b] = c
         start += d
     return R
+
+
+def rope_rotated_pairs(d: int, fraction: float) -> int:
+    r"""Number of rotated coordinate pairs of a block of size ``d`` under p-RoPE fraction p: floor(p d / 2).
+
+    Pairs (2k, 2k+1) with k below this count rotate; the remaining coordinates (the slower pairs and an odd
+    block's last coordinate) are position-free.
+    """
+    return int(fraction * d // 2)
+
+
+def rope_commutant_projection(
+    G:       torch.Tensor,             # (..., r, r) symmetric comparison covariance
+    n_pairs: int,                      # rotated pairs of the block, rope_rotated_pairs(r, fraction)
+) -> torch.Tensor:                     # (..., r, r) P(G), commuting with every R(theta) of the block
+    r"""Project a covariance onto the commutant of the RoPE torus of one comparison block.
+
+    The rotations of :func:`build_rope_rotation` on a block of size r act on the planes
+    :math:`p = (2k, 2k+1)`, :math:`k < m` = ``n_pairs``, and leave the remaining coordinates (index set 0)
+    fixed. Averaging over the torus :math:`T^m` with an independent angle per plane gives the
+    Frobenius-orthogonal projection onto the commutant,
+
+    .. math::
+        P(G) = \int_{T^m} R(\theta) G R(\theta)^T d\theta
+             = \bigoplus_{p} \tfrac12 (G_{2k,2k} + G_{2k+1,2k+1}) I_2 \oplus G_{00},
+
+    one isotropic variance per rotating plane, the full non-rotating block :math:`G_{00}` (the identity acts there,
+    so every matrix on it commutes), and zero cross-covariance between distinct planes and between a plane and the
+    non-rotating coordinates (the plane average of :math:`R_p(\theta_p)` vanishes). Then
+    :math:`R P(G) R^T = P(G)` for every torus element, in particular for every positional rotation
+    :math:`R_i`. P(G) is SPD when G is (an average of congruences of G).
+
+    The torus commutant is the commutant of the realized rotations when the plane frequencies
+    :math:`\mathrm{base}^{-2k/r}` are distinct, which holds for every base other than 1. At base 1 every plane
+    shares one frequency and the realized commutant is larger; P(G) still commutes with every :math:`R_i`.
+    Built without in-place writes, so autograd reads it directly; a bitwise-symmetric G gives a
+    bitwise-symmetric P(G).
+    """
+    r = G.shape[-1]
+    m = 2 * n_pairs
+    if not 0 <= m <= r:
+        raise ValueError(f"n_pairs={n_pairs} does not fit a block of size {r}")
+    diagonal = torch.diagonal(G, dim1=-2, dim2=-1)                                       # (..., r)
+    plane = diagonal[..., :m].reshape(*diagonal.shape[:-1], n_pairs, 2).mean(-1)         # (..., m/2)
+    isotropic = torch.cat((plane.repeat_interleave(2, dim=-1),
+                           torch.zeros_like(diagonal[..., m:])), dim=-1)                 # (..., r)
+    fixed = torch.zeros(r, r, dtype=torch.bool, device=G.device)
+    fixed[m:, m:] = True                                                                 # non-rotating block
+    return torch.diag_embed(isotropic) + G * fixed                                       # (..., r, r)

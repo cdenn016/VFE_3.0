@@ -14,8 +14,10 @@ the projected moments of Eq. (eq:projected_qk_moments) are
 and the model's routing logit is :math:`\ell_{ij} = B_{ij} - \bar D_{ij}/\tau_h` with the attention
 log-prior :math:`B_{ij}` (``-inf`` off the causal support :math:`\mathcal S_i`), the temperature
 :math:`\tau_h = \kappa_h\sqrt{d_h}`, the Gaussian KL :math:`D_{ij}` of Eq. (eq:projected_full_kl) and
-the capped cost :math:`\bar D_{ij} = \min(\max(D_{ij}, 0), \kappa)` (``safe_kl_clamp``, non-finite
-costs set to :math:`\kappa` = ``kl_max``). Everything is recomputed in float64 from the exact inputs the
+the capped cost :math:`\bar D_{ij} = \min(\max(D_{ij} - m_i, 0), \kappa)` (``safe_kl_clamp`` through
+:func:`vfe3.gradients.relational.clamped_routing_cost`, non-finite costs set to :math:`\kappa` = ``kl_max``),
+whose reference :math:`m_i` is the layer's ``kl_max_reference``: :math:`m_i = 0` under ``'absolute'``, the
+row minimum of :math:`D_{ij}` over the admissible sources under ``'row_min'``. Everything is recomputed in float64 from the exact inputs the
 model hands to :func:`vfe3.relational_scoring.projected_moments`, intercepted during an ordinary
 forward (no model code is changed).
 
@@ -41,7 +43,9 @@ The first four and the prior are the terms the manuscript names. The *precision*
 source-dependent part of the quadratic :math:`\delta_{ij}^\top P_j\delta_{ij}` beyond its pooled
 whitened form (it vanishes, like the source dependence of the trace and log-det terms, under the
 shared-covariance hypothesis :math:`V_{K,j} = V_*` of Proposition prop:projected_dot_product); *cap*
-is zero wherever :math:`0 \le D_{ij} \le \kappa`; the *row constant* cancels in the softmax. The
+is :math:`-(\bar D_{ij} + m_i - D_{ij})/\tau`, zero wherever :math:`0 \le D_{ij} - m_i \le \kappa`; the *row
+constant* cancels in the softmax. Under ``'row_min'`` the components sum to the model logit plus the row
+constant :math:`m_i/\tau`, so the logit check compares them modulo a row constant. The
 decomposition is verified per batch against :func:`~vfe3.relational_scoring.projected_gaussian_kl`
 in float64 and against the model's captured costs and routing weights (``checks``).
 
@@ -205,10 +209,10 @@ def _record_routing_inputs() -> Iterator[List[Dict[str, Any]]]:
     active: List[Dict[str, Any]] = []
 
     def moments(mu_h: torch.Tensor, Sigma_h: torch.Tensor, inverse_blocks: torch.Tensor,
-                S: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                S: torch.Tensor, *, head_dims: Optional[Tuple[int, ...]] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         if active:
             active[-1]["moments"].append(tuple(x.detach() for x in (mu_h, Sigma_h, inverse_blocks, S)))
-        return original_moments(mu_h, Sigma_h, inverse_blocks, S)
+        return original_moments(mu_h, Sigma_h, inverse_blocks, S, head_dims=head_dims)
 
     def score(*args: Any, **kwargs: Any) -> torch.Tensor:
         record: Dict[str, Any] = {"moments": []}
@@ -302,15 +306,19 @@ def logit_components(
     log_prior: Optional[torch.Tensor],       # broadcastable to (B, H, N, N); -inf off the support
     tau:       torch.Tensor,                 # (H,) temperatures
     kl_max:    float,
-) -> Dict[str, torch.Tensor]:                # each (B, H, N, N) float64, plus "D", "whitened_key_sq"
+
+    kl_max_reference: str = "absolute",      # the layer's clamp reference ('absolute' | 'row_min')
+) -> Dict[str, torch.Tensor]:                # each (B, H, N, N) float64, plus "D", "reference", "whitened_key_sq"
     r"""The eight components of :math:`\ell_{ij}` (module docstring), the uncapped :math:`D_{ij}`
-    they imply, and :math:`\|\mathsf k_j\|^2` (B, H, N).
+    they imply, the clamp reference :math:`m_i` (``reference``, (B, H, N, 1)) and
+    :math:`\|\mathsf k_j\|^2` (B, H, N).
 
     Every pair term is a batched matrix product: :math:`\operatorname{Tr}(P_jV_{Q,i}) =
     \operatorname{vec}(V_{Q,i})\cdot\operatorname{vec}(P_j)` and :math:`\delta_{ij}^\top\Delta_j\delta_{ij}
     = \operatorname{vec}(a_ia_i^\top)\cdot\operatorname{vec}(\Delta_j) - 2a_i^\top\Delta_jb_j + b_j^\top\Delta_jb_j`.
     """
-    from vfe3.families.base import safe_kl_clamp
+    from types import SimpleNamespace
+    from vfe3.gradients.relational import clamped_routing_cost
 
     aq, ak = a_q.double().movedim(-2, -3), a_k.double().movedim(-2, -3)     # (B, H, N, r)
     Vq, Vk = V_q.double().movedim(-3, -4), V_k.double().movedim(-3, -4)     # (B, H, N, r, r)
@@ -340,12 +348,20 @@ def logit_components(
         "row":       (0.5 * (r + logdet_q - q.square().sum(-1)) / t[..., 0]).unsqueeze(-1).expand(B, H, N, N),
     }
     D = -t * sum(comps[c] for c in ("cross", "key_norm", "trace", "logdet", "precision", "row"))
-    D_bar = safe_kl_clamp(D, kl_max=kl_max)
-    comps["cap"] = -(D_bar - D) / t
     prior = (torch.zeros((), dtype=torch.float64, device=aq.device) if log_prior is None
              else log_prior.double().to(aq.device))
+    # The model's clamp, reference included (the router's own helper); m_i is the row constant it subtracts.
+    D_bar = clamped_routing_cost(D, SimpleNamespace(kl_max_reference=kl_max_reference), kl_max=kl_max,
+                                 log_prior=prior if prior.dim() else None)          # (B, H, N, N)
+    reference = torch.zeros_like(D[..., :1])                                     # (B, H, N, 1) m_i
+    if kl_max_reference == "row_min":
+        admissible = torch.isfinite(D) & (torch.isfinite(prior) if prior.dim() else True)
+        reference = D.masked_fill(~admissible, math.inf).amin(dim=-1, keepdim=True)
+        reference = torch.where(torch.isfinite(reference), reference, torch.zeros_like(reference))
+    comps["cap"] = -(D_bar + reference - D) / t
     comps["prior"] = prior.expand(B, H, N, N) if prior.dim() else torch.zeros_like(D)
     comps["D"] = D
+    comps["reference"] = reference
     comps["whitened_key_sq"] = k_sq
     return comps
 
@@ -565,6 +581,7 @@ def routing_decomposition(
     cfg = model.cfg
     L = int(cfg.n_layers)
     kl_max = float(cfg.kl_max)
+    references = _kl_max_references(model)                                     # per layer
     n_batches = math.ceil(indices.size / batch_size)
 
     # Pass 1: pooled projected key covariance V_* and layer-input covariance Sigma-bar.
@@ -627,7 +644,8 @@ def routing_decomposition(
                 support = _support(log_prior, beta_model)                            # (B, H, N, N)
                 row_mask = valid[:, None, :] & (support.sum(-1) >= 2)                # (B, H, N)
                 entries = support & row_mask.unsqueeze(-1)                           # (B, H, N, N)
-                comps = logit_components(a_q, V_q, a_k, V_k, W, V_inv, log_prior, tau, kl_max)
+                comps = logit_components(a_q, V_q, a_k, V_k, W, V_inv, log_prior, tau, kl_max,
+                                         kl_max_reference=references[layer])
                 logits = sum(comps[c] for c in COMPONENTS)                           # (B, H, N, N)
                 acc.covariances(comps, entries)
                 rows = routing_bound_rows(comps["cross"] + comps["prior"], comps["key_norm"], support,
@@ -640,12 +658,17 @@ def routing_decomposition(
                 model_cost = record["cost"].double()
                 model_logit = (-capture["score_energy_pre"].double() / t
                                + (zero if log_prior is None else log_prior.double()))
-                uncapped = entries & (model_cost <= kl_max) & (model_cost >= 0)
+                gap = model_cost - comps["reference"]                                 # D_ij - m_i
+                uncapped = entries & (gap <= kl_max) & (gap >= 0)
+                logit_error = torch.where(entries, logits - model_logit, zero)       # (B, H, N, N)
+                if references[layer] == "row_min":                                   # modulo the row constant
+                    logit_error = torch.where(entries, logit_error - logit_error.sum(-1, keepdim=True)
+                                              / entries.sum(-1, keepdim=True).clamp_min(1), zero)
                 for name, error in (
                         ("identity_max_rel_error", torch.where(entries, (comps["D"] - D_ref).abs()
                                                                 / D_ref.abs().clamp_min(1.0), zero)),
                         ("model_cost_max_abs_error", torch.where(uncapped, (comps["D"] - model_cost).abs(), zero)),
-                        ("model_logit_max_abs_error", torch.where(entries, (logits - model_logit).abs(), zero)),
+                        ("model_logit_max_abs_error", logit_error.abs()),
                         ("model_beta_max_abs_error", torch.where(
                             row_mask.unsqueeze(-1),
                             (torch.softmax(torch.where(support, logits, neg_inf), dim=-1) - beta_model).abs(),
@@ -677,6 +700,13 @@ def routing_decomposition(
         return _skipped(str(error))
 
     return _assemble(model, accs, whiteners, pooled, tau, coverage, indices, batch_size, device)
+
+
+def _kl_max_references(model: torch.nn.Module) -> List[str]:
+    r"""Each layer's routing clamp reference (``RelationalOperators.kl_max_reference``, else the config field)."""
+    default = getattr(model.cfg, "routing_kl_max_reference", "absolute")
+    layers = getattr(model, "relational_operators_by_layer", None) or [None] * int(model.cfg.n_layers)
+    return [str(getattr(ops, "kl_max_reference", default)) for ops in layers]
 
 
 def _assemble(
@@ -779,6 +809,7 @@ def _assemble(
             "input_width": int(pooled[0]["sigma_shape"][1]),
             "covariance": "diagonal" if len(pooled[0]["sigma_shape"]) == 2 else "full",
             "tau": [float(x) for x in tau.cpu()], "kl_max": float(cfg.kl_max),
+            "kl_max_reference": (lambda refs: refs[0] if len(set(refs)) == 1 else refs)(_kl_max_references(model)),
             "attention_prior": getattr(cfg, "beta_attention_prior", None),
             "input_scope": "full",
             "predictive_covariance": getattr(cfg, "predictive_covariance", None),
@@ -837,7 +868,8 @@ def routing_table(result: Mapping[str, Any]) -> str:
         f"{cov['entries_per_layer_head']:,} causal entries per layer and head "
         f"({cov['rows_total']:,} rows, {cov['entries_total']:,} entries over all {setup['n_layers']} layers x "
         f"{setup['n_heads']} heads), {cov['sources']:,} pooled sources per layer and head. Rank r = {setup['rank']}, "
-        f"tau = {', '.join(f'{t:.4g}' for t in sorted(set(setup['tau'])))}, kl_max = {setup['kl_max']:g}, "
+        f"tau = {', '.join(f'{t:.4g}' for t in sorted(set(setup['tau'])))}, kl_max = {setup['kl_max']:g} "
+        f"(reference {setup.get('kl_max_reference', 'absolute')}), "
         f"{setup['covariance']} layer-input covariance, analysis in float64 (model {setup['model_dtype']}).",
         f"Row sample for distributions: at most {result['sampling']['rows_per_layer_head_max']} rows per layer and "
         f"head, seed {result['sampling']['seed']}.",

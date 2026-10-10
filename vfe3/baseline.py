@@ -124,7 +124,7 @@ _INT_FIELDS: Tuple[str, ...] = (
 _FLOAT_FIELDS: Tuple[str, ...] = (
     "lr", "weight_decay", "adam_beta1", "adam_beta2", "adam_eps", "min_lr", "min_lr_frac",
     "init_std", "layernorm_eps", "alibi_slope", "rope_base", "rope_fraction", "unigram_kappa",
-    "per_type_table_init_scale",
+    "per_type_table_init_scale", "hidden_lr_scale",
 )
 _OPTIONAL_FLOAT_FIELDS: Tuple[str, ...] = ("grad_clip", "per_type_table_lr", "per_type_table_weight_decay")
 _BOOL_FIELDS: Tuple[str, ...] = (
@@ -176,6 +176,9 @@ class BaselineConfig:
     adam_beta1:            float         = 0.9
     adam_beta2:            float         = 0.95
     adam_eps:              float         = 1e-8
+    # Multiplier of lr on the hidden matrices W_{Q,K,V,O}, W_{1,2} only (muP-style width transfer, Yang et al.
+    # 2022, arXiv:2203.03466; total_parameter_width sets K_base / K). 1.0 keeps one decay group.
+    hidden_lr_scale:       float         = 1.0
     min_lr:                float         = 0.0         # retired 2026-10-02: only 0 (kept for saved configs)
     min_lr_frac:           float         = 0.01
     grad_clip:             Optional[float] = 1.0
@@ -268,6 +271,8 @@ class BaselineConfig:
             raise ValueError(f"grad_accum_steps={self.grad_accum_steps} must divide batch_size={self.batch_size}")
         if self.lr <= 0.0:
             raise ValueError(f"lr must be positive, got {self.lr}")
+        if self.hidden_lr_scale <= 0.0:
+            raise ValueError(f"hidden_lr_scale must be positive, got {self.hidden_lr_scale}")
         if self.weight_decay < 0.0 or not 0.0 <= self.min_lr_frac <= 1.0:
             raise ValueError("weight_decay must be >= 0 and min_lr_frac in [0, 1]")
         if self.min_lr != 0.0:
@@ -427,7 +432,11 @@ class BaselineConfig:
         fields absent from an older mapping take the current ``VFE3Config`` defaults. The base must
         use the current full-width projected attention architecture, whose comparison and content
         maps have the same :math:`4K^2` parameters per layer as dense attention. Historical mappings
-        with head-scoped interfaces require explicit architecture migration.
+        with head-scoped interfaces require explicit architecture migration. A base with
+        ``tie_comparison_maps=True`` (:math:`K^2` fewer comparison parameters per layer) or
+        ``prior_covariance_table='block_cholesky'`` (another per-type table count) is refused. A base with
+        ``learn_attention_temperature=True`` is accepted: its :math:`HL` routing log-temperatures are
+        context-processing parameters the matched arm does not have (``paper_arms`` notes the count).
         """
         values = _vfe_base_values(base)
         for field in ("relational_input_scope", "relational_output_scope"):
@@ -446,6 +455,18 @@ class BaselineConfig:
                              "parameters that dense attention does not have")
         if not values["use_block_mlp"]:
             raise ValueError("matched_to: the base has no block MLP, while the matched arm always builds one")
+        # Audit 2026-10-09 round 2 item 19: the tie drops the key comparison map (K^2 per layer fewer
+        # context-processing parameters than dense attention) and the frame-free table replaces the
+        # (V, K) log-variance and V K d frame tables by (V, H, d(d+1)/2) Cholesky entries, so either one
+        # breaks the parameter equivalence the matched arm rests on.
+        if values.get("tie_comparison_maps"):
+            raise ValueError("matched_to: tie_comparison_maps=True shares S_K = S_Q, so the base has K^2 fewer "
+                             "comparison parameters per layer than dense attention (W_Q, W_K); the matched "
+                             "context-processing count does not hold")
+        if values.get("prior_covariance_table", "diagonal") != "diagonal":
+            raise ValueError(f"matched_to: prior_covariance_table={values['prior_covariance_table']!r} changes the "
+                             "per-type table count (no frame table; head-block Cholesky entries instead of "
+                             "diagonal log variances), which the matched per-type read map is sized against")
         # The per-type map is V*K*d, the frame-table size of untied block_glk only (F81).
         if per_type_table != "none" and (values["gauge_group"] != "block_glk"
                                          or values["gauge_tying"] not in (None, "per_head")):
@@ -1090,18 +1111,24 @@ def build_optimizer(
     The read-map table :math:`X` has its own group (``per_type_table_lr``, ``per_type_table_weight_decay``,
     decaying :math:`A` toward :math:`I`) with role ``"phi"``: like the VFE frame table it replaces, it
     gets its own clip budget and the ``lr_phi`` / ``grad_norm_phi`` columns. Every trainable parameter
-    must land in exactly one group.
+    must land in exactly one group. With ``hidden_lr_scale`` :math:`s \ne 1` the hidden matrices
+    (:math:`W_{Q,K,V,O}`, :math:`W_{1,2}`) form a fourth group at :math:`s \cdot` ``lr`` with the same decay
+    and role (the muP Adam rule for hidden weights, Yang et al. 2022, arXiv:2203.03466, Table 3); :math:`E`
+    and :math:`W_{\rm out}` keep ``lr``. At :math:`s = 1` the groups are the three above.
     """
     decay: List[nn.Parameter] = []
+    hidden: List[nn.Parameter] = []
     no_decay: List[nn.Parameter] = []
     table: List[nn.Parameter] = []
+    split_hidden = cfg.hidden_lr_scale != 1.0
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
         if _canonical(name) == "type_table":
             table.append(parameter)
         elif parameter.dim() >= 2:
-            decay.append(parameter)
+            is_hidden = _canonical(name).startswith("blocks.")
+            (hidden if split_hidden and is_hidden else decay).append(parameter)
         else:
             no_decay.append(parameter)
     groups: List[Dict[str, Any]] = [
@@ -1109,6 +1136,9 @@ def build_optimizer(
          "lr_report_role": "mu"},
         {"params": no_decay, "lr": cfg.lr, "weight_decay": 0.0, "role": "mu"},
     ]
+    if hidden:
+        groups.append({"params": hidden, "lr": cfg.lr * cfg.hidden_lr_scale, "weight_decay": cfg.weight_decay,
+                       "role": "mu"})
     if table:
         groups.append({
             "params": table,
@@ -1244,8 +1274,15 @@ def total_parameter_width(
     with :math:`n_{\rm LN} = 4` under pre-LN (0 under ``post_shared``), :math:`b = 1` with a decoder
     bias and :math:`t = 1` with a per-type read map, is strictly increasing in :math:`K`. The chosen
     width minimizes :math:`|P(K) - P^\star|`, the smaller width on a tie, so the rule is deterministic.
-    Returns the chosen config, ``width``, ``head_dim``, ``total_parameters``, ``target_total`` and
-    ``relative_error`` :math:`= (P(K) - P^\star) / P^\star`.
+
+    The learning rate, initialization and warmup are the base width's and were not tuned at the chosen
+    width. As a declared difference the hidden-matrix learning rate is transferred muP-style (Yang et al.
+    2022, arXiv:2203.03466): ``hidden_lr_scale`` becomes :math:`s_0 K_0 / K` with :math:`K_0` and
+    :math:`s_0` the base's width and scale, so Adam updates of :math:`W_{Q,K,V,O}` and :math:`W_{1,2}`
+    keep their base-width effect on the hidden features; the embedding, decoder, initialization and
+    warmup are not transferred.
+    Returns the chosen config, ``width``, ``head_dim``, ``total_parameters``, ``target_total``,
+    ``relative_error`` :math:`= (P(K) - P^\star) / P^\star` and ``hidden_lr_scale``.
     """
     if type(target_total) is not int or target_total < 1:
         raise ValueError(f"target_total must be a positive int, got {target_total!r}")
@@ -1257,9 +1294,11 @@ def total_parameter_width(
         m += 1
     candidates = [base.with_width(k * d, head_dim=d) for k in ((m - 1, m) if m > 1 else (m,))]
     chosen = min(candidates, key=lambda cfg: (abs(cfg.total_parameters() - target_total), cfg.embed_dim))
+    chosen = replace(chosen, hidden_lr_scale=base.hidden_lr_scale * base.embed_dim / chosen.embed_dim)
     total = chosen.total_parameters()
     return {"config": chosen, "width": chosen.embed_dim, "head_dim": d, "total_parameters": total,
-            "target_total": target_total, "relative_error": (total - target_total) / target_total}
+            "target_total": target_total, "relative_error": (total - target_total) / target_total,
+            "hidden_lr_scale": chosen.hidden_lr_scale}
 
 
 def calibrated_tokens_per_s(

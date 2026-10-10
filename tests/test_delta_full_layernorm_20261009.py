@@ -23,7 +23,8 @@ from tests.profiles import test_config
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.geometry.norms import AffineLayerNorm, LayerNorm, MahalanobisNorm
 from vfe3.model.block_mlp import (
-    BlockMLP, CanonicalFrameBlockMLP, GaugeGateBlockMLP, block_norm_jacobian, layernorm_jacobian,
+    BlockMLP, CanonicalFrameBlockMLP, GaugeGateBlockMLP, block_norm_jacobian, block_norm_linearization,
+    layernorm_jacobian,
 )
 from vfe3.model.model import VFEModel
 
@@ -50,6 +51,14 @@ def _fd_jacobian(fn, u: torch.Tensor, h: float = 1e-6) -> torch.Tensor:
 def _spd(batch: tuple, generator: torch.Generator) -> torch.Tensor:
     A = torch.randn(*batch, K, K, generator=generator, dtype=torch.float64)
     return A @ A.transpose(-1, -2) + 0.5 * torch.eye(K, dtype=torch.float64)
+
+
+def _post_norm_floor(norm, u: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+    r"""The floor :math:`fD\Sigma D`, :math:`D = \operatorname{diag}(\gamma)/s` (audit 2026-10-09 round 2, #13), written out."""
+    s = ((u - u.mean(-1, keepdim=True)).square().mean(-1, keepdim=True) + norm.eps).sqrt()   # (..., 1)
+    d = (getattr(norm, "weight", None) if getattr(norm, "weight", None) is not None
+         else torch.ones(u.shape[-1], dtype=u.dtype)) / s                                    # (..., K)
+    return FLOOR * d.unsqueeze(-1) * sigma * d.unsqueeze(-2)
 
 
 def _affine_norm(generator: torch.Generator) -> AffineLayerNorm:
@@ -111,14 +120,15 @@ def test_composite_pushforward_matches_finite_differences(mode: str) -> None:
     mlp, kwargs = _composite_case(mode, g)
     u = 1.5 * torch.randn(2, 3, K, generator=g, dtype=torch.float64)
     sigma = _spd((2, 3), g)
-    J_ln = block_norm_jacobian(norm, u)
-    result = mlp.forward_moments(norm(u, sigma), sigma, input_jacobian=J_ln, **kwargs)
+    J_ln, scale = block_norm_linearization(norm, u)
+    assert torch.equal(J_ln, block_norm_jacobian(norm, u))
+    result = mlp.forward_moments(norm(u, sigma), sigma, input_jacobian=J_ln, input_scale=scale, **kwargs)
 
     def composite(x: torch.Tensor) -> torch.Tensor:
         return mlp.forward_moments(norm(x, sigma), sigma, **kwargs).mu
 
     J_fd = _fd_jacobian(composite, u)
-    expected = J_fd @ sigma @ J_fd.transpose(-1, -2) + FLOOR * sigma
+    expected = J_fd @ sigma @ J_fd.transpose(-1, -2) + _post_norm_floor(norm, u, sigma)
     assert (result.jacobian - J_fd).abs().max() < 1e-7
     assert (result.sigma - expected).abs().max() / expected.abs().max() < 1e-8
     # Omitting the norm Jacobian (the pre-fix behavior) is a different covariance on this input.
@@ -130,7 +140,13 @@ def test_passthrough_contract_refuses_an_input_jacobian() -> None:
     mlp = BlockMLP(K, 2, "gelu", 0.0).double()
     u = torch.zeros(1, K, dtype=torch.float64)
     with pytest.raises(ValueError, match="delta_full"):
-        mlp.forward_moments(u, torch.ones(1, K, dtype=torch.float64), input_jacobian=torch.eye(K, dtype=torch.float64))
+        mlp.forward_moments(u, torch.ones(1, K, dtype=torch.float64), input_jacobian=torch.eye(K, dtype=torch.float64),
+                            input_scale=torch.ones(1, K, dtype=torch.float64))
+    # The Jacobian and its scale come together: a norm Jacobian without the post-norm floor scale is refused.
+    full = BlockMLP(K, 2, "gelu", 0.0, covariance_contract="delta_full").double()
+    with pytest.raises(ValueError, match="input_scale"):
+        full.forward_moments(u, torch.eye(K, dtype=torch.float64).expand(1, K, K),
+                             input_jacobian=torch.eye(K, dtype=torch.float64).expand(1, K, K))
 
 
 def _model_cfg(**over: object):
@@ -170,7 +186,7 @@ def test_executed_block_applies_the_composite_pushforward() -> None:
         return mlp(model.block_norm(x, sigma))
 
     J_fd = _fd_jacobian(composite, mu)
-    expected = J_fd @ sigma @ J_fd.transpose(-1, -2) + FLOOR * sigma
+    expected = J_fd @ sigma @ J_fd.transpose(-1, -2) + _post_norm_floor(model.block_norm, mu, sigma)
     got = capture["block_mlp_output"].sigma
     assert (got - expected).abs().max() / expected.abs().max() < 1e-8
 

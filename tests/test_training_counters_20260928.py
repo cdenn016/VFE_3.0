@@ -366,9 +366,11 @@ def test_frame_projection_counts_survive_resume(tmp_path: Path) -> None:
            n_steps=3)
     checkpoint = tmp_path / "first" / "checkpoints" / "step_3.pt"
     carried = torch.load(checkpoint, weights_only=True)["numerics_counters"]
-    assert carried == {"frame_projection_count": first.numerics_counters["frame_projection_count"],
-                       "frame_projection_total": 3 * _phi_rows(first_model),
-                       "frame_projection_since_step": 0}
+    frame_keys = ("frame_projection_count", "frame_projection_total", "frame_projection_since_step")
+    assert {key: carried[key] for key in frame_keys} == {
+        "frame_projection_count": first.numerics_counters["frame_projection_count"],
+        "frame_projection_total": 3 * _phi_rows(first_model),
+        "frame_projection_since_step": 0}
 
     resumed_model = _model(cfg, seed=99)
     resumed = ra.RunArtifacts(tmp_path / "resumed", cfg, resumed_model)

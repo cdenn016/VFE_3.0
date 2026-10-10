@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 # model_state keys of the tables the accessors read
 MU_KEY = "prior_bank.mu_embed"
 SIGMA_LOG_KEY = "prior_bank.sigma_log_embed"
+SIGMA_CHOL_KEY = "prior_bank.sigma_chol_embed"          # prior_covariance_table='block_cholesky' (V, H, d(d+1)/2)
 PHI_KEY = "prior_bank.phi_embed"
 DECODE_MU_KEY = "prior_bank.decode_mu_embed"
 DECODE_SIGMA_LOG_KEY = "prior_bank.decode_sigma_log_embed"
@@ -238,10 +239,17 @@ class SemanticRun:
         variance for Gaussian families and the scale $b$ for Laplace (variance $2b^2$). The
         family hook ``covariance_diagonal`` maps it to $\operatorname{diag}\Sigma_v$; a full family
         reads the diagonal of the (exactly diagonal) promoted prior ``diag_embed``.
+
+        Under ``prior_covariance_table='block_cholesky'`` (no ``sigma_log_embed``) it is
+        $\log\operatorname{diag}C_v$ of the per-head blocks that
+        :func:`vfe3.model.prior_bank.packed_cholesky_covariance` builds from ``sigma_chol_embed``
+        (audit 2026-10-09 round 2, item 33).
         """
         from vfe3.families.base import get_family
         from vfe3.numerics import bounded_variance_from_log
 
+        if SIGMA_LOG_KEY not in self.state:
+            return self._block_cholesky_log_var(ids)
         family = get_family(self.cfg.family)
         s = self._rows(SIGMA_LOG_KEY, ids)                                  # (n, K)
         dispersion = bounded_variance_from_log(s, eps=self.cfg.eps)         # (n, K)
@@ -252,6 +260,23 @@ class SemanticRun:
             variance = torch.cat(parts, dim=0) if parts else dispersion
         else:
             variance = family.covariance_diagonal(dispersion, eps=self.cfg.eps)   # (n, K)
+        return torch.log(variance).numpy()
+
+    def _block_cholesky_log_var(self, ids: Sequence[int]) -> np.ndarray:
+        r"""(n, K) $\log\operatorname{diag}C_v$ of the ``block_cholesky`` prior blocks, in row chunks."""
+        from vfe3.model.prior_bank import packed_cholesky_covariance
+
+        if SIGMA_CHOL_KEY not in self.state:
+            raise KeyError(f"checkpoint {self.checkpoint_path} has neither {SIGMA_LOG_KEY!r} nor {SIGMA_CHOL_KEY!r}: "
+                           "the prior log-variance is not applicable to this run")
+        packed = self._rows(SIGMA_CHOL_KEY, ids)                            # (n, H, d(d+1)/2)
+        n, H = int(packed.shape[0]), int(packed.shape[1])
+        d = self.K // H
+        chunk = max(1, _BLOCK_EMBED_BUDGET // (self.K * d))                  # rows per (c, H, d, d) chunk
+        parts = [packed_cholesky_covariance(packed[i:i + chunk], d, eps=self.cfg.eps)
+                 .diagonal(dim1=-2, dim2=-1).reshape(-1, self.K)              # (c, K) diag C_v
+                 for i in range(0, n, chunk)]
+        variance = torch.cat(parts, dim=0) if parts else packed.new_zeros(0, self.K)
         return torch.log(variance).numpy()
 
     def phi(self, ids: Sequence[int]) -> np.ndarray:
@@ -492,7 +517,9 @@ def load_semantic_run(
         notes.append("checkpoint carries no selection_data_identity (legacy bundle): the dataset "
                      "name comes from config.json and no token stream can be identity-checked")
 
-    for key in (MU_KEY, SIGMA_LOG_KEY, PHI_KEY):
+    # The prior covariance table is read only where it is needed (log_var, decode_log_var): a
+    # block_cholesky run stores sigma_chol_embed instead of sigma_log_embed (audit 2026-10-09 round 2, item 33).
+    for key in (MU_KEY, PHI_KEY):
         if key not in state:
             raise KeyError(f"{checkpoint_path} model_state lacks {key!r}")
     V, K = (int(n) for n in state[MU_KEY].shape)

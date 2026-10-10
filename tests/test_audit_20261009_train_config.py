@@ -78,7 +78,15 @@ def test_projected_gradient_honors_the_routing_clamp_reference(reference: str) -
         assert grad is None or float(grad.abs().max()) == 0.0
         torch.testing.assert_close(context.beta, torch.full_like(context.beta, 1 / 3))
     else:
-        assert grad is not None and float(grad.abs().max()) > 0.0
+        # Every non-argmin gap exceeds the cap here, so each row routes by its cost order with the constant
+        # weights softmax(-(0, kl_max, kl_max)/tau): not uniform, and (with the row minimum differentiated,
+        # audit 2026-10-09 round 2) exactly flat in the maps. A cap above some gaps leaves the router live.
+        assert not torch.allclose(context.beta, torch.full_like(context.beta, 1 / 3))
+        assert grad is None or float(grad.abs().max()) == 0.0
+        ops.zero_grad()
+        context = build_full_link_context(mu, sigma, mu + .2, sigma * 1.2, frame, ops, kl_max=1.0, value=.4)
+        (context.beta * weight).sum().backward()
+        assert float(ops.raw_score_q.grad.abs().max()) > 0.0
 
 
 def test_projected_gradient_marks_routing_kl_max_reference_live() -> None:
@@ -102,7 +110,9 @@ def test_tiny_run_publishes_source_recoveries_and_warns_once_per_dead_router_lay
 
     def with_router_cap(self: VFEModel, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         out = dict(real_diagnostics(self, *args, **kwargs))
-        out.update(relational_score_klmax_frac_layer_max=0.9, relational_score_klmax_frac_argmax_layer=1)
+        out.update(relational_score_klmax_frac_layer_max=0.9, relational_score_klmax_frac_argmax_layer=1,
+                   relational_clamped_row_frac_head_max=0.9, relational_clamped_row_frac_argmax_layer=1,
+                   relational_clamped_row_frac_argmax_head=0)
         return out
 
     monkeypatch.setattr(VFEModel, "diagnostics", with_router_cap)
@@ -116,7 +126,7 @@ def test_tiny_run_publishes_source_recoveries_and_warns_once_per_dead_router_lay
     assert len(rows) == cfg.max_steps
     assert all(row["source_recovery_elements"] == "0" for row in rows)
     assert all(float(row["relational_score_klmax_frac_layer_max"]) == 0.9 for row in rows)
-    warnings_seen = [r.getMessage() for r in caplog.records if "router layer 1" in r.getMessage()]
+    warnings_seen = [r.getMessage() for r in caplog.records if "router layer 1 head 0" in r.getMessage()]
     assert len(warnings_seen) == 1
 
 
@@ -125,14 +135,15 @@ def test_dead_router_warning_reads_its_keys_defensively(caplog: pytest.LogCaptur
     warned: set = set()
     with caplog.at_level(logging.WARNING, logger="dead-router-unit"):
         T._warn_dead_router({}, warned, logger)                                        # keys absent
-        T._warn_dead_router({"relational_score_klmax_frac_layer_max": 0.5}, warned, logger)   # not above
-        T._warn_dead_router({"relational_score_klmax_frac_layer_max": float("nan")}, warned, logger)
+        T._warn_dead_router({"relational_clamped_row_frac_head_max": 0.5}, warned, logger)    # not above
+        T._warn_dead_router({"relational_clamped_row_frac_head_max": float("nan")}, warned, logger)
         for layer in (0, 0, 2):
-            T._warn_dead_router({"relational_score_klmax_frac_layer_max": torch.tensor(0.75),
-                                 "relational_score_klmax_frac_argmax_layer": layer}, warned, logger)
-    assert warned == {0, 2}
+            T._warn_dead_router({"relational_clamped_row_frac_head_max": torch.tensor(0.75),
+                                 "relational_clamped_row_frac_argmax_layer": layer,
+                                 "relational_clamped_row_frac_argmax_head": 1}, warned, logger)
+    assert warned == {("clamped", 0, 1), ("clamped", 2, 1)}
     assert [r.getMessage().split(":")[0].strip() for r in caplog.records] == [
-        "router layer 0", "router layer 2"]
+        "router layer 0 head 1", "router layer 2 head 1"]
 
 
 def test_evaluate_splits_ignored_targets_into_overlap_context_and_padding() -> None:

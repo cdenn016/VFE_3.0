@@ -291,9 +291,8 @@ def test_diagonal_and_full_family_paths_do_not_enable_the_block_update() -> None
     (dict(gauge_tying="shared"), "gauge_tying"),
     (dict(decode_mode="family_chunked"), "decode_mode"),
     (dict(decode_mode="expected_likelihood_chunked"), "decode_mode"),
-    (dict(block_mlp_covariance="delta_full", block_coordinates="local", norm_type_block="none"),
-     "block_mlp_covariance"),
-    (dict(block_mlp_mode="prototype_agents", block_mlp_covariance="posterior"), "block_mlp_covariance"),
+    (dict(block_mlp_mode="prototype_agents", block_mlp_covariance="posterior", block_mlp_inference="exact"),
+     "block_mlp_inference"),
 ])
 def test_configuration_refuses_routes_outside_the_exact_scope(over: dict, match: str) -> None:
     with pytest.raises(ValueError, match=match):
@@ -303,5 +302,9 @@ def test_configuration_refuses_routes_outside_the_exact_scope(over: dict, match:
 def test_configuration_admits_the_supported_routes() -> None:
     for over in (dict(), dict(decode_mode="diagonal_chunked"), dict(decode_mode="linear"),
                  dict(predictive_covariance="passthrough"), dict(block_coordinates="local", decode_coordinates="local"),
-                 dict(relational_routing="noisy_query"), dict(block_mlp_mode="gaussian_template")):
+                 dict(relational_routing="noisy_query"), dict(block_mlp_mode="gaussian_template"),
+                 # head-block projected covariances (audit 2026-10-09 round 2, #11)
+                 dict(block_mlp_covariance="delta_full", block_coordinates="local", norm_type_block="none"),
+                 dict(block_mlp_covariance="delta_full", block_coordinates="local"),
+                 dict(block_mlp_mode="prototype_agents", block_mlp_covariance="posterior")):
         assert _cfg(**over).family == "gaussian_block"

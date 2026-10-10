@@ -78,7 +78,8 @@ HEADLINE_SAMPLE: str = "occurrence"
 
 def gap_applicability(model: torch.nn.Module) -> Optional[str]:
     r"""``None`` when the realized-frame routing covariance is defined for ``model``, else the reason."""
-    if not hasattr(model.prior_bank, "sigma_log_embed"):
+    # prior_covariance_table='block_cholesky' registers sigma_log_embed as None (audit 2026-10-09 round 2, item 33).
+    if getattr(model.prior_bank, "sigma_log_embed", None) is None:
         return "the prior bank has no stored log-variance table"
     if any(getattr(op, "mixed_heads", False) for op in getattr(model, "relational_operators_by_layer", ()) or ()):
         return "heads of different sizes (a mixed so_n irrep tower) are not supported by this analysis yet"
@@ -380,7 +381,7 @@ def hidden_temperature(
         return {"status": "not_applicable",
                 "reason": _MEAN_DISTANCE_REASON + "; it has no Mahalanobis term for Sigma -> c Sigma to rescale"}
     pb = model.prior_bank
-    if not hasattr(pb, "sigma_log_embed"):
+    if getattr(pb, "sigma_log_embed", None) is None:                         # None under block_cholesky
         return {"status": "not_applicable", "reason": "the prior bank has no stored log-variance table"}
     sigma_init = getattr(model.cfg, "sigma_init", None)
     if sigma_init is None or not float(sigma_init) > 0:

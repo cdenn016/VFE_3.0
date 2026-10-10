@@ -64,11 +64,13 @@ def _learned_frame_model(**over: Any) -> VFEModel:
     return model
 
 
-def _pack(C: torch.Tensor) -> torch.Tensor:                 # (..., d, d) SPD -> (..., d(d+1)/2) log-diag Cholesky
-    L = torch.linalg.cholesky(C)
+def _pack(C: torch.Tensor, eps: float) -> torch.Tensor:    # (..., d, d) SPD -> (..., d(d+1)/2) packed (l, N)
+    r"""Inverse of the table map: :math:`C - \epsilon I = LL^\top`, :math:`L = \operatorname{diag}(e^{\ell/2})(I + N)`."""
+    L = torch.linalg.cholesky(C - eps * torch.eye(D, dtype=C.dtype))
+    scale = torch.diagonal(L, dim1=-2, dim2=-1)                              # (..., d) e^{l/2}
+    unit = L / scale.unsqueeze(-1)                                          # I + N
     rows, cols = torch.tril_indices(D, D)
-    entries = L[..., rows, cols]
-    return torch.where(rows == cols, torch.log(entries), entries)
+    return torch.where(rows == cols, 2.0 * torch.log(scale)[..., rows], unit[..., rows, cols])
 
 
 def _convert(learned: VFEModel, **over: Any) -> VFEModel:
@@ -90,7 +92,8 @@ def _convert(learned: VFEModel, **over: Any) -> VFEModel:
         assert set(missing) == {"prior_bank.sigma_chol_embed", "prior_bank.mu_embed", "prior_bank.phi_embed"}
         assert not unexpected
         free.prior_bank.mu_embed.copy_(xi)
-        free.prior_bank.sigma_chol_embed.copy_(_pack(C))
+        # The learned arm's variances are max(e^s, eps) = e^s here; the table adds eps I, so C - eps I is packed.
+        free.prior_bank.sigma_chol_embed.copy_(_pack(C, free.prior_bank.eps))
         assert bool((free.prior_bank.phi_embed == 0).all())
     return free
 
@@ -136,7 +139,8 @@ def test_table_parameterization_initialization_and_gradients() -> None:
     assert pb.sigma_log_embed is None and "prior_bank.sigma_log_embed" not in model.state_dict()
     assert pb.sigma_chol_embed.shape == (V, H, D * (D + 1) // 2)
     blocks = pb._prior_covariance_blocks()
-    assert torch.allclose(blocks, 2.5 * torch.eye(D, dtype=DT).expand(V, H, D, D), rtol=0, atol=1e-6)   # float32 init
+    expected = (2.5 + pb.eps) * torch.eye(D, dtype=DT).expand(V, H, D, D)  # L = sqrt(sigma_init) I, plus eps I
+    assert torch.allclose(blocks, expected, rtol=0, atol=1e-6)               # float32 init
     # The untied decode bank starts where the diagonal table would have started.
     assert torch.allclose(pb.decode_sigma_log_embed, torch.full((V, K), torch.log(torch.tensor(2.5)).item(),
                                                                 dtype=DT), rtol=0, atol=1e-6)
@@ -146,13 +150,14 @@ def test_table_parameterization_initialization_and_gradients() -> None:
     C = pb._prior_covariance_blocks()
     assert bool((torch.linalg.eigvalsh(C) > 0).all())
     # Packed entries round-trip through the Cholesky factor.
-    assert torch.allclose(_pack(C), pb.sigma_chol_embed, rtol=0, atol=1e-10)
+    assert torch.allclose(_pack(C, pb.eps), pb.sigma_chol_embed, rtol=0, atol=1e-8)
     encoded = pb.encode(torch.tensor([[1, 4]])).sigma                        # (1, 2, K, K) head-block diagonal
     assert torch.equal(encoded[0, 1, :D, :D], C[4, 0]) and torch.equal(encoded[0, 1, D:, D:], C[4, 1])
     assert bool((encoded[0, 1, :D, D:] == 0).all())
     # Gradient check of the table map in float64.
     packed = pb.sigma_chol_embed[:2].detach().clone().requires_grad_(True)
-    assert torch.autograd.gradcheck(lambda x: packed_cholesky_covariance(x, D), (packed,), eps=1e-6, atol=1e-7)
+    assert torch.autograd.gradcheck(lambda x: packed_cholesky_covariance(x, D, eps=pb.eps), (packed,),
+                                    eps=1e-6, atol=1e-7)
 
 
 def test_optimizer_trains_the_table_and_parameter_counts() -> None:

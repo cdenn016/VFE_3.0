@@ -171,13 +171,15 @@ class VFE3Config:
     # The belief covariance structure (read diagonal_covariance, never a second flag).
     #   gaussian_block  one SPD d_head x d_head block per head, stored in the dense (K, K) layout. only:
     #                   projected_predictive, predictive_readout="kernel", block_glk per_head, content_link_edges
-    #                   "off", decode_mode "linear" | "diagonal_chunked" | "full_chunked", a passthrough block MLP
+    #                   "off", decode_mode "linear" | "diagonal_chunked" | "full_chunked"; a block MLP covariance
+    #                   is read through its head-block projection (posterior needs block_mlp_inference="mean_field")
     family:                           str             = "gaussian_diagonal"
 
     # "diagonal" | "block_cholesky"
     #   diagonal        per-type log variances (V, K)
-    #   block_cholesky  frame-free per-type head blocks C_v = L_v L_v^T, (V, H, d(d+1)/2) log-diagonal Cholesky
-    #                   entries; with mu_embed as xi_v it is the learned-frame reference arm without frames.
+    #   block_cholesky  frame-free per-type head blocks C_v = L_v L_v^T + eps I, L_v = diag(exp(l_v/2))(I + N_v),
+    #                   stored (V, H, d(d+1)/2): l_v (log-variance units) on the diagonal slots, N_v below;
+    #                   with mu_embed as xi_v it is the learned-frame reference arm without frames.
     #                   only: family "gaussian_block" | "gaussian_full", gauge_transport="off", block_glk,
     #                   projected_predictive, content_link_edges="off", untie_decode_bank=True or a linear decode
     prior_covariance_table:           str             = "diagonal"
@@ -337,6 +339,14 @@ class VFE3Config:
     #               routing cost depends on positions only through i - j (kernel readout: routing only;
     #               minimal_agent: the record channel R_{j-i}, routing and content by exact conditioning)
     rope_space:                       str             = "frame"
+    # "full" | "rotation_invariant"
+    # rope_space="comparison" with the kernel readout only: the comparison covariance the router scores.
+    #   full                R_i G R_i^T (as run): the trace and log-det terms of every non-self pair grow with the
+    #                       anisotropy of G, which can self-lock a head (audit 2026-10-09 round 2, addendum)
+    #   rotation_invariant  G projected onto the commutant of the RoPE torus (one isotropic variance per rotating
+    #                       plane, the full non-rotating block, no cross-covariance), so R_i P(G) R_i^T = P(G) and
+    #                       only the mean term carries i - j; scored on the Gram route (no source-root factor route)
+    rope_comparison_covariance:       str             = "full"
     
     ##################################################
     #   8. Attention routing
@@ -350,7 +360,7 @@ class VFE3Config:
     # Temperature scale: tau_h = kappa_beta * sqrt(d_h); a list (one per head) gives per-head temperatures.
     # Not read by predictive_readout="minimal_agent".
     kappa_beta:                 'float | List[float]' = 1.0
-    # Learn the routing temperature per layer and head: tau_{l,h} = kappa_h sqrt(d_h) exp(clamp(delta_{l,h}, -3, 3))
+    # Learn the routing temperature per layer and head: tau_{l,h} = kappa_h sqrt(d_h) exp(3 tanh(delta_{l,h} / 3))
     # with delta = 0 at init (routing_log_temperature, (H,) per layer; no weight decay, score learning rate).
     # The KL cost is invariant under (S_Q, S_K) -> (A S_Q, A S_K), so no map can set the sharpness. Cools only
     # below the kl_max cap: a fully capped absolute-reference row stays uniform. Not with minimal_agent.
@@ -649,6 +659,10 @@ class VFE3Config:
     #   absolute  D_ij; a row whose every admissible cost exceeds kl_max routes uniformly with zero gradient
     #   row_min   D_ij - min_{j admissible} D_ij; beta is the exact softmax wherever no gap exceeds kl_max
     routing_kl_max_reference:         str             = "absolute"
+    # None | tolerance in nats (suggested 1e-3): Gaussian-KL kernel router only. A (batch, head) slice whose
+    # a-priori error estimate of the centered pair-KL GEMM exceeds it is rescored by the direct-difference
+    # tiles (audit 2026-10-09 round 2 #7). Opt-in: about +45% step time on the K=128 base.
+    pair_kl_gemm_tol:                 Optional[float] = None
     sigma_max:                        Optional[float] = 100.0        # variance ceiling; None = none
     transport_chart_max_norm:         float           = 50.0         # fail-closed ||M||_F radius of every transport exponential
 
@@ -1111,9 +1125,15 @@ class VFE3Config:
             if self.decode_mode not in ("linear", "diagonal_chunked", "full_chunked"):
                 block_problems.append(f"decode_mode={self.decode_mode!r} (requires 'linear', 'diagonal_chunked' "
                                       "or 'full_chunked')")
-            if self.use_block_mlp and self.block_mlp_covariance != "passthrough":
-                block_problems.append(f"block_mlp_covariance={self.block_mlp_covariance!r} (requires "
-                                      "'passthrough': the block MLP must not leave the head-block family)")
+            # delta_full is read through the head-block M-projection of J Sigma J^T + floor
+            # (vfe3.model.block._head_block_readout); the mean-field prototype posterior
+            # P = (C^-1 + diag D)^-1 of a block-diagonal C is block-diagonal itself; the exact posterior's
+            # between-template spread is dense, so it would leave the family.
+            if (self.use_block_mlp and self.block_mlp_covariance == "posterior"
+                    and self.block_mlp_inference != "mean_field"):
+                block_problems.append(f"block_mlp_covariance='posterior' with block_mlp_inference="
+                                      f"{self.block_mlp_inference!r} (requires 'mean_field': the exact posterior's "
+                                      "between-template spread leaves the head-block family)")
             if self.use_cg_coupling:
                 block_problems.append("use_cg_coupling=True")
             if block_problems:
@@ -1344,6 +1364,12 @@ class VFE3Config:
             if problems:
                 raise ValueError("rope_space='comparison' rotates the projected routing moments after the learned "
                                  "maps; got " + "; ".join(problems))
+        _require(self.rope_comparison_covariance, ("full", "rotation_invariant"), "rope_comparison_covariance")
+        if (self.rope_comparison_covariance == "rotation_invariant" and self.pos_rotation == "rope"
+                and self.rope_space == "comparison" and self.predictive_readout == "minimal_agent"):
+            raise ValueError("rope_comparison_covariance='rotation_invariant' projects the kernel router's comparison "
+                             "covariance; predictive_readout='minimal_agent' applies the rotation as a record channel "
+                             "by exact conditioning and does not read it (use 'full')")
         if self.pos_rotation == "rope" and self.rope_space == "frame" and not _traits.contains_pair_rotations:
             import warnings
             warnings.warn(
@@ -1448,6 +1474,17 @@ class VFE3Config:
                                          or self.predictive_readout != "kernel"):
             raise ValueError("tie_comparison_maps=True requires attention_mode='projected_predictive' with "
                              f"predictive_readout='kernel' (got {self.attention_mode!r}, {self.predictive_readout!r})")
+        if self.tie_comparison_maps and not self.beta_attention_prior.endswith("_noself"):
+            import warnings
+            warnings.warn(
+                f"tie_comparison_maps=True with beta_attention_prior={self.beta_attention_prior!r}: the prior admits "
+                "the self key, and the tie makes D_ii = KL(q_i || q_i) = 0 every row's minimum, so "
+                "routing_kl_max_reference='row_min' coincides with the absolute clamp and routing can collapse onto "
+                "self (audit 2026-10-09 round 2). The self-masking priors 'causal_noself' and "
+                "'causal_alibi_noself' avoid this.",
+                UserWarning,
+                stacklevel=2,
+            )
         # decode_mode / encode_mode validated against the LIVE decode/encode REGISTRIES (not static
         # literals) so a newly registered kernel is config-selectable without editing this validator.
         from vfe3.model.prior_bank import _DECODERS, _ENCODERS
@@ -1542,6 +1579,10 @@ class VFE3Config:
         _require(self.norm_type_block, _valid_norms, "norm_type_block")
         _require(self.norm_type_final, _valid_norms, "norm_type_final")
         _require(self.routing_kl_max_reference, ("absolute", "row_min"), "routing_kl_max_reference")
+        if self.pair_kl_gemm_tol is not None and not (isinstance(self.pair_kl_gemm_tol, (int, float))
+                                                      and not isinstance(self.pair_kl_gemm_tol, bool)
+                                                      and self.pair_kl_gemm_tol > 0):
+            raise ValueError(f"pair_kl_gemm_tol must be None or a positive number, got {self.pair_kl_gemm_tol!r}")
         if not isinstance(self.block_mlp_post_norm, bool):
             raise ValueError(f"block_mlp_post_norm must be a bool, got {self.block_mlp_post_norm!r}")
         if self.block_mlp_post_norm and (self.block_coordinates != "local" or self.norm_type_block == "none"
@@ -1570,11 +1611,12 @@ class VFE3Config:
                 "block_mlp_covariance_floor must be a finite real value > 0, "
                 f"got {self.block_mlp_covariance_floor!r}"
             )
-        if self.use_block_mlp and self.block_mlp_covariance == "delta_full" and self.family != "gaussian_full":
+        if (self.use_block_mlp and self.block_mlp_covariance == "delta_full"
+                and self.family not in ("gaussian_full", "gaussian_block")):
             raise ValueError(
                 "block_mlp_covariance='delta_full' needs a full-covariance Gaussian family "
-                "(family='gaussian_full'): the dense J Sigma J^T cannot be represented by a "
-                f"diagonal/non-Gaussian family (got family={self.family!r})."
+                "(family='gaussian_full', or 'gaussian_block' through its head-block projection): the dense "
+                f"J Sigma J^T cannot be represented by a diagonal/non-Gaussian family (got family={self.family!r})."
             )
         # In local coordinates the block norm maps the mean only and passes Sigma through, so the
         # pushforward must compose the norm Jacobian, J = J_mlp J_norm (vfe3.model.block_mlp.
@@ -1594,13 +1636,14 @@ class VFE3Config:
         # The invariant Mahalanobis gate reads s_b = mu_b^T Sigma_bb^{-1} mu_b per irrep block. With a
         # passthrough covariance it is exact on the diagonal family (Sigma_bb = diag sigma_b gives
         # s_b = sum_k mu_k^2 / sigma_k), where it equals the full-family gate on diag_embed(sigma);
+        # gaussian_block stores its head blocks densely, so the full-layout gate reads them exactly;
         # other families are not admitted.
         if (self.use_block_mlp
                 and block_mlp_registration.gauge_class == "invariant_scalar_intertwiner"
-                and self.family not in ("gaussian_full", "gaussian_diagonal")):
+                and self.family not in ("gaussian_full", "gaussian_block", "gaussian_diagonal")):
             raise ValueError(
                 "block_mlp_mode='gauge_gate' needs a Gaussian family whose block covariance it can "
-                "invert exactly (family='gaussian_full', or 'gaussian_diagonal' with "
+                "invert exactly (family='gaussian_full' or 'gaussian_block', or 'gaussian_diagonal' with "
                 f"block_mlp_covariance='passthrough'); got family={self.family!r}."
             )
         if self.block_mlp_activation not in ("gelu", "silu", "relu"):
@@ -1859,6 +1902,11 @@ class VFE3Config:
         elif self.relational_routing == "noisy_query":
             mark(("projected_factor_route",),
                  "the noisy-query cost factors per-pair sums G_q + G_k and keeps the Gram route")
+        elif (self.pos_rotation == "rope" and self.rope_space == "comparison"
+              and self.rope_comparison_covariance == "rotation_invariant"):
+            mark(("projected_factor_route",),
+                 "rope_comparison_covariance='rotation_invariant' scores the commutant projection of the comparison "
+                 "covariance, which has no source root R_i S U_i^{-1} Sigma_i^{1/2}, so the Gram route factors it")
         if self.decode_mode != "linear" or self.amp_dtype is None:
             mark(("decode_logits_amp",), "only read by decode_mode='linear' with amp_dtype set")
         if self.fp32_matmul_precision == "highest" or self.amp_dtype == "fp16":
@@ -2006,8 +2054,16 @@ class VFE3Config:
             mark(("lambda_alpha",), "only read by lambda_alpha_mode='constant'")
         if self.pos_rotation == "none":
             mark(("rope_on_value", "rope_base", "rope_space", "rope_fraction"), "only read by pos_rotation='rope'")
+        if not (self.pos_rotation == "rope" and self.rope_space == "comparison"
+                and self.attention_mode == "projected_predictive" and self.predictive_readout == "kernel"
+                and self.relational_routing != "mean_distance"):
+            mark(("rope_comparison_covariance",),
+                 "only read by the kernel router's covariance under pos_rotation='rope' with rope_space='comparison'")
         if self.attention_mode == "projected_predictive" and self.predictive_readout != "kernel":
             mark(("routing_kl_max_reference",), "only read by the kernel router (minimal_agent applies no clamp)")
+        if not (self.attention_mode == "projected_predictive" and self.predictive_readout == "kernel"
+                and self.relational_routing == "gaussian_kl"):
+            mark(("pair_kl_gemm_tol",), "only read by the kernel router's Gaussian-KL cost")
         if self.pos_phi == "none":
             mark(("pos_phi_project_slk", "pos_phi_scale"), "only read by a non-'none' pos_phi")
         if (self.beta_attention_prior in ("windowed", "causal_windowed")
@@ -2088,7 +2144,10 @@ class VFE3Config:
             mark(("lambda_alpha_mode", "lambda_alpha", "b0", "c0"),
                  "the single gradient E-step iteration starts at q = p, where the self-coupling "
                  "force vanishes")
-        if (self.attention_mode == "projected_predictive" and self.family == "gaussian_full"
+        # gaussian_block on this route is the same diagonal lookup in the dense layout (audit 2026-10-09
+        # round 2, #20); the block_cholesky table stores a dense block per head, so it is excluded.
+        if (self.attention_mode == "projected_predictive" and self.family in ("gaussian_full", "gaussian_block")
+                and self.prior_covariance_table == "diagonal"
                 and self.encode_mode in ("per_token", "per_token_additive")
                 and self.predictive_covariance == "passthrough"
                 and self.block_coordinates == "local" and self.decode_coordinates == "local"

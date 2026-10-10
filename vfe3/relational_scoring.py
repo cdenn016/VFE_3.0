@@ -60,6 +60,30 @@ def reset_source_recovery_elements() -> None:
         count.zero_()
 
 
+# Suggested tolerance, in nats, for the opt-in GEMM fallback (``gemm_expansion_tol`` of
+# :func:`projected_gaussian_kl`, config ``pair_kl_gemm_tol``) on the a-priori forward-error estimate of
+# the centered pair-KL GEMM (:func:`_gemm_expansion_error`). A (batch, head) slice whose estimate exceeds
+# it is scored by the direct-difference tiles instead (audit 2026-10-09 #7). 1e-3 nats is a logit error of 1e-3 / tau:
+# below the bf16 resolution of a unit-scale logit (2^-8) and two orders under the routing gaps
+# that decide a softmax, while the direct tiles' own error on the audit sweep was 3e-6 to 8e-5.
+_GEMM_EXPANSION_TOL: float = 1e-3
+
+# Cumulative (batch, head) slices routed from the GEMM to the direct tiles. The verdict is already on
+# the host (it joins the scorer's single decision read), so a host integer suffices.
+_GEMM_FALLBACK_SLICES: int = 0
+
+
+def gemm_fallback_slices() -> int:
+    r"""(batch, head) slices whose pair KL took the direct tiles since the last reset."""
+    return _GEMM_FALLBACK_SLICES
+
+
+def reset_gemm_fallback_slices() -> None:
+    r"""Zero the GEMM fallback slice counter."""
+    global _GEMM_FALLBACK_SLICES
+    _GEMM_FALLBACK_SLICES = 0
+
+
 # Conditioning-triggered float64 source recovery (config ``projected_cov_condition_recovery``,
 # installed by VFEModel). Off, only entries whose zero-jitter float32 Cholesky FAILS are rebuilt
 # from source; entries that factor but fail the certificate eps_32 ||G||_F ||G^{-1}||_F <= tol
@@ -191,6 +215,9 @@ def projected_moments(
     Sigma_h:        torch.Tensor,  # (..., N, H, d) or (..., N, H, d, d)
     inverse_blocks: torch.Tensor,  # (..., N, H, d, d)
     S:              torch.Tensor,  # (H, r, d) or (R, H, r, d)
+
+    *,
+    head_dims:      Optional[Tuple[int, ...]] = None,  # caller-declared equal diagonal blocks of a full Sigma
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Return a_i = S U_i^{-1} mu_i and G_i = S U_i^{-1} Sigma_i U_i^{-T} S^T.
 
@@ -202,6 +229,11 @@ def projected_moments(
     A role-stacked ``S`` of shape ``(R, H, r, d)`` returns a leading ``R`` axis,
     ``(R, ..., N, H, r)`` and ``(R, ..., N, H, r, r)``, sharing one frame map and
     one covariance contraction across the roles.
+    ``head_dims`` is the caller's declaration that a full ``Sigma_h`` is block-diagonal with these equal
+    diagonal blocks (the ``gaussian_block`` family); the covariance contraction then reads only the
+    blocks (:func:`_head_block_covariance`) instead of multiplying the dense K x K matrix once per head
+    and role. The structure is declared, never inferred from values; ``None`` keeps the dense product,
+    and a diagonal ``Sigma_h`` ignores it. Source-root recovery still reads the dense covariance.
     Returns (..., N, H, r) and (..., N, H, r, r) for a single map.
     """
     if mu_h.ndim < 3 or S.ndim not in (3, 4):
@@ -221,6 +253,13 @@ def projected_moments(
     full = Sigma_h.shape == (*mu_h.shape, d)
     if not diagonal and not full:
         raise ValueError("covariance must match the mean as diagonal entries or full head matrices")
+    if head_dims is not None:
+        head_dims = tuple(head_dims)
+        if (not head_dims or any(type(m) is not int or m < 1 for m in head_dims)
+                or len(set(head_dims)) != 1 or sum(head_dims) != d):
+            raise ValueError(f"head_dims must be equal positive block sizes summing to {d}, got {head_dims!r}")
+        if diagonal:
+            head_dims = None
     dtype = _compute_dtype(mu_h, Sigma_h, inverse_blocks, S)
     tokens = mu_h.shape[-3]
     batch = torch.broadcast_shapes(mu_h.shape[:-3], inverse_blocks.shape[:-4])
@@ -239,27 +278,32 @@ def projected_moments(
                      else Sigma_h[..., start:start+step, :, :, :])
             args = (mu_h[..., start:start+step, :, :], sigma, inverse, S)
             if torch.is_grad_enabled() and any(x.requires_grad for x in args):
-                a, G = checkpoint(_projected_moments_tile, *args,
+                a, G = checkpoint(_projected_moments_tile, *args, head_dims,
                                   use_reentrant=False, preserve_rng_state=False)
             else:
-                a, G = _projected_moments_tile(*args)
+                a, G = _projected_moments_tile(*args, head_dims)
             means.append(a)
             covariances.append(G)
         return torch.cat(means, dim=-3), torch.cat(covariances, dim=-4)
-    return _projected_moments_tile(mu_h, Sigma_h, inverse_blocks, S)
+    return _projected_moments_tile(mu_h, Sigma_h, inverse_blocks, S, head_dims)
 
 
+@ieee_fp32_matmul()
 def _projected_moments_tile(
     mu_h:           torch.Tensor,
     Sigma_h:        torch.Tensor,
     inverse_blocks: torch.Tensor,
     S:              torch.Tensor,
+    head_dims:      Optional[Tuple[int, ...]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Compute a=L mu and G=L Sigma L^T for one token tile.
 
     ``S`` is ``(H, r, d)`` for one comparison map or ``(R, H, r, d)`` for a
     role-stacked pair; the stacked form returns a leading ``R`` axis and batches
     the covariance contraction across roles while keeping one frame map.
+    ``head_dims`` (validated by :func:`projected_moments`) routes a full covariance through
+    :func:`_head_block_covariance`. The tile is pinned to IEEE fp32 itself, so a checkpointed
+    recompute in backward runs under the same matmul policy as the forward (audit 2026-10-09 #15).
     """
     diagonal = Sigma_h.shape == mu_h.shape
     dtype = _compute_dtype(mu_h, Sigma_h, inverse_blocks, S)
@@ -272,6 +316,8 @@ def _projected_moments_tile(
             a = (L @ mu.unsqueeze(-1)).squeeze(-1)
             if diagonal:
                 G = (L * Sigma.unsqueeze(-2)) @ L.transpose(-1, -2)
+            elif head_dims is not None:
+                G = _head_block_covariance(L, Sigma, len(head_dims), S.ndim == 4)
             else:
                 G = L @ Sigma @ L.transpose(-1, -2)
         else:
@@ -282,12 +328,58 @@ def _projected_moments_tile(
             a = (L @ mu.unsqueeze(-1).unsqueeze(0)).squeeze(-1)  # (R, ..., N, H, r)
             if diagonal:
                 G = (L * Sigma.unsqueeze(0).unsqueeze(-2)) @ L.transpose(-1, -2)
+            elif head_dims is not None:
+                G = _head_block_covariance(L, Sigma, len(head_dims), S.ndim == 4)
             else:
                 G = L @ Sigma.unsqueeze(0) @ L.transpose(-1, -2)
         # The two off-diagonal contractions can round differently near zero.
         # Keep the covariance exactly symmetric for strict zero-jitter Cholesky.
         G = .5 * G + .5 * G.transpose(-1, -2)
     return a, G
+
+
+def _head_block_covariance(
+    L:        torch.Tensor,  # (..., N, H, r, K), optionally with a leading role axis R
+    Sigma:    torch.Tensor,  # (..., N, H, K, K), block-diagonal with n_blocks equal d x d blocks
+    n_blocks: int,
+    stacked:  bool,          # L carries a leading role axis R
+) -> torch.Tensor:           # (..., N, H, r, r), or (R, ..., N, H, r, r) when stacked
+    r"""Return :math:`G_h = \sum_m L_h^{(m)} \Sigma_m L_h^{(m)\top}` for a head-block-diagonal covariance.
+
+    With :math:`\Sigma = \operatorname{diag}(\Sigma_1, \ldots, \Sigma_M)` and :math:`L_h` split into the
+    column blocks :math:`L_h^{(m)}` of width :math:`d = K / M`, :math:`L_h \Sigma L_h^\top` reduces to the
+    sum above, which costs :math:`O(H r K d)` per token instead of :math:`O(H r K^2)`. The diagonal blocks
+    are read through a strided view (no copy), and a head-broadcast covariance (stride zero on the head
+    axis, as built by ``expand``) is read once per token rather than once per head and role; its
+    contraction makes one copy of L in block-major order and never forms a dense K x K product. The caller
+    declares the block structure; off-block entries of ``Sigma`` are never read, so their gradient is zero.
+    """
+    d = Sigma.shape[-1] // n_blocks
+    blocks = (Sigma.unflatten(-1, (n_blocks, d)).unflatten(-3, (n_blocks, d))
+              .diagonal(dim1=-4, dim2=-2).movedim(-1, -3))                    # (..., N, H, M, d, d) view
+    if Sigma.stride(-3) != 0:
+        # Per-head covariances: contract each head's own blocks.
+        L_blocks = L.unflatten(-1, (n_blocks, d))                             # (..., N, H, r, M, d)
+        weighted = torch.einsum("...hrmd,...hmde->...hrme", L_blocks, blocks)  # (..., N, H, r, M, d)
+        return torch.einsum("...hrme,...hsme->...hrs", weighted, L_blocks)    # (..., N, H, r, r)
+    # Head-broadcast covariance: block axis first, so each block's (role, head, rank) rows are one
+    # contiguous slab that multiplies its d x d block with no broadcast of Sigma over heads or roles.
+    shared = blocks.select(-4, 0).movedim(-3, 0)                              # (M, ..., N, d, d)
+    rows = L.unflatten(-1, (n_blocks, d)).movedim(-2, 0)                      # (M, [R,] ..., N, H, r, d)
+    if stacked:
+        rows = rows.movedim(1, -4)                                            # (M, ..., N, R, H, r, d)
+    batch, r = rows.shape[1:-4 if stacked else -3], rows.shape[-2]
+    rows = rows.reshape(n_blocks, *batch, -1, d)                              # (M, ..., N, [R] H r, d): one copy
+    shared = shared.reshape(n_blocks, *(1,) * (rows.ndim - shared.ndim), *shared.shape[1:])
+    weighted = rows @ shared                                                  # (M, ..., N, [R] H r, d)
+    G = None
+    for m in range(n_blocks):
+        term = (weighted[m].unflatten(-2, (-1, r))
+                @ rows[m].unflatten(-2, (-1, r)).transpose(-1, -2))           # (..., N, [R] H, r, r)
+        G = term if G is None else G.add_(term)
+    if stacked:
+        G = G.unflatten(-3, (L.shape[0], -1)).movedim(-4, 0)                  # (R, ..., N, H, r, r)
+    return G
 
 
 @ieee_fp32_matmul()
@@ -336,6 +428,7 @@ def _symmetry_status(G: torch.Tensor, symmetric: bool) -> torch.Tensor:
     return torch.isclose(G, G.transpose(-1, -2), rtol=tolerance, atol=0.).all()
 
 
+@ieee_fp32_matmul()
 def _projected_root_factor_tile(
     Sigma:    torch.Tensor,   # (..., n, H, d) diagonal or (..., n, H, d, d) full
     inverse:  torch.Tensor,   # (..., n, H, d_b, d_b) compact or full-width inverse frame blocks
@@ -343,7 +436,10 @@ def _projected_root_factor_tile(
     dtype:    torch.dtype,
     diagonal: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""CholeskyQR2 factor of X X^T for X = S U^{-1} Sigma^{1/2}, one token tile."""
+    r"""CholeskyQR2 factor of X X^T for X = S U^{-1} Sigma^{1/2}, one token tile.
+
+    Pinned to IEEE fp32 itself, so a checkpointed recompute in backward factors under the forward's policy.
+    """
     with torch.autocast(device_type=S.device.type, enabled=False):
         L = _projected_linear_map(S.to(dtype), inverse.to(dtype))                # (..., n, H, r, d)
         if diagonal:
@@ -610,13 +706,17 @@ def projected_gaussian_kl(
     projection_k: Optional[Tuple[torch.Tensor, ...]] = None,
     symmetric_inputs: bool = False,
     query_row_constant_grad: bool = True,
+    gemm_expansion_tol: Optional[float] = None,
 ) -> torch.Tensor:      # (..., H, Nq, Nk)
     r"""Compute raw KL(q_i || k_j) = (tr(G_j^{-1}G_i) + delta^T G_j^{-1}delta - r + logdet(G_j/G_i))/2.
 
     Cholesky factors and inverses have only one token axis. Healthy pairs are one centered
     expanded GEMM per (batch, head) at IEEE fp32 (:func:`_projected_kl_gemm`), with no pair
     difference grid; above the projection byte budget it is checkpointed, so only its token-linear
-    inputs are saved for backward. Recovered factors use bounded checkpointed pair tiles of triangular solves
+    inputs are saved for backward. With ``gemm_expansion_tol`` set (default None: off), a (batch, head)
+    slice whose GEMM error estimate (:func:`_gemm_expansion_error`) exceeds it in nats is scored instead
+    by the direct-difference tiles at IEEE fp32 and counted in :func:`gemm_fallback_slices`; the verdict
+    joins the existing decision read. Recovered factors use bounded checkpointed pair tiles of triangular solves
     instead of cancelling covariance/precision products, in float64 under
     :func:`projected_recovery_precision` ``"fp64"`` and in the working dtype under ``"fp32"``. No floor, cap,
     symmetrization, jitter, or repair is applied. Optional (Sigma,U^-1,S[,mu])
@@ -669,10 +769,27 @@ def projected_gaussian_kl(
         with torch.set_grad_enabled(torch.is_grad_enabled() and query_row_constant_grad):
             q_status = _status(Gq, projection_q)
         k_status = _status(Gk, projection_k)
+        # Optional per-(batch, head) GEMM error estimate; its verdict joins the single decision read below.
+        slice_shape = torch.broadcast_shapes(aq.shape[:-3], ak.shape[:-3]) + aq.shape[-2:-1]  # (..., H)
+        # The key precision from the prepared factors (failed entries read the identity) serves the
+        # estimate and, on the healthy path, the GEMM: one token-linear inverse either way.
+        with ieee_fp32_matmul():
+            k_prec_prepared = torch.cholesky_inverse(torch.where(
+                k_status[1][..., None, None], torch.eye(r, device=Gk.device, dtype=dtype), k_status[0]))
+        verdicts = [(torch.isfinite(aq).all() & torch.isfinite(ak).all()).reshape(1), q_status[-1], k_status[-1]]
+        if gemm_expansion_tol is not None:
+            # Key entries the recovery will rebuild leave the GEMM (their pairs take the factor route), so
+            # they leave the estimate too: failed or certificate-flagged entries, except that the fp32
+            # factor route keeps a flagged-but-factored entry's CholeskyQR2 factor (see _strict_cholesky).
+            keeps_flagged = factored and _RECOVERY_PRECISION == "fp32" and dtype != torch.float64
+            recovered_k = k_status[1] if keeps_flagged else k_status[1] | k_status[2]
+            fallback = ~(_gemm_expansion_error(aq, ak, k_prec_prepared, recovered_k) <= gemm_expansion_tol)
+            verdicts.append(fallback.expand(slice_shape).reshape(-1))
         # One host transfer for both roles and the means on the healthy path.
         # host_read also resolves raise-only checks deferred by vfe3.contracts.deferred_host_checks.
-        decisions = host_read(torch.cat(((torch.isfinite(aq).all() & torch.isfinite(ak).all()).reshape(1),
-                                         q_status[-1], k_status[-1])))
+        decisions = host_read(torch.cat(verdicts))
+        fallback_slices = [s for s, flag in enumerate(decisions[9:]) if flag]
+        decisions = decisions[:9]
         if not decisions[0]:
             raise ValueError("projected means must contain only finite values")
         if not query_row_constant_grad and torch.is_grad_enabled() and (decisions[3] or decisions[7]):
@@ -720,8 +837,8 @@ def projected_gaussian_kl(
             flags = torch.cat((q_tok, k_tok)).tolist()
             q_needs, k_needs = flags[:nq_flags], flags[nq_flags:]
         else:
-            with ieee_fp32_matmul():                            # token-linear key precision
-                q_cov_healthy, k_prec_healthy = Gq, torch.cholesky_inverse(chol_k)
+            # Healthy path: chol_k is the prepared factor, so this is its precision bit for bit.
+            q_cov_healthy, k_prec_healthy = Gq, k_prec_prepared
             q_needs = k_needs = None
         aq, ak = aq.movedim(-2, -3), ak.movedim(-2, -3)  # (..., H, N, r)
         q_cov_healthy = q_cov_healthy.movedim(-3, -4)   # (..., H, Nq, r, r)
@@ -763,6 +880,40 @@ def projected_gaussian_kl(
             healthy = checkpoint(_projected_kl_gemm, *args, use_reentrant=False, preserve_rng_state=False)
         else:
             healthy = _projected_kl_gemm(*args)
+        if fallback_slices:
+            # Slices whose GEMM error estimate exceeds gemm_expansion_tol take the direct tiles.
+            global _GEMM_FALLBACK_SLICES
+            _GEMM_FALLBACK_SLICES += len(fallback_slices)
+            index = torch.tensor(fallback_slices, dtype=torch.long, device=healthy.device)
+            grid = healthy.shape                                                # (..., H, Nq, Nk)
+
+            def _select(t: torch.Tensor, tail: int) -> torch.Tensor:          # (n_fallback, *tail)
+                trailing = t.shape[t.ndim - tail:]
+                return t.expand(*grid[:-2], *trailing).reshape(-1, *trailing).index_select(0, index)
+
+            selected = (_select(aq_healthy, 2), _select(ak_healthy, 2), _select(q_cov_healthy, 3),
+                        _select(k_prec_healthy, 3), _select(logdet_q_healthy, 1), _select(logdet_k_healthy, 1))
+            # A direct tile holds three (n, I, J, r) pair tensors (delta, P delta, their product).
+            pair_budget = max(1, _PROJECTION_TILE_BYTES // (aq_healthy.element_size() * len(fallback_slices) * 3 * r))
+            q_step = max(1, min(nq, 32, pair_budget))
+            k_step = max(1, min(nk, pair_budget // q_step))
+            rows = []
+            for i in range(0, nq, q_step):
+                columns = []
+                for j in range(0, nk, k_step):
+                    tile_args = (selected[0][:, i:i+q_step], selected[1][:, j:j+k_step],
+                                 selected[2][:, i:i+q_step], selected[3][:, j:j+k_step],
+                                 selected[4][:, i:i+q_step], selected[5][:, j:j+k_step])
+                    if (torch.is_grad_enabled() and (nq > q_step or nk > k_step)
+                            and any(x.requires_grad for x in tile_args)):
+                        columns.append(checkpoint(_projected_kl_direct_tile, *tile_args,
+                                                  use_reentrant=False, preserve_rng_state=False))
+                    else:
+                        columns.append(_projected_kl_direct_tile(*tile_args))
+                rows.append(torch.cat(columns, dim=-1))
+            direct = torch.cat(rows, dim=-2)                                    # (n_fallback, Nq, Nk)
+            healthy = (healthy.reshape(-1, nq, nk)
+                       .index_copy(0, index, direct.to(healthy.dtype)).reshape(grid))
         if not factor_trace_any:
             return healthy.to(dtype)
         # Factor route only for pairs that touch a recovered entry, selected per (b, h, i, j).
@@ -828,6 +979,62 @@ def _projected_kl_gemm(
     cross = query @ key.transpose(-1, -2)                                        # (..., H, Nq, Nk)
     key_constant = (b * Pb).sum(-1) + logdet_k                                   # (..., H, Nk)
     return .5 * (cross + key_constant.unsqueeze(-2) - r - logdet_q.unsqueeze(-1))
+
+
+@torch.no_grad()
+def _gemm_expansion_error(
+    aq:       torch.Tensor,  # (..., Nq, H, r) query means
+    ak:       torch.Tensor,  # (..., Nk, H, r) key means
+    k_prec:   torch.Tensor,  # (..., Nk, H, r, r) key precisions P_j
+    excluded: torch.Tensor,  # (..., Nk, H) key entries the recovery rebuilds (their pairs leave the GEMM)
+) -> torch.Tensor:           # (..., H) estimated max pair error of the GEMM, in nats
+    r"""A-priori estimate of the centered GEMM's excess forward error, maximized per (batch, head).
+
+    With :math:`\alpha_i = a_i - c`, :math:`b_j = a_{k,j} - c` and :math:`c` the first key mean, the
+    GEMM forms the mean part of :math:`2\,\mathrm{KL}_{ij}` as the expansion
+    :math:`\alpha_i^\top P_j\alpha_i - \alpha_i^\top (P_j + P_j^\top) b_j + b_j^\top P_j b_j` of
+    :math:`\delta_{ij}^\top P_j\delta_{ij}`. Standard dot-product analysis bounds its rounding error by
+    :math:`\gamma\,(|\alpha_i| + |b_j|)^\top |P_j| (|\alpha_i| + |b_j|)`, while the direct tile, which
+    forms :math:`\delta_{ij}` first, pays :math:`\gamma\,|\delta_{ij}|^\top|P_j||\delta_{ij}|`; the trace
+    term :math:`\langle G_i, P_j\rangle_F` carries the same error on both routes and is excluded. With
+    :math:`\rho_j = \max(\lVert P_j\rVert_1, \lVert P_j\rVert_\infty) \ge \lVert |P_j| \rVert_2`,
+    :math:`A = \max_i \lVert\alpha_i\rVert_2` and :math:`B_j = \lVert b_j\rVert_2`, the slice maximum is
+
+    .. math::
+        E = \tfrac12\,\gamma\,\max_j \rho_j (A + B_j)^2,
+        \qquad \gamma = \sqrt{r}\,u,
+
+    exact as a maximum of the majorant over pairs since it increases in :math:`A`, and computed in
+    O(N r^2) per slice with no pair grid. The worst-case constant would be
+    :math:`\gamma_{r^2+r} \approx (r^2 + r) u`; :math:`\sqrt{r}\,u` is the probabilistic scale of the
+    accumulated rounding (Higham and Mary, SIAM J. Sci. Comput. 41 (2019) A2815), which on the
+    audit sweep (r = 8 and 32; spread 1 to 4000; cond 1 and 1e3; an outlying key 0) majorized every
+    near-minimum pair error by a factor of at least three. It is an estimate, not a certificate.
+    Key entries the recovery rebuilds are excluded, since their pairs take the factor route; a healthy
+    slice's verdict therefore does not depend on an ill-conditioned token elsewhere in it.
+    """
+    r = aq.shape[-1]
+    u = torch.finfo(aq.dtype).eps / 2
+    c = ak[..., :1, :, :]
+    A = (aq - c).norm(dim=-1).amax(dim=-2)                                       # (..., H)
+    B = (ak - c).norm(dim=-1)                                                    # (..., Nk, H)
+    absolute = k_prec.abs()
+    rho = torch.maximum(absolute.sum(-1).amax(-1), absolute.sum(-2).amax(-1))   # (..., Nk, H)
+    rho = rho.masked_fill(excluded, 0.)
+    return .5 * math.sqrt(r) * u * (rho * (A.unsqueeze(-2) + B).square()).amax(dim=-2)
+
+
+@ieee_fp32_matmul()
+def _projected_kl_direct_tile(
+    aq:       torch.Tensor,  # (n, I, r)
+    ak:       torch.Tensor,  # (n, J, r)
+    q_cov:    torch.Tensor,  # (n, I, r, r)
+    k_prec:   torch.Tensor,  # (n, J, r, r)
+    logdet_q: torch.Tensor,  # (n, I)
+    logdet_k: torch.Tensor,  # (n, J)
+) -> torch.Tensor:           # (n, I, J)
+    r"""Direct-difference KL tile for GEMM fallback slices, pinned to IEEE fp32 also on checkpoint recompute."""
+    return _projected_kl_tile(aq, ak, q_cov, k_prec, logdet_q, logdet_k, False)
 
 
 def _projected_kl_tile(

@@ -1,9 +1,9 @@
 r"""Opt-in learnable routing temperature and comparison-map tie (audit 2026-10-09, info-geometer).
 
 A. ``learn_attention_temperature``: per layer and head, the Gibbs routing temperature is
-:math:`\tau_{\ell,h} = \kappa_h\sqrt{d_h}\exp(\mathrm{clamp}(\delta_{\ell,h}, -3, 3))`, i.e. the
-log-temperature :math:`s_{\ell,h} = \log\kappa_h + \delta_{\ell,h}` with :math:`\delta = 0` at
-initialization, so the configured temperature is reproduced exactly at step 0.
+:math:`\tau_{\ell,h} = \kappa_h\sqrt{d_h}\exp(3\tanh(\delta_{\ell,h}/3))` (a smooth bound since the
+round-2 audit; formerly a hard clamp to [-3, 3]) with :math:`\delta = 0` at initialization, so the configured
+temperature is reproduced exactly at step 0.
 
 B. ``tie_comparison_maps``: :math:`S_K := S_Q` on the projected_predictive kernel route, so the
 self-pair cost :math:`D_{ii} = \mathrm{KL}(q_i \| q_i) = 0` and, with identity frames,
@@ -132,7 +132,7 @@ def test_row_min_learned_temperature_sets_routing_entropy() -> None:
         beta = capture["beta_pre"]
         D = relational_score(mu, sigma, mu, sigma, frame, ops)
         D = D - D.masked_fill(~torch.isfinite(prior), math.inf).amin(-1, keepdim=True)
-        reference = torch.softmax(-D / (0.9 * math.exp(offset)) + prior, dim=-1)
+        reference = torch.softmax(-D / (0.9 * math.exp(3.0 * math.tanh(offset / 3.0))) + prior, dim=-1)
         torch.testing.assert_close(beta, reference, rtol=1e-12, atol=1e-12)
         entropies.append(_entropy(beta)[..., 1:].sum())        # rows 1.. have two or more sources
     assert entropies[0] < entropies[1] < entropies[2]
@@ -159,10 +159,10 @@ def test_fully_capped_absolute_row_has_zero_temperature_gradient() -> None:
     assert torch.autograd.grad(live.square().sum(), ops.routing_log_temperature)[0].abs().max() > 1e-6
 
 
-def test_temperature_offset_is_clamped_like_decode_log_scale() -> None:
+def test_temperature_offset_is_bounded_like_decode_log_scale() -> None:
     ops = make_relational_operators([2, 2], 5, learn_attention_temperature=True).double()
     with torch.no_grad():
-        ops.routing_log_temperature.copy_(torch.tensor([5.0, -5.0]))
+        ops.routing_log_temperature.copy_(torch.tensor([50.0, -50.0]))
     tau = ops.routing_temperature(2.0, torch.float64)
     torch.testing.assert_close(tau, torch.tensor([2.0 * math.exp(3.0), 2.0 * math.exp(-3.0)],
                                                  dtype=torch.float64))

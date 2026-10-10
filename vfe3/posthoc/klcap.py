@@ -1,8 +1,13 @@
 r"""Beta-weighted activation of the routing-cost cap, per layer and head (GL(K)_attention_v2, line 838).
 
 The relational router bounds every cost to :math:`[0, \kappa]` before the softmax,
-:math:`\bar D_{ij} = \min(D_{ij}, \kappa)` with :math:`\kappa` = ``cfg.kl_max`` (non-finite costs are also
-set to :math:`\kappa`). An entry is *at the cap* when :math:`\bar D_{ij} \ge \kappa`. The unweighted
+:math:`\bar D_{ij} = \min(D_{ij} - m_i, \kappa)` with :math:`\kappa` = ``cfg.kl_max`` (non-finite costs are
+also set to :math:`\kappa`) and the clamp reference :math:`m_i` of ``routing_kl_max_reference``: :math:`m_i = 0`
+under ``'absolute'``, the row minimum :math:`\min_{j \in \mathcal S_i} D_{ij}` under ``'row_min'``
+(:func:`vfe3.gradients.relational.clamped_routing_cost`). The captured ``score_energy_pre`` is
+:math:`\bar D_{ij}` either way, so an entry is *at the cap* when :math:`\bar D_{ij} \ge \kappa`; under
+``'row_min'`` that is a gap to the row's best source, ``max_cost_uncapped`` is the largest uncapped gap, and
+the reference is recorded in the summary (``kl_max_reference``). The unweighted
 fraction of capped entries says how often the bound is reached; the routing weight on those entries,
 
 .. math::
@@ -53,8 +58,9 @@ def causal_support(
 class KLCapObserver:
     r"""Accumulate the cap statistics over :func:`vfe3.posthoc.evaluate.nll_pass` batches."""
 
-    def __init__(self, kl_max: float) -> None:
+    def __init__(self, kl_max: float, kl_max_reference: str = "absolute") -> None:
         self.kl_max = float(kl_max)
+        self.kl_max_reference = str(kl_max_reference)
         self._sums: Dict[Tuple[str, int, int], np.ndarray] = {}
         self._max_beta_capped: Dict[Tuple[str, int, int], float] = {}
         self._max_cost_uncapped: Dict[Tuple[str, int, int], float] = {}
@@ -165,6 +171,7 @@ class KLCapObserver:
                 })
         return {
             "kl_max": self.kl_max,
+            "kl_max_reference": self.kl_max_reference,
             "populations": {
                 "scored": "scored query rows of the evaluation protocol (each position once) and their causal sources",
                 "computed": "every query row with a real input token in every evaluated window, and its causal sources",

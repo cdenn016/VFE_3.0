@@ -333,8 +333,9 @@ def test_paper_arms_post_norm_arm_matches_a_base_without_the_residual_and_says_s
     for residual in (True, False):
         base = pa.load_base("tiny", _write_base(tmp_path / str(residual), _tiny_cfg(attention_residual=residual)))
         plan = pa.build_plan(base, budget="base_protocol", seeds=[(1, 1)], counts=False, labels=[label])[0]
-        assert plan.status == "ready" and plan.cfg.attention_residual is residual
-        assert any("without the attention residual" in note for note in plan.notes) is (not residual)
+        # Round 2 #3: the arm keeps the residual on a base without one, as a declared difference.
+        assert plan.status == "ready" and plan.cfg.attention_residual is True
+        assert any("attention residual kept" in note for note in plan.notes) is (not residual)
 
 
 def test_a_code_identity_mismatch_is_reported_without_changing_the_verdict() -> None:
@@ -414,7 +415,7 @@ def test_an_inapplicable_capacity_arm_is_na_and_does_not_block_the_verdict() -> 
     record = pt.decision_rule(manifest)
     c = record["clauses"]["c"]
     assert c["holds"] is None and c["inapplicable"] == reason and c["n"] == 0
-    assert record["verdict"] == "stands"
+    assert record["verdict"] == pt.DECISION_NO_CAPACITY_VERDICT      # (a) and (b) alone cannot stand (round 2 #27)
     latex, markdown, _ = pt.decision_rule_table(manifest)
     row = next(line for line in latex.splitlines() if line.startswith("(c)"))
     assert row.count("&") == 5 and row.endswith(f"& {pt.NOT_APPLICABLE} \\\\")
@@ -494,7 +495,8 @@ def test_total_parameter_width_picks_the_nearest_whole_head_width() -> None:
     assert rule["target_total"] == target and rule["head_dim"] == 32 and rule["width"] == K
     assert total_parameter_width(cfg, target) == rule                       # deterministic
     assert all(getattr(cfg, f.name) == getattr(chosen, f.name)
-               for f in dataclasses.fields(cfg) if f.name not in ("embed_dim", "n_heads"))
+               for f in dataclasses.fields(cfg) if f.name not in ("embed_dim", "n_heads", "hidden_lr_scale"))
+    assert chosen.hidden_lr_scale == rule["hidden_lr_scale"] == 128 / K           # round 2 #18
     with pytest.raises(ValueError):
         total_parameter_width(cfg, 0)
 
@@ -512,14 +514,14 @@ def test_total_matched_arm_matches_the_base_total_and_declares_only_the_width(tm
                                                baseline_overrides={"lr": 3e-3})}
     plan, evaluated = plans[TOTAL_MATCHED], plans[pa.EVALUATED]
     assert plan.status == "ready" and plan.kind == "baseline"
-    assert set(plan.diff) == {"embed_dim", "n_heads"}
+    assert set(plan.diff) == {"embed_dim", "n_heads", "hidden_lr_scale"}         # round 2 #18
     assert plan.cfg.n_layers == evaluated.cfg.n_layers and plan.cfg.max_steps == evaluated.cfg.max_steps
     d = evaluated.cfg.embed_dim // evaluated.cfg.n_heads
     assert plan.cfg.embed_dim % d == 0 and plan.cfg.embed_dim > evaluated.cfg.embed_dim
     target = evaluated.params["total"]
     assert plan.params["total"] == plan.cfg.total_parameters()
     at_base_width = dataclasses.replace(plan.cfg, embed_dim=int(evaluated.cfg.embed_dim),
-                                        n_heads=int(evaluated.cfg.n_heads))
+                                        n_heads=int(evaluated.cfg.n_heads), hidden_lr_scale=1.0)
     assert plan.cfg == total_parameter_width(at_base_width, target)["config"]
     assert any("total parameters" in note and f"{target:,}" in note for note in plan.notes)
     # The sizing does not depend on whether the plan reports counts.

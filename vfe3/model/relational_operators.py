@@ -352,8 +352,9 @@ class RelationalOperators(nn.Module):
     :math:`S_K := S_Q`. ``learn_attention_temperature`` adds ``routing_log_temperature`` ``(H,)``, the offset of
     the log routing temperature (:meth:`routing_temperature`); with it off no such parameter exists.
     ``attention_residual``, ``predictive_covariance``, ``receiver_law``, ``receiver_update``,
-    ``content_link_chart`` and ``minimal_agent_inference`` are keyword-only without defaults, so no
-    constructor default can drift from :class:`vfe3.config.VFE3Config` (audit 2026-10-09).
+    ``content_link_chart``, ``minimal_agent_inference``, ``kl_max_reference`` and
+    ``rope_comparison_covariance`` are keyword-only without defaults, so no constructor default can drift
+    from :class:`vfe3.config.VFE3Config` (audit 2026-10-09).
     """
 
     def __init__(
@@ -386,17 +387,26 @@ class RelationalOperators(nn.Module):
         minimal_agent_channel_noise: float = 1.0,
         comparison_rope_base: Optional[float] = None,
         comparison_rope_fraction: float = 1.0,
-        kl_max_reference:      str   = "absolute",
+        kl_max_reference:      str,
+        rope_comparison_covariance: str,
         learn_attention_temperature: bool = False,
         tie_comparison_maps:   bool  = False,
         block_covariance:      bool  = False,
+        pair_kl_gemm_tol:      Optional[float] = None,
     ) -> None:
         super().__init__()
         self.kl_max_reference = kl_max_reference      # "absolute" | "row_min" kernel-router clamp reference
+        self.pair_kl_gemm_tol = pair_kl_gemm_tol      # None, or the opt-in pair-KL GEMM fallback tolerance (nats)
         # rope_space='comparison': the RoPE frequency base of the rotation applied to each head's projected
         # routing moments after the learned maps (relational_score); None leaves routing un-rotated here.
         self.comparison_rope_base = None if comparison_rope_base is None else float(comparison_rope_base)
         self.comparison_rope_fraction = float(comparison_rope_fraction)              # p-RoPE fraction
+        if rope_comparison_covariance not in ("full", "rotation_invariant"):
+            raise ValueError("rope_comparison_covariance must be 'full' or 'rotation_invariant', "
+                             f"got {rope_comparison_covariance!r}")
+        # "full" | "rotation_invariant": the comparison covariance rotated as R_i G R_i^T, or projected onto the
+        # commutant of the RoPE torus (read only when comparison_rope_base is set; relational_score).
+        self.rope_comparison_covariance = rope_comparison_covariance
         if not irrep_dims or any(type(d) is not int or d < 1 for d in irrep_dims):
             raise ValueError("relational operators require positive integer head sizes")
         if type(seed) is not int:
@@ -531,7 +541,7 @@ class RelationalOperators(nn.Module):
         if tie_comparison_maps and readout_mode != "predictive_content":
             raise ValueError("tie_comparison_maps requires the predictive_content readout")
         self.tie_comparison_maps = tie_comparison_maps
-        # delta_{l,h} of tau_{l,h} = tau_h exp(clamp(delta_{l,h}, -3, 3)); absent (no state-dict key) when off.
+        # delta_{l,h} of tau_{l,h} = tau_h exp(3 tanh(delta_{l,h} / 3)); absent (no state-dict key) when off.
         if learn_attention_temperature:
             self.routing_log_temperature = nn.Parameter(torch.zeros(len(self.irrep_dims)))   # (H,)
         else:
@@ -1294,18 +1304,21 @@ class RelationalOperators(nn.Module):
         Without ``learn_attention_temperature`` the configured temperature is returned unchanged. With it,
 
         .. math::
-            \tau_{\ell,h} = \kappa_h\sqrt{d_h}\exp(\mathrm{clamp}(\delta_{\ell,h}, -3, 3)),
+            \tau_{\ell,h} = \kappa_h\sqrt{d_h}\exp(3\tanh(\delta_{\ell,h}/3)),
 
-        so the log-temperature is :math:`s_{\ell,h} = \log\kappa_h + \delta_{\ell,h}` with
-        :math:`\delta = 0` at initialization (the configured temperature exactly) and the same
-        :math:`\pm 3` window as the decoder's ``decode_log_scale``. The product is formed in float64 and
+        so the log-temperature offset :math:`3\tanh(\delta/3)` equals :math:`\delta` to first order, is
+        :math:`0` at :math:`\delta = 0` (the configured temperature exactly, as at initialization) and stays
+        inside the :math:`\pm 3` window of the decoder's ``decode_log_scale``. This smooth bound replaced a hard
+        ``clamp(delta, -3, 3)`` (audit 2026-10-09 round 2), which was absorbing: past the window the offset had
+        zero gradient. The bound has gradient :math:`1 - \tanh^2(\delta/3) > 0` everywhere. A saved nonzero
+        offset reloads at a different temperature than under the clamp. The product is formed in float64 and
         returned at ``dtype``. The temperature acts after the ``kl_max`` clamp, so it sharpens or flattens
         only costs below the cap.
         """
         delta = self.routing_log_temperature
         if delta is None:
             return tau
-        scale = torch.exp(delta.to(torch.float64).clamp(-3.0, 3.0))                      # (H,)
+        scale = torch.exp(3.0 * torch.tanh(delta.to(torch.float64) / 3.0))               # (H,)
         base = torch.as_tensor(tau, dtype=torch.float64, device=scale.device)            # () or (H,)
         return (base * scale).to(dtype)                                                  # (H,)
 

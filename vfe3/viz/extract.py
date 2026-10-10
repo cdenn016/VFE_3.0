@@ -623,15 +623,18 @@ def readout_state(
     # The minimal-agent posterior applies no cost clamp, so only a non-finite cost reads as saturated.
     kl_max = (math.inf if getattr(model.cfg, "predictive_readout", "kernel") == "minimal_agent"
               else model.cfg.kl_max)
+    # The covariance layout follows the family (audit 2026-10-09 round 2, item 23): a gaussian_block or
+    # gaussian_full belief is a dense K x K matrix whose spectrum, not its entries, meets the variance guards.
+    diagonal = bool(model.cfg.diagonal_covariance)
     guard = metrics.guard_saturation(
-        out.sigma, cap["score_energy_pre"], out.mu.new_empty(0), diagonal=True,
+        out.sigma, cap["score_energy_pre"], out.mu.new_empty(0), diagonal=diagonal,
         eps=model.cfg.eps, sigma_max=model.cfg.sigma_max, kl_max=kl_max,
     )
     guard.pop("selfdiv_klmax_frac", None)  # no self-energy was evaluated by this diagnostic
     state = {
         "mu": out.mu, "sigma": out.sigma, "phi": out.phi,
         "energy": cap["score_energy_pre"], "beta": cap["beta_pre"], "guard": guard,
-        "guard_denominators": guard_denominators(out.sigma, cap["score_energy_pre"], diagonal=True),
+        "guard_denominators": guard_denominators(out.sigma, cap["score_energy_pre"], diagonal=diagonal),
         "inference_semantics": model.conditional_semantics,
         "covariance_semantics": "receiver_bookkeeping",
     }

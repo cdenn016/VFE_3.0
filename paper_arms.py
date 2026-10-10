@@ -40,7 +40,17 @@ base's except where declared. Rules:
   decay-0.04 run is never filed under a "without decay" row, and on a base without decay the
   evaluated row is written as :data:`EVALUATED_NO_DECAY` (:func:`evaluated_label`) and the two
   inapplicable rows print ``n/a``.
-* Residual removed: inapplicable when the base has no attention residual.
+* Residual removed: inapplicable when the base has no attention residual. Residual added
+  (``attention_residual=True``): inapplicable when the base has one; on a base without it, the
+  identity-frame, capacity and frame-free-table arms remove the only per-layer identity path, and this
+  row separates that path from the frames.
+* Head-block family (audit 2026-10-09 round 2, items 4 and 12): ``family='gaussian_block'`` with learned
+  frames (one change; inapplicable on a head-block base); the frame-free equivalent
+  ``prior_covariance_table='block_cholesky'`` with ``gauge_transport='off'`` (its documented coercions are
+  the frame fields); and the covariant stack, ``gaussian_block`` with ``block_coordinates='reference'`` and
+  ``decode_coordinates='reference'``, a declared three-change arm in which every consumer reads the
+  reference moments (xi, C), so its frames are removable and the frame-free table arm is its equivalent.
+  A base the validator does not admit these on resolves them as invalid with the validator's reason.
 * LayerNorm and MLP in reference coordinates: ``block_coordinates='reference'`` (the decoder stays
   local; one change). On a base without a LayerNorm it conjugates the MLP alone.
 * Intertwiner-constrained block: ``block_mlp_mode='gauge_gate'``, the block (and final) LayerNorm
@@ -71,8 +81,11 @@ base's except where declared. Rules:
   so the latter row is inapplicable. From the as-run arm, one change each: the realization's
   optimizer (Adam ``beta_2 = 0.999``, no decay on matrices, decay 0.1 on the table as on the frames;
   the realization's 0.01 MLP decay and per-role clipping remain different), a read-and-write table
-  (``block_rw``), and the shared post-norm layout (``norm_placement='post_shared'``, without the
-  attention residual when the base has none). VFE arms: the realization with the ALiBi prior, and the
+  (``block_rw``), and the shared post-norm layout (``norm_placement='post_shared'``). On a base without
+  the attention residual the post-norm arm keeps it, a declared difference with a plan note: without it
+  the first update is LN(Attn(h)), and with the zero-initialized read table the token states collapse at
+  initialization (own-token logit sensitivity about 1e-6 at six layers), so the arm would not isolate the
+  norm placement. VFE arms: the realization with the ALiBi prior, and the
   covariance-blind routing cost ``relational_routing='mean_distance'``. :data:`TIER_A` lists the
   baseline controls and :data:`TIER_B` the VFE retraining controls.
 
@@ -86,7 +99,9 @@ base's except where declared. Rules:
 * Matched total parameters: the conventional transformer of the base's depth and protocol whose
   total parameter count (context processing plus per-type tables) is nearest the base's exact total,
   widened in whole heads by :func:`vfe3.baseline.total_parameter_width`; its declared changes are
-  :data:`TOTAL_MATCHED_FIELDS`. It is in neither tier.
+  :data:`TOTAL_MATCHED_FIELDS` and the hidden-matrix learning-rate scale K_0/K (muP-style transfer,
+  Yang et al. 2022), recorded in the plan and in the manifest row's ``declared_deviations`` as "lr not
+  tuned at this width" (peak lr, initialization and warmup are the base width's). It is in neither tier.
 
 An arm whose code is not in this build (a missing config field or ``vfe3.baseline`` /
 ``train_baseline``) is reported as unavailable with the reason; an arm that does not apply to the
@@ -345,6 +360,11 @@ ARMS: Dict[str, Dict[str, Any]] = {
     "Attention residual removed": {
         "group": _RETRAINING, "slug": "no_residual", "vfe": {"attention_residual": False},
         "inapplicable": _no_residual},
+    # Audit 2026-10-09 round 2 item 16: on a base without the residual, the identity-frame, capacity and
+    # block_cholesky arms remove the only per-layer identity path; this arm restores it alone.
+    "Attention residual added": {
+        "group": _RETRAINING, "slug": "with_residual", "vfe": {"attention_residual": True},
+        "inapplicable": _already("attention_residual", True)},
     # Manuscript M2 rows (audit 2026-10-08 P1-8). "Exponential chart with the channel receiver" has no
     # single-change arm yet.
     "Affine content chart": {
@@ -369,6 +389,22 @@ ARMS: Dict[str, Dict[str, Any]] = {
                 "norm_type_final": _covariant_norm("norm_type_final"),
                 "decode_coordinates": "reference"},
         "requires": ("decode_coordinates",), "inapplicable": _no_mlp_or_reference_decode},
+    # Audit 2026-10-09 round 2 items 4 and 12: frames are pure gauge wherever every consumer reads (xi, C),
+    # so there a learned-frame model equals the frame-free per-type (xi_v, C_v) table. The head-block family
+    # makes the routing projection closed under block-GL congruence; the covariant stack (three declared
+    # changes) puts the LayerNorm, MLP and decoder in reference coordinates, and the frame-free table with
+    # identity frames (where reference and local coordinates coincide) is its frame-free equivalent.
+    "Head-block family, learned frames": {
+        "group": _RETRAINING, "slug": "block_family", "vfe": {"family": "gaussian_block"},
+        "inapplicable": _already("family", "gaussian_block")},
+    "Head-block family, frame-free Cholesky table": {
+        "group": _RETRAINING, "slug": "block_family_cholesky",
+        "vfe": {"family": "gaussian_block", "prior_covariance_table": "block_cholesky", "gauge_transport": "off"},
+        "coerced": GAUGE_OFF_COERCED, "requires": ("prior_covariance_table",)},
+    "Head-block family, normalization, MLP and decoder in reference coordinates": {
+        "group": _RETRAINING, "slug": "block_family_reference",
+        "vfe": {"family": "gaussian_block", "block_coordinates": "reference", "decode_coordinates": "reference"},
+        "requires": ("block_coordinates", "decode_coordinates")},
     "MLP removed": {
         "group": _RETRAINING, "slug": "no_mlp", "vfe": {"use_block_mlp": False},
         "inapplicable": _no_mlp},
@@ -407,7 +443,10 @@ ARMS: Dict[str, Dict[str, Any]] = {
         "baseline": {"per_type_table": "block_rw", "overrides": dict(_ALIBI)}},
     "Per-type read table, ALiBi, shared post-norm": {
         "group": _CONFOUNDS, "slug": "tf_type_table_alibi_postnorm",
-        "baseline": {"per_type_table": "block_read", "overrides": {**_ALIBI, "norm_placement": "post_shared"}}},
+        # Keeps the attention residual on a base without one (a declared difference): LN(a) with the
+        # zero-initialized read table starts in rank collapse (audit 2026-10-09 round 2 item 3).
+        "baseline": {"per_type_table": "block_read",
+                     "overrides": {**_ALIBI, "norm_placement": "post_shared", "attention_residual": True}}},
     "Gaussian attention": {
         "group": _WORD_LEVEL, "slug": "word_gaussian", "dataset": WORD_DATASET,
         "vfe": {"vocab_size": _word_vocab_size, "decode_ce_checkpoint": "auto_aggregate"}},
@@ -726,6 +765,7 @@ class ArmPlan:
     est_hours:    Optional[float] = None
     notes:        List[str] = field(default_factory=list)
     reused:       List[Tuple[int, int]] = field(default_factory=list)   # seed pairs served by the base run
+    deviations:   List[str] = field(default_factory=list)   # declared differences outside the protocol fields
 
 
 def seed_pairs(seeds: Sequence[Union[int, Sequence[int]]]) -> List[Tuple[int, int]]:
@@ -883,16 +923,40 @@ def _resolve_baseline(
         # Exact base total (two small-vocabulary builds), whether or not the plan reports counts.
         target = _vfe_counts(matched)["total"]
         rule = api.total_parameter_width(plan.cfg, target)
+        unscaled = plan.cfg
         plan.cfg = rule["config"]
         declared += TOTAL_MATCHED_FIELDS
         plan.notes.append(f"total parameters {rule['total_parameters']:,} at width {rule['width']} "
                           f"({rule['config'].n_heads} heads of {rule['head_dim']}) against the base's "
                           f"{target:,} ({100 * rule['relative_error']:+.2f}%)")
+        if plan.cfg.embed_dim != unscaled.embed_dim:
+            deviation = (f"lr not tuned at this width: the peak lr, initialization and warmup are width "
+                         f"{unscaled.embed_dim}'s; the hidden-matrix lr is scaled by {unscaled.embed_dim}/"
+                         f"{plan.cfg.embed_dim} (hidden_lr_scale={plan.cfg.hidden_lr_scale:g}, muP-style "
+                         "transfer, Yang et al. 2022, arXiv:2203.03466)")
+            plan.deviations.append(deviation)
+            plan.notes.append(f"declared difference: {deviation}")
     # A protocol field set by the arm's own overrides is a declared difference.
     plan.diff = check_baseline_arm(matched, plan.cfg, declared=declared)
+    if plan.cfg.hidden_lr_scale != 1.0:
+        plan.diff["hidden_lr_scale"] = (1.0, plan.cfg.hidden_lr_scale)
+    base_residual = bool(getattr(matched, "attention_residual", True))
+    if plan.cfg.norm_placement == "post_shared" and plan.cfg.attention_residual and not base_residual:
+        # Audit 2026-10-09 round 2 item 3: LN(Attn(h)) with a zero-initialized read table collapses the
+        # token states at init; with the residual the arm isolates the norm placement.
+        plan.diff["attention_residual"] = (False, True)
+        deviation = ("attention residual kept although the base has none: LN(h + Attn(h)) instead of the "
+                     "base's LN(Attn(h)), whose zero-initialized read table starts in rank collapse, so the arm "
+                     "isolates the norm placement")
+        plan.deviations.append(deviation)
+        plan.notes.append(f"declared difference: {deviation}")
     if plan.cfg.norm_placement == "post_shared" and not plan.cfg.attention_residual:
         plan.notes.append("shared post-norm without the attention residual, LN(Attn(h)), as the matched base "
                           "(attention_residual=False) computes; BaselineConfig.attention_residual=False")
+    if getattr(matched, "learn_attention_temperature", False):
+        n_temperature = int(matched.n_heads) * int(matched.n_layers)
+        plan.notes.append(f"the base learns its routing temperature: H x L = {n_temperature} context-processing "
+                          "parameters the matched arm does not have")
     for seed, _ in plan.seeds:
         _with_seed(plan.cfg, seed)
     if options.get("compute_matched"):
@@ -1212,6 +1276,7 @@ def build_manifest(
                        "reason": plan.reason if plan else None,
                        "changes": {k: [repr(a), repr(b)] for k, (a, b) in plan.diff.items()} if plan else {},
                        "complete": len(runs),
+                       "declared_deviations": list(plan.deviations) if plan else [],
                        "reuse_verified": expected is not None,
                        "stale": stale,
                        "code_identity": {}, "code_identity_mismatch": []}

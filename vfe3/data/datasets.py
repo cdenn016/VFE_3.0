@@ -825,9 +825,11 @@ class TokenWindows(Dataset):
         return self.window_offset
 
     def at_origin(self) -> "TokenWindows":
-        r"""A view of these windows (same stream, count and stride) with the origin at 0."""
+        r"""A fixed-origin view of these windows: same stream and stride, origin 0, and the ``'fixed'`` mode's
+        window count (a ``'per_epoch_random'`` dataset fits one window fewer whenever the stride's slack
+        does not fit; audit 2026-10-09 round 2, item 34)."""
         view = copy.copy(self)
-        view.window_offset = 0
+        view.window_offset_mode, view.window_offset, view.n = "fixed", 0, self._fixed_n
         return view
 
     def __len__(self) -> int:
