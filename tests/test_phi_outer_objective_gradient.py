@@ -466,7 +466,7 @@ def test_rejected_training_attempt_preserves_every_phi_factor_and_clock(
         status_out=status,
     )
 
-    assert status == {"did_step": False}
+    assert status["did_step"] is False and status["nonfinite_skip"] is True
     assert staging_calls == []
     assert scheduler.last_epoch == scheduler_epoch
     for parameter, expected in zip(factors, before):
@@ -500,4 +500,4 @@ def test_pullback_group_train_step_bypasses_generic_phi_projector(
         targets,
         status_out=status,
     )
-    assert status == {"did_step": True}
+    assert status["did_step"] is True and status["nonfinite_skip"] is False

@@ -343,8 +343,8 @@ def test_capture_keeps_local_coordinates() -> None:
     (dict(family="gaussian_frame_diagonal", decode_mode="diagonal_chunked"), "gaussian_frame_diagonal"),
     (dict(block_mlp_mode="canonical_frame"), "block_mlp_mode"),
     (dict(block_mlp_mode="gauge_gate", family="gaussian_full", decode_mode="full_chunked"), "block_mlp_mode"),
-    (dict(block_mlp_covariance="delta_full", family="gaussian_full", decode_mode="full_chunked"),
-     "block_mlp_covariance"),
+    # delta_full transports its covariance on gaussian_full / gaussian_block (audit 2026-10-10 round 2, #51) only
+    (dict(block_mlp_covariance="delta_full"), "block_mlp_covariance"),
     (dict(norm_type_block="mahalanobis"), "norm_type_block"),
     (dict(norm_type_final="mahalanobis"), "norm_type_final"),
 ])

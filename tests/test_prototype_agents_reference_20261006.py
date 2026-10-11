@@ -1031,7 +1031,7 @@ def test_two_rounds_equal_sequential_conditioning_with_gaussian_collapse(layout:
 def test_statistics_at_initialization_and_against_formulas(inference: str) -> None:
     K, e = 4, 2
     keys = {"prototype_weight_entropy", "prototype_effective_templates", "prototype_gain_fraction",
-            "prototype_template_variance", "prototype_prior_entropy"}
+            "prototype_template_variance", "prototype_prior_entropy", "prototype_label_staleness"}
     torch.manual_seed(0)
     init = PrototypeAgentBlockMLP(K, e, 0.0, inference=inference).double()
     lam0 = float(init.log_lambda.exp()[0, 0])                                     # float32 log(10), about 10

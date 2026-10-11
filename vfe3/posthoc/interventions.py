@@ -135,34 +135,20 @@ def _refuse_minimal_agent(model: torch.nn.Module, row: str) -> None:
 def frames_inactive_reason(model: torch.nn.Module, *, positional: bool = True) -> Optional[str]:
     r"""Why every realized frame of ``model`` is the identity, else ``None``.
 
-    The frame-free cases of the semantics rule (:func:`vfe3.semantics.run.load_semantic_run` sets
-    ``frames_active = gauge_transport == 'on' and n_gen > 0``): ``gauge_transport='off'``, which coerces
-    ``phi_scale=0``, ``m_phi_lr=0`` and ``pos_phi='none'`` and refuses a frame-space RoPE, and a group
-    without generators; and a token-frame table that starts at zero and never moves (``phi_scale=0``
-    with ``m_phi_lr=0``). ``gauge_transport='frozen'`` is not frame-free here: its random fixed frames act
-    on every forward pass, so removing them is a measured intervention (the semantics module skips
-    them because they carry no learned geometry, not because they are the identity). With
-    ``positional`` (the composed frame :math:`U_i = \exp(X_{x_i})\exp(Y_i)` of rows 9-12 and the
-    routing-covariance gap) a positional factor (``pos_phi`` or a frame-space RoPE fold) keeps the
-    frames active; without it (row 7, the token factor alone) it does not (audit 2026-10-10 #18).
+    :func:`vfe3.model.frame_actions.frames_identity_reason` of the model's config and generator count, the rule
+    the semantics run and the routing-covariance gap share (audit 2026-10-10 round 2, #46).
+    ``gauge_transport='frozen'`` is not frame-free here: its random fixed frames act on every forward pass, so
+    removing them is a measured intervention (the semantics module skips them because they carry no learned
+    geometry, not because they are the identity). With ``positional`` (the composed frame
+    :math:`U_i = \exp(X_{x_i})\exp(Y_i)` of rows 9-12 and the routing-covariance gap) a positional factor
+    (``pos_phi`` or a frame-space RoPE fold) keeps the frames active; without it (row 7, the token factor
+    alone) it does not (audit 2026-10-10 #18).
     """
-    cfg = model.cfg
-    if getattr(cfg, "gauge_transport", "on") == "off":
-        return ("gauge_transport='off': every realized frame is the identity (phi_scale=0, m_phi_lr=0 and "
-                "pos_phi='none' are coerced)")
+    from vfe3.model.frame_actions import frames_identity_reason
+
     table = getattr(model.prior_bank, "phi_embed", None)
-    if table is not None and int(table.shape[-1]) == 0:
-        reason = "the gauge group has no generators, so every token frame is the identity"
-    elif float(getattr(cfg, "phi_scale", 1.0)) == 0.0 and float(getattr(cfg, "m_phi_lr", 1.0)) == 0.0:
-        reason = "phi_scale=0 with m_phi_lr=0: the token frames start at the identity and never move"
-    else:
-        return None
-    if positional and (getattr(model, "pos_phi_free", None) is not None
-                       or getattr(cfg, "pos_phi", "none") != "none"
-                       or (getattr(cfg, "pos_rotation", "none") != "none"
-                           and getattr(cfg, "rope_space", "frame") != "comparison")):
-        return None
-    return reason
+    n_gen = int(table.shape[-1]) if table is not None else int(model.group.generators.shape[0])
+    return frames_identity_reason(model.cfg, n_gen, positional=positional)
 
 
 def _refuse_inactive_frames(model: torch.nn.Module, *, positional: bool) -> None:

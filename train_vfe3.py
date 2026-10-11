@@ -109,6 +109,7 @@ config = dict(
 
     batch_size                       = 32,
     max_steps                        = 30000,
+    grad_clip_scope                  = "role",      # "role" | "group" (one L2 clip per optimizer role, or per optimizer group)
 
     n_layers                         = 4,                   # L, number of blocks
     n_e_steps                        = 1,                   # T, E-step inner iterations
@@ -121,6 +122,7 @@ config = dict(
     eval_interval                    = 1500,      # periodic validation every N steps (0 = off)
     diagnose_canonical_free_energy   = False,     # log the canonical free energy (gauge-KL routing) at the captured beliefs
     checkpoint_interval              = 15000,     # save a resumable checkpoint every N steps (0 = off)   
+    divergence_abort                 = False,     # stop after 100 consecutive rejected updates or a row CE above ln V; finalize as "diverged"
     
     #################################
     #           Modes               #
@@ -129,6 +131,7 @@ config = dict(
     prior_covariance_table           = "diagonal",  # "diagonal" | "block_cholesky" (frame-free (xi, C) table: gaussian_block/full, gauge_transport="off", untie_decode_bank)
     encode_mode                      = "per_token",   # "per_token" | "per_token_additive" (additive only when phi carries no position)
     decode_mode                      = 'linear',  # "linear" | "diagonal_chunked" | "full_chunked" | "expected_likelihood_chunked" | "family_chunked" (the *_chunked modes decode through the prior bank)
+    decode_covariance                = "belief",                  # "belief" (stack's final Sigma_q) | "encoded" (token's encoded covariance) | "constant" (sigma_init I); prior-bank decode only
         
     attention_mode                   = "projected_predictive",  # "projected_predictive" | "projected_gradient"
     predictive_covariance            = 'moment_matched',  # "passthrough"| "moment_matched" (exact predictive-kernel covariance)
@@ -166,6 +169,7 @@ config = dict(
     block_mlp_mode                   = "prototype_agents",   # "coordinate" | "prototype_agents" | "canonical_frame" | "gaussian_template" | "gauge_gate"
     block_mlp_covariance             = "passthrough",  # "passthrough" | "delta_full" (coordinate, canonical_frame, gauge_gate) | "posterior" (prototype_agents); gaussian_template: "passthrough" only
     block_mlp_post_norm              = False,          # block norm reapplied to the post-MLP mean before the next router (local coords, needs a block norm)
+    block_mlp_autocast               = True,           # False: the MLP mean path runs in an fp32 island under amp_dtype (not read by prototype_agents)
     block_mlp_template_init          = "absolute",   # "absolute" | "working_variance" (lambda_0, nu from one batch; prototype_agents only)
     
     block_mlp_inference              = "mean_field",   # "mean_field" | "exact" (prototype_agents only)
@@ -279,7 +283,7 @@ config = dict(
 
     m_table_update_mode              = "adamw",   # "adamw" | "fisher" (natural-gradient M-step on mu_embed / sigma_log_embed; linear or untied decode)
     m_table_fisher_lr                = 0.1,       # fisher only: natural step size eta (the AdamW rates m_p_mu_lr / m_p_sigma_lr schedule it and set decay)
-    m_table_fisher_trust_radius      = 0.1,       # fisher only: per-row Fisher-norm bound (KL <= r^2/2 per step)
+    m_table_fisher_trust_radius      = 0.1,       # fisher only: per-row Fisher-norm bound (KL <= r^2/2 per step to second order; decay outside)
 
     #################################
     #    Embedding/Priors M-step
@@ -355,7 +359,7 @@ config["kl_max"] = 8 * config["embed_dim"]
 
 def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int,
             train_loader=None, full_corpus_tokens: 'int | None' = None) -> str:
-    from vfe3.train import _fmt_decode_lrs, _fmt_mixer_lr, coverage_lines, parameter_report
+    from vfe3.train import _fmt_decode_lrs, _fmt_mixer_lr, _fmt_table_lrs, coverage_lines, parameter_report
     rep = parameter_report(model, device=device)
     bar = "=" * 64
     cov = (coverage_lines(train_loader, n_steps, dataset, full_corpus_tokens=full_corpus_tokens)
@@ -375,7 +379,7 @@ def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int,
         f" steps={n_steps}  batch={cfg.batch_size}  dataset={dataset}",
         *cov,
         *dead_line,
-        f" M-LRs: mu={cfg.m_p_mu_lr}  sigma={cfg.m_p_sigma_lr}  "
+        f" M-LRs: {_fmt_table_lrs(cfg)}  "
         f"phi={cfg.m_phi_lr}",
         f" decoder M-LRs: {_fmt_decode_lrs(cfg)}",
         f" auxiliary M-LRs: "

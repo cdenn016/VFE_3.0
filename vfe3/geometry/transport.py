@@ -1137,6 +1137,11 @@ def _stable_compact_glk_exp_pair(
             )
 
     host_check(decisions, _chart_verdict)
+    # A deferred verdict lets matrix_exp see this call's blocks before it raises. CUDA matrix_exp picks its
+    # squaring count from the block norm, which saturates on an infinite block (a possibly endless squaring
+    # loop), while a NaN block exponentiates to NaN. Non-finite entries therefore become NaN; finite entries
+    # and their gradients are unchanged bit for bit, with no host sync (audit 2026-10-10 round 2, item 41).
+    blocks = torch.where(torch.isfinite(blocks), blocks, float("nan"))
 
     # Represented fp32 storage floor; the exponential is evaluated at the storage precision.
     store_dtype = blocks.dtype if blocks.dtype in (torch.float32, torch.float64) else torch.float32

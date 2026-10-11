@@ -113,7 +113,9 @@ def test_pair_gemm_gradcheck_float64(monkeypatch: pytest.MonkeyPatch, checkpoint
         return projected_gaussian_kl(a, .5 * (Gq + Gq.transpose(-1, -2)), b, .5 * (Gk + Gk.transpose(-1, -2)))
 
     assert torch.autograd.gradcheck(cost, (a, b, X, Y), eps=1e-6, atol=1e-7, rtol=1e-6)
-    assert ("_projected_kl_gemm" in calls) == checkpointed
+    # The GEMM saves only its token-linear inputs at every size (_IEEEFP32Recompute, audit 2026-10-10 round 2,
+    # item 2), so it no longer needs the checkpoint above the projection budget.
+    assert "_projected_kl_gemm" not in calls
 
 
 def test_symmetric_inputs_certificate_skips_only_the_symmetry_check() -> None:

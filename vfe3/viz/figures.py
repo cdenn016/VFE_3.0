@@ -1674,6 +1674,175 @@ def plot_free_energy_decomposition(
     return _save(fig, path)
 
 
+# The canonical diagnostic (diagnose_canonical_free_energy) on the projected routes evaluates, per token and at
+# the beliefs each router read, F_i = alpha_i D(q_i||p_i) + R(alpha_i)
+# + lambda_beta sum_h [sum_j beta*_ij D^h_ij + tau_h sum_j beta*_ij log(beta*_ij / pi_ij)] with the canonical
+# router beta* (vfe3.free_energy.canonical_routing_rows). No step on these routes optimizes it, so the figures
+# below title it as a diagnostic and carry no E-step or co-descent reading (audit 2026-10-10 round 2, #17).
+_CANONICAL_FE_LABELS = {
+    "self":              ("self-coupling", "self-coupling\n" r"$\alpha_iD(q_i\|p_i)+R(\alpha_i)$"),
+    "belief":            ("belief coupling", "belief coupling\n" r"$\lambda_\beta\sum_j\beta^*_{ij}D_{ij}$"),
+    "attention_entropy": ("router entropy", "router entropy\n"
+                          r"$\lambda_\beta\tau\sum_j\beta^*_{ij}\log(\beta^*_{ij}/\pi_{ij})$"),
+}
+# The unweighted self-divergence, drawn beside the terms (hatched) and not summed into F.
+_CANONICAL_SELF_DIVERGENCE_LABELS = ("self-divergence $D(q_i\\|p_i)$, not in the sum",
+                                     "self-divergence\n" r"$D(q_i\|p_i)$ (not summed)")
+# Router columns of the canonical diagnostic, drawn beside the energy: (column, label).
+_CANONICAL_ROUTER_SERIES: Tuple[Tuple[str, str], ...] = (
+    ("canonical_beta_tv", r"$\frac{1}{2}\sum_j|\beta_{ij}-\beta^*_{ij}|$ (model vs canonical router)"),
+    ("canonical_self_weight", r"canonical self weight $\beta^*_{ii}$"),
+)
+_CANONICAL_FE_NOTE = ("Canonical F at the beliefs each router read (diagnose_canonical_free_energy): a diagnostic. "
+                      "No step on this route optimizes it.")
+
+
+def _canonical_router_panel(ax, history: Dict, step: np.ndarray) -> bool:
+    r"""Draw the canonical-router columns of ``history`` over ``step``; False when none is finite."""
+    drawn = False
+    for index, (key, label) in enumerate(_CANONICAL_ROUTER_SERIES):
+        if key not in history:
+            continue
+        values = _np(history[key]).astype(float)
+        if not np.isfinite(values).any():
+            continue
+        ax.plot(step, values, "o-", ms=2, lw=1.1, color=_CB[(index + 3) % len(_CB)], label=label)
+        drawn = True
+    if drawn:
+        ax.set(xlabel="training step", ylabel="fraction of row mass", ylim=(0.0, 1.0),
+               title="Model router against the canonical router")
+        ax.legend(frameon=False, loc="best")
+        if _set_finite_xlim(ax, step):
+            _step_xaxis(ax)
+    return drawn
+
+
+@register_figure("canonical_free_energy_relationship")
+def plot_canonical_free_energy_relationship(
+    history: Dict,                       # step, self_coupling, belief_coupling, attention_entropy, val_ce
+    #                                      (+ canonical_beta_tv, canonical_self_weight when logged)
+
+    *,
+    lambda_beta: 'float | np.ndarray' = 1.0,
+    path:        Optional[str] = None,
+):
+    r"""The canonical free energy at the captured beliefs beside the held-out CE (a diagnostic).
+
+    Left: the per-token canonical :math:`F` of ``diagnose_canonical_free_energy`` (the self-coupling
+    :math:`\alpha_iD(q_i\|p_i)+R(\alpha_i)` plus the :math:`\lambda_\beta`-weighted belief coupling and router
+    entropy of the canonical router :math:`\beta^*`) and the validation CE on twin axes, each a faint raw
+    line under a rolling mean, with their Pearson association in the title. Right, when logged: the total
+    variation between the model's router and :math:`\beta^*` (and the canonical self weight). On the
+    projected routes nothing optimizes :math:`F`, so the figure makes no E-step or co-descent claim.
+    """
+    step, _comps, total, ce = _fe_terms(history, lambda_beta)
+    keep = np.isfinite(total) & np.isfinite(ce)
+    router_history = {key: _np(history[key]).astype(float)[keep]
+                      for key, _ in _CANONICAL_ROUTER_SERIES if key in history}
+    step, total, ce = step[keep], total[keep], ce[keep]
+    has_router = any(np.isfinite(values).any() for values in router_history.values())
+    w = max(5, total.size // 80)
+    with _compact_style():
+        fig, axes = plt.subplots(1, 2 if has_router else 1, squeeze=False,
+                                 figsize=(MAX_FIGURE_WIDTH_IN if has_router else 4.6, 3.0))
+        ax = axes[0][0]
+        ax.plot(step, total, lw=0.7, color=_CB[0], alpha=0.25)
+        flab = f"canonical F (left) = {total[-1]:.2f}" if step.size else "canonical F (left)"
+        ln1, = ax.plot(step, _rolling_mean(total, w), lw=1.6, color=_CB[0], label=flab)
+        ax.set(xlabel="training step", ylabel="canonical F (nats/token)")
+        ax.yaxis.label.set_color(_CB[0]); ax.tick_params(axis="y", colors=_CB[0])
+        if step.size and _set_finite_xlim(ax, step):
+            _step_xaxis(ax)
+        ax2 = ax.twinx()
+        ax2.spines["right"].set_visible(True)
+        ax2.plot(step, ce, lw=0.7, color=_CB[1], alpha=0.25)
+        clab = f"val CE (right) = {ce[-1]:.2f}" if step.size else "val CE (right)"
+        ln2, = ax2.plot(step, _rolling_mean(ce, w), lw=1.6, color=_CB[1], ls="--", label=clab)
+        ax2.set_ylabel("validation CE (nats/token)", color=_CB[1]); ax2.tick_params(axis="y", colors=_CB[1])
+        ax2.grid(False)
+        title = "Canonical F (diagnostic) and validation CE"
+        if total.size > 2:
+            title += rf" (Pearson $r={float(np.corrcoef(total, ce)[0, 1]):+.2f}$)"
+        ax.set_title(title)
+        ax.legend([ln1, ln2], [ln1.get_label(), ln2.get_label()], loc="upper right", frameon=False)
+        if has_router:
+            _canonical_router_panel(axes[0][1], router_history, step)
+        fig.text(0.01, 0.005, _CANONICAL_FE_NOTE, fontsize=6, color="#444444", ha="left", va="bottom")
+        fig.tight_layout(rect=(0.0, 0.05, 1.0, 1.0))
+        return _save(fig, path)
+
+
+@register_figure("canonical_free_energy_decomposition")
+def plot_canonical_free_energy_decomposition(
+    history: Dict,                       # step, self_coupling, belief_coupling, attention_entropy
+    #                                      (+ self_divergence, canonical_beta_tv, canonical_self_weight)
+
+    *,
+    lambda_beta: 'float | np.ndarray' = 1.0,
+    path:        Optional[str] = None,
+):
+    r"""Terms of the canonical free energy at the captured beliefs, at the last evaluation and by training third.
+
+    Panel A: the terms of the per-token canonical :math:`F` at the last logged evaluation, the self-coupling
+    :math:`\alpha_iD(q_i\|p_i)+R(\alpha_i)` and the :math:`\lambda_\beta`-weighted belief coupling and router
+    entropy of :math:`\beta^*`, which sum to :math:`F`, and, hatched and not summed, the unweighted
+    self-divergence :math:`D(q_i\|p_i)`, so the regularizer :math:`R(\alpha_i)` is not read as divergence.
+    Panel B: the same terms as medians over the early, mid and late thirds of training. Panel C, when
+    logged: the total variation between the model's router and :math:`\beta^*` (and the canonical self
+    weight). The axes are logarithmic when every drawn value is positive. A diagnostic: nothing on the
+    projected routes optimizes :math:`F`.
+    """
+    step, comps, _total, _ce = _fe_terms(history, lambda_beta)
+    names = [_CANONICAL_FE_LABELS[k][1] for k, _ in comps]
+    labels = [_CANONICAL_FE_LABELS[k][0] for k, _ in comps]
+    series = [c for _, c in comps]
+    hatches = [None] * len(series)
+    if "self_divergence" in history and np.isfinite(_np(history["self_divergence"]).astype(float)).any():
+        series.append(_np(history["self_divergence"]).astype(float))
+        labels.append(_CANONICAL_SELF_DIVERGENCE_LABELS[0])
+        names.append(_CANONICAL_SELF_DIVERGENCE_LABELS[1])
+        hatches.append("///")
+    colors = [_CB[0], _CB[1], _CB[2], _CB[0]][:len(series)]
+    has_router = any(key in history and np.isfinite(_np(history[key]).astype(float)).any()
+                     for key, _ in _CANONICAL_ROUTER_SERIES)
+    last = np.array([s[-1] for s in series], dtype=float)
+    thirds = np.array_split(np.arange(step.size), 3)
+    medians = [[float(np.median(s[idx])) if idx.size else np.nan for idx in thirds] for s in series]
+    with _compact_style():
+        n_panels = 3 if has_router else 2
+        fig, axes = plt.subplots(1, n_panels, squeeze=False, figsize=(MAX_FIGURE_WIDTH_IN, 3.0))
+        axes = axes[0]
+        y = np.arange(len(series))[::-1]
+        for yi, value, color, hatch in zip(y, last, colors, hatches):
+            axes[0].barh(yi, value, color="white" if hatch else color, edgecolor=color, hatch=hatch,
+                         height=0.62, lw=0.8)
+            axes[0].annotate(f"{value:.2f}", xy=(value, yi), xytext=(3, 0), textcoords="offset points",
+                             va="center", ha="left")
+        positive = bool(np.all(last[np.isfinite(last)] > 0))
+        if positive:
+            axes[0].set_xscale("log")
+            axes[0].set_xlim(float(np.nanmin(last)) * 0.5, float(np.nanmax(last)) * 4.0)
+        axes[0].set_yticks(y); axes[0].set_yticklabels(names)
+        axes[0].set(xlabel="nats/token" + (" (log scale)" if positive else ""),
+                    title=f"Terms of F at step {int(step[-1]):,}" if step.size else "Terms of F")
+        centers = np.arange(3)
+        width = min(0.2, 0.8 / max(len(series), 1))
+        off0 = (len(series) - 1) / 2.0
+        for j, (meds, color, hatch) in enumerate(zip(medians, colors, hatches)):
+            axes[1].bar(centers + (j - off0) * width, meds, width=width, color="white" if hatch else color,
+                        edgecolor=color, hatch=hatch, lw=0.8, label=labels[j])
+        if positive and np.all(np.asarray(medians, dtype=float)[np.isfinite(medians)] > 0):
+            axes[1].set_yscale("log")
+        axes[1].set_xticks(centers); axes[1].set_xticklabels(["early", "mid", "late"])
+        axes[1].set(xlabel="training third", ylabel="median (nats/token)", title="Terms by training third")
+        axes[1].legend(frameon=False, loc="best")
+        if has_router:
+            _canonical_router_panel(axes[2], history, step)
+        fig.text(0.01, 0.005, _CANONICAL_FE_NOTE, fontsize=6, color="#444444", ha="left", va="bottom")
+        fig.tight_layout(rect=(0.0, 0.05, 1.0, 1.0))
+        return _save(fig, path)
+
+
 def _grad_norm_decomp_fig(
     history: Dict,
     spec:    list,                       # [(column_key, latex_label, color, role_name), ...]
@@ -2620,6 +2789,8 @@ def _readout_panels(
     drawn beside its ``_layer_max`` column; the routing-cap panels add the per-(layer, head) maxima of
     the capped fraction, the fully clamped rows and the self weight, and the layers attaining them
     (audit 2026-10-09 round 2, item 23). On the per-layer figure the headline columns are that layer's.
+    Under ``diagnose_canonical_free_energy`` two further panels show the canonical :math:`F` terms at the
+    captured beliefs and the model router's distance from the canonical router :math:`\beta^*`.
     """
     last = "" if by_layer else ", last layer"
     panels: List[Dict[str, object]] = [
@@ -2659,6 +2830,18 @@ def _readout_panels(
         {"title": "Comparison map smallest singular value", "ylabel": "singular value", "series": [
             ("relational_score_q_raw_min_singular_value", "Q", _CB[0]),
             ("relational_score_k_raw_min_singular_value", "K", _CB[1])]},
+        # diagnose_canonical_free_energy only (NaN otherwise, so the panels drop): the canonical F at the
+        # beliefs each router read, which nothing on these routes optimizes (audit 2026-10-10 round 2, #24).
+        {"title": "Canonical F at the captured beliefs (diagnostic)", "ylabel": "nats/token", "series": [
+            ("total", "F at the layer input", _CB[7]),
+            ("canonical_total_output", "F at the readout output", _CB[4]),
+            ("self_coupling", r"self-coupling $\alpha D+R(\alpha)$", _CB[0]),
+            ("self_divergence", r"self-divergence $D(q\|p)$", _CB[5]),
+            ("belief_coupling", r"belief coupling $\sum_j\beta^*_{ij}D_{ij}$", _CB[1]),
+            ("attention_entropy", "router entropy term", _CB[2])]},
+        {"title": "Model router against the canonical router", "ylabel": "fraction of row mass", "series": [
+            (key, label, _CB[(index + 3) % len(_CB)])
+            for index, (key, label) in enumerate(_CANONICAL_ROUTER_SERIES)]},
     ]
     panels += [
         {"title": "Content-link spectrum (similarity invariant)", "ylabel": r"$|\lambda|$", "logy": True,
@@ -3143,6 +3326,7 @@ def plot_attention_stats(
     specs:  Sequence[Tuple[str, str, Optional[Tuple[float, float]]]] = _ATTENTION_STATS,
     title:  str = "Attention statistics by layer and head",
     source: str = "attention_stats.csv",
+    note:   Optional[str] = None,        # one-line figure footnote
 ):
     r"""Per-layer, per-head attention statistics at one evaluation (S2 panel B), as heatmaps.
 
@@ -3152,8 +3336,8 @@ def plot_attention_stats(
     overlap :math:`\sum_j\min(\beta_{ij},\beta^{\mathrm{prior}}_{ij})` with the attention of the
     log-prior alone (1 means the prior explains the pattern). Bounded statistics share the [0, 1]
     color range so layers and runs compare directly. ``specs`` (column, label, color bounds),
-    ``title`` and ``source`` let another long ``(step, layer, head)`` table reuse the layout
-    (:func:`plot_routing_heads`).
+    ``title``, ``source`` and ``note`` let another long ``(step, layer, head)`` table reuse the layout
+    (:func:`plot_routing_heads`). NaN cells are left blank and do not set the color range.
     """
     steps = _np(table["step"]).astype(float)
     finite_steps = steps[np.isfinite(steps)]
@@ -3199,7 +3383,11 @@ def plot_attention_stats(
         suffix = (f", {int(np.nanmedian(n_query)):,} query rows per head"
                   if n_query.size and np.isfinite(n_query).any() else "")
         fig.suptitle(f"{title} (step {shown:,.0f}{suffix})")
-        fig.tight_layout()
+        if note:
+            fig.text(0.01, 0.005, note, fontsize=6, color="#444444", ha="left", va="bottom")
+            fig.tight_layout(rect=(0.0, 0.04, 1.0, 1.0))
+        else:
+            fig.tight_layout()
         return _save(fig, path)
 
 
@@ -3213,13 +3401,14 @@ def plot_attention_stats_training(
     specs:  Sequence[Tuple[str, str, Optional[Tuple[float, float]]]] = _ATTENTION_STATS,
     title:  str = "Attention statistics over training",
     source: str = "attention_stats.csv",
+    note:   Optional[str] = None,        # one-line figure footnote
 ):
     r"""The attention statistics of :func:`plot_attention_stats` over training.
 
     For each statistic and layer, the line is the mean over heads and the band spans the heads'
-    minimum and maximum, so both the layer trend and the spread between heads are visible. Raises
-    :class:`FigureSkipped` with fewer than two evaluation steps. ``specs``, ``title`` and ``source``
-    as in :func:`plot_attention_stats`.
+    minimum and maximum, so both the layer trend and the spread between heads are visible; NaN cells
+    enter neither. Raises :class:`FigureSkipped` with fewer than two evaluation steps. ``specs``,
+    ``title``, ``source`` and ``note`` as in :func:`plot_attention_stats`.
     """
     steps = _np(table["step"]).astype(float)
     grid_steps = np.unique(steps[np.isfinite(steps)])
@@ -3262,7 +3451,11 @@ def plot_attention_stats_training(
         for index in range(len(stats), n_rows_fig * n_cols):
             axes[index // n_cols][index % n_cols].axis("off")
         fig.suptitle(f"{title} (line: head mean; band: head range)")
-        fig.tight_layout()
+        if note:
+            fig.text(0.01, 0.005, note, fontsize=6, color="#444444", ha="left", va="bottom")
+            fig.tight_layout(rect=(0.0, 0.04, 1.0, 1.0))
+        else:
+            fig.tight_layout()
         return _save(fig, path)
 
 
@@ -3274,6 +3467,9 @@ _ROUTING_HEAD_STATS: Tuple[Tuple[str, str, Optional[Tuple[float, float]]], ...] 
     ("prior_log_defect_rms", r"prior holonomy: RMS $\log\rho_{ijk}$", None),
 )
 _ROUTING_HEAD_SOURCE = "the per-head routing-cap and holonomy tables"
+# Below this mean two-step path weight per query row a head routes almost no mass along any triangle, and its
+# path-weighted holonomy RMS is a ratio of vanishing sums (audit 2026-10-10 round 2, #22: 27.31 at 1.5e-35).
+ROUTING_HOLONOMY_MIN_PATH_MASS = 1e-6
 
 
 def routing_head_table(
@@ -3287,13 +3483,16 @@ def routing_head_table(
     clamped_rows / rows`` (``cap_clamped_rows.csv``; a row whose every source cost is capped, the
     only case in which the clamp changes :math:`\beta`), NaN at a zero denominator, and the
     path-weighted RMS of :math:`\log\rho_{ijk}` for the router and its prior alone
-    (``routing_holonomy.csv``). A key absent from one table is NaN in its columns. None when every
-    table is None or has no row (audit 2026-10-10 #64).
+    (``routing_holonomy.csv``) with the router's mean two-step path mass ``path_mass``. The router's
+    holonomy is NaN where ``path_mass`` is below :data:`ROUTING_HOLONOMY_MIN_PATH_MASS`. A key absent
+    from one table is NaN in its columns. None when every table is None or has no row (audit
+    2026-10-10 #64).
     """
     sources = ((cap, (("cap_fraction", "capped", "entries"),)),
                (clamped, (("clamped_row_fraction", "clamped_rows", "rows"),)),
                (holonomy, (("log_defect_rms", "log_defect_rms", None),
-                           ("prior_log_defect_rms", "prior_log_defect_rms", None))))
+                           ("prior_log_defect_rms", "prior_log_defect_rms", None),
+                           ("path_mass", "path_mass", None))))
     merged: Dict[Tuple[float, int, int], Dict[str, float]] = {}
     for table, columns in sources:
         if not table or any(key not in table for key in ("step", "layer", "head")):
@@ -3318,7 +3517,24 @@ def routing_head_table(
                                   "head": np.array([k[2] for k in order], dtype=float)}
     for name, _, _ in _ROUTING_HEAD_STATS:
         out[name] = np.array([merged[k].get(name, np.nan) for k in order])
+    out["path_mass"] = np.array([merged[k].get("path_mass", np.nan) for k in order])
+    out["log_defect_rms"][out["path_mass"] < ROUTING_HOLONOMY_MIN_PATH_MASS] = np.nan
     return out
+
+
+def _low_path_mass_note(
+    table: Mapping[str, object],
+    rows:  np.ndarray,                   # bool mask of the table rows the figure draws
+    where: str,                          # how the figure treats the withheld cells
+) -> Optional[str]:
+    r"""Footnote counting the (step, layer, head) cells whose routing holonomy was withheld for low path mass."""
+    if "path_mass" not in table:
+        return None
+    n_low = int(np.sum(rows & (_np(table["path_mass"]).astype(float) < ROUTING_HOLONOMY_MIN_PATH_MASS)))
+    if not n_low:
+        return None
+    return (f"Routing holonomy withheld for {n_low} (step, layer, head) cell(s) whose mean two-step path mass is "
+            f"below {ROUTING_HOLONOMY_MIN_PATH_MASS:g} per query row ({where}).")
 
 
 @register_figure("routing_heads")
@@ -3333,11 +3549,18 @@ def plot_routing_heads(
 
     The columns of :func:`routing_head_table` in the layout of :func:`plot_attention_stats`: the
     capped share of causal entries, the fully clamped share of query rows (both on [0, 1]), and the
-    routing and prior holonomy RMS of :math:`\log\rho_{ijk}`, on the fixed validation windows.
+    routing and prior holonomy RMS of :math:`\log\rho_{ijk}`, on the fixed validation windows. A head
+    whose path mass is below :data:`ROUTING_HOLONOMY_MIN_PATH_MASS` has a blank routing-holonomy cell
+    that does not set the color range, and a footnote counts those cells.
     """
+    steps = _np(table["step"]).astype(float)
+    finite_steps = steps[np.isfinite(steps)]
+    shown = (float(finite_steps.max()) if step is None and finite_steps.size
+             else float("nan") if step is None else float(step))
+    note = _low_path_mass_note(table, steps == shown, "blank cells")
     return plot_attention_stats(table, step=step, path=path, specs=_ROUTING_HEAD_STATS,
                                 title="Routing cap and holonomy by layer and head",
-                                source=_ROUTING_HEAD_SOURCE)
+                                source=_ROUTING_HEAD_SOURCE, note=note)
 
 
 @register_figure("routing_heads_training")
@@ -3347,10 +3570,14 @@ def plot_routing_heads_training(
     *,
     path:  Optional[str] = None,
 ):
-    r"""The statistics of :func:`plot_routing_heads` over training (line: head mean; band: head range)."""
+    r"""The statistics of :func:`plot_routing_heads` over training (line: head mean; band: head range).
+
+    Routing-holonomy cells withheld for low path mass enter neither the head mean nor the head range."""
+    steps = _np(table["step"]).astype(float)
+    note = _low_path_mass_note(table, np.isfinite(steps), "excluded from the head mean and range")
     return plot_attention_stats_training(table, path=path, specs=_ROUTING_HEAD_STATS,
                                          title="Routing cap and holonomy over training",
-                                         source=_ROUTING_HEAD_SOURCE)
+                                         source=_ROUTING_HEAD_SOURCE, note=note)
 
 
 @register_figure("residual_ratio")
@@ -3604,6 +3831,7 @@ _EQUIVARIANCE_LABELS = {
     "receiver_update_mean":       r"update $U_i^{-1}\mu_i^+$",
     "receiver_update_covariance": r"update $U_i^{-1}\Sigma_i^+U_i^{-\top}$",
     "receiver_energy":            r"energy $F$",
+    "self_coupling":              r"self term $\alpha_iD_i+R(\alpha_i)$",
 }
 
 
@@ -5441,15 +5669,20 @@ def plot_ppl_offset(
 # helpers below render manuscript notation -- KL(q_i||p_i), sum_ij beta_ij KL(q_i||Omega_ij q_j),
 # ... -- instead of the raw column names. Math is $...$ mathtext; pub_label() falls back to a
 # humanized name for any key not listed. Notation matches the canonical free energy: q_i belief,
-# p_i prior, Omega_ij transport, beta_ij belief attention, pi_ij prior attention, tau softmax
-# temperature, alpha self-coupling weight, Sigma belief covariance
+# p_i prior, Omega_ij transport, beta*_ij the canonical router softmax_j(log pi_ij - D_ij / tau) that
+# weights the free-energy blocks (the model's attention only on a route whose router is that softmax; on
+# the projected routes the blocks come from diagnose_canonical_free_energy), pi_ij prior attention, tau
+# softmax temperature, alpha self-coupling weight with regularizer R(alpha), Sigma belief covariance
 # (Sigma^{-1} precision / mean-block Fisher).
 PUB_LABELS: Dict[str, str] = {
     # -- belief-channel free-energy blocks (raw per-token block energies) --
-    "self_coupling":      r"$\sum_i \alpha_i\,\mathrm{KL}(q_i\|p_i)$",
+    "self_coupling":      r"$\sum_i [\alpha_i\,\mathrm{KL}(q_i\|p_i)+R(\alpha_i)]$",
     "self_divergence":    r"$\sum_i \mathrm{KL}(q_i\|p_i)$",
-    "belief_coupling":    r"$\sum_{ij}\beta_{ij}\,\mathrm{KL}(q_i\|\Omega_{ij}q_j)$",
-    "attention_entropy":  r"$\tau\sum_{ij}\beta_{ij}\log(\beta_{ij}/\pi_{ij})$",
+    "belief_coupling":    r"$\sum_{ij}\beta^*_{ij}\,\mathrm{KL}(q_i\|\Omega_{ij}q_j)$",
+    "attention_entropy":  r"$\tau\sum_{ij}\beta^*_{ij}\log(\beta^*_{ij}/\pi_{ij})$",
+    "total":              r"free energy $F$ per token (nats)",
+    "canonical_beta_tv":  r"router distance $\frac{1}{2}\sum_j|\beta_{ij}-\beta^*_{ij}|$",
+    "canonical_total_delta": r"$F_l(\mathrm{out})-F_l(\mathrm{in})$ (nats/token)",
     "inner_alignment_energy_total": r"inner alignment energy (nats/token)",
     "free_energy_total":  r"inner alignment energy (legacy column alias)",
     # -- attention / gauge / belief-geometry diagnostics --

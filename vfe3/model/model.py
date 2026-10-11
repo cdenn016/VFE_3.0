@@ -51,7 +51,7 @@ from vfe3.model.block_mlp import (
     build_block_mlp,
     get_block_mlp_registration,
 )
-from vfe3.model.block import _as_coeff
+from vfe3.model.block import _as_coeff, norm_covariance_pushforward
 from vfe3.model.frame_actions import frame_matvec
 from vfe3.model.positional_phi import positional_phi_coords
 from vfe3.model.prior_bank import (
@@ -176,6 +176,15 @@ def build_group(cfg: VFE3Config) -> GaugeGroup:
         f"gauge group {cfg.gauge_group!r} builder has unsupported positional arity {arity}; "
         f"build_group dispatches K (arity 1) or (K, n_heads) (arity 2)"
     )
+
+
+# Per-layer covariance-scale and rank columns of VFEModel._covariance_scale_statistics (audit 2026-10-10 round 2,
+# items 3, 4 and 13); the canonical free-energy columns that only diagnose_canonical_free_energy adds (items 18, 27).
+_COVARIANCE_SCALE_KEYS: Tuple[str, ...] = (
+    "relational_projected_cov_scale", "relational_projected_cov_gram_min_eigenvalue",
+    "relational_comparison_map_norm_spread", "relational_input_cov_scale_ratio", "relational_rank_one_residual")
+CANONICAL_DIAGNOSTIC_KEYS: Tuple[str, ...] = (
+    "canonical_beta_tv", "canonical_self_weight", "canonical_total_output", "canonical_total_delta")
 
 
 @dataclass(frozen=True)
@@ -883,6 +892,35 @@ class VFEModel(nn.Module):
             block_diagonal=canonical_frame.block_diagonal,
         )
 
+    def _decode_covariance(
+        self,
+        mu_q:          torch.Tensor,                             # (B, N, K)
+        sigma_q:       torch.Tensor,                             # (B, N, K) or (B, N, K, K) the stack's Sigma_q
+        encoded_sigma: Optional[torch.Tensor],                   # the stack's input covariance, same layout or diagonal
+    ) -> torch.Tensor:                                            # the covariance the prior-bank decoder reads
+        r"""The covariance the prior-bank decoder reads, selected by ``cfg.decode_covariance``.
+
+        ``"belief"`` returns the stack's final :math:`\Sigma_q`, so the logit is the exact
+        :math:`-\mathrm{KL}(q^*_i\Vert p_v)/\tau`. ``"encoded"`` returns the token's encoded covariance (the stack's
+        input), and ``"constant"`` returns :math:`\sigma_{\mathrm{init}}I`. Both alternatives keep the trace term
+        :math:`\mathrm{tr}(\Sigma_v^{-1}\Sigma_q)/(2\tau)` of the logit off the covariance the stack builds.
+        """
+        mode = self.cfg.decode_covariance
+        if mode == "belief":
+            return sigma_q
+        full = sigma_q.dim() == mu_q.dim() + 1                   # (..., K, K) layout
+        if mode == "constant":
+            if full:
+                eye = torch.eye(sigma_q.shape[-1], dtype=sigma_q.dtype, device=sigma_q.device)
+                return (float(self.cfg.sigma_init) * eye).expand_as(sigma_q).contiguous()
+            return torch.full_like(sigma_q, float(self.cfg.sigma_init))
+        if encoded_sigma is None:
+            raise ValueError("decode_covariance='encoded' needs the encoded covariance; decode through "
+                             "forward_beliefs or forward, which carry it")
+        if full and encoded_sigma.dim() == mu_q.dim():
+            encoded_sigma = torch.diag_embed(encoded_sigma)          # (B, N, K) -> (B, N, K, K)
+        return encoded_sigma
+
     def _decode_belief_with_context(
         self,
         mu_q:            torch.Tensor,                           # (B, N, K)
@@ -891,13 +929,17 @@ class VFEModel(nn.Module):
         *,
         canonical_frame: Optional[CanonicalFrameContext] = None,  # (B, N, ...) realized frame
         decode_last:     bool = False,
+        encoded_sigma:   Optional[torch.Tensor] = None,          # the stack's input covariance (decode_covariance)
     ) -> torch.Tensor:                                            # (B, N, V), or (B, 1, V) when decode_last
         r"""Decode one realized belief through the model-owned frame/context boundary.
 
         Decoding is positionwise, so ``decode_last`` slices the query, its covariance, and its
         realized frame to the final position BEFORE the vocabulary readout rather than decoding
-        all ``N`` positions and discarding ``N - 1`` of them.
+        all ``N`` positions and discarding ``N - 1`` of them. A prior-bank decoder reads the covariance
+        :meth:`_decode_covariance` selects; the linear readout ignores it.
         """
+        if self.cfg.decode_mode != "linear":
+            sigma_q = self._decode_covariance(mu_q, sigma_q, encoded_sigma)
         if decode_last:
             last = slice(-1, None)
             mu_q, sigma_q = mu_q[:, last], sigma_q[:, last]
@@ -975,6 +1017,7 @@ class VFEModel(nn.Module):
         capture:        Optional[MStepCapture]       = None,   # out-param: M-step intermediates (q*, final-block prior, raw out)
         estep_grad_out: Optional[EStepGradientOutput] = None,   # diag out-param: E-step belief-grad norms (forwarded)
         _decode_frame_out: Optional[dict]            = None,   # private out-param: the reference decode frame
+        _encoded_sigma_out: Optional[dict]           = None,   # private out-param: the stack's input covariance
     ) -> 'Tuple[BeliefState, Optional[torch.Tensor]]':
         r"""Run the belief pipeline and return the converged belief q* (post final_norm), optionally
         with the decoded logits. This is the single belief-production seam used by ``forward`` and,
@@ -983,8 +1026,9 @@ class VFEModel(nn.Module):
         Factors the (previously inline) sequence q_i(0) = p_i = encode(token) -> phi <- pos_phi ->
         (optional s-refine) -> precision-bias fold -> vfe_stack (L blocks of E-step belief descent) ->
         final_norm, i.e. the map from token ids to the converged Gaussian tuple q* = (mu*, Sigma*, phi*).
-        The returned ``BeliefState`` carries mu = final_norm(mu_final, sigma_final), sigma = sigma_final,
-        and phi = out.phi UNCHANGED (final_norm transforms only the mean), so a caller reads q*.phi for
+        The returned ``BeliefState`` carries mu = final_norm(mu_final, sigma_final), sigma = sigma_final
+        (pushed through a LayerNorm final norm under block_norm_covariance='pushforward', else unchanged),
+        and phi = out.phi UNCHANGED (final_norm does not touch the frame), so a caller reads q*.phi for
         the M-step gauge penalty exactly as forward does. ``return_logits`` decodes p(o | q*_i) via
         ``prior_bank.decode`` inside the SAME fp32 island forward's inference branch uses. By default
         the decode covers every position and remains byte-identical to the pre-refactor
@@ -1125,7 +1169,16 @@ class VFEModel(nn.Module):
         sigma_final = out.sigma                                  # inside vfe_stack now, not post-stack
 
         if self.final_norm is not None:                          # config-selected final norm (cached)
-            if self.cfg.block_coordinates == "reference":
+            # block_norm_covariance='pushforward' also carries Sigma through a LayerNorm final norm at the pre-norm
+            # mean, as at the block norm, so a decoder that reads Sigma sees post-norm units (audit 2026-10-10
+            # round 2, item 49); in reference coordinates it acts on C_i = U_i^{-1} Sigma_i U_i^{-T}.
+            push_final = (self.cfg.block_norm_covariance == "pushforward"
+                          and self.cfg.norm_type_final == "layernorm")
+            reference = self.cfg.block_coordinates == "reference"
+            sigma_pushed = (norm_covariance_pushforward(self.final_norm, mu_final, sigma_final, self.group, self.cfg,
+                                                        frame=relational_frame if reference else None)
+                            if push_final else sigma_final)
+            if reference:
                 # Reference coordinates: mu -> U_i FN(U_i^{-1} mu), the same conjugation as the block.
                 bd = relational_frame.block_diagonal
                 xi_final = frame_matvec(relational_frame.inverse, mu_final, bd)    # (B, N, K)
@@ -1133,6 +1186,7 @@ class VFEModel(nn.Module):
                                         self.final_norm(xi_final, sigma_final), bd)
             else:
                 mu_final = self.final_norm(mu_final, sigma_final)
+            sigma_final = sigma_pushed
 
         belief = BeliefState(mu=mu_final, sigma=sigma_final, phi=out.phi,
                              right_phi=out.right_phi)   # carry the exact positional right factor
@@ -1142,6 +1196,8 @@ class VFEModel(nn.Module):
             # that need the complete pre-normalization pipeline state.
             capture["prior"] = beliefs
             capture["out"]   = out
+        if _encoded_sigma_out is not None:
+            _encoded_sigma_out["sigma"] = beliefs.sigma          # decode_covariance='encoded' reads it
         logits = None
         if return_logits:
             logits = self._decode_belief_with_context(
@@ -1149,6 +1205,7 @@ class VFEModel(nn.Module):
                 sigma_final,
                 canonical_frame=canonical_frame,
                 decode_last=decode_last,
+                encoded_sigma=beliefs.sigma,
             )
         return belief, logits
 
@@ -1205,6 +1262,9 @@ class VFEModel(nn.Module):
         # captureless fast paths (content-factor reuse, mean-only final layer) stay available.
         decode_frame_out: Optional[dict] = (
             {} if self.cfg.decode_coordinates == "reference" else None)
+        # decode_covariance='encoded': the prior-bank decoder reads the stack's input covariance.
+        encoded_sigma_out: Optional[dict] = (
+            {} if self.cfg.decode_covariance == "encoded" and self.cfg.decode_mode != "linear" else None)
         belief, _ = self.forward_beliefs(
             token_ids,
             return_logits=False,
@@ -1212,8 +1272,12 @@ class VFEModel(nn.Module):
             estep_grad_out=estep_grad_out,
             _reuse_content_factors=True,
             **({} if decode_frame_out is None else {"_decode_frame_out": decode_frame_out}),
+            **({} if encoded_sigma_out is None else {"_encoded_sigma_out": encoded_sigma_out}),
         )
-        mu_final, sigma_final = belief.mu, belief.sigma          # (B, N, K) post final_norm; sigma = out.sigma
+        mu_final, sigma_final = belief.mu, belief.sigma          # (B, N, K) post final_norm (sigma pushed under pushforward)
+        encoded_sigma = encoded_sigma_out["sigma"] if encoded_sigma_out is not None else None
+        if self.cfg.decode_mode != "linear":
+            sigma_final = self._decode_covariance(mu_final, belief.sigma, encoded_sigma)   # what the decoder reads
         canonical_frame = (
             cap.get("canonical_frame") if cap is not None else None
         )
@@ -1288,6 +1352,7 @@ class VFEModel(nn.Module):
                 mu_final,
                 sigma_final,
                 canonical_frame=canonical_frame,
+                encoded_sigma=encoded_sigma,
             )                                                        # (B, N, V) fp32
             # targets is guaranteed not None here (the inference path returned via forward_beliefs above).
             with self._amp_off_context(token_ids.device):
@@ -1395,11 +1460,12 @@ class VFEModel(nn.Module):
                 "objective_total_with_cg": loss.detach(),
             }
         if em_weight > 0.0:
-            # EM M-step term on the prototype templates (audit 2026-10-10, item 24):
+            # EM M-step term on the prototype templates (audit 2026-10-10, item 24; round 2, item 15):
             # L_EM = -w sum_l mean_i Q_il, the mean over the scored tokens (targets != -100) of each layer's rows
-            # Q_il = sum_a rbar_ia [log pihat_a + log N(xibar_i; nu_a, Lambda_a) - sum_k cbar_ik / (2 lambda_ak)]
-            # (PrototypeAgentBlockMLP.em_objective). The block-input moments and the template weights are detached,
-            # so the gradient is the M-step's and reaches only (nu, log lambda, log pi). Added to loss, not to ce.
+            # Q_il = sum_a q(a) E_q(X|a)[log pihat_a + log N(X; nu_a, Lambda_a)] under the posterior the block ran:
+            # the exact component posteriors (m_ia, P_ia), whose gradient is grad log p(xi | theta), or the last
+            # CAVI sweep's (r, xi+, diag C+) (PrototypeAgentBlockMLP.em_objective). That posterior is detached, so
+            # the gradient is the M-step's and reaches only (nu, log lambda, log pi). Added to loss, not to ce.
             em_rows = cap["block_mlp_em_rows"]                                 # n_layers x (B, N)
             if len(em_rows) != self.cfg.n_layers:
                 raise RuntimeError(f"block_mlp_em_weight>0 requires one EM row tensor per layer "
@@ -1774,6 +1840,137 @@ class VFEModel(nn.Module):
         return (min(float(eig.min()) for eig in eigs),
                 max(float((eig[..., -1]/eig[..., 0]).max()) for eig in eigs))
 
+    def _covariance_scale_statistics(
+        self,
+        snapshot:    DiagnosticSnapshot,
+        layer_index: int,
+        cap:         dict,                     # the layer's relational capture
+    ) -> Dict[str, float]:
+        r"""Covariance-scale, scale-free and rank statistics of one layer (audit 2026-10-10 round 2, items 3, 4, 13).
+
+        With :math:`G` the captured query and key projected covariances (per head, :math:`r\times r`; the
+        commutant projection when the router scores it), :math:`S_{Q,h}, S_{K,h}` the head's comparison maps
+        and :math:`P` the projection onto the commutant of the comparison RoPE torus
+        (:func:`vfe3.geometry.rope.rope_commutant_projection`; the identity without comparison RoPE):
+
+        ``relational_projected_cov_scale`` is the median over (role, batch, token, head) of
+        :math:`\operatorname{tr}G/r`, the absolute scale the router reads. It moves with the comparison maps.
+
+        ``relational_projected_cov_gram_min_eigenvalue`` is scale-free. With the joint map Gram
+        :math:`N_h = \tfrac12(S_{Q,h}S_{Q,h}^\top + S_{K,h}S_{K,h}^\top)` it is the smallest eigenvalue of the
+        pencil :math:`(P(G), P(N_h))`, i.e. of :math:`L^{-1}P(G)L^{-\top}` with :math:`LL^\top = P(N_h)`, as the
+        median over (role, batch, token) per head and the minimum over heads. Every routing cost is invariant
+        under :math:`(S_Q, S_K)\mapsto(AS_Q, AS_K)` for :math:`A` in the commutant (all of :math:`GL(r)`
+        without RoPE), and both :math:`P(G)` and :math:`P(N_h)` move by the congruence :math:`A(\cdot)A^\top`
+        (:math:`P` commutes with it), so the pencil is invariant along that free orbit, which moves the
+        absolute :math:`\lambda_{\min}(G)` (item 13). On a rotating plane :math:`p` the pencil eigenvalue is
+        :math:`g_p/n_p`, with :math:`g_p = \tfrac12\operatorname{tr}G_{[p]}` the plane's isotropic variance and
+        :math:`n_p = \tfrac14(\|S_Q[p]\|_F^2 + \|S_K[p]\|_F^2)` the joint map norm per coordinate of the plane
+        (half the audit's :math:`\tfrac12(\|S_Q[p]\|_F^2 + \|S_K[p]\|_F^2)`, so that a reference covariance
+        :math:`\sigma^2I` read by :math:`S_Q = S_K` gives :math:`\sigma^2` on every plane and on the
+        non-rotating block alike); the non-rotating block contributes its generalized eigenvalues against its
+        Gram block. Under the minimal agent :math:`S_K = T` is also the content map, so the orbit is not a
+        symmetry there; the value is still the invariant of the pencil.
+
+        ``relational_comparison_map_norm_spread`` is the condition number of :math:`P(N_h)`, the maximum over
+        heads: the spread of the per-plane joint map norms :math:`n_p` (and of the non-rotating Gram block's
+        eigenvalues). It is the coordinate that moves along the orbit, not an invariant.
+
+        ``relational_input_cov_scale_ratio`` is the median over tokens of
+        :math:`\operatorname{tr}\Sigma_i/\operatorname{tr}\Sigma^{(0)}_i`, the covariance of the belief this
+        layer's router read (the stack entry at layer 0, else the previous layer's output) against the
+        stack-entry belief at the same token (local coordinates). It does not read the comparison maps, so a
+        contraction of the covariance itself shows here and drift of the maps along their orbit does not
+        (item 3).
+
+        ``relational_rank_one_residual`` is the Dong et al. (2021) residual
+        :math:`r(X) = \|X - \mathbf 1\bar x^\top\|_F/\|X\|_F` of the layer's output means
+        (:func:`vfe3.metrics.rank_one_residual`, the definition of
+        :func:`vfe3.viz.extract.across_layer_belief_trace`), the mean over the batch (item 4).
+        """
+        from vfe3 import metrics
+        from vfe3.geometry.rope import rope_commutant_projection, rope_rotated_pairs
+        ops = self.relational_operators_by_layer[layer_index]
+        query_cov, key_cov = cap["projected_covariance_pre"], cap["projected_key_covariance_pre"]
+        if torch.is_tensor(query_cov):                                         # equal heads: one tensor
+            query_cov, key_cov = [query_cov], [key_cov]
+        rope = getattr(ops, "comparison_rope_base", None) is not None
+        scales, gram_minima, spreads = [], [], []
+        with torch.autocast(device_type=query_cov[0].device.type, enabled=False):
+            for (S_q, S_k), q_cov, k_cov in zip(ops.comparison_runs(), query_cov, key_cov):
+                S_q, S_k = S_q.detach().double(), S_k.detach().double()        # (n_r, r, K)
+                gram = 0.5 * (S_q @ S_q.transpose(-1, -2) + S_k @ S_k.transpose(-1, -2))   # (n_r, r, r) N_h
+                r = gram.shape[-1]
+                n_pairs = rope_rotated_pairs(r, ops.comparison_rope_fraction) if rope else 0
+                if n_pairs:
+                    gram = rope_commutant_projection(gram, n_pairs)
+                gram_eig = torch.linalg.eigvalsh(gram)                         # (n_r, r) ascending
+                spreads.append(gram_eig[..., -1] / gram_eig[..., 0])
+                factor, info = torch.linalg.cholesky_ex(gram)                  # (n_r, r, r) L L^T = P(N_h)
+                lam_min = []
+                for G in (q_cov, k_cov):                                       # one role at a time (memory)
+                    G = G.detach().double()                                    # (B, N, n_r, r, r)
+                    scales.append((torch.diagonal(G, dim1=-2, dim2=-1).sum(dim=-1) / r).reshape(-1))
+                    if n_pairs:
+                        G = rope_commutant_projection(G, n_pairs)
+                    left = torch.linalg.solve_triangular(factor, G, upper=False)                      # L^{-1} G
+                    pencil = torch.linalg.solve_triangular(factor, left.transpose(-1, -2), upper=False)
+                    pencil = 0.5 * (pencil + pencil.transpose(-1, -2))         # (B, N, n_r, r, r) L^{-1} G L^{-T}
+                    lam_min.append(safe_eigvalsh(pencil)[..., 0].reshape(-1, pencil.shape[-3]))   # (B N, n_r)
+                head_median = torch.cat(lam_min).median(dim=0).values          # (n_r,)
+                gram_minima.append(torch.where(info == 0, head_median, torch.full_like(head_median, float("nan"))))
+        gram_minima_all, spreads_all = torch.cat(gram_minima), torch.cat(spreads)
+        finite_minima = gram_minima_all[torch.isfinite(gram_minima_all)]
+        finite_spreads = spreads_all[torch.isfinite(spreads_all)]
+        layer = layer_index % self.cfg.n_layers
+        start = snapshot.initial_belief
+        q = start if layer == 0 else snapshot.layer_outputs[layer - 1]
+
+        def trace(belief: BeliefState) -> torch.Tensor:                       # (B, N) tr Sigma_i
+            sigma = belief.sigma.double()
+            return (sigma if sigma.dim() == belief.mu.dim()
+                    else torch.diagonal(sigma, dim1=-2, dim2=-1)).sum(dim=-1)
+
+        return {
+            "relational_projected_cov_scale": float(torch.cat(scales).median()),
+            "relational_projected_cov_gram_min_eigenvalue": (float(finite_minima.min()) if finite_minima.numel()
+                                                             else float("nan")),
+            "relational_comparison_map_norm_spread": (float(finite_spreads.max()) if finite_spreads.numel()
+                                                      else float("nan")),
+            "relational_input_cov_scale_ratio": float((trace(q) / trace(start)).median()),
+            "relational_rank_one_residual": float(
+                metrics.rank_one_residual(snapshot.layer_outputs[layer].mu.double()).mean()),
+        }
+
+    @staticmethod
+    def _self_map_unit_distance(ops: RelationalOperators) -> Optional[torch.Tensor]:   # (H,) float64, or None
+        r"""Per-head identity distance :math:`\rho(\hat T_h\hat O_h - I_{d_h})` of the content self map (item 4).
+
+        A head that routes one-hot to self passes token :math:`i`'s head reading through
+        :math:`M_h = \hat O_h\hat T_h`, whose nonzero spectrum is that of :math:`W_{hh} = \hat T_h\hat O_h`
+        (:func:`vfe3.metrics.content_link_head_invariants`). The norm is the spectral radius of
+        :math:`W_{hh} - I`, :math:`\max_k|\lambda_k(W_{hh}) - 1|`: the infimum of the operator norm of the
+        deviation over the reparametrization :math:`(\hat T_h, \hat O_h)\mapsto(B\hat T_h, \hat O_hB^{-1})`,
+        which leaves :math:`M_h` and the model unchanged, so it is not a basis artifact (a Frobenius norm in
+        the stored basis would be). Zero means the head's self map is a projector onto its range, the identity
+        map a self-locked head needs to carry content through a residual-free block. Its head maximum is the
+        layer's ``relational_link_unit_distance_max``. Under ``content_link_edges`` it describes the shared
+        generator, as the ``relational_link_*`` columns do. None under the minimal agent, which has no
+        content factor :math:`O`.
+        """
+        if getattr(ops, "predictive_readout", "kernel") == "minimal_agent":
+            return None
+        with torch.autocast(device_type=next(ops.parameters()).device.type, enabled=False):
+            T_hat, O_hat = ops._ambient_content_maps(torch.float64)          # (H, d, K), (H, K, d); per run if mixed
+        T_runs = [T_hat] if torch.is_tensor(T_hat) else list(T_hat)
+        O_runs = [O_hat] if torch.is_tensor(O_hat) else list(O_hat)
+        distances = []
+        for T_run, O_run in zip(T_runs, O_runs):
+            W = torch.einsum("hsk,hkt->hst", T_run.detach().to("cpu", torch.float64),
+                             O_run.detach().to("cpu", torch.float64))           # (n_r, d, d) W_hh
+            distances.append((torch.linalg.eigvals(W) - 1.0).abs().amax(dim=-1))
+        return torch.cat(distances)                                            # (H,)
+
     def _layer_guard_maxima(self, snapshot: DiagnosticSnapshot, last: dict) -> dict:
         r"""Layer maxima of the guard columns that :meth:`diagnostics` reports at the last layer (audit 2026-10-09).
 
@@ -1787,12 +1984,23 @@ class VFEModel(nn.Module):
         (layer, head), with the first (layer, head) attaining the clamped-row and the self-weight maxima in
         ``relational_clamped_row_frac_argmax_{layer,head}`` and ``relational_self_lock_argmax_{layer,head}``.
         A pooled head average hides one dead head of several, and under ``row_min`` a capped entry marks a
-        concentrated row rather than a uniform one, so the reference decides which of these signals a dead
-        router (``vfe3.train._warn_dead_router``).
+        concentrated row rather than a uniform one; ``vfe3.train._warn_dead_router`` reads every signal under
+        every reference, the capped one at ``relational_score_klmax_frac_head_argmax_{layer,head}``.
+        ``relational_self_lock_unit_distance`` is :meth:`_self_map_unit_distance` of the self-lock (layer,
+        head): near zero for a self-locked identity head (audit 2026-10-10 round 2, item 4).
+
+        Covariance scale (round 2, items 3 and 13; :meth:`_covariance_scale_statistics` and
+        :meth:`_projected_cov_extremes` at every layer): the layer minima, each with the first layer attaining
+        it, of ``relational_projected_cov_min_eigenvalue``, ``relational_projected_cov_scale``,
+        ``relational_projected_cov_gram_min_eigenvalue`` and ``relational_input_cov_scale_ratio``
+        (``_layer_min`` / ``_argmin_layer``), and the layer maximum
+        ``relational_comparison_map_norm_spread_layer_max``. NaN layers are skipped; NaN when every layer is.
         """
         from vfe3.posthoc.klcap import causal_support
         n_layers = self.cfg.n_layers
-        frac, condition, median = [], [], []
+        frac, condition, median, min_eigenvalue = [], [], [], []
+        scale: List[Dict[str, float]] = []
+        unit_distance: List[Optional[torch.Tensor]] = []
         heads: Dict[str, List[torch.Tensor]] = {}
         for layer_index in range(n_layers):
             cap = self._layer_capture(snapshot, layer_index)
@@ -1805,15 +2013,39 @@ class VFEModel(nn.Module):
             cap_level = math.inf if minimal_agent else self.cfg.kl_max
             for key, value in self._router_head_statistics(score, beta, support, cap_level).items():
                 heads.setdefault(key, []).append(value)                        # per layer (H,)
+            unit_distance.append(self._self_map_unit_distance(self.relational_operators_by_layer[layer_index]))
             if layer_index == n_layers - 1:
                 break
             frac.append(self._klmax_frac(score, support, cap_level))
-            condition.append(self._projected_cov_extremes(cap)[1])
+            extremes = self._projected_cov_extremes(cap)
+            min_eigenvalue.append(extremes[0])
+            condition.append(extremes[1])
+            scale.append(self._covariance_scale_statistics(snapshot, layer_index, cap))
             median.append(float(self._belief_spectrum(snapshot, layer_index)["condition"].median()))
         frac.append(last["relational_score_klmax_frac"])
         condition.append(last["relational_projected_cov_max_condition"])
+        min_eigenvalue.append(last["relational_projected_cov_min_eigenvalue"])
+        scale.append({key: last[key] for key in _COVARIANCE_SCALE_KEYS})
         median.append(last["belief_cond_median"])
         top = max(range(n_layers), key=lambda layer: (frac[layer], -layer))
+
+        def layer_extreme(values: List[float], largest: bool) -> Tuple[float, float]:
+            r"""Minimum (or maximum) over the finite layer values and the first layer attaining it; NaN if none."""
+            finite = [(value, layer) for layer, value in enumerate(values) if math.isfinite(value)]
+            if not finite:
+                return float("nan"), float("nan")
+            value, layer = (max(finite, key=lambda pair: (pair[0], -pair[1])) if largest else min(finite))
+            return float(value), float(layer)
+
+        extremes_out: Dict[str, float] = {}
+        for key, values in (("relational_projected_cov_min_eigenvalue", min_eigenvalue),
+                            *((key, [row[key] for row in scale]) for key in (
+                                "relational_projected_cov_scale", "relational_projected_cov_gram_min_eigenvalue",
+                                "relational_input_cov_scale_ratio"))):
+            extremes_out[f"{key}_layer_min"], extremes_out[f"{key}_argmin_layer"] = layer_extreme(
+                values, largest=False)
+        extremes_out["relational_comparison_map_norm_spread_layer_max"] = layer_extreme(
+            [row["relational_comparison_map_norm_spread"] for row in scale], largest=True)[0]
 
         def head_max(key: str) -> Tuple[float, float, float]:
             r"""Maximum over (layer, head) and the first (layer, head) attaining it; NaN if all NaN."""
@@ -1826,18 +2058,25 @@ class VFEModel(nn.Module):
 
         clamped, clamped_layer, clamped_head = head_max("clamped_row_frac")
         self_weight, self_layer, self_head = head_max("self_weight")
+        capped, capped_layer, capped_head = head_max("klmax_frac")
+        locked = (unit_distance[int(self_layer)] if math.isfinite(self_layer) else None)   # (H,) or None
         return {"relational_score_klmax_frac_layer_max": frac[top],
                 "relational_score_klmax_frac_argmax_layer": float(top),
                 "relational_projected_cov_max_condition_layer_max": max(condition),
                 "belief_cond_median_layer_max": max(median),
-                "relational_score_klmax_frac_head_max": head_max("klmax_frac")[0],
+                "relational_score_klmax_frac_head_max": capped,
+                "relational_score_klmax_frac_head_argmax_layer": capped_layer,
+                "relational_score_klmax_frac_head_argmax_head": capped_head,
                 "relational_clamped_row_frac_head_max": clamped,
                 "relational_clamped_row_frac_argmax_layer": clamped_layer,
                 "relational_clamped_row_frac_argmax_head": clamped_head,
                 "relational_self_weight_head_max": self_weight,
                 "relational_self_argmax_frac_head_max": head_max("self_argmax_frac")[0],
                 "relational_self_lock_argmax_layer": self_layer,
-                "relational_self_lock_argmax_head": self_head}
+                "relational_self_lock_argmax_head": self_head,
+                "relational_self_lock_unit_distance": (float(locked[int(self_head)]) if locked is not None
+                                                       else float("nan")),
+                **extremes_out}
 
     def _canonical_free_energy_diagnostics(
         self,
@@ -1849,9 +2088,8 @@ class VFEModel(nn.Module):
         r"""Canonical free energy of one layer at the beliefs its router read (``diagnose_canonical_free_energy``).
 
         The input beliefs :math:`q_i` (the stack-entry belief at layer 0, else the previous layer's
-        output), the live prior :math:`p_i` entering the layer and the realized frames
-        :math:`U_i = e^{\phi_i\cdot G}e^{Y_i\cdot G}R_i^\top` (RoPE folded as in :meth:`_relational_frames`,
-        rebuilt in float64; fixed through the stack) give, per token, in float64,
+        output), the live prior :math:`p_i` entering the layer and the inverse frames of
+        :meth:`_canonical_frame_inverse` (fixed through the stack) give, per token, in float64,
 
         .. math::
             F_i = \alpha_iD(q_i\|p_i) + R(\alpha_i)
@@ -1859,15 +2097,30 @@ class VFEModel(nn.Module):
                   + \tau_h\sum_j\beta^{*h}_{ij}\log\frac{\beta^{*h}_{ij}}{\pi^h_{ij}}\Big],
 
         the reference free energy of :func:`vfe3.free_energy.free_energy` with the transported head
-        energies and canonical router of :func:`vfe3.free_energy.canonical_routing_rows`. The self term
-        is the registered form of the M-step term (``self_coupling_alpha``, its :math:`R(\alpha)` zero
-        under ``constant``) on the same seam and ``kl_max``; :math:`\tau_h` is the layer's routing
-        temperature. The columns are per-token means over the batch: ``self_coupling``,
+        energies and canonical router of :func:`vfe3.free_energy.canonical_routing_rows`. The router
+        :math:`\beta^* = \operatorname{softmax}_j(\log\pi_{ij} - D^h_{ij}/\tau_h)` carries the attention prior
+        :math:`\pi` (causal mask, ALiBi) and the positional rotation of either RoPE space, and :math:`\tau_h`
+        is the temperature the layer's router runs at (:math:`\kappa_h\sqrt{d_h}`, learned under
+        ``learn_attention_temperature``; 1 under the minimal agent, whose exact posterior has no
+        :math:`\kappa_\beta`; audit 2026-10-10 round 2, item 31). :math:`D^h_{ii} = 0` and :math:`B_{ii} = 0`, so
+        :math:`\beta^*` peaks on the diagonal of every row by construction. The self term is the registered
+        form of the M-step self-coupling (``self_coupling_alpha``, its :math:`R(\alpha)` zero under
+        ``constant``, the same ``kl_max``) evaluated at the layer's input belief; the M-step term itself reads
+        the final block's converged output against its prior, which the output evaluation below matches at the
+        last layer (item 27). The columns are per-token means over the batch: ``self_coupling``,
         ``self_divergence`` (the unweighted :math:`D(q_i\|p_i)`), ``belief_coupling`` and
         ``attention_entropy`` (summed over heads, unweighted by :math:`\lambda_\beta`) and ``total``
         (:math:`F_i`). ``canonical_beta_tv`` is the mean total variation
         :math:`\tfrac12\sum_j|\beta^h_{ij} - \beta^{*h}_{ij}|` between the model's router and
-        :math:`\beta^*` over the (batch, head, query) rows with at least two admissible sources.
+        :math:`\beta^*` over the (batch, head, query) rows with at least two admissible sources, and
+        ``canonical_self_weight`` the mean :math:`\beta^{*h}_{ii}` over those rows that admit self (NaN under a
+        ``*_noself`` prior; item 18), to be read beside the model's per-head self weights.
+
+        ``canonical_total_output`` is the same :math:`F` (same prior :math:`p_l` and frames, :math:`\beta^*`
+        recomputed from the output energies) at the layer's converged readout output
+        ``snapshot.layer_converged[l]``, and ``canonical_total_delta`` is
+        :math:`F_l(\mathrm{out}) - F_l(\mathrm{in})`: negative when the readout lowers the canonical free
+        energy of its layer (item 27).
         """
         from vfe3.alpha_i import alpha_is_per_coord, self_coupling_alpha
         from vfe3.families import get_family
@@ -1876,24 +2129,18 @@ class VFEModel(nn.Module):
         layer = layer_index % cfg.n_layers
         q = snapshot.initial_belief if layer == 0 else snapshot.layer_outputs[layer - 1]
         mu_p, sigma_p = snapshot.layer_priors[layer]
-        start = snapshot.initial_belief
+        ops = self.relational_operators_by_layer[layer]
         device = q.mu.device
-        with torch.autocast(device_type=device.type, enabled=False):
-            frame_inverse = torch.linalg.matrix_exp(
-                -group.embed_algebra(start.phi.double(), dtype=torch.float64))          # (B, N, K, K)
-            if start.right_phi is not None:
-                frame_inverse = torch.linalg.matrix_exp(
-                    -group.embed_algebra(start.right_phi.double(), dtype=torch.float64)) @ frame_inverse
-            if snapshot.rope is not None:
-                frame_inverse = snapshot.rope.double() @ frame_inverse              # U_i^{-1} = R_i e^{-Y G} e^{-phi G}
-            tau = self.relational_operators_by_layer[layer].routing_temperature(
-                attention_tau(_as_coeff(cfg.kappa_beta, device), group.irrep_dims, device=device),
-                torch.float64)
-            rows = canonical_routing_rows(q.mu, q.sigma, frame_inverse, snapshot.log_prior,
+        fam = get_family(cfg.family)
+        lambda_beta = float(cfg.lambda_beta)
+
+        def evaluate(belief: BeliefState, frame_inverse: torch.Tensor,
+                     tau: 'float | torch.Tensor') -> Tuple[Dict[str, float], torch.Tensor]:
+            r"""Per-token means of the terms of :math:`F` at ``belief`` and its :math:`\beta^*` (B, H, N, N)."""
+            rows = canonical_routing_rows(belief.mu, belief.sigma, frame_inverse, snapshot.log_prior,
                                           tau=tau, irrep_dims=list(group.irrep_dims))
-            fam = get_family(cfg.family)
             self_div = self_divergence_for_alpha(                               # (B, N) or (B, N, K)
-                self._family_instance(fam, q.mu.double(), q.sigma.double()),
+                self._family_instance(fam, belief.mu.double(), belief.sigma.double()),
                 self._family_instance(fam, mu_p.double(), sigma_p.double()),
                 kl_max=cfg.kl_max, eps=cfg.eps, lambda_alpha_mode=cfg.lambda_alpha_mode)
             alpha, alpha_reg = self_coupling_alpha(
@@ -1902,20 +2149,111 @@ class VFEModel(nn.Module):
             self_row, raw_row = alpha * self_div + alpha_reg, self_div
             if alpha_is_per_coord(cfg.lambda_alpha_mode):
                 self_row, raw_row = self_row.sum(dim=-1), raw_row.sum(dim=-1)  # (B, N)
+            terms = {"self_coupling": float(self_row.mean()), "self_divergence": float(raw_row.mean()),
+                     "belief_coupling": float(rows.belief_coupling.sum(dim=1).mean()),
+                     "attention_entropy": float(rows.attention_entropy.sum(dim=1).mean())}
+            terms["total"] = terms["self_coupling"] + lambda_beta * (
+                terms["belief_coupling"] + terms["attention_entropy"])
+            return terms, rows.beta
+
+        with torch.autocast(device_type=device.type, enabled=False):
+            frame_inverse = self._canonical_frame_inverse(snapshot, layer)      # (B, N, H, d, d) or (B, N, K, K)
+            if getattr(ops, "predictive_readout", "kernel") == "minimal_agent":
+                tau: 'float | torch.Tensor' = 1.0                              # the exact posterior's temperature
+            else:
+                tau = ops.routing_temperature(
+                    attention_tau(_as_coeff(cfg.kappa_beta, device), group.irrep_dims, device=device),
+                    torch.float64)
+            terms, beta_star = evaluate(q, frame_inverse, tau)                 # beta_star (B, H, N, N)
+            terms_out, _ = evaluate(snapshot.layer_converged[layer], frame_inverse, tau)
             scored = support.sum(dim=-1) >= 2                                  # (B, H, N)
-            tv = 0.5 * (beta.double() - rows.beta).abs().sum(dim=-1)            # (B, H, N)
-        self_coupling = float(self_row.mean())
-        belief_coupling = float(rows.belief_coupling.sum(dim=1).mean())
-        attention_entropy = float(rows.attention_entropy.sum(dim=1).mean())
+            self_rows = scored & support.diagonal(dim1=-2, dim2=-1)            # (B, H, N) rows that admit self
+            tv = 0.5 * (beta.double() - beta_star).abs().sum(dim=-1)            # (B, H, N)
+            beta_star_ii = beta_star.diagonal(dim1=-2, dim2=-1)                 # (B, H, N) beta*_ii^h
         return {
-            "self_coupling": self_coupling,
-            "self_divergence": float(raw_row.mean()),
-            "belief_coupling": belief_coupling,
-            "attention_entropy": attention_entropy,
-            "total": self_coupling + float(cfg.lambda_beta) * (belief_coupling + attention_entropy),
+            **terms,
             "relational_legacy_global_f_available": 1.0,
             "canonical_beta_tv": float(tv[scored].mean()) if bool(scored.any()) else float("nan"),
+            "canonical_self_weight": (float(beta_star_ii[self_rows].mean()) if bool(self_rows.any())
+                                      else float("nan")),
+            "canonical_total_output": terms_out["total"],
+            "canonical_total_delta": terms_out["total"] - terms["total"],
         }
+
+    def _canonical_frame_inverse(
+        self,
+        snapshot: DiagnosticSnapshot,
+        layer:    int,                         # layer index in [0, n_layers)
+    ) -> torch.Tensor:                         # (B, N, H, d, d) head blocks or (B, N, K, K), float64
+        r"""Float64 inverse realized frames of the canonical diagnostic, from the stack-entry belief.
+
+        :math:`U_i^{-1} = R_ie^{-Y_i\cdot G}e^{-\phi_i\cdot G}`, with :math:`R_i` the frame-space RoPE rotation
+        folded into the frames (:meth:`_relational_frames`) or, under ``rope_space='comparison'``, this layer's
+        comparison rotation (``RelationalOperators.comparison_rope_rotation``) on each head's coordinates. The
+        latter rotates each head's reference moments,
+        :math:`(\xi^h_i, C^{hh}_i)\mapsto(R_i\xi^h_i, R_iC^{hh}_iR_i^\top)`, as the router rotates its projected
+        moments, so the head energies and :math:`\beta^*` depend on position through :math:`j - i` as they do
+        under frame-space RoPE (audit 2026-10-10 round 2, item 18). The canonical block reads the full rotated
+        covariance, not the rotation-invariant projection the router may score
+        (``rope_comparison_covariance='rotation_invariant'``).
+
+        Where the group certifies head blocks (the packed ``block_glk`` coordinates, or a basis supported on equal
+        head blocks, :meth:`~vfe3.geometry.groups.GaugeGroup.head_block_generators`) and the frame-space rotation
+        is head-block diagonal, the exponentials run on the ``(B, N, H, d, d)`` head blocks, which
+        :func:`vfe3.free_energy.canonical_routing_rows` reads directly: :math:`O(BNHd^3)` work and
+        :math:`BNHd^2` storage instead of :math:`O(BNK^3)` and :math:`BNK^2` (item 53). Every other group keeps
+        the dense :math:`K\times K` path; the two agree to float64 rounding.
+        """
+        group = self.group
+        start = snapshot.initial_belief
+        dims = list(group.irrep_dims)
+        H, K, N = len(dims), int(sum(dims)), start.mu.shape[-2]
+        device = start.mu.device
+        layout = group.elementary_block_shape
+        head_blocks = None if layout is not None else group.head_block_generators()   # (n_gen, H, d, d)
+        compact = H > 1 and len(set(dims)) == 1 and (
+            (layout is not None and group.generator_shape[0] == H * dims[0] ** 2) or head_blocks is not None)
+        rope = None if snapshot.rope is None else snapshot.rope.double()   # (N, K, K) frame-space R_i
+        if compact and rope is not None:
+            on_block = torch.block_diag(*(torch.ones(d, d, dtype=torch.bool, device=rope.device) for d in dims))
+            compact = not bool((rope[..., ~on_block] != 0).any())
+        if compact:
+            d = dims[0]
+            if layout is not None:
+                def embed(coordinates: torch.Tensor) -> torch.Tensor:          # (..., n_gen) -> (..., H, d, d)
+                    return coordinates.double().reshape(*coordinates.shape[:-1], H, d, d)
+            else:
+                basis = head_blocks.to(dtype=torch.float64)
+
+                def embed(coordinates: torch.Tensor) -> torch.Tensor:          # M_h = sum_a phi_a G_a^(h)
+                    return torch.einsum("...a,ahij->...hij", coordinates.double(), basis)
+            inverse = torch.linalg.matrix_exp(-embed(start.phi))               # (B, N, H, d, d)
+            if start.right_phi is not None:
+                inverse = torch.linalg.matrix_exp(-embed(start.right_phi)) @ inverse
+            if rope is not None:
+                inverse = torch.stack([rope[:, h * d:(h + 1) * d, h * d:(h + 1) * d]
+                                       for h in range(H)], dim=1) @ inverse    # (N, H, d, d) R_i^h
+        else:
+            inverse = torch.linalg.matrix_exp(
+                -group.embed_algebra(start.phi.double(), dtype=torch.float64))   # (B, N, K, K)
+            if start.right_phi is not None:
+                inverse = torch.linalg.matrix_exp(
+                    -group.embed_algebra(start.right_phi.double(), dtype=torch.float64)) @ inverse
+            if rope is not None:
+                inverse = rope @ inverse                                       # U_i^{-1} = R_i e^{-Y G} e^{-phi G}
+        ops = self.relational_operators_by_layer[layer]
+        if getattr(ops, "comparison_rope_base", None) is not None:
+            if compact:
+                inverse = ops.comparison_rope_rotation(N, dims[0], device, torch.float64).unsqueeze(-3) @ inverse
+            else:
+                rotation = torch.zeros(N, K, K, dtype=torch.float64, device=device)   # (N, K, K) block-diagonal
+                offset = 0
+                for d in dims:
+                    rotation[:, offset:offset + d, offset:offset + d] = ops.comparison_rope_rotation(
+                        N, d, device, torch.float64)
+                    offset += d
+                inverse = rotation @ inverse
+        return inverse
 
     def _relational_diagnostics(self, snapshot: DiagnosticSnapshot, layer_index: int = -1) -> dict:
         """Report the actual relational router and fixed-context cost; the legacy global-F fields are NaN
@@ -2056,10 +2394,17 @@ class VFEModel(nn.Module):
         snapshot:    DiagnosticSnapshot,
         layer_index: int,
     ) -> dict:
-        r"""The projected-covariance spectrum, the repair count and the frame magnitudes, shared by both readouts."""
+        r"""The projected-covariance spectrum and scale, the self-map identity distance, the repair count and the
+        frame magnitudes, shared by both readouts (:meth:`_covariance_scale_statistics`,
+        :meth:`_self_map_unit_distance`; ``relational_link_unit_distance_min`` is the head minimum, NaN under the
+        minimal agent)."""
         from vfe3 import metrics
         (d["relational_projected_cov_min_eigenvalue"],
          d["relational_projected_cov_max_condition"]) = self._projected_cov_extremes(cap)
+        d.update(self._covariance_scale_statistics(snapshot, layer_index, cap))
+        unit_distance = self._self_map_unit_distance(self.relational_operators_by_layer[layer_index])
+        d["relational_link_unit_distance_min"] = (float(unit_distance.min()) if unit_distance is not None
+                                                  else float("nan"))
         d["relational_covariance_repair_count"] = float(cap.get("relational_covariance_repair_count", 0.0))
         # Frame magnitude and decoder/head-module state remain meaningful on both readouts.
         belief = snapshot.layer_converged[layer_index]
@@ -2129,8 +2474,9 @@ class VFEModel(nn.Module):
         r"""Report the captured projected routing, receiver costs, and state diagnostics (no_grad).
 
         Reads one diagnostic snapshot (built here unless supplied) and reduces the captured batch
-        through :meth:`_relational_diagnostics` at the last layer, plus the layer maxima of its guard
-        columns (:meth:`_layer_guard_maxima`, keys ending ``_layer_max``). Routing and readout do not
+        through :meth:`_relational_diagnostics` at the last layer, plus the layer and head extremes of its
+        guard columns (:meth:`_layer_guard_maxima`, keys ending ``_layer_max``, ``_layer_min``, ``_head_max``
+        and their ``_arg*`` locations). Routing and readout do not
         define one shared stationary objective, so the legacy global free-energy fields
         (``self_coupling``, ``belief_coupling``, ``attention_entropy``, ``total``, ...) are NaN, except
         under ``diagnose_canonical_free_energy``, which evaluates the canonical free energy at the

@@ -523,7 +523,8 @@ class CanonicalRoutingRows(NamedTuple):
     ``belief_coupling`` is :math:`\sum_j\beta^*_{ij}D_{ij}` and ``attention_entropy`` is
     :math:`\tau_h\sum_j\beta^*_{ij}\log(\beta^*_{ij}/\pi_{ij})`, both unweighted by :math:`\lambda_\beta`;
     ``log_partition`` is :math:`\log Z_i`, :math:`-\infty` on a row with no admissible source (whose two
-    rows are zero)."""
+    rows are zero) and NaN on a row that reads a failed factorization, whose router and two rows are then
+    NaN too (audit 2026-10-10 round 2, item 38)."""
     energy:            torch.Tensor   # (B, H, N, N) D^h_ij on every pair
     beta:              torch.Tensor   # (B, H, N, N) beta*^h_ij, zero off the support
     belief_coupling:   torch.Tensor   # (B, H, N)
@@ -534,7 +535,7 @@ class CanonicalRoutingRows(NamedTuple):
 def canonical_routing_rows(
     mu:            torch.Tensor,              # (B, N, K) belief means, local coordinates
     sigma:         torch.Tensor,              # (B, N, K) variances or (B, N, K, K) covariances
-    frame_inverse: torch.Tensor,              # (B, N, K, K) inverse realized frames U_i^{-1}
+    frame_inverse: torch.Tensor,              # (B, N, K, K) inverse frames U_i^{-1}, or (B, N, H, d, d) head blocks
     log_prior:     Optional[torch.Tensor],    # (N, N), (H, N, N) or (B, H, N, N) log-bias; None -> uniform
 
     *,
@@ -567,12 +568,24 @@ def canonical_routing_rows(
     :math:`L_j` per :math:`C^{hh}_j` gives the log-determinants, the trace as the Frobenius product
     :math:`\langle C^{hh}_i, L_j^{-\top}L_j^{-1}\rangle` and the Mahalanobis term by triangular solves,
     tiled over query rows: :math:`O(BNK^3 + BN^2\sum_hd_h^2)` time and :math:`O(BN^2H)` memory beyond the
-    tiles. A factorization failure leaves NaN in the affected energies.
+    tiles. A factorization failure leaves NaN in the affected energies, and NaN propagates to the router
+    and the rows of every query that reads one (only a row with no admissible source reports zeros).
+
+    A ``(B, N, H, d, d)`` ``frame_inverse`` holds the diagonal head blocks :math:`A^h_i` of frames that are
+    block-diagonal over equal heads (audit 2026-10-10 round 2, item 53): then
+    :math:`\xi^h_i = A^h_i\mu^h_i` and :math:`C^{hh}_i = A^h_i\Sigma^{hh}_iA^{h\top}_i` from the head blocks
+    of the moments alone, in :math:`O(BNHd^3)` instead of :math:`O(BNK^3)`, equal to the dense evaluation of
+    the block-diagonal frames to float64 rounding.
     """
     dtype = torch.float64
     B, N, K = mu.shape
     mu, sigma, frame_inverse = mu.to(dtype), sigma.to(dtype), frame_inverse.to(dtype)
-    xi = (frame_inverse @ mu.unsqueeze(-1)).squeeze(-1)                        # (B, N, K) xi_i = U_i^{-1} mu_i
+    compact = frame_inverse.dim() == mu.dim() + 2                              # (B, N, H, d, d) head blocks
+    if compact and (frame_inverse.shape[-3] != len(irrep_dims)
+                    or any(d != frame_inverse.shape[-1] for d in irrep_dims)):
+        raise ValueError(f"compact frame blocks {tuple(frame_inverse.shape[-3:])} do not match the equal "
+                         f"head partition {list(irrep_dims)}")
+    xi = None if compact else (frame_inverse @ mu.unsqueeze(-1)).squeeze(-1)   # (B, N, K) xi_i = U_i^{-1} mu_i
     diagonal = sigma.dim() == mu.dim()
     H = len(irrep_dims)
     taus = torch.as_tensor(tau, dtype=dtype, device=mu.device).reshape(-1).expand(H)   # (H,)
@@ -587,10 +600,17 @@ def canonical_routing_rows(
     energies, betas, belief_rows, entropy_rows, log_partitions = [], [], [], [], []
     offset = 0
     for h, d in enumerate(irrep_dims):
-        xi_h = xi[..., offset:offset + d]                                      # (B, N, d)
-        rows_h = frame_inverse[..., offset:offset + d, :]                      # (B, N, d, K) head rows of U_i^{-1}
+        if compact:
+            block = frame_inverse[:, :, h]                                     # (B, N, d, d) A_i^h
+            xi_h = (block @ mu[..., offset:offset + d].unsqueeze(-1)).squeeze(-1)   # (B, N, d)
+            sigma_hh = (sigma[..., offset:offset + d] if diagonal
+                        else sigma[..., offset:offset + d, offset:offset + d])  # (B, N, d[, d]) Sigma_i^hh
+            C = ((block * sigma_hh.unsqueeze(-2)) if diagonal else block @ sigma_hh) @ block.transpose(-1, -2)
+        else:
+            xi_h = xi[..., offset:offset + d]                                  # (B, N, d)
+            rows_h = frame_inverse[..., offset:offset + d, :]                  # (B, N, d, K) head rows of U_i^{-1}
+            C = ((rows_h * sigma.unsqueeze(-2)) if diagonal else rows_h @ sigma) @ rows_h.transpose(-1, -2)
         offset += d
-        C = ((rows_h * sigma.unsqueeze(-2)) if diagonal else rows_h @ sigma) @ rows_h.transpose(-1, -2)
         C = 0.5 * (C + C.transpose(-1, -2))                                    # (B, N, d, d) C_i^hh
         L, info = torch.linalg.cholesky_ex(C)
         L = torch.where((info == 0)[..., None, None], L, torch.full_like(L, float("nan")))
@@ -610,7 +630,9 @@ def canonical_routing_rows(
         logits = torch.where(support, log_pi_h - D / taus[h], torch.full_like(D, float("-inf")))
         log_z = torch.logsumexp(logits, dim=-1)                                # (B, N)
         log_beta = logits - log_z.unsqueeze(-1)
-        live = support & torch.isfinite(log_z).unsqueeze(-1)
+        # Only an empty row (log Z = -inf) reports zeros; a NaN log partition from a failed factor stays live
+        # and propagates NaN into beta* and both rows (audit 2026-10-10 round 2, item 38).
+        live = support & ~torch.isneginf(log_z).unsqueeze(-1)
         beta = torch.where(live, log_beta.exp(), torch.zeros_like(D))          # (B, N, N)
         zero = torch.zeros_like(D)
         energies.append(D)

@@ -83,13 +83,10 @@ def test_diagnostics_report_per_head_maxima_over_layers() -> None:
         assert key in d and f"val_{key}" in val_keys
 
 
-@pytest.mark.parametrize("reference,tied,expected", [
-    ("absolute", False, "fully clamped"),
-    ("row_min", False, "one-hot"),
-    ("absolute", True, "one-hot"),
-])
-def test_dead_router_warning_follows_the_clamp_reference(
-        reference: str, tied: bool, expected: str, caplog: pytest.LogCaptureFixture) -> None:
+@pytest.mark.parametrize("reference,tied", [("absolute", False), ("row_min", False), ("absolute", True)])
+def test_dead_router_warning_reads_both_signals_under_every_reference(
+        reference: str, tied: bool, caplog: pytest.LogCaptureFixture) -> None:
+    # audit 2026-10-10 round 2, item 7: the self weight and the clamped rows are read under every reference
     logger = logging.getLogger("dead-router-reference")
     # a self-locked head (99.68 layer 1 head 0) and a head with every scored row clamped
     diagnostics = {"relational_clamped_row_frac_head_max": 0.8, "relational_clamped_row_frac_argmax_layer": 2,
@@ -100,11 +97,10 @@ def test_dead_router_warning_follows_the_clamp_reference(
     with caplog.at_level(logging.WARNING, logger="dead-router-reference"):
         T._warn_dead_router(diagnostics, warned, logger, reference=reference, tied=tied)
         T._warn_dead_router(diagnostics, warned, logger, reference=reference, tied=tied)   # once only
-    assert len(caplog.records) == 1
-    message = caplog.records[0].getMessage()
-    assert expected in message
-    assert message.split(":")[0].strip() == ("router layer 2 head 3" if expected == "fully clamped"
-                                             else "router layer 1 head 0")
+    messages = {r.getMessage().split(":")[0].strip(): r.getMessage() for r in caplog.records}
+    assert len(caplog.records) == 2
+    assert "fully clamped" in messages["router layer 2 head 3"]
+    assert "one-hot" in messages["router layer 1 head 0"] and "softmax saturates" in messages["router layer 1 head 0"]
 
 
 def test_row_min_does_not_call_a_high_cap_fraction_uniform(caplog: pytest.LogCaptureFixture) -> None:

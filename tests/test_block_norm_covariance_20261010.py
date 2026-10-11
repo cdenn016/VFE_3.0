@@ -8,7 +8,8 @@ covariance to post-norm units at the pre-norm mean :math:`u`,
     (J_{\mathrm{LN}})_{kl} = \frac{\gamma_k}{s}\Bigl(\delta_{kl} - \frac{1 + z_kz_l}{K}\Bigr),\qquad
     D = \operatorname{diag}(\gamma)/s,
 
-keeping its diagonal on ``gaussian_diagonal`` (closed form, O(K) per token) and its head blocks on ``gaussian_block``.
+plus the radial second-order term :math:`\rho gg^\top` (audit 2026-10-10 round 2, item 11), keeping its diagonal on
+``gaussian_diagonal`` (closed form, O(K) per token) and its head blocks on ``gaussian_block``.
 The same M-projection admits ``block_mlp_covariance='delta_full'`` on the diagonal family,
 :math:`(J\circ J)\sigma + fD^2\sigma`.
 
@@ -32,8 +33,8 @@ from vfe3.geometry.norms import AffineLayerNorm, LayerNorm
 from vfe3.metrics import covariance_frozen_at_encode
 from vfe3.model.block_mlp import (
     BlockMLP, CanonicalFrameBlockMLP, GaugeGateBlockMLP, _layernorm_diagonal_pushforward_at,
-    block_norm_covariance_pushforward, block_norm_jacobian, block_norm_linearization, layernorm_diagonal_pushforward,
-    layernorm_scale,
+    block_norm_covariance_pushforward, block_norm_jacobian, block_norm_linearization, block_norm_radial_term,
+    layernorm_diagonal_pushforward, layernorm_scale,
 )
 from vfe3.model.model import VFEModel
 
@@ -56,11 +57,14 @@ def _affine_norm(k: int, eps: float, g: torch.Generator) -> AffineLayerNorm:
 
 
 def _dense_diagonal(norm, u: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-    r""":math:`\operatorname{diag}(J\operatorname{diag}(\sigma)J^\top) + fD^2\sigma` from the dense Jacobian."""
+    r""":math:`\operatorname{diag}(J\operatorname{diag}(\sigma)J^\top) + fD^2\sigma + \rho g^2` from the dense Jacobian and the
+    radial second-order term on the dense layout (audit 2026-10-10 round 2, item 11)."""
     J = block_norm_jacobian(norm, u)                                                  # (..., K, K)
     d = layernorm_scale(u, eps=norm.eps, weight=getattr(norm, "weight", None))         # (..., K)
     dense = J @ torch.diag_embed(sigma) @ J.transpose(-1, -2)
-    return torch.diagonal(dense, dim1=-2, dim2=-1) + FLOOR * d.square() * sigma
+    radial = block_norm_radial_term(norm, u, torch.diag_embed(sigma))
+    return (torch.diagonal(dense, dim1=-2, dim2=-1) + FLOOR * d.square() * sigma
+            + radial.rho * radial.direction.square())
 
 
 def _relative(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -85,7 +89,7 @@ def test_closed_form_equals_the_dense_diagonal(affine: bool, eps: float) -> None
     assert got.shape == sigma.shape and got.dtype == torch.float64
     assert _relative(got, _dense_diagonal(norm, u, sigma)) < 1e-13
     # The layout dispatcher: the diagonal layout is the closed form, the full layout on diag_embed(sigma) is
-    # J Sigma J^T + f D Sigma D, whose diagonal it is.
+    # J Sigma J^T + f D Sigma D + rho g g^T, whose diagonal it is.
     assert torch.equal(block_norm_covariance_pushforward(norm, u, sigma, FLOOR), got)
     full = block_norm_covariance_pushforward(norm, u, torch.diag_embed(sigma), FLOOR).detach()
     assert _relative(torch.diagonal(full, dim1=-2, dim2=-1), got) < 1e-12
@@ -249,10 +253,12 @@ def test_diagonal_delta_full_is_the_diagonal_of_the_full_delta_full(mode: str, t
         norm = _affine_norm(K, 1e-6, g)
         lin = block_norm_linearization(norm, u)
         x, extra = norm(u, sigma), {"input_jacobian": lin.jacobian, "input_scale": lin.scale}
+        radial = {"input_radial": block_norm_radial_term(norm, u, sigma)}
+        radial_full = {"input_radial": block_norm_radial_term(norm, u, torch.diag_embed(sigma))}
     else:
-        x, extra = u, {}
-    diag = mlp.forward_moments(x, sigma, **kwargs, **extra)
-    full = mlp.forward_moments(x, torch.diag_embed(sigma), **kwargs, **extra)
+        x, extra, radial, radial_full = u, {}, {}, {}
+    diag = mlp.forward_moments(x, sigma, **kwargs, **extra, **radial)
+    full = mlp.forward_moments(x, torch.diag_embed(sigma), **kwargs, **extra, **radial_full)
     assert diag.sigma.shape == sigma.shape and torch.equal(diag.mu, full.mu)
     assert _relative(diag.sigma, torch.diagonal(full.sigma, dim1=-2, dim2=-1)) < 1e-12
     assert bool((diag.sigma > 0).all())
@@ -276,8 +282,10 @@ def test_diagonal_delta_full_model_runs_and_is_booked_and_labeled() -> None:
         _, loss, _ = model(tokens, targets)
     converged, mlp_out = capture["converged"], capture["block_mlp_output"]
     lin = block_norm_linearization(model.block_norm, converged.mu)
+    radial = block_norm_radial_term(model.block_norm, converged.mu, torch.diag_embed(converged.sigma))
     full = model.block_mlps[0].forward_moments(capture["block_mlp_input"].mu, torch.diag_embed(converged.sigma),
-                                               input_jacobian=lin.jacobian, input_scale=lin.scale).sigma
+                                               input_jacobian=lin.jacobian, input_scale=lin.scale,
+                                               input_radial=radial).sigma
     assert torch.allclose(mlp_out.sigma, torch.diagonal(full, dim1=-2, dim2=-1), rtol=1e-12, atol=0)
     assert bool(torch.isfinite(loss)) and bool((mlp_out.sigma > 0).all())
     # The diagonal delta_full books (J o J) sigma and its floor, no Cholesky.

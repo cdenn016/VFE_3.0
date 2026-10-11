@@ -46,8 +46,10 @@ def ieee_fp32_matmul() -> Iterator[None]:
     For code whose accuracy contract assumes IEEE fp32 multiplication, unit roundoff
     :math:`u = 2^{-23}`: TF32 (``"high"``) or bf16 (``"medium"``) inputs round to :math:`2^{-10}` or
     :math:`2^{-7}` and void it. The policy is restored on every exit path, including exceptions, and
-    the context also works as a function decorator. Only the forward GEMMs inside it are pinned;
-    their backward runs later under the caller's policy.
+    the context also works as a function decorator. Only the GEMMs it encloses are pinned: the autograd
+    backward of a pinned forward runs later under the caller's policy, unless the code pins its own backward
+    (``vfe3.relational_scoring._GramPrecision``, and ``_IEEEFP32Recompute`` for the pair-KL GEMMs of
+    ``projected_gaussian_kl``, run their backward inside this context).
     """
     previous = torch.get_float32_matmul_precision()
     if previous == "highest":

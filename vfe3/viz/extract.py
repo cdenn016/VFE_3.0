@@ -671,9 +671,16 @@ def _act_on_frame(
 
     A dense ``g`` on a compact frame acts through its head blocks: a group whose frames are compact has every
     element block-diagonal over the heads (:meth:`vfe3.geometry.groups.GaugeGroup.head_block_generators`).
+    A dense ``g`` with any nonzero entry outside those blocks raises ``ValueError`` instead of being truncated.
     """
     if frame.block_diagonal and g.dim() == frame.forward.dim() - 1:            # dense g on a compact frame
         H, d = frame.forward.shape[-3], frame.forward.shape[-1]
+        on_block = torch.block_diag(*[torch.ones(d, d, dtype=torch.bool, device=g.device)] * H)   # (K, K)
+        off_block = g[..., ~on_block]                                          # (..., N, K^2 - H d^2)
+        if bool((off_block != 0).any()):
+            raise ValueError(
+                f"a dense group element acting on a compact {H}-head frame must be block-diagonal over the "
+                f"heads; it has nonzero off-block entries (largest {float(off_block.abs().max()):.3e})")
         g = torch.stack([g[..., h * d:(h + 1) * d, h * d:(h + 1) * d] for h in range(H)], dim=-3)
     g_inv = torch.linalg.inv(g)
     if frame.block_diagonal:
@@ -725,15 +732,27 @@ def projected_gauge_equivariance(
     :func:`build_full_link_context` for ``full_link_update`` (the receiver force
     :math:`U_i^\top\nabla_{\mu_i}F`, the closed-form update in reference coordinates, and the
     receiver energy after adding back its exact shift :math:`\sum_i c_i\log|\det g_i|`, which the
-    term :math:`-\tfrac{c_i}{2}\log\det\Sigma_i` produces). The prior moves with the belief.
+    term :math:`-\tfrac{c_i}{2}\log\det\Sigma_i` produces). The receiver's prior moves with the belief.
+
+    When the M-step self-coupling (``mstep_self_coupling_weight > 0``) or the canonical diagnostic
+    (``diagnose_canonical_free_energy``) reads the self term, ``self_coupling`` is its per-token value
+    :math:`\sum_k\alpha_i^{(k)}D_i^{(k)} + R(\alpha_i)` (one term for the per-position forms) against an
+    independent fixed prior :math:`p_i`, a random draw moved with the belief,
+    :math:`(\mu_{p,i},\Sigma_{p,i})\mapsto(g_i\mu_{p,i},g_i\Sigma_{p,i}g_i^\top)`. The summed
+    :math:`D(q_i\|p_i)` is invariant, so a constant or per-position :math:`\alpha` sits at roundoff, while
+    the ordered conditional KLs :math:`D_i^{(k)}` of ``state_dependent_per_coord`` move with the frame.
 
     Everything runs in float64 with the covariance lifted to a full matrix, because the diagonal
     family is closed only under diagonal :math:`g_i`; the residual certifies the
-    reference-coordinate construction, not the diagonal family's local projection. Each entry of
+    reference-coordinate construction, not the diagonal family's local projection (on the lifted
+    covariances the per-coordinate self term is the full family's ordered form). Each entry of
     ``residuals`` is a per-layer list of the maximum over ``n_draws`` of
     :math:`\max|x'-x|/\max|x|`, which should sit at float64 roundoff (``unit_roundoff``) times the
     conditioning of the frames and covariances.
     """
+    from vfe3.alpha_i import alpha_is_per_coord, self_coupling_alpha
+    from vfe3.families.gaussian import FullGaussian
+    from vfe3.free_energy import self_divergence_for_alpha
     from vfe3.gradients.full_link import (
         build_full_link_context, full_link_cost, full_link_gradients, full_link_minimizer)
     from vfe3.gradients.relational import relational_predictive_readout
@@ -750,10 +769,11 @@ def projected_gauge_equivariance(
     log_prior = None if log_prior is None else log_prior.double()
     tau = attention_tau(_as_coeff(cfg.kappa_beta, tokens.device), model._belief_score_irrep_dims(),
                         device=tokens.device)
-    # The prior moves with the belief (mu_p = mu, Sigma_p = Sigma), so D(q||p) = 0 and a
+    # The receiver's prior moves with the belief (mu_p = mu, Sigma_p = Sigma), so D(q||p) = 0 and a
     # state-dependent alpha* = c0/(b0 + D) is the constant c0/b0 at this snapshot.
+    receiver = any(ops.readout_mode != "predictive_content" for ops in model.relational_operators_by_layer)
     alpha = float(cfg.lambda_alpha)
-    if cfg.lambda_alpha_mode != "constant":
+    if receiver and cfg.lambda_alpha_mode != "constant":
         ratio = torch.as_tensor(cfg.c0, dtype=torch.float64) / torch.as_tensor(cfg.b0, dtype=torch.float64)
         if bool((ratio != ratio.flatten()[0]).any()):
             raise ValueError("the gauge-equivariance witness needs a coordinate-uniform c0/b0: a "
@@ -770,6 +790,34 @@ def projected_gauge_equivariance(
     sigma = beliefs.sigma.double()
     sigma = torch.diag_embed(sigma) if sigma.dim() == mu.dim() else sigma      # (1, N, K, K)
     H, d = len(model.group.irrep_dims), model.group.irrep_dims[0]
+
+    # The self term against an independent prior: mu_p = mu + N(0, I) and Sigma_p = B Sigma B^T with B = I + A/4
+    # block-diagonal over the irrep blocks (so a head-block family keeps its layout), from its own generator so
+    # the frame draws below are unchanged.
+    self_coupling_live = cfg.mstep_self_coupling_weight > 0.0 or bool(cfg.diagnose_canonical_free_energy)
+    if self_coupling_live:
+        prior_generator = torch.Generator().manual_seed(int(seed) + 1)
+        mixing = torch.zeros_like(sigma)                                       # (1, N, K, K)
+        offset = 0
+        for k in model.group.irrep_dims:
+            block = torch.randn(1, n, k, k, generator=prior_generator, dtype=torch.float64).to(mu.device)
+            mixing[..., offset:offset + k, offset:offset + k] = (
+                torch.eye(k, dtype=torch.float64, device=mu.device) + 0.25 * block)
+            offset += k
+        mu_p = mu + torch.randn(mu.shape, generator=prior_generator, dtype=torch.float64).to(mu.device)
+        sigma_p = mixing @ sigma @ mixing.transpose(-1, -2)                    # (1, N, K, K)
+        b0, c0 = (torch.as_tensor(v, dtype=torch.float64, device=mu.device) if isinstance(v, (list, tuple))
+                  else v for v in (cfg.b0, cfg.c0))
+
+    def self_coupling(mu: torch.Tensor, sigma: torch.Tensor, mu_p: torch.Tensor,
+                      sigma_p: torch.Tensor) -> torch.Tensor:                 # (1, N)
+        div = self_divergence_for_alpha(                                       # (1, N) or (1, N, K)
+            FullGaussian(mu, sigma), FullGaussian(mu_p, sigma_p),
+            kl_max=cfg.kl_max, eps=cfg.eps, lambda_alpha_mode=cfg.lambda_alpha_mode)
+        alpha_i, regularizer = self_coupling_alpha(
+            div, mode=cfg.lambda_alpha_mode, value=cfg.lambda_alpha, b0=b0, c0=c0)
+        term = alpha_i * div + regularizer
+        return term.sum(dim=-1) if alpha_is_per_coord(cfg.lambda_alpha_mode) else term
 
     def evaluate(ops, mu, sigma, frame, value_frame, link_state=None) -> Dict[str, torch.Tensor]:
         capture: Dict[str, torch.Tensor] = {}
@@ -807,9 +855,12 @@ def projected_gauge_equivariance(
     loops = any(getattr(ops, "content_link_loop_weight", 0.0) > 0.0 for ops in layers)
     previous_links = None
     links = lambda: (None if not loops else {} if previous_links is None else {"previous": previous_links})
+    base_self_coupling = self_coupling(mu, sigma, mu_p, sigma_p) if self_coupling_live else None
     for layer_index, ops in enumerate(layers):
         base_links = links()
         base = evaluate(ops, mu, sigma, frame, value_frame, base_links)
+        if self_coupling_live:
+            base["self_coupling"] = base_self_coupling
         worst: Dict[str, float] = {}
         for _ in range(int(n_draws)):
             if model.group.name == "block_glk" and model.group.tying == "per_head":
@@ -832,6 +883,10 @@ def projected_gauge_equivariance(
                 # -c_i/2 log det(g Sigma g^T) = -c_i/2 log det Sigma - c_i log|det g_i|.
                 shift = (base["_c"] * torch.linalg.slogdet(G)[1]).sum()
                 moved["receiver_energy"] = moved["receiver_energy"] + shift
+            if self_coupling_live:
+                moved["self_coupling"] = self_coupling(
+                    (G @ mu.unsqueeze(-1)).squeeze(-1), G @ sigma @ G.transpose(-1, -2),
+                    (G @ mu_p.unsqueeze(-1)).squeeze(-1), G @ sigma_p @ G.transpose(-1, -2))
             for key, value in base.items():
                 if not key.startswith("_"):
                     worst[key] = max(worst.get(key, 0.0), _relative_deviation(value, moved[key]))

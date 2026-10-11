@@ -24,7 +24,7 @@ from vfe3.contracts import CanonicalFrameContext
 from vfe3.geometry.norms import AffineLayerNorm, LayerNorm, MahalanobisNorm
 from vfe3.model.block_mlp import (
     BlockMLP, CanonicalFrameBlockMLP, GaugeGateBlockMLP, block_norm_jacobian, block_norm_linearization,
-    layernorm_jacobian,
+    block_norm_radial_term, layernorm_jacobian,
 )
 from vfe3.model.model import VFEModel
 
@@ -187,6 +187,10 @@ def test_executed_block_applies_the_composite_pushforward() -> None:
 
     J_fd = _fd_jacobian(composite, mu)
     expected = J_fd @ sigma @ J_fd.transpose(-1, -2) + _post_norm_floor(model.block_norm, mu, sigma)
+    # The norm's radial second-order term rho (J_mlp g)(J_mlp g)^T (audit 2026-10-10 round 2, item 11).
+    radial = block_norm_radial_term(model.block_norm, mu, sigma)
+    h = (_fd_jacobian(mlp, model.block_norm(mu, sigma)) @ radial.direction.unsqueeze(-1)).squeeze(-1)   # (1, N, K)
+    expected = expected + radial.rho.unsqueeze(-1) * h.unsqueeze(-1) * h.unsqueeze(-2)
     got = capture["block_mlp_output"].sigma
     assert (got - expected).abs().max() / expected.abs().max() < 1e-8
 

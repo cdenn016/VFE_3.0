@@ -4,10 +4,11 @@ r"""Multi-step CAVI and the prototype-template EM M-step term (audit 2026-10-10,
 (:func:`vfe3.model.minimal_agent.minimal_agent_readout`, :func:`vfe3.model.prototype_agents.prototype_mean_field_posterior`):
 each later sweep recomputes the labels at the previous sweep's posterior and fuses again from the input moments.
 ``block_mlp_em_weight`` adds :math:`-w\sum_l\operatorname{mean}_iQ_{il}` to the training loss, with :math:`Q_{il}` the
-expected complete-data log-likelihood of the prototype templates at the detached block input and template weights
-(:meth:`vfe3.model.block_mlp.PrototypeAgentBlockMLP.em_objective`). Tiny CPU cases only: one sweep against the
-first-step reference, the label staleness over 20 sweeps, the EM gradient against the analytic M-step gradient, the
-w = 0 path, and one training step with each option on.
+expected complete-data log-likelihood of the prototype templates under the detached posterior the block ran
+(:meth:`vfe3.model.block_mlp.PrototypeAgentBlockMLP.em_objective`; audit 2026-10-10 round 2, item 15). Tiny CPU cases
+only: one sweep against the first-step reference, the label staleness over 20 sweeps, the EM gradient against central
+differences of the evidence (exact) and of the final-state M-step (mean field), the w = 0 path, and one training step
+with each option on.
 """
 import math
 import warnings
@@ -269,16 +270,16 @@ def test_prototype_cavi_steps_reach_the_block_mlp() -> None:
 # EM M-step term
 # ----------------------------------------------------------------------------------------------
 
-def _q_direct(mlp: PrototypeAgentBlockMLP, mu: torch.Tensor, sigma: torch.Tensor,
-              weights: torch.Tensor) -> torch.Tensor:                       # (...) Q_i
-    r""":math:`Q_i = \sum_ar_{ia}[\log\hat\pi_a - \tfrac12\sum_k(\log 2\pi\lambda_{ak} + ((\xi_{ik} - \nu_{ak})^2 + c_{ik})/\lambda_{ak})]`
-    with the explicit difference (no expanded square)."""
-    c = pa.covariance_diagonal(sigma, pa.covariance_layout(mu, sigma))
-    lam = mlp.log_lambda.detach().exp().to(mu.dtype)
-    diff = mu.unsqueeze(-2) - mlp.nu.detach().to(mu.dtype)                 # (..., M, K)
-    log_density = -0.5 * (torch.log(2.0 * math.pi * lam) + (diff.square() + c.unsqueeze(-2)) / lam).sum(dim=-1)
-    log_pi_hat = torch.log_softmax(mlp.log_pi.detach().to(mu.dtype), dim=-1)
-    return (weights * (log_pi_hat + log_density)).sum(dim=-1)
+def _dense_covariance(sigma: torch.Tensor, layout: str) -> torch.Tensor:   # (..., K, K)
+    if layout == "diagonal":
+        return torch.diag_embed(sigma)
+    if layout == "dense":
+        return sigma
+    G, b = sigma.shape[-3], sigma.shape[-1]
+    out = sigma.new_zeros(*sigma.shape[:-3], G * b, G * b)
+    for h in range(G):
+        out[..., h * b:(h + 1) * b, h * b:(h + 1) * b] = sigma[..., h, :, :]
+    return out
 
 
 def _template_weights(mlp: PrototypeAgentBlockMLP, mu: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
@@ -287,13 +288,84 @@ def _template_weights(mlp: PrototypeAgentBlockMLP, mu: torch.Tensor, sigma: torc
     return post.weights if mlp.inference == "exact" else post.responsibilities
 
 
-@pytest.mark.parametrize("inference", ["mean_field", "exact"])
-@pytest.mark.parametrize("layout", ["diagonal", "dense"])
-def test_em_gradient_is_the_m_step_gradient(inference: str, layout: str) -> None:
-    r"""The EM rows equal :math:`Q_i` and :math:`-w\operatorname{mean}_iQ_i` has the analytic M-step gradient,
-    :math:`-w(\operatorname{mean}_i\bar r_{ia} - \hat\pi_a)` for :math:`\log\pi`, and none in the block input."""
+def _q_reference(mlp: PrototypeAgentBlockMLP, mu: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:   # (...) Q_i
+    r""":math:`Q_i = \sum_aq(a)[\log\hat\pi_a - \tfrac12\sum_k(\log 2\pi\lambda_{ak} + ((m_{iak} - \nu_{ak})^2 + p_{iak})/\lambda_{ak})]`
+    from explicit float64 moments: the exact component posteriors :math:`m_{ia} = \xi_i + C_iW_{ia}^{-1}(\nu_a - \xi_i)`,
+    :math:`P_{ia} = C_i - C_iW_{ia}^{-1}C_i` by dense inverses, or the last CAVI sweep's :math:`(r, \xi^+, \operatorname{diag}C^+)`."""
+    with torch.no_grad():
+        layout = pa.covariance_layout(mu, sigma)
+        lam = mlp.log_lambda.detach().double().exp()                        # (M, K)
+        nu = mlp.nu.detach().double()
+        log_pi_hat = torch.log_softmax(mlp.log_pi.detach().double(), dim=-1)
+        x = mu.double()
+        if mlp.inference == "exact":
+            q_a = mlp.posterior(mu, sigma).weights.double()                 # (..., M)
+            C = _dense_covariance(sigma.double(), layout).unsqueeze(-3)     # (..., 1, K, K)
+            W_inv = torch.linalg.inv(C + torch.diag_embed(lam))             # (..., M, K, K)
+            m = x.unsqueeze(-2) + (C @ W_inv @ (nu - x.unsqueeze(-2)).unsqueeze(-1)).squeeze(-1)   # (..., M, K)
+            p = torch.diagonal(C - C @ W_inv @ C, dim1=-2, dim2=-1)         # (..., M, K)
+        else:
+            post = mlp.posterior(mu, sigma, need_covariance=True)
+            q_a = post.responsibilities.double()
+            m = post.xi_plus.double().unsqueeze(-2)                          # (..., 1, K)
+            p = pa.covariance_diagonal(post.C_plus, layout).double().unsqueeze(-2)
+        log_density = -0.5 * (torch.log(2.0 * math.pi * lam) + ((m - nu).square() + p) / lam).sum(dim=-1)
+        return (q_a * (log_pi_hat + log_density)).sum(dim=-1)
+
+
+def _q_block_input(mlp: PrototypeAgentBlockMLP, mu: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+    r"""The pre-fix term (negative control): the posterior's weights with expectations under the block-input moments
+    :math:`(\xi_i, \operatorname{diag}C_i)`."""
+    c = pa.covariance_diagonal(sigma, pa.covariance_layout(mu, sigma))
+    lam = mlp.log_lambda.exp()
+    diff = mu.unsqueeze(-2) - mlp.nu                                        # (..., M, K)
+    log_density = -0.5 * (torch.log(2.0 * math.pi * lam) + (diff.square() + c.unsqueeze(-2)) / lam).sum(dim=-1)
+    return (_template_weights(mlp, mu, sigma) * (torch.log_softmax(mlp.log_pi, dim=-1) + log_density)).sum(dim=-1)
+
+
+def _log_evidence(mlp: PrototypeAgentBlockMLP, mu: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+    r""":math:`\sum_i\log p(\xi_i \mid \theta) = \sum_i\log\sum_a\hat\pi_a\mathcal N(\nu_a;\xi_i, C_i + \Lambda_a)`, dense float64."""
+    C = _dense_covariance(sigma, pa.covariance_layout(mu, sigma)).unsqueeze(-3)          # (..., 1, K, K)
+    W = C + torch.diag_embed(mlp.log_lambda.exp())                          # (..., M, K, K)
+    diff = mlp.nu - mu.unsqueeze(-2)                                        # (..., M, K)
+    maha = (diff.unsqueeze(-2) @ torch.linalg.solve(W, diff.unsqueeze(-1))).squeeze(-1).squeeze(-1)
+    log_density = -0.5 * (maha + torch.logdet(W) + mu.shape[-1] * math.log(2.0 * math.pi))
+    return torch.logsumexp(torch.log_softmax(mlp.log_pi, dim=-1) + log_density, dim=-1).sum()
+
+
+def _final_state_m_step(mlp: PrototypeAgentBlockMLP, mu: torch.Tensor, sigma: torch.Tensor,
+                        post: pa.MeanFieldPrototypePosterior) -> torch.Tensor:
+    r"""The mean-field ELBO's :math:`\theta`-dependent part at the frozen final CAVI state :math:`q(a_i) = r_i`,
+    :math:`q(X_i) = \mathcal N(\xi_i^+, C_i^+)`: :math:`\sum_{ia}r_{ia}E_q[\log\hat\pi_a + \log\mathcal N(X_i;\nu_a,\Lambda_a)]`."""
+    lam = mlp.log_lambda.exp()
+    c_plus = pa.covariance_diagonal(post.C_plus, pa.covariance_layout(mu, sigma)).unsqueeze(-2)
+    diff = post.xi_plus.unsqueeze(-2) - mlp.nu                              # (..., M, K)
+    log_density = -0.5 * (torch.log(2.0 * math.pi * lam) + (diff.square() + c_plus) / lam).sum(dim=-1)
+    return (post.responsibilities * (torch.log_softmax(mlp.log_pi, dim=-1) + log_density)).sum()
+
+
+def _central_differences(fn: Any, params: Tuple[torch.Tensor, ...], h: float = 1e-6) -> List[torch.Tensor]:
+    grads = []
+    with torch.no_grad():
+        for p in params:
+            grad = torch.zeros_like(p)
+            flat, gflat = p.view(-1), grad.view(-1)
+            for j in range(flat.numel()):
+                original = float(flat[j])
+                flat[j] = original + h
+                up = float(fn())
+                flat[j] = original - h
+                down = float(fn())
+                flat[j] = original
+                gflat[j] = (up - down) / (2.0 * h)
+            grads.append(grad)
+    return grads
+
+
+def _em_case(inference: str, layout: str) -> Tuple[PrototypeAgentBlockMLP, torch.Tensor, torch.Tensor]:
+    r"""A float64 block with generic templates (K = 4, M = 8) and a (2, 3) batch of working beliefs in ``layout``."""
     torch.manual_seed(0)
-    K, e, w = 4, 2, 0.7
+    K, e = 4, 2
     mlp = PrototypeAgentBlockMLP(K, e, 0.0, inference=inference, cavi_steps=3 if inference == "mean_field" else 1)
     mlp = mlp.double()
     g = torch.Generator().manual_seed(11)
@@ -303,39 +375,52 @@ def test_em_gradient_is_the_m_step_gradient(inference: str, layout: str) -> None
         mlp.log_pi.copy_(0.5 * torch.randn(mlp.log_pi.shape, generator=g, dtype=F64))
     mu = (1.5 * torch.randn(2, 3, K, generator=g, dtype=F64)).requires_grad_()
     if layout == "diagonal":
-        sigma = (0.5 + torch.rand(2, 3, K, generator=g, dtype=F64)).requires_grad_()
-    else:
+        sigma = 0.5 + torch.rand(2, 3, K, generator=g, dtype=F64)
+    elif layout == "dense":
         X = torch.randn(2, 3, K, K, generator=g, dtype=F64)
-        sigma = (0.3 * X @ X.transpose(-1, -2) + 0.5 * torch.eye(K, dtype=F64)).requires_grad_()
+        sigma = 0.3 * X @ X.transpose(-1, -2) + 0.5 * torch.eye(K, dtype=F64)
+    else:
+        X = torch.randn(2, 3, 2, 2, 2, generator=g, dtype=F64)
+        sigma = 0.3 * X @ X.transpose(-1, -2) + 0.5 * torch.eye(2, dtype=F64)
+    return mlp, mu, sigma.requires_grad_()
+
+
+@pytest.mark.parametrize("inference,layout", [("mean_field", "diagonal"), ("mean_field", "dense"),
+                                              ("exact", "diagonal"), ("exact", "dense"), ("exact", "blocks")])
+def test_em_gradient_is_the_gradient_of_the_intended_objective(inference: str, layout: str) -> None:
+    r"""Audit 2026-10-10 round 2, item 15. The EM rows equal :math:`Q_i` under the posterior the block ran, and
+    :math:`\sum_iQ_i` has, against float64 central differences, the gradient of :math:`\sum_i\log p(\xi_i \mid \theta)`
+    (exact, Fisher's identity) or of the M-step at the final CAVI state (mean field, three sweeps); none reaches the
+    block input. The pre-fix block-input term misses both."""
+    mlp, mu, sigma = _em_case(inference, layout)
     rows: List[torch.Tensor] = []
     mlp.forward_moments(mu, sigma, em_rows=rows)
     assert len(rows) == 1 and rows[0].shape == (2, 3)
-    r_bar = _template_weights(mlp, mu.detach(), sigma.detach())             # (2, 3, M)
-    torch.testing.assert_close(rows[0], _q_direct(mlp, mu.detach(), sigma.detach(), r_bar), rtol=1e-12, atol=1e-12)
-    loss = -w * rows[0].mean()
-    g_nu, g_ll, g_lpi, g_mu, g_sigma = torch.autograd.grad(
-        loss, (mlp.nu, mlp.log_lambda, mlp.log_pi, mu, sigma), allow_unused=True)
-    assert g_mu is None and g_sigma is None                                 # detached block input and weights
-    M = mlp.nu.shape[0]
-    r = r_bar.reshape(-1, M)
-    xi = mu.detach().reshape(-1, K)
-    c = pa.covariance_diagonal(sigma.detach(), layout).reshape(-1, K)
-    lam = mlp.log_lambda.detach().exp()
-    diff = xi.unsqueeze(-2) - mlp.nu.detach()                               # (I, M, K)
-    pi_hat = torch.softmax(mlp.log_pi.detach(), dim=-1)
-    torch.testing.assert_close(g_lpi, -w * (r.mean(dim=0) - pi_hat), rtol=1e-12, atol=1e-13)
-    torch.testing.assert_close(g_nu, -w * (r.unsqueeze(-1) * diff / lam).mean(dim=0), rtol=1e-12, atol=1e-13)
-    torch.testing.assert_close(
-        g_ll, -w * (r.unsqueeze(-1) * 0.5 * ((diff.square() + c.unsqueeze(-2)) / lam - 1.0)).mean(dim=0),
-        rtol=1e-11, atol=1e-12)
+    torch.testing.assert_close(rows[0], _q_reference(mlp, mu.detach(), sigma.detach()), rtol=1e-12, atol=1e-12)
+    params = (mlp.nu, mlp.log_lambda, mlp.log_pi)
+    *got, g_mu, g_sigma = torch.autograd.grad(rows[0].sum(), (*params, mu, sigma), allow_unused=True)
+    assert g_mu is None and g_sigma is None                                 # the posterior is detached
+    x, S = mu.detach(), sigma.detach()
+    if inference == "exact":
+        objective = lambda: _log_evidence(mlp, x, S)                        # noqa: E731
+    else:
+        with torch.no_grad():
+            post = mlp.posterior(x, S, need_covariance=True)                # the final sweep, frozen
+        objective = lambda: _final_state_m_step(mlp, x, S, post)            # noqa: E731
+    want = _central_differences(objective, params)
+    for a, b in zip(got, want):
+        torch.testing.assert_close(a, b, rtol=1e-6, atol=1e-7)
+    stale = torch.autograd.grad(_q_block_input(mlp, x, S).sum(), params[:2])
+    gap = max(float((a - b).norm() / b.norm()) for a, b in zip(stale, want[:2]))
+    assert gap > 0.05, gap                                                  # the old pairing is a different gradient
 
 
 @pytest.mark.parametrize("coordinates", ["local", "reference"])
 @pytest.mark.parametrize("inference", ["mean_field", "exact"])
 def test_em_term_enters_the_loss_with_the_m_step_gradient(coordinates: str, inference: str,
                                                           monkeypatch: pytest.MonkeyPatch) -> None:
-    r"""At :math:`w > 0` the loss is :math:`\mathrm{CE} - w\sum_l\operatorname{mean}_{i\in\mathrm{scored}}Q_{il}` at the
-    inputs each block read, the reported CE is unchanged, :math:`\log\pi` of layer :math:`l` gains
+    r"""At :math:`w > 0` the loss is :math:`\mathrm{CE} - w\sum_l\operatorname{mean}_{i\in\mathrm{scored}}Q_{il}` under the
+    posterior each block ran at its input, the reported CE is unchanged, :math:`\log\pi` of layer :math:`l` gains
     :math:`-w(\operatorname{mean}_i\bar r_{ia} - \hat\pi_a)` and no parameter outside the templates changes gradient."""
     w = 0.4
     base = dict(_PROTOTYPE, block_coordinates=coordinates, block_mlp_inference=inference)
@@ -362,7 +447,7 @@ def test_em_term_enters_the_loss_with_the_m_step_gradient(coordinates: str, infe
     assert [entry[0] for entry in seen] == list(on.block_mlps)
     scored = (targets != -100).to(torch.float32)                            # (B, N)
     n_scored = scored.sum()
-    em = sum((_q_direct(mlp, mu, sigma, _template_weights(mlp, mu, sigma)) * scored).sum() for mlp, mu, sigma in seen)
+    em = sum((_q_reference(mlp, mu, sigma).float() * scored).sum() for mlp, mu, sigma in seen)
     torch.testing.assert_close(ce_on, ce_off, rtol=1e-6, atol=1e-6)
     torch.testing.assert_close(loss_on.detach() - ce_on, -w * em / n_scored, rtol=1e-4, atol=1e-5)
     off_grads = dict(off.named_parameters())

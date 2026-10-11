@@ -445,6 +445,106 @@ def prototype_exact_posterior(
 
 
 @ieee_fp32_matmul()
+def _exact_em_tile(
+    xi:         torch.Tensor,                       # (r, K) or (r, G, b), detached
+    C:          torch.Tensor,                       # (r, K) or (r, G, b, b), detached
+    weights:    torch.Tensor,                       # (r, m) exact weights w_ia of this chunk, detached
+    nu:         torch.Tensor,                       # (m, K) or (m, G, b)
+    log_lambda: torch.Tensor,                       # (m, K) or (m, G, b)
+    log_pi_hat: torch.Tensor,                       # (m,) normalized log prior
+    blocks:     bool,
+) -> torch.Tensor:                                  # (r,) sum over the chunk of w_ia [...]
+    r"""One (rows x templates) tile of :func:`prototype_exact_em_objective`.
+
+    The component moments are formed without gradients at the current templates,
+    :math:`m_{ia} = \xi_i + C_iW_{ia}^{-1}(\nu_a - \xi_i)` and :math:`p_{ia} = \operatorname{diag}(C_iW_{ia}^{-1}\Lambda_a)`
+    (elementwise :math:`c\lambda/(c + \lambda)` for a diagonal :math:`C_i`); the bracket is then evaluated at the live
+    :math:`(\nu, \log\lambda, \log\hat\pi)`.
+    """
+    with torch.no_grad():
+        lam_old, nu_old = log_lambda.detach().exp(), nu.detach()
+        if blocks:
+            W = C.unsqueeze(1) + torch.diag_embed(lam_old)                    # (r, m, G, b, b) C + Lambda_a
+            L, _ = torch.linalg.cholesky_ex(W)                                # factored by the posterior already
+            solved = torch.cholesky_solve((nu_old - xi.unsqueeze(1)).unsqueeze(-1), L)   # (r, m, G, b, 1)
+            m_ia = xi.unsqueeze(1) + (C.unsqueeze(1) @ solved).squeeze(-1)    # (r, m, G, b)
+            p = (C.unsqueeze(1) * torch.cholesky_inverse(L)).sum(dim=-1) * lam_old   # (r, m, G, b) diag(C W^-1 Lambda)
+        else:
+            W = C.unsqueeze(-2) + lam_old                                     # (r, m, K) c + lambda
+            m_ia = xi.unsqueeze(-2) + C.unsqueeze(-2) * (nu_old - xi.unsqueeze(-2)) / W   # (r, m, K)
+            p = C.unsqueeze(-2) * lam_old / W                                 # (r, m, K) c lambda / (c + lambda)
+    axes = tuple(range(2, m_ia.dim()))
+    quadratic = (((m_ia - nu).square() + p) * torch.exp(-log_lambda)).sum(dim=axes)       # (r, m)
+    log_norm = (math.log(2.0 * math.pi) + log_lambda).sum(dim=tuple(range(1, log_lambda.dim())))   # (m,)
+    bracket = log_pi_hat - 0.5 * (quadratic + log_norm)                       # (r, m)
+    return (weights * bracket).sum(dim=-1)
+
+
+def prototype_exact_em_objective(
+    xi:         torch.Tensor,                       # (..., K) working means (detached)
+    C:          torch.Tensor,                       # (..., K), (..., K, K) or (..., G, b, b) working covariance (detached)
+    weights:    torch.Tensor,                       # (..., M) exact template weights w_ia (detached)
+    nu:         torch.Tensor,                       # (M, K) template means
+    log_lambda: torch.Tensor,                       # (M, K) template log variances
+    log_pi_hat: torch.Tensor,                       # (M,) normalized log prior log softmax(log pi)
+    *,
+    tile_bytes: int = PROTOTYPE_TILE_BYTES,
+) -> torch.Tensor:                                  # (...) Q_i
+    r"""EM objective of the exact posterior: expectations under each template's component posterior.
+
+    For the model :math:`a \sim \hat\pi`, :math:`X \mid a \sim \mathcal N(\nu_a, \Lambda_a)`,
+    :math:`\xi_i \mid X \sim \mathcal N(X, C_i)` (evidence :math:`\sum_a\hat\pi_a\mathcal N(\nu_a;\xi_i, W_{ia})`,
+    :math:`W_{ia} = C_i + \Lambda_a`), the exact posterior is :math:`\sum_aw_{ia}\mathcal N(m_{ia}, P_{ia})` (module
+    docstring) and
+
+    .. math::
+        Q_i(\theta) = \sum_aw_{ia}\Bigl[\log\hat\pi_a - \tfrac12\sum_k\Bigl(\log 2\pi\lambda_{ak}
+            + \frac{(m_{iak} - \nu_{ak})^2 + (P_{ia})_{kk}}{\lambda_{ak}}\Bigr)\Bigr],
+
+    with :math:`w`, :math:`m` and :math:`P` taken at the current templates and held fixed. It is the expected
+    complete-data log-likelihood up to the :math:`\theta`-independent :math:`E_q\log\mathcal N(\xi_i;X, C_i)`, so by
+    Fisher's identity :math:`\nabla_\theta Q_i = \nabla_\theta\log p(\xi_i \mid \theta)` at the current templates. Rows and
+    templates are tiled as in :func:`prototype_exact_posterior` (each template chunk adds its share, since the weights
+    are already normalized); with gradients on and more than one tile, each tile runs under a non-reentrant
+    checkpoint. Autocast off, at float64 when an input is float64 and float32 otherwise.
+    """
+    layout = covariance_layout(xi, C)
+    K, M = xi.shape[-1], nu.shape[0]
+    lead = tuple(xi.shape[:-1])
+    rows = math.prod(lead)
+    dtype = _compute_dtype(xi, C, weights, nu, log_lambda, log_pi_hat)
+    blocks = layout != "diagonal"
+    with torch.autocast(device_type=xi.device.type, enabled=False):
+        x = xi.to(dtype).reshape(rows, K)                                    # (R, K)
+        w = weights.to(dtype).reshape(rows, M)                               # (R, M)
+        n, ll, lp = nu.to(dtype), log_lambda.to(dtype), log_pi_hat.to(dtype)
+        if blocks:
+            Cb = (C.to(dtype).unsqueeze(-3) if layout == "dense" else C.to(dtype))   # (..., G, b, b)
+            G, b = Cb.shape[-3], Cb.shape[-1]
+            Cw, xw = Cb.reshape(rows, G, b, b), x.reshape(rows, G, b)
+            nw, lw, elements = n.reshape(M, G, b), ll.reshape(M, G, b), G * b * b
+        else:
+            Cw, xw, nw, lw, elements = C.to(dtype).reshape(rows, K), x, n, ll, K
+        pairs = max(1, int(tile_bytes) // ((torch.finfo(dtype).bits // 8) * 2 * elements))
+        m_step = min(M, pairs)
+        r_step = max(1, min(rows, pairs // m_step))
+        tiled = rows > r_step or M > m_step
+        out_rows = []
+        for i in range(0, rows, r_step):
+            total: Optional[torch.Tensor] = None
+            for j in range(0, M, m_step):
+                args = (xw[i:i + r_step], Cw[i:i + r_step], w[i:i + r_step, j:j + m_step], nw[j:j + m_step],
+                        lw[j:j + m_step], lp[j:j + m_step])
+                if tiled and torch.is_grad_enabled() and any(t.requires_grad for t in args):
+                    part = checkpoint(_exact_em_tile, *args, blocks, use_reentrant=False, preserve_rng_state=False)
+                else:
+                    part = _exact_em_tile(*args, blocks)
+                total = part if total is None else total + part
+            out_rows.append(total)
+        return torch.cat(out_rows).reshape(lead)
+
+
+@ieee_fp32_matmul()
 def prototype_mean_field_posterior(
     xi:         torch.Tensor,              # (..., K) working means
     C:          torch.Tensor,              # (..., K), (..., K, K) or (..., G, b, b) working covariance

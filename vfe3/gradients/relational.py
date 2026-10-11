@@ -5,11 +5,27 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 
 from vfe3.contracts import CanonicalFrameContext
-from vfe3.geometry.rope import rope_commutant_projection, rope_rotated_pairs
+from vfe3.geometry.rope import (
+    rope_commutant_diagonal, rope_commutant_is_diagonal, rope_commutant_projection, rope_rotated_pairs,
+)
 from vfe3.model.edge_links import edge_diagnostic_capture, receive_heads as edge_receive_heads
 from vfe3.model.relational_operators import RelationalOperators
-from vfe3.relational_scoring import _compute_dtype, projected_moments, routing_cost
+from vfe3.relational_scoring import _compute_dtype, projected_condition_recovery, projected_moments, routing_cost
 from vfe3.runtime import ieee_fp32_matmul
+
+
+def _diagonal_comparison_route(operators: RelationalOperators, r: int, n_pairs: int) -> bool:
+    r"""Whether a rotation-invariant comparison block of rank r scores its Gaussian KL on the diagonal route.
+
+    :math:`P(G)` is structurally diagonal when at most one coordinate of the block stays unrotated
+    (:func:`vfe3.geometry.rope.rope_commutant_is_diagonal`). The diagonal route
+    (``diagonal_covariance`` of :func:`vfe3.relational_scoring.projected_gaussian_kl`) also requires the Gaussian-KL
+    cost, no GEMM error fallback (``pair_kl_gemm_tol`` None) and conditioning-triggered recovery off, whose
+    float64 rescoring it would bypass; every other case keeps the dense route with its certificate, recovery and
+    fallback (audit 2026-10-10 round 2, item 30).
+    """
+    return (rope_commutant_is_diagonal(r, n_pairs) and operators.routing == "gaussian_kl"
+            and operators.pair_kl_gemm_tol is None and not projected_condition_recovery())
 
 
 def relational_score(
@@ -44,7 +60,11 @@ def relational_score(
     comparison covariance is replaced by its projection :math:`P(G)` onto the commutant of the RoPE torus
     (:func:`vfe3.geometry.rope.rope_commutant_projection`) before the rotation, so the trace and log-determinant
     terms are position-free and only the mean term reads :math:`j - i`. The capture then records
-    :math:`P(G)`, the covariance the router scores, and the scorer takes its Gram route (no source tuples).
+    :math:`P(G)`, the covariance the router scores. The scorer takes its Gram route; the source tuples carry the
+    rotated maps :math:`R_iS` with ``commutant_pairs``, so a failed (or, under condition recovery, flagged)
+    factorization is rebuilt as :math:`P(XX^\top)` from the source (audit 2026-10-10 round 2, item 12). When
+    :math:`P(G)` is structurally diagonal (:func:`_diagonal_comparison_route`) only diag(G) is formed and the
+    Gaussian KL takes its diagonal route, with no Gram, factorization or source tuple.
     Under ``tie_comparison_maps`` a belief scored against itself is projected once and both roles share it.
     """
     dims = operators.irrep_dims
@@ -83,7 +103,8 @@ def relational_score(
         cost_options["gemm_expansion_tol"] = operators.pair_kl_gemm_tol
     scores, captured_q, captured_k = [], [], []
     # One scoring call per run: the heads of a run share their rank d_r. Each call ends in its own
-    # host transfer, so a tower of R runs pays R of them per call (one for equal heads).
+    # host transfer, so a tower of R runs pays R of them per call (one for equal heads), unless its
+    # verdicts can only raise (the diagonal route), which deferred_host_checks then queues.
     for (S_q, S_k), inverse in zip(comparison, inverse_runs):
         H, K = S_q.shape[0], S_q.shape[-1]
         # Both roles read the one shared frame: there is no separate key-side inverse.
@@ -100,34 +121,37 @@ def relational_score(
         tied = self_scored and S_q is S_k
         # gaussian_block: Sigma is head-block diagonal, so G = L Sigma L^T reads only the diagonal blocks.
         head_dims = tuple(operators.irrep_dims) if operators.block_covariance else None
+        rope_base = getattr(operators, "comparison_rope_base", None)
+        invariant = rope_base is not None and operators.rope_comparison_covariance == "rotation_invariant"
+        n_pairs = rope_rotated_pairs(S_q.shape[-2], operators.comparison_rope_fraction) if invariant else 0
+        # A structurally diagonal P(G) needs only diag(G): the moments return it (..., N, H, r) in place of G.
+        diagonal = invariant and _diagonal_comparison_route(operators, S_q.shape[-2], n_pairs)
+        moment_options = {"head_dims": head_dims, **({"diagonal_only": True} if diagonal else {})}
         if tied:
-            a_q, G_q = projected_moments(mu_h, sigma_h, inverse, S_q, head_dims=head_dims)  # (..., N, H, d), (..., N, H, d, d)
+            a_q, G_q = projected_moments(mu_h, sigma_h, inverse, S_q, **moment_options)  # (..., N, H, d), (..., N, H, d, d)
             a_k, G_k = a_q, G_q
         elif self_scored:
             # Predictive readout scores a belief against itself: one batched projection over both
             # comparison maps. S_q and S_k still differ, so two L = S U^-1 maps are formed, but the
             # covariance contraction G = L Sigma L^T is batched across the role axis.
-            a, G = projected_moments(mu_h, sigma_h, inverse, torch.stack((S_q, S_k)),
-                                     head_dims=head_dims)
+            a, G = projected_moments(mu_h, sigma_h, inverse, torch.stack((S_q, S_k)), **moment_options)
             a_q, G_q = a[0], G[0]
             a_k, G_k = a[1], G[1]
         else:
-            a_q, G_q = projected_moments(mu_h, sigma_h, inverse, S_q, head_dims=head_dims)  # (..., N, H, d), (..., N, H, d, d)
-            a_k, G_k = projected_moments(source_mu_h, source_sigma_h, key_inverse, S_k,
-                                         head_dims=head_dims)
-        rope_base = getattr(operators, "comparison_rope_base", None)
-        invariant = rope_base is not None and operators.rope_comparison_covariance == "rotation_invariant"
+            a_q, G_q = projected_moments(mu_h, sigma_h, inverse, S_q, **moment_options)  # (..., N, H, d), (..., N, H, d, d)
+            a_k, G_k = projected_moments(source_mu_h, source_sigma_h, key_inverse, S_k, **moment_options)
         if invariant:
             # rope_comparison_covariance='rotation_invariant' (audit 2026-10-09 round 2, comparison-space RoPE
             # self-lock): project G onto the commutant of the RoPE torus, one isotropic variance per rotating
             # plane and the full non-rotating block, so R_i P(G) R_i^T = P(G) and only the mean term of the
-            # pair cost carries the relative position j - i.
-            n_pairs = rope_rotated_pairs(S_q.shape[-2], operators.comparison_rope_fraction)
-            G_q = rope_commutant_projection(G_q, n_pairs)                       # (..., N, H, r, r)
-            G_k = G_q if tied else rope_commutant_projection(G_k, n_pairs)
+            # pair cost carries the relative position j - i. On the diagonal route P(G) is its diagonal.
+            project = rope_commutant_diagonal if diagonal else rope_commutant_projection
+            G_q = project(G_q, n_pairs)                                         # (..., N, H, r[, r])
+            G_k = G_q if tied else project(G_k, n_pairs)
         if capture is not None:
-            captured_q.append(G_q.detach().to(public))
-            captured_k.append(G_k.detach().to(public))
+            # The capture records the matrix P(G) on both routes.
+            captured_q.append((torch.diag_embed(G_q.detach()) if diagonal else G_q.detach()).to(public))
+            captured_k.append((torch.diag_embed(G_k.detach()) if diagonal else G_k.detach()).to(public))
         projection_q = (sigma_h, inverse, S_q, mu_h)
         projection_k = (source_sigma_h, key_inverse, S_k, source_mu_h)
         if rope_base is not None:
@@ -140,10 +164,10 @@ def relational_score(
             # X_i = R_i S U_i^{-1} Sigma_i^{1/2} exactly as on the unrotated route (audit 2026-10-08 P1-2).
             # The rotation runs under the same IEEE-fp32 pin as the moments it rotates (P1-1).
             # Under rope_comparison_covariance='rotation_invariant' only the means rotate: R_i P(G) R_i^T = P(G)
-            # exactly, so G is left as projected (no rounding from a rotation). The projected covariance has
-            # no source root of the form R_i S U_i^{-1} Sigma_i^{1/2}, so no source tuples are passed: the scorer
-            # factors the projected Gram itself (the matrix the healthy path scores), and any recovery refactors
-            # that same matrix in float64.
+            # exactly, so G is left as projected (no rounding from a rotation). P is invariant under every torus
+            # element, P(R_i X X^T R_i^T) = P(X X^T), so the source tuples still carry R_i S and, with
+            # commutant_pairs, a recovery rebuilds P(X X^T) from that root (audit 2026-10-10 round 2, item 12).
+            # The diagonal route reads no source tuple and forms no rotated map.
             r = S_q.shape[-2]
             R_q = operators.comparison_rope_rotation(a_q.shape[-3], r, a_q.device, a_q.dtype)  # (N, r, r)
             R_k = R_q if a_k.shape[-3] == a_q.shape[-3] else operators.comparison_rope_rotation(
@@ -154,15 +178,22 @@ def relational_score(
                 if not invariant:
                     G_q = torch.einsum("nst,...nhtu,nvu->...nhsv", R_q, G_q, R_q)
                     G_k = G_q if tied else torch.einsum("nst,...nhtu,nvu->...nhsv", R_k, G_k, R_k)
+                if not diagonal:
                     S_q_rot = torch.einsum("nst,htk->nhsk", R_q.to(S_q.dtype), S_q)   # (N, H, r, K)
                     S_k_rot = S_q_rot if tied else torch.einsum("nst,htk->nhsk", R_k.to(S_k.dtype), S_k)
-            if invariant:
-                projection_q = projection_k = None
-            else:
+            if not invariant:
                 G_q = 0.5 * (G_q + G_q.transpose(-1, -2))
                 G_k = G_q if tied else 0.5 * (G_k + G_k.transpose(-1, -2))
+            if diagonal:
+                projection_q = projection_k = None
+            else:
                 projection_q = (sigma_h, inverse, S_q_rot, mu_h)
                 projection_k = (source_sigma_h, key_inverse, S_k_rot, source_mu_h)
+        run_options = dict(cost_options)
+        if diagonal:
+            run_options["diagonal_covariance"] = True                           # G_q, G_k are (..., N, H, r)
+        elif invariant:
+            run_options["commutant_pairs"] = n_pairs
         # G_q, G_k are bitwise symmetric here (projected_moments and the RoPE branch both end in a
         # symmetrization), so the scorer skips its isclose symmetry check.
         scores.append(score(
@@ -170,7 +201,7 @@ def relational_score(
             projection_q=projection_q,
             projection_k=projection_k,
             symmetric_inputs=True,
-            **cost_options).to(public))
+            **run_options).to(public))
     if capture is not None:
         # One (..., N, H, r, r) tensor for equal heads; a list with one per run for mixed head sizes.
         capture["projected_covariance_pre"] = captured_q[0] if len(captured_q) == 1 else captured_q
