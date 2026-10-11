@@ -5,10 +5,12 @@ is the PriorBank's prior tables, but the block also receives the opt-in learned 
 (CG coupling) as arguments and applies them; the block
 runs the attention step and the configured block norm (the default ``layernorm`` is not
 gauge-equivariant; ``none`` and ``mahalanobis`` are) on the mean, and under ``block_norm_covariance='pushforward'``
-its first-order pushforward on the covariance. The belief handoff across blocks lives in stack.py.
+its pushforward on the covariance (first order plus the radial second-order term). The belief handoff across blocks
+lives in stack.py.
 """
 
-from typing import TYPE_CHECKING, Callable, Optional
+from contextlib import AbstractContextManager, nullcontext
+from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
@@ -132,41 +134,49 @@ def vfe_block(
         else:
             mu_cg, sigma_cg = cg_coupling(out.mu, out.sigma)
             out = out._replace(mu=mu_cg, sigma=sigma_cg)   # _replace preserves phi/reflection
-    if getattr(cfg, "block_coordinates", "local") == "reference":
-        return _reference_coordinate_block(
-            out, block_norm=block_norm, block_mlp=block_mlp, frame=relational_frame,
-            capture=capture, hidden_bias=hidden_bias,
-            readout=lambda pushed: _head_block_readout(pushed, out.sigma, group, cfg))
-    norm_linearization = None
     mlp_delta_full = getattr(block_mlp, "covariance_contract", None) == "delta_full"
     # block_norm_covariance='pushforward' (audit 2026-10-10, item 9): each norm application also carries Sigma to
     # post-norm units; inert under a delta_full MLP, whose Jacobian composes the norm's.
     push_norm = getattr(cfg, "block_norm_covariance", "passthrough") == "pushforward" and not mlp_delta_full
+    mlp_autocast = getattr(cfg, "block_mlp_autocast", True)
+    if getattr(cfg, "block_coordinates", "local") == "reference":
+        return _reference_coordinate_block(
+            out, block_norm=block_norm, block_mlp=block_mlp, frame=relational_frame,
+            capture=capture, hidden_bias=hidden_bias,
+            readout=lambda pushed: _head_block_readout(pushed, out.sigma, group, cfg),
+            push_norm=push_norm, covariance_floor=cfg.block_mlp_covariance_floor, mlp_autocast=mlp_autocast)
+    norm_linearization = norm_radial = None
     if block_norm is not None:               # cached parameter-free norm (audit 2d/4f)
         if mlp_delta_full:
             # The norm maps the mean only; the delta_full pushforward composes its Jacobian at the pre-norm
             # mean, J = J_mlp J_LN, against the pre-norm covariance (audit 2026-10-09, variational), with the
-            # floor in post-norm units through the norm's scale D = diag(gamma)/s (round 2, #13).
-            from vfe3.model.block_mlp import block_norm_linearization
+            # floor in post-norm units through the norm's scale D = diag(gamma)/s (round 2, #13) and the norm's
+            # radial second-order variance carried through J_mlp (2026-10-10 round 2, #11).
+            from vfe3.model.block_mlp import block_norm_linearization, block_norm_radial_term
             norm_linearization = block_norm_linearization(block_norm, out.mu)   # (B, N, K, K), (B, N, K)
+            norm_radial = block_norm_radial_term(block_norm, out.mu, out.sigma)  # (B, N, 1), (B, N, K)
         out = _apply_block_norm(out, block_norm, group, cfg, push_covariance=push_norm)
     if capture is not None:
         capture["block_mlp_input"] = out     # exact immediate seam after CG/norm
     if block_mlp is not None:                # default-off residual moment transform, after norm before handoff
+        context, mu_in = _block_mlp_precision(mlp_autocast, out.mu)
         if hasattr(block_mlp, "forward_moments"):
             extra = {} if hidden_bias is None else {"hidden_bias": hidden_bias}
             if norm_linearization is not None:
                 extra["input_jacobian"] = norm_linearization.jacobian
                 extra["input_scale"] = norm_linearization.scale
+                extra["input_radial"] = norm_radial
             if capture is not None and "block_mlp_em_rows" in capture:   # block_mlp_em_weight > 0 only
                 extra["em_rows"] = capture["block_mlp_em_rows"]
-            result = block_mlp.forward_moments(
-                out.mu, out.sigma, frame_context=block_mlp_frame, **extra)
+            with context:
+                result = block_mlp.forward_moments(
+                    mu_in, out.sigma, frame_context=block_mlp_frame, **extra)
             out = out._replace(mu=result.mu, sigma=_head_block_readout(result.sigma, out.sigma, group, cfg))
         else:                                # legacy callable compatibility: coordinate mean only
             if hidden_bias is not None:
                 raise TypeError("a legacy block-MLP callable cannot take hidden_bias")
-            out = out._replace(mu=block_mlp(out.mu))
+            with context:
+                out = out._replace(mu=block_mlp(mu_in))
     if capture is not None:
         capture["block_mlp_output"] = out
     if block_mlp is not None and block_norm is not None and getattr(cfg, "block_mlp_post_norm", False):
@@ -184,21 +194,69 @@ def _apply_block_norm(
     *,
     push_covariance: bool,                    # block_norm_covariance='pushforward' outside a delta_full MLP
 ) -> BeliefState:
-    r"""The block norm on the mean, and under ``push_covariance`` its first-order pushforward of the covariance.
+    r"""The block norm on the mean, and under ``push_covariance`` its pushforward of the covariance.
 
     The pushforward is taken at the pre-norm mean :math:`u`:
-    :math:`\Sigma \mapsto J_{\mathrm{LN}}\Sigma J_{\mathrm{LN}}^\top + fD\Sigma D`, :math:`D = \operatorname{diag}(\gamma)/s`,
-    :math:`f` = ``block_mlp_covariance_floor``
-    (:func:`vfe3.model.block_mlp.block_norm_covariance_pushforward`). The diagonal family keeps its diagonal and
-    ``gaussian_block`` its head blocks (:func:`_head_block_readout`), each the M-projection onto the family. Without
-    ``push_covariance`` the covariance object passes through unchanged.
+    :math:`\Sigma \mapsto J_{\mathrm{LN}}\Sigma J_{\mathrm{LN}}^\top + fD\Sigma D + \rho gg^\top`,
+    :math:`D = \operatorname{diag}(\gamma)/s`, :math:`f` = ``block_mlp_covariance_floor``, with the radial second-order
+    term :math:`\rho gg^\top` (:func:`norm_covariance_pushforward`). Without ``push_covariance`` the covariance object
+    passes through unchanged.
     """
     if not push_covariance:
         return out._replace(mu=block_norm(out.mu, out.sigma))   # _replace preserves phi/reflection
-    from vfe3.model.block_mlp import block_norm_covariance_pushforward
-    pushed = block_norm_covariance_pushforward(block_norm, out.mu, out.sigma, cfg.block_mlp_covariance_floor)
     return out._replace(mu=block_norm(out.mu, out.sigma),
-                        sigma=_head_block_readout(pushed, out.sigma, group, cfg))
+                        sigma=norm_covariance_pushforward(block_norm, out.mu, out.sigma, group, cfg))
+
+
+def norm_covariance_pushforward(
+    norm:  Callable[..., torch.Tensor],       # a LayerNorm seam (block or final norm)
+    mu:    torch.Tensor,                      # (B, N, K) local pre-norm means
+    sigma: torch.Tensor,                      # (B, N, K) or (B, N, K, K) local covariance at mu
+    group: GaugeGroup,
+    cfg:   VFE3Config,
+    *,
+    frame: Optional[CanonicalFrameContext] = None,   # realized U_i under block_coordinates='reference'
+) -> torch.Tensor:                            # sigma's layout, read by the family
+    r"""The covariance through a LayerNorm seam under ``block_norm_covariance='pushforward'``, read by the family.
+
+    Local coordinates (``frame=None``): :func:`vfe3.model.block_mlp.block_norm_covariance_pushforward` at the
+    pre-norm mean; the diagonal family keeps its diagonal and ``gaussian_block`` its head blocks, each the
+    M-projection onto the family. Reference coordinates: the norm acts on :math:`\xi_i = U_i^{-1}\mu_i`, so the
+    pushforward acts on the invariant :math:`C_i = U_i^{-1}\Sigma_iU_i^{-\top}` and returns as
+    :math:`\Sigma_i' = U_iC_i'U_i^\top` (then its head blocks on ``gaussian_block``; audit 2026-10-10 round 2, #51). Under
+    the passive action :math:`(\mu, \Sigma, U) \to (g\mu, g\Sigma g^\top, gU)` the pair :math:`(\xi, C)` is invariant and
+    :math:`\Sigma' \to g\Sigma'g^\top`.
+    """
+    from vfe3.model.block_mlp import block_norm_covariance_pushforward
+    floor = cfg.block_mlp_covariance_floor
+    if frame is None:
+        return block_norm_covariance_pushforward(norm, mu, sigma, floor, _head_dims(group, cfg))
+    from vfe3.model.frame_actions import frame_matvec, local_covariance, reference_covariance
+    xi = frame_matvec(frame.inverse, mu, frame.block_diagonal)                          # (B, N, K)
+    C = block_norm_covariance_pushforward(norm, xi, reference_covariance(mu, sigma, frame), floor)   # (B, N, K, K)
+    return _head_block_readout(local_covariance(mu, C, frame, diagonal=False).to(sigma.dtype), sigma, group, cfg)
+
+
+def _head_dims(group: GaugeGroup, cfg: VFE3Config) -> Optional[Sequence[int]]:
+    r"""The head block sizes a head-block family (``gaussian_block``) keeps, else None."""
+    from vfe3.families.base import get_family
+    return tuple(group.irrep_dims) if get_family(cfg.family).head_block_covariance else None
+
+
+def _block_mlp_precision(
+    enabled: bool,                            # cfg.block_mlp_autocast
+    mu:      torch.Tensor,                    # (B, N, K) block-MLP input mean
+) -> 'tuple[AbstractContextManager, torch.Tensor]':
+    r"""The block MLP's precision context and input mean (``block_mlp_autocast``, audit 2026-10-10 round 2, #29).
+
+    True: the ambient autocast and the mean unchanged. False: autocast disabled and the mean at
+    ``promote_types(mu.dtype, float32)``, so under ``amp_dtype`` the MLP residual, the only reduced-precision input of
+    the otherwise fp32 router, is computed in fp32.
+    """
+    if enabled:
+        return nullcontext(), mu
+    return (torch.autocast(device_type=mu.device.type, enabled=False),
+            mu.to(torch.promote_types(mu.dtype, torch.float32)))
 
 
 def _head_block_readout(
@@ -233,6 +291,9 @@ def _reference_coordinate_block(
     capture:     Optional[MStepCapture],
     hidden_bias: Optional[torch.Tensor],                   # (B, N, w) or None
     readout:     Callable[[torch.Tensor], torch.Tensor] = lambda pushed: pushed,   # the family's covariance readout
+    push_norm:   bool = False,                             # block_norm_covariance='pushforward' (no delta_full MLP)
+    covariance_floor: float = 1e-4,                        # block_mlp_covariance_floor of the pushforwards
+    mlp_autocast: bool = True,                             # block_mlp_autocast
 ) -> BeliefState:
     r"""Norm and MLP in reference coordinates, one conjugation per block (``block_coordinates='reference'``).
 
@@ -251,13 +312,25 @@ def _reference_coordinate_block(
     ``block_mlp_covariance='posterior'`` its :math:`C_i^+` returns as :math:`\Sigma_i^{(\ell+1)} = U_iC_i^+U_i^\top`
     (its diagonal for diagonal beliefs), so that block is invariant under the passive action. Under the
     passive action :math:`(\mu, \Sigma, U) \to (g\mu, g\Sigma g^\top, gU)` the pair :math:`(\xi, C)` is invariant
-    and :math:`\mu^{(\ell+1)} \to g\mu^{(\ell+1)}`. The frame actions run with autocast off (float32, float64
-    for an escalated frame); the norm and MLP keep the ambient autocast. The captured
+    and :math:`\mu^{(\ell+1)} \to g\mu^{(\ell+1)}`.
+
+    Covariance transport (``gaussian_full`` and ``gaussian_block``; audit 2026-10-10 round 2, #51): under
+    ``push_norm`` the norm also maps the dense :math:`C_i` by
+    :func:`vfe3.model.block_mlp.block_norm_covariance_pushforward` at :math:`\xi_i`, and a coordinate ``delta_full``
+    MLP pushes :math:`C_i` through the composite :math:`J_{\mathrm{MLP}}J_{\mathrm{LN}}` at :math:`\xi_i`, with the norm's
+    floor scale and radial term, as in local coordinates. Either result returns as
+    :math:`\Sigma_i^{(\ell+1)} = U_iC_i'U_i^\top` through the family's readout, so :math:`\Sigma^{(\ell+1)} \to
+    g\Sigma^{(\ell+1)}g^\top` under the passive action; the template and prototype MLPs read the reference covariance
+    of the pushed belief the family keeps.
+    The frame actions run with autocast off (float32, float64 for an escalated frame); the norm keeps the ambient
+    autocast and the MLP keeps it unless ``mlp_autocast`` is False. The captured
     ``block_mlp_input``/``block_mlp_output`` stay in local coordinates (:math:`U_iv_i`, :math:`U_i\xi_i^+`).
     """
-    from vfe3.model.block_mlp import GaussianTemplateBlockMLP, PrototypeAgentBlockMLP
-    from vfe3.model.frame_actions import (frame_matvec, local_covariance, reference_covariance_compact,
-                                          reference_variances)
+    from vfe3.model.block_mlp import (GaussianTemplateBlockMLP, PrototypeAgentBlockMLP,
+                                      block_norm_covariance_pushforward, block_norm_linearization,
+                                      block_norm_radial_term)
+    from vfe3.model.frame_actions import (frame_matvec, local_covariance, reference_covariance,
+                                          reference_covariance_compact, reference_variances)
 
     if frame is None:
         raise RuntimeError(
@@ -267,28 +340,49 @@ def _reference_coordinate_block(
     xi = frame_matvec(frame.inverse, out.mu, bd)                             # (B, N, K) xi = U^{-1} mu
     template = isinstance(block_mlp, GaussianTemplateBlockMLP)
     prototype = isinstance(block_mlp, PrototypeAgentBlockMLP)
-    c = (reference_variances(out.mu, out.sigma, frame) if template           # diag C
-         else reference_covariance_compact(out.mu, out.sigma, frame) if prototype   # C blocks or dense
-         else out.sigma)                                                     # unread
+    delta_full = getattr(block_mlp, "covariance_contract", None) == "delta_full"
+    push = push_norm and block_norm is not None and not delta_full
+    sigma = out.sigma
+    linearization = radial = C = None
+    if push or delta_full:
+        C = reference_covariance(out.mu, out.sigma, frame)                   # (B, N, K, K) invariant C
+        if delta_full and block_norm is not None:
+            linearization = block_norm_linearization(block_norm, xi)         # at the pre-norm xi
+            radial = block_norm_radial_term(block_norm, xi, C)
+        if push:                                                             # Sigma' = U C' U^T, C' at the pre-norm xi
+            pushed = block_norm_covariance_pushforward(block_norm, xi, C, covariance_floor)
+            sigma = readout(local_covariance(out.mu, pushed, frame, diagonal=False).to(out.sigma.dtype))
+    c = (C if delta_full                                                     # the composite reads the pre-norm C
+         else reference_variances(out.mu, sigma, frame) if template          # diag C (of the pushed belief)
+         else reference_covariance_compact(out.mu, sigma, frame) if prototype   # C blocks or dense
+         else sigma)                                                         # unread
     if block_norm is not None:
         xi = block_norm(xi, c)                                               # LN acts on xi only
     if capture is not None:
-        capture["block_mlp_input"] = out._replace(mu=frame_matvec(frame.forward, xi, bd))
-    sigma = out.sigma
+        capture["block_mlp_input"] = out._replace(mu=frame_matvec(frame.forward, xi, bd), sigma=sigma)
     if block_mlp is not None:
+        context, xi = _block_mlp_precision(mlp_autocast, xi)
         if hasattr(block_mlp, "forward_moments"):
             extra = {} if hidden_bias is None else {"hidden_bias": hidden_bias}
+            if linearization is not None:
+                extra.update(input_jacobian=linearization.jacobian, input_scale=linearization.scale,
+                             input_radial=radial)
             if capture is not None and "block_mlp_em_rows" in capture:   # block_mlp_em_weight > 0 only
                 extra["em_rows"] = capture["block_mlp_em_rows"]      # the templates read (xi, diag C)
-            result = block_mlp.forward_moments(xi, c, **extra)
+            with context:
+                result = block_mlp.forward_moments(xi, c, **extra)
             xi = result.mu                                                   # passthrough: covariance kept
-            if prototype and block_mlp.covariance_contract == "posterior":
+            if delta_full:
+                sigma = readout(local_covariance(out.mu, result.sigma, frame,  # Sigma' = U C' U^T
+                                                 diagonal=False).to(out.sigma.dtype))
+            elif prototype and block_mlp.covariance_contract == "posterior":
                 sigma = readout(local_covariance(out.mu, result.sigma, frame,  # Sigma^+ = U C^+ U^T
                                                  diagonal=out.sigma.dim() == out.mu.dim()).to(out.sigma.dtype))
         else:
             if hidden_bias is not None:
                 raise TypeError("a legacy block-MLP callable cannot take hidden_bias")
-            xi = block_mlp(xi)
+            with context:
+                xi = block_mlp(xi)
     out = out._replace(mu=frame_matvec(frame.forward, xi, bd), sigma=sigma)  # (B, N, K) mu = U xi^+
     if capture is not None:
         capture["block_mlp_output"] = out

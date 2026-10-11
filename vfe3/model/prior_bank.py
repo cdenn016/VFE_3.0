@@ -961,6 +961,9 @@ class PriorBank(nn.Module):
         # 'triton' routes decode_ce_expected_likelihood_chunked through vfe3/kernels on CUDA tensors;
         # CPU tensors keep the torch kernel under either value.
         self.expected_likelihood_kernel = expected_likelihood_kernel
+        # The kernel that last ran decode_ce_expected_likelihood_chunked ('torch' | 'triton'; None before
+        # the first call), recorded for summary.json (audit 2026-10-10 round 2, #42).
+        self.realized_expected_likelihood_kernel: Optional[str] = None
         self.decode_ranking_fp64_escalation = decode_ranking_fp64_escalation
         self.unigram_kappa = unigram_kappa
         self.decode_unigram_prior = decode_unigram_prior
@@ -1989,7 +1992,9 @@ class PriorBank(nn.Module):
         mu_v_all = self._decode_mu_table()                                  # (V, K) decode table (untied if set)
         u_all = self._unigram_bias() if self.decode_unigram_prior else None  # (V,) kappa*log pi_v or None
 
-        if self.expected_likelihood_kernel == "triton" and mu_q.is_cuda:
+        fused = self.expected_likelihood_kernel == "triton" and mu_q.is_cuda
+        self.realized_expected_likelihood_kernel = "triton" if fused else "torch"
+        if fused:
             # Fused Triton route: streams (i, v) register tiles and never forms (B, N, Vc, K); same
             # formula, rounding-level differences listed in vfe3/kernels/expected_likelihood.py.
             # CPU tensors fall through to the torch kernel below, which is unchanged.

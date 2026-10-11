@@ -1683,8 +1683,9 @@ def run_phi_section(run: Any, ctx: AnalysisContext) -> SectionResult:
     res = SectionResult(name="phi")
     if not run.frames_active:
         res.status = "skipped"
-        res.notes.append("Gauge frames are inactive for this run (gauge_transport off or no generators), "
-                         "so there is no phi geometry to analyze.")
+        res.notes.append("Gauge frames are inactive for this run (identity token frames, or the unlearned random "
+                         "frames of gauge_transport='frozen'; the run notes give the reason), so there is no phi "
+                         "geometry to analyze.")
         res.seconds = time.perf_counter() - t_start
         return res
     ids = np.asarray(ctx.candidate_ids, dtype=np.int64)

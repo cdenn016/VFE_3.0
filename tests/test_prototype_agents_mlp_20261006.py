@@ -622,9 +622,12 @@ def test_config_validation() -> None:
         _cfg(block_mlp_covariance="delta_full", family="gaussian_full", decode_mode="full_chunked")
     with pytest.raises(ValueError, match="per_type_hidden_bias"):
         _cfg(per_type_hidden_bias=True)
-    with pytest.raises(ValueError, match="block_mlp_covariance"):                # reference still refuses delta_full
-        _cfg(block_coordinates="reference", block_mlp_mode="coordinate", block_mlp_covariance="delta_full",
-             family="gaussian_full", decode_mode="full_chunked")
+    # Reference coordinates transport a delta_full covariance on gaussian_full / gaussian_block only (audit
+    # 2026-10-10 round 2, item 51), so the diagonal family still refuses it.
+    _cfg(block_coordinates="reference", block_mlp_mode="coordinate", block_mlp_covariance="delta_full",
+         family="gaussian_full", decode_mode="full_chunked")
+    with pytest.raises(ValueError, match="block_mlp_covariance"):
+        _cfg(block_coordinates="reference", block_mlp_mode="coordinate", block_mlp_covariance="delta_full")
 
 
 def test_inactive_fields() -> None:

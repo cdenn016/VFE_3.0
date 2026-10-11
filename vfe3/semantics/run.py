@@ -603,6 +603,15 @@ def load_semantic_run(
                          "with a token cap saw a prefix of it")
     if counts is None:
         notes.append("training counts unavailable: no frequency floor or frequency analyses")
+    # The token-frame analyses need learned token frames: not the identity (the rule the interventions and the
+    # routing-covariance gap share, audit 2026-10-10 round 2, #46) and not the random fixed frames of 'frozen'.
+    from vfe3.model.frame_actions import frames_identity_reason
+    identity_reason = frames_identity_reason(cfg, n_gen, positional=False)
+    if identity_reason is not None:
+        notes.append(f"token frames inactive: {identity_reason}")
+    elif cfg.gauge_transport == "frozen":
+        notes.append("token frames inactive: gauge_transport='frozen' fixes random frames that carry no "
+                     "learned geometry")
 
     return SemanticRun(
         run_dir=run_dir, checkpoint_path=checkpoint_path, cfg=cfg, state=state,
@@ -610,7 +619,7 @@ def load_semantic_run(
         counts=counts, counts_source=counts_source, group=group,
         K=K, n_layers=int(cfg.n_layers), n_heads=int(cfg.n_heads), n_gen=n_gen,
         block_slices=block_slices,
-        frames_active=cfg.gauge_transport == "on" and n_gen > 0,
+        frames_active=identity_reason is None and cfg.gauge_transport != "frozen",
         decode_kind=decode_kind, sigma_frozen=sigma_frozen, phi_frozen=phi_frozen,
         counts_diagnostics=counts_diagnostics, notes=notes, cache_dir=cache_dir,
     )

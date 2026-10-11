@@ -30,7 +30,7 @@ from vfe3.families.gaussian import head_block_projection
 from vfe3.geometry.groups import _GROUPS, check_admissible, declared_invariant_families, get_group
 from vfe3.geometry.norms import AffineLayerNorm
 from vfe3.model.block import vfe_block
-from vfe3.model.block_mlp import BlockMLP, PrototypeAgentBlockMLP, block_norm_linearization
+from vfe3.model.block_mlp import BlockMLP, PrototypeAgentBlockMLP, block_norm_linearization, block_norm_radial_term
 from vfe3.model.model import VFEModel
 from vfe3.model.prior_bank import packed_cholesky_covariance
 
@@ -207,8 +207,9 @@ def test_block_family_reads_the_mlp_covariance_through_its_head_block_projection
         converged = capture["converged"]
         if model.block_norm is not None:
             lin = block_norm_linearization(model.block_norm, converged.mu)
+            radial = block_norm_radial_term(model.block_norm, converged.mu, converged.sigma)   # round 2 (10-10), #11
             dense = mlp.forward_moments(pre.mu, converged.sigma, input_jacobian=lin.jacobian,
-                                        input_scale=lin.scale).sigma
+                                        input_scale=lin.scale, input_radial=radial).sigma
         else:
             dense = mlp.forward_moments(pre.mu, converged.sigma).sigma
         assert float(_off_block(dense).abs().max()) > 1e-6                     # the projection is not vacuous

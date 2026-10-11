@@ -2,9 +2,10 @@ r"""Triton kernels for the fused expected-likelihood cross-entropy (see ``expect
 
 This module imports ``triton`` at import time, so only ``expected_likelihood.py`` imports it, and only
 when the fused route launches. Each kernel walks one axis of the (S, V) pair grid in register tiles;
-the (S, V, K) workspace exists only as a (BI, BV) tile per feature k inside the dynamic ``range(K)``
-loop (the dynamic loop keeps ptxas from hoisting all K feature loads, the spill source of a static
-unroll). Tables arrive transposed, (K, V), so each feature row loads coalesced over v.
+the (S, V, K) workspace exists only as a (BI, BV) tile per feature k inside the dynamic loops over k
+(dynamic loops keep ptxas from hoisting all K feature loads, the spill source of a static unroll; the
+energy sums k in blocks of 16, two levels, see ``_energy_tile``). Tables arrive transposed, (K, V), so
+each feature row loads coalesced over v.
 
 Kernels (one owner per output element, so no atomics and no partial buffers):
   ``el_fwd_kernel``       program = BI rows; online logsumexp over V; writes lse_i and CE_i.
@@ -20,28 +21,59 @@ import triton.language as tl
 INTERPRETED: bool = bool(triton.knobs.runtime.interpret)
 
 _LN2: tl.constexpr = tl.constexpr(0.6931471805599453)
+# Features per inner partial sum of the energy (two-level accumulation over k; audit 2026-10-10 round 2, item 56).
+_KB: tl.constexpr = tl.constexpr(16)
+
+
+@triton.jit
+def _energy_terms(MQ, SQ, MVT, SVT, offs_i, mi, offs_v, mv_ok, V, k,
+                  K: tl.constexpr, FAST_LOG: tl.constexpr):
+    r"""Feature k's terms (d^2 / s, log s) of the energy, (BI, BV) each (log2 s if FAST_LOG)."""
+    a = tl.load(MQ + offs_i * K + k, mask=mi, other=0.0)            # (BI,)
+    b = tl.load(SQ + offs_i * K + k, mask=mi, other=1.0)            # (BI,)
+    mv = tl.load(MVT + k * V + offs_v, mask=mv_ok, other=0.0)       # (BV,)
+    sv = tl.load(SVT + k * V + offs_v, mask=mv_ok, other=1.0)       # (BV,)
+    d = a[:, None] - mv[None, :]
+    s = b[:, None] + sv[None, :]
+    if FAST_LOG:
+        lg = tl.inline_asm_elementwise("lg2.approx.f32 $0, $1;", "=r,r", [s],
+                                       dtype=tl.float32, is_pure=True, pack=1)
+    else:
+        lg = tl.log(s)
+    return d * d / s, lg
 
 
 @triton.jit
 def _energy_tile(MQ, SQ, MVT, SVT, offs_i, mi, offs_v, mv_ok, V,
                  K: tl.constexpr, BI: tl.constexpr, BV: tl.constexpr, FAST_LOG: tl.constexpr):
-    r"""E_iv = \sum_k [ (mu_q,ik - mu_v,vk)^2 / s_ivk + log s_ivk ],  s = sigma_q,ik + sigma_v,vk."""
+    r"""E_iv = \sum_k [ (mu_q,ik - mu_v,vk)^2 / s_ivk + log s_ivk ],  s = sigma_q,ik + sigma_v,vk.
+
+    Two-level accumulation: partial sums over blocks of _KB = 16 consecutive features, added into the running
+    sums once per block, so the worst-case fp32 accumulation bound is about (16 + K/16) u instead of K u. In a
+    float32 emulation of this order at tau = 0.1 the per-row CE error fell from 3.8e-4 to 1.4e-4 at K = 128 and
+    from 3.6e-3 to 1.1e-3 at K = 512 (the per-term rounding remains). All three kernels form E here, so the forward
+    and every gradient read the same energy.
+    """
     dt = MQ.dtype.element_ty
     Q = tl.zeros([BI, BV], dt)                                       # (BI, BV) sum_k d^2 / s
     L = tl.zeros([BI, BV], dt)                                       # (BI, BV) sum_k log s (log2 s if FAST_LOG)
-    for k in range(K):
-        a = tl.load(MQ + offs_i * K + k, mask=mi, other=0.0)        # (BI,)
-        b = tl.load(SQ + offs_i * K + k, mask=mi, other=1.0)        # (BI,)
-        mv = tl.load(MVT + k * V + offs_v, mask=mv_ok, other=0.0)   # (BV,)
-        sv = tl.load(SVT + k * V + offs_v, mask=mv_ok, other=1.0)   # (BV,)
-        d = a[:, None] - mv[None, :]
-        s = b[:, None] + sv[None, :]
-        Q += d * d / s
-        if FAST_LOG:
-            L += tl.inline_asm_elementwise("lg2.approx.f32 $0, $1;", "=r,r", [s],
-                                           dtype=tl.float32, is_pure=True, pack=1)
-        else:
-            L += tl.log(s)
+    for k0 in range(0, (K // _KB) * _KB, _KB):                       # full blocks of _KB features
+        q = tl.zeros([BI, BV], dt)
+        lb = tl.zeros([BI, BV], dt)
+        for j in range(_KB):
+            dq, dl = _energy_terms(MQ, SQ, MVT, SVT, offs_i, mi, offs_v, mv_ok, V, k0 + j, K, FAST_LOG)
+            q += dq
+            lb += dl
+        Q += q
+        L += lb
+    q = tl.zeros([BI, BV], dt)                                       # the K mod _KB remaining features
+    lb = tl.zeros([BI, BV], dt)
+    for k in range((K // _KB) * _KB, K):
+        dq, dl = _energy_terms(MQ, SQ, MVT, SVT, offs_i, mi, offs_v, mv_ok, V, k, K, FAST_LOG)
+        q += dq
+        lb += dl
+    Q += q
+    L += lb
     if FAST_LOG:
         L = L * _LN2
     return Q + L

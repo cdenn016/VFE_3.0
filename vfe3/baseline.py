@@ -1095,7 +1095,8 @@ class BaselineTransformer(nn.Module):
         if wall_time is not None and tokens_seen > 0:
             out["wall_time_s"] = float(wall_time)
             out["wall_time_per_token"] = float(wall_time) / float(tokens_seen)
-            out["wall_time_per_step"] = float(wall_time) / max(1, int(cfg.max_steps))
+            out["wall_time_per_step"] = float(wall_time) / max(1, int(tokens_seen) // (int(cfg.batch_size)
+                                                                                     * int(cfg.max_seq_len)))
         return out
 
 

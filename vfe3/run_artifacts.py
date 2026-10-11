@@ -15,6 +15,8 @@ A training run produces a self-contained directory::
       holonomy.png / gauge_trace_spread.png   frame-numerics diagnostics (coboundary closure residual; log|det| spread)
       free_energy_decomposition.png   per-token F budget snapshot + early/mid/late evolution
       free_energy_relationship.png     final-iterate objective vs validation CE
+      canonical_free_energy_{decomposition,relationship}.png   the same on the projected routes under
+                         diagnose_canonical_free_energy: canonical F at the captured beliefs (a diagnostic)
 
 ``RunArtifacts`` is OPT-IN: ``train`` only touches it when an instance is passed, so the silent
 path (``artifacts=None``) writes nothing and is unchanged. ``finalize_run`` reloads the best-val
@@ -3651,7 +3653,8 @@ def _cost_model_fields(
     if wall_time is not None and tokens_seen > 0:
         out["wall_time_s"]         = float(wall_time)
         out["wall_time_per_token"] = float(wall_time) / float(tokens_seen)
-        out["wall_time_per_step"]  = float(wall_time) / max(1, int(cfg.max_steps))
+        out["wall_time_per_step"]  = float(wall_time) / max(1, int(tokens_seen) // (int(cfg.batch_size)
+                                                                                   * int(cfg.max_seq_len)))
     return out
 
 
@@ -4135,7 +4138,15 @@ def finalize_run(
     # Trainable count: parameters frozen by design (requires_grad=False, e.g. the zero token frames
     # under gauge_transport='off') are run constants and are excluded (resources.json lists them).
     n_params_trainable = int(sum(p.numel() for p in model.parameters() if p.requires_grad))
-    tokens_seen = int(cfg.max_steps) * int(cfg.batch_size) * int(cfg.max_seq_len)
+    # "n_steps" is the CONFIGURED budget. The realized counts sit beside it rather than replacing it
+    # (audit 2026-08-06 F5): the LR scheduler clocks on accepted updates, so a run that rejected a
+    # third of its steps trained on a different schedule than its config claims, and sweep arms with
+    # different skip rates are not comparable. Absent on a train() call that had no artifacts.
+    _realized = dict(getattr(artifacts, "realized_updates", None) or {})
+    # Tokens of the steps actually run: a run stopped by divergence_abort ends before max_steps
+    # (audit 2026-10-10 round 2, item 1).
+    steps_run = int(_realized.get("attempted_steps", cfg.max_steps))
+    tokens_seen = steps_run * int(cfg.batch_size) * int(cfg.max_seq_len)
     # scaling-law data point: the 6ND FLOP proxy is LOOSE for a no-NN E-step model, so record the
     # inputs too (a cross-run frontier can be re-fit offline with the right cost model). The
     # _cost_model_fields block adds the structural axes + active-params-per-token + a faithful
@@ -4159,11 +4170,6 @@ def finalize_run(
             scaling_point.update(model.cost_model_fields(n_params, tokens_seen, wall_time=wall_time))
     except Exception as exc:
         logger.warning("cost-model fields failed (%s); scaling_point keeps the 6ND proxy only", exc)
-    # "n_steps" is the CONFIGURED budget. The realized counts sit beside it rather than replacing it
-    # (audit 2026-08-06 F5): the LR scheduler clocks on accepted updates, so a run that rejected a
-    # third of its steps trained on a different schedule than its config claims, and sweep arms with
-    # different skip rates are not comparable. Absent on a train() call that had no artifacts.
-    _realized = dict(getattr(artifacts, "realized_updates", None) or {})
     artifacts.save_json("summary.json", {
         **_conditional_artifact_fields(cfg),
         "n_steps":      cfg.max_steps,
@@ -4203,6 +4209,11 @@ def finalize_run(
         "wall_time_resumed_s": resumed_wall_time,     # carried in by a resumed checkpoint (in wall_time_s)
         "decode_mode":     cfg.decode_mode,
         "decode_tau_eff":  decode_tau_eff,
+        # The expected-likelihood CE kernel that last ran ('torch' | 'triton'; None when that decoder never
+        # ran): expected_likelihood_kernel='triton' runs the torch kernel on CPU tensors (audit 2026-10-10
+        # round 2, #42).
+        "expected_likelihood_ce_kernel": getattr(getattr(model, "prior_bank", None),
+                                                 "realized_expected_likelihood_kernel", None),
         "phi_chart_norm_route": _phi_chart_norm_route(model, cfg),
         "scaling_point":   scaling_point,
         # Audit 2026-09-28: test at the validation-selected weights beside the final-weight
@@ -4393,7 +4404,9 @@ def collect_beta_channel_decomposition(
     comparison moments, or the rotation folded into the frame), so ``no_energy`` then removes RoPE
     position together with content. A fourth arm ``no_rope`` keeps the cost and the prior and removes
     only the rotation; ``delta_ce.rope_position_channel`` reports it and ``energy_includes_rope_position``
-    flags the reading (audit 2026-10-10, item 5).
+    flags the reading (audit 2026-10-10, item 5). Under ``rope_space='comparison'`` the arm sets each
+    operator's comparison rotation to :math:`R_i = I` and keeps everything else, including the commutant
+    projection :math:`P(G)` of ``rope_comparison_covariance='rotation_invariant'``.
     """
     import torch.nn.functional as F
     from vfe3 import free_energy as free_energy_module
@@ -4427,13 +4440,21 @@ def collect_beta_channel_decomposition(
     cfg = getattr(model, "cfg", None)
     rope_active = getattr(cfg, "pos_rotation", "none") == "rope"
     operators = list(getattr(model, "relational_operators_by_layer", None) or [])
-    comparison_bases = [getattr(ops, "comparison_rope_base", None) for ops in operators]
+    comparison_ops = [ops for ops in operators if getattr(ops, "comparison_rope_base", None) is not None]
+
+    def _identity_rotation(n: int, r: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        return torch.eye(r, device=device, dtype=dtype).expand(n, r, r).contiguous()        # (N, r, r) R_i = I
 
     def _set_rope(enabled: bool) -> None:
         # Comparison-space RoPE lives on each layer's operators; frame-space RoPE is the model's rotation.
-        for ops, base in zip(operators, comparison_bases):
-            if base is not None:
-                ops.comparison_rope_base = base if enabled else None
+        # The comparison arm keeps comparison_rope_base, which also gates the rotation_invariant commutant
+        # projection P(G), and replaces each operator's rotation R_i by the identity, so only the rotation
+        # is removed (audit 2026-10-10 round 2, #19).
+        for ops in comparison_ops:
+            if enabled:
+                ops.__dict__.pop("comparison_rope_rotation", None)
+            else:
+                ops.__dict__["comparison_rope_rotation"] = _identity_rotation
         if enabled:
             model.__dict__.pop("_rope_rotation", None)
         elif getattr(cfg, "rope_space", "frame") == "frame":
@@ -4846,6 +4867,9 @@ def finalize_validation_run(
     figures_written = sorted(p.name for p in artifacts.run_dir.glob("*.png") if p.is_file())
     artifacts.save_json("summary.json", {
         **_conditional_artifact_fields(cfg),
+        # train() sets training_status ("diverged" with its reason when divergence_abort stopped the loop)
+        # before calling its terminal callback (audit 2026-10-10 round 2, item 1).
+        **dict(getattr(artifacts, "training_status", None) or {}),
         "selection_split":     "validation",
         "primary_val_ppl":     float(primary_val_ppl),
         "final_val_ce":        final_ce,
@@ -4963,11 +4987,14 @@ def _pure_path_report(
             registration.intertwiner_compatible if block_mlp_active else True
         )
     if block_mlp_active and block_mlp_covariance == "delta_full" and (
-            getattr(cfg, "norm_type_block", "none") == "layernorm"
-            and getattr(cfg, "block_coordinates", "local") == "local"):
-        # Through the local block LayerNorm the floor is f D Sigma D, D = diag(gamma)/s: post-norm units, not
-        # the covariant f Sigma (audit 2026-10-09 round 2, #13).
-        block_mlp_covariance_contract = "delta_full_through_layernorm_plus_post_norm_scaled_floor"
+            getattr(cfg, "norm_type_block", "none") == "layernorm"):
+        # Through the block LayerNorm the floor is f D Sigma D, D = diag(gamma)/s: post-norm units, not the
+        # covariant f Sigma (audit 2026-10-09 round 2, #13). In reference coordinates the composite acts on
+        # C = U^-1 Sigma U^-T and is mapped back (audit 2026-10-10 round 2, item 51).
+        block_mlp_covariance_contract = (
+            "delta_full_through_reference_layernorm_plus_post_norm_scaled_floor"
+            if getattr(cfg, "block_coordinates", "local") == "reference"
+            else "delta_full_through_layernorm_plus_post_norm_scaled_floor")
     if block_mlp_active and block_mlp_covariance != "passthrough" and cfg.family == "gaussian_block":
         # The block's covariance is read through the head-block M-projection (vfe3.model.block._head_block_readout).
         block_mlp_covariance_contract = f"head_block_projection_of_{block_mlp_covariance_contract}"
@@ -5069,12 +5096,35 @@ def _pure_path_report(
     transport_chart_max_norm = float(cfg.transport_chart_max_norm)
     reference_blocks = getattr(cfg, "block_coordinates", "local") == "reference"
 
+    # Readers of the self term alpha_i D(q_i||p_i) + R(alpha_i). Under state_dependent_per_coord a family with
+    # conditional_kl_coordinates (gaussian_full, gaussian_block) supplies the ordered conditional KLs D^(k), whose
+    # sum is frame invariant but whose terms move under a per-head GL element; the diagonal family's marginal KLs
+    # are invariant under the diagonal maps it admits (its GL closure is family_group_invariant). The canonical
+    # diagnostic reads the self term but trains nothing, so it is recorded without gating the gauge-pure path.
+    from vfe3.alpha_i import alpha_is_per_coord
+    from vfe3.families import get_family
+    model_self_coupling_consumers = [name for name, live in (
+        ("projected_gradient_receiver", cfg.attention_mode == "projected_gradient"),
+        ("mstep_self_coupling", float(getattr(cfg, "mstep_self_coupling_weight", 0.0)) > 0.0)) if live]
+    self_coupling_consumers = model_self_coupling_consumers + (
+        ["canonical_free_energy_diagnostic"] if getattr(cfg, "diagnose_canonical_free_energy", False) else [])
+    per_coord_conditional_kl = (alpha_is_per_coord(cfg.lambda_alpha_mode)
+                                and bool(getattr(get_family(cfg.family), "conditional_kl_coordinates", False)))
+    comparison_rope = cfg.pos_rotation == "rope" and getattr(cfg, "rope_space", "frame") == "comparison"
+    # rotation_invariant scores the commutant projection P(G) of the kernel router's comparison covariance:
+    # only the projected means rotate (vfe3.gradients.relational.relational_score).
+    rope_commutant_covariance = (
+        comparison_rope and getattr(cfg, "rope_comparison_covariance", "full") == "rotation_invariant"
+        and getattr(cfg, "relational_routing", "gaussian_kl") != "mean_distance")
+
     conditional_fields = _conditional_artifact_fields(cfg)
     pure_flags = {
         "canonical_attention_entropy": not conditional_fields,
         "flat_transport":              True,
         "constant_lambda_alpha":       cfg.lambda_alpha_mode == "constant",
         "prior_bank_decode":           cfg.decode_mode != "linear",
+        # The prior-bank logit is the exact -KL(q*||p_v)/tau only when it reads the belief's own covariance.
+        "decode_reads_belief_covariance": getattr(cfg, "decode_covariance", "belief") == "belief",
         # Executed-route facet: gradient updates sigma unless skipped; predictive readout
         # keeps it at encode unless moment_matched assigns the predictive covariance.
         "full_sigma_update":           covariance_updated,
@@ -5112,6 +5162,9 @@ def _pure_path_report(
         "no_transport_exponential_clipping": True,
         "no_additive_encoder_control": getattr(cfg, "encode_mode", "per_token") != "per_token_additive",
         "decoder_gauge_compatible": getattr(cfg, "decode_coordinates", "local") == "reference",
+        # False when a per-coordinate alpha over ordered conditional KLs has a live model consumer (audit 2026-10-10
+        # round 2, #16); vfe3.viz.extract.projected_gauge_equivariance witnesses it against an independent prior.
+        "self_coupling_frame_invariant": not (per_coord_conditional_kl and model_self_coupling_consumers),
     }
     on_gauge_pure_path = all(gauge_flags.values())
     theory_flags = {
@@ -5133,8 +5186,10 @@ def _pure_path_report(
         "on_theory_pure_path": all(theory_flags.values()),
         "config_toggles": {
             "lambda_alpha_mode":            cfg.lambda_alpha_mode,
+            "self_coupling_consumers":      self_coupling_consumers,
             "lambda_beta":                  float(cfg.lambda_beta),
             "decode_mode":                  cfg.decode_mode,
+            "decode_covariance":            getattr(cfg, "decode_covariance", "belief"),
             "decode_coordinates":           getattr(cfg, "decode_coordinates", "local"),
             "block_coordinates":            getattr(cfg, "block_coordinates", "local"),
             "encode_mode":                  getattr(cfg, "encode_mode", "per_token"),
@@ -5157,15 +5212,21 @@ def _pure_path_report(
             "rope_on_value":                bool(cfg.rope_on_value),
             # Which RoPE regime the routing score used (audit 2026-07-26 A-02). rope_space='comparison'
             # folds nothing into the frame: it rotates the projected moments by R_i after the comparison
-            # map, so the pair cost depends on positions through j - i (audit 2026-10-08 C#6).
+            # map, so the pair cost depends on positions through j - i (audit 2026-10-08 C#6). Under
+            # rope_comparison_covariance='rotation_invariant' only the means rotate and the covariance is the
+            # commutant projection P(G), with R_i P(G) R_i^T = P(G) (audit 2026-10-10 round 2, #33).
             "rope_pair_energy_exactness":   (
                 "not_applicable" if cfg.pos_rotation == "none"
+                else "comparison_space_rotated_means_commutant_projected_covariance"
+                if rope_commutant_covariance
                 else "comparison_space_rotated_projected_moments"
-                if getattr(cfg, "rope_space", "frame") == "comparison"
+                if comparison_rope
                 else "frame_folded_both_moments"   # projected routes push both moments through U_i R_i^T
             ),
             "rope_space":                   (None if cfg.pos_rotation == "none"
                                              else getattr(cfg, "rope_space", "frame")),
+            "rope_comparison_covariance":   (getattr(cfg, "rope_comparison_covariance", "full")
+                                             if comparison_rope else None),
             "rope_fraction":                (None if cfg.pos_rotation == "none"
                                              else float(cfg.rope_fraction)),
             "rope_base":                    (None if cfg.pos_rotation == "none"
@@ -5450,12 +5511,31 @@ def _save_figures(
                     **{k: [r[k] for r in fe_rows] for k in fe_keys}}
             # Scale the coupling terms by the static config lambda_beta scalar.
             lam = getattr(cfg, "lambda_beta", 1.0)
-            fig = figs.plot_free_energy_decomposition(
-                hist, lambda_beta=lam, path=str(run / "free_energy_decomposition.png"))
-            figs.plt.close(fig)
-            fig = figs.plot_free_energy_relationship(
-                hist, lambda_beta=lam, path=str(run / "free_energy_relationship.png"))
-            figs.plt.close(fig)
+            # On the projected routes these columns are finite only under diagnose_canonical_free_energy, which
+            # writes canonical_beta_tv beside them (relational_* columns mark the route): the canonical F at the
+            # captured beliefs, which nothing there optimizes. Its figures carry no E-step or co-descent reading
+            # and plot the self-divergence apart from R(alpha) (audit 2026-10-10 round 2, #17).
+            canonical_fe = any("canonical_beta_tv" in r or "relational_legacy_global_f_available" in r
+                               for r in fe_rows)
+            if canonical_fe:
+                for key in ("self_divergence",) + tuple(k for k, _ in raw_figs._CANONICAL_ROUTER_SERIES):
+                    column = [float(r[key]) if isinstance(r.get(key), (int, float)) else float("nan")
+                              for r in fe_rows]
+                    if any(math.isfinite(v) for v in column):
+                        hist[key] = column
+                fig = figs.plot_canonical_free_energy_decomposition(
+                    hist, lambda_beta=lam, path=str(run / "canonical_free_energy_decomposition.png"))
+                figs.plt.close(fig)
+                fig = figs.plot_canonical_free_energy_relationship(
+                    hist, lambda_beta=lam, path=str(run / "canonical_free_energy_relationship.png"))
+                figs.plt.close(fig)
+            else:
+                fig = figs.plot_free_energy_decomposition(
+                    hist, lambda_beta=lam, path=str(run / "free_energy_decomposition.png"))
+                figs.plt.close(fig)
+                fig = figs.plot_free_energy_relationship(
+                    hist, lambda_beta=lam, path=str(run / "free_energy_relationship.png"))
+                figs.plt.close(fig)
         # Geometry / SPD / Fisher health dashboard (history-only): the gauge, belief-spectrum, guard,
         # and numerical-safety scalars diagnostics() logs to metrics.csv but that no standard figure
         # surfaced. The panels self-gate, so a run missing a column simply drops that panel.

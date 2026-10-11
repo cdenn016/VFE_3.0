@@ -819,15 +819,22 @@ def aggregate_per_layer(
     *,
     filename: str = "metrics_per_layer.csv",
     layer_col: str = "layer",
+    withheld: Optional[Dict[str, str]] = None,
 ) -> Dict[int, Dict[str, Dict[str, Any]]]:
     r"""Across-seed per-layer diagnostics from each seed's ``metrics_per_layer.csv``.
     Returns ``{layer: {column: {mean, sd, n, values}}}`` with the ddof=1 SD across seeds.
+
+    A missing file, layer index or layer set mismatch withholds the whole channel. A column is withheld on
+    its own, with its reason in ``withheld`` when given, when it is absent from a seed or not a finite
+    number at some (seed, layer): a text column such as ``relational_semantics``, or a column NaN on the
+    route (audit 2026-10-10 round 2, #24).
     """
     root = _resolve_run_root(run_root)
     design = _requested_seed_design(root)
     if not design["complete"]:
         return {}
-    per_seed: List[Dict[tuple[int, str], float]] = []
+    per_seed: List[Dict[tuple[int, str], Optional[float]]] = []
+    seed_layers: List[set] = []
     for cell in design["cells"]:
         run_dir = Path(cell["run_dir"])
         f = run_dir / filename
@@ -839,24 +846,37 @@ def aggregate_per_layer(
             return {}
         if layer_col not in data or not data[layer_col]:
             return {}
-        seed_values: Dict[tuple[int, str], float] = {}
+        seed_values: Dict[tuple[int, str], Optional[float]] = {}
         for i, lay in enumerate(data[layer_col]):
             if lay is None:
                 return {}
             L = int(lay)
             for c, vals in data.items():
-                if c == layer_col:
-                    continue
-                value = vals[i]
-                if value is None:
-                    return {}
-                seed_values[(L, c)] = value
+                if c != layer_col:
+                    seed_values[(L, c)] = vals[i]                   # None: empty, text or non-finite
         if not seed_values:
             return {}
         per_seed.append(seed_values)
-    keys = set(per_seed[0])
-    if any(set(seed_values) != keys for seed_values in per_seed[1:]):
+        seed_layers.append({L for L, _ in seed_values})
+    if any(layers != seed_layers[0] for layers in seed_layers[1:]):
         return {}
+    layers = sorted(seed_layers[0])
+    columns = sorted({c for seed_values in per_seed for _, c in seed_values})
+    keys = []
+    for c in columns:
+        cells = [seed_values.get((L, c)) for seed_values in per_seed for L in layers]
+        if any((L, c) not in seed_values for seed_values in per_seed for L in layers):
+            reason = "absent from at least one seed's metrics_per_layer.csv"
+        elif all(value is None for value in cells):
+            reason = "no finite number for any seed or layer (a text column, or not defined on this route)"
+        elif any(value is None for value in cells):
+            n_bad = sum(any(seed_values[(L, c)] is None for seed_values in per_seed) for L in layers)
+            reason = f"missing or non-finite for at least one seed at {n_bad} of {len(layers)} layer(s)"
+        else:
+            keys += [(L, c) for L in layers]
+            continue
+        if withheld is not None:
+            withheld[c] = reason
     out: Dict[int, Dict[str, Dict[str, Any]]] = {}
     for L, c in sorted(keys):
         vals = [seed_values[(L, c)] for seed_values in per_seed]
@@ -1003,6 +1023,7 @@ _LOGY_COLS = {c for c, logy in CURVE_SPECS if logy}
 PER_LAYER_METRICS: List[str] = [                                  # per-layer bars to draw
     "self_coupling", "belief_coupling", "attention_entropy", "effective_rank",
     "holonomy_deviation", "gauge_trace_spread", "belief_cond_median",
+    "self_divergence", "total", "canonical_beta_tv", "canonical_total_delta",   # diagnose_canonical_free_energy
 ]
 
 def _data_order_status(data_seeds: Iterable[object]) -> Dict[str, object]:
@@ -1211,7 +1232,8 @@ def main() -> int:
     curve_x = _curve_x()
     withheld_curves: Dict[str, str] = {}
     curves = aggregate_seed_curves(root, x=curve_x, withheld=withheld_curves)
-    per_layer = aggregate_per_layer(root)
+    withheld_per_layer: Dict[str, str] = {}
+    per_layer = aggregate_per_layer(root, withheld=withheld_per_layer)
     per_layer_requested = False
     for cell in request_design["cells"]:
         run_dir_value = cell.get("run_dir")
@@ -1313,6 +1335,7 @@ def main() -> int:
             "withheld_curves": withheld_curves,
             "per_layer_requested": per_layer_requested,
             "per_layer_complete": per_layer_complete,
+            "withheld_per_layer_columns": withheld_per_layer,
         },
         "caveat": CAVEAT,
         "scalars": scalars,

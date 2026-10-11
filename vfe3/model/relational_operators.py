@@ -1013,6 +1013,12 @@ class RelationalOperators(nn.Module):
         covariant (local Q_i = floor * (tr C_i / K) U_i U_i^T, with tr C_i frame-invariant).
         The result is Sigma_i^+ = U_i C_i^att U_i^T in the frame the mean content uses. A diagonal
         input returns diag(Sigma_i^+), the KL(p || q) moment projection onto the diagonal family.
+        Only diag(U_i Q~_i U_i^T) survives that projection, so on the diagonal family the floor is not
+        covariant (audit 2026-10-10 round 2, item 39): with D_h = diag(U_h U_h^T) for the head block U_h of
+        U_i, the reference covariance read back in the same frame, U_i^{-1} diag(Sigma_i^+) U_i^{-T}, satisfies
+        only lambda_min >= floor * (tr C_i / K) / max_h ||D_h^{-1/2} U_h||_2^2. Every row of D_h^{-1/2} U_h
+        has unit norm, so 1 <= ||D_h^{-1/2} U_h||_2^2 <= d_h: the guarantee is up to d_h times weaker than the
+        bound floor * (tr C_i / K) of the full family, and equal to it when the rows of U_h are orthogonal.
         Head-space pooling keeps the cost at an attention with d x d values per head pair.
         Under ``predictive_covariance_checkpoint`` the update is recomputed in backward (non-reentrant
         checkpoint; the update draws no random numbers), so values and gradients are unchanged.
@@ -1186,6 +1192,7 @@ class RelationalOperators(nn.Module):
                 blocks = 0.5 * (blocks + blocks.transpose(-1, -2))
                 result = torch.einsum("...hab,hg->...hagb", blocks, eye_h).reshape(*sigma.shape)   # (..., N, K, K)
                 return result.to(sigma.dtype)
+            # Only diag(U C U^T) is kept, so the floor's guarantee is the weaker diagonal-family bound of the docstring.
             result = ((forward @ C_att) * forward).sum(dim=-1)                         # (..., N, H, d) diag(U C U^T)
         return result.flatten(-2).to(sigma.dtype)
 

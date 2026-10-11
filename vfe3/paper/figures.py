@@ -383,12 +383,25 @@ def _checkpoint_sigma_stats(path: Path) -> Optional[Tuple[float, float]]:
     return float(values.mean()), float(values.std(unbiased=False))
 
 
+def _residual_additive(run: RunRecord) -> bool:
+    r"""``vfe3.train._residual_update_is_additive`` of the run: from its loaded config, else the
+    ``residual_additive`` its post-hoc residual sections recorded, else True (audit 2026-10-10 round 2, #23)."""
+    if run.cfg is not None:
+        from vfe3.train import _residual_update_is_additive
+        return bool(_residual_update_is_additive(SimpleNamespace(cfg=run.cfg)))   # the rule reads model.cfg only
+    for section in ((run.posthoc or {}).get("residual") or {}).values():
+        if isinstance(section, Mapping) and isinstance(section.get("residual_additive"), bool):
+            return section["residual_additive"]
+    return True
+
+
 def _residual_panel(run: RunRecord) -> Dict[str, Any]:
     figs = _viz()
+    additive = _residual_additive(run)
     table = figs.read_long_table(run.run_dir / "diagnostics" / "residual_ratio.csv")
     needed = ("step", "layer", "q10", "q50", "q90")
     if table is not None and all(c in table for c in needed) and np.isfinite(table["q50"]).any():
-        return {"status": "ok", "kind": "curves", "table": table,
+        return {"status": "ok", "kind": "curves", "table": table, "residual_additive": additive,
                 "source": "diagnostics/residual_ratio.csv"}
     parts, sources = [], []
     for path in sorted((run.run_dir / "posthoc" / "csv").glob(POSTHOC_RESIDUAL_GLOB)):
@@ -407,7 +420,8 @@ def _residual_panel(run: RunRecord) -> Dict[str, Any]:
     if parts:
         keys = ("step", "layer", "q10", "q50", "q90")
         table = {key: np.concatenate([part.get(key, part["q50"]) for part in parts]) for key in keys}
-        return {"status": "ok", "kind": "endpoint", "table": table, "source": ", ".join(sources)}
+        return {"status": "ok", "kind": "endpoint", "table": table, "residual_additive": additive,
+                "source": ", ".join(sources)}
     return {"status": "skipped",
             "reason": "no diagnostics/residual_ratio.csv (runs before 2026-09-28) and no post-hoc "
                       "residual-ratio table"}
@@ -625,8 +639,11 @@ def plot_numerics(run: RunRecord, out_dir: Path, *, stem: str = "s1_numerics") -
                     ax.errorbar(x, table["q50"][sel][order], yerr=[lo, hi], fmt="o", ms=3, color=color,
                                 label=f"layer {layer}", capsize=1.5, lw=0.8)
             ax.set_yscale("log")
-            ax.set_ylabel(r"$\|m_i\|/\|\mu_i\|$ (median, 10-90%)")
-            ax.set_title("Message-to-state ratio" + (" (endpoint)" if a["kind"] == "endpoint" else ""))
+            additive = a.get("residual_additive", True)
+            name, symbol = figs._residual_ratio_label(additive)
+            ax.set_ylabel(f"{symbol} (median, 10-90%)")
+            ax.set_title(("Message-to-state ratio" if additive else name)
+                         + (" (endpoint)" if a["kind"] == "endpoint" else ""))
             _step_axis(ax, figs, last_step)
             ax.legend(frameon=False, ncol=2)
         draw.append(("A", draw_a))

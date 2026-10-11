@@ -34,12 +34,12 @@ Two measurements:
   :math:`\bar\beta_{ij}\bar\beta_{jk}`.
 * :func:`snapshot_holonomy`: the spectrum invariants of :math:`G` per layer at every map snapshot.
 
-Run as ``python -m vfe3.posthoc.holonomy RUN_DIR [--checkpoints ...]``; writes JSON.
+Click-to-run: edit ``CONFIG`` below and run ``python -m vfe3.posthoc.holonomy``; there is no command-line
+configuration. :func:`holonomy_report` writes the JSON (default ``<run_dir>/posthoc/routing_holonomy.json``).
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import math
 from pathlib import Path
@@ -51,6 +51,17 @@ import torch
 from vfe3.metrics import routing_triangle_defect_sums, triangle_holonomy_eigenvalues
 from vfe3.posthoc.maps import (EDGE_MAP_NAMES, _ambient_content, _frame_geometry, load_map_state,
                                relational_maps, snapshot_files)
+
+CONFIG: Dict[str, Any] = {
+    "run_dir":     None,         # the trained run directory (required)
+    "checkpoints": None,         # None -> every checkpoints/step_*.pt, else final_model.pt; or a sequence
+    "windows":     8,            # evenly spaced validation windows per checkpoint
+    "batch_size":  4,
+    "triangles":   256,          # sampled triangles per window and layer
+    "seed":        0,
+    "device":      "cpu",
+    "out":         None,         # None -> <run_dir>/posthoc/routing_holonomy.json
+}
 
 QUANTILES = (0.1, 0.5, 0.9)
 
@@ -272,33 +283,44 @@ def default_checkpoints(run_dir: Path) -> List[str]:
     return ["final_model.pt"]
 
 
-def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("run_dir", type=Path)
-    parser.add_argument("--checkpoints", nargs="*", default=None)
-    parser.add_argument("--windows", type=int, default=8)
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--triangles", type=int, default=256, help="sampled triangles per window and layer")
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--device", default="cpu")
-    parser.add_argument("--out", type=Path, default=None)
-    args = parser.parse_args(argv)
+def holonomy_report(
+    run_dir:     "str | Path",
+
+    *,
+    checkpoints: Optional[Sequence[str]] = None,
+    windows:     int = 8,
+    batch_size:  int = 4,
+    triangles:   int = 256,
+    seed:        int = 0,
+    device:      str = "cpu",
+    out:         "str | Path | None" = None,
+) -> Dict[str, Any]:
+    r""":func:`checkpoint_holonomy` at each checkpoint and :func:`snapshot_holonomy`, written as JSON to ``out``."""
     from vfe3.posthoc import streams as st
 
-    checkpoints = args.checkpoints or default_checkpoints(args.run_dir)
-    report: Dict[str, Any] = {"run_dir": str(args.run_dir), "checkpoints": []}
+    run_dir = Path(run_dir)
+    checkpoints = list(checkpoints) if checkpoints else default_checkpoints(run_dir)
+    report: Dict[str, Any] = {"run_dir": str(run_dir), "checkpoints": []}
     for checkpoint in checkpoints:
         print(f"[holonomy] {checkpoint}", flush=True)
         report["checkpoints"].append(checkpoint_holonomy(
-            args.run_dir, checkpoint, n_windows=args.windows, batch_size=args.batch_size,
-            n_triangles=args.triangles, seed=args.seed, device=args.device))
-    cfg = st.load_run_info(args.run_dir, checkpoints[-1]).cfg
-    report["snapshots"] = snapshot_holonomy(args.run_dir, cfg)
-    out = args.out or (args.run_dir / "posthoc" / "routing_holonomy.json")
+            run_dir, checkpoint, n_windows=windows, batch_size=batch_size,
+            n_triangles=triangles, seed=seed, device=device))
+    cfg = st.load_run_info(run_dir, checkpoints[-1]).cfg
+    report["snapshots"] = snapshot_holonomy(run_dir, cfg)
+    out = Path(out) if out is not None else run_dir / "posthoc" / "routing_holonomy.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2, default=float), encoding="utf-8")
     print(f"[holonomy] wrote {out}")
     return report
+
+
+def main() -> Dict[str, Any]:
+    r"""Click-to-run entry: :func:`holonomy_report` with the settings in ``CONFIG``."""
+    if CONFIG["run_dir"] is None:
+        raise ValueError("set CONFIG['run_dir'] to the trained run directory")
+    options = {key: value for key, value in CONFIG.items() if key != "run_dir"}
+    return holonomy_report(CONFIG["run_dir"], **options)       # click-to-run: no command-line configuration
 
 
 if __name__ == "__main__":

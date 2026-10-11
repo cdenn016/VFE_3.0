@@ -1145,8 +1145,9 @@ def _routing_covariance(run: Any, ctx: AnalysisContext, result: SectionResult,
     gap :math:`\|C_v - \bar c_v (U_v^\top U_v)^{-1}\|_F / \|C_v\|_F`.
     """
     if not run.frames_active:
-        note = ("frames inactive (gauge_transport off or no generators): the routing covariance "
-                "is the stored Sigma itself; no frame decomposition")
+        note = ("frames inactive (identity token frames, or the unlearned random frames of "
+                "gauge_transport='frozen'; the run notes give the reason): no frame decomposition of the "
+                "routing covariance")
         result.notes.append(note)
         return {"status": "skipped", "reason": note}
     ids = np.asarray(ctx.candidate_ids, dtype=np.int64)

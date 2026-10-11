@@ -17,11 +17,45 @@ dense :math:`K \times K` factor.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 import torch
 
 from vfe3.runtime import ieee_fp32_matmul
+
+
+def frames_identity_reason(
+    cfg:        Any,                               # VFE3Config (or a namespace with its fields)
+    n_gen:      int,                               # generator count of the gauge group (phi_embed width)
+
+    *,
+    positional: bool = True,
+) -> Optional[str]:
+    r"""Why every realized frame :math:`U_i = \exp(X_{x_i})\exp(Y_i)` of ``cfg`` is the identity, else ``None``.
+
+    The one rule shared by the semantics run (``SemanticRun.frames_active``), the frozen interventions and the
+    post-hoc routing-covariance gap (audit 2026-10-10 round 2, #46). The token frames are the identity under
+    ``gauge_transport='off'`` (which coerces ``phi_scale=0``, ``m_phi_lr=0`` and ``pos_phi='none'`` and refuses a
+    frame-space RoPE), for a group without generators, and for a token table that starts at zero and never moves
+    (``phi_scale=0`` with ``m_phi_lr=0``). ``gauge_transport='frozen'`` is not the identity: its random fixed
+    frames act on every forward pass. With ``positional`` a positional factor (``pos_phi`` over a group with
+    generators, or a frame-space RoPE fold) keeps the composed frame active; without it only the token factor
+    :math:`\exp(X_v)` is judged.
+    """
+    if getattr(cfg, "gauge_transport", "on") == "off":
+        return ("gauge_transport='off': every realized frame is the identity (phi_scale=0, m_phi_lr=0 and "
+                "pos_phi='none' are coerced)")
+    if int(n_gen) == 0:
+        reason = "the gauge group has no generators, so every token frame is the identity"
+    elif float(getattr(cfg, "phi_scale", 1.0)) == 0.0 and float(getattr(cfg, "m_phi_lr", 1.0)) == 0.0:
+        reason = "phi_scale=0 with m_phi_lr=0: the token frames start at the identity and never move"
+    else:
+        return None
+    if positional and ((int(n_gen) > 0 and getattr(cfg, "pos_phi", "none") != "none")
+                       or (getattr(cfg, "pos_rotation", "none") != "none"
+                           and getattr(cfg, "rope_space", "frame") != "comparison")):
+        return None
+    return reason
 
 
 def _work_dtype(*tensors: torch.Tensor) -> torch.dtype:

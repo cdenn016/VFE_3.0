@@ -24,12 +24,16 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 
 from vfe3.alpha_i import alpha_gradient_coefficient
-from vfe3.contracts import CanonicalFrameContext
+from vfe3.contracts import CanonicalFrameContext, host_check
 from vfe3.free_energy import attention_weights
 from vfe3.gradients.relational import clamped_routing_cost, relational_score
-from vfe3.model.relational_operators import RelationalOperators, _chart_operands
+from vfe3.model.relational_operators import RelationalOperators, _chart_operands, _content_link_exp
 from vfe3.relational_scoring import _compute_dtype
 from vfe3.runtime import ieee_fp32_matmul
+
+# Certificate of the inverted chart factor of the inverse measurement: eps_64 kappa_F(A) above the float32
+# unit roundoff means the float64 inverse no longer certifies P O' = I to float32 accuracy.
+_MEASUREMENT_CONDITION_TOL: float = torch.finfo(torch.float32).eps
 
 # Receiving-law float64 retries of _spd_precision, per device. They are kept apart from the
 # projected-covariance source-recovery counter, whose window the training loop reads as the
@@ -348,21 +352,61 @@ def _local_pullback(
 
 def _inverse_measurement_runs(
     T_runs: Sequence[torch.Tensor],         # per run (n_r, d_r, K) sending maps
-    O_runs: Sequence[torch.Tensor],         # per run (n_r, K, d_r) effective receiving maps O'_h
+    O_runs: Sequence[torch.Tensor],         # per run (n_r, K, d_r) stored receiving factors O_h
+    chart:  str,                            # content_link_chart
     dtype:  torch.dtype,
 ) -> List[torch.Tensor]:                    # per run (n_r, d_r, K) measurements P_h
-    r"""Dual receiving measurements: the head-h rows of the inverse of the column stack O'.
+    r"""Dual receiving measurements: the head-h rows of the inverse of the column stack O' of the chart.
 
     .. math::
         O'=[O'_1,\dots,O'_H]\in\mathbb{R}^{K\times K},\qquad
         P=\begin{bmatrix}P_1\\\vdots\\P_H\end{bmatrix}=O'^{-1},\qquad P_hO'_g=\delta_{hg}I_{d_h}.
 
-    One float64 K x K inversion per context build (as the non-affine charts invert T), cast to
-    ``dtype``. ``inv_ex`` takes no host sync, so a singular O' yields non-finite measurements.
+    P is formed in float64 from the chart's factors and cast to ``dtype``, never by inverting the float64 O'
+    (audit 2026-10-10 round 2, item 14). The non-affine charts build O' from :math:`T^{-1}`, so inverting it again
+    compounds the conditioning of T with that of O' and returns finite but wrong values at trained condition
+    numbers (at K = 4 and cond(T) = 1e12, relative error 7e-6 in P against 6e-16 from the factors; the audit
+    measured 1.0 in the K = 128 minimizer). From :func:`vfe3.model.relational_operators.chart_receive_runs`,
+
+    .. math::
+        O'_{\mathrm{exponential}} = e^{OT}T^{-1} \Rightarrow P = Te^{-OT},\qquad
+        O'_{\mathrm{first\ order}} = T^{-1} + O = (I + OT)T^{-1} \Rightarrow P = T(I + OT)^{-1},\qquad
+        O'_{\mathrm{affine}} = O \Rightarrow P = O^{-1}.
+
+    The exponential form inverts nothing. The first-order and affine forms invert one matrix of stored parameters,
+    :math:`A = I + OT` or :math:`A = O`, by ``inv_ex`` (no host sync), and certify it: a call is refused when
+    ``inv_ex`` reports A singular, when P is not finite, or when :math:`\varepsilon_{64}\lVert A\rVert_F
+    \lVert A^{-1}\rVert_F` exceeds the float32 unit roundoff, where the float64 inverse no longer certifies
+    :math:`PO' = I` to float32 accuracy (:math:`\kappa_F(A) > 5.4\times10^8`). A singular or near-singular A does
+    not by itself give non-finite values, so the certificate replaces the former finiteness assumption. The verdict
+    only raises and goes through :func:`vfe3.contracts.host_check`, so inside
+    :func:`vfe3.contracts.deferred_host_checks` it joins the next mandatory host read.
     """
-    _, O_stack = _chart_operands(T_runs, O_runs)                           # (K, K) float64, columns by head
-    inverse = torch.linalg.inv_ex(O_stack).inverse.to(dtype)               # (K, K), rows by head
-    K = inverse.shape[-1]
+    T_stack, O_stack = _chart_operands(T_runs, O_runs)                     # (K, K) float64, rows / columns by head
+    K = T_stack.shape[-1]
+    with torch.autocast(device_type=T_stack.device.type, enabled=False):
+        if chart == "exponential":
+            inverse = T_stack @ _content_link_exp(-(O_stack @ T_stack))     # (K, K) T e^{-OT}, rows by head
+            flags = (~torch.isfinite(inverse).all()).reshape(1)
+        else:
+            eye = torch.eye(K, dtype=T_stack.dtype, device=T_stack.device)
+            A = O_stack if chart == "affine" else eye + O_stack @ T_stack    # (K, K) O or I + OT
+            A_inverse, info = torch.linalg.inv_ex(A)                         # (K, K)
+            inverse = A_inverse if chart == "affine" else T_stack @ A_inverse
+            with torch.no_grad():
+                condition = A.norm() * A_inverse.norm()                      # kappa_F(A)
+                flags = torch.stack((info != 0, ~torch.isfinite(inverse).all(),
+                                     ~(torch.finfo(A.dtype).eps * condition <= _MEASUREMENT_CONDITION_TOL)))
+
+    def _verdict(host: List[bool]) -> None:
+        if any(host):
+            raise ValueError(
+                f"inverse receiver measurement refused ({chart} chart): the inverted chart factor is singular, "
+                "non-finite or too ill-conditioned for its float64 inverse to certify P O' = I to float32 accuracy "
+                f"(eps_64 kappa_F > {_MEASUREMENT_CONDITION_TOL:.3g}); use relational_receiver_measurement='adjoint'")
+
+    host_check(flags, _verdict)
+    inverse = inverse.to(dtype)                                            # (K, K), rows by head
     out, start = [], 0
     for O in O_runs:
         n, d = O.shape[0], O.shape[2]
@@ -471,9 +515,10 @@ def build_full_link_context(
         content = operators.content_factor_runs()                  # per-run (T, O') once per context build
         source_precision, source_eta = _source_channel(
             mu_work, sigma_work, channel_frame, operators, receiver_noise, dtype, content)
-        # Dual measurement: per-run head rows of O'^{-1}, one K x K inverse per context build.
-        measurement = (_inverse_measurement_runs(*content, dtype) if channel and getattr(
-            operators, "receiver_measurement", "adjoint") == "inverse" else None)
+        # Dual measurement: per-run head rows of O'^{-1} from the chart factors, once per context build.
+        measurement = (_inverse_measurement_runs(content[0], operators._stored_runs("O"),
+                                                 operators.content_link_chart, dtype)
+                       if channel and getattr(operators, "receiver_measurement", "adjoint") == "inverse" else None)
         # Heads pool run by run (one run for equal heads); the pooled K x K precision and K-vector sum.
         pooled_precision = pooled_eta = None
         for run, (precision_r, eta_r, O) in enumerate(zip(source_precision, source_eta, content[1])):

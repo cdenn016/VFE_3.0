@@ -154,3 +154,28 @@ def rope_commutant_projection(
     fixed = torch.zeros(r, r, dtype=torch.bool, device=G.device)
     fixed[m:, m:] = True                                                                 # non-rotating block
     return torch.diag_embed(isotropic) + G * fixed                                       # (..., r, r)
+
+
+def rope_commutant_is_diagonal(r: int, n_pairs: int) -> bool:
+    r"""Whether :math:`P(G)` of :func:`rope_commutant_projection` is diagonal for every G: at most one coordinate of
+    the block of size r stays unrotated (every coordinate of an even block at ``rope_fraction`` = 1), so the
+    non-rotating block :math:`G_{00}` is at most 1 x 1."""
+    return r - 2 * n_pairs <= 1
+
+
+def rope_commutant_diagonal(
+    g:       torch.Tensor,             # (..., r) diagonal of the comparison covariance G
+    n_pairs: int,                      # rotated pairs of the block, with rope_commutant_is_diagonal(r, n_pairs)
+) -> torch.Tensor:                     # (..., r) P(G), which is diagonal
+    r"""The diagonal :math:`P(G)` of a block whose non-rotating part is at most one coordinate, from diag(G) alone.
+
+    Each rotating plane takes the mean of its two variances and the unrotated coordinate keeps its own; this
+    equals ``torch.diagonal(rope_commutant_projection(G, n_pairs), dim1=-2, dim2=-1)`` bit for bit, and the
+    off-diagonal entries of :math:`P(G)` vanish structurally.
+    """
+    r = g.shape[-1]
+    m = 2 * n_pairs
+    if not (0 <= m <= r and rope_commutant_is_diagonal(r, n_pairs)):
+        raise ValueError(f"n_pairs={n_pairs} leaves a non-rotating block of size {r - m} > 1, so P(G) is not diagonal")
+    plane = g[..., :m].reshape(*g.shape[:-1], n_pairs, 2).mean(-1)                      # (..., m/2)
+    return torch.cat((plane.repeat_interleave(2, dim=-1), g[..., m:]), dim=-1)           # (..., r)

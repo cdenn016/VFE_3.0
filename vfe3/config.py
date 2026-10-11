@@ -91,6 +91,39 @@ class _ConfigTypeError(TypeError, ValueError):
     """Configuration type error compatible with legacy ``ValueError`` callers."""
 
 
+# Messages of the diagonal-comparison-covariance advisory already shown in this process (one warning each).
+_DIAGONAL_COMPARISON_WARNED: set = set()
+
+
+def _warn_diagonal_comparison_covariance(
+    head_dims:   List[int],
+    fraction:    float,
+    base:        float,
+    max_seq_len: int,
+) -> None:
+    r"""Warn once per message that ``rotation_invariant`` makes the router's comparison covariance diagonal.
+
+    With every coordinate of a head's comparison block of size d but at most one in a rotating plane, the
+    commutant projection P(G) is one isotropic variance per plane (audit 2026-10-10 round 2, item 48). Plane k
+    turns by :math:`(N - 1)\,\mathrm{base}^{-2k/d}` across the largest in-window offset N - 1, and the
+    message counts the planes that turn by less than 0.5 rad there.
+    """
+    slow = []
+    for d in sorted(set(head_dims)):
+        planes = int(fraction * d // 2)
+        count = sum((max_seq_len - 1) * base ** (-2.0 * k / d) < 0.5 for k in range(planes))
+        slow.append(f"{count} of {planes} planes for heads of size {d}")
+    message = (f"rope_comparison_covariance='rotation_invariant' with rope_fraction={fraction:g}: every comparison "
+               "coordinate but at most one lies in a rotating plane, so the router's comparison covariance P(G) is "
+               "diagonal, one isotropic variance per plane, and routing reads no covariance between comparison "
+               f"coordinates. At rope_base={base:g} and max_seq_len={max_seq_len}, " + ", ".join(slow)
+               + f" rotate by less than 0.5 rad across the largest offset {max_seq_len - 1}, so they carry "
+               "almost no relative position.")
+    if message not in _DIAGONAL_COMPARISON_WARNED:
+        _DIAGONAL_COMPARISON_WARNED.add(message)
+        warnings.warn(message, UserWarning, stacklevel=3)
+
+
 @dataclass
 class VFE3Config:
     """The single authoritative configuration surface for VFE_3.0.
@@ -121,7 +154,16 @@ class VFE3Config:
     min_lr_frac:                      float           = 0.01         # LR floor as a fraction of each group's base LR (0 = decay to 0)
     
     grad_accum_steps:                 int             = 1            # microbatches per optimizer step (1 = no accumulation)
-    grad_clip:                        Optional[float] = 1.0          # per-role L2 clip after accumulation; None or 0 = off
+    grad_clip:                        Optional[float] = 1.0          # L2 clip per grad_clip_scope set after accumulation; None or 0 = off
+    # "role" | "group"
+    # The parameter sets grad_clip bounds, each by its own L2 norm (groups marked table_fisher are never clipped).
+    #   role   one set per optimizer role (mu / sigma / phi), the historical behavior
+    #   group  one set per optimizer group, so one exploding group cannot set the coefficient of the others
+    grad_clip_scope:                  str             = "role"
+    # Stop a diverging run and finalize it normally with training_status "diverged" and the reason (summary.json):
+    # after 100 consecutive rejected updates, or when a log/eval row's interval-mean training CE exceeds
+    # ln(vocab_size) after the warmup. False: the divergence monitor only warns and forces metrics rows.
+    divergence_abort:                 bool            = False
 
     seed:                             int             = 6
     
@@ -140,9 +182,13 @@ class VFE3Config:
     val_diagnostic_batches:           int             = 1             # validation batches the val_* probes average over
     # Log-step diagnostic: the canonical free energy at each layer's captured beliefs,
     # sum_i [alpha_i KL(q_i||p_i) + R(alpha_i)] + lambda_beta sum_h sum_ij [beta*_ij D^h_ij + tau beta*_ij log(beta*_ij/pi_ij)]
-    # with D^h_ij the head-marginal KL of q_i and Omega_ij q_j and the canonical router beta* = softmax(log pi - D/tau);
-    # fills self_coupling, self_divergence, belief_coupling, attention_entropy and total (per-token means) and
-    # canonical_beta_tv. O(B N K^3 + B N^2 sum_h d_h^2) per diagnostic window
+    # with D^h_ij the head-marginal KL of q_i and Omega_ij q_j and the canonical router beta* = softmax(log pi - D/tau).
+    # beta* includes the attention prior pi (causal mask, ALiBi), the RoPE rotation of either rope_space (comparison:
+    # each head's reference moments rotated by R_i, full rotated covariance) and the router's temperature tau (1 under
+    # minimal_agent); D_ii = 0 = B_ii puts its row maximum on the diagonal. Fills self_coupling, self_divergence,
+    # belief_coupling, attention_entropy and total (per-token means), canonical_beta_tv, canonical_self_weight
+    # (mean beta*_ii) and, at each layer's converged output, canonical_total_output and canonical_total_delta
+    # (F_out - F_in). O(B N K^3 + B N^2 sum_h d_h^2) per diagnostic window (O(B N H d^3) on head-block groups)
     diagnose_canonical_free_energy:   bool            = False
     
     eval_stride:                      Optional[int]   = None         # held-out window stride <= max_seq_len; None = disjoint windows
@@ -228,6 +274,14 @@ class VFE3Config:
 
     decode_tau:                       float           = 1.0          # prior-bank decode temperature (1 = Bayes); not read by linear
     unigram_kappa:                    float           = 1.0          # tempering of log pi_v (1 = exact Bayes class prior)
+
+    # "belief" | "encoded" | "constant": the covariance the prior-bank decoder reads (not read by linear)
+    #   belief    the stack's final Sigma_q (the exact KL(q* || p_v))
+    #   encoded   the token's encoded covariance, the stack's input (passthrough for the decoder only)
+    #   constant  sigma_init I
+    # The decode logit -KL(q || p_v)/tau contains tr(Sigma_v^-1 Sigma_q)/(2 tau), so under a moment-matched
+    # covariance every jump of the Sigma_q the stack builds reaches the cross-entropy (2026-10-11 K=128 spikes).
+    decode_covariance:                str             = "belief"
     
     # Vocabulary entries per chunk of the fused CE kernels. The family_chunked full-covariance route
     # narrows its slice to a fixed byte budget and treats this as an upper bound. Values are unchanged.
@@ -359,7 +413,8 @@ class VFE3Config:
     #                       anisotropy of G, which can self-lock a head (audit 2026-10-09 round 2, addendum)
     #   rotation_invariant  G projected onto the commutant of the RoPE torus (one isotropic variance per rotating
     #                       plane, the full non-rotating block, no cross-covariance), so R_i P(G) R_i^T = P(G) and
-    #                       only the mean term carries i - j; scored on the Gram route (no source-root factor route)
+    #                       only the mean term carries i - j; scored on the Gram route (no source-root factor route),
+    #                       or in closed form with no factorization when P(G) is diagonal (rope_fraction = 1)
     rope_comparison_covariance:       str             = "full"
     
     ##################################################
@@ -535,18 +590,21 @@ class VFE3Config:
     layernorm_affine:                 bool            = False        # layernorm only: learned gamma/beta (init 1/0)
 
     # "passthrough" | "pushforward"
-    # Covariance through the block LayerNorm (block_coordinates="local", norm_type_block="layernorm").
-    #   passthrough  the norm maps the mean only; Sigma stays in pre-norm units
-    #   pushforward  J_LN Sigma J_LN^T + block_mlp_covariance_floor * D Sigma D, D = diag(gamma)/s; its diagonal
-    #                on the diagonal family (O(K) per token). Inert under block_mlp_covariance="delta_full",
-    #                whose Jacobian already composes the norm's
+    # Covariance through the LayerNorm seams (norm_type_block="layernorm"): the block norm and, when
+    # norm_type_final="layernorm", the final norm.
+    #   passthrough  the norms map the mean only; Sigma stays in pre-norm units
+    #   pushforward  J_LN Sigma J_LN^T + block_mlp_covariance_floor * D Sigma D + rho g g^T, D = diag(gamma)/s, with
+    #                rho g g^T the radial second-order variance; its diagonal on the diagonal family (O(K) per
+    #                token). In reference coordinates (gaussian_full / gaussian_block only) it acts on C = U^-1 Sigma U^-T.
+    #                At the block norm inert under block_mlp_covariance="delta_full", whose Jacobian composes the norm's
     block_norm_covariance:            str             = "passthrough"
 
     # "local" | "reference"
     #   local      the block norm, block MLP and final norm act on mu_i
     #   reference  they act on xi_i = U_i^-1 mu_i and map back, mu -> U_i Phi(U_i^-1 mu). only:
     #              projected_predictive, pos_rotation="none", a "none"/"layernorm" norm, and a passthrough
-    #              coordinate / gaussian_template MLP or a prototype_agents MLP
+    #              coordinate / gaussian_template MLP, a prototype_agents MLP, or (gaussian_full / gaussian_block)
+    #              a delta_full coordinate MLP
     block_coordinates:                str             = "local"
 
     # Prior handoff to the next block, convex blends: p_next = (1 - rho) p + rho q.
@@ -581,7 +639,10 @@ class VFE3Config:
     # Block norm reapplied to the post-MLP mean, so the next router reads a normalized mean (audit
     # 2026-10-08 P1-5). False keeps norm -> MLP. only: block_coordinates="local", a block norm, a block MLP
     block_mlp_post_norm:              bool            = False
-       
+    # False: the block MLP's mean path runs with autocast disabled (fp32 island), since under amp_dtype its residual
+    # is the only reduced-precision input to the fp32 router. only: amp_dtype set, a block MLP other than prototype_agents
+    block_mlp_autocast:               bool            = True
+
     # "mean_field" | "exact"
     # prototype_agents only: template posterior.
     #   mean_field  KL-label responsibilities and the power posterior
@@ -650,14 +711,16 @@ class VFE3Config:
     # "adamw" | "fisher"
     # M-step update of the type-prior tables mu_embed and sigma_log_embed, p_v = N(mu_v, diag s_v), s_v = e^{l_v}.
     #   adamw   AdamW at m_p_mu_lr / m_p_sigma_lr
-    #   fisher  natural gradient in the count-weighted Gaussian Fisher metric (n_v/N) diag(1/s_v, 1/2):
-    #           (mu_v, l_v) -= eta (N/n_v) (s_v grad_mu, 2 grad_l), each row's step bounded in Fisher norm by
-    #           m_table_fisher_trust_radius; the AdamW rates schedule it (step times lr_t/lr_0) and set the
-    #           decoupled decay. only: a decoder that does not read these tables (decode_mode="linear" or
-    #           untie_decode_bank=True) and prior_covariance_table="diagonal"
+    #   fisher  natural-gradient step preconditioned by (n_v/N) diag(1/s_v, 1/2), the Fisher metric of the
+    #           prior family p_v counted once per occurrence (the exact Hessian of the self-coupling term only;
+    #           a chosen preconditioner for the CE): (mu_v, l_v) -= eta (N/n_v) (s_v grad_mu, 2 grad_l), each
+    #           row's step bounded in Fisher norm by m_table_fisher_trust_radius and never gradient-clipped; the
+    #           AdamW rates schedule it (step times lr_t/lr_0) and set the decoupled decay, nothing else. only: a
+    #           decoder that does not read these tables (decode_mode="linear" or untie_decode_bank=True) and
+    #           prior_covariance_table="diagonal"
     m_table_update_mode:              str             = "adamw"
     m_table_fisher_lr:                float           = 0.1          # fisher only: natural step size eta > 0
-    m_table_fisher_trust_radius:      float           = 0.1          # fisher only: per-row Fisher-norm bound r (KL <= r^2/2 per step)
+    m_table_fisher_trust_radius:      float           = 0.1          # fisher only: per-row Fisher-norm bound r (KL <= r^2/2 per step to second order; decay outside the bound)
 
     ##################################################
     #   17. Learning rates (M-step)
@@ -689,10 +752,12 @@ class VFE3Config:
     # tokens included. None = weight_decay; 0 = exempt.
     mu_weight_decay:                  Optional[float] = 0
 
-    # Separate decode-side mean tables only (untied decode_mu_embed, linear output_proj_weight): a
-    # Gaussian prior on the decode means. The rows of types that are rarely or never targets receive only
-    # the softmax push away from the queries, which nothing else opposes, and the KL logit is unbounded
-    # below in their distance (audit 2026-10-10, item 2). None = mu_weight_decay; 0 = exempt.
+    # Separate decode-side mean tables only (untied decode_mu_embed, linear output_proj_weight): decoupled
+    # AdamW decay theta <- theta (1 - lr_t lambda), which is not an L2 penalty or a Gaussian-prior MAP
+    # (Loshchilov and Hutter 2019). Against a mean Adam-normalized update u_bar it settles at
+    # |theta| = |u_bar| / lambda. The rows of types that are rarely or never targets receive only the softmax
+    # push away from the queries, which nothing else opposes, and the KL logit is unbounded below in their
+    # distance (audit 2026-10-10, item 2). None = mu_weight_decay; 0 = exempt.
     decode_mu_weight_decay:           Optional[float] = None
 
     # Log-variance tables. Decay pulls sigma toward 1 against sigma_init. None = weight_decay; 0 = exempt.
@@ -731,9 +796,10 @@ class VFE3Config:
     #   medium   bf16 allowed
     fp32_matmul_precision:            Optional[str]   = "highest"
     # Under a reduced fp32_matmul_precision ("medium"/"high"): when a training step raises before its
-    # optimizer update, replay it one rung stricter, "medium" -> "high" -> "highest" (IEEE fp32),
-    # instead of stopping the run. A failure that persists at "highest" is raised as before.
-    # Not used with fp16 (GradScaler state).
+    # optimizer update, or rejects its update for a non-finite loss or gradient, replay it one rung stricter,
+    # "medium" -> "high" -> "highest" (IEEE fp32), instead of stopping the run or skipping the step. A failure
+    # that persists at "highest" is raised (a skip is kept) as before. The log-step diagnostics and evaluation
+    # forwards use the same ladder. Not used with fp16 (GradScaler state).
     matmul_precision_retry:           bool            = False
 
     # Redo a frame producer call in float64 when its float32 frame pair is ill-conditioned
@@ -741,8 +807,9 @@ class VFE3Config:
     frame_pair_fp64_escalation:       bool            = False
     
     # Also rebuild projected covariances that factor in float32 but fail eps_32 ||G||_F ||G^-1||_F <= tol
-    # (failed factorizations are always rebuilt). Costly on CUDA; with minimal_agent it also screens the
-    # ADF query covariances.
+    # (failed factorizations are always rebuilt where the scorer has source tuples; under rotation_invariant
+    # with a diagonal P(G) this also keeps the factored route in place of the closed-form diagonal one).
+    # Costly on CUDA; with minimal_agent it also screens the ADF query covariances.
     projected_cov_condition_recovery: bool            = False
        
     # "fp64" | "fp32"
@@ -1433,6 +1500,11 @@ class VFE3Config:
             raise ValueError("rope_comparison_covariance='rotation_invariant' projects the kernel router's comparison "
                              "covariance; predictive_readout='minimal_agent' applies the rotation as a record channel "
                              "by exact conditioning and does not read it (use 'full')")
+        if (self.rope_comparison_covariance == "rotation_invariant" and self.pos_rotation == "rope"
+                and self.rope_space == "comparison"
+                and all(d - 2 * int(float(self.rope_fraction) * d // 2) <= 1 for d in self.head_dims)):
+            _warn_diagonal_comparison_covariance(self.head_dims, float(self.rope_fraction), float(self.rope_base),
+                                                 self.max_seq_len)
         if self.pos_rotation == "rope" and self.rope_space == "frame" and not _traits.contains_pair_rotations:
             import warnings
             warnings.warn(
@@ -1652,6 +1724,8 @@ class VFE3Config:
             raise ValueError(f"pair_kl_gemm_tol must be None or a positive number, got {self.pair_kl_gemm_tol!r}")
         if not isinstance(self.block_mlp_post_norm, bool):
             raise ValueError(f"block_mlp_post_norm must be a bool, got {self.block_mlp_post_norm!r}")
+        if not isinstance(self.block_mlp_autocast, bool):
+            raise ValueError(f"block_mlp_autocast must be a bool, got {self.block_mlp_autocast!r}")
         if self.block_mlp_post_norm and (self.block_coordinates != "local" or self.norm_type_block == "none"
                                          or not self.use_block_mlp):
             raise ValueError("block_mlp_post_norm=True needs block_coordinates='local', a block norm "
@@ -1694,11 +1768,15 @@ class VFE3Config:
                              "full-covariance layout (family='gaussian_full' or 'gaussian_block')")
         _require(self.block_norm_covariance, ("passthrough", "pushforward"), "block_norm_covariance")
         if self.block_norm_covariance == "pushforward":
+            # The block norm and a 'layernorm' final norm push Sigma; in reference coordinates they act on the dense
+            # C = U^-1 Sigma U^-T and map back as U C' U^T, which the full and head-block families keep (audit
+            # 2026-10-10 round 2, items 49 and 51).
             problems = []
             if self.norm_type_block != "layernorm":
                 problems.append(f"norm_type_block='layernorm' (got {self.norm_type_block!r})")
-            if self.block_coordinates != "local":
-                problems.append(f"block_coordinates='local' (got {self.block_coordinates!r})")
+            if self.block_coordinates != "local" and self.family not in ("gaussian_full", "gaussian_block"):
+                problems.append(f"block_coordinates='local', or 'reference' with family 'gaussian_full' or "
+                                f"'gaussian_block' (got {self.block_coordinates!r} with {self.family!r})")
             if self.family not in ("gaussian_full", "gaussian_block", "gaussian_diagonal"):
                 problems.append(f"a Gaussian family (got {self.family!r})")
             if problems:
@@ -1768,6 +1846,7 @@ class VFE3Config:
         # (comparison-space RoPE rotates only the routing moments). Everything else fails closed.
         _require(self.block_coordinates, ("local", "reference"), "block_coordinates")
         _require(self.decode_coordinates, ("local", "reference"), "decode_coordinates")
+        _require(self.decode_covariance, ("belief", "encoded", "constant"), "decode_covariance")
         frame_requirements = []
         if self.pos_rotation != "none" and self.rope_space != "comparison":
             frame_requirements.append(
@@ -1788,10 +1867,16 @@ class VFE3Config:
                     f"block_mlp_mode={self.block_mlp_mode!r} (requires 'coordinate', 'gaussian_template' or "
                     "'prototype_agents'; canonical_frame is already conjugated and gauge_gate is already "
                     "covariant)")
-            # 'posterior' (prototype_agents only, by the registry) maps C^+ back as U C^+ U^T.
-            if self.use_block_mlp and self.block_mlp_covariance not in ("passthrough", "posterior"):
+            # 'posterior' (prototype_agents only, by the registry) maps C^+ back as U C^+ U^T; a delta_full
+            # coordinate MLP pushes the dense C and maps it back the same way, kept by the full and head-block
+            # families (audit 2026-10-10 round 2, item 51).
+            covariant_delta_full = (self.block_mlp_covariance == "delta_full"
+                                    and self.family in ("gaussian_full", "gaussian_block"))
+            if (self.use_block_mlp and self.block_mlp_covariance not in ("passthrough", "posterior")
+                    and not covariant_delta_full):
                 incompatible.append(f"block_mlp_covariance={self.block_mlp_covariance!r} (requires "
-                                    "'passthrough', or 'posterior' with prototype_agents)")
+                                    "'passthrough', 'posterior' with prototype_agents, or 'delta_full' with "
+                                    "family 'gaussian_full' or 'gaussian_block')")
             if incompatible:
                 raise ValueError(
                     "block_coordinates='reference' conjugates the block by the realized relational frame "
@@ -1956,6 +2041,7 @@ class VFE3Config:
                     "grad_clip must be None or a finite real value >= 0; "
                     f"got {self.grad_clip!r}"
                 )
+        _require(self.grad_clip_scope, ("role", "group"), "grad_clip_scope")
 
     def inactive_fields(self) -> dict[str, str]:
         """Return inactive config field names and reasons, including default-valued fields.
@@ -1985,6 +2071,33 @@ class VFE3Config:
                  "(m_phi_update_mode='pullback_group' or 'fisher_group')")
         if self.m_table_update_mode != "fisher":
             mark(("m_table_fisher_lr", "m_table_fisher_trust_radius"), "only read by m_table_update_mode='fisher'")
+        else:
+            # The table step reads its group rate only through lr_t/lr_0 (independent of the base rate; 0 freezes
+            # the table) and the decoupled decay lr_t * lambda, so a table rate is inert when that decay is 0 and no
+            # other optimizer group falls back to it (vfe3/train.py build_optimizer; audit 2026-10-10 round 2,
+            # item 20). Under the fisher validation the decoder is linear or untied, so its means read
+            # m_decode_mu_lr and an untied bank's log variances read m_decode_sigma_lr.
+            def table_decay(own: Optional[float]) -> float:
+                return self.weight_decay if own is None else own
+            mu_rate_fallback = (
+                self.m_decode_mu_lr is None
+                or (self.use_block_mlp and self.m_block_mlp_lr is None)
+                or self.m_relational_score_lr is None or self.m_relational_content_lr is None
+                or self.use_cg_coupling
+                or (self.t5_learnable_bias and self.beta_attention_prior == "t5_relative_bias")
+                or (self.layernorm_affine and "layernorm" in (self.norm_type_block, self.norm_type_final)
+                    and self.m_layernorm_lr is None))
+            if table_decay(self.mu_weight_decay) == 0.0 and not mu_rate_fallback:
+                mark(("m_p_mu_lr",), "m_table_update_mode='fisher' steps mu_embed at m_table_fisher_lr; its AdamW "
+                     "rate only shapes the schedule (0 freezes the table), its decay is 0 and no other group "
+                     "inherits it")
+            sigma_rate_fallback = self.decode_mode != "linear" and self.m_decode_sigma_lr is None
+            if table_decay(self.sigma_weight_decay) == 0.0 and not sigma_rate_fallback:
+                mark(("m_p_sigma_lr",), "m_table_update_mode='fisher' steps sigma_log_embed at m_table_fisher_lr; "
+                     "its AdamW rate only shapes the schedule (0 freezes the table), its decay is 0 and no other "
+                     "group inherits it")
+        if self.grad_clip is None or self.grad_clip == 0:
+            mark(("grad_clip_scope",), "only read when grad_clip > 0")
         if not phi_update_policy.requires_manifold_optimizer:
             mark(("bch_residual_max",),
                  "only read by the manifold phi optimizer's group-product gate")
@@ -2021,8 +2134,21 @@ class VFE3Config:
         if not self.deterministic:
             mark(("fill_uninitialized_memory",),
                  "torch fills uninitialized memory only under deterministic algorithms")
+        # rotation_invariant scores P(G) on the Gram route whatever projected_factor_route is, so its certificate
+        # reads the Gram tolerance (audit 2026-10-10 round 2, item 32).
+        rotation_invariant = (self.pos_rotation == "rope" and self.rope_space == "comparison"
+                              and self.rope_comparison_covariance == "rotation_invariant")
         gram_status = (self.projected_factor_route == "gram"
-                       or self.relational_routing == "noisy_query" or minimal_agent)
+                       or self.relational_routing == "noisy_query" or minimal_agent or rotation_invariant)
+        if (rotation_invariant and self.attention_mode == "projected_predictive" and not minimal_agent
+                and self.relational_routing == "gaussian_kl" and self.pair_kl_gemm_tol is None
+                and not self.projected_cov_condition_recovery
+                and all(d - 2 * int(float(self.rope_fraction) * d // 2) <= 1 for d in self.head_dims)):
+            # Every head's P(G) is diagonal, so the Gaussian KL takes its diagonal route, which factors nothing
+            # and has no source recovery (audit 2026-10-10 round 2, item 30; gradients/relational.py).
+            mark(("projected_cov_recovery_precision",),
+                 "rope_comparison_covariance='rotation_invariant' with every comparison coordinate but at most one "
+                 "rotating makes P(G) diagonal, scored on the diagonal route with no factorization or source recovery")
         if not (self.projected_cov_condition_recovery and gram_status):
             mark(("projected_gram_condition_tol",),
                  "only read by the Gram-route certificate under projected_cov_condition_recovery=True")
@@ -2067,11 +2193,14 @@ class VFE3Config:
                  "routing-cost selector, no kappa_beta temperature) and derives the receiving map and the "
                  "precision-weighted residual (no content factor O, so no chart, initial output scale or residual flag)")
             # The readout applies no clamp (relational.py returns before safe_kl_clamp); the remaining
-            # readers are the M-step self-coupling and the CG moment energy.
-            if self.mstep_self_coupling_weight == 0.0 and self.cg_energy_weight == 0.0:
+            # readers are the M-step self-coupling, the CG moment energy and the self term of the canonical
+            # free-energy diagnostic (audit 2026-10-10 round 2, item 31).
+            if (self.mstep_self_coupling_weight == 0.0 and self.cg_energy_weight == 0.0
+                    and not self.diagnose_canonical_free_energy):
                 mark(("kl_max",),
                      "the minimal-agent posterior applies no divergence clamp, decoders use kl_max=inf, and "
-                     "no M-step self-coupling or CG energy term is enabled")
+                     "no M-step self-coupling or CG energy term is enabled; with diagnose_canonical_free_energy=True "
+                     "it would feed that log-step diagnostic only")
             # Without the certificate the minimal agent pre-replaces failed factors before projected
             # scoring, so no source recovery (the only reader of the recovery precision) can occur.
             if not self.projected_cov_condition_recovery:
@@ -2126,15 +2255,21 @@ class VFE3Config:
         if self.attention_mode == "projected_predictive":
             mark(gradient_controls, "predictive_content replaces the mean (and, under "
                  "predictive_covariance='moment_matched', the covariance) by readout, not a gradient step")
-            if self.mstep_self_coupling_weight == 0.0:
+            # diagnose_canonical_free_energy reads the self-coupling form (audit 2026-10-10 round 2, item 31).
+            if self.mstep_self_coupling_weight == 0.0 and not self.diagnose_canonical_free_energy:
                 mark(("lambda_alpha_mode", "lambda_alpha", "b0", "c0"),
-                     "predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer")
+                     "predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer; with "
+                     "diagnose_canonical_free_energy=True they would feed that log-step diagnostic only")
         mlp_delta_full = self.use_block_mlp and self.block_mlp_covariance == "delta_full"
         # The norm pushforward reads the same floor (in post-norm units) as delta_full.
         norm_floor = () if self.block_norm_covariance == "pushforward" and not mlp_delta_full else (
             "block_mlp_covariance_floor",)
-        if self.block_norm_covariance == "pushforward" and mlp_delta_full:
-            mark(("block_norm_covariance",), "block_mlp_covariance='delta_full' already composes the norm Jacobian")
+        if self.block_norm_covariance == "pushforward" and mlp_delta_full and self.norm_type_final != "layernorm":
+            mark(("block_norm_covariance",), "block_mlp_covariance='delta_full' already composes the norm Jacobian "
+                 "and no 'layernorm' final norm pushes Sigma")
+        # The prototype block runs with autocast disabled already (its posterior and its residual are fp32).
+        if self.amp_dtype is None or not self.use_block_mlp or self.block_mlp_mode == "prototype_agents":
+            mark(("block_mlp_autocast",), "only read with amp_dtype set and a block MLP other than prototype_agents")
         if not self.use_block_mlp:
             mark(("block_mlp_mode", "block_mlp_covariance", *norm_floor,
                   "block_mlp_expansion", "block_mlp_activation", "block_mlp_dropout", "m_block_mlp_lr"),
@@ -2164,8 +2299,10 @@ class VFE3Config:
             mark(("m_pos_phi_lr",), "only pos_phi='learned' creates the learnable positional table")
         if "layernorm" not in (self.norm_type_block, self.norm_type_final):
             mark(("layernorm_affine",), "only read by a 'layernorm' block or final norm seam")
-        if self.norm_type_block != "layernorm" or self.block_coordinates != "local":
-            mark(("block_norm_covariance",), "only read by a 'layernorm' block norm in local coordinates")
+        if self.norm_type_block != "layernorm" or (self.block_coordinates != "local"
+                                                   and self.family not in ("gaussian_full", "gaussian_block")):
+            mark(("block_norm_covariance",), "only read by a 'layernorm' block norm, in local coordinates or in "
+                 "reference coordinates on gaussian_full / gaussian_block")
         if not (self.layernorm_affine and "layernorm" in (self.norm_type_block, self.norm_type_final)):
             mark(("m_layernorm_lr",), "requires layernorm_affine and a layernorm seam")
         if not self.decode_unigram_prior:
@@ -2224,6 +2361,7 @@ class VFE3Config:
             mark(("decode_av_precision", "decode_ranking_fp64_escalation"),
                  "read only by the prior-bank Gaussian KL decoders and their ranking guard")
             mark(("decode_tau",), "read only by the prior-bank KL decode")
+            mark(("decode_covariance",), "the linear readout reads no covariance")
             mark(("untie_decode_bank",),
                  "read only by the KL-to-bank decode; the linear decode is untied by construction")
         else:
@@ -2263,8 +2401,9 @@ class VFE3Config:
             mark(("sigma_max",),
                  "the closed-form full-covariance receiver sets Sigma = c Lambda^{-1} with no SPD ceiling "
                  "(only the diagonal family clamps at sigma_max)")
-        if self.attention_mode == "projected_predictive":
-            mark(("lambda_beta",), "predictive_content weights no belief-coupling block")
+        if self.attention_mode == "projected_predictive" and not self.diagnose_canonical_free_energy:
+            mark(("lambda_beta",), "predictive_content weights no belief-coupling block; with "
+                 "diagnose_canonical_free_energy=True it would feed that log-step diagnostic only")
         if self.decode_mode != "family_chunked" and not (
                 self.family == "gaussian_full"
                 and (self.mstep_self_coupling_weight != 0.0 or self.cg_energy_weight != 0.0)):
@@ -2275,16 +2414,20 @@ class VFE3Config:
             mark(("mu_trust_cholesky_rounds",),
                  "only an active mean trust region on a full covariance factors sigma_q")
         # stack._can_omit_prior_handoff at config level: predictive_content never reads the prior
-        # and no M-step prior consumer is enabled.
+        # and no M-step prior consumer is enabled. The canonical diagnostic reads each layer's handed-off prior
+        # (the capture keeps the handoff), so it is a consumer too (audit 2026-10-10 round 2, item 31).
         if (self.attention_mode == "projected_predictive" and self.mstep_self_coupling_weight == 0.0
-                and self.cg_energy_weight == 0.0):
+                and self.cg_energy_weight == 0.0 and not self.diagnose_canonical_free_energy):
             mark(("prior_handoff_rho", "prior_handoff_sigma"),
-                 "predictive_content never reads the prior and no M-step prior consumer is enabled")
+                 "predictive_content never reads the prior and no M-step prior consumer is enabled; with "
+                 "diagnose_canonical_free_energy=True they would feed that log-step diagnostic only")
         # The stack enters the E-step with q = p; one gradient iteration in one layer therefore
         # evaluates the self-coupling at D(q||p) = 0, where its force and derivatives vanish.
         # The closed-form receiver jumps to the frozen minimizer, which alpha sets, so the rule holds
-        # only for a gradient step (audit 2026-10-07 F08/F23/F25/F71).
+        # only for a gradient step (audit 2026-10-07 F08/F23/F25/F71). The canonical diagnostic still
+        # reads the self-coupling form (R(alpha) at D = 0, and D > 0 at the layer output).
         if (self.n_e_steps == 1 and self.n_layers == 1 and self.mstep_self_coupling_weight == 0.0
+                and not self.diagnose_canonical_free_energy
                 and not (self.attention_mode == "projected_gradient"
                          and self.relational_receiver_update == "closed_form")):
             mark(("lambda_alpha_mode", "lambda_alpha", "b0", "c0"),

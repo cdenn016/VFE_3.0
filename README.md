@@ -492,7 +492,7 @@ the validator for the complete admission rules.
 | `predictive_covariance="moment_matched"` | Replaces the covariance by the predictive kernel's moment-matched covariance plus a covariant floor. |
 | `family="gaussian_diagonal"` | Keeps the diagonal of the local moment-matched covariance; `gaussian_full` keeps it dense, so the two differ on this route; see below. |
 | `encode_mode="per_token_additive"` | Capacity-matched $\Omega=I$ control; requires `pos_phi="none"`, and either `pos_rotation="none"` or comparison-space RoPE (`rope_space="comparison"`). |
-| `routing_kl_max_reference` | Projected kernel router only. `"absolute"` (default) clamps $D_{ij}$ at `kl_max`; `"row_min"` clamps the detached row gap $D_{ij}-\min_{j\,\mathrm{admissible}}D_{ij}$, which leaves $\beta$ the exact softmax wherever no gap reaches `kl_max` and keeps the cost order of a row whose every cost exceeds it. |
+| `routing_kl_max_reference` | Projected kernel router only. `"absolute"` (default) clamps $D_{ij}$ at `kl_max`; `"row_min"` clamps the row gap $D_{ij}-\min_{j\,\mathrm{admissible}}D_{ij}$, with the row minimum carrying its subgradient, which leaves $\beta$ the exact softmax wherever no gap reaches `kl_max` and keeps the cost order of a row whose every cost exceeds it. |
 | `learn_attention_temperature` | Default `False`. `True` learns $\tau_{\ell,h}=\kappa_h\sqrt{d_h}\exp(\mathrm{clamp}(\delta_{\ell,h},-3,3))$ per layer and head (`routing_log_temperature`, zero at initialization, no weight decay, score learning rate) on both projected routes. It acts after the `kl_max` clamp, so a fully capped absolute-reference row stays uniform. Not with `predictive_readout="minimal_agent"`. |
 | `tie_comparison_maps` | Default `False`. `True` sets $S_K:=S_Q$ (no `raw_score_k`) on the `projected_predictive` kernel readout, so $D_{ii}=0$ and the flat-alignment case $D_{ij}=D_{\mathrm{KL}}(q_i\Vert(\Omega_{ij})_*q_j)$ under one map is testable. |
 | `block_mlp_post_norm` | Default `False`. `True` reapplies the block norm to the post-MLP mean, so the next router reads a normalized mean; requires `block_coordinates="local"`, a block norm and a block MLP. |
@@ -501,8 +501,9 @@ Relational rates of `None` inherit `m_p_mu_lr`; `0.0` freezes that role's
 parameters while retaining its forward operation. Score and content groups have
 zero weight decay.
 
-When both covariance contracts pass the covariance through
-(`predictive_covariance="passthrough"` and `block_mlp_covariance="passthrough"`),
+When every covariance contract passes the covariance through
+(`predictive_covariance="passthrough"`, `block_mlp_covariance="passthrough"` and
+`block_norm_covariance="passthrough"`),
 `family="gaussian_full"` computes the same function as `gaussian_diagonal` with the
 rank-matched decoder: the encoder stores the covariance as the diagonal of a per-token
 table and no seam densifies it, and a float64 probe with shared parameters gives identical
@@ -510,8 +511,9 @@ losses and an exactly zero off-diagonal covariance. The current launcher's
 `predictive_covariance="moment_matched"` densifies it, so on the launcher's route the
 diagonal family keeps only the diagonal of the local moment-matched covariance and the two
 families differ. A genuinely full covariance requires `gaussian_full` together with
-`block_mlp_covariance="delta_full"`, `predictive_covariance="moment_matched"`, or the
-covariance updates of `attention_mode="projected_gradient"`.
+`block_mlp_covariance="delta_full"`, `block_norm_covariance="pushforward"`,
+`predictive_covariance="moment_matched"`, or the covariance updates of
+`attention_mode="projected_gradient"`.
 `VFE3Config.inactive_fields()`
 reports this equivalence when it holds, together with every other setting that no active path reads
 (for example `lambda_beta`, `sigma_max`, and the congruence-precision knobs on this
@@ -600,7 +602,12 @@ objective differs from predictive content aggregation. The derivations are in
 law $O_h^\top\xi_i$ against each sender's $d$-dimensional message $T_h\xi_j$ as an
 expected likelihood with channel floor `relational_receiver_noise`. It counts the
 receiver entropy once, so its minimizer is the exact tempered Gaussian posterior, and
-directions no head observes stay at the prior. `"ambient_alignment"` is the original
+directions no head observes stay at the prior. `relational_receiver_measurement` picks the
+measurement of $\xi_i$: `"adjoint"` (default) reads it through $O_h^\top$, and `"inverse"`
+through the head rows of $O'^{-1}$, formed from the chart factors ($T e^{-OT}$ under the
+exponential chart), whose frozen-context minimizer is the kernel mean for equal channel
+precisions and vanishing self-coupling, and which is invariant
+under $(U,T,S,O')\mapsto(Uh,Th,Sh,h^{-1}O')$. `"ambient_alignment"` is the original
 sum of KLs to $K$-dimensional laws with noise $\nu I_K$; it counts the entropy
 $\alpha+\sum_h\lambda_h$ times and pulls each head's unwritten coordinates toward zero.
 `relational_receiver_update="closed_form"` (default) applies the exact frozen-context

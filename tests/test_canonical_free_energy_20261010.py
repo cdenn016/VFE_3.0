@@ -213,7 +213,7 @@ def test_off_leaves_columns_nan_and_every_other_value_bitwise_unchanged() -> Non
     off, on = _model(diagnose_canonical_free_energy=False), _model()
     for name, tensor in off.state_dict().items():
         assert torch.equal(tensor, on.state_dict()[name]), name
-    added = {"canonical_beta_tv"}
+    added = {"canonical_beta_tv", "canonical_self_weight", "canonical_total_output", "canonical_total_delta"}
     replaced = {*F_KEYS, "relational_legacy_global_f_available"}
     for d_off, d_on in ((off.diagnostics(TOKENS), on.diagnostics(TOKENS)),
                         (off.diagnostics_per_layer(TOKENS), on.diagnostics_per_layer(TOKENS))):
@@ -293,5 +293,6 @@ def test_metrics_csv_carries_the_per_token_columns(tmp_path: Path, monkeypatch: 
             assert float(row["val_relational_legacy_global_f_available"]) == 1.0
     off_rows, _ = _train_run(tmp_path, False)
     assert "canonical_beta_tv" not in off_rows[0] and "val_canonical_beta_tv" not in off_rows[0]
-    assert set(rows[0]) == set(off_rows[0]) | {"canonical_beta_tv", "val_canonical_beta_tv"}
+    added = ("canonical_beta_tv", "canonical_self_weight", "canonical_total_output", "canonical_total_delta")
+    assert set(rows[0]) == set(off_rows[0]) | {*added, *(f"val_{key}" for key in added)}
     assert all(row[column] == "" for row in off_rows for column in ("self_coupling", "val_self_coupling"))

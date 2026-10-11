@@ -166,7 +166,7 @@ def test_fp16_pullback_overflow_preserves_all_phi_factors_and_clock(monkeypatch)
         status_out=status,
     )
 
-    assert status == {"did_step": False}
+    assert status["did_step"] is False and status["nonfinite_skip"] is True
     assert float(scaler.get_scale()) < scale_before
     assert scheduler.last_epoch == scheduler_epoch
     assert staging_calls == []
