@@ -328,6 +328,7 @@ config = dict(
     pair_kl_gemm_tol                 = None,       # None (off) | nats, e.g. 1e-3: rescore pair-KL GEMM slices whose error estimate exceeds it (~+45% step at K=128)
         
     decode_ce_checkpoint             = "auto",     # "auto" | "auto_aggregate" (saves memory with recompute)
+    expected_likelihood_kernel       = "torch",    # "torch" | "triton" (fused EL cross-entropy, CUDA; expected_likelihood_chunked only)
     decode_logits_amp                = False,      # linear decode only: logits matmul under amp_dtype; CE stays fp32
     projected_cov_recovery_precision = "fp32",     # "fp64" | "fp32"
     projected_factor_route           = "gram",     # "gram" | "cholesky_qr2" (slower unless recovery actually trips)

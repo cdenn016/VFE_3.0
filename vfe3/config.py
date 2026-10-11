@@ -238,6 +238,13 @@ class VFE3Config:
     #   auto_aggregate  account the whole vocabulary, including fp64 scores (saves more memory)
     decode_ce_checkpoint:             str             = "auto"  
 
+    # "torch" | "triton"
+    # decode_mode="expected_likelihood_chunked" only: the training cross-entropy kernel.
+    #   torch   chunked broadcast over (B, N, Vc, K), gradient-checkpointed
+    #   triton  fused forward and backward that never forms (B, N, Vc, K) (vfe3/kernels); CUDA tensors only,
+    #           the torch kernel serves CPU tensors. Values agree to rounding
+    expected_likelihood_kernel:       str             = "torch"
+
     # decode_mode="linear" with amp_dtype set only: run the logits matmul x W^T under amp_dtype
     # autocast (bf16/fp16 operands, fp32 accumulate); bias, logsumexp and the cross-entropy stay fp32.
     decode_logits_amp:                bool            = False
@@ -1570,6 +1577,7 @@ class VFE3Config:
         if self.decode_chunk_size < 1:
             raise ValueError(f"decode_chunk_size must be >= 1, got {self.decode_chunk_size}")
         _require(self.decode_ce_checkpoint, ("auto", "auto_aggregate"), "decode_ce_checkpoint")
+        _require(self.expected_likelihood_kernel, ("torch", "triton"), "expected_likelihood_kernel")
         # decode_bias (linear decode only) and decode_tau (prior-bank decode only) are reported by
         # inactive_fields(), so the default-guarded notice below covers them and untouched
         # defaults stay silent.
@@ -2193,6 +2201,8 @@ class VFE3Config:
         registration = _DECODERS[self.decode_mode]
         if not registration.supports_chunked:
             mark(("decode_ce_checkpoint",), "the selected decoder has no checkpointed chunked CE kernel")
+        if self.decode_mode != "expected_likelihood_chunked":
+            mark(("expected_likelihood_kernel",), "only read by decode_mode='expected_likelihood_chunked'")
         canonical_family_dispatch = (
             self.decode_mode == "family_chunked"
             and registration.callable is _decode_family_chunked

@@ -884,6 +884,7 @@ class PriorBank(nn.Module):
         decode_chunk_size:   int   = 8192,
         decode_av_precision: Optional[str] = None,
         decode_ce_checkpoint: str  = "auto",
+        expected_likelihood_kernel: str = "torch",   # "torch" | "triton" (fused CE, CUDA tensors only)
         decode_ranking_fp64_escalation: bool = VFE3Config.decode_ranking_fp64_escalation,
 
         unigram_kappa:        float = 1.0,
@@ -954,6 +955,12 @@ class PriorBank(nn.Module):
         # keeps it in the fp32 decode island. Set by the model after construction.
         self.decode_logits_amp_dtype: Optional[torch.dtype] = None
         self.decode_ce_checkpoint = decode_ce_checkpoint
+        if expected_likelihood_kernel not in ("torch", "triton"):
+            raise ValueError("expected_likelihood_kernel must be 'torch' or 'triton', got "
+                             f"{expected_likelihood_kernel!r}")
+        # 'triton' routes decode_ce_expected_likelihood_chunked through vfe3/kernels on CUDA tensors;
+        # CPU tensors keep the torch kernel under either value.
+        self.expected_likelihood_kernel = expected_likelihood_kernel
         self.decode_ranking_fp64_escalation = decode_ranking_fp64_escalation
         self.unigram_kappa = unigram_kappa
         self.decode_unigram_prior = decode_unigram_prior
@@ -1981,6 +1988,17 @@ class PriorBank(nn.Module):
         )                                                                             # (V, K)
         mu_v_all = self._decode_mu_table()                                  # (V, K) decode table (untied if set)
         u_all = self._unigram_bias() if self.decode_unigram_prior else None  # (V,) kappa*log pi_v or None
+
+        if self.expected_likelihood_kernel == "triton" and mu_q.is_cuda:
+            # Fused Triton route: streams (i, v) register tiles and never forms (B, N, Vc, K); same
+            # formula, rounding-level differences listed in vfe3/kernels/expected_likelihood.py.
+            # CPU tensors fall through to the torch kernel below, which is unchanged.
+            from vfe3.kernels.expected_likelihood import expected_likelihood_ce
+            ce = expected_likelihood_ce(
+                mu_q.reshape(-1, mu_q.shape[-1]), sigma_q.reshape(-1, sigma_q.shape[-1]),
+                mu_v_all, sigma_v_all, u_all, tau_eff, targets.reshape(-1),
+            )                                                               # () mean over packed rows
+            return _decode_ce_result(ce, original_valid, return_stats)
 
         def _chunk_summaries(mu_q_:   torch.Tensor, sigma_q_:   torch.Tensor,
                              mu_v_c:  torch.Tensor, sigma_v_c:  torch.Tensor,
