@@ -40,7 +40,8 @@ the power posterior at fixed labels,
     P_i = (C_i^{-1} + \operatorname{diag}D_i)^{-1},\qquad
     \xi_i^+ = P_i(C_i^{-1}\xi_i + \eta_i) = \xi_i + P_i(\eta_i - D_i\odot\xi_i),\qquad C_i^+ = P_i,
 
-which omits the between-template spread :math:`C_iR_iC_i` of the exact covariance.
+which omits the between-template spread :math:`C_iR_iC_i` of the exact covariance. That is one coordinate-ascent
+sweep; :func:`prototype_mean_field_posterior` runs ``cavi_steps`` of them.
 
 Covariance layouts. ``C`` is diagonal ``(..., K)``, dense ``(..., K, K)``, or compact blocks
 ``(..., G, b, b)`` with :math:`Gb = K` (a block-diagonal :math:`C_i`), and every covariance output uses the
@@ -453,8 +454,10 @@ def prototype_mean_field_posterior(
 
     *,
     need_covariance: bool = True,
+    cavi_steps:      int  = 1,
 ) -> MeanFieldPrototypePosterior:
-    r"""First structured-mean-field step of the prototype-agent model (Proposition ma:prop:mean_field).
+    r"""Structured-mean-field posterior of the prototype-agent model (Proposition ma:prop:mean_field), by
+    ``cavi_steps`` coordinate-ascent sweeps; one sweep is the first step started at the token's prior.
 
     The label update at the token's prior is ``softmax`` of :func:`template_kl_logits`; the power
     posterior at those labels has precision :math:`C_i^{-1} + \operatorname{diag}D_i` and is evaluated
@@ -470,45 +473,69 @@ def prototype_mean_field_posterior(
     :math:`D^{-1/2}B^{-1}D^{1/2}C = (I + CD)^{-1}C = (C^{-1} + D)^{-1}`). For a diagonal :math:`C_i` this is
     :math:`P_{ik} = c_{ik}/(1 + c_{ik}D_{ik})`. :math:`D_i > 0` because the responsibilities sum to one and
     every :math:`\lambda_a` is finite. The covariance omits the between-template spread.
+
+    Coordinate ascent. The label step is the exact CAVI update of :math:`q(a_i)` given :math:`q(X_i) = \mathcal N(m, S)`:
+    the record of template :math:`a` has the likelihood :math:`\mathcal N(X_i;\nu_a,\Lambda_a)`, and
+
+    .. math::
+        E_q[\log\mathcal N(X_i;\nu_a,\Lambda_a)] = -\tfrac12\sum_k\Bigl[\log 2\pi\lambda_{ak}
+            + \frac{(m_k - \nu_{ak})^2 + S_{kk}}{\lambda_{ak}}\Bigr]
+            = -D_{\mathrm{KL}}(\mathcal N(m, S)\|p_a) - \tfrac K2(1 + \log 2\pi) - \tfrac12\log\det S,
+
+    whose last two terms do not depend on :math:`a` and cancel in the softmax, so
+    :math:`q(a_i) = \operatorname{softmax}_a(\log\pi_a - D_{\mathrm{KL}}(\mathcal N(m, S)\|p_a))` and only
+    :math:`\operatorname{diag}S` enters. Sweep 1 takes :math:`(m, S) = (\xi_i, C_i)`; sweep :math:`s > 1` takes the
+    previous sweep's :math:`(\xi_i^+, C_i^+)` and forms the power posterior from the prior moments
+    :math:`(\xi_i, C_i)` with the new responsibilities. Intermediate sweeps form :math:`C_i^+` whatever
+    ``need_covariance`` says; the returned responsibilities, :math:`D_i` and :math:`\eta_i` are the last sweep's.
+    The sweeps are unrolled under autograd, and the factorizations of every sweep are checked on the host once.
     """
     layout = covariance_layout(xi, C)
     if nu.dim() != 2 or nu.shape[-1] != xi.shape[-1] or log_lambda.shape != nu.shape \
             or log_pi.shape != nu.shape[:1]:
         raise ValueError("templates must be nu (M, K), log_lambda (M, K) and log_pi (M,) with the mean's K")
+    if isinstance(cavi_steps, bool) or not isinstance(cavi_steps, int) or cavi_steps < 1:
+        raise ValueError(f"cavi_steps must be an int >= 1, got {cavi_steps!r}")
     K = xi.shape[-1]
     lead = tuple(xi.shape[:-1])
     dtype = _compute_dtype(xi, C, nu, log_lambda, log_pi)
     with torch.autocast(device_type=xi.device.type, enabled=False):
         x, Cw = xi.to(dtype), C.to(dtype)
         n, ll, lp = nu.to(dtype), log_lambda.to(dtype), log_pi.to(dtype)
-        logits = template_kl_logits(x, covariance_diagonal(Cw, layout), n, ll, lp)   # (..., M)
-        responsibilities = torch.softmax(logits, dim=-1)                     # (..., M)
-        precision = torch.exp(-ll)                                           # (M, K) 1 / lambda_a
-        D = responsibilities @ precision                                     # (..., K)
-        eta = responsibilities @ (n * precision)                             # (..., K)
-        g = eta - D * x                                                      # (..., K) sum_a r_a (nu_a - xi)/lambda_a
-        C_plus = None
-        if layout == "diagonal":
-            P = Cw / (1.0 + Cw * D)                                          # (..., K)
-            delta = P * g
-            if need_covariance:
+        x_lab, c_lab = x, covariance_diagonal(Cw, layout)                    # (..., K): moments the labels read
+        failed: Optional[torch.Tensor] = None
+        for sweep in range(cavi_steps):
+            last = sweep == cavi_steps - 1
+            logits = template_kl_logits(x_lab, c_lab, n, ll, lp)             # (..., M)
+            responsibilities = torch.softmax(logits, dim=-1)                 # (..., M)
+            precision = torch.exp(-ll)                                       # (M, K) 1 / lambda_a
+            D = responsibilities @ precision                                 # (..., K)
+            eta = responsibilities @ (n * precision)                         # (..., K)
+            g = eta - D * x                                                  # (..., K) sum_a r_a (nu_a - xi)/lambda_a
+            C_plus = None
+            if layout == "diagonal":
+                P = Cw / (1.0 + Cw * D)                                      # (..., K)
+                delta = P * g
                 C_plus = P
-        else:
-            Cb = Cw.unsqueeze(-3) if layout == "dense" else Cw               # (..., G, b, b)
-            G, b = Cb.shape[-3], Cb.shape[-1]
-            Dh = D.sqrt().reshape(*lead, G, b)                               # (..., G, b) D^{1/2}
-            eye = torch.eye(b, dtype=dtype, device=Cb.device)
-            B = Dh.unsqueeze(-1) * Cb * Dh.unsqueeze(-2) + eye               # (..., G, b, b) I + D^{1/2} C D^{1/2}
-            L, info = torch.linalg.cholesky_ex(B, check_errors=False)
-            Cg = (Cb @ g.reshape(*lead, G, b).unsqueeze(-1)).squeeze(-1)     # (..., G, b) C g
-            delta = (torch.cholesky_solve((Dh * Cg).unsqueeze(-1), L).squeeze(-1) / Dh).reshape(*lead, K)
-            if need_covariance:
-                P = torch.cholesky_solve(Dh.unsqueeze(-1) * Cb, L) / Dh.unsqueeze(-1)   # D^{-1/2} B^{-1} D^{1/2} C
-                P = _symmetric(P)
-                C_plus = P.squeeze(-3) if layout == "dense" else P
-            if bool((info != 0).any()):
-                raise ValueError("prototype-agent power-posterior matrix I + D^{1/2} C D^{1/2} is not positive "
-                                 "definite: the working covariance is not positive semidefinite")
+            else:
+                Cb = Cw.unsqueeze(-3) if layout == "dense" else Cw           # (..., G, b, b)
+                G, b = Cb.shape[-3], Cb.shape[-1]
+                Dh = D.sqrt().reshape(*lead, G, b)                           # (..., G, b) D^{1/2}
+                eye = torch.eye(b, dtype=dtype, device=Cb.device)
+                B = Dh.unsqueeze(-1) * Cb * Dh.unsqueeze(-2) + eye           # (..., G, b, b) I + D^{1/2} C D^{1/2}
+                L, info = torch.linalg.cholesky_ex(B, check_errors=False)
+                Cg = (Cb @ g.reshape(*lead, G, b).unsqueeze(-1)).squeeze(-1)  # (..., G, b) C g
+                delta = (torch.cholesky_solve((Dh * Cg).unsqueeze(-1), L).squeeze(-1) / Dh).reshape(*lead, K)
+                if need_covariance or not last:
+                    P = torch.cholesky_solve(Dh.unsqueeze(-1) * Cb, L) / Dh.unsqueeze(-1)   # D^{-1/2} B^{-1} D^{1/2} C
+                    P = _symmetric(P)
+                    C_plus = P.squeeze(-3) if layout == "dense" else P
+                failed = (info != 0).any() if failed is None else failed | (info != 0).any()
+            if not last:
+                x_lab, c_lab = x + delta, covariance_diagonal(C_plus, layout)   # the next labels read (xi^+, diag C^+)
+        if failed is not None and bool(failed):
+            raise ValueError("prototype-agent power-posterior matrix I + D^{1/2} C D^{1/2} is not positive "
+                             "definite: the working covariance is not positive semidefinite")
         return MeanFieldPrototypePosterior(
-            xi_plus=x + delta, delta_xi=delta, C_plus=C_plus,
+            xi_plus=x + delta, delta_xi=delta, C_plus=C_plus if need_covariance else None,
             responsibilities=responsibilities, D=D, eta=eta)

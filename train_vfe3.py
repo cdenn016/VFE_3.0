@@ -119,6 +119,7 @@ config = dict(
 
     log_interval                     = 100,       # console log every N steps (0 = off)
     eval_interval                    = 1500,      # periodic validation every N steps (0 = off)
+    diagnose_canonical_free_energy   = False,     # log the canonical free energy (gauge-KL routing) at the captured beliefs
     checkpoint_interval              = 15000,     # save a resumable checkpoint every N steps (0 = off)   
     
     #################################
@@ -137,11 +138,13 @@ config = dict(
         
     relational_routing               = "gaussian_kl",           # "gaussian_kl" | "noisy_query" (noisy_query: projected_predictive only)
     relational_receiver_law          = "channel_likelihood",  # "channel_likelihood" | "ambient_alignment" (projected_gradient only)
+    relational_receiver_measurement  = "adjoint",               # "adjoint" O'^T | "inverse" O'^-1, the dual measurement (channel_likelihood only)
     relational_receiver_update       = "closed_form",         # "closed_form" (exact frozen-context update) | "euler" (Fisher step; reads e_q_mu_lr / e_q_sigma_lr / trusts) (projected_gradient only)
     relational_output_init           = "identity",      # "identity" | "depth_scaled" (initial "Oh" times 1/sqrt(2 n_layers))   
        
     predictive_readout               = "minimal_agent",     # "kernel" | "minimal_agent" (projected_predictive only)
     minimal_agent_inference          = "mean_field",         # "exact" | "mean_field" (minimal_agent only)
+    minimal_agent_cavi_steps         = 1,                       # mean_field only: coordinate-ascent sweeps (1 = labels at the input moments)
    
     block_coordinates                = "local",       # "local" | "reference" (LN and MLP applied as U Phi(U^-1 .))
     decode_coordinates               = "local",       # "local" | "reference" (reference: decode_mode "linear" | "diagonal_chunked" | "full_chunked")
@@ -166,6 +169,8 @@ config = dict(
     block_mlp_template_init          = "absolute",   # "absolute" | "working_variance" (lambda_0, nu from one batch; prototype_agents only)
     
     block_mlp_inference              = "mean_field",   # "mean_field" | "exact" (prototype_agents only)
+    block_mlp_cavi_steps             = 1,              # mean_field only: coordinate-ascent sweeps (1 = labels at the input moments)
+    block_mlp_em_weight              = 0.0,            # prototype_agents only: EM M-step term on the templates (nu, lambda, pi); 0 = off
     
     block_mlp_expansion              = 8,    #K*block_mlp_expansion = number of templates
     
@@ -183,6 +188,7 @@ config = dict(
     layernorm_affine                 = True,
     norm_type_block                  = "layernorm",        # "none" | "layernorm" | "mahalanobis" - often useful
     norm_type_final                  = "none",             # "none" | "layernorm" | "mahalanobis" - performs worse generally
+    block_norm_covariance            = "passthrough",      # "passthrough" | "pushforward" (Sigma -> J_LN Sigma J_LN^T + floor D Sigma D; diagonal family: its diagonal)
 
     #################################
     #        Initialization
@@ -271,6 +277,10 @@ config = dict(
     m_phi_group_trust_radius         = 0.1,
     m_phi_fisher_rotation_weight     = 2.0,       # fisher_group only: completion weight on every rotation (also damps Fisher-visible ones)
 
+    m_table_update_mode              = "adamw",   # "adamw" | "fisher" (natural-gradient M-step on mu_embed / sigma_log_embed; linear or untied decode)
+    m_table_fisher_lr                = 0.1,       # fisher only: natural step size eta (the AdamW rates m_p_mu_lr / m_p_sigma_lr schedule it and set decay)
+    m_table_fisher_trust_radius      = 0.1,       # fisher only: per-row Fisher-norm bound (KL <= r^2/2 per step)
+
     #################################
     #    Embedding/Priors M-step
     #        Learning Rates
@@ -305,6 +315,7 @@ config = dict(
     phi_weight_decay                 = 0.1,    
     sigma_weight_decay               = 0,      
     mu_weight_decay                  = 0,       
+    decode_mu_weight_decay           = None,   # decode-side means only (untied decode bank / linear readout); None = mu_weight_decay; try ~1e-3 to bound rare-type rows
 
     #################################
     #   Numerics/Speed

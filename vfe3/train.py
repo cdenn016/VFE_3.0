@@ -34,6 +34,7 @@ except ImportError:                                 # tqdm optional: absent -> n
     _tqdm = None                                    # log lines still emit at log_interval as before
     _redirect_logging = contextlib.nullcontext
 
+from vfe3.attention_prior import get_prior_registration
 from vfe3.contracts import deferred_host_checks, is_vfe_model, model_family_of
 from vfe3.config import VFE3Config
 from vfe3.contracts import DataState, DataStateBuffer
@@ -48,8 +49,10 @@ from vfe3.gauge_optim import (
     project_phi_parameter_rows_,
 )
 from vfe3.geometry.phi_fisher import FisherRowStatistics, middle_fiber_moments
+from vfe3.table_optim import (TABLE_FISHER_DIAGNOSTIC_KEYS, TableFisherAdamW, TableFisherGaugeManifoldAdamW,
+                              TableFisherStatistics)
 from vfe3.metric_contracts import perplexity_from_ce
-from vfe3.metrics import LINK_SPECTRUM_KEYS, routing_triangle_defect_sums
+from vfe3.metrics import COLLAPSE_ENTROPY_FRACTION, LINK_SPECTRUM_KEYS, routing_triangle_defect_sums
 from vfe3.model.block import _as_coeff
 from vfe3.model.block_mlp import PrototypeAgentBlockMLP
 from vfe3.model.model import DiagnosticSnapshot, VFEModel
@@ -274,9 +277,18 @@ def build_optimizer(
     # mean sector. Applied to the same class sigma_wd covers (belief, untied decode) plus
     # the linear-decode projection, which is the mean-role twin of decode_log_scale.
     mu_wd = {} if cfg.mu_weight_decay is None else {"weight_decay": cfg.mu_weight_decay}
+    # decode_mu_weight_decay (default None = mu_wd): a separate decay for the decode-side mean tables only
+    # (untied decode means, linear readout weight), a Gaussian prior that bounds the rows of rarely-targeted
+    # types, which otherwise only receive the softmax push away from the queries (audit 2026-10-10, item 2).
+    decode_mu_wd = (mu_wd if cfg.decode_mu_weight_decay is None
+                    else {"weight_decay": cfg.decode_mu_weight_decay})
+    # m_table_update_mode='fisher' marks the type-prior tables for the natural-gradient step of
+    # vfe3.table_optim; their AdamW rates then only schedule that step and set its decoupled decay.
+    table_fisher = cfg.m_table_update_mode == "fisher"
     groups = []
     if pb.mu_embed is not None:
-        groups.append({"params": [pb.mu_embed], "lr": cfg.m_p_mu_lr, "role": "mu", **mu_wd})
+        groups.append({"params": [pb.mu_embed], "lr": cfg.m_p_mu_lr, "role": "mu", **mu_wd,
+                       **({"table_fisher": "mu"} if table_fisher else {})})
     # decode_log_scale is always frozen (requires_grad=False in VFEModel; the learned temperature was
     # retired 2026-10-02), so it joins no optimizer group and the readout temperature stays fixed.
     decode_mu_lr, decode_sigma_lr = _decode_learning_rates(cfg)
@@ -285,17 +297,19 @@ def build_optimizer(
                         if parameter is not None and parameter.requires_grad]
     if sigma_parameters:
         groups.append({"params": sigma_parameters, "lr": cfg.m_p_sigma_lr,
-                       "role": "sigma", **sigma_wd})
+                       "role": "sigma", **sigma_wd,
+                       **({"table_fisher": "sigma"} if table_fisher and sigma_parameters == [pb.sigma_log_embed]
+                          else {})})
     if phi_group is not None:
         groups.append(phi_group)
     if getattr(pb, "decode_mu_embed", None) is not None:        # untie_decode_bank=True decode tables
         # Cloned from the encode tables at init (step-0 byte-identical decode), trained separately so
         # the decode direction can decouple from the E-step prior/self-coupling target; grouped like
         # the tables they were cloned from unless their decoder rate overrides the fallback.
-        groups.append({"params": [pb.decode_mu_embed],        "lr": decode_mu_lr,    "role": "mu", **mu_wd})
+        groups.append({"params": [pb.decode_mu_embed],        "lr": decode_mu_lr,    "role": "mu", **decode_mu_wd})
         groups.append({"params": [pb.decode_sigma_log_embed], "lr": decode_sigma_lr, "role": "sigma", **sigma_wd})
     if pb.output_proj_weight is not None:                       # decode_mode='linear'
-        groups.append({"params": [pb.output_proj_weight], "lr": decode_mu_lr, "role": "mu", **mu_wd})
+        groups.append({"params": [pb.output_proj_weight], "lr": decode_mu_lr, "role": "mu", **decode_mu_wd})
     if pb.output_proj_bias is not None:                         # decode_bias: learned log-unigram prior
         # weight_decay=0 -- decaying a unigram prior toward zero biases it to a flat distribution
         # (the same protection phi/Omega carry).
@@ -405,6 +419,10 @@ def build_optimizer(
             f"train. Add them to a param group."
         )
 
+    table_kwargs = {}
+    if table_fisher:
+        table_kwargs = dict(statistics=TableFisherStatistics(pb), table_fisher_lr=cfg.m_table_fisher_lr,
+                            table_fisher_trust_radius=cfg.m_table_fisher_trust_radius)
     if phi_update_policy.requires_manifold_optimizer:
         # Stored phi factors use one mixed optimizer; every other group remains standard AdamW.
         #
@@ -420,9 +438,10 @@ def build_optimizer(
         #
         # NOT VERIFIED ON DEVICE: `fused` is a CUDA-only path, so this change cannot be exercised on
         # a CPU box. If a manifold run regresses, this line is the first thing to revert.
-        return GaugeManifoldAdamW(
+        return (TableFisherGaugeManifoldAdamW if table_fisher else GaugeManifoldAdamW)(
             groups,
             model.group,
+            **table_kwargs,
             phi_group_trust_radius=cfg.m_phi_group_trust_radius,
             phi_chart_max_norm=(
                 cfg.phi_mstep_max_matrix_norm
@@ -446,6 +465,8 @@ def build_optimizer(
     # fused AdamW (one CUDA kernel for the whole M-step) when the priors live on CUDA; it is
     # CUDA-only, so on a CPU box this is the standard AdamW. Per-group LRs are honored either way.
     use_fused = next(model.parameters()).is_cuda
+    if table_fisher:
+        return TableFisherAdamW(groups, weight_decay=cfg.weight_decay, fused=use_fused, **table_kwargs)
     return torch.optim.AdamW(groups, weight_decay=cfg.weight_decay, fused=use_fused)
 
 
@@ -1043,10 +1064,16 @@ def train_step(
         _fisher_provider = getattr(optimizer, "phi_statistics_provider", None)
         if _fisher_provider is not None:
             _fisher_provider.set_batch(tokens, _scored_det)
+        # m_table_update_mode='fisher': the table step's counts n_v and denominator N.
+        _table_provider = getattr(optimizer, "table_statistics_provider", None)
+        if _table_provider is not None:
+            _table_provider.set_batch(tokens, _scored_det)
         _scaler.step(optimizer)
         _scaler.update()
         if _fisher_provider is not None:
             _fisher_provider.set_batch(None, None)
+        if _table_provider is not None:
+            _table_provider.set_batch(None, None)
     did_step = not skip_step
     if scale_before is not None and float(_scaler.get_scale()) < scale_before:
         did_step = False
@@ -1186,6 +1213,26 @@ def _evaluation_totals_from_device(
     return total_nats_value, accounting
 
 
+def _require_causal_next_token_prior(
+    model: torch.nn.Module,
+) -> None:
+    r"""Refuse next-token training or scoring of a VFE model whose attention prior is not causal.
+
+    Under ``uniform``, ``alibi`` or ``windowed`` position :math:`i` attends to later tokens, so the
+    cross-entropy of target :math:`y_{i+1}` is scored by a model that reads it (audit 2026-10-10 #4). The
+    configuration admits these priors for forward-only studies; the baseline refuses them at construction
+    (``vfe3/baseline.py``), and a baseline model is not checked here, nor a model with no configured prior.
+    """
+    cfg = getattr(model, "cfg", None)
+    if not is_vfe_model(model) or getattr(cfg, "beta_attention_prior", None) is None:
+        return
+    if not get_prior_registration(cfg.beta_attention_prior).is_causal_for_next_token_scoring(cfg):
+        raise ValueError(
+            f"beta_attention_prior={cfg.beta_attention_prior!r} is not causal for next-token scoring: "
+            "each position would attend to the targets it is scored on. Train and evaluate with a prior "
+            "registered as causal (for example 'causal' or 'causal_alibi')")
+
+
 @torch.no_grad()
 def evaluate(
     model:  VFEModel,
@@ -1217,6 +1264,7 @@ def evaluate(
     and ``padding_targets`` counts the trailing run (the padded final window) plus every target of a
     row that scores none. Ignored targets between scored ones fall in neither count.
     """
+    _require_causal_next_token_prior(model)
     if device is None:
         device = next(model.parameters()).device
     was_training = model.training
@@ -1339,6 +1387,14 @@ def _eval_protocol_train_ce(
     return float(decode_stats.ce)
 
 
+# The model.diagnostics keys the training loop reads unconditionally (console line and metrics row); a
+# failed log-step diagnostic falls back to these as NaN, widened to the first metrics row's key set.
+_TRAIN_DIAGNOSTIC_FALLBACK_KEYS: Tuple[str, ...] = (
+    "attn_entropy", "self_coupling", "self_divergence", "belief_coupling", "attention_entropy",
+    "total", "effective_rank", "holonomy_deviation", "gauge_trace_spread",
+)
+
+
 # Fixed column set for the held-out per-eval probes (initialized to NaN before training and carried
 # forward like last_val, so every metrics.csv row carries the SAME columns -- rectangular -- whether
 # or not an eval has run yet). Config-conditional keys (val_head_redundancy_js needs >= 2 heads;
@@ -1348,7 +1404,8 @@ _VAL_DIAG_KEYS = (
     "val_inner_alignment_energy_total",
     "val_attn_entropy", "val_effective_rank", "val_belief_cond_median", "val_attn_entropy_min",
     "val_attn_entropy_min_all", "val_attn_entropy_min_norm",
-    "val_attn_collapsed_heads", "val_future_leakage", "val_row_sum_error",
+    "val_attn_collapsed_heads",        # per-head mean over the diagnostic windows (_collapsed_head_count)
+    "val_future_leakage", "val_row_sum_error",
     "val_pos_content_r2", "val_prev_token_mass", "val_period_match_mass", "val_head_redundancy_js",
     "estep_f_drop", "estep_f_nondecreasing_frac", "estep_f_comparisons",
     "estep_r_mu_last", "estep_r_sigma_last",
@@ -1472,7 +1529,7 @@ _GROUP_GRAD_ERROR_KEY = "_group_gradient_norm_error"     # private train_step ->
 # Held-out columns the conditional route now fills from its own capture (all members of _VAL_DIAG_KEYS).
 _CONDITIONAL_STRUCTURE_KEYS: Tuple[str, ...] = (
     "val_effective_rank", "val_belief_cond_median", "val_gauge_invariant_spread",
-    "val_attn_entropy_min_all", "val_attn_entropy_min_norm", "val_attn_collapsed_heads",
+    "val_attn_entropy_min_all", "val_attn_entropy_min_norm",
     "val_future_leakage", "val_row_sum_error", "val_pos_content_r2", "val_prev_token_mass",
     "val_period_match_mass", "val_head_redundancy_js",
     "pos_loss_first_q", "pos_loss_last_q", "pos_loss_ratio",
@@ -2482,6 +2539,28 @@ def _residual_and_attention_rows(
     return residual_rows, attention_rows
 
 
+def _collapsed_head_count(
+    attention_rows: Sequence[Mapping[str, float]],   # one evaluation's _residual_and_attention_rows rows
+) -> float:
+    r"""``val_attn_collapsed_heads``: the number of (layer, head) pairs whose mean normalized entropy is below
+    :data:`vfe3.metrics.COLLAPSE_ENTROPY_FRACTION`.
+
+    The mean is the ``entropy_norm`` of ``diagnostics/attention_stats.csv``, over every query row with at least
+    two admissible keys of the ``DIAGNOSTIC_WINDOWS`` fixed validation windows,
+
+    .. math::
+        \bar h_{lh} = \frac{1}{|R|}\sum_{(w,i)\in R}\frac{H(\beta^{lh}_{w,i\cdot})}{\log|S_{w,i}|}, \qquad
+        \#\{(l,h) : \bar h_{lh} < 0.5\}.
+
+    It replaces the count of heads with any single row below 0.5 on the first validation window, which
+    saturated (audit 2026-10-10 #15). NaN when no head has a scorable row.
+    """
+    means = [float(row["entropy_norm"]) for row in attention_rows if math.isfinite(float(row["entropy_norm"]))]
+    if not means:
+        return float("nan")
+    return float(sum(value < COLLAPSE_ENTROPY_FRACTION for value in means))
+
+
 def _wrap_prototype_blocks(
     model:        VFEModel,
     features_out: Dict[str, Any],
@@ -2619,7 +2698,9 @@ def _eval_cadence_diagnostics(
     expected fraction of the fixed sample the shuffled training stream has already served, since the
     sample is drawn independently of the epoch permutation. Before one pass the gap therefore compares
     validation with mostly unseen training text (audit 2026-10-07, F46); (2) ``diagnostics/residual_ratio.csv`` and
-    ``diagnostics/attention_stats.csv`` rows on the fixed validation windows; (3) with
+    ``diagnostics/attention_stats.csv`` rows on the fixed validation windows, and from the latter
+    ``val_attn_collapsed_heads`` (:func:`_collapsed_head_count`; returned beside the columns, NaN when the
+    capture fails, and filed by the caller with the held-out probes); (3) with
     ``count_numerics`` (projected routes), the S1 panel D per-evaluation counters of the same
     capture pass (``NUMERICS_EVAL_COLUMNS``, see :func:`_capture_numerics_counts`) and their
     per-(layer, head) rows in ``diagnostics/cap_activation.csv``; (4) the map snapshot
@@ -2627,7 +2708,7 @@ def _eval_cadence_diagnostics(
     still run (the counters are NaN when their shared capture pass fails; that failure is counted
     once, as ``residual_attention``). CPU and CUDA RNG states are restored on exit.
     """
-    out = {column: float("nan") for column in _EVAL_CADENCE_COLUMNS}
+    out = {column: float("nan") for column in (*_EVAL_CADENCE_COLUMNS, "val_attn_collapsed_heads")}
     rng_devices = [device] if device.type == "cuda" else []
     with torch.random.fork_rng(devices=rng_devices):
         if train_sample is not None:
@@ -2675,6 +2756,7 @@ def _eval_cadence_diagnostics(
                 except Exception as exc:
                     _record_diagnostic_failure(failures, "routing_holonomy", exc, logger)
             if residual_rows is not None:
+                out["val_attn_collapsed_heads"] = _collapsed_head_count(attention_rows)
                 try:
                     artifacts.append_diagnostic_rows(
                         "residual_ratio.csv", RESIDUAL_RATIO_FIELDS, residual_rows)
@@ -2912,11 +2994,12 @@ def _attention_structure_metrics(
     finite_hmin = hmin[torch.isfinite(hmin)]
     out["val_attn_entropy_min_all"] = (float(finite_hmin.min()) if finite_hmin.numel()
                                        else float("nan"))
-    worst_norm, collapsed = M.attention_head_collapse(amaps, support=support)    # (L, H) each
+    # val_attn_collapsed_heads is not scored here: one row of this one window flagged a head, so the
+    # count saturated (audit 2026-10-10 #15). It comes from the diagnostic windows (_collapsed_head_count).
+    worst_norm, _ = M.attention_head_collapse(amaps, support=support)           # (L, H)
     finite_norm = worst_norm[torch.isfinite(worst_norm)]
     out["val_attn_entropy_min_norm"] = (float(finite_norm.min()) if finite_norm.numel()
                                         else float("nan"))
-    out["val_attn_collapsed_heads"] = float(collapsed.float().sum())
     cs = M.causal_sanity(amaps)
     out["val_future_leakage"] = float(cs["future_leakage"].max())   # soft causal prior can leak silently
     out["val_row_sum_error"]  = float(cs["row_sum_error"].max())
@@ -2971,16 +3054,20 @@ def _val_diagnostics_one(
     into a NaN-initialized dict, so the CSV stays rectangular.
 
     Conditional (relational) route: the attention-structure columns (``val_attn_entropy_min_all``,
-    ``val_attn_entropy_min_norm``, ``val_attn_collapsed_heads``, ``val_future_leakage``,
+    ``val_attn_entropy_min_norm``, ``val_future_leakage``,
     ``val_row_sum_error``, ``val_pos_content_r2``, ``val_prev_token_mass``,
     ``val_period_match_mass``, ``val_head_redundancy_js``) are computed on the actual pre-update
-    router ``snapshot.beta_maps`` of the same capture, the ``pos_loss_*`` columns on its logits, and
+    router ``snapshot.beta_maps`` of the same capture (``val_attn_collapsed_heads`` is not: the
+    eval-cadence pass scores it on the diagnostic windows, :func:`_collapsed_head_count`), the
+    ``pos_loss_*`` columns on its logits, and
     ``val_effective_rank`` / ``val_belief_cond_median`` from the last layer's converged covariance
     (as the relational diagnostics report them). The following stay NaN on this route, by definition
     rather than by omission: the legacy free-energy decomposition (``val_self_coupling``,
     ``val_self_divergence``, ``val_belief_coupling``, ``val_attention_entropy``,
     ``val_inner_alignment_energy_total``), because routing plus readout does not define the shared
-    stationary objective; the E-step certificate (``estep_*`` except ``estep_f_comparisons = 0``),
+    stationary objective (``diagnose_canonical_free_energy`` fills them, per token, with the canonical
+    free energy at the beliefs the last router read, and adds ``val_canonical_beta_tv``); the E-step
+    certificate (``estep_*`` except ``estep_f_comparisons = 0``),
     because the route performs one pre-update readout with no iterate sequence; and the held-out
     geometry/guard columns (``val_holonomy_wilson``, ``val_cocycle_residual``,
     ``val_gauge_invariant_spread``, ``val_fisher_trace_mean``, ``val_belief_cond_p95``,
@@ -3008,6 +3095,10 @@ def _val_diagnostics_one(
     out["val_attn_entropy"] = vd["attn_entropy"]
     out["val_attn_entropy_min"] = vd["attn_entropy_min"]
     out["val_belief_cond_median_layer_max"] = float(vd.get("belief_cond_median_layer_max", float("nan")))
+    if "canonical_beta_tv" in vd:                               # diagnose_canonical_free_energy
+        out.update(val_self_coupling=vd["self_coupling"], val_self_divergence=vd["self_divergence"],
+                   val_belief_coupling=vd["belief_coupling"], val_attention_entropy=vd["attention_entropy"],
+                   val_inner_alignment_energy_total=vd["total"], val_canonical_beta_tv=vd["canonical_beta_tv"])
     out["estep_f_comparisons"] = 0.0
     out["estep_f_drop"] = float("nan")
     if diagnostic_targets is not None:
@@ -3457,6 +3548,7 @@ def train(
     # Never expose a stale result after a partial/resumed run or a failed call.
     if _final_validation_out is not None:
         _final_validation_out.clear()
+    _require_causal_next_token_prior(model)
     terminal_validation_signature = None
     terminal_validation_metrics = None
     optimizer = build_optimizer(model, cfg)
@@ -3744,7 +3836,11 @@ def train(
             val_diag_keys = val_diag_keys + _VAL_LATENT_DIAG_KEYS
     if vfe_model and getattr(cfg, "predictive_readout", "kernel") == "minimal_agent":
         val_diag_keys = val_diag_keys + _VAL_MINIMAL_AGENT_DIAG_KEYS
+    if vfe_model and getattr(cfg, "diagnose_canonical_free_energy", False):
+        val_diag_keys = val_diag_keys + ("val_canonical_beta_tv",)
     last_val_diag: Dict[str, float] = {k: float("nan") for k in val_diag_keys}
+    diag_keys: Optional[Tuple[str, ...]] = None      # model.diagnostics keys the first metrics row carried
+    diag_keys_from_failure = False                   # ... and whether that row's diagnostics had failed
     # Training-time diagnostic state (audit 2026-09-28). Built only for a persisted run; the silent
     # path and the console-only path allocate nothing here.
     diagnostics_failures: Dict[str, int] = {}
@@ -3851,6 +3947,8 @@ def train(
         # device-side partition/zero-count predicates ride the existing scalar barrier.
         step_metrics: Optional[Dict[str, float]] = {} if (do_log or do_csv) else None
         phase_ms: Dict[str, float] = {}                       # LOG_TIMING_COLUMNS of this step
+        if hasattr(optimizer, "_collect_table_diag"):        # m_table_update_mode='fisher' step health
+            optimizer._collect_table_diag = bool(do_log or do_csv or do_eval)
         if hasattr(optimizer, "_collect_gauge_diag"):        # D1/EXP-8: sparse log/eval diagnostics
             optimizer._collect_gauge_diag = bool(do_log or do_csv or do_eval)
             if optimizer._collect_gauge_diag:
@@ -3869,19 +3967,27 @@ def train(
             train_features: Optional[Dict[str, Any]] = {} if do_csv else None
             wrapped_templates = (_wrap_prototype_blocks(model, train_features)
                                  if train_features is not None else [])
+            diag_failed = False
             try:
                 d = model.diagnostics(tokens)
             except Exception as exc:                         # optional probes cannot stop training
                 _record_diagnostic_failure(diagnostics_failures, "training_diagnostics", exc, logger)
-                d = {key: float("nan") for key in (
-                    "attn_entropy", "self_coupling", "self_divergence", "belief_coupling",
-                    "attention_entropy", "total", "effective_rank", "holonomy_deviation",
-                    "gauge_trace_spread",
-                )}
+                d = {key: float("nan") for key in _TRAIN_DIAGNOSTIC_FALLBACK_KEYS}
+                diag_failed = True
                 train_features = None
             finally:
                 for mlp in wrapped_templates:
                     del mlp.forward_moments                  # back to the class method
+            if do_csv:
+                # log_metrics refuses a changed field set, so the short fallback above aborted the run at
+                # the next metrics.csv write (audit 2026-10-10 #16). The first metrics row fixes the
+                # diagnostics key set; a failed row carries every key of it as NaN (blank cells). A
+                # failure on the first row fixes the fallback set, and later rows keep to it.
+                if diag_keys is None:
+                    diag_keys = tuple(d)
+                    diag_keys_from_failure = diag_failed
+                elif diag_failed or diag_keys_from_failure:
+                    d = {key: d.get(key, float("nan")) for key in diag_keys}
             if train_features:
                 try:
                     _, template_rows = _feature_rows(model, train_features, step + 1)
@@ -4091,7 +4197,17 @@ def train(
                 phase_ms["eval_val_diagnostics_ms"] = _synced_ms(device) - _t0
                 _t0 = _synced_ms(device)
                 try:
-                    artifacts.maybe_save_best(step + 1, model, m["ppl"])
+                    # Best-effort like the periodic checkpoint below (audit 2026-10-10 #17): a transient
+                    # torch.save failure ("ios_base::badbit set") aborted the run. maybe_save_best
+                    # advances best_val_ppl only after the file is replaced, so the record keeps
+                    # matching best_model.pt and the next eval that beats it retries the save.
+                    try:
+                        artifacts.maybe_save_best(step + 1, model, m["ppl"])
+                    except Exception as exc:
+                        logger.warning("       (best_model.pt save at step %d failed: %s); training "
+                                       "continues, the next improving eval retries", step + 1, exc)
+                        diagnostics_failures["best_model_save"] = (
+                            diagnostics_failures.get("best_model_save", 0) + 1)
                     # Per-layer/per-head attention heatmap grid for this eval (off the graph, seq 0
                     # of the held-out batch). Kept at EVAL cadence (one grid per eval, not per log),
                     # and guarded so replay errors remain nonfatal (audit 2026-07-01 F11).
@@ -4126,6 +4242,9 @@ def train(
                 except Exception as exc:
                     _record_diagnostic_failure(diagnostics_failures, "eval_cadence", exc, logger)
                     last_train_sample = {column: float("nan") for column in _EVAL_CADENCE_COLUMNS}
+                # A held-out probe scored on the diagnostic windows of the pass above (audit 2026-10-10 #15).
+                last_val_diag["val_attn_collapsed_heads"] = last_train_sample.pop(
+                    "val_attn_collapsed_heads", float("nan"))
                 phase_ms["eval_cadence_ms"] = _synced_ms(device) - _t0
             torch.set_rng_state(eval_cpu_rng)            # F30: hand the training stream back untouched
 
@@ -4171,12 +4290,11 @@ def train(
         # step where the eval above just ran (do_eval); on the denser log-interval rows in between they
         # are NaN, which log_metrics renders as a BLANK cell -- so each validation appears exactly once
         # per eval_interval, not carried forward to every log line. The
-        # in-memory history keeps the NaN (figures already drop non-finite rows). The four F-stack
-        # diagnostics are per-sequence SUMS over seq 0, normalized to PER TOKEN so they are
-        # commensurate with val_ce, a token-weighted mean (nats/token; see audit-2026-06-05 Finding 2).
+        # in-memory history keeps the NaN (figures already drop non-finite rows). The F-stack
+        # diagnostics (NaN unless diagnose_canonical_free_energy) arrive as PER-TOKEN means over the
+        # batch, commensurate with val_ce, a token-weighted mean (nats/token; audit-2026-06-05 Finding 2).
         if do_csv:
             _row_t0 = _synced_ms(device)
-            n_tok = max(int(tokens.shape[1]), 1)
             raw_lrs = scheduler.get_last_lr()
             lrs = (_learning_rates_by_role(optimizer.param_groups, raw_lrs) if vfe_model
                    else _learning_rates_by_role(optimizer.param_groups, raw_lrs, required=("mu",)))
@@ -4203,11 +4321,11 @@ def train(
                 "val_scored_targets": (last_val["scored_targets"] if do_eval else float("nan")),
                 "val_excluded_targets": (last_val["excluded_targets"] if do_eval else float("nan")),
                 "attn_entropy":       d["attn_entropy"],
-                "self_coupling":      d["self_coupling"]     / n_tok,   # alpha-regularized F self-term sum_i[alpha_i D + R(alpha_i)]
-                "self_divergence":    d["self_divergence"]   / n_tok,   # raw sum_i D(q_i||p_i) drift; == self_coupling only at lambda_alpha_mode='constant'
-                "belief_coupling":    d["belief_coupling"]   / n_tok,
-                "attention_entropy":  d["attention_entropy"] / n_tok,
-                "inner_alignment_energy_total": d["total"]  / n_tok,
+                "self_coupling":      d["self_coupling"],     # alpha-regularized F self-term alpha_i D + R(alpha_i)
+                "self_divergence":    d["self_divergence"],   # raw D(q_i||p_i) drift; == self_coupling only at lambda_alpha_mode='constant'
+                "belief_coupling":    d["belief_coupling"],
+                "attention_entropy":  d["attention_entropy"],
+                "inner_alignment_energy_total": d["total"],
                 # Weights emitted alongside the RAW per-term fields (audit 2026-07-25 F7): those
                 # fields are deliberately unweighted while "total" routes through the weighted
                 # evaluator, so a naive column sum missed the total by up to 98% relative at
@@ -4275,7 +4393,8 @@ def train(
                         "phi_matrix_norm_median", "phi_matrix_norm_p95", "phi_matrix_norm_p99",
                         "phi_matrix_norm_max",
                         "vertex_cond_median", "vertex_cond_p95", "vertex_cond_p99",
-                        "pos_phi_matrix_norm_p95", "pos_phi_matrix_norm_p99", "pos_phi_matrix_norm_max"):
+                        "pos_phi_matrix_norm_p95", "pos_phi_matrix_norm_p99", "pos_phi_matrix_norm_max",
+                        "canonical_beta_tv"):        # diagnose_canonical_free_energy only
                 if _dk in d:
                     row[_dk] = d[_dk]
             # Gradient health (Tier-1/2): global + per-group (mu/sigma/phi) grad AND weight norms (so
@@ -4320,6 +4439,9 @@ def train(
             # optimizer computes and host-reduces them only on this gated log/eval attempt; missing
             # active rows emit NaN placeholders so metrics.csv remains rectangular. Plain AdamW has
             # no _gauge_diag attribute.
+            if hasattr(optimizer, "_table_diag"):             # fixed key set under m_table_update_mode='fisher'
+                for _pk in TABLE_FISHER_DIAGNOSTIC_KEYS:
+                    row[_pk] = (optimizer._table_diag or {}).get(_pk, float("nan"))
             if hasattr(optimizer, "_gauge_diag"):
                 _gd = optimizer._gauge_diag or {}
                 if any(group.get("pullback_group", False) for group in optimizer.param_groups):

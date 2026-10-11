@@ -6,8 +6,9 @@ r"""Frozen, fully connected Gaussian receiver forces.
 Two receiver laws share one quadratic energy family (projected_gradient.tex, Eq. quadratic_family).
 ``ambient_alignment`` aligns the receiver to K-dimensional noisy receiving laws and counts the
 receiver entropy c = alpha + sum_h lambda_h times. ``channel_likelihood`` scores the receiver's
-partial law O_h^T xi_i against the sender's d-dimensional message as an expected likelihood and
-counts it once (c = alpha).
+partial law P_h xi_i against the sender's d-dimensional message as an expected likelihood and
+counts it once (c = alpha); the measurement P_h is the adjoint O'_h^T or, under
+``receiver_measurement='inverse'``, the head-h rows of O'^{-1}.
 
 A state-dependent self-coupling alpha*(D) = c0/(b0 + D), D = KL(q_i||p_i) (summed per token, or per
 local coordinate on the diagonal family), is profiled out (projected_gradient.tex, Sec. profiled
@@ -18,7 +19,7 @@ existing closed form.
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -26,7 +27,7 @@ from vfe3.alpha_i import alpha_gradient_coefficient
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.free_energy import attention_weights
 from vfe3.gradients.relational import clamped_routing_cost, relational_score
-from vfe3.model.relational_operators import RelationalOperators
+from vfe3.model.relational_operators import RelationalOperators, _chart_operands
 from vfe3.relational_scoring import _compute_dtype
 from vfe3.runtime import ieee_fp32_matmul
 
@@ -345,6 +346,31 @@ def _local_pullback(
     return .5 * (local + local.transpose(-1, -2)), local_eta
 
 
+def _inverse_measurement_runs(
+    T_runs: Sequence[torch.Tensor],         # per run (n_r, d_r, K) sending maps
+    O_runs: Sequence[torch.Tensor],         # per run (n_r, K, d_r) effective receiving maps O'_h
+    dtype:  torch.dtype,
+) -> List[torch.Tensor]:                    # per run (n_r, d_r, K) measurements P_h
+    r"""Dual receiving measurements: the head-h rows of the inverse of the column stack O'.
+
+    .. math::
+        O'=[O'_1,\dots,O'_H]\in\mathbb{R}^{K\times K},\qquad
+        P=\begin{bmatrix}P_1\\\vdots\\P_H\end{bmatrix}=O'^{-1},\qquad P_hO'_g=\delta_{hg}I_{d_h}.
+
+    One float64 K x K inversion per context build (as the non-affine charts invert T), cast to
+    ``dtype``. ``inv_ex`` takes no host sync, so a singular O' yields non-finite measurements.
+    """
+    _, O_stack = _chart_operands(T_runs, O_runs)                           # (K, K) float64, columns by head
+    inverse = torch.linalg.inv_ex(O_stack).inverse.to(dtype)               # (K, K), rows by head
+    K = inverse.shape[-1]
+    out, start = [], 0
+    for O in O_runs:
+        n, d = O.shape[0], O.shape[2]
+        out.append(inverse[start:start + n * d].reshape(n, d, K))          # (n_r, d_r, K)
+        start += n * d
+    return out
+
+
 def build_full_link_context(
     mu:             torch.Tensor,            # (..., N, K), incoming source/query snapshot
     sigma:          torch.Tensor,            # (..., N, K) or (..., N, K, K)
@@ -378,12 +404,22 @@ def build_full_link_context(
             +\sum_{h,j}\lambda_h\beta_{ij}^{(h)}R_{ij}^{(h)-1}m_{ij}^{(h)},
         c_i=\alpha+\sum_{h,j}\lambda_h\beta_{ij}^{(h)}.
 
-    ``channel_likelihood`` pools d x d blocks W_ih = sum_j w R_hj^{-1}, lifts them through the tied
-    receiving measurement P_h = O_h^T, and counts the entropy once:
+    ``channel_likelihood`` pools d x d blocks W_ih = sum_j w R_hj^{-1} and natural means
+    w_ih = sum_j w R_hj^{-1} v_hj, lifts them through the receiving measurement P_h (d x K) of
+    xi_i, and counts the entropy once:
 
     .. math::
-        \Lambda_i=\alpha\Sigma_{p,i}^{-1}+U_i^{-\top}\Bigl(\sum_hO_hW_{ih}O_h^\top\Bigr)U_i^{-1},
+        \Lambda_i=\alpha\Sigma_{p,i}^{-1}+U_i^{-\top}\Bigl(\sum_hP_h^\top W_{ih}P_h\Bigr)U_i^{-1},
+        \qquad \eta_i=\alpha\Sigma_{p,i}^{-1}\mu_{p,i}+U_i^{-\top}\sum_hP_h^\top w_{ih},
         \qquad c_i=\alpha.
+
+    ``operators.receiver_measurement`` selects P_h. ``"adjoint"`` (the default) is P_h = O_h'^T, the
+    adjoint of the effective receiving map O'_h of ``content_link_chart``. ``"inverse"`` is the dual
+    measurement, the head-h rows of O'^{-1} for the square column stack O' (sum_h d_h = K), so
+    P_h O'_g = delta_hg I. The two agree only for orthogonal O'. With equal channel precisions
+    W_ih = w I, the inverse measurement's minimizer tends as alpha -> 0 to the kernel mean
+    U_i sum_h O'_h sum_j beta_ij^h T_h xi_j, and it is invariant under (U, T, S, O') -> (U h, T h, S h,
+    h^{-1} O'); the adjoint's minimizer is neither.
 
     Neither source nor router is detached. Reuse this context with independent
     receiver arguments to get inner partials while preserving the outer graph.
@@ -435,6 +471,9 @@ def build_full_link_context(
         content = operators.content_factor_runs()                  # per-run (T, O') once per context build
         source_precision, source_eta = _source_channel(
             mu_work, sigma_work, channel_frame, operators, receiver_noise, dtype, content)
+        # Dual measurement: per-run head rows of O'^{-1}, one K x K inverse per context build.
+        measurement = (_inverse_measurement_runs(*content, dtype) if channel and getattr(
+            operators, "receiver_measurement", "adjoint") == "inverse" else None)
         # Heads pool run by run (one run for equal heads); the pooled K x K precision and K-vector sum.
         pooled_precision = pooled_eta = None
         for run, (precision_r, eta_r, O) in enumerate(zip(source_precision, source_eta, content[1])):
@@ -442,9 +481,14 @@ def build_full_link_context(
             if channel:
                 pooled_W = torch.einsum("...hij,...jhst->...ihst", weights_r, precision_r)  # (..., I, n_r, d_r, d_r)
                 pooled_w = torch.einsum("...hij,...jhs->...ihs", weights_r, eta_r)          # (..., I, n_r, d_r)
-                O = O.to(dtype)                                                  # O' of content_link_chart
-                precision_term = torch.einsum("hks,...ihst,hmt->...ikm", O, pooled_W, O)    # (..., I, K, K)
-                eta_term = torch.einsum("hks,...ihs->...ik", O, pooled_w)                   # (..., I, K)
+                if measurement is None:                                          # adjoint: P_h = O'_h^T
+                    O = O.to(dtype)                                              # O' of content_link_chart
+                    precision_term = torch.einsum("hks,...ihst,hmt->...ikm", O, pooled_W, O)    # (..., I, K, K)
+                    eta_term = torch.einsum("hks,...ihs->...ik", O, pooled_w)                   # (..., I, K)
+                else:                                                            # inverse: rows of O'^{-1}
+                    P = measurement[run]                                         # (n_r, d_r, K)
+                    precision_term = torch.einsum("hsk,...ihst,htm->...ikm", P, pooled_W, P)    # (..., I, K, K)
+                    eta_term = torch.einsum("hsk,...ihs->...ik", P, pooled_w)                   # (..., I, K)
             else:
                 precision_term = torch.einsum("...hij,...jhkm->...ikm", weights_r, precision_r)
                 eta_term = torch.einsum("...hij,...jhk->...ik", weights_r, eta_r)

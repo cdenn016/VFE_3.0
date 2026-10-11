@@ -102,6 +102,10 @@ _ENGLISH_ONLY_SINGLE_RUN_FIGURES = frozenset({
 HISTORY_FIGURES = ("learning_curves", "attention_stats", "attention_stats_training", "residual_ratio")
 # History figures of opt-in features, drawn only when their eval-cadence table exists (vfe3.viz.feature_figures).
 FEATURE_HISTORY_FIGURES = ("minimal_agent_heads", "prototype_templates")
+# Per-head routing-cap and holonomy figures (diagnostics/cap_activation.csv, cap_clamped_rows.csv,
+# routing_holonomy.csv; vfe3.viz.figures.routing_head_table), drawn when any of the tables exists.
+ROUTING_HISTORY_FIGURES = ("routing_heads", "routing_heads_training")
+_ROUTING_HISTORY_TABLES = ("cap_activation.csv", "cap_clamped_rows.csv", "routing_holonomy.csv")
 # Report tokens the end-of-run feature probes replay (vfe3.posthoc.feature_probes); the prototype gap reruns the
 # block in the other inference mode on at most FEATURE_GAP_TOKENS of them.
 FEATURE_PROBE_TOKENS = 4096
@@ -569,6 +573,23 @@ def _tokens_per_step(run_dir: Path, cfg: Optional[VFE3Config]) -> Optional[float
         return None
 
 
+def _residual_additive(run_dir: Path, cfg: Optional[VFE3Config]) -> bool:
+    r"""``vfe3.train._residual_update_is_additive`` of the run (from ``cfg``, else its ``config.json``).
+
+    Selects the residual-ratio titles (audit 2026-10-10 #34); True, the additive title, when no
+    config is readable.
+    """
+    from types import SimpleNamespace
+    from vfe3.train import _residual_update_is_additive
+
+    if cfg is None:
+        try:
+            cfg, _ = _load_config(run_dir)
+        except (OSError, KeyError, TypeError, ValueError):
+            return True
+    return bool(_residual_update_is_additive(SimpleNamespace(cfg=cfg)))   # the rule reads model.cfg only
+
+
 def generate_history_figures(
     run_dir: 'str | Path',
 
@@ -584,6 +605,8 @@ def generate_history_figures(
     ``diagnostics/attention_stats.csv``; ``residual_ratio`` reads ``diagnostics/residual_ratio.csv``.
     :data:`FEATURE_HISTORY_FIGURES` (``minimal_agent_heads``, ``prototype_templates``) are drawn only when their
     tables exist; ``prototype_templates`` also overlays the log-cadence ``diagnostics/prototype_templates_train.csv``.
+    :data:`ROUTING_HISTORY_FIGURES` (``routing_heads``, ``routing_heads_training``) read the per-head
+    ``diagnostics/cap_activation.csv``, ``cap_clamped_rows.csv`` and ``routing_holonomy.csv``.
     Each figure is written only when its table exists and holds data; otherwise the skip reason is
     logged. ``cfg`` supplies the token axis of runs without ``tokens_seen`` (default: the run's
     ``config.json``). Returns the figure paths written.
@@ -606,7 +629,8 @@ def generate_history_figures(
             lambda p: figs.plot_attention_stats_training(attention_table, path=p)),
         "residual_ratio": (
             residual_table, "diagnostics/residual_ratio.csv",
-            lambda p: figs.plot_residual_ratio(residual_table, path=p)),
+            lambda p: figs.plot_residual_ratio(residual_table, additive=_residual_additive(run_dir, cfg),
+                                               path=p)),
     }
     from vfe3.viz import feature_figures
     feature_jobs = {
@@ -621,8 +645,10 @@ def generate_history_figures(
             feature_jobs["prototype_templates"][0] or {},
             lambda tab, path, _train=template_train_table: feature_figures.plot_prototype_templates(
                 tab or None, train_table=_train, path=path))
+    routing_table = figs.routing_head_table(
+        *(figs.read_long_table(run_dir / "diagnostics" / name) for name in _ROUTING_HISTORY_TABLES))
     if (all(table is None for table, _, _ in jobs.values())
-            and all(table is None for table, _ in feature_jobs.values())):
+            and all(table is None for table, _ in feature_jobs.values()) and routing_table is None):
         logger.info("history figures skipped: no metrics.csv or diagnostics tables in %s", run_dir)
         return []
     figdir = prepare_owned_output_child(run_dir, "figures", role="single-run figure")
@@ -642,6 +668,15 @@ def generate_history_figures(
             path = _write_figure(figdir, name, lambda p, b=builder, tab=table: b(tab, path=p), logger)
             if path is not None:
                 written.append(path)
+    routing_builders = {"routing_heads": figs.plot_routing_heads,
+                        "routing_heads_training": figs.plot_routing_heads_training}
+    for name in ROUTING_HISTORY_FIGURES:
+        if routing_table is None:
+            logger.info("figure %r skipped (no diagnostics/%s)", name, ", ".join(_ROUTING_HISTORY_TABLES))
+            continue
+        path = _write_figure(figdir, name, lambda p, b=routing_builders[name]: b(routing_table, path=p), logger)
+        if path is not None:
+            written.append(path)
     return written
 
 
@@ -1053,7 +1088,8 @@ def generate_figures(
     residual_table = figs.read_long_table(run_dir / "diagnostics" / "residual_ratio.csv")
     _emit("per_layer_diagnostics",                               # the depth axis the aggregates collapse
           lambda p: figs.plot_per_layer_diagnostics(
-              per_layer, residual_ratio=residual_table, covariance_frozen=frozen_covariance, path=p),
+              per_layer, residual_ratio=residual_table, covariance_frozen=frozen_covariance,
+              residual_additive=_residual_additive(run_dir, cfg), path=p),
           "per_layer_diagnostics.png" in planned_figures)
     _emit("head_block_norms",
           lambda p: figs.plot_head_block_norms(block_norms, path=p),

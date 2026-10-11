@@ -15,7 +15,7 @@ import os
 from pathlib import Path
 from threading import Event, RLock
 from types import TracebackType
-from typing import Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from uuid import uuid4
 
 import matplotlib
@@ -2559,13 +2559,31 @@ def _long_rows(
     return tuple(out)
 
 
-def _residual_ratio_training_panel(table: Mapping[str, object]) -> Optional[Dict[str, object]]:
+def _residual_ratio_label(additive: bool) -> Tuple[str, str]:
+    r"""``(name, symbol)`` of the ``residual_ratio.csv`` quantity.
+
+    :math:`\lVert m_i\rVert/\lVert\mu_i\rVert` when the layer update is additive (``mu + m``); without an
+    additive residual (``vfe3.train._residual_update_is_additive`` False: the predictive-content kernel
+    readout with ``attention_residual=False``) the probe records the displacement ratio
+    :math:`\lVert\mu^{\rm out}_i-\mu_i\rVert/\lVert\mu_i\rVert` (audit 2026-10-10 #34).
+    """
+    return (("Residual ratio", r"$\|m_i\|/\|\mu_i\|$") if additive
+            else ("Displacement ratio", r"$\|\mu^{\rm out}_i-\mu_i\|/\|\mu_i\|$"))
+
+
+def _residual_ratio_training_panel(
+    table:    Mapping[str, object],
+
+    *,
+    additive: bool = True,               # vfe3.train._residual_update_is_additive of the run
+) -> Optional[Dict[str, object]]:
     r"""Dashboard panel of the per-layer median residual ratio over training.
 
     ``table`` is ``diagnostics/residual_ratio.csv`` as columns (step, layer, q10, q50, q90, ...).
     The plotted quantity is the per-token median over the fixed validation windows of
     :math:`\lVert m_i\rVert/\lVert\mu_i\rVert`, the attention message relative to the layer's input
-    mean. Returns None when the table has no finite median.
+    mean, or the displacement ratio when the update is not ``additive`` (:func:`_residual_ratio_label`).
+    Returns None when the table has no finite median.
     """
     steps, layers, q50 = _long_rows(table, "q50")
     if not np.isfinite(q50).any():
@@ -2582,7 +2600,7 @@ def _residual_ratio_training_panel(table: Mapping[str, object]) -> Optional[Dict
         key = f"residual_ratio_q50_layer{int(layer)}"
         data[key] = column
         series.append((key, f"layer {int(layer)}", colors[int(layer)]))
-    return {"title": r"Residual ratio $\|m_i\|/\|\mu_i\|$ (token median)", "ylabel": "ratio",
+    return {"title": "{} {} (token median)".format(*_residual_ratio_label(additive)), "ylabel": "ratio",
             "logy": True, "data": data, "series": series}
 
 
@@ -2645,8 +2663,11 @@ def _readout_panels(
     panels += [
         {"title": "Content-link spectrum (similarity invariant)", "ylabel": r"$|\lambda|$", "logy": True,
          "series": [("relational_link_spectral_radius_max", r"max head $\rho(T_hO_h)$", _CB[0]),
-                    ("relational_link_selfloop_spectral_radius_max", "self-loop, max over tokens", _CB[1]),
-                    ("relational_link_selfloop_spectral_radius_mean", "self-loop, token mean", _CB[2]),
+                    # vfe3.metrics.content_link_spectrum: at most SELFLOOP_RADIUS_SAMPLE (256) evenly spaced
+                    # tokens (plus the D_i = I tokens), so the max bounds the all-token max from below.
+                    ("relational_link_selfloop_spectral_radius_max",
+                     "self-loop, max over a 256-token subsample (lower bound)", _CB[1]),
+                    ("relational_link_selfloop_spectral_radius_mean", "self-loop, subsample mean", _CB[2]),
                     ("relational_link_min_abs_eigenvalue", r"min head $|\lambda|$", _CB[3])]},
         {"title": "Composition defect (spectral)", "ylabel": "distance",
          "series": [("relational_link_unit_distance_max", r"max $|\lambda-1|$", _CB[0]),
@@ -2662,16 +2683,18 @@ def plot_readout_diagnostics(
     *,
     residual_ratio:    Optional[Mapping[str, object]] = None,   # diagnostics/residual_ratio.csv columns
     covariance_frozen: bool                           = False,
+    residual_additive: bool                           = True,   # vfe3.train._residual_update_is_additive
     path:              Optional[str]                  = None,
 ) -> object:
     r"""Plot captured routing, the residual ratio, and Gaussian conditioning with no shared-F claim.
 
     With ``residual_ratio`` (the long-format table of :func:`read_long_table`) the displacement panel
-    is the per-layer token-median ratio :math:`\lVert m_i\rVert/\lVert\mu_i\rVert` over training;
+    is the per-layer token-median ratio :math:`\lVert m_i\rVert/\lVert\mu_i\rVert` over training
+    (titled as the displacement ratio when ``residual_additive`` is False, :func:`_residual_ratio_label`);
     without it the legacy unnormalized final-layer displacement is drawn and labeled as such.
     ``covariance_frozen`` drops the receiver-covariance panels (constant on that route).
     """
-    residual_panel = (_residual_ratio_training_panel(residual_ratio)
+    residual_panel = (_residual_ratio_training_panel(residual_ratio, additive=residual_additive)
                       if residual_ratio is not None else None)
     return _history_dashboard(history, _readout_panels(covariance_frozen, residual_panel),
                               "Routing and readout diagnostics", path, ncols=2)
@@ -3116,6 +3139,10 @@ def plot_attention_stats(
     *,
     step:  Optional[float] = None,       # evaluation step to show (default: the last one)
     path:  Optional[str]   = None,
+
+    specs:  Sequence[Tuple[str, str, Optional[Tuple[float, float]]]] = _ATTENTION_STATS,
+    title:  str = "Attention statistics by layer and head",
+    source: str = "attention_stats.csv",
 ):
     r"""Per-layer, per-head attention statistics at one evaluation (S2 panel B), as heatmaps.
 
@@ -3124,19 +3151,21 @@ def plot_attention_stats(
     mean attention distance :math:`\sum_j\beta_{ij}|i-j|`, the self-weight :math:`\beta_{ii}`, and the
     overlap :math:`\sum_j\min(\beta_{ij},\beta^{\mathrm{prior}}_{ij})` with the attention of the
     log-prior alone (1 means the prior explains the pattern). Bounded statistics share the [0, 1]
-    color range so layers and runs compare directly.
+    color range so layers and runs compare directly. ``specs`` (column, label, color bounds),
+    ``title`` and ``source`` let another long ``(step, layer, head)`` table reuse the layout
+    (:func:`plot_routing_heads`).
     """
     steps = _np(table["step"]).astype(float)
     finite_steps = steps[np.isfinite(steps)]
     if not finite_steps.size:
-        raise FigureSkipped("attention_stats.csv has no rows")
+        raise FigureSkipped(f"{source} has no rows")
     shown = float(finite_steps.max()) if step is None else float(step)
     rows = (steps == shown) & np.isfinite(_np(table["layer"]).astype(float)) \
         & np.isfinite(_np(table["head"]).astype(float))
-    stats = [spec for spec in _ATTENTION_STATS
+    stats = [spec for spec in specs
              if spec[0] in table and np.isfinite(_np(table[spec[0]]).astype(float)[rows]).any()]
     if not stats:
-        raise FigureSkipped(f"attention_stats.csv has no finite statistic at step {shown:.0f}")
+        raise FigureSkipped(f"{source} has no finite statistic at step {shown:.0f}")
     grids = [(spec, _layer_head_grid(table, spec[0], rows)) for spec in stats]
     n_layers, n_heads = grids[0][1].shape
     annotate = n_layers * n_heads <= 48
@@ -3169,7 +3198,7 @@ def plot_attention_stats(
         n_query = _np(table["n_rows"]).astype(float)[rows] if "n_rows" in table else np.array([])
         suffix = (f", {int(np.nanmedian(n_query)):,} query rows per head"
                   if n_query.size and np.isfinite(n_query).any() else "")
-        fig.suptitle(f"Attention statistics by layer and head (step {shown:,.0f}{suffix})")
+        fig.suptitle(f"{title} (step {shown:,.0f}{suffix})")
         fig.tight_layout()
         return _save(fig, path)
 
@@ -3180,21 +3209,26 @@ def plot_attention_stats_training(
 
     *,
     path:  Optional[str] = None,
+
+    specs:  Sequence[Tuple[str, str, Optional[Tuple[float, float]]]] = _ATTENTION_STATS,
+    title:  str = "Attention statistics over training",
+    source: str = "attention_stats.csv",
 ):
     r"""The attention statistics of :func:`plot_attention_stats` over training.
 
     For each statistic and layer, the line is the mean over heads and the band spans the heads'
     minimum and maximum, so both the layer trend and the spread between heads are visible. Raises
-    :class:`FigureSkipped` with fewer than two evaluation steps.
+    :class:`FigureSkipped` with fewer than two evaluation steps. ``specs``, ``title`` and ``source``
+    as in :func:`plot_attention_stats`.
     """
     steps = _np(table["step"]).astype(float)
     grid_steps = np.unique(steps[np.isfinite(steps)])
     if grid_steps.size < 2:
-        raise FigureSkipped("attention_stats.csv has fewer than two evaluation steps")
-    stats = [spec for spec in _ATTENTION_STATS
+        raise FigureSkipped(f"{source} has fewer than two evaluation steps")
+    stats = [spec for spec in specs
              if spec[0] in table and np.isfinite(_np(table[spec[0]]).astype(float)).any()]
     if not stats:
-        raise FigureSkipped("attention_stats.csv has no finite statistic")
+        raise FigureSkipped(f"{source} has no finite statistic")
     layers = _np(table["layer"]).astype(float)
     layer_ids = np.unique(layers[np.isfinite(layers)]).astype(int)
     colors = _layer_colors(int(layer_ids.max()) + 1)
@@ -3227,9 +3261,96 @@ def plot_attention_stats_training(
                 ax.legend(frameon=False, loc="best", ncol=2 if layer_ids.size > 4 else 1)
         for index in range(len(stats), n_rows_fig * n_cols):
             axes[index // n_cols][index % n_cols].axis("off")
-        fig.suptitle("Attention statistics over training (line: head mean; band: head range)")
+        fig.suptitle(f"{title} (line: head mean; band: head range)")
         fig.tight_layout()
         return _save(fig, path)
+
+
+# Per-(layer, head) routing-cap and holonomy statistics (routing_head_table): (column, label, color bounds).
+_ROUTING_HEAD_STATS: Tuple[Tuple[str, str, Optional[Tuple[float, float]]], ...] = (
+    ("cap_fraction", "capped entries / causal entries", (0.0, 1.0)),
+    ("clamped_row_fraction", "fully clamped rows / query rows", (0.0, 1.0)),
+    ("log_defect_rms", r"routing holonomy: RMS $\log\rho_{ijk}$", None),
+    ("prior_log_defect_rms", r"prior holonomy: RMS $\log\rho_{ijk}$", None),
+)
+_ROUTING_HEAD_SOURCE = "the per-head routing-cap and holonomy tables"
+
+
+def routing_head_table(
+    cap:      Optional[Mapping[str, object]],     # diagnostics/cap_activation.csv columns
+    clamped:  Optional[Mapping[str, object]],     # diagnostics/cap_clamped_rows.csv columns
+    holonomy: Optional[Mapping[str, object]],     # diagnostics/routing_holonomy.csv columns
+) -> Optional[Dict[str, np.ndarray]]:
+    r"""One long ``(step, layer, head)`` table of the per-head routing-cap and holonomy diagnostics.
+
+    ``cap_fraction = capped / entries`` (``cap_activation.csv``), ``clamped_row_fraction =
+    clamped_rows / rows`` (``cap_clamped_rows.csv``; a row whose every source cost is capped, the
+    only case in which the clamp changes :math:`\beta`), NaN at a zero denominator, and the
+    path-weighted RMS of :math:`\log\rho_{ijk}` for the router and its prior alone
+    (``routing_holonomy.csv``). A key absent from one table is NaN in its columns. None when every
+    table is None or has no row (audit 2026-10-10 #64).
+    """
+    sources = ((cap, (("cap_fraction", "capped", "entries"),)),
+               (clamped, (("clamped_row_fraction", "clamped_rows", "rows"),)),
+               (holonomy, (("log_defect_rms", "log_defect_rms", None),
+                           ("prior_log_defect_rms", "prior_log_defect_rms", None))))
+    merged: Dict[Tuple[float, int, int], Dict[str, float]] = {}
+    for table, columns in sources:
+        if not table or any(key not in table for key in ("step", "layer", "head")):
+            continue
+        keys = [_np(table[key]).astype(float).reshape(-1) for key in ("step", "layer", "head")]
+        keep = np.isfinite(keys[0]) & np.isfinite(keys[1]) & np.isfinite(keys[2])
+        for name, numerator, denominator in columns:
+            if numerator not in table:
+                continue
+            value = _np(table[numerator]).astype(float).reshape(-1)
+            if denominator is not None:
+                count = _np(table[denominator]).astype(float).reshape(-1)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    value = np.where(count > 0, value / count, np.nan)
+            for s, l, h, v in zip(keys[0][keep], keys[1][keep], keys[2][keep], value[keep]):
+                merged.setdefault((float(s), int(l), int(h)), {})[name] = float(v)
+    if not merged:
+        return None
+    order = sorted(merged)
+    out: Dict[str, np.ndarray] = {"step": np.array([k[0] for k in order]),
+                                  "layer": np.array([k[1] for k in order], dtype=float),
+                                  "head": np.array([k[2] for k in order], dtype=float)}
+    for name, _, _ in _ROUTING_HEAD_STATS:
+        out[name] = np.array([merged[k].get(name, np.nan) for k in order])
+    return out
+
+
+@register_figure("routing_heads")
+def plot_routing_heads(
+    table: Mapping[str, object],         # routing_head_table output
+
+    *,
+    step:  Optional[float] = None,       # evaluation step to show (default: the last one)
+    path:  Optional[str]   = None,
+):
+    r"""Routing cap and holonomy per layer and head at one evaluation, as heatmaps.
+
+    The columns of :func:`routing_head_table` in the layout of :func:`plot_attention_stats`: the
+    capped share of causal entries, the fully clamped share of query rows (both on [0, 1]), and the
+    routing and prior holonomy RMS of :math:`\log\rho_{ijk}`, on the fixed validation windows.
+    """
+    return plot_attention_stats(table, step=step, path=path, specs=_ROUTING_HEAD_STATS,
+                                title="Routing cap and holonomy by layer and head",
+                                source=_ROUTING_HEAD_SOURCE)
+
+
+@register_figure("routing_heads_training")
+def plot_routing_heads_training(
+    table: Mapping[str, object],         # routing_head_table output
+
+    *,
+    path:  Optional[str] = None,
+):
+    r"""The statistics of :func:`plot_routing_heads` over training (line: head mean; band: head range)."""
+    return plot_attention_stats_training(table, path=path, specs=_ROUTING_HEAD_STATS,
+                                         title="Routing cap and holonomy over training",
+                                         source=_ROUTING_HEAD_SOURCE)
 
 
 @register_figure("residual_ratio")
@@ -3237,7 +3358,8 @@ def plot_residual_ratio(
     table: Mapping[str, object],         # diagnostics/residual_ratio.csv columns
 
     *,
-    path:  Optional[str] = None,
+    additive: bool          = True,      # vfe3.train._residual_update_is_additive of the run
+    path:     Optional[str] = None,
 ):
     r"""Residual ratio per layer (S1 panel A) and the normalization change when the residual is removed.
 
@@ -3245,7 +3367,9 @@ def plot_residual_ratio(
     message :math:`m_i` (the layer's attention output minus its input mean) relative to the input
     mean :math:`\mu_i`, on the fixed validation windows: the median per layer with a 10th to 90th
     percentile band over training, or with error bars at a single evaluation. A ratio far above 1
-    means the residual term :math:`\mu_i` is small next to the message. Panel B: the median relative
+    means the residual term :math:`\mu_i` is small next to the message. Without an ``additive``
+    update the same column is the displacement ratio :math:`\lVert\mu^{\rm out}_i-\mu_i\rVert/\lVert\mu_i\rVert`
+    and is titled so (:func:`_residual_ratio_label`). Panel B: the median relative
     change :math:`\lVert\mathrm{LN}(\mu_i+m_i)-\mathrm{LN}(m_i)\rVert/\lVert\mathrm{LN}(\mu_i+m_i)\rVert`
     of the block normalization output when the residual is removed; omitted when every value is NaN
     (no block normalization).
@@ -3258,6 +3382,7 @@ def plot_residual_ratio(
     colors = _layer_colors(int(layer_ids.max()) + 1)
     grid_steps = np.unique(steps)
     has_ln = bool(np.isfinite(ln_change).any())
+    name, symbol = _residual_ratio_label(additive)
     with _compact_style():
         n_panels = 2 if has_ln else 1
         fig, axes = plt.subplots(1, n_panels, squeeze=False,
@@ -3279,7 +3404,7 @@ def plot_residual_ratio(
                 ax.set_xlabel("training step")
                 if _set_finite_xlim(ax, grid_steps):
                     _step_xaxis(ax)
-            axes[0].set_title(r"$\|m_i\|/\|\mu_i\|$: median, 10-90% band")
+            axes[0].set_title(f"{symbol}: median, 10-90% band")
         else:
             order = np.argsort(layers)
             x, mid = layers[order], q50[order]
@@ -3291,7 +3416,7 @@ def plot_residual_ratio(
                 axes[1].plot(x, ln_change[order], "o", ms=3, color=_CB[1])
             for ax in axes:
                 ax.set(xlabel="layer", xticks=layer_ids)
-            axes[0].set_title(rf"$\|m_i\|/\|\mu_i\|$ at step {grid_steps[0]:,.0f}")
+            axes[0].set_title(f"{symbol} at step {grid_steps[0]:,.0f}")
         axes[0].set_yscale("log")
         axes[0].set_ylabel("ratio (log)")
         axes[0].legend(frameon=False, loc="best", ncol=2 if layer_ids.size > 4 else 1)
@@ -3301,7 +3426,7 @@ def plot_residual_ratio(
                 axes[1].set_yscale("log")
             axes[1].set_ylabel("relative change")
             axes[1].set_title(r"normalization output change without $\mu_i$ (median)")
-        fig.suptitle("Residual ratio per layer on the fixed validation windows")
+        fig.suptitle(f"{name} per layer on the fixed validation windows")
         fig.tight_layout()
         return _save(fig, path)
 
@@ -3673,6 +3798,7 @@ def plot_per_layer_diagnostics(
     *,
     residual_ratio:    Optional[Mapping[str, object]] = None,   # diagnostics/residual_ratio.csv columns
     covariance_frozen: bool                           = False,
+    residual_additive: bool                           = True,   # vfe3.train._residual_update_is_additive
     path:              Optional[str]                  = None,
 ):
     r"""F8b: per-LAYER (inference-depth) diagnostics -- the depth axis the stack collapses.
@@ -3689,8 +3815,8 @@ def plot_per_layer_diagnostics(
     On the conditional (readout) route the panels are those of :func:`plot_readout_diagnostics`
     with layer on the x axis. With ``residual_ratio`` the unnormalized displacement panel is replaced
     by the 10th, 50th and 90th token percentiles of :math:`\lVert m_i\rVert/\lVert\mu_i\rVert` per
-    layer at the table's last evaluation step; ``covariance_frozen`` drops the constant
-    receiver-covariance panels.
+    layer at the table's last evaluation step (titled as the displacement ratio when
+    ``residual_additive`` is False); ``covariance_frozen`` drops the constant receiver-covariance panels.
     """
     if any(k.endswith("_semantics") for k in per_layer):
         n_layers = len(per_layer["attn_entropy"])
@@ -3704,7 +3830,8 @@ def plot_per_layer_diagnostics(
                 for name, values in (("q10", q10), ("q50", q50), ("q90", q90)):
                     data[f"residual_ratio_{name}"] = values[last][order]
                 residual_panel = {
-                    "title": rf"Residual ratio $\|m_i\|/\|\mu_i\|$ (step {int(steps.max()):,})",
+                    "title": "{} {} (step {:,})".format(*_residual_ratio_label(residual_additive),
+                                                         int(steps.max())),
                     "ylabel": "ratio", "logy": True, "data": data, "series": [
                         ("residual_ratio_q90", "90th percentile", _CB[3]),
                         ("residual_ratio_q50", "median", _CB[0]),
@@ -4332,10 +4459,12 @@ def _t95(n: int) -> float:
         return 1.96
 
 
-def _scaling_point_stats(points: list, x_key: str = "n_params") -> Dict[str, np.ndarray]:
+def _scaling_point_stats(points: list, x_key: str = "n_params") -> Dict[str, Any]:
     r"""Per-point seed aggregation: returns x, mean, sem, ci95, n (one entry per point with >=1 finite
-    seed) plus the flattened per-seed (seed_x, seed_y) cloud for the faint scatter."""
-    x, mean, sem, ci, ns, sx, sy = [], [], [], [], [], [], []
+    seed), the flattened per-seed (seed_x, seed_y) cloud for the faint scatter, and the pooled
+    pure-error variance of log CE over those points (``pooled_log_var``,
+    :func:`_scaling_pooled_log_variance`)."""
+    x, mean, sem, ci, ns, sx, sy, groups = [], [], [], [], [], [], [], []
     for p in points:
         seeds = [float(s) for s in p.get("ce_seeds", []) if np.isfinite(s)]
         try:
@@ -4348,18 +4477,44 @@ def _scaling_point_stats(points: list, x_key: str = "n_params") -> Dict[str, np.
         x.append(xv); mean.append(float(arr.mean())); ns.append(arr.size)
         s = float(arr.std(ddof=1)) / np.sqrt(arr.size) if arr.size > 1 else 0.0
         sem.append(s); ci.append(_t95(arr.size) * s)
-        sx.extend([xv] * arr.size); sy.extend(seeds)
+        sx.extend([xv] * arr.size); sy.extend(seeds); groups.append(seeds)
     return {"x": np.asarray(x), "mean": np.asarray(mean), "sem": np.asarray(sem),
             "ci95": np.asarray(ci), "n": np.asarray(ns, dtype=int),
-            "seed_x": np.asarray(sx), "seed_y": np.asarray(sy)}
+            "seed_x": np.asarray(sx), "seed_y": np.asarray(sy),
+            "pooled_log_var": _scaling_pooled_log_variance(groups)}
 
 
-def _scaling_sem_weights(mean: object, sem: object) -> np.ndarray:
+def _scaling_pooled_log_variance(seed_groups: Sequence[Sequence[float]]) -> float:
+    r"""Pooled pure-error variance of log CE over the seed groups of the fitted points.
+
+    With :math:`y_{ij} = \log\mathrm{CE}_{ij}` (seed j of point i, :math:`n_i` seeds, m points, n runs),
+    :math:`s^2 = \sum_{ij}(y_{ij} - \bar y_i)^2 / (n - m)`, the common-variance model of the analyzer's
+    lack-of-fit test and offset-law bootstrap (``scaling_analysis``). NaN without a replicate seed
+    or with zero spread.
+    """
+    logs = [np.log(np.asarray([c for c in g if np.isfinite(c) and c > 0.0], dtype=float)) for g in seed_groups]
+    logs = [a for a in logs if a.size]
+    df = sum(a.size for a in logs) - len(logs)
+    ss = float(sum(np.sum((a - a.mean()) ** 2) for a in logs))
+    return ss / df if df >= 1 and ss > 0.0 else float("nan")
+
+
+def _scaling_sem_weights(
+    mean: object,
+    sem:  object,
+
+    *,
+    n_seeds:             object = None,          # (P,) seeds per point; with pooled_log_variance
+    pooled_log_variance: Optional[float] = None, # s^2 of _scaling_pooled_log_variance
+) -> np.ndarray:
     r"""Inverse-variance weights for a log-loss fit from point means and their SEMs.
 
-    By the delta method, ``Var(log(mean)) ~= (SEM / mean)^2``, so the WLS
-    weight is ``(mean / SEM)^2``.  A zero SEM receives unit weight instead of
-    infinite leverage, matching the pre-existing headline-fit policy.
+    By the delta method, ``Var(log(mean)) ~= (SEM / mean)^2``, so the WLS weight is
+    ``(mean / SEM)^2``. A point without its own SEM (a single seed, or seeds with zero spread)
+    receives the pooled pure-error variance instead, weight ``n_i / s^2`` with ``s^2`` from
+    :func:`_scaling_pooled_log_variance`, so it neither gains infinite leverage nor counts as a fitted
+    size while carrying a vanishing weight next to the replicated points (audit 2026-10-10 #52).
+    Without a pooled estimate (no replicated point) every point keeps unit weight.
     """
     mean_arr = _np(mean).astype(float).reshape(-1)
     sem_arr = _np(sem).astype(float).reshape(-1)
@@ -4368,6 +4523,13 @@ def _scaling_sem_weights(mean: object, sem: object) -> np.ndarray:
     weights = np.ones_like(mean_arr)
     positive = np.isfinite(mean_arr) & np.isfinite(sem_arr) & (mean_arr > 0.0) & (sem_arr > 0.0)
     weights[positive] = (mean_arr[positive] / sem_arr[positive]) ** 2
+    if (n_seeds is not None and pooled_log_variance is not None
+            and np.isfinite(pooled_log_variance) and pooled_log_variance > 0.0):
+        n_arr = _np(n_seeds).astype(float).reshape(-1)
+        if n_arr.size != mean_arr.size:
+            raise ValueError(f"n_seeds must have length {mean_arr.size}, got {n_arr.size}")
+        imputed = ~positive & np.isfinite(n_arr) & (n_arr >= 1.0)
+        weights[imputed] = n_arr[imputed] / float(pooled_log_variance)
     return weights
 
 
@@ -4417,7 +4579,8 @@ def plot_scaling_law(
                     capsize=3, lw=0, elinewidth=1.2, label="mean (95% CI)", zorder=3)
     fit = None
     if np.unique(st["x"]).size >= 2:
-        w = _scaling_sem_weights(st["mean"], st["sem"])
+        w = _scaling_sem_weights(st["mean"], st["sem"], n_seeds=st["n"],
+                                 pooled_log_variance=st["pooled_log_var"])
         fit = _fit_power_law(st["x"], st["mean"], weights=w, with_offset=with_offset)
         xx = np.geomspace(st["x"].min(), st["x"].max(), 100)
         yy = fit["E"] + fit["A"] * np.power(xx, -fit["alpha"])
@@ -4464,13 +4627,15 @@ def plot_scaling_routes(
     different slope) does not -- the visual companion to the analyzer's ANCOVA test. Marker shape
     duplicates the color so the routes survive grayscale printing."""
     routes = sorted({str(p.get("route", "?")) for p in points})
+    pooled_log_var = _scaling_point_stats(points, x_key)["pooled_log_var"]   # one pure-error model for all routes
     route_stats = []
     for r in routes:
         st = _scaling_point_stats([p for p in points if str(p.get("route", "?")) == r], x_key)
         if not st["x"].size:
             continue
         if weights_by_route is None:
-            weights = _scaling_sem_weights(st["mean"], st["sem"])
+            weights = _scaling_sem_weights(st["mean"], st["sem"], n_seeds=st["n"],
+                                           pooled_log_variance=pooled_log_var)
         else:
             if r not in weights_by_route:
                 raise ValueError(f"weights_by_route is missing route {r!r}")

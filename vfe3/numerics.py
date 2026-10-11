@@ -57,21 +57,41 @@ _MAX_LOG_CHECK_CACHE_MAXSIZE = 32
 def _max_log_exceeded(
     log_sigma: torch.Tensor,
     max_log:   float,
-) -> bool:
-    """The one host-syncing overflow check (the cached slow path)."""
-    return bool((log_sigma.detach() > max_log).any())
+) -> torch.Tensor:                                  # (1,) bool, on log_sigma's device
+    """The one overflow reduction (the cached slow path); its host read happens in ``host_check``."""
+    return (log_sigma.detach() > max_log).any().reshape(1)
 
 
-def _cached_max_log_exceeded(
+def _warn_max_log(max_log: float) -> None:
+    import warnings
+    warnings.warn(
+        f"trainable log-variance exceeds max_log={max_log:g}; clamping before exponentiation",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
+def _check_max_log(
     log_sigma: torch.Tensor,
     max_log:   float,
-) -> bool:
-    """Resolve the overflow check through the weak, mutation-aware identity/version cache."""
+) -> None:
+    """Warn when ``log_sigma`` exceeds ``max_log``, through the weak, mutation-aware identity/version cache.
+
+    The verdict only warns and selects no computation (the clamp below is unconditional), so it goes
+    through :func:`vfe3.contracts.host_check`: inside ``deferred_host_checks`` it rides the scorer's next
+    mandatory host read instead of synchronizing (audit 2026-10-10, item 61), and outside it runs at once.
+    The cache holds ``None`` while a queued verdict is pending, so repeated reads of an unchanged table
+    queue one check.
+    """
+    from vfe3.contracts import host_check
+
     if log_sigma.is_inference():
         # Inference tensors track NO _version counter (reading it raises), so there is no
         # mutation signal to key on -- fall back to the direct uncached check (the pre-cache
         # behavior; one sync per call, exactly as before the N13 cache).
-        return _max_log_exceeded(log_sigma, max_log)
+        if bool(_max_log_exceeded(log_sigma, max_log)):
+            _warn_max_log(max_log)
+        return
     key = (id(log_sigma), log_sigma._version, tuple(log_sigma.shape), log_sigma.dtype,
            log_sigma.device, max_log)
     cached = _MAX_LOG_CHECK_CACHE.get(key)
@@ -79,21 +99,30 @@ def _cached_max_log_exceeded(
         tensor_ref, exceeded = cached
         if tensor_ref() is log_sigma:
             _MAX_LOG_CHECK_CACHE.move_to_end(key)
-            return exceeded
+            if exceeded:
+                _warn_max_log(max_log)
+            return
         del _MAX_LOG_CHECK_CACHE[key]
-
-    exceeded = _max_log_exceeded(log_sigma, max_log)
 
     def _drop_dead_entry(tensor_ref: weakref.ReferenceType) -> None:
         current = _MAX_LOG_CHECK_CACHE.get(key)
         if current is not None and current[0] is tensor_ref:
             del _MAX_LOG_CHECK_CACHE[key]
 
-    _MAX_LOG_CHECK_CACHE[key] = (weakref.ref(log_sigma, _drop_dead_entry), exceeded)
+    tensor_ref = weakref.ref(log_sigma, _drop_dead_entry)
+    _MAX_LOG_CHECK_CACHE[key] = (tensor_ref, None)
     _MAX_LOG_CHECK_CACHE.move_to_end(key)
     while len(_MAX_LOG_CHECK_CACHE) > _MAX_LOG_CHECK_CACHE_MAXSIZE:
         _MAX_LOG_CHECK_CACHE.popitem(last=False)
-    return exceeded
+
+    def _verdict(host: List[bool]) -> None:
+        current = _MAX_LOG_CHECK_CACHE.get(key)
+        if current is not None and current[0] is tensor_ref:
+            _MAX_LOG_CHECK_CACHE[key] = (tensor_ref, bool(host[0]))
+        if host[0]:
+            _warn_max_log(max_log)
+
+    host_check(_max_log_exceeded(log_sigma, max_log), _verdict)
 
 
 def bounded_variance_from_log(
@@ -115,13 +144,7 @@ def bounded_variance_from_log(
     (cached) table and only the gathered rows are exponentiated, so a per-forward gather does not
     defeat the cache (audit 2026-10-07 F03/F61); the values equal those for ``log_sigma[index]``.
     """
-    if _cached_max_log_exceeded(log_sigma, max_log):
-        import warnings
-        warnings.warn(
-            f"trainable log-variance exceeds max_log={max_log:g}; clamping before exponentiation",
-            RuntimeWarning,
-            stacklevel=2,
-        )
+    _check_max_log(log_sigma, max_log)
     if index is not None:
         log_sigma = log_sigma[index]
     return torch.exp(log_sigma.clamp(max=max_log)).clamp(min=eps)

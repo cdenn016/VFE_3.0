@@ -17,6 +17,7 @@ from vfe3.model.prototype_agents import (
     covariance_layout,
     prototype_exact_posterior,
     prototype_mean_field_posterior,
+    template_kl_logits,
 )
 from vfe3.numerics import validated_cholesky_solve
 from vfe3.runtime import ieee_fp32_matmul
@@ -216,6 +217,65 @@ def layernorm_scale(
     return scale
 
 
+def layernorm_diagonal_pushforward(
+    mu:               torch.Tensor,                   # (..., K) pre-norm means
+    sigma:            torch.Tensor,                   # (..., K) diagonal covariance at mu, sigma_k > 0
+    *,
+    eps:              float,
+    covariance_floor: float,
+    weight:           Optional[torch.Tensor] = None,  # (K,) affine gamma, or None for the plain norm
+) -> torch.Tensor:                                    # (..., K)
+    r"""Diagonal of the LayerNorm pushforward :math:`J\operatorname{diag}(\sigma)J^\top + fD\operatorname{diag}(\sigma)D`, O(K) per token.
+
+    With :math:`J_{kl} = (\gamma_k/s)\bigl(\delta_{kl} - (1 + z_kz_l)/K\bigr)` (:func:`layernorm_jacobian`, eps inside
+    :math:`s`), :math:`D = \operatorname{diag}(\gamma)/s` and the moments :math:`S_m = \sum_l\sigma_lz_l^m`,
+
+    .. math::
+        \bigl[J\operatorname{diag}(\sigma)J^\top\bigr]_{kk} = \Bigl(\frac{\gamma_k}{s}\Bigr)^2\Bigl[
+            \sigma_k\Bigl(1 - \frac{2(1 + z_k^2)}{K}\Bigr) + \frac{S_0 + 2z_kS_1 + z_k^2S_2}{K^2}\Bigr],
+
+    so the result is :math:`(\gamma_k/s)^2\bigl([\cdot] + f\sigma_k\bigr)` without forming :math:`J`. It is the M-projection
+    onto the diagonal family of the dense pushforward, the moment-matched diagonal Gaussian. The bracket equals the sum of
+    squares :math:`\sum_l(\delta_{kl} - (1 + z_kz_l)/K)^2\sigma_l` but is evaluated with signed terms, so where the norm
+    saturates (row :math:`k` of :math:`J` near zero) its rounding is of order :math:`u\max_l\sigma_l(\gamma_k/s)^2`; the
+    floor keeps the result positive unless that exceeds :math:`f\sigma_k(\gamma_k/s)^2`. Below float64, entries that
+    round to a non-positive value are recomputed in float64. Evaluated with autocast off at
+    ``promote_types(mu.dtype, sigma.dtype, float32)``, as :func:`_delta_covariance` is.
+    """
+    dtype = _pushforward_dtype(mu, sigma)
+    with torch.autocast(device_type=mu.device.type, enabled=False):
+        pushed = _layernorm_diagonal_pushforward_at(
+            mu.to(dtype), sigma.to(dtype), eps, covariance_floor, None if weight is None else weight.to(dtype))
+        if dtype == torch.float64:
+            return pushed
+        failed = pushed <= 0
+        if bool(failed.any()):
+            high = _layernorm_diagonal_pushforward_at(
+                mu.double(), sigma.double(), eps, covariance_floor, None if weight is None else weight.double())
+            pushed = torch.where(failed, high.to(dtype), pushed)
+    return pushed
+
+
+def _layernorm_diagonal_pushforward_at(
+    mu:               torch.Tensor,                   # (..., K) pre-norm means at the working dtype
+    sigma:            torch.Tensor,                   # (..., K) diagonal covariance at the working dtype
+    eps:              float,
+    covariance_floor: float,
+    weight:           Optional[torch.Tensor],         # (K,) gamma at the working dtype, or None
+) -> torch.Tensor:                                    # (..., K)
+    K = mu.shape[-1]
+    centered = mu - mu.mean(dim=-1, keepdim=True)                                   # (..., K)
+    s2 = centered.square().mean(dim=-1, keepdim=True) + eps                         # (..., 1) s^2
+    z = centered / s2.sqrt()                                                        # (..., K)
+    z2 = z.square()
+    S0 = sigma.sum(dim=-1, keepdim=True)                                            # (..., 1)
+    S1 = (sigma * z).sum(dim=-1, keepdim=True)                                      # (..., 1)
+    S2 = (sigma * z2).sum(dim=-1, keepdim=True)                                     # (..., 1)
+    bracket = sigma * (1.0 - 2.0 * (1.0 + z2) / K) + (S0 + 2.0 * z * S1 + z2 * S2) / (K * K)   # (..., K)
+    d2 = 1.0 / s2 if weight is None else weight.square() / s2                       # (..., 1) or (..., K): D^2
+    return d2 * (bracket + covariance_floor * sigma)
+
+
 class BlockNormLinearization(NamedTuple):
     r"""The block norm's Jacobian :math:`J_{\mathrm{LN}}` at the pre-norm mean and its scale :math:`D = \operatorname{diag}(\gamma)/s`."""
 
@@ -229,8 +289,8 @@ def _layernorm_arguments(norm: Callable[..., torch.Tensor]) -> 'tuple[float, Opt
         return norm.eps, norm.weight
     if isinstance(norm, LayerNorm):
         return norm.eps, None
-    raise ValueError(f"the delta_full block pushforward has the norm Jacobian of the LayerNorm seams only, "
-                     f"got {type(norm).__name__}")
+    raise ValueError(f"the delta_full and block-norm covariance pushforwards have the norm Jacobian of the "
+                     f"LayerNorm seams only, got {type(norm).__name__}")
 
 
 def block_norm_jacobian(
@@ -255,6 +315,25 @@ def block_norm_linearization(
     eps, weight = _layernorm_arguments(norm)
     return BlockNormLinearization(layernorm_jacobian(mu, eps=eps, weight=weight),
                                   layernorm_scale(mu, eps=eps, weight=weight))
+
+
+def block_norm_covariance_pushforward(
+    norm:             Callable[..., torch.Tensor],
+    mu:               torch.Tensor,                   # (..., K) pre-norm means
+    sigma:            torch.Tensor,                   # (..., K) diagonal or (..., K, K) full covariance at mu
+    covariance_floor: float,
+) -> torch.Tensor:                                    # sigma's layout, at promote_types(dtype, float32)
+    r"""The covariance through a block LayerNorm seam at the pre-norm mean (``block_norm_covariance='pushforward'``).
+
+    Full layout: :math:`J_{\mathrm{LN}}\Sigma J_{\mathrm{LN}}^\top + fD\Sigma D`, :math:`D = \operatorname{diag}(\gamma)/s`
+    (:func:`block_norm_linearization`, :func:`_delta_covariance`). Diagonal layout: its diagonal, the M-projection onto
+    the diagonal family, in closed form (:func:`layernorm_diagonal_pushforward`).
+    """
+    eps, weight = _layernorm_arguments(norm)
+    if _is_diagonal_layout(mu, sigma):
+        return layernorm_diagonal_pushforward(mu, sigma, eps=eps, covariance_floor=covariance_floor, weight=weight)
+    linearization = block_norm_linearization(norm, mu)                              # (..., K, K), (..., K)
+    return _delta_covariance(linearization.jacobian, sigma, covariance_floor, linearization.scale)
 
 
 def _pushforward_dtype(*tensors: torch.Tensor) -> torch.dtype:
@@ -312,11 +391,15 @@ def _covariance_cholesky(sigma: torch.Tensor) -> torch.Tensor:   # (..., K, K) S
 
 def _delta_covariance(
     jacobian:         torch.Tensor,                   # (..., K, K) J of the (composite) mean map
-    sigma:            torch.Tensor,                   # (..., K, K) SPD input covariance
+    sigma:            torch.Tensor,                   # (..., K, K) SPD input covariance, or its diagonal (..., K)
     covariance_floor: float,
     floor_scale:      Optional[torch.Tensor] = None,  # (..., K) D = diag(gamma)/s of a block norm, or None
-) -> torch.Tensor:                                    # (..., K, K)
+) -> torch.Tensor:                                    # sigma's layout
     r"""Delta-method pushforward :math:`(JL)(JL)^\top + fD\Sigma D` with :math:`\Sigma = LL^\top`.
+
+    A diagonal layout :math:`\sigma` (``gaussian_diagonal``) returns the diagonal
+    :math:`(J\circ J)\sigma + fD^2\sigma = \operatorname{diag}(J\operatorname{diag}(\sigma)J^\top + fD\operatorname{diag}(\sigma)D)`,
+    the M-projection of the dense pushforward onto the diagonal family (:func:`_diagonal_delta_covariance`).
 
     The first term is formed as a Gram matrix of the factor :math:`JL` rather than as the triple product
     :math:`J\Sigma J^\top`, so it is positive semidefinite up to the rounding of one GEMM, relative to
@@ -331,6 +414,8 @@ def _delta_covariance(
     round 2, #13). Everything runs with autocast off and IEEE fp32 GEMMs at ``promote_types(dtype, float32)``: under
     bf16 autocast the rank-deficient :math:`J_{\mathrm{LN}}` product returned indefinite covariances (#2).
     """
+    if sigma.dim() == jacobian.dim() - 1:
+        return _diagonal_delta_covariance(jacobian, sigma, covariance_floor, floor_scale)
     dtype = _pushforward_dtype(jacobian, sigma)
     with torch.autocast(device_type=jacobian.device.type, enabled=False), ieee_fp32_matmul():
         pushed = _gram_pushforward(jacobian.to(dtype), sigma.to(dtype), covariance_floor,
@@ -349,6 +434,25 @@ def _delta_covariance(
                                      None if floor_scale is None else floor_scale.double())
             pushed = torch.where(failed.unsqueeze(-1).unsqueeze(-1), high.to(dtype), pushed)
         return pushed
+
+
+def _diagonal_delta_covariance(
+    jacobian:         torch.Tensor,                   # (..., K, K) J of the (composite) mean map
+    sigma:            torch.Tensor,                   # (..., K) diagonal input covariance, sigma_k > 0
+    covariance_floor: float,
+    floor_scale:      Optional[torch.Tensor] = None,  # (..., K) D = diag(gamma)/s of a block norm, or None
+) -> torch.Tensor:                                    # (..., K)
+    r"""Diagonal delta method :math:`\bigl[J\operatorname{diag}(\sigma)J^\top\bigr]_{kk} + fD_k^2\sigma_k = \sum_lJ_{kl}^2\sigma_l + fD_k^2\sigma_k`.
+
+    Every term is non-negative and the floor is positive, so the result needs no Cholesky factor or certificate.
+    :math:`D = I` without a block norm. Autocast off and IEEE fp32 GEMMs at ``promote_types(dtype, float32)``.
+    """
+    dtype = _pushforward_dtype(jacobian, sigma)
+    with torch.autocast(device_type=jacobian.device.type, enabled=False), ieee_fp32_matmul():
+        work = sigma.to(dtype)                                                      # (..., K)
+        pushed = torch.einsum("...kl,...l->...k", jacobian.to(dtype).square(), work)   # (J o J) sigma
+        floor = work if floor_scale is None else floor_scale.to(dtype).square() * work
+        return pushed + covariance_floor * floor
 
 
 def _gram_pushforward(
@@ -448,7 +552,7 @@ class BlockMLP(nn.Module):
         With ``input_jacobian`` :math:`J_{\mathrm{in}}` (the block norm's Jacobian at the pre-norm mean) the
         Jacobian is the composite :math:`J = J_{\mathrm{MLP}}J_{\mathrm{in}}` and ``sigma`` is the pre-norm
         covariance, so the pushforward is that of MLP∘norm, with the floor :math:`fD\Sigma D` in post-norm units
-        (:func:`_delta_covariance`).
+        (:func:`_delta_covariance`). A diagonal ``sigma`` (..., K) returns the diagonal of the pushforward.
         """
         del frame_context
         _check_input_linearization(input_jacobian, input_scale)
@@ -750,6 +854,7 @@ class CanonicalFrameBlockMLP(BlockMLP):
                 frame_context.forward @ canonical_jacobian.double() @ frame_context.inverse
             ).to(canonical_jacobian.dtype)
         realized_jacobian = _compose_input_jacobian(realized_jacobian, input_jacobian)
+        # A diagonal sigma (..., K) is local, like the realized Jacobian: it reads the diagonal of the local pushforward.
         return BlockMLPMomentResult(
             mu_out,
             _delta_covariance(realized_jacobian, sigma, self.covariance_floor, input_scale),
@@ -902,6 +1007,11 @@ class PrototypeAgentBlockMLP(nn.Module):
     :math:`\log\lambda` and :math:`\log\pi` train at the same rate with ``weight_decay=0``
     (:func:`vfe3.train.build_optimizer`), because decoupled decay would pull :math:`\lambda` toward 1 and
     :math:`\pi` toward uniform.
+
+    ``cavi_steps`` (mean field only) is the number of coordinate-ascent sweeps of the mean-field posterior
+    (:func:`vfe3.model.prototype_agents.prototype_mean_field_posterior`; 1 is the first step). With an
+    ``em_rows`` list, :meth:`forward_moments` also appends the per-token EM M-step objective
+    (:meth:`em_objective`), which ``block_mlp_em_weight`` adds to the training loss.
     """
 
     def __init__(
@@ -913,6 +1023,7 @@ class PrototypeAgentBlockMLP(nn.Module):
         covariance_contract: str = "passthrough",
         inference: str = "mean_field",
         template_init_variance: float = 10.0,
+        cavi_steps: int = 1,
     ) -> None:
         super().__init__()
         if covariance_contract not in PROTOTYPE_COVARIANCE_CONTRACTS:
@@ -926,9 +1037,12 @@ class PrototypeAgentBlockMLP(nn.Module):
                 or not math.isfinite(float(template_init_variance)) or float(template_init_variance) <= 0.0):
             raise ValueError(
                 f"template_init_variance must be a finite real value > 0, got {template_init_variance!r}")
+        if isinstance(cavi_steps, bool) or not isinstance(cavi_steps, int) or cavi_steps < 1:
+            raise ValueError(f"cavi_steps must be an int >= 1, got {cavi_steps!r}")
         n_templates = embed_dim * expansion
         self.covariance_contract = covariance_contract
         self.inference = inference
+        self.cavi_steps = cavi_steps                                 # mean-field coordinate-ascent sweeps (not state)
         self.tile_bytes = PROTOTYPE_TILE_BYTES                       # exact-path pair-tile budget (not state)
         bound_in = embed_dim ** -0.5
         self.nu = nn.Parameter(torch.empty(n_templates, embed_dim).uniform_(-bound_in, bound_in))   # (M, K)
@@ -953,7 +1067,8 @@ class PrototypeAgentBlockMLP(nn.Module):
                 mu, sigma, self.nu, self.log_lambda, self.log_pi, need_covariance=need_covariance,
                 need_precision=need_precision, tile_bytes=self.tile_bytes)
         return prototype_mean_field_posterior(
-            mu, sigma, self.nu, self.log_lambda, self.log_pi, need_covariance=need_covariance)
+            mu, sigma, self.nu, self.log_lambda, self.log_pi, need_covariance=need_covariance,
+            cavi_steps=self.cavi_steps)
 
     @torch.no_grad()
     def calibrate_templates(
@@ -1000,13 +1115,20 @@ class PrototypeAgentBlockMLP(nn.Module):
         *,
         frame_context: Optional[CanonicalFrameContext] = None,
         hidden_bias: Optional[torch.Tensor] = None,
+        em_rows: Optional[list[torch.Tensor]] = None,  # block_mlp_em_weight > 0: receives this block's (...,) EM rows
     ) -> BlockMLPMomentResult:
-        r""":math:`\mu \mapsto \mu + \mathrm{dropout}(\xi^+ - \mu)`; the covariance is passed through or replaced by :math:`C^+`."""
+        r""":math:`\mu \mapsto \mu + \mathrm{dropout}(\xi^+ - \mu)`; the covariance is passed through or replaced by :math:`C^+`.
+
+        With ``em_rows`` it also appends :meth:`em_objective` at this input and the posterior's template weights
+        (exact :math:`w_{ia}`, or the mean field's last-sweep responsibilities)."""
         del frame_context
         _reject_hidden_bias(
             hidden_bias,
             "the prototype_agents block conditions the belief on template agents and has no fc1 hidden layer")
         posterior = self.posterior(mu, sigma)
+        if em_rows is not None:
+            em_rows.append(self.em_objective(
+                mu, sigma, posterior.weights if self.inference == "exact" else posterior.responsibilities))
         mu_out = mu + self.dropout(posterior.delta_xi.to(mu.dtype))
         if self.covariance_contract == "passthrough":
             return BlockMLPMomentResult(mu_out, sigma, None)
@@ -1014,6 +1136,36 @@ class PrototypeAgentBlockMLP(nn.Module):
 
     def forward(self, mu: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
         return self.forward_moments(mu, sigma).mu
+
+    def em_objective(
+        self,
+        mu:      torch.Tensor,                        # (..., K) block-input means, in the coordinates the templates read
+        sigma:   torch.Tensor,                        # (..., K), (..., K, K) or (..., G, d, d)
+        weights: torch.Tensor,                        # (..., M) template weights r_ia
+    ) -> torch.Tensor:                                # (...) Q_i
+        r"""EM M-step objective of the templates at the detached block input and template weights.
+
+        .. math::
+            Q_i = \sum_a\bar r_{ia}\Bigl[\log\hat\pi_a - \tfrac12\sum_k\Bigl(\log 2\pi\lambda_{ak}
+                + \frac{(\bar\xi_{ik} - \nu_{ak})^2 + \bar c_{ik}}{\lambda_{ak}}\Bigr)\Bigr],\qquad
+            \hat\pi = \operatorname{softmax}(\log\pi),
+
+        the expected complete-data log-likelihood :math:`E_q[\log\hat\pi_a + \log\mathcal N(X_i;\nu_a,\Lambda_a)]` under
+        :math:`q(X_i) = \mathcal N(\bar\xi_i, \bar C_i)` and :math:`q(a_i) = \bar r_i`, with
+        :math:`\bar c_i = \operatorname{diag}\bar C_i`. The moments and the weights are detached, so the gradient is the
+        M-step's and reaches only :math:`(\nu, \log\lambda, \log\pi)`:
+        :math:`\partial Q_i/\partial\log\pi_a = \bar r_{ia} - \hat\pi_a`,
+        :math:`\partial Q_i/\partial\nu_{ak} = \bar r_{ia}(\bar\xi_{ik} - \nu_{ak})/\lambda_{ak}` and
+        :math:`\partial Q_i/\partial\log\lambda_{ak} = \tfrac12\bar r_{ia}[((\bar\xi_{ik} - \nu_{ak})^2 + \bar c_{ik})/\lambda_{ak} - 1]`.
+        The bracket is :func:`vfe3.model.prototype_agents.template_kl_logits` at the normalized log prior, minus
+        :math:`\tfrac K2\log 2\pi` (the weights sum to one).
+        """
+        layout = covariance_layout(mu, sigma)
+        log_pi_hat = torch.log_softmax(self.log_pi, dim=-1)                  # (M,) log softmax(log pi)
+        bracket = template_kl_logits(mu.detach(), covariance_diagonal(sigma.detach(), layout),
+                                     self.nu, self.log_lambda, log_pi_hat)   # (..., M)
+        K = mu.shape[-1]
+        return (weights.detach().to(bracket.dtype) * bracket).sum(dim=-1) - 0.5 * K * math.log(2.0 * math.pi)
 
     @torch.no_grad()
     @torch.no_grad()
@@ -1128,7 +1280,11 @@ class BlockMLPRegistration:
         if layout == "diagonal" and self.diagonal_extra_flops_per_layer is not None:
             extra_flops = self.diagonal_extra_flops_per_layer
         per_layer +=extra_flops(embed_dim, irrep_dims)
-        if covariance_contract == "delta_full":
+        if covariance_contract == "delta_full" and layout == "diagonal":
+            # The diagonal (J o J) sigma: the squares J_kl^2 (K^2) and the product with sigma (2 K^2), plus the floor
+            # f D^2 sigma (4 K); no Cholesky.
+            per_layer += 3.0 * embed_dim ** 2 + 4.0 * embed_dim
+        elif covariance_contract == "delta_full":
             # Cholesky of Sigma (K^3/3), the factor J L (2 K^3), its Gram (J L)(J L)^T (2 K^3) and the
             # certifying Cholesky of the result (K^3/3); a float64 recompute of failed matrices is not booked.
             per_layer += (4.0 + 2.0 / 3.0) * embed_dim ** 3
@@ -1252,7 +1408,7 @@ BLOCK_MLP_REGISTRATIONS: Mapping[str, BlockMLPRegistration] = MappingProxyType({
             2 * expansion * width * width + expansion * width),
         matmul_flops_per_layer=lambda width, expansion: 8.0 * expansion * width * width,
         diagonal_extra_flops_per_layer=lambda embed_dim, _irrep_dims: 7.0 * embed_dim,
-        factory_options=frozenset({"inference", "template_init_variance"}),
+        factory_options=frozenset({"inference", "template_init_variance", "cavi_steps"}),
     ),
 })
 
@@ -1335,12 +1491,14 @@ def build_block_mlp(
     covariance_floor: float,
     inference: str = "mean_field",
     template_init_variance: float = 10.0,
+    cavi_steps: int = 1,
 ) -> nn.Module:
-    r"""Build one block MLP; ``inference`` and ``template_init_variance`` reach only the modes that read them."""
+    r"""Build one block MLP; ``inference``, ``template_init_variance`` and ``cavi_steps`` reach only the modes that
+    read them."""
     registration = get_block_mlp_registration(mode)
     if covariance_contract not in registration.covariance_kinds:
         raise ValueError(f"unknown BlockMLP covariance contract {covariance_contract!r}")
-    options = {"inference": inference, "template_init_variance": template_init_variance}
+    options = {"inference": inference, "template_init_variance": template_init_variance, "cavi_steps": cavi_steps}
     return registration.factory(
         embed_dim=embed_dim,
         irrep_dims=irrep_dims,

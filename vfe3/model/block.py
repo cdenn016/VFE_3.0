@@ -4,7 +4,8 @@ Parameter-free (the block owns no nn.Parameters): on the pure default path the l
 is the PriorBank's prior tables, but the block also receives the opt-in learned exceptions
 (CG coupling) as arguments and applies them; the block
 runs the attention step and the configured block norm (the default ``layernorm`` is not
-gauge-equivariant; ``none`` and ``mahalanobis`` are) on the mean. The belief handoff across blocks lives in stack.py.
+gauge-equivariant; ``none`` and ``mahalanobis`` are) on the mean, and under ``block_norm_covariance='pushforward'``
+its first-order pushforward on the covariance. The belief handoff across blocks lives in stack.py.
 """
 
 from typing import TYPE_CHECKING, Callable, Optional
@@ -137,14 +138,18 @@ def vfe_block(
             capture=capture, hidden_bias=hidden_bias,
             readout=lambda pushed: _head_block_readout(pushed, out.sigma, group, cfg))
     norm_linearization = None
+    mlp_delta_full = getattr(block_mlp, "covariance_contract", None) == "delta_full"
+    # block_norm_covariance='pushforward' (audit 2026-10-10, item 9): each norm application also carries Sigma to
+    # post-norm units; inert under a delta_full MLP, whose Jacobian composes the norm's.
+    push_norm = getattr(cfg, "block_norm_covariance", "passthrough") == "pushforward" and not mlp_delta_full
     if block_norm is not None:               # cached parameter-free norm (audit 2d/4f)
-        if getattr(block_mlp, "covariance_contract", None) == "delta_full":
+        if mlp_delta_full:
             # The norm maps the mean only; the delta_full pushforward composes its Jacobian at the pre-norm
             # mean, J = J_mlp J_LN, against the pre-norm covariance (audit 2026-10-09, variational), with the
             # floor in post-norm units through the norm's scale D = diag(gamma)/s (round 2, #13).
             from vfe3.model.block_mlp import block_norm_linearization
             norm_linearization = block_norm_linearization(block_norm, out.mu)   # (B, N, K, K), (B, N, K)
-        out = out._replace(mu=block_norm(out.mu, out.sigma))   # _replace preserves phi/reflection
+        out = _apply_block_norm(out, block_norm, group, cfg, push_covariance=push_norm)
     if capture is not None:
         capture["block_mlp_input"] = out     # exact immediate seam after CG/norm
     if block_mlp is not None:                # default-off residual moment transform, after norm before handoff
@@ -153,6 +158,8 @@ def vfe_block(
             if norm_linearization is not None:
                 extra["input_jacobian"] = norm_linearization.jacobian
                 extra["input_scale"] = norm_linearization.scale
+            if capture is not None and "block_mlp_em_rows" in capture:   # block_mlp_em_weight > 0 only
+                extra["em_rows"] = capture["block_mlp_em_rows"]
             result = block_mlp.forward_moments(
                 out.mu, out.sigma, frame_context=block_mlp_frame, **extra)
             out = out._replace(mu=result.mu, sigma=_head_block_readout(result.sigma, out.sigma, group, cfg))
@@ -164,21 +171,46 @@ def vfe_block(
         capture["block_mlp_output"] = out
     if block_mlp is not None and block_norm is not None and getattr(cfg, "block_mlp_post_norm", False):
         # Opt-in post-MLP norm (audit 2026-10-08 P1-5): the next router reads a normalized mean instead
-        # of the MLP residual's token-common offset.
-        out = out._replace(mu=block_norm(out.mu, out.sigma))
+        # of the MLP residual's token-common offset. Under pushforward Sigma is linearized at the post-MLP mean.
+        out = _apply_block_norm(out, block_norm, group, cfg, push_covariance=push_norm)
     return out
 
 
+def _apply_block_norm(
+    out:             BeliefState,
+    block_norm:      Callable[..., torch.Tensor],
+    group:           GaugeGroup,
+    cfg:             VFE3Config,
+    *,
+    push_covariance: bool,                    # block_norm_covariance='pushforward' outside a delta_full MLP
+) -> BeliefState:
+    r"""The block norm on the mean, and under ``push_covariance`` its first-order pushforward of the covariance.
+
+    The pushforward is taken at the pre-norm mean :math:`u`:
+    :math:`\Sigma \mapsto J_{\mathrm{LN}}\Sigma J_{\mathrm{LN}}^\top + fD\Sigma D`, :math:`D = \operatorname{diag}(\gamma)/s`,
+    :math:`f` = ``block_mlp_covariance_floor``
+    (:func:`vfe3.model.block_mlp.block_norm_covariance_pushforward`). The diagonal family keeps its diagonal and
+    ``gaussian_block`` its head blocks (:func:`_head_block_readout`), each the M-projection onto the family. Without
+    ``push_covariance`` the covariance object passes through unchanged.
+    """
+    if not push_covariance:
+        return out._replace(mu=block_norm(out.mu, out.sigma))   # _replace preserves phi/reflection
+    from vfe3.model.block_mlp import block_norm_covariance_pushforward
+    pushed = block_norm_covariance_pushforward(block_norm, out.mu, out.sigma, cfg.block_mlp_covariance_floor)
+    return out._replace(mu=block_norm(out.mu, out.sigma),
+                        sigma=_head_block_readout(pushed, out.sigma, group, cfg))
+
+
 def _head_block_readout(
-    pushed: torch.Tensor,                     # (B, N, K, K) covariance returned by the block MLP
+    pushed: torch.Tensor,                     # (B, N, K, K) covariance returned by the block MLP or norm pushforward
     sigma:  torch.Tensor,                     # its input covariance
     group:  GaugeGroup,
     cfg:    VFE3Config,
 ) -> torch.Tensor:
-    r"""The family's readout of a covariance the block MLP produced.
+    r"""The family's readout of a covariance the block MLP or the block norm pushforward produced.
 
-    For a head-block family (``gaussian_block``) a new covariance :math:`\Sigma'` (``delta_full`` or the
-    prototype ``posterior``) is read through :func:`vfe3.families.gaussian.head_block_projection`,
+    For a head-block family (``gaussian_block``) a new covariance :math:`\Sigma'` (``delta_full``, the
+    prototype ``posterior`` or ``block_norm_covariance='pushforward'``) is read through :func:`vfe3.families.gaussian.head_block_projection`,
     :math:`\bigoplus_h\Sigma'_{hh}`, the exact M-projection :math:`\arg\min_q\mathrm{KL}(\mathcal N(\mu,\Sigma')\|q)` onto
     the family over the heads ``group.irrep_dims``. Its head blocks are principal submatrices of an SPD matrix, so
     they stay SPD. A passthrough covariance (the same object) and every other family return ``pushed`` unchanged.
@@ -246,6 +278,8 @@ def _reference_coordinate_block(
     if block_mlp is not None:
         if hasattr(block_mlp, "forward_moments"):
             extra = {} if hidden_bias is None else {"hidden_bias": hidden_bias}
+            if capture is not None and "block_mlp_em_rows" in capture:   # block_mlp_em_weight > 0 only
+                extra["em_rows"] = capture["block_mlp_em_rows"]      # the templates read (xi, diag C)
             result = block_mlp.forward_moments(xi, c, **extra)
             xi = result.mu                                                   # passthrough: covariance kept
             if prototype and block_mlp.covariance_contract == "posterior":

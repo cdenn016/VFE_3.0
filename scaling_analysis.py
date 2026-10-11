@@ -1368,13 +1368,16 @@ def _offset_frontier_collapse(
         out["reason"] = ("offset-law collapse test needs >= 4 distinct sizes per route; "
                          f"{', '.join(short)} has fewer")
         return out
-    from vfe3.viz.figures import _scaling_sem_weights
+    from vfe3.viz.figures import _scaling_pooled_log_variance, _scaling_sem_weights
+    pooled_log_var = _scaling_pooled_log_variance([p.get("ce_seeds", ()) for ps in routes.values() for p in ps])
     x_all, y_all, w_all = [], [], []
     rss_full, n_total, R = 0.0, 0, len(routes)
     for r, ps in routes.items():
         x = np.array([p["n_params"] for p in ps], dtype=float)
         y = np.array([p["ce_mean"] for p in ps], dtype=float)
-        w = _scaling_sem_weights(y, np.array([_as_float(p.get("ce_sem")) for p in ps], dtype=float))
+        w = _scaling_sem_weights(y, np.array([_as_float(p.get("ce_sem")) for p in ps], dtype=float),
+                                 n_seeds=[len(p.get("ce_seeds", ())) for p in ps],
+                                 pooled_log_variance=pooled_log_var)
         rss, form = _offset_rss(x, y, w)
         if not np.isfinite(rss):
             out["reason"] = f"route {r}: offset fit did not converge ({form})"
@@ -1547,10 +1550,14 @@ def analyze() -> None:
 
     weights_by_route: Dict[str, np.ndarray] = {}
     if allow_parameter_fit and param_points:
-        from vfe3.viz.figures import _scaling_sem_weights
+        from vfe3.viz.figures import _scaling_pooled_log_variance, _scaling_sem_weights
         all_means = np.array([p["ce_mean"] for p in param_points], dtype=float)
         all_sem = np.array([p["ce_sem"] for p in param_points], dtype=float)
-        all_weights = _scaling_sem_weights(all_means, all_sem)
+        # Points without their own SEM (single seeds) take the pooled pure-error variance of the
+        # distinct runs, the model of the lack-of-fit test and bootstrap (audit 2026-10-10 #52).
+        pooled_log_var = _scaling_pooled_log_variance([p["ce_seeds"] for p in pooled_param_points])
+        all_weights = _scaling_sem_weights(all_means, all_sem, n_seeds=[len(p["ce_seeds"]) for p in param_points],
+                                           pooled_log_variance=pooled_log_var)
         for route in sorted({p["route"] for p in param_points}):
             route_mask = np.array([p["route"] == route for p in param_points], dtype=bool)
             positive_x = np.array([

@@ -191,7 +191,10 @@ def test_full_family_is_value_identical_to_diagonal_on_launcher_route() -> None:
     assert _off_diagonal(belief.sigma) == 0.0
     _, loss_full, _ = full(ids, tgt)
     _, loss_diag, _ = diag(ids, tgt)
-    assert loss_full.item() == loss_diag.item()
+    # The two families decode through different kernels (full against diagonal chunked). Bitwise equality held
+    # only while the decode rounded float64 beliefs to float32; in float64 they agree to roundoff (audit
+    # 2026-10-10, item 3).
+    assert math.isclose(loss_full.item(), loss_diag.item(), rel_tol=1e-13, abs_tol=0.0)
 
 
 @pytest.mark.parametrize("override", [

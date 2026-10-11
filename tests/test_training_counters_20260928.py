@@ -13,7 +13,7 @@ import json
 import logging
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 import torch
@@ -263,8 +263,9 @@ def test_factorization_fallback_is_counted(monkeypatch: pytest.MonkeyPatch) -> N
     model = _model(cfg)
     real_status = rs._cholesky_status
 
-    def forced(G: torch.Tensor, symmetric: bool = False) -> Tuple[torch.Tensor, ...]:
-        chol, failed, screen, status = real_status(G, symmetric)
+    def forced(G: torch.Tensor, symmetric: bool = False,
+               factor: Optional[Tuple[torch.Tensor, ...]] = None) -> Tuple[torch.Tensor, ...]:
+        chol, failed, screen, status = real_status(G, symmetric, factor)
         first = G.reshape(-1, G.shape[-2], G.shape[-1])[0]
         if torch.equal(first, torch.eye(G.shape[-1], dtype=G.dtype, device=G.device)):
             return chol, failed, screen, status                        # the recovery's own refactor

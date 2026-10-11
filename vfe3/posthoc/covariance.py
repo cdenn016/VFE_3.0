@@ -85,6 +85,12 @@ def gap_applicability(model: torch.nn.Module) -> Optional[str]:
         return "heads of different sizes (a mixed so_n irrep tower) are not supported by this analysis yet"
     if getattr(model.cfg, "relational_routing", "gaussian_kl") == "mean_distance":
         return _MEAN_DISTANCE_REASON
+    from vfe3.posthoc.interventions import frames_inactive_reason
+
+    inactive = frames_inactive_reason(model, positional=True)
+    if inactive is not None:                     # audit 2026-10-10 #18
+        return (f"{inactive}: C_i = Sigma_i and (U_i^T U_i)^{{-1}} = I, so the gap would measure the stored "
+                "covariance's distance from a multiple of I, not a frame quantity")
     return None
 
 

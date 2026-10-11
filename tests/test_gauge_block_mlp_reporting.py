@@ -55,8 +55,10 @@ def test_pure_path_report_distinguishes_strict_gate_from_frame_fixed_mode():
         canonical["config_toggles"]["block_mlp_structural_mode"]
         == "canonical_frame_left_equivariant_right_fixed"
     )
-    assert canonical["gauge_flags"]["block_mlp_intertwiner_compatible"] is False
-    assert canonical["on_gauge_pure_path"] is False
+    # The realized-frame dressing U_i F(U_i^{-1} x) is covariant under the per-token action, as the
+    # reference-coordinate blocks are (audit 2026-10-10, item 42).
+    assert canonical["gauge_flags"]["block_mlp_intertwiner_compatible"] is True
+    assert canonical["on_gauge_pure_path"] is True
 
 
 def test_gauge_gate_parameter_accounting_uses_invariant_block_width():

@@ -676,7 +676,9 @@ def covariance_frozen_at_encode(cfg: object) -> bool:
     assigns its context-dependent kernel covariance. Projected gradient updates sigma unless
     ``skip_belief_sigma_update=True``. Later seams can also rewrite sigma: a block MLP with any
     non-passthrough ``block_mlp_covariance`` (the delta-method ``'delta_full'`` or the prototype-agent
-    ``'posterior'``) or CG coupling with ``cg_covariance_mode='delta_full'``. Normalization acts on the mean alone. Without those updates, tr Sigma_q(x_i) depends only
+    ``'posterior'``) or CG coupling with ``cg_covariance_mode='delta_full'``. Normalization acts on the mean alone,
+    except the block LayerNorm under ``block_norm_covariance='pushforward'``, which carries Sigma to post-norm units
+    through the context-dependent scale of the mean. Without those updates, tr Sigma_q(x_i) depends only
     on the input token, so B1/EXP-3 measures input-token variance against next-token CE.
     """
     attention_mode = getattr(cfg, "attention_mode", "projected_predictive")
@@ -688,7 +690,9 @@ def covariance_frozen_at_encode(cfg: object) -> bool:
                           and getattr(cfg, "block_mlp_covariance", "passthrough") != "passthrough")
     cg_rewrites_sigma = (bool(getattr(cfg, "use_cg_coupling", False))
                          and getattr(cfg, "cg_covariance_mode", "passthrough") == "delta_full")
-    return e_step_frozen and not (mlp_rewrites_sigma or cg_rewrites_sigma)
+    # Validation admits 'pushforward' only for a local-coordinate block LayerNorm.
+    norm_rewrites_sigma = getattr(cfg, "block_norm_covariance", "passthrough") == "pushforward"
+    return e_step_frozen and not (mlp_rewrites_sigma or cg_rewrites_sigma or norm_rewrites_sigma)
 
 
 def rank_one_residual(
@@ -1619,6 +1623,9 @@ LINK_SPECTRUM_KEYS: Tuple[str, ...] = (
     "relational_link_selfloop_spectral_radius_mean",
 )
 
+# Token positions per layer at which content_link_spectrum evaluates the self-loop spectral radius.
+SELFLOOP_RADIUS_SAMPLE: int = 256
+
 
 def _head_transfer(
     T_hat: torch.Tensor,                  # (H, d, K) ambient sending maps
@@ -1822,6 +1829,18 @@ def content_link_spectrum(
     :math:`D_i=\operatorname{diag}(\beta_{ii}^hI_d)` and :math:`\mathsf W=[W_{hg}]` (:math:`K=Hd`). Under a
     causal prior the maximum over tokens is the spectral radius of the whole-sequence fixed-routing operator.
     The mean log-modulus is NaN when any head is singular.
+
+    The self-loop radius is evaluated on at most :data:`SELFLOOP_RADIUS_SAMPLE` tokens: the evenly spaced
+    flat indices ``round(linspace(0, BN - 1, S))`` of the ``(B N)`` token axis (sequence-major, so index 0
+    is position 0 of sequence 0), every token when :math:`BN \le S`. ``_mean`` is the mean over that
+    subsample. ``_max`` is the maximum over the subsample and, when any token has :math:`D_i=I`
+    (:math:`\beta_{ii}^h=1` in every head: position 0 under a causal prior with a self key), the radius
+    :math:`\rho(rI+\mathsf W)` those tokens share, so it is exact over the subsample plus every
+    :math:`D_i=I` token. Over all tokens it is a lower bound: :math:`\rho(rI+D\mathsf W)` is not monotone in
+    :math:`D` for a non-normal :math:`\mathsf W` (a nilpotent :math:`\mathsf W` has :math:`\rho=0` while
+    :math:`\rho(D\mathsf W)>0` for some diagonal :math:`0\le D\le I`), so an unsampled token can exceed both.
+    Evaluating every token cost 4,096 host eigensolves of :math:`128\times128` matrices per layer and log row
+    at the paper base (:math:`BN=4096`, :math:`K=128`; audit 2026-10-10 #29).
     """
     heads = content_link_head_invariants(T_hat, O_hat)
     out = {
@@ -1847,9 +1866,17 @@ def content_link_spectrum(
             H, repeats = len(dims), torch.tensor(dims)
         b = beta_self.detach().to("cpu", torch.float64)
         b = b.reshape(-1, H, b.shape[-1]).transpose(-1, -2).reshape(-1, H)    # (B N, H)
-        A = b.repeat_interleave(repeats, dim=-1).unsqueeze(-1) * W_full       # (B N, K, K) = D_i W
-        rho = (eigvals_on_host(A) + (1.0 if residual else 0.0)).abs().amax(dim=-1)   # (B N,)
-        out["relational_link_selfloop_spectral_radius_max"] = float(rho.max())
+        shift = 1.0 if residual else 0.0
+        count = b.shape[0]
+        picks = torch.linspace(0, count - 1, min(count, SELFLOOP_RADIUS_SAMPLE),
+                               dtype=torch.float64).round().long()            # (S,) flat token indices
+        A = b[picks].repeat_interleave(repeats, dim=-1).unsqueeze(-1) * W_full   # (S, K, K) = D_i W
+        rho = (eigvals_on_host(A) + shift).abs().amax(dim=-1)                 # (S,)
+        rho_max = float(rho.max())
+        # Lower bound over all B N tokens, exact over the subsample and the D_i = I tokens (docstring).
+        if bool((b == 1.0).all(dim=-1).any()):                               # some token has D_i W = W
+            rho_max = max(rho_max, float((eigvals_on_host(W_full) + shift).abs().max()))
+        out["relational_link_selfloop_spectral_radius_max"] = rho_max
         out["relational_link_selfloop_spectral_radius_mean"] = float(rho.mean())
     return out
 

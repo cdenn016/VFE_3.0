@@ -104,6 +104,15 @@ def _block_mlp_diagnostic_eval(method: Callable) -> Callable:
     return guarded
 
 
+def _decode_island_dtype(x: torch.Tensor) -> torch.Tensor:
+    r"""Upcast a reduced-precision decode input to float32; float32 and float64 pass unchanged.
+
+    The decode and CE island needs at least fp32, but ``.float()`` would also round a float64 model's
+    belief to fp32 and cap every fp64 reference check at fp32 accuracy (audit 2026-10-10, item 3).
+    """
+    return x.to(torch.promote_types(x.dtype, torch.float32))
+
+
 def _derived_seed(seed: int, *stream: object) -> int:
     r"""Deterministic 63-bit generator seed for one named init stream of ``seed``.
 
@@ -302,6 +311,7 @@ class VFEModel(nn.Module):
                                 receiver_law=cfg.relational_receiver_law,
                                 receiver_update=cfg.relational_receiver_update,
                                 receiver_damping=cfg.relational_receiver_damping,
+                                receiver_measurement=cfg.relational_receiver_measurement,
                                 content_link_chart=cfg.content_link_chart,
                                 content_link_edges=cfg.content_link_edges,
                                 content_link_edge_rank=cfg.content_link_edge_rank,
@@ -319,6 +329,7 @@ class VFEModel(nn.Module):
                                 predictive_readout=cfg.predictive_readout,
                                 minimal_agent_inference=cfg.minimal_agent_inference,
                                 minimal_agent_channel_noise=cfg.minimal_agent_channel_noise,
+                                minimal_agent_cavi_steps=cfg.minimal_agent_cavi_steps,
                                 comparison_rope_base=(cfg.rope_base if cfg.pos_rotation == "rope"
                                                       and cfg.rope_space == "comparison" else None),
                                 comparison_rope_fraction=cfg.rope_fraction,
@@ -405,6 +416,7 @@ class VFEModel(nn.Module):
                     covariance_contract=cfg.block_mlp_covariance,
                     inference=cfg.block_mlp_inference,                    # read by prototype_agents only
                     template_init_variance=cfg.block_mlp_template_init_variance,
+                    cavi_steps=cfg.block_mlp_cavi_steps,                  # prototype_agents mean field only
                 )
                 for _ in range(cfg.n_layers)
             ]) if cfg.use_block_mlp else None
@@ -889,8 +901,8 @@ class VFEModel(nn.Module):
             canonical_frame = self._slice_canonical_frame(canonical_frame, last)
         with self._amp_off_context(mu_q.device):
             logits = self.prior_bank.decode(
-                mu_q.float(),
-                sigma_q.float(),
+                _decode_island_dtype(mu_q),
+                _decode_island_dtype(sigma_q),
                 canonical_frame=canonical_frame,
             )
         return logits
@@ -1172,15 +1184,20 @@ class VFEModel(nn.Module):
         # Capture regularizer state and, in projected mode, the exact decode frame. Regularizer
         # captures also retain the converged q*, live final-block prior, encode-time prior, and raw
         # pre-final_norm stack output.
+        # The prototype-template EM term is read only by a prototype_agents block MLP (else inactive).
+        em_weight = (self.cfg.block_mlp_em_weight
+                     if self.cfg.use_block_mlp and self.cfg.block_mlp_mode == "prototype_agents" else 0.0)
         cap: Optional[MStepCapture] = (
             {} if (self.cfg.mstep_self_coupling_weight > 0.0
-                   or self.cfg.cg_energy_weight > 0.0) else None
+                   or self.cfg.cg_energy_weight > 0.0 or em_weight > 0.0) else None
         )
         if cap is not None and self.cfg.cg_energy_weight > 0.0:
             # Initialize the CG moment-energy lists ONLY when the regularizer is on. A capture
             # allocated solely for M-step self-coupling leaves these keys absent, so vfe_block never
             # appends to (or stacks) a CG list (PB-13).
             cap["cg_moment_energy_rows"] = []
+        if cap is not None and em_weight > 0.0:
+            cap["block_mlp_em_rows"] = []                            # one (B, N) row tensor per layer
         # decode_coordinates='reference' receives the decode frame through a private out-param, so the
         # captureless fast paths (content-factor reuse, mean-only final layer) stay available.
         decode_frame_out: Optional[dict] = (
@@ -1203,11 +1220,12 @@ class VFEModel(nn.Module):
         # Decode + cross-entropy fp32 island. The decode matmul (_decode_diagonal) reconstructs the
         # Mahalanobis term via a catastrophically-cancelling subtraction pinned at atol-1e-3, and CE
         # is a log-sum-exp over V=50257; both MUST stay fp32 even when amp_dtype is on. The
-        # load-bearing guard is the explicit .float() on the inputs (autocast(enabled=False) only
+        # load-bearing guard is the explicit upcast of the inputs (autocast(enabled=False) only
         # blocks FURTHER downcasting -- it does NOT upcast a tensor that already arrived bf16 from
-        # the autocast E-step), mirroring retraction.py's in-island sigma.float(). On the default
-        # fp32 path .float() is a value-identical no-op AND the island is a nullcontext (see
-        # _amp_off_context), so this block is byte-identical to the no-AMP build.
+        # the autocast E-step), mirroring retraction.py's in-island sigma.float(). The upcast is
+        # _decode_island_dtype, so a float64 model decodes in float64. On the default fp32 path it is
+        # a value-identical no-op AND the island is a nullcontext (see _amp_off_context), so this
+        # block is byte-identical to the no-AMP build.
         # Select the same decoder record PriorBank.decode uses. Capability routing and fused
         # dispatch come from this one registration. logits is None on the fused branch by design.
         active_decode_mode = self.cfg.decode_mode
@@ -1226,23 +1244,23 @@ class VFEModel(nn.Module):
                 if active_decode_mode != "linear":
                     if canonical_frame is None:
                         fused_result = decode_registration.fused_ce(
-                            self.prior_bank, mu_final.float(), sigma_final.float(), targets,
+                            self.prior_bank, _decode_island_dtype(mu_final), _decode_island_dtype(sigma_final), targets,
                             **fused_kwargs,
                         )
                     else:
                         fused_result = decode_registration.fused_ce(
-                            self.prior_bank, mu_final.float(), sigma_final.float(), targets,
+                            self.prior_bank, _decode_island_dtype(mu_final), _decode_island_dtype(sigma_final), targets,
                             canonical_frame=canonical_frame,
                             **fused_kwargs,
                         )
                 elif canonical_frame is None:
                     fused_result = decode_registration.fused_ce(
-                        self.prior_bank, mu_final.float(), targets,
+                        self.prior_bank, _decode_island_dtype(mu_final), targets,
                         **fused_kwargs,
                     )
                 else:                                            # decode_coordinates='reference'
                     fused_result = decode_registration.fused_ce(
-                        self.prior_bank, mu_final.float(), targets,
+                        self.prior_bank, _decode_island_dtype(mu_final), targets,
                         canonical_frame=canonical_frame,
                         **fused_kwargs,
                     )
@@ -1279,13 +1297,13 @@ class VFEModel(nn.Module):
                 ce_targets = targets
                 if active_decode_mode != "linear":
                     degenerate = self.prior_bank.decode_degenerate_positions(
-                        sigma_final.float(),
+                        _decode_island_dtype(sigma_final),
                         canonical_frame=canonical_frame,
                     )
                     if degenerate is not None:
                         ce_targets = torch.where(
                             degenerate, targets.new_full((), -100), targets)
-                flat_logits = logits.reshape(-1, self.cfg.vocab_size).float()
+                flat_logits = _decode_island_dtype(logits.reshape(-1, self.cfg.vocab_size))
                 flat_targets = ce_targets.reshape(-1)
                 # Branchless masked mean (no host sync to test .any()): sum-reduced CE over the
                 # non-ignored tokens divided by a device-side clamped count. An all-ignore microbatch
@@ -1373,6 +1391,20 @@ class VFEModel(nn.Module):
                 "cg_moment_energy_layers": layer_means.detach(),
                 "objective_total_with_cg": loss.detach(),
             }
+        if em_weight > 0.0:
+            # EM M-step term on the prototype templates (audit 2026-10-10, item 24):
+            # L_EM = -w sum_l mean_i Q_il, the mean over the scored tokens (targets != -100) of each layer's rows
+            # Q_il = sum_a rbar_ia [log pihat_a + log N(xibar_i; nu_a, Lambda_a) - sum_k cbar_ik / (2 lambda_ak)]
+            # (PrototypeAgentBlockMLP.em_objective). The block-input moments and the template weights are detached,
+            # so the gradient is the M-step's and reaches only (nu, log lambda, log pi). Added to loss, not to ce.
+            em_rows = cap["block_mlp_em_rows"]                                 # n_layers x (B, N)
+            if len(em_rows) != self.cfg.n_layers:
+                raise RuntimeError(f"block_mlp_em_weight>0 requires one EM row tensor per layer "
+                                   f"(n_layers={self.cfg.n_layers}); got {len(em_rows)}")
+            scored = (targets != -100)                                         # (B, N)
+            n_scored = scored.sum().clamp_min(1)
+            em_objective = sum((rows * scored.to(rows.dtype)).sum().to(loss.dtype) for rows in em_rows) / n_scored
+            loss = loss - em_weight * em_objective
         # TODO(canonical-vfe-phi-mstep): `loss` is the outer supervised objective (CE plus
         # enabled outer regularizers), so the pullback/group phi step consumes its covector.
         # Add a separately selected fixed-returned-state VFE frame objective, declare whether
@@ -1657,8 +1689,14 @@ class VFEModel(nn.Module):
             H, K = len(ops.irrep_dims), ops.input_dim
             b = beta.diagonal(dim1=-2, dim2=-1).to(torch.float64)              # (B, H, N) beta_ii^h
             b = b.reshape(-1, H, b.shape[-1]).transpose(-1, -2).reshape(-1, H)  # (B N, H)
-            A = b.repeat_interleave(K // H, dim=-1).unsqueeze(-1) * W.reshape(-1, K, K)   # (B N, K, K) D_i W_i
-            from vfe3.metrics import eigvals_on_host as _eigvals_on_host
+            from vfe3.metrics import SELFLOOP_RADIUS_SAMPLE, eigvals_on_host as _eigvals_on_host
+            # The same evenly spaced token subsample as vfe3.metrics.content_link_spectrum: the max is a
+            # lower bound over all tokens (audit 2026-10-10, item 29).
+            count = b.shape[0]
+            picks = torch.linspace(0, count - 1, min(count, SELFLOOP_RADIUS_SAMPLE),
+                                   dtype=torch.float64).round().long().to(b.device)   # (S,) flat token indices
+            A = (b[picks].repeat_interleave(K // H, dim=-1).unsqueeze(-1)
+                 * W.reshape(-1, K, K)[picks])                                  # (S, K, K) D_i W_i
             rho = (_eigvals_on_host(A) + (1.0 if ops.attention_residual else 0.0)).abs().amax(dim=-1)
         d["relational_link_selfloop_spectral_radius_max"] = float(rho.max())
         d["relational_link_selfloop_spectral_radius_mean"] = float(rho.mean())
@@ -1798,8 +1836,87 @@ class VFEModel(nn.Module):
                 "relational_self_lock_argmax_layer": self_layer,
                 "relational_self_lock_argmax_head": self_head}
 
+    def _canonical_free_energy_diagnostics(
+        self,
+        snapshot:    DiagnosticSnapshot,
+        layer_index: int,
+        beta:        torch.Tensor,             # (B, H, N, N) the layer's captured router
+        support:     torch.Tensor,             # (B, H, N, N) bool causal support
+    ) -> dict:
+        r"""Canonical free energy of one layer at the beliefs its router read (``diagnose_canonical_free_energy``).
+
+        The input beliefs :math:`q_i` (the stack-entry belief at layer 0, else the previous layer's
+        output), the live prior :math:`p_i` entering the layer and the realized frames
+        :math:`U_i = e^{\phi_i\cdot G}e^{Y_i\cdot G}R_i^\top` (RoPE folded as in :meth:`_relational_frames`,
+        rebuilt in float64; fixed through the stack) give, per token, in float64,
+
+        .. math::
+            F_i = \alpha_iD(q_i\|p_i) + R(\alpha_i)
+                  + \lambda_\beta\sum_h\Big[\sum_j\beta^{*h}_{ij}D^h_{ij}
+                  + \tau_h\sum_j\beta^{*h}_{ij}\log\frac{\beta^{*h}_{ij}}{\pi^h_{ij}}\Big],
+
+        the reference free energy of :func:`vfe3.free_energy.free_energy` with the transported head
+        energies and canonical router of :func:`vfe3.free_energy.canonical_routing_rows`. The self term
+        is the registered form of the M-step term (``self_coupling_alpha``, its :math:`R(\alpha)` zero
+        under ``constant``) on the same seam and ``kl_max``; :math:`\tau_h` is the layer's routing
+        temperature. The columns are per-token means over the batch: ``self_coupling``,
+        ``self_divergence`` (the unweighted :math:`D(q_i\|p_i)`), ``belief_coupling`` and
+        ``attention_entropy`` (summed over heads, unweighted by :math:`\lambda_\beta`) and ``total``
+        (:math:`F_i`). ``canonical_beta_tv`` is the mean total variation
+        :math:`\tfrac12\sum_j|\beta^h_{ij} - \beta^{*h}_{ij}|` between the model's router and
+        :math:`\beta^*` over the (batch, head, query) rows with at least two admissible sources.
+        """
+        from vfe3.alpha_i import alpha_is_per_coord, self_coupling_alpha
+        from vfe3.families import get_family
+        from vfe3.free_energy import attention_tau, canonical_routing_rows, self_divergence_for_alpha
+        cfg, group = self.cfg, self.group
+        layer = layer_index % cfg.n_layers
+        q = snapshot.initial_belief if layer == 0 else snapshot.layer_outputs[layer - 1]
+        mu_p, sigma_p = snapshot.layer_priors[layer]
+        start = snapshot.initial_belief
+        device = q.mu.device
+        with torch.autocast(device_type=device.type, enabled=False):
+            frame_inverse = torch.linalg.matrix_exp(
+                -group.embed_algebra(start.phi.double(), dtype=torch.float64))          # (B, N, K, K)
+            if start.right_phi is not None:
+                frame_inverse = torch.linalg.matrix_exp(
+                    -group.embed_algebra(start.right_phi.double(), dtype=torch.float64)) @ frame_inverse
+            if snapshot.rope is not None:
+                frame_inverse = snapshot.rope.double() @ frame_inverse              # U_i^{-1} = R_i e^{-Y G} e^{-phi G}
+            tau = self.relational_operators_by_layer[layer].routing_temperature(
+                attention_tau(_as_coeff(cfg.kappa_beta, device), group.irrep_dims, device=device),
+                torch.float64)
+            rows = canonical_routing_rows(q.mu, q.sigma, frame_inverse, snapshot.log_prior,
+                                          tau=tau, irrep_dims=list(group.irrep_dims))
+            fam = get_family(cfg.family)
+            self_div = self_divergence_for_alpha(                               # (B, N) or (B, N, K)
+                self._family_instance(fam, q.mu.double(), q.sigma.double()),
+                self._family_instance(fam, mu_p.double(), sigma_p.double()),
+                kl_max=cfg.kl_max, eps=cfg.eps, lambda_alpha_mode=cfg.lambda_alpha_mode)
+            alpha, alpha_reg = self_coupling_alpha(
+                self_div, mode=cfg.lambda_alpha_mode, value=cfg.lambda_alpha,
+                b0=_as_coeff(cfg.b0, device), c0=_as_coeff(cfg.c0, device))
+            self_row, raw_row = alpha * self_div + alpha_reg, self_div
+            if alpha_is_per_coord(cfg.lambda_alpha_mode):
+                self_row, raw_row = self_row.sum(dim=-1), raw_row.sum(dim=-1)  # (B, N)
+            scored = support.sum(dim=-1) >= 2                                  # (B, H, N)
+            tv = 0.5 * (beta.double() - rows.beta).abs().sum(dim=-1)            # (B, H, N)
+        self_coupling = float(self_row.mean())
+        belief_coupling = float(rows.belief_coupling.sum(dim=1).mean())
+        attention_entropy = float(rows.attention_entropy.sum(dim=1).mean())
+        return {
+            "self_coupling": self_coupling,
+            "self_divergence": float(raw_row.mean()),
+            "belief_coupling": belief_coupling,
+            "attention_entropy": attention_entropy,
+            "total": self_coupling + float(cfg.lambda_beta) * (belief_coupling + attention_entropy),
+            "relational_legacy_global_f_available": 1.0,
+            "canonical_beta_tv": float(tv[scored].mean()) if bool(scored.any()) else float("nan"),
+        }
+
     def _relational_diagnostics(self, snapshot: DiagnosticSnapshot, layer_index: int = -1) -> dict:
-        """Report the actual relational router and fixed-context cost; legacy global-F fields are unavailable."""
+        """Report the actual relational router and fixed-context cost; the legacy global-F fields are NaN
+        unless ``diagnose_canonical_free_energy`` (:meth:`_canonical_free_energy_diagnostics`)."""
         cap = self._layer_capture(snapshot, layer_index)
         beta, score = cap["beta_pre"], cap["score_energy_pre"]
         ops = self.relational_operators_by_layer[layer_index]
@@ -1827,6 +1944,8 @@ class VFEModel(nn.Module):
             attn_entropy_min=(float(entropy[scorable].min()) if scorable.any() else float("nan")),
             relational_score_klmax_frac=self._klmax_frac(score, support, cap_level),
         )
+        if self.cfg.diagnose_canonical_free_energy:
+            d.update(self._canonical_free_energy_diagnostics(snapshot, layer_index, beta, support))
         from vfe3 import metrics
         d["covariance_available"] = 1.0
         d["belief_cond_median"] = float("nan")
@@ -2010,7 +2129,9 @@ class VFEModel(nn.Module):
         through :meth:`_relational_diagnostics` at the last layer, plus the layer maxima of its guard
         columns (:meth:`_layer_guard_maxima`, keys ending ``_layer_max``). Routing and readout do not
         define one shared stationary objective, so the legacy global free-energy fields
-        (``self_coupling``, ``belief_coupling``, ``attention_entropy``, ``total``, ...) are NaN.
+        (``self_coupling``, ``belief_coupling``, ``attention_entropy``, ``total``, ...) are NaN, except
+        under ``diagnose_canonical_free_energy``, which evaluates the canonical free energy at the
+        beliefs the router read (:meth:`_canonical_free_energy_diagnostics`).
         ``log_likelihood`` is accepted for call-site compatibility and unused.
         """
         snapshot = (self.build_diagnostic_snapshot(token_ids, return_logits=False) if snapshot is None

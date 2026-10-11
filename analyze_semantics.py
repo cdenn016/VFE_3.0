@@ -1,7 +1,7 @@
 r"""Click-to-run: semantic geometry of one trained run (:mod:`vfe3.semantics`).
 
-Edit ``CONFIG`` below and run ``python analyze_semantics.py``, or pass a run directory as the only
-command-line argument to override ``CONFIG["run_dir"]``. The run directory needs ``config.json`` and
+Edit ``CONFIG`` below and run ``python analyze_semantics.py``; there is no command-line
+configuration. The run directory needs ``config.json`` and
 the checkpoint (``best_model.pt``); ``provenance.json`` / ``summary.json`` are not required.
 Figures (PNG 300 dpi + PDF), markdown tables, ``metrics.json``, ``candidate_ids.npy`` and
 ``REPORT.md`` are written to ``<run_dir>/semantics`` unless ``CONFIG["out_dir"]`` names another
@@ -30,7 +30,6 @@ BLAS/OpenMP pools honor them; ``analyze_run`` additionally pins torch and the po
 """
 
 import os
-import sys
 
 CONFIG = {
     "run_dir":             "D:/DATA_KEEP/30.14_wikitext-103_K160_n=256_6-layer",
@@ -65,12 +64,10 @@ for _variable in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 
-def main(argv: "list[str]") -> None:
+def main() -> None:
     from vfe3.semantics.report import analyze_run
 
-    if len(argv) > 2:
-        raise SystemExit(f"usage: {argv[0]} [run_dir]")
-    run_dir = argv[1] if len(argv) == 2 else CONFIG["run_dir"]
+    run_dir = CONFIG["run_dir"]                     # click-to-run: no command-line configuration
     options = {key: value for key, value in CONFIG.items() if key not in ("run_dir", "out_dir", "checkpoint")}
     options.update(OVERRIDES)
     options["threads"] = _THREADS
@@ -82,4 +79,4 @@ def main(argv: "list[str]") -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv)
+    main()

@@ -302,33 +302,44 @@ def _projected_moments_tile(
     role-stacked pair; the stacked form returns a leading ``R`` axis and batches
     the covariance contraction across roles while keeping one frame map.
     ``head_dims`` (validated by :func:`projected_moments`) routes a full covariance through
-    :func:`_head_block_covariance`. The tile is pinned to IEEE fp32 itself, so a checkpointed
+    :func:`_head_block_covariance`. A diagonal covariance takes the source root
+    (:func:`_diagonal_root_moments`). The tile is pinned to IEEE fp32 itself, so a checkpointed
     recompute in backward runs under the same matmul policy as the forward (audit 2026-10-09 #15).
     """
     diagonal = Sigma_h.shape == mu_h.shape
     dtype = _compute_dtype(mu_h, Sigma_h, inverse_blocks, S)
     with torch.autocast(device_type=mu_h.device.type, enabled=False):
-        mu = mu_h.to(dtype)
-        Sigma = Sigma_h.to(dtype)
         inverse = inverse_blocks.to(dtype)
-        if S.ndim == 3:
+        if diagonal:
+            # G = X X^T with X = S U^{-1} diag(sigma)^{1/2}; neither L = S U^{-1} nor L Sigma is formed
+            # (audit 2026-10-10 #28). Role-stacked maps are one (R H, r, K) contraction sharing xi and W.
+            maps = (S if S.ndim == 4 else S.unsqueeze(0)).to(dtype)                    # (R, H, r, K)
+            a, X = _diagonal_root_moments(_head_shared(mu_h).to(dtype), _head_shared(Sigma_h).to(dtype),
+                                          inverse, maps)                               # (..., N, R, H, r[, K])
+            G = X @ X.transpose(-1, -2)                                                 # (..., N, R, H, r, r)
+            if S.ndim == 3:
+                a, G = a.squeeze(-3), G.squeeze(-4)                                     # (..., N, H, r[, r])
+            else:
+                # The layout of a role-stacked contraction, (R, ..., N, H, r[, r]).
+                a, G = a.movedim(-3, 0).contiguous(), G.movedim(-4, 0).contiguous()
+        elif S.ndim == 3:
+            mu = mu_h.to(dtype)
+            Sigma = Sigma_h.to(dtype)
             L = _projected_linear_map(S.to(dtype), inverse)  # (..., N, H, r, d)
             a = (L @ mu.unsqueeze(-1)).squeeze(-1)
-            if diagonal:
-                G = (L * Sigma.unsqueeze(-2)) @ L.transpose(-1, -2)
-            elif head_dims is not None:
+            if head_dims is not None:
                 G = _head_block_covariance(L, Sigma, len(head_dims), S.ndim == 4)
             else:
                 G = L @ Sigma @ L.transpose(-1, -2)
         else:
+            mu = mu_h.to(dtype)
+            Sigma = Sigma_h.to(dtype)
             # Role-stacked maps: one map per role, batched into a single G contraction.
             L = torch.stack(
                 [_projected_linear_map(S[role].to(dtype), inverse) for role in range(S.shape[0])],
                 dim=0)  # (R, ..., N, H, r, d)
             a = (L @ mu.unsqueeze(-1).unsqueeze(0)).squeeze(-1)  # (R, ..., N, H, r)
-            if diagonal:
-                G = (L * Sigma.unsqueeze(0).unsqueeze(-2)) @ L.transpose(-1, -2)
-            elif head_dims is not None:
+            if head_dims is not None:
                 G = _head_block_covariance(L, Sigma, len(head_dims), S.ndim == 4)
             else:
                 G = L @ Sigma.unsqueeze(0) @ L.transpose(-1, -2)
@@ -336,6 +347,53 @@ def _projected_moments_tile(
         # Keep the covariance exactly symmetric for strict zero-jitter Cholesky.
         G = .5 * G + .5 * G.transpose(-1, -2)
     return a, G
+
+
+def _head_shared(x: torch.Tensor) -> torch.Tensor:  # (..., N, H, K) -> (..., N, 1, K) when head-broadcast
+    r"""The head-0 slice of a head-broadcast tensor (stride 0 on the head axis, as ``expand`` builds it)."""
+    return x[..., :1, :] if x.stride(-2) == 0 else x
+
+
+def _diagonal_root_moments(
+    mu:      torch.Tensor,             # (..., N, h, K), h = 1 for a head-shared mean or H
+    sigma:   torch.Tensor,             # (..., N, h, K) diagonal variances, h = 1 or H
+    inverse: torch.Tensor,             # (..., N, H', K, K) dense or (..., N, M, d, d) compact U^{-1} blocks
+    S:       torch.Tensor,             # (R, H, r, K) comparison maps, one per role
+) -> Tuple[torch.Tensor, torch.Tensor]:  # a (..., N, R, H, r), X (..., N, R, H, r, K)
+    r"""Projected means and source roots of a diagonal covariance for every role's comparison map.
+
+    With :math:`\xi_i = U_i^{-1}\mu_i` and :math:`W_i = U_i^{-1}\operatorname{diag}(\sigma_i)^{1/2}`,
+
+    .. math::
+        a_i = S\xi_i, \qquad X_i = S W_i, \qquad
+        X_i X_i^\top = S U_i^{-1}\operatorname{diag}(\sigma_i) U_i^{-\top} S^\top = G_i,
+
+    so neither :math:`L = S U^{-1}` nor :math:`L\operatorname{diag}(\sigma)` is formed, and :math:`W` keeps
+    the block structure of compact :math:`U^{-1}` blocks. A head-shared mean or variance (``h = 1``, the
+    head-0 slice of :func:`_head_shared`) gives :math:`\xi` or :math:`W` once per token instead of once per
+    head, and the roles then contract as one stacked ``(R H, r, K)`` map.
+    """
+    R, H, r, K = S.shape
+    root = sigma.sqrt()                                                            # (..., N, h, K)
+    if inverse.shape[-2:] == (K, K):
+        # Dense blocks (..., N, H', K, K): W = U^{-1} diag(sigma)^{1/2} column-scales each block.
+        xi = (inverse @ mu.unsqueeze(-1)).squeeze(-1)                              # (..., N, h, K)
+        W = inverse * root.unsqueeze(-2)                                           # (..., N, h, K, K)
+        X = (_projected_linear_map(S.flatten(0, 1), W).unflatten(-3, (R, H)) if W.shape[-3] == 1
+             else _projected_linear_map(S, W.unsqueeze(-4)))                       # (..., N, R, H, r, K)
+    else:
+        M, d = inverse.shape[-3], inverse.shape[-1]
+        blocks = inverse.unsqueeze(-4)                                             # (..., N, 1, M, d, d)
+        xi = (blocks @ mu.unflatten(-1, (M, d)).unsqueeze(-1)).flatten(-3)         # (..., N, h, K)
+        W = blocks * root.unflatten(-1, (M, d)).unsqueeze(-2)                      # (..., N, h, M, d, d)
+        X = (_projected_linear_map(S.flatten(0, 1), W.squeeze(-4)).unflatten(-3, (R, H)) if W.shape[-4] == 1
+             else torch.einsum("Rhrmd,...hmde->...Rhrme", S.unflatten(-1, (M, d)), W).flatten(-2))
+    if xi.shape[-2] == 1:
+        # One (tokens, K) x (K, R H r) GEMM, not a broadcast batched matvec per (token, role, head).
+        a = (xi.squeeze(-2) @ S.flatten(0, 2).transpose(0, 1)).unflatten(-1, (R, H, r))
+    else:
+        a = torch.einsum("Rhrk,...hk->...Rhr", S, xi)                              # (..., N, R, H, r)
+    return a, X
 
 
 def _head_block_covariance(
@@ -382,12 +440,76 @@ def _head_block_covariance(
     return G
 
 
+class _GramPrecision(torch.autograd.Function):
+    r"""Zero-jitter Cholesky :math:`G = C C^\top` with :math:`P = G^{-1}` and :math:`\log\det G`, closed-form backward.
+
+    Returns ``(chol, failed, P, logdet)``. The forward is bitwise the unfused computation: ``cholesky_ex``,
+    the failure mask of :func:`_cholesky_status`, ``cholesky_inverse`` with failed entries reading the
+    identity factor, and :math:`\log\det G = 2\sum_a \log C_{aa}`. For symmetric :math:`G`,
+    :math:`dP = -P\,dG\,P` and :math:`d\log\det G = \operatorname{tr}(P\,dG)` give
+
+    .. math::
+        \bar G = -P \operatorname{sym}(\bar P) P + \bar\ell P + \bar G_C,
+        \qquad \operatorname{sym}(X) = \tfrac12 (X + X^\top),
+
+    two r x r products per entry instead of the two batched triangular solves of the Cholesky backward
+    (audit 2026-10-10 #27). :math:`\bar G_C = C^{-\top} \Phi(C^\top \bar C) C^{-1}` is the Cholesky backward
+    of a factor cotangent :math:`\bar C` (Murray, arXiv:1602.07527, the formula autograd applies to
+    ``cholesky_ex``), present only when a recovery path reads the factor itself. Every term is symmetric,
+    the convention of torch's Cholesky backward. Failed entries receive zero gradient. The forward and
+    the backward run at IEEE fp32.
+    """
+
+    @staticmethod
+    def forward(ctx, G: torch.Tensor) -> Tuple[torch.Tensor, ...]:  # G: (..., r, r)
+        with ieee_fp32_matmul():
+            chol, info = torch.linalg.cholesky_ex(G, check_errors=False)
+            failed = (info != 0) | ~torch.isfinite(chol).all(dim=(-2, -1))                 # (...)
+            eye = torch.eye(G.shape[-1], device=G.device, dtype=G.dtype)
+            P = torch.cholesky_inverse(torch.where(failed[..., None, None], eye, chol))      # (..., r, r)
+        logdet = 2 * chol.diagonal(dim1=-2, dim2=-1).log().sum(-1)                         # (...)
+        ctx.save_for_backward(chol, P, failed)
+        ctx.mark_non_differentiable(failed)
+        ctx.set_materialize_grads(False)
+        return chol, failed, P, logdet
+
+    @staticmethod
+    def backward(
+        ctx,
+        g_chol:   Optional[torch.Tensor],  # (..., r, r)
+        g_failed: Optional[torch.Tensor],
+        g_P:      Optional[torch.Tensor],  # (..., r, r)
+        g_logdet: Optional[torch.Tensor],  # (...)
+    ) -> Optional[torch.Tensor]:           # (..., r, r) symmetric
+        chol, P, failed = ctx.saved_tensors
+        grad = None
+        with ieee_fp32_matmul():
+            if g_P is not None:
+                grad = -(P @ (.5 * (g_P + g_P.transpose(-1, -2))) @ P)
+            if g_logdet is not None:
+                term = g_logdet[..., None, None] * P
+                grad = term if grad is None else grad + term
+            if g_chol is not None:
+                phi = (chol.transpose(-1, -2) @ g_chol).tril()
+                phi = .5 * (phi + phi.tril(-1).transpose(-1, -2))
+                term = torch.linalg.solve_triangular(chol.transpose(-1, -2), phi, upper=True, left=True)
+                term = torch.linalg.solve_triangular(chol, term, upper=False, left=False)
+                grad = term if grad is None else grad + term
+        return None if grad is None else grad.masked_fill(failed[..., None, None], 0.)
+
+
 @ieee_fp32_matmul()
-def _cholesky_status(G: torch.Tensor, symmetric: bool = False) -> Tuple[torch.Tensor, ...]:
+def _cholesky_status(
+    G:         torch.Tensor,
+    symmetric: bool = False,
+    factor:    Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,  # (chol, failed, P) of G
+) -> Tuple[torch.Tensor, ...]:
     r"""Factor G and certify eps ||G||_F ||G^{-1}||_F <= tol for every float32 entry on device.
 
     ``symmetric=True`` is the caller's certificate that G is bitwise symmetric (built as
     0.5 (G + G^T)), and skips the elementwise symmetry check; externally supplied G keeps it.
+    ``factor`` is the ``(chol, failed, P)`` of G from :class:`_GramPrecision`: the factorization is then
+    not repeated, and the certificate reads that ``P``, bitwise the inverse it would otherwise form.
 
     ``tol`` is ``projected_gram_condition_tol`` (``_GRAM_CONDITION_TOL``, default 1e-4).
 
@@ -403,15 +525,20 @@ def _cholesky_status(G: torch.Tensor, symmetric: bool = False) -> Tuple[torch.Te
     The certificate is evaluated only under :func:`projected_condition_recovery`. Otherwise
     ``screen`` is all False and only failed factorizations are flagged for recovery.
     """
-    chol, info = torch.linalg.cholesky_ex(G, check_errors=False)
+    if factor is None:
+        chol, info = torch.linalg.cholesky_ex(G, check_errors=False)
+    else:
+        chol, failed, inverse = factor
     with torch.no_grad():
-        failed = (info != 0) | ~torch.isfinite(chol).all(dim=(-2, -1))
+        if factor is None:
+            failed = (info != 0) | ~torch.isfinite(chol).all(dim=(-2, -1))
         screen = torch.zeros_like(failed)
         r = G.shape[-1]
         if G.dtype == torch.float32 and r > 1 and _CONDITION_RECOVERY:
-            eye = torch.eye(r, device=G.device, dtype=G.dtype)
-            safe_factor = torch.where(failed[..., None, None], eye, chol)
-            inverse_norm = torch.cholesky_inverse(safe_factor).norm(dim=(-2, -1))
+            if factor is None:
+                eye = torch.eye(r, device=G.device, dtype=G.dtype)
+                inverse = torch.cholesky_inverse(torch.where(failed[..., None, None], eye, chol))
+            inverse_norm = inverse.norm(dim=(-2, -1))
             certificate = (torch.finfo(G.dtype).eps * G.norm(dim=(-2, -1)) * inverse_norm
                            > _GRAM_CONDITION_TOL)
             screen = (~failed) & certificate
@@ -689,10 +816,40 @@ def _strict_cholesky(
             # Never backpropagate through a failed Cholesky, even with zero cotangent.
             safe = torch.where(failed[..., None, None], torch.eye(r, device=G.device, dtype=G.dtype), G)
             chol = _strict_cholesky(safe)[0].double()
-        chol[failed] = recovered
+        # Out of place: for float64 inputs .double() returns the factor autograd saved, so an in-place write
+        # would fail its backward (audit 2026-10-10 remediation).
+        chol = chol.index_put((failed,), recovered)
         _count_source_recovery(failed)
         return chol, failed
     return chol, None
+
+
+def _same_source(
+    projection_q: Optional[Tuple[torch.Tensor, ...]],
+    projection_k: Optional[Tuple[torch.Tensor, ...]],
+) -> bool:
+    r"""Whether two source tuples read the same elements: one tuple, or per position one tensor or two
+    views of one base with equal geometry (the head expansions ``relational_score`` builds per role)."""
+    if projection_q is projection_k:
+        return True
+    if projection_q is None or projection_k is None or len(projection_q) != len(projection_k):
+        return False
+    return all(x is y or (x._base is not None and x._base is y._base and x.dtype == y.dtype
+                          and x.shape == y.shape and x.stride() == y.stride()
+                          and x.storage_offset() == y.storage_offset())
+               for x, y in zip(projection_q, projection_k))
+
+
+def _factor_logdet(
+    chol:            torch.Tensor,            # (..., N, H, r, r) factor the caller scores with
+    prepared_factor: torch.Tensor,            # the prepared factor of its role
+    prepared_logdet: Optional[torch.Tensor],  # (..., N, H) from _GramPrecision, or None
+) -> torch.Tensor:                            # (..., N, H)
+    r""":math:`\log\det G = 2\sum_a \log C_{aa}`; the prepared value of :class:`_GramPrecision` (bitwise the
+    same, closed-form backward) when ``chol`` is the prepared factor itself."""
+    if prepared_logdet is not None and chol is prepared_factor:
+        return prepared_logdet
+    return 2 * chol.diagonal(dim1=-2, dim2=-1).log().sum(-1)
 
 
 def projected_gaussian_kl(
@@ -748,6 +905,10 @@ def projected_gaussian_kl(
     returned values, the certificate and the recovery decision are bitwise those of the default. When
     either role needs recovery, the query factor also enters the factor-route trace
     :math:`\lVert L_j^{-1} L_i \rVert_F^2`, so it is recomputed with autograd before recovery.
+
+    ``G_q is G_k`` (``tie_comparison_maps`` scoring a belief against itself; on the factor route the two
+    source tuples must also read the same tensors) factors the covariance once and both roles read that
+    factorization; the values and recovery decisions are those of two factorizations.
     """
     if a_q.ndim < 3 or a_k.ndim < 3 or a_q.shape[-2:] != a_k.shape[-2:]:
         raise ValueError("projected means must have matching head and comparison dimensions")
@@ -766,16 +927,38 @@ def projected_gaussian_kl(
             return (_factor_status(G, projection, symmetric_inputs) if factored
                     else _cholesky_status(G, symmetric_inputs))
 
-        with torch.set_grad_enabled(torch.is_grad_enabled() and query_row_constant_grad):
-            q_status = _status(Gq, projection_q)
-        k_status = _status(Gk, projection_k)
-        # Optional per-(batch, head) GEMM error estimate; its verdict joins the single decision read below.
-        slice_shape = torch.broadcast_shapes(aq.shape[:-3], ak.shape[:-3]) + aq.shape[-2:-1]  # (..., H)
+        # One covariance for both roles (tie_comparison_maps scoring a belief against itself; on the
+        # factor route also one source root): the key factorization serves the query role too, detached
+        # under query_row_constant_grad=False (audit 2026-10-10 #33). The Gram-route status reads G only.
+        tied = G_q is G_k and (not factored or _same_source(projection_q, projection_k))
+        if tied:
+            Gk = Gq
+        query_grad = torch.is_grad_enabled() and query_row_constant_grad
+        if not tied:
+            with torch.set_grad_enabled(query_grad):
+                q_status = _status(Gq, projection_q)
         # The key precision from the prepared factors (failed entries read the identity) serves the
         # estimate and, on the healthy path, the GEMM: one token-linear inverse either way.
-        with ieee_fp32_matmul():
-            k_prec_prepared = torch.cholesky_inverse(torch.where(
-                k_status[1][..., None, None], torch.eye(r, device=Gk.device, dtype=dtype), k_status[0]))
+        if factored:
+            k_status = _status(Gk, projection_k)
+            with ieee_fp32_matmul():
+                k_prec_prepared = torch.cholesky_inverse(torch.where(
+                    k_status[1][..., None, None], torch.eye(r, device=Gk.device, dtype=dtype), k_status[0]))
+            k_logdet_prepared = None
+        else:
+            # Gram route: one factorization returns the key factor, P_j and log det G_j with the closed-form
+            # backward of _GramPrecision; the healthy path reads only P_j and log det G_j (audit 2026-10-10 #27).
+            chol_prepared, failed_prepared, k_prec_prepared, k_logdet_prepared = _GramPrecision.apply(Gk)
+            k_status = _cholesky_status(Gk, symmetric_inputs,
+                                        factor=(chol_prepared, failed_prepared, k_prec_prepared))
+        if tied:
+            q_status, q_logdet_prepared = ((k_status, k_logdet_prepared) if query_grad else
+                                           ((k_status[0].detach(), *k_status[1:]),
+                                            None if k_logdet_prepared is None else k_logdet_prepared.detach()))
+        else:
+            q_logdet_prepared = None
+        # Optional per-(batch, head) GEMM error estimate; its verdict joins the single decision read below.
+        slice_shape = torch.broadcast_shapes(aq.shape[:-3], ak.shape[:-3]) + aq.shape[-2:-1]  # (..., H)
         verdicts = [(torch.isfinite(aq).all() & torch.isfinite(ak).all()).reshape(1), q_status[-1], k_status[-1]]
         if gemm_expansion_tol is not None:
             # Key entries the recovery will rebuild leave the GEMM (their pairs take the factor route), so
@@ -795,7 +978,10 @@ def projected_gaussian_kl(
         if not query_row_constant_grad and torch.is_grad_enabled() and (decisions[3] or decisions[7]):
             # Recovery reads the query factor beyond its log-determinant: refactor it with autograd.
             # The factorization is deterministic, so the factor, masks and decisions are unchanged.
-            q_status = _status(Gq, projection_q)
+            if tied:
+                q_status, q_logdet_prepared = k_status, k_logdet_prepared
+            else:
+                q_status = _status(Gq, projection_q)
         chol_q, rec_q = _strict_cholesky(Gq, projection_q, (*q_status[:3], decisions[1:5]), factored)
         chol_k, rec_k = _strict_cholesky(Gk, projection_k, (*k_status[:3], decisions[5:9]), factored)
         # Only tiles that touch a recovered query or key entry need the factor-route
@@ -846,8 +1032,8 @@ def projected_gaussian_kl(
         if factor_trace_any:
             q_factor = q_factor.movedim(-3, -4)           # (..., H, Nq, r, r)
             k_factor = k_factor.movedim(-3, -4)
-        logdet_q = 2 * chol_q.diagonal(dim1=-2, dim2=-1).log().sum(-1).transpose(-1, -2)
-        logdet_k = 2 * chol_k.diagonal(dim1=-2, dim2=-1).log().sum(-1).transpose(-1, -2)
+        logdet_q = _factor_logdet(chol_q, q_status[0], q_logdet_prepared).transpose(-1, -2)
+        logdet_k = _factor_logdet(chol_k, k_status[0], k_logdet_prepared).transpose(-1, -2)
         if factor_trace_any:
             # Healthy factors round-trip bit-exactly through the cast, so the working-dtype
             # log-determinants repeat the no-recovery arithmetic exactly.
@@ -1037,6 +1223,7 @@ def _projected_kl_direct_tile(
     return _projected_kl_tile(aq, ak, q_cov, k_prec, logdet_q, logdet_k, False)
 
 
+@ieee_fp32_matmul()
 def _projected_kl_tile(
     aq:       torch.Tensor,  # (..., H, I, r)
     ak:       torch.Tensor,  # (..., H, J, r)
@@ -1046,7 +1233,11 @@ def _projected_kl_tile(
     logdet_k: torch.Tensor,
     factor_trace: bool,
 ) -> torch.Tensor:
-    r"""Compute one KL tile; tr(Gk^-1 Gq) = ||Lk^-1 Lq||_F^2 on the factor route."""
+    r"""Compute one KL tile; tr(Gk^-1 Gq) = ||Lk^-1 Lq||_F^2 on the factor route.
+
+    Pinned to IEEE fp32 itself, so the factor-route tiles and their checkpointed recompute run under the
+    same matmul policy as the other scorer tiles (audit 2026-10-10 #45).
+    """
     delta = aq.unsqueeze(-2) - ak.unsqueeze(-3)
     if factor_trace:
         Lk = k_matrix.unsqueeze(-4)
