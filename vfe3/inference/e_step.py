@@ -128,7 +128,7 @@ def build_belief_transport(
     transport_mode:              str                                         = "flat",   # connection-regime registry key
     gauge_mode:                  str                                         = "learned", # 'learned' | 'trivial' (forwarded to the builder)
     rope_insertion:              str = "right",   # "right" (pure, folded frame) | "left" (legacy)
-    compact_phi_block_transport: bool                                        = False,    # packed phi factors for canonical flat block_glk
+    compact_phi_block_transport: bool                                        = False,    # compact head-block factors (equal head-block groups)
     require_vertex_factors:       bool                                        = False,    # exact flat vertex representation even for a single block
     validity_max_norm:           Optional[float]                             = None,     # fail-closed chart radius (None -> VFE3Config.transport_chart_max_norm default)
     mu:                          Optional[torch.Tensor]                      = None,     # belief-dependent builder reads these
@@ -144,8 +144,8 @@ def build_belief_transport(
     r"""Build the FORWARD belief-transport for one E-step iteration (the hot path, P0 #2).
 
     On the flat + block-diagonal-with-equal-blocks path (``_can_fuse_flat``) returns a
-    :class:`FactoredTransport` -- or, for the opt-in canonical block_glk P1 route, a
-    :class:`CompactFactoredTransport` -- containing per-token exps only, NEVER the dense
+    :class:`FactoredTransport` -- or, with ``compact_phi_block_transport`` on a group whose generators live
+    on equal head blocks, a :class:`CompactFactoredTransport` -- containing per-token exps only, NEVER the dense
     (B,N,N,K,K) Omega. Single-block groups and the trivial gauge fall back to ``_transport``'s
     DENSE Omega; that fallback is REGISTRY-driven (belief tensors gated on the registration's
     ``needs_mu`` / ``needs_sigma`` flags, never on literal mode names).

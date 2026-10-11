@@ -88,7 +88,16 @@ def test_public_basis_changes_withdraw_shortcuts(mutation: str) -> None:
         torch.testing.assert_close(embedded_phi_frobenius_norm(phi, group, warn_fallback=False),
                                    torch.linalg.matrix_norm(expected), rtol=0, atol=0)
     transport = build_factored_transport(phi, group, compact_blocks=True)
-    assert not isinstance(transport, CompactFactoredTransport)
+    if mutation == "trainable":
+        assert not isinstance(transport, CompactFactoredTransport)        # the dense embedding keeps the graph
+    else:
+        # The packed-coordinate reshape is withdrawn. The mutated basis still lives on the head blocks, so the
+        # compact route embeds through its blocks (audit 2026-10-10, item 26) and equals the dense factors.
+        assert isinstance(transport, CompactFactoredTransport)
+        from vfe3.geometry.lie_ops import CompactBlockElement
+        dense = build_factored_transport(phi, group, compact_blocks=False)
+        torch.testing.assert_close(CompactBlockElement(transport.exp_blocks, 4).to_dense(), dense.exp_phi,
+                                   rtol=1e-12, atol=1e-14)
     if mutation == "in_place":
         from vfe3.geometry.lie_ops import gram_pinv
         actual = group.gram_pinv()

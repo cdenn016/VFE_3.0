@@ -1190,7 +1190,7 @@ def build_factored_transport(
 
     *,
     gauge_mode:              str                    = "learned",   # 'learned' (Regime I flat) or 'trivial'
-    compact_blocks:          bool                   = False,       # canonical block_glk: retain (..., N, H, d, d) factors
+    compact_blocks:          bool                   = False,       # equal head-block groups: retain (..., N, H, d, d) factors
     validity_max_norm:       Optional[float]        = None,        # fail-closed chart radius (None -> VFE3Config.transport_chart_max_norm default)
     right_phi:               Optional[torch.Tensor] = None,        # (..., N, n_gen) exact right factor exp(Y)
     _content_token_ids:      Optional[torch.Tensor] = None,        # private certified table-lookup identity
@@ -1200,8 +1200,10 @@ def build_factored_transport(
     Builds only the per-token vertex exponentials exp(phi_i), exp(-phi_j) (the same factors
     ``compute_transport_operators`` builds) and the ``ikl,jlm->ijkm`` Omega einsum is NEVER run.
     With ``compact_blocks=True`` on canonical uncoupled ``block_glk``, both the algebra embedding
-    and the returned factors retain ``(..., N, H, d, d)`` storage; every other group and the
-    default keep the legacy dense-vertex :class:`FactoredTransport` representation.
+    and the returned factors retain ``(..., N, H, d, d)`` storage; a basis certified by
+    :meth:`~vfe3.geometry.groups.GaugeGroup.head_block_generators` (every generator supported on equal head
+    blocks) embeds through its blocks and returns the same storage. Every other group and the default keep
+    the legacy dense-vertex :class:`FactoredTransport` representation.
     Consumers read the vertex factors directly (P0 #2); here it only requires the exps, which the
     block-diagonal exp machinery already produces. Rank-agnostic
     via the leading ellipsis: a (B, N, n_gen) frame (batched forward) and a (N, n_gen) frame (the
@@ -1215,13 +1217,17 @@ def build_factored_transport(
     """
     validity_max_norm = _group_chart_radius(group, validity_max_norm)
     block_dims = group.irrep_dims if len(group.irrep_dims) > 1 else None
-    compact = (
+    elementary = (
         compact_blocks
         and group.elementary_block_shape is not None
         and block_dims is not None
         and len(set(block_dims)) == 1
         and group.generator_shape[0] == len(block_dims) * block_dims[0] * block_dims[0]
     )
+    # Any other basis supported on equal head blocks (block_so, block_co, block_glmc, shared block_glk,
+    # an equal-block so_n tower) embeds through its head blocks instead (audit 2026-10-10, item 26).
+    head_blocks = None if elementary or not compact_blocks else group.head_block_generators()
+    compact = elementary or head_blocks is not None
     if gauge_mode == "trivial":
         # Trivial gauge: exp = I. Build the same per-token factors the dense path would (the
         # caller's guard normally excludes trivial, but keep the container well-formed).
@@ -1241,10 +1247,17 @@ def build_factored_transport(
 
     if compact:
         H, d = len(block_dims), block_dims[0]
-        # generate_glk_multihead orders the canonical uncoupled block_glk coordinates as
-        # H consecutive row-major d x d matrices. The reshape is therefore the exact algebra
-        # embedding with the structural zero off-block entries omitted.
-        phi_blocks = phi.reshape(*phi.shape[:-1], H, d, d)
+
+        def _embed(coordinates: torch.Tensor) -> torch.Tensor:          # (..., n_gen) -> (..., H, d, d)
+            # generate_glk_multihead orders the canonical uncoupled block_glk coordinates as
+            # H consecutive row-major d x d matrices. The reshape is therefore the exact algebra
+            # embedding with the structural zero off-block entries omitted; another head-block basis
+            # contracts the coordinates with its blocks, M_h = sum_a phi_a G_a^(h).
+            if elementary:
+                return coordinates.reshape(*coordinates.shape[:-1], H, d, d)
+            return _embed_algebra_fp32_floor(coordinates, head_blocks, pattern="...a,ahij->...hij")
+
+        phi_blocks = _embed(phi)
         # The former autocast-dtype downcast here (dtype parity with the dense
         # einsum(phi, generators) route) is removed by audit 2026-07-25 F2: it rounded the ALGEBRA
         # element to bf16 before exponentiation, so the fp32 store floor in the exp helper could not
@@ -1256,7 +1269,7 @@ def build_factored_transport(
         # consistent float64 pair rather than a float64 factor times a float32-rounded inverse.
         right_pair = None
         if right_phi is not None:
-            right_blocks = right_phi.reshape(*right_phi.shape[:-1], H, d, d)
+            right_blocks = _embed(right_phi)
 
             def _build_right(force_fp64: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
                 return _stable_compact_glk_exp_pair(

@@ -115,8 +115,9 @@ coincide only when no seam densifies the covariance (see the configuration secti
 SPD family closed under the block_glk congruence. It is stored in the dense $(K, K)$ layout
 with zero off-head blocks, and the moment-matched update returns the head blocks
 $U_{i,h}[C_i^{\mathrm{att}}]_{hh}U_{i,h}^\top$, the moment projection onto the family, which
-does not depend on the frame. It is defined on the kernel predictive readout with per-head
-block_glk frames, edge links off, a passthrough block MLP, and the `linear`,
+does not depend on the frame. It is defined on the kernel predictive readout with compact
+head-block frames (block_glk, block_so, block_co, block_glmc or an equal-block so_n tower, any
+tying), edge links off, a passthrough block MLP, and the `linear`,
 `diagonal_chunked` or `full_chunked` decoders (the diagonal decoder reads
 $\operatorname{diag}\Sigma_i$, exact up to a per-position constant). With identity frames
 (`gauge_transport="off"`), `prior_covariance_table="block_cholesky"` replaces the diagonal
