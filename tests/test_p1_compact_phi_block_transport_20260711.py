@@ -11,6 +11,7 @@ from vfe3.config import VFE3Config
 from vfe3.geometry.groups import GaugeGroup, get_group
 from vfe3.geometry.lie_ops import (
     _COMPOSE,
+    CompactBlockElement,
     _equal_diag_blocks,
     compose_bch,
     compose_phi,
@@ -210,7 +211,9 @@ def test_compact_phi_block_transport_keeps_float64_under_autocast() -> None:
     assert torch.equal(compact.exp_blocks, _equal_diag_blocks(legacy.exp_phi, 2, 2))
 
 
-def test_compact_phi_block_transport_rejects_unmarked_same_shape_basis() -> None:
+def test_compact_phi_block_transport_embeds_an_unmarked_same_shape_basis_through_its_blocks() -> None:
+    r"""The packed-coordinate reshape needs the certified row-major basis; any other basis supported on the head
+    blocks takes the compact route through its blocks (audit 2026-10-10, item 26), with the dense values."""
     canonical = get_group("block_glk")(4, 2)
     custom = GaugeGroup(
         name="block_glk",
@@ -225,8 +228,11 @@ def test_compact_phi_block_transport_rejects_unmarked_same_shape_basis() -> None
         custom,
         compact_phi_block_transport=True,
     )
+    dense = build_belief_transport(phi, custom, compact_phi_block_transport=False)
 
-    assert isinstance(transport, FactoredTransport)
+    assert isinstance(transport, CompactFactoredTransport) and isinstance(dense, FactoredTransport)
+    torch.testing.assert_close(CompactBlockElement(transport.exp_blocks, 4).to_dense(), dense.exp_phi,
+                               rtol=1e-6, atol=1e-7)
 
 
 def test_compose_registry_default_call_does_not_require_compact_keyword() -> None:

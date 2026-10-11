@@ -288,7 +288,6 @@ def test_diagonal_and_full_family_paths_do_not_enable_the_block_update() -> None
      "attention_mode"),
     (dict(predictive_readout="minimal_agent", attention_residual=False), "predictive_readout"),
     (dict(content_link_edges="lowrank"), "content_link_edges"),
-    (dict(gauge_tying="shared"), "gauge_tying"),
     (dict(decode_mode="family_chunked"), "decode_mode"),
     (dict(decode_mode="expected_likelihood_chunked"), "decode_mode"),
     (dict(block_mlp_mode="prototype_agents", block_mlp_covariance="posterior", block_mlp_inference="exact"),

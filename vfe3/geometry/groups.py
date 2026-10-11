@@ -114,6 +114,8 @@ class GaugeGroup:
     _gram_uniform_cache:  Optional[float]        = field(default=None, init=False, repr=False, compare=False)
     _gram_uniform_key:    Optional[tuple]        = field(default=None, init=False, repr=False, compare=False)
     _gram_uniform_ready:  bool                   = field(default=False, init=False, repr=False, compare=False)
+    _head_block_cache:    Optional[torch.Tensor] = field(default=None, init=False, repr=False, compare=False)
+    _head_block_key:      Optional[tuple]        = field(default=None, init=False, repr=False, compare=False)
 
     @property
     def generator_shape(self) -> Tuple[int, int, int]:
@@ -191,6 +193,33 @@ class GaugeGroup:
         if phi.dtype != torch.float64 and torch.is_autocast_enabled(phi.device.type):
             matrix = matrix.to(torch.get_autocast_dtype(phi.device.type))
         return matrix
+
+    def head_block_generators(self) -> Optional[torch.Tensor]:   # (n_gen, H, d, d), or None
+        r"""The diagonal head blocks :math:`G_a^{(h)}` of a basis supported on equal head blocks, else None.
+
+        Every generator of ``block_so``, ``block_co``, ``block_glmc``, shared-tied ``block_glk`` and an
+        equal-block ``so_n`` tower vanishes off the ``irrep_dims`` diagonal blocks, so every group element is
+        block-diagonal, :math:`\exp(\sum_a\phi_aG_a) = \bigoplus_h\exp(M_h)` with :math:`M_h = \sum_a\phi_aG_a^{(h)}`,
+        and the transport keeps compact ``(..., N, H, d, d)`` vertex factors (audit 2026-10-10, item 26). The
+        support is checked exactly, once per basis (one host read), and cached on the generator key. The
+        canonical per-head ``block_glk`` basis, whose coordinates are the blocks themselves, returns None: its
+        compact route reshapes ``phi``. A trainable basis returns None too, so the dense embedding keeps its graph.
+        """
+        dims = self.irrep_dims
+        if (len(dims) < 2 or len(set(dims)) != 1 or self.elementary_block_shape is not None
+                or self._generator_source.requires_grad):
+            return None
+        key = self._generator_cache_key()
+        if self._head_block_key != key:
+            G = self.generators.detach()                                                  # (n_gen, K, K)
+            H, d = len(dims), dims[0]
+            on_block = torch.block_diag(*(torch.ones(d, d, dtype=torch.bool, device=G.device) for _ in range(H)))
+            supported = not bool((G[:, ~on_block] != 0).any())
+            self._head_block_cache = (
+                torch.stack([G[:, h * d:(h + 1) * d, h * d:(h + 1) * d] for h in range(H)], dim=1).contiguous()
+                if supported else None)                                                   # (n_gen, H, d, d)
+            self._head_block_key = key
+        return self._head_block_cache
 
     def generator_traces(self) -> torch.Tensor:
         r"""Return $\operatorname{tr}(G_a)$ in coordinate order without a dense basis."""
@@ -426,8 +455,9 @@ def _build_block_glk(
     ``tying='shared'`` builds the diagonal subgroup :math:`\{I_H\otimes g : g\in GL(d)\}`, one
     GL(d_head) element acting identically on every head: generators :math:`I_H\otimes E_{ab}` in
     row-major (a, b) order, n_gen = d_head^2, Frobenius Gram :math:`H\,I`. No generator lives on
-    one block, so the per-block metrics and the per-head compact fast paths do not apply; the
-    group carries no ``phi_coordinate_layout`` and takes the dense transport route.
+    one block, so the per-block metrics and the packed-coordinate fast paths do not apply; the
+    group carries no ``phi_coordinate_layout``. Its elements are still block-diagonal, so the transport
+    keeps compact head blocks through :meth:`GaugeGroup.head_block_generators`.
     """
     if K % n_heads != 0:
         raise ValueError(f"K={K} must be divisible by n_heads={n_heads}")
@@ -672,8 +702,9 @@ def _build_block_local(
     (:func:`vfe3.geometry.generators.generate_block_local`), built in float64 and cast. ``local``
     must have Frobenius Gram ``gram_weight`` times the identity (orthonormal by default), which the
     build verifies, so the generator Gram is ``gram_weight * I``.
-    The group carries no ``phi_coordinate_layout`` and takes the dense transport route; registered
-    block-local groups use :func:`_build_block_local` from their own builder.
+    The group carries no ``phi_coordinate_layout``; its transport keeps compact head blocks through
+    :meth:`GaugeGroup.head_block_generators`. Registered block-local groups use :func:`_build_block_local`
+    from their own builder.
     """
     local = local.to(torch.float64)
     m = local.shape[0]

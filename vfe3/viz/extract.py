@@ -667,7 +667,14 @@ def _act_on_frame(
     g:     torch.Tensor,                   # (..., N, H, d, d) head-block or (..., N, K, K) dense group elements
     frame: CanonicalFrameContext,
 ) -> CanonicalFrameContext:
-    r"""Passive frame action :math:`U_i \mapsto g_i U_i`, :math:`U_i^{-1} \mapsto U_i^{-1} g_i^{-1}`."""
+    r"""Passive frame action :math:`U_i \mapsto g_i U_i`, :math:`U_i^{-1} \mapsto U_i^{-1} g_i^{-1}`.
+
+    A dense ``g`` on a compact frame acts through its head blocks: a group whose frames are compact has every
+    element block-diagonal over the heads (:meth:`vfe3.geometry.groups.GaugeGroup.head_block_generators`).
+    """
+    if frame.block_diagonal and g.dim() == frame.forward.dim() - 1:            # dense g on a compact frame
+        H, d = frame.forward.shape[-3], frame.forward.shape[-1]
+        g = torch.stack([g[..., h * d:(h + 1) * d, h * d:(h + 1) * d] for h in range(H)], dim=-3)
     g_inv = torch.linalg.inv(g)
     if frame.block_diagonal:
         return CanonicalFrameContext(g @ frame.forward, frame.inverse @ g_inv, True)

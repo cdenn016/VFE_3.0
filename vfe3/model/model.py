@@ -762,8 +762,10 @@ class VFEModel(nn.Module):
         return torch.autocast(device_type=device.type, enabled=False)
 
     def _compact_phi_blocks_enabled(self) -> bool:
-        r"""Whether this model is on the canonical route supported by packed phi transport."""
-        return self.group.phi_coordinate_layout == "block_head_row_major"
+        r"""Whether the transport keeps compact head-block vertex factors: the packed canonical ``block_glk``
+        coordinates, or any basis supported on equal head blocks (audit 2026-10-10, item 26)."""
+        return (self.group.phi_coordinate_layout == "block_head_row_major"
+                or self.group.head_block_generators() is not None)
 
     def _apply_pos_phi(self, phi: torch.Tensor) -> torch.Tensor:
         r"""Return stored left coordinates for the group-product positional frame."""

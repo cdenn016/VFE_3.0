@@ -84,12 +84,11 @@ def test_tied_block_glk_frames_are_identical_across_heads() -> None:
     group = get_group("block_glk")(6, 2, tying="shared", dtype=torch.float64)
     phi = 0.4 * torch.randn(1, 4, 9, generator=torch.Generator().manual_seed(1), dtype=torch.float64)
     frame = build_factored_transport(phi, group, compact_blocks=True)
-    U = frame.exp_phi                                                    # (1, N, 6, 6) dense route
-    first, second = _blocks(U, [3, 3])
+    U = frame.exp_blocks                                                 # (1, N, 2, 3, 3) compact head blocks
+    first, second = U[..., 0, :, :], U[..., 1, :, :]
     torch.testing.assert_close(first, second, atol=0, rtol=0)
     torch.testing.assert_close(first, torch.linalg.matrix_exp(phi.reshape(1, 4, 3, 3)), atol=1e-12, rtol=1e-12)
-    assert float(U[..., :3, 3:].abs().max()) == 0.0 and float(U[..., 3:, :3].abs().max()) == 0.0
-    torch.testing.assert_close(frame.exp_neg_phi @ U, torch.eye(6, dtype=torch.float64).expand_as(U),
+    torch.testing.assert_close(frame.inv_blocks @ U, torch.eye(3, dtype=torch.float64).expand_as(U),
                                atol=1e-12, rtol=0)
 
 

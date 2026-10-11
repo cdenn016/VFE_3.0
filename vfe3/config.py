@@ -176,7 +176,8 @@ class VFE3Config:
     # "gaussian_diagonal" | "gaussian_full" | "laplace_diagonal" | "gaussian_block"
     # The belief covariance structure (read diagonal_covariance, never a second flag).
     #   gaussian_block  one SPD d_head x d_head block per head, stored in the dense (K, K) layout. only:
-    #                   projected_predictive, predictive_readout="kernel", block_glk per_head, content_link_edges
+    #                   projected_predictive, predictive_readout="kernel", equal head blocks (block_glk, block_so,
+    #                   block_co, block_glmc or an equal-block so_n tower; any tying), content_link_edges
     #                   "off", decode_mode "linear" | "diagonal_chunked" | "full_chunked"; a block MLP covariance
     #                   is read through its head-block projection (posterior needs block_mlp_inference="mean_field")
     family:                           str             = "gaussian_diagonal"
@@ -1159,7 +1160,7 @@ class VFE3Config:
         _family_cls = get_family(self.family)
         # Head-block family (gaussian_block): exact only where every producer keeps one SPD block per head --
         # the kernel predictive readout's moment-matched head-block projection (or passthrough), mean-only
-        # block maps, compact per-head block_glk frames, and decoders that score a full-layout covariance
+        # block maps, compact head-block frames, and decoders that score a full-layout covariance
         # against the diagonal bank exactly (full_chunked) or up to a per-position constant (diagonal_chunked).
         if _family_cls.head_block_covariance:
             block_problems = []
@@ -1167,9 +1168,14 @@ class VFE3Config:
                 block_problems.append(f"attention_mode={self.attention_mode!r} (requires 'projected_predictive')")
             if self.predictive_readout != "kernel":
                 block_problems.append(f"predictive_readout={self.predictive_readout!r} (requires 'kernel')")
-            if self.gauge_group != "block_glk" or self.gauge_tying not in (None, "per_head"):
-                block_problems.append(f"gauge_group={self.gauge_group!r}, gauge_tying={self.gauge_tying!r} "
-                                      "(requires block_glk with per-head frames)")
+            # Any group declaring the head-block family has every element block-diagonal over its heads, so its
+            # frames are compact head blocks when the heads are equal (GaugeGroup.head_block_generators).
+            from vfe3.geometry.groups import declared_invariant_families
+            if ("gaussian_block" not in declared_invariant_families(self.gauge_group)
+                    or len(set(self.head_dims)) != 1):
+                block_problems.append(f"gauge_group={self.gauge_group!r} with head sizes {self.head_dims} (requires "
+                                      "equal head blocks of a group that preserves them: block_glk, block_so, "
+                                      "block_co, block_glmc or an equal-block so_n tower)")
             if self.content_link_edges != "off":
                 block_problems.append(f"content_link_edges={self.content_link_edges!r} (requires 'off')")
             if self.decode_mode not in ("linear", "diagonal_chunked", "full_chunked"):
