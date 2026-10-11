@@ -20,6 +20,8 @@ CUDA_TESTS: frozenset[str] = frozenset({
     # The training loop on the device: fused AdamW, autocast, transfers, CUDA RNG restore, evaluation.
     'test_cuda_training_lane_20261010.py::test_cuda_resume_matches_the_uninterrupted_run',
     'test_cuda_training_lane_20261010.py::test_cuda_evaluate_matches_cpu_evaluate',
+    # Fused Triton expected-likelihood CE against the torch route, reproducibility and timing (2026-10-10).
+    'test_expected_likelihood_kernel_20261010.py::test_cuda_triton_route_matches_torch_and_is_reproducible',
 })
 
 CUDA_MIRROR_TESTS: frozenset[str] = frozenset({
