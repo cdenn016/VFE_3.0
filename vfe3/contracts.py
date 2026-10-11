@@ -299,6 +299,9 @@ class MStepCapture(TypedDict, total=False):
     # appends its D(q_post||q_pre) rows to ``cg_moment_energy_rows``. A capture allocated only for
     # M-step self-coupling never carries the key.
     cg_moment_energy_rows: List[torch.Tensor]
+    # Prototype-template EM M-step term. Present ONLY when cfg.block_mlp_em_weight>0 on a prototype_agents
+    # block MLP; each block appends its (B, N) rows Q_i (PrototypeAgentBlockMLP.em_objective).
+    block_mlp_em_rows: List[torch.Tensor]
 
 
 class EStepGradientRecord(TypedDict, total=False):

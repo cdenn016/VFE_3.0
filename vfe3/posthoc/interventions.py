@@ -132,6 +132,47 @@ def _refuse_minimal_agent(model: torch.nn.Module, row: str) -> None:
                             "minimal-agent label posterior does not call")
 
 
+def frames_inactive_reason(model: torch.nn.Module, *, positional: bool = True) -> Optional[str]:
+    r"""Why every realized frame of ``model`` is the identity, else ``None``.
+
+    The frame-free cases of the semantics rule (:func:`vfe3.semantics.run.load_semantic_run` sets
+    ``frames_active = gauge_transport == 'on' and n_gen > 0``): ``gauge_transport='off'``, which coerces
+    ``phi_scale=0``, ``m_phi_lr=0`` and ``pos_phi='none'`` and refuses a frame-space RoPE, and a group
+    without generators; and a token-frame table that starts at zero and never moves (``phi_scale=0``
+    with ``m_phi_lr=0``). ``gauge_transport='frozen'`` is not frame-free here: its random fixed frames act
+    on every forward pass, so removing them is a measured intervention (the semantics module skips
+    them because they carry no learned geometry, not because they are the identity). With
+    ``positional`` (the composed frame :math:`U_i = \exp(X_{x_i})\exp(Y_i)` of rows 9-12 and the
+    routing-covariance gap) a positional factor (``pos_phi`` or a frame-space RoPE fold) keeps the
+    frames active; without it (row 7, the token factor alone) it does not (audit 2026-10-10 #18).
+    """
+    cfg = model.cfg
+    if getattr(cfg, "gauge_transport", "on") == "off":
+        return ("gauge_transport='off': every realized frame is the identity (phi_scale=0, m_phi_lr=0 and "
+                "pos_phi='none' are coerced)")
+    table = getattr(model.prior_bank, "phi_embed", None)
+    if table is not None and int(table.shape[-1]) == 0:
+        reason = "the gauge group has no generators, so every token frame is the identity"
+    elif float(getattr(cfg, "phi_scale", 1.0)) == 0.0 and float(getattr(cfg, "m_phi_lr", 1.0)) == 0.0:
+        reason = "phi_scale=0 with m_phi_lr=0: the token frames start at the identity and never move"
+    else:
+        return None
+    if positional and (getattr(model, "pos_phi_free", None) is not None
+                       or getattr(cfg, "pos_phi", "none") != "none"
+                       or (getattr(cfg, "pos_rotation", "none") != "none"
+                           and getattr(cfg, "rope_space", "frame") != "comparison")):
+        return None
+    return reason
+
+
+def _refuse_inactive_frames(model: torch.nn.Module, *, positional: bool) -> None:
+    r"""Raise :class:`NotApplicable` when the frames a row removes are already the identity."""
+    reason = frames_inactive_reason(model, positional=positional)
+    if reason is not None:
+        raise NotApplicable(f"{reason}: removing the frames changes nothing, so the row would report a "
+                            "measured zero effect")
+
+
 # ----------------------------------------------------------------------------------------------
 # Rows 2 and 3: the routing softmax
 # ----------------------------------------------------------------------------------------------
@@ -236,6 +277,7 @@ def token_frames_identity(model: torch.nn.Module) -> Iterator[Dict[str, Any]]:
     table = getattr(model.prior_bank, "phi_embed", None)
     if table is None:
         raise NotApplicable("the prior bank has no phi_embed table")
+    _refuse_inactive_frames(model, positional=False)
     with swap_parameter_data(table, zeros_view(table)):
         yield {"table": "prior_bank.phi_embed"}
 
@@ -490,6 +532,10 @@ def _require_static_routing_covariance(model: torch.nn.Module) -> None:
         raise NotApplicable(
             "the block MLP propagates the covariance (covariance_contract != 'passthrough'), so the routing "
             "covariance is not the static C_i of the normal form")
+    if getattr(model.cfg, "block_norm_covariance", "passthrough") == "pushforward":
+        raise NotApplicable(
+            "block_norm_covariance='pushforward': the block LayerNorm carries the covariance to post-norm units at "
+            "every layer, so the routing covariance is not the static C_i of the normal form")
 
 
 def _norm_plan(model: torch.nn.Module, norm: Any, norm_type: str) -> str:
@@ -703,7 +749,9 @@ def frames_removed(model: torch.nn.Module, roles: Sequence[str]) -> Iterator[Dic
     composed frame (token and positional factors together) from their role; rows 7 and 8 separate the two
     factors across all roles.
 
-    **Scope.** Outside the normal form each row raises :class:`NotApplicable` with the reason: no relational
+    **Scope.** Each row raises :class:`NotApplicable` when every realized frame is already the identity
+    (:func:`frames_inactive_reason`), where it would report a measured zero. Outside the normal form each
+    row raises :class:`NotApplicable` with the reason: no relational
     predictive content on every layer, frame-space RoPE (``rope_space='frame'``; a comparison-space RoPE
     leaves the frames alone, and row 10's scorer refuses it), frame-intrinsic beliefs, a non-``per_token`` encoder, a head
     mixer or CG coupling; row 10 also needs covariance passthrough in attention and MLP, row 11 a mean-only
@@ -718,6 +766,7 @@ def frames_removed(model: torch.nn.Module, roles: Sequence[str]) -> Iterator[Dic
     if unknown or not wanted:
         raise ValueError(f"roles must be a nonempty subset of {FRAME_ROLES}, got {sorted(wanted)}")
     roles = tuple(role for role in FRAME_ROLES if role in wanted)
+    _refuse_inactive_frames(model, positional=True)
     _require_normal_form(model)
     cfg = model.cfg
     for role in roles:
@@ -730,6 +779,10 @@ def frames_removed(model: torch.nn.Module, roles: Sequence[str]) -> Iterator[Dic
         _require_static_routing_covariance(model)
         record["intercepted_calls"] = 0
     if ROLE_NORM_MLP in roles:
+        if getattr(cfg, "block_norm_covariance", "passthrough") == "pushforward":
+            raise NotApplicable(
+                "block_norm_covariance='pushforward': the block LayerNorm also pushes the covariance through its "
+                "local-coordinate Jacobian, so its reference conjugate is not the normal form's mean-only normalization")
         norm_plan = _norm_plan(model, getattr(model, "block_norm", None), cfg.norm_type_block)
         final_plan = _norm_plan(model, getattr(model, "final_norm", None), cfg.norm_type_final)
         mlp_plans = [_mlp_plan(m) for m in (getattr(model, "block_mlps", None) or ())]

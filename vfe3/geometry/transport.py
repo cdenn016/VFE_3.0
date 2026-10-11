@@ -16,7 +16,7 @@ from torch import nn
 from vfe3.config import VFE3Config
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.lie_ops import CompactBlockElement
-from vfe3.contracts import host_check, mark_gathered_frame_pair
+from vfe3.contracts import host_check, host_read, mark_gathered_frame_pair
 from vfe3.runtime import ieee_fp32_matmul
 
 if TYPE_CHECKING:
@@ -1049,8 +1049,9 @@ def _checked_group_inverse_certified(
         # vfe3.contracts.deferred_host_checks it joins the next mandatory host read.
         host_check(flags, lambda host: _group_inverse_verdict(host, False, omega.dtype, residual, residual_tol))
         return inverse, False
-    # The single host read for the whole strict certificate.
-    host = flags.tolist()
+    # The single host read for the whole strict certificate; host_read first resolves any queued
+    # raise-only verdict (the compact chart-radius check), in registration order.
+    host = host_read(flags)
     escalate = bool(host[-1])
     _group_inverse_verdict(host, escalate, omega.dtype, residual, residual_tol)
     return inverse, escalate
@@ -1113,22 +1114,29 @@ def _stable_compact_glk_exp_pair(
     """
     validity_max_norm = _resolve_chart_max_norm(validity_max_norm)
     # The chart radius bounds the Frobenius norm of the whole block-diagonal element, as on the
-    # dense route; both decisions share one host read.
+    # dense route; both decisions share one host read. The verdict only raises and every consumer of
+    # this pair sits behind the scorer's first host_read (the certified inverse below reads through
+    # host_read too), so inside vfe3.contracts.deferred_host_checks it joins that read instead of
+    # synchronizing here (audit 2026-10-10, item 61).
     with torch.no_grad():
         raw_mat_norm = blocks.square().sum(dim=(-3, -2, -1)).sqrt()
         decisions = torch.stack(((~torch.isfinite(raw_mat_norm)).any(),
                                  (raw_mat_norm > validity_max_norm).any()))
-    nonfinite, outside_chart = decisions.tolist()
-    if nonfinite:
-        raise ValueError(
-            "transport chart validity bound encountered a nonfinite matrix norm"
-        )
-    if outside_chart:
-        observed = float(raw_mat_norm.max())
-        raise ValueError(
-            "transport chart validity bound exceeded before the matrix exponential: "
-            f"observed ||M||_F={observed:.6g} > transport_chart_max_norm={validity_max_norm:.6g}"
-        )
+
+    def _chart_verdict(host: List[bool]) -> None:
+        nonfinite, outside_chart = host
+        if nonfinite:
+            raise ValueError(
+                "transport chart validity bound encountered a nonfinite matrix norm"
+            )
+        if outside_chart:
+            observed = float(raw_mat_norm.max())
+            raise ValueError(
+                "transport chart validity bound exceeded before the matrix exponential: "
+                f"observed ||M||_F={observed:.6g} > transport_chart_max_norm={validity_max_norm:.6g}"
+            )
+
+    host_check(decisions, _chart_verdict)
 
     # Represented fp32 storage floor; the exponential is evaluated at the storage precision.
     store_dtype = blocks.dtype if blocks.dtype in (torch.float32, torch.float64) else torch.float32

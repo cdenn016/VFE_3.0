@@ -3908,6 +3908,22 @@ def _resources_record(
     return record
 
 
+def _cumulative_wall_time(
+    artifacts: "RunArtifacts",
+    wall_time: Optional[float],
+) -> Tuple[Optional[float], Optional[float]]:
+    r"""Return ``(run-total wall time, wall time carried in by the resumed checkpoint)``.
+
+    The launchers time ``train()`` in their own process, so a resumed run's ``wall_time`` covers only the
+    continuation; the checkpoint's carried wall clock (the same offset metrics.csv ``wall_clock_s`` uses)
+    is added so summary.json and resources.json report the whole run (audit 2026-10-10, item 51).
+    """
+    resumed = getattr(artifacts, "resumed_wall_clock_s", None)
+    if wall_time is None or resumed is None:
+        return wall_time, resumed
+    return float(wall_time) + float(resumed), float(resumed)
+
+
 def finalize_run(
     model:       torch.nn.Module,
     artifacts:   RunArtifacts,
@@ -3940,6 +3956,7 @@ def finalize_run(
     logger = logger or logging.getLogger(__name__)
     if device is None:
         device = next(model.parameters()).device
+    wall_time, resumed_wall_time = _cumulative_wall_time(artifacts, wall_time)
 
     final_step = getattr(artifacts, "final_step", None)
     final_val_fields = {
@@ -4183,6 +4200,7 @@ def finalize_run(
         ),
         "final_train_loss": (losses[-1] if losses else None),
         "wall_time_s":  wall_time,
+        "wall_time_resumed_s": resumed_wall_time,     # carried in by a resumed checkpoint (in wall_time_s)
         "decode_mode":     cfg.decode_mode,
         "decode_tau_eff":  decode_tau_eff,
         "phi_chart_norm_route": _phi_chart_norm_route(model, cfg),
@@ -4370,6 +4388,12 @@ def collect_beta_channel_decomposition(
     while its graded positional shape is flattened. A configuration carrying no attention log-prior
     at all therefore leaves ``no_prior`` equal to ``full``, correctly reporting that this model has
     no positional channel to ablate.
+
+    Under ``pos_rotation='rope'`` position also enters through the routing cost itself (the rotated
+    comparison moments, or the rotation folded into the frame), so ``no_energy`` then removes RoPE
+    position together with content. A fourth arm ``no_rope`` keeps the cost and the prior and removes
+    only the rotation; ``delta_ce.rope_position_channel`` reports it and ``energy_includes_rope_position``
+    flags the reading (audit 2026-10-10, item 5).
     """
     import torch.nn.functional as F
     from vfe3 import free_energy as free_energy_module
@@ -4400,6 +4424,21 @@ def collect_beta_channel_decomposition(
         intercepted["n"] += 1
         return _patched(energy, tau=tau, log_prior=log_prior)
 
+    cfg = getattr(model, "cfg", None)
+    rope_active = getattr(cfg, "pos_rotation", "none") == "rope"
+    operators = list(getattr(model, "relational_operators_by_layer", None) or [])
+    comparison_bases = [getattr(ops, "comparison_rope_base", None) for ops in operators]
+
+    def _set_rope(enabled: bool) -> None:
+        # Comparison-space RoPE lives on each layer's operators; frame-space RoPE is the model's rotation.
+        for ops, base in zip(operators, comparison_bases):
+            if base is not None:
+                ops.comparison_rope_base = base if enabled else None
+        if enabled:
+            model.__dict__.pop("_rope_rotation", None)
+        elif getattr(cfg, "rope_space", "frame") == "frame":
+            model._rope_rotation = lambda n, device: None
+
     cpu_rng = torch.get_rng_state().clone()
     cuda_rng = ([state.clone() for state in torch.cuda.get_rng_state_all()]
                 if torch.cuda.device_count() > 0 else None)
@@ -4407,8 +4446,9 @@ def collect_beta_channel_decomposition(
         model.eval()
         for module in binders:
             module.attention_weights = _counting
-        for arm in ("full", "no_energy", "no_prior"):
-            mode["arm"] = arm
+        for arm in ("full", "no_energy", "no_prior") + (("no_rope",) if rope_active else ()):
+            mode["arm"] = "full" if arm == "no_rope" else arm
+            _set_rope(arm != "no_rope")
             logits = model(tokens)
             arms[arm] = float(F.cross_entropy(
                 logits.reshape(-1, logits.shape[-1]).float(),
@@ -4416,6 +4456,7 @@ def collect_beta_channel_decomposition(
                 ignore_index=-100,
             ))
     finally:
+        _set_rope(True)
         for module in binders:
             module.attention_weights = original
         model.train(was_training)
@@ -4432,12 +4473,16 @@ def collect_beta_channel_decomposition(
         "delta_ce": ({
             "content_channel":    (arms["no_energy"] - baseline) if available else None,
             "positional_channel": (arms["no_prior"] - baseline) if available else None,
+            **({"rope_position_channel": arms["no_rope"] - baseline} if rope_active else {}),
         } if available else {}),
+        "energy_includes_rope_position": rope_active,
         "interpretation": (
             "delta_ce.content_channel is the cost of ablating the belief-coupling energy from beta "
-            "(what CONTENT is worth); delta_ce.positional_channel is the cost of flattening the "
-            "attention log-prior on its causal support (what POSITION is worth). available=False "
-            "means no live beta softmax was intercepted, and the arms carry no meaning."
+            "(what CONTENT is worth, plus RoPE position when energy_includes_rope_position is true); "
+            "delta_ce.positional_channel is the cost of flattening the attention log-prior on its causal "
+            "support (what the PRIOR's position is worth); delta_ce.rope_position_channel, present under "
+            "RoPE, is the cost of removing only the rotation. available=False means no live beta softmax "
+            "was intercepted, and the arms carry no meaning."
         ),
     }
 
@@ -4459,8 +4504,10 @@ def collect_context_sensitivity(
     reads is SEQUENCE 0 only, so ``tokens`` supplies one measured sequence however large the batch.
 
     Two stages separate the inference loop from the lookup. ``raw_prior`` (inference off) is the
-    control and must read 0; ``belief_estep`` adds the belief E-step on top, so the increment is the
-    context the fitted inference injects.
+    control and must read 0; ``belief_estep`` (``predictive_content`` on the predictive route) reads the
+    final belief after every layer and the final norm, so the increment is the context the whole stack
+    injects. ``layer0_readout`` keeps the layer-0 attention output the record measured before (the
+    E-step trace is captured at layer 0 only; audit 2026-10-10, item 34).
 
     This standard mechanism record costs ``n_replicates`` extra forward passes per stage.
     """
@@ -4468,7 +4515,6 @@ def collect_context_sensitivity(
 
     if type(n_replicates) is not int or n_replicates < 1:
         raise ValueError(f"n_replicates must be an int >= 1, got {n_replicates!r}")
-    trained_depth = int(model.cfg.n_e_steps)
     was_training = bool(model.training)
     cpu_rng = torch.get_rng_state().clone()
     cuda_rng = ([state.clone() for state in torch.cuda.get_rng_state_all()]
@@ -4477,19 +4523,25 @@ def collect_context_sensitivity(
     vocab = int(model.cfg.vocab_size)
     generator = torch.Generator(device="cpu").manual_seed(int(seed))
 
-    def _final_mean(batch: torch.Tensor, initial: bool = False) -> torch.Tensor:
+    def _trace_mean(batch: torch.Tensor, initial: bool = False) -> torch.Tensor:
         trace = e_step_belief_trace(model, batch, n_iter=int(model.cfg.n_e_steps))
         return torch.as_tensor(trace["mu"][0 if initial else -1])[-1].flatten().float()
+
+    def _final_belief_mean(batch: torch.Tensor) -> torch.Tensor:
+        belief, _ = model.forward_beliefs(batch, return_logits=False)
+        return belief.mu[0, -1].detach().flatten().float()           # sequence 0, final position
 
     stages: Dict[str, Optional[float]] = {}
     try:
         model.eval()
         readout_name = ("predictive_content"
                         if model.cfg.relational_readout_mode == "predictive_content" else "belief_estep")
-        variants = [("raw_prior", 0), (readout_name, trained_depth)]
-        for name, belief_depth in variants:
-            # Depth 0 reads the captured initial state of the configured forward (no depth sweep).
-            reference = _final_mean(tokens, initial=belief_depth == 0)
+        # Depth 0 reads the captured initial state of the configured forward (no depth sweep).
+        variants = [("raw_prior", lambda batch: _trace_mean(batch, initial=True)),
+                    (readout_name, _final_belief_mean),
+                    ("layer0_readout", _trace_mean)]
+        for name, final_mean in variants:
+            reference = final_mean(tokens)
             shifts = []
             for _ in range(n_replicates):
                 perturbed = tokens.clone()
@@ -4497,7 +4549,7 @@ def collect_context_sensitivity(
                     perturbed[:, :-1] = torch.randint(
                         0, vocab, perturbed[:, :-1].shape, generator=generator, dtype=perturbed.dtype
                     ).to(perturbed.device)
-                moved = _final_mean(perturbed, initial=belief_depth == 0)
+                moved = final_mean(perturbed)
                 denominator = float(reference.norm())
                 shifts.append(float((moved - reference).norm()) / denominator
                               if denominator > 0.0 else 0.0)
@@ -4516,8 +4568,9 @@ def collect_context_sensitivity(
         "interpretation": (
             "mean relative L2 displacement of the FINAL position's belief mean when the prefix is "
             "randomized and the final token held fixed. raw_prior is the control and reads 0 for a "
-            "pure per-token lookup; belief_estep adds the belief loop, so the increment is the "
-            "context the fitted inference injects."
+            "pure per-token lookup; belief_estep / predictive_content reads the final belief after "
+            "every layer, so the increment is the context the stack injects; layer0_readout is the "
+            "same measure at layer 0's attention output."
         ),
     }
 
@@ -4649,6 +4702,7 @@ def finalize_validation_run(
     logger = logger or logging.getLogger(__name__)
     if device is None:
         device = next(model.parameters()).device
+    wall_time, resumed_wall_time = _cumulative_wall_time(artifacts, wall_time)
     completed_step = _require_nonnegative_int(
         terminal_state.step if terminal_state is not None else cfg.max_steps,
         "terminal step",
@@ -4809,6 +4863,7 @@ def finalize_validation_run(
         "n_params_trainable":  n_params_trainable,
         "final_train_loss":    final_train_loss,
         "wall_time_s":         (float(wall_time) if wall_time is not None else None),
+        "wall_time_resumed_s": resumed_wall_time,     # carried in by a resumed checkpoint (in wall_time_s)
         "terminal_checkpoint": terminal_checkpoint,
         "save_model_artifacts": artifacts.save_model_artifacts,
         "figures_written":     figures_written,
@@ -4916,6 +4971,10 @@ def _pure_path_report(
     if block_mlp_active and block_mlp_covariance != "passthrough" and cfg.family == "gaussian_block":
         # The block's covariance is read through the head-block M-projection (vfe3.model.block._head_block_readout).
         block_mlp_covariance_contract = f"head_block_projection_of_{block_mlp_covariance_contract}"
+    if block_mlp_active and block_mlp_covariance == "delta_full" and cfg.family == "gaussian_diagonal":
+        # The diagonal family keeps diag(J Sigma J^T) + floor, the M-projection of the dense pushforward (audit
+        # 2026-10-10, item 9; vfe3.model.block_mlp._diagonal_delta_covariance).
+        block_mlp_covariance_contract = f"diagonal_projection_of_{block_mlp_covariance_contract}"
     runtime_exactness_key = transport_registration.runtime_exactness_key
     if runtime_exactness_key is None:
         # No runtime exactness certificate is registered for this transport: the flat cocycle is
@@ -5038,8 +5097,10 @@ def _pure_path_report(
         "family_group_invariant":    family_group_invariant,
         # block_coordinates='reference' conjugates the block norm, final norm and block MLP by the
         # realized frame, x -> U_i N(U_i^{-1} x), which is covariant for any registered map
-        # (audit 2026-10-07 F18).
-        "block_mlp_intertwiner_compatible": block_mlp_intertwiner_compatible or reference_blocks,
+        # (audit 2026-10-07 F18). The canonical_frame MLP is the same dressing U_i F(U_i^{-1} x) applied to the MLP
+        # alone, covariant under the per-token action U_i -> g_i U_i (audit 2026-10-10, item 42).
+        "block_mlp_intertwiner_compatible": (block_mlp_intertwiner_compatible or reference_blocks
+                                             or (block_mlp_active and block_mlp_mode == "canonical_frame")),
         "block_norm_gauge_equivariant": block_norm_registration.gauge_equivariant or reference_blocks,
         "final_norm_gauge_equivariant": final_norm_registration.gauge_equivariant or reference_blocks,
         "no_fixed_coordinate_spectral_cap": (
@@ -5090,6 +5151,7 @@ def _pure_path_report(
                 if getattr(cfg, "m_block_mlp_lr", None) is not None else getattr(cfg, "m_p_mu_lr", 0.0)),
             "block_mlp_structural_mode":    block_mlp_structural_mode,
             "block_mlp_covariance_contract": block_mlp_covariance_contract,
+            "block_norm_covariance":        getattr(cfg, "block_norm_covariance", "passthrough"),
             "gauge_transport":              cfg.gauge_transport,
             "pos_rotation":                 cfg.pos_rotation,
             "rope_on_value":                bool(cfg.rope_on_value),
@@ -5255,10 +5317,14 @@ def _save_figures(
                     frozen = bool(covariance_frozen_at_encode(artifacts.cfg))
                 except Exception:                              # config-free artifacts: assume live Sigma
                     frozen = False
+                from types import SimpleNamespace
+
+                from vfe3.train import _residual_update_is_additive
                 fig = figs.plot_readout_diagnostics(
                     readout_history,
                     residual_ratio=raw_figs.read_long_table(run / "diagnostics" / "residual_ratio.csv"),
                     covariance_frozen=frozen,
+                    residual_additive=_residual_update_is_additive(SimpleNamespace(cfg=artifacts.cfg)),
                     path=str(run / "readout_diagnostics.png"))
                 figs.plt.close(fig)
 

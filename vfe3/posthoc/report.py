@@ -7,7 +7,10 @@ identity-checked streams of :mod:`vfe3.posthoc.streams`. Each pass is cross-chec
 :func:`vfe3.train.evaluate` on the same windows and, on a full split, against the numbers the run
 recorded (the reproduction check; fields dropped from a legacy config are recorded beside it). The
 final-weight validation pass also feeds the KL-cap and attention observers, and it is the baseline of
-the M5 interventions, each of which re-runs the same windows under a reversible patch.
+the M5 interventions, each of which re-runs the same windows under a reversible patch. A checkpoint
+whose config and model state are bitwise identical to the final weights' is not evaluated again: its
+passes, residual and covariance entries are the final weights', marked ``aliased_to`` and listed
+under ``checkpoint_aliases``, with the reproduction check redone against its own recorded numbers.
 
 The same passes carry the v2:899 residual observer (every checkpoint on ``residual_split``, with the
 per-layer self-weights), the final-weight ``routing_split`` pass is handed to the M4 decomposition of
@@ -236,6 +239,97 @@ def _subsample_reproduction(
     out.update(ce=ce, n_scored=n_scored, n_windows=int(windows.size),
                sample="the training loop's fixed sample (a subset of the windows of this pass)")
     return out
+
+
+def _identical_model_states(path_a: Path, path_b: Path) -> bool:
+    r"""Whether two checkpoint bundles carry the same config and a bitwise-identical ``model_state``.
+
+    Tensors are compared byte for byte (dtype, shape and raw storage), so ``-0.0`` against ``0.0`` or a
+    NaN payload counts as a difference and the second checkpoint is evaluated on its own.
+    """
+    a = torch.load(path_a, map_location="cpu", weights_only=True, mmap=True)
+    b = torch.load(path_b, map_location="cpu", weights_only=True, mmap=True)
+    state_a, state_b = a.get("model_state"), b.get("model_state")
+    if not (isinstance(state_a, Mapping) and isinstance(state_b, Mapping)) or a.get("config") != b.get("config"):
+        return False
+    if list(state_a) != list(state_b):
+        return False
+    for key, x in state_a.items():
+        y = state_b[key]
+        if not (isinstance(x, torch.Tensor) and isinstance(y, torch.Tensor)):
+            if x != y:
+                return False
+        elif (x.dtype != y.dtype or x.shape != y.shape
+              or not torch.equal(x.reshape(-1).view(torch.uint8), y.reshape(-1).view(torch.uint8))):
+            return False
+    return True
+
+
+def _checkpoint_aliases(run_dir: Path, options: "PosthocOptions", final_ckpt: str) -> Dict[str, str]:
+    r"""``{checkpoint: final_ckpt}`` for each requested checkpoint after ``final_ckpt`` identical to it.
+
+    Such a checkpoint is not evaluated again: its passes and sections are the final weights' (audit
+    2026-10-10 #30). The intervention checkpoint is never aliased while the M5 rows are requested,
+    since the rows run on the loaded model.
+    """
+    checkpoints = list(options.checkpoints)
+    if final_ckpt not in checkpoints or not (run_dir / final_ckpt).is_file():
+        return {}
+    interventions = options.interventions is None or len(options.interventions) > 0
+    aliases: Dict[str, str] = {}
+    for checkpoint in checkpoints[checkpoints.index(final_ckpt) + 1:]:
+        if checkpoint == final_ckpt or not (run_dir / checkpoint).is_file():
+            continue
+        if interventions and checkpoint == options.intervention_checkpoint:
+            continue
+        if _identical_model_states(run_dir / final_ckpt, run_dir / checkpoint):
+            aliases[checkpoint] = final_ckpt
+    return aliases
+
+
+def _alias_checkpoint(
+    report:     Dict[str, Any],
+    info:       st.RunInfo,
+    checkpoint: str,
+    target:     str,
+
+    *,
+    kept:                 Mapping[str, Tuple[ev.TargetNLL, np.ndarray, bool]],
+    matched:              bool,
+    reproduction_windows: Mapping[str, np.ndarray],
+    test_passes:          Dict[str, Tuple[np.ndarray, np.ndarray]],
+) -> None:
+    r"""Record ``checkpoint``'s passes and sections as ``target``'s (bitwise-identical model state).
+
+    Every pass entry of ``target`` is copied with ``checkpoint``, its step and ``aliased_to`` and its
+    reproduction check redone against the references recorded for ``checkpoint``; the residual and
+    covariance sections and the test pass handed to the calibration are ``target``'s, relabeled alike.
+    ``kept`` holds ``target``'s per-split ``(result, indices, full)``.
+    """
+    step = _checkpoint_step(info, checkpoint)
+    for entry in [p for p in report["passes"] if p["checkpoint"] == target]:
+        alias = dict(entry, checkpoint=checkpoint, step=step, aliased_to=target)
+        split = entry["split"]
+        if entry.get("status") == "ok" and split in kept:
+            result, indices, full = kept[split]
+            reference = _recorded_reference(info, checkpoint, split)
+            if split in reproduction_windows:
+                alias["reproduction"] = _subsample_reproduction(
+                    result, indices, reproduction_windows[split], reference, matched=matched)
+            else:
+                alias["reproduction"] = _reproduction(alias, reference, full=full, matched=matched)
+        report["passes"].append(alias)
+    for section in ("residual", "covariance"):
+        if target in report[section]:
+            report[section][checkpoint] = dict(report[section][target], checkpoint=checkpoint,
+                                               stem=_stem(checkpoint), step=step, aliased_to=target)
+    if target in test_passes:
+        test_passes[checkpoint] = test_passes[target]
+    report["checkpoint_aliases"][checkpoint] = {
+        "aliased_to": target,
+        "reason": (f"model_state and config are bitwise identical to {target}: its passes, residual and "
+                   "covariance sections are reused (reproduction checked against this checkpoint's "
+                   "own references), not evaluated again")}
 
 
 def _units_for(result: ev.TargetNLL, split: str, stream_units: Optional[np.ndarray]) -> np.ndarray:
@@ -577,6 +671,7 @@ def run_posthoc(
         "passes": [], "interventions": None, "klcap": {}, "attention": None, "maps": {},
         "resources": None, "alibi_slopes": None, "figures": [], "tables": {}, "notes": [],
         "residual": {}, "covariance": {}, "calibration": None, "routing": None, "ce_by_context": None,
+        "checkpoint_aliases": {},
     }
     if not is_vfe_config(cfg):
         report["model_family"] = model_family_of(cfg)
@@ -602,9 +697,18 @@ def run_posthoc(
         report["notes"].append(f"residual ratios skipped: split {options.residual_split!r} is not evaluated")
     if not options.covariance:
         report["notes"].append("routing-covariance gap and hidden temperature disabled (covariance=False)")
+    aliases = _checkpoint_aliases(run_dir, options, final_ckpt)
+    kept: Dict[str, Tuple[ev.TargetNLL, np.ndarray, bool]] = {}     # final_ckpt's passes, for the aliases
+    kept_matched = False
     for checkpoint in options.checkpoints:
         if not (run_dir / checkpoint).is_file():
             report["notes"].append(f"{checkpoint} not found; skipped")
+            continue
+        if checkpoint in aliases:
+            _alias_checkpoint(report, info, checkpoint, aliases[checkpoint], kept=kept, matched=kept_matched,
+                              reproduction_windows=reproduction_windows, test_passes=test_passes)
+            report["notes"].append(f"{checkpoint}: {report['checkpoint_aliases'][checkpoint]['reason']}")
+            log(f"[posthoc] {checkpoint}: model state identical to {aliases[checkpoint]}; its results are reused")
             continue
         loaded = ev.load_model(run_dir, checkpoint, device=device, precision=options.precision,
                                drop_unknown_config_fields=options.drop_unknown_config_fields)
@@ -614,6 +718,7 @@ def run_posthoc(
         step = _checkpoint_step(info, checkpoint)
         is_final = checkpoint == final_ckpt
         if is_final:
+            kept_matched = matched
             report["alibi_slopes"] = ev.alibi_slopes(model, info.seq_len)
             if options.latency_batches > 0 and "validation" in datasets:
                 latency = measure_latency(model, datasets["validation"], batch_size, device, options.latency_batches)
@@ -671,6 +776,8 @@ def run_posthoc(
                     subset=not full, n_windows=int(indices.size))
             if split == "test":
                 test_passes[checkpoint] = (result.nll, result.target_pos)
+            if is_final and aliases:
+                kept[split] = (result, indices, full)
             if is_final and split in ("validation", "test"):
                 from vfe3.posthoc.figures import ce_by_context
 

@@ -4,8 +4,8 @@ Analyze every seed first with ``analyze_semantics.py`` (``CONFIG["preset"] = "qu
 per-seed battery), so that each run holds ``<run>/semantics/metrics.json`` (or the training report's
 ``<run>/figures/semantics/metrics.json``, or a pre-preset ``<run>/figures/metrics.json``) and, for
 analyses written by this code line, ``candidate_ids.npy``.
-Then edit ``CONFIG`` below and run ``python multiseed_semantics.py``, or pass the run directories
-(two or more) or one parent folder on the command line to override ``CONFIG["runs"]``.
+Then edit ``CONFIG`` below (``CONFIG["runs"]``: two or more run directories or one parent folder) and
+run ``python multiseed_semantics.py``; there is no command-line configuration.
 
 Outputs in ``CONFIG["out_dir"]`` (default ``<parent>/multiseed_semantics``): ``multiseed_semantics.json``,
 ``MULTISEED_SEMANTICS.md`` and ``figures/`` (headline metrics per seed with the across-seed mean and SD;
@@ -20,7 +20,6 @@ GPU; the frame chart stays on the CPU.
 """
 
 import os
-import sys
 
 CONFIG = {
     # One parent folder whose analyzed children are the seeds (the per-seed run dirs train_vfe3.py
@@ -43,15 +42,10 @@ for _variable in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 
-def main(argv: "list[str]") -> None:
+def main() -> None:
     from vfe3.semantics.multiseed import aggregate_seeds
 
-    if len(argv) == 1:
-        runs = CONFIG["runs"]
-    elif len(argv) == 2:
-        runs = argv[1]                                         # one parent folder
-    else:
-        runs = argv[1:]                                        # two or more run directories
+    runs = CONFIG["runs"]                               # click-to-run: no command-line configuration
     shown = runs if isinstance(runs, str) else "\n    " + "\n    ".join(str(r) for r in runs)
     print(f"\nvfe3 multi-seed semantic aggregation\n  runs: {shown}\n  stability: {CONFIG['stability']}\n"
           f"  device: {CONFIG['device']}\n  threads: {_THREADS}", flush=True)
@@ -62,4 +56,4 @@ def main(argv: "list[str]") -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv)
+    main()

@@ -45,6 +45,11 @@ def _phi1(A: torch.Tensor) -> torch.Tensor:          # (..., n, n) -> (..., n, n
     return torch.linalg.matrix_exp(augmented)[..., :n, n:]
 
 
+def _content_link_exp(X: torch.Tensor) -> torch.Tensor:   # (..., K, K) -> (..., K, K)
+    r"""The shared content link :math:`e^X`, :math:`X = OT`, one batched ``matrix_exp`` over the leading axes."""
+    return torch.linalg.matrix_exp(X)
+
+
 def _centered_spread_tile(
     b:      torch.Tensor,  # (..., H, I, N) routing rows of the tile
     values: torch.Tensor,  # (..., N, H, d) source values
@@ -166,16 +171,18 @@ def _chart_receive(
 ) -> Tuple[torch.Tensor, torch.Tensor]:  # (..., K, K) T^{-1} and O'
     r""":math:`(T^{-1}, O')` of a non-affine chart; leading axes (a layer stack) are one batched call each.
 
-    :math:`O'_{\mathrm{exponential}} = T^{-1} + O\varphi_1(TO)`, which equals :math:`e^{OT}T^{-1}`. Against a
-    60-digit reference (K = 6, cond(T) up to 1e9) the product form had the same relative error as this
-    one, but it differed from this form by up to 3.5e-12 in absolute value at :math:`\|O'\|\approx 7\times10^2`
-    (cond(T) = 1e3), so the evaluated form is kept and only batched (audit 2026-10-09).
+    :math:`O'_{\mathrm{exponential}} = e^{OT}T^{-1}`, which equals :math:`T^{-1} + O\varphi_1(TO)` because
+    :math:`e^{OT} = I + O\varphi_1(TO)T`. The product form takes one :math:`K\times K` ``matrix_exp`` where the
+    :math:`\varphi_1` form took the :math:`2K\times 2K` augmented one, and its backward a :math:`2K\times 2K`
+    exponential instead of :math:`4K\times 4K` (3.6 to 5 times cheaper on the K = 128 tables; audit 2026-10-10,
+    item 31). Against a 60-digit reference (K = 6, cond(T) up to 1e9) the two forms have the same relative error;
+    they differ by up to 3.5e-12 in absolute value at :math:`\|O'\|\approx 7\times10^2` (cond(T) = 1e3).
     """
     # inv_ex: no host sync (linalg.inv checks info on the host); a singular T yields non-finite maps.
     inverse = torch.linalg.inv_ex(T_stack).inverse                                      # (..., K, K) order zero
     if chart == "first_order":
         return inverse, inverse + O_stack
-    return inverse, inverse + O_stack @ _phi1(T_stack @ O_stack)                        # all orders
+    return inverse, _content_link_exp(O_stack @ T_stack) @ inverse                      # all orders
 
 
 def _split_receive(
@@ -230,7 +237,7 @@ def shared_content_charts(operators: Sequence["RelationalOperators"]) -> Iterato
     Each distinct operator that stores O, uses a non-affine chart and has the edge links off (the edge
     links evaluate their own chart stacks) receives its slice of one ``(L, K, K)`` evaluation of
     :func:`_chart_receive`, which :meth:`RelationalOperators.content_factor_runs` returns until the
-    context exits. This replaces one :math:`2K \times 2K` ``matrix_exp`` per layer per forward, whose host
+    context exits. This replaces one ``matrix_exp`` per layer per forward, whose host
     synchronizations dominated the exponential chart's cost (audit 2026-10-09). On the CPU the batched
     values equal the per-layer ones bit for bit; on CUDA the batched GEMMs may round differently.
     """
@@ -322,6 +329,9 @@ class RelationalOperators(nn.Module):
     receiving maps built from the stored (O, T) (:func:`chart_receive_map`); the stored O starts at
     :math:`sI`, :math:`(s-1)I` or :math:`(\log s)I` per chart so every chart starts at :math:`sB_{ij}`.
     Every consumer reads the content maps through :meth:`content_factors`.
+    ``receiver_measurement`` (full_link_update under ``receiver_law='channel_likelihood'``) selects the
+    receiving measurement :math:`P_h` of :math:`\xi_i`: the adjoint :math:`O_h'^\top` or the head-h rows of
+    :math:`O'^{-1}` (:func:`vfe3.gradients.full_link.build_full_link_context`); it is an attribute, not a parameter.
     ``routing`` selects the projected routing cost: Gaussian KL, or the noisy-query cost
     N(a_i; b_j, V_Q + V_K) of the expected likelihood kernel (predictive_content only).
     ``predictive_covariance_checkpoint`` recomputes the moment-matched covariance update in backward
@@ -347,7 +357,8 @@ class RelationalOperators(nn.Module):
     (initialized to ``log(minimal_agent_channel_noise)``). ``raw_score_k`` and ``O`` are not created (registered as
     None: the key is tied and the receiving map is derived), so the chart, the initial output scale and
     ``routing`` are unused, and every O-reading method raises. ``minimal_agent_inference`` selects the exact
-    ADF posterior or the mean-field step.
+    ADF posterior or the mean-field step, and ``minimal_agent_cavi_steps`` the mean field's number of
+    coordinate-ascent sweeps (:func:`vfe3.model.minimal_agent.minimal_agent_readout`).
     ``tie_comparison_maps`` (kernel predictive readout) stores no ``raw_score_k``: the key map is the query map,
     :math:`S_K := S_Q`. ``learn_attention_temperature`` adds ``routing_log_temperature`` ``(H,)``, the offset of
     the log routing temperature (:meth:`routing_temperature`); with it off no such parameter exists.
@@ -372,6 +383,7 @@ class RelationalOperators(nn.Module):
         receiver_law:          str,
         receiver_update:       str,
         receiver_damping:      float = 1.0,
+        receiver_measurement:  str   = "adjoint",
         content_link_chart:    str,
         predictive_covariance_checkpoint: bool = False,
         content_link_edges:    str   = "off",
@@ -385,6 +397,7 @@ class RelationalOperators(nn.Module):
         predictive_readout:    str   = "kernel",
         minimal_agent_inference: str,
         minimal_agent_channel_noise: float = 1.0,
+        minimal_agent_cavi_steps: int = 1,
         comparison_rope_base: Optional[float] = None,
         comparison_rope_fraction: float = 1.0,
         kl_max_reference:      str,
@@ -431,8 +444,12 @@ class RelationalOperators(nn.Module):
         if (isinstance(receiver_damping, bool) or not isinstance(receiver_damping, Real)
                 or not math.isfinite(receiver_damping) or not 0.0 < receiver_damping <= 1.0):
             raise ValueError("receiver_damping must lie in (0, 1]")
+        if receiver_measurement not in ("adjoint", "inverse"):
+            raise ValueError("receiver_measurement must be 'adjoint' or 'inverse'")
         # Full-link receiver law and update (projected_gradient.tex); inert under predictive_content.
         self.receiver_law = receiver_law
+        # channel_likelihood only: P_h = O'_h^T ("adjoint") or the head-h rows of O'^{-1} ("inverse").
+        self.receiver_measurement = receiver_measurement
         self.receiver_update = receiver_update
         self.receiver_damping = float(receiver_damping)
         self.readout_mode = readout_mode
@@ -501,6 +518,9 @@ class RelationalOperators(nn.Module):
                 or not math.isfinite(minimal_agent_channel_noise) or minimal_agent_channel_noise <= 0.0):
             raise ValueError("minimal_agent_channel_noise must be finite and positive, "
                              f"got {minimal_agent_channel_noise!r}")
+        if (isinstance(minimal_agent_cavi_steps, bool) or not isinstance(minimal_agent_cavi_steps, int)
+                or minimal_agent_cavi_steps < 1):
+            raise ValueError(f"minimal_agent_cavi_steps must be an int >= 1, got {minimal_agent_cavi_steps!r}")
         minimal = predictive_readout == "minimal_agent"
         if minimal:
             if readout_mode != "predictive_content":
@@ -518,6 +538,7 @@ class RelationalOperators(nn.Module):
         self.predictive_readout = predictive_readout
         self.minimal_agent_inference = minimal_agent_inference
         self.minimal_agent_channel_noise = float(minimal_agent_channel_noise)
+        self.minimal_agent_cavi_steps = minimal_agent_cavi_steps   # mean-field CAVI sweeps (plain attribute, not state)
         if not isinstance(block_covariance, bool):
             raise ValueError(f"block_covariance must be bool, got {block_covariance!r}")
         if block_covariance:
@@ -907,7 +928,7 @@ class RelationalOperators(nn.Module):
                 rope = self.comparison_rope_rotation(xi.shape[-2], S.shape[1], xi.device, dtype)  # (N, d, d)
             result = minimal_agent.minimal_agent_readout(
                 xi, C, S, T, log_noise, log_prior, self.minimal_agent_inference, diagnostics=diagnostics,
-                check=False, rope=rope)
+                check=False, rope=rope, cavi_steps=self.minimal_agent_cavi_steps)
             forward = frame.forward.to(dtype)
             mu_plus = frame_matvec(forward, result.xi, frame.block_diagonal)              # (..., N, K) U_i xi_i^+
             sigma_plus = None

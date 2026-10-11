@@ -1,7 +1,7 @@
 r"""Click-to-run: post-hoc analyses of one trained run (:mod:`vfe3.posthoc`), no training.
 
-Edit ``CONFIG`` below and run ``python posthoc_eval.py``, or pass a run directory as the only
-command-line argument to override ``CONFIG["run_dir"]``. The run directory needs ``final_model.pt``,
+Edit ``CONFIG`` below and run ``python posthoc_eval.py``; there is no command-line configuration.
+The run directory needs ``final_model.pt``,
 ``best_model.pt``, ``summary.json`` and ``provenance.json``; ``checkpoints/step_*.pt`` (optimizer
 state), ``metrics.csv`` (throughput) and ``map_snapshots/`` (map invariants over training) are used
 when present.
@@ -42,7 +42,6 @@ toggle that mattered shows as a reproduction mismatch.
 """
 
 import os
-import sys
 
 CONFIG = {
     "run_dir":                    "D:/DATA_KEEP/31.04_wikitext-103_K256_4-layer_noHM",
@@ -86,14 +85,12 @@ for _variable in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 
-def main(argv: "list[str]") -> None:
+def main() -> None:
     import torch
 
     from vfe3.posthoc.report import PosthocOptions, run_posthoc
 
-    if len(argv) > 2:
-        raise SystemExit(f"usage: {argv[0]} [run_dir]")
-    run_dir = argv[1] if len(argv) == 2 else CONFIG["run_dir"]
+    run_dir = CONFIG["run_dir"]                     # click-to-run: no command-line configuration
     torch.set_num_threads(_THREADS)
     fields = {key: value for key, value in CONFIG.items() if key not in ("run_dir", "out_dir", "threads")}
     options = PosthocOptions(**fields)
@@ -108,4 +105,4 @@ def main(argv: "list[str]") -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv)
+    main()

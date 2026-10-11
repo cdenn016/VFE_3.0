@@ -1,7 +1,8 @@
 r"""Reference implementation of the scalar free energy F = sum_i F_i for VFE_3.0.
 
 The supported projected routes neither evaluate nor minimize this scalar: they train on the
-decoder cross-entropy plus optional M-step terms, and their diagnostics report the global free energy as NaN. The scalar
+decoder cross-entropy plus optional M-step terms, and their diagnostics report the global free energy as NaN
+unless ``diagnose_canonical_free_energy`` evaluates it (:func:`canonical_routing_rows`). The scalar
 evaluators below serve as test oracles and as the definition the routes' local updates refer to;
 the Gibbs weights ``attention_weights`` are live.
 
@@ -506,3 +507,117 @@ def _belief_free_energy_rows(
                        else torch.zeros_like(self_row))
 
     return BeliefFreeEnergyRows(self_row, belief_row, entropy_row, observation_row)
+
+
+# ===========================================================================
+# Canonical transported routing block (diagnose_canonical_free_energy).
+# ===========================================================================
+
+# Elements of one (B, N_j, d, T) Mahalanobis tile: T query rows are whitened against every key factor at once.
+_CANONICAL_QUERY_TILE_ELEMENTS = 1 << 24
+
+
+class CanonicalRoutingRows(NamedTuple):
+    r"""Per-head rows of the canonical routing block (float64; heads indexed by ``irrep_dims``).
+
+    ``belief_coupling`` is :math:`\sum_j\beta^*_{ij}D_{ij}` and ``attention_entropy`` is
+    :math:`\tau_h\sum_j\beta^*_{ij}\log(\beta^*_{ij}/\pi_{ij})`, both unweighted by :math:`\lambda_\beta`;
+    ``log_partition`` is :math:`\log Z_i`, :math:`-\infty` on a row with no admissible source (whose two
+    rows are zero)."""
+    energy:            torch.Tensor   # (B, H, N, N) D^h_ij on every pair
+    beta:              torch.Tensor   # (B, H, N, N) beta*^h_ij, zero off the support
+    belief_coupling:   torch.Tensor   # (B, H, N)
+    attention_entropy: torch.Tensor   # (B, H, N)
+    log_partition:     torch.Tensor   # (B, H, N)
+
+
+def canonical_routing_rows(
+    mu:            torch.Tensor,              # (B, N, K) belief means, local coordinates
+    sigma:         torch.Tensor,              # (B, N, K) variances or (B, N, K, K) covariances
+    frame_inverse: torch.Tensor,              # (B, N, K, K) inverse realized frames U_i^{-1}
+    log_prior:     Optional[torch.Tensor],    # (N, N), (H, N, N) or (B, H, N, N) log-bias; None -> uniform
+
+    *,
+    tau:           'float | torch.Tensor',    # scalar or (H,) per-head temperature tau_h
+    irrep_dims:    List[int],                 # head block sizes d_h, summing to K
+) -> CanonicalRoutingRows:
+    r"""The canonical routing block of one layer with gauge-transported KL energies, in float64.
+
+    With the reference moments :math:`\xi_i = U_i^{-1}\mu_i` and :math:`C_i = U_i^{-1}\Sigma_iU_i^{-\top}`,
+    KL is invariant under the common map :math:`U_i^{-1}`, so the flat transport
+    :math:`\Omega_{ij} = U_iU_j^{-1}` gives on the coordinates :math:`I_h` of head :math:`h`
+
+    .. math::
+        D^h_{ij} = \mathrm{KL}\big(\mathcal N(\xi^h_i, C^{hh}_i)\,\|\,\mathcal N(\xi^h_j, C^{hh}_j)\big)
+                 = \tfrac12\Big[\operatorname{tr}\big((C^{hh}_j)^{-1}C^{hh}_i\big)
+                   + (\xi^h_i-\xi^h_j)^\top(C^{hh}_j)^{-1}(\xi^h_i-\xi^h_j) - d_h
+                   + \log\det C^{hh}_j - \log\det C^{hh}_i\Big],
+
+    the head-marginal energy of the retired transported route (a single block is the full
+    :math:`\mathrm{KL}(q_i\|\Omega_{ij}q_j)`; for frames block-diagonal over ``irrep_dims`` the reference
+    and local head marginals agree). The router and its block are
+
+    .. math::
+        \beta^*_{ij} = \operatorname{softmax}_j\big(\log\pi_{ij} - D^h_{ij}/\tau_h\big),\qquad
+        \sum_j\beta^*_{ij}D^h_{ij} + \tau_h\sum_j\beta^*_{ij}\log\frac{\beta^*_{ij}}{\pi_{ij}}
+        = -\tau_h\log\sum_j\pi_{ij}e^{-D^h_{ij}/\tau_h},
+
+    with :math:`\pi = \operatorname{softmax}_j(\log\text{-prior})` on its finite (causal) support and the
+    envelope identity on the right. The pair energies are uncapped. One Cholesky factor
+    :math:`L_j` per :math:`C^{hh}_j` gives the log-determinants, the trace as the Frobenius product
+    :math:`\langle C^{hh}_i, L_j^{-\top}L_j^{-1}\rangle` and the Mahalanobis term by triangular solves,
+    tiled over query rows: :math:`O(BNK^3 + BN^2\sum_hd_h^2)` time and :math:`O(BN^2H)` memory beyond the
+    tiles. A factorization failure leaves NaN in the affected energies.
+    """
+    dtype = torch.float64
+    B, N, K = mu.shape
+    mu, sigma, frame_inverse = mu.to(dtype), sigma.to(dtype), frame_inverse.to(dtype)
+    xi = (frame_inverse @ mu.unsqueeze(-1)).squeeze(-1)                        # (B, N, K) xi_i = U_i^{-1} mu_i
+    diagonal = sigma.dim() == mu.dim()
+    H = len(irrep_dims)
+    taus = torch.as_tensor(tau, dtype=dtype, device=mu.device).reshape(-1).expand(H)   # (H,)
+    if log_prior is None:
+        log_pi = mu.new_full((1, 1, N, N), -math.log(N))
+    else:
+        bias = log_prior.to(device=mu.device, dtype=dtype)
+        while bias.dim() < 4:
+            bias = bias.unsqueeze(0)                                           # (1|B, 1|H, N, N)
+        log_pi = torch.where(torch.isfinite(bias), torch.log_softmax(bias, dim=-1),
+                             torch.full_like(bias, float("-inf")))
+    energies, betas, belief_rows, entropy_rows, log_partitions = [], [], [], [], []
+    offset = 0
+    for h, d in enumerate(irrep_dims):
+        xi_h = xi[..., offset:offset + d]                                      # (B, N, d)
+        rows_h = frame_inverse[..., offset:offset + d, :]                      # (B, N, d, K) head rows of U_i^{-1}
+        offset += d
+        C = ((rows_h * sigma.unsqueeze(-2)) if diagonal else rows_h @ sigma) @ rows_h.transpose(-1, -2)
+        C = 0.5 * (C + C.transpose(-1, -2))                                    # (B, N, d, d) C_i^hh
+        L, info = torch.linalg.cholesky_ex(C)
+        L = torch.where((info == 0)[..., None, None], L, torch.full_like(L, float("nan")))
+        logdet = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(dim=-1)   # (B, N)
+        precision = torch.cholesky_inverse(L)                                  # (B, N, d, d) (C_j^hh)^{-1}
+        trace = torch.einsum("bikl,bjkl->bij", C, precision)                   # (B, N_i, N_j)
+        mahalanobis = torch.empty_like(trace)                                  # (B, N_i, N_j)
+        tile = max(1, min(N, _CANONICAL_QUERY_TILE_ELEMENTS // max(1, B * N * d)))
+        for start in range(0, N, tile):
+            stop = min(N, start + tile)
+            diff = xi_h[:, None, start:stop, :] - xi_h[:, :, None, :]           # (B, N_j, T, d) xi_i - xi_j
+            white = torch.linalg.solve_triangular(L, diff.transpose(-1, -2), upper=False)   # (B, N_j, d, T)
+            mahalanobis[:, start:stop, :] = white.pow(2).sum(dim=-2).transpose(-1, -2)
+        D = 0.5 * (trace + mahalanobis - d + logdet[:, None, :] - logdet[:, :, None])   # (B, N_i, N_j)
+        log_pi_h = log_pi[:, h if log_pi.shape[1] > 1 else 0].expand(B, N, N)   # (B, N, N)
+        support = torch.isfinite(log_pi_h)
+        logits = torch.where(support, log_pi_h - D / taus[h], torch.full_like(D, float("-inf")))
+        log_z = torch.logsumexp(logits, dim=-1)                                # (B, N)
+        log_beta = logits - log_z.unsqueeze(-1)
+        live = support & torch.isfinite(log_z).unsqueeze(-1)
+        beta = torch.where(live, log_beta.exp(), torch.zeros_like(D))          # (B, N, N)
+        zero = torch.zeros_like(D)
+        energies.append(D)
+        betas.append(beta)
+        belief_rows.append((beta * torch.where(live, D, zero)).sum(dim=-1))
+        entropy_rows.append(taus[h] * (beta * torch.where(live, log_beta - log_pi_h, zero)).sum(dim=-1))
+        log_partitions.append(log_z)
+    return CanonicalRoutingRows(
+        torch.stack(energies, dim=1), torch.stack(betas, dim=1), torch.stack(belief_rows, dim=1),
+        torch.stack(entropy_rows, dim=1), torch.stack(log_partitions, dim=1))

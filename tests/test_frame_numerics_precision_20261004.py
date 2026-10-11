@@ -3,8 +3,8 @@
 U^{-1} and U round trips amplify rounding by kappa(U) (means) or kappa(U)^2 (covariances, Gram
 matrices), and the factorization certificates use the fp32 epsilon. Under fp32_matmul_precision="high"
 these token-linear pieces are pinned to "highest". The healthy pair KL, one centered GEMM per (batch,
-head) since the 2026-10-09 audit, is pinned too; the recovery-path factor tiles keep TF32. TF32 does not
-exist on the CPU, so these tests record the policy each operation sees and check the restore.
+head) since the 2026-10-09 audit, is pinned too, and so are the recovery-path factor tiles (2026-10-10). TF32
+does not exist on the CPU, so these tests record the policy each operation sees and check the restore.
 Tiny CPU shapes only.
 """
 from typing import Any, Dict, List, Set

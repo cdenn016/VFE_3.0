@@ -209,7 +209,7 @@ def test_full_gaussian_natural_promotes_mixed_public_dtypes_before_lu_solve(mu_d
     mu_public = mu.to(public_dtype)
     sigma_public = sigma.to(public_dtype)
     eye = torch.eye(2, dtype=public_dtype)
-    precision = torch.linalg.solve(sigma_public + 1e-6 * eye, eye.expand_as(sigma_public))
+    precision = torch.linalg.solve(sigma_public, eye.expand_as(sigma_public))
     expected = (
         (precision @ mu_public.unsqueeze(-1)).squeeze(-1),
         -0.5 * precision,
@@ -291,4 +291,4 @@ def test_generic_kl_from_A_works_for_matrix_sufficient_statistic():
     closed = q.renyi_closed_form(p, alpha=1.0, kl_max=float("inf"), eps=1e-6)
     generic = _renyi_from_log_partition(q, p, alpha=1.0, kl_max=float("inf"), eps=1e-6)
     assert generic.shape == closed.shape, (generic.shape, closed.shape)
-    assert torch.allclose(generic, closed, atol=1e-3), (generic - closed).abs().max()
+    assert torch.allclose(generic, closed, atol=1e-5), (generic - closed).abs().max()

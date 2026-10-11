@@ -25,8 +25,9 @@ training sample is a subset of the post-hoc one (:func:`training_loop_sample_win
 reproduction of the logged ``train_sample_ce`` is checked on that subset only.
 
 WikiText articles begin at level-1 headings, lines of the form ``" = Title = "``;
-:func:`article_ids` finds them in the decoded byte stream and assigns every token the index of the
-article it belongs to, the resampling unit of the article-level bootstrap.
+:func:`article_ids` finds them in the decoded byte stream (skipping the formula fragments of the same
+shape) and assigns every token the index of the article it belongs to, the resampling unit of the
+article-level bootstrap.
 """
 
 from __future__ import annotations
@@ -52,6 +53,9 @@ _PROVENANCE_PREFIX = {"validation": "val", "test": "test", "train": "train"}
 
 # A level-1 WikiText heading line: " = Title = " (level 2+ headings start with " = = ").
 _HEADING = re.compile(rb"(?m)^ = [^=\n][^\n]* = $")
+# Last characters of a line that can close the article before a level-1 heading: sentence ends, closing
+# brackets and quotes, and a heading's own "=" (see _equation_fragment).
+_LINE_CLOSERS = frozenset('.!?"\')]:;=\u201d\u2019\u00bb')
 
 
 class StreamIdentityError(ValueError):
@@ -342,6 +346,26 @@ def _byte_decoder(dataset: str) -> Optional[Callable[[Sequence[int]], bytes]]:
     return get_tiktoken_byte_decoder(dataset)
 
 
+def _equation_fragment(text: bytes, match: "re.Match[bytes]") -> bool:
+    r"""Whether a heading-shaped line is a piece of a sentence split at a removed formula.
+
+    WikiText drops ``<math>`` markup and leaves its ``=`` signs on lines of their own, so
+    ``"... cut-off frequency of w_c"`` / ``" = 1 rad / s and a nominal impedance k = "`` / ``" 1 Ohm . ..."``
+    reads as a level-1 heading. Such a line continues a sentence on both sides: the previous non-blank
+    line does not close (its last character is none of :data:`_LINE_CLOSERS`) and the next one opens
+    with a digit (the value on the right of the trailing ``=``). A true heading follows the end of the
+    previous article. On the cached GPT-2 streams this rule keeps the published 60 validation and 60
+    test articles (it drops the two such lines in the test article "Constant k filter"; audit
+    2026-10-10 #53); on the train stream it would also drop a few digit-led titles after an unclosed
+    list line ("2nd Battalion 9th Marines"), which no post-hoc analysis segments.
+    """
+    head = text[:match.start()].rstrip(b"\n ")
+    previous = head[head.rfind(b"\n") + 1:].decode("utf-8", errors="replace")
+    if not previous or previous[-1] in _LINE_CLOSERS:
+        return False
+    return text[match.end():].lstrip(b"\n ")[:1].isdigit()
+
+
 def article_ids(
     tokens:  torch.Tensor,
     dataset: Optional[str] = None,
@@ -353,8 +377,9 @@ def article_ids(
     r"""Per-token article index from the level-1 headings of the decoded stream, or ``None``.
 
     The stream is decoded to bytes; each match of ``^ = Title = $`` (a line whose first character
-    after ``" = "`` is not ``"="``) starts an article at the token containing the heading's first
-    byte. Tokens before the first heading join article 0. Returns ``(ids (T,) int64, titles, info)``,
+    after ``" = "`` is not ``"="``) that is not a formula fragment (:func:`_equation_fragment`) starts
+    an article at the token containing the heading's first byte. Tokens before the first heading join
+    article 0. Returns ``(ids (T,) int64, titles, info)``,
     or ``None`` when no byte decoder exists for the dataset or no heading is found. ``vocab_size``,
     when given, bounds the ids (``ValueError`` otherwise); only the ids present are decoded.
     """
@@ -379,7 +404,7 @@ def article_ids(
     text = decode_bytes(ids.tolist())
     if len(text) != int(ends[-1]):
         raise ValueError("per-token byte lengths do not add up to the decoded stream")
-    matches = list(_HEADING.finditer(text))
+    matches = [m for m in _HEADING.finditer(text) if not _equation_fragment(text, m)]
     if not matches:
         return None
     starts = np.searchsorted(ends, np.array([m.start() for m in matches], dtype=np.int64), side="right")
@@ -390,7 +415,8 @@ def article_ids(
     article = np.maximum(article, 0)
     titles = [m.group(0).decode("utf-8", errors="replace").strip(" =") for m in matches]
     info = {"n_articles": len(matches), "n_preamble_tokens": n_preamble,
-            "rule": "level-1 heading lines ' = Title = ' in the decoded byte stream"}
+            "rule": "level-1 heading lines ' = Title = ' in the decoded byte stream, excluding formula "
+                    "fragments that continue a sentence on both sides"}
     return article, titles, info
 
 

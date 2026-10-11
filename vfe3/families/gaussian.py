@@ -627,16 +627,15 @@ class FullGaussian(BeliefParams):
         }
 
     def natural(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Ridge the covariance before inverting to the precision (the natural parameter); the
-        # 1e-6 jitter matches the eps the closed-form full kernel uses for SPD safety. NOT routed
-        # through ``safe_spd_inverse``: that helper's Cholesky-inverse diverges from this LU solve by
-        # ~1.5e-4 once cond(Sigma) >= 1e3 (reachable here, eps=1e-6 floor / sigma_max=5 cap give
-        # cond up to ~5e6), so centralizing would CHANGE the live result -- pinned by
-        # tests/test_fix_numerics_audit.py::test_natural_inverse_not_routed_solve_vs_safe_spd_diverges.
+        # The exact precision (the natural parameter) by an LU solve. No ridge: ``expected_statistic``
+        # returns the unridged Sigma + mu mu^T, so a ridge here made gradA(theta_q) != E_q[T] and biased
+        # the generic log-partition oracle by about 1e-6 / lambda_min(Sigma) (audit 2026-10-10, item 41).
+        # Only that oracle (vfe3.families.base._renyi_from_log_partition) consumes this method; the full
+        # family's divergences use its closed form.
         mu = self.mu if self.mu.dtype == self._public_dtype else self.mu.to(self._public_dtype)
         sigma = self.sigma if self.sigma.dtype == self._public_dtype else self.sigma.to(self._public_dtype)
         eye = torch.eye(mu.shape[-1], device=mu.device, dtype=self._public_dtype)
-        prec = torch.linalg.solve(sigma + 1e-6 * eye, eye.expand_as(sigma))
+        prec = torch.linalg.solve(sigma, eye.expand_as(sigma))
         t1 = (prec @ mu.unsqueeze(-1)).squeeze(-1)
         return (t1, -0.5 * prec)
 

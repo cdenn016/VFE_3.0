@@ -23,8 +23,10 @@ no dtype knob here to set.
 ``SELF_CE`` adds the diagnostic that separates a sampler artifact from a model property. Each
 generated continuation is scored teacher-forced against its own prompt, and compared with held-out
 corpus slices of the same length that carry an equal window of preceding text. Both go through the
-identical scorer, which anchors its blocks at the end of the stream so the scored tail keeps as much
-context as ``max_seq_len`` allows and every tail token is counted exactly once. A self-CE well below
+identical scorer, which slides ``max_seq_len`` windows back from the end of the stream by the run's
+``eval_stride`` (a quarter of the window when unset) and scores only each window's last ``stride``
+targets, so every tail token is counted exactly once with at least ``max_seq_len - stride`` tokens of
+context (disjoint blocks would give the first target of each block one token). A self-CE well below
 the held-out CE means the model has a sharp mode its own sampler keeps falling into; a self-CE at or
 above it means the loop is not a preferred mode at all, and greedy is walking a flat, uninformative
 distribution. Note that the held-out reference is the model's own, not a ceiling: this script scores
@@ -256,35 +258,52 @@ def generate_for_prompts(
     return generations
 
 
+def scoring_stride(seq_len: int, eval_stride: Optional[int] = None) -> int:
+    r"""Stride of :func:`stream_ce`: the run's ``eval_stride`` when set, else a quarter of ``seq_len``.
+
+    A quarter is the launcher's held-out protocol (``eval_stride = 32`` at ``max_seq_len = 128``); every
+    scored target then keeps at least ``seq_len - stride`` tokens of context.
+    """
+    return int(eval_stride) if eval_stride is not None else max(1, int(seq_len) // 4)
+
+
 @torch.no_grad()
 def stream_ce(
     model:   "torch.nn.Module",
     prefix:  torch.Tensor,          # (P,) the context the text was produced from; may be empty
     tail:    torch.Tensor,          # (T,) the tokens actually being scored
     seq_len: int,
+
+    *,
+    stride:  Optional[int] = None,  # scored targets per window; None -> seq_len (disjoint blocks)
 ) -> float:
     r"""Teacher-forced mean cross-entropy (nats/token) of ``tail`` given ``prefix``.
 
-    Blocks are anchored at the END of ``prefix + tail``, so the scored tail always carries as much
-    preceding context as ``seq_len`` allows. Scoring the tail cold instead would let the
-    no-context first position dominate whenever ``tail`` is short, which is an artifact of the
-    measurement rather than a property of the text. Each tail token is scored exactly once, so two
-    texts of equal length are directly comparable; with an empty ``prefix`` the first tail token has
-    no context to be predicted from and is the one position left unscored.
+    Windows of up to ``seq_len`` tokens are anchored at the END of ``prefix + tail`` and step back by
+    ``stride``; each window runs the model on its whole length but scores only its last ``stride``
+    targets, the overlapping head being context (the masking of
+    :class:`vfe3.data.datasets.TokenWindows` under ``stride < seq_len``). Every tail token is scored
+    exactly once, with at least ``seq_len - stride + 1`` tokens of context wherever the stream
+    provides them, so two texts of equal length are directly comparable. With ``stride == seq_len``
+    the windows are disjoint and the first target of each has one token of context, which inflates
+    the CE (audit 2026-10-10 #35); :func:`scoring_stride` gives the stride the script uses. With an
+    empty ``prefix`` the first tail token has no context to be predicted from and is the one position
+    left unscored.
     """
     n_prefix = int(prefix.shape[0])
     n_tail = int(tail.shape[0])
     if n_tail < 1:
         raise ValueError("stream_ce needs at least one scored token")
+    stride = int(seq_len) if stride is None else int(stride)
+    if not 1 <= stride <= seq_len:
+        raise ValueError(f"stride must lie in [1, seq_len={seq_len}], got {stride}")
     combined = torch.cat([prefix, tail]) if n_prefix else tail
     device = next(model.parameters()).device
     total_nats = 0.0
     total_tokens = 0
-    end = n_prefix + n_tail - 1     # last target index; position i is scored as the target of i-1
-    # A block scores targets start+1..end, so the block that scores the first tail token (index
-    # n_prefix) must END there. Stopping at end == n_prefix would skip it whenever a block boundary
-    # lands on start == n_prefix, i.e. whenever (n_tail - 1) % seq_len == 0.
-    while end >= max(n_prefix, 1):
+    first = max(n_prefix, 1)        # first scored index; position i is scored as the target of i-1
+    end = n_prefix + n_tail - 1     # last target index of the current window
+    while end >= first:
         start = max(0, end - seq_len)
         inputs = combined[start:end].unsqueeze(0).to(device)          # (1, end - start)
         targets = combined[start + 1:end + 1].unsqueeze(0).to(device)
@@ -294,12 +313,13 @@ def stream_ce(
             targets.reshape(-1),
             reduction="none",
         )
-        # per_token[k] scores the token at index start + 1 + k; drop the prefix-predicting head.
-        offset = max(0, n_prefix - start - 1)
-        scored = per_token[offset:]
+        # per_token[k] scores the token at index start + 1 + k. Score indices lo..end only: the last
+        # `stride` targets, never a prefix-predicting head; the next window ends at lo - 1.
+        lo = max(first, end - stride + 1)
+        scored = per_token[lo - start - 1:]
         total_nats += float(scored.sum())
         total_tokens += int(scored.numel())
-        end = start
+        end = lo - 1
     if total_tokens == 0:
         raise ValueError("stream_ce scored no tokens")
     return total_nats / total_tokens
@@ -357,19 +377,23 @@ def score_streams(
     draws:            Sequence[torch.Tensor],
     max_new_tokens:   int,
     seq_len:          int,
+
+    *,
+    stride:           int,
 ) -> SelfCEScore:
-    r"""Score each continuation and the SHARED held-out draws through one scorer.
+    r"""Score each continuation and the SHARED held-out draws through one scorer (window ``seq_len``,
+    ``stride`` scored targets per window; :func:`stream_ce`).
 
     ``draws`` is passed in rather than fetched here so a baseline scores the identical corpus
     slices, which is what makes two models' numbers comparable at all.
     """
     generated = [
         stream_ce(forward, torch.tensor(prefix, dtype=torch.long),
-                  torch.tensor(tail, dtype=torch.long), seq_len)
+                  torch.tensor(tail, dtype=torch.long), seq_len, stride=stride)
         for prefix, tail in zip(prompt_ids, continuation_ids)
     ]
     reference = [
-        stream_ce(forward, draw[:-max_new_tokens], draw[-max_new_tokens:], seq_len)
+        stream_ce(forward, draw[:-max_new_tokens], draw[-max_new_tokens:], seq_len, stride=stride)
         for draw in draws
     ]
     return SelfCEScore(generated=generated, reference=reference)
@@ -457,8 +481,11 @@ def main() -> None:
     baseline_texts: Optional[List[str]] = None
     seq_len = 0
     baseline_seq_len = 0
+    stride = 0
+    baseline_stride = 0
     if SELF_CE:
         seq_len = int(loaded.cfg.max_seq_len)
+        stride = scoring_stride(seq_len, loaded.cfg.eval_stride)
         prompt_ids = [prompt_token_ids(generation.prompt, loaded.dataset)
                       for generation in generations]
         if BASELINE != "none":
@@ -469,6 +496,7 @@ def main() -> None:
                     f"window of {baseline.context}; its position embeddings do not extend")
             baseline_seq_len = (BLOCK_TOKENS if BLOCK_TOKENS is not None
                                 else baseline.context)
+            baseline_stride = scoring_stride(baseline_seq_len)
         # Drawn once and shared, so both models score the identical corpus slices. Warming to the
         # LARGER block keeps the longer-block model supplied; the shorter-block one ignores the rest.
         warmup = max(seq_len, baseline_seq_len)
@@ -476,12 +504,13 @@ def main() -> None:
             loaded.dataset, SPLIT, MAX_NEW_TOKENS, REFERENCE_DRAWS, warmup=warmup)
         scores = score_streams(
             loaded.model, prompt_ids, [g.token_ids for g in generations],
-            draws, MAX_NEW_TOKENS, seq_len)
+            draws, MAX_NEW_TOKENS, seq_len, stride=stride)
         if baseline is not None:
             baseline_ids = [baseline.generate(ids, MAX_NEW_TOKENS) for ids in prompt_ids]
             baseline_texts = [decode_ids(ids, loaded.dataset) for ids in baseline_ids]
             baseline_scores = score_streams(
-                baseline, prompt_ids, baseline_ids, draws, MAX_NEW_TOKENS, baseline_seq_len)
+                baseline, prompt_ids, baseline_ids, draws, MAX_NEW_TOKENS, baseline_seq_len,
+                stride=baseline_stride)
 
     if JSON_OUTPUT:
         payload = {
@@ -510,6 +539,7 @@ def main() -> None:
                 "reference_ppl_mean": math.exp(mean),
                 "reference_draws":    len(scores.reference),
                 "block_tokens":       seq_len,
+                "stride_tokens":      stride,
                 "generated":          scores.generated,
                 "generated_delta":    [value - mean for value in scores.generated],
             }
@@ -519,6 +549,7 @@ def main() -> None:
                     "name":               BASELINE,
                     "parameters":         baseline.parameter_count(),
                     "block_tokens":       baseline_seq_len,
+                    "stride_tokens":      baseline_stride,
                     "reference_mean":     base_mean,
                     "reference_min":      base_low,
                     "reference_max":      base_high,
@@ -539,7 +570,8 @@ def main() -> None:
           f"   max_new_tokens: {MAX_NEW_TOKENS}\n")
     if scores is not None:
         mean, low, high = scores.summary()
-        print("self-CE (teacher-forced nats/token; one scorer and one shared held-out reference)")
+        print("self-CE (teacher-forced nats/token; one scorer and one shared held-out reference; "
+              f"window {seq_len}, stride {stride})")
         print(f"  held-out {SPLIT}: {mean:.3f}  [{low:.3f}, {high:.3f}] over "
               f"{len(scores.reference)} x {MAX_NEW_TOKENS} tokens   ppl {math.exp(mean):.2f}")
         print("  delta < 0 means the model finds its own output less surprising than real text")

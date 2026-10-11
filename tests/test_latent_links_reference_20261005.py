@@ -733,8 +733,11 @@ def test_zero_loop_weight_equals_loop_free_model() -> None:
                                       link_state={"previous": case.previous})
     torch.testing.assert_close(A_zero, A_free, atol=0, rtol=0)
     torch.testing.assert_close(e_zero, e_free, atol=0, rtol=0)
-    torch.testing.assert_close(ctx_a.A, A_free, atol=0, rtol=0)
-    torch.testing.assert_close(ctx_b.A, A_free, atol=0, rtol=0)
+    # The implementation forms C_i through the symmetrized _reference_covariance and the reference through
+    # U^{-1} Sigma U^{-T}, so the two paths agree to rounding (1 ulp under the product-form chart, 2026-10-10);
+    # the exact lambda_W = 0 identity is pinned bitwise on one path above.
+    torch.testing.assert_close(ctx_a.A, A_free, atol=1e-12, rtol=1e-12)
+    torch.testing.assert_close(ctx_b.A, A_free, atol=1e-12, rtol=1e-12)
     # The loop-free energy lacks the loop term the reference would add.
     F, _, _, _ = _chart(case.ops)
     assert float(_reference_loop_energy(F, A_free, case.B, case.previous, case.weights, None).sum()) > 1e-4

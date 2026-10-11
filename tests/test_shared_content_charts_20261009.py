@@ -1,7 +1,6 @@
 """Every layer's content-link chart O' in one batched float64 evaluation per forward (audit 2026-10-09).
 
-The exponential chart O' = T^{-1} + O phi1(TO) was evaluated per layer per forward, one 2K x 2K matrix_exp
-each. ``shared_content_charts`` evaluates all layers' stacks in one batched call and hands each operator
+The exponential chart O' = e^{OT} T^{-1} was evaluated per layer per forward, one matrix_exp each. ``shared_content_charts`` evaluates all layers' stacks in one batched call and hands each operator
 its slice. Checked here: the values equal the per-layer evaluation (bit for bit on the CPU), the gradients
 with respect to every layer's (T, O) agree, the float64 gradcheck of the batched kernel, an ill-conditioned
 T, the restore on exit, and an unchanged model loss. Tiny CPU shapes only.
@@ -81,8 +80,8 @@ def test_model_loss_is_unchanged_by_the_shared_charts(monkeypatch: pytest.Monkey
     model = VFEModel(tiny_config(n_layers=2, content_link_chart="exponential"))
     tokens = torch.tensor([[1, 2, 3], [4, 5, 6]])
     calls = []
-    real_phi1 = relational_operators._phi1
-    monkeypatch.setattr(relational_operators, "_phi1", lambda A: calls.append(A.shape) or real_phi1(A))
+    real_exp = relational_operators._content_link_exp
+    monkeypatch.setattr(relational_operators, "_content_link_exp", lambda X: calls.append(X.shape) or real_exp(X))
     _, shared, _ = model(tokens, targets=tokens)
     assert calls == [torch.Size([2, 4, 4])]                          # one batched call for both layers
     shared.backward()

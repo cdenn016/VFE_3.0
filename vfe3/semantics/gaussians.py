@@ -514,16 +514,16 @@ def _centered_unit(X: np.ndarray) -> np.ndarray:
     return Xc / np.where(norms > 0.0, norms, 1.0)
 
 
-def _dispersion(lv: np.ndarray, log_d0: np.ndarray) -> Dict[str, Any]:
+def _dispersion(lv: np.ndarray, log_d0: np.ndarray, logdet: np.ndarray) -> Dict[str, Any]:
     r"""CV of :math:`\mathrm{tr}\,\Sigma`, log-determinant and per-coordinate summaries.
 
     ``cv_trace`` (and the gate) is computed in the trained coordinates, which the global rescaling
     :math:`lv \to lv + 2\log D` changes; ``cv_trace_d0`` uses
     :math:`\mathrm{tr}\,\Sigma^{D_0} = \sum_k e^{lv_k + 2\log d_{0,k}}`, which it leaves invariant.
+    ``logdet`` is :math:`\log\det\Sigma_v` per row (the row sum of ``lv`` for a diagonal table).
     """
     trace = np.exp(lv).sum(axis=1)                              # (n,) trained coordinates
     trace_d0 = np.exp(lv + 2.0 * log_d0).sum(axis=1)            # (n,) D0 units
-    logdet = lv.sum(axis=1)
     q = [0.01, 0.25, 0.5, 0.75, 0.99]
     cv = float(trace.std() / trace.mean())
     return {
@@ -744,9 +744,10 @@ def _ok_benches(sim: Dict[str, Any]) -> List[str]:
     return [b for b, v in sim.items() if isinstance(v, dict) and v.get("status") == "ok"]
 
 
-def _token_classes(run: Any, ctx: AnalysisContext, lv_all: np.ndarray,
+def _token_classes(run: Any, ctx: AnalysisContext, logdet_all: np.ndarray,
                    cand_mask: np.ndarray) -> Tuple[Dict[str, Any], Dict[str, np.ndarray]]:
-    r"""log det Sigma per token class over all valid frequent tokens (not only whole words)."""
+    r"""log det Sigma per token class over all valid frequent tokens (not only whole words);
+    ``logdet_all`` is (V,) :math:`\log\det\Sigma_v`."""
     codes, names = run.vocab.token_classes()
     codes = np.asarray(codes)
     if ctx.counts is not None:
@@ -756,7 +757,6 @@ def _token_classes(run: Any, ctx: AnalysisContext, lv_all: np.ndarray,
     else:
         mask = cand_mask
         population = "candidate words (training counts unavailable)"
-    logdet_all = lv_all.sum(axis=1)
     groups: Dict[str, np.ndarray] = {}
     summary: Dict[str, Any] = {}
     for c, name in enumerate(names):
@@ -797,11 +797,15 @@ def _fields(ctx: AnalysisContext, row_of: Dict[int, int], logdet: np.ndarray,
 def _bank_battery(run: Any, ctx: AnalysisContext, mu_fn: Callable[[np.ndarray], np.ndarray],
                   lv_fn: Callable[[np.ndarray], np.ndarray], lv_init: float,
                   rng: np.random.Generator, *, bank: str, failed: List[Dict[str, str]],
-                  notes: List[str]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+                  notes: List[str],
+                  logdet_fn: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+                  ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     r"""Items 1-6 of the Sigma section for one bank. Returns (metrics, arrays for figures).
 
     Loading the tables and the dispersion summary are required; every later item that raises is
     recorded in ``failed`` (step ``"<bank>: <item>"``) and replaced by a failed-status entry.
+    ``logdet_fn`` gives (n,) :math:`\log\det\Sigma_v` for a covariance that is not diagonal (the
+    per-head ``block_cholesky`` blocks); None takes the row sum of ``lv_fn``.
     """
     ids = np.asarray(ctx.candidate_ids, dtype=np.int64)
     row_of = {int(t): r for r, t in enumerate(ids)}
@@ -809,17 +813,19 @@ def _bank_battery(run: Any, ctx: AnalysisContext, mu_fn: Callable[[np.ndarray], 
     mu = np.asarray(mu_fn(ids), dtype=np.float64)              # (n, K)
     lv_all = np.asarray(lv_fn(np.arange(V, dtype=np.int64)), dtype=np.float64)   # (V, K)
     lv = lv_all[ids]                                            # (n, K)
-    if not (np.isfinite(mu).all() and np.isfinite(lv_all).all()):
-        raise ValueError("non-finite values in the mean or log-variance table")
+    logdet_all = (lv_all.sum(axis=1) if logdet_fn is None
+                  else np.asarray(logdet_fn(np.arange(V, dtype=np.int64)), dtype=np.float64))   # (V,)
+    if not (np.isfinite(mu).all() and np.isfinite(lv_all).all() and np.isfinite(logdet_all).all()):
+        raise ValueError("non-finite values in the mean, log-variance or log-determinant table")
     mu_d0, log_d0 = sigma_units(mu, lv)
     lv_d0 = lv + 2.0 * log_d0                                   # (n, K) D0-unit log-variances
-    logdet = lv.sum(axis=1)
+    logdet = logdet_all[ids]                                    # (n,)
     log_count = ctx.log_count(ids)
     cand_mask = np.zeros(V, dtype=bool)
     cand_mask[ids] = True
 
     metrics: Dict[str, Any] = {"n_candidates": int(ids.size), "log_d0": log_d0,
-                               "dispersion": _dispersion(lv, log_d0),
+                               "dispersion": _dispersion(lv, log_d0, logdet),
                                "init": _init_fractions(lv_all, lv_init, cand_mask, ctx.counts)}
     def step(name: str, fn: Callable[[], Any], default: Any) -> Any:
         return _attempt(failed, notes, f"{bank}: {name}", fn, default)
@@ -835,7 +841,7 @@ def _bank_battery(run: Any, ctx: AnalysisContext, mu_fn: Callable[[np.ndarray], 
     else:
         metrics["frequency"] = {"status": "skipped", "reason": "training counts unavailable"}
     metrics["classes"], class_groups = step(
-        "token classes", lambda: _token_classes(run, ctx, lv_all, cand_mask), (dict(_FAILED_STEP), {}))
+        "token classes", lambda: _token_classes(run, ctx, logdet_all, cand_mask), (dict(_FAILED_STEP), {}))
     metrics["fields"], field_groups = step(
         "semantic fields", lambda: _fields(ctx, row_of, logdet, log_count), (dict(_FAILED_STEP), {}))
     metrics["neighbors"] = step(
@@ -1347,6 +1353,20 @@ def run_sigma_section(run: Any, ctx: AnalysisContext) -> SectionResult:
     if not family.startswith("gaussian"):
         result.notes.append(f"family {family}: the Gaussian divergences are evaluated on the "
                             "moment-matched diagonal Gaussians (same mean and covariance diagonal)")
+    blocks = bool(getattr(run, "prior_covariance_blocks", False))
+    metrics["prior_covariance"] = {
+        "table": "block_cholesky" if blocks else "diagonal",
+        "log_det": "exact, from the per-head blocks" if blocks else "exact (diagonal table)",
+        "divergences": ("diagonal marginals N(mu_v, diag C_v): the within-head correlations are dropped"
+                        if blocks else "exact (diagonal table)")}
+    if blocks:                                   # audit 2026-10-10 #20
+        result.notes.append("prior_covariance_table='block_cholesky': log det Σ (dispersion, frequency, token "
+                            "classes, semantic fields, neighbor ordering and the log-det entailment baseline) is "
+                            "computed exactly from the per-head blocks C_v^(h). The divergences (KL, Jeffreys, "
+                            "Fisher–Rao, W2 and the distribution cosine of the similarity scorers, the KL-asymmetry "
+                            "entailment test and the KL neighbors) use the diagonal marginals N(μ_v, diag C_v), "
+                            "which drop the within-head correlations, so they are not the divergences of the "
+                            "stored Gaussians; tr Σ needs only the diagonal and is exact")
     invariance = ("KL, Jeffreys, Fisher–Rao and the distribution cosine are invariant under a common "
                   "positive-diagonal rescaling μ → Dμ, log σ² → log σ² + 2 log D of the table; W2 and "
                   "cos(μ) are evaluated in D0 units (log d0_k = −½ mean over candidates of log σ²_k), "
@@ -1369,7 +1389,7 @@ def run_sigma_section(run: Any, ctx: AnalysisContext) -> SectionResult:
         result.notes.append(f"decode kind {run.decode_kind!r}: no decode-bank covariance analysis")
 
     m, arr = _bank_battery(run, ctx, run.mu, run.log_var, lv_init, rng, bank="Prior bank",
-                           failed=failed, notes=result.notes)
+                           failed=failed, notes=result.notes, logdet_fn=run.log_det if blocks else None)
     metrics["banks"]["prior"] = m
     disp = m["dispersion"]
     result.notes.append(f"CV(tr Σ) = {disp['cv_trace']:.3f} is computed in the trained coordinates "

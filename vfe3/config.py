@@ -138,6 +138,12 @@ class VFE3Config:
     eval_interval:                    int             = 1500         # validation every N steps (0 = off)
     checkpoint_interval:              int             = 15000        # resumable checkpoint every N steps (0 = off)
     val_diagnostic_batches:           int             = 1             # validation batches the val_* probes average over
+    # Log-step diagnostic: the canonical free energy at each layer's captured beliefs,
+    # sum_i [alpha_i KL(q_i||p_i) + R(alpha_i)] + lambda_beta sum_h sum_ij [beta*_ij D^h_ij + tau beta*_ij log(beta*_ij/pi_ij)]
+    # with D^h_ij the head-marginal KL of q_i and Omega_ij q_j and the canonical router beta* = softmax(log pi - D/tau);
+    # fills self_coupling, self_divergence, belief_coupling, attention_entropy and total (per-token means) and
+    # canonical_beta_tv. O(B N K^3 + B N^2 sum_h d_h^2) per diagnostic window
+    diagnose_canonical_free_energy:   bool            = False
     
     eval_stride:                      Optional[int]   = None         # held-out window stride <= max_seq_len; None = disjoint windows
     # Training-window origin: "fixed" (window i starts at i*max_seq_len every epoch) | "per_epoch_random"
@@ -391,7 +397,9 @@ class VFE3Config:
     #   mean_distance  ||a_i - b_j||^2 / 2 of the projected means: the covariance-blind control
     relational_routing:               str             = "gaussian_kl"
     # projected_predictive kernel only: tie the key comparison map to the query map, S_K := S_Q (no raw_score_k),
-    # so D_ii = 0 and D_ij = KL(q_i || (Omega_ij)_* q_j) under one map (GL(K) v2, flat alignment).
+    # so D_ii = 0 and each head scores D^h_ij = KL((S_h)_* r_i || (S_h)_* r_j) between the reference beliefs pushed
+    # forward by the one rank-d map S_h, which is at most KL(q_i || (Omega_ij)_* q_j) and equals it only when S_h
+    # is sufficient for the pair (GL(K) v2, flat alignment).
     tie_comparison_maps:              bool            = False
 
     ##################################################
@@ -412,6 +420,7 @@ class VFE3Config:
     #   exact       each head's exact posterior; heads combined by assumed-density filtering
     #   mean_field  KL labels at the input moments and an information-form fusion (no between-source spread)
     minimal_agent_inference:          str             = "mean_field"
+    minimal_agent_cavi_steps:         int             = 1            # mean_field only: label/Gaussian coordinate-ascent sweeps >= 1 (1 = labels at the input moments)
     
     # "passthrough" | "moment_matched"
     #   passthrough     keep the incoming covariance
@@ -467,9 +476,16 @@ class VFE3Config:
     ##################################################
 
     # "channel_likelihood" | "ambient_alignment"
-    #   channel_likelihood  expected likelihood of O_h^T xi_i against the d-dim message T_h xi_j
+    #   channel_likelihood  expected likelihood of P_h xi_i (relational_receiver_measurement) against the d-dim message T_h xi_j
     #   ambient_alignment   sum of KLs to K-dim noisy laws
     relational_receiver_law:          str             = "channel_likelihood"
+
+    # "adjoint" | "inverse"
+    # channel_likelihood only: the receiving measurement of xi_i on head h.
+    #   adjoint  O'_h^T xi_i (equals the inverse only for orthogonal O')
+    #   inverse  the head-h rows of O'^-1 (the dual measurement): the frozen-context minimizer is the kernel
+    #            mean as alpha -> 0 with equal channel precisions, invariant under (U h, T h, S h, h^-1 O')
+    relational_receiver_measurement:  str             = "adjoint"
 
     # "closed_form" | "euler"
     #   closed_form  exact frozen-context natural-parameter update, damped by relational_receiver_damping
@@ -510,6 +526,14 @@ class VFE3Config:
     norm_type_final:                  str             = "none"
     layernorm_affine:                 bool            = False        # layernorm only: learned gamma/beta (init 1/0)
 
+    # "passthrough" | "pushforward"
+    # Covariance through the block LayerNorm (block_coordinates="local", norm_type_block="layernorm").
+    #   passthrough  the norm maps the mean only; Sigma stays in pre-norm units
+    #   pushforward  J_LN Sigma J_LN^T + block_mlp_covariance_floor * D Sigma D, D = diag(gamma)/s; its diagonal
+    #                on the diagonal family (O(K) per token). Inert under block_mlp_covariance="delta_full",
+    #                whose Jacobian already composes the norm's
+    block_norm_covariance:            str             = "passthrough"
+
     # "local" | "reference"
     #   local      the block norm, block MLP and final norm act on mu_i
     #   reference  they act on xi_i = U_i^-1 mu_i and map back, mu -> U_i Phi(U_i^-1 mu). only:
@@ -537,7 +561,8 @@ class VFE3Config:
 
     # "passthrough" | "delta_full" | "posterior"
     #   passthrough  covariance untouched (every mode)
-    #   delta_full   J Sigma J^T + block_mlp_covariance_floor * Sigma (coordinate, gauge_gate, canonical_frame)
+    #   delta_full   J Sigma J^T + block_mlp_covariance_floor * Sigma (coordinate, gauge_gate, canonical_frame);
+    #                its diagonal on gaussian_diagonal (coordinate, canonical_frame)
     #   posterior    the template posterior covariance (prototype_agents)
     block_mlp_covariance:             str             = "passthrough"
    
@@ -554,6 +579,8 @@ class VFE3Config:
     #   mean_field  KL-label responsibilities and the power posterior
     #   exact       exact mixture posterior (dense or block covariance needs a Cholesky per token/template)
     block_mlp_inference:              str             = "mean_field"
+    block_mlp_cavi_steps:             int             = 1            # mean_field only: label/Gaussian coordinate-ascent sweeps >= 1 (1 = labels at the input moments)
+    block_mlp_em_weight:              float           = 0.0          # prototype_agents only: weight of the EM M-step term on (nu, lambda, pi); 0 = off
     
     # Per-type (V, n_gen) table added to the first hidden pre-activations of each layer's MLP (zero init).
     # only: projected attention, use_block_mlp with a coordinate or canonical_frame MLP.
@@ -561,7 +588,7 @@ class VFE3Config:
     
     block_mlp_expansion:              int             = 8            # hidden width (or template count) = expansion * K
     block_mlp_dropout:                float           = 0.0
-    block_mlp_covariance_floor:       float           = 1e-4         # delta_full only
+    block_mlp_covariance_floor:       float           = 1e-4         # delta_full and block_norm_covariance="pushforward"
     block_mlp_template_init_variance: float           = 10.0         # prototype_agents only: initial template variance > 0
     # "absolute" | "working_variance"
     # prototype_agents only: template initialization.
@@ -611,7 +638,19 @@ class VFE3Config:
     
     m_phi_group_trust_radius:         float           = 0.1          # pullback_group / fisher_group only: step bound
     m_phi_fisher_rotation_weight:     float           = 2.0          # fisher_group only: completion weight lambda on every rotation; raises Fisher-visible rotation metrics a -> a + 2 lambda
-    
+
+    # "adamw" | "fisher"
+    # M-step update of the type-prior tables mu_embed and sigma_log_embed, p_v = N(mu_v, diag s_v), s_v = e^{l_v}.
+    #   adamw   AdamW at m_p_mu_lr / m_p_sigma_lr
+    #   fisher  natural gradient in the count-weighted Gaussian Fisher metric (n_v/N) diag(1/s_v, 1/2):
+    #           (mu_v, l_v) -= eta (N/n_v) (s_v grad_mu, 2 grad_l), each row's step bounded in Fisher norm by
+    #           m_table_fisher_trust_radius; the AdamW rates schedule it (step times lr_t/lr_0) and set the
+    #           decoupled decay. only: a decoder that does not read these tables (decode_mode="linear" or
+    #           untie_decode_bank=True) and prior_covariance_table="diagonal"
+    m_table_update_mode:              str             = "adamw"
+    m_table_fisher_lr:                float           = 0.1          # fisher only: natural step size eta > 0
+    m_table_fisher_trust_radius:      float           = 0.1          # fisher only: per-row Fisher-norm bound r (KL <= r^2/2 per step)
+
     ##################################################
     #   17. Learning rates (M-step)
     ##################################################
@@ -641,7 +680,13 @@ class VFE3Config:
     # Mean tables (mu_embed, decode means, linear readout). Decay reaches every row every step, rare
     # tokens included. None = weight_decay; 0 = exempt.
     mu_weight_decay:                  Optional[float] = 0
-    
+
+    # Separate decode-side mean tables only (untied decode_mu_embed, linear output_proj_weight): a
+    # Gaussian prior on the decode means. The rows of types that are rarely or never targets receive only
+    # the softmax push away from the queries, which nothing else opposes, and the KL logit is unbounded
+    # below in their distance (audit 2026-10-10, item 2). None = mu_weight_decay; 0 = exempt.
+    decode_mu_weight_decay:           Optional[float] = None
+
     # Log-variance tables. Decay pulls sigma toward 1 against sigma_init. None = weight_decay; 0 = exempt.
     sigma_weight_decay:               Optional[float] = 0
     
@@ -744,6 +789,10 @@ class VFE3Config:
         from vfe3.model.minimal_agent import MINIMAL_AGENT_INFERENCE, PREDICTIVE_READOUTS
         _require(self.predictive_readout, PREDICTIVE_READOUTS, "predictive_readout")
         _require(self.minimal_agent_inference, MINIMAL_AGENT_INFERENCE, "minimal_agent_inference")
+        for name in ("minimal_agent_cavi_steps", "block_mlp_cavi_steps"):
+            steps = getattr(self, name)
+            if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+                raise ValueError(f"{name} must be an int >= 1, got {steps!r}")
         if (isinstance(self.minimal_agent_channel_noise, bool)
                 or not isinstance(self.minimal_agent_channel_noise, Real)
                 or not math.isfinite(float(self.minimal_agent_channel_noise))
@@ -765,6 +814,7 @@ class VFE3Config:
             raise ValueError("relational_receiver_noise must be a finite positive reference variance")
         _require(self.relational_receiver_law, ("channel_likelihood", "ambient_alignment"),
                  "relational_receiver_law")
+        _require(self.relational_receiver_measurement, ("adjoint", "inverse"), "relational_receiver_measurement")
         _require(self.relational_receiver_update, ("closed_form", "euler"), "relational_receiver_update")
         if (isinstance(self.relational_receiver_damping, bool)
                 or not isinstance(self.relational_receiver_damping, Real)
@@ -1404,6 +1454,9 @@ class VFE3Config:
             raise ValueError(
                 "mu_trust_cholesky_rounds must be a nonnegative int, got "
                 f"{self.mu_trust_cholesky_rounds!r}")
+        if not isinstance(self.diagnose_canonical_free_energy, bool):
+            raise ValueError(f"diagnose_canonical_free_energy must be a bool, got "
+                             f"{self.diagnose_canonical_free_energy!r}")
         if self.val_diagnostic_batches < 1:
             raise ValueError(
                 "val_diagnostic_batches must be an int >= 1, got "
@@ -1611,13 +1664,34 @@ class VFE3Config:
                 "block_mlp_covariance_floor must be a finite real value > 0, "
                 f"got {self.block_mlp_covariance_floor!r}"
             )
+        # The diagonal family reads the pushforward through its M-projection diag(J Sigma J^T) (audit 2026-10-10,
+        # item 9), as the attention update already projects its dense covariance; gauge_gate's delta_full
+        # Jacobian needs the full layout.
         if (self.use_block_mlp and self.block_mlp_covariance == "delta_full"
-                and self.family not in ("gaussian_full", "gaussian_block")):
+                and self.family not in ("gaussian_full", "gaussian_block", "gaussian_diagonal")):
             raise ValueError(
-                "block_mlp_covariance='delta_full' needs a full-covariance Gaussian family "
-                "(family='gaussian_full', or 'gaussian_block' through its head-block projection): the dense "
-                f"J Sigma J^T cannot be represented by a diagonal/non-Gaussian family (got family={self.family!r})."
+                "block_mlp_covariance='delta_full' needs a Gaussian family (family='gaussian_full', "
+                "'gaussian_block' through its head-block projection, or 'gaussian_diagonal' through its "
+                f"diagonal projection); got family={self.family!r}."
             )
+        if (self.use_block_mlp and self.block_mlp_covariance == "delta_full"
+                and self.family == "gaussian_diagonal" and self.block_mlp_mode == "gauge_gate"):
+            raise ValueError("block_mlp_mode='gauge_gate' with block_mlp_covariance='delta_full' needs the "
+                             "full-covariance layout (family='gaussian_full' or 'gaussian_block')")
+        _require(self.block_norm_covariance, ("passthrough", "pushforward"), "block_norm_covariance")
+        if self.block_norm_covariance == "pushforward":
+            problems = []
+            if self.norm_type_block != "layernorm":
+                problems.append(f"norm_type_block='layernorm' (got {self.norm_type_block!r})")
+            if self.block_coordinates != "local":
+                problems.append(f"block_coordinates='local' (got {self.block_coordinates!r})")
+            if self.family not in ("gaussian_full", "gaussian_block", "gaussian_diagonal"):
+                problems.append(f"a Gaussian family (got {self.family!r})")
+            if problems:
+                raise ValueError("block_norm_covariance='pushforward' needs " + "; ".join(problems))
+        if (isinstance(self.block_mlp_em_weight, bool) or not isinstance(self.block_mlp_em_weight, Real)
+                or not math.isfinite(float(self.block_mlp_em_weight)) or float(self.block_mlp_em_weight) < 0.0):
+            raise ValueError(f"block_mlp_em_weight must be a finite real value >= 0, got {self.block_mlp_em_weight!r}")
         # In local coordinates the block norm maps the mean only and passes Sigma through, so the
         # pushforward must compose the norm Jacobian, J = J_mlp J_norm (vfe3.model.block_mlp.
         # block_norm_jacobian). That closed form exists for 'layernorm' (plain or affine); 'mahalanobis'
@@ -1736,6 +1810,22 @@ class VFE3Config:
                 self.m_per_type_hidden_bias_lr = declared_m_phi_lr
 
         # M-step / training
+        _require(self.m_table_update_mode, ("adamw", "fisher"), "m_table_update_mode")
+        for name in ("m_table_fisher_lr", "m_table_fisher_trust_radius"):
+            v = getattr(self, name)
+            if isinstance(v, bool) or not isinstance(v, Real) or not math.isfinite(float(v)) or v <= 0.0:
+                raise ValueError(f"{name} must be a finite real value > 0, got {v!r}")
+        if self.m_table_update_mode == "fisher":
+            # The count-weighted metric (n_v/N) G_v is the Fisher of the gathered prior rows only: a decoder
+            # that reads these tables sends every row a softmax gradient, including rows with n_v = 0.
+            table_problems = []
+            if self.decode_mode != "linear" and not self.untie_decode_bank:
+                table_problems.append("a decoder that does not read the prior tables (decode_mode='linear' or "
+                                      "untie_decode_bank=True)")
+            if self.prior_covariance_table != "diagonal":
+                table_problems.append(f"prior_covariance_table='diagonal' (got {self.prior_covariance_table!r})")
+            if table_problems:
+                raise ValueError("m_table_update_mode='fisher' needs " + "; ".join(table_problems))
         if self.e_mu_q_trust is not None and not (
             math.isfinite(self.e_mu_q_trust) and self.e_mu_q_trust > 0.0
         ):
@@ -1784,7 +1874,7 @@ class VFE3Config:
         if not math.isfinite(self.unigram_kappa) or self.unigram_kappa < 0.0:
             raise ValueError(
                 f"unigram_kappa must be finite and >= 0, got {self.unigram_kappa}")
-        for name in ("sigma_weight_decay", "mu_weight_decay"):
+        for name in ("sigma_weight_decay", "mu_weight_decay", "decode_mu_weight_decay"):
             value = getattr(self, name)
             if value is not None and (not math.isfinite(value) or value < 0.0):
                 raise ValueError(f"{name} must be finite and >= 0 or None, got {value}")
@@ -1879,6 +1969,8 @@ class VFE3Config:
             mark(("m_phi_group_trust_radius", "m_phi_group_retraction"),
                  "only read by the manifold phi optimizer "
                  "(m_phi_update_mode='pullback_group' or 'fisher_group')")
+        if self.m_table_update_mode != "fisher":
+            mark(("m_table_fisher_lr", "m_table_fisher_trust_radius"), "only read by m_table_update_mode='fisher'")
         if not phi_update_policy.requires_manifold_optimizer:
             mark(("bch_residual_max",),
                  "only read by the manifold phi optimizer's group-product gate")
@@ -1987,8 +2079,10 @@ class VFE3Config:
                      "MLP, a none/layernorm norm and linear decode, every contraction runs with autocast "
                      "disabled")
         else:
-            mark(("minimal_agent_inference", "minimal_agent_channel_noise"),
+            mark(("minimal_agent_inference", "minimal_agent_channel_noise", "minimal_agent_cavi_steps"),
                  "only read by predictive_readout='minimal_agent'")
+        if self.predictive_readout == "minimal_agent" and self.minimal_agent_inference != "mean_field":
+            mark(("minimal_agent_cavi_steps",), "only read by minimal_agent_inference='mean_field'")
         if self.content_link_edges == "off":
             mark(("content_link_edge_rank",), "only read when content_link_edges is 'lowrank' or 'pure_gauge'")
         if self.content_link_edges != "lowrank":
@@ -2000,13 +2094,16 @@ class VFE3Config:
             mark(("content_link_loop_window",), "only read when content_link_loop_weight > 0")
         if self.attention_mode != "projected_gradient":
             mark(("relational_receiver_noise", "relational_receiver_law", "relational_receiver_update",
-                  "relational_receiver_damping"), "only read by projected_gradient receiving laws")
+                  "relational_receiver_damping", "relational_receiver_measurement"),
+                 "only read by projected_gradient receiving laws")
         elif self.relational_receiver_update == "closed_form":
             mark(("e_q_mu_lr", "e_q_sigma_lr", "e_mu_q_trust", "e_sigma_q_trust"),
                  "relational_receiver_update='closed_form' applies the exact frozen-context update; "
                  "its step control is relational_receiver_damping")
         else:
             mark(("relational_receiver_damping",), "only read by relational_receiver_update='closed_form'")
+        if self.attention_mode == "projected_gradient" and self.relational_receiver_law != "channel_likelihood":
+            mark(("relational_receiver_measurement",), "only read by relational_receiver_law='channel_likelihood'")
         gradient_controls = ("e_q_mu_lr", "e_q_sigma_lr", "e_mu_q_trust", "e_sigma_q_trust")
         if self.attention_mode == "projected_predictive":
             mark(("skip_belief_sigma_update",),
@@ -2018,32 +2115,43 @@ class VFE3Config:
             if self.mstep_self_coupling_weight == 0.0:
                 mark(("lambda_alpha_mode", "lambda_alpha", "b0", "c0"),
                      "predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer")
+        mlp_delta_full = self.use_block_mlp and self.block_mlp_covariance == "delta_full"
+        # The norm pushforward reads the same floor (in post-norm units) as delta_full.
+        norm_floor = () if self.block_norm_covariance == "pushforward" and not mlp_delta_full else (
+            "block_mlp_covariance_floor",)
+        if self.block_norm_covariance == "pushforward" and mlp_delta_full:
+            mark(("block_norm_covariance",), "block_mlp_covariance='delta_full' already composes the norm Jacobian")
         if not self.use_block_mlp:
-            mark(("block_mlp_mode", "block_mlp_covariance", "block_mlp_covariance_floor",
+            mark(("block_mlp_mode", "block_mlp_covariance", *norm_floor,
                   "block_mlp_expansion", "block_mlp_activation", "block_mlp_dropout", "m_block_mlp_lr"),
                  "only read when use_block_mlp=True")
         elif self.block_mlp_mode == "gaussian_template":
-            mark(("block_mlp_activation", "block_mlp_covariance_floor"),
+            mark(("block_mlp_activation", *norm_floor),
                  "gaussian_template gates by softmax over template KLs and keeps covariance")
         elif self.block_mlp_mode == "prototype_agents":
-            mark(("block_mlp_activation", "block_mlp_covariance_floor"),
+            mark(("block_mlp_activation", *norm_floor),
                  "prototype_agents has no hidden activation, and its posterior covariance is exact, "
                  "with no floor")
         elif self.block_mlp_covariance != "delta_full":
-            mark(("block_mlp_covariance_floor",), "only read by block_mlp_covariance='delta_full'")
+            mark(norm_floor, "only read by block_mlp_covariance='delta_full' or block_norm_covariance='pushforward'")
         if not (self.use_block_mlp and self.block_mlp_mode == "prototype_agents"):
             mark(("block_mlp_inference", "block_mlp_template_init_variance", "block_mlp_template_init",
-                  "block_mlp_template_init_pull"),
+                  "block_mlp_template_init_pull", "block_mlp_cavi_steps", "block_mlp_em_weight"),
                  "only read by block_mlp_mode='prototype_agents' with use_block_mlp=True")
-        elif self.block_mlp_template_init == "working_variance":
-            mark(("block_mlp_template_init_variance",),
-                 "block_mlp_template_init='working_variance' sets lambda_0 from the measured working variance")
         else:
-            mark(("block_mlp_template_init_pull",), "only read by block_mlp_template_init='working_variance'")
+            if self.block_mlp_inference != "mean_field":
+                mark(("block_mlp_cavi_steps",), "only read by block_mlp_inference='mean_field'")
+            if self.block_mlp_template_init == "working_variance":
+                mark(("block_mlp_template_init_variance",),
+                     "block_mlp_template_init='working_variance' sets lambda_0 from the measured working variance")
+            else:
+                mark(("block_mlp_template_init_pull",), "only read by block_mlp_template_init='working_variance'")
         if self.pos_phi != "learned":
             mark(("m_pos_phi_lr",), "only pos_phi='learned' creates the learnable positional table")
         if "layernorm" not in (self.norm_type_block, self.norm_type_final):
             mark(("layernorm_affine",), "only read by a 'layernorm' block or final norm seam")
+        if self.norm_type_block != "layernorm" or self.block_coordinates != "local":
+            mark(("block_norm_covariance",), "only read by a 'layernorm' block norm in local coordinates")
         if not (self.layernorm_affine and "layernorm" in (self.norm_type_block, self.norm_type_final)):
             mark(("m_layernorm_lr",), "requires layernorm_affine and a layernorm seam")
         if not self.decode_unigram_prior:
@@ -2068,7 +2176,12 @@ class VFE3Config:
             mark(("pos_phi_project_slk", "pos_phi_scale"), "only read by a non-'none' pos_phi")
         if (self.beta_attention_prior in ("windowed", "causal_windowed")
                 and self.attention_window >= self.max_seq_len - 1):
-            mark(("attention_window",), "window covers the context and is identical to plain causal")
+            # The two-sided band then admits every pair, so 'windowed' equals the non-causal uniform
+            # prior (audit 2026-10-10, item 4).
+            mark(("attention_window",),
+                 "window covers the context: 'causal_windowed' is identical to plain causal"
+                 if self.beta_attention_prior == "causal_windowed" else
+                 "window covers the context: 'windowed' is identical to the uniform (non-causal) prior")
         if self.n_layers == 1:
             mark(("prior_handoff_rho", "prior_handoff_sigma"), "no next layer consumes the handoff")
         registration = _DECODERS[self.decode_mode]
@@ -2101,7 +2214,24 @@ class VFE3Config:
             if not self.untie_decode_bank:
                 mark(("m_decode_mu_lr", "m_decode_sigma_lr"),
                      "shared encode/decode tables use the encoder rates")
+                mark(("decode_mu_weight_decay",),
+                     "shared encode/decode tables: the decode means are mu_embed, decayed by mu_weight_decay")
             mark(("decode_bias",), "linear decode only; the prior-bank KL decoders create no output bias")
+        # Decay is read per optimizer group (vfe3/train.py build_optimizer). The global weight_decay reaches
+        # only a group that sets no decay of its own: the block MLP and CG path weights, and the mean,
+        # log-variance and decode-mean tables whose dedicated decay is None (audit 2026-10-10, item 13).
+        decode_mean_wd = (self.decode_mu_weight_decay if self.decode_mu_weight_decay is not None
+                          else self.mu_weight_decay)
+        if (not self.use_block_mlp and not self.use_cg_coupling
+                and self.mu_weight_decay is not None and self.sigma_weight_decay is not None
+                and decode_mean_wd is not None):
+            mark(("weight_decay",),
+                 "every optimizer group sets its own decay (no block MLP or CG coupling, and "
+                 "mu/sigma/decode-mean decays are set)")
+        if "weight_decay" in phi_update_policy.optimizer_group_metadata:
+            mark(("phi_weight_decay",),
+                 f"m_phi_update_mode={self.m_phi_update_mode!r} replaces the frame-table decay "
+                 "with its own optimizer-group value")
         if self.beta_attention_prior not in ("windowed", "causal_windowed"):
             mark(("attention_window",), "only the windowed/causal_windowed priors read the band half-width")
         if self.gauge_transport in ("off", "frozen"):
@@ -2152,13 +2282,14 @@ class VFE3Config:
                 and self.predictive_covariance == "passthrough"
                 and self.block_coordinates == "local" and self.decode_coordinates == "local"
                 and not (self.use_block_mlp and self.block_mlp_covariance != "passthrough")
-                and not (self.use_cg_coupling and self.cg_covariance_mode == "delta_full")):
+                and not (self.use_cg_coupling and self.cg_covariance_mode == "delta_full")
+                and self.block_norm_covariance != "pushforward"):
             # A passthrough gauge gate no longer distinguishes the families: the diagonal gate on
             # (mu, sigma) is the full gate on (mu, diag_embed sigma), and nothing densifies sigma.
             mark(("family",),
                  "value-identical to gaussian_diagonal under the rank-matched decoder on this "
                  "route: stored covariance is a diagonal token lookup and no seam densifies it; "
-                 "full covariance requires block_mlp_covariance='delta_full', "
+                 "full covariance requires block_mlp_covariance='delta_full', block_norm_covariance='pushforward', "
                  "predictive_covariance='moment_matched', or attention_mode='projected_gradient'")
         # Reference coordinates. With identically-I frames xi = mu and C = Sigma exactly, so both
         # selectors are no-ops; without a block norm, final norm or block MLP nothing is conjugated.

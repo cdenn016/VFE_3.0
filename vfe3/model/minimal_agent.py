@@ -79,6 +79,16 @@ fusion runs through the same assembly (:func:`information_step`): head :math:`h`
 result is :math:`(\xi_i^+, P_i)` exactly, in any head order. The mean-field covariance omits the between-source
 spread :math:`G\operatorname{Cov}_w(T\xi)G^\top` that the exact posterior keeps.
 
+Coordinate ascent (``cavi_steps`` :math:`= n`). The step above is one sweep of coordinate-ascent variational
+inference on the structured family :math:`q(X_i)\prod_hq(J^h)`. Sweep :math:`s > 1` recomputes every head's labels
+at the posterior query moments of sweep :math:`s - 1`,
+:math:`\beta^{h,(s)}_{ij} = \operatorname{softmax}_j(\log\pi^h_{ij} - \mathrm{KL}(N(S_h\xi_i^{(s-1)}, S_hC_i^{(s-1)}S_h^\top)\|N(b_j^h, B_j^h)))`
+(rotated as below under comparison-space RoPE), and fuses the heads again with them, starting from the INPUT
+moments :math:`(\xi_i, C_i)`. This is the exact CAVI label update:
+:math:`E_{q(X)}[\log N(S_hX; b_j, B_j)] = -\mathrm{KL}(N(a, A)\|N(b_j, B_j)) + c(a, A)` with a :math:`j`-independent
+:math:`c`, and the label factors of different heads decouple given :math:`q(X)`, so updating them together is a
+block coordinate step. :math:`n = 1` is the step above; the sweeps are unrolled under autograd.
+
 Float32. The query covariance of a later head is a downdate,
 :math:`A^h = S_hCS_h^\top - \sum_{g<h}Y_{hg}M^gY_{hg}^\top`. Its float32 error grows with
 :math:`\|S_hCS_h^\top\|` and with the float32 error of the earlier heads' inverses :math:`W_{ij}^{-1}` (about
@@ -176,7 +186,7 @@ class MinimalAgentResult(NamedTuple):
     xi:               torch.Tensor             # (..., N, K) xi_i^+
     gains:            torch.Tensor             # (..., N, H, K, d) Kmat_i^h = C_i^{(h-1)} S_h^T
     M:                torch.Tensor             # (..., N, H, d, d) M_i^h
-    weights:          torch.Tensor             # (..., H, N, N) labels actually used (w^h or beta^h)
+    weights:          torch.Tensor             # (..., H, N, N) labels actually used (w^h, or beta^h of the last sweep)
     cost:             torch.Tensor             # (..., H, N, N) the per-pair costs those labels read (exact: 0 in a skipped masked tile)
     gain_fraction:    Optional[torch.Tensor]   # (..., N, H) in [0, 1): exact at the ADF moments, mean field at the input
     query_covariance: torch.Tensor             # (..., N, H, d, d) S_h C_i S_h^T at the input moments
@@ -561,6 +571,40 @@ def _covariance_contraction(
     return 1.0 - removed / trace
 
 
+def _posterior_query_moments(
+    xi_plus: torch.Tensor,                      # (..., N, K) posterior reference means
+    V_Q:     torch.Tensor,                      # (..., N, H, d, d) S_h C S_h^T at the input moments
+    S:       torch.Tensor,                      # (H, d, K)
+    gains:   torch.Tensor,                      # (..., N, H, K, d)
+    M:       torch.Tensor,                      # (..., N, H, d, d)
+    rope:    Optional[torch.Tensor] = None,     # (N, d, d) comparison rotation R_i
+) -> Tuple[torch.Tensor, torch.Tensor]:         # a^+ (..., N, H, d), A^+ (..., N, H, d, d)
+    r"""Posterior query moments :math:`(S_h\xi_i^+, S_hC_i^+S_h^\top)` of every head, in the comparison frame.
+
+    .. math::
+        S_hC^+S_h^\top = S_hCS_h^\top - \sum_gY_{hg}M^gY_{hg}^\top,\qquad Y_{hg} = S_h\mathsf K^g,
+
+    then :math:`(R_ia^+, R_iA^+R_i^\top)` under comparison-space RoPE. Computed in the dtype of the inputs; nothing is
+    factored here (the label step of a further sweep and :func:`_label_staleness` read these moments).
+    """
+    Y = torch.einsum("hsk,...ngkt->...nhgst", S, gains)                        # (..., N, H, H, d, d) S_h K^g
+    A_plus = _symmetrize(V_Q - torch.einsum("...nhgst,...ngtu,...nhgvu->...nhsv", Y, M, Y))
+    a_plus = torch.einsum("hsk,...nk->...nhs", S, xi_plus)                     # (..., N, H, d)
+    if rope is not None:
+        a_plus = torch.einsum("nst,...nht->...nhs", rope, a_plus)
+        A_plus = _symmetrize(torch.einsum("nst,...nhtu,nvu->...nhsv", rope, A_plus, rope))
+    return a_plus, A_plus
+
+
+def _unfactorable(
+    a: torch.Tensor,                            # (..., r) query means
+    A: torch.Tensor,                            # (..., r, r) query covariances
+) -> torch.Tensor:                              # (...) bool
+    r"""Entries whose covariance fails a zero-jitter Cholesky factorization or whose moments are not finite."""
+    return ((torch.linalg.cholesky_ex(torch.nan_to_num(A))[1] != 0)
+            | ~torch.isfinite(A).all(dim=(-2, -1)) | ~torch.isfinite(a).all(dim=-1))
+
+
 def _label_staleness(
     xi_plus: torch.Tensor,                      # (..., N, K) posterior reference means
     V_Q:     torch.Tensor,                      # (..., N, H, d, d) S_h C S_h^T at the input moments
@@ -570,30 +614,23 @@ def _label_staleness(
     b:       torch.Tensor,                      # (..., H, N, d)
     B:       torch.Tensor,                      # (..., H, N, d, d)
     lp:      torch.Tensor,                      # (..., H, N, N)
-    weights: torch.Tensor,                      # (..., H, N, N) labels used (input moments)
+    weights: torch.Tensor,                      # (..., H, N, N) labels the last sweep used
     rope:    Optional[torch.Tensor] = None,     # (N, d, d) comparison rotation R_i; b, B already rotated by R_j
 ) -> torch.Tensor:                              # (..., N, H)
-    r"""Total variation :math:`\tfrac12\sum_j|\beta^+_{ij} - \beta_{ij}|` between the mean-field labels at the input
-    moments and the same KL labels recomputed at the posterior query moments
-    :math:`(S_h\xi_i^+, S_hC_i^+S_h^\top)`, with
-    :math:`S_hC^+S_h^\top = S_hCS_h^\top - \sum_gY_{hg}M^gY_{hg}^\top`, :math:`Y_{hg} = S_h\mathsf K^g`: one further
-    coordinate-ascent label step. Near 0 means a second mean-field step would not move the labels. Computed in
+    r"""Total variation :math:`\tfrac12\sum_j|\beta^+_{ij} - \beta_{ij}|` between the mean-field labels the last sweep
+    used and the same KL labels recomputed at its posterior query moments
+    :math:`(S_h\xi_i^+, S_hC_i^+S_h^\top)` (:func:`_posterior_query_moments`): one further coordinate-ascent label
+    step. Near 0 means a further sweep would not move the labels. Computed in
     float64; a receiver whose posterior query covariance does not factor or whose posterior mean is not finite reads
     NaN, and every receiver of a head with an utterance covariance that does not factor reads NaN. These inputs are
     replaced by placeholders before the KL, so a float32 attempt that failed (and that the caller recomputes in
     float64) never raises here.
     """
     f64 = torch.float64
-    Y = torch.einsum("hsk,...ngkt->...nhgst", S.to(f64), gains.to(f64))        # (..., N, H, H, d, d) S_h K^g
-    A_plus = _symmetrize(V_Q.to(f64) - torch.einsum("...nhgst,...ngtu,...nhgvu->...nhsv", Y, M.to(f64), Y))
-    a_plus = torch.einsum("hsk,...nk->...nhs", S.to(f64), xi_plus.to(f64))     # (..., N, H, d)
-    if rope is not None:
-        R64 = rope.to(f64)                                                      # (N, d, d)
-        a_plus = torch.einsum("nst,...nht->...nhs", R64, a_plus)
-        A_plus = _symmetrize(torch.einsum("nst,...nhtu,nvu->...nhsv", R64, A_plus, R64))
+    a_plus, A_plus = _posterior_query_moments(xi_plus.to(f64), V_Q.to(f64), S.to(f64), gains.to(f64), M.to(f64),
+                                              None if rope is None else rope.to(f64))
     eye = torch.eye(A_plus.shape[-1], dtype=f64, device=A_plus.device)
-    bad = ((torch.linalg.cholesky_ex(torch.nan_to_num(A_plus))[1] != 0)
-           | ~torch.isfinite(A_plus).all(dim=(-2, -1)) | ~torch.isfinite(a_plus).all(dim=-1))   # (..., N, H)
+    bad = _unfactorable(a_plus, A_plus)                                         # (..., N, H)
     A_plus = torch.where(bad[..., None, None], eye, A_plus)                     # (..., N, H, d, d)
     a_plus = torch.where(bad[..., None], torch.zeros((), dtype=f64, device=a_plus.device), a_plus)
     B64 = B.to(f64)
@@ -619,6 +656,7 @@ def minimal_agent_readout(
     diagnostics: bool = False,
     check:       bool = True,
     rope:        Optional[torch.Tensor] = None,  # (N, d, d) comparison-space rotation R_i, or None
+    cavi_steps:  int = 1,                       # mean field: coordinate-ascent sweeps (1: labels at the input)
 ) -> MinimalAgentResult:
     r"""Posterior reference moments of every receiver under the minimal agent model.
 
@@ -626,13 +664,18 @@ def minimal_agent_readout(
     :math:`C_j`). ``inference="exact"`` runs ADF over the heads with :func:`exact_record_posterior` at each head's
     current moments, :math:`M^h = \bar\Lambda^h - R^h`; ``"mean_field"`` takes every head's labels from
     :func:`mean_field_record_posterior` at the input moments and fuses them with :func:`information_step`
-    (module docstring).
+    (module docstring). With ``cavi_steps`` :math:`= n > 1` the mean field runs :math:`n` coordinate-ascent sweeps:
+    each later sweep recomputes the labels at the previous sweep's posterior query moments
+    (:func:`_posterior_query_moments`, rotated under ``rope``) and fuses them from the input moments again. Those
+    moments are factored with zero jitter first; a failure is a flag and enters the KL as an identity placeholder.
+    ``weights``, ``cost``, the gain fraction and the label staleness then belong to the last sweep. The exact path
+    does not read ``cavi_steps``.
 
     The gain fraction of the exact path is :math:`\operatorname{tr}(A_i^h\bar\Lambda_i^h)/d` at head :math:`h`'s ADF
     moments: the label-averaged share of the probed variance that the component updates remove, in
     :math:`A^h`-whitened coordinates, :math:`\in [0, 1)`; like ADF it depends on the head order. The mean field's is
-    evaluated at the INPUT moments :math:`A_i^h = S_hC_iS_h^\top`, like its labels, so it does not depend on the
-    head order, as the fused posterior does not:
+    evaluated at the INPUT moments :math:`A_i^h = S_hC_iS_h^\top`, from which every sweep fuses (with the last
+    sweep's :math:`\Lambda^h`), so it does not depend on the head order, as the fused posterior does not:
 
     .. math::
         \tfrac1d\operatorname{tr}(A^hM_0^h) = 1 - \tfrac1d\operatorname{tr}(E^{-1}),\qquad
@@ -655,6 +698,8 @@ def minimal_agent_readout(
     """
     if inference not in MINIMAL_AGENT_INFERENCE:
         raise ValueError(f"minimal_agent_inference must be one of {MINIMAL_AGENT_INFERENCE}, got {inference!r}")
+    if isinstance(cavi_steps, bool) or not isinstance(cavi_steps, int) or cavi_steps < 1:
+        raise ValueError(f"cavi_steps must be an int >= 1, got {cavi_steps!r}")
     if S.shape != T.shape or S.dim() != 3 or log_noise.shape != (S.shape[0],):
         raise ValueError("minimal_agent_readout needs S and T of shape (H, d, K) and log_noise of shape (H,)")
     H, d, K = S.shape
@@ -766,21 +811,22 @@ def minimal_agent_readout(
                     bad_Q_r = torch.linalg.cholesky_ex(V_Q_r)[1] != 0            # (..., H, N)
                 flags.append(bad_Q_r.any())
                 V_Q_r = torch.where(bad_Q_r[..., None, None], eye, V_Q_r)
-            labels = mean_field_record_posterior(a0_r, V_Q_r, b, B_kl, lp, check=False)
-            if Rot is not None:
-                # Label information back to receiver i's record frame: Lambda -> R_i^T Lambda R_i, eta -> R_i^T eta.
-                labels = labels._replace(
-                    Lambda=_symmetrize(torch.einsum("nts,...hntu,nuv->...hnsv", Rot, labels.Lambda, Rot)),
-                    eta=torch.einsum("nts,...hnt->...hns", Rot, labels.eta))
-            weights.append(labels.weights)
-            costs.append(labels.cost)
-            flags.append(labels.failed)
-            if diagnostics:
-                with torch.no_grad():                                           # gain fraction at the input moments
-                    L_lab = torch.linalg.cholesky_ex(labels.Lambda)[0]           # (..., H, N, d, d) Lambda = L L^T
-                    E0 = _symmetrize(eye + L_lab.transpose(-1, -2) @ V_Q.movedim(-3, -4) @ L_lab)
-                    E0_inv = torch.cholesky_inverse(torch.linalg.cholesky_ex(E0)[0])
-                    fractions.append(1.0 - torch.diagonal(E0_inv, dim1=-2, dim2=-1).sum(-1).movedim(-2, -1) / d)
+
+            def label_step(a_r: torch.Tensor, A_r: torch.Tensor) -> MeanFieldPosterior:
+                r"""Labels at the comparison-frame query moments ``(a_r, A_r)`` ``(..., H, N, d)``, ``(..., H, N, d, d)``,
+                their information back in the record frame; the labels, costs and flag are recorded."""
+                step = mean_field_record_posterior(a_r, A_r, b, B_kl, lp, check=False)
+                if Rot is not None:
+                    # Label information back to receiver i's record frame: Lambda -> R_i^T Lambda R_i, eta -> R_i^T eta.
+                    step = step._replace(
+                        Lambda=_symmetrize(torch.einsum("nts,...hntu,nuv->...hnsv", Rot, step.Lambda, Rot)),
+                        eta=torch.einsum("nts,...hnt->...hns", Rot, step.eta))
+                weights.append(step.weights)
+                costs.append(step.cost)
+                flags.append(step.failed)
+                return step
+
+            labels = label_step(a0_r, V_Q_r)                                    # sweep 1: the input moments
 
             def head_update(h: int, a: torch.Tensor, A: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
                 check_query(h, A)
@@ -796,8 +842,25 @@ def minimal_agent_readout(
             return torch.where(skip[..., None], zero, u), torch.where(skip[..., None, None], zero, M_h)
 
         xi_plus, gains, M, _ = sequential_head_assembly(xi, X0, S, head_update)
-        weights_out = torch.stack(weights, dim=-3) if inference == "exact" else weights[0]   # (..., H, N, N)
-        cost_out = torch.stack(costs, dim=-3) if inference == "exact" else costs[0]
+        for _ in range(1, cavi_steps if inference == "mean_field" else 1):
+            # A further CAVI sweep: labels at the current posterior query moments (head_update reads the rebound
+            # labels), then the Gaussian fused again from the input moments.
+            a_post, A_post = _posterior_query_moments(xi_plus, V_Q, S, gains, M, Rot)   # (..., N, H, d), (..., N, H, d, d)
+            with torch.no_grad():
+                bad_post = _unfactorable(a_post, A_post)                        # (..., N, H)
+            flags.append(bad_post.any())
+            A_post = torch.where(bad_post[..., None, None], eye, A_post)
+            a_post = torch.where(bad_post[..., None], torch.zeros((), dtype=dtype, device=xi.device), a_post)
+            labels = label_step(a_post.movedim(-2, -3), A_post.movedim(-3, -4))
+            xi_plus, gains, M, _ = sequential_head_assembly(xi, X0, S, head_update)
+        if diagnostics and inference == "mean_field":
+            with torch.no_grad():                                               # gain fraction at the input moments
+                L_lab = torch.linalg.cholesky_ex(labels.Lambda)[0]               # (..., H, N, d, d) Lambda = L L^T
+                E0 = _symmetrize(eye + L_lab.transpose(-1, -2) @ V_Q.movedim(-3, -4) @ L_lab)
+                E0_inv = torch.cholesky_inverse(torch.linalg.cholesky_ex(E0)[0])
+                fractions.append(1.0 - torch.diagonal(E0_inv, dim1=-2, dim2=-1).sum(-1).movedim(-2, -1) / d)
+        weights_out = torch.stack(weights, dim=-3) if inference == "exact" else weights[-1]   # (..., H, N, N)
+        cost_out = torch.stack(costs, dim=-3) if inference == "exact" else costs[-1]
         gain_fraction = coupling = contraction = staleness = spread = None
         if diagnostics:
             gain_fraction = torch.stack(fractions, dim=-1) if inference == "exact" else fractions[0]   # (..., N, H)

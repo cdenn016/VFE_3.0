@@ -68,6 +68,7 @@ class _GeneratorTensor:
             instance.frobenius_gram_uniform = None
             instance.phi_coordinate_layout = None
         instance._generator_source = value
+        instance.float64_generators = None              # a replaced basis has no float64 master
         instance._elementary_certificate = None
         instance._elementary_layout = (
             (value.n_heads, value.K // value.n_heads)
@@ -100,6 +101,10 @@ class GaugeGroup:
     # The (m, d, d) local algebra basis of a block-local group (copied into every head block);
     # None for every other group.
     block_local_basis:    Optional[torch.Tensor] = field(default=None, repr=False, compare=False)
+    # The float64 basis a builder computed before storing ``generators`` at a lower precision (so_n);
+    # a move to float64 restores it instead of widening the rounded copy (audit 2026-10-10, item 43).
+    # None = no such master; replacing ``generators`` drops it.
+    float64_generators:   Optional[torch.Tensor] = field(default=None, repr=False, compare=False)
 
     # Cached pseudo-inverse of the generator Frobenius Gram (computed once, off __init__/eq/repr).
     _gram_pinv_cache:     Optional[torch.Tensor] = field(default=None, init=False, repr=False, compare=False)
@@ -151,7 +156,10 @@ class GaugeGroup:
                 source.K, source.n_heads, moved.dtype, moved.device)
         else:
             canonical = self.elementary_block_shape is not None
-            self._generator_source = fn(source)
+            moved = fn(source)
+            if self.float64_generators is not None and moved.dtype == torch.float64:
+                moved = self.float64_generators.to(device=moved.device)
+            self._generator_source = moved
             if canonical:
                 self._elementary_certificate = self._generator_cache_key()
 
@@ -633,6 +641,7 @@ def _build_so_n(
     return GaugeGroup(
         name="so_n",
         generators=G.to(dtype).to(device),
+        float64_generators=G.to(device),
         irrep_dims=dims,
         skew_symmetric=True,
         irrep_labels=labels,

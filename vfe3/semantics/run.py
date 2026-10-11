@@ -20,7 +20,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import torch
@@ -264,6 +264,13 @@ class SemanticRun:
 
     def _block_cholesky_log_var(self, ids: Sequence[int]) -> np.ndarray:
         r"""(n, K) $\log\operatorname{diag}C_v$ of the ``block_cholesky`` prior blocks, in row chunks."""
+        parts = [C.diagonal(dim1=-2, dim2=-1).reshape(-1, self.K)          # (c, K) diag C_v
+                 for C in self._block_cholesky_chunks(ids)]
+        variance = torch.cat(parts, dim=0) if parts else torch.zeros(0, self.K, dtype=torch.float64)
+        return torch.log(variance).numpy()
+
+    def _block_cholesky_chunks(self, ids: Sequence[int]) -> Iterator[torch.Tensor]:
+        r"""The ``block_cholesky`` prior blocks of ``ids`` as float64 ``(c, H, d, d)`` row chunks."""
         from vfe3.model.prior_bank import packed_cholesky_covariance
 
         if SIGMA_CHOL_KEY not in self.state:
@@ -273,11 +280,27 @@ class SemanticRun:
         n, H = int(packed.shape[0]), int(packed.shape[1])
         d = self.K // H
         chunk = max(1, _BLOCK_EMBED_BUDGET // (self.K * d))                  # rows per (c, H, d, d) chunk
-        parts = [packed_cholesky_covariance(packed[i:i + chunk], d, eps=self.cfg.eps)
-                 .diagonal(dim1=-2, dim2=-1).reshape(-1, self.K)              # (c, K) diag C_v
-                 for i in range(0, n, chunk)]
-        variance = torch.cat(parts, dim=0) if parts else packed.new_zeros(0, self.K)
-        return torch.log(variance).numpy()
+        for i in range(0, n, chunk):
+            yield packed_cholesky_covariance(packed[i:i + chunk], d, eps=self.cfg.eps)   # (c, H, d, d)
+
+    @property
+    def prior_covariance_blocks(self) -> bool:
+        r"""Whether the prior covariance is the dense per-head ``block_cholesky`` table (not a diagonal)."""
+        return SIGMA_LOG_KEY not in self.state and SIGMA_CHOL_KEY in self.state
+
+    def log_det(self, ids: Sequence[int]) -> np.ndarray:
+        r"""(n,) $\log\det\Sigma_v$ of the prior covariance.
+
+        For a diagonal table (and a full family's exactly diagonal promoted prior) this is the row sum
+        of :meth:`log_var`. Under ``block_cholesky`` it is $\sum_h\log\det C_v^{(h)}$ over the per-head
+        blocks, from their Cholesky factors; the diagonal sum $\sum_k\log C_{v,kk}$ is only an upper
+        bound on it (Hadamard's inequality; audit 2026-10-10 #20).
+        """
+        if not self.prior_covariance_blocks:
+            return self.log_var(ids).sum(axis=1)
+        parts = [2.0 * torch.linalg.cholesky(C).diagonal(dim1=-2, dim2=-1).log().sum(dim=(-2, -1))   # (c,)
+                 for C in self._block_cholesky_chunks(ids)]
+        return (torch.cat(parts) if parts else torch.zeros(0, dtype=torch.float64)).numpy()
 
     def phi(self, ids: Sequence[int]) -> np.ndarray:
         r"""(n, n_gen) raw gauge-frame algebra coordinates ``phi_v`` (trained trivialization)."""

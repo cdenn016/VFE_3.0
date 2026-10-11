@@ -1095,7 +1095,7 @@ def test_registry_metadata_and_factory_forwarding() -> None:
     assert registration.covariance_kinds == frozenset({"passthrough", "posterior"})
     assert registration.gauge_class == "coordinate_nonintertwiner" and not registration.intertwiner_compatible
     assert not registration.requires_frame_context
-    assert registration.factory_options == frozenset({"inference", "template_init_variance"})
+    assert registration.factory_options == frozenset({"inference", "template_init_variance", "cavi_steps"})
     for K, e, L in ((4, 2, 1), (6, 3, 2)):
         assert registration.parameter_count(embed_dim=K, irrep_dims=(2, K - 2), expansion=e, n_layers=L) \
             == L * (2 * e * K * K + e * K)
