@@ -583,39 +583,37 @@ class VFE3Config:
     #   11. Receiver (projected_gradient)
     ##################################################
 
-    # "channel_likelihood" | "ambient_alignment"
-    #   channel_likelihood  expected likelihood of P_h xi_i (relational_receiver_measurement) against the d-dim message T_h xi_j
-    #   ambient_alignment   sum of KLs to K-dim noisy laws
-    relational_receiver_law:          str             = "channel_likelihood"
+    # The receiver law is the channel likelihood: the expected likelihood of the measurement P_h xi_i
+    # against the d-dim message T_h xi_j, with the receiver entropy counted once.
 
-    # "adjoint" | "inverse"
-    # channel_likelihood only: the receiving measurement of xi_i on head h.
-    #   adjoint  O'_h^T xi_i (equals the inverse only for orthogonal O')
-    #   inverse  the head-h rows of O'^-1 (the dual measurement): the frozen-context minimizer is the kernel
-    #            mean as alpha -> 0 with equal channel precisions, invariant under (U h, T h, S h, h^-1 O')
-    relational_receiver_measurement:  str             = "adjoint"
+    # "inverse" | "adjoint"
+    # The receiving measurement P_h xi_i of xi_i on head h.
+    #   inverse  (default, the theoretically consistent choice) the head-h rows of O'^-1, the dual
+    #            measurement: invariant under (U h, T h, S h, h^-1 O'), and the frozen-context minimizer
+    #            is the kernel mean as alpha -> 0 with equal channel precisions
+    #   adjoint  O'_h^T xi_i, equal to the inverse only for orthogonal O'; kept for charts too
+    #            ill-conditioned for the inverse's float64 certificate
+    relational_receiver_measurement:  str             = "inverse"
 
     # "closed_form" | "closed_form_profiled" | "euler"
     #   closed_form           exact frozen-context natural-parameter update, damped by relational_receiver_damping
     #   closed_form_profiled  under lambda_alpha_mode="state_dependent": the limit of iterated closed_form (MM)
     #                         steps, a stationary point of c0 log(b0 + D) + G, in one scalar root solve per
-    #                         receiver (not per_coord); under a constant alpha identical to closed_form
+    #                         receiver (not per_coord)
     #   euler                 explicit Fisher step with e_q_mu_lr / e_q_sigma_lr and the trust regions
     relational_receiver_update:       str             = "closed_form"
     relational_receiver_damping:      float           = 1.0          # closed_form(_profiled) only: rho in (0, 1]; 1 = the minimizer
-    relational_receiver_noise:        float           = 1.0          # channel floor (channel_likelihood) | K-dim noise (ambient_alignment)
+    relational_receiver_noise:        float           = 1.0          # channel floor nu I_d, nu > 0
 
     ##################################################
     #   12. Free-energy weights
     ##################################################
 
-    # "constant" | "state_dependent" | "state_dependent_per_coord"
+    # "state_dependent" | "state_dependent_per_coord"
     # Self-coupling alpha_i on KL(q_i || p_i).
-    #   constant                   alpha = lambda_alpha
-    #   state_dependent            alpha_i = c0 / (b0 + D(q_i || p_i))
+    #   state_dependent            alpha_i = c0 / (b0 + D(q_i || p_i)), frame-invariant
     #   state_dependent_per_coord  the same per coordinate (b0, c0 may be K-lists)
     lambda_alpha_mode:                str                   = "state_dependent_per_coord"
-    lambda_alpha:                     float                 = 1.0          # constant only
     b0:                               'float | List[float]' = 1.0
     c0:                               'float | List[float]' = 1.0
 
@@ -949,8 +947,6 @@ class VFE3Config:
                 or not math.isfinite(float(self.relational_receiver_noise))
                 or self.relational_receiver_noise <= 0.0):
             raise ValueError("relational_receiver_noise must be a finite positive reference variance")
-        _require(self.relational_receiver_law, ("channel_likelihood", "ambient_alignment"),
-                 "relational_receiver_law")
         _require(self.relational_receiver_measurement, ("adjoint", "inverse"), "relational_receiver_measurement")
         _require(self.relational_receiver_update, ("closed_form", "closed_form_profiled", "euler"),
                  "relational_receiver_update")
@@ -962,18 +958,6 @@ class VFE3Config:
         if full_link and self.n_e_steps < 1:
             raise ValueError("attention_mode='projected_gradient' requires n_e_steps >= 1; "
                              "n_e_steps=0 would remove attention from every layer")
-        # A state-dependent alpha* = c0/(b0 + D) is positive (c0 > 0), so only constant alpha can
-        # leave the receiver without mass or the channel law without its entropy term.
-        constant_alpha = self.lambda_alpha_mode == "constant"
-        if (full_link and constant_alpha and self.relational_receiver_law == "ambient_alignment"
-                and isinstance(self.lambda_alpha, Real) and self.lambda_alpha <= 0
-                and isinstance(self.lambda_beta, Real) and self.lambda_beta <= 0):
-            raise ValueError("projected_gradient needs lambda_alpha > 0 or lambda_beta > 0: "
-                             "otherwise the receiver energy has no mass")
-        if (full_link and constant_alpha and self.relational_receiver_law == "channel_likelihood"
-                and not (isinstance(self.lambda_alpha, Real) and self.lambda_alpha > 0)):
-            raise ValueError("relational_receiver_law='channel_likelihood' requires lambda_alpha > 0: "
-                             "the prior divergence carries the receiver's only entropy term")
         # The projected support envelope. The divergence (KL), connection (flat), gradient roles
         # (filtering), estimator (unroll) and mean preconditioner (Fisher) are fixed, not fields.
         incompatible = []
@@ -981,10 +965,6 @@ class VFE3Config:
             incompatible.append(f"n_e_steps={self.n_e_steps!r} (requires 1)")
         # The receiver profiles the closed-form alpha forms (projected_gradient.tex, profiled
         # self-coupling); per coordinate, KL(q||p) separates only on the diagonal family.
-        if full_link and self.lambda_alpha_mode not in (
-                "constant", "state_dependent", "state_dependent_per_coord"):
-            incompatible.append(f"lambda_alpha_mode={self.lambda_alpha_mode!r} (requires 'constant', "
-                                "'state_dependent' or 'state_dependent_per_coord')")
         if (full_link and self.lambda_alpha_mode == "state_dependent_per_coord"
                 and self.family != "gaussian_diagonal"):
             incompatible.append(f"lambda_alpha_mode='state_dependent_per_coord' with family={self.family!r} "
@@ -993,7 +973,7 @@ class VFE3Config:
         if (full_link and self.relational_receiver_update == "closed_form_profiled"
                 and self.lambda_alpha_mode == "state_dependent_per_coord"):
             incompatible.append("relational_receiver_update='closed_form_profiled' with lambda_alpha_mode="
-                                "'state_dependent_per_coord' (requires 'state_dependent' or 'constant')")
+                                "'state_dependent_per_coord' (requires 'state_dependent')")
         if self.encode_mode not in ("per_token", "per_token_additive"):
             incompatible.append(
                 f"encode_mode={self.encode_mode!r} (requires 'per_token' or 'per_token_additive')")
@@ -1438,11 +1418,6 @@ class VFE3Config:
         # lambda_alpha_mode validated against the alpha-form REGISTRY (add-by-registering).
         from vfe3.alpha_i import _ALPHAS
         _require(self.lambda_alpha_mode, tuple(sorted(_ALPHAS)), "lambda_alpha_mode")
-        if not (math.isfinite(self.lambda_alpha) and self.lambda_alpha >= 0.0):
-            raise ValueError(
-                f"lambda_alpha must be finite and nonnegative under lambda_alpha_mode='constant', "
-                f"got {self.lambda_alpha}"
-            )
         # Full Gaussians expose an ordered conditional KL decomposition, not a sum of marginal KLs.
         from vfe3.alpha_i import alpha_is_per_coord
         if (alpha_is_per_coord(self.lambda_alpha_mode) and not family_is_diagonal
@@ -2283,7 +2258,7 @@ class VFE3Config:
         if self.content_link_loop_weight == 0.0:
             mark(("content_link_loop_window",), "only read when content_link_loop_weight > 0")
         if self.attention_mode != "projected_gradient":
-            mark(("relational_receiver_noise", "relational_receiver_law", "relational_receiver_update",
+            mark(("relational_receiver_noise", "relational_receiver_update",
                   "relational_receiver_damping", "relational_receiver_measurement"),
                  "only read by projected_gradient receiving laws")
         elif self.relational_receiver_update in ("closed_form", "closed_form_profiled"):
@@ -2293,8 +2268,6 @@ class VFE3Config:
         else:
             mark(("relational_receiver_damping",),
                  "only read by relational_receiver_update='closed_form' or 'closed_form_profiled'")
-        if self.attention_mode == "projected_gradient" and self.relational_receiver_law != "channel_likelihood":
-            mark(("relational_receiver_measurement",), "only read by relational_receiver_law='channel_likelihood'")
         gradient_controls = ("e_q_mu_lr", "e_q_sigma_lr", "e_mu_q_trust", "e_sigma_q_trust")
         if self.attention_mode == "projected_predictive":
             mark(("skip_belief_sigma_update",),
@@ -2305,7 +2278,7 @@ class VFE3Config:
                  "predictive_covariance='moment_matched', the covariance) by readout, not a gradient step")
             # diagnose_canonical_free_energy reads the self-coupling form (audit 2026-10-10 round 2, item 31).
             if self.mstep_self_coupling_weight == 0.0 and not self.diagnose_canonical_free_energy:
-                mark(("lambda_alpha_mode", "lambda_alpha", "b0", "c0"),
+                mark(("lambda_alpha_mode", "b0", "c0"),
                      "predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer; with "
                      "diagnose_canonical_free_energy=True they would feed that log-step diagnostic only")
         mlp_delta_full = self.use_block_mlp and self.block_mlp_covariance == "delta_full"
@@ -2355,10 +2328,6 @@ class VFE3Config:
             mark(("m_layernorm_lr",), "requires layernorm_affine and a layernorm seam")
         if not self.decode_unigram_prior:
             mark(("unigram_kappa",), "needs decode_unigram_prior=True")
-        if self.lambda_alpha_mode == "constant":
-            mark(("b0", "c0"), "only read by a state_dependent lambda_alpha_mode")
-        else:
-            mark(("lambda_alpha",), "only read by lambda_alpha_mode='constant'")
         if self.rope_mode == "none":
             mark(("rope_base", "rope_fraction"), "only read by a rope_mode other than 'none'")
         if self.attention_mode == "projected_predictive" and self.predictive_readout != "kernel":
@@ -2479,7 +2448,7 @@ class VFE3Config:
                 and not self.diagnose_canonical_free_energy
                 and not (self.attention_mode == "projected_gradient"
                          and self.relational_receiver_update in ("closed_form", "closed_form_profiled"))):
-            mark(("lambda_alpha_mode", "lambda_alpha", "b0", "c0"),
+            mark(("lambda_alpha_mode", "b0", "c0"),
                  "the single gradient E-step iteration starts at q = p, where the self-coupling "
                  "force vanishes")
         # gaussian_block on this route is the same diagonal lookup in the dense layout (audit 2026-10-09
@@ -2716,7 +2685,9 @@ RETIRED_CONFIG_KEYS = frozenset(
        "relational_readout_mode", "relational_input_scope", "relational_output_scope",
        "relational_identity_content"}
     | set(_PROJECTED_FACTORIZATION_FIELDS) | set(_ROPE_FIELDS) | set(_HARDCODED_FIELDS)
-    | set(_FRAME_PAIR_FIELDS))
+    | set(_FRAME_PAIR_FIELDS)
+    # removed 2026-10-12 (second pass): the ambient_alignment receiver law and the constant alpha form
+    | {"relational_receiver_law", "lambda_alpha"})
 # laplace_diagonal (retired 2026-10-12) was registered but refused on both projected routes.
 _RETIRED_FAMILIES = frozenset({"gaussian_frame_diagonal", "laplace_diagonal"})
 _MIGRATED_FAMILIES = {"gaussian_diagonal_exact": "gaussian_diagonal"}
@@ -2744,7 +2715,7 @@ def _migrate_retired_fields(
     pinned, or when the field was inert for this config; any other value changed a forward this
     build no longer computes and is refused as retired. Value renames (dense decode modes,
     ``gaussian_diagonal_exact``, ``m_decode_lr``) are rewritten to their surviving equivalents.
-    Must run after the attention selector and receiver-law defaults are resolved.
+    Must run after the attention selector and receiver-update defaults are resolved.
     """
     def refuse(name: str, value: object, detail: str = "") -> None:
         raise ValueError(f"serialized config from {source} requests retired {name}={value!r}"
@@ -3010,13 +2981,47 @@ def _migrate_projected_factorization(
 #   rope_space                        "frame" from eaa3a21 (2026-10-07); merged into rope_mode on 2026-10-12,
 #                                     whose migration treats an absent rope_space as "frame"
 #   kl_max                            100.0 until 2026-10-12, now None (8 * embed_dim)
+#   relational_receiver_measurement   "adjoint" from 2026-10-10 until 2026-10-12, now "inverse"
 _HISTORICAL_DEFAULT_PINS: dict[str, Any] = {
     "content_link_chart":               "affine",
     "predictive_covariance":            "passthrough",
     "m_decode_mu_lr":                   None,
     "m_decode_sigma_lr":                None,
     "kl_max":                           100.0,
+    "relational_receiver_measurement":  "adjoint",
 }
+
+
+def _migrate_receiver_law_and_alpha(
+    payload: dict[str, Any],
+
+    *,
+    source: str,
+) -> None:
+    r"""Drop ``relational_receiver_law`` and ``lambda_alpha`` (removed 2026-10-12, second pass).
+
+    The receiver law is now always the channel likelihood. The law and ``relational_receiver_update`` were
+    introduced together (2017ea3, 2026-10-02), so a payload with neither predates both and ran
+    ``ambient_alignment``, while one with only the update was saved after this removal and ran the channel
+    likelihood. Must run before the update default is filled in. A resolved ``ambient_alignment`` on
+    ``projected_gradient`` is refused (the receiver forward changed); elsewhere the law was inert.
+    ``lambda_alpha_mode="constant"`` is refused (the self-coupling forward changed); ``lambda_alpha`` was
+    read only by that form, so it is dropped silently otherwise.
+    """
+    predates_law = "relational_receiver_update" not in payload
+    law = payload.pop("relational_receiver_law", "ambient_alignment" if predates_law else "channel_likelihood")
+    if law not in ("channel_likelihood", "ambient_alignment"):
+        raise ValueError(f"serialized config from {source} has invalid relational_receiver_law={law!r}")
+    if law == "ambient_alignment" and payload.get("attention_mode") == "projected_gradient":
+        raise ValueError(
+            f"serialized config from {source} requests retired relational_receiver_law='ambient_alignment' "
+            "on projected_gradient (only the channel likelihood survives); continuation requires explicit "
+            "migration")
+    if payload.get("lambda_alpha_mode") == "constant":
+        raise ValueError(
+            f"serialized config from {source} requests retired lambda_alpha_mode='constant' (only the "
+            "state-dependent forms survive); continuation requires explicit migration")
+    payload.pop("lambda_alpha", None)
 
 
 def config_from_serialized(
@@ -3089,7 +3094,7 @@ def config_from_serialized(
         raise ValueError(f"serialized config from {source} names no attention selector; it predates "
                          "the projected routes and requires explicit migration")
     # Configs saved before the receiver-law fields keep the PR #30 receiver they ran.
-    payload.setdefault("relational_receiver_law", "ambient_alignment")
+    _migrate_receiver_law_and_alpha(payload, source=source)
     payload.setdefault("relational_receiver_update", "euler")
     # Fields whose default changed after they were introduced: a config saved before the field existed
     # ran the introduction-time value, not today's default (audit 2026-10-08 P2-3).

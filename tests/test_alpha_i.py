@@ -20,13 +20,6 @@ def _restore_registry_entry(
         registry[name] = previous
 
 
-def test_constant_alpha_is_value_zero_reg():
-    kl = torch.rand(3, 5)
-    a, r = self_coupling_alpha(kl, mode="constant", value=1.0)
-    assert torch.allclose(a, torch.ones(3, 5))
-    assert torch.allclose(r, torch.zeros(3, 5))
-
-
 def test_state_dependent_alpha_formula_and_minimizes_objective():
     # alpha* = c0/(b0 + KL) is the stationary point of  alpha*KL + b0*alpha - c0*log(alpha).
     kl = torch.tensor([0.0, 1.0, 4.0])
@@ -76,7 +69,8 @@ def test_alpha_is_per_coord_declares_reduction_need():
     from vfe3.alpha_i import alpha_is_per_coord
     assert alpha_is_per_coord("state_dependent_per_coord") is True
     assert alpha_is_per_coord("state_dependent") is False
-    assert alpha_is_per_coord("constant") is False
+    with pytest.raises(KeyError, match="constant"):                    # removed 2026-10-12
+        alpha_is_per_coord("constant")
 
 
 @pytest.mark.registry_mutation
@@ -97,12 +91,6 @@ def test_register_alpha_per_coord_flag_is_modular():
 
 
 from vfe3.alpha_i import alpha_gradient_coefficient
-
-
-def test_alpha_grad_coefficient_constant_is_value():
-    kl = torch.rand(3, 5)
-    assert torch.allclose(alpha_gradient_coefficient(kl, mode="constant", value=2.0),
-                          torch.full((3, 5), 2.0))
 
 
 def test_alpha_grad_coefficient_state_dependent_is_alpha_star():

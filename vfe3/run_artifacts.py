@@ -203,16 +203,14 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "score_covariance_contract": ("exact_full_reduced_covariance_from_local_gaussian_plus_channel_noise"
                                       if minimal_agent else "exact_full_reduced_covariance_from_local_gaussian"),
         "receiver_noise": cfg.relational_receiver_noise if full_link else None,
-        "receiver_law": cfg.relational_receiver_law if full_link else None,
+        "receiver_measurement": cfg.relational_receiver_measurement if full_link else None,
         "receiver_update": cfg.relational_receiver_update if full_link else None,
         "receiver_damping": (cfg.relational_receiver_damping
                              if full_link and cfg.relational_receiver_update != "euler" else None),
         "covariance_update": (("passthrough" if cfg.skip_belief_sigma_update else
                                "fisher_step" if cfg.relational_receiver_update == "euler" else "closed_form")
                               if full_link else getattr(cfg, "predictive_covariance", "passthrough")),
-        "content_covariance_contract": (("value_space_channel_likelihood_plus_channel_noise"
-                                         if cfg.relational_receiver_law == "channel_likelihood" else
-                                         "full_link_pushforward_plus_positive_reference_noise") if full_link else
+        "content_covariance_contract": ("value_space_channel_likelihood_plus_channel_noise" if full_link else
                                         (("minimal_agent_mean_field_label_spread_corrected_plus_prior_floor"
                                           if getattr(cfg, "predictive_covariance", "passthrough") == "spread_corrected"
                                           else "minimal_agent_posterior_moment_match_plus_covariant_floor")
@@ -5162,7 +5160,6 @@ def _pure_path_report(
     pure_flags = {
         "canonical_attention_entropy": not conditional_fields,
         "flat_transport":              True,
-        "constant_lambda_alpha":       cfg.lambda_alpha_mode == "constant",
         "prior_bank_decode":           cfg.decode_mode != "linear",
         # The prior-bank logit is the exact -KL(q*||p_v)/tau only when it reads the belief's own covariance.
         "decode_reads_belief_covariance": getattr(cfg, "decode_covariance", "belief") == "belief",

@@ -81,7 +81,7 @@ def _projected_extract_model(**overrides: object) -> VFEModel:
         family="gaussian_diagonal",
         decode_mode="diagonal_chunked",
         encode_mode="per_token",
-        lambda_alpha_mode="constant",
+        lambda_alpha_mode="state_dependent",
         pos_phi="learned",
         max_steps=1,
     )

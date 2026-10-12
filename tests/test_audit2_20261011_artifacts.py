@@ -75,7 +75,7 @@ def test_self_coupling_frame_flag_tracks_family_and_consumer(
 
 
 @pytest.mark.parametrize(("mode", "frame_dependent"), [
-    ("state_dependent_per_coord", True), ("state_dependent", False), ("constant", False)])
+    ("state_dependent_per_coord", True), ("state_dependent", False)])
 def test_witness_self_term_uses_an_independent_prior(mode: str, frame_dependent: bool) -> None:
     model = _witness_model(family="gaussian_full", decode_mode="full_chunked", lambda_alpha_mode=mode,
                            mstep_self_coupling_weight=0.5)

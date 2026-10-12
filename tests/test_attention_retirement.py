@@ -17,7 +17,7 @@ def _values(**overrides: Any) -> dict[str, Any]:
     values = config_values(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=3,
                            eval_stride=3, n_layers=2, n_e_steps=1,
                            attention_mode="projected_predictive", attention_residual=False,
-                           predictive_covariance="passthrough", lambda_alpha_mode="constant",
+                           predictive_covariance="passthrough", lambda_alpha_mode="state_dependent",
                            norm_type_block="none", norm_type_final="none", use_block_mlp=False,
                            block_mlp_expansion=2, amp_dtype=None)
     for name in ("relational_input_scope", "relational_output_scope", "relational_identity_content"):

@@ -136,7 +136,7 @@ READOUT_CONFIGS = [
     dict(attention_mode="projected_predictive", decode_mode="diagonal_chunked", untie_decode_bank=True),
     dict(norm_type_final="layernorm"),
     dict(family="gaussian_full", decode_mode="full_chunked"),
-    dict(encode_mode="per_token_additive", pos_phi="none", decode_mode="diagonal_chunked", lambda_alpha_mode="constant"),
+    dict(encode_mode="per_token_additive", pos_phi="none", decode_mode="diagonal_chunked", lambda_alpha_mode="state_dependent"),
 ]
 
 

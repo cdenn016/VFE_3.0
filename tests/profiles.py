@@ -82,7 +82,6 @@ _CONFIG_VALUES: dict[str, Any] = {
     'content_link_loop_weight': 0.0,
     'content_link_loop_window': 1,
     'relational_receiver_noise': 1.0,
-    'relational_receiver_law': 'ambient_alignment',
     'relational_receiver_measurement': 'adjoint',
     'relational_receiver_update': 'euler',
     'relational_receiver_damping': 1.0,
@@ -96,11 +95,10 @@ _CONFIG_VALUES: dict[str, Any] = {
     'predictive_covariance': 'passthrough',
     'predictive_covariance_floor': 0.0001,
     'predictive_covariance_checkpoint': False,
-    'lambda_alpha_mode': 'constant',
+    'lambda_alpha_mode': 'state_dependent',
     'b0': 1.0,
     'c0': 1.0,
     'lambda_beta': 1.0,
-    'lambda_alpha': 1.0,
     'mass_phi': 0.0,
     'mstep_self_coupling_weight': 0.0,
     'kappa_beta': 1.0,
@@ -225,7 +223,7 @@ def tiny_config(**overrides: Any) -> VFE3Config:
 # The live route of the train_vfe3.py launcher at tiny scale: projected_predictive with the kernel readout and a
 # moment-matched covariance, gaussian_diagonal, block_glk, a layernorm block norm, the coordinate block MLP, the
 # causal ALiBi prior, the row_min routing clamp, a linear decode and AdamW. The legacy baseline above
-# (projected_gradient, Euler, ambient alignment) stays the default profile; this one is opt-in.
+# (projected_gradient, Euler, state-dependent alpha) stays the default profile; this one is opt-in.
 _LIVE_OVERRIDES: dict[str, Any] = {
     'vocab_size': 7,
     'embed_dim': 4,
@@ -241,7 +239,6 @@ _LIVE_OVERRIDES: dict[str, Any] = {
     'predictive_covariance': 'moment_matched',
     'attention_residual': True,
     'relational_routing': 'gaussian_kl',
-    'relational_receiver_law': 'channel_likelihood',
     'relational_receiver_update': 'closed_form',
     'content_link_chart': 'exponential',
     'family': 'gaussian_diagonal',
@@ -300,9 +297,9 @@ live_config.__test__ = False
 
 
 def make_relational_operators(*args: Any, **overrides: Any) -> Any:
-    """RelationalOperators whose eight required config-mirroring keywords come from the test baseline.
+    """RelationalOperators whose seven required config-mirroring keywords come from the test baseline.
 
-    ``attention_residual``, ``predictive_covariance``, ``receiver_law``, ``receiver_update``,
+    ``attention_residual``, ``predictive_covariance``, ``receiver_update``,
     ``content_link_chart``, ``minimal_agent_inference``, ``kl_max_reference`` and
     ``rope_comparison_covariance`` have no constructor default; explicit keyword arguments override the
     baseline values (the comparison covariance is ``"full"``, the operator spelling of every rope_mode but
@@ -312,7 +309,6 @@ def make_relational_operators(*args: Any, **overrides: Any) -> Any:
     values = _CONFIG_VALUES
     baseline = dict(attention_residual=values['attention_residual'],
                     predictive_covariance=values['predictive_covariance'],
-                    receiver_law=values['relational_receiver_law'],
                     receiver_update=values['relational_receiver_update'],
                     content_link_chart=values['content_link_chart'],
                     minimal_agent_inference=values['minimal_agent_inference'],

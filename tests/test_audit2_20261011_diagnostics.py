@@ -471,15 +471,12 @@ def test_inactive_fields_keep_the_diagnostic_inputs_live() -> None:
 
     for n_layers in (1, 2):
         for mode, live in (("state_dependent", {"lambda_alpha_mode", "b0", "c0", "lambda_beta"}),
-                           ("constant", {"lambda_alpha_mode", "lambda_alpha", "lambda_beta"})):
+                           ("state_dependent_per_coord", {"lambda_alpha_mode", "b0", "c0", "lambda_beta"})):
             off = inactive(lambda_alpha_mode=mode, n_layers=n_layers)
             on = inactive(lambda_alpha_mode=mode, n_layers=n_layers, diagnose_canonical_free_energy=True)
             assert live <= set(off), (mode, n_layers)
             assert not live & set(on), (mode, n_layers, live & set(on))
             assert "would feed that log-step diagnostic only" in off["lambda_beta"]
-        # the mode rules still hold: the diagnostic reads only the coefficients of its alpha form
-        assert "lambda_alpha" in inactive(lambda_alpha_mode="state_dependent", diagnose_canonical_free_energy=True)
-        assert {"b0", "c0"} <= set(inactive(lambda_alpha_mode="constant", diagnose_canonical_free_energy=True))
     assert {"prior_handoff_rho", "prior_handoff_sigma"} <= set(inactive(n_layers=2))
     assert not {"prior_handoff_rho", "prior_handoff_sigma"} & set(
         inactive(n_layers=2, diagnose_canonical_free_energy=True))

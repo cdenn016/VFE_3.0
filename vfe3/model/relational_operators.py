@@ -329,7 +329,7 @@ class RelationalOperators(nn.Module):
     receiving maps built from the stored (O, T) (:func:`chart_receive_map`); the stored O starts at
     :math:`sI`, :math:`(s-1)I` or :math:`(\log s)I` per chart so every chart starts at :math:`sB_{ij}`.
     Every consumer reads the content maps through :meth:`content_factors`.
-    ``receiver_measurement`` (full_link_update under ``receiver_law='channel_likelihood'``) selects the
+    ``receiver_measurement`` (full_link_update) selects the
     receiving measurement :math:`P_h` of :math:`\xi_i`: the adjoint :math:`O_h'^\top` or the head-h rows of
     :math:`O'^{-1}` (:func:`vfe3.gradients.full_link.build_full_link_context`); it is an attribute, not a parameter.
     ``routing`` selects the projected routing cost: Gaussian KL, or the noisy-query cost
@@ -372,7 +372,7 @@ class RelationalOperators(nn.Module):
     ``tie_comparison_maps`` (kernel predictive readout) stores no ``raw_score_k``: the key map is the query map,
     :math:`S_K := S_Q`. ``learn_attention_temperature`` adds ``routing_log_temperature`` ``(H,)``, the offset of
     the log routing temperature (:meth:`routing_temperature`); with it off no such parameter exists.
-    ``attention_residual``, ``predictive_covariance``, ``receiver_law``, ``receiver_update``,
+    ``attention_residual``, ``predictive_covariance``, ``receiver_update``,
     ``content_link_chart``, ``minimal_agent_inference``, ``kl_max_reference`` and
     ``rope_comparison_covariance`` are keyword-only without defaults, so no constructor default can drift
     from :class:`vfe3.config.VFE3Config` (audit 2026-10-09).
@@ -390,7 +390,6 @@ class RelationalOperators(nn.Module):
         predictive_covariance: str,
         predictive_covariance_floor: float = 1e-4,
         receiver_noise:        float = 1.0,
-        receiver_law:          str,
         receiver_update:       str,
         receiver_damping:      float = 1.0,
         receiver_measurement:  str   = "adjoint",
@@ -449,8 +448,6 @@ class RelationalOperators(nn.Module):
                 or not math.isfinite(receiver_noise) or receiver_noise <= 0.0):
             raise ValueError("receiver_noise must be a finite positive reference variance")
         self.receiver_noise = float(receiver_noise)
-        if receiver_law not in ("ambient_alignment", "channel_likelihood"):
-            raise ValueError("receiver_law must be 'ambient_alignment' or 'channel_likelihood'")
         if receiver_update not in ("euler", "closed_form", "closed_form_profiled"):
             raise ValueError("receiver_update must be 'euler', 'closed_form' or 'closed_form_profiled'")
         if (isinstance(receiver_damping, bool) or not isinstance(receiver_damping, Real)
@@ -458,9 +455,8 @@ class RelationalOperators(nn.Module):
             raise ValueError("receiver_damping must lie in (0, 1]")
         if receiver_measurement not in ("adjoint", "inverse"):
             raise ValueError("receiver_measurement must be 'adjoint' or 'inverse'")
-        # Full-link receiver law and update (projected_gradient.tex); inert under predictive_content.
-        self.receiver_law = receiver_law
-        # channel_likelihood only: P_h = O'_h^T ("adjoint") or the head-h rows of O'^{-1} ("inverse").
+        # Full-link receiver measurement and update (projected_gradient.tex); inert under predictive_content.
+        # P_h = O'_h^T ("adjoint") or the head-h rows of O'^{-1} ("inverse").
         self.receiver_measurement = receiver_measurement
         self.receiver_update = receiver_update
         self.receiver_damping = float(receiver_damping)

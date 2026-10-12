@@ -51,7 +51,7 @@ def test_block_mlp_on_off_arms_differ_only_by_enable_toggle():
     The registered ``block_mlp`` on/off sweep was retired from ``ablation.SWEEPS`` on purpose; the
     comparison it ran stays reachable as a single override and stays out of the default schedule.
     """
-    neutral = {"lambda_alpha_mode": "constant", "pos_phi": "none"}
+    neutral = {"lambda_alpha_mode": "state_dependent", "pos_phi": "none"}
     arms = {
         enabled: ablation._cell_cfg_dict({**neutral, "use_block_mlp": enabled}, seed=0)
         for enabled in (False, True)
@@ -82,7 +82,7 @@ def test_block_mlp_hyperparameter_sweeps_are_complete_and_constructible():
         assert all(overrides["use_block_mlp"] is True for _, overrides in runs)
         for _, overrides in runs:
             test_config(**ablation._cell_cfg_dict({
-                "lambda_alpha_mode": "constant",
+                "lambda_alpha_mode": "state_dependent",
                 "pos_phi": "none",
                 **overrides,
             }, seed=0))

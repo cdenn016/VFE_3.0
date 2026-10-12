@@ -3,14 +3,12 @@ r"""Frozen, fully connected Gaussian receiver forces.
 .. math::
     L_{ij}^{(h)}=U_iO_hT_hU_j^{-1}.
 
-Two receiver laws share one quadratic energy family (projected_gradient.tex, Eq. quadratic_family).
-``ambient_alignment`` aligns the receiver to K-dimensional noisy receiving laws and counts the
-receiver entropy c = alpha + sum_h lambda_h times. ``channel_likelihood`` scores the receiver's
-partial law P_h xi_i against the sender's d-dimensional message as an expected likelihood and
-counts it once (c = alpha); the measurement P_h is the adjoint O'_h^T or, under
-``receiver_measurement='inverse'``, the head-h rows of O'^{-1}.
+The receiver law is the channel likelihood (projected_gradient.tex, Eq. quadratic_family): it scores
+the receiver's partial law P_h xi_i against the sender's d-dimensional message as an expected likelihood
+and counts the receiver entropy once (c = alpha). The measurement P_h is the head-h rows of O'^{-1}
+under ``receiver_measurement='inverse'``, or the adjoint O'_h^T.
 
-A state-dependent self-coupling alpha*(D) = c0/(b0 + D), D = KL(q_i||p_i) (summed per token, or per
+The state-dependent self-coupling alpha*(D) = c0/(b0 + D), D = KL(q_i||p_i) (summed per token, or per
 local coordinate on the diagonal family), is profiled out (projected_gradient.tex, Sec. profiled
 self-coupling): the receiver energy becomes c0 log(b0 + D) + G(q), its exact force is alpha*(q) dD/dq
 + dG/dq, and freezing alpha at the current state gives a majorizer whose exact minimizer is the
@@ -74,10 +72,10 @@ class FullLinkContext:
 
     Lambda: torch.Tensor       # (..., N, K, K), local pooled precision
     eta:    torch.Tensor       # (..., N, K), local precision-weighted target mean
-    c:      torch.Tensor       # (..., N), entropy multiplicity: alpha + sum_h lambda_h (ambient) or alpha (channel)
+    c:      torch.Tensor       # (..., N) or (..., N, K), entropy multiplicity alpha
     beta:   torch.Tensor       # (..., H, N, N), fixed-value projected Q/K routing
     score:  torch.Tensor       # (..., H, N, N), routing cost, distinct from receiving energy
-    profile: Optional["SelfCouplingProfile"] = None   # state-dependent alpha; None = constant alpha
+    profile: Optional["SelfCouplingProfile"] = None   # profiled alpha; None = fixed coefficients
 
 
 @dataclass(frozen=True)
@@ -87,9 +85,9 @@ class SelfCouplingProfile:
     .. math::
         E_i(q)=c_0\log(b_0+D_i(q))+G_i(q),\qquad D_i=\mathrm{KL}(q_i\|p_i),
 
-    with G the receiver energy at alpha = 0 (coefficients Lambda_c, eta_c and entropy multiplicity
-    m = sum_h lambda_h under ambient_alignment, 0 under channel_likelihood). ``per_coord`` replaces
-    c0 log(b0+D) by sum_k c0_k log(b0_k + D_ik) over local coordinates of the diagonal family.
+    with G the receiver energy at alpha = 0 (coefficients Lambda_c, eta_c; the channel likelihood
+    carries no entropy term of its own). ``per_coord`` replaces c0 log(b0+D) by
+    sum_k c0_k log(b0_k + D_ik) over local coordinates of the diagonal family.
     """
 
     mode:            str                      # 'state_dependent' | 'state_dependent_per_coord'
@@ -102,15 +100,13 @@ class SelfCouplingProfile:
     prior_logdet:    torch.Tensor             # (..., N), log det Sigma_p
     Lambda:          torch.Tensor             # (..., N, K, K), coupling-only precision
     eta:             torch.Tensor             # (..., N, K), coupling-only natural mean
-    mass:            torch.Tensor             # (..., N), coupling-only entropy multiplicity
 
     @property
     def per_coord(self) -> bool:
         return self.mode == "state_dependent_per_coord"
 
 
-_PROFILED_MODES = ("state_dependent", "state_dependent_per_coord")
-FULL_LINK_ALPHA_MODES = ("constant",) + _PROFILED_MODES
+FULL_LINK_ALPHA_MODES = ("state_dependent", "state_dependent_per_coord")
 
 
 def self_coupling_divergence(
@@ -159,13 +155,12 @@ def full_link_context_at(
     .. math::
         \alpha_i=\frac{c_0}{b_0+D_i(q)},\quad
         \Lambda_i=\Lambda_{c,i}+\alpha_i\Sigma_{p,i}^{-1},\quad
-        \eta_i=\eta_{c,i}+\alpha_i\Sigma_{p,i}^{-1}\mu_{p,i},\quad c_i=\alpha_i+m_i.
+        \eta_i=\eta_{c,i}+\alpha_i\Sigma_{p,i}^{-1}\mu_{p,i},\quad c_i=\alpha_i.
 
-    Per coordinate, alpha_i Sigma_p^{-1} becomes diag(alpha_ik / p_ik) and c_i the vector
-    alpha_ik + m_i. The returned context's force alpha* dD/dq + dG/dq is the exact gradient of the
+    Per coordinate, alpha_i Sigma_p^{-1} becomes diag(alpha_ik / p_ik) and c_i the vector alpha_ik. The returned context's force alpha* dD/dq + dG/dq is the exact gradient of the
     profiled energy (envelope theorem), and its minimizer is the MM step. alpha keeps its graph: the
     force value is unchanged, and the unrolled outer derivative of the force map needs d alpha*/d theta.
-    A constant-alpha context is returned unchanged.
+    A context without a profile (fixed coefficients) is returned unchanged.
     """
     profile = context.profile
     if profile is None:
@@ -187,12 +182,10 @@ def _context_at_alpha(
         sigma_p = profile.sigma_p.to(alpha.dtype)
         Lambda = profile.Lambda + torch.diag_embed(alpha / sigma_p)
         eta = profile.eta + alpha * profile.mu_p.to(alpha.dtype) / sigma_p
-        c = alpha + profile.mass.unsqueeze(-1)                           # (..., N, K)
     else:
         Lambda = profile.Lambda + alpha[..., None, None] * profile.prior_precision
         eta = profile.eta + alpha.unsqueeze(-1) * profile.prior_eta
-        c = alpha + profile.mass                                         # (..., N)
-    return FullLinkContext(Lambda, eta, c, context.beta, context.score, profile)
+    return FullLinkContext(Lambda, eta, alpha, context.beta, context.score, profile)   # c = alpha
 
 
 def _diagonal_weight(c: torch.Tensor, mu: torch.Tensor) -> torch.Tensor:
@@ -260,29 +253,20 @@ def _source_channel(
     dtype:     torch.dtype,
     content:   Optional[Tuple[torch.Tensor, torch.Tensor]] = None,   # precomputed (T, O'); None evaluates
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Return per-source, per-head precisions and natural means.
-
-    ``ambient_alignment`` lifts each message to the K-dimensional law
-
-    .. math::
-        R_{hj}=O_hT_hC_jT_h^\top O_h^\top+\nu I_K,\qquad m_{hj}=O_hT_h\xi_j,
-
-    returning (..., N, H, K, K) and (..., N, H, K); the noise is required for finiteness when d<K.
-    ``channel_likelihood`` keeps the message in the d-dimensional value space,
+    r"""Return per-source, per-head precisions and natural means of the d-dimensional messages.
 
     .. math::
         R_{hj}=T_hC_jT_h^\top+\nu I_d,\qquad v_{hj}=T_h\xi_j,
 
-    returning (..., N, H, d, d) and (..., N, H, d); there nu is a declared channel floor.
+    returning (..., N, H, d, d) and (..., N, H, d); nu is a declared channel floor.
 
     Both are returned as lists with one entry per run of equal-size heads (``operators.runs``),
     the run's heads in place of H and its size in place of d; one entry for equal heads.
     """
-    T_runs, O_runs = content or operators.content_factor_runs()            # O' of the chart
+    T_runs, _ = content or operators.content_factor_runs()
     inverse = frame.inverse.to(dtype)
-    channels = [_source_channel_run(mu, sigma, inverse, frame.block_diagonal, T.to(dtype), O.to(dtype),
-                                    operators.receiver_law, noise, dtype)
-                for T, O in zip(T_runs, O_runs)]
+    channels = [_source_channel_run(mu, sigma, inverse, frame.block_diagonal, T.to(dtype), noise, dtype)
+                for T in T_runs]
     return [precision for precision, _ in channels], [eta for _, eta in channels]
 
 
@@ -293,8 +277,6 @@ def _source_channel_run(
     inverse:        torch.Tensor,           # (..., N, H, d, d) compact or (..., N, K, K) dense
     block_diagonal: bool,
     T:              torch.Tensor,           # (H, d, K) one run's sending maps
-    O:              torch.Tensor,           # (H, K, d) one run's effective receiving maps
-    receiver_law:   str,
     noise:          float,
     dtype:          torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -317,18 +299,10 @@ def _source_channel_run(
             "...nhsk,...nk,...nhtk->...nhst", action, sigma.to(dtype), action)
     else:
         reduced = action @ sigma.to(dtype).unsqueeze(-3) @ action.transpose(-1, -2)
-    if receiver_law == "channel_likelihood":
-        target = .5 * (reduced + reduced.transpose(-1, -2))
-        target = target + noise * torch.eye(d, dtype=dtype, device=mu.device)
-        precision = _spd_precision(target)                                 # (..., N, H, d, d)
-        return precision, (precision @ values.unsqueeze(-1)).squeeze(-1)    # (..., N, H, d)
-    target = torch.einsum("hks,...nhst,hmt->...nhkm", O, reduced, O)
-    target = .5 * (target + target.transpose(-1, -2))
-    target = target + noise * torch.eye(K, dtype=dtype, device=mu.device)
-    precision = _spd_precision(target)                                     # (..., N, H, K, K)
-    means = torch.einsum("hks,...nhs->...nhk", O, values)                  # (..., N, H, K)
-    natural_mean = (precision @ means.unsqueeze(-1)).squeeze(-1)
-    return precision, natural_mean
+    target = .5 * (reduced + reduced.transpose(-1, -2))
+    target = target + noise * torch.eye(d, dtype=dtype, device=mu.device)
+    precision = _spd_precision(target)                                     # (..., N, H, d, d)
+    return precision, (precision @ values.unsqueeze(-1)).squeeze(-1)        # (..., N, H, d)
 
 
 @ieee_fp32_matmul()
@@ -434,42 +408,31 @@ def build_full_link_context(
     *,
     tau:            'float | torch.Tensor' = 1.0,
     lambda_beta:    'float | torch.Tensor' = 1.0,
-    value:          float                 = 1.0,
     receiver_noise: float                 = 1.0,
     kl_max:         float                 = 100.0,
     log_prior:      Optional[torch.Tensor] = None,
     value_frame:    Optional[CanonicalFrameContext] = None,
     capture:        Optional[Dict[str, Any]] = None,
-    lambda_alpha_mode: str                = "constant",
+    lambda_alpha_mode: str                = "state_dependent",
     b0:             'float | torch.Tensor' = 1.0,
     c0:             'float | torch.Tensor' = 1.0,
 ) -> FullLinkContext:
     r"""Snapshot beta and source laws once for receiver filtering with noisy full L links.
 
     Routing uses the incoming Q/K comparison and frame. Channels use value_frame or frame.
-    With alpha=value and weights w = lambda_beta beta_ij^h, ``ambient_alignment`` uses
-    Q_i = receiver_noise U_i U_i.T and computes
-
-    .. math::
-        \Lambda_i=\alpha\Sigma_{p,i}^{-1}
-            +\sum_{h,j}\lambda_h\beta_{ij}^{(h)}R_{ij}^{(h)-1},
-        \eta_i=\alpha\Sigma_{p,i}^{-1}\mu_{p,i}
-            +\sum_{h,j}\lambda_h\beta_{ij}^{(h)}R_{ij}^{(h)-1}m_{ij}^{(h)},
-        c_i=\alpha+\sum_{h,j}\lambda_h\beta_{ij}^{(h)}.
-
-    ``channel_likelihood`` pools d x d blocks W_ih = sum_j w R_hj^{-1} and natural means
-    w_ih = sum_j w R_hj^{-1} v_hj, lifts them through the receiving measurement P_h (d x K) of
-    xi_i, and counts the entropy once:
+    With weights w = lambda_beta beta_ij^h, the channel likelihood pools d x d blocks
+    W_ih = sum_j w R_hj^{-1} and natural means w_ih = sum_j w R_hj^{-1} v_hj, lifts them through
+    the receiving measurement P_h (d x K) of xi_i, and counts the entropy once:
 
     .. math::
         \Lambda_i=\alpha\Sigma_{p,i}^{-1}+U_i^{-\top}\Bigl(\sum_hP_h^\top W_{ih}P_h\Bigr)U_i^{-1},
         \qquad \eta_i=\alpha\Sigma_{p,i}^{-1}\mu_{p,i}+U_i^{-\top}\sum_hP_h^\top w_{ih},
         \qquad c_i=\alpha.
 
-    ``operators.receiver_measurement`` selects P_h. ``"adjoint"`` (the default) is P_h = O_h'^T, the
-    adjoint of the effective receiving map O'_h of ``content_link_chart``. ``"inverse"`` is the dual
+    ``operators.receiver_measurement`` selects P_h. ``"inverse"`` (the config default) is the dual
     measurement, the head-h rows of O'^{-1} for the square column stack O' (sum_h d_h = K), so
-    P_h O'_g = delta_hg I. The two agree only for orthogonal O'. With equal channel precisions
+    P_h O'_g = delta_hg I. ``"adjoint"`` is P_h = O_h'^T, the adjoint of the effective receiving map
+    O'_h of ``content_link_chart``. The two agree only for orthogonal O'. With equal channel precisions
     W_ih = w I, the inverse measurement's minimizer tends as alpha -> 0 to the kernel mean
     U_i sum_h O'_h sum_j beta_ij^h T_h xi_j, and it is invariant under (U, T, S, O') -> (U h, T h, S h,
     h^{-1} O'); the adjoint's minimizer is neither.
@@ -478,7 +441,7 @@ def build_full_link_context(
     receiver arguments to get inner partials while preserving the outer graph.
     relational_score retains its head-block frame contract (block_glk heads or so_n irrep blocks).
 
-    A state-dependent ``lambda_alpha_mode`` ignores ``value``: the context carries a
+    The self-coupling alpha*(D) = c0/(b0 + D) is profiled: the context carries a
     SelfCouplingProfile (coupling-only coefficients and the layer prior) and is returned frozen at
     alpha*(q) of the snapshot (mu, sigma), which is the episode's initial receiver state;
     full_link_context_at refreshes alpha at later states. ``state_dependent_per_coord`` requires the
@@ -487,7 +450,6 @@ def build_full_link_context(
     if lambda_alpha_mode not in FULL_LINK_ALPHA_MODES:
         raise ValueError(f"full-link inference supports lambda_alpha_mode in {FULL_LINK_ALPHA_MODES}, "
                          f"got {lambda_alpha_mode!r}")
-    profiled = lambda_alpha_mode != "constant"
     if lambda_alpha_mode == "state_dependent_per_coord" and (
             sigma.ndim != mu.ndim or sigma_p.ndim != mu_p.ndim):
         raise ValueError("state_dependent_per_coord on the full-link receiver requires the diagonal family "
@@ -505,11 +467,6 @@ def build_full_link_context(
         raise ValueError("full-link inference requires gaussian_kl routing")
     if not math.isfinite(receiver_noise) or receiver_noise <= 0:
         raise ValueError("receiver_noise must be finite and positive")
-    if not math.isfinite(value) or value < 0:
-        raise ValueError("value must be a finite nonnegative prior coefficient")
-    channel = operators.receiver_law == "channel_likelihood"
-    if channel and value <= 0 and not profiled:
-        raise ValueError("channel_likelihood requires a positive prior coefficient (its only entropy term)")
     channel_frame = value_frame or frame
     dtype = _compute_dtype(mu, sigma, mu_p, sigma_p, frame.inverse,
                            channel_frame.inverse, *operators._content_parameters())
@@ -527,25 +484,21 @@ def build_full_link_context(
         # Dual measurement: per-run head rows of O'^{-1} from the chart factors, once per context build.
         measurement = (_inverse_measurement_runs(content[0], operators._stored_runs("O"),
                                                  operators.content_link_chart, dtype)
-                       if channel and getattr(operators, "receiver_measurement", "adjoint") == "inverse" else None)
+                       if getattr(operators, "receiver_measurement", "adjoint") == "inverse" else None)
         # Heads pool run by run (one run for equal heads); the pooled K x K precision and K-vector sum.
         pooled_precision = pooled_eta = None
         for run, (precision_r, eta_r, O) in enumerate(zip(source_precision, source_eta, content[1])):
             weights_r = operators._head_slice(weights, run, -3)                 # (..., n_r, I, J)
-            if channel:
-                pooled_W = torch.einsum("...hij,...jhst->...ihst", weights_r, precision_r)  # (..., I, n_r, d_r, d_r)
-                pooled_w = torch.einsum("...hij,...jhs->...ihs", weights_r, eta_r)          # (..., I, n_r, d_r)
-                if measurement is None:                                          # adjoint: P_h = O'_h^T
-                    O = O.to(dtype)                                              # O' of content_link_chart
-                    precision_term = torch.einsum("hks,...ihst,hmt->...ikm", O, pooled_W, O)    # (..., I, K, K)
-                    eta_term = torch.einsum("hks,...ihs->...ik", O, pooled_w)                   # (..., I, K)
-                else:                                                            # inverse: rows of O'^{-1}
-                    P = measurement[run]                                         # (n_r, d_r, K)
-                    precision_term = torch.einsum("hsk,...ihst,htm->...ikm", P, pooled_W, P)    # (..., I, K, K)
-                    eta_term = torch.einsum("hsk,...ihs->...ik", P, pooled_w)                   # (..., I, K)
-            else:
-                precision_term = torch.einsum("...hij,...jhkm->...ikm", weights_r, precision_r)
-                eta_term = torch.einsum("...hij,...jhk->...ik", weights_r, eta_r)
+            pooled_W = torch.einsum("...hij,...jhst->...ihst", weights_r, precision_r)  # (..., I, n_r, d_r, d_r)
+            pooled_w = torch.einsum("...hij,...jhs->...ihs", weights_r, eta_r)          # (..., I, n_r, d_r)
+            if measurement is None:                                              # adjoint: P_h = O'_h^T
+                O = O.to(dtype)                                                  # O' of content_link_chart
+                precision_term = torch.einsum("hks,...ihst,hmt->...ikm", O, pooled_W, O)    # (..., I, K, K)
+                eta_term = torch.einsum("hks,...ihs->...ik", O, pooled_w)                   # (..., I, K)
+            else:                                                                # inverse: rows of O'^{-1}
+                P = measurement[run]                                             # (n_r, d_r, K)
+                precision_term = torch.einsum("hsk,...ihst,htm->...ikm", P, pooled_W, P)    # (..., I, K, K)
+                eta_term = torch.einsum("hsk,...ihs->...ik", P, pooled_w)                   # (..., I, K)
             pooled_precision = precision_term if pooled_precision is None else pooled_precision + precision_term
             pooled_eta = eta_term if pooled_eta is None else pooled_eta + eta_term
         Lambda, eta = _local_pullback(pooled_precision, pooled_eta, channel_frame)
@@ -553,33 +506,16 @@ def build_full_link_context(
             prior_precision = torch.diag_embed(sigma_p.to(dtype).reciprocal())
         else:
             prior_precision = torch.cholesky_inverse(torch.linalg.cholesky(sigma_p.to(dtype)))
-        if profiled:
-            mass = weights.sum(dim=(-3, -1))                             # (..., I)
-            if sigma_p.ndim == mu_p.ndim:
-                prior_logdet = sigma_p.to(dtype).log().sum(-1)
-            else:
-                prior_logdet = 2 * torch.linalg.cholesky(sigma_p.to(dtype)).diagonal(
-                    dim1=-2, dim2=-1).log().sum(-1)
-            profile = SelfCouplingProfile(
-                lambda_alpha_mode, b0, c0, mu_p.to(dtype), sigma_p.to(dtype), prior_precision,
-                (prior_precision @ mu_p.to(dtype).unsqueeze(-1)).squeeze(-1), prior_logdet,
-                Lambda, eta, torch.zeros_like(mass) if channel else mass)
-            context = full_link_context_at(
-                FullLinkContext(Lambda, eta, mass, beta, score, profile), mu_work, sigma_work)
-            if capture is not None:
-                capture.update(beta_pre=beta.detach(), score_energy_pre=score.detach(),
-                               full_link_context=context)
-            return context
-        Lambda = Lambda + value * prior_precision
-        eta = eta + value * (prior_precision @ mu_p.to(dtype).unsqueeze(-1)).squeeze(-1)
-        mass = weights.sum(dim=(-3, -1))                                 # (..., I)
-        c = torch.full_like(mass, value) if channel else value + mass
-        # Every causal row keeps j = i, so the mass is sum_h lambda_h; check it on the host.
-        if value <= 0 and not channel and (
-                not torch.is_tensor(lambda_beta) or lambda_beta.device.type == "cpu") and not bool(
-                (torch.as_tensor(lambda_beta, dtype=torch.float64) > 0).any()):
-            raise ValueError("prior and lambda_beta must give positive total receiver mass")
-        context = FullLinkContext(Lambda, eta, c, beta, score)
+        if sigma_p.ndim == mu_p.ndim:
+            prior_logdet = sigma_p.to(dtype).log().sum(-1)
+        else:
+            prior_logdet = 2 * torch.linalg.cholesky(sigma_p.to(dtype)).diagonal(
+                dim1=-2, dim2=-1).log().sum(-1)
+        profile = SelfCouplingProfile(
+            lambda_alpha_mode, b0, c0, mu_p.to(dtype), sigma_p.to(dtype), prior_precision,
+            (prior_precision @ mu_p.to(dtype).unsqueeze(-1)).squeeze(-1), prior_logdet, Lambda, eta)
+        context = full_link_context_at(
+            FullLinkContext(Lambda, eta, torch.zeros_like(prior_logdet), beta, score, profile), mu_work, sigma_work)
     if capture is not None:
         capture.update(beta_pre=beta.detach(), score_energy_pre=score.detach(),
                        full_link_context=context)
@@ -644,7 +580,7 @@ def full_link_cost(
     if context.profile is not None:
         profile = context.profile
         coupling = full_link_cost(mu, sigma, FullLinkContext(
-            profile.Lambda, profile.eta, profile.mass, context.beta, context.score))
+            profile.Lambda, profile.eta, torch.zeros_like(profile.prior_logdet), context.beta, context.score))
         with torch.autocast(device_type=mu.device.type, enabled=False):
             D = self_coupling_divergence(mu, sigma, profile)
             self_term = _coeff(profile.c0, D) * torch.log(_coeff(profile.b0, D) + D)
@@ -754,10 +690,10 @@ class _DivergenceCurve:
 
     .. math::
         D_\mu(a)=\tfrac12\sum_k\frac{r_k^2}{(l_k+a)^2},\qquad
-        D_\Sigma^{\mathrm{full}}(a)=\tfrac12\sum_k(u_k-1-\log u_k),\quad u_k=\frac{a+m}{l_k+a},
+        D_\Sigma^{\mathrm{full}}(a)=\tfrac12\sum_k(u_k-1-\log u_k),\quad u_k=\frac{a}{l_k+a},
 
-    from \Sigma^\star = (a+m)(\Lambda_c+aP)^{-1}. The diagonal family's variances
-    s_k = \operatorname{clamp}((a+m)/(\Lambda_{c,kk}+aP_{kk}), \epsilon, \sigma_{\max}) give
+    from \Sigma^\star = a(\Lambda_c+aP)^{-1}. The diagonal family's variances
+    s_k = \operatorname{clamp}(a/(\Lambda_{c,kk}+aP_{kk}), \epsilon, \sigma_{\max}) give
     D_\Sigma^{\mathrm{diag}} = \tfrac12[\sum_k(P_{kk}s_k-\log s_k)+\log\det\Sigma_p-K]; a kept covariance
     (``update_sigma=False``) gives a constant. Every term has slope -dD_k/da >= 0 that is nonincreasing in a
     (on the clamp-free interval of a diagonal coordinate), which :meth:`slope_floor` uses.
@@ -765,7 +701,6 @@ class _DivergenceCurve:
 
     l:     torch.Tensor                      # (..., N, K) generalized eigenvalues of (Lambda_c, P), >= 0
     r2:    torch.Tensor                      # (..., N, K) squared rotated mean offsets
-    mass:  torch.Tensor                      # (..., N, 1) coupling-only entropy multiplicity m
     kind:  str                               # 'full' | 'diagonal' | 'fixed'
     const: torch.Tensor                      # (..., N) variance constant (diagonal, fixed)
     Lc_diag: Optional[torch.Tensor]          # (..., N, K) Lambda_c,kk (diagonal)
@@ -780,11 +715,11 @@ class _DivergenceCurve:
         shifted = self.l + a_k                                           # (..., N, K)
         D = .5 * (self.r2 / shifted.square()).sum(-1)
         slope_mean = (self.r2 / shifted.pow(3)).sum(-1)
-        weight = a_k + self.mass                                         # (..., N, 1), a + m
+        weight = a_k                                                     # (..., N, 1), the entropy weight a
         if self.kind == "full":
             u = weight / shifted
             D = D + .5 * (u - 1 - u.log()).sum(-1)
-            var_slope = (self.l - self.mass).square() / (2 * shifted.square() * weight)
+            var_slope = self.l.square() / (2 * shifted.square() * weight)
             free = torch.ones_like(var_slope, dtype=torch.bool)
         elif self.kind == "diagonal":
             denominator = self.Lc_diag + a_k * self.P_diag
@@ -792,7 +727,7 @@ class _DivergenceCurve:
             s_c = s.clamp(min=self.eps, max=self.sigma_max)
             D = D + .5 * ((self.P_diag * s_c - s_c.log()).sum(-1) + self.const)
             free = (s > self.eps) if self.sigma_max is None else (s > self.eps) & (s < self.sigma_max)
-            var_slope = torch.where(free, (self.Lc_diag - self.mass * self.P_diag).square()
+            var_slope = torch.where(free, self.Lc_diag.square()
                                     / (2 * weight * denominator.square()), torch.zeros_like(s))
         else:
             D = D + self.const
@@ -830,8 +765,7 @@ def _divergence_curve(
     l, V = torch.linalg.eigh(.5 * (A + A.transpose(-1, -2)))             # (..., N, K), (..., N, K, K)
     offset = profile.eta.to(f64) - (Lc @ profile.mu_p.to(f64).unsqueeze(-1)).squeeze(-1)
     r = (V.transpose(-1, -2) @ torch.linalg.solve_triangular(L, offset.unsqueeze(-1), upper=False)).squeeze(-1)
-    mass = profile.mass.to(f64).unsqueeze(-1)
-    const = torch.zeros_like(mass.squeeze(-1))
+    const = torch.zeros_like(r[..., 0])                                  # (..., N)
     Lc_diag = P_diag = None
     if not update_sigma:
         kind = "fixed"
@@ -843,7 +777,7 @@ def _divergence_curve(
         const = profile.prior_logdet.to(f64) - mu.shape[-1]
     else:
         kind = "full"
-    return _DivergenceCurve(l.clamp(min=0), r.square(), mass, kind, const, Lc_diag, P_diag, eps, sigma_max)
+    return _DivergenceCurve(l.clamp(min=0), r.square(), kind, const, Lc_diag, P_diag, eps, sigma_max)
 
 
 def _profiled_root(
@@ -934,12 +868,9 @@ def full_link_profiled_minimizer(
     either family: the frozen energy at r majorizes E with contact at q*(r), not at q_t.
     ``update_sigma=False`` keeps the covariance and solves the mean-only fixed point.
     ``state_dependent_per_coord`` is refused: its fixed points couple across coordinates through the
-    dense mean precision. A constant-alpha context dispatches to :func:`full_link_minimizer` unchanged.
+    dense mean precision.
     """
     profile = context.profile
-    if profile is None:
-        return full_link_minimizer(mu, sigma, context, damping=damping, update_sigma=update_sigma,
-                                   eps=eps, sigma_max=sigma_max)
     if profile.per_coord:
         raise ValueError("relational_receiver_update='closed_form_profiled' supports lambda_alpha_mode="
                          "'state_dependent' only: per coordinate, mu*(alpha) = Lambda(alpha)^{-1} eta(alpha) "
