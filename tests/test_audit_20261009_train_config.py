@@ -28,11 +28,11 @@ from vfe3.model.relational_operators import RelationalOperators
 # --------------------------------------------------------------------------- rope_space pin
 
 def test_rope_record_without_rope_space_reloads_as_frame_space() -> None:
-    payload = asdict(test_config(attention_mode="projected_predictive", pos_rotation="rope",
-                                 rope_space="comparison", rope_on_value=False))
-    payload.pop("rope_space")
+    payload = asdict(test_config(attention_mode="projected_predictive"))
+    payload.pop("rope_mode")
+    payload.update(pos_rotation="rope", rope_on_value=False)          # a pre-2026-10-07 record: no rope_space
     restored = config_from_serialized(payload, source="pre-2026-10-07 record")
-    assert restored.rope_space == "frame"
+    assert restored.rope_mode == "frame"
 
 
 # --------------------------------------------------------------------------- delta_full guard

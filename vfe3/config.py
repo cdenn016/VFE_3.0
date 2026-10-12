@@ -91,6 +91,11 @@ _DENSE_DECODE_MIGRATIONS   = {"diagonal": "diagonal_chunked", "full": "full_chun
 _FAMILY_DECODE_MIGRATIONS  = {"gaussian_diagonal": "diagonal_chunked", "gaussian_full": "full_chunked"}
 # Projected Gaussian-KL factorizations (see VFE3Config.projected_factorization).
 _PROJECTED_FACTORIZATIONS  = ("gram", "gram_certified", "cholesky_qr2_certified")
+# Gauge-RoPE placements (see VFE3Config.rope_mode): frame space folds R_i into the frame, comparison space
+# rotates the projected routing moments after the learned maps.
+_FRAME_ROPE_MODES          = ("frame", "frame_value")
+_COMPARISON_ROPE_MODES     = ("comparison", "comparison_invariant")
+_ROPE_MODES                = ("none",) + _FRAME_ROPE_MODES + _COMPARISON_ROPE_MODES
 
 
 class _ConfigTypeError(TypeError, ValueError):
@@ -107,7 +112,7 @@ def _warn_diagonal_comparison_covariance(
     base:        float,
     max_seq_len: int,
 ) -> None:
-    r"""Warn once per message that ``rotation_invariant`` makes the router's comparison covariance diagonal.
+    r"""Warn once per message that ``comparison_invariant`` makes the router's comparison covariance diagonal.
 
     With every coordinate of a head's comparison block of size d but at most one in a rotating plane, the
     commutant projection P(G) is one isotropic variance per plane (audit 2026-10-10 round 2, item 48). Plane k
@@ -119,7 +124,7 @@ def _warn_diagonal_comparison_covariance(
         planes = int(fraction * d // 2)
         count = sum((max_seq_len - 1) * base ** (-2.0 * k / d) < 0.5 for k in range(planes))
         slow.append(f"{count} of {planes} planes for heads of size {d}")
-    message = (f"rope_comparison_covariance='rotation_invariant' with rope_fraction={fraction:g}: every comparison "
+    message = (f"rope_mode='comparison_invariant' with rope_fraction={fraction:g}: every comparison "
                "coordinate but at most one lies in a rotating plane, so the router's comparison covariance P(G) is "
                "diagonal, one isotropic variance per plane, and routing reads no covariance between comparison "
                f"coordinates. At rope_base={base:g} and max_seq_len={max_seq_len}, " + ", ".join(slow)
@@ -209,7 +214,7 @@ class VFE3Config:
     # Log-step diagnostic: the canonical free energy at each layer's captured beliefs,
     # sum_i [alpha_i KL(q_i||p_i) + R(alpha_i)] + lambda_beta sum_h sum_ij [beta*_ij D^h_ij + tau beta*_ij log(beta*_ij/pi_ij)]
     # with D^h_ij the head-marginal KL of q_i and Omega_ij q_j and the canonical router beta* = softmax(log pi - D/tau).
-    # beta* includes the attention prior pi (causal mask, ALiBi), the RoPE rotation of either rope_space (comparison:
+    # beta* includes the attention prior pi (causal mask, ALiBi), the RoPE rotation of either rope_mode space (comparison:
     # each head's reference moments rotated by R_i, full rotated covariance) and the router's temperature tau (1 under
     # minimal_agent); D_ii = 0 = B_ii puts its row maximum on the diagonal. Fills self_coupling, self_divergence,
     # belief_coupling, attention_entropy and total (per-token means), canonical_beta_tv, canonical_self_weight
@@ -289,7 +294,7 @@ class VFE3Config:
     # "local" | "reference"
     #   local      decode the local moments (mu_i, Sigma_i)
     #   reference  decode xi_i = U_i^-1 mu_i, C_i = U_i^-1 Sigma_i U_i^-T through the attention frame.
-    #              only: a projected attention_mode, pos_rotation="none", decode_mode "linear" |
+    #              only: a projected attention_mode, rope_mode "none" or a comparison mode, decode_mode "linear" |
     #              "diagonal_chunked" | "full_chunked"
     decode_coordinates:               str             = "local"
 
@@ -366,8 +371,8 @@ class VFE3Config:
 
     # "on" | "off" | "frozen"
     #   on      the frame is learned as phi_scale / m_phi_lr / pos_phi specify (pure path)
-    #   off     Omega = I exactly: coerces phi_scale=0, pos_phi="none", m_phi_lr=0; needs pos_rotation="none"
-    #           or rope_space="comparison" (which rotates the routing moments, never the frame)
+    #   off     Omega = I exactly: coerces phi_scale=0, pos_phi="none", m_phi_lr=0; needs rope_mode="none"
+    #           or a comparison mode (which rotates the routing moments, never the frame)
     #   frozen  a random fixed frame: keeps phi_scale, coerces m_phi_lr=0 (same parameter count as "on")
     gauge_transport:                  str             = "on"
 
@@ -412,35 +417,33 @@ class VFE3Config:
     #   none     no positional frame (pure path)
     #   learned  learned (max_seq_len, n_gen) table
     #   frozen   parameter-free i * pos_phi_scale on one generator axis; on the projected routes it is folded into
-    #            the frame before the learned maps, so routing is not relative (relative: pos_rotation='rope' with
-    #            rope_space='comparison')
+    #            the frame before the learned maps, so routing is not relative (relative: a comparison rope_mode)
     pos_phi:                          str             = "learned"
-    pos_rotation:                     str             = "none"       # "none" | "rope" block-diagonal rotation R(theta) folded 
-                                                                     # into each frame on the right, V_i = U_i R_i^T.
-    rope_on_value:                    bool            = False        # rope only: rotate the content frame too (False: routing only)
+    # "none" | "frame" | "frame_value" | "comparison" | "comparison_invariant"
+    # Gauge-RoPE: the block-diagonal positional rotation R(theta_i).
+    #   none                  no rotation
+    #   frame                 folded into each routing frame on the right, V_i = U_i R_i^T, before the learned maps
+    #                         (absolute-position routing); the content frame stays U_i (routing only)
+    #   frame_value           frame, and the content frame is rotated too
+    #   comparison            applied to each head's projected query and key moments after the learned maps, so the
+    #                         routing cost depends on positions only through i - j (kernel readout: routing only;
+    #                         minimal_agent: the record channel R_{j-i}, routing and content by exact conditioning).
+    #                         The kernel router scores the comparison covariance R_i G R_i^T (as run): the trace and
+    #                         log-det terms of every non-self pair grow with the anisotropy of G, which can self-lock a
+    #                         head (audit 2026-10-09 round 2, addendum). only: projected_predictive
+    #   comparison_invariant  comparison, with G projected onto the commutant of the RoPE torus (one isotropic variance
+    #                         per rotating plane, the full non-rotating block, no cross-covariance), so
+    #                         R_i P(G) R_i^T = P(G) and only the mean term carries i - j; scored on the Gram route (no
+    #                         source-root factor route), or in closed form with no factorization when P(G) is diagonal
+    #                         (rope_fraction = 1). only: the kernel readout (not minimal_agent)
+    rope_mode:                        str             = "none"
     pos_phi_project_slk:              bool            = False        # pos_phi only: per-block trace projection (det = 1)
     bch_residual_max:                 Optional[float] = None         # manifold phi M-step only: group-product residual gate, min(1e-6, value); None = 1e-6 (tightens only)
     
-    rope_base:                        float           = 100.0        # rope only: frequency base
-    # rope only: p-RoPE fraction p in (0, 1] (Barbero et al., ICLR 2025): only the floor(p d / 2) fastest
+    rope_base:                        float           = 100.0        # rope_mode != "none" only: frequency base
+    # rope_mode != "none" only: p-RoPE fraction p in (0, 1] (Barbero et al., ICLR 2025): only the floor(p d / 2) fastest
     # pairs of each block rotate, at their full-RoPE frequencies; the slower pairs stay position-free. 1.0 = RoPE.
     rope_fraction:                    float           = 1.0
-    # "frame" | "comparison"
-    # rope only: where the rotation acts.
-    #   frame       folded into each frame, V_i = U_i R_i^T, before the learned maps (absolute-position routing)
-    #   comparison  applied to each head's projected query and key moments after the learned maps, so the
-    #               routing cost depends on positions only through i - j (kernel readout: routing only;
-    #               minimal_agent: the record channel R_{j-i}, routing and content by exact conditioning)
-    rope_space:                       str             = "frame"
-    # "full" | "rotation_invariant"
-    # rope_space="comparison" with the kernel readout only: the comparison covariance the router scores.
-    #   full                R_i G R_i^T (as run): the trace and log-det terms of every non-self pair grow with the
-    #                       anisotropy of G, which can self-lock a head (audit 2026-10-09 round 2, addendum)
-    #   rotation_invariant  G projected onto the commutant of the RoPE torus (one isotropic variance per rotating
-    #                       plane, the full non-rotating block, no cross-covariance), so R_i P(G) R_i^T = P(G) and
-    #                       only the mean term carries i - j; scored on the Gram route (no source-root factor route),
-    #                       or in closed form with no factorization when P(G) is diagonal (rope_fraction = 1)
-    rope_comparison_covariance:       str             = "full"
     
     ##################################################
     #   8. Attention routing
@@ -499,7 +502,7 @@ class VFE3Config:
     #   minimal_agent  each receiver conditions exactly on a noisy comparison record with the key tied to
     #                  the content (S_K = T); no O, routing is the exact source posterior (temperature 1;
     #                  relational_routing, kappa_beta and kl_max are not read). Needs equal heads,
-    #                  content_link_edges="off" and not (frame-space pos_rotation="rope" with rope_on_value=False);
+    #                  content_link_edges="off" and not rope_mode="frame";
     #                  comparison-space RoPE is the known record channel R_{j-i} (exact conditioning).
     predictive_readout:               str             = "kernel"
 
@@ -630,7 +633,7 @@ class VFE3Config:
     # "local" | "reference"
     #   local      the block norm, block MLP and final norm act on mu_i
     #   reference  they act on xi_i = U_i^-1 mu_i and map back, mu -> U_i Phi(U_i^-1 mu). only:
-    #              projected_predictive, pos_rotation="none", a "none"/"layernorm" norm, and a passthrough
+    #              projected_predictive, rope_mode "none" or a comparison mode, a "none"/"layernorm" norm, and a passthrough
     #              coordinate / gaussian_template MLP, a prototype_agents MLP, or (gaussian_full / gaussian_block)
     #              a delta_full coordinate MLP
     block_coordinates:                str             = "local"
@@ -850,11 +853,11 @@ class VFE3Config:
     #   gram                    factor the float32 Gram X X^T (error O(eps kappa^2))
     #   gram_certified          gram, and also rebuild entries that factor but fail
     #                           eps_32 ||G||_F ||G^-1||_F <= 1e-4 (costly on CUDA; with minimal_agent it
-    #                           also screens the ADF query covariances; under rotation_invariant with a
+    #                           also screens the ADF query covariances; under comparison_invariant with a
     #                           diagonal P(G) it keeps the factored route in place of the diagonal one)
     #   cholesky_qr2_certified  factor X by CholeskyQR2 (error O(eps kappa)) and rebuild entries failing
     #                           eps_32 kappa_1(C) <= 3e-4; the Gram route serves minimal_agent,
-    #                           noisy_query and rotation_invariant, which pass no source root
+    #                           noisy_query and comparison_invariant, which pass no source root
     projected_factorization:          str             = "gram"
 
     frame_pair_condition_tol:         float           = 1e-4         # escalation only: kappa_F > 838.9 at 1e-4
@@ -1060,10 +1063,10 @@ class VFE3Config:
             # Omega = exp(phi_i) exp(-phi_j) = I needs a ZERO frame AND no other transport modifier, so
             # a frame-space positional rotation must also be off (else Omega != I and the cell is mislabeled).
             # Comparison-space RoPE rotates the projected routing moments after the maps and leaves Omega = I.
-            if self.pos_rotation != "none" and self.rope_space != "comparison":
+            if self.rope_mode in _FRAME_ROPE_MODES:
                 raise ValueError(
-                    f"gauge_transport='off' requires Omega=I, but pos_rotation={self.pos_rotation!r} folds "
-                    f"a positional rotation into the transport. Set pos_rotation='none'."
+                    f"gauge_transport='off' requires Omega=I, but rope_mode={self.rope_mode!r} folds "
+                    f"a positional rotation into the transport. Set rope_mode='none' or a comparison mode."
                 )
             self.phi_scale    = 0.0
             self.pos_phi      = "none"
@@ -1522,8 +1525,7 @@ class VFE3Config:
 
         from vfe3.model.positional_phi import _POS_PHI
         _require(self.pos_phi, tuple(sorted(_POS_PHI)), "pos_phi")
-        from vfe3.geometry.rope import _POS_ROTATIONS
-        _require(self.pos_rotation, tuple(sorted(_POS_ROTATIONS)), "pos_rotation")
+        _require(self.rope_mode, _ROPE_MODES, "rope_mode")
         # The retained projected routes fold RoPE into the realized frame on the right,
         # V_i = U_i R_i^T (rope_insertion is fixed to "right"). Under U_i -> g_i U_i this gives
         # V_i -> g_i V_i, the same right-factor structure as pos_phi's exp(Y_i), so routing and
@@ -1532,39 +1534,29 @@ class VFE3Config:
         # RoPE's adjacent-pair rotation R is orthogonal but generally NOT in the irrep image
         # rho(SO(N)) inside GL(K), so R Omega R^T leaves the SELECTED structure group
         # (GL(K)-congruence invariance survives).
-        _require(self.rope_space, ("frame", "comparison"), "rope_space")
-        if self.pos_rotation == "rope":
+        if self.rope_mode != "none":
             # p-RoPE rotates floor(p d / 2) pairs of each block (frame space: each irrep block; comparison
             # space: each head's comparison block, also of the head size); none rotated is NoPE, not p-RoPE.
             empty = sorted({d for d in self.head_dims if d >= 2 and int(float(self.rope_fraction) * d // 2) == 0})
             if empty:
                 raise ValueError(f"rope_fraction={self.rope_fraction} rotates no pair of blocks of size {empty}; "
-                                 "raise it or use pos_rotation='none'")
-        if self.pos_rotation == "rope" and self.rope_space == "comparison":
-            problems = []
-            if self.attention_mode != "projected_predictive":
-                problems.append(f"attention_mode={self.attention_mode!r} (requires 'projected_predictive')")
-            # minimal_agent: the rotation is a known record channel R_{j-i}, applied by exact conditioning.
-            if self.rope_on_value:
-                problems.append("rope_on_value=True (the comparison-space rotation is not a frame rotation)")
-            if problems:
-                raise ValueError("rope_space='comparison' rotates the projected routing moments after the learned "
-                                 "maps; got " + "; ".join(problems))
-        _require(self.rope_comparison_covariance, ("full", "rotation_invariant"), "rope_comparison_covariance")
-        if (self.rope_comparison_covariance == "rotation_invariant" and self.pos_rotation == "rope"
-                and self.rope_space == "comparison" and self.predictive_readout == "minimal_agent"):
-            raise ValueError("rope_comparison_covariance='rotation_invariant' projects the kernel router's comparison "
+                                 "raise it or use rope_mode='none'")
+        # minimal_agent: the comparison rotation is a known record channel R_{j-i}, applied by exact conditioning.
+        if self.rope_mode in _COMPARISON_ROPE_MODES and self.attention_mode != "projected_predictive":
+            raise ValueError(f"rope_mode={self.rope_mode!r} rotates the projected routing moments after the learned "
+                             f"maps; got attention_mode={self.attention_mode!r} (requires 'projected_predictive')")
+        if self.rope_mode == "comparison_invariant" and self.predictive_readout == "minimal_agent":
+            raise ValueError("rope_mode='comparison_invariant' projects the kernel router's comparison "
                              "covariance; predictive_readout='minimal_agent' applies the rotation as a record channel "
-                             "by exact conditioning and does not read it (use 'full')")
-        if (self.rope_comparison_covariance == "rotation_invariant" and self.pos_rotation == "rope"
-                and self.rope_space == "comparison"
+                             "by exact conditioning and does not read it (use 'comparison')")
+        if (self.rope_mode == "comparison_invariant"
                 and all(d - 2 * int(float(self.rope_fraction) * d // 2) <= 1 for d in self.head_dims)):
             _warn_diagonal_comparison_covariance(self.head_dims, float(self.rope_fraction), float(self.rope_base),
                                                  self.max_seq_len)
-        if self.pos_rotation == "rope" and self.rope_space == "frame" and not _traits.contains_pair_rotations:
+        if self.rope_mode in _FRAME_ROPE_MODES and not _traits.contains_pair_rotations:
             import warnings
             warnings.warn(
-                f"pos_rotation='rope' with gauge_group={self.gauge_group!r} leaves the structure "
+                f"rope_mode={self.rope_mode!r} with gauge_group={self.gauge_group!r} leaves the structure "
                 f"group: the coordinate-pair rotation R(theta) is generally not in the group's "
                 f"image in GL(K), so R Omega R^T is no longer in the selected group. The "
                 f"GL(K)-congruence divergence invariance still holds (R is orthogonal), so the "
@@ -1647,9 +1639,9 @@ class VFE3Config:
             if self.content_link_edges != "off":
                 agent_problems.append(f"content_link_edges={self.content_link_edges!r} (requires 'off': the edge links "
                                       "multiply the content factors O, which the minimal agent derives)")
-            if self.pos_rotation == "rope" and self.rope_space == "frame" and not self.rope_on_value:
-                agent_problems.append("frame-space pos_rotation='rope' with rope_on_value=False (the tied key is "
-                                      "the content, so both are read in one frame; or use rope_space='comparison')")
+            if self.rope_mode == "frame":
+                agent_problems.append("rope_mode='frame' (the tied key is the content, so both are read in one "
+                                      "frame; use 'frame_value' or 'comparison')")
             if agent_problems:
                 raise ValueError("predictive_readout='minimal_agent' is unsupported here: " + "; ".join(agent_problems))
         for _name in ("learn_attention_temperature", "tie_comparison_maps"):
@@ -1736,12 +1728,12 @@ class VFE3Config:
         # not compose into U_i.
         if (self.encode_mode == "per_token_additive"
                 and (self.pos_phi != "none"
-                     or (self.pos_rotation != "none" and self.rope_space != "comparison"))):
+                     or self.rope_mode in _FRAME_ROPE_MODES)):
             detail = (
                 f"encode_mode='per_token_additive' with pos_phi={self.pos_phi!r}, "
-                f"pos_rotation={self.pos_rotation!r}: the positional frame keeps Omega_ij != I, "
+                f"rope_mode={self.rope_mode!r}: the positional frame keeps Omega_ij != I, "
                 "so the additive encoder is not the Omega = I capacity control; set "
-                "pos_phi='none' and pos_rotation='none'"
+                "pos_phi='none' and rope_mode='none' (or a comparison mode)"
             )
             raise ValueError(detail + " on the projected routes")
         # The additive encoder's learned capacity is the phi table itself, which gauge_transport 'off'
@@ -1897,9 +1889,9 @@ class VFE3Config:
         _require(self.decode_coordinates, ("local", "reference"), "decode_coordinates")
         _require(self.decode_covariance, ("belief", "encoded", "constant"), "decode_covariance")
         frame_requirements = []
-        if self.pos_rotation != "none" and self.rope_space != "comparison":
+        if self.rope_mode in _FRAME_ROPE_MODES:
             frame_requirements.append(
-                f"pos_rotation={self.pos_rotation!r} (RoPE folds a rotation into the routing frame, "
+                f"rope_mode={self.rope_mode!r} (RoPE folds a rotation into the routing frame, "
                 "so the content/decode frame is not U_i)")
         if self.block_coordinates == "reference":
             incompatible = list(frame_requirements)
@@ -2321,13 +2313,8 @@ class VFE3Config:
             mark(("b0", "c0"), "only read by a state_dependent lambda_alpha_mode")
         else:
             mark(("lambda_alpha",), "only read by lambda_alpha_mode='constant'")
-        if self.pos_rotation == "none":
-            mark(("rope_on_value", "rope_base", "rope_space", "rope_fraction"), "only read by pos_rotation='rope'")
-        if not (self.pos_rotation == "rope" and self.rope_space == "comparison"
-                and self.attention_mode == "projected_predictive" and self.predictive_readout == "kernel"
-                and self.relational_routing != "mean_distance"):
-            mark(("rope_comparison_covariance",),
-                 "only read by the kernel router's covariance under pos_rotation='rope' with rope_space='comparison'")
+        if self.rope_mode == "none":
+            mark(("rope_base", "rope_fraction"), "only read by a rope_mode other than 'none'")
         if self.attention_mode == "projected_predictive" and self.predictive_readout != "kernel":
             mark(("routing_kl_max_reference",), "only read by the kernel router (minimal_agent applies no clamp)")
         if not (self.attention_mode == "projected_predictive" and self.predictive_readout == "kernel"
@@ -2661,13 +2648,15 @@ _RETIRED_CONDITIONAL_FIELDS = frozenset({
 _PROJECTED_FACTORIZATION_FIELDS = (
     "projected_cov_condition_recovery", "projected_factor_route", "projected_cov_recovery_precision",
     "projected_gram_condition_tol", "projected_factor_condition_tol")
+# The four RoPE selectors merged into rope_mode (2026-10-12).
+_ROPE_FIELDS = ("pos_rotation", "rope_space", "rope_on_value", "rope_comparison_covariance")
 # Every serialized key config_from_serialized migrates or refuses that is not a VFE3Config field.
 RETIRED_CONFIG_KEYS = frozenset(
     set(_RETIRED_PINNED_FIELDS) | _RETIRED_INERT_FIELDS | _RETIRED_CONDITIONAL_FIELDS
     | {"grad_clip_per_role", "exp_fp64_mode", "compile_pair_kernel", "relational_mode",
        "relational_readout_mode", "relational_input_scope", "relational_output_scope",
        "relational_identity_content"}
-    | set(_PROJECTED_FACTORIZATION_FIELDS))
+    | set(_PROJECTED_FACTORIZATION_FIELDS) | set(_ROPE_FIELDS))
 # laplace_diagonal (retired 2026-10-12) was registered but refused on both projected routes.
 _RETIRED_FAMILIES = frozenset({"gaussian_frame_diagonal", "laplace_diagonal"})
 _MIGRATED_FAMILIES = {"gaussian_diagonal_exact": "gaussian_diagonal"}
@@ -2816,6 +2805,46 @@ def _migrate_retired_fields(
     if isinstance(gauge_group, str) and gauge_group in _RETIRED_GAUGE_GROUPS:
         refuse("gauge_group", gauge_group)
     _migrate_projected_factorization(payload, source=source, refuse=refuse)
+    _migrate_rope_mode(payload, source=source, refuse=refuse)
+
+
+def _migrate_rope_mode(
+    payload: dict[str, Any],
+
+    *,
+    source: str,
+    refuse: Callable[..., None],
+) -> None:
+    r"""Merge ``pos_rotation``, ``rope_space``, ``rope_on_value`` and ``rope_comparison_covariance`` into ``rope_mode``.
+
+    Every combination the old validator admitted maps to exactly one mode: ``pos_rotation="none"`` to ``none``
+    (the other three were inert); frame space to ``frame`` or, with ``rope_on_value``, ``frame_value`` (the
+    comparison covariance was inert); comparison space to ``comparison`` (covariance ``full``) or
+    ``comparison_invariant`` (``rotation_invariant``). Comparison space with ``rope_on_value=True`` was refused
+    and stays refused. An absent ``rope_space`` is the historical frame space (its 2026-10-07 pin row).
+    """
+    present = [name for name in _ROPE_FIELDS if name in payload]
+    if not present:
+        return
+    if "rope_mode" in payload:
+        raise ValueError(f"serialized config from {source} has conflicting RoPE selectors: rope_mode and {present}")
+    rotation = payload.pop("pos_rotation", "none")
+    space = payload.pop("rope_space", "frame")
+    on_value = _normalize_serialized_boolean(payload.pop("rope_on_value", False), "rope_on_value", source=source)
+    covariance = payload.pop("rope_comparison_covariance", "full")
+    for name, value, valid in (("pos_rotation", rotation, ("none", "rope")),
+                               ("rope_space", space, ("frame", "comparison")),
+                               ("rope_comparison_covariance", covariance, ("full", "rotation_invariant"))):
+        if value not in valid:
+            refuse(name, value, f" (only {valid} was valid)")
+    if rotation == "none":
+        payload["rope_mode"] = "none"
+    elif space == "frame":
+        payload["rope_mode"] = "frame_value" if on_value else "frame"
+    elif on_value:
+        refuse("rope_on_value", True, " with rope_space='comparison' (never a valid combination)")
+    else:
+        payload["rope_mode"] = "comparison_invariant" if covariance == "rotation_invariant" else "comparison"
 
 
 def _migrate_projected_factorization(
@@ -2868,14 +2897,14 @@ def _migrate_projected_factorization(
 #   m_decode_mu_lr, m_decode_sigma_lr None (inherit) at d04dfc4 (2026-09-30), now 0.025 / 0.001
 #   projected_cov_recovery_precision  "fp64" at fed4164 (2026-10-04); merged into projected_factorization
 #                                     on 2026-10-12, whose migration treats an absent precision as fp64
-#   rope_space                        "frame" from eaa3a21 (2026-10-07)
+#   rope_space                        "frame" from eaa3a21 (2026-10-07); merged into rope_mode on 2026-10-12,
+#                                     whose migration treats an absent rope_space as "frame"
 #   kl_max                            100.0 until 2026-10-12, now None (8 * embed_dim)
 _HISTORICAL_DEFAULT_PINS: dict[str, Any] = {
     "content_link_chart":               "affine",
     "predictive_covariance":            "passthrough",
     "m_decode_mu_lr":                   None,
     "m_decode_sigma_lr":                None,
-    "rope_space":                       "frame",
     "kl_max":                           100.0,
 }
 

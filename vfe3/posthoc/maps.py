@@ -294,7 +294,7 @@ def map_invariants(
     Frobenius norms ``{edge map}_fro`` of the stored factor maps; the per-edge links themselves are
     data-dependent and are reported by the model diagnostics (``relational_edge_*``), not here.
 
-    Under comparison-space RoPE (``pos_rotation='rope'``, ``rope_space='comparison'``) the routing cost
+    Under comparison-space RoPE (a comparison ``rope_mode``) the routing cost
     is :math:`\mathrm{KL}(R_i A a_i \Vert R_j A b_j)`, invariant only under the commutant of the
     rotations, so the comparison-pair charge :math:`S_Q S_Q^\top + S_K S_K^\top` is not conserved by
     gradient flow. ``conserved_S_drift`` is then NaN and the row carries ``comparison_rope = 1.0``;
@@ -303,8 +303,7 @@ def map_invariants(
     """
     state, _ = unwrap_state(state)
     s0 = _output_init_scale(cfg)
-    comparison_rope = (getattr(cfg, "pos_rotation", "none") == "rope"
-                       and getattr(cfg, "rope_space", "frame") == "comparison")
+    comparison_rope = getattr(cfg, "rope_mode", "none") in ("comparison", "comparison_invariant")
     rows: List[Dict[str, float]] = []
     norms_by_layer = head_block_norms(state, cfg)
     for layer, maps in relational_maps(state, cfg).items():

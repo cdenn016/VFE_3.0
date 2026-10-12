@@ -110,7 +110,7 @@ earlier inverses. :meth:`RelationalOperators.minimal_agent_update` recomputes a 
 float32 layer call in float64 (the whole call, from the local beliefs) and raises only if the float64 call fails
 too.
 
-Comparison-space RoPE (``rope_space='comparison'``). With the per-position rotation :math:`R_i` of
+Comparison-space RoPE (``rope_mode='comparison'``). With the per-position rotation :math:`R_i` of
 :func:`vfe3.geometry.rope.build_rope_rotation` (orthogonal, :math:`d\times d`), head :math:`h`'s record is
 :math:`o_h = R_iS_hX_i - R_jT_hX_{J^h} + \varepsilon_h`; the noise :math:`n_hI_d` is rotation invariant, so this is the
 record :math:`S_hX_i - R_{j-i}T_hX_{J^h} + \varepsilon'_h` of a source whose utterance reaches receiver :math:`i` through the
@@ -120,7 +120,7 @@ known channel :math:`R_{j-i} = R_i^\top R_j`. Every cost (exact and mean field) 
 :math:`u_i \to R_i^\top u_i`, :math:`\bar\Lambda_i, R_i^{\rm spread}, \Lambda_i \to R_i^\top(\cdot)R_i`,
 :math:`\eta_i \to R_i^\top\eta_i`. This is the exact posterior of the rotated record: the gain
 :math:`\mathsf K_i = C_iS^\top` is unchanged and the received content arrives through :math:`R_{j-i}` and is decoded by it,
-so routing and content stay in one frame (no ``rope_on_value`` split). :math:`R = I` is the unrotated model.
+so routing and content stay in one frame (no ``rope_mode='frame'`` split). :math:`R = I` is the unrotated model.
 
 Pure functions with shape comments; :class:`vfe3.model.relational_operators.RelationalOperators` owns the parameters
 (``raw_score_q``, ``T``, ``channel_log_noise``) and calls these. Factorizations use zero jitter and no covariance

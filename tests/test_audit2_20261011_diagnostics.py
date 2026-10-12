@@ -29,8 +29,7 @@ from vfe3.model.model import CANONICAL_DIAGNOSTIC_KEYS, DiagnosticSnapshot, VFEM
 from vfe3.posthoc.klcap import causal_support
 
 TOKENS = torch.tensor([[0, 1, 2, 3, 4], [4, 5, 6, 7, 8]])
-COMPARISON_ROPE = dict(pos_rotation="rope", rope_space="comparison", rope_on_value=False,
-                       beta_attention_prior="causal_alibi", rope_comparison_covariance="rotation_invariant",
+COMPARISON_ROPE = dict(rope_mode="comparison_invariant", beta_attention_prior="causal_alibi",
                        routing_kl_max_reference="row_min")
 MINIMAL_AGENT = dict(predictive_readout="minimal_agent", attention_residual=False)
 PER_LAYER_KEYS = ("relational_projected_cov_scale", "relational_projected_cov_gram_min_eigenvalue",
@@ -429,7 +428,7 @@ def test_failed_factor_propagates_nan_and_an_empty_row_reports_zero() -> None:
 @pytest.mark.parametrize("overrides", [
     dict(),                                                          # packed block_glk coordinates
     dict(gauge_group="block_so"),                                    # head_block_generators basis
-    dict(pos_rotation="rope", beta_attention_prior="causal_alibi"),  # frame-space rotation blocks
+    dict(rope_mode="frame_value", beta_attention_prior="causal_alibi"),  # frame-space rotation blocks
     COMPARISON_ROPE,                                                 # comparison rotation on head blocks
     dict(family="gaussian_full"),
 ], ids=["block_glk", "block_so", "frame_rope", "comparison_rope", "full"])

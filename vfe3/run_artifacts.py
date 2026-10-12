@@ -4417,13 +4417,13 @@ def collect_beta_channel_decomposition(
     at all therefore leaves ``no_prior`` equal to ``full``, correctly reporting that this model has
     no positional channel to ablate.
 
-    Under ``pos_rotation='rope'`` position also enters through the routing cost itself (the rotated
+    Under a ``rope_mode`` other than ``'none'`` position also enters through the routing cost itself (the rotated
     comparison moments, or the rotation folded into the frame), so ``no_energy`` then removes RoPE
     position together with content. A fourth arm ``no_rope`` keeps the cost and the prior and removes
     only the rotation; ``delta_ce.rope_position_channel`` reports it and ``energy_includes_rope_position``
-    flags the reading (audit 2026-10-10, item 5). Under ``rope_space='comparison'`` the arm sets each
+    flags the reading (audit 2026-10-10, item 5). Under a comparison ``rope_mode`` the arm sets each
     operator's comparison rotation to :math:`R_i = I` and keeps everything else, including the commutant
-    projection :math:`P(G)` of ``rope_comparison_covariance='rotation_invariant'``.
+    projection :math:`P(G)` of ``rope_mode='comparison_invariant'``.
     """
     import torch.nn.functional as F
     from vfe3 import free_energy as free_energy_module
@@ -4455,7 +4455,7 @@ def collect_beta_channel_decomposition(
         return _patched(energy, tau=tau, log_prior=log_prior)
 
     cfg = getattr(model, "cfg", None)
-    rope_active = getattr(cfg, "pos_rotation", "none") == "rope"
+    rope_active = getattr(cfg, "rope_mode", "none") != "none"
     operators = list(getattr(model, "relational_operators_by_layer", None) or [])
     comparison_ops = [ops for ops in operators if getattr(ops, "comparison_rope_base", None) is not None]
 
@@ -4464,7 +4464,7 @@ def collect_beta_channel_decomposition(
 
     def _set_rope(enabled: bool) -> None:
         # Comparison-space RoPE lives on each layer's operators; frame-space RoPE is the model's rotation.
-        # The comparison arm keeps comparison_rope_base, which also gates the rotation_invariant commutant
+        # The comparison arm keeps comparison_rope_base, which also gates the comparison_invariant commutant
         # projection P(G), and replaces each operator's rotation R_i by the identity, so only the rotation
         # is removed (audit 2026-10-10 round 2, #19).
         for ops in comparison_ops:
@@ -4474,7 +4474,7 @@ def collect_beta_channel_decomposition(
                 ops.__dict__["comparison_rope_rotation"] = _identity_rotation
         if enabled:
             model.__dict__.pop("_rope_rotation", None)
-        elif getattr(cfg, "rope_space", "frame") == "frame":
+        elif getattr(cfg, "rope_mode", "none") in ("frame", "frame_value"):
             model._rope_rotation = lambda n, device: None
 
     cpu_rng = torch.get_rng_state().clone()
@@ -5137,11 +5137,11 @@ def _pure_path_report(
         ["canonical_free_energy_diagnostic"] if getattr(cfg, "diagnose_canonical_free_energy", False) else [])
     per_coord_conditional_kl = (alpha_is_per_coord(cfg.lambda_alpha_mode)
                                 and bool(getattr(get_family(cfg.family), "conditional_kl_coordinates", False)))
-    comparison_rope = cfg.pos_rotation == "rope" and getattr(cfg, "rope_space", "frame") == "comparison"
-    # rotation_invariant scores the commutant projection P(G) of the kernel router's comparison covariance:
+    comparison_rope = cfg.rope_mode in ("comparison", "comparison_invariant")
+    # comparison_invariant scores the commutant projection P(G) of the kernel router's comparison covariance:
     # only the projected means rotate (vfe3.gradients.relational.relational_score).
     rope_commutant_covariance = (
-        comparison_rope and getattr(cfg, "rope_comparison_covariance", "full") == "rotation_invariant"
+        cfg.rope_mode == "comparison_invariant"
         and getattr(cfg, "relational_routing", "gaussian_kl") != "mean_distance")
 
     conditional_fields = _conditional_artifact_fields(cfg)
@@ -5162,15 +5162,15 @@ def _pure_path_report(
         "gradient_e_step_update":      gradient_e_step_update,
     }
     # Second, INDEPENDENT purity axis (audit 2026-07-01 F8): the gauge / model-channel path. Keyed
-    # on pos_rotation itself rather than the RoPE sub-toggle rope_on_value,
-    # which is inert while RoPE is off -- those are reported in config_toggles for transparency.
+    # on rope_mode itself; the RoPE base and fraction are inert while RoPE is off and are reported in
+    # config_toggles for transparency.
     gauge_flags = {
         "learned_gauge_transport":   cfg.gauge_transport == "on",
         "transport_gauge_equivariant": transport_registration.gauge_equivariant,
         # RoPE is folded on the right of the realized frame (U_i R_i^T), the same right-factor
         # structure as pos_phi, so both projected routes stay covariant (audit 2026-10-01 F11).
         "positional_rotation_gauge_covariant": (
-            cfg.pos_rotation == "none" or getattr(cfg, "rope_insertion", "right") == "right"),
+            cfg.rope_mode == "none" or getattr(cfg, "rope_insertion", "right") == "right"),
         "family_group_invariant":    family_group_invariant,
         # block_coordinates='reference' conjugates the block norm, final norm and block MLP by the
         # realized frame, x -> U_i N(U_i^{-1} x), which is covariant for any registered map
@@ -5235,28 +5235,23 @@ def _pure_path_report(
             "block_mlp_covariance_contract": block_mlp_covariance_contract,
             "block_norm_covariance":        getattr(cfg, "block_norm_covariance", "passthrough"),
             "gauge_transport":              cfg.gauge_transport,
-            "pos_rotation":                 cfg.pos_rotation,
-            "rope_on_value":                bool(cfg.rope_on_value),
-            # Which RoPE regime the routing score used (audit 2026-07-26 A-02). rope_space='comparison'
+            "rope_mode":                    cfg.rope_mode,
+            # Which RoPE regime the routing score used (audit 2026-07-26 A-02). A comparison rope_mode
             # folds nothing into the frame: it rotates the projected moments by R_i after the comparison
             # map, so the pair cost depends on positions through j - i (audit 2026-10-08 C#6). Under
-            # rope_comparison_covariance='rotation_invariant' only the means rotate and the covariance is the
+            # rope_mode='comparison_invariant' only the means rotate and the covariance is the
             # commutant projection P(G), with R_i P(G) R_i^T = P(G) (audit 2026-10-10 round 2, #33).
             "rope_pair_energy_exactness":   (
-                "not_applicable" if cfg.pos_rotation == "none"
+                "not_applicable" if cfg.rope_mode == "none"
                 else "comparison_space_rotated_means_commutant_projected_covariance"
                 if rope_commutant_covariance
                 else "comparison_space_rotated_projected_moments"
                 if comparison_rope
                 else "frame_folded_both_moments"   # projected routes push both moments through U_i R_i^T
             ),
-            "rope_space":                   (None if cfg.pos_rotation == "none"
-                                             else getattr(cfg, "rope_space", "frame")),
-            "rope_comparison_covariance":   (getattr(cfg, "rope_comparison_covariance", "full")
-                                             if comparison_rope else None),
-            "rope_fraction":                (None if cfg.pos_rotation == "none"
+            "rope_fraction":                (None if cfg.rope_mode == "none"
                                              else float(cfg.rope_fraction)),
-            "rope_base":                    (None if cfg.pos_rotation == "none"
+            "rope_base":                    (None if cfg.rope_mode == "none"
                                              else float(cfg.rope_base)),
             "skip_belief_sigma_update":      bool(cfg.skip_belief_sigma_update),
             "predictive_covariance":         getattr(cfg, "predictive_covariance", "passthrough"),

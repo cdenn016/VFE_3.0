@@ -126,7 +126,7 @@ def _brute_force(model: VFEModel, snapshot: DiagnosticSnapshot, layer: int) -> D
 @pytest.mark.parametrize("overrides", [
     dict(),                                                               # block_glk frames, nonzero phi
     dict(gauge_transport="off"),                                          # U = I
-    dict(pos_rotation="rope", beta_attention_prior="causal_alibi"),       # RoPE folded, per-head prior
+    dict(rope_mode="frame_value", beta_attention_prior="causal_alibi"),       # RoPE folded, per-head prior
     dict(lambda_alpha_mode="state_dependent_per_coord", c0=0.7, b0=1.3),
     dict(lambda_alpha_mode="state_dependent", lambda_beta=0.6, kappa_beta=1.7),
     dict(learn_attention_temperature=True),

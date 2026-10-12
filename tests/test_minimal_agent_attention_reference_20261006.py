@@ -1038,13 +1038,13 @@ def test_config_validation_and_inactive_fields() -> None:
     assert "predictive_covariance_floor" not in moment
     prefix = "predictive_readout='minimal_agent' is unsupported here: "
     for overrides, needle in ((dict(predictive_readout="minimal_agent"), "attention_mode"),
-                              (dict(**AGENT, pos_rotation="rope", rope_on_value=False), "rope"),
+                              (dict(**AGENT, rope_mode="frame"), "rope"),
                               (dict(**AGENT, content_link_chart="exponential", content_link_edges="lowrank",
                                     content_link_edge_rank=2), "content_link_edges")):
         with pytest.raises(ValueError) as info:
             test_config(**overrides)
         assert str(info.value).startswith(prefix) and needle in str(info.value), str(info.value)
-    test_config(**AGENT, pos_rotation="rope", rope_on_value=True)                  # one frame: accepted
+    test_config(**AGENT, rope_mode="frame_value")                  # one frame: accepted
     with pytest.raises(ValueError, match="predictive_readout"):
         test_config(attention_mode="projected_predictive", predictive_readout="other")
     with pytest.raises(ValueError, match="minimal_agent_inference"):

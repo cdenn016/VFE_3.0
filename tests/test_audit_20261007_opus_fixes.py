@@ -522,12 +522,12 @@ def test_offstrip_frame_rows_recover_the_exact_covector_and_chart_velocity(theta
 
 
 def _rope_cfg(space: str, **overrides):
-    return _cfg(_minimal_agent(predictive_readout="kernel", block_mlp_mode="coordinate", pos_rotation="rope",
-                               rope_on_value=False, rope_space=space, **overrides))
+    return _cfg(_minimal_agent(predictive_readout="kernel", block_mlp_mode="coordinate", rope_mode=space,
+                               **overrides))
 
 
 def test_comparison_space_rope_routes_on_relative_position() -> None:
-    """Item 25 (F28): under rope_space='comparison' the routing cost depends on positions only via i - j."""
+    """Item 25 (F28): under rope_mode='comparison' the routing cost depends on positions only via i - j."""
     import vfe3.gradients.relational as rel
 
     cfg = _rope_cfg("comparison")
@@ -553,11 +553,10 @@ def test_comparison_space_rope_routes_on_relative_position() -> None:
 
 def test_comparison_space_rope_trains_a_tiny_step_and_refuses_unsupported_routes() -> None:
     _loss_and_grads({**_minimal_agent(predictive_readout="kernel", block_mlp_mode="coordinate",
-                                      pos_rotation="rope", rope_on_value=False, rope_space="comparison")})
-    for bad in ({"predictive_readout": "minimal_agent", "block_mlp_mode": "prototype_agents", "rope_on_value": True},
-                {"predictive_readout": "kernel", "block_mlp_mode": "coordinate", "rope_on_value": True}):
-        with pytest.raises(ValueError, match="rope_space='comparison'"):
-            _cfg(_minimal_agent(pos_rotation="rope", rope_space="comparison", **bad))
+                                      rope_mode="comparison")})
+    with pytest.raises(ValueError, match="rope_mode='comparison'"):
+        _cfg(_minimal_agent(predictive_readout="kernel", block_mlp_mode="coordinate", rope_mode="comparison",
+                            attention_mode="projected_gradient", attention_residual=False))
 
 
 @pytest.mark.parametrize("group_cfg", [
@@ -572,7 +571,7 @@ def test_pullback_group_frame_step_reaches_every_registered_group(group_cfg) -> 
 
     values = dict(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1, pos_phi="none",
                   m_phi_update_mode="pullback_group", m_phi_group_retraction="chart",
-                  transport_chart_max_norm=6.0, m_phi_lr=0.1, pos_rotation="none")
+                  transport_chart_max_norm=6.0, m_phi_lr=0.1, rope_mode="none")
     values.update(group_cfg)
     cfg = _cfg(values)
     torch.manual_seed(0)

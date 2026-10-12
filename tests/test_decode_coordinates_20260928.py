@@ -345,7 +345,7 @@ def test_functional_stack_is_covariant_under_block_frame_changes(decode: str) ->
 @pytest.mark.parametrize("over, message", [
     (dict(attention_mode="transported", attention_residual=False,
           decode_mode="diagonal_chunked"), "transported"),
-    (dict(pos_rotation="rope"), "pos_rotation"),
+    (dict(rope_mode="frame_value"), "rope_mode"),
     (dict(family="gaussian_frame_diagonal", decode_mode="diagonal_chunked"), "gaussian_frame_diagonal"),
     (dict(decode_mode="expected_likelihood_chunked"), "decode_mode"),
 ])

@@ -401,14 +401,12 @@ def test_affine_inverse_measurement_is_certified() -> None:
 def _invariant_config(**overrides: Any) -> Any:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        return tiny_config(embed_dim=8, pos_rotation="rope", rope_space="comparison", rope_on_value=False,
-                           rope_comparison_covariance="rotation_invariant", **overrides)
+        return tiny_config(embed_dim=8, rope_mode="comparison_invariant", **overrides)
 
 
 def test_rotation_invariant_with_every_coordinate_rotating_warns_once(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config_module, "_DIAGONAL_COMPARISON_WARNED", set())
-    values = dict(embed_dim=128, n_heads=4, max_seq_len=128, rope_base=10000.0, pos_rotation="rope",
-                  rope_space="comparison", rope_on_value=False, rope_comparison_covariance="rotation_invariant")
+    values = dict(embed_dim=128, n_heads=4, max_seq_len=128, rope_base=10000.0, rope_mode="comparison_invariant")
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         tiny_config(**values)

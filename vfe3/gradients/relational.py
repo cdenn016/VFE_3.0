@@ -56,7 +56,7 @@ def relational_score(
     Gaussian KL then computes its query log-determinant without autograd (``query_row_constant_grad``
     of :func:`vfe3.relational_scoring.projected_gaussian_kl`); the returned values are unchanged.
 
-    Under comparison-space RoPE with ``operators.rope_comparison_covariance == 'rotation_invariant'`` each
+    Under ``rope_mode='comparison_invariant'`` (``operators.rope_comparison_covariance == 'rotation_invariant'``) each
     comparison covariance is replaced by its projection :math:`P(G)` onto the commutant of the RoPE torus
     (:func:`vfe3.geometry.rope.rope_commutant_projection`) before the rotation, so the trace and log-determinant
     terms are position-free and only the mean term reads :math:`j - i`. The capture then records
@@ -155,7 +155,7 @@ def relational_score(
         projection_q = (sigma_h, inverse, S_q, mu_h)
         projection_k = (source_sigma_h, key_inverse, S_k, source_mu_h)
         if rope_base is not None:
-            # rope_space='comparison' (audit 2026-10-07, F28): rotate token i's projected moments by R_i in the
+            # comparison rope_mode (audit 2026-10-07, F28): rotate token i's projected moments by R_i in the
             # r-dimensional comparison space, a -> R_i a, G -> R_i G R_i^T, for query and key alike. A Gaussian KL
             # (and the noisy-query and mean-distance costs) is invariant under a common orthogonal map, so the
             # pair (i, j) cost equals the cost of (a_i, G_i) against (R_{j-i} b_j, R_{j-i} G_j R_{j-i}^T): a function
@@ -289,7 +289,7 @@ def relational_predictive_readout(
                 and torch.equal(value_frame.forward, frame.forward)
                 and torch.equal(value_frame.inverse, frame.inverse)):
             raise ValueError("predictive_readout='minimal_agent' reads key and content in one frame; the value frame "
-                             "differs from the routing frame (pos_rotation='rope' with rope_on_value=False)")
+                             "differs from the routing frame (rope_mode='frame')")
         mean, sigma_plus = operators.minimal_agent_update(
             mu, sigma, frame, log_prior, return_covariance=return_covariance, capture=capture,
             floor_anchor=floor_anchor)

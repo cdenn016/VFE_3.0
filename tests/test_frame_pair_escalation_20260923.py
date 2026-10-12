@@ -340,11 +340,11 @@ _ROUTES: Dict[str, Callable[[], VFE3Config]] = {
                                            attention_residual=True),
     # RoPE folded into a CanonicalFrameContext: the float32 rotation must meet the float64 pair
     # re-orthogonalized, or the float64 contract rejects the folded frame (review of #12).
-    "launcher_rope": lambda: _launcher(pos_rotation="rope"),            # rope_on_value=False
-    "launcher_rope_on_value": lambda: _launcher(pos_rotation="rope", rope_on_value=True),
+    "launcher_rope": lambda: _launcher(rope_mode="frame"),
+    "launcher_rope_on_value": lambda: _launcher(rope_mode="frame_value"),
     "projected_predictive_rope": _tiny(attention_mode="projected_predictive",
 
-                                       pos_rotation="rope"),
+                                       rope_mode="frame_value"),
     # Intrinsic frame of a RoPE'd frame-diagonal state: built from R, never through U (review r2).
 }
 

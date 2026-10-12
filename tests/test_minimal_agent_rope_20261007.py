@@ -106,7 +106,7 @@ def test_config_accepts_comparison_rope_on_the_minimal_agent() -> None:
     from vfe3.model.model import VFEModel
 
     for inference in ("exact", "mean_field"):
-        cfg = _cfg(_minimal_agent(pos_rotation="rope", rope_space="comparison", rope_on_value=False,
+        cfg = _cfg(_minimal_agent(rope_mode="comparison",
                                   minimal_agent_inference=inference))
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -117,7 +117,5 @@ def test_config_accepts_comparison_rope_on_the_minimal_agent() -> None:
         loss.backward()
         assert torch.isfinite(loss)
         assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
-    with pytest.raises(ValueError, match="rope_on_value"):
-        _cfg(_minimal_agent(pos_rotation="rope", rope_space="frame", rope_on_value=False))
-    with pytest.raises(ValueError, match="rope_on_value"):
-        _cfg(_minimal_agent(pos_rotation="rope", rope_space="comparison", rope_on_value=True))
+    with pytest.raises(ValueError, match="rope_mode='frame'"):
+        _cfg(_minimal_agent(rope_mode="frame"))

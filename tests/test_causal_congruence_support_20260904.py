@@ -27,7 +27,7 @@ def test_tiny_full_gaussian_forward_backward_and_logger(
         n_layers=1, n_e_steps=1, family="gaussian_full", gauge_group="block_glk",
         encode_mode="per_token", decode_mode="full_chunked",
         beta_attention_prior="causal_alibi_noself",
-        pos_phi="learned", pos_rotation="none",
+        pos_phi="learned", rope_mode="none",
         full_cov_kl_precision="fp32_escalate",
     )
     model = VFEModel(cfg).to(device)

@@ -230,7 +230,7 @@ def test_projected_diagnostics_do_not_report_a_transported_shared_objective(
     torch.manual_seed(5)
     cfg = _tiny(vocab_size=12, max_seq_len=4, e_q_mu_lr=1.0, mu_init_std=0.5, pos_phi="none",
                 sigma_init=1.0, phi_scale=0.01, lambda_alpha_mode="constant",
-                pos_rotation="none", **overrides)
+                rope_mode="none", **overrides)
     model = VFEModel(cfg).eval()
     tokens = torch.tensor([[0, 5, 2, 9]])
     snapshot = model.build_diagnostic_snapshot(tokens)

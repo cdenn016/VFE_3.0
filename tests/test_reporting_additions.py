@@ -291,7 +291,7 @@ def _pure_ns(**over):
         lambda_alpha_mode="constant",
         decode_mode="diagonal_chunked", decode_coordinates="reference", encode_mode="per_token",
         lambda_beta=1.0,
-        gauge_transport="on", pos_rotation="none", rope_on_value=True,
+        gauge_transport="on", rope_mode="none",
         skip_belief_sigma_update=False,
         gauge_group="block_glk", family="gaussian_full",
         attention_mode="projected_gradient",
@@ -347,11 +347,11 @@ def test_gauge_purity_axis_is_independent_of_fe_axis():
     assert rep["on_pure_path"] is False and rep["on_gauge_pure_path"] is False
     assert rep["gauge_flags"]["learned_gauge_transport"] is False
     # Right-folded RoPE (U_i R_i^T) is covariant on the projected routes (audit 2026-10-01 F11).
-    rep2 = _pure_path_report(_pure_ns(pos_rotation="rope"), history)
+    rep2 = _pure_path_report(_pure_ns(rope_mode="frame_value"), history)
     assert rep2["on_pure_path"] is False
     assert rep2["gauge_flags"]["positional_rotation_gauge_covariant"] is True
     # the gauge settings are surfaced in config_toggles for transparency
-    for key in ("gauge_transport", "pos_rotation", "rope_on_value"):
+    for key in ("gauge_transport", "rope_mode"):
         assert key in rep["config_toggles"]
 
 
@@ -379,7 +379,7 @@ def _finalize_ns(**over):
         min_lr_frac=0.0,
         lambda_alpha_mode="constant",
         lambda_beta=1.0,
-        gauge_transport="on", pos_rotation="none", rope_on_value=True,
+        gauge_transport="on", rope_mode="none",
         skip_belief_sigma_update=False,
         embed_dim=4, n_heads=2, n_layers=1, n_e_steps=1, diagonal_covariance=True,
         gauge_group="block_glk", family="gaussian_full",

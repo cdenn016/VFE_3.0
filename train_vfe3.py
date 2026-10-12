@@ -232,15 +232,12 @@ config = dict(
     ####################################
     #       Positional Encoding
     #    BCH gauge-frame PE (pos_phi)
-    #     gauge-RoPE (pos_rotation)
+    #     gauge-RoPE (rope_mode)
     ####################################
 
     pos_phi                          = "learned",           # "none" | "learned" | "frozen"
-    pos_rotation                     = "none",              # "none" | "rope"
+    rope_mode                        = "none",              # "none" | "frame" | "frame_value" | "comparison" | "comparison_invariant"
          
-    rope_on_value                    = False,
-    rope_space                       = "frame",       # "frame" (folded into U_i, absolute) | "comparison" (relative, kernel readout only)
-    rope_comparison_covariance       = "full",     # "full" | "rotation_invariant" (comparison RoPE: project G onto the rotation commutant; prevents self-lock)
     rope_fraction                    = 1.0,       # p-RoPE: fraction of each head's pairs rotated (fastest first); 1.0 = RoPE
 
     ######################################

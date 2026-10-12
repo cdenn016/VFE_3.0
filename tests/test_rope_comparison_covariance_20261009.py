@@ -1,10 +1,10 @@
 r"""Rotation-invariant comparison covariance under comparison-space RoPE (audit 2026-10-09 round 2, addendum).
 
-Under ``rope_space='comparison'`` token i's projected moments are rotated, a -> R_i a and G -> R_i G R_i^T,
+Under ``rope_mode='comparison'`` token i's projected moments are rotated, a -> R_i a and G -> R_i G R_i^T,
 so the pair cost is KL(N(a_q, G_q) || N(R_{j-i} a_k, R_{j-i} G_k R_{j-i}^T)). The trace and log-determinant
 terms then penalize every non-self pair in proportion to the anisotropy of the comparison covariance, and the
 self pair, compared without a relative rotation, wins (the layer-1 self-lock). With
-``rope_comparison_covariance='rotation_invariant'`` each comparison covariance is projected onto the commutant
+``rope_mode='comparison_invariant'`` each comparison covariance is projected onto the commutant
 of the RoPE torus,
 
 .. math::
@@ -165,13 +165,12 @@ def test_rotation_invariant_cost_is_relative_for_distinct_beliefs() -> None:
 # ------------------------------------------------------------------------------------- (c) default off, (d) gradients
 
 def test_full_option_is_the_default_and_matches_the_as_run_rotation() -> None:
-    cfg = tiny_config(embed_dim=8, pos_rotation="rope", rope_space="comparison", rope_on_value=False)
-    assert cfg.rope_comparison_covariance == "full"
+    cfg = tiny_config(embed_dim=8, rope_mode="comparison")
+    assert cfg.rope_mode == "comparison"
     model = VFEModel(cfg)
     for ops in model.relational_operators_by_layer:
         assert ops.rope_comparison_covariance == "full"
-    on = VFEModel(tiny_config(embed_dim=8, pos_rotation="rope", rope_space="comparison", rope_on_value=False,
-                              rope_comparison_covariance="rotation_invariant"))
+    on = VFEModel(tiny_config(embed_dim=8, rope_mode="comparison_invariant"))
     assert sorted(on.state_dict()) == sorted(model.state_dict())                     # no new parameter
 
 
@@ -191,8 +190,7 @@ def test_rotation_invariant_gradcheck() -> None:
 
 def test_rotation_invariant_model_trains() -> None:
     torch.manual_seed(0)
-    cfg = tiny_config(embed_dim=8, n_layers=2, pos_rotation="rope", rope_space="comparison", rope_on_value=False,
-                      rope_comparison_covariance="rotation_invariant")
+    cfg = tiny_config(embed_dim=8, n_layers=2, rope_mode="comparison_invariant")
     model = VFEModel(cfg)
     _, logits = model.forward_beliefs(torch.tensor([[0, 1, 2]]), return_logits=True)
     logits.square().sum().backward()
@@ -202,22 +200,15 @@ def test_rotation_invariant_model_trains() -> None:
 
 # ------------------------------------------------------------------------------------- configuration
 
-def test_option_is_inactive_without_comparison_rope_and_validated() -> None:
-    assert "rope_comparison_covariance" in tiny_config().inactive_fields()
-    assert "rope_comparison_covariance" in tiny_config(
-        pos_rotation="rope", rope_space="frame", rope_on_value=True).inactive_fields()
-    on = tiny_config(embed_dim=8, pos_rotation="rope", rope_space="comparison", rope_on_value=False,
-                     rope_comparison_covariance="rotation_invariant")
-    inactive = on.inactive_fields()
-    assert "rope_comparison_covariance" not in inactive
-    with pytest.raises(ValueError, match="rope_comparison_covariance"):
-        tiny_config(rope_comparison_covariance="isotropic")
-    with pytest.raises(ValueError, match="rope_comparison_covariance"):
+def test_option_is_validated_and_refused_on_the_minimal_agent() -> None:
+    assert "rope_mode" not in tiny_config(embed_dim=8, rope_mode="comparison_invariant").inactive_fields()
+    with pytest.raises(ValueError, match="rope_mode"):
+        tiny_config(rope_mode="isotropic")
+    with pytest.raises(ValueError, match="comparison_invariant"):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            tiny_config(embed_dim=8, pos_rotation="rope", rope_space="comparison", rope_on_value=False,
-                        predictive_readout="minimal_agent", attention_residual=False,
-                        rope_comparison_covariance="rotation_invariant")
+            tiny_config(embed_dim=8, rope_mode="comparison_invariant",
+                        predictive_readout="minimal_agent", attention_residual=False)
 
 
 # ------------------------------------------------------------------------------------- item 6: the tie under comparison RoPE

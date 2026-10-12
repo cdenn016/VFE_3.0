@@ -67,12 +67,9 @@ _CONFIG_VALUES: dict[str, Any] = {
     'pos_phi': 'learned',
     'bch_residual_max': None,
     'pos_phi_project_slk': False,
-    'pos_rotation': 'none',
+    'rope_mode': 'none',
     'rope_base': 100.0,
     'rope_fraction': 1.0,
-    'rope_space': 'frame',
-    'rope_comparison_covariance': 'full',
-    'rope_on_value': True,
     'attention_mode': 'projected_gradient',
     'attention_residual': False,
     'relational_output_init': 'identity',
@@ -231,7 +228,8 @@ def make_relational_operators(*args: Any, **overrides: Any) -> Any:
     ``attention_residual``, ``predictive_covariance``, ``receiver_law``, ``receiver_update``,
     ``content_link_chart``, ``minimal_agent_inference``, ``kl_max_reference`` and
     ``rope_comparison_covariance`` have no constructor default; explicit keyword arguments override the
-    baseline values.
+    baseline values (the comparison covariance is ``"full"``, the operator spelling of every rope_mode but
+    ``"comparison_invariant"``).
     """
     from vfe3.model.relational_operators import RelationalOperators
     values = _CONFIG_VALUES
@@ -242,5 +240,5 @@ def make_relational_operators(*args: Any, **overrides: Any) -> Any:
                     content_link_chart=values['content_link_chart'],
                     minimal_agent_inference=values['minimal_agent_inference'],
                     kl_max_reference=values['routing_kl_max_reference'],
-                    rope_comparison_covariance=values['rope_comparison_covariance'])
+                    rope_comparison_covariance='full')
     return RelationalOperators(*args, **{**baseline, **overrides})

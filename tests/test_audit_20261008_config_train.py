@@ -52,8 +52,7 @@ def _cfg(**overrides: Any) -> VFE3Config:
 
 
 def _rope(**overrides: Any) -> VFE3Config:
-    return _cfg(pos_rotation="rope", rope_space="comparison", rope_on_value=False, rope_base=100.0,
-                **overrides)
+    return _cfg(rope_mode="comparison", rope_base=100.0, **overrides)
 
 
 def _loaders(cfg: VFE3Config) -> Tuple[DataLoader, DataLoader, DataLoader]:
@@ -168,9 +167,9 @@ def test_package_identity_covers_the_baseline_and_paper_arm_launchers(monkeypatc
 def test_pure_path_report_labels_comparison_rope_and_records_its_settings() -> None:
     toggles = ra._pure_path_report(_rope(rope_fraction=1), [])["config_toggles"]
     assert toggles["rope_pair_energy_exactness"] == "comparison_space_rotated_projected_moments"
-    assert (toggles["rope_space"], toggles["rope_fraction"], toggles["rope_base"]) == ("comparison", 1.0, 100.0)
+    assert (toggles["rope_mode"], toggles["rope_fraction"], toggles["rope_base"]) == ("comparison", 1.0, 100.0)
     plain = ra._pure_path_report(_cfg(), [])["config_toggles"]
-    assert plain["rope_pair_energy_exactness"] == "not_applicable" and plain["rope_space"] is None
+    assert plain["rope_pair_energy_exactness"] == "not_applicable" and plain["rope_mode"] == "none"
 
 
 def test_git_probe_carries_the_system_line_ending_policy(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -113,9 +113,8 @@ def test_act_on_frame_refuses_a_dense_element_with_off_block_entries() -> None:
 
 def _rope_model(**overrides: object) -> VFEModel:
     torch.manual_seed(4)
-    cfg = test_config(vocab_size=11, embed_dim=4, n_heads=2, max_seq_len=6, n_layers=2,
-                      attention_mode="projected_predictive", pos_rotation="rope", rope_space="comparison",
-                      rope_on_value=False, **overrides)
+    cfg = test_config(**{"vocab_size": 11, "embed_dim": 4, "n_heads": 2, "max_seq_len": 6, "n_layers": 2,
+                         "attention_mode": "projected_predictive", "rope_mode": "comparison", **overrides})
     return VFEModel(cfg)
 
 
@@ -129,7 +128,7 @@ def _ce(model: VFEModel, tokens: torch.Tensor, targets: torch.Tensor) -> float:
 def test_no_rope_arm_keeps_the_commutant_projection(monkeypatch: pytest.MonkeyPatch) -> None:
     import vfe3.geometry.rope as rope_module
 
-    model = _rope_model(rope_comparison_covariance="rotation_invariant")
+    model = _rope_model(rope_mode="comparison_invariant")
     tokens, targets = torch.tensor([[0, 1, 2, 3, 4, 5]]), torch.tensor([[1, 2, 3, 4, 5, 6]])
     channel = ra.collect_beta_channel_decomposition(model, tokens, targets)
     operators = model.relational_operators_by_layer
@@ -156,15 +155,15 @@ def test_pure_path_rope_label_and_recorded_covariance_mode() -> None:
     def toggles(**overrides: object) -> Dict[str, object]:
         return ra._pure_path_report(_rope_model(**overrides).cfg, [])["config_toggles"]
 
-    invariant = toggles(rope_comparison_covariance="rotation_invariant")
+    invariant = toggles(rope_mode="comparison_invariant")
     assert invariant["rope_pair_energy_exactness"] == (
         "comparison_space_rotated_means_commutant_projected_covariance")
-    assert invariant["rope_comparison_covariance"] == "rotation_invariant"
-    full = toggles(rope_comparison_covariance="full")
+    assert invariant["rope_mode"] == "comparison_invariant"
+    full = toggles(rope_mode="comparison")
     assert full["rope_pair_energy_exactness"] == "comparison_space_rotated_projected_moments"
-    assert full["rope_comparison_covariance"] == "full"
+    assert full["rope_mode"] == "comparison"
     plain = ra._pure_path_report(tiny_config(), [])["config_toggles"]
-    assert plain["rope_comparison_covariance"] is None
+    assert plain["rope_mode"] == "none"
 
 
 # ------------------------------------------------------------------------------------- item 17
@@ -354,7 +353,7 @@ def test_frames_identity_rule_is_shared(tmp_path: Path) -> None:
     from vfe3.model.frame_actions import frames_identity_reason
     from vfe3.posthoc import interventions as iv
 
-    base = dict(gauge_transport="on", phi_scale=0.01, m_phi_lr=0.01, pos_phi="none", pos_rotation="none")
+    base = dict(gauge_transport="on", phi_scale=0.01, m_phi_lr=0.01, pos_phi="none", rope_mode="none")
     assert frames_identity_reason(SimpleNamespace(**base), 8) is None
     assert "gauge_transport='off'" in frames_identity_reason(SimpleNamespace(**{**base, "gauge_transport": "off"}), 8)
     assert "no generators" in frames_identity_reason(SimpleNamespace(**base), 0)

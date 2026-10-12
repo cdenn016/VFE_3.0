@@ -31,9 +31,9 @@ def test_per_unit_eval_nats_shapes_and_token_count():
 
 
 def test_numerical_health_under_rope_does_not_raise():
-    # m5: numerical_health used RopeTransport without importing it -> NameError under pos_rotation='rope',
+    # m5: numerical_health used RopeTransport without importing it -> NameError under frame-space RoPE,
     # which report.py's _safe silently swallowed (blank health panel). Assert it returns the dict instead.
-    model = _model(n_layers=1, pos_rotation="rope")
+    model = _model(n_layers=1, rope_mode="frame_value")
     tok = torch.randint(0, 20, (1, 5))
     health = numerical_health(model, tok)
     for k in ("nan_mu", "nan_sigma", "nan_phi", "nan_energy", "nan_beta", "max_condition"):

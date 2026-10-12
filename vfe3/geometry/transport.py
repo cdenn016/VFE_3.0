@@ -152,7 +152,7 @@ class RopeTransport:
     Omega^RoPE_ij = R(theta_i) Omega_ij R(theta_j)^T, is kept only so the regression tests can
     reproduce its absolute-position and gauge-breaking defect; no configuration selects it, and its
     ``score_operator`` is None. Whether the value path rotates is decided by the model
-    (``rope_on_value``), not by this wrapper.
+    (``rope_mode`` ``'frame'`` versus ``'frame_value'``), not by this wrapper.
     """
 
     base:                    'torch.Tensor | FactoredTransport | CompactFactoredTransport'

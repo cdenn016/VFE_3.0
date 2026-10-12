@@ -410,7 +410,7 @@ class RelationalOperators(nn.Module):
         super().__init__()
         self.kl_max_reference = kl_max_reference      # "absolute" | "row_min" kernel-router clamp reference
         self.pair_kl_gemm_tol = pair_kl_gemm_tol      # None, or the opt-in pair-KL GEMM fallback tolerance (nats)
-        # rope_space='comparison': the RoPE frequency base of the rotation applied to each head's projected
+        # comparison rope_mode: the RoPE frequency base of the rotation applied to each head's projected
         # routing moments after the learned maps (relational_score); None leaves routing un-rotated here.
         self.comparison_rope_base = None if comparison_rope_base is None else float(comparison_rope_base)
         self.comparison_rope_fraction = float(comparison_rope_fraction)              # p-RoPE fraction
@@ -947,7 +947,7 @@ class RelationalOperators(nn.Module):
             C = self._reference_covariance(sigma, frame, dtype, diagonal=sigma.dim() == mu.dim())
             rope = None
             if self.comparison_rope_base is not None:
-                # rope_space='comparison': the record of a source at offset j - i arrives through R_{j-i}.
+                # comparison rope_mode: the record of a source at offset j - i arrives through R_{j-i}.
                 rope = self.comparison_rope_rotation(xi.shape[-2], S.shape[1], xi.device, dtype)  # (N, d, d)
             result = minimal_agent.minimal_agent_readout(
                 xi, C, S, T, log_noise, log_prior, self.minimal_agent_inference, diagnostics=diagnostics,
@@ -1366,7 +1366,7 @@ class RelationalOperators(nn.Module):
         device: torch.device,
         dtype:  torch.dtype,
     ) -> torch.Tensor:                 # (N, r, r) R_i, positions 0..N-1
-        r"""Cached comparison-space RoPE rotation :math:`R_i` under ``rope_space='comparison'``.
+        r"""Cached comparison-space RoPE rotation :math:`R_i` under a comparison ``rope_mode``.
 
         The rotation is a constant of (N, r, base, fraction, device, dtype) with no graph, so one build
         serves every layer and forward. A build under ``torch.inference_mode`` is not cached, since an

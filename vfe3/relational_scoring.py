@@ -850,7 +850,7 @@ def _strict_cholesky(
     working-dtype retry takes the float64 recovery for the whole call.
 
     ``commutant_pairs`` declares that G is the projection :math:`P(XX^\top)` of the source covariance onto the
-    commutant of the RoPE torus with that many rotating planes (``rope_comparison_covariance='rotation_invariant'``,
+    commutant of the RoPE torus with that many rotating planes (``rope_mode='comparison_invariant'``,
     where the source tuple carries the rotated map :math:`R_iS`). A rebuilt entry then factors
     :math:`P(XX^\top)` from the source root (:func:`_commutant_root_factor`), in float64 or by shifted CholeskyQR3
     as above, instead of :math:`XX^\top` (audit 2026-10-10 round 2, item 12). The factor route never runs with it.
@@ -1035,7 +1035,7 @@ def projected_gaussian_kl(
     factorization; the values and recovery decisions are those of two factorizations.
 
     ``commutant_pairs`` declares that G_q and G_k are RoPE-commutant projections :math:`P(XX^\top)` of the
-    source covariances with that many rotating planes (``rope_comparison_covariance='rotation_invariant'``; the
+    source covariances with that many rotating planes (``rope_mode='comparison_invariant'``; the
     source tuples then carry the rotated maps :math:`R_iS`). Recovery rebuilds :math:`P(XX^\top)` from the
     source (:func:`_strict_cholesky`) and the factor route, which factors :math:`XX^\top`, is not taken.
 
@@ -1375,7 +1375,7 @@ def _projected_diagonal_kl(
     which is the dense Gaussian KL of the diagonal matrices exactly. No Gram, Cholesky factorization or
     :math:`r^2 + r` GEMM runs: the pair grid is one GEMM of inner dimension :math:`2r` per (batch, head)
     (:func:`_diagonal_kl_expansion`), forward and backward at IEEE fp32 through :class:`_IEEEFP32Recompute`, and
-    no (..., H, Nq, Nk, r) tensor is formed. This is the route of ``rope_comparison_covariance='rotation_invariant'``
+    no (..., H, Nq, Nk, r) tensor is formed. This is the route of ``rope_mode='comparison_invariant'``
     whenever every comparison coordinate but at most one rotates (audit 2026-10-10 round 2, item 30).
 
     The diagonal analogue of the zero-jitter positivity certificate is that every variance is finite and positive;

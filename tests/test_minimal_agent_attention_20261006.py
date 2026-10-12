@@ -841,9 +841,9 @@ def test_config_validation_and_inactive_fields() -> None:
             test_config(**_AGENT, minimal_agent_channel_noise=bad)
     with pytest.raises(ValueError, match="content_link_edges"):
         test_config(**_AGENT, content_link_chart="exponential", content_link_edges="lowrank", content_link_edge_rank=2)
-    with pytest.raises(ValueError, match="rope_on_value"):
-        test_config(**_AGENT, pos_rotation="rope", rope_on_value=False)
-    test_config(**_AGENT, pos_rotation="rope", rope_on_value=True)  # one frame for key and content: accepted
+    with pytest.raises(ValueError, match="rope_mode='frame'"):
+        test_config(**_AGENT, rope_mode="frame")
+    test_config(**_AGENT, rope_mode="frame_value")  # one frame for key and content: accepted
     with pytest.raises(ValueError, match="equal heads"):
         test_config(**_AGENT, gauge_group="so_n", group_n=3, irrep_spec=[("l1", 2), ("l2", 1)], embed_dim=11,
                     n_heads=3)

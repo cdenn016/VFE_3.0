@@ -6,6 +6,7 @@ config as the current spelling, fingerprint identically after migration (so fini
 stay current), and keep a finished scaling cell harvestable.
 """
 import json
+import warnings
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,7 @@ import pytest
 
 import ablation
 import scaling_analysis as sa
-from tests.profiles import test_config
+from tests.profiles import test_config, tiny_config
 from tests.test_audit_20261008_stats import _write_scaling_run
 from vfe3.artifact_utils import canonical_json_sha256
 from vfe3.config import VFE3Config, config_from_serialized, serialize_config
@@ -166,4 +167,63 @@ def test_inert_tolerances_load_and_live_off_default_tolerances_are_refused() -> 
 def test_old_and_new_factorization_selectors_conflict() -> None:
     payload = {**serialize_config(test_config()), "projected_factor_route": "gram"}
     with pytest.raises(ValueError, match="conflicting projected-factorization"):
+        config_from_serialized(payload, source="test")
+
+
+# =============================================================================
+# C8: pos_rotation, rope_space, rope_on_value and rope_comparison_covariance merge into rope_mode
+# =============================================================================
+
+_ROPE_FIELDS = ("rope_mode",)
+
+
+def _rope_config(mode: str) -> VFE3Config:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")                    # comparison_invariant at head size 2: P(G) diagonal
+        return tiny_config(rope_mode=mode)
+
+
+# Every combination the old validator admitted, each mapped to exactly one mode.
+@pytest.mark.parametrize(("rotation", "space", "on_value", "covariance", "mode"), [
+    ("none", "frame", True, "full", "none"),
+    ("none", "comparison", False, "rotation_invariant", "none"),
+    ("rope", "frame", False, "full", "frame"),
+    ("rope", "frame", False, "rotation_invariant", "frame"),
+    ("rope", "frame", True, "full", "frame_value"),
+    ("rope", "frame", True, "rotation_invariant", "frame_value"),
+    ("rope", "comparison", False, "full", "comparison"),
+    ("rope", "comparison", False, "rotation_invariant", "comparison_invariant"),
+])
+def test_rope_combinations_migrate(
+    rotation: str, space: str, on_value: bool, covariance: str, mode: str, tmp_path: Path,
+) -> None:
+    expected = _rope_config(mode)
+    payload = _old_payload(expected, _ROPE_FIELDS, pos_rotation=rotation, rope_space=space,
+                           rope_on_value=on_value, rope_comparison_covariance=covariance)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        _assert_migrates(payload, expected, tmp_path)
+
+
+def test_a_rope_record_predating_rope_space_migrates_as_frame_space(tmp_path: Path) -> None:
+    expected = _rope_config("frame")
+    payload = _old_payload(expected, _ROPE_FIELDS, pos_rotation="rope", rope_on_value=False)
+    _assert_migrates(payload, expected, tmp_path)
+
+
+def test_rope_scaling_cell_survives(tmp_path: Path) -> None:
+    _assert_scaling_cell_survives(tmp_path, {}, _ROPE_FIELDS, pos_rotation="none", rope_space="frame",
+                                  rope_on_value=True, rope_comparison_covariance="full")
+
+
+def test_comparison_rope_on_the_value_frame_stays_refused() -> None:
+    payload = _old_payload(_rope_config("none"), _ROPE_FIELDS, pos_rotation="rope", rope_space="comparison",
+                           rope_on_value=True, rope_comparison_covariance="full")
+    with pytest.raises(ValueError, match="retired rope_on_value=True"):
+        config_from_serialized(payload, source="test")
+
+
+def test_old_and_new_rope_selectors_conflict() -> None:
+    payload = {**serialize_config(test_config()), "pos_rotation": "none"}
+    with pytest.raises(ValueError, match="conflicting RoPE selectors"):
         config_from_serialized(payload, source="test")

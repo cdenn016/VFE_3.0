@@ -42,7 +42,7 @@ def _rope_model() -> VFEModel:
         n_e_steps=2,
         e_q_mu_lr=0.2,
         e_q_sigma_lr=0.1,
-        pos_rotation="rope",
+        rope_mode="frame_value",
     )
     torch.manual_seed(23)
     model = VFEModel(cfg).to(DEVICE)
@@ -198,7 +198,7 @@ def test_projected_readout_state_matches_production_snapshot() -> None:
 
 def test_projected_rope_unrolled_replay_matches_production_snapshot() -> None:
     """Gauge-RoPE readout state of an independent forward equals the supplied snapshot's."""
-    model, tokens, snapshot = _projected_parity_case(pos_rotation="rope", use_block_mlp=False)
+    model, tokens, snapshot = _projected_parity_case(rope_mode="frame_value", use_block_mlp=False)
     assert snapshot.rope is not None
     replay = extract.readout_state(model, tokens)
     production = extract.readout_state(model, tokens, snapshot=snapshot)
@@ -209,7 +209,7 @@ def test_projected_rope_unrolled_replay_matches_production_snapshot() -> None:
     ("overrides", "expected_shared_builds"),
     [
         pytest.param({}, 1, id="flat-fixed-no-rope"),
-        pytest.param({"pos_rotation": "rope"}, 1, id="rope"),
+        pytest.param({"rope_mode": "frame_value"}, 1, id="rope"),
     ],
 )
 def test_refine_transport_sharing_is_derived_from_exact_eligibility(

@@ -408,13 +408,12 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     ####################################
     #       Positional Encoding
     #    BCH gauge-frame PE (pos_phi)
-    #     gauge-RoPE (pos_rotation)
+    #     gauge-RoPE (rope_mode)
     ####################################
 
     pos_phi                          = "learned",           # "none" | "learned" | "frozen"
-    pos_rotation                     = "none",              # "none" | "rope"
+    rope_mode                        = "none",              # "none" | "frame" | "frame_value" | "comparison" | "comparison_invariant"
          
-    rope_on_value                    = False,
 
     ######################################
     #                Self Energy:
@@ -814,7 +813,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "param": "rope_base", 
         "values": [25, 75, 100, 150, 250, 1000],
         "scale": "log",
-        "requires": {"pos_rotation": "rope"},
+        "requires": {"rope_mode": "frame"},
     },    
     
     
@@ -1012,7 +1011,7 @@ _ATTENTION_REQUIRES = {
     "family": "gaussian_diagonal",
     "n_layers": 1, "n_e_steps": 1, "skip_belief_sigma_update": True,
     "gauge_group": "block_glk",
-    "gauge_transport": "on", "pos_rotation": "none",
+    "gauge_transport": "on", "rope_mode": "none",
     "encode_mode": "per_token", "decode_mode": "linear",
     "attention_mode": "projected_predictive",
     "m_relational_score_lr": None, "m_relational_content_lr": None,

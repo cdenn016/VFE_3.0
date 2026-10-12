@@ -153,15 +153,14 @@ config: Dict[str, Any] = dict(
     ####################################
     #       Positional Encoding
     #    BCH gauge-frame PE (pos_phi)
-    #     gauge-RoPE (pos_rotation)
+    #     gauge-RoPE (rope_mode)
     ####################################
 
     pos_phi                   = "learned",           # "none" (pure path) | "learned" | "frozen"
-    pos_rotation              = "none",              # "none" | "rope"
+    rope_mode                 = "none",              # "none" | "frame" | "frame_value" | "comparison" | "comparison_invariant"
 
     rope_base                 = 100.0,               # rotary frequency base
 
-    rope_on_value             = False,
 
 
     ######################################
