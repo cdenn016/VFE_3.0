@@ -1258,9 +1258,13 @@ def minimal_agent_readout(
     ``label_spread`` :math:`R'^h_i` (:func:`label_spread`, in the record frame, 0 for a head without a record), from
     which :func:`local_posterior_covariance` adds :math:`\sum_hP_iS_h^\top R'^h_iS_hP_i` (module docstring, T2); its
     factorization flags join ``failed``. ``elbo`` also returns, per receiver in float64 and without autograd,
-    :func:`minimal_agent_elbo` at the returned posterior and :func:`minimal_agent_log_evidence` at the ADF moments of
-    the exact path (computed in float64: a mean-field or float32 call reruns that path once in float64 on detached
-    inputs for it; NaN if it fails).
+    :func:`minimal_agent_elbo` at the returned posterior (with the label spread under ``spread_corrected``),
+    ``adf_evidence`` from :func:`minimal_agent_log_evidence` at the ADF moments of the exact path (computed in
+    float64: a mean-field or float32 call reruns that path once in float64 on detached inputs for it; NaN if it
+    fails), ``evidence``, the same value where the receiver's heads are uncoupled and ADF is exact (NaN elsewhere),
+    and ``is_evidence`` from :func:`minimal_agent_importance_evidence` with the returned posterior as proposal
+    (audit 2026-10-12 round 2, item 12 and M1). Under ``diagnostics`` the mean field's
+    ``channel_noise_mstep_boundary`` flags the heads whose M-step optimum sits at the :math:`n\to 0` bracket.
     """
     if inference not in MINIMAL_AGENT_INFERENCE:
         raise ValueError(f"minimal_agent_inference must be one of {MINIMAL_AGENT_INFERENCE}, got {inference!r}")

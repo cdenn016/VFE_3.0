@@ -1537,6 +1537,8 @@ _VAL_RELATIONAL_DIAG_KEYS = (
     "val_relational_receiver_cost_delta", "val_relational_receiver_noise",
     "val_relational_receiver_mean_cost_delta", "val_relational_receiver_covariance_cost_delta",
     "val_relational_receiver_target_distance_ratio",
+    # closed_form_profiled: the root solve's largest residual and floored-slope count (audit 2026-10-12 round 2, M6)
+    "val_relational_receiver_profiled_residual", "val_relational_receiver_profiled_floored_slopes",
 ) + tuple("val_relational_" + key for key in (
     "score_raw_min_singular_value", "score_q_raw_min_singular_value",
     "score_k_raw_min_singular_value", "score_rank_per_head", "content_rank_per_head",

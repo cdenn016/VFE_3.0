@@ -169,3 +169,53 @@ def test_mean_field_label_step_factors_each_covariance_once() -> None:
             minimal_agent.minimal_agent_readout(xi, C, S, T, torch.zeros(H, dtype=torch.float64), None, "mean_field",
                                                 spread_corrected=spread)
         assert count.counts["linalg_cholesky_ex.default"] == 8, spread
+
+
+def test_canonical_router_scores_the_noise_broadened_key_law() -> None:
+    r"""Item 16: under ``noisy_key`` the canonical energies are
+    :math:`\mathrm{KL}(N(\xi_i, C_i)\|N(\xi_j, C_j + n_hI))`, against a dense oracle on random head blocks; without the
+    noise they are unchanged."""
+    from vfe3.free_energy import canonical_routing_rows
+
+    g = torch.Generator().manual_seed(5)
+    B, N, H, d = 1, 4, 2, 2
+    K = H * d
+    mu = torch.randn(B, N, K, generator=g, dtype=torch.float64)
+    sigma = torch.rand(B, N, K, generator=g, dtype=torch.float64) + 0.2
+    frames = torch.eye(K, dtype=torch.float64).expand(B, N, K, K) + 0.1 * torch.randn(B, N, K, K, generator=g,
+                                                                                         dtype=torch.float64)
+    frames = frames * torch.block_diag(torch.ones(d, d), torch.ones(d, d)).double()   # head-block diagonal
+    noise = torch.tensor([0.4, 1.7], dtype=torch.float64)
+    rows = canonical_routing_rows(mu, sigma, frames, None, tau=1.0, irrep_dims=[d, d], key_noise=noise)
+    plain = canonical_routing_rows(mu, sigma, frames, None, tau=1.0, irrep_dims=[d, d])
+    xi = (frames @ mu.unsqueeze(-1)).squeeze(-1)
+    C = frames @ torch.diag_embed(sigma) @ frames.transpose(-1, -2)
+    for h in range(H):
+        s = slice(h * d, (h + 1) * d)
+        for i in range(N):
+            for j in range(N):
+                q = torch.distributions.MultivariateNormal(xi[0, i, s], C[0, i, s, s])
+                k = torch.distributions.MultivariateNormal(xi[0, j, s], C[0, j, s, s] + noise[h] * torch.eye(d,
+                                                           dtype=torch.float64))
+                k0 = torch.distributions.MultivariateNormal(xi[0, j, s], C[0, j, s, s])
+                assert abs(float(rows.energy[0, h, i, j] - torch.distributions.kl_divergence(q, k))) < 1e-12
+                assert abs(float(plain.energy[0, h, i, j] - torch.distributions.kl_divergence(q, k0))) < 1e-12
+    assert bool((rows.energy.diagonal(dim1=-2, dim2=-1) > 0).all())
+
+
+def test_canonical_diagnostic_reads_the_layer_key_noise() -> None:
+    model = _model(n_layers=1, predictive_readout="kernel", relational_routing="noisy_key",
+                   diagnose_canonical_free_energy=True)
+    model.eval()
+    ids = _tokens()
+
+    def input_total() -> float:
+        r"""F at the layer-0 input belief, which the key noise reaches only through the canonical router."""
+        row = model.diagnostics(ids)
+        return row["canonical_total_output"] - row["canonical_total_delta"]
+
+    before = input_total()
+    with torch.no_grad():
+        model.relational_operators_by_layer[0].routing_key_log_noise.add_(1.0)
+    after = input_total()
+    assert math.isfinite(before) and math.isfinite(after) and abs(before - after) > 1e-6

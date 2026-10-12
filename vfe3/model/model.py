@@ -2065,7 +2065,10 @@ class VFEModel(nn.Module):
         is the temperature the layer's router runs at (:math:`\kappa_h\sqrt{d_h}`, learned under
         ``learn_attention_temperature``; 1 under the minimal agent, whose exact posterior has no
         :math:`\kappa_\beta`; audit 2026-10-10 round 2, item 31). :math:`D^h_{ii} = 0` and :math:`B_{ii} = 0`, so
-        :math:`\beta^*` peaks on the diagonal of every row by construction. The self term is the registered
+        :math:`\beta^*` peaks on the diagonal of every row by construction. Under ``relational_routing='noisy_key'``
+        the key laws carry the layer's noise :math:`n_hI`, as its router's do (temperature 1; ``key_noise`` of
+        :func:`vfe3.free_energy.canonical_routing_rows`), so :math:`D^h_{ii} > 0` there (audit 2026-10-12 round 2,
+        item 16). The self term is the registered
         form of the M-step self-coupling (``self_coupling_alpha`` with its :math:`R(\alpha)`, the same
         ``kl_max``) evaluated at the layer's input belief; the M-step term itself reads
         the final block's converged output against its prior, which the output evaluation below matches at the
@@ -2095,12 +2098,16 @@ class VFEModel(nn.Module):
         device = q.mu.device
         fam = get_family(cfg.family)
         lambda_beta = float(cfg.lambda_beta)
+        # noisy_key: the canonical router scores the same noise-broadened key law as the layer's router (its
+        # declared joint at temperature 1; audit 2026-10-12 round 2, item 16).
+        key_log_noise = getattr(ops, "routing_key_log_noise", None)               # (H,) or None
+        key_noise = None if key_log_noise is None else key_log_noise.detach().double().exp()
 
         def evaluate(belief: BeliefState, frame_inverse: torch.Tensor,
                      tau: 'float | torch.Tensor') -> Tuple[Dict[str, float], torch.Tensor]:
             r"""Per-token means of the terms of :math:`F` at ``belief`` and its :math:`\beta^*` (B, H, N, N)."""
             rows = canonical_routing_rows(belief.mu, belief.sigma, frame_inverse, snapshot.log_prior,
-                                          tau=tau, irrep_dims=list(group.irrep_dims))
+                                          tau=tau, irrep_dims=list(group.irrep_dims), key_noise=key_noise)
             self_div = self_divergence_for_alpha(                               # (B, N) or (B, N, K)
                 fam(belief.mu.double(), belief.sigma.double()),
                 fam(mu_p.double(), sigma_p.double()),
@@ -2278,6 +2285,10 @@ class VFEModel(nn.Module):
                 distance_after / distance_before if distance_before > 0 else float("nan"))
             d["relational_receiver_noise"] = float(self.cfg.relational_receiver_noise)
             d["relational_attention_capture"] = "episode_initial"
+            # closed_form_profiled: the root solve's largest residual and its floored-slope count (NaN on the
+            # other receiver updates; audit 2026-10-12 round 2, item 16 and M6).
+            for name in ("relational_receiver_profiled_residual", "relational_receiver_profiled_floored_slopes"):
+                d[name] = float(cap.get(name, float("nan")))
         comparison_runs = ops.comparison_runs()                            # per run (S_Q, S_K); S_K = T if tied
         minima = []
         for role_index, role in enumerate(("q", "k")):

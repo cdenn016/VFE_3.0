@@ -166,3 +166,24 @@ def test_config_validation_and_inactive_marking() -> None:
     with pytest.raises(ValueError, match="gaussian_diagonal"):
         test_config(decode_mode="linear", decode_second_order=True, family="gaussian_full",
                     attention_mode="projected_predictive", predictive_readout="kernel")
+
+
+def test_auto_checkpoint_counts_the_second_order_workspace_twice(monkeypatch: pytest.MonkeyPatch) -> None:
+    r"""The second-order closure keeps the logits and the chunk probabilities, two (B, N, Vc) tensors, so the "auto"
+    estimate is twice the first-order one (audit 2026-10-12 round 2, item 16)."""
+    import vfe3.model.prior_bank as prior_bank
+
+    seen = []
+    original = prior_bank._decode_ce_should_checkpoint
+
+    def spy(mode: str, grad_active: bool, activation_bytes: int) -> bool:
+        seen.append(activation_bytes)
+        return original(mode, grad_active, activation_bytes)
+
+    monkeypatch.setattr(prior_bank, "_decode_ce_should_checkpoint", spy)
+    pb = _bank()
+    pb.decode_ce_checkpoint = "auto"
+    mu, sigma, targets = _inputs()
+    pb.decode_ce_linear_chunked(mu, targets, chunk_size=V)
+    pb.decode_ce_linear_chunked(mu, targets, chunk_size=V, sigma_q=sigma)
+    assert len(seen) == 2 and seen[1] == 2 * seen[0] > 0

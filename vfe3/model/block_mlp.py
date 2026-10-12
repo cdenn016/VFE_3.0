@@ -475,8 +475,8 @@ _SECULAR_ROUNDS = 8
 def _centered_affine_bound(
     gamma: torch.Tensor,                              # (K,) LayerNorm affine weight
 ) -> torch.Tensor:                                    # () lambda_max(Pi Gamma^2 Pi), differentiable in gamma
-    r""":math:`\lambda_{\max}(\Pi\Gamma^2\Pi)`, :math:`\Pi = I - \mathbf 1\mathbf 1^\top/K`, :math:`\Gamma = \operatorname{diag}\gamma`,
-    on the device with no host read.
+    r""":math:`\lambda_{\max}(\Pi\Gamma^2\Pi)`, :math:`\Pi = I - \mathbf 1\mathbf 1^\top/K`,
+    :math:`\Gamma = \operatorname{diag}\gamma`, on the device with no host read.
 
     The nonzero spectrum of :math:`\Pi\Gamma^2\Pi = (\Gamma\Pi)^\top(\Gamma\Pi)` is that of
     :math:`\Gamma\Pi\Gamma = D - \gamma\gamma^\top/K`, :math:`D = \operatorname{diag}d`, :math:`d = \gamma^2`, a rank-one
@@ -540,8 +540,9 @@ def layernorm_trace_cap(
     :math:`K\max_k\gamma_k^2` and, by the test vector :math:`e_k`, at least :math:`(1 - 1/K)` of it, so it tightens that
     cap by at most the factor :math:`K/(K-1)` (audit 2026-10-12 round 2, M3).
     :math:`B` carries its gradient with respect to :math:`\gamma`, so where the cap binds the output
-    :math:`BP/\operatorname{tr}P` differentiates exactly (round 2, item 3). The delta method is valid only while the input variance is small against
-    :math:`s^2`: its first-order term grows as :math:`\Sigma/s^2` and its radial term as :math:`(\Sigma/s^2)^2`, and at
+    :math:`BP/\operatorname{tr}P` differentiates exactly (round 2, item 3). The delta method is valid only while the
+    input variance is small against :math:`s^2`: its first-order term grows as :math:`\Sigma/s^2` and its radial term
+    as :math:`(\Sigma/s^2)^2`, and at
     :math:`\Sigma/s^2 \approx 4\cdot 10^3` it gave a trace of :math:`7\cdot 10^6` against the Monte Carlo value
     :math:`K = 20`, reaching NaN by the third layer (audit 2026-10-12, item 1). Scaling the pushforward :math:`P` by
     :math:`\lambda` keeps it positive semidefinite, leaves it unchanged wherever its trace is within the bound, and
