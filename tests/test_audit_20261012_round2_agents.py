@@ -137,3 +137,35 @@ def test_prototype_flags_are_deferred_inside_the_scope() -> None:
     with pytest.raises(ValueError, match="positive and finite"):
         with deferred_host_checks():
             pa.prototype_exact_posterior(xi, C, nu, log_lambda, log_pi)
+
+
+def test_mean_field_label_step_factors_each_covariance_once() -> None:
+    r"""Item 15: one factorization of V_Q and of B_j per layer serves the flags, the label KL, the label statistics
+    and the label spread; with two heads the readout runs 8 Cholesky factorizations (it ran 11, 12 under
+    spread_corrected): V_Q, B, and per head the ADF query check, Lambda and I + L^T A L."""
+    from collections import Counter
+
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class _Count(TorchDispatchMode):
+        def __init__(self) -> None:
+            super().__init__()
+            self.counts: Counter = Counter()
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # type: ignore[no-untyped-def]
+            self.counts[func.__name__] += 1
+            return func(*args, **(kwargs or {}))
+
+    g = torch.Generator().manual_seed(0)
+    N, H, d = 5, 2, 2
+    K = H * d
+    xi = torch.randn(N, K, generator=g, dtype=torch.float64)
+    X = torch.randn(N, K, K, generator=g, dtype=torch.float64)
+    C = X @ X.transpose(-1, -2) / K + 0.3 * torch.eye(K, dtype=torch.float64)
+    S = torch.eye(K, dtype=torch.float64).reshape(H, d, K) + 0.3 * torch.randn(H, d, K, generator=g, dtype=torch.float64)
+    T = torch.eye(K, dtype=torch.float64).reshape(H, d, K)
+    for spread in (False, True):
+        with _Count() as count:
+            minimal_agent.minimal_agent_readout(xi, C, S, T, torch.zeros(H, dtype=torch.float64), None, "mean_field",
+                                                spread_corrected=spread)
+        assert count.counts["linalg_cholesky_ex.default"] == 8, spread

@@ -181,7 +181,8 @@ import torch
 from torch.utils.checkpoint import checkpoint
 
 from vfe3.relational_scoring import (
-    _compute_dtype, projected_condition_recovery, projected_gaussian_kl, projected_gram_condition_tol,
+    _compute_dtype, _GramPrecision, _projected_kl_gemm, projected_condition_recovery, projected_gaussian_kl,
+    projected_gram_condition_tol,
 )
 from vfe3.runtime import ieee_fp32_matmul
 
@@ -244,6 +245,43 @@ class MeanFieldPosterior(NamedTuple):
     Lambda:  torch.Tensor      # (..., I, r, r) sum_j beta_ij B_j^{-1}
     eta:     torch.Tensor      # (..., I, r) sum_j beta_ij B_j^{-1} b_j
     failed:  torch.Tensor      # () bool
+
+
+class KeyFactors(NamedTuple):
+    r"""One zero-jitter factorization of the noisy utterance covariances :math:`B_j`, shared by the label KL, the
+    label statistics and the label spread of a mean-field call (:func:`key_factors`; audit 2026-10-12 round 2, item 15)."""
+
+    chol:   torch.Tensor       # (..., J, r, r) L_j with B_j = L_j L_j^T (identity where failed)
+    failed: torch.Tensor       # (..., J) bool
+    P:      torch.Tensor       # (..., J, r, r) B_j^{-1} (identity where failed)
+    logdet: torch.Tensor       # (..., J) log det B_j (0 where failed)
+    Pb:     torch.Tensor       # (..., J, r) B_j^{-1} b_j
+
+
+def key_factors(
+    b: torch.Tensor,                            # (..., J, r) utterance means
+    B: torch.Tensor,                            # (..., J, r, r) noisy utterance covariances, bitwise symmetric
+) -> KeyFactors:
+    r""":class:`KeyFactors` of :math:`B_j` from one factorization (:class:`vfe3.relational_scoring._GramPrecision`: the
+    precision and log-determinant carry its closed-form backward, the factor the Cholesky backward). A failed entry
+    reads the identity, as the identity placeholder of the readout does."""
+    chol, failed, P, logdet = _GramPrecision.apply(B)
+    eye = torch.eye(B.shape[-1], dtype=B.dtype, device=B.device)
+    chol = torch.where(failed[..., None, None], eye, chol)
+    logdet = logdet.masked_fill(failed, 0.0)
+    Pb = torch.cholesky_solve(b.unsqueeze(-1), chol).squeeze(-1)               # (..., J, r)
+    return KeyFactors(chol, failed, P, logdet, Pb)
+
+
+def _query_logdet(
+    A: torch.Tensor,                            # (..., I, r, r) query covariances
+) -> Tuple[torch.Tensor, torch.Tensor]:         # log det A (..., I) without autograd (0 where failed), failed (..., I)
+    r"""Zero-jitter factorization of the label step's query covariances, read for their failure flag and their
+    log-determinant, the row constant of the label KL (no autograd: the softmax is invariant to it)."""
+    with torch.no_grad():
+        L, info = torch.linalg.cholesky_ex(torch.nan_to_num(A))
+        failed = (info != 0) | ~torch.isfinite(A).all(dim=(-2, -1))
+        return (2.0 * L.diagonal(dim1=-2, dim2=-1).log().sum(-1)).masked_fill(failed, 0.0), failed
 
 
 class MinimalAgentResult(NamedTuple):
@@ -481,20 +519,20 @@ def label_statistics(
     weights: torch.Tensor,                      # (..., I, J) labels (rows sum to one)
     b:       torch.Tensor,                      # (..., J, r) utterance means
     B:       torch.Tensor,                      # (..., J, r, r) noisy utterance covariances
+    factors: Optional[KeyFactors] = None,       # B's factorization (key_factors), or None to factor here
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:   # Lambda (..., I, r, r), eta (..., I, r), failed ()
     r"""Information statistics of the power posterior at fixed labels.
 
     .. math::
         \Lambda_i = \sum_j\beta_{ij}B_j^{-1},\qquad \eta_i = \sum_j\beta_{ij}B_j^{-1}b_j,
 
-    from one zero-jitter Cholesky factor per source (no per-pair inverse).
+    from one zero-jitter Cholesky factor per source (no per-pair inverse), the caller's ``factors`` when given.
     """
-    L, info = torch.linalg.cholesky_ex(B)                                       # (..., J, r, r)
-    B_inv = torch.cholesky_inverse(L)                                           # (..., J, r, r)
-    B_inv_b = torch.cholesky_solve(b.unsqueeze(-1), L).squeeze(-1)              # (..., J, r)
-    Lambda = _symmetrize(torch.einsum("...ij,...jrs->...irs", weights, B_inv))
-    eta = torch.einsum("...ij,...jr->...ir", weights, B_inv_b)
-    return Lambda, eta, (info != 0).any()
+    if factors is None:
+        factors = key_factors(b, B)
+    Lambda = _symmetrize(torch.einsum("...ij,...jrs->...irs", weights, factors.P))
+    eta = torch.einsum("...ij,...jr->...ir", weights, factors.Pb)
+    return Lambda, eta, factors.failed.any()
 
 
 def mean_field_record_posterior(
@@ -506,6 +544,8 @@ def mean_field_record_posterior(
     *,
     check:     bool = True,
     labels_only_cost: bool = False,
+    factors:   Optional[KeyFactors] = None,     # B's factorization (key_factors), shared with the caller
+    query_logdet: Optional[torch.Tensor] = None,   # (..., I) log det A_i from the caller's factorization
 ) -> MeanFieldPosterior:
     r"""Mean-field label step at the receiver's prior and the label-averaged channel information.
 
@@ -526,6 +566,14 @@ def mean_field_record_posterior(
     query factorization without autograd (``symmetric_inputs``, ``query_row_constant_grad=False``). The values are
     bitwise those of the default; the gradients lose only the log-determinant term, which the softmax backward
     multiplies by a row sum that is zero analytically, so they agree to rounding (audit 2026-10-12, item 21).
+
+    ``factors`` (:func:`key_factors` of ``B``) and ``query_logdet`` (the log-determinants of ``A`` from the caller's
+    own factorization, read without autograd, so only with ``labels_only_cost``) let the readout factor each
+    covariance once per layer: the KL is then the healthy centered
+    GEMM of :func:`vfe3.relational_scoring.projected_gaussian_kl` on those factors, the label statistics read the
+    same precision, and a non-finite cost is a failure flag. Values equal the unshared call to rounding (audit
+    2026-10-12 round 2, item 15). Under :func:`vfe3.relational_scoring.projected_condition_recovery`, which may
+    rebuild ill-conditioned factors in float64, the KL keeps its own factorization.
     """
     if A.shape != (*a.shape, a.shape[-1]) or B.shape != (*b.shape, b.shape[-1]):
         raise ValueError("mean_field_record_posterior needs covariances (..., I, r, r) and (..., J, r, r)")
@@ -533,13 +581,20 @@ def mean_field_record_posterior(
     I, J = a.shape[-2], b.shape[-2]
     with torch.autocast(device_type=a.device.type, enabled=False):
         a, A, b, B = a.to(dtype), A.to(dtype), b.to(dtype), B.to(dtype)
-        cost = projected_gaussian_kl(a.unsqueeze(-2), A.unsqueeze(-3),
-                                     b.unsqueeze(-2), B.unsqueeze(-3),
-                                     symmetric_inputs=labels_only_cost,
-                                     query_row_constant_grad=not labels_only_cost).squeeze(-3)   # (..., I, J)
+        shared = (factors is not None and query_logdet is not None and labels_only_cost
+                  and not projected_condition_recovery())
+        if shared:
+            cost = _projected_kl_gemm(a, b, A, factors.P, query_logdet.to(dtype), factors.logdet)   # (..., I, J)
+        else:
+            cost = projected_gaussian_kl(a.unsqueeze(-2), A.unsqueeze(-3),
+                                         b.unsqueeze(-2), B.unsqueeze(-3),
+                                         symmetric_inputs=labels_only_cost,
+                                         query_row_constant_grad=not labels_only_cost).squeeze(-3)   # (..., I, J)
         lp = (torch.zeros(I, J, dtype=dtype, device=a.device) if log_prior is None else log_prior.to(dtype))
         weights = torch.softmax(lp - cost, dim=-1)                              # (..., I, J)
-        Lambda, eta, failed = label_statistics(weights, b, B)
+        Lambda, eta, failed = label_statistics(weights, b, B, factors)
+        if shared:
+            failed = failed | ~torch.isfinite(cost).all()
     if check:
         _raise_on_failure([failed], "minimal-agent utterance covariance B_j")
     return MeanFieldPosterior(weights, cost, Lambda, eta, failed)
@@ -874,6 +929,7 @@ def label_spread(
     a:       torch.Tensor,                      # (..., I, r) posterior query means a_i^+
     b:       torch.Tensor,                      # (..., J, r) utterance means
     B:       torch.Tensor,                      # (..., J, r, r) noisy utterance covariances
+    factors: Optional[KeyFactors] = None,       # B's factorization (key_factors), or None to factor here
 ) -> Tuple[torch.Tensor, torch.Tensor]:         # R'_i (..., I, r, r), failed ()
     r"""Linearized label spread of the spread-corrected mean-field covariance (module docstring, T2).
 
@@ -886,11 +942,13 @@ def label_spread(
     per source; receiver rows are tiled so that one tile holds at most :data:`SPREAD_TILE_BYTES` of the
     :math:`(I, J, r)` deviations, and each tile is a non-reentrant checkpoint under autograd when there is more than
     one. No :math:`(I, J, r, r)` tensor is formed: the spread is a batched product over :math:`j`. Cost
-    :math:`O(IJr^2)` per batch element.
+    :math:`O(IJr^2)` per batch element. ``factors`` is the label step's factorization of ``B`` (:func:`key_factors`),
+    so the readout factors it once (audit 2026-10-12 round 2, item 15).
     """
-    L, info = torch.linalg.cholesky_ex(B)                                       # (..., J, r, r)
-    B_inv = _symmetrize(torch.cholesky_inverse(L))                              # (..., J, r, r)
-    v = torch.cholesky_solve(b.unsqueeze(-1), L).squeeze(-1)                    # (..., J, r) B_j^{-1} b_j
+    if factors is None:
+        factors = key_factors(b, B)
+    B_inv = _symmetrize(factors.P)                                              # (..., J, r, r)
+    v = factors.Pb                                                              # (..., J, r) B_j^{-1} b_j
     I, J, r = a.shape[-2], b.shape[-2], a.shape[-1]
     batch = math.prod(torch.broadcast_shapes(weights.shape[:-2], a.shape[:-2], b.shape[:-2]))
     per_row = max(1, batch * J * r * a.element_size())
@@ -903,7 +961,7 @@ def label_spread(
         else:
             tiles.append(_label_spread_tile(*args))
     spread = tiles[0] if len(tiles) == 1 else torch.cat(tiles, dim=-3)
-    return _symmetrize(spread), (info != 0).any()
+    return _symmetrize(spread), factors.failed.any()
 
 
 def _spread_gains(
@@ -1306,29 +1364,34 @@ def minimal_agent_readout(
             # projected_gaussian_kl raises on a failed factorization, so the input query and utterance covariances
             # are factored here first: a failure becomes a flag and its entry enters the KL as an identity
             # placeholder (the caller then recomputes or refuses the call); a healthy call is unchanged.
-            with torch.no_grad():
-                bad_Q = torch.linalg.cholesky_ex(V_Q)[1] != 0                    # (..., N, H)
-                bad_B = torch.linalg.cholesky_ex(B)[1] != 0                      # (..., H, N)
+            # Each covariance is factored once per layer (audit 2026-10-12 round 2, item 15): the query factorization
+            # gives the failure flag and the KL's row constant log det A_i, and the one factorization of B_j serves
+            # the KL, the label statistics of every sweep and the label spread.
+            logdet_Q, bad_Q = _query_logdet(V_Q)                                # (..., N, H) each
+            factors = key_factors(b, B)                                         # B_j: (..., H, N, d, d)
+            bad_B = factors.failed                                              # (..., H, N)
             flags += [bad_Q.any(), bad_B.any()]
             V_Q_kl = torch.where(bad_Q[..., None, None], eye, V_Q)
             B_kl = torch.where(bad_B[..., None, None], eye, B)
             a0_r, V_Q_r = a0, V_Q_kl.movedim(-3, -4)                            # (..., H, N, d), (..., H, N, d, d)
+            logdet_r = logdet_Q.movedim(-1, -2)                                 # (..., H, N)
             if Rot is not None:
                 a0_r = torch.einsum("nst,...hnt->...hns", Rot, a0_r)
                 V_Q_r = _symmetrize(torch.einsum("nst,...hntu,nvu->...hnsv", Rot, V_Q_r, Rot))
                 # The rotation rounds, so the rotated covariance is factored again: a failure is a flag
                 # with the identity placeholder, as for the unrotated one (audit 2026-10-08).
-                with torch.no_grad():
-                    bad_Q_r = torch.linalg.cholesky_ex(V_Q_r)[1] != 0            # (..., H, N)
+                logdet_r, bad_Q_r = _query_logdet(V_Q_r)                        # (..., H, N) each
                 flags.append(bad_Q_r.any())
                 V_Q_r = torch.where(bad_Q_r[..., None, None], eye, V_Q_r)
 
-            def label_step(a_r: torch.Tensor, A_r: torch.Tensor) -> MeanFieldPosterior:
-                r"""Labels at the comparison-frame query moments ``(a_r, A_r)`` ``(..., H, N, d)``, ``(..., H, N, d, d)``,
-                their information back in the record frame; the labels, costs and flag are recorded."""
+            def label_step(a_r: torch.Tensor, A_r: torch.Tensor, logdet_A: torch.Tensor) -> MeanFieldPosterior:
+                r"""Labels at the comparison-frame query moments ``(a_r, A_r)`` ``(..., H, N, d)``, ``(..., H, N, d, d)``
+                (``logdet_A`` ``(..., H, N)`` from their factorization), their information back in the record frame;
+                the labels, costs and flag are recorded."""
                 # A_r and B_kl are bitwise symmetric (_symmetrize, a diagonal shift, identity placeholders) and the
                 # cost leaves this readout only detached (score_energy_pre).
-                step = mean_field_record_posterior(a_r, A_r, b, B_kl, lp, check=False, labels_only_cost=True)
+                step = mean_field_record_posterior(a_r, A_r, b, B_kl, lp, check=False, labels_only_cost=True,
+                                                   factors=factors, query_logdet=logdet_A)
                 if Rot is not None:
                     # Label information back to receiver i's record frame: Lambda -> R_i^T Lambda R_i, eta -> R_i^T eta.
                     step = step._replace(
@@ -1339,7 +1402,7 @@ def minimal_agent_readout(
                 flags.append(step.failed)
                 return step
 
-            labels = label_step(a0_r, V_Q_r)                                    # sweep 1: the input moments
+            labels = label_step(a0_r, V_Q_r, logdet_r)                          # sweep 1: the input moments
 
             def head_update(h: int, a: torch.Tensor, A: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
                 check_query(h, A)
@@ -1359,12 +1422,13 @@ def minimal_agent_readout(
             # A further CAVI sweep: labels at the current posterior query moments (head_update reads the rebound
             # labels), then the Gaussian fused again from the input moments.
             a_post, A_post = _posterior_query_moments(xi_plus, V_Q, S, gains, M, Rot)   # (..., N, H, d), (..., N, H, d, d)
-            with torch.no_grad():
-                bad_post = _unfactorable(a_post, A_post)                        # (..., N, H)
+            logdet_post, bad_post = _query_logdet(A_post)                       # (..., N, H) each
+            bad_post = bad_post | ~torch.isfinite(a_post).all(dim=-1)
             flags.append(bad_post.any())
             A_post = torch.where(bad_post[..., None, None], eye, A_post)
             a_post = torch.where(bad_post[..., None], torch.zeros((), dtype=dtype, device=xi.device), a_post)
-            labels = label_step(a_post.movedim(-2, -3), A_post.movedim(-3, -4))
+            labels = label_step(a_post.movedim(-2, -3), A_post.movedim(-3, -4),
+                                logdet_post.masked_fill(bad_post, 0.0).movedim(-1, -2))
             xi_plus, gains, M, _ = sequential_head_assembly(xi, X0, S, head_update)
         if diagnostics and inference == "mean_field":
             with torch.no_grad():                                               # gain fraction at the input moments
@@ -1407,7 +1471,7 @@ def minimal_agent_readout(
             a_post = torch.einsum("hsk,...nk->...hns", S, xi_plus)              # (..., H, N, d) a^+
             if Rot is not None:
                 a_post = torch.einsum("nst,...hnt->...hns", Rot, a_post)
-            R_prime, bad_spread = label_spread(weights_out, a_post, b, B_kl)     # (..., H, N, d, d)
+            R_prime, bad_spread = label_spread(weights_out, a_post, b, B_kl, factors)   # (..., H, N, d, d)
             flags.append(bad_spread)
             if Rot is not None:
                 R_prime = _symmetrize(torch.einsum("nts,...hntu,nuv->...hnsv", Rot, R_prime, Rot))
