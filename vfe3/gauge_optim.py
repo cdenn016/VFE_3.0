@@ -1200,8 +1200,15 @@ def bound_phi_frame_condition_(
     coordinates are the row-major blocks themselves; any other supported basis (shared ``block_glk``,
     ``block_glmc``) embeds as :math:`M_h = \sum_a \phi_a G_a^{(h)}` and maps back through its diagonal Frobenius
     Gram, :math:`\Delta\phi_a = \sum_h \langle G_a^{(h)}, \Delta M_h\rangle_F / \|G_a\|_F^2`, which is exact
-    because :math:`\Delta M` lies in the algebra. The eigendecomposition runs in float64 and the result is cast
-    back to the table dtype. Optimizer moments are left unchanged, as in :func:`project_phi_parameter_rows_`.
+    because :math:`\Delta M` lies in the algebra. Optimizer moments are left unchanged, as in
+    :func:`project_phi_parameter_rows_`.
+
+    Cost: a row is decomposed only if a head block fails the exact screen
+    :math:`\sqrt2\lVert S_0\rVert_F \le 2c` (:math:`\lambda_{\max} - \lambda_{\min} \le \sqrt2\lVert S_0\rVert_F` for a
+    traceless spectrum), which runs in float32 with no eigensolver; rows passing it are within the bound and are
+    not touched. The flagged rows are gathered (one host read per table) and decomposed in float32 with a
+    residual and orthogonality certificate, and rows with an uncertified block are recomputed in float64
+    (:func:`_frame_bound_rows`); a float64 table is decomposed in float64. Results are cast back to the table dtype.
     """
     if isinstance(kappa_max, bool) or not math.isfinite(kappa_max) or kappa_max <= 1.0:
         raise ValueError(f"kappa_max must be a finite real > 1, got {kappa_max!r}")
@@ -1234,6 +1241,10 @@ def bound_phi_frame_condition_(
                 "diagonal Frobenius Gram")
         basis = basis.detach().to(torch.float64)
         gram = basis.square().sum(dim=(1, 2, 3))                               # (n_gen,)
+    # A traceless spectrum has lambda_max - lambda_min <= sqrt(2) ||S_0||_F, so a row whose every head block has
+    # 2 ||S_0||_F^2 <= (2c)^2 is within the bound and needs no eigensolver. The margin flags a row on the
+    # boundary rather than letting float32 rounding pass it.
+    screen = 0.5 * (2.0 * c) ** 2 * (1.0 - 1e-4)
     # Roughly six float64 (H, d, d) temporaries per row (X, S_0, Q, the update and two products).
     rows_per_chunk = max(1, temporary_bytes // (6 * 8 * H * d * d))
     for table in tables:
@@ -1242,28 +1253,74 @@ def bound_phi_frame_condition_(
             raise ValueError(
                 "the frame condition bound requires full generator coordinates; got table width "
                 f"{rows.shape[-1]} and {group.generator_shape[0]} generators")
+        flagged = []
         for start in range(0, rows.shape[0], rows_per_chunk):
-            chunk = rows[start : start + rows_per_chunk]
-            phi64 = chunk.to(torch.float64)                                    # (r, n_gen)
-            if elementary:
-                X = phi64.reshape(-1, H, d, d)                                 # (r, H, d, d)
-            else:
-                X = torch.einsum("ra,ahij->rhij", phi64, basis)                # (r, H, d, d)
-            S = 0.5 * (X + X.transpose(-1, -2))
-            trace_mean = S.diagonal(dim1=-2, dim2=-1).mean(-1)                 # (r, H)
-            S0 = S - trace_mean[..., None, None] * torch.eye(d, dtype=S.dtype, device=S.device)
-            lam, Q = torch.linalg.eigh(S0)                                     # (r, H, d), (r, H, d, d)
-            over = (lam[..., -1] - lam[..., 0]) > 2.0 * c                     # (r, H)
-            shift = torch.where(over[..., None], _bounded_traceless_spectrum(lam, c) - lam, 0.0)
-            delta = (Q * shift[..., None, :]) @ Q.transpose(-1, -2)            # (r, H, d, d) S_0' - S_0
-            if elementary:
-                dphi = delta.reshape(phi64.shape)
-            else:
-                dphi = torch.einsum("rhij,ahij->ra", delta, basis) / gram
-            row_over = over.any(-1)                                            # (r,)
-            chunk.copy_(torch.where(row_over[:, None], (phi64 + dphi).to(chunk.dtype), chunk))
-            changed.add_(row_over.sum())
+            S0 = _traceless_symmetric_blocks(rows[start : start + rows_per_chunk], basis, H, d, torch.float32)
+            flagged.append((S0.square().sum(dim=(-2, -1)) > screen).any(-1))     # (r,)
+        index = torch.cat(flagged).nonzero().squeeze(-1)                      # the one host read per table
+        for start in range(0, index.numel(), rows_per_chunk):
+            idx = index[start : start + rows_per_chunk]
+            phi = rows.index_select(0, idx)                                    # (r, n_gen)
+            work = torch.float64 if rows.dtype == torch.float64 else torch.float32
+            new, over, failed = _frame_bound_rows(phi, basis, gram, H, d, c, work)
+            if bool(failed.any()):                                            # uncertified float32 eigh: redo in float64
+                new64, over64, _ = _frame_bound_rows(phi[failed], basis, gram, H, d, c, torch.float64)
+                new[failed], over[failed] = new64.to(new.dtype), over64
+            rows.index_copy_(0, idx, torch.where(over[:, None], new.to(rows.dtype), phi))
+            changed.add_(over.sum())
     return changed
+
+
+def _traceless_symmetric_blocks(
+    phi:   torch.Tensor,                    # (r, n_gen) frame coordinates
+    basis: Optional[torch.Tensor],          # (n_gen, H, d, d) head-block basis, or None for row-major blocks
+    H:     int,
+    d:     int,
+    dtype: torch.dtype,
+) -> torch.Tensor:                          # (r, H, d, d) S_0 = sym(X) - tr(sym X)/d I
+    work = phi.to(dtype)
+    X = (work.reshape(-1, H, d, d) if basis is None
+         else torch.einsum("ra,ahij->rhij", work, basis.to(dtype)))
+    S = 0.5 * (X + X.transpose(-1, -2))
+    trace_mean = S.diagonal(dim1=-2, dim2=-1).mean(-1)                        # (r, H)
+    return S - trace_mean[..., None, None] * torch.eye(d, dtype=dtype, device=S.device)
+
+
+def _frame_bound_rows(
+    phi:   torch.Tensor,                    # (r, n_gen) flagged rows
+    basis: Optional[torch.Tensor],          # (n_gen, H, d, d) float64, or None for row-major blocks
+    gram:  Optional[torch.Tensor],          # (n_gen,) float64 Frobenius Gram of the basis
+    H:     int,
+    d:     int,
+    c:     float,
+    dtype: torch.dtype,                     # float32 (certified) or float64
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:   # projected rows (r, n_gen), over (r,), failed (r,)
+    r"""The spread projection of :func:`bound_phi_frame_condition_` on ``rows`` at ``dtype``.
+
+    In float32 the eigendecomposition :math:`S_0 = Q\Lambda Q^\top` of each head block is certified by
+    :math:`\lVert S_0Q - Q\Lambda\rVert_F \le \tau\lVert S_0\rVert_F`, :math:`\lVert Q^\top Q - I\rVert_F \le \tau` and
+    finiteness, :math:`\tau = 64\,d\,\varepsilon_{32}`; ``failed`` marks the rows with an uncertified block, which the
+    caller recomputes in float64. The update :math:`S_0' - S_0` is symmetrized, so the skew part of :math:`X` is
+    unchanged exactly and its trace to rounding.
+    """
+    S0 = _traceless_symmetric_blocks(phi, basis, H, d, dtype)                # (r, H, d, d)
+    lam, Q = torch.linalg.eigh(S0)                                            # (r, H, d), (r, H, d, d)
+    failed = torch.zeros(phi.shape[0], dtype=torch.bool, device=phi.device)
+    if dtype != torch.float64:
+        tol = 64 * d * torch.finfo(dtype).eps
+        eye = torch.eye(d, dtype=dtype, device=phi.device)
+        residual = (S0 @ Q - Q * lam[..., None, :]).norm(dim=(-2, -1))
+        orthogonality = (Q.transpose(-1, -2) @ Q - eye).norm(dim=(-2, -1))
+        certified = (torch.isfinite(lam).all(-1) & torch.isfinite(Q).all(dim=(-2, -1))
+                     & (residual <= tol * S0.norm(dim=(-2, -1))) & (orthogonality <= tol))   # (r, H)
+        failed = ~certified.all(-1)
+    over = (lam[..., -1] - lam[..., 0]) > 2.0 * c                             # (r, H)
+    shift = torch.where(over[..., None], _bounded_traceless_spectrum(lam, c) - lam, 0.0)
+    delta = (Q * shift[..., None, :]) @ Q.transpose(-1, -2)                   # (r, H, d, d) S_0' - S_0
+    delta = 0.5 * (delta + delta.transpose(-1, -2))
+    dphi = (delta.reshape(phi.shape[0], -1) if basis is None
+            else torch.einsum("rhij,ahij->ra", delta, basis.to(dtype)) / gram.to(dtype))
+    return phi.to(dtype) + dphi, over.any(-1), failed
 
 
 def _fisher_diagnostics(accumulated: Dict[str, List[torch.Tensor]]) -> Dict[str, float]:

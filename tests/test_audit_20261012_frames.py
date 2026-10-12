@@ -66,6 +66,80 @@ def test_projection_bounds_spread_and_keeps_skew_and_trace(overrides: dict) -> N
     torch.testing.assert_close(model.prior_bank.phi_embed.detach(), snapshot, rtol=0.0, atol=1e-5)
 
 
+def _stretched_model(overrides: dict) -> VFEModel:
+    cfg = test_config(vocab_size=12, max_seq_len=3, pos_phi="none", phi_frame_condition_max=20.0, **overrides)
+    model = VFEModel(cfg)                                                      # one frame factor: c = log(kappa)/2
+    generator = torch.Generator().manual_seed(1)
+    with torch.no_grad():
+        phi = model.prior_bank.phi_embed
+        phi.copy_(1e-3 * torch.randn(phi.shape, generator=generator))       # inside the bound
+        phi[::3].copy_(2.0 * torch.randn(phi[::3].shape, generator=generator))   # every third row stretched
+    return model
+
+
+def _float64_reference(model: VFEModel, kappa_max: float) -> torch.Tensor:
+    r"""The unscreened float64 projection of every row (the pre-screen algorithm)."""
+    from vfe3.gauge_optim import _frame_bound_rows
+    group = model.group
+    H, d = len(group.irrep_dims), group.irrep_dims[0]
+    basis = gram = None
+    if group.elementary_block_shape is None:
+        basis = group.head_block_generators().detach().to(torch.float64)
+        gram = basis.square().sum(dim=(1, 2, 3))
+    phi = model.prior_bank.phi_embed.detach()
+    new, over, _ = _frame_bound_rows(phi, basis, gram, H, d, math.log(kappa_max) / 2, torch.float64)
+    return torch.where(over[:, None], new.to(phi.dtype), phi)
+
+
+@pytest.mark.parametrize("overrides", [
+    dict(gauge_group="block_glk", embed_dim=6, n_heads=2),
+    dict(gauge_group="block_glk", embed_dim=6, n_heads=2, gauge_tying="shared"),
+    dict(gauge_group="block_glmc", embed_dim=8, n_heads=2),
+])
+def test_screened_float32_projection_matches_the_float64_projection(overrides: dict) -> None:
+    r"""The screen skips only rows already within the bound (bitwise unchanged), and the certified float32
+    projection of the flagged rows equals the float64 projection to float32 rounding."""
+    model = _stretched_model(overrides)
+    before = model.prior_bank.phi_embed.detach().clone()
+    reference = _float64_reference(model, 20.0)
+    bound_phi_frame_condition_(model, 20.0)
+    after = model.prior_bank.phi_embed.detach()
+    unchanged = torch.equal(reference, before)
+    assert not unchanged                                                       # the projection acts
+    torch.testing.assert_close(after, reference, rtol=0.0, atol=1e-5)
+    untouched = (reference == before).all(-1)
+    assert bool(untouched.any()) and torch.equal(after[untouched], before[untouched])
+
+
+def test_uncertified_float32_blocks_are_recomputed_in_float64(monkeypatch: pytest.MonkeyPatch) -> None:
+    r"""A float32 eigendecomposition that fails the orthogonality certificate is redone in float64."""
+    model = _stretched_model(dict(gauge_group="block_glk", embed_dim=6, n_heads=2))
+    reference = _float64_reference(model, 20.0)
+    eigh, calls = torch.linalg.eigh, []
+
+    def corrupted(A: torch.Tensor) -> tuple:
+        lam, Q = eigh(A)
+        calls.append(A.dtype)
+        return (lam, 1.01 * Q) if A.dtype == torch.float32 else (lam, Q)
+
+    monkeypatch.setattr(torch.linalg, "eigh", corrupted)
+    bound_phi_frame_condition_(model, 20.0)
+    monkeypatch.setattr(torch.linalg, "eigh", eigh)
+    assert torch.float32 in calls and torch.float64 in calls
+    torch.testing.assert_close(model.prior_bank.phi_embed.detach(), reference, rtol=0.0, atol=1e-6)
+
+
+def test_screen_is_a_sound_bound_on_the_spread() -> None:
+    r""":math:`\lambda_{\max} - \lambda_{\min} \le \sqrt2\lVert S_0\rVert_F` for a traceless symmetric :math:`S_0`."""
+    generator = torch.Generator().manual_seed(2)
+    X = torch.randn(4000, 7, 7, generator=generator, dtype=torch.float64) * torch.logspace(-3, 2, 4000,
+                                                                                          dtype=torch.float64)[:, None, None]
+    S = 0.5 * (X + X.transpose(-1, -2))
+    S0 = S - S.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None] * torch.eye(7, dtype=torch.float64)
+    lam = torch.linalg.eigvalsh(S0)
+    assert bool(((lam[:, -1] - lam[:, 0]) <= math.sqrt(2.0) * S0.norm(dim=(-2, -1)) * (1 + 1e-12)).all())
+
+
 def _train_case(**overrides: object) -> tuple:
     cfg = test_config(vocab_size=8, embed_dim=6, n_heads=2, max_seq_len=4, n_layers=1, n_e_steps=1,
                       pos_phi="learned", **overrides)
