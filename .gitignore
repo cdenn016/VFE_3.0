@@ -19,3 +19,6 @@ vfe3_policy_results/
 .codex/
 .verification/
 docs/
+
+# Scratch file (not valid Python); kept locally, not tracked
+zzzzz.py

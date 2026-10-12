@@ -57,6 +57,7 @@ from vfe3.metric_contracts import perplexity_from_ce
 from vfe3.metrics import COLLAPSE_ENTROPY_FRACTION, LINK_SPECTRUM_KEYS, routing_triangle_defect_sums
 from vfe3.model.block import _as_coeff
 from vfe3.model.block_mlp import PrototypeAgentBlockMLP
+from vfe3.model.minimal_agent import MINIMAL_AGENT_ELBO_KEYS
 from vfe3.model.model import CANONICAL_DIAGNOSTIC_KEYS, DiagnosticSnapshot, VFEModel
 from vfe3.model.prior_bank import PriorBank, get_decode_registration
 from vfe3.run_artifacts import RunArtifacts          # top-level safe: run_artifacts imports evaluate
@@ -332,7 +333,9 @@ def build_optimizer(
         layers = model.relational_operators_by_layer
         # channel_log_noise (predictive_readout='minimal_agent') is a score-side parameter: it enters the routing
         # through the record covariance. raw_score_k and O are None there (tied key, derived receiving map).
-        for role, names in (("score", ("raw_score_q", "raw_score_k", "channel_log_noise", "routing_log_temperature")),
+        # routing_key_log_noise (relational_routing='noisy_key') is score-side for the same reason.
+        for role, names in (("score", ("raw_score_q", "raw_score_k", "channel_log_noise", "routing_log_temperature",
+                                       "routing_key_log_noise")),
                             ("content", ("T", "O"))):
             # Mixed head sizes store a ParameterList per name (one tensor per run of equal heads).
             parameters = [p for ops in layers for name in names
@@ -444,11 +447,7 @@ def build_optimizer(
                 if cfg.phi_mstep_max_matrix_norm is not None
                 else 5.0
             ),
-            phi_bch_residual_max=(
-                min(1e-6, cfg.bch_residual_max)
-                if cfg.bch_residual_max is not None
-                else 1e-6
-            ),
+            phi_bch_residual_max=1e-6,
             phi_group_retraction=cfg.m_phi_group_retraction,
             phi_statistics_provider=(
                 PhiFisherStatisticsProvider(model, cfg.m_phi_fisher_rotation_weight)
@@ -719,7 +718,7 @@ def _transfer_targets(
     decode_mode = getattr(getattr(model, "cfg", None), "decode_mode", None)
     if (type(model) is VFEModel and type(model.prior_bank) is PriorBank
             and decode_mode in ("linear", "diagonal_chunked", "full_chunked",
-                                "expected_likelihood_chunked", "family_chunked")
+                                "expected_likelihood_chunked")
             and get_decode_registration(decode_mode).fused_ce is getattr(
                 PriorBank, "decode_ce_linear_chunked" if decode_mode == "linear"
                 else f"decode_ce_{decode_mode}")
@@ -825,7 +824,8 @@ def train_step(
         _step_ce_det = ce.detach() if ce is not None else None   # () pre-step CE, read at the existing barrier
         _scored_det = decode_stats.scored_tokens.detach()
         _excluded_det = _excluded_token_count(decode_stats, targets.numel()).detach()
-        _expected_det = torch.tensor(targets.numel(), dtype=torch.int64, device=targets.device)
+        # A device fill, not a pageable host-to-device copy (which synchronizes the stream).
+        _expected_det = torch.full((), targets.numel(), dtype=torch.int64, device=targets.device)
         _scaler.scale(loss).backward()
         _loss_det = loss.detach()                               # host read DEFERRED: fused with the grad-finite
         step_loss = None                                        # flag at the gate below (audit 2026-07-01 round-3)
@@ -856,8 +856,8 @@ def train_step(
             count_tensors.append(count_mb)
             excluded_count_tensors.append(
                 _excluded_token_count(decode_stats_mb, tgt_mb.numel()).detach())
-            expected_count_tensors.append(torch.tensor(
-                tgt_mb.numel(), dtype=torch.int64, device=tgt_mb.device))
+            expected_count_tensors.append(torch.full(
+                (), tgt_mb.numel(), dtype=torch.int64, device=tgt_mb.device))
             if _egrad_mb is not None:
                 for _name, _value in _egrad_mb.items():
                     if isinstance(_value, Real):
@@ -1572,10 +1572,14 @@ _VAL_LATENT_DIAG_KEYS = tuple("val_relational_latent_" + key for key in (
 # head-max coupling ||S_h C S_g^T||_F / (||S_h C S_h^T||_F ||S_g C S_g^T||_F)^{1/2} at the input moments (0: ADF is
 # exact), the head-mean mean-field label staleness (TV of one relabeling at the posterior; NaN under 'exact') and the
 # covariance contraction tr C^+ / tr C and the head-mean exact spread share tr(A R) / tr(A Lambda_bar) (NaN under
-# 'mean_field').
+# 'mean_field'), and the head-mean mean-field M-step optimum n_h^* (minimal_agent.channel_noise_mstep; NaN under
+# 'exact').
 _VAL_MINIMAL_AGENT_DIAG_KEYS = tuple("val_relational_minimal_agent_" + key for key in (
     "gain_fraction", "channel_noise", "head_coupling", "label_staleness", "covariance_contraction",
-    "spread_share"))
+    "spread_share", "channel_noise_mstep"))
+# Under diagnose_agent_elbo (minimal agent only; audit 2026-10-12 T1): the last layer's receiver-mean evidence lower
+# bound of the readout's posterior, the ADF evidence of the record model and their gap, in nats.
+_VAL_MINIMAL_AGENT_ELBO_KEYS = tuple("val_" + key for key in MINIMAL_AGENT_ELBO_KEYS)
 
 
 # =============================================================================
@@ -1651,10 +1655,11 @@ ROUTING_HOLONOMY_FIELDS: Tuple[str, ...] = (
 # Minimal-agent readout per (layer, head) (predictive_readout='minimal_agent'; vfe3.model.minimal_agent), means over
 # the fixed validation windows: gain fraction, channel noise n_h, head coupling, mean-field label staleness (TV of one
 # relabeling at the posterior; NaN under 'exact'), the layer's covariance contraction tr C^+ / tr C and the exact
-# spread share tr(A R) / tr(A Lambda_bar) (the part of the removed variance the mean field drops; NaN under the mean field).
+# spread share tr(A R) / tr(A Lambda_bar) (the part of the removed variance the mean field drops; NaN under the mean field)
+# and the mean-field M-step optimum n_h^* of the channel noise beside the learned channel_noise (NaN under 'exact').
 MINIMAL_AGENT_HEAD_FIELDS: Tuple[str, ...] = (
     "step", "layer", "head", "gain_fraction", "channel_noise", "head_coupling", "label_staleness",
-    "covariance_contraction", "spread_share")
+    "covariance_contraction", "spread_share", "channel_noise_mstep")
 _MINIMAL_AGENT_HEAD_CAPTURE = tuple("relational_minimal_agent_" + key for key in MINIMAL_AGENT_HEAD_FIELDS[3:])
 # Prototype-agent block MLP per layer (block_mlp_mode='prototype_agents'), over the tokens of the fixed validation
 # windows: effective templates in use exp(H(mean_t w_t)), the token-mean weight entropy, the fraction of templates
@@ -1664,6 +1669,12 @@ _MINIMAL_AGENT_HEAD_CAPTURE = tuple("relational_minimal_agent_" + key for key in
 PROTOTYPE_TEMPLATE_FIELDS: Tuple[str, ...] = (
     "step", "layer", "effective_templates", "weight_entropy", "dead_fraction", "log_lambda_min",
     "log_lambda_median", "log_lambda_max", "prior_entropy", "gain_fraction", "label_staleness", "n_tokens")
+# Per-layer evidence diagnostics (diagnose_agent_elbo; audit 2026-10-12 T1), means over the receivers (tokens) of the
+# fixed validation windows, in nats: the evidence lower bound of the posterior the layer forms, the evidence of its
+# declared record model (minimal agent: ADF over the heads, exact for one head; prototypes: exact) and their gap.
+# Written to diagnostics/minimal_agent_elbo.csv and diagnostics/prototype_elbo.csv only when the toggle is on.
+MINIMAL_AGENT_ELBO_FIELDS: Tuple[str, ...] = ("step", "layer", "elbo", "evidence", "elbo_gap")
+PROTOTYPE_ELBO_FIELDS: Tuple[str, ...] = ("step", "layer", "elbo", "evidence", "elbo_gap", "n_tokens")
 
 # S1 panel D numerical-event counters (GL(K)_attention_v2 fig:placeholder_numerics, 2026-09-28).
 # Every count is an integer with its denominator beside it. NUMERICS_EVAL_COLUMNS are measured at
@@ -1890,12 +1901,12 @@ def _capture_numerics_counts(
     :func:`vfe3.relational_scoring._strict_cholesky` (float64 QR of the source root
     :math:`L \Sigma^{1/2}`, or a shifted CholeskyQR3 retry on the ``cholesky_qr2`` factor route) for an
     entry whose working-precision factor failed, or failed the conditioning certificate under
-    ``projected_cov_condition_recovery``. The numerator is the layer's recovered-entry count
+    a certified ``projected_factorization``. The numerator is the layer's recovered-entry count
     ``relational_covariance_repair_count``, a subset of the same entries. The pair-level factorizations
     of :math:`G_{q,i} + G_{k,j}` on the noisy-query route have no fallback (a failure raises) and are
     not counted. The minimal agent's fallback is the float64 recomputation of a whole float32 layer call
     whose factorizations failed (or whose ADF query covariance failed the certificate under
-    ``projected_cov_condition_recovery``); it counts every recorded query and key entry of that call, so
+    a certified ``projected_factorization``); it counts every recorded query and key entry of that call, so
     there the ratio is the share of recomputed layer calls (plus, for the mean field under the certificate,
     the KL factors it refactors in calls that were not recomputed).
 
@@ -2196,7 +2207,8 @@ def _parameter_group(
     if name.startswith("relational_operators"):
         # Mixed head sizes store per-run lists: the attribute is the segment before the run index.
         attribute = name.rsplit(".", 2)[-2] if leaf.isdigit() else leaf
-        if attribute in ("raw_score_q", "raw_score_k", "channel_log_noise", "routing_log_temperature"):
+        if attribute in ("raw_score_q", "raw_score_k", "channel_log_noise", "routing_log_temperature",
+                         "routing_key_log_noise"):
             return "relational_score"                         # channel_log_noise: minimal agent
         if attribute in ("T", "O"):
             return "relational_content"
@@ -2594,7 +2606,9 @@ def _residual_and_attention_rows(
     sums: Dict[Tuple[int, int], List[float]] = {}          # (layer, head) -> [H_norm, dist, self, overlap, n]
     modes = [(module, module.training) for module in model.modules()]
     model.eval()
-    wrapped = _wrap_prototype_blocks(model, features_out) if features_out is not None else []
+    wrapped = (_wrap_prototype_blocks(model, features_out,
+                                      elbo=bool(getattr(model.cfg, "diagnose_agent_elbo", False)))
+               if features_out is not None else [])
     try:
         for chunk in windows.split(max(1, DIAGNOSTIC_CHUNK_WINDOWS)):
             ids = chunk.to(device)                                              # (B, N)
@@ -2735,16 +2749,21 @@ def _collapsed_head_count(
 def _wrap_prototype_blocks(
     model:        VFEModel,
     features_out: Dict[str, Any],
+
+    *,
+    elbo:         bool = False,
 ) -> List[torch.nn.Module]:
     r"""Wrap ``forward_moments`` of every ``prototype_agents`` block on the instance so the eval pass sums, per
     layer, the template weights ``(M,)``, the weight entropy, the removed variance, the label staleness and the token
     count of its inputs into ``features_out["prototype"][layer]``; returns the wrapped blocks (the caller deletes the
-    wrappers)."""
+    wrappers). With ``elbo`` (``diagnose_agent_elbo``) it also sums the block's evidence lower bound and log evidence
+    (:meth:`PrototypeAgentBlockMLP.elbo_and_evidence`) into ``features_out["prototype_elbo"][layer]``."""
     blocks = getattr(model, "block_mlps", None)
     wrapped: List[torch.nn.Module] = []
     if blocks is None:
         return wrapped
     sums = features_out.setdefault("prototype", {})
+    sums_elbo = features_out.setdefault("prototype_elbo", {}) if elbo else {}
     for layer, mlp in enumerate(blocks):
         if not isinstance(mlp, PrototypeAgentBlockMLP):
             continue
@@ -2760,6 +2779,13 @@ def _wrap_prototype_blocks(
             entry["gain"] += float(gain.double().sum())
             entry["staleness"] += float(staleness.double().sum())                # NaN under exact inference
             entry["tokens"] += int(weights.shape[0])
+            if elbo:
+                bound, evidence = _mlp.elbo_and_evidence(mu, sigma)              # (...) float64 each
+                totals = sums_elbo.setdefault(_layer, [0.0, 0.0, 0.0, 0])        # [elbo, evidence, gap, tokens]
+                totals[0] += float(bound.sum())
+                totals[1] += float(evidence.sum())
+                totals[2] += float((evidence - bound).sum())
+                totals[3] += int(bound.numel())
             return _original(mu, sigma, *args, **kwargs)
 
         mlp.forward_moments = recording
@@ -2784,6 +2810,32 @@ def _accumulate_minimal_agent(
         entry = features_out.setdefault("minimal_agent", {}).setdefault(layer, [torch.zeros_like(stacked), 0])
         entry[0] += stacked
         entry[1] += 1
+        if MINIMAL_AGENT_ELBO_KEYS[0] in capture:                                # diagnose_agent_elbo
+            bound = torch.stack([capture[key].detach().double().cpu().reshape(()) for key in MINIMAL_AGENT_ELBO_KEYS])
+            total = features_out.setdefault("minimal_agent_elbo", {}).setdefault(layer, [torch.zeros_like(bound), 0])
+            total[0] += bound                                                    # (3,) elbo, evidence, gap
+            total[1] += 1
+
+
+def _elbo_rows(
+    features: Mapping[str, Any],
+    step:     int,
+) -> Tuple[List[Dict[str, float]], List[Dict[str, float]]]:
+    r"""``diagnostics/minimal_agent_elbo.csv`` and ``diagnostics/prototype_elbo.csv`` rows (:data:`MINIMAL_AGENT_ELBO_FIELDS`,
+    :data:`PROTOTYPE_ELBO_FIELDS`) from the sums of :func:`_residual_and_attention_rows`; empty lists without
+    ``diagnose_agent_elbo``. The minimal-agent values are chunk means of the receiver means; the prototype values are
+    token means."""
+    minimal_rows: List[Dict[str, float]] = []
+    for layer, (total, count) in sorted(features.get("minimal_agent_elbo", {}).items()):
+        elbo, evidence, gap = (total / count).tolist()
+        minimal_rows.append({"step": int(step), "layer": int(layer), "elbo": elbo, "evidence": evidence,
+                             "elbo_gap": gap})
+    prototype_rows: List[Dict[str, float]] = []
+    for layer, (elbo, evidence, gap, tokens) in sorted(features.get("prototype_elbo", {}).items()):
+        n = max(1, tokens)
+        prototype_rows.append({"step": int(step), "layer": int(layer), "elbo": elbo / n, "evidence": evidence / n,
+                               "elbo_gap": gap / n, "n_tokens": int(tokens)})
+    return minimal_rows, prototype_rows
 
 
 def _feature_rows(
@@ -2918,6 +2970,13 @@ def _eval_cadence_diagnostics(
                     if template_rows:
                         artifacts.append_diagnostic_rows(
                             "prototype_templates.csv", PROTOTYPE_TEMPLATE_FIELDS, template_rows)
+                    minimal_elbo_rows, prototype_elbo_rows = _elbo_rows(features, step)
+                    if minimal_elbo_rows:
+                        artifacts.append_diagnostic_rows(
+                            "minimal_agent_elbo.csv", MINIMAL_AGENT_ELBO_FIELDS, minimal_elbo_rows)
+                    if prototype_elbo_rows:
+                        artifacts.append_diagnostic_rows(
+                            "prototype_elbo.csv", PROTOTYPE_ELBO_FIELDS, prototype_elbo_rows)
                 except Exception as exc:
                     _record_diagnostic_failure(failures, "feature_diagnostics", exc, logger)
             if holonomy is not None:
@@ -4273,6 +4332,8 @@ def train(
             val_diag_keys = val_diag_keys + _VAL_LATENT_DIAG_KEYS
     if vfe_model and getattr(cfg, "predictive_readout", "kernel") == "minimal_agent":
         val_diag_keys = val_diag_keys + _VAL_MINIMAL_AGENT_DIAG_KEYS
+        if getattr(cfg, "diagnose_agent_elbo", False):
+            val_diag_keys = val_diag_keys + _VAL_MINIMAL_AGENT_ELBO_KEYS
     if vfe_model and getattr(cfg, "diagnose_canonical_free_energy", False):
         val_diag_keys = val_diag_keys + tuple(f"val_{key}" for key in CANONICAL_DIAGNOSTIC_KEYS)
     last_val_diag: Dict[str, float] = {k: float("nan") for k in val_diag_keys}
@@ -5259,6 +5320,9 @@ def _fmt_tau(cfg: VFE3Config, model: VFEModel) -> str:
     if (getattr(cfg, "attention_mode", None) == "projected_predictive"
             and getattr(cfg, "predictive_readout", "kernel") == "minimal_agent"):
         return "1 (minimal_agent posterior; kappa_beta unused)"
+    if (getattr(cfg, "attention_mode", None) == "projected_predictive"
+            and getattr(cfg, "relational_routing", "gaussian_kl") == "noisy_key"):
+        return "1 (noisy_key routing; kappa_beta unused)"
     dev = next(model.parameters()).device
     tau = attention_tau(_as_coeff(cfg.kappa_beta, dev), model.group.irrep_dims, device=dev)
     if isinstance(tau, torch.Tensor) and tau.dim() >= 1:

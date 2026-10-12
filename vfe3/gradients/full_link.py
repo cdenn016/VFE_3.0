@@ -174,15 +174,24 @@ def full_link_context_at(
         D = self_coupling_divergence(mu, sigma, profile)                 # (..., N) or (..., N, K)
         alpha = alpha_gradient_coefficient(
             D, b0=_coeff(profile.b0, D), c0=_coeff(profile.c0, D), mode=profile.mode)
-        if profile.per_coord:
-            sigma_p = profile.sigma_p.to(D.dtype)
-            Lambda = profile.Lambda + torch.diag_embed(alpha / sigma_p)
-            eta = profile.eta + alpha * profile.mu_p.to(D.dtype) / sigma_p
-            c = alpha + profile.mass.unsqueeze(-1)                       # (..., N, K)
-        else:
-            Lambda = profile.Lambda + alpha[..., None, None] * profile.prior_precision
-            eta = profile.eta + alpha.unsqueeze(-1) * profile.prior_eta
-            c = alpha + profile.mass                                     # (..., N)
+        return _context_at_alpha(context, alpha)
+
+
+def _context_at_alpha(
+    context: FullLinkContext,
+    alpha:   torch.Tensor,                   # (..., N), or (..., N, K) per coordinate
+) -> FullLinkContext:
+    r"""The profiled context frozen at a given self-coupling alpha (see :func:`full_link_context_at`)."""
+    profile = context.profile
+    if profile.per_coord:
+        sigma_p = profile.sigma_p.to(alpha.dtype)
+        Lambda = profile.Lambda + torch.diag_embed(alpha / sigma_p)
+        eta = profile.eta + alpha * profile.mu_p.to(alpha.dtype) / sigma_p
+        c = alpha + profile.mass.unsqueeze(-1)                           # (..., N, K)
+    else:
+        Lambda = profile.Lambda + alpha[..., None, None] * profile.prior_precision
+        eta = profile.eta + alpha.unsqueeze(-1) * profile.prior_eta
+        c = alpha + profile.mass                                         # (..., N)
     return FullLinkContext(Lambda, eta, c, context.beta, context.score, profile)
 
 
@@ -724,6 +733,237 @@ def full_link_minimizer(
             new_sigma = .5 * (new_sigma + new_sigma.transpose(-1, -2))
     return (new_mu.to(torch.promote_types(mu.dtype, torch.float32)),
             new_sigma.to(torch.promote_types(sigma.dtype, torch.float32)))
+
+
+# Fixed iteration count of the certified one-sided Newton solve for the profiled self-coupling: no host
+# sync and no early exit. Quadratic convergence needs a handful; a fold (g' -> 0) converges linearly.
+_PROFILED_ROOT_ITERATIONS: int = 48
+# Log-spaced trial lengths per iteration, from the MM step to the domain width, evaluated in one batch.
+_PROFILED_TRIAL_LADDER: int = 16
+# Floor on g'(alpha) = 1 - h'(alpha) in the implicit derivative: g' = 0 is a fold of the fixed-point set,
+# where the root is not a differentiable function of the parameters.
+_PROFILED_SLOPE_FLOOR: float = 1e-6
+
+
+@dataclass(frozen=True)
+class _DivergenceCurve:
+    r"""D(a) = KL(q^\star(a) \| p) along the closed-form minimizers at prior weight a (float64, detached).
+
+    With the prior precision P = LL^T, A = L^{-1}\Lambda_cL^{-\top} = V\operatorname{diag}(l)V^\top and
+    r = V^\top L^{-1}(\eta_c - \Lambda_c\mu_p), the minimizer \mu^\star(a) = (\Lambda_c + aP)^{-1}(\eta_c + aP\mu_p) gives
+
+    .. math::
+        D_\mu(a)=\tfrac12\sum_k\frac{r_k^2}{(l_k+a)^2},\qquad
+        D_\Sigma^{\mathrm{full}}(a)=\tfrac12\sum_k(u_k-1-\log u_k),\quad u_k=\frac{a+m}{l_k+a},
+
+    from \Sigma^\star = (a+m)(\Lambda_c+aP)^{-1}. The diagonal family's variances
+    s_k = \operatorname{clamp}((a+m)/(\Lambda_{c,kk}+aP_{kk}), \epsilon, \sigma_{\max}) give
+    D_\Sigma^{\mathrm{diag}} = \tfrac12[\sum_k(P_{kk}s_k-\log s_k)+\log\det\Sigma_p-K]; a kept covariance
+    (``update_sigma=False``) gives a constant. Every term has slope -dD_k/da >= 0 that is nonincreasing in a
+    (on the clamp-free interval of a diagonal coordinate), which :meth:`slope_floor` uses.
+    """
+
+    l:     torch.Tensor                      # (..., N, K) generalized eigenvalues of (Lambda_c, P), >= 0
+    r2:    torch.Tensor                      # (..., N, K) squared rotated mean offsets
+    mass:  torch.Tensor                      # (..., N, 1) coupling-only entropy multiplicity m
+    kind:  str                               # 'full' | 'diagonal' | 'fixed'
+    const: torch.Tensor                      # (..., N) variance constant (diagonal, fixed)
+    Lc_diag: Optional[torch.Tensor]          # (..., N, K) Lambda_c,kk (diagonal)
+    P_diag:  Optional[torch.Tensor]          # (..., N, K) P_kk (diagonal)
+    eps:   float
+    sigma_max: Optional[float]
+
+    def evaluate(self, a: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        r"""Return D(a) (..., N), the mean slope (..., N), and the per-coordinate variance slopes and
+        clamp-free mask (..., N, K)."""
+        a_k = a.unsqueeze(-1)
+        shifted = self.l + a_k                                           # (..., N, K)
+        D = .5 * (self.r2 / shifted.square()).sum(-1)
+        slope_mean = (self.r2 / shifted.pow(3)).sum(-1)
+        weight = a_k + self.mass                                         # (..., N, 1), a + m
+        if self.kind == "full":
+            u = weight / shifted
+            D = D + .5 * (u - 1 - u.log()).sum(-1)
+            var_slope = (self.l - self.mass).square() / (2 * shifted.square() * weight)
+            free = torch.ones_like(var_slope, dtype=torch.bool)
+        elif self.kind == "diagonal":
+            denominator = self.Lc_diag + a_k * self.P_diag
+            s = weight / denominator
+            s_c = s.clamp(min=self.eps, max=self.sigma_max)
+            D = D + .5 * ((self.P_diag * s_c - s_c.log()).sum(-1) + self.const)
+            free = (s > self.eps) if self.sigma_max is None else (s > self.eps) & (s < self.sigma_max)
+            var_slope = torch.where(free, (self.Lc_diag - self.mass * self.P_diag).square()
+                                    / (2 * weight * denominator.square()), torch.zeros_like(s))
+        else:
+            D = D + self.const
+            var_slope = torch.zeros_like(shifted)
+            free = torch.ones_like(var_slope, dtype=torch.bool)
+        return D, slope_mean, var_slope, free
+
+    @staticmethod
+    def slope_floor(left: Tuple[torch.Tensor, ...], right: Tuple[torch.Tensor, ...]) -> torch.Tensor:
+        r"""Lower bound of -D' on [x, y] from evaluations at x (``left``) and y (``right``).
+
+        Each slope term decreases in a, so its value at y bounds it below; a diagonal variance term is
+        kept only when clamp-free at both ends (its clamp-free set is an interval), else bounded by 0.
+        """
+        _, slope_mean, var_slope, free = right
+        return slope_mean + torch.where(left[3] & free, var_slope, torch.zeros_like(var_slope)).sum(-1)
+
+
+def _divergence_curve(
+    profile:      SelfCouplingProfile,
+    mu:           torch.Tensor,              # (..., N, K)
+    sigma:        torch.Tensor,              # (..., N, K) or (..., N, K, K)
+    update_sigma: bool,
+    eps:          float,
+    sigma_max:    Optional[float],
+) -> _DivergenceCurve:
+    r"""Diagonalize the frozen-alpha family once per receiver (float64, no graph); see :class:`_DivergenceCurve`."""
+    f64 = torch.float64
+    P = profile.prior_precision.to(f64)                                  # (..., N, K, K)
+    Lc = profile.Lambda.to(f64)
+    Lc = .5 * (Lc + Lc.transpose(-1, -2))
+    L = torch.linalg.cholesky(P)
+    half = torch.linalg.solve_triangular(L, Lc, upper=False)             # L^{-1} Lambda_c
+    A = torch.linalg.solve_triangular(L, half.transpose(-1, -2), upper=False)   # L^{-1} Lambda_c L^{-T}
+    l, V = torch.linalg.eigh(.5 * (A + A.transpose(-1, -2)))             # (..., N, K), (..., N, K, K)
+    offset = profile.eta.to(f64) - (Lc @ profile.mu_p.to(f64).unsqueeze(-1)).squeeze(-1)
+    r = (V.transpose(-1, -2) @ torch.linalg.solve_triangular(L, offset.unsqueeze(-1), upper=False)).squeeze(-1)
+    mass = profile.mass.to(f64).unsqueeze(-1)
+    const = torch.zeros_like(mass.squeeze(-1))
+    Lc_diag = P_diag = None
+    if not update_sigma:
+        kind = "fixed"
+        mu_p = torch.broadcast_to(profile.mu_p.to(f64), mu.shape)
+        const = self_coupling_divergence(mu_p, sigma.to(f64), profile)  # variance part only
+    elif sigma.ndim == mu.ndim:
+        kind = "diagonal"
+        Lc_diag, P_diag = Lc.diagonal(dim1=-2, dim2=-1), P.diagonal(dim1=-2, dim2=-1)
+        const = profile.prior_logdet.to(f64) - mu.shape[-1]
+    else:
+        kind = "full"
+    return _DivergenceCurve(l.clamp(min=0), r.square(), mass, kind, const, Lc_diag, P_diag, eps, sigma_max)
+
+
+def _profiled_root(
+    curve: _DivergenceCurve,
+    a0:    torch.Tensor,                     # (..., N) alpha*(q_t), float64
+    b0:    'float | torch.Tensor',
+    c0:    'float | torch.Tensor',
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Fixed point of h(a) = c0/(b0 + D(a)) reached by the closed-form MM iteration a_{t+1} = h(a_t) from a0.
+
+    h is nondecreasing (the minimizers of aD + E have D nonincreasing in a) and h <= c0/b0, so the MM
+    sequence is monotone and converges to r, the nearest fixed point of g(a) = a - h(a) on the side
+    sign(h(a0) - a0); g keeps the sign of g(a0) strictly between a0 and r. From the current point s the
+    step is certified not to cross r: with \underline{h}' = c_0\,\underline{S}/(b_0+D_{\mathrm{left}})^2 a
+    lower bound of h' on the trial interval (:meth:`_DivergenceCurve.slope_floor`, D is largest at its
+    left end), g(s \pm t) keeps its sign for t < |g(s)|/(1 - \underline{h}'). Each iteration certifies the
+    Newton step |g|/(1 - h'(s)) and a log-spaced ladder of trial lengths from the MM step |g| to the domain
+    bound (c0/b0 above, half of s below) in one batch, and takes the longest certified step. Steps are never
+    shorter than the MM step, the ladder crosses near-tangent stretches where h' ~ 1 (where MM and Newton
+    both crawl), and the Newton trial converges quadratically at a simple root. Returns
+    (r, |g(r)|, g'(r) = 1 - h'(r)).
+    """
+    tiny = torch.finfo(a0.dtype).tiny
+    cap = c0 / b0
+    D, *_ = curve.evaluate(a0)
+    up = c0 / (b0 + D) > a0                                              # (..., N), MM direction
+    ladder = torch.linspace(0, 1, _PROFILED_TRIAL_LADDER, dtype=a0.dtype, device=a0.device).reshape(
+        -1, *(1,) * a0.ndim)                                             # (J, 1, ..., 1) log-spaced exponents
+    s = a0
+    for _ in range(_PROFILED_ROOT_ITERATIONS):
+        at_s = curve.evaluate(s)
+        D_s = at_s[0]
+        gap = torch.where(up, c0 / (b0 + D_s) - s, s - c0 / (b0 + D_s)).clamp(min=0)   # |g(s)| toward r
+        h_prime = c0 * (at_s[1] + at_s[2].sum(-1)) / (b0 + D_s).square()
+        newton = torch.where(h_prime < 1, gap / (1 - h_prime).clamp(min=tiny), gap)
+        width = torch.where(up, cap - s, .5 * s)
+        # Trials: the Newton step and a log-spaced ladder from the MM step |g| to the domain width.
+        log_gap = gap.clamp(min=tiny).log()
+        spread = (width.clamp(min=tiny).log() - log_gap).clamp(min=0)
+        trials = torch.cat((newton.unsqueeze(0), (log_gap + ladder * spread).exp()))     # (J + 1, ..., N)
+        trials = torch.maximum(torch.minimum(trials, width), gap)
+        y = torch.where(up, s + trials, s - trials)
+        at_y = curve.evaluate(y)
+        slope = torch.where(up, _DivergenceCurve.slope_floor(at_s, at_y), _DivergenceCurve.slope_floor(at_y, at_s))
+        floor = c0 * slope / (b0 + torch.where(up, D_s, at_y[0])).square()   # h' >= floor on each trial interval
+        certified = torch.where(floor < 1, torch.minimum(trials, gap / (1 - floor).clamp(min=tiny)), trials)
+        step = torch.where(gap > 0, torch.maximum(certified.amax(0), gap), gap)     # g(s) = 0: stay
+        s = torch.where(up, s + step, s - step)
+    D, slope_mean, var_slope, _ = curve.evaluate(s)
+    h = c0 / (b0 + D)
+    return s, (h - s).abs(), 1 - c0 * (slope_mean + var_slope.sum(-1)) / (b0 + D).square()
+
+
+@ieee_fp32_matmul()                       # receiver force and solves at IEEE fp32
+def full_link_profiled_minimizer(
+    mu:      torch.Tensor,                   # (..., N, K), current receiver means
+    sigma:   torch.Tensor,                   # (..., N, K) or (..., N, K, K)
+    context: FullLinkContext,
+    *,
+    damping:          float = 1.0,
+    update_sigma:     bool  = True,
+    eps:              float = 1e-6,
+    sigma_max:        Optional[float] = None,
+    capture:          Optional[Dict[str, Any]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Stationary point of the profiled receiver energy reached by the closed-form MM iteration.
+
+    .. math::
+        E(q)=c_0\log(b_0+D(q))+G(q),\qquad
+        q^\star(a)=\arg\min_q\,aD(q)+G(q),\qquad
+        r=h(r),\quad h(a)=\frac{c_0}{b_0+D(q^\star(a))}.
+
+    Stationarity of E is \alpha^\star(q) = c0/(b0 + D(q)) with q = q*(alpha^\star), the scalar fixed point
+    r = h(r) per receiver. Iterated ``closed_form`` steps are the fixed-point iteration a_{t+1} = h(a_t) from
+    a_0 = alpha*(q_t); this returns their limit q*(r) in one solve (:func:`_profiled_root`). Along the curve
+    a -> q*(a), dE/da = -g(a) dD/da with g = a - h, so E decreases monotonically from the one-step MM point
+    q*(a_0) to q*(r): E(q*(r)) <= E(q*(a_0)) <= E(q_t). E need not be convex, and several fixed points can
+    exist; r is the one the MM iteration from q_t converges to, not necessarily the global minimizer.
+
+    The root is solved without graph in float64. Its derivative is attached by one implicit Newton step,
+    alpha = r + (h(r; theta) - sg[h(r; theta)])/g'(r), which leaves the value r and has derivative
+    d alpha/d theta = (dh/d theta)/(1 - h'), the implicit-function derivative of g(alpha; theta) = 0
+    (g' floored at _PROFILED_SLOPE_FLOOR; at a fold of the fixed-point set no derivative exists).
+
+    ``damping`` rho interpolates the natural parameters toward q*(r) exactly as :func:`full_link_minimizer`
+    does toward its frozen target (it is that function, applied to the context frozen at alpha). At rho = 1
+    the descent E(q*(r)) <= E(q_t) holds on both families. For rho < 1 no descent of E is guaranteed on
+    either family: the frozen energy at r majorizes E with contact at q*(r), not at q_t.
+    ``update_sigma=False`` keeps the covariance and solves the mean-only fixed point.
+    ``state_dependent_per_coord`` is refused: its fixed points couple across coordinates through the
+    dense mean precision. A constant-alpha context dispatches to :func:`full_link_minimizer` unchanged.
+    """
+    profile = context.profile
+    if profile is None:
+        return full_link_minimizer(mu, sigma, context, damping=damping, update_sigma=update_sigma,
+                                   eps=eps, sigma_max=sigma_max)
+    if profile.per_coord:
+        raise ValueError("relational_receiver_update='closed_form_profiled' supports lambda_alpha_mode="
+                         "'state_dependent' only: per coordinate, mu*(alpha) = Lambda(alpha)^{-1} eta(alpha) "
+                         "couples the coordinate fixed points through the dense coupling precision")
+    dtype = context.Lambda.dtype
+    with torch.autocast(device_type=mu.device.type, enabled=False):
+        with torch.no_grad():
+            f64 = torch.float64
+            mu64, sigma64 = mu.detach().to(f64), sigma.detach().to(f64)
+            b0, c0 = _coeff(profile.b0, mu64), _coeff(profile.c0, mu64)
+            curve = _divergence_curve(profile, mu64, sigma64, update_sigma, eps, sigma_max)
+            a0 = c0 / (b0 + self_coupling_divergence(mu64, sigma64, profile))             # (..., N)
+            root, residual, g_prime = _profiled_root(curve, a0, b0, c0)
+        if capture is not None:
+            capture["relational_receiver_profiled_residual"] = residual.max().to(dtype)
+        alpha = root.to(dtype)
+        if torch.is_grad_enabled():
+            at_root = full_link_minimizer(mu, sigma, _context_at_alpha(context, alpha), damping=1.0,
+                                          update_sigma=update_sigma, eps=eps, sigma_max=sigma_max)
+            D = self_coupling_divergence(*at_root, profile)
+            h = _coeff(profile.c0, D) / (_coeff(profile.b0, D) + D)
+            alpha = alpha + (h - h.detach()) / g_prime.clamp(min=_PROFILED_SLOPE_FLOOR).to(dtype)
+        return full_link_minimizer(mu, sigma, _context_at_alpha(context, alpha), damping=damping,
+                                   update_sigma=update_sigma, eps=eps, sigma_max=sigma_max)
 
 
 @ieee_fp32_matmul()                       # receiver force and solves at IEEE fp32

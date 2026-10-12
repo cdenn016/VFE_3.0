@@ -60,7 +60,7 @@ def _rope_cfg(**kw):
 
 def test_rope_cache_key_tracks_mutated_rope_base():
     model = VFEModel(_rope_cfg(
-        embed_dim=8, n_heads=2, pos_rotation="rope",  rope_base=100.0,
+        embed_dim=8, n_heads=2, rope_mode="frame_value",  rope_base=100.0,
     ))
     device = model.prior_bank.mu_embed.device
     first = model._rope_rotation(8, device)
@@ -68,7 +68,7 @@ def test_rope_cache_key_tracks_mutated_rope_base():
     model.cfg.rope_base = 2.0
     second = model._rope_rotation(8, device)
     fresh = VFEModel(_rope_cfg(
-        embed_dim=8, n_heads=2, pos_rotation="rope",  rope_base=2.0,
+        embed_dim=8, n_heads=2, rope_mode="frame_value",  rope_base=2.0,
     ))._rope_rotation(8, device)
 
     assert not torch.equal(first, second)
@@ -76,37 +76,8 @@ def test_rope_cache_key_tracks_mutated_rope_base():
     assert len(model._rope_cache) == 1
 
 
-def test_rope_cache_key_tracks_mutated_pos_rotation():
-    from vfe3.geometry import rope as rope_module
-
-    name = "audit_negated_rope"
-
-    @rope_module.register_pos_rotation(name)
-    def _negated_rope(positions, irrep_dims, *, base=100.0, device=None, dtype=torch.float32):
-        return -build_rope_rotation(
-            positions,
-            irrep_dims,
-            base=base,
-            device=device,
-            dtype=dtype,
-        )
-
-    try:
-        model = VFEModel(_rope_cfg(pos_rotation="rope", ))
-        device = model.prior_bank.mu_embed.device
-        first = model._rope_rotation(8, device)
-
-        model.cfg.pos_rotation = name
-        second = model._rope_rotation(8, device)
-
-        assert torch.equal(second, -first)
-        assert len(model._rope_cache) == 1
-    finally:
-        rope_module._POS_ROTATIONS.pop(name, None)
-
-
 def test_runtime_length_caches_retain_only_the_latest_shape():
-    model = VFEModel(_rope_cfg(pos_rotation="rope", ))
+    model = VFEModel(_rope_cfg(rope_mode="frame_value", ))
     device = model.prior_bank.mu_embed.device
 
     for length in range(1, model.cfg.max_seq_len + 1):
@@ -120,8 +91,8 @@ def test_runtime_length_caches_retain_only_the_latest_shape():
 def test_rope_changes_logits_vs_no_rope():
     torch.manual_seed(0)
     x = torch.randint(0, 6, (2, 8))
-    base = VFEModel(_rope_cfg(pos_rotation="none"))
-    roped = VFEModel(_rope_cfg(pos_rotation="rope", ))
+    base = VFEModel(_rope_cfg(rope_mode="none"))
+    roped = VFEModel(_rope_cfg(rope_mode="frame_value", ))
     roped.load_state_dict(base.state_dict())
     assert not torch.allclose(base(x), roped(x), atol=1e-5)   # RoPE perturbs attention -> logits
 
@@ -129,8 +100,8 @@ def test_rope_changes_logits_vs_no_rope():
 def test_attention_maps_reflect_rope():
     torch.manual_seed(0)
     x = torch.randint(0, 6, (1, 8))
-    base = VFEModel(_rope_cfg(pos_rotation="none"))
-    roped = VFEModel(_rope_cfg(pos_rotation="rope", ))
+    base = VFEModel(_rope_cfg(rope_mode="none"))
+    roped = VFEModel(_rope_cfg(rope_mode="frame_value", ))
     roped.load_state_dict(base.state_dict())
     a = base.attention_maps(x)
     b = roped.attention_maps(x)
@@ -142,7 +113,7 @@ def test_diagnostics_runs_under_rope() -> None:
     """RoPE diagnostics capture the supported full-link receiver episode in float32."""
     torch.manual_seed(0)
     x = torch.randint(0, 6, (1, 8))
-    roped = VFEModel(_rope_cfg(pos_rotation="rope"))
+    roped = VFEModel(_rope_cfg(rope_mode="frame_value"))
     snapshot = roped.build_diagnostic_snapshot(x)
     diag = roped.diagnostics(x, snapshot=snapshot)
     assert snapshot.rope is not None
@@ -164,7 +135,7 @@ def _full_cov_cfg(**kw):
 
 def test_full_gauge_model_runs_forward_backward():
     # Reachability: a full-covariance rope_full_gauge model trains (finite gradients) end to end.
-    cfg = _full_cov_cfg(pos_rotation="rope")
+    cfg = _full_cov_cfg(rope_mode="frame_value")
     torch.manual_seed(0)
     m = VFEModel(cfg)
     x = torch.randint(0, 6, (1, 6)); y = torch.randint(0, 6, (1, 6))
@@ -176,46 +147,35 @@ def test_full_gauge_model_runs_forward_backward():
 def test_2x2_positional_ablation_runs():
     torch.manual_seed(0)
     x = torch.randint(0, 6, (2, 8))
-    for pr in ("none", "rope"):
+    for pr in ("none", "frame_value"):
         for pp in ("none", "learned"):
-            m = VFEModel(_rope_cfg(pos_rotation=pr, pos_phi=pp))
+            m = VFEModel(_rope_cfg(rope_mode=pr, pos_phi=pp))
             out = m(x)
             assert out.shape[0] == 2 and torch.isfinite(out).all()
 
 
-# --- value-gauge decoupling toggle (rope_on_value) -------------------------
+# --- value-gauge decoupling (rope_mode "frame" versus "frame_value") ------------------
 
-def test_rope_on_value_can_be_enabled_explicitly():
-    assert test_config(rope_on_value=True).rope_on_value is True
+def test_frame_value_rope_can_be_enabled_explicitly():
+    assert test_config(rope_mode="frame_value").rope_mode == "frame_value"
 
 
 def test_rope_on_value_false_decouples_and_changes_logits():
-    # With RoPE on, factoring the value gauge from the attention gauge (rope_on_value=False) gives a
+    # With RoPE on, factoring the value gauge from the attention gauge (rope_mode="frame") gives a
     # different forward than the coherent single-gauge default -- the value aggregation drops RoPE.
     torch.manual_seed(0)
     x = torch.randint(0, 6, (2, 8))
-    coupled = VFEModel(_rope_cfg(pos_rotation="rope",  rope_on_value=True))
-    decoupled = VFEModel(_rope_cfg(pos_rotation="rope",  rope_on_value=False))
+    coupled = VFEModel(_rope_cfg(rope_mode="frame_value"))
+    decoupled = VFEModel(_rope_cfg(rope_mode="frame"))
     decoupled.load_state_dict(coupled.state_dict())
     assert not torch.allclose(coupled(x), decoupled(x), atol=1e-5)
-
-
-def test_rope_on_value_inert_without_rope():
-    # rope_on_value only factors the gauge-RoPE rotation; with pos_rotation='none' there is no
-    # rotation, so the flag is a no-op and the forward is byte-identical.
-    torch.manual_seed(0)
-    x = torch.randint(0, 6, (2, 8))
-    a = VFEModel(_rope_cfg(pos_rotation="none", rope_on_value=True))
-    b = VFEModel(_rope_cfg(pos_rotation="none", rope_on_value=False))
-    b.load_state_dict(a.state_dict())
-    assert torch.allclose(a(x), b(x), atol=1e-6)
 
 
 def test_rope_on_value_false_model_trains_end_to_end():
     # Decoupled value gauge routes the belief gradient to the autograd oracle; the model must still
     # train (finite loss and prior-table gradients) end to end.
     torch.manual_seed(0)
-    m = VFEModel(_rope_cfg(pos_rotation="rope",  rope_on_value=False))
+    m = VFEModel(_rope_cfg(rope_mode="frame"))
     x = torch.randint(0, 6, (1, 8)); y = torch.randint(0, 6, (1, 8))
     _, loss, _ = m(x, y); loss.backward()
     assert torch.isfinite(loss)

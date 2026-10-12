@@ -97,16 +97,15 @@ def test_predictive_live_model_config_optimizer_and_diagnostics() -> None:
     assert "conditional_context" not in cap["relational_capture"]
 
 
-@pytest.mark.parametrize("rope_on_value", [False, True])
+@pytest.mark.parametrize("rope_mode", ["frame", "frame_value"])
 def test_predictive_full_scope_accepts_rope_and_keeps_outer_gradients(
-    rope_on_value: bool,
+    rope_mode: str,
 ) -> None:
     cfg = _cfg(
 
         attention_mode="projected_predictive",
 
-        pos_rotation="rope",
-        rope_on_value=rope_on_value,
+        rope_mode=rope_mode,
     )
     model = VFEModel(cfg)
     ids, targets = _tokens()

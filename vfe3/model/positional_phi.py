@@ -93,7 +93,7 @@ def _pos_phi_frozen(
     On the projected routes this element is composed into the frame, before the learned comparison maps, and the
     generator's exponential is not orthogonal in general, so neither it nor its relative products commute with
     those maps: the routing cost depends on absolute position (audit 2026-10-07, F31). The relative alternative is
-    ``pos_rotation='rope'`` with ``rope_space='comparison'``, which rotates the projected moments after the maps.
+    a comparison ``rope_mode``, which rotates the projected moments after the maps.
     """
     coords = torch.zeros(n, n_gen, device=device, dtype=dtype)
     coords[:, frozen_axis] = torch.arange(n, device=device, dtype=dtype) * scale

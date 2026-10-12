@@ -316,9 +316,9 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #################################
     #           Modes               #
     #################################
-    family                           = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full" | "laplace_diagonal"
+    family                           = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full"
     encode_mode                      = "per_token",   # "per_token" | "per_token_additive" (additive only when phi carries no position)
-    decode_mode                      = 'linear',  # "linear" | "diagonal_chunked" | "full_chunked" | "expected_likelihood_chunked" | "family_chunked" (the *_chunked modes decode through the prior bank)
+    decode_mode                      = 'linear',  # "linear" | "diagonal_chunked" | "full_chunked" | "expected_likelihood_chunked" (the *_chunked modes decode through the prior bank)
         
     attention_mode                   = "projected_predictive",  # "projected_predictive" | "projected_gradient"
     predictive_covariance            = 'moment_matched',  # "passthrough"| "moment_matched" (exact predictive-kernel covariance)
@@ -327,7 +327,6 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     relational_routing               = "gaussian_kl",           # "gaussian_kl" | "noisy_query" (noisy_query: projected_predictive only)
     relational_receiver_law          = "channel_likelihood",  # "channel_likelihood" | "ambient_alignment" (projected_gradient only)
     relational_receiver_update       = "closed_form",         # "closed_form" (exact frozen-context update) | "euler" (Fisher step; reads e_q_mu_lr / e_q_sigma_lr / trusts) (projected_gradient only)
-    relational_output_init           = "identity",      # "identity" | "depth_scaled" (initial "Oh" times 1/sqrt(2 n_layers))   
        
     predictive_readout               = "minimal_agent",     # "kernel" | "minimal_agent" (projected_predictive only)
     minimal_agent_inference          = "mean_field",         # "exact" | "mean_field" (minimal_agent only)
@@ -408,13 +407,12 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     ####################################
     #       Positional Encoding
     #    BCH gauge-frame PE (pos_phi)
-    #     gauge-RoPE (pos_rotation)
+    #     gauge-RoPE (rope_mode)
     ####################################
 
     pos_phi                          = "learned",           # "none" | "learned" | "frozen"
-    pos_rotation                     = "none",              # "none" | "rope"
+    rope_mode                        = "none",              # "none" | "frame" | "frame_value" | "comparison" | "comparison_invariant"
          
-    rope_on_value                    = False,
 
     ######################################
     #                Self Energy:
@@ -496,16 +494,11 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     fp32_matmul_precision            = "highest",          # None (leave as-is) | "highest" | "high" | "medium" ("high" permits TF32 on the decode/energy GEMMs)
         
     decode_ce_checkpoint             = "auto",     # "auto" | "auto_aggregate" (saves memory with recompute)
-    projected_cov_recovery_precision = "fp32",     # "fp64" | "fp32"
-    projected_factor_route           = "gram",     # "gram" | "cholesky_qr2" (slower unless recovery actually trips)
+    projected_factorization          = "gram",     # "gram" | "gram_certified" | "cholesky_qr2_certified" (certified: rebuild ill-conditioned factors; costly)
    
-    frame_pair_fp64_escalation       = False,
-    projected_cov_condition_recovery = False,
+    frame_pair_escalation_tol        = None,       # None (off) | tol, e.g. 1e-4: redo ill-conditioned frame pairs in fp64 (costly)
     predictive_covariance_checkpoint = False,       # moment_matched only: recompute the (B,N,K,K) update in backward; bit-identical.
         
-    projected_gram_condition_tol     = 1e-4,
-    projected_factor_condition_tol   = 3e-4,
-    frame_pair_condition_tol         = 1e-4,       # inactive while the escalation is off
    
     
 )
@@ -818,7 +811,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "param": "rope_base", 
         "values": [25, 75, 100, 150, 250, 1000],
         "scale": "log",
-        "requires": {"pos_rotation": "rope"},
+        "requires": {"rope_mode": "frame"},
     },    
     
     
@@ -1016,7 +1009,7 @@ _ATTENTION_REQUIRES = {
     "family": "gaussian_diagonal",
     "n_layers": 1, "n_e_steps": 1, "skip_belief_sigma_update": True,
     "gauge_group": "block_glk",
-    "gauge_transport": "on", "pos_rotation": "none",
+    "gauge_transport": "on", "rope_mode": "none",
     "encode_mode": "per_token", "decode_mode": "linear",
     "attention_mode": "projected_predictive",
     "m_relational_score_lr": None, "m_relational_content_lr": None,

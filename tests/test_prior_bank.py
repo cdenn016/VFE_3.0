@@ -140,9 +140,9 @@ def test_decode_exact_at_large_mean_offset():
 # ===========================================================================
 # PB-14 (Task 5, 2026-07-12): family/divergence-consistent prior-bank decode.
 #
-# The generic `family`/`family_chunked` decode modes score logits = -D_configured(q||p_v)/
-# tau_eff through the CONFIGURED belief family and divergence functional, with NO kl_max ranking
-# clamp, so the readout matches the E-step geometry instead of a hardcoded gaussian alpha=1 KL.
+# The dense family oracle behind reference_decode scores logits = -D_configured(q||p_v)/tau_eff
+# through the CONFIGURED belief family and divergence functional, with NO kl_max ranking clamp
+# (the registered generic family decode modes were retired 2026-10-12).
 # The DecodeRegistration carries a resolved covariance_kinds set (backward-compatible with the
 # legacy supports_full bit) and a family_consistent flag the config validates against.
 # ===========================================================================
@@ -169,7 +169,7 @@ def test_family_decode_matches_direct_functional_diagonal_gaussian(alpha):
     torch.manual_seed(0)
     V, K, n_gen = 7, 3, 4
     pb = PriorBank(V, K, n_gen, decode_tau=1.3, family="gaussian_diagonal",
-                   renyi_order=alpha, decode_mode="family_chunked")
+                   renyi_order=alpha, decode_mode="diagonal_chunked")
     with torch.no_grad():
         pb.mu_embed.normal_(0.0, 0.7)
         pb.sigma_log_embed.normal_(0.0, 0.4)
@@ -189,8 +189,8 @@ def test_noncanonical_family_decode_ranking_differs_from_gaussian_kl():
     # differently from the alpha=1 KL readout (the alpha blend reweights the tight-vs-loose priors).
     torch.manual_seed(1)
     V, K, n_gen = 7, 3, 4
-    pb_kl = PriorBank(V, K, n_gen, family="gaussian_diagonal", decode_mode="family_chunked")
-    pb_renyi = PriorBank(V, K, n_gen, family="gaussian_diagonal", renyi_order=0.5, decode_mode="family_chunked")
+    pb_kl = PriorBank(V, K, n_gen, family="gaussian_diagonal", decode_mode="diagonal_chunked")
+    pb_renyi = PriorBank(V, K, n_gen, family="gaussian_diagonal", renyi_order=0.5, decode_mode="diagonal_chunked")
     with torch.no_grad():
         mu = torch.randn(V, K)
         sig_log = torch.linspace(-3.0, 3.0, V).unsqueeze(-1).expand(V, K).contiguous()
@@ -211,7 +211,7 @@ def test_reference_decode_dispatches_configured_divergence(alpha):
     torch.manual_seed(2)
     V, K, n_gen = 7, 3, 4
     pb = PriorBank(V, K, n_gen, decode_tau=1.1, family="gaussian_diagonal",
-                   renyi_order=alpha, decode_mode="family_chunked")
+                   renyi_order=alpha, decode_mode="diagonal_chunked")
     with torch.no_grad():
         pb.mu_embed.normal_(0.0, 0.5)
     mu_q = torch.randn(2, 3, K); sigma_q = torch.rand(2, 3, K) + 0.3
@@ -222,16 +222,11 @@ def test_reference_decode_dispatches_configured_divergence(alpha):
 
 # --- covariance-kind membership: both diagonal and full configs construct --------------------
 
-def test_family_decode_config_accepts_diagonal_and_full_by_membership():
-    dcfg = test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=5,
-                      family="gaussian_diagonal", decode_mode="family_chunked")
-    assert dcfg.decode_mode == "family_chunked"
-    fcfg = test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=5,
-                      family="gaussian_full", decode_mode="family_chunked")
-    assert fcfg.decode_mode == "family_chunked"
-    # the family_chunked rank also accepts both kinds.
-    test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=5,
-               family="gaussian_full", decode_mode="family_chunked")
+def test_retired_family_decode_is_not_a_config_value():
+    for family in ("gaussian_diagonal", "gaussian_full"):
+        with pytest.raises(ValueError, match="decode_mode"):
+            test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=5,
+                        family=family, decode_mode="family_chunked")
 
 
 # --- PriorBank constructor stays source-compatible (no new args required) --------------------
@@ -324,12 +319,9 @@ def test_decode_registration_rejects_noncallable_fused_ce_direct_and_decorator()
         _DECODERS.pop(name, None)
 
 
-def test_registered_family_modes_are_family_consistent_dual_rank():
-    for name in ("family_chunked",):
-        r = get_decode_registration(name)
-        assert r.family_consistent is True
-        assert r.covariance_kinds == frozenset({"diagonal", "full"})
-    assert get_decode_registration("family_chunked").supports_chunked is True
+def test_builtin_gaussian_kernels_are_single_rank_and_not_family_consistent():
+    with pytest.raises(KeyError):
+        get_decode_registration("family_chunked")
     # the fast canonical kernels stay single-rank and NOT family-consistent.
     assert get_decode_registration("diagonal_chunked").covariance_kinds == frozenset({"diagonal"})
     assert get_decode_registration("full_chunked").covariance_kinds == frozenset({"full"})

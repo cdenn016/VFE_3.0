@@ -12,7 +12,6 @@ import pytest
 SLOW_TESTS: frozenset[str] = frozenset()
 
 CUDA_TESTS: frozenset[str] = frozenset({
-    'test_laplace_family.py::test_laplace_cuda_matches_cpu',
     # cuSOLVER batched-eigensolver ceiling guards, which skip without CUDA (audit 2026-10-10, item 50).
     'test_eigvalsh_batch_ceiling_20260807.py::test_convex_regime_survives_batch_above_eigvalsh_ceiling',
     'test_eigvalsh_batch_ceiling_20260807.py::test_eigvalsh_ceiling_is_real_and_cholesky_ex_has_none',

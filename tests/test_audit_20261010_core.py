@@ -263,11 +263,11 @@ def _probe_model(**overrides: object) -> VFEModel:
     return VFEModel(cfg)
 
 
-@pytest.mark.parametrize("rope_space", ["comparison", "frame"])
-def test_beta_channel_decomposition_separates_rope_position(rope_space: str) -> None:
+@pytest.mark.parametrize("rope_mode", ["comparison", "frame"])
+def test_beta_channel_decomposition_separates_rope_position(rope_mode: str) -> None:
     from vfe3.run_artifacts import collect_beta_channel_decomposition
 
-    model = _probe_model(pos_rotation="rope", rope_space=rope_space, rope_on_value=False)
+    model = _probe_model(rope_mode=rope_mode)
     bases = [ops.comparison_rope_base for ops in model.relational_operators_by_layer]
     tokens, targets = torch.tensor([[0, 1, 2, 3, 4, 5]]), torch.tensor([[1, 2, 3, 4, 5, 6]])
     channel = collect_beta_channel_decomposition(model, tokens, targets)
@@ -281,7 +281,7 @@ def test_beta_channel_decomposition_separates_rope_position(rope_space: str) -> 
 def test_beta_channel_decomposition_without_rope_has_no_rope_arm() -> None:
     from vfe3.run_artifacts import collect_beta_channel_decomposition
 
-    model = _probe_model(pos_rotation="none")
+    model = _probe_model(rope_mode="none")
     tokens, targets = torch.tensor([[0, 1, 2, 3]]), torch.tensor([[1, 2, 3, 4]])
     channel = collect_beta_channel_decomposition(model, tokens, targets)
     assert channel["energy_includes_rope_position"] is False
@@ -291,7 +291,7 @@ def test_beta_channel_decomposition_without_rope_has_no_rope_arm() -> None:
 def test_context_sensitivity_reads_the_final_belief() -> None:
     from vfe3.run_artifacts import collect_context_sensitivity
 
-    model = _probe_model(pos_rotation="none")
+    model = _probe_model(rope_mode="none")
     tokens = torch.tensor([[0, 1, 2, 3, 4, 5]])
     context = collect_context_sensitivity(model, tokens, n_replicates=2)
     stages = context["stages"]

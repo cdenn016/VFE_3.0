@@ -52,8 +52,7 @@ def frames_identity_reason(
     else:
         return None
     if positional and ((int(n_gen) > 0 and getattr(cfg, "pos_phi", "none") != "none")
-                       or (getattr(cfg, "pos_rotation", "none") != "none"
-                           and getattr(cfg, "rope_space", "frame") != "comparison")):
+                       or getattr(cfg, "rope_mode", "none") in ("frame", "frame_value")):
         return None
     return reason
 

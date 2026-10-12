@@ -273,16 +273,15 @@ def positional_frames_identity(model: torch.nn.Module) -> Iterator[Dict[str, Any
     r"""Row 8: positional generators :math:`\to 0`, so :math:`\exp(Y_i) = I` in every role.
 
     A learned table (``pos_phi_free``) is zeroed; a fixed positional chart is replaced by zero
-    coordinates through an instance override of ``_pos_phi_right``. Under ``rope_space='frame'`` the
+    coordinates through an instance override of ``_pos_phi_right``. Under a frame ``rope_mode`` the
     RoPE rotation is folded into the frames as a positional factor, and an instance override of
-    ``_rope_rotation`` removes it too. A comparison-space RoPE (``rope_space='comparison'``) rotates
+    ``_rope_rotation`` removes it too. A comparison-space RoPE (a comparison ``rope_mode``) rotates
     the projected routing moments, not a frame, and is kept.
     """
     cfg = model.cfg
     table = getattr(model, "pos_phi_free", None)
     chart = table is None and getattr(cfg, "pos_phi", "none") != "none"
-    rope_fold = (getattr(cfg, "pos_rotation", "none") != "none"
-                 and getattr(cfg, "rope_space", "frame") != "comparison")
+    rope_fold = getattr(cfg, "rope_mode", "none") in ("frame", "frame_value")
     if table is None and not chart and not rope_fold:
         raise NotApplicable("the model has no positional frames (no pos_phi chart and no frame-space RoPE fold)")
     removed: List[str] = []
@@ -303,7 +302,7 @@ def positional_frames_identity(model: torch.nn.Module) -> Iterator[Dict[str, Any
         if rope_fold:
             model._rope_rotation = lambda n, device: None
             stack.callback(delattr, model, "_rope_rotation")
-            removed.append(f"pos_rotation={cfg.pos_rotation!r} frame fold")
+            removed.append(f"rope_mode={cfg.rope_mode!r} frame fold")
         yield {"table": ", ".join(removed)}
 
 
@@ -334,7 +333,7 @@ def _identity_covariance_score(
         _compute_dtype, projected_moments, routing_cost)
 
     if getattr(operators, "comparison_rope_base", None) is not None:
-        raise NotApplicable("rope_space='comparison': this counterfactual scorer does not apply the comparison-space "
+        raise NotApplicable("comparison rope_mode: this counterfactual scorer does not apply the comparison-space "
                             "rotation, so it would not match the trained router")
     if operators.mixed_heads:
         raise NotApplicable(f"{operators.irrep_dims}: heads of different sizes (a mixed so_n irrep tower) are not supported by this analysis yet")
@@ -488,11 +487,11 @@ def _require_normal_form(model: torch.nn.Module) -> None:
             "the frame roles are the channels of the reference normal form (Corollary cor:normal_form) of the "
             "projected predictive route; this model has attention_mode="
             f"{getattr(cfg, 'attention_mode', None)!r} without relational predictive content on every layer")
-    # Only a frame-space RoPE is folded into the frames; rope_space='comparison' rotates the projected
+    # Only a frame-space RoPE is folded into the frames; a comparison rope_mode rotates the projected
     # routing moments and leaves every frame role as the normal form describes (row 10 refuses it itself).
-    if getattr(cfg, "pos_rotation", "none") != "none" and getattr(cfg, "rope_space", "frame") != "comparison":
+    if getattr(cfg, "rope_mode", "none") in ("frame", "frame_value"):
         raise NotApplicable(
-            f"pos_rotation={cfg.pos_rotation!r} with rope_space='frame' folds a positional rotation into the "
+            f"rope_mode={cfg.rope_mode!r} folds a positional rotation into the "
             "routing and content frames, a frame channel outside the four-role normal form")
     if getattr(cfg, "encode_mode", None) != "per_token":
         raise NotApplicable(
@@ -509,7 +508,8 @@ def _require_static_routing_covariance(model: torch.nn.Module) -> None:
     if any(getattr(op, "predictive_covariance", "passthrough") != "passthrough"
            for op in model.relational_operators_by_layer):
         raise NotApplicable(
-            "predictive_covariance='moment_matched': the routing covariance of layer l > 0 is the moment-matched "
+            "predictive_covariance='moment_matched' or 'spread_corrected': the routing covariance of layer l > 0 "
+            "is the readout's "
             "C_i^att, not the static C_i = U_i^{-1} Sigma_p U_i^{-T} of the normal form; removing the frame from "
             "the input covariance alone would need the full local covariance U_i Sigma_p U_i^T as stack input "
             "(and on the diagonal family the frame also enters the diagonal moment projection at every layer)")
@@ -614,7 +614,7 @@ def _frame_free_covariance_score(
         _compute_dtype, projected_moments, routing_cost)
 
     if getattr(operators, "comparison_rope_base", None) is not None:
-        raise NotApplicable("rope_space='comparison': this counterfactual scorer does not apply the comparison-space "
+        raise NotApplicable("comparison rope_mode: this counterfactual scorer does not apply the comparison-space "
                             "rotation, so it would not match the trained router")
     if operators.mixed_heads:
         raise NotApplicable(f"{operators.irrep_dims}: heads of different sizes (a mixed so_n irrep tower) are not supported by this analysis yet")
@@ -738,7 +738,7 @@ def frames_removed(model: torch.nn.Module, roles: Sequence[str]) -> Iterator[Dic
     **Scope.** Each row raises :class:`NotApplicable` when every realized frame is already the identity
     (:func:`frames_inactive_reason`), where it would report a measured zero. Outside the normal form each
     row raises :class:`NotApplicable` with the reason: no relational
-    predictive content on every layer, frame-space RoPE (``rope_space='frame'``; a comparison-space RoPE
+    predictive content on every layer, frame-space RoPE (``rope_mode`` ``'frame'`` or ``'frame_value'``; a comparison-space RoPE
     leaves the frames alone, and row 10's scorer refuses it), frame-intrinsic beliefs, a non-``per_token`` encoder, a head
     mixer or CG coupling; row 10 also needs covariance passthrough in attention and MLP, row 11 a mean-only
     normalization or MLP acting in local coordinates, row 12 the linear decoder. A model trained with

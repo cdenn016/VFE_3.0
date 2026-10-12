@@ -63,6 +63,7 @@ from typing import List, NamedTuple, Optional, Tuple
 import torch
 from torch.utils.checkpoint import checkpoint
 
+from vfe3.contracts import host_check
 from vfe3.runtime import ieee_fp32_matmul
 
 
@@ -88,6 +89,7 @@ class ExactPrototypePosterior(NamedTuple):
     u:          torch.Tensor               # (..., K) sum_a w_a r_a
     Lambda_bar: Optional[torch.Tensor]     # sum_a w_a W_a^{-1} (None unless need_precision)
     R:          Optional[torch.Tensor]     # between-template spread of r (None unless need_covariance)
+    log_evidence: Optional[torch.Tensor] = None   # (...,) log sum_a pi_hat_a N(nu_a; xi, C + Lambda_a)
 
 
 class MeanFieldPrototypePosterior(NamedTuple):
@@ -157,6 +159,12 @@ def _broadcast(t: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
 
 def _symmetric(A: torch.Tensor) -> torch.Tensor:
     return 0.5 * (A + A.transpose(-1, -2))
+
+
+def _raise_if(host: List[bool], message: str) -> None:
+    r"""Raise-only verdict of a :func:`vfe3.contracts.host_check`: ``ValueError(message)`` when the flag is set."""
+    if host[0]:
+        raise ValueError(message)
 
 
 @ieee_fp32_matmul()
@@ -344,7 +352,10 @@ def prototype_exact_posterior(
 
     ``need_covariance`` adds :math:`C^+` and :math:`R`; ``need_precision`` adds :math:`\bar\Lambda`
     (diagnostics and tests; :math:`C^+` does not read it). Covariance-shaped outputs use the input layout:
-    the diagonal, the diagonal blocks, or the dense matrix.
+    the diagonal, the diagonal blocks, or the dense matrix. ``log_evidence`` is the log evidence of the declared
+    record model, :math:`\log\sum_a\hat\pi_aN(\nu_a;\xi_i, C_i + \Lambda_a)` with :math:`\hat\pi = \operatorname{softmax}(\log\pi)`,
+    the log-sum-exp of the logits already formed less :math:`\operatorname{logsumexp}_a\log\pi_a + \tfrac K2\log 2\pi`
+    (audit 2026-10-12 T1; a diagnostic: it is unbounded above as :math:`C_i + \Lambda_a\to 0`).
     """
     layout = covariance_layout(xi, C)
     if nu.dim() != 2 or nu.shape[-1] != xi.shape[-1] or log_lambda.shape != nu.shape \
@@ -399,15 +410,18 @@ def prototype_exact_posterior(
             M2_rows.append(acc.M2)
             Psi_rows.append(acc.Psi)
             Lbar_rows.append(acc.Lbar)
-        # One device-side reduction and one host check for every tile.
-        if bool(torch.stack(failures).any()):
-            raise ValueError(
-                "prototype-agent record covariance C_i + Lambda_a is not positive definite: zero-jitter "
-                "Cholesky failed; no repair applied" if blocks else
-                "prototype-agent record variances c_i + lambda_a must be positive and finite")
+        # One device-side reduction and one raise-only host check for every tile (deferred to the next
+        # mandatory host read inside vfe3.contracts.deferred_host_checks).
+        message = ("prototype-agent record covariance C_i + Lambda_a is not positive definite: zero-jitter "
+                   "Cholesky failed; no repair applied" if blocks else
+                   "prototype-agent record variances c_i + lambda_a must be positive and finite")
+        host_check(torch.stack(failures).any().reshape(1), lambda host: _raise_if(host, message))
         s = torch.cat(s_rows)                                                # (R,)
         u = torch.cat(u_rows)                                                # (R, K) or (R, G, b)
-        weights = torch.softmax(torch.cat(logit_rows), dim=-1)               # (R, M)
+        logits = torch.cat(logit_rows)                                       # (R, M)
+        weights = torch.softmax(logits, dim=-1)                              # (R, M)
+        log_evidence = (torch.logsumexp(logits, dim=-1) - torch.logsumexp(lp, dim=-1)
+                        - 0.5 * K * math.log(2.0 * math.pi))                 # (R,)
         delta = (Cw @ u.unsqueeze(-1)).squeeze(-1) if blocks else Cw * u     # (R, ...) C u
         C_plus = R = Lambda_bar = None
         if need_covariance:
@@ -441,6 +455,7 @@ def prototype_exact_posterior(
             u=u.reshape(*lead, K),
             Lambda_bar=out_layout(Lambda_bar),
             R=out_layout(R),
+            log_evidence=log_evidence.reshape(lead),
         )
 
 
@@ -636,9 +651,84 @@ def prototype_mean_field_posterior(
                 failed = (info != 0).any() if failed is None else failed | (info != 0).any()
             if not last:
                 x_lab, c_lab = x + delta, covariance_diagonal(C_plus, layout)   # the next labels read (xi^+, diag C^+)
-        if failed is not None and bool(failed):
-            raise ValueError("prototype-agent power-posterior matrix I + D^{1/2} C D^{1/2} is not positive "
-                             "definite: the working covariance is not positive semidefinite or not finite")
+        if failed is not None:
+            # Raise-only: deferred to the next mandatory host read inside vfe3.contracts.deferred_host_checks.
+            host_check(failed.reshape(1), lambda host: _raise_if(
+                host, "prototype-agent power-posterior matrix I + D^{1/2} C D^{1/2} is not positive "
+                      "definite: the working covariance is not positive semidefinite or not finite"))
         return MeanFieldPrototypePosterior(
             xi_plus=x + delta, delta_xi=delta, C_plus=C_plus if need_covariance else None,
             responsibilities=responsibilities, D=D, eta=eta)
+
+
+def _cholesky_logdet(L: torch.Tensor) -> torch.Tensor:   # (..., G, b, b) -> (...)
+    return 2.0 * L.diagonal(dim1=-2, dim2=-1).log().sum(dim=(-2, -1))
+
+
+def _gaussian_kl_layout(
+    m_q:    torch.Tensor,                  # (..., K) mean of q
+    C_q:    torch.Tensor,                  # covariance of q in ``layout``
+    m_p:    torch.Tensor,                  # (..., K) mean of p
+    C_p:    torch.Tensor,                  # covariance of p in ``layout``
+    layout: str,
+) -> torch.Tensor:                         # (...)
+    r""":math:`\mathrm{KL}(N(m_q, C_q)\,\|\,N(m_p, C_p)) = \tfrac12[\operatorname{tr}(C_p^{-1}C_q) + \delta^\top C_p^{-1}\delta - K
+    + \log\det C_p - \log\det C_q]`, :math:`\delta = m_q - m_p`, elementwise (diagonal) or blockwise by Cholesky
+    factors (dense: one block). A factor that fails reads NaN."""
+    K = m_q.shape[-1]
+    delta = m_q - m_p
+    if layout == "diagonal":
+        return 0.5 * ((C_q / C_p).sum(-1) + (delta.square() / C_p).sum(-1) - K
+                      + C_p.log().sum(-1) - C_q.log().sum(-1))
+    Cq = C_q.unsqueeze(-3) if layout == "dense" else C_q                     # (..., G, b, b)
+    Cp = C_p.unsqueeze(-3) if layout == "dense" else C_p
+    G, b = Cp.shape[-3], Cp.shape[-1]
+    L_p, info_p = torch.linalg.cholesky_ex(Cp)
+    L_q, info_q = torch.linalg.cholesky_ex(Cq)
+    whitened = torch.linalg.solve_triangular(L_p, L_q, upper=False)          # (..., G, b, b) L_p^{-1} L_q
+    shift = torch.linalg.solve_triangular(L_p, delta.reshape(*delta.shape[:-1], G, b).unsqueeze(-1),
+                                          upper=False)                       # (..., G, b, 1)
+    kl = 0.5 * (whitened.square().sum(dim=(-3, -2, -1)) + shift.square().sum(dim=(-3, -2, -1)) - K
+                + _cholesky_logdet(L_p) - _cholesky_logdet(L_q))
+    return kl.masked_fill((info_p != 0).any(-1) | (info_q != 0).any(-1), math.nan)
+
+
+def prototype_elbo(
+    xi:         torch.Tensor,              # (..., K) working means (the block input)
+    C:          torch.Tensor,              # (..., K), (..., K, K) or (..., G, b, b) working covariance
+    xi_plus:    torch.Tensor,              # (..., K) posterior mean of q(X)
+    C_plus:     torch.Tensor,              # posterior covariance of q(X), C's layout
+    labels:     torch.Tensor,              # (..., M) template factor q(a)
+    nu:         torch.Tensor,              # (M, K) template means
+    log_lambda: torch.Tensor,              # (M, K) template log variances
+    log_pi:     torch.Tensor,              # (M,) template log prior weights (unnormalized)
+) -> torch.Tensor:                         # (...) float64
+    r"""Evidence lower bound of the prototype record model at :math:`q(X)q(a) = N(\xi^+, C^+)\,r` (audit 2026-10-12 T1).
+
+    The declared joint is :math:`N(X;\xi_i, C_i)\,\hat\pi_a\,N(X;\nu_a,\Lambda_a)` (the record of template :math:`a`
+    with :math:`S = T = I`, noise absorbed into :math:`\Lambda_a`, :math:`\hat\pi = \operatorname{softmax}(\log\pi)`), whose
+    evidence is :math:`\sum_a\hat\pi_aN(\nu_a;\xi_i, C_i + \Lambda_a)` (``log_evidence`` of
+    :func:`prototype_exact_posterior`). Then
+
+    .. math::
+        \mathcal L_i = -\mathrm{KL}(N(\xi_i^+, C_i^+)\,\|\,N(\xi_i, C_i)) + \sum_ar_{ia}\ell^+_{ia} - \sum_ar_{ia}\log r_{ia}
+            - \tfrac K2\log 2\pi,\qquad
+        \ell^+_{ia} = \log\hat\pi_a - \tfrac12\sum_k\Bigl[\frac{(C_i^+)_{kk} + (\xi^+_{ik} - \nu_{ak})^2}{\lambda_{ak}}
+            + \log\lambda_{ak}\Bigr],
+
+    since :math:`E_q\log N(X;\nu_a,\Lambda_a) = \ell^+_{ia} - \log\hat\pi_a - \tfrac K2\log 2\pi` (:func:`template_kl_logits`
+    at :math:`(\xi^+, \operatorname{diag}C^+)` and the normalized prior). It bounds the log evidence from below for any
+    :math:`q`, and the mean field's coordinate ascent does not decrease it from sweep to sweep. Computed in float64
+    without autograd (inputs detached); a covariance that does not factor reads NaN. Never part of the loss.
+    """
+    f64 = torch.float64
+    with torch.no_grad():
+        layout = covariance_layout(xi, C)
+        xi, C, xi_plus, C_plus, labels = (t.detach().to(f64) for t in (xi, C, xi_plus, C_plus, labels))
+        nu, log_lambda, log_pi = (t.detach().to(f64) for t in (nu, log_lambda, log_pi))
+        K = xi.shape[-1]
+        logits = template_kl_logits(xi_plus, covariance_diagonal(C_plus, layout), nu, log_lambda,
+                                    torch.log_softmax(log_pi, dim=-1))      # (..., M) l^+
+        entropy = -torch.special.xlogy(labels, labels).sum(dim=-1)            # (...)
+        expected = (labels * logits).sum(dim=-1) - 0.5 * K * math.log(2.0 * math.pi)
+        return expected + entropy - _gaussian_kl_layout(xi_plus, C_plus, xi, C, layout)

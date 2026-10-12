@@ -158,7 +158,7 @@ def _as_numpy_stream(stream: Any) -> np.ndarray:
 
 
 def _covariance_diagonal(run: Any, sigma: torch.Tensor) -> torch.Tensor:
-    r"""``diag Cov`` of a belief's sigma slot, family-aware (Laplace stores a scale, full a matrix)."""
+    r"""``diag Cov`` of a belief's sigma slot, family-aware (a full family stores a matrix)."""
     from vfe3.families.base import get_family
 
     return get_family(run.cfg.family).covariance_diagonal(sigma, eps=run.cfg.eps)

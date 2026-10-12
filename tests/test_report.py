@@ -288,7 +288,7 @@ class _MemoryGuardModel(torch.nn.Module):
             batch_size=32,
             n_e_steps=1,
             embed_dim=4,
-            decode_mode="family_chunked",
+            decode_mode="expected_likelihood_chunked",
             diagonal_covariance=True,
             family="gaussian_diagonal",
             decode_chunk_size=4096,

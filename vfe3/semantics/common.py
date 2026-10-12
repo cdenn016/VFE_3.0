@@ -201,8 +201,8 @@ def diagonal_redundancy_status(cfg: Any) -> Tuple[str, str]:
         unprobed.append(f"block_mlp_mode={cfg.block_mlp_mode!r}")
     if getattr(cfg, "use_cg_coupling", False):
         unprobed.append("use_cg_coupling=True")
-    if getattr(cfg, "pos_rotation", "none") != "none":
-        unprobed.append(f"pos_rotation={cfg.pos_rotation!r}")
+    if getattr(cfg, "rope_mode", "none") != "none":
+        unprobed.append(f"rope_mode={cfg.rope_mode!r}")
     if "mahalanobis" in norms:
         unprobed.append("a Mahalanobis norm (equivariant, not measured)")
     if unprobed:

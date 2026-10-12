@@ -168,15 +168,16 @@ def not_applicable_reason(model: torch.nn.Module) -> Optional[str]:
                 "step), not the clamped Gaussian KL of Eq. (projected_full_kl)")
     routes = sorted({str(getattr(op, "routing", "gaussian_kl")) for op in operators})
     if routes != ["gaussian_kl"]:
-        return (f"relational_routing={routes}: the noisy-query cost -log N(a_i; b_j, V_Q + V_K) and the "
-                "mean-distance cost ||a_i - b_j||^2/2 are not the Gaussian KL of Eq. (projected_full_kl)")
+        return (f"relational_routing={routes}: the noisy-query cost -log N(a_i; b_j, V_Q + V_K), the noisy-key cost "
+                "KL(N(a_i, V_Q) || N(b_j, V_K + n_h I)) at temperature 1 and the mean-distance cost ||a_i - b_j||^2/2 "
+                "are not the Gaussian KL of Eq. (projected_full_kl)")
     readouts = sorted({str(op.readout_mode) for op in operators})
     if readouts != ["predictive_content"]:
         return f"readout_mode={readouts}: routing is not the predictive-content readout"
     if int(getattr(cfg, "n_e_steps", 1)) < 1:
         return "n_e_steps=0: no E-step iteration, so the router is never evaluated"
     if any(getattr(op, "comparison_rope_base", None) is not None for op in operators):
-        return ("rope_space='comparison': the router scores the R_i-rotated projected moments, which this "
+        return ("comparison rope_mode: the router scores the R_i-rotated projected moments, which this "
                 "decomposition does not rebuild (it would decompose the unrotated cost)")
     if any(getattr(op, "routing_log_temperature", None) is not None for op in operators):
         return ("learn_attention_temperature=True: the routing temperature is learned per layer, and this "

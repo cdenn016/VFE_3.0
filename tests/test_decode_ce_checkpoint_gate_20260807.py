@@ -12,12 +12,12 @@ tolerance noise.
 Primary target: ``decode_ce_full_chunked`` (``decode_mode='full_chunked'``, the live
 ``train_vfe3.py`` config, measured at 8-13%% of the training step at reference scale entirely from
 an unconditional recompute). A handful of tests also exercise
-``decode_ce_diagonal_chunked``/``decode_ce_linear_chunked``/``decode_ce_expected_likelihood_chunked``/
-``decode_ce_family_chunked``: a grep for ``_checkpoint.checkpoint`` across ``vfe3/`` turned up the
-SAME unconditional ``if torch.is_grad_enabled() and ...requires_grad:`` pattern at all five call
-sites (prior_bank.py's only five checkpoint uses), so the fix -- a shared
-``_decode_ce_should_checkpoint`` dispatch reading ``pb.decode_ce_checkpoint`` -- was applied to
-all five for consistency, not just the dispatched target.
+``decode_ce_diagonal_chunked``/``decode_ce_linear_chunked``/``decode_ce_expected_likelihood_chunked``
+(and the generic family kernel, retired 2026-10-12): a grep for ``_checkpoint.checkpoint`` across
+``vfe3/`` turned up the SAME unconditional ``if torch.is_grad_enabled() and ...requires_grad:``
+pattern at all five call sites, so the fix -- a shared ``_decode_ce_should_checkpoint`` dispatch
+reading ``pb.decode_ce_checkpoint`` -- was applied to all of them for consistency, not just the
+dispatched target.
 """
 
 from tests.profiles import test_config
@@ -289,7 +289,6 @@ def test_config_decode_ce_checkpoint_live_under_full_chunked():
 @pytest.mark.parametrize("decode_mode,kwargs", [
     ("diagonal_chunked", {}),
     ("expected_likelihood_chunked", {}),
-    ("family_chunked", {"family": "gaussian_diagonal"}),
 ])
 def test_other_diagonal_chunked_kernels_value_identical_always_vs_never(decode_mode, kwargs):
     torch.manual_seed(0)

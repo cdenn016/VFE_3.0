@@ -35,9 +35,12 @@ _FINGERPRINTS_6B872B4 = {
 
 def _fingerprint_over_saved_fields(cfg: VFE3Config) -> str:
     r"""Fingerprint over the fields the 6b872b4 payload carries: a field added later is a schema-only change,
-    which the ablation and scaling resume paths re-derive separately."""
+    which the ablation and scaling resume paths re-derive separately. A field retired since 6b872b4 (merged
+    into a later field by the loader migration) is taken at its saved value, so every surviving field is
+    still compared."""
+    current = asdict(cfg)
     return semantic_config_fingerprint(
-        {key: value for key, value in asdict(cfg).items() if key in _PAYLOAD_6B872B4})
+        {key: current[key] if key in current else value for key, value in _PAYLOAD_6B872B4.items()})
 
 
 # --- C6: kl_max ------------------------------------------------------------------------------------------------

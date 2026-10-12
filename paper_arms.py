@@ -77,7 +77,7 @@ base's except where declared. Rules:
   protocol field among them is a declared difference. "Per-type read table, ALiBi (as run)" repeats
   the 55.10 configuration (``block_read``, ALiBi, no RoPE); the "Per-type table of the frame table's
   size" row is the same table under the base's own positional scheme. On a base with
-  ``beta_attention_prior='causal_alibi'`` and ``pos_rotation='none'`` the two configs are identical,
+  ``beta_attention_prior='causal_alibi'`` and ``rope_mode='none'`` the two configs are identical,
   so the latter row is inapplicable. From the as-run arm, one change each: the realization's
   optimizer (Adam ``beta_2 = 0.999``, no decay on matrices, decay 0.1 on the table as on the frames;
   the realization's 0.01 MLP decay and per-role clipping remain different), a read-and-write table
@@ -299,7 +299,7 @@ def _alibi_already(cfg: Any) -> Optional[str]:
 def _alibi_without_rope(cfg: Any) -> bool:
     r"""Whether ``cfg`` positions by the ALiBi prior alone (the as-run 55.10 scheme)."""
     return (getattr(cfg, "beta_attention_prior", None) == "causal_alibi"
-            and getattr(cfg, "pos_rotation", "none") == "none")
+            and getattr(cfg, "rope_mode", "none") == "none")
 
 
 def decision_comparator(base_cfg: Any) -> str:
@@ -314,7 +314,7 @@ def decision_comparator(base_cfg: Any) -> str:
 
 def _same_as_alibi_as_run(cfg: Any) -> Optional[str]:
     if _alibi_without_rope(cfg):
-        return (f"the base has beta_attention_prior='causal_alibi' and pos_rotation='none', so this row's "
+        return (f"the base has beta_attention_prior='causal_alibi' and rope_mode='none', so this row's "
                 f"config is {DECISION_COMPARATOR_ALIBI!r}'s")
     return None
 
@@ -331,7 +331,8 @@ def _no_kernel_routing(cfg: Any) -> Optional[str]:
 
 # The ALiBi confound swaps the positional scheme: on a RoPE base the rotation is removed with it, so the
 # arm is ALiBi instead of RoPE, not ALiBi on top of RoPE (a no-op change on a base without RoPE).
-_ALIBI = {"beta_attention_prior": "causal_alibi", "pos_rotation": "none"}
+_ALIBI = {"beta_attention_prior": "causal_alibi", "pos_rotation": "none"}       # BaselineConfig spelling
+_ALIBI_VFE = {"beta_attention_prior": "causal_alibi", "rope_mode": "none"}      # VFE3Config spelling
 # The realization's optimizer on the baseline: Adam beta_2 0.999 and no decay on matrices (the prior
 # means, comparison/content maps and decoder are undecayed), decay 0.1 on the table as on the frames.
 _REALIZATION_OPTIMIZER = {"adam_beta2": 0.999, "weight_decay": 0.0, "per_type_table_weight_decay": 0.1}
@@ -428,7 +429,7 @@ ARMS: Dict[str, Dict[str, Any]] = {
         "group": _BASELINES, "slug": "tf_type_table", "baseline": {"per_type_table": "block_read"},
         "inapplicable": _same_as_alibi_as_run},
     "Learned frames, ALiBi prior": {
-        "group": _CONFOUNDS, "slug": "alibi_prior", "vfe": dict(_ALIBI), "inapplicable": _alibi_already},
+        "group": _CONFOUNDS, "slug": "alibi_prior", "vfe": dict(_ALIBI_VFE), "inapplicable": _alibi_already},
     "Covariance-blind routing (mean distance)": {
         "group": _CONFOUNDS, "slug": "mean_distance", "vfe": {"relational_routing": "mean_distance"},
         "requires": ("relational_routing",), "inapplicable": _no_kernel_routing},
@@ -467,7 +468,7 @@ BASELINE_PROTOCOL_FIELDS: Dict[str, str] = {
     "amp_dtype": "amp_dtype", "fp32_matmul_precision": "fp32_matmul_precision",
     "warmup_steps": "warmup_steps", "min_lr_frac": "min_lr_frac",
     "grad_clip": "grad_clip", "beta_attention_prior": "beta_attention_prior",
-    "alibi_slope": "alibi_slope", "pos_rotation": "pos_rotation", "rope_base": "rope_base",
+    "alibi_slope": "alibi_slope", "rope_base": "rope_base",
     "rope_fraction": "rope_fraction",
     "decode_bias": "decode_bias",
     "decode_unigram_prior": "decode_unigram_prior", "unigram_kappa": "unigram_kappa",
@@ -678,6 +679,11 @@ def check_baseline_arm(
         a, b = getattr(matched_cfg, vfe_name), getattr(baseline_cfg, name)
         if a != b:
             diff[name] = (a, b)
+    # The baseline's rotary positions match a VFE rope_mode other than "none".
+    if hasattr(baseline_cfg, "pos_rotation") and hasattr(matched_cfg, "rope_mode"):
+        a = "none" if matched_cfg.rope_mode == "none" else "rope"
+        if a != baseline_cfg.pos_rotation:
+            diff["pos_rotation"] = (a, baseline_cfg.pos_rotation)
     undeclared = sorted(set(diff) - declared)
     if undeclared:
         raise ArmDefinitionError(

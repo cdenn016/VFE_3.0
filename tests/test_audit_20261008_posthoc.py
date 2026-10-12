@@ -173,7 +173,7 @@ def test_prior_flattened_refuses_a_row_constant_prior_and_runs_on_alibi() -> Non
 
 
 def test_positional_frames_identity_removes_the_frame_space_rope_fold() -> None:
-    cfg = _cfg(pos_rotation="rope", rope_space="frame", rope_on_value=True, pos_phi="none")
+    cfg = _cfg(rope_mode="frame_value", pos_phi="none")
     model = _model(cfg)
     dataset = st.eval_windows(_stream(41, 2), 8, 4)
     assert model._rope_rotation(8, DEVICE) is not None
@@ -186,15 +186,15 @@ def test_positional_frames_identity_removes_the_frame_space_rope_fold() -> None:
 
 
 def test_frame_roles_are_not_refused_for_comparison_rope() -> None:
-    model = _model(_cfg(pos_rotation="rope", rope_space="comparison", rope_on_value=False))
+    model = _model(_cfg(rope_mode="comparison"))
     iv._require_normal_form(model)                                        # no frame carries the rotation
     dataset = st.eval_windows(_stream(41, 3), 8, 4)
     base = _nll(model, dataset)
     with iv.frames_removed_input_moments(model):
         arm = _nll(model, dataset)
     assert np.abs(arm - base).max() > 0.0 and np.array_equal(_nll(model, dataset), base)
-    with pytest.raises(iv.NotApplicable, match="rope_space='frame'"):
-        iv._require_normal_form(_model(_cfg(pos_rotation="rope", rope_space="frame", rope_on_value=True)))
+    with pytest.raises(iv.NotApplicable, match="rope_mode='frame_value'"):
+        iv._require_normal_form(_model(_cfg(rope_mode="frame_value")))
 
 
 # ----------------------------------------------------------------------------------------------

@@ -142,8 +142,7 @@ def test_charts_agree_at_initialization_through_the_model(route: str) -> None:
     outputs = {}
     for chart in CONTENT_LINK_CHARTS:
         torch.manual_seed(5)
-        model = VFEModel(_cfg(content_link_chart=chart, relational_output_init="depth_scaled",
-                              **_ROUTES[route])).eval()
+        model = VFEModel(_cfg(content_link_chart=chart, **_ROUTES[route])).eval()
         with torch.no_grad():
             belief, logits = model.forward_beliefs(ids, return_logits=True)
         outputs[chart] = (belief.mu, belief.sigma, logits)

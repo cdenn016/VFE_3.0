@@ -20,7 +20,7 @@ def _canonical_cfg():
         block_mlp_covariance="passthrough",
         gauge_group="block_glk",
         pos_phi="none",
-        pos_rotation="none",
+        rope_mode="none",
     )
 
 

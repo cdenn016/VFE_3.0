@@ -9,7 +9,7 @@ import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
-from vfe3.contracts import CanonicalFrameContext
+from vfe3.contracts import CanonicalFrameContext, host_read
 from vfe3.model import edge_links, minimal_agent
 from vfe3.model.edge_links import EDGE_MODES, EdgeContext
 from vfe3.model.frame_actions import frame_matvec
@@ -334,6 +334,11 @@ class RelationalOperators(nn.Module):
     :math:`O'^{-1}` (:func:`vfe3.gradients.full_link.build_full_link_context`); it is an attribute, not a parameter.
     ``routing`` selects the projected routing cost: Gaussian KL, or the noisy-query cost
     N(a_i; b_j, V_Q + V_K) of the expected likelihood kernel (predictive_content only).
+    ``routing="noisy_key"`` (predictive_content, kernel readout) scores
+    :math:`\mathrm{KL}(N(a_i, V_{Q,i})\,\|\,N(b_j, V_{K,j} + n_hI))` at temperature 1
+    (:func:`vfe3.relational_scoring.projected_noisy_key_cost`, :meth:`routing_temperature`) and adds
+    ``routing_key_log_noise`` ``(H,)``, :math:`\log n_h`, initialized to ``log(routing_key_noise)``; with any other
+    routing no such parameter exists.
     ``predictive_covariance_checkpoint`` recomputes the moment-matched covariance update in backward
     instead of saving its (..., N, K, K) intermediates: the same values and gradients bit for bit,
     for about half the activation memory of a large-K step.
@@ -359,6 +364,11 @@ class RelationalOperators(nn.Module):
     ``routing`` are unused, and every O-reading method raises. ``minimal_agent_inference`` selects the exact
     ADF posterior or the mean-field step, and ``minimal_agent_cavi_steps`` the mean field's number of
     coordinate-ascent sweeps (:func:`vfe3.model.minimal_agent.minimal_agent_readout`).
+    ``predictive_covariance='spread_corrected'`` (minimal agent, mean field only) adds the linearized label spread
+    :math:`\sum_hP_iS_h^\top R'^h_iS_hP_i` to the mean-field covariance (audit 2026-10-12 T2); the kernel readout and
+    the exact minimal agent refuse it. ``elbo_diagnostic`` (minimal agent; a plain attribute, not state) adds the
+    per-layer evidence lower bound, the ADF evidence and their gap to a diagnostic capture
+    (:data:`vfe3.model.minimal_agent.MINIMAL_AGENT_ELBO_KEYS`); it never enters the loss.
     ``tie_comparison_maps`` (kernel predictive readout) stores no ``raw_score_k``: the key map is the query map,
     :math:`S_K := S_Q`. ``learn_attention_temperature`` adds ``routing_log_temperature`` ``(H,)``, the offset of
     the log routing temperature (:meth:`routing_temperature`); with it off no such parameter exists.
@@ -406,11 +416,13 @@ class RelationalOperators(nn.Module):
         tie_comparison_maps:   bool  = False,
         block_covariance:      bool  = False,
         pair_kl_gemm_tol:      Optional[float] = None,
+        routing_key_noise:     float = 1.0,
+        elbo_diagnostic:       bool  = False,
     ) -> None:
         super().__init__()
         self.kl_max_reference = kl_max_reference      # "absolute" | "row_min" kernel-router clamp reference
         self.pair_kl_gemm_tol = pair_kl_gemm_tol      # None, or the opt-in pair-KL GEMM fallback tolerance (nats)
-        # rope_space='comparison': the RoPE frequency base of the rotation applied to each head's projected
+        # comparison rope_mode: the RoPE frequency base of the rotation applied to each head's projected
         # routing moments after the learned maps (relational_score); None leaves routing un-rotated here.
         self.comparison_rope_base = None if comparison_rope_base is None else float(comparison_rope_base)
         self.comparison_rope_fraction = float(comparison_rope_fraction)              # p-RoPE fraction
@@ -439,8 +451,8 @@ class RelationalOperators(nn.Module):
         self.receiver_noise = float(receiver_noise)
         if receiver_law not in ("ambient_alignment", "channel_likelihood"):
             raise ValueError("receiver_law must be 'ambient_alignment' or 'channel_likelihood'")
-        if receiver_update not in ("euler", "closed_form"):
-            raise ValueError("receiver_update must be 'euler' or 'closed_form'")
+        if receiver_update not in ("euler", "closed_form", "closed_form_profiled"):
+            raise ValueError("receiver_update must be 'euler', 'closed_form' or 'closed_form_profiled'")
         if (isinstance(receiver_damping, bool) or not isinstance(receiver_damping, Real)
                 or not math.isfinite(receiver_damping) or not 0.0 < receiver_damping <= 1.0):
             raise ValueError("receiver_damping must lie in (0, 1]")
@@ -458,10 +470,16 @@ class RelationalOperators(nn.Module):
         if routing != "gaussian_kl" and readout_mode != "predictive_content":
             raise ValueError(f"{routing} routing requires predictive_content")
         self.routing = routing
-        if predictive_covariance not in ("passthrough", "moment_matched"):
-            raise ValueError("predictive_covariance must be 'passthrough' or 'moment_matched'")
-        if predictive_covariance == "moment_matched" and readout_mode != "predictive_content":
-            raise ValueError("moment_matched predictive covariance requires predictive_content")
+        if predictive_covariance not in minimal_agent.PREDICTIVE_COVARIANCES:
+            raise ValueError(f"predictive_covariance must be one of {minimal_agent.PREDICTIVE_COVARIANCES}")
+        if predictive_covariance in minimal_agent.READOUT_COVARIANCES and readout_mode != "predictive_content":
+            raise ValueError(f"{predictive_covariance} predictive covariance requires predictive_content")
+        if predictive_covariance == "spread_corrected" and (predictive_readout != "minimal_agent"
+                                                            or minimal_agent_inference != "mean_field"):
+            raise ValueError("predictive_covariance='spread_corrected' corrects the minimal agent's mean-field "
+                             "covariance for the label spread; it requires predictive_readout='minimal_agent' with "
+                             "minimal_agent_inference='mean_field' (the kernel readout and the exact posterior "
+                             "already carry the between-source spread)")
         if (isinstance(predictive_covariance_floor, bool)
                 or not isinstance(predictive_covariance_floor, (int, float))
                 or not math.isfinite(predictive_covariance_floor) or predictive_covariance_floor <= 0.0):
@@ -539,6 +557,9 @@ class RelationalOperators(nn.Module):
         self.minimal_agent_inference = minimal_agent_inference
         self.minimal_agent_channel_noise = float(minimal_agent_channel_noise)
         self.minimal_agent_cavi_steps = minimal_agent_cavi_steps   # mean-field CAVI sweeps (plain attribute, not state)
+        if not isinstance(elbo_diagnostic, bool):
+            raise ValueError(f"elbo_diagnostic must be bool, got {elbo_diagnostic!r}")
+        self.elbo_diagnostic = elbo_diagnostic                       # T1 diagnostic capture (plain attribute, not state)
         if not isinstance(block_covariance, bool):
             raise ValueError(f"block_covariance must be bool, got {block_covariance!r}")
         if block_covariance:
@@ -559,6 +580,13 @@ class RelationalOperators(nn.Module):
         if minimal and (learn_attention_temperature or tie_comparison_maps):
             raise ValueError("predictive_readout='minimal_agent' routes at temperature 1 with the key tied to T; "
                              "learn_attention_temperature and tie_comparison_maps need the kernel readout")
+        noisy_key = routing == "noisy_key" and not minimal   # the minimal agent does not read ``routing``
+        if noisy_key and learn_attention_temperature:
+            raise ValueError("routing='noisy_key' routes at temperature 1 (the learned key noise sets the sharpness); "
+                             "learn_attention_temperature must be False")
+        if (isinstance(routing_key_noise, bool) or not isinstance(routing_key_noise, Real)
+                or not math.isfinite(routing_key_noise) or routing_key_noise <= 0.0):
+            raise ValueError(f"routing_key_noise must be finite and positive, got {routing_key_noise!r}")
         if tie_comparison_maps and readout_mode != "predictive_content":
             raise ValueError("tie_comparison_maps requires the predictive_content readout")
         self.tie_comparison_maps = tie_comparison_maps
@@ -567,6 +595,12 @@ class RelationalOperators(nn.Module):
             self.routing_log_temperature = nn.Parameter(torch.zeros(len(self.irrep_dims)))   # (H,)
         else:
             self.register_parameter("routing_log_temperature", None)
+        # log n_h of the noisy-key law N(b_j, V_K,j + n_h I); absent (no state-dict key) under any other routing.
+        if noisy_key:
+            self.routing_key_log_noise = nn.Parameter(
+                torch.full((len(self.irrep_dims),), math.log(float(routing_key_noise))))     # (H,)
+        else:
+            self.register_parameter("routing_key_log_noise", None)
         self.score_rank_per_head = irrep_dims[0] if equal else list(irrep_dims)
         self.content_rank_per_head = irrep_dims[0] if equal else list(irrep_dims)
         if minimal:
@@ -866,13 +900,18 @@ class RelationalOperators(nn.Module):
         (:math:`T_hC_jT_h^\top`, the noise-free key law), ``relational_mean_displacement_norm`` and the per-head
         :data:`vfe3.model.minimal_agent.MINIMAL_AGENT_DIAGNOSTIC_KEYS`: per head ``(H,)`` the gain fraction, head
         coupling, mean-field label staleness and exact spread share (means over receivers; each NaN in the other
-        mode) and
+        mode), the mean-field M-step optimum :math:`n_h^*` of the call
+        (:func:`vfe3.model.minimal_agent.channel_noise_mstep`; NaN under exact inference) and
         :math:`n_h`, and the layer's covariance contraction :math:`\operatorname{tr}C^+/\operatorname{tr}C` (repeated
-        per head).
+        per head). Under ``elbo_diagnostic`` the capture also receives the receiver means of the evidence lower bound,
+        the ADF evidence and their gap (:data:`vfe3.model.minimal_agent.MINIMAL_AGENT_ELBO_KEYS`, float64 scalars,
+        computed without autograd). Under ``predictive_covariance='spread_corrected'`` the returned covariance also
+        carries :math:`\sum_hZ'^h_iR'^h_iZ'^{h\top}_i`, :math:`Z'^h_i = U_iP_iS_h^\top`
+        (:func:`vfe3.model.minimal_agent.local_posterior_covariance`), with the same floor.
 
         One host check covers the call. A float32 call that reports a failed factorization (an ADF query covariance
         :math:`A^h` that lost positive definiteness by cancellation, a record covariance, ...) or, under
-        ``projected_cov_condition_recovery``, a query certificate (module docstring of
+        a certified ``projected_factorization``, a query certificate (module docstring of
         :mod:`vfe3.model.minimal_agent`) is recomputed whole in float64 from the local beliefs, frame and prior, and
         its outputs and capture are cast back to the input dtypes. The float32 attempt is discarded, so backward
         never runs through its failed factorizations. Every query and key entry of the call (:math:`2BNH`) is then
@@ -889,7 +928,9 @@ class RelationalOperators(nn.Module):
         floor = self.floor_term(floor_anchor, sigma) if return_covariance else None
         mu_plus, sigma_plus, record, status = self._minimal_agent_call(
             mu, sigma, frame, log_prior, return_covariance, capture is not None, floor)
-        failed, ill_conditioned = status.tolist()                       # the one host check of a healthy call
+        # The one host read of a healthy call; it also resolves raise-only checks queued by
+        # vfe3.contracts.deferred_host_checks (earlier frame certificates and prototype-agent checks) first.
+        failed, ill_conditioned = host_read(status)
         if failed and dtype == torch.float64:
             raise ValueError(minimal_agent.readout_failure_message(dtype))
         if failed or ill_conditioned:
@@ -947,17 +988,24 @@ class RelationalOperators(nn.Module):
             C = self._reference_covariance(sigma, frame, dtype, diagonal=sigma.dim() == mu.dim())
             rope = None
             if self.comparison_rope_base is not None:
-                # rope_space='comparison': the record of a source at offset j - i arrives through R_{j-i}.
+                # comparison rope_mode: the record of a source at offset j - i arrives through R_{j-i}.
                 rope = self.comparison_rope_rotation(xi.shape[-2], S.shape[1], xi.device, dtype)  # (N, d, d)
+            # The constructor refuses spread_corrected with exact inference; a probe that switches the inference to
+            # "exact" on a spread-corrected layer (vfe3.posthoc.feature_probes.minimal_agent_gap) gets the exact
+            # posterior's covariance, which already carries the spread.
+            spread_corrected = (return_covariance and self.predictive_covariance == "spread_corrected"
+                                and self.minimal_agent_inference == "mean_field")
             result = minimal_agent.minimal_agent_readout(
                 xi, C, S, T, log_noise, log_prior, self.minimal_agent_inference, diagnostics=diagnostics,
-                check=False, rope=rope, cavi_steps=self.minimal_agent_cavi_steps)
+                check=False, rope=rope, cavi_steps=self.minimal_agent_cavi_steps,
+                spread_corrected=spread_corrected, elbo=diagnostics and self.elbo_diagnostic)
             forward = frame.forward.to(dtype)
             mu_plus = frame_matvec(forward, result.xi, frame.block_diagonal)              # (..., N, K) U_i xi_i^+
             sigma_plus = None
             if return_covariance:
                 sigma_plus = minimal_agent.local_posterior_covariance(
-                    sigma.to(dtype), forward, frame.block_diagonal, result.gains, result.M, floor.to(dtype))
+                    sigma.to(dtype), forward, frame.block_diagonal, result.gains, result.M, floor.to(dtype),
+                    result.spread_gains, result.label_spread)
         record: dict = {}
         if diagnostics:
             with torch.no_grad():
@@ -973,7 +1021,13 @@ class RelationalOperators(nn.Module):
                     "relational_minimal_agent_covariance_contraction":                     # layer value per head
                         result.covariance_contraction.mean().expand(H),
                     "relational_minimal_agent_spread_share": result.spread_share.reshape(-1, H).nanmean(0),
+                    # mean field: the M-step optimum n_h^* of the call beside the learned n_h (exact: NaN)
+                    "relational_minimal_agent_channel_noise_mstep": result.channel_noise_mstep.to(dtype),
                 }
+                if result.elbo is not None:                                              # elbo_diagnostic: nats
+                    record.update(zip(minimal_agent.MINIMAL_AGENT_ELBO_KEYS, (
+                        result.elbo.nanmean(), result.evidence.nanmean(),
+                        (result.evidence - result.elbo).nanmean())))                    # () float64 each
         status = torch.stack((result.failed, result.ill_conditioned))                         # (2,) bool
         return (mu_plus.to(mu.dtype), None if sigma_plus is None else sigma_plus.to(sigma.dtype), record, status)
 
@@ -1338,7 +1392,9 @@ class RelationalOperators(nn.Module):
     ) -> 'float | torch.Tensor':                # tau unchanged, or the learned (H,) tau_{l,h}
         r"""Gibbs routing temperature of this layer.
 
-        Without ``learn_attention_temperature`` the configured temperature is returned unchanged. With it,
+        Under ``routing="noisy_key"`` it is exactly 1 (the learned key noise :math:`n_h` sets the sharpness and the
+        routing objective is the KL of the declared joint). Otherwise, without ``learn_attention_temperature`` the
+        configured temperature is returned unchanged. With it,
 
         .. math::
             \tau_{\ell,h} = \kappa_h\sqrt{d_h}\exp(3\tanh(\delta_{\ell,h}/3)),
@@ -1352,6 +1408,8 @@ class RelationalOperators(nn.Module):
         returned at ``dtype``. The temperature acts after the ``kl_max`` clamp, so it sharpens or flattens
         only costs below the cap.
         """
+        if self.routing_key_log_noise is not None:
+            return 1.0                                  # noisy_key: the KL of the declared joint, no kappa sqrt(d)
         delta = self.routing_log_temperature
         if delta is None:
             return tau
@@ -1366,7 +1424,7 @@ class RelationalOperators(nn.Module):
         device: torch.device,
         dtype:  torch.dtype,
     ) -> torch.Tensor:                 # (N, r, r) R_i, positions 0..N-1
-        r"""Cached comparison-space RoPE rotation :math:`R_i` under ``rope_space='comparison'``.
+        r"""Cached comparison-space RoPE rotation :math:`R_i` under a comparison ``rope_mode``.
 
         The rotation is a constant of (N, r, base, fraction, device, dtype) with no graph, so one build
         serves every layer and forward. A build under ``torch.inference_mode`` is not cached, since an

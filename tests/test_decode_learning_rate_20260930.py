@@ -87,7 +87,7 @@ def test_decoder_override_keeps_temperature_freeze() -> None:
 
 
 @pytest.mark.parametrize("mode", ["linear", "diagonal_chunked", "full_chunked",
-                                  "expected_likelihood_chunked", "family_chunked"])
+                                  "expected_likelihood_chunked"])
 def test_owned_cpu_target_handoff_applies_to_each_builtin_fused_decoder(mode: str) -> None:
     model = VFEModel(_config(decode_mode=mode))
     original = torch.tensor([[1, -100, 2]])
@@ -110,7 +110,7 @@ def test_owned_cpu_target_handoff_applies_to_each_builtin_fused_decoder(mode: st
 
 
 @pytest.mark.parametrize("mode", ["linear", "diagonal_chunked", "full_chunked",
-                                  "expected_likelihood_chunked", "family_chunked"])
+                                  "expected_likelihood_chunked"])
 def test_owned_cpu_targets_are_validated_before_any_builtin_fused_decoder(mode: str) -> None:
     model = VFEModel(_config(decode_mode=mode))
     with pytest.raises(IndexError, match="Target 7"):
@@ -119,7 +119,7 @@ def test_owned_cpu_targets_are_validated_before_any_builtin_fused_decoder(mode: 
 
 
 @pytest.mark.parametrize("mode", ["linear", "diagonal_chunked", "full_chunked",
-                                  "expected_likelihood_chunked", "family_chunked"])
+                                  "expected_likelihood_chunked"])
 def test_replaced_fused_callable_keeps_normal_target_validation(
     mode:        str,
     monkeypatch: pytest.MonkeyPatch,

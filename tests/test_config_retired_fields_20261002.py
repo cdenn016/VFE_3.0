@@ -119,7 +119,7 @@ def test_m_decode_lr_is_refused_where_it_set_a_learned_temperature_rate() -> Non
 
 
 @pytest.mark.parametrize(("dense", "chunked"), [
-    ("diagonal", "diagonal_chunked"), ("full", "full_chunked"), ("family", "family_chunked"),
+    ("diagonal", "diagonal_chunked"), ("full", "full_chunked"), ("family", "diagonal_chunked"),
 ])
 def test_dense_decode_modes_migrate_to_their_chunked_kernels(dense: str, chunked: str) -> None:
     family = "gaussian_full" if dense == "full" else "gaussian_diagonal"
@@ -290,14 +290,15 @@ def test_retired_exponential_policy_keys_load_with_any_value(key: str, value: ob
     assert _load(**{key: value}) == test_config()
 
 
-# frame_pair_fp64_escalation was retired on 2026-10-02 and is a live opt-in field again since
-# 2026-10-04: a saved value loads as saved, and a config without it loads the default False.
+# frame_pair_fp64_escalation was retired on 2026-10-02, a live opt-in field again from 2026-10-04, and merged
+# into frame_pair_escalation_tol on 2026-10-12: a saved value loads as saved, and a config without it is off.
 @pytest.mark.parametrize("value", [True, False])
 def test_reinstated_frame_pair_escalation_loads_its_saved_value(value: bool) -> None:
-    assert _load(frame_pair_fp64_escalation=value).frame_pair_fp64_escalation is value
-    payload = _payload()
+    payload = _payload(frame_pair_fp64_escalation=value, frame_pair_condition_tol=1e-4)
+    del payload["frame_pair_escalation_tol"]
+    assert config_from_serialized(payload, source="test").frame_pair_escalation_tol == (1e-4 if value else None)
     del payload["frame_pair_fp64_escalation"]
-    assert config_from_serialized(payload, source="test").frame_pair_fp64_escalation is False
+    assert config_from_serialized(payload, source="test").frame_pair_escalation_tol is None
 
 
 def test_a_missing_chart_radius_loads_as_the_retired_clamp_radius() -> None:

@@ -57,8 +57,6 @@ POS_PHI_KEY = "pos_phi_free"
 
 # Decoders whose logits are -KL(q || N(m_v, diag t_v)) / tau_eff (+ kappa log pi_v).
 _KL_DECODE_MODES = frozenset(("diagonal", "diagonal_chunked", "full", "full_chunked"))
-_FAMILY_DECODE_MODES = frozenset(("family", "family_chunked"))
-_GAUSSIAN_KL_FAMILIES = frozenset(("gaussian_diagonal", "gaussian_full"))
 
 CORE_DEFAULT_OPTIONS: Dict[str, Any] = {
     "min_count":      100,
@@ -236,7 +234,7 @@ class SemanticRun:
 
         The slot stores $s_{vk}$; the family dispersion is
         $\max(\exp(\min(s_{vk}, 80)), \epsilon)$ (``bounded_variance_from_log``), which is the
-        variance for Gaussian families and the scale $b$ for Laplace (variance $2b^2$). The
+        variance for the Gaussian families (a scale family would store its scale). The
         family hook ``covariance_diagonal`` maps it to $\operatorname{diag}\Sigma_v$; a full family
         reads the diagonal of the (exactly diagonal) promoted prior ``diag_embed``.
 
@@ -472,9 +470,6 @@ def _decode_kind(cfg: VFE3Config) -> str:
     if cfg.decode_mode == "linear":
         return "linear"
     if cfg.decode_mode in _KL_DECODE_MODES:
-        return "gaussian"
-    if cfg.decode_mode in _FAMILY_DECODE_MODES and cfg.family in _GAUSSIAN_KL_FAMILIES:
-        # The family decode scores the KL divergence (Renyi order 1), the only retained divergence.
         return "gaussian"
     return "unsupported"
 

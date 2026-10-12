@@ -184,7 +184,7 @@ config = dict(
 
 
 
-    decode_mode                       = 'linear',  # prior-bank: diagonal_chunked/full_chunked/expected_likelihood_chunked/family_chunked
+    decode_mode                       = 'linear',  # prior-bank: diagonal_chunked/full_chunked/expected_likelihood_chunked
     encode_mode                       = "per_token",   #"per_token_additive" is ~1.5x faster at K=80 currently unablated
     decode_chunk_size                 = 8192,
     decode_tau                        = 0.008,       #prior_bank = True temperature
@@ -219,15 +219,14 @@ config = dict(
     ####################################
     #       Positional Encoding
     #    BCH gauge-frame PE (pos_phi)
-    #     gauge-RoPE (pos_rotation)
+    #     gauge-RoPE (rope_mode)
     ####################################
 
     pos_phi                   = "learned",           # "none" (pure path) | "learned" | "frozen"
-    pos_rotation              = "none",              # "none" | "rope"
+    rope_mode                 = "none",              # "none" | "frame" | "frame_value" | "comparison" | "comparison_invariant"
 
     rope_base                 = 100.0,               # rotary frequency base
 
-    rope_on_value             = False,
 
 
     ######################################
@@ -911,14 +910,18 @@ def _cell_resume_status(
     if cellmeta.get("data_seed", cfg.seed) != _effective_data_seed(cfg.seed):
         return None
     try:
-        saved_config_sha256 = _canonical_json_sha256(saved_effective)
+        # The cell binds the config.json it wrote. A cell written before a schema migration (a retired
+        # field or value the loader migrates) hashed the saved form, so either the saved bytes or their
+        # migrated form may carry the digest; equality of effective configs is checked above.
+        saved_config_sha256 = {_canonical_json_sha256(saved_effective),
+                               _canonical_json_sha256(raw_saved_config)}
     except (TypeError, ValueError):
         return None
     saved_contract_sha256 = cellmeta.get(_SCALING_REUSE_DIGEST_FIELD)
     if (not isinstance(saved_contract_sha256, str)
             or len(saved_contract_sha256) != 64
             or summary.get(_SCALING_SUMMARY_DIGEST_FIELD) != saved_contract_sha256
-            or cellmeta.get("config_sha256") != saved_config_sha256):
+            or cellmeta.get("config_sha256") not in saved_config_sha256):
         return None
     if _scaling_result_status(_cached_scaling_metrics(summary)) != "complete":
         return None

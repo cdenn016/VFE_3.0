@@ -152,7 +152,7 @@ class RopeTransport:
     Omega^RoPE_ij = R(theta_i) Omega_ij R(theta_j)^T, is kept only so the regression tests can
     reproduce its absolute-position and gauge-breaking defect; no configuration selects it, and its
     ``score_operator`` is None. Whether the value path rotates is decided by the model
-    (``rope_on_value``), not by this wrapper.
+    (``rope_mode`` ``'frame'`` versus ``'frame_value'``), not by this wrapper.
     """
 
     base:                    'torch.Tensor | FactoredTransport | CompactFactoredTransport'
@@ -546,17 +546,18 @@ DEFAULT_TRANSPORT_CHART_MAX_NORM: float = VFE3Config.transport_chart_max_norm
 
 
 # Measured-condition escalation of the stored frame pair (audit 2026-09-23 #12). The pair (U, U^-1)
-# is stored in float32. With the escalation enabled (VFE3Config.frame_pair_fp64_escalation, installed
+# is stored in float32. With the escalation enabled (VFE3Config.frame_pair_escalation_tol set, installed
 # by VFEModel), a producer call whose stored pair cannot stay mutually inverse at float32 is redone in
 # float64 as a whole, and every relational consumer of that frame then runs in float64. It was
 # unconditional from 2026-10-02 to 2026-10-04 and is opt-in again: one escalated call costs about
 # 7x a float32 step on the RTX 5090 (FP64 at 1/64 rate). Disabled, no certificate is formed and the
 # stored pair keeps the inverse residual <= eps_32 kappa_F(U); CanonicalFrameContext still fails
-# closed far above that. The tolerance (VFE3Config.frame_pair_condition_tol) is read at call time.
+# closed far above that. The tolerance (VFE3Config.frame_pair_escalation_tol) is read at call time.
 # The counter is a host int incremented from the already-read decision, so it adds no device work
 # and no synchronization.
+DEFAULT_FRAME_PAIR_CONDITION_TOL: float = 1e-4
 _FRAME_PAIR_FP64_ESCALATION: bool = False
-_FRAME_PAIR_CONDITION_TOL: float = 1e-4
+_FRAME_PAIR_CONDITION_TOL: float = DEFAULT_FRAME_PAIR_CONDITION_TOL
 _FRAME_PAIR_FP64_ESCALATIONS: int = 0
 
 
@@ -703,7 +704,7 @@ def stable_matrix_exp_pair(
     Precision: the exponential is evaluated at the storage precision (float32, or float64 for a
     float64 input). Under :func:`frame_pair_fp64_escalation`, a float32 pair failing
     :func:`_frame_pair_kappa`'s certificate, :math:`\max_b \kappa_F(U_b)\,\varepsilon_{32} > \tau`
-    (``frame_pair_condition_tol``, default :math:`10^{-4}`), is returned in float64 for the whole
+    (``frame_pair_escalation_tol``, typically :math:`10^{-4}`), is returned in float64 for the whole
     call, recomputed from the same ``M`` and inverted from the float64 ``exp(M)`` (audit 2026-09-23
     #12). The verdict rides the inverse's existing host read; ``only_forward`` builds no inverse and
     is never certified. With the escalation disabled no certificate is formed.

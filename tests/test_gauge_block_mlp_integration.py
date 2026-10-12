@@ -27,7 +27,7 @@ def _full_cfg(**overrides):
         decode_mode="full_chunked",
         gauge_group="block_glk",
         pos_phi="none",
-        pos_rotation="none",
+        rope_mode="none",
         norm_type_block="none",
     )
     values.update(overrides)
@@ -75,7 +75,7 @@ def test_block_mlp_mode_and_covariance_controls_validate(mode, covariance):
         ({
             "use_block_mlp": True,
             "block_mlp_mode": "canonical_frame",
-            "pos_rotation": "rope",
+            "rope_mode": "frame_value",
             "rope_insertion": "left",
             "_allow_legacy_left_rope": True,
         }, "rope_insertion"),
@@ -87,9 +87,9 @@ def test_block_mlp_modes_fail_closed_on_incompatible_config(overrides, message):
 
 
 @pytest.mark.parametrize("attention_mode", ["projected_predictive", "projected_gradient"])
-@pytest.mark.parametrize("rope_on_value", [False, True])
+@pytest.mark.parametrize("rope_mode", ["frame", "frame_value"])
 def test_canonical_rope_split_config_builds_with_visible_caveat(
-    attention_mode: str, rope_on_value: bool,
+    attention_mode: str, rope_mode: str,
     capsys: pytest.CaptureFixture, recwarn: pytest.WarningsRecorder,
 ) -> None:
     cfg = tiny_config(
@@ -102,13 +102,12 @@ def test_canonical_rope_split_config_builds_with_visible_caveat(
         decode_mode="diagonal_chunked",
         use_block_mlp=True,
         block_mlp_mode="canonical_frame",
-        pos_rotation="rope",
-        rope_on_value=rope_on_value,
+        rope_mode=rope_mode,
     )
     VFEModel(cfg)
     output = capsys.readouterr().out
     assert not any("not the covariance sandwich" in str(warning.message) for warning in recwarn)
-    if not rope_on_value:
+    if rope_mode == "frame":
         assert output.count("WARNING: canonical_frame + RoPE") == 1
         lines = output.strip().splitlines()
         assert lines[0] == lines[-1] == "-" * 72
@@ -121,8 +120,7 @@ def test_canonical_diagonal_predictive_rope_forward_backward() -> None:
     cfg = tiny_config(
         use_block_mlp=True,
         block_mlp_mode="canonical_frame",
-        pos_rotation="rope",
-        rope_on_value=False,
+        rope_mode="frame",
         attention_residual=False,
         decode_unigram_prior=False,
     )
@@ -139,14 +137,13 @@ def test_canonical_diagonal_predictive_rope_forward_backward() -> None:
     assert model.block_mlps[0].fc1.weight.grad.abs().sum() > 0
 
 
-@pytest.mark.parametrize("pos_rotation", ["none", "rope"])
+@pytest.mark.parametrize("rope_mode", ["none", "frame_value"])
 def test_canonical_rope_build_caveat_is_absent_without_split(
-    pos_rotation: str, capsys: pytest.CaptureFixture,
+    rope_mode: str, capsys: pytest.CaptureFixture,
 ) -> None:
     VFEModel(_full_cfg(
         vocab_size=7, block_mlp_expansion=2,
-        use_block_mlp=True, block_mlp_mode="canonical_frame", pos_rotation=pos_rotation,
-        rope_on_value=True,
+        use_block_mlp=True, block_mlp_mode="canonical_frame", rope_mode=rope_mode,
     ))
     assert "WARNING: canonical_frame + RoPE" not in capsys.readouterr().out
 

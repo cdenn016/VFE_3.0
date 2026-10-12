@@ -44,6 +44,8 @@ def relational_score(
 
     ``operators.routing`` selects the cost: ``"gaussian_kl"`` (projected_gaussian_kl) or
     ``"noisy_query"`` (projected_noisy_query_cost, the expected-likelihood source posterior), or
+    ``"noisy_key"`` (projected_noisy_key_cost, the Gaussian KL against the key law broadened by the head's learned
+    noise :math:`n_hI`, ``operators.routing_key_log_noise``), or
     ``"mean_distance"`` (projected_mean_distance_cost, the covariance-blind control).
 
     Every head projects the full canonical state through its own Q/K maps. The
@@ -56,7 +58,7 @@ def relational_score(
     Gaussian KL then computes its query log-determinant without autograd (``query_row_constant_grad``
     of :func:`vfe3.relational_scoring.projected_gaussian_kl`); the returned values are unchanged.
 
-    Under comparison-space RoPE with ``operators.rope_comparison_covariance == 'rotation_invariant'`` each
+    Under ``rope_mode='comparison_invariant'`` (``operators.rope_comparison_covariance == 'rotation_invariant'``) each
     comparison covariance is replaced by its projection :math:`P(G)` onto the commutant of the RoPE torus
     (:func:`vfe3.geometry.rope.rope_commutant_projection`) before the rotation, so the trace and log-determinant
     terms are position-free and only the mean term reads :math:`j - i`. The capture then records
@@ -97,14 +99,18 @@ def relational_score(
     # float64; the results are returned at the dtype a lower-precision frame would have produced.
     public = _compute_dtype(mu, sigma, source_mu, source_sigma, *(S for pair in comparison for S in pair))
     score = routing_cost(operators.routing)                                  # ROUTING_COSTS registry
+    # noisy_key is the Gaussian KL of a broadened key law, so it takes the Gaussian-KL options.
+    gaussian_kl = operators.routing in ("gaussian_kl", "noisy_key")
     cost_options = ({"query_row_constant_grad": False}
-                    if row_invariant and operators.routing == "gaussian_kl" else {})
-    if operators.routing == "gaussian_kl" and operators.pair_kl_gemm_tol is not None:
+                    if row_invariant and gaussian_kl else {})
+    if gaussian_kl and operators.pair_kl_gemm_tol is not None:
         cost_options["gemm_expansion_tol"] = operators.pair_kl_gemm_tol
+    key_log_noise = getattr(operators, "routing_key_log_noise", None)             # (H,) noisy_key only
     scores, captured_q, captured_k = [], [], []
     # One scoring call per run: the heads of a run share their rank d_r. Each call ends in its own
     # host transfer, so a tower of R runs pays R of them per call (one for equal heads), unless its
     # verdicts can only raise (the diagonal route), which deferred_host_checks then queues.
+    first_head = 0                                                             # index of the run's first head
     for (S_q, S_k), inverse in zip(comparison, inverse_runs):
         H, K = S_q.shape[0], S_q.shape[-1]
         # Both roles read the one shared frame: there is no separate key-side inverse.
@@ -155,7 +161,7 @@ def relational_score(
         projection_q = (sigma_h, inverse, S_q, mu_h)
         projection_k = (source_sigma_h, key_inverse, S_k, source_mu_h)
         if rope_base is not None:
-            # rope_space='comparison' (audit 2026-10-07, F28): rotate token i's projected moments by R_i in the
+            # comparison rope_mode (audit 2026-10-07, F28): rotate token i's projected moments by R_i in the
             # r-dimensional comparison space, a -> R_i a, G -> R_i G R_i^T, for query and key alike. A Gaussian KL
             # (and the noisy-query and mean-distance costs) is invariant under a common orthogonal map, so the
             # pair (i, j) cost equals the cost of (a_i, G_i) against (R_{j-i} b_j, R_{j-i} G_j R_{j-i}^T): a function
@@ -190,6 +196,9 @@ def relational_score(
                 projection_q = (sigma_h, inverse, S_q_rot, mu_h)
                 projection_k = (source_sigma_h, key_inverse, S_k_rot, source_mu_h)
         run_options = dict(cost_options)
+        if key_log_noise is not None:
+            run_options["key_noise"] = key_log_noise[first_head:first_head + H].exp()   # (H_run,) n_h
+        first_head += H
         if diagonal:
             run_options["diagonal_covariance"] = True                           # G_q, G_k are (..., N, H, r)
         elif invariant:
@@ -289,7 +298,7 @@ def relational_predictive_readout(
                 and torch.equal(value_frame.forward, frame.forward)
                 and torch.equal(value_frame.inverse, frame.inverse)):
             raise ValueError("predictive_readout='minimal_agent' reads key and content in one frame; the value frame "
-                             "differs from the routing frame (pos_rotation='rope' with rope_on_value=False)")
+                             "differs from the routing frame (rope_mode='frame')")
         mean, sigma_plus = operators.minimal_agent_update(
             mu, sigma, frame, log_prior, return_covariance=return_covariance, capture=capture,
             floor_anchor=floor_anchor)

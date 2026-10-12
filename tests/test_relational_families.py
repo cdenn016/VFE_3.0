@@ -63,13 +63,13 @@ def test_full_covariance_score_matches_dense_marginals(scope: str) -> None:
 
 @pytest.mark.parametrize("family", ["gaussian_full", "gaussian_diagonal"])
 @pytest.mark.parametrize("readout", ["predictive_content"])
-@pytest.mark.parametrize("rope_on_value", [False, True])
-def test_gaussian_rope_autocast_snapshot(family: str, readout: str, rope_on_value: bool) -> None:
+@pytest.mark.parametrize("rope_mode", ["frame", "frame_value"])
+def test_gaussian_rope_autocast_snapshot(family: str, readout: str, rope_mode: str) -> None:
     torch.manual_seed(9)
     model = VFEModel(_cfg(family=family,
                          attention_mode="projected_predictive",
 
-                         pos_rotation="rope", rope_on_value=rope_on_value))
+                         rope_mode=rope_mode))
     ids, targets = _tokens()
     with torch.autocast("cpu", dtype=torch.bfloat16):
         _, logits = model.forward_beliefs(ids, return_logits=True)
@@ -84,8 +84,8 @@ def test_gaussian_rope_autocast_snapshot(family: str, readout: str, rope_on_valu
     assert 0 < diagnostics["effective_rank"] <= 4.0001
 
 
-def test_laplace_remains_outside_gaussian_projection_envelope() -> None:
-    with pytest.raises(ValueError, match="requires gaussian_diagonal, gaussian_full or gaussian_block"):
+def test_retired_laplace_family_does_not_construct() -> None:
+    with pytest.raises(ValueError, match="laplace_diagonal"):
         _cfg(family="laplace_diagonal")
 
 

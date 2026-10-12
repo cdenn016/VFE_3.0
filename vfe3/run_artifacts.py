@@ -60,6 +60,7 @@ from vfe3.config import (
     serialize_config,
 )
 from vfe3.contracts import DataState, DataStateBuffer, ExecutableBuildMetadata
+from vfe3.model.minimal_agent import READOUT_COVARIANCES
 from vfe3.model.block_mlp import (
     block_mlp_build_metadata,
     get_block_mlp_registration,
@@ -150,6 +151,11 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         layer_counts["score"] -= K*K
     if getattr(cfg, "learn_attention_temperature", False):  # routing_log_temperature (H,) per layer
         layer_counts["score"] += H
+    noisy_key = not minimal_agent and getattr(cfg, "relational_routing", "gaussian_kl") == "noisy_key"
+    key_noise_fields: Dict[str, object] = {}
+    if noisy_key:                                           # routing_key_log_noise (H,) per layer
+        layer_counts["score"] += H
+        key_noise_fields = {"relational_key_noise_init": float(cfg.relational_key_noise)}
     counts = {role: count * cfg.n_layers for role, count in layer_counts.items()}
     return {"relational_operators": {
         "attention_mode": cfg.attention_mode,
@@ -164,7 +170,9 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "readout_mode": cfg.relational_readout_mode,
         "output_scope": "full",
         "mean_update": (("receiver_closed_form_natural_parameter_update"
-                         if cfg.relational_receiver_update == "closed_form" else "receiver_fisher_step")
+                         if cfg.relational_receiver_update == "closed_form" else
+                         "receiver_profiled_closed_form_natural_parameter_update"
+                         if cfg.relational_receiver_update == "closed_form_profiled" else "receiver_fisher_step")
                         if full_link else
                         "minimal_agent_posterior_mean" if minimal_agent else
                         "input_plus_predictive_mean" if cfg.attention_residual else
@@ -185,6 +193,7 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "content_link_chart": None if minimal_agent else cfg.content_link_chart,
         **edge_fields,
         **agent_fields,
+        **key_noise_fields,
         "score_shape": score_shape,
         "content_shapes": content_shapes,
         "parameter_counts": counts, "total_parameters": sum(counts.values()),
@@ -197,14 +206,17 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "receiver_law": cfg.relational_receiver_law if full_link else None,
         "receiver_update": cfg.relational_receiver_update if full_link else None,
         "receiver_damping": (cfg.relational_receiver_damping
-                             if full_link and cfg.relational_receiver_update == "closed_form" else None),
+                             if full_link and cfg.relational_receiver_update != "euler" else None),
         "covariance_update": (("passthrough" if cfg.skip_belief_sigma_update else
-                               "closed_form" if cfg.relational_receiver_update == "closed_form" else "fisher_step")
+                               "fisher_step" if cfg.relational_receiver_update == "euler" else "closed_form")
                               if full_link else getattr(cfg, "predictive_covariance", "passthrough")),
         "content_covariance_contract": (("value_space_channel_likelihood_plus_channel_noise"
                                          if cfg.relational_receiver_law == "channel_likelihood" else
                                          "full_link_pushforward_plus_positive_reference_noise") if full_link else
-                                        ("minimal_agent_posterior_moment_match_plus_covariant_floor" if minimal_agent
+                                        (("minimal_agent_mean_field_label_spread_corrected_plus_prior_floor"
+                                          if getattr(cfg, "predictive_covariance", "passthrough") == "spread_corrected"
+                                          else "minimal_agent_posterior_moment_match_plus_covariant_floor")
+                                         if minimal_agent
                                          # The head-block family stores the head blocks of U_i(C^att + f I)U_i^T: the
                                          # exact M-projection onto block-diagonal Gaussians, covariant under the
                                          # per-head block group (audit 2026-10-09 round 2, #10).
@@ -215,7 +227,7 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
                                          else "diagonal_local_moment_projection_of_predictive_kernel_plus_floor"
                                          if cfg.family != "gaussian_full"
                                          else "exact_predictive_kernel_moment_match_plus_covariant_floor")
-                                        if getattr(cfg, "predictive_covariance", "passthrough") == "moment_matched"
+                                        if getattr(cfg, "predictive_covariance", "passthrough") in READOUT_COVARIANCES
                                         else "frozen_receiver_bookkeeping_not_predictive_covariance"),
         "self_coupling_coordinate_contract": (
             "ordered_conditional_kl_stored_coordinate_order"
@@ -223,7 +235,7 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
             else "family_default"),
         "factorization_policy": "zero_jitter_no_covariance_repairs",
         # The minimal agent passes no source tuples, so no source-root recovery exists. A float32 layer call with a
-        # failed factorization (or, under projected_cov_condition_recovery, an ADF query covariance that fails the
+        # failed factorization (or, under a certified projected_factorization, an ADF query covariance that fails the
         # certificate) is recomputed whole in float64; a float64 failure raises. Its mean field also keeps the
         # Gram-route certificate of projected_gaussian_kl (a whole-tensor float64 refactor of the KL factors).
         "factorization_fallback": (("fp32_failure_or_certificate_layer_fp64_recompute"
@@ -232,6 +244,7 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
                                    else "failed_entries_source_square_root_qr_fp64"),
         "temperature_convention": ((f"unit_temperature_{'exact' if cfg.minimal_agent_inference == 'exact' else 'mean_field'}"
                                     "_posterior_no_clamp") if minimal_agent
+                                   else "unit_temperature_learned_key_noise" if noisy_key
                                    else "kappa_beta_times_sqrt_ambient_head_dim"),
         # Exact minimal agent: head h routes on the receiver moments left by heads 1..h-1 (ADF), sources pre-update.
         "routing_state": ("episode_initial" if full_link
@@ -240,7 +253,7 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "state_destination": (
             "receiver_belief_mean_and_covariance"
             if (full_link and not getattr(cfg, "skip_belief_sigma_update", False))
-            or (not full_link and getattr(cfg, "predictive_covariance", "passthrough") == "moment_matched")
+            or (not full_link and getattr(cfg, "predictive_covariance", "passthrough") in READOUT_COVARIANCES)
             else "receiver_belief_mean"),
         "source_beliefs": "live_episode_initial" if full_link else "live_pre_update",
         "outer_operator_and_frame_graph": "live",
@@ -4417,13 +4430,13 @@ def collect_beta_channel_decomposition(
     at all therefore leaves ``no_prior`` equal to ``full``, correctly reporting that this model has
     no positional channel to ablate.
 
-    Under ``pos_rotation='rope'`` position also enters through the routing cost itself (the rotated
+    Under a ``rope_mode`` other than ``'none'`` position also enters through the routing cost itself (the rotated
     comparison moments, or the rotation folded into the frame), so ``no_energy`` then removes RoPE
     position together with content. A fourth arm ``no_rope`` keeps the cost and the prior and removes
     only the rotation; ``delta_ce.rope_position_channel`` reports it and ``energy_includes_rope_position``
-    flags the reading (audit 2026-10-10, item 5). Under ``rope_space='comparison'`` the arm sets each
+    flags the reading (audit 2026-10-10, item 5). Under a comparison ``rope_mode`` the arm sets each
     operator's comparison rotation to :math:`R_i = I` and keeps everything else, including the commutant
-    projection :math:`P(G)` of ``rope_comparison_covariance='rotation_invariant'``.
+    projection :math:`P(G)` of ``rope_mode='comparison_invariant'``.
     """
     import torch.nn.functional as F
     from vfe3 import free_energy as free_energy_module
@@ -4455,7 +4468,7 @@ def collect_beta_channel_decomposition(
         return _patched(energy, tau=tau, log_prior=log_prior)
 
     cfg = getattr(model, "cfg", None)
-    rope_active = getattr(cfg, "pos_rotation", "none") == "rope"
+    rope_active = getattr(cfg, "rope_mode", "none") != "none"
     operators = list(getattr(model, "relational_operators_by_layer", None) or [])
     comparison_ops = [ops for ops in operators if getattr(ops, "comparison_rope_base", None) is not None]
 
@@ -4464,7 +4477,7 @@ def collect_beta_channel_decomposition(
 
     def _set_rope(enabled: bool) -> None:
         # Comparison-space RoPE lives on each layer's operators; frame-space RoPE is the model's rotation.
-        # The comparison arm keeps comparison_rope_base, which also gates the rotation_invariant commutant
+        # The comparison arm keeps comparison_rope_base, which also gates the comparison_invariant commutant
         # projection P(G), and replaces each operator's rotation R_i by the identity, so only the rotation
         # is removed (audit 2026-10-10 round 2, #19).
         for ops in comparison_ops:
@@ -4474,7 +4487,7 @@ def collect_beta_channel_decomposition(
                 ops.__dict__["comparison_rope_rotation"] = _identity_rotation
         if enabled:
             model.__dict__.pop("_rope_rotation", None)
-        elif getattr(cfg, "rope_space", "frame") == "frame":
+        elif getattr(cfg, "rope_mode", "none") in ("frame", "frame_value"):
             model._rope_rotation = lambda n, device: None
 
     cpu_rng = torch.get_rng_state().clone()
@@ -5069,14 +5082,15 @@ def _pure_path_report(
     receiver_gradient = attention_mode == "projected_gradient"
     predictive_covariance_updated = (
         attention_mode == "projected_predictive"
-        and getattr(cfg, "predictive_covariance", "passthrough") == "moment_matched")
+        and getattr(cfg, "predictive_covariance", "passthrough") in READOUT_COVARIANCES)
     covariance_updated = (receiver_gradient and not cfg.skip_belief_sigma_update) or predictive_covariance_updated
     # The receiver always descends its own energy by Fisher steps or the closed-form update.
     gradient_e_step_update: 'bool | str' = True if receiver_gradient else "not_applicable"
     # The closed-form receiver sets the covariance from natural parameters, Sigma = c Lambda^{-1}; it
     # runs no AIRM retraction, trust projection or exponential, and only its diagonal branch clamps
     # at sigma_max (audit 2026-10-07 F72).
-    closed_form_receiver = getattr(cfg, "relational_receiver_update", "closed_form") == "closed_form"
+    closed_form_receiver = getattr(cfg, "relational_receiver_update", "closed_form") in (
+        "closed_form", "closed_form_profiled")
     sigma_step = receiver_gradient and not cfg.skip_belief_sigma_update
     spd_retraction_applies = sigma_step and not closed_form_receiver
 
@@ -5137,11 +5151,11 @@ def _pure_path_report(
         ["canonical_free_energy_diagnostic"] if getattr(cfg, "diagnose_canonical_free_energy", False) else [])
     per_coord_conditional_kl = (alpha_is_per_coord(cfg.lambda_alpha_mode)
                                 and bool(getattr(get_family(cfg.family), "conditional_kl_coordinates", False)))
-    comparison_rope = cfg.pos_rotation == "rope" and getattr(cfg, "rope_space", "frame") == "comparison"
-    # rotation_invariant scores the commutant projection P(G) of the kernel router's comparison covariance:
+    comparison_rope = cfg.rope_mode in ("comparison", "comparison_invariant")
+    # comparison_invariant scores the commutant projection P(G) of the kernel router's comparison covariance:
     # only the projected means rotate (vfe3.gradients.relational.relational_score).
     rope_commutant_covariance = (
-        comparison_rope and getattr(cfg, "rope_comparison_covariance", "full") == "rotation_invariant"
+        cfg.rope_mode == "comparison_invariant"
         and getattr(cfg, "relational_routing", "gaussian_kl") != "mean_distance")
 
     conditional_fields = _conditional_artifact_fields(cfg)
@@ -5162,15 +5176,15 @@ def _pure_path_report(
         "gradient_e_step_update":      gradient_e_step_update,
     }
     # Second, INDEPENDENT purity axis (audit 2026-07-01 F8): the gauge / model-channel path. Keyed
-    # on pos_rotation itself rather than the RoPE sub-toggle rope_on_value,
-    # which is inert while RoPE is off -- those are reported in config_toggles for transparency.
+    # on rope_mode itself; the RoPE base and fraction are inert while RoPE is off and are reported in
+    # config_toggles for transparency.
     gauge_flags = {
         "learned_gauge_transport":   cfg.gauge_transport == "on",
         "transport_gauge_equivariant": transport_registration.gauge_equivariant,
         # RoPE is folded on the right of the realized frame (U_i R_i^T), the same right-factor
         # structure as pos_phi, so both projected routes stay covariant (audit 2026-10-01 F11).
         "positional_rotation_gauge_covariant": (
-            cfg.pos_rotation == "none" or getattr(cfg, "rope_insertion", "right") == "right"),
+            cfg.rope_mode == "none" or getattr(cfg, "rope_insertion", "right") == "right"),
         "family_group_invariant":    family_group_invariant,
         # block_coordinates='reference' conjugates the block norm, final norm and block MLP by the
         # realized frame, x -> U_i N(U_i^{-1} x), which is covariant for any registered map
@@ -5235,28 +5249,23 @@ def _pure_path_report(
             "block_mlp_covariance_contract": block_mlp_covariance_contract,
             "block_norm_covariance":        getattr(cfg, "block_norm_covariance", "passthrough"),
             "gauge_transport":              cfg.gauge_transport,
-            "pos_rotation":                 cfg.pos_rotation,
-            "rope_on_value":                bool(cfg.rope_on_value),
-            # Which RoPE regime the routing score used (audit 2026-07-26 A-02). rope_space='comparison'
+            "rope_mode":                    cfg.rope_mode,
+            # Which RoPE regime the routing score used (audit 2026-07-26 A-02). A comparison rope_mode
             # folds nothing into the frame: it rotates the projected moments by R_i after the comparison
             # map, so the pair cost depends on positions through j - i (audit 2026-10-08 C#6). Under
-            # rope_comparison_covariance='rotation_invariant' only the means rotate and the covariance is the
+            # rope_mode='comparison_invariant' only the means rotate and the covariance is the
             # commutant projection P(G), with R_i P(G) R_i^T = P(G) (audit 2026-10-10 round 2, #33).
             "rope_pair_energy_exactness":   (
-                "not_applicable" if cfg.pos_rotation == "none"
+                "not_applicable" if cfg.rope_mode == "none"
                 else "comparison_space_rotated_means_commutant_projected_covariance"
                 if rope_commutant_covariance
                 else "comparison_space_rotated_projected_moments"
                 if comparison_rope
                 else "frame_folded_both_moments"   # projected routes push both moments through U_i R_i^T
             ),
-            "rope_space":                   (None if cfg.pos_rotation == "none"
-                                             else getattr(cfg, "rope_space", "frame")),
-            "rope_comparison_covariance":   (getattr(cfg, "rope_comparison_covariance", "full")
-                                             if comparison_rope else None),
-            "rope_fraction":                (None if cfg.pos_rotation == "none"
+            "rope_fraction":                (None if cfg.rope_mode == "none"
                                              else float(cfg.rope_fraction)),
-            "rope_base":                    (None if cfg.pos_rotation == "none"
+            "rope_base":                    (None if cfg.rope_mode == "none"
                                              else float(cfg.rope_base)),
             "skip_belief_sigma_update":      bool(cfg.skip_belief_sigma_update),
             "predictive_covariance":         getattr(cfg, "predictive_covariance", "passthrough"),
@@ -5290,8 +5299,8 @@ def _pure_path_report(
             "m_phi_fisher_rotation_weight":  float(getattr(cfg, "m_phi_fisher_rotation_weight", 2.0)),
             "phi_mstep_max_matrix_norm":     getattr(cfg, "phi_mstep_max_matrix_norm", None),
             "transport_chart_max_norm":      transport_chart_max_norm,
-            "frame_pair_fp64_escalation":    bool(getattr(cfg, "frame_pair_fp64_escalation", False)),
-            "projected_cov_recovery_precision": getattr(cfg, "projected_cov_recovery_precision", "fp64"),
+            "frame_pair_escalation_tol":     getattr(cfg, "frame_pair_escalation_tol", None),
+            "projected_factorization":       getattr(cfg, "projected_factorization", "gram"),
             # Covariance class of the ACTIVE transport (audit C7), owned by its complete registry
             # record. An unregistered mode fails closed instead of inventing report metadata.
             "transport_covariance_class":   transport_registration.covariance_class,

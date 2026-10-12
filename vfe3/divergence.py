@@ -37,7 +37,6 @@ from vfe3.families.base import (
     divergence_functionals_per_coord,
 )
 from vfe3.families import gaussian as _gaussian     # noqa: F401  (registers the Gaussian families)
-from vfe3.families import laplace as _laplace       # noqa: F401  (registers the Laplace family)
 
 __all__ = [
     "renyi",

@@ -6,7 +6,7 @@ Successful factorization always uses zero jitter and no spectral repair.
 """
 
 import math
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 from torch.autograd.function import once_differentiable
@@ -24,7 +24,7 @@ _PROJECTION_TILE_BYTES = 32 * 1024 ** 2
 
 # Cumulative (token, head) covariance entries whose Cholesky factor was rebuilt from source by the
 # recovery path (float64 QR, or float32 shifted CholeskyQR3 on the "cholesky_qr2" factor route or
-# under projected_cov_recovery_precision="fp32"), per device. Updated asynchronously on the recovery
+# under the fp32 recovery precision), per device. Updated asynchronously on the recovery
 # path only, so the healthy path pays nothing (audit 2026-09-23 low: the recovery had no activation counter).
 _SOURCE_RECOVERY_COUNTS: Dict[str, torch.Tensor] = {}
 
@@ -85,16 +85,16 @@ def reset_gemm_fallback_slices() -> None:
     _GEMM_FALLBACK_SLICES = 0
 
 
-# Conditioning-triggered float64 source recovery (config ``projected_cov_condition_recovery``,
-# installed by VFEModel). Off, only entries whose zero-jitter float32 Cholesky FAILS are rebuilt
-# from source; entries that factor but fail the certificate eps_32 ||G||_F ||G^{-1}||_F <= tol
-# keep their float32 factor, and the certificate itself is not evaluated. The Gram-route tolerance
-# is ``projected_gram_condition_tol`` (default 1e-4, i.e. kappa_F(G) > 838.9 in float32).
+# Conditioning-triggered source recovery (on under config ``projected_factorization`` "gram_certified"
+# and "cholesky_qr2_certified", installed by VFEModel). Off, only entries whose zero-jitter float32
+# Cholesky FAILS are rebuilt from source; entries that factor but fail the certificate
+# eps_32 ||G||_F ||G^{-1}||_F <= tol keep their float32 factor, and the certificate itself is not
+# evaluated. The Gram-route tolerance is GRAM_CONDITION_TOL (1e-4, i.e. kappa_F(G) > 838.9 in float32).
+GRAM_CONDITION_TOL: float = 1e-4
 _CONDITION_RECOVERY: bool = False
-_GRAM_CONDITION_TOL: float = 1e-4
+_GRAM_CONDITION_TOL: float = GRAM_CONDITION_TOL
 
-# Working precision of a source recovery (config ``projected_cov_recovery_precision``, installed by
-# VFEModel). "fp64" rebuilds the flagged factors by float64 QR, promotes the factor tensor to float64
+# Working precision of a source recovery (installed by VFEModel, which fixes "fp32"). "fp64" rebuilds the flagged factors by float64 QR, promotes the factor tensor to float64
 # and routes every pair touching a recovered entry through float64 triangular-solve tiles. "fp32"
 # rebuilds them by float32 shifted CholeskyQR3 of the source root (backward stable for
 # kappa_2(X) <~ 1/eps_32; Fukaya et al., SIAM J. Sci. Comput. 42 (2020) A477), keeps the factor in
@@ -120,7 +120,7 @@ def set_projected_gram_condition_tol(tol: float) -> float:
 
 
 def projected_gram_condition_tol() -> float:
-    r"""Return the Gram-route certificate tolerance (config ``projected_gram_condition_tol``)."""
+    r"""Return the Gram-route certificate tolerance (installed by VFEModel as GRAM_CONDITION_TOL)."""
     return _GRAM_CONDITION_TOL
 
 
@@ -155,7 +155,8 @@ def projected_condition_recovery() -> bool:
     return _CONDITION_RECOVERY
 
 
-# Factor route of projected_gaussian_kl (config ``projected_factor_route``, installed by VFEModel;
+# Factor route of projected_gaussian_kl ("cholesky_qr2" under config projected_factorization=
+# "cholesky_qr2_certified", installed by VFEModel;
 # optimization_plan.md WS1/WS2). "gram" factors the rounded Gram G = fl(X X^T), whose factor carries
 # whitened error O(eps kappa(X)^2). "cholesky_qr2" factors the source root X = S U^{-1} Sigma^{1/2}
 # by CholeskyQR2: the same Gaussian, whitened error O(eps kappa(X)). Its recovery certificate is
@@ -849,7 +850,7 @@ def _strict_cholesky(
     working-dtype retry takes the float64 recovery for the whole call.
 
     ``commutant_pairs`` declares that G is the projection :math:`P(XX^\top)` of the source covariance onto the
-    commutant of the RoPE torus with that many rotating planes (``rope_comparison_covariance='rotation_invariant'``,
+    commutant of the RoPE torus with that many rotating planes (``rope_mode='comparison_invariant'``,
     where the source tuple carries the rotated map :math:`R_iS`). A rebuilt entry then factors
     :math:`P(XX^\top)` from the source root (:func:`_commutant_root_factor`), in float64 or by shifted CholeskyQR3
     as above, instead of :math:`XX^\top` (audit 2026-10-10 round 2, item 12). The factor route never runs with it.
@@ -1034,7 +1035,7 @@ def projected_gaussian_kl(
     factorization; the values and recovery decisions are those of two factorizations.
 
     ``commutant_pairs`` declares that G_q and G_k are RoPE-commutant projections :math:`P(XX^\top)` of the
-    source covariances with that many rotating planes (``rope_comparison_covariance='rotation_invariant'``; the
+    source covariances with that many rotating planes (``rope_mode='comparison_invariant'``; the
     source tuples then carry the rotated maps :math:`R_iS`). Recovery rebuilds :math:`P(XX^\top)` from the
     source (:func:`_strict_cholesky`) and the factor route, which factors :math:`XX^\top`, is not taken.
 
@@ -1374,7 +1375,7 @@ def _projected_diagonal_kl(
     which is the dense Gaussian KL of the diagonal matrices exactly. No Gram, Cholesky factorization or
     :math:`r^2 + r` GEMM runs: the pair grid is one GEMM of inner dimension :math:`2r` per (batch, head)
     (:func:`_diagonal_kl_expansion`), forward and backward at IEEE fp32 through :class:`_IEEEFP32Recompute`, and
-    no (..., H, Nq, Nk, r) tensor is formed. This is the route of ``rope_comparison_covariance='rotation_invariant'``
+    no (..., H, Nq, Nk, r) tensor is formed. This is the route of ``rope_mode='comparison_invariant'``
     whenever every comparison coordinate but at most one rotates (audit 2026-10-10 round 2, item 30).
 
     The diagonal analogue of the zero-jitter positivity certificate is that every variance is finite and positive;
@@ -1555,7 +1556,7 @@ def projected_noisy_query_cost(
     Factorization and recovery follow projected_gaussian_kl: zero jitter, no covariance repair,
     float64 source recovery for flagged entries, bounded checkpointed pair tiles, and the float64
     route selected per pair, so healthy pairs are bit-identical to a call without recovery. Under
-    ``projected_cov_recovery_precision="fp32"`` the recovered factors come from float32 shifted
+    the fp32 recovery precision the recovered factors come from float32 shifted
     CholeskyQR3, and these pair tiles still run in float64.
     Recovered entries enter the working-dtype grid as identity placeholders, so no factorization
     of a numerically non-SPD sum runs even for a pair whose value the factor route replaces.
@@ -1684,6 +1685,51 @@ def _noisy_query_tile(
     return .5 * (quadratic + logdet_w - logdet_q.unsqueeze(-1)), (info != 0).any()
 
 
+def projected_noisy_key_cost(
+    a_q: torch.Tensor,        # (..., Nq, H, r)
+    G_q: torch.Tensor,        # (..., Nq, H, r, r)
+    a_k: torch.Tensor,        # (..., Nk, H, r)
+    G_k: torch.Tensor,        # (..., Nk, H, r, r)
+
+    *,
+    key_noise: torch.Tensor,  # (H,) n_h > 0
+    projection_q: Optional[Tuple[torch.Tensor, ...]] = None,
+    projection_k: Optional[Tuple[torch.Tensor, ...]] = None,
+    symmetric_inputs: bool = False,
+    commutant_pairs: Optional[int] = None,
+    **kl_options: Any,
+) -> torch.Tensor:            # (..., H, Nq, Nk)
+    r"""Noisy-key routing cost :math:`D_{ij} = \mathrm{KL}(N(a_i, G_{q,i})\,\|\,N(b_j, G_{k,j} + n_hI_r))`.
+
+    Each key law is broadened by a per-head isotropic noise :math:`n_h` (audit 2026-10-12, T6). The router applies
+    it at temperature 1 (:meth:`vfe3.model.relational_operators.RelationalOperators.routing_temperature`), so the
+    routing objective :math:`\sum_j\beta_{ij}D_{ij} + \mathrm{KL}(\beta_i\,\|\,\pi_i)` is
+    :math:`\mathrm{KL}(\mathbb Q_{i,\beta}\,\|\,\mathbb P_i)` of the declared joint
+    :math:`\mathbb P_i(y, J=j) = \pi_{ij}N(y; b_j, G_{k,j} + n_hI)` and the factorized recognition law
+    :math:`\mathbb Q_{i,\beta}(y, J=j) = \beta_{ij}N(y; a_i, G_{q,i})` (GL(K) v2, Eq. (mixture_free_energy)) with
+    no temperature :math:`\kappa\sqrt d`: the noise sets the sharpness. At :math:`n_h = 0` it is
+    :func:`projected_gaussian_kl` at temperature 1.
+
+    The cost is :func:`projected_gaussian_kl` of the broadened key covariance. The key source tuple is not passed:
+    :math:`G_{k,j} + n_hI` is not the Gram matrix of a source root, so no key recovery or factor route applies (the
+    Gram route runs, and :math:`G_{k,j} + n_hI \succeq n_hI` needs none). The query keeps its source tuple and
+    recovery. ``kl_options`` (``query_row_constant_grad``, ``gemm_expansion_tol``) pass through. ``key_noise`` is
+    required, so a caller that does not supply it fails instead of scoring the noise-free Gaussian KL.
+    """
+    r = a_k.shape[-1]
+    if G_k.shape != (*a_k.shape, r):
+        raise ValueError("projected covariances must match their means with one additional matrix axis")
+    if key_noise.shape != (a_k.shape[-2],):
+        raise ValueError(f"key_noise must have one entry per head, shape ({a_k.shape[-2]},), "
+                         f"got {tuple(key_noise.shape)}")
+    dtype = _compute_dtype(a_q, G_q, a_k, G_k, key_noise)
+    eye = torch.eye(r, dtype=dtype, device=G_k.device)
+    # G_k + n_h I is exactly symmetric when G_k is: the shift touches only the diagonal.
+    G_noisy = G_k.to(dtype) + key_noise.to(dtype)[:, None, None] * eye           # (..., Nk, H, r, r)
+    return projected_gaussian_kl(a_q, G_q, a_k, G_noisy, projection_q=projection_q, projection_k=None,
+                                 symmetric_inputs=symmetric_inputs, commutant_pairs=commutant_pairs, **kl_options)
+
+
 def relational_mixture_mean(
     xi:             torch.Tensor,  # (..., Nk, H, d)
     forward_blocks: torch.Tensor,  # (..., Nq, H, d, d)
@@ -1770,6 +1816,7 @@ def _mean_distance_tile(
 ROUTING_COSTS = {
     "gaussian_kl":   projected_gaussian_kl,
     "noisy_query":   projected_noisy_query_cost,
+    "noisy_key":     projected_noisy_key_cost,       # also requires key_noise (H,): the router passes it
     "mean_distance": projected_mean_distance_cost,
 }
 

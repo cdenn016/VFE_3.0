@@ -31,7 +31,7 @@ PAIRS = [(6, 3), (23, 23), (54, 54)]
 
 def _planned(**over: Any) -> Any:
     r"""Tiny twin of the planned paper base: ALiBi, no RoPE, row_min, no residual, chunked diagonal decode."""
-    values = dict(attention_residual=False, beta_attention_prior="causal_alibi", pos_rotation="none",
+    values = dict(attention_residual=False, beta_attention_prior="causal_alibi", rope_mode="none",
                   routing_kl_max_reference="row_min", decode_mode="diagonal_chunked", sigma_weight_decay=0.0,
                   norm_type_final="none", pos_phi="none", predictive_covariance="moment_matched",
                   content_link_chart="exponential")

@@ -137,7 +137,7 @@ def parameter_role(
         # Mixed head sizes store per-run lists: the attribute is the segment before the run index.
         attribute = name.rsplit(".", 2)[-2] if leaf.isdigit() else leaf
         if attribute in ("raw_score_q", "raw_score_k", "channel_log_noise",   # channel_log_noise: minimal agent
-                         "routing_log_temperature"):
+                         "routing_log_temperature", "routing_key_log_noise"):
             return "context_processing", "relational_score"
         if attribute in ("T", "O") or attribute.startswith("edge_"):   # edge_*: content_link_edges factor maps
             return "context_processing", "relational_content"

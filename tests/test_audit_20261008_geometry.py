@@ -168,7 +168,7 @@ def test_untied_so_n_with_l0_block_takes_a_pullback_group_train_step() -> None:
     cfg = _cfg(vocab_size=12, embed_dim=7, n_heads=3, max_seq_len=8, n_layers=1, pos_phi="none",
                gauge_group="so_n", group_n=3, irrep_spec=[("l0", 1), ("l1", 2)], gauge_tying="per_head",
                m_phi_update_mode="pullback_group", m_phi_group_retraction="chart",
-               transport_chart_max_norm=6.0, m_phi_lr=0.1, pos_rotation="none")
+               transport_chart_max_norm=6.0, m_phi_lr=0.1, rope_mode="none")
     torch.manual_seed(0)
     model = VFEModel(cfg)
     optimizer = build_optimizer(model, cfg)

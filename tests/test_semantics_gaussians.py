@@ -257,7 +257,6 @@ def test_paired_spearman_delta_detects_better_scorer() -> None:
 def test_init_log_var_is_family_aware() -> None:
     assert G._init_log_var(SimpleNamespace(family="gaussian_diagonal", sigma_init=15.0)) == pytest.approx(math.log(15.0))
     assert G._init_log_var(SimpleNamespace(family="gaussian_full", sigma_init=3.0)) == pytest.approx(math.log(3.0))
-    assert G._init_log_var(SimpleNamespace(family="laplace_diagonal", sigma_init=2.0)) == pytest.approx(math.log(8.0))
 
 
 # ----------------------------------------------------------------------------------------------

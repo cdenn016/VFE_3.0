@@ -2,7 +2,7 @@
 
 A float32 projected covariance whose zero-jitter Cholesky SUCCEEDS but whose certificate
 eps_32 ||G||_F ||G^{-1}||_F exceeds 1e-4 is rebuilt from its source in float64 only under
-``projected_cov_condition_recovery``. A covariance whose Cholesky FAILS is always rebuilt.
+``projected_factorization="gram_certified"``. A covariance whose Cholesky FAILS is always rebuilt.
 """
 from typing import Callable, Iterator
 
@@ -48,10 +48,10 @@ def _reference(sources: tuple, cost: Callable) -> torch.Tensor:
 def test_config_disabled_validated_and_active_on_supported_routes() -> None:
     from tests.profiles import tiny_config
     from tests.test_relational_integration import _cfg
-    assert _cfg(projected_cov_condition_recovery=False).projected_cov_condition_recovery is False
-    with pytest.raises(ValueError, match="projected_cov_condition_recovery"):
-        _cfg(projected_cov_condition_recovery=1)
-    assert "projected_cov_condition_recovery" not in _cfg().inactive_fields()
+    assert _cfg(projected_factorization="gram").projected_factorization == "gram"
+    with pytest.raises(ValueError, match="projected_factorization"):
+        _cfg(projected_factorization=True)
+    assert "projected_factorization" not in _cfg().inactive_fields()
 
 
 @pytest.mark.parametrize("enabled", [True, False])
@@ -61,7 +61,7 @@ def test_model_installs_the_config_policy(condition_recovery: Callable[[bool], b
     from vfe3.model.model import VFEModel
 
     condition_recovery(not enabled)
-    VFEModel(_cfg(projected_cov_condition_recovery=enabled))
+    VFEModel(_cfg(projected_factorization="gram_certified" if enabled else "gram"))
     assert projected_condition_recovery() is enabled
 
 

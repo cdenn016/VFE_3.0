@@ -129,10 +129,10 @@ def test_config_seam_reads_the_traits_of_a_new_group(block_co: str) -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("error")                                       # no structure-group warning
         warnings.simplefilter("ignore", ConfigNotice)              # inert-setting advisories are not the subject
-        test_config(gauge_group=block_co, embed_dim=6, n_heads=2, pos_rotation="rope")
+        test_config(gauge_group=block_co, embed_dim=6, n_heads=2, rope_mode="frame_value")
     with pytest.warns(UserWarning, match="leaves the structure"):
         test_config(gauge_group="so_n", group_n=3, irrep_spec=[("l1", 2)], embed_dim=6, n_heads=2,
-                    pos_rotation="rope")
+                    rope_mode="frame_value")
 
 
 @pytest.mark.parametrize("route", ["predictive", "gradient"])

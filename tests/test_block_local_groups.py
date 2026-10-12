@@ -100,7 +100,7 @@ def test_config_accepts_and_refuses() -> None:
         with warnings.catch_warnings():
             warnings.simplefilter("error")                    # RoPE stays inside the group: no warning
             warnings.simplefilter("ignore", ConfigNotice)              # inert-setting advisories are not the subject
-            test_config(gauge_group=name, embed_dim=6, n_heads=2, pos_rotation="rope")
+            test_config(gauge_group=name, embed_dim=6, n_heads=2, rope_mode="frame_value")
     with pytest.raises(ValueError, match="head blocks of size >= 2"):
         test_config(gauge_group="block_so", embed_dim=4, n_heads=4)
     assert test_config(gauge_group="block_co", embed_dim=4, n_heads=4).head_dims == [1, 1, 1, 1]
@@ -128,7 +128,7 @@ def test_train_step_and_gauge_equivariance(name: str, route: str) -> None:
 @pytest.mark.parametrize("name", GROUPS)
 def test_rope_train_step(name: str) -> None:
     from vfe3.train import build_optimizer, train_step
-    model = _model(name, pos_rotation="rope", rope_on_value=False, n_layers=2)
+    model = _model(name, rope_mode="frame", n_layers=2)
     optimizer = build_optimizer(model, model.cfg)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
     assert math.isfinite(train_step(model, optimizer, scheduler, torch.tensor([[1, 4, 2]]),
