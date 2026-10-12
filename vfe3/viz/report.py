@@ -1038,8 +1038,8 @@ def generate_figures(
     def _emit(name: str, thunk: Callable[[str], object], available: bool) -> None:
         r"""Write ``figures/<name>.png`` from ``thunk(path)``; skip a route-trivial figure with its
         logged reason, or one whose input is missing."""
-        if name in skip_reasons:
-            logger.info("figure %r skipped (%s)", name, skip_reasons[name])
+        if name in skip_reasons:                               # route-trivial: fixed by the config, not news
+            logger.debug("figure %r skipped (%s)", name, skip_reasons[name])
             return
         if not available:
             logger.info("figure %r skipped (input unavailable)", name)
