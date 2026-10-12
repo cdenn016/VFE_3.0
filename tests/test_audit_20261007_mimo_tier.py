@@ -57,11 +57,9 @@ def test_hidden_temperature_is_not_applicable_on_the_minimal_agent() -> None:
 
 # ---------------------------------------------------------------- items 16, 31, 32: matched baseline
 
-def test_matched_baseline_copies_fill_and_refuses_non_dense_bases() -> None:
+def test_matched_baseline_refuses_non_dense_bases() -> None:
     from vfe3.baseline import BaselineConfig
 
-    base = _cfg(attention_mode="projected_predictive", fill_uninitialized_memory=False)
-    assert BaselineConfig.matched_to(base).fill_uninitialized_memory is False
     for overrides, match in (({"predictive_readout": "minimal_agent"}, "predictive_readout"),
                              ({"use_block_mlp": False}, "no block MLP")):
         with pytest.raises(ValueError, match=match):
@@ -191,7 +189,7 @@ def _ladder_fixture(monkeypatch: pytest.MonkeyPatch, behavior):
     monkeypatch.setattr(train_module, "train_step", fake_step)
     parameter = torch.nn.Parameter(torch.zeros(1))
     optimizer = torch.optim.SGD([parameter], lr=0.1)
-    model = types.SimpleNamespace(cfg=types.SimpleNamespace(matmul_precision_retry=True))
+    model = types.SimpleNamespace(cfg=types.SimpleNamespace())
 
     def run(policy: str):
         previous = torch.get_float32_matmul_precision()
@@ -245,7 +243,7 @@ def test_only_the_first_replay_warns(monkeypatch, caplog) -> None:
 
     _ladder_fixture(monkeypatch, flaky)
     optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1)
-    model = types.SimpleNamespace(cfg=types.SimpleNamespace(matmul_precision_retry=True))
+    model = types.SimpleNamespace(cfg=types.SimpleNamespace())
     previous = torch.get_float32_matmul_precision()
     torch.set_float32_matmul_precision("high")
     try:

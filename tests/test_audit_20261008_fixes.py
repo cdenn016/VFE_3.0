@@ -103,8 +103,6 @@ def test_eval_forward_replays_at_a_stricter_policy() -> None:
         return "ok"
 
     class Fake:
-        cfg = types.SimpleNamespace(matmul_precision_retry=True)
-
         def __call__(self, *args, **kwargs):
             return forward(*args, **kwargs)
 
@@ -115,9 +113,6 @@ def test_eval_forward_replays_at_a_stricter_policy() -> None:
         assert _eval_forward_with_precision_retry(model) == "ok"
         assert seen == ["high", "highest"]
         assert torch.get_float32_matmul_precision() == "high"
-        model.cfg.matmul_precision_retry = False
-        with pytest.raises(ValueError):
-            _eval_forward_with_precision_retry(model)
     finally:
         torch.set_float32_matmul_precision(previous)
 

@@ -191,16 +191,9 @@ class VFE3Config:
     #   role   one set per optimizer role (mu / sigma / phi), the historical behavior
     #   group  one set per optimizer group, so one exploding group cannot set the coefficient of the others
     grad_clip_scope:                  str             = "role"
-    # Stop a diverging run and finalize it normally with training_status "diverged" and the reason (summary.json):
-    # after 100 consecutive rejected updates, or when a log/eval row's interval-mean training CE exceeds
-    # ln(vocab_size) after the warmup. False: the divergence monitor only warns and forces metrics rows.
-    divergence_abort:                 bool            = False
 
     seed:                             int             = 6
     
-    # deterministic only: fill uninitialized allocations with NaN so stray reads are visible. False
-    # skips the fill kernels (about 13.5 ms per K=64 step on the RTX 5090; loss and gradients identical).
-    fill_uninitialized_memory:        bool            = True
     deterministic:                    bool            = True         # torch/cuDNN determinism (TF32: see fp32_matmul_precision)
     
     ##################################################
@@ -231,9 +224,6 @@ class VFE3Config:
     diagnose_agent_elbo:              bool            = False
 
     eval_stride:                     Optional[int]   = None         # held-out window stride <= max_seq_len; None = disjoint windows
-    # Training-window origin: "fixed" (window i starts at i*max_seq_len every epoch) | "per_epoch_random"
-    # (each epoch draws an origin in [0, max_seq_len) from the train loader's generator; vfe3.train.train).
-    train_window_offset:              str             = "fixed"
                
     generate_embedding_figures:       bool            = False        # slow semantic-geometry figures at finalize
 
@@ -842,12 +832,6 @@ class VFE3Config:
     #   high     TF32 (or bf16x3) allowed
     #   medium   bf16 allowed
     fp32_matmul_precision:            Optional[str]   = "highest"
-    # Under a reduced fp32_matmul_precision ("medium"/"high"): when a training step raises before its
-    # optimizer update, or rejects its update for a non-finite loss or gradient, replay it one rung stricter,
-    # "medium" -> "high" -> "highest" (IEEE fp32), instead of stopping the run or skipping the step. A failure
-    # that persists at "highest" is raised (a skip is kept) as before. The log-step diagnostics and evaluation
-    # forwards use the same ladder. Not used with fp16 (GradScaler state).
-    matmul_precision_retry:           bool            = False
 
     # None (off) | tol in (0, 1)
     # Redo a frame producer call in float64 when its float32 frame pair is ill-conditioned,
@@ -1133,10 +1117,6 @@ class VFE3Config:
                 UserWarning,
                 stacklevel=2,
             )
-        from vfe3.data.datasets import WINDOW_OFFSET_MODES
-        if self.train_window_offset not in WINDOW_OFFSET_MODES:
-            raise ValueError(f"train_window_offset must be one of {WINDOW_OFFSET_MODES}, "
-                             f"got {self.train_window_offset!r}")
         # eval_stride above max_seq_len would skip transitions between consecutive held-out windows,
         # which no target mask can recover, so the exactly-once eval contract rejects it. Equal to
         # max_seq_len is the disjoint default spelled out.
@@ -2176,12 +2156,6 @@ class VFE3Config:
         minimal_agent = self.predictive_readout == "minimal_agent"
         if self.decode_mode != "linear" or self.amp_dtype is None:
             mark(("decode_logits_amp",), "only read by decode_mode='linear' with amp_dtype set")
-        if self.fp32_matmul_precision == "highest" or self.amp_dtype == "fp16":
-            mark(("matmul_precision_retry",),
-                 "only read under a reduced fp32_matmul_precision and without the fp16 GradScaler")
-        if not self.deterministic:
-            mark(("fill_uninitialized_memory",),
-                 "torch fills uninitialized memory only under deterministic algorithms")
         if (self.attention_mode == "projected_predictive" and not minimal_agent
                 and self.relational_routing == "mean_distance"):
             # The covariance-blind cost reads neither the projected covariances nor the source tuples,
@@ -2675,6 +2649,11 @@ _FRAME_PAIR_FIELDS = ("frame_pair_fp64_escalation", "frame_pair_condition_tol")
 _NORM_MLP_FIELDS = ("norm_type_final", "block_mlp_post_norm", "block_mlp_autocast")
 # Removed 2026-10-12 (second pass): the non-causal attention priors (each position saw future tokens).
 _RETIRED_ATTENTION_PRIORS = frozenset({"uniform", "alibi", "windowed"})
+# Runtime and diagnostic policies hardcoded/removed 2026-10-12 (second pass): no divergence abort, no NaN fill
+# of uninitialized memory, a per-epoch random training-window origin and the matmul-precision replay ladder.
+# None changes the model, so any saved value is dropped silently.
+_RUNTIME_POLICY_FIELDS = ("divergence_abort", "fill_uninitialized_memory", "train_window_offset",
+                          "matmul_precision_retry")
 # Every serialized key config_from_serialized migrates or refuses that is not a VFE3Config field.
 RETIRED_CONFIG_KEYS = frozenset(
     set(_RETIRED_PINNED_FIELDS) | _RETIRED_INERT_FIELDS | _RETIRED_CONDITIONAL_FIELDS
@@ -2682,7 +2661,8 @@ RETIRED_CONFIG_KEYS = frozenset(
        "relational_readout_mode", "relational_input_scope", "relational_output_scope",
        "relational_identity_content"}
     | set(_PROJECTED_FACTORIZATION_FIELDS) | set(_ROPE_FIELDS) | set(_HARDCODED_FIELDS)
-    | set(_FRAME_PAIR_FIELDS) | set(_NORM_MLP_FIELDS))
+    | set(_FRAME_PAIR_FIELDS) | set(_NORM_MLP_FIELDS)
+    | set(_RUNTIME_POLICY_FIELDS))
 # laplace_diagonal (retired 2026-10-12) was registered but refused on both projected routes.
 _RETIRED_FAMILIES = frozenset({"gaussian_frame_diagonal", "laplace_diagonal"})
 _MIGRATED_FAMILIES = {"gaussian_diagonal_exact": "gaussian_diagonal"}
@@ -2724,7 +2704,7 @@ def _migrate_retired_fields(
             value = payload.pop(name)
             if not _same_serialized_value(value, pinned):
                 refuse(name, value, f" (only {pinned!r} survives)")
-    for name in _RETIRED_INERT_FIELDS:
+    for name in (*_RETIRED_INERT_FIELDS, *_RUNTIME_POLICY_FIELDS):
         payload.pop(name, None)
     payload.pop("_allow_legacy_dense_decode", None)
 

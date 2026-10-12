@@ -2219,7 +2219,7 @@ class RunArtifacts:
                 "epoch":                       epoch,
                 "data_identity":               data_identity,
             }
-            if "window_offset" in data_state:            # train_window_offset='per_epoch_random' only
+            if "window_offset" in data_state:            # per-epoch window origins only
                 saved_data_state["window_offset"] = _require_nonnegative_int(
                     data_state["window_offset"], "window_offset")
         # Portable best-model selection state (PB-03): a finite best_val_ppl means best_model.pt IS the
@@ -4172,8 +4172,7 @@ def finalize_run(
     # third of its steps trained on a different schedule than its config claims, and sweep arms with
     # different skip rates are not comparable. Absent on a train() call that had no artifacts.
     _realized = dict(getattr(artifacts, "realized_updates", None) or {})
-    # Tokens of the steps actually run: a run stopped by divergence_abort ends before max_steps
-    # (audit 2026-10-10 round 2, item 1).
+    # Tokens of the steps actually run (attempted_steps; cfg.max_steps without a realized record).
     steps_run = int(_realized.get("attempted_steps", cfg.max_steps))
     tokens_seen = steps_run * int(cfg.batch_size) * int(cfg.max_seq_len)
     # scaling-law data point: the 6ND FLOP proxy is LOOSE for a no-NN E-step model, so record the
@@ -4906,9 +4905,6 @@ def finalize_validation_run(
     figures_written = sorted(p.name for p in artifacts.run_dir.glob("*.png") if p.is_file())
     artifacts.save_json("summary.json", {
         **_conditional_artifact_fields(cfg),
-        # train() sets training_status ("diverged" with its reason when divergence_abort stopped the loop)
-        # before calling its terminal callback (audit 2026-10-10 round 2, item 1).
-        **dict(getattr(artifacts, "training_status", None) or {}),
         "selection_split":     "validation",
         "primary_val_ppl":     float(primary_val_ppl),
         "final_val_ce":        final_ce,

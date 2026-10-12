@@ -105,7 +105,6 @@ config = dict(
 
     max_seq_len                      = 128,                 # N, context length
     eval_stride                      = 32,
-    train_window_offset              = "fixed",     # "fixed" | "per_epoch_random" (a new window origin in [0, N) each epoch; resume-exact)
 
     batch_size                       = 32,
     max_steps                        = 30000,
@@ -122,7 +121,6 @@ config = dict(
     eval_interval                    = 1500,      # periodic validation every N steps (0 = off)
     diagnose_canonical_free_energy   = False,     # log the canonical free energy (gauge-KL routing) at the captured beliefs
     checkpoint_interval              = 15000,     # save a resumable checkpoint every N steps (0 = off)   
-    divergence_abort                 = False,     # stop after 100 consecutive rejected updates or a row CE above ln V; finalize as "diverged"
     
     #################################
     #           Modes               #
@@ -324,7 +322,6 @@ config = dict(
   
     amp_dtype                        = 'bf16',        # None (fp32) | "bf16" | "fp16". Sigma must be at least fp32
     fp32_matmul_precision            = "highest",          # None (leave as-is) | "highest" | "high" | "medium" ("high" permits TF32 on the decode/energy GEMMs)
-    matmul_precision_retry           = False,      # on a step error under "medium"/"high", replay it one rung stricter (-> "highest")
     routing_kl_max_reference         = "absolute",  # "absolute" | "row_min" (kernel router: kl_max caps D_ij, or the gap D_ij - min_j D_ij)
     pair_kl_gemm_tol                 = None,       # None (off) | nats, e.g. 1e-3: rescore pair-KL GEMM slices whose error estimate exceeds it (~+45% step at K=128)
         

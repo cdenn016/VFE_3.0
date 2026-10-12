@@ -3545,29 +3545,22 @@ def _loader_data_identity(
 
 def _configure_train_window_offset(
     loader: object,
-    mode:   str,
 ) -> Optional[object]:
-    r"""Put the train loader's windows in ``mode`` (``cfg.train_window_offset``); return the dataset to draw on.
+    r"""Give the train loader's windows a per-epoch random origin; return the dataset to draw on.
 
-    ``'fixed'`` resets a window dataset that a previous call (a loader shared across cells) left in
-    another mode and returns None: nothing is drawn. ``'per_epoch_random'`` needs a
-    :class:`~vfe3.data.datasets.TokenWindows` dataset, a ``torch.Generator`` on the loader (the
-    origin of each epoch is drawn from it just before the epoch's iterator, so the saved epoch-start
-    generator state replays origin and permutation on resume) and in-process loading
-    (``num_workers=0``, so the dataset the workers read is the one whose origin was set).
+    A training :class:`~vfe3.data.datasets.TokenWindows` dataset draws a new origin each epoch, just
+    before the epoch's iterator: from the loader's ``torch.Generator`` when the loader shuffles with one
+    (the saved epoch-start generator state then replays origin and permutation on resume), else from the
+    global CPU RNG. It needs in-process loading (``num_workers=0``, so the dataset the workers read is
+    the one whose origin was set). Any other train dataset (in-memory batches, an evaluation stream
+    with ``pad_final``) has no window origin to draw and returns None.
     """
     dataset = getattr(loader, "dataset", None)
-    if mode == "fixed":
-        if hasattr(dataset, "set_window_offset_mode"):
-            dataset.set_window_offset_mode("fixed")
+    if not hasattr(dataset, "use_per_epoch_offsets") or getattr(dataset, "pad_final", False):
         return None
-    if not hasattr(dataset, "draw_window_offset"):
-        raise ValueError(f"train_window_offset={mode!r} needs a TokenWindows train dataset")
-    if not isinstance(getattr(loader, "generator", None), torch.Generator):
-        raise ValueError(f"train_window_offset={mode!r} needs a seeded torch.Generator on the train loader")
     if getattr(loader, "num_workers", 0) != 0:
-        raise ValueError(f"train_window_offset={mode!r} needs num_workers=0")
-    dataset.set_window_offset_mode(mode)
+        raise ValueError("per-epoch training-window origins need num_workers=0")
+    dataset.use_per_epoch_offsets()
     return dataset
 
 
@@ -3634,8 +3627,8 @@ def _no_update_call_with_precision_retry(
 ) -> Any:
     r"""Run a no-update call (an evaluation forward or a diagnostic) on the replay ladder of training.
 
-    Under ``cfg.matmul_precision_retry`` a call that raises at a reduced ``fp32_matmul_precision``
-    (a fail-closed certificate tripped by TF32 or bf16 GEMM rounding) is run again one rung stricter,
+    A call that raises at a reduced ``fp32_matmul_precision`` (a fail-closed certificate tripped by TF32 or
+    bf16 GEMM rounding) is run again one rung stricter,
     ``"medium" -> "high" -> "highest"``, as :func:`_train_step_with_precision_retry` does for the train
     step (audit 2026-10-08 P0-1). A no-update call changes no parameter, so a replay needs no gradient
     or optimizer rollback; ``restore_rng`` also rewinds the CPU and CUDA RNG streams before each replay,
@@ -3643,7 +3636,7 @@ def _no_update_call_with_precision_retry(
     with the earlier failures attached as notes; out-of-memory errors are never replayed.
     """
     current = torch.get_float32_matmul_precision()
-    if not getattr(getattr(model, "cfg", None), "matmul_precision_retry", False) or current == "highest":
+    if current == "highest":
         return call()
     cpu_rng = torch.get_rng_state().clone() if restore_rng else None
     cuda_rng = ([state.clone() for state in torch.cuda.get_rng_state_all()]
@@ -3709,7 +3702,7 @@ def _train_step_with_precision_retry(
     replay_log: Optional[List[Dict[str, object]]] = None,   # one record appended per failed attempt
     **step_kwargs: Any,
 ) -> Tuple[float, int]:                  # (loss, number of escalated replays the step needed)
-    r"""Run :func:`train_step`; under ``cfg.matmul_precision_retry`` replay a failed step at a stricter policy.
+    r"""Run :func:`train_step`; under a reduced fp32 matmul policy replay a failed step at a stricter one.
 
     Under a reduced ``fp32_matmul_precision`` the GEMM rounding is about :math:`2^{-10}` (TF32,
     ``"high"``) or :math:`2^{-7}` (bf16, ``"medium"``) instead of :math:`2^{-23}`, enough to trip a
@@ -3736,9 +3729,7 @@ def _train_step_with_precision_retry(
     """
     scaler = step_kwargs.get("scaler")
     current = torch.get_float32_matmul_precision()
-    if (not getattr(model.cfg, "matmul_precision_retry", False)
-            or current == "highest"
-            or (scaler is not None and scaler.is_enabled())):
+    if current == "highest" or (scaler is not None and scaler.is_enabled()):
         return train_step(model, optimizer, scheduler, tokens, targets, **step_kwargs), 0
     status = step_kwargs.get("status_out")
     if status is None:                                  # the skip verdict is read from the step's status
@@ -3824,10 +3815,9 @@ DIVERGENCE_EMA_WARMUP:        int   = 50       # finite observations of a quanti
 DIVERGENCE_NORM_SPIKE_RATIO:  float = 10.0     # a role's pre-clip norm above 10x its EMA is a spike
 DIVERGENCE_LOSS_SPIKE_MARGIN: float = 1.0      # nats: a training loss above its EMA by more is a spike
 DIVERGENCE_SPIKE_COOLDOWN:    int   = 100      # steps between reported spikes (each forces a metrics row)
-DIVERGENCE_ABORT_SKIPS:       int   = 100      # divergence_abort: consecutive rejected updates that stop the run
 DIVERGENCE_ROLES: Tuple[str, ...] = ("mu", "sigma", "phi")
 # Columns on every metrics row: statistics over the steps since the previous log/eval row, the realized clip
-# coefficients of the row's own step, and whether the row was forced by a spike or an abort.
+# coefficients of the row's own step, and whether the row was forced by a spike.
 DIVERGENCE_COLUMNS: Tuple[str, ...] = (
     "interval_steps", "train_loss_interval_mean", "train_loss_interval_max", "train_ce_interval_mean",
     *(f"grad_norm_{role}_interval_{stat}" for role in DIVERGENCE_ROLES for stat in ("mean", "max")),
@@ -3888,9 +3878,6 @@ class _DivergenceMonitor:
         self._clipped = 0
         self._binding = 0
 
-    def interval_ce_mean(self) -> float:
-        return self._ce.mean()
-
     def observe(
         self,
         step:   int,                       # completed-step number of this step
@@ -3936,7 +3923,7 @@ class _DivergenceMonitor:
     def columns(
         self,
         status:  Mapping[str, Any],        # train_step status_out of the row's own step
-        flagged: bool,                     # the row's step spiked or triggered divergence_abort
+        flagged: bool,                     # the row's step spiked
     ) -> Dict[str, float]:
         r"""The ``DIVERGENCE_COLUMNS`` of a metrics row (NaN where nothing was measured)."""
         out: Dict[str, float] = {
@@ -4026,11 +4013,7 @@ def train(
     ``train_step`` already transfers, so the trajectory is unchanged: each metrics row carries the
     ``DIVERGENCE_COLUMNS`` (loss, CE and per-role pre-clip norm statistics since the previous row,
     the clip-binding fraction and the realized clip coefficients), and a spike logs a warning and
-    forces a metrics row at its step. Under ``cfg.divergence_abort`` the loop stops after
-    ``DIVERGENCE_ABORT_SKIPS`` consecutive rejected updates or a row whose interval-mean CE exceeds
-    :math:`\ln V`; the run then ends normally at that step and records ``training_status="diverged"``
-    with the reason in ``artifacts.realized_updates`` (summary.json), so a multi-seed launch continues
-    (audit 2026-10-10 round 2, item 1).
+    forces a metrics row at its step (audit 2026-10-10 round 2, item 1).
     """
     # Never expose a stale result after a partial/resumed run or a failed call.
     if _final_validation_out is not None:
@@ -4065,7 +4048,9 @@ def train(
     loader_sampler = getattr(loader, "sampler", None)
     shuffled_loader = isinstance(loader_sampler, torch.utils.data.RandomSampler)
     loader_generator = getattr(loader, "generator", None)
-    offset_windows = _configure_train_window_offset(loader, getattr(cfg, "train_window_offset", "fixed"))
+    offset_windows = _configure_train_window_offset(loader)
+    offset_generator = (loader_generator if shuffled_loader and isinstance(loader_generator, torch.Generator)
+                        else None)                           # None: the global CPU RNG
     try:
         steps_per_epoch = int(len(loader))  # type: ignore[arg-type]
     except (TypeError, AttributeError):
@@ -4124,6 +4109,9 @@ def train(
     # Created BEFORE the resume block so load_checkpoint can restore its scale/growth state
     # (audit 2026-06-09 IE3).
     scaler = torch.amp.GradScaler(device=device.type, enabled=(cfg.amp_dtype == "fp16"))
+    # Train steps can replay on the precision ladder (_train_step_with_precision_retry): a reduced fp32 matmul
+    # policy without the fp16 GradScaler.
+    precision_ladder = torch.get_float32_matmul_precision() != "highest" and not scaler.is_enabled()
     if resume_path is not None:
         from vfe3.run_artifacts import load_checkpoint           # local import avoids any import cycle
         start_step = load_checkpoint(resume_path, model, optimizer, map_location=device,
@@ -4221,13 +4209,9 @@ def train(
     skipped_steps = 0                 # cumulative REJECTED optimizer updates (audit 2026-08-06 F5)
     consecutive_skips = 0
     # Finite-divergence detection (audit 2026-10-10 round 2, item 1): interval statistics and spike warnings
-    # on host values train_step already transfers; divergence_abort stops the loop at completed_steps and the
-    # run finalizes with training_status "diverged" instead of raising.
+    # on host values train_step already transfers.
     divergence = _DivergenceMonitor()
-    divergence_abort = bool(getattr(cfg, "divergence_abort", False))
-    divergence_reason: Optional[str] = None
     completed_steps = int(n_steps)
-    previous_row_steps = 0                                   # regular (log/eval) rows written so far
     reset_nonfinite_tangent_elements()   # per-run accounting for the SPD-retraction guard
     reset_public_spd_repair_elements()   # ... and its certificate repairs
     reset_mu_trust_fallback_elements()   # ... the mu-trust-region equivariance fallback
@@ -4237,7 +4221,7 @@ def train(
     reset_layernorm_trace_cap_elements()    # ... and LayerNorm pushforward sphere-bound caps
     run_total_base = _resumed_run_totals(getattr(artifacts, "resumed_numerics_counters", None),
                                          start_step, logger)
-    # steps replayed at "highest" under cfg.matmul_precision_retry (whole run), and its value at the last log step
+    # steps replayed at a stricter matmul policy (whole run), and its value at the last log step
     precision_replays = precision_replays_logged = run_total_base["matmul_precision_replays"]
     dead_router_warned: Set[Tuple[str, int, int]] = set()    # (kind, layer, head) reported by _warn_dead_router
 
@@ -4294,11 +4278,15 @@ def train(
     # stream around resume-only reconstruction/skip so stochastic model behavior continues exactly.
     replay_cpu_rng = torch.get_rng_state().clone() if resume_data_state else None
     if offset_windows is not None:
-        drawn_offset = offset_windows.draw_window_offset(loader_generator)
         saved_offset = resume_data_state.get("window_offset") if resume_data_state else None
-        if saved_offset is not None and saved_offset != drawn_offset:
-            raise RuntimeError(f"checkpoint data_state window_offset {saved_offset} is not the replayed "
-                               f"origin {drawn_offset}")
+        if saved_offset is not None and offset_generator is None:
+            # The global RNG was restored after this epoch's draw: reinstate the saved origin.
+            offset_windows.window_offset = int(saved_offset)
+        else:
+            drawn_offset = offset_windows.draw_window_offset(offset_generator)
+            if saved_offset is not None and saved_offset != drawn_offset:
+                raise RuntimeError(f"checkpoint data_state window_offset {saved_offset} is not the replayed "
+                                   f"origin {drawn_offset}")
     try:
         it = iter(loader)
         for _ in range(saved_batches_consumed):
@@ -4341,7 +4329,7 @@ def train(
     last_val_diag: Dict[str, float] = {k: float("nan") for k in val_diag_keys}
     diag_keys: Optional[Tuple[str, ...]] = None      # model.diagnostics keys of the first SUCCESSFUL call
     # metrics.csv columns are fixed by the first row written, so a row that cannot carry the full column set
-    # (failed diagnostics before diag_keys is known, or a forced spike/abort row) waits here until the first
+    # (failed diagnostics before diag_keys is known, or a forced spike row) waits here until the first
     # complete row fixes the schema, and is then written NaN-filled to it (audit 2026-10-10 round 2, item 10).
     metrics_fields: Optional[List[str]] = (list(artifacts._fieldnames)
                                            if getattr(artifacts, "_fieldnames", None) else None)
@@ -4437,7 +4425,7 @@ def train(
                 loader_generator.get_state().clone()
                 if shuffled_loader and isinstance(loader_generator, torch.Generator) else None)
             if offset_windows is not None:
-                offset_windows.draw_window_offset(loader_generator)
+                offset_windows.draw_window_offset(offset_generator)
             it = iter(loader)
             tokens, targets = next(it)
         batches_consumed += 1
@@ -4591,28 +4579,11 @@ def train(
                     "step %d: %d CONSECUTIVE rejected updates (%d of %d total so far)",
                     step + 1, consecutive_skips, skipped_steps, step + 1)
         # Divergence monitor (audit 2026-10-10 round 2, item 1), on host values only. A spike is logged and
-        # forces a metrics row at this step. Under divergence_abort the run stops after this step's row when
-        # DIVERGENCE_ABORT_SKIPS consecutive updates were rejected, or when a log/eval row's interval-mean
-        # training CE exceeds ln V (the CE of the uniform prediction); the criterion skips the first row's
-        # interval and any interval that starts inside the LR warmup, where an initialization can sit above ln V.
+        # forces a metrics row at this step.
         spike = divergence.observe(step + 1, step_loss, step_status)
         if spike is not None:
             logger.warning("step %d: divergence spike: %s", step + 1, spike)
-        aborting = False
-        if divergence_abort and divergence_reason is None:
-            interval_ce = divergence.interval_ce_mean()
-            if consecutive_skips >= DIVERGENCE_ABORT_SKIPS:
-                divergence_reason = (f"{consecutive_skips} consecutive rejected optimizer updates "
-                                     "(non-finite loss, gradient or clip norm)")
-            elif ((do_log or do_csv) and previous_row_steps > 0
-                  and step + 1 - divergence.steps >= cfg.warmup_steps
-                  and math.isfinite(interval_ce) and interval_ce > math.log(cfg.vocab_size)):
-                divergence_reason = (f"interval-mean training CE {interval_ce:.4f} over steps "
-                                     f"{step + 2 - divergence.steps}-{step + 1} exceeds ln(vocab_size) = "
-                                     f"{math.log(cfg.vocab_size):.4f}")
-            aborting = divergence_reason is not None
-        forced_row = (not do_csv and artifacts is not None and timer is not None
-                      and (spike is not None or aborting))
+        forced_row = (not do_csv and artifacts is not None and timer is not None and spike is not None)
         if forced_row:
             # Nothing was collected before the step: the pre-step diagnostics are blank on this row.
             d = {key: float("nan") for key in (diag_keys or _TRAIN_DIAGNOSTIC_FALLBACK_KEYS)}
@@ -4968,7 +4939,7 @@ def train(
                                     if _role_norms else float("nan"))
                 row["loss_finite"] = float(math.isfinite(losses[-1]))
                 row["step_skipped"] = float(not step_status["did_step"])
-            if getattr(cfg, "matmul_precision_retry", False):
+            if precision_ladder:
                 row["matmul_precision_replays"] = float(precision_replays)
                 if precision_replays > precision_replays_logged:
                     logger.info("matmul precision: %d step(s) replayed at a stricter policy since the last log "
@@ -5069,7 +5040,7 @@ def train(
             row["wall_clock_s"]            = pipeline_timing.wall_clock_s
             phase_ms["log_row_ms"] = _synced_ms(device) - _row_t0
             row.update({column: phase_ms.get(column, float("nan")) for column in LOG_TIMING_COLUMNS})
-            row.update(divergence.columns(step_status, flagged=spike is not None or aborting))
+            row.update(divergence.columns(step_status, flagged=spike is not None))
             # The first complete row (regular, with the full diagnostics key set) fixes the metrics.csv schema;
             # earlier incomplete rows are then written NaN-filled to it, in step order, and later incomplete
             # rows are written NaN-filled at once (audit 2026-10-10 round 2, items 1 and 10).
@@ -5086,12 +5057,6 @@ def train(
             timer.reset_pipeline_window()
         if do_log or do_csv:                                 # a log/eval row ends the divergence interval
             divergence.reset_interval()
-            previous_row_steps += 1
-        if aborting:
-            completed_steps = step + 1
-            logger.warning("step %d: divergence_abort stops training: %s; the run finalizes with "
-                           "training_status 'diverged'", step + 1, divergence_reason)
-            break
     if pending_rows:
         # No complete row was ever written (every diagnostic call failed): the incomplete rows share the union
         # of their columns.
@@ -5099,15 +5064,6 @@ def train(
         for pending in pending_rows:
             artifacts.log_metrics(_conform_row(pending, union))
         pending_rows.clear()
-    # "diverged" with its reason and step when divergence_abort stopped the loop, else "completed"; set before
-    # the terminal callback so both finalizers' summary.json carry it (audit 2026-10-10 round 2, item 1).
-    training_status: Dict[str, object] = {
-        "training_status": "diverged" if divergence_reason is not None else "completed",
-        **({"divergence_reason": divergence_reason, "diverged_at_step": int(completed_steps)}
-           if divergence_reason is not None else {}),
-    }
-    if artifacts is not None:
-        artifacts.training_status = training_status
     # S1 panel D handoff (2026-09-28), before the terminal callback so its checkpoint and summary see
     # it: the cumulative frame-projection counts for any later checkpoint, and summary.json's
     # "numerics_counters" (final cumulative counts, last measured per-evaluation counts, skip reasons).
@@ -5148,7 +5104,7 @@ def train(
         } if loader_data_identity is not None else None)
         terminal_callback(
             TrainingTerminalState(
-                step=completed_steps,                # n_steps unless divergence_abort stopped the loop
+                step=completed_steps,
                 optimizer=optimizer,
                 scaler=scaler,
                 data_state=terminal_data_state,
@@ -5195,8 +5151,7 @@ def train(
     # CUMULATIVE over a resume: attempted counts every outer step from 0, and accepted_updates is the
     # optimizer's persisted accepted-update clock (restored by load_checkpoint and advanced by
     # train_step), so a continuation reports the whole run's budget, not only its own segment.
-    # The fallback-element counters below are per-process and still cover this call only. A run stopped by
-    # divergence_abort counts the steps it ran.
+    # The fallback-element counters below are per-process and still cover this call only.
     attempted = int(completed_steps)
     accepted = _successful_update_count(optimizer)
     skipped_total = attempted - accepted
@@ -5223,8 +5178,7 @@ def train(
                                      if attempted else float("nan")),
             **{key: run_totals[key] for key in RUN_TOTAL_COUNTER_KEYS if key != "matmul_precision_replays"},
             **({"matmul_precision_replays": run_totals["matmul_precision_replays"]}
-               if getattr(cfg, "matmul_precision_retry", False) else {}),
-            **training_status,
+               if precision_ladder else {}),
         }
         if skipped_total or neutralized or mu_fallbacks:
             logger.warning(

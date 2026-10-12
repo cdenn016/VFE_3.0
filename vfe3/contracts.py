@@ -332,7 +332,7 @@ class DataStateBuffer(TypedDict, total=False):
     batches_consumed:            int
     epoch:                       int
     data_identity:               Dict[str, object]
-    window_offset:               int        # train_window_offset='per_epoch_random': the epoch's origin
+    window_offset:               int        # per-epoch window origins: the epoch's origin
 
 
 class DataState(TypedDict):

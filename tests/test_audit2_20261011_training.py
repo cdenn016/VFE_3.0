@@ -6,11 +6,10 @@ marked table_fisher are never clipped (#9); a failed first log-row diagnostic no
 and the diagnostics run on the precision ladder (#10); the table rates are marked inert under the Fisher step when
 nothing else reads them and the realized table step size is logged (#20, #37); the base step runs before the table
 step, so the frame metric reads pre-step rows (#34); the table counts and the device overflow gate keep their values
-(#57); the interval statistics, spike rows and divergence_abort of the divergence monitor (#1); and the replay of a
-step skipped for non-finite gradients (#58).
+(#57); the interval statistics and spike rows of the divergence monitor (#1); and the replay of a step skipped
+for non-finite gradients (#58).
 """
 import csv
-import json
 import logging
 import math
 from pathlib import Path
@@ -191,7 +190,6 @@ def test_clip_scope_config_is_validated_and_inert_without_a_clip() -> None:
         _cfg(grad_clip_scope="layer")
     assert "grad_clip_scope" in _cfg(grad_clip=0.0).inactive_fields()
     assert "grad_clip_scope" not in _cfg().inactive_fields()
-    assert "divergence_abort" not in _cfg(grad_clip=None).inactive_fields()
 
 
 # ------------------------------------------------------------------------- #20, #37: table rates and diagnostics
@@ -377,7 +375,7 @@ def test_failed_first_row_diagnostic_keeps_the_full_column_set(tmp_path: Path,
 
 
 def test_diagnostics_replay_at_a_stricter_matmul_policy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    cfg = _cfg(matmul_precision_retry=True, fp32_matmul_precision="high")
+    cfg = _cfg(fp32_matmul_precision="high")
     model = _model(cfg)
     policies: List[str] = []
     original = model.diagnostics
@@ -402,7 +400,7 @@ def test_diagnostics_replay_at_a_stricter_matmul_policy(tmp_path: Path, monkeypa
     assert all(math.isfinite(_num(row["attn_entropy"])) for row in rows)
 
 
-# ------------------------------------------------------------------------- #1: interval statistics, spikes, abort
+# ------------------------------------------------------------------------- #1: interval statistics and spikes
 
 def test_rows_carry_interval_statistics_of_the_steps_since_the_previous_row(tmp_path: Path) -> None:
     cfg = _cfg(grad_clip=1e-3)
@@ -468,87 +466,22 @@ def _nan_after(model: VFEModel, monkeypatch: pytest.MonkeyPatch, healthy_steps: 
     monkeypatch.setattr(model, "forward", forward)
 
 
-def test_divergence_abort_stops_and_finalizes_with_the_diverged_status(tmp_path: Path,
-                                                                       monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(T, "DIVERGENCE_ABORT_SKIPS", 3)
-    cfg = _cfg(divergence_abort=True, max_steps=20)
-    model = _model(cfg)
-    _nan_after(model, monkeypatch, healthy_steps=2)
-    loaders = _loaders(cfg)
-    run_dir = tmp_path / "run"
-    artifacts = ra.RunArtifacts(run_dir, cfg, model, save_model_artifacts=False)
-    losses = _train(model, cfg, loaders, artifacts=artifacts, log_interval=10, n_steps=20)
-    assert len(losses) == 5 and not any(math.isfinite(x) for x in losses[2:])
-    realized = artifacts.realized_updates
-    assert realized["training_status"] == "diverged" and realized["diverged_at_step"] == 5
-    assert "3 consecutive rejected optimizer updates" in realized["divergence_reason"]
-    assert realized["attempted_steps"] == 5 and realized["accepted_updates"] == 2
-    assert artifacts.final_step == 5
-    rows = _rows(run_dir / "metrics.csv")
-    assert [int(row["step"]) for row in rows] == [5] and float(rows[0]["divergence_spike"]) == 1.0
-    monkeypatch.undo()                                               # finalize on the healthy forward
-    ra.finalize_run(model, artifacts, cfg, final_validation=T.evaluate(model, loaders[1], device=CPU),
-                    train_loader=loaders[0], val_loader=loaders[1], test_loader=loaders[1], losses=losses,
-                    device=CPU, wall_time=1.0, logger=logging.getLogger("audit2-1011"))
-    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
-    assert summary["training_status"] == "diverged" and summary["diverged_at_step"] == 5
-    assert "consecutive" in summary["divergence_reason"] and summary["evaluated_step"] == 5
-
-
-def test_the_terminal_callback_sees_the_completed_step_and_the_status(tmp_path: Path,
-                                                                      monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(T, "DIVERGENCE_ABORT_SKIPS", 2)
-    cfg = _cfg(divergence_abort=True, max_steps=10)
-    model = _model(cfg)
-    _nan_after(model, monkeypatch, healthy_steps=1)
-    artifacts = ra.RunArtifacts(tmp_path / "run", cfg, model, save_model_artifacts=False)
-    seen: Dict[str, Any] = {}
-
-    def callback(state: T.TrainingTerminalState, losses: List[float]) -> None:
-        seen.update(step=state.step, n=len(losses), status=dict(artifacts.training_status))
-
-    loaders = _loaders(cfg)
-    torch.manual_seed(11)
-    T.train(model, loaders[0], cfg, n_steps=10, grad_clip=1.0, device=CPU, artifacts=artifacts,
-            terminal_callback=callback, generate_samples=False)
-    assert seen["step"] == seen["n"] == 3
-    assert seen["status"]["training_status"] == "diverged" and seen["status"]["diverged_at_step"] == 3
-
-
-def test_without_divergence_abort_the_run_continues_and_completes(tmp_path: Path,
-                                                                  monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(T, "DIVERGENCE_ABORT_SKIPS", 3)
+def test_rejected_updates_never_stop_the_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _cfg(max_steps=8)
     model = _model(cfg)
     _nan_after(model, monkeypatch, healthy_steps=2)
     artifacts = ra.RunArtifacts(tmp_path / "run", cfg, model, save_model_artifacts=False)
     losses = _train(model, cfg, _loaders(cfg), artifacts=artifacts, n_steps=8)
-    assert len(losses) == 8 and artifacts.realized_updates["training_status"] == "completed"
-    assert "divergence_reason" not in artifacts.realized_updates
-
-
-def test_interval_ce_above_ln_vocab_aborts_after_the_first_row(monkeypatch: pytest.MonkeyPatch) -> None:
-    real_step = T.train_step
-    calls = {"n": 0}
-
-    def high_ce(*args: Any, **kwargs: Any) -> float:
-        loss = real_step(*args, **kwargs)
-        calls["n"] += 1
-        if calls["n"] >= 3:
-            kwargs["status_out"]["ce"] = 2.0 * math.log(V)
-        return loss
-
-    monkeypatch.setattr(T, "train_step", high_ce)
-    cfg = _cfg(divergence_abort=True, max_steps=12)
-    model = _model(cfg)
-    losses = _train(model, cfg, _loaders(cfg), log_interval=2, n_steps=12)
-    assert len(losses) == 4                    # rows at 2 (first interval, exempt) and 4 (CE 2 ln V) -> stop
+    assert len(losses) == 8 and artifacts.final_step == 8
+    realized = artifacts.realized_updates
+    assert realized["attempted_steps"] == 8 and realized["accepted_updates"] == 2
+    assert "training_status" not in realized
 
 
 # ------------------------------------------------------------------------- #58: replay of a non-finite skip
 
 def test_nonfinite_skip_under_a_reduced_policy_is_replayed_stricter(monkeypatch: pytest.MonkeyPatch) -> None:
-    cfg = _cfg(matmul_precision_retry=True, fp32_matmul_precision="high")
+    cfg = _cfg(fp32_matmul_precision="high")
     model = _model(cfg)
     reference = _model(cfg)
     real_forward = model.forward
@@ -587,7 +520,7 @@ def test_nonfinite_skip_under_a_reduced_policy_is_replayed_stricter(monkeypatch:
 
 
 def test_a_skip_that_persists_at_highest_is_returned_as_a_skip(monkeypatch: pytest.MonkeyPatch) -> None:
-    cfg = _cfg(matmul_precision_retry=True, fp32_matmul_precision="high")
+    cfg = _cfg(fp32_matmul_precision="high")
     model = _model(cfg)
     _nan_after(model, monkeypatch, healthy_steps=0)
     tokens, targets = _batch(cfg)

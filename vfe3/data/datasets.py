@@ -704,10 +704,6 @@ def tokens_per_char(
     return tpc
 
 
-# Training-window origin modes (VFE3Config / BaselineConfig ``train_window_offset``).
-WINDOW_OFFSET_MODES: Tuple[str, ...] = ("fixed", "per_epoch_random")
-
-
 class TokenWindows(Dataset):
     r"""Causal-LM windows over a 1-D token stream: item ``i`` -> (input_L, target_L).
 
@@ -735,11 +731,11 @@ class TokenWindows(Dataset):
     formula below reduces to the disjoint case exactly (the mask covers zero positions and
     ``n == ceil(transitions / seq_len)``), so the default path is byte-identical.
 
-    TRAINING-WINDOW ORIGIN. ``window_offset_mode='fixed'`` (the default) starts window ``i`` at
-    ``i * stride`` in every epoch. ``'per_epoch_random'`` (:meth:`set_window_offset_mode`, training
-    only) starts window ``i`` at :math:`o + i s` with an origin :math:`o \in [0, s)` that
-    :meth:`draw_window_offset` draws once per epoch from the train loader's generator
-    (:func:`vfe3.train.train`). With :math:`T` tokens, window length :math:`L` and stride :math:`s`,
+    TRAINING-WINDOW ORIGIN. ``window_offset_mode='fixed'`` (a new dataset, and every evaluation stream)
+    starts window ``i`` at ``i * stride``. ``'per_epoch_random'`` (:meth:`use_per_epoch_offsets`, which
+    :func:`vfe3.train.train` applies to every training window dataset) starts window ``i`` at
+    :math:`o + i s` with an origin :math:`o \in [0, s)` that :meth:`draw_window_offset` draws once per
+    epoch. With :math:`T` tokens, window length :math:`L` and stride :math:`s`,
     the window count is the one that fits every origin,
 
     .. math::
@@ -748,7 +744,7 @@ class TokenWindows(Dataset):
     so the epoch length does not depend on the draw. At :math:`s = L` an epoch scores the transitions
     :math:`[o, o + nL)` exactly once; the :math:`o` transitions before the origin and the
     :math:`T - 1 - o - nL < 2L` after the last window (the tail) are not scored in that epoch, and a
-    different draw moves them. Under ``'fixed'`` nothing is drawn and every window is as before.
+    different draw moves them. Under ``'fixed'`` nothing is drawn.
     """
 
     def __init__(
@@ -798,27 +794,22 @@ class TokenWindows(Dataset):
         self.n = usable // self.stride + 1
         self._fixed_n = self.n
 
-    def set_window_offset_mode(self, mode: str) -> None:
-        r"""Select the training-window origin mode (see the class docstring); the origin resets to 0.
+    def use_per_epoch_offsets(self) -> None:
+        r"""Switch to per-epoch random origins (see the class docstring); the origin resets to 0.
 
-        ``'fixed'`` restores the fixed-origin windows and their count. ``'per_epoch_random'`` is a
-        training mode: an evaluation stream (``pad_final``) keeps its fixed origin.
+        A training mode: an evaluation stream (``pad_final``) keeps its fixed origin.
         """
-        if mode not in WINDOW_OFFSET_MODES:
-            raise ValueError(f"window offset mode must be one of {WINDOW_OFFSET_MODES}, got {mode!r}")
-        if mode == "fixed":
-            self.window_offset_mode, self.window_offset, self.n = "fixed", 0, self._fixed_n
-            return
         if self.pad_final:
             raise ValueError("evaluation windows (pad_final=True) keep a fixed origin")
         usable = self.tokens.numel() - self.seq_len - 1 - (self.stride - 1)
         if usable < 0:
             raise ValueError(f"stream of {self.tokens.numel()} too short for per-epoch origins of "
                              f"seq_len={self.seq_len}, stride={self.stride}")
-        self.window_offset_mode, self.window_offset, self.n = mode, 0, usable // self.stride + 1
+        self.window_offset_mode, self.window_offset, self.n = "per_epoch_random", 0, usable // self.stride + 1
 
-    def draw_window_offset(self, generator: torch.Generator) -> int:
-        r"""Draw this epoch's origin :math:`o \sim \mathcal{U}\{0, \dots, s - 1\}` from ``generator`` and set it."""
+    def draw_window_offset(self, generator: Optional[torch.Generator]) -> int:
+        r"""Draw this epoch's origin :math:`o \sim \mathcal{U}\{0, \dots, s - 1\}` from ``generator`` (None: the
+        global CPU RNG) and set it."""
         if self.window_offset_mode == "fixed":
             raise RuntimeError("fixed-origin windows draw no offset")
         self.window_offset = int(torch.randint(self.stride, (1,), generator=generator).item())
