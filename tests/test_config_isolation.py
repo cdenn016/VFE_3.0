@@ -5,11 +5,11 @@ from collections.abc import Callable
 
 import pytest
 
-from tests.profiles import test_config, tiny_config
+from tests.profiles import live_config, test_config, tiny_config
 from vfe3.config import VFE3Config
 
 
-@pytest.mark.parametrize("factory", [test_config, tiny_config])
+@pytest.mark.parametrize("factory", [test_config, tiny_config, live_config])
 @pytest.mark.parametrize("changes", [
     dict(family="gaussian_full", decode_mode="full_chunked", gauge_transport="off",
          predictive_covariance="passthrough", sigma_init=0.4, pos_phi="frozen"),
