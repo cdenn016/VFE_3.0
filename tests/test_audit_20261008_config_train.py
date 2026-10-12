@@ -304,7 +304,7 @@ def _train(cfg: VFE3Config, artifacts: Any = None) -> Tuple[VFEModel, List[float
 
 def test_replay_ladder_inside_train_records_counts_and_reasons(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _high_precision: Any) -> None:
-    cfg = _cfg(matmul_precision_retry=True, fp32_matmul_precision="high")
+    cfg = _cfg(fp32_matmul_precision="high")
     _, reference, _ = _train(cfg)
 
     real_step = T.train_step

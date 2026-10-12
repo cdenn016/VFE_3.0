@@ -460,7 +460,6 @@ ARMS: Dict[str, Dict[str, Any]] = {
 # name); only fields present on both are compared.
 BASELINE_PROTOCOL_FIELDS: Dict[str, str] = {
     "vocab_size": "vocab_size", "max_seq_len": "max_seq_len", "eval_stride": "eval_stride",
-    "train_window_offset": "train_window_offset",
     "batch_size": "batch_size", "max_steps": "max_steps", "eval_interval": "eval_interval",
     "checkpoint_interval": "checkpoint_interval", "grad_accum_steps": "grad_accum_steps",
     "embed_dim": "embed_dim", "n_heads": "n_heads", "n_layers": "n_layers",

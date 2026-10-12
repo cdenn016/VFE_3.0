@@ -1337,7 +1337,7 @@ def test_shuffled_resume_matches_uninterrupted_run(tmp_path):
     assert ckpt.exists()
     saved_data_state = torch.load(ckpt, weights_only=True)["data_state"]
     assert set(saved_data_state) == {
-        "epoch_start_generator_state", "batches_consumed", "epoch", "data_identity",
+        "epoch_start_generator_state", "batches_consumed", "epoch", "data_identity", "window_offset",
     }
     assert saved_data_state["data_identity"] == _loader_data_identity(loader_b, cfg.vocab_size)
     assert torch.equal(saved_data_state["epoch_start_generator_state"], epoch_start_generator_state)

@@ -111,7 +111,7 @@ MAX_PASSES: float = 16.0
 MATCHED_FIELDS: Tuple[str, ...] = (
     "vocab_size", "embed_dim", "n_heads", "n_layers", "max_seq_len", "batch_size", "eval_stride",
     "max_steps", "warmup_steps", "min_lr_frac", "grad_clip", "grad_clip_scope", "grad_accum_steps",
-    "train_window_offset", "amp_dtype", "fp32_matmul_precision", "seed", "deterministic", "fill_uninitialized_memory",
+    "amp_dtype", "fp32_matmul_precision", "seed", "deterministic",
     "log_interval", "eval_interval",
     "checkpoint_interval", "val_diagnostic_batches", "beta_attention_prior", "alibi_slope",
     "decode_unigram_prior", "unigram_kappa", "decode_chunk_size", "decode_ce_checkpoint",
@@ -129,11 +129,14 @@ _FLOAT_FIELDS: Tuple[str, ...] = (
 )
 _OPTIONAL_FLOAT_FIELDS: Tuple[str, ...] = ("grad_clip", "per_type_table_lr", "per_type_table_weight_decay")
 _BOOL_FIELDS: Tuple[str, ...] = (
-    "deterministic", "fill_uninitialized_memory", "trust_resume_checkpoint", "generate_embedding_figures",
+    "deterministic", "trust_resume_checkpoint", "generate_embedding_figures",
     "decode_bias",
     "decode_unigram_prior", "attention_residual",
 )
 _WRAPPER_PREFIXES: Tuple[str, ...] = ("_orig_mod.", "module.")
+# Removed 2026-10-12 (second pass) with their VFE3Config counterparts: training windows always take a per-epoch
+# random origin and uninitialized memory is never NaN-filled. A saved value is dropped on load.
+_REMOVED_FIELDS: Tuple[str, ...] = ("train_window_offset", "fill_uninitialized_memory")
 
 
 def _derived_seed(seed: int, *stream: object) -> int:
@@ -168,7 +171,6 @@ class BaselineConfig:
     # Data protocol.
     batch_size:            int           = 64
     eval_stride:           Optional[int] = None        # validation/test sliding-window stride
-    train_window_offset:   str           = "fixed"     # "fixed" | "per_epoch_random" (VFE3Config's)
     # Optimization (AdamW; warmup then half-cosine, floored as in vfe3.train._floor_lr_lambdas).
     max_steps:             int           = 15000
     warmup_steps:          int           = 100
@@ -194,7 +196,6 @@ class BaselineConfig:
     fp32_matmul_precision: Optional[str] = "highest"
     seed:                  int           = 6
     deterministic:         bool          = True
-    fill_uninitialized_memory: bool      = True        # read only under deterministic algorithms; matched
     # Cadence and resume.
     log_interval:          int           = 100
     eval_interval:         int           = 1500
@@ -267,10 +268,6 @@ class BaselineConfig:
         if self.eval_stride is not None and (type(self.eval_stride) is not int
                                              or not 1 <= self.eval_stride <= self.max_seq_len):
             raise ValueError(f"eval_stride must be None or an int in [1, max_seq_len], got {self.eval_stride!r}")
-        from vfe3.data.datasets import WINDOW_OFFSET_MODES
-        if self.train_window_offset not in WINDOW_OFFSET_MODES:
-            raise ValueError(f"train_window_offset must be one of {WINDOW_OFFSET_MODES}, "
-                             f"got {self.train_window_offset!r}")
         if self.batch_size % self.grad_accum_steps:
             raise ValueError(f"grad_accum_steps={self.grad_accum_steps} must divide batch_size={self.batch_size}")
         if self.lr <= 0.0:
@@ -375,12 +372,13 @@ class BaselineConfig:
         family = payload.get("model_family")
         if family != MODEL_FAMILY:
             raise ValueError(f"{source}: model_family must be {MODEL_FAMILY!r}, got {family!r}")
+        payload = {key: value for key, value in payload.items() if key not in _REMOVED_FIELDS}
         known = {f.name for f in fields(cls)}
         unknown = sorted(str(key) for key in payload if key not in known)
         if unknown:
             raise ValueError(f"{source}: undeclared baseline config field(s) {unknown}")
         try:
-            return cls(**dict(payload))
+            return cls(**payload)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"{source}: {exc}") from exc
 
@@ -423,8 +421,7 @@ class BaselineConfig:
 
         Copied from the base: tokenizer size, width :math:`K`, heads :math:`H` (head width
         :math:`d = K/H`, the VFE block size), depth :math:`L`, context, batch, evaluation stride, step
-        budget, warmup and learning-rate floors, gradient clip, its scope and accumulation, the training-window
-        origin (``train_window_offset``), precision, seed,
+        budget, warmup and learning-rate floors, gradient clip, its scope and accumulation, precision, seed,
         cadence, the attention log-prior and its slope, and the unigram decode prior
         (:data:`MATCHED_FIELDS`). A base with a ``rope_mode`` other than ``'none'`` gives the arm rotary query/key
         positions at the base's ``rope_base``; for a comparison ``rope_mode`` this is the rotation the base
@@ -828,10 +825,10 @@ class BaselineTransformer(nn.Module):
         super().__init__()
         if not isinstance(cfg, BaselineConfig):
             raise TypeError(f"BaselineTransformer needs a BaselineConfig, got {type(cfg).__name__}")
-        from vfe3.runtime import set_fill_uninitialized_memory, set_fp32_matmul_precision
+        from vfe3.runtime import disable_fill_uninitialized_memory, set_fp32_matmul_precision
 
         set_fp32_matmul_precision(cfg.fp32_matmul_precision)
-        set_fill_uninitialized_memory(cfg.fill_uninitialized_memory)
+        disable_fill_uninitialized_memory()
         self.cfg = cfg
         V, K, H, d = cfg.vocab_size, cfg.embed_dim, cfg.n_heads, cfg.d_head
         self.tok_embed = nn.Parameter(torch.empty(V, K))                                   # (V, K) E

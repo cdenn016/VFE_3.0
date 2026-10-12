@@ -79,7 +79,7 @@ from vfe3.relational_scoring import (
     set_projected_gram_condition_tol,
     set_projected_recovery_precision,
 )
-from vfe3.runtime import set_fill_uninitialized_memory, set_fp32_matmul_precision
+from vfe3.runtime import disable_fill_uninitialized_memory, set_fp32_matmul_precision
 from vfe3.model.minimal_agent import MINIMAL_AGENT_ELBO_KEYS
 from vfe3.model.relational_operators import RelationalOperators, shared_content_charts
 
@@ -298,7 +298,7 @@ class VFEModel(nn.Module):
         # card untouched, so this line changes nothing unless a config asks for it.
         set_fp32_matmul_precision(cfg.fp32_matmul_precision)
         # Process-global like the matmul policy; torch reads it only under deterministic algorithms.
-        set_fill_uninitialized_memory(cfg.fill_uninitialized_memory)
+        disable_fill_uninitialized_memory()
         self._transport_status: Dict[str, bool] = {}
         self.group = build_group(cfg)
         if self.group.basis_fingerprint is not None:

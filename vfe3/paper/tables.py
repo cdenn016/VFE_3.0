@@ -962,9 +962,11 @@ def _numerics_items(run: RunRecord) -> List[Item]:
     if realized_kernel is not None:
         # The configured kernel is a request: 'triton' runs the torch kernel on CPU tensors (vfe3.model.prior_bank).
         items.append(("expected-likelihood CE kernel that ran", Code(str(realized_kernel))))
-    if run.raw("matmul_precision_retry") is True:
+    if run.raw("matmul_precision_retry") is True or "matmul_precision_replays" in run.summary:
         # A step that raises under a reduced fp32 matmul policy is replayed one rung stricter, ending at
-        # "highest" (vfe3.train); the count is the run's realized_updates record in summary.json.
+        # "highest" (vfe3.train); the count is the run's realized_updates record in summary.json. Runs
+        # before 2026-10-12 recorded the opt-in matmul_precision_retry; later runs record the count whenever
+        # the ladder was active.
         replays = run.summary.get("matmul_precision_replays")
         items.append(("steps replayed at a stricter matmul precision (up to highest)",
                       f"{replays:,}" if isinstance(replays, int) else NOT_RECORDED))
