@@ -134,15 +134,15 @@ config = dict(
     decode_covariance                = "belief",                  # "belief" (stack's final Sigma_q) | "encoded" (token's encoded covariance) | "constant" (sigma_init I); prior-bank decode only
         
     attention_mode                   = "projected_predictive",  # "projected_predictive" | "projected_gradient"
-    predictive_covariance            = 'moment_matched',  # "passthrough"| "moment_matched" (exact predictive-kernel covariance)
+    predictive_covariance            = 'moment_matched',        # "passthrough" | "moment_matched" (kernel: exact moment-matched; minimal_agent: CAVI posterior) | "spread_corrected" (minimal_agent mean_field: plus the label spread)
     content_link_chart               = "exponential",        # "affine" Oh'=Oh | "first_order" Oh'=T^-1+Oh | "exponential" Oh'=T^-1+Oh phi_1(TOh)=e^{OhT}T^-1 
         
     tie_comparison_maps              = False,           # S_K := S_Q (kernel readout): D_ii = 0, flat-alignment routing
         
-    relational_routing               = "gaussian_kl",           # "gaussian_kl" | "noisy_query" (noisy_query: projected_predictive only)
+    relational_routing               = "gaussian_kl",           # "gaussian_kl" | "noisy_query" | "noisy_key" | "mean_distance" (noisy_key: kernel readout, temperature 1)
     relational_receiver_law          = "channel_likelihood",  # "channel_likelihood" | "ambient_alignment" (projected_gradient only)
     relational_receiver_measurement  = "adjoint",               # "adjoint" O'^T | "inverse" O'^-1, the dual measurement (channel_likelihood only)
-    relational_receiver_update       = "closed_form",         # "closed_form" (exact frozen-context update) | "euler" (Fisher step; reads e_q_mu_lr / e_q_sigma_lr / trusts) (projected_gradient only)
+    relational_receiver_update       = "closed_form",           # "closed_form" (exact frozen-context update) | "closed_form_profiled" (state-dependent alpha: the profiled stationary point) | "euler" (Fisher step; reads e_q_mu_lr / e_q_sigma_lr / trusts) (projected_gradient only)
     relational_output_init           = "identity",      # "identity" | "depth_scaled" (initial "Oh" times 1/sqrt(2 n_layers))   
        
     predictive_readout               = "minimal_agent",     # "kernel" | "minimal_agent" (projected_predictive only)
