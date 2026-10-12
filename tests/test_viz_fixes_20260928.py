@@ -178,7 +178,7 @@ def test_report_gates_route_trivial_figures_and_emits_history_figures(tmp_path, 
     for name in ("e_step_belief_trace", "across_layer_belief_trace"):
         monkeypatch.setattr(extract, name, lambda *a, _n=name, **k: called.append(_n))
     tokens, targets = torch.tensor([[0, 1, 2, 3]]), torch.tensor([[1, 2, 3, 4]])
-    with caplog.at_level(logging.INFO):
+    with caplog.at_level(logging.DEBUG):                  # route-trivial skips log at debug
         written = report.generate_figures(run_dir, model=_projected_model(),
                                           loader=[(tokens, targets)], device=torch.device("cpu"),
                                           max_sequences=1)

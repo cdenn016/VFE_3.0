@@ -5363,8 +5363,8 @@ def _save_figures(
         except Exception as exc:                               # no gates beats no figures
             logger.warning("route figure gates unavailable (%s); emitting every figure", exc)
             route_skips = {}
-        for name, reason in route_skips.items():
-            logger.info("figure %s skipped (%s)", name, reason)
+        for name, reason in route_skips.items():            # route-trivial: fixed by the config, not news
+            logger.debug("figure %s skipped (%s)", name, reason)
 
         def _aligned(key: str) -> tuple:
             r"""Aligned (step, value) for a history column, dropping pre-first-eval NaN rows."""

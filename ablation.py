@@ -590,6 +590,7 @@ SWEEP_ORDER: List[str] = [
    
   
    
+  # "rope_fraction",
   # "block_mlp_cavi_steps",
   # "block_mlp_em_weight",
   # "block_mlp_template_init_variance",
@@ -832,6 +833,15 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "scale": "log",
         "requires": {"rope_mode": "frame"},
     },    
+
+    "rope_fraction": {
+        "description": "p-RoPE fraction of each head's planes rotated (fastest first); under comparison_invariant "
+                       "the unrotated coordinates keep their full comparison covariance",
+        "param": "rope_fraction",
+        "values": [0.2, 0.4, 0.6, 0.8, 1.0],
+        "requires": {"rope_mode": "comparison_invariant", "predictive_readout": "kernel"},
+    },
+
     
     
     
