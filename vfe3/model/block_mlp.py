@@ -15,6 +15,7 @@ from vfe3.model.prototype_agents import (
     MeanFieldPrototypePosterior,
     covariance_diagonal,
     covariance_layout,
+    prototype_elbo,
     prototype_exact_em_objective,
     prototype_exact_posterior,
     prototype_mean_field_posterior,
@@ -1543,6 +1544,35 @@ class PrototypeAgentBlockMLP(nn.Module):
         one further coordinate-ascent sweep would make, near 0 at the fixed point (the prototype analogue of
         ``relational_minimal_agent_label_staleness``), computed in float64. Exact inference: NaN."""
         return self._template_statistics(mu, sigma, staleness=True)
+
+    @torch.no_grad()
+    def elbo_and_evidence(
+        self,
+        mu:    torch.Tensor,                          # (..., K) working means this block receives
+        sigma: torch.Tensor,                          # (..., K), (..., K, K) or (..., G, d, d)
+    ) -> Tuple[torch.Tensor, torch.Tensor]:           # (...) ELBO, (...) log evidence, float64 nats
+        r"""Evidence lower bound of the posterior this block's ``inference`` forms and the exact log evidence of the
+        record model (``diagnose_agent_elbo``, audit 2026-10-12 T1).
+
+        :func:`vfe3.model.prototype_agents.prototype_elbo` at :math:`q = N(\xi^+, C^+)\,q(a)` (mean field: the last
+        sweep's responsibilities and power posterior; exact: the template posterior :math:`w` and the moment-matched
+        :math:`C^+` in the input layout) and ``log_evidence`` :math:`\log\sum_a\hat\pi_aN(\nu_a;\xi_i, C_i + \Lambda_a)` of
+        :func:`vfe3.model.prototype_agents.prototype_exact_posterior`. The posterior is recomputed in float64 from the
+        detached inputs (dropout is not applied: it acts on the mean increment after the posterior); the mean field
+        runs the exact path once more for the evidence, at :math:`O(MK)` per token on the diagonal layout and one
+        :math:`b\times b` factor per (token, template, block) otherwise. A diagnostic: never part of the loss.
+        """
+        mu64, sigma64 = mu.detach().double(), sigma.detach().double()
+        posterior = self.posterior(mu64, sigma64, need_covariance=True)
+        if self.inference == "exact":
+            labels, evidence = posterior.weights, posterior.log_evidence
+        else:
+            labels = posterior.responsibilities
+            evidence = prototype_exact_posterior(mu64, sigma64, self.nu, self.log_lambda, self.log_pi,
+                                                 need_covariance=False, tile_bytes=self.tile_bytes).log_evidence
+        elbo = prototype_elbo(mu64, sigma64, posterior.xi_plus, posterior.C_plus, labels, self.nu, self.log_lambda,
+                              self.log_pi)
+        return elbo, evidence
 
     def _template_statistics(
         self,

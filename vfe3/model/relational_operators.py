@@ -359,6 +359,11 @@ class RelationalOperators(nn.Module):
     ``routing`` are unused, and every O-reading method raises. ``minimal_agent_inference`` selects the exact
     ADF posterior or the mean-field step, and ``minimal_agent_cavi_steps`` the mean field's number of
     coordinate-ascent sweeps (:func:`vfe3.model.minimal_agent.minimal_agent_readout`).
+    ``predictive_covariance='spread_corrected'`` (minimal agent, mean field only) adds the linearized label spread
+    :math:`\sum_hP_iS_h^\top R'^h_iS_hP_i` to the mean-field covariance (audit 2026-10-12 T2); the kernel readout and
+    the exact minimal agent refuse it. ``elbo_diagnostic`` (minimal agent; a plain attribute, not state) adds the
+    per-layer evidence lower bound, the ADF evidence and their gap to a diagnostic capture
+    (:data:`vfe3.model.minimal_agent.MINIMAL_AGENT_ELBO_KEYS`); it never enters the loss.
     ``tie_comparison_maps`` (kernel predictive readout) stores no ``raw_score_k``: the key map is the query map,
     :math:`S_K := S_Q`. ``learn_attention_temperature`` adds ``routing_log_temperature`` ``(H,)``, the offset of
     the log routing temperature (:meth:`routing_temperature`); with it off no such parameter exists.
@@ -406,6 +411,7 @@ class RelationalOperators(nn.Module):
         tie_comparison_maps:   bool  = False,
         block_covariance:      bool  = False,
         pair_kl_gemm_tol:      Optional[float] = None,
+        elbo_diagnostic:       bool  = False,
     ) -> None:
         super().__init__()
         self.kl_max_reference = kl_max_reference      # "absolute" | "row_min" kernel-router clamp reference
@@ -458,10 +464,16 @@ class RelationalOperators(nn.Module):
         if routing != "gaussian_kl" and readout_mode != "predictive_content":
             raise ValueError(f"{routing} routing requires predictive_content")
         self.routing = routing
-        if predictive_covariance not in ("passthrough", "moment_matched"):
-            raise ValueError("predictive_covariance must be 'passthrough' or 'moment_matched'")
-        if predictive_covariance == "moment_matched" and readout_mode != "predictive_content":
-            raise ValueError("moment_matched predictive covariance requires predictive_content")
+        if predictive_covariance not in minimal_agent.PREDICTIVE_COVARIANCES:
+            raise ValueError(f"predictive_covariance must be one of {minimal_agent.PREDICTIVE_COVARIANCES}")
+        if predictive_covariance in minimal_agent.READOUT_COVARIANCES and readout_mode != "predictive_content":
+            raise ValueError(f"{predictive_covariance} predictive covariance requires predictive_content")
+        if predictive_covariance == "spread_corrected" and (predictive_readout != "minimal_agent"
+                                                            or minimal_agent_inference != "mean_field"):
+            raise ValueError("predictive_covariance='spread_corrected' corrects the minimal agent's mean-field "
+                             "covariance for the label spread; it requires predictive_readout='minimal_agent' with "
+                             "minimal_agent_inference='mean_field' (the kernel readout and the exact posterior "
+                             "already carry the between-source spread)")
         if (isinstance(predictive_covariance_floor, bool)
                 or not isinstance(predictive_covariance_floor, (int, float))
                 or not math.isfinite(predictive_covariance_floor) or predictive_covariance_floor <= 0.0):
@@ -539,6 +551,9 @@ class RelationalOperators(nn.Module):
         self.minimal_agent_inference = minimal_agent_inference
         self.minimal_agent_channel_noise = float(minimal_agent_channel_noise)
         self.minimal_agent_cavi_steps = minimal_agent_cavi_steps   # mean-field CAVI sweeps (plain attribute, not state)
+        if not isinstance(elbo_diagnostic, bool):
+            raise ValueError(f"elbo_diagnostic must be bool, got {elbo_diagnostic!r}")
+        self.elbo_diagnostic = elbo_diagnostic                       # T1 diagnostic capture (plain attribute, not state)
         if not isinstance(block_covariance, bool):
             raise ValueError(f"block_covariance must be bool, got {block_covariance!r}")
         if block_covariance:
@@ -868,7 +883,11 @@ class RelationalOperators(nn.Module):
         coupling, mean-field label staleness and exact spread share (means over receivers; each NaN in the other
         mode) and
         :math:`n_h`, and the layer's covariance contraction :math:`\operatorname{tr}C^+/\operatorname{tr}C` (repeated
-        per head).
+        per head). Under ``elbo_diagnostic`` the capture also receives the receiver means of the evidence lower bound,
+        the ADF evidence and their gap (:data:`vfe3.model.minimal_agent.MINIMAL_AGENT_ELBO_KEYS`, float64 scalars,
+        computed without autograd). Under ``predictive_covariance='spread_corrected'`` the returned covariance also
+        carries :math:`\sum_hZ'^h_iR'^h_iZ'^{h\top}_i`, :math:`Z'^h_i = U_iP_iS_h^\top`
+        (:func:`vfe3.model.minimal_agent.local_posterior_covariance`), with the same floor.
 
         One host check covers the call. A float32 call that reports a failed factorization (an ADF query covariance
         :math:`A^h` that lost positive definiteness by cancellation, a record covariance, ...) or, under
@@ -949,15 +968,22 @@ class RelationalOperators(nn.Module):
             if self.comparison_rope_base is not None:
                 # rope_space='comparison': the record of a source at offset j - i arrives through R_{j-i}.
                 rope = self.comparison_rope_rotation(xi.shape[-2], S.shape[1], xi.device, dtype)  # (N, d, d)
+            # The constructor refuses spread_corrected with exact inference; a probe that switches the inference to
+            # "exact" on a spread-corrected layer (vfe3.posthoc.feature_probes.minimal_agent_gap) gets the exact
+            # posterior's covariance, which already carries the spread.
+            spread_corrected = (return_covariance and self.predictive_covariance == "spread_corrected"
+                                and self.minimal_agent_inference == "mean_field")
             result = minimal_agent.minimal_agent_readout(
                 xi, C, S, T, log_noise, log_prior, self.minimal_agent_inference, diagnostics=diagnostics,
-                check=False, rope=rope, cavi_steps=self.minimal_agent_cavi_steps)
+                check=False, rope=rope, cavi_steps=self.minimal_agent_cavi_steps,
+                spread_corrected=spread_corrected, elbo=diagnostics and self.elbo_diagnostic)
             forward = frame.forward.to(dtype)
             mu_plus = frame_matvec(forward, result.xi, frame.block_diagonal)              # (..., N, K) U_i xi_i^+
             sigma_plus = None
             if return_covariance:
                 sigma_plus = minimal_agent.local_posterior_covariance(
-                    sigma.to(dtype), forward, frame.block_diagonal, result.gains, result.M, floor.to(dtype))
+                    sigma.to(dtype), forward, frame.block_diagonal, result.gains, result.M, floor.to(dtype),
+                    result.spread_gains, result.label_spread)
         record: dict = {}
         if diagnostics:
             with torch.no_grad():
@@ -974,6 +1000,10 @@ class RelationalOperators(nn.Module):
                         result.covariance_contraction.mean().expand(H),
                     "relational_minimal_agent_spread_share": result.spread_share.reshape(-1, H).nanmean(0),
                 }
+                if result.elbo is not None:                                              # elbo_diagnostic: nats
+                    record.update(zip(minimal_agent.MINIMAL_AGENT_ELBO_KEYS, (
+                        result.elbo.nanmean(), result.evidence.nanmean(),
+                        (result.evidence - result.elbo).nanmean())))                    # () float64 each
         status = torch.stack((result.failed, result.ill_conditioned))                         # (2,) bool
         return (mu_plus.to(mu.dtype), None if sigma_plus is None else sigma_plus.to(sigma.dtype), record, status)
 

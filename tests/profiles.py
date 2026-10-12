@@ -191,6 +191,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'phi_frame_condition_max': None,
     'val_diagnostic_batches': 1,
     'diagnose_canonical_free_energy': False,
+    'diagnose_agent_elbo': False,
     'grad_accum_steps': 1,
     'min_lr_frac': 0.01,
     'generate_embedding_figures': False,

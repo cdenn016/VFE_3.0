@@ -60,6 +60,7 @@ from vfe3.config import (
     serialize_config,
 )
 from vfe3.contracts import DataState, DataStateBuffer, ExecutableBuildMetadata
+from vfe3.model.minimal_agent import READOUT_COVARIANCES
 from vfe3.model.block_mlp import (
     block_mlp_build_metadata,
     get_block_mlp_registration,
@@ -204,7 +205,10 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "content_covariance_contract": (("value_space_channel_likelihood_plus_channel_noise"
                                          if cfg.relational_receiver_law == "channel_likelihood" else
                                          "full_link_pushforward_plus_positive_reference_noise") if full_link else
-                                        ("minimal_agent_posterior_moment_match_plus_covariant_floor" if minimal_agent
+                                        (("minimal_agent_mean_field_label_spread_corrected_plus_prior_floor"
+                                          if getattr(cfg, "predictive_covariance", "passthrough") == "spread_corrected"
+                                          else "minimal_agent_posterior_moment_match_plus_covariant_floor")
+                                         if minimal_agent
                                          # The head-block family stores the head blocks of U_i(C^att + f I)U_i^T: the
                                          # exact M-projection onto block-diagonal Gaussians, covariant under the
                                          # per-head block group (audit 2026-10-09 round 2, #10).
@@ -215,7 +219,7 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
                                          else "diagonal_local_moment_projection_of_predictive_kernel_plus_floor"
                                          if cfg.family != "gaussian_full"
                                          else "exact_predictive_kernel_moment_match_plus_covariant_floor")
-                                        if getattr(cfg, "predictive_covariance", "passthrough") == "moment_matched"
+                                        if getattr(cfg, "predictive_covariance", "passthrough") in READOUT_COVARIANCES
                                         else "frozen_receiver_bookkeeping_not_predictive_covariance"),
         "self_coupling_coordinate_contract": (
             "ordered_conditional_kl_stored_coordinate_order"
@@ -240,7 +244,7 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "state_destination": (
             "receiver_belief_mean_and_covariance"
             if (full_link and not getattr(cfg, "skip_belief_sigma_update", False))
-            or (not full_link and getattr(cfg, "predictive_covariance", "passthrough") == "moment_matched")
+            or (not full_link and getattr(cfg, "predictive_covariance", "passthrough") in READOUT_COVARIANCES)
             else "receiver_belief_mean"),
         "source_beliefs": "live_episode_initial" if full_link else "live_pre_update",
         "outer_operator_and_frame_graph": "live",
@@ -5069,7 +5073,7 @@ def _pure_path_report(
     receiver_gradient = attention_mode == "projected_gradient"
     predictive_covariance_updated = (
         attention_mode == "projected_predictive"
-        and getattr(cfg, "predictive_covariance", "passthrough") == "moment_matched")
+        and getattr(cfg, "predictive_covariance", "passthrough") in READOUT_COVARIANCES)
     covariance_updated = (receiver_gradient and not cfg.skip_belief_sigma_update) or predictive_covariance_updated
     # The receiver always descends its own energy by Fisher steps or the closed-form update.
     gradient_e_step_update: 'bool | str' = True if receiver_gradient else "not_applicable"

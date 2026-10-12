@@ -86,6 +86,52 @@ fusion runs through the same assembly (:func:`information_step`): head :math:`h`
 result is :math:`(\xi_i^+, P_i)` exactly, in any head order. The mean-field covariance omits the between-source
 spread :math:`G\operatorname{Cov}_w(T\xi)G^\top` that the exact posterior keeps.
 
+Spread-corrected mean-field covariance (``predictive_covariance='spread_corrected'``, audit 2026-10-12 T2;
+:func:`label_spread`). With the labels :math:`\beta^h` and the Gaussian :math:`(\xi_i^+, P_i)` of the last sweep,
+:math:`a_h^+ = S_h\xi_i^+`, the gradient of :math:`\log p(X, J, o)` at :math:`X = \xi_i^+` for a label tuple
+:math:`J` is :math:`\sum_hS_h^\top d^h_{J^h}` with
+
+.. math::
+    d^h_j = B_j^{h\,-1}(b_j^h - a_h^+) - \sum_k\beta^h_{ik}B_k^{h\,-1}(b_k^h - a_h^+),
+
+because its label average :math:`-C_i^{-1}(\xi_i^+ - \xi_i) + \sum_hS_h^\top(\eta^h - \Lambda^ha_h^+)` vanishes at the
+power posterior. One Newton step with the mean-field Hessian :math:`P_i^{-1}` gives the label-conditional means
+:math:`E[X\mid J] \approx \xi_i^+ + P_i\sum_hS_h^\top d^h_{J^h}`, and the law of total variance over the independent
+labels :math:`J^h\sim\beta^h` gives
+
+.. math::
+    C_i^+ = P_i + \sum_hP_iS_h^\top R'^h_iS_hP_i,\qquad R'^h_i = \sum_j\beta^h_{ij}d^h_jd_j^{h\top}.
+
+It is positive definite by construction: :math:`R'^h_i` is a nonnegative combination of rank-one positive semidefinite
+terms, so :math:`P_iS_h^\top R'^h_iS_hP_i = (S_hP_i)^\top R'^h_i(S_hP_i)\succeq 0`, and :math:`P_i\succ 0`. It is a
+linearization (a hybrid of coordinate ascent and assumed-density filtering), not an exact moment: the precision of
+each label-conditional Gaussian is held at the label-averaged :math:`P_i^{-1}`. Under comparison-space RoPE
+:math:`d^h_j` is formed on the rotated moments and :math:`R'^h_i` is rotated back, :math:`R_i^\top(\cdot)R_i`, like
+:math:`\Lambda^h`. It is defined for the mean field only.
+
+Per-layer evidence bound (``diagnose_agent_elbo``, audit 2026-10-12 T1; :func:`minimal_agent_elbo`,
+:func:`minimal_agent_log_evidence`). In the per-head snapshot model the sources marginalize to
+:math:`p(o_h = 0\mid X, J^h = j) = N(S_hX; b_j, B_j)`, and given :math:`X` the heads are independent, so the declared
+joint is :math:`N(X; \xi, C)\prod_h\hat\pi^h_{J^h}N(S_hX; b^h_{J^h}, B^h_{J^h})` with
+:math:`\hat\pi^h = \operatorname{softmax}_j\log\pi^h` (the normalized routing prior). Its evidence lower bound on
+:math:`q(X)\prod_hq(J^h)`, :math:`q(X) = N(\xi^+, C^+)`, :math:`q(J^h) = \beta^h`, is
+
+.. math::
+    \mathcal L_i = -\mathrm{KL}(N(\xi_i^+, C_i^+)\,\|\,N(\xi_i, C_i)) + \sum_h\Bigl[-\sum_j\beta^h_{ij}
+        \mathrm{KL}(N(a_h^+, A_h^+)\,\|\,N(b_j^h, B_j^h)) - \mathrm{KL}(\beta^h_i\,\|\,\hat\pi^h_i)
+        - \tfrac d2(1 + \log 2\pi) - \tfrac12\log\det A_h^+\Bigr],
+
+with :math:`A_h^+ = S_hC_i^+S_h^\top`, from
+:math:`E_q\log N(S_hX; b_j, B_j) = -\mathrm{KL}(N(a^+, A^+)\|N(b_j, B_j)) - \tfrac d2(1 + \log 2\pi) - \tfrac12\log\det A^+`.
+Coordinate ascent maximizes :math:`\mathcal L` over :math:`q(J)` and :math:`q(X)` in turn (the label and fusion steps
+above are its exact coordinate maxima), so :math:`\mathcal L` does not decrease over sweeps. The evidence of one head is
+:math:`\log p(o_h) = \operatorname{logsumexp}_j(\log\hat\pi^h_{ij} - c^h_{ij}) - \tfrac d2\log 2\pi` with the exact cost
+:math:`c^h_{ij}` of :func:`exact_record_posterior`; summing it over the heads at the ADF moments is the
+assumed-density-filtering evidence, which is the exact :math:`\log p(o)` for one head and for heads that satisfy the
+exactness condition above, and an approximation otherwise (it is then not guaranteed to exceed :math:`\mathcal L`).
+The record is declared rather than observed, so the evidence is unbounded above as :math:`S, T\to 0` and
+:math:`n\to 0`: it is a diagnostic and never enters the loss.
+
 Coordinate ascent (``cavi_steps`` :math:`= n`). The step above is one sweep of coordinate-ascent variational
 inference on the structured family :math:`q(X_i)\prod_hq(J^h)`. Sweep :math:`s > 1` recomputes every head's labels
 at the posterior query moments of sweep :math:`s - 1`,
@@ -141,9 +187,19 @@ from vfe3.runtime import ieee_fp32_matmul
 
 PREDICTIVE_READOUTS: Tuple[str, ...] = ("kernel", "minimal_agent")
 MINIMAL_AGENT_INFERENCE: Tuple[str, ...] = ("exact", "mean_field")
+# predictive_covariance values, and those under which the readout returns a covariance (passthrough keeps the
+# incoming one). spread_corrected is the minimal agent's mean field with the linearized label spread (T2).
+PREDICTIVE_COVARIANCES: Tuple[str, ...] = ("passthrough", "moment_matched", "spread_corrected")
+READOUT_COVARIANCES: Tuple[str, ...] = ("moment_matched", "spread_corrected")
 # Bytes of pair matrices one exact-routing tile may hold: W_ij, its Cholesky factor and W_ij^{-1}, r x r each.
 # Read at call time, so a test can force tiny tiles by setting it.
 PAIR_TILE_BYTES: int = 32 * 1024 ** 2
+# Bytes of the (rows x sources x d) label-deviation tensor one label-spread tile may hold (label_spread).
+SPREAD_TILE_BYTES: int = 32 * 1024 ** 2
+# Per-layer evidence diagnostics (diagnose_agent_elbo only; means over receivers, nats): the evidence lower bound of
+# the readout's posterior, the ADF evidence and their difference.
+MINIMAL_AGENT_ELBO_KEYS: Tuple[str, ...] = (
+    "relational_minimal_agent_elbo", "relational_minimal_agent_evidence", "relational_minimal_agent_elbo_gap")
 # Per-layer, per-head diagnostics written to the relational capture (means over receivers).
 MINIMAL_AGENT_DIAGNOSTIC_KEYS: Tuple[str, ...] = (
     "relational_minimal_agent_gain_fraction", "relational_minimal_agent_channel_noise",
@@ -204,6 +260,10 @@ class MinimalAgentResult(NamedTuple):
     covariance_contraction: Optional[torch.Tensor] = None   # (..., N) tr C_i^+ / tr C_i (diagnostics only)
     label_staleness:  Optional[torch.Tensor] = None         # (..., N, H) mean field: TV of one relabeling (diagnostics)
     spread_share:     Optional[torch.Tensor] = None         # (..., N, H) exact: tr(A R) / tr(A Lambda_bar) (diagnostics)
+    spread_gains:     Optional[torch.Tensor] = None         # (..., N, H, K, d) P_i S_h^T (spread_corrected only)
+    label_spread:     Optional[torch.Tensor] = None         # (..., N, H, d, d) R'_i^h (spread_corrected only)
+    elbo:             Optional[torch.Tensor] = None         # (..., N) float64 evidence lower bound (elbo only)
+    evidence:         Optional[torch.Tensor] = None         # (..., N) float64 ADF log evidence (elbo only)
 
 
 def _symmetrize(X: torch.Tensor) -> torch.Tensor:          # (..., r, r) -> (..., r, r)
@@ -661,6 +721,183 @@ def _label_staleness(
     return tv.movedim(-1, -2).masked_fill(bad, math.nan)                        # (..., N, H)
 
 
+def _label_spread_tile(
+    weights: torch.Tensor,                      # (..., I, J) labels of the tile's receivers
+    a:       torch.Tensor,                      # (..., I, r) posterior query means of the tile's receivers
+    B_inv:   torch.Tensor,                      # (..., J, r, r) B_j^{-1}
+    v:       torch.Tensor,                      # (..., J, r) B_j^{-1} b_j
+) -> torch.Tensor:                              # (..., I, r, r)
+    r"""One receiver-row tile of :func:`label_spread`."""
+    e = v.unsqueeze(-3) - torch.einsum("...jst,...it->...ijs", B_inv, a)       # (..., I, J, r) B_j^{-1}(b_j - a_i)
+    mean = torch.einsum("...ij,...ijs->...is", weights, e)                      # (..., I, r) eta_i - Lambda_i a_i
+    diff = e - mean.unsqueeze(-2)                                               # (..., I, J, r) d_ij
+    weighted = weights.unsqueeze(-1) * diff                                     # (..., I, J, r)
+    spread = torch.einsum("...ijs,...ijt->...ist", weighted, diff)              # (..., I, r, r), contracted over j
+    residual = weighted.sum(dim=-2)                                             # (..., I, r) rounding of the mean
+    return spread - residual.unsqueeze(-1) * residual.unsqueeze(-2)
+
+
+def label_spread(
+    weights: torch.Tensor,                      # (..., I, J) labels beta_ij (rows sum to one, 0 on masked pairs)
+    a:       torch.Tensor,                      # (..., I, r) posterior query means a_i^+
+    b:       torch.Tensor,                      # (..., J, r) utterance means
+    B:       torch.Tensor,                      # (..., J, r, r) noisy utterance covariances
+) -> Tuple[torch.Tensor, torch.Tensor]:         # R'_i (..., I, r, r), failed ()
+    r"""Linearized label spread of the spread-corrected mean-field covariance (module docstring, T2).
+
+    .. math::
+        R'_i = \sum_j\beta_{ij}d_{ij}d_{ij}^\top,\qquad
+        d_{ij} = B_j^{-1}(b_j - a_i) - \sum_k\beta_{ik}B_k^{-1}(b_k - a_i),
+
+    accumulated about each row's own mean (the two-pass form of ``_centered_spread``, so the label average is not
+    cancelled against a second moment) and positive semidefinite up to the rounding of that mean. One Cholesky factor
+    per source; receiver rows are tiled so that one tile holds at most :data:`SPREAD_TILE_BYTES` of the
+    :math:`(I, J, r)` deviations, and each tile is a non-reentrant checkpoint under autograd when there is more than
+    one. No :math:`(I, J, r, r)` tensor is formed: the spread is a batched product over :math:`j`. Cost
+    :math:`O(IJr^2)` per batch element.
+    """
+    L, info = torch.linalg.cholesky_ex(B)                                       # (..., J, r, r)
+    B_inv = _symmetrize(torch.cholesky_inverse(L))                              # (..., J, r, r)
+    v = torch.cholesky_solve(b.unsqueeze(-1), L).squeeze(-1)                    # (..., J, r) B_j^{-1} b_j
+    I, J, r = a.shape[-2], b.shape[-2], a.shape[-1]
+    batch = math.prod(torch.broadcast_shapes(weights.shape[:-2], a.shape[:-2], b.shape[:-2]))
+    per_row = max(1, batch * J * r * a.element_size())
+    step = max(1, min(I, SPREAD_TILE_BYTES // per_row))
+    tiles = []
+    for i in range(0, I, step):
+        args = (weights[..., i:i + step, :], a[..., i:i + step, :], B_inv, v)
+        if torch.is_grad_enabled() and step < I and any(x.requires_grad for x in args):
+            tiles.append(checkpoint(_label_spread_tile, *args, use_reentrant=False, preserve_rng_state=False))
+        else:
+            tiles.append(_label_spread_tile(*args))
+    spread = tiles[0] if len(tiles) == 1 else torch.cat(tiles, dim=-3)
+    return _symmetrize(spread), (info != 0).any()
+
+
+def _spread_gains(
+    X0:    torch.Tensor,                        # (..., N, H, K, d) C_i S_h^T
+    S:     torch.Tensor,                        # (H, d, K)
+    gains: torch.Tensor,                        # (..., N, H, K, d) Kmat^g
+    M:     torch.Tensor,                        # (..., N, H, d, d) M^g
+) -> torch.Tensor:                              # (..., N, H, K, d) C_i^+ S_h^T
+    r""":math:`C_i^+S_h^\top = C_iS_h^\top - \sum_g\mathsf K^gM^gY_{hg}^\top`, :math:`Y_{hg} = S_h\mathsf K^g`; the mean field's
+    :math:`P_iS_h^\top` (only :math:`K\times d` and :math:`d\times d` products)."""
+    Y = torch.einsum("hsk,...ngkt->...nhgst", S, gains)                        # (..., N, H, H, d, d) S_h K^g
+    return X0 - torch.einsum("...ngkt,...ngtu,...nhgsu->...nhks", gains, M, Y)
+
+
+def _dense_covariance(
+    C:      torch.Tensor,                       # (..., N, K, K) dense or (..., N, G, g, g) blocks
+    blocks: bool,
+) -> torch.Tensor:                              # (..., N, K, K)
+    r"""The dense :math:`C_i` of a dense or block-diagonal input."""
+    if not blocks:
+        return C
+    G, g = C.shape[-3], C.shape[-1]
+    eye = torch.eye(G, dtype=C.dtype, device=C.device)
+    return torch.einsum("...nmab,mq->...nmaqb", C, eye).reshape(*C.shape[:-3], G * g, G * g)
+
+
+def _cholesky_logdet(L: torch.Tensor) -> torch.Tensor:   # (..., r, r) -> (...)
+    return 2.0 * L.diagonal(dim1=-2, dim2=-1).log().sum(dim=-1)
+
+
+def minimal_agent_elbo(
+    xi:        torch.Tensor,                    # (..., N, K) input reference means xi_i
+    C:         torch.Tensor,                    # (..., N, K, K) dense or (..., N, G, g, g) blocks, input C_i
+    xi_plus:   torch.Tensor,                    # (..., N, K) posterior means
+    gains:     torch.Tensor,                    # (..., N, H, K, d) Kmat_i^h
+    M:         torch.Tensor,                    # (..., N, H, d, d) M_i^h
+    V_Q:       torch.Tensor,                    # (..., N, H, d, d) S_h C_i S_h^T at the input moments
+    S:         torch.Tensor,                    # (H, d, K)
+    b:         torch.Tensor,                    # (..., H, N, d) utterance means (comparison frame)
+    B:         torch.Tensor,                    # (..., H, N, d, d) noisy utterance covariances (comparison frame)
+    lp:        torch.Tensor,                    # (..., H, N, N) routing log-prior log pi (unnormalized; -inf masks)
+    weights:   torch.Tensor,                    # (..., H, N, N) label factors q(J^h) = beta^h
+    no_record: torch.Tensor,                    # (..., H, N) bool: the receiver hears no record from head h
+    *,
+    blocks:    bool,
+    rope:      Optional[torch.Tensor] = None,   # (N, d, d) comparison rotation R_i
+) -> torch.Tensor:                              # (..., N) float64
+    r"""Evidence lower bound :math:`\mathcal L_i` of the declared record model at
+    :math:`q = N(\xi_i^+, C_i^+)\prod_h\beta^h_i` (module docstring, T1), per receiver, in nats.
+
+    .. math::
+        \mathcal L_i = -\mathrm{KL}(N(\xi_i^+, C_i^+)\,\|\,N(\xi_i, C_i)) + \sum_{h:\,\text{record}}\Bigl[
+            -\sum_j\beta^h_{ij}\mathrm{KL}_{ij}^{h,+} - \mathrm{KL}(\beta^h_i\,\|\,\hat\pi^h_i)
+            - \tfrac d2(1 + \log 2\pi) - \tfrac12\log\det A_h^+\Bigr],
+
+    :math:`C_i^+ = C_i - \sum_h\mathsf K_i^hM_i^h\mathsf K_i^{h\top}` (formed dense, :math:`K\times K`),
+    :math:`\mathrm{KL}^{h,+}_{ij} = \mathrm{KL}(N(a_h^+, A_h^+)\|N(b_j^h, B_j^h))` on the comparison-frame posterior query
+    moments of :func:`_posterior_query_moments` (rotated under ``rope``; :math:`\log\det A^+` is rotation invariant),
+    :math:`\hat\pi^h_i = \operatorname{softmax}_j\log\pi^h_{ij}` and :math:`0\log 0 = 0`. A head that gives a receiver no
+    record (``no_record``) contributes nothing, as in the readout. Every quantity is detached and the computation
+    runs in float64 without autograd: it is a diagnostic of the posterior the readout returned, valid for any
+    :math:`q` (mean field: the last sweep's labels and fused Gaussian; exact: the ADF posterior and its per-head
+    labels), and never enters the loss. A receiver whose :math:`C_i^+` or :math:`A_h^+` does not factor, or a head
+    with an utterance covariance that does not, reads NaN.
+    """
+    f64 = torch.float64
+    with torch.no_grad():
+        xi, xi_plus, gains, M = (t.detach().to(f64) for t in (xi, xi_plus, gains, M))
+        V_Q, S, b, B, lp, weights = (t.detach().to(f64) for t in (V_Q, S, b, B, lp, weights))
+        rope = None if rope is None else rope.detach().to(f64)
+        H, d, K = S.shape
+        C = _dense_covariance(C.detach().to(f64), blocks)                       # (..., N, K, K)
+        C_plus = _symmetrize(C - torch.einsum("...nhks,...nhst,...nhlt->...nkl", gains, M, gains))
+        L_C, info_C = torch.linalg.cholesky_ex(C)
+        L_P, info_P = torch.linalg.cholesky_ex(C_plus)
+        eye_K = torch.eye(K, dtype=f64, device=C.device)
+        L_P = torch.where((info_P != 0)[..., None, None], eye_K, L_P)
+        whitened = torch.linalg.solve_triangular(L_C, L_P, upper=False)         # L_C^{-1} L_P
+        shift = torch.linalg.solve_triangular(L_C, (xi_plus - xi).unsqueeze(-1), upper=False).squeeze(-1)
+        kl_X = 0.5 * (whitened.square().sum(dim=(-2, -1)) + shift.square().sum(dim=-1) - K
+                      + _cholesky_logdet(L_C) - _cholesky_logdet(L_P))           # (..., N)
+        kl_X = kl_X.masked_fill((info_C != 0) | (info_P != 0), math.nan)
+
+        a_plus, A_plus = _posterior_query_moments(xi_plus, V_Q, S, gains, M, rope)   # (..., N, H, d), (..., N, H, d, d)
+        eye = torch.eye(d, dtype=f64, device=C.device)
+        bad = _unfactorable(a_plus, A_plus)                                     # (..., N, H)
+        A_plus = torch.where(bad[..., None, None], eye, A_plus)
+        a_plus = torch.where(bad[..., None], torch.zeros((), dtype=f64, device=C.device), a_plus)
+        bad_B = torch.linalg.cholesky_ex(B)[1] != 0                              # (..., H, N)
+        B = torch.where(bad_B[..., None, None], eye, B)
+        cost = projected_gaussian_kl(a_plus, A_plus, b.movedim(-3, -2), B.movedim(-4, -3))   # (..., H, N, N)
+        log_pi = torch.log_softmax(lp, dim=-1)                                  # (..., H, N, N) normalized
+        live = weights > 0
+        zero = torch.zeros((), dtype=f64, device=C.device)
+        expected = torch.where(live, weights * cost, zero).sum(dim=-1)          # (..., H, N) sum_j beta KL^+
+        kl_labels = torch.where(live, weights * (weights.log() - log_pi), zero).sum(dim=-1)   # KL(beta || pi_hat)
+        logdet_A = _cholesky_logdet(torch.linalg.cholesky(A_plus))              # (..., N, H)
+        head = (-(expected + kl_labels).movedim(-1, -2) - 0.5 * d * (1.0 + math.log(2.0 * math.pi))
+                - 0.5 * logdet_A)                                               # (..., N, H)
+        head = head.masked_fill(bad | bad_B.any(dim=-1, keepdim=True).movedim(-1, -2), math.nan)
+        head = head.masked_fill(no_record.movedim(-1, -2), 0.0)
+        return head.sum(dim=-1) - kl_X                                          # (..., N)
+
+
+def minimal_agent_log_evidence(
+    cost:      torch.Tensor,                    # (..., H, N, N) exact costs c_ij at each head's ADF moments
+    lp:        torch.Tensor,                    # (..., H, N, N) routing log-prior (unnormalized; -inf masks)
+    no_record: torch.Tensor,                    # (..., H, N) bool
+    d:         int,                             # comparison rank
+) -> torch.Tensor:                              # (..., N) float64
+    r"""ADF log evidence :math:`\sum_h\bigl[\operatorname{logsumexp}_j(\log\hat\pi^h_{ij} - c^h_{ij}) - \tfrac d2\log 2\pi\bigr]`.
+
+    :math:`c^h_{ij} = -\log N(b_j; a_i^h, W_{ij}^h) - \tfrac d2\log 2\pi` is the cost of :func:`exact_record_posterior`
+    at head :math:`h`'s ADF moments, so each bracket is :math:`\log\sum_j\hat\pi^h_{ij}N(0; a_i^h - b_j^h, W^h_{ij})`, the
+    log probability of the record :math:`o_h = 0` given the records of heads :math:`1..h-1` under the collapsed
+    Gaussian. For one head this is the exact :math:`\log p(o)`; for several it is exact when
+    :math:`S_hC_iS_g^\top = 0` for :math:`h\ne g` (module docstring, Exactness). A head without a record contributes 0.
+    Detached, float64, no autograd; costs of a skipped masked tile (0) meet :math:`\log\hat\pi = -\infty` and add nothing.
+    """
+    with torch.no_grad():
+        cost, lp = cost.detach().to(torch.float64), lp.detach().to(torch.float64)
+        per_head = (torch.logsumexp(torch.log_softmax(lp, dim=-1) - cost, dim=-1)
+                    - 0.5 * d * math.log(2.0 * math.pi))                        # (..., H, N)
+        return per_head.masked_fill(no_record, 0.0).sum(dim=-2)                 # (..., N)
+
+
 def minimal_agent_readout(
     xi:          torch.Tensor,                  # (..., N, K) reference means xi_i
     C:           torch.Tensor,                  # (..., N, K, K) dense or (..., N, G, g, g) block-diagonal C_i
@@ -674,6 +911,8 @@ def minimal_agent_readout(
     check:       bool = True,
     rope:        Optional[torch.Tensor] = None,  # (N, d, d) comparison-space rotation R_i, or None
     cavi_steps:  int = 1,                       # mean field: coordinate-ascent sweeps (1: labels at the input)
+    spread_corrected: bool = False,             # mean field: also return P S_h^T and the label spread R'^h (T2)
+    elbo:        bool = False,                  # also return the evidence lower bound and the ADF evidence (T1)
 ) -> MinimalAgentResult:
     r"""Posterior reference moments of every receiver under the minimal agent model.
 
@@ -712,9 +951,20 @@ def minimal_agent_readout(
     own host transfer) never receives a failed one. Requires :math:`n_h > 0`, every :math:`S_h` of full row rank and
     :math:`C_i\succ 0`. ``rope`` applies the comparison-space rotation of the module docstring (labels depend on
     position only through :math:`j - i`; ``query_covariance`` and ``key_covariance`` stay unrotated).
+
+    ``spread_corrected`` (mean field only) also returns ``spread_gains`` :math:`P_iS_h^\top` (:func:`_spread_gains`) and
+    ``label_spread`` :math:`R'^h_i` (:func:`label_spread`, in the record frame, 0 for a head without a record), from
+    which :func:`local_posterior_covariance` adds :math:`\sum_hP_iS_h^\top R'^h_iS_hP_i` (module docstring, T2); its
+    factorization flags join ``failed``. ``elbo`` also returns, per receiver in float64 and without autograd,
+    :func:`minimal_agent_elbo` at the returned posterior and :func:`minimal_agent_log_evidence` at the ADF moments of
+    the exact path (computed in float64: a mean-field or float32 call reruns that path once in float64 on detached
+    inputs for it; NaN if it fails).
     """
     if inference not in MINIMAL_AGENT_INFERENCE:
         raise ValueError(f"minimal_agent_inference must be one of {MINIMAL_AGENT_INFERENCE}, got {inference!r}")
+    if spread_corrected and inference != "mean_field":
+        raise ValueError("the spread-corrected covariance is a mean-field correction; the exact path already returns "
+                         "the moments of the exact posterior mixture (spread included)")
     if isinstance(cavi_steps, bool) or not isinstance(cavi_steps, int) or cavi_steps < 1:
         raise ValueError(f"cavi_steps must be an int >= 1, got {cavi_steps!r}")
     if S.shape != T.shape or S.dim() != 3 or log_noise.shape != (S.shape[0],):
@@ -891,13 +1141,44 @@ def minimal_agent_readout(
                              else torch.full_like(coupling, math.nan))           # (..., N, H)
                 spread = (torch.stack(spreads, dim=-1) if inference == "exact"
                           else torch.full_like(coupling, math.nan))              # (..., N, H)
+        spread_gains = label_spread_out = None
+        if spread_corrected:
+            # T2: the label spread at the last sweep's labels and posterior query means, in the comparison frame,
+            # rotated back to the record frame; a head without a record adds nothing.
+            a_post = torch.einsum("hsk,...nk->...hns", S, xi_plus)              # (..., H, N, d) a^+
+            if Rot is not None:
+                a_post = torch.einsum("nst,...hnt->...hns", Rot, a_post)
+            R_prime, bad_spread = label_spread(weights_out, a_post, b, B_kl)     # (..., H, N, d, d)
+            flags.append(bad_spread)
+            if Rot is not None:
+                R_prime = _symmetrize(torch.einsum("nts,...hntu,nuv->...hnsv", Rot, R_prime, Rot))
+            R_prime = torch.where(no_record[..., None, None], torch.zeros((), dtype=dtype, device=xi.device), R_prime)
+            label_spread_out = R_prime.movedim(-4, -3)                          # (..., N, H, d, d)
+            spread_gains = _spread_gains(X0, S, gains, M)                       # (..., N, H, K, d) P S_h^T
+        elbo_out = evidence_out = None
+        if elbo:
+            with torch.no_grad():
+                elbo_out = minimal_agent_elbo(xi, C, xi_plus, gains, M, V_Q, S, b, B, lp, weights_out, no_record,
+                                              blocks=blocks, rope=Rot)          # (..., N)
+                exact_cost = cost_out
+                if inference != "exact" or dtype != torch.float64:
+                    # The ADF costs in float64 from the detached inputs (the exact path of this call when it already
+                    # ran in float64).
+                    f64 = torch.float64
+                    exact = minimal_agent_readout(xi.detach().to(f64), C.detach().to(f64), S.detach().to(f64),
+                                                  T.detach().to(f64), log_noise.detach().to(f64), lp.detach().to(f64),
+                                                  "exact", check=False,
+                                                  rope=None if Rot is None else Rot.detach().to(f64))
+                    exact_cost = exact.cost.masked_fill(exact.failed, math.nan)
+                evidence_out = minimal_agent_log_evidence(exact_cost, lp, no_record, d)   # (..., N)
         failed = torch.stack([flag.reshape(()) for flag in flags]).any()
         ill_conditioned = (torch.stack([screen.reshape(()) for screen in screens]).any() if screens
                            else torch.zeros((), dtype=torch.bool, device=xi.device))
     if check and bool(failed):                                                  # the one host check
         raise ValueError(readout_failure_message(dtype))
     return MinimalAgentResult(xi_plus, gains, M, weights_out, cost_out, gain_fraction, V_Q, V_K, coupling,
-                              failed, ill_conditioned, contraction, staleness, spread)
+                              failed, ill_conditioned, contraction, staleness, spread,
+                              spread_gains, label_spread_out, elbo_out, evidence_out)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -911,6 +1192,8 @@ def local_posterior_covariance(
     gains:          torch.Tensor,               # (..., N, H, K, d) Kmat_i^h
     M:              torch.Tensor,               # (..., N, H, d, d) M_i^h
     floor:          torch.Tensor,               # sigma's layout: f Sigma_{p,i}, the prior-anchored floor
+    spread_gains:   Optional[torch.Tensor] = None,   # (..., N, H, K, d) P_i S_h^T (spread_corrected only)
+    spread:         Optional[torch.Tensor] = None,   # (..., N, H, d, d) R'_i^h (spread_corrected only)
 ) -> torch.Tensor:                              # same layout as sigma
     r"""Local posterior covariance :math:`\Sigma_i^+ = U_iC_i^+U_i^\top + f\,\Sigma_{p,i}`.
 
@@ -925,18 +1208,34 @@ def local_posterior_covariance(
     diagonal (the moment projection onto the diagonal family),
     :math:`\operatorname{diag}\Sigma_i - \sum_h\operatorname{rowquad}(Z_i^h, M_i^h) + f\,\operatorname{diag}\Sigma_{p,i}`
     with :math:`\operatorname{rowquad}(Z, M)_k = Z_kMZ_k^\top`, which never forms a :math:`K\times K` matrix.
+
+    With ``spread_gains`` :math:`P_iS_h^\top` and ``spread`` :math:`R'^h_i` (``spread_corrected``, module docstring T2)
+    the term :math:`\sum_hZ'^h_iR'^h_iZ'^{h\top}_i`, :math:`Z'^h_i = U_iP_iS_h^\top`, is added (its row quadratic forms on
+    the diagonal family), which is :math:`U_i(\sum_hP_iS_h^\top R'^h_iS_hP_i)U_i^\top`. Without them the arithmetic is
+    the moment-matched one, operation for operation.
     """
     if floor.shape != sigma.shape:
         raise ValueError(f"the floor must have the covariance's shape {tuple(sigma.shape)}, got {tuple(floor.shape)}")
+    if (spread_gains is None) != (spread is None):
+        raise ValueError("spread_gains and spread are given together (spread_corrected) or not at all")
     H, K, d = gains.shape[-3:]
-    if block_diagonal:
-        G, g = forward.shape[-3], forward.shape[-1]
-        Z = torch.einsum("...nmab,...nhmbs->...nhmas", forward,
-                         gains.reshape(*gains.shape[:-2], G, g, d)).reshape(gains.shape)    # (..., N, H, K, d)
-    else:
-        Z = forward.unsqueeze(-3) @ gains                                       # (..., N, H, K, d)
+
+    def local(X: torch.Tensor) -> torch.Tensor:                                 # (..., N, H, K, d) -> U_i X
+        if block_diagonal:
+            G, g = forward.shape[-3], forward.shape[-1]
+            return torch.einsum("...nmab,...nhmbs->...nhmas", forward,
+                                X.reshape(*X.shape[:-2], G, g, d)).reshape(X.shape)
+        return forward.unsqueeze(-3) @ X
+
+    Z = local(gains)                                                            # (..., N, H, K, d)
     if sigma.dim() == gains.dim() - 2:                                          # diagonal (..., N, K)
         downdate = torch.einsum("...nhks,...nhst,...nhkt->...nk", Z, M, Z)       # sum_h rowquad(Z^h, M^h)
-        return sigma - downdate + floor
+        if spread is None:
+            return sigma - downdate + floor
+        Zs = local(spread_gains)                                                # (..., N, H, K, d) U_i P_i S_h^T
+        return sigma - downdate + torch.einsum("...nhks,...nhst,...nhkt->...nk", Zs, spread, Zs) + floor
     downdate = torch.einsum("...nhks,...nhst,...nhlt->...nkl", Z, M, Z)          # (..., N, K, K)
-    return _symmetrize(sigma - downdate + floor)
+    if spread is None:
+        return _symmetrize(sigma - downdate + floor)
+    Zs = local(spread_gains)
+    return _symmetrize(sigma - downdate + torch.einsum("...nhks,...nhst,...nhlt->...nkl", Zs, spread, Zs) + floor)
