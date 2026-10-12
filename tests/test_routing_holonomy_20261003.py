@@ -1,9 +1,8 @@
 """Triangle holonomy of the head-sum link field (link_curvature note, 2026-10-03).
 
 Tiny CPU tensors and models only (K=4, two heads, N <= 6). Covers the exact path-weighted defect
-moments against brute force, zero defect for flat routing beta_ij = c_i / c_j, the conjugacy
-F_ijk ~ R_ijk G against the direct product of edge operators, the training-time
-diagnostics/routing_holonomy.csv, and the post-hoc observer's sampled triangles.
+moments against brute force, zero defect for flat routing beta_ij = c_i / c_j, and the training-time
+diagnostics/routing_holonomy.csv.
 """
 from tests.profiles import test_config
 import csv
@@ -19,9 +18,8 @@ from torch.utils.data import DataLoader
 import vfe3.run_artifacts as ra
 import vfe3.train as T
 from vfe3.data.datasets import TokenWindows
-from vfe3.metrics import routing_triangle_defect_sums, triangle_holonomy_eigenvalues
+from vfe3.metrics import routing_triangle_defect_sums
 from vfe3.model.model import VFEModel
-from vfe3.posthoc.holonomy import RoutingHolonomyObserver, curvature_size
 
 B, N, V = 2, 4, 7
 
@@ -72,27 +70,6 @@ def test_flat_routing_has_zero_defect_and_uniform_does_not() -> None:
     assert float(routing_triangle_defect_sums(uniform[None, None])[0, 2]) > 1e-3
 
 
-def test_holonomy_is_conjugate_to_routing_times_transfer() -> None:
-    g = torch.Generator().manual_seed(3)
-    H, d = 2, 2
-    K = H * d
-    T_hat = torch.randn(H, d, K, generator=g, dtype=torch.float64)
-    O_hat = torch.randn(H, K, d, generator=g, dtype=torch.float64)
-    beta = _causal_beta(1, H, 4, seed=4)[0]                                  # (H, N, N)
-
-    def edge(i: int, j: int) -> torch.Tensor:                                # sum_h beta^h O_h T_h
-        return sum(beta[h, i, j] * O_hat[h] @ T_hat[h] for h in range(H))
-
-    i, j, k = 3, 2, 0
-    F = torch.linalg.solve(edge(i, k), edge(i, j) @ edge(j, k))
-    rho = (beta[:, i, j] * beta[:, j, k] / beta[:, i, k])[None]              # (1, H)
-    lam = triangle_holonomy_eigenvalues(T_hat, O_hat, rho)[0]
-    direct = torch.linalg.eigvals(F)
-    key = lambda z: sorted((round(v.real, 8), round(v.imag, 8)) for v in z.tolist())
-    assert key(lam) == key(direct)
-    assert float(curvature_size(torch.ones(K, dtype=torch.complex128))) == 0.0
-
-
 def _cfg(**overrides: Any) -> Any:
     values: Dict[str, Any] = dict(
         vocab_size=V, embed_dim=4, n_heads=2, batch_size=B, max_seq_len=N, eval_stride=2,
@@ -141,13 +118,3 @@ def test_training_writes_routing_holonomy_csv(tmp_path: Path) -> None:
         assert float(r["path_mass"]) > 0.0
         assert float(r["log_defect_rms"]) >= abs(float(r["log_defect_mean"])) - 1e-12
         assert math.isfinite(float(r["prior_log_defect_rms"]))
-
-
-def test_observer_samples_exact_defects() -> None:
-    beta = _causal_beta(2, 2, 5, seed=7).float()
-    observer = RoutingHolonomyObserver(n_triangles=64, seed=0)
-    observer.update({"layer_conditional_captures": [{"beta_pre": beta}], "log_prior": None},
-                    torch.ones(2, 5, dtype=torch.bool), {})
-    torch.testing.assert_close(observer.sums[0][:, :3], _brute(beta.double()), rtol=1e-6, atol=1e-9)
-    rho = observer.rho[0][0]
-    assert rho.shape == (128, 2) and torch.isfinite(rho).all() and (rho > 0).all()

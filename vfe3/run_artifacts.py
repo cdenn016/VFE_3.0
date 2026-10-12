@@ -3679,29 +3679,6 @@ def _cost_model_fields(
     return out
 
 
-def _estep_iterate_evidence(
-    *,
-    free_energy: Iterable[float],
-    halted: bool,
-    fixed_point_residual: Optional[float],
-    fixed_point_tolerance: Optional[float],
-) -> Dict[str, object]:
-    """Gate scientific iterate labels on explicit mechanical evidence."""
-    values = [float(value) for value in free_energy]
-    descent = len(values) >= 2 and all(
-        current <= previous for previous, current in zip(values, values[1:]))
-    fixed = bool(
-        halted and fixed_point_residual is not None and fixed_point_tolerance is not None
-        and float(fixed_point_residual) <= float(fixed_point_tolerance)
-    )
-    return {
-        "iterate_label": "final_iterate",
-        "descent_evidence": descent,
-        "convergence_evidence": fixed,
-        "fixed_point_evidence": fixed,
-    }
-
-
 def _estep_endpoint_artifact(evidence: Mapping[str, object]) -> Dict[str, str]:
     """Name the endpoint-delta artifact without claiming unproven iterate behavior."""
     title = "E-step endpoint delta"

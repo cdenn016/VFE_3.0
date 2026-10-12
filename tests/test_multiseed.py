@@ -23,11 +23,11 @@ def _write_run(d, ppl, seed):
     (d / "config.json").write_text(json.dumps(serialize_config(test_config(seed=seed))))
 
 
-def test_aggregate_seed_metric_mean_sd_and_seeds(tmp_path):
+def test_aggregate_scalar_mean_sd_and_seeds(tmp_path):
     vals = [10.0, 12.0, 11.0, 13.0, 9.0]                     # mean 11, ddof=1 var 2.5
     for i, v in enumerate(vals):
         _write_run(tmp_path / f"seed{i}", v, seed=i)
-    out = ms.aggregate_seed_metric(tmp_path)
+    out = ms.aggregate_scalar(tmp_path, "test_ppl", sources=("summary.json",))
     assert out["n"] == 5
     assert abs(out["mean"] - 11.0) < 1e-9
     assert abs(out["sd"] - math.sqrt(2.5)) < 1e-9
@@ -43,16 +43,20 @@ def test_aggregate_skips_nonfinite_and_unreadable(tmp_path):
     (tmp_path / "c" / "summary.json").write_text("{ not json")
     (tmp_path / "c" / "config.json").write_text(json.dumps(
         serialize_config(test_config(seed=3))))
-    out = ms.aggregate_seed_metric(tmp_path)
+    out = ms.aggregate_scalar(tmp_path, "test_ppl", sources=("summary.json",))
     assert out["n"] == 1 and abs(out["mean"] - 10.0) < 1e-9
     assert math.isnan(out["sd"])                            # n<2 -> SD undefined
 
 
 def test_aggregate_empty_root(tmp_path):
-    out = ms.aggregate_seed_metric(tmp_path)
+    out = ms.aggregate_scalar(tmp_path, "test_ppl", sources=("summary.json",))
     assert out["n"] == 0 and math.isnan(out["mean"])
 
 
+# =============================================================================
+# Full cross-seed digest (2026-06-22): run-root resolution, seed source, curves,
+# per-layer, research scalars, and the new figure functions.
+# =============================================================================
 def _write_full_run(d, *, ppl, seed, metrics=None, per_layer=None, research=None, config=None):
     d.mkdir(parents=True, exist_ok=True)
     (d / "summary.json").write_text(json.dumps({"test_ppl": ppl}))
@@ -206,10 +210,10 @@ def test_multiseed_manifest_rejects_invalid_observed_seed_without_request(tmp_pa
     assert manifest["requested_seeds"] == []
 
 
-def test_aggregate_seed_metric_uses_provenance_seed(tmp_path):
+def test_aggregate_scalar_uses_provenance_seed(tmp_path):
     for v, s in [(10.0, 23), (12.0, 54)]:
         _write_full_run(tmp_path / f"run_s{s}", ppl=v, seed=s)
-    out = ms.aggregate_seed_metric(tmp_path)
+    out = ms.aggregate_scalar(tmp_path, "test_ppl", sources=("summary.json",))
     assert out["n"] == 2 and sorted(out["seeds"]) == [23, 54]
 
 
@@ -240,7 +244,7 @@ def test_seed_dirs_reject_mixed_semantic_configs(tmp_path):
     assert str(run_a / "config.json") in message
     assert str(run_b / "config.json") in message
     with pytest.raises(ValueError, match="mixed semantic config fingerprints"):
-        ms.aggregate_seed_metric(tmp_path)
+        ms.aggregate_scalar(tmp_path, "test_ppl", sources=("summary.json",))
 
 
 def test_seed_dirs_accept_homogeneous_semantic_configs(tmp_path):
@@ -269,7 +273,7 @@ def test_seed_dirs_accept_homogeneous_semantic_configs(tmp_path):
         == ms._config_fingerprint(flat / "config.json")
     )
     assert ms._seed_dirs(tmp_path) == [nested, flat]
-    out = ms.aggregate_seed_metric(tmp_path)
+    out = ms.aggregate_scalar(tmp_path, "test_ppl", sources=("summary.json",))
     assert out["n"] == 2
     assert out["mean"] == pytest.approx(11.0)
 
@@ -349,7 +353,7 @@ def test_requested_panel_reports_unexpected_duplicate_runs_and_withholds_publica
     assert design["n_observed_runs"] == 3
     assert design["complete"] is False
 
-    aggregate = ms.aggregate_seed_metric(tmp_path)
+    aggregate = ms.aggregate_scalar(tmp_path, "test_ppl", sources=("summary.json",))
     assert aggregate["n"] == 1
     assert aggregate["seeds"] == [8]
     assert aggregate["accepted_seeds"] == [8]

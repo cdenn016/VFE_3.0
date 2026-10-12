@@ -290,7 +290,7 @@ def _manifold_optimizer(phi, other, fused: bool):
         [{"params": [phi], "lr": 0.05, "pullback_group": True, "weight_decay": 0.0},
          {"params": [other], "lr": 0.01, "weight_decay": 0.0}],
         get_group("block_glk")(n_heads=1, K=2), phi_group_trust_radius=0.1, phi_chart_max_norm=5.0,
-        phi_bch_residual_max=1e-6, weight_decay=0.0, fused=fused)
+        weight_decay=0.0, fused=fused)
 
 
 def test_fused_grad_scale_contract_reaches_the_manifold_phi_step() -> None:
@@ -602,7 +602,7 @@ def test_pullback_group_diagnostic_step_on_a_non_elementary_basis(group_name: st
     phi = nn.Parameter(0.2 * torch.randn(5, group.generators.shape[0]))
     optimizer = GaugeManifoldAdamW([{"params": [phi], "lr": 0.05, "pullback_group": True, "weight_decay": 0.0}],
                                    group, phi_group_trust_radius=0.1, phi_chart_max_norm=5.0,
-                                   phi_bch_residual_max=1e-6, weight_decay=0.0)
+                                   weight_decay=0.0)
     before = phi.detach().clone()
     phi.grad = torch.randn_like(phi)
     optimizer._collect_gauge_diag = True

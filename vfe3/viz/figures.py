@@ -580,16 +580,6 @@ class UMAPWorker:
         self.cleanup_statuses: List[Dict[str, object]] = []
         self._workdir = None
 
-    @property
-    def _procs(self) -> List[object]:
-        with self._lifecycle_lock:
-            return [record.process for record in self._workers]
-
-    @property
-    def _stderr_handles(self) -> List[object]:
-        with self._lifecycle_lock:
-            return [record.stderr_handle for record in self._workers]
-
     def _record_cleanup_failure(self, *, reason: str, path: str, exc: BaseException) -> dict:
         status: Dict[str, object] = {
             "pid": None,
@@ -5721,7 +5711,7 @@ def pub_label(
 
 @register_figure("ppl_noise_band")
 def plot_ppl_noise_band(
-    agg,                                 # aggregate_seed_metric output: {values, seeds, mean, sd}
+    agg,                                 # aggregate_scalar output: {values, seeds, mean, sd}
 
     *,
     label: str  = "K=20 baseline",

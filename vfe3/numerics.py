@@ -1,12 +1,8 @@
-r"""Numerical conditioning fallbacks + runtime monitors for VFE_3.0.
+r"""Numerical conditioning fallbacks + health probes for VFE_3.0.
 
-Two concerns, both modular (registry-backed):
-  CONDITIONING FALLBACKS keep the SPD-manifold math finite under ill-conditioning:
-    safe_spd_inverse (escalating-jitter Cholesky -> pinv), floor_eigenvalues,
-    condition_number.
-  RUNTIME MONITORS report numerical health during a run (nan/inf fraction, condition
-    number, ...) as plain scalars, via a register_monitor registry so a new probe slots
-    in without editing call sites. ``run_monitors`` emits a CSV/JSON-friendly record.
+CONDITIONING FALLBACKS keep the SPD-manifold math finite under ill-conditioning
+(guarded Cholesky factorizations and solves, chunked eigensolvers, the mean trust region);
+``nan_inf_fraction`` reports numerical health as a plain scalar.
 
 A theoretically pure path is always available (the unregularized op); the fallbacks are
 guards that activate only when the pure path fails, and they are documented as such.
@@ -16,7 +12,7 @@ import contextlib
 import math
 import weakref
 from collections import OrderedDict
-from typing import Callable, Dict, List, Literal, NamedTuple, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -371,44 +367,6 @@ def safe_cholesky(
     return L, ok
 
 
-def safe_spd_inverse(
-    matrix:    torch.Tensor,             # (..., K, K) symmetric ~PD
-
-    *,
-    eps:       float = 1e-6,
-    max_tries: int   = 5,
-) -> torch.Tensor:                       # (..., K, K) inverse
-    r"""SPD inverse via Cholesky with escalating jitter, falling back to the pseudo-inverse.
-
-    Per element (via ``cholesky_ex``, which never raises): tries ``cholesky_inverse`` on
-    ``M + (eps * 10^t) I`` for t = 0..max_tries-1, escalating the ridge ONLY on the elements that
-    still fail; an element where every jitter level fails falls back to ``pinv``. The per-element
-    retry mirrors ``safe_cholesky`` so one non-PD batch element cannot poison the exact inverse of
-    its well-conditioned siblings. The pure path is ``t=0`` with the documented default ridge.
-    """
-    # float64 stays float64 (audit 2026-07-12 N4/N12 dtype policy); half promotes to fp32.
-    compute_dtype = torch.float64 if matrix.dtype == torch.float64 else torch.float32
-    M = _symmetrize(matrix.to(compute_dtype))
-    K = M.shape[-1]
-    eye = torch.eye(K, device=M.device, dtype=M.dtype)
-    L, ok = safe_cholesky(M + eps * eye)                    # round 0: documented eps ridge
-    if bool(ok.all()):
-        return torch.cholesky_inverse(L).to(matrix.dtype)
-    out = torch.cholesky_inverse(L)                          # ok elements keep their good inverse
-    for t in range(1, max_tries):                            # retry ONLY the still-failed elements
-        if bool(ok.all()):
-            break
-        L_t, ok_t = safe_cholesky(M + (eps * (10.0 ** t)) * eye)
-        newly = (~ok) & ok_t
-        if bool(newly.any()):
-            inv_t = torch.cholesky_inverse(L_t)
-            out = torch.where(newly.unsqueeze(-1).unsqueeze(-1), inv_t, out)
-            ok = ok | ok_t
-    if not bool(ok.all()):                                   # pinv ONLY the still-failed elements
-        out = torch.where(ok.unsqueeze(-1).unsqueeze(-1), out, torch.linalg.pinv(M))
-    return out.to(matrix.dtype)
-
-
 # cuSOLVER's batched symmetric eigensolver -- the routine torch dispatches to for n <= 32 -- rejects
 # the CALL past a fixed batch count, with CUSOLVER_STATUS_INVALID_VALUE out of
 # cusolverDnXsyevBatched_bufferSize. Measured last-OK / first-FAIL, IDENTICAL in float32 and float64
@@ -746,68 +704,6 @@ def triangular_condition_estimate(
         return norm * estimate
 
 
-def floor_eigenvalues(
-    matrix: torch.Tensor,                # (..., K, K) symmetric
-    *,
-    floor:  float = 1e-6,
-) -> torch.Tensor:                       # (..., K, K) SPD with eigenvalues >= floor
-    r"""Project a symmetric matrix to SPD by clamping its eigenvalues up to ``floor``.
-
-    float64 stays float64 (the module dtype policy); every other dtype computes in float32.
-    """
-    compute_dtype = torch.float64 if matrix.dtype == torch.float64 else torch.float32
-    M = _symmetrize(matrix.to(compute_dtype))
-    evals, evecs = safe_eigh(M)
-    evals = evals.clamp(min=floor)
-    out = (evecs * evals.unsqueeze(-2)) @ evecs.transpose(-1, -2)
-    return _symmetrize(out).to(matrix.dtype)
-
-
-def condition_number(
-    matrix: torch.Tensor,                # (..., K, K) symmetric PD OR (..., K) diagonal variances
-
-    *,
-    eps:    float                               = 1e-12,
-    kind:   Literal["auto", "full", "diagonal"] = "auto",
-) -> torch.Tensor:                       # (...) lambda_max / lambda_min
-    r"""Spectral condition number lambda_max / lambda_min (clamped at ``eps``).
-
-    ``kind='diagonal'`` always treats the last axis as a variance spectrum, including a square
-    ``(N, K)`` table with ``N == K``. ``kind='full'`` requires square trailing dimensions and uses
-    ``eigvalsh``. ``kind='auto'`` preserves the legacy shape inference: square trailing dimensions
-    select the full-matrix path and every other non-scalar shape selects the diagonal path.
-    """
-    if kind not in ("auto", "full", "diagonal"):
-        raise ValueError(
-            f"condition_number kind must be 'auto', 'full', or 'diagonal', got {kind!r}")
-
-    square = matrix.dim() >= 2 and matrix.shape[-1] == matrix.shape[-2]
-    if kind == "full" and not square:
-        raise ValueError(
-            "condition_number kind='full' requires square trailing dimensions (..., K, K), "
-            f"got shape {tuple(matrix.shape)}")
-    full = kind == "full" or (kind == "auto" and square)
-    # float64 stays float64 (the module dtype policy); every other dtype computes in float32.
-    compute_dtype = torch.float64 if matrix.dtype == torch.float64 else torch.float32
-    if not full:
-        if matrix.dim() == 0:
-            raise ValueError("condition_number diagonal input must have at least one dimension")
-        spec = matrix.to(compute_dtype)
-        lam_min = spec.min(dim=-1).values
-        cond = spec.max(dim=-1).values / lam_min.clamp(min=eps)
-        # non-positive variance -> no condition number; surface +inf, mirroring the full-matrix branch
-        # (audit 2026-06-17 round 2 id1), not a large positive value from clamping a zero/negative up to eps.
-        return torch.where(lam_min > 0, cond, cond.new_tensor(float("inf"))).to(matrix.dtype)
-    evals = safe_eigvalsh(_symmetrize(matrix.to(compute_dtype)))
-    lam_min = evals[..., 0]
-    cond = evals[..., -1] / lam_min.clamp(min=eps)
-    # A non-PD matrix (lambda_min <= 0) has no condition number; surface +inf rather than the large
-    # positive value clamping a negative lambda_min up to eps would give (which reads as a merely
-    # ill-conditioned SPD matrix and hides the loss of positive-definiteness). (audit 2026-06-17)
-    cond = torch.where(lam_min > 0, cond, cond.new_tensor(float("inf")))
-    return cond.to(matrix.dtype)
-
-
 def nan_inf_fraction(
     tensor: torch.Tensor,
 ) -> float:                              # fraction of non-finite entries in [0, 1]
@@ -815,81 +711,3 @@ def nan_inf_fraction(
     if tensor.numel() == 0:
         return 0.0
     return float((~torch.isfinite(tensor)).float().mean())
-
-
-def check_finite(
-    tensor: torch.Tensor,
-    name:   str = "tensor",
-
-    *,
-    raise_on_nonfinite: bool = False,
-) -> bool:                               # True if all-finite
-    r"""Report (and optionally raise on) non-finite entries; returns finiteness."""
-    frac = nan_inf_fraction(tensor)
-    if frac > 0.0:
-        msg = f"{name}: {frac:.3%} non-finite entries"
-        if raise_on_nonfinite:
-            raise FloatingPointError(msg)
-        import warnings
-        warnings.warn(msg, RuntimeWarning, stacklevel=2)
-        return False
-    return True
-
-
-# ---------------------------------------------------------------------------
-# Monitor registry: name -> (tensor -> scalar). New probes slot in by name.
-# ---------------------------------------------------------------------------
-_MONITORS: Dict[str, Callable[[torch.Tensor], float]] = {}
-
-
-def register_monitor(name: str, *, override: bool = False) -> Callable:
-    """Decorator registering a scalar numerical monitor under ``name``.
-
-    Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
-    existing name silently shadowed the first. Pass ``override=True`` to replace deliberately.
-    """
-    def _wrap(fn: Callable[[torch.Tensor], float]) -> Callable[[torch.Tensor], float]:
-        if name in _MONITORS and not override:
-            raise KeyError(f"monitor {name!r} already registered; pass override=True to replace")
-        _MONITORS[name] = fn
-        return fn
-    return _wrap
-
-
-def get_monitor(name: str) -> Callable[[torch.Tensor], float]:
-    """Return the registered monitor (KeyError if absent)."""
-    if name not in _MONITORS:
-        raise KeyError(f"no monitor {name!r}; available: {sorted(_MONITORS)}")
-    return _MONITORS[name]
-
-
-@register_monitor("nan_fraction")
-def _mon_nan(tensor: torch.Tensor) -> float:
-    """Fraction of non-finite entries."""
-    return nan_inf_fraction(tensor)
-
-
-@register_monitor("abs_max")
-def _mon_absmax(tensor: torch.Tensor) -> float:
-    """Largest absolute (finite) entry magnitude."""
-    finite = tensor[torch.isfinite(tensor)]
-    return float(finite.abs().max()) if finite.numel() else float("nan")
-
-
-@register_monitor("condition_number")
-def _mon_cond(matrix: torch.Tensor) -> float:
-    """Spectral condition number (max over any leading batch)."""
-    return float(condition_number(matrix).max())
-
-
-def run_monitors(
-    tensor:   torch.Tensor,
-    monitors: Optional[List[str]] = None,
-) -> Dict[str, float]:
-    r"""Apply the named monitors to ``tensor``; returns a CSV/JSON-friendly record.
-
-    ``monitors=None`` runs the family-agnostic probes (nan_fraction, abs_max); pass an
-    explicit list to include matrix probes (e.g. condition_number) on SPD inputs.
-    """
-    names = ["nan_fraction", "abs_max"] if monitors is None else monitors
-    return {n: get_monitor(n)(tensor) for n in names}

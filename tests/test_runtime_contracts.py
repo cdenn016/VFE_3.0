@@ -119,13 +119,6 @@ def test_repaired_cholesky_has_finite_correct_derivative() -> None:
     torch.testing.assert_close(derivative, torch.eye(2, dtype=M.dtype), rtol=1e-8, atol=1e-8)
 
 
-def test_spd_inverse_reaches_fallback_without_inverting_failed_factor() -> None:
-    from vfe3.numerics import safe_spd_inverse
-    M = torch.diag(torch.tensor([1., -1e-6], dtype=torch.float64))
-    expected = torch.linalg.inv(M + 1e-5 * torch.eye(2, dtype=M.dtype))
-    torch.testing.assert_close(safe_spd_inverse(M), expected)
-
-
 def test_cholesky_recovery_directional_derivative_matches_finite_difference() -> None:
     from vfe3.numerics import safe_cholesky
     M = torch.diag(torch.tensor([1., 0.], dtype=torch.float64)).requires_grad_()

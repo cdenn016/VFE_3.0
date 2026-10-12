@@ -213,16 +213,6 @@ class WordVocabulary:
         r"""Render ids as space-joined words, ``<unk>`` included as its literal marker."""
         return " ".join(self.words[int(i)] for i in ids)
 
-    def row_token_counts(self, rows: Iterable[str]) -> Tuple[int, int]:
-        r"""Token and OOV counts over ``rows`` under this vocabulary, for build-time reporting."""
-        n_tokens = 0
-        n_oov = 0
-        for row in rows:
-            tokens = tokenize_row(row, eos=self.eos)
-            n_tokens += len(tokens)
-            n_oov += sum(1 for word in tokens if word not in self._ids)
-        return n_tokens, n_oov
-
     def save(self, path: Path) -> None:
         """Write the vocabulary as JSON, with the schema and cutoff it was built at.
 

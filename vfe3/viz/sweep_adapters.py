@@ -303,8 +303,7 @@ def ablation_forest_kwargs(
 
     The named baseline arm must exist and load; every arm must be aligned (same token length) with
     it; each arm's delta / lo / hi is the paired SEQUENCE-cluster bootstrap band (``seed=0``, whole
-    evaluation windows of the baseline cell's ``max_seq_len`` tokens resampled, as
-    ``bootstrap_ce_band`` does) converted from nats to BITS per token (divided by ``ln 2``). Tokens
+    evaluation windows of the baseline cell's ``max_seq_len`` tokens resampled) converted from nats to BITS per token (divided by ``ln 2``). Tokens
     of one window share context, so a token-iid resample would undercover. ``n_seeds`` counts the
     distinct training seeds among the admitted cells, which sets the single-seed caption. A missing
     baseline, a missing window length, a shape mismatch, or a token file whose identity no longer

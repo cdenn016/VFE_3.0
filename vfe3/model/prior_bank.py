@@ -127,22 +127,6 @@ def packed_cholesky_covariance(
     return factor @ factor.transpose(-1, -2) + eps * eye
 
 
-def set_decode_av_precision(precision: str) -> str:
-    r"""Set the process-wide decode ``a_v`` working precision; returns the previous value."""
-    global _DECODE_AV_PRECISION
-    if precision not in _DECODE_AV_PRECISIONS:
-        raise ValueError(
-            f"decode_av_precision must be one of {_DECODE_AV_PRECISIONS}, got {precision!r}")
-    previous = _DECODE_AV_PRECISION
-    _DECODE_AV_PRECISION = precision
-    return previous
-
-
-def decode_av_precision() -> str:
-    r"""Return the active decode ``a_v`` working precision."""
-    return _DECODE_AV_PRECISION
-
-
 DECODE_CE_CHECKPOINT_AUTO_BYTES: int = 2 * 1024 ** 3   # 2 GiB; see decode_ce_checkpoint in config.py
 
 def _decode_ce_chunk_summaries(

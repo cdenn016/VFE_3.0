@@ -219,7 +219,7 @@ def test_head_block_norms_energy_shares_and_own_block_range(tmp_path):
 
 
 def test_head_block_norms_from_model_state_through_posthoc_maps(tmp_path):
-    maps = pytest.importorskip("vfe3.posthoc.maps")
+    import vfe3.posthoc.maps as maps
     model = _projected_model()
     state = {k: v for k, v in model.state_dict().items() if k.startswith("relational_operators")}
     norms = maps.head_block_norms(state, model.cfg)

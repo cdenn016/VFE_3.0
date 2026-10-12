@@ -58,6 +58,9 @@ _UGROUP_STRIP_MARGIN = 0.25
 # form amplifies relative covector noise by about kappa(U_h) (review 2026-09-28).
 _UGROUP_FAST_FRAME_COND_MAX = 1e3
 _UGROUP_RETRACTIONS = ("chart", "group_log")
+# Relative group-product residual gate of the staged phi retractions (``bch_residual_max`` in
+# configs before 2026-10-12, hardcoded then).
+_GROUP_PRODUCT_RESIDUAL_MAX = 1e-6
 # Optimizer diagnostics added only when the group_log retraction is active (fixed order).
 GROUP_LOG_DIAGNOSTIC_KEYS = (
     "phi_group_fast_rows",
@@ -333,10 +336,9 @@ def _validated_staging_scalars(
     learning_rate:    float,
     trust_radius:     float,
     chart_max_norm:   float,
-    bch_residual_max: float,
     max_backtracks:   int,
-) -> Tuple[float, float, float, float]:
-    r"""Validate staging inputs; return ``(learning_rate, trust_radius, chart_max_norm, bch_residual_max)``."""
+) -> Tuple[float, float, float]:
+    r"""Validate staging inputs; return ``(learning_rate, trust_radius, chart_max_norm)``."""
     if not isinstance(group, GaugeGroup):
         raise TypeError(f"group must be a GaugeGroup, got {type(group).__name__}")
     if grad_phi.ndim != 2 or phi.ndim != 2 or grad_phi.shape != phi.shape:
@@ -360,14 +362,13 @@ def _validated_staging_scalars(
         )
     trust_radius = _require_positive_finite(trust_radius, "trust_radius")
     chart_max_norm = _require_positive_finite(chart_max_norm, "chart_max_norm")
-    bch_residual_max = _require_positive_finite(bch_residual_max, "bch_residual_max")
     if type(max_backtracks) is not int or max_backtracks < 0:
         raise ValueError(
             f"max_backtracks must be a nonnegative int, got {max_backtracks!r}"
         )
     if grad_phi.shape[0] == 0:
         raise ValueError("pullback group staging requires at least one active row")
-    return learning_rate, trust_radius, chart_max_norm, bch_residual_max
+    return learning_rate, trust_radius, chart_max_norm
 
 
 @torch.no_grad()
@@ -380,7 +381,6 @@ def stage_pullback_group_candidate(
     learning_rate:    float,
     trust_radius:     float,
     chart_max_norm:   float,
-    bch_residual_max: float,
     max_backtracks:   int = 10,
     differential_mode: Optional[str] = None,
     direction_fn:     Optional[Callable[[torch.Tensor, torch.Tensor],
@@ -395,8 +395,7 @@ def stage_pullback_group_candidate(
     the supplied direction when ``direction_fn`` is given.
     Trust scaling uses ``xi = Psi_L(ad_phi) v_phi``. Backtracking bounds the difference
     from ``exp(phi) exp(-eta xi)``; this is a chart retraction, not exact group
-    multiplication. The legacy ``bch_residual_max`` keyword retains that product
-    tolerance. Certification uses values rounded to the input chart's storage dtype.
+    multiplication; ``_GROUP_PRODUCT_RESIDUAL_MAX`` is that product tolerance. Certification uses values rounded to the input chart's storage dtype.
 
     Per-row rejection (audit 2026-09-23 #10): a row whose pullback metric fails the direction
     solver's conditioning certificate (undamped-eigenvalue floor or ``1e6`` damped condition)
@@ -408,12 +407,11 @@ def stage_pullback_group_candidate(
     fisher_group chart route's off-strip rows), which keep their current chart and are counted in
     ``rejected_rows``.
     """
-    learning_rate, trust_radius, chart_max_norm, bch_residual_max = _validated_staging_scalars(
+    learning_rate, trust_radius, chart_max_norm = _validated_staging_scalars(
         grad_phi, phi, group,
         learning_rate=learning_rate,
         trust_radius=trust_radius,
         chart_max_norm=chart_max_norm,
-        bch_residual_max=bch_residual_max,
         max_backtracks=max_backtracks,
     )
 
@@ -477,7 +475,7 @@ def stage_pullback_group_candidate(
             dtype=torch.long,
             device=grad64.device,
         )
-        residual_limit = min(1e-6, bch_residual_max)
+        residual_limit = _GROUP_PRODUCT_RESIDUAL_MAX
         current_element = direction.current_element
         if current_element is None:
             current_element = _pullback_group_current_element(phi64, group)
@@ -861,7 +859,6 @@ def stage_group_log_candidate(
     learning_rate:    float,
     trust_radius:     float,
     chart_max_norm:   float,
-    bch_residual_max: float,
     max_backtracks:   int  = 10,
     collect:          bool = False,
 ) -> PullbackGroupCandidate:
@@ -873,7 +870,7 @@ def stage_group_log_candidate(
     right product :math:`U e^{Z}`, rounded to the chart's storage dtype before any gate. A nonfinite
     ``xi`` or covector on a row the direction accepted raises. Gates: log
     failure, nonfinite candidate, product residual
-    :math:`\|e^{\varphi_{\rm new}} - U e^Z\|_F / \|U e^Z\|_F > \min(10^{-6}, \mathrm{bch\_residual\_max})`,
+    :math:`\|e^{\varphi_{\rm new}} - U e^Z\|_F / \|U e^Z\|_F > 10^{-6}`,
     positive first-order slope :math:`\langle \bar G, e^{\varphi_{\rm new}} - U \rangle_F > 0`, and
     the chart bound. A failing row halves its scale; there is no halving for retraction truncation,
     since the product is exact up to the log's accuracy. A row still failing after
@@ -884,12 +881,11 @@ def stage_group_log_candidate(
     commit path is shared. ``direction.current_element`` is ``(A, H, d, d)``, or ``(A, K, K)`` when
     ``H = 1``, matching :func:`_pullback_group_current_element`.
     """
-    learning_rate, trust_radius, chart_max_norm, bch_residual_max = _validated_staging_scalars(
+    learning_rate, trust_radius, chart_max_norm = _validated_staging_scalars(
         grad_phi, phi, group,
         learning_rate=learning_rate,
         trust_radius=trust_radius,
         chart_max_norm=chart_max_norm,
-        bch_residual_max=bch_residual_max,
         max_backtracks=max_backtracks,
     )
     n_blocks, block_dim = group_log_block_shape(group)
@@ -921,7 +917,7 @@ def stage_group_log_candidate(
         trust_scale = (trust_radius / right_norm.clamp_min(tiny)).clamp(max=1.0)   # (A,)
         factor_scale = trust_scale.clone()
         reductions = torch.zeros(rows, dtype=torch.long, device=phi64.device)
-        residual_limit = min(1e-6, bch_residual_max)
+        residual_limit = _GROUP_PRODUCT_RESIDUAL_MAX
         # Rejected and unresolved rows keep the current chart exactly.
         candidate_phi = phi64.clone()
         candidate_chart_norm = embedded_phi_frobenius_norm(phi64, group, warn_fallback=False)
@@ -1366,7 +1362,6 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
         *,
         phi_group_trust_radius: float,
         phi_chart_max_norm:     float,
-        phi_bch_residual_max:   float,
         phi_group_retraction:   str = "chart",
         phi_statistics_provider:    Optional[PhiStatisticsProvider] = None,
         phi_fisher_rotation_weight: float = 2.0,
@@ -1393,16 +1388,11 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
             phi_chart_max_norm,
             "phi_chart_max_norm",
         )
-        phi_bch_residual_max = _require_positive_finite(
-            phi_bch_residual_max,
-            "phi_bch_residual_max",
-        )
         super().__init__(params, **kwargs)
         self._group                  = group
         self._phi_group_differential_mode = phi_group_differential_mode()
         self._phi_group_trust_radius = phi_group_trust_radius
         self._phi_chart_max_norm     = phi_chart_max_norm
-        self._phi_bch_residual_max   = phi_bch_residual_max
         self._phi_group_retraction   = phi_group_retraction
         self.phi_statistics_provider = phi_statistics_provider
         self._phi_fisher_rotation_weight = phi_fisher_rotation_weight
@@ -1577,7 +1567,6 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                         learning_rate=phi_group["lr"],
                         trust_radius=self._phi_group_trust_radius,
                         chart_max_norm=self._phi_chart_max_norm,
-                        bch_residual_max=self._phi_bch_residual_max,
                         collect=collect,
                     )
                 else:
@@ -1588,7 +1577,6 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                         learning_rate=phi_group["lr"],
                         trust_radius=self._phi_group_trust_radius,
                         chart_max_norm=self._phi_chart_max_norm,
-                        bch_residual_max=self._phi_bch_residual_max,
                         differential_mode=self._phi_group_differential_mode,
                         direction_fn=None if fisher is None else functools.partial(
                             _fisher_chart_direction,

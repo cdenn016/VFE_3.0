@@ -64,13 +64,10 @@ from vfe3.model.prior_bank import (
 )
 from vfe3.model.stack import vfe_stack
 from vfe3.families.base import get_family as _get_family
-from vfe3.numerics import FACTOR_CONDITION_TOL, safe_eigvalsh
+from vfe3.numerics import safe_eigvalsh
 from vfe3.relational_scoring import (
-    GRAM_CONDITION_TOL,
     set_projected_condition_recovery,
-    set_projected_factor_condition_tol,
     set_projected_factor_route,
-    set_projected_gram_condition_tol,
     set_projected_recovery_precision,
 )
 from vfe3.runtime import set_fp32_matmul_precision
@@ -267,8 +264,6 @@ class VFEModel(nn.Module):
         set_projected_condition_recovery(cfg.projected_factorization != "gram")
         set_projected_factor_route(
             "cholesky_qr2" if cfg.projected_factorization == "cholesky_qr2_certified" else "gram")
-        set_projected_gram_condition_tol(GRAM_CONDITION_TOL)
-        set_projected_factor_condition_tol(FACTOR_CONDITION_TOL)
         set_projected_recovery_precision("fp32")
         set_frame_pair_fp64_escalation(cfg.frame_pair_escalation_tol is not None)
         set_frame_pair_condition_tol(cfg.frame_pair_escalation_tol if cfg.frame_pair_escalation_tol is not None

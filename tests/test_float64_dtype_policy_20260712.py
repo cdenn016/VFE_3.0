@@ -17,7 +17,6 @@ import torch
 
 from vfe3.families.base import get_family
 from vfe3.geometry.retraction import natural_gradient, retract_spd_diagonal
-from vfe3.numerics import safe_spd_inverse
 
 
 def test_diagonal_spd_retraction_preserves_float64():
@@ -53,17 +52,6 @@ def test_natural_gradient_preserves_float64_diagonal_and_full():
     torch.testing.assert_close(nat_mu_f, sigma_full @ grad_mu, rtol=0.0, atol=1e-14)
     torch.testing.assert_close(nat_sigma_f, 2.0 * sigma_full @ grad_sigma_full @ sigma_full,
                                rtol=0.0, atol=1e-14)
-
-
-def test_safe_spd_inverse_preserves_float64():
-    """inv(M + eps I) on diag(3, 7): the fp64 reciprocals 1/(3+eps), 1/(7+eps) differ from the
-    fp32 ones at ~1e-8. The round-0 documented eps ridge is included in the reference."""
-    eps = 1e-6
-    m = torch.diag(torch.tensor([3.0, 7.0], dtype=torch.float64))
-    out = safe_spd_inverse(m, eps=eps)
-    expected = torch.linalg.inv(m + eps * torch.eye(2, dtype=torch.float64))
-    assert out.dtype == torch.float64
-    torch.testing.assert_close(out, expected, rtol=0.0, atol=1e-12)
 
 
 def _diag_full_gaussians(dtype):

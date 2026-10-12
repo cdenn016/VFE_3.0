@@ -92,7 +92,6 @@ def reset_gemm_fallback_slices() -> None:
 # evaluated. The Gram-route tolerance is GRAM_CONDITION_TOL (1e-4, i.e. kappa_F(G) > 838.9 in float32).
 GRAM_CONDITION_TOL: float = 1e-4
 _CONDITION_RECOVERY: bool = False
-_GRAM_CONDITION_TOL: float = GRAM_CONDITION_TOL
 
 # Working precision of a source recovery (installed by VFEModel, which fixes "fp32"). "fp64" rebuilds the flagged factors by float64 QR, promotes the factor tensor to float64
 # and routes every pair touching a recovered entry through float64 triangular-solve tiles. "fp32"
@@ -104,24 +103,9 @@ _RECOVERY_PRECISIONS = ("fp64", "fp32")
 _RECOVERY_PRECISION: str = "fp64"
 
 
-def _validated_tolerance(tol: float, name: str) -> float:
-    if (isinstance(tol, bool) or not isinstance(tol, (int, float))
-            or not math.isfinite(tol) or not 0.0 < tol < 1.0):
-        raise ValueError(f"{name} must lie in (0, 1), got {tol!r}")
-    return float(tol)
-
-
-def set_projected_gram_condition_tol(tol: float) -> float:
-    r"""Set the Gram-route certificate tolerance eps ||G||_F ||G^{-1}||_F > tol; returns the previous value."""
-    global _GRAM_CONDITION_TOL
-    previous = _GRAM_CONDITION_TOL
-    _GRAM_CONDITION_TOL = _validated_tolerance(tol, "projected Gram condition tolerance")
-    return previous
-
-
 def projected_gram_condition_tol() -> float:
-    r"""Return the Gram-route certificate tolerance (installed by VFEModel as GRAM_CONDITION_TOL)."""
-    return _GRAM_CONDITION_TOL
+    r"""Return the Gram-route certificate tolerance GRAM_CONDITION_TOL."""
+    return GRAM_CONDITION_TOL
 
 
 def set_projected_recovery_precision(precision: str) -> str:
@@ -160,10 +144,9 @@ def projected_condition_recovery() -> bool:
 # optimization_plan.md WS1/WS2). "gram" factors the rounded Gram G = fl(X X^T), whose factor carries
 # whitened error O(eps kappa(X)^2). "cholesky_qr2" factors the source root X = S U^{-1} Sigma^{1/2}
 # by CholeskyQR2: the same Gaussian, whitened error O(eps kappa(X)). Its recovery certificate is
-# eps kappa_1(C) > _FACTOR_CONDITION_TOL on the factor itself (see _factor_status).
+# eps kappa_1(C) > FACTOR_CONDITION_TOL on the factor itself (see _factor_status).
 _FACTOR_ROUTES = ("gram", "cholesky_qr2")
 _FACTOR_ROUTE: str = "gram"
-_FACTOR_CONDITION_TOL: float = FACTOR_CONDITION_TOL
 
 
 def set_projected_factor_route(route: str) -> str:
@@ -179,18 +162,6 @@ def set_projected_factor_route(route: str) -> str:
 def projected_factor_route() -> str:
     r"""Return the active projected Gaussian-KL factor route."""
     return _FACTOR_ROUTE
-
-
-def set_projected_factor_condition_tol(tol: float) -> float:
-    r"""Set the factor-route certificate tolerance eps kappa_1-estimate(C) > tol; returns the previous value.
-
-    Writes this module's ``_FACTOR_CONDITION_TOL``, the value the factor route reads at call time
-    (``numerics.FACTOR_CONDITION_TOL`` is only its import-time default).
-    """
-    global _FACTOR_CONDITION_TOL
-    previous = _FACTOR_CONDITION_TOL
-    _FACTOR_CONDITION_TOL = _validated_tolerance(tol, "projected factor condition tolerance")
-    return previous
 
 
 def _compute_dtype(*tensors: torch.Tensor) -> torch.dtype:
@@ -575,7 +546,7 @@ def _cholesky_status(
     ``factor`` is the ``(chol, failed, P)`` of G from :class:`_GramPrecision`: the factorization is then
     not repeated, and the certificate reads that ``P``, bitwise the inverse it would otherwise form.
 
-    ``tol`` is ``projected_gram_condition_tol`` (``_GRAM_CONDITION_TOL``, default 1e-4).
+    ``tol`` is ``GRAM_CONDITION_TOL`` (1e-4).
 
     The certificate is evaluated EXACTLY for every successfully factored float32 entry from its
     own factor (``cholesky_inverse``), so ``screen`` marks exactly the ill-conditioned entries and
@@ -604,7 +575,7 @@ def _cholesky_status(
                 inverse = torch.cholesky_inverse(torch.where(failed[..., None, None], eye, chol))
             inverse_norm = inverse.norm(dim=(-2, -1))
             certificate = (torch.finfo(G.dtype).eps * G.norm(dim=(-2, -1)) * inverse_norm
-                           > _GRAM_CONDITION_TOL)
+                           > GRAM_CONDITION_TOL)
             screen = (~failed) & certificate
         status = torch.stack((torch.isfinite(G).all(), _symmetry_status(G, symmetric),
                               (failed | screen).any(), failed.any()))
@@ -721,7 +692,7 @@ def _factor_status(
         screen = torch.zeros_like(failed)
         if G.dtype == torch.float32 and G.shape[-1] > 1 and _CONDITION_RECOVERY:
             estimate = triangular_condition_estimate(chol)
-            screen = (~failed) & (torch.finfo(G.dtype).eps * estimate > _FACTOR_CONDITION_TOL)
+            screen = (~failed) & (torch.finfo(G.dtype).eps * estimate > FACTOR_CONDITION_TOL)
         status = torch.stack((torch.isfinite(G).all(), _symmetry_status(G, symmetric),
                               (failed | screen).any(), failed.any()))
     return chol, failed, screen, status
@@ -920,7 +891,7 @@ def _strict_cholesky(
                     # A retried factor must pass the same certificate as a first-pass one.
                     with torch.no_grad():
                         accepted &= ~(torch.finfo(G.dtype).eps * triangular_condition_estimate(shifted)
-                                      > _FACTOR_CONDITION_TOL)
+                                      > FACTOR_CONDITION_TOL)
                 recovered = torch.where(accepted[..., None, None], shifted.to(root.dtype),
                                         torch.zeros((), dtype=root.dtype, device=root.device))
                 qr_rows = ~accepted

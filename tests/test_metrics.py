@@ -11,28 +11,20 @@ from vfe3.metrics import (
     attention_entropy,
     attention_entropy_rows,
     belief_spectrum,
-    bootstrap_ce_band,
     bootstrap_token_ce_band,
     causal_sanity,
-    compute_metrics,
     curvature_field,
     effective_rank,
     effective_rank_per_token,
-    energy_directedness,
     estep_residuals,
     fisher_trace,
-    free_energy_full_decomposition,
     free_energy_terms,
-    gauge_trace_spread,
     group_gauge_invariant,
     guard_saturation,
     head_redundancy_js,
-    holonomy_deviation,
     holonomy_deviation_sampled,
-    holonomy_wilson_sampled,
     per_head_gauge_invariants,
     positional_content_score,
-    self_coupling_profile,
     spearman_rho,
     spd_geodesic_distance,
     structured_head_scores,
@@ -55,40 +47,6 @@ def test_attention_entropy_uniform_and_onehot():
     assert float(attention_entropy(onehot)) < 1e-5
 
 
-def test_free_energy_terms_is_registered_metric():
-    """free_energy_terms is selectable through the metrics registry (compute_metrics), not only
-    as a bare function."""
-    N = 4
-    self_div = torch.rand(N)
-    energy = torch.rand(N, N)
-    beta = torch.softmax(-energy, dim=-1)
-    alpha = torch.ones(N)
-    out = compute_metrics(["free_energy_terms"], self_div=self_div, energy=energy,
-                          beta=beta, alpha=alpha, tau=1.0)
-    assert "free_energy_terms" in out and "total" in out["free_energy_terms"]
-
-
-def test_holonomy_deviation_zero_for_flat_cocycle():
-    grp = get_group("block_glk")(3, 1)
-    phi = 0.2 * torch.randn(1, 4, grp.generators.shape[0])
-    omega = compute_transport_operators(phi, grp)["Omega"][0]      # (4,4,3,3) flat cocycle
-    assert float(holonomy_deviation(omega)) < 1e-4                 # every triangle closes (H=I)
-
-
-def test_holonomy_deviation_positive_for_non_cocycle():
-    g = torch.Generator().manual_seed(0)
-    N, K = 4, 3
-    omega = torch.eye(K).expand(N, N, K, K) + 0.3 * torch.randn(N, N, K, K, generator=g)
-    assert float(holonomy_deviation(omega)) > 1e-2                 # random transport does not close
-
-
-def test_gauge_trace_spread_zero_at_phi_zero():
-    grp = get_group("block_glk")(3, 1)
-    G = grp.generators
-    assert float(gauge_trace_spread(torch.zeros(5, G.shape[0]), G)) < 1e-7
-    assert float(gauge_trace_spread(torch.randn(5, G.shape[0]), G)) > 0.0
-
-
 def test_free_energy_terms_decomposition():
     N = 3
     self_div = torch.zeros(N)                                      # q == p -> self term 0
@@ -98,23 +56,6 @@ def test_free_energy_terms_decomposition():
     terms = free_energy_terms(self_div, energy, beta, alpha, tau=1.0)
     assert abs(terms["self_coupling"]) < 1e-6
     assert abs(terms["total"] - (terms["self_coupling"] + terms["belief_coupling"] + terms["attention_entropy"])) < 1e-5
-
-
-def test_compute_metrics_registry_record():
-    grp = get_group("block_glk")(3, 1)
-    phi = 0.1 * torch.randn(1, 4, grp.generators.shape[0])
-    omega = compute_transport_operators(phi, grp)["Omega"][0]
-    rec = compute_metrics(
-        ["effective_rank", "attention_entropy", "holonomy_deviation", "gauge_trace_spread"],
-        sigma=torch.rand(4, 3) + 0.5,
-        diagonal=True,                                                # effective_rank REQUIRES the flag (PB-07)
-        beta=torch.softmax(torch.randn(4, 4), dim=-1),
-        omega=omega,
-        phi=phi[0],
-        generators=grp.generators,
-    )
-    assert set(rec) == {"effective_rank", "attention_entropy", "holonomy_deviation", "gauge_trace_spread"}
-    assert all(isinstance(v, float) for v in rec.values())
 
 
 # --- publication-figure metrics --------------------------------------------
@@ -303,14 +244,6 @@ def test_transport_asymmetry_zero_at_identity_positive_for_gauge():
     assert float(transport_asymmetry(omega).max()) > 1e-2         # directed transport
 
 
-def test_energy_directedness_symmetric_vs_asymmetric():
-    sym = torch.rand(5, 5); sym = sym + sym.t()
-    out = energy_directedness(sym)
-    assert float(out["abs_asymmetry"]) < 1e-6
-    asym = torch.triu(torch.rand(5, 5) + 0.5, diagonal=1)         # upper-only -> asymmetric
-    assert float(energy_directedness(asym)["abs_asymmetry"]) > 1e-2
-
-
 # --- attention structure ---------------------------------------------------
 
 def test_structured_head_scores_prev_token():
@@ -378,94 +311,7 @@ def test_compact_curvature_field_flat_backward_is_finite():
     assert torch.isfinite(inv_blocks.grad).all()
 
 
-def test_holonomy_wilson_flat_cocycle_is_unity():
-    # Wilson observable W/K = Re Tr(H)/K -> 1 (deviation 1 - W/K -> 0) when every triangle closes.
-    grp = get_group("block_glk")(3, 1)
-    omega = compute_transport_operators(0.2 * torch.randn(1, 8, grp.generators.shape[0]), grp)["Omega"][0]
-    out = holonomy_wilson_sampled(omega, n_triples=64, seed=0)
-    assert abs(float(out["wilson_mean"]) - 1.0) < 1e-3
-    assert float(out["deviation_mean"]) < 1e-3
-
-
-def test_holonomy_wilson_constant_rotation_matches_analytic():
-    # omega_ij = R(theta) for all distinct pairs -> H_ijk = R(theta)^3 = R(3*theta),
-    # so Re Tr(H)/K = Tr(R(3*theta))/2 = cos(3*theta) for every triple.
-    theta = 0.3
-    c, s = math.cos(theta), math.sin(theta)
-    R = torch.tensor([[c, -s], [s, c]])
-    omega = R.expand(5, 5, 2, 2).contiguous()
-    out = holonomy_wilson_sampled(omega, n_triples=32, seed=1)
-    assert abs(float(out["wilson_mean"]) - math.cos(3.0 * theta)) < 1e-4
-    assert torch.allclose(out["per_triple"], torch.full_like(out["per_triple"], math.cos(3.0 * theta)), atol=1e-4)
-
-
-def test_holonomy_wilson_per_head_decomposition_averages_to_full():
-    # Tr(H) = sum_h Tr(H^(h)) over the n_heads diagonal blocks, so the per-head normalized
-    # Wilson values (each Tr(H^(h))/d_k) average back to the full Wilson observable Tr(H)/K.
-    g = torch.Generator().manual_seed(0)
-    omega = torch.eye(4).expand(6, 6, 4, 4) + 0.3 * torch.randn(6, 6, 4, 4, generator=g)
-    out = holonomy_wilson_sampled(omega, n_heads=2, n_triples=64, seed=0)
-    assert out["per_head"].shape == (2,)
-    assert abs(float(out["per_head"].mean()) - float(out["wilson_mean"])) < 1e-5
-
-
-def test_wilson_trace_is_conjugation_invariant():
-    """C6: the Wilson deviation 1 - Re Tr(H)/K is invariant under a per-vertex NON-orthogonal
-    GL(K) conjugation Omega_ij -> g_i Omega_ij g_j^{-1} (the holonomy conjugates, H -> g_i H
-    g_i^{-1}, and Tr is a class function), while the Frobenius ||H - I||_F deviation is
-    frame-dependent and CHANGES -- the invariant/frame-dependent split the labels now assert."""
-    g_rng = torch.Generator().manual_seed(0)
-    N, K = 6, 3
-    omega = (torch.eye(K, dtype=torch.float64).expand(N, N, K, K)
-             + 0.3 * torch.randn(N, N, K, K, generator=g_rng, dtype=torch.float64))
-    # invertible, deliberately NON-orthogonal per-vertex frames g_i = I + small random
-    g_i = (torch.eye(K, dtype=torch.float64).expand(N, K, K)
-           + 0.3 * torch.randn(N, K, K, generator=g_rng, dtype=torch.float64))
-    g_inv = torch.linalg.inv(g_i)
-    omega_conj = torch.einsum("ikl,ijlm,jmn->ijkn", g_i, omega, g_inv)
-
-    wil = holonomy_wilson_sampled(omega, n_triples=64, seed=0)
-    wil_c = holonomy_wilson_sampled(omega_conj, n_triples=64, seed=0)
-    assert abs(float(wil["deviation_mean"]) - float(wil_c["deviation_mean"])) < 1e-5
-
-    fro = holonomy_deviation_sampled(omega, n_triples=64, seed=0)
-    fro_c = holonomy_deviation_sampled(omega_conj, n_triples=64, seed=0)
-    assert abs(float(fro["mean"]) - float(fro_c["mean"])) > 1e-3
-
-
-def test_holonomy_frobenius_and_wilson_both_flat_zero():
-    """C6: both the frame-dependent Frobenius deviation and the gauge-invariant Wilson deviation
-    are ~0 on the flat cocycle -- the labeling split changes reporting, not the flatness oracle."""
-    grp = get_group("block_glk")(3, 1)
-    omega = compute_transport_operators(0.2 * torch.randn(1, 8, grp.generators.shape[0]), grp)["Omega"][0]
-    assert float(holonomy_deviation_sampled(omega, n_triples=64, seed=0)["mean"]) < 1e-3
-    assert float(holonomy_wilson_sampled(omega, n_triples=64, seed=0)["deviation_mean"]) < 1e-3
-
-
-def test_holonomy_wilson_rejects_indivisible_head_count():
-    omega = torch.eye(3).expand(4, 4, 3, 3).contiguous()
-    try:
-        holonomy_wilson_sampled(omega, n_heads=2)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("expected ValueError when n_heads does not divide K")
-
-
 # --- free-energy closure / profile / residuals -----------------------------
-
-def test_free_energy_full_decomposition_closes():
-    out = free_energy_full_decomposition(2.0, 10.0, 5.0, 188.0, lambda_beta=2.0)
-    assert abs(out["total"] - (2.0 + 2.0 * 10.0 + 2.0 * 5.0 + 188.0)) < 1e-6
-    assert abs(out["belief_coupling"] - 20.0) < 1e-6                # lambda_beta scaling applied
-
-
-def test_self_coupling_profile_per_coord_sums():
-    self_div = torch.rand(5, 3)                                    # per-coordinate
-    alpha = torch.ones(5, 3)
-    prof = self_coupling_profile(self_div, alpha)
-    assert prof["self_div"].shape == (5,)
-    assert torch.allclose(prof["self_coupling_per_token"], self_div.sum(-1), atol=1e-5)
 
 
 def test_estep_residuals_zero_for_constant_trajectory():
@@ -517,24 +363,6 @@ def test_spearman_rho_non_degenerate_ordering_is_unchanged():
     x = torch.arange(5.0)
     assert abs(spearman_rho(x, 2.0 * x + 1.0) - 1.0) < 1e-12
     assert abs(spearman_rho(x, -x) + 1.0) < 1e-12
-
-
-def test_bootstrap_ce_band_brackets_point():
-    nats = torch.rand(40) * 5.0 + 1.0
-    toks = torch.full((40,), 10.0)
-    band = bootstrap_ce_band(nats, toks, n_boot=500, seed=0)
-    assert band["lo"] <= band["ce"] <= band["hi"]
-
-
-def test_bootstrap_ce_band_returns_nan_for_zero_total_tokens():
-    band = bootstrap_ce_band(
-        torch.tensor([2.0, 3.0, 4.0]),
-        torch.zeros(3),
-        n_boot=20,
-        seed=0,
-    )
-
-    assert all(math.isnan(band[key]) for key in ("ce", "lo", "hi"))
 
 
 def test_bootstrap_token_ce_band_paired_zero_when_equal():

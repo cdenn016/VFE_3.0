@@ -144,7 +144,7 @@ def _calibration_run(root: Path, cfg: Any, width: int, *, device_name: Optional[
 
 
 def test_train_baseline_compute_match_validates_config_and_device(tmp_path: Path) -> None:
-    pytest.importorskip("vfe3.baseline")
+    import vfe3.baseline  # noqa: F401
     import train_baseline as tb
     from vfe3.baseline import BaselineConfig, calibration_mismatch
 
@@ -174,7 +174,7 @@ def test_train_baseline_compute_match_validates_config_and_device(tmp_path: Path
 
 def test_compute_matched_width_rule_is_frozen_after_its_first_launch(
         tmp_path: Path, caches: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    pytest.importorskip("vfe3.baseline")
+    import vfe3.baseline  # noqa: F401
     import train_baseline as tb
 
     def refuse(*args: Any, **kwargs: Any) -> None:

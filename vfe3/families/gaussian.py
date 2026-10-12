@@ -262,14 +262,6 @@ class DiagonalGaussian(BeliefParams):
         return dispersion.clamp(min=eps).sqrt()
 
     @classmethod
-    def mix_dispersion(
-        cls,
-        dispersion: torch.Tensor,                    # (..., n, d) independent variances
-        mixing:    torch.Tensor,                     # (m, n) component mixer
-    ) -> torch.Tensor:
-        return torch.einsum("mn,...nd->...md", mixing.square(), dispersion)
-
-    @classmethod
     def diagnostic_labels(cls) -> dict[str, str]:
         return {
             "dispersion":             "Gaussian variance",
@@ -557,14 +549,6 @@ class FullGaussian(BeliefParams):
     ) -> torch.Tensor:
         factor, _ = safe_cholesky(dispersion, eps=eps, rounds=0)
         return factor
-
-    @classmethod
-    def mix_dispersion(
-        cls,
-        dispersion: torch.Tensor,                    # (..., K, K) covariance
-        mixing:    torch.Tensor,                     # (K, K) dense linear map
-    ) -> torch.Tensor:
-        return mixing @ dispersion @ mixing.transpose(-1, -2)
 
     @classmethod
     def diagnostic_labels(cls) -> dict[str, str]:

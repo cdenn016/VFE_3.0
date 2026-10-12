@@ -186,29 +186,6 @@ def _as_finite_float(v: Any) -> Optional[float]:
     return f if math.isfinite(f) else None
 
 
-def aggregate_seed_metric(
-    run_root:  Any,
-    key:       str = "test_ppl",
-
-    *,
-    filename:  str = "summary.json",
-    seed_file: str = "config.json",
-) -> Dict[str, Any]:
-    r"""Scan ``run_root`` for per-seed ``filename``, gather ``key``, return the across-seed summary.
-
-    Returns ``{n, mean, sd, noise_floor, cv, values, seeds}`` with the UNBIASED (ddof=1) SD and the
-    :func:`single_seed_noise_floor`; ``sd``/``noise_floor``/``cv`` are NaN for n<2. ``seeds`` reads :func:`_seed_for` (provenance.json -> config.json -> dir name).
-    Non-finite or unreadable points are skipped (never crash the aggregation).
-    """
-    root = Path(run_root)
-    return _aggregate_requested_metric(
-        root,
-        key,
-        sources=(filename,),
-        seed_file=seed_file,
-    )
-
-
 def single_seed_noise_floor(sd: float, n_sd_seeds: int) -> float:
     r"""Half-width of the 95% band for the difference of two single-seed runs.
 
@@ -501,11 +478,6 @@ def _request_manifest(root: Path, observed: List[int]) -> Dict[str, Any]:
     }
 
 
-def _requested_seeds(root: Path, observed: List[int]) -> tuple[List[int], bool]:
-    manifest = _request_manifest(root, observed)
-    return manifest["requested_seeds"], manifest["request_verified"]
-
-
 _CODE_IDENTITY_KEYS = ("git_sha", "git_dirty", "git_dirty_fingerprint")
 # The data-order seed is reported through ``_data_order_status`` and the noise-band caption; it is
 # not a comparability key, so a per-seed data order (``DATA_SEED=None``, data_seed == seed) still
@@ -743,7 +715,8 @@ def aggregate_scalar(
     sources: tuple = ("summary.json", "test_results.json", "research.json"),
 ) -> Dict[str, Any]:
     r"""Across-seed summary of one (possibly dotted) scalar ``key``, searching ``sources`` in order
-    per seed dir. Same return shape as :func:`aggregate_seed_metric`. Handles ``research.json`` keys
+    per seed dir. Returns ``{n, mean, sd, noise_floor, cv, values, seeds}`` plus the seed-design and
+    per-cell records. Handles ``research.json`` keys
     (ECE, ``corpus_freq_strata_ce.rare``, ...) that never appear in ``summary.json``.
     """
     root = _resolve_run_root(run_root)

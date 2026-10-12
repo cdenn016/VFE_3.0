@@ -51,14 +51,6 @@ def ratio_minus_one_minus_log(num: torch.Tensor, den: torch.Tensor) -> torch.Ten
     return torch.where(near, small, far)
 
 
-def expm1_neg_plus(u: torch.Tensor) -> torch.Tensor:
-    r"""Cancellation-free :math:`e^{-u} - 1 + u` for :math:`u \ge 0` (series for :math:`u < 10^{-3}`)."""
-    near = u.abs() < 1e-3
-    small = torch.where(near, u, torch.zeros_like(u))
-    series = small.square() * (0.5 + small * (-1.0 / 6.0 + small * (1.0 / 24.0 - small / 120.0)))
-    return torch.where(near, series, torch.expm1(-u) + u)
-
-
 def safe_kl_clamp(
     kl:     torch.Tensor,
 
@@ -267,17 +259,6 @@ class BeliefParams(ABC):
         r"""Factor ``L`` used to whiten a mean perturbation in this family's Fisher geometry."""
         raise NotImplementedError(
             f"{cls.__name__} does not provide trust_region_scale"
-        )
-
-    @classmethod
-    def mix_dispersion(
-        cls,
-        dispersion: torch.Tensor,                    # (..., n, d) or (..., K, K) family parameter
-        mixing:    torch.Tensor,                     # (m, n) component map or (K, K) dense map
-    ) -> torch.Tensor:
-        r"""Push the stored dispersion through an independent-component linear mixer."""
-        raise NotImplementedError(
-            f"{cls.__name__} does not provide mix_dispersion"
         )
 
     @classmethod
