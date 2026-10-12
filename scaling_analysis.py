@@ -248,15 +248,17 @@ def _validated_bound_scaling_run(
         effective_config = asdict(migrated)
         # Digest the strict-JSON serialized form exactly as scaling.run_cell and
         # _cell_resume_status do; raw asdict carries kl_max=inf, which strict JSON refuses.
-        expected_config_sha256 = _canonical_json_sha256(
-            json.loads(json.dumps(serialize_config(migrated), default=str)))
+        # A cell written before a schema migration hashed the saved form of its config.json.
+        expected_config_sha256 = {
+            _canonical_json_sha256(json.loads(json.dumps(serialize_config(migrated), default=str))),
+            _canonical_json_sha256(dict(config))}
         saved_digest = cell.get(_SCALING_REUSE_DIGEST_FIELD)
     except (TypeError, ValueError):
         return reject("config could not be migrated or digested")
     if (not isinstance(saved_digest, str)
             or len(saved_digest) != 64
             or summary.get(_SCALING_SUMMARY_DIGEST_FIELD) != saved_digest
-            or cell.get("config_sha256") != expected_config_sha256):
+            or cell.get("config_sha256") not in expected_config_sha256):
         return reject("reuse digest or config_sha256 mismatch")
     scaling_point = summary.get("scaling_point")
     if not isinstance(scaling_point, Mapping):

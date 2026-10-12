@@ -136,7 +136,7 @@ def test_family_decode_matches_direct_functional_full_gaussian(alpha):
     g = torch.Generator().manual_seed(0)
     V, K, n_gen = 7, 3, 4
     pb = PriorBank(V, K, n_gen, decode_tau=1.2, family="gaussian_full",
-                   renyi_order=alpha, decode_mode="family_chunked",
+                   renyi_order=alpha, decode_mode="full_chunked",
                    diagonal_covariance=False)
     with torch.no_grad():
         pb.mu_embed.normal_(0.0, 0.6)
@@ -155,13 +155,13 @@ def test_family_decode_matches_direct_functional_full_gaussian(alpha):
 
 def test_full_family_decode_config_has_no_decode_lower_triangle_keys():
     cfg = test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                     family="gaussian_full", decode_mode="family_chunked",
+                     family="gaussian_full", decode_mode="full_chunked",
                      untie_decode_bank=True)
     model = VFEModel(cfg)
     names = {n for n, _ in model.named_parameters()}
     assert not any("sigma_lower" in n for n in names)           # decode/vocab tables stay diagonal
     assert model.prior_bank.decode_sigma_log_embed.shape == (6, 4)
-    # end-to-end: full family + family decode runs forward + backward.
+    # end-to-end: full family + full-covariance decode runs forward + backward.
     tokens = torch.randint(0, 6, (2, 5)); targets = torch.randint(0, 6, (2, 5))
     _, loss, _ = model(tokens, targets)
     assert torch.isfinite(loss)

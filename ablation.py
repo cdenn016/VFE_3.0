@@ -316,9 +316,9 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #################################
     #           Modes               #
     #################################
-    family                           = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full" | "laplace_diagonal"
+    family                           = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full"
     encode_mode                      = "per_token",   # "per_token" | "per_token_additive" (additive only when phi carries no position)
-    decode_mode                      = 'linear',  # "linear" | "diagonal_chunked" | "full_chunked" | "expected_likelihood_chunked" | "family_chunked" (the *_chunked modes decode through the prior bank)
+    decode_mode                      = 'linear',  # "linear" | "diagonal_chunked" | "full_chunked" | "expected_likelihood_chunked" (the *_chunked modes decode through the prior bank)
         
     attention_mode                   = "projected_predictive",  # "projected_predictive" | "projected_gradient"
     predictive_covariance            = 'moment_matched',  # "passthrough"| "moment_matched" (exact predictive-kernel covariance)

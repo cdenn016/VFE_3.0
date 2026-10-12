@@ -217,7 +217,7 @@ class DiagonalGaussian(BeliefParams):
     # 0.000400 as sigma fell 1e0 -> 1e-6. At the live K=210, eps=1e-6 the floor binds below
     # sigma ~ 7e-5, INSIDE the admissible [eps, sigma_max] band, so eff_rank_* reported a
     # maximally FLAT covariance as sub-rank-1 collapse -- the opposite of what it exists to
-    # detect. ``laplace_diagonal`` already opted in; these did not.
+    # detect.
     effective_rank_rescale = True
     gaussian_pointwise_algebra = True
 
@@ -488,7 +488,7 @@ class FullGaussian(BeliefParams):
     # 0.000400 as sigma fell 1e0 -> 1e-6. At the live K=210, eps=1e-6 the floor binds below
     # sigma ~ 7e-5, INSIDE the admissible [eps, sigma_max] band, so eff_rank_* reported a
     # maximally FLAT covariance as sub-rank-1 collapse -- the opposite of what it exists to
-    # detect. ``laplace_diagonal`` already opted in; these did not.
+    # detect.
     effective_rank_rescale = True
     gaussian_pointwise_algebra = True
 
@@ -867,7 +867,8 @@ class FullGaussian(BeliefParams):
             # batch_size=1 (2*64*128^2 = 2.1e6 at the live config, 71.7x over). cholesky_ex carries
             # no such ceiling (verified to 2,097,152), reproduces the spectral verdict 20000/20000 at
             # alpha in {1.5,2.0,5.0}, and costs ~K^3/3 flops against eigvalsh's ~9K^3. Measured 8.0x
-            # end-to-end on family_chunked decode, with max relative value diff 0.000e+00.
+            # end-to-end on the (since retired) family_chunked decode, with max relative value diff
+            # 0.000e+00.
             if alpha > 1.0:
                 # info == 0 IS the numerical PD predicate, and NO ridge is added here (unlike
                 # safe_cholesky above), so an indefinite blend is reported as such.

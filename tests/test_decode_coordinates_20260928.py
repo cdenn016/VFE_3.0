@@ -347,7 +347,6 @@ def test_functional_stack_is_covariant_under_block_frame_changes(decode: str) ->
           decode_mode="diagonal_chunked"), "transported"),
     (dict(pos_rotation="rope"), "pos_rotation"),
     (dict(family="gaussian_frame_diagonal", decode_mode="diagonal_chunked"), "gaussian_frame_diagonal"),
-    (dict(decode_mode="family_chunked"), "decode_mode"),
     (dict(decode_mode="expected_likelihood_chunked"), "decode_mode"),
 ])
 def test_config_fails_closed_where_the_decode_frame_is_undefined(over: Dict[str, Any], message: str) -> None:
@@ -361,7 +360,7 @@ def test_prior_bank_rejects_reference_decode_outside_its_contract() -> None:
     from vfe3.model.prior_bank import PriorBank
 
     with pytest.raises(ValueError, match="decode_coordinates"):
-        PriorBank(V, 4, 8, decode_mode="family_chunked", decode_coordinates="reference")
+        PriorBank(V, 4, 8, decode_mode="expected_likelihood_chunked", decode_coordinates="reference")
     with pytest.raises(ValueError, match="decode_coordinates"):
         PriorBank(V, 4, 8, decode_mode="linear", decode_coordinates="canonical")
 
@@ -399,8 +398,7 @@ def test_gauge_gate_admits_the_diagonal_family_and_delta_full_still_needs_full()
              decode_mode="diagonal_chunked")
     with pytest.raises(ValueError, match="retired"):
         _cfg(attention_mode="transported", attention_residual=False,
-             use_block_mlp=True, block_mlp_mode="gauge_gate", family="laplace_diagonal",
-             decode_mode="family_chunked")
+             use_block_mlp=True, block_mlp_mode="gauge_gate", decode_mode="diagonal_chunked")
 
 
 def test_family_marker_no_longer_depends_on_a_passthrough_gauge_gate() -> None:

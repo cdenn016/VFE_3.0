@@ -719,7 +719,7 @@ def _transfer_targets(
     decode_mode = getattr(getattr(model, "cfg", None), "decode_mode", None)
     if (type(model) is VFEModel and type(model.prior_bank) is PriorBank
             and decode_mode in ("linear", "diagonal_chunked", "full_chunked",
-                                "expected_likelihood_chunked", "family_chunked")
+                                "expected_likelihood_chunked")
             and get_decode_registration(decode_mode).fused_ce is getattr(
                 PriorBank, "decode_ce_linear_chunked" if decode_mode == "linear"
                 else f"decode_ce_{decode_mode}")

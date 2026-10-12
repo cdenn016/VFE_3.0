@@ -474,7 +474,7 @@ def _init_log_var(cfg: Any) -> float:
     r"""Log of the covariance diagonal the family assigns to the initial slot value ``sigma_init``.
 
     The stored slot starts at ``log(sigma_init)``; the dispersion ``sigma_init`` maps to a variance
-    through the family hook (Gaussian: itself; Laplace scale b: ``2 b^2``).
+    through the family hook (the Gaussian families: itself).
     """
     import torch
     from vfe3.families.base import get_family       # importing the package registers the families

@@ -10,7 +10,7 @@ import torch.nn.functional as F
 import vfe3.model.prior_bank as bank_module
 from vfe3.model.prior_bank import PriorBank, _decode_av, _decode_av_lhs
 
-MODES = ("diagonal_chunked", "full_chunked", "expected_likelihood_chunked", "family_chunked")
+MODES = ("diagonal_chunked", "full_chunked", "expected_likelihood_chunked")
 
 
 def _bank(mode: str, checkpoint: str = "never", precision: str = "fp32") -> PriorBank:
@@ -162,7 +162,7 @@ def test_fixed_decode_scope_releases_on_exception() -> None:
             raise RuntimeError("scope")
     assert not hasattr(pb, "_fixed_decode_bank_cache")
 
-@pytest.mark.parametrize("mode", ["full_chunked", "expected_likelihood_chunked", "family_chunked"])
+@pytest.mark.parametrize("mode", ["full_chunked", "expected_likelihood_chunked"])
 @pytest.mark.parametrize("channel", ["mu", "sigma"])
 def test_nonlinear_gradient_matches_directional_finite_difference(mode: str, channel: str) -> None:
     pb = _bank(mode, "never", "fp64").double()
@@ -186,18 +186,13 @@ def test_nonlinear_gradient_matches_directional_finite_difference(mode: str, cha
     torch.testing.assert_close(analytic, (plus - minus) / (2 * h), atol=1e-8, rtol=1e-5)
 
 
-@pytest.mark.parametrize("generic_family", [False, True])
-def test_full_covariance_invalid_and_ignored_rows_keep_original_statistics(generic_family: bool) -> None:
+def test_full_covariance_invalid_and_ignored_rows_keep_original_statistics() -> None:
     pb = _bank("full_chunked")
-    if generic_family:
-        pb.decode_mode = "family_chunked"
-        pb.renyi_order = 0.5  # exercises the functional route, without the analytic KL delegate
     mu_q, sigma_q = _query("full_chunked")
     with torch.no_grad():
         sigma_q[:, 0] = -5 * torch.eye(2)
     targets = torch.tensor([[0, -100, 6]])
-    fn = pb.decode_ce_family_chunked if generic_family else pb.decode_ce_full_chunked
-    result = fn(mu_q, sigma_q, targets, return_stats=True)
+    result = pb.decode_ce_full_chunked(mu_q, sigma_q, targets, return_stats=True)
     assert int(result.scored_tokens) == 1
     assert int(result.excluded_tokens) == 2
     result.ce.backward()

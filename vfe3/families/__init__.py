@@ -1,7 +1,7 @@
 r"""The exponential-family parameter layer for VFE_3.0.
 
-Importing this package registers the built-in concrete families (``vfe3.families.gaussian``,
-``vfe3.families.laplace``) so the family registry is populated for any consumer that does
+Importing this package registers the built-in concrete families (``vfe3.families.gaussian``)
+so the family registry is populated for any consumer that does
 ``import vfe3.families`` and then ``get_family(...)`` -- without having to import the
 concrete-family module by hand.
 """
@@ -21,7 +21,6 @@ from vfe3.families.base import (
     safe_kl_clamp,
 )
 from vfe3.families import gaussian as _gaussian  # noqa: F401  (registers the Gaussian families)
-from vfe3.families import laplace as _laplace    # noqa: F401  (registers the Laplace family)
 
 __all__ = [
     "BeliefParams",

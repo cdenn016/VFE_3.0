@@ -119,7 +119,7 @@ def test_m_decode_lr_is_refused_where_it_set_a_learned_temperature_rate() -> Non
 
 
 @pytest.mark.parametrize(("dense", "chunked"), [
-    ("diagonal", "diagonal_chunked"), ("full", "full_chunked"), ("family", "family_chunked"),
+    ("diagonal", "diagonal_chunked"), ("full", "full_chunked"), ("family", "diagonal_chunked"),
 ])
 def test_dense_decode_modes_migrate_to_their_chunked_kernels(dense: str, chunked: str) -> None:
     family = "gaussian_full" if dense == "full" else "gaussian_diagonal"

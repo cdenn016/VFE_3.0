@@ -84,7 +84,11 @@ _RETIRED_GAUGE_GROUPS      = frozenset({"glk", "tied_block_glk", "so_k", "sp", "
 _REFERENCE_DECODE_MODES    = ("linear", "diagonal_chunked", "full_chunked")
 # Retired dense decode spellings and the chunked kernels they migrate to on load (same logits; the
 # dense helpers remain private oracles in vfe3.model.prior_bank).
-_DENSE_DECODE_MIGRATIONS   = {"diagonal": "diagonal_chunked", "full": "full_chunked", "family": "family_chunked"}
+_DENSE_DECODE_MIGRATIONS   = {"diagonal": "diagonal_chunked", "full": "full_chunked"}
+# Retired generic family decode ("family" dense, "family_chunked" fused; 2026-10-12): the validator
+# admitted it only for the Gaussian families at Renyi order 1, where it scores the same -KL(q || p_v)/tau
+# as the fast kernel of the family's covariance rank (float64 loss differences of 2e-16 and 0).
+_FAMILY_DECODE_MIGRATIONS  = {"gaussian_diagonal": "diagonal_chunked", "gaussian_full": "full_chunked"}
 
 
 class _ConfigTypeError(TypeError, ValueError):
@@ -239,8 +243,7 @@ class VFE3Config:
     #   4. Belief family and table initialization
     ##################################################
 
-    # "gaussian_diagonal" | "gaussian_full" | "gaussian_block" ("laplace_diagonal" is registered but refused on both
-    # projected routes)
+    # "gaussian_diagonal" | "gaussian_full" | "gaussian_block"
     # The belief covariance structure (read diagonal_covariance, never a second flag).
     #   gaussian_block  one SPD d_head x d_head block per head, stored in the dense (K, K) layout. only:
     #                   projected_predictive, predictive_readout="kernel", equal head blocks (block_glk, block_so,
@@ -273,11 +276,10 @@ class VFE3Config:
     #   per_token_additive  control: the same phi table used additively, not as a frame (no position in phi)
     encode_mode:                      str             = "per_token"
 
-    # "linear" | "diagonal_chunked" | "full_chunked" | "family_chunked" | "expected_likelihood_chunked"
+    # "linear" | "diagonal_chunked" | "full_chunked" | "expected_likelihood_chunked"
     #   linear                       learned (V, K) readout of mu_q (+ bias); ignores sigma
     #   diagonal_chunked             -KL(q || p_v)/tau against the diagonal prior bank
     #   full_chunked                 -KL(q || p_v)/tau with a full q against the diagonal bank
-    #   family_chunked               -D(q || p_v)/tau through the configured family (any covariance rank)
     #   expected_likelihood_chunked  log N(mu_q; mu_v, Sigma_q + Sigma_v), diagonal only
     # Every prior-bank mode streams the vocabulary in chunks and never forms (B, N, V) in training.
     decode_mode:                      str             = "linear"
@@ -304,8 +306,7 @@ class VFE3Config:
     # covariance every jump of the Sigma_q the stack builds reaches the cross-entropy (2026-10-11 K=128 spikes).
     decode_covariance:                str             = "belief"
     
-    # Vocabulary entries per chunk of the fused CE kernels. The family_chunked full-covariance route
-    # narrows its slice to a fixed byte budget and treats this as an upper bound. Values are unchanged.
+    # Vocabulary entries per chunk of the fused CE kernels. Values do not depend on the width.
     decode_chunk_size:                int             = 8192
 
     # "auto" | "auto_aggregate"
@@ -330,7 +331,8 @@ class VFE3Config:
     decode_av_precision:              str             = "fp32"
 
     # "fp64" | "fp32_escalate" | "fp32_escalate_cond"
-    # family="gaussian_full" with family_chunked only: precision of the full-covariance pair KL.
+    # family="gaussian_full" with a nonzero M-step self-coupling or CG energy only: precision of the
+    # full-covariance pair KL.
     #   fp64                unconditional float64
     #   fp32_escalate       float32, recomputed in float64 when the Cholesky certificate fails
     #   fp32_escalate_cond  fp32_escalate plus a pivot-ratio conditioning trigger
@@ -1701,8 +1703,7 @@ class VFE3Config:
                 f"decode_mode={self.decode_mode!r} is rank-incompatible with family={self.family!r}: "
                 f"it scores covariance kinds {sorted(decode_registration.covariance_kinds)} but the "
                 f"family is {family_kind!r}. Pair a matching decode_mode (a full/diagonal kernel "
-                f"with a full/diagonal family, or 'family_chunked' which scores both), or "
-                f"select decode_mode='linear'."
+                f"with a full/diagonal family), or select decode_mode='linear'."
             )
         if self.decode_chunk_size < 1:
             raise ValueError(f"decode_chunk_size must be >= 1, got {self.decode_chunk_size}")
@@ -1712,14 +1713,14 @@ class VFE3Config:
         # inactive_fields(), so the default-guarded notice below covers them and untouched
         # defaults stay silent.
         # Capability validation: the fast diagonal/full kernels hardcode the Gaussian KL readout, so a
-        # family without the Gaussian POINTWISE algebra must select the family-consistent
-        # 'family_chunked' decode, which scores logits through the configured family.
+        # family without the Gaussian POINTWISE algebra needs a registered family-consistent decoder,
+        # one that scores logits through the configured family.
         if (self.decode_mode != "linear" and not _family_cls.gaussian_pointwise_algebra
                 and not decode_registration.family_consistent):
             raise ValueError(
                 f"prior-bank decode with family={self.family!r} requires a family-consistent "
-                f"decode_mode ('family_chunked'); decode_mode={self.decode_mode!r} is a fixed "
-                f"Gaussian KL kernel. Set decode_mode='family_chunked' or 'linear'.")
+                f"decode_mode; decode_mode={self.decode_mode!r} is a fixed Gaussian KL kernel. "
+                f"Set decode_mode='linear'.")
         # Full-covariance compute discarded at the decode boundary: linear decode reads out
         # logits = mu_q @ W^T and DISCARDS sigma. The E-step still evolves a (B,N,K,K) covariance (it
         # shapes the mean trajectory, so the result is correct, not wasted) but that covariance never
@@ -2110,10 +2111,7 @@ class VFE3Config:
         The same structural result drives display notices and sweep admission. Consumers
         must not infer activity from whether a warning happens to be visible.
         """
-        from vfe3.model.prior_bank import PriorBank, _DECODERS, _decode_family_chunked
-        from vfe3.divergence import get_functional, renyi
-        from vfe3.families.base import get_family
-        from vfe3.families.gaussian import FullGaussian
+        from vfe3.model.prior_bank import _DECODERS
 
         inactive: dict[str, str] = {}
 
@@ -2403,15 +2401,7 @@ class VFE3Config:
             mark(("decode_ce_checkpoint",), "the selected decoder has no checkpointed chunked CE kernel")
         if self.decode_mode != "expected_likelihood_chunked":
             mark(("expected_likelihood_kernel",), "only read by decode_mode='expected_likelihood_chunked'")
-        canonical_family_dispatch = (
-            self.decode_mode == "family_chunked"
-            and registration.callable is _decode_family_chunked
-            and registration.fused_ce is PriorBank.decode_ce_family_chunked
-            and get_family(self.family) is FullGaussian
-            and get_functional("renyi") is renyi
-            and self.full_cov_kl_precision == "fp32_escalate"
-        )
-        if registration.family_consistent and not canonical_family_dispatch:
+        if registration.family_consistent:
             mark(("decode_av_precision",), "generic family-consistent decoding does not call _decode_av")
 
         # The route-specific rules below were confirmed by tiny launcher-derived CPU probes: loss and
@@ -2473,12 +2463,11 @@ class VFE3Config:
         if self.attention_mode == "projected_predictive" and not self.diagnose_canonical_free_energy:
             mark(("lambda_beta",), "predictive_content weights no belief-coupling block; with "
                  "diagnose_canonical_free_energy=True it would feed that log-step diagnostic only")
-        if self.decode_mode != "family_chunked" and not (
-                self.family == "gaussian_full"
+        if not (self.family == "gaussian_full"
                 and (self.mstep_self_coupling_weight != 0.0 or self.cg_energy_weight != 0.0)):
             mark(("full_cov_kl_precision",),
-                 "projected scoring has its own factor policy; only the family_chunked decoder "
-                 "evaluates the pair divergence")
+                 "projected scoring has its own factor policy; only the full-covariance M-step "
+                 "self-coupling and CG energy evaluate the pair divergence")
         if "e_mu_q_trust" in inactive or self.e_mu_q_trust is None or self.diagonal_covariance:
             mark(("mu_trust_cholesky_rounds",),
                  "only an active mean trust region on a full covariance factors sigma_q")
@@ -2725,7 +2714,8 @@ RETIRED_CONFIG_KEYS = frozenset(
     | {"grad_clip_per_role", "exp_fp64_mode", "compile_pair_kernel", "relational_mode",
        "relational_readout_mode", "relational_input_scope", "relational_output_scope",
        "relational_identity_content"})
-_RETIRED_FAMILIES = frozenset({"gaussian_frame_diagonal"})
+# laplace_diagonal (retired 2026-10-12) was registered but refused on both projected routes.
+_RETIRED_FAMILIES = frozenset({"gaussian_frame_diagonal", "laplace_diagonal"})
 _MIGRATED_FAMILIES = {"gaussian_diagonal_exact": "gaussian_diagonal"}
 _RETIRED_ENCODE_MODES = frozenset({"canonical_content_gauge", "canonical_content_projected"})
 
@@ -2822,6 +2812,14 @@ def _migrate_retired_fields(
         if family in _RETIRED_FAMILIES:
             refuse("family", family)
         payload["family"] = _MIGRATED_FAMILIES.get(family, family)
+    if payload.get("decode_mode") in ("family", "family_chunked"):
+        # The generic family decode ran only on a Gaussian family at Renyi order 1, where it equals the
+        # fast kernel of the family's rank up to rounding (float64 loss differences of 2e-16 and 0).
+        family = payload.get("family", VFE3Config.family)
+        if family not in _FAMILY_DECODE_MIGRATIONS:
+            refuse("decode_mode", payload["decode_mode"],
+                   f" with family={family!r} (only gaussian_diagonal and gaussian_full migrate)")
+        payload["decode_mode"] = _FAMILY_DECODE_MIGRATIONS[family]
     if "decode_temperature_learned" in payload:
         # Either value loads: decode_log_scale is restored from the weights and then held frozen, so
         # evaluation replays the saved temperature exactly. Resuming the optimizer of a run that

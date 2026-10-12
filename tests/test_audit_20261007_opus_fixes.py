@@ -238,19 +238,13 @@ def test_saturated_mean_step_pins_at_the_trust_radius(diagonal: bool) -> None:
     assert abs(whitened_norm - trust) < 1e-3 * trust
 
 
-def _laplace_kl(mu_q, b_q, mu_p, b_p):
-    from vfe3.families.laplace import DiagonalLaplace
-
-    return DiagonalLaplace(mu_q, b_q)._renyi_terms(DiagonalLaplace(mu_p, b_p), alpha=1.0, eps=1e-12)
-
-
 def _gaussian_kl(mu_q, s_q, mu_p, s_p):
     from vfe3.families.gaussian import diag_kl_unclamped_per_coord
 
     return diag_kl_unclamped_per_coord(mu_q, s_q, mu_p, s_p, eps=1e-12)
 
 
-@pytest.mark.parametrize("kl", [_gaussian_kl, _laplace_kl])
+@pytest.mark.parametrize("kl", [_gaussian_kl])
 def test_float32_diagonal_kl_keeps_relative_accuracy_near_equality(kl) -> None:
     """Item 54 (F36): just outside the series band, the float32 KL matches float64 to roundoff."""
     torch.manual_seed(0)
@@ -268,7 +262,7 @@ def test_float32_diagonal_kl_keeps_relative_accuracy_near_equality(kl) -> None:
     assert float(rel_err) < 1e-4                    # the two-log form gave about 2e-3 here
 
 
-@pytest.mark.parametrize("kl", [_gaussian_kl, _laplace_kl])
+@pytest.mark.parametrize("kl", [_gaussian_kl])
 def test_regrouped_diagonal_kl_matches_the_textbook_form_and_gradcheck(kl) -> None:
     import math
 
@@ -408,7 +402,7 @@ def test_noself_prior_forced_entry_is_not_a_self_record(inference: str) -> None:
     assert not torch.allclose(plain.xi[0], xi[0])
 
 
-@pytest.mark.parametrize("kl", [_gaussian_kl, _laplace_kl])
+@pytest.mark.parametrize("kl", [_gaussian_kl])
 def test_diagonal_kl_stays_finite_for_extreme_variance_ratios(kl) -> None:
     """A ratio below float32 resolution (x rounds to -1) keeps the KL and its gradient finite."""
     p = torch.tensor([5.5e34, 1e-20, 1.0], requires_grad=True)
