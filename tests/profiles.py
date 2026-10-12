@@ -3,6 +3,8 @@
 Each constructor argument is supplied from this checked-in mapping. Keep behavioral
 requirements beside their tests as overrides; never regenerate this mapping from
 experiment defaults at import time.
+The opt-in live profile is the exception: it reads the launcher dictionary of
+``train_vfe3.py`` on purpose, so that it follows the launcher's route.
 """
 from copy import deepcopy
 from typing import Any
@@ -209,74 +211,52 @@ def tiny_config(**overrides: Any) -> VFE3Config:
     return test_config(**values)
 
 
-# The live route of the train_vfe3.py launcher at tiny scale: projected_predictive with the kernel readout and a
-# moment-matched covariance, gaussian_diagonal, block_glk, a layernorm block norm, the coordinate block MLP, the
-# causal ALiBi prior, the row_min routing clamp, a linear decode and AdamW. The legacy baseline above
-# (projected_gradient, Euler, state-dependent alpha) stays the default profile; this one is opt-in.
-_LIVE_OVERRIDES: dict[str, Any] = {
+# The live route of the train_vfe3.py launcher at tiny scale. Every key the launcher's ``config`` dictionary sets is
+# taken from it, so the route switches (readout, MLP mode, family, decode, routing, prior, rope, norms, residual,
+# alpha form, ...) follow the launcher; _LIVE_TINY then shrinks the shape and run fields to a CPU unit test. A field
+# the launcher omits runs at its VFE3Config default, which _LIVE_OMITTED pins here as a test-owned value wherever
+# the legacy baseline differs (test_live_route_profile checks every omitted field against its default). The legacy
+# baseline above (projected_gradient, Euler, state-dependent alpha) stays the default profile; this one is opt-in.
+_LIVE_OMITTED: dict[str, Any] = {
+    'decode_av_precision': 'fp32',
+    'decode_ranking_fp64_escalation': False,
+    'skip_belief_sigma_update': False,
+    'transport_chart_max_norm': 50.0,
+}
+
+_LIVE_TINY: dict[str, Any] = {
     'vocab_size': 7,
-    'embed_dim': 4,
+    'embed_dim': 8,                   # heads of 4: p-RoPE at rope_fraction >= 0.5 still rotates a pair
     'n_heads': 2,
     'max_seq_len': 4,
+    'eval_stride': None,              # the launcher's stride exceeds the tiny context
     'batch_size': 2,
     'n_layers': 2,
-    'n_e_steps': 1,
     'max_steps': 10,
     'warmup_steps': 1,
-    'attention_mode': 'projected_predictive',
-    'predictive_readout': 'kernel',
-    'predictive_covariance': 'moment_matched',
-    'attention_residual': True,
-    'relational_routing': 'gaussian_kl',
-    'relational_receiver_update': 'closed_form',
-    'content_link_chart': 'exponential',
-    'family': 'gaussian_diagonal',
-    'gauge_group': 'block_glk',
-    'gauge_tying': 'per_head',
-    'gauge_transport': 'on',
-    'pos_phi': 'learned',
-    'rope_mode': 'none',
-    'norm_type_block': 'layernorm',
-    'layernorm_affine': True,
-    'use_block_mlp': True,
-    'block_mlp_mode': 'coordinate',
     'block_mlp_expansion': 2,
-    'beta_attention_prior': 'causal_alibi',
-    'routing_kl_max_reference': 'row_min',
-    'kl_max': None,
-    'decode_mode': 'linear',
-    'lambda_alpha_mode': 'state_dependent_per_coord',
-    'm_phi_update_mode': 'adamw',
-    'm_table_update_mode': 'adamw',
-    'mu_init_std': 0.065,
-    'sigma_init': 15.0,
-    'phi_scale': 0.035,
-    'm_p_mu_lr': 0.005,
-    'm_p_sigma_lr': 0.001,
-    'm_phi_lr': 0.003,
-    'm_pos_phi_lr': 0.003,
-    'm_decode_mu_lr': 0.005,
-    'm_decode_sigma_lr': 0.001,
-    'm_relational_score_lr': 0.01,
-    'm_relational_content_lr': 0.0025,
-    'm_block_mlp_lr': 0.005,
-    'm_layernorm_lr': 0.005,
-    'weight_decay': 0.01,
-    'phi_weight_decay': 0.1,
-    'sigma_weight_decay': 0.0,
-    'mu_weight_decay': 0.0,
-    'amp_dtype': None,
-    'fp32_matmul_precision': 'highest',
+    'kl_max': None,                   # the launcher's 8 K, resolved at the tiny K
+    'amp_dtype': None,                # CPU unit tests run in fp32
+    'log_interval': 0,                # run-only fields: no unit test reaches the logging or saving of train()
+    'eval_interval': 0,
+    'checkpoint_interval': 0,
+    'generate_embedding_figures': False,
 }
+
+
+def launcher_values() -> dict[str, Any]:
+    """Return a fresh copy of the ``config`` dictionary of ``train_vfe3.py`` (imported on first use)."""
+    import train_vfe3
+    return deepcopy(train_vfe3.config)
 
 
 def live_values(**overrides: Any) -> dict[str, Any]:
     """Return a fresh complete live-route configuration dictionary with local overrides."""
-    return deepcopy({**_CONFIG_VALUES, **_LIVE_OVERRIDES, **overrides})
+    return deepcopy({**_CONFIG_VALUES, **_LIVE_OMITTED, **launcher_values(), **_LIVE_TINY, **overrides})
 
 
 def live_config(**overrides: Any) -> VFE3Config:
-    """Construct the validated live-route config from test-owned arguments."""
+    """Construct the validated launcher route at tiny scale."""
     return VFE3Config(**live_values(**overrides))
 
 
@@ -284,11 +264,12 @@ live_config.__test__ = False
 
 
 def make_relational_operators(*args: Any, **overrides: Any) -> Any:
-    """RelationalOperators whose seven required config-mirroring keywords come from the test baseline.
+    """RelationalOperators whose config-mirroring keywords come from the test baseline.
 
     ``attention_residual``, ``predictive_covariance``, ``receiver_update``,
     ``content_link_chart``, ``minimal_agent_inference``, ``kl_max_reference`` and
-    ``rope_comparison_covariance`` have no constructor default; explicit keyword arguments override the
+    ``rope_comparison_covariance`` have no constructor default; ``receiver_measurement`` mirrors the
+    baseline's ``"adjoint"`` rather than the constructor default. Explicit keyword arguments override the
     baseline values (the comparison covariance is ``"full"``, the operator spelling of every rope_mode but
     ``"comparison_invariant"``).
     """
@@ -297,6 +278,7 @@ def make_relational_operators(*args: Any, **overrides: Any) -> Any:
     baseline = dict(attention_residual=values['attention_residual'],
                     predictive_covariance=values['predictive_covariance'],
                     receiver_update=values['relational_receiver_update'],
+                    receiver_measurement=values['relational_receiver_measurement'],
                     content_link_chart=values['content_link_chart'],
                     minimal_agent_inference=values['minimal_agent_inference'],
                     kl_max_reference=values['routing_kl_max_reference'],

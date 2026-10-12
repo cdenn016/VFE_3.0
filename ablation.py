@@ -18,8 +18,8 @@ Three sweep shapes are supported, all declared in the ``SWEEPS`` registry:
 The baseline is the self-contained ``BASELINE_CONFIG`` dict below -- a full ``VFE3Config`` toggle
 set kept deliberately separate from ``train_vfe3.py`` so an ablation can pin its own (fast)
 operating point. It tracks train_vfe3.py's K=20 / block_glk point; keep the two in sync by hand
-when the training operating point moves. ``kl_max`` is derived as ``8 * embed_dim`` below exactly
-as in train_vfe3.py, and ``DATA_SEED`` mirrors ``train_vfe3.DATA_SEED``, so an identical config
+when the training operating point moves. ``kl_max=None`` resolves to ``8 * embed_dim`` in every cell
+exactly as in train_vfe3.py, and ``DATA_SEED mirrors ``train_vfe3.DATA_SEED``, so an identical config
 trains on the identical batch order and reproduces train_vfe3.py run-for-run. Each run gets a self-contained
 ``RunArtifacts`` directory (``config.json``, ``metrics.csv``, ``best_model.pt``, figures)
 nested under its sweep, plus an ``ablation_result.json`` headline used for resume and the
@@ -325,6 +325,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     content_link_chart               = "exponential",        # "affine" Oh'=Oh | "first_order" Oh'=T^-1+Oh | "exponential" Oh'=T^-1+Oh phi_1(TOh)=e^{OhT}T^-1 
         
     relational_routing               = "gaussian_kl",           # "gaussian_kl" | "noisy_query" (noisy_query: projected_predictive only)
+    relational_receiver_measurement  = "inverse",             # "inverse" O'^-1, the dual measurement (VFE3Config default) | "adjoint" O'^T (projected_gradient only)
     relational_receiver_update       = "closed_form",         # "closed_form" (exact frozen-context update) | "euler" (Fisher step; reads e_q_mu_lr / e_q_sigma_lr / trusts) (projected_gradient only)
        
     predictive_readout               = "minimal_agent",     # "kernel" | "minimal_agent" (projected_predictive only)
@@ -334,7 +335,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     decode_coordinates               = "local",       # "local" | "reference" (reference: decode_mode "linear" | "diagonal_chunked" | "full_chunked")
               
     minimal_agent_channel_noise      = 1.0,         # initial channel noise n_h > 0
-    predictive_covariance_floor      = 1e-4,        # moment_matched only: covariant floor floor * (tr C_i / K) I in reference coordinates
+    predictive_covariance_floor      = 1e-4,        # moment_matched / spread_corrected only: floor * Sigma_p (token's local prior covariance), reference-invariant
     relational_receiver_damping      = 1.0,         # closed_form only: rho in (0, 1]; 1 = the frozen minimizer    
     relational_receiver_noise        = 1.0,         # channel floor nu I_d, nu > 0 (projected_gradient only)
      
@@ -486,6 +487,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #   Numerics/Speed
     #################################
   
+    kl_max                           = None,          # None (8 * embed_dim, per cell) | nats: the safety clamp on every divergence
     amp_dtype                        = 'bf16',        # None (fp32) | "bf16" | "fp16". Sigma must be at least fp32
     fp32_matmul_precision            = "highest",          # None (leave as-is) | "highest" | "high" | "medium" ("high" permits TF32 on the decode/energy GEMMs)
         
@@ -499,14 +501,6 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
 )
 
-
-
-# kl_max is the numerical safety-net clamp on EVERY divergence, scaled with K exactly as in
-# train_vfe3.py (``config["kl_max"] = 8 * config["embed_dim"]``) so the two entry points share one
-# objective under an identical config -- the K-independent 100.0 dataclass default would silently
-# differ from train_vfe3's 160 at K=20. A sweep that changes embed_dim must override kl_max itself
-# (the K=28 multi-arm below already sets kl_max=224).
-BASELINE_CONFIG["kl_max"] = 8 * BASELINE_CONFIG["embed_dim"]
 
 
 # Fields deliberately NOT swept, with the reason:
@@ -831,7 +825,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "param": "rope_base", 
         "values": [25, 75, 100, 150, 250, 1000],
         "scale": "log",
-        "requires": {"rope_mode": "frame"},
+        "requires": {"rope_mode": "frame_value"},             # the minimal-agent baseline refuses "frame"
     },    
 
     "rope_fraction": {
@@ -893,6 +887,8 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     "lambda_beta": {
         "description": "belief-coupling block weight (1.0 = pure F)",
         "param": "lambda_beta", "range": [0.0, 5, 0.05],
+        # projected_predictive weights no coupling block in training; projected_gradient (kernel readout) does
+        "requires": {"attention_mode": "projected_gradient", "predictive_readout": "kernel"},
     },
     
     
@@ -904,7 +900,8 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     "decode_tau": {
         "description": "KL-to-prior decode temperature",
         "param": "decode_tau", "values": [0.0025, 0.01, 0.05, 0.1, 0.25, 1],
-        "scale": "log"
+        "scale": "log",
+        "requires": {"decode_mode": "diagonal_chunked"},      # read only by the prior-bank KL decode
     },
     
 
@@ -1211,7 +1208,7 @@ def _validated_param_relative_deviation(value: object) -> float:
 
 
 def _parameter_grid_overrides(sweep: Mapping[str, object]) -> List[Dict[str, Any]]:
-    r"""Expand one declared parameter grid in stable order, deriving width-scaled ``kl_max``."""
+    r"""Expand one declared parameter grid in stable order (``kl_max=None`` resolves to 8 K per cell)."""
     grid = sweep.get("parameter_grid")
     if not isinstance(grid, Mapping) or not grid:
         raise ValueError("parameter-matched sweep needs a non-empty parameter_grid mapping")
@@ -1245,13 +1242,6 @@ def _parameter_grid_overrides(sweep: Mapping[str, object]) -> List[Dict[str, Any
     for values in itertools.product(*value_lists):
         candidate = dict(requires)
         candidate.update(dict(zip(fields, values)))
-        if "embed_dim" in candidate and "kl_max" not in candidate:
-            embed_dim = candidate["embed_dim"]
-            if type(embed_dim) is not int:
-                raise ValueError(
-                    f"parameter_grid embed_dim must be an exact integer, got {embed_dim!r}"
-                )
-            candidate["kl_max"] = 8 * embed_dim
         overrides.append(candidate)
     return overrides
 

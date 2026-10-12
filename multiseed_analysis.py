@@ -55,7 +55,7 @@ if os.environ.get(_CHILD_SENTINEL) == "1":
 
 import numpy as np
 
-from vfe3.config import config_from_serialized
+from vfe3.paper.runs import load_config
 from vfe3.run_artifacts import _write_json_atomic
 
 logger = logging.getLogger(__name__)
@@ -83,7 +83,7 @@ def _strip_seed_keys(value: Any) -> Any:
 
 
 def _semantic_config(config_path: Path) -> Dict[str, Any]:
-    """Strictly migrate one nested or flat artifact and remove only its effective run seed."""
+    """Migrate one nested or flat artifact (raw values when it cannot be built) and remove only its run seed."""
     try:
         serialized = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -97,14 +97,14 @@ def _semantic_config(config_path: Path) -> Dict[str, Any]:
         raise ValueError(
             f"cannot aggregate {config_path.parent}: config.json['config'] must contain an object"
         )
-    try:
-        migration = config_from_serialized(
-            raw_config,
-            source=str(config_path),
-        )
-    except ValueError as exc:
-        raise ValueError(f"cannot aggregate {config_path.parent}: {exc}") from exc
-    return _strip_seed_keys(_float_fields_as_float(migration))
+    # No forward is replayed here, so a run that saved a value this build refuses is read from its raw
+    # saved values, as the manuscript assemblers read it (vfe3.paper.runs.load_config).
+    cfg, load_mode, dropped = load_config(raw_config, source=str(config_path))
+    if cfg is None:
+        logger.warning("%s: config could not be built (%s); raw saved values used", config_path, load_mode)
+        return _strip_seed_keys(dict(raw_config))
+    retired = {f"retired:{key}": value for key, value in dropped.items()}
+    return _strip_seed_keys({**_float_fields_as_float(cfg), **retired})
 
 
 def _float_fields_as_float(config: Any) -> Dict[str, Any]:
@@ -216,12 +216,50 @@ def single_seed_noise_floor(sd: float, n_sd_seeds: int) -> float:
         t_{n-1, 0.975} \sqrt{2} s,
 
     with :math:`s` the across-seed SD estimated from :math:`n` seeds. NaN for :math:`n < 2` or a
-    non-finite :math:`s`. :func:`flag_noise_dominated` applies this floor.
+    non-finite :math:`s`. A single-seed ablation difference below it is within seed noise.
     """
     if n_sd_seeds < 2 or not math.isfinite(sd):
         return math.nan
-    from scipy.stats import t as t_dist
-    return float(t_dist.ppf(0.975, n_sd_seeds - 1)) * math.sqrt(2.0) * sd
+    return _student_t_quantile_975(n_sd_seeds - 1) * math.sqrt(2.0) * sd
+
+
+def _student_t_quantile_975(nu: int) -> float:
+    r"""The 0.975 quantile of Student's t with an integer :math:`\nu \geq 1` degrees of freedom, without scipy.
+
+    With :math:`\theta = \arctan(t / \sqrt{\nu})` and :math:`c = \cos\theta`, the two-sided probability
+    :math:`A(t) = P(|T| \leq t)` has the finite closed form (Abramowitz and Stegun 1964, 26.7.3-26.7.4)
+
+    .. math::
+        A = \frac{2}{\pi}\Big[\theta + \sin\theta \sum_{k=0}^{(\nu-3)/2} a_k c^{2k+1}\Big],
+        \quad a_0 = 1,\ a_k = a_{k-1} \frac{2k}{2k+1} \quad (\nu \text{ odd}),
+
+        A = \sin\theta \sum_{k=0}^{(\nu-2)/2} b_k c^{2k},
+        \quad b_0 = 1,\ b_k = b_{k-1} \frac{2k-1}{2k} \quad (\nu \text{ even}).
+
+    :math:`A` increases strictly in :math:`\theta \in (0, \pi/2)`, so bisection on :math:`A = 0.95` to
+    rounding gives the quantile :math:`\sqrt{\nu} \tan\theta`.
+    """
+    def coverage(theta: float) -> float:
+        s, c = math.sin(theta), math.cos(theta)
+        if nu % 2:
+            total, term = 0.0, c
+            for k in range((nu - 1) // 2):
+                total += term
+                term *= c * c * (2 * k + 2) / (2 * k + 3)
+            return 2.0 / math.pi * (theta + s * total)
+        total, term = 0.0, 1.0
+        for k in range(nu // 2):
+            total += term
+            term *= c * c * (2 * k + 1) / (2 * k + 2)
+        return s * total
+
+    low, high = 0.0, math.pi / 2
+    for _ in range(200):
+        mid = 0.5 * (low + high)
+        if mid in (low, high):
+            break
+        low, high = (mid, high) if coverage(mid) < 0.95 else (low, mid)
+    return math.sqrt(nu) * math.tan(0.5 * (low + high))
 
 
 def _summarize(values: List[float]) -> Dict[str, Any]:
@@ -902,46 +940,6 @@ def aggregate_per_layer(
             "mean": s["mean"], "sd": s["sd"], "n": s["n"], "values": vals,
         }
     return out
-
-
-def flag_noise_dominated(
-    cell_metric: Dict[str, Optional[float]],
-    sd:          float,
-
-    *,
-    baseline:    Optional[float] = None,
-    n_sd_seeds:  Optional[int] = None,
-    k:           Optional[float] = None,
-) -> List[str]:
-    r"""Labels of single-seed ablation cells whose difference from ``baseline`` is within seed noise.
-
-    ``cell_metric`` maps label -> the cell's single-seed metric, ``baseline`` is the single-seed
-    reference value, and ``sd`` is the across-seed SD of one run estimated from ``n_sd_seeds`` seeds.
-    The difference of two independent single-seed values has SD :math:`\sqrt{2} \sigma`, and
-    :math:`\sigma` is estimated on :math:`n-1` degrees of freedom, so a cell is noise-dominated when
-
-    .. math::
-        |v - v_{\mathrm{baseline}}| < t_{n-1, 0.975} \sqrt{2} s,
-
-    the two-sided 95% band for a difference of two independent normal observations with a pooled
-    SD estimate (Student 1908; Hahn and Meeker 1991, *Statistical Intervals*). Comparing
-    against a fixed baseline avoids the winner's-curse bias of measuring from the best cell.
-
-    Legacy mode: an explicit ``k`` reproduces the historic rule ``v - min(cells) < k * sd`` (no
-    sqrt(2), no t quantile, best-cell reference), which flags too few cells as noise.
-    """
-    finite = {lab: float(v) for lab, v in cell_metric.items() if _as_finite_float(v) is not None}
-    if not finite or not math.isfinite(sd):
-        return []
-    if k is not None:
-        best = min(finite.values())
-        return [lab for lab, v in finite.items() if (v - best) < k * sd]
-    if _as_finite_float(baseline) is None:
-        raise ValueError("flag_noise_dominated needs a finite single-seed baseline value")
-    if type(n_sd_seeds) is not int or n_sd_seeds < 2:
-        raise ValueError("flag_noise_dominated needs n_sd_seeds >= 2 (the seeds behind sd)")
-    half_width = single_seed_noise_floor(sd, n_sd_seeds)
-    return [lab for lab, v in finite.items() if abs(v - float(baseline)) < half_width]
 
 
 # =============================================================================

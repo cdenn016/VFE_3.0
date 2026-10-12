@@ -53,7 +53,7 @@ def _reference_tiny_model(seed: int = 0, **overrides) -> VFEModel:
         lambda_alpha_mode="state_dependent",
         pos_phi="learned",
         seed=seed,
-        max_steps=1,
+        max_steps=1, warmup_steps=1,
     )
     base.update(overrides)
     torch.manual_seed(seed)

@@ -392,7 +392,7 @@ class RelationalOperators(nn.Module):
         receiver_noise:        float = 1.0,
         receiver_update:       str,
         receiver_damping:      float = 1.0,
-        receiver_measurement:  str   = "adjoint",
+        receiver_measurement:  str   = "inverse",
         content_link_chart:    str,
         predictive_covariance_checkpoint: bool = False,
         content_link_edges:    str   = "off",

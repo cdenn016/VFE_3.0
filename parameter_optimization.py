@@ -80,6 +80,7 @@ config: Dict[str, Any] = dict(
 
 
     family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full"
+    relational_receiver_measurement = "inverse",     # "inverse" O'^-1, the dual measurement (VFE3Config default) | "adjoint" O'^T (projected_gradient only)
     #################################
     #        Initialization
     #################################
@@ -271,6 +272,7 @@ config: Dict[str, Any] = dict(
     sigma_max                            = 100.0,
 
 
+    kl_max                               = None,          # None (8 * embed_dim) | nats: the safety clamp on every divergence
     amp_dtype                            = 'bf16',        # None=fp32 | 'bf16' , 'fp16'. Sigma must be at least fp32
     fp32_matmul_precision                = "highest",       # None (leave as-is) | "highest" | "high" | "medium"
 
@@ -290,12 +292,6 @@ config: Dict[str, Any] = dict(
     
 )
 
-# kl_max is the numerical safety-net clamp on EVERY divergence, scaled with K exactly as in
-# train_vfe3.py (``config["kl_max"] = 8 * config["embed_dim"]``) so the two entry points share one
-# objective under an identical config -- the K-independent 100.0 dataclass default would silently
-# differ from train_vfe3's 160 at K=20. A sweep that changes embed_dim must override kl_max itself
-# (the K=28 multi-arm below already sets kl_max=224).
-config["kl_max"] = 8 * config["embed_dim"]
 
 
 # =============================================================================

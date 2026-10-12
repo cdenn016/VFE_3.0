@@ -3,8 +3,9 @@ r"""Dual receiving measurement of the channel_likelihood receiver (audit 2026-10
 ``relational_receiver_measurement='inverse'`` measures :math:`\xi_i` on head h by the head-h rows of
 :math:`O'^{-1}` instead of :math:`O_h'^\top`. Pins, on CPU at tiny size in float64: with equal channel
 precisions the alpha -> 0 frozen-context minimizer is the kernel mean; the minimizer is invariant under
-:math:`(U h, T h, S h, h^{-1}O')`; the operator's default 'adjoint' context is unchanged; config -> model -> operator
-wiring and one finite training step under both receiver updates; and the gradient of the context build.
+:math:`(U h, T h, S h, h^{-1}O')`; the operator default matches the config's 'inverse', and an operator
+without the attribute builds the 'adjoint' context; config -> model -> operator wiring and one finite
+training step under both receiver updates; and the gradient of the context build.
 """
 from typing import Any, Dict, List, Tuple
 
@@ -13,6 +14,7 @@ import torch
 
 from tests.profiles import make_relational_operators
 from tests.test_projected_gradient import _cfg, _tokens
+from vfe3.config import VFE3Config
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.gradients import full_link
 from vfe3.gradients.full_link import build_full_link_context
@@ -155,8 +157,12 @@ def test_inverse_minimizer_is_invariant_under_the_reference_change(
     assert moves["adjoint"] > 1e-3, moves
 
 
-def test_default_measurement_is_the_unchanged_adjoint() -> None:
-    assert make_relational_operators([2, 2], 5).receiver_measurement == "adjoint"
+def test_default_measurement_matches_the_config_and_a_missing_attribute_is_the_adjoint() -> None:
+    required = dict(attention_residual=False, predictive_covariance="passthrough", receiver_update="euler",
+                    content_link_chart="affine", minimal_agent_inference="exact", kl_max_reference="absolute",
+                    rope_comparison_covariance="full")
+    config_default = VFE3Config.__dataclass_fields__["relational_receiver_measurement"].default
+    assert RelationalOperators([2, 2], 5, **required).receiver_measurement == config_default == "inverse"
     with pytest.raises(ValueError, match="receiver_measurement"):
         make_relational_operators([2, 2], 5, receiver_measurement="other")
     mu, sigma, mu_p, sigma_p = _state(5, seed=21)
@@ -165,13 +171,13 @@ def test_default_measurement_is_the_unchanged_adjoint() -> None:
     ops = _operators([2, 3], "adjoint")
     build = lambda: build_full_link_context(mu, sigma, mu_p, sigma_p, frame, ops,
                                             receiver_noise=.7, log_prior=CAUSAL)
-    default = build()
+    adjoint = build()
     del ops.receiver_measurement                                     # the pre-option operator
     legacy = build()
     for name in ("Lambda", "eta", "c", "beta", "score"):
-        assert torch.equal(getattr(default, name), getattr(legacy, name)), name
+        assert torch.equal(getattr(adjoint, name), getattr(legacy, name)), name
     ops.receiver_measurement = "inverse"
-    assert not torch.allclose(build().Lambda, default.Lambda)
+    assert not torch.allclose(build().Lambda, adjoint.Lambda)
 
 
 @pytest.mark.parametrize("update", ["closed_form", "euler"])

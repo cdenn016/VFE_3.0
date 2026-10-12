@@ -31,7 +31,7 @@ def test_experiment_arms_validate_and_build(
     assert len(runs) >= 2
     for _label, overrides in runs:
         cfg_dict = ablation._cell_cfg_dict(
-            {**overrides, "vocab_size": 7, "max_seq_len": 3}, seed=0, max_steps=1)
+            {**overrides, "vocab_size": 7, "max_seq_len": 3, "warmup_steps": 1}, seed=0, max_steps=1)
         model = VFEModel(test_config(**cfg_dict))                    # config + build validation
         assert model is not None
 

@@ -6,6 +6,7 @@ import pytest
 import torch
 
 import scaling
+from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 
 
@@ -15,7 +16,7 @@ def _baseline() -> dict:
                 eval_stride=None, gauge_group="block_glk", pos_phi="none",
 
                 attention_mode="projected_predictive",
-                use_block_mlp=True, block_mlp_expansion=2, kl_max=32.)
+                use_block_mlp=True, block_mlp_expansion=2, kl_max=None)
 
 
 @pytest.fixture(autouse=True)
@@ -41,7 +42,7 @@ def test_grids_preserve_baseline_and_change_only_declared_axes(monkeypatch: pyte
         cfg = scaling._cell_cfg_dict(cell["overrides"], 3, None)
         assert cfg["attention_mode"] == "projected_predictive"
         assert cfg["n_heads"] == 2 and cfg["n_layers"] == 1
-        assert cfg["kl_max"] / cfg["embed_dim"] == 8
+        assert VFE3Config(**cfg).kl_max == 8.0 * cfg["embed_dim"]           # kl_max=None resolves per cell
     for cell in routes["depth"]:
         assert cell["route"] == "depth"
         assert set(cell["overrides"]) == {"n_layers"}

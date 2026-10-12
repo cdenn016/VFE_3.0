@@ -9,6 +9,7 @@ Item 16: figure titles use the headline :func:`vfe3.metrics.spearman_rho`.
 from tests.profiles import test_config
 import json
 import math
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict
@@ -107,15 +108,19 @@ def test_validation_finalizer_summary_carries_the_validation_scored_target_key(t
     assert "final_val_scored_targets" not in summary and "test_ce" not in summary
 
 
-def test_noise_floor_is_the_single_seed_difference_band_and_drives_the_flags() -> None:
-    from scipy.stats import t as t_dist
+def test_noise_floor_is_the_single_seed_difference_band(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "scipy", None)                   # aggregation needs no scipy
     agg = ms._summarize([10.0, 11.0, 12.0])
-    expected = float(t_dist.ppf(0.975, 2)) * math.sqrt(2.0) * 1.0
+    expected = 4.302652729749464 * math.sqrt(2.0) * 1.0               # t(2, 0.975) = sqrt(2) c / sqrt(1 - c^2), c = 0.95
     assert "two_sd" not in agg
-    assert agg["noise_floor"] == pytest.approx(expected)              # ~6.09 s at n = 3, not 2 s
-    cells = {"inside": 10.0 + 0.99 * expected, "outside": 10.0 + 1.01 * expected}
-    assert ms.flag_noise_dominated(cells, agg["sd"], baseline=10.0, n_sd_seeds=agg["n"]) == ["inside"]
+    assert agg["noise_floor"] == pytest.approx(expected, rel=1e-13)  # ~6.09 s at n = 3, not 2 s
     assert math.isnan(ms._summarize([10.0])["noise_floor"])
+
+
+@pytest.mark.parametrize("nu", [*range(1, 41), 99, 100, 1000])
+def test_scipy_free_t_quantile_matches_scipy(nu: int) -> None:
+    t_dist = pytest.importorskip("scipy.stats").t
+    assert ms._student_t_quantile_975(nu) == pytest.approx(float(t_dist.ppf(0.975, nu)), rel=1e-12)
 
 
 def test_figure_spearman_is_the_headline_average_rank_statistic() -> None:

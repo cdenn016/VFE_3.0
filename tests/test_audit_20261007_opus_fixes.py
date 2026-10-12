@@ -485,7 +485,7 @@ def test_train_calibrates_only_on_a_fresh_working_variance_start(monkeypatch: py
     import vfe3.train as T
     from vfe3.data.datasets import TokenWindows
 
-    cfg = _prototype_cfg(block_mlp_template_init=init, max_steps=1, eval_stride=None)
+    cfg = _prototype_cfg(block_mlp_template_init=init, max_steps=1, warmup_steps=1, eval_stride=None)
     torch.manual_seed(0)
     model = VFEModel(cfg)
     seen = []
