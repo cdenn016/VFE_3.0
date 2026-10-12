@@ -18,7 +18,8 @@ from vfe3.belief import BeliefState
 from vfe3.contracts import CanonicalFrameContext, EStepGradientRecord
 from vfe3.gradients.full_link import (
     FULL_LINK_ALPHA_MODES, FullLinkContext, build_full_link_context, full_link_context_at,
-    full_link_cost, full_link_cost_parts, full_link_gradients, full_link_minimizer, receiver_law_retry_counter,
+    full_link_cost, full_link_cost_parts, full_link_gradients, full_link_minimizer, full_link_profiled_minimizer,
+    receiver_law_retry_counter,
 )
 from vfe3.gradients.relational import relational_predictive_readout
 from vfe3.families.base import get_family
@@ -235,7 +236,9 @@ def e_step_iteration(
     from the current receiver and the layer prior at every iteration (full_link_context_at): the
     Euler force is then the exact gradient of the profiled energy, and the undamped closed form
     (rho = 1) is its majorize-minimize step; a damped diagonal-family closed form is not guaranteed
-    to descend (see full_link_minimizer).
+    to descend (see full_link_minimizer). ``'closed_form_profiled'`` returns the limit of those MM steps
+    from the current iterate, a stationary point of the profiled energy, in one solve
+    (full_link_profiled_minimizer); under a constant alpha it is ``'closed_form'``.
     """
     if (relational_operators is None
             or relational_operators.readout_mode not in ("predictive_content", "full_link_update")):
@@ -282,13 +285,19 @@ def e_step_iteration(
         # Constant alpha: the episode context itself. State-dependent: alpha frozen at this iterate.
         iterate_context = full_link_context_at(_full_link_context, belief.mu, belief.sigma)
         grad_mu, grad_sigma = full_link_gradients(belief.mu, belief.sigma, iterate_context)
-        closed_form = relational_operators.receiver_update == "closed_form"
+        closed_form = relational_operators.receiver_update in ("closed_form", "closed_form_profiled")
         if grad_record is not None:
             grad_record["mu"] = grad_mu.detach().pow(2).sum().sqrt()
             grad_record["sigma"] = (grad_sigma.detach().pow(2).sum().sqrt()
                                     if grad_sigma is not None else grad_mu.new_zeros(()))
             grad_record["phi"] = grad_mu.new_zeros(())
-        if closed_form:
+        if relational_operators.receiver_update == "closed_form_profiled":
+            mu, sigma = full_link_profiled_minimizer(
+                belief.mu, belief.sigma, iterate_context,
+                damping=relational_operators.receiver_damping,
+                update_sigma=not skip_belief_sigma_update, eps=eps, sigma_max=sigma_max,
+                capture=relational_capture)
+        elif closed_form:
             mu, sigma = full_link_minimizer(
                 belief.mu, belief.sigma, iterate_context,
                 damping=relational_operators.receiver_damping,

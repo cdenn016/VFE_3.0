@@ -595,11 +595,14 @@ class VFE3Config:
     #            mean as alpha -> 0 with equal channel precisions, invariant under (U h, T h, S h, h^-1 O')
     relational_receiver_measurement:  str             = "adjoint"
 
-    # "closed_form" | "euler"
-    #   closed_form  exact frozen-context natural-parameter update, damped by relational_receiver_damping
-    #   euler        explicit Fisher step with e_q_mu_lr / e_q_sigma_lr and the trust regions
+    # "closed_form" | "closed_form_profiled" | "euler"
+    #   closed_form           exact frozen-context natural-parameter update, damped by relational_receiver_damping
+    #   closed_form_profiled  under lambda_alpha_mode="state_dependent": the limit of iterated closed_form (MM)
+    #                         steps, a stationary point of c0 log(b0 + D) + G, in one scalar root solve per
+    #                         receiver (not per_coord); under a constant alpha identical to closed_form
+    #   euler                 explicit Fisher step with e_q_mu_lr / e_q_sigma_lr and the trust regions
     relational_receiver_update:       str             = "closed_form"
-    relational_receiver_damping:      float           = 1.0          # closed_form only: rho in (0, 1]; 1 = the minimizer
+    relational_receiver_damping:      float           = 1.0          # closed_form(_profiled) only: rho in (0, 1]; 1 = the minimizer
     relational_receiver_noise:        float           = 1.0          # channel floor (channel_likelihood) | K-dim noise (ambient_alignment)
 
     ##################################################
@@ -956,7 +959,8 @@ class VFE3Config:
         _require(self.relational_receiver_law, ("channel_likelihood", "ambient_alignment"),
                  "relational_receiver_law")
         _require(self.relational_receiver_measurement, ("adjoint", "inverse"), "relational_receiver_measurement")
-        _require(self.relational_receiver_update, ("closed_form", "euler"), "relational_receiver_update")
+        _require(self.relational_receiver_update, ("closed_form", "closed_form_profiled", "euler"),
+                 "relational_receiver_update")
         if (isinstance(self.relational_receiver_damping, bool)
                 or not isinstance(self.relational_receiver_damping, Real)
                 or not math.isfinite(float(self.relational_receiver_damping))
@@ -992,6 +996,11 @@ class VFE3Config:
                 and self.family != "gaussian_diagonal"):
             incompatible.append(f"lambda_alpha_mode='state_dependent_per_coord' with family={self.family!r} "
                                 "(requires gaussian_diagonal)")
+        # Per coordinate, mu*(alpha) = Lambda(alpha)^{-1} eta(alpha) couples the coordinate fixed points.
+        if (full_link and self.relational_receiver_update == "closed_form_profiled"
+                and self.lambda_alpha_mode == "state_dependent_per_coord"):
+            incompatible.append("relational_receiver_update='closed_form_profiled' with lambda_alpha_mode="
+                                "'state_dependent_per_coord' (requires 'state_dependent' or 'constant')")
         if self.encode_mode not in ("per_token", "per_token_additive"):
             incompatible.append(
                 f"encode_mode={self.encode_mode!r} (requires 'per_token' or 'per_token_additive')")
@@ -2366,12 +2375,13 @@ class VFE3Config:
             mark(("relational_receiver_noise", "relational_receiver_law", "relational_receiver_update",
                   "relational_receiver_damping", "relational_receiver_measurement"),
                  "only read by projected_gradient receiving laws")
-        elif self.relational_receiver_update == "closed_form":
+        elif self.relational_receiver_update in ("closed_form", "closed_form_profiled"):
             mark(("e_q_mu_lr", "e_q_sigma_lr", "e_mu_q_trust", "e_sigma_q_trust"),
-                 "relational_receiver_update='closed_form' applies the exact frozen-context update; "
-                 "its step control is relational_receiver_damping")
+                 f"relational_receiver_update={self.relational_receiver_update!r} applies an exact "
+                 "natural-parameter update; its step control is relational_receiver_damping")
         else:
-            mark(("relational_receiver_damping",), "only read by relational_receiver_update='closed_form'")
+            mark(("relational_receiver_damping",),
+                 "only read by relational_receiver_update='closed_form' or 'closed_form_profiled'")
         if self.attention_mode == "projected_gradient" and self.relational_receiver_law != "channel_likelihood":
             mark(("relational_receiver_measurement",), "only read by relational_receiver_law='channel_likelihood'")
         gradient_controls = ("e_q_mu_lr", "e_q_sigma_lr", "e_mu_q_trust", "e_sigma_q_trust")
@@ -2538,7 +2548,8 @@ class VFE3Config:
                  "no sigma E-step runs on projected routes or under skip_belief_sigma_update "
                  "(a moment-matched predictive covariance is a readout with its own floor), so no "
                  "sigma step, trust region, or SPD ceiling runs")
-        elif (self.relational_receiver_update == "closed_form" and self.family == "gaussian_full"):
+        elif (self.relational_receiver_update in ("closed_form", "closed_form_profiled")
+              and self.family == "gaussian_full"):
             mark(("sigma_max",),
                  "the closed-form full-covariance receiver sets Sigma = c Lambda^{-1} with no SPD ceiling "
                  "(only the diagonal family clamps at sigma_max)")
@@ -2570,7 +2581,7 @@ class VFE3Config:
         if (self.n_e_steps == 1 and self.n_layers == 1 and self.mstep_self_coupling_weight == 0.0
                 and not self.diagnose_canonical_free_energy
                 and not (self.attention_mode == "projected_gradient"
-                         and self.relational_receiver_update == "closed_form")):
+                         and self.relational_receiver_update in ("closed_form", "closed_form_profiled"))):
             mark(("lambda_alpha_mode", "lambda_alpha", "b0", "c0"),
                  "the single gradient E-step iteration starts at q = p, where the self-coupling "
                  "force vanishes")

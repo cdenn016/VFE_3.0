@@ -451,8 +451,8 @@ class RelationalOperators(nn.Module):
         self.receiver_noise = float(receiver_noise)
         if receiver_law not in ("ambient_alignment", "channel_likelihood"):
             raise ValueError("receiver_law must be 'ambient_alignment' or 'channel_likelihood'")
-        if receiver_update not in ("euler", "closed_form"):
-            raise ValueError("receiver_update must be 'euler' or 'closed_form'")
+        if receiver_update not in ("euler", "closed_form", "closed_form_profiled"):
+            raise ValueError("receiver_update must be 'euler', 'closed_form' or 'closed_form_profiled'")
         if (isinstance(receiver_damping, bool) or not isinstance(receiver_damping, Real)
                 or not math.isfinite(receiver_damping) or not 0.0 < receiver_damping <= 1.0):
             raise ValueError("receiver_damping must lie in (0, 1]")

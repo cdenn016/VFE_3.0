@@ -170,7 +170,9 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "readout_mode": cfg.relational_readout_mode,
         "output_scope": "full",
         "mean_update": (("receiver_closed_form_natural_parameter_update"
-                         if cfg.relational_receiver_update == "closed_form" else "receiver_fisher_step")
+                         if cfg.relational_receiver_update == "closed_form" else
+                         "receiver_profiled_closed_form_natural_parameter_update"
+                         if cfg.relational_receiver_update == "closed_form_profiled" else "receiver_fisher_step")
                         if full_link else
                         "minimal_agent_posterior_mean" if minimal_agent else
                         "input_plus_predictive_mean" if cfg.attention_residual else
@@ -204,9 +206,9 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "receiver_law": cfg.relational_receiver_law if full_link else None,
         "receiver_update": cfg.relational_receiver_update if full_link else None,
         "receiver_damping": (cfg.relational_receiver_damping
-                             if full_link and cfg.relational_receiver_update == "closed_form" else None),
+                             if full_link and cfg.relational_receiver_update != "euler" else None),
         "covariance_update": (("passthrough" if cfg.skip_belief_sigma_update else
-                               "closed_form" if cfg.relational_receiver_update == "closed_form" else "fisher_step")
+                               "fisher_step" if cfg.relational_receiver_update == "euler" else "closed_form")
                               if full_link else getattr(cfg, "predictive_covariance", "passthrough")),
         "content_covariance_contract": (("value_space_channel_likelihood_plus_channel_noise"
                                          if cfg.relational_receiver_law == "channel_likelihood" else
@@ -5087,7 +5089,8 @@ def _pure_path_report(
     # The closed-form receiver sets the covariance from natural parameters, Sigma = c Lambda^{-1}; it
     # runs no AIRM retraction, trust projection or exponential, and only its diagonal branch clamps
     # at sigma_max (audit 2026-10-07 F72).
-    closed_form_receiver = getattr(cfg, "relational_receiver_update", "closed_form") == "closed_form"
+    closed_form_receiver = getattr(cfg, "relational_receiver_update", "closed_form") in (
+        "closed_form", "closed_form_profiled")
     sigma_step = receiver_gradient and not cfg.skip_belief_sigma_update
     spd_retraction_applies = sigma_step and not closed_form_receiver
 

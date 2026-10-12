@@ -612,7 +612,12 @@ sum of KLs to $K$-dimensional laws with noise $\nu I_K$; it counts the entropy
 $\alpha+\sum_h\lambda_h$ times and pulls each head's unwritten coordinates toward zero.
 `relational_receiver_update="closed_form"` (default) applies the exact frozen-context
 natural-parameter update with damping `relational_receiver_damping` in $(0,1]$
-($1$ is the minimizer; then extra E-steps change nothing). `"euler"` is the explicit
+($1$ is the minimizer; then extra E-steps change nothing). Under
+`lambda_alpha_mode="state_dependent"` that update is one majorize-minimize step on the profiled
+energy $c_0\log(b_0+D)+G$; `"closed_form_profiled"` returns the limit of those steps, the
+fixed point $\alpha=c_0/(b_0+D(q^\star(\alpha)))$ reached from the current state, in one
+scalar root solve per receiver with implicit gradients (not available per coordinate; under a
+constant alpha it is `"closed_form"`). `"euler"` is the explicit
 Fisher step governed by `e_q_mu_lr`, `e_q_sigma_lr` and the trust radii; it is stable
 only for `e_q_mu_lr` below $2/\lambda_{\max}(\Sigma\Lambda)$. Serialized configs that
 predate these fields reload as `ambient_alignment` with `euler`.
