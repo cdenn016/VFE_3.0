@@ -18,9 +18,10 @@ def deferred_host_checks() -> Iterator[None]:
     r"""Defer raise-only device verdicts to the next mandatory host read inside this scope.
 
     A check registered through :func:`host_check` whose verdict can only raise (it selects no
-    computation) is queued instead of synchronizing. :func:`host_read` (the projected scorer's
-    per-layer recovery decision) resolves every queued verdict in its own transfer, in registration
-    order and before its own values, so each check raises its original exception before any later
+    computation) is queued instead of synchronizing. :func:`host_read` (the per-layer recovery
+    decision of the projected scorer or the minimal-agent readout) resolves every queued verdict in its
+    own transfer, in registration order and before its own values, so each check raises its original
+    exception before any later
     check or computation reads its result. Whatever is still queued at a normal scope exit is resolved
     there in one transfer, so the scope must close before anything consumes the scoped computation
     (``train_step`` closes it after the forward and before ``backward``). An exception leaving the

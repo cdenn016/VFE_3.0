@@ -825,7 +825,8 @@ def train_step(
         _step_ce_det = ce.detach() if ce is not None else None   # () pre-step CE, read at the existing barrier
         _scored_det = decode_stats.scored_tokens.detach()
         _excluded_det = _excluded_token_count(decode_stats, targets.numel()).detach()
-        _expected_det = torch.tensor(targets.numel(), dtype=torch.int64, device=targets.device)
+        # A device fill, not a pageable host-to-device copy (which synchronizes the stream).
+        _expected_det = torch.full((), targets.numel(), dtype=torch.int64, device=targets.device)
         _scaler.scale(loss).backward()
         _loss_det = loss.detach()                               # host read DEFERRED: fused with the grad-finite
         step_loss = None                                        # flag at the gate below (audit 2026-07-01 round-3)
@@ -856,8 +857,8 @@ def train_step(
             count_tensors.append(count_mb)
             excluded_count_tensors.append(
                 _excluded_token_count(decode_stats_mb, tgt_mb.numel()).detach())
-            expected_count_tensors.append(torch.tensor(
-                tgt_mb.numel(), dtype=torch.int64, device=tgt_mb.device))
+            expected_count_tensors.append(torch.full(
+                (), tgt_mb.numel(), dtype=torch.int64, device=tgt_mb.device))
             if _egrad_mb is not None:
                 for _name, _value in _egrad_mb.items():
                     if isinstance(_value, Real):

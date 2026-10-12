@@ -691,7 +691,7 @@ def _decode_ce_result(
     if not return_stats:
         return ce
     scored = valid.sum(dtype=torch.int64)
-    excluded = valid.new_tensor(valid.numel(), dtype=torch.int64) - scored
+    excluded = valid.numel() - scored                      # no host-to-device copy of the count
     return DecodeCEResult(ce=ce, scored_tokens=scored, excluded_tokens=excluded)
 
 # Once-per-process guard for the decode_unigram_prior=True-with-unset-table warning
