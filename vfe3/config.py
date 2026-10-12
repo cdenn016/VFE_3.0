@@ -829,7 +829,8 @@ class VFE3Config:
     #                           also screens the ADF query covariances; under comparison_invariant with a
     #                           diagonal P(G) it keeps the factored route in place of the diagonal one)
     #   cholesky_qr2_certified  factor X by CholeskyQR2 (error O(eps kappa)) and rebuild entries failing
-    #                           eps_32 kappa_1(C) <= 3e-4; the Gram route serves minimal_agent,
+    #                           eps_32 kappa_1(C) <= 3e-4 by the same recovery as gram_certified (their
+    #                           pairs leave the GEMM for triangular-solve tiles); the Gram route serves minimal_agent,
     #                           noisy_query and comparison_invariant, which pass no source root
     projected_factorization:          str             = "gram"
     
