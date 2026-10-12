@@ -80,7 +80,10 @@ def test_amp_and_kl_max_stay_live_where_a_consumer_runs() -> None:
     assert "amp_dtype" not in logits
     kernel = _cfg(_minimal_agent(predictive_readout="kernel", block_mlp_mode="coordinate",
                                  amp_dtype="bf16")).inactive_fields()
-    assert "kl_max" not in kernel and "amp_dtype" not in kernel
+    assert "kl_max" not in kernel
+    # The kernel readout has no amp consumer either: amp_dtype is live only with decode_logits_amp or the CG
+    # coupling (tests/test_amp_routes_20261012.py).
+    assert "amp_dtype" in kernel
     coupled = _cfg(_minimal_agent(mstep_self_coupling_weight=0.1)).inactive_fields()
     assert "kl_max" not in coupled
 

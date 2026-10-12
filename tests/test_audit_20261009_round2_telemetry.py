@@ -244,10 +244,13 @@ def test_run_artifacts_checkpoint_carries_the_run_totals(tmp_path, monkeypatch: 
 
 # --------------------------------------------------------------------------- item 40: replay records
 
-@pytest.mark.parametrize("amp_dtype", [None, "bf16"])
-def test_precision_replay_records_carry_the_autocast_dtype(amp_dtype, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("amp_dtype,logits_amp", [(None, False), ("bf16", False), ("bf16", True)])
+def test_precision_replay_records_carry_the_autocast_dtype(amp_dtype, logits_amp,
+                                                           monkeypatch: pytest.MonkeyPatch) -> None:
+    # bf16 autocast is active only where a consumer runs (here the linear decode's logits matmul); elsewhere the
+    # rule marks amp_dtype inert and the record carries no autocast note (2026-10-12).
     cfg = test_config(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
-                      amp_dtype=amp_dtype)
+                      amp_dtype=amp_dtype, decode_mode="linear", decode_logits_amp=logits_amp)
     torch.manual_seed(0)
     model = VFEModel(cfg)
     optimizer = T.build_optimizer(model, cfg)
@@ -275,8 +278,8 @@ def test_precision_replay_records_carry_the_autocast_dtype(amp_dtype, monkeypatc
     assert replays == 1 and len(records) == 1
     record = records[0]
     assert record["amp_dtype"] == amp_dtype
-    assert record["autocast_active"] is (amp_dtype is not None)
-    assert ("autocast_note" in record) is (amp_dtype is not None)
+    assert record["autocast_active"] is logits_amp
+    assert ("autocast_note" in record) is logits_amp
 
 
 # --------------------------------------------------------------------------- item 5: M4 and klcap under row_min

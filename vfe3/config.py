@@ -792,7 +792,8 @@ class VFE3Config:
 
     # None | "bf16" | "fp16"
     # Mixed precision on CUDA. None = full fp32 (no autocast). Decode, CE and matrix functions stay fp32.
-    # bf16 needs no GradScaler; fp16 training does.
+    # bf16 needs no GradScaler; fp16 training does. Its only reduced-precision consumers are the linear
+    # decode's logits matmul (decode_logits_amp) and the CG coupling; elsewhere inactive_fields() marks it.
     amp_dtype:                        Optional[str]   = "bf16"
 
     # None | "highest" | "high" | "medium"
@@ -2060,6 +2061,18 @@ class VFE3Config:
         minimal_agent = self.predictive_readout == "minimal_agent"
         if self.decode_mode != "linear" or self.amp_dtype is None:
             mark(("decode_logits_amp",), "only read by decode_mode='linear' with amp_dtype set")
+        # The forward enters autocast, but every contraction runs in an autocast-disabled fp32/fp64 island
+        # (transport exponentials, routing and pair-KL GEMMs, covariance updates, the block MLP's mean path,
+        # norms, the minimal agent, the prototype posteriors, decode and CE) or is elementwise. The only
+        # reduced-precision consumers are the linear decode's logits matmul under decode_logits_amp and the
+        # CG coupling's moment contraction. A dispatch-mode dtype probe found no bf16 output and bitwise-equal
+        # loss, gradients and eval logits on every other route tried, on CPU and CUDA (2026-10-12; pinned by
+        # tests/test_amp_routes_20261012.py). fp16 is never marked: it also enables the GradScaler.
+        if (self.amp_dtype == "bf16" and not self.use_cg_coupling
+                and not (self.decode_mode == "linear" and self.decode_logits_amp)):
+            mark(("amp_dtype",),
+                 "effective precision float32: no contraction on this route runs under autocast (only "
+                 "decode_logits_amp on the linear decode and use_cg_coupling consume amp_dtype)")
         if (self.attention_mode == "projected_predictive" and not minimal_agent
                 and self.relational_routing == "mean_distance"):
             # The covariance-blind cost reads neither the projected covariances nor the source tuples,
@@ -2106,18 +2119,6 @@ class VFE3Config:
                      "the minimal-agent posterior applies no divergence clamp, decoders use kl_max=inf, and "
                      "no M-step self-coupling or CG energy term is enabled; with diagnose_canonical_free_energy=True "
                      "it would feed that log-step diagnostic only")
-            # Every contraction on this combination runs in an autocast-disabled island (the minimal-agent
-            # update, the block MLP's mean path (fp32 since 2026-10-12), the prototype posteriors, LayerNorm,
-            # the transport exponentials and the linear decode/CE) or is elementwise, so the forward computes
-            # in float32 whatever amp_dtype says. Checked bit-for-bit on CPU autocast for every block MLP mode
-            # (tests/test_audit_20261007_opus_fixes.py); not run on CUDA.
-            if (self.amp_dtype is not None and self.decode_mode == "linear"
-                    and self.norm_type_block in ("none", "layernorm")
-                    and self.mstep_self_coupling_weight == 0.0 and not self.use_cg_coupling
-                    and not self.decode_logits_amp):
-                mark(("amp_dtype",),
-                     "effective precision float32: on minimal_agent with a none/layernorm norm and linear "
-                     "decode, every contraction runs with autocast disabled")
         else:
             mark(("minimal_agent_inference", "minimal_agent_channel_noise", "minimal_agent_cavi_steps"),
                  "only read by predictive_readout='minimal_agent'")
