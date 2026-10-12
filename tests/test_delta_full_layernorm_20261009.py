@@ -191,6 +191,9 @@ def test_executed_block_applies_the_composite_pushforward() -> None:
     radial = block_norm_radial_term(model.block_norm, mu, sigma)
     h = (_fd_jacobian(mlp, model.block_norm(mu, sigma)) @ radial.direction.unsqueeze(-1)).squeeze(-1)   # (1, N, K)
     expected = expected + radial.rho.unsqueeze(-1) * h.unsqueeze(-1) * h.unsqueeze(-2)
+    # Scaled by the norm's sphere-bound cap (audit 2026-10-12, item 1); the composite is linear in the norm stage.
+    from vfe3.model.block_mlp import block_norm_trace_cap
+    expected = expected * block_norm_trace_cap(model.block_norm, mu, sigma, cfg.block_mlp_covariance_floor).unsqueeze(-1)
     got = capture["block_mlp_output"].sigma
     assert (got - expected).abs().max() / expected.abs().max() < 1e-8
 

@@ -257,6 +257,7 @@ def relational_predictive_readout(
     capture:     Optional[Dict[str, Any]] = None,
     return_covariance: bool = False,
     link_state:  Optional[dict] = None,
+    floor_anchor: Optional[torch.Tensor] = None,   # return_covariance: the local prior covariance Sigma_p
 ) -> 'torch.Tensor | Tuple[torch.Tensor, torch.Tensor]':
     r"""Return the conditional predictive mean with the configured projected routing cost and live source graphs.
 
@@ -272,13 +273,15 @@ def relational_predictive_readout(
     Under ``content_link_latent`` its receiver factors are inferred from the source covariances of
     ``sigma`` (whatever ``predictive_covariance`` is), and a positive loop weight reads and writes
     ``link_state`` (``{"previous": ..., "current": ...}``, threaded across layers by ``vfe_stack``).
+    ``floor_anchor`` is the local prior covariance :math:`\Sigma_p` whose multiple :math:`f\,\Sigma_p` floors the
+    returned covariance (:meth:`RelationalOperators.floor_term`); it is required with ``return_covariance``.
 
     Under ``predictive_readout='minimal_agent'`` the routing, the content and the residual are replaced by the
     exact Gaussian conditioning of :meth:`RelationalOperators.minimal_agent_update`, which reads the ROUTING frame
     for query, key, content and write-back (a distinct ``value_frame`` with different matrices is refused: the tied
     key is the content). ``tau`` and ``kl_max`` are not read (the posterior has temperature 1 and no clamp); the
     result is the posterior mean, with no residual added, and ``return_covariance`` gives the posterior covariance
-    plus the covariant floor.
+    plus the prior-anchored floor.
     """
     if getattr(operators, "predictive_readout", "kernel") == "minimal_agent":
         if value_frame is not None and value_frame is not frame and not (
@@ -288,7 +291,8 @@ def relational_predictive_readout(
             raise ValueError("predictive_readout='minimal_agent' reads key and content in one frame; the value frame "
                              "differs from the routing frame (pos_rotation='rope' with rope_on_value=False)")
         mean, sigma_plus = operators.minimal_agent_update(
-            mu, sigma, frame, log_prior, return_covariance=return_covariance, capture=capture)
+            mu, sigma, frame, log_prior, return_covariance=return_covariance, capture=capture,
+            floor_anchor=floor_anchor)
         return (mean, sigma_plus) if return_covariance else mean
     from vfe3.free_energy import attention_weights
     dtype = torch.float64 if mu.dtype == torch.float64 else torch.float32
@@ -321,7 +325,8 @@ def relational_predictive_readout(
         if operators.attention_residual:
             result = mu + result
         sigma_plus = (operators.predictive_covariance_update(mu_work, sigma_work, beta, value_frame or frame,
-                                                             receive, **shared).to(sigma.dtype)
+                                                             receive, floor_anchor=floor_anchor,
+                                                             **shared).to(sigma.dtype)
                       if return_covariance else None)
     if capture is not None:
         capture.update(beta_pre=beta.detach(), score_energy_pre=score.detach(),

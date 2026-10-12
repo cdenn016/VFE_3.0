@@ -283,9 +283,11 @@ def test_diagonal_delta_full_model_runs_and_is_booked_and_labeled() -> None:
     converged, mlp_out = capture["converged"], capture["block_mlp_output"]
     lin = block_norm_linearization(model.block_norm, converged.mu)
     radial = block_norm_radial_term(model.block_norm, converged.mu, torch.diag_embed(converged.sigma))
+    from vfe3.model.block_mlp import block_norm_trace_cap   # the sphere-bound cap (audit 2026-10-12, item 1)
+    cap = block_norm_trace_cap(model.block_norm, converged.mu, converged.sigma, cfg.block_mlp_covariance_floor)
     full = model.block_mlps[0].forward_moments(capture["block_mlp_input"].mu, torch.diag_embed(converged.sigma),
                                                input_jacobian=lin.jacobian, input_scale=lin.scale,
-                                               input_radial=radial).sigma
+                                               input_radial=radial, input_cap=cap).sigma
     assert torch.allclose(mlp_out.sigma, torch.diagonal(full, dim1=-2, dim2=-1), rtol=1e-12, atol=0)
     assert bool(torch.isfinite(loss)) and bool((mlp_out.sigma > 0).all())
     # The diagonal delta_full books (J o J) sigma and its floor, no Cholesky.

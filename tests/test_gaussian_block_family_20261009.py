@@ -117,8 +117,10 @@ def _reference(sigma: torch.Tensor, frame: CanonicalFrameContext) -> torch.Tenso
 @pytest.mark.parametrize("residual", [False, True])
 def test_block_update_is_the_head_block_projection_of_the_dense_update(residual: bool) -> None:
     mu, sigma, beta, frame, _ = _update_inputs()
-    block = _operators(True, residual).predictive_covariance_update(mu, sigma, beta, frame)
-    dense = _operators(False, residual).predictive_covariance_update(mu, sigma, beta, frame)  # full U C U^T
+    # The floor anchor Sigma_p is the (head-block diagonal) belief covariance, so f Sigma_p keeps the block layout.
+    block = _operators(True, residual).predictive_covariance_update(mu, sigma, beta, frame, floor_anchor=sigma)
+    dense = _operators(False, residual).predictive_covariance_update(mu, sigma, beta, frame,
+                                                                     floor_anchor=sigma)  # full U C U^T
     assert block.shape == sigma.shape
     assert (block - _block_diag(_diag_blocks(block))).abs().max() == 0.0          # exactly head-block diagonal
     assert (dense - _block_diag(_diag_blocks(dense))).abs().max() > 1e-3          # the dense result is not
@@ -128,16 +130,18 @@ def test_block_update_is_the_head_block_projection_of_the_dense_update(residual:
 
 @pytest.mark.parametrize("residual", [False, True])
 def test_next_layer_reference_covariance_is_frame_independent_only_for_the_block_projection(residual: bool) -> None:
-    r"""Under :math:`U\to gU` the block projection's :math:`C^+` is fixed; the diagonal projection's moves."""
+    r"""Under :math:`U\to gU` the block projection's :math:`C^+` is fixed; the diagonal projection's moves. The floor
+    anchor is the belief covariance, so the prior moves with the site action (:math:`\Sigma_p\to g\Sigma_pg^\top`)."""
     mu, sigma, beta, frame, action = _update_inputs()
     mu_g, sigma_g = _act(action, mu, sigma)
     frame_g = _act_on_frame(action, frame)
     block_ops, dense_ops = _operators(True, residual), _operators(False, residual)
-    C = _reference(block_ops.predictive_covariance_update(mu, sigma, beta, frame), frame)
-    C_g = _reference(block_ops.predictive_covariance_update(mu_g, sigma_g, beta, frame_g), frame_g)
+    C = _reference(block_ops.predictive_covariance_update(mu, sigma, beta, frame, floor_anchor=sigma), frame)
+    C_g = _reference(block_ops.predictive_covariance_update(mu_g, sigma_g, beta, frame_g, floor_anchor=sigma_g),
+                     frame_g)
     block_deviation = float((C - C_g).abs().max())
     # Diagonal projection of the same moment-matched covariance, read back in reference coordinates.
-    full, full_g = (dense_ops.predictive_covariance_update(*args) for args in
+    full, full_g = (dense_ops.predictive_covariance_update(*args, floor_anchor=args[1]) for args in
                     ((mu, sigma, beta, frame), (mu_g, sigma_g, beta, frame_g)))
     D_ref = _reference(torch.diag_embed(torch.diagonal(full, dim1=-2, dim2=-1)), frame)
     D_ref_g = _reference(torch.diag_embed(torch.diagonal(full_g, dim1=-2, dim2=-1)), frame_g)
@@ -163,7 +167,7 @@ def test_block_operators_refuse_routes_they_cannot_serve() -> None:
     mu, sigma, beta, frame, _ = _update_inputs()
     dense_frame = CanonicalFrameContext(_dense_frame(frame.forward, True), _dense_frame(frame.inverse, True))
     with pytest.raises(ValueError, match="compact"):
-        ops.predictive_covariance_update(mu, sigma, beta, dense_frame)
+        ops.predictive_covariance_update(mu, sigma, beta, dense_frame, floor_anchor=sigma)
 
 
 # ----------------------------------------------------------------------------------------------

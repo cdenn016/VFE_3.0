@@ -393,21 +393,36 @@ def _fd_gradient(f: Callable[[torch.Tensor], torch.Tensor], A: torch.Tensor, h: 
     return grad
 
 
+def _prior(sigma: torch.Tensor) -> torch.Tensor:
+    r"""A fixed local prior covariance :math:`\Sigma_p` in ``sigma``'s layout (diagonal ``(N, K)`` or full
+    ``(N, K, K)``), from its own generator: the anchor of the floor :math:`f\,\Sigma_p`, distinct from sigma."""
+    generator = torch.Generator().manual_seed(99)
+    if sigma.dim() == 2:
+        return torch.rand(sigma.shape, generator=generator, dtype=F64) + 0.4
+    K = sigma.shape[-1]
+    factor = torch.randn(sigma.shape, generator=generator, dtype=F64)
+    return factor @ factor.transpose(-1, -2) / K + 0.5 * torch.eye(K, dtype=F64)
+
+
+def _prior_dense(sigma: torch.Tensor) -> torch.Tensor:   # (N, K, K)
+    prior = _prior(sigma)
+    return torch.diag_embed(prior) if sigma.dim() == 2 else prior
+
+
 def _reference_outputs(case: _Case, A: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Local mean (without the residual) and moment-matched covariance (floor included) at factors ``A``."""
+    r"""Local mean (without the residual) and moment-matched covariance at factors ``A``, with the prior-anchored
+    floor :math:`f\,\Sigma_{p,i}` added in local coordinates (audit 2026-10-12 T5)."""
     F, _, Pi, _ = _chart(case.ops)
-    N, K = case.mu.shape
     M = _links(F, Pi, A, case.B, (case.beta != 0).any(dim=0), U=case.U)
     mean, cov = _kernel_moments(M, case.mu, case.sigma_dense, case.beta, case.ops.attention_residual)
-    trace = torch.diagonal(case.C, dim1=-2, dim2=-1).sum(-1)                   # (N,)
-    cov = cov + (FLOOR * trace / K)[:, None, None] * (case.U @ case.U.transpose(-1, -2))
-    return mean, cov
+    return mean, cov + FLOOR * _prior_dense(case.sigma)
 
 
 def _impl_outputs(case: _Case, ctx: edge_links.EdgeContext) -> Tuple[torch.Tensor, torch.Tensor]:
     with torch.no_grad():
         mean = case.ops.predictive_content(case.mu, case.beta, case.frame, edges=ctx)
-        cov = case.ops.predictive_covariance_update(case.mu, case.sigma, case.beta, case.frame, edges=ctx)
+        cov = case.ops.predictive_covariance_update(case.mu, case.sigma, case.beta, case.frame, edges=ctx,
+                                                    floor_anchor=_prior(case.sigma))
     return mean, cov
 
 
@@ -444,7 +459,7 @@ def test_reference_transport_energy_is_the_level_one_trace() -> None:
     K = case.mu.shape[-1]
     U_inv = torch.linalg.inv(case.U)
     trace_C = torch.diagonal(case.C, dim1=-2, dim2=-1).sum(-1)
-    cov_ref = U_inv @ cov_local @ U_inv.transpose(-1, -2) - (FLOOR * trace_C / K)[:, None, None] * torch.eye(K, dtype=F64)
+    cov_ref = U_inv @ (cov_local - FLOOR * _prior_dense(case.sigma)) @ U_inv.transpose(-1, -2)
     E_from_level_one = torch.diagonal(cov_ref, dim1=-2, dim2=-1).sum(-1) / (2.0 * trace_C / K)
     E = _reference_transport_energy(case.ops, case.A0, case.B, case.xi, case.C, case.beta, True)
     torch.testing.assert_close(E, E_from_level_one, atol=1e-10, rtol=1e-10)
@@ -702,7 +717,8 @@ def test_causality(regime: str) -> None:
         ctx2 = case.ops.edge_context(mu2, beta2, case.frame, sigma=sigma2, log_prior=log_prior2,
                                      link_state={"previous": prev2})
         mean2 = case.ops.predictive_content(mu2, beta2, case.frame, edges=ctx2)
-        cov2 = case.ops.predictive_covariance_update(mu2, sigma2, beta2, case.frame, edges=ctx2)
+        cov2 = case.ops.predictive_covariance_update(mu2, sigma2, beta2, case.frame, edges=ctx2,
+                                                     floor_anchor=_prior(sigma2))
     torch.testing.assert_close(ctx2.A[:m], ctx.A[:m], atol=1e-12, rtol=1e-12)
     torch.testing.assert_close(mean2[:m], mean[:m], atol=1e-12, rtol=1e-12)
     torch.testing.assert_close(cov2[:m], cov[:m], atol=1e-12, rtol=1e-12)
@@ -860,7 +876,8 @@ def test_no_grad_matches_grad_mode_and_outer_gradients_flow() -> None:
     ctx_g = case.ops.edge_context(mu, case.beta, case.frame, sigma=sigma, log_prior=case.log_prior,
                                   link_state=link_state)
     mean_g = case.ops.predictive_content(mu, case.beta, case.frame, edges=ctx_g)
-    cov_g = case.ops.predictive_covariance_update(mu, sigma, case.beta, case.frame, edges=ctx_g)
+    cov_g = case.ops.predictive_covariance_update(mu, sigma, case.beta, case.frame, edges=ctx_g,
+                                                  floor_anchor=_prior(sigma))
     assert ctx_g.A.requires_grad
     with torch.no_grad():
         ctx_n = case.ops.edge_context(case.mu, case.beta, case.frame, sigma=case.sigma, log_prior=case.log_prior,
@@ -879,12 +896,14 @@ def test_no_grad_matches_grad_mode_and_outer_gradients_flow() -> None:
     capture_g: dict = {}
     out_g, cov_rg = relational_predictive_readout(case.mu, case.sigma, case.frame, case.ops, log_prior=case.log_prior,
                                                   capture=capture_g, return_covariance=True,
-                                                  link_state={"previous": case.previous})
+                                                  link_state={"previous": case.previous},
+                                                  floor_anchor=_prior(case.sigma))
     with torch.no_grad():
         capture_n: dict = {}
         out_n, cov_rn = relational_predictive_readout(case.mu, case.sigma, case.frame, case.ops, log_prior=case.log_prior,
                                                       capture=capture_n, return_covariance=True,
-                                                      link_state={"previous": case.previous})
+                                                      link_state={"previous": case.previous},
+                                                      floor_anchor=_prior(case.sigma))
     torch.testing.assert_close(out_n, out_g.detach(), atol=1e-12, rtol=1e-12)
     torch.testing.assert_close(cov_rn, cov_rg.detach(), atol=1e-12, rtol=1e-12)
     for key in KEYS:

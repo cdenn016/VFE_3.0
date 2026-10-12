@@ -14,6 +14,13 @@ the routing prior :math:`\pi^h_{ij}` (the attention log-prior, causal mask and A
 is an independent snapshot of its input belief (the self edge included), and each head hears its own snapshot
 (the per-head snapshot convention, which coincides with the note's model when :math:`T_hC_jT_g^\top = 0`).
 
+The self-edge snapshot is a trade-off, not an identity (audit 2026-10-12, item 10). The record of source :math:`i` at
+receiver :math:`i` treats an independent copy of the receiver's own prior as evidence, so it counts that prior twice:
+at :math:`S = T` a receiver whose only admissible source is itself (token 0 under the causal prior) keeps its mean
+but contracts its covariance with no new information. Conditioning on the self edge exactly (the same :math:`X_i` on
+both sides of the record) removes the double count but makes the self record free, which at :math:`S = T` locks the
+routing onto the self edge. The share of the self term is measurable against the ``causal_noself`` prior.
+
 One head (index suppressed), with receiver query moments :math:`a_i = S\xi_i`, :math:`A_i = SC_iS^\top`, source
 utterance moments :math:`b_j = T\xi_j`, :math:`B_j = TC_jT^\top + nI` and record covariance
 :math:`W_{ij} = A_i + B_j\succ 0` (:func:`exact_record_posterior`, Proposition ``ma:prop:minimal`` (a)):
@@ -421,6 +428,7 @@ def mean_field_record_posterior(
     log_prior: Optional[torch.Tensor] = None,   # broadcastable to (..., I, J); None: uniform
     *,
     check:     bool = True,
+    labels_only_cost: bool = False,
 ) -> MeanFieldPosterior:
     r"""Mean-field label step at the receiver's prior and the label-averaged channel information.
 
@@ -434,6 +442,13 @@ def mean_field_record_posterior(
     :func:`vfe3.relational_scoring.projected_gaussian_kl` with the noisy key covariance :math:`B_j` (separable: one
     factor per receiver and per sender, no per-pair inverse; it raises if :math:`A_i` or :math:`B_j` is not
     positive definite). :func:`label_statistics` gives :math:`(\Lambda_i, \eta_i)`.
+
+    ``labels_only_cost=True`` is the caller's declaration that ``A`` and ``B`` are bitwise symmetric and that it
+    uses the returned cost only detached, so the cost reaches autograd only through the label softmax, which is
+    invariant to the row constant :math:`-\tfrac12\log\det A_i`. The KL then skips its symmetry check and runs the
+    query factorization without autograd (``symmetric_inputs``, ``query_row_constant_grad=False``). The values are
+    bitwise those of the default; the gradients lose only the log-determinant term, which the softmax backward
+    multiplies by a row sum that is zero analytically, so they agree to rounding (audit 2026-10-12, item 21).
     """
     if A.shape != (*a.shape, a.shape[-1]) or B.shape != (*b.shape, b.shape[-1]):
         raise ValueError("mean_field_record_posterior needs covariances (..., I, r, r) and (..., J, r, r)")
@@ -442,7 +457,9 @@ def mean_field_record_posterior(
     with torch.autocast(device_type=a.device.type, enabled=False):
         a, A, b, B = a.to(dtype), A.to(dtype), b.to(dtype), B.to(dtype)
         cost = projected_gaussian_kl(a.unsqueeze(-2), A.unsqueeze(-3),
-                                     b.unsqueeze(-2), B.unsqueeze(-3)).squeeze(-3)   # (..., I, J)
+                                     b.unsqueeze(-2), B.unsqueeze(-3),
+                                     symmetric_inputs=labels_only_cost,
+                                     query_row_constant_grad=not labels_only_cost).squeeze(-3)   # (..., I, J)
         lp = (torch.zeros(I, J, dtype=dtype, device=a.device) if log_prior is None else log_prior.to(dtype))
         weights = torch.softmax(lp - cost, dim=-1)                              # (..., I, J)
         Lambda, eta, failed = label_statistics(weights, b, B)
@@ -815,7 +832,9 @@ def minimal_agent_readout(
             def label_step(a_r: torch.Tensor, A_r: torch.Tensor) -> MeanFieldPosterior:
                 r"""Labels at the comparison-frame query moments ``(a_r, A_r)`` ``(..., H, N, d)``, ``(..., H, N, d, d)``,
                 their information back in the record frame; the labels, costs and flag are recorded."""
-                step = mean_field_record_posterior(a_r, A_r, b, B_kl, lp, check=False)
+                # A_r and B_kl are bitwise symmetric (_symmetrize, a diagonal shift, identity placeholders) and the
+                # cost leaves this readout only detached (score_energy_pre).
+                step = mean_field_record_posterior(a_r, A_r, b, B_kl, lp, check=False, labels_only_cost=True)
                 if Rot is not None:
                     # Label information back to receiver i's record frame: Lambda -> R_i^T Lambda R_i, eta -> R_i^T eta.
                     step = step._replace(
@@ -891,20 +910,24 @@ def local_posterior_covariance(
     block_diagonal: bool,
     gains:          torch.Tensor,               # (..., N, H, K, d) Kmat_i^h
     M:              torch.Tensor,               # (..., N, H, d, d) M_i^h
-    floor_scale:    torch.Tensor,               # (..., N) f tr(C_i) / K, the covariant floor coefficient
+    floor:          torch.Tensor,               # sigma's layout: f Sigma_{p,i}, the prior-anchored floor
 ) -> torch.Tensor:                              # same layout as sigma
-    r"""Local posterior covariance :math:`\Sigma_i^+ = U_iC_i^+U_i^\top + f\,\tfrac{\operatorname{tr}C_i}{K}U_iU_i^\top`.
+    r"""Local posterior covariance :math:`\Sigma_i^+ = U_iC_i^+U_i^\top + f\,\Sigma_{p,i}`.
 
     .. math::
-        \Sigma_i^+ = \Sigma_i - \sum_hZ_i^hM_i^hZ_i^{h\top} + f\,\tfrac{\operatorname{tr}C_i}{K}U_iU_i^\top,\qquad
+        \Sigma_i^+ = \Sigma_i - \sum_hZ_i^hM_i^hZ_i^{h\top} + f\,\Sigma_{p,i},\qquad
         Z_i^h = U_i\mathsf K_i^h\ (K\times d),
 
-    using :math:`\Sigma_i = U_iC_iU_i^\top` exactly, so the input covariance is not recomputed. A diagonal input returns
-    the diagonal (the moment projection onto the diagonal family),
-    :math:`\operatorname{diag}\Sigma_i - \sum_h\operatorname{rowquad}(Z_i^h, M_i^h) + f\,\tfrac{\operatorname{tr}C_i}{K}
-    \operatorname{diag}(U_iU_i^\top)` with :math:`\operatorname{rowquad}(Z, M)_k = Z_kMZ_k^\top`, which never forms a
-    :math:`K\times K` matrix.
+    using :math:`\Sigma_i = U_iC_iU_i^\top` exactly, so the input covariance is not recomputed. The floor
+    :math:`f\,\Sigma_{p,i}` (``floor``, formed by the caller) is the token's prior covariance in local coordinates: it
+    involves no frame, so the result is exactly invariant under a common reference change and covariant under a site
+    action, and it does not compound with depth (audit 2026-10-12, item 4 and T5). A diagonal input returns the
+    diagonal (the moment projection onto the diagonal family),
+    :math:`\operatorname{diag}\Sigma_i - \sum_h\operatorname{rowquad}(Z_i^h, M_i^h) + f\,\operatorname{diag}\Sigma_{p,i}`
+    with :math:`\operatorname{rowquad}(Z, M)_k = Z_kMZ_k^\top`, which never forms a :math:`K\times K` matrix.
     """
+    if floor.shape != sigma.shape:
+        raise ValueError(f"the floor must have the covariance's shape {tuple(sigma.shape)}, got {tuple(floor.shape)}")
     H, K, d = gains.shape[-3:]
     if block_diagonal:
         G, g = forward.shape[-3], forward.shape[-1]
@@ -913,19 +936,7 @@ def local_posterior_covariance(
     else:
         Z = forward.unsqueeze(-3) @ gains                                       # (..., N, H, K, d)
     if sigma.dim() == gains.dim() - 2:                                          # diagonal (..., N, K)
-        if block_diagonal:
-            frame_diag = forward.square().sum(dim=-1).flatten(-2)               # (..., N, K) diag(U U^T)
-        else:
-            frame_diag = forward.square().sum(dim=-1)
         downdate = torch.einsum("...nhks,...nhst,...nhkt->...nk", Z, M, Z)       # sum_h rowquad(Z^h, M^h)
-        return sigma - downdate + floor_scale.unsqueeze(-1) * frame_diag
-    if block_diagonal:
-        blocks = forward @ forward.transpose(-1, -2)                            # (..., N, G, g, g) U_m U_m^T
-        G, g = blocks.shape[-3], blocks.shape[-1]
-        frame_outer = torch.einsum("...mab,mn->...manb", blocks,
-                                   torch.eye(G, dtype=blocks.dtype, device=blocks.device)).reshape(
-                                       *blocks.shape[:-3], K, K)               # (..., N, K, K)
-    else:
-        frame_outer = forward @ forward.transpose(-1, -2)
+        return sigma - downdate + floor
     downdate = torch.einsum("...nhks,...nhst,...nhlt->...nkl", Z, M, Z)          # (..., N, K, K)
-    return _symmetrize(sigma - downdate + floor_scale[..., None, None] * frame_outer)
+    return _symmetrize(sigma - downdate + floor)

@@ -5,7 +5,7 @@ plain autograd bit for bit on the CPU. #30: the structurally diagonal rotation-i
 and a direct-difference float64 reference, values and every gradient, and is selected exactly when P(G) is diagonal.
 #12: a failed factorization under rotation_invariant with rope_fraction < 1 is rebuilt as P(X X^T) from the source.
 #14: the inverse measurement from chart factors against a 60-digit reference. #32, #48: configuration. #39: the
-diagonal-family floor bound. #40: finite source-root gradient at zero variance. #41: non-finite chart blocks reach
+diagonal-family floor, since audit 2026-10-12 T5 the prior floor f diag Sigma_p in every frame. #40: finite source-root gradient at zero variance. #41: non-finite chart blocks reach
 matrix_exp as NaN. #55: raise-only scorer verdicts are deferred. Tiny CPU shapes only.
 """
 import math
@@ -438,16 +438,33 @@ def test_rotation_invariant_with_every_coordinate_rotating_warns_once(monkeypatc
 # ---------------------------------------------------------------------------------------------- #39
 
 def test_diagonal_family_floor_bound() -> None:
-    r"""With only the floor, U^{-1} diag(U (f tau I) U^T) U^{-T} has lambda_min = f tau / ||D^{-1/2} U||_2^2 in [f tau/d, f tau]."""
+    r"""The diagonal family's floor is f diag Sigma_p in local coordinates, whatever the frames (audit 2026-10-12 T5).
+
+    The former reference floor f tau I survived the diagonal projection only as diag(U (f tau I) U^T), whose
+    guarantee was up to d times weaker than the full family's. With zero content maps and no residual the kernel
+    covariance vanishes, so the readout is exactly f Sigma_p for frames of growing non-orthogonality, and with the
+    content restored every variance exceeds f sigma_p (the bound is the same in both families)."""
     g = torch.Generator().manual_seed(8)
-    d, f_tau = 4, .3
+    H, d, N, f = 2, 2, 3, .3
+    K = H * d
+    ops = make_relational_operators([d] * H, 11, readout_mode="predictive_content", attention_residual=False,
+                                    predictive_covariance="moment_matched", predictive_covariance_floor=f).double()
+    mu = torch.randn(1, N, K, generator=g, dtype=F64)
+    sigma = torch.rand(1, N, K, generator=g, dtype=F64) + .3
+    prior = torch.rand(1, N, K, generator=g, dtype=F64) + .4
+    beta = torch.softmax(torch.randn(1, H, N, N, generator=g, dtype=F64), dim=-1)
+    O = ops.O.detach().clone()
     for scale in (.1, .5, 1.):
-        U = torch.linalg.matrix_exp(scale * torch.randn(d, d, generator=g, dtype=F64))
-        D = torch.diagonal(U @ U.T)
-        back = torch.linalg.inv(U) @ torch.diag(f_tau * D) @ torch.linalg.inv(U).T
-        bound = f_tau / torch.linalg.matrix_norm(U / D.sqrt().unsqueeze(-1), ord=2) ** 2
-        torch.testing.assert_close(torch.linalg.eigvalsh(back)[0], bound, rtol=1e-8, atol=0)
-        assert f_tau / d - 1e-12 <= float(bound) <= f_tau + 1e-12
+        blocks = torch.linalg.matrix_exp(scale * torch.randn(1, N, H, d, d, generator=g, dtype=F64))
+        frame = CanonicalFrameContext(blocks, torch.linalg.inv(blocks), block_diagonal=True)
+        with torch.no_grad():
+            ops.O.zero_()
+        torch.testing.assert_close(ops.predictive_covariance_update(mu, sigma, beta, frame, floor_anchor=prior),
+                                   f * prior, rtol=1e-12, atol=0)
+        with torch.no_grad():
+            ops.O.copy_(O)
+        content = ops.predictive_covariance_update(mu, sigma, beta, frame, floor_anchor=prior)
+        assert bool((content - f * prior > 0).all())
 
 
 # ---------------------------------------------------------------------------------------------- #40

@@ -332,12 +332,7 @@ def test_on_demand_probe_preparation_reuses_retained_batch_and_preserves_existin
         calls.append(("phi", model, seen_tokens.clone()))
         return {"probe": "phi"}
 
-    def collect_depth(model, seen_tokens, seen_targets, depths):
-        calls.append(("depth", model, seen_tokens.clone(), seen_targets.clone(), tuple(depths)))
-        return {"probe": "depth"}
-
     monkeypatch.setattr(report, "collect_phi_numerics", collect_phi)
-    monkeypatch.setattr(report, "collect_estep_depth_sensitivity", collect_depth)
     model = object()
     logger = logging.getLogger("test_on_demand_probes")
 
@@ -352,14 +347,8 @@ def test_on_demand_probe_preparation_reuses_retained_batch_and_preserves_existin
     assert json.loads((tmp_path / "phi_numerics.json").read_text(encoding="utf-8")) == {
         "probe": "phi",
     }
-    assert json.loads((tmp_path / "estep_depth_sensitivity.json").read_text(encoding="utf-8")) == {
-        "probe": "depth",
-    }
-    assert [call[0] for call in calls] == ["phi", "depth"]
+    assert [call[0] for call in calls] == ["phi"]
     assert torch.equal(calls[0][2], tokens)
-    assert torch.equal(calls[1][2], tokens)
-    assert torch.equal(calls[1][3], targets)
-    assert calls[1][4] == (0, 1, 2, 3, 5, 8)
 
     report._prepare_missing_saved_probes(
         model,
@@ -368,7 +357,7 @@ def test_on_demand_probe_preparation_reuses_retained_batch_and_preserves_existin
         torch.device("cpu"),
         logger,
     )
-    assert [call[0] for call in calls] == ["phi", "depth"]
+    assert [call[0] for call in calls] == ["phi"]
 
 
 def test_report_worker_rebuilds_persisted_figures_without_second_report_replay(

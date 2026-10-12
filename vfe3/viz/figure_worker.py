@@ -155,7 +155,6 @@ def _render_saved_probe_figures(run_dir: Path, logger: logging.Logger) -> List[P
         plot_beta_channel_decomposition,
         plot_context_sensitivity,
         plot_estep_character,
-        plot_estep_depth_sensitivity,
         plot_phi_numerics_reference,
         set_publication_style,
     )
@@ -163,11 +162,6 @@ def _render_saved_probe_figures(run_dir: Path, logger: logging.Logger) -> List[P
     set_publication_style()
 
     saved_probes = (
-        (
-            "estep_depth_sensitivity.json",
-            "estep_depth_sensitivity.png",
-            plot_estep_depth_sensitivity,
-        ),
         ("estep_character.json", "estep_character.png", plot_estep_character),
         (
             "beta_channel_decomposition.json",

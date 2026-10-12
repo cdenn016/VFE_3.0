@@ -439,13 +439,100 @@ def block_norm_covariance_pushforward(
     :math:`D = \operatorname{diag}(\gamma)/s`, in the O(K^2) rank-two form (:func:`layernorm_full_pushforward`), with
     the radial second-order term (:func:`layernorm_radial_term`); ``head_dims`` returns its head-block projection.
     Diagonal layout: its diagonal, the M-projection onto the diagonal family, in closed form
-    (:func:`layernorm_diagonal_pushforward`).
+    (:func:`layernorm_diagonal_pushforward`). Both are capped at the sphere bound (:func:`layernorm_trace_cap`).
     """
+    pushed = _uncapped_block_norm_pushforward(norm, mu, sigma, covariance_floor, head_dims)
+    diagonal = _is_diagonal_layout(mu, sigma)
+    return _apply_trace_cap(pushed, layernorm_trace_cap(pushed, _layernorm_arguments(norm)[1], diagonal), diagonal)
+
+
+def _uncapped_block_norm_pushforward(
+    norm:             Callable[..., torch.Tensor],
+    mu:               torch.Tensor,
+    sigma:            torch.Tensor,
+    covariance_floor: float,
+    head_dims:        Optional[Sequence[int]] = None,
+) -> torch.Tensor:
     eps, weight = _layernorm_arguments(norm)
     if _is_diagonal_layout(mu, sigma):
         return layernorm_diagonal_pushforward(mu, sigma, eps=eps, covariance_floor=covariance_floor, weight=weight)
     return layernorm_full_pushforward(mu, sigma, eps=eps, covariance_floor=covariance_floor, weight=weight,
                                       head_dims=head_dims)
+
+
+# Tokens whose LayerNorm covariance pushforward was capped at the sphere bound, per device, counted on the device
+# (no host synchronization); read by the training loop through layernorm_trace_cap_elements().
+_LAYERNORM_TRACE_CAPS: Dict[str, torch.Tensor] = {}
+
+
+def layernorm_trace_cap(
+    pushed:   torch.Tensor,                           # (..., K) diagonal or (..., K, K) full LayerNorm pushforward
+    weight:   Optional[torch.Tensor],                 # (K,) affine gamma, or None for the plain norm
+    diagonal: bool,
+) -> torch.Tensor:                                    # (..., 1) lambda in (0, 1]
+    r"""Scale :math:`\lambda = \min(1, B/\operatorname{tr}P)` that caps a LayerNorm pushforward at the sphere bound.
+
+    The exact LayerNorm output is :math:`\gamma\odot z + b` with :math:`z = c/\sqrt{v + \epsilon}`, so
+    :math:`\lVert z\rVert^2 = Kv/(v + \epsilon) < K` for every input, and for any input distribution
+
+    .. math::
+        \operatorname{tr}\operatorname{Cov}(\gamma\odot z) \le E\lVert\gamma\odot z\rVert^2
+            \le B = K\max_k\gamma_k^2
+
+    (:math:`B = K` for the plain norm). The delta method is valid only while the input variance is small against
+    :math:`s^2`: its first-order term grows as :math:`\Sigma/s^2` and its radial term as :math:`(\Sigma/s^2)^2`, and at
+    :math:`\Sigma/s^2 \approx 4\cdot 10^3` it gave a trace of :math:`7\cdot 10^6` against the Monte Carlo value
+    :math:`K = 20`, reaching NaN by the third layer (audit 2026-10-12, item 1). Scaling the pushforward :math:`P` by
+    :math:`\lambda` keeps it positive semidefinite, leaves it unchanged wherever its trace is within the bound, and
+    otherwise makes its trace exactly :math:`B`. In the bad regime the result is still an approximation; the capped
+    tokens are counted (:func:`layernorm_trace_cap_elements`).
+    """
+    K = pushed.shape[-1]
+    bound = float(K) if weight is None else K * weight.detach().to(pushed.dtype).square().amax()
+    trace = (pushed.sum(dim=-1, keepdim=True) if diagonal
+             else torch.diagonal(pushed, dim1=-2, dim2=-1).sum(dim=-1, keepdim=True))       # (..., 1)
+    lam = torch.clamp(bound / trace, max=1.0)                                                 # (..., 1)
+    with torch.no_grad():
+        key = str(pushed.device)
+        capped = (lam < 1.0).sum()
+        _LAYERNORM_TRACE_CAPS[key] = (capped if key not in _LAYERNORM_TRACE_CAPS
+                                      else _LAYERNORM_TRACE_CAPS[key] + capped)
+    return lam
+
+
+def _apply_trace_cap(
+    covariance: torch.Tensor,                         # (..., K) or (..., K, K)
+    lam:        Optional[torch.Tensor],               # (..., 1) from layernorm_trace_cap, or None
+    diagonal:   bool,
+) -> torch.Tensor:
+    if lam is None:
+        return covariance
+    lam = lam.to(covariance.dtype)
+    return covariance * lam if diagonal else covariance * lam.unsqueeze(-1)
+
+
+def block_norm_trace_cap(
+    norm:             Callable[..., torch.Tensor],
+    mu:               torch.Tensor,                   # (..., K) pre-norm means
+    sigma:            torch.Tensor,                   # (..., K) or (..., K, K) pre-norm covariance
+    covariance_floor: float,
+) -> torch.Tensor:                                    # (..., 1)
+    r"""The sphere-bound scale :math:`\lambda` of a block LayerNorm seam (:func:`layernorm_trace_cap`) for the
+    ``delta_full`` composite: its pushforward is linear in the norm-stage covariance
+    :math:`J_{\mathrm{LN}}\Sigma J_{\mathrm{LN}}^\top + fD\Sigma D + \rho gg^\top`, so capping that stage by :math:`\lambda`
+    scales the whole composite by :math:`\lambda` (``input_cap`` of ``forward_moments``)."""
+    pushed = _uncapped_block_norm_pushforward(norm, mu, sigma, covariance_floor)
+    return layernorm_trace_cap(pushed, _layernorm_arguments(norm)[1], _is_diagonal_layout(mu, sigma))
+
+
+def layernorm_trace_cap_elements() -> int:
+    r"""Capped LayerNorm-pushforward tokens since the last reset, over all devices. Host-syncs."""
+    return int(sum(int(count) for count in _LAYERNORM_TRACE_CAPS.values()))
+
+
+def reset_layernorm_trace_cap_elements() -> None:
+    r"""Zero the per-device LayerNorm trace-cap counters."""
+    _LAYERNORM_TRACE_CAPS.clear()
 
 
 def layernorm_full_pushforward(
@@ -563,6 +650,7 @@ def _check_input_linearization(
     input_jacobian: Optional[torch.Tensor],
     input_scale:    Optional[torch.Tensor],
     input_radial:   Optional[LayerNormRadialTerm] = None,
+    input_cap:      Optional[torch.Tensor] = None,
 ) -> None:
     if (input_jacobian is None) != (input_scale is None):
         raise ValueError("input_jacobian and input_scale come together from block_norm_linearization: the floor "
@@ -570,6 +658,9 @@ def _check_input_linearization(
     if input_radial is not None and input_jacobian is None:
         raise ValueError("input_radial is the block norm's radial second-order term (block_norm_radial_term) and "
                          "needs the norm's input_jacobian and input_scale")
+    if input_cap is not None and input_jacobian is None:
+        raise ValueError("input_cap is the block norm's sphere-bound scale (block_norm_trace_cap) and needs the "
+                         "norm's input_jacobian and input_scale")
 
 
 def _push_radial(
@@ -612,6 +703,7 @@ def _delta_covariance(
     covariance_floor: float,
     floor_scale:      Optional[torch.Tensor] = None,  # (..., K) D = diag(gamma)/s of a block norm, or None
     radial:           Optional[LayerNormRadialTerm] = None,   # the norm's radial term through the MLP, or None
+    cap:              Optional[torch.Tensor] = None,  # (..., 1) the norm's sphere-bound scale, or None
 ) -> torch.Tensor:                                    # sigma's layout
     r"""Delta-method pushforward :math:`(JL)(JL)^\top + \rho hh^\top + fD\Sigma D` with :math:`\Sigma = LL^\top`.
 
@@ -633,15 +725,18 @@ def _delta_covariance(
     independent of :math:`s` (the pre-norm floor :math:`f\Sigma` had a share growing as :math:`s^2`; audit 2026-10-09
     round 2, #13). Everything runs with autocast off and IEEE fp32 GEMMs at ``promote_types(dtype, float32)``: under
     bf16 autocast the rank-deficient :math:`J_{\mathrm{LN}}` product returned indefinite covariances (#2).
+    With ``cap`` (:func:`block_norm_trace_cap`) the whole result, linear in the norm-stage covariance, is scaled by the
+    norm's sphere-bound :math:`\lambda` (audit 2026-10-12, item 1).
     """
     if sigma.dim() == jacobian.dim() - 1:
-        return _diagonal_delta_covariance(jacobian, sigma, covariance_floor, floor_scale, radial)
+        return _apply_trace_cap(_diagonal_delta_covariance(jacobian, sigma, covariance_floor, floor_scale, radial),
+                                cap, True)
     dtype = _pushforward_dtype(jacobian, sigma)
     with torch.autocast(device_type=jacobian.device.type, enabled=False), ieee_fp32_matmul():
         pushed = _gram_pushforward(jacobian.to(dtype), sigma.to(dtype), covariance_floor,
                                    None if floor_scale is None else floor_scale.to(dtype), radial)
         if dtype == torch.float64:
-            return pushed
+            return _apply_trace_cap(pushed, cap, False)
         # The GEMM rounding of the Gram is bounded by about K u ||J L||^2, which exceeds the floor's smallest
         # eigenvalue f lambda_min(D Sigma D) once cond(Sigma) passes about f / (K u) (u the working roundoff). The
         # result is therefore certified by a Cholesky factorization at the working precision, and matrices that
@@ -653,7 +748,7 @@ def _delta_covariance(
             high = _gram_pushforward(jacobian.double(), sigma.double(), covariance_floor,
                                      None if floor_scale is None else floor_scale.double(), radial)
             pushed = torch.where(failed.unsqueeze(-1).unsqueeze(-1), high.to(dtype), pushed)
-        return pushed
+        return _apply_trace_cap(pushed, cap, False)
 
 
 def _diagonal_delta_covariance(
@@ -774,6 +869,7 @@ class BlockMLP(nn.Module):
         input_jacobian: Optional[torch.Tensor] = None, # (..., K, K) Jacobian of the block norm before the MLP
         input_scale: Optional[torch.Tensor] = None,    # (..., K) its scale D = diag(gamma)/s (with input_jacobian)
         input_radial: Optional[LayerNormRadialTerm] = None,   # its radial second-order term (with input_jacobian)
+        input_cap: Optional[torch.Tensor] = None,      # (..., 1) the norm's sphere-bound scale (block_norm_trace_cap)
     ) -> BlockMLPMomentResult:
         r"""Mean update and covariance under the contract; ``delta_full`` gives :math:`J\Sigma J^\top + f\Sigma`.
 
@@ -784,7 +880,7 @@ class BlockMLP(nn.Module):
         A diagonal ``sigma`` (..., K) returns the diagonal of the pushforward.
         """
         del frame_context
-        _check_input_linearization(input_jacobian, input_scale, input_radial)
+        _check_input_linearization(input_jacobian, input_scale, input_radial, input_cap)
         if self.covariance_contract == "passthrough":
             _reject_input_jacobian(input_jacobian, self.covariance_contract)
             return BlockMLPMomentResult(self.forward(mu, hidden_bias=hidden_bias), sigma, None)
@@ -792,7 +888,7 @@ class BlockMLP(nn.Module):
         radial = _push_radial(jacobian, input_radial)
         jacobian = _compose_input_jacobian(jacobian, input_jacobian)
         return BlockMLPMomentResult(
-            mu_out, _delta_covariance(jacobian, sigma, self.covariance_floor, input_scale, radial), jacobian)
+            mu_out, _delta_covariance(jacobian, sigma, self.covariance_floor, input_scale, radial, input_cap), jacobian)
 
 
 class GaugeGateBlockMLP(nn.Module):
@@ -968,9 +1064,10 @@ class GaugeGateBlockMLP(nn.Module):
         input_jacobian: Optional[torch.Tensor] = None,  # (..., K, K) block-norm Jacobian (delta_full only)
         input_scale: Optional[torch.Tensor] = None,     # (..., K) its scale D = diag(gamma)/s
         input_radial: Optional[LayerNormRadialTerm] = None,   # its radial second-order term
+        input_cap: Optional[torch.Tensor] = None,      # (..., 1) the norm's sphere-bound scale (block_norm_trace_cap)
     ) -> BlockMLPMomentResult:
         del frame_context
-        _check_input_linearization(input_jacobian, input_scale, input_radial)
+        _check_input_linearization(input_jacobian, input_scale, input_radial, input_cap)
         _reject_hidden_bias(
             hidden_bias,
             "the gauge_gate fc1 acts on the per-block Mahalanobis invariants, not on a coordinate "
@@ -1020,7 +1117,7 @@ class GaugeGateBlockMLP(nn.Module):
         jacobian = _compose_input_jacobian(jacobian, input_jacobian)
         return BlockMLPMomentResult(
             mu_out,
-            _delta_covariance(jacobian, sigma, self.covariance_floor, input_scale, radial),
+            _delta_covariance(jacobian, sigma, self.covariance_floor, input_scale, radial, input_cap),
             jacobian,
         )
 
@@ -1061,9 +1158,10 @@ class CanonicalFrameBlockMLP(BlockMLP):
         input_jacobian: Optional[torch.Tensor] = None,  # (..., K, K) block-norm Jacobian (delta_full only)
         input_scale: Optional[torch.Tensor] = None,     # (..., K) its scale D = diag(gamma)/s
         input_radial: Optional[LayerNormRadialTerm] = None,   # its radial second-order term
+        input_cap: Optional[torch.Tensor] = None,      # (..., 1) the norm's sphere-bound scale (block_norm_trace_cap)
     ) -> BlockMLPMomentResult:
         frame_context = _require_canonical_frame_context(frame_context)
-        _check_input_linearization(input_jacobian, input_scale, input_radial)
+        _check_input_linearization(input_jacobian, input_scale, input_radial, input_cap)
         apply = _frame_action(frame_context, mu)
         canonical_mu = apply(frame_context.inverse, mu)
         if self.covariance_contract == "passthrough":
@@ -1091,7 +1189,7 @@ class CanonicalFrameBlockMLP(BlockMLP):
         # A diagonal sigma (..., K) is local, like the realized Jacobian: it reads the diagonal of the local pushforward.
         return BlockMLPMomentResult(
             mu_out,
-            _delta_covariance(realized_jacobian, sigma, self.covariance_floor, input_scale, radial),
+            _delta_covariance(realized_jacobian, sigma, self.covariance_floor, input_scale, radial, input_cap),
             realized_jacobian,
         )
 

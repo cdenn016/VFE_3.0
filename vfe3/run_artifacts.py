@@ -189,9 +189,8 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "content_shapes": content_shapes,
         "parameter_counts": counts, "total_parameters": sum(counts.values()),
         "learning_rates": {
-            role: (cfg.m_p_mu_lr if getattr(cfg, f"m_relational_{role}_lr") is None
-                   else getattr(cfg, f"m_relational_{role}_lr"))
-            for role in counts},
+            # Unbound, so a duck-typed config (tests pass namespaces) resolves through the same rule.
+            role: VFE3Config.resolved_hyperparameter(cfg, f"m_relational_{role}_lr") for role in counts},
         "score_covariance_contract": ("exact_full_reduced_covariance_from_local_gaussian_plus_channel_noise"
                                       if minimal_agent else "exact_full_reduced_covariance_from_local_gaussian"),
         "receiver_noise": cfg.relational_receiver_noise if full_link else None,
@@ -253,6 +252,18 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
 def _conditional_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
     # The query/key frame pair is gone, so the conditional block carries no frame-role record.
     return _relational_artifact_fields(cfg)
+
+
+def _count_finalize_failure(
+    artifacts: "RunArtifacts",
+    name:      str,
+) -> None:
+    r"""Count one failed finalize-time probe in ``artifacts.diagnostics_failures``, which summary.json publishes
+    beside the training-time failures (audit 2026-10-12 #15)."""
+    failures = getattr(artifacts, "diagnostics_failures", None)
+    if failures is None:
+        failures = artifacts.diagnostics_failures = {}
+    failures[name] = failures.get(name, 0) + 1
 
 
 def _conditional_unavailable_probe(probe: str, cfg: Optional[VFE3Config] = None) -> Dict[str, object]:
@@ -4071,6 +4082,7 @@ def finalize_run(
             _depth_targets = _batch[1].to(device)
         except Exception as exc:
             logger.warning("diagnostic batch unavailable (%s); mechanism probes skipped", exc)
+            _count_finalize_failure(artifacts, "mechanism_probe_batch")
     if _depth_tokens is not None:
         try:
             _depth_record = collect_estep_depth_sensitivity(
@@ -4082,6 +4094,7 @@ def finalize_run(
             artifacts.save_json("estep_depth_sensitivity.json", _depth_record)
         except Exception as exc:
             logger.warning("estep depth-sensitivity probe failed (%s); skipped", exc)
+            _count_finalize_failure(artifacts, "estep_depth_sensitivity")
         _character_record = None
         _beta_record = None
         _context_record = None
@@ -4091,16 +4104,19 @@ def finalize_run(
             artifacts.save_json("estep_character.json", _character_record)
         except Exception as exc:
             logger.warning("estep character probe failed (%s); skipped", exc)
+            _count_finalize_failure(artifacts, "estep_character")
         try:
             _beta_record = collect_beta_channel_decomposition(model, _depth_tokens, _depth_targets)
             artifacts.save_json("beta_channel_decomposition.json", _beta_record)
         except Exception as exc:
             logger.warning("beta channel decomposition failed (%s); skipped", exc)
+            _count_finalize_failure(artifacts, "beta_channel_decomposition")
         try:
             _context_record = collect_context_sensitivity(model, _depth_tokens)
             artifacts.save_json("context_sensitivity.json", _context_record)
         except Exception as exc:
             logger.warning("context-sensitivity probe failed (%s); skipped", exc)
+            _count_finalize_failure(artifacts, "context_sensitivity")
         _log_mechanism_diagnostics(logger, _character_record, _beta_record, _context_record)
     if depth_loader is not None and vfe_model:
         try:
@@ -4112,6 +4128,7 @@ def finalize_run(
             artifacts.save_json("phi_numerics.json", _phi_record)
         except Exception as exc:
             logger.warning("phi numerical-reference probe failed (%s); skipped", exc)
+            _count_finalize_failure(artifacts, "phi_numerics")
     if skipped_analyses:
         results["model_family"] = model_family_of(model)
         results["skipped_analyses"] = dict(skipped_analyses)
@@ -4708,7 +4725,9 @@ def finalize_validation_run(
     is written from the restored model plus its matching optimizer/scaler/private-RNG/data cursor.
     ``summary.json`` is written only after that checkpoint exists. A validation/checkpoint failure
     restores the captured weights/RNG and re-raises,
-    publishing no summary (and, via the caller, no success contract).
+    publishing no summary (and, via the caller, no success contract). When ``terminal_state.final_validation``
+    carries the training loop's validation of the same final weights on this loader and ``tokens_per_char``,
+    those metrics are reused and the loop's row for that step stands in for the terminal row.
 
     Returns the ablation merge mapping with both ``final_val_bits_per_token`` and nullable
     ``final_val_bpc`` alongside the validation/selection/checkpoint fields.
@@ -4745,8 +4764,15 @@ def finalize_validation_run(
     final_train_loss = (float(losses[-1]) if losses else None)
     vfe_model = is_vfe_model(model)
 
+    # The loop already scored these weights on this loader at the final step and wrote that step's row: reuse
+    # it rather than evaluating twice and logging a second row for the same step (audit 2026-10-12 #12).
+    loop_validation = getattr(terminal_state, "final_validation", None)
+    reuse_loop_validation = (loop_validation is not None
+                             and loop_validation["val_loader"] is val_loader
+                             and loop_validation["tokens_per_char"] == tokens_per_char)
     try:
-        metrics = evaluate(model, val_loader, tokens_per_char=tokens_per_char, device=device)
+        metrics = (dict(loop_validation["metrics"]) if reuse_loop_validation
+                   else evaluate(model, val_loader, tokens_per_char=tokens_per_char, device=device))
         final_ce = float(metrics["ce"])
         final_ppl = float(metrics["ppl"])
         final_bits_per_token = float(metrics["bits_per_token"])
@@ -4788,7 +4814,8 @@ def finalize_validation_run(
         # Run-wide best BEFORE the terminal save: primary is the better of the finite periodic best and
         # the final validation, so after maybe_save_best it equals the selected finite best.
         prior_best = artifacts.best_val_ppl
-        artifacts.log_metrics(terminal_row)
+        if not reuse_loop_validation:
+            artifacts.log_metrics(terminal_row)
         artifacts.maybe_save_best(completed_step, model, final_ppl)
         # After the terminal save the selection is live and MUST be reachable: maybe_save_best either
         # atomically replaced any stale file with the terminal weights (a recomputed cell) or left an

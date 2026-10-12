@@ -622,10 +622,13 @@ and writes all $K$ state coordinates through a reduced $d=K/H$ channel. Q/K/T ha
 shape $(H,d,K)$ and O has shape $(H,K,d)$; the maps contribute $4K^2$ parameters per
 layer. There are no configurable input/output scope fields or identity-content arm.
 
-`projected_gradient` requires constant alpha (positive under `channel_likelihood`),
-`predictive_covariance="passthrough"`, `attention_residual=False`, `n_e_steps>=1`,
-`relational_routing="gaussian_kl"`, `family` in {`gaussian_diagonal`, `gaussian_full`},
-filtering, and unrolled updates. Under `euler` its inner mean and covariance learning
+`projected_gradient` requires `lambda_alpha_mode` in {`constant`, `state_dependent`,
+`state_dependent_per_coord`} (the last on `gaussian_diagonal` only; a constant alpha must be
+positive under `channel_likelihood`), `n_e_steps>=1`, `relational_routing="gaussian_kl"`,
+`family` in {`gaussian_diagonal`, `gaussian_full`, `gaussian_block`}, at least two heads,
+filtering, and unrolled updates. `predictive_covariance` and `attention_residual` are
+predictive-readout fields: under `projected_gradient` they are inert (listed by
+`inactive_fields()`), not refused. Under `euler` its inner mean and covariance learning
 rates are active and need calibration; under `closed_form` they are inert.
 
 Serialized retained-mode configurations with historical full/full scopes are accepted

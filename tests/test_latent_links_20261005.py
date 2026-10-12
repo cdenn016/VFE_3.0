@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader
 import vfe3.run_artifacts as ra
 import vfe3.train as T
 from tests.profiles import test_config, tiny_config
-from tests.test_edge_links_20261005 import FLOOR, _block_dense, _cases, _close, _inputs, _ops
+from tests.test_edge_links_20261005 import FLOOR, _block_dense, _cases, _close, _inputs, _ops, _prior
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.data.datasets import TokenWindows
 from vfe3.gradients.relational import relational_predictive_readout
@@ -102,6 +102,8 @@ def _previous(N: int, K: int = 4, r: int = 2, seed: int = 0, batch: Tuple[int, .
 
 def _readout(ops: RelationalOperators, mu: torch.Tensor, sigma: torch.Tensor, frame: CanonicalFrameContext,
              **kwargs: object) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""The covariance readout; the floor anchor Sigma_p defaults to a fixed prior in sigma's layout."""
+    kwargs.setdefault("floor_anchor", _prior(sigma, sigma.dim() == mu.dim() + 1))
     return relational_predictive_readout(mu, sigma, frame, ops, return_covariance=True, **kwargs)
 
 
@@ -128,8 +130,7 @@ def test_static_limit_reproduces_level_one(damping: float, residual: bool) -> No
 def test_transport_energy_is_the_trace_of_the_dense_covariance_body(residual: bool) -> None:
     r"""E_i(A) = tr C_i^att(A)|_no floor / (2 tr(C_i)/K) at a random A != A^0, against the Level 1 dense body."""
     ops = _latent_ops(residual, seed=3, sender=0.3, receiver=0.3)
-    twin = _level_one(ops)
-    twin.predictive_covariance_floor = 0.0
+    twin = _level_one(ops)                    # the dense body carries no floor (it is added by the public update)
     data = _inputs(seed=4, batch=(2,))
     mu, beta = data["mu"], data["beta"]
     g = torch.Generator().manual_seed(7)
@@ -216,7 +217,8 @@ def test_future_perturbations_leave_earlier_receivers_unchanged() -> None:
     def run(mu: torch.Tensor, sigma: torch.Tensor, previous: LinkState) -> Tuple[torch.Tensor, ...]:
         ctx = ops.edge_context(mu, beta, frame, sigma=sigma, link_state={"previous": previous})
         return (ctx.A, ops.predictive_content(mu, beta, frame, edges=ctx),
-                ops.predictive_covariance_update(mu, sigma, beta, frame, edges=ctx))
+                ops.predictive_covariance_update(mu, sigma, beta, frame, edges=ctx,
+                                                 floor_anchor=_prior(sigma, False)))
 
     base = run(data["mu"], data["sigma_diag"], previous)
     for last in range(1, N):
@@ -252,7 +254,8 @@ def test_masking_before_phi1_survives_a_future_overflow() -> None:
     def run(x: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         ctx = ops.edge_context(local(x), beta, frame, sigma=sigma)
         return (ctx.A, ops.predictive_content(local(x), beta, frame, edges=ctx),
-                ops.predictive_covariance_update(local(x), sigma, beta, frame, edges=ctx))
+                ops.predictive_covariance_update(local(x), sigma, beta, frame, edges=ctx,
+                                                 floor_anchor=_prior(sigma, False)))
 
     base = run(xi)
     assert all(bool(torch.isfinite(x).all()) for x in base)
@@ -283,9 +286,11 @@ def test_readout_is_gauge_covariant_through_routing_with_latent_factors() -> Non
     moved = CanonicalFrameContext(g_blocks @ blocks, torch.linalg.inv(g_blocks @ blocks), block_diagonal=True)
     mu, sigma = data["mu"], data["sigma_full"]
     capture: Dict[str, torch.Tensor] = {}
-    mean, cov = _readout(ops, mu, sigma, data["compact"], capture=capture)
+    prior = _prior(sigma, True)                                       # the floor's prior moves with the site action
+    mean, cov = _readout(ops, mu, sigma, data["compact"], capture=capture, floor_anchor=prior)
     assert float(capture["relational_latent_receiver_shift"]) > 1e-3   # the inference moved the factors
-    mean_g, cov_g = _readout(ops, (g @ mu.unsqueeze(-1)).squeeze(-1), g @ sigma @ g.transpose(-1, -2), moved)
+    mean_g, cov_g = _readout(ops, (g @ mu.unsqueeze(-1)).squeeze(-1), g @ sigma @ g.transpose(-1, -2), moved,
+                             floor_anchor=g @ prior @ g.transpose(-1, -2))
     _close(mean_g, (g @ mean.unsqueeze(-1)).squeeze(-1), 1e-9)
     _close(cov_g, g @ cov @ g.transpose(-1, -2), 1e-9)
 
@@ -306,8 +311,11 @@ def test_passive_gauge_action_at_fixed_routing_with_loops() -> None:
     _close(ctx_g.A, ctx.A, 1e-9)
     _close(ops.predictive_content(mu_g, beta, moved, edges=ctx_g),
            (g @ ops.predictive_content(mu, beta, data["dense"], edges=ctx).unsqueeze(-1)).squeeze(-1), 1e-9)
-    cov = ops.predictive_covariance_update(mu, sigma, beta, data["dense"], edges=ctx)
-    _close(ops.predictive_covariance_update(mu_g, sigma_g, beta, moved, edges=ctx_g), g @ cov @ g.transpose(-1, -2), 1e-9)
+    prior = _prior(sigma, True)
+    cov = ops.predictive_covariance_update(mu, sigma, beta, data["dense"], edges=ctx, floor_anchor=prior)
+    _close(ops.predictive_covariance_update(mu_g, sigma_g, beta, moved, edges=ctx_g,
+                                            floor_anchor=g @ prior @ g.transpose(-1, -2)),
+           g @ cov @ g.transpose(-1, -2), 1e-9)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -349,7 +357,8 @@ class _LatentReadout(torch.nn.Module):
         self.weights = weights
 
     def forward(self, mu: torch.Tensor, sigma: torch.Tensor, frame: CanonicalFrameContext) -> torch.Tensor:
-        mean, cov = relational_predictive_readout(mu, sigma, frame, self.ops, return_covariance=True)
+        mean, cov = relational_predictive_readout(mu, sigma, frame, self.ops, return_covariance=True,
+                                                  floor_anchor=_prior(sigma, False))
         return (self.weights[0] * mean).sum() + (self.weights[1] * cov).sum()
 
 

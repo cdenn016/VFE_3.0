@@ -346,7 +346,7 @@ def test_partial_scalar_is_withheld_alone(tmp_path, monkeypatch):
 
 
 def test_cv_is_kept_only_for_positive_ratio_scale_metrics():
-    signed = ms._ratio_scale_cv("diagnostics.zero_e_steps_counterfactual.ce_delta_vs_headline",
+    signed = ms._ratio_scale_cv("sigma_ce_spearman",
                                 ms._summarize([0.01, -0.02, 0.015]))
     ratio = ms._ratio_scale_cv("test_ppl", ms._summarize([10.0, 11.0, 12.0]))
     nonpositive = ms._ratio_scale_cv("test_ce", ms._summarize([1.0, -1.0, 2.0]))

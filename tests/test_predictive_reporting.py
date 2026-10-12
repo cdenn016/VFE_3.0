@@ -141,7 +141,7 @@ def test_report_draws_sigma_max_only_where_it_bounds_the_belief(
 def test_existing_unavailable_probes_are_refreshed_without_changing_valid_records(tmp_path: Path) -> None:
     model = _model()
     tokens, targets = torch.tensor([[0, 1, 2, 3]]), torch.tensor([[1, 2, 3, 4]])
-    for name in ("estep_depth_sensitivity", "phi_numerics", "estep_character",
+    for name in ("phi_numerics", "estep_character",
                  "beta_channel_decomposition", "context_sensitivity"):
         (tmp_path / f"{name}.json").write_text('{"available": false}', encoding="utf-8")
     report._prepare_missing_saved_probes(
@@ -156,7 +156,7 @@ def test_existing_unavailable_probes_are_refreshed_without_changing_valid_record
             assert not (tmp_path / f"{name}.png").exists()
         else:
             assert (tmp_path / f"{name}.png").stat().st_size > 0
-    # A subsequent call has no work; even the placeholder depth and phi records are preserved.
+    # A subsequent call has no work; even the placeholder phi record is preserved.
     before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
     report._prepare_missing_saved_probes(
         model, [], tmp_path, torch.device("cpu"), logging.getLogger(__name__))

@@ -208,8 +208,11 @@ def test_block_family_reads_the_mlp_covariance_through_its_head_block_projection
         if model.block_norm is not None:
             lin = block_norm_linearization(model.block_norm, converged.mu)
             radial = block_norm_radial_term(model.block_norm, converged.mu, converged.sigma)   # round 2 (10-10), #11
+            from vfe3.model.block_mlp import block_norm_trace_cap   # the sphere-bound cap (2026-10-12, item 1)
+            cap = block_norm_trace_cap(model.block_norm, converged.mu, converged.sigma,
+                                       model.cfg.block_mlp_covariance_floor)
             dense = mlp.forward_moments(pre.mu, converged.sigma, input_jacobian=lin.jacobian,
-                                        input_scale=lin.scale, input_radial=radial).sigma
+                                        input_scale=lin.scale, input_radial=radial, input_cap=cap).sigma
         else:
             dense = mlp.forward_moments(pre.mu, converged.sigma).sigma
         assert float(_off_block(dense).abs().max()) > 1e-6                     # the projection is not vacuous

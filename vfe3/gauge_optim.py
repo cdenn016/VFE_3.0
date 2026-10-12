@@ -1018,6 +1018,17 @@ def phi_projection_chunk_rows(
     return max(1, temporary_bytes // max(working_elements * element_size, 1))
 
 
+def _trainable_phi_tables(model: torch.nn.Module) -> List[torch.Tensor]:
+    """The distinct trainable frame tables: the token frames and, when learned, the positional table."""
+    unique = []
+    seen = set()
+    for table in (getattr(model.prior_bank, "phi_embed", None), getattr(model, "pos_phi_free", None)):
+        if table is not None and table.requires_grad and id(table) not in seen:
+            unique.append(table)
+            seen.add(id(table))
+    return unique
+
+
 @torch.no_grad()
 def project_phi_parameter_rows_(
     model:           torch.nn.Module,
@@ -1054,16 +1065,7 @@ def project_phi_parameter_rows_(
             not isinstance(count_out, torch.Tensor) or tuple(count_out.shape) != (2,)
             or count_out.dtype != torch.long or count_out.device != model.group.generator_device):
         raise ValueError("count_out must be a (2,) int64 tensor on the generator device")
-    tables = [
-        getattr(model.prior_bank, "phi_embed", None),
-        getattr(model, "pos_phi_free", None),
-    ]
-    unique = []
-    seen = set()
-    for table in tables:
-        if table is not None and table.requires_grad and id(table) not in seen:
-            unique.append(table)
-            seen.add(id(table))
+    unique = _trainable_phi_tables(model)
 
     group = model.group
     total_rows = 0
@@ -1112,6 +1114,156 @@ def project_phi_parameter_rows_(
         "phi_chart_preproject_max":     norm_max_value,
         "phi_chart_projection_scale_min": minimum_scale_value,
     }
+
+
+# Groups whose head-block algebra the spread projection maps into itself: gl(d) on every head
+# (block_glk, per-head or shared) and the realified gl(m, C) (block_glmc), where the clamp is a
+# functional calculus of the realified Hermitian part and so stays realified. Frames of the inert
+# groups are orthogonal or conformal on every head (S_0 = 0), so cond_2 = 1 and nothing is projected.
+FRAME_CONDITION_GROUPS:       Tuple[str, ...] = ("block_glk", "block_glmc")
+FRAME_CONDITION_INERT_GROUPS: Tuple[str, ...] = ("block_so", "block_co", "so_n")
+_SPREAD_BISECTION_STEPS = 64
+
+
+def _bounded_traceless_spectrum(
+    lam: torch.Tensor,             # (..., d) ascending eigenvalues of a traceless symmetric S_0
+    c:   float,
+) -> torch.Tensor:                 # (..., d) zero-sum spectrum with lambda_max - lambda_min <= 2c
+    r"""Clamp a zero-sum spectrum into a window of width :math:`2c` that keeps the sum at zero.
+
+    Returns :math:`x_i = \operatorname{clamp}(\lambda_i, t - c, t + c) - \bar{x}`, where :math:`t` solves
+    :math:`g(t) = \sum_i \operatorname{clamp}(\lambda_i, t - c, t + c) = 0`. The function :math:`g` is continuous
+    and nondecreasing, :math:`g(\lambda_{\min} + c) \le \sum_i\lambda_i = 0 \le g(\lambda_{\max} - c)`, so a root
+    lies in that bracket whenever the spread exceeds :math:`2c`; it is found by bisection. The final centering only
+    removes the bisection residual and leaves the spread unchanged. The result is the Euclidean projection of
+    :math:`\lambda` onto :math:`\{x : \max_i x_i - \min_i x_i \le 2c\}`: for a fixed window
+    :math:`[a, a + 2c]` the nearest point is the clamp, and stationarity in :math:`a` is
+    :math:`\sum_i (\operatorname{clamp}_i - \lambda_i) = 0`, which is :math:`g(t) = 0` for a zero-sum input.
+    A spectrum whose spread is already at most :math:`2c` is not meaningful input here: the caller masks
+    those blocks out.
+    """
+    lo = lam[..., :1] + c                                                  # (..., 1)
+    hi = lam[..., -1:] - c                                                 # (..., 1)
+    for _ in range(_SPREAD_BISECTION_STEPS):
+        t = 0.5 * (lo + hi)
+        below = torch.clamp(lam, t - c, t + c).sum(-1, keepdim=True) < 0.0
+        lo = torch.where(below, t, lo)
+        hi = torch.where(below, hi, t)
+    t = 0.5 * (lo + hi)
+    x = torch.clamp(lam, t - c, t + c)
+    return x - x.mean(-1, keepdim=True)
+
+
+@torch.no_grad()
+def bound_phi_frame_condition_(
+    model:     torch.nn.Module,
+    kappa_max: float,
+
+    *,
+    temporary_bytes: int = _PHI_PROJECTION_TEMPORARY_BYTES,
+) -> torch.Tensor:                 # () int64 on the generator device: rows changed (no host read)
+    r"""Bound the spectral condition number of every composed frame by ``kappa_max`` (audit 2026-10-12 T4).
+
+    For :math:`X\in\mathfrak{gl}(d)` let :math:`S = \tfrac12(X + X^\top)`. The logarithmic norm
+    (Dahlquist; Lozinskii) gives :math:`\|e^{X}\|_2 \le e^{\lambda_{\max}(S)}` and
+    :math:`\|e^{-X}\|_2 \le e^{-\lambda_{\min}(S)}`, so
+
+    .. math::
+        \kappa_2(e^{X}) \le \exp\big(\lambda_{\max}(S) - \lambda_{\min}(S)\big),
+
+    and :math:`\kappa_2` is submultiplicative over products. The trace part of :math:`S` shifts both
+    eigenvalues equally and the skew part :math:`\tfrac12(X - X^\top)` does not enter, so only the traceless
+    symmetric part :math:`S_0 = S - \tfrac{\operatorname{tr} S}{d} I` matters. Each head block whose spread
+    :math:`\lambda_{\max}(S_0) - \lambda_{\min}(S_0)` exceeds :math:`2c` is replaced by
+    :math:`X \leftarrow X - S_0 + S_0'`, with :math:`S_0' = Q\operatorname{diag}(x)Q^\top` built from
+    :math:`S_0 = Q\operatorname{diag}(\lambda)Q^\top` and :math:`x` from :func:`_bounded_traceless_spectrum`:
+    the eigenvalues are clamped into a width-:math:`2c` window placed so that :math:`\operatorname{tr} S_0' = 0`.
+    (A plain clamp to :math:`[-c, c]` would change the trace of an asymmetric spectrum.) The skew part, and
+    therefore the rotation, and the trace, and therefore :math:`\det e^{X}`, are unchanged, and
+    :math:`\kappa_2(e^{X}) \le e^{2c}`. Since :math:`\mathfrak{gl}(d)` splits Frobenius-orthogonally into skew,
+    scalar and traceless symmetric parts, and the nearest symmetric matrix under a spectral constraint shares
+    the eigenvectors (Hoffman-Wielandt), :math:`X'` is the Frobenius-nearest point of
+    :math:`\{X : \operatorname{spread}(S_0) \le 2c\}`; in particular :math:`\|X'\|_F \le \|X\|_F`, so the bound
+    never leaves the ``phi_mstep_max_matrix_norm`` ball. Blocks already within the bound, and rows with no
+    such block, are left bitwise unchanged; the projection is idempotent up to roundoff.
+
+    A frame is the product :math:`U_i = e^{X_i} e^{Y_i}` of ``n_factors`` learned factors (the token frame
+    ``phi_embed`` and, under ``pos_phi='learned'``, the positional row ``pos_phi_free``;
+    :func:`vfe3.geometry.transport.build_factored_transport`). With :math:`c = \log\kappa_{\max} / (2\,n)` every
+    composed frame satisfies :math:`\kappa_2(U_i) \le \kappa_{\max}` per head block, and since the frames are
+    block-diagonal, for the whole :math:`K\times K` frame. A RoPE rotation folded on the right is orthogonal and
+    does not change this. Not guaranteed: the pair transport :math:`\Omega_{ij} = U_i U_j^{-1}` is bounded only
+    by :math:`\kappa_{\max}^2`, and a fixed ``pos_phi='frozen'`` factor is not a parameter and is not counted
+    or bounded (the composed bound is then :math:`\kappa_{\max}\,\kappa_2(e^{Y_i})`).
+
+    The coordinates map to the per-head :math:`d\times d` blocks exactly: the canonical per-head ``block_glk``
+    coordinates are the row-major blocks themselves; any other supported basis (shared ``block_glk``,
+    ``block_glmc``) embeds as :math:`M_h = \sum_a \phi_a G_a^{(h)}` and maps back through its diagonal Frobenius
+    Gram, :math:`\Delta\phi_a = \sum_h \langle G_a^{(h)}, \Delta M_h\rangle_F / \|G_a\|_F^2`, which is exact
+    because :math:`\Delta M` lies in the algebra. The eigendecomposition runs in float64 and the result is cast
+    back to the table dtype. Optimizer moments are left unchanged, as in :func:`project_phi_parameter_rows_`.
+    """
+    if isinstance(kappa_max, bool) or not math.isfinite(kappa_max) or kappa_max <= 1.0:
+        raise ValueError(f"kappa_max must be a finite real > 1, got {kappa_max!r}")
+    if type(temporary_bytes) is not int or temporary_bytes < 1:
+        raise ValueError(f"temporary_bytes must be a positive int, got {temporary_bytes!r}")
+    group = model.group
+    if group.name not in FRAME_CONDITION_GROUPS:
+        raise ValueError(
+            f"the frame condition bound is implemented for gauge groups {FRAME_CONDITION_GROUPS}, "
+            f"got {group.name!r}")
+    dims = group.irrep_dims
+    if len(set(dims)) != 1:
+        raise ValueError(f"the frame condition bound needs equal head blocks, got {dims}")
+    H, d = len(dims), dims[0]
+    changed = torch.zeros((), device=group.generator_device, dtype=torch.long)
+    tables = _trainable_phi_tables(model)
+    if not tables:
+        return changed
+    c = math.log(kappa_max) / (2 * len(tables))
+
+    elementary = group.elementary_block_shape is not None
+    basis = gram = None
+    if not elementary:
+        basis = group.head_block_generators()                                  # (n_gen, H, d, d)
+        if basis is None and H == 1:
+            basis = group.generators.unsqueeze(1)                              # (n_gen, 1, K, K)
+        if basis is None or not group.frobenius_gram_diagonal:
+            raise ValueError(
+                f"gauge group {group.name!r}: the frame condition bound needs a head-block basis with a "
+                "diagonal Frobenius Gram")
+        basis = basis.detach().to(torch.float64)
+        gram = basis.square().sum(dim=(1, 2, 3))                               # (n_gen,)
+    # Roughly six float64 (H, d, d) temporaries per row (X, S_0, Q, the update and two products).
+    rows_per_chunk = max(1, temporary_bytes // (6 * 8 * H * d * d))
+    for table in tables:
+        rows = table.reshape(-1, table.shape[-1])
+        if rows.shape[-1] != group.generator_shape[0]:
+            raise ValueError(
+                "the frame condition bound requires full generator coordinates; got table width "
+                f"{rows.shape[-1]} and {group.generator_shape[0]} generators")
+        for start in range(0, rows.shape[0], rows_per_chunk):
+            chunk = rows[start : start + rows_per_chunk]
+            phi64 = chunk.to(torch.float64)                                    # (r, n_gen)
+            if elementary:
+                X = phi64.reshape(-1, H, d, d)                                 # (r, H, d, d)
+            else:
+                X = torch.einsum("ra,ahij->rhij", phi64, basis)                # (r, H, d, d)
+            S = 0.5 * (X + X.transpose(-1, -2))
+            trace_mean = S.diagonal(dim1=-2, dim2=-1).mean(-1)                 # (r, H)
+            S0 = S - trace_mean[..., None, None] * torch.eye(d, dtype=S.dtype, device=S.device)
+            lam, Q = torch.linalg.eigh(S0)                                     # (r, H, d), (r, H, d, d)
+            over = (lam[..., -1] - lam[..., 0]) > 2.0 * c                     # (r, H)
+            shift = torch.where(over[..., None], _bounded_traceless_spectrum(lam, c) - lam, 0.0)
+            delta = (Q * shift[..., None, :]) @ Q.transpose(-1, -2)            # (r, H, d, d) S_0' - S_0
+            if elementary:
+                dphi = delta.reshape(phi64.shape)
+            else:
+                dphi = torch.einsum("rhij,ahij->ra", delta, basis) / gram
+            row_over = over.any(-1)                                            # (r,)
+            chunk.copy_(torch.where(row_over[:, None], (phi64 + dphi).to(chunk.dtype), chunk))
+            changed.add_(row_over.sum())
+    return changed
 
 
 def _fisher_diagnostics(accumulated: Dict[str, List[torch.Tensor]]) -> Dict[str, float]:

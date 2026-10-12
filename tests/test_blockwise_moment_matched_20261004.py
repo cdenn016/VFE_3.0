@@ -86,10 +86,11 @@ def test_public_update_dispatches_on_family_and_frame(monkeypatch: pytest.Monkey
     for name in ("_predictive_covariance_update_blockwise", "_predictive_covariance_update_dense"):
         original = getattr(ops, name)
         monkeypatch.setattr(ops, name, lambda *a, _o=original, _n=name, **k: calls.append(_n) or _o(*a, **k))
-    ops.predictive_covariance_update(mu, sigma, beta, frame, receive)          # diagonal, compact
-    ops.predictive_covariance_update(mu, torch.diag_embed(sigma), beta, frame, receive)   # full family
+    ops.predictive_covariance_update(mu, sigma, beta, frame, receive, floor_anchor=sigma)          # diagonal, compact
+    ops.predictive_covariance_update(mu, torch.diag_embed(sigma), beta, frame, receive,
+                                     floor_anchor=torch.diag_embed(sigma))                         # full family
     dense_frame = CanonicalFrameContext(torch.block_diag(*frame.forward[0, 0]).expand(1, 5, 4, 4).clone(),
                                         torch.block_diag(*frame.inverse[0, 0]).expand(1, 5, 4, 4).clone())
-    ops.predictive_covariance_update(mu, sigma, beta, dense_frame, receive)    # dense frame
+    ops.predictive_covariance_update(mu, sigma, beta, dense_frame, receive, floor_anchor=sigma)    # dense frame
     assert calls == ["_predictive_covariance_update_blockwise", "_predictive_covariance_update_dense",
                      "_predictive_covariance_update_dense"]

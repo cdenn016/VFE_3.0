@@ -174,12 +174,17 @@ def _latest_training_checkpoint(run_dir: Path) -> Optional[Path]:
 
 
 def _recorded_reference(info: st.RunInfo, checkpoint: str, split: str) -> Optional[Dict[str, Any]]:
-    r"""The CE and scored-target count the run recorded for (checkpoint, split), if any."""
+    r"""The CE and scored-target count the run recorded for (checkpoint, split), if any.
+
+    The validation count is ``final_val_scored_targets`` in a :func:`finalize_run` summary and
+    ``val_scored_targets`` in a :func:`finalize_validation_run` (ablation-cell) summary.
+    """
     s = info.summary
+    val_scored = s.get("final_val_scored_targets", s.get("val_scored_targets"))
     weights = s.get("evaluation_weights", "final")
     if split == "validation" and checkpoint.startswith("final") and s.get("final_val_ce") is not None:
         return {"source": "summary.json final_val_ce", "ce": float(s["final_val_ce"]),
-                "scored_targets": s.get("final_val_scored_targets"), "kind": "final evaluation"}
+                "scored_targets": val_scored, "kind": "final evaluation"}
     if split == "test" and s.get("test_ce") is not None and checkpoint.startswith(weights):
         return {"source": "summary.json test_ce", "ce": float(s["test_ce"]),
                 "scored_targets": s.get("test_scored_targets"), "kind": "final evaluation"}
@@ -188,7 +193,7 @@ def _recorded_reference(info: st.RunInfo, checkpoint: str, split: str) -> Option
                 "scored_targets": s.get("test_scored_targets"), "kind": "final evaluation"}
     if split == "validation" and checkpoint.startswith("best") and s.get("best_val_ppl"):
         return {"source": "summary.json log(best_val_ppl)", "ce": math.log(float(s["best_val_ppl"])),
-                "scored_targets": s.get("final_val_scored_targets"), "kind": "in-training evaluation"}
+                "scored_targets": val_scored, "kind": "in-training evaluation"}
     if split == "train_sample":
         key = "train_sample_ce_final" if checkpoint.startswith("final") else "train_sample_ce_best"
         if s.get(key) is not None:

@@ -62,7 +62,7 @@ from vfe3.model.block_mlp import get_block_mlp_registration
 from vfe3.model.model import VFEModel, build_group
 from vfe3.path_utils import portable_path_component_key
 from vfe3.run_artifacts import RunArtifacts, _git_code_identity, _write_json_atomic, finalize_run
-from vfe3.runtime import seed_everything
+from vfe3.runtime import restored_fp32_matmul_precision, seed_everything
 from vfe3.train import train
 
 logger = logging.getLogger("scaling")
@@ -416,6 +416,8 @@ def build_standard_routes(settings: Dict[str, List[int]]) -> Dict[str, List[Dict
     ceiling = BASELINE.get("kl_max", VFE3Config.__dataclass_fields__["kl_max"].default)
 
     def width_override(k: int) -> Dict[str, Any]:
+        if ceiling is None:                                  # kl_max=None resolves to 8 * k in each cell
+            return {"embed_dim": k}
         return {"embed_dim": k, "kl_max": ceiling * k / baseline_k}
 
     return {
@@ -1180,6 +1182,7 @@ def _scaling_cell_has_payload(run_dir: Path) -> bool:
     )
 
 
+@restored_fp32_matmul_precision()         # a None cell must not inherit the previous cell's pinned matmul policy
 def run_cell(
     cell:       Dict[str, Any],
     run_dir:    Path,
