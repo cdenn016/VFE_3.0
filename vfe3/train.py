@@ -57,7 +57,7 @@ from vfe3.metric_contracts import perplexity_from_ce
 from vfe3.metrics import COLLAPSE_ENTROPY_FRACTION, LINK_SPECTRUM_KEYS, routing_triangle_defect_sums
 from vfe3.model.block import _as_coeff
 from vfe3.model.block_mlp import PrototypeAgentBlockMLP
-from vfe3.model.minimal_agent import MINIMAL_AGENT_ELBO_KEYS
+from vfe3.model.minimal_agent import MINIMAL_AGENT_ELBO_KEYS, MINIMAL_AGENT_IS_SAMPLES
 from vfe3.model.model import CANONICAL_DIAGNOSTIC_KEYS, DiagnosticSnapshot, VFEModel
 from vfe3.model.prior_bank import PriorBank, get_decode_registration
 from vfe3.run_artifacts import RunArtifacts          # top-level safe: run_artifacts imports evaluate
@@ -1574,13 +1574,15 @@ _VAL_LATENT_DIAG_KEYS = tuple("val_relational_latent_" + key for key in (
 # head-max coupling ||S_h C S_g^T||_F / (||S_h C S_h^T||_F ||S_g C S_g^T||_F)^{1/2} at the input moments (0: ADF is
 # exact), the head-mean mean-field label staleness (TV of one relabeling at the posterior; NaN under 'exact') and the
 # covariance contraction tr C^+ / tr C and the head-mean exact spread share tr(A R) / tr(A Lambda_bar) (NaN under
-# 'mean_field'), and the head-mean mean-field M-step optimum n_h^* (minimal_agent.channel_noise_mstep; NaN under
-# 'exact').
+# 'mean_field'), the head-mean mean-field M-step optimum n_h^* over the heads with an interior optimum
+# (minimal_agent.channel_noise_mstep; NaN under 'exact') and the fraction of heads at its n -> 0 bracket.
 _VAL_MINIMAL_AGENT_DIAG_KEYS = tuple("val_relational_minimal_agent_" + key for key in (
     "gain_fraction", "channel_noise", "head_coupling", "label_staleness", "covariance_contraction",
-    "spread_share", "channel_noise_mstep"))
-# Under diagnose_agent_elbo (minimal agent only; audit 2026-10-12 T1): the last layer's receiver-mean evidence lower
-# bound of the readout's posterior, the ADF evidence of the record model and their gap, in nats.
+    "spread_share", "channel_noise_mstep", "channel_noise_mstep_boundary"))
+# Under diagnose_agent_elbo (minimal agent only; audit 2026-10-12 T1 and round 2, item 12 and M1): the last layer's
+# receiver-mean evidence lower bound of the posterior the readout returns, the ADF evidence of the record model
+# (assumed density; exact only for uncoupled heads), the exact evidence (NaN unless every receiver's heads are
+# uncoupled), the importance-sampled evidence under q, and the gaps to the bound, in nats.
 _VAL_MINIMAL_AGENT_ELBO_KEYS = tuple("val_" + key for key in MINIMAL_AGENT_ELBO_KEYS)
 
 
@@ -1658,10 +1660,11 @@ ROUTING_HOLONOMY_FIELDS: Tuple[str, ...] = (
 # the fixed validation windows: gain fraction, channel noise n_h, head coupling, mean-field label staleness (TV of one
 # relabeling at the posterior; NaN under 'exact'), the layer's covariance contraction tr C^+ / tr C and the exact
 # spread share tr(A R) / tr(A Lambda_bar) (the part of the removed variance the mean field drops; NaN under the mean field)
-# and the mean-field M-step optimum n_h^* of the channel noise beside the learned channel_noise (NaN under 'exact').
+# and the mean-field M-step optimum n_h^* of the channel noise beside the learned channel_noise (NaN under 'exact'
+# and at the n -> 0 bracket) with its bracket flag (1 at the bracket; audit 2026-10-12 round 2, M2).
 MINIMAL_AGENT_HEAD_FIELDS: Tuple[str, ...] = (
     "step", "layer", "head", "gain_fraction", "channel_noise", "head_coupling", "label_staleness",
-    "covariance_contraction", "spread_share", "channel_noise_mstep")
+    "covariance_contraction", "spread_share", "channel_noise_mstep", "channel_noise_mstep_boundary")
 _MINIMAL_AGENT_HEAD_CAPTURE = tuple("relational_minimal_agent_" + key for key in MINIMAL_AGENT_HEAD_FIELDS[3:])
 # Prototype-agent block MLP per layer (block_mlp_mode='prototype_agents'), over the tokens of the fixed validation
 # windows: effective templates in use exp(H(mean_t w_t)), the token-mean weight entropy, the fraction of templates
@@ -1673,9 +1676,12 @@ PROTOTYPE_TEMPLATE_FIELDS: Tuple[str, ...] = (
     "log_lambda_median", "log_lambda_max", "prior_entropy", "gain_fraction", "label_staleness", "n_tokens")
 # Per-layer evidence diagnostics (diagnose_agent_elbo; audit 2026-10-12 T1), means over the receivers (tokens) of the
 # fixed validation windows, in nats: the evidence lower bound of the posterior the layer forms, the evidence of its
-# declared record model (minimal agent: ADF over the heads, exact for one head; prototypes: exact) and their gap.
+# declared record model and their gap. Minimal agent (round 2, item 12 and M1): the ADF evidence over the heads
+# (assumed density, exact for uncoupled heads) and its gap, the exact evidence (NaN unless every receiver's heads are
+# uncoupled), and the importance-sampled evidence under q with its gap and sample count. Prototypes: exact.
 # Written to diagnostics/minimal_agent_elbo.csv and diagnostics/prototype_elbo.csv only when the toggle is on.
-MINIMAL_AGENT_ELBO_FIELDS: Tuple[str, ...] = ("step", "layer", "elbo", "evidence", "elbo_gap")
+MINIMAL_AGENT_ELBO_FIELDS: Tuple[str, ...] = (
+    "step", "layer", *(key[len("relational_minimal_agent_"):] for key in MINIMAL_AGENT_ELBO_KEYS), "is_samples")
 PROTOTYPE_ELBO_FIELDS: Tuple[str, ...] = ("step", "layer", "elbo", "evidence", "elbo_gap", "n_tokens")
 
 # S1 panel D numerical-event counters (GL(K)_attention_v2 fig:placeholder_numerics, 2026-09-28).
@@ -2815,7 +2821,7 @@ def _accumulate_minimal_agent(
         if MINIMAL_AGENT_ELBO_KEYS[0] in capture:                                # diagnose_agent_elbo
             bound = torch.stack([capture[key].detach().double().cpu().reshape(()) for key in MINIMAL_AGENT_ELBO_KEYS])
             total = features_out.setdefault("minimal_agent_elbo", {}).setdefault(layer, [torch.zeros_like(bound), 0])
-            total[0] += bound                                                    # (3,) elbo, evidence, gap
+            total[0] += bound                                                    # (F,) MINIMAL_AGENT_ELBO_KEYS
             total[1] += 1
 
 
@@ -2829,9 +2835,9 @@ def _elbo_rows(
     token means."""
     minimal_rows: List[Dict[str, float]] = []
     for layer, (total, count) in sorted(features.get("minimal_agent_elbo", {}).items()):
-        elbo, evidence, gap = (total / count).tolist()
-        minimal_rows.append({"step": int(step), "layer": int(layer), "elbo": elbo, "evidence": evidence,
-                             "elbo_gap": gap})
+        minimal_rows.append({"step": int(step), "layer": int(layer),
+                             **dict(zip(MINIMAL_AGENT_ELBO_FIELDS[2:-1], (total / count).tolist())),
+                             "is_samples": MINIMAL_AGENT_IS_SAMPLES})
     prototype_rows: List[Dict[str, float]] = []
     for layer, (elbo, evidence, gap, tokens) in sorted(features.get("prototype_elbo", {}).items()):
         n = max(1, tokens)

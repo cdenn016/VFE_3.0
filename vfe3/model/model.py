@@ -2337,23 +2337,25 @@ class VFEModel(nn.Module):
         fraction, of the channel noise :math:`n_h`, of the mean-field label staleness (NaN under ``"exact"``) and of
         the exact spread share (NaN under ``"mean_field"``), the head maximum of the head coupling (0 means ADF is
         exact at the input moments), the layer's covariance contraction :math:`\operatorname{tr}C^+/\operatorname{tr}C` and
-        the head mean of the mean-field M-step optimum :math:`n_h^*` (NaN under ``"exact"``), to set beside the learned
-        :math:`n_h`.
-        Under ``diagnose_agent_elbo`` it also reports the layer's receiver-mean evidence lower bound, ADF evidence and
-        their gap in nats (:data:`vfe3.model.minimal_agent.MINIMAL_AGENT_ELBO_KEYS`).
+        the head mean of the mean-field M-step optimum :math:`n_h^*` over the heads whose optimum is interior (NaN
+        under ``"exact"`` or when every head sits at the :math:`n\to 0` bracket), to set beside the learned
+        :math:`n_h`, and the fraction of heads at that bracket.
+        Under ``diagnose_agent_elbo`` it also reports the layer's receiver-mean evidence lower bound, ADF, exact and
+        importance-sampled evidence and the gaps in nats (:data:`vfe3.model.minimal_agent.MINIMAL_AGENT_ELBO_KEYS`).
         """
-        gain, noise, coupling, staleness, contraction, spread, mstep = (cap[key] for key in (
+        gain, noise, coupling, staleness, contraction, spread, mstep, boundary = (cap[key] for key in (
             "relational_minimal_agent_gain_fraction", "relational_minimal_agent_channel_noise",
             "relational_minimal_agent_head_coupling", "relational_minimal_agent_label_staleness",
             "relational_minimal_agent_covariance_contraction", "relational_minimal_agent_spread_share",
-            "relational_minimal_agent_channel_noise_mstep"))
+            "relational_minimal_agent_channel_noise_mstep", "relational_minimal_agent_channel_noise_mstep_boundary"))
         out = {"relational_minimal_agent_gain_fraction": float(gain.mean()),
                "relational_minimal_agent_channel_noise": float(noise.mean()),
                "relational_minimal_agent_head_coupling": float(coupling.max()),
                "relational_minimal_agent_label_staleness": float(staleness.double().nanmean()),
                "relational_minimal_agent_covariance_contraction": float(contraction.mean()),
                "relational_minimal_agent_spread_share": float(spread.double().nanmean()),
-               "relational_minimal_agent_channel_noise_mstep": float(mstep.double().nanmean())}
+               "relational_minimal_agent_channel_noise_mstep": float(mstep.double().nanmean()),
+               "relational_minimal_agent_channel_noise_mstep_boundary": float(boundary.double().mean())}
         out.update({key: float(cap[key]) for key in MINIMAL_AGENT_ELBO_KEYS if key in cap})
         return out
 
