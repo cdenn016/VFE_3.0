@@ -153,6 +153,7 @@ config = dict(
     decode_coordinates               = "local",       # "local" | "reference" (reference: decode_mode "linear" | "diagonal_chunked" | "full_chunked")
               
     minimal_agent_channel_noise      = 1.0,         # initial channel noise n_h > 0
+    relational_key_noise             = 1.0,         # relational_routing="noisy_key" only: initial per-head key noise n_h > 0 (learned; routes at temperature 1)
     predictive_covariance_floor      = 1e-4,        # moment_matched only: floor * Sigma_p (token's local prior covariance), reference-invariant
     relational_receiver_damping      = 1.0,         # closed_form only: rho in (0, 1]; 1 = the frozen minimizer    
     relational_receiver_noise        = 1.0,         # channel floor nu I_d (channel_likelihood) | K-dim reference noise (ambient_alignment)

@@ -52,7 +52,7 @@ def test_mean_distance_cost_is_the_identity_covariance_kl_and_ignores_covariance
 
 
 def test_routing_cost_dispatch() -> None:
-    assert set(ROUTING_COSTS) == {"gaussian_kl", "noisy_query", "mean_distance"}
+    assert set(ROUTING_COSTS) == {"gaussian_kl", "noisy_query", "noisy_key", "mean_distance"}
     assert routing_cost("mean_distance") is projected_mean_distance_cost
     with pytest.raises(ValueError, match="relational routing"):
         routing_cost("dot_product")

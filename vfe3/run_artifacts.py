@@ -150,6 +150,11 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         layer_counts["score"] -= K*K
     if getattr(cfg, "learn_attention_temperature", False):  # routing_log_temperature (H,) per layer
         layer_counts["score"] += H
+    noisy_key = not minimal_agent and getattr(cfg, "relational_routing", "gaussian_kl") == "noisy_key"
+    key_noise_fields: Dict[str, object] = {}
+    if noisy_key:                                           # routing_key_log_noise (H,) per layer
+        layer_counts["score"] += H
+        key_noise_fields = {"relational_key_noise_init": float(cfg.relational_key_noise)}
     counts = {role: count * cfg.n_layers for role, count in layer_counts.items()}
     return {"relational_operators": {
         "attention_mode": cfg.attention_mode,
@@ -185,6 +190,7 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "content_link_chart": None if minimal_agent else cfg.content_link_chart,
         **edge_fields,
         **agent_fields,
+        **key_noise_fields,
         "score_shape": score_shape,
         "content_shapes": content_shapes,
         "parameter_counts": counts, "total_parameters": sum(counts.values()),
@@ -232,6 +238,7 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
                                    else "failed_entries_source_square_root_qr_fp64"),
         "temperature_convention": ((f"unit_temperature_{'exact' if cfg.minimal_agent_inference == 'exact' else 'mean_field'}"
                                     "_posterior_no_clamp") if minimal_agent
+                                   else "unit_temperature_learned_key_noise" if noisy_key
                                    else "kappa_beta_times_sqrt_ambient_head_dim"),
         # Exact minimal agent: head h routes on the receiver moments left by heads 1..h-1 (ADF), sources pre-update.
         "routing_state": ("episode_initial" if full_link

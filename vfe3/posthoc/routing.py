@@ -168,8 +168,9 @@ def not_applicable_reason(model: torch.nn.Module) -> Optional[str]:
                 "step), not the clamped Gaussian KL of Eq. (projected_full_kl)")
     routes = sorted({str(getattr(op, "routing", "gaussian_kl")) for op in operators})
     if routes != ["gaussian_kl"]:
-        return (f"relational_routing={routes}: the noisy-query cost -log N(a_i; b_j, V_Q + V_K) and the "
-                "mean-distance cost ||a_i - b_j||^2/2 are not the Gaussian KL of Eq. (projected_full_kl)")
+        return (f"relational_routing={routes}: the noisy-query cost -log N(a_i; b_j, V_Q + V_K), the noisy-key cost "
+                "KL(N(a_i, V_Q) || N(b_j, V_K + n_h I)) at temperature 1 and the mean-distance cost ||a_i - b_j||^2/2 "
+                "are not the Gaussian KL of Eq. (projected_full_kl)")
     readouts = sorted({str(op.readout_mode) for op in operators})
     if readouts != ["predictive_content"]:
         return f"readout_mode={readouts}: routing is not the predictive-content readout"

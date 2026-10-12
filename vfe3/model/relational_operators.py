@@ -334,6 +334,11 @@ class RelationalOperators(nn.Module):
     :math:`O'^{-1}` (:func:`vfe3.gradients.full_link.build_full_link_context`); it is an attribute, not a parameter.
     ``routing`` selects the projected routing cost: Gaussian KL, or the noisy-query cost
     N(a_i; b_j, V_Q + V_K) of the expected likelihood kernel (predictive_content only).
+    ``routing="noisy_key"`` (predictive_content, kernel readout) scores
+    :math:`\mathrm{KL}(N(a_i, V_{Q,i})\,\|\,N(b_j, V_{K,j} + n_hI))` at temperature 1
+    (:func:`vfe3.relational_scoring.projected_noisy_key_cost`, :meth:`routing_temperature`) and adds
+    ``routing_key_log_noise`` ``(H,)``, :math:`\log n_h`, initialized to ``log(routing_key_noise)``; with any other
+    routing no such parameter exists.
     ``predictive_covariance_checkpoint`` recomputes the moment-matched covariance update in backward
     instead of saving its (..., N, K, K) intermediates: the same values and gradients bit for bit,
     for about half the activation memory of a large-K step.
@@ -406,6 +411,7 @@ class RelationalOperators(nn.Module):
         tie_comparison_maps:   bool  = False,
         block_covariance:      bool  = False,
         pair_kl_gemm_tol:      Optional[float] = None,
+        routing_key_noise:     float = 1.0,
     ) -> None:
         super().__init__()
         self.kl_max_reference = kl_max_reference      # "absolute" | "row_min" kernel-router clamp reference
@@ -559,6 +565,13 @@ class RelationalOperators(nn.Module):
         if minimal and (learn_attention_temperature or tie_comparison_maps):
             raise ValueError("predictive_readout='minimal_agent' routes at temperature 1 with the key tied to T; "
                              "learn_attention_temperature and tie_comparison_maps need the kernel readout")
+        noisy_key = routing == "noisy_key" and not minimal   # the minimal agent does not read ``routing``
+        if noisy_key and learn_attention_temperature:
+            raise ValueError("routing='noisy_key' routes at temperature 1 (the learned key noise sets the sharpness); "
+                             "learn_attention_temperature must be False")
+        if (isinstance(routing_key_noise, bool) or not isinstance(routing_key_noise, Real)
+                or not math.isfinite(routing_key_noise) or routing_key_noise <= 0.0):
+            raise ValueError(f"routing_key_noise must be finite and positive, got {routing_key_noise!r}")
         if tie_comparison_maps and readout_mode != "predictive_content":
             raise ValueError("tie_comparison_maps requires the predictive_content readout")
         self.tie_comparison_maps = tie_comparison_maps
@@ -567,6 +580,12 @@ class RelationalOperators(nn.Module):
             self.routing_log_temperature = nn.Parameter(torch.zeros(len(self.irrep_dims)))   # (H,)
         else:
             self.register_parameter("routing_log_temperature", None)
+        # log n_h of the noisy-key law N(b_j, V_K,j + n_h I); absent (no state-dict key) under any other routing.
+        if noisy_key:
+            self.routing_key_log_noise = nn.Parameter(
+                torch.full((len(self.irrep_dims),), math.log(float(routing_key_noise))))     # (H,)
+        else:
+            self.register_parameter("routing_key_log_noise", None)
         self.score_rank_per_head = irrep_dims[0] if equal else list(irrep_dims)
         self.content_rank_per_head = irrep_dims[0] if equal else list(irrep_dims)
         if minimal:
@@ -866,7 +885,8 @@ class RelationalOperators(nn.Module):
         (:math:`T_hC_jT_h^\top`, the noise-free key law), ``relational_mean_displacement_norm`` and the per-head
         :data:`vfe3.model.minimal_agent.MINIMAL_AGENT_DIAGNOSTIC_KEYS`: per head ``(H,)`` the gain fraction, head
         coupling, mean-field label staleness and exact spread share (means over receivers; each NaN in the other
-        mode) and
+        mode), the mean-field M-step optimum :math:`n_h^*` of the call
+        (:func:`vfe3.model.minimal_agent.channel_noise_mstep`; NaN under exact inference) and
         :math:`n_h`, and the layer's covariance contraction :math:`\operatorname{tr}C^+/\operatorname{tr}C` (repeated
         per head).
 
@@ -973,6 +993,8 @@ class RelationalOperators(nn.Module):
                     "relational_minimal_agent_covariance_contraction":                     # layer value per head
                         result.covariance_contraction.mean().expand(H),
                     "relational_minimal_agent_spread_share": result.spread_share.reshape(-1, H).nanmean(0),
+                    # mean field: the M-step optimum n_h^* of the call beside the learned n_h (exact: NaN)
+                    "relational_minimal_agent_channel_noise_mstep": result.channel_noise_mstep.to(dtype),
                 }
         status = torch.stack((result.failed, result.ill_conditioned))                         # (2,) bool
         return (mu_plus.to(mu.dtype), None if sigma_plus is None else sigma_plus.to(sigma.dtype), record, status)
@@ -1338,7 +1360,9 @@ class RelationalOperators(nn.Module):
     ) -> 'float | torch.Tensor':                # tau unchanged, or the learned (H,) tau_{l,h}
         r"""Gibbs routing temperature of this layer.
 
-        Without ``learn_attention_temperature`` the configured temperature is returned unchanged. With it,
+        Under ``routing="noisy_key"`` it is exactly 1 (the learned key noise :math:`n_h` sets the sharpness and the
+        routing objective is the KL of the declared joint). Otherwise, without ``learn_attention_temperature`` the
+        configured temperature is returned unchanged. With it,
 
         .. math::
             \tau_{\ell,h} = \kappa_h\sqrt{d_h}\exp(3\tanh(\delta_{\ell,h}/3)),
@@ -1352,6 +1376,8 @@ class RelationalOperators(nn.Module):
         returned at ``dtype``. The temperature acts after the ``kl_max`` clamp, so it sharpens or flattens
         only costs below the cap.
         """
+        if self.routing_key_log_noise is not None:
+            return 1.0                                  # noisy_key: the KL of the declared joint, no kappa sqrt(d)
         delta = self.routing_log_temperature
         if delta is None:
             return tau

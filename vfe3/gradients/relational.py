@@ -44,6 +44,8 @@ def relational_score(
 
     ``operators.routing`` selects the cost: ``"gaussian_kl"`` (projected_gaussian_kl) or
     ``"noisy_query"`` (projected_noisy_query_cost, the expected-likelihood source posterior), or
+    ``"noisy_key"`` (projected_noisy_key_cost, the Gaussian KL against the key law broadened by the head's learned
+    noise :math:`n_hI`, ``operators.routing_key_log_noise``), or
     ``"mean_distance"`` (projected_mean_distance_cost, the covariance-blind control).
 
     Every head projects the full canonical state through its own Q/K maps. The
@@ -97,14 +99,18 @@ def relational_score(
     # float64; the results are returned at the dtype a lower-precision frame would have produced.
     public = _compute_dtype(mu, sigma, source_mu, source_sigma, *(S for pair in comparison for S in pair))
     score = routing_cost(operators.routing)                                  # ROUTING_COSTS registry
+    # noisy_key is the Gaussian KL of a broadened key law, so it takes the Gaussian-KL options.
+    gaussian_kl = operators.routing in ("gaussian_kl", "noisy_key")
     cost_options = ({"query_row_constant_grad": False}
-                    if row_invariant and operators.routing == "gaussian_kl" else {})
-    if operators.routing == "gaussian_kl" and operators.pair_kl_gemm_tol is not None:
+                    if row_invariant and gaussian_kl else {})
+    if gaussian_kl and operators.pair_kl_gemm_tol is not None:
         cost_options["gemm_expansion_tol"] = operators.pair_kl_gemm_tol
+    key_log_noise = getattr(operators, "routing_key_log_noise", None)             # (H,) noisy_key only
     scores, captured_q, captured_k = [], [], []
     # One scoring call per run: the heads of a run share their rank d_r. Each call ends in its own
     # host transfer, so a tower of R runs pays R of them per call (one for equal heads), unless its
     # verdicts can only raise (the diagonal route), which deferred_host_checks then queues.
+    first_head = 0                                                             # index of the run's first head
     for (S_q, S_k), inverse in zip(comparison, inverse_runs):
         H, K = S_q.shape[0], S_q.shape[-1]
         # Both roles read the one shared frame: there is no separate key-side inverse.
@@ -190,6 +196,9 @@ def relational_score(
                 projection_q = (sigma_h, inverse, S_q_rot, mu_h)
                 projection_k = (source_sigma_h, key_inverse, S_k_rot, source_mu_h)
         run_options = dict(cost_options)
+        if key_log_noise is not None:
+            run_options["key_noise"] = key_log_noise[first_head:first_head + H].exp()   # (H_run,) n_h
+        first_head += H
         if diagonal:
             run_options["diagonal_covariance"] = True                           # G_q, G_k are (..., N, H, r)
         elif invariant:

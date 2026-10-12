@@ -92,6 +92,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'relational_receiver_damping': 1.0,
     'relational_routing': 'gaussian_kl',
     'tie_comparison_maps': False,
+    'relational_key_noise': 1.0,
     'predictive_readout': 'kernel',
     'minimal_agent_inference': 'exact',
     'minimal_agent_cavi_steps': 1,
