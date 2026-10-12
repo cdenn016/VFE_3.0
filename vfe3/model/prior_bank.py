@@ -1864,6 +1864,7 @@ class PriorBank(nn.Module):
         ignore_index:  int                   = -100,
         return_stats:  bool                  = False,
         canonical_frame: Optional[CanonicalFrameContext] = None,   # decode_coordinates='reference' only
+        sigma_q:       Optional[torch.Tensor] = None,  # (B, N, K) diagonal variances: second-order term
     ) -> 'torch.Tensor | DecodeCEResult':
         r"""Fused chunked-vocab cross-entropy for ``decode_mode='linear'``.
 
@@ -1878,7 +1879,35 @@ class PriorBank(nn.Module):
         the original mask still supplies scored and excluded token counts. Under
         ``decode_coordinates='reference'`` the logits read :math:`\xi_i = U_i^{-1}\mu_i` through
         ``canonical_frame``, pulled back before any position is gathered out.
+
+        With ``sigma_q`` (``decode_second_order``; local coordinates, diagonal covariance) each
+        position's loss is the second-order expected log-loss under
+        :math:`q = \mathcal{N}(\mu, \Sigma)`, :math:`\Sigma = \mathrm{diag}(\sigma)`. Write
+        :math:`\ell(x) = \mathrm{LSE}(Wx + c) - w_y^\top x - c_y` with :math:`c` the bias plus unigram
+        prior. The target term is linear in :math:`x`, so the Hessian is that of the log-sum-exp,
+        :math:`\nabla^2 \ell = W^\top(\mathrm{diag}\, p - p p^\top) W` at
+        :math:`p = \mathrm{softmax}(W\mu + c)`. Taylor expansion about :math:`\mu` with
+        :math:`\varepsilon = x - \mu`, :math:`\mathbb{E}\varepsilon = 0` and vanishing odd Gaussian
+        moments gives
+        :math:`\mathbb{E}_q \ell = \ell(\mu) + \tfrac12 \mathrm{tr}(\Sigma\, \mathrm{Cov}_{v\sim p}(w_v))
+        + O(\|\Sigma\|^2)`, which for diagonal :math:`\Sigma` is
+
+        .. math::
+            \mathrm{CE}(\mu) + \tfrac12 \Big[\sum_v p_v \big((W \circ W)\sigma\big)_v
+            - \sum_k \sigma_k (W^\top p)_k^2\Big].
+
+        Each chunk returns, besides its summaries, the chunk-normalized moments
+        :math:`\sum_{v \in c} e^{\ell_v - \mathrm{lse}_c} [w_v, w_v \circ w_v]` from one
+        :math:`(B, N, V_c) \times (V_c, 2K)` GEMM in the caller's precision (outside the
+        ``decode_logits_amp`` autocast); the chunks are recombined with weights
+        :math:`e^{\mathrm{lse}_c - \mathrm{LSE}}`. No (B, N, V, K) tensor is formed, and gradients reach
+        :math:`\mu`, :math:`\sigma`, :math:`W` and the bias. The full-covariance analogue
+        :math:`\tfrac12\mathrm{tr}(\Sigma W^\top \mathrm{diag}(p) W) - \tfrac12 (W^\top p)^\top \Sigma (W^\top p)`
+        needs a per-position :math:`(K, K)` moment (K times the logits GEMM) and is not implemented.
         """
+        if sigma_q is not None and (canonical_frame is not None or self.decode_coordinates == "reference"):
+            raise ValueError("the second-order linear decode term needs local coordinates: the "
+                             "reference covariance U^-1 Sigma U^-T is not diagonal")
         if canonical_frame is not None or self.decode_coordinates == "reference":
             mu_q = self._reference_mean(mu_q, canonical_frame)             # (B, N, K) xi = U^{-1} mu
         has_ignored = self._validate_fused_ce_targets(
@@ -1888,17 +1917,17 @@ class PriorBank(nn.Module):
             # Retain the (batch, positions, K) checkpoint contract with only S scored rows.
             mu_q = mu_q[original_valid].unsqueeze(0)       # (1, S, K)
             targets = targets[original_valid].unsqueeze(0) # (1, S)
+            if sigma_q is not None:
+                sigma_q = sigma_q[original_valid].unsqueeze(0)  # (1, S, K)
         chunk = self.decode_chunk_size if chunk_size is None else chunk_size
         V = self.vocab_size
         W = self.output_proj_weight                                        # (V, K)
         bias = self.output_proj_bias                                       # (V,) or None
         u_all = self._unigram_bias() if self.decode_unigram_prior else None  # (V,) kappa*log pi_v or None
 
-        def _chunk_summaries(mu_:     torch.Tensor, w_c:       torch.Tensor,
-                             in_chunk_f: torch.Tensor, local_idx: torch.Tensor,
-                             b_c:     Optional[torch.Tensor],
-                             u_c:     Optional[torch.Tensor]) -> 'tuple[torch.Tensor, torch.Tensor]':
-            r"""Reduce one vocab chunk to (lse_chunk, target_contrib), both (B, N), on the inside."""
+        def _chunk_logits(mu_: torch.Tensor, w_c: torch.Tensor,
+                          b_c: Optional[torch.Tensor], u_c: Optional[torch.Tensor]) -> torch.Tensor:
+            r"""One vocab chunk's logits :math:`x W_c^\top + b_c + u_c`, (B, N, Vc)."""
             logit_chunk = _linear_logits(self, mu_, w_c)                   # (B, N, Vc)
             if b_c is not None:
                 if torch.promote_types(logit_chunk.dtype, b_c.dtype) == logit_chunk.dtype:
@@ -1910,6 +1939,11 @@ class PriorBank(nn.Module):
                     logit_chunk.add_(u_c)  # fresh logits; the bias slice cannot expand shape
                 else:
                     logit_chunk = logit_chunk + u_c
+            return logit_chunk
+
+        def _chunk_reduce(logit_chunk: torch.Tensor, in_chunk_f: torch.Tensor,
+                          local_idx: torch.Tensor) -> 'tuple[torch.Tensor, torch.Tensor]':
+            r"""(lse_chunk, target_contrib), both (B, N), from one chunk's logits."""
             lse_chunk = torch.logsumexp(logit_chunk, dim=-1)               # (B, N)
             gathered = logit_chunk.gather(-1, local_idx.unsqueeze(-1)).squeeze(-1)  # (B, N)
             # SELECT rather than multiply (audit 2026-08-06 F31): `gathered * in_chunk_f` is
@@ -1918,8 +1952,30 @@ class PriorBank(nn.Module):
             # Byte-identical for finite logits (x*1.0 == x, x*0.0 == 0.0).
             return lse_chunk, torch.where(in_chunk_f > 0, gathered, torch.zeros_like(gathered))
 
+        def _chunk_summaries(mu_:     torch.Tensor, w_c:       torch.Tensor,
+                             in_chunk_f: torch.Tensor, local_idx: torch.Tensor,
+                             b_c:     Optional[torch.Tensor],
+                             u_c:     Optional[torch.Tensor]) -> 'tuple[torch.Tensor, torch.Tensor]':
+            r"""Reduce one vocab chunk to (lse_chunk, target_contrib), both (B, N), on the inside."""
+            return _chunk_reduce(_chunk_logits(mu_, w_c, b_c, u_c), in_chunk_f, local_idx)
+
+        def _chunk_summaries_second_order(
+                mu_:     torch.Tensor, w_c:       torch.Tensor,
+                in_chunk_f: torch.Tensor, local_idx: torch.Tensor,
+                b_c:     Optional[torch.Tensor],
+                u_c:     Optional[torch.Tensor]) -> 'tuple[torch.Tensor, torch.Tensor, torch.Tensor]':
+            r"""As ``_chunk_summaries`` plus the chunk-normalized moments
+            :math:`\sum_{v \in c} e^{\ell_v - \mathrm{lse}_c} [w_v, w_v \circ w_v]`, (B, N, 2K)."""
+            logit_chunk = _chunk_logits(mu_, w_c, b_c, u_c)                # (B, N, Vc)
+            lse_chunk, contrib = _chunk_reduce(logit_chunk, in_chunk_f, local_idx)
+            p_c = torch.exp(logit_chunk - lse_chunk.unsqueeze(-1))         # (B, N, Vc) chunk-normalized
+            w_moments = torch.cat((w_c, w_c * w_c), dim=-1).to(p_c.dtype)  # (Vc, 2K) [w_v, w_v o w_v]
+            return lse_chunk, contrib, p_c @ w_moments                     # (B, N, 2K)
+
         valid = targets != ignore_index                                    # (B, N) bool
+        second_order = sigma_q is not None
         lse_chunks = []
+        moment_chunks = []                                                 # (B, N, 2K) per chunk (second order)
         target_logit = torch.zeros(mu_q.shape[:-1], device=mu_q.device, dtype=mu_q.dtype)  # (B, N)
 
         for v0 in range(0, V, chunk):
@@ -1933,18 +1989,31 @@ class PriorBank(nn.Module):
             grad_active = torch.is_grad_enabled() and (mu_q.requires_grad or W.requires_grad)
             activation_bytes = _decode_ce_chunk_activation_bytes(
                 mu_q, V if self.decode_ce_checkpoint == "auto_aggregate" else v1 - v0)
+            summaries = _chunk_summaries_second_order if second_order else _chunk_summaries
             if _decode_ce_should_checkpoint(self.decode_ce_checkpoint, grad_active, activation_bytes):
-                lse_chunk, contrib = _checkpoint.checkpoint(
-                    _chunk_summaries, mu_q, w_c, in_chunk_f, local_idx, b_c, u_c,
+                chunk_result = _checkpoint.checkpoint(
+                    summaries, mu_q, w_c, in_chunk_f, local_idx, b_c, u_c,
                     use_reentrant=False,
                 )
             else:
-                lse_chunk, contrib = _chunk_summaries(mu_q, w_c, in_chunk_f, local_idx, b_c, u_c)
+                chunk_result = summaries(mu_q, w_c, in_chunk_f, local_idx, b_c, u_c)
+            lse_chunk, contrib = chunk_result[:2]
+            if second_order:
+                moment_chunks.append(chunk_result[2])
             lse_chunks.append(lse_chunk)
             target_logit = target_logit + contrib                          # exactly one chunk contributes per valid pos
 
-        logsumexp_v = torch.logsumexp(torch.stack(lse_chunks, dim=0), dim=0)  # (B, N)
+        lse_stack = torch.stack(lse_chunks, dim=0)                         # (C, B, N)
+        logsumexp_v = torch.logsumexp(lse_stack, dim=0)                    # (B, N)
         ce_per_pos = logsumexp_v - target_logit                           # (B, N) = -log-softmax at target
+        if second_order:
+            # Global moments E_p[w], E_p[w o w]: chunk weights exp(lse_c - LSE) sum to 1 per position.
+            chunk_weight = torch.exp(lse_stack - logsumexp_v)              # (C, B, N)
+            moments = (chunk_weight.unsqueeze(-1) * torch.stack(moment_chunks, dim=0)).sum(0)  # (B, N, 2K)
+            K = mu_q.shape[-1]
+            mean_w, mean_w_sq = moments[..., :K], moments[..., K:]         # (B, N, K) each
+            # 1/2 sum_k sigma_k Var_p(w_k) = 1/2 tr(Sigma Cov_p(w)), the delta-method term.
+            ce_per_pos = ce_per_pos + 0.5 * (sigma_q * (mean_w_sq - mean_w * mean_w)).sum(-1)  # (B, N)
         # Device-side masked mean: clamp the denominator so an all-ignore microbatch yields a finite
         # grad-connected 0 (the numerator is then 0) without a host sync to branch on valid.sum() == 0.
         ce = (ce_per_pos * valid).sum() / valid.sum().clamp_min(1)

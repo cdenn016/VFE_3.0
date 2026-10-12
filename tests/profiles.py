@@ -50,6 +50,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'decode_ce_checkpoint': 'auto',
     'expected_likelihood_kernel': 'torch',
     'decode_logits_amp': False,
+    'decode_second_order': False,
     'decode_ranking_fp64_escalation': True,
     'gauge_group': 'block_glk',
     'gauge_transport': 'on',

@@ -1308,6 +1308,9 @@ class VFEModel(nn.Module):
                 fused_kwargs = {}
                 if return_decode_stats and decode_registration.fused_ce_supports_stats:
                     fused_kwargs["return_stats"] = True
+                if active_decode_mode == "linear" and self.cfg.decode_second_order and self.training:
+                    # Training objective only: evaluation scores the plug-in predictive CE.
+                    fused_kwargs["sigma_q"] = _decode_island_dtype(sigma_final)   # (B, N, K) diagonal
                 if active_decode_mode != "linear":
                     if canonical_frame is None:
                         fused_result = decode_registration.fused_ce(

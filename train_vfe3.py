@@ -151,6 +151,7 @@ config = dict(
    
     block_coordinates                = "local",       # "local" | "reference" (LN and MLP applied as U Phi(U^-1 .))
     decode_coordinates               = "local",       # "local" | "reference" (reference: decode_mode "linear" | "diagonal_chunked" | "full_chunked")
+    decode_second_order              = False,         # linear decode, diagonal family, local coords: train on CE(mu) + 1/2 tr(Sigma Cov_p(w)); pushes Sigma to its floor, ablation arm first
               
     minimal_agent_channel_noise      = 1.0,         # initial channel noise n_h > 0
     predictive_covariance_floor      = 1e-4,        # moment_matched only: floor * Sigma_p (token's local prior covariance), reference-invariant
