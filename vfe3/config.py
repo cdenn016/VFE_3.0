@@ -339,7 +339,13 @@ class VFE3Config:
     # Prior-bank Gaussian decoders only: recompute an uncertain float32 decode argmax in float64 for the
     # candidates whose score interval reaches the winner's (the fused training CE is unaffected).
     decode_ranking_fp64_escalation:   bool            = False
-    
+
+    # decode_mode="diagonal_chunked" | "full_chunked" on CUDA tensors only: run each vocabulary chunk's score assembly
+    # (bias, clamp, temperature, unigram bias), online log-sum-exp, target gather and their backward in fused Triton
+    # kernels (vfe3/kernels/kl_decode.py); the cross-term GEMMs stay cuBLAS. Same formula and logits, rounding-level
+    # differences in the log-sum-exp and the backward sums. CPU tensors always run the torch loop.
+    decode_ce_triton:                 bool            = False
+
     ##################################################
     #   6. Gauge group
     ##################################################
@@ -2227,6 +2233,8 @@ class VFE3Config:
         registration = _DECODERS[self.decode_mode]
         if not registration.supports_chunked:
             mark(("decode_ce_checkpoint",), "the selected decoder has no checkpointed chunked CE kernel")
+        if self.decode_mode not in ("diagonal_chunked", "full_chunked"):
+            mark(("decode_ce_triton",), "read only by the diagonal_chunked and full_chunked KL decode CE")
 
         # The route-specific rules below were confirmed by tiny launcher-derived CPU probes: loss and
         # every parameter gradient stay torch.equal under an override of the marked knob

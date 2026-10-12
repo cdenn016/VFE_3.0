@@ -961,6 +961,10 @@ def _numerics_items(run: RunRecord) -> List[Item]:
     if realized_kernel is not None:
         # Derived from the device: CUDA tensors run the fused Triton kernel, CPU tensors the torch kernel.
         items.append(("expected-likelihood CE kernel that ran", Code(str(realized_kernel))))
+    decode_kernel = run.summary.get("decode_ce_kernel")
+    if decode_kernel is not None:
+        # 'triton' when decode_ce_triton was on and the decode ran on CUDA tensors, else 'torch'.
+        items.append(("KL decode CE kernel that ran", Code(str(decode_kernel))))
     if run.raw("matmul_precision_retry") is True or "matmul_precision_replays" in run.summary:
         # A step that raises under a reduced fp32 matmul policy is replayed one rung stricter, ending at
         # "highest" (vfe3.train); the count is the run's realized_updates record in summary.json. Runs

@@ -324,6 +324,7 @@ config = dict(
     pair_kl_gemm_tol                 = None,       # None (off) | nats, e.g. 1e-3: rescore pair-KL GEMM slices whose error estimate exceeds it (~+45% step at K=128)
         
     decode_ce_checkpoint             = "auto",     # "auto" | "auto_aggregate" (saves memory with recompute)
+    decode_ce_triton                 = False,      # True | False: diagonal_chunked / full_chunked on CUDA: fused Triton chunk kernels (fp32-rounding differences)
     decode_logits_amp                = False,      # linear decode only: logits matmul under amp_dtype; CE stays fp32
     projected_factorization          = "gram",     # "gram" | "gram_certified" | "cholesky_qr2_certified" (certified: rebuild ill-conditioned factors; costly)
    
