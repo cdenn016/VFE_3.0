@@ -259,8 +259,8 @@ class VFEModel(nn.Module):
         # before model + loader are built), NOT here: seeding inside __init__ would clobber a
         # caller-set RNG state (e.g. a test that seeds then constructs several models).
         self.cfg = cfg
-        # projected_factorization: the certificate and factor route; tolerances and the fp32 recovery
-        # precision (float64 fallback) are fixed.
+        # projected_factorization: the certificate and factor route; tolerances and the recovery precision
+        # (fp32 with a float64 fallback on the Gram routes, float64 on cholesky_qr2_certified) are fixed.
         set_projected_condition_recovery(cfg.projected_factorization != "gram")
         set_projected_factor_route(
             "cholesky_qr2" if cfg.projected_factorization == "cholesky_qr2_certified" else "gram")
