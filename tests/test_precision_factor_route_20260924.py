@@ -272,11 +272,213 @@ def test_factor_certificate_runs_only_under_condition_recovery(factor_route, dev
             set_projected_condition_recovery(enabled)
             mu_h, sigma_h, blocks, S_q, _ = _projected_case(device, kappa=kappa)
             _, Gq = projected_moments(mu_h, sigma_h, blocks, S_q)
-            assert bool(_factor_status(Gq, (sigma_h, blocks, S_q, mu_h))[2].any()) is fires, (kappa, enabled)
-            # fp32 recovery keeps a certificate-flagged CholeskyQR2 factor (a float32 redo cannot improve on it),
-            # so only outright failures are rebuilt and none occur here.
+            flagged = _factor_status(Gq, (sigma_h, blocks, S_q, mu_h))[2]
+            assert bool(flagged.any()) is fires, (kappa, enabled)
+            # Every certificate-flagged entry is rebuilt and counted; none fails outright here.
             reset_source_recovery_elements()
             _score(*_projected_case(device, kappa=kappa))
-            assert source_recovery_elements() == 0, (kappa, enabled)
+            assert source_recovery_elements() == int(flagged.sum()), (kappa, enabled)
     finally:
         set_projected_condition_recovery(previous)
+
+
+def _mixed_case(device: torch.device, dtype: torch.dtype = torch.float32, kappa: float = 3e3, seed: int = 0,
+                tokens: int = 5) -> list:
+    r"""Diagonal-covariance projected inputs: head 0's query roots have kappa(X) ~ ``kappa``, head 1's ~ 3.
+
+    Two heads of width 3 read the full 6-coordinate belief, rank r = 3; the key maps are Gaussian.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    H, d, K = 2, 3, 6
+    mu = torch.randn(1, tokens, K, generator=generator, dtype=torch.float64)
+    sigma = torch.exp(torch.randn(1, tokens, K, generator=generator, dtype=torch.float64) * .3)
+    blocks = torch.linalg.matrix_exp(.3 * torch.randn(1, tokens, H, d, d, generator=generator,
+                                                      dtype=torch.float64))
+    S_k = torch.randn(H, d, K, generator=generator, dtype=torch.float64)
+    S_q = torch.stack([_conditioned_root(kappa, d, K, seed=seed), _conditioned_root(3., d, K, seed=seed + 1)])
+    mu_h, sigma_h = (x.unsqueeze(-2).expand(1, tokens, H, K) for x in (mu, sigma))
+    return [x.to(device=device, dtype=dtype) for x in (mu_h, sigma_h, blocks, S_q, S_k)]
+
+
+def _rebuilt_entries(case: list) -> tuple:
+    r"""(query, key) entries (1, N, H) the certified factor route rebuilds: failed or certificate-flagged."""
+    from vfe3.relational_scoring import _factor_status, projected_moments, set_projected_condition_recovery
+
+    mu_h, sigma_h, blocks, S_q, S_k = case
+    masks = []
+    previous = set_projected_condition_recovery(True)
+    try:
+        for S in (S_q, S_k):
+            _, G = projected_moments(mu_h, sigma_h, blocks, S)
+            _, failed, screen, _ = _factor_status(G, (sigma_h, blocks, S, mu_h))
+            masks.append(failed | screen)
+    finally:
+        set_projected_condition_recovery(previous)
+    return tuple(masks)
+
+
+def _root_kappas(case: list) -> list:
+    r"""(query, key) float64 condition numbers (1, H, N) of the source roots X = S U^{-1} Sigma^{1/2}."""
+    from vfe3.relational_scoring import _source_root, projected_moments
+
+    mu_h, sigma_h, blocks, S_q, S_k = (x.detach().cpu().double() for x in case)
+    kappas = []
+    for S in (S_q, S_k):
+        _, G = projected_moments(mu_h, sigma_h, blocks, S)
+        root = _source_root(G, (sigma_h, blocks, S), torch.ones(G.shape[:-2], dtype=torch.bool))
+        singular = torch.linalg.svdvals(root)
+        kappas.append((singular[:, 0] / singular[:, -1]).reshape(G.shape[:-2]).transpose(-1, -2))
+    return kappas
+
+
+def _pair_bound(case: list) -> torch.Tensor:
+    r"""(1, H, Nq, Nk) first-order fp32 bound eps (kappa_q,i + kappa_k,j)(tr P_k G_q + d^T P_k d + r).
+
+    The model of :func:`vfe3.relational_scoring._factor_status`, with kappa the float64 condition numbers of the
+    source roots X = S U^{-1} Sigma^{1/2}.
+    """
+    from vfe3.relational_scoring import projected_moments
+
+    mu_h, sigma_h, blocks, S_q, S_k = (x.detach().cpu().double() for x in case)
+    moments = [projected_moments(mu_h, sigma_h, blocks, S) for S in (S_q, S_k)]
+    kappas = _root_kappas(case)
+    (aq, Gq), (ak, Gk) = moments
+    Pk = torch.linalg.inv(Gk)
+    trace = torch.einsum("znhxy,zmhyx->zhnm", Gq, Pk)
+    delta = aq.unsqueeze(2) - ak.unsqueeze(1)                                 # (1, Nq, Nk, H, r)
+    quadratic = torch.einsum("znmhx,zmhxy,znmhy->zhnm", delta, Pk, delta)
+    return (torch.finfo(torch.float32).eps * (kappas[0].unsqueeze(-1) + kappas[1].unsqueeze(-2))
+            * (trace + quadratic + Gq.shape[-1]))
+
+
+def _score_and_count(case: list, recovery: bool) -> tuple:
+    from vfe3.relational_scoring import (
+        reset_source_recovery_elements, set_projected_condition_recovery, source_recovery_elements,
+    )
+
+    previous = set_projected_condition_recovery(recovery)
+    try:
+        reset_source_recovery_elements()
+        score = _score(*case)
+        return score, source_recovery_elements()
+    finally:
+        set_projected_condition_recovery(previous)
+
+
+def test_certified_factor_route_rebuilds_its_flagged_entries(factor_route, device: torch.device) -> None:
+    r"""``cholesky_qr2_certified`` rebuilds every certificate-flagged CholeskyQR2 factor from its source root.
+
+    Head 0's query roots have kappa(X) = 3e3: they factor by CholeskyQR2 but fail eps kappa_1(C) <= 3e-4. Each
+    flagged entry is counted, the pairs touching it change, every pair stays inside the first-order fp32 bound of
+    :func:`_pair_bound`, and the pairs touching no flagged entry are bitwise those of the uncertified route.
+
+    The rebuilt factor (float32 shifted CholeskyQR3 of a float64-formed root) has the same O(eps kappa) whitened
+    error as the CholeskyQR2 factor it replaces, so the error falls on aggregate rather than on every case:
+    measured over these six seeds the flagged pairs' mean error fell in five and rose in one (1.3e-5 to 2.5e-5),
+    with the summed means 1.50e-4 kept against 1.14e-4 rebuilt. The rebuilt pairs reach at most 0.025 of the bound;
+    the largest ratio over all pairs, 0.44, is on a healthy well-conditioned pair whose bound is tight.
+    """
+    factor_route("cholesky_qr2")
+    kept_means, rebuilt_means = [], []
+    for seed in range(6):
+        case = _mixed_case(device, seed=seed)
+        reference = _score(*(x.double() for x in case)).cpu()
+        rebuilt_q, rebuilt_k = (mask.cpu() for mask in _rebuilt_entries(case))
+        touched = (rebuilt_q[0].T.unsqueeze(-1) | rebuilt_k[0].T.unsqueeze(-2)).unsqueeze(0)  # (1, H, Nq, Nk)
+        assert bool(rebuilt_q[0, :, 0].any()) and not bool(rebuilt_q[0, :, 1].any()), seed
+        kept, kept_count = _score_and_count(case, False)
+        rebuilt, rebuilt_count = _score_and_count(case, True)
+        assert kept_count == 0 and rebuilt_count == int(rebuilt_q.sum() + rebuilt_k.sum()), seed
+        kept, rebuilt = kept.cpu(), rebuilt.cpu()
+        assert rebuilt.dtype == torch.float32 and torch.isfinite(rebuilt).all()
+        assert torch.equal(rebuilt[~touched], kept[~touched]), seed
+        assert not torch.equal(rebuilt[touched], kept[touched]), seed
+        error = (rebuilt.double() - reference).abs()
+        bound = _pair_bound(case)
+        assert bool((error <= bound).all()), (seed, float((error / bound).max()))
+        kept_means.append(float((kept.double() - reference).abs()[touched].mean()))
+        rebuilt_means.append(float(error[touched].mean()))
+    assert sum(rebuilt_means) < sum(kept_means), (kept_means, rebuilt_means)
+
+
+def test_certified_factor_route_is_inert_at_float64(factor_route, device: torch.device) -> None:
+    r"""The certificate is evaluated only on float32 factors, so a float64 call rebuilds nothing and is bitwise
+    the uncertified route."""
+    factor_route("cholesky_qr2")
+    case = _mixed_case(device, torch.float64)
+    kept, kept_count = _score_and_count(case, False)
+    rebuilt, rebuilt_count = _score_and_count(case, True)
+    assert kept_count == rebuilt_count == 0
+    assert rebuilt.dtype == torch.float64 and torch.equal(rebuilt, kept)
+
+
+def test_certified_factor_route_gradients_match_float64_central_differences(factor_route) -> None:
+    r"""Gradients through the rebuilt factors are finite and match float64 central differences.
+
+    Query token 0 of head 0 is certificate-flagged (kappa(X) = 3.1e3). The fp32 gradient bound is that of
+    tests/test_relational_source_factorization.py: dKL/dG is at most quadratic in P = G^{-1}, whose relative
+    error under an O(eps kappa) factor is <= 2 eps kappa, and the float32 means add <= 2 eps kappa, so normwise
+    |dg| <= 6 eps kappa |g| per input (measured at most 0.004 of the bound). The reference is the float64 score's
+    central difference with step 1e-6 (truncation O(1e-12), rounding O(1e-10) relative), not its autograd.
+    """
+    from vfe3.relational_scoring import set_projected_condition_recovery
+
+    factor_route("cholesky_qr2")
+    case = _mixed_case(torch.device("cpu"), seed=0, tokens=2)
+    rebuilt_q, rebuilt_k = _rebuilt_entries(case)
+    assert bool(rebuilt_q.any())
+    previous = set_projected_condition_recovery(True)
+    try:
+        working = [x.detach().clone().requires_grad_(True) for x in case]
+        _score(*working).sum().backward()
+        reference = [x.double() for x in case]
+        step = 1e-6
+        kappa = max(float(k.max()) for k in _root_kappas(case))
+        bound = 6 * torch.finfo(torch.float32).eps * kappa
+        for index, x in enumerate(working):
+            assert torch.isfinite(x.grad).all(), index
+            central = torch.zeros_like(reference[index])
+            for flat in range(central.numel()):
+                shifted = [y.clone() for y in reference]
+                shifted[index].view(-1)[flat] += step
+                plus = float(_score(*shifted).sum())
+                shifted[index].view(-1)[flat] -= 2 * step
+                minus = float(_score(*shifted).sum())
+                central.view(-1)[flat] = (plus - minus) / (2 * step)
+            error = float((x.grad.double() - central).norm())
+            assert error <= bound * float(central.norm()), (index, error / float(central.norm()), bound)
+    finally:
+        set_projected_condition_recovery(previous)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_gram_routes_are_unchanged_by_the_factor_route_rebuild(factor_route, device: torch.device,
+                                                               dtype: torch.dtype) -> None:
+    r"""``gram`` rebuilds only failures (none here); ``gram_certified`` rebuilds the entries its Gram certificate
+    flags at float32 and nothing at float64, with untouched pairs bitwise those of ``gram``."""
+    from vfe3.relational_scoring import _cholesky_status, projected_moments, set_projected_condition_recovery
+
+    factor_route("gram")
+    case = _mixed_case(device, dtype)
+    mu_h, sigma_h, blocks, S_q, S_k = case
+    previous = set_projected_condition_recovery(True)
+    try:
+        flags = [_cholesky_status(projected_moments(mu_h, sigma_h, blocks, S)[1])
+                 for S in (S_q, S_k)]
+    finally:
+        set_projected_condition_recovery(previous)
+    rebuilt_q, rebuilt_k = ((status[1] | status[2]).cpu() for status in flags)
+    gram, gram_count = _score_and_count(case, False)
+    certified, certified_count = _score_and_count(case, True)
+    assert gram_count == 0 and certified_count == int(rebuilt_q.sum() + rebuilt_k.sum())
+    assert bool(rebuilt_q.any()) is (dtype == torch.float32)
+    touched = (rebuilt_q[0].T.unsqueeze(-1) | rebuilt_k[0].T.unsqueeze(-2)).unsqueeze(0)
+    gram, certified = gram.cpu(), certified.cpu()
+    assert torch.equal(certified[~touched], gram[~touched])
+    if dtype == torch.float32:
+        reference = _score(*(x.double() for x in case)).cpu()
+        # The Gram factor's O(eps kappa^2) error is what the rebuild removes.
+        kept_error = float((gram.double() - reference).abs()[touched].max())
+        rebuilt_error = (certified.double() - reference).abs()
+        assert float(rebuilt_error[touched].max()) < kept_error / 10
+        assert bool((rebuilt_error <= _pair_bound(case)).all())

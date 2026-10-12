@@ -125,7 +125,8 @@ def projected_condition_recovery() -> bool:
 # optimization_plan.md WS1/WS2). "gram" factors the rounded Gram G = fl(X X^T), whose factor carries
 # whitened error O(eps kappa(X)^2). "cholesky_qr2" factors the source root X = S U^{-1} Sigma^{1/2}
 # by CholeskyQR2: the same Gaussian, whitened error O(eps kappa(X)). Its recovery certificate is
-# eps kappa_1(C) > FACTOR_CONDITION_TOL on the factor itself (see _factor_status).
+# eps kappa_1(C) > FACTOR_CONDITION_TOL on the factor itself (see _factor_status); flagged factors are
+# rebuilt from the source root as on the Gram route (see _strict_cholesky).
 _FACTOR_ROUTES = ("gram", "cholesky_qr2")
 _FACTOR_ROUTE: str = "gram"
 
@@ -792,10 +793,10 @@ def _strict_cholesky(
     the working dtype. No jitter, covariance floor, or projection constraint is introduced.
 
     ``factored`` marks a ``prepared`` factor from :func:`_factor_status` (CholeskyQR2 of the source
-    root). Its outright failures are rebuilt as above, its certificate-flagged entries keep their
-    CholeskyQR2 factor, since a working-dtype redo cannot improve on it, and its healthy entries keep
-    their prepared factor on the recovery path. Without source tuples no rebuild is possible, so
-    flagged entries keep their factor.
+    root). Its outright failures and its certificate-flagged entries are both rebuilt as above, from a
+    root formed in float64 and factored by shifted CholeskyQR3, so a flagged entry's pairs then take the
+    triangular-solve tiles instead of the centered GEMM; its healthy entries keep their prepared factor
+    bitwise. Without source tuples no rebuild is possible, so flagged entries keep their factor.
 
     A failed working-dtype retry, and a float64 input, take the float64 recovery for the whole call:
     the root is factored by float64 QR, X^T = QR, giving C = R^T.
@@ -840,9 +841,7 @@ def _strict_cholesky(
             _count_source_recovery(recovered_all)
             return chol64, recovered_all
         if working_recovery:
-            if factored and not failed_any:
-                return chol, None
-            rebuild = failed if factored else failed | ill_conditioned
+            rebuild = failed | ill_conditioned
             root = _source_root(G, projection, rebuild)
             with torch.autocast(device_type=G.device.type, enabled=False):
                 shifted, shifted_failed = (
@@ -850,7 +849,9 @@ def _strict_cholesky(
                     else _commutant_root_factor(root.to(G.dtype), commutant_pairs, shift=True))
             if not bool(shifted_failed.any()):
                 if factored:
-                    base = chol         # failed CholeskyQR2 entries already factor the identity
+                    # Failed CholeskyQR2 entries already factor the identity and flagged ones are finite,
+                    # so the prepared factor is safe to differentiate and is overwritten only where rebuilt.
+                    base = chol
                 else:
                     # Never backpropagate through a failed Cholesky, even with zero cotangent.
                     safe = torch.where(rebuild[..., None, None],
@@ -959,6 +960,10 @@ def projected_gaussian_kl(
     Gram (whitened error O(eps kappa(X)) instead of O(eps kappa(X)^2)); the key precision and both
     log-determinants read those factors, and the query trace product still reads the explicit G_q,
     whose pair-stage cancellation sum |P_ab G_ab| / tr(P G) measured at most 18 on the saved runs.
+    Under :func:`projected_condition_recovery` an entry whose CholeskyQR2 factor fails the certificate of
+    :func:`_factor_status` is rebuilt from its source root exactly as a flagged Gram-route entry is
+    (float32 shifted CholeskyQR3, float64 QR on its fallback; :func:`_strict_cholesky`), its pairs take the
+    triangular-solve tiles, and it is counted in :func:`source_recovery_elements`.
 
     The factor route is selected PER PAIR (audit 2026-09-23 low): a pair (b, h, i, j) takes
     it only when its own query entry (b, i, h) or key entry (b, j, h) was recovered. Every other
@@ -1061,10 +1066,8 @@ def projected_gaussian_kl(
         verdicts = [(torch.isfinite(aq).all() & torch.isfinite(ak).all()).reshape(1), q_status[-1], k_status[-1]]
         if gemm_expansion_tol is not None:
             # Key entries the recovery will rebuild leave the GEMM (their pairs take the factor route), so
-            # they leave the estimate too: failed or certificate-flagged entries, except that the fp32
-            # factor route keeps a flagged-but-factored entry's CholeskyQR2 factor (see _strict_cholesky).
-            keeps_flagged = factored and dtype != torch.float64
-            recovered_k = k_status[1] if keeps_flagged else k_status[1] | k_status[2]
+            # they leave the estimate too: failed or certificate-flagged entries, on either route.
+            recovered_k = k_status[1] | k_status[2]
             fallback = ~(_gemm_expansion_error(aq, ak, k_prec_prepared, recovered_k) <= gemm_expansion_tol)
             verdicts.append(fallback.expand(slice_shape).reshape(-1))
         if (projection_q is None and projection_k is None and not _CONDITION_RECOVERY
