@@ -5,7 +5,7 @@ comparison and content maps of every attention layer (4K^2 parameters per layer 
 readout, the count of dense W_Q, W_K, W_V, W_O; 2K^2 + H on the minimal agent), the default linear decoder (``decode_mode='linear'``), the default
 coordinate block MLP (``block_mlp_mode='coordinate'``: nn.Linear fc1/fc2 with a pointwise
 activation), the default ``pos_phi='learned'`` positional table, and the tables of opt-in toggles
-(CG coupling, T5 bias, LayerNorm affine). These are learned linear and neural maps trained by
+(CG coupling, LayerNorm affine). These are learned linear and neural maps trained by
 backpropagation. No nn.Linear module is built only with ``use_block_mlp=False`` or a
 ``prototype_agents`` / ``gaussian_template`` block MLP together with a prior-bank decoder, and the
 attention maps remain learned linear maps there. The M-step minimizes the decode cross-entropy;
@@ -369,17 +369,10 @@ def build_optimizer(
             groups.append({"params": hidden_bias_parameters,
                            "lr": cfg.resolved_hyperparameter("m_per_type_hidden_bias_lr"),
                            "weight_decay": cfg.phi_weight_decay, "role": "phi"})
-    if getattr(model, "t5_bias", None) is not None:             # t5_learnable_bias=True relative-position bias
-        # weight_decay=0: the per-bucket T5 bias b_{i-j} is a relative-position PRIOR shaping the
-        # attention pi, not capacity; L2-decaying it toward zero biases the prior toward a flat/uniform
-        # relative-position distribution (the same exemption output_proj_bias / r / the gauge frame
-        # carry). role='mu' is the catch-all for learned non-variance/non-gauge tables (block_mlp,
-        # ...); the bias is not a gauge frame, so it steps under the mean LR, not m_phi_lr.
-        groups.append({"params": [model.t5_bias], "lr": cfg.m_p_mu_lr, "weight_decay": 0.0, "role": "mu"})
     # LayerNorm affine (layernorm_affine=True on a "layernorm" block norm): learned per-feature gamma/beta
     # on the belief mean, carried by the block AffineLayerNorm nn.Module. weight_decay=0 --
     # gamma/beta are normalization calibration, not capacity (decaying gamma toward 0 shrinks the
-    # normalized signal; the same exemption t5_bias / output_proj_bias carry). role='mu'
+    # normalized signal; the same exemption output_proj_bias carries). role='mu'
     # is the catch-all for learned non-variance/non-gauge tables; NO gauge flag (the affine touches
     # no gauge transport), so it rides as plain AdamW even under GaugeManifoldAdamW.
     ln_affine = []
@@ -430,7 +423,7 @@ def build_optimizer(
         # `foreach` unresolved `adam()` selects the FOREACH multi-tensor path -- 9 kernel launches
         # per parameter group per step against 1 for the fused kernel. So choosing the manifold
         # route silently deoptimized every OTHER group (mu_embed, sigma_log_embed,
-        # transport_state, t5_bias, LayerNorm affine), none of which the manifold logic
+        # transport_state, LayerNorm affine), none of which the manifold logic
         # touches. `step()` sets `p.grad = None` on every pullback_group parameter BEFORE
         # the trailing `super().step()`, so base AdamW skips exactly those and the fused kernel only
         # ever sees the standard groups.
@@ -886,7 +879,7 @@ def train_step(
             import warnings
             warnings.warn(
                 "grad_accum_steps>1 with uneven counted-token microbatches: non-CE regularizers "
-                "(mass_phi, mstep_self_coupling) are token-weighted by n_mb/n_tot "
+                "(mstep_self_coupling) are token-weighted by n_mb/n_tot "
                 "rather than by their own reduction, so their accumulated gradient is an "
                 "approximation. Use an unpadded/equal-token loader or grad_accum_steps=1 for the "
                 "exact objective.",
@@ -5444,7 +5437,7 @@ def _banner(
         f" M-LRs: {_fmt_table_lrs(cfg)}  phi={cfg.m_phi_lr}",
         f" decoder M-LRs: {_fmt_decode_lrs(cfg)}",
         f" VFE: lambda_alpha_mode={cfg.lambda_alpha_mode}  kappa_beta={cfg.kappa_beta}  "
-        f"tau={_fmt_tau(cfg, model)}  mass_phi={cfg.mass_phi}",
+        f"tau={_fmt_tau(cfg, model)}",
         f" seed={cfg.seed}",
         bar,
     ])

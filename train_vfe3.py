@@ -250,7 +250,7 @@ config = dict(
     kappa_beta                       = 1,        # tau = kappa * sqrt(d_head)
     learn_attention_temperature      = False,    # learn a per-layer, per-head log-temperature offset (starts at tau above)
     
-    beta_attention_prior             = 'causal',    # "causal" | "causal_noself" | "causal_alibi" | "causal_alibi_noself" | "causal_windowed" | "t5_relative_bias"
+    beta_attention_prior             = 'causal',    # "causal" | "causal_noself" | "causal_alibi" | "causal_alibi_noself" | "causal_windowed"
     
     #################################
     #         Belief E-step
@@ -370,7 +370,7 @@ def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int,
         f" auxiliary M-LRs: "
         f"block_mlp={_fmt_mixer_lr(cfg.m_block_mlp_lr, cfg.m_p_mu_lr)}",
         f" VFE: lambda_alpha_mode={cfg.lambda_alpha_mode}  kappa_beta={cfg.kappa_beta}  "
-        f"tau={_fmt_tau(cfg, model)}  mass_phi={cfg.mass_phi}",
+        f"tau={_fmt_tau(cfg, model)}",
         f" seed={cfg.seed}",
         bar,
     ])

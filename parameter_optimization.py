@@ -196,7 +196,6 @@ config: Dict[str, Any] = dict(
 
 
     # Further Regularizers
-    mass_phi                   = 0.0,       # (mass_phi/2) ||phi||^2 penalty
     mstep_self_coupling_weight = 0.0,       # alpha_hat * sum_i KL(q_i*||p_i) M-step term (0 = OFF)
 
 
@@ -279,8 +278,6 @@ config: Dict[str, Any] = dict(
     transport_chart_max_norm             = 20,
 
 
-
-    mu_trust_cholesky_rounds             = 3,
 
     
     decode_av_precision                  = "fp64",     #  "fp32" | "fp64"   
@@ -490,11 +487,6 @@ SEARCH_CONFIG: Dict[str, Any] = {
             "enabled": False, "bounds": [0.1, 1.0], "values": None, "scale": "linear",
             "requires": {},
             "description": "M-step self-coupling weight.",
-        },
-        "mass_phi": {
-            "enabled": False, "bounds": [0.0, 0.4], "values": None, "scale": "linear",
-            "requires": {},
-            "description": "Gauge-frame mass coefficient.",
         },
     },
 }

@@ -160,6 +160,10 @@ def _overflow_safe_norm(x: torch.Tensor) -> torch.Tensor:   # (..., K) -> (..., 
     return torch.where(torch.isfinite(plain), plain, scale * (x / scale).norm(dim=-1, keepdim=True))
 
 
+# Mean-trust ridge rounds: fp32/fp64 Sigma (K 4-210, spectra in [1e-6, 100], indefinite to -100u) need <= 3 (2026-10-12).
+MU_TRUST_CHOLESKY_ROUNDS: int = 4
+
+
 @_autocast_disabled()
 def apply_mu_trust_region(
     delta_mu: torch.Tensor,              # (..., K) proposed mean step (e_q_mu_lr * nat_grad_mu)
@@ -226,17 +230,12 @@ def apply_mu_trust_region(
         norm2 = _overflow_safe_norm(whitened)
         return delta_mu * (trust / norm2.clamp(min=eps)).clamp(max=1.0)
 
-    # rounds is a POLICY, not a constant (audit 2026-08-06 C6/F29). At rounds=0 there is zero
-    # jitter escalation, so one marginally non-PD sigma_q routes that element to the diagonal
-    # whitening below -- which is NOT GL-equivariant in either mode. Raising it lets the ladder
-    # rescue the element and keep it on the equivariant path instead. Default 0 keeps every run on
-    # disk bit-reproducible; the counter below makes the fallback visible either way.
-    factor, ok = safe_cholesky(sigma_q, eps=eps, rounds=_MU_TRUST_CHOLESKY_ROUNDS)
-    # rounds=0 means ZERO jitter escalation here, so one marginally non-PD sigma_q routes that batch
-    # element to the diagonal-whitening fallback below -- which is NOT GL-equivariant in either mode
-    # (measured relative equivariance error 9.3e-2 / 6.6e-1 / 1.1e-1 at gauge scales 0.06/0.5/1.5,
-    # against the ball path's 1.1e-15 / 1.1e-13 / 9.8e-11). It is masked in by torch.where with no
-    # signal, so a run could not tell it happened (audit 2026-08-06 F29). Counted on-device, no sync.
+    # The ridge ladder rescues a marginally non-PD sigma_q and keeps it on the GL-equivariant whitening; an
+    # element that still fails falls back to the diagonal whitening below, which is NOT GL-equivariant in
+    # either mode (measured relative equivariance error 9.3e-2 / 6.6e-1 / 1.1e-1 at gauge scales
+    # 0.06/0.5/1.5, against the ball path's 1.1e-15 / 1.1e-13 / 9.8e-11). It is masked in by torch.where,
+    # so it is counted on-device, without a sync (audit 2026-08-06 F29).
+    factor, ok = safe_cholesky(sigma_q, eps=eps, rounds=MU_TRUST_CHOLESKY_ROUNDS)
     _count_mu_trust_fallback(ok)
     eye = torch.eye(sigma_q.shape[-1], device=sigma_q.device, dtype=sigma_q.dtype)
     safe_factor = torch.where(ok.unsqueeze(-1).unsqueeze(-1), factor, eye.expand_as(factor))
@@ -265,29 +264,6 @@ def apply_mu_trust_region(
         delta_mu / scale, nan=0.0, posinf=whitened_finfo.max, neginf=-whitened_finfo.max))
     fallback = delta_mu * (trust / fallback_norm.clamp(min=eps)).clamp(max=1.0)
     return torch.where(ok.unsqueeze(-1), full_out, fallback)
-
-
-_MU_TRUST_CHOLESKY_ROUNDS: int = 0
-
-
-def set_mu_trust_cholesky_rounds(rounds: int) -> int:
-    r"""Set the process-wide jitter-escalation rounds for the mu-trust-region whitening Cholesky.
-
-    Returns the previous value. Default 0 reproduces the historical behavior exactly; a positive
-    value trades a small ridge for staying on the GL-EQUIVARIANT whitening path instead of dropping
-    to the non-equivariant diagonal fallback (measured relative equivariance error 9.3e-2 / 6.6e-1 /
-    1.1e-1 at gauge scales 0.06/0.5/1.5, against the ball path's 1.1e-15 / 1.1e-13 / 9.8e-11)."""
-    global _MU_TRUST_CHOLESKY_ROUNDS
-    if not isinstance(rounds, int) or isinstance(rounds, bool) or rounds < 0:
-        raise ValueError(f"mu_trust_cholesky_rounds must be a nonnegative int, got {rounds!r}")
-    previous = _MU_TRUST_CHOLESKY_ROUNDS
-    _MU_TRUST_CHOLESKY_ROUNDS = rounds
-    return previous
-
-
-def mu_trust_cholesky_rounds() -> int:
-    r"""Return the active mu-trust-region Cholesky jitter rounds."""
-    return _MU_TRUST_CHOLESKY_ROUNDS
 
 
 _MU_TRUST_FALLBACK_COUNTS: Dict[str, torch.Tensor] = {}

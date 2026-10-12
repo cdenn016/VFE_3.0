@@ -3,7 +3,7 @@ r"""The full VFE_3.0 model: encode -> E-step inference -> decode -> cross-entrop
 The parameters are the PriorBank's prior tables, the learned comparison and content maps of each
 attention layer (4K^2 per layer on the kernel readout, 2K^2 + H on the minimal agent), the default linear decoder, the default coordinate block MLP
 (nn.Linear layers with a pointwise activation), the default pos_phi='learned' positional table, and
-the tables of opt-in toggles (CG coupling, T5 bias, LayerNorm affine). No nn.Linear module is
+the tables of opt-in toggles (CG coupling, LayerNorm affine). No nn.Linear module is
 built only with use_block_mlp=False or a prototype_agents / gaussian_template block MLP together
 with a prior-bank decoder. Each layer's attention is one readout step (projected_predictive) or
 n_e_steps unrolled receiver updates (projected_gradient), and the CE loss backpropagates through it
@@ -64,7 +64,7 @@ from vfe3.model.prior_bank import (
 )
 from vfe3.model.stack import vfe_stack
 from vfe3.families.base import get_family as _get_family
-from vfe3.numerics import FACTOR_CONDITION_TOL, safe_eigvalsh, set_mu_trust_cholesky_rounds
+from vfe3.numerics import FACTOR_CONDITION_TOL, safe_eigvalsh
 from vfe3.relational_scoring import (
     GRAM_CONDITION_TOL,
     set_projected_condition_recovery,
@@ -273,7 +273,6 @@ class VFEModel(nn.Module):
         set_frame_pair_fp64_escalation(cfg.frame_pair_escalation_tol is not None)
         set_frame_pair_condition_tol(cfg.frame_pair_escalation_tol if cfg.frame_pair_escalation_tol is not None
                                      else DEFAULT_FRAME_PAIR_CONDITION_TOL)
-        set_mu_trust_cholesky_rounds(cfg.mu_trust_cholesky_rounds)
         # ... and the fp32 matmul / TF32 policy (audit 2026-08-06 C7/F25), which is process-global
         # for the same reason and belongs to the same one-place-set rule. It lives here rather than
         # in `seed_everything` because that is called by four separate driver entry points, only one
@@ -544,31 +543,6 @@ class VFEModel(nn.Module):
                            getattr(self, "pos_phi_free", None)):
                 if _frame is not None:
                     _frame.requires_grad_(False)
-        # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): a LEARNED T5 relative-position
-        # attention-bias table. When t5_learnable_bias=True, create t5_bias as a trainable
-        # nn.Parameter of shape (t5_num_buckets,); the attention log-prior reads it as the per-bucket
-        # bias b_{i-j} (manuscript GL(K)_attention.tex:826-838: pi_j ∝ exp(b_{i-j}), beta_ij =
-        # softmax_j(-E_ij/tau + b_{i-j}), the first-principles T5 derivation). Init to the fixed-table
-        # default -log1p(bucket) so a learnable model is byte-identical to the fixed t5_relative_bias
-        # prior at step 0, then trains. Unlike the gauge/value exceptions this bias is a scalar
-        # function of position OFFSET only and touches NO gauge transport, so it does NOT break gauge
-        # equivariance. Created ONLY when t5_relative_bias is an active channel (so the parameter is
-        # never orphaned); else no t5_bias attribute and the
-        # pure path stays param-free (the fixed-table default still runs).
-        if cfg.t5_learnable_bias and cfg.beta_attention_prior == "t5_relative_bias":
-            self.t5_bias = nn.Parameter(-torch.log1p(torch.arange(cfg.t5_num_buckets, dtype=torch.float32)))
-        elif cfg.t5_learnable_bias:
-            # t5_learnable_bias=True but no 't5_relative_bias' channel is active (the beta attention
-            # prior is not 't5_relative_bias'): no t5_bias parameter is created and the toggle is
-            # silently inert. Warn so the dead toggle is not mistaken for a trained bias.
-            import warnings
-            warnings.warn(
-                "t5_learnable_bias=True but no 't5_relative_bias' attention channel is active "
-                "(beta_attention_prior): no learnable t5_bias is created and "
-                "the toggle is inert. Set beta_attention_prior to "
-                "'t5_relative_bias' to use the learnable bias.",
-                UserWarning, stacklevel=2,
-            )
     @property
     def relational_operators_by_layer(self) -> Tuple[RelationalOperators, ...]:
         """Return independent layer projections without registering duplicate modules."""
@@ -646,26 +620,9 @@ class VFEModel(nn.Module):
         lets the gamma model-coupling block reuse the same cache under its own attention prior."""
         name = prior if prior is not None else self.cfg.beta_attention_prior
         dtype = self.group.generator_dtype
-        # Learnable T5 bias: the per-bucket table is a live nn.Parameter that changes every step, so
-        # the (name, N, ...) cache MUST be bypassed -- a cached tensor would serve a stale table and
-        # sever the gradient. Build fresh each call, passing the parameter as bias_values so the loss
-        # backpropagates to t5_bias (through the E-step). getattr keeps this None-safe when the param
-        # was not created (t5_learnable_bias off, or no active t5 channel); .to preserves the graph.
-        if name == "t5_relative_bias" and getattr(self, "t5_bias", None) is not None:
-            out = attention_log_prior(
-                name, n, n,
-                device=device, dtype=dtype,
-                n_heads=self.cfg.n_heads, alibi_slope=self.cfg.alibi_slope,
-                window=self.cfg.attention_window,
-                num_buckets=self.cfg.t5_num_buckets, max_distance=self.cfg.t5_max_distance,
-                bias_values=self.t5_bias.to(device=device, dtype=dtype))
-            if out.dim() == 3 and len(self.group.irrep_dims) == 1:
-                out = out.squeeze(0)
-            return out
-        # The key carries every cfg field a builder consumes (n_heads, alibi_slope, window, T5
-        # bucketing) so a post-construction cfg mutation cannot serve a stale prior (audit PP4/P9).
-        key = (name, n, device, dtype, self.cfg.n_heads, self.cfg.alibi_slope,
-               self.cfg.attention_window, self.cfg.t5_num_buckets, self.cfg.t5_max_distance)
+        # The key carries every cfg field a builder consumes (n_heads, alibi_slope, window) so a
+        # post-construction cfg mutation cannot serve a stale prior (audit PP4/P9).
+        key = (name, n, device, dtype, self.cfg.n_heads, self.cfg.alibi_slope, self.cfg.attention_window)
         cached = self._log_prior_cache.get(key)
         if cached is None:
             cached = attention_log_prior(
@@ -673,7 +630,6 @@ class VFEModel(nn.Module):
                 device=device, dtype=dtype,
                 n_heads=self.cfg.n_heads, alibi_slope=self.cfg.alibi_slope,
                 window=self.cfg.attention_window,
-                num_buckets=self.cfg.t5_num_buckets, max_distance=self.cfg.t5_max_distance,
             )
             # A (1, N, N) per-head prior on a single-block group collapses to the (N, N)
             # single-block convention (the energy carries no head axis there); the construction
@@ -1341,14 +1297,6 @@ class VFEModel(nn.Module):
                 ce = F.cross_entropy(flat_logits, flat_targets, ignore_index=-100,
                                      reduction="sum") / n_valid
         loss = ce
-        if self.cfg.mass_phi > 0.0:
-            # M-step gauge-frame penalty (manuscript Algorithm 1 M-step loss): regularizes the
-            # CONVERGED output phi -> backprops to the learned prior table phi_embed. The projected
-            # routes run no inner phi E-step, so this is the only place mass_phi enters.
-            # D-08: the penalty is the per-position squared norm ||phi_i||^2 = (phi ** 2).sum(dim=-1),
-            # averaged over positions to match the per-token mean that `ce` already is. Latent at
-            # the 0.0 default (no shipped config changes), material on a mass_phi sweep.
-            loss = loss + 0.5 * self.cfg.mass_phi * (belief.phi ** 2).sum(dim=-1).mean()
         if self.cfg.mstep_self_coupling_weight > 0.0:
             # M-step self-coupling regularizer (manuscript Algorithm 1, GL(K)_attention.tex:2111):
             # L += alpha_hat * sum_i alpha_i D(q_i*||p_i), the alpha-weighted self-coupling of the
@@ -1368,8 +1316,8 @@ class VFEModel(nn.Module):
             # so d/dalpha[alpha*D + R] = 0 there), the M-step gradient of the F self-term w.r.t. the
             # prior is alpha_i* dD/dtheta with alpha_i* held fixed -- detaching it (and dropping R)
             # is exact for the closed-form forms (state_dependent/state_dependent_per_coord).
-            # Grad-connected through D (no detach on D), so it backprops to the learned prior tables,
-            # like mass_phi. Capturing the final-block input preserves the exact stack recurrence at
+            # Grad-connected through D (no detach on D), so it backprops to the learned prior tables.
+            # Capturing the final-block input preserves the exact stack recurrence at
             # every depth; at n_layers=1 it is the encode-time prior, preserving the existing path.
             from vfe3.families import get_family
             from vfe3.free_energy import self_divergence_for_alpha

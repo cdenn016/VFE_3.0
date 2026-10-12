@@ -21,11 +21,9 @@ Modularity:
 Decode seam (PB-14): the authoritative ``reference_decode`` scores logits =
 -D_configured(q || pi_v)/tau_eff through the configured family (``self.family``) and divergence
 functional (``self.divergence_family`` at ``self.renyi_order``). The fast diagonal/full kernels are
-the OPTIMIZED gaussian_* + renyi(alpha=1) implementations; config requires a ``family_consistent``
-decoder for any non-Gaussian family on a prior-bank decoder. The registry seam is
+the OPTIMIZED gaussian_* + renyi(alpha=1) implementations. The registry seam is
 honored at the COVARIANCE-STRUCTURE granularity (``DecodeRegistration.covariance_kinds``): a new
-covariance structure or a new family-consistent readout is added by writing-and-registering a decode
-kernel, never by editing a call site. The full kernels score a full q against the intentionally
+covariance structure is added by writing-and-registering a decode kernel, never by editing a call site. The full kernels score a full q against the intentionally
 DIAGONAL vocabulary-prior table (promoted with diag_embed only when the family is full).
 ``reference_decode`` is the slow per-V seam-call cross-check the fused canonical kernels are pinned
 to EXACTLY (and under ``log_softmax``) on the canonical path.
@@ -473,10 +471,6 @@ class DecodeRegistration:
     rather than treating ``supports_full`` as an exclusive rank bit, so a dual-rank decoder (e.g.
     ``family``) accepts BOTH a diagonal and a full family. ``supports_full`` is retained (public,
     read by legacy callers) and stays coherent with the set: it is ``"full" in covariance_kinds``.
-    ``family_consistent`` flags a decoder that scores logits = -D_configured(q||p_v)/tau_eff through
-    the CONFIGURED family AND divergence functional (as opposed to the fast kernels' hardcoded
-    gaussian alpha=1 KL); config requires a family_consistent decoder for any non-Gaussian family or
-    noncanonical divergence on a prior-bank decoder.
 
     Direct construction ``DecodeRegistration(callable, supports_full, supports_chunked, fused_ce)``
     stays source-compatible: later capability fields default, and ``__post_init__`` derives the
@@ -489,7 +483,6 @@ class DecodeRegistration:
     supports_full:     bool
     supports_chunked:  bool
     fused_ce:          'Optional[FusedCECallable]'
-    family_consistent: bool                        = False
     covariance_kinds:  'Optional[FrozenSet[str]]'  = None
     can_omit_base_mean: bool                       = False
     can_omit_base_variance: bool                   = False
@@ -501,7 +494,6 @@ class DecodeRegistration:
         for field_name in (
             "supports_full",
             "supports_chunked",
-            "family_consistent",
             "can_omit_base_mean",
             "can_omit_base_variance",
             "fused_ce_supports_stats",
@@ -625,7 +617,6 @@ def register_decode(
     supports_full:     Optional[bool]              = None,
     supports_chunked:  bool                        = False,
     override:          bool                        = False,
-    family_consistent: bool                        = False,
     fused_ce:          'Optional[FusedCECallable]'      = None,
     covariance_kinds:  'Optional[FrozenSet[str]]'       = None,
     can_omit_base_mean:     bool                        = False,
@@ -639,8 +630,7 @@ def register_decode(
     ``{"diagonal"}``); SUPPLIED -> derive ``supports_full`` from membership (``"full" in kinds``) and
     reject an explicitly contradictory legacy ``supports_full``. Every existing
     ``register_decode(..., supports_full=True|False)`` call therefore keeps its old behavior.
-    ``family_consistent`` marks a decoder that reads logits out through the CONFIGURED family and
-    divergence functional. ``supports_chunked`` advertises a fused chunked-CE training path, whose
+    ``supports_chunked`` advertises a fused chunked-CE training path, whose
     callable is ``fused_ce``. ``fused_ce_supports_stats=True`` declares that callable's opt-in
     ``return_stats`` contract; the default is false so existing callables receive exactly their
     historical keyword set. The callable and all capabilities are replaced atomically, so an
@@ -689,7 +679,6 @@ def register_decode(
             supports_full=resolved_full,
             supports_chunked=supports_chunked,
             fused_ce=fused_ce,
-            family_consistent=family_consistent,
             covariance_kinds=resolved_kinds,
             can_omit_base_mean=can_omit_base_mean,
             can_omit_base_variance=can_omit_base_variance,

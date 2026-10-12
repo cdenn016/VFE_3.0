@@ -181,7 +181,6 @@ class DiagonalGaussian(BeliefParams):
     # maximally FLAT covariance as sub-rank-1 collapse -- the opposite of what it exists to
     # detect.
     effective_rank_rescale = True
-    gaussian_pointwise_algebra = True
 
     def __init__(self, mu: torch.Tensor, sigma: torch.Tensor) -> None:
         self.mu = mu
@@ -452,7 +451,6 @@ class FullGaussian(BeliefParams):
     # maximally FLAT covariance as sub-rank-1 collapse -- the opposite of what it exists to
     # detect.
     effective_rank_rescale = True
-    gaussian_pointwise_algebra = True
 
     @classmethod
     def from_covariance(cls, mu: torch.Tensor, covariance: torch.Tensor) -> "FullGaussian":

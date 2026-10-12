@@ -87,7 +87,6 @@ def _assert_bit_inert(base: Dict[str, Any], override: Dict[str, Any]) -> None:
 _PREDICTIVE_INERT = [
     {"lambda_beta": 5.0},
     {"sigma_max": 1e-3},
-    {"mu_trust_cholesky_rounds": 0},
     {"prior_handoff_rho": 0.0},
     {"prior_handoff_sigma": 1.0},
     {"attention_window": 1},
@@ -147,8 +146,7 @@ def test_decode_notices_only_report_active_explicit_settings(monkeypatch: pytest
 
 def test_launcher_route_inactive_report() -> None:
     inactive = _cfg(_launcher()).inactive_fields()
-    for name in ("family", "lambda_beta", "sigma_max",
-                 "mu_trust_cholesky_rounds", "attention_window", "prior_handoff_rho",
+    for name in ("family", "lambda_beta", "sigma_max", "attention_window", "prior_handoff_rho",
                  "prior_handoff_sigma"):
         assert name in inactive, name
     for name in ("decode_tau", "kappa_beta", "kl_max", "untie_decode_bank"):

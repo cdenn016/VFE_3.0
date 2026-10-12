@@ -5922,7 +5922,7 @@ def plot_pos_extrapolation(
 ):
     r"""H1/EXP-13: held-out CE vs eval sequence length N, one line per positional scheme.
 
-    Offset attention priors (alibi / t5, functions of |i-j|) stay flat past the trained length; the
+    Offset attention priors (causal_alibi, a function of |i-j|) stay flat past the trained length; the
     absolute schemes (learned pos_phi table, RoPE) rise -- the extrapolation contrast. The train
     length is marked; points beyond it are pure extrapolation."""
     if isinstance(arms, dict):

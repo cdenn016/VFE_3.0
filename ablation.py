@@ -425,7 +425,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     lambda_beta                      = 1.0,        # belief-coupling block weight (1.0 = pure F)
     kappa_beta                       = 1,        # tau = kappa * sqrt(d_head)
     
-    beta_attention_prior             = 'causal',    # "causal" | "causal_noself" | "causal_alibi" | "causal_alibi_noself" | "causal_windowed" | "t5_relative_bias"
+    beta_attention_prior             = 'causal',    # "causal" | "causal_noself" | "causal_alibi" | "causal_alibi_noself" | "causal_windowed"
     
     #################################
     #         Belief E-step
@@ -578,7 +578,6 @@ SWEEP_ORDER: List[str] = [
 
   
  # "mstep_self_coupling_weight",
- #  "mass_phi",   
   
    
   # "block_mlp_dropout",
@@ -872,16 +871,6 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     },
 
    
-     "mass_phi": {  # D1 / EXP-8: the regime knob (NOT phi_weight_decay, which is hard-zeroed under
-         # pullback group descent). The pullback advantage is predicted to shrink as mass_phi rises (the frame-
-         # norm penalty pulls phi toward 0, where ad_phi -> 0 and the pullback metric -> I).
-         "description": "mass_phi ",
-         "param": "mass_phi", 
-         "log_range": [0.0001, 2, 20],
-         "scale": "log",
-     },
-     
-    
      "mstep_self_coupling_weight": {
          "description": "M-step self-coupling term alpha_hat * sum_i KL(q_i*||p_i)",
          "param": "mstep_self_coupling_weight", 

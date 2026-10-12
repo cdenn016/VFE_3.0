@@ -118,14 +118,6 @@ class BeliefParams(ABC):
     dispersion_is_covariance: ClassVar[bool] = False
     effective_rank_rescale:   ClassVar[bool] = False
 
-    # Whether the family's POINTWISE law -- self-divergence, moments, entropy, decode readout -- is
-    # the Gaussian one of its ``cov_kind``, so the Gaussian closed forms elsewhere (the moment-matched
-    # barycenter r-update, the fixed alpha=1 KL decode kernels) are exact for it. A family that differs
-    # only in its transport/coupling seams inherits True from its Gaussian base and is served correctly
-    # by both; a genuinely non-Gaussian family leaves it False and is routed to the family-consistent
-    # alternatives.
-    gaussian_pointwise_algebra: ClassVar[bool] = False
-
     # Whether the coupling energy is defined only at the KL point (divergence_family='renyi',
     # renyi_order=1). Set by a family whose transported-divergence identity is KL-specific.
     requires_kl_divergence: ClassVar[bool] = False
