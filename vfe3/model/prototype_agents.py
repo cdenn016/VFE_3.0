@@ -63,6 +63,7 @@ from typing import List, NamedTuple, Optional, Tuple
 import torch
 from torch.utils.checkpoint import checkpoint
 
+from vfe3.contracts import host_check
 from vfe3.runtime import ieee_fp32_matmul
 
 
@@ -157,6 +158,12 @@ def _broadcast(t: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
 
 def _symmetric(A: torch.Tensor) -> torch.Tensor:
     return 0.5 * (A + A.transpose(-1, -2))
+
+
+def _raise_if(host: List[bool], message: str) -> None:
+    r"""Raise-only verdict of a :func:`vfe3.contracts.host_check`: ``ValueError(message)`` when the flag is set."""
+    if host[0]:
+        raise ValueError(message)
 
 
 @ieee_fp32_matmul()
@@ -399,12 +406,12 @@ def prototype_exact_posterior(
             M2_rows.append(acc.M2)
             Psi_rows.append(acc.Psi)
             Lbar_rows.append(acc.Lbar)
-        # One device-side reduction and one host check for every tile.
-        if bool(torch.stack(failures).any()):
-            raise ValueError(
-                "prototype-agent record covariance C_i + Lambda_a is not positive definite: zero-jitter "
-                "Cholesky failed; no repair applied" if blocks else
-                "prototype-agent record variances c_i + lambda_a must be positive and finite")
+        # One device-side reduction and one raise-only host check for every tile (deferred to the next
+        # mandatory host read inside vfe3.contracts.deferred_host_checks).
+        message = ("prototype-agent record covariance C_i + Lambda_a is not positive definite: zero-jitter "
+                   "Cholesky failed; no repair applied" if blocks else
+                   "prototype-agent record variances c_i + lambda_a must be positive and finite")
+        host_check(torch.stack(failures).any().reshape(1), lambda host: _raise_if(host, message))
         s = torch.cat(s_rows)                                                # (R,)
         u = torch.cat(u_rows)                                                # (R, K) or (R, G, b)
         weights = torch.softmax(torch.cat(logit_rows), dim=-1)               # (R, M)
@@ -636,9 +643,11 @@ def prototype_mean_field_posterior(
                 failed = (info != 0).any() if failed is None else failed | (info != 0).any()
             if not last:
                 x_lab, c_lab = x + delta, covariance_diagonal(C_plus, layout)   # the next labels read (xi^+, diag C^+)
-        if failed is not None and bool(failed):
-            raise ValueError("prototype-agent power-posterior matrix I + D^{1/2} C D^{1/2} is not positive "
-                             "definite: the working covariance is not positive semidefinite or not finite")
+        if failed is not None:
+            # Raise-only: deferred to the next mandatory host read inside vfe3.contracts.deferred_host_checks.
+            host_check(failed.reshape(1), lambda host: _raise_if(
+                host, "prototype-agent power-posterior matrix I + D^{1/2} C D^{1/2} is not positive "
+                      "definite: the working covariance is not positive semidefinite or not finite"))
         return MeanFieldPrototypePosterior(
             xi_plus=x + delta, delta_xi=delta, C_plus=C_plus if need_covariance else None,
             responsibilities=responsibilities, D=D, eta=eta)

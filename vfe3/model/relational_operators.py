@@ -9,7 +9,7 @@ import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
-from vfe3.contracts import CanonicalFrameContext
+from vfe3.contracts import CanonicalFrameContext, host_read
 from vfe3.model import edge_links, minimal_agent
 from vfe3.model.edge_links import EDGE_MODES, EdgeContext
 from vfe3.model.frame_actions import frame_matvec
@@ -889,7 +889,9 @@ class RelationalOperators(nn.Module):
         floor = self.floor_term(floor_anchor, sigma) if return_covariance else None
         mu_plus, sigma_plus, record, status = self._minimal_agent_call(
             mu, sigma, frame, log_prior, return_covariance, capture is not None, floor)
-        failed, ill_conditioned = status.tolist()                       # the one host check of a healthy call
+        # The one host read of a healthy call; it also resolves raise-only checks queued by
+        # vfe3.contracts.deferred_host_checks (earlier frame certificates and prototype-agent checks) first.
+        failed, ill_conditioned = host_read(status)
         if failed and dtype == torch.float64:
             raise ValueError(minimal_agent.readout_failure_message(dtype))
         if failed or ill_conditioned:
