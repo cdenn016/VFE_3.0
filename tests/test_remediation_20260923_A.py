@@ -328,7 +328,9 @@ def test_run_once_prints_inactive_launcher_settings(
 def test_inert_sweep_is_rejected_when_selected(monkeypatch: pytest.MonkeyPatch) -> None:
     baseline = serialize_config(_cfg(_launcher()))
     monkeypatch.setattr(ablation, "_resolved_sweep_baseline", lambda: dict(baseline))
-    for name in ("lambda_beta", "sigma_max"):
+    # The registered sigma_max sweep requires its sigma E-step; without it the ceiling is inert on this baseline.
+    monkeypatch.setitem(ablation.SWEEPS, "sigma_max_unrouted", {"param": "sigma_max", "values": [1, 100]})
+    for name in ("lambda_beta", "sigma_max_unrouted"):
         with pytest.raises(ValueError, match=f"{name}.*INERT on EVERY"):
             ablation.validate_sweeps([name], require_construction=True)
     ablation.validate_sweeps(list(ablation.SWEEPS), require_construction=False)   # registry stays valid
