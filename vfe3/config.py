@@ -2326,14 +2326,20 @@ class VFE3Config:
         if "e_mu_q_trust" in inactive or self.e_mu_q_trust is None or self.diagonal_covariance:
             mark(("mu_trust_cholesky_rounds",),
                  "only an active mean trust region on a full covariance factors sigma_q")
-        # stack._can_omit_prior_handoff at config level: predictive_content never reads the prior
+        # stack._can_omit_prior_handoff at config level: predictive_content never reads the prior mean,
         # and no M-step prior consumer is enabled. The canonical diagnostic reads each layer's handed-off prior
-        # (the capture keeps the handoff), so it is a consumer too (audit 2026-10-10 round 2, item 31).
+        # (the capture keeps the handoff), so it is a consumer too (audit 2026-10-10 round 2, item 31). The
+        # moment-matched and spread-corrected readouts floor at f * Sigma_p with the layer's prior covariance, so
+        # there the variance handoff is read (audit 2026-10-12 round 2, item 8).
         if (self.attention_mode == "projected_predictive" and self.mstep_self_coupling_weight == 0.0
                 and self.cg_energy_weight == 0.0 and not self.diagnose_canonical_free_energy):
-            mark(("prior_handoff_rho", "prior_handoff_sigma"),
-                 "predictive_content never reads the prior and no M-step prior consumer is enabled; with "
-                 "diagnose_canonical_free_energy=True they would feed that log-step diagnostic only")
+            from vfe3.model.minimal_agent import READOUT_COVARIANCES
+            floored = self.predictive_covariance in READOUT_COVARIANCES
+            mark(("prior_handoff_rho",) if floored else ("prior_handoff_rho", "prior_handoff_sigma"),
+                 "predictive_content never reads the prior mean"
+                 + ("" if floored else " or, without a moment-matched covariance, the prior covariance")
+                 + ", and no M-step prior consumer is enabled; with diagnose_canonical_free_energy=True "
+                 "they would feed that log-step diagnostic only")
         # The stack enters the E-step with q = p; one gradient iteration in one layer therefore
         # evaluates the self-coupling at D(q||p) = 0, where its force and derivatives vanish.
         # The closed-form receiver jumps to the frozen minimizer, which alpha sets, so the rule holds

@@ -34,7 +34,7 @@ from vfe3.metrics import covariance_frozen_at_encode
 from vfe3.model.block_mlp import (
     BlockMLP, CanonicalFrameBlockMLP, GaugeGateBlockMLP, _layernorm_diagonal_pushforward_at,
     block_norm_covariance_pushforward, block_norm_jacobian, block_norm_linearization, block_norm_radial_term,
-    layernorm_diagonal_pushforward, layernorm_scale,
+    layernorm_diagonal_pushforward, layernorm_scale, layernorm_trace_cap,
 )
 from vfe3.model.model import VFEModel
 
@@ -89,7 +89,9 @@ def test_closed_form_equals_the_dense_diagonal(affine: bool, eps: float) -> None
     assert got.shape == sigma.shape and got.dtype == torch.float64
     assert _relative(got, _dense_diagonal(norm, u, sigma)) < 1e-13
     # The layout dispatcher: the diagonal layout is the closed form, the full layout on diag_embed(sigma) is
-    # J Sigma J^T + f D Sigma D + rho g g^T, whose diagonal it is.
+    # J Sigma J^T + f D Sigma D + rho g g^T, whose diagonal it is; both are capped at the sphere bound, which binds
+    # on one token at eps = 1e-6 with gamma (audit 2026-10-12 round 2, M3).
+    got = got * layernorm_trace_cap(got, norm.weight if affine else None, True)
     assert torch.equal(block_norm_covariance_pushforward(norm, u, sigma, FLOOR), got)
     full = block_norm_covariance_pushforward(norm, u, torch.diag_embed(sigma), FLOOR).detach()
     assert _relative(torch.diagonal(full, dim1=-2, dim2=-1), got) < 1e-12

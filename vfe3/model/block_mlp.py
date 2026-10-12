@@ -466,6 +466,59 @@ def _uncapped_block_norm_pushforward(
 _LAYERNORM_TRACE_CAPS: Dict[str, torch.Tensor] = {}
 
 
+# Multisection of the secular equation in _centered_affine_bound: each round evaluates it at this many interior
+# points of the bracket, and the rounds shrink the bracket by 64^8 = 2^48, below float64 resolution.
+_SECULAR_POINTS = 63
+_SECULAR_ROUNDS = 8
+
+
+def _centered_affine_bound(
+    gamma: torch.Tensor,                              # (K,) LayerNorm affine weight
+) -> torch.Tensor:                                    # () lambda_max(Pi Gamma^2 Pi), differentiable in gamma
+    r""":math:`\lambda_{\max}(\Pi\Gamma^2\Pi)`, :math:`\Pi = I - \mathbf 1\mathbf 1^\top/K`, :math:`\Gamma = \operatorname{diag}\gamma`,
+    on the device with no host read.
+
+    The nonzero spectrum of :math:`\Pi\Gamma^2\Pi = (\Gamma\Pi)^\top(\Gamma\Pi)` is that of
+    :math:`\Gamma\Pi\Gamma = D - \gamma\gamma^\top/K`, :math:`D = \operatorname{diag}d`, :math:`d = \gamma^2`, a rank-one
+    downdate of a diagonal matrix. By interlacing its largest eigenvalue lies in :math:`[d_{(K-1)}, d_{(K)}]`, the two
+    largest :math:`d_k`, and on that interval it is the root of the secular equation
+
+    .. math::
+        f(\lambda) = 1 - \frac1K\sum_k\frac{d_k}{d_k - \lambda} = 0,
+
+    which decreases strictly from :math:`+\infty` to :math:`-\infty` there. A tie :math:`d_{(K-1)} = d_{(K)}` makes
+    :math:`d_{(K)}` itself the eigenvalue. The root is bracketed by a fixed number of multisection rounds
+    (:data:`_SECULAR_POINTS`, :data:`_SECULAR_ROUNDS`), so the loop reads nothing on the host, and the upper end of the
+    final bracket is returned, which keeps the cap valid. The implicit-function derivative
+
+    .. math::
+        \frac{\partial\lambda}{\partial d_k} = \frac{\lambda/(d_k - \lambda)^2}{\sum_j d_j/(d_j - \lambda)^2},
+
+    the squared component of the unit eigenvector, carries the gradient; at a tie it splits evenly among the tied
+    coordinates, the subgradient ``amax`` takes. :func:`torch.linalg.eigvalsh` would give the same value but checks its
+    status on the host on CUDA.
+    """
+    d = gamma.square()                                                        # (K,)
+    K = d.shape[-1]
+    with torch.no_grad():
+        dd = d.detach().double()                                              # (K,)
+        if K == 1:
+            return d.sum() * 0.0                                              # Pi = 0: LayerNorm of one coordinate is b
+        top = torch.topk(dd, 2).values                                        # (2,) d_(K), d_(K-1)
+        lo, hi = top[1:], top[:1]                                             # (1,) each
+        t = torch.linspace(0.0, 1.0, _SECULAR_POINTS + 2, dtype=torch.float64, device=dd.device)
+        for _ in range(_SECULAR_ROUNDS):
+            grid = lo + (hi - lo) * t                                         # (P + 2,) bracket ends included
+            f = 1.0 - (dd / (dd - grid[1:-1, None])).sum(dim=-1) / K          # (P,) decreasing; NaN at a tie
+            left = (f > 0).sum().reshape(1)                                   # (1,) grid points left of the root
+            lo, hi = grid.index_select(0, left), grid.index_select(0, left + 1)
+        lam = hi.reshape(())
+        den = (dd - lam).square().clamp_min((lam * torch.finfo(torch.float64).eps).square())   # (K,)
+        total = (dd / den).sum()
+        weight = torch.where(total > 0, (lam / den) / total, torch.zeros_like(dd))             # (K,) d lambda / d d_k
+    return lam.to(d.dtype) + (weight.to(d.dtype) * (d - d.detach())).sum()
+
+
 def layernorm_trace_cap(
     pushed:   torch.Tensor,                           # (..., K) diagonal or (..., K, K) full LayerNorm pushforward
     weight:   Optional[torch.Tensor],                 # (K,) affine gamma, or None for the plain norm
@@ -473,14 +526,21 @@ def layernorm_trace_cap(
 ) -> torch.Tensor:                                    # (..., 1) lambda in (0, 1]
     r"""Scale :math:`\lambda = \min(1, B/\operatorname{tr}P)` that caps a LayerNorm pushforward at the sphere bound.
 
-    The exact LayerNorm output is :math:`\gamma\odot z + b` with :math:`z = c/\sqrt{v + \epsilon}`, so
-    :math:`\lVert z\rVert^2 = Kv/(v + \epsilon) < K` for every input, and for any input distribution
+    The exact LayerNorm output is :math:`\gamma\odot z + b` with :math:`z = c/\sqrt{v + \epsilon}`, where
+    :math:`c = \Pi x` is the centered input, :math:`\Pi = I - \mathbf 1\mathbf 1^\top/K`. Hence :math:`z = \Pi z`,
+    :math:`\lVert z\rVert^2 = Kv/(v + \epsilon) < K` for every input, and for any input distribution, with
+    :math:`\Gamma = \operatorname{diag}\gamma`,
 
     .. math::
-        \operatorname{tr}\operatorname{Cov}(\gamma\odot z) \le E\lVert\gamma\odot z\rVert^2
-            \le B = K\max_k\gamma_k^2
+        \operatorname{tr}\operatorname{Cov}(\Gamma z) \le E\lVert\Gamma\Pi z\rVert^2
+            \le B = K\lambda_{\max}(\Pi\Gamma^2\Pi)
 
-    (:math:`B = K` for the plain norm). The delta method is valid only while the input variance is small against
+    (:func:`_centered_affine_bound`; :math:`B = K` for the plain norm). :math:`B` is the supremum of
+    :math:`\lVert\Gamma z\rVert^2` over the centered sphere of radius :math:`\sqrt K`. It is at most the earlier
+    :math:`K\max_k\gamma_k^2` and, by the test vector :math:`e_k`, at least :math:`(1 - 1/K)` of it, so it tightens that
+    cap by at most the factor :math:`K/(K-1)` (audit 2026-10-12 round 2, M3).
+    :math:`B` carries its gradient with respect to :math:`\gamma`, so where the cap binds the output
+    :math:`BP/\operatorname{tr}P` differentiates exactly (round 2, item 3). The delta method is valid only while the input variance is small against
     :math:`s^2`: its first-order term grows as :math:`\Sigma/s^2` and its radial term as :math:`(\Sigma/s^2)^2`, and at
     :math:`\Sigma/s^2 \approx 4\cdot 10^3` it gave a trace of :math:`7\cdot 10^6` against the Monte Carlo value
     :math:`K = 20`, reaching NaN by the third layer (audit 2026-10-12, item 1). Scaling the pushforward :math:`P` by
@@ -489,7 +549,7 @@ def layernorm_trace_cap(
     tokens are counted (:func:`layernorm_trace_cap_elements`).
     """
     K = pushed.shape[-1]
-    bound = float(K) if weight is None else K * weight.detach().to(pushed.dtype).square().amax()
+    bound = float(K) if weight is None else K * _centered_affine_bound(weight.to(pushed.dtype))   # carries d/d gamma
     trace = (pushed.sum(dim=-1, keepdim=True) if diagonal
              else torch.diagonal(pushed, dim1=-2, dim2=-1).sum(dim=-1, keepdim=True))       # (..., 1)
     lam = torch.clamp(bound / trace, max=1.0)                                                 # (..., 1)

@@ -996,6 +996,7 @@ class VFEModel(nn.Module):
         estep_grad_out: Optional[EStepGradientOutput] = None,   # diag out-param: E-step belief-grad norms (forwarded)
         _decode_frame_out: Optional[dict]            = None,   # private out-param: the reference decode frame
         _encoded_sigma_out: Optional[dict]           = None,   # private out-param: the stack's input covariance
+        _relational_capture: bool                    = True,   # private: False for forward's M-step-only capture
     ) -> 'Tuple[BeliefState, Optional[torch.Tensor]]':
         r"""Run the belief pipeline and return the converged belief q*, optionally
         with the decoded logits. This is the single belief-production seam used by ``forward`` and,
@@ -1017,7 +1018,10 @@ class VFEModel(nn.Module):
         from the returned belief: ``capture['converged']`` (the last block's converged
         pre-transform q*) and ``capture['final_block_prior']`` (the live ``(mu_p, sigma_p)`` entering
         that block), both written by ``vfe_stack``. ``capture['prior']`` retains the encode-time prior
-        (post s-refine), and ``capture['out']`` retains the raw stack output.
+        (post s-refine), and ``capture['out']`` retains the raw stack output. A capture also receives the
+        relational diagnostics (``capture['relational_capture']``: router labels, receiver costs, the minimal-agent
+        diagnostics); ``forward``'s M-step capture passes ``_relational_capture=False``, since no M-step term reads
+        them (audit 2026-10-12 round 2, item 6).
 
         Reference coordinates. Under ``decode_coordinates='reference'`` the realized relational frame :math:`U_i` is the decode
         frame: it is stored as ``capture['canonical_frame']`` (the key every decode caller already
@@ -1062,7 +1066,7 @@ class VFEModel(nn.Module):
         # .float()-ed; see _amp_off_context).
         amp = self._amp_context(token_ids.device)
         with amp:
-            relational_capture = {} if capture is not None else None
+            relational_capture = {} if capture is not None and _relational_capture else None
             if relational_capture is not None:
                 capture[self.conditional_capture_key] = relational_capture
             canonical_frame: Optional[CanonicalFrameContext] = None
@@ -1226,6 +1230,7 @@ class VFEModel(nn.Module):
             capture=cap,
             estep_grad_out=estep_grad_out,
             _reuse_content_factors=True,
+            _relational_capture=False,                           # the M-step terms read no relational diagnostic
             **({} if decode_frame_out is None else {"_decode_frame_out": decode_frame_out}),
             **({} if encoded_sigma_out is None else {"_encoded_sigma_out": encoded_sigma_out}),
         )
