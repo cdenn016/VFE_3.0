@@ -291,6 +291,12 @@ class VFE3Config:
 
     decode_unigram_prior:             bool            = True         # add unigram_kappa * log pi_v (corpus unigram) to the logits
     decode_bias:                      bool            = True         # linear only: learned per-vocab bias (zero init, no decay)
+    # decode_mode="linear" only: train on the second-order (delta-method) expected log-loss
+    # E_q[-log p_y] ~ CE(mu) + 1/2 tr(Sigma Cov_p(w)) instead of the plug-in CE(mu), at one extra (V, 2K)
+    # GEMM per vocab chunk. Training mode only; evaluation keeps the plug-in predictive CE. Requires
+    # family="gaussian_diagonal" and decode_coordinates="local". Its sigma gradient 1/2 Var_p(w_k) >= 0
+    # pushes Sigma toward its floor: run it as an ablation arm first.
+    decode_second_order:              bool            = False
     untie_decode_bank:                bool            = True         # prior-bank only: decode reads its own copy of the (V, K) tables
 
     decode_tau:                       float           = 1.0          # prior-bank decode temperature (1 = Bayes); not read by linear
@@ -1949,6 +1955,20 @@ class VFE3Config:
                 raise ValueError(
                     "decode_coordinates='reference' decodes the reference moments through the realized "
                     "relational frame and is defined only where that frame is; got " + "; ".join(incompatible))
+        if self.decode_second_order and self.decode_mode == "linear":
+            incompatible = []
+            if self.family != "gaussian_diagonal":
+                incompatible.append(
+                    f"family={self.family!r} (requires 'gaussian_diagonal': the full-covariance term "
+                    "1/2 tr(Sigma W^T diag(p) W) needs a per-position (K, K) moment, K times the logits GEMM)")
+            if self.decode_coordinates != "local":
+                incompatible.append(
+                    f"decode_coordinates={self.decode_coordinates!r} (requires 'local': the reference "
+                    "covariance U^-1 Sigma U^-T is not diagonal)")
+            if incompatible:
+                raise ValueError(
+                    "decode_second_order=True adds the diagonal delta-method term to the linear decode CE; "
+                    "got " + "; ".join(incompatible))
 
         # Per-type hidden bias on the block-MLP pre-activation (capacity-bearing per-type table).
         if self.per_type_hidden_bias:
@@ -2434,6 +2454,8 @@ class VFE3Config:
                 mark(("decode_mu_weight_decay",),
                      "shared encode/decode tables: the decode means are mu_embed, decayed by mu_weight_decay")
             mark(("decode_bias",), "linear decode only; the prior-bank KL decoders create no output bias")
+            mark(("decode_second_order",),
+                 "linear decode only; the prior-bank KL decoders already read Sigma_q")
         # Decay is read per optimizer group (vfe3/train.py build_optimizer). The global weight_decay reaches
         # only a group that sets no decay of its own: the block MLP and CG path weights, and the mean,
         # log-variance and decode-mean tables whose dedicated decay is None (audit 2026-10-10, item 13).
