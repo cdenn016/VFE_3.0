@@ -25,7 +25,7 @@ from vfe3.geometry.generators import (
     generate_block_local, generate_glk_multihead, generate_son, local_basis_co, local_basis_glc,
     local_basis_so,
 )
-from vfe3.geometry.irreps import DEFAULT_IRREP_BASIS, direct_sum_generators
+from vfe3.geometry.irreps import direct_sum_generators
 
 
 @dataclass(frozen=True)
@@ -593,7 +593,6 @@ def _build_so_n(
     *,
     group_n:    Optional[int]                   = None,
     irrep_spec: Optional[List[Tuple[str, int]]] = None,
-    irrep_basis: str                            = DEFAULT_IRREP_BASIS,
     tying:      str                             = "shared",
     dtype:      torch.dtype                     = torch.float32,
     device:     'torch.device | str | None'     = None,
@@ -617,10 +616,9 @@ def _build_so_n(
     per-head tau = kappa_h sqrt(d_h)); equal-dims specs (one label, mult > 1) additionally
     keep the fused factored-transport fast path.
 
-    ``irrep_basis`` selects the block bases (:mod:`vfe3.geometry.irreps`): 'canonical' is
-    deterministic and builds SO(3) spins of any order; 'eigh' is the original construction, kept
-    for checkpoints trained in it. The basis is rebuilt at every load, so the builder records a
-    sha256 ``basis_fingerprint`` of the float64 generators for the checkpoint loader to compare.
+    The block bases are the deterministic canonical ones of :mod:`vfe3.geometry.irreps` (SO(3)
+    spins of any order in closed form). The basis is rebuilt at every load, so the builder records
+    a sha256 ``basis_fingerprint`` of the float64 generators for the checkpoint loader to compare.
     The generator Frobenius Gram is certified diagonal with one common weight when the build
     verifies it numerically: for SIMPLE so(N) (N = 3 or N >= 5), in the orthogonal L_jk basis the
     trace form of any representation is a multiple of the Killing form, so
@@ -646,7 +644,7 @@ def _build_so_n(
             "([(label, mult), ...], labels 'l<p>'); set both in the config"
         )
     G_def = generate_son(group_n, dtype=torch.float64)
-    G, dims = direct_sum_generators(G_def, algebra="so", irrep_spec=irrep_spec, basis=irrep_basis)
+    G, dims = direct_sum_generators(G_def, algebra="so", irrep_spec=irrep_spec)
     if sum(dims) != K:
         raise ValueError(
             f"irrep_spec blocks {dims} sum to {sum(dims)} != K={K} (group_n={group_n})"

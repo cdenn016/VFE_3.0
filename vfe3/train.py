@@ -312,7 +312,7 @@ def build_optimizer(
         groups.append({"params": [pb.decode_sigma_log_embed], "lr": decode_sigma_lr, "role": "sigma", **sigma_wd})
     if pb.output_proj_weight is not None:                       # decode_mode='linear'
         groups.append({"params": [pb.output_proj_weight], "lr": decode_mu_lr, "role": "mu", **decode_mu_wd})
-    if pb.output_proj_bias is not None:                         # decode_bias: learned log-unigram prior
+    if pb.output_proj_bias is not None:                         # decode_mode='linear': learned log-unigram prior
         # weight_decay=0 -- decaying a unigram prior toward zero biases it to a flat distribution
         # (the same protection phi/Omega carry).
         groups.append({"params": [pb.output_proj_bias], "lr": decode_mu_lr, "weight_decay": 0.0, "role": "mu"})

@@ -21,16 +21,15 @@ def _full_gaussian_public_dtype(*dtypes: torch.dtype) -> torch.dtype:
     return torch.float64 if torch.float64 in dtypes else torch.float32
 
 
-# --- full-covariance KL precision policy (audit 2026-08-05) --------------------------------
-# "fp64": the historical unconditional float64 island -- the default, so every existing caller,
-#         test, and viz path is byte-identical to the pre-policy build.
-# "fp32_escalate": evaluate the pair grid in float32 and retain it only when Task 4's
-#         zero-jitter residual/conditioning certificate passes; otherwise recompute and return
-#         float64. "fp32_escalate_cond" adds its legacy pivot-ratio trigger to that shared gate.
-# The module-level value remains the standalone-call default. Model-owned callers pass an immutable
-# instance policy instead, so constructing another model cannot alter an existing model's numerics.
-_FULL_COV_KL_PRECISIONS = ("fp64", "fp32_escalate", "fp32_escalate_cond")
-# Pivot-ratio floor at which "fp32_escalate_cond" promotes the grid to float64.
+# --- full-covariance KL precision (audit 2026-08-05; hardcoded 2026-10-12) ------------------
+# A float32 full-covariance pair KL is evaluated in float32 and retained only when every row's
+# Cholesky factorization succeeded, both operands pass the zero-jitter residual/conditioning
+# certificate (validated_cholesky_solve), and the pivot-ratio trigger below is clear; otherwise
+# the whole grid is recomputed and returned in float64. A float64 family computes in float64
+# throughout. This is the former "fp32_escalate_cond" option of the retired full_cov_kl_precision
+# field; its "fp64" and "fp32_escalate" options were removed 2026-10-12 (second pass).
+#
+# Pivot-ratio floor at which a float32 grid is promoted to float64.
 #
 # CALIBRATED, NOT DERIVED. The proxy is min(diag L)^2 / max(diag L)^2, which is a lower bound on
 # 1/cond and under-reports true conditioning by 2-3 decades, so the threshold was measured rather
@@ -53,43 +52,6 @@ _FULL_COV_KL_PRECISIONS = ("fp64", "fp32_escalate", "fp32_escalate_cond")
 # clear, so this does not fire during normal training. The 1e9 row is non-monotone but still below
 # the floor, so the trigger holds there too.
 _FULL_COV_KL_COND_FLOOR: float = 1e-4
-_FULL_COV_KL_PRECISION: str = "fp64"
-
-
-def validate_full_cov_kl_precision(policy: str) -> str:
-    """Validate and return one supported full-covariance KL precision policy."""
-    if policy not in _FULL_COV_KL_PRECISIONS:
-        raise ValueError(
-            f"full_cov_kl_precision must be one of {_FULL_COV_KL_PRECISIONS}, got {policy!r}")
-    return policy
-
-
-def set_full_cov_kl_precision(policy: str) -> str:
-    r"""Set the process-wide full-covariance KL precision policy; returns the previous value."""
-    global _FULL_COV_KL_PRECISION
-    validate_full_cov_kl_precision(policy)
-    previous = _FULL_COV_KL_PRECISION
-    _FULL_COV_KL_PRECISION = policy
-    return previous
-
-
-def full_cov_kl_precision() -> str:
-    r"""Return the active full-covariance KL precision policy."""
-    return _FULL_COV_KL_PRECISION
-
-
-def _full_cov_kl_compute_dtype(
-    result_dtype: torch.dtype,
-    precision_policy: Optional[str] = None,
-) -> torch.dtype:
-    r"""Working dtype for the full-covariance KL under an explicit or standalone policy.
-
-    A float64 PUBLIC family always computes in float64 regardless of policy -- the policy only
-    governs whether a float32 family is promoted, which is what the historical island did."""
-    policy = full_cov_kl_precision() if precision_policy is None else validate_full_cov_kl_precision(precision_policy)
-    if policy == "fp64" or result_dtype == torch.float64:
-        return torch.float64
-    return torch.float32
 
 
 def _inv_cond_from_chol(factor: torch.Tensor) -> torch.Tensor:
@@ -504,7 +466,6 @@ class FullGaussian(BeliefParams):
 
         *,
         _public_dtype: Optional[torch.dtype] = None,
-        _precision_policy: Optional[str] = None,
     ) -> None:
         self.mu = mu
         self.sigma = sigma
@@ -512,9 +473,6 @@ class FullGaussian(BeliefParams):
             _public_dtype
             if _public_dtype is not None
             else _full_gaussian_public_dtype(mu.dtype, sigma.dtype)
-        )
-        self._precision_policy = (
-            None if _precision_policy is None else validate_full_cov_kl_precision(_precision_policy)
         )
 
     def coordinate_dim(self) -> int:
@@ -525,7 +483,6 @@ class FullGaussian(BeliefParams):
             self.mu[..., start:end],
             self.sigma[..., start:end, start:end],
             _public_dtype=self._public_dtype,
-            _precision_policy=self._precision_policy,
         )
 
     def broadcast_over_keys(self) -> "FullGaussian":
@@ -533,22 +490,15 @@ class FullGaussian(BeliefParams):
             self.mu.unsqueeze(-2),
             self.sigma.unsqueeze(-3),
             _public_dtype=self._public_dtype,
-            _precision_policy=self._precision_policy,
         )
 
     @classmethod
     def stack(cls, parts: List["FullGaussian"], *, dim: int = 0) -> "FullGaussian":
         public_dtype = _full_gaussian_public_dtype(*(part._public_dtype for part in parts))
-        explicit_policies = {part._precision_policy for part in parts if part._precision_policy is not None}
-        if len(explicit_policies) > 1:
-            raise ValueError(
-                "cannot stack FullGaussian values with conflicting explicit precision policies")
-        precision_policy = next(iter(explicit_policies), None)
         return FullGaussian(
             torch.stack([p.mu for p in parts], dim=dim),
             torch.stack([p.sigma for p in parts], dim=dim),
             _public_dtype=public_dtype,
-            _precision_policy=precision_policy,
         )
 
     @classmethod
@@ -691,21 +641,15 @@ class FullGaussian(BeliefParams):
         """
         if alpha != 1.0:
             raise ValueError("full-Gaussian per-coordinate self-coupling requires KL (alpha=1)")
-        if (self._precision_policy is not None and other._precision_policy is not None
-                and self._precision_policy != other._precision_policy):
-            raise ValueError("FullGaussian operands have conflicting explicit precision policies")
-        policy = self._precision_policy or other._precision_policy or full_cov_kl_precision()
         public_dtype = _full_gaussian_public_dtype(self._public_dtype, other._public_dtype)
-        compute_dtype = _full_cov_kl_compute_dtype(public_dtype, policy)
+        compute_dtype = public_dtype
         with torch.autocast(device_type=self.mu.device.type, enabled=False):
             args = tuple(x.to(compute_dtype) for x in (self.mu, self.sigma, other.mu, other.sigma))
             terms, ok, inv_cond = _full_gaussian_kl_coordinate_terms(*args, eps)
             if compute_dtype != torch.float64:
-                escalate = ~ok
-                if policy == "fp32_escalate_cond":
-                    escalate = (escalate | (inv_cond < _FULL_COV_KL_COND_FLOOR)
-                                | ~validated_cholesky_solve(args[1]).certified
-                                | ~validated_cholesky_solve(args[3]).certified)
+                escalate = (~ok | (inv_cond < _FULL_COV_KL_COND_FLOOR)
+                            | ~validated_cholesky_solve(args[1]).certified
+                            | ~validated_cholesky_solve(args[3]).certified)
                 if bool(escalate.any()):
                     args = tuple(x.double() for x in args)
                     terms, ok, _ = _full_gaussian_kl_coordinate_terms(*args, eps)
@@ -720,15 +664,11 @@ class FullGaussian(BeliefParams):
         alpha:   float = 1.0,
         kl_max:  float = 100.0,
         eps:     float = 1e-6,
-        precision_policy: Optional[str] = None,
     ) -> torch.Tensor:
         r"""Closed-form full-covariance Gaussian Renyi/KL (ported verbatim from
         ``divergence._gaussian_full_renyi``; mu_q=self, mu_t=other)."""
         K = self.mu.shape[-1]
-        # Preserve the public dtype policy (float64 for a public float64 family, otherwise float32),
-        # but evaluate every full-SPD factorization and cancellation in float64. Near the admitted
-        # cond(Sigma)~1e6 ceiling, float32 can turn the exact self-KL and shared derivative into
-        # O(1e-2) and O(1e4) artifacts, respectively.
+        # Public dtype: float64 when either operand's public dtype is float64, otherwise float32.
         # External construction retains the any-operand float64 policy. Family-owned transport
         # records the source public dtype before retaining an internal float64 covariance, and the
         # constructor plus shape combinators carry that provenance to this boundary.
@@ -736,21 +676,14 @@ class FullGaussian(BeliefParams):
                         if torch.float64 in (self._public_dtype, other._public_dtype)
                         else torch.float32)
         return_dtype = result_dtype
-        # Precision policy (audit 2026-08-05). Historically this was an unconditional
-        # `compute_dtype = torch.float64` -- unlike the `result_dtype` line directly above it and
-        # unlike DiagonalGaussian.renyi_closed_form, which keys on its operand dtypes. On the live
-        # gaussian_full pair grid that meant every cholesky / solve_triangular / logdet ran in
-        # float64, measured at 15.7x the float32 cost on a consumer GPU whose float64 throughput is
-        # heavily reduced. The policy is process-global ON PURPOSE: one policy, one read site, so a
-        # gradient cannot be computed at one precision against an objective reported at another.
-        if precision_policy is not None:
-            policy = validate_full_cov_kl_precision(precision_policy)
-        elif (self._precision_policy is not None and other._precision_policy is not None
-              and self._precision_policy != other._precision_policy):
-            raise ValueError("FullGaussian operands have conflicting explicit precision policies; pass precision_policy explicitly")
-        else:
-            policy = self._precision_policy or other._precision_policy
-        compute_dtype = _full_cov_kl_compute_dtype(result_dtype, policy)
+        # Working precision (audit 2026-08-05; hardcoded 2026-10-12). Historically this was an
+        # unconditional `compute_dtype = torch.float64`; on the live gaussian_full pair grid that
+        # ran every cholesky / solve_triangular / logdet in float64, measured at 15.7x the float32
+        # cost on a consumer GPU whose float64 throughput is heavily reduced. A float32 family now
+        # computes in float32 and the KL branch below escalates to float64 on a failed
+        # certificate (near the cond(Sigma)~1e6 ceiling float32 can turn the exact self-KL and
+        # shared derivative into O(1e-2) and O(1e4) artifacts).
+        compute_dtype = result_dtype
         mu_q = self.mu.to(compute_dtype)
         sigma_q = self.sigma.to(compute_dtype)
         mu_t = other.mu.to(compute_dtype)
@@ -770,35 +703,27 @@ class FullGaussian(BeliefParams):
             # jitter, so valid-SPD inputs stay byte-identical to torch.linalg.cholesky; an element
             # that fails every round -> NaN -> safe_kl_clamp -> kl_max (mirroring that branch).
             div, ok, inv_cond = _full_gaussian_kl_terms(mu_q, sigma_q, mu_t, sigma_t, K, eps)
-            # Data-keyed escalation: under a float32 policy a pair is recomputed in float64 rather
-            # than being written off to kl_max. The whole grid is escalated (not the failed subset)
-            # so the returned tensor keeps one dtype and one autograd graph; the branch is skipped
-            # entirely on the float64 policy, which is why that path stays bit-identical to the
-            # pre-policy build.
+            # Data-keyed escalation: a float32 pair is recomputed in float64 rather than being
+            # written off to kl_max. The whole grid is escalated (not the failed subset) so the
+            # returned tensor keeps one dtype and one autograd graph; the branch is skipped
+            # entirely for a float64 family.
             #
-            # The base fp32_escalate policy is the production hot path: reuse the Cholesky result
-            # above and promote only on an actual failed row. The opt-in *_cond policy adds Task 4's
-            # zero-jitter residual/spectral certificate plus the older pivot-ratio trigger. That
-            # strict check is deliberately gated because a full pair grid can contain millions of
-            # matrices; running a second Cholesky and eigvalsh on every one caused a 3x baseline
-            # regression and a whole-grid float64 cliff once a single row crossed the condition
-            # limit. The strict route retains that behavior for accuracy-sensitive experiments.
-            #
-            # The default limit is conservative and dimension/dtype dependent; at K=20 float32 it
-            # is about 6.55e3, so upper-tail rows may promote even when Cholesky succeeds.
-            # That is the explicit opt-in accuracy policy, not a failure fallback.
+            # The trigger is a failed Cholesky row, Task 4's zero-jitter residual/spectral
+            # certificate on either operand, or the pivot-ratio floor. The certificate runs a
+            # second Cholesky and eigvalsh on every matrix of the pair grid, measured at about 3x
+            # the Cholesky-failure-only trigger, and a single row past the condition limit
+            # promotes the whole grid to float64. The certificate limit is conservative and
+            # dimension/dtype dependent; at K=20 float32 it is about 6.55e3, so upper-tail rows
+            # may promote even when Cholesky succeeds.
             if compute_dtype is not torch.float64:
-                active_policy = full_cov_kl_precision() if policy is None else policy
-                escalate_mask = ~ok
-                if active_policy == "fp32_escalate_cond":
-                    q_certificate = validated_cholesky_solve(sigma_q)
-                    t_certificate = validated_cholesky_solve(sigma_t)
-                    escalate_mask = (
-                        escalate_mask
-                        | ~q_certificate.certified
-                        | ~t_certificate.certified
-                        | (inv_cond < _FULL_COV_KL_COND_FLOOR)
-                    )
+                q_certificate = validated_cholesky_solve(sigma_q)
+                t_certificate = validated_cholesky_solve(sigma_t)
+                escalate_mask = (
+                    ~ok
+                    | ~q_certificate.certified
+                    | ~t_certificate.certified
+                    | (inv_cond < _FULL_COV_KL_COND_FLOOR)
+                )
                 if bool(escalate_mask.any()):
                     div, ok, _ = _full_gaussian_kl_terms(
                         mu_q.double(), sigma_q.double(), mu_t.double(), sigma_t.double(), K, eps)
@@ -935,7 +860,6 @@ class BlockGaussian(FullGaussian):
             self.mu[..., start:end],
             self.sigma[..., start:end, start:end],
             _public_dtype=self._public_dtype,
-            _precision_policy=self._precision_policy,
         )
 
     def broadcast_over_keys(self) -> "BlockGaussian":
@@ -943,11 +867,9 @@ class BlockGaussian(FullGaussian):
             self.mu.unsqueeze(-2),
             self.sigma.unsqueeze(-3),
             _public_dtype=self._public_dtype,
-            _precision_policy=self._precision_policy,
         )
 
     @classmethod
     def stack(cls, parts: List["FullGaussian"], *, dim: int = 0) -> "BlockGaussian":
         stacked = FullGaussian.stack(parts, dim=dim)
-        return BlockGaussian(stacked.mu, stacked.sigma, _public_dtype=stacked._public_dtype,
-                             _precision_policy=stacked._precision_policy)
+        return BlockGaussian(stacked.mu, stacked.sigma, _public_dtype=stacked._public_dtype)

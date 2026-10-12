@@ -215,7 +215,6 @@ config = dict(
     
     decode_unigram_prior             = True,       # add kappa*log pi_v (corpus unigram) to decode logits    
     untie_decode_bank                = True,       # prior-bank modes only: decode reads its OWN cloned (V,K) tables
-    decode_bias                      = True,     # only for decode_mode='linear'
       
     deterministic                    = True,
     generate_embedding_figures       = False,
@@ -332,7 +331,6 @@ config = dict(
     pair_kl_gemm_tol                 = None,       # None (off) | nats, e.g. 1e-3: rescore pair-KL GEMM slices whose error estimate exceeds it (~+45% step at K=128)
         
     decode_ce_checkpoint             = "auto",     # "auto" | "auto_aggregate" (saves memory with recompute)
-    expected_likelihood_kernel       = "torch",    # "torch" | "triton" (fused EL cross-entropy, CUDA; expected_likelihood_chunked only)
     decode_logits_amp                = False,      # linear decode only: logits matmul under amp_dtype; CE stays fp32
     projected_factorization          = "gram",     # "gram" | "gram_certified" | "cholesky_qr2_certified" (certified: rebuild ill-conditioned factors; costly)
    

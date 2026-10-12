@@ -78,8 +78,8 @@ SELECTOR_KEYS: Tuple[str, ...] = (
     "covariance_update", "temperature_convention",
 )
 PRECISION_KEYS: Tuple[str, ...] = (
-    "amp_dtype", "fp32_matmul_precision", "matmul_precision_retry", "full_cov_kl_precision",
-    "decode_av_precision", "decode_logits_amp", "expected_likelihood_kernel", "deterministic",
+    "amp_dtype", "fp32_matmul_precision", "matmul_precision_retry",
+    "decode_av_precision", "decode_logits_amp", "deterministic",
 )
 FACTORIZATION_KEYS: Tuple[str, ...] = (
     "projected_factorization", "projected_factor_route", "projected_cov_condition_recovery",
@@ -898,7 +898,7 @@ def _architecture_items(run: RunRecord) -> List[Item]:
     if (run.raw("use_block_mlp") and run.raw("block_mlp_mode") == "coordinate"
             and isinstance(run.raw("block_mlp_expansion"), int) and isinstance(run.raw("embed_dim"), int)):
         items.append(("MLP hidden width", str(run.raw("block_mlp_expansion") * run.raw("embed_dim"))))
-    items += _raw_items(run, ("decode_mode", "decode_bias", "decode_unigram_prior", "unigram_kappa",
+    items += _raw_items(run, ("decode_mode", "decode_unigram_prior", "unigram_kappa",
                               "untie_decode_bank", "pos_phi"))
     return items
 
@@ -960,7 +960,7 @@ def _numerics_items(run: RunRecord) -> List[Item]:
     items = _raw_items(run, PRECISION_KEYS)
     realized_kernel = run.summary.get("expected_likelihood_ce_kernel")
     if realized_kernel is not None:
-        # The configured kernel is a request: 'triton' runs the torch kernel on CPU tensors (vfe3.model.prior_bank).
+        # Derived from the device: CUDA tensors run the fused Triton kernel, CPU tensors the torch kernel.
         items.append(("expected-likelihood CE kernel that ran", Code(str(realized_kernel))))
     if run.raw("matmul_precision_retry") is True:
         # A step that raises under a reduced fp32 matmul policy is replayed one rung stricter, ending at

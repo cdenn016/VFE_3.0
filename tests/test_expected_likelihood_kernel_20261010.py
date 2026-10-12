@@ -1,14 +1,15 @@
-r"""Fused Triton expected-likelihood cross-entropy (``expected_likelihood_kernel='triton'``, 2026-10-10).
+r"""Fused Triton expected-likelihood cross-entropy (2026-10-10; the only CUDA route since 2026-10-12).
 
 The fused route (vfe3/kernels/expected_likelihood.py) replaces the (B, N, Vc, K) broadcast of
-``PriorBank.decode_ce_expected_likelihood_chunked`` on CUDA tensors only. These tests pin:
+``PriorBank.decode_ce_expected_likelihood_chunked`` on every CUDA tensor; CPU tensors run the chunked
+torch kernel (the expected_likelihood_kernel selector was removed 2026-10-12). These tests pin:
 
-* the torch route is bitwise unchanged under ``'triton'`` for CPU tensors, and never imports triton;
+* CPU tensors run the torch kernel, record it as the realized kernel, and never import triton;
 * under the Triton interpreter (CPU, ``TRITON_INTERPRET=1``) the kernels reproduce the torch route's CE
   and every gradient on ragged shapes with ignored targets and the unigram bias (fp32 and fp64);
 * the kernels compile offline for the RTX 5090 target (sm_120) with zero register-spill bytes;
-* on CUDA (``CUDA_TESTS``) the compiled kernels match the torch route, are bitwise reproducible, and the
-  timing of both routes is recorded.
+* on CUDA (``CUDA_TESTS``) the compiled kernels match the float64 CPU torch route, are bitwise
+  reproducible, and their timing is recorded.
 
 The interpreter and compile checks run in subprocesses, so the test process never imports triton.
 """
@@ -23,8 +24,6 @@ from typing import Any, Dict, List, Tuple
 import pytest
 import torch
 
-from tests.profiles import test_config
-from vfe3.model.model import VFEModel
 from vfe3.model.prior_bank import PriorBank
 
 REPO = Path(__file__).resolve().parents[1]
@@ -36,13 +35,12 @@ requires_cuda = pytest.mark.skipif(
     reason="requires the CUDA lane (VFE3_TEST_DEVICE=cuda) and a CUDA device")
 
 
-def _bank(kernel: str, dtype: torch.dtype, *, V: int, K: int, unigram: bool, seed: int = 0,
+def _bank(dtype: torch.dtype, *, V: int, K: int, unigram: bool, seed: int = 0,
           chunk: int = 16) -> PriorBank:
     r"""A tiny expected-likelihood bank with non-degenerate tables (several vocabulary chunks)."""
     torch.manual_seed(seed)
     pb = PriorBank(V, K, 3, decode_mode="expected_likelihood_chunked", decode_chunk_size=chunk,
-                   decode_unigram_prior=unigram, unigram_kappa=0.7, decode_tau=0.9,
-                   expected_likelihood_kernel=kernel).to(dtype)
+                   decode_unigram_prior=unigram, unigram_kappa=0.7, decode_tau=0.9).to(dtype)
     with torch.no_grad():
         pb.sigma_log_embed.normal_(0.0, 0.5)
         pb.mu_embed.normal_(0.0, 1.0)
@@ -79,7 +77,7 @@ def _run_script(script: str, env: Dict[str, str]) -> Dict[str, Any]:
     return json.loads(proc.stdout.strip().splitlines()[-1])
 
 
-def test_torch_route_is_bitwise_unchanged_under_triton_for_cpu_tensors() -> None:
+def test_cpu_tensors_run_and_record_the_torch_kernel() -> None:
     V, K = 37, 5
     torch.manual_seed(1)
     mu_q = torch.randn(2, 7, K, dtype=torch.float64)
@@ -87,23 +85,19 @@ def test_torch_route_is_bitwise_unchanged_under_triton_for_cpu_tensors() -> None
     targets = torch.randint(0, V, (2, 7))
     targets[0, 2] = -100
     targets[1, 6] = -100
-    ref, g_ref = _ce_and_grads(_bank("torch", torch.float64, V=V, K=K, unigram=True), mu_q, sigma_q,
-                               targets, return_stats=True)
-    new, g_new = _ce_and_grads(_bank("triton", torch.float64, V=V, K=K, unigram=True), mu_q, sigma_q,
-                               targets, return_stats=True)
-    assert torch.equal(ref.ce, new.ce)
-    assert torch.equal(ref.scored_tokens, new.scored_tokens)
-    assert torch.equal(ref.excluded_tokens, new.excluded_tokens)
-    assert len(g_ref) == len(g_new) == 5
-    for a, b in zip(g_ref, g_new):
-        assert torch.equal(a, b)
+    pb = _bank(torch.float64, V=V, K=K, unigram=True)
+    assert pb.realized_expected_likelihood_kernel is None              # nothing ran yet
+    out, grads = _ce_and_grads(pb, mu_q, sigma_q, targets, return_stats=True)
+    assert pb.realized_expected_likelihood_kernel == "torch"
+    assert int(out.scored_tokens) == int((targets != -100).sum())
+    assert torch.isfinite(out.ce) and len(grads) == 5
 
 
 def test_cpu_route_never_imports_triton() -> None:
     script = """
     import json, sys, torch
     from vfe3.model.prior_bank import PriorBank
-    pb = PriorBank(11, 3, 3, decode_mode="expected_likelihood_chunked", expected_likelihood_kernel="triton")
+    pb = PriorBank(11, 3, 3, decode_mode="expected_likelihood_chunked")
     mu_q = torch.randn(1, 4, 3, requires_grad=True)
     ce = pb.decode_ce_expected_likelihood_chunked(mu_q, 0.5 + torch.rand(1, 4, 3), torch.tensor([[1, 2, -100, 4]]))
     ce.backward()
@@ -112,17 +106,6 @@ def test_cpu_route_never_imports_triton() -> None:
     """
     loaded = _run_script(script, _subprocess_env())
     assert loaded == {"triton": False, "kernel_module": False}
-
-
-def test_unknown_kernel_is_rejected() -> None:
-    with pytest.raises(ValueError, match="expected_likelihood_kernel"):
-        PriorBank(11, 3, 3, decode_mode="expected_likelihood_chunked", expected_likelihood_kernel="cuda")
-
-
-def test_model_plumbs_the_kernel_toggle_into_the_prior_bank() -> None:
-    cfg = test_config(decode_mode="expected_likelihood_chunked", expected_likelihood_kernel="triton",
-                      skip_belief_sigma_update=False)
-    assert VFEModel(cfg).prior_bank.expected_likelihood_kernel == "triton"
 
 
 _INTERPRETER_SCRIPT = """
@@ -262,7 +245,7 @@ def _time_cuda_ms(fn: Any, repeats: int = 5) -> float:
 
 
 @requires_cuda
-def test_cuda_triton_route_matches_torch_and_is_reproducible(record_property: Any) -> None:
+def test_cuda_triton_route_matches_cpu_torch_and_is_reproducible(record_property: Any) -> None:
     pytest.importorskip("triton")
     device = torch.device("cuda")
     V, K, B, N = 2085, 20, 4, 64
@@ -271,15 +254,16 @@ def test_cuda_triton_route_matches_torch_and_is_reproducible(record_property: An
     sigma_q = 0.2 + torch.rand(B, N, K, device=device)
     targets = torch.randint(0, V, (B, N), device=device)
     targets[0, :7] = -100
-    torch_bank = _bank("torch", torch.float32, V=V, K=K, unigram=True, chunk=8192).to(device)   # the default chunk
-    triton_bank = _bank("triton", torch.float32, V=V, K=K, unigram=True, chunk=8192).to(device)
-    triton_bank.load_state_dict(torch_bank.state_dict())
+    triton_bank = _bank(torch.float32, V=V, K=K, unigram=True, chunk=8192).to(device)   # the default chunk
 
-    reference_bank = _bank("torch", torch.float64, V=V, K=K, unigram=True)
-    reference_bank.load_state_dict({k: v.double().cpu() for k, v in torch_bank.state_dict().items()})
+    # CPU tensors run the chunked torch kernel: the float64 reference.
+    reference_bank = _bank(torch.float64, V=V, K=K, unigram=True)
+    reference_bank.load_state_dict({k: v.double().cpu() for k, v in triton_bank.state_dict().items()})
     ref, g_ref = _ce_and_grads(reference_bank, mu_q.double().cpu(), sigma_q.double().cpu(), targets.cpu())
+    assert reference_bank.realized_expected_likelihood_kernel == "torch"
 
     first, g_first = _ce_and_grads(triton_bank, mu_q, sigma_q, targets, return_stats=True)
+    assert triton_bank.realized_expected_likelihood_kernel == "triton"
     second, g_second = _ce_and_grads(triton_bank, mu_q, sigma_q, targets, return_stats=True)
     assert int(first.scored_tokens) == int((targets != -100).sum())
     assert torch.equal(first.ce, second.ce)                    # bitwise run-to-run reproducibility
@@ -292,18 +276,6 @@ def test_cuda_triton_route_matches_torch_and_is_reproducible(record_property: An
     assert ce_rel <= 1e-5
     assert len(grad_rel) == 5 and max(grad_rel) <= 1e-4
 
-    def step(bank: PriorBank) -> Any:
-        return lambda: _ce_and_grads(bank, mu_q, sigma_q, targets)
-
-    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
-    enabled = torch.are_deterministic_algorithms_enabled()
-    torch.use_deterministic_algorithms(enabled, warn_only=True)      # time the torch route as trained
-    try:
-        torch_ms = _time_cuda_ms(step(torch_bank))
-    finally:
-        torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
-    triton_ms = _time_cuda_ms(step(triton_bank))
-    record_property("cuda_ms_torch_route", torch_ms)
+    triton_ms = _time_cuda_ms(lambda: _ce_and_grads(triton_bank, mu_q, sigma_q, targets))
     record_property("cuda_ms_triton_route", triton_ms)
-    print(f"expected-likelihood CE fwd+bwd at B={B} N={N} V={V} K={K}: torch {torch_ms:.2f} ms, "
-          f"triton {triton_ms:.2f} ms ({torch_ms / triton_ms:.1f}x)")
+    print(f"expected-likelihood CE fwd+bwd at B={B} N={N} V={V} K={K}: triton {triton_ms:.2f} ms")

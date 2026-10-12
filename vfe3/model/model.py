@@ -64,12 +64,7 @@ from vfe3.model.prior_bank import (
     _encode_per_token,
 )
 from vfe3.model.stack import vfe_stack
-from vfe3.families.gaussian import (
-    set_full_cov_kl_precision,
-    validate_full_cov_kl_precision,
-)
-from vfe3.families.base import BeliefParams, get_family as _get_family
-from vfe3.families.policy import family_instance
+from vfe3.families.base import get_family as _get_family
 from vfe3.numerics import FACTOR_CONDITION_TOL, safe_eigvalsh, set_mu_trust_cholesky_rounds
 from vfe3.relational_scoring import (
     GRAM_CONDITION_TOL,
@@ -168,8 +163,6 @@ def build_group(cfg: VFE3Config) -> GaugeGroup:
         kwargs["group_n"] = cfg.group_n
     if cfg.irrep_spec is not None and "irrep_spec" in params:
         kwargs["irrep_spec"] = cfg.irrep_spec
-    if getattr(cfg, "irrep_basis", None) is not None and "irrep_basis" in params:
-        kwargs["irrep_basis"] = cfg.irrep_basis
     if getattr(cfg, "gauge_tying", None) is not None and "tying" in params:
         kwargs["tying"] = cfg.gauge_tying
     if arity == 1:
@@ -270,14 +263,6 @@ class VFEModel(nn.Module):
         # before model + loader are built), NOT here: seeding inside __init__ would clobber a
         # caller-set RNG state (e.g. a test that seeds then constructs several models).
         self.cfg = cfg
-        # The full-covariance KL precision policy is model state and the process-wide default for
-        # un-threaded family callers. It is installed under the same one-place-set rule as the
-        # Cholesky and fp32-matmul policies below, so direct full-Gaussian calls and the
-        # PriorBank fallback resolve the config-selected policy rather than the module default.
-        self.full_cov_kl_precision = validate_full_cov_kl_precision(
-            cfg.full_cov_kl_precision)
-        # Same one-place-set rule for the KL policy itself (audit 2026-08-06 C1).
-        set_full_cov_kl_precision(self.full_cov_kl_precision)
         # projected_factorization: the certificate and factor route; tolerances and the fp32 recovery
         # precision (float64 fallback) are fixed.
         set_projected_condition_recovery(cfg.projected_factorization != "gram")
@@ -386,12 +371,9 @@ class VFEModel(nn.Module):
             decode_av_precision=cfg.decode_av_precision,
             diagonal_covariance=cfg.diagonal_covariance,
             family=cfg.family,
-            full_cov_precision_policy=self.full_cov_kl_precision,
-            decode_bias=cfg.decode_bias,
             encode_mode=cfg.encode_mode, decode_mode=cfg.decode_mode,
             decode_chunk_size=cfg.decode_chunk_size,
             decode_ce_checkpoint=cfg.decode_ce_checkpoint,
-            expected_likelihood_kernel=cfg.expected_likelihood_kernel,
             decode_ranking_fp64_escalation=cfg.decode_ranking_fp64_escalation,
             # Tier-1/Tier-2 decode toggles (2026-07-05; all default OFF, byte-identical):
             unigram_kappa=cfg.unigram_kappa,
@@ -514,8 +496,7 @@ class VFEModel(nn.Module):
                 cfg.group_n, self.group.algebra,
                 self.group.irrep_dims, self.group.irrep_labels,
                 cg_covariance_mode=cfg.cg_covariance_mode,
-                cg_covariance_floor=cfg.cg_covariance_floor,
-                irrep_basis=cfg.irrep_basis)
+                cg_covariance_floor=cfg.cg_covariance_floor)
         else:
             self.cg_coupling = None
         # The projected routes run on the flat connection, whose registration has no trainable
@@ -611,12 +592,6 @@ class VFEModel(nn.Module):
         r"""Return the ambient block sizes the beta score is computed in."""
         return self.group.irrep_dims
 
-    def _family_instance(
-        self, family: type[BeliefParams], mu: torch.Tensor, sigma: torch.Tensor,
-    ) -> BeliefParams:
-        """Construct a model-owned Gaussian with this model's immutable policy."""
-        return family_instance(mu, sigma, family, self.full_cov_kl_precision)
-
     def load_state_dict(
         self,
         state_dict: Mapping[str, Any],
@@ -638,15 +613,14 @@ class VFEModel(nn.Module):
                 import warnings
                 warnings.warn(
                     "checkpoint predates the irrep-basis fingerprint; its so_n basis cannot be "
-                    "verified against this build (irrep_basis="
-                    f"{self.cfg.irrep_basis!r})", UserWarning, stacklevel=2)
+                    "verified against this build's canonical basis", UserWarning, stacklevel=2)
                 state_dict = {**state_dict, key: self.gauge_basis_fingerprint.detach().clone()}
             elif not torch.equal(saved.detach().to(device="cpu", dtype=torch.uint8),
                                  self.gauge_basis_fingerprint.detach().cpu()):
                 raise ValueError(
-                    "checkpoint was trained in a different so_n irrep basis than this build "
-                    f"(irrep_basis={self.cfg.irrep_basis!r}); its learned tables would load "
-                    "against the wrong frames. A config saved before 2026-10-05 loads as 'eigh'.")
+                    "checkpoint was trained in a different so_n irrep basis than this build's "
+                    "canonical basis (such as the 'eigh' basis removed 2026-10-12); its learned "
+                    "tables would load against the wrong frames.")
         return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
     def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True) -> "VFEModel":
@@ -1435,8 +1409,8 @@ class VFEModel(nn.Module):
             fam = get_family(cfg.family)
             q_conv = cap["converged"]                           # q*: pre-transform converged belief
             self_div = self_divergence_for_alpha(               # (B, N) summed, or (B, N, K) per-coord
-                self._family_instance(fam, q_conv.mu, q_conv.sigma),
-                self._family_instance(fam, mu_p, sigma_p),
+                fam(q_conv.mu, q_conv.sigma),
+                fam(mu_p, sigma_p),
                 kl_max=cfg.kl_max, eps=cfg.eps, lambda_alpha_mode=cfg.lambda_alpha_mode,
             )
             alpha_sc, _ = self_coupling_alpha(                  # SAME form as the E-step / diagnostics
@@ -2153,8 +2127,8 @@ class VFEModel(nn.Module):
             rows = canonical_routing_rows(belief.mu, belief.sigma, frame_inverse, snapshot.log_prior,
                                           tau=tau, irrep_dims=list(group.irrep_dims))
             self_div = self_divergence_for_alpha(                               # (B, N) or (B, N, K)
-                self._family_instance(fam, belief.mu.double(), belief.sigma.double()),
-                self._family_instance(fam, mu_p.double(), sigma_p.double()),
+                fam(belief.mu.double(), belief.sigma.double()),
+                fam(mu_p.double(), sigma_p.double()),
                 kl_max=cfg.kl_max, eps=cfg.eps, lambda_alpha_mode=cfg.lambda_alpha_mode)
             alpha, alpha_reg = self_coupling_alpha(
                 self_div, mode=cfg.lambda_alpha_mode, value=cfg.lambda_alpha,

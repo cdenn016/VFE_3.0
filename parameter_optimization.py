@@ -92,7 +92,6 @@ config: Dict[str, Any] = dict(
     #################################
     #        Encode/Decode          #
     #################################
-    decode_bias                       = True,     # only for decode_mode='linear'
 
 
     decode_mode                       = 'linear',  # prior-bank: diagonal_chunked/full_chunked/expected_likelihood_chunked
@@ -282,7 +281,6 @@ config: Dict[str, Any] = dict(
     transport_chart_max_norm             = 20,
 
 
-    full_cov_kl_precision                = "fp32_escalate",  # "fp64" | "fp32_escalate"
 
     mu_trust_cholesky_rounds             = 3,
 

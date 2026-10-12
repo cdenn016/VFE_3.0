@@ -345,15 +345,13 @@ class SemanticRun:
         return self._rows(OUTPUT_W_KEY, ids).numpy()
 
     def decode_b(self, ids: Sequence[int]) -> np.ndarray:
-        r"""(n,) linear-decode bias ``output_proj_bias`` (exactly zero when ``decode_bias=False``).
+        r"""(n,) linear-decode bias ``output_proj_bias`` (always present on the linear decoder).
 
         The unigram prior $\kappa\log\pi_v$ is separate (:meth:`unigram_log_prior`)."""
         self._require_decode("linear")
-        if OUTPUT_B_KEY in self.state:
-            return self._rows(OUTPUT_B_KEY, ids).numpy()
-        if self.cfg.decode_bias:
-            raise KeyError(f"decode_bias=True but {OUTPUT_B_KEY!r} is absent from the checkpoint")
-        return np.zeros(self._index(ids).shape[0], dtype=np.float64)
+        if OUTPUT_B_KEY not in self.state:
+            raise KeyError(f"{OUTPUT_B_KEY!r} is absent from the checkpoint")
+        return self._rows(OUTPUT_B_KEY, ids).numpy()
 
     def _decode_untied(self) -> bool:
         untied = bool(self.cfg.untie_decode_bank) and self.cfg.decode_mode != "linear"

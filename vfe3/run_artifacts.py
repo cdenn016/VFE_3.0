@@ -3610,7 +3610,7 @@ def _cost_model_fields(
     if cfg.decode_mode != "linear":
         decode_readout = 2 * V * K
     else:
-        decode_readout = V * K + (V if cfg.decode_bias else 0)
+        decode_readout = V * K + V                                    # output_proj_weight, output_proj_bias
     active = token_row + decode_readout
     active += block_mlp_params
     # Audit 2026-09-28: every token also reads one row of the learned positional-frame table
@@ -4240,8 +4240,8 @@ def finalize_run(
         "decode_mode":     cfg.decode_mode,
         "decode_tau_eff":  decode_tau_eff,
         # The expected-likelihood CE kernel that last ran ('torch' | 'triton'; None when that decoder never
-        # ran): expected_likelihood_kernel='triton' runs the torch kernel on CPU tensors (audit 2026-10-10
-        # round 2, #42).
+        # ran): CUDA tensors run the fused Triton kernel, CPU tensors the chunked torch kernel (audit
+        # 2026-10-10 round 2, #42; selector removed 2026-10-12).
         "expected_likelihood_ce_kernel": getattr(getattr(model, "prior_bank", None),
                                                  "realized_expected_likelihood_kernel", None),
         "phi_chart_norm_route": _phi_chart_norm_route(model, cfg),

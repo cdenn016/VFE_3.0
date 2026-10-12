@@ -88,12 +88,10 @@ def test_unread_prior_and_cg_knobs_are_reported_inert() -> None:
     assert "alibi_slope" not in _cfg(beta_attention_prior="causal_alibi").inactive_fields()
 
 
-def test_closed_form_full_covariance_marks_sigma_max_and_keeps_kl_precision_with_mstep() -> None:
+def test_closed_form_full_covariance_marks_sigma_max() -> None:
     closed_full = _cfg(relational_receiver_update="closed_form", family="gaussian_full",
                        skip_belief_sigma_update=False, lambda_alpha_mode="constant")
     assert "sigma_max" in closed_full.inactive_fields()
-    mstep = _cfg(family="gaussian_full", lambda_alpha_mode="constant", mstep_self_coupling_weight=0.5)
-    assert "full_cov_kl_precision" not in mstep.inactive_fields()
 
 
 def test_lambda_alpha_is_validated_in_every_alpha_mode() -> None:

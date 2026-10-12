@@ -14,25 +14,22 @@ of one structure group (possibly with unequal dimensions). Registered family:
                            spin-p tower (dim 2p + 1). Built in real orthonormal bases,
                            so every generator image is exactly skew.
 
-Two bases are registered for the 'so' family (``basis``):
-
-* ``"canonical"`` (the default) is deterministic. For N = 3 the spin-l block is built in
-  closed form from the angular-momentum ladder, J_z |l,m> = m |l,m> and
-  J_+ |l,m> = sqrt(l(l+1) - m(m+1)) |l,m+1> (Varshalovich, Moskalev and Khersonskii,
-  *Quantum Theory of Angular Momentum*, 1988), carried to the real spherical-harmonic basis
-  (Blanco, Florez and Bermejo, J. Mol. Struct. THEOCHEM 419 (1997) 19-27), for any l at
-  O(l^2) cost; l = 1 is the defining representation itself. For N != 3 the tensor-power
-  construction below runs on a fixed monomial basis of Sym^p with a fixed-order Gram-Schmidt
-  for the traceless subspace, so no eigensolver chooses the basis.
-* ``"eigh"`` is the original tensor-power construction, whose basis is whatever ``eigh``
-  returns inside a degenerate eigenspace. It is kept so checkpoints trained in it still load.
+Every block is built in one deterministic (canonical) basis. For N = 3 the spin-l block is
+built in closed form from the angular-momentum ladder, J_z |l,m> = m |l,m> and
+J_+ |l,m> = sqrt(l(l+1) - m(m+1)) |l,m+1> (Varshalovich, Moskalev and Khersonskii,
+*Quantum Theory of Angular Momentum*, 1988), carried to the real spherical-harmonic basis
+(Blanco, Florez and Bermejo, J. Mol. Struct. THEOCHEM 419 (1997) 19-27), for any l at
+O(l^2) cost; l = 1 is the defining representation itself. For N != 3 the tensor-power
+construction below runs on a fixed monomial basis of Sym^p with a fixed-order Gram-Schmidt
+for the traceless subspace, so no eigensolver chooses the basis. The original eigh-based
+tensor-power basis (the retired irrep_basis="eigh") was removed 2026-10-12.
 
 Tensor-power construction: the rank-p tensor power carries the Leibniz action
 
     rho_p(X) = sum_{k=0}^{p-1} I^{(k)} (x) X (x) I^{(p-1-k)}      on (R^N)^{(x)p},
 
 and the irrep is its restriction rho(X) = Q^T rho_p(X) Q to an orthonormal basis Q of
-the invariant subspace (symmetric, and traceless for so). In both bases the homomorphism
+the invariant subspace (symmetric, and traceless for so). The homomorphism
 property [rho(X), rho(Y)] = rho([X, Y]) is VERIFIED at build time against the structure
 constants of the defining basis (raise, not warn, on residual). All construction runs in
 float64; callers cast.
@@ -47,38 +44,28 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-IRREP_BASES: Tuple[str, ...] = ("canonical", "eigh")
-DEFAULT_IRREP_BASIS: str = "canonical"
-
-# key 'algebra:prefix' -> (dim_fn(N, p) -> int, build_fn(G_def, p, basis) -> (n_gen, d, d))
+# key 'algebra:prefix' -> (dim_fn(N, p) -> int, build_fn(G_def, p) -> (n_gen, d, d))
 _IRREPS: Dict[str, Tuple[Callable[[int, int], int],
-                         Callable[[torch.Tensor, int, str], torch.Tensor]]] = {}
+                         Callable[[torch.Tensor, int], torch.Tensor]]] = {}
 
 
 def register_irrep(
     key:      str,                                               # 'algebra:prefix', e.g. 'so:l'
     dim_fn:   Callable[[int, int], int],                         # (N, rank) -> block dimension
-    build_fn: Callable[[torch.Tensor, int, str], torch.Tensor],  # (G_def, rank, basis) -> (n_gen, d, d)
+    build_fn: Callable[[torch.Tensor, int], torch.Tensor],       # (G_def, rank) -> (n_gen, d, d)
 
     *,
     override: bool = False,
 ) -> None:
     """Register an irrep family under ``key`` (label grammar: '<prefix><rank>').
 
-    ``build_fn`` receives the basis name (one of ``IRREP_BASES``) and must raise for a basis it
-    does not implement. Duplicate keys fail closed (audit 2026-07-01 round-3): a second
+    Duplicate keys fail closed (audit 2026-07-01 round-3): a second
     registration under an existing key silently shadowed the first. Pass ``override=True`` to
     replace deliberately.
     """
     if key in _IRREPS and not override:
         raise KeyError(f"irrep family {key!r} already registered; pass override=True to replace")
     _IRREPS[key] = (dim_fn, build_fn)
-
-
-def _check_basis(basis: str) -> str:
-    if basis not in IRREP_BASES:
-        raise ValueError(f"irrep basis must be one of {IRREP_BASES}, got {basis!r}")
-    return basis
 
 
 def _parse_label(algebra: str, label: str) -> Tuple[str, int]:
@@ -112,11 +99,10 @@ def irrep_generators(
     *,
     algebra: str,                          # 'so'
     label:   str,                          # e.g. 'l2'
-    basis:   str = DEFAULT_IRREP_BASIS,    # 'canonical' | 'eigh'
 ) -> torch.Tensor:                         # (n_gen, d, d) generator images on the irrep
     """Build one irrep's generator images (the registry's public single-label entry point)."""
     key, p = _parse_label(algebra, label)
-    return _IRREPS[key][1](G_def, p, _check_basis(basis))
+    return _IRREPS[key][1](G_def, p)
 
 
 def check_irrep_constructible(
@@ -125,14 +111,13 @@ def check_irrep_constructible(
     *,
     algebra: str,                          # 'so'
     label:   str,                          # e.g. 'l8'
-    basis:   str = DEFAULT_IRREP_BASIS,
 ) -> None:
-    """Raise, before any tensor is built, if ``label`` cannot be constructed in ``basis``."""
+    """Raise, before any tensor is built, if ``label`` cannot be constructed."""
     key, p = _parse_label(algebra, label)
     _IRREPS[key][0](N, p)                  # the family's dimension formula refuses an undefined (N, rank)
     if key in _WEDGE_FAMILIES:
         return                             # direct construction on the p-vector basis: no tensor power
-    if algebra == "so" and N == 3 and _check_basis(basis) == "canonical":
+    if algebra == "so" and N == 3:
         return                             # closed-form ladder construction: any rank
     if p >= 2:
         _guard_cost(N, p)
@@ -143,9 +128,8 @@ def _guard_cost(N: int, p: int) -> None:
     if p > 6 or N ** p > 60000:
         raise ValueError(
             f"rank-{p} tensor-power irrep over R^{N} exceeds the supported construction size "
-            f"(rank <= 6 and N^rank <= 60000); for SO(3) use irrep_basis='canonical', which "
-            f"builds any spin in closed form; higher ranks for N != 3 await the Young-tableau "
-            f"buildout."
+            f"(rank <= 6 and N^rank <= 60000); SO(3) builds any spin in closed form; higher "
+            f"ranks for N != 3 await the Young-tableau buildout."
         )
 
 
@@ -163,16 +147,6 @@ def _leibniz_action(
             M = torch.kron(M, X if slot == k else eye)
         out += M
     return out
-
-
-def _symmetrizer(N: int, p: int) -> torch.Tensor:
-    r"""Projector onto Sym^p(R^N) inside (R^N)^{(x)p}: average of the p! slot permutations."""
-    dim = N ** p
-    T = torch.eye(dim, dtype=torch.float64).reshape([N] * p + [dim])
-    S = torch.zeros(dim, dim, dtype=torch.float64)
-    for perm in itertools.permutations(range(p)):
-        S += T.permute(*perm, p).reshape(dim, dim)
-    return S / math.factorial(p)
 
 
 def _contraction(N: int, p: int) -> torch.Tensor:
@@ -246,46 +220,19 @@ def _canonical_invariant_basis(
     return B @ _ordered_gram_schmidt(P)
 
 
-def _invariant_basis(
-    N:         int,                        # defining-rep dimension
-    p:         int,                        # tensor-power rank
-
-    *,
-    traceless: bool,                       # additionally impose the trace-zero condition (so)
-) -> torch.Tensor:                         # (N^p, d) orthonormal basis of the invariant subspace
-    """Orthonormal basis of Sym^p(R^N) (optionally traceless) inside the tensor power ('eigh')."""
-    if p == 0:
-        return torch.ones(1, 1, dtype=torch.float64)
-    if p == 1:
-        return torch.eye(N, dtype=torch.float64)
-    evals, evecs = torch.linalg.eigh(_symmetrizer(N, p))
-    B = evecs[:, evals > 0.5]                                 # Sym^p eigenspace (projector eval 1)
-    if traceless:
-        M = _contraction(N, p) @ B                            # trace map in Sym^p coordinates
-        _, sv, Vh = torch.linalg.svd(M, full_matrices=True)
-        rank = int((sv > 1e-10).sum())
-        B = B @ Vh[rank:].T                                   # null space: traceless subspace
-        B, _ = torch.linalg.qr(B)                             # numerical re-orthonormalization
-    return B
-
-
 def _tensor_power_irrep(
     G_def:     torch.Tensor,               # (n_gen, N, N) defining-rep algebra basis (float64)
     p:         int,                        # tensor-power rank (label's trailing integer)
 
     *,
     traceless: bool,                       # so: True (sym-traceless)
-    basis:     str = "eigh",               # 'eigh' | 'canonical' (deterministic invariant basis)
 ) -> torch.Tensor:                         # (n_gen, d, d) generator images on the irrep
     """Restrict the Leibniz action to the invariant subspace: rho(X) = Q^T rho_p(X) Q."""
     n_gen, N, _ = G_def.shape
     if p == 0:
         return torch.zeros(n_gen, 1, 1, dtype=torch.float64)  # trivial rep: zero generators
     _guard_cost(N, p)
-    if basis == "canonical":
-        Q = _canonical_invariant_basis(N, p, traceless=traceless)
-    else:
-        Q = _invariant_basis(N, p, traceless=traceless)
+    Q = _canonical_invariant_basis(N, p, traceless=traceless)
     return torch.stack([Q.T @ _leibniz_action(G_def[a], p) @ Q for a in range(n_gen)])
 
 
@@ -395,7 +342,6 @@ def direct_sum_generators(
     *,
     algebra:    str,                                # registry namespace: 'so'
     irrep_spec: Sequence[Tuple[str, int]],          # (label, multiplicity) pairs, in block order
-    basis:      str = DEFAULT_IRREP_BASIS,          # 'canonical' | 'eigh'
 ) -> Tuple[torch.Tensor, List[int]]:                # ((n_gen, K, K) float64, per-block dims)
     """Assemble blockdiag_b rho_b(X_a) over the spec; each distinct label is built once,
     verified (dimension formula + bracket homomorphism), then tiled by its multiplicity."""
@@ -410,7 +356,7 @@ def direct_sum_generators(
         if label not in built:
             key, p = _parse_label(algebra, label)
             dim_fn, build_fn = _IRREPS[key]
-            rho = build_fn(G_def, p, _check_basis(basis))
+            rho = build_fn(G_def, p)
             d_expect = dim_fn(N, p)
             if rho.shape[-1] != d_expect:
                 raise RuntimeError(
@@ -441,10 +387,10 @@ def _son_sym_traceless_dim(N: int, p: int) -> int:
     return math.comb(N + p - 1, p) - math.comb(N + p - 3, p - 2)
 
 
-def _son_sym_traceless_build(G_def: torch.Tensor, p: int, basis: str) -> torch.Tensor:
-    if basis == "canonical" and G_def.shape[-1] == 3:
+def _son_sym_traceless_build(G_def: torch.Tensor, p: int) -> torch.Tensor:
+    if G_def.shape[-1] == 3:
         return _so3_canonical_irrep(G_def, p)
-    return _tensor_power_irrep(G_def, p, traceless=True, basis=basis)
+    return _tensor_power_irrep(G_def, p, traceless=True)
 
 
 register_irrep("so:l",   _son_sym_traceless_dim, _son_sym_traceless_build)
@@ -459,7 +405,7 @@ register_irrep("so:l",   _son_sym_traceless_dim, _son_sym_traceless_build)
 #   m even (N = 0 mod 4): Lambda^m = Lambda^m_+ (+) Lambda^m_-, the self-dual 'wp<m>' and
 #                         anti-self-dual 'wm<m>' irreps, each of dim C(N, m)/2; 'w<m>' is refused.
 # Every construction is a fixed integer recipe on the orthonormal basis e_I (I an increasing p-tuple
-# in lexicographic order), so the basis is deterministic and the same for 'canonical' and 'eigh'.
+# in lexicographic order), so the basis is deterministic.
 
 _WEDGE_FAMILIES = ("so:w", "so:wp", "so:wm")
 
@@ -513,7 +459,7 @@ def _wedge_action(G_def: torch.Tensor, p: int) -> Tuple[torch.Tensor, List[Tuple
     return rho, tuples
 
 
-def _wedge_build(G_def: torch.Tensor, p: int, basis: str) -> torch.Tensor:
+def _wedge_build(G_def: torch.Tensor, p: int) -> torch.Tensor:
     _wedge_dim(G_def.shape[-1], p)
     return _wedge_action(G_def, p)[0]
 
@@ -544,11 +490,11 @@ def _hodge_half(G_def: torch.Tensor, p: int, sign: int) -> torch.Tensor:
     return P.T @ rho @ P
 
 
-def _wedge_plus_build(G_def: torch.Tensor, p: int, basis: str) -> torch.Tensor:
+def _wedge_plus_build(G_def: torch.Tensor, p: int) -> torch.Tensor:
     return _hodge_half(G_def, p, +1)
 
 
-def _wedge_minus_build(G_def: torch.Tensor, p: int, basis: str) -> torch.Tensor:
+def _wedge_minus_build(G_def: torch.Tensor, p: int) -> torch.Tensor:
     return _hodge_half(G_def, p, -1)
 
 
@@ -586,7 +532,6 @@ def random_irrep_spec(
 
     *,
     algebra:  str           = "so",
-    basis:    str           = DEFAULT_IRREP_BASIS,
     seed:     int           = 0,
     min_rank: int           = 1,           # 1 skips the trivial rank-0 block (no generators)
     max_rank: Optional[int] = None,        # None: every rank whose block fits and is constructible
@@ -594,7 +539,7 @@ def random_irrep_spec(
     r"""Draw an irrep tower of exactly ``n_heads`` blocks whose dimensions sum to ``K``.
 
     The candidates are the labels of every family registered for ``algebra`` with rank in
-    [``min_rank``, ``max_rank``] that fit in K and are constructible in ``basis``. The draw is
+    [``min_rank``, ``max_rank``] that fit in K and are constructible. The draw is
     uniform over the multisets of candidate labels with ``n_heads`` elements and total dimension
     K, sampled exactly from the counts by dynamic programming with ``random.Random(seed)``. The
     result is in ascending (family, rank) order with multiplicities, so equal blocks are
@@ -625,13 +570,12 @@ def random_irrep_spec(
                     break
                 continue
             try:
-                check_irrep_constructible(N, algebra=algebra, label=label, basis=basis)
+                check_irrep_constructible(N, algebra=algebra, label=label)
             except ValueError:
                 break                                          # higher ranks cost more still
             candidates.append((label, d))
     if not candidates:
-        raise ValueError(f"no {algebra}({N}) irrep with rank in [{min_rank}, {top}] fits K={K} "
-                         f"in basis {basis!r}")
+        raise ValueError(f"no {algebra}({N}) irrep with rank in [{min_rank}, {top}] fits K={K}")
 
     count = _multiset_counts([d for _, d in candidates], n_heads, K)
     if count[0][n_heads][K] == 0:
@@ -643,7 +587,7 @@ def random_irrep_spec(
             for p in range(min_rank, (2 * K if max_rank is None else max_rank) + 1):
                 try:
                     d = irrep_dim(N, algebra=algebra, label=f"{prefix}{p}")
-                    check_irrep_constructible(N, algebra=algebra, label=f"{prefix}{p}", basis=basis)
+                    check_irrep_constructible(N, algebra=algebra, label=f"{prefix}{p}")
                 except ValueError:
                     continue
                 if d <= 2 * K:

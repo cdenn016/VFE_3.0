@@ -307,7 +307,6 @@ class VFE3Config:
     decode_coordinates:               str             = "local"
 
     decode_unigram_prior:             bool            = True         # add unigram_kappa * log pi_v (corpus unigram) to the logits
-    decode_bias:                      bool            = True         # linear only: learned per-vocab bias (zero init, no decay)
     # decode_mode="linear" only: train on the second-order (delta-method) expected log-loss
     # E_q[-log p_y] ~ CE(mu) + 1/2 tr(Sigma Cov_p(w)) instead of the plug-in CE(mu), at one extra (V, 2K)
     # GEMM per vocab chunk. Training mode only; evaluation keeps the plug-in predictive CE. Requires
@@ -335,13 +334,6 @@ class VFE3Config:
     #   auto_aggregate  account the whole vocabulary, including fp64 scores (saves more memory)
     decode_ce_checkpoint:             str             = "auto"  
 
-    # "torch" | "triton"
-    # decode_mode="expected_likelihood_chunked" only: the training cross-entropy kernel.
-    #   torch   chunked broadcast over (B, N, Vc, K), gradient-checkpointed
-    #   triton  fused forward and backward that never forms (B, N, Vc, K) (vfe3/kernels); CUDA tensors only,
-    #           the torch kernel serves CPU tensors. Values agree to rounding
-    expected_likelihood_kernel:       str             = "torch"
-
     # decode_mode="linear" with amp_dtype set only: run the logits matmul x W^T under amp_dtype
     # autocast (bf16/fp16 operands, fp32 accumulate); bias, logsumexp and the cross-entropy stay fp32.
     decode_logits_amp:                bool            = False
@@ -351,14 +343,6 @@ class VFE3Config:
     # sigma_v falls far below 1; watch decode_sigma_v_min.
     decode_av_precision:              str             = "fp32"
 
-    # "fp64" | "fp32_escalate" | "fp32_escalate_cond"
-    # family="gaussian_full" with a nonzero M-step self-coupling or CG energy only: precision of the
-    # full-covariance pair KL.
-    #   fp64                unconditional float64
-    #   fp32_escalate       float32, recomputed in float64 when the Cholesky certificate fails
-    #   fp32_escalate_cond  fp32_escalate plus a pivot-ratio conditioning trigger
-    full_cov_kl_precision:            str             = "fp32_escalate_cond"
-    
     # Prior-bank Gaussian decoders only: recompute an uncertain float32 decode argmax in float64 for the
     # candidates whose score interval reaches the winner's (the fused training CE is unaffected).
     decode_ranking_fp64_escalation:   bool            = False
@@ -404,12 +388,6 @@ class VFE3Config:
     irrep_spec_seed:                    int             = 0
     irrep_min_rank:                     int             = 1            # 1 skips the gauge-invariant trivial irrep l0
     
-    # "canonical" | "eigh"
-    # so_n only: basis of each irrep block.
-    #   canonical  deterministic; for group_n=3 any spin in closed form
-    #   eigh       the original tensor-power construction (rank <= 6); old so_n configs load as eigh
-    irrep_basis:                      str             = "canonical"
-
     # so_n with gauge_tying="shared" only: Clebsch-Gordan coupling between irrep blocks on the means
     # (exactly equivariant; learned scalar path weights, zero init).
     use_cg_coupling:                  bool            = False
@@ -1195,8 +1173,7 @@ class VFE3Config:
                 )
             if type(self.group_n) is not int or self.group_n < 2:
                 raise ValueError(f"group_n must be an int >= 2, got {self.group_n!r}")
-            from vfe3.geometry.irreps import IRREP_BASES, check_irrep_constructible, irrep_dim
-            _require(self.irrep_basis, IRREP_BASES, "irrep_basis")
+            from vfe3.geometry.irreps import check_irrep_constructible, irrep_dim
             if isinstance(self.irrep_spec, str):
                 if self.irrep_spec != "random":
                     raise ValueError(f"irrep_spec must be a list of (label, mult) pairs or 'random', "
@@ -1206,7 +1183,7 @@ class VFE3Config:
                 from vfe3.geometry.irreps import random_irrep_spec
                 self.irrep_spec = random_irrep_spec(
                     self.group_n, self.embed_dim, self.n_heads, algebra=_traits.algebra,
-                    basis=self.irrep_basis, seed=self.irrep_spec_seed,
+                    seed=self.irrep_spec_seed,
                     min_rank=self.irrep_min_rank, max_rank=self.irrep_max_rank)
             if not isinstance(self.irrep_spec, list) or not self.irrep_spec:
                 raise ValueError(
@@ -1226,8 +1203,7 @@ class VFE3Config:
                         f"got {_entry!r}"
                     )
                 _d = irrep_dim(self.group_n, algebra=_traits.algebra, label=_entry[0])
-                check_irrep_constructible(self.group_n, algebra=_traits.algebra, label=_entry[0],
-                                          basis=self.irrep_basis)
+                check_irrep_constructible(self.group_n, algebra=_traits.algebra, label=_entry[0])
                 _block_dims.extend([_d] * _entry[1])
             if sum(_block_dims) != self.embed_dim:
                 raise ValueError(
@@ -1591,13 +1567,6 @@ class VFE3Config:
                 UserWarning,
                 stacklevel=2,
             )
-        # The full-covariance KL precision spellings are inlined rather than imported from
-        # vfe3.families.gaussian (importing a family module inside __post_init__ perturbs import
-        # order). set_full_cov_kl_precision validates the same set.
-        if self.full_cov_kl_precision not in ("fp64", "fp32_escalate", "fp32_escalate_cond"):
-            raise ValueError(
-                "full_cov_kl_precision must be one of ('fp64', 'fp32_escalate', "
-                f"'fp32_escalate_cond'), got {self.full_cov_kl_precision!r}")
         _require(self.projected_factorization, _PROJECTED_FACTORIZATIONS, "projected_factorization")
         value = self.frame_pair_escalation_tol
         if value is not None and (isinstance(value, bool) or not isinstance(value, Real)
@@ -1721,10 +1690,8 @@ class VFE3Config:
         if self.decode_chunk_size < 1:
             raise ValueError(f"decode_chunk_size must be >= 1, got {self.decode_chunk_size}")
         _require(self.decode_ce_checkpoint, ("auto", "auto_aggregate"), "decode_ce_checkpoint")
-        _require(self.expected_likelihood_kernel, ("torch", "triton"), "expected_likelihood_kernel")
-        # decode_bias (linear decode only) and decode_tau (prior-bank decode only) are reported by
-        # inactive_fields(), so the default-guarded notice below covers them and untouched
-        # defaults stay silent.
+        # decode_tau (prior-bank decode only) is reported by inactive_fields(), so the
+        # default-guarded notice below covers it and an untouched default stays silent.
         # Capability validation: the fast diagonal/full kernels hardcode the Gaussian KL readout, so a
         # family without the Gaussian POINTWISE algebra needs a registered family-consistent decoder,
         # one that scores logits through the configured family.
@@ -2148,7 +2115,7 @@ class VFE3Config:
 
         from vfe3.geometry.groups import group_traits
         if group_traits(self.gauge_group).algebra is None:
-            mark(("irrep_basis", "irrep_spec_seed", "irrep_min_rank", "irrep_max_rank"),
+            mark(("irrep_spec_seed", "irrep_min_rank", "irrep_max_rank"),
                  "only read by irrep-tower groups (gauge_group='so_n')")
         from vfe3.gauge_optim import get_phi_update_policy
         phi_update_policy = get_phi_update_policy(self.m_phi_update_mode)
@@ -2387,8 +2354,6 @@ class VFE3Config:
         registration = _DECODERS[self.decode_mode]
         if not registration.supports_chunked:
             mark(("decode_ce_checkpoint",), "the selected decoder has no checkpointed chunked CE kernel")
-        if self.decode_mode != "expected_likelihood_chunked":
-            mark(("expected_likelihood_kernel",), "only read by decode_mode='expected_likelihood_chunked'")
         if registration.family_consistent:
             mark(("decode_av_precision",), "generic family-consistent decoding does not call _decode_av")
 
@@ -2411,7 +2376,6 @@ class VFE3Config:
                      "shared encode/decode tables use the encoder rates")
                 mark(("decode_mu_weight_decay",),
                      "shared encode/decode tables: the decode means are mu_embed, decayed by mu_weight_decay")
-            mark(("decode_bias",), "linear decode only; the prior-bank KL decoders create no output bias")
             mark(("decode_second_order",),
                  "linear decode only; the prior-bank KL decoders already read Sigma_q")
         # Decay is read per optimizer group (vfe3/train.py build_optimizer). The global weight_decay reaches
@@ -2454,11 +2418,6 @@ class VFE3Config:
         if self.attention_mode == "projected_predictive" and not self.diagnose_canonical_free_energy:
             mark(("lambda_beta",), "predictive_content weights no belief-coupling block; with "
                  "diagnose_canonical_free_energy=True it would feed that log-step diagnostic only")
-        if not (self.family == "gaussian_full"
-                and (self.mstep_self_coupling_weight != 0.0 or self.cg_energy_weight != 0.0)):
-            mark(("full_cov_kl_precision",),
-                 "projected scoring has its own factor policy; only the full-covariance M-step "
-                 "self-coupling and CG energy evaluate the pair divergence")
         if "e_mu_q_trust" in inactive or self.e_mu_q_trust is None or self.diagonal_covariance:
             mark(("mu_trust_cholesky_rounds",),
                  "only an active mean trust region on a full covariance factors sigma_q")
@@ -2664,6 +2623,10 @@ def serialize_config(config: VFE3Config) -> dict[str, Any]:
     payload = asdict(config)
     if math.isinf(config.kl_max):
         payload["kl_max"] = "inf"  # Strict JSON has no Infinity number.
+    if config.gauge_group == "so_n":
+        # Basis marker (the irrep_basis field was removed 2026-10-12): config_from_serialized refuses an
+        # so_n payload without it, which identifies a save from before 2026-10-05 built in the eigh basis.
+        payload["irrep_basis"] = "canonical"
     return payload
 
 
@@ -2709,6 +2672,12 @@ _ROPE_FIELDS = ("pos_rotation", "rope_space", "rope_on_value", "rope_comparison_
 # the frame-pair escalation switch and tolerance merged into frame_pair_escalation_tol.
 _HARDCODED_FIELDS = ("relational_output_init", "bch_residual_max")
 _FRAME_PAIR_FIELDS = ("frame_pair_fp64_escalation", "frame_pair_condition_tol")
+# Removed or hardcoded 2026-10-12 (second pass): the expected-likelihood CE kernel selector (CUDA tensors
+# run the fused Triton kernel, CPU tensors the chunked torch kernel), the full-covariance pair-KL precision
+# (fixed at the former "fp32_escalate_cond"), the so_n irrep basis (canonical only) and the linear decoder's
+# bias toggle (the per-vocab bias is always on).
+_NUMERICS_REMOVED_FIELDS = (
+    "expected_likelihood_kernel", "full_cov_kl_precision", "irrep_basis", "decode_bias")
 # Every serialized key config_from_serialized migrates or refuses that is not a VFE3Config field.
 RETIRED_CONFIG_KEYS = frozenset(
     set(_RETIRED_PINNED_FIELDS) | _RETIRED_INERT_FIELDS | _RETIRED_CONDITIONAL_FIELDS
@@ -2716,7 +2685,7 @@ RETIRED_CONFIG_KEYS = frozenset(
        "relational_readout_mode", "relational_input_scope", "relational_output_scope",
        "relational_identity_content"}
     | set(_PROJECTED_FACTORIZATION_FIELDS) | set(_ROPE_FIELDS) | set(_HARDCODED_FIELDS)
-    | set(_FRAME_PAIR_FIELDS))
+    | set(_FRAME_PAIR_FIELDS) | set(_NUMERICS_REMOVED_FIELDS))
 # laplace_diagonal (retired 2026-10-12) was registered but refused on both projected routes.
 _RETIRED_FAMILIES = frozenset({"gaussian_frame_diagonal", "laplace_diagonal"})
 _MIGRATED_FAMILIES = {"gaussian_diagonal_exact": "gaussian_diagonal"}
@@ -2867,6 +2836,43 @@ def _migrate_retired_fields(
     _migrate_projected_factorization(payload, source=source, refuse=refuse)
     _migrate_rope_mode(payload, source=source, refuse=refuse)
     _migrate_hardcoded_fields(payload, source=source, refuse=refuse)
+    _migrate_numerics_removals(payload, source=source, refuse=refuse)
+
+
+def _migrate_numerics_removals(
+    payload: dict[str, Any],
+
+    *,
+    source: str,
+    refuse: Callable[..., None],
+) -> None:
+    r"""Drop the fields removed on 2026-10-12 (second pass), refusing the two that changed a forward.
+
+    ``expected_likelihood_kernel`` and ``full_cov_kl_precision`` chose how one quantity was computed
+    (agreement to rounding), so any saved value is dropped. ``irrep_basis`` is dropped for every
+    non-so_n config and for an so_n config saved as ``"canonical"``; an so_n config saved as ``"eigh"``,
+    or without the field (saved before 2026-10-05, built in the eigh basis), is refused because its
+    learned tables live in the eigh basis and would load against canonical frames. ``decode_bias`` is
+    dropped when True or when the decoder is not linear (it was inert there); a linear decoder saved
+    with ``decode_bias=False`` is refused, since its checkpoint carries no ``output_proj_bias``.
+    """
+    payload.pop("expected_likelihood_kernel", None)
+    payload.pop("full_cov_kl_precision", None)
+    so_n = payload.get("gauge_group") == "so_n"
+    if so_n and payload.get("irrep_basis") != "canonical":
+        basis = payload.get("irrep_basis")
+        saved = "without irrep_basis" if basis is None else f"with irrep_basis={basis!r}"
+        raise ValueError(
+            f"serialized so_n config from {source} was saved {saved}; such configs were built in "
+            "the eigh irrep basis, which was removed 2026-10-12. Its learned tables live in that "
+            "basis and would load against the canonical frames, changing the forward; continuation "
+            "requires explicit migration")
+    payload.pop("irrep_basis", None)
+    if "decode_bias" in payload:
+        bias = _normalize_serialized_boolean(payload.pop("decode_bias"), "decode_bias", source=source)
+        if not bias and payload.get("decode_mode", VFE3Config.decode_mode) == "linear":
+            refuse("decode_bias", False, " (the linear decoder always carries its learned per-vocab "
+                   "bias since 2026-10-12, and this checkpoint has no output_proj_bias)")
 
 
 def _migrate_hardcoded_fields(
@@ -3048,10 +3054,6 @@ def config_from_serialized(
     # compile_pair_kernel was a pure wall-clock toggle: the eager and compiled pair kernels are
     # value-identical, so a recorded value cannot change a continuation's math. Drop it silently.
     payload.pop("compile_pair_kernel", None)
-    # so_n configs saved before irrep_basis existed were built in the eigh basis (2026-10-05); the
-    # learned tables live in that basis, so the reload must rebuild it rather than the new default.
-    if payload.get("gauge_group") == "so_n" and "irrep_basis" not in payload:
-        payload["irrep_basis"] = "eigh"
     if "relational_mode" in payload or "relational_readout_mode" in payload:
         mode = payload.pop("relational_mode", "off")
         readout = payload.pop("relational_readout_mode", "conditional_update")

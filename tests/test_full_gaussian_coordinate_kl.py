@@ -51,14 +51,13 @@ def test_full_coordinate_non_kl_renyi_fails_explicitly() -> None:
         q.renyi_per_coord(q, alpha=.5)
 
 
-@pytest.mark.parametrize("policy", ["fp64", "fp32_escalate", "fp32_escalate_cond"])
-def test_coordinate_kl_precision_and_order(policy: str) -> None:
+def test_coordinate_kl_precision_and_order() -> None:
     mu = torch.tensor([.2, -.3], requires_grad=True)
     Sigma = torch.tensor([[1., .4], [.4, 1.2]], requires_grad=True)
     p_mu = torch.tensor([-.2, .1])
     p_sigma = torch.tensor([[1.4, -.2], [-.2, .8]])
-    q = FullGaussian(mu, Sigma, _precision_policy=policy)
-    p = FullGaussian(p_mu, p_sigma, _precision_policy=policy)
+    q = FullGaussian(mu, Sigma)
+    p = FullGaussian(p_mu, p_sigma)
     with torch.autocast("cpu", dtype=torch.bfloat16):
         actual = q.renyi_per_coord(p)
     reference = FullGaussian(mu.double(), Sigma.double()).renyi_closed_form(

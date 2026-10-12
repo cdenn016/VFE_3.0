@@ -388,7 +388,6 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     decode_unigram_prior             = True,       # add kappa*log pi_v (corpus unigram) to decode logits    
     untie_decode_bank                = True,       # prior-bank modes only: decode reads its OWN cloned (V,K) tables
-    decode_bias                      = True,     # only for decode_mode='linear'
       
     deterministic                    = True,
     generate_embedding_figures       = False,

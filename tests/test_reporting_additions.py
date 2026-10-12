@@ -217,7 +217,7 @@ def _cost_cfg(**over):
     base = dict(
         vocab_size=11, embed_dim=6, n_heads=2, max_seq_len=7, batch_size=2,
         n_layers=2, n_e_steps=3, max_steps=5,
-        decode_mode="linear", decode_bias=False,
+        decode_mode="linear",
         diagonal_covariance=True, gauge_group="block_glk", amp_dtype="fp32", use_block_mlp=False,
         relational_mode="projected_filtering", relational_readout_mode="full_link_update",
     )
@@ -246,12 +246,6 @@ def test_cost_model_linear_decode_does_not_count_prior_bank_readout():
     token_row = 2 * K + n_gen
 
     linear = _cost_model_fields(model, _cost_cfg(), n_params=123, tokens_seen=13)
-    biased = _cost_model_fields(
-        model,
-        _cost_cfg(decode_bias=True),
-        n_params=123,
-        tokens_seen=13,
-    )
     prior_bank = _cost_model_fields(
         model,
         _cost_cfg(decode_mode="diagonal_chunked"),
@@ -259,8 +253,7 @@ def test_cost_model_linear_decode_does_not_count_prior_bank_readout():
         tokens_seen=13,
     )
 
-    assert linear["active_params_per_token"] == token_row + V * K + 4 * 2 * K * K
-    assert biased["active_params_per_token"] == token_row + V * K + V + 4 * 2 * K * K
+    assert linear["active_params_per_token"] == token_row + V * K + V + 4 * 2 * K * K   # weight + bias
     assert prior_bank["active_params_per_token"] == token_row + 2 * V * K + 4 * 2 * K * K
     assert linear["flops_per_token_decode"] == prior_bank["flops_per_token_decode"] == 2.0 * V * K
 
@@ -278,7 +271,7 @@ def test_cost_model_declares_projected_estep_flops_unavailable():
     out = _cost_model_fields(model, cfg, n_params=123, tokens_seen=tokens_seen)
 
     # The linear decoder reads only W, so the report must not count a prior-bank readout here.
-    expected_active = (2 * K + n_gen) + V * K + 4 * L * K * K
+    expected_active = (2 * K + n_gen) + V * K + V + 4 * L * K * K          # linear weight + bias
     assert out["active_params_per_token"] == expected_active
     assert out["flops_per_token_estep"] is None
     assert out["est_flops_analytic"] is None
@@ -375,7 +368,7 @@ def _finalize_ns(**over):
         generate_embedding_figures=False,
 
         # numeric-path attrs (summary / provenance / cost model / pure-path report)
-        seed=0, max_steps=2, decode_mode="full_chunked", decode_bias=False,
+        seed=0, max_steps=2, decode_mode="full_chunked",
         min_lr_frac=0.0,
         lambda_alpha_mode="constant",
         lambda_beta=1.0,
@@ -1210,7 +1203,7 @@ def test_cost_model_counts_untied_block_mlp_params_and_flops():
     off = _cost_model_fields(model, off_cfg, n_params=123, tokens_seen=13)
     per_layer = 2 * expansion * K * K + (expansion + 1) * K
     mlp_flops = 4.0 * layers * expansion * K * K
-    base_active = (2 * K + 5) + 11 * K + 4 * layers * K * K
+    base_active = (2 * K + 5) + 11 * K + 11 + 4 * layers * K * K          # linear weight + bias
 
     assert off["active_params_per_token"] == base_active
     assert out["active_params_per_token"] - base_active == layers * per_layer

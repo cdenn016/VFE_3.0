@@ -470,7 +470,6 @@ BASELINE_PROTOCOL_FIELDS: Dict[str, str] = {
     "grad_clip": "grad_clip", "beta_attention_prior": "beta_attention_prior",
     "alibi_slope": "alibi_slope", "rope_base": "rope_base",
     "rope_fraction": "rope_fraction",
-    "decode_bias": "decode_bias",
     "decode_unigram_prior": "decode_unigram_prior", "unigram_kappa": "unigram_kappa",
 }
 # Confound controls for the 34.48 against 55.10 comparison (October 7, 2026), with the plain
@@ -670,8 +669,6 @@ def check_baseline_arm(
     Returns ``{BaselineConfig field: (VFE value, baseline value)}`` of the declared differences.
     """
     declared = set(declared)
-    if getattr(matched_cfg, "decode_mode", "linear") != "linear":
-        declared.add("decode_bias")         # documented: the baseline decodes linearly, with a bias
     diff: Dict[str, Tuple[Any, Any]] = {}
     for name, vfe_name in BASELINE_PROTOCOL_FIELDS.items():
         if not hasattr(baseline_cfg, name) or not hasattr(matched_cfg, vfe_name):
@@ -684,6 +681,10 @@ def check_baseline_arm(
         a = "none" if matched_cfg.rope_mode == "none" else "rope"
         if a != baseline_cfg.pos_rotation:
             diff["pos_rotation"] = (a, baseline_cfg.pos_rotation)
+    # The VFE linear decoder always carries the per-vocab bias (decode_bias removed 2026-10-12); the
+    # baseline decodes linearly with a bias even against a Gaussian-decode VFE (documented).
+    if hasattr(baseline_cfg, "decode_bias") and baseline_cfg.decode_bias is not True:
+        diff["decode_bias"] = (True, baseline_cfg.decode_bias)
     undeclared = sorted(set(diff) - declared)
     if undeclared:
         raise ArmDefinitionError(
