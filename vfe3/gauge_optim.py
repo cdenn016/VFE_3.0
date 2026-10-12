@@ -1127,7 +1127,7 @@ _SPREAD_BISECTION_STEPS = 64
 
 def _bounded_traceless_spectrum(
     lam: torch.Tensor,             # (..., d) ascending eigenvalues of a traceless symmetric S_0
-    c:   float,
+    c:   'float | torch.Tensor',  # half-width, scalar or broadcastable to (..., 1)
 ) -> torch.Tensor:                 # (..., d) zero-sum spectrum with lambda_max - lambda_min <= 2c
     r"""Clamp a zero-sum spectrum into a window of width :math:`2c` that keeps the sum at zero.
 
@@ -1160,7 +1160,9 @@ def bound_phi_frame_condition_(
     kappa_max: float,
 
     *,
-    temporary_bytes: int = _PHI_PROJECTION_TEMPORARY_BYTES,
+    temporary_bytes: int                    = _PHI_PROJECTION_TEMPORARY_BYTES,
+    count_out:       Optional[torch.Tensor] = None,   # (2,) int64 on the generator device, or None
+    check_budget:    bool                   = False,
 ) -> torch.Tensor:                 # () int64 on the generator device: rows changed (no host read)
     r"""Bound the spectral condition number of every composed frame by ``kappa_max`` (audit 2026-10-12 T4).
 
@@ -1177,24 +1179,35 @@ def bound_phi_frame_condition_(
     :math:`\lambda_{\max}(S_0) - \lambda_{\min}(S_0)` exceeds :math:`2c` is replaced by
     :math:`X \leftarrow X - S_0 + S_0'`, with :math:`S_0' = Q\operatorname{diag}(x)Q^\top` built from
     :math:`S_0 = Q\operatorname{diag}(\lambda)Q^\top` and :math:`x` from :func:`_bounded_traceless_spectrum`:
-    the eigenvalues are clamped into a width-:math:`2c` window placed so that :math:`\operatorname{tr} S_0' = 0`.
-    (A plain clamp to :math:`[-c, c]` would change the trace of an asymmetric spectrum.) The skew part, and
-    therefore the rotation, and the trace, and therefore :math:`\det e^{X}`, are unchanged, and
-    :math:`\kappa_2(e^{X}) \le e^{2c}`. Since :math:`\mathfrak{gl}(d)` splits Frobenius-orthogonally into skew,
-    scalar and traceless symmetric parts, and the nearest symmetric matrix under a spectral constraint shares
-    the eigenvectors (Hoffman-Wielandt), :math:`X'` is the Frobenius-nearest point of
-    :math:`\{X : \operatorname{spread}(S_0) \le 2c\}`; in particular :math:`\|X'\|_F \le \|X\|_F`, so the bound
-    never leaves the ``phi_mstep_max_matrix_norm`` ball. Blocks already within the bound, and rows with no
-    such block, are left bitwise unchanged; the projection is idempotent up to roundoff.
+    the eigenvalues are clamped into a window placed so that :math:`\operatorname{tr} S_0' = 0`. (A plain clamp
+    to :math:`[-c, c]` would change the trace of an asymmetric spectrum.) The skew part, and therefore the
+    rotation, and the trace, and therefore :math:`\det e^{X}`, are unchanged. Since :math:`\mathfrak{gl}(d)`
+    splits Frobenius-orthogonally into skew, scalar and traceless symmetric parts, and the nearest symmetric
+    matrix under a spectral constraint shares the eigenvectors (Hoffman-Wielandt), :math:`X'` is the
+    Frobenius-nearest point of :math:`\{X : \operatorname{spread}(S_0) \le 2c'\}`; in particular
+    :math:`\|X'\|_F \le \|X\|_F`, so the bound never leaves the ``phi_mstep_max_matrix_norm`` ball. The window
+    width is :math:`2c' = 2c - m` with the storage-roundoff margin
+    :math:`m = 8\,d\,\varepsilon\,(\lVert X\rVert_F + 2c)` (:math:`\varepsilon` the table dtype's machine
+    epsilon), so a projected row, once stored, passes the test :math:`\mathrm{spread} \le 2c` on the next call
+    and is left unchanged: rounding :math:`X'` to the table dtype moves the spread by at most
+    :math:`\varepsilon\lVert X'\rVert_F`. Blocks within the bound, and rows with no such block, are left bitwise
+    unchanged.
 
-    A frame is the product :math:`U_i = e^{X_i} e^{Y_i}` of ``n_factors`` learned factors (the token frame
-    ``phi_embed`` and, under ``pos_phi='learned'``, the positional row ``pos_phi_free``;
-    :func:`vfe3.geometry.transport.build_factored_transport`). With :math:`c = \log\kappa_{\max} / (2\,n)` every
-    composed frame satisfies :math:`\kappa_2(U_i) \le \kappa_{\max}` per head block, and since the frames are
-    block-diagonal, for the whole :math:`K\times K` frame. A RoPE rotation folded on the right is orthogonal and
-    does not change this. Not guaranteed: the pair transport :math:`\Omega_{ij} = U_i U_j^{-1}` is bounded only
-    by :math:`\kappa_{\max}^2`, and a fixed ``pos_phi='frozen'`` factor is not a parameter and is not counted
-    or bounded (the composed bound is then :math:`\kappa_{\max}\,\kappa_2(e^{Y_i})`).
+    A frame is the product :math:`U_i = e^{X_{v(i)}} e^{Y_{n(i)}}` of the token factor (``phi_embed``) and the
+    positional factor (``pos_phi_free`` under ``pos_phi='learned'``, the fixed
+    ``pos_phi='frozen'`` coordinates, none under ``pos_phi='none'``;
+    :func:`vfe3.geometry.transport.build_factored_transport`). Every token can meet every position, so with
+    :math:`L = \log\kappa_{\max}` the budget is shared per head :math:`h` as follows. A learned positional row
+    is first bounded to its even share, spread :math:`\le L/2`. The realized positional spread
+    :math:`s_h = \max_n \operatorname{spread}(S_0(Y_n)_h)` is then measured exactly (float64 eigenvalues of the
+    positional rows that occur, :math:`n < N_{\max}`), and the token factor receives the remainder,
+    :math:`2c_h = L - s_h`. Hence :math:`\kappa_2(e^{X_v}e^{Y_n})_h \le e^{L - s_h} e^{s_h} = \kappa_{\max}` for every
+    (token, position, head), and a token factor never receives less than the even split. A fixed positional
+    factor whose spread alone reaches :math:`L` leaves the token factor no budget; ``check_budget=True`` (model
+    construction and checkpoint load, :func:`bound_frame_condition_if_configured_`) refuses it. The bound is per
+    head block, which is where the transports act; the pair transport :math:`\Omega_{ij} = U_i U_j^{-1}` is
+    bounded by :math:`\kappa_{\max}^2`, and a RoPE rotation folded on the right is orthogonal and does not
+    change it.
 
     The coordinates map to the per-head :math:`d\times d` blocks exactly: the canonical per-head ``block_glk``
     coordinates are the row-major blocks themselves; any other supported basis (shared ``block_glk``,
@@ -1203,12 +1216,16 @@ def bound_phi_frame_condition_(
     because :math:`\Delta M` lies in the algebra. Optimizer moments are left unchanged, as in
     :func:`project_phi_parameter_rows_`.
 
+    ``count_out`` (S1 panel D counters): when given, the rows this call changed are added to ``count_out[0]``
+    and the rows it checked (token and learned positional rows) to ``count_out[1]``, on the device.
+
     Cost: a row is decomposed only if a head block fails the exact screen
     :math:`\sqrt2\lVert S_0\rVert_F \le 2c` (:math:`\lambda_{\max} - \lambda_{\min} \le \sqrt2\lVert S_0\rVert_F` for a
     traceless spectrum), which runs in float32 with no eigensolver; rows passing it are within the bound and are
     not touched. The flagged rows are gathered (one host read per table) and decomposed in float32 with a
     residual and orthogonality certificate, and rows with an uncertified block are recomputed in float64
     (:func:`_frame_bound_rows`); a float64 table is decomposed in float64. Results are cast back to the table dtype.
+    The positional spread is computed on the device with no host read.
     """
     if isinstance(kappa_max, bool) or not math.isfinite(kappa_max) or kappa_max <= 1.0:
         raise ValueError(f"kappa_max must be a finite real > 1, got {kappa_max!r}")
@@ -1223,11 +1240,15 @@ def bound_phi_frame_condition_(
     if len(set(dims)) != 1:
         raise ValueError(f"the frame condition bound needs equal head blocks, got {dims}")
     H, d = len(dims), dims[0]
-    changed = torch.zeros((), device=group.generator_device, dtype=torch.long)
-    tables = _trainable_phi_tables(model)
-    if not tables:
+    device = group.generator_device
+    changed = torch.zeros((), device=device, dtype=torch.long)
+    token_table = getattr(model.prior_bank, "phi_embed", None)
+    token_table = token_table if token_table is not None and token_table.requires_grad else None
+    pos_table = getattr(model, "pos_phi_free", None)
+    pos_table = pos_table if pos_table is not None and pos_table.requires_grad else None
+    if token_table is None and pos_table is None:
         return changed
-    c = math.log(kappa_max) / (2 * len(tables))
+    L = math.log(kappa_max)
 
     elementary = group.elementary_block_shape is not None
     basis = gram = None
@@ -1241,34 +1262,89 @@ def bound_phi_frame_condition_(
                 "diagonal Frobenius Gram")
         basis = basis.detach().to(torch.float64)
         gram = basis.square().sum(dim=(1, 2, 3))                               # (n_gen,)
-    # A traceless spectrum has lambda_max - lambda_min <= sqrt(2) ||S_0||_F, so a row whose every head block has
-    # 2 ||S_0||_F^2 <= (2c)^2 is within the bound and needs no eigensolver. The margin flags a row on the
-    # boundary rather than letting float32 rounding pass it.
-    screen = 0.5 * (2.0 * c) ** 2 * (1.0 - 1e-4)
     # Roughly six float64 (H, d, d) temporaries per row (X, S_0, Q, the update and two products).
     rows_per_chunk = max(1, temporary_bytes // (6 * 8 * H * d * d))
-    for table in tables:
+    checked = 0
+
+    def bound_table_(table: torch.Tensor, c: torch.Tensor) -> None:            # c: (H,) half-widths
+        nonlocal checked
         rows = table.reshape(-1, table.shape[-1])
         if rows.shape[-1] != group.generator_shape[0]:
             raise ValueError(
                 "the frame condition bound requires full generator coordinates; got table width "
                 f"{rows.shape[-1]} and {group.generator_shape[0]} generators")
+        # A traceless spectrum has lambda_max - lambda_min <= sqrt(2) ||S_0||_F, so a row whose every head block
+        # has 2 ||S_0||_F^2 <= (2c)^2 is within the bound and needs no eigensolver. The margin flags a row on the
+        # boundary rather than letting float32 rounding pass it.
+        screen = (0.5 * (2.0 * c) ** 2 * (1.0 - 1e-4)).to(torch.float32)      # (H,)
         flagged = []
         for start in range(0, rows.shape[0], rows_per_chunk):
             S0 = _traceless_symmetric_blocks(rows[start : start + rows_per_chunk], basis, H, d, torch.float32)
             flagged.append((S0.square().sum(dim=(-2, -1)) > screen).any(-1))     # (r,)
         index = torch.cat(flagged).nonzero().squeeze(-1)                      # the one host read per table
+        work = torch.float64 if rows.dtype == torch.float64 else torch.float32
         for start in range(0, index.numel(), rows_per_chunk):
             idx = index[start : start + rows_per_chunk]
             phi = rows.index_select(0, idx)                                    # (r, n_gen)
-            work = torch.float64 if rows.dtype == torch.float64 else torch.float32
-            new, over, failed = _frame_bound_rows(phi, basis, gram, H, d, c, work)
+            new, over, failed = _frame_bound_rows(phi, basis, gram, H, d, c, work, store_dtype=rows.dtype)
             if bool(failed.any()):                                            # uncertified float32 eigh: redo in float64
-                new64, over64, _ = _frame_bound_rows(phi[failed], basis, gram, H, d, c, torch.float64)
+                new64, over64, _ = _frame_bound_rows(phi[failed], basis, gram, H, d, c, torch.float64,
+                                                     store_dtype=rows.dtype)
                 new[failed], over[failed] = new64.to(new.dtype), over64
             rows.index_copy_(0, idx, torch.where(over[:, None], new.to(rows.dtype), phi))
             changed.add_(over.sum())
+        checked += rows.shape[0]
+
+    if pos_table is not None:                   # the learned positional rows to their even share
+        bound_table_(pos_table, torch.full((H,), L / 4.0, dtype=torch.float64, device=device))
+    positional_spread = _positional_spread(model, basis, H, d)                 # (H,) float64, or None
+    if positional_spread is not None and check_budget and bool((positional_spread >= L).any()):
+        raise ValueError(
+            f"phi_frame_condition_max={kappa_max}: the fixed positional factor alone has a per-head frame "
+            f"condition up to {math.exp(float(positional_spread.max())):.4g} >= kappa_max, which leaves the token "
+            "frames no budget; raise phi_frame_condition_max, lower pos_phi_scale or max_seq_len, or use "
+            "pos_phi='learned'")
+    if token_table is not None:                 # the token factor receives the remainder
+        c_token = (torch.full((H,), L / 2.0, dtype=torch.float64, device=device) if positional_spread is None
+                   else (0.5 * (L - positional_spread)).clamp_min(0.0))
+        bound_table_(token_table, c_token)
+    if count_out is not None:
+        count_out[0].add_(changed)
+        count_out[1].add_(checked)
     return changed
+
+
+def _positional_spread(
+    model: torch.nn.Module,
+    basis: Optional[torch.Tensor],          # (n_gen, H, d, d) float64 head-block basis, or None for row-major
+    H:     int,
+    d:     int,
+) -> Optional[torch.Tensor]:                # (H,) float64: max over positions of the S_0 spread, or None
+    r""":math:`s_h = \max_{n < N_{\max}} (\lambda_{\max} - \lambda_{\min})(S_0(Y_n)_h)` of the positional factor the
+    frames read (:meth:`VFEModel._pos_phi_right`), exactly, in float64; None without a positional factor."""
+    right = getattr(model, "_pos_phi_right", None)
+    if right is None:
+        return None
+    group = model.group
+    template = torch.zeros(model.cfg.max_seq_len, group.generator_shape[0],
+                           dtype=torch.float64, device=group.generator_device)
+    Y = right(template)                                                        # (N, n_gen) or None
+    if Y is None:
+        return None
+    lam = torch.linalg.eigvalsh(_traceless_symmetric_blocks(Y.detach(), basis, H, d, torch.float64))  # (N, H, d)
+    return (lam[..., -1] - lam[..., 0]).amax(dim=0)                            # (H,)
+
+
+def bound_frame_condition_if_configured_(model: torch.nn.Module) -> None:
+    r"""Apply :func:`bound_phi_frame_condition_` once, with the budget check, when the model's config sets
+    ``phi_frame_condition_max`` on a group the bound acts on: at model construction and after a checkpoint load,
+    so step 0 and evaluation read bounded frames. A checkpoint saved by a bounded run is a fixed point (the
+    projected rows carry the storage margin), so a resume is unchanged bitwise."""
+    cfg = getattr(model, "cfg", None)
+    kappa_max = getattr(cfg, "phi_frame_condition_max", None)
+    if kappa_max is None or model.group.name not in FRAME_CONDITION_GROUPS:
+        return
+    bound_phi_frame_condition_(model, kappa_max, check_budget=True)
 
 
 def _traceless_symmetric_blocks(
@@ -1278,12 +1354,25 @@ def _traceless_symmetric_blocks(
     d:     int,
     dtype: torch.dtype,
 ) -> torch.Tensor:                          # (r, H, d, d) S_0 = sym(X) - tr(sym X)/d I
-    work = phi.to(dtype)
-    X = (work.reshape(-1, H, d, d) if basis is None
-         else torch.einsum("ra,ahij->rhij", work, basis.to(dtype)))
-    S = 0.5 * (X + X.transpose(-1, -2))
+    S = _symmetric_part(_head_blocks(phi, basis, H, d, dtype))
     trace_mean = S.diagonal(dim1=-2, dim2=-1).mean(-1)                        # (r, H)
     return S - trace_mean[..., None, None] * torch.eye(d, dtype=dtype, device=S.device)
+
+
+def _head_blocks(
+    phi:   torch.Tensor,                    # (r, n_gen) frame coordinates
+    basis: Optional[torch.Tensor],          # (n_gen, H, d, d) head-block basis, or None for row-major blocks
+    H:     int,
+    d:     int,
+    dtype: torch.dtype,
+) -> torch.Tensor:                          # (r, H, d, d) head blocks X_h
+    work = phi.to(dtype)
+    return (work.reshape(-1, H, d, d) if basis is None
+            else torch.einsum("ra,ahij->rhij", work, basis.to(dtype)))
+
+
+def _symmetric_part(X: torch.Tensor) -> torch.Tensor:
+    return 0.5 * (X + X.transpose(-1, -2))
 
 
 def _frame_bound_rows(
@@ -1292,18 +1381,24 @@ def _frame_bound_rows(
     gram:  Optional[torch.Tensor],          # (n_gen,) float64 Frobenius Gram of the basis
     H:     int,
     d:     int,
-    c:     float,
+    c:     'float | torch.Tensor',          # half-width budget, scalar or (H,)
     dtype: torch.dtype,                     # float32 (certified) or float64
+
+    *,
+    store_dtype: Optional[torch.dtype] = None,   # the table dtype the result is stored in (default: dtype)
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:   # projected rows (r, n_gen), over (r,), failed (r,)
     r"""The spread projection of :func:`bound_phi_frame_condition_` on ``rows`` at ``dtype``.
 
     In float32 the eigendecomposition :math:`S_0 = Q\Lambda Q^\top` of each head block is certified by
     :math:`\lVert S_0Q - Q\Lambda\rVert_F \le \tau\lVert S_0\rVert_F`, :math:`\lVert Q^\top Q - I\rVert_F \le \tau` and
     finiteness, :math:`\tau = 64\,d\,\varepsilon_{32}`; ``failed`` marks the rows with an uncertified block, which the
-    caller recomputes in float64. The update :math:`S_0' - S_0` is symmetrized, so the skew part of :math:`X` is
-    unchanged exactly and its trace to rounding.
+    caller recomputes in float64. A block over the budget :math:`2c` is projected to spread :math:`2c - m`, with the
+    storage margin :math:`m = 8\,d\,\varepsilon\,(\lVert X\rVert_F + 2c)` of ``store_dtype``. The update
+    :math:`S_0' - S_0` is symmetrized, so the skew part of :math:`X` is unchanged exactly and its trace to rounding.
     """
-    S0 = _traceless_symmetric_blocks(phi, basis, H, d, dtype)                # (r, H, d, d)
+    X = _head_blocks(phi, basis, H, d, dtype)                                 # (r, H, d, d)
+    S = _symmetric_part(X)
+    S0 = S - S.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None] * torch.eye(d, dtype=dtype, device=X.device)
     lam, Q = torch.linalg.eigh(S0)                                            # (r, H, d), (r, H, d, d)
     failed = torch.zeros(phi.shape[0], dtype=torch.bool, device=phi.device)
     if dtype != torch.float64:
@@ -1314,8 +1409,11 @@ def _frame_bound_rows(
         certified = (torch.isfinite(lam).all(-1) & torch.isfinite(Q).all(dim=(-2, -1))
                      & (residual <= tol * S0.norm(dim=(-2, -1))) & (orthogonality <= tol))   # (r, H)
         failed = ~certified.all(-1)
+    c = torch.as_tensor(c, dtype=dtype, device=phi.device).expand(H)          # (H,)
     over = (lam[..., -1] - lam[..., 0]) > 2.0 * c                             # (r, H)
-    shift = torch.where(over[..., None], _bounded_traceless_spectrum(lam, c) - lam, 0.0)
+    margin = 8 * d * torch.finfo(store_dtype or dtype).eps * (X.norm(dim=(-2, -1)) + 2.0 * c)   # (r, H)
+    c_target = (c - 0.5 * margin).clamp_min(0.0)[..., None]                   # (r, H, 1)
+    shift = torch.where(over[..., None], _bounded_traceless_spectrum(lam, c_target) - lam, 0.0)
     delta = (Q * shift[..., None, :]) @ Q.transpose(-1, -2)                   # (r, H, d, d) S_0' - S_0
     delta = 0.5 * (delta + delta.transpose(-1, -2))
     dphi = (delta.reshape(phi.shape[0], -1) if basis is None

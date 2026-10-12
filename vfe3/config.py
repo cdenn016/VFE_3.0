@@ -709,11 +709,13 @@ class VFE3Config:
     # pullback_group rejects the step). None: nothing bounds ||phi|| under adamw.
     phi_mstep_max_matrix_norm:        Optional[float] = None
 
-    # Condition-number ceiling kappa_max > 1 on every composed frame U_i, applied after each accepted
-    # adamw step (audit 2026-10-12 T4). Each learned factor's head block X (phi_embed, and pos_phi_free under
-    # pos_phi="learned") keeps its skew part and trace while the spread of its traceless symmetric part is
-    # bounded by log(kappa_max) / n_factors, so cond_2(U_i) <= kappa_max (Omega_ij <= kappa_max^2).
-    # block_glk / block_glmc; inert (cond = 1) for block_so, block_co, so_n. None: no bound.
+    # Condition-number ceiling kappa_max > 1 on every composed frame head block U_i = e^X e^Y, applied at
+    # construction, on checkpoint load and after each accepted adamw step (audit 2026-10-12 T4; round 2, M4).
+    # Each factor's head block keeps its skew part and trace while the spread of its traceless symmetric part is
+    # bounded: a learned positional row (pos_phi="learned") by log(kappa_max) / 2, then the token frame by
+    # log(kappa_max) minus the realized positional spread (learned or "frozen"), so cond_2(U_i) <= kappa_max
+    # (Omega_ij <= kappa_max^2). A frozen positional factor whose spread alone reaches log(kappa_max) is refused
+    # at model construction. block_glk / block_glmc; inert (cond = 1) for block_so, block_co, so_n. None: no bound.
     phi_frame_condition_max:          Optional[float] = None
 
     m_phi_group_trust_radius:        float           = 0.1          # pullback_group / fisher_group only: step bound

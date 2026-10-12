@@ -12,6 +12,7 @@ to every table and map; encode, attention, decode and CE are batched.
 
 import hashlib
 import inspect
+import itertools
 import math
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -569,6 +570,11 @@ class VFEModel(nn.Module):
                 "'t5_relative_bias' to use the learnable bias.",
                 UserWarning, stacklevel=2,
             )
+        # phi_frame_condition_max: bound the initial frames too, so step 0 and evaluation read bounded frames, and
+        # refuse a fixed positional factor that leaves the token frames no budget (audit round 2, M4 and item 14).
+        from vfe3.gauge_optim import bound_frame_condition_if_configured_
+        bound_frame_condition_if_configured_(self)
+
     @property
     def relational_operators_by_layer(self) -> Tuple[RelationalOperators, ...]:
         """Return independent layer projections without registering duplicate modules."""
@@ -1182,7 +1188,9 @@ class VFEModel(nn.Module):
         ``{'mu','sigma','phi'}`` (||grad_mu/sigma/phi|| of F over the belief tuple) -- the E-step
         analogue of the M-step per-group grad norms; default None is zero-overhead and byte-identical.
         ``return_decode_stats=True`` replaces only the third training-tuple item with an immutable
-        :class:`DecodeCEResult`; the default three-tuple remains unchanged.
+        :class:`DecodeCEResult`; the default three-tuple remains unchanged. The ``ce`` item is always
+        the plug-in cross-entropy; under ``decode_second_order`` in training mode the loss trains on the
+        second-order objective instead, which the stats record carries as ``objective``.
 
         Belief production is factored into :meth:`forward_beliefs` (the shared seam); this method is the
         decode + cross-entropy + M-step assembly on top of it."""
@@ -1258,12 +1266,17 @@ class VFEModel(nn.Module):
         )
         scored_tokens = None
         excluded_tokens = None
+        # Second-order linear decode (decode_second_order, training only): the decoder trains on the
+        # delta-method objective and reports the plug-in CE beside it (audit 2026-10-12 round 2, item 12).
+        second_order = (fused_chunked and active_decode_mode == "linear"
+                        and self.cfg.decode_second_order and self.training)
+        decode_objective = None
         if fused_chunked:
             with self._amp_off_context(token_ids.device):
                 fused_kwargs = {}
-                if return_decode_stats and decode_registration.fused_ce_supports_stats:
+                if second_order or (return_decode_stats and decode_registration.fused_ce_supports_stats):
                     fused_kwargs["return_stats"] = True
-                if active_decode_mode == "linear" and self.cfg.decode_second_order and self.training:
+                if second_order:
                     # Training objective only: evaluation scores the plug-in predictive CE.
                     fused_kwargs["sigma_q"] = _decode_island_dtype(sigma_final)   # (B, N, K) diagonal
                 if active_decode_mode != "linear":
@@ -1289,13 +1302,14 @@ class VFEModel(nn.Module):
                         canonical_frame=canonical_frame,
                         **fused_kwargs,
                     )
-                if return_decode_stats and decode_registration.fused_ce_supports_stats:
+                if "return_stats" in fused_kwargs:
                     if not isinstance(fused_result, DecodeCEResult):
                         raise TypeError(
                             f"decode mode {active_decode_mode!r} declares fused CE stats support "
                             f"but returned {type(fused_result).__name__}"
                         )
                     ce = fused_result.ce
+                    decode_objective = fused_result.objective
                     excluded_tokens = fused_result.excluded_tokens
                     scored_tokens = fused_result.scored_tokens
                 else:
@@ -1340,7 +1354,7 @@ class VFEModel(nn.Module):
                 n_valid = scored_tokens.clamp_min(1)
                 ce = F.cross_entropy(flat_logits, flat_targets, ignore_index=-100,
                                      reduction="sum") / n_valid
-        loss = ce
+        loss = ce if decode_objective is None else decode_objective
         if self.cfg.mass_phi > 0.0:
             # M-step gauge-frame penalty (manuscript Algorithm 1 M-step loss): regularizes the
             # CONVERGED output phi -> backprops to the learned prior table phi_embed. The projected
@@ -1440,7 +1454,8 @@ class VFEModel(nn.Module):
             if scored_tokens is None or excluded_tokens is None:
                 raise RuntimeError("decoder stats requested without scored/excluded-token counts")
             return logits, loss, DecodeCEResult(
-                ce_detached, scored_tokens, excluded_tokens)
+                ce_detached, scored_tokens, excluded_tokens,
+                objective=(decode_objective.detach() if decode_objective is not None else None))
         return logits, loss, ce_detached
 
     @torch.no_grad()
@@ -1785,6 +1800,65 @@ class VFEModel(nn.Module):
         return metrics.belief_spectrum(
             snapshot.layer_converged[layer_index].sigma, diagonal=self.cfg.diagonal_covariance,
             eps=self.cfg.eps, family=self.cfg.family)
+
+    def _belief_health_diagnostics(
+        self,
+        snapshot:    DiagnosticSnapshot,
+        layer_index: int,
+        spectrum:    dict,                     # metrics.belief_spectrum of the layer's converged covariance
+        entropy:     torch.Tensor,             # (B, H, N) routing row entropies
+        support:     torch.Tensor,             # (B, H, N, N) bool admissible keys
+        scorable:    torch.Tensor,             # (B, H, N) bool rows with at least two admissible keys
+    ) -> Dict[str, float]:
+        r"""Belief-spectrum, precision, guard and routing-collapse statistics of one layer, the columns the
+        geometry-health figure plots (audit 2026-10-12 round 2, item 13).
+
+        Over the converged covariances :math:`\Sigma_i` of the captured batch: quantiles of the condition
+        number :math:`\kappa(\Sigma_i)` (``"higher"`` interpolation, so an infinite condition at a non-PD token is
+        reported rather than turned into NaN) and of the effective rank; the extreme eigenvalues and the fraction
+        of tokens whose condition is a belief property (smallest eigenvalue above the covariance floor); the
+        mean and median per-token half mean-block Fisher trace :math:`\tfrac12\mathrm{tr}\,\Sigma_i^{-1}`
+        (:func:`vfe3.metrics.half_fisher_trace`); the fractions of variance eigenvalues at the ``eps`` floor and
+        the ``sigma_max`` ceiling (:func:`vfe3.metrics.guard_saturation`); the non-finite fraction of the belief
+        entries :math:`(\mu, \Sigma, \phi)`; and the number of heads whose mean normalized row entropy
+        :math:`H(\beta_{i\cdot})/\log|S_i|` over the scorable rows is below
+        :data:`vfe3.metrics.COLLAPSE_ENTROPY_FRACTION`.
+        """
+        from vfe3 import metrics
+        belief = snapshot.layer_converged[layer_index]
+        condition = spectrum["condition"].double().flatten()
+        effective_rank = spectrum["effective_rank"].double().flatten()
+        d: Dict[str, float] = {
+            "belief_cond_p95": float(torch.quantile(condition, 0.95, interpolation="higher")),
+            "belief_cond_max": float(condition.max()),
+            "belief_lam_min": float(spectrum["lam_min"].min()),
+            "belief_lam_max": float(spectrum["lam_max"].max()),
+            "belief_cond_valid_frac": float(spectrum["condition_is_belief"].double().mean()),
+            "eff_rank_p5": float(torch.quantile(effective_rank, 0.05)),
+            "eff_rank_median": float(torch.quantile(effective_rank, 0.50)),
+            "eff_rank_p95": float(torch.quantile(effective_rank, 0.95)),
+        }
+        fisher = metrics.half_fisher_trace(belief.sigma.double(), eps=self.cfg.eps,
+                                           family=self.cfg.family).flatten()          # (B N,)
+        d["fisher_trace_mean"] = float(fisher.mean())
+        d["fisher_trace_median"] = float(fisher.median())
+        empty = belief.sigma.new_empty(0)
+        guard = metrics.guard_saturation(belief.sigma.double(), empty, empty,
+                                         diagonal=self.cfg.diagonal_covariance,
+                                         eps=self.cfg.eps, sigma_max=self.cfg.sigma_max)
+        d["guard_sigma_floor_frac"] = guard["sigma_floor_frac"]
+        d["guard_sigma_ceil_frac"] = guard["sigma_ceil_frac"]
+        entries = [t for t in (belief.mu, belief.sigma, belief.phi) if t is not None]
+        d["nonfinite_frac"] = (float(sum(int((~torch.isfinite(t)).sum()) for t in entries))
+                               / max(sum(t.numel() for t in entries), 1))
+        n_support = support.sum(-1).clamp_min(2).double()                              # (B, H, N)
+        normalized = torch.where(scorable, entropy.double() / n_support.log(), 0.0)    # (B, H, N)
+        rows = scorable.double().sum(dim=(0, 2))                                        # (H,)
+        head_mean = normalized.sum(dim=(0, 2)) / rows.clamp_min(1)                      # (H,)
+        d["attn_entropy_collapsed_heads"] = (
+            float(((head_mean < metrics.COLLAPSE_ENTROPY_FRACTION) & (rows > 0)).sum())
+            if bool((rows > 0).any()) else float("nan"))
+        return d
 
     @staticmethod
     def _projected_cov_extremes(cap: dict) -> Tuple[float, float]:
@@ -2250,6 +2324,7 @@ class VFEModel(nn.Module):
         spectrum = self._belief_spectrum(snapshot, layer_index)
         d["effective_rank"] = float(spectrum["effective_rank"].mean())
         d["belief_cond_median"] = float(spectrum["condition"].median())
+        d.update(self._belief_health_diagnostics(snapshot, layer_index, spectrum, entropy, support, scorable))
         d["relational_mean_displacement_norm"] = float(
             cap.get("relational_mean_displacement_norm", float("nan")))
         if self.cfg.attention_mode == "projected_gradient":
@@ -2383,6 +2458,14 @@ class VFEModel(nn.Module):
         d["phi_matrix_norm_p95"] = float(torch.quantile(matrix_norm, 0.95))
         d["phi_matrix_norm_p99"] = float(torch.quantile(matrix_norm, 0.99))
         d["phi_matrix_norm_max"] = float(matrix_norm.max())
+        if belief.right_phi is not None:
+            # The positional right factor Y_i of U_i = e^{phi_i G} e^{Y_i G} (audit 2026-10-12 round 2, item 13).
+            pos_norm = metrics.diagnostic_frame_norm(
+                belief.right_phi.float(), self.group, max_norm=self.cfg.transport_chart_max_norm,
+                eps=self.cfg.eps)
+            d["pos_phi_matrix_norm_p95"] = float(torch.quantile(pos_norm, 0.95))
+            d["pos_phi_matrix_norm_p99"] = float(torch.quantile(pos_norm, 0.99))
+            d["pos_phi_matrix_norm_max"] = float(pos_norm.max())
         d.update(self._frame_class_diagnostics(belief))
         return d
 
@@ -2409,6 +2492,19 @@ class VFEModel(nn.Module):
                     group.embed_algebra(belief.right_phi.double(), dtype=torch.float64))
             U = U.reshape(-1, *U.shape[-2:])                                     # (B N, K, K)
             out = {}
+            # Vertex conditioning: the largest head-block condition max_h s_max / s_min of the realized frame, the
+            # quantity phi_frame_condition_max bounds (the transports act per head; audit 2026-10-12 round 2,
+            # item 13).
+            offsets = [0, *itertools.accumulate(group.irrep_dims)]
+            head_cond = []
+            for start, stop in zip(offsets[:-1], offsets[1:]):
+                singular = torch.linalg.svdvals(U[:, start:stop, start:stop])    # (B N, d_h) descending
+                head_cond.append(singular[..., 0] / singular[..., -1])
+            vertex_cond = torch.stack(head_cond, dim=-1).amax(-1)                # (B N,)
+            out["vertex_cond_median"] = float(torch.quantile(vertex_cond, 0.50))
+            out["vertex_cond_p95"] = float(torch.quantile(vertex_cond, 0.95))
+            out["vertex_cond_p99"] = float(torch.quantile(vertex_cond, 0.99))
+            out["vertex_cond_max"] = float(vertex_cond.max())
             invariant = metrics.group_gauge_invariant(U, group)
             out["gauge_invariant_mean"] = float(invariant.mean())
             out["gauge_invariant_spread"] = float(invariant.std(unbiased=False))

@@ -543,24 +543,36 @@ _DECODERS: Dict[str, DecodeRegistration] = {}
 
 @dataclass(frozen=True)
 class DecodeCEResult:
-    """Opt-in fused-decoder result with the exact, unclamped reduction denominator."""
+    """Opt-in fused-decoder result with the exact, unclamped reduction denominator.
+
+    ``ce`` is always the plug-in cross-entropy. ``objective`` is the training objective when it differs
+    from that CE (the second-order linear decode, ``decode_second_order``) and None otherwise.
+    """
 
     ce:            torch.Tensor
     scored_tokens: torch.Tensor
     excluded_tokens: Optional[torch.Tensor] = None
+    objective:     Optional[torch.Tensor] = None
 
 
 def _decode_ce_result(
     ce:           torch.Tensor,
     valid:        torch.Tensor,
     return_stats: bool,
+
+    *,
+    objective:    Optional[torch.Tensor] = None,
 ) -> 'torch.Tensor | DecodeCEResult':
-    """Keep scalar CE as the default while exposing a device-side int64 count on request."""
+    """Keep the scalar training loss as the default while exposing a device-side int64 count on request.
+
+    The scalar return is the objective when one is given (the loss the caller trains on); the stats
+    record carries the plug-in ``ce`` and the ``objective`` separately.
+    """
     if not return_stats:
-        return ce
+        return ce if objective is None else objective
     scored = valid.sum(dtype=torch.int64)
     excluded = valid.numel() - scored                      # no host-to-device copy of the count
-    return DecodeCEResult(ce=ce, scored_tokens=scored, excluded_tokens=excluded)
+    return DecodeCEResult(ce=ce, scored_tokens=scored, excluded_tokens=excluded, objective=objective)
 
 # Once-per-process guard for the decode_unigram_prior=True-with-unset-table warning
 # (the decode then degenerates to the current uniform-prior behavior).
@@ -1859,18 +1871,23 @@ class PriorBank(nn.Module):
         lse_stack = torch.stack(lse_chunks, dim=0)                         # (C, B, N)
         logsumexp_v = torch.logsumexp(lse_stack, dim=0)                    # (B, N)
         ce_per_pos = logsumexp_v - target_logit                           # (B, N) = -log-softmax at target
-        if second_order:
-            # Global moments E_p[w], E_p[w o w]: chunk weights exp(lse_c - LSE) sum to 1 per position.
-            chunk_weight = torch.exp(lse_stack - logsumexp_v)              # (C, B, N)
-            moments = (chunk_weight.unsqueeze(-1) * torch.stack(moment_chunks, dim=0)).sum(0)  # (B, N, 2K)
-            K = mu_q.shape[-1]
-            mean_w, mean_w_sq = moments[..., :K], moments[..., K:]         # (B, N, K) each
-            # 1/2 sum_k sigma_k Var_p(w_k) = 1/2 tr(Sigma Cov_p(w)), the delta-method term.
-            ce_per_pos = ce_per_pos + 0.5 * (sigma_q * (mean_w_sq - mean_w * mean_w)).sum(-1)  # (B, N)
         # Device-side masked mean: clamp the denominator so an all-ignore microbatch yields a finite
         # grad-connected 0 (the numerator is then 0) without a host sync to branch on valid.sum() == 0.
-        ce = (ce_per_pos * valid).sum() / valid.sum().clamp_min(1)
-        return _decode_ce_result(ce, original_valid, return_stats)
+        n_valid = valid.sum().clamp_min(1)
+        ce = (ce_per_pos * valid).sum() / n_valid
+        if not second_order:
+            return _decode_ce_result(ce, original_valid, return_stats)
+        # Global moments E_p[w], E_p[w o w]: chunk weights exp(lse_c - LSE) sum to 1 per position.
+        chunk_weight = torch.exp(lse_stack - logsumexp_v)                  # (C, B, N)
+        moments = (chunk_weight.unsqueeze(-1) * torch.stack(moment_chunks, dim=0)).sum(0)  # (B, N, 2K)
+        K = mu_q.shape[-1]
+        mean_w, mean_w_sq = moments[..., :K], moments[..., K:]             # (B, N, K) each
+        # 1/2 sum_k sigma_k Var_p(w_k) = 1/2 tr(Sigma Cov_p(w)), the delta-method term.
+        delta_term = 0.5 * (sigma_q * (mean_w_sq - mean_w * mean_w)).sum(-1)  # (B, N)
+        objective = ((ce_per_pos + delta_term) * valid).sum() / n_valid
+        # The plug-in CE is reported, the second-order objective is trained on (audit 2026-10-12 round 2,
+        # item 12): the plug-in value is the one validation scores.
+        return _decode_ce_result(ce.detach(), original_valid, return_stats, objective=objective)
 
     def decode_ce_expected_likelihood_chunked(
         self,
