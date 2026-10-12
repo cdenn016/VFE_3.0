@@ -17,7 +17,6 @@ from vfe3.geometry.lie_ops import (
     compose_phi,
     register_compose,
 )
-from vfe3.geometry.retraction import retract_phi
 from vfe3.geometry.transport import (
     CompactFactoredTransport,
     FactoredTransport,
@@ -267,44 +266,6 @@ def test_compose_registry_default_call_does_not_require_compact_keyword() -> Non
         assert torch.equal(out, phi2)
     finally:
         _COMPOSE.pop(name, None)
-
-
-def test_compact_phi_block_transport_keeps_bch_retraction_packed_and_matches_vjp(
-    device:      torch.device,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    group = get_group("block_glk")(4, 2, device=device)
-    phi = (0.02 * torch.randn(1, 3, group.generators.shape[0], device=device)).requires_grad_()
-    delta = (0.01 * torch.randn_like(phi)).requires_grad_()
-    cotangent = torch.randn_like(phi)
-
-    legacy = retract_phi(
-        phi,
-        delta,
-        group,
-        mode="bch",
-        compact_blocks=False,
-    )
-    legacy_grad = torch.autograd.grad(legacy, (phi, delta), cotangent)
-
-    def _dense_embed_forbidden(*args: object, **kwargs: object) -> torch.Tensor:
-        raise AssertionError("canonical packed BCH retraction must not embed a dense KxK matrix")
-
-    monkeypatch.setattr(lie_ops_module, "embed_phi", _dense_embed_forbidden)
-    phi_compact = phi.detach().clone().requires_grad_()
-    delta_compact = delta.detach().clone().requires_grad_()
-    compact = retract_phi(
-        phi_compact,
-        delta_compact,
-        group,
-        mode="bch",
-        compact_blocks=True,
-    )
-    compact_grad = torch.autograd.grad(compact, (phi_compact, delta_compact), cotangent)
-
-    assert torch.allclose(compact, legacy, atol=2e-6, rtol=1e-5)
-    assert torch.allclose(compact_grad[0], legacy_grad[0], atol=2e-6, rtol=1e-5)
-    assert torch.allclose(compact_grad[1], legacy_grad[1], atol=2e-6, rtol=1e-5)
 
 
 @pytest.mark.parametrize("route", ["single_head", "block_glk"])

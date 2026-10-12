@@ -186,29 +186,6 @@ def _as_finite_float(v: Any) -> Optional[float]:
     return f if math.isfinite(f) else None
 
 
-def aggregate_seed_metric(
-    run_root:  Any,
-    key:       str = "test_ppl",
-
-    *,
-    filename:  str = "summary.json",
-    seed_file: str = "config.json",
-) -> Dict[str, Any]:
-    r"""Scan ``run_root`` for per-seed ``filename``, gather ``key``, return the across-seed summary.
-
-    Returns ``{n, mean, sd, noise_floor, cv, values, seeds}`` with the UNBIASED (ddof=1) SD and the
-    :func:`single_seed_noise_floor`; ``sd``/``noise_floor``/``cv`` are NaN for n<2. ``seeds`` reads :func:`_seed_for` (provenance.json -> config.json -> dir name).
-    Non-finite or unreadable points are skipped (never crash the aggregation).
-    """
-    root = Path(run_root)
-    return _aggregate_requested_metric(
-        root,
-        key,
-        sources=(filename,),
-        seed_file=seed_file,
-    )
-
-
 def single_seed_noise_floor(sd: float, n_sd_seeds: int) -> float:
     r"""Half-width of the 95% band for the difference of two single-seed runs.
 
@@ -216,7 +193,7 @@ def single_seed_noise_floor(sd: float, n_sd_seeds: int) -> float:
         t_{n-1, 0.975} \sqrt{2} s,
 
     with :math:`s` the across-seed SD estimated from :math:`n` seeds. NaN for :math:`n < 2` or a
-    non-finite :math:`s`. :func:`flag_noise_dominated` applies this floor.
+    non-finite :math:`s`.
     """
     if n_sd_seeds < 2 or not math.isfinite(sd):
         return math.nan
@@ -463,11 +440,6 @@ def _request_manifest(root: Path, observed: List[int]) -> Dict[str, Any]:
     }
 
 
-def _requested_seeds(root: Path, observed: List[int]) -> tuple[List[int], bool]:
-    manifest = _request_manifest(root, observed)
-    return manifest["requested_seeds"], manifest["request_verified"]
-
-
 _CODE_IDENTITY_KEYS = ("git_sha", "git_dirty", "git_dirty_fingerprint")
 # The data-order seed is reported through ``_data_order_status`` and the noise-band caption; it is
 # not a comparability key, so a per-seed data order (``DATA_SEED=None``, data_seed == seed) still
@@ -705,7 +677,8 @@ def aggregate_scalar(
     sources: tuple = ("summary.json", "test_results.json", "research.json"),
 ) -> Dict[str, Any]:
     r"""Across-seed summary of one (possibly dotted) scalar ``key``, searching ``sources`` in order
-    per seed dir. Same return shape as :func:`aggregate_seed_metric`. Handles ``research.json`` keys
+    per seed dir. Returns ``{n, mean, sd, noise_floor, cv, values, seeds}`` plus the seed-design and
+    per-cell records. Handles ``research.json`` keys
     (ECE, ``corpus_freq_strata_ce.rare``, ...) that never appear in ``summary.json``.
     """
     root = _resolve_run_root(run_root)
@@ -902,46 +875,6 @@ def aggregate_per_layer(
             "mean": s["mean"], "sd": s["sd"], "n": s["n"], "values": vals,
         }
     return out
-
-
-def flag_noise_dominated(
-    cell_metric: Dict[str, Optional[float]],
-    sd:          float,
-
-    *,
-    baseline:    Optional[float] = None,
-    n_sd_seeds:  Optional[int] = None,
-    k:           Optional[float] = None,
-) -> List[str]:
-    r"""Labels of single-seed ablation cells whose difference from ``baseline`` is within seed noise.
-
-    ``cell_metric`` maps label -> the cell's single-seed metric, ``baseline`` is the single-seed
-    reference value, and ``sd`` is the across-seed SD of one run estimated from ``n_sd_seeds`` seeds.
-    The difference of two independent single-seed values has SD :math:`\sqrt{2} \sigma`, and
-    :math:`\sigma` is estimated on :math:`n-1` degrees of freedom, so a cell is noise-dominated when
-
-    .. math::
-        |v - v_{\mathrm{baseline}}| < t_{n-1, 0.975} \sqrt{2} s,
-
-    the two-sided 95% band for a difference of two independent normal observations with a pooled
-    SD estimate (Student 1908; Hahn and Meeker 1991, *Statistical Intervals*). Comparing
-    against a fixed baseline avoids the winner's-curse bias of measuring from the best cell.
-
-    Legacy mode: an explicit ``k`` reproduces the historic rule ``v - min(cells) < k * sd`` (no
-    sqrt(2), no t quantile, best-cell reference), which flags too few cells as noise.
-    """
-    finite = {lab: float(v) for lab, v in cell_metric.items() if _as_finite_float(v) is not None}
-    if not finite or not math.isfinite(sd):
-        return []
-    if k is not None:
-        best = min(finite.values())
-        return [lab for lab, v in finite.items() if (v - best) < k * sd]
-    if _as_finite_float(baseline) is None:
-        raise ValueError("flag_noise_dominated needs a finite single-seed baseline value")
-    if type(n_sd_seeds) is not int or n_sd_seeds < 2:
-        raise ValueError("flag_noise_dominated needs n_sd_seeds >= 2 (the seeds behind sd)")
-    half_width = single_seed_noise_floor(sd, n_sd_seeds)
-    return [lab for lab, v in finite.items() if abs(v - float(baseline)) < half_width]
 
 
 # =============================================================================

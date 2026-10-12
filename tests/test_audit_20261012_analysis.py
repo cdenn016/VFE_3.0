@@ -107,14 +107,12 @@ def test_validation_finalizer_summary_carries_the_validation_scored_target_key(t
     assert "final_val_scored_targets" not in summary and "test_ce" not in summary
 
 
-def test_noise_floor_is_the_single_seed_difference_band_and_drives_the_flags() -> None:
+def test_noise_floor_is_the_single_seed_difference_band() -> None:
     from scipy.stats import t as t_dist
     agg = ms._summarize([10.0, 11.0, 12.0])
     expected = float(t_dist.ppf(0.975, 2)) * math.sqrt(2.0) * 1.0
     assert "two_sd" not in agg
     assert agg["noise_floor"] == pytest.approx(expected)              # ~6.09 s at n = 3, not 2 s
-    cells = {"inside": 10.0 + 0.99 * expected, "outside": 10.0 + 1.01 * expected}
-    assert ms.flag_noise_dominated(cells, agg["sd"], baseline=10.0, n_sd_seeds=agg["n"]) == ["inside"]
     assert math.isnan(ms._summarize([10.0])["noise_floor"])
 
 

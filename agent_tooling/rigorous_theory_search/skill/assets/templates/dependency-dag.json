@@ -1,6 +1,0 @@
-{
-  "schema_version": "rigorous-theory-search/v1",
-  "contract_id": "{{CONTRACT_ID}}",
-  "target_digest": "{{TARGET_DIGEST}}",
-  "edges": []
-}

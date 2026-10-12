@@ -367,32 +367,3 @@ def test_frames_identity_rule_is_shared(tmp_path: Path) -> None:
     cfg, model = _tiny_model(decode_mode="linear")
     run = _load(_save_run(tmp_path, "moving", cfg, model))
     assert run.frames_active is True and iv.frames_inactive_reason(model) is None
-
-
-# ------------------------------------------------------------------------------------- item 47
-
-def test_holonomy_driver_is_click_to_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import inspect
-
-    from vfe3.posthoc import holonomy
-    from vfe3.posthoc import streams
-
-    assert "argparse" not in inspect.getsource(holonomy)
-    assert list(inspect.signature(holonomy.main).parameters) == []
-    assert {"run_dir", "checkpoints", "windows", "batch_size", "triangles", "seed", "device", "out"} == set(
-        holonomy.CONFIG)
-    monkeypatch.setitem(holonomy.CONFIG, "run_dir", None)
-    with pytest.raises(ValueError, match="run_dir"):
-        holonomy.main()
-    seen: Dict[str, object] = {}
-    monkeypatch.setattr(holonomy, "checkpoint_holonomy",
-                        lambda run_dir, checkpoint, **kw: seen.setdefault(checkpoint, kw) and {"checkpoint": checkpoint})
-    monkeypatch.setattr(holonomy, "snapshot_holonomy", lambda run_dir, cfg: [])
-    monkeypatch.setattr(streams, "load_run_info", lambda run_dir, checkpoint: SimpleNamespace(cfg=None))
-    out = tmp_path / "holonomy.json"
-    for key, value in (("run_dir", str(tmp_path)), ("checkpoints", ["final_model.pt"]), ("windows", 2),
-                       ("out", str(out))):
-        monkeypatch.setitem(holonomy.CONFIG, key, value)
-    report = holonomy.main()
-    assert seen["final_model.pt"]["n_windows"] == 2
-    assert json.loads(out.read_text(encoding="utf-8"))["checkpoints"] == report["checkpoints"]

@@ -21,19 +21,16 @@ from vfe3.model.model import VFEModel
 from vfe3.numerics import triangular_condition_estimate
 from vfe3.relational_scoring import (
     _cholesky_status, _factor_status, projected_gaussian_kl, projected_moments,
-    reset_source_recovery_elements, set_projected_condition_recovery, set_projected_factor_condition_tol,
-    set_projected_factor_route, set_projected_gram_condition_tol, set_projected_recovery_precision,
-    source_recovery_elements,
+    reset_source_recovery_elements, set_projected_condition_recovery, set_projected_factor_route,
+    set_projected_recovery_precision, source_recovery_elements,
 )
 
 
 @pytest.fixture(autouse=True)
 def _restore_scorer_policies() -> Iterator[None]:
-    saved = (scoring._CONDITION_RECOVERY, scoring._FACTOR_ROUTE, scoring._GRAM_CONDITION_TOL,
-             scoring._FACTOR_CONDITION_TOL, scoring._RECOVERY_PRECISION)
+    saved = (scoring._CONDITION_RECOVERY, scoring._FACTOR_ROUTE, scoring._RECOVERY_PRECISION)
     yield
-    (scoring._CONDITION_RECOVERY, scoring._FACTOR_ROUTE, scoring._GRAM_CONDITION_TOL,
-     scoring._FACTOR_CONDITION_TOL, scoring._RECOVERY_PRECISION) = saved
+    scoring._CONDITION_RECOVERY, scoring._FACTOR_ROUTE, scoring._RECOVERY_PRECISION = saved
 
 
 class _Ops(TorchDispatchMode):
@@ -99,31 +96,26 @@ def test_fields_validate_and_report_inactivity() -> None:
     ("gram", False, "gram"), ("gram_certified", True, "gram"), ("cholesky_qr2_certified", True, "cholesky_qr2")])
 def test_model_installs_the_scorer_policies(factorization: str, recovery: bool, route: str) -> None:
     set_projected_recovery_precision("fp64")
-    set_projected_gram_condition_tol(2e-4)
-    set_projected_factor_condition_tol(5e-4)
     VFEModel(tiny_config(projected_factorization=factorization))
     assert scoring.projected_condition_recovery() is recovery
     assert scoring.projected_factor_route() == route
     assert scoring.projected_recovery_precision() == "fp32"
-    assert scoring._GRAM_CONDITION_TOL == 1e-4 and scoring._FACTOR_CONDITION_TOL == 3e-4
-    for setter in (set_projected_gram_condition_tol, set_projected_factor_condition_tol):
-        with pytest.raises(ValueError, match="condition tolerance"):
-            setter(0.0)
+    assert scoring.GRAM_CONDITION_TOL == 1e-4 and scoring.FACTOR_CONDITION_TOL == 3e-4
     with pytest.raises(ValueError, match="recovery precision"):
         set_projected_recovery_precision("bf16")
 
 
-# -- the exposed certificate tolerances reach the certificates ------------------------------------
+# -- the certificate tolerances reach the certificates ----------------------------------------------
 
-def test_gram_tolerance_moves_the_certificate(device: torch.device) -> None:
+def test_gram_tolerance_moves_the_certificate(device: torch.device, monkeypatch: pytest.MonkeyPatch) -> None:
     set_projected_condition_recovery(True)
     G = torch.diag(torch.tensor([1.0, 1e-4], device=device))[None]    # eps_32 kappa_F(G) ~ 1.2e-3
     assert bool(_cholesky_status(G)[2].all())
-    set_projected_gram_condition_tol(1e-2)
+    monkeypatch.setattr(scoring, "GRAM_CONDITION_TOL", 1e-2)
     assert not bool(_cholesky_status(G)[2].any())
 
 
-def test_factor_tolerance_moves_the_certificate(device: torch.device) -> None:
+def test_factor_tolerance_moves_the_certificate(device: torch.device, monkeypatch: pytest.MonkeyPatch) -> None:
     set_projected_condition_recovery(True)
     generator = torch.Generator().manual_seed(4)
     Q = torch.linalg.qr(torch.randn(3, 3, generator=generator))[0]
@@ -135,9 +127,9 @@ def test_factor_tolerance_moves_the_certificate(device: torch.device) -> None:
     chol, failed, _, _ = _factor_status(G, projection)
     assert not bool(failed.any())                                    # CholeskyQR2 succeeds
     measured = torch.finfo(torch.float32).eps * triangular_condition_estimate(chol)
-    set_projected_factor_condition_tol(0.5 * float(measured.min()))
+    monkeypatch.setattr(scoring, "FACTOR_CONDITION_TOL", 0.5 * float(measured.min()))
     assert bool(_factor_status(G, projection)[2].all())
-    set_projected_factor_condition_tol(2.0 * float(measured.max()))
+    monkeypatch.setattr(scoring, "FACTOR_CONDITION_TOL", 2.0 * float(measured.max()))
     assert not bool(_factor_status(G, projection)[2].any())
 
 

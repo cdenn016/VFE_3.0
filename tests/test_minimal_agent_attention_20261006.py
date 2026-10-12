@@ -1007,7 +1007,6 @@ def test_diagnostics_and_consumers(inference: str) -> None:
     from vfe3.gradients.full_link import build_full_link_context
     from vfe3.metrics import LINK_SPECTRUM_KEYS
     from vfe3.posthoc import interventions as iv
-    from vfe3.posthoc.holonomy import layer_content_maps
     from vfe3.posthoc.maps import map_invariants
     from vfe3.posthoc.routing import not_applicable_reason
 
@@ -1029,14 +1028,12 @@ def test_diagnostics_and_consumers(inference: str) -> None:
     for cap in capture["diagnostic"]["layer_conditional_captures"]:
         torch.testing.assert_close(cap["beta_pre"].sum(-1), torch.ones(1, 2, 4))
         assert cap["relational_minimal_agent_gain_fraction"].shape == (2,)
-    # Posthoc: map invariants read the tied key; holonomy and routing decomposition refuse.
+    # Posthoc: map invariants read the tied key; the routing decomposition refuses.
     for row in map_invariants(model.state_dict(), model.cfg):
         assert row["key_tied_to_content"] == 1.0 and row["channel_noise"] == pytest.approx(1.0)
         T_h = model.relational_operators_by_layer[row["layer"]].T.detach()[row["head"]].double()
         assert row["S_K_fro"] == pytest.approx(float(T_h.norm()))   # the S_K columns describe the tied T
         assert math.isnan(row["O_fro"]) and math.isnan(row["M_sigma_max"])   # no content factor O
-    with pytest.raises(NotImplementedError, match="minimal_agent"):
-        layer_content_maps(model.state_dict(), model.cfg)
     assert "minimal_agent" in not_applicable_reason(model)
     with pytest.raises(iv.NotApplicable):
         with iv.residual_removed(model):
@@ -1052,18 +1049,6 @@ def test_diagnostics_and_consumers(inference: str) -> None:
     score = relational_score(torch.zeros(1, 4, 4), torch.ones(1, 4, 4), torch.zeros(1, 4, 4), torch.ones(1, 4, 4),
                              frame, ops)                              # reads (S_Q, T), the tied comparison pair
     assert score.shape == (1, 2, 4, 4) and bool(torch.isfinite(score).all())
-
-
-def test_checkpoint_holonomy_refuses_before_the_validation_pass(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
-    from types import SimpleNamespace
-    from vfe3.posthoc import evaluate as ev
-    from vfe3.posthoc.holonomy import checkpoint_holonomy
-
-    model = _agent_model("exact")
-    monkeypatch.setattr(ev, "load_model", lambda *args, **kwargs: SimpleNamespace(model=model, cfg=model.cfg))
-    monkeypatch.setattr(ev, "nll_pass", lambda *args, **kwargs: pytest.fail("the validation pass ran first"))
-    with pytest.raises(NotImplementedError, match="minimal_agent"):
-        checkpoint_holonomy(tmp_path, "final")
 
 
 def test_value_frame_must_equal_the_routing_frame() -> None:

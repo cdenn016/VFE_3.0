@@ -630,8 +630,7 @@ def test_diagnostics_and_consumers(mode: str) -> None:
     assert sorted("val_" + key for key in edge_keys) == sorted(T._VAL_EDGE_DIAG_KEYS)
     assert all(math.isfinite(v) and v > 0 for key in edge_keys for v in rows[key])
     assert not any(key.startswith("relational_edge_") for key in b0)
-    # Map invariants carry the edge maps; the holonomy analysis and the full-link builder refuse.
-    from vfe3.posthoc.holonomy import layer_content_maps
+    # Map invariants carry the edge maps; the full-link builder refuses.
     from vfe3.posthoc.maps import map_invariants
     invariant_rows = map_invariants(model.state_dict(), model.cfg)
     assert all(row["edge_sender_map_fro"] > 0 for row in invariant_rows)
@@ -639,8 +638,6 @@ def test_diagnostics_and_consumers(mode: str) -> None:
     assert all(row["link_shared_generator_only"] == 1.0
                for row in invariant_rows + link_eigenvalue_rows(model.state_dict(), model.cfg))
     assert not any("link_shared_generator_only" in row for row in map_invariants(base.state_dict(), base.cfg))
-    with pytest.raises(NotImplementedError, match="content_link_edges"):
-        layer_content_maps(model.state_dict(), model.cfg)
     from vfe3.gradients.full_link import build_full_link_context
     ops = model.relational_operators
     with pytest.raises(ValueError, match="content_link_edges"):

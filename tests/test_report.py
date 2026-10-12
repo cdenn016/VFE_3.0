@@ -26,7 +26,7 @@ from vfe3.run_artifacts import RunArtifacts, semantic_config_fingerprint
 from vfe3.train import _loader_data_identity, train
 from vfe3.viz.extract import readout_state
 from vfe3.viz.figures import register_figure
-from vfe3.viz.report import generate_figures, plan_single_run_figures, vocab_comparison_figures
+from vfe3.viz.report import generate_figures, plan_single_run_figures
 from vfe3.viz.specs import FigureSpec, emit_registered_figures
 
 
@@ -260,24 +260,6 @@ def test_generate_figures_rejects_empty_best_bundle_state(tmp_path):
         generate_figures(art.run_dir, loader=_loader(), max_sequences=16)
 
 
-def test_vocab_comparison_rejects_semantically_mismatched_best_bundle(tmp_path):
-    cfg = _cfg()
-    model = _model()
-    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic-period3")
-    _bind_offline_selection_contract(art)
-    mismatched = serialize_config(_cfg(n_e_steps=3))
-    torch.save({
-        "model_state":             model.state_dict(),
-        "config":                  mismatched,
-        "config_fingerprint":      semantic_config_fingerprint(mismatched),
-        "code_identity_sha256":    art.code_identity_sha256,
-        "selection_data_identity": art.selection_data_identity,
-    }, art.best_path)
-
-    with pytest.raises(ValueError, match="selection config"):
-        vocab_comparison_figures([art.run_dir], tmp_path / "comparison")
-
-
 class _MemoryGuardModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -423,24 +405,6 @@ def test_figure_worker_snapshot_caps_actual_loader_shapes():
     targets.fill_(9)
     assert torch.equal(batches[0][0], torch.zeros_like(batches[0][0]))
     assert torch.equal(batches[0][1], torch.ones_like(batches[0][1]))
-
-
-def test_vocab_comparison_rejects_mixed_tokenizers(tmp_path):
-    cfg = _cfg()
-    model = _model()
-    gpt2 = RunArtifacts(tmp_path / "gpt2", cfg, model, dataset="wikitext-103")
-    cl100k = RunArtifacts(tmp_path / "cl100k", cfg, model, dataset="wiki-en")
-
-    with pytest.raises(ValueError, match="mixed tokenizer tags") as exc:
-        vocab_comparison_figures(
-            [gpt2.run_dir, cl100k.run_dir],
-            tmp_path / "comparison",
-        )
-
-    message = str(exc.value)
-    assert "tiktoken" in message
-    assert "tiktoken_cl100k" in message
-    assert not (tmp_path / "comparison").exists()
 
 
 def test_metrics_csv_logs_at_log_cadence(tmp_path):

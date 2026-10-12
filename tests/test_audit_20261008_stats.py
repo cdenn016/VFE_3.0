@@ -354,15 +354,3 @@ def test_cv_is_kept_only_for_positive_ratio_scale_metrics():
     assert math.isfinite(signed["sd"])
     assert ratio["cv"] == pytest.approx(1.0 / 11.0)
     assert math.isnan(nonpositive["cv"])
-
-
-def test_flag_noise_dominated_uses_t_and_sqrt2_against_a_baseline():
-    cells = {"a": 12.0, "b": 17.0, "c": 4.5, "d": None}
-    # sd = 1 from 3 seeds: half width t_{2, 0.975} * sqrt(2) = 4.303 * 1.414 = 6.085.
-    flagged = ms.flag_noise_dominated(cells, sd=1.0, baseline=10.0, n_sd_seeds=3)
-    assert set(flagged) == {"a", "c"}
-    with pytest.raises(ValueError):
-        ms.flag_noise_dominated(cells, sd=1.0, n_sd_seeds=3)
-    with pytest.raises(ValueError):
-        ms.flag_noise_dominated(cells, sd=1.0, baseline=10.0, n_sd_seeds=1)
-    assert set(ms.flag_noise_dominated(cells, sd=1.0, k=2.0)) == {"c"}   # legacy rule reachable

@@ -85,8 +85,7 @@ def _fixed_direction(xi_blocks: torch.Tensor):
 
 
 def _stage(grad, phi, group, direction, **kwargs):
-    options = dict(learning_rate=0.05, trust_radius=0.1, chart_max_norm=20.0,
-                   bch_residual_max=1e-6)
+    options = dict(learning_rate=0.05, trust_radius=0.1, chart_max_norm=20.0)
     options.update(kwargs)
     return stage_group_log_candidate(grad, phi, group, direction=direction, **options)
 
@@ -252,8 +251,7 @@ def test_trust_saturated_step_needs_no_truncation_halvings() -> None:
     generator = torch.Generator().manual_seed(8)
     phi = torch.randn(4, 18, generator=generator, dtype=F64) / 3.0     # ||X_h||_F ~ 1
     grad = torch.randn(4, 18, generator=generator, dtype=F64)
-    options = dict(learning_rate=10.0, trust_radius=0.1, chart_max_norm=20.0,
-                   bch_residual_max=1e-6)
+    options = dict(learning_rate=10.0, trust_radius=0.1, chart_max_norm=20.0)
     group_log = stage_group_log_candidate(grad, phi, group, direction=_pullback(group),
                                           **options)
     chart = stage_pullback_group_candidate(grad, phi, group, **options)
@@ -470,7 +468,6 @@ def test_group_log_optimizer_moves_only_active_rows_and_equals_the_stager() -> N
         group,
         phi_group_trust_radius=0.1,
         phi_chart_max_norm=5.0,
-        phi_bch_residual_max=1e-6,
         phi_group_retraction="group_log",
         weight_decay=0.0,
     )
@@ -480,7 +477,7 @@ def test_group_log_optimizer_moves_only_active_rows_and_equals_the_stager() -> N
     phi.grad[3, 3] = -2.0
     expected = stage_group_log_candidate(
         phi.grad[[1, 3]], before[[1, 3]], group, direction=_pullback(group),
-        learning_rate=0.05, trust_radius=0.1, chart_max_norm=5.0, bch_residual_max=1e-6,
+        learning_rate=0.05, trust_radius=0.1, chart_max_norm=5.0,
     ).candidate_phi.to(dtype=phi.dtype)
     optimizer._collect_gauge_diag = True
 
@@ -591,12 +588,10 @@ def test_retraction_config_validation_inactive_marks_and_serialized_default(
     with pytest.raises(ValueError, match="phi_group_retraction"):
         GaugeManifoldAdamW([nn.Parameter(torch.zeros(1))], get_group("block_glk")(n_heads=1, K=2),
                            phi_group_trust_radius=0.1, phi_chart_max_norm=5.0,
-                           phi_bch_residual_max=1e-6, 
                            phi_group_retraction="bogus")
     with pytest.raises(ValueError, match="group_log"):
         GaugeManifoldAdamW([nn.Parameter(torch.zeros(1))], get_group("so_n")(3, group_n=3, irrep_spec=[("l1", 1)]),
                            phi_group_trust_radius=0.1, phi_chart_max_norm=5.0,
-                           phi_bch_residual_max=1e-6, 
                            phi_group_retraction="group_log")
 
 

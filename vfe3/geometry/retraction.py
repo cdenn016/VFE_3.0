@@ -2,22 +2,14 @@ r"""SPD-manifold retractions + Fisher natural-gradient preconditioner (VFE_3.0).
 
 The SPD retraction keeps Sigma on the SPD manifold under a tangent update; the
 Fisher preconditioner converts Euclidean (mu, sigma) gradients to natural
-gradients. The phi Lie-algebra retraction (retract_phi) lives here too, dispatching to the
-GL(K)/SO(N) retractions in lie_ops.py.
+gradients.
 """
 
 import math
-from typing import Callable, Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 
-from vfe3.geometry.groups import GaugeGroup
-from vfe3.geometry.lie_ops import (
-    clamp_phi_trace,
-    project_phi_to_slk,
-    retract_glk,
-    retract_son,
-)
 from vfe3.numerics import safe_eigh
 
 
@@ -55,30 +47,6 @@ def _public_spd_bounds(
             f"[{eps}, {sigma_max}] has no representable strict interior in {dtype}"
         )
     return lower, upper
-
-
-_RETRACTIONS: Dict[str, Callable[..., torch.Tensor]] = {}
-
-
-def register_retraction(name: str, *, override: bool = False) -> Callable:
-    """Decorator registering an SPD covariance retraction sigma -> sigma_new.
-
-    Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
-    existing name silently shadowed the first. Pass ``override=True`` to replace deliberately.
-    """
-    def _wrap(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
-        if name in _RETRACTIONS and not override:
-            raise KeyError(f"retraction {name!r} already registered; pass override=True to replace")
-        _RETRACTIONS[name] = fn
-        return fn
-    return _wrap
-
-
-def get_retraction(name: str) -> Callable[..., torch.Tensor]:
-    """Return the registered SPD retraction (KeyError-with-available-list if absent)."""
-    if name not in _RETRACTIONS:
-        raise KeyError(f"no retraction {name!r}; available: {sorted(_RETRACTIONS)}")
-    return _RETRACTIONS[name]
 
 
 class _EighDamped(torch.autograd.Function):
@@ -767,7 +735,6 @@ def retract_spd_full(
     return sigma_new
 
 
-@register_retraction("spd_affine")
 def retract_spd_affine(
     sigma:        torch.Tensor,             # (..., K) diagonal OR (..., K, K) full covariance
     delta_sigma:  torch.Tensor,             # matching rank: the tangent step (e.g. -e_q_sigma_lr * nat_sigma)
@@ -782,7 +749,7 @@ def retract_spd_affine(
 ) -> torch.Tensor:                          # (...) same rank as sigma
     r"""Affine-invariant SPD retraction (the default; Pennec, Fillard and Ayache, Int. J. Comput. Vision 66(1), 2006, Sec. 3.3).
 
-    The single registered home for the rank dispatch the E-step used to perform inline: a full
+    The single home for the rank dispatch the E-step used to perform inline: a full
     covariance (sigma.dim() == mean_ndim + 1) steps along the affine-invariant geodesic via
     ``retract_spd_full``; a diagonal sigma (matching the mean rank) uses ``retract_spd_diagonal``.
     Both are the same affine-invariant exponential map,
@@ -846,64 +813,3 @@ def natural_gradient(
                 nat_grad_sigma = 0.5 * (nat_grad_sigma + nat_grad_sigma.transpose(-1, -2))
     return nat_grad_mu.to(orig_dtype), (None if nat_grad_sigma is None
                                         else nat_grad_sigma.to(orig_dtype))
-
-
-def retract_phi(
-    phi:          torch.Tensor,           # (..., n_gen) current gauge frame
-    delta_phi:    torch.Tensor,           # (..., n_gen) tangent step (e.g. -grad_phi)
-    group:        GaugeGroup,             # supplies generators, skew flag, irrep_dims
-
-    *,
-    step_size:      float           = 1.0,
-    eps:            float           = 1e-6,
-    order:          int             = 4,
-    project_slk:    bool            = False,
-    compact_blocks: bool            = False,
-    mode:           str             = "euclidean",
-
-    trust_region:   Optional[float] = None, # None -> group default (GL:0.1, SO:0.3)
-    max_norm:       Optional[float] = None, # None -> group default (GL:5.0, SO:pi)
-    trace_clamp:    Optional[float] = None, # soft per-block |tr| cap (GL only)
-    residual_max:   Optional[float] = None, # opt-in fail-closed BCH-to-group-product residual gate
-) -> torch.Tensor:
-    r"""Group-aware phi retraction dispatcher (Gaussian-specialized).
-
-    Skew group (SO(N)) -> retract_son, det control is a no-op (det exp = 1).
-    Non-skew (GL(K))   -> retract_glk, then optional det control:
-      project_slk=True  hard-projects each block to sl(K) (det Omega_h = 1);
-      else trace_clamp soft-bounds |tr| per block. Defaults for trust_region /
-      max_norm are taken from the group's compactness when not given.
-    ``max_norm`` caps the step, not the base point: a row is capped at
-    ``max(max_norm, ||phi||)``, so ``R_phi(0) = phi`` for every frame (see ``_retract_core``).
-    ``residual_max`` (None = off) forwards to ``compose_bch``'s fail-closed residual gate under
-    ``mode='bch'``.
-    """
-    G = group.generators
-    compact_blocks = (
-        compact_blocks
-        and mode == "bch"
-        and group.phi_coordinate_layout == "block_head_row_major"
-    )
-    if trust_region is None:
-        trust_region = 0.3 if group.skew_symmetric else 0.1
-    if max_norm is None:
-        max_norm = math.pi if group.skew_symmetric else 5.0
-
-    if group.skew_symmetric:
-        return retract_son(
-            phi, delta_phi, G, step_size=step_size, trust_region=trust_region,
-            max_norm=max_norm, eps=eps, order=order, mode=mode, residual_max=residual_max,
-        )
-
-    phi_new = retract_glk(
-        phi, delta_phi, G, step_size=step_size, trust_region=trust_region,
-        max_norm=max_norm, eps=eps, order=order, mode=mode,
-        compact_blocks=compact_blocks,
-        block_dims=(group.irrep_dims if compact_blocks else None),
-        residual_max=residual_max,
-    )
-    if project_slk:
-        phi_new = project_phi_to_slk(phi_new, G, group.irrep_dims)
-    elif trace_clamp is not None:
-        phi_new = clamp_phi_trace(phi_new, G, group.irrep_dims, trace_max=trace_clamp)
-    return phi_new

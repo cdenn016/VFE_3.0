@@ -4,8 +4,7 @@ The gauge frame phi lives in a Lie algebra g (a vector space) as coordinates in 
 generator basis {G_a}: the algebra element is embed(phi) = sum_a phi^a G_a. The
 group element U = exp(embed(phi)) lies in GL+(K) (det>0) or SO(N). This module
 supplies: coordinate<->matrix maps, the Lie bracket, a composition registry
-(euclidean step or BCH chart correction), the GL(K)/SO(N) retractions, and
-determinant control. Pure: operates on a generator TENSOR, not a GaugeGroup.
+(euclidean step or BCH chart correction), and determinant control. Pure: operates on a generator TENSOR, not a GaugeGroup.
 """
 
 import hashlib
@@ -743,122 +742,6 @@ def compose_phi(
     return compose(phi1, phi2, generators, **kwargs)
 
 
-def _retract_core(
-    phi:          torch.Tensor,           # (..., n_gen) current frame
-    delta_phi:    torch.Tensor,           # (..., n_gen) tangent step direction
-
-    *,
-    step_size:      float                  = 1.0,
-    eps:            float                  = 1e-6,
-    order:          int                    = 4,
-    mode:           str                    = "euclidean",
-    compact_blocks: bool                   = False,
-    trust_region:   Optional[float]        = 0.1,   # None / <=0 disables the trust-region clamp
-    max_norm:       Optional[float]        = 5.0,   # None / <=0 disables the max-norm clamp
-    generators:     Optional[torch.Tensor] = None,
-    gram_pinv_:     Optional[torch.Tensor] = None,
-    block_dims:     Optional[List[int]]    = None,
-    residual_max:   Optional[float]        = None,  # opt-in BCH-to-group-product residual gate
-) -> torch.Tensor:
-    r"""Shared retraction: scale -> trust-region clamp -> compose -> step-bounding norm cap.
-
-      update   = clamp_||.|| ( step_size * delta_phi , trust_region )
-      phi_new  = compose(phi, update; mode, order)
-      c        = max( max_norm , ||phi|| )                    (per row)
-      phi_new <- clamp_||.|| ( phi_new , c )
-    Trust region and cap are applied to the coordinate-vector norm.
-
-    The cap bounds the STEP, not the base point (audit 2026-09-23 #7). With the former cap
-    ``c = max_norm``, a frame already outside the ball was rescaled onto it at ANY step size, so
-    :math:`R_\phi(0) \ne \phi` and the retraction axiom (Absil, Mahony and Sepulchre 2008,
-    Def. 4.1.1) failed. With ``c = max(max_norm, ||phi||)`` a zero step returns ``phi`` (exactly
-    for the euclidean and compact-block BCH compositions; to the ``extract_phi`` projection
-    roundoff for the dense BCH composition), rows inside the ball keep ``dR(0) = id``, and a row
-    outside the ball can move tangentially or inward but never outward. The retractions have no
-    caller that relies on the former point projection: the only production caller is the E-step
-    phi retraction, and the public ``retract_glk``/``retract_son`` contracts (a step from inside the
-    ball saturates at ``max_norm``) are unchanged.
-    """
-    update = step_size * delta_phi
-    if trust_region is not None and trust_region > 0:
-        u_norm = update.norm(dim=-1, keepdim=True)
-        update = update * (trust_region / (u_norm + eps)).clamp(max=1.0)
-    if compact_blocks:
-        phi_new = compose_phi(
-            phi,
-            update,
-            generators,
-            order=order,
-            mode=mode,
-            gram_pinv_=gram_pinv_,
-            block_dims=block_dims,
-            compact_blocks=True,
-            residual_max=residual_max,
-        )
-    else:
-        phi_new = compose_phi(phi, update, generators, order=order, mode=mode,
-                              gram_pinv_=gram_pinv_, residual_max=residual_max)
-    if max_norm is not None and max_norm > 0:
-        n_norm = phi_new.norm(dim=-1, keepdim=True)
-        cap = phi.norm(dim=-1, keepdim=True).clamp(min=max_norm)          # max(max_norm, ||phi||)
-        outside = n_norm > cap
-        # The denominator is n_norm > cap > 0 on the rescaled rows and cap on the others, so both
-        # torch.where branches stay finite (no eps, whose bias would move a zero-step exterior row).
-        phi_new = torch.where(outside, phi_new * (cap / torch.where(outside, n_norm, cap)), phi_new)
-    return phi_new
-
-
-def retract_glk(
-    phi:          torch.Tensor,           # (..., n_gen) current GL(K) frame
-    delta_phi:    torch.Tensor,           # (..., n_gen) tangent step
-
-    generators:   torch.Tensor,           # (n_gen, K, K)
-
-    *,
-    step_size:      float                  = 1.0,
-    trust_region:   float                  = 0.1,    # tighter than SO(N): GL(K) is non-compact
-    max_norm:       float                  = 10.0,   # bounds singular values to ~[e^-5, e^5]
-    eps:            float                  = 1e-6,
-    order:          int                    = 4,
-    mode:           str                    = "euclidean",
-    compact_blocks: bool                   = False,
-    gram_pinv_:     Optional[torch.Tensor] = None,
-    block_dims:     Optional[List[int]]    = None,
-    residual_max:   Optional[float]        = None,   # opt-in BCH-to-group-product residual gate
-) -> torch.Tensor:
-    r"""GL(K) retraction (no det control here; the dispatcher applies it)."""
-    return _retract_core(
-        phi, delta_phi, step_size=step_size, trust_region=trust_region,
-        max_norm=max_norm, eps=eps, order=order, mode=mode,
-        compact_blocks=compact_blocks, generators=generators, gram_pinv_=gram_pinv_,
-        block_dims=block_dims, residual_max=residual_max,
-    )
-
-
-def retract_son(
-    phi:          torch.Tensor,           # (..., n_gen) current SO(N) frame
-    delta_phi:    torch.Tensor,           # (..., n_gen) tangent step
-
-    generators:   torch.Tensor,           # (n_gen, K, K) skew so(N) basis
-
-    *,
-    step_size:    float = 1.0,
-    trust_region: float = 0.3,            # compact group
-    max_norm:     float = math.pi,        # bounds principal angles
-    eps:          float = 1e-6,
-    order:        int   = 4,
-    mode:         str   = "euclidean",
-    gram_pinv_:   Optional[torch.Tensor] = None,
-    residual_max: Optional[float]        = None,   # opt-in BCH-to-group-product residual gate
-) -> torch.Tensor:
-    r"""SO(N) retraction. det(exp) = 1 automatic (skew generators)."""
-    return _retract_core(
-        phi, delta_phi, step_size=step_size, trust_region=trust_region,
-        max_norm=max_norm, eps=eps, order=order, mode=mode,
-        generators=generators, gram_pinv_=gram_pinv_, residual_max=residual_max,
-    )
-
-
 def _block_trace_vectors(
     generators: torch.Tensor,             # (n_gen, K, K)
     irrep_dims: List[int],                # block sizes; sum == K
@@ -906,34 +789,4 @@ def project_phi_to_slk(
         s = phi_c @ V.transpose(-1, -2)                       # (..., H)
         coeffs = s @ gram_pinv                                # (..., H) joint solve, not per-block
         out = phi_c - torch.einsum("...h,hg->...g", coeffs, V)
-    return out.to(phi.dtype)
-
-
-def clamp_phi_trace(
-    phi:        torch.Tensor,             # (..., n_gen)
-    generators: torch.Tensor,             # (n_gen, K, K)
-    irrep_dims: List[int],                # block sizes; sum == K
-
-    *,
-    trace_max:  float = 5.0,              # soft cap T on |tr(embed(phi)|block h)|
-) -> torch.Tensor:                        # (..., n_gen) with |s_h| <= T
-    r"""Soft per-block trace clamp: rescale only the trace component so |s_h| <= T,
-
-    bounding log|det(Omega_h)|. Off-trace (sl(K)) directions are untouched. Realizes the clamped
-    trace via the JOINT Gram solve ``delta = (s_clamped - s) (V V^T)^+`` so the tied gauge (coinciding
-    V_h) is corrected once, not n_heads times; reduces to ``(s_clamped - s)/||V_h||^2`` for an
-    orthogonal (untied) basis.
-
-    Runs in the same ``autocast(enabled=False)`` fp32 island as ``project_phi_to_slk`` (``linalg.pinv``
-    has no bf16/fp16 kernel, and the bound |s_h| <= T must hold in the precision it is asserted in).
-    The island is a no-op without AMP, so the default path is byte-identical.
-    """
-    with torch.amp.autocast(phi.device.type, enabled=False):
-        phi_c = phi.to(torch.promote_types(phi.dtype, torch.float32))   # bf16/fp16 -> fp32
-        V = _block_trace_vectors(generators, irrep_dims)      # (H, n_gen)
-        gram_pinv = torch.linalg.pinv(V @ V.transpose(-1, -2))   # (H, H); diag -> 1/||V_h||^2
-        s = phi_c @ V.transpose(-1, -2)                       # (..., H)
-        s_clamped = s.clamp(min=-trace_max, max=trace_max)
-        delta = (s_clamped - s) @ gram_pinv                   # (..., H) joint solve, not per-block
-        out = phi_c + torch.einsum("...h,hg->...g", delta, V)
     return out.to(phi.dtype)

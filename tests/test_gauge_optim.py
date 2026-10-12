@@ -22,7 +22,6 @@ def _make_optimizer(
     *,
     trust_radius=0.1,
     chart_max_norm=5.0,
-    bch_residual_max=1e-6,
     **kwargs,
 ):
     return GaugeManifoldAdamW(
@@ -30,7 +29,6 @@ def _make_optimizer(
         group,
         phi_group_trust_radius=trust_radius,
         phi_chart_max_norm=chart_max_norm,
-        phi_bch_residual_max=bch_residual_max,
         weight_decay=0.0,
         **kwargs,
     )
@@ -124,8 +122,6 @@ def test_default_adamw_one_step_matches_direct_torch_optimizer() -> None:
         ("trust_radius", float("nan")),
         ("chart_max_norm", -1.0),
         ("chart_max_norm", float("inf")),
-        ("bch_residual_max", 0.0),
-        ("bch_residual_max", float("nan")),
     ],
 )
 def test_direct_optimizer_rejects_invalid_phi_bounds(name, value):
@@ -212,7 +208,6 @@ def test_pullback_group_trust_scales_the_learning_rate_weighted_right_factor(mon
         learning_rate=0.5,
         trust_radius=0.25,
         chart_max_norm=5.0,
-        bch_residual_max=1e-6,
     )
 
     assert candidate.trust_scale.item() == pytest.approx(0.125)
@@ -245,7 +240,6 @@ def test_pullback_group_stage_passes_source_basis_and_registered_coordinate_layo
         learning_rate=0.0,
         trust_radius=0.25,
         chart_max_norm=5.0,
-        bch_residual_max=1e-6,
     )
 
     assert seen["generators"] is group.generators
@@ -274,7 +268,6 @@ def test_pullback_group_stage_normalizes_basis_for_registered_extension(device):
             learning_rate=0.0,
             trust_radius=0.25,
             chart_max_norm=5.0,
-            bch_residual_max=1e-6,
         )
     finally:
         for support_name in (
@@ -310,7 +303,6 @@ def test_pullback_group_chart_retraction_certifies_right_product_order(
         learning_rate=1.0,
         trust_radius=1.0,
         chart_max_norm=6.0,
-        bch_residual_max=1e-6,
     )
 
     factor_scale = candidate.trust_scale / torch.exp2(candidate.backtracking_reductions.double())
@@ -477,7 +469,6 @@ def test_pullback_group_candidate_rejects_chart_bound(monkeypatch):
         learning_rate=1.0,
         trust_radius=1.0,
         chart_max_norm=1.0,
-        bch_residual_max=1e-6,
     )
     assert candidate.rejected_rows.tolist() == [True]
     assert torch.equal(candidate.candidate_phi, phi)

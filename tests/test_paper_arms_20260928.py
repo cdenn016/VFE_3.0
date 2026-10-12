@@ -262,8 +262,8 @@ def test_unavailable_arms_when_code_is_missing(tmp_path: Path, caches: Path,
 
 
 def test_baseline_arms_match_the_protocol_when_the_baseline_exists(tmp_path: Path, caches: Path) -> None:
-    pytest.importorskip("vfe3.baseline")
-    pytest.importorskip("train_baseline")
+    import vfe3.baseline  # noqa: F401
+    import train_baseline  # noqa: F401
     base = pa.load_base("tiny", _write_base(tmp_path, _tiny_cfg()))
     plans = _plans(base)
     matched = plans["Matched context-processing parameters"]
@@ -396,8 +396,8 @@ def test_launch_trains_paired_seeds_skips_completed_and_writes_the_manifest(
 
 def test_compute_matched_arm_calibrates_the_ladder_and_applies_the_width_rule(
         tmp_path: Path, caches: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    pytest.importorskip("vfe3.baseline")
-    train_baseline = pytest.importorskip("train_baseline")
+    import vfe3.baseline  # noqa: F401
+    import train_baseline
 
     monkeypatch.setitem(pa.BUDGETS, "tiny", lambda cfg, dataset: {
         "max_steps": 4, "eval_interval": 2, "checkpoint_interval": 4})
@@ -452,7 +452,7 @@ def test_run_vfe_data_seed_alone_sets_the_training_batch_order(caches: Path) -> 
 def test_run_vfe_reproduces_the_launcher_run_bitwise(tmp_path: Path, caches: Path,
                                                      monkeypatch: pytest.MonkeyPatch) -> None:
     r"""The same config, seed and data seed through ``train_vfe3._run_once`` and :func:`run_vfe`."""
-    launcher = pytest.importorskip("train_vfe3")
+    import train_vfe3 as launcher
     from vfe3.experiment import run_vfe
 
     cfg = _tiny_cfg(vocab_size=V_WORD)
