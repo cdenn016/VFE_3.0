@@ -88,13 +88,8 @@ def test_unread_prior_and_cg_knobs_are_reported_inert() -> None:
 
 def test_closed_form_full_covariance_marks_sigma_max() -> None:
     closed_full = _cfg(relational_receiver_update="closed_form", family="gaussian_full",
-                       skip_belief_sigma_update=False, lambda_alpha_mode="constant")
+                       skip_belief_sigma_update=False, lambda_alpha_mode="state_dependent")
     assert "sigma_max" in closed_full.inactive_fields()
-
-
-def test_lambda_alpha_is_validated_in_every_alpha_mode() -> None:
-    with pytest.raises(ValueError, match="lambda_alpha"):
-        _cfg(lambda_alpha_mode="state_dependent", lambda_alpha=-1.0)
 
 
 def test_gauge_group_is_validated_against_the_registry() -> None:
@@ -108,7 +103,7 @@ def test_pure_path_report_labels_the_closed_form_update_and_reference_blocks() -
     from vfe3.run_artifacts import _pure_path_report
 
     closed = _cfg(relational_receiver_update="closed_form", family="gaussian_full",
-                  skip_belief_sigma_update=False, lambda_alpha_mode="constant")
+                  skip_belief_sigma_update=False, lambda_alpha_mode="state_dependent")
     toggles = _pure_path_report(closed, [])["config_toggles"]
     assert toggles["spd_retraction_route"] == "closed_form_natural_parameter"
     assert toggles["spd_retraction_exact"] is True

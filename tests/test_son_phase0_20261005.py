@@ -5,7 +5,9 @@ Pins, on CPU at tiny size:
 * equal-head goldens captured at 389413b before any Phase 0 edit (rewritten October 9, 2026 for the
   centered pair-KL GEMM, a float32 rounding-level change, under the CUDA interpreter's torch build; the four
   predictive routes rewritten October 12, 2026, same build, for the prior-anchored covariance floor f Sigma_p of
-  audit 2026-10-12 T5, which changes only their moment-matched sigma and the full route's loss and gradients) (block_glk K=4 H=2 and so_n
+  audit 2026-10-12 T5, which changes only their moment-matched sigma and the full route's loss and gradients;
+  the gradient routes rewritten October 12, 2026, same build, for the removal of the ambient_alignment receiver
+  law and of the constant alpha form of the test baseline) (block_glk K=4 H=2 and so_n
   [("l1", 2)] K=6 H=2 on four projected routes): initial state, forward beliefs, loss and every
   gradient stay bitwise identical (so_n reproduces them because l1 is the defining representation);
 * the canonical irrep basis: closed-form SO(3) spins of any order, deterministic, and a deterministic

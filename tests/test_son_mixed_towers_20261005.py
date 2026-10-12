@@ -276,10 +276,9 @@ def test_predictive_content_matches_the_per_head_sum() -> None:
 
 # ---------------------------------------------------------------- projected-gradient receiver
 
-@pytest.mark.parametrize("law", ["ambient_alignment", "channel_likelihood"])
-def test_full_link_receiver_matches_the_dense_reference(law: str) -> None:
+def test_full_link_receiver_matches_the_dense_reference() -> None:
     from vfe3.gradients.full_link import build_full_link_context
-    ops = _operators([3, 3, 5], readout_mode="full_link_update", receiver_law=law, receiver_noise=0.7)
+    ops = _operators([3, 3, 5], readout_mode="full_link_update", receiver_noise=0.7)
     U = _frames(SPEC, 11)
     frame = CanonicalFrameContext(U, torch.linalg.inv(U))
     g = torch.Generator().manual_seed(5)
@@ -289,7 +288,11 @@ def test_full_link_receiver_matches_the_dense_reference(law: str) -> None:
     sigma_p = torch.rand(1, 3, 11, generator=g, dtype=torch.float64) + 0.5
     lam = torch.tensor([1.0, 0.5, 2.0], dtype=torch.float64)
     context = build_full_link_context(mu, sigma, mu_p, sigma_p, frame, ops, lambda_beta=lam,
-                                      value=0.8, receiver_noise=0.7)
+                                      c0=0.8, receiver_noise=0.7)
+    # alpha*_i = c0/(b0 + KL(q_i||p_i)) at the snapshot, b0 = 1.
+    ratio = sigma / sigma_p
+    D = 0.5 * (ratio + (mu - mu_p) ** 2 / sigma_p - 1 - ratio.log()).sum(-1)       # (1, N)
+    alpha = 0.8 / (1.0 + D)
     T_runs, O_runs = ops.content_factor_runs()
     T, O = _per_head(T_runs), _per_head(O_runs)
     U_inv = torch.linalg.inv(U[0])
@@ -301,16 +304,10 @@ def test_full_link_receiver_matches_the_dense_reference(law: str) -> None:
         for h in range(3):
             for j in range(3):
                 w = lam[h] * context.beta[0, h, i, j]
-                if law == "channel_likelihood":
-                    R_inv = torch.linalg.inv(T[h] @ C[j] @ T[h].T + 0.7 * torch.eye(T[h].shape[0], dtype=torch.float64))
-                    P = P + w * O[h] @ R_inv @ O[h].T
-                    b = b + w * O[h] @ R_inv @ T[h] @ xi[j]
-                else:
-                    M = O[h] @ T[h]
-                    R_inv = torch.linalg.inv(M @ C[j] @ M.T + 0.7 * torch.eye(11, dtype=torch.float64))
-                    P = P + w * R_inv
-                    b = b + w * R_inv @ M @ xi[j]
-        prior = 0.8 * torch.diag(1.0 / sigma_p[0, i])
+                R_inv = torch.linalg.inv(T[h] @ C[j] @ T[h].T + 0.7 * torch.eye(T[h].shape[0], dtype=torch.float64))
+                P = P + w * O[h] @ R_inv @ O[h].T
+                b = b + w * O[h] @ R_inv @ T[h] @ xi[j]
+        prior = alpha[0, i] * torch.diag(1.0 / sigma_p[0, i])
         torch.testing.assert_close(context.Lambda[0, i], prior + U_inv[i].T @ P @ U_inv[i], atol=1e-10, rtol=1e-10)
         torch.testing.assert_close(context.eta[0, i], prior @ mu_p[0, i] + U_inv[i].T @ b, atol=1e-10, rtol=1e-10)
 

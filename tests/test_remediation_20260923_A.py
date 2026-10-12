@@ -32,7 +32,7 @@ _AUDITED_ROUTE = dict(
     gauge_transport="on", pos_phi="learned", use_block_mlp=True,
     block_mlp_mode="coordinate", block_mlp_covariance="passthrough", block_mlp_expansion=2,
     decode_coordinates="local", decode_unigram_prior=True,
-    decode_tau=0.01, lambda_beta=1.0, lambda_alpha_mode="constant",
+    decode_tau=0.01, lambda_beta=1.0, lambda_alpha_mode="state_dependent",
     transport_chart_max_norm=18.0, decode_av_precision="fp32",
     decode_ranking_fp64_escalation=False,
     skip_belief_sigma_update=False,

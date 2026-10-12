@@ -166,7 +166,7 @@ config: Dict[str, Any] = dict(
     #                Self Energy:
     #        Sum_i alpha_i * KL(q_i||p_i)
     ######################################
-    lambda_alpha_mode          = "state_dependent_per_coord",  # "constant" | "state_dependent" | "state_dependent_per_coord"
+    lambda_alpha_mode          = "state_dependent_per_coord",  # "state_dependent" | "state_dependent_per_coord"
 
     b0   = 1.0,                                # state-dependent alpha shape: alpha* = c0/(b0 + D)
     c0   = 1.0,                                 # state-dependent alpha shape (numerator)
@@ -192,7 +192,6 @@ config: Dict[str, Any] = dict(
     #  lambda_beta*Sum_i beta_ij * KL(q_i||Omega_ij q_j) + ...
     ##########################################################
 
-    lambda_alpha               = 1,          # constant self-coupling value
     lambda_beta                = 1.0,        # belief-coupling block weight (1.0 = pure F)
 
 
@@ -430,12 +429,6 @@ SEARCH_CONFIG: Dict[str, Any] = {
         
         
         
-        "lambda_alpha": {
-            "enabled": False, "bounds": None, "values": [0.0, 0.5, 1.0, 5.0],
-            "scale": "linear",
-            "requires": {"lambda_alpha_mode": "constant", "n_e_steps": 2},
-            "description": "Constant self-coupling value.",
-        },
         "lambda_beta": {
             "enabled": False, "bounds": [0.0, 5.0], "values": None, "scale": "linear",
             "requires": {},

@@ -43,7 +43,7 @@ def e_step_shared_kwargs(
     (list-valued) b0/c0 for the state-dependent self-coupling.
     """
     return dict(
-        value=cfg.lambda_alpha, kl_max=cfg.kl_max, eps=cfg.eps,
+        kl_max=cfg.kl_max, eps=cfg.eps,
         sigma_max=cfg.sigma_max, e_sigma_q_trust=cfg.e_sigma_q_trust,
         e_mu_q_trust=cfg.e_mu_q_trust,
         family=cfg.family, lambda_alpha_mode=cfg.lambda_alpha_mode,

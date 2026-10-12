@@ -61,7 +61,7 @@ def tiny_config(**overrides: object) -> VFE3Config:
     return _profile_tiny_config(**{
         "frame_pair_escalation_tol": 1e-4, "attention_mode": "projected_predictive",
         "attention_residual": False,
-        "predictive_covariance": "passthrough", "lambda_alpha_mode": "constant",
+        "predictive_covariance": "passthrough", "lambda_alpha_mode": "state_dependent",
         "mu_init_std": 0.02, "sigma_init": 1.0, "phi_scale": 0.01, **overrides,
     })
 
@@ -318,7 +318,7 @@ def _launcher(**overrides: object) -> VFE3Config:
         use_block_mlp=True, norm_type_block="layernorm",
         layernorm_affine=True, decode_mode="diagonal_chunked",
         decode_av_precision="fp32", decode_ranking_fp64_escalation=False,
-        lambda_alpha_mode="constant", mu_init_std=0.02, sigma_init=1.0, phi_scale=0.01,
+        lambda_alpha_mode="state_dependent", mu_init_std=0.02, sigma_init=1.0, phi_scale=0.01,
     )
     values.update(_LAUNCHER_TINY)
     values["frame_pair_escalation_tol"] = 1e-4

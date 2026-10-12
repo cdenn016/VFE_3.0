@@ -40,7 +40,7 @@ def _cfg(**overrides: Any) -> VFE3Config:
         e_q_mu_lr=0.2,
         e_q_sigma_lr=0.05,
         e_sigma_q_trust=5.0,
-        lambda_alpha_mode="constant",
+        lambda_alpha_mode="state_dependent",
         skip_belief_sigma_update=False,
     )
     values.update(overrides)
@@ -112,8 +112,9 @@ def test_frozen_context_is_built_once_per_layer_episode(
     assert len(contexts) == 2
     assert contexts[0] is not contexts[1]
     assert len(gradient_contexts) == 6
+    # Each iteration refreezes alpha at its iterate on the one built context: routing and profile are shared.
     for layer in range(2):
-        assert all(context is contexts[layer]
+        assert all(context.beta is contexts[layer].beta and context.profile is contexts[layer].profile
                    for context in gradient_contexts[3 * layer:3 * (layer + 1)])
         assert not torch.equal(receiver_means[3 * layer], receiver_means[3 * layer + 1])
     assert torch.isfinite(belief.mu).all() and torch.isfinite(belief.sigma).all()

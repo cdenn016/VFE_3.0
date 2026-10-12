@@ -325,7 +325,6 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     content_link_chart               = "exponential",        # "affine" Oh'=Oh | "first_order" Oh'=T^-1+Oh | "exponential" Oh'=T^-1+Oh phi_1(TOh)=e^{OhT}T^-1 
         
     relational_routing               = "gaussian_kl",           # "gaussian_kl" | "noisy_query" (noisy_query: projected_predictive only)
-    relational_receiver_law          = "channel_likelihood",  # "channel_likelihood" | "ambient_alignment" (projected_gradient only)
     relational_receiver_update       = "closed_form",         # "closed_form" (exact frozen-context update) | "euler" (Fisher step; reads e_q_mu_lr / e_q_sigma_lr / trusts) (projected_gradient only)
        
     predictive_readout               = "minimal_agent",     # "kernel" | "minimal_agent" (projected_predictive only)
@@ -337,7 +336,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     minimal_agent_channel_noise      = 1.0,         # initial channel noise n_h > 0
     predictive_covariance_floor      = 1e-4,        # moment_matched only: covariant floor floor * (tr C_i / K) I in reference coordinates
     relational_receiver_damping      = 1.0,         # closed_form only: rho in (0, 1]; 1 = the frozen minimizer    
-    relational_receiver_noise        = 1.0,         # channel floor nu I_d (channel_likelihood) | K-dim reference noise (ambient_alignment)
+    relational_receiver_noise        = 1.0,         # channel floor nu I_d, nu > 0 (projected_gradient only)
      
     #################################
     #     Optional Block MLP        #
@@ -417,8 +416,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #        Sum_i alpha_i * KL(q_i||p_i)
     ######################################
     
-    lambda_alpha_mode                = "state_dependent_per_coord",  # "constant" | "state_dependent" | "state_dependent_per_coord"
-    lambda_alpha                     = 1,          # constant self-coupling value
+    lambda_alpha_mode                = "state_dependent_per_coord",  # "state_dependent" | "state_dependent_per_coord"
   
     ########################################
     #     Attention Belief/Model Settings
@@ -587,7 +585,6 @@ SWEEP_ORDER: List[str] = [
    
    
  
-  # "lambda_alpha",
   # "lambda_beta",
    
   
@@ -859,18 +856,6 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
      },
 
 
-    "lambda_alpha": {
-        "description": "constant self-coupling value (lambda_alpha_mode=constant)",
-        # audit 2026-08-05: n_e_steps >= 2 is REQUIRED for this sweep to measure anything. At
-        # n_e_steps=1 forward_beliefs hands the E-step its own encode output as the prior, so
-        # q0 == p exactly and BOTH self-term derivatives are identically zero -- measured
-        # bit-identical logits at lambda_alpha 0.0 vs 7.5, i.e. seven identical runs. Same reason
-        # lambda_alpha_mode / b0 / c0 are inert at depth 1.
-        "param": "lambda_alpha", "values": [0, 0.5, 1, 5],
-        "requires": {"lambda_alpha_mode": "constant", "n_e_steps": 2},
-    },
-    
-    
     "lambda_beta": {
         "description": "belief-coupling block weight (1.0 = pure F)",
         "param": "lambda_beta", "range": [0.0, 5, 0.05],

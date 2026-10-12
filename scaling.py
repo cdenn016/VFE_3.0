@@ -232,7 +232,7 @@ config = dict(
     #                Self Energy:
     #        Sum_i alpha_i * KL(q_i||p_i)
     ######################################
-    lambda_alpha_mode          = "state_dependent_per_coord",  # "constant" | "state_dependent" | "state_dependent_per_coord"
+    lambda_alpha_mode          = "state_dependent_per_coord",  # "state_dependent" | "state_dependent_per_coord"
 
     b0   = 1.0,                                # state-dependent alpha shape: alpha* = c0/(b0 + D)
     c0   = 1.0,                                 # state-dependent alpha shape (numerator)
@@ -258,7 +258,6 @@ config = dict(
     #  lambda_beta*Sum_i beta_ij * KL(q_i||Omega_ij q_j) + ...
     ##########################################################
 
-    lambda_alpha               = 1,          # constant self-coupling value
     lambda_beta                = 1.0,        # belief-coupling block weight (1.0 = pure F)
 
 

@@ -281,7 +281,7 @@ def test_cost_model_declares_projected_estep_flops_unavailable():
 def _pure_ns(**over):
     r"""SimpleNamespace with every attribute _pure_path_report reads, at the pure values."""
     base = dict(
-        lambda_alpha_mode="constant",
+        lambda_alpha_mode="state_dependent",
         decode_mode="diagonal_chunked", decode_coordinates="reference", encode_mode="per_token",
         lambda_beta=1.0,
         gauge_transport="on", rope_mode="none",
@@ -370,7 +370,7 @@ def _finalize_ns(**over):
         # numeric-path attrs (summary / provenance / cost model / pure-path report)
         seed=0, max_steps=2, decode_mode="full_chunked",
         min_lr_frac=0.0,
-        lambda_alpha_mode="constant",
+        lambda_alpha_mode="state_dependent",
         lambda_beta=1.0,
         gauge_transport="on", rope_mode="none",
         skip_belief_sigma_update=False,

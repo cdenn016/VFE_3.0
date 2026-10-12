@@ -308,7 +308,6 @@ class VFEModel(nn.Module):
                                 attention_residual=cfg.attention_residual and predictive and not minimal_agent,
                                 output_init_scale=output_init_scale,
                                 receiver_noise=cfg.relational_receiver_noise,
-                                receiver_law=cfg.relational_receiver_law,
                                 receiver_update=cfg.relational_receiver_update,
                                 receiver_damping=cfg.relational_receiver_damping,
                                 receiver_measurement=cfg.relational_receiver_measurement,
@@ -1368,8 +1367,7 @@ class VFEModel(nn.Module):
             # is DETACHED: by the alpha-envelope (alpha* is the stationary point of alpha*D + R(alpha),
             # so d/dalpha[alpha*D + R] = 0 there), the M-step gradient of the F self-term w.r.t. the
             # prior is alpha_i* dD/dtheta with alpha_i* held fixed -- detaching it (and dropping R)
-            # is exact for the closed-form forms (constant/state_dependent/state_dependent_per_coord).
-            # At constant alpha=1.0 (the default) alpha_i==1, byte-identical to the prior mean-D form.
+            # is exact for the closed-form forms (state_dependent/state_dependent_per_coord).
             # Grad-connected through D (no detach on D), so it backprops to the learned prior tables,
             # like mass_phi. Capturing the final-block input preserves the exact stack recurrence at
             # every depth; at n_layers=1 it is the encode-time prior, preserving the existing path.
@@ -1386,7 +1384,7 @@ class VFEModel(nn.Module):
                 kl_max=cfg.kl_max, eps=cfg.eps, lambda_alpha_mode=cfg.lambda_alpha_mode,
             )
             alpha_sc, _ = self_coupling_alpha(                  # SAME form as the E-step / diagnostics
-                self_div, mode=cfg.lambda_alpha_mode, value=cfg.lambda_alpha, b0=_as_coeff(cfg.b0, cap["out"].mu.device), c0=_as_coeff(cfg.c0, cap["out"].mu.device),
+                self_div, mode=cfg.lambda_alpha_mode, b0=_as_coeff(cfg.b0, cap["out"].mu.device), c0=_as_coeff(cfg.c0, cap["out"].mu.device),
             )
             coupling = alpha_sc.detach() * self_div            # alpha_i^(k)* D^(k) (envelope: alpha* fixed)
             if alpha_is_per_coord(cfg.lambda_alpha_mode):
@@ -2063,8 +2061,8 @@ class VFEModel(nn.Module):
         ``learn_attention_temperature``; 1 under the minimal agent, whose exact posterior has no
         :math:`\kappa_\beta`; audit 2026-10-10 round 2, item 31). :math:`D^h_{ii} = 0` and :math:`B_{ii} = 0`, so
         :math:`\beta^*` peaks on the diagonal of every row by construction. The self term is the registered
-        form of the M-step self-coupling (``self_coupling_alpha``, its :math:`R(\alpha)` zero under
-        ``constant``, the same ``kl_max``) evaluated at the layer's input belief; the M-step term itself reads
+        form of the M-step self-coupling (``self_coupling_alpha`` with its :math:`R(\alpha)`, the same
+        ``kl_max``) evaluated at the layer's input belief; the M-step term itself reads
         the final block's converged output against its prior, which the output evaluation below matches at the
         last layer (item 27). The columns are per-token means over the batch: ``self_coupling``,
         ``self_divergence`` (the unweighted :math:`D(q_i\|p_i)`), ``belief_coupling`` and
@@ -2103,7 +2101,7 @@ class VFEModel(nn.Module):
                 fam(mu_p.double(), sigma_p.double()),
                 kl_max=cfg.kl_max, eps=cfg.eps, lambda_alpha_mode=cfg.lambda_alpha_mode)
             alpha, alpha_reg = self_coupling_alpha(
-                self_div, mode=cfg.lambda_alpha_mode, value=cfg.lambda_alpha,
+                self_div, mode=cfg.lambda_alpha_mode,
                 b0=_as_coeff(cfg.b0, device), c0=_as_coeff(cfg.c0, device))
             self_row, raw_row = alpha * self_div + alpha_reg, self_div
             if alpha_is_per_coord(cfg.lambda_alpha_mode):

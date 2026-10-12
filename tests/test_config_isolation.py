@@ -13,7 +13,7 @@ from vfe3.config import VFE3Config
 @pytest.mark.parametrize("changes", [
     dict(family="gaussian_full", decode_mode="full_chunked", gauge_transport="off",
          predictive_covariance="passthrough", sigma_init=0.4, pos_phi="frozen"),
-    dict(relational_receiver_update="closed_form", skip_belief_sigma_update=False, lambda_alpha_mode="constant",
+    dict(relational_receiver_update="closed_form", skip_belief_sigma_update=False, lambda_alpha_mode="state_dependent",
          m_decode_mu_lr=None, m_decode_sigma_lr=None, m_pos_phi_lr=None,
          projected_factorization="gram_certified", phi_weight_decay=0.0),
 ])

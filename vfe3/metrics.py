@@ -1925,8 +1925,7 @@ def self_coupling_profile(
     ``self_divergence_for_alpha`` and ``self_coupling_alpha`` already produce these inside
     model.diagnostics before they are summed into the scalar ``self_coupling``; this returns the
     per-token vectors for the self-divergence violin. Per-coordinate inputs (N, K) are summed over
-    the coordinate axis for the per-token totals while the raw arrays are kept. (alpha_i is a flat
-    scalar on the default constant-alpha path; only informative under a state-dependent alpha.)
+    the coordinate axis for the per-token totals while the raw arrays are kept.
     """
     div_tok = self_div.sum(dim=-1) if self_div.dim() > 1 else self_div
     coupling_tok = (alpha * self_div)

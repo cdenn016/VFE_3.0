@@ -750,6 +750,8 @@ def projected_gauge_equivariance(
     :math:`\max|x'-x|/\max|x|`, which should sit at float64 roundoff (``unit_roundoff``) times the
     conditioning of the frames and covariances.
     """
+    from dataclasses import replace
+
     from vfe3.alpha_i import alpha_is_per_coord, self_coupling_alpha
     from vfe3.families.gaussian import FullGaussian
     from vfe3.free_energy import self_divergence_for_alpha
@@ -769,11 +771,10 @@ def projected_gauge_equivariance(
     log_prior = None if log_prior is None else log_prior.double()
     tau = attention_tau(_as_coeff(cfg.kappa_beta, tokens.device), model._belief_score_irrep_dims(),
                         device=tokens.device)
-    # The receiver's prior moves with the belief (mu_p = mu, Sigma_p = Sigma), so D(q||p) = 0 and a
-    # state-dependent alpha* = c0/(b0 + D) is the constant c0/b0 at this snapshot.
+    # The receiver's prior moves with the belief (mu_p = mu, Sigma_p = Sigma), so D(q||p) = 0 and
+    # alpha* = c0/(b0 + D) is the constant c0/b0 at this snapshot.
     receiver = any(ops.readout_mode != "predictive_content" for ops in model.relational_operators_by_layer)
-    alpha = float(cfg.lambda_alpha)
-    if receiver and cfg.lambda_alpha_mode != "constant":
+    if receiver:
         ratio = torch.as_tensor(cfg.c0, dtype=torch.float64) / torch.as_tensor(cfg.b0, dtype=torch.float64)
         if bool((ratio != ratio.flatten()[0]).any()):
             raise ValueError("the gauge-equivariance witness needs a coordinate-uniform c0/b0: a "
@@ -815,7 +816,7 @@ def projected_gauge_equivariance(
             FullGaussian(mu, sigma), FullGaussian(mu_p, sigma_p),
             kl_max=cfg.kl_max, eps=cfg.eps, lambda_alpha_mode=cfg.lambda_alpha_mode)
         alpha_i, regularizer = self_coupling_alpha(
-            div, mode=cfg.lambda_alpha_mode, value=cfg.lambda_alpha, b0=b0, c0=c0)
+            div, mode=cfg.lambda_alpha_mode, b0=b0, c0=c0)
         term = alpha_i * div + regularizer
         return term.sum(dim=-1) if alpha_is_per_coord(cfg.lambda_alpha_mode) else term
 
@@ -832,10 +833,13 @@ def projected_gauge_equivariance(
             out = {"readout_mean": (U_v_inv @ mean.unsqueeze(-1)).squeeze(-1),
                    "readout_covariance": U_v_inv @ cov @ U_v_inv.transpose(-1, -2)}
         else:
-            context = build_full_link_context(
+            # The scalar form with (b0, c0) = (1, c0/b0) gives alpha* = c0/b0 at D = 0 on every family; the
+            # profile is dropped, so the witness reads the receiver energy frozen at that alpha.
+            context = replace(build_full_link_context(
                 mu, sigma, mu, sigma, frame, ops, tau=tau, lambda_beta=cfg.lambda_beta,
-                value=alpha, receiver_noise=ops.receiver_noise,
-                kl_max=cfg.kl_max, log_prior=log_prior, value_frame=value_frame, capture=capture)
+                receiver_noise=ops.receiver_noise,
+                kl_max=cfg.kl_max, log_prior=log_prior, value_frame=value_frame, capture=capture,
+                lambda_alpha_mode="state_dependent", b0=1.0, c0=alpha), profile=None)
             force, _ = full_link_gradients(mu, sigma, context)                  # (1, N, K)
             new_mu, new_sigma = full_link_minimizer(
                 mu, sigma, context, damping=ops.receiver_damping, sigma_max=None)

@@ -138,8 +138,7 @@ config = dict(
     tie_comparison_maps              = False,           # S_K := S_Q (kernel readout): D_ii = 0, flat-alignment routing
         
     relational_routing               = "gaussian_kl",           # "gaussian_kl" | "noisy_query" | "noisy_key" | "mean_distance" (noisy_key: kernel readout, temperature 1)
-    relational_receiver_law          = "channel_likelihood",  # "channel_likelihood" | "ambient_alignment" (projected_gradient only)
-    relational_receiver_measurement  = "adjoint",               # "adjoint" O'^T | "inverse" O'^-1, the dual measurement (channel_likelihood only)
+    relational_receiver_measurement  = "adjoint",               # "inverse" O'^-1, the dual measurement (VFE3Config default) | "adjoint" O'^T (projected_gradient only)
     relational_receiver_update       = "closed_form",           # "closed_form" (exact frozen-context update) | "closed_form_profiled" (state-dependent alpha: the profiled stationary point) | "euler" (Fisher step; reads e_q_mu_lr / e_q_sigma_lr / trusts) (projected_gradient only)
        
     predictive_readout               = "minimal_agent",     # "kernel" | "minimal_agent" (projected_predictive only)
@@ -155,7 +154,7 @@ config = dict(
     predictive_covariance_floor      = 1e-4,        # moment_matched / spread_corrected only: floor * Sigma_p (token's local prior covariance), reference-invariant
     diagnose_agent_elbo              = False,       # True | False: per-layer ELBO, evidence and gap at eval (minimal_agent, prototype_agents); never in the loss
     relational_receiver_damping      = 1.0,         # closed_form only: rho in (0, 1]; 1 = the frozen minimizer    
-    relational_receiver_noise        = 1.0,         # channel floor nu I_d (channel_likelihood) | K-dim reference noise (ambient_alignment)
+    relational_receiver_noise        = 1.0,         # channel floor nu I_d, nu > 0 (projected_gradient only)
      
     #################################
     #     Optional Block MLP        #
@@ -241,8 +240,7 @@ config = dict(
     #        Sum_i alpha_i * KL(q_i||p_i)
     ######################################
     
-    lambda_alpha_mode                = "state_dependent_per_coord",  # "constant" | "state_dependent" | "state_dependent_per_coord"
-    lambda_alpha                     = 1,          # constant self-coupling value
+    lambda_alpha_mode                = "state_dependent_per_coord",  # "state_dependent" | "state_dependent_per_coord"
   
     ########################################
     #     Attention Belief/Model Settings
@@ -371,7 +369,7 @@ def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int,
         f" decoder M-LRs: {_fmt_decode_lrs(cfg)}",
         f" auxiliary M-LRs: "
         f"block_mlp={_fmt_mixer_lr(cfg.m_block_mlp_lr, cfg.m_p_mu_lr)}",
-        f" VFE: lambda_alpha={cfg.lambda_alpha}  kappa_beta={cfg.kappa_beta}  "
+        f" VFE: lambda_alpha_mode={cfg.lambda_alpha_mode}  kappa_beta={cfg.kappa_beta}  "
         f"tau={_fmt_tau(cfg, model)}  mass_phi={cfg.mass_phi}",
         f" seed={cfg.seed}",
         bar,

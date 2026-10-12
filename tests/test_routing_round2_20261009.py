@@ -136,7 +136,6 @@ def test_kl_max_reference_is_keyword_required() -> None:
 
     values = config_values()
     required = dict(attention_residual=False, predictive_covariance="passthrough",
-                    receiver_law=values["relational_receiver_law"],
                     receiver_update=values["relational_receiver_update"],
                     content_link_chart=values["content_link_chart"],
                     minimal_agent_inference=values["minimal_agent_inference"],

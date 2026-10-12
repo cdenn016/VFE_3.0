@@ -4838,7 +4838,7 @@ def train(
                 "val_excluded_targets": (last_val["excluded_targets"] if do_eval else float("nan")),
                 "attn_entropy":       d["attn_entropy"],
                 "self_coupling":      d["self_coupling"],     # alpha-regularized F self-term alpha_i D + R(alpha_i)
-                "self_divergence":    d["self_divergence"],   # raw D(q_i||p_i) drift; == self_coupling only at lambda_alpha_mode='constant'
+                "self_divergence":    d["self_divergence"],   # raw D(q_i||p_i) drift, unweighted by alpha_i and without R(alpha_i)
                 "belief_coupling":    d["belief_coupling"],
                 "attention_entropy":  d["attention_entropy"],
                 "inner_alignment_energy_total": d["total"],
@@ -5443,7 +5443,7 @@ def _banner(
         *dead_line,
         f" M-LRs: {_fmt_table_lrs(cfg)}  phi={cfg.m_phi_lr}",
         f" decoder M-LRs: {_fmt_decode_lrs(cfg)}",
-        f" VFE: lambda_alpha={cfg.lambda_alpha}  kappa_beta={cfg.kappa_beta}  "
+        f" VFE: lambda_alpha_mode={cfg.lambda_alpha_mode}  kappa_beta={cfg.kappa_beta}  "
         f"tau={_fmt_tau(cfg, model)}  mass_phi={cfg.mass_phi}",
         f" seed={cfg.seed}",
         bar,

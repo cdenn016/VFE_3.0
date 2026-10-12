@@ -20,7 +20,6 @@ from vfe3.gradients.full_link import (
 from vfe3.inference.e_step import e_step
 
 NOISE, HEADS, B0, C0 = .7, (.6, 1.3), .8, 1.7
-LAWS = ("ambient_alignment", "channel_likelihood")
 # (b0, c0): the default pair, a weak regularizer (h near c0/b0 = 60, large alpha moves) and a strong one.
 COEFFICIENTS = ((B0, C0), (.05, 3.), (5., .2))
 
@@ -35,39 +34,38 @@ def _single_cpu_thread() -> Any:
         torch.set_num_threads(previous)
 
 
-def _setup(law: str, full: bool, update: str) -> tuple:
+def _setup(full: bool, update: str) -> tuple:
     mu, sigma, mu_p, sigma_p, frame, ops, prior = _fixture(full=full)
     ops.readout_mode = "full_link_update"
-    ops.receiver_law, ops.receiver_update = law, update
+    ops.receiver_update = update
     r_mu, r_sigma = mu.detach() * .7 - .1, sigma.detach() * 1.3
     if full:
         r_sigma = r_sigma + .05 * torch.eye(4, dtype=mu.dtype)
     return r_mu, r_sigma, mu_p, sigma_p, frame, ops, prior
 
 
-def _run(law: str, full: bool, update: str, n_iter: int, *, b0: float = B0, c0: float = C0,
+def _run(full: bool, update: str, n_iter: int, *, b0: float = B0, c0: float = C0,
          mode: str = "state_dependent", damping: float = 1.0, sigma_max: Any = None,
          skip_sigma: bool = False, inputs: Any = None, record: Any = None) -> tuple:
-    r_mu, r_sigma, mu_p, sigma_p, frame, ops, prior = _setup(law, full, update)
+    r_mu, r_sigma, mu_p, sigma_p, frame, ops, prior = _setup(full, update)
     ops.receiver_damping = damping
     if inputs is not None:
         r_mu, r_sigma, mu_p, sigma_p = inputs
     capture: dict = {}
     out = e_step(BeliefState(r_mu, r_sigma, torch.zeros(1, 3, 2, dtype=r_mu.dtype)), mu_p, sigma_p, None,
                  log_prior=prior, relational_operators=ops, relational_frame=frame, relational_capture=capture,
-                 state_record=record, n_iter=n_iter, sigma_max=sigma_max, value=.4,
+                 state_record=record, n_iter=n_iter, sigma_max=sigma_max,
                  skip_belief_sigma_update=skip_sigma, family="gaussian_full" if full else "gaussian_diagonal",
                  lambda_beta=torch.tensor(HEADS, dtype=r_mu.dtype), lambda_alpha_mode=mode, b0=b0, c0=c0)
     return out, capture
 
 
-@pytest.mark.parametrize("law", LAWS)
 @pytest.mark.parametrize("full", [False, True])
 @pytest.mark.parametrize(("b0", "c0"), COEFFICIENTS)
-def test_one_profiled_step_is_the_limit_of_iterated_closed_form(law: str, full: bool, b0: float, c0: float) -> None:
-    profiled, capture = _run(law, full, "closed_form_profiled", 1, b0=b0, c0=c0)
-    iterated, _ = _run(law, full, "closed_form", 400, b0=b0, c0=c0)
-    one_step, _ = _run(law, full, "closed_form", 1, b0=b0, c0=c0)
+def test_one_profiled_step_is_the_limit_of_iterated_closed_form(full: bool, b0: float, c0: float) -> None:
+    profiled, capture = _run(full, "closed_form_profiled", 1, b0=b0, c0=c0)
+    iterated, _ = _run(full, "closed_form", 400, b0=b0, c0=c0)
+    one_step, _ = _run(full, "closed_form", 1, b0=b0, c0=c0)
     torch.testing.assert_close(profiled.mu, iterated.mu, atol=1e-12, rtol=0)
     torch.testing.assert_close(profiled.sigma, iterated.sigma, atol=1e-12, rtol=0)
     assert float((profiled.mu - one_step.mu).abs().max()) > 1e-3        # the solve goes beyond one MM step
@@ -78,10 +76,9 @@ def test_one_profiled_step_is_the_limit_of_iterated_closed_form(law: str, full: 
     assert float(capture["relational_receiver_profiled_residual"]) < 1e-12 * c0 / b0
 
 
-@pytest.mark.parametrize("law", LAWS)
 @pytest.mark.parametrize("full", [False, True])
-def test_returned_state_is_the_profiled_stationary_point(law: str, full: bool) -> None:
-    out, capture = _run(law, full, "closed_form_profiled", 1)
+def test_returned_state_is_the_profiled_stationary_point(full: bool) -> None:
+    out, capture = _run(full, "closed_form_profiled", 1)
     ctx = capture["full_link_context"]
     mu, sigma = out.mu.detach(), out.sigma.detach()
     # alpha = c0/(b0 + D(q)) at the returned q: the closed form frozen there reproduces q ...
@@ -92,7 +89,7 @@ def test_returned_state_is_the_profiled_stationary_point(law: str, full: bool) -
     g_mu, g_sigma = full_link_gradients(mu, sigma, full_link_context_at(ctx, mu, sigma))
     assert float(g_mu.abs().max()) < 1e-12 and float(g_sigma.abs().max()) < 1e-12
     # The root equals alpha*(q) of the returned state to rounding.
-    r_mu, r_sigma, *_ = _setup(law, full, "closed_form_profiled")
+    r_mu, r_sigma, *_ = _setup(full, "closed_form_profiled")
     curve = full_link._divergence_curve(ctx.profile, r_mu, r_sigma, True, 1e-6, None)
     a0 = C0 / (B0 + self_coupling_divergence(r_mu, r_sigma, ctx.profile))
     root, *_ = full_link._profiled_root(curve, a0, B0, C0)
@@ -101,24 +98,14 @@ def test_returned_state_is_the_profiled_stationary_point(law: str, full: bool) -
 
 
 @pytest.mark.parametrize("full", [False, True])
-@pytest.mark.parametrize("damping", [1.0, .6])
-def test_constant_alpha_is_bitwise_closed_form(full: bool, damping: float) -> None:
-    for law in LAWS:
-        closed, _ = _run(law, full, "closed_form", 3, mode="constant", damping=damping)
-        profiled, _ = _run(law, full, "closed_form_profiled", 3, mode="constant", damping=damping)
-        assert torch.equal(closed.mu, profiled.mu) and torch.equal(closed.sigma, profiled.sigma)
-
-
-@pytest.mark.parametrize("law", LAWS)
-@pytest.mark.parametrize("full", [False, True])
-def test_implicit_gradient_matches_central_differences(law: str, full: bool, monkeypatch: Any) -> None:
-    r_mu, r_sigma, mu_p, sigma_p, *_ = _setup(law, full, "closed_form_profiled")
+def test_implicit_gradient_matches_central_differences(full: bool, monkeypatch: Any) -> None:
+    r_mu, r_sigma, mu_p, sigma_p, *_ = _setup(full, "closed_form_profiled")
     weights = torch.linspace(-1., 1., r_mu.numel(), dtype=r_mu.dtype).reshape(r_mu.shape)
 
     def loss(source_mu: torch.Tensor, prior_mu: torch.Tensor, prior_shift: torch.Tensor) -> torch.Tensor:
         # The prior covariance moves along its diagonal, a symmetric direction for the full family.
         prior_sigma = sigma_p + (torch.diag_embed(prior_shift) if full else prior_shift)
-        out, _ = _run(law, full, "closed_form_profiled", 1, inputs=(source_mu, r_sigma, prior_mu, prior_sigma))
+        out, _ = _run(full, "closed_form_profiled", 1, inputs=(source_mu, r_sigma, prior_mu, prior_sigma))
         sigma = out.sigma if not full else out.sigma.diagonal(dim1=-2, dim2=-1)
         return (weights * out.mu).sum() + (weights.flip(-1) * sigma).sum()
 
@@ -132,8 +119,8 @@ def test_implicit_gradient_matches_central_differences(law: str, full: bool, mon
 @pytest.mark.parametrize("full", [False, True])
 def test_kept_covariance_and_diagonal_clamp_match_iterated_closed_form(full: bool) -> None:
     for kwargs in ({"skip_sigma": True}, {"sigma_max": .9} if not full else {"skip_sigma": True, "b0": .05}):
-        profiled, _ = _run("channel_likelihood", full, "closed_form_profiled", 1, **kwargs)
-        iterated, _ = _run("channel_likelihood", full, "closed_form", 400, **kwargs)
+        profiled, _ = _run(full, "closed_form_profiled", 1, **kwargs)
+        iterated, _ = _run(full, "closed_form", 400, **kwargs)
         torch.testing.assert_close(profiled.mu, iterated.mu, atol=1e-12, rtol=0)
         torch.testing.assert_close(profiled.sigma, iterated.sigma, atol=1e-12, rtol=0)
         if "sigma_max" in kwargs:
@@ -142,22 +129,22 @@ def test_kept_covariance_and_diagonal_clamp_match_iterated_closed_form(full: boo
 
 @pytest.mark.parametrize("full", [False, True])
 def test_future_tokens_leave_earlier_receivers_bitwise_unchanged(full: bool) -> None:
-    r_mu, r_sigma, mu_p, sigma_p, *_ = _setup("ambient_alignment", full, "closed_form_profiled")
-    first, _ = _run("ambient_alignment", full, "closed_form_profiled", 2, inputs=(r_mu, r_sigma, mu_p, sigma_p))
+    r_mu, r_sigma, mu_p, sigma_p, *_ = _setup(full, "closed_form_profiled")
+    first, _ = _run(full, "closed_form_profiled", 2, inputs=(r_mu, r_sigma, mu_p, sigma_p))
     changed_mu, changed_sigma = r_mu.clone(), r_sigma.clone()
     changed_mu[0, 2] += 3.
     changed_sigma[0, 2] *= 2.
-    second, _ = _run("ambient_alignment", full, "closed_form_profiled", 2,
+    second, _ = _run(full, "closed_form_profiled", 2,
                      inputs=(changed_mu, changed_sigma, mu_p, sigma_p))
     assert torch.equal(first.mu[0, :2], second.mu[0, :2]) and torch.equal(first.sigma[0, :2], second.sigma[0, :2])
     assert not torch.equal(first.mu[0, 2], second.mu[0, 2])
 
 
 def test_damping_interpolates_toward_the_profiled_point() -> None:
-    target, _ = _run("channel_likelihood", True, "closed_form_profiled", 1)
-    damped, capture = _run("channel_likelihood", True, "closed_form_profiled", 1, damping=.5)
+    target, _ = _run(True, "closed_form_profiled", 1)
+    damped, capture = _run(True, "closed_form_profiled", 1, damping=.5)
     ctx = capture["full_link_context"]
-    r_mu, r_sigma, *_ = _setup("channel_likelihood", True, "closed_form_profiled")
+    r_mu, r_sigma, *_ = _setup(True, "closed_form_profiled")
     # rho = 1/2 in natural parameters: J = (Sigma_0^{-1} + Sigma_r^{-1})/2, h = (J_0 mu_0 + J_r mu_r)/2.
     J0, Jr = torch.linalg.inv(r_sigma), torch.linalg.inv(target.sigma)
     J = .5 * (J0 + Jr)
@@ -169,7 +156,7 @@ def test_damping_interpolates_toward_the_profiled_point() -> None:
 
 def test_per_coordinate_alpha_is_refused() -> None:
     with pytest.raises(ValueError, match="state_dependent"):
-        _run("channel_likelihood", False, "closed_form_profiled", 1, mode="state_dependent_per_coord")
+        _run(False, "closed_form_profiled", 1, mode="state_dependent_per_coord")
     with pytest.raises(ValueError, match="closed_form_profiled"):
         _cfg(relational_receiver_update="closed_form_profiled", lambda_alpha_mode="state_dependent_per_coord")
 
@@ -184,10 +171,10 @@ def test_config_accepts_the_profiled_update_and_marks_euler_controls_inert() -> 
 
 
 def _single_term_curve(Q: float) -> full_link._DivergenceCurve:
-    r"""K = 1, l = 0, m = 0: D(a) = Q/a^2, so h(a) = c0 a^2/(b0 a^2 + Q)."""
+    r"""K = 1, l = 0: D(a) = Q/a^2, so h(a) = c0 a^2/(b0 a^2 + Q)."""
     f64 = torch.float64
     return full_link._DivergenceCurve(
-        torch.zeros(3, 1, dtype=f64), torch.full((3, 1), 2 * Q, dtype=f64), torch.zeros(3, 1, dtype=f64),
+        torch.zeros(3, 1, dtype=f64), torch.full((3, 1), 2 * Q, dtype=f64),
         "fixed", torch.zeros(3, dtype=f64), None, None, 1e-6, None)
 
 
@@ -208,12 +195,11 @@ def test_random_curves_reach_the_mm_limit() -> None:
     f64, n, K = torch.float64, 400, 3
     l = torch.rand(n, K, dtype=f64, generator=generator).pow(3) * 2
     r2 = torch.rand(n, K, dtype=f64, generator=generator).pow(2) * torch.rand(n, 1, dtype=f64, generator=generator) * 20
-    mass = torch.rand(n, 1, dtype=f64, generator=generator) * (torch.rand(n, 1, generator=generator) < .5)
     b0 = torch.rand(n, dtype=f64, generator=generator) * .5 + .02
     c0 = torch.rand(n, dtype=f64, generator=generator) * 4 + .1
     P = torch.rand(n, K, dtype=f64, generator=generator) + .2
-    curves = (full_link._DivergenceCurve(l, r2, mass, "full", torch.zeros(n, dtype=f64), None, None, 1e-6, None),
-              full_link._DivergenceCurve(l, r2, mass, "diagonal", -P.log().sum(-1) - K, l, P, 1e-6, 5.))
+    curves = (full_link._DivergenceCurve(l, r2, "full", torch.zeros(n, dtype=f64), None, None, 1e-6, None),
+              full_link._DivergenceCurve(l, r2, "diagonal", -P.log().sum(-1) - K, l, P, 1e-6, 5.))
     multiple = 0
     for curve in curves:
         a0 = (c0 / b0) * torch.rand(n, dtype=f64, generator=generator)
