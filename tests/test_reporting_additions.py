@@ -129,7 +129,7 @@ def test_dashboard_drops_absent_and_empty():
 
 def test_save_figures_emits_dashboards(tmp_path):
     torch.manual_seed(0)
-    cfg = test_config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=2, batch_size=2)
+    cfg = test_config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=2, warmup_steps=2, batch_size=2)
     model = VFEModel(cfg).to(DEVICE)
     art = RunArtifacts(str(tmp_path), cfg, model, dataset="synthetic", device=str(DEVICE))
     keys = ("holonomy_wilson", "cocycle_residual", "fisher_trace_mean", "belief_cond_p95",
@@ -388,7 +388,7 @@ def _finalize_ns(**over):
 
 def test_finalize_run_forwards_disabled_embedding_policy_to_figure_driver(tmp_path, monkeypatch):
     torch.manual_seed(0)
-    real_cfg = test_config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=2,
+    real_cfg = test_config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=2, warmup_steps=2,
                           batch_size=2)
     model = VFEModel(real_cfg).to(DEVICE)
     art = RunArtifacts(str(tmp_path), real_cfg, model, dataset="synthetic", device=str(DEVICE))
@@ -404,7 +404,7 @@ def test_finalize_run_forwards_disabled_embedding_policy_to_figure_driver(tmp_pa
 
 def test_finalize_run_forwards_enabled_embedding_policy_to_figure_driver(tmp_path, monkeypatch):
     torch.manual_seed(0)
-    real_cfg = test_config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=2,
+    real_cfg = test_config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=2, warmup_steps=2,
                           batch_size=2)
     model = VFEModel(real_cfg).to(DEVICE)
     art = RunArtifacts(str(tmp_path), real_cfg, model, dataset="synthetic", device=str(DEVICE))
@@ -422,7 +422,7 @@ def test_finalize_run_forwards_enabled_embedding_policy_to_figure_driver(tmp_pat
 
 def test_train_logs_held_out_geometry(tmp_path):
     torch.manual_seed(0)
-    cfg = test_config(vocab_size=32, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=4,
+    cfg = test_config(vocab_size=32, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=4, warmup_steps=4,
                      log_interval=2, eval_interval=2, batch_size=2)
     model = VFEModel(cfg).to(DEVICE)
     batches = [(torch.randint(0, 32, (2, 8), device=DEVICE),

@@ -83,7 +83,7 @@ def _projected_extract_model(**overrides: object) -> VFEModel:
         encode_mode="per_token",
         lambda_alpha_mode="state_dependent",
         pos_phi="learned",
-        max_steps=1,
+        max_steps=1, warmup_steps=1,
     )
     values.update(overrides)
     cfg = test_config(**values)

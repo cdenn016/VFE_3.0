@@ -1901,11 +1901,15 @@ class VFE3Config:
         if self.checkpoint_interval < 0:
             raise ValueError(f"checkpoint_interval must be >= 0, got {self.checkpoint_interval}")
         # max_steps=0 is an empty training loop and warmup_steps<0 is meaningless; warmup_steps=0
-        # stays legal. (The plain-int type is gated at the top of __post_init__.)
+        # stays legal. A warmup longer than the run never reaches the peak rate, so the cosine
+        # schedule would silently train at a fraction of it. (The plain-int type is gated at the top
+        # of __post_init__.)
         if self.max_steps < 1:
             raise ValueError(f"max_steps must be an int >= 1, got {self.max_steps!r}")
         if self.warmup_steps < 0:
             raise ValueError(f"warmup_steps must be an int >= 0, got {self.warmup_steps!r}")
+        if self.warmup_steps > self.max_steps:
+            raise ValueError(f"warmup_steps ({self.warmup_steps}) must not exceed max_steps ({self.max_steps})")
         if self.resume_from is not None and not isinstance(self.resume_from, str):
             raise ValueError(
                 f"resume_from must be None or a path string to a checkpoints/step_<N>.pt, got "

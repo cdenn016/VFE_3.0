@@ -62,7 +62,7 @@ from vfe3.model.model import CANONICAL_DIAGNOSTIC_KEYS, DiagnosticSnapshot, VFEM
 from vfe3.model.prior_bank import PriorBank, get_decode_registration
 from vfe3.run_artifacts import RunArtifacts          # top-level safe: run_artifacts imports evaluate
 #                                                      lazily (function-local), so there is no cycle
-from vfe3.runtime import seed_everything
+from vfe3.runtime import disable_fill_uninitialized_memory, seed_everything
 from vfe3.timing import TrainingTimer
 from vfe3.viz.extract import e_step_belief_trace as _snapshot_trace
 from vfe3.geometry.retraction import (                          # SPD-retraction non-finite tangent guard
@@ -4012,6 +4012,9 @@ def train(
     if _final_validation_out is not None:
         _final_validation_out.clear()
     _require_causal_next_token_prior(model)
+    # Process-global; torch reads it only under deterministic algorithms. Set by the training run, not
+    # by model construction, so code that only builds models keeps torch's NaN fill of uninitialized reads.
+    disable_fill_uninitialized_memory()
     terminal_validation_signature = None
     terminal_validation_metrics = None
     # (step, metrics, parameter/buffer versions) of the latest eval, handed to terminal_callback (audit 2026-10-12 #12).

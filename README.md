@@ -284,8 +284,13 @@ unchanged **within this attention step**. Under `predictive_covariance="moment_m
 it replaces the covariance by the exact moment-matched covariance of the predictive
 kernel (Theorem `thm:probabilistic_status` (2) of the v2 manuscript): source covariances
 pushed through the head maps, cross-head terms, the between-source spread, the residual
-persistence term, and the covariant floor $f(\mathrm{tr}C_i/K)I$ in reference
-coordinates, with $f$ = `predictive_covariance_floor`. Neither is a routed population
+persistence term, and the prior-anchored floor $f\Sigma_{p,i}$, with $f$ =
+`predictive_covariance_floor` and $\Sigma_{p,i}$ the token's local prior covariance (the layer
+prior, the embedding prior under `prior_handoff_sigma=0`). The floor involves no frame, so a
+common reference change leaves the covariance unchanged. It replaced the floor
+$f(\mathrm{tr}C_i/K)I$ in reference coordinates on 2026-10-12; a run saved before then replays
+with the new floor, and its saved configuration does not record which floor it trained under.
+Neither is a routed population
 joint law. Subsequent block transforms and
 stack handoff have separate covariance policies, and neither contract is exact Gaussian
 propagation through an entire nonlinear layer.
@@ -489,7 +494,12 @@ the validator for the complete admission rules.
 | `m_relational_score_lr` | Outer rate for $S_Q,S_K$ across layers. |
 | `m_relational_content_lr` | Outer rate for $T,O$ (and edge-link factor maps) across layers. |
 | `content_link_chart="exponential"` | Receiving map $e^{OT}T^{-1}$; see [Content-link charts](#content-link-charts). |
-| `predictive_covariance="moment_matched"` | Replaces the covariance by the predictive kernel's moment-matched covariance plus a covariant floor. |
+| `predictive_covariance="moment_matched"` | Replaces the covariance by the predictive kernel's moment-matched covariance plus the prior-anchored floor $f\Sigma_p$. |
+| `predictive_readout="minimal_agent"` | Replaces the kernel readout by each receiver's exact Gaussian conditioning on a noisy comparison record whose key is tied to the content ($S_K=T$, no $O$). Routing is the source posterior at temperature 1, so `relational_routing`, `kappa_beta` and `kl_max` are unread. `minimal_agent_inference="exact"` combines per-head exact posteriors by assumed-density filtering; `"mean_field"` uses KL labels and an information-form fusion, with `minimal_agent_cavi_steps` coordinate-ascent sweeps. |
+| `predictive_covariance="spread_corrected"` | Minimal agent with mean-field inference only. Restores the between-source spread that the mean field drops: the mean-field covariance $P$ plus the linearized label spread $\sum_h PS_h^\top R'_hS_hP$, $R'_h=\sum_j\beta_{ij}^{(h)}d_jd_j^\top$, plus the floor; invariant under a reference change. |
+| `relational_routing="noisy_key"` | Kernel readout only. Routes on $D_{\mathrm{KL}}(\mathcal N(a_i,V_{Q,i})\Vert\mathcal N(b_j,V_{K,j}+n_hI))$ at temperature 1, with a learned per-head key noise $n_h$ (`routing_key_log_noise`, initialized from `relational_key_noise`, score learning rate, no weight decay). |
+| `diagnose_agent_elbo` | Default `False`. At the evaluation cadence, logs per layer the ELBO of the minimal agent's posterior and of each prototype-agent block, the evidence of the declared record model and their gap, in nats per token; computed without autograd and never in the loss. With coupled heads the minimal agent's evidence is an assumed-density value, so its gap is not guaranteed nonnegative. The mean-field minimal agent also reports the channel-noise M-step optimum $n_h^\star$ (`channel_noise_mstep`) as a diagnostic; the learned noise is not set to it. |
+| `block_mlp_mode="prototype_agents"` | Replaces the feed-forward block MLP by the minimal-agent model on $M$ = `block_mlp_expansion`·$K$ template agents. `block_mlp_inference` selects `"mean_field"` (KL-label responsibilities and a power posterior, `block_mlp_cavi_steps` sweeps) or `"exact"` (the mixture posterior); `block_mlp_covariance="posterior"` returns the template posterior covariance; `block_mlp_em_weight>0` adds an EM M-step term on the templates; `block_mlp_template_init` is `"absolute"` or `"working_variance"`. |
 | `family="gaussian_diagonal"` | Keeps the diagonal of the local moment-matched covariance; `gaussian_full` keeps it dense, so the two differ on this route; see below. |
 | `encode_mode="per_token_additive"` | Capacity-matched $\Omega=I$ control; requires `pos_phi="none"`, and either `rope_mode="none"` or comparison-space RoPE (`"comparison"` or `"comparison_invariant"`). |
 | `routing_kl_max_reference` | Projected kernel router only. `"absolute"` (default) clamps $D_{ij}$ at `kl_max`; `"row_min"` clamps the row gap $D_{ij}-\min_{j\,\mathrm{admissible}}D_{ij}$, with the row minimum carrying its subgradient, which leaves $\beta$ the exact softmax wherever no gap reaches `kl_max` and keeps the cost order of a row whose every cost exceeds it. |
@@ -499,6 +509,14 @@ the validator for the complete admission rules.
 Relational rates of `None` inherit `m_p_mu_lr`; `0.0` freezes that role's
 parameters while retaining its forward operation. Score and content groups have
 zero weight decay.
+
+Three numerical safeguards trade cost for conditioning; each is at its cheapest setting by default.
+
+| Setting | Effect |
+|---|---|
+| `phi_frame_condition_max` | Default `None`. A number $\kappa_{\max}>1$ bounds $\mathrm{cond}_2(U_i)\le\kappa_{\max}$ after each accepted step: through $\kappa_2(e^X)\le e^{\mathrm{spread}(\mathrm{sym}X)}$, the eigenvalue spread of the traceless symmetric part of every head block of each frame factor is limited to $\log\kappa_{\max}/n_{\mathrm{factors}}$, keeping the trace and the skew part. `block_glk` and `block_glmc` with `m_phi_update_mode="adamw"` and `encode_mode="per_token"` only; under `pos_phi="frozen"` the frozen positional factor is not bounded. |
+| `projected_factorization` | Factorization of the projected Gaussian-KL scorer. `"gram"` (default) factors the float32 Gram matrix (error $O(\epsilon\kappa^2)$); `"gram_certified"` also rebuilds entries that factor but fail a condition certificate; `"cholesky_qr2_certified"` factors by CholeskyQR2 (error $O(\epsilon\kappa)$) where the scorer has source roots. The certified modes are costly on CUDA. |
+| `frame_pair_escalation_tol` | Default `None`. A tolerance in $(0,1)$ recomputes a frame producer call in float64 when its float32 frame pair has $\epsilon_{32}\kappa_F(U)$ above it; about 7 times the cost of an escalated step. |
 
 When every covariance contract passes the covariance through
 (`predictive_covariance="passthrough"`, `block_mlp_covariance="passthrough"` and
@@ -545,7 +563,11 @@ every decoder; there is no `use_prior_bank` switch.
 The linear decoder `decode_mode="linear"` reads
 $z_{iv}=(W\mu_i+b)_v+\kappa\log u_v$ from the final mean (the unigram term under
 `decode_unigram_prior=True`), which discards the covariance; the reported K = 128 run decoded
-this way. The prior-bank decoder
+this way. With `decode_second_order=True` (diagonal family, local decode coordinates) training
+instead minimizes the second-order expected log-loss
+$\mathrm{CE}(\mu_i)+\frac12\mathrm{tr}(\Sigma_i\mathrm{Cov}_{p_i}(w))$, with $\mathrm{Cov}_{p_i}(w)$ the
+covariance of the decoder rows $w_v$ under the predicted distribution $p_i$, so the covariance
+enters the training loss; evaluation keeps the plug-in cross-entropy. The prior-bank decoder
 `decode_mode="full_chunked"` instead gives each vocabulary item $v$ a Gaussian $p_v$ (an
 untied copy of the token tables under `untie_decode_bank=True`) and combines the divergence
 to it with the corpus unigram log-prior,

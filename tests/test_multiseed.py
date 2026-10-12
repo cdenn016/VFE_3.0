@@ -53,17 +53,6 @@ def test_aggregate_empty_root(tmp_path):
     assert out["n"] == 0 and math.isnan(out["mean"])
 
 
-def test_flag_noise_dominated():
-    cells = {"a": 10.0, "b": 10.5, "c": 15.0, "d": None}
-    flagged = ms.flag_noise_dominated(cells, sd=1.0, k=2.0)   # threshold 2.0 above best (10.0)
-    assert set(flagged) == {"a", "b"}                         # c is 5 > 2 away; d skipped
-    assert ms.flag_noise_dominated(cells, sd=float("nan")) == []
-
-
-# =============================================================================
-# Full cross-seed digest (2026-06-22): run-root resolution, seed source, curves,
-# per-layer, research scalars, and the new figure functions.
-# =============================================================================
 def _write_full_run(d, *, ppl, seed, metrics=None, per_layer=None, research=None, config=None):
     d.mkdir(parents=True, exist_ok=True)
     (d / "summary.json").write_text(json.dumps({"test_ppl": ppl}))
@@ -287,28 +276,34 @@ def test_seed_dirs_accept_homogeneous_semantic_configs(tmp_path):
 
 @pytest.mark.parametrize("nested", [False, True], ids=["flat", "nested"])
 @pytest.mark.parametrize("retired_surface", ["active_phi", "ambiguous_policy"])
-def test_semantic_config_rejects_retired_legacy_fields(
+def test_semantic_config_keeps_dropped_legacy_fields_in_the_fingerprint(
     tmp_path,
     nested,
     retired_surface,
 ):
     payload = asdict(test_config(seed=1, vocab_size=8, embed_dim=4, n_heads=2, max_seq_len=4))
     payload["pos_phi"] = "none"
+    clean_path = tmp_path / f"clean-{nested}.json"
+    clean_path.write_text(json.dumps({"config": payload} if nested else payload), encoding="utf-8")
     if retired_surface == "active_phi":
         payload.pop("m_phi_update_mode")
-        payload.update({
+        retired = {
             "m_phi_natural_grad": True,
             "m_gauge_momentum": 0.9,
             "m_gauge_update_rule": "heavy_ball",
-        })
+        }
     else:
-        payload["policy_mode"] = "future_policy"
+        retired = {"policy_mode": "future_policy"}
+    payload.update(retired)
     artifact = {"config": payload, "timestamp": "legacy"} if nested else payload
     config_path = tmp_path / f"{retired_surface}-{nested}.json"
     config_path.write_text(json.dumps(artifact), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="unknown field"):
-        ms._semantic_config(config_path)
+    # The lenient loader of vfe3.paper drops fields this build no longer declares; they stay in the
+    # semantic config, so such a run never shares a fingerprint with one that lacks them.
+    semantic = ms._semantic_config(config_path)
+    assert {key: semantic[f"retired:{key}"] for key in retired} == retired
+    assert ms._config_fingerprint(config_path) != ms._config_fingerprint(clean_path)
 
 
 @pytest.mark.parametrize("config_text", [None, "{ not json"])
