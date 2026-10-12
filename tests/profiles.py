@@ -47,6 +47,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'untie_decode_bank': True,
     'decode_chunk_size': 8192,
     'decode_ce_checkpoint': 'auto',
+    'decode_ce_triton': False,
     'decode_logits_amp': False,
     'decode_second_order': False,
     'decode_ranking_fp64_escalation': True,

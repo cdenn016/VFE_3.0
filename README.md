@@ -591,6 +591,17 @@ Under either decoder, outer backpropagation trains enabled prior, frame, interfa
 MLP, normalization, and decoder parameters. Optional outer penalties are separate
 choices. This loss is not the same scalar as the variational routing objective.
 
+The `diagonal_chunked` and `full_chunked` decoders stream the vocabulary in chunks of
+`decode_chunk_size`. With `decode_ce_triton=True` (default False) and CUDA tensors, each chunk's
+score assembly, clamp, temperature, unigram term, online log-sum-exp, target gather and their
+backward run in fused Triton kernels (`vfe3/kernels/kl_decode.py`), while the cross-term GEMMs
+stay in cuBLAS under the same IEEE fp32 pin. The logits are the same; the log-sum-exp and the
+backward sums differ at fp32 rounding. At the launcher shapes (B = 64, N = 128, K = 20,
+V = 50257) on an RTX 5090 the diagonal decode forward and backward took 7 ms instead of 48 ms
+on the idle device, and a `full_chunked` training step took 87 ms instead of 127 ms with peak
+memory 3.5 GB instead of 5.7 GB. CPU tensors always run the torch loop, and `summary.json`
+records the kernel that ran as `decode_ce_kernel`.
+
 Prior-bank divergence decoders such as `diagonal_chunked` and `full_chunked` are
 available on both supported projected routes. With
 `predictive_covariance="passthrough"`, the predictive readout replaces only the mean.

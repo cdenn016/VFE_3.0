@@ -22,6 +22,9 @@ CUDA_TESTS: frozenset[str] = frozenset({
     # Fused Triton expected-likelihood CE against the float64 CPU torch route, reproducibility and timing
     # (2026-10-10).
     'test_expected_likelihood_kernel_20261010.py::test_cuda_triton_route_matches_cpu_torch_and_is_reproducible',
+    # Fused Triton KL-decode CE (decode_ce_triton) against the float64 torch route, bitwise logits, reproducibility,
+    # memory and timing (2026-10-12).
+    'test_kl_decode_triton_20261012.py::test_cuda_fused_route_matches_float64_like_the_torch_route',
     # The amp_dtype reduced-precision probe under CUDA autocast's operation lists (2026-10-12).
     'test_amp_routes_20261012.py::test_cuda_autocast_probe_matches_the_rule',
 })
