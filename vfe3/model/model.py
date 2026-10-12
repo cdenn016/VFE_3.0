@@ -77,6 +77,7 @@ from vfe3.relational_scoring import (
     set_projected_recovery_precision,
 )
 from vfe3.runtime import set_fill_uninitialized_memory, set_fp32_matmul_precision
+from vfe3.model.minimal_agent import MINIMAL_AGENT_ELBO_KEYS
 from vfe3.model.relational_operators import RelationalOperators, shared_content_charts
 
 
@@ -339,6 +340,7 @@ class VFEModel(nn.Module):
                                 minimal_agent_inference=cfg.minimal_agent_inference,
                                 minimal_agent_channel_noise=cfg.minimal_agent_channel_noise,
                                 minimal_agent_cavi_steps=cfg.minimal_agent_cavi_steps,
+                                elbo_diagnostic=cfg.diagnose_agent_elbo,          # minimal agent only (T1)
                                 comparison_rope_base=(cfg.rope_base if cfg.pos_rotation == "rope"
                                                       and cfg.rope_space == "comparison" else None),
                                 comparison_rope_fraction=cfg.rope_fraction,
@@ -2381,19 +2383,23 @@ class VFEModel(nn.Module):
         exact at the input moments), the layer's covariance contraction :math:`\operatorname{tr}C^+/\operatorname{tr}C` and
         the head mean of the mean-field M-step optimum :math:`n_h^*` (NaN under ``"exact"``), to set beside the learned
         :math:`n_h`.
+        Under ``diagnose_agent_elbo`` it also reports the layer's receiver-mean evidence lower bound, ADF evidence and
+        their gap in nats (:data:`vfe3.model.minimal_agent.MINIMAL_AGENT_ELBO_KEYS`).
         """
         gain, noise, coupling, staleness, contraction, spread, mstep = (cap[key] for key in (
             "relational_minimal_agent_gain_fraction", "relational_minimal_agent_channel_noise",
             "relational_minimal_agent_head_coupling", "relational_minimal_agent_label_staleness",
             "relational_minimal_agent_covariance_contraction", "relational_minimal_agent_spread_share",
             "relational_minimal_agent_channel_noise_mstep"))
-        return {"relational_minimal_agent_gain_fraction": float(gain.mean()),
-                "relational_minimal_agent_channel_noise": float(noise.mean()),
-                "relational_minimal_agent_head_coupling": float(coupling.max()),
-                "relational_minimal_agent_label_staleness": float(staleness.double().nanmean()),
-                "relational_minimal_agent_covariance_contraction": float(contraction.mean()),
-                "relational_minimal_agent_spread_share": float(spread.double().nanmean()),
-                "relational_minimal_agent_channel_noise_mstep": float(mstep.double().nanmean())}
+        out = {"relational_minimal_agent_gain_fraction": float(gain.mean()),
+               "relational_minimal_agent_channel_noise": float(noise.mean()),
+               "relational_minimal_agent_head_coupling": float(coupling.max()),
+               "relational_minimal_agent_label_staleness": float(staleness.double().nanmean()),
+               "relational_minimal_agent_covariance_contraction": float(contraction.mean()),
+               "relational_minimal_agent_spread_share": float(spread.double().nanmean()),
+               "relational_minimal_agent_channel_noise_mstep": float(mstep.double().nanmean())}
+        out.update({key: float(cap[key]) for key in MINIMAL_AGENT_ELBO_KEYS if key in cap})
+        return out
 
     def _projected_covariance_and_frame_diagnostics(
         self,

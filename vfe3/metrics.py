@@ -685,7 +685,8 @@ def covariance_frozen_at_encode(cfg: object) -> bool:
     if attention_mode == "projected_gradient":
         e_step_frozen = bool(getattr(cfg, "skip_belief_sigma_update", False))
     else:
-        e_step_frozen = getattr(cfg, "predictive_covariance", "passthrough") != "moment_matched"
+        e_step_frozen = getattr(cfg, "predictive_covariance", "passthrough") not in ("moment_matched",
+                                                                                        "spread_corrected")
     mlp_rewrites_sigma = (bool(getattr(cfg, "use_block_mlp", False))
                           and getattr(cfg, "block_mlp_covariance", "passthrough") != "passthrough")
     cg_rewrites_sigma = (bool(getattr(cfg, "use_cg_coupling", False))

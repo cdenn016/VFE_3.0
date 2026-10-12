@@ -509,7 +509,8 @@ def _require_static_routing_covariance(model: torch.nn.Module) -> None:
     if any(getattr(op, "predictive_covariance", "passthrough") != "passthrough"
            for op in model.relational_operators_by_layer):
         raise NotApplicable(
-            "predictive_covariance='moment_matched': the routing covariance of layer l > 0 is the moment-matched "
+            "predictive_covariance='moment_matched' or 'spread_corrected': the routing covariance of layer l > 0 "
+            "is the readout's "
             "C_i^att, not the static C_i = U_i^{-1} Sigma_p U_i^{-T} of the normal form; removing the frame from "
             "the input covariance alone would need the full local covariance U_i Sigma_p U_i^T as stack input "
             "(and on the diagonal family the frame also enters the diagonal moment projection at every layer)")

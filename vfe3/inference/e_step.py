@@ -24,6 +24,7 @@ from vfe3.gradients.relational import relational_predictive_readout
 from vfe3.families.base import get_family
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.retraction import retract_spd_affine
+from vfe3.model.minimal_agent import READOUT_COVARIANCES
 from vfe3.numerics import apply_mu_trust_region
 from vfe3.relational_scoring import source_recovery_counter
 from vfe3.geometry.transport import (
@@ -255,7 +256,7 @@ def e_step_iteration(
     recovery_before = (source_recovery_counter(belief.mu.device)
                        if relational_capture is not None else None)
     if not full_link:
-        moment_matched = relational_operators.predictive_covariance == "moment_matched"
+        moment_matched = relational_operators.predictive_covariance in READOUT_COVARIANCES   # the readout returns Sigma
         readout = relational_predictive_readout(
             belief.mu, belief.sigma, relational_frame, relational_operators,
             tau=tau, kl_max=kl_max, log_prior=log_prior,

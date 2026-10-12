@@ -210,8 +210,16 @@ class VFE3Config:
     # (mean beta*_ii) and, at each layer's converged output, canonical_total_output and canonical_total_delta
     # (F_out - F_in). O(B N K^3 + B N^2 sum_h d_h^2) per diagnostic window (O(B N H d^3) on head-block groups)
     diagnose_canonical_free_energy:   bool            = False
-    
-    eval_stride:                      Optional[int]   = None         # held-out window stride <= max_seq_len; None = disjoint windows
+    # Eval-cadence diagnostic (audit 2026-10-12 T1): per layer, the evidence lower bound of the minimal agent's
+    # posterior (predictive_readout='minimal_agent') and of each prototype_agents block, the evidence of the declared
+    # record model (ADF over heads for the minimal agent, exact for the prototypes) and their gap, in nats per token.
+    # Logged as val_relational_minimal_agent_{elbo,evidence,elbo_gap} (last layer) and in
+    # diagnostics/minimal_agent_elbo.csv and diagnostics/prototype_elbo.csv; computed without autograd, never in the
+    # loss (the evidence is unbounded above as the maps and the noise shrink). The mean field also runs the exact
+    # path once per diagnostic forward for the evidence.
+    diagnose_agent_elbo:              bool            = False
+
+    eval_stride:                     Optional[int]   = None         # held-out window stride <= max_seq_len; None = disjoint windows
     # Training-window origin: "fixed" (window i starts at i*max_seq_len every epoch) | "per_epoch_random"
     # (each epoch draws an origin in [0, max_seq_len) from the train loader's generator; vfe3.train.train).
     train_window_offset:              str             = "fixed"
@@ -517,12 +525,14 @@ class VFE3Config:
     minimal_agent_inference:          str             = "mean_field"
     minimal_agent_cavi_steps:         int             = 1            # mean_field only: label/Gaussian coordinate-ascent sweeps >= 1 (1 = labels at the input moments)
     
-    # "passthrough" | "moment_matched"
-    #   passthrough     keep the incoming covariance
-    #   moment_matched  the readout's covariance plus floor * Sigma_p: kernel, the exact moment-matched covariance of
-    #                   the predictive kernel; minimal_agent exact, the exact posterior's; minimal_agent mean_field,
-    #                   the CAVI posterior (C^-1 + sum_h S_h^T Lambda_h S_h)^-1 without the between-source spread, so
-    #                   with equal source covariances it does not depend on the context (audit 2026-10-12, item 9)
+    # "passthrough" | "moment_matched" | "spread_corrected"
+    #   passthrough       keep the incoming covariance
+    #   moment_matched    the readout's covariance plus floor * Sigma_p: kernel, the exact moment-matched covariance of
+    #                     the predictive kernel; minimal_agent exact, the exact posterior's; minimal_agent mean_field,
+    #                     the CAVI posterior (C^-1 + sum_h S_h^T Lambda_h S_h)^-1 without the between-source spread, so
+    #                     with equal source covariances it does not depend on the context (audit 2026-10-12, item 9)
+    #   spread_corrected  minimal_agent mean_field only: P + sum_h P S_h^T R'_h S_h P plus floor * Sigma_p, the
+    #                     linearized label spread R'_h = sum_j beta_j d_j d_j^T (audit 2026-10-12 T2)
     predictive_covariance:            str             = "moment_matched"
     
     predictive_covariance_floor:      float           = 1e-4         # moment_matched only (kernel and minimal_agent readouts): floor * Sigma_p, the token's local prior covariance
@@ -923,7 +933,14 @@ class VFE3Config:
                 or not math.isfinite(float(self.relational_key_noise))
                 or float(self.relational_key_noise) <= 0.0):
             raise ValueError(f"relational_key_noise must be a finite real value > 0, got {self.relational_key_noise!r}")
-        _require(self.predictive_covariance, ("passthrough", "moment_matched"), "predictive_covariance")
+        from vfe3.model.minimal_agent import PREDICTIVE_COVARIANCES
+        _require(self.predictive_covariance, PREDICTIVE_COVARIANCES, "predictive_covariance")
+        if (self.predictive_covariance == "spread_corrected" and self.attention_mode == "projected_predictive"
+                and (self.predictive_readout != "minimal_agent" or self.minimal_agent_inference != "mean_field")):
+            raise ValueError("predictive_covariance='spread_corrected' is the minimal agent's mean-field covariance "
+                             "with the linearized label spread; it requires predictive_readout='minimal_agent' and "
+                             "minimal_agent_inference='mean_field' (the kernel readout and the exact posterior "
+                             "already carry the between-source spread; use 'moment_matched')")
         if (isinstance(self.predictive_covariance_floor, bool)
                 or not isinstance(self.predictive_covariance_floor, Real)
                 or not math.isfinite(float(self.predictive_covariance_floor))
@@ -1616,6 +1633,8 @@ class VFE3Config:
         if not isinstance(self.diagnose_canonical_free_energy, bool):
             raise ValueError(f"diagnose_canonical_free_energy must be a bool, got "
                              f"{self.diagnose_canonical_free_energy!r}")
+        if not isinstance(self.diagnose_agent_elbo, bool):
+            raise ValueError(f"diagnose_agent_elbo must be a bool, got {self.diagnose_agent_elbo!r}")
         if self.val_diagnostic_batches < 1:
             raise ValueError(
                 "val_diagnostic_batches must be an int >= 1, got "
@@ -2107,8 +2126,9 @@ class VFE3Config:
                     UserWarning, stacklevel=2,
                 )
 
+        from vfe3.model.minimal_agent import READOUT_COVARIANCES
         predictive_moment_matched = (self.attention_mode == "projected_predictive"
-                                     and self.predictive_covariance == "moment_matched")
+                                     and self.predictive_covariance in READOUT_COVARIANCES)
         if self.decode_mode != "linear" and not predictive_moment_matched and (
             self.skip_belief_sigma_update or self.attention_mode == "projected_predictive"
         ):
@@ -2283,9 +2303,14 @@ class VFE3Config:
             # The minimal agent checkpoints its whole readout (mean included), so only the floor is inert there.
             mark(("predictive_covariance_floor",) if minimal_agent
                  else ("predictive_covariance_floor", "predictive_covariance_checkpoint"),
-                 "only read by predictive_covariance='moment_matched'")
+                 "only read by predictive_covariance='moment_matched' or 'spread_corrected'")
         if self.attention_mode != "projected_predictive":
             mark(("predictive_readout",), "only read by attention_mode='projected_predictive'")
+        if not ((self.attention_mode == "projected_predictive" and minimal_agent)
+                or (self.use_block_mlp and self.block_mlp_mode == "prototype_agents")):
+            mark(("diagnose_agent_elbo",),
+                 "only read by predictive_readout='minimal_agent' (attention_mode='projected_predictive') or a "
+                 "block_mlp_mode='prototype_agents' block MLP")
         if minimal_agent:
             posterior = ("exact source posterior" if self.minimal_agent_inference == "exact"
                          else "mean-field source posterior")
