@@ -8,15 +8,14 @@ and the normalized prior used in the attention-entropy term is pi = softmax_j(B)
   causal_noself / causal_alibi_noself -> the same with the self key j=i also masked
     (except (0,0); see prior_causal_noself for the attention-sink rationale).
   causal_windowed -> hard causal local band 0 <= i-j <= window.
-  t5_relative_bias -> learned or fixed per-bucket relative-position bias.
 Every registered prior is causal for next-token scoring; the non-causal uniform, alibi and windowed
-priors were removed on 2026-10-12. Config-selected so a new prior slots in by register_prior without
-editing the free-energy call site; a non-causal registration is refused by training (vfe3/train.py).
+priors were removed on 2026-10-12, and the T5 relative-position bias in the round-2 audit.
+Config-selected so a new prior slots in by register_prior without editing the free-energy call
+site; a non-causal registration is refused by training (vfe3/train.py).
 """
 
-import math
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional, Sequence
+from typing import Callable, Dict, Optional
 
 import torch
 
@@ -247,94 +246,6 @@ def prior_causal_windowed(
     allowed = (d >= 0) & (d <= window)
     B = torch.zeros(n_query, n_key, device=device, dtype=dtype)
     return B.masked_fill(~allowed, float("-inf"))
-
-
-def _t5_relative_position_bucket(
-    relative_position: torch.Tensor,        # (..., Nq, Nk) long: key_pos - query_pos
-
-    *,
-    bidirectional: bool = False,
-    num_buckets:   int  = 32,
-    max_distance:  int  = 128,
-) -> torch.Tensor:                          # (..., Nq, Nk) long bucket index in [0, num_buckets)
-    r"""T5 relative-position bucketing (Raffel et al. 2020), the standard piecewise map.
-
-    The first half of the buckets are EXACT for small relative distances; the second half are
-    LOG-spaced up to ``max_distance`` (everything beyond shares the last bucket). With
-    ``bidirectional=True`` the sign of the relative position selects a half-range of buckets so
-    forward and backward distances are distinguished; with ``bidirectional=False`` (the causal
-    decoder form) future positions collapse to bucket 0 and only the past distance is bucketed.
-    Matches the reference HuggingFace implementation.
-    """
-    rel = relative_position
-    buckets = torch.zeros_like(rel)
-    if bidirectional:
-        nb = num_buckets // 2
-        buckets = buckets + (rel > 0).long() * nb
-        n = rel.abs()
-    else:
-        nb = num_buckets
-        n = (-torch.minimum(rel, torch.zeros_like(rel)))        # past distance (>=0); future -> 0
-    max_exact = nb // 2
-    is_small = n < max_exact
-    n_large = n.clamp(min=max_exact).float()                    # clamp avoids log(0); used only where ~is_small
-    large = max_exact + (
-        torch.log(n_large / max_exact) / math.log(max_distance / max_exact) * (nb - max_exact)
-    ).long()
-    # Self-protect against a degenerate max_distance <= max_exact, where log(max_distance/max_exact)
-    # is <= 0 and the .long() yields a negative sentinel: clamp into the valid [max_exact, nb-1] band
-    # so the bucket index is in-range independent of the config guard (audit 2026-06-17). A no-op for
-    # valid inputs (large is already >= max_exact there).
-    large = large.clamp(min=max_exact, max=nb - 1)
-    return buckets + torch.where(is_small, n, large)
-
-
-@register_prior(
-    "t5_relative_bias",
-    causal_for_next_token_scoring=True,
-)
-def prior_t5_relative_bias(
-    n_query: int,
-    n_key:   int,
-
-    *,
-    bias_values:   Optional['torch.Tensor | Sequence[float]'] = None,   # learnable (num_buckets,) handle; None -> fixed default
-    num_buckets:   int                    = 32,
-    max_distance:  int                    = 128,
-    bidirectional: bool                   = False,
-    device:        'torch.device | str | None' = None,
-    dtype:         torch.dtype             = torch.float32,
-    **kwargs,
-) -> torch.Tensor:
-    r"""T5-style relative-position bias prior (Raffel et al. 2020).
-
-    Buckets the relative position ``key - query`` (see ``_t5_relative_position_bucket``) and reads
-    a per-bucket bias. ``bias_values`` is the per-bucket bias vector ``(num_buckets,)``: pass the
-    model's learnable handle to get the trainable T5 bias (the registry's documented learned-bias
-    extension point), or leave it ``None`` for a deterministic monotone log-distance default
-    ``-log1p(bucket)`` (nearer keys ~0, farther keys more negative) so the prior is usable
-    standalone. In the causal (``bidirectional=False``) decoder form the future is masked to
-    ``-inf``, matching how a T5 decoder pairs its relative bias with a causal mask. A genuinely
-    per-HEAD T5 bias (a ``(num_buckets, H)`` table and a head axis on the prior) is the separate
-    head-axis item; this returns the per-bucket 2D bias the current registry contract carries.
-
-    CACHE CAVEAT: the model caches the prior on ``(name, n, device, dtype)`` (``model._attention_log_prior``).
-    The default (``bias_values=None``) bias is constant, so the cache is correct. The learnable
-    ``bias_values`` path (the ``t5_learnable_bias`` toggle) is threaded through the model, and
-    ``_attention_log_prior`` BYPASSES the cache on that path (rebuilds each call) so the live
-    parameter is never served stale as it trains."""
-    i = torch.arange(n_query, device=device).unsqueeze(-1)
-    j = torch.arange(n_key, device=device).unsqueeze(0)
-    bucket = _t5_relative_position_bucket(
-        j - i, bidirectional=bidirectional, num_buckets=num_buckets, max_distance=max_distance)
-    if bias_values is None:
-        table = -torch.log1p(torch.arange(num_buckets, device=device, dtype=dtype))
-    else:
-        table = torch.as_tensor(bias_values, device=device, dtype=dtype)
-    B = table[bucket]
-    if not bidirectional:                                       # causal decoder form: forbid the future
-        B = B.masked_fill(j > i, float("-inf"))
-    return B
 
 
 def attention_log_prior(

@@ -813,9 +813,7 @@ def _source_items(run: RunRecord) -> List[Item]:
         final = p.get("final_git_identity") or {}
         if p.get("source_identity_drift") and isinstance(final.get("git_sha"), str):
             items.append(("source drifted; final revision", Hash(final["git_sha"])))
-    schema = run.raw("__vfe3_config_schema__", run.dropped_config_fields.get("__vfe3_config_schema__"))
-    items.append(("config schema", str(schema) if schema is not None else NOT_RECORDED))
-    retired = sorted(k for k in run.dropped_config_fields if k != "__vfe3_config_schema__")
+    retired = sorted(run.dropped_config_fields)
     if retired:
         items.append(("retired fields ignored on reload", ", ".join(retired)))
     ops = rec.get("relational_operators")
@@ -898,7 +896,7 @@ def _architecture_items(run: RunRecord) -> List[Item]:
     if (run.raw("use_block_mlp") and run.raw("block_mlp_mode") == "coordinate"
             and isinstance(run.raw("block_mlp_expansion"), int) and isinstance(run.raw("embed_dim"), int)):
         items.append(("MLP hidden width", str(run.raw("block_mlp_expansion") * run.raw("embed_dim"))))
-    items += _raw_items(run, ("decode_mode", "decode_unigram_prior", "unigram_kappa",
+    items += _raw_items(run, ("decode_mode", "decode_second_order", "decode_unigram_prior", "unigram_kappa",
                               "untie_decode_bank", "pos_phi"))
     return items
 
@@ -942,7 +940,8 @@ def _optimization_items(run: RunRecord) -> List[Item]:
     kind = (run.summary.get("scheduler") or {}).get("kind")
     items.append(("schedule", Code(kind) if kind else NOT_RECORDED))
     items += _raw_items(run, ("warmup_steps", "max_steps", "min_lr_frac", "grad_clip",
-                              "m_phi_update_mode", "phi_mstep_max_matrix_norm"))
+                              "m_phi_update_mode", "phi_mstep_max_matrix_norm",
+                              "phi_frame_condition_max"))
     # vfe3.train.train_step bounds each optimizer role's gradient L2 norm by grad_clip separately (the
     # global clip was retired with grad_clip_per_role).
     clip = finite_float(run.raw("grad_clip"))

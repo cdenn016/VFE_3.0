@@ -181,7 +181,6 @@ class DiagonalGaussian(BeliefParams):
     # maximally FLAT covariance as sub-rank-1 collapse -- the opposite of what it exists to
     # detect.
     effective_rank_rescale = True
-    gaussian_pointwise_algebra = True
 
     def __init__(self, mu: torch.Tensor, sigma: torch.Tensor) -> None:
         self.mu = mu
@@ -261,14 +260,6 @@ class DiagonalGaussian(BeliefParams):
         eps:        float = 1e-12,
     ) -> torch.Tensor:
         return dispersion.clamp(min=eps).sqrt()
-
-    @classmethod
-    def mix_dispersion(
-        cls,
-        dispersion: torch.Tensor,                    # (..., n, d) independent variances
-        mixing:    torch.Tensor,                     # (m, n) component mixer
-    ) -> torch.Tensor:
-        return torch.einsum("mn,...nd->...md", mixing.square(), dispersion)
 
     @classmethod
     def diagnostic_labels(cls) -> dict[str, str]:
@@ -452,7 +443,6 @@ class FullGaussian(BeliefParams):
     # maximally FLAT covariance as sub-rank-1 collapse -- the opposite of what it exists to
     # detect.
     effective_rank_rescale = True
-    gaussian_pointwise_algebra = True
 
     @classmethod
     def from_covariance(cls, mu: torch.Tensor, covariance: torch.Tensor) -> "FullGaussian":
@@ -559,14 +549,6 @@ class FullGaussian(BeliefParams):
     ) -> torch.Tensor:
         factor, _ = safe_cholesky(dispersion, eps=eps, rounds=0)
         return factor
-
-    @classmethod
-    def mix_dispersion(
-        cls,
-        dispersion: torch.Tensor,                    # (..., K, K) covariance
-        mixing:    torch.Tensor,                     # (K, K) dense linear map
-    ) -> torch.Tensor:
-        return mixing @ dispersion @ mixing.transpose(-1, -2)
 
     @classmethod
     def diagnostic_labels(cls) -> dict[str, str]:

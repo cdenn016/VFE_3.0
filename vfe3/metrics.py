@@ -1,21 +1,15 @@
-r"""Diagnostic metrics for VFE_3.0 runs (publication-oriented, registry-backed).
+r"""Diagnostic metrics for VFE_3.0 runs (publication-oriented).
 
-A registry of named metrics over beliefs / transport / attention. Each metric reads
-what it needs from a keyword context and returns a plain float (or a small dict), so
-new probes slot in by ``register_metric`` without editing call sites; ``compute_metrics``
-emits a CSV/JSON-friendly record. The metrics are pure measurements (no gradients, no
-side effects) suitable for logging a training run or a figure.
-
-Provided: effective_rank (spectral participation ratio), attention_entropy (row entropy
-of beta), holonomy_deviation (closure residual of the coboundary transport
-Omega_ij = U_i U_j^{-1}; zero in exact arithmetic, so a roundoff and frame-conditioning monitor, not
-curvature), gauge_trace_spread (spread of log|det Omega| = tr embed(phi)), free_energy_terms
-(the per-term F decomposition), and content_link_spectrum (similarity invariants of the relational
-content maps M_h = O_h T_h).
+Pure measurements over beliefs / transport / attention (no gradients, no side effects), suitable
+for logging a training run or a figure: effective rank (spectral participation ratio), attention
+row entropy, the sampled coboundary closure residual of Omega_ij = U_i U_j^{-1} (zero in exact
+arithmetic, so a roundoff and frame-conditioning monitor, not curvature), the per-term free-energy
+decomposition, and content_link_spectrum (similarity invariants of the relational content maps
+M_h = O_h T_h).
 """
 
 import math
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -65,55 +59,6 @@ def attention_entropy(
     r"""Mean Shannon entropy -Σ_j β_ij log β_ij over query rows (log N for uniform β)."""
     h = -(beta.clamp(min=eps) * torch.log(beta.clamp(min=eps))).sum(dim=-1)
     return h.mean()
-
-
-def holonomy_deviation(
-    omega: torch.Tensor,                 # (N, N, K, K) pairwise transport Omega_ij
-
-    *,
-    max_triangles: int = 512,
-) -> torch.Tensor:                       # () mean ||Omega_ij Omega_jk Omega_ki - I||_F
-    r"""Coboundary closure residual: mean Frobenius departure of the triangle product from identity.
-
-    FRAME-DEPENDENT (Frobenius; conjugation-invariant only for orthogonal gauges): under a GL(K)
-    frame change the holonomy conjugates, H -> g H g^{-1}, and ||H - I||_F is preserved only for
-    orthogonal/unitary g -- :func:`holonomy_wilson_sampled` is the conjugation-invariant trace analog.
-
-    For the coboundary Omega_ij = U_i U_j^{-1} (every registered transport) H_ijk = I identically, so
-    the value is roundoff of the stored (U, U^{-1}) pair, growing with cond(U); it would carry
-    curvature only for a non-coboundary transport, and none is registered.
-    """
-    N, K = omega.shape[0], omega.shape[-1]
-    eye = torch.eye(K, device=omega.device, dtype=omega.dtype)
-
-    # Enumerate the first ``max_triangles`` distinct (i, j, k) triples in the same
-    # row-major order the nested-loop form used, then evaluate them as ONE batched
-    # (T, K, K) matmul rather than T Python-dispatched (K, K) matmuls -- same triangles,
-    # same value, one kernel launch instead of T.
-    triples: List[Tuple[int, int, int]] = []
-    for i in range(N):
-        for j in range(N):
-            if j == i:
-                continue
-            for k in range(N):
-                if k == i or k == j:
-                    continue
-                triples.append((i, j, k))
-                if len(triples) >= max_triangles:
-                    break
-            if len(triples) >= max_triangles:
-                break
-        if len(triples) >= max_triangles:
-            break
-    if not triples:
-        return torch.tensor(0.0, device=omega.device, dtype=omega.dtype)
-
-    idx = torch.tensor(triples, device=omega.device)                      # (T, 3)
-    o_ij = omega[idx[:, 0], idx[:, 1]]                                     # (T, K, K)
-    o_jk = omega[idx[:, 1], idx[:, 2]]                                     # (T, K, K)
-    o_ki = omega[idx[:, 2], idx[:, 0]]                                     # (T, K, K)
-    H = o_ij @ o_jk @ o_ki                                                # (T, K, K) holonomy
-    return torch.linalg.norm(H - eye, dim=(-2, -1)).mean()
 
 
 def _finite_quantile(values: torch.Tensor, q: float) -> float:
@@ -329,17 +274,6 @@ def flatness_reference_statistics(
     }
 
 
-def gauge_trace_spread(
-    phi:        torch.Tensor,            # (..., n_gen) gauge-frame coordinates
-    generators: 'torch.Tensor | GaugeGroup',           # (n_gen, K, K)
-) -> torch.Tensor:                       # () std of tr(embed(phi)) = std of log|det exp(embed phi)|
-    r"""Spread (std) of log|det Omega| across tokens; 0 at phi = 0 (Omega = I)."""
-    traces = (generators.generator_traces() if isinstance(generators, GaugeGroup)
-              else generators.diagonal(dim1=-2, dim2=-1).sum(-1))        # (n_gen,) tr(G_a)
-    logdet = torch.einsum("...a,a->...", phi, traces)            # tr(embed(phi)) = sum_a phi^a tr(G_a)
-    return logdet.flatten().std(unbiased=False)
-
-
 def free_energy_terms(
     self_div: torch.Tensor,              # (..., N) D(q_i||p_i)
     energy:   torch.Tensor,              # (..., N, N) E_ij
@@ -438,7 +372,7 @@ def free_energy_terms(
 # ===========================================================================
 # Publication-figure metrics (pure measurements; no gradients, no side effects).
 # These return per-token / per-head VECTORS or small dicts for figures, rather
-# than the single CSV scalar the registry path logs. Runners that reload a
+# than a single CSV scalar. Runners that reload a
 # checkpoint or drive the model live (e_step_belief_trace,
 # per_unit_eval_nats, ...) live in vfe3/viz/extract.py, NOT here, so this
 # module keeps its "pure measurement" contract.
@@ -717,27 +651,6 @@ def rank_one_residual(
     return num / den
 
 
-def depth_decay_rate(
-    curve: torch.Tensor,                 # (L,) a per-layer scalar (e.g. r(X) by depth)
-
-    *,
-    eps:   float = 1e-12,
-) -> float:                              # log-linear slope d log(curve) / d layer
-    r"""Log-linear decay rate (slope of log(curve) vs layer index) of a per-depth scalar.
-
-    For F2/EXP-7 the per-arm rank-residual curves are compared by their DECAY RATE, not absolute
-    level (the no-anchor control plateaus rather than collapsing to rank-one). Fits
-    log(curve) ~ a + b * layer by least squares and returns b (negative = decaying with depth).
-    """
-    y = torch.log(curve.flatten().clamp(min=eps).to(torch.float64))
-    n = y.shape[0]
-    if n < 2:
-        raise ValueError(f"depth_decay_rate needs >= 2 layers, got {n}")
-    x = torch.arange(n, dtype=torch.float64, device=y.device)
-    xm, ym = x.mean(), y.mean()
-    return float(((x - xm) * (y - ym)).sum() / ((x - xm) ** 2).sum().clamp(min=eps))
-
-
 def _average_ranks(
     values: torch.Tensor,                # (M,) finite sample
 ) -> torch.Tensor:                       # (M,) zero-based fractional ranks
@@ -1011,7 +924,7 @@ def guard_saturation(
     return out
 
 
-# --- per-token frame class functions (group-dispatched; fixes gauge_trace_spread's det-blindness) ---
+# --- per-token frame class functions (group-dispatched; not blind to unimodular groups) ---
 #
 # NOT gauge invariants of the declared local action. The model's gauge acts on vertex frames on the
 # LEFT, U_i -> g_i U_i with mu_i -> g_i mu_i, and on the flat coboundary Omega_ij = U_i U_j^{-1} the
@@ -1034,10 +947,10 @@ def group_gauge_invariant(
     local left action U_i -> g_i U_i (see the section note above): it is a reference-trivialization
     frame statistic, not a gauge-invariant observable, despite the historical function name.
 
-    The logged ``gauge_trace_spread`` (= std of log|det Omega| = tr embed(phi)) is identically 0
-    for the unimodular SO(N) towers (traceless generators, det == 1), so it is blind off block_glk.
-    This dispatches the correct invariant: GL volume log|det exp(phi)| for block_glk, and total
-    rotation angle (1/2) sum_k |arg(eig)| for the orthogonal so_n irrep towers.
+    A spread of log|det Omega| (= tr embed(phi)) is identically 0 for the unimodular SO(N) towers
+    (traceless generators, det == 1), so it is blind off block_glk. This dispatches the correct
+    invariant: GL volume log|det exp(phi)| for block_glk, and total rotation angle
+    (1/2) sum_k |arg(eig)| for the orthogonal so_n irrep towers.
     """
     if getattr(group, "skew_symmetric", False):                  # so_n, tied or untied
         ang = torch.angle(eigvals_on_host(exp_phi))              # (..., K) eigenphases
@@ -1235,30 +1148,6 @@ def _compact_sampled_pairs(
         "thkl,thlm->thkm", omega.exp_blocks[left], omega.inv_blocks[right])
 
 
-def energy_directedness(
-    energy: torch.Tensor,                # (..., N, N) pairwise energies E_ij
-
-    *,
-    eps:    float = 1e-12,
-) -> Dict[str, torch.Tensor]:
-    r"""Asymmetry of the pre-softmax pairwise energy E_ij over off-diagonal pairs.
-
-    Returns the mean absolute asymmetry mean|E_ij - E_ji| and its scale-free normalization
-    mean(|E_ij - E_ji| / (E_ij + E_ji)); both are 0 for symmetric (frozen-gauge) transport and
-    grow once Omega(phi) is directional.
-    """
-    n = energy.shape[-1]
-    off = ~torch.eye(n, dtype=torch.bool, device=energy.device)
-    e_t = energy.transpose(-1, -2)
-    abs_asym = (energy - e_t).abs()
-    rel_asym = abs_asym / (energy + e_t).abs().clamp(min=eps)
-    mask = off.expand_as(abs_asym)
-    return {
-        "abs_asymmetry": abs_asym[mask].mean() if mask.any() else abs_asym.new_zeros(()),
-        "rel_asymmetry": rel_asym[mask].mean() if mask.any() else rel_asym.new_zeros(()),
-    }
-
-
 def structured_head_scores(
     beta:        torch.Tensor,           # (..., N, N) attention weights (rows = query i)
 
@@ -1394,9 +1283,9 @@ def holonomy_deviation_sampled(
 ) -> Dict[str, torch.Tensor]:
     r"""Triangle holonomy ||Omega_ij Omega_jk Omega_ki - I||_F over RANDOM distinct triples.
 
-    Replaces ``holonomy_deviation``'s deterministic first-512 row-major enumeration (which always
-    samples the same low-index-token triangles -- a systematically biased curvature estimate)
-    with seeded random distinct (i, j, k), returning the full per-triple distribution, a
+    Uses seeded random distinct (i, j, k) rather than a deterministic first-512 row-major
+    enumeration (which always samples the same low-index-token triangles -- a systematically
+    biased curvature estimate), returning the full per-triple distribution, a
     bootstrap-over-triples mean CI, and each triple's index span max|.-.|. On the flat phi-cocycle
     every triangle closes (H = I) by construction, so this is ~0 up to roundoff: a numerical
     consistency monitor of the coboundary, not a flatness certificate (see the section note).
@@ -1436,101 +1325,6 @@ def holonomy_deviation_sampled(
     }
 
 
-def holonomy_wilson_sampled(
-    omega:      'torch.Tensor | CompactFactoredTransport',
-
-    *,
-    n_heads:    int                 = 1,
-    n_triples:  int                 = 512,
-    n_boot:     int                 = 200,
-    seed:       int                 = 0,
-    irrep_dims: Optional[List[int]] = None,   # per-block dims d_b of an unequal irrep tower (sum d_b = K)
-) -> Dict[str, torch.Tensor]:
-    r"""Wilson holonomy observable W_ijk = Re Tr(H_ijk) over random distinct triples.
-
-    The gauge-INVARIANT triangle observable (PIFB:862-869): H_ijk = Omega_ij Omega_jk Omega_ki,
-    W_ijk = Re Tr(H_ijk), reported normalized as W/K so a closed triangle H = I gives W/K = 1,
-    with the Wilson-action density 1 - W/K (flat -> 0) -- the trace complement of
-    ``holonomy_deviation_sampled``'s Frobenius ||H - I||_F. When ``n_heads > 1`` the gauge is
-    block-diagonal H = oplus_h H^(h), so Tr(H) = sum_h Tr(H^(h)) and the per-head observable is
-    W^(h)/d_k with d_k = K / n_heads; the per-head normalized values average back to the full W/K.
-    That equal-chunk reshape assumes n_heads EQUAL contiguous blocks; for an UNEQUAL irrep tower
-    (so_n/sp_n direct sums with per-block dims like [3, 5]) pass ``irrep_dims`` (audit 2026-07-01
-    round-3): the diagonal is split per block and each block b reports W^(b)/d_b = Re Tr(H^(b))/d_b,
-    so the d_b-weighted mean sum_b (d_b/K) W^(b)/d_b recovers the full W/K; ``irrep_dims=None``
-    keeps the equal-chunk decomposition byte-identical.
-    The real part is exact (= Tr) for the real groups built today; it would need ``.real`` only for
-    a complex GL(K, C) gauge. On the flat phi-cocycle every triangle closes by construction so
-    W/K = 1 (deviation 0) up to roundoff; on the coboundary-only registry this is a roundoff monitor,
-    not curvature evidence (see the section note).
-    Seeded random triples match
-    ``holonomy_deviation_sampled`` so the two observables are directly comparable.
-    """
-    compact = isinstance(omega, CompactFactoredTransport)
-    n = _require_unbatched_square_token_transport(omega, "holonomy_wilson_sampled")
-    k = omega.K if compact else omega.shape[-1]
-    device, dtype = omega.device, omega.dtype
-    if irrep_dims is not None:
-        if sum(irrep_dims) != k:
-            raise ValueError(f"sum(irrep_dims)={sum(irrep_dims)} must equal K={k}")
-        if n_heads > 1 and len(irrep_dims) != n_heads:
-            raise ValueError(f"len(irrep_dims)={len(irrep_dims)} must match n_heads={n_heads}")
-    elif n_heads > 1 and k % n_heads != 0:
-        raise ValueError(f"n_heads={n_heads} must divide K={k} for the per-head Wilson decomposition")
-    n_blocks = n_heads if irrep_dims is None else len(irrep_dims)
-    if compact and irrep_dims is not None and irrep_dims != omega.irrep_dims:
-        raise ValueError(
-            f"compact irrep_dims={omega.irrep_dims} do not match requested {irrep_dims}")
-    if compact and n_heads > 1 and n_heads != omega.n_blocks:
-        raise ValueError(
-            f"compact n_heads={n_heads} must match stored blocks={omega.n_blocks}")
-    gen = torch.Generator(device=device).manual_seed(int(seed))
-    draw = torch.randint(0, n, (max(n_triples * 3, 12), 3), generator=gen, device=device)
-    keep = (draw[:, 0] != draw[:, 1]) & (draw[:, 1] != draw[:, 2]) & (draw[:, 0] != draw[:, 2])
-    idx = draw[keep][:n_triples]
-    if idx.numel() == 0:
-        z = torch.zeros((), device=device, dtype=dtype)
-        return {"wilson_mean": torch.ones((), device=device, dtype=dtype),
-                "deviation_mean": z, "ci_lo": z, "ci_hi": z,
-                "per_triple": torch.zeros(0, device=device, dtype=dtype),
-                "span": torch.zeros(0, device=device, dtype=dtype),
-                "per_head": torch.ones(n_blocks, device=device, dtype=dtype)}
-    if compact:
-        o_ij = _compact_sampled_pairs(omega, idx[:, 0], idx[:, 1])
-        o_jk = _compact_sampled_pairs(omega, idx[:, 1], idx[:, 2])
-        o_ki = _compact_sampled_pairs(omega, idx[:, 2], idx[:, 0])
-        h = o_ij @ o_jk @ o_ki                                  # (T,H,d,d)
-        block_trace = torch.diagonal(h, dim1=-2, dim2=-1).sum(dim=-1)  # (T,H)
-        per = block_trace.sum(dim=-1) / k
-        diag = None
-    else:
-        h = omega[idx[:, 0], idx[:, 1]] @ omega[idx[:, 1], idx[:, 2]] @ omega[idx[:, 2], idx[:, 0]]
-        diag = torch.diagonal(h, dim1=-2, dim2=-1)               # (T,K)
-        per = diag.sum(dim=-1) / k
-    span = (idx.amax(dim=1) - idx.amin(dim=1)).to(dtype)
-    dev = 1.0 - per                                              # (T,) Wilson-action density 1 - W/K
-    ridx = torch.randint(0, dev.shape[0], (n_boot, dev.shape[0]), generator=gen, device=device)
-    boot = dev[ridx].mean(dim=1)
-    if compact:
-        native = block_trace.mean(dim=0) / omega.block_dim
-        per_head = native if (irrep_dims is not None or n_heads > 1) else per.mean().reshape(1)
-    elif irrep_dims is not None:
-        blocks   = torch.split(diag, irrep_dims, dim=-1)             # B chunks, each (T, d_b)
-        per_head = torch.stack([b.sum(dim=-1).mean(dim=0) / b.shape[-1] for b in blocks])   # (B,) W^(b)/d_b
-    else:
-        d_k = k // n_heads
-        per_head = diag.reshape(diag.shape[0], n_heads, d_k).sum(dim=-1).mean(dim=0) / d_k   # (n_heads,) W^(h)/d_k
-    return {
-        "wilson_mean":    per.mean(),
-        "deviation_mean": dev.mean(),
-        "ci_lo":          torch.quantile(boot, 0.025),
-        "ci_hi":          torch.quantile(boot, 0.975),
-        "per_triple":     per,
-        "span":           span,
-        "per_head":       per_head,
-    }
-
-
 def curvature_field(
     omega:  'torch.Tensor | CompactFactoredTransport',
     anchor: int = 0,
@@ -1554,44 +1348,6 @@ def curvature_field(
     o_ja = omega[:, anchor].unsqueeze(0)                         # (1, N, K, K) Omega_{j, a} (over j)
     h = o_ai @ omega @ o_ja                                      # (N, N, K, K)
     return torch.linalg.norm(h - eye, dim=(-2, -1))
-
-
-def cocycle_residual_sampled(
-    omega:      'torch.Tensor | CompactFactoredTransport',
-
-    *,
-    n_triples:  int = 512,
-    seed:       int = 0,
-) -> torch.Tensor:                       # () mean ||Omega_ik - Omega_ij Omega_jk||_F over random triples
-    r"""Cocycle defect mean ||Omega_ik - Omega_ij Omega_jk||_F over random distinct triples.
-
-    A consistency check of the COMPOSITION law itself: a flat phi-cocycle
-    Omega_ij = exp(phi_i) exp(-phi_j) satisfies Omega_ik = Omega_ij Omega_jk exactly, so this is ~0
-    (cheaper and more fundamental than the triangle holonomy, which is the special case k -> i).
-    Because every registered transport is built this way, a nonzero value measures floating-point
-    roundoff and the conditioning of the stored frame pair, never a property of the construction:
-    a roundoff monitor, not a flatness certificate (see the section note above).
-    Seeded random triples (matching
-    ``holonomy_deviation_sampled``) avoid the row-major low-index sampling bias.
-    """
-    compact = isinstance(omega, CompactFactoredTransport)
-    n = _require_unbatched_square_token_transport(omega, "cocycle_residual_sampled")
-    device, dtype = omega.device, omega.dtype
-    gen = torch.Generator(device=device).manual_seed(int(seed))
-    draw = torch.randint(0, n, (max(n_triples * 3, 12), 3), generator=gen, device=device)
-    keep = (draw[:, 0] != draw[:, 1]) & (draw[:, 1] != draw[:, 2]) & (draw[:, 0] != draw[:, 2])
-    idx = draw[keep][:n_triples]
-    if idx.numel() == 0:
-        return torch.zeros((), device=device, dtype=dtype)
-    if compact:
-        o_ik = _compact_sampled_pairs(omega, idx[:, 0], idx[:, 2])
-        o_ij = _compact_sampled_pairs(omega, idx[:, 0], idx[:, 1])
-        o_jk = _compact_sampled_pairs(omega, idx[:, 1], idx[:, 2])
-        return (o_ik - o_ij @ o_jk).square().sum(dim=(-3, -2, -1)).sqrt().mean()
-    o_ik = omega[idx[:, 0], idx[:, 2]]                           # (T, K, K)
-    o_ij = omega[idx[:, 0], idx[:, 1]]
-    o_jk = omega[idx[:, 1], idx[:, 2]]
-    return torch.linalg.norm(o_ik - o_ij @ o_jk, dim=(-2, -1)).mean()
 
 
 # --- content-link spectrum (similarity invariants of M_h = O_h T_h) ---
@@ -1798,25 +1554,6 @@ def routing_triangle_defect_sums(
     return out.cpu()                                                          # (H, 3)
 
 
-def triangle_holonomy_eigenvalues(
-    T_hat: torch.Tensor,                  # (H, d, K) ambient sending maps, Hd = K
-    O_hat: torch.Tensor,                  # (H, K, d) ambient receiving maps
-    rho:   torch.Tensor,                  # (S, H) per-head defects rho^h_ijk of S triangles (rho = 1: G alone)
-) -> torch.Tensor:                        # (S, K) complex128
-    r"""Spectra of :math:`R_{ijk}G`, the conjugacy class of the head-sum triangle holonomy.
-
-    :math:`G=[\hat T_h\hat O_g]_{hg}` is the :math:`K\times K` head-transfer matrix and
-    :math:`R=\bigoplus_h\rho^hI_d` (see :func:`routing_triangle_defect_sums`). Frames drop out.
-    """
-    W = _head_transfer(T_hat, O_hat)                                          # (H, H, d, d)
-    H, d = W.shape[0], W.shape[-1]
-    if H * d != T_hat.shape[-1]:
-        raise ValueError(f"holonomy needs tiled heads H*d = K, got H*d={H * d}, K={T_hat.shape[-1]}")
-    G = W.permute(0, 2, 1, 3).reshape(H * d, H * d)                           # (K, K)
-    scale = rho.to(torch.float64).repeat_interleave(d, dim=-1)                # (S, K)
-    return eigvals_on_host(scale.unsqueeze(-1) * G)                           # (S, K)
-
-
 def content_link_spectrum(
     T_hat:     torch.Tensor,                    # (H, d, K)
     O_hat:     torch.Tensor,                    # (H, K, d)
@@ -1884,58 +1621,6 @@ def content_link_spectrum(
 
 # --- free-energy closure and per-token profile (the headline F figure) ---
 
-def free_energy_full_decomposition(
-    self_coupling:   'float | torch.Tensor',     # F self-term sum_i[alpha_i D(q_i||p_i) + R(alpha_i)] (nats)
-    belief_coupling: 'float | torch.Tensor',     # raw sum_ij beta_ij E_ij (nats)
-    attention_ent:   'float | torch.Tensor',     # raw tau sum_ij beta_ij log(beta_ij/pi_ij) (nats)
-    data_term:       'float | torch.Tensor',     # -E_q[log p(o|x)] = val_ce in nats
-
-    *,
-    lambda_beta:     'float | torch.Tensor' = 1.0,
-) -> Dict[str, 'float | torch.Tensor']:
-    r"""Close the free-energy stack: add the data/likelihood term and the lambda_beta scaling.
-
-    The runtime-realised total is self_coupling + lambda_beta (belief_coupling + attention_entropy)
-    + data_term, so the stacked-area figure CLOSES to the F the E-step minimizes (the current
-    one-bar snapshot omits the data term and the scaling). Accepts scalars or per-step arrays
-    elementwise.
-    """
-    belief_scaled = lambda_beta * belief_coupling
-    entropy_scaled = lambda_beta * attention_ent
-    total = self_coupling + belief_scaled + entropy_scaled + data_term
-    out: Dict[str, 'float | torch.Tensor'] = {
-        "self_coupling":   self_coupling,
-        "belief_coupling": belief_scaled,
-        "attention_entropy": entropy_scaled,
-        "data_term":       data_term,
-    }
-    out["total"] = total
-    return out
-
-
-def self_coupling_profile(
-    self_div: torch.Tensor,              # (N,) or (N, K) per-coordinate D(q_i||p_i)
-    alpha:    torch.Tensor,              # (N,) or (N, K) self-coupling alpha_i
-
-    *,
-    eps:      float = 1e-12,
-) -> Dict[str, torch.Tensor]:
-    r"""Surface the per-token (D_i, alpha_i, alpha_i D_i) that diagnostics computes then collapses.
-
-    ``self_divergence_for_alpha`` and ``self_coupling_alpha`` already produce these inside
-    model.diagnostics before they are summed into the scalar ``self_coupling``; this returns the
-    per-token vectors for the self-divergence violin. Per-coordinate inputs (N, K) are summed over
-    the coordinate axis for the per-token totals while the raw arrays are kept.
-    """
-    div_tok = self_div.sum(dim=-1) if self_div.dim() > 1 else self_div
-    coupling_tok = (alpha * self_div)
-    coupling_tok = coupling_tok.sum(dim=-1) if coupling_tok.dim() > 1 else coupling_tok
-    return {
-        "self_div":             div_tok,
-        "alpha":                alpha,
-        "self_coupling_per_token": coupling_tok,
-    }
-
 
 def estep_residuals(
     mu_traj:    torch.Tensor,            # (T+1, N, K) belief means over inner iterations
@@ -1959,34 +1644,6 @@ def estep_residuals(
 
 
 # --- single-seed bootstrap bands (resample data, NOT seeds) ---
-
-def bootstrap_ce_band(
-    per_seq_nats:   torch.Tensor,        # (S,) summed nats per validation sequence
-    per_seq_tokens: torch.Tensor,        # (S,) non-ignored token count per sequence
-
-    *,
-    n_boot:         int   = 1000,
-    seed:           int   = 0,
-    q_lo:           float = 0.025,
-    q_hi:           float = 0.975,
-) -> Dict[str, float]:
-    r"""Token-weighted cross-entropy with a bootstrap-over-SEQUENCES band (single-seed-legitimate).
-
-    Resamples validation sequences with replacement and reports the token-weighted CE
-    sum(nats) / sum(tokens) percentiles. This is within-run uncertainty over the eval set, NOT a
-    cross-seed confidence interval (the run protocol is single-seed); captions must say so. An
-    aggregate with zero evaluated tokens has no cross-entropy estimate and returns NaN for all fields.
-    """
-    total_tokens = per_seq_tokens.sum()
-    if bool(total_tokens == 0):
-        nan = float("nan")
-        return {"ce": nan, "lo": nan, "hi": nan}
-    gen = torch.Generator(device=per_seq_nats.device).manual_seed(int(seed))
-    s = per_seq_nats.shape[0]
-    idx = torch.randint(0, s, (n_boot, s), generator=gen, device=per_seq_nats.device)
-    boot = per_seq_nats[idx].sum(dim=1) / per_seq_tokens[idx].sum(dim=1).clamp(min=1.0)
-    point = float(per_seq_nats.sum() / total_tokens)
-    return {"ce": point, "lo": float(torch.quantile(boot, q_lo)), "hi": float(torch.quantile(boot, q_hi))}
 
 
 def bootstrap_token_ce_band(
@@ -2013,7 +1670,7 @@ def bootstrap_token_ce_band(
     .. math:: D_b = \sum_{t \in b} (\ell^{\mathrm{arm}}_t - \ell^{\mathrm{full}}_t), \qquad n_b = |b|,
 
     and whole blocks are resampled, each replicate being :math:`\sum_b D_b / \sum_b n_b` -- the
-    per-sequence ratio design of :func:`bootstrap_ce_band`. Tokens of one sequence share context,
+    per-sequence ratio design. Tokens of one sequence share context,
     so resampling them independently (``block_len=None``, kept for API compatibility) undercovers
     whenever the per-token deltas are correlated within a sequence.
     """
@@ -2038,153 +1695,3 @@ def bootstrap_token_ce_band(
         idx = torch.randint(0, s, (n_boot, s), generator=gen, device=paired.device)
         delta = block_sums[idx].sum(dim=1) / block_sizes[idx].sum(dim=1)
     return {"delta": point, "lo": float(torch.quantile(delta, q_lo)), "hi": float(torch.quantile(delta, q_hi))}
-
-
-# ---------------------------------------------------------------------------
-# Registry: name -> metric(**context). New probes slot in by name.
-# ---------------------------------------------------------------------------
-_METRICS: Dict[str, Callable] = {}
-
-
-def register_metric(name: str, *, override: bool = False) -> Callable:
-    """Decorator registering a metric that reads its inputs from the context kwargs.
-
-    Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
-    existing name silently shadowed the first, so a config-selected probe could dispatch to
-    an unintended implementation. Pass ``override=True`` to replace deliberately.
-    """
-    def _wrap(fn: Callable) -> Callable:
-        if name in _METRICS and not override:
-            raise KeyError(f"metric {name!r} already registered; pass override=True to replace")
-        _METRICS[name] = fn
-        return fn
-    return _wrap
-
-
-def get_metric(name: str) -> Callable:
-    """Return the registered metric (KeyError if absent)."""
-    if name not in _METRICS:
-        raise KeyError(f"no metric {name!r}; available: {sorted(_METRICS)}")
-    return _METRICS[name]
-
-
-# Each metric's OWN context key is REQUIRED (no None default): a missing or mis-keyed
-# context now raises TypeError at the call instead of an AttributeError deep inside the
-# kernel (effective_rank(None) etc.). The trailing **kw stays only to absorb SIBLING
-# metrics' context keys, since ``compute_metrics`` floods the full context to every metric.
-@register_metric("effective_rank")
-def _m_eff_rank(
-    *,
-    sigma:    torch.Tensor,
-    diagonal: bool,
-    eps:      float         = 1e-12,
-    family:   Optional[str] = None,
-    **kw,
-) -> float:
-    """Mean spectral effective rank of the belief covariances.
-
-    Routes through ``_spectrum`` so a FULL covariance (..., K, K) is reduced to its eigenvalue
-    spectrum before the participation ratio (audit 2026-06-13 L15); passing the matrix directly
-    treated its rows as a spectrum. A diagonal (..., K) variance tensor is its own spectrum.
-
-    ``diagonal`` is REQUIRED (no auto-inference): a diagonal (N, K) variance table with N == K is
-    square in its last two axes, so shape-based auto-inference would misread it as a full (K, K)
-    covariance and eigvalsh a variance vector. The caller passes the explicit flag (audit PB-07)."""
-    return float(effective_rank_per_token(
-        sigma,
-        diagonal=diagonal,
-        eps=eps,
-        family=family,
-    ).mean())
-
-
-@register_metric("attention_entropy")
-def _m_attn_entropy(*, beta: torch.Tensor, **kw) -> float:
-    """Mean attention row entropy."""
-    return float(attention_entropy(beta))
-
-
-@register_metric("holonomy_deviation")
-def _m_holonomy(*, omega: 'torch.Tensor | CompactFactoredTransport', **kw) -> float:
-    """Mean triangle-holonomy departure from identity (coboundary closure residual; a roundoff monitor).
-
-    Routes to the SAMPLED estimator (audit 2026-06-10 F16): the deterministic row-major
-    ``holonomy_deviation`` always reads the same low-index-token triangles -- a systematically
-    biased estimate -- and ``diagnostics()`` already logs the sampled one, so the
-    registry key now agrees with the training log."""
-    return float(holonomy_deviation_sampled(omega)["mean"])
-
-
-@register_metric("gauge_trace_spread")
-def _m_gauge_spread(*, phi: torch.Tensor, generators: torch.Tensor, **kw) -> float:
-    """Spread of log|det Omega| across tokens."""
-    return float(gauge_trace_spread(phi, generators))
-
-
-@register_metric("free_energy_terms")
-def _m_free_energy_terms(
-    *,
-    self_div:                  torch.Tensor,
-    energy:                    torch.Tensor,
-    beta:                      torch.Tensor,
-    alpha:                     torch.Tensor,
-
-    tau:                       'float | torch.Tensor',
-    lambda_beta:               'float | torch.Tensor' = 1.0,
-
-    include_attention_entropy: bool = True,
-
-    log_prior:                 Optional[torch.Tensor] = None,
-    alpha_reg:                 Optional[torch.Tensor] = None,
-    coupling_energy:           Optional[torch.Tensor] = None,
-    log_likelihood:            Optional[torch.Tensor] = None,
-    **kw:                      object,
-) -> Dict[str, float]:
-    """Per-term free-energy decomposition (self-coupling, belief-coupling, attention entropy).
-
-    ``tau`` is REQUIRED (no default): the wrapper has no way to recover the group-aware softmax
-    temperature tau = kappa*sqrt(d_head), and a silent tau=1.0 makes the attention-entropy term (and
-    so ``total``) wrong for any K>1 (audit 2026-06-13 L16). Callers pass ``attention_tau(...)`` -- as
-    the live diagnostics path already does -- matching this module's required-context-key convention.
-
-    Every scalar-objective seam is forwarded. Defaults reproduce the old behavior when a context
-    omits the opt-in terms, so existing registry callers remain byte-identical."""
-    return free_energy_terms(self_div, energy, beta, alpha, tau=tau, log_prior=log_prior,
-                             lambda_beta=lambda_beta,
-                             include_attention_entropy=include_attention_entropy,
-                             alpha_reg=alpha_reg, coupling_energy=coupling_energy,
-                             log_likelihood=log_likelihood)
-
-
-def compute_metrics(
-    names: List[str],
-
-    **context,
-) -> Dict[str, 'float | Dict[str, float]']:
-    r"""Run the named metrics against the keyword ``context`` (sigma=, beta=, omega=, ...).
-
-    Most metrics return a float; ``free_energy_terms`` returns a nested ``Dict[str, float]``,
-    so the value type is widened accordingly."""
-    return {n: get_metric(n)(**context) for n in names}
-
-
-# ---------------------------------------------------------------------------
-# Production diagnostics group (audit PB-07): the metric names ``VFEModel.diagnostics()``
-# dispatches through the registry, plus the declarative (metric, output_key, flatten) mapping
-# the call site walks to assemble its dict. ``attention_entropy`` (row entropy) is aliased to
-# ``attn_entropy`` so it does NOT overwrite the free-energy component named ``attention_entropy``
-# that ``free_energy_terms`` returns; ``free_energy_terms`` flattens its returned mapping into the
-# dict (the call site guards the flatten against overwrite collisions). Holonomy / gauge metrics
-# stay OFF this group: their diagnostics consume sibling confidence bounds and active-frame
-# branches the scalar registry wrappers do not return.
-# ---------------------------------------------------------------------------
-DIAGNOSTIC_METRIC_NAMES = (
-    "attention_entropy",
-    "free_energy_terms",
-    "effective_rank",
-)
-DIAGNOSTIC_METRIC_OUTPUTS = (
-    ("attention_entropy", "attn_entropy", False),
-    ("free_energy_terms", None, True),
-    ("effective_rank", "effective_rank", False),
-)

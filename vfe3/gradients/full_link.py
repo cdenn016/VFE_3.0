@@ -885,7 +885,12 @@ def full_link_profiled_minimizer(
             a0 = c0 / (b0 + self_coupling_divergence(mu64, sigma64, profile))             # (..., N)
             root, residual, g_prime = _profiled_root(curve, a0, b0, c0)
         if capture is not None:
+            # Diagnostic captures only (audit 2026-10-12 round 2, item 16 and M6): the largest root residual
+            # |h(r) - r| and the receivers whose slope 1 - h'(r) is floored at _PROFILED_SLOPE_FLOOR, where the
+            # implicit derivative 1/(1 - h') is capped (near a fold of the fixed-point set). Device tensors; the
+            # diagnostics read them.
             capture["relational_receiver_profiled_residual"] = residual.max().to(dtype)
+            capture["relational_receiver_profiled_floored_slopes"] = (g_prime < _PROFILED_SLOPE_FLOOR).sum()
         alpha = root.to(dtype)
         if torch.is_grad_enabled():
             at_root = full_link_minimizer(mu, sigma, _context_at_alpha(context, alpha), damping=1.0,

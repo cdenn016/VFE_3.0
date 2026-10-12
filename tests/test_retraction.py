@@ -4,9 +4,8 @@ import torch
 import vfe3.geometry.retraction as retraction_module
 
 from vfe3.geometry.retraction import (
-    get_retraction,
     natural_gradient,
-    register_retraction,
+    retract_spd_affine,
     retract_spd_diagonal,
     retract_spd_full,
 )
@@ -169,29 +168,6 @@ def test_full_retraction_uncapped_path_retains_spd_floor(trust_region: float) ->
     assert (torch.linalg.eigvalsh(out) >= eps).all()
 
 
-# --- register_retraction / get_retraction seam (roadmap item 4) ------------
-def test_retraction_registry_round_trip():
-    """register_retraction/get_retraction round-trip and the unknown-name KeyError."""
-    sentinel = object()
-
-    @register_retraction("_test_dummy_retraction")
-    def _dummy(*args, **kwargs):
-        return sentinel
-
-    try:
-        assert get_retraction("_test_dummy_retraction")() is sentinel
-        with pytest.raises(KeyError):
-            get_retraction("nope")
-    finally:
-        from vfe3.geometry.retraction import _RETRACTIONS
-        _RETRACTIONS.pop("_test_dummy_retraction", None)
-
-
-def test_spd_affine_is_registered():
-    """The default affine-invariant SPD retraction is registered under 'spd_affine'."""
-    assert callable(get_retraction("spd_affine"))
-
-
 def test_log_euclidean_helpers_are_retired() -> None:
     assert not hasattr(retraction_module, "retract_log_euclidean")
     assert not hasattr(retraction_module, "retract_logeuclidean_full")
@@ -206,7 +182,7 @@ def test_spd_affine_bit_identical_diagonal():
     legacy = retract_spd_diagonal(
         sigma, -step * nat_sigma, trust_region=5.0, eps=1e-6, sigma_max=5.0,
     )
-    seam = get_retraction("spd_affine")(
+    seam = retract_spd_affine(
         sigma, -step * nat_sigma, mean_ndim=3, trust_region=5.0, eps=1e-6, sigma_max=5.0,
     )
     assert torch.equal(seam, legacy)
@@ -223,7 +199,7 @@ def test_spd_affine_bit_identical_full():
     legacy = retract_spd_full(
         sigma, -step * nat_sigma, trust_region=5.0, eps=1e-6, sigma_max=5.0,
     )
-    seam = get_retraction("spd_affine")(
+    seam = retract_spd_affine(
         sigma, -step * nat_sigma, mean_ndim=3, trust_region=5.0, eps=1e-6, sigma_max=5.0,
     )
     assert torch.equal(seam, legacy)

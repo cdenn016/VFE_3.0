@@ -87,7 +87,6 @@ def _assert_bit_inert(base: Dict[str, Any], override: Dict[str, Any]) -> None:
 _PREDICTIVE_INERT = [
     {"lambda_beta": 5.0},
     {"sigma_max": 1e-3},
-    {"mu_trust_cholesky_rounds": 0},
     {"prior_handoff_rho": 0.0},
     {"prior_handoff_sigma": 1.0},
     {"attention_window": 1},
@@ -147,8 +146,7 @@ def test_decode_notices_only_report_active_explicit_settings(monkeypatch: pytest
 
 def test_launcher_route_inactive_report() -> None:
     inactive = _cfg(_launcher()).inactive_fields()
-    for name in ("family", "lambda_beta", "sigma_max",
-                 "mu_trust_cholesky_rounds", "attention_window", "prior_handoff_rho",
+    for name in ("family", "lambda_beta", "sigma_max", "attention_window", "prior_handoff_rho",
                  "prior_handoff_sigma"):
         assert name in inactive, name
     for name in ("decode_tau", "kappa_beta", "kl_max", "untie_decode_bank"):
@@ -330,7 +328,9 @@ def test_inert_sweep_is_rejected_when_selected(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(ablation, "_resolved_sweep_baseline", lambda: dict(baseline))
     # The registered sigma_max sweep requires its sigma E-step; without it the ceiling is inert on this baseline.
     monkeypatch.setitem(ablation.SWEEPS, "sigma_max_unrouted", {"param": "sigma_max", "values": [1, 100]})
-    for name in ("lambda_beta", "sigma_max_unrouted"):
+    # The registered lambda_beta sweep requires projected_gradient; without it the weight is inert on this baseline.
+    monkeypatch.setitem(ablation.SWEEPS, "lambda_beta_unrouted", {"param": "lambda_beta", "values": [0.5, 1.0]})
+    for name in ("lambda_beta_unrouted", "sigma_max_unrouted"):
         with pytest.raises(ValueError, match=f"{name}.*INERT on EVERY"):
             ablation.validate_sweeps([name], require_construction=True)
     ablation.validate_sweeps(list(ablation.SWEEPS), require_construction=False)   # registry stays valid

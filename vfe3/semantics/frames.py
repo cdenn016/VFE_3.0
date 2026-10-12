@@ -176,10 +176,6 @@ def _spearman(x: Any, y: Any) -> Dict[str, Any]:
 # Matrix exponential / logarithm
 # ----------------------------------------------------------------------------------------------
 
-def expm_blocks(X_blocks: Sequence[Any]) -> List[Tensor]:
-    r"""Per-block matrix exponentials :math:`U^b = \exp(X^b)` (float64), one (n, d_b, d_b) per block."""
-    return [_expm(_t(X)) for X in X_blocks]
-
 
 def _relative_residual(L: Tensor, A: Tensor) -> Tensor:
     r"""Reconstruction residual :math:`r = \|e^{L} - A\|_F / \|A\|_F` per matrix (NaN if L is not finite)."""

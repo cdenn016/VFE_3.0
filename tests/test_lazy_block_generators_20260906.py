@@ -121,7 +121,6 @@ def test_diagnostic_embedding_and_statistics_keep_dense_reductions(dtype: torch.
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         torch.testing.assert_close(torch.linalg.matrix_norm(actual), torch.linalg.matrix_norm(expected), rtol=0, atol=0)
         assert metrics.phi_chart_statistics(phi, group, block_dims=[2, 2]) == metrics.phi_chart_statistics(phi, basis, block_dims=[2, 2])
-        torch.testing.assert_close(metrics.gauge_trace_spread(phi, group), metrics.gauge_trace_spread(phi, basis), rtol=0, atol=0)
         small_phi = phi * 0.002
         assert metrics.flatness_reference_statistics(small_phi, group, block_dims=[2, 2]) == metrics.flatness_reference_statistics(small_phi, basis, block_dims=[2, 2])
     assert isinstance(group._generator_source, groups._ElementaryBlockBasis)

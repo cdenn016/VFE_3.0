@@ -125,10 +125,10 @@ config = dict(
     #################################
     #           Modes               #
     #################################
-    family                           = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full" | "gaussian_block" (per-head SPD blocks; equal head-block groups, kernel readout) | "laplace_diagonal"
+    family                           = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full" | "gaussian_block" (per-head SPD blocks; equal head-block groups, kernel readout)
     prior_covariance_table           = "diagonal",  # "diagonal" | "block_cholesky" (frame-free (xi, C) table: gaussian_block/full, gauge_transport="off", untie_decode_bank)
     encode_mode                      = "per_token",   # "per_token" | "per_token_additive" (additive only when phi carries no position)
-    decode_mode                      = 'linear',  # "linear" | "diagonal_chunked" | "full_chunked" | "expected_likelihood_chunked" | "family_chunked" (the *_chunked modes decode through the prior bank)
+    decode_mode                      = 'linear',  # "linear" | "diagonal_chunked" | "full_chunked" | "expected_likelihood_chunked" (the *_chunked modes decode through the prior bank)
     decode_covariance                = "belief",                  # "belief" (stack's final Sigma_q) | "encoded" (token's encoded covariance) | "constant" (sigma_init I); prior-bank decode only
         
     attention_mode                   = "projected_predictive",  # "projected_predictive" | "projected_gradient"
@@ -250,7 +250,7 @@ config = dict(
     kappa_beta                       = 1,        # tau = kappa * sqrt(d_head)
     learn_attention_temperature      = False,    # learn a per-layer, per-head log-temperature offset (starts at tau above)
     
-    beta_attention_prior             = 'causal',    # "causal" | "causal_noself" | "causal_alibi" | "causal_alibi_noself" | "causal_windowed" | "t5_relative_bias"
+    beta_attention_prior             = 'causal',    # "causal" | "causal_noself" | "causal_alibi" | "causal_alibi_noself" | "causal_windowed"
     
     #################################
     #         Belief E-step
@@ -317,6 +317,7 @@ config = dict(
     #   Numerics/Speed
     #################################
   
+    kl_max                           = None,          # None (8 * embed_dim) | nats: safety clamp on every divergence, binding only on blowups
     amp_dtype                        = 'bf16',        # None (fp32) | "bf16" | "fp16". Sigma must be at least fp32
     fp32_matmul_precision            = "highest",          # None (leave as-is) | "highest" | "high" | "medium" ("high" permits TF32 on the decode/energy GEMMs)
     routing_kl_max_reference         = "absolute",  # "absolute" | "row_min" (kernel router: kl_max caps D_ij, or the gap D_ij - min_j D_ij)
@@ -332,13 +333,6 @@ config = dict(
    
     
 )
-
-# kl_max is the numerical safety-net clamp on EVERY divergence (KL(q||p), pairwise energy),
-# next to eps -- NOT an operating ceiling. Diagonal KL is a sum over K coords (~0.8 nats/coord trained),
-# so the K-INDEPENDENT 100.0 default binds for ~100% of tokens at large K (K* ~ 126). Scale it with K
-# so it binds only on genuine NaN/inf/Cholesky blowups; F is provably kl_max-independent below the
-# ceiling (safe_kl_clamp is the identity there). See docs/2026-06-21-edits.md.
-config["kl_max"] = 8 * config["embed_dim"]
 
 
 
@@ -370,7 +364,7 @@ def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int,
         f" auxiliary M-LRs: "
         f"block_mlp={_fmt_mixer_lr(cfg.m_block_mlp_lr, cfg.m_p_mu_lr)}",
         f" VFE: lambda_alpha_mode={cfg.lambda_alpha_mode}  kappa_beta={cfg.kappa_beta}  "
-        f"tau={_fmt_tau(cfg, model)}  mass_phi={cfg.mass_phi}",
+        f"tau={_fmt_tau(cfg, model)}",
         f" seed={cfg.seed}",
         bar,
     ])

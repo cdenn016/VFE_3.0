@@ -21,11 +21,9 @@ Modularity:
 Decode seam (PB-14): the authoritative ``reference_decode`` scores logits =
 -D_configured(q || pi_v)/tau_eff through the configured family (``self.family``) and divergence
 functional (``self.divergence_family`` at ``self.renyi_order``). The fast diagonal/full kernels are
-the OPTIMIZED gaussian_* + renyi(alpha=1) implementations; config requires a ``family_consistent``
-decoder for any non-Gaussian family on a prior-bank decoder. The registry seam is
+the OPTIMIZED gaussian_* + renyi(alpha=1) implementations. The registry seam is
 honored at the COVARIANCE-STRUCTURE granularity (``DecodeRegistration.covariance_kinds``): a new
-covariance structure or a new family-consistent readout is added by writing-and-registering a decode
-kernel, never by editing a call site. The full kernels score a full q against the intentionally
+covariance structure is added by writing-and-registering a decode kernel, never by editing a call site. The full kernels score a full q against the intentionally
 DIAGONAL vocabulary-prior table (promoted with diag_embed only when the family is full).
 ``reference_decode`` is the slow per-V seam-call cross-check the fused canonical kernels are pinned
 to EXACTLY (and under ``log_softmax``) on the canonical path.
@@ -127,22 +125,6 @@ def packed_cholesky_covariance(
     factor = torch.exp(0.5 * log_variance).unsqueeze(-1) * factor                    # diag(e^{l/2}) (I + N)
     eye = torch.eye(d, dtype=packed.dtype, device=packed.device)
     return factor @ factor.transpose(-1, -2) + eps * eye
-
-
-def set_decode_av_precision(precision: str) -> str:
-    r"""Set the process-wide decode ``a_v`` working precision; returns the previous value."""
-    global _DECODE_AV_PRECISION
-    if precision not in _DECODE_AV_PRECISIONS:
-        raise ValueError(
-            f"decode_av_precision must be one of {_DECODE_AV_PRECISIONS}, got {precision!r}")
-    previous = _DECODE_AV_PRECISION
-    _DECODE_AV_PRECISION = precision
-    return previous
-
-
-def decode_av_precision() -> str:
-    r"""Return the active decode ``a_v`` working precision."""
-    return _DECODE_AV_PRECISION
 
 
 DECODE_CE_CHECKPOINT_AUTO_BYTES: int = 2 * 1024 ** 3   # 2 GiB; see decode_ce_checkpoint in config.py
@@ -473,10 +455,6 @@ class DecodeRegistration:
     rather than treating ``supports_full`` as an exclusive rank bit, so a dual-rank decoder (e.g.
     ``family``) accepts BOTH a diagonal and a full family. ``supports_full`` is retained (public,
     read by legacy callers) and stays coherent with the set: it is ``"full" in covariance_kinds``.
-    ``family_consistent`` flags a decoder that scores logits = -D_configured(q||p_v)/tau_eff through
-    the CONFIGURED family AND divergence functional (as opposed to the fast kernels' hardcoded
-    gaussian alpha=1 KL); config requires a family_consistent decoder for any non-Gaussian family or
-    noncanonical divergence on a prior-bank decoder.
 
     Direct construction ``DecodeRegistration(callable, supports_full, supports_chunked, fused_ce)``
     stays source-compatible: later capability fields default, and ``__post_init__`` derives the
@@ -489,7 +467,6 @@ class DecodeRegistration:
     supports_full:     bool
     supports_chunked:  bool
     fused_ce:          'Optional[FusedCECallable]'
-    family_consistent: bool                        = False
     covariance_kinds:  'Optional[FrozenSet[str]]'  = None
     can_omit_base_mean: bool                       = False
     can_omit_base_variance: bool                   = False
@@ -501,7 +478,6 @@ class DecodeRegistration:
         for field_name in (
             "supports_full",
             "supports_chunked",
-            "family_consistent",
             "can_omit_base_mean",
             "can_omit_base_variance",
             "fused_ce_supports_stats",
@@ -543,24 +519,36 @@ _DECODERS: Dict[str, DecodeRegistration] = {}
 
 @dataclass(frozen=True)
 class DecodeCEResult:
-    """Opt-in fused-decoder result with the exact, unclamped reduction denominator."""
+    """Opt-in fused-decoder result with the exact, unclamped reduction denominator.
+
+    ``ce`` is always the plug-in cross-entropy. ``objective`` is the training objective when it differs
+    from that CE (the second-order linear decode, ``decode_second_order``) and None otherwise.
+    """
 
     ce:            torch.Tensor
     scored_tokens: torch.Tensor
     excluded_tokens: Optional[torch.Tensor] = None
+    objective:     Optional[torch.Tensor] = None
 
 
 def _decode_ce_result(
     ce:           torch.Tensor,
     valid:        torch.Tensor,
     return_stats: bool,
+
+    *,
+    objective:    Optional[torch.Tensor] = None,
 ) -> 'torch.Tensor | DecodeCEResult':
-    """Keep scalar CE as the default while exposing a device-side int64 count on request."""
+    """Keep the scalar training loss as the default while exposing a device-side int64 count on request.
+
+    The scalar return is the objective when one is given (the loss the caller trains on); the stats
+    record carries the plug-in ``ce`` and the ``objective`` separately.
+    """
     if not return_stats:
-        return ce
+        return ce if objective is None else objective
     scored = valid.sum(dtype=torch.int64)
     excluded = valid.numel() - scored                      # no host-to-device copy of the count
-    return DecodeCEResult(ce=ce, scored_tokens=scored, excluded_tokens=excluded)
+    return DecodeCEResult(ce=ce, scored_tokens=scored, excluded_tokens=excluded, objective=objective)
 
 # Once-per-process guard for the decode_unigram_prior=True-with-unset-table warning
 # (the decode then degenerates to the current uniform-prior behavior).
@@ -625,7 +613,6 @@ def register_decode(
     supports_full:     Optional[bool]              = None,
     supports_chunked:  bool                        = False,
     override:          bool                        = False,
-    family_consistent: bool                        = False,
     fused_ce:          'Optional[FusedCECallable]'      = None,
     covariance_kinds:  'Optional[FrozenSet[str]]'       = None,
     can_omit_base_mean:     bool                        = False,
@@ -639,8 +626,7 @@ def register_decode(
     ``{"diagonal"}``); SUPPLIED -> derive ``supports_full`` from membership (``"full" in kinds``) and
     reject an explicitly contradictory legacy ``supports_full``. Every existing
     ``register_decode(..., supports_full=True|False)`` call therefore keeps its old behavior.
-    ``family_consistent`` marks a decoder that reads logits out through the CONFIGURED family and
-    divergence functional. ``supports_chunked`` advertises a fused chunked-CE training path, whose
+    ``supports_chunked`` advertises a fused chunked-CE training path, whose
     callable is ``fused_ce``. ``fused_ce_supports_stats=True`` declares that callable's opt-in
     ``return_stats`` contract; the default is false so existing callables receive exactly their
     historical keyword set. The callable and all capabilities are replaced atomically, so an
@@ -689,7 +675,6 @@ def register_decode(
             supports_full=resolved_full,
             supports_chunked=supports_chunked,
             fused_ce=fused_ce,
-            family_consistent=family_consistent,
             covariance_kinds=resolved_kinds,
             can_omit_base_mean=can_omit_base_mean,
             can_omit_base_variance=can_omit_base_variance,
@@ -1840,8 +1825,10 @@ class PriorBank(nn.Module):
             in_chunk_f = in_chunk.to(mu_q.dtype)                           # (B, N) 0/1, carried into the checkpoint
             local_idx = (targets - v0).clamp(min=0, max=v1 - v0 - 1)       # (B, N) safe gather index
             grad_active = torch.is_grad_enabled() and (mu_q.requires_grad or W.requires_grad)
+            # The second-order closure keeps two (B, N, Vc) tensors for backward, the logits and the chunk
+            # probabilities p_c (audit 2026-10-12 round 2, item 16), so it counts twice the first-order workspace.
             activation_bytes = _decode_ce_chunk_activation_bytes(
-                mu_q, V if self.decode_ce_checkpoint == "auto_aggregate" else v1 - v0)
+                mu_q, V if self.decode_ce_checkpoint == "auto_aggregate" else v1 - v0, 2 if second_order else 1)
             summaries = _chunk_summaries_second_order if second_order else _chunk_summaries
             if _decode_ce_should_checkpoint(self.decode_ce_checkpoint, grad_active, activation_bytes):
                 chunk_result = _checkpoint.checkpoint(
@@ -1859,18 +1846,23 @@ class PriorBank(nn.Module):
         lse_stack = torch.stack(lse_chunks, dim=0)                         # (C, B, N)
         logsumexp_v = torch.logsumexp(lse_stack, dim=0)                    # (B, N)
         ce_per_pos = logsumexp_v - target_logit                           # (B, N) = -log-softmax at target
-        if second_order:
-            # Global moments E_p[w], E_p[w o w]: chunk weights exp(lse_c - LSE) sum to 1 per position.
-            chunk_weight = torch.exp(lse_stack - logsumexp_v)              # (C, B, N)
-            moments = (chunk_weight.unsqueeze(-1) * torch.stack(moment_chunks, dim=0)).sum(0)  # (B, N, 2K)
-            K = mu_q.shape[-1]
-            mean_w, mean_w_sq = moments[..., :K], moments[..., K:]         # (B, N, K) each
-            # 1/2 sum_k sigma_k Var_p(w_k) = 1/2 tr(Sigma Cov_p(w)), the delta-method term.
-            ce_per_pos = ce_per_pos + 0.5 * (sigma_q * (mean_w_sq - mean_w * mean_w)).sum(-1)  # (B, N)
         # Device-side masked mean: clamp the denominator so an all-ignore microbatch yields a finite
         # grad-connected 0 (the numerator is then 0) without a host sync to branch on valid.sum() == 0.
-        ce = (ce_per_pos * valid).sum() / valid.sum().clamp_min(1)
-        return _decode_ce_result(ce, original_valid, return_stats)
+        n_valid = valid.sum().clamp_min(1)
+        ce = (ce_per_pos * valid).sum() / n_valid
+        if not second_order:
+            return _decode_ce_result(ce, original_valid, return_stats)
+        # Global moments E_p[w], E_p[w o w]: chunk weights exp(lse_c - LSE) sum to 1 per position.
+        chunk_weight = torch.exp(lse_stack - logsumexp_v)                  # (C, B, N)
+        moments = (chunk_weight.unsqueeze(-1) * torch.stack(moment_chunks, dim=0)).sum(0)  # (B, N, 2K)
+        K = mu_q.shape[-1]
+        mean_w, mean_w_sq = moments[..., :K], moments[..., K:]             # (B, N, K) each
+        # 1/2 sum_k sigma_k Var_p(w_k) = 1/2 tr(Sigma Cov_p(w)), the delta-method term.
+        delta_term = 0.5 * (sigma_q * (mean_w_sq - mean_w * mean_w)).sum(-1)  # (B, N)
+        objective = ((ce_per_pos + delta_term) * valid).sum() / n_valid
+        # The plug-in CE is reported, the second-order objective is trained on (audit 2026-10-12 round 2,
+        # item 12): the plug-in value is the one validation scores.
+        return _decode_ce_result(ce.detach(), original_valid, return_stats, objective=objective)
 
     def decode_ce_expected_likelihood_chunked(
         self,

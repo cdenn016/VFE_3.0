@@ -477,7 +477,10 @@ def test_inactive_fields_keep_the_diagnostic_inputs_live() -> None:
             assert live <= set(off), (mode, n_layers)
             assert not live & set(on), (mode, n_layers, live & set(on))
             assert "would feed that log-step diagnostic only" in off["lambda_beta"]
-    assert {"prior_handoff_rho", "prior_handoff_sigma"} <= set(inactive(n_layers=2))
+    # The moment-matched floor f Sigma_p reads the handed-off prior covariance (audit 2026-10-12 round 2, item 8).
+    assert "prior_handoff_rho" in inactive(n_layers=2) and "prior_handoff_sigma" not in inactive(n_layers=2)
+    assert {"prior_handoff_rho", "prior_handoff_sigma"} <= set(
+        inactive(n_layers=2, predictive_covariance="passthrough"))
     assert not {"prior_handoff_rho", "prior_handoff_sigma"} & set(
         inactive(n_layers=2, diagnose_canonical_free_energy=True))
     minimal_off = inactive(**MINIMAL_AGENT)

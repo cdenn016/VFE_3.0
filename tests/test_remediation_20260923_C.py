@@ -21,7 +21,6 @@ from vfe3.belief import BeliefState
 from vfe3.gauge_optim import GaugeManifoldAdamW, stage_pullback_group_candidate
 from vfe3.geometry.groups import get_group
 from vfe3.geometry.phi_preconditioner import pullback_group_direction
-from vfe3.geometry.retraction import retract_phi
 from vfe3.geometry.transport import (
     _checked_group_inverse,
     stable_matrix_exp_pair,
@@ -29,7 +28,6 @@ from vfe3.geometry.transport import (
 from vfe3.inference import e_step as e_step_module
 from vfe3.inference.e_step import e_step_iteration
 from vfe3.model.model import VFEModel
-from vfe3.numerics import condition_number, floor_eigenvalues
 from vfe3.relational_scoring import (
     projected_gaussian_kl,
     projected_moments,
@@ -138,43 +136,6 @@ def _max_future_leak(cfg) -> float:
     return worst
 
 
-# -- #7: the E-step phi retraction bounds the step, not the base point ---------------------------
-
-@pytest.mark.parametrize("n_heads, mode, compact", [
-    (1, "euclidean", False), (1, "bch", False), (2, "bch", True)])
-def test_retract_phi_zero_step_returns_an_exterior_frame(n_heads: int, mode: str,
-                                                          compact: bool) -> None:
-    group = get_group("block_glk")(3 if n_heads == 1 else 4, n_heads, dtype=torch.float64)
-    torch.manual_seed(0)
-    phi = torch.randn(3, group.generators.shape[0], dtype=torch.float64)
-    phi = 8.0 * phi / phi.norm(dim=-1, keepdim=True)              # outside the default cap of 5
-    out = retract_phi(phi, torch.zeros_like(phi), group, mode=mode, compact_blocks=compact)
-    if mode == "euclidean" or compact:
-        assert torch.equal(out, phi)
-    else:
-        assert torch.allclose(out, phi, rtol=0.0, atol=1e-12)
-
-
-def test_retract_phi_keeps_identity_differential_inside_and_bounds_outward_steps() -> None:
-    group = get_group("block_glk")(3, 1, dtype=torch.float64)
-    torch.manual_seed(1)
-    inside = torch.randn(2, 9, dtype=torch.float64)
-    inside = 1.5 * inside / inside.norm(dim=-1, keepdim=True)
-    direction = torch.randn(2, 9, dtype=torch.float64)
-    t = 1e-7
-    step = retract_phi(inside, direction, group, step_size=t, trust_region=100.0)
-    assert torch.allclose((step - inside) / t, direction, atol=1e-6)
-
-    outside = 8.0 * inside / inside.norm(dim=-1, keepdim=True)
-    moved = retract_phi(outside, outside, group, step_size=1.0, trust_region=100.0)
-    assert (moved.norm(dim=-1) <= 8.0 + 1e-9).all()
-    # A step from inside the ball still saturates at the group constant.
-    saturated = retract_phi(torch.zeros(2, 9, dtype=torch.float64),
-                            1e3 * torch.ones(2, 9, dtype=torch.float64), group, trust_region=100.0)
-    assert torch.allclose(saturated.norm(dim=-1), torch.full((2,), 5.0, dtype=torch.float64),
-                          atol=1e-3)
-
-
 # -- #10: pullback_group rejects ill-conditioned or chart-violating rows individually ------------
 
 def test_pullback_staging_rejects_only_the_ill_conditioned_row(monkeypatch) -> None:
@@ -187,8 +148,7 @@ def test_pullback_staging_rejects_only_the_ill_conditioned_row(monkeypatch) -> N
         _pullback_single_block(grad, phi, group.generators)
 
     candidate = stage_pullback_group_candidate(
-        grad, phi, group, learning_rate=1e-3, trust_radius=0.1, chart_max_norm=10.0,
-        bch_residual_max=1e-6)
+        grad, phi, group, learning_rate=1e-3, trust_radius=0.1, chart_max_norm=10.0)
     assert candidate.rejected_rows.tolist() == [True, False]
     assert torch.equal(candidate.candidate_phi[0], phi[0])
     assert not torch.equal(candidate.candidate_phi[1], phi[1])
@@ -196,8 +156,7 @@ def test_pullback_staging_rejects_only_the_ill_conditioned_row(monkeypatch) -> N
     param = torch.nn.Parameter(phi.clone())
     optimizer = GaugeManifoldAdamW(
         [{"params": [param], "lr": 1e-3, "pullback_group": True, "weight_decay": 0.0}], group,
-        phi_group_trust_radius=0.1, phi_chart_max_norm=10.0, phi_bch_residual_max=1e-6,
-        weight_decay=0.0)
+        phi_group_trust_radius=0.1, phi_chart_max_norm=10.0, weight_decay=0.0)
     param.grad = grad.clone()
     optimizer._collect_gauge_diag = True
     optimizer.step()
@@ -222,7 +181,7 @@ def test_pullback_staging_backtracks_or_rejects_chart_bound_rows_per_row(monkeyp
                                      scaled_solve_residual=zeros, series_order=40)))
     candidate = stage_pullback_group_candidate(
         -torch.ones_like(phi), phi, group, learning_rate=1.0, trust_radius=1.0,
-        chart_max_norm=1.0, bch_residual_max=1e-6)
+        chart_max_norm=1.0)
     # Row 0 starts inside: 0.99 + 0.2 / 2^5 = 0.99625 is the first backtrack inside the chart.
     assert candidate.backtracking_reductions[0].item() == 5
     assert candidate.candidate_phi[0, 0].item() == pytest.approx(0.99625)
@@ -240,8 +199,7 @@ def test_pullback_staging_still_raises_on_nonfinite_state() -> None:
     grad[0, 0] = float("nan")
     with pytest.raises(FloatingPointError, match="nonfinite grad or chart"):
         stage_pullback_group_candidate(
-            grad, phi, group, learning_rate=1e-3, trust_radius=0.1, chart_max_norm=10.0,
-            bch_residual_max=1e-6)
+            grad, phi, group, learning_rate=1e-3, trust_radius=0.1, chart_max_norm=10.0)
 
 
 # -- #27: sigma_max annotations match VFE3Config ------------------------------------------------
@@ -254,19 +212,6 @@ def test_sigma_max_annotation_matches_config(function) -> None:
 
 
 # -- Low: numerics keep float64 in float64 -------------------------------------------------------
-
-def test_condition_number_and_floor_eigenvalues_keep_float64() -> None:
-    torch.manual_seed(0)
-    Q = torch.linalg.qr(torch.randn(8, 8, dtype=torch.float64))[0]
-    spectrum = torch.logspace(-10, 0, 8, dtype=torch.float64)
-    A = Q @ torch.diag(spectrum) @ Q.T
-    cond = condition_number(A)
-    assert cond.dtype == torch.float64
-    assert cond.item() == pytest.approx(1e10, rel=1e-3)          # float32 returned inf here
-    floored = floor_eigenvalues(A, floor=1e-9)
-    assert floored.dtype == torch.float64
-    assert torch.linalg.eigvalsh(floored).min().item() >= 1e-9 * (1 - 1e-6)
-    assert condition_number(A.float()).dtype == torch.float32    # float32 policy unchanged
 
 
 def test_eigh_damped_forward_routes_through_safe_eigh(monkeypatch) -> None:

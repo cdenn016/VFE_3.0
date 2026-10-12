@@ -196,14 +196,14 @@ def test_elbo_is_nondecreasing_over_sweeps_and_below_the_one_head_evidence(H: in
               for n in range(1, 9)]
     for before, after in zip(bounds, bounds[1:]):
         assert float((after.elbo - before.elbo).min()) >= -1e-10
-    gap_1, gap_8 = (bounds[0].evidence - bounds[0].elbo), (bounds[-1].evidence - bounds[-1].elbo)
+    gap_1, gap_8 = (bounds[0].adf_evidence - bounds[0].elbo), (bounds[-1].adf_evidence - bounds[-1].elbo)
     exact = ma.minimal_agent_readout(xi, C, S, Tm, log_noise, lp, "exact", elbo=True)
     if H == 1:                                                                # the ADF evidence is exact
         assert float(gap_1.min()) >= -1e-10 and float(gap_8.min()) >= -1e-10
-        assert float((exact.evidence - exact.elbo).min()) >= -1e-10
+        assert float((exact.adf_evidence - exact.elbo).min()) >= -1e-10
     print(f"\n[T1] H={H} mean-field gap per receiver (nats): 1 sweep {gap_1.numpy().round(4).tolist()}, "
           f"8 sweeps {gap_8.numpy().round(4).tolist()}; exact-path ELBO gap "
-          f"{(exact.evidence - exact.elbo).numpy().round(4).tolist()}")
+          f"{(exact.adf_evidence - exact.elbo).numpy().round(4).tolist()}")
 
 
 def test_elbo_on_block_diagonal_covariances_equals_the_dense_call() -> None:
@@ -215,7 +215,8 @@ def test_elbo_on_block_diagonal_covariances_equals_the_dense_call() -> None:
         a = ma.minimal_agent_readout(xi, dense, S, Tm, log_noise, lp, inference, elbo=True)
         b = ma.minimal_agent_readout(xi, blocks, S, Tm, log_noise, lp, inference, elbo=True)
         torch.testing.assert_close(b.elbo, a.elbo, rtol=1e-11, atol=1e-11)
-        torch.testing.assert_close(b.evidence, a.evidence, rtol=1e-11, atol=1e-11)
+        torch.testing.assert_close(b.adf_evidence, a.adf_evidence, rtol=1e-11, atol=1e-11)
+        torch.testing.assert_close(b.is_evidence, a.is_evidence, rtol=1e-11, atol=1e-11)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -322,11 +323,18 @@ def test_elbo_capture_rows_and_columns_appear_only_with_the_toggle() -> None:
         logits_on, logits_off = on(windows), off(windows)
     assert torch.equal(logits_on, logits_off)                                 # the toggle never touches the forward
     per_layer = on.diagnostics_per_layer(windows[:1])
+    uncoupled = [coupling == 0.0 for coupling in per_layer["relational_minimal_agent_head_coupling"]]
     for key in ma.MINIMAL_AGENT_ELBO_KEYS:
         values = per_layer[key]
-        assert len(values) == on.cfg.n_layers and all(math.isfinite(v) for v in values)
-    for elbo, evidence, gap in zip(*(per_layer[key] for key in ma.MINIMAL_AGENT_ELBO_KEYS)):
-        assert gap == pytest.approx(evidence - elbo, rel=1e-6, abs=1e-6)
+        # The exact evidence is reported only where every receiver's heads are uncoupled (round 2, item 12).
+        expect = uncoupled if key == "relational_minimal_agent_evidence" else [True] * on.cfg.n_layers
+        assert [math.isfinite(v) for v in values] == expect, key
+    for row in zip(uncoupled, *(per_layer[key] for key in ma.MINIMAL_AGENT_ELBO_KEYS)):
+        exact_layer, elbo, adf, adf_gap, evidence, sampled, sampled_gap = row
+        assert adf_gap == pytest.approx(adf - elbo, rel=1e-6, abs=1e-6)
+        assert sampled_gap == pytest.approx(sampled - elbo, rel=1e-6, abs=1e-6)
+        if exact_layer:                                                       # ADF is exact: the gap is a true gap
+            assert evidence == pytest.approx(adf, rel=1e-6, abs=1e-6) and adf_gap >= -1e-6
     assert not any(key in off.diagnostics_per_layer(windows[:1]) for key in ma.MINIMAL_AGENT_ELBO_KEYS)
     for model, expect in ((on, True), (off, False)):
         features: dict = {}
@@ -335,7 +343,10 @@ def test_elbo_capture_rows_and_columns_appear_only_with_the_toggle() -> None:
         minimal_rows, prototype_rows = T._elbo_rows(features, 5)
         assert bool(minimal_rows) == expect and bool(prototype_rows) == expect
         for row in minimal_rows:
-            assert set(row) == set(T.MINIMAL_AGENT_ELBO_FIELDS) and row["elbo_gap"] >= -1e-6
+            # The ADF gap is not sign-definite with coupled heads, and the importance-sampled one is a finite-sample
+            # estimate (round 2, item 12 and M1), so neither is asserted nonnegative here.
+            assert set(row) == set(T.MINIMAL_AGENT_ELBO_FIELDS) and row["is_samples"] == ma.MINIMAL_AGENT_IS_SAMPLES
+            assert math.isfinite(row["adf_elbo_gap"]) and math.isfinite(row["is_elbo_gap"])
         for row in prototype_rows:
             assert set(row) == set(T.PROTOTYPE_ELBO_FIELDS) and row["n_tokens"] == windows.numel()
             assert row["elbo_gap"] >= -1e-9

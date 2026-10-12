@@ -49,7 +49,6 @@ def test_frame_keys_match_an_independent_rebuild(overrides: dict) -> None:
     if belief.right_phi is not None:
         U = U @ torch.linalg.matrix_exp(torch.einsum("...a,aij->...ij", belief.right_phi.double(), G))
     U = U.reshape(-1, *U.shape[-2:])
-    assert math.isnan(d["gauge_trace_spread"])                 # legacy column, NaN by contract
     inv = metrics.group_gauge_invariant(U, model.group)
     assert math.isclose(d["gauge_invariant_spread"], float(inv.std(unbiased=False)), rel_tol=1e-9, abs_tol=1e-12)
     heads = metrics.per_head_gauge_invariants(U, model.group.irrep_dims)

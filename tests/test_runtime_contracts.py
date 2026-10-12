@@ -65,7 +65,7 @@ class _OverflowModel(torch.nn.Module):
 
     def forward(self, tokens: torch.Tensor, targets: torch.Tensor, **kwargs: object) -> tuple:
         loss = self.weight * 1e35 + 1.
-        return None, loss, SimpleNamespace(ce=loss, scored_tokens=torch.tensor(1), excluded_tokens=torch.tensor(0))
+        return None, loss, SimpleNamespace(ce=loss, objective=None, scored_tokens=torch.tensor(1), excluded_tokens=torch.tensor(0))
 
 
 @pytest.mark.parametrize('metrics', [False, True])
@@ -117,13 +117,6 @@ def test_repaired_cholesky_has_finite_correct_derivative() -> None:
     assert ok
     derivative, = torch.autograd.grad(L.square().sum(), M)
     torch.testing.assert_close(derivative, torch.eye(2, dtype=M.dtype), rtol=1e-8, atol=1e-8)
-
-
-def test_spd_inverse_reaches_fallback_without_inverting_failed_factor() -> None:
-    from vfe3.numerics import safe_spd_inverse
-    M = torch.diag(torch.tensor([1., -1e-6], dtype=torch.float64))
-    expected = torch.linalg.inv(M + 1e-5 * torch.eye(2, dtype=M.dtype))
-    torch.testing.assert_close(safe_spd_inverse(M), expected)
 
 
 def test_cholesky_recovery_directional_derivative_matches_finite_difference() -> None:

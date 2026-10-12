@@ -61,8 +61,7 @@ def _staging_inputs(rows=6, scale=LIVE_PHI_SCALE, seed=0):
 
 
 def _stage(grad, phi, group, **kw):
-    params = dict(learning_rate=2.5e-3, trust_radius=0.1, chart_max_norm=12.0,
-                  bch_residual_max=1e-6)
+    params = dict(learning_rate=2.5e-3, trust_radius=0.1, chart_max_norm=12.0)
     params.update(kw)
     return gauge_optim.stage_pullback_group_candidate(grad, phi, group, **params)
 

@@ -213,14 +213,14 @@ def _word_vocab_size(base: Any) -> int:
 
 
 def _no_decay_already(base: Any) -> Optional[str]:
-    if base.sigma_weight_decay == 0:
+    if base.resolved_hyperparameter("sigma_weight_decay") == 0:
         return ("the base has sigma_weight_decay=0, so the evaluated arm already is this row's "
                 "configuration")
     return None
 
 
 def _decay_absent(base: Any) -> Optional[str]:
-    if base.sigma_weight_decay == 0:
+    if base.resolved_hyperparameter("sigma_weight_decay") == 0:
         return ("the base has no stored-covariance decay (sigma_weight_decay=0); this row would need "
                 "one as a second change")
     return None
@@ -607,7 +607,7 @@ def evaluated_label(base_cfg: Any) -> str:
     :data:`EVALUATED` stays the arm's key in :data:`ARMS`; the manifest and the LaTeX table carry this
     label, so a base with ``sigma_weight_decay=0`` is never described as decayed.
     """
-    return EVALUATED_NO_DECAY if base_cfg.sigma_weight_decay == 0 else EVALUATED
+    return EVALUATED_NO_DECAY if base_cfg.resolved_hyperparameter("sigma_weight_decay") == 0 else EVALUATED
 
 
 def rebuild(cfg: Any, overrides: Mapping[str, Any], source: str) -> Any:

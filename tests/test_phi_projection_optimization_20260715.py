@@ -407,7 +407,7 @@ def test_enabled_projection_persists_timing_metrics_in_training_row(tmp_path) ->
         n_e_steps=1,
         pos_phi="none",
         phi_mstep_max_matrix_norm=2.0,
-        max_steps=1,
+        max_steps=1, warmup_steps=1,
     )
     model = VFEModel(cfg)
     artifacts = RunArtifacts(tmp_path, cfg, model)

@@ -141,17 +141,6 @@ def test_compact_sampled_metrics_match_canonical_dense_operator():
     assert compact_h.keys() == dense_h.keys()
     for key in compact_h:
         assert torch.allclose(compact_h[key], dense_h[key], atol=2e-5, rtol=1e-5), key
-    compact_w = metrics_module.holonomy_wilson_sampled(
-        compact, n_heads=H, irrep_dims=[d] * H, n_triples=24, n_boot=16, seed=7)
-    dense_w = metrics_module.holonomy_wilson_sampled(
-        dense, n_heads=H, irrep_dims=[d] * H, n_triples=24, n_boot=16, seed=7)
-    assert compact_w.keys() == dense_w.keys()
-    for key in compact_w:
-        assert torch.allclose(compact_w[key], dense_w[key], atol=2e-5, rtol=1e-5), key
-    assert torch.allclose(
-        metrics_module.cocycle_residual_sampled(compact, n_triples=24, seed=7),
-        metrics_module.cocycle_residual_sampled(dense, n_triples=24, seed=7),
-        atol=2e-5, rtol=1e-5)
 
 
 @pytest.mark.parametrize("L,M", [(2, 3), (3, 2)])
@@ -161,8 +150,6 @@ def test_compact_sampled_metrics_match_canonical_dense_operator():
     [
         "transport_asymmetry",
         "holonomy_deviation_sampled",
-        "holonomy_wilson_sampled",
-        "cocycle_residual_sampled",
     ],
 )
 def test_square_graph_metrics_reject_rectangular_transport(
@@ -186,8 +173,6 @@ def test_square_graph_metrics_reject_rectangular_transport(
     "metric_name",
     [
         "holonomy_deviation_sampled",
-        "holonomy_wilson_sampled",
-        "cocycle_residual_sampled",
     ],
 )
 def test_sampled_graph_metrics_reject_batched_square_transport_before_empty_return(
@@ -210,8 +195,6 @@ def test_sampled_graph_metrics_reject_batched_square_transport_before_empty_retu
     [
         "transport_asymmetry",
         "holonomy_deviation_sampled",
-        "holonomy_wilson_sampled",
-        "cocycle_residual_sampled",
     ],
 )
 def test_graph_metrics_reject_dense_nonsquare_matrix_axes(metric_name):

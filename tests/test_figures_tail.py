@@ -92,7 +92,7 @@ def test_aggregate_points_carries_embed_dim_and_ppl():
 
 def test_val_receiver_cost_logged_per_eval(tmp_path):
     torch.manual_seed(0)
-    cfg = test_config(vocab_size=32, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=4,
+    cfg = test_config(vocab_size=32, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=4, warmup_steps=4,
                      log_interval=2, eval_interval=2, batch_size=2,
                      gauge_group="block_glk")
     model = VFEModel(cfg).to(DEVICE)

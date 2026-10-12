@@ -80,6 +80,7 @@ config: Dict[str, Any] = dict(
 
 
     family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full"
+    relational_receiver_measurement = "inverse",     # "inverse" O'^-1, the dual measurement (VFE3Config default) | "adjoint" O'^T (projected_gradient only)
     #################################
     #        Initialization
     #################################
@@ -196,7 +197,6 @@ config: Dict[str, Any] = dict(
 
 
     # Further Regularizers
-    mass_phi                   = 0.0,       # (mass_phi/2) ||phi||^2 penalty
     mstep_self_coupling_weight = 0.0,       # alpha_hat * sum_i KL(q_i*||p_i) M-step term (0 = OFF)
 
 
@@ -271,6 +271,7 @@ config: Dict[str, Any] = dict(
     sigma_max                            = 100.0,
 
 
+    kl_max                               = None,          # None (8 * embed_dim) | nats: the safety clamp on every divergence
     amp_dtype                            = 'bf16',        # None=fp32 | 'bf16' , 'fp16'. Sigma must be at least fp32
     fp32_matmul_precision                = "highest",       # None (leave as-is) | "highest" | "high" | "medium"
 
@@ -280,8 +281,6 @@ config: Dict[str, Any] = dict(
 
 
 
-    mu_trust_cholesky_rounds             = 3,
-
     
     decode_av_precision                  = "fp64",     #  "fp32" | "fp64"   
     decode_ranking_fp64_escalation       = True, 
@@ -290,12 +289,6 @@ config: Dict[str, Any] = dict(
     
 )
 
-# kl_max is the numerical safety-net clamp on EVERY divergence, scaled with K exactly as in
-# train_vfe3.py (``config["kl_max"] = 8 * config["embed_dim"]``) so the two entry points share one
-# objective under an identical config -- the K-independent 100.0 dataclass default would silently
-# differ from train_vfe3's 160 at K=20. A sweep that changes embed_dim must override kl_max itself
-# (the K=28 multi-arm below already sets kl_max=224).
-config["kl_max"] = 8 * config["embed_dim"]
 
 
 # =============================================================================
@@ -490,11 +483,6 @@ SEARCH_CONFIG: Dict[str, Any] = {
             "enabled": False, "bounds": [0.1, 1.0], "values": None, "scale": "linear",
             "requires": {},
             "description": "M-step self-coupling weight.",
-        },
-        "mass_phi": {
-            "enabled": False, "bounds": [0.0, 0.4], "values": None, "scale": "linear",
-            "requires": {},
-            "description": "Gauge-frame mass coefficient.",
         },
     },
 }

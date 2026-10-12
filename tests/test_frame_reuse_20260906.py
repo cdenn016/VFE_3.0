@@ -104,11 +104,11 @@ def test_unique_exp_work_is_shared(device: torch.device, monkeypatch: pytest.Mon
     table = torch.zeros(2, 2, 2, 2, device=device)
     table[0, 0, 0, 0] = 1.5
     shapes = []
-    original = torch.linalg.matrix_exp
-    def counted(matrix: torch.Tensor) -> torch.Tensor:
+    original = transport._frame_matrix_exp          # the frame exponential on every device
+    def counted(matrix: torch.Tensor, norm_bound: float) -> torch.Tensor:
         shapes.append(tuple(matrix.shape))
-        return original(matrix)
-    monkeypatch.setattr(torch.linalg, 'matrix_exp', counted)
+        return original(matrix, norm_bound)
+    monkeypatch.setattr(transport, '_frame_matrix_exp', counted)
     transport._stable_compact_glk_exp_pair(table[ids], _content_token_ids=ids)
     assert shapes == [(2, 2, 2, 2)]
 
@@ -157,6 +157,12 @@ def test_builtin_model_gate(fallback: str, device: torch.device, monkeypatch: py
         seen.append(kwargs.get('_content_token_ids') is not None)
         return original(blocks, **kwargs)
     monkeypatch.setattr(transport, '_stable_compact_glk_exp_pair', recorded)
+    # With a positional right factor both factors go through the stacked call (one exponential).
+    original_stacked = transport._stacked_compact_exp_pairs
+    def recorded_stacked(right: torch.Tensor, left: torch.Tensor, **kwargs: object) -> object:
+        seen.append(kwargs.get('_content_token_ids') is not None)
+        return original_stacked(right, left, **kwargs)
+    monkeypatch.setattr(transport, '_stacked_compact_exp_pairs', recorded_stacked)
     if fallback == 'encoder':
         builtin = prior_bank._ENCODERS['per_token']
         monkeypatch.setitem(prior_bank._ENCODERS, 'per_token', lambda *args: builtin(*args))
@@ -178,12 +184,12 @@ def test_reuse_extreme_token_counts(same_token: bool, device: torch.device,
                                    monkeypatch: pytest.MonkeyPatch) -> None:
     ids = torch.zeros(1, 4, dtype=torch.long, device=device) if same_token else torch.arange(4, device=device).unsqueeze(0)
     table = torch.zeros(4, 2, 2, 2, device=device)
-    original = torch.linalg.matrix_exp
+    original = transport._frame_matrix_exp          # the frame exponential on every device
     counts = []
-    def counted(matrix: torch.Tensor) -> torch.Tensor:
+    def counted(matrix: torch.Tensor, norm_bound: float) -> torch.Tensor:
         counts.append(matrix.numel() // 4)
-        return original(matrix)
-    monkeypatch.setattr(torch.linalg, 'matrix_exp', counted)
+        return original(matrix, norm_bound)
+    monkeypatch.setattr(transport, '_frame_matrix_exp', counted)
     actual = transport._stable_compact_glk_exp_pair(table[ids], _content_token_ids=ids)
     assert counts == [2 if same_token else 8]
     assert actual[0].shape == (1, 4, 2, 2, 2)

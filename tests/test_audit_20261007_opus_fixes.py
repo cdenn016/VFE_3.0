@@ -80,7 +80,10 @@ def test_amp_and_kl_max_stay_live_where_a_consumer_runs() -> None:
     assert "amp_dtype" not in logits
     kernel = _cfg(_minimal_agent(predictive_readout="kernel", block_mlp_mode="coordinate",
                                  amp_dtype="bf16")).inactive_fields()
-    assert "kl_max" not in kernel and "amp_dtype" not in kernel
+    assert "kl_max" not in kernel
+    # The kernel readout has no amp consumer either: amp_dtype is live only with decode_logits_amp or the CG
+    # coupling (tests/test_amp_routes_20261012.py).
+    assert "amp_dtype" in kernel
     coupled = _cfg(_minimal_agent(mstep_self_coupling_weight=0.1)).inactive_fields()
     assert "kl_max" not in coupled
 
@@ -290,7 +293,7 @@ def _manifold_optimizer(phi, other, fused: bool):
         [{"params": [phi], "lr": 0.05, "pullback_group": True, "weight_decay": 0.0},
          {"params": [other], "lr": 0.01, "weight_decay": 0.0}],
         get_group("block_glk")(n_heads=1, K=2), phi_group_trust_radius=0.1, phi_chart_max_norm=5.0,
-        phi_bch_residual_max=1e-6, weight_decay=0.0, fused=fused)
+        weight_decay=0.0, fused=fused)
 
 
 def test_fused_grad_scale_contract_reaches_the_manifold_phi_step() -> None:
@@ -485,7 +488,7 @@ def test_train_calibrates_only_on_a_fresh_working_variance_start(monkeypatch: py
     import vfe3.train as T
     from vfe3.data.datasets import TokenWindows
 
-    cfg = _prototype_cfg(block_mlp_template_init=init, max_steps=1, eval_stride=None)
+    cfg = _prototype_cfg(block_mlp_template_init=init, max_steps=1, warmup_steps=1, eval_stride=None)
     torch.manual_seed(0)
     model = VFEModel(cfg)
     seen = []
@@ -602,7 +605,7 @@ def test_pullback_group_diagnostic_step_on_a_non_elementary_basis(group_name: st
     phi = nn.Parameter(0.2 * torch.randn(5, group.generators.shape[0]))
     optimizer = GaugeManifoldAdamW([{"params": [phi], "lr": 0.05, "pullback_group": True, "weight_decay": 0.0}],
                                    group, phi_group_trust_radius=0.1, phi_chart_max_norm=5.0,
-                                   phi_bch_residual_max=1e-6, weight_decay=0.0)
+                                   weight_decay=0.0)
     before = phi.detach().clone()
     phi.grad = torch.randn_like(phi)
     optimizer._collect_gauge_diag = True

@@ -15,7 +15,7 @@ from vfe3.model.model import VFEModel
 def _tiny_model(decode_mode: str = "diagonal_chunked") -> VFEModel:
     family = "gaussian_full" if decode_mode == "full_chunked" else "gaussian_diagonal"
     cfg = test_config(vocab_size=7, embed_dim=4, n_heads=2, n_layers=1, n_e_steps=1,
-                    max_seq_len=4, batch_size=2, max_steps=1, family=family,
+                    max_seq_len=4, batch_size=2, max_steps=1, warmup_steps=1, family=family,
                     attention_mode="projected_predictive",
                     predictive_covariance="moment_matched",
                     decode_mode=decode_mode, decode_chunk_size=3, untie_decode_bank=True,

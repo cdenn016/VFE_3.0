@@ -741,7 +741,8 @@ def stable_matrix_exp_pair(
         blocked = block_dims is not None and len(block_dims) > 1
 
         def _exp(m: torch.Tensor) -> torch.Tensor:
-            return _blockwise_matrix_exp(m, block_dims) if blocked else torch.linalg.matrix_exp(m)
+            return (_blockwise_matrix_exp(m, block_dims, norm_bound=validity_max_norm) if blocked
+                    else _frame_matrix_exp(m, validity_max_norm))
 
         exp_pos = _exp(matrix_up)
         if only_forward:
@@ -770,6 +771,9 @@ def stable_matrix_exp_pair(
 def _blockwise_matrix_exp(
     matrix:     torch.Tensor,             # (..., d, d) block-diagonal Lie-algebra matrix
     block_dims: List[int],                # block sizes; sum == d
+
+    *,
+    norm_bound: float = math.inf,         # chart radius bounding every block's ||.||_F (inf: torch.linalg.matrix_exp)
 ) -> torch.Tensor:                        # (..., d, d) block-diagonal exp
     r"""exp of a block-diagonal matrix = block-diagonal of the blocks' exps (audit 4b).
 
@@ -784,6 +788,7 @@ def _blockwise_matrix_exp(
     independently, so this is bit-identical to the per-block loop (pinned at 1e-12 by
     tests/test_perf_equivalence.py::test_per_block_exp_is_bit_equivalent_to_full_exp). Unequal
     block sizes (a mixed so_n irrep tower) take one batched call per run of contiguous equal blocks.
+    A finite ``norm_bound`` evaluates each call with :func:`_frame_matrix_exp`, as the compact route does.
     """
     out = torch.zeros_like(matrix)
     if len(set(block_dims)) == 1 and len(block_dims) > 1:
@@ -797,15 +802,15 @@ def _blockwise_matrix_exp(
         batch = matrix.shape[:-2]
         m5 = matrix.reshape(*batch, H, d, H, d)
         blocks = torch.diagonal(m5, dim1=-4, dim2=-2).movedim(-1, 0).contiguous()  # (H, ..., d, d)
-        exps = torch.linalg.matrix_exp(blocks)                  # one batched call
+        exps = _frame_matrix_exp(blocks, norm_bound)            # one batched call
         out5 = out.reshape(*batch, H, d, H, d)
         torch.diagonal(out5, dim1=-4, dim2=-2).copy_(exps.movedim(0, -1))
         return out
     for start, n, dim in _block_runs(block_dims):
         end = start + n * dim
         blk = matrix[..., start:end, start:end]
-        out[..., start:end, start:end] = (torch.linalg.matrix_exp(blk.contiguous()) if n == 1
-                                          else _blockwise_matrix_exp(blk, [dim] * n))
+        out[..., start:end, start:end] = (_frame_matrix_exp(blk.contiguous(), norm_bound) if n == 1
+                                          else _blockwise_matrix_exp(blk, [dim] * n, norm_bound=norm_bound))
     return out
 
 
@@ -1090,6 +1095,312 @@ def _group_inverse_verdict(
         )
 
 
+# Degree-18 Taylor evaluation of Bader, Blanes and Casas (2019), the scheme torch.linalg.matrix_exp uses
+# on batched input: rows give B_1..B_5 over the basis (I, A, A^2, A^3, A^6). It reproduces the
+# Taylor coefficients 1/k!, k <= 18, to a relative 5e-13 (checked in exact arithmetic).
+_T18_COEFFICIENTS: Tuple[Tuple[float, ...], ...] = (
+    (0.0, -1.00365581030144618291e-01, -8.02924648241156932449e-03, -8.92138498045941001470e-04, 0.0),
+    (0.0, 3.97849749499645077844e-01, 1.36783778460411719922e+00, 4.98289622525382669416e-01,
+     -6.37898194594723280150e-04),
+    (-1.09676396052962061844e+01, 1.68015813878906206114e+00, 5.71779846478865511061e-02,
+     -6.98210122488052056106e-03, 3.34975017086070470649e-05),
+    (-9.04316832390810593223e-02, -6.76404519071381882256e-02, 6.75961301770459654925e-02,
+     2.95552570429315521194e-02, -1.39180257516060693404e-05),
+    (0.0, 0.0, -9.23364619367118555360e-02, -1.69364939002081722752e-02, -1.40086798182036094347e-05),
+)
+# Scaling thresholds, recomputed with mpmath from h(x) = log(e^{-x} T_18(x)) = sum_{k>=19} c_k x^k and
+# h~(x) = sum |c_k| x^k: theta_18 = max{t : h~(t)/t <= u} bounds the backward error of e^A (Higham 2005),
+# l_18 = max{t : h~'(t) <= u} that of the Frechet derivative L(A, E) (Al-Mohy and Higham 2009, sec. 6),
+# for u = 2^-24 and 2^-53. theta_18 equals torch's own degree-18 threshold.
+_T18_THETA: Dict[torch.dtype, float] = {torch.float32: 3.010066362817634, torch.float64: 1.090863719290036}
+_T18_ELL: Dict[torch.dtype, float] = {torch.float32: 2.595044802471324, torch.float64: 0.9317169257310866}
+_T18_COEFFICIENT_CACHE: Dict[Tuple[torch.device, torch.dtype], Tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _t18_coefficients(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    r"""The (5, 5) T18 coefficient matrix on ``device``, copied host-to-device once per process.
+
+    The copy is made from pinned memory without blocking, so even the first call does not synchronize
+    (a pageable copy would). The pinned source stays in the cache, alive until the copy completes.
+    """
+    key = (device, dtype)
+    cached = _T18_COEFFICIENT_CACHE.get(key)
+    if cached is None:
+        host = torch.tensor(_T18_COEFFICIENTS, dtype=dtype)
+        if device.type == "cuda":
+            host = host.pin_memory()
+        cached = (host, host.to(device, non_blocking=True))
+        _T18_COEFFICIENT_CACHE[key] = cached
+    return cached[1]
+
+
+def _t18_scale_square(
+    matrix:     torch.Tensor,               # (..., n, n) A, float32 or float64
+    direction:  Optional[torch.Tensor],     # (..., n, n) E for the Frechet derivative, or None
+    threshold:  float,                      # theta_18 (exponential) or l_18 (derivative)
+    norm_bound: float,                      # static bound on every ||A||_1
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    r"""Return :math:`(e^A, L(A, E))` by scaling and squaring on a static schedule, without a host read.
+
+    Each matrix takes :math:`s = \min(s_{\max}, \max(0, \lceil\log_2(\lVert A\rVert_1/\vartheta)\rceil))`
+    with :math:`s_{\max} = \max(0, \lceil\log_2(b/\vartheta)\rceil)` fixed by the bound :math:`b`, and
+    :math:`e^A = T_{18}(2^{-s}A)^{2^s}`. With :math:`\vartheta = \theta_{18}` this is the count
+    ``torch.linalg.matrix_exp`` takes on batched input. All :math:`s_{\max}` squarings run on the whole
+    batch and ``torch.where`` keeps a matrix whose own count is spent, so there is no data-dependent
+    control flow. A nonfinite matrix takes no squarings and returns NaN.
+
+    With ``direction`` the evaluation carries the pair :math:`(X, \dot X)` through every product,
+    :math:`(P, \dot P)(Q, \dot Q) = (PQ, P\dot Q + \dot P Q)`, from :math:`(2^{-s}A, 2^{-s}E)`; the second
+    component is then the Frechet derivative of the scaled-and-squared Taylor approximant
+    (Al-Mohy and Higham 2009, Algorithm 6.4, with their Pade step replaced by :math:`T_{18}`).
+    """
+    n = matrix.shape[-1]
+    with torch.no_grad():
+        norm1 = matrix.abs().sum(dim=-2).amax(dim=-1)                       # (...,) ||A||_1
+        max_squarings = max(0, math.ceil(math.log2(norm_bound / threshold))) if norm_bound > 0.0 else 0
+        s = torch.nan_to_num(torch.ceil(torch.log2(norm1 / threshold)).clamp(0.0, float(max_squarings)), nan=0.0)
+        scale = torch.exp2(-s)[..., None, None]                             # exact power-of-two scaling
+    a = matrix * scale
+    e = None if direction is None else direction * scale
+
+    def product(p: torch.Tensor, dp: Optional[torch.Tensor],
+                q: torch.Tensor, dq: Optional[torch.Tensor]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        return p @ q, (None if dp is None else (p @ dq).add_(dp @ q))
+
+    a2, e2 = product(a, e, a, e)
+    a3, e3 = product(a2, e2, a, e)
+    a6, e6 = product(a3, e3, a3, e3)
+    coefficients = _t18_coefficients(matrix.device, matrix.dtype)
+    eye = torch.eye(n, dtype=matrix.dtype, device=matrix.device).expand_as(a)
+    b = (coefficients @ torch.stack((eye, a, a2, a3, a6)).reshape(5, -1)).reshape(5, *a.shape)
+    del a2, a3, a6
+    db = (None if e is None else
+          (coefficients[:, 1:] @ torch.stack((e, e2, e3, e6)).reshape(4, -1)).reshape(5, *a.shape))
+    del e2, e3, e6
+    a9, e9 = product(b[0], None if db is None else db[0], b[4], None if db is None else db[4])
+    a9 = a9.add_(b[3])                                                      # B_1 B_5 + B_4
+    e9 = None if db is None else e9.add_(db[3])
+    result, derivative = product(b[2] + a9, None if db is None else db[2] + e9, a9, e9)
+    result = result.add_(b[1])                                              # T_18(2^-s A)
+    derivative = None if db is None else derivative.add_(db[1])
+    del b, db
+    for k in range(max_squarings):
+        keep = (s > k)[..., None, None]
+        squared, d_squared = product(result, derivative, result, derivative)
+        result = torch.where(keep, squared, result)
+        derivative = None if derivative is None else torch.where(keep, d_squared, derivative)
+    return result, derivative
+
+
+class _FixedScheduleMatrixExp(torch.autograd.Function):
+    r"""Sync-free :math:`e^A`; the backward is :class:`_FixedScheduleExpAdjoint`, :math:`L(A^\top, G)`.
+
+    ``norm_bound`` bounds :math:`\lVert A\rVert_1` and :math:`\lVert A\rVert_\infty` of every matrix.
+    Every matrix product, at every derivative order, runs inside one of these two functions under IEEE
+    fp32 with autocast off, whatever the caller's policy; a double backward taken inside an active
+    autocast region would otherwise run the recorded products of an ordinary backward in bf16.
+    """
+
+    @staticmethod
+    def forward(ctx, matrix: torch.Tensor, norm_bound: float) -> torch.Tensor:  # type: ignore[override]
+        ctx.save_for_backward(matrix)
+        ctx.norm_bound = norm_bound
+        with torch.amp.autocast(matrix.device.type, enabled=False), ieee_fp32_matmul():
+            return _t18_scale_square(matrix, None, _T18_THETA[matrix.dtype], norm_bound)[0]
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor) -> Tuple[torch.Tensor, None]:  # type: ignore[override]
+        matrix, = ctx.saved_tensors
+        return _FixedScheduleExpAdjoint.apply(matrix, grad.to(matrix.dtype), ctx.norm_bound), None
+
+
+class _FixedScheduleExpAdjoint(torch.autograd.Function):
+    r""":math:`F(A, G) = L(A^\top, G)`, the gradient of :math:`\langle G, e^A\rangle`, by the derivative pair.
+
+    The forward is :func:`_t18_scale_square` with a direction at :math:`\ell_{18}`. The backward uses
+    the block-triangular identity (Higham 2008, Functions of Matrices, eq. 3.16)
+
+    .. math::
+        F(A, G) = c\,\Bigl[\exp\begin{pmatrix} A^\top & G/c \\ 0 & A^\top\end{pmatrix}\Bigr]_{12},
+
+    so the gradient of :math:`\langle H, F\rangle` with respect to the block is :math:`c F(M, H_{12})`,
+    which is this function again. :math:`c = 2^e` takes :math:`\nu(G)` to at most
+    :math:`\max(\nu(A), \theta_{18}/2)`, :math:`\nu = \max(\lVert\cdot\rVert_1, \lVert\cdot\rVert_\infty)`;
+    it is exact and :math:`F` is linear in :math:`G`, so it changes no value and only bounds the
+    block's norms by :math:`2\max(b, \theta_{18}/2)`, which keeps the schedule static at every order.
+    """
+
+    @staticmethod
+    def forward(ctx, matrix: torch.Tensor, grad: torch.Tensor, norm_bound: float) -> torch.Tensor:  # type: ignore[override]
+        ctx.save_for_backward(matrix, grad)
+        ctx.norm_bound = norm_bound
+        with torch.amp.autocast(matrix.device.type, enabled=False), ieee_fp32_matmul():
+            return _t18_scale_square(matrix.transpose(-2, -1), grad, _T18_ELL[matrix.dtype], norm_bound)[1]
+
+    @staticmethod
+    def backward(ctx, upstream: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, None]:  # type: ignore[override]
+        matrix, grad = ctx.saved_tensors
+        n, theta = matrix.shape[-1], _T18_THETA[matrix.dtype]
+        with torch.no_grad():
+            def _norm(x: torch.Tensor) -> torch.Tensor:
+                magnitude = x.abs()
+                return torch.maximum(magnitude.sum(dim=-2).amax(dim=-1), magnitude.sum(dim=-1).amax(dim=-1))
+            exponent = torch.ceil(torch.log2(_norm(grad) / _norm(matrix).clamp(min=theta / 2.0)))
+            exponent = torch.nan_to_num(exponent.clamp(0.0, 126.0), nan=0.0)[..., None, None]
+        transposed = matrix.transpose(-2, -1)
+        zeros = torch.zeros_like(transposed)
+        block = torch.cat((torch.cat((transposed, grad * torch.exp2(-exponent)), dim=-1),
+                           torch.cat((zeros, transposed), dim=-1)), dim=-2)          # (..., 2n, 2n)
+        padded = torch.cat((torch.cat((zeros, upstream.to(matrix.dtype)), dim=-1),
+                            torch.cat((zeros, zeros), dim=-1)), dim=-2)
+        block_grad = _FixedScheduleExpAdjoint.apply(block, padded, 2.0 * max(ctx.norm_bound, theta / 2.0))
+        scale = torch.exp2(exponent)
+        matrix_grad = ((block_grad[..., :n, :n] + block_grad[..., n:, n:]) * scale).transpose(-2, -1)
+        return matrix_grad, block_grad[..., :n, n:], None
+
+
+def _frame_matrix_exp(
+    blocks:     torch.Tensor,     # (..., d, d) float32/float64, finite or NaN entries
+    norm_bound: float,            # bound on every block's ||A||_F (inf: none)
+) -> torch.Tensor:
+    r"""The frame exponential: the sync-free fixed schedule on CUDA, ``torch.linalg.matrix_exp`` elsewhere.
+
+    CUDA ``matrix_exp`` copies its per-matrix squaring counts to the host (12 synchronizations for the
+    two frame calls, forward and backward, measured on the RTX 5090), which also blocks capturing a
+    step in a CUDA graph. The chart radius
+    bounds every block's Frobenius norm by :math:`r`, so :math:`\lVert A\rVert_1 \le \sqrt{d}\,r` and a
+    static squaring count covers the whole chart (Higham 2005; Al-Mohy and Higham 2009, whose
+    backward-error bound is stated in a consistent norm and so holds for non-normal :math:`A`; the
+    1-norm used here is never below the spectral radius). The forward is the same degree-18 Taylor
+    scheme and the same per-matrix count as ``torch.linalg.matrix_exp`` (Bader, Blanes and Casas 2019),
+    so the values agree to rounding. A block outside the chart, which the deferred chart verdict
+    rejects, takes at most :math:`s_{\max}` squarings instead of a possibly endless loop. The gradient
+    is not bitwise torch's: torch's backward exponentiates the unscaled block matrix, whose squaring
+    count grows with the gradient's norm, and loses accuracy when that norm is large (a frequent
+    token's accumulated table gradient was off by 4e-4 relative to float64; this route, 1e-6). On CPU
+    there is no synchronization to save and ``torch.linalg.matrix_exp`` is kept (it is 1.2-1.6x faster
+    there at d = 10); a group without a radius (skew-symmetric, ``r = inf``) also keeps it.
+
+    References: N. J. Higham, SIAM J. Matrix Anal. Appl. 26(4):1179-1193 (2005); A. H. Al-Mohy and
+    N. J. Higham, SIAM J. Matrix Anal. Appl. 30(4):1639-1657 (2009); P. Bader, S. Blanes and F. Casas,
+    Mathematics 7(12):1174 (2019); N. J. Higham, Functions of Matrices, SIAM (2008).
+    """
+    if (blocks.device.type != "cuda" or not math.isfinite(norm_bound)
+            or blocks.dtype not in (torch.float32, torch.float64)):
+        return torch.linalg.matrix_exp(blocks)
+    return _FixedScheduleMatrixExp.apply(blocks, math.sqrt(blocks.shape[-1]) * norm_bound)
+
+
+def _compact_chart_check(
+    blocks:            torch.Tensor,     # (..., H, d, d) raw blocks
+    validity_max_norm: float,            # resolved chart radius
+) -> Tuple[torch.Tensor, Callable[[List[bool]], None]]:
+    r"""The chart decisions of one compact call and their raise-only verdict, for :func:`host_check`.
+
+    The chart radius bounds the Frobenius norm of the whole block-diagonal element, as on the dense
+    route; both decisions share one host read. The verdict only raises and every consumer of the pair
+    sits behind the scorer's first host_read (the certified inverse reads through host_read too), so
+    inside vfe3.contracts.deferred_host_checks it joins that read instead of synchronizing here
+    (audit 2026-10-10, item 61).
+    """
+    with torch.no_grad():
+        raw_mat_norm = blocks.square().sum(dim=(-3, -2, -1)).sqrt()
+        decisions = torch.stack(((~torch.isfinite(raw_mat_norm)).any(),
+                                 (raw_mat_norm > validity_max_norm).any()))
+
+    def _chart_verdict(host: List[bool]) -> None:
+        nonfinite, outside_chart = host
+        if nonfinite:
+            raise ValueError(
+                "transport chart validity bound encountered a nonfinite matrix norm"
+            )
+        if outside_chart:
+            observed = float(raw_mat_norm.max())
+            raise ValueError(
+                "transport chart validity bound exceeded before the matrix exponential: "
+                f"observed ||M||_F={observed:.6g} > transport_chart_max_norm={validity_max_norm:.6g}"
+            )
+
+    return decisions, _chart_verdict
+
+
+def _finite_or_nan(blocks: torch.Tensor) -> torch.Tensor:
+    r"""Map nonfinite entries to NaN; finite entries and their gradients are unchanged bit for bit.
+
+    A deferred chart verdict lets the exponential see a call's blocks before it raises. CUDA
+    ``matrix_exp`` picks its squaring count from the block norm, which saturates on an infinite block (a
+    possibly endless squaring loop), while a NaN block exponentiates to NaN; the fixed schedule caps the
+    count either way. No host sync (audit 2026-10-10 round 2, item 41).
+    """
+    return torch.where(torch.isfinite(blocks), blocks, float("nan"))
+
+
+def _content_rows(
+    blocks:             torch.Tensor,             # (..., H, d, d) occurrence blocks
+    _content_token_ids: Optional[torch.Tensor],   # (...) token ids of the occurrences, or None
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Size]:
+    r"""Return ``(rows, inverse_index, occurrence_shape)``: one row per distinct token.
+
+    Rows are the distinct tokens in ascending id order, each taken from its first occurrence, and
+    ``inverse_index`` maps every occurrence to its row; with no repeated token the occurrences are the
+    rows (``inverse_index=None``). ``torch.unique`` reads its output size on the host, the one
+    synchronization this path keeps: a static-size buffer avoids it but runs the exponential and the
+    float64 inverse on every occurrence, which measured 2x slower at K=128, B=64 on the RTX 5090
+    (audit 2026-10-12 round 2, item 19).
+    """
+    occurrence_shape = blocks.shape
+    if _content_token_ids is None:
+        return blocks, None, occurrence_shape
+    ids = _content_token_ids.reshape(-1)
+    unique_ids, inverse_index = torch.unique(ids, return_inverse=True)
+    if unique_ids.numel() == ids.numel():
+        return blocks, None, occurrence_shape
+    first = torch.full_like(unique_ids, ids.numel())
+    first.scatter_reduce_(0, inverse_index, torch.arange(ids.numel(), device=ids.device),
+                          reduce="amin", include_self=True)
+    return blocks.reshape(-1, *blocks.shape[-3:]).index_select(0, first), inverse_index, occurrence_shape
+
+
+def _compact_pair_from_exp(
+    exp_pos:           torch.Tensor,                        # (..., H, d, d) exp of ``blocks`` at store dtype
+    blocks:            torch.Tensor,                        # (..., H, d, d) finite-or-NaN rows
+    *,
+    validity_max_norm: float,
+    inverse_index:     Optional[torch.Tensor],              # occurrence -> row, or None
+    occurrence_shape:  torch.Size,
+    right_pair:        Optional[Tuple[torch.Tensor, torch.Tensor]],
+    force_fp64:        bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Invert, certify (and escalate) one compact call's exponential, then gather its occurrences."""
+    with torch.amp.autocast(blocks.device.type, enabled=False):
+        if exp_pos.dtype == torch.float64:
+            exp_neg, escalate = _checked_group_inverse(exp_pos), False
+        elif force_fp64:
+            escalate = True
+        else:
+            gather = None
+            if inverse_index is not None and right_pair is not None:
+                index, shape = inverse_index, occurrence_shape
+
+                def gather(t: torch.Tensor) -> torch.Tensor:
+                    return t.index_select(0, index).reshape(shape)
+            exp_neg, escalate = _checked_group_inverse_certified(
+                exp_pos, kappa=(_frame_pair_kappa(right_pair, gather)
+                                if _FRAME_PAIR_FP64_ESCALATION else None))
+        if escalate:
+            exp_pos = _frame_matrix_exp(blocks.to(torch.float64).contiguous(), validity_max_norm)
+            exp_neg = _checked_group_inverse(exp_pos)
+            _count_frame_pair_escalation()
+    if inverse_index is not None:
+        unique_pos, unique_neg = exp_pos, exp_neg                    # (U, H, d, d)
+        exp_pos = exp_pos.index_select(0, inverse_index).reshape(occurrence_shape)
+        exp_neg = exp_neg.index_select(0, inverse_index).reshape(occurrence_shape)
+        # Every occurrence copies a unique row and every unique row occurs, so a frame context built
+        # from this exact pair validates its residual on the unique rows.
+        mark_gathered_frame_pair(exp_pos, exp_neg, unique_pos, unique_neg)
+    return exp_pos, exp_neg
+
+
 def _stable_compact_glk_exp_pair(
     blocks:                  torch.Tensor,       # (..., H, d, d) block-diagonal gl(d)^H element
 
@@ -1111,82 +1422,59 @@ def _stable_compact_glk_exp_pair(
     ``U = exp(M)`` recomputed in float64 from the same blocks and ``U^-1`` inverted from
     that float64 ``U`` itself, never the float64 inverse of the rounded float32 ``U`` (which is
     no more consistent with a float64 ``U`` than the float32 pair was). ``_right_pair`` certifies
-    the composed pair instead, and ``_force_fp64`` goes straight to float64.
+    the composed pair instead, and ``_force_fp64`` goes straight to float64. The exponential is
+    :func:`_frame_matrix_exp`.
     """
     validity_max_norm = _resolve_chart_max_norm(validity_max_norm)
-    # The chart radius bounds the Frobenius norm of the whole block-diagonal element, as on the
-    # dense route; both decisions share one host read. The verdict only raises and every consumer of
-    # this pair sits behind the scorer's first host_read (the certified inverse below reads through
-    # host_read too), so inside vfe3.contracts.deferred_host_checks it joins that read instead of
-    # synchronizing here (audit 2026-10-10, item 61).
-    with torch.no_grad():
-        raw_mat_norm = blocks.square().sum(dim=(-3, -2, -1)).sqrt()
-        decisions = torch.stack(((~torch.isfinite(raw_mat_norm)).any(),
-                                 (raw_mat_norm > validity_max_norm).any()))
-
-    def _chart_verdict(host: List[bool]) -> None:
-        nonfinite, outside_chart = host
-        if nonfinite:
-            raise ValueError(
-                "transport chart validity bound encountered a nonfinite matrix norm"
-            )
-        if outside_chart:
-            observed = float(raw_mat_norm.max())
-            raise ValueError(
-                "transport chart validity bound exceeded before the matrix exponential: "
-                f"observed ||M||_F={observed:.6g} > transport_chart_max_norm={validity_max_norm:.6g}"
-            )
-
-    host_check(decisions, _chart_verdict)
-    # A deferred verdict lets matrix_exp see this call's blocks before it raises. CUDA matrix_exp picks its
-    # squaring count from the block norm, which saturates on an infinite block (a possibly endless squaring
-    # loop), while a NaN block exponentiates to NaN. Non-finite entries therefore become NaN; finite entries
-    # and their gradients are unchanged bit for bit, with no host sync (audit 2026-10-10 round 2, item 41).
-    blocks = torch.where(torch.isfinite(blocks), blocks, float("nan"))
-
+    host_check(*_compact_chart_check(blocks, validity_max_norm))
+    blocks = _finite_or_nan(blocks)
     # Represented fp32 storage floor; the exponential is evaluated at the storage precision.
     store_dtype = blocks.dtype if blocks.dtype in (torch.float32, torch.float64) else torch.float32
+    rows, inverse_index, occurrence_shape = _content_rows(blocks, _content_token_ids)
+    with torch.amp.autocast(rows.device.type, enabled=False):
+        exp_pos = _frame_matrix_exp(rows.to(store_dtype).contiguous(), validity_max_norm)
+    return _compact_pair_from_exp(
+        exp_pos, rows, validity_max_norm=validity_max_norm, inverse_index=inverse_index,
+        occurrence_shape=occurrence_shape, right_pair=_right_pair, force_fp64=_force_fp64)
 
-    inverse_index = None
-    occurrence_shape = blocks.shape
-    if _content_token_ids is not None:
-        ids = _content_token_ids.reshape(-1)
-        unique_ids, inverse_index = torch.unique(ids, return_inverse=True)
-        if unique_ids.numel() < ids.numel():
-            first = torch.full_like(unique_ids, ids.numel())
-            first.scatter_reduce_(0, inverse_index, torch.arange(ids.numel(), device=ids.device),
-                                  reduce="amin", include_self=True)
-            blocks = blocks.reshape(-1, *blocks.shape[-3:]).index_select(0, first)
-        else:
-            inverse_index = None
-    with torch.amp.autocast(blocks.device.type, enabled=False):
-        exp_pos = torch.linalg.matrix_exp(blocks.to(store_dtype).contiguous())
-        if store_dtype == torch.float64:
-            exp_neg, escalate = _checked_group_inverse(exp_pos), False
-        elif _force_fp64:
-            escalate = True
-        else:
-            gather = None
-            if inverse_index is not None and _right_pair is not None:
-                index, shape = inverse_index, occurrence_shape
 
-                def gather(t: torch.Tensor) -> torch.Tensor:
-                    return t.index_select(0, index).reshape(shape)
-            exp_neg, escalate = _checked_group_inverse_certified(
-                exp_pos, kappa=(_frame_pair_kappa(_right_pair, gather)
-                                if _FRAME_PAIR_FP64_ESCALATION else None))
-        if escalate:
-            exp_pos = torch.linalg.matrix_exp(blocks.to(torch.float64).contiguous())
-            exp_neg = _checked_group_inverse(exp_pos)
-            _count_frame_pair_escalation()
-    if inverse_index is not None:
-        unique_pos, unique_neg = exp_pos, exp_neg                    # (U, H, d, d)
-        exp_pos = exp_pos.index_select(0, inverse_index).reshape(occurrence_shape)
-        exp_neg = exp_neg.index_select(0, inverse_index).reshape(occurrence_shape)
-        # Every occurrence copies a unique row and every unique row occurs, so a frame context built
-        # from this exact pair validates its residual on the unique rows.
-        mark_gathered_frame_pair(exp_pos, exp_neg, unique_pos, unique_neg)
-    return exp_pos, exp_neg
+def _stacked_compact_exp_pairs(
+    right_blocks:       torch.Tensor,             # (..., H, d, d) right (positional) factor blocks
+    left_blocks:        torch.Tensor,             # (..., H, d, d) left (token) factor blocks
+    *,
+    validity_max_norm:  float,
+    _content_token_ids: Optional[torch.Tensor] = None,
+) -> Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]]:
+    r"""The right call and then the left call of :func:`_stable_compact_glk_exp_pair`, with one exponential.
+
+    Both factors' rows are exponentiated in one batched call (one forward and one backward instead of
+    two each); the checks, inverses, certificates and escalations run as in the two sequential calls,
+    with the host checks registered in the same order. Returns ``None`` when the two store dtypes
+    differ (a float64 factor), and the caller then makes the two calls.
+    """
+    store = [b.dtype if b.dtype in (torch.float32, torch.float64) else torch.float32
+             for b in (right_blocks, left_blocks)]
+    if store[0] != store[1] or right_blocks.shape[-3:] != left_blocks.shape[-3:]:
+        return None
+    validity_max_norm = _resolve_chart_max_norm(validity_max_norm)
+    host_check(*_compact_chart_check(right_blocks, validity_max_norm))
+    left_check = _compact_chart_check(left_blocks, validity_max_norm)
+    right_rows = _finite_or_nan(right_blocks)
+    left_rows, inverse_index, occurrence_shape = _content_rows(_finite_or_nan(left_blocks), _content_token_ids)
+    n_right = right_rows.reshape(-1, *right_rows.shape[-3:]).shape[0]
+    with torch.amp.autocast(left_rows.device.type, enabled=False):
+        stacked = torch.cat((right_rows.reshape(-1, *right_rows.shape[-3:]),
+                             left_rows.reshape(-1, *left_rows.shape[-3:]))).to(store[0]).contiguous()
+        exp_both = _frame_matrix_exp(stacked, validity_max_norm)                # (n_right + n_left, H, d, d)
+    right_pair = _compact_pair_from_exp(
+        exp_both[:n_right].reshape(right_rows.shape), right_rows, validity_max_norm=validity_max_norm,
+        inverse_index=None, occurrence_shape=right_rows.shape, right_pair=None, force_fp64=False)
+    host_check(*left_check)
+    left_pair = _compact_pair_from_exp(
+        exp_both[n_right:].reshape(left_rows.shape), left_rows, validity_max_norm=validity_max_norm,
+        inverse_index=inverse_index, occurrence_shape=occurrence_shape, right_pair=right_pair,
+        force_fp64=right_pair[0].dtype == torch.float64)
+    return right_pair, left_pair
 
 
 @ieee_fp32_matmul()
@@ -1273,7 +1561,9 @@ def build_factored_transport(
         # (U E, E^-1 U^-1), so the left call certifies that product inside its own single read, and
         # an escalation of either factor rebuilds the other in float64 so the composition is one
         # consistent float64 pair rather than a float64 factor times a float32-rounded inverse.
-        right_pair = None
+        # Both factors share one batched exponential when their store dtypes agree (audit 2026-10-12
+        # round 2, item 19); the sequential calls remain for a mixed-dtype pair and the float64 rebuild.
+        right_pair, stacked = None, None
         if right_phi is not None:
             right_blocks = _embed(right_phi)
 
@@ -1283,8 +1573,11 @@ def build_factored_transport(
                     validity_max_norm=validity_max_norm,
                     _force_fp64=force_fp64,
                 )
-            right_pair = _build_right()
-        exp_blocks, inv_blocks = _stable_compact_glk_exp_pair(
+            stacked = _stacked_compact_exp_pairs(
+                right_blocks, phi_blocks, validity_max_norm=validity_max_norm,
+                _content_token_ids=_content_token_ids)
+            right_pair = _build_right() if stacked is None else stacked[0]
+        exp_blocks, inv_blocks = stacked[1] if stacked is not None else _stable_compact_glk_exp_pair(
             phi_blocks,
             validity_max_norm=validity_max_norm,
             _content_token_ids=_content_token_ids,

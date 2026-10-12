@@ -12,7 +12,6 @@ A training run produces a self-contained directory::
       summary.json       headline numbers (best_val_ppl, test_ppl, wall_time, ...)
       loss_curve.png     training cross-entropy trajectory
       val_ppl.png        validation perplexity trajectory (log-y, best marked)
-      holonomy.png / gauge_trace_spread.png   frame-numerics diagnostics (coboundary closure residual; log|det| spread)
       free_energy_decomposition.png   per-token F budget snapshot + early/mid/late evolution
       free_energy_relationship.png     final-iterate objective vs validation CE
       canonical_free_energy_{decomposition,relationship}.png   the same on the projected routes under
@@ -60,6 +59,7 @@ from vfe3.config import (
     serialize_config,
 )
 from vfe3.contracts import DataState, DataStateBuffer, ExecutableBuildMetadata
+from vfe3.gauge_optim import FRAME_CONDITION_GROUPS, bound_frame_condition_if_configured_
 from vfe3.model.minimal_agent import READOUT_COVARIANCES
 from vfe3.model.block_mlp import (
     block_mlp_build_metadata,
@@ -2653,6 +2653,9 @@ def load_checkpoint(
             raise
         del optimizer_snapshot
     model.load_state_dict(saved_model_state)
+    # A bounded run's checkpoint is a fixed point of the frame condition bound, so this is a bitwise no-op
+    # there; it bounds the frames of any other state before step 0 or evaluation (audit round 2, M4).
+    bound_frame_condition_if_configured_(model)
     if scaler is not None and scaler.is_enabled():
         scaler.load_state_dict(saved_scaler_state)
     # Portable best-val model-selection state (PB-03, extends audit 2026-07-01 C2): restore
@@ -3677,29 +3680,6 @@ def _cost_model_fields(
         out["wall_time_per_step"]  = float(wall_time) / max(1, int(tokens_seen) // (int(cfg.batch_size)
                                                                                    * int(cfg.max_seq_len)))
     return out
-
-
-def _estep_iterate_evidence(
-    *,
-    free_energy: Iterable[float],
-    halted: bool,
-    fixed_point_residual: Optional[float],
-    fixed_point_tolerance: Optional[float],
-) -> Dict[str, object]:
-    """Gate scientific iterate labels on explicit mechanical evidence."""
-    values = [float(value) for value in free_energy]
-    descent = len(values) >= 2 and all(
-        current <= previous for previous, current in zip(values, values[1:]))
-    fixed = bool(
-        halted and fixed_point_residual is not None and fixed_point_tolerance is not None
-        and float(fixed_point_residual) <= float(fixed_point_tolerance)
-    )
-    return {
-        "iterate_label": "final_iterate",
-        "descent_evidence": descent,
-        "convergence_evidence": fixed,
-        "fixed_point_evidence": fixed,
-    }
 
 
 def _estep_endpoint_artifact(evidence: Mapping[str, object]) -> Dict[str, str]:
@@ -4916,6 +4896,9 @@ def finalize_validation_run(
         "best_val_ppl":        best_val_ppl,
         "best_step":           artifacts.best_step,
         "n_steps":             completed_step,
+        # Realized-update counts and training-time diagnostic failures, as finalize_run publishes them
+        # (train() sets both before the terminal callback; audit 2026-10-12 round 2, item 7).
+        **dict(getattr(artifacts, "realized_updates", None) or {}),
         "n_params":            n_params,
         "n_params_trainable":  n_params_trainable,
         "final_train_loss":    final_train_loss,
@@ -4926,6 +4909,8 @@ def finalize_validation_run(
         "figures_written":     figures_written,
         "phi_chart_norm_route": _phi_chart_norm_route(model, cfg),
         "decode_tau_eff":      _decode_tau_eff(model, cfg),
+        "diagnostics_failures": dict(sorted(
+            (getattr(artifacts, "diagnostics_failures", None) or {}).items())),
         "numerics_counters":   getattr(artifacts, "numerics_counters", None),
     })
 
@@ -5185,7 +5170,11 @@ def _pure_path_report(
         "block_norm_gauge_equivariant": block_norm_registration.gauge_equivariant or reference_blocks,
         "no_fixed_coordinate_spectral_cap": (
             sigma_max is None if sigma_cap_consumer_active else "not_applicable"),
-        "no_phi_mstep_chart_cap": getattr(cfg, "phi_mstep_max_matrix_norm", None) is None,
+        # The chart-norm ball and the frame condition bound both rewrite frame rows after a step (round 2, item 14).
+        "no_phi_mstep_chart_cap": (getattr(cfg, "phi_mstep_max_matrix_norm", None) is None
+                                   and (getattr(cfg, "phi_frame_condition_max", None) is None
+                                        or getattr(cfg, "gauge_group", None) not in FRAME_CONDITION_GROUPS
+                                        or getattr(cfg, "gauge_transport", "on") != "on")),
         "no_pullback_trust_region": getattr(cfg, "m_phi_update_mode", "adamw") not in (
             "pullback_group", "fisher_group"),
         # The transport exponential is never rescaled: its chart radius is fail-closed (2026-10-02).
@@ -5294,9 +5283,8 @@ def _pure_path_report(
             "transport_covariance_class":   transport_registration.covariance_class,
         },
         "converged_stress": {k: _last(k) for k in (
-            "guard_sigma_floor_frac", "guard_sigma_ceil_frac", "guard_energy_klmax_frac",
-            "guard_selfdiv_klmax_frac", "nonfinite_frac", "renyi_band_frac",
-            "cocycle_residual", "holonomy_wilson", "gauge_invariant_spread")},
+            "guard_sigma_floor_frac", "guard_sigma_ceil_frac", "nonfinite_frac",
+            "gauge_invariant_spread")},
     }
 
 
@@ -5445,26 +5433,6 @@ def _save_figures(
                 color=figs._CB[1], logy=True, smooth=max(5, len(sy) // 80), annotate="min",
                 path=str(run / "val_ppl.png"))
             figs.plt.close(fig)
-        # Frame-numerics trajectories (diagnostics tier): coboundary closure residual + gauge-trace spread.
-        hx, hy = _aligned("holonomy_deviation")
-        if hy:
-            # Heavy-tailed (median ~1e-3, rare spikes ~1e3): log y + a median reference; NOT smoothed,
-            # so the roundoff spikes survive.
-            fig = figs.plot_trajectory(
-                hy, hx,
-                ylabel="numerical closure residual",
-                title="Numerical closure of nominally flat transport",
-                color=figs._CB[2],
-                logy=True, median_line=True, annotate="max",
-                path=str(run / "holonomy.png"))
-            figs.plt.close(fig)
-        gx, gy = _aligned("gauge_trace_spread")
-        if gy:
-            fig = figs.plot_trajectory(
-                gy, gx, ylabel=r"std $\log|\det\Omega|$", title="Gauge trace spread",
-                color=figs._CB[3], smooth=max(5, len(gy) // 60), annotate_final=True,
-                path=str(run / "gauge_trace_spread.png"))
-            figs.plt.close(fig)
         # Optimization and endpoint trends (history-only; no model re-run): the pre-clip gradient
         # norm, belief-covariance conditioning, and the per-eval E-step endpoint delta.
         nx, ny = _aligned("grad_norm")
@@ -5563,17 +5531,7 @@ def _save_figures(
         # Geometry / SPD / Fisher health dashboard (history-only): the gauge, belief-spectrum, guard,
         # and numerical-safety scalars diagnostics() logs to metrics.csv but that no standard figure
         # surfaced. The panels self-gate, so a run missing a column simply drops that panel.
-        hist_geom = _hist_subset((
-            "holonomy_wilson", "cocycle_residual", "holonomy_deviation",
-            "gauge_invariant_spread", "gauge_head_logdet_spread", "phi_norm_mean", "phi_norm_std",
-            "phi_matrix_norm_p95", "phi_matrix_norm_p99", "phi_matrix_norm_max",
-            "vertex_cond_median", "vertex_cond_p95", "vertex_cond_p99",
-            "phi_chart_projected_fraction", "phi_chart_projection_scale_min",
-            "phi_chart_projection_ms",
-            "belief_cond_p95", "belief_cond_max", "eff_rank_p5", "eff_rank_median", "eff_rank_p95",
-            "fisher_trace_mean", "guard_sigma_floor_frac", "guard_sigma_ceil_frac",
-            "guard_energy_klmax_frac", "guard_selfdiv_klmax_frac", "nonfinite_frac", "renyi_band_frac",
-            "attn_entropy_min", "attn_entropy_collapsed_heads"))
+        hist_geom = _hist_subset(raw_figs.GEOMETRY_HEALTH_COLUMNS)
         if hist_geom:
             fig = figs.plot_geometry_health(
                 hist_geom,

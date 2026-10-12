@@ -38,12 +38,6 @@ from vfe3.geometry.irreps import irrep_dim, irrep_generators
 _CG_CACHE: Dict[Tuple[str, int, str, str, str, float], torch.Tensor] = {}
 
 
-def clear_cg_cache() -> None:
-    """Drop every cached intertwiner (process-global; entries are otherwise kept for the
-    process lifetime, bounded only by the distinct (algebra, N, triple, atol) keys built)."""
-    _CG_CACHE.clear()
-
-
 def _defining(N: int, algebra: str) -> torch.Tensor:
     if algebra == "so":
         return generate_son(N, dtype=torch.float64)

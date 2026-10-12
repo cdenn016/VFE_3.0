@@ -18,7 +18,7 @@ from typing import Dict, List, Mapping
 
 import torch
 
-from vfe3.config import VFE3Config, config_from_serialized
+from vfe3.config import VFE3Config
 from vfe3.path_utils import (
     path_is_reparse_point,
     portable_path_component_key,
@@ -140,13 +140,24 @@ def _history_from_csv(path: Path) -> List[Dict[str, object]]:
     return history
 
 
-def _load_worker_config(run_dir: Path) -> VFE3Config:
-    """Load one run's serialized config for history-only figure reconstruction."""
+def _load_worker_config(run_dir: Path) -> 'VFE3Config | SimpleNamespace':
+    """Load one run's serialized config for history-only figure reconstruction.
+
+    No forward is replayed, so a run that saved a value this build refuses is read from its raw saved
+    values, as the manuscript assemblers read it (:func:`vfe3.paper.runs.load_config`).
+    """
+    from vfe3.paper.runs import load_config
+
     metadata_path = run_dir / "config.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     if not isinstance(metadata, Mapping) or not isinstance(metadata.get("config"), Mapping):
         raise ValueError(f"run metadata {metadata_path} has no config mapping")
-    return config_from_serialized(metadata["config"], source=str(metadata_path))
+    cfg, load_mode, _ = load_config(metadata["config"], source=str(metadata_path))
+    if cfg is None:
+        logging.getLogger(__name__).warning(
+            "%s: config could not be built (%s); raw saved values used", metadata_path, load_mode)
+        return SimpleNamespace(**metadata["config"])
+    return cfg
 
 
 def _render_saved_probe_figures(run_dir: Path, logger: logging.Logger) -> List[Path]:
@@ -204,7 +215,7 @@ def _render_saved_probe_figures(run_dir: Path, logger: logging.Logger) -> List[P
 
 def _render_persisted_run_figures(
     run_dir: Path,
-    cfg:     VFE3Config,
+    cfg:     'VFE3Config | SimpleNamespace',
     losses:  'List[float] | None',
     logger:  logging.Logger,
 ) -> None:

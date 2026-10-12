@@ -580,16 +580,6 @@ class UMAPWorker:
         self.cleanup_statuses: List[Dict[str, object]] = []
         self._workdir = None
 
-    @property
-    def _procs(self) -> List[object]:
-        with self._lifecycle_lock:
-            return [record.process for record in self._workers]
-
-    @property
-    def _stderr_handles(self) -> List[object]:
-        with self._lifecycle_lock:
-            return [record.stderr_handle for record in self._workers]
-
     def _record_cleanup_failure(self, *, reason: str, path: str, exc: BaseException) -> dict:
         status: Dict[str, object] = {
             "pid": None,
@@ -1371,7 +1361,7 @@ def plot_trajectory(
         tag = "best" if annotate == "min" else "max"
         ax.scatter([x[idx]], [v[idx]], s=28, color="black", zorder=5)
         # ``:.4g`` (matching annotate_final) so a heavy-tailed log series whose extremum is O(1e-4)
-        # -- holonomy.png -- prints its real value instead of rounding to "0.0" under ``:.1f``.
+        # prints its real value instead of rounding to "0.0" under ``:.1f``.
         callout = ax.annotate(f"{tag} {v[idx]:.4g}\n@ step {int(x[idx]):,}",
                               xy=(x[idx], v[idx]), xytext=(0, 0), textcoords="offset points",
                               fontsize=7.5, arrowprops=dict(arrowstyle="->", lw=0.8, color="black"))
@@ -2852,14 +2842,9 @@ def plot_geometry_health(
     stays meaningful rather than degenerating to a flat cocycle (phi -> 0, an UNGAUGED transformer) or
     a guard-pinned fixed point. Each panel self-gates on column presence."""
     fisher_label = pub_label("fisher_trace_mean", family=family)
+    # The flat-transport closure panel (holonomy_wilson, cocycle_residual, holonomy_deviation) was removed:
+    # no projected route writes those columns (audit 2026-10-12 round 2, item 13).
     panels = [
-        # The projected routes run only the flat connection, so these columns measure closure roundoff.
-        {"title": "Numerical closure of flat transport",
-         "ylabel": "numerical closure residual",
-         "logy": True, "series": [
-            ("holonomy_wilson", r"Wilson $1-\mathrm{Re}\,\mathrm{Tr}(H)/K$ (gauge-invariant)", _CB[0]),
-            ("cocycle_residual", "cocycle residual", _CB[1]),
-            ("holonomy_deviation", r"$\langle\|H-I\|_F\rangle$ (frame-dependent)", _CB[2])]},
         {"title": "Gauge-frame spread", "ylabel": "spread", "series": [
             ("gauge_invariant_spread", "frame class-function spread", _CB[3]),
             ("gauge_head_logdet_spread", r"head $\log|\det|$", _CB[4])]},
@@ -2894,17 +2879,28 @@ def plot_geometry_health(
          "logy": True, "series": [("fisher_trace_mean", fisher_label, _CB[3])]},
         {"title": "Guard saturation", "ylabel": "fraction", "series": [
             ("guard_sigma_floor_frac", r"$\sigma$ floor", _CB[0]),
-            ("guard_sigma_ceil_frac", r"$\sigma$ ceil", _CB[1]),
-            ("guard_energy_klmax_frac", "energy klmax", _CB[2]),
-            ("guard_selfdiv_klmax_frac", "selfdiv klmax", _CB[4])]},
+            ("guard_sigma_ceil_frac", r"$\sigma$ ceil", _CB[1])]},
         {"title": "Numerical safety", "ylabel": "fraction", "series": [
-            ("nonfinite_frac", "nonfinite", _CB[1]),
-            ("renyi_band_frac", "energy near kl_max", _CB[5])]},
+            ("nonfinite_frac", "nonfinite", _CB[1])]},
         {"title": "Attention-entropy collapse", "ylabel": "count / nats", "series": [
             ("attn_entropy_collapsed_heads", "collapsed heads", _CB[0]),
             ("attn_entropy_min", "min row entropy", _CB[3])]},
     ]
     return _history_dashboard(history, panels, "Gauge / SPD / Fisher geometry health", path)
+
+
+# The metrics.csv columns plot_geometry_health reads (the run finalizer passes exactly these).
+GEOMETRY_HEALTH_COLUMNS = (
+    "gauge_invariant_spread", "gauge_head_logdet_spread", "phi_norm_mean", "phi_norm_std",
+    "phi_matrix_norm_p95", "phi_matrix_norm_p99", "phi_matrix_norm_max",
+    "pos_phi_matrix_norm_p95", "pos_phi_matrix_norm_max",
+    "vertex_cond_median", "vertex_cond_p95", "vertex_cond_p99",
+    "phi_chart_projected_fraction", "phi_chart_projection_scale_min",
+    "phi_chart_projection_ms",
+    "belief_cond_p95", "belief_cond_max", "eff_rank_p5", "eff_rank_median", "eff_rank_p95",
+    "fisher_trace_mean", "guard_sigma_floor_frac", "guard_sigma_ceil_frac",
+    "nonfinite_frac",
+    "attn_entropy_min", "attn_entropy_collapsed_heads")
 
 
 @register_figure("estep_quality")
@@ -2985,9 +2981,6 @@ def plot_validation_sanity(
             ("val_prev_token_mass", "prev-token", _CB[0]),
             ("val_period_match_mass", "period-match", _CB[1]),
             ("val_head_redundancy_js", "redundancy JS", _CB[2])]},
-        {"title": "Held-out closure residual (roundoff)", "ylabel": "closure residual", "logy": True, "series": [
-            ("val_holonomy_wilson", "Wilson holonomy (gauge-invariant)", _CB[0]),
-            ("val_cocycle_residual", "cocycle residual", _CB[1])]},
         {"title": "Held-out gauge spread", "ylabel": "spread",
          "series": [("val_gauge_invariant_spread", "frame class-function spread", _CB[3])]},
         {"title": "Held-out conditioning", "ylabel": r"$\kappa(\Sigma)$", "logy": True,
@@ -2996,8 +2989,7 @@ def plot_validation_sanity(
          "logy": True, "series": [("val_fisher_trace_mean", fisher_label, _CB[3])]},
         {"title": "Held-out guard saturation", "ylabel": "fraction", "series": [
             ("val_guard_sigma_floor_frac", r"$\sigma$ floor", _CB[0]),
-            ("val_guard_sigma_ceil_frac", r"$\sigma$ ceil", _CB[1]),
-            ("val_guard_energy_klmax_frac", "energy klmax", _CB[2])]},
+            ("val_guard_sigma_ceil_frac", r"$\sigma$ ceil", _CB[1])]},
         {"title": "Held-out frame norm", "ylabel": r"$\|\phi\|$", "series": [
             ("val_phi_norm_mean", r"mean $\|\phi\|$", _CB[0]),
             ("val_phi_norm_std", r"std $\|\phi\|$", _CB[5])]},
@@ -3009,9 +3001,9 @@ VALIDATION_SANITY_COLUMNS = (
     "generalization_gap_fixed", "generalization_gap", "pos_loss_first_q", "pos_loss_last_q",
     "pos_loss_ratio", "val_future_leakage", "val_row_sum_error", "val_pos_content_r2",
     "val_prev_token_mass", "val_period_match_mass", "val_head_redundancy_js",
-    "val_holonomy_wilson", "val_cocycle_residual", "val_gauge_invariant_spread",
+    "val_gauge_invariant_spread",
     "val_belief_cond_p95", "val_fisher_trace_mean", "val_guard_sigma_floor_frac",
-    "val_guard_sigma_ceil_frac", "val_guard_energy_klmax_frac",
+    "val_guard_sigma_ceil_frac",
     "val_phi_norm_mean", "val_phi_norm_std")
 
 
@@ -3985,12 +3977,10 @@ def plot_per_layer_diagnostics(
 
     The aggregate metrics.csv and every converged-state figure show only the FINAL block; this
     plots ``VFEModel.diagnostics_per_layer`` block-by-block so depth is legible: which layer carries
-    the coupling vs entropy mass, and whether frame-closure roundoff and belief rank build up
-    with depth. Panel A: belief-channel free-energy budget (self-coupling, belief-coupling, attention
-    entropy, total) vs layer. Panel B: coboundary closure residual and Wilson trace deficit vs layer
-    (roundoff-level on the flat cocycle; not curvature).
-    Panel C: gauge action (trace spread, group-invariant spread, mean ``||phi||``) vs layer. Panel D:
-    belief geometry (effective rank, attention entropy; condition number on a twin log axis) vs layer.
+    the coupling vs entropy mass, and whether belief rank builds up with depth. Panel A: belief-channel free-energy budget (self-coupling, belief-coupling, attention
+    entropy, total) vs layer. Panel B: gauge action (group-invariant spread, mean ``||phi||``) vs layer.
+    Panel C: belief geometry (effective rank, attention entropy; condition number on a twin log axis) vs
+    layer.
 
     On the conditional (readout) route the panels are those of :func:`plot_readout_diagnostics`
     with layer on the x axis. With ``residual_ratio`` the unnormalized displacement panel is replaced
@@ -4031,29 +4021,22 @@ def plot_per_layer_diagnostics(
     x = np.arange(L)
     _m = "o-" if L > 1 else "o"                                  # a single layer has no line to draw
     with _compact_style():
-        fig, axes = plt.subplots(2, 2, figsize=(MAX_FIGURE_WIDTH_IN, 5.4))
+        fig, axes = plt.subplots(1, 3, figsize=(MAX_FIGURE_WIDTH_IN, 2.9))
         for k, c, lab in (("self_coupling", _CB[0], r"self $\alpha\,$KL$(q\|p)$"),
                           ("belief_coupling", _CB[1], r"belief $\sum\beta\,$KL"),
                           ("attention_entropy", _CB[2], "attn entropy term"),
                           ("total", _CB[7], "total (belief F)")):
             if k in per_layer:
-                axes[0][0].plot(x, g(k), _m, color=c, lw=1.4, label=lab)
-        axes[0][0].set(xticks=x, xlabel="layer", ylabel="nats", title="Free-energy budget by layer")
-        axes[0][0].legend(fontsize=6, frameon=False)
-        for k, c, lab in (("holonomy_deviation", _CB[0], r"$\|H-I\|_F$ (frame-dependent)"),
-                          ("holonomy_wilson", _CB[1], r"Wilson $1-\mathrm{Re}\,\mathrm{Tr}\,H/K$ (gauge-invariant)")):
-            if k in per_layer:
-                axes[0][1].plot(x, g(k), _m, color=c, lw=1.4, label=lab)
-        axes[0][1].set(xticks=x, xlabel="layer", ylabel="deviation", title="Holonomy / curvature by layer")
-        axes[0][1].legend(fontsize=6, frameon=False)
-        for k, c, lab in (("gauge_trace_spread", _CB[0], "tr spread"),
-                          ("gauge_invariant_spread", _CB[1], "class-function spread"),
+                axes[0].plot(x, g(k), _m, color=c, lw=1.4, label=lab)
+        axes[0].set(xticks=x, xlabel="layer", ylabel="nats", title="Free-energy budget by layer")
+        axes[0].legend(fontsize=6, frameon=False)
+        for k, c, lab in (("gauge_invariant_spread", _CB[1], "class-function spread"),
                           ("phi_norm_mean", _CB[2], r"mean $\|\phi\|$")):
             if k in per_layer:
-                axes[1][0].plot(x, g(k), _m, color=c, lw=1.4, label=lab)
-        axes[1][0].set(xticks=x, xlabel="layer", ylabel="magnitude", title="Gauge action by layer")
-        axes[1][0].legend(fontsize=6, frameon=False)
-        ax = axes[1][1]
+                axes[1].plot(x, g(k), _m, color=c, lw=1.4, label=lab)
+        axes[1].set(xticks=x, xlabel="layer", ylabel="magnitude", title="Gauge action by layer")
+        axes[1].legend(fontsize=6, frameon=False)
+        ax = axes[2]
         if "effective_rank" in per_layer:
             ax.plot(x, g("effective_rank"), _m, color=_CB[0], lw=1.4, label="effective rank")
         if "attn_entropy" in per_layer:
@@ -5636,8 +5619,6 @@ PUB_LABELS: Dict[str, str] = {
     # -- attention / gauge / belief-geometry diagnostics --
     "attn_entropy":       r"attention row entropy $H(\beta)=-\sum_j\beta_{ij}\log\beta_{ij}$",
     "effective_rank":     r"belief effective rank $\mathrm{erank}(\Sigma)$",
-    "holonomy_deviation": r"holonomy $\langle\|H-I\|_F\rangle$ (frame-dependent)",
-    "gauge_trace_spread": r"gauge spread $\mathrm{std}_i\,\log|\det\Omega_i|$",
     "belief_cond_median": r"belief conditioning $\mathrm{med}_i\,\kappa(\Sigma_i)$",
     "fisher_trace_mean":  r"Half Fisher trace $\mathrm{tr}(I_\mu)/2$",
     "val_fisher_trace_mean": r"Half Fisher trace $\mathrm{tr}(I_\mu)/2$",
@@ -5665,15 +5646,12 @@ PUB_LABELS: Dict[str, str] = {
     "corpus_freq_strata_ce.mid":      r"$\mathrm{CE}_{\mathrm{mid}}$ (nats)",
     "corpus_freq_strata_ce.frequent": r"$\mathrm{CE}_{\mathrm{frequent}}$ (nats)",
     # -- geometry-health dashboard (gauge / SPD / Fisher / guard) --
-    "holonomy_wilson":         r"Wilson holonomy $1-\mathrm{Re}\,\mathrm{Tr}(H)/K$ (gauge-invariant)",
-    "cocycle_residual":        "cocycle residual (roundoff)",
     "gauge_invariant_spread":  r"frame class-function spread $\mathrm{std}_i\,I(\exp\phi_i)$",
     "phi_norm_mean":           r"gauge-frame norm $\langle\|\phi_i\|\rangle$",
     "belief_cond_p95":         r"belief conditioning $\kappa_{95}(\Sigma)$",
     "eff_rank_median":         r"belief effective rank $\mathrm{med}_i\,\mathrm{erank}(\Sigma_i)$",
     "fisher_trace_median":     r"Half Fisher trace $\mathrm{med}_i\mathrm{tr}(I_{\mu,i})/2$",
     "nonfinite_frac":          "non-finite fraction",
-    "renyi_band_frac":         "pair-energy fraction in (0.9, 1.0) kl_max",
     "attn_entropy_min":        r"min row entropy $\min_{i,h}H(\beta)$",
     "attn_entropy_collapsed_heads": "collapsed-head count",
     # -- E-step inference quality --
@@ -5721,7 +5699,7 @@ def pub_label(
 
 @register_figure("ppl_noise_band")
 def plot_ppl_noise_band(
-    agg,                                 # aggregate_seed_metric output: {values, seeds, mean, sd}
+    agg,                                 # aggregate_scalar output: {values, seeds, mean, sd}
 
     *,
     label: str  = "K=20 baseline",
@@ -5922,7 +5900,7 @@ def plot_pos_extrapolation(
 ):
     r"""H1/EXP-13: held-out CE vs eval sequence length N, one line per positional scheme.
 
-    Offset attention priors (alibi / t5, functions of |i-j|) stay flat past the trained length; the
+    Offset attention priors (causal_alibi, a function of |i-j|) stay flat past the trained length; the
     absolute schemes (learned pos_phi table, RoPE) rise -- the extrapolation contrast. The train
     length is marked; points beyond it are pure extrapolation."""
     if isinstance(arms, dict):

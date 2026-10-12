@@ -158,7 +158,7 @@ def test_tiers_name_existing_arms_and_base_protocol_keeps_the_base_budget() -> N
 
 
 def test_confound_arms_resolve_with_declared_changes_only(tmp_path: Path) -> None:
-    pytest.importorskip("train_baseline")
+    import train_baseline  # noqa: F401
     base = pa.load_base("tiny", _write_base(tmp_path, _tiny_cfg(beta_attention_prior="causal")))
     plans = {p.label: p for p in pa.build_plan(
         base, budget="base_protocol", seeds=[(6, 3)], labels=[*pa.TIER_A, *pa.TIER_B],

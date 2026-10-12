@@ -203,8 +203,8 @@ def condition_recovery_on() -> Iterator[None]:
         set_projected_condition_recovery(previous)
 
 
-_PROJECTED_SCORER_POLICY = ("_CONDITION_RECOVERY", "_GRAM_CONDITION_TOL", "_RECOVERY_PRECISION",
-                            "_FACTOR_ROUTE", "_FACTOR_CONDITION_TOL")
+_PROJECTED_SCORER_POLICY = ("_CONDITION_RECOVERY", "_RECOVERY_PRECISION", "_FACTOR_ROUTE",
+                            "GRAM_CONDITION_TOL", "FACTOR_CONDITION_TOL")
 
 
 @pytest.fixture(autouse=True)

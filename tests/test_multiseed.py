@@ -23,11 +23,11 @@ def _write_run(d, ppl, seed):
     (d / "config.json").write_text(json.dumps(serialize_config(test_config(seed=seed))))
 
 
-def test_aggregate_seed_metric_mean_sd_and_seeds(tmp_path):
+def test_aggregate_scalar_mean_sd_and_seeds(tmp_path):
     vals = [10.0, 12.0, 11.0, 13.0, 9.0]                     # mean 11, ddof=1 var 2.5
     for i, v in enumerate(vals):
         _write_run(tmp_path / f"seed{i}", v, seed=i)
-    out = ms.aggregate_seed_metric(tmp_path)
+    out = ms.aggregate_scalar(tmp_path, "test_ppl", sources=("summary.json",))
     assert out["n"] == 5
     assert abs(out["mean"] - 11.0) < 1e-9
     assert abs(out["sd"] - math.sqrt(2.5)) < 1e-9
@@ -43,21 +43,14 @@ def test_aggregate_skips_nonfinite_and_unreadable(tmp_path):
     (tmp_path / "c" / "summary.json").write_text("{ not json")
     (tmp_path / "c" / "config.json").write_text(json.dumps(
         serialize_config(test_config(seed=3))))
-    out = ms.aggregate_seed_metric(tmp_path)
+    out = ms.aggregate_scalar(tmp_path, "test_ppl", sources=("summary.json",))
     assert out["n"] == 1 and abs(out["mean"] - 10.0) < 1e-9
     assert math.isnan(out["sd"])                            # n<2 -> SD undefined
 
 
 def test_aggregate_empty_root(tmp_path):
-    out = ms.aggregate_seed_metric(tmp_path)
+    out = ms.aggregate_scalar(tmp_path, "test_ppl", sources=("summary.json",))
     assert out["n"] == 0 and math.isnan(out["mean"])
-
-
-def test_flag_noise_dominated():
-    cells = {"a": 10.0, "b": 10.5, "c": 15.0, "d": None}
-    flagged = ms.flag_noise_dominated(cells, sd=1.0, k=2.0)   # threshold 2.0 above best (10.0)
-    assert set(flagged) == {"a", "b"}                         # c is 5 > 2 away; d skipped
-    assert ms.flag_noise_dominated(cells, sd=float("nan")) == []
 
 
 # =============================================================================
@@ -217,10 +210,10 @@ def test_multiseed_manifest_rejects_invalid_observed_seed_without_request(tmp_pa
     assert manifest["requested_seeds"] == []
 
 
-def test_aggregate_seed_metric_uses_provenance_seed(tmp_path):
+def test_aggregate_scalar_uses_provenance_seed(tmp_path):
     for v, s in [(10.0, 23), (12.0, 54)]:
         _write_full_run(tmp_path / f"run_s{s}", ppl=v, seed=s)
-    out = ms.aggregate_seed_metric(tmp_path)
+    out = ms.aggregate_scalar(tmp_path, "test_ppl", sources=("summary.json",))
     assert out["n"] == 2 and sorted(out["seeds"]) == [23, 54]
 
 
@@ -251,7 +244,7 @@ def test_seed_dirs_reject_mixed_semantic_configs(tmp_path):
     assert str(run_a / "config.json") in message
     assert str(run_b / "config.json") in message
     with pytest.raises(ValueError, match="mixed semantic config fingerprints"):
-        ms.aggregate_seed_metric(tmp_path)
+        ms.aggregate_scalar(tmp_path, "test_ppl", sources=("summary.json",))
 
 
 def test_seed_dirs_accept_homogeneous_semantic_configs(tmp_path):
@@ -280,35 +273,41 @@ def test_seed_dirs_accept_homogeneous_semantic_configs(tmp_path):
         == ms._config_fingerprint(flat / "config.json")
     )
     assert ms._seed_dirs(tmp_path) == [nested, flat]
-    out = ms.aggregate_seed_metric(tmp_path)
+    out = ms.aggregate_scalar(tmp_path, "test_ppl", sources=("summary.json",))
     assert out["n"] == 2
     assert out["mean"] == pytest.approx(11.0)
 
 
 @pytest.mark.parametrize("nested", [False, True], ids=["flat", "nested"])
 @pytest.mark.parametrize("retired_surface", ["active_phi", "ambiguous_policy"])
-def test_semantic_config_rejects_retired_legacy_fields(
+def test_semantic_config_keeps_dropped_legacy_fields_in_the_fingerprint(
     tmp_path,
     nested,
     retired_surface,
 ):
     payload = asdict(test_config(seed=1, vocab_size=8, embed_dim=4, n_heads=2, max_seq_len=4))
     payload["pos_phi"] = "none"
+    clean_path = tmp_path / f"clean-{nested}.json"
+    clean_path.write_text(json.dumps({"config": payload} if nested else payload), encoding="utf-8")
     if retired_surface == "active_phi":
         payload.pop("m_phi_update_mode")
-        payload.update({
+        retired = {
             "m_phi_natural_grad": True,
             "m_gauge_momentum": 0.9,
             "m_gauge_update_rule": "heavy_ball",
-        })
+        }
     else:
-        payload["policy_mode"] = "future_policy"
+        retired = {"policy_mode": "future_policy"}
+    payload.update(retired)
     artifact = {"config": payload, "timestamp": "legacy"} if nested else payload
     config_path = tmp_path / f"{retired_surface}-{nested}.json"
     config_path.write_text(json.dumps(artifact), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="unknown field"):
-        ms._semantic_config(config_path)
+    # The lenient loader of vfe3.paper drops fields this build no longer declares; they stay in the
+    # semantic config, so such a run never shares a fingerprint with one that lacks them.
+    semantic = ms._semantic_config(config_path)
+    assert {key: semantic[f"retired:{key}"] for key in retired} == retired
+    assert ms._config_fingerprint(config_path) != ms._config_fingerprint(clean_path)
 
 
 @pytest.mark.parametrize("config_text", [None, "{ not json"])
@@ -354,7 +353,7 @@ def test_requested_panel_reports_unexpected_duplicate_runs_and_withholds_publica
     assert design["n_observed_runs"] == 3
     assert design["complete"] is False
 
-    aggregate = ms.aggregate_seed_metric(tmp_path)
+    aggregate = ms.aggregate_scalar(tmp_path, "test_ppl", sources=("summary.json",))
     assert aggregate["n"] == 1
     assert aggregate["seeds"] == [8]
     assert aggregate["accepted_seeds"] == [8]

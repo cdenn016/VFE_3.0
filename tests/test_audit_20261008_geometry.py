@@ -199,8 +199,7 @@ def test_offstrip_chart_failure_rejects_the_row_instead_of_killing_the_step(thet
     counts = torch.tensor([2.0, 0.0, 3.0, 0.0, 1.0], dtype=F64)
     optimizer = GaugeManifoldAdamW(
         [{"params": [phi], "lr": 0.05, "pullback_group": True, "weight_decay": 0.0}],
-        group, phi_group_trust_radius=0.1, phi_chart_max_norm=5.0, phi_bch_residual_max=1e-6,
-        phi_group_retraction="chart",
+        group, phi_group_trust_radius=0.1, phi_chart_max_norm=5.0, phi_group_retraction="chart",
         phi_statistics_provider=_stub_provider(mu, s, counts), weight_decay=0.0)
     before = phi.detach().clone()
     phi.grad = torch.zeros_like(phi)
@@ -229,7 +228,7 @@ def test_compact_staging_never_materializes_the_elementary_basis() -> None:
     phi = nn.Parameter(0.1 * torch.randn(3, 18))
     GaugeManifoldAdamW([{"params": [phi], "lr": 0.05, "pullback_group": True, "weight_decay": 0.0}],
                        group, phi_group_trust_radius=0.1, phi_chart_max_norm=5.0,
-                       phi_bch_residual_max=1e-6, weight_decay=0.0)
+                       weight_decay=0.0)
     phi64 = phi.detach().double()
     delta = 1e-3 * torch.randn_like(phi64)
     current = _pullback_group_current_element(phi64, group)

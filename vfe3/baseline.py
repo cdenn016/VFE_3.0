@@ -825,10 +825,9 @@ class BaselineTransformer(nn.Module):
         super().__init__()
         if not isinstance(cfg, BaselineConfig):
             raise TypeError(f"BaselineTransformer needs a BaselineConfig, got {type(cfg).__name__}")
-        from vfe3.runtime import disable_fill_uninitialized_memory, set_fp32_matmul_precision
+        from vfe3.runtime import set_fp32_matmul_precision
 
         set_fp32_matmul_precision(cfg.fp32_matmul_precision)
-        disable_fill_uninitialized_memory()
         self.cfg = cfg
         V, K, H, d = cfg.vocab_size, cfg.embed_dim, cfg.n_heads, cfg.d_head
         self.tok_embed = nn.Parameter(torch.empty(V, K))                                   # (V, K) E
@@ -1011,7 +1010,6 @@ class BaselineTransformer(nn.Module):
             "attn_entropy": float(attention_entropy(maps)),
             "self_coupling": nan, "self_divergence": nan, "belief_coupling": nan,
             "attention_entropy": nan, "total": nan, "effective_rank": nan,
-            "holonomy_deviation": nan, "gauge_trace_spread": nan,
         }
 
     @torch.no_grad()

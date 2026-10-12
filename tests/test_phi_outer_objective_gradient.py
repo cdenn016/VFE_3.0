@@ -25,7 +25,6 @@ def _outer_cfg(**overrides: object) -> VFE3Config:
         "n_e_steps": 1,
         "gauge_group": "block_glk",
         "pos_phi": "none",
-        "mass_phi": 0.0,
         "mstep_self_coupling_weight": 0.0,
         "seed": 19,
         "mu_init_std": 0.02,
@@ -127,7 +126,7 @@ def test_returned_outer_ce_phi_covector_matches_central_differences(record_prope
 
 def test_completed_outer_loss_not_reconstructed_ce_supplies_phi_covector(record_property) -> None:
     torch.manual_seed(7)
-    model = VFEModel(_outer_cfg(mass_phi=3.0, n_e_steps=2))
+    model = VFEModel(_outer_cfg(mstep_self_coupling_weight=1.0e4, n_e_steps=2))
     tokens, targets = _fixed_batch()
     parameter = model.prior_bank.phi_embed
     direction = _seeded_active_direction(parameter, tokens)
@@ -207,7 +206,7 @@ def _production_regularized_covectors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
     cfg = _pullback_cfg(
-        mass_phi=3.0,
+        mstep_self_coupling_weight=100.0,
         decode_mode="diagonal_chunked",
         n_e_steps=2,
         amp_dtype="fp16",

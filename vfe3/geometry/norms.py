@@ -9,8 +9,7 @@ gauge-invariant and mu_norm transforms as a vector. Pure math, no parameters.
 ``layernorm`` (the ``norm_type_block`` default) is a NON-gauge-equivariant baseline: standard transformer LayerNorm
 standardization of the mean over the belief dimension (see LayerNorm). With ``layernorm_affine=True``
 the builder returns the AffineLayerNorm variant, which adds a learned per-feature affine (gamma/beta)
-on top of the standardization -- a SANCTIONED learned-scalar exception (t5_bias / learnable_kappa
-family), still non-equivariant. Both are ablations / baselines against the gauge-pure paths, which
+on top of the standardization -- a SANCTIONED learned-scalar exception, still non-equivariant. Both are ablations / baselines against the gauge-pure paths, which
 remain ``none``/``mahalanobis``.
 """
 
@@ -204,11 +203,9 @@ class AffineLayerNorm(nn.Module):
     per-feature scale ``gamma`` (``weight``) and shift ``beta`` (``bias``), each of shape ``(K,)``,
     exactly ``torch.nn.LayerNorm(K, elementwise_affine=True)`` on the belief MEAN (``sigma`` ignored).
     ``gamma`` inits to ones and ``beta`` to zeros, so at construction the affine is the identity and
-    the output is BYTE-IDENTICAL to the parameter-free ``LayerNorm`` (the same step-0 contract the
-    learnable_kappa / t5_bias exceptions carry).
+    the output is BYTE-IDENTICAL to the parameter-free ``LayerNorm``.
 
-    SANCTIONED LEARNED-SCALAR EXCEPTION (t5_bias / learnable_kappa family, default OFF via
-    ``layernorm_affine``): ``gamma``/``beta`` are raw ``nn.Parameter`` diagonal scale/shift tables,
+    SANCTIONED LEARNED-SCALAR EXCEPTION (default OFF via ``layernorm_affine``): ``gamma``/``beta`` are raw ``nn.Parameter`` diagonal scale/shift tables,
     not an ``nn.Linear`` / MLP / activation, so they carry no hidden network. They are still
     NON-gauge-equivariant -- a per-coordinate affine in the fixed basis does not commute with a
     general g in GL(K); the affine sits on the same non-gauge-pure path LayerNorm already occupies,

@@ -213,3 +213,26 @@ def test_random_curves_reach_the_mm_limit() -> None:
         converged = (c0 / (b0 + curve.evaluate(a)[0]) - a).abs() < 1e-11      # slow MM tails excluded
         assert float(((root - a).abs() / a.clamp(min=1e-3))[converged].max()) < 1e-8
     assert multiple > 0                                                  # the sweep has non-unique fixed points
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_capture_records_the_root_residual_and_floored_slopes(full: bool, monkeypatch: Any) -> None:
+    r"""The diagnostic capture carries the largest root residual and the count of receivers whose slope
+    :math:`1 - h'(r)` was floored (audit 2026-10-12 round 2, item 16 and M6): none at the default floor here, and every
+    receiver once the floor exceeds every slope."""
+    _, capture = _run(full, "closed_form_profiled", 1)
+    assert 0.0 <= float(capture["relational_receiver_profiled_residual"]) < 1e-9
+    assert int(capture["relational_receiver_profiled_floored_slopes"]) == 0
+    monkeypatch.setattr(full_link, "_PROFILED_SLOPE_FLOOR", 1e12)
+    _, capture = _run(full, "closed_form_profiled", 1)
+    assert int(capture["relational_receiver_profiled_floored_slopes"]) == 3      # every receiver (1 x 3)
+
+
+def test_model_diagnostics_report_the_profiled_root() -> None:
+    from vfe3.model.model import VFEModel
+
+    model = VFEModel(_cfg(relational_receiver_update="closed_form_profiled")).eval()
+    ids = torch.tensor([[1, 2, 3]])
+    row = model.diagnostics(ids)
+    assert 0.0 <= row["relational_receiver_profiled_residual"] < 1e-6
+    assert row["relational_receiver_profiled_floored_slopes"] == 0.0

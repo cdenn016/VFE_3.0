@@ -165,7 +165,7 @@ def test_resolve_manifest_carries_the_paper_arms_row_flags(tmp_path: Path) -> No
 
 def test_comparator_follows_the_positional_scheme_and_the_alibi_duplicate_is_inapplicable(
         tmp_path: Path) -> None:
-    pytest.importorskip("train_baseline")
+    import train_baseline  # noqa: F401
     from vfe3.baseline import BaselineConfig
 
     alibi = pa.load_base("alibi", _write_base(tmp_path / "a", _tiny_cfg(beta_attention_prior="causal_alibi",
@@ -207,7 +207,7 @@ def test_comparator_follows_the_positional_scheme_and_the_alibi_duplicate_is_ina
 
 def test_compute_matched_rule_waits_for_every_planned_evaluated_seed_pair(
         tmp_path: Path, caches: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    pytest.importorskip("vfe3.baseline")
+    import vfe3.baseline  # noqa: F401
     import train_baseline as tb
 
     def refuse(*args: Any, **kwargs: Any) -> None:
@@ -328,7 +328,7 @@ def test_post_shared_baseline_drops_the_attention_residual_of_a_base_without_one
 
 
 def test_paper_arms_post_norm_arm_matches_a_base_without_the_residual_and_says_so(tmp_path: Path) -> None:
-    pytest.importorskip("train_baseline")
+    import train_baseline  # noqa: F401
     label = "Per-type read table, ALiBi, shared post-norm"
     for residual in (True, False):
         base = pa.load_base("tiny", _write_base(tmp_path / str(residual), _tiny_cfg(attention_residual=residual)))
@@ -504,7 +504,7 @@ def test_total_parameter_width_picks_the_nearest_whole_head_width() -> None:
 def test_total_matched_arm_matches_the_base_total_and_declares_only_the_width(tmp_path: Path) -> None:
     import dataclasses
 
-    pytest.importorskip("train_baseline")
+    import train_baseline  # noqa: F401
     from vfe3.baseline import total_parameter_width
 
     # A vocabulary large enough that the frame table makes the base wider in total than its dense twin.

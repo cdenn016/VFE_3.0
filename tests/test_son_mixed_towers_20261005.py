@@ -190,13 +190,14 @@ def test_routing_score_float64_recovery_path_agrees_on_a_mixed_tower() -> None:
     mu = torch.randn(1, 3, 11, generator=g)
     sigma = torch.rand(1, 3, 11, generator=g) + 0.5
     healthy = relational_score(mu, sigma, mu, sigma, frame, ops)
-    previous = rs.set_projected_gram_condition_tol(1e-30)        # every float32 entry fails the certificate
+    previous = rs.GRAM_CONDITION_TOL
+    rs.GRAM_CONDITION_TOL = 1e-30                                 # every float32 entry fails the certificate
     previous_recovery = rs.set_projected_condition_recovery(True)
     before = rs.source_recovery_elements()
     try:
         recovered = relational_score(mu, sigma, mu, sigma, frame, ops)
     finally:
-        rs.set_projected_gram_condition_tol(previous)
+        rs.GRAM_CONDITION_TOL = previous
         rs.set_projected_condition_recovery(previous_recovery)
     assert rs.source_recovery_elements() > before
     torch.testing.assert_close(recovered, healthy, atol=2e-4, rtol=2e-4)

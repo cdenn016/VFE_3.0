@@ -3,10 +3,9 @@ r"""Opt-in M-step self-coupling regularizer alpha_hat * sum_i KL(q_i*||p_i).
 Manuscript Algorithm 1 (GL(K)_attention.tex:2083): the M-step loss carries a self-
 coupling term alpha_hat * sum_i KL(q_i*||p_i) at the converged belief against the
 per-block prior. It is wired as an OPT-IN, DEFAULT-OFF scalar coefficient
-``cfg.mstep_self_coupling_weight`` (alpha_hat), mirroring ``mass_phi``. These tests
-pin the two contracts: (1) at weight 0 the term is absent (loss == ce when mass_phi
-is also 0), and (2) at weight w the loss is exactly ce + w * mean KL(q*||p), with the
-self-divergence ``sc`` recomputed independently by the same recipe ``forward`` uses.
+``cfg.mstep_self_coupling_weight`` (alpha_hat). These tests pin the two contracts:
+(1) at weight 0 the term is absent (loss == ce), and (2) at weight w the loss is
+exactly ce + w * mean KL(q*||p), with the self-divergence ``sc`` recomputed independently by the same recipe ``forward`` uses.
 """
 
 from tests.profiles import test_config
@@ -35,9 +34,9 @@ def _converged_self_divergence(model: VFEModel, tokens: torch.Tensor) -> torch.T
 
 
 def test_noop_at_weight_zero():
-    # The key oracle: at weight 0 the new term is absent, so loss == ce (mass_phi=0 too).
+    # The key oracle: at weight 0 the new term is absent, so loss == ce.
     cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                     n_e_steps=1, e_q_mu_lr=0.5, mass_phi=0.0,
+                     n_e_steps=1, e_q_mu_lr=0.5,
                      mstep_self_coupling_weight=0.0, seed=0)
     model = VFEModel(cfg)
     tokens = torch.randint(0, 20, (3, 5))
@@ -50,7 +49,7 @@ def test_linear_in_weight():
     # Pins the term: loss == ce + w * mean KL(q*||p), with sc recomputed independently.
     w = 0.5
     cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                     n_e_steps=1, e_q_mu_lr=0.5, mass_phi=0.0,
+                     n_e_steps=1, e_q_mu_lr=0.5,
                      mstep_self_coupling_weight=w, seed=0)
     model = VFEModel(cfg)
     tokens = torch.randint(0, 20, (3, 5))
@@ -85,7 +84,7 @@ def test_per_coord_alpha_weighting():
     #   loss == ce + w * mean_i sum_k alpha_i^(k)* D_i^(k).
     w, b0, c0 = 0.5, 0.5, 2.0
     cfg = test_config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
-                     n_e_steps=1, e_q_mu_lr=0.5, mass_phi=0.0,
+                     n_e_steps=1, e_q_mu_lr=0.5,
                      attention_mode="projected_predictive",
                      lambda_alpha_mode="state_dependent_per_coord", b0=b0, c0=c0,
                      mstep_self_coupling_weight=w, seed=0)

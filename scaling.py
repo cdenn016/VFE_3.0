@@ -151,6 +151,7 @@ config = dict(
 
     # Attention execution; all interfaces have full input/output.
     attention_mode                   = "projected_predictive",  # "projected_predictive" | "projected_gradient"
+    relational_receiver_measurement  = "inverse",               # "inverse" O'^-1, the dual measurement (VFE3Config default) | "adjoint" O'^T (projected_gradient only)
 
 
 
@@ -262,7 +263,6 @@ config = dict(
 
 
     # Further Regularizers
-    mass_phi                   = 0.0,       # (mass_phi/2) ||phi||^2 penalty
     mstep_self_coupling_weight = 0.0,       # alpha_hat * sum_i KL(q_i*||p_i) M-step term (0 = OFF)
 
 
@@ -348,6 +348,7 @@ config = dict(
     e_sigma_q_trust                      = 1.0,
 
 
+    kl_max                               = None,          # None (8 * embed_dim, per cell) | nats; a number stays fixed across widths
     amp_dtype                            = 'bf16',        # None=fp32 | 'bf16' , 'fp16'. Sigma must be at least fp32
     fp32_matmul_precision                = "highest",       # None (leave as-is) | "highest" | "high" | "medium"
 
@@ -384,8 +385,6 @@ config = dict(
     generate_embedding_figures           = True,
 )
 
-config["kl_max"] = 8 * config["embed_dim"]
-
 # The scaling operating point IS the local ``config`` dict above (self-contained; NOT train_vfe3.py).
 # Edit ``config`` to change what every cell trains around; each ROUTE cell overrides only its scale knob(s).
 BASELINE: Dict[str, Any] = config
@@ -408,22 +407,14 @@ def build_standard_routes(settings: Dict[str, List[int]]) -> Dict[str, List[Dict
                 or len(values) != len(set(values))):
             raise ValueError(f"SWEEPS[{name!r}] must contain unique positive integers")
     widths, depths, steps = (settings[name] for name in ("widths", "depths", "train_steps"))
-    baseline_k = BASELINE.get("embed_dim", VFE3Config.__dataclass_fields__["embed_dim"].default)
-    ceiling = BASELINE.get("kl_max", VFE3Config.__dataclass_fields__["kl_max"].default)
-
-    def width_override(k: int) -> Dict[str, Any]:
-        if ceiling is None:                                  # kl_max=None resolves to 8 * k in each cell
-            return {"embed_dim": k}
-        return {"embed_dim": k, "kl_max": ceiling * k / baseline_k}
-
     return {
         "width": [{"label": f"K{k}", "route": "width", "scale_knob": "embed_dim",
-                   "overrides": width_override(k)} for k in widths],
+                   "overrides": {"embed_dim": k}} for k in widths],
         "depth": [{"label": f"L{depth}", "route": "depth", "scale_knob": "n_layers",
                    "overrides": {"n_layers": depth}} for depth in depths],
         "width_depth": [{"label": f"K{k}_L{depth}", "route": "width_depth",
                          "scale_knob": "embed_dim+n_layers",
-                         "overrides": {**width_override(k), "n_layers": depth}}
+                         "overrides": {"embed_dim": k, "n_layers": depth}}
                         for k in widths for depth in depths],
         "train_steps": [{"label": f"steps{step}", "route": "train_steps", "scale_knob": "max_steps",
                          "overrides": {"max_steps": step}} for step in steps],
@@ -434,14 +425,9 @@ def route_grow_k(embed_dims: List[int], n_heads: int = 4) -> List[Dict[str, Any]
     r"""Grow N by widening embed_dim at a FIXED block_glk head count (route A). Mixed linear+quadratic
     token-prior route: 2VK grows linearly, phi_embed = V*K^2/n_heads quadratically. n_heads stays equal to the
     block count so the baseline causal_alibi prior remains valid."""
-    # kl_max scales WITH k (audit 2026-07-27). BASELINE freezes it at 8*train_K once, so route A
-    # inherited 8*20 = 160 at every width while its three siblings (route_grow_k_mup,
-    # route_grow_k_fixed_block, route_vary_block_fixed_k) each set 8*k per cell. Route A's divergence
-    # ceiling therefore fell from 8.0 to 1.33 nats/coordinate across the very axis it measures, so
-    # its width exponent was not measured under the same functional as route A'.
+    # kl_max scales WITH k (audit 2026-07-27): BASELINE's kl_max=None resolves to 8*k in each cell.
     return [{"label": f"K{k}", "route": "grow_K", "scale_knob": "embed_dim",
-             "overrides": {"embed_dim": k, "n_heads": n_heads, "gauge_group": "block_glk",
-                           "kl_max": 8 * k}}
+             "overrides": {"embed_dim": k, "n_heads": n_heads, "gauge_group": "block_glk"}}
             for k in embed_dims]
 
 
@@ -459,9 +445,8 @@ def route_grow_k_mup(embed_dims: List[int], n_heads: int = 4, anchor_k: int = 20
     r"""muP width-stability route for the inverse-K exponent (F1/EXP-6). For each K it emits a matched
     PAIR: a 'fixed' arm at the baseline mean LR/init (the width-fixed control) and a 'mup' arm that
     scales the E/M-step mean LRs ~ anchor_k/K and the mean-init std ~ sqrt(anchor_k/K) (Tensor-Programs
-    muP for width). BOTH arms recompute kl_max = 8*K per cell -- the baseline freezes kl_max at
-    8*train_K (a width confound that over-relaxes every small-K cell;
-    see docs/experiments/2026-06-21-experiment-readiness.md). Anchored at
+    muP for width). BOTH arms run at kl_max = 8*K per cell (BASELINE's kl_max=None), which avoids the
+    frozen-kl_max width confound (see docs/experiments/2026-06-21-experiment-readiness.md). Anchored at
     K=anchor_k, where the muP factors are 1 and the two arms coincide. Scoped to this route so the
     other routes (incl. an active blocksize run) are untouched. The fitted exponent should be compared
     against embed_dim, not n_params (which is K^2-dominated by phi_embed)."""
@@ -470,7 +455,7 @@ def route_grow_k_mup(embed_dims: List[int], n_heads: int = 4, anchor_k: int = 20
     base_init = _baseline_value("mu_init_std")
     cells: List[Dict[str, Any]] = []
     for k in embed_dims:
-        common = {"embed_dim": k, "n_heads": n_heads, "gauge_group": "block_glk", "kl_max": 8 * k}
+        common = {"embed_dim": k, "n_heads": n_heads, "gauge_group": "block_glk"}
         cells.append({"label": f"K{k}_fixed", "route": "grow_K_mup", "scale_knob": "embed_dim",
                       "overrides": dict(common)})
         w = anchor_k / k                                     # muP width ratio (1 at the anchor)
@@ -492,7 +477,7 @@ def route_grow_k_fixed_block(embed_dims: List[int], block: int) -> List[Dict[str
     r"""Grow N by widening K at a FIXED gauge block size GL(``block``): n_heads = K/block scales WITH K
     (every head is one GL(block) frame). Because block_glk has n_gen = K^2/n_heads = block*K, phi_embed
     = V*block*K grows LINEARLY in K here -- contrast ``route_grow_k`` (fixed n_heads, so the block grows
-    and n_gen ~ K^2). kl_max = 8*K per cell (avoids the frozen-kl_max width confound). K must be a
+    and n_gen ~ K^2). kl_max = 8*K per cell (BASELINE's kl_max=None). K must be a
     positive multiple of ``block``; non-multiples are skipped with a warning."""
     cells: List[Dict[str, Any]] = []
     for k in embed_dims:
@@ -500,7 +485,7 @@ def route_grow_k_fixed_block(embed_dims: List[int], block: int) -> List[Dict[str
             logger.warning("  [skip] grow_K_GL%d: K=%d is not a positive multiple of block=%d", block, k, block)
             continue
         h = k // block
-        ov: Dict[str, Any] = {"embed_dim": k, "n_heads": h, "gauge_group": "block_glk", "kl_max": 8 * k}
+        ov: Dict[str, Any] = {"embed_dim": k, "n_heads": h, "gauge_group": "block_glk"}
         cells.append({"label": f"K{k}_GL{block}", "route": f"grow_K_GL{block}",
                       "scale_knob": "embed_dim", "overrides": ov})
     return cells
@@ -518,7 +503,8 @@ def route_vary_block_fixed_k(
     r"""Fixed K, vary the gauge block size GL(``b``): n_heads = K/b, so block_glk n_gen = K^2/n_heads =
     b*K. FEWER/LARGER blocks (bigger b) = MORE params (n_gen up) -- the opposite sign of a standard
     transformer, and the parameter axis here. This is the ``route_blocksize`` idea written in GL(b) terms
-    (b=K/n_heads). kl_max = 8*K (constant; K is fixed across the route). Each b must divide K; non-divisors are skipped with a warning.
+    (b=K/n_heads). kl_max = 8*K (BASELINE's kl_max=None; constant, as K is fixed across the route). Each b must
+    divide K; non-divisors are skipped with a warning.
 
     ``gauge_group`` selects the structure group per cell (default ``block_glk``, the untied per-head
     GL(d_head)). ``tag`` overrides the internal cell route
@@ -530,8 +516,7 @@ def route_vary_block_fixed_k(
             logger.warning("  [skip] blocks_K%d: block=%d does not divide K=%d", embed_dim, b, embed_dim)
             continue
         h = embed_dim // b
-        ov: Dict[str, Any] = {"embed_dim": embed_dim, "n_heads": h, "gauge_group": gauge_group,
-                              "kl_max": 8 * embed_dim}
+        ov: Dict[str, Any] = {"embed_dim": embed_dim, "n_heads": h, "gauge_group": gauge_group}
         if extra_overrides:
             ov.update(extra_overrides)
         cells.append({"label": f"K{embed_dim}_GL{b}", "route": tag or f"blocks_K{embed_dim}",

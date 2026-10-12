@@ -5,7 +5,7 @@ comparison and content maps of every attention layer (4K^2 parameters per layer 
 readout, the count of dense W_Q, W_K, W_V, W_O; 2K^2 + H on the minimal agent), the default linear decoder (``decode_mode='linear'``), the default
 coordinate block MLP (``block_mlp_mode='coordinate'``: nn.Linear fc1/fc2 with a pointwise
 activation), the default ``pos_phi='learned'`` positional table, and the tables of opt-in toggles
-(CG coupling, T5 bias, LayerNorm affine). These are learned linear and neural maps trained by
+(CG coupling, LayerNorm affine). These are learned linear and neural maps trained by
 backpropagation. No nn.Linear module is built only with ``use_block_mlp=False`` or a
 ``prototype_agents`` / ``gaussian_template`` block MLP together with a prior-bank decoder, and the
 attention maps remain learned linear maps there. The M-step minimizes the decode cross-entropy;
@@ -57,12 +57,12 @@ from vfe3.metric_contracts import perplexity_from_ce
 from vfe3.metrics import COLLAPSE_ENTROPY_FRACTION, LINK_SPECTRUM_KEYS, routing_triangle_defect_sums
 from vfe3.model.block import _as_coeff
 from vfe3.model.block_mlp import PrototypeAgentBlockMLP
-from vfe3.model.minimal_agent import MINIMAL_AGENT_ELBO_KEYS
+from vfe3.model.minimal_agent import MINIMAL_AGENT_ELBO_KEYS, MINIMAL_AGENT_IS_SAMPLES
 from vfe3.model.model import CANONICAL_DIAGNOSTIC_KEYS, DiagnosticSnapshot, VFEModel
 from vfe3.model.prior_bank import PriorBank, get_decode_registration
 from vfe3.run_artifacts import RunArtifacts          # top-level safe: run_artifacts imports evaluate
 #                                                      lazily (function-local), so there is no cycle
-from vfe3.runtime import seed_everything
+from vfe3.runtime import disable_fill_uninitialized_memory, seed_everything
 from vfe3.timing import TrainingTimer
 from vfe3.viz.extract import e_step_belief_trace as _snapshot_trace
 from vfe3.geometry.retraction import (                          # SPD-retraction non-finite tangent guard
@@ -369,17 +369,10 @@ def build_optimizer(
             groups.append({"params": hidden_bias_parameters,
                            "lr": cfg.resolved_hyperparameter("m_per_type_hidden_bias_lr"),
                            "weight_decay": cfg.phi_weight_decay, "role": "phi"})
-    if getattr(model, "t5_bias", None) is not None:             # t5_learnable_bias=True relative-position bias
-        # weight_decay=0: the per-bucket T5 bias b_{i-j} is a relative-position PRIOR shaping the
-        # attention pi, not capacity; L2-decaying it toward zero biases the prior toward a flat/uniform
-        # relative-position distribution (the same exemption output_proj_bias / r / the gauge frame
-        # carry). role='mu' is the catch-all for learned non-variance/non-gauge tables (block_mlp,
-        # ...); the bias is not a gauge frame, so it steps under the mean LR, not m_phi_lr.
-        groups.append({"params": [model.t5_bias], "lr": cfg.m_p_mu_lr, "weight_decay": 0.0, "role": "mu"})
     # LayerNorm affine (layernorm_affine=True on a "layernorm" block norm): learned per-feature gamma/beta
     # on the belief mean, carried by the block AffineLayerNorm nn.Module. weight_decay=0 --
     # gamma/beta are normalization calibration, not capacity (decaying gamma toward 0 shrinks the
-    # normalized signal; the same exemption t5_bias / output_proj_bias carry). role='mu'
+    # normalized signal; the same exemption output_proj_bias carries). role='mu'
     # is the catch-all for learned non-variance/non-gauge tables; NO gauge flag (the affine touches
     # no gauge transport), so it rides as plain AdamW even under GaugeManifoldAdamW.
     ln_affine = []
@@ -430,7 +423,7 @@ def build_optimizer(
         # `foreach` unresolved `adam()` selects the FOREACH multi-tensor path -- 9 kernel launches
         # per parameter group per step against 1 for the fused kernel. So choosing the manifold
         # route silently deoptimized every OTHER group (mu_embed, sigma_log_embed,
-        # transport_state, t5_bias, LayerNorm affine), none of which the manifold logic
+        # transport_state, LayerNorm affine), none of which the manifold logic
         # touches. `step()` sets `p.grad = None` on every pullback_group parameter BEFORE
         # the trailing `super().step()`, so base AdamW skips exactly those and the fused kernel only
         # ever sees the standard groups.
@@ -447,7 +440,6 @@ def build_optimizer(
                 if cfg.phi_mstep_max_matrix_norm is not None
                 else 5.0
             ),
-            phi_bch_residual_max=1e-6,
             phi_group_retraction=cfg.m_phi_group_retraction,
             phi_statistics_provider=(
                 PhiFisherStatisticsProvider(model, cfg.m_phi_fisher_rotation_weight)
@@ -832,6 +824,9 @@ def train_step(
         # CE is synced to a Python float only when a metrics dict is being filled this step (it feeds
         # metrics_out['train_ce'] and nothing else); on a silent step the extra D2H copy is skipped.
         step_ce = (float(ce.detach()) if (ce is not None and metrics_out is not None) else float("nan"))
+        # decode_second_order: the second-order objective the step trained on, beside the plug-in CE.
+        step_objective = (float(decode_stats.objective)
+                          if (decode_stats.objective is not None and metrics_out is not None) else None)
     else:
         if tokens.shape[0] % grad_accum_steps != 0:            # equal-size microbatches require an even split
             raise ValueError(
@@ -846,6 +841,7 @@ def train_step(
         expected_count_tensors = []
         loss_numerator = torch.zeros((), dtype=torch.float64, device=tokens.device)
         ce_numerator = torch.zeros((), dtype=torch.float64, device=tokens.device)
+        objective_numerator: Optional[torch.Tensor] = None     # decode_second_order only
         for tok_mb, tgt_mb in zip(tok_chunks, tgt_chunks):
             _egrad_mb = {} if metrics_out is not None else None
             with deferred_host_checks():
@@ -869,6 +865,9 @@ def train_step(
                 loss_mb.detach().to(dtype=torch.float64) * count_mb)
             ce_numerator = ce_numerator + (
                 ce_mb.detach().to(dtype=torch.float64) * count_mb)
+            if decode_stats_mb.objective is not None:
+                objective_numerator = (0.0 if objective_numerator is None else objective_numerator) + (
+                    decode_stats_mb.objective.to(dtype=torch.float64) * count_mb)
         _counts = torch.stack(count_tensors)
         _scored_det = _counts.sum(dtype=torch.int64)
         _excluded_det = torch.stack(excluded_count_tensors).sum(dtype=torch.int64)
@@ -879,6 +878,8 @@ def train_step(
         _step_ce_det = _ce_det
         step_loss = None
         step_ce = float(_ce_det) if metrics_out is not None else float("nan")
+        step_objective = (float(objective_numerator / _denominator)
+                          if (objective_numerator is not None and metrics_out is not None) else None)
         _mb_tok[:] = [int(value) for value in _counts.cpu().tolist()]
         # Decoder exclusions, not merely ignore_index, define the CE denominator. Weighting the
         # non-CE regularizers by that same count remains approximate when microbatch counts differ.
@@ -886,7 +887,7 @@ def train_step(
             import warnings
             warnings.warn(
                 "grad_accum_steps>1 with uneven counted-token microbatches: non-CE regularizers "
-                "(mass_phi, mstep_self_coupling) are token-weighted by n_mb/n_tot "
+                "(mstep_self_coupling) are token-weighted by n_mb/n_tot "
                 "rather than by their own reduction, so their accumulated gradient is an "
                 "approximation. Use an unpadded/equal-token loader or grad_accum_steps=1 for the "
                 "exact objective.",
@@ -1090,6 +1091,10 @@ def train_step(
                 _total / _egrad_counts[_name])
         metrics_out["loss_finite"] = float(loss_finite)
         metrics_out["train_ce"] = step_ce            # pre-step CE (matches step_loss; not a post-update re-forward)
+        if step_objective is not None:
+            # decode_second_order: train_ce stays the plug-in CE validation scores; the second-order
+            # objective the step trained on is logged under its own name (audit 2026-10-12 round 2, item 12).
+            metrics_out["train_second_order_ce"] = step_objective
         if _target_partition is None:
             raise RuntimeError("target accounting metrics were not materialized")
         metrics_out.update(_target_partition)
@@ -1212,10 +1217,12 @@ def train_step(
                 **projection_count,
             )
     # Opt-in frame condition bound (audit 2026-10-12 T4); validation admits it only under adamw and
-    # per_token, and the orthogonal/conformal groups have cond_2 = 1, so nothing runs for them.
+    # per_token, and the orthogonal/conformal groups have cond_2 = 1, so nothing runs for them. Its changed
+    # and checked rows join the S1 panel D frame-projection counter on the device (round 2, item 14).
     if (did_step and getattr(_cfg, "phi_frame_condition_max", None) is not None
             and model.group.name in FRAME_CONDITION_GROUPS):
-        bound_phi_frame_condition_(model, _cfg.phi_frame_condition_max)
+        bound_phi_frame_condition_(model, _cfg.phi_frame_condition_max,
+                                   **({} if frame_projection_out is None else {"count_out": frame_projection_out}))
     if did_step:
         successful_updates += 1
         scheduler.step()                   # accepted optimizer updates are the scheduler's clock
@@ -1483,7 +1490,20 @@ def _eval_protocol_train_ce(
 # failed log-step diagnostic falls back to these as NaN, widened to the first metrics row's key set.
 _TRAIN_DIAGNOSTIC_FALLBACK_KEYS: Tuple[str, ...] = (
     "attn_entropy", "self_coupling", "self_divergence", "belief_coupling", "attention_entropy",
-    "total", "effective_rank", "holonomy_deviation", "gauge_trace_spread",
+    "total", "effective_rank",
+)
+
+
+# Held-out geometry columns copied, under a "val_" prefix, from the relational diagnostics of the validation
+# capture (audit 2026-10-12 round 2, item 13).
+_VAL_GEOMETRY_KEYS: Tuple[str, ...] = (
+    "fisher_trace_mean", "belief_cond_p95", "belief_lam_min", "belief_lam_max", "belief_cond_valid_frac",
+    "phi_norm_mean", "phi_norm_std",
+    "phi_matrix_norm_p95", "phi_matrix_norm_p99", "phi_matrix_norm_max",
+    "vertex_cond_p99",
+    "pos_phi_matrix_norm_p95", "pos_phi_matrix_norm_p99", "pos_phi_matrix_norm_max",
+    "guard_sigma_floor_frac", "guard_sigma_ceil_frac",
+    "nonfinite_frac",
 )
 
 
@@ -1505,16 +1525,8 @@ _VAL_DIAG_KEYS = (
     "estep_fp_phi_rms", "estep_beta_js", "estep_alpha_rms_delta",
     "pos_loss_first_q", "pos_loss_last_q", "pos_loss_ratio",
     # held-out gauge / SPD / Fisher geometry (surfaced from the already-computed val diagnostics dict)
-    "val_holonomy_wilson", "val_cocycle_residual", "val_gauge_invariant_spread",
-    "val_fisher_trace_mean", "val_belief_cond_p95", "val_belief_lam_min", "val_belief_lam_max",
-    "val_belief_cond_valid_frac",
-    "val_phi_norm_mean", "val_phi_norm_std",
-    "val_phi_matrix_norm_p95", "val_phi_matrix_norm_p99", "val_phi_matrix_norm_max",
-    "val_vertex_cond_p99",
-    "val_pos_phi_matrix_norm_p95", "val_pos_phi_matrix_norm_p99", "val_pos_phi_matrix_norm_max",
-    "val_guard_sigma_floor_frac", "val_guard_sigma_ceil_frac", "val_guard_energy_klmax_frac",
-    "val_guard_energy_klmax_frac_live", "val_live_pair_frac",
-    "val_nonfinite_frac",
+    "val_gauge_invariant_spread",
+    *(f"val_{key}" for key in _VAL_GEOMETRY_KEYS),
 )
 
 
@@ -1537,6 +1549,8 @@ _VAL_RELATIONAL_DIAG_KEYS = (
     "val_relational_receiver_cost_delta", "val_relational_receiver_noise",
     "val_relational_receiver_mean_cost_delta", "val_relational_receiver_covariance_cost_delta",
     "val_relational_receiver_target_distance_ratio",
+    # closed_form_profiled: the root solve's largest residual and floored-slope count (audit 2026-10-12 round 2, M6)
+    "val_relational_receiver_profiled_residual", "val_relational_receiver_profiled_floored_slopes",
 ) + tuple("val_relational_" + key for key in (
     "score_raw_min_singular_value", "score_q_raw_min_singular_value",
     "score_k_raw_min_singular_value", "score_rank_per_head", "content_rank_per_head",
@@ -1574,13 +1588,15 @@ _VAL_LATENT_DIAG_KEYS = tuple("val_relational_latent_" + key for key in (
 # head-max coupling ||S_h C S_g^T||_F / (||S_h C S_h^T||_F ||S_g C S_g^T||_F)^{1/2} at the input moments (0: ADF is
 # exact), the head-mean mean-field label staleness (TV of one relabeling at the posterior; NaN under 'exact') and the
 # covariance contraction tr C^+ / tr C and the head-mean exact spread share tr(A R) / tr(A Lambda_bar) (NaN under
-# 'mean_field'), and the head-mean mean-field M-step optimum n_h^* (minimal_agent.channel_noise_mstep; NaN under
-# 'exact').
+# 'mean_field'), the head-mean mean-field M-step optimum n_h^* over the heads with an interior optimum
+# (minimal_agent.channel_noise_mstep; NaN under 'exact') and the fraction of heads at its n -> 0 bracket.
 _VAL_MINIMAL_AGENT_DIAG_KEYS = tuple("val_relational_minimal_agent_" + key for key in (
     "gain_fraction", "channel_noise", "head_coupling", "label_staleness", "covariance_contraction",
-    "spread_share", "channel_noise_mstep"))
-# Under diagnose_agent_elbo (minimal agent only; audit 2026-10-12 T1): the last layer's receiver-mean evidence lower
-# bound of the readout's posterior, the ADF evidence of the record model and their gap, in nats.
+    "spread_share", "channel_noise_mstep", "channel_noise_mstep_boundary"))
+# Under diagnose_agent_elbo (minimal agent only; audit 2026-10-12 T1 and round 2, item 12 and M1): the last layer's
+# receiver-mean evidence lower bound of the posterior the readout returns, the ADF evidence of the record model
+# (assumed density; exact only for uncoupled heads), the exact evidence (NaN unless every receiver's heads are
+# uncoupled), the importance-sampled evidence under q, and the gaps to the bound, in nats.
 _VAL_MINIMAL_AGENT_ELBO_KEYS = tuple("val_" + key for key in MINIMAL_AGENT_ELBO_KEYS)
 
 
@@ -1658,10 +1674,11 @@ ROUTING_HOLONOMY_FIELDS: Tuple[str, ...] = (
 # the fixed validation windows: gain fraction, channel noise n_h, head coupling, mean-field label staleness (TV of one
 # relabeling at the posterior; NaN under 'exact'), the layer's covariance contraction tr C^+ / tr C and the exact
 # spread share tr(A R) / tr(A Lambda_bar) (the part of the removed variance the mean field drops; NaN under the mean field)
-# and the mean-field M-step optimum n_h^* of the channel noise beside the learned channel_noise (NaN under 'exact').
+# and the mean-field M-step optimum n_h^* of the channel noise beside the learned channel_noise (NaN under 'exact'
+# and at the n -> 0 bracket) with its bracket flag (1 at the bracket; audit 2026-10-12 round 2, M2).
 MINIMAL_AGENT_HEAD_FIELDS: Tuple[str, ...] = (
     "step", "layer", "head", "gain_fraction", "channel_noise", "head_coupling", "label_staleness",
-    "covariance_contraction", "spread_share", "channel_noise_mstep")
+    "covariance_contraction", "spread_share", "channel_noise_mstep", "channel_noise_mstep_boundary")
 _MINIMAL_AGENT_HEAD_CAPTURE = tuple("relational_minimal_agent_" + key for key in MINIMAL_AGENT_HEAD_FIELDS[3:])
 # Prototype-agent block MLP per layer (block_mlp_mode='prototype_agents'), over the tokens of the fixed validation
 # windows: effective templates in use exp(H(mean_t w_t)), the token-mean weight entropy, the fraction of templates
@@ -1673,9 +1690,12 @@ PROTOTYPE_TEMPLATE_FIELDS: Tuple[str, ...] = (
     "log_lambda_median", "log_lambda_max", "prior_entropy", "gain_fraction", "label_staleness", "n_tokens")
 # Per-layer evidence diagnostics (diagnose_agent_elbo; audit 2026-10-12 T1), means over the receivers (tokens) of the
 # fixed validation windows, in nats: the evidence lower bound of the posterior the layer forms, the evidence of its
-# declared record model (minimal agent: ADF over the heads, exact for one head; prototypes: exact) and their gap.
+# declared record model and their gap. Minimal agent (round 2, item 12 and M1): the ADF evidence over the heads
+# (assumed density, exact for uncoupled heads) and its gap, the exact evidence (NaN unless every receiver's heads are
+# uncoupled), and the importance-sampled evidence under q with its gap and sample count. Prototypes: exact.
 # Written to diagnostics/minimal_agent_elbo.csv and diagnostics/prototype_elbo.csv only when the toggle is on.
-MINIMAL_AGENT_ELBO_FIELDS: Tuple[str, ...] = ("step", "layer", "elbo", "evidence", "elbo_gap")
+MINIMAL_AGENT_ELBO_FIELDS: Tuple[str, ...] = (
+    "step", "layer", *(key[len("relational_minimal_agent_"):] for key in MINIMAL_AGENT_ELBO_KEYS), "is_samples")
 PROTOTYPE_ELBO_FIELDS: Tuple[str, ...] = ("step", "layer", "elbo", "evidence", "elbo_gap", "n_tokens")
 
 # S1 panel D numerical-event counters (GL(K)_attention_v2 fig:placeholder_numerics, 2026-09-28).
@@ -1685,9 +1705,9 @@ PROTOTYPE_ELBO_FIELDS: Tuple[str, ...] = ("step", "layer", "elbo", "evidence", "
 # (layer, head); they are NaN on rows without an evaluation, when the run
 # has no diagnostic windows, and when their capture pass fails. NUMERICS_CUMULATIVE_COLUMNS are on
 # every metrics row and cover every attempted optimizer step since step 0 (frame_projection_* NaN
-# without a post-update frame projection). The exact definitions and skip rules are in
-# _capture_numerics_counts, _numerics_counter_skip_reasons and _cumulative_counter_columns; the
-# final values go to summary.json "numerics_counters" (_numerics_counters_summary).
+# without a post-update frame projection, the chart-norm ball or the condition bound). The exact
+# definitions and skip rules are in _capture_numerics_counts, _numerics_counter_skip_reasons and
+# _cumulative_counter_columns; the final values go to summary.json "numerics_counters" (_numerics_counters_summary).
 NUMERICS_EVAL_COLUMNS: Tuple[str, ...] = (
     "cap_active_count", "cap_entry_count", "factorization_fallback_count", "factorization_count")
 NUMERICS_CUMULATIVE_COLUMNS: Tuple[str, ...] = (
@@ -1840,9 +1860,9 @@ def _numerics_counter_skip_reasons(
     covariances in the diagnostic capture. The full-link gradient episode keeps that router fixed
     across its receiver iterations.
     ``frame_projection`` (``frame_projection_count``, ``frame_projection_total``) is measured when
-    :func:`train_step` runs the post-update frame projection, i.e. ``m_phi_update_mode='adamw'`` with
-    ``phi_mstep_max_matrix_norm`` set; otherwise both stay NaN. ``skipped_updates`` and
-    ``attempted_updates`` are defined on every route.
+    :func:`train_step` runs a post-update frame projection, i.e. ``m_phi_update_mode='adamw'`` with
+    ``phi_mstep_max_matrix_norm`` set, or ``phi_frame_condition_max`` set on a group the condition bound acts
+    on; otherwise both stay NaN. ``skipped_updates`` and ``attempted_updates`` are defined on every route.
     """
     cfg = model.cfg
     if not is_vfe_model(model):
@@ -1859,9 +1879,11 @@ def _numerics_counter_skip_reasons(
         reasons["frame_projection"] = (
             f"m_phi_update_mode={mode!r}: no post-update frame projection (the pullback-group step "
             "rejects rows outside the chart bound instead of projecting them)")
-    elif cfg.phi_mstep_max_matrix_norm is None:
+    elif cfg.phi_mstep_max_matrix_norm is None and not (
+            cfg.phi_frame_condition_max is not None and model.group.name in FRAME_CONDITION_GROUPS):
         reasons["frame_projection"] = (
-            "phi_mstep_max_matrix_norm is None: the run has no post-update frame projection")
+            "phi_mstep_max_matrix_norm and phi_frame_condition_max are None (or the condition bound is inert "
+            "for this gauge group): the run has no post-update frame projection")
     return reasons
 
 
@@ -2154,11 +2176,14 @@ def _cumulative_counter_columns(
     Both are host integers already, so they cost nothing.
 
     ``frame_projection_count`` / ``frame_projection_total``: frame-generator rows (rows of
-    ``prior_bank.phi_embed`` and of the learned positional table ``pos_phi_free``) that the
-    post-update projection onto the embedded Frobenius ball of radius ``phi_mstep_max_matrix_norm``
-    rescaled (scale :math:`< 1`), and the rows it checked, summed over every projection call, i.e.
-    over the accepted updates. They accumulate on the device inside
-    :func:`vfe3.gauge_optim.project_phi_parameter_rows_` and are read here, on a metrics row only.
+    ``prior_bank.phi_embed`` and of the learned positional table ``pos_phi_free``) that a post-update
+    projection changed, and the rows it checked, summed over every projection call, i.e. over the accepted
+    updates. The projections are the one onto the embedded Frobenius ball of radius
+    ``phi_mstep_max_matrix_norm`` (a row rescaled with scale :math:`< 1`) and the condition bound
+    ``phi_frame_condition_max`` (a row whose traceless symmetric spread was clamped); when both run, each
+    counts its own rows. They accumulate on the device inside
+    :func:`vfe3.gauge_optim.project_phi_parameter_rows_` and
+    :func:`vfe3.gauge_optim.bound_phi_frame_condition_` and are read here, on a metrics row only.
     ``frame_base`` carries the counts restored from a checkpoint on resume. NaN when the run has
     no post-update projection (see :func:`_numerics_counter_skip_reasons`) or no counter.
     """
@@ -2815,7 +2840,7 @@ def _accumulate_minimal_agent(
         if MINIMAL_AGENT_ELBO_KEYS[0] in capture:                                # diagnose_agent_elbo
             bound = torch.stack([capture[key].detach().double().cpu().reshape(()) for key in MINIMAL_AGENT_ELBO_KEYS])
             total = features_out.setdefault("minimal_agent_elbo", {}).setdefault(layer, [torch.zeros_like(bound), 0])
-            total[0] += bound                                                    # (3,) elbo, evidence, gap
+            total[0] += bound                                                    # (F,) MINIMAL_AGENT_ELBO_KEYS
             total[1] += 1
 
 
@@ -2829,9 +2854,9 @@ def _elbo_rows(
     token means."""
     minimal_rows: List[Dict[str, float]] = []
     for layer, (total, count) in sorted(features.get("minimal_agent_elbo", {}).items()):
-        elbo, evidence, gap = (total / count).tolist()
-        minimal_rows.append({"step": int(step), "layer": int(layer), "elbo": elbo, "evidence": evidence,
-                             "elbo_gap": gap})
+        minimal_rows.append({"step": int(step), "layer": int(layer),
+                             **dict(zip(MINIMAL_AGENT_ELBO_FIELDS[2:-1], (total / count).tolist())),
+                             "is_samples": MINIMAL_AGENT_IS_SAMPLES})
     prototype_rows: List[Dict[str, float]] = []
     for layer, (elbo, evidence, gap, tokens) in sorted(features.get("prototype_elbo", {}).items()):
         n = max(1, tokens)
@@ -3097,6 +3122,11 @@ def _val_diagnostics(
         key: (sums[key] / counts[key]) if counts.get(key) else float("nan")
         for key in first.metrics
     }
+    if "pos_loss_ratio" in averaged:
+        # The ratio of the averaged quarters, not the average of per-batch ratios, so the three columns agree
+        # (a sliding-window batch whose first quarter is masked contributes to last_q alone; audit 2026-10-12
+        # round 2, item 16).
+        averaged["pos_loss_ratio"] = averaged["pos_loss_last_q"] / max(averaged["pos_loss_first_q"], 1e-9)
     return ValidationDiagnostics(averaged, first.token_ids, first.snapshot)
 
 
@@ -3312,20 +3342,18 @@ def _val_diagnostics_one(
     eval-cadence pass scores it on the diagnostic windows, :func:`_collapsed_head_count`), the
     ``pos_loss_*`` columns on its logits, and
     ``val_effective_rank`` / ``val_belief_cond_median`` from the last layer's converged covariance
-    (as the relational diagnostics report them). The following stay NaN on this route, by definition
-    rather than by omission: the legacy free-energy decomposition (``val_self_coupling``,
+    (as the relational diagnostics report them), and the held-out geometry and guard columns
+    (``val_fisher_trace_mean``, ``val_belief_cond_p95``, ``val_belief_lam_*``, ``val_belief_cond_valid_frac``,
+    ``val_phi_*``, ``val_vertex_cond_p99``, ``val_pos_phi_*`` when a positional factor exists,
+    ``val_guard_sigma_*``, ``val_nonfinite_frac``) from the same diagnostics. The following stay NaN on this
+    route, by definition rather than by omission: the legacy free-energy decomposition (``val_self_coupling``,
     ``val_self_divergence``, ``val_belief_coupling``, ``val_attention_entropy``,
     ``val_inner_alignment_energy_total``), because routing plus readout does not define the shared
     stationary objective (``diagnose_canonical_free_energy`` fills them, per token, with the canonical
     free energy at the beliefs the last router read, and adds ``val_canonical_beta_tv``,
     ``val_canonical_self_weight``, ``val_canonical_total_output`` and ``val_canonical_total_delta``); the E-step
     certificate (``estep_*`` except ``estep_f_comparisons = 0``),
-    because the route performs one pre-update readout with no iterate sequence; and the held-out
-    geometry/guard columns (``val_holonomy_wilson``, ``val_cocycle_residual``,
-    ``val_gauge_invariant_spread``, ``val_fisher_trace_mean``, ``val_belief_cond_p95``,
-    ``val_belief_lam_*``, ``val_belief_cond_valid_frac``, ``val_phi_*``, ``val_vertex_cond_p99``,
-    ``val_pos_phi_*``, ``val_guard_*``, ``val_live_pair_frac``, ``val_nonfinite_frac``), which come from
-    the legacy ``diagnostics`` geometry pass that the relational diagnostics do not run.
+    because the route performs one pre-update readout with no iterate sequence.
     """
     import torch.nn.functional as F
 
@@ -3347,6 +3375,7 @@ def _val_diagnostics_one(
     out["val_attn_entropy"] = vd["attn_entropy"]
     out["val_attn_entropy_min"] = vd["attn_entropy_min"]
     out["val_belief_cond_median_layer_max"] = float(vd.get("belief_cond_median_layer_max", float("nan")))
+    out.update({f"val_{key}": float(vd[key]) for key in _VAL_GEOMETRY_KEYS if key in vd})
     if "canonical_beta_tv" in vd:                               # diagnose_canonical_free_energy
         out.update(val_self_coupling=vd["self_coupling"], val_self_divergence=vd["self_divergence"],
                    val_belief_coupling=vd["belief_coupling"], val_attention_entropy=vd["attention_entropy"],
@@ -4019,6 +4048,9 @@ def train(
     if _final_validation_out is not None:
         _final_validation_out.clear()
     _require_causal_next_token_prior(model)
+    # Process-global; torch reads it only under deterministic algorithms. Set by the training run, not
+    # by model construction, so code that only builds models keeps torch's NaN fill of uninitialized reads.
+    disable_fill_uninitialized_memory()
     terminal_validation_signature = None
     terminal_validation_metrics = None
     # (step, metrics, parameter/buffer versions) of the latest eval, handed to terminal_callback (audit 2026-10-12 #12).
@@ -4596,6 +4628,9 @@ def train(
             # post-step re-forward made train_ce one optimizer step ahead of train_loss (audit r2 id5).
             ce = (step_metrics.get("train_ce", float("nan")) if step_metrics is not None
                   else float(step_status.get("ce", float("nan"))))
+            # decode_second_order: the second-order objective the step trained on (train_ce stays plug-in).
+            second_order_ce = (step_metrics.get("train_second_order_ce", float("nan"))
+                               if step_metrics is not None else float("nan"))
             # d (the F-decomposition) is computed PRE-step above so it shares train_ce's provenance (m7).
             assert timer is not None
             train_timing = timer.sample_train_window()
@@ -4611,6 +4646,9 @@ def train(
                 step + 1, n_steps, losses[-1], ce, d["attn_entropy"],
                 train_timing.train_steps_per_s, _perplexity_from_ce(ce),
             )
+            if getattr(cfg, "decode_second_order", False):
+                logger.info("    Second-order CE (trained on): %.4f | plug-in CE (as validation): %.4f",
+                            second_order_ce, ce)
             bits_per_token = ce / math.log(2.0)
             bpc_text = (
                 f" | BPC {bits_per_token * tokens_per_char:.4f}"
@@ -4820,6 +4858,9 @@ def train(
                 "train_loss":        losses[-1],
                 "train_ce":          ce,                      # true CE (nats), off the graph
                 "train_ppl":         _perplexity_from_ce(ce),  # exact exp(CE), infinity on overflow
+                # decode_second_order: the delta-method objective trained on; train_ce/train_ppl stay the
+                # plug-in CE that validation scores (audit 2026-10-12 round 2, item 12).
+                **({"train_second_order_ce": second_order_ce} if getattr(cfg, "decode_second_order", False) else {}),
                 "lr_block_mlp":       aux_lrs["block_mlp"],
                 "lr_layernorm":      aux_lrs["layernorm"],
                 "lr_mu":             lrs["mu"],
@@ -4848,8 +4889,6 @@ def train(
                 # lambda_beta=0.5 with no column to reconcile it. Now each row is self-describing.
                 "lambda_beta":        float(getattr(cfg, "lambda_beta", float("nan"))),
                 "effective_rank":     d["effective_rank"],
-                "holonomy_deviation": d["holonomy_deviation"],
-                "gauge_trace_spread": d["gauge_trace_spread"],
             }
             row.update({key: value for key, value in d.items() if key.startswith(("qkv_", "relational_"))})
             _warn_dead_router(d, dead_router_warned, logger,
@@ -4892,19 +4931,20 @@ def train(
             # health scalars from diagnostics() -- NOT per-token sums, so logged RAW (no /n_tok).
             # Conditional mixer/connection keys appear only with their toggle; the
             # config is fixed per run so the CSV stays rectangular.
-            for _dk in ("holonomy_ci_lo", "holonomy_ci_hi", "holonomy_wilson",
-                        "gauge_invariant_mean", "gauge_invariant_spread",
+            # Every key is produced by the relational diagnostics (VFEModel._relational_diagnostics); the
+            # legacy closure, pair-energy and transport-asymmetry keys that no route produces were removed
+            # (audit 2026-10-12 round 2, item 13).
+            for _dk in ("gauge_invariant_mean", "gauge_invariant_spread",
                         "phi_norm_mean", "phi_norm_std",
-                        "belief_cond_median", "belief_cond_p95", "belief_cond_max", "belief_pd_margin",
+                        "belief_cond_median", "belief_cond_p95", "belief_cond_max",
+                        "belief_lam_min", "belief_lam_max", "belief_cond_valid_frac",
                         "belief_cond_median_layer_max",
                         "eff_rank_p5", "eff_rank_median", "eff_rank_p95",
                         "fisher_trace_mean", "fisher_trace_median",
                         "guard_sigma_floor_frac", "guard_sigma_ceil_frac",
-                        "guard_energy_klmax_frac", "guard_selfdiv_klmax_frac",
-                        "nonfinite_frac", "renyi_band_frac",
+                        "nonfinite_frac",
                         "attn_entropy_min", "attn_entropy_collapsed_heads",
-                        "cocycle_residual", "vertex_cond_max", "sandwich_absmax", "transport_asymmetry",
-                        "energy_abs_asymmetry", "energy_rel_asymmetry",
+                        "vertex_cond_max",
                         "gauge_head_aniso_mean", "gauge_head_logdet_spread",
                         "gauge_head_phase_abs_mean", "belief_circularity_mean",
                         "phi_matrix_norm_median", "phi_matrix_norm_p95", "phi_matrix_norm_p99",
@@ -5078,6 +5118,52 @@ def train(
                 numerics_reasons, diagnostic_windows)
         except Exception as exc:
             _record_diagnostic_failure(diagnostics_failures, "numerics_summary", exc, logger)
+    # Realized-vs-configured update accounting (audit 2026-08-06 F5), handed to finalize_run through
+    # the artifacts object because train() returns only `losses`. Built before the terminal callback,
+    # so the ablation finalizer (finalize_validation_run) publishes it too (audit 2026-10-12 round 2,
+    # item 7). The launcher summary.json's "n_steps" is
+    # cfg.max_steps -- what was ASKED for. These say what actually happened, so an arm that quietly
+    # trained on 95% of its budget is visible instead of being compared as if it had the full one.
+    # CUMULATIVE over a resume: attempted counts every outer step from 0, and accepted_updates is the
+    # optimizer's persisted accepted-update clock (restored by load_checkpoint and advanced by
+    # train_step), so a continuation reports the whole run's budget, not only its own segment.
+    # The fallback-element counters below are per-process and still cover this call only.
+    attempted = int(completed_steps)
+    accepted = _successful_update_count(optimizer)
+    skipped_total = attempted - accepted
+    if artifacts is not None:
+        # Training-time diagnostic handoff to finalize_run (audit 2026-09-28): the optimizer-state
+        # footprint for resources.json and the per-name diagnostic failure counts for summary.json.
+        try:
+            artifacts.optimizer_state_bytes = _optimizer_state_bytes(optimizer)
+        except Exception as exc:
+            _record_diagnostic_failure(diagnostics_failures, "optimizer_state_bytes", exc, logger)
+        artifacts.diagnostics_failures = diagnostics_failures
+        if diagnostics_failures:
+            logger.warning(" diagnostic failures during training (counted, training unaffected): %s",
+                           dict(sorted(diagnostics_failures.items())))
+        run_totals = _run_total_counters(run_total_base, precision_replays)   # whole run across resumes
+        neutralized = run_totals["nonfinite_tangent_elements"]
+        mu_fallbacks = run_totals["mu_trust_fallback_elements"]
+        artifacts.final_step = int(completed_steps)
+        artifacts.realized_updates = {
+            "attempted_steps":      attempted,
+            "accepted_updates":     int(accepted),
+            "skipped_steps":        int(skipped_total),
+            "accepted_update_frac": (float(accepted) / attempted
+                                     if attempted else float("nan")),
+            **{key: run_totals[key] for key in RUN_TOTAL_COUNTER_KEYS if key != "matmul_precision_replays"},
+            **({"matmul_precision_replays": run_totals["matmul_precision_replays"]}
+               if precision_ladder else {}),
+        }
+        if skipped_total or neutralized or mu_fallbacks:
+            logger.warning(
+                " realized budget: %d/%d optimizer updates accepted (%.3f%%); "
+                "%d SPD tangent element(s) neutralized as non-finite; "
+                "%d belief(s) whitened by the non-equivariant mu-trust fallback",
+                accepted, attempted,
+                100.0 * accepted / max(attempted, 1),
+                neutralized, mu_fallbacks)
     # Terminal callback seam (PB-02): immediately after the final optimizer step, hand the resumable
     # training state to an optional callback so a
     # default cell (log/eval interval above max_steps, checkpoint_interval=0) can finalize a complete
@@ -5144,50 +5230,6 @@ def train(
         elif logger is not None:
             logger.info(" parameter motion: all %d trainable parameters moved",
                         sum(1 for m in motion["motion"].values() if m["requires_grad"]))
-    # Realized-vs-configured update accounting (audit 2026-08-06 F5), handed to finalize_run through
-    # the artifacts object because train() returns only `losses`. summary.json's "n_steps" is
-    # cfg.max_steps -- what was ASKED for. These say what actually happened, so an arm that quietly
-    # trained on 95% of its budget is visible instead of being compared as if it had the full one.
-    # CUMULATIVE over a resume: attempted counts every outer step from 0, and accepted_updates is the
-    # optimizer's persisted accepted-update clock (restored by load_checkpoint and advanced by
-    # train_step), so a continuation reports the whole run's budget, not only its own segment.
-    # The fallback-element counters below are per-process and still cover this call only.
-    attempted = int(completed_steps)
-    accepted = _successful_update_count(optimizer)
-    skipped_total = attempted - accepted
-    if artifacts is not None:
-        # Training-time diagnostic handoff to finalize_run (audit 2026-09-28): the optimizer-state
-        # footprint for resources.json and the per-name diagnostic failure counts for summary.json.
-        try:
-            artifacts.optimizer_state_bytes = _optimizer_state_bytes(optimizer)
-        except Exception as exc:
-            _record_diagnostic_failure(diagnostics_failures, "optimizer_state_bytes", exc, logger)
-        artifacts.diagnostics_failures = diagnostics_failures
-        if diagnostics_failures:
-            logger.warning(" diagnostic failures during training (counted, training unaffected): %s",
-                           dict(sorted(diagnostics_failures.items())))
-        run_totals = _run_total_counters(run_total_base, precision_replays)   # whole run across resumes
-        neutralized = run_totals["nonfinite_tangent_elements"]
-        mu_fallbacks = run_totals["mu_trust_fallback_elements"]
-        artifacts.final_step = int(completed_steps)
-        artifacts.realized_updates = {
-            "attempted_steps":      attempted,
-            "accepted_updates":     int(accepted),
-            "skipped_steps":        int(skipped_total),
-            "accepted_update_frac": (float(accepted) / attempted
-                                     if attempted else float("nan")),
-            **{key: run_totals[key] for key in RUN_TOTAL_COUNTER_KEYS if key != "matmul_precision_replays"},
-            **({"matmul_precision_replays": run_totals["matmul_precision_replays"]}
-               if precision_ladder else {}),
-        }
-        if skipped_total or neutralized or mu_fallbacks:
-            logger.warning(
-                " realized budget: %d/%d optimizer updates accepted (%.3f%%); "
-                "%d SPD tangent element(s) neutralized as non-finite; "
-                "%d belief(s) whitened by the non-equivariant mu-trust fallback",
-                accepted, attempted,
-                100.0 * accepted / max(attempted, 1),
-                neutralized, mu_fallbacks)
     if (terminal_validation_signature is not None
             and terminal_validation_metrics is not None
             and all(value is None or math.isfinite(value)
@@ -5444,7 +5486,7 @@ def _banner(
         f" M-LRs: {_fmt_table_lrs(cfg)}  phi={cfg.m_phi_lr}",
         f" decoder M-LRs: {_fmt_decode_lrs(cfg)}",
         f" VFE: lambda_alpha_mode={cfg.lambda_alpha_mode}  kappa_beta={cfg.kappa_beta}  "
-        f"tau={_fmt_tau(cfg, model)}  mass_phi={cfg.mass_phi}",
+        f"tau={_fmt_tau(cfg, model)}",
         f" seed={cfg.seed}",
         bar,
     ])

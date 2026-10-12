@@ -506,12 +506,6 @@ def ce_by_context(context: np.ndarray, nll: np.ndarray) -> List[Dict[str, float]
     return rows
 
 
-def ce_by_context_from_dump(path: "str | Path") -> List[Dict[str, float]]:
-    r""":func:`ce_by_context` of a per-target dump ``nll/<weights>_<split>.npz`` (its ``context`` and ``nll``)."""
-    with np.load(Path(path)) as dump:
-        return ce_by_context(dump["context"], dump["nll"])
-
-
 def plot_ce_by_context(
     series:  Mapping[str, Sequence[Mapping[str, float]]],
     out_dir: Path,

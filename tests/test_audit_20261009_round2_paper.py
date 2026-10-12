@@ -75,7 +75,7 @@ def test_post_norm_arm_keeps_the_residual_and_is_not_rank_collapsed_at_init(tmp_
 
     from vfe3.baseline import BaselineConfig
 
-    pytest.importorskip("train_baseline")
+    import train_baseline  # noqa: F401
     base = _base(tmp_path, n_layers=6)
     plan = _plan(base, POST_NORM, counts=False)
     assert plan.status == "ready" and plan.cfg.norm_placement == "post_shared" and plan.cfg.n_layers == 6
@@ -99,7 +99,7 @@ def test_post_norm_arm_keeps_the_residual_and_is_not_rank_collapsed_at_init(tmp_
 def test_matched_to_refuses_tied_and_block_cholesky_bases_and_notes_learned_temperature(tmp_path: Path) -> None:
     from vfe3.baseline import BaselineConfig
 
-    pytest.importorskip("train_baseline")
+    import train_baseline  # noqa: F401
     tied = _planned(tie_comparison_maps=True)
     with pytest.raises(ValueError, match="tie_comparison_maps"):
         BaselineConfig.matched_to(tied)
@@ -125,7 +125,7 @@ def test_matched_to_refuses_tied_and_block_cholesky_bases_and_notes_learned_temp
 def test_total_matched_arm_scales_the_hidden_lr_and_records_it_untuned(tmp_path: Path) -> None:
     from vfe3.baseline import BaselineTransformer, build_optimizer
 
-    pytest.importorskip("train_baseline")
+    import train_baseline  # noqa: F401
     base = _base(tmp_path, vocab_size=200)
     plan = _plan(base, TOTAL_MATCHED)
     K0, K = base.cfg.embed_dim, plan.cfg.embed_dim

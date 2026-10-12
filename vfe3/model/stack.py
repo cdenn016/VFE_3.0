@@ -29,6 +29,7 @@ from vfe3.contracts import CanonicalFrameContext, EStepGradientRecord, MStepCapt
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.free_energy import attention_tau
 from vfe3.model.block import _as_coeff, vfe_block
+from vfe3.model.minimal_agent import READOUT_COVARIANCES
 
 
 def _can_omit_prior_handoff(
@@ -39,7 +40,12 @@ def _can_omit_prior_handoff(
     relational_operators:          Optional["RelationalOperators"],
     relational_operators_by_layer: Optional[Sequence["RelationalOperators"]],
 ) -> bool:
-    """Admit only unobserved predictive stacks with no prior-dependent consumer."""
+    r"""Admit only unobserved predictive stacks with no prior-dependent consumer.
+
+    Predictive content never reads the prior mean. A moment-matched or spread-corrected readout reads the layer's
+    prior covariance through its floor :math:`f\Sigma_p`, so a stack with ``prior_handoff_sigma > 0`` and such a
+    readout keeps the handoff (audit 2026-10-12 round 2, item 8); at ``prior_handoff_sigma = 0`` every layer's
+    :math:`\Sigma_p` is the embedding prior and omitting the handoff is exact."""
     from vfe3.model.relational_operators import RelationalOperators
 
     if (capture is not None or grad_record is not None or relational_capture is not None
@@ -49,6 +55,7 @@ def _can_omit_prior_handoff(
               else (relational_operators,) * cfg.n_layers)
     return len(layers) == cfg.n_layers and all(
         type(operator) is RelationalOperators and operator.readout_mode == "predictive_content"
+        and (cfg.prior_handoff_sigma == 0.0 or operator.predictive_covariance not in READOUT_COVARIANCES)
         for operator in layers)
 
 

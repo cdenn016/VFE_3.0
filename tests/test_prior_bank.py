@@ -144,7 +144,7 @@ def test_decode_exact_at_large_mean_offset():
 # through the CONFIGURED belief family and divergence functional, with NO kl_max ranking clamp
 # (the registered generic family decode modes were retired 2026-10-12).
 # The DecodeRegistration carries a resolved covariance_kinds set (backward-compatible with the
-# legacy supports_full bit) and a family_consistent flag the config validates against.
+# legacy supports_full bit).
 # ===========================================================================
 
 
@@ -257,7 +257,6 @@ def test_register_decode_resolves_covariance_kinds_from_supports_full():
         r = get_decode_registration("_pb14_omitted")
         assert r.supports_full is False
         assert r.covariance_kinds == frozenset({"diagonal"})
-        assert r.family_consistent is False
 
         register_decode("_pb14_false", supports_full=False)(_fn); names.append("_pb14_false")
         r = get_decode_registration("_pb14_false")
@@ -267,12 +266,11 @@ def test_register_decode_resolves_covariance_kinds_from_supports_full():
         r = get_decode_registration("_pb14_true")
         assert r.supports_full is True and r.covariance_kinds == frozenset({"full"})
 
-        register_decode("_pb14_dual", covariance_kinds=frozenset({"diagonal", "full"}),
-                        family_consistent=True)(_fn); names.append("_pb14_dual")
+        register_decode("_pb14_dual", covariance_kinds=frozenset({"diagonal", "full"}))(_fn)
+        names.append("_pb14_dual")
         r = get_decode_registration("_pb14_dual")
         assert r.covariance_kinds == frozenset({"diagonal", "full"})
         assert r.supports_full is True                          # derived from membership
-        assert r.family_consistent is True
 
         with pytest.raises(ValueError):                         # contradictory dual metadata
             register_decode("_pb14_bad", supports_full=False,
@@ -289,7 +287,6 @@ def test_direct_decode_registration_is_backward_compatible():
     reg_full = DecodeRegistration(_fn, True, False, None)        # legacy positional construction
     assert reg_full.supports_full is True
     assert reg_full.covariance_kinds == frozenset({"full"})
-    assert reg_full.family_consistent is False
     reg_diag = DecodeRegistration(_fn, False, False, None)
     assert reg_diag.covariance_kinds == frozenset({"diagonal"})
 
@@ -319,11 +316,9 @@ def test_decode_registration_rejects_noncallable_fused_ce_direct_and_decorator()
         _DECODERS.pop(name, None)
 
 
-def test_builtin_gaussian_kernels_are_single_rank_and_not_family_consistent():
+def test_builtin_gaussian_kernels_are_single_rank():
     with pytest.raises(KeyError):
         get_decode_registration("family_chunked")
-    # the fast canonical kernels stay single-rank and NOT family-consistent.
+    # the fast canonical kernels stay single-rank.
     assert get_decode_registration("diagonal_chunked").covariance_kinds == frozenset({"diagonal"})
     assert get_decode_registration("full_chunked").covariance_kinds == frozenset({"full"})
-    assert get_decode_registration("diagonal_chunked").family_consistent is False
-    assert get_decode_registration("full_chunked").family_consistent is False

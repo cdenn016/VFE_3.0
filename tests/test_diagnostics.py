@@ -72,22 +72,6 @@ def test_projected_router_entropy_is_distinct_from_global_free_energy_component(
     assert d["relational_legacy_global_f_available"] == 0.0
 
 
-def test_effective_rank_registry_dispatch_uses_explicit_diagonal_flag() -> None:
-    r"""PB-07: the registered ``effective_rank`` wrapper REQUIRES an explicit ``diagonal`` flag and
-    threads it to ``_spectrum``. A diagonal (N, K) variance table with N == K is square in its last two
-    axes, so shape auto-inference misclassifies it as a full covariance and eigvalsh a variance vector;
-    the explicit flag keeps the diagonal interpretation."""
-    torch.manual_seed(0)
-    K = 3
-    sigma = torch.rand(K, K) + 0.5                                       # N == K diagonal variance table
-    got = metrics.get_metric("effective_rank")(sigma=sigma, diagonal=True)
-    ref = float(metrics.effective_rank(sigma).mean())                    # variances ARE the spectrum
-    eig = torch.linalg.eigvalsh(0.5 * (sigma + sigma.transpose(-1, -2)))
-    wrong = float(metrics.effective_rank(eig).mean())                    # misclassified full-cov reading
-    assert got == pytest.approx(ref, rel=1e-6, abs=1e-9)                 # explicit flag -> diagonal spectrum
-    assert abs(ref - wrong) > 1e-3                                       # the two readings genuinely differ
-
-
 def test_eval_diagnostics_builds_one_snapshot(monkeypatch) -> None:
     model = _model()
     tokens = _tokens()

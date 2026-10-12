@@ -25,7 +25,7 @@ torch.set_num_threads(1)
 
 
 def test_log_steps_write_template_rows_and_calibration_is_saved(tmp_path: Path) -> None:
-    cfg = _prototype_cfg(block_mlp_template_init="working_variance", max_steps=3, eval_stride=None)
+    cfg = _prototype_cfg(block_mlp_template_init="working_variance", max_steps=3, warmup_steps=3, eval_stride=None)
     torch.manual_seed(0)
     model = VFEModel(cfg)
     artifacts = ra.RunArtifacts(tmp_path / "run", cfg, model, save_model_artifacts=False)

@@ -491,7 +491,7 @@ def test_plot_attention_structure_single_layer_uses_head_labels(tmp_path):
 def test_plot_per_layer_diagnostics_saves(tmp_path):
     L = 3
     keys = ("self_coupling", "belief_coupling", "attention_entropy", "total", "self_divergence",
-            "holonomy_deviation", "holonomy_wilson", "gauge_trace_spread", "gauge_invariant_spread",
+            "holonomy_wilson", "gauge_invariant_spread",
             "effective_rank", "attn_entropy", "belief_cond_median", "phi_norm_mean")
     per_layer = {k: [float(v) for v in torch.rand(L)] for k in keys}
     p = tmp_path / "f8b.png"
@@ -539,7 +539,7 @@ def test_per_layer_belief_geometry_labels_cond_median(tmp_path):
     # The twin-axis condition-number marker must be named in the legend so it cannot be misread as a
     # second attention-entropy series on the left rank/nats axis.
     keys = ("self_coupling", "belief_coupling", "attention_entropy", "total",
-            "holonomy_deviation", "holonomy_wilson", "gauge_trace_spread", "gauge_invariant_spread",
+            "holonomy_wilson", "gauge_invariant_spread",
             "phi_norm_mean", "effective_rank", "attn_entropy", "belief_cond_median")
     per_layer = {k: [float(v) for v in torch.rand(3)] for k in keys}
     fig = plot_per_layer_diagnostics(per_layer, path=str(tmp_path / "bg.png"))
