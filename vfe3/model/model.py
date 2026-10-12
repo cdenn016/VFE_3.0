@@ -69,7 +69,6 @@ from vfe3.numerics import safe_eigvalsh
 from vfe3.relational_scoring import (
     set_projected_condition_recovery,
     set_projected_factor_route,
-    set_projected_recovery_precision,
 )
 from vfe3.runtime import set_fp32_matmul_precision
 from vfe3.model.minimal_agent import MINIMAL_AGENT_ELBO_KEYS
@@ -265,7 +264,6 @@ class VFEModel(nn.Module):
         set_projected_condition_recovery(cfg.projected_factorization != "gram")
         set_projected_factor_route(
             "cholesky_qr2" if cfg.projected_factorization == "cholesky_qr2_certified" else "gram")
-        set_projected_recovery_precision("fp32")
         set_frame_pair_fp64_escalation(cfg.frame_pair_escalation_tol is not None)
         set_frame_pair_condition_tol(cfg.frame_pair_escalation_tol if cfg.frame_pair_escalation_tol is not None
                                      else DEFAULT_FRAME_PAIR_CONDITION_TOL)
@@ -365,6 +363,7 @@ class VFEModel(nn.Module):
             encode_mode=cfg.encode_mode, decode_mode=cfg.decode_mode,
             decode_chunk_size=cfg.decode_chunk_size,
             decode_ce_checkpoint=cfg.decode_ce_checkpoint,
+            decode_ce_triton=cfg.decode_ce_triton,
             decode_ranking_fp64_escalation=cfg.decode_ranking_fp64_escalation,
             # Tier-1/Tier-2 decode toggles (2026-07-05; all default OFF, byte-identical):
             unigram_kappa=cfg.unigram_kappa,

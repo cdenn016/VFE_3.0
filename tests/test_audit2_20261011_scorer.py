@@ -10,7 +10,7 @@ matrix_exp as NaN. #55: raise-only scorer verdicts are deferred. Tiny CPU shapes
 """
 import math
 import warnings
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import mpmath
 import pytest
@@ -32,11 +32,10 @@ F64 = torch.float64
 
 @pytest.fixture(autouse=True)
 def _restore_scorer_policies() -> Iterator[None]:
-    saved = (scoring._CONDITION_RECOVERY, scoring._FACTOR_ROUTE, scoring._RECOVERY_PRECISION,
-             torch.get_float32_matmul_precision())
+    saved = (scoring._CONDITION_RECOVERY, scoring._FACTOR_ROUTE, torch.get_float32_matmul_precision())
     yield
-    scoring._CONDITION_RECOVERY, scoring._FACTOR_ROUTE, scoring._RECOVERY_PRECISION = saved[:3]
-    torch.set_float32_matmul_precision(saved[3])
+    scoring._CONDITION_RECOVERY, scoring._FACTOR_ROUTE = saved[:2]
+    torch.set_float32_matmul_precision(saved[2])
 
 
 class _MatmulPolicies(TorchDispatchMode):
@@ -322,12 +321,22 @@ def _inject_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(scoring, "_cholesky_status", failing)
 
 
-@pytest.mark.parametrize("precision", ["fp64", "fp32"])
+def _failing_retry(real: Callable[..., Tuple[torch.Tensor, torch.Tensor]]) -> Callable[..., Tuple[torch.Tensor, torch.Tensor]]:
+    r"""``cholesky_qr2`` whose shifted (float32 retry) calls report failure, forcing the float64 fallback."""
+    def failing(root: torch.Tensor, shift: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+        factor, failed = real(root, shift=shift)
+        return factor, (torch.ones_like(failed) if shift else failed)
+    return failing
+
+
+@pytest.mark.parametrize("fallback", [False, True])
 def test_rotation_invariant_recovery_rebuilds_the_commutant_projection(monkeypatch: pytest.MonkeyPatch,
-                                                                       precision: str) -> None:
+                                                                       fallback: bool) -> None:
     r"""rope_fraction < 1: the non-rotating block is dense, a failed float32 factor is rebuilt from the source
-    as P(X X^T) instead of raising, and every pair matches the healthy call to float32 accuracy."""
-    scoring.set_projected_recovery_precision(precision)
+    as P(X X^T) instead of raising, and every pair matches the healthy call to float32 accuracy, by float32
+    shifted CholeskyQR3 and (``fallback``: that retry reports failure) by the float64 QR fallback."""
+    if fallback:
+        monkeypatch.setattr(scoring, "cholesky_qr2", _failing_retry(scoring.cholesky_qr2))
     d, heads = 4, 2
     ops = _ops(fraction=.5, d=d, heads=heads).float()
     mu, sigma, frame = _beliefs(d, heads, full=False, dtype=torch.float32)

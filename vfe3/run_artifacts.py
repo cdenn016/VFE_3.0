@@ -4220,6 +4220,9 @@ def finalize_run(
         # 2026-10-10 round 2, #42; selector removed 2026-10-12).
         "expected_likelihood_ce_kernel": getattr(getattr(model, "prior_bank", None),
                                                  "realized_expected_likelihood_kernel", None),
+        # The diagonal_chunked / full_chunked CE kernel that last ran ('torch' | 'triton'; None when neither
+        # ran): 'triton' needs decode_ce_triton=True and CUDA tensors (2026-10-12).
+        "decode_ce_kernel": getattr(getattr(model, "prior_bank", None), "realized_decode_ce_kernel", None),
         "phi_chart_norm_route": _phi_chart_norm_route(model, cfg),
         "scaling_point":   scaling_point,
         # Audit 2026-09-28: test at the validation-selected weights beside the final-weight

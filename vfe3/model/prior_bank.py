@@ -735,6 +735,7 @@ class PriorBank(nn.Module):
         decode_chunk_size:   int   = 8192,
         decode_av_precision: Optional[str] = None,
         decode_ce_checkpoint: str  = "auto",
+        decode_ce_triton:     bool = False,
         decode_ranking_fp64_escalation: bool = VFE3Config.decode_ranking_fp64_escalation,
 
         unigram_kappa:        float = 1.0,
@@ -803,6 +804,13 @@ class PriorBank(nn.Module):
         # The kernel that last ran decode_ce_expected_likelihood_chunked ('torch' | 'triton'; None before
         # the first call), recorded for summary.json (audit 2026-10-10 round 2, #42).
         self.realized_expected_likelihood_kernel: Optional[str] = None
+        # decode_ce_triton (VFE3Config): the diagonal_chunked / full_chunked CE runs its per-chunk elementwise
+        # work in the fused Triton kernels of vfe3/kernels/kl_decode.py on CUDA tensors. The kernel that last
+        # ran either CE ('torch' | 'triton'; None before the first call) is recorded for summary.json.
+        if not isinstance(decode_ce_triton, bool):
+            raise ValueError(f"decode_ce_triton must be bool, got {decode_ce_triton!r}")
+        self.decode_ce_triton = decode_ce_triton
+        self.realized_decode_ce_kernel: Optional[str] = None
         self.decode_ranking_fp64_escalation = decode_ranking_fp64_escalation
         self.unigram_kappa = unigram_kappa
         self.decode_unigram_prior = decode_unigram_prior
@@ -1318,6 +1326,63 @@ class PriorBank(nn.Module):
             raise IndexError(f"Target {invalid_target} is out of bounds.")
         return has_ignored
 
+    def _decode_ce_triton_active(
+        self,
+        lhs:   torch.Tensor,                     # (..., N, 2K) expanded-form left factor
+        u_all: Optional[torch.Tensor],           # (V,) unigram bias or None
+    ) -> bool:
+        r"""Whether this KL decode CE call runs the fused Triton kernels, and record the kernel that runs."""
+        fused = self.decode_ce_triton and lhs.is_cuda and (u_all is None or not u_all.requires_grad)
+        self.realized_decode_ce_kernel = "triton" if fused else "torch"
+        return fused
+
+    def _decode_ce_triton_rows(
+        self,
+        sq:          torch.Tensor,               # (B, N, K) query variances (diag(Sigma_q) for the full family)
+        mc_q:        torch.Tensor,               # (B, N, K) centered query means
+        lhs:         torch.Tensor,               # (B, N, 2K) _decode_av_lhs(sq, mc_q)
+        per_pos:     torch.Tensor,               # (B, N, 1) per-position v-independent term
+        mu_v_all:    torch.Tensor,               # (V, K) decode mean table
+        sigma_v_all: torch.Tensor,               # (V, K) decode variances
+        c:           torch.Tensor,               # (1, K) centering offset mean_v(mu_v)
+        u_all:       Optional[torch.Tensor],     # (V,) unigram bias or None
+        tau_eff:     torch.Tensor,               # (1,) effective temperature
+        targets:     torch.Tensor,               # (B, N) target ids in [0, V)
+        chunk:       int,                        # vocabulary chunk width
+    ) -> torch.Tensor:                           # (B, N) CE rows = -log-softmax at the target
+        r"""The chunked KL decode CE rows through the fused Triton kernels (``decode_ce_triton``).
+
+        Same factors and working precision as the torch loop of the two callers: the ``_decode_av`` expanded
+        form (built in float64 from the float32 pieces under ``decode_av_precision='fp64'``), the bias add, clamp,
+        temperature and unigram bias of ``_decode_analytic_kl_logits``, and the cross-entropy of
+        ``_decode_ce_combine_summaries``. The (S, Vc) cross term is kept for backward exactly when the torch
+        route would keep its chunk workspace (``decode_ce_checkpoint`` accounting) and recomputed otherwise.
+        Rounding-level differences are listed in ``vfe3/kernels/kl_decode.py``.
+        """
+        from vfe3.kernels.kl_decode import kl_decode_ce_rows
+        V = self.vocab_size
+        work = torch.float64 if self.decode_av_precision == "fp64" else lhs.dtype
+        lhs_w = lhs if lhs.dtype is work else _decode_av_lhs(sq.to(work), mc_q.to(work))
+        mc_v = (mu_v_all - c).to(work)                                      # (V, K) centered prior means
+        inv_v = (1.0 / sigma_v_all).to(work)                                # (V, K)
+        lsum = torch.log(sigma_v_all).sum(-1).to(work)                      # (V,)
+        rhs = torch.cat([inv_v, mc_v * inv_v], dim=-1)                      # (V, 2K)
+        bias = (mc_v ** 2 * inv_v).sum(-1) + lsum                           # (V,)
+        grad_active = torch.is_grad_enabled() and any(
+            value is not None and value.requires_grad for value in
+            (lhs, per_pos, mu_v_all, sigma_v_all, tau_eff))
+        aggregate = self.decode_ce_checkpoint == "auto_aggregate"
+        activation_bytes = _decode_ce_chunk_activation_bytes(
+            lhs, V if aggregate else min(chunk, V), inner=2,
+            workspace_bytes_per_scalar=(8 if aggregate and self.decode_av_precision == "fp64" else None))
+        keep = grad_active and not _decode_ce_should_checkpoint(
+            self.decode_ce_checkpoint, grad_active, activation_bytes)
+        ce_rows = kl_decode_ce_rows(
+            lhs_w.reshape(-1, lhs_w.shape[-1]), per_pos.to(work).reshape(-1), rhs, bias,
+            u_all.to(work) if u_all is not None else None, tau_eff.to(work), targets.reshape(-1),
+            chunk=chunk, keep=keep)                                         # (S,)
+        return ce_rows.reshape(targets.shape)
+
     def decode_ce_diagonal_chunked(
         self,
         mu_q:    torch.Tensor,           # (B, N, K) posterior means
@@ -1412,6 +1477,11 @@ class PriorBank(nn.Module):
 
         valid = targets != ignore_index                                    # (B, N) bool
         scored_valid = original_valid
+        if self._decode_ce_triton_active(lhs, u_all):
+            ce_per_pos = self._decode_ce_triton_rows(
+                sigma_q, mc_q, lhs, per_pos, mu_v_all, sigma_v_all, c, u_all, tau_eff, targets, chunk)
+            ce = (ce_per_pos * valid).sum() / valid.sum().clamp_min(1)
+            return _decode_ce_result(ce, scored_valid, return_stats)
         lse_chunks = []
         max_chunks = []
         target_chunks = []
@@ -1647,6 +1717,11 @@ class PriorBank(nn.Module):
             scored_valid[original_valid] = valid.flatten()
         else:
             scored_valid = valid
+        if self._decode_ce_triton_active(lhs, u_all):
+            ce_per_pos = self._decode_ce_triton_rows(
+                diag_sq, mc_q, lhs, per_pos, mu_v_all, sigma_v_all, c, u_all, tau_eff, targets, chunk)
+            ce = (ce_per_pos * valid).sum() / valid.sum().clamp_min(1)
+            return _decode_ce_result(ce, scored_valid, return_stats)
         lse_chunks = []
         max_chunks = []
         target_chunks = []

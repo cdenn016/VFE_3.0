@@ -191,12 +191,14 @@ def test_mean_field_rope_flags_a_rotated_query_covariance_that_loses_pd() -> Non
 # -- hotspot-1#3: float64 factor tiles under a query-only recovery ---------------------------------
 
 def test_query_only_fp64_recovery_runs_the_factor_tiles_in_float64(monkeypatch: pytest.MonkeyPatch) -> None:
+    r"""The float64 fallback (the float32 shifted CholeskyQR3 retry reports failure) promotes both factors."""
+    from tests.test_audit2_20261011_scorer import _failing_retry
     from tests.test_audit_20261008_fixes import _rank_ill_maps
     from vfe3.relational_scoring import projected_moments
 
-    saved = (scoring._RECOVERY_PRECISION, scoring._CONDITION_RECOVERY)
-    scoring.set_projected_recovery_precision("fp64")
+    saved = scoring._CONDITION_RECOVERY
     scoring.set_projected_condition_recovery(True)
+    monkeypatch.setattr(scoring, "cholesky_qr2", _failing_retry(scoring.cholesky_qr2))
     try:
         dtypes = []
         real = scoring._projected_kl_tile
@@ -219,7 +221,7 @@ def test_query_only_fp64_recovery_runs_the_factor_tiles_in_float64(monkeypatch: 
         scoring.projected_gaussian_kl(a_q, G_q, a_k, G_k, projection_q=(sigma, inverse, S_q, mu),
                                       projection_k=(sigma, inverse, S_k, mu))
     finally:
-        scoring._RECOVERY_PRECISION, scoring._CONDITION_RECOVERY = saved
+        scoring._CONDITION_RECOVERY = saved
     assert dtypes, "precondition: the query entries were recovered"
     assert all(pair == (torch.float64, torch.float64) for pair in dtypes), dtypes
 

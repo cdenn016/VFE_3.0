@@ -214,7 +214,7 @@ def _nearly_dependent_case(device: torch.device) -> list:
 def test_factor_route_recovers_a_failed_root_with_finite_gradients(
         factor_route, device: torch.device, recovery: bool) -> None:
     from vfe3.relational_scoring import (
-        projected_condition_recovery, reset_source_recovery_elements, set_projected_condition_recovery,
+        _source_root, projected_moments, reset_source_recovery_elements, set_projected_condition_recovery,
         source_recovery_elements,
     )
 
@@ -227,24 +227,41 @@ def test_factor_route_recovers_a_failed_root_with_finite_gradients(
         ops = _OpNames()
         with ops:
             score = _score(*working)
-        # Off: the outright CholeskyQR2 failure is rebuilt by float32 shifted CholeskyQR3 only.
-        # On: the certificate also flags it, and it takes the float64 QR.
-        assert ("linalg_qr" in ops.names) is recovery
+        # The outright CholeskyQR2 failure is rebuilt by float32 shifted CholeskyQR3, with or without the
+        # certificate (fp32 recovery); no float64 QR runs.
+        assert "linalg_qr" not in ops.names
         assert source_recovery_elements() > 0
         assert torch.isfinite(score).all()
         score.sum().backward()
         assert all(torch.isfinite(x.grad).all() for x in working)
         reference = _score(*(x.double() for x in case))
-        tolerance = 1e-4 if recovery else 5e-2
-        torch.testing.assert_close(score.detach().double(), reference, rtol=tolerance, atol=tolerance)
+        # Per pair, the first-order model of _factor_status: |dKL_ij| <= eps (kappa_q,i + kappa_k,j)
+        # (tr P_k G_q + d^T P_k d + r), with kappa the float64 condition numbers of the source roots (head 0's
+        # query roots reach 1.3e6, eps kappa = 0.15). Measured: at most 0.21 of the bound (8.3e-3 on head 0).
+        mu_h, sigma_h, blocks, S_q, S_k = (x.double() for x in case)
+        moments = [projected_moments(mu_h, sigma_h, blocks, S) for S in (S_q, S_k)]
+        kappas = []
+        for (_, G), S in zip(moments, (S_q, S_k)):
+            root = _source_root(G, (sigma_h, blocks, S), torch.ones(G.shape[:-2], dtype=torch.bool))
+            singular = torch.linalg.svdvals(root)
+            kappas.append((singular[:, 0] / singular[:, -1]).reshape(G.shape[:-2]).transpose(-1, -2))  # (1, H, N)
+        (aq, Gq), (ak, Gk) = moments
+        Pk = torch.linalg.inv(Gk)
+        trace = torch.einsum("znhxy,zmhyx->zhnm", Gq, Pk)
+        delta = aq.unsqueeze(2) - ak.unsqueeze(1)                                 # (1, Nq, Nk, H, r)
+        quadratic = torch.einsum("znmhx,zmhxy,znmhy->zhnm", delta, Pk, delta)
+        bound = (torch.finfo(torch.float32).eps * (kappas[0].unsqueeze(-1) + kappas[1].unsqueeze(-2))
+                 * (trace + quadratic + Gq.shape[-1]))
+        error = (score.detach().double() - reference).abs()
+        assert bool((error <= bound).all()), float((error / bound).max())
     finally:
         set_projected_condition_recovery(previous)
 
 
 def test_factor_certificate_runs_only_under_condition_recovery(factor_route, device: torch.device) -> None:
     from vfe3.relational_scoring import (
-        projected_condition_recovery, reset_source_recovery_elements, set_projected_condition_recovery,
-        source_recovery_elements,
+        _factor_status, projected_condition_recovery, projected_moments, reset_source_recovery_elements,
+        set_projected_condition_recovery, source_recovery_elements,
     )
 
     factor_route("cholesky_qr2")
@@ -253,8 +270,13 @@ def test_factor_certificate_runs_only_under_condition_recovery(factor_route, dev
         # kappa(X) = 3e3 factors by CholeskyQR2 but exceeds the certificate eps kappa_1 > 3e-4.
         for kappa, enabled, fires in ((30., True, False), (3e3, False, False), (3e3, True, True)):
             set_projected_condition_recovery(enabled)
+            mu_h, sigma_h, blocks, S_q, _ = _projected_case(device, kappa=kappa)
+            _, Gq = projected_moments(mu_h, sigma_h, blocks, S_q)
+            assert bool(_factor_status(Gq, (sigma_h, blocks, S_q, mu_h))[2].any()) is fires, (kappa, enabled)
+            # fp32 recovery keeps a certificate-flagged CholeskyQR2 factor (a float32 redo cannot improve on it),
+            # so only outright failures are rebuilt and none occur here.
             reset_source_recovery_elements()
             _score(*_projected_case(device, kappa=kappa))
-            assert (source_recovery_elements() > 0) is fires, (kappa, enabled)
+            assert source_recovery_elements() == 0, (kappa, enabled)
     finally:
         set_projected_condition_recovery(previous)
