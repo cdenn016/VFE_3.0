@@ -172,7 +172,7 @@ def test_config_contract_and_inactive_fields() -> None:
     cfg = _cfg(**predictive, relational_routing="noisy_key", relational_key_noise=0.25)
     inactive = cfg.inactive_fields()
     assert "relational_key_noise" not in inactive and "kappa_beta" in inactive
-    assert "projected_factor_route" in inactive and "pair_kl_gemm_tol" not in inactive
+    assert "pair_kl_gemm_tol" not in inactive           # the factor-route selector is merged into projected_factorization (C4)
     assert asdict(config_from_serialized(serialize_config(cfg), source="noisy key")) == asdict(cfg)
     for bad in (0.0, -1.0, float("nan"), True):
         with pytest.raises(ValueError, match="relational_key_noise"):
