@@ -180,7 +180,6 @@ config = dict(
     #################################
     #        Encode/Decode          #
     #################################
-    decode_bias                       = True,     # only for decode_mode='linear'
 
 
 
@@ -635,8 +634,7 @@ def predict_n_params(cfg: VFE3Config) -> Tuple[int, int]:
     n += V * K                                               # token-prior variance table
     if cfg.decode_mode == "linear":
         n += V * K                                          # output_proj_weight
-        if cfg.decode_bias:
-            n += V                                          # output_proj_bias
+        n += V                                              # output_proj_bias
     elif cfg.untie_decode_bank:
         n += 2 * V * K                                      # independent routed decode tables
     if cfg.pos_phi == "learned":

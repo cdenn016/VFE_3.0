@@ -327,8 +327,7 @@ def test_realized_expected_likelihood_kernel_is_recorded_on_cpu(tmp_path: Path,
                         lambda *a, **k: {"git_sha": "0" * 40, "git_dirty": False, "git_dirty_fingerprint": None})
     for name in ("_write_provenance", "_write_research_artifacts", "_run_figures_isolated"):
         monkeypatch.setattr(ra, name, lambda *a, **k: None)
-    cfg = tiny_config(decode_mode="expected_likelihood_chunked", expected_likelihood_kernel="triton",
-                      generate_embedding_figures=False)
+    cfg = tiny_config(decode_mode="expected_likelihood_chunked", generate_embedding_figures=False)
     model = VFEModel(cfg)
     assert model.prior_bank.realized_expected_likelihood_kernel is None
     model(torch.tensor([[1, 2, 3]]), torch.tensor([[2, 3, 4]]))                   # CPU: the torch kernel runs
@@ -337,13 +336,10 @@ def test_realized_expected_likelihood_kernel_is_recorded_on_cpu(tmp_path: Path,
     ra.finalize_run(model, art, cfg, test_loader=None)
     summary = json.loads((tmp_path / "r" / "summary.json").read_text(encoding="utf-8"))
     assert summary["expected_likelihood_ce_kernel"] == "torch"
-    assert "expected_likelihood_kernel" in tables.PRECISION_KEYS
-    run = SimpleNamespace(config_raw={"expected_likelihood_kernel": "triton"}, summary=summary, provenance={},
-                          config_record={}, raw=lambda key, default=None: {"expected_likelihood_kernel": "triton"}.get(
-                              key, default))
+    run = SimpleNamespace(config_raw={}, summary=summary, provenance={}, config_record={},
+                          raw=lambda key, default=None: default)
     items = tables._numerics_items(run)
-    rendered = " ".join(str(value) for _, value in items)
-    assert "expected_likelihood_kernel=triton" in rendered and "torch" in rendered
+    assert ("expected-likelihood CE kernel that ran", "torch") in [(label, str(value)) for label, value in items]
 
 
 # ------------------------------------------------------------------------------------- item 46

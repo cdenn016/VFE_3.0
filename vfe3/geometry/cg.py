@@ -33,9 +33,9 @@ from typing import Dict, List, Tuple
 import torch
 
 from vfe3.geometry.generators import generate_son
-from vfe3.geometry.irreps import DEFAULT_IRREP_BASIS, irrep_dim, irrep_generators
+from vfe3.geometry.irreps import irrep_dim, irrep_generators
 
-_CG_CACHE: Dict[Tuple[str, int, str, str, str, float, str], torch.Tensor] = {}
+_CG_CACHE: Dict[Tuple[str, int, str, str, str, float], torch.Tensor] = {}
 
 
 def clear_cg_cache() -> None:
@@ -59,13 +59,11 @@ def cg_intertwiners(
     label_b: str,                          # second source irrep label
     label_c: str,                          # target irrep label
     atol:    float = 1e-8,
-    basis:   str   = DEFAULT_IRREP_BASIS,  # irrep block basis the intertwiners are expressed in
 ) -> torch.Tensor:                         # (n_mult, d_c, d_a * d_b) float64; n_mult may be 0
     """All independent intertwiners V_a (x) V_b -> V_c (empty leading axis if none)."""
     # atol is part of the key: it sets the null-space cut, so two calls with different
     # tolerances are different solves and must not alias (audit 2026-06-09 overnight CR1).
-    # The basis is part of it too: an intertwiner is only an intertwiner in its own block bases.
-    key = (algebra, N, label_a, label_b, label_c, float(atol), basis)
+    key = (algebra, N, label_a, label_b, label_c, float(atol))
     if key in _CG_CACHE:
         return _CG_CACHE[key].clone()
     da = irrep_dim(N, algebra=algebra, label=label_a)
@@ -79,9 +77,9 @@ def cg_intertwiners(
             f"matrix-free solver."
         )
     G_def = _defining(N, algebra)
-    ra = irrep_generators(G_def, algebra=algebra, label=label_a, basis=basis)
-    rb = irrep_generators(G_def, algebra=algebra, label=label_b, basis=basis)
-    rc = irrep_generators(G_def, algebra=algebra, label=label_c, basis=basis)
+    ra = irrep_generators(G_def, algebra=algebra, label=label_a)
+    rb = irrep_generators(G_def, algebra=algebra, label=label_b)
+    rc = irrep_generators(G_def, algebra=algebra, label=label_c)
     I_a = torch.eye(da, dtype=torch.float64)
     I_b = torch.eye(db, dtype=torch.float64)
     I_c = torch.eye(dc, dtype=torch.float64)
@@ -142,7 +140,6 @@ def cg_selection(
     algebra: str,                          # 'so'
     labels:  List[str],                    # the spec's irrep labels (duplicates allowed)
     atol:    float = 1e-8,                  # null-space cut; MUST match the buffer build's atol
-    basis:   str   = DEFAULT_IRREP_BASIS,   # irrep block basis (multiplicities do not depend on it)
 ) -> List[Tuple[str, str, str, int]]:      # admissible (a, b, c, n_mult), a <= b, n_mult > 0
     """Enumerate admissible CG triples among the spec's labels (unordered source pairs:
     swapped duplicates are not independent bilinear maps, so a <= b canonically).
@@ -172,7 +169,7 @@ def cg_selection(
                     )
                     continue
                 n = cg_intertwiners(N, algebra=algebra, label_a=a, label_b=b,
-                                    label_c=c, atol=atol, basis=basis).shape[0]
+                                    label_c=c, atol=atol).shape[0]
                 if n > 0:
                     out.append((a, b, c, n))
     return out

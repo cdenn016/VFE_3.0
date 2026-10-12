@@ -1,13 +1,12 @@
-r"""decode_bias: a learned per-vocab log-unigram bias on the linear decode path.
+r"""The learned per-vocab log-unigram bias of the linear decode path (always on since 2026-10-12).
 
-Zero-initialised so the decode is bit-identical to no-bias at construction; routed to a
+Zero-initialised so the decode is bit-identical to a bias-free map at construction; routed to a
 weight-decay-free optimizer group (decaying a unigram prior toward zero biases it to a flat
-distribution). Inert under prior-bank decoder modes, whose per-vocab priors
-already carry the unigram role), where it warns and creates no parameter.
+distribution). Prior-bank decoder modes, whose per-vocab priors already carry the unigram role,
+create no bias parameter.
 """
 
 from tests.profiles import test_config
-import pytest
 import torch
 import torch.nn.functional as F
 
@@ -16,33 +15,29 @@ from vfe3.model.prior_bank import PriorBank
 from vfe3.train import build_optimizer
 
 
-def test_bias_param_created_only_on_linear_path_when_enabled():
+def test_bias_param_created_only_on_linear_path():
     V, K, n_gen = 20, 4, 16
-    pb = PriorBank(V, K, n_gen, decode_mode="linear", decode_bias=True)
+    pb = PriorBank(V, K, n_gen, decode_mode="linear")
     assert isinstance(pb.output_proj_bias, torch.nn.Parameter)
     assert pb.output_proj_bias.shape == (V,)
     assert torch.equal(pb.output_proj_bias, torch.zeros(V))         # zero-init
 
-    pb_nob = PriorBank(V, K, n_gen, decode_mode="linear", decode_bias=False)
-    assert pb_nob.output_proj_bias is None                          # off -> no param
-
-    pb_kl = PriorBank(V, K, n_gen, decode_mode="diagonal_chunked", decode_bias=True)
-    assert pb_kl.output_proj_bias is None                           # inert on the KL path
+    pb_kl = PriorBank(V, K, n_gen, decode_mode="diagonal_chunked")
+    assert pb_kl.output_proj_bias is None                           # no bias on the KL path
 
 
-def test_zero_init_bias_is_bit_identical_to_no_bias():
+def test_zero_init_bias_is_bit_identical_to_the_bias_free_map():
     V, K, n_gen = 12, 4, 16
-    torch.manual_seed(0); pb_b  = PriorBank(V, K, n_gen, decode_mode="linear", decode_bias=True)
-    torch.manual_seed(0); pb_nb = PriorBank(V, K, n_gen, decode_mode="linear", decode_bias=False)
+    pb = PriorBank(V, K, n_gen, decode_mode="linear")
     rng = torch.Generator().manual_seed(1)
     mu_q = torch.randn(2, 3, K, generator=rng)
     sigma_q = torch.rand(2, 3, K, generator=rng) + 0.5
-    assert torch.equal(pb_b.decode(mu_q, sigma_q), pb_nb.decode(mu_q, sigma_q))
+    assert torch.equal(pb.decode(mu_q, sigma_q), mu_q @ pb.output_proj_weight.T)
 
 
 def test_bias_adds_per_vocab_shift_to_linear_logits():
     V, K, n_gen = 10, 3, 9
-    pb = PriorBank(V, K, n_gen, decode_mode="linear", decode_bias=True)
+    pb = PriorBank(V, K, n_gen, decode_mode="linear")
     rng = torch.Generator().manual_seed(2)
     mu_q = torch.randn(2, 4, K, generator=rng)
     sigma_q = torch.rand(2, 4, K, generator=rng) + 0.5
@@ -58,7 +53,7 @@ def test_bias_gradient_descends_toward_log_unigram():
     # (uniform softmax) gives grad_v = 1/V - p_emp(v), so gradient DESCENT raises the most
     # frequent token's bias the most: argmin(grad) == argmax(freq), grad monotone in freq.
     V, K, n_gen = 8, 3, 9
-    pb = PriorBank(V, K, n_gen, decode_mode="linear", decode_bias=True)
+    pb = PriorBank(V, K, n_gen, decode_mode="linear")
     with torch.no_grad():
         pb.output_proj_weight.zero_()
     mu_q = torch.zeros(1, 50, K)
@@ -73,7 +68,7 @@ def test_bias_gradient_descends_toward_log_unigram():
 
 def test_bias_in_weight_decay_free_optimizer_group():
     cfg = test_config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
-                     decode_mode="linear", decode_bias=True, weight_decay=0.05)
+                     decode_mode="linear", weight_decay=0.05)
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
     bias = model.prior_bank.output_proj_bias
@@ -82,12 +77,8 @@ def test_bias_in_weight_decay_free_optimizer_group():
     assert groups[0]["weight_decay"] == 0.0                         # unigram prior is not decayed
 
 
-def test_decode_bias_inert_under_prior_bank_warns():
-    # decode_bias is structurally inactive under a prior-bank decoder; the notice shows only a
-    # non-default value (the default True is silent), matching every other inactive field.
-    from vfe3.config import VFE3Config
-    selected = not VFE3Config.__dataclass_fields__["decode_bias"].default
-    with pytest.warns(UserWarning, match="decode_bias"):
-        cfg = test_config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=4,
-                         decode_mode="diagonal_chunked", decode_bias=selected)
-    assert "decode_bias" in cfg.inactive_fields()
+def test_prior_bank_decode_model_has_no_bias():
+    cfg = test_config(vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=4,
+                      decode_mode="diagonal_chunked")
+    assert "decode_bias" not in cfg.inactive_fields()
+    assert VFEModel(cfg).prior_bank.output_proj_bias is None

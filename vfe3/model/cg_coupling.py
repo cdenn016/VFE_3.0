@@ -21,7 +21,6 @@ import torch
 from torch import nn
 
 from vfe3.geometry.cg import cg_intertwiners, cg_selection
-from vfe3.families.gaussian import FullGaussian
 
 
 class CGMomentResult(NamedTuple):
@@ -50,7 +49,6 @@ def cg_moment_energy_rows(
     eps:               float = 1e-6,
     family:            str   = "gaussian_diagonal",
     divergence_family: str   = "renyi",
-    full_cov_kl_precision: Optional[str] = None,
 ) -> torch.Tensor:                        # (..., N) D(q_post || q_pre)
     r"""Per-token post-CG moment divergence D(q_post || q_pre) via the active-family divergence seam.
 
@@ -62,12 +60,8 @@ def cg_moment_energy_rows(
     from vfe3.families.base import get_family
     from vfe3.free_energy import self_divergence
     fam = get_family(family)
-    def _instance(mu: torch.Tensor, sigma: torch.Tensor):
-        if fam is FullGaussian and full_cov_kl_precision is not None:
-            return fam(mu, sigma, _precision_policy=full_cov_kl_precision)
-        return fam(mu, sigma)
     return self_divergence(
-        _instance(post_mu, post_sigma), _instance(pre_mu, pre_sigma),
+        fam(post_mu, post_sigma), fam(pre_mu, pre_sigma),
         alpha=renyi_order, kl_max=kl_max, eps=eps, divergence_family=divergence_family,
     )
 
@@ -86,7 +80,6 @@ class CGCoupling(nn.Module):
         atol:               float = 1e-8,        # CG null-space solve tolerance (shared with the prune)
         cg_covariance_mode: str   = "passthrough",  # 'passthrough' | 'delta_full' (delta-method J Sigma J^T)
         cg_covariance_floor: float = 1e-6,       # positive covariant floor: floor * input Sigma
-        irrep_basis:        str   = "canonical", # block basis of the group the coupling acts in
     ) -> None:
         super().__init__()
         if not (math.isfinite(cg_covariance_floor) and cg_covariance_floor > 0.0):
@@ -105,15 +98,13 @@ class CGCoupling(nn.Module):
         blocks = list(zip(irrep_labels, starts[:-1], irrep_dims))     # (label, start, d)
 
         # one stacked intertwiner buffer per admissible type triple
-        self._group_n, self._algebra, self._irrep_basis, self._atol = (
-            group_n, algebra, irrep_basis, atol)
-        triples = cg_selection(group_n, algebra=algebra, labels=irrep_labels, atol=atol,
-                               basis=irrep_basis)
+        self._group_n, self._algebra, self._atol = group_n, algebra, atol
+        triples = cg_selection(group_n, algebra=algebra, labels=irrep_labels, atol=atol)
         self._triple_index = {}
         for t, (a, b, c, _n) in enumerate(triples):
             C = cg_intertwiners(group_n, algebra=algebra,
                                 label_a=a, label_b=b, label_c=c,
-                                atol=atol, basis=irrep_basis)         # (n_mult, dc, da*db)
+                                atol=atol)                            # (n_mult, dc, da*db)
             # Stored float64 (the solver's construction precision). A model-wide .float()/
             # .double() converts buffers like everything else; forward re-casts to mu's dtype
             # from the cast cache either way, so numerics follow the RUNTIME dtype -- float64
@@ -197,8 +188,7 @@ class CGCoupling(nn.Module):
 
         def rho(label: str) -> torch.Tensor:
             if label not in reps:
-                reps[label] = irrep_generators(G_def, algebra=self._algebra, label=label,
-                                               basis=self._irrep_basis)
+                reps[label] = irrep_generators(G_def, algebra=self._algebra, label=label)
             return reps[label]
 
         gate = max(1e-6, 10.0 * float(self._atol))
@@ -216,7 +206,7 @@ class CGCoupling(nn.Module):
                     error_msgs.append(
                         f"{prefix}cg_{t}: the loaded ({a}, {b}) -> {c} intertwiner is not equivariant "
                         f"for this build's irrep basis (residual {residual:.3e} > {gate:.1e}); the "
-                        f"checkpoint was saved in a different basis (irrep_basis={self._irrep_basis!r})")
+                        f"checkpoint was saved in a different basis (such as the retired 'eigh' basis)")
                     break
 
     def _apply(self, fn, recurse=True):

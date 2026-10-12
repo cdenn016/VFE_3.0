@@ -1,4 +1,4 @@
-r"""Fused Triton cross-entropy for the expected-likelihood decode (``expected_likelihood_kernel='triton'``).
+r"""Fused Triton cross-entropy for the expected-likelihood decode (every CUDA tensor; CPU tensors run torch).
 
 For packed rows i (the scored positions) with diagonal posteriors (mu_q, sigma_q) and diagonal decode
 tables (mu_v, sigma_v), the logits of ``decode_mode='expected_likelihood_chunked'`` are
@@ -62,9 +62,9 @@ def _kernels() -> Any:
             from vfe3.kernels import _expected_likelihood_triton as kernels
         except ImportError as exc:
             raise RuntimeError(
-                "expected_likelihood_kernel='triton' needs the triton package (triton-windows on "
-                f"Windows) for CUDA tensors, and importing it failed: {exc}. Install triton or set "
-                "expected_likelihood_kernel='torch'."
+                "decode_mode='expected_likelihood_chunked' on CUDA tensors runs the fused Triton "
+                "kernel, which needs the triton package (triton-windows on Windows), and importing "
+                f"it failed: {exc}. Install triton, or run the decoder on CPU tensors."
             ) from exc
         _KERNELS = kernels
     return _KERNELS

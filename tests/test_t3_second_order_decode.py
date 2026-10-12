@@ -24,7 +24,7 @@ V, K, N_GEN = 23, 4, 4
 def _bank(dtype: torch.dtype = torch.float64) -> PriorBank:
     r"""A tiny linear-decode bank with a nonzero bias and a set unigram prior."""
     torch.manual_seed(0)
-    pb = PriorBank(V, K, N_GEN, decode_mode="linear", decode_bias=True, decode_unigram_prior=True,
+    pb = PriorBank(V, K, N_GEN, decode_mode="linear", decode_unigram_prior=True,
                    unigram_kappa=0.7).to(dtype)
     with torch.no_grad():
         pb.output_proj_weight.normal_(std=0.8)

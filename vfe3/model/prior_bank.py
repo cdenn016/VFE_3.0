@@ -48,10 +48,6 @@ from vfe3.belief import BeliefState
 from vfe3.divergence import get_family, get_functional, kl
 from vfe3.families.base import _logdet_chol
 from vfe3.runtime import ieee_fp32_matmul
-from vfe3.families.gaussian import (
-    FullGaussian,
-    validate_full_cov_kl_precision,
-)
 from vfe3.numerics import (
     _count_decode_logdet_fallback,
     bounded_variance_from_log,
@@ -244,22 +240,6 @@ def _decode_ce_should_checkpoint(
     if checkpoint_mode == "never":
         return False
     return activation_bytes > DECODE_CE_CHECKPOINT_AUTO_BYTES               # automatic modes
-
-
-def _family_with_precision_policy(
-    family_cls: type,
-    mu: torch.Tensor,
-    sigma: torch.Tensor,
-    precision_policy: str,
-):
-    """Construct the built-in full family with its owning PriorBank policy.
-
-    Registry overrides retain their legacy constructor contract; only the built-in family consumes
-    this private model-owned policy marker.
-    """
-    if family_cls is FullGaussian:
-        return family_cls(mu, sigma, _precision_policy=precision_policy)
-    return family_cls(mu, sigma)
 
 
 def _decode_av_lhs(
@@ -745,7 +725,7 @@ class PriorBank(nn.Module):
     """
 
     output_proj_weight: Optional[nn.Parameter]   # (V, K) linear-decode weight; None for prior-bank modes
-    output_proj_bias:   Optional[nn.Parameter]   # (V,) optional linear-decode log-unigram bias
+    output_proj_bias:   Optional[nn.Parameter]   # (V,) linear-decode log-unigram bias (None off linear)
     mu_embed:           nn.Parameter             # (V, K) token-prior mean
     sigma_log_embed:    Optional[nn.Parameter]   # (V, K) token-prior log variance; None under 'block_cholesky'
 
@@ -765,14 +745,11 @@ class PriorBank(nn.Module):
         family:              str   = "gaussian_diagonal",
         divergence_family:   str   = "renyi",
         renyi_order:         float = 1.0,
-        full_cov_precision_policy: Optional[str] = None,
-        decode_bias:         bool  = False,
         encode_mode:         str   = "per_token",
         decode_mode:         str   = "diagonal_chunked",
         decode_chunk_size:   int   = 8192,
         decode_av_precision: Optional[str] = None,
         decode_ce_checkpoint: str  = "auto",
-        expected_likelihood_kernel: str = "torch",   # "torch" | "triton" (fused CE, CUDA tensors only)
         decode_ranking_fp64_escalation: bool = VFE3Config.decode_ranking_fp64_escalation,
 
         unigram_kappa:        float = 1.0,
@@ -831,11 +808,6 @@ class PriorBank(nn.Module):
         # readout every projected route uses.
         self.divergence_family = divergence_family
         self.renyi_order = renyi_order
-        # Default to the VFE3Config spelling rather than snapshotting the process global, so a
-        # standalone PriorBank cannot inherit the module-level "fp64" fallback. The model-owned
-        # bank is always constructed with the explicit cfg policy.
-        self.full_cov_kl_precision = validate_full_cov_kl_precision(
-            "fp32_escalate" if full_cov_precision_policy is None else full_cov_precision_policy)
         self.encode_mode = encode_mode
         self.decode_mode = decode_mode
         self.decode_chunk_size = decode_chunk_size
@@ -843,12 +815,6 @@ class PriorBank(nn.Module):
         # keeps it in the fp32 decode island. Set by the model after construction.
         self.decode_logits_amp_dtype: Optional[torch.dtype] = None
         self.decode_ce_checkpoint = decode_ce_checkpoint
-        if expected_likelihood_kernel not in ("torch", "triton"):
-            raise ValueError("expected_likelihood_kernel must be 'torch' or 'triton', got "
-                             f"{expected_likelihood_kernel!r}")
-        # 'triton' routes decode_ce_expected_likelihood_chunked through vfe3/kernels on CUDA tensors;
-        # CPU tensors keep the torch kernel under either value.
-        self.expected_likelihood_kernel = expected_likelihood_kernel
         # The kernel that last ran decode_ce_expected_likelihood_chunked ('torch' | 'triton'; None before
         # the first call), recorded for summary.json (audit 2026-10-10 round 2, #42).
         self.realized_expected_likelihood_kernel: Optional[str] = None
@@ -916,16 +882,15 @@ class PriorBank(nn.Module):
         else:
             self.output_proj_weight = nn.Parameter(torch.empty(vocab_size, K))
             nn.init.xavier_uniform_(self.output_proj_weight)
-            # Optional per-vocab bias (decode_bias): a *per-class* bias is NOT a softmax-invariant
-            # constant shift -- it is a learned log-unigram prior, and a 50k Zipfian vocab is the
-            # opposite of balanced, so the bias-free map can represent token base rates only by
-            # spending rank-K mean capacity. Zero-init -> logits bit-identical to decode_bias=False
-            # at construction (drawn AFTER the weight, so the weight's RNG is unchanged); the CE
-            # gradient drives it toward log p(token). Routed to a weight-decay-free optimizer group
-            # in build_optimizer (decaying a unigram prior toward zero biases it to flat).
-            self.output_proj_bias = (
-                nn.Parameter(torch.zeros(vocab_size)) if decode_bias else None
-            )
+            # Per-vocab bias (always on; the decode_bias toggle was removed 2026-10-12): a
+            # *per-class* bias is NOT a softmax-invariant constant shift -- it is a learned
+            # log-unigram prior, and a 50k Zipfian vocab is the opposite of balanced, so the
+            # bias-free map can represent token base rates only by spending rank-K mean capacity.
+            # Zero-init -> logits bit-identical to a bias-free map at construction (drawn AFTER the
+            # weight, so the weight's RNG is unchanged); the CE gradient drives it toward
+            # log p(token). Routed to a weight-decay-free optimizer group in build_optimizer
+            # (decaying a unigram prior toward zero biases it to flat).
+            self.output_proj_bias = nn.Parameter(torch.zeros(vocab_size))
 
         # Unigram log-prior decode table (decode_unigram_prior=True): a non-trainable (V,) buffer
         # log pi_v holding the smoothed corpus unigram log-frequencies, added to EVERY decode
@@ -1949,12 +1914,13 @@ class PriorBank(nn.Module):
         mu_v_all = self._decode_mu_table()                                  # (V, K) decode table (untied if set)
         u_all = self._unigram_bias() if self.decode_unigram_prior else None  # (V,) kappa*log pi_v or None
 
-        fused = self.expected_likelihood_kernel == "triton" and mu_q.is_cuda
+        # CUDA tensors always take the fused Triton kernel (the expected_likelihood_kernel selector
+        # was removed 2026-10-12): it streams (i, v) register tiles and never forms (B, N, Vc, K);
+        # same formula, rounding-level differences listed in vfe3/kernels/expected_likelihood.py.
+        # The Triton kernel is CUDA-only, so CPU tensors run the chunked torch kernel below.
+        fused = mu_q.is_cuda
         self.realized_expected_likelihood_kernel = "triton" if fused else "torch"
         if fused:
-            # Fused Triton route: streams (i, v) register tiles and never forms (B, N, Vc, K); same
-            # formula, rounding-level differences listed in vfe3/kernels/expected_likelihood.py.
-            # CPU tensors fall through to the torch kernel below, which is unchanged.
             from vfe3.kernels.expected_likelihood import expected_likelihood_ce
             ce = expected_likelihood_ce(
                 mu_q.reshape(-1, mu_q.shape[-1]), sigma_q.reshape(-1, sigma_q.shape[-1]),
@@ -2252,8 +2218,8 @@ def _decode_full(
     sigma_q_b = sigma_q.unsqueeze(-3)                                    # (B, N, 1, K, K)
     full = get_family("gaussian_full")
     kl_v = kl(
-        _family_with_precision_policy(full, mu_q_b, sigma_q_b, pb.full_cov_kl_precision),
-        _family_with_precision_policy(full, mu_v, sigma_v, pb.full_cov_kl_precision),
+        full(mu_q_b, sigma_q_b),
+        full(mu_v, sigma_v),
         kl_max=float("inf"),
         eps=pb.eps,
     )                                                                       # (B, N, V)
@@ -2358,21 +2324,17 @@ def _family_logits(
         degenerate = ~full_ok
         _count_decode_logdet_fallback(full_ok)
 
-    q = _family_with_precision_policy(
-        family_cls,
+    q = family_cls(
         mu_q.unsqueeze(-2),
         sigma_q.unsqueeze(-3 if is_full else -2),
-        pb.full_cov_kl_precision,
     )
     p_sigma_all = bounded_variance_from_log(
         pb._decode_sigma_log_table(), eps=pb.eps
     )                                                                       # (V, K) diagonal prior variances
     mu_v_all = pb._decode_mu_table()                                        # (V, K) decode table (untied if set)
-    p = _family_with_precision_policy(
-        family_cls,
+    p = family_cls(
         mu_v_all,
         torch.diag_embed(p_sigma_all) if is_full else p_sigma_all,
-        pb.full_cov_kl_precision,
     )
     energy = functional(q, p, alpha=pb.renyi_order,
                         kl_max=float("inf"), eps=pb.eps)                    # (B, N, V)
@@ -2495,8 +2457,8 @@ def _decode_linear(
     The one authorized neural exception: a single learned (V, K) output weight applied to the
     converged mean, with NO KL geometry at the decode boundary (the decode temperature is discarded;
     only encode + the E-step remain gauge-aware). Realized as a raw nn.Parameter matmul, not an
-    nn.Linear module. With ``decode_bias`` a learned per-vocab log-unigram bias ``b`` (V,) is added
-    (see __init__). Prior-bank KL readout remains available through the non-linear modes; this is
+    nn.Linear module. A learned per-vocab log-unigram bias ``b`` (V,) is added (see __init__; a
+    bank without one, such as a bias-free baseline decoder, skips it). Prior-bank KL readout remains available through the non-linear modes; this is
     the opt-in ablation the user uses to compare with/without the prior-bank decode.
     """
     x = mu_q                                                           # bare converged mean

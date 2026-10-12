@@ -480,7 +480,7 @@ class BaselineConfig:
                              f"{values['gauge_group']!r}/{values['gauge_tying']!r}")
         derived: Dict[str, Any] = {name: values[name] for name in MATCHED_FIELDS}
         derived["mlp_expansion"] = int(values["block_mlp_expansion"])
-        derived["decode_bias"] = (bool(values["decode_bias"]) if values["decode_mode"] == "linear" else True)
+        derived["decode_bias"] = True                    # the VFE linear decoder always carries the bias
         # rope_mode, or the pos_rotation of a base saved before the 2026-10-12 merge.
         rope_active = values.get("rope_mode", "none") != "none" or values.get("pos_rotation") == "rope"
         derived["pos_rotation"] = "rope" if rope_active else "none"

@@ -92,7 +92,7 @@ def test_retired_laplace_family_does_not_construct() -> None:
 def test_full_gaussian_predictive_active_per_coordinate_alpha() -> None:
     model = VFEModel(_cfg(family="gaussian_full", attention_mode="projected_predictive",
                          lambda_alpha_mode="state_dependent_per_coord",
-                         mstep_self_coupling_weight=.2, full_cov_kl_precision="fp64"))
+                         mstep_self_coupling_weight=.2))
     ids, targets = _tokens()
     _, loss, _ = model(ids, targets)
     loss.backward()

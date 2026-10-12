@@ -196,14 +196,13 @@ def test_linear_chunked_ce_matches_dense_value_and_grads():
 
 
 def test_linear_chunked_ce_with_decode_bias():
-    # decode_bias=True: the learned per-vocab log-unigram bias must enter every chunk's logits
+    # The learned per-vocab log-unigram bias (always on the linear decoder) must enter every chunk's logits
     # and receive the same gradient as on the dense path.
     torch.manual_seed(7)
     V = 50
     tokens = torch.randint(0, V, (2, 6))
     targets = torch.randint(0, V, (2, 6))
-    m = _linear_model(vocab_size=V, decode_chunk_size=11,
-                      decode_bias=True)
+    m = _linear_model(vocab_size=V, decode_chunk_size=11)
     with torch.no_grad():
         m.prior_bank.output_proj_bias.normal_(std=0.3)     # nonzero so the bias is load-bearing
     mu, _ = _converged(m, tokens)
