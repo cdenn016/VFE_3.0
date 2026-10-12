@@ -388,7 +388,7 @@ def route_figure_skip_reasons(cfg: object) -> Dict[str, str]:
     if not has_estep_iterates(cfg):
         reason = (f"attention_mode={getattr(cfg, 'attention_mode', 'projected_predictive')!r}: "
                   "legacy shared-objective E-step probes do not apply")
-        for name in ("iterate_trajectory", "belief_trajectories", "estep_depth_sensitivity",
+        for name in ("iterate_trajectory", "belief_trajectories",
                      "estep_character", "estep_quality", "estep_grad_norm_decomposition",
                      "attention_estep"):
             reasons[name] = reason
@@ -2178,40 +2178,6 @@ def _unavailable_probe_figure(record: Mapping[str, object], path: Optional[str])
     return _save(fig, path)
 
 
-@register_figure("estep_depth_sensitivity")
-def plot_estep_depth_sensitivity(
-    record: Mapping[str, object],
-
-    *,
-    path:   Optional[str] = None,
-):
-    r"""Plot current-weight CE and free energy across enabled inference depths.
-
-    Raises :class:`FigureSkipped` with the recorded reason when the probe is unavailable (a single
-    configured readout has no depth sweep); the JSON record keeps the reason.
-    """
-    if record.get("available") is False:
-        raise FigureSkipped(str(record.get("reason", "inference-depth probe unavailable")))
-    points = list(record.get("points", []))
-    depths = np.asarray([point["depth"] for point in points], dtype=float)
-    ce = np.asarray([point["ce"] for point in points], dtype=float)
-    free_energy = np.asarray([point["free_energy_per_token"] for point in points], dtype=float)
-    fig, ax_ce = plt.subplots(figsize=(5.6, 3.6))
-    ax_f = ax_ce.twinx()
-    ax_ce.plot(depths, ce, "o-", color=_CB[0], label="CE")
-    ax_f.plot(depths, free_energy, "s--", color=_CB[1], label="E-step F/token")
-    trained_depth = float(record.get("trained_depth", np.nan))
-    if np.isfinite(trained_depth):
-        ax_ce.axvline(trained_depth, color="#555555", ls=":", lw=1.0, label="trained depth")
-    ax_ce.set(xlabel="E-step inference iterations", ylabel="CE (nats/token)")
-    ax_f.set_ylabel("free energy (nats/token)")
-    ax_ce.set_title("Current-weight inference-depth sensitivity")
-    lines = ax_ce.lines + ax_f.lines
-    ax_ce.legend(lines, [line.get_label() for line in lines], frameon=False, fontsize=8)
-    fig.tight_layout()
-    return _save(fig, path)
-
-
 @register_figure("estep_character")
 def plot_estep_character(
     record: Mapping[str, object],
@@ -2334,7 +2300,7 @@ def plot_phi_numerics_reference(
     *,
     path:   Optional[str] = None,
 ):
-    r"""Plot fp32/fp64 flat-closure references and BCH chart fidelity."""
+    r"""Plot fp32/fp64 flat-closure references and the group-product factor radii."""
     fig, axes = plt.subplots(1, 2, figsize=(9.0, 3.6))
     flatness = record.get("flatness", {})
     labels = ["holonomy", "cocycle", "inverse"]
@@ -2368,22 +2334,8 @@ def plot_phi_numerics_reference(
     axes[0].set(ylabel="relative numerical residual", title="Nominally flat closure")
     axes[0].legend(frameon=False, fontsize=8)
 
-    bch = record.get("bch_fidelity", {})
     right_chart = record.get("right_chart", {})
-    if bch:
-        bch_labels = ["median", "p95", "p99", "max"]
-        bch_values = [
-            float(bch.get("bch_relative_error_median", np.nan)),
-            float(bch.get("bch_relative_error_p95", np.nan)),
-            float(bch.get("bch_relative_error_p99", np.nan)),
-            float(bch.get("bch_relative_error_max", np.nan)),
-        ]
-        axes[1].bar(np.arange(len(bch_labels)), bch_values, color=_CB[3])
-        axes[1].set_xticks(np.arange(len(bch_labels)), bch_labels)
-        if any(np.isfinite(value) and value > 0.0 for value in bch_values):
-            axes[1].set_yscale("log")
-        axes[1].set(ylabel="relative group-product error", title="Truncated BCH fidelity")
-    elif right_chart:
+    if right_chart:
         left_chart = record.get("chart", {})
         factor_labels = ["left p95", "left max", "right p95", "right max"]
         factor_values = [
@@ -5147,16 +5099,12 @@ def plot_decode_readout(
 # B1 / EXP-3  --  Sigma_q as calibrated Fisher uncertainty
 # ===========================================================================
 
-def _spearman_np(x: np.ndarray, y: np.ndarray) -> float:
-    r"""Spearman rank correlation of two 1-D arrays (Pearson on ranks); 0.0 if degenerate."""
-    x, y = np.asarray(x, float).ravel(), np.asarray(y, float).ravel()
-    if x.size < 2:
-        return 0.0
-    rx = x.argsort().argsort().astype(float)
-    ry = y.argsort().argsort().astype(float)
-    rx -= rx.mean(); ry -= ry.mean()
-    den = float(np.linalg.norm(rx) * np.linalg.norm(ry))
-    return float((rx * ry).sum() / den) if den > 0 else 0.0
+def _spearman(x: np.ndarray, y: np.ndarray) -> float:
+    r"""The headline :func:`vfe3.metrics.spearman_rho` (average ranks, paired-finite mask) on arrays."""
+    import torch
+    from vfe3.metrics import spearman_rho
+    return spearman_rho(torch.as_tensor(np.asarray(x, float).ravel()),
+                        torch.as_tensor(np.asarray(y, float).ravel()))
 
 
 @register_figure("reliability_diagram")
@@ -5259,7 +5207,7 @@ def plot_sigma_stratified_error(
             his.append(float(np.percentile(boot, 90)))
         ax.plot(xs, ms, "o-", color=_CB[0], lw=1.8, label=f"mean CE per {labels['bin']} decile")
         ax.fill_between(xs, los, his, color=_CB[0], alpha=0.2, label="bootstrap 10-90 band")
-        rho = _spearman_np(tr, ce)
+        rho = _spearman(tr, ce)
         ax.set_title(rf"{title} (Spearman $\rho$ = {rho:+.3f})")
     else:
         ax.set_title(f"{title} (insufficient tokens)")
@@ -5308,7 +5256,7 @@ def plot_sigma_ce_scatter(
             fig.colorbar(hb, ax=ax, fraction=0.046, pad=0.02, label="tokens (log)")
             if not positive:
                 ax.xaxis.set_major_formatter(FuncFormatter(_count_label))
-        rho = _spearman_np(tr, ce) if tr.size >= 2 else float("nan")
+        rho = _spearman(tr, ce)
         ax.set(xlabel=labels["axis"],
                ylabel=("next-token cross-entropy (nats)" if frozen_covariance
                        else "cross-entropy (nats)"))

@@ -145,16 +145,19 @@ def vfe_block(
             capture=capture, hidden_bias=hidden_bias,
             readout=lambda pushed: _head_block_readout(pushed, out.sigma, group, cfg),
             push_norm=push_norm, covariance_floor=cfg.block_mlp_covariance_floor, mlp_autocast=mlp_autocast)
-    norm_linearization = norm_radial = None
+    norm_linearization = norm_radial = norm_cap = None
     if block_norm is not None:               # cached parameter-free norm (audit 2d/4f)
         if mlp_delta_full:
             # The norm maps the mean only; the delta_full pushforward composes its Jacobian at the pre-norm
             # mean, J = J_mlp J_LN, against the pre-norm covariance (audit 2026-10-09, variational), with the
             # floor in post-norm units through the norm's scale D = diag(gamma)/s (round 2, #13) and the norm's
             # radial second-order variance carried through J_mlp (2026-10-10 round 2, #11).
-            from vfe3.model.block_mlp import block_norm_linearization, block_norm_radial_term
+            from vfe3.model.block_mlp import block_norm_linearization, block_norm_radial_term, block_norm_trace_cap
             norm_linearization = block_norm_linearization(block_norm, out.mu)   # (B, N, K, K), (B, N, K)
             norm_radial = block_norm_radial_term(block_norm, out.mu, out.sigma)  # (B, N, 1), (B, N, K)
+            # The composite is linear in the norm-stage covariance, so the norm's sphere-bound cap scales it
+            # (audit 2026-10-12, item 1).
+            norm_cap = block_norm_trace_cap(block_norm, out.mu, out.sigma, cfg.block_mlp_covariance_floor)   # (B, N, 1)
         out = _apply_block_norm(out, block_norm, group, cfg, push_covariance=push_norm)
     if capture is not None:
         capture["block_mlp_input"] = out     # exact immediate seam after CG/norm
@@ -166,6 +169,7 @@ def vfe_block(
                 extra["input_jacobian"] = norm_linearization.jacobian
                 extra["input_scale"] = norm_linearization.scale
                 extra["input_radial"] = norm_radial
+                extra["input_cap"] = norm_cap
             if capture is not None and "block_mlp_em_rows" in capture:   # block_mlp_em_weight > 0 only
                 extra["em_rows"] = capture["block_mlp_em_rows"]
             with context:
@@ -328,7 +332,7 @@ def _reference_coordinate_block(
     """
     from vfe3.model.block_mlp import (GaussianTemplateBlockMLP, PrototypeAgentBlockMLP,
                                       block_norm_covariance_pushforward, block_norm_linearization,
-                                      block_norm_radial_term)
+                                      block_norm_radial_term, block_norm_trace_cap)
     from vfe3.model.frame_actions import (frame_matvec, local_covariance, reference_covariance,
                                           reference_covariance_compact, reference_variances)
 
@@ -343,12 +347,13 @@ def _reference_coordinate_block(
     delta_full = getattr(block_mlp, "covariance_contract", None) == "delta_full"
     push = push_norm and block_norm is not None and not delta_full
     sigma = out.sigma
-    linearization = radial = C = None
+    linearization = radial = cap = C = None
     if push or delta_full:
         C = reference_covariance(out.mu, out.sigma, frame)                   # (B, N, K, K) invariant C
         if delta_full and block_norm is not None:
             linearization = block_norm_linearization(block_norm, xi)         # at the pre-norm xi
             radial = block_norm_radial_term(block_norm, xi, C)
+            cap = block_norm_trace_cap(block_norm, xi, C, covariance_floor)   # the norm's sphere-bound scale
         if push:                                                             # Sigma' = U C' U^T, C' at the pre-norm xi
             pushed = block_norm_covariance_pushforward(block_norm, xi, C, covariance_floor)
             sigma = readout(local_covariance(out.mu, pushed, frame, diagonal=False).to(out.sigma.dtype))
@@ -366,7 +371,7 @@ def _reference_coordinate_block(
             extra = {} if hidden_bias is None else {"hidden_bias": hidden_bias}
             if linearization is not None:
                 extra.update(input_jacobian=linearization.jacobian, input_scale=linearization.scale,
-                             input_radial=radial)
+                             input_radial=radial, input_cap=cap)
             if capture is not None and "block_mlp_em_rows" in capture:   # block_mlp_em_weight > 0 only
                 extra["em_rows"] = capture["block_mlp_em_rows"]      # the templates read (xi, diag C)
             with context:

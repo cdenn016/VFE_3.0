@@ -196,8 +196,8 @@ def aggregate_seed_metric(
 ) -> Dict[str, Any]:
     r"""Scan ``run_root`` for per-seed ``filename``, gather ``key``, return the across-seed summary.
 
-    Returns ``{n, mean, sd, two_sd, cv, values, seeds}`` with the UNBIASED (ddof=1) SD; ``sd``/``cv``
-    are NaN for n<2. ``seeds`` reads :func:`_seed_for` (provenance.json -> config.json -> dir name).
+    Returns ``{n, mean, sd, noise_floor, cv, values, seeds}`` with the UNBIASED (ddof=1) SD and the
+    :func:`single_seed_noise_floor`; ``sd``/``noise_floor``/``cv`` are NaN for n<2. ``seeds`` reads :func:`_seed_for` (provenance.json -> config.json -> dir name).
     Non-finite or unreadable points are skipped (never crash the aggregation).
     """
     root = Path(run_root)
@@ -209,16 +209,33 @@ def aggregate_seed_metric(
     )
 
 
+def single_seed_noise_floor(sd: float, n_sd_seeds: int) -> float:
+    r"""Half-width of the 95% band for the difference of two single-seed runs.
+
+    .. math::
+        t_{n-1, 0.975} \sqrt{2} s,
+
+    with :math:`s` the across-seed SD estimated from :math:`n` seeds. NaN for :math:`n < 2` or a
+    non-finite :math:`s`. :func:`flag_noise_dominated` applies this floor.
+    """
+    if n_sd_seeds < 2 or not math.isfinite(sd):
+        return math.nan
+    from scipy.stats import t as t_dist
+    return float(t_dist.ppf(0.975, n_sd_seeds - 1)) * math.sqrt(2.0) * sd
+
+
 def _summarize(values: List[float]) -> Dict[str, Any]:
-    r"""Across-seed ``{n, mean, sd, two_sd, cv, values}`` with the UNBIASED (ddof=1) SD (NaN for n<2)."""
+    r"""Across-seed ``{n, mean, sd, noise_floor, cv, values}`` with the UNBIASED (ddof=1) SD and the
+    :func:`single_seed_noise_floor` (both NaN for n<2)."""
     n = len(values)
     if n == 0:
-        return {"n": 0, "mean": math.nan, "sd": math.nan, "two_sd": math.nan,
+        return {"n": 0, "mean": math.nan, "sd": math.nan, "noise_floor": math.nan,
                 "cv": math.nan, "values": []}
     mean = sum(values) / n
     sd = math.sqrt(sum((v - mean) ** 2 for v in values) / (n - 1)) if n >= 2 else math.nan
     cv = (sd / abs(mean)) if (n >= 2 and mean != 0.0) else math.nan
-    return {"n": n, "mean": mean, "sd": sd, "two_sd": 2.0 * sd, "cv": cv, "values": values}
+    return {"n": n, "mean": mean, "sd": sd, "noise_floor": single_seed_noise_floor(sd, n),
+            "cv": cv, "values": values}
 
 
 def _resolve_run_root(
@@ -923,8 +940,7 @@ def flag_noise_dominated(
         raise ValueError("flag_noise_dominated needs a finite single-seed baseline value")
     if type(n_sd_seeds) is not int or n_sd_seeds < 2:
         raise ValueError("flag_noise_dominated needs n_sd_seeds >= 2 (the seeds behind sd)")
-    from scipy.stats import t as t_dist
-    half_width = float(t_dist.ppf(0.975, n_sd_seeds - 1)) * math.sqrt(2.0) * sd
+    half_width = single_seed_noise_floor(sd, n_sd_seeds)
     return [lab for lab, v in finite.items() if abs(v - float(baseline)) < half_width]
 
 
@@ -953,8 +969,6 @@ SCALAR_KEYS: List[str] = [
     "test_ppl", "best_val_ppl", "test_ce", "test_bits_per_token", "test_bpc",
     "test_best_ce", "test_best_ppl", "test_best_step",
     "train_sample_ce_final", "train_sample_ce_best",
-    "diagnostics.zero_e_steps_counterfactual.counterfactual_ce",
-    "diagnostics.zero_e_steps_counterfactual.ce_delta_vs_headline",
     "wall_time_s", "ece", "overall_ce", "sigma_trace_cv", "sigma_ce_spearman",
     "fd_gradient_worst_rel_error",
     "corpus_freq_strata_ce.rare", "corpus_freq_strata_ce.mid", "corpus_freq_strata_ce.frequent",
@@ -986,12 +1000,11 @@ CURVE_SPECS: List[tuple] = [
 
 # Scalars on a positive ratio scale (losses, perplexities, bits, wall time), the only ones whose
 # coefficient of variation SD/|mean| is a seed-stability measure. Signed or near-zero quantities
-# (a CE delta, a correlation, a gradient-check error, a step index, ECE) keep their SD on their own
+# (a correlation, a gradient-check error, a step index, ECE) keep their SD on their own
 # scale but get no CV and are left out of the seed-stability ranking.
 CV_RATIO_SCALE_KEYS = frozenset({
     "test_ppl", "best_val_ppl", "test_ce", "test_bits_per_token", "test_bpc",
     "test_best_ce", "test_best_ppl", "train_sample_ce_final", "train_sample_ce_best",
-    "diagnostics.zero_e_steps_counterfactual.counterfactual_ce",
     "wall_time_s", "overall_ce",
     "corpus_freq_strata_ce.rare", "corpus_freq_strata_ce.mid", "corpus_freq_strata_ce.frequent",
 })
@@ -1086,10 +1099,10 @@ def _final_finite(d: Dict[str, np.ndarray]) -> Dict[str, Any]:
 def _write_csv(path: Path, scalars: Dict[str, Any]) -> None:
     with open(path, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
-        w.writerow(["metric", "n", "mean", "sd", "two_sd", "cv"])
+        w.writerow(["metric", "n", "mean", "sd", "noise_floor", "cv"])
         for k, v in scalars.items():
             row = [k, v["n"]]
-            for key in ("mean", "sd", "two_sd", "cv"):
+            for key in ("mean", "sd", "noise_floor", "cv"):
                 x = v[key]
                 row.append("" if not (isinstance(x, (int, float)) and math.isfinite(x)) else x)
             w.writerow(row)
@@ -1108,12 +1121,14 @@ def _write_md(path: Path, root: Path, seeds, scalars, per_layer, *,
                      f"fingerprint=`{(ident['git_dirty_fingerprint'] or '-')[:12]}`")
         L.append("")
     L += ["## Headline scalars (across-seed)", "",
-          "| metric | n | mean | SD (ddof=1) | 2*SD | CV% |",
+          "| metric | n | mean | SD (ddof=1) | noise floor, t(n-1, 0.975)*sqrt(2)*SD | CV% |",
           "|---|---|---|---|---|---|"]
     for k, v in scalars.items():
         cvpct = 100 * v["cv"] if math.isfinite(v["cv"]) else float("nan")
         L.append(f"| {k} | {v['n']} | {_fnum(v['mean'])} | {_fnum(v['sd'])} | "
-                 f"{_fnum(v['two_sd'])} | {_fnum(cvpct, '.3f')} |")
+                 f"{_fnum(v['noise_floor'])} | {_fnum(cvpct, '.3f')} |")
+    L += ["", "The noise floor is the 95% half-width for the difference of two single-seed runs; "
+          "a single-seed ablation difference below it is within seed noise."]
     finite = {k: v for k, v in scalars.items() if math.isfinite(v["cv"])}
     if finite:
         most = min(finite.items(), key=lambda kv: kv[1]["cv"])
@@ -1123,7 +1138,7 @@ def _write_md(path: Path, root: Path, seeds, scalars, per_layer, *,
             t = scalars["test_ppl"]
             vals = [round(x, 3) for x in t["values"]]
             L.append(f"- test PPL = {_fnum(t['mean'], '.3f')} +/- {_fnum(t['sd'], '.3f')} "
-                     f"(2*SD = {_fnum(t['two_sd'], '.3f')}); per-seed {vals}.")
+                     f"(single-seed noise floor = {_fnum(t['noise_floor'], '.3f')}); per-seed {vals}.")
         L.append(f"- Most seed-stable ratio-scale metric: `{most[0]}` (CV {100 * most[1]['cv']:.3f}%).")
         L.append(f"- Least seed-stable ratio-scale metric: `{least[0]}` "
                  f"(CV {100 * least[1]['cv']:.3f}%). Signed or near-zero metrics carry no CV; "
@@ -1264,12 +1279,12 @@ def main() -> int:
             key: _ratio_scale_cv(key, aggregate) for key, aggregate in scalar_candidates.items()
             if aggregate["n"] > 0 and aggregate["complete"]
         }
-        print(f"{'metric':<28}{'n':>3}{'mean':>14}{'sd':>13}{'2sd':>12}{'cv%':>9}")
+        print(f"{'metric':<28}{'n':>3}{'mean':>14}{'sd':>13}{'floor':>12}{'cv%':>9}")
         print("-" * 79)
         for key, aggregate in scalars.items():
             cvpct = 100 * aggregate["cv"] if math.isfinite(aggregate["cv"]) else float("nan")
             print(f"{key:<28}{aggregate['n']:>3}{aggregate['mean']:>14.4f}"
-                  f"{_fnum(aggregate['sd']):>13}{_fnum(aggregate['two_sd']):>12}"
+                  f"{_fnum(aggregate['sd']):>13}{_fnum(aggregate['noise_floor']):>12}"
                   f"{_fnum(cvpct, '.3f'):>9}")
         if not per_layer_complete:
             print("optional per-layer diagnostics are incomplete; that channel is withheld")

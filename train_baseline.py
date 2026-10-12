@@ -15,7 +15,8 @@ weights), ``resources.json`` (per-type tables against context-processing paramet
 ``provenance.json``, ``best_model.pt``, ``final_model.pt`` and checkpoints, in
 ``<OUT_ROOT>/<timestamp>_<label>/``, renamed ``<test_ppl>_<label>/`` after finalize. The loaders are
 built with the exact arguments of ``train_vfe3._select_loader``; ``DATA_SEED=None`` sets the data
-order seed to the model seed.
+order seed to the model seed. :func:`check_base_data` refuses a launch whose dataset, tokenizer, data
+seed or token cap differs from what the base run recorded.
 
 Three optional stages precede the seeded runs:
 
@@ -133,6 +134,59 @@ def load_base_config(base: str) -> Any:
         logging.getLogger("train_baseline").info(
             "base %s: dropped retired config fields %s", path.name, sorted(dropped))
     return cfg
+
+
+def check_base_data(
+    base:       str,
+
+    *,
+    dataset:    str,
+    seeds:      Sequence[int],
+    data_seed:  Optional[int],
+    max_tokens: Optional[int],
+    logger:     Optional[logging.Logger] = None,
+) -> None:
+    r"""Refuse a launch whose data differs from the base run's (audit 2026-10-12 #5).
+
+    ``dataset`` is compared with the base ``config.json`` ``"dataset"``; its cache tokenizer tag,
+    ``max_tokens`` and each seed's data-order seed with the base ``provenance.json`` ``"tokenizer_tag"``,
+    ``"max_tokens"`` and ``"data_seed"``. The data-order seed is resolved as :func:`run_baseline` resolves
+    it (``data_seed``, or the model seed when None). ``data_seed=None`` also matches a base whose recorded
+    data seed equals its model seed, the same model-seed rule applied per seed. A field the base did not
+    record is logged as unchecked; any recorded disagreement raises ``ValueError``.
+    """
+    logger = logger or logging.getLogger("train_baseline")
+    path = Path(BASE_PRESETS.get(base, base))
+    record = json.loads((path / "config.json").read_text(encoding="utf-8"))
+    prov_path = path / "provenance.json"
+    prov: Dict[str, Any] = (json.loads(prov_path.read_text(encoding="utf-8")) if prov_path.is_file() else {})
+    mismatches = []
+    unchecked = []
+    if record.get("dataset") is None:
+        unchecked.append("dataset")
+    elif record["dataset"] != dataset:
+        mismatches.append(f"dataset {dataset!r} != base {record['dataset']!r}")
+    if prov.get("tokenizer_tag") is None:
+        unchecked.append("tokenizer_tag")
+    elif prov["tokenizer_tag"] != _tokenizer_tag(dataset):
+        mismatches.append(f"tokenizer {_tokenizer_tag(dataset)!r} != base {prov['tokenizer_tag']!r}")
+    if "max_tokens" not in prov:
+        unchecked.append("max_tokens")
+    elif prov["max_tokens"] != max_tokens:
+        mismatches.append(f"max_tokens {max_tokens!r} != base {prov['max_tokens']!r}")
+    base_data_seed = prov.get("data_seed")
+    if base_data_seed is None:
+        unchecked.append("data_seed")
+    else:
+        follows_model_seed = data_seed is None and base_data_seed == prov.get("seed")
+        for seed in seeds:
+            resolved = int(seed) if data_seed is None else int(data_seed)
+            if resolved != base_data_seed and not follows_model_seed:
+                mismatches.append(f"seed {seed}: data seed {resolved} != base {base_data_seed}")
+    if mismatches:
+        raise ValueError(f"base {path}: the baseline data differ from the base run's: " + "; ".join(mismatches))
+    if unchecked:
+        logger.warning("base %s records no %s; those data settings are unchecked", path.name, unchecked)
 
 
 def _select_loader(
@@ -401,6 +455,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     logger = logging.getLogger("train_baseline")
     base = load_base_config(BASE)
+    check_base_data(BASE, dataset=DATASET, seeds=SEEDS, data_seed=DATA_SEED, max_tokens=MAX_TOKENS, logger=logger)
     fallback = {} if getattr(base, "pos_rotation", "none") == "rope" else dict(POSITION_FALLBACK)
     cfg = BaselineConfig.matched_to(base, per_type_table=PER_TYPE_TABLE, **{**fallback, **OVERRIDES})
     logger.info("baseline position: prior=%s, pos_rotation=%s (rope_base %g)",

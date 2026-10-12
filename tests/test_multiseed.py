@@ -31,7 +31,7 @@ def test_aggregate_seed_metric_mean_sd_and_seeds(tmp_path):
     assert out["n"] == 5
     assert abs(out["mean"] - 11.0) < 1e-9
     assert abs(out["sd"] - math.sqrt(2.5)) < 1e-9
-    assert abs(out["two_sd"] - 2.0 * math.sqrt(2.5)) < 1e-9
+    assert abs(out["noise_floor"] - 2.7764451051977987 * math.sqrt(2.0) * math.sqrt(2.5)) < 1e-9   # t_{4, 0.975}
     assert abs(out["cv"] - math.sqrt(2.5) / 11.0) < 1e-9
     assert sorted(out["seeds"]) == [0, 1, 2, 3, 4]
 

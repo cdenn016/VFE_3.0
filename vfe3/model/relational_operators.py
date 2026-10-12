@@ -812,6 +812,26 @@ class RelationalOperators(nn.Module):
             C = inverse @ local @ inverse.transpose(-1, -2)                                # (..., N, K, K)
         return 0.5 * (C + C.transpose(-1, -2))
 
+    def floor_term(
+        self,
+        floor_anchor: Optional[torch.Tensor],      # the local prior covariance Sigma_p, sigma's layout (broadcastable)
+        sigma:        torch.Tensor,                # (..., N, K) or (..., N, K, K) the covariance being floored
+    ) -> torch.Tensor:                             # sigma's shape and dtype: f Sigma_p
+        r"""The prior-anchored covariance floor :math:`f\,\Sigma_{p,i}` of the moment-matched readouts.
+
+        :math:`\Sigma_{p,i}` is the prior covariance of token :math:`i` in local coordinates (the layer's prior, which is
+        the embedding prior under ``prior_handoff_sigma=0``). It involves no frame, so the floored covariance is exactly
+        invariant under a common reference change :math:`U_i \to U_ia` for every :math:`a`, covariant under a site action
+        that also acts on the prior, and the same in every covariance family. It replaces the floor
+        :math:`f\,\tfrac{\operatorname{tr}C_i}{K}U_iU_i^\top`, which changed under a non-orthogonal :math:`a` because
+        :math:`\operatorname{tr}(a^{-1}Ca^{-\top}) \ne \operatorname{tr}C` (audit 2026-10-12, item 4 and T5). It does not
+        compound with depth: every layer's output is at least :math:`f\,\Sigma_{p,i}` whatever the input was.
+        """
+        if floor_anchor is None:
+            raise ValueError("the moment-matched covariance needs floor_anchor, the local prior covariance Sigma_p of "
+                             "each token (the covariance floor is f * Sigma_p)")
+        return torch.broadcast_to(self.predictive_covariance_floor * floor_anchor.to(sigma.dtype), sigma.shape)
+
     def minimal_agent_update(
         self,
         mu:        torch.Tensor,                    # (..., N, K) local means
@@ -821,6 +841,7 @@ class RelationalOperators(nn.Module):
         *,
         return_covariance: bool = False,
         capture:   Optional[dict] = None,           # out-param: router, costs and minimal-agent diagnostics
+        floor_anchor: Optional[torch.Tensor] = None,   # return_covariance: local prior covariance Sigma_p
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:  # local (mu_plus, sigma_plus or None), input layout
         r"""Minimal-agent posterior of every receiver in local coordinates (:mod:`vfe3.model.minimal_agent`).
 
@@ -830,13 +851,13 @@ class RelationalOperators(nn.Module):
 
         .. math::
             \mu_i^+ = U_i\xi_i^+,\qquad
-            \Sigma_i^+ = \Sigma_i - \sum_hZ_i^hM_i^hZ_i^{h\top} + f\,\tfrac{\operatorname{tr}C_i}{K}U_iU_i^\top,
+            \Sigma_i^+ = \Sigma_i - \sum_hZ_i^hM_i^hZ_i^{h\top} + f\,\Sigma_{p,i},
             \qquad Z_i^h = U_i\mathsf K_i^h,
 
         the posterior mean (no residual is added: the residual is the precision-weighted part of the gain update)
-        and, with ``return_covariance``, the posterior covariance plus the covariant floor
-        :math:`f = ` ``predictive_covariance_floor`` (tr of the input :math:`C_i`), in the input layout (a diagonal
-        input returns the diagonal). ``predictive_covariance='passthrough'`` is applied by the caller, which keeps
+        and, with ``return_covariance``, the posterior covariance plus the prior-anchored floor
+        :math:`f\,\Sigma_{p,i}` (:meth:`floor_term`; :math:`f = ` ``predictive_covariance_floor``, :math:`\Sigma_{p,i} = `
+        ``floor_anchor``), in the input layout (a diagonal input returns the diagonal). ``predictive_covariance='passthrough'`` is applied by the caller, which keeps
         the incoming covariance and does not request it; the mean uses :math:`C_i` in its gain either way. Under
         ``predictive_covariance_checkpoint`` the whole readout is a non-reentrant checkpoint (it draws no random
         numbers), so values and gradients equal the plain call. ``capture`` receives ``beta_pre`` (the labels each
@@ -865,8 +886,9 @@ class RelationalOperators(nn.Module):
         # escalated call then adds only the rest of its entries below, so no entry is counted twice.
         before = (source_recovery_counter(mu.device) if dtype != torch.float64
                   and self.minimal_agent_inference == "mean_field" and projected_condition_recovery() else None)
+        floor = self.floor_term(floor_anchor, sigma) if return_covariance else None
         mu_plus, sigma_plus, record, status = self._minimal_agent_call(
-            mu, sigma, frame, log_prior, return_covariance, capture is not None)
+            mu, sigma, frame, log_prior, return_covariance, capture is not None, floor)
         failed, ill_conditioned = status.tolist()                       # the one host check of a healthy call
         if failed and dtype == torch.float64:
             raise ValueError(minimal_agent.readout_failure_message(dtype))
@@ -876,7 +898,7 @@ class RelationalOperators(nn.Module):
             # against the float64 residual tolerance).
             mu_plus, sigma_plus, record, status = self._minimal_agent_call(
                 mu.double(), sigma.double(), frame, None if log_prior is None else log_prior.double(),
-                return_covariance, capture is not None)
+                return_covariance, capture is not None, None if floor is None else floor.double())
             if bool(status[0]):
                 raise ValueError(minimal_agent.readout_failure_message(torch.float64)
                                  + "; the float32 call failed first and was recomputed in float64")
@@ -911,6 +933,7 @@ class RelationalOperators(nn.Module):
         log_prior:         Optional[torch.Tensor],
         return_covariance: bool,
         diagnostics:       bool,
+        floor:             Optional[torch.Tensor],  # sigma's layout: f Sigma_p (return_covariance only)
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], dict, torch.Tensor]:
         r"""Body of :meth:`minimal_agent_update`: autocast off, IEEE fp32 GEMMs, float64 under an escalated frame.
 
@@ -933,11 +956,8 @@ class RelationalOperators(nn.Module):
             mu_plus = frame_matvec(forward, result.xi, frame.block_diagonal)              # (..., N, K) U_i xi_i^+
             sigma_plus = None
             if return_covariance:
-                trace = (torch.diagonal(C, dim1=-2, dim2=-1).sum(dim=(-2, -1)) if C.dim() == mu.dim() + 2
-                         else torch.diagonal(C, dim1=-2, dim2=-1).sum(dim=-1))           # (..., N) tr C_i
                 sigma_plus = minimal_agent.local_posterior_covariance(
-                    sigma.to(dtype), forward, frame.block_diagonal, result.gains, result.M,
-                    self.predictive_covariance_floor * trace / K)
+                    sigma.to(dtype), forward, frame.block_diagonal, result.gains, result.M, floor.to(dtype))
         record: dict = {}
         if diagnostics:
             with torch.no_grad():
@@ -995,6 +1015,7 @@ class RelationalOperators(nn.Module):
         receive: Optional[torch.Tensor] = None,   # (H, K, d) precomputed O'_h; None evaluates the chart
         *,
         edges: Optional[EdgeContext] = None,      # content_link_edges: the layer's edge context (built when None)
+        floor_anchor: Optional[torch.Tensor] = None,   # the local prior covariance Sigma_p (required)
     ) -> torch.Tensor:        # same layout as sigma: the moment-matched covariance Sigma_i^+
         r"""Moment-matched covariance of the predictive kernel (GL(K) v2, Theorem thm:probabilistic_status (2)).
 
@@ -1003,22 +1024,16 @@ class RelationalOperators(nn.Module):
         ``attention_residual`` and 0 otherwise, the covariance in reference coordinates is
 
         .. math::
-            C_i^{\mathrm{att}} = \widetilde Q_i
-              + r\Bigl[C_i + \sum_h \beta_{ii}^h (M_h C_i + C_i M_h^\top)\Bigr]
+            C_i^{\mathrm{att}} = r\Bigl[C_i + \sum_h \beta_{ii}^h (M_h C_i + C_i M_h^\top)\Bigr]
               + \sum_j \sum_{h,h'} c_{ij}^{hh'} M_h C_j M_{h'}^\top
               + \sum_h \Bigl[\sum_j \beta_{ij}^h n_{ij}^h n_{ij}^{h\top} - \bar n_i^h \bar n_i^{h\top}\Bigr],
 
         with M_h = O_h T_h, C_j = U_j^{-1} Sigma_j U_j^{-T}, c^{hh} = beta^h, c^{hh'} = beta^h beta^{h'}
-        (h != h'), n_ij^h = M_h xi_j, and the reference floor Q~_i = floor * (tr C_i / K) I, which is
-        covariant (local Q_i = floor * (tr C_i / K) U_i U_i^T, with tr C_i frame-invariant).
-        The result is Sigma_i^+ = U_i C_i^att U_i^T in the frame the mean content uses. A diagonal
-        input returns diag(Sigma_i^+), the KL(p || q) moment projection onto the diagonal family.
-        Only diag(U_i Q~_i U_i^T) survives that projection, so on the diagonal family the floor is not
-        covariant (audit 2026-10-10 round 2, item 39): with D_h = diag(U_h U_h^T) for the head block U_h of
-        U_i, the reference covariance read back in the same frame, U_i^{-1} diag(Sigma_i^+) U_i^{-T}, satisfies
-        only lambda_min >= floor * (tr C_i / K) / max_h ||D_h^{-1/2} U_h||_2^2. Every row of D_h^{-1/2} U_h
-        has unit norm, so 1 <= ||D_h^{-1/2} U_h||_2^2 <= d_h: the guarantee is up to d_h times weaker than the
-        bound floor * (tr C_i / K) of the full family, and equal to it when the rows of U_h are orthogonal.
+        (h != h'), n_ij^h = M_h xi_j. The result is Sigma_i^+ = U_i C_i^att U_i^T + f Sigma_{p,i} in the frame the
+        mean content uses, with the kernel noise Q_i = f Sigma_{p,i} the prior-anchored floor in local coordinates
+        (:meth:`floor_term`, ``floor_anchor``; audit 2026-10-12 T5): frame-free, so it is exactly reference-invariant and
+        holds as Sigma_i^+ >= f Sigma_{p,i} in every family. A diagonal input returns diag(U_i C_i^att U_i^T) +
+        f diag(Sigma_{p,i}), the KL(p || q) moment projection onto the diagonal family.
         Head-space pooling keeps the cost at an attention with d x d values per head pair.
         Under ``predictive_covariance_checkpoint`` the update is recomputed in backward (non-reentrant
         checkpoint; the update draws no random numbers), so values and gradients are unchanged.
@@ -1028,22 +1043,25 @@ class RelationalOperators(nn.Module):
         .. math::
             C_i^{\mathrm{att}} = g_iF\Bigl(\hat P_i + \sum_hR_h\tilde\Sigma_i^hR_h^\top
               + A_iX_i + X_i^\top A_i^\top + A_iY_iA_i^\top\Bigr)F^\top g_i^\top
-              + r\bigl[C_i + \mathrm{cross}_i + \mathrm{cross}_i^\top\bigr] + \tilde Q_i,
+              + r\bigl[C_i + \mathrm{cross}_i + \mathrm{cross}_i^\top\bigr],
             \qquad \mathrm{cross}_i = \sum_h\beta_{ii}^h\,g_iF(I + A_i\Phi_{ii}B_i^\top)\Pi_hC_i,
 
         with :math:`X_i, Y_i` of :func:`vfe3.model.edge_links.edge_covariance_factors`; the edge context is
         computed outside the checkpointed region and enters it as an input.
         """
         self._require_kernel_readout("predictive_covariance_update")
+        floor = self.floor_term(floor_anchor, sigma)
         if edges is None and self.content_link_edges != "off":
             edges = self.edge_context(mu, beta, frame, receive, sigma=sigma)
         if edges is not None:
             receive = edge_links.receive_heads(edges, len(self.irrep_dims))
         extra = () if edges is None else (edges,)
         if self.predictive_covariance_checkpoint and torch.is_grad_enabled():
-            return checkpoint(self._predictive_covariance_update, mu, sigma, beta, frame, receive, *extra,
-                              use_reentrant=False, preserve_rng_state=False)
-        return self._predictive_covariance_update(mu, sigma, beta, frame, receive, *extra)
+            kernel = checkpoint(self._predictive_covariance_update, mu, sigma, beta, frame, receive, *extra,
+                                use_reentrant=False, preserve_rng_state=False)
+        else:
+            kernel = self._predictive_covariance_update(mu, sigma, beta, frame, receive, *extra)
+        return kernel + floor                                       # f Sigma_p in local coordinates (floor_term)
 
     @ieee_fp32_matmul()
     def _predictive_covariance_update(
@@ -1099,11 +1117,12 @@ class RelationalOperators(nn.Module):
 
         .. math::
             [C_i^{\mathrm{att}}]_{ll} = \sum_{h,g} O_h^{(l)} P_{i,hg} O_g^{(l)\top}
-              + r\bigl[C_{i,l} + X_{i,l} + X_{i,l}^\top\bigr] + \tilde q_i I_d,
+              + r\bigl[C_{i,l} + X_{i,l} + X_{i,l}^\top\bigr],
             \qquad X_{i,l} = \sum_h \beta_{ii}^h O_h^{(l)} T_h^{(l)} C_{i,l},
 
         with :math:`P_{i,hg}` the head-pair pooled covariance of
-        :meth:`_predictive_covariance_update_dense` and :math:`\tilde q_i = f\,\mathrm{tr}(C_i)/K`. It is the
+        :meth:`_predictive_covariance_update_dense` (the floor :math:`f\,\Sigma_{p,i}` is added in local coordinates by
+        :meth:`predictive_covariance_update`). It is the
         dense update reassociated, equal up to rounding, at about :math:`2K^3 + NK^2` multiply-adds per
         token instead of about :math:`9.5K^3 + NK^2`, with no :math:`K \times K` intermediate.
 
@@ -1184,15 +1203,11 @@ class RelationalOperators(nn.Module):
                 if edges is not None:                                                  # blocks of sum_h beta_ii M_h^{ii} C_i
                     cross = edge_links.edge_residual_cross_blocks(edges, A_hat, self_weight, TC, cross)
                 C_att = C_att + C + cross + cross.transpose(-1, -2)
-            scale = torch.diagonal(C, dim1=-2, dim2=-1).flatten(-2).mean(dim=-1)      # (..., N) tr(C_i)/K
-            C_att = C_att + (self.predictive_covariance_floor * scale)[..., None, None, None] * torch.eye(
-                d, dtype=dtype, device=mu.device)
             if block:
                 blocks = forward @ C_att @ forward.transpose(-1, -2)                   # (..., N, H, d, d) U_l [C_att]_ll U_l^T
                 blocks = 0.5 * (blocks + blocks.transpose(-1, -2))
                 result = torch.einsum("...hab,hg->...hagb", blocks, eye_h).reshape(*sigma.shape)   # (..., N, K, K)
                 return result.to(sigma.dtype)
-            # Only diag(U C U^T) is kept, so the floor's guarantee is the weaker diagonal-family bound of the docstring.
             result = ((forward @ C_att) * forward).sum(dim=-1)                         # (..., N, H, d) diag(U C U^T)
         return result.flatten(-2).to(sigma.dtype)
 
@@ -1276,12 +1291,6 @@ class RelationalOperators(nn.Module):
                     cross = edge_links.outer_gauge_left(edges, cross + edge_links.edge_residual_cross_dense(
                         edges, A_hat, self_weight, TC_runs[0]))
                 C_att = C_att + C + cross + cross.transpose(-1, -2)
-            # Isotropic reference floor scaled by the invariant tr(C_i)/K: a relative floor
-            # floor * C_i compounds as floor**depth along a residual-free stack and loses float32
-            # definiteness; this one keeps cond(C_att) bounded by the content spread over floor.
-            scale = torch.diagonal(C, dim1=-2, dim2=-1).mean(dim=-1)              # (..., N) tr(C_i)/K
-            C_att = C_att + (self.predictive_covariance_floor * scale)[..., None, None] * torch.eye(
-                K, dtype=dtype, device=mu.device)
             result = forward @ C_att @ forward.transpose(-1, -2)
             result = 0.5 * (result + result.transpose(-1, -2))
             if diagonal:

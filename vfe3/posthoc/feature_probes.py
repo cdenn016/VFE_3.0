@@ -81,7 +81,10 @@ def minimal_agent_gap(
                 for mode in ("exact", "mean_field"):
                     _ops.minimal_agent_inference = mode
                     capture: dict = {}
-                    mean, cov = _original(mu, sigma, frame, log_prior, return_covariance=True, capture=capture)
+                    # The layer prior when the caller passed it (moment_matched), else the input covariance: the
+                    # floor f Sigma_p is common to both modes and does not enter the mean.
+                    mean, cov = _original(mu, sigma, frame, log_prior, return_covariance=True, capture=capture,
+                                          floor_anchor=kwargs.get("floor_anchor", sigma))
                     outputs[mode] = (mean, cov, capture)
             finally:
                 _ops.minimal_agent_inference = configured

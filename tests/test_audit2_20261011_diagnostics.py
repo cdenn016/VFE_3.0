@@ -239,7 +239,7 @@ def test_covariance_collapse_warns_on_a_contracting_stack_and_not_on_a_healthy_o
             ops.O.mul_(1e-2)                     # affine chart: every layer's content map M scaled by 1e-2
     d_healthy, d_collapsed = healthy.diagnostics(TOKENS), collapsed.diagnostics(TOKENS)
     assert d_healthy["relational_input_cov_scale_ratio_layer_min"] >= T.COVARIANCE_COLLAPSE_RATIO
-    # floor 1e-4 of tr C plus the 1e-4 scale of M Sigma M^T per layer
+    # floor 1e-4 Sigma_p plus the 1e-4 scale of M Sigma M^T per layer
     assert d_collapsed["relational_input_cov_scale_ratio_layer_min"] < T.COVARIANCE_COLLAPSE_RATIO
     assert d_collapsed["relational_input_cov_scale_ratio_argmin_layer"] == 2.0
     # collapse of the covariance lowers the scale-free statistic as well, not only the absolute one

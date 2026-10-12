@@ -205,8 +205,9 @@ def test_routing_score_float64_recovery_path_agrees_on_a_mixed_tower() -> None:
 # ---------------------------------------------------------------- moment-matched covariance
 
 def _reference_moment_matched(ops: RelationalOperators, mu: torch.Tensor, Sigma: torch.Tensor,
-                              beta: torch.Tensor, U: torch.Tensor) -> torch.Tensor:
-    r"""Sigma_i^+ = U_i C_i^att U_i^T by the defining sums over sources and head pairs (float64 loops)."""
+                              beta: torch.Tensor, U: torch.Tensor, prior: torch.Tensor) -> torch.Tensor:
+    r"""Sigma_i^+ = U_i C_i^att U_i^T + f Sigma_{p,i} by the defining sums over sources and head pairs (float64
+    loops); the prior-anchored floor f Sigma_{p,i} (``prior`` dense, (1, N, K, K)) is added in local coordinates."""
     T_runs, O_runs = ops.content_factor_runs()
     T, O = _per_head(T_runs), _per_head(O_runs)
     M = [o @ t for t, o in zip(T, O)]                                            # (K, K) per head
@@ -217,7 +218,7 @@ def _reference_moment_matched(ops: RelationalOperators, mu: torch.Tensor, Sigma:
     out = []
     for i in range(N):
         b = beta[0, :, i, :]                                                     # (H, N)
-        C_att = ops.predictive_covariance_floor * torch.trace(C[i]) / K * torch.eye(K, dtype=torch.float64)
+        C_att = torch.zeros(K, K, dtype=torch.float64)
         for j in range(N):
             for h in range(H):
                 for g in range(H):
@@ -229,7 +230,7 @@ def _reference_moment_matched(ops: RelationalOperators, mu: torch.Tensor, Sigma:
             C_att = C_att + sum(b[h, j] * torch.outer(n[j], n[j]) for j in range(N)) - torch.outer(mean, mean)
         if ops.attention_residual:
             C_att = C_att + C[i] + sum(b[h, i] * (M[h] @ C[i] + C[i] @ M[h].T) for h in range(H))
-        out.append(U[0, i] @ C_att @ U[0, i].T)
+        out.append(U[0, i] @ C_att @ U[0, i].T + ops.predictive_covariance_floor * prior[0, i])
     return torch.stack(out)[None]
 
 
@@ -248,8 +249,12 @@ def test_moment_matched_covariance_matches_the_dense_reference(spec: list, dims:
     Sigma = A @ A.transpose(-1, -2) / 11 + 0.5 * torch.eye(11, dtype=torch.float64)
     sigma = Sigma if full else torch.diagonal(Sigma, dim1=-2, dim2=-1)
     beta = torch.randn(1, 3, 3, 3, generator=g, dtype=torch.float64).softmax(-1)
-    got = ops.predictive_covariance_update(mu, sigma, beta, frame)
-    ref = _reference_moment_matched(ops, mu, Sigma if full else torch.diag_embed(sigma), beta, U)
+    B = torch.randn(1, 3, 11, 11, generator=torch.Generator().manual_seed(99), dtype=torch.float64)
+    P = B @ B.transpose(-1, -2) / 11 + 0.5 * torch.eye(11, dtype=torch.float64)   # the local prior Sigma_p
+    prior = P if full else torch.diagonal(P, dim1=-2, dim2=-1)
+    got = ops.predictive_covariance_update(mu, sigma, beta, frame, floor_anchor=prior)
+    ref = _reference_moment_matched(ops, mu, Sigma if full else torch.diag_embed(sigma), beta, U,
+                                    prior if full else torch.diag_embed(prior))
     torch.testing.assert_close(got, ref if full else torch.diagonal(ref, dim1=-2, dim2=-1),
                                atol=1e-10, rtol=1e-10)
 

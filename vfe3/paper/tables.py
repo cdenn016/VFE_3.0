@@ -850,7 +850,6 @@ def _tokens_seen(run: RunRecord) -> Tuple[Optional[int], Optional[str]]:
 def _data_items(run: RunRecord) -> List[Item]:
     p = run.provenance
     items: List[Item] = [("dataset", Code(run.dataset) if run.dataset else NOT_RECORDED)]
-    items.append(("split revision", str(p["dataset_revision"]) if p.get("dataset_revision") else NOT_RECORDED))
     manifest = p.get("tokenizer_manifest")
     if isinstance(manifest, Mapping) and manifest.get("status") == "recorded":
         items.append(("tokenizer", Code(f"{manifest.get('kind')}/{manifest.get('encoding')}")))
@@ -864,8 +863,6 @@ def _data_items(run: RunRecord) -> List[Item]:
         items.append(("tokenizer", Code(str(tag)) if tag else NOT_RECORDED))
         items.append(("tokenizer manifest", NOT_RECORDED + (f" ({status})" if status else "")))
     items.append(("vocabulary", str(run.raw("vocab_size")) if "vocab_size" in run.config_raw else NOT_RECORDED))
-    policy = p.get("concatenation_policy")
-    items.append(("concatenation policy", str(policy) if policy else NOT_RECORDED))
     for split in ("train", "val", "test"):
         digest, n = p.get(f"{split}_data_sha256"), p.get(f"{split}_data_n_tokens")
         if isinstance(digest, str):
@@ -1007,7 +1004,9 @@ def _evaluation_items(run: RunRecord, rule: str) -> List[Item]:
     if isinstance(s.get("best_step"), int):
         items.append(("best-validation step", f"{s['best_step']:,}"))
     items += _raw_items(run, ("max_seq_len", "eval_stride", "beta_attention_prior"))
-    for prefix, label in (("test_", "test"), ("final_val_", "validation")):
+    # Validation counts: finalize_run writes final_val_*, finalize_validation_run (ablation cells) val_*.
+    val_prefix = "final_val_" if "final_val_scored_targets" in s else "val_"
+    for prefix, label in (("test_", "test"), (val_prefix, "validation")):
         scored, expected = s.get(f"{prefix}scored_targets"), s.get(f"{prefix}expected_targets")
         excluded = s.get(f"{prefix}excluded_targets")
         overlap, padding = s.get(f"{prefix}overlap_context_targets"), s.get(f"{prefix}padding_targets")

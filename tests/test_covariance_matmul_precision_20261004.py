@@ -47,7 +47,7 @@ def test_moment_matched_update_runs_ieee_fp32_and_restores_the_policy(
         frame = type(frame)(torch.block_diag(*frame.forward[0, 0]).expand(2, 5, 4, 4).clone(),
                             torch.block_diag(*frame.inverse[0, 0]).expand(2, 5, 4, 4).clone())
     with _RecordMatmulPrecision() as recorder:
-        ops.predictive_covariance_update(mu, sigma, beta, frame, receive)
+        ops.predictive_covariance_update(mu, sigma, beta, frame, receive, floor_anchor=sigma)
     assert recorder.seen and set(recorder.seen) == {"highest"}
     assert torch.get_float32_matmul_precision() == "high"
 
@@ -64,7 +64,7 @@ def test_checkpointed_recompute_runs_ieee_fp32(high_precision_policy: None) -> N
 
     ops._predictive_covariance_update_blockwise = recorded
     mu = mu.requires_grad_(True)
-    out = ops.predictive_covariance_update(mu, sigma, beta, frame, receive)
+    out = ops.predictive_covariance_update(mu, sigma, beta, frame, receive, floor_anchor=sigma)
     out.sum().backward()                                       # recomputes the checkpointed forward
     assert seen == ["highest", "highest"] and mu.grad is not None
     assert torch.get_float32_matmul_precision() == "high"

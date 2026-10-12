@@ -110,6 +110,17 @@ def _inputs(H: int = 2, d: int = 2, N: int = 4, seed: int = 0, batch: Tuple[int,
                 beta=beta)
 
 
+def _prior(like: torch.Tensor, full: bool, seed: int = 99) -> torch.Tensor:
+    r"""A local prior covariance Sigma_p in ``like``'s layout (``full``: SPD (..., N, K, K), else a positive
+    diagonal (..., N, K)), drawn from its own generator: the anchor of the floor f Sigma_p, distinct from sigma."""
+    generator = torch.Generator().manual_seed(seed)
+    if not full:
+        return torch.rand(like.shape, generator=generator, dtype=F64) + 0.4
+    n = like.shape[-1]
+    factor = torch.randn(like.shape, generator=generator, dtype=F64)
+    return factor @ factor.transpose(-1, -2) / n + 0.5 * torch.eye(n, dtype=F64)
+
+
 # ----------------------------------------------------------------------------------------------
 # Independent brute-force reference (explicit matrix exponentials and loops)
 # ----------------------------------------------------------------------------------------------
@@ -144,8 +155,10 @@ def _reference(
     sigma: torch.Tensor,                # (1, N, K, K) local covariance
     beta:  torch.Tensor,                # (1, H, N, N)
     U:     torch.Tensor,                # (1, N, K, K)
+    prior: torch.Tensor,                # (1, N, K, K) local prior covariance Sigma_p
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Local mean m_i (residual-free) and covariance U C^att U^T of the generic edge kernel, by loops."""
+    r"""Local mean m_i (residual-free) and covariance U C^att U^T + f Sigma_{p,i} of the generic edge kernel, by
+    loops; the prior-anchored floor is added in local coordinates (audit 2026-10-12 T5)."""
     H, K = len(ops.irrep_dims), ops.input_dim
     N = mu.shape[-2]
     _, _, Pi = _shared(ops)
@@ -169,9 +182,8 @@ def _reference(
         if ops.attention_residual:
             cross = sum(beta[0, h, i, i] * M[i][i][h] @ C[i] for h in range(H))
             cov = cov + C[i] + cross + cross.T
-        cov = cov + FLOOR * torch.trace(C[i]) / K * torch.eye(K, dtype=F64)
         means.append(U[0, i] @ m)
-        covs.append(U[0, i] @ cov @ U[0, i].T)
+        covs.append(U[0, i] @ cov @ U[0, i].T + FLOOR * prior[0, i])
     return torch.stack(means)[None], torch.stack(covs)[None]
 
 
@@ -197,8 +209,9 @@ def test_zero_sender_map_reduces_to_the_exponential_chart(mode: str, residual: b
     mu, beta = data["mu"], data["beta"]
     for _, sigma, frame in _cases(data):
         _close(ops.predictive_content(mu, beta, frame), twin.predictive_content(mu, beta, frame), 1e-12)
-        _close(ops.predictive_covariance_update(mu, sigma, beta, frame),
-               twin.predictive_covariance_update(mu, sigma, beta, frame), 1e-12)
+        prior = _prior(sigma, sigma.dim() == 4)
+        _close(ops.predictive_covariance_update(mu, sigma, beta, frame, floor_anchor=prior),
+               twin.predictive_covariance_update(mu, sigma, beta, frame, floor_anchor=prior), 1e-12)
         edges = ops.edge_context(mu, beta, frame)
         for body in ("_predictive_covariance_update_dense", "_predictive_covariance_update_blockwise"):
             if body.endswith("blockwise") and not (frame.block_diagonal and sigma.dim() == mu.dim()):
@@ -222,10 +235,12 @@ def test_mean_and_covariance_match_the_brute_force_kernel(mode: str, residual: b
     assert float(xi0.norm()) > 1.0                                    # the token-0 shift is not trivial
     for _, sigma, frame in _cases(data):
         dense_sigma = sigma if sigma.dim() == 4 else torch.diag_embed(sigma)
-        mean_ref, cov_ref = _reference(ops, mu, dense_sigma, beta, U)
+        prior = _prior(sigma, sigma.dim() == 4)
+        dense_prior = prior if sigma.dim() == 4 else torch.diag_embed(prior)
+        mean_ref, cov_ref = _reference(ops, mu, dense_sigma, beta, U, dense_prior)
         _close(ops.predictive_content(mu, beta, frame), mean_ref, 1e-10)
         want = cov_ref if sigma.dim() == 4 else torch.diagonal(cov_ref, dim1=-2, dim2=-1)
-        _close(ops.predictive_covariance_update(mu, sigma, beta, frame), want, 1e-10)
+        _close(ops.predictive_covariance_update(mu, sigma, beta, frame, floor_anchor=prior), want, 1e-10)
 
 
 @pytest.mark.parametrize("mode", MODES)
@@ -239,9 +254,12 @@ def test_shift_trap_is_detected(mode: str) -> None:
     xi = torch.linalg.solve(U, mu.unsqueeze(-1)).squeeze(-1)
     values = torch.einsum("hsk,...nk->...nhs", ctx.T.reshape(H, d, K), xi - xi[..., :1, :])
     shifted = torch.einsum("...nhsa,...nhs->...nha", ctx.B_ref.reshape(*ctx.B_ref.shape[:-2], H, d, -1), values)
-    want = torch.diagonal(_reference(ops, mu, torch.diag_embed(sigma), beta, U)[1], dim1=-2, dim2=-1)
-    _close(ops.predictive_covariance_update(mu, sigma, beta, frame, edges=ctx), want, 1e-10)
-    wrong = ops.predictive_covariance_update(mu, sigma, beta, frame, edges=ctx._replace(p=shifted))
+    prior = _prior(sigma, False)
+    want = torch.diagonal(_reference(ops, mu, torch.diag_embed(sigma), beta, U, torch.diag_embed(prior))[1],
+                          dim1=-2, dim2=-1)
+    _close(ops.predictive_covariance_update(mu, sigma, beta, frame, edges=ctx, floor_anchor=prior), want, 1e-10)
+    wrong = ops.predictive_covariance_update(mu, sigma, beta, frame, edges=ctx._replace(p=shifted),
+                                             floor_anchor=prior)
     assert float((wrong - want).abs().max() / want.abs().max()) > 1e-2
 
 
@@ -297,7 +315,8 @@ def test_blockwise_gradients_equal_dense_with_edges(mode: str) -> None:
 @pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("residual", [False, True])
 def test_passive_gauge_action_maps_outputs_covariantly(mode: str, residual: bool) -> None:
-    r"""mu -> g mu, Sigma -> g Sigma g^T, U -> g U gives m -> g m, Sigma^+ -> g Sigma^+ g^T at fixed beta."""
+    r"""mu -> g mu, Sigma -> g Sigma g^T, U -> g U, Sigma_p -> g Sigma_p g^T gives m -> g m, Sigma^+ -> g Sigma^+ g^T
+    at fixed beta (the prior-anchored floor moves with the prior)."""
     ops = _ops(mode, residual, seed=10)
     data = _inputs(seed=11)
     N, K = data["mu"].shape[-2:]
@@ -307,10 +326,11 @@ def test_passive_gauge_action_maps_outputs_covariantly(mode: str, residual: bool
     moved_U = g @ U
     moved = CanonicalFrameContext(moved_U, torch.linalg.inv(moved_U))
     mean = ops.predictive_content(mu, beta, data["dense"])
-    cov = ops.predictive_covariance_update(mu, sigma, beta, data["dense"])
+    prior = _prior(sigma, True)
+    cov = ops.predictive_covariance_update(mu, sigma, beta, data["dense"], floor_anchor=prior)
     mean_g = ops.predictive_content((g @ mu.unsqueeze(-1)).squeeze(-1), beta, moved)
     cov_g = ops.predictive_covariance_update((g @ mu.unsqueeze(-1)).squeeze(-1), g @ sigma @ g.transpose(-1, -2),
-                                             beta, moved)
+                                             beta, moved, floor_anchor=g @ prior @ g.transpose(-1, -2))
     _close(mean_g, (g @ mean.unsqueeze(-1)).squeeze(-1), 1e-9)
     _close(cov_g, g @ cov @ g.transpose(-1, -2), 1e-9)
 
@@ -327,9 +347,12 @@ def test_readout_is_gauge_covariant_through_routing(mode: str) -> None:
     blocks = data["compact"].forward
     moved = CanonicalFrameContext(g_blocks @ blocks, torch.linalg.inv(g_blocks @ blocks), block_diagonal=True)
     mu, sigma = data["mu"], data["sigma_full"]
-    mean, cov = relational_predictive_readout(mu, sigma, data["compact"], ops, return_covariance=True)
+    prior = _prior(sigma, True)
+    mean, cov = relational_predictive_readout(mu, sigma, data["compact"], ops, return_covariance=True,
+                                              floor_anchor=prior)
     mean_g, cov_g = relational_predictive_readout((g @ mu.unsqueeze(-1)).squeeze(-1), g @ sigma @ g.transpose(-1, -2),
-                                                  moved, ops, return_covariance=True)
+                                                  moved, ops, return_covariance=True,
+                                                  floor_anchor=g @ prior @ g.transpose(-1, -2))
     _close(mean_g, (g @ mean.unsqueeze(-1)).squeeze(-1), 1e-9)
     _close(cov_g, g @ cov @ g.transpose(-1, -2), 1e-9)
 
@@ -387,8 +410,9 @@ def test_future_tokens_do_not_reach_earlier_receivers_even_when_phi1_overflows(m
     xi[..., -1] = 0.0                                                 # no token reads the huge direction
     local = lambda x: (_block_dense(blocks) @ x.unsqueeze(-1)).squeeze(-1)
     sigma = data["sigma_diag"]
+    prior = _prior(sigma, False)
     base_mean = ops.predictive_content(local(xi), beta, data["compact"])
-    base_cov = ops.predictive_covariance_update(local(xi), sigma, beta, data["compact"])
+    base_cov = ops.predictive_covariance_update(local(xi), sigma, beta, data["compact"], floor_anchor=prior)
     assert bool(torch.isfinite(base_mean).all()) and bool(torch.isfinite(base_cov).all())
     overflowed = False
     for sign in (1.0, -1.0):
@@ -403,9 +427,11 @@ def test_future_tokens_do_not_reach_earlier_receivers_even_when_phi1_overflows(m
             unmasked = [-edge_links.phi1(-(B_last.T @ ctx.A))]
         overflowed = overflowed or any(not bool(torch.isfinite(x).all()) for x in unmasked)
         mean = ops.predictive_content(local(moved), beta, data["compact"])
-        cov = ops.predictive_covariance_update(local(moved), sigma, beta, data["compact"])
-        dense_cov = ops.predictive_covariance_update(local(moved), torch.diag_embed(sigma), beta, data["compact"])
-        dense_base = ops.predictive_covariance_update(local(xi), torch.diag_embed(sigma), beta, data["compact"])
+        cov = ops.predictive_covariance_update(local(moved), sigma, beta, data["compact"], floor_anchor=prior)
+        dense_cov = ops.predictive_covariance_update(local(moved), torch.diag_embed(sigma), beta, data["compact"],
+                                                     floor_anchor=torch.diag_embed(prior))
+        dense_base = ops.predictive_covariance_update(local(xi), torch.diag_embed(sigma), beta, data["compact"],
+                                                      floor_anchor=torch.diag_embed(prior))
         for got, want in ((mean, base_mean), (cov, base_cov), (dense_cov, dense_base)):
             assert bool(torch.isfinite(got[0, :N - 1]).all())
             torch.testing.assert_close(got[0, :N - 1], want[0, :N - 1], rtol=1e-12, atol=1e-12)
@@ -429,8 +455,10 @@ class _Readout(torch.nn.Module):
         w_mean, w_diag, w_full = self.weights
         full = torch.diag_embed(sigma) + 0.1 * torch.ones(sigma.shape[-1], sigma.shape[-1], dtype=sigma.dtype)
         return ((w_mean * self.ops.predictive_content(mu, beta, frame)).sum()
-                + (w_diag * self.ops.predictive_covariance_update(mu, sigma, beta, frame)).sum()
-                + (w_full * self.ops.predictive_covariance_update(mu, full, beta, frame)).sum())
+                + (w_diag * self.ops.predictive_covariance_update(mu, sigma, beta, frame,
+                                                                  floor_anchor=_prior(sigma, False))).sum()
+                + (w_full * self.ops.predictive_covariance_update(mu, full, beta, frame,
+                                                                  floor_anchor=_prior(full, True))).sum())
 
 
 @pytest.mark.parametrize("mode", MODES)
@@ -465,7 +493,8 @@ def test_checkpointed_covariance_is_bit_identical_with_edges(mode: str) -> None:
         ops = _ops(mode, True, seed=21, predictive_covariance_checkpoint=flag)
         data = _inputs(seed=22)
         mu = data["mu"].clone().requires_grad_(True)
-        out = relational_predictive_readout(mu, data["sigma_diag"], data["compact"], ops, return_covariance=True)
+        out = relational_predictive_readout(mu, data["sigma_diag"], data["compact"], ops, return_covariance=True,
+                                            floor_anchor=_prior(data["sigma_diag"], False))
         (out[0].sum() + out[1].square().sum()).backward()
         outputs.append([out[0].detach(), out[1].detach(), mu.grad] + [p.grad for p in ops.parameters()])
     for plain, recomputed in zip(*outputs):

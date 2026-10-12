@@ -51,6 +51,16 @@ def _setup(input_scope: str, output_scope: str, residual: bool, seed: int = 0):
     return ops, blocks, mu, sigma_full, sigma_diag, beta
 
 
+def _prior(sigma: torch.Tensor, seed: int = 123) -> torch.Tensor:
+    """A local prior covariance Sigma_p in sigma's layout (positive diagonal or SPD), drawn independently of sigma."""
+    generator = torch.Generator().manual_seed(seed)
+    if sigma.dim() == 3:
+        return torch.rand(sigma.shape, generator=generator, dtype=sigma.dtype) + 0.4
+    n = sigma.shape[-1]
+    factor = torch.randn(sigma.shape, generator=generator, dtype=sigma.dtype)
+    return factor @ factor.transpose(-1, -2) / n + 0.5 * torch.eye(n, dtype=sigma.dtype)
+
+
 def _frame(blocks: torch.Tensor, compact: bool) -> CanonicalFrameContext:
     inverse = torch.linalg.inv(blocks)
     if compact:
@@ -76,11 +86,12 @@ def _content_maps(ops: RelationalOperators) -> list:
     return maps
 
 
-def _enumerated_moments(ops, blocks, mu, sigma, beta, residual, floor):
+def _enumerated_moments(ops, blocks, mu, sigma, beta, residual, floor, prior):
     """Exact mean and covariance of the declared kernel by enumerating every head-label tuple.
 
     X = r k_i + sum_h L_{i J^h} k_{J^h} + eps, k_s ~ N(mu_s, Sigma_s) independent,
-    J^h ~ beta_i^h independent, eps ~ N(0, floor (tr C_i / K) U_i U_i^T), L_ij^h = U_i M_h U_j^{-1}.
+    J^h ~ beta_i^h independent, eps ~ N(0, floor Sigma_{p,i}) in local coordinates (the prior-anchored floor,
+    audit 2026-10-12 T5), L_ij^h = U_i M_h U_j^{-1}. ``prior`` is the dense (1, N, K, K) Sigma_p.
     """
     U = _block_dense(blocks[0])
     U_inv = torch.linalg.inv(U)
@@ -105,8 +116,7 @@ def _enumerated_moments(ops, blocks, mu, sigma, beta, residual, floor):
             second = second + weight * torch.outer(mean, mean)
             within = within + weight * cov
         means.append(first)
-        C_i = U_inv[i] @ sigma[0, i] @ U_inv[i].T
-        noise = floor * torch.trace(C_i) / K * (U[i] @ U[i].T)
+        noise = floor * prior[0, i]
         covariances.append(within + second - torch.outer(first, first) + noise)
     return torch.stack(means)[None], torch.stack(covariances)[None]
 
@@ -120,8 +130,10 @@ def test_covariance_matches_enumerated_predictive_kernel(input_scope, output_sco
     frame = _frame(blocks, compact)
     for sigma in (sigma_full, sigma_diag):
         dense = sigma if sigma.dim() == 4 else torch.diag_embed(sigma)
-        mean_ref, cov_ref = _enumerated_moments(ops, blocks, mu, dense, beta, residual, floor=1e-3)
-        actual = ops.predictive_covariance_update(mu, sigma, beta, frame)
+        prior = _prior(sigma)
+        mean_ref, cov_ref = _enumerated_moments(ops, blocks, mu, dense, beta, residual, floor=1e-3,
+                                                prior=prior if prior.dim() == 4 else torch.diag_embed(prior))
+        actual = ops.predictive_covariance_update(mu, sigma, beta, frame, floor_anchor=prior)
         expected = cov_ref if sigma.dim() == 4 else torch.diagonal(cov_ref, dim1=-2, dim2=-1)
         torch.testing.assert_close(actual, expected, atol=1e-10, rtol=1e-10)
         content = ops.predictive_content(mu, beta, frame) + (mu if residual else 0.0)
@@ -131,7 +143,8 @@ def test_covariance_matches_enumerated_predictive_kernel(input_scope, output_sco
 def test_cross_head_terms_are_present_for_full_covariance() -> None:
     ops, blocks, mu, sigma_full, _, beta = _setup("full", "full", False)
     frame = _frame(blocks, True)
-    _, cov_ref = _enumerated_moments(ops, blocks, mu, sigma_full, beta, False, floor=1e-3)
+    prior = _prior(sigma_full)
+    _, cov_ref = _enumerated_moments(ops, blocks, mu, sigma_full, beta, False, floor=1e-3, prior=prior)
     # Dropping the h != h' terms (independent-heads approximation) is measurably wrong here.
     maps = _content_maps(ops)
     U = _block_dense(blocks[0])
@@ -140,20 +153,25 @@ def test_cross_head_terms_are_present_for_full_covariance() -> None:
     cross = sum(beta[0, 0, i, j] * beta[0, 1, i, j] * (
         U[i] @ maps[0] @ U_inv[j] @ sigma_full[0, j] @ (U[i] @ maps[1] @ U_inv[j]).T) for j in range(N))
     assert (cross + cross.T).abs().max() > 1e-3
-    torch.testing.assert_close(ops.predictive_covariance_update(mu, sigma_full, beta, frame), cov_ref,
+    torch.testing.assert_close(ops.predictive_covariance_update(mu, sigma_full, beta, frame, floor_anchor=prior),
+                               cov_ref,
                                atol=1e-10, rtol=1e-10)
 
 
 def test_passive_frame_law() -> None:
-    """U -> gU, mu -> g mu, Sigma -> g Sigma g^T maps Sigma^+ -> g Sigma^+ g^T at fixed beta."""
+    """U -> gU, mu -> g mu, Sigma -> g Sigma g^T, Sigma_p -> g Sigma_p g^T maps Sigma^+ -> g Sigma^+ g^T at fixed beta.
+
+    The prior-anchored floor f Sigma_p is a local covariance, so a site action moves it with the prior.
+    """
     ops, blocks, mu, sigma_full, _, beta = _setup("full", "full", True, seed=3)
     g_blocks = torch.eye(D, dtype=torch.float64) + 0.5 * torch.randn(
         1, N, H, D, D, generator=torch.Generator().manual_seed(9), dtype=torch.float64)
     g = _block_dense(g_blocks)
-    before = ops.predictive_covariance_update(mu, sigma_full, beta, _frame(blocks, True))
+    prior = _prior(sigma_full)
+    before = ops.predictive_covariance_update(mu, sigma_full, beta, _frame(blocks, True), floor_anchor=prior)
     after = ops.predictive_covariance_update(
         (g @ mu.unsqueeze(-1)).squeeze(-1), g @ sigma_full @ g.transpose(-1, -2), beta,
-        _frame(g_blocks @ blocks, True))
+        _frame(g_blocks @ blocks, True), floor_anchor=g @ prior @ g.transpose(-1, -2))
     torch.testing.assert_close(after, g @ before @ g.transpose(-1, -2), atol=1e-9, rtol=1e-9)
 
 
@@ -164,40 +182,53 @@ def test_positive_definite_with_sharp_routing_and_rank_deficient_maps(residual) 
         ops.O.zero_()                           # every content map M_h = 0: Cov(m) is exactly zero
     beta = torch.zeros(1, H, N, N, dtype=torch.float64)
     beta[..., torch.arange(N), torch.arange(N)] = 1.0
-    out = ops.predictive_covariance_update(mu, sigma_full, beta, _frame(blocks, True))
+    prior = _prior(sigma_full)
+    out = ops.predictive_covariance_update(mu, sigma_full, beta, _frame(blocks, True), floor_anchor=prior)
     assert torch.linalg.eigvalsh(out).min() > 0
-    U = _block_dense(blocks)
-    U_inv = torch.linalg.inv(U)
-    scale = torch.diagonal(U_inv @ sigma_full @ U_inv.transpose(-1, -2), dim1=-2, dim2=-1).mean(-1)
-    expected = (1.0 if residual else 0.0) * sigma_full + 1e-3 * scale[..., None, None] * (U @ U.transpose(-1, -2))
+    expected = (1.0 if residual else 0.0) * sigma_full + 1e-3 * prior
     torch.testing.assert_close(out, expected, atol=1e-12, rtol=1e-10)
 
 
 def test_depth_recursion_stays_well_conditioned_in_float32() -> None:
     """Regression (2026-09-27 sweep): rank-one content maps and no residual over many layers.
 
-    A relative floor floor * Sigma_i compounds as floor**depth and lost float32 definiteness by the
-    third layer; the trace-scaled reference floor keeps the condition number bounded.
+    The kernel covariance has rank at most H < K here, so only the floor keeps the output definite. A relative
+    floor f Sigma_i compounds as f**depth on the kernel's null space and loses float32 definiteness within a few
+    layers (checked below as the contrast). The prior-anchored floor f Sigma_p (audit 2026-10-12 T5) is re-added
+    at every layer from the fixed prior, so it does not compound: every layer's output is at least f Sigma_p in
+    the Loewner order, its smallest eigenvalue is at least f lambda_min(Sigma_p) at every depth, and the float32
+    Cholesky succeeds. The content maps are scaled to be contractive, so the spread stays O(1): an absolute floor
+    cannot keep float32 definiteness under a spread that grows geometrically with depth (float32 rounding of order
+    eps_32 lambda_max then exceeds f lambda_min(Sigma_p)), which the former trace-scaled floor tolerated.
     """
     torch.manual_seed(0)
     Hq, Dq = 4, 2
     ops = make_relational_operators([Dq] * Hq, 3, readout_mode="predictive_content",
                               predictive_covariance="moment_matched")
     with torch.no_grad():
-        ops.O.copy_(torch.randn(Hq, Hq * Dq, 1) @ torch.randn(Hq, 1, Dq))    # rank-one O_h
+        ops.O.copy_(0.3 * torch.randn(Hq, Hq * Dq, 1) @ torch.randn(Hq, 1, Dq))    # rank-one, contractive O_h
     n = 6
     blocks = torch.eye(Dq) + 0.2 * torch.randn(1, n, Hq, Dq, Dq)
     frame = CanonicalFrameContext(blocks, torch.linalg.inv(blocks), block_diagonal=True)
     mu = torch.randn(1, n, Hq * Dq)
     sigma = torch.diag_embed(torch.rand(1, n, Hq * Dq) + 0.5)
+    prior = sigma.clone()                                                   # the embedding prior, fixed over depth
+    f = ops.predictive_covariance_floor
+    floor_min = f * torch.linalg.eigvalsh(prior.double()).min(-1).values   # (1, n) f lambda_min(Sigma_p)
     causal = torch.ones(n, n, dtype=torch.bool).tril()
     beta = torch.softmax(torch.randn(1, Hq, n, n).masked_fill(~causal, -torch.inf), dim=-1)
+    relative = sigma.clone()                                                # the contrast: a relative floor f Sigma_i
     for _ in range(12):
-        sigma = ops.predictive_covariance_update(mu, sigma, beta, frame)
+        sigma = ops.predictive_covariance_update(mu, sigma, beta, frame, floor_anchor=prior)
+        relative = ops.predictive_covariance_update(mu, relative, beta, frame, floor_anchor=relative)
+        # Sigma^+ - f Sigma_p is the kernel covariance, positive semidefinite up to float32 rounding.
+        excess = torch.linalg.eigvalsh((sigma - f * prior).double())
+        assert (excess.min(-1).values >= -1e-6 * excess.max(-1).values).all()
         eigenvalues = torch.linalg.eigvalsh(sigma.double())
-        assert eigenvalues.min() > 0
-        assert (eigenvalues.max(-1).values / eigenvalues.min(-1).values).max() < 1e7
+        assert eigenvalues.max() < 10.0                                     # the contractive regime of the docstring
+        assert (eigenvalues.min(-1).values >= (1 - 1e-3) * floor_min).all()
         torch.linalg.cholesky(sigma)
+    assert torch.linalg.eigvalsh(relative.double()).min() < 1e-2 * floor_min.min()
 
 
 def test_gradcheck_inputs_and_content_maps() -> None:
@@ -214,7 +245,7 @@ def test_gradcheck_inputs_and_content_maps() -> None:
         original = ops._parameters["T"], ops._parameters["O"]
         try:
             ops._parameters["T"], ops._parameters["O"] = T_in, O_in
-            return ops.predictive_covariance_update(mu_in, sigma_in, beta_in, frame)
+            return ops.predictive_covariance_update(mu_in, sigma_in, beta_in, frame, floor_anchor=_prior(sigma_in))
         finally:
             ops._parameters["T"], ops._parameters["O"] = original
 
@@ -242,10 +273,11 @@ def test_readout_returns_the_same_mean_and_the_operator_covariance() -> None:
                               predictive_covariance="moment_matched").double()
     capture = {}
     mean_only = relational_predictive_readout(mu, sigma, frame, ops, tau=.9, log_prior=prior)
+    anchor = _prior(sigma)
     mean, sigma_plus = relational_predictive_readout(
-        mu, sigma, frame, ops, tau=.9, log_prior=prior, capture=capture, return_covariance=True)
+        mu, sigma, frame, ops, tau=.9, log_prior=prior, capture=capture, return_covariance=True, floor_anchor=anchor)
     torch.testing.assert_close(mean, mean_only, atol=0, rtol=0)
-    expected = ops.predictive_covariance_update(mu, sigma, capture["beta_pre"], frame)
+    expected = ops.predictive_covariance_update(mu, sigma, capture["beta_pre"], frame, floor_anchor=anchor)
     torch.testing.assert_close(sigma_plus, expected, atol=1e-12, rtol=1e-12)
     assert sigma_plus.shape == sigma.shape
     grads = torch.autograd.grad(sigma_plus.sum(), [mu, ops.T, ops.O, ops.raw_score_q])

@@ -188,6 +188,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'frame_pair_fp64_escalation': False,
     'frame_pair_condition_tol': 0.0001,
     'phi_mstep_max_matrix_norm': None,
+    'phi_frame_condition_max': None,
     'val_diagnostic_batches': 1,
     'diagnose_canonical_free_energy': False,
     'grad_accum_steps': 1,

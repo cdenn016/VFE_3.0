@@ -260,7 +260,7 @@ def e_step_iteration(
             belief.mu, belief.sigma, relational_frame, relational_operators,
             tau=tau, kl_max=kl_max, log_prior=log_prior,
             value_frame=relational_value_frame, capture=relational_capture,
-            **({"return_covariance": True} if moment_matched else {}),
+            **({"return_covariance": True, "floor_anchor": sigma_p} if moment_matched else {}),
             **({"link_state": link_state} if link_state is not None else {}))
         mu, sigma = readout if moment_matched else (readout, belief.sigma)
         if grad_record is not None:

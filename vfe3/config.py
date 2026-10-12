@@ -124,6 +124,26 @@ def _warn_diagonal_comparison_covariance(
         warnings.warn(message, UserWarning, stacklevel=3)
 
 
+# The optional rates and decays for which None inherits another hyperparameter, child -> parent. This is the
+# one place the inheritance rule lives (audit 2026-10-12 C7): build_optimizer, the run artifacts and the inert-field
+# rules read it through VFE3Config.resolved_hyperparameter / inherits_hyperparameter. The fields keep None, so a
+# saved config and its fingerprint are unchanged. m_per_type_hidden_bias_lr inherits the DECLARED m_phi_lr, which
+# __post_init__ writes into the field before gauge_transport can coerce m_phi_lr to 0.
+_INHERITED_HYPERPARAMETERS: Mapping[str, str] = {
+    "m_decode_mu_lr":            "m_p_mu_lr",
+    "m_decode_sigma_lr":         "m_p_sigma_lr",
+    "m_block_mlp_lr":            "m_p_mu_lr",
+    "m_layernorm_lr":            "m_p_mu_lr",
+    "m_relational_score_lr":     "m_p_mu_lr",
+    "m_relational_content_lr":   "m_p_mu_lr",
+    "m_pos_phi_lr":              "m_phi_lr",
+    "m_per_type_hidden_bias_lr": "m_phi_lr",
+    "mu_weight_decay":           "weight_decay",
+    "sigma_weight_decay":        "weight_decay",
+    "decode_mu_weight_decay":    "mu_weight_decay",
+}
+
+
 @dataclass
 class VFE3Config:
     """The single authoritative configuration surface for VFE_3.0.
@@ -219,7 +239,8 @@ class VFE3Config:
     #   4. Belief family and table initialization
     ##################################################
 
-    # "gaussian_diagonal" | "gaussian_full" | "laplace_diagonal" | "gaussian_block"
+    # "gaussian_diagonal" | "gaussian_full" | "gaussian_block" ("laplace_diagonal" is registered but refused on both
+    # projected routes)
     # The belief covariance structure (read diagonal_covariance, never a second flag).
     #   gaussian_block  one SPD d_head x d_head block per head, stored in the dense (K, K) layout. only:
     #                   projected_predictive, predictive_readout="kernel", equal head blocks (block_glk, block_so,
@@ -487,10 +508,13 @@ class VFE3Config:
     
     # "passthrough" | "moment_matched"
     #   passthrough     keep the incoming covariance
-    #   moment_matched  the exact moment-matched covariance of the readout
+    #   moment_matched  the readout's covariance plus floor * Sigma_p: kernel, the exact moment-matched covariance of
+    #                   the predictive kernel; minimal_agent exact, the exact posterior's; minimal_agent mean_field,
+    #                   the CAVI posterior (C^-1 + sum_h S_h^T Lambda_h S_h)^-1 without the between-source spread, so
+    #                   with equal source covariances it does not depend on the context (audit 2026-10-12, item 9)
     predictive_covariance:            str             = "moment_matched"
     
-    predictive_covariance_floor:      float           = 1e-4         # moment_matched only (kernel and minimal_agent readouts): floor * (tr C_i / K) I
+    predictive_covariance_floor:      float           = 1e-4         # moment_matched only (kernel and minimal_agent readouts): floor * Sigma_p, the token's local prior covariance
     minimal_agent_channel_noise:      float           = 1.0          # minimal_agent only: initial channel noise n_h > 0 (learned)
    
     # moment_matched only: recompute the covariance update in backward instead of storing its
@@ -704,8 +728,15 @@ class VFE3Config:
     # Interior radius for phi after each M-step, < transport_chart_max_norm (AdamW projects rows back;
     # pullback_group rejects the step). None: nothing bounds ||phi|| under adamw.
     phi_mstep_max_matrix_norm:        Optional[float] = None
-    
-    m_phi_group_trust_radius:         float           = 0.1          # pullback_group / fisher_group only: step bound
+
+    # Condition-number ceiling kappa_max > 1 on every composed frame U_i, applied after each accepted
+    # adamw step (audit 2026-10-12 T4). Each learned factor's head block X (phi_embed, and pos_phi_free under
+    # pos_phi="learned") keeps its skew part and trace while the spread of its traceless symmetric part is
+    # bounded by log(kappa_max) / n_factors, so cond_2(U_i) <= kappa_max (Omega_ij <= kappa_max^2).
+    # block_glk / block_glmc; inert (cond = 1) for block_so, block_co, so_n. None: no bound.
+    phi_frame_condition_max:          Optional[float] = None
+
+    m_phi_group_trust_radius:        float           = 0.1          # pullback_group / fisher_group only: step bound
     m_phi_fisher_rotation_weight:     float           = 2.0          # fisher_group only: completion weight lambda on every rotation; raises Fisher-visible rotation metrics a -> a + 2 lambda
 
     # "adamw" | "fisher"
@@ -771,7 +802,9 @@ class VFE3Config:
     ##################################################
 
     eps:                              float           = 1e-6
-    kl_max:                           float           = 100.0        # safety clamp on every divergence (launchers scale it with K)
+    # safety clamp on every divergence; None resolves at construction to 8 * embed_dim, the launchers' scaling,
+    # and the resolved number is what the config stores and saves (audit 2026-10-12 C6)
+    kl_max:                           Optional[float] = None
     # "absolute" | "row_min": what kl_max clamps in the kernel router, projected_predictive and
     # projected_gradient (audit 2026-10-08 P1-4)
     #   absolute  D_ij; a row whose every admissible cost exceeds kl_max routes uniformly with zero gradient
@@ -942,6 +975,8 @@ class VFE3Config:
         # numerics
         if not (math.isfinite(self.eps) and self.eps > 0.0):
             raise ValueError(f"eps must be finite and positive, got {self.eps}")
+        if self.kl_max is None:
+            self.kl_max = float(8 * self.embed_dim)
         if not self.kl_max > 0.0:
             raise ValueError(f"kl_max must be positive (infinity disables the ceiling), got {self.kl_max}")
         if not (math.isfinite(self.rope_base) and self.rope_base > 0.0):
@@ -955,9 +990,9 @@ class VFE3Config:
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be >= 0 and finite, got {value}")
-        if self.pos_phi != "none" and not math.isfinite(self.pos_phi_scale):
+        if self.pos_phi != "none" and not (math.isfinite(self.pos_phi_scale) and self.pos_phi_scale >= 0.0):
             raise ValueError(
-                f"pos_phi_scale must be finite when pos_phi is active, got {self.pos_phi_scale}")
+                f"pos_phi_scale must be finite and >= 0 when pos_phi is active, got {self.pos_phi_scale}")
         if not (
             math.isfinite(self.m_phi_group_trust_radius)
             and self.m_phi_group_trust_radius > 0.0
@@ -1463,6 +1498,29 @@ class VFE3Config:
                 "requires untied block_glk; "
                 f"got gauge_group={self.gauge_group!r}, gauge_tying={self.gauge_tying!r}"
             )
+        if self.phi_frame_condition_max is not None:
+            from vfe3.gauge_optim import FRAME_CONDITION_GROUPS, FRAME_CONDITION_INERT_GROUPS
+            if (isinstance(self.phi_frame_condition_max, bool)
+                    or not isinstance(self.phi_frame_condition_max, Real)
+                    or not math.isfinite(self.phi_frame_condition_max)
+                    or self.phi_frame_condition_max <= 1.0):
+                raise ValueError("phi_frame_condition_max must be None or a finite real > 1, got "
+                                 f"{self.phi_frame_condition_max!r}")
+            frame_condition_problems = []
+            if self.gauge_group not in FRAME_CONDITION_GROUPS + FRAME_CONDITION_INERT_GROUPS:
+                frame_condition_problems.append(
+                    f"gauge_group in {FRAME_CONDITION_GROUPS} (implemented) or {FRAME_CONDITION_INERT_GROUPS} "
+                    f"(cond = 1, inert); got {self.gauge_group!r}")
+            if phi_update_policy.requires_manifold_optimizer:
+                frame_condition_problems.append(
+                    f"m_phi_update_mode='adamw' (the manifold optimizer keeps its own chart); got "
+                    f"{self.m_phi_update_mode!r}")
+            if self.encode_mode != "per_token":
+                frame_condition_problems.append(
+                    f"encode_mode='per_token' (per_token_additive does not use phi_embed as a frame); got "
+                    f"{self.encode_mode!r}")
+            if frame_condition_problems:
+                raise ValueError("phi_frame_condition_max requires " + "; ".join(frame_condition_problems))
 
         from vfe3.model.positional_phi import _POS_PHI
         _require(self.pos_phi, tuple(sorted(_POS_PHI)), "pos_phi")
@@ -1934,6 +1992,8 @@ class VFE3Config:
             v = getattr(self, name)
             if not math.isfinite(v) or v < 0.0:
                 raise ValueError(f"{name} must be finite and >= 0, got {v}")
+        if self.min_lr_frac > 1.0:      # a floor above the base rate would raise every group's peak lr
+            raise ValueError(f"min_lr_frac must be <= 1, got {self.min_lr_frac}")
         # Optional absolute rates: None inherits, otherwise a finite real >= 0 (never a bool).
         for name in ("m_relational_score_lr", "m_relational_content_lr",
                      "m_pos_phi_lr", "m_layernorm_lr", "m_decode_mu_lr",
@@ -1981,6 +2041,7 @@ class VFE3Config:
         # Activity is structural, independent of values and warning visibility. Notices only
         # display settings that differ from their defaults; sweep validation uses the full map.
         defaults = {field.name: field.default for field in fields(self) if field.default is not MISSING}
+        defaults["kl_max"] = float(8 * self.embed_dim)       # what the None default resolved to
         inactive = self.inactive_fields()
         notices = [
             f"{name}={getattr(self, name)!r} ({reason})"
@@ -2077,22 +2138,24 @@ class VFE3Config:
             # other optimizer group falls back to it (vfe3/train.py build_optimizer; audit 2026-10-10 round 2,
             # item 20). Under the fisher validation the decoder is linear or untied, so its means read
             # m_decode_mu_lr and an untied bank's log variances read m_decode_sigma_lr.
-            def table_decay(own: Optional[float]) -> float:
-                return self.weight_decay if own is None else own
+            layernorm_affine_live = (self.layernorm_affine
+                                     and "layernorm" in (self.norm_type_block, self.norm_type_final))
+            # Groups that read m_p_mu_lr: those whose own rate inherits it, plus CG path weights and the T5 bias.
             mu_rate_fallback = (
-                self.m_decode_mu_lr is None
-                or (self.use_block_mlp and self.m_block_mlp_lr is None)
-                or self.m_relational_score_lr is None or self.m_relational_content_lr is None
+                any(self.inherits_hyperparameter(name, "m_p_mu_lr")
+                    for name, live in (("m_decode_mu_lr", True), ("m_block_mlp_lr", self.use_block_mlp),
+                                       ("m_relational_score_lr", True), ("m_relational_content_lr", True),
+                                       ("m_layernorm_lr", layernorm_affine_live))
+                    if live)
                 or self.use_cg_coupling
-                or (self.t5_learnable_bias and self.beta_attention_prior == "t5_relative_bias")
-                or (self.layernorm_affine and "layernorm" in (self.norm_type_block, self.norm_type_final)
-                    and self.m_layernorm_lr is None))
-            if table_decay(self.mu_weight_decay) == 0.0 and not mu_rate_fallback:
+                or (self.t5_learnable_bias and self.beta_attention_prior == "t5_relative_bias"))
+            if self.resolved_hyperparameter("mu_weight_decay") == 0.0 and not mu_rate_fallback:
                 mark(("m_p_mu_lr",), "m_table_update_mode='fisher' steps mu_embed at m_table_fisher_lr; its AdamW "
                      "rate only shapes the schedule (0 freezes the table), its decay is 0 and no other group "
                      "inherits it")
-            sigma_rate_fallback = self.decode_mode != "linear" and self.m_decode_sigma_lr is None
-            if table_decay(self.sigma_weight_decay) == 0.0 and not sigma_rate_fallback:
+            sigma_rate_fallback = (self.decode_mode != "linear"
+                                   and self.inherits_hyperparameter("m_decode_sigma_lr", "m_p_sigma_lr"))
+            if self.resolved_hyperparameter("sigma_weight_decay") == 0.0 and not sigma_rate_fallback:
                 mark(("m_p_sigma_lr",), "m_table_update_mode='fisher' steps sigma_log_embed at m_table_fisher_lr; "
                      "its AdamW rate only shapes the schedule (0 freezes the table), its decay is 0 and no other "
                      "group inherits it")
@@ -2374,11 +2437,9 @@ class VFE3Config:
         # Decay is read per optimizer group (vfe3/train.py build_optimizer). The global weight_decay reaches
         # only a group that sets no decay of its own: the block MLP and CG path weights, and the mean,
         # log-variance and decode-mean tables whose dedicated decay is None (audit 2026-10-10, item 13).
-        decode_mean_wd = (self.decode_mu_weight_decay if self.decode_mu_weight_decay is not None
-                          else self.mu_weight_decay)
         if (not self.use_block_mlp and not self.use_cg_coupling
-                and self.mu_weight_decay is not None and self.sigma_weight_decay is not None
-                and decode_mean_wd is not None):
+                and not any(self.inherits_hyperparameter(name, "weight_decay")
+                            for name in ("mu_weight_decay", "sigma_weight_decay", "decode_mu_weight_decay"))):
             mark(("weight_decay",),
                  "every optimizer group sets its own decay (no block MLP or CG coupling, and "
                  "mu/sigma/decode-mean decays are set)")
@@ -2392,6 +2453,14 @@ class VFE3Config:
             mark(("m_pos_phi_lr", "phi_weight_decay"),
                  f"gauge_transport={self.gauge_transport!r} sets requires_grad=False on the frame "
                  "tables, so no phi-role step or decay applies")
+        from vfe3.gauge_optim import FRAME_CONDITION_INERT_GROUPS
+        if self.gauge_transport in ("off", "frozen"):
+            mark(("phi_frame_condition_max",),
+                 f"gauge_transport={self.gauge_transport!r} freezes the frame tables, so no step is bounded")
+        elif self.gauge_group in FRAME_CONDITION_INERT_GROUPS:
+            mark(("phi_frame_condition_max",),
+                 f"gauge_group={self.gauge_group!r} frames are orthogonal or conformal on every head "
+                 "(cond_2 = 1), so there is nothing to bound")
         if self.attention_mode == "projected_predictive" or self.skip_belief_sigma_update:
             mark(("e_q_sigma_lr", "e_sigma_q_trust", "sigma_max"),
                  "no sigma E-step runs on projected routes or under skip_belief_sigma_update "
@@ -2576,6 +2645,25 @@ class VFE3Config:
             raise ValueError(f"d_head is undefined for heads of different sizes {self.head_dims}; "
                              f"read head_dims")
         return self.embed_dim // self.n_heads
+
+    def resolved_hyperparameter(self, name: str) -> float:
+        r"""Effective value of a rate or decay: its own value, or, when None, its parent's (recursively).
+
+        The parents are listed in ``_INHERITED_HYPERPARAMETERS``; a field outside it is returned as stored.
+        """
+        value = getattr(self, name)
+        while value is None:
+            name = _INHERITED_HYPERPARAMETERS[name]
+            value = getattr(self, name)
+        return value
+
+    def inherits_hyperparameter(self, name: str, ancestor: str) -> bool:
+        """True when ``name`` is None and its value resolves through ``ancestor``."""
+        while getattr(self, name) is None:
+            name = _INHERITED_HYPERPARAMETERS[name]
+            if name == ancestor:
+                return True
+        return False
 
     def _chart_ordering_problem(self) -> Optional[str]:
         r"""Describe a violated manifold-phi chart ordering, or return None when it holds.
@@ -2784,6 +2872,7 @@ def _migrate_retired_fields(
 #   m_decode_mu_lr, m_decode_sigma_lr None (inherit) at d04dfc4 (2026-09-30), now 0.025 / 0.001
 #   projected_cov_recovery_precision  "fp64" at fed4164 (2026-10-04), now "fp32"
 #   rope_space                        "frame" from eaa3a21 (2026-10-07)
+#   kl_max                            100.0 until 2026-10-12, now None (8 * embed_dim)
 _HISTORICAL_DEFAULT_PINS: dict[str, Any] = {
     "content_link_chart":               "affine",
     "predictive_covariance":            "passthrough",
@@ -2791,6 +2880,7 @@ _HISTORICAL_DEFAULT_PINS: dict[str, Any] = {
     "m_decode_sigma_lr":                None,
     "projected_cov_recovery_precision": "fp64",
     "rope_space":                       "frame",
+    "kl_max":                           100.0,
 }
 
 

@@ -62,6 +62,21 @@ def ieee_fp32_matmul() -> Iterator[None]:
         torch.set_float32_matmul_precision(previous)
 
 
+@contextmanager
+def restored_fp32_matmul_precision() -> Iterator[None]:
+    r"""Restore the process fp32 matmul policy on exit, so each in-process sweep cell starts from the same state.
+
+    ``fp32_matmul_precision=None`` leaves the policy as it is, and the policy is process state, so without this
+    a None cell would inherit whatever the previous cell pinned and its result would depend on sweep order
+    (audit 2026-10-12 #14). Wraps the ablation and scaling cell runners; also works as a function decorator.
+    """
+    previous = torch.get_float32_matmul_precision()
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(previous)
+
+
 def set_fill_uninitialized_memory(enabled: bool) -> None:
     r"""Set ``torch.utils.deterministic.fill_uninitialized_memory`` (read only under deterministic algorithms).
 

@@ -28,6 +28,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from vfe3.config import VFE3Config, config_from_serialized, serialize_config
+from vfe3.runtime import restored_fp32_matmul_precision
 
 __all__ = ["run_vfe", "reserve_directory", "rename_run_by_test_ppl"]
 
@@ -117,6 +118,7 @@ def _loader(
                            vocab_size=cfg.vocab_size, generator=generator)
 
 
+@restored_fp32_matmul_precision()         # a None arm must not inherit the previous arm's pinned matmul policy
 def run_vfe(
     cfg:       VFE3Config,
 

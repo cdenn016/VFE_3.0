@@ -827,6 +827,7 @@ def projected_gauge_equivariance(
             mean, cov = relational_predictive_readout(
                 mu, sigma, frame, ops, tau=tau, kl_max=cfg.kl_max, log_prior=log_prior,
                 value_frame=value_frame, capture=capture, return_covariance=True,
+                floor_anchor=sigma,                     # the snapshot prior moves with the belief: Sigma_p = Sigma
                 **({"link_state": link_state} if link_state is not None else {}))
             out = {"readout_mean": (U_v_inv @ mean.unsqueeze(-1)).squeeze(-1),
                    "readout_covariance": U_v_inv @ cov @ U_v_inv.transpose(-1, -2)}

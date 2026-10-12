@@ -125,6 +125,15 @@ def _inputs(H: int = 2, d: int = 2, N: int = 4, seed: int = 0, batch: Tuple[int,
                 log_prior=_causal_prior(g, N, H))
 
 
+def _prior(like: torch.Tensor, full: bool, seed: int = 99) -> torch.Tensor:
+    r"""A fixed local prior covariance Sigma_p in ``like``'s layout (``full``: SPD (..., N, K, K), else a positive
+    diagonal (..., N, K)): the anchor of the prior-anchored floor f Sigma_p, distinct from the belief covariance."""
+    g = _gen(seed)
+    if not full:
+        return torch.rand(like.shape, generator=g, dtype=F64) + 0.4
+    return _spd(g, *like.shape[:-1])
+
+
 # ----------------------------------------------------------------------------------------------
 # Independent references
 # ----------------------------------------------------------------------------------------------
@@ -459,7 +468,8 @@ def test_mean_field_gain_fraction_is_evaluated_at_the_input_moments() -> None:
 @pytest.mark.parametrize("inference", INFERENCE)
 @pytest.mark.parametrize("layout", ["dense", "compact"])
 def test_passive_gauge_action_maps_outputs_covariantly(inference: str, layout: str) -> None:
-    r"""mu -> g mu, Sigma -> g Sigma g^T, U -> g U gives mu^+ -> g mu^+ and Sigma^+ -> g Sigma^+ g^T."""
+    r"""mu -> g mu, Sigma -> g Sigma g^T, U -> g U and the prior Sigma_p -> g Sigma_p g^T give mu^+ -> g mu^+ and
+    Sigma^+ -> g Sigma^+ g^T (the floor f Sigma_p moves with the prior)."""
     ops = _ops(inference, seed=61)
     data = _inputs(seed=62)
     N, K = data["mu"].shape[-2:]
@@ -475,9 +485,11 @@ def test_passive_gauge_action_maps_outputs_covariantly(inference: str, layout: s
         moved_blocks = g_blocks @ frame.forward
         moved = CanonicalFrameContext(moved_blocks, torch.linalg.inv(moved_blocks), block_diagonal=True)
     mu, sigma, lp = data["mu"], data["sigma_full"], data["log_prior"]
-    mean, cov = ops.minimal_agent_update(mu, sigma, frame, lp, return_covariance=True)
+    prior = _prior(sigma, True)
+    mean, cov = ops.minimal_agent_update(mu, sigma, frame, lp, return_covariance=True, floor_anchor=prior)
     mean_g, cov_g = ops.minimal_agent_update((G @ mu.unsqueeze(-1)).squeeze(-1), G @ sigma @ G.transpose(-1, -2),
-                                             moved, lp, return_covariance=True)
+                                             moved, lp, return_covariance=True,
+                                             floor_anchor=G @ prior @ G.transpose(-1, -2))
     _close(mean_g, (G @ mean.unsqueeze(-1)).squeeze(-1), 1e-9)
     _close(cov_g, G @ cov @ G.transpose(-1, -2), 1e-9)
 
@@ -489,11 +501,14 @@ def test_future_tokens_do_not_reach_earlier_receivers(inference: str, family: st
     data = _inputs(seed=72)
     N = data["mu"].shape[-2]
     sigma = data["sigma_diag"] if family == "diagonal" else data["sigma_full"]
-    base = ops.minimal_agent_update(data["mu"], sigma, data["compact"], data["log_prior"], return_covariance=True)
+    prior = _prior(sigma, family == "full")
+    base = ops.minimal_agent_update(data["mu"], sigma, data["compact"], data["log_prior"], return_covariance=True,
+                                    floor_anchor=prior)
     mu2, sigma2 = data["mu"].clone(), sigma.clone()
     mu2[0, N - 1] += 3.0
     sigma2[0, N - 1] *= 2.5
-    moved = ops.minimal_agent_update(mu2, sigma2, data["compact"], data["log_prior"], return_covariance=True)
+    moved = ops.minimal_agent_update(mu2, sigma2, data["compact"], data["log_prior"], return_covariance=True,
+                                     floor_anchor=prior)
     for got, want in zip(moved, base):
         torch.testing.assert_close(got[0, :N - 1], want[0, :N - 1], rtol=1e-12, atol=1e-12)
         assert not torch.allclose(got[0, N - 1], want[0, N - 1])     # the last receiver does see its own change
@@ -515,10 +530,13 @@ def test_blockwise_equals_dense(inference: str, batch: Tuple[int, ...]) -> None:
 
     ma.gain_basis = recording
     try:
-        blockwise = ops.minimal_agent_update(mu, sigma, data["compact"], lp, return_covariance=True)
-        dense_frame = ops.minimal_agent_update(mu, sigma, data["dense"], lp, return_covariance=True)
+        prior = _prior(sigma, False)
+        blockwise = ops.minimal_agent_update(mu, sigma, data["compact"], lp, return_covariance=True,
+                                             floor_anchor=prior)
+        dense_frame = ops.minimal_agent_update(mu, sigma, data["dense"], lp, return_covariance=True,
+                                               floor_anchor=prior)
         full_family = ops.minimal_agent_update(mu, torch.diag_embed(sigma), data["compact"], lp,
-                                               return_covariance=True)
+                                               return_covariance=True, floor_anchor=torch.diag_embed(prior))
     finally:
         ma.gain_basis = original
     assert calls == [1, 1, 0, 0, 0, 0]                                # the block route ran first, dense twice
@@ -542,7 +560,8 @@ class _Readout(torch.nn.Module):
 
     def forward(self, mu: torch.Tensor, sigma: torch.Tensor, frame: CanonicalFrameContext,
                 log_prior: torch.Tensor) -> torch.Tensor:
-        mean, cov = self.ops.minimal_agent_update(mu, sigma, frame, log_prior, return_covariance=True)
+        mean, cov = self.ops.minimal_agent_update(mu, sigma, frame, log_prior, return_covariance=True,
+                                                  floor_anchor=_prior(sigma, sigma.dim() == mu.dim() + 1))
         return (self.weights[0] * mean).sum() + (self.weights[1] * cov).sum()
 
 
@@ -581,7 +600,8 @@ def test_tile_boundaries_give_identical_values_and_gradients(inference: str, mon
         ops.zero_grad(set_to_none=True)
         mu = data["mu"].clone().requires_grad_(True)
         sigma = data["sigma_diag"].clone().requires_grad_(True)
-        mean, cov = ops.minimal_agent_update(mu, sigma, data["compact"], data["log_prior"], return_covariance=True)
+        mean, cov = ops.minimal_agent_update(mu, sigma, data["compact"], data["log_prior"], return_covariance=True,
+                                             floor_anchor=_prior(sigma, False))
         (mean.square().sum() + cov.sum()).backward()
         return [mean.detach(), cov.detach(), mu.grad, sigma.grad] + [p.grad for p in ops.parameters()]
 
@@ -717,13 +737,14 @@ def test_float32_failure_is_recomputed_in_float64(inference: str) -> None:
     before = int(source_recovery_counter(mu.device))
     capture: dict = {}
     mean32, cov32 = ops32.minimal_agent_update(mu32, sigma32, frame32, lp.float(), return_covariance=True,
-                                               capture=capture)
+                                               capture=capture, floor_anchor=sigma.float())
     assert int(source_recovery_counter(mu.device)) - before == 2 * _N32 * _H32
     assert mean32.dtype == cov32.dtype == capture["beta_pre"].dtype == torch.float32
     ops64 = _k32_operators(inference, maps32[0].double(), maps32[1].double(), F64)
     mu64 = mu32.detach().double().requires_grad_(True)
     sigma64 = sigma32.detach().double().requires_grad_(True)
-    mean64, cov64 = ops64.minimal_agent_update(mu64, sigma64, frame32, lp, return_covariance=True)
+    mean64, cov64 = ops64.minimal_agent_update(mu64, sigma64, frame32, lp, return_covariance=True,
+                                               floor_anchor=sigma.float().double())
     assert torch.equal(mean32, mean64.float()) and torch.equal(cov32, cov64.float())
     g = _gen(8)
     w_mean, w_cov = _rn(g, *mean32.shape).float(), _rn(g, *cov32.shape).float()
@@ -734,7 +755,7 @@ def test_float32_failure_is_recomputed_in_float64(inference: str) -> None:
         assert torch.equal(p32.grad, p64.grad.float())
     with torch.no_grad():
         mean_ref, cov_ref = _k32_operators(inference, S, T_, F64).minimal_agent_update(
-            mu, sigma, frame, lp, return_covariance=True)
+            mu, sigma, frame, lp, return_covariance=True, floor_anchor=sigma)
     gap_mean, gap_cov = _relative(mean32, mean_ref), _relative(cov32, cov_ref)
     print(f"\n[minimal agent] float32 failure recomputed in float64 ({inference}): relative gap to the unrounded "
           f"float64 readout, mean {gap_mean:.2e}, covariance {gap_cov:.2e}")
@@ -753,16 +774,17 @@ def test_float32_operating_range_and_the_query_certificate(inference: str) -> No
         frame32 = CanonicalFrameContext(frame.forward.float(), frame.inverse.float(), block_diagonal=True)
         with torch.no_grad():
             mean_ref, cov_ref = _k32_operators(inference, S, T_, F64).minimal_agent_update(
-                mu, sigma, frame, lp, return_covariance=True)
+                mu, sigma, frame, lp, return_covariance=True, floor_anchor=sigma)
             rounded = _k32_operators(inference, ops32.raw_score_q.double(), ops32.T.double(), F64).minimal_agent_update(
-                mu.float().double(), sigma.float().double(), frame32, lp, return_covariance=True)
+                mu.float().double(), sigma.float().double(), frame32, lp, return_covariance=True,
+                floor_anchor=sigma.float().double())
         for recovery in (False, True):
             previous = set_projected_condition_recovery(recovery)
             try:
                 before = int(source_recovery_counter(mu.device))
                 with torch.no_grad():
                     mean32, cov32 = ops32.minimal_agent_update(mu.float(), sigma.float(), frame32, lp.float(),
-                                                               return_covariance=True)
+                                                               return_covariance=True, floor_anchor=sigma.float())
                 recovered = int(source_recovery_counter(mu.device)) - before
             finally:
                 set_projected_condition_recovery(previous)

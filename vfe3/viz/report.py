@@ -38,7 +38,6 @@ from vfe3.run_artifacts import (
     _unique_sibling_temp,
     _unique_sibling_output_temp,
     _write_json_atomic,
-    collect_estep_depth_sensitivity,
     collect_estep_character,
     collect_beta_channel_decomposition,
     collect_context_sensitivity,
@@ -444,14 +443,13 @@ def _prepare_missing_saved_probes(
     split:          str = "validation",
 ) -> None:
     r"""Persist missing finalization probes from the loaded model and first retained report batch."""
-    depth_path = run_dir / "estep_depth_sensitivity.json"
     phi_path = run_dir / "phi_numerics.json"
     pending = []
     for name in ("estep_character", "beta_channel_decomposition", "context_sensitivity"):
         path = run_dir / f"{name}.json"
         if not path.is_file() or json.loads(path.read_text(encoding="utf-8")).get("available") is False:
             pending.append(name)
-    if depth_path.is_file() and phi_path.is_file() and not pending:
+    if phi_path.is_file() and not pending:
         return
     if not report_batches:
         logger.warning("saved probes skipped: report loader supplied no retained batch")
@@ -494,22 +492,6 @@ def _prepare_missing_saved_probes(
                 logger.info("probe figure %r skipped (%s); record kept in %s.json", name, exc, name)
         except Exception as exc:
             logger.warning("supported probe %s failed (%s); skipped", name, exc)
-    if depth_path.is_file():
-        return
-    if not isinstance(targets, torch.Tensor):
-        logger.warning("E-step depth-sensitivity probe skipped: report batch has no tensor targets")
-        return
-    try:
-        record = collect_estep_depth_sensitivity(
-            model,
-            tokens,
-            targets.to(device),
-            depths=(0, 1, 2, 3, 5, 8),
-        )
-        _write_json_atomic(depth_path, record)
-        logger.info("saved probe -> %s", depth_path)
-    except Exception as exc:
-        logger.warning("E-step depth-sensitivity probe failed (%s); skipped", exc)
 
 
 def _write_figure(
@@ -780,8 +762,8 @@ def generate_figures(
     the figures it is best-effort, and its ``REPORT.md`` is appended to the returned paths.
     Full-vocabulary computation is always skipped when its actual-batch,
     decode-aware workspace estimate exceeds the internal 8 GB safety guard; lighter inputs and
-    figures still run. ``prepare_saved_probes`` persists missing depth-sensitivity and phi-numerics
-    inputs from the already-loaded model and retained report batch so an isolated on-demand worker
+    figures still run. ``prepare_saved_probes`` persists missing E-step-character, beta-channel,
+    context-sensitivity and phi-numerics inputs from the already-loaded model and retained report batch so an isolated on-demand worker
     can render the corresponding finalization figures without a second report replay. ``n_e_steps``
     overrides the E-step trace length (default: the trained ``cfg.n_e_steps``). Returns the figure
     paths actually written (best-effort: a failed figure is logged and omitted).

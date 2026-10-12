@@ -112,7 +112,7 @@ from vfe3.run_artifacts import (
     semantic_config_fingerprint,
     strict_code_identity_enabled,
 )
-from vfe3.runtime import seed_everything
+from vfe3.runtime import restored_fp32_matmul_precision, seed_everything
 from vfe3.train import coverage_lines, evaluate, train
 from vfe3.viz.extract import (
     across_layer_belief_trace,
@@ -1929,6 +1929,7 @@ def _eval_at_growing_n(
     return out
 
 
+@restored_fp32_matmul_precision()         # a None cell must not inherit the previous cell's pinned matmul policy
 def run_single(
     label:       str,
     overrides:   Dict[str, Any],

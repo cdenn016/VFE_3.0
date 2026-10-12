@@ -614,9 +614,12 @@ def prototype_mean_field_posterior(
             g = eta - D * x                                                  # (..., K) sum_a r_a (nu_a - xi)/lambda_a
             C_plus = None
             if layout == "diagonal":
-                P = Cw / (1.0 + Cw * D)                                      # (..., K)
+                B = 1.0 + Cw * D                                             # (..., K) I + D^{1/2} C D^{1/2}
+                P = Cw / B                                                   # (..., K)
                 delta = P * g
                 C_plus = P
+                bad = ~(torch.isfinite(B) & (B > 0)).all()                   # the diagonal Cholesky check; NaN fails
+                failed = bad if failed is None else failed | bad
             else:
                 Cb = Cw.unsqueeze(-3) if layout == "dense" else Cw           # (..., G, b, b)
                 G, b = Cb.shape[-3], Cb.shape[-1]
@@ -635,7 +638,7 @@ def prototype_mean_field_posterior(
                 x_lab, c_lab = x + delta, covariance_diagonal(C_plus, layout)   # the next labels read (xi^+, diag C^+)
         if failed is not None and bool(failed):
             raise ValueError("prototype-agent power-posterior matrix I + D^{1/2} C D^{1/2} is not positive "
-                             "definite: the working covariance is not positive semidefinite")
+                             "definite: the working covariance is not positive semidefinite or not finite")
         return MeanFieldPrototypePosterior(
             xi_plus=x + delta, delta_xi=delta, C_plus=C_plus if need_covariance else None,
             responsibilities=responsibilities, D=D, eta=eta)

@@ -95,6 +95,7 @@ PER_TYPE_TABLE_INITS: Tuple[str, ...] = ("zero", "phi_like")
 ATTENTION_PRIORS: Tuple[str, ...] = ("causal_alibi", "causal")
 POS_ROTATIONS: Tuple[str, ...] = ("none", "rope")
 AMP_DTYPES: Tuple[Optional[str], ...] = (None, "bf16", "fp16")
+GRAD_CLIP_SCOPES: Tuple[str, ...] = ("role", "group")
 FP32_MATMUL_PRECISIONS: Tuple[Optional[str], ...] = (None, "highest", "high", "medium")
 DECODE_CE_CHECKPOINTS: Tuple[str, ...] = ("auto", "auto_aggregate", "always", "never")
 
@@ -109,8 +110,8 @@ MAX_PASSES: float = 16.0
 # Fields that the matched arm copies from the VFE base config (identical names on both sides).
 MATCHED_FIELDS: Tuple[str, ...] = (
     "vocab_size", "embed_dim", "n_heads", "n_layers", "max_seq_len", "batch_size", "eval_stride",
-    "max_steps", "warmup_steps", "min_lr_frac", "grad_clip", "grad_accum_steps", "train_window_offset",
-    "amp_dtype", "fp32_matmul_precision", "seed", "deterministic", "fill_uninitialized_memory",
+    "max_steps", "warmup_steps", "min_lr_frac", "grad_clip", "grad_clip_scope", "grad_accum_steps",
+    "train_window_offset", "amp_dtype", "fp32_matmul_precision", "seed", "deterministic", "fill_uninitialized_memory",
     "log_interval", "eval_interval",
     "checkpoint_interval", "val_diagnostic_batches", "beta_attention_prior", "alibi_slope",
     "decode_unigram_prior", "unigram_kappa", "decode_chunk_size", "decode_ce_checkpoint",
@@ -182,6 +183,9 @@ class BaselineConfig:
     min_lr:                float         = 0.0         # retired 2026-10-02: only 0 (kept for saved configs)
     min_lr_frac:           float         = 0.01
     grad_clip:             Optional[float] = 1.0
+    # "role" | "group": one L2 clip per optimizer role (mu, and phi with a per-type table) or per optimizer
+    # group, read by the shared loop as VFE3Config.grad_clip_scope is.
+    grad_clip_scope:       str           = "role"
     grad_accum_steps:      int           = 1
     init_std:              float         = 0.02        # N(0, init_std^2) matrices; W_O and W_2 / sqrt(2L)
     layernorm_eps:         float         = 1e-5
@@ -283,6 +287,8 @@ class BaselineConfig:
             raise ValueError("adam_beta1, adam_beta2 must lie in [0, 1) and adam_eps must be positive")
         if self.grad_clip is not None and self.grad_clip < 0.0:
             raise ValueError(f"grad_clip must be None or >= 0, got {self.grad_clip}")
+        if self.grad_clip_scope not in GRAD_CLIP_SCOPES:
+            raise ValueError(f"grad_clip_scope must be one of {GRAD_CLIP_SCOPES}, got {self.grad_clip_scope!r}")
         if self.init_std <= 0.0 or self.layernorm_eps <= 0.0:
             raise ValueError("init_std and layernorm_eps must be positive")
         if self.amp_dtype not in AMP_DTYPES:
@@ -389,6 +395,8 @@ class BaselineConfig:
             out["per_type_table_init_scale"] = "per_type_table_init='zero' draws no random table"
         if self.amp_dtype is None:
             out["amp_dtype"] = "autocast is off (fp32 blocks)"
+        if not self.grad_clip:
+            out["grad_clip_scope"] = "only read when grad_clip > 0"
         if self.eval_stride is None:
             out["eval_stride"] = "validation and test use disjoint max_seq_len windows"
         if not self.decode_unigram_prior:
@@ -415,7 +423,7 @@ class BaselineConfig:
 
         Copied from the base: tokenizer size, width :math:`K`, heads :math:`H` (head width
         :math:`d = K/H`, the VFE block size), depth :math:`L`, context, batch, evaluation stride, step
-        budget, warmup and learning-rate floors, gradient clip and accumulation, the training-window
+        budget, warmup and learning-rate floors, gradient clip, its scope and accumulation, the training-window
         origin (``train_window_offset``), precision, seed,
         cadence, the attention log-prior and its slope, and the unigram decode prior
         (:data:`MATCHED_FIELDS`). A base with ``pos_rotation='rope'`` gives the arm rotary query/key
@@ -1108,7 +1116,8 @@ def build_optimizer(
 
     Matrices and tables (:math:`E`, :math:`W_{Q,K,V,O}`, :math:`W_{1,2}`, :math:`W_{\rm out}`) decay
     at ``weight_decay``; gains and biases (LayerNorm, :math:`b_{1,2}`, :math:`b_{\rm out}`) do not.
-    Both carry role ``"mu"``, so the loop's per-role clip is one global clip over the transformer.
+    Both carry role ``"mu"``, so under ``grad_clip_scope='role'`` the loop's per-role clip is one global
+    clip over the transformer; under ``'group'`` each group below is clipped by its own norm.
     The read-map table :math:`X` has its own group (``per_type_table_lr``, ``per_type_table_weight_decay``,
     decaying :math:`A` toward :math:`I`) with role ``"phi"``: like the VFE frame table it replaces, it
     gets its own clip budget and the ``lr_phi`` / ``grad_norm_phi`` columns. Every trainable parameter

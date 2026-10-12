@@ -121,6 +121,15 @@ def _local_inputs(seed: int, N: int, H: int, d: int, batch: int = 1) -> _Local:
                   _causal_log_prior(g, H, N))
 
 
+def _prior(like: torch.Tensor, full: bool, seed: int = 99) -> torch.Tensor:
+    r"""A fixed local prior covariance :math:`\Sigma_p` in ``like``'s layout (``full``: SPD ``(..., N, K, K)``, else
+    a positive diagonal ``(..., N, K)``): the anchor of the floor :math:`f\,\Sigma_p`, distinct from the belief."""
+    g = _gen(seed)
+    if not full:
+        return torch.rand(like.shape, generator=g, dtype=F64) + 0.4
+    return _spd(g, *like.shape[:-1])
+
+
 def _operators(inference: str, H: int, d: int, seed: int, *, checkpoint: bool = False,
                noise_init: float = 1.0) -> RelationalOperators:
     r"""Float64 minimal-agent operators with generic full-row-rank :math:`S_h`, :math:`T_h` and channel noises."""
@@ -348,10 +357,11 @@ def _reference_posterior_covariance(C_dense: torch.Tensor, result: ma.MinimalAge
 def _local_reference(
     mu: torch.Tensor, sigma: torch.Tensor, U: torch.Tensor,          # (N, K), (N, K) or (N, K, K), (N, K, K)
     S: torch.Tensor, T: torch.Tensor, noise: torch.Tensor, log_prior: torch.Tensor, inference: str, floor: float,
+    prior: torch.Tensor,                                             # sigma's layout: the local prior Sigma_p
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    r"""Local outputs :math:`\mu^+ = U\xi^+`, :math:`\Sigma^+ = UC^+U^\top + f\,\tfrac{\operatorname{tr}C}{K}UU^\top`
-    (its diagonal for a diagonal input) from the brute-force reference posteriors, plus the labels and costs."""
-    N, K = mu.shape
+    r"""Local outputs :math:`\mu^+ = U\xi^+`, :math:`\Sigma^+ = UC^+U^\top + f\,\Sigma_p` (its diagonal for a diagonal
+    input; the prior-anchored floor is added in local coordinates, audit 2026-10-12 T5) from the brute-force reference
+    posteriors, plus the labels and costs."""
     diagonal = sigma.dim() == 2
     U_inv = torch.linalg.inv(U)
     xi = (U_inv @ mu.unsqueeze(-1)).squeeze(-1)
@@ -364,9 +374,7 @@ def _local_reference(
         mf = _mean_field_reference(xi, C, S, T, noise, log_prior)
         xi_plus, C_plus, labels, cost = mf.xi, mf.C, mf.labels, mf.kl
     mu_plus = (U @ xi_plus.unsqueeze(-1)).squeeze(-1)
-    trace = torch.diagonal(C, dim1=-2, dim2=-1).sum(-1)                                  # (N,)
-    Sigma_plus = U @ C_plus @ U.transpose(-1, -2) + (floor * trace / K)[:, None, None] * (U @ U.transpose(-1, -2))
-    Sigma_plus = _sym(Sigma_plus)
+    Sigma_plus = _sym(U @ C_plus @ U.transpose(-1, -2)) + floor * (torch.diag_embed(prior) if diagonal else prior)
     return mu_plus, (torch.diagonal(Sigma_plus, dim1=-2, dim2=-1) if diagonal else Sigma_plus), labels, cost
 
 
@@ -775,12 +783,13 @@ def test_operator_local_update_matches_the_brute_force_through_the_frames(infere
     sigma = data.sigma_diag if family == "diagonal" else data.sigma_full
     frame = data.compact if frame_kind == "compact" else data.dense
     capture: Dict[str, torch.Tensor] = {}
+    prior = _prior(sigma, family == "full")
     mean, cov = ops.minimal_agent_update(data.mu, sigma, frame, data.log_prior, return_covariance=True,
-                                         capture=capture)
+                                         capture=capture, floor_anchor=prior)
     assert mean.shape == data.mu.shape and cov.shape == sigma.shape
     for bidx in range(2):
         want_mean, want_cov, labels, cost = _local_reference(data.mu[bidx], sigma[bidx], data.U[bidx], S, T, noise,
-                                                             data.log_prior, inference, FLOOR)
+                                                             data.log_prior, inference, FLOOR, prior[bidx])
         _close(mean[bidx], want_mean, 1e-10, f"local mean, batch {bidx}")
         _close(cov[bidx], want_cov, 1e-10, f"local covariance plus floor, batch {bidx}")
         _close(capture["beta_pre"][bidx], labels, 1e-10, "captured labels")
@@ -794,7 +803,8 @@ def test_operator_local_update_matches_the_brute_force_through_the_frames(infere
     assert none is None and torch.equal(mean_only, mean)
     # The dispatch returns the same tensors and ignores tau and kl_max.
     via_mean, via_cov = relational_predictive_readout(data.mu, sigma, frame, ops, log_prior=data.log_prior,
-                                                      return_covariance=True, tau=0.37, kl_max=2.0)
+                                                      return_covariance=True, tau=0.37, kl_max=2.0,
+                                                      floor_anchor=prior)
     assert torch.equal(via_mean, mean) and torch.equal(via_cov, cov)
     assert torch.equal(relational_predictive_readout(data.mu, sigma, frame, ops, log_prior=data.log_prior), mean)
 
@@ -803,9 +813,11 @@ def test_blockwise_equals_dense_and_the_full_family_equals_its_diagonal_projecti
     ops = _operators("exact", 2, 3, seed=21)
     data = _local_inputs(22, N=4, H=2, d=3, batch=1)
     mu, sigma, lp = data.mu, data.sigma_diag, data.log_prior
-    blockwise = ops.minimal_agent_update(mu, sigma, data.compact, lp, return_covariance=True)
-    dense_frame = ops.minimal_agent_update(mu, sigma, data.dense, lp, return_covariance=True)
-    full_family = ops.minimal_agent_update(mu, torch.diag_embed(sigma), data.compact, lp, return_covariance=True)
+    prior = _prior(sigma, False)
+    blockwise = ops.minimal_agent_update(mu, sigma, data.compact, lp, return_covariance=True, floor_anchor=prior)
+    dense_frame = ops.minimal_agent_update(mu, sigma, data.dense, lp, return_covariance=True, floor_anchor=prior)
+    full_family = ops.minimal_agent_update(mu, torch.diag_embed(sigma), data.compact, lp, return_covariance=True,
+                                           floor_anchor=torch.diag_embed(prior))
     _close(dense_frame[0], blockwise[0], 1e-10)
     _close(dense_frame[1], blockwise[1], 1e-10)
     _close(full_family[0], blockwise[0], 1e-10)
@@ -837,7 +849,8 @@ def test_value_frame_with_equal_matrices_is_accepted_and_a_different_one_refused
 def test_passive_gauge_action_is_covariant(inference: str, frame_kind: str) -> None:
     r""":math:`(U_i, \mu_i, \Sigma_i)\mapsto(g_iU_i, g_i\mu_i, g_i\Sigma_ig_i^\top)` leaves the reference moments, hence
     the labels, unchanged and maps :math:`\mu_i^+\mapsto g_i\mu_i^+`, :math:`\Sigma_i^+\mapsto g_i\Sigma_i^+g_i^\top`
-    (the floor :math:`f\,\tfrac{\operatorname{tr}C_i}{K}U_iU_i^\top` transforms the same way). Tolerance :math:`10^{-9}`:
+    (the floor :math:`f\,\Sigma_{p,i}` transforms the same way when the site action also moves the prior,
+    :math:`\Sigma_{p,i}\mapsto g_i\Sigma_{p,i}g_i^\top`). Tolerance :math:`10^{-9}`:
     the random :math:`g_i` and frames have condition numbers of a few units, and two inversions enter."""
     ops = _operators(inference, 2, 2, seed=41)
     data = _local_inputs(42, N=4, H=2, d=2)
@@ -855,9 +868,12 @@ def test_passive_gauge_action_is_covariant(inference: str, frame_kind: str) -> N
         moved = CanonicalFrameContext(moved_blocks, torch.linalg.inv(moved_blocks), block_diagonal=True)
     mu, sigma, lp = data.mu, data.sigma_full, data.log_prior
     cap, cap_g = {}, {}
-    mean, cov = ops.minimal_agent_update(mu, sigma, frame, lp, return_covariance=True, capture=cap)
+    prior = _prior(sigma, True)
+    mean, cov = ops.minimal_agent_update(mu, sigma, frame, lp, return_covariance=True, capture=cap,
+                                         floor_anchor=prior)
     mean_g, cov_g = ops.minimal_agent_update((G @ mu.unsqueeze(-1)).squeeze(-1), _sym(G @ sigma @ G.transpose(-1, -2)),
-                                             moved, lp, return_covariance=True, capture=cap_g)
+                                             moved, lp, return_covariance=True, capture=cap_g,
+                                             floor_anchor=_sym(G @ prior @ G.transpose(-1, -2)))
     _close(mean_g, (G @ mean.unsqueeze(-1)).squeeze(-1), 1e-9, "mean covariance under the passive action")
     _close(cov_g, G @ cov @ G.transpose(-1, -2), 1e-9, "covariance covariance under the passive action")
     _close(cap_g["beta_pre"], cap["beta_pre"], 1e-9, "labels are gauge invariant")
@@ -873,11 +889,14 @@ def test_causal_prior_makes_later_tokens_invisible_to_earlier_receivers(inferenc
     ops = _operators(inference, 2, 2, seed=51)
     data = _local_inputs(52, N=4, H=2, d=2)
     sigma = data.sigma_diag if family == "diagonal" else data.sigma_full
-    base = ops.minimal_agent_update(data.mu, sigma, data.compact, data.log_prior, return_covariance=True)
+    prior = _prior(sigma, family == "full")
+    base = ops.minimal_agent_update(data.mu, sigma, data.compact, data.log_prior, return_covariance=True,
+                                    floor_anchor=prior)
     mu2, sigma2 = data.mu.clone(), sigma.clone()
     mu2[0, 2:] += 2.0
     sigma2[0, 2:] *= 1.7
-    moved = ops.minimal_agent_update(mu2, sigma2, data.compact, data.log_prior, return_covariance=True)
+    moved = ops.minimal_agent_update(mu2, sigma2, data.compact, data.log_prior, return_covariance=True,
+                                     floor_anchor=prior)
     for got, want in zip(moved, base):
         torch.testing.assert_close(got[0, :2], want[0, :2], rtol=1e-13, atol=1e-13)
         assert float((got[0, 2:] - want[0, 2:]).abs().max()) > 1e-3
@@ -891,7 +910,8 @@ def test_causal_prior_makes_later_tokens_invisible_to_earlier_receivers(inferenc
 
 def _readout_scalar(ops: RelationalOperators, mu: torch.Tensor, sigma: torch.Tensor, frame: CanonicalFrameContext,
                     lp: torch.Tensor, weights: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
-    mean, cov = ops.minimal_agent_update(mu, sigma, frame, lp, return_covariance=True)
+    mean, cov = ops.minimal_agent_update(mu, sigma, frame, lp, return_covariance=True,
+                                         floor_anchor=_prior(sigma, sigma.dim() == mu.dim() + 1))
     return (weights[0] * mean).sum() + (weights[1] * cov).sum()
 
 
@@ -952,7 +972,8 @@ def test_one_pair_tiles_reproduce_the_single_tile_values_and_gradients(monkeypat
         ops.zero_grad(set_to_none=True)
         mu = data.mu.clone().requires_grad_(True)
         sigma = data.sigma_full.clone().requires_grad_(True)
-        mean, cov = ops.minimal_agent_update(mu, sigma, data.compact, data.log_prior, return_covariance=True)
+        mean, cov = ops.minimal_agent_update(mu, sigma, data.compact, data.log_prior, return_covariance=True,
+                                             floor_anchor=_prior(sigma, True))
         (mean.square().sum() + cov.sum()).backward()
         return [mean.detach(), cov.detach(), mu.grad, sigma.grad] + [p.grad for p in ops.parameters()]
 
@@ -985,7 +1006,8 @@ def test_checkpointed_readout_is_bitwise_identical(inference: str, family: str) 
         ops = _operators(inference, 2, 2, seed=81, checkpoint=flag)
         mu = data.mu.clone().requires_grad_(True)
         sigma = sigma0.clone().requires_grad_(True)
-        mean, cov = ops.minimal_agent_update(mu, sigma, data.compact, data.log_prior, return_covariance=True)
+        mean, cov = ops.minimal_agent_update(mu, sigma, data.compact, data.log_prior, return_covariance=True,
+                                             floor_anchor=_prior(sigma, family == "full"))
         (mean.square().sum() + cov.sum()).backward()
         outputs.append([mean.detach(), cov.detach(), mu.grad, sigma.grad] + [p.grad for p in ops.parameters()])
     for plain, recomputed in zip(*outputs):

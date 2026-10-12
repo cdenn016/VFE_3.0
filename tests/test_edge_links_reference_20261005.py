@@ -17,7 +17,7 @@ The moments are derived here from the kernel
 .. math::
     X = r\,k_i + \sum_h L^h_{iJ^h}k_{J^h} + \epsilon,\qquad
     k_s\sim N(\mu_s,\Sigma_s)\ \text{independent},\quad J^h\sim\beta^h_i\ \text{independent},\quad
-    \epsilon\sim N\bigl(0,\ \phi\,\tfrac{\mathrm{tr}C_i}{K}\,U_iU_i^\top\bigr),
+    \epsilon\sim N\bigl(0,\ \phi\,\Sigma_{p,i}\bigr)\ \text{(the prior-anchored floor in local coordinates, audit 2026-10-12 T5)},
 
 by the law of total covariance, :math:`\mathrm{Cov}X=E_J[\mathrm{Cov}(X|J)]+\mathrm{Cov}_J[E(X|J)]`.
 Conditioned on the labels, :math:`X=\sum_sA_s(J)k_s+\epsilon` with
@@ -128,6 +128,17 @@ def _inputs(
     return mu, sigma_diag, sigma_full, beta, U, frame
 
 
+def _prior(like: torch.Tensor, full: bool, seed: int = 99) -> torch.Tensor:
+    r"""A local prior covariance :math:`\Sigma_p` in ``like``'s layout (``full``: SPD ``(..., N, K, K)``, else a
+    positive diagonal ``(..., N, K)``), drawn from its own generator so the floor anchor differs from the belief."""
+    generator = torch.Generator().manual_seed(seed)
+    if not full:
+        return torch.rand(like.shape, generator=generator, dtype=F64) + 0.4
+    n = like.shape[-1]
+    factor = torch.randn(like.shape, generator=generator, dtype=F64)
+    return factor @ factor.transpose(-1, -2) / n + 0.5 * torch.eye(n, dtype=F64)
+
+
 # --------------------------------------------------------------------------------------------------
 # The reference
 # --------------------------------------------------------------------------------------------------
@@ -180,11 +191,13 @@ def _reference_moments(
     beta:  torch.Tensor,    # (H, N, N)
     U:     torch.Tensor,    # (N, K, K)
     residual: bool,
+    prior: torch.Tensor,    # (N, K, K) local prior covariance Sigma_p (the floor anchor)
     floor: float = FLOOR,
     shift_trap: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Mean (without the residual, as ``predictive_content`` returns it) and the moment-matched
-    covariance of the kernel, by explicit loops over j, h, h' (module docstring).
+    covariance of the kernel, by explicit loops over j, h, h' (module docstring), plus the prior-anchored
+    floor :math:`f\,\Sigma_{p,i}` in local coordinates (audit 2026-10-12 T5).
 
     ``shift_trap`` deliberately forms the spread from the token-0-shifted reference means
     :math:`\xi_j-\xi_0` (the shortcut the edge-free code may take, invalid with edge-dependent links);
@@ -217,8 +230,7 @@ def _reference_moments(
         for h in range(H):
             cov = cov + sum(beta[h, i, j] * torch.outer(n[h, j], n[h, j]) for j in senders)
             cov = cov - torch.outer(n_bar[h], n_bar[h])
-        C_i = U_inv[i] @ sigma[i] @ U_inv[i].T
-        cov = cov + floor * torch.trace(C_i) / K * (U[i] @ U[i].T)
+        cov = cov + floor * prior[i]
         means.append(mean)
         covs.append(cov)
     return torch.stack(means), torch.stack(covs)
@@ -231,6 +243,7 @@ def _enumerated_moments(
     beta:  torch.Tensor,
     U:     torch.Tensor,
     residual: bool,
+    prior: torch.Tensor,    # (N, K, K) local prior covariance Sigma_p
     floor: float = FLOOR,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""The same kernel by enumerating every head-label tuple (checks the loop derivation)."""
@@ -256,9 +269,8 @@ def _enumerated_moments(
             first = first + weight * mean
             second = second + weight * torch.outer(mean, mean)
             within = within + weight * sum(A_s[s] @ sigma[s] @ A_s[s].T for s in range(N))
-        C_i = U_inv[i] @ sigma[i] @ U_inv[i].T
         means.append(first - (mu[i] if residual else 0.0))
-        covs.append(within + second - torch.outer(first, first) + floor * torch.trace(C_i) / K * (U[i] @ U[i].T))
+        covs.append(within + second - torch.outer(first, first) + floor * prior[i])
     return torch.stack(means), torch.stack(covs)
 
 
@@ -278,8 +290,9 @@ def test_reference_loop_derivation_matches_label_enumeration(mode: str, rank: in
     ops = _make_ops(d, mode, rank, residual)
     _set_maps(ops, generator)
     mu, _, sigma_full, beta, U, _ = _inputs(N, H * d, d, generator, block=False)
-    mean_a, cov_a = _reference_moments(ops, mu, sigma_full, beta, U, residual)
-    mean_b, cov_b = _enumerated_moments(ops, mu, sigma_full, beta, U, residual)
+    prior = _prior(sigma_full, True)
+    mean_a, cov_a = _reference_moments(ops, mu, sigma_full, beta, U, residual, prior)
+    mean_b, cov_b = _enumerated_moments(ops, mu, sigma_full, beta, U, residual, prior)
     torch.testing.assert_close(mean_a, mean_b, atol=1e-11, rtol=1e-11)
     torch.testing.assert_close(cov_a, cov_b, atol=1e-11, rtol=1e-11)
 
@@ -314,10 +327,12 @@ def test_mean_and_covariance_match_reference(mode: str, rank: int, residual: boo
     mu, sigma_diag, sigma_full, beta, U, frame = _inputs(N, H * d, d, generator, block=block)
     sigma = sigma_diag if family == "diag" else sigma_full
     dense_sigma = torch.diag_embed(sigma) if family == "diag" else sigma
-    mean_ref, cov_ref = _reference_moments(ops, mu, dense_sigma, beta, U, residual)
+    prior = _prior(sigma, family == "full")
+    dense_prior = torch.diag_embed(prior) if family == "diag" else prior
+    mean_ref, cov_ref = _reference_moments(ops, mu, dense_sigma, beta, U, residual, dense_prior)
     with torch.no_grad():
         mean = ops.predictive_content(mu, beta, frame)
-        cov = ops.predictive_covariance_update(mu, sigma, beta, frame)
+        cov = ops.predictive_covariance_update(mu, sigma, beta, frame, floor_anchor=prior)
     expected = torch.diagonal(cov_ref, dim1=-2, dim2=-1) if family == "diag" else cov_ref
     assert mean.shape == mu.shape and cov.shape == sigma.shape
     torch.testing.assert_close(mean, mean_ref, atol=1e-10, rtol=1e-10)
@@ -338,11 +353,12 @@ def test_reference_has_teeth(mode: str, rank: int) -> None:
         off.T.copy_(ops.T)
         off.O.copy_(ops.O)
     mu, _, sigma_full, beta, U, frame = _inputs(N, H * d, d, generator, block=False)
-    _, cov_ref = _reference_moments(ops, mu, sigma_full, beta, U, True)
-    _, cov_trap = _reference_moments(ops, mu, sigma_full, beta, U, True, shift_trap=True)
+    prior = _prior(sigma_full, True)
+    _, cov_ref = _reference_moments(ops, mu, sigma_full, beta, U, True, prior)
+    _, cov_trap = _reference_moments(ops, mu, sigma_full, beta, U, True, prior, shift_trap=True)
     with torch.no_grad():
         mean, mean_off = ops.predictive_content(mu, beta, frame), off.predictive_content(mu, beta, frame)
-        cov = ops.predictive_covariance_update(mu, sigma_full, beta, frame)
+        cov = ops.predictive_covariance_update(mu, sigma_full, beta, frame, floor_anchor=prior)
     scale = float(cov.abs().max())
     assert float((mean - mean_off).abs().max()) > 1e-3 * float(mean.abs().max())
     assert float((cov_trap - cov).abs().max()) > 1e-4 * scale
@@ -366,9 +382,11 @@ def test_batched_inputs_match_reference(mode: str, rank: int, residual: bool) ->
     frame = CanonicalFrameContext(blocks, torch.linalg.inv(blocks), block_diagonal=True)
     with torch.no_grad():
         mean = ops.predictive_content(mu, beta, frame)
-        cov = ops.predictive_covariance_update(mu, sigma, beta, frame)
+        prior = _prior(sigma, False)
+        cov = ops.predictive_covariance_update(mu, sigma, beta, frame, floor_anchor=prior)
     for b in range(B):
-        mean_ref, cov_ref = _reference_moments(ops, mu[b], torch.diag_embed(sigma[b]), beta[b], items[b][4], residual)
+        mean_ref, cov_ref = _reference_moments(ops, mu[b], torch.diag_embed(sigma[b]), beta[b], items[b][4], residual,
+                                               torch.diag_embed(prior[b]))
         torch.testing.assert_close(mean[b], mean_ref, atol=1e-10, rtol=1e-10)
         torch.testing.assert_close(cov[b], torch.diagonal(cov_ref, dim1=-2, dim2=-1), atol=1e-10, rtol=1e-10)
 
@@ -392,8 +410,8 @@ def test_zero_sender_map_reduces_to_exponential_chart(mode: str, rank: int, resi
     sigma = sigma_diag if family == "diag" else sigma_full
     with torch.no_grad():
         mean_on, mean_off = ops.predictive_content(mu, beta, frame), off.predictive_content(mu, beta, frame)
-        cov_on = ops.predictive_covariance_update(mu, sigma, beta, frame)
-        cov_off = off.predictive_covariance_update(mu, sigma, beta, frame)
+        cov_on = ops.predictive_covariance_update(mu, sigma, beta, frame, floor_anchor=_prior(sigma, family == "full"))
+        cov_off = off.predictive_covariance_update(mu, sigma, beta, frame, floor_anchor=_prior(sigma, family == "full"))
     torch.testing.assert_close(mean_on, mean_off, atol=1e-12, rtol=1e-12)
     torch.testing.assert_close(cov_on, cov_off, atol=1e-12, rtol=1e-12)
 
@@ -409,8 +427,9 @@ def _gauge(generator: torch.Generator, N: int, K: int, d: int, block: bool) -> t
 @pytest.mark.parametrize("residual", [False, True])
 @pytest.mark.parametrize("block", [True, False])
 def test_passive_gauge_covariance(mode: str, rank: int, residual: bool, block: bool) -> None:
-    r"""Plan 2.6 item 4: :math:`\mu\to g\mu`, :math:`\Sigma\to g\Sigma g^\top`, :math:`U\to gU` gives
-    :math:`m\to gm` and :math:`\Sigma^+\to g\Sigma^+g^\top` (full family, so the output is a matrix)."""
+    r"""Plan 2.6 item 4: :math:`\mu\to g\mu`, :math:`\Sigma\to g\Sigma g^\top`, :math:`U\to gU` and the prior
+    :math:`\Sigma_p\to g\Sigma_pg^\top` give :math:`m\to gm` and :math:`\Sigma^+\to g\Sigma^+g^\top` (full family,
+    so the output is a matrix)."""
     generator = torch.Generator().manual_seed(9)
     d, N = 3, 4
     K = H * d
@@ -428,9 +447,11 @@ def test_passive_gauge_covariance(mode: str, rank: int, residual: bool, block: b
         frame_g = CanonicalFrameContext(U_g, torch.linalg.inv(U_g))
     with torch.no_grad():
         mean = ops.predictive_content(mu, beta, frame)
-        cov = ops.predictive_covariance_update(mu, sigma_full, beta, frame)
+        prior = _prior(sigma_full, True)
+        cov = ops.predictive_covariance_update(mu, sigma_full, beta, frame, floor_anchor=prior)
         mean_g = ops.predictive_content(mu_g, beta, frame_g)
-        cov_g = ops.predictive_covariance_update(mu_g, sigma_g, beta, frame_g)
+        cov_g = ops.predictive_covariance_update(mu_g, sigma_g, beta, frame_g,
+                                                 floor_anchor=g @ prior @ g.transpose(-1, -2))
     torch.testing.assert_close(mean_g, (g @ mean.unsqueeze(-1)).squeeze(-1), atol=1e-9, rtol=1e-9)
     torch.testing.assert_close(cov_g, g @ cov @ g.transpose(-1, -2), atol=1e-9, rtol=1e-9)
 
@@ -521,10 +542,11 @@ def test_lowrank_causality_with_overflowing_future_pairs(rank: int, residual: bo
     assert not torch.isfinite(torch.linalg.matrix_exp(A3 @ B3.T)).all()
     sigma = torch.rand(N, K, generator=generator, dtype=F64) + 0.3
     sigma_full = torch.diag_embed(sigma)
-    mean_ref, cov_ref = _reference_moments(ops, mu, sigma_full, beta, U, residual)
+    prior = _prior(sigma_full, True)
+    mean_ref, cov_ref = _reference_moments(ops, mu, sigma_full, beta, U, residual, prior)
     with torch.no_grad():
         mean = ops.predictive_content(mu, beta, frame)
-        cov = ops.predictive_covariance_update(mu, sigma_full, beta, frame)
+        cov = ops.predictive_covariance_update(mu, sigma_full, beta, frame, floor_anchor=prior)
     assert torch.isfinite(mean).all() and torch.isfinite(cov).all()
     torch.testing.assert_close(mean, mean_ref, atol=1e-9, rtol=1e-9)
     torch.testing.assert_close(cov, cov_ref, atol=1e-9, rtol=1e-9)
@@ -534,7 +556,7 @@ def test_lowrank_causality_with_overflowing_future_pairs(rank: int, residual: bo
     mu2[N - 1] = U[N - 1] @ (torch.eye(K, dtype=F64)[N - 1] + 0.002 * torch.randn(K, generator=generator, dtype=F64))
     with torch.no_grad():
         mean2 = ops.predictive_content(mu2, beta, frame)
-        cov2 = ops.predictive_covariance_update(mu2, sigma_full, beta, frame)
+        cov2 = ops.predictive_covariance_update(mu2, sigma_full, beta, frame, floor_anchor=prior)
     torch.testing.assert_close(mean2[:N - 1], mean[:N - 1], atol=1e-12, rtol=1e-12)
     torch.testing.assert_close(cov2[:N - 1], cov[:N - 1], atol=1e-12, rtol=1e-12)
     assert (mean2[N - 1] - mean[N - 1]).abs().max() > 1e-6
@@ -551,10 +573,11 @@ def test_causality_with_large_but_finite_factors(mode: str, rank: int) -> None:
     ops = _make_ops(d, mode, rank, True)
     _set_maps(ops, generator, edge_scale=6.0)
     mu, sigma_diag, _, beta, U, frame = _inputs(N, K, d, generator, block=True)
-    mean_ref, cov_ref = _reference_moments(ops, mu, torch.diag_embed(sigma_diag), beta, U, True)
+    prior = _prior(sigma_diag, False)
+    mean_ref, cov_ref = _reference_moments(ops, mu, torch.diag_embed(sigma_diag), beta, U, True, torch.diag_embed(prior))
     with torch.no_grad():
         mean = ops.predictive_content(mu, beta, frame)
-        cov = ops.predictive_covariance_update(mu, sigma_diag, beta, frame)
+        cov = ops.predictive_covariance_update(mu, sigma_diag, beta, frame, floor_anchor=prior)
     assert torch.isfinite(mean).all() and torch.isfinite(cov).all()
     torch.testing.assert_close(mean, mean_ref, atol=1e-9, rtol=1e-9)
     torch.testing.assert_close(cov, torch.diagonal(cov_ref, dim1=-2, dim2=-1), atol=1e-9, rtol=1e-9)
@@ -562,6 +585,6 @@ def test_causality_with_large_but_finite_factors(mode: str, rank: int) -> None:
     mu2[1:] = mu2[1:] + 0.7 * torch.randn(N - 1, K, generator=generator, dtype=F64)
     with torch.no_grad():
         mean2 = ops.predictive_content(mu2, beta, frame)
-        cov2 = ops.predictive_covariance_update(mu2, sigma_diag, beta, frame)
+        cov2 = ops.predictive_covariance_update(mu2, sigma_diag, beta, frame, floor_anchor=prior)
     torch.testing.assert_close(mean2[0], mean[0], atol=1e-12, rtol=1e-12)
     torch.testing.assert_close(cov2[0], cov[0], atol=1e-12, rtol=1e-12)

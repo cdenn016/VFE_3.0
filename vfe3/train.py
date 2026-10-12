@@ -42,8 +42,10 @@ from vfe3.data.datasets import make_dataloader
 from vfe3.free_energy import attention_tau
 from vfe3.gauge_optim import (
     FISHER_DIAGNOSTIC_KEYS,
+    FRAME_CONDITION_GROUPS,
     GROUP_LOG_DIAGNOSTIC_KEYS,
     GaugeManifoldAdamW,
+    bound_phi_frame_condition_,
     get_phi_update_policy,
     group_log_block_shape,
     project_phi_parameter_rows_,
@@ -82,6 +84,8 @@ from vfe3.geometry.transport import (                           # float64 frame-
     frame_pair_fp64_escalations,
     reset_frame_pair_fp64_escalations,
 )
+from vfe3.model.block_mlp import (                              # LayerNorm pushforward sphere-bound caps
+    layernorm_trace_cap_elements, reset_layernorm_trace_cap_elements)
 
 
 _SUCCESSFUL_UPDATES_KEY = "successful_updates"
@@ -200,13 +204,6 @@ class PhiFisherStatisticsProvider:
         raise ValueError("fisher_group statistics exist only for phi_embed and pos_phi_free")
 
 
-def _decode_learning_rates(cfg: VFE3Config) -> tuple[float, float]:
-    """Resolve split decoder rates, falling back to the encoder rates."""
-    mu_lr = cfg.m_p_mu_lr if cfg.m_decode_mu_lr is None else cfg.m_decode_mu_lr
-    sigma_lr = cfg.m_p_sigma_lr if cfg.m_decode_sigma_lr is None else cfg.m_decode_sigma_lr
-    return mu_lr, sigma_lr
-
-
 def build_optimizer(
     model: VFEModel,
     cfg:   VFE3Config,
@@ -269,21 +266,22 @@ def build_optimizer(
     # log sigma toward 0 (sigma toward 1) -- an unintended lognormal prior fighting the configured
     # sigma_init on the KL-decode path; sigma_weight_decay=0.0 exempts the sigma sector. Applied to
     # every sigma-role CAPACITY table (belief, untied decode).
-    sigma_wd = {} if cfg.sigma_weight_decay is None else {"weight_decay": cfg.sigma_weight_decay}
+    # Every None-inherits rate and decay below resolves through VFE3Config.resolved_hyperparameter, the one place
+    # the inheritance rule lives (audit 2026-10-12 C7).
+    sigma_wd = {"weight_decay": cfg.resolved_hyperparameter("sigma_weight_decay")}
     # mu_weight_decay (default None = inherit the global weight_decay, the long-standing behavior):
     # the exact mirror of sigma_wd for the MEAN-role capacity tables. Decoupled AdamW decay reaches
     # every row of a live embedding table on every step, so the rarely-visited rows are decayed far
     # faster than their gather-driven gradient can restore them; mu_weight_decay=0.0 exempts the
     # mean sector. Applied to the same class sigma_wd covers (belief, untied decode) plus
     # the linear-decode projection, which is the mean-role twin of decode_log_scale.
-    mu_wd = {} if cfg.mu_weight_decay is None else {"weight_decay": cfg.mu_weight_decay}
+    mu_wd = {"weight_decay": cfg.resolved_hyperparameter("mu_weight_decay")}
     # decode_mu_weight_decay (default None = mu_wd): a separate decoupled decay for the decode-side mean tables
     # only (untied decode means, linear readout weight). Decoupled AdamW decay is not an L2 penalty or a
     # Gaussian-prior MAP (Loshchilov and Hutter 2019); against a mean Adam-normalized update u_bar it settles at
     # |theta| = |u_bar| / lambda, which bounds the rows of rarely-targeted types that otherwise only receive the
     # softmax push away from the queries (audit 2026-10-10, item 2; round 2, item 43).
-    decode_mu_wd = (mu_wd if cfg.decode_mu_weight_decay is None
-                    else {"weight_decay": cfg.decode_mu_weight_decay})
+    decode_mu_wd = {"weight_decay": cfg.resolved_hyperparameter("decode_mu_weight_decay")}
     # m_table_update_mode='fisher' marks the type-prior tables for the natural-gradient step of
     # vfe3.table_optim; their AdamW rates then only schedule that step and set its decoupled decay.
     table_fisher = cfg.m_table_update_mode == "fisher"
@@ -293,7 +291,8 @@ def build_optimizer(
                        **({"table_fisher": "mu"} if table_fisher else {})})
     # decode_log_scale is always frozen (requires_grad=False in VFEModel; the learned temperature was
     # retired 2026-10-02), so it joins no optimizer group and the readout temperature stays fixed.
-    decode_mu_lr, decode_sigma_lr = _decode_learning_rates(cfg)
+    decode_mu_lr = cfg.resolved_hyperparameter("m_decode_mu_lr")
+    decode_sigma_lr = cfg.resolved_hyperparameter("m_decode_sigma_lr")
     # prior_covariance_table='block_cholesky' replaces sigma_log_embed by the Cholesky table sigma_chol_embed.
     sigma_parameters = [parameter for parameter in (pb.sigma_log_embed, getattr(pb, "sigma_chol_embed", None))
                         if parameter is not None and parameter.requires_grad]
@@ -317,8 +316,7 @@ def build_optimizer(
         # (the same protection phi/Omega carry).
         groups.append({"params": [pb.output_proj_bias], "lr": decode_mu_lr, "weight_decay": 0.0, "role": "mu"})
     if getattr(model, "block_mlps", None) is not None:         # use_block_mlp=True coordinate MLPs
-        block_mlp_lr = (cfg.m_p_mu_lr if cfg.m_block_mlp_lr is None
-                        else cfg.m_block_mlp_lr)
+        block_mlp_lr = cfg.resolved_hyperparameter("m_block_mlp_lr")
         # weight_decay=0 on the prototype_agents template log-variances log(lambda) and log-weights log(pi):
         # decaying them pulls lambda toward 1 and pi toward uniform, a prior on the templates rather than a
         # capacity penalty. The template means nu keep the global decay.
@@ -344,8 +342,7 @@ def build_optimizer(
                 parameters += [p for ops in layers for p in getattr(ops, "edge_parameters", list)()]
             parameters = [p for p in parameters if p.requires_grad]
             if parameters:
-                rate = getattr(cfg, f"m_relational_{role}_lr")
-                groups.append({"params": parameters, "lr": cfg.m_p_mu_lr if rate is None else rate,
+                groups.append({"params": parameters, "lr": cfg.resolved_hyperparameter(f"m_relational_{role}_lr"),
                                "weight_decay": 0.0, "role": "mu", "lr_aux_role": f"relational_{role}"})
 
     if getattr(model, "cg_coupling", None) is not None:         # use_cg_coupling=True CG path weights
@@ -354,8 +351,7 @@ def build_optimizer(
         # A gauge-frame scale, decayed like phi_embed (both compose into the ONE clamped frame, so
         # they share phi_weight_decay), but with its OWN optional step size: m_pos_phi_lr=None
         # inherits m_phi_lr, which is the historical yoked behavior.
-        pos_lr = cfg.m_phi_lr if cfg.m_pos_phi_lr is None else cfg.m_pos_phi_lr
-        pos_group = {"params": [model.pos_phi_free], "lr": pos_lr,
+        pos_group = {"params": [model.pos_phi_free], "lr": cfg.resolved_hyperparameter("m_pos_phi_lr"),
                      "weight_decay": cfg.phi_weight_decay, "role": "phi"}
         pos_group.update(phi_group_metadata)
         groups.append(pos_group)
@@ -366,10 +362,9 @@ def build_optimizer(
         hidden_bias_parameters = [p for p in hidden_bias_parameters if p.requires_grad]
         # m_per_type_hidden_bias_lr resolves (in VFE3Config) to the DECLARED m_phi_lr, which
         # gauge_transport 'off'/'frozen' would otherwise have coerced to 0 for this table too.
-        hidden_bias_lr = getattr(cfg, "m_per_type_hidden_bias_lr", None)
         if hidden_bias_parameters:
             groups.append({"params": hidden_bias_parameters,
-                           "lr": cfg.m_phi_lr if hidden_bias_lr is None else hidden_bias_lr,
+                           "lr": cfg.resolved_hyperparameter("m_per_type_hidden_bias_lr"),
                            "weight_decay": cfg.phi_weight_decay, "role": "phi"})
     if getattr(model, "t5_bias", None) is not None:             # t5_learnable_bias=True relative-position bias
         # weight_decay=0: the per-bucket T5 bias b_{i-j} is a relative-position PRIOR shaping the
@@ -392,8 +387,7 @@ def build_optimizer(
         # Normalization calibration, not prior-table capacity, so it carries its own optional rate
         # (m_layernorm_lr=None inherits m_p_mu_lr, the historical behavior) and its own aux role, the
         # way block_mlp does. Both seams' gamma/beta share this ONE group.
-        layernorm_lr = cfg.m_p_mu_lr if cfg.m_layernorm_lr is None else cfg.m_layernorm_lr
-        groups.append({"params": ln_affine, "lr": layernorm_lr, "weight_decay": 0.0,
+        groups.append({"params": ln_affine, "lr": cfg.resolved_hyperparameter("m_layernorm_lr"), "weight_decay": 0.0,
                        "role": "mu", "lr_aux_role": "layernorm"})
 
     # Stable CSV learning-rate fields are attached to semantic roles rather than optimizer indices.
@@ -1217,6 +1211,11 @@ def train_step(
                 collect_stats=False,
                 **projection_count,
             )
+    # Opt-in frame condition bound (audit 2026-10-12 T4); validation admits it only under adamw and
+    # per_token, and the orthogonal/conformal groups have cond_2 = 1, so nothing runs for them.
+    if (did_step and getattr(_cfg, "phi_frame_condition_max", None) is not None
+            and model.group.name in FRAME_CONDITION_GROUPS):
+        bound_phi_frame_condition_(model, _cfg.phi_frame_condition_max)
     if did_step:
         successful_updates += 1
         scheduler.step()                   # accepted optimizer updates are the scheduler's clock
@@ -2048,7 +2047,7 @@ def _frame_projection_state(
 RUN_TOTAL_COUNTER_KEYS: Tuple[str, ...] = (
     "nonfinite_tangent_elements", "mu_trust_fallback_elements", "decode_logdet_fallback_elements",
     "frame_pair_fp64_escalations", "public_spd_repair_elements", "public_spd_ceiling_contact_elements",
-    "source_recovery_elements", "matmul_precision_replays")
+    "source_recovery_elements", "layernorm_trace_cap_elements", "matmul_precision_replays")
 
 
 def _process_counter_values() -> Dict[str, int]:
@@ -2059,7 +2058,8 @@ def _process_counter_values() -> Dict[str, int]:
             "frame_pair_fp64_escalations": int(frame_pair_fp64_escalations()),
             "public_spd_repair_elements": int(public_spd_repair_elements()),
             "public_spd_ceiling_contact_elements": int(public_spd_ceiling_contact_elements()),
-            "source_recovery_elements": int(source_recovery_elements())}
+            "source_recovery_elements": int(source_recovery_elements()),
+            "layernorm_trace_cap_elements": int(layernorm_trace_cap_elements())}
 
 
 def _resumed_run_totals(
@@ -3127,6 +3127,14 @@ def _terminal_validation_signature(
     )
 
 
+def _tensor_versions(
+    model: torch.nn.Module,
+) -> tuple:
+    r"""Identity, storage and in-place version of every parameter and buffer: equal tuples mean unchanged weights."""
+    return tuple((id(tensor), tensor.data_ptr(), tensor._version)
+                 for tensor in (*model.parameters(), *model.buffers()))
+
+
 def _snapshot_key_support(
     log_prior: Optional[torch.Tensor],        # (N, N), (H, N, N) or (1, H, N, N) for one sequence
 ) -> Optional[torch.Tensor]:                  # bool, broadcastable to (L, H, N, N); None if absent
@@ -3193,7 +3201,12 @@ def _position_loss_metrics(
     logits:  torch.Tensor,                    # (B, N, V) captured held-out logits
     targets: torch.Tensor,                    # (B, N) next-token ids (-100 = ignore)
 ) -> Dict[str, float]:
-    r"""Per-position within-sequence loss: mean CE over the first and last quarter of positions."""
+    r"""Per-position within-sequence loss: mean CE over the scored positions of the first and last quarter.
+
+    A position with no scored target (the masked overlap prefix of a sliding-window eval window, or the padded
+    tail of a final window) has no CE, so it is left out of its quarter's mean rather than counted as 0; a quarter
+    with no scored position is NaN, which the multi-batch average skips (audit 2026-10-12 #13).
+    """
     import torch.nn.functional as F
 
     out: Dict[str, float] = {}
@@ -3201,12 +3214,15 @@ def _position_loss_metrics(
     per = F.cross_entropy(logits.reshape(-1, logits.shape[-1]).float(), targets.reshape(-1),
                           ignore_index=-100, reduction="none").reshape(b, n)
     valid = (targets != -100).float()
-    pos_ce = (per * valid).sum(0) / valid.sum(0).clamp(min=1.0)   # (N,) mean CE at each position
+    n_valid = valid.sum(0)                                        # (N,) scored targets at each position
+    pos_ce = (per * valid).sum(0) / n_valid.clamp(min=1.0)        # (N,) mean CE at each position
+    pos_ce = pos_ce.masked_fill(n_valid == 0, float("nan"))       # unscored position: no CE
     q = n // 4
     if q > 0:
-        out["pos_loss_first_q"] = float(pos_ce[:q].mean())
-        out["pos_loss_last_q"]  = float(pos_ce[-q:].mean())
-        out["pos_loss_ratio"]   = float(pos_ce[-q:].mean() / pos_ce[:q].mean().clamp(min=1e-9))
+        first_q, last_q = pos_ce[:q].nanmean(), pos_ce[-q:].nanmean()
+        out["pos_loss_first_q"] = float(first_q)
+        out["pos_loss_last_q"]  = float(last_q)
+        out["pos_loss_ratio"]   = float(last_q / first_q.clamp(min=1e-9))
     return out
 
 
@@ -3369,6 +3385,10 @@ class TrainingTerminalState(NamedTuple):
     data_state:           Optional[DataState]
     raw_model_state:      Dict[str, torch.Tensor]
     rng_state:            Dict[str, object]
+    # The loop's validation of these same final weights when its last eval fell on ``step``, so the finalizer
+    # neither scores validation again nor writes a second metrics row for the step (audit 2026-10-12 #12):
+    # ``{"val_loader", "tokens_per_char", "metrics"}``. None when the last step was not an eval step.
+    final_validation:     Optional[Dict[str, object]] = None
 
 
 def _loader_data_identity(
@@ -3957,6 +3977,8 @@ def train(
     _require_causal_next_token_prior(model)
     terminal_validation_signature = None
     terminal_validation_metrics = None
+    # (step, metrics, parameter/buffer versions) of the latest eval, handed to terminal_callback (audit 2026-10-12 #12).
+    last_eval_record: Optional[Tuple[int, Dict[str, Any], tuple]] = None
     optimizer = build_optimizer(model, cfg)
     # Warmup/cosine multiplier, floored per group so each group's ABSOLUTE LR never decays below
     # cfg.min_lr_frac * base -- see _floor_lr_lambdas. With cfg.min_lr_frac=0
@@ -4151,6 +4173,7 @@ def train(
     reset_decode_logdet_fallback_elements()   # ... and the decode log-det non-PD fallback
     reset_source_recovery_elements()        # ... and projected float64 source-factor recoveries
     reset_frame_pair_fp64_escalations()     # ... and float64 frame-pair escalations
+    reset_layernorm_trace_cap_elements()    # ... and LayerNorm pushforward sphere-bound caps
     run_total_base = _resumed_run_totals(getattr(artifacts, "resumed_numerics_counters", None),
                                          start_step, logger)
     # steps replayed at "highest" under cfg.matmul_precision_retry (whole run), and its value at the last log step
@@ -4446,6 +4469,10 @@ def train(
         if timer is not None:
             timer.start_step()
         replay_records: List[Dict[str, object]] = []
+        # The rates this step uses, read before train_step advances the scheduler, so a logged lr_* is the
+        # step's own rate on an accepted and on a skipped step alike (audit 2026-10-12 #11).
+        step_raw_lrs = scheduler.get_last_lr()
+        step_table_fisher_lrs = _table_fisher_learning_rates(optimizer)
         step_loss, replays = _train_step_with_precision_retry(
             model, optimizer, scheduler, tokens, targets, logger=logger, step=step,
             quiet=precision_replays > 0, replay_log=replay_records, grad_clip=grad_clip,
@@ -4585,6 +4612,8 @@ def train(
             phase_ms["eval_validation_ms"] = _synced_ms(device) - _t0
             if terminal_validation_signature is not None:
                 terminal_validation_metrics = dict(m)
+            if terminal_callback is not None and artifacts is not None:      # do_csv: this step writes its row
+                last_eval_record = (step + 1, dict(m), _tensor_versions(model))
             logger.info(" \n Validation @ step %d:", step + 1)
             logger.info(                                         # val has no separate loss; CE is the loss
                 "\n       CE: %.4f \n      Val PPL: %.1f \n       BPT: %.4f%s \n\n",
@@ -4746,13 +4775,12 @@ def train(
         # batch, commensurate with val_ce, a token-weighted mean (nats/token; audit-2026-06-05 Finding 2).
         if do_csv or forced_row:
             _row_t0 = _synced_ms(device)
-            raw_lrs = scheduler.get_last_lr()
-            lrs = (_learning_rates_by_role(optimizer.param_groups, raw_lrs) if vfe_model
-                   else _learning_rates_by_role(optimizer.param_groups, raw_lrs, required=("mu",)))
+            lrs = (_learning_rates_by_role(optimizer.param_groups, step_raw_lrs) if vfe_model
+                   else _learning_rates_by_role(optimizer.param_groups, step_raw_lrs, required=("mu",)))
             # m_table_update_mode='fisher': lr_mu / lr_sigma report the realized table step size eta lr_t/lr_0,
             # not the AdamW rate that only schedules it (audit 2026-10-10 round 2, items 20 and 37).
-            lrs.update(_table_fisher_learning_rates(optimizer))
-            aux_lrs = _learning_rates_by_aux_role(optimizer.param_groups, raw_lrs)
+            lrs.update(step_table_fisher_lrs)
+            aux_lrs = _learning_rates_by_aux_role(optimizer.param_groups, step_raw_lrs)
             row = {
                 "step":              step + 1,
                 "train_loss":        losses[-1],
@@ -5063,6 +5091,12 @@ def train(
                 data_state=terminal_data_state,
                 raw_model_state=raw_model_state,
                 rng_state=rng_state,
+                final_validation=(
+                    {"val_loader": val_loader, "tokens_per_char": tokens_per_char,
+                     "metrics": last_eval_record[1]}
+                    if (last_eval_record is not None and last_eval_record[0] == completed_steps
+                        and last_eval_record[2] == _tensor_versions(model))
+                    else None),
             ),
             losses,
         )
@@ -5199,7 +5233,7 @@ def _fmt_mixer_lr(configured: Optional[float], mean_lr: float) -> str:
 
 def _fmt_decode_lrs(cfg: VFE3Config) -> str:
     """Show realized decoder rates, including inactive variance and shared-table cases."""
-    mu_lr, sigma_lr = _decode_learning_rates(cfg)
+    mu_lr, sigma_lr = (cfg.resolved_hyperparameter(name) for name in ("m_decode_mu_lr", "m_decode_sigma_lr"))
     if cfg.decode_mode == "linear":
         return f"mu={mu_lr}  sigma=inactive"
     if not cfg.untie_decode_bank:

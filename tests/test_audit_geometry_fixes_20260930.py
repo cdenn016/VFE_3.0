@@ -29,7 +29,8 @@ def test_predictive_spread_survives_common_translation(
     ops = make_relational_operators([2, 2], 6,
                               readout_mode="predictive_content",
                               predictive_covariance="moment_matched")
-    actual = ops.predictive_covariance_update(mu, sigma, beta, frame)
+    # The prior equals the belief covariance here, so the floor f Sigma_p adds 1e-4 * 15 = 0.0015 to every variance.
+    actual = ops.predictive_covariance_update(mu, sigma, beta, frame, floor_anchor=sigma)
     expected = torch.tensor([15.0015, 15.2515, 15.689]).reshape(1, 3, 1).expand(1, 3, 4)
     actual_diagonal = actual if diagonal else actual.diagonal(dim1=-2, dim2=-1)
     torch.testing.assert_close(actual_diagonal, expected, atol=2e-6, rtol=1e-7)
@@ -47,8 +48,10 @@ def _centered_predictive_reference(
     frame: CanonicalFrameContext,
     floor: float,
     residual: bool,
+    prior: torch.Tensor,
 ) -> torch.Tensor:
-    r"""Direct centered covariance, retaining shared sources and residual cross terms."""
+    r"""Direct centered covariance, retaining shared sources and residual cross terms, plus the prior-anchored floor
+    ``floor * prior`` in local coordinates."""
     C = frame.inverse @ sigma @ frame.inverse.transpose(-1, -2)
     C = 0.5 * (C + C.transpose(-1, -2))
     xi = (frame.inverse @ mu.unsqueeze(-1)).squeeze(-1)
@@ -57,7 +60,7 @@ def _centered_predictive_reference(
     values = torch.einsum("hkl,bjl->bjhk", M, xi)
     rows = []
     for i in range(mu.shape[-2]):
-        cov = torch.eye(4, dtype=mu.dtype) * (floor * C[0, i].trace() / 4)
+        cov = torch.zeros(4, 4, dtype=mu.dtype)
         for h in range(2):
             mean = (beta[0, h, i, :, None] * values[0, :, h]).sum(dim=0)
             centered = values[0, :, h] - mean
@@ -72,7 +75,7 @@ def _centered_predictive_reference(
         if residual:
             cov = cov + C[0, i]
         local = frame.forward[0, i] @ cov @ frame.forward[0, i].T
-        rows.append(0.5 * (local + local.T))
+        rows.append(0.5 * (local + local.T) + floor * prior[0, i])
     return torch.stack(rows).unsqueeze(0)
 
 
@@ -97,13 +100,13 @@ def test_centered_predictive_covariance_retains_correlations_and_gradients(resid
                                  [[.5, 0., 1., .25], [-.25, 1., 0., .5]]]))
         ops.O.copy_(torch.tensor([[[1., .25], [.5, 1.], [.25, -.5], [0., .5]],
                                  [[.25, .5], [1., -.25], [.5, 1.], [1., .25]]]))
-    actual = ops.predictive_covariance_update(mu, sigma, logits.softmax(-1), frame)
+    actual = ops.predictive_covariance_update(mu, sigma, logits.softmax(-1), frame, floor_anchor=sigma.detach())
     inputs = (mu, sigma, logits, ops.T, ops.O)
     reference_inputs = tuple(t.detach().double().requires_grad_() for t in inputs)
     mu64, sigma64, logits64, T64, O64 = reference_inputs
     frame64 = CanonicalFrameContext(frame.forward.double(), frame.inverse.double())
     expected = _centered_predictive_reference(mu64, sigma64, logits64.softmax(-1), T64, O64,
-                                              frame64, ops.predictive_covariance_floor, residual)
+                                              frame64, ops.predictive_covariance_floor, residual, sigma64.detach())
     torch.testing.assert_close(actual.double(), expected, atol=8e-6, rtol=3e-6)
     weight = torch.arange(1., 49.).reshape_as(actual) / 48.
     gradients = torch.autograd.grad((actual * weight).sum(), inputs)

@@ -99,7 +99,7 @@ def _write_residual_ratio(path: Path, steps=(30, 60, 90), n_layers=3, ln=True) -
 # (1) route gates
 # ---------------------------------------------------------------------------
 
-_ESTEP_FAMILY = {"iterate_trajectory", "belief_trajectories", "estep_depth_sensitivity",
+_ESTEP_FAMILY = {"iterate_trajectory", "belief_trajectories",
                  "estep_character", "estep_quality", "estep_grad_norm_decomposition",
                  "attention_estep"}
 _SIGMA_FAMILY = {"belief_spectrum", "spd_ellipses", "belief_condition"}
@@ -137,8 +137,6 @@ def test_route_gates_zero_estep_and_frozen_gradient() -> None:
 
 def test_estep_probe_figures_skip_instead_of_drawing_placeholders(tmp_path):
     unavailable = {"available": False, "reason": "only the configured single readout is supported"}
-    with pytest.raises(figs.FigureSkipped, match="single readout"):
-        figs.plot_estep_depth_sensitivity(unavailable, path=str(tmp_path / "d.png"))
     with pytest.raises(figs.FigureSkipped, match="single readout"):
         figs.plot_estep_character(unavailable, path=str(tmp_path / "c.png"))
     single = {"available": True, "depth_sweep_available": False,
