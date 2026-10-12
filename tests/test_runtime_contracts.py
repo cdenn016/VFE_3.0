@@ -65,7 +65,7 @@ class _OverflowModel(torch.nn.Module):
 
     def forward(self, tokens: torch.Tensor, targets: torch.Tensor, **kwargs: object) -> tuple:
         loss = self.weight * 1e35 + 1.
-        return None, loss, SimpleNamespace(ce=loss, scored_tokens=torch.tensor(1), excluded_tokens=torch.tensor(0))
+        return None, loss, SimpleNamespace(ce=loss, objective=None, scored_tokens=torch.tensor(1), excluded_tokens=torch.tensor(0))
 
 
 @pytest.mark.parametrize('metrics', [False, True])
