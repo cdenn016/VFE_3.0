@@ -282,7 +282,7 @@ def test_per_layer_aggregation_withholds_per_column(tmp_path: Path) -> None:
     from tests.test_multiseed import _write_full_run, _write_request
 
     _write_request(tmp_path, [1, 2])
-    header = "layer,self_coupling,relational_semantics,holonomy_deviation,canonical_beta_tv\n"
+    header = "layer,self_coupling,relational_semantics,belief_cond_median,canonical_beta_tv\n"
     _write_full_run(tmp_path / "a", ppl=1.0, seed=1,
                     per_layer=header + "0,10,relational_predictive_content,nan,0.5\n1,12,relational_predictive_content,nan,0.4\n")
     _write_full_run(tmp_path / "b", ppl=1.0, seed=2,
@@ -291,9 +291,9 @@ def test_per_layer_aggregation_withholds_per_column(tmp_path: Path) -> None:
     out = ms.aggregate_per_layer(tmp_path, withheld=withheld)
     assert out[0]["self_coupling"]["mean"] == pytest.approx(15.0) and out[1]["self_coupling"]["mean"] == 13.0
     assert set(out[0]) == {"self_coupling"}
-    assert set(withheld) == {"relational_semantics", "holonomy_deviation", "canonical_beta_tv"}
+    assert set(withheld) == {"relational_semantics", "belief_cond_median", "canonical_beta_tv"}
     assert "text column" in withheld["relational_semantics"]
-    assert "at 2 of 2 layer(s)" in withheld["holonomy_deviation"]
+    assert "at 2 of 2 layer(s)" in withheld["belief_cond_median"]
     assert "at 1 of 2 layer(s)" in withheld["canonical_beta_tv"]
     assert {"total", "canonical_beta_tv", "self_divergence"} <= set(ms.PER_LAYER_METRICS)
 

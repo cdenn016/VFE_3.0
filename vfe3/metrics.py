@@ -924,7 +924,7 @@ def guard_saturation(
     return out
 
 
-# --- per-token frame class functions (group-dispatched; fixes gauge_trace_spread's det-blindness) ---
+# --- per-token frame class functions (group-dispatched; not blind to unimodular groups) ---
 #
 # NOT gauge invariants of the declared local action. The model's gauge acts on vertex frames on the
 # LEFT, U_i -> g_i U_i with mu_i -> g_i mu_i, and on the flat coboundary Omega_ij = U_i U_j^{-1} the
@@ -947,10 +947,10 @@ def group_gauge_invariant(
     local left action U_i -> g_i U_i (see the section note above): it is a reference-trivialization
     frame statistic, not a gauge-invariant observable, despite the historical function name.
 
-    The logged ``gauge_trace_spread`` (= std of log|det Omega| = tr embed(phi)) is identically 0
-    for the unimodular SO(N) towers (traceless generators, det == 1), so it is blind off block_glk.
-    This dispatches the correct invariant: GL volume log|det exp(phi)| for block_glk, and total
-    rotation angle (1/2) sum_k |arg(eig)| for the orthogonal so_n irrep towers.
+    A spread of log|det Omega| (= tr embed(phi)) is identically 0 for the unimodular SO(N) towers
+    (traceless generators, det == 1), so it is blind off block_glk. This dispatches the correct
+    invariant: GL volume log|det exp(phi)| for block_glk, and total rotation angle
+    (1/2) sum_k |arg(eig)| for the orthogonal so_n irrep towers.
     """
     if getattr(group, "skew_symmetric", False):                  # so_n, tied or untied
         ang = torch.angle(eigvals_on_host(exp_phi))              # (..., K) eigenphases

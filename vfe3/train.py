@@ -1490,7 +1490,7 @@ def _eval_protocol_train_ce(
 # failed log-step diagnostic falls back to these as NaN, widened to the first metrics row's key set.
 _TRAIN_DIAGNOSTIC_FALLBACK_KEYS: Tuple[str, ...] = (
     "attn_entropy", "self_coupling", "self_divergence", "belief_coupling", "attention_entropy",
-    "total", "effective_rank", "holonomy_deviation", "gauge_trace_spread",
+    "total", "effective_rank",
 )
 
 
@@ -4889,8 +4889,6 @@ def train(
                 # lambda_beta=0.5 with no column to reconcile it. Now each row is self-describing.
                 "lambda_beta":        float(getattr(cfg, "lambda_beta", float("nan"))),
                 "effective_rank":     d["effective_rank"],
-                "holonomy_deviation": d["holonomy_deviation"],
-                "gauge_trace_spread": d["gauge_trace_spread"],
             }
             row.update({key: value for key, value in d.items() if key.startswith(("qkv_", "relational_"))})
             _warn_dead_router(d, dead_router_warned, logger,

@@ -2260,7 +2260,7 @@ class VFEModel(nn.Module):
         scorable = support.sum(-1) >= 2                                       # (B, H, N)
         d = {key: float("nan") for key in (
             "self_coupling", "self_divergence", "belief_coupling", "attention_entropy",
-            "total", "effective_rank", "holonomy_deviation", "gauge_trace_spread")}
+            "total", "effective_rank")}
         d.update(
             relational_semantics=self.conditional_semantics,
             relational_attention_capture="pre_update",

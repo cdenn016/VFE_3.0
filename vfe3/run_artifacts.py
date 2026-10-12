@@ -12,7 +12,6 @@ A training run produces a self-contained directory::
       summary.json       headline numbers (best_val_ppl, test_ppl, wall_time, ...)
       loss_curve.png     training cross-entropy trajectory
       val_ppl.png        validation perplexity trajectory (log-y, best marked)
-      holonomy.png / gauge_trace_spread.png   frame-numerics diagnostics (coboundary closure residual; log|det| spread)
       free_energy_decomposition.png   per-token F budget snapshot + early/mid/late evolution
       free_energy_relationship.png     final-iterate objective vs validation CE
       canonical_free_energy_{decomposition,relationship}.png   the same on the projected routes under
@@ -5433,26 +5432,6 @@ def _save_figures(
                 sy, sx, ylabel="validation perplexity", title="Validation perplexity",
                 color=figs._CB[1], logy=True, smooth=max(5, len(sy) // 80), annotate="min",
                 path=str(run / "val_ppl.png"))
-            figs.plt.close(fig)
-        # Frame-numerics trajectories (diagnostics tier): coboundary closure residual + gauge-trace spread.
-        hx, hy = _aligned("holonomy_deviation")
-        if hy:
-            # Heavy-tailed (median ~1e-3, rare spikes ~1e3): log y + a median reference; NOT smoothed,
-            # so the roundoff spikes survive.
-            fig = figs.plot_trajectory(
-                hy, hx,
-                ylabel="numerical closure residual",
-                title="Numerical closure of nominally flat transport",
-                color=figs._CB[2],
-                logy=True, median_line=True, annotate="max",
-                path=str(run / "holonomy.png"))
-            figs.plt.close(fig)
-        gx, gy = _aligned("gauge_trace_spread")
-        if gy:
-            fig = figs.plot_trajectory(
-                gy, gx, ylabel=r"std $\log|\det\Omega|$", title="Gauge trace spread",
-                color=figs._CB[3], smooth=max(5, len(gy) // 60), annotate_final=True,
-                path=str(run / "gauge_trace_spread.png"))
             figs.plt.close(fig)
         # Optimization and endpoint trends (history-only; no model re-run): the pre-clip gradient
         # norm, belief-covariance conditioning, and the per-eval E-step endpoint delta.

@@ -481,7 +481,7 @@ def test_per_layer_conditional_branch_uses_last_eval_residual_ratio(tmp_path):
 
 def test_per_layer_transported_branch_fits_page(tmp_path):
     keys = ("self_coupling", "belief_coupling", "attention_entropy", "total",
-            "holonomy_deviation", "holonomy_wilson", "gauge_trace_spread", "gauge_invariant_spread",
+            "holonomy_wilson", "gauge_invariant_spread",
             "phi_norm_mean", "effective_rank", "attn_entropy", "belief_cond_median")
     fig = figs.plot_per_layer_diagnostics({k: [1.0, 2.0, 3.0] for k in keys},
                                           path=str(tmp_path / "plt.png"))

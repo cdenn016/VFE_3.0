@@ -133,7 +133,6 @@ def test_diagnostics_reports_projected_geometry_semantics() -> None:
     d = VFEModel(cfg).diagnostics(torch.randint(0, 7, (2, 4)))
     assert d["relational_semantics"] == "relational_full_link_frozen_filtering"
     assert d["relational_legacy_global_f_available"] == 0.0
-    assert math.isnan(d["holonomy_deviation"]) and math.isnan(d["gauge_trace_spread"])
     assert math.isfinite(d["relational_receiver_cost_before"])
     assert math.isfinite(d["relational_receiver_cost_after"])
 
@@ -183,8 +182,7 @@ def test_diagnostics_per_layer_shape_and_finite():
     for k in ("effective_rank", "belief_cond_median", "phi_norm_mean", "attn_entropy"):
         assert k in pl and len(pl[k]) == 3
         assert all(math.isfinite(v) for v in pl[k])
-    for k in ("self_coupling", "belief_coupling", "attention_entropy", "total",
-              "holonomy_deviation", "gauge_trace_spread"):
+    for k in ("self_coupling", "belief_coupling", "attention_entropy", "total"):
         assert k in pl and len(pl[k]) == 3
         assert all(math.isnan(v) for v in pl[k])
 

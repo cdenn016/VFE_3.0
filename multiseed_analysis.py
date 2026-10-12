@@ -958,8 +958,6 @@ CURVE_SPECS: List[tuple] = [
     ("attention_entropy",  False),
     ("self_divergence",    False),
     ("grad_norm",          True),
-    ("holonomy_deviation", True),
-    ("gauge_trace_spread", False),
     ("effective_rank",     False),
     ("attn_entropy",       False),
     ("belief_cond_median", True),
@@ -999,14 +997,14 @@ def _ratio_scale_cv(key: str, aggregate: Dict[str, Any]) -> Dict[str, Any]:
 
 
 GRID_COLS: List[str] = [                                          # overview-grid subset
-    "train_ce", "val_ppl", "inner_alignment_energy_total", "grad_norm", "holonomy_deviation",
-    "gauge_trace_spread", "effective_rank", "attn_entropy", "belief_cond_median",
+    "train_ce", "val_ppl", "inner_alignment_energy_total", "grad_norm",
+    "effective_rank", "attn_entropy", "belief_cond_median",
 ]
 _LOGY_COLS = {c for c, logy in CURVE_SPECS if logy}
 
 PER_LAYER_METRICS: List[str] = [                                  # per-layer bars to draw
     "self_coupling", "belief_coupling", "attention_entropy", "effective_rank",
-    "holonomy_deviation", "gauge_trace_spread", "belief_cond_median",
+    "belief_cond_median",
     "self_divergence", "total", "canonical_beta_tv", "canonical_total_delta",   # diagnose_canonical_free_energy
 ]
 

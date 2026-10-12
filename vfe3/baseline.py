@@ -1010,7 +1010,6 @@ class BaselineTransformer(nn.Module):
             "attn_entropy": float(attention_entropy(maps)),
             "self_coupling": nan, "self_divergence": nan, "belief_coupling": nan,
             "attention_entropy": nan, "total": nan, "effective_rank": nan,
-            "holonomy_deviation": nan, "gauge_trace_spread": nan,
         }
 
     @torch.no_grad()

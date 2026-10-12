@@ -1361,7 +1361,7 @@ def plot_trajectory(
         tag = "best" if annotate == "min" else "max"
         ax.scatter([x[idx]], [v[idx]], s=28, color="black", zorder=5)
         # ``:.4g`` (matching annotate_final) so a heavy-tailed log series whose extremum is O(1e-4)
-        # -- holonomy.png -- prints its real value instead of rounding to "0.0" under ``:.1f``.
+        # prints its real value instead of rounding to "0.0" under ``:.1f``.
         callout = ax.annotate(f"{tag} {v[idx]:.4g}\n@ step {int(x[idx]):,}",
                               xy=(x[idx], v[idx]), xytext=(0, 0), textcoords="offset points",
                               fontsize=7.5, arrowprops=dict(arrowstyle="->", lw=0.8, color="black"))
@@ -3977,12 +3977,10 @@ def plot_per_layer_diagnostics(
 
     The aggregate metrics.csv and every converged-state figure show only the FINAL block; this
     plots ``VFEModel.diagnostics_per_layer`` block-by-block so depth is legible: which layer carries
-    the coupling vs entropy mass, and whether frame-closure roundoff and belief rank build up
-    with depth. Panel A: belief-channel free-energy budget (self-coupling, belief-coupling, attention
-    entropy, total) vs layer. Panel B: coboundary closure residual and Wilson trace deficit vs layer
-    (roundoff-level on the flat cocycle; not curvature).
-    Panel C: gauge action (trace spread, group-invariant spread, mean ``||phi||``) vs layer. Panel D:
-    belief geometry (effective rank, attention entropy; condition number on a twin log axis) vs layer.
+    the coupling vs entropy mass, and whether belief rank builds up with depth. Panel A: belief-channel free-energy budget (self-coupling, belief-coupling, attention
+    entropy, total) vs layer. Panel B: gauge action (group-invariant spread, mean ``||phi||``) vs layer.
+    Panel C: belief geometry (effective rank, attention entropy; condition number on a twin log axis) vs
+    layer.
 
     On the conditional (readout) route the panels are those of :func:`plot_readout_diagnostics`
     with layer on the x axis. With ``residual_ratio`` the unnormalized displacement panel is replaced
@@ -4023,28 +4021,22 @@ def plot_per_layer_diagnostics(
     x = np.arange(L)
     _m = "o-" if L > 1 else "o"                                  # a single layer has no line to draw
     with _compact_style():
-        fig, axes = plt.subplots(2, 2, figsize=(MAX_FIGURE_WIDTH_IN, 5.4))
+        fig, axes = plt.subplots(1, 3, figsize=(MAX_FIGURE_WIDTH_IN, 2.9))
         for k, c, lab in (("self_coupling", _CB[0], r"self $\alpha\,$KL$(q\|p)$"),
                           ("belief_coupling", _CB[1], r"belief $\sum\beta\,$KL"),
                           ("attention_entropy", _CB[2], "attn entropy term"),
                           ("total", _CB[7], "total (belief F)")):
             if k in per_layer:
-                axes[0][0].plot(x, g(k), _m, color=c, lw=1.4, label=lab)
-        axes[0][0].set(xticks=x, xlabel="layer", ylabel="nats", title="Free-energy budget by layer")
-        axes[0][0].legend(fontsize=6, frameon=False)
-        for k, c, lab in (("holonomy_deviation", _CB[0], r"$\|H-I\|_F$ (frame-dependent)"),):
-            if k in per_layer:
-                axes[0][1].plot(x, g(k), _m, color=c, lw=1.4, label=lab)
-        axes[0][1].set(xticks=x, xlabel="layer", ylabel="deviation", title="Holonomy / curvature by layer")
-        axes[0][1].legend(fontsize=6, frameon=False)
-        for k, c, lab in (("gauge_trace_spread", _CB[0], "tr spread"),
-                          ("gauge_invariant_spread", _CB[1], "class-function spread"),
+                axes[0].plot(x, g(k), _m, color=c, lw=1.4, label=lab)
+        axes[0].set(xticks=x, xlabel="layer", ylabel="nats", title="Free-energy budget by layer")
+        axes[0].legend(fontsize=6, frameon=False)
+        for k, c, lab in (("gauge_invariant_spread", _CB[1], "class-function spread"),
                           ("phi_norm_mean", _CB[2], r"mean $\|\phi\|$")):
             if k in per_layer:
-                axes[1][0].plot(x, g(k), _m, color=c, lw=1.4, label=lab)
-        axes[1][0].set(xticks=x, xlabel="layer", ylabel="magnitude", title="Gauge action by layer")
-        axes[1][0].legend(fontsize=6, frameon=False)
-        ax = axes[1][1]
+                axes[1].plot(x, g(k), _m, color=c, lw=1.4, label=lab)
+        axes[1].set(xticks=x, xlabel="layer", ylabel="magnitude", title="Gauge action by layer")
+        axes[1].legend(fontsize=6, frameon=False)
+        ax = axes[2]
         if "effective_rank" in per_layer:
             ax.plot(x, g("effective_rank"), _m, color=_CB[0], lw=1.4, label="effective rank")
         if "attn_entropy" in per_layer:
@@ -5627,8 +5619,6 @@ PUB_LABELS: Dict[str, str] = {
     # -- attention / gauge / belief-geometry diagnostics --
     "attn_entropy":       r"attention row entropy $H(\beta)=-\sum_j\beta_{ij}\log\beta_{ij}$",
     "effective_rank":     r"belief effective rank $\mathrm{erank}(\Sigma)$",
-    "holonomy_deviation": r"holonomy $\langle\|H-I\|_F\rangle$ (frame-dependent)",
-    "gauge_trace_spread": r"gauge spread $\mathrm{std}_i\,\log|\det\Omega_i|$",
     "belief_cond_median": r"belief conditioning $\mathrm{med}_i\,\kappa(\Sigma_i)$",
     "fisher_trace_mean":  r"Half Fisher trace $\mathrm{tr}(I_\mu)/2$",
     "val_fisher_trace_mean": r"Half Fisher trace $\mathrm{tr}(I_\mu)/2$",
