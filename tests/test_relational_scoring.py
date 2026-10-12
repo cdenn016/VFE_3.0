@@ -217,8 +217,34 @@ def test_ill_conditioned_source_maps_preserve_projected_kl(smallest: float) -> N
         maps[0, :, :3] = S; maps[1, :, 3:] = S
         ops.raw_score_q.copy_(maps); ops.raw_score_k.copy_(maps)
     score = relational_score(mu, torch.ones_like(mu), mu, torch.ones_like(mu), frame, ops)
-    expected = torch.tensor([[[[0., .175], [.175, 0.]], [[0., .175], [.175, 0.]]]])
-    torch.testing.assert_close(score, expected, rtol=1e-4, atol=1e-5)
+    expected = torch.tensor([[[[0., .175], [.175, 0.]], [[0., .175], [.175, 0.]]]], dtype=torch.float64)
+    # fp32 recovery bound. X = S (Sigma = I, U = I), kappa = kappa(X). Query and key factors come from bitwise
+    # equal roots, so the log-determinants cancel exactly and KL_ij = (tr - r + |w_ij|^2)/2 with
+    # w_ij = C^{-1}(a_i - a_j). Float32 shifted CholeskyQR3 gives a whitened factor error <= eps kappa, so to first
+    # order (i) tr = |C^{-1}C|_F^2 from the triangular solve moves by <= 2 r eps kappa, (ii) |w|^2 moves by
+    # <= 2 |w|^2 eps kappa, and (iii) the float32 means a = X mu carry |e_i| <= eps |X| |mu_i|, which C^{-1}
+    # amplifies by 1/sigma_min, moving |w|^2 by <= 2 |w| eps kappa (|mu_i| + |mu_j|). Halving,
+    #     |dKL_ij| <= eps kappa (r + 2 KL_ij + |w_ij| (|mu_i| + |mu_j|)),
+    # 4.9e-3 / 4.9e-2 / 4.8e-1 off the diagonal at smallest = 1e-4 / 1e-5 / 1e-6 (measured 4.4e-5 / 3.8e-4 / 1.4e-2;
+    # on the diagonal 0 / 0 / 7.8e-4 against 3 eps kappa). At 1e-6, eps kappa = 0.12 and the bound exceeds the KL
+    # itself: float32 recovery keeps the score finite there but certifies no digits.
+    eps = torch.finfo(torch.float32).eps
+    singular = torch.linalg.svdvals(S.double())
+    kappa = float(singular[0] / singular[-1])
+    norms = mu[0, :, :3].double().norm(dim=-1)                                 # (N,) |mu_i|
+    bound = eps * kappa * (3 + 2 * expected + (2 * expected).sqrt() * (norms[:, None] + norms[None, :]))
+    error = (score.double() - expected).abs()
+    assert bool((error <= bound).all()), (error, bound)
+    # The float32 Gram G = fl(X X^T) loses O(eps kappa^2) in the weak direction, the source route O(eps kappa): a
+    # ratio of order 1/kappa. Where float64 can still factor the rounded Gram, its KL error stays two decades or
+    # more above the recovered one (measured 4.8e-2 at 1e-4); beyond that the Gram has lost SPD outright.
+    G32 = S @ S.T
+    a32 = mu[0, :, :3] @ S.T                                                   # (N, 3) float32 projected means
+    chol, info = torch.linalg.cholesky_ex(G32.double())
+    if int(info) == 0:
+        w = torch.linalg.solve_triangular(chol, (a32[0] - a32[1]).double()[:, None], upper=False)
+        gram_error = abs(.5 * float(w.square().sum()) - .175)
+        assert float(error.max()) <= 1e-2 * gram_error
     gradients = torch.autograd.grad(score.sum(), (ops.raw_score_q, ops.raw_score_k))
     assert all(torch.isfinite(g).all() for g in gradients)
     assert all(g.norm() > 0 for g in gradients)
@@ -288,7 +314,7 @@ def test_healthy_projected_kl_uses_only_the_key_precision_inverse(recovery: bool
 @pytest.mark.usefixtures("condition_recovery_on")
 def test_shear_source_recovery_matches_unprojected_kl() -> None:
     """Equal Cholesky pivots do not certify a well-conditioned covariance."""
-    from vfe3.relational_scoring import projected_gaussian_kl, projected_moments
+    from vfe3.relational_scoring import projected_gaussian_kl, projected_moments, set_projected_condition_recovery
 
     mu = torch.tensor([[[[0., 0.]], [[.001, 0.]]]])
     sigma = torch.ones_like(mu)
@@ -297,8 +323,24 @@ def test_shear_source_recovery_matches_unprojected_kl() -> None:
     a, G = projected_moments(mu, sigma, inverse, S)
     source = (sigma, inverse, S, mu)
     actual = projected_gaussian_kl(a, G, a, G, projection_q=source, projection_k=source)
-    expected = torch.tensor([[[[0., 5e-7], [5e-7, 0.]]]])
-    torch.testing.assert_close(actual, expected, atol=1e-10, rtol=1e-5)
+    expected = .5 * mu[0, 1, 0, 0].double() ** 2                               # |mu_1 - mu_0|^2 / 2, about 5e-7
+    expected = torch.tensor([[[[0., expected], [expected, 0.]]]], dtype=torch.float64)
+    # kappa(X) = 9.0e6 exceeds 1/eps_32 = 8.4e6, the range of float32 shifted CholeskyQR3, so the first-order
+    # factor bound eps kappa = 1.07 certifies nothing here; this lower-triangular X with integer entries factors
+    # essentially exactly. What remains is the float32 assembly KL = (tr + |w|^2 - r)/2 with tr = r = 2 to rounding:
+    # a KL of 5e-7 is resolved against tr + |w|^2 ~ r, i.e. to half an ulp of r per rounding, and with the trace's
+    # own rounding |dKL| <= eps r / 2 = 1.2e-7 (measured 2.3e-8).
+    eps = torch.finfo(torch.float32).eps
+    error = float((actual.double() - expected).abs().max())
+    assert error <= eps * G.shape[-1] / 2
+    # Equal Cholesky pivots do not certify: without the certificate the healthy GEMM loses the whole KL (5e-7);
+    # the recovered score is more than a decade closer (measured 21x).
+    previous = set_projected_condition_recovery(False)
+    try:
+        unrecovered = projected_gaussian_kl(a, G, a, G, projection_q=source, projection_k=source).detach()
+    finally:
+        set_projected_condition_recovery(previous)
+    assert error <= .1 * float((unrecovered.double() - expected).abs().max())
     gradient, = torch.autograd.grad(actual.sum(), S)
     assert torch.isfinite(gradient).all()
 

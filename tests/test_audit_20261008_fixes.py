@@ -17,9 +17,9 @@ from vfe3.model.model import VFEModel
 
 @pytest.fixture(autouse=True)
 def _restore_scorer_policies() -> Iterator[None]:
-    saved = (scoring._CONDITION_RECOVERY, scoring._FACTOR_ROUTE, scoring._RECOVERY_PRECISION)
+    saved = (scoring._CONDITION_RECOVERY, scoring._FACTOR_ROUTE)
     yield
-    scoring._CONDITION_RECOVERY, scoring._FACTOR_ROUTE, scoring._RECOVERY_PRECISION = saved
+    scoring._CONDITION_RECOVERY, scoring._FACTOR_ROUTE = saved
 
 
 def _identity_frame(dtype: torch.dtype) -> CanonicalFrameContext:
@@ -40,9 +40,9 @@ def _rank_ill_maps(dtype: torch.dtype) -> tuple:
 
 
 @pytest.mark.parametrize("route", ["gram", "cholesky_qr2"])
-@pytest.mark.parametrize("precision, condition", [("fp64", True), ("fp32", False)])   # fp32/off: the launcher
+@pytest.mark.parametrize("condition", [True, False])   # off: the launcher
 def test_comparison_rope_recovers_a_failed_float32_factor_from_the_rotated_source(
-        route: str, precision: str, condition: bool) -> None:
+        route: str, condition: bool) -> None:
     """P1-2: the rotated source tuple R_i S rebuilds the rotated Gram instead of raising."""
     import vfe3.gradients.relational as rel
 
@@ -59,7 +59,6 @@ def test_comparison_rope_recovers_a_failed_float32_factor_from_the_rotated_sourc
 
     reference = cost(torch.float64)
     scoring.set_projected_factor_route(route)
-    scoring.set_projected_recovery_precision(precision)
     scoring.set_projected_condition_recovery(condition)
     scoring.reset_source_recovery_elements()
     recovered = cost(torch.float32)

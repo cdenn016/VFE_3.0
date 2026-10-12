@@ -19,9 +19,9 @@ from vfe3.model.model import VFEModel
 
 @pytest.fixture(autouse=True)
 def _restore_scorer_policies() -> Iterator[None]:
-    saved = (scoring._CONDITION_RECOVERY, scoring._FACTOR_ROUTE, scoring._RECOVERY_PRECISION)
+    saved = (scoring._CONDITION_RECOVERY, scoring._FACTOR_ROUTE)
     yield
-    scoring._CONDITION_RECOVERY, scoring._FACTOR_ROUTE, scoring._RECOVERY_PRECISION = saved
+    scoring._CONDITION_RECOVERY, scoring._FACTOR_ROUTE = saved
 
 
 def _kernel_values(reference: str, **overrides: Any) -> Dict[str, Any]:

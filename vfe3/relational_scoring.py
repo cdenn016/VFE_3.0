@@ -23,8 +23,8 @@ from vfe3.numerics import (
 _PROJECTION_TILE_BYTES = 32 * 1024 ** 2
 
 # Cumulative (token, head) covariance entries whose Cholesky factor was rebuilt from source by the
-# recovery path (float64 QR, or float32 shifted CholeskyQR3 on the "cholesky_qr2" factor route or
-# under the fp32 recovery precision), per device. Updated asynchronously on the recovery
+# recovery path (float32 shifted CholeskyQR3, or float64 QR where the float32 retry fails or the input is
+# float64), per device. Updated asynchronously on the recovery
 # path only, so the healthy path pays nothing (audit 2026-09-23 low: the recovery had no activation counter).
 _SOURCE_RECOVERY_COUNTS: Dict[str, torch.Tensor] = {}
 
@@ -93,14 +93,11 @@ def reset_gemm_fallback_slices() -> None:
 GRAM_CONDITION_TOL: float = 1e-4
 _CONDITION_RECOVERY: bool = False
 
-# Working precision of a source recovery (installed by VFEModel, which fixes "fp32"). "fp64" rebuilds the flagged factors by float64 QR, promotes the factor tensor to float64
-# and routes every pair touching a recovered entry through float64 triangular-solve tiles. "fp32"
-# rebuilds them by float32 shifted CholeskyQR3 of the source root (backward stable for
-# kappa_2(X) <~ 1/eps_32; Fukaya et al., SIAM J. Sci. Comput. 42 (2020) A477), keeps the factor in
-# the working dtype, and evaluates the touched pairs by the same triangular-solve tiles in the working
-# dtype. A call whose float32 retry fails falls back to "fp64" for that call.
-_RECOVERY_PRECISIONS = ("fp64", "fp32")
-_RECOVERY_PRECISION: str = "fp64"
+# Working precision of a source recovery: fp32. The flagged factors are rebuilt by float32 shifted CholeskyQR3 of
+# the source root (backward stable for kappa_2(X) <~ 1/eps_32; Fukaya et al., SIAM J. Sci. Comput. 42 (2020) A477),
+# the factor stays in the working dtype, and the touched pairs are evaluated by triangular-solve tiles in the working
+# dtype. A call whose float32 retry fails, and a float64 input, take the float64 recovery: float64 QR, the factor
+# tensor promoted to float64, and float64 triangular-solve tiles for every pair touching a recovered entry.
 
 
 def projected_gram_condition_tol() -> float:
@@ -108,24 +105,8 @@ def projected_gram_condition_tol() -> float:
     return GRAM_CONDITION_TOL
 
 
-def set_projected_recovery_precision(precision: str) -> str:
-    r"""Set the projected source-recovery working precision ("fp64" | "fp32"); returns the previous value."""
-    if precision not in _RECOVERY_PRECISIONS:
-        raise ValueError(
-            f"projected recovery precision must be one of {_RECOVERY_PRECISIONS}, got {precision!r}")
-    global _RECOVERY_PRECISION
-    previous = _RECOVERY_PRECISION
-    _RECOVERY_PRECISION = precision
-    return previous
-
-
-def projected_recovery_precision() -> str:
-    r"""Return the projected source-recovery working precision."""
-    return _RECOVERY_PRECISION
-
-
 def set_projected_condition_recovery(enabled: bool) -> bool:
-    r"""Set conditioning-triggered float64 source recovery; returns the previous value."""
+    r"""Set conditioning-triggered source recovery; returns the previous value."""
     if not isinstance(enabled, bool):
         raise ValueError(f"projected condition recovery must be bool, got {enabled!r}")
     global _CONDITION_RECOVERY
@@ -804,26 +785,25 @@ def _strict_cholesky(
 
     A failed rounded Gram matrix can lose SPD although its source measurement
     still has full row rank. For failed float32 entries, and for poorly conditioned ones under
-    :func:`projected_condition_recovery`, reconstruct
-    X = S U^{-1} Sigma^{1/2} in float64 and factor X^T = QR, giving C = R^T.
-    No jitter, covariance floor, or projection constraint is introduced.
+    :func:`projected_condition_recovery`, reconstruct the source root X = S U^{-1} Sigma^{1/2}
+    (formed in float64, then rounded to the working dtype) and factor it by shifted CholeskyQR3 in
+    the working dtype, whose factor C satisfies C C^T = (X + dX)(X + dX)^T with
+    ||dX|| <= c eps ||X|| for kappa_2(X) <~ 1/eps (Fukaya et al. 2020); the factor tensor stays in
+    the working dtype. No jitter, covariance floor, or projection constraint is introduced.
 
     ``factored`` marks a ``prepared`` factor from :func:`_factor_status` (CholeskyQR2 of the source
-    root). Its outright failures first retry shifted CholeskyQR3 in the working dtype, and its
-    healthy entries keep their prepared factor on the recovery path.
+    root). Its outright failures are rebuilt as above, its certificate-flagged entries keep their
+    CholeskyQR2 factor, since a working-dtype redo cannot improve on it, and its healthy entries keep
+    their prepared factor on the recovery path. Without source tuples no rebuild is possible, so
+    flagged entries keep their factor.
 
-    Under :func:`projected_recovery_precision` ``"fp32"`` the rebuilt entries are factored instead by
-    shifted CholeskyQR3 of the rounded source root in the working dtype, whose factor C satisfies
-    C C^T = (X + dX)(X + dX)^T with ||dX|| <= c eps ||X|| for kappa_2(X) <~ 1/eps (Fukaya et al.
-    2020), and the factor tensor stays in the working dtype. The factor route's certificate-flagged
-    entries keep their CholeskyQR2 factor there, since a working-dtype redo cannot improve on it, and
-    without source tuples no rebuild is possible, so flagged entries keep their factor. A failed
-    working-dtype retry takes the float64 recovery for the whole call.
+    A failed working-dtype retry, and a float64 input, take the float64 recovery for the whole call:
+    the root is factored by float64 QR, X^T = QR, giving C = R^T.
 
     ``commutant_pairs`` declares that G is the projection :math:`P(XX^\top)` of the source covariance onto the
     commutant of the RoPE torus with that many rotating planes (``rope_mode='comparison_invariant'``,
     where the source tuple carries the rotated map :math:`R_iS`). A rebuilt entry then factors
-    :math:`P(XX^\top)` from the source root (:func:`_commutant_root_factor`), in float64 or by shifted CholeskyQR3
+    :math:`P(XX^\top)` from the source root (:func:`_commutant_root_factor`), by shifted CholeskyQR3 or in float64
     as above, instead of :math:`XX^\top` (audit 2026-10-10 round 2, item 12). The factor route never runs with it.
 
     Returns ``(chol, recover_mask)``. ``chol`` stays in ``G.dtype`` on the healthy
@@ -847,7 +827,7 @@ def _strict_cholesky(
     if not symmetric:
         raise ValueError("projected covariance must be symmetric for zero-jitter Cholesky")
     if recover_any:
-        working_recovery = _RECOVERY_PRECISION == "fp32" and G.dtype != torch.float64
+        working_recovery = G.dtype != torch.float64
         r = G.shape[-1]
         if projection is None:
             if failed_any:
@@ -969,9 +949,8 @@ def projected_gaussian_kl(
     slice whose GEMM error estimate (:func:`_gemm_expansion_error`) exceeds it in nats is scored instead
     by the direct-difference tiles at IEEE fp32 and counted in :func:`gemm_fallback_slices`; the verdict
     joins the existing decision read. Recovered factors use bounded checkpointed pair tiles of triangular solves
-    instead of cancelling covariance/precision products, in float64 under
-    :func:`projected_recovery_precision` ``"fp64"`` and in the working dtype under ``"fp32"``. No floor, cap,
-    symmetrization, jitter, or repair is applied. Optional (Sigma,U^-1,S[,mu])
+    instead of cancelling covariance/precision products, in the working dtype, or in float64 where the
+    recovery fell back to float64 (:func:`_strict_cholesky`). No floor, cap, symmetrization, jitter, or repair is applied. Optional (Sigma,U^-1,S[,mu])
     source tuples allow inaccurate rounded covariances and projected means to
     be recomputed from their original sources; covariance-only non-SPD inputs fail explicitly.
 
@@ -1084,7 +1063,7 @@ def projected_gaussian_kl(
             # Key entries the recovery will rebuild leave the GEMM (their pairs take the factor route), so
             # they leave the estimate too: failed or certificate-flagged entries, except that the fp32
             # factor route keeps a flagged-but-factored entry's CholeskyQR2 factor (see _strict_cholesky).
-            keeps_flagged = factored and _RECOVERY_PRECISION == "fp32" and dtype != torch.float64
+            keeps_flagged = factored and dtype != torch.float64
             recovered_k = k_status[1] if keeps_flagged else k_status[1] | k_status[2]
             fallback = ~(_gemm_expansion_error(aq, ak, k_prec_prepared, recovered_k) <= gemm_expansion_tol)
             verdicts.append(fallback.expand(slice_shape).reshape(-1))
@@ -1117,10 +1096,10 @@ def projected_gaussian_kl(
             chol_k, rec_k = _strict_cholesky(Gk, projection_k, (*k_status[:3], decisions[5:9]), factored,
                                              commutant_pairs)
         # Only tiles that touch a recovered query or key entry need the factor-route
-        # triangular solves (float64 under "fp64" recovery). Healthy pairs keep the centered GEMM
+        # triangular solves (float64 after a float64 recovery). Healthy pairs keep the centered GEMM
         # in the working dtype; the healthy factors round-trip bit-exactly through the cast.
         factor_trace_any = rec_q is not None or rec_k is not None
-        # "fp32" recovery keeps both factors in the working dtype, so its factor tiles do too.
+        # Working-dtype recovery keeps both factors in the working dtype, so its factor tiles do too.
         factor_fp64 = chol_q.dtype == torch.float64 or chol_k.dtype == torch.float64
         # Healthy tiles read the working-dtype means; only float64 factor-route tiles use float64 means.
         aq_healthy, ak_healthy = aq.movedim(-2, -3), ak.movedim(-2, -3)  # (..., H, N, r)
@@ -1140,7 +1119,7 @@ def projected_gaussian_kl(
                 # Both factors at float64, so the tile's triangular solves (which take the
                 # triangular operand's dtype) run in float64 also when only one role was recovered.
                 chol_q, chol_k = chol_q.double(), chol_k.double()
-            q_factor, k_factor = chol_q, chol_k                 # float64 under "fp64" recovery
+            q_factor, k_factor = chol_q, chol_k                 # float64 after a float64 recovery
             q_cov_healthy = Gq                                  # working dtype
             with ieee_fp32_matmul():                            # token-linear key precision
                 k_prec_healthy = torch.cholesky_inverse(chol_k.to(dtype))
@@ -1525,10 +1504,10 @@ def projected_noisy_query_cost(
     D_ij nonnegative because W_ij > G_q,i. Each pair needs its own r x r Cholesky factor of W_ij.
 
     Factorization and recovery follow projected_gaussian_kl: zero jitter, no covariance repair,
-    float64 source recovery for flagged entries, bounded checkpointed pair tiles, and the float64
-    route selected per pair, so healthy pairs are bit-identical to a call without recovery. Under
-    the fp32 recovery precision the recovered factors come from float32 shifted
-    CholeskyQR3, and these pair tiles still run in float64.
+    source recovery for flagged entries, bounded checkpointed pair tiles, and the float64
+    route selected per pair, so healthy pairs are bit-identical to a call without recovery. The
+    recovered factors come from float32 shifted CholeskyQR3 (float64 QR on its fallback), and these
+    pair tiles run in float64.
     Recovered entries enter the working-dtype grid as identity placeholders, so no factorization
     of a numerically non-SPD sum runs even for a pair whose value the factor route replaces.
     ``symmetric_inputs`` is the bitwise-symmetry certificate of :func:`projected_gaussian_kl`, and

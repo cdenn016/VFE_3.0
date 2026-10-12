@@ -1,8 +1,8 @@
 r"""Numeric-policy toggles exposed on 2026-10-04.
 
 The frame-pair float64 escalation is opt-in again (``tests/test_frame_pair_escalation_20260923.py``).
-This file covers the projected source-recovery precision and the certificate tolerances (module
-policies that the merged ``projected_factorization`` fixes at fp32, 1e-4 and 3e-4 since 2026-10-12),
+This file covers the fp32 projected source recovery and the certificate tolerances (module
+constants since 2026-10-12: 1e-4 and 3e-4),
 and the bit-identical ``predictive_covariance_checkpoint``. The recovery fixture is the rank-ill source of
 ``tests/test_relational_source_factorization.py``: S has singular values (1, 0.5, 1e-4), so
 kappa(X) = 1e4 and the rounded float32 Gram G = X X^T (kappa 1e8) loses SPD.
@@ -22,15 +22,15 @@ from vfe3.numerics import triangular_condition_estimate
 from vfe3.relational_scoring import (
     _cholesky_status, _factor_status, projected_gaussian_kl, projected_moments,
     reset_source_recovery_elements, set_projected_condition_recovery, set_projected_factor_route,
-    set_projected_recovery_precision, source_recovery_elements,
+    source_recovery_elements,
 )
 
 
 @pytest.fixture(autouse=True)
 def _restore_scorer_policies() -> Iterator[None]:
-    saved = (scoring._CONDITION_RECOVERY, scoring._FACTOR_ROUTE, scoring._RECOVERY_PRECISION)
+    saved = (scoring._CONDITION_RECOVERY, scoring._FACTOR_ROUTE)
     yield
-    scoring._CONDITION_RECOVERY, scoring._FACTOR_ROUTE, scoring._RECOVERY_PRECISION = saved
+    scoring._CONDITION_RECOVERY, scoring._FACTOR_ROUTE = saved
 
 
 class _Ops(TorchDispatchMode):
@@ -95,14 +95,10 @@ def test_fields_validate_and_report_inactivity() -> None:
 @pytest.mark.parametrize(("factorization", "recovery", "route"), [
     ("gram", False, "gram"), ("gram_certified", True, "gram"), ("cholesky_qr2_certified", True, "cholesky_qr2")])
 def test_model_installs_the_scorer_policies(factorization: str, recovery: bool, route: str) -> None:
-    set_projected_recovery_precision("fp64")
     VFEModel(tiny_config(projected_factorization=factorization))
     assert scoring.projected_condition_recovery() is recovery
     assert scoring.projected_factor_route() == route
-    assert scoring.projected_recovery_precision() == "fp32"
     assert scoring.GRAM_CONDITION_TOL == 1e-4 and scoring.FACTOR_CONDITION_TOL == 3e-4
-    with pytest.raises(ValueError, match="recovery precision"):
-        set_projected_recovery_precision("bf16")
 
 
 # -- the certificate tolerances reach the certificates ----------------------------------------------
@@ -139,30 +135,25 @@ def test_factor_tolerance_moves_the_certificate(device: torch.device, monkeypatc
 @pytest.mark.parametrize("full", [False, True])
 def test_fp32_recovery_stays_in_the_working_dtype(device: torch.device, role: str, full: bool) -> None:
     reference = _reference(device, role, full)
-    for precision in ("fp64", "fp32"):
-        set_projected_recovery_precision(precision)
-        S = _inputs(device)[3].clone().requires_grad_(True)
-        aq, Gq, ak, Gk, source_q, source_k = _case(device, role, full, S)
-        assert torch.linalg.cholesky_ex(Gq if role == "q" else Gk)[1].ne(0).any()   # lost SPD
-        reset_source_recovery_elements()
-        ops = _Ops()
-        with ops:
-            score = projected_gaussian_kl(aq, Gq, ak, Gk, projection_q=source_q, projection_k=source_k)
-        assert source_recovery_elements() > 0
-        assert score.dtype == torch.float32
-        assert ("linalg_qr" in ops.names) is (precision == "fp64")
-        if precision == "fp32":
-            # Only the per-entry source root is formed in float64; no float64 QR or pair tiles run.
-            assert "linalg_solve_triangular" not in ops.float64
-        # Measured: 3e-8 (fp64) and <= 6.2e-6 (fp32) relative to |reference| + 1.
-        torch.testing.assert_close(score.double(), reference, rtol=5e-5, atol=5e-5)
-        score.sum().backward()
-        assert torch.isfinite(S.grad).all()
+    S = _inputs(device)[3].clone().requires_grad_(True)
+    aq, Gq, ak, Gk, source_q, source_k = _case(device, role, full, S)
+    assert torch.linalg.cholesky_ex(Gq if role == "q" else Gk)[1].ne(0).any()   # lost SPD
+    reset_source_recovery_elements()
+    ops = _Ops()
+    with ops:
+        score = projected_gaussian_kl(aq, Gq, ak, Gk, projection_q=source_q, projection_k=source_k)
+    assert source_recovery_elements() > 0
+    assert score.dtype == torch.float32
+    # Only the per-entry source root is formed in float64; no float64 QR or pair tiles run.
+    assert "linalg_qr" not in ops.names and "linalg_solve_triangular" not in ops.float64
+    # Measured: <= 6.2e-6 relative to |reference| + 1.
+    torch.testing.assert_close(score.double(), reference, rtol=5e-5, atol=5e-5)
+    score.sum().backward()
+    assert torch.isfinite(S.grad).all()
 
 
 def test_fp32_recovery_falls_back_to_fp64_when_the_retry_fails(device: torch.device,
                                                                   monkeypatch: pytest.MonkeyPatch) -> None:
-    set_projected_recovery_precision("fp32")
     real = scoring.cholesky_qr2
 
     def failing(root: torch.Tensor, shift: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -180,7 +171,6 @@ def test_fp32_recovery_falls_back_to_fp64_when_the_retry_fails(device: torch.dev
 
 def test_fp32_recovery_keeps_the_factor_route_factor(device: torch.device) -> None:
     set_projected_factor_route("cholesky_qr2")
-    set_projected_recovery_precision("fp32")
     aq, Gq, ak, Gk, source_q, source_k = _case(device, "k", False, _inputs(device)[3])
     ops = _Ops()
     with ops:
