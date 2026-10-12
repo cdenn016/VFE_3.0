@@ -361,7 +361,8 @@ def _identity_covariance_score(
         capture["projected_key_covariance_pre"] = G_k.detach().to(public)
     score = routing_cost(operators.routing)
     return score(a[0], G_q, a[1], G_k,
-                 projection_q=(ones, eye, S_q), projection_k=(ones, eye, S_k)).to(public)
+                 projection_q=(ones, eye, S_q), projection_k=(ones, eye, S_k),
+                 **_key_noise_options(operators)).to(public)
 
 
 @contextmanager
@@ -629,7 +630,16 @@ def _frame_free_covariance_score(
         capture["projected_key_covariance_pre"] = G_k.detach().to(public)
     score = routing_cost(operators.routing)
     return score(a_q, G_q, a_k, G_k,
-                 projection_q=(sigma_h, eye, S_q), projection_k=(source_sigma_h, eye, S_k)).to(public)
+                 projection_q=(sigma_h, eye, S_q), projection_k=(source_sigma_h, eye, S_k),
+                 **_key_noise_options(operators)).to(public)
+
+
+def _key_noise_options(operators: Any) -> Dict[str, torch.Tensor]:
+    r"""``{"key_noise": n}``, the per-head key noise :math:`n_h = \exp(\log n_h)` ``(H,)`` under
+    ``relational_routing='noisy_key'``, as the router passes it (:func:`vfe3.gradients.relational.relational_score`);
+    empty for every other routing cost (audit 2026-10-12 round 2, item 11)."""
+    log_noise = getattr(operators, "routing_key_log_noise", None)              # (H,) or None
+    return {} if log_noise is None else {"key_noise": log_noise.exp()}
 
 
 @contextmanager

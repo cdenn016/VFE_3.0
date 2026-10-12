@@ -1825,8 +1825,10 @@ class PriorBank(nn.Module):
             in_chunk_f = in_chunk.to(mu_q.dtype)                           # (B, N) 0/1, carried into the checkpoint
             local_idx = (targets - v0).clamp(min=0, max=v1 - v0 - 1)       # (B, N) safe gather index
             grad_active = torch.is_grad_enabled() and (mu_q.requires_grad or W.requires_grad)
+            # The second-order closure keeps two (B, N, Vc) tensors for backward, the logits and the chunk
+            # probabilities p_c (audit 2026-10-12 round 2, item 16), so it counts twice the first-order workspace.
             activation_bytes = _decode_ce_chunk_activation_bytes(
-                mu_q, V if self.decode_ce_checkpoint == "auto_aggregate" else v1 - v0)
+                mu_q, V if self.decode_ce_checkpoint == "auto_aggregate" else v1 - v0, 2 if second_order else 1)
             summaries = _chunk_summaries_second_order if second_order else _chunk_summaries
             if _decode_ce_should_checkpoint(self.decode_ce_checkpoint, grad_active, activation_bytes):
                 chunk_result = _checkpoint.checkpoint(

@@ -897,11 +897,13 @@ class RelationalOperators(nn.Module):
         :data:`vfe3.model.minimal_agent.MINIMAL_AGENT_DIAGNOSTIC_KEYS`: per head ``(H,)`` the gain fraction, head
         coupling, mean-field label staleness and exact spread share (means over receivers; each NaN in the other
         mode), the mean-field M-step optimum :math:`n_h^*` of the call
-        (:func:`vfe3.model.minimal_agent.channel_noise_mstep`; NaN under exact inference) and
+        (:func:`vfe3.model.minimal_agent.channel_noise_mstep`; NaN under exact inference and at the :math:`n\to 0`
+        bracket, which the boundary flag marks) and
         :math:`n_h`, and the layer's covariance contraction :math:`\operatorname{tr}C^+/\operatorname{tr}C` (repeated
-        per head). Under ``elbo_diagnostic`` the capture also receives the receiver means of the evidence lower bound,
-        the ADF evidence and their gap (:data:`vfe3.model.minimal_agent.MINIMAL_AGENT_ELBO_KEYS`, float64 scalars,
-        computed without autograd). Under ``predictive_covariance='spread_corrected'`` the returned covariance also
+        per head). Under ``elbo_diagnostic`` the capture also receives the receiver means of the evidence lower bound
+        of the returned posterior, the ADF evidence, the exact evidence (NaN unless every receiver's heads are
+        uncoupled), the importance-sampled evidence and the gaps to the bound
+        (:data:`vfe3.model.minimal_agent.MINIMAL_AGENT_ELBO_KEYS`, float64 scalars, computed without autograd). Under ``predictive_covariance='spread_corrected'`` the returned covariance also
         carries :math:`\sum_hZ'^h_iR'^h_iZ'^{h\top}_i`, :math:`Z'^h_i = U_iP_iS_h^\top`
         (:func:`vfe3.model.minimal_agent.local_posterior_covariance`), with the same floor.
 
@@ -1019,11 +1021,18 @@ class RelationalOperators(nn.Module):
                     "relational_minimal_agent_spread_share": result.spread_share.reshape(-1, H).nanmean(0),
                     # mean field: the M-step optimum n_h^* of the call beside the learned n_h (exact: NaN)
                     "relational_minimal_agent_channel_noise_mstep": result.channel_noise_mstep.to(dtype),
+                    # mean field: 1 where n_h^* sits at the n -> 0 bracket (n_h^* is then NaN); exact: NaN
+                    "relational_minimal_agent_channel_noise_mstep_boundary": (
+                        result.channel_noise_mstep_boundary.to(dtype)
+                        if result.channel_noise_mstep_boundary is not None
+                        else torch.full((H,), math.nan, dtype=dtype, device=mu.device)),
                 }
                 if result.elbo is not None:                                              # elbo_diagnostic: nats
+                    # The exact evidence is reported only when every receiver's heads are uncoupled (else NaN).
                     record.update(zip(minimal_agent.MINIMAL_AGENT_ELBO_KEYS, (
-                        result.elbo.nanmean(), result.evidence.nanmean(),
-                        (result.evidence - result.elbo).nanmean())))                    # () float64 each
+                        result.elbo.nanmean(), result.adf_evidence.nanmean(),
+                        (result.adf_evidence - result.elbo).nanmean(), result.evidence.mean(),
+                        result.is_evidence.nanmean(), (result.is_evidence - result.elbo).nanmean())))   # () float64
         status = torch.stack((result.failed, result.ill_conditioned))                         # (2,) bool
         return (mu_plus.to(mu.dtype), None if sigma_plus is None else sigma_plus.to(sigma.dtype), record, status)
 

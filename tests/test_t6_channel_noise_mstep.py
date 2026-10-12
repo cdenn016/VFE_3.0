@@ -54,43 +54,50 @@ def _loss(n: torch.Tensor, a, A, b, V, weights, heard, h: int) -> torch.Tensor:
 @pytest.mark.parametrize("seed", [0, 1, 2, 3])
 def test_mstep_is_the_global_minimizer_of_the_dense_objective(seed: int) -> None:
     inputs = _instance(seed, spread=1.5)
-    n_star = ma.channel_noise_mstep(*inputs)
-    assert n_star.shape == (2,) and n_star.dtype == F64
+    n_star, boundary = ma.channel_noise_mstep(*inputs)
+    assert n_star.shape == (2,) and n_star.dtype == F64 and boundary.dtype == torch.bool
+    assert torch.equal(torch.isnan(n_star), boundary)                         # n* is reported only when interior
     for h in range(2):
         grid = torch.logspace(-6, 3, 2000, dtype=F64)
         dense = torch.stack([_loss(n, *inputs, h) for n in grid])
         best = float(dense.min())
-        at_star = float(_loss(n_star[h], *inputs, h))
+        n_eval = torch.zeros((), dtype=F64) if bool(boundary[h]) else n_star[h]
+        at_star = float(_loss(n_eval, *inputs, h))
         assert at_star <= best + 1e-10 * abs(best)                             # no grid point beats n*
-        if float(n_star[h]) > 0:
+        if not bool(boundary[h]):
             n = n_star[h].clone().requires_grad_(True)
             gradient, = torch.autograd.grad(_loss(n, *inputs, h), n)
             assert abs(float(gradient)) < 1e-8 * max(1.0, abs(best))           # stationary
 
 
 def test_one_direction_closed_form_and_the_boundary() -> None:
-    def single(a: float, A: float, b: float, V: float) -> float:
+    def single(a: float, A: float, b: float, V: float) -> tuple:
         t = lambda x: torch.tensor(x, dtype=F64)
-        return float(ma.channel_noise_mstep(t(a).reshape(1, 1, 1, 1), t(A).reshape(1, 1, 1, 1, 1),
-                                            t(b).reshape(1, 1, 1, 1), t(V).reshape(1, 1, 1, 1, 1),
-                                            torch.ones(1, 1, 1, dtype=F64), torch.ones(1, 1, 1, dtype=torch.bool))[0])
-    # e = A + (a - b)^2 = 0.5 + 4 = 4.5, v = 0.3: n* = 4.2.
-    assert single(0.0, 0.5, 2.0, 0.3) == pytest.approx(4.2, rel=1e-12)
-    # e - v < 0: the records are less dispersed than the key law alone explains, n* = 0.
-    assert single(0.0, 0.1, 0.1, 0.5) == 0.0
+        n_star, boundary = ma.channel_noise_mstep(t(a).reshape(1, 1, 1, 1), t(A).reshape(1, 1, 1, 1, 1),
+                                                  t(b).reshape(1, 1, 1, 1), t(V).reshape(1, 1, 1, 1, 1),
+                                                  torch.ones(1, 1, 1, dtype=F64), torch.ones(1, 1, 1, dtype=torch.bool))
+        return float(n_star[0]), bool(boundary[0])
+    # e = A + (a - b)^2 = 0.5 + 4 = 4.5, v = 0.3: n* = 4.2, interior.
+    n_star, boundary = single(0.0, 0.5, 2.0, 0.3)
+    assert n_star == pytest.approx(4.2, rel=1e-12) and not boundary
+    # e - v < 0: the records are less dispersed than the key law alone explains; the minimizer is the n -> 0 bracket,
+    # flagged, with no value reported (audit 2026-10-12 round 2, M2).
+    n_star, boundary = single(0.0, 0.1, 0.1, 0.5)
+    assert math.isnan(n_star) and boundary
 
 
 def test_unheard_receivers_and_masked_pairs_do_not_enter() -> None:
     a, A, b, V, weights, heard = _instance(5)
-    reference = ma.channel_noise_mstep(a, A, b, V, weights, heard)
+    reference = ma.channel_noise_mstep(a, A, b, V, weights, heard)[0]
     # Receiver 0 hears no record: its row is dropped, so changing its moments changes nothing.
     heard = heard.clone()
     heard[..., 0] = False
-    dropped = ma.channel_noise_mstep(a, A, b, V, weights, heard)
+    dropped = ma.channel_noise_mstep(a, A, b, V, weights, heard)[0]
     a2 = a.clone()
     a2[:, 0] += 50.0
-    torch.testing.assert_close(ma.channel_noise_mstep(a2, A, b, V, weights, heard), dropped, rtol=1e-12, atol=0)
-    assert not torch.allclose(dropped, reference)
+    torch.testing.assert_close(ma.channel_noise_mstep(a2, A, b, V, weights, heard)[0], dropped, rtol=1e-12, atol=0,
+                               equal_nan=True)
+    assert not torch.allclose(dropped, reference, equal_nan=True)
 
 
 @pytest.mark.parametrize("inference", ["mean_field", "exact"])
@@ -116,7 +123,7 @@ def test_readout_reports_the_mstep_at_its_own_posterior(inference: str) -> None:
     V = result.key_covariance.movedim(-3, -4)
     heard = torch.ones(Bt, H, N, dtype=torch.bool)
     inputs = (a_post, A_post, b, V, result.weights, heard)
-    torch.testing.assert_close(n_star, ma.channel_noise_mstep(*inputs), rtol=1e-12, atol=0)
+    torch.testing.assert_close(n_star, ma.channel_noise_mstep(*inputs)[0], rtol=1e-12, atol=0)
     for h in range(H):
         # The M-step does not raise the free energy relative to the learned noise at the same posterior.
         assert float(_loss(n_star[h], *inputs, h)) <= float(_loss(log_noise[h].exp(), *inputs, h)) + 1e-12
@@ -141,6 +148,10 @@ def test_capture_and_layer_row_carry_the_mstep() -> None:
     cap: dict = {}
     model.forward_beliefs(ids, capture=cap)
     value = cap["relational_capture"]["relational_minimal_agent_channel_noise_mstep"]
-    assert value.shape == (len(model.group.irrep_dims),) and torch.isfinite(value).all()
+    boundary = cap["relational_capture"]["relational_minimal_agent_channel_noise_mstep_boundary"]
+    assert value.shape == boundary.shape == (len(model.group.irrep_dims),)
+    assert torch.equal(torch.isnan(value), boundary == 1.0) and bool(((boundary == 0) | (boundary == 1)).all())
     row = model._minimal_agent_diagnostics(cap["relational_capture"])
-    assert row["relational_minimal_agent_channel_noise_mstep"] == pytest.approx(float(value.double().mean()))
+    assert row["relational_minimal_agent_channel_noise_mstep"] == pytest.approx(
+        float(value.double().nanmean()), nan_ok=True)
+    assert row["relational_minimal_agent_channel_noise_mstep_boundary"] == pytest.approx(float(boundary.double().mean()))

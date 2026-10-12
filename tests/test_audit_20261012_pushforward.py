@@ -26,6 +26,13 @@ def _one_thread() -> None:
     torch.set_num_threads(1)
 
 
+def _centered_lambda_max(gamma: torch.Tensor) -> float:
+    r"""Dense reference :math:`\lambda_{\max}(\Pi\Gamma^2\Pi)`, :math:`\Pi = I - \mathbf 1\mathbf 1^\top/K`."""
+    K = gamma.shape[-1]
+    Pi = torch.eye(K, dtype=F64) - 1.0 / K
+    return float(torch.linalg.eigvalsh(Pi @ torch.diag(gamma.double().square()) @ Pi).max())
+
+
 def _launcher_like(K: int = 20, n: int = 6, sigma: float = 15.0, full: bool = False) -> tuple:
     g = torch.Generator().manual_seed(0)
     mu = 0.065 * torch.randn(n, K, generator=g, dtype=F64)                 # the launcher's mean scale
@@ -45,7 +52,7 @@ def test_pushforward_trace_is_capped_at_the_sphere_bound(full: bool, affine: boo
     uncapped = bm._uncapped_block_norm_pushforward(norm, mu, sigma, 1e-4)
     capped = bm.block_norm_covariance_pushforward(norm, mu, sigma, 1e-4)
     trace = (lambda P: P.sum(-1)) if not full else (lambda P: torch.diagonal(P, dim1=-2, dim2=-1).sum(-1))
-    bound = K * (1.5 ** 2 if affine else 1.0)
+    bound = K * (_centered_lambda_max(norm.weight.detach()) if affine else 1.0)
     assert (trace(uncapped) > 1e3 * bound).all()                          # the delta method far outside its regime
     torch.testing.assert_close(trace(capped), torch.full_like(trace(capped), bound), rtol=1e-12, atol=0.0)
     lam = bound / trace(uncapped)                                         # (n,) one scale per token
@@ -94,3 +101,74 @@ def test_model_with_pushforward_stays_finite_at_large_sigma_init(mlp: dict, fami
     assert torch.isfinite(loss)
     loss.backward()
     assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_gamma_gradient_is_exact_where_the_cap_binds(full: bool) -> None:
+    r"""Where the cap binds the output is :math:`K\max_k\gamma_k^2 P/\operatorname{tr}P`, so the bound carries a
+    gamma gradient; a detached bound dropped it (audit 2026-10-12 round 2, item 3). Central differences on a
+    non-uniform gamma at K = 4 in float64."""
+    K = 4
+    norm = AffineLayerNorm(K, eps=1e-5).double()
+    with torch.no_grad():
+        norm.weight.copy_(torch.tensor([0.7, 1.3, 0.9, 1.1], dtype=F64))
+    mu, sigma = _launcher_like(K, n=3, full=full)
+    with torch.no_grad():
+        lam = bm.layernorm_trace_cap(bm._uncapped_block_norm_pushforward(norm, mu, sigma, 1e-4), norm.weight,
+                                     not full)
+    assert (lam < 1.0).all()                                              # the cap binds on every token
+    shape = bm.block_norm_covariance_pushforward(norm, mu, sigma, 1e-4).shape
+    probe = torch.randn(shape, generator=torch.Generator().manual_seed(2), dtype=F64)
+
+    def objective() -> torch.Tensor:
+        return (bm.block_norm_covariance_pushforward(norm, mu, sigma, 1e-4) * probe).sum()
+
+    norm.weight.grad = None
+    objective().backward()
+    analytic = norm.weight.grad.clone()
+    numeric = torch.empty_like(analytic)
+    h = 1e-6
+    with torch.no_grad():
+        for k in range(K):
+            norm.weight[k] += h
+            plus = objective()
+            norm.weight[k] -= 2 * h
+            minus = objective()
+            norm.weight[k] += h
+            numeric[k] = (plus - minus) / (2 * h)
+    torch.testing.assert_close(analytic, numeric, rtol=1e-6, atol=1e-8)
+
+
+@pytest.mark.parametrize("K", [2, 3, 5, 20])
+def test_centered_bound_is_the_largest_eigenvalue_of_the_centered_scale(K: int) -> None:
+    r"""The secular-equation multisection returns :math:`\lambda_{\max}(\Pi\Gamma^2\Pi)` from above to rounding, for
+    random, tied and uniform gamma, and lies in :math:`[(1 - 1/K)\max\gamma^2, \max\gamma^2]` (M3)."""
+    g = torch.Generator().manual_seed(K)
+    cases = [torch.randn(K, generator=g, dtype=F64) * s for s in (0.1, 1.0, 7.0)]
+    cases += [torch.full((K,), 1.3, dtype=F64), torch.cat([torch.full((2,), 2.0, dtype=F64),
+                                                          torch.rand(K - 2, generator=g, dtype=F64)])]
+    for gamma in cases:
+        reference = _centered_lambda_max(gamma)
+        bound = float(bm._centered_affine_bound(gamma))
+        assert reference * (1 - 1e-13) <= bound <= reference * (1 + 1e-13) + 1e-300
+        top = float(gamma.square().max())
+        assert (1 - 1 / K) * top * (1 - 1e-13) <= bound <= top * (1 + 1e-13)
+
+
+def test_centered_bound_holds_for_the_layernorm_output_and_is_attained() -> None:
+    r"""Monte Carlo :math:`\operatorname{tr}\operatorname{Cov}(\gamma\odot\mathrm{LN}(x))` stays below
+    :math:`K\lambda_{\max}(\Pi\Gamma^2\Pi)` at every input scale, and the bound is the supremum of
+    :math:`\lVert\Gamma z\rVert^2` on the centered sphere of radius :math:`\sqrt K` (attained by the top eigenvector)."""
+    K = 20
+    gamma = torch.linspace(0.5, 1.5, K, dtype=F64)
+    bound = K * float(bm._centered_affine_bound(gamma))
+    g = torch.Generator().manual_seed(0)
+    for sigma in (1e-2, 1.0, 15.0, 1e3):
+        mu = 0.065 * torch.randn(K, generator=g, dtype=F64)
+        x = mu + sigma ** 0.5 * torch.randn(20000, K, generator=g, dtype=F64)
+        y = torch.nn.functional.layer_norm(x, (K,), eps=1e-5) * gamma
+        assert float(torch.cov(y.T).trace()) <= bound
+    Pi = torch.eye(K, dtype=F64) - 1.0 / K
+    v = torch.linalg.eigh(Pi @ torch.diag(gamma.square()) @ Pi).eigenvectors[:, -1]
+    z = K ** 0.5 * v                                                      # centered, |z|^2 = K
+    torch.testing.assert_close(float((gamma * z).square().sum()), bound, rtol=1e-12, atol=0.0)

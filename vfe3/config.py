@@ -217,7 +217,10 @@ class VFE3Config:
     # Eval-cadence diagnostic (audit 2026-10-12 T1): per layer, the evidence lower bound of the minimal agent's
     # posterior (predictive_readout='minimal_agent') and of each prototype_agents block, the evidence of the declared
     # record model (ADF over heads for the minimal agent, exact for the prototypes) and their gap, in nats per token.
-    # Logged as val_relational_minimal_agent_{elbo,evidence,elbo_gap} (last layer) and in
+    # The minimal agent also logs the exact evidence (NaN unless its heads are uncoupled) and a 64-sample
+    # importance-sampled evidence under q with its gap (audit 2026-10-12 round 2, item 12 and M1).
+    # Logged as val_relational_minimal_agent_{elbo,adf_evidence,adf_elbo_gap,evidence,is_evidence,is_elbo_gap}
+    # (last layer) and in
     # diagnostics/minimal_agent_elbo.csv and diagnostics/prototype_elbo.csv; computed without autograd, never in the
     # loss (the evidence is unbounded above as the maps and the noise shrink). The mean field also runs the exact
     # path once per diagnostic forward for the evidence.
@@ -2286,14 +2289,20 @@ class VFE3Config:
         if self.attention_mode == "projected_predictive" and not self.diagnose_canonical_free_energy:
             mark(("lambda_beta",), "predictive_content weights no belief-coupling block; with "
                  "diagnose_canonical_free_energy=True it would feed that log-step diagnostic only")
-        # stack._can_omit_prior_handoff at config level: predictive_content never reads the prior
+        # stack._can_omit_prior_handoff at config level: predictive_content never reads the prior mean,
         # and no M-step prior consumer is enabled. The canonical diagnostic reads each layer's handed-off prior
-        # (the capture keeps the handoff), so it is a consumer too (audit 2026-10-10 round 2, item 31).
+        # (the capture keeps the handoff), so it is a consumer too (audit 2026-10-10 round 2, item 31). The
+        # moment-matched and spread-corrected readouts floor at f * Sigma_p with the layer's prior covariance, so
+        # there the variance handoff is read (audit 2026-10-12 round 2, item 8).
         if (self.attention_mode == "projected_predictive" and self.mstep_self_coupling_weight == 0.0
                 and self.cg_energy_weight == 0.0 and not self.diagnose_canonical_free_energy):
-            mark(("prior_handoff_rho", "prior_handoff_sigma"),
-                 "predictive_content never reads the prior and no M-step prior consumer is enabled; with "
-                 "diagnose_canonical_free_energy=True they would feed that log-step diagnostic only")
+            from vfe3.model.minimal_agent import READOUT_COVARIANCES
+            floored = self.predictive_covariance in READOUT_COVARIANCES
+            mark(("prior_handoff_rho",) if floored else ("prior_handoff_rho", "prior_handoff_sigma"),
+                 "predictive_content never reads the prior mean"
+                 + ("" if floored else " or, without a moment-matched covariance, the prior covariance")
+                 + ", and no M-step prior consumer is enabled; with diagnose_canonical_free_energy=True "
+                 "they would feed that log-step diagnostic only")
         # The stack enters the E-step with q = p; one gradient iteration in one layer therefore
         # evaluates the self-coupling at D(q||p) = 0, where its force and derivatives vanish.
         # The closed-form receiver jumps to the frozen minimizer, which alpha sets, so the rule holds

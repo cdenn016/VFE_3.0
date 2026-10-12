@@ -951,6 +951,7 @@ class VFEModel(nn.Module):
         estep_grad_out: Optional[EStepGradientOutput] = None,   # diag out-param: E-step belief-grad norms (forwarded)
         _decode_frame_out: Optional[dict]            = None,   # private out-param: the reference decode frame
         _encoded_sigma_out: Optional[dict]           = None,   # private out-param: the stack's input covariance
+        _relational_capture: bool                    = True,   # private: False for forward's M-step-only capture
     ) -> 'Tuple[BeliefState, Optional[torch.Tensor]]':
         r"""Run the belief pipeline and return the converged belief q*, optionally
         with the decoded logits. This is the single belief-production seam used by ``forward`` and,
@@ -972,7 +973,10 @@ class VFEModel(nn.Module):
         from the returned belief: ``capture['converged']`` (the last block's converged
         pre-transform q*) and ``capture['final_block_prior']`` (the live ``(mu_p, sigma_p)`` entering
         that block), both written by ``vfe_stack``. ``capture['prior']`` retains the encode-time prior
-        (post s-refine), and ``capture['out']`` retains the raw stack output.
+        (post s-refine), and ``capture['out']`` retains the raw stack output. A capture also receives the
+        relational diagnostics (``capture['relational_capture']``: router labels, receiver costs, the minimal-agent
+        diagnostics); ``forward``'s M-step capture passes ``_relational_capture=False``, since no M-step term reads
+        them (audit 2026-10-12 round 2, item 6).
 
         Reference coordinates. Under ``decode_coordinates='reference'`` the realized relational frame :math:`U_i` is the decode
         frame: it is stored as ``capture['canonical_frame']`` (the key every decode caller already
@@ -1017,7 +1021,7 @@ class VFEModel(nn.Module):
         # .float()-ed; see _amp_off_context).
         amp = self._amp_context(token_ids.device)
         with amp:
-            relational_capture = {} if capture is not None else None
+            relational_capture = {} if capture is not None and _relational_capture else None
             if relational_capture is not None:
                 capture[self.conditional_capture_key] = relational_capture
             canonical_frame: Optional[CanonicalFrameContext] = None
@@ -1183,6 +1187,7 @@ class VFEModel(nn.Module):
             capture=cap,
             estep_grad_out=estep_grad_out,
             _reuse_content_factors=True,
+            _relational_capture=False,                           # the M-step terms read no relational diagnostic
             **({} if decode_frame_out is None else {"_decode_frame_out": decode_frame_out}),
             **({} if encoded_sigma_out is None else {"_encoded_sigma_out": encoded_sigma_out}),
         )
@@ -2075,7 +2080,10 @@ class VFEModel(nn.Module):
         is the temperature the layer's router runs at (:math:`\kappa_h\sqrt{d_h}`, learned under
         ``learn_attention_temperature``; 1 under the minimal agent, whose exact posterior has no
         :math:`\kappa_\beta`; audit 2026-10-10 round 2, item 31). :math:`D^h_{ii} = 0` and :math:`B_{ii} = 0`, so
-        :math:`\beta^*` peaks on the diagonal of every row by construction. The self term is the registered
+        :math:`\beta^*` peaks on the diagonal of every row by construction. Under ``relational_routing='noisy_key'``
+        the key laws carry the layer's noise :math:`n_hI`, as its router's do (temperature 1; ``key_noise`` of
+        :func:`vfe3.free_energy.canonical_routing_rows`), so :math:`D^h_{ii} > 0` there (audit 2026-10-12 round 2,
+        item 16). The self term is the registered
         form of the M-step self-coupling (``self_coupling_alpha`` with its :math:`R(\alpha)`, the same
         ``kl_max``) evaluated at the layer's input belief; the M-step term itself reads
         the final block's converged output against its prior, which the output evaluation below matches at the
@@ -2105,12 +2113,16 @@ class VFEModel(nn.Module):
         device = q.mu.device
         fam = get_family(cfg.family)
         lambda_beta = float(cfg.lambda_beta)
+        # noisy_key: the canonical router scores the same noise-broadened key law as the layer's router (its
+        # declared joint at temperature 1; audit 2026-10-12 round 2, item 16).
+        key_log_noise = getattr(ops, "routing_key_log_noise", None)               # (H,) or None
+        key_noise = None if key_log_noise is None else key_log_noise.detach().double().exp()
 
         def evaluate(belief: BeliefState, frame_inverse: torch.Tensor,
                      tau: 'float | torch.Tensor') -> Tuple[Dict[str, float], torch.Tensor]:
             r"""Per-token means of the terms of :math:`F` at ``belief`` and its :math:`\beta^*` (B, H, N, N)."""
             rows = canonical_routing_rows(belief.mu, belief.sigma, frame_inverse, snapshot.log_prior,
-                                          tau=tau, irrep_dims=list(group.irrep_dims))
+                                          tau=tau, irrep_dims=list(group.irrep_dims), key_noise=key_noise)
             self_div = self_divergence_for_alpha(                               # (B, N) or (B, N, K)
                 fam(belief.mu.double(), belief.sigma.double()),
                 fam(mu_p.double(), sigma_p.double()),
@@ -2289,6 +2301,10 @@ class VFEModel(nn.Module):
                 distance_after / distance_before if distance_before > 0 else float("nan"))
             d["relational_receiver_noise"] = float(self.cfg.relational_receiver_noise)
             d["relational_attention_capture"] = "episode_initial"
+            # closed_form_profiled: the root solve's largest residual and its floored-slope count (NaN on the
+            # other receiver updates; audit 2026-10-12 round 2, item 16 and M6).
+            for name in ("relational_receiver_profiled_residual", "relational_receiver_profiled_floored_slopes"):
+                d[name] = float(cap.get(name, float("nan")))
         comparison_runs = ops.comparison_runs()                            # per run (S_Q, S_K); S_K = T if tied
         minima = []
         for role_index, role in enumerate(("q", "k")):
@@ -2348,23 +2364,25 @@ class VFEModel(nn.Module):
         fraction, of the channel noise :math:`n_h`, of the mean-field label staleness (NaN under ``"exact"``) and of
         the exact spread share (NaN under ``"mean_field"``), the head maximum of the head coupling (0 means ADF is
         exact at the input moments), the layer's covariance contraction :math:`\operatorname{tr}C^+/\operatorname{tr}C` and
-        the head mean of the mean-field M-step optimum :math:`n_h^*` (NaN under ``"exact"``), to set beside the learned
-        :math:`n_h`.
-        Under ``diagnose_agent_elbo`` it also reports the layer's receiver-mean evidence lower bound, ADF evidence and
-        their gap in nats (:data:`vfe3.model.minimal_agent.MINIMAL_AGENT_ELBO_KEYS`).
+        the head mean of the mean-field M-step optimum :math:`n_h^*` over the heads whose optimum is interior (NaN
+        under ``"exact"`` or when every head sits at the :math:`n\to 0` bracket), to set beside the learned
+        :math:`n_h`, and the fraction of heads at that bracket.
+        Under ``diagnose_agent_elbo`` it also reports the layer's receiver-mean evidence lower bound, ADF, exact and
+        importance-sampled evidence and the gaps in nats (:data:`vfe3.model.minimal_agent.MINIMAL_AGENT_ELBO_KEYS`).
         """
-        gain, noise, coupling, staleness, contraction, spread, mstep = (cap[key] for key in (
+        gain, noise, coupling, staleness, contraction, spread, mstep, boundary = (cap[key] for key in (
             "relational_minimal_agent_gain_fraction", "relational_minimal_agent_channel_noise",
             "relational_minimal_agent_head_coupling", "relational_minimal_agent_label_staleness",
             "relational_minimal_agent_covariance_contraction", "relational_minimal_agent_spread_share",
-            "relational_minimal_agent_channel_noise_mstep"))
+            "relational_minimal_agent_channel_noise_mstep", "relational_minimal_agent_channel_noise_mstep_boundary"))
         out = {"relational_minimal_agent_gain_fraction": float(gain.mean()),
                "relational_minimal_agent_channel_noise": float(noise.mean()),
                "relational_minimal_agent_head_coupling": float(coupling.max()),
                "relational_minimal_agent_label_staleness": float(staleness.double().nanmean()),
                "relational_minimal_agent_covariance_contraction": float(contraction.mean()),
                "relational_minimal_agent_spread_share": float(spread.double().nanmean()),
-               "relational_minimal_agent_channel_noise_mstep": float(mstep.double().nanmean())}
+               "relational_minimal_agent_channel_noise_mstep": float(mstep.double().nanmean()),
+               "relational_minimal_agent_channel_noise_mstep_boundary": float(boundary.double().mean())}
         out.update({key: float(cap[key]) for key in MINIMAL_AGENT_ELBO_KEYS if key in cap})
         return out
 

@@ -1015,6 +1015,11 @@ def test_diagnostics_and_consumers(inference: str) -> None:
     rows = model.diagnostics_per_layer(ids)
     for key in ma.MINIMAL_AGENT_DIAGNOSTIC_KEYS:
         defined = ma.MINIMAL_AGENT_MODE_ONLY_KEYS.get(key, inference) == inference   # else NaN by design
+        if defined and key == "relational_minimal_agent_channel_noise_mstep":
+            # NaN when every head sits at the n -> 0 bracket (audit 2026-10-12 round 2, M2)
+            assert all(math.isfinite(v) == (at < 1.0)
+                       for v, at in zip(rows[key], rows[key + "_boundary"])), key
+            continue
         assert all(math.isfinite(v) == defined for v in rows[key]), key
     assert all(0.0 < v < 1.0 for v in rows["relational_minimal_agent_gain_fraction"])
     assert rows["relational_minimal_agent_channel_noise"] == [1.0, 1.0]

@@ -541,6 +541,7 @@ def canonical_routing_rows(
     *,
     tau:           'float | torch.Tensor',    # scalar or (H,) per-head temperature tau_h
     irrep_dims:    List[int],                 # head block sizes d_h, summing to K
+    key_noise:     Optional[torch.Tensor] = None,   # (H,) n_h of relational_routing='noisy_key', or None
 ) -> CanonicalRoutingRows:
     r"""The canonical routing block of one layer with gauge-transported KL energies, in float64.
 
@@ -576,6 +577,11 @@ def canonical_routing_rows(
     :math:`\xi^h_i = A^h_i\mu^h_i` and :math:`C^{hh}_i = A^h_i\Sigma^{hh}_iA^{h\top}_i` from the head blocks
     of the moments alone, in :math:`O(BNHd^3)` instead of :math:`O(BNK^3)`, equal to the dense evaluation of
     the block-diagonal frames to float64 rounding.
+
+    ``key_noise`` (``relational_routing='noisy_key'``) broadens every key law to :math:`C^{hh}_j + n_hI_{d_h}`,
+    :math:`D^h_{ij} = \mathrm{KL}(\mathcal N(\xi^h_i, C^{hh}_i)\|\mathcal N(\xi^h_j, C^{hh}_j + n_hI))`, the energy of
+    the noisy-key router's declared joint, which that router scores at temperature 1; then :math:`D^h_{ii} > 0`
+    (audit 2026-10-12 round 2, item 16). Without it the energies are bitwise those above.
     """
     dtype = torch.float64
     B, N, K = mu.shape
@@ -614,8 +620,14 @@ def canonical_routing_rows(
         C = 0.5 * (C + C.transpose(-1, -2))                                    # (B, N, d, d) C_i^hh
         L, info = torch.linalg.cholesky_ex(C)
         L = torch.where((info == 0)[..., None, None], L, torch.full_like(L, float("nan")))
-        logdet = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(dim=-1)   # (B, N)
-        precision = torch.cholesky_inverse(L)                                  # (B, N, d, d) (C_j^hh)^{-1}
+        logdet = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(dim=-1)   # (B, N) query log det C_i
+        logdet_key = logdet                                                    # (B, N) key log det
+        if key_noise is not None:                                              # key law C_j^hh + n_h I
+            eye = torch.eye(d, dtype=dtype, device=C.device)
+            L, info = torch.linalg.cholesky_ex(C + key_noise.to(dtype)[h] * eye)
+            L = torch.where((info == 0)[..., None, None], L, torch.full_like(L, float("nan")))
+            logdet_key = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(dim=-1)
+        precision = torch.cholesky_inverse(L)                                  # (B, N, d, d) key precision
         trace = torch.einsum("bikl,bjkl->bij", C, precision)                   # (B, N_i, N_j)
         mahalanobis = torch.empty_like(trace)                                  # (B, N_i, N_j)
         tile = max(1, min(N, _CANONICAL_QUERY_TILE_ELEMENTS // max(1, B * N * d)))
@@ -624,7 +636,7 @@ def canonical_routing_rows(
             diff = xi_h[:, None, start:stop, :] - xi_h[:, :, None, :]           # (B, N_j, T, d) xi_i - xi_j
             white = torch.linalg.solve_triangular(L, diff.transpose(-1, -2), upper=False)   # (B, N_j, d, T)
             mahalanobis[:, start:stop, :] = white.pow(2).sum(dim=-2).transpose(-1, -2)
-        D = 0.5 * (trace + mahalanobis - d + logdet[:, None, :] - logdet[:, :, None])   # (B, N_i, N_j)
+        D = 0.5 * (trace + mahalanobis - d + logdet_key[:, None, :] - logdet[:, :, None])   # (B, N_i, N_j)
         log_pi_h = log_pi[:, h if log_pi.shape[1] > 1 else 0].expand(B, N, N)   # (B, N, N)
         support = torch.isfinite(log_pi_h)
         logits = torch.where(support, log_pi_h - D / taus[h], torch.full_like(D, float("-inf")))

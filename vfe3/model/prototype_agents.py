@@ -161,6 +161,22 @@ def _symmetric(A: torch.Tensor) -> torch.Tensor:
     return 0.5 * (A + A.transpose(-1, -2))
 
 
+def _posterior_failed(
+    delta:  torch.Tensor,                  # (R, K) or (R, G, b) the mean update
+    C_plus: Optional[torch.Tensor],        # the posterior covariance in the working layout, or None
+    blocks: bool,
+) -> torch.Tensor:                         # () bool
+    r"""Device-side flag of a posterior that is not finite or whose covariance is not positive: a negative or
+    non-finite diagonal entry, or a block whose zero-jitter Cholesky factor fails (audit 2026-10-12 round 2,
+    item 9)."""
+    failed = ~torch.isfinite(delta).all()
+    if C_plus is None:
+        return failed
+    if not blocks:
+        return failed | ~(torch.isfinite(C_plus) & (C_plus >= 0)).all()
+    return failed | (torch.linalg.cholesky_ex(C_plus, check_errors=False)[1] != 0).any()
+
+
 def _raise_if(host: List[bool], message: str) -> None:
     r"""Raise-only verdict of a :func:`vfe3.contracts.host_check`: ``ValueError(message)`` when the flag is set."""
     if host[0]:
@@ -256,7 +272,8 @@ def _exact_diagonal_tile(
     :math:`W_{iak} = c_{ik} + \lambda_{ak}`, :math:`r_{iak} = (\nu_{ak} - \xi_{ik})/W_{iak}` and
     :math:`\ell_{ia} = \log\pi_a - \tfrac12\sum_k[(\nu_{ak} - \xi_{ik})r_{iak} + \log W_{iak}]`, the log
     density up to the row constant :math:`-\tfrac K2\log 2\pi` and the prior normalizer. Returns the
-    logits, the tile statistics and a failure flag (some :math:`W_{iak}` not positive).
+    logits, the tile statistics and a failure flag: some :math:`c_{ik}` negative (then :math:`C_i^+` can be negative
+    although every :math:`W_{iak} > 0`), some :math:`W_{iak}` not positive or not finite, or a non-finite mean.
     """
     W = c.unsqueeze(-2) + lam                                                # (r, m, K) diag W_ia
     W_inv = W.reciprocal()
@@ -264,7 +281,8 @@ def _exact_diagonal_tile(
     r_vec = diff * W_inv                                                     # (r, m, K) r_ia
     logits = log_pi - 0.5 * ((diff * r_vec).sum(dim=-1) + W.log().sum(dim=-1))   # (r, m)
     stats = _tile_statistics(logits, r_vec, W_inv, lam, need_covariance, need_precision, blocks=False)
-    return logits, stats, ~(W > 0).all()
+    failed = ~((W > 0) & torch.isfinite(W)).all() | ~torch.isfinite(diff).all() | (c < 0).any()
+    return logits, stats, failed
 
 
 @ieee_fp32_matmul()
@@ -410,12 +428,6 @@ def prototype_exact_posterior(
             M2_rows.append(acc.M2)
             Psi_rows.append(acc.Psi)
             Lbar_rows.append(acc.Lbar)
-        # One device-side reduction and one raise-only host check for every tile (deferred to the next
-        # mandatory host read inside vfe3.contracts.deferred_host_checks).
-        message = ("prototype-agent record covariance C_i + Lambda_a is not positive definite: zero-jitter "
-                   "Cholesky failed; no repair applied" if blocks else
-                   "prototype-agent record variances c_i + lambda_a must be positive and finite")
-        host_check(torch.stack(failures).any().reshape(1), lambda host: _raise_if(host, message))
         s = torch.cat(s_rows)                                                # (R,)
         u = torch.cat(u_rows)                                                # (R, K) or (R, G, b)
         logits = torch.cat(logit_rows)                                       # (R, M)
@@ -437,6 +449,15 @@ def prototype_exact_posterior(
             Lambda_bar = Lbar / _broadcast(s, Lbar)
             if blocks:
                 Lambda_bar = _symmetric(Lambda_bar)
+        failures.append(_posterior_failed(delta, C_plus, blocks))
+        # One device-side reduction and one raise-only host check for every tile and the outputs (deferred to
+        # the next mandatory host read inside vfe3.contracts.deferred_host_checks).
+        message = ("prototype-agent record covariance C_i + Lambda_a is not positive definite (zero-jitter "
+                   "Cholesky failed; no repair applied), or the posterior is not finite or its covariance is not "
+                   "positive definite" if blocks else
+                   "prototype-agent record variances c_i + lambda_a must be positive and finite, the working "
+                   "variances c_i nonnegative, and the posterior finite")
+        host_check(torch.stack(failures).any().reshape(1), lambda host: _raise_if(host, message))
 
         def out_layout(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
             if t is None:
@@ -633,7 +654,7 @@ def prototype_mean_field_posterior(
                 P = Cw / B                                                   # (..., K)
                 delta = P * g
                 C_plus = P
-                bad = ~(torch.isfinite(B) & (B > 0)).all()                   # the diagonal Cholesky check; NaN fails
+                bad = ~(torch.isfinite(B) & (B > 0) & (Cw >= 0)).all()       # Cholesky check and c >= 0; NaN fails
                 failed = bad if failed is None else failed | bad
             else:
                 Cb = Cw.unsqueeze(-3) if layout == "dense" else Cw           # (..., G, b, b)
@@ -651,11 +672,11 @@ def prototype_mean_field_posterior(
                 failed = (info != 0).any() if failed is None else failed | (info != 0).any()
             if not last:
                 x_lab, c_lab = x + delta, covariance_diagonal(C_plus, layout)   # the next labels read (xi^+, diag C^+)
-        if failed is not None:
-            # Raise-only: deferred to the next mandatory host read inside vfe3.contracts.deferred_host_checks.
-            host_check(failed.reshape(1), lambda host: _raise_if(
-                host, "prototype-agent power-posterior matrix I + D^{1/2} C D^{1/2} is not positive "
-                      "definite: the working covariance is not positive semidefinite or not finite"))
+        failed = failed | _posterior_failed(delta, C_plus if need_covariance else None, layout != "diagonal")
+        # Raise-only: deferred to the next mandatory host read inside vfe3.contracts.deferred_host_checks.
+        host_check(failed.reshape(1), lambda host: _raise_if(
+            host, "prototype-agent power-posterior matrix I + D^{1/2} C D^{1/2} is not positive definite, or a "
+                  "working variance or the posterior is not positive semidefinite or not finite"))
         return MeanFieldPrototypePosterior(
             xi_plus=x + delta, delta_xi=delta, C_plus=C_plus if need_covariance else None,
             responsibilities=responsibilities, D=D, eta=eta)
