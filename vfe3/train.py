@@ -332,7 +332,9 @@ def build_optimizer(
         layers = model.relational_operators_by_layer
         # channel_log_noise (predictive_readout='minimal_agent') is a score-side parameter: it enters the routing
         # through the record covariance. raw_score_k and O are None there (tied key, derived receiving map).
-        for role, names in (("score", ("raw_score_q", "raw_score_k", "channel_log_noise", "routing_log_temperature")),
+        # routing_key_log_noise (relational_routing='noisy_key') is score-side for the same reason.
+        for role, names in (("score", ("raw_score_q", "raw_score_k", "channel_log_noise", "routing_log_temperature",
+                                       "routing_key_log_noise")),
                             ("content", ("T", "O"))):
             # Mixed head sizes store a ParameterList per name (one tensor per run of equal heads).
             parameters = [p for ops in layers for name in names
@@ -1573,10 +1575,11 @@ _VAL_LATENT_DIAG_KEYS = tuple("val_relational_latent_" + key for key in (
 # head-max coupling ||S_h C S_g^T||_F / (||S_h C S_h^T||_F ||S_g C S_g^T||_F)^{1/2} at the input moments (0: ADF is
 # exact), the head-mean mean-field label staleness (TV of one relabeling at the posterior; NaN under 'exact') and the
 # covariance contraction tr C^+ / tr C and the head-mean exact spread share tr(A R) / tr(A Lambda_bar) (NaN under
-# 'mean_field').
+# 'mean_field'), and the head-mean mean-field M-step optimum n_h^* (minimal_agent.channel_noise_mstep; NaN under
+# 'exact').
 _VAL_MINIMAL_AGENT_DIAG_KEYS = tuple("val_relational_minimal_agent_" + key for key in (
     "gain_fraction", "channel_noise", "head_coupling", "label_staleness", "covariance_contraction",
-    "spread_share"))
+    "spread_share", "channel_noise_mstep"))
 
 
 # =============================================================================
@@ -1652,10 +1655,11 @@ ROUTING_HOLONOMY_FIELDS: Tuple[str, ...] = (
 # Minimal-agent readout per (layer, head) (predictive_readout='minimal_agent'; vfe3.model.minimal_agent), means over
 # the fixed validation windows: gain fraction, channel noise n_h, head coupling, mean-field label staleness (TV of one
 # relabeling at the posterior; NaN under 'exact'), the layer's covariance contraction tr C^+ / tr C and the exact
-# spread share tr(A R) / tr(A Lambda_bar) (the part of the removed variance the mean field drops; NaN under the mean field).
+# spread share tr(A R) / tr(A Lambda_bar) (the part of the removed variance the mean field drops; NaN under the mean field)
+# and the mean-field M-step optimum n_h^* of the channel noise beside the learned channel_noise (NaN under 'exact').
 MINIMAL_AGENT_HEAD_FIELDS: Tuple[str, ...] = (
     "step", "layer", "head", "gain_fraction", "channel_noise", "head_coupling", "label_staleness",
-    "covariance_contraction", "spread_share")
+    "covariance_contraction", "spread_share", "channel_noise_mstep")
 _MINIMAL_AGENT_HEAD_CAPTURE = tuple("relational_minimal_agent_" + key for key in MINIMAL_AGENT_HEAD_FIELDS[3:])
 # Prototype-agent block MLP per layer (block_mlp_mode='prototype_agents'), over the tokens of the fixed validation
 # windows: effective templates in use exp(H(mean_t w_t)), the token-mean weight entropy, the fraction of templates
@@ -2197,7 +2201,8 @@ def _parameter_group(
     if name.startswith("relational_operators"):
         # Mixed head sizes store per-run lists: the attribute is the segment before the run index.
         attribute = name.rsplit(".", 2)[-2] if leaf.isdigit() else leaf
-        if attribute in ("raw_score_q", "raw_score_k", "channel_log_noise", "routing_log_temperature"):
+        if attribute in ("raw_score_q", "raw_score_k", "channel_log_noise", "routing_log_temperature",
+                         "routing_key_log_noise"):
             return "relational_score"                         # channel_log_noise: minimal agent
         if attribute in ("T", "O"):
             return "relational_content"
@@ -5260,6 +5265,9 @@ def _fmt_tau(cfg: VFE3Config, model: VFEModel) -> str:
     if (getattr(cfg, "attention_mode", None) == "projected_predictive"
             and getattr(cfg, "predictive_readout", "kernel") == "minimal_agent"):
         return "1 (minimal_agent posterior; kappa_beta unused)"
+    if (getattr(cfg, "attention_mode", None) == "projected_predictive"
+            and getattr(cfg, "relational_routing", "gaussian_kl") == "noisy_key"):
+        return "1 (noisy_key routing; kappa_beta unused)"
     dev = next(model.parameters()).device
     tau = attention_tau(_as_coeff(cfg.kappa_beta, dev), model.group.irrep_dims, device=dev)
     if isinstance(tau, torch.Tensor) and tau.dim() >= 1:

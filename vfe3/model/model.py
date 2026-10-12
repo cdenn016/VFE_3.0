@@ -347,7 +347,8 @@ class VFEModel(nn.Module):
                                 rope_comparison_covariance=cfg.rope_comparison_covariance,
                                 learn_attention_temperature=cfg.learn_attention_temperature,
                                 tie_comparison_maps=cfg.tie_comparison_maps,
-                                block_covariance=_get_family(cfg.family).head_block_covariance)
+                                block_covariance=_get_family(cfg.family).head_block_covariance,
+                                routing_key_noise=cfg.relational_key_noise)
             for layer_index in range(cfg.n_layers)
         ]
         self.relational_operators = layers[0]
@@ -2377,18 +2378,22 @@ class VFEModel(nn.Module):
         The capture holds per-head ``(H,)`` values (receiver means); the row reports the head mean of the gain
         fraction, of the channel noise :math:`n_h`, of the mean-field label staleness (NaN under ``"exact"``) and of
         the exact spread share (NaN under ``"mean_field"``), the head maximum of the head coupling (0 means ADF is
-        exact at the input moments) and the layer's covariance contraction :math:`\operatorname{tr}C^+/\operatorname{tr}C`.
+        exact at the input moments), the layer's covariance contraction :math:`\operatorname{tr}C^+/\operatorname{tr}C` and
+        the head mean of the mean-field M-step optimum :math:`n_h^*` (NaN under ``"exact"``), to set beside the learned
+        :math:`n_h`.
         """
-        gain, noise, coupling, staleness, contraction, spread = (cap[key] for key in (
+        gain, noise, coupling, staleness, contraction, spread, mstep = (cap[key] for key in (
             "relational_minimal_agent_gain_fraction", "relational_minimal_agent_channel_noise",
             "relational_minimal_agent_head_coupling", "relational_minimal_agent_label_staleness",
-            "relational_minimal_agent_covariance_contraction", "relational_minimal_agent_spread_share"))
+            "relational_minimal_agent_covariance_contraction", "relational_minimal_agent_spread_share",
+            "relational_minimal_agent_channel_noise_mstep"))
         return {"relational_minimal_agent_gain_fraction": float(gain.mean()),
                 "relational_minimal_agent_channel_noise": float(noise.mean()),
                 "relational_minimal_agent_head_coupling": float(coupling.max()),
                 "relational_minimal_agent_label_staleness": float(staleness.double().nanmean()),
                 "relational_minimal_agent_covariance_contraction": float(contraction.mean()),
-                "relational_minimal_agent_spread_share": float(spread.double().nanmean())}
+                "relational_minimal_agent_spread_share": float(spread.double().nanmean()),
+                "relational_minimal_agent_channel_noise_mstep": float(mstep.double().nanmean())}
 
     def _projected_covariance_and_frame_diagnostics(
         self,

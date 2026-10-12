@@ -6,7 +6,7 @@ Successful factorization always uses zero jitter and no spectral repair.
 """
 
 import math
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 from torch.autograd.function import once_differentiable
@@ -1684,6 +1684,51 @@ def _noisy_query_tile(
     return .5 * (quadratic + logdet_w - logdet_q.unsqueeze(-1)), (info != 0).any()
 
 
+def projected_noisy_key_cost(
+    a_q: torch.Tensor,        # (..., Nq, H, r)
+    G_q: torch.Tensor,        # (..., Nq, H, r, r)
+    a_k: torch.Tensor,        # (..., Nk, H, r)
+    G_k: torch.Tensor,        # (..., Nk, H, r, r)
+
+    *,
+    key_noise: torch.Tensor,  # (H,) n_h > 0
+    projection_q: Optional[Tuple[torch.Tensor, ...]] = None,
+    projection_k: Optional[Tuple[torch.Tensor, ...]] = None,
+    symmetric_inputs: bool = False,
+    commutant_pairs: Optional[int] = None,
+    **kl_options: Any,
+) -> torch.Tensor:            # (..., H, Nq, Nk)
+    r"""Noisy-key routing cost :math:`D_{ij} = \mathrm{KL}(N(a_i, G_{q,i})\,\|\,N(b_j, G_{k,j} + n_hI_r))`.
+
+    Each key law is broadened by a per-head isotropic noise :math:`n_h` (audit 2026-10-12, T6). The router applies
+    it at temperature 1 (:meth:`vfe3.model.relational_operators.RelationalOperators.routing_temperature`), so the
+    routing objective :math:`\sum_j\beta_{ij}D_{ij} + \mathrm{KL}(\beta_i\,\|\,\pi_i)` is
+    :math:`\mathrm{KL}(\mathbb Q_{i,\beta}\,\|\,\mathbb P_i)` of the declared joint
+    :math:`\mathbb P_i(y, J=j) = \pi_{ij}N(y; b_j, G_{k,j} + n_hI)` and the factorized recognition law
+    :math:`\mathbb Q_{i,\beta}(y, J=j) = \beta_{ij}N(y; a_i, G_{q,i})` (GL(K) v2, Eq. (mixture_free_energy)) with
+    no temperature :math:`\kappa\sqrt d`: the noise sets the sharpness. At :math:`n_h = 0` it is
+    :func:`projected_gaussian_kl` at temperature 1.
+
+    The cost is :func:`projected_gaussian_kl` of the broadened key covariance. The key source tuple is not passed:
+    :math:`G_{k,j} + n_hI` is not the Gram matrix of a source root, so no key recovery or factor route applies (the
+    Gram route runs, and :math:`G_{k,j} + n_hI \succeq n_hI` needs none). The query keeps its source tuple and
+    recovery. ``kl_options`` (``query_row_constant_grad``, ``gemm_expansion_tol``) pass through. ``key_noise`` is
+    required, so a caller that does not supply it fails instead of scoring the noise-free Gaussian KL.
+    """
+    r = a_k.shape[-1]
+    if G_k.shape != (*a_k.shape, r):
+        raise ValueError("projected covariances must match their means with one additional matrix axis")
+    if key_noise.shape != (a_k.shape[-2],):
+        raise ValueError(f"key_noise must have one entry per head, shape ({a_k.shape[-2]},), "
+                         f"got {tuple(key_noise.shape)}")
+    dtype = _compute_dtype(a_q, G_q, a_k, G_k, key_noise)
+    eye = torch.eye(r, dtype=dtype, device=G_k.device)
+    # G_k + n_h I is exactly symmetric when G_k is: the shift touches only the diagonal.
+    G_noisy = G_k.to(dtype) + key_noise.to(dtype)[:, None, None] * eye           # (..., Nk, H, r, r)
+    return projected_gaussian_kl(a_q, G_q, a_k, G_noisy, projection_q=projection_q, projection_k=None,
+                                 symmetric_inputs=symmetric_inputs, commutant_pairs=commutant_pairs, **kl_options)
+
+
 def relational_mixture_mean(
     xi:             torch.Tensor,  # (..., Nk, H, d)
     forward_blocks: torch.Tensor,  # (..., Nq, H, d, d)
@@ -1770,6 +1815,7 @@ def _mean_distance_tile(
 ROUTING_COSTS = {
     "gaussian_kl":   projected_gaussian_kl,
     "noisy_query":   projected_noisy_query_cost,
+    "noisy_key":     projected_noisy_key_cost,       # also requires key_noise (H,): the router passes it
     "mean_distance": projected_mean_distance_cost,
 }
 

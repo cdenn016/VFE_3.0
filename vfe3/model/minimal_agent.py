@@ -148,11 +148,13 @@ PAIR_TILE_BYTES: int = 32 * 1024 ** 2
 MINIMAL_AGENT_DIAGNOSTIC_KEYS: Tuple[str, ...] = (
     "relational_minimal_agent_gain_fraction", "relational_minimal_agent_channel_noise",
     "relational_minimal_agent_head_coupling", "relational_minimal_agent_label_staleness",
-    "relational_minimal_agent_covariance_contraction", "relational_minimal_agent_spread_share")
+    "relational_minimal_agent_covariance_contraction", "relational_minimal_agent_spread_share",
+    "relational_minimal_agent_channel_noise_mstep")
 # Diagnostics defined in one inference mode only (NaN in the other).
 MINIMAL_AGENT_MODE_ONLY_KEYS: Dict[str, str] = {
     "relational_minimal_agent_label_staleness": "mean_field",
     "relational_minimal_agent_spread_share": "exact",
+    "relational_minimal_agent_channel_noise_mstep": "mean_field",
 }
 
 
@@ -204,6 +206,7 @@ class MinimalAgentResult(NamedTuple):
     covariance_contraction: Optional[torch.Tensor] = None   # (..., N) tr C_i^+ / tr C_i (diagnostics only)
     label_staleness:  Optional[torch.Tensor] = None         # (..., N, H) mean field: TV of one relabeling (diagnostics)
     spread_share:     Optional[torch.Tensor] = None         # (..., N, H) exact: tr(A R) / tr(A Lambda_bar) (diagnostics)
+    channel_noise_mstep: Optional[torch.Tensor] = None      # (H,) mean field: M-step n_h^* (channel_noise_mstep; diagnostics)
 
 
 def _symmetrize(X: torch.Tensor) -> torch.Tensor:          # (..., r, r) -> (..., r, r)
@@ -622,6 +625,110 @@ def _unfactorable(
             | ~torch.isfinite(A).all(dim=(-2, -1)) | ~torch.isfinite(a).all(dim=-1))
 
 
+def channel_noise_mstep(
+    a_plus:  torch.Tensor,                      # (..., N, H, d) posterior query means S_h xi_i^+ (record frame)
+    A_plus:  torch.Tensor,                      # (..., N, H, d, d) posterior query covariances S_h C_i^+ S_h^T
+    b:       torch.Tensor,                      # (..., H, N, d) utterance means T_h xi_j (same frame)
+    V_K:     torch.Tensor,                      # (..., H, N, d, d) noise-free utterance covariances T_h C_j T_h^T
+    weights: torch.Tensor,                      # (..., H, N, N) labels beta_ij of the last sweep
+    heard:   torch.Tensor,                      # (..., H, N) bool: receivers that hear a record
+    *,
+    grid:    int = 64,
+    iterations: int = 40,
+) -> torch.Tensor:                              # (H,) float64 n_h^*, pooled over every receiver of the call
+    r"""Variational M-step for the channel noise :math:`n_h` at the mean-field posterior (a diagnostic).
+
+    With the sources collapsed (:math:`X_j\sim N(\xi_j, C_j)` integrated out, so the record of head :math:`h` given
+    :math:`J = j` is :math:`N(S_hX_i; b_j, V_j + nI)`, :math:`V_j = T_hC_jT_h^\top`), the terms of the mean-field
+    free energy on :math:`q(X_i)\prod_hq(J^h)` that depend on :math:`n = n_h` are, pooled over the receivers,
+
+    .. math::
+        -\sum_i\sum_j\beta_{ij}E_{q(X_i)}\bigl[\log N(S_hX_i; b_j, V_j + nI)\bigr]
+        = \tfrac12F(n) + \mathrm{const},\qquad
+        F(n) = \sum_j\bigl[m_j\log\det(V_j + nI) + \operatorname{tr}\bigl((V_j + nI)^{-1}E_j\bigr)\bigr],
+
+    with :math:`m_j = \sum_i\beta_{ij}` and :math:`E_j = \sum_i\beta_{ij}\bigl(A_i^+ + (a_i^+ - b_j)(a_i^+ - b_j)^\top\bigr)`,
+    :math:`(a_i^+, A_i^+) = (S_h\xi_i^+, S_hC_i^+S_h^\top)`. One eigendecomposition :math:`V_j = Q_j\operatorname{diag}(v_j)Q_j^\top`
+    per source and :math:`e_{jk} = (Q_j^\top E_jQ_j)_{kk}\ge0` make it scalar,
+
+    .. math::
+        F(n) = \sum_{j,k}\Bigl[m_j\log(v_{jk} + n) + \frac{e_{jk}}{v_{jk} + n}\Bigr],\qquad
+        F'(n) = \sum_{j,k}\Bigl[\frac{m_j}{v_{jk} + n} - \frac{e_{jk}}{(v_{jk} + n)^2}\Bigr].
+
+    Each term decreases for :math:`n < e_{jk}/m_j - v_{jk}` and increases beyond, so every minimizer over
+    :math:`n\ge0` lies in :math:`[0, U]`, :math:`U = \max_{j,k}(e_{jk}/m_j - v_{jk})^+`, and :math:`U = 0` gives
+    :math:`n^* = 0`. :math:`F` is not convex in general, so the global minimizer is located on a log grid of ``grid``
+    points over :math:`[10^{-12}U, U]` and refined by safeguarded Newton steps on :math:`\partial F/\partial\log n`
+    inside the neighboring grid cells (bisection when a step leaves the bracket); a minimizer at the lowest grid
+    point is reported as 0. This is the stationarity condition of the collapsed record. Treating :math:`X_j` as a
+    latent at its snapshot law instead gives the closed form :math:`n = \sum\beta E\|S_hX_i - T_hX_j\|^2/(d\sum\beta)`,
+    which minimizes a looser bound and is not this M-step (audit 2026-10-12, T6).
+
+    The labels ``weights`` and the posterior moments must be the last CAVI sweep's pair, which is the state at which
+    the M-step maximizes the free energy. ``heard`` drops receivers that hear no record (a self-masking prior's row
+    0). Means are shifted by the per-head mean utterance, which leaves every difference unchanged. Computed in
+    float64 without autograd; a head with a non-finite statistic reads NaN.
+    """
+    f64 = torch.float64
+    with torch.no_grad():
+        a = a_plus.movedim(-2, -3).to(f64)                                      # (..., H, N, d)
+        A = A_plus.movedim(-3, -4).to(f64)                                      # (..., H, N, d, d)
+        b, V = b.to(f64), V_K.to(f64)
+        H, d = b.shape[-3], b.shape[-1]
+        eye = torch.eye(d, dtype=f64, device=b.device)
+        V = torch.where(torch.isfinite(V).all(dim=(-2, -1), keepdim=True), V, eye)   # eigh never sees a NaN
+        beta = weights.to(f64) * heard.to(f64).unsqueeze(-1)                    # (..., H, N, N), rows i
+        center = b.mean(dim=-2, keepdim=True)                                   # (..., H, 1, d)
+        a, b = a - center, b - center
+        m = beta.sum(dim=-2)                                                    # (..., H, N) m_j
+        s = torch.einsum("...hij,...hir->...hjr", beta, a)                      # (..., H, N, d) sum_i beta_ij a_i
+        P = A + a.unsqueeze(-1) * a.unsqueeze(-2)                               # (..., H, N, d, d) A_i + a_i a_i^T
+        E = (torch.einsum("...hij,...hirs->...hjrs", beta, P)
+             - s.unsqueeze(-1) * b.unsqueeze(-2) - b.unsqueeze(-1) * s.unsqueeze(-2)
+             + m[..., None, None] * b.unsqueeze(-1) * b.unsqueeze(-2))          # (..., H, N, d, d) E_j
+        v, Q = torch.linalg.eigh(_symmetrize(V))                                # (..., H, N, d), (..., H, N, d, d)
+        e = torch.einsum("...rk,...rs,...sk->...k", Q, E, Q)                    # (..., H, N, d) diag(Q^T E Q)
+        v = v.clamp_min(0.0).movedim(-3, 0).reshape(H, -1)                     # (H, T) per-direction terms
+        e = e.clamp_min(0.0).movedim(-3, 0).reshape(H, -1)
+        m = m.unsqueeze(-1).expand(*m.shape, d).movedim(-3, 0).reshape(H, -1)
+        healthy = torch.isfinite(e).all(dim=-1) & torch.isfinite(m).all(dim=-1)   # (H,)
+        e, m = torch.nan_to_num(e), torch.nan_to_num(m)
+        ratio = torch.where(m > 0, e / torch.where(m > 0, m, torch.ones_like(m)) - v,
+                            torch.full_like(v, -math.inf))
+        U = ratio.amax(dim=-1).clamp_min(0.0)                                   # (H,) upper bracket
+        positive = U > 0
+        log_U = torch.where(positive, U, torch.ones_like(U)).log()              # (H,)
+        t_grid = log_U.unsqueeze(-1) + torch.linspace(math.log(1e-12), 0.0, grid, dtype=f64, device=U.device)
+
+        def objective(t: torch.Tensor) -> torch.Tensor:                         # (H, G) -> (H, G) F(e^t)
+            shifted = v.unsqueeze(-2) + t.exp().unsqueeze(-1)                   # (H, G, T) v + n
+            return (m.unsqueeze(-2) * shifted.log() + e.unsqueeze(-2) / shifted).sum(dim=-1)
+
+        F_grid = torch.cat([objective(t_grid[:, k:k + 8]) for k in range(0, grid, 8)], dim=-1)   # (H, G)
+        best = F_grid.argmin(dim=-1)                                            # (H,)
+        rows = torch.arange(H, device=U.device)
+        lo = t_grid[rows, (best - 1).clamp_min(0)]
+        hi = t_grid[rows, (best + 1).clamp_max(grid - 1)]
+        t = t_grid[rows, best]
+        for _ in range(iterations):
+            n = t.exp().unsqueeze(-1)                                           # (H, 1)
+            shifted = v + n                                                     # (H, T)
+            F_n = (m / shifted - e / shifted.square()).sum(dim=-1)              # (H,)
+            F_nn = (-m / shifted.square() + 2.0 * e / shifted.pow(3)).sum(dim=-1)
+            n = n.squeeze(-1)
+            F_t, F_tt = n * F_n, n * F_n + n.square() * F_nn                    # d/dlog n, d^2/dlog n^2
+            # Bracket update: F_t < 0 means the minimizer lies above t.
+            lo = torch.where(F_t < 0, t, lo)
+            hi = torch.where(F_t > 0, t, hi)
+            newton = t - F_t / torch.where(F_tt > 0, F_tt, torch.ones_like(F_tt))
+            inside = (F_tt > 0) & (newton > lo) & (newton < hi)
+            t = torch.where(inside, newton, 0.5 * (lo + hi))
+        refined = objective(t.unsqueeze(-1)).squeeze(-1)                       # (H,)
+        t = torch.where(refined <= F_grid[rows, best], t, t_grid[rows, best])
+        n_star = torch.where(positive & (best > 0), t.exp(), torch.zeros_like(t))
+        return torch.where(healthy, n_star, torch.full_like(n_star, math.nan))
+
+
 def _label_staleness(
     xi_plus: torch.Tensor,                      # (..., N, K) posterior reference means
     V_Q:     torch.Tensor,                      # (..., N, H, d, d) S_h C S_h^T at the input moments
@@ -880,7 +987,7 @@ def minimal_agent_readout(
                 fractions.append(1.0 - torch.diagonal(E0_inv, dim1=-2, dim2=-1).sum(-1).movedim(-2, -1) / d)
         weights_out = torch.stack(weights, dim=-3) if inference == "exact" else weights[-1]   # (..., H, N, N)
         cost_out = torch.stack(costs, dim=-3) if inference == "exact" else costs[-1]
-        gain_fraction = coupling = contraction = staleness = spread = None
+        gain_fraction = coupling = contraction = staleness = spread = mstep = None
         if diagnostics:
             gain_fraction = torch.stack(fractions, dim=-1) if inference == "exact" else fractions[0]   # (..., N, H)
             with torch.no_grad():
@@ -891,13 +998,27 @@ def minimal_agent_readout(
                              else torch.full_like(coupling, math.nan))           # (..., N, H)
                 spread = (torch.stack(spreads, dim=-1) if inference == "exact"
                           else torch.full_like(coupling, math.nan))              # (..., N, H)
+                if inference == "mean_field":
+                    # The M-step reads the last sweep's labels with the posterior they produced, in the record
+                    # frame of the labels (sources and receivers rotated under comparison-space RoPE).
+                    f64 = torch.float64
+                    a_post, A_post = _posterior_query_moments(
+                        xi_plus.to(f64), V_Q.to(f64), S.to(f64), gains.to(f64), M.to(f64),
+                        None if Rot is None else Rot.to(f64))                   # (..., N, H, d), (..., N, H, d, d)
+                    V_src = V_K.movedim(-3, -4).to(f64)                         # (..., H, N, d, d) T_h C_j T_h^T
+                    if Rot is not None:
+                        V_src = _symmetrize(torch.einsum("nst,...hntu,nvu->...hnsv", Rot.to(f64), V_src, Rot.to(f64)))
+                    heard = torch.broadcast_to(~no_record, weights_out.shape[:-1])   # (..., H, N)
+                    mstep = channel_noise_mstep(a_post, A_post, b.to(f64), V_src, weights_out, heard)   # (H,)
+                else:
+                    mstep = torch.full((H,), math.nan, dtype=torch.float64, device=xi.device)
         failed = torch.stack([flag.reshape(()) for flag in flags]).any()
         ill_conditioned = (torch.stack([screen.reshape(()) for screen in screens]).any() if screens
                            else torch.zeros((), dtype=torch.bool, device=xi.device))
     if check and bool(failed):                                                  # the one host check
         raise ValueError(readout_failure_message(dtype))
     return MinimalAgentResult(xi_plus, gains, M, weights_out, cost_out, gain_fraction, V_Q, V_K, coupling,
-                              failed, ill_conditioned, contraction, staleness, spread)
+                              failed, ill_conditioned, contraction, staleness, spread, mstep)
 
 
 # ----------------------------------------------------------------------------------------------

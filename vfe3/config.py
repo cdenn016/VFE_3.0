@@ -480,7 +480,7 @@ class VFE3Config:
     t5_max_distance:                  int             = 128          # t5_relative_bias only: log-bucketing horizon
     t5_learnable_bias:                bool            = False        # t5_relative_bias only: learn the bucket table
 
-    # "gaussian_kl" | "noisy_query" | "mean_distance"
+    # "gaussian_kl" | "noisy_query" | "noisy_key" | "mean_distance" (noisy_key: see relational_key_noise below)
     # projected_predictive with predictive_readout="kernel" only: routing cost.
     #   gaussian_kl    KL between the projected query and key Gaussians
     #   noisy_query    the query mean treated as a noisy measurement (GL(K) v2, Remark 9)
@@ -491,6 +491,11 @@ class VFE3Config:
     # forward by the one rank-d map S_h, which is at most KL(q_i || (Omega_ij)_* q_j) and equals it only when S_h
     # is sufficient for the pair (GL(K) v2, flat alignment).
     tie_comparison_maps:              bool            = False
+    # relational_routing="noisy_key" only (audit 2026-10-12, T6): the initial per-head key noise n_h > 0 (learned as
+    # routing_key_log_noise, (H,) per layer). The router scores D_ij = KL(N(a_i, V_Q,i) || N(b_j, V_K,j + n_h I)) at
+    # temperature exactly 1 (kappa_beta is not read; learn_attention_temperature is refused), so the routing
+    # objective is the KL of the declared joint pi_ij N(y; b_j, V_K,j + n_h I) (GL(K) v2, Eq. mixture_free_energy).
+    relational_key_noise:             float           = 1.0
 
     ##################################################
     #   9. Predictive readout (projected_predictive)
@@ -913,6 +918,11 @@ class VFE3Config:
                 or float(self.minimal_agent_channel_noise) <= 0.0):
             raise ValueError("minimal_agent_channel_noise must be a finite real value > 0, "
                              f"got {self.minimal_agent_channel_noise!r}")
+        if (isinstance(self.relational_key_noise, bool)
+                or not isinstance(self.relational_key_noise, Real)
+                or not math.isfinite(float(self.relational_key_noise))
+                or float(self.relational_key_noise) <= 0.0):
+            raise ValueError(f"relational_key_noise must be a finite real value > 0, got {self.relational_key_noise!r}")
         _require(self.predictive_covariance, ("passthrough", "moment_matched"), "predictive_covariance")
         if (isinstance(self.predictive_covariance_floor, bool)
                 or not isinstance(self.predictive_covariance_floor, Real)
@@ -1672,6 +1682,10 @@ class VFE3Config:
         if self.learn_attention_temperature and self.predictive_readout == "minimal_agent":
             raise ValueError("learn_attention_temperature=True needs a kernel router: predictive_readout='minimal_agent' "
                              "routes by the source posterior at temperature 1")
+        if (self.learn_attention_temperature and self.relational_routing == "noisy_key"
+                and self.predictive_readout == "kernel"):
+            raise ValueError("learn_attention_temperature=True is incompatible with relational_routing='noisy_key', "
+                             "which routes at temperature exactly 1 (the learned key noise n_h sets the sharpness)")
         if self.tie_comparison_maps and (self.attention_mode != "projected_predictive"
                                          or self.predictive_readout != "kernel"):
             raise ValueError("tie_comparison_maps=True requires attention_mode='projected_predictive' with "
@@ -2204,6 +2218,10 @@ class VFE3Config:
         elif self.relational_routing == "noisy_query":
             mark(("projected_factor_route",),
                  "the noisy-query cost factors per-pair sums G_q + G_k and keeps the Gram route")
+        elif self.relational_routing == "noisy_key":
+            mark(("projected_factor_route",),
+                 "the noisy-key cost factors the broadened key covariance G_k + n_h I, which has no source root, so "
+                 "the Gram route runs")
         elif (self.pos_rotation == "rope" and self.rope_space == "comparison"
               and self.rope_comparison_covariance == "rotation_invariant"):
             mark(("projected_factor_route",),
@@ -2222,7 +2240,8 @@ class VFE3Config:
         rotation_invariant = (self.pos_rotation == "rope" and self.rope_space == "comparison"
                               and self.rope_comparison_covariance == "rotation_invariant")
         gram_status = (self.projected_factor_route == "gram"
-                       or self.relational_routing == "noisy_query" or minimal_agent or rotation_invariant)
+                       or self.relational_routing in ("noisy_query", "noisy_key") or minimal_agent
+                       or rotation_invariant)
         if (rotation_invariant and self.attention_mode == "projected_predictive" and not minimal_agent
                 and self.relational_routing == "gaussian_kl" and self.pair_kl_gemm_tol is None
                 and not self.projected_cov_condition_recovery
@@ -2404,8 +2423,14 @@ class VFE3Config:
         if self.attention_mode == "projected_predictive" and self.predictive_readout != "kernel":
             mark(("routing_kl_max_reference",), "only read by the kernel router (minimal_agent applies no clamp)")
         if not (self.attention_mode == "projected_predictive" and self.predictive_readout == "kernel"
-                and self.relational_routing == "gaussian_kl"):
+                and self.relational_routing in ("gaussian_kl", "noisy_key")):
             mark(("pair_kl_gemm_tol",), "only read by the kernel router's Gaussian-KL cost")
+        if (self.attention_mode == "projected_predictive" and self.predictive_readout == "kernel"
+                and self.relational_routing == "noisy_key"):
+            mark(("kappa_beta",), "relational_routing='noisy_key' routes at temperature exactly 1: the learned key "
+                                  "noise n_h sets the sharpness")
+        else:
+            mark(("relational_key_noise",), "only read by relational_routing='noisy_key' on the kernel router")
         if self.pos_phi == "none":
             mark(("pos_phi_project_slk", "pos_phi_scale"), "only read by a non-'none' pos_phi")
         if (self.beta_attention_prior in ("windowed", "causal_windowed")
