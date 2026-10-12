@@ -535,6 +535,7 @@ SWEEP_ORDER: List[str] = [
    
    "m_phi_lr",   
    "m_p_sigma_lr",
+   # "m_table_fisher_lr",
     
  
     "m_decode_mu_lr",
@@ -589,6 +590,16 @@ SWEEP_ORDER: List[str] = [
    
   
    
+  # "block_mlp_cavi_steps",
+  # "block_mlp_em_weight",
+  # "block_mlp_template_init_variance",
+  # "block_mlp_template_init_pull",
+  # "block_mlp_covariance_floor",
+  # "minimal_agent_channel_noise",
+  # "minimal_agent_cavi_steps",
+  # "relational_key_noise",
+  # "predictive_covariance_floor",
+  # "relational_receiver_noise",
 ]
 
 
@@ -599,6 +610,8 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "param": "relational_receiver_damping",
         "values": [0.001, 0.1, 0.25, 0.5, 0.75, 1],
         "scale": "linear",
+       "requires": {"attention_mode": "projected_gradient", "predictive_readout": "kernel", "relational_receiver_update": "closed_form",
+                    "lambda_alpha_mode": "state_dependent", "rope_mode": "frame"},
     },
 
     
@@ -610,6 +623,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "param": "m_p_mu_lr", 
         "values": [0.0025, 0.005, 0.0075, 0.01],
         "scale": "linear",
+        "requires": {"m_table_update_mode": "adamw"},   # under "fisher" the table steps at m_table_fisher_lr
     },
     
    "m_phi_lr": {
@@ -625,6 +639,15 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
        "param": "m_p_sigma_lr", 
        "values": [0.001, 0.0025, 0.005, 0.0075],
        "scale": "linear",
+       "requires": {"m_table_update_mode": "adamw"},   # under "fisher" the table steps at m_table_fisher_lr
+   },
+
+   "m_table_fisher_lr": {
+       "description": "natural-gradient step size eta of the prior-bank tables (m_table_update_mode='fisher')",
+       "param": "m_table_fisher_lr",
+       "values": [0.025, 0.05, 0.1, 0.2, 0.4],
+       "scale": "log",
+       "requires": {"m_table_update_mode": "fisher"},
    },
    
    
@@ -644,7 +667,8 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
        "param": "m_decode_sigma_lr",
        "values": [0.001, 0.0025, 0.005, 0.0075],
        "scale": "linear",
-       "requires": {"decode_mode": "diagonal_chunked", "untie_decode_bank": True},   # live only with an untied prior-bank decoder
+       # live only with an untied prior-bank decoder; the family and decode mode must agree in rank
+       "requires": {"family": "gaussian_full", "decode_mode": "full_chunked", "untie_decode_bank": True},
    },
 
    
@@ -885,6 +909,11 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         # audit 2026-08-06 F20: a single-value grid is not a comparison. The point of this sweep is
         # whether the ceiling ever BINDS, so it needs points either side of the baseline 100.
         "param": "sigma_max", "values": [1, 5, 10, 20, 50, 100],
+        # The ceiling binds only in a sigma E-step: projected_gradient's euler receiver (the closed-form
+        # receiver on gaussian_full has none), which takes the scalar alpha and frame-space RoPE.
+        "requires": {"attention_mode": "projected_gradient", "predictive_readout": "kernel", "relational_receiver_update": "euler",
+                     "skip_belief_sigma_update": False, "lambda_alpha_mode": "state_dependent",
+                     "rope_mode": "frame"},
     },
     
     
@@ -916,14 +945,16 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
       "param": "e_q_mu_lr",
       "range": [0.8, 1.1, 0.1],
       "scale": "linear",
-      "requires": {"attention_mode": "projected_gradient", "relational_receiver_update": "euler"},   
+      "requires": {"attention_mode": "projected_gradient", "predictive_readout": "kernel", "relational_receiver_update": "euler",
+                   "lambda_alpha_mode": "state_dependent", "rope_mode": "frame"},   
    },
   
    "e_q_sigma_lr": {
       "description": "E-step retraction step size for sigma_q",
       "param": "e_q_sigma_lr", "range": [0.0000, 0.1, 0.005],
-      "requires": {"attention_mode": "projected_gradient", "relational_receiver_update": "euler",
-                   "skip_belief_sigma_update": False},
+      "requires": {"attention_mode": "projected_gradient", "predictive_readout": "kernel", "relational_receiver_update": "euler",
+                   "skip_belief_sigma_update": False, "lambda_alpha_mode": "state_dependent",
+                   "rope_mode": "frame"},
    },
   
 
@@ -981,6 +1012,93 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     },
 
    
+    "block_mlp_cavi_steps": {
+        "description": "prototype_agents mean-field coordinate-ascent sweeps (1 = labels at the input moments)",
+        "param": "block_mlp_cavi_steps",
+        "values": [1, 2, 3, 5],
+        "requires": {"use_block_mlp": True, "block_mlp_mode": "prototype_agents",
+                     "block_mlp_inference": "mean_field"},
+    },
+
+    "block_mlp_em_weight": {
+        "description": "prototype_agents EM M-step term on the templates (nu, lambda, pi); 0 = off",
+        "param": "block_mlp_em_weight",
+        "values": [0.0, 0.01, 0.03, 0.1, 0.3, 1.0],
+        "requires": {"use_block_mlp": True, "block_mlp_mode": "prototype_agents"},
+    },
+
+    "block_mlp_template_init_variance": {
+        "description": "prototype_agents initial template variance lambda_0 (absolute init)",
+        "param": "block_mlp_template_init_variance",
+        "values": [1.0, 3.0, 10.0, 30.0, 100.0],
+        "scale": "log",
+        "requires": {"use_block_mlp": True, "block_mlp_mode": "prototype_agents",
+                     "block_mlp_template_init": "absolute"},
+    },
+
+    "block_mlp_template_init_pull": {
+        "description": "prototype_agents initial pull p in (0, 1) (working_variance init)",
+        "param": "block_mlp_template_init_pull",
+        "values": [0.01, 0.03, 0.09, 0.2, 0.4],
+        "scale": "log",
+        "requires": {"use_block_mlp": True, "block_mlp_mode": "prototype_agents",
+                     "block_mlp_template_init": "working_variance"},
+    },
+
+    "block_mlp_covariance_floor": {
+        "description": "delta_full covariance floor: Sigma+ = J Sigma J^T + floor Sigma",
+        "param": "block_mlp_covariance_floor",
+        "values": [1e-6, 1e-5, 1e-4, 1e-3, 1e-2],
+        "scale": "log",
+        "requires": {"use_block_mlp": True, "block_mlp_mode": "coordinate",
+                     "block_mlp_covariance": "delta_full"},
+    },
+
+    "minimal_agent_channel_noise": {
+        "description": "minimal agent initial channel noise n_h (learned)",
+        "param": "minimal_agent_channel_noise",
+        "values": [0.1, 0.3, 1.0, 3.0, 10.0],
+        "scale": "log",
+        "requires": {"attention_mode": "projected_predictive", "predictive_readout": "minimal_agent",
+                     "rope_mode": "comparison"},
+    },
+
+    "minimal_agent_cavi_steps": {
+        "description": "minimal agent mean-field coordinate-ascent sweeps (1 = labels at the input moments)",
+        "param": "minimal_agent_cavi_steps",
+        "values": [1, 2, 3, 5],
+        "requires": {"attention_mode": "projected_predictive", "predictive_readout": "minimal_agent",
+                     "minimal_agent_inference": "mean_field", "rope_mode": "comparison"},
+    },
+
+    "relational_key_noise": {
+        "description": "noisy_key routing: initial per-head key noise n_h (learned; temperature 1)",
+        "param": "relational_key_noise",
+        "values": [0.1, 0.3, 1.0, 3.0, 10.0],
+        "scale": "log",
+        "requires": {"attention_mode": "projected_predictive", "predictive_readout": "kernel",
+                     "relational_routing": "noisy_key", "learn_attention_temperature": False},
+    },
+
+    "predictive_covariance_floor": {
+        "description": "predictive covariance floor: floor * Sigma_p (moment_matched)",
+        "param": "predictive_covariance_floor",
+        "values": [1e-6, 1e-5, 1e-4, 1e-3, 1e-2],
+        "scale": "log",
+        "requires": {"attention_mode": "projected_predictive", "predictive_covariance": "moment_matched"},
+    },
+
+    "relational_receiver_noise": {
+        "description": "projected_gradient receiver channel floor nu I_d",
+        "param": "relational_receiver_noise",
+        "values": [0.1, 0.3, 1.0, 3.0, 10.0],
+        "scale": "log",
+        # gaussian_full refuses the per-coordinate alpha on the receiver (the scalar form is the frame-invariant one),
+        # and projected_gradient takes only frame-space RoPE.
+        "requires": {"attention_mode": "projected_gradient", "predictive_readout": "kernel", "lambda_alpha_mode": "state_dependent",
+                     "rope_mode": "frame"},
+    },
+
 }
 
 
