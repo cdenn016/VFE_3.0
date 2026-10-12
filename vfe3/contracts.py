@@ -216,7 +216,7 @@ class CanonicalFrameContext:
                         "pair outside vfe3.runtime.ieee_fp32_matmul rounded it at TF32/bf16 "
                         "precision" if policy != "highest" else
                         "; a float32 frame this ill-conditioned needs "
-                        "VFE3Config.frame_pair_fp64_escalation=True")
+                        "VFE3Config.frame_pair_escalation_tol (e.g. 1e-4)")
             raise ValueError(
                 "canonical forward and inverse factors must be mutual inverses within a "
                 "dtype-scaled residual; got max residual "

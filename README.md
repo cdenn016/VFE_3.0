@@ -251,8 +251,8 @@ determines the Gibbs weights without an iterative gradient update over
 them. The attention-temperature policy uses `kappa_beta` and head dimensions
 ($\tau_h=\kappa\sqrt{d}$; the launcher's `kappa_beta=1` gives $\tau_h=\sqrt d$). Position
 can enter through learned positional frames (`pos_phi="learned"`), through rotary positions
-(`pos_rotation="rope"`, folded into the frame under `rope_space="frame"` or applied to the
-projected comparison moments under `rope_space="comparison"`), or through an ALiBi source
+(`rope_mode`: folded into the frame under `"frame"` or `"frame_value"`, or applied to the
+projected comparison moments under `"comparison"` or `"comparison_invariant"`), or through an ALiBi source
 prior (`beta_attention_prior="causal_alibi"`). The launcher dictionary in `train_vfe3.py`
 holds the current choice and each run records its own in `config.json`; the reported K = 128
 run (34.48 test perplexity) used the uniform `causal` prior with learned positional frames and
@@ -276,7 +276,7 @@ $$
 
 The code extracts values, pools sources, applies output maps, sums heads, and
 applies the receiver frame. It need not materialize every $K\times K$ pair link.
-These formulas use a common score/value frame, as under `pos_rotation="none"`; the
+These formulas use a common score/value frame, as under `rope_mode="none"`; the
 rotary-position policies can give comparison and content distinct realized frames.
 
 Under `predictive_covariance="passthrough"`, `predictive_content` leaves covariance
@@ -455,7 +455,7 @@ config.update(
     family="gaussian_diagonal",
     encode_mode="per_token",
     pos_phi="learned",                      # learned positional frames
-    pos_rotation="none",
+    rope_mode="none",
     beta_attention_prior="causal",          # uniform causal source prior
     kappa_beta=1,                           # tau_h = sqrt(d)
     norm_type_block="layernorm",
@@ -491,7 +491,7 @@ the validator for the complete admission rules.
 | `content_link_chart="exponential"` | Receiving map $e^{OT}T^{-1}$; see [Content-link charts](#content-link-charts). |
 | `predictive_covariance="moment_matched"` | Replaces the covariance by the predictive kernel's moment-matched covariance plus a covariant floor. |
 | `family="gaussian_diagonal"` | Keeps the diagonal of the local moment-matched covariance; `gaussian_full` keeps it dense, so the two differ on this route; see below. |
-| `encode_mode="per_token_additive"` | Capacity-matched $\Omega=I$ control; requires `pos_phi="none"`, and either `pos_rotation="none"` or comparison-space RoPE (`rope_space="comparison"`). |
+| `encode_mode="per_token_additive"` | Capacity-matched $\Omega=I$ control; requires `pos_phi="none"`, and either `rope_mode="none"` or comparison-space RoPE (`"comparison"` or `"comparison_invariant"`). |
 | `routing_kl_max_reference` | Projected kernel router only. `"absolute"` (default) clamps $D_{ij}$ at `kl_max`; `"row_min"` clamps the row gap $D_{ij}-\min_{j\,\mathrm{admissible}}D_{ij}$, with the row minimum carrying its subgradient, which leaves $\beta$ the exact softmax wherever no gap reaches `kl_max` and keeps the cost order of a row whose every cost exceeds it. |
 | `learn_attention_temperature` | Default `False`. `True` learns $\tau_{\ell,h}=\kappa_h\sqrt{d_h}\exp(\mathrm{clamp}(\delta_{\ell,h},-3,3))$ per layer and head (`routing_log_temperature`, zero at initialization, no weight decay, score learning rate) on both projected routes. It acts after the `kl_max` clamp, so a fully capped absolute-reference row stays uniform. Not with `predictive_readout="minimal_agent"`. |
 | `tie_comparison_maps` | Default `False`. `True` sets $S_K:=S_Q$ (no `raw_score_k`) on the `projected_predictive` kernel readout, so $D_{ii}=0$ and the flat-alignment case $D_{ij}=D_{\mathrm{KL}}(q_i\Vert(\Omega_{ij})_*q_j)$ under one map is testable. |
@@ -525,7 +525,7 @@ the per-token frame table and the positional table together with the group struc
 so on its own it cannot separate frame structure from lookup capacity. The
 `per_token_additive` encoder keeps the same learned $(V,n_{\mathrm{gen}})$ table but
 applies it as an additive mean shift with $\Omega_{ij}=I$; it is admitted on the projected
-routes only with `pos_phi="none"`, and with either `pos_rotation="none"` or comparison-space
+routes only with `pos_phi="none"`, and with either `rope_mode="none"` or comparison-space
 RoPE, since a positional frame (or RoPE folded into the frame) would reintroduce a
 non-identity transport, while comparison-space RoPE rotates only the projected comparison
 moments and does not enter $U_i$. A gauge on/off result on this route should

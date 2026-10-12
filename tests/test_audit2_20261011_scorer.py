@@ -401,28 +401,12 @@ def test_affine_inverse_measurement_is_certified() -> None:
 def _invariant_config(**overrides: Any) -> Any:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        return tiny_config(embed_dim=8, pos_rotation="rope", rope_space="comparison", rope_on_value=False,
-                           rope_comparison_covariance="rotation_invariant", **overrides)
-
-
-def test_inactive_fields_read_the_gram_tolerance_under_rotation_invariant() -> None:
-    inactive = _invariant_config(projected_cov_condition_recovery=True,
-                                 projected_factor_route="cholesky_qr2").inactive_fields()
-    assert "projected_gram_condition_tol" not in inactive
-    assert "projected_factor_condition_tol" in inactive and "projected_factor_route" in inactive
-    assert "projected_cov_recovery_precision" not in inactive                 # condition recovery: dense route
-    diagonal = _invariant_config().inactive_fields()                          # rope_fraction = 1: diagonal route
-    assert "projected_cov_recovery_precision" in diagonal
-    assert "projected_cov_recovery_precision" not in _invariant_config(rope_fraction=.5).inactive_fields()
-    assert "projected_cov_recovery_precision" not in _invariant_config(pair_kl_gemm_tol=1e-3).inactive_fields()
-    full = tiny_config(projected_cov_condition_recovery=True, projected_factor_route="cholesky_qr2").inactive_fields()
-    assert "projected_gram_condition_tol" in full and "projected_factor_condition_tol" not in full
+        return tiny_config(embed_dim=8, rope_mode="comparison_invariant", **overrides)
 
 
 def test_rotation_invariant_with_every_coordinate_rotating_warns_once(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config_module, "_DIAGONAL_COMPARISON_WARNED", set())
-    values = dict(embed_dim=128, n_heads=4, max_seq_len=128, rope_base=10000.0, pos_rotation="rope",
-                  rope_space="comparison", rope_on_value=False, rope_comparison_covariance="rotation_invariant")
+    values = dict(embed_dim=128, n_heads=4, max_seq_len=128, rope_base=10000.0, rope_mode="comparison_invariant")
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         tiny_config(**values)

@@ -66,17 +66,12 @@ _CONFIG_VALUES: dict[str, Any] = {
     'cg_covariance_floor': 1e-06,
     'cg_energy_weight': 0.0,
     'pos_phi': 'learned',
-    'bch_residual_max': None,
     'pos_phi_project_slk': False,
-    'pos_rotation': 'none',
+    'rope_mode': 'none',
     'rope_base': 100.0,
     'rope_fraction': 1.0,
-    'rope_space': 'frame',
-    'rope_comparison_covariance': 'full',
-    'rope_on_value': True,
     'attention_mode': 'projected_gradient',
     'attention_residual': False,
-    'relational_output_init': 'identity',
     'content_link_chart': 'affine',
     'content_link_edges': 'off',
     'content_link_edge_rank': 4,
@@ -179,16 +174,11 @@ _CONFIG_VALUES: dict[str, Any] = {
     'fp32_matmul_precision': 'highest',
     'matmul_precision_retry': False,
     'full_cov_kl_precision': 'fp32_escalate',
-    'projected_cov_condition_recovery': False,
-    'projected_factor_route': 'gram',
-    'projected_gram_condition_tol': 0.0001,
-    'projected_factor_condition_tol': 0.0003,
-    'projected_cov_recovery_precision': 'fp64',
+    'projected_factorization': 'gram',
     'mu_trust_cholesky_rounds': 3,
     'decode_av_precision': 'fp64',
     'transport_chart_max_norm': 20.0,
-    'frame_pair_fp64_escalation': False,
-    'frame_pair_condition_tol': 0.0001,
+    'frame_pair_escalation_tol': None,
     'phi_mstep_max_matrix_norm': None,
     'phi_frame_condition_max': None,
     'val_diagnostic_batches': 1,
@@ -232,13 +222,91 @@ def tiny_config(**overrides: Any) -> VFE3Config:
     return test_config(**values)
 
 
+# The live route of the train_vfe3.py launcher at tiny scale: projected_predictive with the kernel readout and a
+# moment-matched covariance, gaussian_diagonal, block_glk, a layernorm block norm, the coordinate block MLP, the
+# causal ALiBi prior, the row_min routing clamp, a linear decode and AdamW. The legacy baseline above
+# (projected_gradient, Euler, ambient alignment) stays the default profile; this one is opt-in.
+_LIVE_OVERRIDES: dict[str, Any] = {
+    'vocab_size': 7,
+    'embed_dim': 4,
+    'n_heads': 2,
+    'max_seq_len': 4,
+    'batch_size': 2,
+    'n_layers': 2,
+    'n_e_steps': 1,
+    'max_steps': 10,
+    'warmup_steps': 1,
+    'attention_mode': 'projected_predictive',
+    'predictive_readout': 'kernel',
+    'predictive_covariance': 'moment_matched',
+    'attention_residual': True,
+    'relational_routing': 'gaussian_kl',
+    'relational_receiver_law': 'channel_likelihood',
+    'relational_receiver_update': 'closed_form',
+    'content_link_chart': 'exponential',
+    'family': 'gaussian_diagonal',
+    'gauge_group': 'block_glk',
+    'gauge_tying': 'per_head',
+    'gauge_transport': 'on',
+    'pos_phi': 'learned',
+    'rope_mode': 'none',
+    'norm_type_block': 'layernorm',
+    'norm_type_final': 'none',
+    'layernorm_affine': True,
+    'use_block_mlp': True,
+    'block_mlp_mode': 'coordinate',
+    'block_mlp_expansion': 2,
+    'beta_attention_prior': 'causal_alibi',
+    'routing_kl_max_reference': 'row_min',
+    'kl_max': None,
+    'decode_mode': 'linear',
+    'decode_bias': True,
+    'lambda_alpha_mode': 'state_dependent_per_coord',
+    'm_phi_update_mode': 'adamw',
+    'm_table_update_mode': 'adamw',
+    'mu_init_std': 0.065,
+    'sigma_init': 15.0,
+    'phi_scale': 0.035,
+    'm_p_mu_lr': 0.005,
+    'm_p_sigma_lr': 0.001,
+    'm_phi_lr': 0.003,
+    'm_pos_phi_lr': 0.003,
+    'm_decode_mu_lr': 0.005,
+    'm_decode_sigma_lr': 0.001,
+    'm_relational_score_lr': 0.01,
+    'm_relational_content_lr': 0.0025,
+    'm_block_mlp_lr': 0.005,
+    'm_layernorm_lr': 0.005,
+    'weight_decay': 0.01,
+    'phi_weight_decay': 0.1,
+    'sigma_weight_decay': 0.0,
+    'mu_weight_decay': 0.0,
+    'amp_dtype': None,
+    'fp32_matmul_precision': 'highest',
+}
+
+
+def live_values(**overrides: Any) -> dict[str, Any]:
+    """Return a fresh complete live-route configuration dictionary with local overrides."""
+    return deepcopy({**_CONFIG_VALUES, **_LIVE_OVERRIDES, **overrides})
+
+
+def live_config(**overrides: Any) -> VFE3Config:
+    """Construct the validated live-route config from test-owned arguments."""
+    return VFE3Config(**live_values(**overrides))
+
+
+live_config.__test__ = False
+
+
 def make_relational_operators(*args: Any, **overrides: Any) -> Any:
     """RelationalOperators whose eight required config-mirroring keywords come from the test baseline.
 
     ``attention_residual``, ``predictive_covariance``, ``receiver_law``, ``receiver_update``,
     ``content_link_chart``, ``minimal_agent_inference``, ``kl_max_reference`` and
     ``rope_comparison_covariance`` have no constructor default; explicit keyword arguments override the
-    baseline values.
+    baseline values (the comparison covariance is ``"full"``, the operator spelling of every rope_mode but
+    ``"comparison_invariant"``).
     """
     from vfe3.model.relational_operators import RelationalOperators
     values = _CONFIG_VALUES
@@ -249,5 +317,5 @@ def make_relational_operators(*args: Any, **overrides: Any) -> Any:
                     content_link_chart=values['content_link_chart'],
                     minimal_agent_inference=values['minimal_agent_inference'],
                     kl_max_reference=values['routing_kl_max_reference'],
-                    rope_comparison_covariance=values['rope_comparison_covariance'])
+                    rope_comparison_covariance='full')
     return RelationalOperators(*args, **{**baseline, **overrides})

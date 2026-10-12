@@ -1029,8 +1029,8 @@ def test_config_validation_and_inactive_fields() -> None:
     assert "predictive_readout" in test_config().inactive_fields()                 # projected_gradient
     for inference in INFERENCE:
         inactive = set(test_config(**AGENT, minimal_agent_inference=inference).inactive_fields())
-        assert {"relational_routing", "content_link_chart", "attention_residual", "relational_output_init",
-                "kappa_beta", "projected_factor_route"} <= inactive
+        assert {"relational_routing", "content_link_chart", "attention_residual",
+                "kappa_beta"} <= inactive
         assert not inactive & {"predictive_readout", "minimal_agent_inference", "minimal_agent_channel_noise"}
         assert "predictive_covariance_floor" in inactive                           # passthrough: the floor is inert
         assert "predictive_covariance_checkpoint" not in inactive
@@ -1038,13 +1038,13 @@ def test_config_validation_and_inactive_fields() -> None:
     assert "predictive_covariance_floor" not in moment
     prefix = "predictive_readout='minimal_agent' is unsupported here: "
     for overrides, needle in ((dict(predictive_readout="minimal_agent"), "attention_mode"),
-                              (dict(**AGENT, pos_rotation="rope", rope_on_value=False), "rope"),
+                              (dict(**AGENT, rope_mode="frame"), "rope"),
                               (dict(**AGENT, content_link_chart="exponential", content_link_edges="lowrank",
                                     content_link_edge_rank=2), "content_link_edges")):
         with pytest.raises(ValueError) as info:
             test_config(**overrides)
         assert str(info.value).startswith(prefix) and needle in str(info.value), str(info.value)
-    test_config(**AGENT, pos_rotation="rope", rope_on_value=True)                  # one frame: accepted
+    test_config(**AGENT, rope_mode="frame_value")                  # one frame: accepted
     with pytest.raises(ValueError, match="predictive_readout"):
         test_config(attention_mode="projected_predictive", predictive_readout="other")
     with pytest.raises(ValueError, match="minimal_agent_inference"):

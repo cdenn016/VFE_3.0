@@ -22,7 +22,7 @@ def _model(**overrides) -> VFEModel:
         n_layers=2,
         n_e_steps=2,
         pos_phi="none",
-        pos_rotation="none",
+        rope_mode="none",
     )
     base.update(overrides)
     torch.manual_seed(17)

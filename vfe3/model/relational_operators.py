@@ -422,7 +422,7 @@ class RelationalOperators(nn.Module):
         super().__init__()
         self.kl_max_reference = kl_max_reference      # "absolute" | "row_min" kernel-router clamp reference
         self.pair_kl_gemm_tol = pair_kl_gemm_tol      # None, or the opt-in pair-KL GEMM fallback tolerance (nats)
-        # rope_space='comparison': the RoPE frequency base of the rotation applied to each head's projected
+        # comparison rope_mode: the RoPE frequency base of the rotation applied to each head's projected
         # routing moments after the learned maps (relational_score); None leaves routing un-rotated here.
         self.comparison_rope_base = None if comparison_rope_base is None else float(comparison_rope_base)
         self.comparison_rope_fraction = float(comparison_rope_fraction)              # p-RoPE fraction
@@ -911,7 +911,7 @@ class RelationalOperators(nn.Module):
 
         One host check covers the call. A float32 call that reports a failed factorization (an ADF query covariance
         :math:`A^h` that lost positive definiteness by cancellation, a record covariance, ...) or, under
-        ``projected_cov_condition_recovery``, a query certificate (module docstring of
+        a certified ``projected_factorization``, a query certificate (module docstring of
         :mod:`vfe3.model.minimal_agent`) is recomputed whole in float64 from the local beliefs, frame and prior, and
         its outputs and capture are cast back to the input dtypes. The float32 attempt is discarded, so backward
         never runs through its failed factorizations. Every query and key entry of the call (:math:`2BNH`) is then
@@ -988,7 +988,7 @@ class RelationalOperators(nn.Module):
             C = self._reference_covariance(sigma, frame, dtype, diagonal=sigma.dim() == mu.dim())
             rope = None
             if self.comparison_rope_base is not None:
-                # rope_space='comparison': the record of a source at offset j - i arrives through R_{j-i}.
+                # comparison rope_mode: the record of a source at offset j - i arrives through R_{j-i}.
                 rope = self.comparison_rope_rotation(xi.shape[-2], S.shape[1], xi.device, dtype)  # (N, d, d)
             # The constructor refuses spread_corrected with exact inference; a probe that switches the inference to
             # "exact" on a spread-corrected layer (vfe3.posthoc.feature_probes.minimal_agent_gap) gets the exact
@@ -1424,7 +1424,7 @@ class RelationalOperators(nn.Module):
         device: torch.device,
         dtype:  torch.dtype,
     ) -> torch.Tensor:                 # (N, r, r) R_i, positions 0..N-1
-        r"""Cached comparison-space RoPE rotation :math:`R_i` under ``rope_space='comparison'``.
+        r"""Cached comparison-space RoPE rotation :math:`R_i` under a comparison ``rope_mode``.
 
         The rotation is a constant of (N, r, base, fraction, device, dtype) with no graph, so one build
         serves every layer and forward. A build under ``torch.inference_mode`` is not cached, since an

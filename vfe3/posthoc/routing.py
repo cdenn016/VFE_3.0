@@ -177,7 +177,7 @@ def not_applicable_reason(model: torch.nn.Module) -> Optional[str]:
     if int(getattr(cfg, "n_e_steps", 1)) < 1:
         return "n_e_steps=0: no E-step iteration, so the router is never evaluated"
     if any(getattr(op, "comparison_rope_base", None) is not None for op in operators):
-        return ("rope_space='comparison': the router scores the R_i-rotated projected moments, which this "
+        return ("comparison rope_mode: the router scores the R_i-rotated projected moments, which this "
                 "decomposition does not rebuild (it would decompose the unrotated cost)")
     if any(getattr(op, "routing_log_temperature", None) is not None for op in operators):
         return ("learn_attention_temperature=True: the routing temperature is learned per layer, and this "

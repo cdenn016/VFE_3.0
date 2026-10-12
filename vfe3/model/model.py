@@ -35,6 +35,7 @@ from vfe3.contracts import (
 from vfe3.geometry.groups import GaugeGroup, get_group
 from vfe3.geometry.lie_ops import CompactBlockElement, project_phi_to_slk
 from vfe3.geometry.norms import get_norm
+from vfe3.config import _COMPARISON_ROPE_MODES, _FRAME_ROPE_MODES
 from vfe3.geometry.rope import get_pos_rotation
 from vfe3.geometry.transport import (
     CompactFactoredTransport,
@@ -42,6 +43,7 @@ from vfe3.geometry.transport import (
     RopeTransport,
     TransportState,
     get_transport_registration,
+    DEFAULT_FRAME_PAIR_CONDITION_TOL,
     set_frame_pair_condition_tol,
     set_frame_pair_fp64_escalation,
     _build_flat,
@@ -68,8 +70,9 @@ from vfe3.families.gaussian import (
 )
 from vfe3.families.base import BeliefParams, get_family as _get_family
 from vfe3.families.policy import family_instance
-from vfe3.numerics import safe_eigvalsh, set_mu_trust_cholesky_rounds
+from vfe3.numerics import FACTOR_CONDITION_TOL, safe_eigvalsh, set_mu_trust_cholesky_rounds
 from vfe3.relational_scoring import (
+    GRAM_CONDITION_TOL,
     set_projected_condition_recovery,
     set_projected_factor_condition_tol,
     set_projected_factor_route,
@@ -275,13 +278,17 @@ class VFEModel(nn.Module):
             cfg.full_cov_kl_precision)
         # Same one-place-set rule for the KL policy itself (audit 2026-08-06 C1).
         set_full_cov_kl_precision(self.full_cov_kl_precision)
-        set_projected_condition_recovery(cfg.projected_cov_condition_recovery)
-        set_projected_factor_route(cfg.projected_factor_route)
-        set_projected_gram_condition_tol(cfg.projected_gram_condition_tol)
-        set_projected_factor_condition_tol(cfg.projected_factor_condition_tol)
-        set_projected_recovery_precision(cfg.projected_cov_recovery_precision)
-        set_frame_pair_fp64_escalation(cfg.frame_pair_fp64_escalation)
-        set_frame_pair_condition_tol(cfg.frame_pair_condition_tol)
+        # projected_factorization: the certificate and factor route; tolerances and the fp32 recovery
+        # precision (float64 fallback) are fixed.
+        set_projected_condition_recovery(cfg.projected_factorization != "gram")
+        set_projected_factor_route(
+            "cholesky_qr2" if cfg.projected_factorization == "cholesky_qr2_certified" else "gram")
+        set_projected_gram_condition_tol(GRAM_CONDITION_TOL)
+        set_projected_factor_condition_tol(FACTOR_CONDITION_TOL)
+        set_projected_recovery_precision("fp32")
+        set_frame_pair_fp64_escalation(cfg.frame_pair_escalation_tol is not None)
+        set_frame_pair_condition_tol(cfg.frame_pair_escalation_tol if cfg.frame_pair_escalation_tol is not None
+                                     else DEFAULT_FRAME_PAIR_CONDITION_TOL)
         set_mu_trust_cholesky_rounds(cfg.mu_trust_cholesky_rounds)
         # ... and the fp32 matmul / TF32 policy (audit 2026-08-06 C7/F25), which is process-global
         # for the same reason and belongs to the same one-place-set rule. It lives here rather than
@@ -301,10 +308,9 @@ class VFEModel(nn.Module):
                 list(bytes.fromhex(self.group.basis_fingerprint)), dtype=torch.uint8))
         # Keep layer zero's state-dict prefix for existing single-layer checkpoints.
         self.relational_operators_extra = nn.ModuleList()
-        # 'depth_scaled' starts the residual-branch writer O at 1/sqrt(2 L) so the L-layer
-        # stack of near-uniform routing at init does not add a unit-gain token mean per layer.
-        output_init_scale = (1.0 / math.sqrt(2.0 * cfg.n_layers)
-                             if cfg.relational_output_init == "depth_scaled" else 1.0)
+        # The residual-branch writer O starts at the identity (the paper's initialization; the
+        # depth-scaled 1/sqrt(2 L) option was retired 2026-10-12).
+        output_init_scale = 1.0
         # The residual and the moment-matched covariance are predictive-readout knobs; the gradient
         # receiver ignores them (its covariance comes from the receiver update and its
         # self-information from alpha KL(q||p)), so they reach only predictive operators.
@@ -341,12 +347,13 @@ class VFEModel(nn.Module):
                                 minimal_agent_channel_noise=cfg.minimal_agent_channel_noise,
                                 minimal_agent_cavi_steps=cfg.minimal_agent_cavi_steps,
                                 elbo_diagnostic=cfg.diagnose_agent_elbo,          # minimal agent only (T1)
-                                comparison_rope_base=(cfg.rope_base if cfg.pos_rotation == "rope"
-                                                      and cfg.rope_space == "comparison" else None),
+                                comparison_rope_base=(cfg.rope_base if cfg.rope_mode in _COMPARISON_ROPE_MODES
+                                                      else None),
                                 comparison_rope_fraction=cfg.rope_fraction,
                                 kl_max_reference=cfg.routing_kl_max_reference,
                                 pair_kl_gemm_tol=cfg.pair_kl_gemm_tol,
-                                rope_comparison_covariance=cfg.rope_comparison_covariance,
+                                rope_comparison_covariance=("rotation_invariant"
+                                                            if cfg.rope_mode == "comparison_invariant" else "full"),
                                 learn_attention_temperature=cfg.learn_attention_temperature,
                                 tie_comparison_maps=cfg.tie_comparison_maps,
                                 block_covariance=_get_family(cfg.family).head_block_covariance,
@@ -470,11 +477,11 @@ class VFEModel(nn.Module):
                 covariance_layout=_get_family(cfg.family).cov_kind,     # 'full' also for the dense head-block storage
             )
         )
-        # Under rope_space='comparison' no frame carries R_i: the MLP and the values both read U_i.
+        # Under a comparison rope_mode no frame carries R_i: the MLP and the values both read U_i.
         if (cfg.use_block_mlp and self._block_mlp_registration.requires_frame_context
-                and cfg.pos_rotation == "rope" and getattr(cfg, "rope_space", "frame") == "frame"):
+                and cfg.rope_mode in _FRAME_ROPE_MODES):
             rope_caveats = []
-            if not cfg.rope_on_value:
+            if cfg.rope_mode == "frame":
                 rope_caveats.append(
                     "Values use U_i; the MLP uses U_i R_i^T (position-dependent MLP).")
             if rope_caveats:
@@ -524,8 +531,8 @@ class VFEModel(nn.Module):
         if not transport_registration.satisfies(requirement):
             raise ValueError(f"family={cfg.family!r} requires a {requirement!r} transport; the flat "
                              f"registration is {transport_registration.pair_transport_kind!r}")
-        if cfg.pos_rotation == "rope" and not transport_registration.rope_right_foldable:
-            raise ValueError("pos_rotation='rope' folds R into the vertex frame, which the flat "
+        if cfg.rope_mode != "none" and not transport_registration.rope_right_foldable:
+            raise ValueError(f"rope_mode={cfg.rope_mode!r} folds R into the vertex frame, which the flat "
                              "registration does not declare rope_right_foldable")
         # Causal/attention log-prior is loop-invariant for fixed (N, device, dtype); cache it
         # (audit 4e) keyed on those so it is built once, not every forward. Not an nn.buffer
@@ -714,20 +721,20 @@ class VFEModel(nn.Module):
         n:      int,                          # sequence length N (varies across calls)
         device: torch.device,
     ) -> Optional[torch.Tensor]:
-        r"""Cached gauge-RoPE rotation R(theta) for length n (None when pos_rotation='none').
+        r"""Cached gauge-RoPE rotation R(theta) for length n (None when rope_mode='none').
 
-        Also None under ``rope_space='comparison'``: the rotation is then not folded into any frame but applied to
+        Also None under a comparison ``rope_mode``: the rotation is then not folded into any frame but applied to
         the projected routing moments inside :func:`vfe3.gradients.relational.relational_score`.
         """
-        if self.cfg.pos_rotation == "none" or getattr(self.cfg, "rope_space", "frame") == "comparison":
+        if self.cfg.rope_mode not in _FRAME_ROPE_MODES:
             return None
         dtype = self.group.generator_dtype
-        key = (n, device, dtype, self.cfg.pos_rotation, self.cfg.rope_base, self.cfg.rope_fraction)
+        key = (n, device, dtype, self.cfg.rope_base, self.cfg.rope_fraction)
         cached = self._rope_cache.get(key)
         if cached is None:
             # p-RoPE fraction only when set: registered builders predating it keep their signature.
             extra = {} if self.cfg.rope_fraction == 1.0 else {"fraction": self.cfg.rope_fraction}
-            cached = get_pos_rotation(self.cfg.pos_rotation)(
+            cached = get_pos_rotation("rope")(
                 torch.arange(n, device=device), self.group.irrep_dims,
                 base=self.cfg.rope_base, device=device, dtype=dtype, **extra)
             self._rope_cache.clear()
@@ -844,7 +851,7 @@ class VFEModel(nn.Module):
         r"""Build the shared flat transport and the realized routing and value frames.
 
         The routing frame folds RoPE into the vertex factors, :math:`U_i R_i^\top`; the value frame
-        is the same unless ``rope_on_value=False``, which keeps the un-rotated :math:`U_i`. Both are
+        is the same under ``rope_mode='frame_value'``; ``'frame'`` keeps the un-rotated :math:`U_i`. Both are
         compact head blocks: :math:`\xi_i = U_i^{-1}\mu_i` and
         :math:`C_i = U_i^{-1}\Sigma_i U_i^{-\top}` are the reference moments the projected scorers read.
         """
@@ -853,7 +860,7 @@ class VFEModel(nn.Module):
         frame = self._canonical_frame_context(shared_omega, fold_rope=True, compact=True)
         value_frame = (
             self._canonical_frame_context(shared_omega, fold_rope=False, compact=True)
-            if rope is not None and not self.cfg.rope_on_value else frame)
+            if rope is not None and self.cfg.rope_mode == "frame" else frame)
         return shared_omega, frame, value_frame
 
     def _build_shared_flat_transport(
@@ -2194,14 +2201,14 @@ class VFEModel(nn.Module):
         r"""Float64 inverse realized frames of the canonical diagnostic, from the stack-entry belief.
 
         :math:`U_i^{-1} = R_ie^{-Y_i\cdot G}e^{-\phi_i\cdot G}`, with :math:`R_i` the frame-space RoPE rotation
-        folded into the frames (:meth:`_relational_frames`) or, under ``rope_space='comparison'``, this layer's
+        folded into the frames (:meth:`_relational_frames`) or, under a comparison ``rope_mode``, this layer's
         comparison rotation (``RelationalOperators.comparison_rope_rotation``) on each head's coordinates. The
         latter rotates each head's reference moments,
         :math:`(\xi^h_i, C^{hh}_i)\mapsto(R_i\xi^h_i, R_iC^{hh}_iR_i^\top)`, as the router rotates its projected
         moments, so the head energies and :math:`\beta^*` depend on position through :math:`j - i` as they do
         under frame-space RoPE (audit 2026-10-10 round 2, item 18). The canonical block reads the full rotated
         covariance, not the rotation-invariant projection the router may score
-        (``rope_comparison_covariance='rotation_invariant'``).
+        (``rope_mode='comparison_invariant'``).
 
         Where the group certifies head blocks (the packed ``block_glk`` coordinates, or a basis supported on equal
         head blocks, :meth:`~vfe3.geometry.groups.GaugeGroup.head_block_generators`) and the frame-space rotation

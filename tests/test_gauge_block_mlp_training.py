@@ -23,7 +23,7 @@ def _training_cfg(mode, covariance):
         norm_type_block="none" if covariance == "delta_full" else "layernorm",
         gauge_group="block_glk",
         pos_phi="none",
-        pos_rotation="none",
+        rope_mode="none",
     )
 
 
@@ -59,7 +59,7 @@ def _diagonal_cfg(mode, **overrides):
         decode_mode="linear",
         gauge_group="block_glk",
         pos_phi="learned",
-        pos_rotation="none",
+        rope_mode="none",
         use_block_mlp=True,
         block_mlp_mode=mode,
         norm_type_block="none",

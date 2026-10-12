@@ -34,7 +34,7 @@ def _vcfg(**over: Any) -> VFE3Config:
         block_mlp_expansion=E, block_mlp_mode="coordinate", beta_attention_prior="causal",
         family="gaussian_diagonal", gauge_group="block_glk", attention_mode="projected_predictive",
         predictive_readout="kernel", attention_residual=True, decode_mode="diagonal_chunked",
-        pos_phi="none", pos_rotation="rope", rope_space="comparison", rope_on_value=False, rope_base=100.0,
+        pos_phi="none", rope_mode="comparison", rope_base=100.0,
         norm_type_block="layernorm", layernorm_affine=True, skip_belief_sigma_update=True)
     values.update(over)
     with warnings.catch_warnings():
@@ -59,9 +59,9 @@ def _bcfg(**over: Any) -> BaselineConfig:
 ])
 def test_frame_controls_accept_comparison_rope_and_reject_frame_rope(over: Dict[str, Any]) -> None:
     cfg = _vcfg(**over)
-    assert cfg.pos_rotation == "rope" and cfg.rope_space == "comparison"
-    with pytest.raises(ValueError, match="pos_rotation"):
-        _vcfg(rope_space="frame", **over)
+    assert cfg.rope_mode == "comparison"
+    with pytest.raises(ValueError, match="rope_mode"):
+        _vcfg(rope_mode="frame", **over)
 
 
 def test_identity_frames_keep_comparison_rope_routing() -> None:
@@ -116,7 +116,7 @@ def test_matched_to_copies_rope_and_the_arms_check_it() -> None:
     assert (bcfg.pos_rotation, bcfg.rope_base) == ("rope", vcfg.rope_base)
     assert BaselineConfig.from_serialized(bcfg.serialize()) == bcfg
     assert pa.check_baseline_arm(vcfg, bcfg) == {}
-    assert BaselineConfig.matched_to(_vcfg(pos_rotation="none", pos_phi="learned")).pos_rotation == "none"
+    assert BaselineConfig.matched_to(_vcfg(rope_mode="none", pos_phi="learned")).pos_rotation == "none"
     swapped = BaselineConfig.matched_to(vcfg, **pa._ALIBI)
     with pytest.raises(pa.ArmDefinitionError, match="pos_rotation"):
         pa.check_baseline_arm(vcfg, swapped)
@@ -153,7 +153,7 @@ def test_rope_fraction_reaches_every_rope_path() -> None:
         warnings.simplefilter("ignore")
         model = VFEModel(cfg)
     assert model.relational_operators.comparison_rope_fraction == 0.5
-    frame = _vcfg(rope_space="frame", rope_fraction=0.5)
+    frame = _vcfg(rope_mode="frame", rope_fraction=0.5)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         R = VFEModel(frame)._rope_rotation(N, torch.device("cpu"))           # (N, K, K)

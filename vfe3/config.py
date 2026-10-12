@@ -15,7 +15,7 @@ import os
 import warnings
 from dataclasses import MISSING, asdict, dataclass, fields
 from numbers import Real
-from typing import Any, List, Literal, Mapping, Optional, Tuple
+from typing import Any, Callable, List, Literal, Mapping, Optional, Tuple
 
 
 class ConfigNotice(UserWarning):
@@ -84,7 +84,18 @@ _RETIRED_GAUGE_GROUPS      = frozenset({"glk", "tied_block_glk", "so_k", "sp", "
 _REFERENCE_DECODE_MODES    = ("linear", "diagonal_chunked", "full_chunked")
 # Retired dense decode spellings and the chunked kernels they migrate to on load (same logits; the
 # dense helpers remain private oracles in vfe3.model.prior_bank).
-_DENSE_DECODE_MIGRATIONS   = {"diagonal": "diagonal_chunked", "full": "full_chunked", "family": "family_chunked"}
+_DENSE_DECODE_MIGRATIONS   = {"diagonal": "diagonal_chunked", "full": "full_chunked"}
+# Retired generic family decode ("family" dense, "family_chunked" fused; 2026-10-12): the validator
+# admitted it only for the Gaussian families at Renyi order 1, where it scores the same -KL(q || p_v)/tau
+# as the fast kernel of the family's covariance rank (float64 loss differences of 2e-16 and 0).
+_FAMILY_DECODE_MIGRATIONS  = {"gaussian_diagonal": "diagonal_chunked", "gaussian_full": "full_chunked"}
+# Projected Gaussian-KL factorizations (see VFE3Config.projected_factorization).
+_PROJECTED_FACTORIZATIONS  = ("gram", "gram_certified", "cholesky_qr2_certified")
+# Gauge-RoPE placements (see VFE3Config.rope_mode): frame space folds R_i into the frame, comparison space
+# rotates the projected routing moments after the learned maps.
+_FRAME_ROPE_MODES          = ("frame", "frame_value")
+_COMPARISON_ROPE_MODES     = ("comparison", "comparison_invariant")
+_ROPE_MODES                = ("none",) + _FRAME_ROPE_MODES + _COMPARISON_ROPE_MODES
 
 
 class _ConfigTypeError(TypeError, ValueError):
@@ -101,7 +112,7 @@ def _warn_diagonal_comparison_covariance(
     base:        float,
     max_seq_len: int,
 ) -> None:
-    r"""Warn once per message that ``rotation_invariant`` makes the router's comparison covariance diagonal.
+    r"""Warn once per message that ``comparison_invariant`` makes the router's comparison covariance diagonal.
 
     With every coordinate of a head's comparison block of size d but at most one in a rotating plane, the
     commutant projection P(G) is one isotropic variance per plane (audit 2026-10-10 round 2, item 48). Plane k
@@ -113,7 +124,7 @@ def _warn_diagonal_comparison_covariance(
         planes = int(fraction * d // 2)
         count = sum((max_seq_len - 1) * base ** (-2.0 * k / d) < 0.5 for k in range(planes))
         slow.append(f"{count} of {planes} planes for heads of size {d}")
-    message = (f"rope_comparison_covariance='rotation_invariant' with rope_fraction={fraction:g}: every comparison "
+    message = (f"rope_mode='comparison_invariant' with rope_fraction={fraction:g}: every comparison "
                "coordinate but at most one lies in a rotating plane, so the router's comparison covariance P(G) is "
                "diagonal, one isotropic variance per plane, and routing reads no covariance between comparison "
                f"coordinates. At rope_base={base:g} and max_seq_len={max_seq_len}, " + ", ".join(slow)
@@ -203,7 +214,7 @@ class VFE3Config:
     # Log-step diagnostic: the canonical free energy at each layer's captured beliefs,
     # sum_i [alpha_i KL(q_i||p_i) + R(alpha_i)] + lambda_beta sum_h sum_ij [beta*_ij D^h_ij + tau beta*_ij log(beta*_ij/pi_ij)]
     # with D^h_ij the head-marginal KL of q_i and Omega_ij q_j and the canonical router beta* = softmax(log pi - D/tau).
-    # beta* includes the attention prior pi (causal mask, ALiBi), the RoPE rotation of either rope_space (comparison:
+    # beta* includes the attention prior pi (causal mask, ALiBi), the RoPE rotation of either rope_mode space (comparison:
     # each head's reference moments rotated by R_i, full rotated covariance) and the router's temperature tau (1 under
     # minimal_agent); D_ii = 0 = B_ii puts its row maximum on the diagonal. Fills self_coupling, self_divergence,
     # belief_coupling, attention_entropy and total (per-token means), canonical_beta_tv, canonical_self_weight
@@ -247,8 +258,7 @@ class VFE3Config:
     #   4. Belief family and table initialization
     ##################################################
 
-    # "gaussian_diagonal" | "gaussian_full" | "gaussian_block" ("laplace_diagonal" is registered but refused on both
-    # projected routes)
+    # "gaussian_diagonal" | "gaussian_full" | "gaussian_block"
     # The belief covariance structure (read diagonal_covariance, never a second flag).
     #   gaussian_block  one SPD d_head x d_head block per head, stored in the dense (K, K) layout. only:
     #                   projected_predictive, predictive_readout="kernel", equal head blocks (block_glk, block_so,
@@ -281,11 +291,10 @@ class VFE3Config:
     #   per_token_additive  control: the same phi table used additively, not as a frame (no position in phi)
     encode_mode:                      str             = "per_token"
 
-    # "linear" | "diagonal_chunked" | "full_chunked" | "family_chunked" | "expected_likelihood_chunked"
+    # "linear" | "diagonal_chunked" | "full_chunked" | "expected_likelihood_chunked"
     #   linear                       learned (V, K) readout of mu_q (+ bias); ignores sigma
     #   diagonal_chunked             -KL(q || p_v)/tau against the diagonal prior bank
     #   full_chunked                 -KL(q || p_v)/tau with a full q against the diagonal bank
-    #   family_chunked               -D(q || p_v)/tau through the configured family (any covariance rank)
     #   expected_likelihood_chunked  log N(mu_q; mu_v, Sigma_q + Sigma_v), diagonal only
     # Every prior-bank mode streams the vocabulary in chunks and never forms (B, N, V) in training.
     decode_mode:                      str             = "linear"
@@ -293,7 +302,7 @@ class VFE3Config:
     # "local" | "reference"
     #   local      decode the local moments (mu_i, Sigma_i)
     #   reference  decode xi_i = U_i^-1 mu_i, C_i = U_i^-1 Sigma_i U_i^-T through the attention frame.
-    #              only: a projected attention_mode, pos_rotation="none", decode_mode "linear" |
+    #              only: a projected attention_mode, rope_mode "none" or a comparison mode, decode_mode "linear" |
     #              "diagonal_chunked" | "full_chunked"
     decode_coordinates:               str             = "local"
 
@@ -318,8 +327,7 @@ class VFE3Config:
     # covariance every jump of the Sigma_q the stack builds reaches the cross-entropy (2026-10-11 K=128 spikes).
     decode_covariance:                str             = "belief"
     
-    # Vocabulary entries per chunk of the fused CE kernels. The family_chunked full-covariance route
-    # narrows its slice to a fixed byte budget and treats this as an upper bound. Values are unchanged.
+    # Vocabulary entries per chunk of the fused CE kernels. Values do not depend on the width.
     decode_chunk_size:                int             = 8192
 
     # "auto" | "auto_aggregate"
@@ -344,7 +352,8 @@ class VFE3Config:
     decode_av_precision:              str             = "fp32"
 
     # "fp64" | "fp32_escalate" | "fp32_escalate_cond"
-    # family="gaussian_full" with family_chunked only: precision of the full-covariance pair KL.
+    # family="gaussian_full" with a nonzero M-step self-coupling or CG energy only: precision of the
+    # full-covariance pair KL.
     #   fp64                unconditional float64
     #   fp32_escalate       float32, recomputed in float64 when the Cholesky certificate fails
     #   fp32_escalate_cond  fp32_escalate plus a pivot-ratio conditioning trigger
@@ -376,8 +385,8 @@ class VFE3Config:
 
     # "on" | "off" | "frozen"
     #   on      the frame is learned as phi_scale / m_phi_lr / pos_phi specify (pure path)
-    #   off     Omega = I exactly: coerces phi_scale=0, pos_phi="none", m_phi_lr=0; needs pos_rotation="none"
-    #           or rope_space="comparison" (which rotates the routing moments, never the frame)
+    #   off     Omega = I exactly: coerces phi_scale=0, pos_phi="none", m_phi_lr=0; needs rope_mode="none"
+    #           or a comparison mode (which rotates the routing moments, never the frame)
     #   frozen  a random fixed frame: keeps phi_scale, coerces m_phi_lr=0 (same parameter count as "on")
     gauge_transport:                  str             = "on"
 
@@ -422,35 +431,32 @@ class VFE3Config:
     #   none     no positional frame (pure path)
     #   learned  learned (max_seq_len, n_gen) table
     #   frozen   parameter-free i * pos_phi_scale on one generator axis; on the projected routes it is folded into
-    #            the frame before the learned maps, so routing is not relative (relative: pos_rotation='rope' with
-    #            rope_space='comparison')
+    #            the frame before the learned maps, so routing is not relative (relative: a comparison rope_mode)
     pos_phi:                          str             = "learned"
-    pos_rotation:                     str             = "none"       # "none" | "rope" block-diagonal rotation R(theta) folded 
-                                                                     # into each frame on the right, V_i = U_i R_i^T.
-    rope_on_value:                    bool            = False        # rope only: rotate the content frame too (False: routing only)
+    # "none" | "frame" | "frame_value" | "comparison" | "comparison_invariant"
+    # Gauge-RoPE: the block-diagonal positional rotation R(theta_i).
+    #   none                  no rotation
+    #   frame                 folded into each routing frame on the right, V_i = U_i R_i^T, before the learned maps
+    #                         (absolute-position routing); the content frame stays U_i (routing only)
+    #   frame_value           frame, and the content frame is rotated too
+    #   comparison            applied to each head's projected query and key moments after the learned maps, so the
+    #                         routing cost depends on positions only through i - j (kernel readout: routing only;
+    #                         minimal_agent: the record channel R_{j-i}, routing and content by exact conditioning).
+    #                         The kernel router scores the comparison covariance R_i G R_i^T (as run): the trace and
+    #                         log-det terms of every non-self pair grow with the anisotropy of G, which can self-lock a
+    #                         head (audit 2026-10-09 round 2, addendum). only: projected_predictive
+    #   comparison_invariant  comparison, with G projected onto the commutant of the RoPE torus (one isotropic variance
+    #                         per rotating plane, the full non-rotating block, no cross-covariance), so
+    #                         R_i P(G) R_i^T = P(G) and only the mean term carries i - j; scored on the Gram route (no
+    #                         source-root factor route), or in closed form with no factorization when P(G) is diagonal
+    #                         (rope_fraction = 1). only: the kernel readout (not minimal_agent)
+    rope_mode:                        str             = "none"
     pos_phi_project_slk:              bool            = False        # pos_phi only: per-block trace projection (det = 1)
-    bch_residual_max:                 Optional[float] = None         # manifold phi M-step only: group-product residual gate, min(1e-6, value); None = 1e-6 (tightens only)
     
-    rope_base:                        float           = 100.0        # rope only: frequency base
-    # rope only: p-RoPE fraction p in (0, 1] (Barbero et al., ICLR 2025): only the floor(p d / 2) fastest
+    rope_base:                        float           = 100.0        # rope_mode != "none" only: frequency base
+    # rope_mode != "none" only: p-RoPE fraction p in (0, 1] (Barbero et al., ICLR 2025): only the floor(p d / 2) fastest
     # pairs of each block rotate, at their full-RoPE frequencies; the slower pairs stay position-free. 1.0 = RoPE.
     rope_fraction:                    float           = 1.0
-    # "frame" | "comparison"
-    # rope only: where the rotation acts.
-    #   frame       folded into each frame, V_i = U_i R_i^T, before the learned maps (absolute-position routing)
-    #   comparison  applied to each head's projected query and key moments after the learned maps, so the
-    #               routing cost depends on positions only through i - j (kernel readout: routing only;
-    #               minimal_agent: the record channel R_{j-i}, routing and content by exact conditioning)
-    rope_space:                       str             = "frame"
-    # "full" | "rotation_invariant"
-    # rope_space="comparison" with the kernel readout only: the comparison covariance the router scores.
-    #   full                R_i G R_i^T (as run): the trace and log-det terms of every non-self pair grow with the
-    #                       anisotropy of G, which can self-lock a head (audit 2026-10-09 round 2, addendum)
-    #   rotation_invariant  G projected onto the commutant of the RoPE torus (one isotropic variance per rotating
-    #                       plane, the full non-rotating block, no cross-covariance), so R_i P(G) R_i^T = P(G) and
-    #                       only the mean term carries i - j; scored on the Gram route (no source-root factor route),
-    #                       or in closed form with no factorization when P(G) is diagonal (rope_fraction = 1)
-    rope_comparison_covariance:       str             = "full"
     
     ##################################################
     #   8. Attention routing
@@ -514,7 +520,7 @@ class VFE3Config:
     #   minimal_agent  each receiver conditions exactly on a noisy comparison record with the key tied to
     #                  the content (S_K = T); no O, routing is the exact source posterior (temperature 1;
     #                  relational_routing, kappa_beta and kl_max are not read). Needs equal heads,
-    #                  content_link_edges="off" and not (frame-space pos_rotation="rope" with rope_on_value=False);
+    #                  content_link_edges="off" and not rope_mode="frame";
     #                  comparison-space RoPE is the known record channel R_{j-i} (exact conditioning).
     predictive_readout:               str             = "kernel"
 
@@ -546,12 +552,6 @@ class VFE3Config:
     ##################################################
     #   10. Content links (O, T)
     ##################################################
-
-    # "identity" | "depth_scaled"
-    # predictive_readout="kernel" only (as are content_link_chart and attention_residual).
-    #   identity      initial content scale 1
-    #   depth_scaled  initial O times 1/sqrt(2 n_layers)
-    relational_output_init:           str             = "identity"
 
     # "affine" | "first_order" | "exponential"
     # Receiving-map chart on the stored (O, T); every chart starts at the same content.
@@ -650,7 +650,7 @@ class VFE3Config:
     # "local" | "reference"
     #   local      the block norm, block MLP and final norm act on mu_i
     #   reference  they act on xi_i = U_i^-1 mu_i and map back, mu -> U_i Phi(U_i^-1 mu). only:
-    #              projected_predictive, pos_rotation="none", a "none"/"layernorm" norm, and a passthrough
+    #              projected_predictive, rope_mode "none" or a comparison mode, a "none"/"layernorm" norm, and a passthrough
     #              coordinate / gaussian_template MLP, a prototype_agents MLP, or (gaussian_full / gaussian_block)
     #              a delta_full coordinate MLP
     block_coordinates:                str             = "local"
@@ -859,31 +859,24 @@ class VFE3Config:
     # forwards use the same ladder. Not used with fp16 (GradScaler state).
     matmul_precision_retry:           bool            = False
 
-    # Redo a frame producer call in float64 when its float32 frame pair is ill-conditioned
-    # (eps_32 kappa_F(U) > frame_pair_condition_tol). Costly (about 7x per escalated step).
-    frame_pair_fp64_escalation:       bool            = False
+    # None (off) | tol in (0, 1)
+    # Redo a frame producer call in float64 when its float32 frame pair is ill-conditioned,
+    # eps_32 kappa_F(U) > tol (1e-4: kappa_F > 838.9). Costly (about 7x per escalated step).
+    frame_pair_escalation_tol:        Optional[float] = None
     
-    # Also rebuild projected covariances that factor in float32 but fail eps_32 ||G||_F ||G^-1||_F <= tol
-    # (failed factorizations are always rebuilt where the scorer has source tuples; under rotation_invariant
-    # with a diagonal P(G) this also keeps the factored route in place of the closed-form diagonal one).
-    # Costly on CUDA; with minimal_agent it also screens the ADF query covariances.
-    projected_cov_condition_recovery: bool            = False
-       
-    # "fp64" | "fp32"
-    # Precision of the projected source recovery.
-    #   fp64  float64 QR, and float64 for every pair touching a recovered entry
-    #   fp32  float32 shifted CholeskyQR3 (falls back to fp64 when that fails)
-    projected_cov_recovery_precision: str             = "fp32"
-
-    # "gram" | "cholesky_qr2"
-    # Factor route of the projected Gaussian-KL scorer.
-    #   gram          factor the float32 Gram X X^T (error O(eps kappa^2))
-    #   cholesky_qr2  factor X by CholeskyQR2 (error O(eps kappa); slower unless recovery trips)
-    projected_factor_route:           str             = "gram"
-    
-    projected_gram_condition_tol:     float           = 1e-4         # recovery only, gram route
-    projected_factor_condition_tol:   float           = 3e-4         # recovery only, cholesky_qr2 route
-    frame_pair_condition_tol:         float           = 1e-4         # escalation only: kappa_F > 838.9 at 1e-4
+    # "gram" | "gram_certified" | "cholesky_qr2_certified"
+    # Factorization of the projected Gaussian-KL scorer. Failed float32 factorizations are always rebuilt
+    # from source where the scorer has source tuples; a recovery runs in float32 shifted CholeskyQR3 and
+    # falls back to float64 QR when that fails.
+    #   gram                    factor the float32 Gram X X^T (error O(eps kappa^2))
+    #   gram_certified          gram, and also rebuild entries that factor but fail
+    #                           eps_32 ||G||_F ||G^-1||_F <= 1e-4 (costly on CUDA; with minimal_agent it
+    #                           also screens the ADF query covariances; under comparison_invariant with a
+    #                           diagonal P(G) it keeps the factored route in place of the diagonal one)
+    #   cholesky_qr2_certified  factor X by CholeskyQR2 (error O(eps kappa)) and rebuild entries failing
+    #                           eps_32 kappa_1(C) <= 3e-4; the Gram route serves minimal_agent,
+    #                           noisy_query and comparison_invariant, which pass no source root
+    projected_factorization:          str             = "gram"
     
     def __post_init__(self) -> None:
         # Every plain bool/int field is gated here on its exact type (bool is not an int, and
@@ -1086,13 +1079,6 @@ class VFE3Config:
                 "M-step interior radius lies inside the fail-closed transport chart), got "
                 f"{self.phi_mstep_max_matrix_norm} >= {self.transport_chart_max_norm}"
             )
-        if self.bch_residual_max is not None and not (
-            math.isfinite(self.bch_residual_max) and self.bch_residual_max > 0.0
-        ):
-            raise ValueError(
-                "bch_residual_max must be None or finite and positive, got "
-                f"{self.bch_residual_max!r}"
-            )
 
         # The declared phi step size, read BEFORE the coercion below can zero it: the per-type hidden-bias
         # table (per_type_hidden_bias) inherits it when m_per_type_hidden_bias_lr is None.
@@ -1104,10 +1090,10 @@ class VFE3Config:
             # Omega = exp(phi_i) exp(-phi_j) = I needs a ZERO frame AND no other transport modifier, so
             # a frame-space positional rotation must also be off (else Omega != I and the cell is mislabeled).
             # Comparison-space RoPE rotates the projected routing moments after the maps and leaves Omega = I.
-            if self.pos_rotation != "none" and self.rope_space != "comparison":
+            if self.rope_mode in _FRAME_ROPE_MODES:
                 raise ValueError(
-                    f"gauge_transport='off' requires Omega=I, but pos_rotation={self.pos_rotation!r} folds "
-                    f"a positional rotation into the transport. Set pos_rotation='none'."
+                    f"gauge_transport='off' requires Omega=I, but rope_mode={self.rope_mode!r} folds "
+                    f"a positional rotation into the transport. Set rope_mode='none' or a comparison mode."
                 )
             self.phi_scale    = 0.0
             self.pos_phi      = "none"
@@ -1566,8 +1552,7 @@ class VFE3Config:
 
         from vfe3.model.positional_phi import _POS_PHI
         _require(self.pos_phi, tuple(sorted(_POS_PHI)), "pos_phi")
-        from vfe3.geometry.rope import _POS_ROTATIONS
-        _require(self.pos_rotation, tuple(sorted(_POS_ROTATIONS)), "pos_rotation")
+        _require(self.rope_mode, _ROPE_MODES, "rope_mode")
         # The retained projected routes fold RoPE into the realized frame on the right,
         # V_i = U_i R_i^T (rope_insertion is fixed to "right"). Under U_i -> g_i U_i this gives
         # V_i -> g_i V_i, the same right-factor structure as pos_phi's exp(Y_i), so routing and
@@ -1576,39 +1561,29 @@ class VFE3Config:
         # RoPE's adjacent-pair rotation R is orthogonal but generally NOT in the irrep image
         # rho(SO(N)) inside GL(K), so R Omega R^T leaves the SELECTED structure group
         # (GL(K)-congruence invariance survives).
-        _require(self.rope_space, ("frame", "comparison"), "rope_space")
-        if self.pos_rotation == "rope":
+        if self.rope_mode != "none":
             # p-RoPE rotates floor(p d / 2) pairs of each block (frame space: each irrep block; comparison
             # space: each head's comparison block, also of the head size); none rotated is NoPE, not p-RoPE.
             empty = sorted({d for d in self.head_dims if d >= 2 and int(float(self.rope_fraction) * d // 2) == 0})
             if empty:
                 raise ValueError(f"rope_fraction={self.rope_fraction} rotates no pair of blocks of size {empty}; "
-                                 "raise it or use pos_rotation='none'")
-        if self.pos_rotation == "rope" and self.rope_space == "comparison":
-            problems = []
-            if self.attention_mode != "projected_predictive":
-                problems.append(f"attention_mode={self.attention_mode!r} (requires 'projected_predictive')")
-            # minimal_agent: the rotation is a known record channel R_{j-i}, applied by exact conditioning.
-            if self.rope_on_value:
-                problems.append("rope_on_value=True (the comparison-space rotation is not a frame rotation)")
-            if problems:
-                raise ValueError("rope_space='comparison' rotates the projected routing moments after the learned "
-                                 "maps; got " + "; ".join(problems))
-        _require(self.rope_comparison_covariance, ("full", "rotation_invariant"), "rope_comparison_covariance")
-        if (self.rope_comparison_covariance == "rotation_invariant" and self.pos_rotation == "rope"
-                and self.rope_space == "comparison" and self.predictive_readout == "minimal_agent"):
-            raise ValueError("rope_comparison_covariance='rotation_invariant' projects the kernel router's comparison "
+                                 "raise it or use rope_mode='none'")
+        # minimal_agent: the comparison rotation is a known record channel R_{j-i}, applied by exact conditioning.
+        if self.rope_mode in _COMPARISON_ROPE_MODES and self.attention_mode != "projected_predictive":
+            raise ValueError(f"rope_mode={self.rope_mode!r} rotates the projected routing moments after the learned "
+                             f"maps; got attention_mode={self.attention_mode!r} (requires 'projected_predictive')")
+        if self.rope_mode == "comparison_invariant" and self.predictive_readout == "minimal_agent":
+            raise ValueError("rope_mode='comparison_invariant' projects the kernel router's comparison "
                              "covariance; predictive_readout='minimal_agent' applies the rotation as a record channel "
-                             "by exact conditioning and does not read it (use 'full')")
-        if (self.rope_comparison_covariance == "rotation_invariant" and self.pos_rotation == "rope"
-                and self.rope_space == "comparison"
+                             "by exact conditioning and does not read it (use 'comparison')")
+        if (self.rope_mode == "comparison_invariant"
                 and all(d - 2 * int(float(self.rope_fraction) * d // 2) <= 1 for d in self.head_dims)):
             _warn_diagonal_comparison_covariance(self.head_dims, float(self.rope_fraction), float(self.rope_base),
                                                  self.max_seq_len)
-        if self.pos_rotation == "rope" and self.rope_space == "frame" and not _traits.contains_pair_rotations:
+        if self.rope_mode in _FRAME_ROPE_MODES and not _traits.contains_pair_rotations:
             import warnings
             warnings.warn(
-                f"pos_rotation='rope' with gauge_group={self.gauge_group!r} leaves the structure "
+                f"rope_mode={self.rope_mode!r} with gauge_group={self.gauge_group!r} leaves the structure "
                 f"group: the coordinate-pair rotation R(theta) is generally not in the group's "
                 f"image in GL(K), so R Omega R^T is no longer in the selected group. The "
                 f"GL(K)-congruence divergence invariance still holds (R is orthogonal), so the "
@@ -1623,18 +1598,11 @@ class VFE3Config:
             raise ValueError(
                 "full_cov_kl_precision must be one of ('fp64', 'fp32_escalate', "
                 f"'fp32_escalate_cond'), got {self.full_cov_kl_precision!r}")
-        if self.projected_factor_route not in ("gram", "cholesky_qr2"):
-            raise ValueError(
-                "projected_factor_route must be one of ('gram', 'cholesky_qr2'), "
-                f"got {self.projected_factor_route!r}")
-        _require(self.projected_cov_recovery_precision, ("fp64", "fp32"),
-                 "projected_cov_recovery_precision")
-        for name in ("frame_pair_condition_tol", "projected_gram_condition_tol",
-                     "projected_factor_condition_tol"):
-            value = getattr(self, name)
-            if (isinstance(value, bool) or not isinstance(value, Real)
-                    or not math.isfinite(value) or not 0.0 < value < 1.0):
-                raise ValueError(f"{name} must be a finite number in (0, 1), got {value!r}")
+        _require(self.projected_factorization, _PROJECTED_FACTORIZATIONS, "projected_factorization")
+        value = self.frame_pair_escalation_tol
+        if value is not None and (isinstance(value, bool) or not isinstance(value, Real)
+                                  or not math.isfinite(value) or not 0.0 < value < 1.0):
+            raise ValueError(f"frame_pair_escalation_tol must be None or a finite number in (0, 1), got {value!r}")
         if self.mu_trust_cholesky_rounds < 0:
             raise ValueError(
                 "mu_trust_cholesky_rounds must be a nonnegative int, got "
@@ -1660,7 +1628,6 @@ class VFE3Config:
         # decode / encode
         if not math.isfinite(self.decode_tau) or self.decode_tau <= 0.0:
             raise ValueError(f"decode_tau must be finite and positive, got {self.decode_tau}")
-        _require(self.relational_output_init, ("identity", "depth_scaled"), "relational_output_init")
         from vfe3.model.relational_operators import CONTENT_LINK_CHARTS
         _require(self.content_link_chart, CONTENT_LINK_CHARTS, "content_link_chart")
         from vfe3.model.edge_links import EDGE_MODES
@@ -1699,9 +1666,9 @@ class VFE3Config:
             if self.content_link_edges != "off":
                 agent_problems.append(f"content_link_edges={self.content_link_edges!r} (requires 'off': the edge links "
                                       "multiply the content factors O, which the minimal agent derives)")
-            if self.pos_rotation == "rope" and self.rope_space == "frame" and not self.rope_on_value:
-                agent_problems.append("frame-space pos_rotation='rope' with rope_on_value=False (the tied key is "
-                                      "the content, so both are read in one frame; or use rope_space='comparison')")
+            if self.rope_mode == "frame":
+                agent_problems.append("rope_mode='frame' (the tied key is the content, so both are read in one "
+                                      "frame; use 'frame_value' or 'comparison')")
             if agent_problems:
                 raise ValueError("predictive_readout='minimal_agent' is unsupported here: " + "; ".join(agent_problems))
         for _name in ("learn_attention_temperature", "tie_comparison_maps"):
@@ -1749,8 +1716,7 @@ class VFE3Config:
                 f"decode_mode={self.decode_mode!r} is rank-incompatible with family={self.family!r}: "
                 f"it scores covariance kinds {sorted(decode_registration.covariance_kinds)} but the "
                 f"family is {family_kind!r}. Pair a matching decode_mode (a full/diagonal kernel "
-                f"with a full/diagonal family, or 'family_chunked' which scores both), or "
-                f"select decode_mode='linear'."
+                f"with a full/diagonal family), or select decode_mode='linear'."
             )
         if self.decode_chunk_size < 1:
             raise ValueError(f"decode_chunk_size must be >= 1, got {self.decode_chunk_size}")
@@ -1760,14 +1726,14 @@ class VFE3Config:
         # inactive_fields(), so the default-guarded notice below covers them and untouched
         # defaults stay silent.
         # Capability validation: the fast diagonal/full kernels hardcode the Gaussian KL readout, so a
-        # family without the Gaussian POINTWISE algebra must select the family-consistent
-        # 'family_chunked' decode, which scores logits through the configured family.
+        # family without the Gaussian POINTWISE algebra needs a registered family-consistent decoder,
+        # one that scores logits through the configured family.
         if (self.decode_mode != "linear" and not _family_cls.gaussian_pointwise_algebra
                 and not decode_registration.family_consistent):
             raise ValueError(
                 f"prior-bank decode with family={self.family!r} requires a family-consistent "
-                f"decode_mode ('family_chunked'); decode_mode={self.decode_mode!r} is a fixed "
-                f"Gaussian KL kernel. Set decode_mode='family_chunked' or 'linear'.")
+                f"decode_mode; decode_mode={self.decode_mode!r} is a fixed Gaussian KL kernel. "
+                f"Set decode_mode='linear'.")
         # Full-covariance compute discarded at the decode boundary: linear decode reads out
         # logits = mu_q @ W^T and DISCARDS sigma. The E-step still evolves a (B,N,K,K) covariance (it
         # shapes the mean trajectory, so the result is correct, not wasted) but that covariance never
@@ -1793,12 +1759,12 @@ class VFE3Config:
         # not compose into U_i.
         if (self.encode_mode == "per_token_additive"
                 and (self.pos_phi != "none"
-                     or (self.pos_rotation != "none" and self.rope_space != "comparison"))):
+                     or self.rope_mode in _FRAME_ROPE_MODES)):
             detail = (
                 f"encode_mode='per_token_additive' with pos_phi={self.pos_phi!r}, "
-                f"pos_rotation={self.pos_rotation!r}: the positional frame keeps Omega_ij != I, "
+                f"rope_mode={self.rope_mode!r}: the positional frame keeps Omega_ij != I, "
                 "so the additive encoder is not the Omega = I capacity control; set "
-                "pos_phi='none' and pos_rotation='none'"
+                "pos_phi='none' and rope_mode='none' (or a comparison mode)"
             )
             raise ValueError(detail + " on the projected routes")
         # The additive encoder's learned capacity is the phi table itself, which gauge_transport 'off'
@@ -1954,9 +1920,9 @@ class VFE3Config:
         _require(self.decode_coordinates, ("local", "reference"), "decode_coordinates")
         _require(self.decode_covariance, ("belief", "encoded", "constant"), "decode_covariance")
         frame_requirements = []
-        if self.pos_rotation != "none" and self.rope_space != "comparison":
+        if self.rope_mode in _FRAME_ROPE_MODES:
             frame_requirements.append(
-                f"pos_rotation={self.pos_rotation!r} (RoPE folds a rotation into the routing frame, "
+                f"rope_mode={self.rope_mode!r} (RoPE folds a rotation into the routing frame, "
                 "so the content/decode frame is not U_i)")
         if self.block_coordinates == "reference":
             incompatible = list(frame_requirements)
@@ -2173,10 +2139,7 @@ class VFE3Config:
         The same structural result drives display notices and sweep admission. Consumers
         must not infer activity from whether a warning happens to be visible.
         """
-        from vfe3.model.prior_bank import PriorBank, _DECODERS, _decode_family_chunked
-        from vfe3.divergence import get_functional, renyi
-        from vfe3.families.base import get_family
-        from vfe3.families.gaussian import FullGaussian
+        from vfe3.model.prior_bank import _DECODERS
 
         inactive: dict[str, str] = {}
 
@@ -2224,9 +2187,6 @@ class VFE3Config:
                      "group inherits it")
         if self.grad_clip is None or self.grad_clip == 0:
             mark(("grad_clip_scope",), "only read when grad_clip > 0")
-        if not phi_update_policy.requires_manifold_optimizer:
-            mark(("bch_residual_max",),
-                 "only read by the manifold phi optimizer's group-product gate")
         if self.beta_attention_prior not in ("alibi", "causal_alibi", "causal_alibi_noself"):
             mark(("alibi_slope",), "only read by an alibi attention prior")
         if self.beta_attention_prior != "t5_relative_bias":
@@ -2240,22 +2200,6 @@ class VFE3Config:
         if not phi_update_policy.requires_fisher_statistics:
             mark(("m_phi_fisher_rotation_weight",), "only read by m_phi_update_mode='fisher_group'")
         minimal_agent = self.predictive_readout == "minimal_agent"
-        if minimal_agent:
-            mark(("projected_factor_route",),
-                 "predictive_readout='minimal_agent' passes no source tuples to its factorizations, so the "
-                 "cholesky_qr2 factor route is never selected")
-        elif self.relational_routing == "noisy_query":
-            mark(("projected_factor_route",),
-                 "the noisy-query cost factors per-pair sums G_q + G_k and keeps the Gram route")
-        elif self.relational_routing == "noisy_key":
-            mark(("projected_factor_route",),
-                 "the noisy-key cost factors the broadened key covariance G_k + n_h I, which has no source root, so "
-                 "the Gram route runs")
-        elif (self.pos_rotation == "rope" and self.rope_space == "comparison"
-              and self.rope_comparison_covariance == "rotation_invariant"):
-            mark(("projected_factor_route",),
-                 "rope_comparison_covariance='rotation_invariant' scores the commutant projection of the comparison "
-                 "covariance, which has no source root R_i S U_i^{-1} Sigma_i^{1/2}, so the Gram route factors it")
         if self.decode_mode != "linear" or self.amp_dtype is None:
             mark(("decode_logits_amp",), "only read by decode_mode='linear' with amp_dtype set")
         if self.fp32_matmul_precision == "highest" or self.amp_dtype == "fp16":
@@ -2264,44 +2208,18 @@ class VFE3Config:
         if not self.deterministic:
             mark(("fill_uninitialized_memory",),
                  "torch fills uninitialized memory only under deterministic algorithms")
-        # rotation_invariant scores P(G) on the Gram route whatever projected_factor_route is, so its certificate
-        # reads the Gram tolerance (audit 2026-10-10 round 2, item 32).
-        rotation_invariant = (self.pos_rotation == "rope" and self.rope_space == "comparison"
-                              and self.rope_comparison_covariance == "rotation_invariant")
-        gram_status = (self.projected_factor_route == "gram"
-                       or self.relational_routing in ("noisy_query", "noisy_key") or minimal_agent
-                       or rotation_invariant)
-        if (rotation_invariant and self.attention_mode == "projected_predictive" and not minimal_agent
-                and self.relational_routing == "gaussian_kl" and self.pair_kl_gemm_tol is None
-                and not self.projected_cov_condition_recovery
-                and all(d - 2 * int(float(self.rope_fraction) * d // 2) <= 1 for d in self.head_dims)):
-            # Every head's P(G) is diagonal, so the Gaussian KL takes its diagonal route, which factors nothing
-            # and has no source recovery (audit 2026-10-10 round 2, item 30; gradients/relational.py).
-            mark(("projected_cov_recovery_precision",),
-                 "rope_comparison_covariance='rotation_invariant' with every comparison coordinate but at most one "
-                 "rotating makes P(G) diagonal, scored on the diagonal route with no factorization or source recovery")
-        if not (self.projected_cov_condition_recovery and gram_status):
-            mark(("projected_gram_condition_tol",),
-                 "only read by the Gram-route certificate under projected_cov_condition_recovery=True")
-        if not (self.projected_cov_condition_recovery and not gram_status):
-            mark(("projected_factor_condition_tol",),
-                 "only read by the cholesky_qr2 certificate under projected_cov_condition_recovery=True")
         if (self.attention_mode == "projected_predictive" and not minimal_agent
                 and self.relational_routing == "mean_distance"):
             # The covariance-blind cost reads neither the projected covariances nor the source tuples,
             # so no factorization, certificate or source recovery runs on the routing path (audit
             # 2026-10-08 implementation-engineer#4).
-            mark(("projected_factor_route", "projected_cov_condition_recovery",
-                  "projected_cov_recovery_precision", "projected_gram_condition_tol",
-                  "projected_factor_condition_tol"),
+            mark(("projected_factorization",),
                  "relational_routing='mean_distance' scores ||a_i - b_j||^2 / 2 and factors no projected "
                  "covariance")
         if self.gauge_transport == "off":
-            mark(("frame_pair_fp64_escalation", "frame_pair_condition_tol"),
+            mark(("frame_pair_escalation_tol",),
                  "gauge_transport='off' fixes every frame to the identity (kappa_F = d), so the "
                  "certificate cannot trip")
-        elif not self.frame_pair_fp64_escalation:
-            mark(("frame_pair_condition_tol",), "only read when frame_pair_fp64_escalation=True")
         if self.attention_mode != "projected_predictive":
             mark(("predictive_covariance", "predictive_covariance_floor", "attention_residual",
                   "predictive_covariance_checkpoint"),
@@ -2323,11 +2241,10 @@ class VFE3Config:
         if minimal_agent:
             posterior = ("exact source posterior" if self.minimal_agent_inference == "exact"
                          else "mean-field source posterior")
-            mark(("relational_routing", "content_link_chart", "attention_residual", "relational_output_init",
-                  "kappa_beta"),
+            mark(("relational_routing", "content_link_chart", "attention_residual", "kappa_beta"),
                  f"predictive_readout='minimal_agent' routes by the {posterior} at temperature 1 (no "
                  "routing-cost selector, no kappa_beta temperature) and derives the receiving map and the "
-                 "precision-weighted residual (no content factor O, so no chart, initial output scale or residual flag)")
+                 "precision-weighted residual (no content factor O, so no chart or residual flag)")
             # The readout applies no clamp (relational.py returns before safe_kl_clamp); the remaining
             # readers are the M-step self-coupling, the CG moment energy and the self term of the canonical
             # free-energy diagnostic (audit 2026-10-10 round 2, item 31).
@@ -2337,12 +2254,6 @@ class VFE3Config:
                      "the minimal-agent posterior applies no divergence clamp, decoders use kl_max=inf, and "
                      "no M-step self-coupling or CG energy term is enabled; with diagnose_canonical_free_energy=True "
                      "it would feed that log-step diagnostic only")
-            # Without the certificate the minimal agent pre-replaces failed factors before projected
-            # scoring, so no source recovery (the only reader of the recovery precision) can occur.
-            if not self.projected_cov_condition_recovery:
-                mark(("projected_cov_recovery_precision",),
-                     "the minimal agent recomputes failed layers itself; without "
-                     "projected_cov_condition_recovery no source recovery runs")
             # Every contraction on this combination runs in an autocast-disabled island (the minimal-agent
             # update, the prototype posteriors, LayerNorm, the transport exponentials and the linear
             # decode/CE) or is elementwise, so the forward computes in float32 whatever amp_dtype says.
@@ -2448,13 +2359,8 @@ class VFE3Config:
             mark(("b0", "c0"), "only read by a state_dependent lambda_alpha_mode")
         else:
             mark(("lambda_alpha",), "only read by lambda_alpha_mode='constant'")
-        if self.pos_rotation == "none":
-            mark(("rope_on_value", "rope_base", "rope_space", "rope_fraction"), "only read by pos_rotation='rope'")
-        if not (self.pos_rotation == "rope" and self.rope_space == "comparison"
-                and self.attention_mode == "projected_predictive" and self.predictive_readout == "kernel"
-                and self.relational_routing != "mean_distance"):
-            mark(("rope_comparison_covariance",),
-                 "only read by the kernel router's covariance under pos_rotation='rope' with rope_space='comparison'")
+        if self.rope_mode == "none":
+            mark(("rope_base", "rope_fraction"), "only read by a rope_mode other than 'none'")
         if self.attention_mode == "projected_predictive" and self.predictive_readout != "kernel":
             mark(("routing_kl_max_reference",), "only read by the kernel router (minimal_agent applies no clamp)")
         if not (self.attention_mode == "projected_predictive" and self.predictive_readout == "kernel"
@@ -2483,15 +2389,7 @@ class VFE3Config:
             mark(("decode_ce_checkpoint",), "the selected decoder has no checkpointed chunked CE kernel")
         if self.decode_mode != "expected_likelihood_chunked":
             mark(("expected_likelihood_kernel",), "only read by decode_mode='expected_likelihood_chunked'")
-        canonical_family_dispatch = (
-            self.decode_mode == "family_chunked"
-            and registration.callable is _decode_family_chunked
-            and registration.fused_ce is PriorBank.decode_ce_family_chunked
-            and get_family(self.family) is FullGaussian
-            and get_functional("renyi") is renyi
-            and self.full_cov_kl_precision == "fp32_escalate"
-        )
-        if registration.family_consistent and not canonical_family_dispatch:
+        if registration.family_consistent:
             mark(("decode_av_precision",), "generic family-consistent decoding does not call _decode_av")
 
         # The route-specific rules below were confirmed by tiny launcher-derived CPU probes: loss and
@@ -2556,12 +2454,11 @@ class VFE3Config:
         if self.attention_mode == "projected_predictive" and not self.diagnose_canonical_free_energy:
             mark(("lambda_beta",), "predictive_content weights no belief-coupling block; with "
                  "diagnose_canonical_free_energy=True it would feed that log-step diagnostic only")
-        if self.decode_mode != "family_chunked" and not (
-                self.family == "gaussian_full"
+        if not (self.family == "gaussian_full"
                 and (self.mstep_self_coupling_weight != 0.0 or self.cg_energy_weight != 0.0)):
             mark(("full_cov_kl_precision",),
-                 "projected scoring has its own factor policy; only the family_chunked decoder "
-                 "evaluates the pair divergence")
+                 "projected scoring has its own factor policy; only the full-covariance M-step "
+                 "self-coupling and CG energy evaluate the pair divergence")
         if "e_mu_q_trust" in inactive or self.e_mu_q_trust is None or self.diagonal_covariance:
             mark(("mu_trust_cholesky_rounds",),
                  "only an active mean trust region on a full covariance factors sigma_q")
@@ -2783,8 +2680,8 @@ _RETIRED_INERT_FIELDS = frozenset({
     "full_cov_congruence_certification", "congruence_cond_escalation", "rope_full_gauge",
     # 2026-10-02 transport-exponential unification: the clamp monitor watched the retired clamp;
     # the norm threshold changed only the interior precision of float32-stored exponentials.
-    # (frame_pair_fp64_escalation, retired the same day, is a live opt-in field again since
-    # 2026-10-04; a saved value loads as saved, and a config without it loads the default False.)
+    # (frame_pair_fp64_escalation, retired the same day, was a live opt-in field again from 2026-10-04
+    # until it merged into frame_pair_escalation_tol on 2026-10-12; a config without it loads as off.)
     "transport_clamp_monitor", "exp_fp64_norm_threshold",
     # 2026-10-05 head-mixer removal: the two mixer rates were read only by the retired mixers.
     "m_head_mixer_lr", "m_head_evidence_lr",
@@ -2802,13 +2699,26 @@ _RETIRED_CONDITIONAL_FIELDS = frozenset({
     # 2026-10-05: the Schur head mixer and the PriorBank head-evidence mixer were removed.
     "use_head_mixer", "use_priorbank_head_evidence_mixer",
 })
+# The five projected-factorization fields merged into projected_factorization (2026-10-12).
+_PROJECTED_FACTORIZATION_FIELDS = (
+    "projected_cov_condition_recovery", "projected_factor_route", "projected_cov_recovery_precision",
+    "projected_gram_condition_tol", "projected_factor_condition_tol")
+# The four RoPE selectors merged into rope_mode (2026-10-12).
+_ROPE_FIELDS = ("pos_rotation", "rope_space", "rope_on_value", "rope_comparison_covariance")
+# Hardcoded on 2026-10-12: the paper's identity content init and the 1e-6 group-product residual gate;
+# the frame-pair escalation switch and tolerance merged into frame_pair_escalation_tol.
+_HARDCODED_FIELDS = ("relational_output_init", "bch_residual_max")
+_FRAME_PAIR_FIELDS = ("frame_pair_fp64_escalation", "frame_pair_condition_tol")
 # Every serialized key config_from_serialized migrates or refuses that is not a VFE3Config field.
 RETIRED_CONFIG_KEYS = frozenset(
     set(_RETIRED_PINNED_FIELDS) | _RETIRED_INERT_FIELDS | _RETIRED_CONDITIONAL_FIELDS
     | {"grad_clip_per_role", "exp_fp64_mode", "compile_pair_kernel", "relational_mode",
        "relational_readout_mode", "relational_input_scope", "relational_output_scope",
-       "relational_identity_content"})
-_RETIRED_FAMILIES = frozenset({"gaussian_frame_diagonal"})
+       "relational_identity_content"}
+    | set(_PROJECTED_FACTORIZATION_FIELDS) | set(_ROPE_FIELDS) | set(_HARDCODED_FIELDS)
+    | set(_FRAME_PAIR_FIELDS))
+# laplace_diagonal (retired 2026-10-12) was registered but refused on both projected routes.
+_RETIRED_FAMILIES = frozenset({"gaussian_frame_diagonal", "laplace_diagonal"})
 _MIGRATED_FAMILIES = {"gaussian_diagonal_exact": "gaussian_diagonal"}
 _RETIRED_ENCODE_MODES = frozenset({"canonical_content_gauge", "canonical_content_projected"})
 
@@ -2905,6 +2815,14 @@ def _migrate_retired_fields(
         if family in _RETIRED_FAMILIES:
             refuse("family", family)
         payload["family"] = _MIGRATED_FAMILIES.get(family, family)
+    if payload.get("decode_mode") in ("family", "family_chunked"):
+        # The generic family decode ran only on a Gaussian family at Renyi order 1, where it equals the
+        # fast kernel of the family's rank up to rounding (float64 loss differences of 2e-16 and 0).
+        family = payload.get("family", VFE3Config.family)
+        if family not in _FAMILY_DECODE_MIGRATIONS:
+            refuse("decode_mode", payload["decode_mode"],
+                   f" with family={family!r} (only gaussian_diagonal and gaussian_full migrate)")
+        payload["decode_mode"] = _FAMILY_DECODE_MIGRATIONS[family]
     if "decode_temperature_learned" in payload:
         # Either value loads: decode_log_scale is restored from the weights and then held frozen, so
         # evaluation replays the saved temperature exactly. Resuming the optimizer of a run that
@@ -2946,6 +2864,140 @@ def _migrate_retired_fields(
     gauge_group = payload.get("gauge_group")
     if isinstance(gauge_group, str) and gauge_group in _RETIRED_GAUGE_GROUPS:
         refuse("gauge_group", gauge_group)
+    _migrate_projected_factorization(payload, source=source, refuse=refuse)
+    _migrate_rope_mode(payload, source=source, refuse=refuse)
+    _migrate_hardcoded_fields(payload, source=source, refuse=refuse)
+
+
+def _migrate_hardcoded_fields(
+    payload: dict[str, Any],
+
+    *,
+    source: str,
+    refuse: Callable[..., None],
+) -> None:
+    r"""Drop the fields hardcoded on 2026-10-12 and merge the frame-pair escalation pair.
+
+    ``relational_output_init`` loads when ``"identity"`` or where it was inert (the minimal-agent readout has
+    no content factor O); ``"depth_scaled"`` elsewhere is refused. ``bch_residual_max`` loads when ``None``,
+    when at least 1e-6 (the gate is ``min(1e-6, value)``, so the gate is the same 1e-6), or where no manifold
+    phi optimizer read it; a tighter gate is refused. ``frame_pair_fp64_escalation`` and
+    ``frame_pair_condition_tol`` become ``frame_pair_escalation_tol``: the saved tolerance when the escalation
+    was on, else ``None`` (an absent switch was off).
+    """
+    if "relational_output_init" in payload:
+        value = payload.pop("relational_output_init")
+        inert = (payload.get("attention_mode") == "projected_predictive"
+                 and payload.get("predictive_readout", VFE3Config.predictive_readout) == "minimal_agent")
+        if value not in ("identity", "depth_scaled"):
+            refuse("relational_output_init", value, " (only 'identity' or 'depth_scaled' was valid)")
+        if value != "identity" and not inert:
+            refuse("relational_output_init", value, " (the initial content scale is fixed at the identity)")
+    if "bch_residual_max" in payload:
+        value = payload.pop("bch_residual_max")
+        if value is not None:
+            from vfe3.gauge_optim import get_phi_update_policy
+            try:
+                read = get_phi_update_policy(
+                    payload.get("m_phi_update_mode", VFE3Config.m_phi_update_mode)).requires_manifold_optimizer
+            except (KeyError, ValueError):
+                read = True
+            if (isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value)
+                    or value <= 0.0):
+                refuse("bch_residual_max", value, " (only None or a finite positive gate was valid)")
+            if read and value < 1e-6:
+                refuse("bch_residual_max", value, " (the group-product residual gate is fixed at 1e-6)")
+    present = [name for name in _FRAME_PAIR_FIELDS if name in payload]
+    if present:
+        if "frame_pair_escalation_tol" in payload:
+            raise ValueError(f"serialized config from {source} has conflicting frame-pair escalation "
+                             f"selectors: frame_pair_escalation_tol and {present}")
+        enabled = _normalize_serialized_boolean(
+            payload.pop("frame_pair_fp64_escalation", False), "frame_pair_fp64_escalation", source=source)
+        tol = payload.pop("frame_pair_condition_tol", 1e-4)
+        payload["frame_pair_escalation_tol"] = tol if enabled else None
+
+
+def _migrate_rope_mode(
+    payload: dict[str, Any],
+
+    *,
+    source: str,
+    refuse: Callable[..., None],
+) -> None:
+    r"""Merge ``pos_rotation``, ``rope_space``, ``rope_on_value`` and ``rope_comparison_covariance`` into ``rope_mode``.
+
+    Every combination the old validator admitted maps to exactly one mode: ``pos_rotation="none"`` to ``none``
+    (the other three were inert); frame space to ``frame`` or, with ``rope_on_value``, ``frame_value`` (the
+    comparison covariance was inert); comparison space to ``comparison`` (covariance ``full``) or
+    ``comparison_invariant`` (``rotation_invariant``). Comparison space with ``rope_on_value=True`` was refused
+    and stays refused. An absent ``rope_space`` is the historical frame space (its 2026-10-07 pin row).
+    """
+    present = [name for name in _ROPE_FIELDS if name in payload]
+    if not present:
+        return
+    if "rope_mode" in payload:
+        raise ValueError(f"serialized config from {source} has conflicting RoPE selectors: rope_mode and {present}")
+    rotation = payload.pop("pos_rotation", "none")
+    space = payload.pop("rope_space", "frame")
+    on_value = _normalize_serialized_boolean(payload.pop("rope_on_value", False), "rope_on_value", source=source)
+    covariance = payload.pop("rope_comparison_covariance", "full")
+    for name, value, valid in (("pos_rotation", rotation, ("none", "rope")),
+                               ("rope_space", space, ("frame", "comparison")),
+                               ("rope_comparison_covariance", covariance, ("full", "rotation_invariant"))):
+        if value not in valid:
+            refuse(name, value, f" (only {valid} was valid)")
+    if rotation == "none":
+        payload["rope_mode"] = "none"
+    elif space == "frame":
+        payload["rope_mode"] = "frame_value" if on_value else "frame"
+    elif on_value:
+        refuse("rope_on_value", True, " with rope_space='comparison' (never a valid combination)")
+    else:
+        payload["rope_mode"] = "comparison_invariant" if covariance == "rotation_invariant" else "comparison"
+
+
+def _migrate_projected_factorization(
+    payload: dict[str, Any],
+
+    *,
+    source: str,
+    refuse: Callable[..., None],
+) -> None:
+    r"""Merge the five projected-factorization fields into ``projected_factorization`` (2026-10-12).
+
+    ``(recovery, route)`` maps to ``gram`` for ``(False, gram)``, ``gram_certified`` for ``(True, gram)``
+    and ``cholesky_qr2_certified`` for either ``cholesky_qr2`` tuple; an uncertified CholeskyQR2 run now
+    also rebuilds the entries that fail the factor certificate. The tolerances are module constants at
+    their defaults (1e-4 Gram, 3e-4 factor); a non-default tolerance under recovery is refused, and any
+    tolerance without recovery was inert. The recovery precision is fixed at fp32 (shifted CholeskyQR3
+    with a float64 fallback); a saved fp64 precision loads and replays a recovery with rounding-level
+    differences, as the 2026-10-02 numerical-policy hardcoding did.
+    """
+    present = [name for name in _PROJECTED_FACTORIZATION_FIELDS if name in payload]
+    if not present:
+        return
+    if "projected_factorization" in payload:
+        raise ValueError(f"serialized config from {source} has conflicting projected-factorization "
+                         f"selectors: projected_factorization and {present}")
+    recovery = _normalize_serialized_boolean(
+        payload.pop("projected_cov_condition_recovery", False), "projected_cov_condition_recovery",
+        source=source)
+    route = payload.pop("projected_factor_route", "gram")
+    precision = payload.pop("projected_cov_recovery_precision", "fp64")
+    tolerances = {name: payload.pop(name, default) for name, default in (
+        ("projected_gram_condition_tol", 1e-4), ("projected_factor_condition_tol", 3e-4))}
+    if route not in ("gram", "cholesky_qr2"):
+        refuse("projected_factor_route", route, " (only 'gram' or 'cholesky_qr2' was valid)")
+    if precision not in ("fp64", "fp32"):
+        refuse("projected_cov_recovery_precision", precision, " (only 'fp64' or 'fp32' was valid)")
+    if recovery:
+        for name, default in (("projected_gram_condition_tol", 1e-4), ("projected_factor_condition_tol", 3e-4)):
+            if not _same_serialized_value(tolerances[name], default):
+                refuse(name, tolerances[name], f" (the certificate tolerance is fixed at {default!r})")
+    payload["projected_factorization"] = (
+        "cholesky_qr2_certified" if route == "cholesky_qr2"
+        else "gram_certified" if recovery else "gram")
 
 
 # Introduction-time values of fields whose default was later flipped, applied by config_from_serialized
@@ -2953,16 +3005,16 @@ def _migrate_retired_fields(
 #   content_link_chart                "affine" at 6e54aee (2026-10-03), now "exponential"
 #   predictive_covariance             "passthrough" at 8b398f3 (2026-09-27), now "moment_matched"
 #   m_decode_mu_lr, m_decode_sigma_lr None (inherit) at d04dfc4 (2026-09-30), now 0.025 / 0.001
-#   projected_cov_recovery_precision  "fp64" at fed4164 (2026-10-04), now "fp32"
-#   rope_space                        "frame" from eaa3a21 (2026-10-07)
+#   projected_cov_recovery_precision  "fp64" at fed4164 (2026-10-04); merged into projected_factorization
+#                                     on 2026-10-12, whose migration treats an absent precision as fp64
+#   rope_space                        "frame" from eaa3a21 (2026-10-07); merged into rope_mode on 2026-10-12,
+#                                     whose migration treats an absent rope_space as "frame"
 #   kl_max                            100.0 until 2026-10-12, now None (8 * embed_dim)
 _HISTORICAL_DEFAULT_PINS: dict[str, Any] = {
     "content_link_chart":               "affine",
     "predictive_covariance":            "passthrough",
     "m_decode_mu_lr":                   None,
     "m_decode_sigma_lr":                None,
-    "projected_cov_recovery_precision": "fp64",
-    "rope_space":                       "frame",
     "kl_max":                           100.0,
 }
 

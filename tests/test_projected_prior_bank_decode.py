@@ -60,12 +60,6 @@ def test_projected_predictive_admits_full_chunked_and_unpinned_sigma_flag() -> N
     assert cfg.attention_mode == "projected_predictive"
 
 
-def test_projected_predictive_admits_family_chunked() -> None:
-    """family_chunked is admitted alongside full_chunked for a full-covariance family."""
-    cfg = test_config(**_projected_surface(decode_mode="family_chunked"))
-    assert cfg.decode_mode == "family_chunked"
-
-
 def test_projected_predictive_admits_diagonal_chunked_for_diagonal_family() -> None:
     """diagonal_chunked is admitted when paired with a diagonal-covariance family."""
     cfg = test_config(**_projected_surface(
@@ -104,9 +98,9 @@ def test_retired_attention_does_not_construct(mode: str) -> None:
         tiny_config(attention_mode=mode)
 
 
-def test_projected_still_rejects_non_gaussian_family() -> None:
-    """The Gaussian-family admission on the projected route is retained."""
-    with pytest.raises(ValueError, match="unsupported projected_filtering configuration"):
+def test_retired_laplace_family_is_not_registered() -> None:
+    """laplace_diagonal (refused on both projected routes) was retired 2026-10-12."""
+    with pytest.raises(ValueError, match="laplace_diagonal"):
         test_config(**_projected_surface(family="laplace_diagonal"))
 
 

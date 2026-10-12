@@ -456,7 +456,7 @@ def main() -> None:
     logger = logging.getLogger("train_baseline")
     base = load_base_config(BASE)
     check_base_data(BASE, dataset=DATASET, seeds=SEEDS, data_seed=DATA_SEED, max_tokens=MAX_TOKENS, logger=logger)
-    fallback = {} if getattr(base, "pos_rotation", "none") == "rope" else dict(POSITION_FALLBACK)
+    fallback = {} if getattr(base, "rope_mode", "none") != "none" else dict(POSITION_FALLBACK)
     cfg = BaselineConfig.matched_to(base, per_type_table=PER_TYPE_TABLE, **{**fallback, **OVERRIDES})
     logger.info("baseline position: prior=%s, pos_rotation=%s (rope_base %g)",
                 cfg.beta_attention_prior, cfg.pos_rotation, cfg.rope_base)

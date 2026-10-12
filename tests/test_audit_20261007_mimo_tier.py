@@ -80,10 +80,10 @@ def test_closed_form_receiver_keeps_self_coupling_live_at_one_step() -> None:
     assert "lambda_alpha_mode" not in closed
 
 
-def test_unread_prior_cg_and_bch_knobs_are_reported_inert() -> None:
+def test_unread_prior_and_cg_knobs_are_reported_inert() -> None:
     inactive = _cfg(beta_attention_prior="causal").inactive_fields()
     for name in ("alibi_slope", "t5_num_buckets", "t5_max_distance", "t5_learnable_bias",
-                 "cg_covariance_mode", "cg_covariance_floor", "cg_energy_weight", "bch_residual_max"):
+                 "cg_covariance_mode", "cg_covariance_floor", "cg_energy_weight"):
         assert name in inactive, name
     assert "alibi_slope" not in _cfg(beta_attention_prior="causal_alibi").inactive_fields()
 

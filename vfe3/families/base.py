@@ -122,8 +122,8 @@ class BeliefParams(ABC):
     # the Gaussian one of its ``cov_kind``, so the Gaussian closed forms elsewhere (the moment-matched
     # barycenter r-update, the fixed alpha=1 KL decode kernels) are exact for it. A family that differs
     # only in its transport/coupling seams inherits True from its Gaussian base and is served correctly
-    # by both; a genuinely non-Gaussian family (laplace_diagonal) leaves it False and is routed to the
-    # family-consistent alternatives.
+    # by both; a genuinely non-Gaussian family leaves it False and is routed to the family-consistent
+    # alternatives.
     gaussian_pointwise_algebra: ClassVar[bool] = False
 
     # Whether the coupling energy is defined only at the KL point (divergence_family='renyi',

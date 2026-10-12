@@ -4,11 +4,11 @@ Realizes the manuscript's rotary positional structure (GL(K)_attention.tex, "Ide
 rotary positional structure"): within each irrep block of size d, coordinate pairs (2k, 2k+1)
 rotate by theta_{n,k} = n * base^{-2k/d}. The executable laws are:
 
-- rope_space='frame': RIGHT insertion, V_i = U_i R(theta_i)^T, so transport composes as
+- rope_mode 'frame' / 'frame_value': RIGHT insertion, V_i = U_i R(theta_i)^T, so transport composes as
   Omega_ij = U_i R(theta_i)^T R(theta_j) U_j^{-1} = U_i R(theta_j - theta_i) U_j^{-1} (transport.py; config pins ``rope_insertion='right'``).
   The retired left insertion R(theta_i) Omega_ij R(theta_j)^T is gauge-breaking and survives only as
   a test reference.
-- rope_space='comparison': the rotation acts only on the projected routing moments,
+- rope_mode 'comparison' / 'comparison_invariant': the rotation acts only on the projected routing moments,
   a_i -> R(theta_i) a_i and G_i -> R(theta_i) G_i R(theta_i)^T (gradients/relational.py), never on a
   frame.
 
@@ -17,7 +17,7 @@ SO(d) (block_glk heads; the l1 defining rep of SO(3)). On higher so_n irrep bloc
 coordinate-pair rotation is a generic SO(d) element OUTSIDE the irrep image rho(SO(N)) (config.py
 warns at build); the code never assumes R in rho(G). Block-diagonal on irrep_dims so R is
 orthogonal (the GL(K)-congruence divergence invariance and the block-diagonal exp fast path are
-unaffected). Parameter-free; default-off via the ``pos_rotation`` registry ("none").
+unaffected). Parameter-free; default-off (config ``rope_mode="none"``).
 """
 
 from typing import Callable, Dict, List, Optional

@@ -352,7 +352,7 @@ def test_euler_zero_rates_freeze_their_components() -> None:
 
 @pytest.mark.parametrize("mode", ["projected_predictive", "projected_gradient"])
 def test_diagnostics_run_under_rope(mode: str) -> None:
-    overrides = dict(pos_rotation="rope")
+    overrides = dict(rope_mode="frame_value")
     if mode == "projected_predictive":
         cfg = test_config(attention_mode=mode, **overrides)
     else:

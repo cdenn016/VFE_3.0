@@ -1,9 +1,9 @@
 r"""Numeric-policy toggles exposed on 2026-10-04.
 
 The frame-pair float64 escalation is opt-in again (``tests/test_frame_pair_escalation_20260923.py``).
-This file covers the projected source-recovery precision ``projected_cov_recovery_precision``, the
-certificate tolerances ``projected_gram_condition_tol`` / ``projected_factor_condition_tol``, and the
-bit-identical ``predictive_covariance_checkpoint``. The recovery fixture is the rank-ill source of
+This file covers the projected source-recovery precision and the certificate tolerances (module
+policies that the merged ``projected_factorization`` fixes at fp32, 1e-4 and 3e-4 since 2026-10-12),
+and the bit-identical ``predictive_covariance_checkpoint``. The recovery fixture is the rank-ill source of
 ``tests/test_relational_source_factorization.py``: S has singular values (1, 0.5, 1e-4), so
 kappa(X) = 1e4 and the rounded float32 Gram G = X X^T (kappa 1e8) loses SPD.
 """
@@ -83,36 +83,29 @@ def _reference(device: torch.device, role: str, full: bool) -> torch.Tensor:
 
 def test_fields_validate_and_report_inactivity() -> None:
     cfg = test_config()
-    assert cfg.projected_cov_recovery_precision == "fp64"
+    assert cfg.projected_factorization == "gram"
     assert cfg.predictive_covariance_checkpoint is False
-    with pytest.raises(ValueError, match="projected_cov_recovery_precision"):
-        test_config(projected_cov_recovery_precision="fp16")
+    with pytest.raises(ValueError, match="projected_factorization"):
+        test_config(projected_factorization="cholesky_qr2")
     with pytest.raises(ValueError, match="predictive_covariance_checkpoint"):
         test_config(predictive_covariance_checkpoint=1)
-    for name in ("projected_gram_condition_tol", "projected_factor_condition_tol"):
-        for bad in (0.0, 1.0, -1e-4, float("inf"), float("nan"), True):
-            with pytest.raises(ValueError, match=name):
-                test_config(**{name: bad})
-    off = test_config(projected_cov_condition_recovery=False).inactive_fields()
-    assert {"projected_gram_condition_tol", "projected_factor_condition_tol"} <= set(off)
-    assert "projected_cov_recovery_precision" not in off     # failures recover on every route
-    gram = test_config(projected_cov_condition_recovery=True, projected_factor_route="gram").inactive_fields()
-    assert "projected_gram_condition_tol" not in gram and "projected_factor_condition_tol" in gram
-    qr2 = test_config(projected_cov_condition_recovery=True,
-                      projected_factor_route="cholesky_qr2").inactive_fields()
-    assert "projected_factor_condition_tol" not in qr2 and "projected_gram_condition_tol" in qr2
     assert "predictive_covariance_checkpoint" in test_config(
         predictive_covariance="passthrough").inactive_fields()
     assert "predictive_covariance_checkpoint" not in tiny_config(
         attention_mode="projected_predictive", predictive_covariance="moment_matched").inactive_fields()
 
 
-@pytest.mark.parametrize("precision", ["fp64", "fp32"])
-def test_model_installs_the_scorer_policies(precision: str) -> None:
-    VFEModel(tiny_config(projected_cov_recovery_precision=precision, projected_gram_condition_tol=2e-4,
-                         projected_factor_condition_tol=5e-4))
-    assert scoring.projected_recovery_precision() == precision
-    assert scoring._GRAM_CONDITION_TOL == 2e-4 and scoring._FACTOR_CONDITION_TOL == 5e-4
+@pytest.mark.parametrize(("factorization", "recovery", "route"), [
+    ("gram", False, "gram"), ("gram_certified", True, "gram"), ("cholesky_qr2_certified", True, "cholesky_qr2")])
+def test_model_installs_the_scorer_policies(factorization: str, recovery: bool, route: str) -> None:
+    set_projected_recovery_precision("fp64")
+    set_projected_gram_condition_tol(2e-4)
+    set_projected_factor_condition_tol(5e-4)
+    VFEModel(tiny_config(projected_factorization=factorization))
+    assert scoring.projected_condition_recovery() is recovery
+    assert scoring.projected_factor_route() == route
+    assert scoring.projected_recovery_precision() == "fp32"
+    assert scoring._GRAM_CONDITION_TOL == 1e-4 and scoring._FACTOR_CONDITION_TOL == 3e-4
     for setter in (set_projected_gram_condition_tol, set_projected_factor_condition_tol):
         with pytest.raises(ValueError, match="condition tolerance"):
             setter(0.0)

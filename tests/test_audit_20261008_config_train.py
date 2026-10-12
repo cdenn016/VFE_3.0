@@ -52,8 +52,7 @@ def _cfg(**overrides: Any) -> VFE3Config:
 
 
 def _rope(**overrides: Any) -> VFE3Config:
-    return _cfg(pos_rotation="rope", rope_space="comparison", rope_on_value=False, rope_base=100.0,
-                **overrides)
+    return _cfg(rope_mode="comparison", rope_base=100.0, **overrides)
 
 
 def _loaders(cfg: VFE3Config) -> Tuple[DataLoader, DataLoader, DataLoader]:
@@ -81,20 +80,16 @@ def test_pos_phi_scale_and_passthrough_mlp_floor_are_inactive() -> None:
     assert "pos_phi_scale" not in live
 
 
-def test_mean_distance_routing_marks_every_projected_factor_knob_inactive() -> None:
-    knobs = ("projected_factor_route", "projected_cov_condition_recovery", "projected_cov_recovery_precision",
-             "projected_gram_condition_tol", "projected_factor_condition_tol")
-    inactive = _cfg(relational_routing="mean_distance", projected_cov_condition_recovery=True).inactive_fields()
-    assert all(knob in inactive for knob in knobs)
-    assert "projected_cov_condition_recovery" not in _cfg(projected_cov_condition_recovery=True).inactive_fields()
+def test_mean_distance_routing_marks_the_projected_factorization_inactive() -> None:
+    inactive = _cfg(relational_routing="mean_distance", projected_factorization="gram_certified").inactive_fields()
+    assert "projected_factorization" in inactive
+    assert "projected_factorization" not in _cfg(projected_factorization="gram_certified").inactive_fields()
 
 
 def test_comparison_rope_keeps_the_factor_route_live() -> None:
     # P2-6 is moot after P1-2: the rotated route keeps its source tuples, so cholesky_qr2 runs there.
-    inactive = _rope(projected_factor_route="cholesky_qr2", projected_cov_condition_recovery=True).inactive_fields()
-    assert "projected_factor_route" not in inactive
-    assert "projected_factor_condition_tol" not in inactive
-    assert "projected_gram_condition_tol" in inactive
+    inactive = _rope(projected_factorization="cholesky_qr2_certified").inactive_fields()
+    assert "projected_factorization" not in inactive
 
 
 def test_block_coordinates_mark_no_longer_claims_bit_identity() -> None:
@@ -116,15 +111,13 @@ def test_additive_encoder_requires_trainable_frames(transport: str) -> None:
 
 def test_reload_pins_introduction_time_values_of_flipped_defaults() -> None:
     payload = serialize_config(_cfg())
-    for name in ("content_link_chart", "predictive_covariance", "m_decode_mu_lr", "m_decode_sigma_lr",
-                 "projected_cov_recovery_precision"):
+    for name in ("content_link_chart", "predictive_covariance", "m_decode_mu_lr", "m_decode_sigma_lr"):
         payload.pop(name)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         restored = config_from_serialized(payload, source="pre-flip record")
     assert (restored.content_link_chart, restored.predictive_covariance) == ("affine", "passthrough")
     assert restored.m_decode_mu_lr is None and restored.m_decode_sigma_lr is None
-    assert restored.projected_cov_recovery_precision == "fp64"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         current = config_from_serialized(serialize_config(_cfg()), source="current record")
@@ -174,9 +167,9 @@ def test_package_identity_covers_the_baseline_and_paper_arm_launchers(monkeypatc
 def test_pure_path_report_labels_comparison_rope_and_records_its_settings() -> None:
     toggles = ra._pure_path_report(_rope(rope_fraction=1), [])["config_toggles"]
     assert toggles["rope_pair_energy_exactness"] == "comparison_space_rotated_projected_moments"
-    assert (toggles["rope_space"], toggles["rope_fraction"], toggles["rope_base"]) == ("comparison", 1.0, 100.0)
+    assert (toggles["rope_mode"], toggles["rope_fraction"], toggles["rope_base"]) == ("comparison", 1.0, 100.0)
     plain = ra._pure_path_report(_cfg(), [])["config_toggles"]
-    assert plain["rope_pair_energy_exactness"] == "not_applicable" and plain["rope_space"] is None
+    assert plain["rope_pair_energy_exactness"] == "not_applicable" and plain["rope_mode"] == "none"
 
 
 def test_git_probe_carries_the_system_line_ending_policy(monkeypatch: pytest.MonkeyPatch) -> None:

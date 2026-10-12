@@ -12,7 +12,7 @@ from vfe3.config import config_from_serialized, serialize_config
 from vfe3.model.model import VFEModel
 from vfe3.model.prior_bank import PriorBank
 
-MODES = ("diagonal_chunked", "full_chunked", "expected_likelihood_chunked", "family_chunked")
+MODES = ("diagonal_chunked", "full_chunked", "expected_likelihood_chunked")
 
 
 def _bank(mode: str, **kwargs: object) -> PriorBank:
@@ -29,7 +29,7 @@ def _query(mode: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return mu_q, sigma_q, torch.tensor([[0, 4, 6]])
 
 
-@pytest.mark.parametrize("mode", MODES[:3] + ("linear",))
+@pytest.mark.parametrize("mode", MODES + ("linear",))
 def test_aggregate_recomputation_requires_explicit_policy(mode: str) -> None:
     pb = _bank(mode, decode_ce_checkpoint="auto")
     mu_q, sigma_q, targets = _query(mode)
@@ -86,39 +86,6 @@ def test_config_roundtrip_reaches_model_and_matched_baseline() -> None:
     baseline = BaselineConfig(vocab_size=7, embed_dim=2, n_heads=1, n_layers=1,
                               max_seq_len=3, batch_size=1, decode_ce_checkpoint="auto_aggregate")
     assert baseline.decode_ce_checkpoint == "auto_aggregate"
-
-
-@pytest.mark.parametrize("policy", ["auto", "auto_aggregate"])
-def test_generic_family_keeps_aggregate_policy_and_excluded_row_gradients(policy: str) -> None:
-    pb = _bank("full_chunked", decode_ce_checkpoint=policy)
-    pb.decode_mode = "family_chunked"
-    pb.renyi_order = 0.5  # Exercise the generic full-family route rather than the analytic delegate.
-    mu_q, sigma_q, targets = _query("full_chunked")
-    with torch.no_grad():
-        sigma_q[:, 1] = -torch.eye(2)
-    with patch.object(bank_module, "DECODE_CE_CHECKPOINT_AUTO_BYTES", 100), \
-         patch.object(bank_module._checkpoint, "checkpoint", wraps=bank_module._checkpoint.checkpoint) as checkpoint:
-        result = pb.decode_ce_family_chunked(mu_q, sigma_q, targets, return_stats=True)
-    assert checkpoint.call_count == 2
-    assert int(result.excluded_tokens) == 1
-    result.ce.backward()
-    assert torch.isfinite(result.ce)
-    assert torch.isfinite(mu_q.grad).all()
-    assert torch.isfinite(sigma_q.grad).all()
-    assert torch.equal(sigma_q.grad[:, 1], torch.zeros_like(sigma_q.grad[:, 1]))
-
-
-@pytest.mark.parametrize("policy", ["auto", "auto_aggregate"])
-def test_canonical_full_family_delegates_checkpoint_policy(policy: str) -> None:
-    pb = _bank("full_chunked", decode_ce_checkpoint=policy)
-    pb.decode_mode = "family_chunked"
-    mu_q, sigma_q, targets = _query("full_chunked")
-    with patch.object(bank_module, "DECODE_CE_CHECKPOINT_AUTO_BYTES", 100), \
-         patch.object(bank_module._checkpoint, "checkpoint", wraps=bank_module._checkpoint.checkpoint) as checkpoint:
-        result = pb.decode_ce_family_chunked(mu_q, sigma_q, targets)
-    assert checkpoint.call_count == (2 if policy == "auto_aggregate" else 0)
-    result.backward()
-    assert torch.isfinite(mu_q.grad).all()
 
 
 @pytest.mark.parametrize("mode", MODES)

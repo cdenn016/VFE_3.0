@@ -133,7 +133,7 @@ def test_arm_labels_and_groups_are_the_manuscript_rows() -> None:
 def test_load_base_reports_loader_pins_and_records_legacy_fields(tmp_path: Path) -> None:
     from vfe3.config import _HISTORICAL_DEFAULT_PINS
 
-    pin = "projected_cov_recovery_precision"
+    pin = "content_link_chart"
     run = _write_base(tmp_path, _tiny_cfg(), extra={"mean_only": False}, drop=(pin, "rope_fraction"))
     base = pa.load_base("tiny", run)
     # The loader (config_from_serialized) applies the historical pin; load_base reports it.
@@ -144,8 +144,8 @@ def test_load_base_reports_loader_pins_and_records_legacy_fields(tmp_path: Path)
     assert base.tokens_per_s == pytest.approx(100 * 2 * 4 / 20.0)
     # A recorded value wins over the pin and is not reported as pinned.
     other = tmp_path / "other"
-    recorded = pa.load_base("tiny", _write_base(other, _tiny_cfg(**{pin: "fp32"})))
-    assert recorded.pinned == {} and getattr(recorded.cfg, pin) == "fp32"
+    recorded = pa.load_base("tiny", _write_base(other, _tiny_cfg(**{pin: "exponential"})))
+    assert recorded.pinned == {} and getattr(recorded.cfg, pin) == "exponential"
 
 
 def test_one_epoch_budget_gives_twenty_evaluations_and_one_checkpoint(monkeypatch: pytest.MonkeyPatch) -> None:

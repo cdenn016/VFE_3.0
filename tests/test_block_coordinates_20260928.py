@@ -339,7 +339,7 @@ def test_capture_keeps_local_coordinates() -> None:
 @pytest.mark.parametrize("over, message", [
     (dict(attention_mode="transported", attention_residual=False), "retired"),
     (dict(attention_mode="projected_conditional", attention_residual=False, n_layers=1), "retired"),
-    (dict(pos_rotation="rope"), "pos_rotation"),
+    (dict(rope_mode="frame_value"), "rope_mode"),
     (dict(family="gaussian_frame_diagonal", decode_mode="diagonal_chunked"), "gaussian_frame_diagonal"),
     (dict(block_mlp_mode="canonical_frame"), "block_mlp_mode"),
     (dict(block_mlp_mode="gauge_gate", family="gaussian_full", decode_mode="full_chunked"), "block_mlp_mode"),

@@ -200,7 +200,7 @@ def test_routing_decomposition_refuses_comparison_rope() -> None:
     """P1-3: M4 does not decompose the unrotated router of a comparison-RoPE model."""
     from vfe3.posthoc.routing import not_applicable_reason
 
-    assert "rope_space='comparison'" in not_applicable_reason(VFEModel(_rope_cfg("comparison")))
+    assert "comparison rope_mode" in not_applicable_reason(VFEModel(_rope_cfg("comparison")))
     assert not_applicable_reason(VFEModel(_rope_cfg("frame"))) is None
 
 

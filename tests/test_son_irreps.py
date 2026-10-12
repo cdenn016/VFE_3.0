@@ -170,7 +170,7 @@ _SON_ROUTES = {
     "predictive_diagonal": dict(),
     "predictive_full": dict(family="gaussian_full", decode_mode="full_chunked"),
     "predictive_full_rope": dict(family="gaussian_full", decode_mode="full_chunked",
-                                 pos_rotation="rope", rope_on_value=False, n_layers=2),
+                                 rope_mode="frame", n_layers=2),
     "gradient_diagonal": dict(attention_mode="projected_gradient",
                               predictive_covariance="passthrough", attention_residual=False),
     "gradient_full_closed_form": dict(attention_mode="projected_gradient",

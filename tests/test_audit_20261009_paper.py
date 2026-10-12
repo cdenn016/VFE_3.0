@@ -169,7 +169,7 @@ def test_comparator_follows_the_positional_scheme_and_the_alibi_duplicate_is_ina
     from vfe3.baseline import BaselineConfig
 
     alibi = pa.load_base("alibi", _write_base(tmp_path / "a", _tiny_cfg(beta_attention_prior="causal_alibi",
-                                                                         pos_rotation="none")))
+                                                                         rope_mode="none")))
     assert pa.decision_comparator(alibi.cfg) == pa.DECISION_COMPARATOR_ALIBI == pt.DECISION_COMPARATOR
     plans = {p.label: p for p in pa.build_plan(alibi, budget="base_protocol", seeds=[(1, 1)], counts=False,
                                                labels=list(pa.TIER_A), baseline_overrides={"lr": 3e-3})}
@@ -187,8 +187,8 @@ def test_comparator_follows_the_positional_scheme_and_the_alibi_duplicate_is_ina
     assert manifest["decision"]["comparator"] == pa.DECISION_COMPARATOR_ALIBI
     assert resolve_manifest(json.loads(json.dumps(manifest))).decision["comparator"] == pa.DECISION_COMPARATOR_ALIBI
 
-    for name, over in (("rope", {"beta_attention_prior": "causal_alibi", "pos_rotation": "rope"}),
-                       ("causal", {"beta_attention_prior": "causal", "pos_rotation": "none"})):
+    for name, over in (("rope", {"beta_attention_prior": "causal_alibi", "rope_mode": "frame_value"}),
+                       ("causal", {"beta_attention_prior": "causal", "rope_mode": "none"})):
         base = pa.load_base(name, _write_base(tmp_path / name, _tiny_cfg(**over)))
         assert pa.decision_comparator(base.cfg) == pa.DECISION_COMPARATOR_MATCHED
         plan = pa.build_plan(base, budget="base_protocol", seeds=[(1, 1)], counts=False,

@@ -337,7 +337,7 @@ class GroupTraits:
     heads are the ``n_heads`` equal blocks of ``embed_dim``. ``tyings`` are the supported
     ``gauge_tying`` values and ``native_tying`` the one an unset field resolves to.
     ``contains_pair_rotations`` says whether every adjacent-pair rotation of a head block lies in
-    the group, which is what keeps ``pos_rotation='rope'`` inside it. ``min_head_dim`` is the
+    the group, which is what keeps frame-space RoPE inside it. ``min_head_dim`` is the
     smallest head block the builder accepts, and every head block must be a multiple of
     ``head_dim_multiple``.
     """

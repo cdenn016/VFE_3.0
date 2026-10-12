@@ -95,7 +95,7 @@ config: Dict[str, Any] = dict(
     decode_bias                       = True,     # only for decode_mode='linear'
 
 
-    decode_mode                       = 'linear',  # prior-bank: diagonal_chunked/full_chunked/expected_likelihood_chunked/family_chunked
+    decode_mode                       = 'linear',  # prior-bank: diagonal_chunked/full_chunked/expected_likelihood_chunked
     encode_mode                       = "per_token",   #"per_token_additive" is ~1.5x faster at K=80 currently unablated
     decode_chunk_size                 = 8192,
     decode_tau                        = 0.008,  #prior_bank = True temperature
@@ -153,15 +153,14 @@ config: Dict[str, Any] = dict(
     ####################################
     #       Positional Encoding
     #    BCH gauge-frame PE (pos_phi)
-    #     gauge-RoPE (pos_rotation)
+    #     gauge-RoPE (rope_mode)
     ####################################
 
     pos_phi                   = "learned",           # "none" (pure path) | "learned" | "frozen"
-    pos_rotation              = "none",              # "none" | "rope"
+    rope_mode                 = "none",              # "none" | "frame" | "frame_value" | "comparison" | "comparison_invariant"
 
     rope_base                 = 100.0,               # rotary frequency base
 
-    rope_on_value             = False,
 
 
     ######################################

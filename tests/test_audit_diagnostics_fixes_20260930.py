@@ -24,7 +24,7 @@ def _cfg(**overrides: object) -> VFE3Config:
         family="gaussian_full", gauge_group="block_glk",
         attention_mode="projected_predictive", predictive_covariance="moment_matched",
         decode_mode="full_chunked", decode_coordinates="reference",
-        pos_phi="none", pos_rotation="none", use_block_mlp=False,
+        pos_phi="none", rope_mode="none", use_block_mlp=False,
         norm_type_block="none", norm_type_final="none", layernorm_affine=False,
         sigma_max=None, phi_mstep_max_matrix_norm=None, transport_chart_max_norm=12.0,
         generate_embedding_figures=False,

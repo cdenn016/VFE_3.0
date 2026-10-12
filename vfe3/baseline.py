@@ -27,7 +27,7 @@ under ``pos_rotation='rope'`` the per-head rotary map :math:`R_i = \bigoplus_h R
 :func:`vfe3.geometry.rope.build_rope_rotation` (pairs :math:`(2k, 2k+1)` of each head rotate by
 :math:`i\,b^{-2k/d}`, base :math:`b` = ``rope_base``), so that
 :math:`(R_i q)^\top R_j k = q^\top R_{j-i} k` depends on position only through :math:`j - i`. These are
-the VFE's comparison-space RoPE frequencies (``rope_space='comparison'``), which rotate the projected
+the VFE's comparison-space RoPE frequencies (a comparison ``rope_mode``), which rotate the projected
 query and key moments of each head by the same :math:`R_i`. Exact (erf) GELU, no
 dropout and bias-free attention maps. The per-type read map :math:`A_v` exists only with
 ``per_type_table='block_read'``; it is one ``(V, H, d, d)`` table shared by every layer, applied to the
@@ -426,8 +426,8 @@ class BaselineConfig:
         budget, warmup and learning-rate floors, gradient clip, its scope and accumulation, the training-window
         origin (``train_window_offset``), precision, seed,
         cadence, the attention log-prior and its slope, and the unigram decode prior
-        (:data:`MATCHED_FIELDS`). A base with ``pos_rotation='rope'`` gives the arm rotary query/key
-        positions at the base's ``rope_base``; for ``rope_space='comparison'`` this is the rotation the base
+        (:data:`MATCHED_FIELDS`). A base with a ``rope_mode`` other than ``'none'`` gives the arm rotary query/key
+        positions at the base's ``rope_base``; for a comparison ``rope_mode`` this is the rotation the base
         applies to its projected routing moments, while frame-space RoPE (absolute, folded into the frame)
         has no exact dense counterpart and is matched by the same relative rotation. The MLP width is the base's ``block_mlp_expansion`` times :math:`K`
         (the template router's template count :math:`eK` when the base uses one). The decode is the
@@ -484,7 +484,9 @@ class BaselineConfig:
         derived: Dict[str, Any] = {name: values[name] for name in MATCHED_FIELDS}
         derived["mlp_expansion"] = int(values["block_mlp_expansion"])
         derived["decode_bias"] = (bool(values["decode_bias"]) if values["decode_mode"] == "linear" else True)
-        derived["pos_rotation"] = "rope" if values.get("pos_rotation") == "rope" else "none"
+        # rope_mode, or the pos_rotation of a base saved before the 2026-10-12 merge.
+        rope_active = values.get("rope_mode", "none") != "none" or values.get("pos_rotation") == "rope"
+        derived["pos_rotation"] = "rope" if rope_active else "none"
         derived["rope_base"] = float(values.get("rope_base", 100.0))
         derived["rope_fraction"] = float(values.get("rope_fraction", 1.0))
         derived["per_type_table"] = per_type_table

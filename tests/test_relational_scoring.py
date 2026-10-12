@@ -255,7 +255,7 @@ def test_healthy_projected_kl_uses_only_the_key_precision_inverse(recovery: bool
     Audit 2026-09-23 (low): the exact eps ||G||_F ||G^-1||_F certificate replaced the AM-GM screen,
     which was ~4.5e4x loose and so sent almost every live call through a second host read and
     masked gathers to evaluate this same certificate; the score still uses one key-precision inverse.
-    The certificate runs only under the opt-in projected_cov_condition_recovery. Audit 2026-10-10
+    The certificate runs only under the opt-in projected_factorization certificate. Audit 2026-10-10
     (#27, #33): the key certificate reads the key precision the score already forms, and a tied
     covariance (G_q is G_k) is factored once, so a tied call forms one inverse and an untied call
     adds only the query certificate's.
