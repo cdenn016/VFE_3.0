@@ -250,7 +250,6 @@ config: Dict[str, Any] = dict(
 
     layernorm_affine           = False,
     norm_type_block            = "none",             # "none" | "mahalanobis"
-    norm_type_final            = "none",             # "none" | "mahalanobis"
 
     prior_handoff_rho          = 1,                  # 1.0 = full flow; 0.0 = priors frozen
     prior_handoff_sigma        = 0.1,                # sigma damping in [0,1] (0.0 = frozen at embedding)

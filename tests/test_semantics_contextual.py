@@ -134,14 +134,13 @@ def _ctx(tmp_path: Path, run, **options) -> AnalysisContext:
 READOUT_CONFIGS = [
     dict(decode_mode="linear"),                                                      # Sigma moves
     dict(attention_mode="projected_predictive", decode_mode="diagonal_chunked", untie_decode_bank=True),
-    dict(norm_type_final="layernorm"),
     dict(family="gaussian_full", decode_mode="full_chunked"),
     dict(encode_mode="per_token_additive", pos_phi="none", decode_mode="diagonal_chunked", lambda_alpha_mode="constant"),
 ]
 
 
-@pytest.mark.parametrize("over", READOUT_CONFIGS, ids=["linear", "projected_kl", "final_layernorm",
-                                                       "full_family", "additive_control"])
+@pytest.mark.parametrize("over", READOUT_CONFIGS, ids=["linear", "projected_kl", "full_family",
+                                                       "additive_control"])
 def test_lens_at_last_layer_reproduces_forward_logits(over):
     cfg, model = _tiny_model(**over)
     x = torch.from_numpy(np.random.default_rng(3).integers(1, V, size=(3, N_CTX)))
@@ -154,13 +153,9 @@ def test_lens_at_last_layer_reproduces_forward_logits(over):
         assert len(layers) == cfg.n_layers + 1
         got = C._readout(model, layers[-1].mu, layers[-1].sigma, frame)
         torch.testing.assert_close(got, want, rtol=0.0, atol=1e-6)
-        final_mu = layers[-1].mu if model.final_norm is None else model.final_norm(layers[-1].mu, layers[-1].sigma)
-        torch.testing.assert_close(final_mu, belief.mu, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(layers[-1].mu, belief.mu, rtol=0.0, atol=0.0)
         first = C._readout(model, layers[0].mu, layers[0].sigma, frame)
         assert (first - want).abs().max() > 1e-3                        # the layers really differ
-        if cfg.norm_type_final != "none":                                 # the final norm is load-bearing
-            raw = model._decode_belief_with_context(layers[-1].mu, layers[-1].sigma, canonical_frame=frame)
-            assert (raw - want).abs().max() > 1e-3
     if cfg.encode_mode == "canonical_content_projected":
         assert frame is not None                                          # decode needs the realized frame
 

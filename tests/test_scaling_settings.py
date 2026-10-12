@@ -85,7 +85,7 @@ def test_preview_never_reads_corpus_or_builds_model(tmp_path, monkeypatch: pytes
 def test_parameter_estimate_includes_per_layer_relational_maps(monkeypatch: pytest.MonkeyPatch) -> None:
     base = _baseline()
     # Pin norms off to isolate the per-layer map and MLP parameter increment.
-    base.update(norm_type_block="none", norm_type_final="none", layernorm_affine=False)
+    base.update(norm_type_block="none", layernorm_affine=False)
     shallow = test_config(**base)
     deep = test_config(**dict(base, n_layers=2))
     actual = [sum(p.numel() for p in VFEModel(c).parameters()) for c in (shallow, deep)]

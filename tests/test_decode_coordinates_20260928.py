@@ -195,7 +195,7 @@ def test_linear_reference_decode_equals_row_12_patch(block: str) -> None:
 
 FUSED_ROUTES = {
     "linear":                 {},
-    "linear_reference_block": dict(block_coordinates="reference", norm_type_final="layernorm"),
+    "linear_reference_block": dict(block_coordinates="reference"),
     "diagonal_chunked":       GAUSSIAN_DIAG,
     "full_chunked":           GAUSSIAN_FULL,
     "full_moment_matched":    MOMENT_MATCHED_FULL,
@@ -366,7 +366,7 @@ def test_prior_bank_rejects_reference_decode_outside_its_contract() -> None:
 
 
 def test_row_12_not_applicable_while_rows_9_to_11_run() -> None:
-    model = _build(_cfg(decode_coordinates="reference", norm_type_final="layernorm"))
+    model = _build(_cfg(decode_coordinates="reference"))
     dataset = _dataset()
     idx = np.arange(len(dataset))
     with pytest.raises(iv.NotApplicable, match="nothing to remove"):

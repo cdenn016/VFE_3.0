@@ -78,22 +78,7 @@ def test_default_slope_matches_alibi():
 
 
 def test_existing_priors_unchanged_regression_guard():
-    # (5) regression guard: recompute uniform / causal / alibi and pin behavior.
-    # uniform and causal are still (N,N); alibi/causal_alibi are now (H,N,N).
-    assert torch.equal(attention_log_prior("uniform", 4, 4), torch.zeros(4, 4))
-
+    # (5) regression guard: recompute causal and pin behavior; causal is (N,N).
     Bc = attention_log_prior("causal", 3, 3)
     assert torch.isneginf(Bc[0, 1]) and torch.isneginf(Bc[0, 2]) and torch.isneginf(Bc[1, 2])
     assert Bc[2, 0] == 0.0 and Bc[1, 1] == 0.0 and Bc[2, 2] == 0.0
-
-    import math
-    H, N = 1, 4
-    alibi_slope = 0.5
-    Ba = attention_log_prior("alibi", N, N, n_heads=H, alibi_slope=alibi_slope)
-    assert Ba.shape == (H, N, N)
-    slope_h = alibi_slope * (2.0 ** (-8.0 * 1 / 1))
-    for i in range(N):
-        for j in range(N):
-            # alibi is SYMMETRIC with no causal mask (per head).
-            assert torch.isclose(Ba[0, i, j], torch.tensor(-slope_h * abs(i - j)), atol=1e-6)
-    assert torch.equal(Ba[0], Ba[0].T)  # symmetric per head: distinguishes it from causal_alibi

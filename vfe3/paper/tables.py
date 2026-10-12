@@ -892,7 +892,7 @@ def _architecture_items(run: RunRecord) -> List[Item]:
     items.append(("frame blocks", str(blocks) if isinstance(blocks, int) else NOT_RECORDED))
     for key in ("score_rank_per_head", "content_rank_per_head"):              # r_h and s_h
         items.append(("", Code(f"{key}={ops[key]}")) if key in ops else (key, NOT_RECORDED))
-    items += _raw_items(run, ("norm_type_block", "norm_type_final", "layernorm_affine",
+    items += _raw_items(run, ("norm_type_block", "layernorm_affine",
                               "attention_residual", "content_link_chart", "use_block_mlp", "block_mlp_mode",
                               "block_mlp_expansion"))
     if (run.raw("use_block_mlp") and run.raw("block_mlp_mode") == "coordinate"

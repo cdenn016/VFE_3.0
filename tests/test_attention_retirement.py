@@ -18,7 +18,7 @@ def _values(**overrides: Any) -> dict[str, Any]:
                            eval_stride=3, n_layers=2, n_e_steps=1,
                            attention_mode="projected_predictive", attention_residual=False,
                            predictive_covariance="passthrough", lambda_alpha_mode="constant",
-                           norm_type_block="none", norm_type_final="none", use_block_mlp=False,
+                           norm_type_block="none", use_block_mlp=False,
                            block_mlp_expansion=2, amp_dtype=None)
     for name in ("relational_input_scope", "relational_output_scope", "relational_identity_content"):
         values.pop(name, None)

@@ -743,7 +743,6 @@ def _run_facts(run: Any, ctx: AnalysisContext) -> Dict[str, Any]:
         "decode_unigram_prior": getattr(cfg, "decode_unigram_prior", None),
         "pos_phi": getattr(cfg, "pos_phi", None), "max_seq_len": getattr(cfg, "max_seq_len", None),
         "norm_type_block": getattr(cfg, "norm_type_block", None),
-        "norm_type_final": getattr(cfg, "norm_type_final", None),
         "layernorm_affine": getattr(cfg, "layernorm_affine", None),
         "amp_dtype_trained": getattr(cfg, "amp_dtype", None),
         "frames_active": bool(run.frames_active), "sigma_frozen": run.sigma_frozen,
@@ -1643,8 +1642,8 @@ def _render_report(run: Any, ctx: AnalysisContext, results: Mapping[str, Section
         ("transport", f"gauge_transport={getattr(cfg, 'gauge_transport', None)}, "
                       f"flat connection, pos_phi={getattr(cfg, 'pos_phi', None)}"),
         ("attention mode", getattr(cfg, "attention_mode", None)),
-        ("coordinate normalization", f"block={getattr(cfg, 'norm_type_block', None)}, final="
-                                     f"{getattr(cfg, 'norm_type_final', None)}, affine={getattr(cfg, 'layernorm_affine', None)}"),
+        ("coordinate normalization", f"block={getattr(cfg, 'norm_type_block', None)}, "
+                                     f"affine={getattr(cfg, 'layernorm_affine', None)}"),
         ("decode", f"{cfg.decode_mode} ({run.decode_kind}; unigram prior "
                    f"{getattr(cfg, 'decode_unigram_prior', None)})"),
         ("Σ frozen at encode", run.sigma_frozen),

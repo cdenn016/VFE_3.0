@@ -33,7 +33,7 @@ from tests.test_relational_integration import _cfg
 # train_vfe3.py and ablation.py, so these tests exercise the real configuration, not a corner.
 _LIVE = dict(use_block_mlp=False,
              pos_phi="learned", layernorm_affine=True,
-             norm_type_block="layernorm", norm_type_final="layernorm", phi_weight_decay=0.065)
+             norm_type_block="layernorm", phi_weight_decay=0.065)
 
 def _groups(**overrides: Any) -> tuple[Any, dict]:
     cfg = _cfg(**_LIVE, **overrides)
@@ -78,7 +78,7 @@ def test_layernorm_affine_inherits_m_p_mu_lr_when_unset() -> None:
 
 def test_layernorm_affine_takes_its_own_rate_when_set() -> None:
     _, groups = _groups(m_p_mu_lr=0.009, m_layernorm_lr=0.03)
-    for name in ("block_norm.weight", "block_norm.bias", "final_norm.weight", "final_norm.bias"):
+    for name in ("block_norm.weight", "block_norm.bias"):
         assert groups[name]["lr"] == 0.03
     # mu_embed is NOT dragged along -- the whole point of the decoupling.
     assert groups["prior_bank.mu_embed"]["lr"] == 0.009
@@ -120,9 +120,8 @@ def _inert_fields(**overrides: Any) -> set:
     (dict(pos_phi="none", m_pos_phi_lr=0.004), {"m_pos_phi_lr"}),
     (dict(layernorm_affine=True, norm_type_block="layernorm", m_layernorm_lr=0.03), set()),
     (dict(layernorm_affine=False, m_layernorm_lr=0.03), {"m_layernorm_lr"}),
-    # affine on, but neither seam is a 'layernorm' -> no gamma/beta are created at all
-    (dict(layernorm_affine=True, norm_type_block="none", norm_type_final="none",
-          m_layernorm_lr=0.03), {"m_layernorm_lr"}),
+    # affine on, but the block norm is not a 'layernorm' -> no gamma/beta are created at all
+    (dict(layernorm_affine=True, norm_type_block="none", m_layernorm_lr=0.03), {"m_layernorm_lr"}),
 ])
 def test_inertness_advisories(overrides: dict, expected: set) -> None:
     assert _inert_fields(**overrides) == expected

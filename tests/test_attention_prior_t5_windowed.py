@@ -1,6 +1,6 @@
-r"""T5 relative-position bias and windowed (local-attention) attention priors (PL13-priors).
+r"""T5 relative-position bias and causal windowed (local-attention) attention priors (PL13-priors).
 
-These extend the attention-prior registry beyond uniform/causal/alibi. Each is a pure builder
+These extend the attention-prior registry beyond causal/causal_alibi. Each is a pure builder
 returning a log-prior bias (Nq, Nk); they are config-selectable through the live _PRIORS
 registry (config.py validates beta_attention_prior against tuple(sorted(_PRIORS))),
 so no config-validator edit is needed. Variant params (window, T5 bucketing) use defaults when
@@ -22,21 +22,10 @@ from vfe3.model.model import VFEModel
 
 
 def test_new_priors_are_registered_and_config_selectable():
-    for name in ("windowed", "causal_windowed", "t5_relative_bias"):
+    for name in ("causal_windowed", "t5_relative_bias"):
         assert name in _PRIORS
         # config validation accepts the new prior names against the live registry
         test_config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, beta_attention_prior=name)
-
-
-def test_windowed_is_a_symmetric_band():
-    B = attention_log_prior("windowed", 6, 6, window=2)
-    inf = float("-inf")
-    for i in range(6):
-        for j in range(6):
-            if abs(i - j) <= 2:
-                assert B[i, j] == 0.0
-            else:
-                assert B[i, j] == inf
 
 
 def test_causal_windowed_is_causal_and_banded():
@@ -102,7 +91,7 @@ def _model_forward_finite(prior_name: str):
 
 
 def test_model_forward_under_windowed_priors():
-    for name in ("causal_windowed", "windowed", "t5_relative_bias"):
+    for name in ("causal_windowed", "t5_relative_bias"):
         _model_forward_finite(name)
 
 

@@ -229,7 +229,7 @@ def test_view_notes_follow_the_diagonal_status_and_barycenter(tmp_path):
 
 
 def _fake_run(**cfg) -> SimpleNamespace:
-    base = dict(norm_type_block="none", norm_type_final="none", gauge_group="block_glk",
+    base = dict(norm_type_block="none", gauge_group="block_glk",
                 attention_mode="projected_predictive", use_block_mlp=True, block_mlp_mode="coordinate",
                 transport_mode="regular_representation")
     return SimpleNamespace(cfg=SimpleNamespace(**{**base, **cfg}), sigma_frozen=False, phi_frozen=False,

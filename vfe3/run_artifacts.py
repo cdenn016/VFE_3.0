@@ -3614,7 +3614,7 @@ def _cost_model_fields(
     active = token_row + decode_readout
     active += block_mlp_params
     # Audit 2026-09-28: every token also reads one row of the learned positional-frame table
-    # (pos_phi_free is (max_seq_len, n_gen)) and every block/final normalization affine; both were
+    # (pos_phi_free is (max_seq_len, n_gen)) and the block normalization affine; both were
     # omitted (K160: +5,120 + 320 = 11,182,897). Parameters are deduplicated by identity, so a
     # normalization shared across layers counts once.
     pos_phi_free = getattr(model, "pos_phi_free", None)
@@ -3622,11 +3622,10 @@ def _cost_model_fields(
             and pos_phi_free.shape[0] > 0):
         active += int(pos_phi_free.numel() // pos_phi_free.shape[0])
     norm_parameters: Dict[int, int] = {}
-    for norm_name in ("block_norm", "final_norm"):
-        norm_module = getattr(model, norm_name, None)
-        if isinstance(norm_module, torch.nn.Module):
-            for parameter in norm_module.parameters():
-                norm_parameters[id(parameter)] = int(parameter.numel())
+    norm_module = getattr(model, "block_norm", None)
+    if isinstance(norm_module, torch.nn.Module):
+        for parameter in norm_module.parameters():
+            norm_parameters[id(parameter)] = int(parameter.numel())
     active += sum(norm_parameters.values())
     # Transparent analytic FLOP proxy. Per token: decode over all V (2VK) and L*T belief E-step
     # iterations. Each E-step iteration has O(N) attention energy (2NK) plus O(N) transport
@@ -5131,9 +5130,7 @@ def _pure_path_report(
     on_causal_lm_path = all(causal_flags.values())
 
     block_norm_name = getattr(cfg, "norm_type_block", "none")
-    final_norm_name = getattr(cfg, "norm_type_final", "none")
     block_norm_registration = get_norm_registration(block_norm_name)
-    final_norm_registration = get_norm_registration(final_norm_name)
     transport_chart_max_norm = float(cfg.transport_chart_max_norm)
     reference_blocks = getattr(cfg, "block_coordinates", "local") == "reference"
 
@@ -5186,14 +5183,13 @@ def _pure_path_report(
         "positional_rotation_gauge_covariant": (
             cfg.rope_mode == "none" or getattr(cfg, "rope_insertion", "right") == "right"),
         "family_group_invariant":    family_group_invariant,
-        # block_coordinates='reference' conjugates the block norm, final norm and block MLP by the
+        # block_coordinates='reference' conjugates the block norm and block MLP by the
         # realized frame, x -> U_i N(U_i^{-1} x), which is covariant for any registered map
         # (audit 2026-10-07 F18). The canonical_frame MLP is the same dressing U_i F(U_i^{-1} x) applied to the MLP
         # alone, covariant under the per-token action U_i -> g_i U_i (audit 2026-10-10, item 42).
         "block_mlp_intertwiner_compatible": (block_mlp_intertwiner_compatible or reference_blocks
                                              or (block_mlp_active and block_mlp_mode == "canonical_frame")),
         "block_norm_gauge_equivariant": block_norm_registration.gauge_equivariant or reference_blocks,
-        "final_norm_gauge_equivariant": final_norm_registration.gauge_equivariant or reference_blocks,
         "no_fixed_coordinate_spectral_cap": (
             sigma_max is None if sigma_cap_consumer_active else "not_applicable"),
         "no_phi_mstep_chart_cap": getattr(cfg, "phi_mstep_max_matrix_norm", None) is None,
@@ -5291,7 +5287,6 @@ def _pure_path_report(
             "spd_retraction_trust_projection_active": spd_retraction_trust_projection_active,
             "spd_retraction_exponential_clipping_active": spd_retraction_exponential_clipping_active,
             "norm_type_block":              block_norm_name,
-            "norm_type_final":              final_norm_name,
             "layernorm_affine":             bool(getattr(cfg, "layernorm_affine", False)),
             "m_phi_update_mode":            getattr(cfg, "m_phi_update_mode", "adamw"),
             "m_phi_group_trust_radius":      float(getattr(cfg, "m_phi_group_trust_radius", 0.1)),

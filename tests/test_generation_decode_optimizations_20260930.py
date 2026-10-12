@@ -20,7 +20,7 @@ def _tiny_model(decode_mode: str = "diagonal_chunked") -> VFEModel:
                     predictive_covariance="moment_matched",
                     decode_mode=decode_mode, decode_chunk_size=3, untie_decode_bank=True,
                     decode_coordinates="local", decode_unigram_prior=False,
-                    use_block_mlp=False, norm_type_block="none", norm_type_final="none", seed=6)
+                    use_block_mlp=False, norm_type_block="none", seed=6)
     torch.manual_seed(6)
     return VFEModel(cfg).eval()
 

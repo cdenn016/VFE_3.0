@@ -184,8 +184,7 @@ def diagonal_redundancy_status(cfg: Any) -> Tuple[str, str]:
     * ``"assumed"`` -- nothing rules it out but the configuration was not probed (e.g. a
       Mahalanobis norm, which is equivariant, or a CG coupling / RoPE / other block MLP).
     """
-    norms = (getattr(cfg, "norm_type_block", "none"), getattr(cfg, "norm_type_final", "none"))
-    if "layernorm" in norms:
+    if getattr(cfg, "norm_type_block", "none") == "layernorm":
         return "broken", ("a LayerNorm (affine or not) normalizes across coordinates, so "
                           "LN(Dμ) ≠ D LN(μ) for a non-uniform D")
     group = getattr(cfg, "gauge_group", "block_glk")
@@ -203,7 +202,7 @@ def diagonal_redundancy_status(cfg: Any) -> Tuple[str, str]:
         unprobed.append("use_cg_coupling=True")
     if getattr(cfg, "rope_mode", "none") != "none":
         unprobed.append(f"rope_mode={cfg.rope_mode!r}")
-    if "mahalanobis" in norms:
+    if getattr(cfg, "norm_type_block", "none") == "mahalanobis":
         unprobed.append("a Mahalanobis norm (equivariant, not measured)")
     if unprobed:
         return "assumed", "not probed for " + ", ".join(unprobed)

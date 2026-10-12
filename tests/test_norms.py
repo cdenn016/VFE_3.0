@@ -87,7 +87,7 @@ def test_layernorm_is_not_gauge_equivariant():
 
 def test_layernorm_registered_and_buildable():
     # Registered under "layernorm" and buildable via get_norm; config validation reads _NORMS, so
-    # registration alone makes "layernorm" a valid norm_type_block / norm_type_final value.
+    # registration alone makes "layernorm" a valid norm_type_block value.
     assert "layernorm" in _NORMS
     built = get_norm("layernorm")(4, eps=1e-6)
     assert isinstance(built, LayerNorm)

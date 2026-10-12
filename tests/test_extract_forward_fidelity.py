@@ -2,7 +2,7 @@ r"""Forward-fidelity tests for the viz belief extractors.
 
 The extractors read one diagnostic snapshot of the production forward, so every figure describes
 the model that actually trained. The forward reference is ``forward_beliefs(capture=...)['out']``,
-the raw pre-final_norm ``vfe_stack`` output.
+the raw ``vfe_stack`` output.
 
 Device-agnostic (CPU default; set VFE3_TEST_DEVICE=cuda for the GPU).
 """
@@ -20,7 +20,7 @@ DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
 
 
 def _forward_reference(model, tokens: torch.Tensor):
-    r"""forward's raw pre-final_norm converged belief (``capture['out']``, the extractor target)."""
+    r"""forward's raw converged belief (``capture['out']``, the extractor target)."""
     cap: dict = {}
     with torch.no_grad():
         model.forward_beliefs(tokens, capture=cap)

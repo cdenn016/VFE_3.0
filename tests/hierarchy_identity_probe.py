@@ -72,7 +72,7 @@ def main() -> None:
         predictive_covariance="passthrough", attention_residual=False,
 
         use_block_mlp=False, use_cg_coupling=False,
-        norm_type_block="none", norm_type_final="none", layernorm_affine=False,
+        norm_type_block="none", layernorm_affine=False,
         decode_mode="diagonal_chunked", decode_bias=False, decode_unigram_prior=False,
         untie_decode_bank=False, pos_phi="none",
         lambda_alpha_mode="constant", skip_belief_sigma_update=False,

@@ -56,7 +56,7 @@ class FakeRun:
         self.phi_frozen = True
         self.cfg = SimpleNamespace(pos_phi="none" if Y is None else "learned",
                                    max_seq_len=0 if Y is None else Y[0].shape[0],
-                                   norm_type_block="none", norm_type_final="none", layernorm_affine=False)
+                                   norm_type_block="none", layernorm_affine=False)
 
     def phi_blocks(self, ids: Sequence[int]) -> List[np.ndarray]:
         idx = np.asarray(ids, dtype=np.int64)
@@ -628,8 +628,7 @@ def test_run_phi_section_on_fake_run(tmp_path: Path) -> None:
 def test_diagonal_note_follows_the_shared_redundancy_status() -> None:
     from vfe3.semantics.common import diagonal_redundancy_status
 
-    base = dict(gauge_group="block_glk", attention_mode="projected_predictive", norm_type_block="none",
-                norm_type_final="none")
+    base = dict(gauge_group="block_glk", attention_mode="projected_predictive", norm_type_block="none")
     exact = diagonal_redundancy_status(SimpleNamespace(**base))
     ln = diagonal_redundancy_status(SimpleNamespace(**{**base, "norm_type_block": "layernorm",
                                                        "layernorm_affine": False}))

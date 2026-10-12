@@ -367,7 +367,6 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
 
     layernorm_affine                 = True,
     norm_type_block                  = "layernorm",        # "none" | "layernorm" | "mahalanobis" - often useful
-    norm_type_final                  = "none",             # "none" | "layernorm" | "mahalanobis" - performs worse generally
 
     #################################
     #        Initialization
@@ -429,7 +428,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     lambda_beta                      = 1.0,        # belief-coupling block weight (1.0 = pure F)
     kappa_beta                       = 1,        # tau = kappa * sqrt(d_head)
     
-    beta_attention_prior             = 'causal',    # "causal" | "causal_noself" | "causal_alibi" | "causal_alibi_noself" | "causal_windowed" | "t5_relative_bias" | "uniform" | "alibi" | "windowed" (the last three are not causal)
+    beta_attention_prior             = 'causal',    # "causal" | "causal_noself" | "causal_alibi" | "causal_alibi_noself" | "causal_windowed" | "t5_relative_bias"
     
     #################################
     #         Belief E-step

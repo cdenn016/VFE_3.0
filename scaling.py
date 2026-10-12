@@ -330,7 +330,6 @@ config = dict(
 
     layernorm_affine          = True,
     norm_type_block           = "layernorm",        # "none" | "mahalanobis" |"layernorm"
-    norm_type_final           = "none",             # "none" | "mahalanobis" |"layernorm"
 
 
     #################################
@@ -650,8 +649,8 @@ def predict_n_params(cfg: VFE3Config) -> Tuple[int, int]:
             expansion=int(cfg.block_mlp_expansion),
             n_layers=int(cfg.n_layers),
         )
-    if cfg.layernorm_affine:
-        n += 2 * K * sum(mode == "layernorm" for mode in (cfg.norm_type_block, cfg.norm_type_final))
+    if cfg.layernorm_affine and cfg.norm_type_block == "layernorm":
+        n += 2 * K
     n += int(cfg.n_layers) * 4 * K * K                       # full-width Q/K/T/O maps
     return n, n_gen
 

@@ -477,19 +477,18 @@ class VFE3Config:
     learn_attention_temperature:      bool            = False
 
     # "causal" | "causal_noself" | "causal_alibi" | "causal_alibi_noself" | "causal_windowed"
-    # | "t5_relative_bias" | "uniform" | "alibi" | "windowed"
-    # Log-prior over sources. The last three are not causal (they see future tokens).
+    # | "t5_relative_bias"
+    # Causal log-prior over sources.
     #   *_noself           masks the self key
-    #   *alibi             adds -slope_h |i - j| (Press et al.)
-    #   *windowed          -inf outside a band of attention_window
+    #   causal_alibi*      adds -slope_h (i - j) (Press et al.)
+    #   causal_windowed    -inf more than attention_window keys back
     #   t5_relative_bias   T5 bucketed relative-position bias
-    #   uniform            zero log-bias
     beta_attention_prior:             str             = "causal"
     
     # alibi priors only: BASE multiplier; the realized head slopes are alibi_slope * 2^(-8h/H), so an
     # n_heads sweep at fixed alibi_slope rescales the prior.
     alibi_slope:                      float           = 1.0
-    attention_window:                 int             = 128          # windowed priors only: band half-width
+    attention_window:                 int             = 128          # causal_windowed only: band width
     t5_num_buckets:                   int             = 32           # t5_relative_bias only: bucket count
     t5_max_distance:                  int             = 128          # t5_relative_bias only: log-bucketing horizon
     t5_learnable_bias:                bool            = False        # t5_relative_bias only: learn the bucket table
@@ -632,14 +631,12 @@ class VFE3Config:
     #   none         identity (gauge-pure)
     #   layernorm    standard LayerNorm over the belief dim (not gauge-equivariant)
     #   mahalanobis  gauge-invariant rescale
-    # norm_type_block runs inside every block; norm_type_final once before decode.
+    # norm_type_block runs inside every block; no norm runs between the stack and the decoder.
     norm_type_block:                  str             = "layernorm"
-    norm_type_final:                  str             = "none"
     layernorm_affine:                 bool            = False        # layernorm only: learned gamma/beta (init 1/0)
 
     # "passthrough" | "pushforward"
-    # Covariance through the LayerNorm seams (norm_type_block="layernorm"): the block norm and, when
-    # norm_type_final="layernorm", the final norm.
+    # Covariance through the LayerNorm block norm (norm_type_block="layernorm").
     #   passthrough  the norms map the mean only; Sigma stays in pre-norm units
     #   pushforward  J_LN Sigma J_LN^T + block_mlp_covariance_floor * D Sigma D + rho g g^T, D = diag(gamma)/s, with
     #                rho g g^T the radial second-order variance; its diagonal on the diagonal family (O(K) per
@@ -648,7 +645,7 @@ class VFE3Config:
     block_norm_covariance:            str             = "passthrough"
 
     # "local" | "reference"
-    #   local      the block norm, block MLP and final norm act on mu_i
+    #   local      the block norm and block MLP act on mu_i
     #   reference  they act on xi_i = U_i^-1 mu_i and map back, mu -> U_i Phi(U_i^-1 mu). only:
     #              projected_predictive, rope_mode "none" or a comparison mode, a "none"/"layernorm" norm, and a passthrough
     #              coordinate / gaussian_template MLP, a prototype_agents MLP, or (gaussian_full / gaussian_block)
@@ -683,13 +680,6 @@ class VFE3Config:
     # "gelu" | "silu" | "relu"
     # Hidden activation; not read by gaussian_template or prototype_agents.
     block_mlp_activation:             str             = "gelu"
-
-    # Block norm reapplied to the post-MLP mean, so the next router reads a normalized mean (audit
-    # 2026-10-08 P1-5). False keeps norm -> MLP. only: block_coordinates="local", a block norm, a block MLP
-    block_mlp_post_norm:              bool            = False
-    # False: the block MLP's mean path runs with autocast disabled (fp32 island), since under amp_dtype its residual
-    # is the only reduced-precision input to the fp32 router. only: amp_dtype set, a block MLP other than prototype_agents
-    block_mlp_autocast:               bool            = True
 
     # "mean_field" | "exact"
     # prototype_agents only: template posterior.
@@ -1391,8 +1381,8 @@ class VFE3Config:
         # attention priors validated against the prior REGISTRY (add-by-registering), so a newly
         # registered prior is a valid config value without editing this validator.
         from vfe3.attention_prior import _PRIORS
-        # prior-shape knobs (threaded into model._attention_log_prior; audit P9): the windowed
-        # band half-width and the T5 bucketing parameters must be positive ints.
+        # prior-shape knobs (threaded into model._attention_log_prior; audit P9): the causal_windowed
+        # band width and the T5 bucketing parameters must be positive ints.
         for name in ("attention_window", "t5_max_distance"):
             if not isinstance(getattr(self, name), int) or getattr(self, name) < 1:
                 raise ValueError(f"{name} must be an int >= 1, got {getattr(self, name)!r}")
@@ -1788,20 +1778,11 @@ class VFE3Config:
         from vfe3.geometry.norms import _NORMS
         _valid_norms = tuple(sorted(_NORMS))
         _require(self.norm_type_block, _valid_norms, "norm_type_block")
-        _require(self.norm_type_final, _valid_norms, "norm_type_final")
         _require(self.routing_kl_max_reference, ("absolute", "row_min"), "routing_kl_max_reference")
         if self.pair_kl_gemm_tol is not None and not (isinstance(self.pair_kl_gemm_tol, (int, float))
                                                       and not isinstance(self.pair_kl_gemm_tol, bool)
                                                       and self.pair_kl_gemm_tol > 0):
             raise ValueError(f"pair_kl_gemm_tol must be None or a positive number, got {self.pair_kl_gemm_tol!r}")
-        if not isinstance(self.block_mlp_post_norm, bool):
-            raise ValueError(f"block_mlp_post_norm must be a bool, got {self.block_mlp_post_norm!r}")
-        if not isinstance(self.block_mlp_autocast, bool):
-            raise ValueError(f"block_mlp_autocast must be a bool, got {self.block_mlp_autocast!r}")
-        if self.block_mlp_post_norm and (self.block_coordinates != "local" or self.norm_type_block == "none"
-                                         or not self.use_block_mlp):
-            raise ValueError("block_mlp_post_norm=True needs block_coordinates='local', a block norm "
-                             "(norm_type_block != 'none') and use_block_mlp=True")
 
         if self.block_mlp_expansion < 1:
             raise ValueError(
@@ -1840,9 +1821,8 @@ class VFE3Config:
                              "full-covariance layout (family='gaussian_full' or 'gaussian_block')")
         _require(self.block_norm_covariance, ("passthrough", "pushforward"), "block_norm_covariance")
         if self.block_norm_covariance == "pushforward":
-            # The block norm and a 'layernorm' final norm push Sigma; in reference coordinates they act on the dense
-            # C = U^-1 Sigma U^-T and map back as U C' U^T, which the full and head-block families keep (audit
-            # 2026-10-10 round 2, items 49 and 51).
+            # The block norm pushes Sigma; in reference coordinates it acts on the dense C = U^-1 Sigma U^-T and
+            # maps back as U C' U^T, which the full and head-block families keep (audit 2026-10-10 round 2, item 51).
             problems = []
             if self.norm_type_block != "layernorm":
                 problems.append(f"norm_type_block='layernorm' (got {self.norm_type_block!r})")
@@ -1859,7 +1839,7 @@ class VFE3Config:
         # In local coordinates the block norm maps the mean only and passes Sigma through, so the
         # pushforward must compose the norm Jacobian, J = J_mlp J_norm (vfe3.model.block_mlp.
         # block_norm_jacobian). That closed form exists for 'layernorm' (plain or affine); 'mahalanobis'
-        # reads Sigma and has none here. A post-MLP norm would act on the mean after the pushforward.
+        # reads Sigma and has none here.
         if self.use_block_mlp and self.block_mlp_covariance == "delta_full" and self.norm_type_block not in (
                 "none", "layernorm"):
             raise ValueError(
@@ -1867,10 +1847,6 @@ class VFE3Config:
                 "pushforward composes the norm Jacobian, which is implemented for LayerNorm only "
                 f"(got norm_type_block={self.norm_type_block!r})."
             )
-        if self.use_block_mlp and self.block_mlp_covariance == "delta_full" and self.block_mlp_post_norm:
-            raise ValueError(
-                "block_mlp_covariance='delta_full' with block_mlp_post_norm=True: the post-MLP norm acts on "
-                "the mean only, so the pushforward would omit its Jacobian")
         # The invariant Mahalanobis gate reads s_b = mu_b^T Sigma_bb^{-1} mu_b per irrep block. With a
         # passthrough covariance it is exact on the diagonal family (Sigma_bb = diag sigma_b gives
         # s_b = sum_k mu_k^2 / sigma_k), where it equals the full-family gate on diag_embed(sigma);
@@ -1928,9 +1904,8 @@ class VFE3Config:
             incompatible = list(frame_requirements)
             if self.attention_mode != "projected_predictive":
                 incompatible.append(f"attention_mode={self.attention_mode!r} (requires 'projected_predictive')")
-            for name in ("norm_type_block", "norm_type_final"):
-                if getattr(self, name) not in ("none", "layernorm"):
-                    incompatible.append(f"{name}={getattr(self, name)!r} (requires 'none' or 'layernorm')")
+            if self.norm_type_block not in ("none", "layernorm"):
+                incompatible.append(f"norm_type_block={self.norm_type_block!r} (requires 'none' or 'layernorm')")
             if self.use_cg_coupling:
                 incompatible.append("use_cg_coupling=True (acts in local coordinates before the norm)")
             if self.use_block_mlp and self.block_mlp_mode not in ("coordinate", "gaussian_template",
@@ -2164,8 +2139,7 @@ class VFE3Config:
             # other optimizer group falls back to it (vfe3/train.py build_optimizer; audit 2026-10-10 round 2,
             # item 20). Under the fisher validation the decoder is linear or untied, so its means read
             # m_decode_mu_lr and an untied bank's log variances read m_decode_sigma_lr.
-            layernorm_affine_live = (self.layernorm_affine
-                                     and "layernorm" in (self.norm_type_block, self.norm_type_final))
+            layernorm_affine_live = self.layernorm_affine and self.norm_type_block == "layernorm"
             # Groups that read m_p_mu_lr: those whose own rate inherits it, plus CG path weights and the T5 bias.
             mu_rate_fallback = (
                 any(self.inherits_hyperparameter(name, "m_p_mu_lr")
@@ -2187,7 +2161,7 @@ class VFE3Config:
                      "group inherits it")
         if self.grad_clip is None or self.grad_clip == 0:
             mark(("grad_clip_scope",), "only read when grad_clip > 0")
-        if self.beta_attention_prior not in ("alibi", "causal_alibi", "causal_alibi_noself"):
+        if self.beta_attention_prior not in ("causal_alibi", "causal_alibi_noself"):
             mark(("alibi_slope",), "only read by an alibi attention prior")
         if self.beta_attention_prior != "t5_relative_bias":
             mark(("t5_num_buckets", "t5_max_distance", "t5_learnable_bias"),
@@ -2255,19 +2229,17 @@ class VFE3Config:
                      "no M-step self-coupling or CG energy term is enabled; with diagnose_canonical_free_energy=True "
                      "it would feed that log-step diagnostic only")
             # Every contraction on this combination runs in an autocast-disabled island (the minimal-agent
-            # update, the prototype posteriors, LayerNorm, the transport exponentials and the linear
-            # decode/CE) or is elementwise, so the forward computes in float32 whatever amp_dtype says.
-            # Checked bit-for-bit on CPU autocast (tests/test_audit_20261007_opus_fixes.py); not run on CUDA.
+            # update, the block MLP's mean path (fp32 since 2026-10-12), the prototype posteriors, LayerNorm,
+            # the transport exponentials and the linear decode/CE) or is elementwise, so the forward computes
+            # in float32 whatever amp_dtype says. Checked bit-for-bit on CPU autocast for every block MLP mode
+            # (tests/test_audit_20261007_opus_fixes.py); not run on CUDA.
             if (self.amp_dtype is not None and self.decode_mode == "linear"
-                    and (not self.use_block_mlp or self.block_mlp_mode == "prototype_agents")
                     and self.norm_type_block in ("none", "layernorm")
-                    and self.norm_type_final in ("none", "layernorm")
                     and self.mstep_self_coupling_weight == 0.0 and not self.use_cg_coupling
                     and not self.decode_logits_amp):
                 mark(("amp_dtype",),
-                     "effective precision float32: on minimal_agent with a prototype_agents or absent block "
-                     "MLP, a none/layernorm norm and linear decode, every contraction runs with autocast "
-                     "disabled")
+                     "effective precision float32: on minimal_agent with a none/layernorm norm and linear "
+                     "decode, every contraction runs with autocast disabled")
         else:
             mark(("minimal_agent_inference", "minimal_agent_channel_noise", "minimal_agent_cavi_steps"),
                  "only read by predictive_readout='minimal_agent'")
@@ -2312,12 +2284,8 @@ class VFE3Config:
         # The norm pushforward reads the same floor (in post-norm units) as delta_full.
         norm_floor = () if self.block_norm_covariance == "pushforward" and not mlp_delta_full else (
             "block_mlp_covariance_floor",)
-        if self.block_norm_covariance == "pushforward" and mlp_delta_full and self.norm_type_final != "layernorm":
-            mark(("block_norm_covariance",), "block_mlp_covariance='delta_full' already composes the norm Jacobian "
-                 "and no 'layernorm' final norm pushes Sigma")
-        # The prototype block runs with autocast disabled already (its posterior and its residual are fp32).
-        if self.amp_dtype is None or not self.use_block_mlp or self.block_mlp_mode == "prototype_agents":
-            mark(("block_mlp_autocast",), "only read with amp_dtype set and a block MLP other than prototype_agents")
+        if self.block_norm_covariance == "pushforward" and mlp_delta_full:
+            mark(("block_norm_covariance",), "block_mlp_covariance='delta_full' already composes the norm Jacobian")
         if not self.use_block_mlp:
             mark(("block_mlp_mode", "block_mlp_covariance", *norm_floor,
                   "block_mlp_expansion", "block_mlp_activation", "block_mlp_dropout", "m_block_mlp_lr"),
@@ -2345,14 +2313,14 @@ class VFE3Config:
                 mark(("block_mlp_template_init_pull",), "only read by block_mlp_template_init='working_variance'")
         if self.pos_phi != "learned":
             mark(("m_pos_phi_lr",), "only pos_phi='learned' creates the learnable positional table")
-        if "layernorm" not in (self.norm_type_block, self.norm_type_final):
-            mark(("layernorm_affine",), "only read by a 'layernorm' block or final norm seam")
+        if self.norm_type_block != "layernorm":
+            mark(("layernorm_affine",), "only read by a 'layernorm' block norm")
         if self.norm_type_block != "layernorm" or (self.block_coordinates != "local"
                                                    and self.family not in ("gaussian_full", "gaussian_block")):
             mark(("block_norm_covariance",), "only read by a 'layernorm' block norm, in local coordinates or in "
                  "reference coordinates on gaussian_full / gaussian_block")
-        if not (self.layernorm_affine and "layernorm" in (self.norm_type_block, self.norm_type_final)):
-            mark(("m_layernorm_lr",), "requires layernorm_affine and a layernorm seam")
+        if not (self.layernorm_affine and self.norm_type_block == "layernorm"):
+            mark(("m_layernorm_lr",), "requires layernorm_affine and a layernorm block norm")
         if not self.decode_unigram_prior:
             mark(("unigram_kappa",), "needs decode_unigram_prior=True")
         if self.lambda_alpha_mode == "constant":
@@ -2374,14 +2342,8 @@ class VFE3Config:
             mark(("relational_key_noise",), "only read by relational_routing='noisy_key' on the kernel router")
         if self.pos_phi == "none":
             mark(("pos_phi_project_slk", "pos_phi_scale"), "only read by a non-'none' pos_phi")
-        if (self.beta_attention_prior in ("windowed", "causal_windowed")
-                and self.attention_window >= self.max_seq_len - 1):
-            # The two-sided band then admits every pair, so 'windowed' equals the non-causal uniform
-            # prior (audit 2026-10-10, item 4).
-            mark(("attention_window",),
-                 "window covers the context: 'causal_windowed' is identical to plain causal"
-                 if self.beta_attention_prior == "causal_windowed" else
-                 "window covers the context: 'windowed' is identical to the uniform (non-causal) prior")
+        if self.beta_attention_prior == "causal_windowed" and self.attention_window >= self.max_seq_len - 1:
+            mark(("attention_window",), "window covers the context: 'causal_windowed' is identical to plain causal")
         if self.n_layers == 1:
             mark(("prior_handoff_rho", "prior_handoff_sigma"), "no next layer consumes the handoff")
         registration = _DECODERS[self.decode_mode]
@@ -2427,8 +2389,8 @@ class VFE3Config:
             mark(("phi_weight_decay",),
                  f"m_phi_update_mode={self.m_phi_update_mode!r} replaces the frame-table decay "
                  "with its own optimizer-group value")
-        if self.beta_attention_prior not in ("windowed", "causal_windowed"):
-            mark(("attention_window",), "only the windowed/causal_windowed priors read the band half-width")
+        if self.beta_attention_prior != "causal_windowed":
+            mark(("attention_window",), "only the causal_windowed prior reads the band width")
         if self.gauge_transport in ("off", "frozen"):
             mark(("m_pos_phi_lr", "phi_weight_decay"),
                  f"gauge_transport={self.gauge_transport!r} sets requires_grad=False on the frame "
@@ -2500,17 +2462,16 @@ class VFE3Config:
                  "full covariance requires block_mlp_covariance='delta_full', block_norm_covariance='pushforward', "
                  "predictive_covariance='moment_matched', or attention_mode='projected_gradient'")
         # Reference coordinates. With identically-I frames xi = mu and C = Sigma exactly, so both
-        # selectors are no-ops; without a block norm, final norm or block MLP nothing is conjugated.
+        # selectors are no-ops; without a block norm or block MLP nothing is conjugated.
         identity_frames = (self.gauge_transport == "off"
                            or (self.encode_mode == "per_token_additive" and self.pos_phi == "none"))
         if identity_frames:
             mark(("block_coordinates", "decode_coordinates"),
                  "the realized frames are identically I (gauge_transport='off', or per_token_additive "
                  "without positional frames), so reference and local coordinates coincide")
-        elif (self.norm_type_block == "none" and self.norm_type_final == "none"
-              and not self.use_block_mlp):
+        elif self.norm_type_block == "none" and not self.use_block_mlp:
             mark(("block_coordinates",),
-                 "no block norm, final norm or block MLP to conjugate: reference and local coordinates "
+                 "no block norm or block MLP to conjugate: reference and local coordinates "
                  "agree in exact arithmetic, but the reference block still runs the U(U^{-1} mu) round "
                  "trip, so the two differ at roundoff (not bit-identical)")
         if not self.per_type_hidden_bias:
@@ -2709,6 +2670,11 @@ _ROPE_FIELDS = ("pos_rotation", "rope_space", "rope_on_value", "rope_comparison_
 # the frame-pair escalation switch and tolerance merged into frame_pair_escalation_tol.
 _HARDCODED_FIELDS = ("relational_output_init", "bch_residual_max")
 _FRAME_PAIR_FIELDS = ("frame_pair_fp64_escalation", "frame_pair_condition_tol")
+# Removed 2026-10-12 (second pass): the final norm before decode is fixed at none, the block runs norm -> MLP
+# with no post-MLP norm, and under amp_dtype the block MLP's mean path always runs in an fp32 island.
+_NORM_MLP_FIELDS = ("norm_type_final", "block_mlp_post_norm", "block_mlp_autocast")
+# Removed 2026-10-12 (second pass): the non-causal attention priors (each position saw future tokens).
+_RETIRED_ATTENTION_PRIORS = frozenset({"uniform", "alibi", "windowed"})
 # Every serialized key config_from_serialized migrates or refuses that is not a VFE3Config field.
 RETIRED_CONFIG_KEYS = frozenset(
     set(_RETIRED_PINNED_FIELDS) | _RETIRED_INERT_FIELDS | _RETIRED_CONDITIONAL_FIELDS
@@ -2716,7 +2682,7 @@ RETIRED_CONFIG_KEYS = frozenset(
        "relational_readout_mode", "relational_input_scope", "relational_output_scope",
        "relational_identity_content"}
     | set(_PROJECTED_FACTORIZATION_FIELDS) | set(_ROPE_FIELDS) | set(_HARDCODED_FIELDS)
-    | set(_FRAME_PAIR_FIELDS))
+    | set(_FRAME_PAIR_FIELDS) | set(_NORM_MLP_FIELDS))
 # laplace_diagonal (retired 2026-10-12) was registered but refused on both projected routes.
 _RETIRED_FAMILIES = frozenset({"gaussian_frame_diagonal", "laplace_diagonal"})
 _MIGRATED_FAMILIES = {"gaussian_diagonal_exact": "gaussian_diagonal"}
@@ -2867,6 +2833,37 @@ def _migrate_retired_fields(
     _migrate_projected_factorization(payload, source=source, refuse=refuse)
     _migrate_rope_mode(payload, source=source, refuse=refuse)
     _migrate_hardcoded_fields(payload, source=source, refuse=refuse)
+    _migrate_norm_mlp_fields(payload, source=source, refuse=refuse)
+
+
+def _migrate_norm_mlp_fields(
+    payload: dict[str, Any],
+
+    *,
+    source: str,
+    refuse: Callable[..., None],
+) -> None:
+    r"""Drop the norm and block-MLP fields removed on 2026-10-12 (second pass), or refuse them, and refuse a
+    removed attention prior.
+
+    ``norm_type_final`` loads only as ``"none"``: any other final norm changed the decoded mean. ``block_mlp_post_norm``
+    loads only as False: True re-normalized the post-MLP mean (validation refused it wherever it was not read).
+    ``block_mlp_autocast`` was a precision policy, so any saved value is dropped. A non-causal
+    ``beta_attention_prior`` (``uniform``, ``alibi``, ``windowed``) is refused.
+    """
+    if "norm_type_final" in payload:
+        value = payload.pop("norm_type_final")
+        if value != "none":
+            refuse("norm_type_final", value, " (only 'none' survives; a final norm changed the decoded mean)")
+    if "block_mlp_post_norm" in payload:
+        value = _normalize_serialized_boolean(payload.pop("block_mlp_post_norm"), "block_mlp_post_norm",
+                                              source=source)
+        if value:
+            refuse("block_mlp_post_norm", value, " (only False survives; the post-MLP norm changed the forward)")
+    payload.pop("block_mlp_autocast", None)
+    prior = payload.get("beta_attention_prior")
+    if isinstance(prior, str) and prior in _RETIRED_ATTENTION_PRIORS:
+        refuse("beta_attention_prior", prior, " (a non-causal prior; only causal priors survive)")
 
 
 def _migrate_hardcoded_fields(

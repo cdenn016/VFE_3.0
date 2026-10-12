@@ -170,8 +170,6 @@ config = dict(
     
     block_mlp_mode                   = "prototype_agents",   # "coordinate" | "prototype_agents" | "canonical_frame" | "gaussian_template" | "gauge_gate"
     block_mlp_covariance             = "passthrough",  # "passthrough" | "delta_full" (coordinate, canonical_frame, gauge_gate) | "posterior" (prototype_agents); gaussian_template: "passthrough" only
-    block_mlp_post_norm              = False,          # block norm reapplied to the post-MLP mean before the next router (local coords, needs a block norm)
-    block_mlp_autocast               = True,           # False: the MLP mean path runs in an fp32 island under amp_dtype (not read by prototype_agents)
     block_mlp_template_init          = "absolute",   # "absolute" | "working_variance" (lambda_0, nu from one batch; prototype_agents only)
     
     block_mlp_inference              = "mean_field",   # "mean_field" | "exact" (prototype_agents only)
@@ -193,7 +191,6 @@ config = dict(
 
     layernorm_affine                 = True,
     norm_type_block                  = "layernorm",        # "none" | "layernorm" | "mahalanobis" - often useful
-    norm_type_final                  = "none",             # "none" | "layernorm" | "mahalanobis" - performs worse generally
     block_norm_covariance            = "passthrough",      # "passthrough" | "pushforward" (Sigma -> J_LN Sigma J_LN^T + floor D Sigma D; diagonal family: its diagonal)
 
     #################################
@@ -258,7 +255,7 @@ config = dict(
     kappa_beta                       = 1,        # tau = kappa * sqrt(d_head)
     learn_attention_temperature      = False,    # learn a per-layer, per-head log-temperature offset (starts at tau above)
     
-    beta_attention_prior             = 'causal',    # "causal" | "causal_noself" | "causal_alibi" | "causal_alibi_noself" | "causal_windowed" | "t5_relative_bias" | "uniform" | "alibi" | "windowed" (the last three are not causal)
+    beta_attention_prior             = 'causal',    # "causal" | "causal_noself" | "causal_alibi" | "causal_alibi_noself" | "causal_windowed" | "t5_relative_bias"
     
     #################################
     #         Belief E-step

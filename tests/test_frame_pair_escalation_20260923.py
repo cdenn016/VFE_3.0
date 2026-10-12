@@ -315,7 +315,7 @@ def _launcher(**overrides: object) -> VFE3Config:
         attention_mode="projected_predictive", pos_phi="learned",
         skip_belief_sigma_update=True,
 
-        use_block_mlp=True, norm_type_block="layernorm", norm_type_final="layernorm",
+        use_block_mlp=True, norm_type_block="layernorm",
         layernorm_affine=True, decode_mode="diagonal_chunked",
         decode_av_precision="fp32", decode_ranking_fp64_escalation=False,
         lambda_alpha_mode="constant", mu_init_std=0.02, sigma_init=1.0, phi_scale=0.01,

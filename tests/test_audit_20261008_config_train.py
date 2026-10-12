@@ -93,7 +93,7 @@ def test_comparison_rope_keeps_the_factor_route_live() -> None:
 
 
 def test_block_coordinates_mark_no_longer_claims_bit_identity() -> None:
-    inactive = _cfg(block_coordinates="reference", norm_type_block="none", norm_type_final="none",
+    inactive = _cfg(block_coordinates="reference", norm_type_block="none",
                     use_block_mlp=False).inactive_fields()
     assert "roundoff" in inactive["block_coordinates"]
 

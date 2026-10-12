@@ -124,9 +124,7 @@ def test_phi_weight_decay_is_live_under_adamw() -> None:
 
 # ------------------------------------------------------------------------------------- item 4
 
-def test_windowed_inactive_reason_names_the_uniform_prior() -> None:
-    cfg = test_config(**BASE, beta_attention_prior="windowed", attention_window=64)
-    assert "uniform" in cfg.inactive_fields()["attention_window"]
+def test_causal_windowed_inactive_reason_names_plain_causal() -> None:
     cfg = test_config(**BASE, beta_attention_prior="causal_windowed", attention_window=64)
     assert "plain causal" in cfg.inactive_fields()["attention_window"]
 

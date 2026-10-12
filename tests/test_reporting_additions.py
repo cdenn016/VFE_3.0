@@ -302,7 +302,7 @@ def _pure_ns(**over):
         block_mlp_activation="gelu", block_mlp_dropout=0.0,
         m_block_mlp_lr=None, m_p_mu_lr=1e-3,
         sigma_max=None,
-        norm_type_block="none", norm_type_final="none", layernorm_affine=False,
+        norm_type_block="none", layernorm_affine=False,
         m_phi_update_mode="adamw", m_phi_group_trust_radius=0.1,
         phi_mstep_max_matrix_norm=None, transport_chart_max_norm=12.0,
         beta_attention_prior="causal")

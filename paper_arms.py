@@ -270,7 +270,7 @@ def _template_already(base: Any) -> Optional[str]:
 
 
 def _no_ln_or_mlp(base: Any) -> Optional[str]:
-    if base.norm_type_block != "layernorm" and base.norm_type_final != "layernorm" and not base.use_block_mlp:
+    if base.norm_type_block != "layernorm" and not base.use_block_mlp:
         return "the base has neither a LayerNorm nor a block MLP"
     return None
 
@@ -387,7 +387,6 @@ ARMS: Dict[str, Dict[str, Any]] = {
         "group": _RETRAINING, "slug": "intertwiner_block",
         "vfe": {"block_mlp_mode": "gauge_gate",
                 "norm_type_block": _covariant_norm("norm_type_block"),
-                "norm_type_final": _covariant_norm("norm_type_final"),
                 "decode_coordinates": "reference"},
         "requires": ("decode_coordinates",), "inapplicable": _no_mlp_or_reference_decode},
     # Audit 2026-10-09 round 2 items 4 and 12: frames are pure gauge wherever every consumer reads (xi, C),
@@ -1045,7 +1044,7 @@ def format_plan(base: Base, plans: Sequence[ArmPlan], *, budget: str) -> str:
         f"base {base.name}: {base.run_dir}",
         f"  dataset={base.dataset} K={cfg.embed_dim} heads={cfg.n_heads} L={cfg.n_layers} family={cfg.family} "
         f"attention={cfg.attention_mode} covariance={cfg.predictive_covariance} residual={cfg.attention_residual} "
-        f"norm={cfg.norm_type_block}/{cfg.norm_type_final} affine={cfg.layernorm_affine} "
+        f"norm={cfg.norm_type_block} affine={cfg.layernorm_affine} "
         f"mlp={cfg.block_mlp_mode if cfg.use_block_mlp else 'none'}x{cfg.block_mlp_expansion} "
         f"decode={cfg.decode_mode} batch={cfg.batch_size}x{cfg.max_seq_len} sigma_wd={cfg.sigma_weight_decay}",
         f"  pinned (historical defaults the loader applies to absent fields): {base.pinned}",

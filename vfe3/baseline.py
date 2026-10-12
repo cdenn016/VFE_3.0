@@ -46,7 +46,7 @@ by every layer, applied after the attention residual and before the MLP residual
     h_i \leftarrow \mathrm{LN}\big(h_i + \mathrm{Attn}(h)_i\big),\qquad
     h_i \leftarrow h_i + W_2\, \mathrm{GELU}(W_1 h_i + b_1) + b_2,
 
-with no final normalization (the VFE's ``norm_type_final='none'``); the context-processing count is then
+with no final normalization (the VFE has none before decode); the context-processing count is then
 exactly the VFE's. With ``attention_residual=False`` (copied by :meth:`BaselineConfig.matched_to` from a
 VFE base without an attention residual) the first update is
 :math:`h_i \leftarrow \mathrm{LN}(\mathrm{Attn}(h)_i)`, as that base computes. The decoder is the VFE linear decoder,

@@ -24,7 +24,7 @@ def _fixture(n: int = 4, seed: int = 3) -> tuple:
 
 # ------------------------------------------------------------------------------------- item 2: tie with a self prior
 
-@pytest.mark.parametrize("prior", ["causal", "causal_alibi", "uniform"])
+@pytest.mark.parametrize("prior", ["causal", "causal_alibi"])
 def test_tie_with_a_self_admitting_prior_warns(prior: str) -> None:
     with pytest.warns(UserWarning, match="causal_noself"):
         tiny_config(tie_comparison_maps=True, beta_attention_prior=prior)

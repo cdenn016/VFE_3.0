@@ -1,7 +1,7 @@
 r"""Block MLP, LayerNorm pushforward, prototype agents and the Triton kernel (audit 2026-10-10 round 2, agent 4).
 
-Items 11 (radial second-order variance of the LayerNorm pushforward), 29 (``block_mlp_autocast``), 49 (final-norm
-pushforward), 50 (rank-two full-layout pushforward), 51 (covariance transport in reference coordinates), 54 (prototype
+Items 11 (radial second-order variance of the LayerNorm pushforward), 29 (the block MLP's fp32 island under
+``amp_dtype``), 50 (rank-two full-layout pushforward), 51 (covariance transport in reference coordinates), 54 (prototype
 label staleness), 56 (two-level accumulation in the Triton energy, by emulation) and 57 (the no-sync float64 select).
 The EM gradients of item 15 are checked against finite differences in ``tests/test_cavi_em_20261010.py``, together
 with the evidence fixed point here. Float64 and tiny K unless stated; CPU only.
@@ -238,17 +238,16 @@ def test_no_sync_select_equals_the_old_values(K: int, floor: float, monkeypatch:
 
 
 # ----------------------------------------------------------------------------------------------
-# Item 49: the final LayerNorm pushes Sigma; item 51: covariance transport in reference coordinates
+# Item 51: covariance transport in reference coordinates (no norm runs before the decoder)
 # ----------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("coordinates", ["local", "reference"])
-def test_final_norm_pushforward_reaches_the_decoder(coordinates: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    r"""Under ``block_norm_covariance='pushforward'`` a LayerNorm final norm carries :math:`\Sigma` to post-norm units
-    (in reference coordinates through :math:`C = U^{-1}\Sigma U^{-\top}`), and that covariance is what the Gaussian
-    decoder receives; inert under ``norm_type_final='none'`` and under passthrough."""
-    base = dict(family="gaussian_full", decode_mode="full_chunked", norm_type_final="layernorm",
-                block_norm_covariance="pushforward", block_coordinates=coordinates, decode_coordinates=coordinates)
-    model = _model(_cfg(**base))
+def test_decoder_reads_the_stack_covariance_under_pushforward(coordinates: str,
+                                                              monkeypatch: pytest.MonkeyPatch) -> None:
+    r"""With no norm between the stack and the decoder, the Gaussian decoder receives the stack output's
+    covariance object under ``block_norm_covariance='pushforward'``."""
+    model = _model(_cfg(family="gaussian_full", decode_mode="full_chunked", block_norm_covariance="pushforward",
+                        block_coordinates=coordinates, decode_coordinates=coordinates))
     seen: List[torch.Tensor] = []
     decode = model._decode_belief_with_context
 
@@ -260,25 +259,7 @@ def test_final_norm_pushforward_reaches_the_decoder(coordinates: str, monkeypatc
     capture: dict = {}
     with torch.no_grad():
         belief, _ = model.forward_beliefs(_tokens(), return_logits=True, capture=capture)
-    out = capture["out"]                                                    # the raw stack output, pre final norm
-    if coordinates == "local":
-        want = bm.block_norm_covariance_pushforward(model.final_norm, out.mu, out.sigma, model.cfg.block_mlp_covariance_floor)
-    else:
-        from vfe3.model.frame_actions import frame_matvec, local_covariance, reference_covariance
-        frame = capture["canonical_frame"]                                  # the realized U_i (decode reference)
-        xi = frame_matvec(frame.inverse, out.mu, frame.block_diagonal)
-        C = bm.block_norm_covariance_pushforward(model.final_norm, xi, reference_covariance(out.mu, out.sigma, frame),
-                                                 model.cfg.block_mlp_covariance_floor)
-        want = local_covariance(out.mu, C, frame, diagonal=False)
-    assert len(seen) == 1 and seen[0] is belief.sigma
-    torch.testing.assert_close(belief.sigma, want, rtol=1e-12, atol=1e-14)
-    assert float((belief.sigma - out.sigma).abs().max()) > 1e-3
-    for over in (dict(norm_type_final="none"), dict(block_norm_covariance="passthrough")):
-        plain = _model(_cfg(**{**base, **over}))
-        capture = {}
-        with torch.no_grad():
-            belief, _ = plain.forward_beliefs(_tokens(), capture=capture)
-        assert belief.sigma is capture["out"].sigma                         # inert: the stack covariance object
+    assert len(seen) == 1 and seen[0] is belief.sigma is capture["out"].sigma
 
 
 def _frame_blocks(B: int, N: int, G: int, d: int, scale: float, seed: int) -> torch.Tensor:   # (B, N, G, d, d)
@@ -345,8 +326,7 @@ def test_reference_block_at_identity_frames_equals_the_local_pushforward() -> No
 
 
 @pytest.mark.parametrize("over", [dict(block_norm_covariance="pushforward"),
-                                  dict(block_mlp_covariance="delta_full"),
-                                  dict(block_norm_covariance="pushforward", norm_type_final="layernorm")])
+                                  dict(block_mlp_covariance="delta_full")])
 def test_reference_models_with_covariance_transport_run(over: dict) -> None:
     cfg = _cfg(family="gaussian_full", decode_mode="full_chunked", block_coordinates="reference", n_layers=2, **over)
     if "block_norm_covariance" in over:
@@ -363,15 +343,14 @@ def test_reference_models_with_covariance_transport_run(over: dict) -> None:
         _cfg(block_coordinates="reference", block_mlp_covariance="delta_full")            # gaussian_diagonal
 
 
-def test_final_norm_keeps_the_toggle_active_under_delta_full() -> None:
+def test_delta_full_marks_the_norm_pushforward_inert() -> None:
     base = dict(family="gaussian_full", decode_mode="full_chunked", block_mlp_covariance="delta_full",
                 block_norm_covariance="pushforward")
     assert "block_norm_covariance" in _cfg(**base).inactive_fields()
-    assert "block_norm_covariance" not in _cfg(**base, norm_type_final="layernorm").inactive_fields()
 
 
 # ----------------------------------------------------------------------------------------------
-# Item 29: block_mlp_autocast
+# Item 29: the block MLP's fp32 island under amp_dtype
 # ----------------------------------------------------------------------------------------------
 
 def _fc1_dtypes(model: VFEModel, tokens: torch.Tensor) -> List[torch.dtype]:
@@ -385,40 +364,23 @@ def _fc1_dtypes(model: VFEModel, tokens: torch.Tensor) -> List[torch.dtype]:
 
 
 @pytest.mark.parametrize("coordinates", ["local", "reference"])
-def test_block_mlp_autocast_false_keeps_the_mlp_in_fp32(coordinates: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    over = dict(amp_dtype="bf16", block_coordinates=coordinates, n_layers=2)
-    on = _model(_cfg(**over), double=False)
-    off = _model(_cfg(**over, block_mlp_autocast=False), double=False)
-    off.load_state_dict(on.state_dict())
+def test_block_mlp_runs_in_fp32_under_amp(coordinates: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    r"""Under ``amp_dtype`` the block MLP's mean path runs with autocast disabled on a float32 input (hardcoded
+    2026-10-12), in local and reference coordinates."""
+    model = _model(_cfg(amp_dtype="bf16", block_coordinates=coordinates, n_layers=2), double=False)
     tokens = _tokens()
-    assert set(_fc1_dtypes(on, tokens)) == {torch.bfloat16}
-    assert set(_fc1_dtypes(off, tokens)) == {torch.float32}
-    # True is the historical path: no context and the same input tensor object reach the MLP.
-    inputs: List[Tuple[torch.Tensor, torch.Tensor]] = []
+    assert set(_fc1_dtypes(model, tokens)) == {torch.float32}
+    inputs: List[Tuple[torch.dtype, bool]] = []
     original = BlockMLP.forward_moments
 
     def spy(self: BlockMLP, mu: torch.Tensor, sigma: torch.Tensor, **kwargs: Any) -> Any:
-        inputs.append((mu, torch.is_autocast_enabled("cpu")))
+        inputs.append((mu.dtype, torch.is_autocast_enabled("cpu")))
         return original(self, mu, sigma, **kwargs)
 
     monkeypatch.setattr(BlockMLP, "forward_moments", spy)
-    capture: dict = {}
     with torch.no_grad():
-        on.forward_beliefs(tokens, capture=capture)
-    assert inputs and all(enabled for _, enabled in inputs)
-    if coordinates == "local":
-        assert inputs[-1][0] is capture["block_mlp_input"].mu              # the last block's post-norm mean itself
-    monkeypatch.undo()
-    with torch.no_grad():
-        default = _model(_cfg(amp_dtype="bf16", block_coordinates=coordinates, n_layers=2), double=False)
-        default.load_state_dict(on.state_dict())
-        assert torch.equal(default(tokens, tokens)[1], on(tokens, tokens)[1])
-    assert "block_mlp_autocast" not in _cfg(**over).inactive_fields()
-    for inert in (dict(amp_dtype=None), dict(amp_dtype="bf16", use_block_mlp=False),
-                  dict(amp_dtype="bf16", block_mlp_mode="prototype_agents")):
-        assert "block_mlp_autocast" in _cfg(**inert).inactive_fields()
-    with pytest.raises(ValueError, match="block_mlp_autocast"):
-        _cfg(block_mlp_autocast=0)
+        model.forward_beliefs(tokens)
+    assert inputs and all(dtype == torch.float32 and not enabled for dtype, enabled in inputs)
 
 
 # ----------------------------------------------------------------------------------------------

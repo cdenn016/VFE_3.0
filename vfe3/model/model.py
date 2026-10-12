@@ -53,8 +53,7 @@ from vfe3.model.block_mlp import (
     build_block_mlp,
     get_block_mlp_registration,
 )
-from vfe3.model.block import _as_coeff, norm_covariance_pushforward
-from vfe3.model.frame_actions import frame_matvec
+from vfe3.model.block import _as_coeff
 from vfe3.model.positional_phi import positional_phi_coords
 from vfe3.model.prior_bank import (
     DecodeCEResult,
@@ -369,14 +368,14 @@ class VFEModel(nn.Module):
         # n_heads=1 (the (1, N, N) prior is squeezed to the (N, N) convention in
         # _attention_log_prior below).
         for _pname in ("beta_attention_prior",):
-            if (getattr(cfg, _pname) in ("alibi", "causal_alibi", "causal_alibi_noself")
+            if (getattr(cfg, _pname) in ("causal_alibi", "causal_alibi_noself")
                     and cfg.n_heads != len(self.group.irrep_dims)):
                 raise ValueError(
                     f"{_pname}={getattr(cfg, _pname)!r} builds an (n_heads, N, N) prior but the "
                     f"energy head axis is {len(self.group.irrep_dims)} "
                     f"(irrep_dims={self.group.irrep_dims}); set "
                     f"n_heads={len(self.group.irrep_dims)} or use a headless prior "
-                    f"(uniform/causal/windowed/...)."
+                    f"(causal/causal_windowed/...)."
                 )
         n_gen = self.group.generator_shape[0]
         self.prior_bank = PriorBank(
@@ -489,18 +488,14 @@ class VFEModel(nn.Module):
                 print("\n" + "-" * 72 + "\n"
                       "WARNING: canonical_frame + RoPE uses a split positional path.\n"
                       + "\n".join(rope_caveats) + "\n" + "-" * 72 + "\n")
-        self.final_norm = get_norm(cfg.norm_type_final)(cfg.embed_dim, eps=cfg.eps,
-                                                         family=cfg.family,
-                                                         affine=cfg.layernorm_affine) \
-            if cfg.norm_type_final != "none" else None
-        # layernorm_affine inert warning: the affine gamma/beta exist only on a "layernorm" seam.
+        # layernorm_affine inert warning: the affine gamma/beta exist only on a "layernorm" block norm.
         if cfg.layernorm_affine:
-            if not (cfg.norm_type_block == "layernorm" or cfg.norm_type_final == "layernorm"):
+            if cfg.norm_type_block != "layernorm":
                 import warnings
                 warnings.warn(
-                    "layernorm_affine=True but neither norm_type_block nor norm_type_final is "
-                    "'layernorm': no affine gamma/beta are created and the toggle is inert. Set a "
-                    "norm seam to 'layernorm' to use the learned affine.",
+                    "layernorm_affine=True but norm_type_block is not 'layernorm': no affine gamma/beta "
+                    "are created and the toggle is inert. Set norm_type_block='layernorm' to use the "
+                    "learned affine.",
                     UserWarning, stacklevel=2,
                 )
         # Opt-in CG cross-type coupling (default off; so_n only). Built ONCE from the
@@ -1029,16 +1024,15 @@ class VFEModel(nn.Module):
         _decode_frame_out: Optional[dict]            = None,   # private out-param: the reference decode frame
         _encoded_sigma_out: Optional[dict]           = None,   # private out-param: the stack's input covariance
     ) -> 'Tuple[BeliefState, Optional[torch.Tensor]]':
-        r"""Run the belief pipeline and return the converged belief q* (post final_norm), optionally
+        r"""Run the belief pipeline and return the converged belief q*, optionally
         with the decoded logits. This is the single belief-production seam used by ``forward`` and,
         through it, the ordinary autoregressive sampler in ``generate``.
 
         Factors the (previously inline) sequence q_i(0) = p_i = encode(token) -> phi <- pos_phi ->
-        (optional s-refine) -> precision-bias fold -> vfe_stack (L blocks of E-step belief descent) ->
-        final_norm, i.e. the map from token ids to the converged Gaussian tuple q* = (mu*, Sigma*, phi*).
-        The returned ``BeliefState`` carries mu = final_norm(mu_final, sigma_final), sigma = sigma_final
-        (pushed through a LayerNorm final norm under block_norm_covariance='pushforward', else unchanged),
-        and phi = out.phi UNCHANGED (final_norm does not touch the frame), so a caller reads q*.phi for
+        (optional s-refine) -> precision-bias fold -> vfe_stack (L blocks of E-step belief descent),
+        i.e. the map from token ids to the converged Gaussian tuple q* = (mu*, Sigma*, phi*). No norm runs
+        between the stack and the decoder (the final norm was removed on 2026-10-12), so the returned
+        ``BeliefState`` carries the stack output's mu, sigma and phi, and a caller reads q*.phi for
         the M-step gauge penalty exactly as forward does. ``return_logits`` decodes p(o | q*_i) via
         ``prior_bank.decode`` inside the SAME fp32 island forward's inference branch uses. By default
         the decode covers every position and remains byte-identical to the pre-refactor
@@ -1047,15 +1041,12 @@ class VFEModel(nn.Module):
 
         ``capture`` (an out-param dict, non-None only when ``mstep_self_coupling_weight>0``) is filled
         with the pre-transform intermediates the M-step self-coupling term reads and cannot recover
-        from the post-final_norm belief: ``capture['converged']`` (the last block's converged
+        from the returned belief: ``capture['converged']`` (the last block's converged
         pre-transform q*) and ``capture['final_block_prior']`` (the live ``(mu_p, sigma_p)`` entering
         that block), both written by ``vfe_stack``. ``capture['prior']`` retains the encode-time prior
-        (post s-refine), and ``capture['out']`` retains the raw stack output (pre final_norm).
+        (post s-refine), and ``capture['out']`` retains the raw stack output.
 
-        Reference coordinates. Under ``block_coordinates='reference'`` the final norm, like the block
-        norm and MLP, acts on :math:`\xi_i = U_i^{-1}\mu_i` and is mapped back,
-        :math:`\mu \mapsto U_i\,\mathrm{FN}(U_i^{-1}\mu)`; the returned belief stays in local coordinates.
-        Under ``decode_coordinates='reference'`` the realized relational frame :math:`U_i` is the decode
+        Reference coordinates. Under ``decode_coordinates='reference'`` the realized relational frame :math:`U_i` is the decode
         frame: it is stored as ``capture['canonical_frame']`` (the key every decode caller already
         threads into ``_decode_belief_with_context``) and in the private ``_decode_frame_out['frame']``
         for the fused training CE, so the logits read :math:`(\xi_i, C_i)` on every decode path.
@@ -1178,32 +1169,13 @@ class VFEModel(nn.Module):
         mu_final = out.mu                                        # (B, N, K); CG coupling (if any) applied PER BLOCK
         sigma_final = out.sigma                                  # inside vfe_stack now, not post-stack
 
-        if self.final_norm is not None:                          # config-selected final norm (cached)
-            # block_norm_covariance='pushforward' also carries Sigma through a LayerNorm final norm at the pre-norm
-            # mean, as at the block norm, so a decoder that reads Sigma sees post-norm units (audit 2026-10-10
-            # round 2, item 49); in reference coordinates it acts on C_i = U_i^{-1} Sigma_i U_i^{-T}.
-            push_final = (self.cfg.block_norm_covariance == "pushforward"
-                          and self.cfg.norm_type_final == "layernorm")
-            reference = self.cfg.block_coordinates == "reference"
-            sigma_pushed = (norm_covariance_pushforward(self.final_norm, mu_final, sigma_final, self.group, self.cfg,
-                                                        frame=relational_frame if reference else None)
-                            if push_final else sigma_final)
-            if reference:
-                # Reference coordinates: mu -> U_i FN(U_i^{-1} mu), the same conjugation as the block.
-                bd = relational_frame.block_diagonal
-                xi_final = frame_matvec(relational_frame.inverse, mu_final, bd)    # (B, N, K)
-                mu_final = frame_matvec(relational_frame.forward,
-                                        self.final_norm(xi_final, sigma_final), bd)
-            else:
-                mu_final = self.final_norm(mu_final, sigma_final)
-            sigma_final = sigma_pushed
 
         belief = BeliefState(mu=mu_final, sigma=sigma_final, phi=out.phi,
                              right_phi=out.right_phi)   # carry the exact positional right factor
         if capture is not None:
             # M-step out-param enrichment: vfe_stack already wrote capture['converged'] (q*); add the
-            # encode-time prior p (post s-refine) and the raw pre-final_norm stack output for callers
-            # that need the complete pre-normalization pipeline state.
+            # encode-time prior p (post s-refine) and the raw stack output for callers
+            # that need the complete pipeline state.
             capture["prior"] = beliefs
             capture["out"]   = out
         if _encoded_sigma_out is not None:
@@ -1253,7 +1225,7 @@ class VFEModel(nn.Module):
         # run the existing decode + cross-entropy + M-step assembly reading belief.mu / sigma / phi.
         # Capture regularizer state and, in projected mode, the exact decode frame. Regularizer
         # captures also retain the converged q*, live final-block prior, encode-time prior, and raw
-        # pre-final_norm stack output.
+        # stack output.
         # The prototype-template EM term is read only by a prototype_agents block MLP (else inactive).
         em_weight = (self.cfg.block_mlp_em_weight
                      if self.cfg.use_block_mlp and self.cfg.block_mlp_mode == "prototype_agents" else 0.0)
@@ -1284,7 +1256,7 @@ class VFEModel(nn.Module):
             **({} if decode_frame_out is None else {"_decode_frame_out": decode_frame_out}),
             **({} if encoded_sigma_out is None else {"_encoded_sigma_out": encoded_sigma_out}),
         )
-        mu_final, sigma_final = belief.mu, belief.sigma          # (B, N, K) post final_norm (sigma pushed under pushforward)
+        mu_final, sigma_final = belief.mu, belief.sigma          # (B, N, K) stack output
         encoded_sigma = encoded_sigma_out["sigma"] if encoded_sigma_out is not None else None
         if self.cfg.decode_mode != "linear":
             sigma_final = self._decode_covariance(mu_final, belief.sigma, encoded_sigma)   # what the decoder reads

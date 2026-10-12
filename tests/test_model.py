@@ -92,29 +92,16 @@ def test_group_generators_follow_dtype_move():
     assert model.group.generators.dtype == torch.float64
 
 
-def test_norm_type_final_is_wired():
-    # norm_type_final must actually be applied before decode (not a dead seam): a
-    # configured final norm changes the logits relative to 'none'.
-    base = dict(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
-                n_e_steps=1, e_q_mu_lr=0.05)
-    tok = torch.randint(0, 12, (2, 4))
-    torch.manual_seed(0); m_norm = VFEModel(test_config(**base, norm_type_final="mahalanobis"))
-    torch.manual_seed(0); m_none = VFEModel(test_config(**base, norm_type_final="none"))
-    assert not torch.allclose(m_norm(tok), m_none(tok))
-
-
-def test_norm_type_layernorm_is_wired_both_seams():
-    # "layernorm" flows end-to-end through BOTH norm seams (block + final) with no model.py change:
-    # the registry key builds via get_norm(cfg.norm_type_*) and the standardized means change the
+def test_norm_type_layernorm_is_wired_at_the_block_seam():
+    # "layernorm" flows end-to-end through the block norm seam with no model.py change:
+    # the registry key builds via get_norm(cfg.norm_type_block) and the standardized means change the
     # logits vs 'none'. Parameter-free: it adds no learnable parameters over the 'none' model, so
     # there is no optimizer wiring to do (the whole point of the parameter-free variant).
     base = dict(vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=2,
                 n_e_steps=1, e_q_mu_lr=0.05, layernorm_affine=False)     # parameter-free variant
     tok = torch.randint(0, 12, (2, 4))
-    torch.manual_seed(0); m_ln   = VFEModel(test_config(**base, norm_type_block="layernorm",
-                                                       norm_type_final="layernorm"))
-    torch.manual_seed(0); m_none = VFEModel(test_config(**base, norm_type_block="none",
-                                                       norm_type_final="none"))
+    torch.manual_seed(0); m_ln   = VFEModel(test_config(**base, norm_type_block="layernorm"))
+    torch.manual_seed(0); m_none = VFEModel(test_config(**base, norm_type_block="none"))
     assert not torch.allclose(m_ln(tok), m_none(tok))
     assert sum(p.numel() for p in m_ln.parameters()) == sum(p.numel() for p in m_none.parameters())
 

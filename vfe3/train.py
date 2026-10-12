@@ -376,20 +376,20 @@ def build_optimizer(
         # carry). role='mu' is the catch-all for learned non-variance/non-gauge tables (block_mlp,
         # ...); the bias is not a gauge frame, so it steps under the mean LR, not m_phi_lr.
         groups.append({"params": [model.t5_bias], "lr": cfg.m_p_mu_lr, "weight_decay": 0.0, "role": "mu"})
-    # LayerNorm affine (layernorm_affine=True on a "layernorm" seam): learned per-feature gamma/beta
-    # on the belief mean, carried by the block/final AffineLayerNorm nn.Modules. weight_decay=0 --
+    # LayerNorm affine (layernorm_affine=True on a "layernorm" block norm): learned per-feature gamma/beta
+    # on the belief mean, carried by the block AffineLayerNorm nn.Module. weight_decay=0 --
     # gamma/beta are normalization calibration, not capacity (decaying gamma toward 0 shrinks the
     # normalized signal; the same exemption t5_bias / output_proj_bias carry). role='mu'
     # is the catch-all for learned non-variance/non-gauge tables; NO gauge flag (the affine touches
     # no gauge transport), so it rides as plain AdamW even under GaugeManifoldAdamW.
     ln_affine = []
-    for _nm in (getattr(model, "block_norm", None), getattr(model, "final_norm", None)):
-        if isinstance(_nm, torch.nn.Module):
-            ln_affine += [p for p in _nm.parameters() if p.requires_grad]
+    _nm = getattr(model, "block_norm", None)
+    if isinstance(_nm, torch.nn.Module):
+        ln_affine += [p for p in _nm.parameters() if p.requires_grad]
     if ln_affine:
         # Normalization calibration, not prior-table capacity, so it carries its own optional rate
         # (m_layernorm_lr=None inherits m_p_mu_lr, the historical behavior) and its own aux role, the
-        # way block_mlp does. Both seams' gamma/beta share this ONE group.
+        # way block_mlp does.
         groups.append({"params": ln_affine, "lr": cfg.resolved_hyperparameter("m_layernorm_lr"), "weight_decay": 0.0,
                        "role": "mu", "lr_aux_role": "layernorm"})
 
@@ -1308,10 +1308,12 @@ def _require_causal_next_token_prior(
 ) -> None:
     r"""Refuse next-token training or scoring of a VFE model whose attention prior is not causal.
 
-    Under ``uniform``, ``alibi`` or ``windowed`` position :math:`i` attends to later tokens, so the
-    cross-entropy of target :math:`y_{i+1}` is scored by a model that reads it (audit 2026-10-10 #4). The
-    configuration admits these priors for forward-only studies; the baseline refuses them at construction
-    (``vfe3/baseline.py``), and a baseline model is not checked here, nor a model with no configured prior.
+    Under a non-causal prior position :math:`i` attends to later tokens, so the cross-entropy of target
+    :math:`y_{i+1}` is scored by a model that reads it (audit 2026-10-10 #4). Every built-in prior is causal
+    since the non-causal ``uniform``, ``alibi`` and ``windowed`` were removed on 2026-10-12; this check reads the
+    registry's causality metadata and guards a future non-causal registration. The baseline admits only
+    causal priors at construction (``vfe3/baseline.py``), and a baseline model is not checked here, nor a model
+    with no configured prior.
     """
     cfg = getattr(model, "cfg", None)
     if not is_vfe_model(model) or getattr(cfg, "beta_attention_prior", None) is None:
@@ -1320,7 +1322,7 @@ def _require_causal_next_token_prior(
         raise ValueError(
             f"beta_attention_prior={cfg.beta_attention_prior!r} is not causal for next-token scoring: "
             "each position would attend to the targets it is scored on. Train and evaluate with a prior "
-            "registered as causal (for example 'causal' or 'causal_alibi')")
+            "registered as causal")
 
 
 @torch.no_grad()
@@ -2217,7 +2219,7 @@ def _parameter_group(
         return "other"
     if name.startswith("block_mlps."):
         return "block_mlp"
-    if name.startswith(("block_norm.", "final_norm.")):
+    if name.startswith("block_norm."):
         return "norm"
     from vfe3.baseline import baseline_parameter_group
     return baseline_parameter_group(name) or "other"
@@ -3162,7 +3164,7 @@ def _terminal_validation_signature(
             or get_encode(model.prior_bank.encode_mode) is not _encode_per_token
             or model.cfg.decode_mode != "linear"
             or get_decode_registration("linear").fused_ce is not PriorBank.decode_ce_linear_chunked
-            or model.cfg.norm_type_block != "none" or model.cfg.norm_type_final != "none"
+            or model.cfg.norm_type_block != "none"
             or model.cg_coupling is not None
             or any("forward" in vars(module) for module in model.modules())):
         return None
