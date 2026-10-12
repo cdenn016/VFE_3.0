@@ -201,7 +201,6 @@ def e_step_iteration(
     tau:                       'float | torch.Tensor' = 1.0,
     e_q_mu_lr:                 float = 0.1,
     e_q_sigma_lr:              float = 0.1,
-    value:                     float = 1.0,
     lambda_beta:               'float | torch.Tensor' = 1.0,   # weight on the belief-coupling block (1.0 = pure)
     kl_max:                    float = 100.0,
     eps:                       float = 1e-6,
@@ -210,8 +209,8 @@ def e_step_iteration(
     e_mu_q_trust:              Optional[float] = None,   # Mahalanobis mean trust radius (sigma units); None = unbounded
     skip_belief_sigma_update:  bool = False,             # freeze the belief sigma through this iteration (no grad, no retraction)
     family:                    str  = "gaussian_diagonal",
-    lambda_alpha_mode:         str  = "constant",
-    b0:                        'float | torch.Tensor' = 1.0,   # state-dependent alpha* = c0/(b0 + D)
+    lambda_alpha_mode:         str  = "state_dependent",
+    b0:                        'float | torch.Tensor' = 1.0,   # alpha* = c0/(b0 + D)
     c0:                        'float | torch.Tensor' = 1.0,
 
     log_prior:                 Optional[torch.Tensor]        = None,
@@ -232,13 +231,13 @@ def e_step_iteration(
     :math:`(\Sigma\nabla_\mu F, 2\Sigma\nabla_\Sigma F\Sigma)` through the family Fisher metric
     with an SPD retraction (``'euler'``). The realized frame is fixed throughout the episode, the
     source rows are frozen (filtering), the trajectory is unrolled, and the mean trust region is
-    the Mahalanobis ball. A state-dependent ``lambda_alpha_mode`` recomputes alpha*(q) = c0/(b0 + D)
+    the Mahalanobis ball. The self-coupling alpha*(q) = c0/(b0 + D) is recomputed
     from the current receiver and the layer prior at every iteration (full_link_context_at): the
     Euler force is then the exact gradient of the profiled energy, and the undamped closed form
     (rho = 1) is its majorize-minimize step; a damped diagonal-family closed form is not guaranteed
     to descend (see full_link_minimizer). ``'closed_form_profiled'`` returns the limit of those MM steps
     from the current iterate, a stationary point of the profiled energy, in one solve
-    (full_link_profiled_minimizer); under a constant alpha it is ``'closed_form'``.
+    (full_link_profiled_minimizer).
     """
     if (relational_operators is None
             or relational_operators.readout_mode not in ("predictive_content", "full_link_update")):
@@ -252,7 +251,7 @@ def e_step_iteration(
             lambda_alpha_mode not in FULL_LINK_ALPHA_MODES
             or family not in ("gaussian_diagonal", "gaussian_full")
             or (lambda_alpha_mode == "state_dependent_per_coord" and family != "gaussian_diagonal")):
-        raise ValueError("full-link filtering requires Gaussian gradient inference, a constant or "
+        raise ValueError("full-link filtering requires Gaussian gradient inference, a "
                          "state-dependent alpha (per coordinate only on gaussian_diagonal), "
                          "and unrolled Fisher steps")
 
@@ -274,7 +273,7 @@ def e_step_iteration(
         if _full_link_context is None:
             _full_link_context = build_full_link_context(
                 belief.mu, belief.sigma, mu_p, sigma_p, relational_frame, relational_operators,
-                tau=tau, lambda_beta=lambda_beta, value=value,
+                tau=tau, lambda_beta=lambda_beta,
                 receiver_noise=relational_operators.receiver_noise, kl_max=kl_max,
                 value_frame=relational_value_frame, log_prior=log_prior, capture=relational_capture,
                 lambda_alpha_mode=lambda_alpha_mode, b0=b0, c0=c0)
@@ -282,7 +281,7 @@ def e_step_iteration(
                 with torch.no_grad():
                     relational_capture["relational_receiver_cost_before"] = full_link_cost(
                         belief.mu, belief.sigma, _full_link_context).detach()
-        # Constant alpha: the episode context itself. State-dependent: alpha frozen at this iterate.
+        # The episode context with alpha frozen at this iterate.
         iterate_context = full_link_context_at(_full_link_context, belief.mu, belief.sigma)
         grad_mu, grad_sigma = full_link_gradients(belief.mu, belief.sigma, iterate_context)
         closed_form = relational_operators.receiver_update in ("closed_form", "closed_form_profiled")
@@ -342,7 +341,6 @@ def e_step(
     e_q_mu_lr:                 float = 0.1,
     e_q_sigma_lr:              float = 0.1,
     n_iter:                    int = 1,
-    value:                     float = 1.0,
     lambda_beta:               'float | torch.Tensor' = 1.0,
     kl_max:                    float = 100.0,
     eps:                       float = 1e-6,
@@ -351,8 +349,8 @@ def e_step(
     e_mu_q_trust:              Optional[float] = None,
     skip_belief_sigma_update:  bool = False,
     family:                    str  = "gaussian_diagonal",
-    lambda_alpha_mode:         str  = "constant",
-    b0:                        'float | torch.Tensor' = 1.0,   # state-dependent alpha* = c0/(b0 + D)
+    lambda_alpha_mode:         str  = "state_dependent",
+    b0:                        'float | torch.Tensor' = 1.0,   # alpha* = c0/(b0 + D)
     c0:                        'float | torch.Tensor' = 1.0,
 
     grad_record:                 Optional[EStepGradientRecord] = None,   # diag out-param: LAST iteration's belief-grad norms
@@ -389,7 +387,7 @@ def e_step(
             episode_law_retry = receiver_law_retry_counter(belief.mu.device)
         full_link_context = build_full_link_context(
             belief.mu, belief.sigma, mu_p, sigma_p, relational_frame, relational_operators,
-            tau=tau, lambda_beta=lambda_beta, value=value,
+            tau=tau, lambda_beta=lambda_beta,
             receiver_noise=relational_operators.receiver_noise, kl_max=kl_max,
             value_frame=relational_value_frame, log_prior=log_prior, capture=relational_capture,
             lambda_alpha_mode=lambda_alpha_mode, b0=b0, c0=c0)
@@ -407,7 +405,7 @@ def e_step(
     for _ in range(n_iter):
         belief = e_step_iteration(
             belief, mu_p, sigma_p, group, tau=tau,
-            e_q_mu_lr=e_q_mu_lr, e_q_sigma_lr=e_q_sigma_lr, value=value, lambda_beta=lambda_beta,
+            e_q_mu_lr=e_q_mu_lr, e_q_sigma_lr=e_q_sigma_lr, lambda_beta=lambda_beta,
             kl_max=kl_max, eps=eps, sigma_max=sigma_max, e_sigma_q_trust=e_sigma_q_trust,
             e_mu_q_trust=e_mu_q_trust, skip_belief_sigma_update=skip_belief_sigma_update,
             family=family, lambda_alpha_mode=lambda_alpha_mode, b0=b0, c0=c0,

@@ -1,23 +1,23 @@
-r"""Per-epoch training-window offsets (``train_window_offset``, audit 2026-10-09 training sweep).
+r"""Per-epoch training-window offsets (audit 2026-10-09 training sweep; the only training policy since 2026-10-12).
 
-Under ``"fixed"`` (the default) training window ``i`` starts at ``i * stride`` in every epoch, bitwise
-as before. Under ``"per_epoch_random"`` every epoch draws an origin :math:`o \in [0, s)` from the train
-loader's seeded generator, window ``i`` starts at :math:`o + i s`, and the window count is the one that
-fits every origin. Tiny streams and models only (K = 4, two heads, one layer).
+A fresh :class:`TokenWindows` and every evaluation stream start window ``i`` at ``i * stride``. :func:`vfe3.train.train`
+switches a training window dataset to per-epoch origins: every epoch draws an origin :math:`o \in [0, s)`, from the
+train loader's generator when the loader shuffles with one and from the global CPU RNG otherwise, window ``i`` starts
+at :math:`o + i s`, and the window count is the one that fits every origin. Tiny streams and models only (K = 4, two
+heads, one layer).
 """
 
 from __future__ import annotations
 
-import dataclasses
 from pathlib import Path
 from typing import Any, List, Tuple
 
 import pytest
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 
 import vfe3.train as vt
-from tests.profiles import config_values, test_config
+from tests.profiles import test_config
 from vfe3.data.datasets import TokenWindows
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import RunArtifacts
@@ -44,34 +44,13 @@ def _cfg(**kw: Any) -> Any:
     return test_config(**base)
 
 
-# ---- config ------------------------------------------------------------------------------------
-
-def test_field_defaults_to_fixed_is_validated_and_is_a_shared_baseline_protocol_field() -> None:
-    import paper_arms as pa
-    from vfe3.baseline import BaselineConfig
-    from vfe3.config import VFE3Config
-
-    assert VFE3Config.__dataclass_fields__["train_window_offset"].default == "fixed"
-    assert BaselineConfig().train_window_offset == "fixed"
-    assert config_values()["train_window_offset"] == "fixed"
-    with pytest.raises(ValueError, match="train_window_offset"):
-        _cfg(train_window_offset="random")
-    with pytest.raises(ValueError, match="train_window_offset"):
-        BaselineConfig(train_window_offset="random")
-    assert pa.BASELINE_PROTOCOL_FIELDS["train_window_offset"] == "train_window_offset"
-    matched = BaselineConfig.matched_to(_cfg(train_window_offset="per_epoch_random", block_mlp_expansion=2,
-                                             use_block_mlp=True))
-    assert matched.train_window_offset == "per_epoch_random"
-
-
 # ---- TokenWindows ------------------------------------------------------------------------------
 
-def test_fixed_windows_are_bitwise_unchanged() -> None:
+def test_a_fresh_dataset_has_fixed_windows() -> None:
     tokens = _stream()
     ds = TokenWindows(tokens, SEQ)
     assert ds.window_offset_mode == "fixed" and ds.window_offset == 0 and len(ds) == 10
     expected = [(tokens[i * SEQ:i * SEQ + SEQ], tokens[i * SEQ + 1:i * SEQ + SEQ + 1]) for i in range(10)]
-    ds.set_window_offset_mode("fixed")                               # a reset on a fresh dataset is a no-op
     for (x, y), (ex, ey) in zip((ds[i] for i in range(len(ds))), expected):
         assert torch.equal(x, ex) and torch.equal(y, ey)
     with pytest.raises(RuntimeError):
@@ -81,7 +60,7 @@ def test_fixed_windows_are_bitwise_unchanged() -> None:
 def test_per_epoch_offsets_tile_each_epoch_without_duplication() -> None:
     tokens = torch.arange(T_TOKENS, dtype=torch.long)                # position-valued stream
     ds = TokenWindows(tokens, SEQ)
-    ds.set_window_offset_mode("per_epoch_random")
+    ds.use_per_epoch_offsets()
     assert len(ds) == 9                                              # floor((T - 1 - 2 SEQ + 1) / SEQ) + 1
     generator = torch.Generator().manual_seed(0)
     origins = set()
@@ -97,10 +76,22 @@ def test_per_epoch_offsets_tile_each_epoch_without_duplication() -> None:
         assert offset + len(ds) * SEQ <= T_TOKENS - 1                # every window lies in the stream
     assert len(origins) > 1                                          # origins differ across epochs
     assert torch.equal(ds.at_origin()[3][0], tokens[3 * SEQ:4 * SEQ])  # the fixed-origin view
-    ds.set_window_offset_mode("fixed")
-    assert len(ds) == 10 and ds.window_offset == 0
+    assert len(ds.at_origin()) == 10
     with pytest.raises(ValueError):
-        TokenWindows(tokens, SEQ, pad_final=True).set_window_offset_mode("per_epoch_random")
+        TokenWindows(tokens, SEQ, pad_final=True).use_per_epoch_offsets()
+
+
+def test_only_in_process_training_window_datasets_get_offsets() -> None:
+    assert vt._configure_train_window_offset(DataLoader(TensorDataset(torch.zeros(4, SEQ)), batch_size=2)) is None
+    evaluation = DataLoader(TokenWindows(_stream(), SEQ, pad_final=True), batch_size=2)
+    assert vt._configure_train_window_offset(evaluation) is None
+    assert evaluation.dataset.window_offset_mode == "fixed"
+    workers = DataLoader(TokenWindows(_stream(), SEQ), batch_size=2, num_workers=1)
+    with pytest.raises(ValueError, match="num_workers=0"):
+        vt._configure_train_window_offset(workers)
+    training = _loader()
+    assert vt._configure_train_window_offset(training) is training.dataset
+    assert training.dataset.window_offset_mode == "per_epoch_random"
 
 
 # ---- the training loop -------------------------------------------------------------------------
@@ -117,33 +108,24 @@ def _record_batches(monkeypatch: pytest.MonkeyPatch) -> List[Tuple[torch.Tensor,
     return seen
 
 
-def test_fixed_training_reads_the_historical_epoch_order(monkeypatch: pytest.MonkeyPatch) -> None:
-    seen = _record_batches(monkeypatch)
-    cfg = _cfg()
-    torch.manual_seed(0)
-    vt.train(VFEModel(cfg), _loader(), cfg, n_steps=8, log_interval=0, generate_samples=False)
-    replay = _loader()
-    expected: List[torch.Tensor] = []
-    while len(expected) < 8:
-        expected.extend(x for x, _ in replay)
-    assert len(seen) == 8 and all(torch.equal(a, b) for a, b in zip(seen, expected[:8]))
-    identity = vt._loader_data_identity(_loader(), cfg.vocab_size)
-    assert "window_offset" not in identity["iterator"]
+def _record_draws(monkeypatch: pytest.MonkeyPatch) -> List[int]:
+    drawn: List[int] = []
+    original_draw = TokenWindows.draw_window_offset
+
+    def recording_draw(self: TokenWindows, generator: Any) -> int:
+        drawn.append(original_draw(self, generator))
+        return drawn[-1]
+
+    monkeypatch.setattr(TokenWindows, "draw_window_offset", recording_draw)
+    return drawn
 
 
 def test_per_epoch_offsets_change_the_origin_and_resume_exactly_mid_epoch(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     seen = _record_batches(monkeypatch)
-    drawn: List[int] = []
-    original_draw = TokenWindows.draw_window_offset
-
-    def recording_draw(self: TokenWindows, generator: torch.Generator) -> int:
-        drawn.append(original_draw(self, generator))
-        return drawn[-1]
-
-    monkeypatch.setattr(TokenWindows, "draw_window_offset", recording_draw)
+    drawn = _record_draws(monkeypatch)
     # Position-valued tokens (vocabulary above the stream length) identify every window's start.
-    cfg = _cfg(train_window_offset="per_epoch_random", checkpoint_interval=4, vocab_size=96)
+    cfg = _cfg(checkpoint_interval=4, vocab_size=96)
     tokens = torch.arange(T_TOKENS, dtype=torch.long)
 
     torch.manual_seed(0)
@@ -175,26 +157,32 @@ def test_per_epoch_offsets_change_the_origin_and_resume_exactly_mid_epoch(
     resumed = _loader(tokens=tokens)
     vt.train(VFEModel(cfg), resumed, cfg, n_steps=8, resume_from=ckpt, log_interval=0, generate_samples=False)
     assert len(seen) == 4 and all(torch.equal(a, b) for a, b in zip(seen, straight_steps[4:]))
-    # A fixed-window run cannot resume this checkpoint: its iterator identity differs.
-    with pytest.raises(RuntimeError, match="data identity"):
-        fixed = dataclasses.replace(cfg, train_window_offset="fixed")
-        vt.train(VFEModel(fixed), _loader(tokens=tokens), fixed, n_steps=8, resume_from=ckpt,
-                 log_interval=0, generate_samples=False)
 
 
-def test_per_epoch_offsets_refuse_a_loader_without_a_generator() -> None:
-    cfg = _cfg(train_window_offset="per_epoch_random")
-    ds = TokenWindows(_stream(), SEQ)
-    loader = DataLoader(ds, batch_size=BATCH, shuffle=False, drop_last=True)
-    with pytest.raises(ValueError, match="torch.Generator"):
-        vt.train(VFEModel(cfg), loader, cfg, n_steps=1, log_interval=0, generate_samples=False)
+def test_a_sequential_loader_draws_from_the_global_rng_and_resumes_exactly(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen = _record_batches(monkeypatch)
+    drawn = _record_draws(monkeypatch)
+    cfg = _cfg(checkpoint_interval=4, vocab_size=96)
+    tokens = torch.arange(T_TOKENS, dtype=torch.long)
 
+    def sequential() -> DataLoader:
+        return DataLoader(TokenWindows(tokens, SEQ), batch_size=BATCH, shuffle=False, drop_last=True)
 
-def test_a_shared_loader_returns_to_fixed_windows_under_a_fixed_config() -> None:
-    loader = _loader()
-    vt.train(VFEModel(_cfg(train_window_offset="per_epoch_random")), loader,
-             _cfg(train_window_offset="per_epoch_random"), n_steps=4, log_interval=0, generate_samples=False)
-    assert loader.dataset.window_offset_mode == "per_epoch_random"
-    vt.train(VFEModel(_cfg()), loader, _cfg(), n_steps=1, log_interval=0, generate_samples=False)
-    assert loader.dataset.window_offset_mode == "fixed" and loader.dataset.window_offset == 0
-    assert len(loader.dataset) == 10
+    torch.manual_seed(0)
+    vt.train(VFEModel(cfg), sequential(), cfg, n_steps=8, log_interval=0, generate_samples=False)
+    assert len(drawn) == 3
+    for step, batch in enumerate(seen):
+        assert [int(start) for start in batch[:, 0]] == [drawn[step // 3] + SEQ * (3 * (step % 3) + row)
+                                                         for row in range(BATCH)]
+    straight_steps = [s.clone() for s in seen]
+    seen.clear()
+
+    torch.manual_seed(0)
+    model = VFEModel(cfg)
+    vt.train(model, sequential(), cfg, n_steps=4, artifacts=RunArtifacts(tmp_path / "run", cfg, model),
+             log_interval=0, generate_samples=False)
+    seen.clear()
+    vt.train(VFEModel(cfg), sequential(), cfg, n_steps=8, resume_from=tmp_path / "run" / "checkpoints" / "step_4.pt",
+             log_interval=0, generate_samples=False)
+    assert len(seen) == 4 and all(torch.equal(a, b) for a, b in zip(seen, straight_steps[4:]))

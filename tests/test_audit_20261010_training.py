@@ -287,15 +287,30 @@ def test_selfloop_radius_without_identity_tokens_does_not_report_the_full_transf
 
 # ------------------------------------------------------------------------- #4: non-causal priors refused
 
-@pytest.mark.parametrize("prior", ["uniform", "alibi", "windowed"])
-def test_train_and_evaluate_refuse_a_non_causal_vfe_prior(prior: str) -> None:
-    cfg = _cfg(beta_attention_prior=prior, max_steps=1)
-    model = _model(cfg)
-    train_loader, val_loader = _loaders(cfg)
-    with pytest.raises(ValueError, match="not causal for next-token"):
-        T.train(model, train_loader, cfg, n_steps=1, device=torch.device("cpu"))
-    with pytest.raises(ValueError, match="not causal for next-token"):
-        T.evaluate(model, val_loader)
+@pytest.mark.registry_mutation
+def test_train_and_evaluate_refuse_a_non_causal_vfe_prior() -> None:
+    r"""No built-in prior is non-causal since 2026-10-12; the guard reads the registry's causality metadata, so a
+    newly registered prior without the causal declaration is refused."""
+    from vfe3.attention_prior import _PRIOR_CAUSALITY, _PRIORS, register_prior
+
+    name = "_test_bidirectional_zero"
+
+    @register_prior(name)
+    def _bidirectional(n_query: int, n_key: int, *, device: Any = None, dtype: torch.dtype = torch.float32,
+                       **kwargs: Any) -> torch.Tensor:
+        return torch.zeros(n_query, n_key, device=device, dtype=dtype)    # (Nq, Nk) sees the future
+
+    try:
+        cfg = _cfg(beta_attention_prior=name, max_steps=1)
+        model = _model(cfg)
+        train_loader, val_loader = _loaders(cfg)
+        with pytest.raises(ValueError, match="not causal for next-token"):
+            T.train(model, train_loader, cfg, n_steps=1, device=torch.device("cpu"))
+        with pytest.raises(ValueError, match="not causal for next-token"):
+            T.evaluate(model, val_loader)
+    finally:
+        _PRIORS.pop(name, None)
+        _PRIOR_CAUSALITY.pop(name, None)
 
 
 def test_baseline_evaluation_does_not_consult_the_vfe_prior(monkeypatch: pytest.MonkeyPatch) -> None:

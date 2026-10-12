@@ -70,7 +70,7 @@ def test_projected_gradient_honors_the_routing_clamp_reference(reference: str) -
         score = relational_score(mu, sigma, mu, sigma, frame, ops, None)    # (1, H, N, N)
     kl_max = 0.5 * float(score.min())     # every row fully saturated under the absolute reference
     context = build_full_link_context(mu, sigma, mu + .2, sigma * 1.2, frame, ops,
-                                      kl_max=kl_max, value=.4)
+                                      kl_max=kl_max)
     weight = torch.arange(1, 4, dtype=mu.dtype)                        # non-constant readout of beta
     (context.beta * weight).sum().backward()
     grad = ops.raw_score_q.grad
@@ -84,7 +84,7 @@ def test_projected_gradient_honors_the_routing_clamp_reference(reference: str) -
         assert not torch.allclose(context.beta, torch.full_like(context.beta, 1 / 3))
         assert grad is None or float(grad.abs().max()) == 0.0
         ops.zero_grad()
-        context = build_full_link_context(mu, sigma, mu + .2, sigma * 1.2, frame, ops, kl_max=1.0, value=.4)
+        context = build_full_link_context(mu, sigma, mu + .2, sigma * 1.2, frame, ops, kl_max=1.0)
         (context.beta * weight).sum().backward()
         assert float(ops.raw_score_q.grad.abs().max()) > 0.0
 

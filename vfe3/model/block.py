@@ -9,7 +9,7 @@ its pushforward on the covariance (first order plus the radial second-order term
 lives in stack.py.
 """
 
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
@@ -43,7 +43,7 @@ def e_step_shared_kwargs(
     (list-valued) b0/c0 for the state-dependent self-coupling.
     """
     return dict(
-        value=cfg.lambda_alpha, kl_max=cfg.kl_max, eps=cfg.eps,
+        kl_max=cfg.kl_max, eps=cfg.eps,
         sigma_max=cfg.sigma_max, e_sigma_q_trust=cfg.e_sigma_q_trust,
         e_mu_q_trust=cfg.e_mu_q_trust,
         family=cfg.family, lambda_alpha_mode=cfg.lambda_alpha_mode,
@@ -128,8 +128,7 @@ def vfe_block(
             res = cg_coupling.forward_moments(pre_mu, pre_sigma)
             capture["cg_moment_energy_rows"].append(cg_moment_energy_rows(
                 pre_mu, pre_sigma, res.mu, res.sigma,
-                kl_max=cfg.kl_max, eps=cfg.eps, family=cfg.family,
-                full_cov_kl_precision=cfg.full_cov_kl_precision))
+                kl_max=cfg.kl_max, eps=cfg.eps, family=cfg.family))
             out = out._replace(mu=res.mu, sigma=res.sigma)
         else:
             mu_cg, sigma_cg = cg_coupling(out.mu, out.sigma)
@@ -138,13 +137,12 @@ def vfe_block(
     # block_norm_covariance='pushforward' (audit 2026-10-10, item 9): each norm application also carries Sigma to
     # post-norm units; inert under a delta_full MLP, whose Jacobian composes the norm's.
     push_norm = getattr(cfg, "block_norm_covariance", "passthrough") == "pushforward" and not mlp_delta_full
-    mlp_autocast = getattr(cfg, "block_mlp_autocast", True)
     if getattr(cfg, "block_coordinates", "local") == "reference":
         return _reference_coordinate_block(
             out, block_norm=block_norm, block_mlp=block_mlp, frame=relational_frame,
             capture=capture, hidden_bias=hidden_bias,
             readout=lambda pushed: _head_block_readout(pushed, out.sigma, group, cfg),
-            push_norm=push_norm, covariance_floor=cfg.block_mlp_covariance_floor, mlp_autocast=mlp_autocast)
+            push_norm=push_norm, covariance_floor=cfg.block_mlp_covariance_floor)
     norm_linearization = norm_radial = norm_cap = None
     if block_norm is not None:               # cached parameter-free norm (audit 2d/4f)
         if mlp_delta_full:
@@ -162,7 +160,7 @@ def vfe_block(
     if capture is not None:
         capture["block_mlp_input"] = out     # exact immediate seam after CG/norm
     if block_mlp is not None:                # default-off residual moment transform, after norm before handoff
-        context, mu_in = _block_mlp_precision(mlp_autocast, out.mu)
+        context, mu_in = _block_mlp_precision(out.mu)
         if hasattr(block_mlp, "forward_moments"):
             extra = {} if hidden_bias is None else {"hidden_bias": hidden_bias}
             if norm_linearization is not None:
@@ -183,10 +181,6 @@ def vfe_block(
                 out = out._replace(mu=block_mlp(mu_in))
     if capture is not None:
         capture["block_mlp_output"] = out
-    if block_mlp is not None and block_norm is not None and getattr(cfg, "block_mlp_post_norm", False):
-        # Opt-in post-MLP norm (audit 2026-10-08 P1-5): the next router reads a normalized mean instead
-        # of the MLP residual's token-common offset. Under pushforward Sigma is linearized at the post-MLP mean.
-        out = _apply_block_norm(out, block_norm, group, cfg, push_covariance=push_norm)
     return out
 
 
@@ -213,32 +207,21 @@ def _apply_block_norm(
 
 
 def norm_covariance_pushforward(
-    norm:  Callable[..., torch.Tensor],       # a LayerNorm seam (block or final norm)
+    norm:  Callable[..., torch.Tensor],       # the LayerNorm block norm
     mu:    torch.Tensor,                      # (B, N, K) local pre-norm means
     sigma: torch.Tensor,                      # (B, N, K) or (B, N, K, K) local covariance at mu
     group: GaugeGroup,
     cfg:   VFE3Config,
-    *,
-    frame: Optional[CanonicalFrameContext] = None,   # realized U_i under block_coordinates='reference'
 ) -> torch.Tensor:                            # sigma's layout, read by the family
-    r"""The covariance through a LayerNorm seam under ``block_norm_covariance='pushforward'``, read by the family.
+    r"""The covariance through the LayerNorm block norm under ``block_norm_covariance='pushforward'``, read by the family.
 
-    Local coordinates (``frame=None``): :func:`vfe3.model.block_mlp.block_norm_covariance_pushforward` at the
-    pre-norm mean; the diagonal family keeps its diagonal and ``gaussian_block`` its head blocks, each the
-    M-projection onto the family. Reference coordinates: the norm acts on :math:`\xi_i = U_i^{-1}\mu_i`, so the
-    pushforward acts on the invariant :math:`C_i = U_i^{-1}\Sigma_iU_i^{-\top}` and returns as
-    :math:`\Sigma_i' = U_iC_i'U_i^\top` (then its head blocks on ``gaussian_block``; audit 2026-10-10 round 2, #51). Under
-    the passive action :math:`(\mu, \Sigma, U) \to (g\mu, g\Sigma g^\top, gU)` the pair :math:`(\xi, C)` is invariant and
-    :math:`\Sigma' \to g\Sigma'g^\top`.
+    :func:`vfe3.model.block_mlp.block_norm_covariance_pushforward` at the pre-norm mean in local coordinates; the
+    diagonal family keeps its diagonal and ``gaussian_block`` its head blocks, each the M-projection onto the family.
+    Reference coordinates run their own pushforward on :math:`C_i = U_i^{-1}\Sigma_iU_i^{-\top}` in
+    :func:`_reference_coordinate_block`.
     """
     from vfe3.model.block_mlp import block_norm_covariance_pushforward
-    floor = cfg.block_mlp_covariance_floor
-    if frame is None:
-        return block_norm_covariance_pushforward(norm, mu, sigma, floor, _head_dims(group, cfg))
-    from vfe3.model.frame_actions import frame_matvec, local_covariance, reference_covariance
-    xi = frame_matvec(frame.inverse, mu, frame.block_diagonal)                          # (B, N, K)
-    C = block_norm_covariance_pushforward(norm, xi, reference_covariance(mu, sigma, frame), floor)   # (B, N, K, K)
-    return _head_block_readout(local_covariance(mu, C, frame, diagonal=False).to(sigma.dtype), sigma, group, cfg)
+    return block_norm_covariance_pushforward(norm, mu, sigma, cfg.block_mlp_covariance_floor, _head_dims(group, cfg))
 
 
 def _head_dims(group: GaugeGroup, cfg: VFE3Config) -> Optional[Sequence[int]]:
@@ -248,17 +231,14 @@ def _head_dims(group: GaugeGroup, cfg: VFE3Config) -> Optional[Sequence[int]]:
 
 
 def _block_mlp_precision(
-    enabled: bool,                            # cfg.block_mlp_autocast
-    mu:      torch.Tensor,                    # (B, N, K) block-MLP input mean
+    mu: torch.Tensor,                         # (B, N, K) block-MLP input mean
 ) -> 'tuple[AbstractContextManager, torch.Tensor]':
-    r"""The block MLP's precision context and input mean (``block_mlp_autocast``, audit 2026-10-10 round 2, #29).
+    r"""The block MLP's precision context and input mean (audit 2026-10-10 round 2, #29).
 
-    True: the ambient autocast and the mean unchanged. False: autocast disabled and the mean at
-    ``promote_types(mu.dtype, float32)``, so under ``amp_dtype`` the MLP residual, the only reduced-precision input of
-    the otherwise fp32 router, is computed in fp32.
+    Autocast disabled and the mean at ``promote_types(mu.dtype, float32)``, so under ``amp_dtype`` the MLP residual,
+    otherwise the only reduced-precision input of the fp32 router, is computed in fp32 (hardcoded 2026-10-12;
+    the ``block_mlp_autocast`` toggle that kept the ambient autocast was removed).
     """
-    if enabled:
-        return nullcontext(), mu
     return (torch.autocast(device_type=mu.device.type, enabled=False),
             mu.to(torch.promote_types(mu.dtype, torch.float32)))
 
@@ -297,7 +277,6 @@ def _reference_coordinate_block(
     readout:     Callable[[torch.Tensor], torch.Tensor] = lambda pushed: pushed,   # the family's covariance readout
     push_norm:   bool = False,                             # block_norm_covariance='pushforward' (no delta_full MLP)
     covariance_floor: float = 1e-4,                        # block_mlp_covariance_floor of the pushforwards
-    mlp_autocast: bool = True,                             # block_mlp_autocast
 ) -> BeliefState:
     r"""Norm and MLP in reference coordinates, one conjugation per block (``block_coordinates='reference'``).
 
@@ -326,8 +305,8 @@ def _reference_coordinate_block(
     :math:`\Sigma_i^{(\ell+1)} = U_iC_i'U_i^\top` through the family's readout, so :math:`\Sigma^{(\ell+1)} \to
     g\Sigma^{(\ell+1)}g^\top` under the passive action; the template and prototype MLPs read the reference covariance
     of the pushed belief the family keeps.
-    The frame actions run with autocast off (float32, float64 for an escalated frame); the norm keeps the ambient
-    autocast and the MLP keeps it unless ``mlp_autocast`` is False. The captured
+    The frame actions and the MLP run with autocast off (float32, float64 for an escalated frame); the norm keeps
+    the ambient autocast. The captured
     ``block_mlp_input``/``block_mlp_output`` stay in local coordinates (:math:`U_iv_i`, :math:`U_i\xi_i^+`).
     """
     from vfe3.model.block_mlp import (GaussianTemplateBlockMLP, PrototypeAgentBlockMLP,
@@ -366,7 +345,7 @@ def _reference_coordinate_block(
     if capture is not None:
         capture["block_mlp_input"] = out._replace(mu=frame_matvec(frame.forward, xi, bd), sigma=sigma)
     if block_mlp is not None:
-        context, xi = _block_mlp_precision(mlp_autocast, xi)
+        context, xi = _block_mlp_precision(xi)
         if hasattr(block_mlp, "forward_moments"):
             extra = {} if hidden_bias is None else {"hidden_bias": hidden_bias}
             if linearization is not None:

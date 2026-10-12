@@ -10,7 +10,7 @@ import pytest
 import torch
 
 import vfe3.relational_scoring as scoring
-from tests.test_audit_20261007_opus_fixes import B, H, K, N, V, _cfg, _loss_and_grads, _minimal_agent, _rope_cfg
+from tests.test_audit_20261007_opus_fixes import B, H, K, N, V, _cfg, _minimal_agent, _rope_cfg
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.model.model import VFEModel
 
@@ -103,8 +103,6 @@ def test_eval_forward_replays_at_a_stricter_policy() -> None:
         return "ok"
 
     class Fake:
-        cfg = types.SimpleNamespace(matmul_precision_retry=True)
-
         def __call__(self, *args, **kwargs):
             return forward(*args, **kwargs)
 
@@ -115,9 +113,6 @@ def test_eval_forward_replays_at_a_stricter_policy() -> None:
         assert _eval_forward_with_precision_retry(model) == "ok"
         assert seen == ["high", "highest"]
         assert torch.get_float32_matmul_precision() == "high"
-        model.cfg.matmul_precision_retry = False
-        with pytest.raises(ValueError):
-            _eval_forward_with_precision_retry(model)
     finally:
         torch.set_float32_matmul_precision(previous)
 
@@ -183,17 +178,6 @@ def test_row_min_is_inactive_off_the_kernel_router() -> None:
     with pytest.raises(ValueError, match="routing_kl_max_reference"):
         _cfg(_minimal_agent(predictive_readout="kernel", block_mlp_mode="coordinate",
                             routing_kl_max_reference="row"))
-
-
-def test_block_mlp_post_norm_is_opt_in_and_validated() -> None:
-    """P1-5: the post-MLP norm changes the trained function only when enabled."""
-    base = _minimal_agent(predictive_readout="kernel", block_mlp_mode="coordinate")
-    loss_off, _ = _loss_and_grads(base)
-    loss_on, grads_on = _loss_and_grads({**base, "block_mlp_post_norm": True})
-    assert not torch.equal(loss_off, loss_on)
-    assert all(torch.isfinite(g).all() for g in grads_on.values() if g is not None)
-    with pytest.raises(ValueError, match="block_mlp_post_norm"):
-        _cfg({**base, "block_mlp_post_norm": True, "norm_type_block": "none"})
 
 
 def test_routing_decomposition_refuses_comparison_rope() -> None:

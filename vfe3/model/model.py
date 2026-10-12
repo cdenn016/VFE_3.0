@@ -53,8 +53,7 @@ from vfe3.model.block_mlp import (
     build_block_mlp,
     get_block_mlp_registration,
 )
-from vfe3.model.block import _as_coeff, norm_covariance_pushforward
-from vfe3.model.frame_actions import frame_matvec
+from vfe3.model.block import _as_coeff
 from vfe3.model.positional_phi import positional_phi_coords
 from vfe3.model.prior_bank import (
     DecodeCEResult,
@@ -64,12 +63,7 @@ from vfe3.model.prior_bank import (
     _encode_per_token,
 )
 from vfe3.model.stack import vfe_stack
-from vfe3.families.gaussian import (
-    set_full_cov_kl_precision,
-    validate_full_cov_kl_precision,
-)
-from vfe3.families.base import BeliefParams, get_family as _get_family
-from vfe3.families.policy import family_instance
+from vfe3.families.base import get_family as _get_family
 from vfe3.numerics import FACTOR_CONDITION_TOL, safe_eigvalsh, set_mu_trust_cholesky_rounds
 from vfe3.relational_scoring import (
     GRAM_CONDITION_TOL,
@@ -79,7 +73,7 @@ from vfe3.relational_scoring import (
     set_projected_gram_condition_tol,
     set_projected_recovery_precision,
 )
-from vfe3.runtime import set_fill_uninitialized_memory, set_fp32_matmul_precision
+from vfe3.runtime import disable_fill_uninitialized_memory, set_fp32_matmul_precision
 from vfe3.model.minimal_agent import MINIMAL_AGENT_ELBO_KEYS
 from vfe3.model.relational_operators import RelationalOperators, shared_content_charts
 
@@ -168,8 +162,6 @@ def build_group(cfg: VFE3Config) -> GaugeGroup:
         kwargs["group_n"] = cfg.group_n
     if cfg.irrep_spec is not None and "irrep_spec" in params:
         kwargs["irrep_spec"] = cfg.irrep_spec
-    if getattr(cfg, "irrep_basis", None) is not None and "irrep_basis" in params:
-        kwargs["irrep_basis"] = cfg.irrep_basis
     if getattr(cfg, "gauge_tying", None) is not None and "tying" in params:
         kwargs["tying"] = cfg.gauge_tying
     if arity == 1:
@@ -270,14 +262,6 @@ class VFEModel(nn.Module):
         # before model + loader are built), NOT here: seeding inside __init__ would clobber a
         # caller-set RNG state (e.g. a test that seeds then constructs several models).
         self.cfg = cfg
-        # The full-covariance KL precision policy is model state and the process-wide default for
-        # un-threaded family callers. It is installed under the same one-place-set rule as the
-        # Cholesky and fp32-matmul policies below, so direct full-Gaussian calls and the
-        # PriorBank fallback resolve the config-selected policy rather than the module default.
-        self.full_cov_kl_precision = validate_full_cov_kl_precision(
-            cfg.full_cov_kl_precision)
-        # Same one-place-set rule for the KL policy itself (audit 2026-08-06 C1).
-        set_full_cov_kl_precision(self.full_cov_kl_precision)
         # projected_factorization: the certificate and factor route; tolerances and the fp32 recovery
         # precision (float64 fallback) are fixed.
         set_projected_condition_recovery(cfg.projected_factorization != "gram")
@@ -298,7 +282,7 @@ class VFEModel(nn.Module):
         # card untouched, so this line changes nothing unless a config asks for it.
         set_fp32_matmul_precision(cfg.fp32_matmul_precision)
         # Process-global like the matmul policy; torch reads it only under deterministic algorithms.
-        set_fill_uninitialized_memory(cfg.fill_uninitialized_memory)
+        disable_fill_uninitialized_memory()
         self._transport_status: Dict[str, bool] = {}
         self.group = build_group(cfg)
         if self.group.basis_fingerprint is not None:
@@ -324,7 +308,6 @@ class VFEModel(nn.Module):
                                 attention_residual=cfg.attention_residual and predictive and not minimal_agent,
                                 output_init_scale=output_init_scale,
                                 receiver_noise=cfg.relational_receiver_noise,
-                                receiver_law=cfg.relational_receiver_law,
                                 receiver_update=cfg.relational_receiver_update,
                                 receiver_damping=cfg.relational_receiver_damping,
                                 receiver_measurement=cfg.relational_receiver_measurement,
@@ -369,14 +352,14 @@ class VFEModel(nn.Module):
         # n_heads=1 (the (1, N, N) prior is squeezed to the (N, N) convention in
         # _attention_log_prior below).
         for _pname in ("beta_attention_prior",):
-            if (getattr(cfg, _pname) in ("alibi", "causal_alibi", "causal_alibi_noself")
+            if (getattr(cfg, _pname) in ("causal_alibi", "causal_alibi_noself")
                     and cfg.n_heads != len(self.group.irrep_dims)):
                 raise ValueError(
                     f"{_pname}={getattr(cfg, _pname)!r} builds an (n_heads, N, N) prior but the "
                     f"energy head axis is {len(self.group.irrep_dims)} "
                     f"(irrep_dims={self.group.irrep_dims}); set "
                     f"n_heads={len(self.group.irrep_dims)} or use a headless prior "
-                    f"(uniform/causal/windowed/...)."
+                    f"(causal/causal_windowed/...)."
                 )
         n_gen = self.group.generator_shape[0]
         self.prior_bank = PriorBank(
@@ -386,12 +369,9 @@ class VFEModel(nn.Module):
             decode_av_precision=cfg.decode_av_precision,
             diagonal_covariance=cfg.diagonal_covariance,
             family=cfg.family,
-            full_cov_precision_policy=self.full_cov_kl_precision,
-            decode_bias=cfg.decode_bias,
             encode_mode=cfg.encode_mode, decode_mode=cfg.decode_mode,
             decode_chunk_size=cfg.decode_chunk_size,
             decode_ce_checkpoint=cfg.decode_ce_checkpoint,
-            expected_likelihood_kernel=cfg.expected_likelihood_kernel,
             decode_ranking_fp64_escalation=cfg.decode_ranking_fp64_escalation,
             # Tier-1/Tier-2 decode toggles (2026-07-05; all default OFF, byte-identical):
             unigram_kappa=cfg.unigram_kappa,
@@ -489,18 +469,14 @@ class VFEModel(nn.Module):
                 print("\n" + "-" * 72 + "\n"
                       "WARNING: canonical_frame + RoPE uses a split positional path.\n"
                       + "\n".join(rope_caveats) + "\n" + "-" * 72 + "\n")
-        self.final_norm = get_norm(cfg.norm_type_final)(cfg.embed_dim, eps=cfg.eps,
-                                                         family=cfg.family,
-                                                         affine=cfg.layernorm_affine) \
-            if cfg.norm_type_final != "none" else None
-        # layernorm_affine inert warning: the affine gamma/beta exist only on a "layernorm" seam.
+        # layernorm_affine inert warning: the affine gamma/beta exist only on a "layernorm" block norm.
         if cfg.layernorm_affine:
-            if not (cfg.norm_type_block == "layernorm" or cfg.norm_type_final == "layernorm"):
+            if cfg.norm_type_block != "layernorm":
                 import warnings
                 warnings.warn(
-                    "layernorm_affine=True but neither norm_type_block nor norm_type_final is "
-                    "'layernorm': no affine gamma/beta are created and the toggle is inert. Set a "
-                    "norm seam to 'layernorm' to use the learned affine.",
+                    "layernorm_affine=True but norm_type_block is not 'layernorm': no affine gamma/beta "
+                    "are created and the toggle is inert. Set norm_type_block='layernorm' to use the "
+                    "learned affine.",
                     UserWarning, stacklevel=2,
                 )
         # Opt-in CG cross-type coupling (default off; so_n only). Built ONCE from the
@@ -514,8 +490,7 @@ class VFEModel(nn.Module):
                 cfg.group_n, self.group.algebra,
                 self.group.irrep_dims, self.group.irrep_labels,
                 cg_covariance_mode=cfg.cg_covariance_mode,
-                cg_covariance_floor=cfg.cg_covariance_floor,
-                irrep_basis=cfg.irrep_basis)
+                cg_covariance_floor=cfg.cg_covariance_floor)
         else:
             self.cg_coupling = None
         # The projected routes run on the flat connection, whose registration has no trainable
@@ -611,12 +586,6 @@ class VFEModel(nn.Module):
         r"""Return the ambient block sizes the beta score is computed in."""
         return self.group.irrep_dims
 
-    def _family_instance(
-        self, family: type[BeliefParams], mu: torch.Tensor, sigma: torch.Tensor,
-    ) -> BeliefParams:
-        """Construct a model-owned Gaussian with this model's immutable policy."""
-        return family_instance(mu, sigma, family, self.full_cov_kl_precision)
-
     def load_state_dict(
         self,
         state_dict: Mapping[str, Any],
@@ -638,15 +607,14 @@ class VFEModel(nn.Module):
                 import warnings
                 warnings.warn(
                     "checkpoint predates the irrep-basis fingerprint; its so_n basis cannot be "
-                    "verified against this build (irrep_basis="
-                    f"{self.cfg.irrep_basis!r})", UserWarning, stacklevel=2)
+                    "verified against this build's canonical basis", UserWarning, stacklevel=2)
                 state_dict = {**state_dict, key: self.gauge_basis_fingerprint.detach().clone()}
             elif not torch.equal(saved.detach().to(device="cpu", dtype=torch.uint8),
                                  self.gauge_basis_fingerprint.detach().cpu()):
                 raise ValueError(
-                    "checkpoint was trained in a different so_n irrep basis than this build "
-                    f"(irrep_basis={self.cfg.irrep_basis!r}); its learned tables would load "
-                    "against the wrong frames. A config saved before 2026-10-05 loads as 'eigh'.")
+                    "checkpoint was trained in a different so_n irrep basis than this build's "
+                    "canonical basis (such as the 'eigh' basis removed 2026-10-12); its learned "
+                    "tables would load against the wrong frames.")
         return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
     def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True) -> "VFEModel":
@@ -1029,16 +997,15 @@ class VFEModel(nn.Module):
         _decode_frame_out: Optional[dict]            = None,   # private out-param: the reference decode frame
         _encoded_sigma_out: Optional[dict]           = None,   # private out-param: the stack's input covariance
     ) -> 'Tuple[BeliefState, Optional[torch.Tensor]]':
-        r"""Run the belief pipeline and return the converged belief q* (post final_norm), optionally
+        r"""Run the belief pipeline and return the converged belief q*, optionally
         with the decoded logits. This is the single belief-production seam used by ``forward`` and,
         through it, the ordinary autoregressive sampler in ``generate``.
 
         Factors the (previously inline) sequence q_i(0) = p_i = encode(token) -> phi <- pos_phi ->
-        (optional s-refine) -> precision-bias fold -> vfe_stack (L blocks of E-step belief descent) ->
-        final_norm, i.e. the map from token ids to the converged Gaussian tuple q* = (mu*, Sigma*, phi*).
-        The returned ``BeliefState`` carries mu = final_norm(mu_final, sigma_final), sigma = sigma_final
-        (pushed through a LayerNorm final norm under block_norm_covariance='pushforward', else unchanged),
-        and phi = out.phi UNCHANGED (final_norm does not touch the frame), so a caller reads q*.phi for
+        (optional s-refine) -> precision-bias fold -> vfe_stack (L blocks of E-step belief descent),
+        i.e. the map from token ids to the converged Gaussian tuple q* = (mu*, Sigma*, phi*). No norm runs
+        between the stack and the decoder (the final norm was removed on 2026-10-12), so the returned
+        ``BeliefState`` carries the stack output's mu, sigma and phi, and a caller reads q*.phi for
         the M-step gauge penalty exactly as forward does. ``return_logits`` decodes p(o | q*_i) via
         ``prior_bank.decode`` inside the SAME fp32 island forward's inference branch uses. By default
         the decode covers every position and remains byte-identical to the pre-refactor
@@ -1047,15 +1014,12 @@ class VFEModel(nn.Module):
 
         ``capture`` (an out-param dict, non-None only when ``mstep_self_coupling_weight>0``) is filled
         with the pre-transform intermediates the M-step self-coupling term reads and cannot recover
-        from the post-final_norm belief: ``capture['converged']`` (the last block's converged
+        from the returned belief: ``capture['converged']`` (the last block's converged
         pre-transform q*) and ``capture['final_block_prior']`` (the live ``(mu_p, sigma_p)`` entering
         that block), both written by ``vfe_stack``. ``capture['prior']`` retains the encode-time prior
-        (post s-refine), and ``capture['out']`` retains the raw stack output (pre final_norm).
+        (post s-refine), and ``capture['out']`` retains the raw stack output.
 
-        Reference coordinates. Under ``block_coordinates='reference'`` the final norm, like the block
-        norm and MLP, acts on :math:`\xi_i = U_i^{-1}\mu_i` and is mapped back,
-        :math:`\mu \mapsto U_i\,\mathrm{FN}(U_i^{-1}\mu)`; the returned belief stays in local coordinates.
-        Under ``decode_coordinates='reference'`` the realized relational frame :math:`U_i` is the decode
+        Reference coordinates. Under ``decode_coordinates='reference'`` the realized relational frame :math:`U_i` is the decode
         frame: it is stored as ``capture['canonical_frame']`` (the key every decode caller already
         threads into ``_decode_belief_with_context``) and in the private ``_decode_frame_out['frame']``
         for the fused training CE, so the logits read :math:`(\xi_i, C_i)` on every decode path.
@@ -1178,32 +1142,13 @@ class VFEModel(nn.Module):
         mu_final = out.mu                                        # (B, N, K); CG coupling (if any) applied PER BLOCK
         sigma_final = out.sigma                                  # inside vfe_stack now, not post-stack
 
-        if self.final_norm is not None:                          # config-selected final norm (cached)
-            # block_norm_covariance='pushforward' also carries Sigma through a LayerNorm final norm at the pre-norm
-            # mean, as at the block norm, so a decoder that reads Sigma sees post-norm units (audit 2026-10-10
-            # round 2, item 49); in reference coordinates it acts on C_i = U_i^{-1} Sigma_i U_i^{-T}.
-            push_final = (self.cfg.block_norm_covariance == "pushforward"
-                          and self.cfg.norm_type_final == "layernorm")
-            reference = self.cfg.block_coordinates == "reference"
-            sigma_pushed = (norm_covariance_pushforward(self.final_norm, mu_final, sigma_final, self.group, self.cfg,
-                                                        frame=relational_frame if reference else None)
-                            if push_final else sigma_final)
-            if reference:
-                # Reference coordinates: mu -> U_i FN(U_i^{-1} mu), the same conjugation as the block.
-                bd = relational_frame.block_diagonal
-                xi_final = frame_matvec(relational_frame.inverse, mu_final, bd)    # (B, N, K)
-                mu_final = frame_matvec(relational_frame.forward,
-                                        self.final_norm(xi_final, sigma_final), bd)
-            else:
-                mu_final = self.final_norm(mu_final, sigma_final)
-            sigma_final = sigma_pushed
 
         belief = BeliefState(mu=mu_final, sigma=sigma_final, phi=out.phi,
                              right_phi=out.right_phi)   # carry the exact positional right factor
         if capture is not None:
             # M-step out-param enrichment: vfe_stack already wrote capture['converged'] (q*); add the
-            # encode-time prior p (post s-refine) and the raw pre-final_norm stack output for callers
-            # that need the complete pre-normalization pipeline state.
+            # encode-time prior p (post s-refine) and the raw stack output for callers
+            # that need the complete pipeline state.
             capture["prior"] = beliefs
             capture["out"]   = out
         if _encoded_sigma_out is not None:
@@ -1253,7 +1198,7 @@ class VFEModel(nn.Module):
         # run the existing decode + cross-entropy + M-step assembly reading belief.mu / sigma / phi.
         # Capture regularizer state and, in projected mode, the exact decode frame. Regularizer
         # captures also retain the converged q*, live final-block prior, encode-time prior, and raw
-        # pre-final_norm stack output.
+        # stack output.
         # The prototype-template EM term is read only by a prototype_agents block MLP (else inactive).
         em_weight = (self.cfg.block_mlp_em_weight
                      if self.cfg.use_block_mlp and self.cfg.block_mlp_mode == "prototype_agents" else 0.0)
@@ -1284,7 +1229,7 @@ class VFEModel(nn.Module):
             **({} if decode_frame_out is None else {"_decode_frame_out": decode_frame_out}),
             **({} if encoded_sigma_out is None else {"_encoded_sigma_out": encoded_sigma_out}),
         )
-        mu_final, sigma_final = belief.mu, belief.sigma          # (B, N, K) post final_norm (sigma pushed under pushforward)
+        mu_final, sigma_final = belief.mu, belief.sigma          # (B, N, K) stack output
         encoded_sigma = encoded_sigma_out["sigma"] if encoded_sigma_out is not None else None
         if self.cfg.decode_mode != "linear":
             sigma_final = self._decode_covariance(mu_final, belief.sigma, encoded_sigma)   # what the decoder reads
@@ -1422,8 +1367,7 @@ class VFEModel(nn.Module):
             # is DETACHED: by the alpha-envelope (alpha* is the stationary point of alpha*D + R(alpha),
             # so d/dalpha[alpha*D + R] = 0 there), the M-step gradient of the F self-term w.r.t. the
             # prior is alpha_i* dD/dtheta with alpha_i* held fixed -- detaching it (and dropping R)
-            # is exact for the closed-form forms (constant/state_dependent/state_dependent_per_coord).
-            # At constant alpha=1.0 (the default) alpha_i==1, byte-identical to the prior mean-D form.
+            # is exact for the closed-form forms (state_dependent/state_dependent_per_coord).
             # Grad-connected through D (no detach on D), so it backprops to the learned prior tables,
             # like mass_phi. Capturing the final-block input preserves the exact stack recurrence at
             # every depth; at n_layers=1 it is the encode-time prior, preserving the existing path.
@@ -1435,12 +1379,12 @@ class VFEModel(nn.Module):
             fam = get_family(cfg.family)
             q_conv = cap["converged"]                           # q*: pre-transform converged belief
             self_div = self_divergence_for_alpha(               # (B, N) summed, or (B, N, K) per-coord
-                self._family_instance(fam, q_conv.mu, q_conv.sigma),
-                self._family_instance(fam, mu_p, sigma_p),
+                fam(q_conv.mu, q_conv.sigma),
+                fam(mu_p, sigma_p),
                 kl_max=cfg.kl_max, eps=cfg.eps, lambda_alpha_mode=cfg.lambda_alpha_mode,
             )
             alpha_sc, _ = self_coupling_alpha(                  # SAME form as the E-step / diagnostics
-                self_div, mode=cfg.lambda_alpha_mode, value=cfg.lambda_alpha, b0=_as_coeff(cfg.b0, cap["out"].mu.device), c0=_as_coeff(cfg.c0, cap["out"].mu.device),
+                self_div, mode=cfg.lambda_alpha_mode, b0=_as_coeff(cfg.b0, cap["out"].mu.device), c0=_as_coeff(cfg.c0, cap["out"].mu.device),
             )
             coupling = alpha_sc.detach() * self_div            # alpha_i^(k)* D^(k) (envelope: alpha* fixed)
             if alpha_is_per_coord(cfg.lambda_alpha_mode):
@@ -2117,8 +2061,8 @@ class VFEModel(nn.Module):
         ``learn_attention_temperature``; 1 under the minimal agent, whose exact posterior has no
         :math:`\kappa_\beta`; audit 2026-10-10 round 2, item 31). :math:`D^h_{ii} = 0` and :math:`B_{ii} = 0`, so
         :math:`\beta^*` peaks on the diagonal of every row by construction. The self term is the registered
-        form of the M-step self-coupling (``self_coupling_alpha``, its :math:`R(\alpha)` zero under
-        ``constant``, the same ``kl_max``) evaluated at the layer's input belief; the M-step term itself reads
+        form of the M-step self-coupling (``self_coupling_alpha`` with its :math:`R(\alpha)`, the same
+        ``kl_max``) evaluated at the layer's input belief; the M-step term itself reads
         the final block's converged output against its prior, which the output evaluation below matches at the
         last layer (item 27). The columns are per-token means over the batch: ``self_coupling``,
         ``self_divergence`` (the unweighted :math:`D(q_i\|p_i)`), ``belief_coupling`` and
@@ -2153,11 +2097,11 @@ class VFEModel(nn.Module):
             rows = canonical_routing_rows(belief.mu, belief.sigma, frame_inverse, snapshot.log_prior,
                                           tau=tau, irrep_dims=list(group.irrep_dims))
             self_div = self_divergence_for_alpha(                               # (B, N) or (B, N, K)
-                self._family_instance(fam, belief.mu.double(), belief.sigma.double()),
-                self._family_instance(fam, mu_p.double(), sigma_p.double()),
+                fam(belief.mu.double(), belief.sigma.double()),
+                fam(mu_p.double(), sigma_p.double()),
                 kl_max=cfg.kl_max, eps=cfg.eps, lambda_alpha_mode=cfg.lambda_alpha_mode)
             alpha, alpha_reg = self_coupling_alpha(
-                self_div, mode=cfg.lambda_alpha_mode, value=cfg.lambda_alpha,
+                self_div, mode=cfg.lambda_alpha_mode,
                 b0=_as_coeff(cfg.b0, device), c0=_as_coeff(cfg.c0, device))
             self_row, raw_row = alpha * self_div + alpha_reg, self_div
             if alpha_is_per_coord(cfg.lambda_alpha_mode):

@@ -5,27 +5,25 @@ Pins, on CPU at tiny size:
 * equal-head goldens captured at 389413b before any Phase 0 edit (rewritten October 9, 2026 for the
   centered pair-KL GEMM, a float32 rounding-level change, under the CUDA interpreter's torch build; the four
   predictive routes rewritten October 12, 2026, same build, for the prior-anchored covariance floor f Sigma_p of
-  audit 2026-10-12 T5, which changes only their moment-matched sigma and the full route's loss and gradients) (block_glk K=4 H=2 and so_n
+  audit 2026-10-12 T5, which changes only their moment-matched sigma and the full route's loss and gradients;
+  the gradient routes rewritten October 12, 2026, same build, for the removal of the ambient_alignment receiver
+  law and of the constant alpha form of the test baseline) (block_glk K=4 H=2 and so_n
   [("l1", 2)] K=6 H=2 on four projected routes): initial state, forward beliefs, loss and every
-  gradient stay bitwise identical, and so_n reproduces them in BOTH irrep bases because l1 is the
-  defining representation in each;
-* the canonical irrep basis: closed-form SO(3) spins of any order, deterministic, exactly related
-  to the eigh basis by an orthogonal intertwiner, and a deterministic tensor basis for N != 3;
-* the irrep_basis config field, its construction check and the loader default 'eigh' for so_n
-  configs saved before the field existed;
-* the generator fingerprint refusing a checkpoint from another basis, and the CG intertwiners
-  re-verified after a buffer load;
+  gradient stay bitwise identical (so_n reproduces them because l1 is the defining representation);
+* the canonical irrep basis: closed-form SO(3) spins of any order, deterministic, and a deterministic
+  tensor basis for N != 3 (the eigh basis and the irrep_basis field were removed 2026-10-12; their
+  loader rules are pinned in tests/test_config_removals_20261012_numerics.py);
+* the generator fingerprint carried by so_n checkpoints, and the CG intertwiners re-verified after a
+  buffer load;
 * the so_n Frobenius Gram certificate and the skew-group exemption from the transport radius.
 """
 from pathlib import Path
-import math
 import warnings
 
 import pytest
 import torch
 
 from tests.profiles import test_config, tiny_config
-from vfe3.config import config_from_serialized, serialize_config
 from vfe3.geometry.generators import generate_son
 from vfe3.geometry.groups import get_group
 from vfe3.geometry.irreps import irrep_generators
@@ -74,8 +72,7 @@ def _golden_run(case: str, route: str, **extra: object) -> dict:
 @pytest.mark.parametrize("route", sorted(_ROUTES))
 @pytest.mark.parametrize("case, extra", [
     ("block_glk", {}),
-    ("so_n", {"irrep_basis": "eigh"}),
-    ("so_n", {"irrep_basis": "canonical"}),
+    ("so_n", {}),
 ])
 def test_equal_head_goldens_are_bitwise_unchanged(case: str, extra: dict, route: str) -> None:
     goldens = torch.load(_GOLDENS)
@@ -86,12 +83,16 @@ def test_equal_head_goldens_are_bitwise_unchanged(case: str, extra: dict, route:
     same_build = goldens.get("torch_version") == torch.__version__
     out = _golden_run(case, route, **extra)
     extra_keys = set(out["state"]) - set(golden["state"])
-    assert extra_keys <= {"gauge_basis_fingerprint"}, extra_keys
+    # The linear decoder's zero-initialized bias is always built since 2026-10-12 (decode_bias removed);
+    # the goldens were captured without it, and a zero bias leaves the forward unchanged.
+    assert extra_keys <= {"gauge_basis_fingerprint", "prior_bank.output_proj_bias"}, extra_keys
+    if "prior_bank.output_proj_bias" in extra_keys:
+        assert not out["state"]["prior_bank.output_proj_bias"].any()
     for key, value in golden["state"].items():
         assert torch.equal(out["state"][key], value), key
     for name in ("mu", "sigma", "phi", "loss"):
         assert torch.equal(out[name].detach(), golden[name]), name
-    assert out["grads"].keys() == golden["grads"].keys()
+    assert out["grads"].keys() - extra_keys == golden["grads"].keys()
     for name, value in golden["grads"].items():
         if same_build:
             assert torch.equal(out["grads"][name], value), name
@@ -106,7 +107,7 @@ _G3 = generate_son(3, dtype=torch.float64)
 
 @pytest.mark.parametrize("l", [1, 2, 3, 6, 8, 12])
 def test_canonical_so3_spin_blocks(l: int) -> None:
-    rho = irrep_generators(_G3, algebra="so", label=f"l{l}", basis="canonical")
+    rho = irrep_generators(_G3, algebra="so", label=f"l{l}")
     d = 2 * l + 1
     assert rho.shape == (3, d, d)
     assert torch.equal(rho, -rho.transpose(-1, -2))                             # exactly skew
@@ -114,109 +115,64 @@ def test_canonical_so3_spin_blocks(l: int) -> None:
     torch.testing.assert_close(casimir, l * (l + 1) * torch.eye(d, dtype=torch.float64), atol=1e-12, rtol=0)
     for a in range(3):                                                         # ||rho_l(L)||_F^2
         assert abs(float((rho[a] ** 2).sum()) - l * (l + 1) * (2 * l + 1) / 3) < 1e-10
-    assert torch.equal(rho, irrep_generators(_G3, algebra="so", label=f"l{l}", basis="canonical"))
+    assert torch.equal(rho, irrep_generators(_G3, algebra="so", label=f"l{l}"))
 
 
 def test_canonical_l1_is_the_defining_representation() -> None:
-    assert torch.equal(irrep_generators(_G3, algebra="so", label="l1", basis="canonical"), _G3)
-    assert torch.equal(irrep_generators(_G3, algebra="so", label="l1", basis="eigh"), _G3)
+    assert torch.equal(irrep_generators(_G3, algebra="so", label="l1"), _G3)
 
 
-@pytest.mark.parametrize("label", ["l2", "l3", "l5"])
-def test_canonical_and_eigh_bases_differ_by_an_orthogonal_intertwiner(label: str) -> None:
-    can = irrep_generators(_G3, algebra="so", label=label, basis="canonical")
-    old = irrep_generators(_G3, algebra="so", label=label, basis="eigh")
-    d = can.shape[-1]
-    eye = torch.eye(d, dtype=torch.float64)
-    # X with can_a X = X old_a for every generator: null space of sum_a ||(I (x) can_a - old_a^T (x) I) vec X||^2.
-    op = torch.cat([torch.kron(eye, can[a]) - torch.kron(old[a].T.contiguous(), eye) for a in range(3)])
-    _, sv, Vh = torch.linalg.svd(op)
-    assert float(sv[-1]) < 1e-10 and float(sv[-2]) > 1e-3                        # one-dimensional (Schur)
-    X = Vh[-1].clone().reshape(d, d).T.contiguous()                             # vec is column-major
-    X = X / X.norm() * math.sqrt(d)
-    torch.testing.assert_close(X.T @ X, eye, atol=1e-10, rtol=0)                # orthogonal
-    for a in range(3):
-        torch.testing.assert_close(can[a] @ X, X @ old[a], atol=1e-10, rtol=0)
-
-
-def test_eigh_basis_keeps_its_rank_cap_and_canonical_lifts_it_for_so3() -> None:
+def test_so3_has_no_rank_cap_and_other_n_keeps_the_tensor_power_cap() -> None:
+    assert irrep_generators(_G3, algebra="so", label="l7").shape == (3, 15, 15)
     with pytest.raises(ValueError, match="rank-7"):
-        irrep_generators(_G3, algebra="so", label="l7", basis="eigh")
-    assert irrep_generators(_G3, algebra="so", label="l7", basis="canonical").shape == (3, 15, 15)
+        irrep_generators(generate_son(4, dtype=torch.float64), algebra="so", label="l7")
 
 
 @pytest.mark.parametrize("N, label", [(2, "l3"), (4, "l2"), (4, "l3"), (5, "l2")])
 def test_canonical_tensor_basis_for_other_n_is_deterministic_and_a_representation(N: int, label: str) -> None:
     G = generate_son(N, dtype=torch.float64)
-    first = irrep_generators(G, algebra="so", label=label, basis="canonical")    # homomorphism asserted inside
-    assert torch.equal(first, irrep_generators(G, algebra="so", label=label, basis="canonical"))
+    first = irrep_generators(G, algebra="so", label=label)    # homomorphism asserted inside
+    assert torch.equal(first, irrep_generators(G, algebra="so", label=label))
     assert float((first + first.transpose(-1, -2)).abs().max()) < 1e-12
 
 
-# ---------------------------------------------------------------- config field and loader
+# ---------------------------------------------------------------- construction check
 
-def test_irrep_basis_config_field_and_construction_check() -> None:
-    cfg = test_config(gauge_group="so_n", group_n=3, irrep_spec=[("l8", 2)], embed_dim=34, n_heads=2)
-    assert cfg.irrep_basis == "canonical"
-    with pytest.raises(ValueError, match="rank-8"):
-        test_config(gauge_group="so_n", group_n=3, irrep_spec=[("l8", 2)], embed_dim=34, n_heads=2,
-                    irrep_basis="eigh")
-    with pytest.raises(ValueError, match="irrep_basis"):
-        test_config(gauge_group="so_n", group_n=3, irrep_spec=[("l1", 2)], embed_dim=6, n_heads=2,
-                    irrep_basis="spherical")
-    assert "irrep_basis" in test_config().inactive_fields()                     # block_glk never reads it
-    assert "irrep_basis" not in test_config(gauge_group="so_n", group_n=3, irrep_spec=[("l1", 2)],
-                                            embed_dim=6, n_heads=2).inactive_fields()
-
-
-def test_saved_so_n_config_without_the_field_loads_in_the_eigh_basis() -> None:
-    so_n = serialize_config(test_config(gauge_group="so_n", group_n=3, irrep_spec=[("l2", 2)],
-                                        embed_dim=10, n_heads=2))
-    legacy = {k: v for k, v in so_n.items() if k != "irrep_basis"}
-    assert config_from_serialized(legacy, source="test").irrep_basis == "eigh"
-    assert config_from_serialized(so_n, source="test").irrep_basis == "canonical"
-    glk = {k: v for k, v in serialize_config(test_config()).items() if k != "irrep_basis"}
-    assert config_from_serialized(glk, source="test").irrep_basis == "canonical"
+def test_canonical_basis_constructs_high_so3_spins() -> None:
+    test_config(gauge_group="so_n", group_n=3, irrep_spec=[("l8", 2)], embed_dim=34, n_heads=2)
 
 
 # ---------------------------------------------------------------- fingerprint and CG reload
 
-def _so_n_l2_model(basis: str, **extra: object) -> VFEModel:
+def _so_n_l2_model(**extra: object) -> VFEModel:
     torch.manual_seed(0)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         return VFEModel(tiny_config(gauge_group="so_n", group_n=3, irrep_spec=[("l2", 2)], embed_dim=10,
-                                    n_heads=2, irrep_basis=basis, **extra))
+                                    n_heads=2, **extra))
 
 
-def test_fingerprint_refuses_a_checkpoint_from_another_basis() -> None:
-    canonical, eigh = _so_n_l2_model("canonical"), _so_n_l2_model("eigh")
-    state = canonical.state_dict()
+def test_fingerprint_is_saved_and_a_same_basis_checkpoint_loads() -> None:
+    state = _so_n_l2_model().state_dict()
     assert "gauge_basis_fingerprint" in state
-    assert not torch.equal(canonical.group.generators, eigh.group.generators)
-    with pytest.raises(ValueError, match="different so_n irrep basis"):
-        eigh.load_state_dict(state)
-    _so_n_l2_model("canonical").load_state_dict(state)                          # same basis loads
+    _so_n_l2_model().load_state_dict(state)                                     # same basis loads
     assert "gauge_basis_fingerprint" not in VFEModel(tiny_config()).state_dict()  # block_glk: deterministic
 
 
 def test_checkpoint_without_fingerprint_loads_with_a_warning() -> None:
-    state = {k: v for k, v in _so_n_l2_model("eigh").state_dict().items() if k != "gauge_basis_fingerprint"}
-    target = _so_n_l2_model("eigh")
+    state = {k: v for k, v in _so_n_l2_model().state_dict().items() if k != "gauge_basis_fingerprint"}
+    target = _so_n_l2_model()
     with pytest.warns(UserWarning, match="predates the irrep-basis fingerprint"):
         target.load_state_dict(state)
 
 
 def test_cg_intertwiners_are_reverified_after_load() -> None:
     cg = dict(use_cg_coupling=True, family="gaussian_full", decode_mode="full_chunked")
-    saved = _so_n_l2_model("canonical", **cg)
+    saved = _so_n_l2_model(**cg)
     assert saved.cg_coupling is not None
     state = {k: v for k, v in saved.state_dict().items() if k != "gauge_basis_fingerprint"}
     with pytest.warns(UserWarning, match="predates"):
-        _so_n_l2_model("canonical", **cg).load_state_dict(state)               # same basis: equivariant
-    with pytest.warns(UserWarning, match="predates"):
-        with pytest.raises(RuntimeError, match="not equivariant for this build's irrep basis"):
-            _so_n_l2_model("eigh", **cg).load_state_dict(state)
+        _so_n_l2_model(**cg).load_state_dict(state)                            # same basis: equivariant
 
 
 # ---------------------------------------------------------------- Gram certificate and chart radius

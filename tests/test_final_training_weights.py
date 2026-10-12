@@ -29,7 +29,7 @@ def test_launcher_saves_and_tests_all_training_without_periodic_checkpoints(
         skip_belief_sigma_update=True,
         generate_embedding_figures=False,
     )
-    loader = DataLoader(TokenWindows(torch.tensor([0, 1, 2, 3, 4]), 4), batch_size=1)
+    loader = DataLoader(TokenWindows(torch.arange(9) % 7, 4), batch_size=1)    # one window at every origin
     run_dir = tmp_path / "run"
     artifacts = importlib.import_module("vfe3.run_artifacts")
     training = importlib.import_module("vfe3.train")

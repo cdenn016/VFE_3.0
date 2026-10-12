@@ -31,8 +31,8 @@ _AUDITED_ROUTE = dict(
     attention_residual=True, predictive_covariance="passthrough",
     gauge_transport="on", pos_phi="learned", use_block_mlp=True,
     block_mlp_mode="coordinate", block_mlp_covariance="passthrough", block_mlp_expansion=2,
-    decode_coordinates="local", decode_unigram_prior=True, decode_bias=True,
-    decode_tau=0.01, lambda_beta=1.0, lambda_alpha_mode="constant",
+    decode_coordinates="local", decode_unigram_prior=True,
+    decode_tau=0.01, lambda_beta=1.0, lambda_alpha_mode="state_dependent",
     transport_chart_max_norm=18.0, decode_av_precision="fp32",
     decode_ranking_fp64_escalation=False,
     skip_belief_sigma_update=False,
@@ -131,13 +131,13 @@ def test_frozen_frame_optimizer_knobs_are_marked_and_inert(gauge_transport: str)
 
 def test_decode_notices_only_report_active_explicit_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     # Notice policy compares dataclass declarations, so give this test its own declarations too.
-    values = config_values(untie_decode_bank=False, decode_bias=False)
+    values = config_values(untie_decode_bank=False)
     for field in fields(VFE3Config):
         monkeypatch.setattr(field, "default", values[field.name])
     with warnings.catch_warnings():
         warnings.simplefilter("error", ConfigNotice)
-        test_config(decode_mode="linear", untie_decode_bank=False, decode_bias=False, decode_tau=1.0)
-        test_config(decode_mode="diagonal_chunked", decode_bias=False, untie_decode_bank=False)
+        test_config(decode_mode="linear", untie_decode_bank=False, decode_tau=1.0)
+        test_config(decode_mode="diagonal_chunked", untie_decode_bank=False)
     inactive = test_config(decode_mode="linear", untie_decode_bank=False).inactive_fields()
     assert "untie_decode_bank" in inactive
     assert "decode_tau" in inactive
@@ -149,7 +149,7 @@ def test_launcher_route_inactive_report() -> None:
     inactive = _cfg(_launcher()).inactive_fields()
     for name in ("family", "lambda_beta", "sigma_max",
                  "mu_trust_cholesky_rounds", "attention_window", "prior_handoff_rho",
-                 "prior_handoff_sigma", "decode_bias"):
+                 "prior_handoff_sigma"):
         assert name in inactive, name
     for name in ("decode_tau", "kappa_beta", "kl_max", "untie_decode_bank"):
         assert name not in inactive, name

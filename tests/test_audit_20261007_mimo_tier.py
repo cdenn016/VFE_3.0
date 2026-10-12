@@ -57,11 +57,9 @@ def test_hidden_temperature_is_not_applicable_on_the_minimal_agent() -> None:
 
 # ---------------------------------------------------------------- items 16, 31, 32: matched baseline
 
-def test_matched_baseline_copies_fill_and_refuses_non_dense_bases() -> None:
+def test_matched_baseline_refuses_non_dense_bases() -> None:
     from vfe3.baseline import BaselineConfig
 
-    base = _cfg(attention_mode="projected_predictive", fill_uninitialized_memory=False)
-    assert BaselineConfig.matched_to(base).fill_uninitialized_memory is False
     for overrides, match in (({"predictive_readout": "minimal_agent"}, "predictive_readout"),
                              ({"use_block_mlp": False}, "no block MLP")):
         with pytest.raises(ValueError, match=match):
@@ -88,17 +86,10 @@ def test_unread_prior_and_cg_knobs_are_reported_inert() -> None:
     assert "alibi_slope" not in _cfg(beta_attention_prior="causal_alibi").inactive_fields()
 
 
-def test_closed_form_full_covariance_marks_sigma_max_and_keeps_kl_precision_with_mstep() -> None:
+def test_closed_form_full_covariance_marks_sigma_max() -> None:
     closed_full = _cfg(relational_receiver_update="closed_form", family="gaussian_full",
-                       skip_belief_sigma_update=False, lambda_alpha_mode="constant")
+                       skip_belief_sigma_update=False, lambda_alpha_mode="state_dependent")
     assert "sigma_max" in closed_full.inactive_fields()
-    mstep = _cfg(family="gaussian_full", lambda_alpha_mode="constant", mstep_self_coupling_weight=0.5)
-    assert "full_cov_kl_precision" not in mstep.inactive_fields()
-
-
-def test_lambda_alpha_is_validated_in_every_alpha_mode() -> None:
-    with pytest.raises(ValueError, match="lambda_alpha"):
-        _cfg(lambda_alpha_mode="state_dependent", lambda_alpha=-1.0)
 
 
 def test_gauge_group_is_validated_against_the_registry() -> None:
@@ -112,7 +103,7 @@ def test_pure_path_report_labels_the_closed_form_update_and_reference_blocks() -
     from vfe3.run_artifacts import _pure_path_report
 
     closed = _cfg(relational_receiver_update="closed_form", family="gaussian_full",
-                  skip_belief_sigma_update=False, lambda_alpha_mode="constant")
+                  skip_belief_sigma_update=False, lambda_alpha_mode="state_dependent")
     toggles = _pure_path_report(closed, [])["config_toggles"]
     assert toggles["spd_retraction_route"] == "closed_form_natural_parameter"
     assert toggles["spd_retraction_exact"] is True
@@ -191,7 +182,7 @@ def _ladder_fixture(monkeypatch: pytest.MonkeyPatch, behavior):
     monkeypatch.setattr(train_module, "train_step", fake_step)
     parameter = torch.nn.Parameter(torch.zeros(1))
     optimizer = torch.optim.SGD([parameter], lr=0.1)
-    model = types.SimpleNamespace(cfg=types.SimpleNamespace(matmul_precision_retry=True))
+    model = types.SimpleNamespace(cfg=types.SimpleNamespace())
 
     def run(policy: str):
         previous = torch.get_float32_matmul_precision()
@@ -245,7 +236,7 @@ def test_only_the_first_replay_warns(monkeypatch, caplog) -> None:
 
     _ladder_fixture(monkeypatch, flaky)
     optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1)
-    model = types.SimpleNamespace(cfg=types.SimpleNamespace(matmul_precision_retry=True))
+    model = types.SimpleNamespace(cfg=types.SimpleNamespace())
     previous = torch.get_float32_matmul_precision()
     torch.set_float32_matmul_precision("high")
     try:

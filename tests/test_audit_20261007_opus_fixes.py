@@ -20,7 +20,7 @@ def _minimal_agent(**overrides: Any) -> Dict[str, Any]:
     cfg.update(vocab_size=V, embed_dim=K, n_heads=H, max_seq_len=N, batch_size=B, eval_stride=None,
                attention_window=N, n_layers=2, attention_mode="projected_predictive",
                predictive_readout="minimal_agent", decode_mode="linear", use_block_mlp=True,
-               block_mlp_mode="prototype_agents", norm_type_block="layernorm", norm_type_final="none",
+               block_mlp_mode="prototype_agents", norm_type_block="layernorm",
                amp_dtype=None, kl_max=8 * K, mstep_self_coupling_weight=0.0, cg_energy_weight=0.0,
                use_cg_coupling=False, projected_factorization="gram")
     cfg.update(overrides)
@@ -66,7 +66,9 @@ def test_minimal_agent_marks_and_is_bit_inert_in_the_reported_knobs(inference: s
     _assert_bit_inert(base, override)
 
 
-@pytest.mark.parametrize("mlp", [{"use_block_mlp": False}, {"norm_type_block": "none"}])
+@pytest.mark.parametrize("mlp", [{"use_block_mlp": False}, {"norm_type_block": "none"},
+                                 {"block_mlp_mode": "coordinate"}, {"block_mlp_mode": "canonical_frame"},
+                                 {"block_mlp_mode": "gaussian_template"}, {"block_mlp_mode": "gauge_gate"}])
 def test_amp_rule_covers_the_other_listed_combinations(mlp: Dict[str, Any]) -> None:
     base = _minimal_agent(**mlp)
     assert "amp_dtype" in _cfg({**base, "amp_dtype": "bf16"}).inactive_fields()
@@ -74,8 +76,8 @@ def test_amp_rule_covers_the_other_listed_combinations(mlp: Dict[str, Any]) -> N
 
 
 def test_amp_and_kl_max_stay_live_where_a_consumer_runs() -> None:
-    coordinate = _cfg(_minimal_agent(block_mlp_mode="coordinate", amp_dtype="bf16")).inactive_fields()
-    assert "amp_dtype" not in coordinate
+    logits = _cfg(_minimal_agent(decode_logits_amp=True, amp_dtype="bf16")).inactive_fields()
+    assert "amp_dtype" not in logits
     kernel = _cfg(_minimal_agent(predictive_readout="kernel", block_mlp_mode="coordinate",
                                  amp_dtype="bf16")).inactive_fields()
     assert "kl_max" not in kernel and "amp_dtype" not in kernel
@@ -93,8 +95,9 @@ def test_mean_field_reason_and_record_do_not_claim_the_exact_posterior() -> None
 
 
 def test_amp_probe_detects_a_bf16_consumer() -> None:
-    """The bit-inertness probe has power: the coordinate MLP does change under CPU bf16 autocast."""
-    base = _minimal_agent(block_mlp_mode="coordinate")
+    """The bit-inertness probe has power: reduced-precision decode logits do change under CPU bf16 autocast (the
+    block MLP's mean path is an fp32 island since 2026-10-12)."""
+    base = _minimal_agent(decode_logits_amp=True)
     loss_a, _ = _loss_and_grads(base)
     loss_b, _ = _loss_and_grads({**base, "amp_dtype": "bf16"})
     assert not torch.equal(loss_a, loss_b)

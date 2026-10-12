@@ -569,8 +569,8 @@ def test_decode_bank_failure_is_recorded(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("overrides, status, phrase", [
     ({"norm_type_block": "layernorm", "layernorm_affine": False}, "broken", "not a symmetry of this run"),
-    ({"gauge_group": "block_glk", "attention_mode": "projected_predictive", "norm_type_block": "none",
-      "norm_type_final": "none"}, "exact", "exact redundancy of this run"),
+    ({"gauge_group": "block_glk", "attention_mode": "projected_predictive", "norm_type_block": "none"},
+     "exact", "exact redundancy of this run"),
 ])
 def test_invariance_note_follows_diagonal_redundancy_status(tmp_path: Path, overrides: Dict[str, Any],
                                                             status: str, phrase: str) -> None:

@@ -79,10 +79,9 @@ def _perturb(model: VFEModel, *, identity_frames: bool = False, seed: int = 0) -
         for op in model.relational_operators_by_layer:
             for p in op.parameters():
                 p.add_(noise(p, 0.3))
-        for norm in (model.block_norm, model.final_norm):
-            if isinstance(norm, torch.nn.Module):
-                for p in norm.parameters():
-                    p.add_(noise(p, 0.2))
+        if isinstance(model.block_norm, torch.nn.Module):
+            for p in model.block_norm.parameters():
+                p.add_(noise(p, 0.2))
         if identity_frames:
             model.prior_bank.phi_embed.zero_()
             if getattr(model, "pos_phi_free", None) is not None:
@@ -111,7 +110,7 @@ def _dataset(seed: int = 3) -> Any:
     return st.eval_windows(torch.randint(0, V, (61,), generator=torch.Generator().manual_seed(seed)), 8, 4)
 
 
-LAYERNORM_FULL = dict(norm_type_final="layernorm", )
+LAYERNORM_FULL: Dict[str, Any] = {}
 TEMPLATE = dict(block_mlp_mode="gaussian_template")
 MOMENT_MATCHED = dict(predictive_covariance="moment_matched", attention_residual=False)
 VARIANTS = {
@@ -346,7 +345,6 @@ def test_capture_keeps_local_coordinates() -> None:
     # delta_full transports its covariance on gaussian_full / gaussian_block (audit 2026-10-10 round 2, #51) only
     (dict(block_mlp_covariance="delta_full"), "block_mlp_covariance"),
     (dict(norm_type_block="mahalanobis"), "norm_type_block"),
-    (dict(norm_type_final="mahalanobis"), "norm_type_final"),
 ])
 def test_config_fails_closed_outside_the_frame_envelope(over: Dict[str, Any], message: str) -> None:
     with pytest.raises(ValueError, match=message):

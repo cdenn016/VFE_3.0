@@ -24,7 +24,7 @@ def _fixture(n: int = 4, seed: int = 3) -> tuple:
 
 # ------------------------------------------------------------------------------------- item 2: tie with a self prior
 
-@pytest.mark.parametrize("prior", ["causal", "causal_alibi", "uniform"])
+@pytest.mark.parametrize("prior", ["causal", "causal_alibi"])
 def test_tie_with_a_self_admitting_prior_warns(prior: str) -> None:
     with pytest.warns(UserWarning, match="causal_noself"):
         tiny_config(tie_comparison_maps=True, beta_attention_prior=prior)
@@ -136,7 +136,6 @@ def test_kl_max_reference_is_keyword_required() -> None:
 
     values = config_values()
     required = dict(attention_residual=False, predictive_covariance="passthrough",
-                    receiver_law=values["relational_receiver_law"],
                     receiver_update=values["relational_receiver_update"],
                     content_link_chart=values["content_link_chart"],
                     minimal_agent_inference=values["minimal_agent_inference"],

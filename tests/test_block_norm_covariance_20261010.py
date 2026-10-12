@@ -210,20 +210,6 @@ def test_model_forward_is_finite_and_executes_the_pre_mlp_pushforward(family: st
     assert model.block_norm.weight.grad is not None and float(model.block_norm.weight.grad.abs().max()) > 0.0
 
 
-@pytest.mark.parametrize("family", ["gaussian_diagonal", "gaussian_full"])
-def test_post_mlp_norm_seam_also_pushes(family: str) -> None:
-    model = _model(_cfg(family, block_mlp_post_norm=True))
-    tokens, _ = _tokens()
-    capture: dict = {}
-    with torch.no_grad():
-        model.forward_beliefs(tokens, capture=capture)
-    mlp_out, block_out = capture["block_mlp_output"], capture["out"]
-    assert torch.allclose(block_out.sigma, _expected(model, mlp_out.mu, mlp_out.sigma), rtol=1e-14, atol=0)
-    assert torch.allclose(block_out.mu, model.block_norm(mlp_out.mu, mlp_out.sigma), rtol=1e-14, atol=0)
-    assert float((block_out.sigma - mlp_out.sigma).abs().max()) > 1e-3
-    assert _positive(block_out.sigma, family == "gaussian_diagonal")
-
-
 # ----------------------------------------------------------------------------------------------
 # delta_full on the diagonal family
 # ----------------------------------------------------------------------------------------------

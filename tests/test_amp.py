@@ -25,7 +25,7 @@ def _tiny_model(**overrides) -> VFEModel:
     base = dict(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                 n_e_steps=2, e_q_mu_lr=0.05,
                 decode_mode="diagonal_chunked", decode_av_precision="fp32",
-                decode_ranking_fp64_escalation=False, lambda_alpha_mode="constant",
+                decode_ranking_fp64_escalation=False, lambda_alpha_mode="state_dependent",
                 mu_init_std=0.02, sigma_init=1.0, phi_scale=0.01)
     base.update(overrides)
     return VFEModel(test_config(**base))

@@ -3,7 +3,7 @@ r"""Dual receiving measurement of the channel_likelihood receiver (audit 2026-10
 ``relational_receiver_measurement='inverse'`` measures :math:`\xi_i` on head h by the head-h rows of
 :math:`O'^{-1}` instead of :math:`O_h'^\top`. Pins, on CPU at tiny size in float64: with equal channel
 precisions the alpha -> 0 frozen-context minimizer is the kernel mean; the minimizer is invariant under
-:math:`(U h, T h, S h, h^{-1}O')`; the default 'adjoint' context is unchanged; config -> model -> operator
+:math:`(U h, T h, S h, h^{-1}O')`; the operator's default 'adjoint' context is unchanged; config -> model -> operator
 wiring and one finite training step under both receiver updates; and the gradient of the context build.
 """
 from typing import Any, Dict, List, Tuple
@@ -36,7 +36,7 @@ def _single_cpu_thread() -> Any:
 
 def _operators(dims: List[int], measurement: str, chart: str = "affine") -> RelationalOperators:
     r"""Float64 channel-law operators moved off the identity start, where O' is orthogonal."""
-    ops = make_relational_operators(dims, 5, readout_mode="full_link_update", receiver_law="channel_likelihood",
+    ops = make_relational_operators(dims, 5, readout_mode="full_link_update",
                                     receiver_measurement=measurement, content_link_chart=chart).double()
     generator = torch.Generator().manual_seed(7)
     with torch.no_grad():
@@ -83,7 +83,7 @@ def _reference_change(ops: RelationalOperators, h: torch.Tensor) -> None:
 
 
 def kernel_mean_gaps(dims: List[int]) -> Dict[str, float]:
-    r"""max |mu* - kernel mean| per measurement, equal channel precisions and alpha / sigma_p = 1e-24.
+    r"""max |mu* - kernel mean| per measurement, equal channel precisions and alpha / sigma_p below 1e-24.
 
     Orthonormal sending rows (T_h T_h^T = I), rotation frames and a constant source variance s give
     R_hj = (s + nu) I for every (h, j), so W_ih = I / (s + nu) for scalar lambda_beta.
@@ -103,15 +103,19 @@ def kernel_mean_gaps(dims: List[int]) -> Dict[str, float]:
                 n, d = T.shape[0], T.shape[1]
                 T.copy_(Q[start:start + n * d].reshape(n, d, K))
                 start += n * d
-        context = build_full_link_context(mu, sigma, mu, sigma * 1e12, frame, ops, value=1e-12,
+        # c0 = 1e-12 bounds alpha* = c0/(b0 + D) by 1e-12.
+        context = build_full_link_context(mu, sigma, mu, sigma * 1e12, frame, ops, c0=1e-12,
                                           receiver_noise=.7, log_prior=CAUSAL)
         kernel = ops.predictive_content(mu, context.beta, frame)                     # (1, N, K)
         gaps[measurement] = float((_minimizer(context) - kernel).abs().max())
     return gaps
 
 
-def reference_change_moves(dims: List[int], chart: str, value: float) -> Dict[str, float]:
-    r"""max |mu*(U h, T h, S h, h^{-1} O') - mu*(U, T, S, O')| per measurement, block h."""
+def reference_change_moves(dims: List[int], chart: str, c0: float) -> Dict[str, float]:
+    r"""max |mu*(U h, T h, S h, h^{-1} O') - mu*(U, T, S, O')| per measurement, block h.
+
+    alpha* = c0/(b0 + KL(q_i||p_i)) reads only the local-coordinate laws, which the change leaves fixed.
+    """
     K = sum(dims)
     U, U_inv = _block_frames(dims, seed=11, orthogonal=False)
     h, h_inv = (x[0, 0] for x in _block_frames(dims, seed=12, orthogonal=False))
@@ -119,7 +123,7 @@ def reference_change_moves(dims: List[int], chart: str, value: float) -> Dict[st
     moves = {}
     for measurement in ("adjoint", "inverse"):
         ops = _operators(dims, measurement, chart)
-        build = lambda f: build_full_link_context(mu, sigma, mu_p, sigma_p, f, ops, value=value,
+        build = lambda f: build_full_link_context(mu, sigma, mu_p, sigma_p, f, ops, c0=c0,
                                                   receiver_noise=.7, log_prior=CAUSAL)
         before = build(CanonicalFrameContext(U, U_inv))
         kernel_before = ops.predictive_content(mu, before.beta, CanonicalFrameContext(U, U_inv))
@@ -143,10 +147,10 @@ def test_inverse_minimizer_is_the_kernel_mean_with_equal_channel_precisions(dims
 
 @pytest.mark.parametrize("chart", ["affine", "exponential"])
 @pytest.mark.parametrize("dims", [[2, 2], [2, 3]])
-@pytest.mark.parametrize("value", [1e-12, .4])
+@pytest.mark.parametrize("c0", [1e-12, .4])
 def test_inverse_minimizer_is_invariant_under_the_reference_change(
-        dims: List[int], chart: str, value: float) -> None:
-    moves = reference_change_moves(dims, chart, value)
+        dims: List[int], chart: str, c0: float) -> None:
+    moves = reference_change_moves(dims, chart, c0)
     assert moves["inverse"] < 1e-10, moves
     assert moves["adjoint"] > 1e-3, moves
 
@@ -159,7 +163,7 @@ def test_default_measurement_is_the_unchanged_adjoint() -> None:
     U, U_inv = _block_frames([2, 3], seed=22, orthogonal=False)
     frame = CanonicalFrameContext(U, U_inv)
     ops = _operators([2, 3], "adjoint")
-    build = lambda: build_full_link_context(mu, sigma, mu_p, sigma_p, frame, ops, value=.4,
+    build = lambda: build_full_link_context(mu, sigma, mu_p, sigma_p, frame, ops,
                                             receiver_noise=.7, log_prior=CAUSAL)
     default = build()
     del ops.receiver_measurement                                     # the pre-option operator
@@ -168,11 +172,6 @@ def test_default_measurement_is_the_unchanged_adjoint() -> None:
         assert torch.equal(getattr(default, name), getattr(legacy, name)), name
     ops.receiver_measurement = "inverse"
     assert not torch.allclose(build().Lambda, default.Lambda)
-    # ambient_alignment never reads the measurement.
-    ops.receiver_law = "ambient_alignment"
-    ambient = build()
-    ops.receiver_measurement = "adjoint"
-    assert torch.equal(build().Lambda, ambient.Lambda)
 
 
 @pytest.mark.parametrize("update", ["closed_form", "euler"])
@@ -185,8 +184,7 @@ def test_tiny_model_trains_one_step_under_the_inverse_measurement(
     ids, targets = _tokens()
     losses = {}
     for measurement in ("adjoint", "inverse"):
-        cfg = _cfg(relational_receiver_law="channel_likelihood", relational_receiver_update=update,
-                   relational_receiver_measurement=measurement)
+        cfg = _cfg(relational_receiver_update=update, relational_receiver_measurement=measurement)
         torch.manual_seed(0)
         model = VFEModel(cfg)
         layers = model.relational_operators_by_layer
@@ -220,7 +218,7 @@ def test_context_build_gradient_under_the_inverse_measurement(chart: str) -> Non
     frame = CanonicalFrameContext(U, U_inv)
 
     def build(m: torch.Tensor, s: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        context = build_full_link_context(m, s, mu_p, sigma_p, frame, ops, value=.4,
+        context = build_full_link_context(m, s, mu_p, sigma_p, frame, ops, c0=.4,
                                           receiver_noise=.7, log_prior=CAUSAL)
         return context.Lambda, context.eta
 

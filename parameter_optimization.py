@@ -92,7 +92,6 @@ config: Dict[str, Any] = dict(
     #################################
     #        Encode/Decode          #
     #################################
-    decode_bias                       = True,     # only for decode_mode='linear'
 
 
     decode_mode                       = 'linear',  # prior-bank: diagonal_chunked/full_chunked/expected_likelihood_chunked
@@ -167,7 +166,7 @@ config: Dict[str, Any] = dict(
     #                Self Energy:
     #        Sum_i alpha_i * KL(q_i||p_i)
     ######################################
-    lambda_alpha_mode          = "state_dependent_per_coord",  # "constant" | "state_dependent" | "state_dependent_per_coord"
+    lambda_alpha_mode          = "state_dependent_per_coord",  # "state_dependent" | "state_dependent_per_coord"
 
     b0   = 1.0,                                # state-dependent alpha shape: alpha* = c0/(b0 + D)
     c0   = 1.0,                                 # state-dependent alpha shape (numerator)
@@ -193,7 +192,6 @@ config: Dict[str, Any] = dict(
     #  lambda_beta*Sum_i beta_ij * KL(q_i||Omega_ij q_j) + ...
     ##########################################################
 
-    lambda_alpha               = 1,          # constant self-coupling value
     lambda_beta                = 1.0,        # belief-coupling block weight (1.0 = pure F)
 
 
@@ -250,7 +248,6 @@ config: Dict[str, Any] = dict(
 
     layernorm_affine           = False,
     norm_type_block            = "none",             # "none" | "mahalanobis"
-    norm_type_final            = "none",             # "none" | "mahalanobis"
 
     prior_handoff_rho          = 1,                  # 1.0 = full flow; 0.0 = priors frozen
     prior_handoff_sigma        = 0.1,                # sigma damping in [0,1] (0.0 = frozen at embedding)
@@ -282,7 +279,6 @@ config: Dict[str, Any] = dict(
     transport_chart_max_norm             = 20,
 
 
-    full_cov_kl_precision                = "fp32_escalate",  # "fp64" | "fp32_escalate"
 
     mu_trust_cholesky_rounds             = 3,
 
@@ -433,12 +429,6 @@ SEARCH_CONFIG: Dict[str, Any] = {
         
         
         
-        "lambda_alpha": {
-            "enabled": False, "bounds": None, "values": [0.0, 0.5, 1.0, 5.0],
-            "scale": "linear",
-            "requires": {"lambda_alpha_mode": "constant", "n_e_steps": 2},
-            "description": "Constant self-coupling value.",
-        },
         "lambda_beta": {
             "enabled": False, "bounds": [0.0, 5.0], "values": None, "scale": "linear",
             "requires": {},

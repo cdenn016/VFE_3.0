@@ -16,7 +16,6 @@ _CONFIG_VALUES: dict[str, Any] = {
     'embed_dim': 4,
     'max_seq_len': 3,
     'eval_stride': None,
-    'train_window_offset': 'fixed',
     'batch_size': 2,
     'max_steps': 15000,
     'warmup_steps': 100,
@@ -25,7 +24,6 @@ _CONFIG_VALUES: dict[str, Any] = {
     'n_heads': 2,
     'seed': 6,
     'deterministic': True,
-    'fill_uninitialized_memory': True,
     'log_interval': 100,
     'eval_interval': 1500,
     'checkpoint_interval': 15000,
@@ -44,11 +42,9 @@ _CONFIG_VALUES: dict[str, Any] = {
     'decode_tau': 1.0,
     'decode_unigram_prior': True,
     'unigram_kappa': 1.0,
-    'decode_bias': True,
     'untie_decode_bank': True,
     'decode_chunk_size': 8192,
     'decode_ce_checkpoint': 'auto',
-    'expected_likelihood_kernel': 'torch',
     'decode_logits_amp': False,
     'decode_second_order': False,
     'decode_ranking_fp64_escalation': True,
@@ -56,7 +52,6 @@ _CONFIG_VALUES: dict[str, Any] = {
     'gauge_transport': 'on',
     'group_n': None,
     'irrep_spec': None,
-    'irrep_basis': 'canonical',
     'irrep_spec_seed': 0,
     'irrep_min_rank': 1,
     'irrep_max_rank': None,
@@ -82,7 +77,6 @@ _CONFIG_VALUES: dict[str, Any] = {
     'content_link_loop_weight': 0.0,
     'content_link_loop_window': 1,
     'relational_receiver_noise': 1.0,
-    'relational_receiver_law': 'ambient_alignment',
     'relational_receiver_measurement': 'adjoint',
     'relational_receiver_update': 'euler',
     'relational_receiver_damping': 1.0,
@@ -96,11 +90,10 @@ _CONFIG_VALUES: dict[str, Any] = {
     'predictive_covariance': 'passthrough',
     'predictive_covariance_floor': 0.0001,
     'predictive_covariance_checkpoint': False,
-    'lambda_alpha_mode': 'constant',
+    'lambda_alpha_mode': 'state_dependent',
     'b0': 1.0,
     'c0': 1.0,
     'lambda_beta': 1.0,
-    'lambda_alpha': 1.0,
     'mass_phi': 0.0,
     'mstep_self_coupling_weight': 0.0,
     'kappa_beta': 1.0,
@@ -112,7 +105,6 @@ _CONFIG_VALUES: dict[str, Any] = {
     't5_max_distance': 128,
     't5_learnable_bias': False,
     'norm_type_block': 'layernorm',
-    'norm_type_final': 'none',
     'block_coordinates': 'local',
     'prior_handoff_rho': 1.0,
     'prior_handoff_sigma': 0.0,
@@ -120,8 +112,6 @@ _CONFIG_VALUES: dict[str, Any] = {
     'block_mlp_mode': 'coordinate',
     'block_mlp_covariance': 'passthrough',
     'block_mlp_activation': 'gelu',
-    'block_mlp_post_norm': False,
-    'block_mlp_autocast': True,
     'block_mlp_covariance_floor': 0.0001,
     'block_mlp_expansion': 8,
     'block_mlp_inference': 'mean_field',
@@ -169,11 +159,8 @@ _CONFIG_VALUES: dict[str, Any] = {
     'e_sigma_q_trust': 5.0,
     'grad_clip': 1.0,
     'grad_clip_scope': 'role',
-    'divergence_abort': False,
     'amp_dtype': None,
     'fp32_matmul_precision': 'highest',
-    'matmul_precision_retry': False,
-    'full_cov_kl_precision': 'fp32_escalate',
     'projected_factorization': 'gram',
     'mu_trust_cholesky_rounds': 3,
     'decode_av_precision': 'fp64',
@@ -209,8 +196,8 @@ def tiny_config(**overrides: Any) -> VFE3Config:
     """Minimal profile for relational and runtime contracts."""
     values = dict(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=3,
                   n_layers=1, n_e_steps=1, norm_type_block='none',
-                  norm_type_final='none', use_block_mlp=False, layernorm_affine=False,
-                  decode_bias=False, decode_unigram_prior=False, untie_decode_bank=False,
+                  use_block_mlp=False, layernorm_affine=False,
+                  decode_unigram_prior=False, untie_decode_bank=False,
                   beta_attention_prior='causal', fp32_matmul_precision=None,
                   attention_mode='projected_predictive', predictive_covariance='moment_matched',
                   attention_residual=True,
@@ -225,7 +212,7 @@ def tiny_config(**overrides: Any) -> VFE3Config:
 # The live route of the train_vfe3.py launcher at tiny scale: projected_predictive with the kernel readout and a
 # moment-matched covariance, gaussian_diagonal, block_glk, a layernorm block norm, the coordinate block MLP, the
 # causal ALiBi prior, the row_min routing clamp, a linear decode and AdamW. The legacy baseline above
-# (projected_gradient, Euler, ambient alignment) stays the default profile; this one is opt-in.
+# (projected_gradient, Euler, state-dependent alpha) stays the default profile; this one is opt-in.
 _LIVE_OVERRIDES: dict[str, Any] = {
     'vocab_size': 7,
     'embed_dim': 4,
@@ -241,7 +228,6 @@ _LIVE_OVERRIDES: dict[str, Any] = {
     'predictive_covariance': 'moment_matched',
     'attention_residual': True,
     'relational_routing': 'gaussian_kl',
-    'relational_receiver_law': 'channel_likelihood',
     'relational_receiver_update': 'closed_form',
     'content_link_chart': 'exponential',
     'family': 'gaussian_diagonal',
@@ -251,7 +237,6 @@ _LIVE_OVERRIDES: dict[str, Any] = {
     'pos_phi': 'learned',
     'rope_mode': 'none',
     'norm_type_block': 'layernorm',
-    'norm_type_final': 'none',
     'layernorm_affine': True,
     'use_block_mlp': True,
     'block_mlp_mode': 'coordinate',
@@ -260,7 +245,6 @@ _LIVE_OVERRIDES: dict[str, Any] = {
     'routing_kl_max_reference': 'row_min',
     'kl_max': None,
     'decode_mode': 'linear',
-    'decode_bias': True,
     'lambda_alpha_mode': 'state_dependent_per_coord',
     'm_phi_update_mode': 'adamw',
     'm_table_update_mode': 'adamw',
@@ -300,9 +284,9 @@ live_config.__test__ = False
 
 
 def make_relational_operators(*args: Any, **overrides: Any) -> Any:
-    """RelationalOperators whose eight required config-mirroring keywords come from the test baseline.
+    """RelationalOperators whose seven required config-mirroring keywords come from the test baseline.
 
-    ``attention_residual``, ``predictive_covariance``, ``receiver_law``, ``receiver_update``,
+    ``attention_residual``, ``predictive_covariance``, ``receiver_update``,
     ``content_link_chart``, ``minimal_agent_inference``, ``kl_max_reference`` and
     ``rope_comparison_covariance`` have no constructor default; explicit keyword arguments override the
     baseline values (the comparison covariance is ``"full"``, the operator spelling of every rope_mode but
@@ -312,7 +296,6 @@ def make_relational_operators(*args: Any, **overrides: Any) -> Any:
     values = _CONFIG_VALUES
     baseline = dict(attention_residual=values['attention_residual'],
                     predictive_covariance=values['predictive_covariance'],
-                    receiver_law=values['relational_receiver_law'],
                     receiver_update=values['relational_receiver_update'],
                     content_link_chart=values['content_link_chart'],
                     minimal_agent_inference=values['minimal_agent_inference'],

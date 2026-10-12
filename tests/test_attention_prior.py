@@ -20,11 +20,6 @@ def _restore_registry_entry(
         registry[name] = previous
 
 
-def test_uniform_is_zero_bias():
-    B = attention_log_prior("uniform", 4, 4)
-    assert torch.allclose(B, torch.zeros(4, 4))
-
-
 def test_causal_masks_future_keys():
     B = attention_log_prior("causal", 3, 3)
     # j > i masked (-inf), j <= i allowed (0)
@@ -32,16 +27,18 @@ def test_causal_masks_future_keys():
     assert B[2, 0] == 0.0 and B[1, 1] == 0.0 and B[2, 2] == 0.0
 
 
-def test_alibi_is_linear_in_distance():
-    # n_heads=1 -> (1, N, N); Press slope for h=1, H=1: 2^(-8) * alibi_slope
+def test_causal_alibi_is_linear_in_past_distance():
+    # n_heads=1 -> (1, N, N); Press slope for h=1, H=1: 2^(-8) * alibi_slope; the future is masked.
     H, N = 1, 4
-    B = attention_log_prior("alibi", N, N, n_heads=H, alibi_slope=1.0)
+    B = attention_log_prior("causal_alibi", N, N, n_heads=H, alibi_slope=1.0)
     assert B.shape == (H, N, N)
-    import math
     slope = 1.0 * (2.0 ** (-8.0 * 1 / 1))          # _press_slopes(1, 1.0)[0]
     for i in range(N):
         for j in range(N):
-            assert torch.isclose(B[0, i, j], torch.tensor(-slope * abs(i - j)), atol=1e-6)
+            if j <= i:
+                assert torch.isclose(B[0, i, j], torch.tensor(-slope * (i - j)), atol=1e-6)
+            else:
+                assert torch.isneginf(B[0, i, j])
 
 
 @pytest.mark.registry_mutation

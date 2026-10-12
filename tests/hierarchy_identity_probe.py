@@ -72,10 +72,10 @@ def main() -> None:
         predictive_covariance="passthrough", attention_residual=False,
 
         use_block_mlp=False, use_cg_coupling=False,
-        norm_type_block="none", norm_type_final="none", layernorm_affine=False,
-        decode_mode="diagonal_chunked", decode_bias=False, decode_unigram_prior=False,
+        norm_type_block="none", layernorm_affine=False,
+        decode_mode="diagonal_chunked", decode_unigram_prior=False,
         untie_decode_bank=False, pos_phi="none",
-        lambda_alpha_mode="constant", skip_belief_sigma_update=False,
+        lambda_alpha_mode="state_dependent", skip_belief_sigma_update=False,
         mu_init_std=0.02, sigma_init=1.0, phi_scale=0.01, beta_attention_prior="causal",
     )
     torch.manual_seed(0)

@@ -29,7 +29,7 @@ def test_log_steps_write_template_rows_and_calibration_is_saved(tmp_path: Path) 
     torch.manual_seed(0)
     model = VFEModel(cfg)
     artifacts = ra.RunArtifacts(tmp_path / "run", cfg, model, save_model_artifacts=False)
-    loader = DataLoader(TokenWindows(torch.arange(41) % V, N), batch_size=B, shuffle=False)
+    loader = DataLoader(TokenWindows(torch.arange(41) % V, N), batch_size=B, shuffle=False, drop_last=True)
     T.train(model, loader, cfg, n_steps=3, log_interval=1, eval_interval=0, device=torch.device("cpu"),
             logger=logging.getLogger("prototype-log-test"), generate_samples=False, artifacts=artifacts)
 

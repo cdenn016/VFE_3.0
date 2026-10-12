@@ -31,7 +31,7 @@ def _outer_cfg(**overrides: object) -> VFE3Config:
         "mu_init_std": 0.02,
         "sigma_init": 1.0,
         "phi_scale": 0.01,
-        "lambda_alpha_mode": "constant",
+        "lambda_alpha_mode": "state_dependent",
         "norm_type_block": "layernorm",
         "layernorm_affine": True,
         "skip_belief_sigma_update": True,

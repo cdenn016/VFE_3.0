@@ -144,7 +144,7 @@ def parameter_role(
         return "other", leaf
     if name.startswith("block_mlps."):
         return "context_processing", "block_mlp"
-    if name.startswith(("block_norm.", "final_norm.")):
+    if name.startswith("block_norm."):
         return "context_processing", "norm"
     if name.startswith("cg_coupling."):
         return "context_processing", "cg_coupling"

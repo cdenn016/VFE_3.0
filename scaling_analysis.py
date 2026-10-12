@@ -107,7 +107,6 @@ _CSV_COLUMNS = [
     "route", "scale_knob", "label", "seed", "n_params", "n_learnable_params",
     "n_non_embedding_params", "embed_dim", "n_heads",
     "n_gen", "gauge_group", "n_layers", "n_e_steps", "family",
-    "full_cov_kl_precision",
     "use_block_mlp", "block_mlp_mode", "block_mlp_covariance", "block_mlp_expansion",
     "block_mlp_activation", "block_mlp_dropout", "block_mlp_covariance_floor",
     "tokens_seen", "est_flops_6ND",
@@ -131,7 +130,6 @@ _SCALING_SOURCE_SPLITS = ("train", "validation", "test")
 _SCALING_STRUCTURAL_FIELDS = (
     "n_params", "scale_knob", "embed_dim", "n_heads", "n_layers", "n_e_steps",
     "n_gen", "gauge_group", "family", "tokens_seen",
-    "full_cov_kl_precision",
     "use_block_mlp", "block_mlp_mode", "block_mlp_covariance",
     "block_mlp_expansion", "block_mlp_activation", "block_mlp_dropout",
     "block_mlp_covariance_floor",
@@ -544,7 +542,6 @@ def harvest(
             "n_layers":    effective_cfg.get("n_layers"),
             "n_e_steps":   effective_cfg.get("n_e_steps"),
             "family":      effective_cfg.get("family"),
-            "full_cov_kl_precision": effective_cfg.get("full_cov_kl_precision"),
             **block_mlp_structure,
             "tokens_seen": sp.get("tokens_seen"),
             "est_flops_6ND":           sp.get("est_flops_6ND"),

@@ -17,7 +17,7 @@ from vfe3.train import _transfer_targets, build_optimizer
 def _config(**overrides: Any) -> VFE3Config:
     values = dict(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=3,
                   n_layers=1, n_e_steps=1, use_block_mlp=False, pos_phi="none",
-                  norm_type_block="none", norm_type_final="none", layernorm_affine=False,
+                  norm_type_block="none", layernorm_affine=False,
                   decode_mode="diagonal_chunked")
     values.update(overrides)
     if values["decode_mode"] == "full_chunked":

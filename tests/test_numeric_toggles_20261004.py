@@ -232,17 +232,13 @@ def test_covariance_checkpoint_is_bit_identical(monkeypatch: pytest.MonkeyPatch)
 
 # -- deterministic fill of uninitialized memory -----------------------------------------------------
 
-@pytest.mark.parametrize("enabled", [False, True])
-def test_model_installs_the_uninitialized_fill_policy(enabled: bool) -> None:
+def test_model_turns_off_the_uninitialized_fill() -> None:
     from vfe3.runtime import deterministic_state
     previous = torch.utils.deterministic.fill_uninitialized_memory
     try:
-        VFEModel(tiny_config(fill_uninitialized_memory=enabled))
-        assert torch.utils.deterministic.fill_uninitialized_memory is enabled
-        assert deterministic_state()["fill_uninitialized_memory"] is enabled
+        torch.utils.deterministic.fill_uninitialized_memory = True
+        VFEModel(tiny_config())
+        assert torch.utils.deterministic.fill_uninitialized_memory is False
+        assert deterministic_state()["fill_uninitialized_memory"] is False
     finally:
         torch.utils.deterministic.fill_uninitialized_memory = previous
-    with pytest.raises(ValueError, match="fill_uninitialized_memory"):
-        test_config(fill_uninitialized_memory=1)
-    assert "fill_uninitialized_memory" in test_config(deterministic=False).inactive_fields()
-    assert "fill_uninitialized_memory" not in test_config(deterministic=True).inactive_fields()

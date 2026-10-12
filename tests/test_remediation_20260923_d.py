@@ -55,7 +55,7 @@ def _sequential_loader(seq_len: int = 8, batch_size: int = 4, n: int = 105,
 
 def test_decode_temperature_is_always_frozen_and_keeps_its_name() -> None:
     torch.manual_seed(0)
-    cfg = _tiny(decode_mode="diagonal_chunked", decode_bias=False, decode_tau=0.5)
+    cfg = _tiny(decode_mode="diagonal_chunked", decode_tau=0.5)
     model = VFEModel(cfg)
     scale = model.prior_bank.decode_log_scale
     assert "prior_bank.decode_log_scale" in model.state_dict()
@@ -129,7 +129,7 @@ def test_relational_output_init_is_the_identity() -> None:
 
 def test_eval_protocol_train_ce_scores_only_the_sliding_window_tail() -> None:
     torch.manual_seed(1)
-    model = VFEModel(_tiny(decode_mode="diagonal_chunked", decode_bias=False))
+    model = VFEModel(_tiny(decode_mode="diagonal_chunked"))
     model.train()
     tokens = torch.randint(0, 6, (2, 8))
     targets = torch.roll(tokens, -1, dims=1)
@@ -155,7 +155,7 @@ def test_generalization_gap_uses_the_validation_protocol_under_a_sliding_window(
         return value
 
     monkeypatch.setattr(train_module, "_eval_protocol_train_ce", _record)
-    cfg = _tiny(decode_mode="diagonal_chunked", decode_bias=False, eval_stride=4, max_steps=2)
+    cfg = _tiny(decode_mode="diagonal_chunked", eval_stride=4, max_steps=2)
     torch.manual_seed(2)
     model = VFEModel(cfg)
     artifacts = RunArtifacts(tmp_path / "run", cfg, model)
@@ -199,8 +199,8 @@ def _self_divergence(model: VFEModel, q, prior) -> float:
     fam = get_family(cfg.family)
     mu_p, sigma_p = prior
     return float(self_divergence_for_alpha(
-        model._family_instance(fam, q.mu, q.sigma),
-        model._family_instance(fam, mu_p, sigma_p),
+        fam(q.mu, q.sigma),
+        fam(mu_p, sigma_p),
         kl_max=cfg.kl_max, eps=cfg.eps, lambda_alpha_mode=cfg.lambda_alpha_mode,
     ).sum())
 
@@ -214,7 +214,7 @@ def test_projected_diagnostics_do_not_report_a_transported_shared_objective(
         overrides: dict) -> None:
     torch.manual_seed(5)
     cfg = _tiny(vocab_size=12, max_seq_len=4, e_q_mu_lr=1.0, mu_init_std=0.5, pos_phi="none",
-                sigma_init=1.0, phi_scale=0.01, lambda_alpha_mode="constant",
+                sigma_init=1.0, phi_scale=0.01, lambda_alpha_mode="state_dependent",
                 rope_mode="none", **overrides)
     model = VFEModel(cfg).eval()
     tokens = torch.tensor([[0, 5, 2, 9]])
@@ -353,7 +353,7 @@ def test_relational_score_rejects_head_coupling_dense_frames_and_accepts_block_o
 
 def test_decode_last_decodes_only_the_final_position(monkeypatch: pytest.MonkeyPatch) -> None:
     torch.manual_seed(7)
-    model = VFEModel(_tiny(decode_mode="diagonal_chunked", decode_bias=False)).eval()
+    model = VFEModel(_tiny(decode_mode="diagonal_chunked")).eval()
     tokens = torch.randint(0, 6, (2, 5))
     with torch.no_grad():
         _, full = model.forward_beliefs(tokens, return_logits=True)

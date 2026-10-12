@@ -85,12 +85,11 @@ def _logits(model: VFEModel, tokens: torch.Tensor) -> torch.Tensor:
         return model.forward_beliefs(tokens, return_logits=True)[1]
 
 
-LAYERNORM = dict(norm_type_block="layernorm", layernorm_affine=True, norm_type_final="layernorm")
+LAYERNORM = dict(norm_type_block="layernorm", layernorm_affine=True)
 CONFIGS = {
     "mlp_only_head_scope":   {},
     "layernorm_full_scope":  dict(LAYERNORM, ),
-    "template_mlp":          dict(norm_type_block="layernorm", norm_type_final="layernorm",
-                                  block_mlp_mode="gaussian_template"),
+    "template_mlp":          dict(norm_type_block="layernorm", block_mlp_mode="gaussian_template"),
     "full_family_gaussian_decode": dict(family="gaussian_full", decode_mode="full_chunked",
                                         block_mlp_mode="gaussian_template"),
 }
@@ -151,7 +150,7 @@ def test_rows_change_the_output_and_restore_the_model_bit_exactly(name: str) -> 
     dataset = _dataset(5)
     base = _nll(model, dataset)
     before = {k: v.clone() for k, v in model.state_dict().items()}
-    final_norm, score = model.final_norm, relational.relational_score
+    score = relational.relational_score
     n_batches = math.ceil(len(dataset) / 2)
     for row in ROW_KEYS:
         with iv.by_key([ROW_KEYS[row]])[1].apply(model) as record:
@@ -166,7 +165,7 @@ def test_rows_change_the_output_and_restore_the_model_bit_exactly(name: str) -> 
     assert all(torch.equal(before[k], v) for k, v in model.state_dict().items())
     assert model_module.vfe_stack is stack_module.vfe_stack
     assert relational.relational_score is score
-    assert "_decode_belief_with_context" not in vars(model) and model.final_norm is final_norm
+    assert "_decode_belief_with_context" not in vars(model)
 
 
 def test_an_exception_inside_the_patch_still_restores() -> None:
@@ -263,8 +262,6 @@ def _reference_logits(model: VFEModel, tokens: torch.Tensor, removed: Sequence[s
                 else:
                     x = mlp.forward(x)
             xi = mv(U11[1], x.double())
-        if model.final_norm is not None:
-            xi = mv(U11[1], model.final_norm(mv(U11[0], xi).float(), beliefs.sigma).double())
         x = mv(U12[0], xi)                                                     # decoder W_out U_12
         pb = model.prior_bank
         logits = x @ pb.output_proj_weight.double().T

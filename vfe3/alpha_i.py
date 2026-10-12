@@ -1,7 +1,6 @@
 r"""Self-coupling coefficient alpha_i for VFE_3.0 (the weight on D(q_i || p_i)).
 
 A config-selected registry of forms:
-  constant                  alpha = value (default 1.0); no regularizer.
   state_dependent           alpha*_i = c0 / (b0 + D(q_i||p_i)), the stationary
                             point of alpha*D + R(alpha), R(alpha)=b0*alpha - c0*log alpha.
   state_dependent_per_coord per-coordinate alpha^(k)* = c0^(k)/(b0^(k) + D^(k)).
@@ -66,22 +65,7 @@ def alpha_regularizer(
 # The complete set of named params across ALL registered alpha forms. Each form's
 # **kwargs may validly contain the other forms' params (the dispatcher forwards a
 # single kwargs bag); only keys OUTSIDE this universe are genuine misspellings.
-_KNOWN_ALPHA_KWARGS: frozenset = frozenset({"value", "b0", "c0", "eps"})
-
-
-@register_alpha("constant")
-def alpha_constant(
-    kl:    torch.Tensor,             # (..., N) or (..., N, K) self-divergence (unused)
-
-    *,
-    value: float = 1.0,
-    **kwargs,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Constant alpha = value, zero regularizer."""
-    unknown = set(kwargs) - _KNOWN_ALPHA_KWARGS
-    if unknown:
-        raise TypeError(f"alpha_constant: unexpected kwargs {sorted(unknown)}")
-    return torch.full_like(kl, value), torch.zeros_like(kl)
+_KNOWN_ALPHA_KWARGS: frozenset = frozenset({"b0", "c0", "eps"})
 
 
 def _state_dependent_coefficient(
@@ -141,46 +125,41 @@ def alpha_gradient_coefficient(
     kl:        torch.Tensor,             # (..., N) or (..., N, K) self-divergence
 
     *,
-    value:     float = 1.0,
     b0:        'float | torch.Tensor' = 1.0,
     c0:        'float | torch.Tensor' = 1.0,
-    mode:      str = "constant",
+    mode:      str,
 ) -> torch.Tensor:
     r"""Effective coefficient a_i multiplying d D(q_i||p_i) in the belief gradient.
 
     By the alpha-envelope, at the state-dependent stationary point alpha* the
     coefficient is alpha* itself: d/dx[alpha*(D)*D + R(alpha*(D))] = alpha* dD/dx,
     because alpha + alpha'(D + b0 - c0/alpha) and the bracket vanishes at alpha*.
-    So no product-rule correction is needed (R must be present in F). Constant
-    mode returns ``value``.
+    So no product-rule correction is needed (R must be present in F).
 
     The coefficient is the alpha leg of the SAME registered form used by the
-    oracle (``self_coupling_alpha``), not a re-derived copy: constant -> value,
-    state-dependent -> alpha* = c0/(b0 + D). Sharing the one
+    oracle (``self_coupling_alpha``), not a re-derived copy: alpha* = c0/(b0 + D). Sharing the one
     formula makes the envelope-cancellation (kernel coefficient == oracle alpha) a
     structural identity rather than a maintained coincidence.
     """
     form = get_alpha(mode)
     # Built-in forms share the same coefficient formula but need no discarded R(alpha).
     # A replacement registration keeps its complete callable and all dependencies.
-    if form is alpha_constant:
-        return torch.full_like(kl, value)
     if form is alpha_state_dependent or form is alpha_state_dependent_per_coord:
         return _state_dependent_coefficient(kl, b0, c0)
-    return form(kl, value=value, b0=b0, c0=c0)[0]
+    return form(kl, b0=b0, c0=c0)[0]
 
 
 def self_coupling_alpha(
     kl:       torch.Tensor,          # (..., N) or (..., N, K) self-divergence
 
     *,
-    mode:     str = "constant",
-    **kwargs,                        # forwarded verbatim to the form (value / b0 / c0 / ...)
+    mode:     str,
+    **kwargs,                        # forwarded verbatim to the form (b0 / c0 / ...)
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Dispatch to the registered alpha form `mode`; returns (alpha, regularizer).
 
-    Variant params are forwarded via **kwargs (each form declares its own:
-    `constant` takes `value`; the state-dependent forms take `b0`/`c0`). A new
+    Variant params are forwarded via **kwargs (each form declares its own; the
+    state-dependent forms take `b0`/`c0`). A new
     form with a novel param slots in by `register_alpha` + config -- the call site
     is never edited (matching the divergence seam, which forwards only what the
     selected leaf declares).

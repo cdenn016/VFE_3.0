@@ -105,7 +105,6 @@ config = dict(
 
     max_seq_len                      = 128,                 # N, context length
     eval_stride                      = 32,
-    train_window_offset              = "fixed",     # "fixed" | "per_epoch_random" (a new window origin in [0, N) each epoch; resume-exact)
 
     batch_size                       = 32,
     max_steps                        = 30000,
@@ -122,7 +121,6 @@ config = dict(
     eval_interval                    = 1500,      # periodic validation every N steps (0 = off)
     diagnose_canonical_free_energy   = False,     # log the canonical free energy (gauge-KL routing) at the captured beliefs
     checkpoint_interval              = 15000,     # save a resumable checkpoint every N steps (0 = off)   
-    divergence_abort                 = False,     # stop after 100 consecutive rejected updates or a row CE above ln V; finalize as "diverged"
     
     #################################
     #           Modes               #
@@ -140,8 +138,7 @@ config = dict(
     tie_comparison_maps              = False,           # S_K := S_Q (kernel readout): D_ii = 0, flat-alignment routing
         
     relational_routing               = "gaussian_kl",           # "gaussian_kl" | "noisy_query" | "noisy_key" | "mean_distance" (noisy_key: kernel readout, temperature 1)
-    relational_receiver_law          = "channel_likelihood",  # "channel_likelihood" | "ambient_alignment" (projected_gradient only)
-    relational_receiver_measurement  = "adjoint",               # "adjoint" O'^T | "inverse" O'^-1, the dual measurement (channel_likelihood only)
+    relational_receiver_measurement  = "adjoint",               # "inverse" O'^-1, the dual measurement (VFE3Config default) | "adjoint" O'^T (projected_gradient only)
     relational_receiver_update       = "closed_form",           # "closed_form" (exact frozen-context update) | "closed_form_profiled" (state-dependent alpha: the profiled stationary point) | "euler" (Fisher step; reads e_q_mu_lr / e_q_sigma_lr / trusts) (projected_gradient only)
        
     predictive_readout               = "minimal_agent",     # "kernel" | "minimal_agent" (projected_predictive only)
@@ -157,7 +154,7 @@ config = dict(
     predictive_covariance_floor      = 1e-4,        # moment_matched / spread_corrected only: floor * Sigma_p (token's local prior covariance), reference-invariant
     diagnose_agent_elbo              = False,       # True | False: per-layer ELBO, evidence and gap at eval (minimal_agent, prototype_agents); never in the loss
     relational_receiver_damping      = 1.0,         # closed_form only: rho in (0, 1]; 1 = the frozen minimizer    
-    relational_receiver_noise        = 1.0,         # channel floor nu I_d (channel_likelihood) | K-dim reference noise (ambient_alignment)
+    relational_receiver_noise        = 1.0,         # channel floor nu I_d, nu > 0 (projected_gradient only)
      
     #################################
     #     Optional Block MLP        #
@@ -170,8 +167,6 @@ config = dict(
     
     block_mlp_mode                   = "prototype_agents",   # "coordinate" | "prototype_agents" | "canonical_frame" | "gaussian_template" | "gauge_gate"
     block_mlp_covariance             = "passthrough",  # "passthrough" | "delta_full" (coordinate, canonical_frame, gauge_gate) | "posterior" (prototype_agents); gaussian_template: "passthrough" only
-    block_mlp_post_norm              = False,          # block norm reapplied to the post-MLP mean before the next router (local coords, needs a block norm)
-    block_mlp_autocast               = True,           # False: the MLP mean path runs in an fp32 island under amp_dtype (not read by prototype_agents)
     block_mlp_template_init          = "absolute",   # "absolute" | "working_variance" (lambda_0, nu from one batch; prototype_agents only)
     
     block_mlp_inference              = "mean_field",   # "mean_field" | "exact" (prototype_agents only)
@@ -193,7 +188,6 @@ config = dict(
 
     layernorm_affine                 = True,
     norm_type_block                  = "layernorm",        # "none" | "layernorm" | "mahalanobis" - often useful
-    norm_type_final                  = "none",             # "none" | "layernorm" | "mahalanobis" - performs worse generally
     block_norm_covariance            = "passthrough",      # "passthrough" | "pushforward" (Sigma -> J_LN Sigma J_LN^T + floor D Sigma D; diagonal family: its diagonal)
 
     #################################
@@ -215,7 +209,6 @@ config = dict(
     
     decode_unigram_prior             = True,       # add kappa*log pi_v (corpus unigram) to decode logits    
     untie_decode_bank                = True,       # prior-bank modes only: decode reads its OWN cloned (V,K) tables
-    decode_bias                      = True,     # only for decode_mode='linear'
       
     deterministic                    = True,
     generate_embedding_figures       = False,
@@ -247,8 +240,7 @@ config = dict(
     #        Sum_i alpha_i * KL(q_i||p_i)
     ######################################
     
-    lambda_alpha_mode                = "state_dependent_per_coord",  # "constant" | "state_dependent" | "state_dependent_per_coord"
-    lambda_alpha                     = 1,          # constant self-coupling value
+    lambda_alpha_mode                = "state_dependent_per_coord",  # "state_dependent" | "state_dependent_per_coord"
   
     ########################################
     #     Attention Belief/Model Settings
@@ -258,7 +250,7 @@ config = dict(
     kappa_beta                       = 1,        # tau = kappa * sqrt(d_head)
     learn_attention_temperature      = False,    # learn a per-layer, per-head log-temperature offset (starts at tau above)
     
-    beta_attention_prior             = 'causal',    # "causal" | "causal_noself" | "causal_alibi" | "causal_alibi_noself" | "causal_windowed" | "t5_relative_bias" | "uniform" | "alibi" | "windowed" (the last three are not causal)
+    beta_attention_prior             = 'causal',    # "causal" | "causal_noself" | "causal_alibi" | "causal_alibi_noself" | "causal_windowed" | "t5_relative_bias"
     
     #################################
     #         Belief E-step
@@ -327,12 +319,10 @@ config = dict(
   
     amp_dtype                        = 'bf16',        # None (fp32) | "bf16" | "fp16". Sigma must be at least fp32
     fp32_matmul_precision            = "highest",          # None (leave as-is) | "highest" | "high" | "medium" ("high" permits TF32 on the decode/energy GEMMs)
-    matmul_precision_retry           = False,      # on a step error under "medium"/"high", replay it one rung stricter (-> "highest")
     routing_kl_max_reference         = "absolute",  # "absolute" | "row_min" (kernel router: kl_max caps D_ij, or the gap D_ij - min_j D_ij)
     pair_kl_gemm_tol                 = None,       # None (off) | nats, e.g. 1e-3: rescore pair-KL GEMM slices whose error estimate exceeds it (~+45% step at K=128)
         
     decode_ce_checkpoint             = "auto",     # "auto" | "auto_aggregate" (saves memory with recompute)
-    expected_likelihood_kernel       = "torch",    # "torch" | "triton" (fused EL cross-entropy, CUDA; expected_likelihood_chunked only)
     decode_logits_amp                = False,      # linear decode only: logits matmul under amp_dtype; CE stays fp32
     projected_factorization          = "gram",     # "gram" | "gram_certified" | "cholesky_qr2_certified" (certified: rebuild ill-conditioned factors; costly)
    
@@ -379,7 +369,7 @@ def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int,
         f" decoder M-LRs: {_fmt_decode_lrs(cfg)}",
         f" auxiliary M-LRs: "
         f"block_mlp={_fmt_mixer_lr(cfg.m_block_mlp_lr, cfg.m_p_mu_lr)}",
-        f" VFE: lambda_alpha={cfg.lambda_alpha}  kappa_beta={cfg.kappa_beta}  "
+        f" VFE: lambda_alpha_mode={cfg.lambda_alpha_mode}  kappa_beta={cfg.kappa_beta}  "
         f"tau={_fmt_tau(cfg, model)}  mass_phi={cfg.mass_phi}",
         f" seed={cfg.seed}",
         bar,

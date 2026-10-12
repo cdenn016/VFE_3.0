@@ -25,6 +25,12 @@ from vfe3.train import build_optimizer
 
 _PAYLOAD_6B872B4 = json.loads(
     (Path(__file__).parent / "data" / "config_payload_6b872b4.json").read_text(encoding="utf-8"))
+# The payload ran relational_receiver_law='ambient_alignment' and lambda_alpha_mode='constant', both removed on
+# 2026-10-12 (second pass) and refused by the loader. The kl_max checks load it on the surviving receiver law and
+# alpha form, and the fingerprint takes lambda_alpha_mode at its saved value, as it does a retired field.
+_LOADABLE_6B872B4 = dict(_PAYLOAD_6B872B4, relational_receiver_law="channel_likelihood",
+                         lambda_alpha_mode="state_dependent")
+_SAVED_VALUE_FIELDS = frozenset({"lambda_alpha_mode"})
 
 # semantic_config_fingerprint(asdict(config_from_serialized(payload))) at 6b872b4.
 _FINGERPRINTS_6B872B4 = {
@@ -40,7 +46,8 @@ def _fingerprint_over_saved_fields(cfg: VFE3Config) -> str:
     still compared."""
     current = asdict(cfg)
     return semantic_config_fingerprint(
-        {key: current[key] if key in current else value for key, value in _PAYLOAD_6B872B4.items()})
+        {key: current[key] if key in current and key not in _SAVED_VALUE_FIELDS else value
+         for key, value in _PAYLOAD_6B872B4.items()})
 
 
 # --- C6: kl_max ------------------------------------------------------------------------------------------------
@@ -57,13 +64,13 @@ def test_kl_max_none_resolves_to_eight_k_and_saves_the_number() -> None:
 
 @pytest.mark.parametrize("kl_max", [100.0, 160.0])
 def test_saved_explicit_kl_max_loads_unchanged_with_pre_change_fingerprint(kl_max: float) -> None:
-    cfg = config_from_serialized(dict(_PAYLOAD_6B872B4, kl_max=kl_max), source="test")
+    cfg = config_from_serialized(dict(_LOADABLE_6B872B4, kl_max=kl_max), source="test")
     assert cfg.kl_max == kl_max
     assert _fingerprint_over_saved_fields(cfg) == _FINGERPRINTS_6B872B4[kl_max]
 
 
 def test_saved_config_without_kl_max_keeps_the_historical_default() -> None:
-    payload = dict(_PAYLOAD_6B872B4)
+    payload = dict(_LOADABLE_6B872B4)
     payload.pop("kl_max")
     cfg = config_from_serialized(payload, source="test")
     assert cfg.kl_max == 100.0

@@ -93,7 +93,7 @@ def test_comparison_rope_keeps_the_factor_route_live() -> None:
 
 
 def test_block_coordinates_mark_no_longer_claims_bit_identity() -> None:
-    inactive = _cfg(block_coordinates="reference", norm_type_block="none", norm_type_final="none",
+    inactive = _cfg(block_coordinates="reference", norm_type_block="none",
                     use_block_mlp=False).inactive_fields()
     assert "roundoff" in inactive["block_coordinates"]
 
@@ -304,7 +304,7 @@ def _train(cfg: VFE3Config, artifacts: Any = None) -> Tuple[VFEModel, List[float
 
 def test_replay_ladder_inside_train_records_counts_and_reasons(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _high_precision: Any) -> None:
-    cfg = _cfg(matmul_precision_retry=True, fp32_matmul_precision="high")
+    cfg = _cfg(fp32_matmul_precision="high")
     _, reference, _ = _train(cfg)
 
     real_step = T.train_step

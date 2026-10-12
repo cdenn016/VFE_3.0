@@ -168,8 +168,8 @@ def _log_prior_row_constant(model: torch.nn.Module) -> bool:
     r"""True when the finite entries of :math:`\log\pi_{ij}` are equal within every row :math:`i`.
 
     The softmax is invariant to a per-row constant, so row 3's map
-    :math:`\log\pi_{ij} \to 0` on the support then changes no routing weight (causal, causal_noself,
-    windowed and causal_windowed masks). Checked at the model's ``max_seq_len``.
+    :math:`\log\pi_{ij} \to 0` on the support then changes no routing weight (causal, causal_noself
+    and causal_windowed masks). Checked at the model's ``max_seq_len``.
     """
     build = getattr(model, "_attention_log_prior", None)
     if build is None:
@@ -201,7 +201,7 @@ def _routing_arm(model: torch.nn.Module, arm: str) -> Iterator[Dict[str, Any]]:
         return original(energy, tau=tau, log_prior=keep)
 
     _refuse_minimal_agent(model, "the routing-softmax arm")
-    if arm == "no_prior" and getattr(model.cfg, "beta_attention_prior", None) in (None, "uniform"):
+    if arm == "no_prior" and getattr(model.cfg, "beta_attention_prior", None) is None:
         raise NotApplicable("the model has no attention log-prior to flatten")
     if arm == "no_prior" and _log_prior_row_constant(model):
         raise NotApplicable(
@@ -417,28 +417,6 @@ class _ConjugatedNorm:
         return _frame_matvec(self.frame.forward, self.inner(_frame_matvec(self.frame.inverse, mu, bd), sigma), bd)
 
 
-class _ConjugatedFinalNormModule(torch.nn.Module):
-    r"""Module form of :class:`_ConjugatedNorm` for a final norm registered as a submodule.
-
-    The wrapped norm is held outside the module tree, so the swap adds no parameter or state key.
-    """
-
-    def __init__(self, inner: Callable[..., torch.Tensor], state: Dict[str, Any]) -> None:
-        super().__init__()
-        object.__setattr__(self, "_inner", inner)
-        object.__setattr__(self, "_state", state)
-
-    def forward(self, mu: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-        return _ConjugatedNorm(self._inner, _current_frame(self._state))(mu, sigma)
-
-
-def _final_norm_replacement(inner: Callable[..., torch.Tensor], state: Dict[str, Any]) -> Callable[..., torch.Tensor]:
-    r"""A replacement of the same kind (module or plain callable), so ``setattr`` swaps it and restores it."""
-    if isinstance(inner, torch.nn.Module):
-        return _ConjugatedFinalNormModule(inner, state)
-    return lambda mu, sigma: _ConjugatedNorm(inner, _current_frame(state))(mu, sigma)
-
-
 class _ConjugatedBlockMLP:
     r"""A local-coordinate block MLP with the frame removed from its conjugation.
 
@@ -564,8 +542,8 @@ def _mlp_plan(mlp: torch.nn.Module) -> str:
 def _role_trained_frame_free(model: torch.nn.Module, role: str) -> Optional[str]:
     r"""Why ``role`` already carries no frame on a model trained in reference coordinates, else ``None``.
 
-    ``block_coordinates='reference'`` trains :math:`\mu \mapsto U_i\Phi(U_i^{-1}\mu)` (normalization, MLP
-    and final norm in reference coordinates), so row 11 has nothing to remove and a second conjugation
+    ``block_coordinates='reference'`` trains :math:`\mu \mapsto U_i\Phi(U_i^{-1}\mu)` (normalization and MLP
+    in reference coordinates), so row 11 has nothing to remove and a second conjugation
     would be wrong; ``decode_coordinates='reference'`` trains logits :math:`W_{\mathrm{out}}U_i^{-1}\mu_i`
     (or a Gaussian decode of :math:`(U_i^{-1}\mu_i, C_i)`), so row 12 has nothing to remove.
     """
@@ -669,16 +647,6 @@ def _instance_override(obj: Any, name: str, value: Any) -> Iterator[None]:
 
 
 @contextmanager
-def _swap_attribute(obj: Any, name: str, value: Any) -> Iterator[None]:
-    original = getattr(obj, name)
-    setattr(obj, name, value)
-    try:
-        yield
-    finally:
-        setattr(obj, name, original)
-
-
-@contextmanager
 def frames_removed(model: torch.nn.Module, roles: Sequence[str]) -> Iterator[Dict[str, Any]]:
     r"""Remove the frames from the given roles of the reference normal form, keeping them in every other role.
 
@@ -696,8 +664,8 @@ def frames_removed(model: torch.nn.Module, roles: Sequence[str]) -> Iterator[Dic
         \mu_i^{(\ell+1)} = \Phi^{(\ell)}(\mu_i^{\mathrm{att}}),\qquad
         \ell_i = W_{\mathrm{out}}\mu_i^{(L)} + b,
 
-    with :math:`\Phi^{(\ell)} = (\mathrm{id}+\mathrm{MLP}^{(\ell)})\circ\mathrm{LN}` (and a final norm, if
-    any, before the decoder). Writing :math:`\mu_i = U_i\xi_i` gives the normal form of Eq.
+    with :math:`\Phi^{(\ell)} = (\mathrm{id}+\mathrm{MLP}^{(\ell)})\circ\mathrm{LN}` (no norm runs before the
+    decoder). Writing :math:`\mu_i = U_i\xi_i` gives the normal form of Eq.
     ``eq:reference_normal_form``: :math:`\xi_i^{(0)} = U_i^{-1}\mu_{p,x_i}`,
     :math:`C_i = U_i^{-1}\Sigma_{p,x_i}U_i^{-\top}`, the frame-free attention step
     :math:`\xi_i^{\mathrm{att}} = \xi_i + \sum_h O_h\sum_j\beta_{ij}^{(h)}T_h\xi_j` with :math:`\beta` a
@@ -717,8 +685,7 @@ def frames_removed(model: torch.nn.Module, roles: Sequence[str]) -> Iterator[Dic
     * row 11 (``norm_mlp``): :math:`\xi_i^{(\ell+1)} = \Phi^{(\ell)}(\xi_i^{\mathrm{att}})`, i.e.
       :math:`\mu_i^{(\ell+1)} = U_i\Phi^{(\ell)}(U_i^{-1}\mu_i^{\mathrm{att}})`, realized factor by factor as
       :math:`U_i\,\mathrm{LN}(U_i^{-1}\cdot)` followed by :math:`U_i(\mathrm{id}+\mathrm{MLP})(U_i^{-1}\cdot)`,
-      whose composition is :math:`U_i\Phi U_i^{-1}`; a final norm :math:`\mathrm{FN}` becomes
-      :math:`U_i\mathrm{FN}(U_i^{-1}\cdot)`; a block already of the form :math:`U_iG(U_i^{-1}\cdot)`
+      whose composition is :math:`U_i\Phi U_i^{-1}`; a block already of the form :math:`U_iG(U_i^{-1}\cdot)`
       (``canonical_frame`` MLP, or a GL(K)-covariant norm on the full family) has no frame role and is kept;
     * row 12 (``decoder``): logits :math:`W_{\mathrm{out}}\xi_i^{(L)} + b`, i.e.
       :math:`W_{\mathrm{out}}U_i^{-1}\mu_i^{(L)} + b` (unigram prior unchanged).
@@ -760,7 +727,7 @@ def frames_removed(model: torch.nn.Module, roles: Sequence[str]) -> Iterator[Dic
         if reason is not None:
             raise NotApplicable(reason)
     record: Dict[str, Any] = {"roles": list(roles), "frame": FRAME_DESCRIPTION, "stack_calls": 0}
-    norm_plan, final_plan, mlp_plans = "absent", "absent", []
+    norm_plan, mlp_plans = "absent", []
     if ROLE_ROUTING_COVARIANCE in roles:
         _require_static_routing_covariance(model)
         record["intercepted_calls"] = 0
@@ -770,13 +737,12 @@ def frames_removed(model: torch.nn.Module, roles: Sequence[str]) -> Iterator[Dic
                 "block_norm_covariance='pushforward': the block LayerNorm also pushes the covariance through its "
                 "local-coordinate Jacobian, so its reference conjugate is not the normal form's mean-only normalization")
         norm_plan = _norm_plan(model, getattr(model, "block_norm", None), cfg.norm_type_block)
-        final_plan = _norm_plan(model, getattr(model, "final_norm", None), cfg.norm_type_final)
         mlp_plans = [_mlp_plan(m) for m in (getattr(model, "block_mlps", None) or ())]
-        if "conjugated" not in (norm_plan, final_plan) and not any(p.startswith("conjugated") for p in mlp_plans):
+        if norm_plan != "conjugated" and not any(p.startswith("conjugated") for p in mlp_plans):
             raise NotApplicable(
                 "no normalization or MLP acts in local coordinates (block norm "
-                f"{norm_plan}, final norm {final_plan}, MLP {mlp_plans or 'absent'}): nothing to remove")
-        record.update(block_norm=norm_plan, final_norm=final_plan, block_mlp=mlp_plans)
+                f"{norm_plan}, MLP {mlp_plans or 'absent'}): nothing to remove")
+        record.update(block_norm=norm_plan, block_mlp=mlp_plans)
     if ROLE_DECODER in roles:
         _require_linear_decoder(model)
         record["decode_calls"] = 0
@@ -832,9 +798,6 @@ def frames_removed(model: torch.nn.Module, roles: Sequence[str]) -> Iterator[Dic
                 patches.enter_context(patch_bindings(_relational_score_modules(), "relational_score", scored))
             if ROLE_DECODER in roles:
                 patches.enter_context(_instance_override(model, "_decode_belief_with_context", decode))
-            if final_plan == "conjugated":
-                patches.enter_context(_swap_attribute(
-                    model, "final_norm", _final_norm_replacement(model.final_norm, state)))
             yield record
     finally:
         state["frame"] = None

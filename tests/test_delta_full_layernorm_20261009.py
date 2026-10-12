@@ -198,11 +198,9 @@ def test_executed_block_applies_the_composite_pushforward() -> None:
     assert (got - expected).abs().max() / expected.abs().max() < 1e-8
 
 
-def test_config_admits_layernorm_and_refuses_mahalanobis_and_post_norm() -> None:
+def test_config_admits_layernorm_and_refuses_mahalanobis() -> None:
     for affine in (False, True):
         cfg = _model_cfg(layernorm_affine=affine)
         assert cfg.block_mlp_covariance == "delta_full" and cfg.norm_type_block == "layernorm"
     with pytest.raises(ValueError, match="mahalanobis"):
         _model_cfg(norm_type_block="mahalanobis")
-    with pytest.raises(ValueError, match="block_mlp_post_norm"):
-        _model_cfg(block_mlp_post_norm=True)

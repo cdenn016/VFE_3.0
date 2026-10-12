@@ -164,7 +164,7 @@ def self_divergence_for_alpha(
     kl_max:            float = 100.0,
     eps:               float = 1e-6,
     divergence_family: str   = "renyi",
-    lambda_alpha_mode: str   = "constant",
+    lambda_alpha_mode: str,
 ) -> torch.Tensor:                         # (..., N) summed, or (..., N, K) per-coordinate
     r"""Self-divergence shaped for the selected alpha form: per-coordinate (..., N, K) when the
     form declares ``per_coord=True`` (``alpha_i.alpha_is_per_coord``), else the per-position

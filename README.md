@@ -485,7 +485,7 @@ the validator for the complete admission rules.
 |---|---|
 | `attention_mode="projected_predictive"` | Selects projected comparison and direct content aggregation (internal read-only views: `relational_mode="projected_filtering"`, `relational_readout_mode="predictive_content"`). |
 | `e_q_mu_lr`, `e_q_sigma_lr` | Unread by the predictive readout. |
-| `lambda_alpha`, `lambda_alpha_mode`, `b0`, `c0` | Unused by predictive readout; may affect separately enabled outer self-coupling. |
+| `lambda_alpha_mode`, `b0`, `c0` | Unused by predictive readout; may affect separately enabled outer self-coupling. |
 | `m_relational_score_lr` | Outer rate for $S_Q,S_K$ across layers. |
 | `m_relational_content_lr` | Outer rate for $T,O$ (and edge-link factor maps) across layers. |
 | `content_link_chart="exponential"` | Receiving map $e^{OT}T^{-1}$; see [Content-link charts](#content-link-charts). |
@@ -495,7 +495,6 @@ the validator for the complete admission rules.
 | `routing_kl_max_reference` | Projected kernel router only. `"absolute"` (default) clamps $D_{ij}$ at `kl_max`; `"row_min"` clamps the row gap $D_{ij}-\min_{j\,\mathrm{admissible}}D_{ij}$, with the row minimum carrying its subgradient, which leaves $\beta$ the exact softmax wherever no gap reaches `kl_max` and keeps the cost order of a row whose every cost exceeds it. |
 | `learn_attention_temperature` | Default `False`. `True` learns $\tau_{\ell,h}=\kappa_h\sqrt{d_h}\exp(\mathrm{clamp}(\delta_{\ell,h},-3,3))$ per layer and head (`routing_log_temperature`, zero at initialization, no weight decay, score learning rate) on both projected routes. It acts after the `kl_max` clamp, so a fully capped absolute-reference row stays uniform. Not with `predictive_readout="minimal_agent"`. |
 | `tie_comparison_maps` | Default `False`. `True` sets $S_K:=S_Q$ (no `raw_score_k`) on the `projected_predictive` kernel readout, so $D_{ii}=0$ and the flat-alignment case $D_{ij}=D_{\mathrm{KL}}(q_i\Vert(\Omega_{ij})_*q_j)$ under one map is testable. |
-| `block_mlp_post_norm` | Default `False`. `True` reapplies the block norm to the post-MLP mean, so the next router reads a normalized mean; requires `block_coordinates="local"`, a block norm and a block MLP. |
 
 Relational rates of `None` inherit `m_p_mu_lr`; `0.0` freezes that role's
 parameters while retaining its forward operation. Score and content groups have
@@ -598,38 +597,40 @@ this episode context. Sources and routing retain their outer gradient graph. Thi
 objective differs from predictive content aggregation. The derivations are in
 `Research/manuscripts/Attention/projected_gradient.tex`.
 
-`relational_receiver_law="channel_likelihood"` (default) scores the receiver's partial
-law $O_h^\top\xi_i$ against each sender's $d$-dimensional message $T_h\xi_j$ as an
-expected likelihood with channel floor `relational_receiver_noise`. It counts the
+The receiver law is the channel likelihood: it scores the receiver's partial law
+$P_h\xi_i$ against each sender's $d$-dimensional message $T_h\xi_j$ as an expected
+likelihood with channel floor $\nu I_d$, $\nu$ = `relational_receiver_noise`. It counts the
 receiver entropy once, so its minimizer is the exact tempered Gaussian posterior, and
 directions no head observes stay at the prior. `relational_receiver_measurement` picks the
-measurement of $\xi_i$: `"adjoint"` (default) reads it through $O_h^\top$, and `"inverse"`
-through the head rows of $O'^{-1}$, formed from the chart factors ($T e^{-OT}$ under the
-exponential chart), whose frozen-context minimizer is the kernel mean for equal channel
-precisions and vanishing self-coupling, and which is invariant
-under $(U,T,S,O')\mapsto(Uh,Th,Sh,h^{-1}O')$. `"ambient_alignment"` is the original
-sum of KLs to $K$-dimensional laws with noise $\nu I_K$; it counts the entropy
-$\alpha+\sum_h\lambda_h$ times and pulls each head's unwritten coordinates toward zero.
-`relational_receiver_update="closed_form"` (default) applies the exact frozen-context
+measurement $P_h$ of $\xi_i$: `"inverse"` (default) reads it through the head rows of
+$O'^{-1}$, formed from the chart factors ($T e^{-OT}$ under the exponential chart), whose
+frozen-context minimizer is the kernel mean for equal channel precisions and vanishing
+self-coupling, and which is invariant under $(U,T,S,O')\mapsto(Uh,Th,Sh,h^{-1}O')$;
+`"adjoint"` reads it through $O_h'^\top$, which agrees with the inverse only for orthogonal
+$O'$ and is kept for charts too ill-conditioned for the inverse's float64 certificate. The
+`ambient_alignment` law (a sum of KLs to $K$-dimensional laws with noise $\nu I_K$, counting
+the entropy $\alpha+\sum_h\lambda_h$ times) and the `relational_receiver_law` field were
+removed on 2026-10-12. `relational_receiver_update="closed_form"` (default) applies the exact frozen-context
 natural-parameter update with damping `relational_receiver_damping` in $(0,1]$
 ($1$ is the minimizer; then extra E-steps change nothing). Under
 `lambda_alpha_mode="state_dependent"` that update is one majorize-minimize step on the profiled
 energy $c_0\log(b_0+D)+G$; `"closed_form_profiled"` returns the limit of those steps, the
 fixed point $\alpha=c_0/(b_0+D(q^\star(\alpha)))$ reached from the current state, in one
-scalar root solve per receiver with implicit gradients (not available per coordinate; under a
-constant alpha it is `"closed_form"`). `"euler"` is the explicit
+scalar root solve per receiver with implicit gradients (not available per coordinate). `"euler"` is the explicit
 Fisher step governed by `e_q_mu_lr`, `e_q_sigma_lr` and the trust radii; it is stable
 only for `e_q_mu_lr` below $2/\lambda_{\max}(\Sigma\Lambda)$. Serialized configs that
-predate these fields reload as `ambient_alignment` with `euler`.
+predate `relational_receiver_update` reload with `euler`; a `projected_gradient` config that
+ran `ambient_alignment` (saved explicitly, or predating the law field) is refused, as is any
+config with the removed `lambda_alpha_mode="constant"`. Configs that predate
+`relational_receiver_measurement` reload with `"adjoint"`.
 
 Both supported attention modes have fixed full input and output. Every head reads
 and writes all $K$ state coordinates through a reduced $d=K/H$ channel. Q/K/T have
 shape $(H,d,K)$ and O has shape $(H,K,d)$; the maps contribute $4K^2$ parameters per
 layer. There are no configurable input/output scope fields or identity-content arm.
 
-`projected_gradient` requires `lambda_alpha_mode` in {`constant`, `state_dependent`,
-`state_dependent_per_coord`} (the last on `gaussian_diagonal` only; a constant alpha must be
-positive under `channel_likelihood`), `n_e_steps>=1`, `relational_routing="gaussian_kl"`,
+`projected_gradient` takes `lambda_alpha_mode` `state_dependent` or
+`state_dependent_per_coord` (the last on `gaussian_diagonal` only), `n_e_steps>=1`, `relational_routing="gaussian_kl"`,
 `family` in {`gaussian_diagonal`, `gaussian_full`, `gaussian_block`}, at least two heads,
 filtering, and unrolled updates. `predictive_covariance` and `attention_residual` are
 predictive-readout fields: under `projected_gradient` they are inert (listed by

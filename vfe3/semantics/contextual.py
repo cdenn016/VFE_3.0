@@ -8,7 +8,7 @@ that per-layer bank the section computes, in the protocols of the transformer-in
 literature adapted to Gaussian beliefs:
 
 * the logit lens (nostalgebraist 2020): every layer's belief read out through the model's OWN final
-  readout -- ``final_norm`` (when configured), then ``prior_bank.decode`` with the realized
+  readout -- ``prior_bank.decode`` with the realized
   frame under ``decode_coordinates='reference'`` and the unigram bias -- exactly the path
   ``VFEModel.forward_beliefs(return_logits=True)`` applies after the last block;
 * per-layer geometry (anisotropy, IsoScore, effective rank, TwoNN, rogue dimensions);
@@ -292,7 +292,7 @@ def _forward_layers(model: Any, x: torch.Tensor, *, return_logits: bool = False)
 
     ``layers[0]`` is ``capture["diagnostic"]["initial_belief"]`` -- the belief ``vfe_stack``
     receives (after the positional right factor) -- and ``layers[l]`` is ``layer_outputs[l-1]``, the post-block belief
-    handed to block ``l+1``; ``layers[L]`` is the raw stack output (pre ``final_norm``).
+    handed to block ``l+1``; ``layers[L]`` is the raw stack output.
     """
     capture: Dict[str, Any] = {"diagnostic": {}}
     with torch.no_grad():
@@ -370,20 +370,13 @@ def _forward_split(model: Any, x: torch.Tensor, log: _SplitLog, *, return_logits
 def _readout(model: Any, mu: torch.Tensor, sigma: torch.Tensor, canonical_frame: Any) -> torch.Tensor:
     r"""Logits of one belief through the model's final readout, as ``forward_beliefs`` applies it.
 
-    .. math:: \ell = \mathrm{decode}\big(\mathrm{final\_norm}(\mu, \Sigma),\ \Sigma;\ U\big),
+    .. math:: \ell = \mathrm{decode}\big(\mu,\ \Sigma;\ U\big),
 
-    i.e. ``final_norm`` (when ``norm_type_final`` is not ``none``), then
-    ``VFEModel._decode_belief_with_context`` -- ``prior_bank.decode`` in the fp32 island with the
+    i.e. ``VFEModel._decode_belief_with_context`` -- ``prior_bank.decode`` in the fp32 island with the
     realized frame ``U`` of the same forward (``decode_coordinates='reference'`` only) and the
     unigram bias :math:`\kappa \log\pi_v`. Returns ``(B, N, V)`` float32 logits.
     """
     with torch.no_grad():
-        if model.final_norm is not None:
-            if getattr(model.cfg, "block_coordinates", "local") == "reference":
-                # forward_beliefs applies U FN(U^{-1} .) there; this replay has no frame to do so.
-                raise NotImplementedError("logit lens replay of a final norm under "
-                                          "block_coordinates='reference' is not supported")
-            mu = model.final_norm(mu, sigma)
         return model._decode_belief_with_context(mu, sigma, canonical_frame=canonical_frame)
 
 
@@ -681,7 +674,7 @@ def logit_lens(
     result: Dict[str, Any] = {
         "n_tokens": int(cl.size), "n_windows": len(used), "n_windows_requested": int(n_win), "seq_len": N,
         "layers": list(range(L + 1)), "layer_names": _layer_names(L, run.cfg.encode_mode),
-        "final_norm": run.cfg.norm_type_final, "decode_mode": run.cfg.decode_mode,
+        "decode_mode": run.cfg.decode_mode,
         "forward_resplit": split_log.record(), "notes": [],
     }
     for key in ("ce", "acc", "agree", "kl", "entropy"):
@@ -714,9 +707,6 @@ def logit_lens(
                            "were never trained to be read out there, so the early-layer numbers describe what "
                            "the final readout makes of those beliefs, not all the information they carry (no "
                            "tuned lens is fitted)")
-    if run.cfg.norm_type_final != "none":
-        result["notes"].append(f"the final norm ({run.cfg.norm_type_final}) is applied to every layer before "
-                               "the decode, as the forward applies it after the last block")
     return result
 
 

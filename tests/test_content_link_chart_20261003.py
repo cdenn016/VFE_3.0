@@ -125,14 +125,8 @@ _GRADIENT = dict(attention_mode="projected_gradient", attention_residual=False,
                  predictive_covariance="passthrough")
 _ROUTES = {
     "predictive": {},
-    "gradient_ambient_euler": dict(_GRADIENT, relational_receiver_law="ambient_alignment",
-                                   relational_receiver_update="euler"),
-    "gradient_channel_closed_form": dict(_GRADIENT, relational_receiver_law="channel_likelihood",
-                                         relational_receiver_update="closed_form"),
-    "gradient_channel_euler": dict(_GRADIENT, relational_receiver_law="channel_likelihood",
-                                   relational_receiver_update="euler"),
-    "gradient_ambient_closed_form": dict(_GRADIENT, relational_receiver_law="ambient_alignment",
-                                         relational_receiver_update="closed_form"),
+    "gradient_closed_form": dict(_GRADIENT, relational_receiver_update="closed_form"),
+    "gradient_euler": dict(_GRADIENT, relational_receiver_update="euler"),
 }
 
 

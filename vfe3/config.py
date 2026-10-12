@@ -191,16 +191,9 @@ class VFE3Config:
     #   role   one set per optimizer role (mu / sigma / phi), the historical behavior
     #   group  one set per optimizer group, so one exploding group cannot set the coefficient of the others
     grad_clip_scope:                  str             = "role"
-    # Stop a diverging run and finalize it normally with training_status "diverged" and the reason (summary.json):
-    # after 100 consecutive rejected updates, or when a log/eval row's interval-mean training CE exceeds
-    # ln(vocab_size) after the warmup. False: the divergence monitor only warns and forces metrics rows.
-    divergence_abort:                 bool            = False
 
     seed:                             int             = 6
     
-    # deterministic only: fill uninitialized allocations with NaN so stray reads are visible. False
-    # skips the fill kernels (about 13.5 ms per K=64 step on the RTX 5090; loss and gradients identical).
-    fill_uninitialized_memory:        bool            = True
     deterministic:                    bool            = True         # torch/cuDNN determinism (TF32: see fp32_matmul_precision)
     
     ##################################################
@@ -231,9 +224,6 @@ class VFE3Config:
     diagnose_agent_elbo:              bool            = False
 
     eval_stride:                     Optional[int]   = None         # held-out window stride <= max_seq_len; None = disjoint windows
-    # Training-window origin: "fixed" (window i starts at i*max_seq_len every epoch) | "per_epoch_random"
-    # (each epoch draws an origin in [0, max_seq_len) from the train loader's generator; vfe3.train.train).
-    train_window_offset:              str             = "fixed"
                
     generate_embedding_figures:       bool            = False        # slow semantic-geometry figures at finalize
 
@@ -307,7 +297,6 @@ class VFE3Config:
     decode_coordinates:               str             = "local"
 
     decode_unigram_prior:             bool            = True         # add unigram_kappa * log pi_v (corpus unigram) to the logits
-    decode_bias:                      bool            = True         # linear only: learned per-vocab bias (zero init, no decay)
     # decode_mode="linear" only: train on the second-order (delta-method) expected log-loss
     # E_q[-log p_y] ~ CE(mu) + 1/2 tr(Sigma Cov_p(w)) instead of the plug-in CE(mu), at one extra (V, 2K)
     # GEMM per vocab chunk. Training mode only; evaluation keeps the plug-in predictive CE. Requires
@@ -335,13 +324,6 @@ class VFE3Config:
     #   auto_aggregate  account the whole vocabulary, including fp64 scores (saves more memory)
     decode_ce_checkpoint:             str             = "auto"  
 
-    # "torch" | "triton"
-    # decode_mode="expected_likelihood_chunked" only: the training cross-entropy kernel.
-    #   torch   chunked broadcast over (B, N, Vc, K), gradient-checkpointed
-    #   triton  fused forward and backward that never forms (B, N, Vc, K) (vfe3/kernels); CUDA tensors only,
-    #           the torch kernel serves CPU tensors. Values agree to rounding
-    expected_likelihood_kernel:       str             = "torch"
-
     # decode_mode="linear" with amp_dtype set only: run the logits matmul x W^T under amp_dtype
     # autocast (bf16/fp16 operands, fp32 accumulate); bias, logsumexp and the cross-entropy stay fp32.
     decode_logits_amp:                bool            = False
@@ -351,14 +333,6 @@ class VFE3Config:
     # sigma_v falls far below 1; watch decode_sigma_v_min.
     decode_av_precision:              str             = "fp32"
 
-    # "fp64" | "fp32_escalate" | "fp32_escalate_cond"
-    # family="gaussian_full" with a nonzero M-step self-coupling or CG energy only: precision of the
-    # full-covariance pair KL.
-    #   fp64                unconditional float64
-    #   fp32_escalate       float32, recomputed in float64 when the Cholesky certificate fails
-    #   fp32_escalate_cond  fp32_escalate plus a pivot-ratio conditioning trigger
-    full_cov_kl_precision:            str             = "fp32_escalate_cond"
-    
     # Prior-bank Gaussian decoders only: recompute an uncertain float32 decode argmax in float64 for the
     # candidates whose score interval reaches the winner's (the fused training CE is unaffected).
     decode_ranking_fp64_escalation:   bool            = False
@@ -404,12 +378,6 @@ class VFE3Config:
     irrep_spec_seed:                    int             = 0
     irrep_min_rank:                     int             = 1            # 1 skips the gauge-invariant trivial irrep l0
     
-    # "canonical" | "eigh"
-    # so_n only: basis of each irrep block.
-    #   canonical  deterministic; for group_n=3 any spin in closed form
-    #   eigh       the original tensor-power construction (rank <= 6); old so_n configs load as eigh
-    irrep_basis:                      str             = "canonical"
-
     # so_n with gauge_tying="shared" only: Clebsch-Gordan coupling between irrep blocks on the means
     # (exactly equivariant; learned scalar path weights, zero init).
     use_cg_coupling:                  bool            = False
@@ -477,19 +445,18 @@ class VFE3Config:
     learn_attention_temperature:      bool            = False
 
     # "causal" | "causal_noself" | "causal_alibi" | "causal_alibi_noself" | "causal_windowed"
-    # | "t5_relative_bias" | "uniform" | "alibi" | "windowed"
-    # Log-prior over sources. The last three are not causal (they see future tokens).
+    # | "t5_relative_bias"
+    # Causal log-prior over sources.
     #   *_noself           masks the self key
-    #   *alibi             adds -slope_h |i - j| (Press et al.)
-    #   *windowed          -inf outside a band of attention_window
+    #   causal_alibi*      adds -slope_h (i - j) (Press et al.)
+    #   causal_windowed    -inf more than attention_window keys back
     #   t5_relative_bias   T5 bucketed relative-position bias
-    #   uniform            zero log-bias
     beta_attention_prior:             str             = "causal"
     
     # alibi priors only: BASE multiplier; the realized head slopes are alibi_slope * 2^(-8h/H), so an
     # n_heads sweep at fixed alibi_slope rescales the prior.
     alibi_slope:                      float           = 1.0
-    attention_window:                 int             = 128          # windowed priors only: band half-width
+    attention_window:                 int             = 128          # causal_windowed only: band width
     t5_num_buckets:                   int             = 32           # t5_relative_bias only: bucket count
     t5_max_distance:                  int             = 128          # t5_relative_bias only: log-bucketing horizon
     t5_learnable_bias:                bool            = False        # t5_relative_bias only: learn the bucket table
@@ -583,39 +550,37 @@ class VFE3Config:
     #   11. Receiver (projected_gradient)
     ##################################################
 
-    # "channel_likelihood" | "ambient_alignment"
-    #   channel_likelihood  expected likelihood of P_h xi_i (relational_receiver_measurement) against the d-dim message T_h xi_j
-    #   ambient_alignment   sum of KLs to K-dim noisy laws
-    relational_receiver_law:          str             = "channel_likelihood"
+    # The receiver law is the channel likelihood: the expected likelihood of the measurement P_h xi_i
+    # against the d-dim message T_h xi_j, with the receiver entropy counted once.
 
-    # "adjoint" | "inverse"
-    # channel_likelihood only: the receiving measurement of xi_i on head h.
-    #   adjoint  O'_h^T xi_i (equals the inverse only for orthogonal O')
-    #   inverse  the head-h rows of O'^-1 (the dual measurement): the frozen-context minimizer is the kernel
-    #            mean as alpha -> 0 with equal channel precisions, invariant under (U h, T h, S h, h^-1 O')
-    relational_receiver_measurement:  str             = "adjoint"
+    # "inverse" | "adjoint"
+    # The receiving measurement P_h xi_i of xi_i on head h.
+    #   inverse  (default, the theoretically consistent choice) the head-h rows of O'^-1, the dual
+    #            measurement: invariant under (U h, T h, S h, h^-1 O'), and the frozen-context minimizer
+    #            is the kernel mean as alpha -> 0 with equal channel precisions
+    #   adjoint  O'_h^T xi_i, equal to the inverse only for orthogonal O'; kept for charts too
+    #            ill-conditioned for the inverse's float64 certificate
+    relational_receiver_measurement:  str             = "inverse"
 
     # "closed_form" | "closed_form_profiled" | "euler"
     #   closed_form           exact frozen-context natural-parameter update, damped by relational_receiver_damping
     #   closed_form_profiled  under lambda_alpha_mode="state_dependent": the limit of iterated closed_form (MM)
     #                         steps, a stationary point of c0 log(b0 + D) + G, in one scalar root solve per
-    #                         receiver (not per_coord); under a constant alpha identical to closed_form
+    #                         receiver (not per_coord)
     #   euler                 explicit Fisher step with e_q_mu_lr / e_q_sigma_lr and the trust regions
     relational_receiver_update:       str             = "closed_form"
     relational_receiver_damping:      float           = 1.0          # closed_form(_profiled) only: rho in (0, 1]; 1 = the minimizer
-    relational_receiver_noise:        float           = 1.0          # channel floor (channel_likelihood) | K-dim noise (ambient_alignment)
+    relational_receiver_noise:        float           = 1.0          # channel floor nu I_d, nu > 0
 
     ##################################################
     #   12. Free-energy weights
     ##################################################
 
-    # "constant" | "state_dependent" | "state_dependent_per_coord"
+    # "state_dependent" | "state_dependent_per_coord"
     # Self-coupling alpha_i on KL(q_i || p_i).
-    #   constant                   alpha = lambda_alpha
-    #   state_dependent            alpha_i = c0 / (b0 + D(q_i || p_i))
+    #   state_dependent            alpha_i = c0 / (b0 + D(q_i || p_i)), frame-invariant
     #   state_dependent_per_coord  the same per coordinate (b0, c0 may be K-lists)
     lambda_alpha_mode:                str                   = "state_dependent_per_coord"
-    lambda_alpha:                     float                 = 1.0          # constant only
     b0:                               'float | List[float]' = 1.0
     c0:                               'float | List[float]' = 1.0
 
@@ -632,14 +597,12 @@ class VFE3Config:
     #   none         identity (gauge-pure)
     #   layernorm    standard LayerNorm over the belief dim (not gauge-equivariant)
     #   mahalanobis  gauge-invariant rescale
-    # norm_type_block runs inside every block; norm_type_final once before decode.
+    # norm_type_block runs inside every block; no norm runs between the stack and the decoder.
     norm_type_block:                  str             = "layernorm"
-    norm_type_final:                  str             = "none"
     layernorm_affine:                 bool            = False        # layernorm only: learned gamma/beta (init 1/0)
 
     # "passthrough" | "pushforward"
-    # Covariance through the LayerNorm seams (norm_type_block="layernorm"): the block norm and, when
-    # norm_type_final="layernorm", the final norm.
+    # Covariance through the LayerNorm block norm (norm_type_block="layernorm").
     #   passthrough  the norms map the mean only; Sigma stays in pre-norm units
     #   pushforward  J_LN Sigma J_LN^T + block_mlp_covariance_floor * D Sigma D + rho g g^T, D = diag(gamma)/s, with
     #                rho g g^T the radial second-order variance; its diagonal on the diagonal family (O(K) per
@@ -648,7 +611,7 @@ class VFE3Config:
     block_norm_covariance:            str             = "passthrough"
 
     # "local" | "reference"
-    #   local      the block norm, block MLP and final norm act on mu_i
+    #   local      the block norm and block MLP act on mu_i
     #   reference  they act on xi_i = U_i^-1 mu_i and map back, mu -> U_i Phi(U_i^-1 mu). only:
     #              projected_predictive, rope_mode "none" or a comparison mode, a "none"/"layernorm" norm, and a passthrough
     #              coordinate / gaussian_template MLP, a prototype_agents MLP, or (gaussian_full / gaussian_block)
@@ -683,13 +646,6 @@ class VFE3Config:
     # "gelu" | "silu" | "relu"
     # Hidden activation; not read by gaussian_template or prototype_agents.
     block_mlp_activation:             str             = "gelu"
-
-    # Block norm reapplied to the post-MLP mean, so the next router reads a normalized mean (audit
-    # 2026-10-08 P1-5). False keeps norm -> MLP. only: block_coordinates="local", a block norm, a block MLP
-    block_mlp_post_norm:              bool            = False
-    # False: the block MLP's mean path runs with autocast disabled (fp32 island), since under amp_dtype its residual
-    # is the only reduced-precision input to the fp32 router. only: amp_dtype set, a block MLP other than prototype_agents
-    block_mlp_autocast:               bool            = True
 
     # "mean_field" | "exact"
     # prototype_agents only: template posterior.
@@ -852,12 +808,6 @@ class VFE3Config:
     #   high     TF32 (or bf16x3) allowed
     #   medium   bf16 allowed
     fp32_matmul_precision:            Optional[str]   = "highest"
-    # Under a reduced fp32_matmul_precision ("medium"/"high"): when a training step raises before its
-    # optimizer update, or rejects its update for a non-finite loss or gradient, replay it one rung stricter,
-    # "medium" -> "high" -> "highest" (IEEE fp32), instead of stopping the run or skipping the step. A failure
-    # that persists at "highest" is raised (a skip is kept) as before. The log-step diagnostics and evaluation
-    # forwards use the same ladder. Not used with fp16 (GradScaler state).
-    matmul_precision_retry:           bool            = False
 
     # None (off) | tol in (0, 1)
     # Redo a frame producer call in float64 when its float32 frame pair is ill-conditioned,
@@ -949,8 +899,6 @@ class VFE3Config:
                 or not math.isfinite(float(self.relational_receiver_noise))
                 or self.relational_receiver_noise <= 0.0):
             raise ValueError("relational_receiver_noise must be a finite positive reference variance")
-        _require(self.relational_receiver_law, ("channel_likelihood", "ambient_alignment"),
-                 "relational_receiver_law")
         _require(self.relational_receiver_measurement, ("adjoint", "inverse"), "relational_receiver_measurement")
         _require(self.relational_receiver_update, ("closed_form", "closed_form_profiled", "euler"),
                  "relational_receiver_update")
@@ -962,18 +910,6 @@ class VFE3Config:
         if full_link and self.n_e_steps < 1:
             raise ValueError("attention_mode='projected_gradient' requires n_e_steps >= 1; "
                              "n_e_steps=0 would remove attention from every layer")
-        # A state-dependent alpha* = c0/(b0 + D) is positive (c0 > 0), so only constant alpha can
-        # leave the receiver without mass or the channel law without its entropy term.
-        constant_alpha = self.lambda_alpha_mode == "constant"
-        if (full_link and constant_alpha and self.relational_receiver_law == "ambient_alignment"
-                and isinstance(self.lambda_alpha, Real) and self.lambda_alpha <= 0
-                and isinstance(self.lambda_beta, Real) and self.lambda_beta <= 0):
-            raise ValueError("projected_gradient needs lambda_alpha > 0 or lambda_beta > 0: "
-                             "otherwise the receiver energy has no mass")
-        if (full_link and constant_alpha and self.relational_receiver_law == "channel_likelihood"
-                and not (isinstance(self.lambda_alpha, Real) and self.lambda_alpha > 0)):
-            raise ValueError("relational_receiver_law='channel_likelihood' requires lambda_alpha > 0: "
-                             "the prior divergence carries the receiver's only entropy term")
         # The projected support envelope. The divergence (KL), connection (flat), gradient roles
         # (filtering), estimator (unroll) and mean preconditioner (Fisher) are fixed, not fields.
         incompatible = []
@@ -981,10 +917,6 @@ class VFE3Config:
             incompatible.append(f"n_e_steps={self.n_e_steps!r} (requires 1)")
         # The receiver profiles the closed-form alpha forms (projected_gradient.tex, profiled
         # self-coupling); per coordinate, KL(q||p) separates only on the diagonal family.
-        if full_link and self.lambda_alpha_mode not in (
-                "constant", "state_dependent", "state_dependent_per_coord"):
-            incompatible.append(f"lambda_alpha_mode={self.lambda_alpha_mode!r} (requires 'constant', "
-                                "'state_dependent' or 'state_dependent_per_coord')")
         if (full_link and self.lambda_alpha_mode == "state_dependent_per_coord"
                 and self.family != "gaussian_diagonal"):
             incompatible.append(f"lambda_alpha_mode='state_dependent_per_coord' with family={self.family!r} "
@@ -993,7 +925,7 @@ class VFE3Config:
         if (full_link and self.relational_receiver_update == "closed_form_profiled"
                 and self.lambda_alpha_mode == "state_dependent_per_coord"):
             incompatible.append("relational_receiver_update='closed_form_profiled' with lambda_alpha_mode="
-                                "'state_dependent_per_coord' (requires 'state_dependent' or 'constant')")
+                                "'state_dependent_per_coord' (requires 'state_dependent')")
         if self.encode_mode not in ("per_token", "per_token_additive"):
             incompatible.append(
                 f"encode_mode={self.encode_mode!r} (requires 'per_token' or 'per_token_additive')")
@@ -1143,10 +1075,6 @@ class VFE3Config:
                 UserWarning,
                 stacklevel=2,
             )
-        from vfe3.data.datasets import WINDOW_OFFSET_MODES
-        if self.train_window_offset not in WINDOW_OFFSET_MODES:
-            raise ValueError(f"train_window_offset must be one of {WINDOW_OFFSET_MODES}, "
-                             f"got {self.train_window_offset!r}")
         # eval_stride above max_seq_len would skip transitions between consecutive held-out windows,
         # which no target mask can recover, so the exactly-once eval contract rejects it. Equal to
         # max_seq_len is the disjoint default spelled out.
@@ -1195,8 +1123,7 @@ class VFE3Config:
                 )
             if type(self.group_n) is not int or self.group_n < 2:
                 raise ValueError(f"group_n must be an int >= 2, got {self.group_n!r}")
-            from vfe3.geometry.irreps import IRREP_BASES, check_irrep_constructible, irrep_dim
-            _require(self.irrep_basis, IRREP_BASES, "irrep_basis")
+            from vfe3.geometry.irreps import check_irrep_constructible, irrep_dim
             if isinstance(self.irrep_spec, str):
                 if self.irrep_spec != "random":
                     raise ValueError(f"irrep_spec must be a list of (label, mult) pairs or 'random', "
@@ -1206,7 +1133,7 @@ class VFE3Config:
                 from vfe3.geometry.irreps import random_irrep_spec
                 self.irrep_spec = random_irrep_spec(
                     self.group_n, self.embed_dim, self.n_heads, algebra=_traits.algebra,
-                    basis=self.irrep_basis, seed=self.irrep_spec_seed,
+                    seed=self.irrep_spec_seed,
                     min_rank=self.irrep_min_rank, max_rank=self.irrep_max_rank)
             if not isinstance(self.irrep_spec, list) or not self.irrep_spec:
                 raise ValueError(
@@ -1226,8 +1153,7 @@ class VFE3Config:
                         f"got {_entry!r}"
                     )
                 _d = irrep_dim(self.group_n, algebra=_traits.algebra, label=_entry[0])
-                check_irrep_constructible(self.group_n, algebra=_traits.algebra, label=_entry[0],
-                                          basis=self.irrep_basis)
+                check_irrep_constructible(self.group_n, algebra=_traits.algebra, label=_entry[0])
                 _block_dims.extend([_d] * _entry[1])
             if sum(_block_dims) != self.embed_dim:
                 raise ValueError(
@@ -1391,8 +1317,8 @@ class VFE3Config:
         # attention priors validated against the prior REGISTRY (add-by-registering), so a newly
         # registered prior is a valid config value without editing this validator.
         from vfe3.attention_prior import _PRIORS
-        # prior-shape knobs (threaded into model._attention_log_prior; audit P9): the windowed
-        # band half-width and the T5 bucketing parameters must be positive ints.
+        # prior-shape knobs (threaded into model._attention_log_prior; audit P9): the causal_windowed
+        # band width and the T5 bucketing parameters must be positive ints.
         for name in ("attention_window", "t5_max_distance"):
             if not isinstance(getattr(self, name), int) or getattr(self, name) < 1:
                 raise ValueError(f"{name} must be an int >= 1, got {getattr(self, name)!r}")
@@ -1438,11 +1364,6 @@ class VFE3Config:
         # lambda_alpha_mode validated against the alpha-form REGISTRY (add-by-registering).
         from vfe3.alpha_i import _ALPHAS
         _require(self.lambda_alpha_mode, tuple(sorted(_ALPHAS)), "lambda_alpha_mode")
-        if not (math.isfinite(self.lambda_alpha) and self.lambda_alpha >= 0.0):
-            raise ValueError(
-                f"lambda_alpha must be finite and nonnegative under lambda_alpha_mode='constant', "
-                f"got {self.lambda_alpha}"
-            )
         # Full Gaussians expose an ordered conditional KL decomposition, not a sum of marginal KLs.
         from vfe3.alpha_i import alpha_is_per_coord
         if (alpha_is_per_coord(self.lambda_alpha_mode) and not family_is_diagonal
@@ -1591,13 +1512,6 @@ class VFE3Config:
                 UserWarning,
                 stacklevel=2,
             )
-        # The full-covariance KL precision spellings are inlined rather than imported from
-        # vfe3.families.gaussian (importing a family module inside __post_init__ perturbs import
-        # order). set_full_cov_kl_precision validates the same set.
-        if self.full_cov_kl_precision not in ("fp64", "fp32_escalate", "fp32_escalate_cond"):
-            raise ValueError(
-                "full_cov_kl_precision must be one of ('fp64', 'fp32_escalate', "
-                f"'fp32_escalate_cond'), got {self.full_cov_kl_precision!r}")
         _require(self.projected_factorization, _PROJECTED_FACTORIZATIONS, "projected_factorization")
         value = self.frame_pair_escalation_tol
         if value is not None and (isinstance(value, bool) or not isinstance(value, Real)
@@ -1721,10 +1635,8 @@ class VFE3Config:
         if self.decode_chunk_size < 1:
             raise ValueError(f"decode_chunk_size must be >= 1, got {self.decode_chunk_size}")
         _require(self.decode_ce_checkpoint, ("auto", "auto_aggregate"), "decode_ce_checkpoint")
-        _require(self.expected_likelihood_kernel, ("torch", "triton"), "expected_likelihood_kernel")
-        # decode_bias (linear decode only) and decode_tau (prior-bank decode only) are reported by
-        # inactive_fields(), so the default-guarded notice below covers them and untouched
-        # defaults stay silent.
+        # decode_tau (prior-bank decode only) is reported by inactive_fields(), so the
+        # default-guarded notice below covers it and an untouched default stays silent.
         # Capability validation: the fast diagonal/full kernels hardcode the Gaussian KL readout, so a
         # family without the Gaussian POINTWISE algebra needs a registered family-consistent decoder,
         # one that scores logits through the configured family.
@@ -1788,20 +1700,11 @@ class VFE3Config:
         from vfe3.geometry.norms import _NORMS
         _valid_norms = tuple(sorted(_NORMS))
         _require(self.norm_type_block, _valid_norms, "norm_type_block")
-        _require(self.norm_type_final, _valid_norms, "norm_type_final")
         _require(self.routing_kl_max_reference, ("absolute", "row_min"), "routing_kl_max_reference")
         if self.pair_kl_gemm_tol is not None and not (isinstance(self.pair_kl_gemm_tol, (int, float))
                                                       and not isinstance(self.pair_kl_gemm_tol, bool)
                                                       and self.pair_kl_gemm_tol > 0):
             raise ValueError(f"pair_kl_gemm_tol must be None or a positive number, got {self.pair_kl_gemm_tol!r}")
-        if not isinstance(self.block_mlp_post_norm, bool):
-            raise ValueError(f"block_mlp_post_norm must be a bool, got {self.block_mlp_post_norm!r}")
-        if not isinstance(self.block_mlp_autocast, bool):
-            raise ValueError(f"block_mlp_autocast must be a bool, got {self.block_mlp_autocast!r}")
-        if self.block_mlp_post_norm and (self.block_coordinates != "local" or self.norm_type_block == "none"
-                                         or not self.use_block_mlp):
-            raise ValueError("block_mlp_post_norm=True needs block_coordinates='local', a block norm "
-                             "(norm_type_block != 'none') and use_block_mlp=True")
 
         if self.block_mlp_expansion < 1:
             raise ValueError(
@@ -1840,9 +1743,8 @@ class VFE3Config:
                              "full-covariance layout (family='gaussian_full' or 'gaussian_block')")
         _require(self.block_norm_covariance, ("passthrough", "pushforward"), "block_norm_covariance")
         if self.block_norm_covariance == "pushforward":
-            # The block norm and a 'layernorm' final norm push Sigma; in reference coordinates they act on the dense
-            # C = U^-1 Sigma U^-T and map back as U C' U^T, which the full and head-block families keep (audit
-            # 2026-10-10 round 2, items 49 and 51).
+            # The block norm pushes Sigma; in reference coordinates it acts on the dense C = U^-1 Sigma U^-T and
+            # maps back as U C' U^T, which the full and head-block families keep (audit 2026-10-10 round 2, item 51).
             problems = []
             if self.norm_type_block != "layernorm":
                 problems.append(f"norm_type_block='layernorm' (got {self.norm_type_block!r})")
@@ -1859,7 +1761,7 @@ class VFE3Config:
         # In local coordinates the block norm maps the mean only and passes Sigma through, so the
         # pushforward must compose the norm Jacobian, J = J_mlp J_norm (vfe3.model.block_mlp.
         # block_norm_jacobian). That closed form exists for 'layernorm' (plain or affine); 'mahalanobis'
-        # reads Sigma and has none here. A post-MLP norm would act on the mean after the pushforward.
+        # reads Sigma and has none here.
         if self.use_block_mlp and self.block_mlp_covariance == "delta_full" and self.norm_type_block not in (
                 "none", "layernorm"):
             raise ValueError(
@@ -1867,10 +1769,6 @@ class VFE3Config:
                 "pushforward composes the norm Jacobian, which is implemented for LayerNorm only "
                 f"(got norm_type_block={self.norm_type_block!r})."
             )
-        if self.use_block_mlp and self.block_mlp_covariance == "delta_full" and self.block_mlp_post_norm:
-            raise ValueError(
-                "block_mlp_covariance='delta_full' with block_mlp_post_norm=True: the post-MLP norm acts on "
-                "the mean only, so the pushforward would omit its Jacobian")
         # The invariant Mahalanobis gate reads s_b = mu_b^T Sigma_bb^{-1} mu_b per irrep block. With a
         # passthrough covariance it is exact on the diagonal family (Sigma_bb = diag sigma_b gives
         # s_b = sum_k mu_k^2 / sigma_k), where it equals the full-family gate on diag_embed(sigma);
@@ -1928,9 +1826,8 @@ class VFE3Config:
             incompatible = list(frame_requirements)
             if self.attention_mode != "projected_predictive":
                 incompatible.append(f"attention_mode={self.attention_mode!r} (requires 'projected_predictive')")
-            for name in ("norm_type_block", "norm_type_final"):
-                if getattr(self, name) not in ("none", "layernorm"):
-                    incompatible.append(f"{name}={getattr(self, name)!r} (requires 'none' or 'layernorm')")
+            if self.norm_type_block not in ("none", "layernorm"):
+                incompatible.append(f"norm_type_block={self.norm_type_block!r} (requires 'none' or 'layernorm')")
             if self.use_cg_coupling:
                 incompatible.append("use_cg_coupling=True (acts in local coordinates before the norm)")
             if self.use_block_mlp and self.block_mlp_mode not in ("coordinate", "gaussian_template",
@@ -2148,7 +2045,7 @@ class VFE3Config:
 
         from vfe3.geometry.groups import group_traits
         if group_traits(self.gauge_group).algebra is None:
-            mark(("irrep_basis", "irrep_spec_seed", "irrep_min_rank", "irrep_max_rank"),
+            mark(("irrep_spec_seed", "irrep_min_rank", "irrep_max_rank"),
                  "only read by irrep-tower groups (gauge_group='so_n')")
         from vfe3.gauge_optim import get_phi_update_policy
         phi_update_policy = get_phi_update_policy(self.m_phi_update_mode)
@@ -2164,8 +2061,7 @@ class VFE3Config:
             # other optimizer group falls back to it (vfe3/train.py build_optimizer; audit 2026-10-10 round 2,
             # item 20). Under the fisher validation the decoder is linear or untied, so its means read
             # m_decode_mu_lr and an untied bank's log variances read m_decode_sigma_lr.
-            layernorm_affine_live = (self.layernorm_affine
-                                     and "layernorm" in (self.norm_type_block, self.norm_type_final))
+            layernorm_affine_live = self.layernorm_affine and self.norm_type_block == "layernorm"
             # Groups that read m_p_mu_lr: those whose own rate inherits it, plus CG path weights and the T5 bias.
             mu_rate_fallback = (
                 any(self.inherits_hyperparameter(name, "m_p_mu_lr")
@@ -2187,7 +2083,7 @@ class VFE3Config:
                      "group inherits it")
         if self.grad_clip is None or self.grad_clip == 0:
             mark(("grad_clip_scope",), "only read when grad_clip > 0")
-        if self.beta_attention_prior not in ("alibi", "causal_alibi", "causal_alibi_noself"):
+        if self.beta_attention_prior not in ("causal_alibi", "causal_alibi_noself"):
             mark(("alibi_slope",), "only read by an alibi attention prior")
         if self.beta_attention_prior != "t5_relative_bias":
             mark(("t5_num_buckets", "t5_max_distance", "t5_learnable_bias"),
@@ -2202,12 +2098,6 @@ class VFE3Config:
         minimal_agent = self.predictive_readout == "minimal_agent"
         if self.decode_mode != "linear" or self.amp_dtype is None:
             mark(("decode_logits_amp",), "only read by decode_mode='linear' with amp_dtype set")
-        if self.fp32_matmul_precision == "highest" or self.amp_dtype == "fp16":
-            mark(("matmul_precision_retry",),
-                 "only read under a reduced fp32_matmul_precision and without the fp16 GradScaler")
-        if not self.deterministic:
-            mark(("fill_uninitialized_memory",),
-                 "torch fills uninitialized memory only under deterministic algorithms")
         if (self.attention_mode == "projected_predictive" and not minimal_agent
                 and self.relational_routing == "mean_distance"):
             # The covariance-blind cost reads neither the projected covariances nor the source tuples,
@@ -2255,19 +2145,17 @@ class VFE3Config:
                      "no M-step self-coupling or CG energy term is enabled; with diagnose_canonical_free_energy=True "
                      "it would feed that log-step diagnostic only")
             # Every contraction on this combination runs in an autocast-disabled island (the minimal-agent
-            # update, the prototype posteriors, LayerNorm, the transport exponentials and the linear
-            # decode/CE) or is elementwise, so the forward computes in float32 whatever amp_dtype says.
-            # Checked bit-for-bit on CPU autocast (tests/test_audit_20261007_opus_fixes.py); not run on CUDA.
+            # update, the block MLP's mean path (fp32 since 2026-10-12), the prototype posteriors, LayerNorm,
+            # the transport exponentials and the linear decode/CE) or is elementwise, so the forward computes
+            # in float32 whatever amp_dtype says. Checked bit-for-bit on CPU autocast for every block MLP mode
+            # (tests/test_audit_20261007_opus_fixes.py); not run on CUDA.
             if (self.amp_dtype is not None and self.decode_mode == "linear"
-                    and (not self.use_block_mlp or self.block_mlp_mode == "prototype_agents")
                     and self.norm_type_block in ("none", "layernorm")
-                    and self.norm_type_final in ("none", "layernorm")
                     and self.mstep_self_coupling_weight == 0.0 and not self.use_cg_coupling
                     and not self.decode_logits_amp):
                 mark(("amp_dtype",),
-                     "effective precision float32: on minimal_agent with a prototype_agents or absent block "
-                     "MLP, a none/layernorm norm and linear decode, every contraction runs with autocast "
-                     "disabled")
+                     "effective precision float32: on minimal_agent with a none/layernorm norm and linear "
+                     "decode, every contraction runs with autocast disabled")
         else:
             mark(("minimal_agent_inference", "minimal_agent_channel_noise", "minimal_agent_cavi_steps"),
                  "only read by predictive_readout='minimal_agent'")
@@ -2283,7 +2171,7 @@ class VFE3Config:
         if self.content_link_loop_weight == 0.0:
             mark(("content_link_loop_window",), "only read when content_link_loop_weight > 0")
         if self.attention_mode != "projected_gradient":
-            mark(("relational_receiver_noise", "relational_receiver_law", "relational_receiver_update",
+            mark(("relational_receiver_noise", "relational_receiver_update",
                   "relational_receiver_damping", "relational_receiver_measurement"),
                  "only read by projected_gradient receiving laws")
         elif self.relational_receiver_update in ("closed_form", "closed_form_profiled"):
@@ -2293,8 +2181,6 @@ class VFE3Config:
         else:
             mark(("relational_receiver_damping",),
                  "only read by relational_receiver_update='closed_form' or 'closed_form_profiled'")
-        if self.attention_mode == "projected_gradient" and self.relational_receiver_law != "channel_likelihood":
-            mark(("relational_receiver_measurement",), "only read by relational_receiver_law='channel_likelihood'")
         gradient_controls = ("e_q_mu_lr", "e_q_sigma_lr", "e_mu_q_trust", "e_sigma_q_trust")
         if self.attention_mode == "projected_predictive":
             mark(("skip_belief_sigma_update",),
@@ -2305,19 +2191,15 @@ class VFE3Config:
                  "predictive_covariance='moment_matched', the covariance) by readout, not a gradient step")
             # diagnose_canonical_free_energy reads the self-coupling form (audit 2026-10-10 round 2, item 31).
             if self.mstep_self_coupling_weight == 0.0 and not self.diagnose_canonical_free_energy:
-                mark(("lambda_alpha_mode", "lambda_alpha", "b0", "c0"),
+                mark(("lambda_alpha_mode", "b0", "c0"),
                      "predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer; with "
                      "diagnose_canonical_free_energy=True they would feed that log-step diagnostic only")
         mlp_delta_full = self.use_block_mlp and self.block_mlp_covariance == "delta_full"
         # The norm pushforward reads the same floor (in post-norm units) as delta_full.
         norm_floor = () if self.block_norm_covariance == "pushforward" and not mlp_delta_full else (
             "block_mlp_covariance_floor",)
-        if self.block_norm_covariance == "pushforward" and mlp_delta_full and self.norm_type_final != "layernorm":
-            mark(("block_norm_covariance",), "block_mlp_covariance='delta_full' already composes the norm Jacobian "
-                 "and no 'layernorm' final norm pushes Sigma")
-        # The prototype block runs with autocast disabled already (its posterior and its residual are fp32).
-        if self.amp_dtype is None or not self.use_block_mlp or self.block_mlp_mode == "prototype_agents":
-            mark(("block_mlp_autocast",), "only read with amp_dtype set and a block MLP other than prototype_agents")
+        if self.block_norm_covariance == "pushforward" and mlp_delta_full:
+            mark(("block_norm_covariance",), "block_mlp_covariance='delta_full' already composes the norm Jacobian")
         if not self.use_block_mlp:
             mark(("block_mlp_mode", "block_mlp_covariance", *norm_floor,
                   "block_mlp_expansion", "block_mlp_activation", "block_mlp_dropout", "m_block_mlp_lr"),
@@ -2345,20 +2227,16 @@ class VFE3Config:
                 mark(("block_mlp_template_init_pull",), "only read by block_mlp_template_init='working_variance'")
         if self.pos_phi != "learned":
             mark(("m_pos_phi_lr",), "only pos_phi='learned' creates the learnable positional table")
-        if "layernorm" not in (self.norm_type_block, self.norm_type_final):
-            mark(("layernorm_affine",), "only read by a 'layernorm' block or final norm seam")
+        if self.norm_type_block != "layernorm":
+            mark(("layernorm_affine",), "only read by a 'layernorm' block norm")
         if self.norm_type_block != "layernorm" or (self.block_coordinates != "local"
                                                    and self.family not in ("gaussian_full", "gaussian_block")):
             mark(("block_norm_covariance",), "only read by a 'layernorm' block norm, in local coordinates or in "
                  "reference coordinates on gaussian_full / gaussian_block")
-        if not (self.layernorm_affine and "layernorm" in (self.norm_type_block, self.norm_type_final)):
-            mark(("m_layernorm_lr",), "requires layernorm_affine and a layernorm seam")
+        if not (self.layernorm_affine and self.norm_type_block == "layernorm"):
+            mark(("m_layernorm_lr",), "requires layernorm_affine and a layernorm block norm")
         if not self.decode_unigram_prior:
             mark(("unigram_kappa",), "needs decode_unigram_prior=True")
-        if self.lambda_alpha_mode == "constant":
-            mark(("b0", "c0"), "only read by a state_dependent lambda_alpha_mode")
-        else:
-            mark(("lambda_alpha",), "only read by lambda_alpha_mode='constant'")
         if self.rope_mode == "none":
             mark(("rope_base", "rope_fraction"), "only read by a rope_mode other than 'none'")
         if self.attention_mode == "projected_predictive" and self.predictive_readout != "kernel":
@@ -2374,21 +2252,13 @@ class VFE3Config:
             mark(("relational_key_noise",), "only read by relational_routing='noisy_key' on the kernel router")
         if self.pos_phi == "none":
             mark(("pos_phi_project_slk", "pos_phi_scale"), "only read by a non-'none' pos_phi")
-        if (self.beta_attention_prior in ("windowed", "causal_windowed")
-                and self.attention_window >= self.max_seq_len - 1):
-            # The two-sided band then admits every pair, so 'windowed' equals the non-causal uniform
-            # prior (audit 2026-10-10, item 4).
-            mark(("attention_window",),
-                 "window covers the context: 'causal_windowed' is identical to plain causal"
-                 if self.beta_attention_prior == "causal_windowed" else
-                 "window covers the context: 'windowed' is identical to the uniform (non-causal) prior")
+        if self.beta_attention_prior == "causal_windowed" and self.attention_window >= self.max_seq_len - 1:
+            mark(("attention_window",), "window covers the context: 'causal_windowed' is identical to plain causal")
         if self.n_layers == 1:
             mark(("prior_handoff_rho", "prior_handoff_sigma"), "no next layer consumes the handoff")
         registration = _DECODERS[self.decode_mode]
         if not registration.supports_chunked:
             mark(("decode_ce_checkpoint",), "the selected decoder has no checkpointed chunked CE kernel")
-        if self.decode_mode != "expected_likelihood_chunked":
-            mark(("expected_likelihood_kernel",), "only read by decode_mode='expected_likelihood_chunked'")
         if registration.family_consistent:
             mark(("decode_av_precision",), "generic family-consistent decoding does not call _decode_av")
 
@@ -2411,7 +2281,6 @@ class VFE3Config:
                      "shared encode/decode tables use the encoder rates")
                 mark(("decode_mu_weight_decay",),
                      "shared encode/decode tables: the decode means are mu_embed, decayed by mu_weight_decay")
-            mark(("decode_bias",), "linear decode only; the prior-bank KL decoders create no output bias")
             mark(("decode_second_order",),
                  "linear decode only; the prior-bank KL decoders already read Sigma_q")
         # Decay is read per optimizer group (vfe3/train.py build_optimizer). The global weight_decay reaches
@@ -2427,8 +2296,8 @@ class VFE3Config:
             mark(("phi_weight_decay",),
                  f"m_phi_update_mode={self.m_phi_update_mode!r} replaces the frame-table decay "
                  "with its own optimizer-group value")
-        if self.beta_attention_prior not in ("windowed", "causal_windowed"):
-            mark(("attention_window",), "only the windowed/causal_windowed priors read the band half-width")
+        if self.beta_attention_prior != "causal_windowed":
+            mark(("attention_window",), "only the causal_windowed prior reads the band width")
         if self.gauge_transport in ("off", "frozen"):
             mark(("m_pos_phi_lr", "phi_weight_decay"),
                  f"gauge_transport={self.gauge_transport!r} sets requires_grad=False on the frame "
@@ -2454,11 +2323,6 @@ class VFE3Config:
         if self.attention_mode == "projected_predictive" and not self.diagnose_canonical_free_energy:
             mark(("lambda_beta",), "predictive_content weights no belief-coupling block; with "
                  "diagnose_canonical_free_energy=True it would feed that log-step diagnostic only")
-        if not (self.family == "gaussian_full"
-                and (self.mstep_self_coupling_weight != 0.0 or self.cg_energy_weight != 0.0)):
-            mark(("full_cov_kl_precision",),
-                 "projected scoring has its own factor policy; only the full-covariance M-step "
-                 "self-coupling and CG energy evaluate the pair divergence")
         if "e_mu_q_trust" in inactive or self.e_mu_q_trust is None or self.diagonal_covariance:
             mark(("mu_trust_cholesky_rounds",),
                  "only an active mean trust region on a full covariance factors sigma_q")
@@ -2479,7 +2343,7 @@ class VFE3Config:
                 and not self.diagnose_canonical_free_energy
                 and not (self.attention_mode == "projected_gradient"
                          and self.relational_receiver_update in ("closed_form", "closed_form_profiled"))):
-            mark(("lambda_alpha_mode", "lambda_alpha", "b0", "c0"),
+            mark(("lambda_alpha_mode", "b0", "c0"),
                  "the single gradient E-step iteration starts at q = p, where the self-coupling "
                  "force vanishes")
         # gaussian_block on this route is the same diagonal lookup in the dense layout (audit 2026-10-09
@@ -2500,17 +2364,16 @@ class VFE3Config:
                  "full covariance requires block_mlp_covariance='delta_full', block_norm_covariance='pushforward', "
                  "predictive_covariance='moment_matched', or attention_mode='projected_gradient'")
         # Reference coordinates. With identically-I frames xi = mu and C = Sigma exactly, so both
-        # selectors are no-ops; without a block norm, final norm or block MLP nothing is conjugated.
+        # selectors are no-ops; without a block norm or block MLP nothing is conjugated.
         identity_frames = (self.gauge_transport == "off"
                            or (self.encode_mode == "per_token_additive" and self.pos_phi == "none"))
         if identity_frames:
             mark(("block_coordinates", "decode_coordinates"),
                  "the realized frames are identically I (gauge_transport='off', or per_token_additive "
                  "without positional frames), so reference and local coordinates coincide")
-        elif (self.norm_type_block == "none" and self.norm_type_final == "none"
-              and not self.use_block_mlp):
+        elif self.norm_type_block == "none" and not self.use_block_mlp:
             mark(("block_coordinates",),
-                 "no block norm, final norm or block MLP to conjugate: reference and local coordinates "
+                 "no block norm or block MLP to conjugate: reference and local coordinates "
                  "agree in exact arithmetic, but the reference block still runs the U(U^{-1} mu) round "
                  "trip, so the two differ at roundoff (not bit-identical)")
         if not self.per_type_hidden_bias:
@@ -2664,6 +2527,10 @@ def serialize_config(config: VFE3Config) -> dict[str, Any]:
     payload = asdict(config)
     if math.isinf(config.kl_max):
         payload["kl_max"] = "inf"  # Strict JSON has no Infinity number.
+    if config.gauge_group == "so_n":
+        # Basis marker (the irrep_basis field was removed 2026-10-12): config_from_serialized refuses an
+        # so_n payload without it, which identifies a save from before 2026-10-05 built in the eigh basis.
+        payload["irrep_basis"] = "canonical"
     return payload
 
 
@@ -2709,6 +2576,22 @@ _ROPE_FIELDS = ("pos_rotation", "rope_space", "rope_on_value", "rope_comparison_
 # the frame-pair escalation switch and tolerance merged into frame_pair_escalation_tol.
 _HARDCODED_FIELDS = ("relational_output_init", "bch_residual_max")
 _FRAME_PAIR_FIELDS = ("frame_pair_fp64_escalation", "frame_pair_condition_tol")
+# Removed 2026-10-12 (second pass): the final norm before decode is fixed at none, the block runs norm -> MLP
+# with no post-MLP norm, and under amp_dtype the block MLP's mean path always runs in an fp32 island.
+_NORM_MLP_FIELDS = ("norm_type_final", "block_mlp_post_norm", "block_mlp_autocast")
+# Removed 2026-10-12 (second pass): the non-causal attention priors (each position saw future tokens).
+_RETIRED_ATTENTION_PRIORS = frozenset({"uniform", "alibi", "windowed"})
+# Runtime and diagnostic policies hardcoded/removed 2026-10-12 (second pass): no divergence abort, no NaN fill
+# of uninitialized memory, a per-epoch random training-window origin and the matmul-precision replay ladder.
+# None changes the model, so any saved value is dropped silently.
+_RUNTIME_POLICY_FIELDS = ("divergence_abort", "fill_uninitialized_memory", "train_window_offset",
+                          "matmul_precision_retry")
+# Removed or hardcoded 2026-10-12 (second pass): the expected-likelihood CE kernel selector (CUDA tensors
+# run the fused Triton kernel, CPU tensors the chunked torch kernel), the full-covariance pair-KL precision
+# (fixed at the former "fp32_escalate_cond"), the so_n irrep basis (canonical only) and the linear decoder's
+# bias toggle (the per-vocab bias is always on).
+_NUMERICS_REMOVED_FIELDS = (
+    "expected_likelihood_kernel", "full_cov_kl_precision", "irrep_basis", "decode_bias")
 # Every serialized key config_from_serialized migrates or refuses that is not a VFE3Config field.
 RETIRED_CONFIG_KEYS = frozenset(
     set(_RETIRED_PINNED_FIELDS) | _RETIRED_INERT_FIELDS | _RETIRED_CONDITIONAL_FIELDS
@@ -2716,7 +2599,10 @@ RETIRED_CONFIG_KEYS = frozenset(
        "relational_readout_mode", "relational_input_scope", "relational_output_scope",
        "relational_identity_content"}
     | set(_PROJECTED_FACTORIZATION_FIELDS) | set(_ROPE_FIELDS) | set(_HARDCODED_FIELDS)
-    | set(_FRAME_PAIR_FIELDS))
+    | set(_FRAME_PAIR_FIELDS) | set(_NORM_MLP_FIELDS)
+    | set(_RUNTIME_POLICY_FIELDS) | set(_NUMERICS_REMOVED_FIELDS)
+    # removed 2026-10-12 (second pass): the ambient_alignment receiver law and the constant alpha form
+    | {"relational_receiver_law", "lambda_alpha"})
 # laplace_diagonal (retired 2026-10-12) was registered but refused on both projected routes.
 _RETIRED_FAMILIES = frozenset({"gaussian_frame_diagonal", "laplace_diagonal"})
 _MIGRATED_FAMILIES = {"gaussian_diagonal_exact": "gaussian_diagonal"}
@@ -2744,7 +2630,7 @@ def _migrate_retired_fields(
     pinned, or when the field was inert for this config; any other value changed a forward this
     build no longer computes and is refused as retired. Value renames (dense decode modes,
     ``gaussian_diagonal_exact``, ``m_decode_lr``) are rewritten to their surviving equivalents.
-    Must run after the attention selector and receiver-law defaults are resolved.
+    Must run after the attention selector and receiver-update defaults are resolved.
     """
     def refuse(name: str, value: object, detail: str = "") -> None:
         raise ValueError(f"serialized config from {source} requests retired {name}={value!r}"
@@ -2758,7 +2644,7 @@ def _migrate_retired_fields(
             value = payload.pop(name)
             if not _same_serialized_value(value, pinned):
                 refuse(name, value, f" (only {pinned!r} survives)")
-    for name in _RETIRED_INERT_FIELDS:
+    for name in (*_RETIRED_INERT_FIELDS, *_RUNTIME_POLICY_FIELDS):
         payload.pop(name, None)
     payload.pop("_allow_legacy_dense_decode", None)
 
@@ -2867,6 +2753,74 @@ def _migrate_retired_fields(
     _migrate_projected_factorization(payload, source=source, refuse=refuse)
     _migrate_rope_mode(payload, source=source, refuse=refuse)
     _migrate_hardcoded_fields(payload, source=source, refuse=refuse)
+    _migrate_norm_mlp_fields(payload, source=source, refuse=refuse)
+    _migrate_numerics_removals(payload, source=source, refuse=refuse)
+
+
+def _migrate_norm_mlp_fields(
+    payload: dict[str, Any],
+
+    *,
+    source: str,
+    refuse: Callable[..., None],
+) -> None:
+    r"""Drop the norm and block-MLP fields removed on 2026-10-12 (second pass), or refuse them, and refuse a
+    removed attention prior.
+
+    ``norm_type_final`` loads only as ``"none"``: any other final norm changed the decoded mean. ``block_mlp_post_norm``
+    loads only as False: True re-normalized the post-MLP mean (validation refused it wherever it was not read).
+    ``block_mlp_autocast`` was a precision policy, so any saved value is dropped. A non-causal
+    ``beta_attention_prior`` (``uniform``, ``alibi``, ``windowed``) is refused.
+    """
+    if "norm_type_final" in payload:
+        value = payload.pop("norm_type_final")
+        if value != "none":
+            refuse("norm_type_final", value, " (only 'none' survives; a final norm changed the decoded mean)")
+    if "block_mlp_post_norm" in payload:
+        value = _normalize_serialized_boolean(payload.pop("block_mlp_post_norm"), "block_mlp_post_norm",
+                                              source=source)
+        if value:
+            refuse("block_mlp_post_norm", value, " (only False survives; the post-MLP norm changed the forward)")
+    payload.pop("block_mlp_autocast", None)
+    prior = payload.get("beta_attention_prior")
+    if isinstance(prior, str) and prior in _RETIRED_ATTENTION_PRIORS:
+        refuse("beta_attention_prior", prior, " (a non-causal prior; only causal priors survive)")
+
+
+def _migrate_numerics_removals(
+    payload: dict[str, Any],
+
+    *,
+    source: str,
+    refuse: Callable[..., None],
+) -> None:
+    r"""Drop the fields removed on 2026-10-12 (second pass), refusing the two that changed a forward.
+
+    ``expected_likelihood_kernel`` and ``full_cov_kl_precision`` chose how one quantity was computed
+    (agreement to rounding), so any saved value is dropped. ``irrep_basis`` is dropped for every
+    non-so_n config and for an so_n config saved as ``"canonical"``; an so_n config saved as ``"eigh"``,
+    or without the field (saved before 2026-10-05, built in the eigh basis), is refused because its
+    learned tables live in the eigh basis and would load against canonical frames. ``decode_bias`` is
+    dropped when True or when the decoder is not linear (it was inert there); a linear decoder saved
+    with ``decode_bias=False`` is refused, since its checkpoint carries no ``output_proj_bias``.
+    """
+    payload.pop("expected_likelihood_kernel", None)
+    payload.pop("full_cov_kl_precision", None)
+    so_n = payload.get("gauge_group") == "so_n"
+    if so_n and payload.get("irrep_basis") != "canonical":
+        basis = payload.get("irrep_basis")
+        saved = "without irrep_basis" if basis is None else f"with irrep_basis={basis!r}"
+        raise ValueError(
+            f"serialized so_n config from {source} was saved {saved}; such configs were built in "
+            "the eigh irrep basis, which was removed 2026-10-12. Its learned tables live in that "
+            "basis and would load against the canonical frames, changing the forward; continuation "
+            "requires explicit migration")
+    payload.pop("irrep_basis", None)
+    if "decode_bias" in payload:
+        bias = _normalize_serialized_boolean(payload.pop("decode_bias"), "decode_bias", source=source)
+        if not bias and payload.get("decode_mode", VFE3Config.decode_mode) == "linear":
+            refuse("decode_bias", False, " (the linear decoder always carries its learned per-vocab "
+                   "bias since 2026-10-12, and this checkpoint has no output_proj_bias)")
 
 
 def _migrate_hardcoded_fields(
@@ -3010,13 +2964,47 @@ def _migrate_projected_factorization(
 #   rope_space                        "frame" from eaa3a21 (2026-10-07); merged into rope_mode on 2026-10-12,
 #                                     whose migration treats an absent rope_space as "frame"
 #   kl_max                            100.0 until 2026-10-12, now None (8 * embed_dim)
+#   relational_receiver_measurement   "adjoint" from 2026-10-10 until 2026-10-12, now "inverse"
 _HISTORICAL_DEFAULT_PINS: dict[str, Any] = {
     "content_link_chart":               "affine",
     "predictive_covariance":            "passthrough",
     "m_decode_mu_lr":                   None,
     "m_decode_sigma_lr":                None,
     "kl_max":                           100.0,
+    "relational_receiver_measurement":  "adjoint",
 }
+
+
+def _migrate_receiver_law_and_alpha(
+    payload: dict[str, Any],
+
+    *,
+    source: str,
+) -> None:
+    r"""Drop ``relational_receiver_law`` and ``lambda_alpha`` (removed 2026-10-12, second pass).
+
+    The receiver law is now always the channel likelihood. The law and ``relational_receiver_update`` were
+    introduced together (2017ea3, 2026-10-02), so a payload with neither predates both and ran
+    ``ambient_alignment``, while one with only the update was saved after this removal and ran the channel
+    likelihood. Must run before the update default is filled in. A resolved ``ambient_alignment`` on
+    ``projected_gradient`` is refused (the receiver forward changed); elsewhere the law was inert.
+    ``lambda_alpha_mode="constant"`` is refused (the self-coupling forward changed); ``lambda_alpha`` was
+    read only by that form, so it is dropped silently otherwise.
+    """
+    predates_law = "relational_receiver_update" not in payload
+    law = payload.pop("relational_receiver_law", "ambient_alignment" if predates_law else "channel_likelihood")
+    if law not in ("channel_likelihood", "ambient_alignment"):
+        raise ValueError(f"serialized config from {source} has invalid relational_receiver_law={law!r}")
+    if law == "ambient_alignment" and payload.get("attention_mode") == "projected_gradient":
+        raise ValueError(
+            f"serialized config from {source} requests retired relational_receiver_law='ambient_alignment' "
+            "on projected_gradient (only the channel likelihood survives); continuation requires explicit "
+            "migration")
+    if payload.get("lambda_alpha_mode") == "constant":
+        raise ValueError(
+            f"serialized config from {source} requests retired lambda_alpha_mode='constant' (only the "
+            "state-dependent forms survive); continuation requires explicit migration")
+    payload.pop("lambda_alpha", None)
 
 
 def config_from_serialized(
@@ -3048,10 +3036,6 @@ def config_from_serialized(
     # compile_pair_kernel was a pure wall-clock toggle: the eager and compiled pair kernels are
     # value-identical, so a recorded value cannot change a continuation's math. Drop it silently.
     payload.pop("compile_pair_kernel", None)
-    # so_n configs saved before irrep_basis existed were built in the eigh basis (2026-10-05); the
-    # learned tables live in that basis, so the reload must rebuild it rather than the new default.
-    if payload.get("gauge_group") == "so_n" and "irrep_basis" not in payload:
-        payload["irrep_basis"] = "eigh"
     if "relational_mode" in payload or "relational_readout_mode" in payload:
         mode = payload.pop("relational_mode", "off")
         readout = payload.pop("relational_readout_mode", "conditional_update")
@@ -3089,7 +3073,7 @@ def config_from_serialized(
         raise ValueError(f"serialized config from {source} names no attention selector; it predates "
                          "the projected routes and requires explicit migration")
     # Configs saved before the receiver-law fields keep the PR #30 receiver they ran.
-    payload.setdefault("relational_receiver_law", "ambient_alignment")
+    _migrate_receiver_law_and_alpha(payload, source=source)
     payload.setdefault("relational_receiver_update", "euler")
     # Fields whose default changed after they were introduced: a config saved before the field existed
     # ran the introduction-time value, not today's default (audit 2026-10-08 P2-3).

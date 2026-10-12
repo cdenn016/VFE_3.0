@@ -44,16 +44,17 @@ def test_envelope_identity_canonical_block_equals_neg_tau_logZ():
     assert torch.allclose(fred, torch.tensor(1.1264), atol=1e-3)
 
 
-def test_envelope_holds_for_raw_registry_priors_uniform_causal_alibi():
+def test_envelope_holds_for_raw_registry_priors_zero_causal_alibi():
     # The envelope must hold for the RAW seam output B (logsumexp(B) != 0), not only
     # a hand-normalized log(pi). A non-uniform-but-NORMALIZED prior cannot catch the
-    # +tau*logsumexp(B) per-row offset (uniform B=0 -> offset tau*log N; alibi -> tau*lse(B)).
+    # +tau*logsumexp(B) per-row offset (zero B -> offset tau*log N; causal_alibi -> tau*lse(B)).
     N, tau = 3, 2.0
     energy = torch.tensor([[1.0, 2.0, 0.5],
                            [0.7, 0.3, 1.1],
                            [1.2, 0.9, 0.4]])
-    for name, kw in [("uniform", {}), ("causal", {}), ("alibi", {"slope": 0.5})]:
-        B = attention_log_prior(name, N, N, **kw)            # un-normalized log-bias
+    for name, B in [("zero", torch.zeros(N, N)), ("causal", attention_log_prior("causal", N, N)),
+                    ("causal_alibi", attention_log_prior("causal_alibi", N, N, n_heads=1)[0])]:
+        # B: (N, N) un-normalized log-bias
         beta = attention_weights(energy, log_prior=B, tau=tau)
         pi = torch.softmax(B, dim=-1)
         canon_block = (beta * energy).sum(-1) + tau * (
@@ -62,8 +63,8 @@ def test_envelope_holds_for_raw_registry_priors_uniform_causal_alibi():
         fred = reduced_free_energy(energy, log_prior=B, tau=tau)   # -tau log Z
         assert torch.allclose(canon_block, fred, atol=1e-5), name
 
-    # None prior -> uniform 1/N; must match the uniform-B result, not drift by tau*log N.
-    B0 = attention_log_prior("uniform", N, N)
+    # None prior -> uniform 1/N; must match the zero-B result, not drift by tau*log N.
+    B0 = torch.zeros(N, N)
     assert torch.allclose(reduced_free_energy(energy, log_prior=None, tau=tau),
                           reduced_free_energy(energy, log_prior=B0, tau=tau), atol=1e-5)
 

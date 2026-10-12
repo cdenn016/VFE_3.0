@@ -1,4 +1,6 @@
-"""Tiny CPU checks against literal full-link Gaussian receiving laws."""
+"""Tiny CPU checks against the literal channel-likelihood receiving law."""
+
+from dataclasses import replace
 
 from tests.profiles import make_relational_operators
 import pytest
@@ -6,7 +8,7 @@ import torch
 
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.gradients.full_link import (
-    build_full_link_context, full_link_cost, full_link_gradients,
+    build_full_link_context, full_link_context_at, full_link_cost, full_link_gradients,
 )
 from vfe3.model.relational_operators import RelationalOperators
 
@@ -62,40 +64,60 @@ def _literal_cost(
     beta:           torch.Tensor,
     frame:          CanonicalFrameContext,
     ops:            RelationalOperators,
+    alpha:          torch.Tensor,           # (1, N) self-coupling per receiver
     noise:          float = .7,
-    alpha:          float = .4,
     head_weights:   tuple = (.6, 1.3),
 ) -> torch.Tensor:
-    """Sum literal KL(q_i || N(L_ij mu_j, L_ij Sigma_j L_ij.T + Q_i))."""
+    r"""alpha_i KL(q_i||p_i) + sum w E_q[-log N(T_h xi_j; O_h^T xi_i, T_h C_j T_h^T + nu I_d)] (no constants).
+
+    The affine-chart adjoint measurement P_h = O_h^T of the reference-coordinate receiver xi_i = U_i^{-1} mu_i.
+    """
     U = _dense_frame(frame)
     source_cov = torch.diag_embed(source_sigma) if source_sigma.ndim == source_mu.ndim else source_sigma
     receiver_cov = torch.diag_embed(receiver_sigma) if receiver_sigma.ndim == receiver_mu.ndim else receiver_sigma
     prior_cov = torch.diag_embed(sigma_p) if sigma_p.ndim == mu_p.ndim else sigma_p
+    d = ops.T.shape[1]
     result = receiver_mu.new_zeros(())
     for i in range(3):
         q = torch.distributions.MultivariateNormal(receiver_mu[0, i], receiver_cov[0, i])
         p = torch.distributions.MultivariateNormal(mu_p[0, i], prior_cov[0, i])
-        result = result + alpha * torch.distributions.kl_divergence(q, p)
+        result = result + alpha[0, i] * torch.distributions.kl_divergence(q, p)
+        Ui = torch.linalg.inv(U[0, i])
+        xi, C = Ui @ receiver_mu[0, i], Ui @ receiver_cov[0, i] @ Ui.T
         for h in range(2):
+            P = ops.O[h].T
             for j in range(3):
-                L_ij = U[0, i] @ ops.O[h] @ ops.T[h] @ torch.linalg.inv(U[0, j])
-                mean = L_ij @ source_mu[0, j]
-                target_cov = L_ij @ source_cov[0, j] @ L_ij.T + noise * U[0, i] @ U[0, i].T
-                target = torch.distributions.MultivariateNormal(mean, target_cov)
-                result = result + head_weights[h] * beta[0, h, i, j] * torch.distributions.kl_divergence(q, target)
+                Uj = torch.linalg.inv(U[0, j])
+                v = ops.T[h] @ Uj @ source_mu[0, j]
+                R = ops.T[h] @ Uj @ source_cov[0, j] @ Uj.T @ ops.T[h].T + noise * torch.eye(d, dtype=v.dtype)
+                r = v - P @ xi
+                result = result + head_weights[h] * beta[0, h, i, j] * .5 * (
+                    r @ torch.linalg.solve(R, r) + torch.trace(torch.linalg.solve(R, P @ C @ P.T)))
     return result
+
+
+def _snapshot_alpha(mu: torch.Tensor, sigma: torch.Tensor, mu_p: torch.Tensor, sigma_p: torch.Tensor,
+                    b0: float = 1., c0: float = 1.) -> torch.Tensor:
+    r"""alpha*_i = c0/(b0 + KL(q_i||p_i)) of the snapshot, computed independently of the kernel; (1, N)."""
+    cov = lambda m, s: torch.diag_embed(s) if s.ndim == m.ndim else s
+    q = torch.distributions.MultivariateNormal(mu.detach(), cov(mu, sigma.detach()))
+    p = torch.distributions.MultivariateNormal(mu_p, cov(mu_p, sigma_p))
+    return c0 / (b0 + torch.distributions.kl_divergence(q, p))
 
 
 @pytest.mark.parametrize("full", [False, True])
 @pytest.mark.parametrize("compact", [False, True])
 def test_receiver_derivatives_match_literal_gaussian_energy(full: bool, compact: bool) -> None:
     mu, sigma, mu_p, sigma_p, frame, ops, prior = _fixture(full, compact)
-    context = build_full_link_context(
+    # The context frozen at alpha*(snapshot), without the profile: fixed receiving-law coefficients.
+    context = replace(build_full_link_context(
         mu, sigma, mu_p, sigma_p, frame, ops, tau=.9, receiver_noise=.7,
-        lambda_beta=torch.tensor([.6, 1.3], dtype=mu.dtype), value=.4, log_prior=prior)
+        lambda_beta=torch.tensor([.6, 1.3], dtype=mu.dtype), log_prior=prior), profile=None)
+    alpha = _snapshot_alpha(mu, sigma, mu_p, sigma_p)
+    torch.testing.assert_close(context.c.detach(), alpha, atol=1e-13, rtol=1e-13)
     probe_mu = (mu.detach() + .17).requires_grad_()
     probe_sigma = (sigma.detach() * 1.07).requires_grad_()
-    literal = _literal_cost(probe_mu, probe_sigma, mu, sigma, mu_p, sigma_p, context.beta, frame, ops)
+    literal = _literal_cost(probe_mu, probe_sigma, mu, sigma, mu_p, sigma_p, context.beta, frame, ops, alpha)
     expected = torch.autograd.grad(literal, (probe_mu, probe_sigma))
     actual = full_link_gradients(probe_mu, probe_sigma, context)
     for actual_gradient, expected_gradient in zip(actual, expected):
@@ -105,7 +127,8 @@ def test_receiver_derivatives_match_literal_gaussian_energy(full: bool, compact:
         torch.testing.assert_close(actual_gradient, cost_gradient, atol=3e-11, rtol=3e-11)
     # Receiver-independent normalizers are intentionally omitted from full_link_cost.
     next_mu, next_sigma = probe_mu + .03, probe_sigma * .97
-    expected_delta = _literal_cost(next_mu, next_sigma, mu, sigma, mu_p, sigma_p, context.beta, frame, ops) - literal
+    expected_delta = _literal_cost(next_mu, next_sigma, mu, sigma, mu_p, sigma_p, context.beta, frame, ops,
+                                   alpha) - literal
     actual_delta = full_link_cost(next_mu, next_sigma, context) - full_link_cost(probe_mu, probe_sigma, context)
     torch.testing.assert_close(actual_delta, expected_delta, atol=3e-11, rtol=3e-11)
 
@@ -115,7 +138,8 @@ def test_receiver_derivatives_finite_difference(full: bool) -> None:
     mu, sigma, mu_p, sigma_p, frame, ops, prior = _fixture(full)
     context = build_full_link_context(mu, sigma, mu_p, sigma_p, frame, ops, log_prior=prior)
     probe_mu, probe_sigma = mu.detach() + .12, sigma.detach() * .95
-    gradients = full_link_gradients(probe_mu, probe_sigma, context)
+    # alpha frozen at the probe: the profiled-energy gradient alpha*(q) dD/dq + dG/dq (envelope theorem).
+    gradients = full_link_gradients(probe_mu, probe_sigma, full_link_context_at(context, probe_mu, probe_sigma))
     direction_mu = torch.arange(12, dtype=mu.dtype).reshape_as(mu) / 12 - .4
     direction_sigma = torch.ones_like(sigma) * .07
     if full:
@@ -133,26 +157,30 @@ def test_source_factorized_pooling_matches_literal_pair_precision() -> None:
     mu, sigma, mu_p, sigma_p, frame, ops, prior = _fixture(full=True, compact=True)
     weights = torch.tensor([.6, 1.3], dtype=mu.dtype)
     context = build_full_link_context(
-        mu, sigma, mu_p, sigma_p, frame, ops, receiver_noise=.7, value=.4,
-        lambda_beta=weights, log_prior=prior)
+        mu, sigma, mu_p, sigma_p, frame, ops, receiver_noise=.7, lambda_beta=weights, log_prior=prior)
+    alpha = _snapshot_alpha(mu, sigma, mu_p, sigma_p)
     U = _dense_frame(frame)
-    identity = torch.eye(4, dtype=mu.dtype)
+    identity2 = torch.eye(2, dtype=mu.dtype)
     Lambda, eta = torch.empty_like(context.Lambda), torch.empty_like(context.eta)
     for i in range(3):
-        precision = torch.linalg.solve(sigma_p[0, i], identity)
-        Lambda[0, i] = .4 * precision
-        eta[0, i] = .4 * precision @ mu_p[0, i]
+        precision = torch.linalg.inv(sigma_p[0, i])
+        Lambda[0, i] = alpha[0, i] * precision
+        eta[0, i] = alpha[0, i] * precision @ mu_p[0, i]
+        Ui = torch.linalg.inv(U[0, i])
         for h in range(2):
             for j in range(3):
-                L_ij = U[0, i] @ ops.O[h] @ ops.T[h] @ torch.linalg.inv(U[0, j])
-                target_cov = L_ij @ sigma[0, j] @ L_ij.T + .7 * U[0, i] @ U[0, i].T
-                precision = torch.linalg.solve(target_cov, identity)
+                # The d x d pair precision R_hj^{-1} of the message T_h xi_j, lifted by P_h = O_h^T.
+                Uj = torch.linalg.inv(U[0, j])
+                R = ops.T[h] @ Uj @ sigma[0, j] @ Uj.T @ ops.T[h].T + .7 * identity2
+                pair = torch.linalg.solve(R, identity2)
+                lift = ops.O[h].T @ Ui                                          # (d, K)
                 weight = weights[h] * context.beta[0, h, i, j]
-                Lambda[0, i] += weight * precision
-                eta[0, i] += weight * precision @ (L_ij @ mu[0, j])
+                Lambda[0, i] += weight * lift.T @ pair @ lift
+                eta[0, i] += weight * lift.T @ pair @ (ops.T[h] @ Uj @ mu[0, j])
     torch.testing.assert_close(context.Lambda, Lambda, atol=3e-11, rtol=3e-11)
     torch.testing.assert_close(context.eta, eta, atol=3e-11, rtol=3e-11)
-    torch.testing.assert_close(context.c, torch.full_like(context.c, .4 + .6 + 1.3))
+    # The channel law counts the receiver entropy once: c = alpha.
+    torch.testing.assert_close(context.c, alpha, atol=1e-13, rtol=1e-13)
 
 
 @pytest.mark.parametrize("full", [False, True])
@@ -237,7 +265,7 @@ def test_separate_value_frame_changes_channels_without_changing_router() -> None
     # Independent receiver probes define filtering partials while source graphs stay live.
     probe = mu.detach().clone().requires_grad_()
     literal = _literal_cost(probe, sigma.detach(), mu, sigma, mu_p, sigma_p, second.beta, value_frame, ops,
-                            noise=1., alpha=1., head_weights=(1., 1.))
+                            second.c.detach(), noise=1., head_weights=(1., 1.))
     expected, = torch.autograd.grad(literal, probe)
     torch.testing.assert_close(full_link_gradients(mu, sigma, second)[0], expected, atol=3e-11, rtol=3e-11)
 

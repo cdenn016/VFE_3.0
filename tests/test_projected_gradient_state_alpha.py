@@ -33,12 +33,11 @@ def _single_cpu_thread() -> Any:
         torch.set_num_threads(previous)
 
 
-def _context(law: str, mode: str, full: bool, b0: Any = B0, c0: Any = C0) -> tuple:
+def _context(mode: str, full: bool, b0: Any = B0, c0: Any = C0) -> tuple:
     mu, sigma, mu_p, sigma_p, frame, ops, prior = _fixture(full=full)
-    ops.receiver_law = law
     context = build_full_link_context(
         mu.detach(), sigma.detach(), mu_p, sigma_p, frame, ops, tau=1.0,
-        lambda_beta=torch.tensor(HEADS, dtype=mu.dtype), value=.4, receiver_noise=NOISE,
+        lambda_beta=torch.tensor(HEADS, dtype=mu.dtype), receiver_noise=NOISE,
         log_prior=prior, lambda_alpha_mode=mode, b0=b0, c0=c0)
     return mu.detach(), sigma.detach(), mu_p, sigma_p, frame, ops, prior, context
 
@@ -51,13 +50,13 @@ def _away(mu: torch.Tensor, sigma: torch.Tensor) -> tuple:
     return r_mu, r_sigma
 
 
-@pytest.mark.parametrize("law", ["ambient_alignment", "channel_likelihood"])
 @pytest.mark.parametrize(("mode", "full"), CASES)
-def test_profiled_energy_is_c0_log_b0_plus_literal_kl(law: str, mode: str, full: bool) -> None:
-    mu, sigma, mu_p, sigma_p, *_, ctx = _context(law, mode, full)
+def test_profiled_energy_is_c0_log_b0_plus_literal_kl(mode: str, full: bool) -> None:
+    mu, sigma, mu_p, sigma_p, *_, ctx = _context(mode, full)
     r_mu, r_sigma = _away(mu, sigma)
+    # The channel law carries no coupling entropy: the coupling-only energy has c = 0.
     coupling = full_link_cost(r_mu, r_sigma, FullLinkContext(
-        ctx.profile.Lambda, ctx.profile.eta, ctx.profile.mass, ctx.beta, ctx.score))
+        ctx.profile.Lambda, ctx.profile.eta, torch.zeros_like(ctx.profile.prior_logdet), ctx.beta, ctx.score))
     cov = lambda m, s: torch.diag_embed(s) if s.ndim == m.ndim else s
     if mode == "state_dependent_per_coord":
         literal = torch.distributions.kl_divergence(
@@ -70,9 +69,6 @@ def test_profiled_energy_is_c0_log_b0_plus_literal_kl(law: str, mode: str, full:
                                atol=1e-12, rtol=1e-11)
     torch.testing.assert_close(full_link_cost(r_mu, r_sigma, ctx) - coupling,
                                (C0 * torch.log(B0 + literal)).sum(), atol=1e-12, rtol=1e-11)
-    # The channel law carries no coupling entropy; ambient carries sum_h lambda_h per row.
-    expected_mass = 0.0 if law == "channel_likelihood" else sum(HEADS)
-    torch.testing.assert_close(ctx.profile.mass, torch.full_like(ctx.profile.mass, expected_mass))
 
 
 def _fd_gradient(energy: Any, x: torch.Tensor, symmetric: bool, h: float = 1e-6) -> torch.Tensor:
@@ -93,11 +89,9 @@ def _fd_gradient(energy: Any, x: torch.Tensor, symmetric: bool, h: float = 1e-6)
     return out
 
 
-@pytest.mark.parametrize("law", ["ambient_alignment", "channel_likelihood"])
 @pytest.mark.parametrize(("mode", "full"), CASES)
-def test_euler_force_is_the_finite_difference_gradient_of_the_profiled_energy(
-        law: str, mode: str, full: bool) -> None:
-    mu, sigma, *_, ctx = _context(law, mode, full)
+def test_euler_force_is_the_finite_difference_gradient_of_the_profiled_energy(mode: str, full: bool) -> None:
+    mu, sigma, *_, ctx = _context(mode, full)
     r_mu, r_sigma = _away(mu, sigma)
     g_mu, g_sigma = full_link_gradients(r_mu, r_sigma, full_link_context_at(ctx, r_mu, r_sigma))
     fd_mu = _fd_gradient(lambda x: full_link_cost(x, r_sigma, ctx), r_mu, False)
@@ -112,7 +106,7 @@ def test_euler_force_is_the_finite_difference_gradient_of_the_profiled_energy(
 def test_per_coordinate_alpha_accepts_coordinate_vectors() -> None:
     b0 = torch.tensor([.5, 1., 1.5, 2.], dtype=torch.float64)
     c0 = torch.tensor([2., 1., .7, 1.3], dtype=torch.float64)
-    mu, sigma, mu_p, sigma_p, *_, ctx = _context("channel_likelihood", "state_dependent_per_coord", False, b0, c0)
+    mu, sigma, mu_p, sigma_p, *_, ctx = _context("state_dependent_per_coord", False, b0, c0)
     r_mu, r_sigma = _away(mu, sigma)
     at = full_link_context_at(ctx, r_mu, r_sigma)
     D = self_coupling_divergence(r_mu, r_sigma, ctx.profile)
@@ -129,10 +123,10 @@ def test_per_coordinate_alpha_accepts_coordinate_vectors() -> None:
     assert float(grad_mu.abs().max()) < 1e-10 and float(grad_sigma.abs().max()) < 1e-10
 
 
-def _profiled_trajectory(law: str, mode: str, full: bool, damping: float, n_iter: int) -> list:
+def _profiled_trajectory(mode: str, full: bool, damping: float, n_iter: int) -> list:
     mu, sigma, mu_p, sigma_p, frame, ops, prior = _fixture(full=full)
     ops.readout_mode = "full_link_update"
-    ops.receiver_law, ops.receiver_update, ops.receiver_damping = law, "closed_form", damping
+    ops.receiver_update, ops.receiver_damping = "closed_form", damping
     r_mu, r_sigma = _away(mu.detach(), sigma.detach())
     belief = BeliefState(r_mu, r_sigma, torch.zeros(1, 3, 2, dtype=mu.dtype))
     capture: dict = {}
@@ -148,24 +142,22 @@ def _profiled_trajectory(law: str, mode: str, full: bool, damping: float, n_iter
     return costs, record["beliefs"][-1], ctx
 
 
-@pytest.mark.parametrize("law", ["ambient_alignment", "channel_likelihood"])
 @pytest.mark.parametrize(("mode", "full"), CASES)
-def test_closed_form_mm_step_never_increases_the_profiled_energy(law: str, mode: str, full: bool) -> None:
-    costs, last, ctx = _profiled_trajectory(law, mode, full, 1.0, 8)
+def test_closed_form_mm_step_never_increases_the_profiled_energy(mode: str, full: bool) -> None:
+    costs, last, ctx = _profiled_trajectory(mode, full, 1.0, 8)
     assert all(b <= a + 1e-12 for a, b in zip(costs, costs[1:])), costs
     assert costs[-1] < costs[0] - 1e-3
     # The MM fixed point is a stationary point of the profiled energy.
-    costs_long, last, ctx = _profiled_trajectory(law, mode, full, 1.0, 60)
+    costs_long, last, ctx = _profiled_trajectory(mode, full, 1.0, 60)
     g_mu, g_sigma = full_link_gradients(last.mu, last.sigma, full_link_context_at(ctx, last.mu, last.sigma))
     assert float(g_mu.abs().max()) < 1e-8 and float(g_sigma.abs().max()) < 1e-8
 
 
-@pytest.mark.parametrize("law", ["ambient_alignment", "channel_likelihood"])
 @pytest.mark.parametrize("damping", [.3, .7])
-def test_damped_mm_step_descends_on_the_full_family(law: str, damping: float) -> None:
+def test_damped_mm_step_descends_on_the_full_family(damping: float) -> None:
     """rho < 1 on gaussian_full: the frozen energy is c KL(q||q*) + const and the natural-parameter
     segment decreases KL(q_rho||q*) monotonically, so the MM bound still gives descent."""
-    costs, *_ = _profiled_trajectory(law, "state_dependent", True, damping, 8)
+    costs, *_ = _profiled_trajectory("state_dependent", True, damping, 8)
     assert all(b <= a + 1e-12 for a, b in zip(costs, costs[1:])), costs
 
 
@@ -185,7 +177,7 @@ def test_diagonal_damping_is_not_a_descent_guarantee() -> None:
 def test_euler_episode_descends_with_small_steps() -> None:
     mu, sigma, mu_p, sigma_p, frame, ops, prior = _fixture()
     ops.readout_mode = "full_link_update"
-    ops.receiver_law, ops.receiver_update = "channel_likelihood", "euler"
+    ops.receiver_update = "euler"
     r_mu, r_sigma = _away(mu.detach(), sigma.detach())
     record: dict = {}
     capture: dict = {}
@@ -207,9 +199,9 @@ def test_full_family_rejects_per_coordinate_alpha_in_the_receiver() -> None:
 
 def test_config_accepts_state_dependent_alpha_and_predictive_knobs_as_inactive() -> None:
     cfg = _cfg(lambda_alpha_mode="state_dependent", predictive_covariance="moment_matched",
-               attention_residual=True, relational_receiver_law="channel_likelihood", lambda_alpha=0.0)
+               attention_residual=True)
     inactive = cfg.inactive_fields()
-    for name in ("predictive_covariance", "predictive_covariance_floor", "attention_residual", "lambda_alpha"):
+    for name in ("predictive_covariance", "predictive_covariance_floor", "attention_residual"):
         assert name in inactive, name
     assert "b0" not in inactive and "c0" not in inactive
     assert "lambda_alpha_mode" not in inactive
@@ -218,8 +210,6 @@ def test_config_accepts_state_dependent_alpha_and_predictive_knobs_as_inactive()
         _cfg(lambda_alpha_mode="state_dependent_per_coord", family="gaussian_full")
     with pytest.raises(ValueError, match="requires attention_mode='projected_predictive'"):
         _cfg(relational_routing="noisy_query")
-    with pytest.raises(ValueError, match="lambda_alpha > 0"):
-        _cfg(relational_receiver_law="channel_likelihood", lambda_alpha=0.0)
 
 
 def test_inactive_predictive_knobs_leave_the_gradient_route_unchanged() -> None:

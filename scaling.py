@@ -180,7 +180,6 @@ config = dict(
     #################################
     #        Encode/Decode          #
     #################################
-    decode_bias                       = True,     # only for decode_mode='linear'
 
 
 
@@ -233,7 +232,7 @@ config = dict(
     #                Self Energy:
     #        Sum_i alpha_i * KL(q_i||p_i)
     ######################################
-    lambda_alpha_mode          = "state_dependent_per_coord",  # "constant" | "state_dependent" | "state_dependent_per_coord"
+    lambda_alpha_mode          = "state_dependent_per_coord",  # "state_dependent" | "state_dependent_per_coord"
 
     b0   = 1.0,                                # state-dependent alpha shape: alpha* = c0/(b0 + D)
     c0   = 1.0,                                 # state-dependent alpha shape (numerator)
@@ -259,7 +258,6 @@ config = dict(
     #  lambda_beta*Sum_i beta_ij * KL(q_i||Omega_ij q_j) + ...
     ##########################################################
 
-    lambda_alpha               = 1,          # constant self-coupling value
     lambda_beta                = 1.0,        # belief-coupling block weight (1.0 = pure F)
 
 
@@ -330,7 +328,6 @@ config = dict(
 
     layernorm_affine          = True,
     norm_type_block           = "layernorm",        # "none" | "mahalanobis" |"layernorm"
-    norm_type_final           = "none",             # "none" | "mahalanobis" |"layernorm"
 
 
     #################################
@@ -636,8 +633,7 @@ def predict_n_params(cfg: VFE3Config) -> Tuple[int, int]:
     n += V * K                                               # token-prior variance table
     if cfg.decode_mode == "linear":
         n += V * K                                          # output_proj_weight
-        if cfg.decode_bias:
-            n += V                                          # output_proj_bias
+        n += V                                              # output_proj_bias
     elif cfg.untie_decode_bank:
         n += 2 * V * K                                      # independent routed decode tables
     if cfg.pos_phi == "learned":
@@ -650,8 +646,8 @@ def predict_n_params(cfg: VFE3Config) -> Tuple[int, int]:
             expansion=int(cfg.block_mlp_expansion),
             n_layers=int(cfg.n_layers),
         )
-    if cfg.layernorm_affine:
-        n += 2 * K * sum(mode == "layernorm" for mode in (cfg.norm_type_block, cfg.norm_type_final))
+    if cfg.layernorm_affine and cfg.norm_type_block == "layernorm":
+        n += 2 * K
     n += int(cfg.n_layers) * 4 * K * K                       # full-width Q/K/T/O maps
     return n, n_gen
 

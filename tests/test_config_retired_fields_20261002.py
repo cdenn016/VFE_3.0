@@ -86,8 +86,7 @@ def test_mu_trust_mode_box_is_refused_only_where_the_trust_region_was_read() -> 
     assert _load(mu_trust_mode="box", e_mu_q_trust=None) == test_config(e_mu_q_trust=None)
     closed = _load(mu_trust_mode="box", relational_receiver_update="closed_form")
     assert closed == test_config(relational_receiver_update="closed_form")
-    predictive = dict(attention_mode="projected_predictive", relational_receiver_law="channel_likelihood",
-                      relational_receiver_update="closed_form")
+    predictive = dict(attention_mode="projected_predictive", relational_receiver_update="closed_form")
     assert _load(mu_trust_mode="box", **predictive) == test_config(**predictive)
 
 
@@ -95,8 +94,7 @@ def test_e_step_mu_precond_raw_is_inert_on_predictive_and_refused_on_gradient() 
     with pytest.raises(ValueError, match="retired e_step_mu_precond='raw'"):
         _load(e_step_mu_precond="raw")
     assert _load(e_step_mu_precond="fisher") == test_config()
-    predictive = dict(attention_mode="projected_predictive", relational_receiver_law="channel_likelihood",
-                      relational_receiver_update="closed_form")
+    predictive = dict(attention_mode="projected_predictive", relational_receiver_update="closed_form")
     assert _load(e_step_mu_precond="raw", **predictive) == test_config(**predictive)
 
 

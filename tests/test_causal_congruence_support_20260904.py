@@ -28,7 +28,6 @@ def test_tiny_full_gaussian_forward_backward_and_logger(
         encode_mode="per_token", decode_mode="full_chunked",
         beta_attention_prior="causal_alibi_noself",
         pos_phi="learned", rope_mode="none",
-        full_cov_kl_precision="fp32_escalate",
     )
     model = VFEModel(cfg).to(device)
     tokens = torch.tensor([[0, 1, 2]], device=device)

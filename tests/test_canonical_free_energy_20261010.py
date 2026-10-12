@@ -90,11 +90,8 @@ def _brute_force(model: VFEModel, snapshot: DiagnosticSnapshot, layer: int) -> D
                 raw_terms.append(float(D_k.sum()))
             else:
                 D_self = _dense_kl(mu_q, Sigma[b, i], mu_t, Sigma_p[b, i])
-                if mode == "constant":
-                    self_terms.append(cfg.lambda_alpha * D_self)
-                else:                                                    # state_dependent
-                    alpha = cfg.c0 / (cfg.b0 + D_self)
-                    self_terms.append(alpha * D_self + cfg.b0 * alpha - cfg.c0 * math.log(alpha))
+                alpha = cfg.c0 / (cfg.b0 + D_self)                       # state_dependent
+                self_terms.append(alpha * D_self + cfg.b0 * alpha - cfg.c0 * math.log(alpha))
                 raw_terms.append(D_self)
             row_coupling, row_entropy = 0.0, 0.0
             offset = 0
@@ -132,7 +129,7 @@ def _brute_force(model: VFEModel, snapshot: DiagnosticSnapshot, layer: int) -> D
     dict(learn_attention_temperature=True),
     dict(family="gaussian_full", beta_attention_prior="causal_noself"),
     dict(attention_mode="projected_gradient", predictive_covariance="passthrough",
-         relational_receiver_law="ambient_alignment", relational_receiver_update="euler",
+         relational_receiver_update="euler",
          attention_residual=False),
 ], ids=["frames", "gauge_off", "rope_alibi", "per_coord_alpha", "state_alpha", "learned_tau", "full_noself",
         "gradient"])

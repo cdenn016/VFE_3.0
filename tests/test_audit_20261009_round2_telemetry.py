@@ -180,7 +180,7 @@ def test_fixed_training_sample_is_the_same_under_per_epoch_offsets() -> None:
     val = DataLoader(TokenWindows(torch.arange(60) % 11, 8, pad_final=True), batch_size=2)
     fixed = TokenWindows(tokens, 8)
     offset = TokenWindows(tokens, 8)
-    offset.set_window_offset_mode("per_epoch_random")
+    offset.use_per_epoch_offsets()
     assert (len(fixed), len(offset)) == (25, 24)                              # T = 201, L = 8
     offset.draw_window_offset(torch.Generator().manual_seed(3))
     sample_fixed, _ = T._build_fixed_train_sample(DataLoader(fixed, batch_size=2), val, cfg)
@@ -247,7 +247,7 @@ def test_run_artifacts_checkpoint_carries_the_run_totals(tmp_path, monkeypatch: 
 @pytest.mark.parametrize("amp_dtype", [None, "bf16"])
 def test_precision_replay_records_carry_the_autocast_dtype(amp_dtype, monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = test_config(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1,
-                      matmul_precision_retry=True, amp_dtype=amp_dtype)
+                      amp_dtype=amp_dtype)
     torch.manual_seed(0)
     model = VFEModel(cfg)
     optimizer = T.build_optimizer(model, cfg)

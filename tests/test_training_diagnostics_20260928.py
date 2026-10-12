@@ -51,7 +51,7 @@ def _cfg(route: str = "conditional", **overrides: Any) -> VFE3Config:
 
 
 def _loaders(cfg: VFE3Config) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    train_ds = TokenWindows(torch.arange(41) % V, N)                     # 10 windows = 5 full batches
+    train_ds = TokenWindows(torch.arange(45) % V, N)                     # 10 windows per epoch = 5 full batches
     val_ds = TokenWindows((torch.arange(23) * 3) % V, N, pad_final=True, stride=cfg.eval_stride)
     test_ds = TokenWindows((torch.arange(19) * 5 + 1) % V, N, pad_final=True, stride=cfg.eval_stride)
     return (DataLoader(train_ds, batch_size=B, shuffle=True),              # global-RNG permutations

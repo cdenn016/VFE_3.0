@@ -203,16 +203,14 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
         "score_covariance_contract": ("exact_full_reduced_covariance_from_local_gaussian_plus_channel_noise"
                                       if minimal_agent else "exact_full_reduced_covariance_from_local_gaussian"),
         "receiver_noise": cfg.relational_receiver_noise if full_link else None,
-        "receiver_law": cfg.relational_receiver_law if full_link else None,
+        "receiver_measurement": cfg.relational_receiver_measurement if full_link else None,
         "receiver_update": cfg.relational_receiver_update if full_link else None,
         "receiver_damping": (cfg.relational_receiver_damping
                              if full_link and cfg.relational_receiver_update != "euler" else None),
         "covariance_update": (("passthrough" if cfg.skip_belief_sigma_update else
                                "fisher_step" if cfg.relational_receiver_update == "euler" else "closed_form")
                               if full_link else getattr(cfg, "predictive_covariance", "passthrough")),
-        "content_covariance_contract": (("value_space_channel_likelihood_plus_channel_noise"
-                                         if cfg.relational_receiver_law == "channel_likelihood" else
-                                         "full_link_pushforward_plus_positive_reference_noise") if full_link else
+        "content_covariance_contract": ("value_space_channel_likelihood_plus_channel_noise" if full_link else
                                         (("minimal_agent_mean_field_label_spread_corrected_plus_prior_floor"
                                           if getattr(cfg, "predictive_covariance", "passthrough") == "spread_corrected"
                                           else "minimal_agent_posterior_moment_match_plus_covariant_floor")
@@ -2219,7 +2217,7 @@ class RunArtifacts:
                 "epoch":                       epoch,
                 "data_identity":               data_identity,
             }
-            if "window_offset" in data_state:            # train_window_offset='per_epoch_random' only
+            if "window_offset" in data_state:            # per-epoch window origins only
                 saved_data_state["window_offset"] = _require_nonnegative_int(
                     data_state["window_offset"], "window_offset")
         # Portable best-model selection state (PB-03): a finite best_val_ppl means best_model.pt IS the
@@ -3610,11 +3608,11 @@ def _cost_model_fields(
     if cfg.decode_mode != "linear":
         decode_readout = 2 * V * K
     else:
-        decode_readout = V * K + (V if cfg.decode_bias else 0)
+        decode_readout = V * K + V                                    # output_proj_weight, output_proj_bias
     active = token_row + decode_readout
     active += block_mlp_params
     # Audit 2026-09-28: every token also reads one row of the learned positional-frame table
-    # (pos_phi_free is (max_seq_len, n_gen)) and every block/final normalization affine; both were
+    # (pos_phi_free is (max_seq_len, n_gen)) and the block normalization affine; both were
     # omitted (K160: +5,120 + 320 = 11,182,897). Parameters are deduplicated by identity, so a
     # normalization shared across layers counts once.
     pos_phi_free = getattr(model, "pos_phi_free", None)
@@ -3622,11 +3620,10 @@ def _cost_model_fields(
             and pos_phi_free.shape[0] > 0):
         active += int(pos_phi_free.numel() // pos_phi_free.shape[0])
     norm_parameters: Dict[int, int] = {}
-    for norm_name in ("block_norm", "final_norm"):
-        norm_module = getattr(model, norm_name, None)
-        if isinstance(norm_module, torch.nn.Module):
-            for parameter in norm_module.parameters():
-                norm_parameters[id(parameter)] = int(parameter.numel())
+    norm_module = getattr(model, "block_norm", None)
+    if isinstance(norm_module, torch.nn.Module):
+        for parameter in norm_module.parameters():
+            norm_parameters[id(parameter)] = int(parameter.numel())
     active += sum(norm_parameters.values())
     # Transparent analytic FLOP proxy. Per token: decode over all V (2VK) and L*T belief E-step
     # iterations. Each E-step iteration has O(N) attention energy (2NK) plus O(N) transport
@@ -4173,8 +4170,7 @@ def finalize_run(
     # third of its steps trained on a different schedule than its config claims, and sweep arms with
     # different skip rates are not comparable. Absent on a train() call that had no artifacts.
     _realized = dict(getattr(artifacts, "realized_updates", None) or {})
-    # Tokens of the steps actually run: a run stopped by divergence_abort ends before max_steps
-    # (audit 2026-10-10 round 2, item 1).
+    # Tokens of the steps actually run (attempted_steps; cfg.max_steps without a realized record).
     steps_run = int(_realized.get("attempted_steps", cfg.max_steps))
     tokens_seen = steps_run * int(cfg.batch_size) * int(cfg.max_seq_len)
     # scaling-law data point: the 6ND FLOP proxy is LOOSE for a no-NN E-step model, so record the
@@ -4240,8 +4236,8 @@ def finalize_run(
         "decode_mode":     cfg.decode_mode,
         "decode_tau_eff":  decode_tau_eff,
         # The expected-likelihood CE kernel that last ran ('torch' | 'triton'; None when that decoder never
-        # ran): expected_likelihood_kernel='triton' runs the torch kernel on CPU tensors (audit 2026-10-10
-        # round 2, #42).
+        # ran): CUDA tensors run the fused Triton kernel, CPU tensors the chunked torch kernel (audit
+        # 2026-10-10 round 2, #42; selector removed 2026-10-12).
         "expected_likelihood_ce_kernel": getattr(getattr(model, "prior_bank", None),
                                                  "realized_expected_likelihood_kernel", None),
         "phi_chart_norm_route": _phi_chart_norm_route(model, cfg),
@@ -4907,9 +4903,6 @@ def finalize_validation_run(
     figures_written = sorted(p.name for p in artifacts.run_dir.glob("*.png") if p.is_file())
     artifacts.save_json("summary.json", {
         **_conditional_artifact_fields(cfg),
-        # train() sets training_status ("diverged" with its reason when divergence_abort stopped the loop)
-        # before calling its terminal callback (audit 2026-10-10 round 2, item 1).
-        **dict(getattr(artifacts, "training_status", None) or {}),
         "selection_split":     "validation",
         "primary_val_ppl":     float(primary_val_ppl),
         "final_val_ce":        final_ce,
@@ -5131,9 +5124,7 @@ def _pure_path_report(
     on_causal_lm_path = all(causal_flags.values())
 
     block_norm_name = getattr(cfg, "norm_type_block", "none")
-    final_norm_name = getattr(cfg, "norm_type_final", "none")
     block_norm_registration = get_norm_registration(block_norm_name)
-    final_norm_registration = get_norm_registration(final_norm_name)
     transport_chart_max_norm = float(cfg.transport_chart_max_norm)
     reference_blocks = getattr(cfg, "block_coordinates", "local") == "reference"
 
@@ -5162,7 +5153,6 @@ def _pure_path_report(
     pure_flags = {
         "canonical_attention_entropy": not conditional_fields,
         "flat_transport":              True,
-        "constant_lambda_alpha":       cfg.lambda_alpha_mode == "constant",
         "prior_bank_decode":           cfg.decode_mode != "linear",
         # The prior-bank logit is the exact -KL(q*||p_v)/tau only when it reads the belief's own covariance.
         "decode_reads_belief_covariance": getattr(cfg, "decode_covariance", "belief") == "belief",
@@ -5186,14 +5176,13 @@ def _pure_path_report(
         "positional_rotation_gauge_covariant": (
             cfg.rope_mode == "none" or getattr(cfg, "rope_insertion", "right") == "right"),
         "family_group_invariant":    family_group_invariant,
-        # block_coordinates='reference' conjugates the block norm, final norm and block MLP by the
+        # block_coordinates='reference' conjugates the block norm and block MLP by the
         # realized frame, x -> U_i N(U_i^{-1} x), which is covariant for any registered map
         # (audit 2026-10-07 F18). The canonical_frame MLP is the same dressing U_i F(U_i^{-1} x) applied to the MLP
         # alone, covariant under the per-token action U_i -> g_i U_i (audit 2026-10-10, item 42).
         "block_mlp_intertwiner_compatible": (block_mlp_intertwiner_compatible or reference_blocks
                                              or (block_mlp_active and block_mlp_mode == "canonical_frame")),
         "block_norm_gauge_equivariant": block_norm_registration.gauge_equivariant or reference_blocks,
-        "final_norm_gauge_equivariant": final_norm_registration.gauge_equivariant or reference_blocks,
         "no_fixed_coordinate_spectral_cap": (
             sigma_max is None if sigma_cap_consumer_active else "not_applicable"),
         "no_phi_mstep_chart_cap": getattr(cfg, "phi_mstep_max_matrix_norm", None) is None,
@@ -5291,7 +5280,6 @@ def _pure_path_report(
             "spd_retraction_trust_projection_active": spd_retraction_trust_projection_active,
             "spd_retraction_exponential_clipping_active": spd_retraction_exponential_clipping_active,
             "norm_type_block":              block_norm_name,
-            "norm_type_final":              final_norm_name,
             "layernorm_affine":             bool(getattr(cfg, "layernorm_affine", False)),
             "m_phi_update_mode":            getattr(cfg, "m_phi_update_mode", "adamw"),
             "m_phi_group_trust_radius":      float(getattr(cfg, "m_phi_group_trust_radius", 0.1)),

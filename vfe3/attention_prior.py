@@ -3,16 +3,15 @@ r"""Attention-prior registry for VFE_3.0 (the prior pi_ij over keys).
 Each prior returns a LOG-PRIOR BIAS B_ij added to the attention logits:
     beta*_ij = softmax_j(B_ij - E_ij / tau),
 and the normalized prior used in the attention-entropy term is pi = softmax_j(B).
-  uniform  B = 0            -> pi_ij = 1/N (manuscript default).
   causal   B = 0 (j<=i), -inf (j>i)   -> uniform over the causal active set.
-  alibi    B_ij = -slope*|i-j|        -> linear distance bias (Press et al.).
   causal_alibi  B_ij = -slope*(i-j) (j<=i), -inf (j>i) -> causal + ALiBi (Press et al.).
   causal_noself / causal_alibi_noself -> the same with the self key j=i also masked
     (except (0,0); see prior_causal_noself for the attention-sink rationale).
-  windowed / causal_windowed -> hard local band |i-j| <= window (bidirectional / causal).
+  causal_windowed -> hard causal local band 0 <= i-j <= window.
   t5_relative_bias -> learned or fixed per-bucket relative-position bias.
-Config-selected so a new prior (learned bias, windowed, ...) slots in by
-register_prior without editing the free-energy call site.
+Every registered prior is causal for next-token scoring; the non-causal uniform, alibi and windowed
+priors were removed on 2026-10-12. Config-selected so a new prior slots in by register_prior without
+editing the free-energy call site; a non-causal registration is refused by training (vfe3/train.py).
 """
 
 import math
@@ -120,20 +119,6 @@ def get_prior_registration(name: str) -> AttentionPriorRegistration:
     return AttentionPriorRegistration(fn, causal, config_key)
 
 
-@register_prior("uniform")
-def prior_uniform(
-    n_query: int,
-    n_key:   int,
-
-    *,
-    device:  'torch.device | str | None' = None,
-    dtype:   torch.dtype                  = torch.float32,
-    **kwargs,
-) -> torch.Tensor:
-    r"""Uniform prior: zero log-bias (pi_ij = 1/N after softmax)."""
-    return torch.zeros(n_query, n_key, device=device, dtype=dtype)
-
-
 @register_prior("causal", causal_for_next_token_scoring=True)
 def prior_causal(
     n_query: int,
@@ -174,30 +159,6 @@ def prior_causal_noself(
     allowed = (j < i) | ((i == 0) & (j == 0))
     B = torch.zeros(n_query, n_key, device=device, dtype=dtype)
     return B.masked_fill(~allowed, float("-inf"))
-
-
-@register_prior("alibi")
-def prior_alibi(
-    n_query:     int,
-    n_key:       int,
-
-    *,
-    n_heads:     int                          = 1,
-    alibi_slope: float                        = 1.0,
-    device:      'torch.device | str | None'  = None,
-    dtype:       torch.dtype                  = torch.float32,
-    **kwargs,
-) -> torch.Tensor:
-    r"""ALiBi prior with per-head Press et al. slopes: B_hij = -slope_h * |i - j|.
-
-    Returns shape ``(H, N_q, N_k)`` where ``H = n_heads`` and the per-head slopes follow
-    Press et al.'s reference power-of-two schedule plus its non-power-of-two interpolation.
-    """
-    i      = torch.arange(n_query, device=device).unsqueeze(-1)
-    j      = torch.arange(n_key,   device=device).unsqueeze(0)
-    dist   = (i - j).abs().to(dtype)                                # (N_q, N_k)
-    slopes = _press_slopes(n_heads, alibi_slope, device, dtype)     # (H,)
-    return (-slopes.view(n_heads, 1, 1) * dist)                     # (H, N_q, N_k)
 
 
 @register_prior("causal_alibi", causal_for_next_token_scoring=True)
@@ -261,34 +222,6 @@ def prior_causal_alibi_noself(
     return B.masked_fill(~allowed.unsqueeze(0), float("-inf"))      # (H, N_q, N_k)
 
 
-@register_prior("windowed")
-def prior_windowed(
-    n_query: int,
-    n_key:   int,
-
-    *,
-    window:  int                          = 128,
-    device:  'torch.device | str | None'  = None,
-    dtype:   torch.dtype                   = torch.float32,
-    **kwargs,
-) -> torch.Tensor:
-    r"""Windowed (local-attention) prior: 0 inside a symmetric band, -inf outside.
-
-        B_ij = 0      for |i - j| <= window,
-             = -inf   otherwise,
-    a hard local-attention restriction (a mask-like prior, like `causal`). The bidirectional
-    band; for the autoregressive form use `causal_windowed`. ``window`` IS threaded from the model
-    (``model.py`` forwards ``window=cfg.attention_window``, validated in ``config.py``), so it is a
-    per-run knob; the former claim that it was default-only was stale (audit 2026-07-25 F21).
-    NOTE it is inert at ``attention_window >= max_seq_len - 1``, where every entry is allowed and
-    the prior is byte-identical to plain ``causal``."""
-    i = torch.arange(n_query, device=device).unsqueeze(-1)
-    j = torch.arange(n_key, device=device).unsqueeze(0)
-    allowed = (i - j).abs() <= window
-    B = torch.zeros(n_query, n_key, device=device, dtype=dtype)
-    return B.masked_fill(~allowed, float("-inf"))
-
-
 @register_prior("causal_windowed", causal_for_next_token_scoring=True)
 def prior_causal_windowed(
     n_query: int,
@@ -304,9 +237,10 @@ def prior_causal_windowed(
 
         B_ij = 0      for 0 <= i - j <= window   (past keys within the band),
              = -inf   otherwise                  (future keys, or keys further back than window).
-    The causal counterpart of `windowed`: it forbids the future like `causal` and additionally
-    drops keys more than ``window`` steps in the past, the sliding-window local attention of
-    Longformer/Mistral. ``window`` is default-only from the model (as `alibi`'s slope is)."""
+    It forbids the future like `causal` and additionally drops keys more than ``window`` steps in
+    the past, the sliding-window local attention of Longformer/Mistral. ``window`` is threaded from
+    the model (``window=cfg.attention_window``, validated in ``config.py``). It is inert at
+    ``attention_window >= max_seq_len - 1``, where it equals plain ``causal``."""
     i = torch.arange(n_query, device=device).unsqueeze(-1)
     j = torch.arange(n_key, device=device).unsqueeze(0)
     d = i - j

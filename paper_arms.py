@@ -270,7 +270,7 @@ def _template_already(base: Any) -> Optional[str]:
 
 
 def _no_ln_or_mlp(base: Any) -> Optional[str]:
-    if base.norm_type_block != "layernorm" and base.norm_type_final != "layernorm" and not base.use_block_mlp:
+    if base.norm_type_block != "layernorm" and not base.use_block_mlp:
         return "the base has neither a LayerNorm nor a block MLP"
     return None
 
@@ -387,7 +387,6 @@ ARMS: Dict[str, Dict[str, Any]] = {
         "group": _RETRAINING, "slug": "intertwiner_block",
         "vfe": {"block_mlp_mode": "gauge_gate",
                 "norm_type_block": _covariant_norm("norm_type_block"),
-                "norm_type_final": _covariant_norm("norm_type_final"),
                 "decode_coordinates": "reference"},
         "requires": ("decode_coordinates",), "inapplicable": _no_mlp_or_reference_decode},
     # Audit 2026-10-09 round 2 items 4 and 12: frames are pure gauge wherever every consumer reads (xi, C),
@@ -460,7 +459,6 @@ ARMS: Dict[str, Dict[str, Any]] = {
 # name); only fields present on both are compared.
 BASELINE_PROTOCOL_FIELDS: Dict[str, str] = {
     "vocab_size": "vocab_size", "max_seq_len": "max_seq_len", "eval_stride": "eval_stride",
-    "train_window_offset": "train_window_offset",
     "batch_size": "batch_size", "max_steps": "max_steps", "eval_interval": "eval_interval",
     "checkpoint_interval": "checkpoint_interval", "grad_accum_steps": "grad_accum_steps",
     "embed_dim": "embed_dim", "n_heads": "n_heads", "n_layers": "n_layers",
@@ -470,7 +468,6 @@ BASELINE_PROTOCOL_FIELDS: Dict[str, str] = {
     "grad_clip": "grad_clip", "beta_attention_prior": "beta_attention_prior",
     "alibi_slope": "alibi_slope", "rope_base": "rope_base",
     "rope_fraction": "rope_fraction",
-    "decode_bias": "decode_bias",
     "decode_unigram_prior": "decode_unigram_prior", "unigram_kappa": "unigram_kappa",
 }
 # Confound controls for the 34.48 against 55.10 comparison (October 7, 2026), with the plain
@@ -670,8 +667,6 @@ def check_baseline_arm(
     Returns ``{BaselineConfig field: (VFE value, baseline value)}`` of the declared differences.
     """
     declared = set(declared)
-    if getattr(matched_cfg, "decode_mode", "linear") != "linear":
-        declared.add("decode_bias")         # documented: the baseline decodes linearly, with a bias
     diff: Dict[str, Tuple[Any, Any]] = {}
     for name, vfe_name in BASELINE_PROTOCOL_FIELDS.items():
         if not hasattr(baseline_cfg, name) or not hasattr(matched_cfg, vfe_name):
@@ -684,6 +679,10 @@ def check_baseline_arm(
         a = "none" if matched_cfg.rope_mode == "none" else "rope"
         if a != baseline_cfg.pos_rotation:
             diff["pos_rotation"] = (a, baseline_cfg.pos_rotation)
+    # The VFE linear decoder always carries the per-vocab bias (decode_bias removed 2026-10-12); the
+    # baseline decodes linearly with a bias even against a Gaussian-decode VFE (documented).
+    if hasattr(baseline_cfg, "decode_bias") and baseline_cfg.decode_bias is not True:
+        diff["decode_bias"] = (True, baseline_cfg.decode_bias)
     undeclared = sorted(set(diff) - declared)
     if undeclared:
         raise ArmDefinitionError(
@@ -1045,7 +1044,7 @@ def format_plan(base: Base, plans: Sequence[ArmPlan], *, budget: str) -> str:
         f"base {base.name}: {base.run_dir}",
         f"  dataset={base.dataset} K={cfg.embed_dim} heads={cfg.n_heads} L={cfg.n_layers} family={cfg.family} "
         f"attention={cfg.attention_mode} covariance={cfg.predictive_covariance} residual={cfg.attention_residual} "
-        f"norm={cfg.norm_type_block}/{cfg.norm_type_final} affine={cfg.layernorm_affine} "
+        f"norm={cfg.norm_type_block} affine={cfg.layernorm_affine} "
         f"mlp={cfg.block_mlp_mode if cfg.use_block_mlp else 'none'}x{cfg.block_mlp_expansion} "
         f"decode={cfg.decode_mode} batch={cfg.batch_size}x{cfg.max_seq_len} sigma_wd={cfg.sigma_weight_decay}",
         f"  pinned (historical defaults the loader applies to absent fields): {base.pinned}",
