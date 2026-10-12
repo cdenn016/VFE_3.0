@@ -1923,7 +1923,8 @@ def _capture_numerics_counts(
     :math:`\mathrm{numel}(G_q)/r^2 + \mathrm{numel}(G_k)/r^2`. The factorization uses zero jitter and
     no spectral repair; its only fallback is the source-factor recovery of
     :func:`vfe3.relational_scoring._strict_cholesky` (float32 shifted CholeskyQR3 of the source root
-    :math:`L \Sigma^{1/2}`, with float64 QR when that fails) for an entry whose working-precision factor
+    :math:`L \Sigma^{1/2}`, with float64 QR when that fails; float64 QR for every rebuilt entry under
+    ``cholesky_qr2_certified``) for an entry whose working-precision factor
     failed, or failed the conditioning certificate under a certified ``projected_factorization`` (on
     either factor route). The numerator is the layer's recovered-entry count
     ``relational_covariance_repair_count``, a subset of the same entries. The pair-level factorizations

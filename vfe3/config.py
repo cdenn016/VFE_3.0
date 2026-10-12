@@ -821,16 +821,17 @@ class VFE3Config:
     
     # "gram" | "gram_certified" | "cholesky_qr2_certified"
     # Factorization of the projected Gaussian-KL scorer. Failed float32 factorizations are always rebuilt
-    # from source where the scorer has source tuples; a recovery runs in float32 shifted CholeskyQR3 and
-    # falls back to float64 QR when that fails.
+    # from source where the scorer has source tuples; a Gram-route recovery runs in float32 shifted
+    # CholeskyQR3 and falls back to float64 QR when that fails.
     #   gram                    factor the float32 Gram X X^T (error O(eps kappa^2))
     #   gram_certified          gram, and also rebuild entries that factor but fail
     #                           eps_32 ||G||_F ||G^-1||_F <= 1e-4 (costly on CUDA; with minimal_agent it
     #                           also screens the ADF query covariances; under comparison_invariant with a
     #                           diagonal P(G) it keeps the factored route in place of the diagonal one)
     #   cholesky_qr2_certified  factor X by CholeskyQR2 (error O(eps kappa)) and rebuild entries failing
-    #                           eps_32 kappa_1(C) <= 3e-4 by the same recovery as gram_certified (their
-    #                           pairs leave the GEMM for triangular-solve tiles); the Gram route serves minimal_agent,
+    #                           eps_32 kappa_1(C) <= 3e-4, or failing outright, in float64 (QR of the
+    #                           float64 source root; their pairs leave the GEMM for float64 triangular-solve
+    #                           tiles); the Gram route serves minimal_agent,
     #                           noisy_query and comparison_invariant, which pass no source root
     projected_factorization:          str             = "gram"
     
