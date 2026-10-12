@@ -97,13 +97,13 @@ def factor_route():
 def test_factor_route_config_validated_and_active_on_supported_routes() -> None:
     from tests.profiles import tiny_config
     from tests.test_relational_integration import _cfg
-    assert _cfg(projected_factor_route="gram").projected_factor_route == "gram"
-    with pytest.raises(ValueError, match="projected_factor_route"):
-        _cfg(projected_factor_route="qr")
-    assert "projected_factor_route" not in _cfg().inactive_fields()
-    assert "projected_factor_route" in _cfg(attention_mode="projected_predictive",
+    assert _cfg(projected_factorization="gram").projected_factorization == "gram"
+    with pytest.raises(ValueError, match="projected_factorization"):
+        _cfg(projected_factorization="qr")
+    assert "projected_factorization" not in _cfg().inactive_fields()
+    assert "projected_factorization" in _cfg(attention_mode="projected_predictive",
 
-                                               relational_routing="noisy_query").inactive_fields()
+                                               relational_routing="mean_distance").inactive_fields()
 
 
 @pytest.mark.parametrize("route", ["gram", "cholesky_qr2"])
@@ -113,7 +113,7 @@ def test_model_installs_the_factor_route(factor_route, route: str) -> None:
     from vfe3.relational_scoring import projected_factor_route
 
     factor_route("cholesky_qr2" if route == "gram" else "gram")
-    VFEModel(_cfg(projected_factor_route=route))
+    VFEModel(_cfg(projected_factorization="gram" if route == "gram" else "cholesky_qr2_certified"))
     assert projected_factor_route() == route
 
 

@@ -68,8 +68,9 @@ from vfe3.families.gaussian import (
 )
 from vfe3.families.base import BeliefParams, get_family as _get_family
 from vfe3.families.policy import family_instance
-from vfe3.numerics import safe_eigvalsh, set_mu_trust_cholesky_rounds
+from vfe3.numerics import FACTOR_CONDITION_TOL, safe_eigvalsh, set_mu_trust_cholesky_rounds
 from vfe3.relational_scoring import (
+    GRAM_CONDITION_TOL,
     set_projected_condition_recovery,
     set_projected_factor_condition_tol,
     set_projected_factor_route,
@@ -274,11 +275,14 @@ class VFEModel(nn.Module):
             cfg.full_cov_kl_precision)
         # Same one-place-set rule for the KL policy itself (audit 2026-08-06 C1).
         set_full_cov_kl_precision(self.full_cov_kl_precision)
-        set_projected_condition_recovery(cfg.projected_cov_condition_recovery)
-        set_projected_factor_route(cfg.projected_factor_route)
-        set_projected_gram_condition_tol(cfg.projected_gram_condition_tol)
-        set_projected_factor_condition_tol(cfg.projected_factor_condition_tol)
-        set_projected_recovery_precision(cfg.projected_cov_recovery_precision)
+        # projected_factorization: the certificate and factor route; tolerances and the fp32 recovery
+        # precision (float64 fallback) are fixed.
+        set_projected_condition_recovery(cfg.projected_factorization != "gram")
+        set_projected_factor_route(
+            "cholesky_qr2" if cfg.projected_factorization == "cholesky_qr2_certified" else "gram")
+        set_projected_gram_condition_tol(GRAM_CONDITION_TOL)
+        set_projected_factor_condition_tol(FACTOR_CONDITION_TOL)
+        set_projected_recovery_precision("fp32")
         set_frame_pair_fp64_escalation(cfg.frame_pair_fp64_escalation)
         set_frame_pair_condition_tol(cfg.frame_pair_condition_tol)
         set_mu_trust_cholesky_rounds(cfg.mu_trust_cholesky_rounds)

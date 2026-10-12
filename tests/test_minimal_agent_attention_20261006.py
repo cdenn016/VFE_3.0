@@ -766,7 +766,7 @@ def test_float32_failure_is_recomputed_in_float64(inference: str) -> None:
 def test_float32_operating_range_and_the_query_certificate(inference: str) -> None:
     r"""Two K = 32 instances without a float32 failure. Certificate off, neither is recomputed and both lie within
     1e-4 of the float64 readout with positive variances (measured: about 1e-6 benign, 1e-5 ill-conditioned). Under
-    ``projected_cov_condition_recovery`` the benign one still runs in float32. The ill-conditioned one fails the
+    ``projected_factorization="gram_certified"`` the benign one still runs in float32. The ill-conditioned one fails the
     query certificate and is recomputed in float64, bitwise equal to the float64 readout of its float32 inputs."""
     for kind, trips in (("benign", False), ("ill_conditioned", True)):
         frame, mu, sigma, S, T_, lp = _k32_case(kind)
@@ -826,7 +826,7 @@ def test_config_validation_and_inactive_fields() -> None:
         cfg = test_config(**_AGENT, minimal_agent_inference=inference, minimal_agent_channel_noise=0.25)
         inactive = cfg.inactive_fields()
         assert {"relational_routing", "content_link_chart", "attention_residual", "relational_output_init",
-                "kappa_beta", "projected_factor_route"} <= set(inactive)
+                "kappa_beta"} <= set(inactive)
         assert not {"minimal_agent_inference", "minimal_agent_channel_noise", "predictive_readout"} & set(inactive)
         # Passthrough covariance: the floor is inert, the whole-readout checkpoint is not.
         assert "predictive_covariance_floor" in inactive and "predictive_covariance_checkpoint" not in inactive

@@ -22,7 +22,7 @@ def _minimal_agent(**overrides: Any) -> Dict[str, Any]:
                predictive_readout="minimal_agent", decode_mode="linear", use_block_mlp=True,
                block_mlp_mode="prototype_agents", norm_type_block="layernorm", norm_type_final="none",
                amp_dtype=None, kl_max=8 * K, mstep_self_coupling_weight=0.0, cg_energy_weight=0.0,
-               use_cg_coupling=False, projected_cov_condition_recovery=False)
+               use_cg_coupling=False, projected_factorization="gram")
     cfg.update(overrides)
     return cfg
 
@@ -57,8 +57,7 @@ def _assert_bit_inert(base: Dict[str, Any], override: Dict[str, Any]) -> None:
 
 
 @pytest.mark.parametrize("inference", ["mean_field", "exact"])
-@pytest.mark.parametrize("override", [{"kl_max": 1.0}, {"amp_dtype": "bf16"},
-                                      {"projected_cov_recovery_precision": "fp64"}])
+@pytest.mark.parametrize("override", [{"kl_max": 1.0}, {"amp_dtype": "bf16"}])
 def test_minimal_agent_marks_and_is_bit_inert_in_the_reported_knobs(inference: str,
                                                                     override: Dict[str, Any]) -> None:
     base = _minimal_agent(minimal_agent_inference=inference, block_mlp_inference=inference)

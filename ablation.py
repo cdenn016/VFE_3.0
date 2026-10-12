@@ -496,15 +496,11 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     fp32_matmul_precision            = "highest",          # None (leave as-is) | "highest" | "high" | "medium" ("high" permits TF32 on the decode/energy GEMMs)
         
     decode_ce_checkpoint             = "auto",     # "auto" | "auto_aggregate" (saves memory with recompute)
-    projected_cov_recovery_precision = "fp32",     # "fp64" | "fp32"
-    projected_factor_route           = "gram",     # "gram" | "cholesky_qr2" (slower unless recovery actually trips)
+    projected_factorization          = "gram",     # "gram" | "gram_certified" | "cholesky_qr2_certified" (certified: rebuild ill-conditioned factors; costly)
    
     frame_pair_fp64_escalation       = False,
-    projected_cov_condition_recovery = False,
     predictive_covariance_checkpoint = False,       # moment_matched only: recompute the (B,N,K,K) update in backward; bit-identical.
         
-    projected_gram_condition_tol     = 1e-4,
-    projected_factor_condition_tol   = 3e-4,
     frame_pair_condition_tol         = 1e-4,       # inactive while the escalation is off
    
     

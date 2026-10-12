@@ -15,7 +15,7 @@ from vfe3.config import VFE3Config
          predictive_covariance="passthrough", sigma_init=0.4, pos_phi="frozen"),
     dict(relational_receiver_update="closed_form", skip_belief_sigma_update=False, lambda_alpha_mode="constant",
          m_decode_mu_lr=None, m_decode_sigma_lr=None, m_pos_phi_lr=None,
-         projected_cov_condition_recovery=True, phi_weight_decay=0.0),
+         projected_factorization="gram_certified", phi_weight_decay=0.0),
 ])
 def test_profile_ignores_changed_experiment_defaults(
     factory:     Callable[..., VFE3Config],

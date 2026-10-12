@@ -15,7 +15,7 @@ import os
 import warnings
 from dataclasses import MISSING, asdict, dataclass, fields
 from numbers import Real
-from typing import Any, List, Literal, Mapping, Optional, Tuple
+from typing import Any, Callable, List, Literal, Mapping, Optional, Tuple
 
 
 class ConfigNotice(UserWarning):
@@ -89,6 +89,8 @@ _DENSE_DECODE_MIGRATIONS   = {"diagonal": "diagonal_chunked", "full": "full_chun
 # admitted it only for the Gaussian families at Renyi order 1, where it scores the same -KL(q || p_v)/tau
 # as the fast kernel of the family's covariance rank (float64 loss differences of 2e-16 and 0).
 _FAMILY_DECODE_MIGRATIONS  = {"gaussian_diagonal": "diagonal_chunked", "gaussian_full": "full_chunked"}
+# Projected Gaussian-KL factorizations (see VFE3Config.projected_factorization).
+_PROJECTED_FACTORIZATIONS  = ("gram", "gram_certified", "cholesky_qr2_certified")
 
 
 class _ConfigTypeError(TypeError, ValueError):
@@ -841,26 +843,20 @@ class VFE3Config:
     # (eps_32 kappa_F(U) > frame_pair_condition_tol). Costly (about 7x per escalated step).
     frame_pair_fp64_escalation:       bool            = False
     
-    # Also rebuild projected covariances that factor in float32 but fail eps_32 ||G||_F ||G^-1||_F <= tol
-    # (failed factorizations are always rebuilt where the scorer has source tuples; under rotation_invariant
-    # with a diagonal P(G) this also keeps the factored route in place of the closed-form diagonal one).
-    # Costly on CUDA; with minimal_agent it also screens the ADF query covariances.
-    projected_cov_condition_recovery: bool            = False
-       
-    # "fp64" | "fp32"
-    # Precision of the projected source recovery.
-    #   fp64  float64 QR, and float64 for every pair touching a recovered entry
-    #   fp32  float32 shifted CholeskyQR3 (falls back to fp64 when that fails)
-    projected_cov_recovery_precision: str             = "fp32"
+    # "gram" | "gram_certified" | "cholesky_qr2_certified"
+    # Factorization of the projected Gaussian-KL scorer. Failed float32 factorizations are always rebuilt
+    # from source where the scorer has source tuples; a recovery runs in float32 shifted CholeskyQR3 and
+    # falls back to float64 QR when that fails.
+    #   gram                    factor the float32 Gram X X^T (error O(eps kappa^2))
+    #   gram_certified          gram, and also rebuild entries that factor but fail
+    #                           eps_32 ||G||_F ||G^-1||_F <= 1e-4 (costly on CUDA; with minimal_agent it
+    #                           also screens the ADF query covariances; under rotation_invariant with a
+    #                           diagonal P(G) it keeps the factored route in place of the diagonal one)
+    #   cholesky_qr2_certified  factor X by CholeskyQR2 (error O(eps kappa)) and rebuild entries failing
+    #                           eps_32 kappa_1(C) <= 3e-4; the Gram route serves minimal_agent,
+    #                           noisy_query and rotation_invariant, which pass no source root
+    projected_factorization:          str             = "gram"
 
-    # "gram" | "cholesky_qr2"
-    # Factor route of the projected Gaussian-KL scorer.
-    #   gram          factor the float32 Gram X X^T (error O(eps kappa^2))
-    #   cholesky_qr2  factor X by CholeskyQR2 (error O(eps kappa); slower unless recovery trips)
-    projected_factor_route:           str             = "gram"
-    
-    projected_gram_condition_tol:     float           = 1e-4         # recovery only, gram route
-    projected_factor_condition_tol:   float           = 3e-4         # recovery only, cholesky_qr2 route
     frame_pair_condition_tol:         float           = 1e-4         # escalation only: kappa_F > 838.9 at 1e-4
     
     def __post_init__(self) -> None:
@@ -1583,14 +1579,8 @@ class VFE3Config:
             raise ValueError(
                 "full_cov_kl_precision must be one of ('fp64', 'fp32_escalate', "
                 f"'fp32_escalate_cond'), got {self.full_cov_kl_precision!r}")
-        if self.projected_factor_route not in ("gram", "cholesky_qr2"):
-            raise ValueError(
-                "projected_factor_route must be one of ('gram', 'cholesky_qr2'), "
-                f"got {self.projected_factor_route!r}")
-        _require(self.projected_cov_recovery_precision, ("fp64", "fp32"),
-                 "projected_cov_recovery_precision")
-        for name in ("frame_pair_condition_tol", "projected_gram_condition_tol",
-                     "projected_factor_condition_tol"):
+        _require(self.projected_factorization, _PROJECTED_FACTORIZATIONS, "projected_factorization")
+        for name in ("frame_pair_condition_tol",):
             value = getattr(self, name)
             if (isinstance(value, bool) or not isinstance(value, Real)
                     or not math.isfinite(value) or not 0.0 < value < 1.0):
@@ -2175,18 +2165,6 @@ class VFE3Config:
         if not phi_update_policy.requires_fisher_statistics:
             mark(("m_phi_fisher_rotation_weight",), "only read by m_phi_update_mode='fisher_group'")
         minimal_agent = self.predictive_readout == "minimal_agent"
-        if minimal_agent:
-            mark(("projected_factor_route",),
-                 "predictive_readout='minimal_agent' passes no source tuples to its factorizations, so the "
-                 "cholesky_qr2 factor route is never selected")
-        elif self.relational_routing == "noisy_query":
-            mark(("projected_factor_route",),
-                 "the noisy-query cost factors per-pair sums G_q + G_k and keeps the Gram route")
-        elif (self.pos_rotation == "rope" and self.rope_space == "comparison"
-              and self.rope_comparison_covariance == "rotation_invariant"):
-            mark(("projected_factor_route",),
-                 "rope_comparison_covariance='rotation_invariant' scores the commutant projection of the comparison "
-                 "covariance, which has no source root R_i S U_i^{-1} Sigma_i^{1/2}, so the Gram route factors it")
         if self.decode_mode != "linear" or self.amp_dtype is None:
             mark(("decode_logits_amp",), "only read by decode_mode='linear' with amp_dtype set")
         if self.fp32_matmul_precision == "highest" or self.amp_dtype == "fp16":
@@ -2195,35 +2173,12 @@ class VFE3Config:
         if not self.deterministic:
             mark(("fill_uninitialized_memory",),
                  "torch fills uninitialized memory only under deterministic algorithms")
-        # rotation_invariant scores P(G) on the Gram route whatever projected_factor_route is, so its certificate
-        # reads the Gram tolerance (audit 2026-10-10 round 2, item 32).
-        rotation_invariant = (self.pos_rotation == "rope" and self.rope_space == "comparison"
-                              and self.rope_comparison_covariance == "rotation_invariant")
-        gram_status = (self.projected_factor_route == "gram"
-                       or self.relational_routing == "noisy_query" or minimal_agent or rotation_invariant)
-        if (rotation_invariant and self.attention_mode == "projected_predictive" and not minimal_agent
-                and self.relational_routing == "gaussian_kl" and self.pair_kl_gemm_tol is None
-                and not self.projected_cov_condition_recovery
-                and all(d - 2 * int(float(self.rope_fraction) * d // 2) <= 1 for d in self.head_dims)):
-            # Every head's P(G) is diagonal, so the Gaussian KL takes its diagonal route, which factors nothing
-            # and has no source recovery (audit 2026-10-10 round 2, item 30; gradients/relational.py).
-            mark(("projected_cov_recovery_precision",),
-                 "rope_comparison_covariance='rotation_invariant' with every comparison coordinate but at most one "
-                 "rotating makes P(G) diagonal, scored on the diagonal route with no factorization or source recovery")
-        if not (self.projected_cov_condition_recovery and gram_status):
-            mark(("projected_gram_condition_tol",),
-                 "only read by the Gram-route certificate under projected_cov_condition_recovery=True")
-        if not (self.projected_cov_condition_recovery and not gram_status):
-            mark(("projected_factor_condition_tol",),
-                 "only read by the cholesky_qr2 certificate under projected_cov_condition_recovery=True")
         if (self.attention_mode == "projected_predictive" and not minimal_agent
                 and self.relational_routing == "mean_distance"):
             # The covariance-blind cost reads neither the projected covariances nor the source tuples,
             # so no factorization, certificate or source recovery runs on the routing path (audit
             # 2026-10-08 implementation-engineer#4).
-            mark(("projected_factor_route", "projected_cov_condition_recovery",
-                  "projected_cov_recovery_precision", "projected_gram_condition_tol",
-                  "projected_factor_condition_tol"),
+            mark(("projected_factorization",),
                  "relational_routing='mean_distance' scores ||a_i - b_j||^2 / 2 and factors no projected "
                  "covariance")
         if self.gauge_transport == "off":
@@ -2262,12 +2217,6 @@ class VFE3Config:
                      "the minimal-agent posterior applies no divergence clamp, decoders use kl_max=inf, and "
                      "no M-step self-coupling or CG energy term is enabled; with diagnose_canonical_free_energy=True "
                      "it would feed that log-step diagnostic only")
-            # Without the certificate the minimal agent pre-replaces failed factors before projected
-            # scoring, so no source recovery (the only reader of the recovery precision) can occur.
-            if not self.projected_cov_condition_recovery:
-                mark(("projected_cov_recovery_precision",),
-                     "the minimal agent recomputes failed layers itself; without "
-                     "projected_cov_condition_recovery no source recovery runs")
             # Every contraction on this combination runs in an autocast-disabled island (the minimal-agent
             # update, the prototype posteriors, LayerNorm, the transport exponentials and the linear
             # decode/CE) or is elementwise, so the forward computes in float32 whatever amp_dtype says.
@@ -2708,12 +2657,17 @@ _RETIRED_CONDITIONAL_FIELDS = frozenset({
     # 2026-10-05: the Schur head mixer and the PriorBank head-evidence mixer were removed.
     "use_head_mixer", "use_priorbank_head_evidence_mixer",
 })
+# The five projected-factorization fields merged into projected_factorization (2026-10-12).
+_PROJECTED_FACTORIZATION_FIELDS = (
+    "projected_cov_condition_recovery", "projected_factor_route", "projected_cov_recovery_precision",
+    "projected_gram_condition_tol", "projected_factor_condition_tol")
 # Every serialized key config_from_serialized migrates or refuses that is not a VFE3Config field.
 RETIRED_CONFIG_KEYS = frozenset(
     set(_RETIRED_PINNED_FIELDS) | _RETIRED_INERT_FIELDS | _RETIRED_CONDITIONAL_FIELDS
     | {"grad_clip_per_role", "exp_fp64_mode", "compile_pair_kernel", "relational_mode",
        "relational_readout_mode", "relational_input_scope", "relational_output_scope",
-       "relational_identity_content"})
+       "relational_identity_content"}
+    | set(_PROJECTED_FACTORIZATION_FIELDS))
 # laplace_diagonal (retired 2026-10-12) was registered but refused on both projected routes.
 _RETIRED_FAMILIES = frozenset({"gaussian_frame_diagonal", "laplace_diagonal"})
 _MIGRATED_FAMILIES = {"gaussian_diagonal_exact": "gaussian_diagonal"}
@@ -2861,6 +2815,50 @@ def _migrate_retired_fields(
     gauge_group = payload.get("gauge_group")
     if isinstance(gauge_group, str) and gauge_group in _RETIRED_GAUGE_GROUPS:
         refuse("gauge_group", gauge_group)
+    _migrate_projected_factorization(payload, source=source, refuse=refuse)
+
+
+def _migrate_projected_factorization(
+    payload: dict[str, Any],
+
+    *,
+    source: str,
+    refuse: Callable[..., None],
+) -> None:
+    r"""Merge the five projected-factorization fields into ``projected_factorization`` (2026-10-12).
+
+    ``(recovery, route)`` maps to ``gram`` for ``(False, gram)``, ``gram_certified`` for ``(True, gram)``
+    and ``cholesky_qr2_certified`` for either ``cholesky_qr2`` tuple; an uncertified CholeskyQR2 run now
+    also rebuilds the entries that fail the factor certificate. The tolerances are module constants at
+    their defaults (1e-4 Gram, 3e-4 factor); a non-default tolerance under recovery is refused, and any
+    tolerance without recovery was inert. The recovery precision is fixed at fp32 (shifted CholeskyQR3
+    with a float64 fallback); a saved fp64 precision loads and replays a recovery with rounding-level
+    differences, as the 2026-10-02 numerical-policy hardcoding did.
+    """
+    present = [name for name in _PROJECTED_FACTORIZATION_FIELDS if name in payload]
+    if not present:
+        return
+    if "projected_factorization" in payload:
+        raise ValueError(f"serialized config from {source} has conflicting projected-factorization "
+                         f"selectors: projected_factorization and {present}")
+    recovery = _normalize_serialized_boolean(
+        payload.pop("projected_cov_condition_recovery", False), "projected_cov_condition_recovery",
+        source=source)
+    route = payload.pop("projected_factor_route", "gram")
+    precision = payload.pop("projected_cov_recovery_precision", "fp64")
+    tolerances = {name: payload.pop(name, default) for name, default in (
+        ("projected_gram_condition_tol", 1e-4), ("projected_factor_condition_tol", 3e-4))}
+    if route not in ("gram", "cholesky_qr2"):
+        refuse("projected_factor_route", route, " (only 'gram' or 'cholesky_qr2' was valid)")
+    if precision not in ("fp64", "fp32"):
+        refuse("projected_cov_recovery_precision", precision, " (only 'fp64' or 'fp32' was valid)")
+    if recovery:
+        for name, default in (("projected_gram_condition_tol", 1e-4), ("projected_factor_condition_tol", 3e-4)):
+            if not _same_serialized_value(tolerances[name], default):
+                refuse(name, tolerances[name], f" (the certificate tolerance is fixed at {default!r})")
+    payload["projected_factorization"] = (
+        "cholesky_qr2_certified" if route == "cholesky_qr2"
+        else "gram_certified" if recovery else "gram")
 
 
 # Introduction-time values of fields whose default was later flipped, applied by config_from_serialized
@@ -2868,7 +2866,8 @@ def _migrate_retired_fields(
 #   content_link_chart                "affine" at 6e54aee (2026-10-03), now "exponential"
 #   predictive_covariance             "passthrough" at 8b398f3 (2026-09-27), now "moment_matched"
 #   m_decode_mu_lr, m_decode_sigma_lr None (inherit) at d04dfc4 (2026-09-30), now 0.025 / 0.001
-#   projected_cov_recovery_precision  "fp64" at fed4164 (2026-10-04), now "fp32"
+#   projected_cov_recovery_precision  "fp64" at fed4164 (2026-10-04); merged into projected_factorization
+#                                     on 2026-10-12, whose migration treats an absent precision as fp64
 #   rope_space                        "frame" from eaa3a21 (2026-10-07)
 #   kl_max                            100.0 until 2026-10-12, now None (8 * embed_dim)
 _HISTORICAL_DEFAULT_PINS: dict[str, Any] = {
@@ -2876,7 +2875,6 @@ _HISTORICAL_DEFAULT_PINS: dict[str, Any] = {
     "predictive_covariance":            "passthrough",
     "m_decode_mu_lr":                   None,
     "m_decode_sigma_lr":                None,
-    "projected_cov_recovery_precision": "fp64",
     "rope_space":                       "frame",
     "kl_max":                           100.0,
 }

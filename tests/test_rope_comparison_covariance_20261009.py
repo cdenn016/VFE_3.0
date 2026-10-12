@@ -210,7 +210,6 @@ def test_option_is_inactive_without_comparison_rope_and_validated() -> None:
                      rope_comparison_covariance="rotation_invariant")
     inactive = on.inactive_fields()
     assert "rope_comparison_covariance" not in inactive
-    assert "projected_factor_route" in inactive                     # the projected covariance has no source root
     with pytest.raises(ValueError, match="rope_comparison_covariance"):
         tiny_config(rope_comparison_covariance="isotropic")
     with pytest.raises(ValueError, match="rope_comparison_covariance"):

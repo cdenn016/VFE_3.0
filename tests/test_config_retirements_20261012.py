@@ -110,3 +110,60 @@ def test_family_decode_with_a_block_family_is_refused() -> None:
     payload = _old_payload(test_config(), family="gaussian_block", decode_mode="family_chunked")
     with pytest.raises(ValueError, match="retired decode_mode='family_chunked'"):
         config_from_serialized(payload, source="test")
+
+
+# =============================================================================
+# C4: the five projected-factorization fields merge into projected_factorization
+# =============================================================================
+
+_FACTORIZATION_FIELDS = ("projected_factorization",)
+
+
+@pytest.mark.parametrize(("recovery", "route", "precision", "factorization"), [
+    (False, "gram", "fp64", "gram"),
+    (False, "gram", "fp32", "gram"),
+    (True, "gram", "fp64", "gram_certified"),
+    (True, "gram", "fp32", "gram_certified"),
+    (True, "cholesky_qr2", "fp32", "cholesky_qr2_certified"),
+    (False, "cholesky_qr2", "fp64", "cholesky_qr2_certified"),
+])
+def test_projected_factor_tuples_migrate(
+    recovery: bool, route: str, precision: str, factorization: str, tmp_path: Path,
+) -> None:
+    expected = test_config(projected_factorization=factorization)
+    payload = _old_payload(
+        expected, _FACTORIZATION_FIELDS, projected_cov_condition_recovery=recovery,
+        projected_factor_route=route, projected_cov_recovery_precision=precision,
+        projected_gram_condition_tol=1e-4, projected_factor_condition_tol=3e-4)
+    _assert_migrates(payload, expected, tmp_path)
+
+
+def test_a_payload_predating_the_recovery_precision_migrates(tmp_path: Path) -> None:
+    expected = test_config()
+    payload = _old_payload(expected, _FACTORIZATION_FIELDS, projected_cov_condition_recovery=False,
+                           projected_factor_route="gram")
+    _assert_migrates(payload, expected, tmp_path)
+
+
+def test_projected_factor_scaling_cell_survives(tmp_path: Path) -> None:
+    _assert_scaling_cell_survives(
+        tmp_path, {}, _FACTORIZATION_FIELDS, projected_cov_condition_recovery=False,
+        projected_factor_route="gram", projected_cov_recovery_precision="fp32",
+        projected_gram_condition_tol=1e-4, projected_factor_condition_tol=3e-4)
+
+
+def test_inert_tolerances_load_and_live_off_default_tolerances_are_refused() -> None:
+    base = _old_payload(test_config(), _FACTORIZATION_FIELDS, projected_factor_route="gram")
+    assert config_from_serialized(
+        {**base, "projected_cov_condition_recovery": False, "projected_gram_condition_tol": 2e-4},
+        source="test") == test_config()
+    with pytest.raises(ValueError, match="retired projected_gram_condition_tol=0.0002"):
+        config_from_serialized(
+            {**base, "projected_cov_condition_recovery": True, "projected_gram_condition_tol": 2e-4},
+            source="test")
+
+
+def test_old_and_new_factorization_selectors_conflict() -> None:
+    payload = {**serialize_config(test_config()), "projected_factor_route": "gram"}
+    with pytest.raises(ValueError, match="conflicting projected-factorization"):
+        config_from_serialized(payload, source="test")

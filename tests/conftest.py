@@ -201,3 +201,24 @@ def condition_recovery_on() -> Iterator[None]:
         yield
     finally:
         set_projected_condition_recovery(previous)
+
+
+_PROJECTED_SCORER_POLICY = ("_CONDITION_RECOVERY", "_GRAM_CONDITION_TOL", "_RECOVERY_PRECISION",
+                            "_FACTOR_ROUTE", "_FACTOR_CONDITION_TOL")
+
+
+@pytest.fixture(autouse=True)
+def restore_projected_scorer_policy() -> Iterator[None]:
+    """Restore the process-wide projected-scorer policy after each test.
+
+    VFEModel installs the policy of ``projected_factorization`` (recovery precision fixed at fp32), so a
+    model built in one test must not change the module defaults a later scorer-primitive test reads.
+    """
+    import vfe3.relational_scoring as scoring
+
+    saved = {name: getattr(scoring, name) for name in _PROJECTED_SCORER_POLICY}
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            setattr(scoring, name, value)

@@ -1890,12 +1890,12 @@ def _capture_numerics_counts(
     :func:`vfe3.relational_scoring._strict_cholesky` (float64 QR of the source root
     :math:`L \Sigma^{1/2}`, or a shifted CholeskyQR3 retry on the ``cholesky_qr2`` factor route) for an
     entry whose working-precision factor failed, or failed the conditioning certificate under
-    ``projected_cov_condition_recovery``. The numerator is the layer's recovered-entry count
+    a certified ``projected_factorization``. The numerator is the layer's recovered-entry count
     ``relational_covariance_repair_count``, a subset of the same entries. The pair-level factorizations
     of :math:`G_{q,i} + G_{k,j}` on the noisy-query route have no fallback (a failure raises) and are
     not counted. The minimal agent's fallback is the float64 recomputation of a whole float32 layer call
     whose factorizations failed (or whose ADF query covariance failed the certificate under
-    ``projected_cov_condition_recovery``); it counts every recorded query and key entry of that call, so
+    a certified ``projected_factorization``); it counts every recorded query and key entry of that call, so
     there the ratio is the share of recomputed layer calls (plus, for the mean field under the certificate,
     the KL factors it refactors in calls that were not recomputed).
 

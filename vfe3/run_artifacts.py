@@ -223,7 +223,7 @@ def _relational_artifact_fields(cfg: VFE3Config) -> Dict[str, object]:
             else "family_default"),
         "factorization_policy": "zero_jitter_no_covariance_repairs",
         # The minimal agent passes no source tuples, so no source-root recovery exists. A float32 layer call with a
-        # failed factorization (or, under projected_cov_condition_recovery, an ADF query covariance that fails the
+        # failed factorization (or, under a certified projected_factorization, an ADF query covariance that fails the
         # certificate) is recomputed whole in float64; a float64 failure raises. Its mean field also keeps the
         # Gram-route certificate of projected_gaussian_kl (a whole-tensor float64 refactor of the KL factors).
         "factorization_fallback": (("fp32_failure_or_certificate_layer_fp64_recompute"
@@ -5291,7 +5291,7 @@ def _pure_path_report(
             "phi_mstep_max_matrix_norm":     getattr(cfg, "phi_mstep_max_matrix_norm", None),
             "transport_chart_max_norm":      transport_chart_max_norm,
             "frame_pair_fp64_escalation":    bool(getattr(cfg, "frame_pair_fp64_escalation", False)),
-            "projected_cov_recovery_precision": getattr(cfg, "projected_cov_recovery_precision", "fp64"),
+            "projected_factorization":       getattr(cfg, "projected_factorization", "gram"),
             # Covariance class of the ACTIVE transport (audit C7), owned by its complete registry
             # record. An unregistered mode fails closed instead of inventing report metadata.
             "transport_covariance_class":   transport_registration.covariance_class,

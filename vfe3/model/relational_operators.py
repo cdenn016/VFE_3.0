@@ -872,7 +872,7 @@ class RelationalOperators(nn.Module):
 
         One host check covers the call. A float32 call that reports a failed factorization (an ADF query covariance
         :math:`A^h` that lost positive definiteness by cancellation, a record covariance, ...) or, under
-        ``projected_cov_condition_recovery``, a query certificate (module docstring of
+        a certified ``projected_factorization``, a query certificate (module docstring of
         :mod:`vfe3.model.minimal_agent`) is recomputed whole in float64 from the local beliefs, frame and prior, and
         its outputs and capture are cast back to the input dtypes. The float32 attempt is discarded, so backward
         never runs through its failed factorizations. Every query and key entry of the call (:math:`2BNH`) is then

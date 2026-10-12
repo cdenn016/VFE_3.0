@@ -24,7 +24,7 @@ _PROJECTION_TILE_BYTES = 32 * 1024 ** 2
 
 # Cumulative (token, head) covariance entries whose Cholesky factor was rebuilt from source by the
 # recovery path (float64 QR, or float32 shifted CholeskyQR3 on the "cholesky_qr2" factor route or
-# under projected_cov_recovery_precision="fp32"), per device. Updated asynchronously on the recovery
+# under the fp32 recovery precision), per device. Updated asynchronously on the recovery
 # path only, so the healthy path pays nothing (audit 2026-09-23 low: the recovery had no activation counter).
 _SOURCE_RECOVERY_COUNTS: Dict[str, torch.Tensor] = {}
 
@@ -85,16 +85,16 @@ def reset_gemm_fallback_slices() -> None:
     _GEMM_FALLBACK_SLICES = 0
 
 
-# Conditioning-triggered float64 source recovery (config ``projected_cov_condition_recovery``,
-# installed by VFEModel). Off, only entries whose zero-jitter float32 Cholesky FAILS are rebuilt
-# from source; entries that factor but fail the certificate eps_32 ||G||_F ||G^{-1}||_F <= tol
-# keep their float32 factor, and the certificate itself is not evaluated. The Gram-route tolerance
-# is ``projected_gram_condition_tol`` (default 1e-4, i.e. kappa_F(G) > 838.9 in float32).
+# Conditioning-triggered source recovery (on under config ``projected_factorization`` "gram_certified"
+# and "cholesky_qr2_certified", installed by VFEModel). Off, only entries whose zero-jitter float32
+# Cholesky FAILS are rebuilt from source; entries that factor but fail the certificate
+# eps_32 ||G||_F ||G^{-1}||_F <= tol keep their float32 factor, and the certificate itself is not
+# evaluated. The Gram-route tolerance is GRAM_CONDITION_TOL (1e-4, i.e. kappa_F(G) > 838.9 in float32).
+GRAM_CONDITION_TOL: float = 1e-4
 _CONDITION_RECOVERY: bool = False
-_GRAM_CONDITION_TOL: float = 1e-4
+_GRAM_CONDITION_TOL: float = GRAM_CONDITION_TOL
 
-# Working precision of a source recovery (config ``projected_cov_recovery_precision``, installed by
-# VFEModel). "fp64" rebuilds the flagged factors by float64 QR, promotes the factor tensor to float64
+# Working precision of a source recovery (installed by VFEModel, which fixes "fp32"). "fp64" rebuilds the flagged factors by float64 QR, promotes the factor tensor to float64
 # and routes every pair touching a recovered entry through float64 triangular-solve tiles. "fp32"
 # rebuilds them by float32 shifted CholeskyQR3 of the source root (backward stable for
 # kappa_2(X) <~ 1/eps_32; Fukaya et al., SIAM J. Sci. Comput. 42 (2020) A477), keeps the factor in
@@ -120,7 +120,7 @@ def set_projected_gram_condition_tol(tol: float) -> float:
 
 
 def projected_gram_condition_tol() -> float:
-    r"""Return the Gram-route certificate tolerance (config ``projected_gram_condition_tol``)."""
+    r"""Return the Gram-route certificate tolerance (installed by VFEModel as GRAM_CONDITION_TOL)."""
     return _GRAM_CONDITION_TOL
 
 
@@ -155,7 +155,8 @@ def projected_condition_recovery() -> bool:
     return _CONDITION_RECOVERY
 
 
-# Factor route of projected_gaussian_kl (config ``projected_factor_route``, installed by VFEModel;
+# Factor route of projected_gaussian_kl ("cholesky_qr2" under config projected_factorization=
+# "cholesky_qr2_certified", installed by VFEModel;
 # optimization_plan.md WS1/WS2). "gram" factors the rounded Gram G = fl(X X^T), whose factor carries
 # whitened error O(eps kappa(X)^2). "cholesky_qr2" factors the source root X = S U^{-1} Sigma^{1/2}
 # by CholeskyQR2: the same Gaussian, whitened error O(eps kappa(X)). Its recovery certificate is
@@ -1555,7 +1556,7 @@ def projected_noisy_query_cost(
     Factorization and recovery follow projected_gaussian_kl: zero jitter, no covariance repair,
     float64 source recovery for flagged entries, bounded checkpointed pair tiles, and the float64
     route selected per pair, so healthy pairs are bit-identical to a call without recovery. Under
-    ``projected_cov_recovery_precision="fp32"`` the recovered factors come from float32 shifted
+    the fp32 recovery precision the recovered factors come from float32 shifted
     CholeskyQR3, and these pair tiles still run in float64.
     Recovered entries enter the working-dtype grid as identity placeholders, so no factorization
     of a numerically non-SPD sum runs even for a pair whose value the factor route replaces.

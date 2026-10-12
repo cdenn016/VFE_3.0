@@ -102,7 +102,7 @@ Float32. The query covariance of a later head is a downdate,
 :math:`\kappa(W_{ij})\varepsilon`). With coupled heads and an ill-conditioned :math:`C_i` the error can cancel the
 smallest eigenvalues of :math:`A^h` and leave it indefinite, although the exact :math:`A^h` is positive definite.
 :func:`minimal_agent_readout` therefore factors every :math:`A^h` (zero jitter) and reports a failure together with
-its other factorizations. Under ``projected_cov_condition_recovery`` it also flags any float32 receiver whose
+its other factorizations. Under a certified ``projected_factorization`` it also flags any float32 receiver whose
 :math:`A^h` fails the certificate :math:`\varepsilon\|S_hC_iS_h^\top\|_F\|(A_i^h)^{-1}\|_F > \mathrm{tol}`, with
 :math:`\mathrm{tol}` = ``projected_gram_condition_tol``. For the first head this is the kernel's Gram-route
 certificate of the projected query covariance. It is a screen: it does not bound the error contributed by the
@@ -187,7 +187,7 @@ class MinimalAgentResult(NamedTuple):
     with ``diagnostics=True``.
     ``failed`` reports a failed
     zero-jitter factorization or a non-finite cost anywhere in the call; ``ill_conditioned`` reports a float32 ADF
-    query covariance that failed the certificate (only under ``projected_cov_condition_recovery``, else False).
+    query covariance that failed the certificate (only under a certified ``projected_factorization``, else False).
     """
 
     xi:               torch.Tensor             # (..., N, K) xi_i^+
@@ -705,7 +705,7 @@ def minimal_agent_readout(
     ``C`` with two more axes than ``xi`` is read as the diagonal blocks of a block-diagonal :math:`C_i` (diagonal
     beliefs on block frames); no :math:`K\times K` matrix is then formed. Every factorization of the call has zero
     jitter, the ADF query covariances :math:`A^h` included (module docstring, Float32), and their failure flags are
-    folded into ``failed``. Under ``projected_cov_condition_recovery`` a float32 call also screens every :math:`A^h`
+    folded into ``failed``. Under a certified ``projected_factorization`` a float32 call also screens every :math:`A^h`
     with the certificate into ``ill_conditioned``. ``check=True`` makes one host check and raises ``ValueError`` on
     a failure (a certificate alone does not raise); ``check=False`` returns both flags for the caller's single
     check. The mean field's input covariances are factored here first, so ``projected_gaussian_kl`` (which keeps its
