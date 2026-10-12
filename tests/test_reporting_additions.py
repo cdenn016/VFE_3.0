@@ -308,7 +308,7 @@ def _pure_ns(**over):
 
 
 def test_pure_path_report_structure_and_flags():
-    history = [{"step": 0, "nonfinite_frac": 0.0, "cocycle_residual": 1e-7, "holonomy_wilson": 2e-7,
+    history = [{"step": 0, "nonfinite_frac": 0.0, "gauge_invariant_spread": 1e-7,
                 "guard_sigma_floor_frac": 0.0}]
     pure = _pure_ns()
     rep = _pure_path_report(pure, history)
@@ -324,7 +324,7 @@ def test_pure_path_report_structure_and_flags():
     }
     assert preexisting <= rep.keys()
     assert additions <= rep.keys()
-    assert rep["converged_stress"]["cocycle_residual"] == 1e-7
+    assert rep["converged_stress"]["gauge_invariant_spread"] == 1e-7
     assert rep["pure_flags"]["canonical_attention_entropy"] is False
     # Optional components retain independent flags despite the unavailable shared objective.
     impure = types.SimpleNamespace(**{**pure.__dict__, "use_block_mlp": True})
@@ -432,9 +432,10 @@ def test_train_logs_held_out_geometry(tmp_path):
           val_loader=batches, artifacts=art, device=DEVICE, generate_samples=False)
     with open(tmp_path / "metrics.csv", newline="", encoding="utf-8") as fh:
         rows = list(_csv.DictReader(fh))
-    assert rows and "val_holonomy_wilson" in rows[0]      # rectangular: column defined from row 0
-    finite = [r for r in rows if r["val_holonomy_wilson"] not in ("", "nan", None)]
-    assert not finite, "legacy geometry is unavailable on projected attention"
+    assert rows and "val_fisher_trace_mean" in rows[0]    # rectangular: column defined from row 0
+    # The held-out geometry comes from the relational diagnostics (audit 2026-10-12 round 2, item 13).
+    assert any(r["val_fisher_trace_mean"] not in ("", "nan", None) for r in rows)
+    assert "val_holonomy_wilson" not in rows[0]           # no projected route produces the closure residual
     assert any(r["val_relational_receiver_cost_after"] not in ("", "nan", None) for r in rows)
 
 

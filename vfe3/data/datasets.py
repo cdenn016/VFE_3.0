@@ -734,12 +734,15 @@ class TokenWindows(Dataset):
     TRAINING-WINDOW ORIGIN. ``window_offset_mode='fixed'`` (a new dataset, and every evaluation stream)
     starts window ``i`` at ``i * stride``. ``'per_epoch_random'`` (:meth:`use_per_epoch_offsets`, which
     :func:`vfe3.train.train` applies to every training window dataset) starts window ``i`` at
-    :math:`o + i s` with an origin :math:`o \in [0, s)` that :meth:`draw_window_offset` draws once per
-    epoch. With :math:`T` tokens, window length :math:`L` and stride :math:`s`,
-    the window count is the one that fits every origin,
+    :math:`o + i s` with an origin :math:`o \in [0, b)` that :meth:`draw_window_offset` draws once per
+    epoch. With :math:`T` tokens, window length :math:`L` and stride :math:`s`, the origin bound is
+    :math:`b = \min(s, T - L)`, so every origin leaves at least one full window: :math:`b = s` once
+    :math:`T \ge L + s`, and a shorter stream (a smoke run with a small token budget,
+    :math:`L + 1 \le T < L + s`) draws its origin from the :math:`T - L` that fit instead of being refused
+    (audit 2026-10-12 round 2, item 16). The window count is the one that fits every origin,
 
     .. math::
-        n = \Big\lfloor \frac{T - 1 - L - (s - 1)}{s} \Big\rfloor + 1,
+        n = \Big\lfloor \frac{T - 1 - L - (b - 1)}{s} \Big\rfloor + 1,
 
     so the epoch length does not depend on the draw. At :math:`s = L` an epoch scores the transitions
     :math:`[o, o + nL)` exactly once; the :math:`o` transitions before the origin and the
@@ -801,18 +804,17 @@ class TokenWindows(Dataset):
         """
         if self.pad_final:
             raise ValueError("evaluation windows (pad_final=True) keep a fixed origin")
-        usable = self.tokens.numel() - self.seq_len - 1 - (self.stride - 1)
-        if usable < 0:
-            raise ValueError(f"stream of {self.tokens.numel()} too short for per-epoch origins of "
-                             f"seq_len={self.seq_len}, stride={self.stride}")
+        slack = self.tokens.numel() - self.seq_len - 1          # the largest origin with one full window
+        self.offset_bound = min(self.stride, slack + 1)         # origins o in [0, offset_bound)
+        usable = slack - (self.offset_bound - 1)
         self.window_offset_mode, self.window_offset, self.n = "per_epoch_random", 0, usable // self.stride + 1
 
     def draw_window_offset(self, generator: Optional[torch.Generator]) -> int:
-        r"""Draw this epoch's origin :math:`o \sim \mathcal{U}\{0, \dots, s - 1\}` from ``generator`` (None: the
-        global CPU RNG) and set it."""
+        r"""Draw this epoch's origin :math:`o \sim \mathcal{U}\{0, \dots, b - 1\}`, :math:`b = \min(s, T - L)`, from
+        ``generator`` (None: the global CPU RNG) and set it."""
         if self.window_offset_mode == "fixed":
             raise RuntimeError("fixed-origin windows draw no offset")
-        self.window_offset = int(torch.randint(self.stride, (1,), generator=generator).item())
+        self.window_offset = int(torch.randint(self.offset_bound, (1,), generator=generator).item())
         return self.window_offset
 
     def at_origin(self) -> "TokenWindows":

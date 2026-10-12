@@ -1,8 +1,9 @@
 r"""Audit 2026-10-12 item 3 / T4: the opt-in frame condition bound ``phi_frame_condition_max``.
 
 The bound keeps every learned frame factor's skew part and trace and limits the spread of its traceless
-symmetric part :math:`S_0` to :math:`2c`, :math:`c = \log\kappa_{\max} / (2 n_{\mathrm{factors}})`, so that the
-composed frame :math:`U_i = e^{X_i} e^{Y_i}` has :math:`\kappa_2(U_i) \le \kappa_{\max}`.
+symmetric part :math:`S_0`: a learned positional row to :math:`L/2`, :math:`L = \log\kappa_{\max}`, and the token
+frame to :math:`L` minus the realized positional spread (round 2, M4), so that the composed frame
+:math:`U_i = e^{X_i} e^{Y_i}` has :math:`\kappa_2(U_i) \le \kappa_{\max}` per head.
 """
 import math
 
@@ -46,24 +47,26 @@ def test_projection_bounds_spread_and_keeps_skew_and_trace(overrides: dict) -> N
         model.prior_bank.phi_embed[0].mul_(1e-3)                  # a row already inside the bound
     tables = (model.prior_bank.phi_embed, model.pos_phi_free)
     before = [table.detach().clone() for table in tables]
-    c = math.log(20.0) / (2 * len(tables))
+    L = math.log(20.0)
     spread0, _, _ = _spread_skew_trace(_head_blocks(before[0], model))
-    assert bool((spread0[1:] > 2 * c).any())                       # the stretch is actually active
+    assert bool((spread0[1:] > L / 2).any())                       # the stretch is actually active
 
     changed = bound_phi_frame_condition_(model, 20.0)
 
     assert int(changed) > 0
     assert torch.equal(model.prior_bank.phi_embed[0], before[0][0])   # feasible row bitwise unchanged
-    for table, old in zip(tables, before):
+    pos_spread = _spread_skew_trace(_head_blocks(model.pos_phi_free, model))[0].amax(0)   # (H,)
+    assert float(pos_spread.max()) <= 0.5 * L * (1 + 1e-5)
+    for table, old, budget in zip(tables, before, (L - pos_spread, torch.full_like(pos_spread, L / 2))):
         spread_new, skew_new, trace_new = _spread_skew_trace(_head_blocks(table, model))
         _, skew_old, trace_old = _spread_skew_trace(_head_blocks(old, model))
-        assert float(spread_new.max()) <= 2 * c * (1 + 1e-5)
+        assert bool((spread_new <= budget * (1 + 1e-5)).all())
         torch.testing.assert_close(skew_new, skew_old, rtol=0.0, atol=1e-6)
         torch.testing.assert_close(trace_new, trace_old, rtol=0.0, atol=1e-5)
-    # Idempotent up to fp32 roundoff of the boundary rows.
+    # Idempotent: the projected rows carry the storage margin.
     snapshot = model.prior_bank.phi_embed.detach().clone()
     bound_phi_frame_condition_(model, 20.0)
-    torch.testing.assert_close(model.prior_bank.phi_embed.detach(), snapshot, rtol=0.0, atol=1e-5)
+    assert torch.equal(model.prior_bank.phi_embed.detach(), snapshot)
 
 
 def _stretched_model(overrides: dict) -> VFEModel:
@@ -87,7 +90,8 @@ def _float64_reference(model: VFEModel, kappa_max: float) -> torch.Tensor:
         basis = group.head_block_generators().detach().to(torch.float64)
         gram = basis.square().sum(dim=(1, 2, 3))
     phi = model.prior_bank.phi_embed.detach()
-    new, over, _ = _frame_bound_rows(phi, basis, gram, H, d, math.log(kappa_max) / 2, torch.float64)
+    new, over, _ = _frame_bound_rows(phi, basis, gram, H, d, math.log(kappa_max) / 2, torch.float64,
+                                     store_dtype=phi.dtype)
     return torch.where(over[:, None], new.to(phi.dtype), phi)
 
 
