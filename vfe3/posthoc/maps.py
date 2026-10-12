@@ -212,7 +212,8 @@ def block_energy_shares(norms: np.ndarray) -> np.ndarray:
 # ----------------------------------------------------------------------------------------------
 
 def _output_init_scale(cfg: Any) -> float:
-    r"""Initial content-writer scale :math:`s_0` (``relational_output_init``)."""
+    r"""Initial content-writer scale :math:`s_0` (1 since 2026-10-12; a historical record may carry the
+    retired ``relational_output_init``)."""
     if getattr(cfg, "relational_output_init", None) == "depth_scaled":
         return 1.0 / math.sqrt(2.0 * float(getattr(cfg, "n_layers", 1)))
     return 1.0

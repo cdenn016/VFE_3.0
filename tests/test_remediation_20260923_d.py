@@ -116,28 +116,13 @@ def test_decode_av_gemm_runs_ieee_fp32_and_restores_the_global_policy() -> None:
 
 # ---- #16 relational output init ------------------------------------------------------------
 
-@pytest.mark.parametrize("scope", ["full"])
-def test_relational_output_init_identity_and_depth_scaled(scope: str) -> None:
-    common = dict(attention_mode="projected_predictive",
-
-                  attention_residual=True, n_layers=2)
+def test_relational_output_init_is_the_identity() -> None:
+    common = dict(attention_mode="projected_predictive", attention_residual=True, n_layers=2)
     identity = VFEModel(_relational_cfg(**common))
-    scaled = VFEModel(_relational_cfg(**common, relational_output_init="depth_scaled"))
-    assert identity.cfg.relational_output_init == "identity"
-    factor = 1.0 / math.sqrt(2.0 * 2)
-    for plain, depth in zip(identity.relational_operators_by_layer,
-                            scaled.relational_operators_by_layer):
+    for plain in identity.relational_operators_by_layer:
         eye_blocks = torch.eye(2).expand(2, 2, 2)
         for h in range(2):
             assert torch.equal(plain.O[h, 2 * h:2 * h + 2], eye_blocks[h])
-        torch.testing.assert_close(depth.O, plain.O * factor, rtol=0, atol=1e-7)
-        assert torch.equal(depth.T, plain.T)
-        assert torch.equal(depth.raw_score_q, plain.raw_score_q)
-
-
-def test_invalid_depth_scaled_output_init_is_rejected() -> None:
-    with pytest.raises(ValueError, match="relational_output_init"):
-        _tiny(relational_output_init="bogus")
 
 
 # ---- #17 generalization gap ----------------------------------------------------------------

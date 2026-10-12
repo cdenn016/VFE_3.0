@@ -438,7 +438,6 @@ class VFE3Config:
     #                         (rope_fraction = 1). only: the kernel readout (not minimal_agent)
     rope_mode:                        str             = "none"
     pos_phi_project_slk:              bool            = False        # pos_phi only: per-block trace projection (det = 1)
-    bch_residual_max:                 Optional[float] = None         # manifold phi M-step only: group-product residual gate, min(1e-6, value); None = 1e-6 (tightens only)
     
     rope_base:                        float           = 100.0        # rope_mode != "none" only: frequency base
     # rope_mode != "none" only: p-RoPE fraction p in (0, 1] (Barbero et al., ICLR 2025): only the floor(p d / 2) fastest
@@ -532,12 +531,6 @@ class VFE3Config:
     ##################################################
     #   10. Content links (O, T)
     ##################################################
-
-    # "identity" | "depth_scaled"
-    # predictive_readout="kernel" only (as are content_link_chart and attention_residual).
-    #   identity      initial content scale 1
-    #   depth_scaled  initial O times 1/sqrt(2 n_layers)
-    relational_output_init:           str             = "identity"
 
     # "affine" | "first_order" | "exponential"
     # Receiving-map chart on the stored (O, T); every chart starts at the same content.
@@ -842,9 +835,10 @@ class VFE3Config:
     # forwards use the same ladder. Not used with fp16 (GradScaler state).
     matmul_precision_retry:           bool            = False
 
-    # Redo a frame producer call in float64 when its float32 frame pair is ill-conditioned
-    # (eps_32 kappa_F(U) > frame_pair_condition_tol). Costly (about 7x per escalated step).
-    frame_pair_fp64_escalation:       bool            = False
+    # None (off) | tol in (0, 1)
+    # Redo a frame producer call in float64 when its float32 frame pair is ill-conditioned,
+    # eps_32 kappa_F(U) > tol (1e-4: kappa_F > 838.9). Costly (about 7x per escalated step).
+    frame_pair_escalation_tol:        Optional[float] = None
     
     # "gram" | "gram_certified" | "cholesky_qr2_certified"
     # Factorization of the projected Gaussian-KL scorer. Failed float32 factorizations are always rebuilt
@@ -859,8 +853,6 @@ class VFE3Config:
     #                           eps_32 kappa_1(C) <= 3e-4; the Gram route serves minimal_agent,
     #                           noisy_query and comparison_invariant, which pass no source root
     projected_factorization:          str             = "gram"
-
-    frame_pair_condition_tol:         float           = 1e-4         # escalation only: kappa_F > 838.9 at 1e-4
     
     def __post_init__(self) -> None:
         # Every plain bool/int field is gated here on its exact type (bool is not an int, and
@@ -1044,13 +1036,6 @@ class VFE3Config:
                 "phi_mstep_max_matrix_norm must be strictly below transport_chart_max_norm (the "
                 "M-step interior radius lies inside the fail-closed transport chart), got "
                 f"{self.phi_mstep_max_matrix_norm} >= {self.transport_chart_max_norm}"
-            )
-        if self.bch_residual_max is not None and not (
-            math.isfinite(self.bch_residual_max) and self.bch_residual_max > 0.0
-        ):
-            raise ValueError(
-                "bch_residual_max must be None or finite and positive, got "
-                f"{self.bch_residual_max!r}"
             )
 
         # The declared phi step size, read BEFORE the coercion below can zero it: the per-type hidden-bias
@@ -1572,11 +1557,10 @@ class VFE3Config:
                 "full_cov_kl_precision must be one of ('fp64', 'fp32_escalate', "
                 f"'fp32_escalate_cond'), got {self.full_cov_kl_precision!r}")
         _require(self.projected_factorization, _PROJECTED_FACTORIZATIONS, "projected_factorization")
-        for name in ("frame_pair_condition_tol",):
-            value = getattr(self, name)
-            if (isinstance(value, bool) or not isinstance(value, Real)
-                    or not math.isfinite(value) or not 0.0 < value < 1.0):
-                raise ValueError(f"{name} must be a finite number in (0, 1), got {value!r}")
+        value = self.frame_pair_escalation_tol
+        if value is not None and (isinstance(value, bool) or not isinstance(value, Real)
+                                  or not math.isfinite(value) or not 0.0 < value < 1.0):
+            raise ValueError(f"frame_pair_escalation_tol must be None or a finite number in (0, 1), got {value!r}")
         if self.mu_trust_cholesky_rounds < 0:
             raise ValueError(
                 "mu_trust_cholesky_rounds must be a nonnegative int, got "
@@ -1600,7 +1584,6 @@ class VFE3Config:
         # decode / encode
         if not math.isfinite(self.decode_tau) or self.decode_tau <= 0.0:
             raise ValueError(f"decode_tau must be finite and positive, got {self.decode_tau}")
-        _require(self.relational_output_init, ("identity", "depth_scaled"), "relational_output_init")
         from vfe3.model.relational_operators import CONTENT_LINK_CHARTS
         _require(self.content_link_chart, CONTENT_LINK_CHARTS, "content_link_chart")
         from vfe3.model.edge_links import EDGE_MODES
@@ -2141,9 +2124,6 @@ class VFE3Config:
                      "group inherits it")
         if self.grad_clip is None or self.grad_clip == 0:
             mark(("grad_clip_scope",), "only read when grad_clip > 0")
-        if not phi_update_policy.requires_manifold_optimizer:
-            mark(("bch_residual_max",),
-                 "only read by the manifold phi optimizer's group-product gate")
         if self.beta_attention_prior not in ("alibi", "causal_alibi", "causal_alibi_noself"):
             mark(("alibi_slope",), "only read by an alibi attention prior")
         if self.beta_attention_prior != "t5_relative_bias":
@@ -2174,11 +2154,9 @@ class VFE3Config:
                  "relational_routing='mean_distance' scores ||a_i - b_j||^2 / 2 and factors no projected "
                  "covariance")
         if self.gauge_transport == "off":
-            mark(("frame_pair_fp64_escalation", "frame_pair_condition_tol"),
+            mark(("frame_pair_escalation_tol",),
                  "gauge_transport='off' fixes every frame to the identity (kappa_F = d), so the "
                  "certificate cannot trip")
-        elif not self.frame_pair_fp64_escalation:
-            mark(("frame_pair_condition_tol",), "only read when frame_pair_fp64_escalation=True")
         if self.attention_mode != "projected_predictive":
             mark(("predictive_covariance", "predictive_covariance_floor", "attention_residual",
                   "predictive_covariance_checkpoint"),
@@ -2195,11 +2173,10 @@ class VFE3Config:
         if minimal_agent:
             posterior = ("exact source posterior" if self.minimal_agent_inference == "exact"
                          else "mean-field source posterior")
-            mark(("relational_routing", "content_link_chart", "attention_residual", "relational_output_init",
-                  "kappa_beta"),
+            mark(("relational_routing", "content_link_chart", "attention_residual", "kappa_beta"),
                  f"predictive_readout='minimal_agent' routes by the {posterior} at temperature 1 (no "
                  "routing-cost selector, no kappa_beta temperature) and derives the receiving map and the "
-                 "precision-weighted residual (no content factor O, so no chart, initial output scale or residual flag)")
+                 "precision-weighted residual (no content factor O, so no chart or residual flag)")
             # The readout applies no clamp (relational.py returns before safe_kl_clamp); the remaining
             # readers are the M-step self-coupling, the CG moment energy and the self term of the canonical
             # free-energy diagnostic (audit 2026-10-10 round 2, item 31).
@@ -2625,8 +2602,8 @@ _RETIRED_INERT_FIELDS = frozenset({
     "full_cov_congruence_certification", "congruence_cond_escalation", "rope_full_gauge",
     # 2026-10-02 transport-exponential unification: the clamp monitor watched the retired clamp;
     # the norm threshold changed only the interior precision of float32-stored exponentials.
-    # (frame_pair_fp64_escalation, retired the same day, is a live opt-in field again since
-    # 2026-10-04; a saved value loads as saved, and a config without it loads the default False.)
+    # (frame_pair_fp64_escalation, retired the same day, was a live opt-in field again from 2026-10-04
+    # until it merged into frame_pair_escalation_tol on 2026-10-12; a config without it loads as off.)
     "transport_clamp_monitor", "exp_fp64_norm_threshold",
     # 2026-10-05 head-mixer removal: the two mixer rates were read only by the retired mixers.
     "m_head_mixer_lr", "m_head_evidence_lr",
@@ -2650,13 +2627,18 @@ _PROJECTED_FACTORIZATION_FIELDS = (
     "projected_gram_condition_tol", "projected_factor_condition_tol")
 # The four RoPE selectors merged into rope_mode (2026-10-12).
 _ROPE_FIELDS = ("pos_rotation", "rope_space", "rope_on_value", "rope_comparison_covariance")
+# Hardcoded on 2026-10-12: the paper's identity content init and the 1e-6 group-product residual gate;
+# the frame-pair escalation switch and tolerance merged into frame_pair_escalation_tol.
+_HARDCODED_FIELDS = ("relational_output_init", "bch_residual_max")
+_FRAME_PAIR_FIELDS = ("frame_pair_fp64_escalation", "frame_pair_condition_tol")
 # Every serialized key config_from_serialized migrates or refuses that is not a VFE3Config field.
 RETIRED_CONFIG_KEYS = frozenset(
     set(_RETIRED_PINNED_FIELDS) | _RETIRED_INERT_FIELDS | _RETIRED_CONDITIONAL_FIELDS
     | {"grad_clip_per_role", "exp_fp64_mode", "compile_pair_kernel", "relational_mode",
        "relational_readout_mode", "relational_input_scope", "relational_output_scope",
        "relational_identity_content"}
-    | set(_PROJECTED_FACTORIZATION_FIELDS) | set(_ROPE_FIELDS))
+    | set(_PROJECTED_FACTORIZATION_FIELDS) | set(_ROPE_FIELDS) | set(_HARDCODED_FIELDS)
+    | set(_FRAME_PAIR_FIELDS))
 # laplace_diagonal (retired 2026-10-12) was registered but refused on both projected routes.
 _RETIRED_FAMILIES = frozenset({"gaussian_frame_diagonal", "laplace_diagonal"})
 _MIGRATED_FAMILIES = {"gaussian_diagonal_exact": "gaussian_diagonal"}
@@ -2806,6 +2788,56 @@ def _migrate_retired_fields(
         refuse("gauge_group", gauge_group)
     _migrate_projected_factorization(payload, source=source, refuse=refuse)
     _migrate_rope_mode(payload, source=source, refuse=refuse)
+    _migrate_hardcoded_fields(payload, source=source, refuse=refuse)
+
+
+def _migrate_hardcoded_fields(
+    payload: dict[str, Any],
+
+    *,
+    source: str,
+    refuse: Callable[..., None],
+) -> None:
+    r"""Drop the fields hardcoded on 2026-10-12 and merge the frame-pair escalation pair.
+
+    ``relational_output_init`` loads when ``"identity"`` or where it was inert (the minimal-agent readout has
+    no content factor O); ``"depth_scaled"`` elsewhere is refused. ``bch_residual_max`` loads when ``None``,
+    when at least 1e-6 (the gate is ``min(1e-6, value)``, so the gate is the same 1e-6), or where no manifold
+    phi optimizer read it; a tighter gate is refused. ``frame_pair_fp64_escalation`` and
+    ``frame_pair_condition_tol`` become ``frame_pair_escalation_tol``: the saved tolerance when the escalation
+    was on, else ``None`` (an absent switch was off).
+    """
+    if "relational_output_init" in payload:
+        value = payload.pop("relational_output_init")
+        inert = (payload.get("attention_mode") == "projected_predictive"
+                 and payload.get("predictive_readout", VFE3Config.predictive_readout) == "minimal_agent")
+        if value not in ("identity", "depth_scaled"):
+            refuse("relational_output_init", value, " (only 'identity' or 'depth_scaled' was valid)")
+        if value != "identity" and not inert:
+            refuse("relational_output_init", value, " (the initial content scale is fixed at the identity)")
+    if "bch_residual_max" in payload:
+        value = payload.pop("bch_residual_max")
+        if value is not None:
+            from vfe3.gauge_optim import get_phi_update_policy
+            try:
+                read = get_phi_update_policy(
+                    payload.get("m_phi_update_mode", VFE3Config.m_phi_update_mode)).requires_manifold_optimizer
+            except (KeyError, ValueError):
+                read = True
+            if (isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value)
+                    or value <= 0.0):
+                refuse("bch_residual_max", value, " (only None or a finite positive gate was valid)")
+            if read and value < 1e-6:
+                refuse("bch_residual_max", value, " (the group-product residual gate is fixed at 1e-6)")
+    present = [name for name in _FRAME_PAIR_FIELDS if name in payload]
+    if present:
+        if "frame_pair_escalation_tol" in payload:
+            raise ValueError(f"serialized config from {source} has conflicting frame-pair escalation "
+                             f"selectors: frame_pair_escalation_tol and {present}")
+        enabled = _normalize_serialized_boolean(
+            payload.pop("frame_pair_fp64_escalation", False), "frame_pair_fp64_escalation", source=source)
+        tol = payload.pop("frame_pair_condition_tol", 1e-4)
+        payload["frame_pair_escalation_tol"] = tol if enabled else None
 
 
 def _migrate_rope_mode(

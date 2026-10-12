@@ -227,3 +227,57 @@ def test_old_and_new_rope_selectors_conflict() -> None:
     payload = {**serialize_config(test_config()), "pos_rotation": "none"}
     with pytest.raises(ValueError, match="conflicting RoPE selectors"):
         config_from_serialized(payload, source="test")
+
+
+# =============================================================================
+# C10: relational_output_init and bch_residual_max hardcoded; one frame-pair escalation tolerance
+# =============================================================================
+
+_C10_FIELDS = ("frame_pair_escalation_tol",)
+_C10_DEFAULTS = dict(relational_output_init="identity", bch_residual_max=None,
+                     frame_pair_fp64_escalation=False, frame_pair_condition_tol=1e-4)
+
+
+@pytest.mark.parametrize(("old", "tol"), [
+    ({}, None),
+    ({"bch_residual_max": 1e-6}, None),
+    ({"bch_residual_max": 1e-3}, None),                     # min(1e-6, 1e-3) is the fixed 1e-6 gate
+    ({"frame_pair_condition_tol": 3e-4}, None),             # inert while the escalation was off
+    ({"frame_pair_fp64_escalation": True}, 1e-4),
+    ({"frame_pair_fp64_escalation": True, "frame_pair_condition_tol": 3e-4}, 3e-4),
+])
+def test_c10_fields_migrate(old: dict[str, Any], tol: Any, tmp_path: Path) -> None:
+    expected = test_config(frame_pair_escalation_tol=tol)
+    payload = _old_payload(expected, _C10_FIELDS, **{**_C10_DEFAULTS, **old})
+    _assert_migrates(payload, expected, tmp_path)
+
+
+def test_c10_scaling_cell_survives(tmp_path: Path) -> None:
+    _assert_scaling_cell_survives(tmp_path, {}, _C10_FIELDS, **_C10_DEFAULTS)
+
+
+def test_non_default_hardcoded_values_are_refused_where_they_were_read() -> None:
+    base = _old_payload(test_config(), _C10_FIELDS, **_C10_DEFAULTS)
+    with pytest.raises(ValueError, match="retired relational_output_init='depth_scaled'"):
+        config_from_serialized({**base, "relational_output_init": "depth_scaled"}, source="test")
+    manifold = _old_payload(test_config(m_phi_update_mode="pullback_group"), _C10_FIELDS, **_C10_DEFAULTS)
+    assert config_from_serialized({**manifold, "bch_residual_max": 1e-6}, source="test") == test_config(
+        m_phi_update_mode="pullback_group")
+    with pytest.raises(ValueError, match="retired bch_residual_max=1e-08"):
+        config_from_serialized({**manifold, "bch_residual_max": 1e-8}, source="test")
+
+
+def test_non_default_hardcoded_values_load_where_they_were_inert() -> None:
+    assert config_from_serialized({**_old_payload(test_config(), _C10_FIELDS, **_C10_DEFAULTS),
+                                   "bch_residual_max": 1e-8}, source="test") == test_config()   # adamw phi step
+    agent = dict(attention_mode="projected_predictive", predictive_readout="minimal_agent",
+                 attention_residual=False, predictive_covariance="passthrough")
+    expected = test_config(**agent)
+    payload = {**_old_payload(expected, _C10_FIELDS, **_C10_DEFAULTS), "relational_output_init": "depth_scaled"}
+    assert config_from_serialized(payload, source="test") == expected
+
+
+def test_old_and_new_frame_pair_selectors_conflict() -> None:
+    payload = {**serialize_config(test_config()), "frame_pair_fp64_escalation": False}
+    with pytest.raises(ValueError, match="conflicting frame-pair escalation"):
+        config_from_serialized(payload, source="test")

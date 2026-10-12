@@ -1029,7 +1029,7 @@ def test_config_validation_and_inactive_fields() -> None:
     assert "predictive_readout" in test_config().inactive_fields()                 # projected_gradient
     for inference in INFERENCE:
         inactive = set(test_config(**AGENT, minimal_agent_inference=inference).inactive_fields())
-        assert {"relational_routing", "content_link_chart", "attention_residual", "relational_output_init",
+        assert {"relational_routing", "content_link_chart", "attention_residual",
                 "kappa_beta"} <= inactive
         assert not inactive & {"predictive_readout", "minimal_agent_inference", "minimal_agent_channel_noise"}
         assert "predictive_covariance_floor" in inactive                           # passthrough: the floor is inert

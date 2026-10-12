@@ -5285,7 +5285,7 @@ def _pure_path_report(
             "m_phi_fisher_rotation_weight":  float(getattr(cfg, "m_phi_fisher_rotation_weight", 2.0)),
             "phi_mstep_max_matrix_norm":     getattr(cfg, "phi_mstep_max_matrix_norm", None),
             "transport_chart_max_norm":      transport_chart_max_norm,
-            "frame_pair_fp64_escalation":    bool(getattr(cfg, "frame_pair_fp64_escalation", False)),
+            "frame_pair_escalation_tol":     getattr(cfg, "frame_pair_escalation_tol", None),
             "projected_factorization":       getattr(cfg, "projected_factorization", "gram"),
             # Covariance class of the ACTIVE transport (audit C7), owned by its complete registry
             # record. An unregistered mode fails closed instead of inventing report metadata.

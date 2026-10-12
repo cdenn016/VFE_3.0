@@ -143,7 +143,6 @@ config = dict(
     relational_receiver_law          = "channel_likelihood",  # "channel_likelihood" | "ambient_alignment" (projected_gradient only)
     relational_receiver_measurement  = "adjoint",               # "adjoint" O'^T | "inverse" O'^-1, the dual measurement (channel_likelihood only)
     relational_receiver_update       = "closed_form",         # "closed_form" (exact frozen-context update) | "euler" (Fisher step; reads e_q_mu_lr / e_q_sigma_lr / trusts) (projected_gradient only)
-    relational_output_init           = "identity",      # "identity" | "depth_scaled" (initial "Oh" times 1/sqrt(2 n_layers))   
        
     predictive_readout               = "minimal_agent",     # "kernel" | "minimal_agent" (projected_predictive only)
     minimal_agent_inference          = "mean_field",         # "exact" | "mean_field" (minimal_agent only)
@@ -334,10 +333,9 @@ config = dict(
     decode_logits_amp                = False,      # linear decode only: logits matmul under amp_dtype; CE stays fp32
     projected_factorization          = "gram",     # "gram" | "gram_certified" | "cholesky_qr2_certified" (certified: rebuild ill-conditioned factors; costly)
    
-    frame_pair_fp64_escalation       = False,
+    frame_pair_escalation_tol        = None,       # None (off) | tol, e.g. 1e-4: redo ill-conditioned frame pairs in fp64 (costly)
     predictive_covariance_checkpoint = False,       # moment_matched only: recompute the (B,N,K,K) update in backward; bit-identical.
         
-    frame_pair_condition_tol         = 1e-4,       # inactive while the escalation is off
    
     
 )

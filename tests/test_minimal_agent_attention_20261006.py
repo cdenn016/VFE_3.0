@@ -825,7 +825,7 @@ def test_config_validation_and_inactive_fields() -> None:
     for inference in INFERENCE:
         cfg = test_config(**_AGENT, minimal_agent_inference=inference, minimal_agent_channel_noise=0.25)
         inactive = cfg.inactive_fields()
-        assert {"relational_routing", "content_link_chart", "attention_residual", "relational_output_init",
+        assert {"relational_routing", "content_link_chart", "attention_residual",
                 "kappa_beta"} <= set(inactive)
         assert not {"minimal_agent_inference", "minimal_agent_channel_noise", "predictive_readout"} & set(inactive)
         # Passthrough covariance: the floor is inert, the whole-readout checkpoint is not.

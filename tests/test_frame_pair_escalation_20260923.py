@@ -59,7 +59,7 @@ from vfe3.train import (
 # on; the switch is restored after each test.
 def tiny_config(**overrides: object) -> VFE3Config:
     return _profile_tiny_config(**{
-        "frame_pair_fp64_escalation": True, "attention_mode": "projected_predictive",
+        "frame_pair_escalation_tol": 1e-4, "attention_mode": "projected_predictive",
         "attention_residual": False,
         "predictive_covariance": "passthrough", "lambda_alpha_mode": "constant",
         "mu_init_std": 0.02, "sigma_init": 1.0, "phi_scale": 0.01, **overrides,
@@ -77,7 +77,7 @@ def _fresh_counter():
 
 def _force(monkeypatch: pytest.MonkeyPatch) -> None:
     r"""Escalate every producer call. A model built afterwards would install its config tolerance
-    (frame_pair_condition_tol, exposed 2026-10-04), so its installer keeps the forced zero."""
+    (frame_pair_escalation_tol), so its installer keeps the forced zero."""
     monkeypatch.setattr(transport, "_FRAME_PAIR_CONDITION_TOL", 0.0)
     monkeypatch.setattr(model_module, "set_frame_pair_condition_tol", lambda tol: 0.0)
 
@@ -321,7 +321,7 @@ def _launcher(**overrides: object) -> VFE3Config:
         lambda_alpha_mode="constant", mu_init_std=0.02, sigma_init=1.0, phi_scale=0.01,
     )
     values.update(_LAUNCHER_TINY)
-    values["frame_pair_fp64_escalation"] = True
+    values["frame_pair_escalation_tol"] = 1e-4
     values.update(overrides)
     return test_config(**values)
 
@@ -555,20 +555,18 @@ def test_an_escalating_terminal_validation_is_not_handed_off(forced: bool, monke
 # -- the opt-in switch and its threshold ------------------------------------------------------------
 
 def test_escalation_is_off_by_default_and_installed_from_config() -> None:
-    assert VFE3Config.frame_pair_fp64_escalation is False           # dataclass default
-    assert test_config().frame_pair_fp64_escalation is False
+    assert VFE3Config.frame_pair_escalation_tol is None             # dataclass default: off
+    assert test_config().frame_pair_escalation_tol is None
     VFEModel(_profile_tiny_config())
     assert transport.frame_pair_fp64_escalation() is False
-    VFEModel(tiny_config(frame_pair_condition_tol=3e-4))
+    VFEModel(tiny_config(frame_pair_escalation_tol=3e-4))
     assert transport.frame_pair_fp64_escalation() is True
     assert transport._FRAME_PAIR_CONDITION_TOL == 3e-4
     VFEModel(tiny_config())
     assert transport._FRAME_PAIR_CONDITION_TOL == 1e-4
-    with pytest.raises(ValueError, match="frame_pair_fp64_escalation"):
-        test_config(frame_pair_fp64_escalation=1)
-    for bad in (0.0, 1.0, -1e-4, math.inf, math.nan, True):
-        with pytest.raises(ValueError, match="frame_pair_condition_tol"):
-            test_config(frame_pair_condition_tol=bad)
+    for bad in (0.0, 1.0, -1e-4, math.inf, math.nan, True, "1e-4"):
+        with pytest.raises(ValueError, match="frame_pair_escalation_tol"):
+            test_config(frame_pair_escalation_tol=bad)
 
 
 @pytest.mark.parametrize("kind", ["compact", "dense_full", "dense_equal", "dense_unequal"])
@@ -602,6 +600,6 @@ def test_condition_tolerance_moves_the_escalation_boundary(kind: str) -> None:
 
 def test_disabled_escalation_trains_the_launcher_route_in_float32(monkeypatch) -> None:
     _force(monkeypatch)
-    result = _run(_launcher(frame_pair_fp64_escalation=False))
+    result = _run(_launcher(frame_pair_escalation_tol=None))
     assert result["escalations"] == 0
     assert math.isfinite(float(result["loss"])) and result["mu"].dtype == torch.float32

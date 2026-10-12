@@ -43,6 +43,7 @@ from vfe3.geometry.transport import (
     RopeTransport,
     TransportState,
     get_transport_registration,
+    DEFAULT_FRAME_PAIR_CONDITION_TOL,
     set_frame_pair_condition_tol,
     set_frame_pair_fp64_escalation,
     _build_flat,
@@ -284,8 +285,9 @@ class VFEModel(nn.Module):
         set_projected_gram_condition_tol(GRAM_CONDITION_TOL)
         set_projected_factor_condition_tol(FACTOR_CONDITION_TOL)
         set_projected_recovery_precision("fp32")
-        set_frame_pair_fp64_escalation(cfg.frame_pair_fp64_escalation)
-        set_frame_pair_condition_tol(cfg.frame_pair_condition_tol)
+        set_frame_pair_fp64_escalation(cfg.frame_pair_escalation_tol is not None)
+        set_frame_pair_condition_tol(cfg.frame_pair_escalation_tol if cfg.frame_pair_escalation_tol is not None
+                                     else DEFAULT_FRAME_PAIR_CONDITION_TOL)
         set_mu_trust_cholesky_rounds(cfg.mu_trust_cholesky_rounds)
         # ... and the fp32 matmul / TF32 policy (audit 2026-08-06 C7/F25), which is process-global
         # for the same reason and belongs to the same one-place-set rule. It lives here rather than
@@ -305,10 +307,9 @@ class VFEModel(nn.Module):
                 list(bytes.fromhex(self.group.basis_fingerprint)), dtype=torch.uint8))
         # Keep layer zero's state-dict prefix for existing single-layer checkpoints.
         self.relational_operators_extra = nn.ModuleList()
-        # 'depth_scaled' starts the residual-branch writer O at 1/sqrt(2 L) so the L-layer
-        # stack of near-uniform routing at init does not add a unit-gain token mean per layer.
-        output_init_scale = (1.0 / math.sqrt(2.0 * cfg.n_layers)
-                             if cfg.relational_output_init == "depth_scaled" else 1.0)
+        # The residual-branch writer O starts at the identity (the paper's initialization; the
+        # depth-scaled 1/sqrt(2 L) option was retired 2026-10-12).
+        output_init_scale = 1.0
         # The residual and the moment-matched covariance are predictive-readout knobs; the gradient
         # receiver ignores them (its covariance comes from the receiver update and its
         # self-information from alpha KL(q||p)), so they reach only predictive operators.

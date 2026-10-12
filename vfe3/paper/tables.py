@@ -86,7 +86,7 @@ FACTORIZATION_KEYS: Tuple[str, ...] = (
     "projected_cov_recovery_precision",
 )
 EXPONENTIAL_KEYS: Tuple[str, ...] = ("exp_fp64_mode", "transport_chart_max_norm",
-                                     "frame_pair_fp64_escalation")
+                                     "frame_pair_escalation_tol", "frame_pair_fp64_escalation")
 
 
 # ----------------------------------------------------------------------------------------------
