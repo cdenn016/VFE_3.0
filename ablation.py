@@ -877,7 +877,8 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "description": "belief-coupling block weight (1.0 = pure F)",
         "param": "lambda_beta", "range": [0.0, 5, 0.05],
         # projected_predictive weights no coupling block in training; projected_gradient (kernel readout) does
-        "requires": {"attention_mode": "projected_gradient", "predictive_readout": "kernel"},
+        "requires": {"attention_mode": "projected_gradient", "predictive_readout": "kernel",
+                     "lambda_alpha_mode": "state_dependent", "rope_mode": "frame"},
     },
     
     
@@ -890,7 +891,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "description": "KL-to-prior decode temperature",
         "param": "decode_tau", "values": [0.0025, 0.01, 0.05, 0.1, 0.25, 1],
         "scale": "log",
-        "requires": {"decode_mode": "diagonal_chunked"},      # read only by the prior-bank KL decode
+        "requires": {"family": "gaussian_full", "decode_mode": "full_chunked"},      # read only by the prior-bank KL decode
     },
     
 
