@@ -84,6 +84,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import torch
 
 from vfe3.config import VFE3Config, config_notices_shown
+from vfe3.gauge_covariant import fully_gauge_covariant_overrides, gauge_covariance_failures
 from vfe3.data.datasets import (
     _sha256_file,
     _tokenizer_tag,
@@ -129,6 +130,7 @@ _RESERVED_SWEEP_KEYS = {
 }
 _DECLARATIVE_ABLATION_NAMES = {
     "BASELINE_CONFIG",
+    "fully_gauge_covariant",
     "CONFIG",
     "DATA_SEED",
     "SWEEPS",
@@ -283,6 +285,12 @@ CONFIG: Dict[str, Any] = {
 # =============================================================================
 # BASELINE CONFIG  -- self-contained operating point: EVERY VFE3Config toggle.
 # =============================================================================
+
+# True: every cell runs the fully gauge-covariant model. BASELINE_CONFIG is left as written; the keys that break
+# gauge covariance are overridden on the baseline (vfe3.gauge_covariant, as in train_vfe3.py), before the arms are
+# applied, and an arm that breaks covariance again is refused at startup and as a config error. The content
+# links (Lie-algebra L_ij), routing, readout and learning rates are not touched. False: the baseline as written.
+fully_gauge_covariant = False
 
 
 BASELINE_CONFIG: Dict[str, Any] = dict(
@@ -1542,6 +1550,7 @@ def validate_sweeps(sweep_names: List[str], *, require_construction: bool = True
             try:
                 # Activity is structural, including default-valued fields; warnings are display only.
                 resolved = VFE3Config(**cfg)
+                _require_gauge_covariant(resolved)
                 inert_per_arm.append(set(resolved.inactive_fields()) & varying_keys)
             except (TypeError, ValueError) as exc:
                 construction_errors.append((name, label, str(exc)))
@@ -1709,6 +1718,14 @@ def make_run_overrides(sweep_name: str) -> List[Tuple[str, Dict[str, Any]]]:
     return runs
 
 
+def _require_gauge_covariant(cfg: VFE3Config) -> None:
+    r"""Under ``fully_gauge_covariant``, refuse a cell whose arm left a gauge flag of the pure-path report false."""
+    if fully_gauge_covariant:
+        failures = gauge_covariance_failures(cfg)
+        if failures:
+            raise ValueError(f"fully_gauge_covariant=True: this arm breaks gauge covariance ({', '.join(failures)})")
+
+
 def _resolved_sweep_baseline() -> Dict[str, Any]:
     r"""Return the one broadly compatible baseline used before applying every sweep arm.
 
@@ -1716,6 +1733,8 @@ def _resolved_sweep_baseline() -> Dict[str, Any]:
     sweep baseline once before expansion so labels and arm overrides state only their contrast.
     """
     resolved = copy.deepcopy(BASELINE_CONFIG)
+    if fully_gauge_covariant:
+        resolved.update(fully_gauge_covariant_overrides(resolved))
     return resolved
 
 
@@ -2072,6 +2091,7 @@ def run_single(
                        "windows (eval_stride=None)", label, requested_stride, cfg_dict.get("max_seq_len"))
     try:
         cfg = VFE3Config(**cfg_dict)
+        _require_gauge_covariant(cfg)
         stop_after_steps = _validated_stop_after_steps(stop_after_steps)
         n_steps = cfg.max_steps if stop_after_steps is None else min(cfg.max_steps, stop_after_steps)
     except (ValueError, NotImplementedError, TypeError) as exc:

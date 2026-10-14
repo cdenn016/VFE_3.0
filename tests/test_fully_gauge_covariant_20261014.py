@@ -85,3 +85,20 @@ def test_launcher_switch_defaults_off() -> None:
     import train_vfe3
 
     assert train_vfe3.fully_gauge_covariant is False
+
+
+def test_ablation_switch_overrides_the_baseline_and_refuses_breaking_arms(monkeypatch: pytest.MonkeyPatch) -> None:
+    import ablation
+
+    assert ablation.fully_gauge_covariant is False
+    assert ablation._resolved_sweep_baseline() == ablation.BASELINE_CONFIG          # off: the baseline as written
+    config = CASES["diagonal_chunked"]
+    monkeypatch.setattr(ablation, "BASELINE_CONFIG", config)
+    monkeypatch.setattr(ablation, "fully_gauge_covariant", True)
+    baseline = ablation._resolved_sweep_baseline()
+    assert baseline == {**config, **fully_gauge_covariant_overrides(config)}
+    ablation._require_gauge_covariant(VFE3Config(**baseline))                      # the covariant baseline passes
+    with pytest.raises(ValueError, match="breaks gauge covariance"):                 # an arm that re-breaks it
+        ablation._require_gauge_covariant(VFE3Config(**{**baseline, "block_coordinates": "local"}))
+    cell = ablation._cell_cfg_dict({"m_phi_lr": 0.002}, seed=0)                     # cells read the switched baseline
+    assert cell["family"] == "gaussian_full" and cell["m_phi_lr"] == 0.002
