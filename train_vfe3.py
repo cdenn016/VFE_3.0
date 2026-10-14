@@ -92,6 +92,14 @@ DATA_SEED = 3    #TODO need data order variance for pub - set to None
 # vfe3_runs/<test_ppl>_<label>/ (timestamp dropped) at finalize. None disables persistence.
 RUN_ROOT = "vfe3_runs"
 
+# True: run the fully gauge-covariant model. The config below is left as written; at launch the few keys that
+# break gauge covariance are overridden (vfe3.gauge_covariant: frame transport on, a family that carries
+# g Sigma g^T, block and decoder in reference coordinates, no fixed-coordinate caps or trust regions, total-KL
+# self term) and the run is refused unless every gauge flag of the pure-path report holds. The content links
+# (Lie-algebra L_ij), routing, readout and learning rates are not touched. The overrides are logged and listed
+# in the run's config.md. False: the config exactly as written.
+fully_gauge_covariant = False
+
 config = dict(
        
     #################################
@@ -532,7 +540,18 @@ def _run_once(
     from vfe3.model.model import VFEModel
     from vfe3.run_artifacts import RunArtifacts, finalize_run
 
-    cfg = VFE3Config(**{**config, "seed": seed})         # the run's seed, from SEEDS
+    overrides = {}
+    if fully_gauge_covariant:
+        from vfe3.gauge_covariant import fully_gauge_covariant_overrides, gauge_covariance_failures
+        overrides = fully_gauge_covariant_overrides(config)
+    cfg = VFE3Config(**{**config, **overrides, "seed": seed})   # the run's seed, from SEEDS
+    if fully_gauge_covariant:
+        failures = gauge_covariance_failures(cfg)
+        if failures:
+            raise ValueError(f"fully_gauge_covariant=True left these gauge flags false: {failures}")
+        logger.info("fully_gauge_covariant=True: overriding %s",
+                    ", ".join(f"{key}={config.get(key)!r} -> {value!r}" for key, value in overrides.items())
+                    or "nothing (the config is already fully gauge covariant)")
     # Always shown, unlike the env-gated ConfigNotice: every setting this launcher names explicitly
     # that no active path reads under the resolved config, with the structural reason.
     inert = {name: reason for name, reason in cfg.inactive_fields().items() if name in config}
@@ -566,7 +585,9 @@ def _run_once(
         try:
             from vfe3.config_markdown import write_config_markdown
             write_config_markdown(run_dir, __file__, {key: getattr(cfg, key) for key in [*config, "seed"]},
-                                  header={"DATASET": DATASET, "data seed": _effective_data_seed(cfg)})
+                                  header={"DATASET": DATASET, "data seed": _effective_data_seed(cfg),
+                                          "fully_gauge_covariant": fully_gauge_covariant,
+                                          "fully_gauge_covariant overrides": overrides})
         except Exception as exc:
             logger.warning("config.md was not written (%s: %s); the run continues", type(exc).__name__, exc)
         logger.info("Saving run artifacts to %s", run_dir)
