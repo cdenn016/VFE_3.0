@@ -315,6 +315,7 @@ class VFEModel(nn.Module):
                                 predictive_covariance=(cfg.predictive_covariance if predictive
                                                        else "passthrough"),
                                 predictive_covariance_floor=cfg.predictive_covariance_floor,
+                                predictive_covariance_ceiling=cfg.predictive_covariance_ceiling,
                                 predictive_covariance_checkpoint=cfg.predictive_covariance_checkpoint,
                                 predictive_readout=cfg.predictive_readout,
                                 minimal_agent_inference=cfg.minimal_agent_inference,

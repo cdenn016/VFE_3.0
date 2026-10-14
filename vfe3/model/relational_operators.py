@@ -11,6 +11,7 @@ from torch.utils.checkpoint import checkpoint
 
 from vfe3.contracts import CanonicalFrameContext, host_read
 from vfe3.model import edge_links, minimal_agent
+from vfe3.model.covariance_ceiling import covariance_ceiling
 from vfe3.model.edge_links import EDGE_MODES, EdgeContext
 from vfe3.model.frame_actions import frame_matvec
 from vfe3.relational_scoring import (
@@ -339,6 +340,9 @@ class RelationalOperators(nn.Module):
     (:func:`vfe3.relational_scoring.projected_noisy_key_cost`, :meth:`routing_temperature`) and adds
     ``routing_key_log_noise`` ``(H,)``, :math:`\log n_h`, initialized to ``log(routing_key_noise)``; with any other
     routing no such parameter exists.
+    ``predictive_covariance_ceiling`` (None = off) bounds the moment-matched covariance above by
+    :math:`c\Sigma_{p,i}` in the Loewner order (:mod:`vfe3.model.covariance_ceiling`), the counterpart of the
+    floor :math:`f\Sigma_{p,i}`; it is a clamp and is counted where it binds.
     ``predictive_covariance_checkpoint`` recomputes the moment-matched covariance update in backward
     instead of saving its (..., N, K, K) intermediates: the same values and gradients bit for bit,
     for about half the activation memory of a large-K step.
@@ -389,6 +393,7 @@ class RelationalOperators(nn.Module):
         routing:               str   = "gaussian_kl",
         predictive_covariance: str,
         predictive_covariance_floor: float = 1e-4,
+        predictive_covariance_ceiling: Optional[float] = None,
         receiver_noise:        float = 1.0,
         receiver_update:       str,
         receiver_damping:      float = 1.0,
@@ -483,6 +488,16 @@ class RelationalOperators(nn.Module):
                 f"predictive_covariance_floor must be finite and positive, got {predictive_covariance_floor!r}")
         self.predictive_covariance = predictive_covariance
         self.predictive_covariance_floor = float(predictive_covariance_floor)
+        if predictive_covariance_ceiling is not None and (
+                isinstance(predictive_covariance_ceiling, bool)
+                or not isinstance(predictive_covariance_ceiling, (int, float))
+                or not math.isfinite(predictive_covariance_ceiling)
+                or predictive_covariance_ceiling <= self.predictive_covariance_floor):
+            raise ValueError("predictive_covariance_ceiling must be None or finite and above "
+                             f"predictive_covariance_floor ({self.predictive_covariance_floor}), "
+                             f"got {predictive_covariance_ceiling!r}")
+        self.predictive_covariance_ceiling = (None if predictive_covariance_ceiling is None
+                                              else float(predictive_covariance_ceiling))
         if not isinstance(predictive_covariance_checkpoint, bool):
             raise ValueError("predictive_covariance_checkpoint must be bool, got "
                              f"{predictive_covariance_checkpoint!r}")
@@ -862,6 +877,20 @@ class RelationalOperators(nn.Module):
                              "each token (the covariance floor is f * Sigma_p)")
         return torch.broadcast_to(self.predictive_covariance_floor * floor_anchor.to(sigma.dtype), sigma.shape)
 
+    def ceiling_term(
+        self,
+        sigma_plus:   torch.Tensor,                # (..., N, K) or (..., N, K, K) floored moment-matched covariance
+        floor_anchor: torch.Tensor,                # the local prior covariance Sigma_p, sigma_plus's layout
+        diagonal:     bool,
+    ) -> torch.Tensor:                             # sigma_plus, clamped to Sigma^+ <= c Sigma_p when c is set
+        r"""The prior-anchored Loewner ceiling :math:`\Sigma_i^+ \preceq c\Sigma_{p,i}`
+        (:func:`vfe3.model.covariance_ceiling.covariance_ceiling`); the identity when ``predictive_covariance_ceiling``
+        is None. Under ``block_covariance`` each head block is clamped on its own."""
+        if self.predictive_covariance_ceiling is None:
+            return sigma_plus
+        return covariance_ceiling(sigma_plus, floor_anchor, self.predictive_covariance_ceiling, diagonal=diagonal,
+                                  head_dims=self.irrep_dims if (self.block_covariance and not diagonal) else None)
+
     def minimal_agent_update(
         self,
         mu:        torch.Tensor,                    # (..., N, K) local means
@@ -953,6 +982,8 @@ class RelationalOperators(nn.Module):
         if capture is not None:
             capture.update(record)
             capture["relational_mean_displacement_norm"] = (mu_plus - mu).norm().detach()
+        if sigma_plus is not None:
+            sigma_plus = self.ceiling_term(sigma_plus, floor_anchor, diagonal=sigma.dim() == mu.dim())
         return mu_plus, sigma_plus
 
     def _minimal_agent_call(
@@ -1120,7 +1151,8 @@ class RelationalOperators(nn.Module):
                                 use_reentrant=False, preserve_rng_state=False)
         else:
             kernel = self._predictive_covariance_update(mu, sigma, beta, frame, receive, *extra)
-        return kernel + floor                                       # f Sigma_p in local coordinates (floor_term)
+        return self.ceiling_term(kernel + floor, floor_anchor,      # f Sigma_p in local coordinates (floor_term)
+                                 diagonal=sigma.dim() == mu.dim())  # at most c Sigma_p when the ceiling is set
 
     @ieee_fp32_matmul()
     def _predictive_covariance_update(
