@@ -152,6 +152,7 @@ config = dict(
     minimal_agent_channel_noise      = 1.0,         # initial channel noise n_h > 0
     relational_key_noise             = 1.0,         # relational_routing="noisy_key" only: initial per-head key noise n_h > 0 (learned; routes at temperature 1)
     predictive_covariance_floor      = 1e-4,        # moment_matched / spread_corrected only: floor * Sigma_p (token's local prior covariance), reference-invariant
+    predictive_covariance_ceiling    = None,        # None (off) | c > floor, e.g. 100: Loewner ceiling Sigma^+ <= c * Sigma_p (a clamp; counted in metrics.csv)
     diagnose_agent_elbo              = False,       # True | False: per-layer ELBO, evidence and gap at eval (minimal_agent, prototype_agents); never in the loss
     relational_receiver_damping      = 1.0,         # closed_form only: rho in (0, 1]; 1 = the frozen minimizer    
     relational_receiver_noise        = 1.0,         # channel floor nu I_d, nu > 0 (projected_gradient only)

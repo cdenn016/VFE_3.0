@@ -513,6 +513,9 @@ class VFE3Config:
     predictive_covariance:            str             = "moment_matched"
     
     predictive_covariance_floor:      float           = 1e-4         # moment_matched only (kernel and minimal_agent readouts): floor * Sigma_p, the token's local prior covariance
+    # moment_matched / spread_corrected only: Loewner ceiling Sigma^+ <= c * Sigma_p (vfe3.model.covariance_ceiling),
+    # the counterpart of the floor; a clamp where it binds, counted in metrics.csv covariance_ceiling_elements. None = off.
+    predictive_covariance_ceiling:    Optional[float] = None
     minimal_agent_channel_noise:      float           = 1.0          # minimal_agent only: initial channel noise n_h > 0 (learned)
    
     # moment_matched only: recompute the covariance update in backward instead of storing its
@@ -901,6 +904,14 @@ class VFE3Config:
             raise ValueError(
                 f"predictive_covariance_floor must be a finite real value > 0, "
                 f"got {self.predictive_covariance_floor!r}")
+        if self.predictive_covariance_ceiling is not None and (
+                isinstance(self.predictive_covariance_ceiling, bool)
+                or not isinstance(self.predictive_covariance_ceiling, Real)
+                or not math.isfinite(float(self.predictive_covariance_ceiling))
+                or float(self.predictive_covariance_ceiling) <= float(self.predictive_covariance_floor)):
+            raise ValueError(
+                f"predictive_covariance_ceiling must be None or a finite real value above predictive_covariance_floor "
+                f"({self.predictive_covariance_floor}), got {self.predictive_covariance_ceiling!r}")
         if (isinstance(self.relational_receiver_noise, bool)
                 or not isinstance(self.relational_receiver_noise, Real)
                 or not math.isfinite(float(self.relational_receiver_noise))
@@ -2099,15 +2110,16 @@ class VFE3Config:
                  "gauge_transport='off' fixes every frame to the identity (kappa_F = d), so the "
                  "certificate cannot trip")
         if self.attention_mode != "projected_predictive":
-            mark(("predictive_covariance", "predictive_covariance_floor", "attention_residual",
-                  "predictive_covariance_checkpoint"),
+            mark(("predictive_covariance", "predictive_covariance_floor", "predictive_covariance_ceiling",
+                  "attention_residual", "predictive_covariance_checkpoint"),
                  "only read by attention_mode='projected_predictive': the gradient receiver's covariance "
                  "comes from its receiver update, and its self-information enters through "
                  "alpha KL(q||p) and the closed-form damping")
         elif self.predictive_covariance == "passthrough":
             # The minimal agent checkpoints its whole readout (mean included), so only the floor is inert there.
-            mark(("predictive_covariance_floor",) if minimal_agent
-                 else ("predictive_covariance_floor", "predictive_covariance_checkpoint"),
+            mark(("predictive_covariance_floor", "predictive_covariance_ceiling") if minimal_agent
+                 else ("predictive_covariance_floor", "predictive_covariance_ceiling",
+                       "predictive_covariance_checkpoint"),
                  "only read by predictive_covariance='moment_matched' or 'spread_corrected'")
         if self.attention_mode != "projected_predictive":
             mark(("predictive_readout",), "only read by attention_mode='projected_predictive'")

@@ -5251,6 +5251,7 @@ def _pure_path_report(
             "skip_belief_sigma_update":      bool(cfg.skip_belief_sigma_update),
             "predictive_covariance":         getattr(cfg, "predictive_covariance", "passthrough"),
             "predictive_covariance_floor":   float(getattr(cfg, "predictive_covariance_floor", 1e-4)),
+            "predictive_covariance_ceiling": getattr(cfg, "predictive_covariance_ceiling", None),
             "gauge_group":                   cfg.gauge_group,
             "gauge_tying":                   getattr(cfg, "gauge_tying", None),
             "family":                        cfg.family,

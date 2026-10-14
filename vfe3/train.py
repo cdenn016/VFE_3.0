@@ -87,6 +87,8 @@ from vfe3.geometry.transport import (                           # float64 frame-
 )
 from vfe3.model.block_mlp import (                              # LayerNorm pushforward sphere-bound caps
     layernorm_trace_cap_elements, reset_layernorm_trace_cap_elements)
+from vfe3.model.covariance_ceiling import (                     # moment-matched covariance ceiling clamps
+    covariance_ceiling_elements, reset_covariance_ceiling_elements)
 
 
 _SUCCESSFUL_UPDATES_KEY = "successful_updates"
@@ -2083,7 +2085,8 @@ def _frame_projection_state(
 RUN_TOTAL_COUNTER_KEYS: Tuple[str, ...] = (
     "nonfinite_tangent_elements", "mu_trust_fallback_elements", "decode_logdet_fallback_elements",
     "frame_pair_fp64_escalations", "public_spd_repair_elements", "public_spd_ceiling_contact_elements",
-    "source_recovery_elements", "layernorm_trace_cap_elements", "matmul_precision_replays")
+    "source_recovery_elements", "layernorm_trace_cap_elements", "covariance_ceiling_elements",
+    "matmul_precision_replays")
 
 
 def _process_counter_values() -> Dict[str, int]:
@@ -2095,7 +2098,8 @@ def _process_counter_values() -> Dict[str, int]:
             "public_spd_repair_elements": int(public_spd_repair_elements()),
             "public_spd_ceiling_contact_elements": int(public_spd_ceiling_contact_elements()),
             "source_recovery_elements": int(source_recovery_elements()),
-            "layernorm_trace_cap_elements": int(layernorm_trace_cap_elements())}
+            "layernorm_trace_cap_elements": int(layernorm_trace_cap_elements()),
+            "covariance_ceiling_elements": int(covariance_ceiling_elements())}
 
 
 def _resumed_run_totals(
@@ -4252,6 +4256,7 @@ def train(
     reset_source_recovery_elements()        # ... and projected float64 source-factor recoveries
     reset_frame_pair_fp64_escalations()     # ... and float64 frame-pair escalations
     reset_layernorm_trace_cap_elements()    # ... and LayerNorm pushforward sphere-bound caps
+    reset_covariance_ceiling_elements()     # ... and moment-matched covariance ceiling clamps
     run_total_base = _resumed_run_totals(getattr(artifacts, "resumed_numerics_counters", None),
                                          start_step, logger)
     # steps replayed at a stricter matmul policy (whole run), and its value at the last log step
@@ -5071,6 +5076,9 @@ def train(
             # forwards included); a rise localizes fp64 promotions in the step time (audit 2026-10-09).
             row["source_recovery_elements"] = (run_total_base["source_recovery_elements"]
                                                + source_recovery_elements())
+            # Cumulative moment-matched covariance entries clamped by predictive_covariance_ceiling.
+            row["covariance_ceiling_elements"] = (run_total_base["covariance_ceiling_elements"]
+                                                  + covariance_ceiling_elements())
             row["tokens_seen"] = tokens_seen
             row["diagnostics_failures"] = int(sum(diagnostics_failures.values()))
             pipeline_timing = timer.sample_pipeline_window()
