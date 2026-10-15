@@ -521,8 +521,8 @@ class VFE3Config:
     # moment_matched only: recompute the covariance update in backward instead of storing its
     # intermediates (identical values and gradients; saves memory at large K).
     predictive_covariance_checkpoint: bool            = False
-    # moment_matched, kernel readout only: recompute a float32 update in float64 when its output is not positive
-    # definite (diag(U C^att U^T) amplifies float32 rounding by about kappa(U)^2), counted in source_recovery_elements;
+    # moment_matched, kernel readout only: recompute the failing sequences of a float32 update in float64 when its
+    # output is not positive definite (diag(U C^att U^T) amplifies float32 rounding by about kappa(U)^2), counted in source_recovery_elements;
     # one host read per layer call. A float64 failure raises.
     predictive_covariance_fp64_escalation: bool       = False
     attention_residual:               bool            = True      # kernel only: new mean = mu_i + content (False: content only)

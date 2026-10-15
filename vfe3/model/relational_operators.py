@@ -95,6 +95,10 @@ def _centered_spread(
     return tiles[0] if len(tiles) == 1 else torch.cat(tiles, dim=-4)
 
 
+_FP64_ESCALATION_FAILURE = ("the moment-matched covariance update is not positive definite in float64 either (the "
+                            "float32 update failed first and was recomputed in float64); no repair applied")
+
+
 def _covariance_positive(
     sigma:    torch.Tensor,   # (..., N, K) diagonal or (..., N, K, K) covariance
     diagonal: bool,
@@ -1149,12 +1153,12 @@ class RelationalOperators(nn.Module):
         checkpoint; the update draws no random numbers), so values and gradients are unchanged.
 
         Under ``predictive_covariance_fp64_escalation`` a float32 update whose floored output has a nonpositive or
-        non-finite variance (diagonal family) or fails a Cholesky factorization (full and head-block families) is
-        recomputed whole in float64 and cast back; the float32 attempt is discarded, so backward runs through the
-        float64 recompute. The diagonal :math:`\mathrm{diag}(U_iC_i^{\mathrm{att}}U_i^\top)` leaves reference
+        non-finite variance (diagonal family) or fails a Cholesky factorization (full and head-block families) has
+        its failing sequences recomputed in float64 and cast back (:meth:`_escalate_failed_sequences`); their
+        float32 values are discarded, so backward runs through the float64 recompute there. The diagonal :math:`\mathrm{diag}(U_iC_i^{\mathrm{att}}U_i^\top)` leaves reference
         coordinates through :math:`U_i`, so float32 rounding of :math:`C_i^{\mathrm{att}}` is amplified by about
         :math:`\kappa(U_i)^2`; on ill-conditioned block_glk frames it returned negative variances. The check is one
-        host read per call; every token of an escalated call is counted in the source-recovery counter
+        host read per call; every token of a recomputed sequence is counted in the source-recovery counter
         (``source_recovery_elements``). A float64 failure raises ``ValueError``; nothing is repaired. The ceiling
         is applied after the check.
 
@@ -1178,18 +1182,66 @@ class RelationalOperators(nn.Module):
         extra = () if edges is None else (edges,)
         diagonal = sigma.dim() == mu.dim()
         sigma_plus = self._kernel_covariance(mu, sigma, beta, frame, receive, extra) + floor   # f Sigma_p, local
-        if (self.predictive_covariance_fp64_escalation and sigma_plus.dtype != torch.float64
-                and not _covariance_positive(sigma_plus, diagonal)):
+        if self.predictive_covariance_fp64_escalation and sigma_plus.dtype != torch.float64:
+            sigma_plus = self._escalate_failed_sequences(sigma_plus, floor, mu, sigma, beta, frame, receive, extra,
+                                                         diagonal)
+        return self.ceiling_term(sigma_plus, floor_anchor, diagonal=diagonal)   # at most c Sigma_p when set
+
+    def _escalate_failed_sequences(
+        self,
+        sigma_plus: torch.Tensor,                  # (B, N, K) or (B, N, K, K) floored float32 update
+        floor:      torch.Tensor,                  # sigma_plus's shape: f Sigma_p
+        mu:         torch.Tensor,                  # (B, N, K)
+        sigma:      torch.Tensor,                  # (B, N, K) or (B, N, K, K)
+        beta:       torch.Tensor,                  # (B, H, N, N)
+        frame:      CanonicalFrameContext,         # (B or 1, N, H, d, d) or unbatched
+        receive:    Optional[torch.Tensor],
+        extra:      Tuple[EdgeContext, ...],
+        diagonal:   bool,
+    ) -> torch.Tensor:                             # sigma_plus with every failing sequence recomputed in float64
+        r"""The float64 escalation of :meth:`predictive_covariance_update`, restricted to the failing sequences.
+
+        A token fails when a variance is nonpositive or non-finite (diagonal) or its matrix does not factor by
+        Cholesky (full and head-block families); one host read finds the sequences with a failing token. The
+        update of a receiver reads only its own sequence (beta is (B, H, N, N)), so those sequences are recomputed
+        whole in float64 and written back, and the others keep their float32 values and graph bit for bit. Every
+        token of a recomputed sequence is counted. Without a single leading batch axis, or with edge links (whose
+        context is not split here), the whole call is recomputed. A float64 failure raises; nothing is repaired.
+        """
+        with torch.no_grad():
+            if diagonal:
+                bad = ~(torch.isfinite(sigma_plus) & (sigma_plus > 0)).all(dim=-1)              # (..., N)
+            else:
+                bad = torch.linalg.cholesky_ex(sigma_plus.detach())[1] != 0                    # (..., N)
+        batched = mu.dim() == 3 and beta.dim() == 4 and not extra
+        if batched:
+            rows = bad.any(dim=-1).nonzero().flatten()                     # failing sequences (one host sync)
+            n_rows = rows.numel()
+            if n_rows == 0:
+                return sigma_plus
+        elif not bool(host_read(bad.any().reshape(1))[0]):
+            return sigma_plus
+        wide_receive = None if receive is None else [O.double() for O in self._receive_runs(receive)]
+        if not batched:
             # float64 beliefs make the body compute in float64; it casts the frame and the content maps itself.
             sigma_wide = self._kernel_covariance(
-                mu.double(), sigma.double(), beta.double(), frame, None if receive is None else receive.double(),
+                mu.double(), sigma.double(), beta.double(), frame, wide_receive,
                 tuple(edge_links.cast_context(e, torch.float64) for e in extra)) + floor.double()
             if not _covariance_positive(sigma_wide, diagonal):
-                raise ValueError("the moment-matched covariance update is not positive definite in float64 either "
-                                 "(the float32 update failed first and was recomputed in float64); no repair applied")
+                raise ValueError(_FP64_ESCALATION_FAILURE)
             _count_source_recovery(torch.full((), math.prod(mu.shape[:-1]), dtype=torch.long, device=mu.device))
-            sigma_plus = sigma_wide.to(sigma_plus.dtype)
-        return self.ceiling_term(sigma_plus, floor_anchor, diagonal=diagonal)   # at most c Sigma_p when set
+            return sigma_wide.to(sigma_plus.dtype)
+        # A frame with its own batch axis is split with the beliefs; a shared (unbatched or size-1) frame broadcasts.
+        per_sequence = (frame.forward.dim() >= (5 if frame.block_diagonal else 4)
+                        and frame.forward.shape[0] == mu.shape[0] > 1)
+        sub_frame = (CanonicalFrameContext(frame.forward[rows], frame.inverse[rows],
+                                           block_diagonal=frame.block_diagonal) if per_sequence else frame)
+        sigma_wide = self._kernel_covariance(
+            mu[rows].double(), sigma[rows].double(), beta[rows].double(), sub_frame, wide_receive, ())             + floor[rows].double()
+        if not _covariance_positive(sigma_wide, diagonal):
+            raise ValueError(_FP64_ESCALATION_FAILURE)
+        _count_source_recovery(torch.full((), n_rows * mu.shape[-2], dtype=torch.long, device=mu.device))
+        return sigma_plus.index_copy(0, rows, sigma_wide.to(sigma_plus.dtype))
 
     def _kernel_covariance(
         self,
