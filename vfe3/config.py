@@ -521,6 +521,10 @@ class VFE3Config:
     # moment_matched only: recompute the covariance update in backward instead of storing its
     # intermediates (identical values and gradients; saves memory at large K).
     predictive_covariance_checkpoint: bool            = False
+    # moment_matched, kernel readout only: recompute a float32 update in float64 when its output is not positive
+    # definite (diag(U C^att U^T) amplifies float32 rounding by about kappa(U)^2), counted in source_recovery_elements;
+    # one host read per layer call. A float64 failure raises.
+    predictive_covariance_fp64_escalation: bool       = False
     attention_residual:               bool            = True      # kernel only: new mean = mu_i + content (False: content only)
 
     ##################################################
@@ -897,6 +901,9 @@ class VFE3Config:
                              "with the linearized label spread; it requires predictive_readout='minimal_agent' and "
                              "minimal_agent_inference='mean_field' (the kernel readout and the exact posterior "
                              "already carry the between-source spread; use 'moment_matched')")
+        if not isinstance(self.predictive_covariance_fp64_escalation, bool):
+            raise ValueError("predictive_covariance_fp64_escalation must be bool, got "
+                             f"{self.predictive_covariance_fp64_escalation!r}")
         if (isinstance(self.predictive_covariance_floor, bool)
                 or not isinstance(self.predictive_covariance_floor, Real)
                 or not math.isfinite(float(self.predictive_covariance_floor))
@@ -2111,7 +2118,8 @@ class VFE3Config:
                  "certificate cannot trip")
         if self.attention_mode != "projected_predictive":
             mark(("predictive_covariance", "predictive_covariance_floor", "predictive_covariance_ceiling",
-                  "attention_residual", "predictive_covariance_checkpoint"),
+                  "attention_residual", "predictive_covariance_checkpoint",
+                  "predictive_covariance_fp64_escalation"),
                  "only read by attention_mode='projected_predictive': the gradient receiver's covariance "
                  "comes from its receiver update, and its self-information enters through "
                  "alpha KL(q||p) and the closed-form damping")
@@ -2119,8 +2127,11 @@ class VFE3Config:
             # The minimal agent checkpoints its whole readout (mean included), so only the floor is inert there.
             mark(("predictive_covariance_floor", "predictive_covariance_ceiling") if minimal_agent
                  else ("predictive_covariance_floor", "predictive_covariance_ceiling",
-                       "predictive_covariance_checkpoint"),
+                       "predictive_covariance_checkpoint", "predictive_covariance_fp64_escalation"),
                  "only read by predictive_covariance='moment_matched' or 'spread_corrected'")
+        elif minimal_agent:
+            mark(("predictive_covariance_fp64_escalation",),
+                 "only read by predictive_readout='kernel'; the minimal agent escalates its own failed readout")
         if self.attention_mode != "projected_predictive":
             mark(("predictive_readout",), "only read by attention_mode='projected_predictive'")
         if not ((self.attention_mode == "projected_predictive" and minimal_agent)

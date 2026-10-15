@@ -94,6 +94,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'predictive_covariance_floor': 0.0001,
     'predictive_covariance_ceiling': None,
     'predictive_covariance_checkpoint': False,
+    'predictive_covariance_fp64_escalation': False,
     'lambda_alpha_mode': 'state_dependent',
     'b0': 1.0,
     'c0': 1.0,

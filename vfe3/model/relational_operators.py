@@ -95,6 +95,19 @@ def _centered_spread(
     return tiles[0] if len(tiles) == 1 else torch.cat(tiles, dim=-4)
 
 
+def _covariance_positive(
+    sigma:    torch.Tensor,   # (..., N, K) diagonal or (..., N, K, K) covariance
+    diagonal: bool,
+) -> bool:
+    r"""Whether every variance is finite and positive (diagonal) or every matrix factors by Cholesky. Host-syncs."""
+    with torch.no_grad():
+        if diagonal:
+            healthy = (torch.isfinite(sigma) & (sigma > 0)).all()
+        else:
+            healthy = (torch.linalg.cholesky_ex(sigma.detach())[1] == 0).all()
+    return bool(host_read(healthy.reshape(1))[0])
+
+
 def _per_block_bmm(
     left:  torch.Tensor,  # (H, a, k)
     right: torch.Tensor,  # (H, k, c)
@@ -346,6 +359,8 @@ class RelationalOperators(nn.Module):
     ``predictive_covariance_checkpoint`` recomputes the moment-matched covariance update in backward
     instead of saving its (..., N, K, K) intermediates: the same values and gradients bit for bit,
     for about half the activation memory of a large-K step.
+    ``predictive_covariance_fp64_escalation`` recomputes a float32 kernel-readout moment-matched update in float64
+    when its output is not positive definite (:meth:`predictive_covariance_update`).
     ``block_covariance`` (family ``gaussian_block``; equal heads, the kernel predictive readout, edges off) makes
     the moment-matched update return the head-block M-projection of :math:`\Sigma_i^+` in the dense layout,
     one SPD :math:`d\times d` block per head (:meth:`_predictive_covariance_update_blockwise`).
@@ -400,6 +415,7 @@ class RelationalOperators(nn.Module):
         receiver_measurement:  str   = "inverse",
         content_link_chart:    str,
         predictive_covariance_checkpoint: bool = False,
+        predictive_covariance_fp64_escalation: bool = False,
         content_link_edges:    str   = "off",
         content_link_edge_rank: int  = 4,
         content_link_latent:   bool  = False,
@@ -502,6 +518,10 @@ class RelationalOperators(nn.Module):
             raise ValueError("predictive_covariance_checkpoint must be bool, got "
                              f"{predictive_covariance_checkpoint!r}")
         self.predictive_covariance_checkpoint = predictive_covariance_checkpoint
+        if not isinstance(predictive_covariance_fp64_escalation, bool):
+            raise ValueError("predictive_covariance_fp64_escalation must be bool, got "
+                             f"{predictive_covariance_fp64_escalation!r}")
+        self.predictive_covariance_fp64_escalation = predictive_covariance_fp64_escalation
         if content_link_chart not in CONTENT_LINK_CHARTS:
             raise ValueError(
                 f"content_link_chart must be one of {CONTENT_LINK_CHARTS}, got {content_link_chart!r}")
@@ -1128,6 +1148,16 @@ class RelationalOperators(nn.Module):
         Under ``predictive_covariance_checkpoint`` the update is recomputed in backward (non-reentrant
         checkpoint; the update draws no random numbers), so values and gradients are unchanged.
 
+        Under ``predictive_covariance_fp64_escalation`` a float32 update whose floored output has a nonpositive or
+        non-finite variance (diagonal family) or fails a Cholesky factorization (full and head-block families) is
+        recomputed whole in float64 and cast back; the float32 attempt is discarded, so backward runs through the
+        float64 recompute. The diagonal :math:`\mathrm{diag}(U_iC_i^{\mathrm{att}}U_i^\top)` leaves reference
+        coordinates through :math:`U_i`, so float32 rounding of :math:`C_i^{\mathrm{att}}` is amplified by about
+        :math:`\kappa(U_i)^2`; on ill-conditioned block_glk frames it returned negative variances. The check is one
+        host read per call; every token of an escalated call is counted in the source-recovery counter
+        (``source_recovery_elements``). A float64 failure raises ``ValueError``; nothing is repaired. The ceiling
+        is applied after the check.
+
         Under ``content_link_edges`` the kernel is the same with :math:`M_h \to M_h^{ij} = G_{ij}\Pi_h`:
 
         .. math::
@@ -1146,13 +1176,35 @@ class RelationalOperators(nn.Module):
         if edges is not None:
             receive = edge_links.receive_heads(edges, len(self.irrep_dims))
         extra = () if edges is None else (edges,)
+        diagonal = sigma.dim() == mu.dim()
+        sigma_plus = self._kernel_covariance(mu, sigma, beta, frame, receive, extra) + floor   # f Sigma_p, local
+        if (self.predictive_covariance_fp64_escalation and sigma_plus.dtype != torch.float64
+                and not _covariance_positive(sigma_plus, diagonal)):
+            # float64 beliefs make the body compute in float64; it casts the frame and the content maps itself.
+            sigma_wide = self._kernel_covariance(
+                mu.double(), sigma.double(), beta.double(), frame, None if receive is None else receive.double(),
+                tuple(edge_links.cast_context(e, torch.float64) for e in extra)) + floor.double()
+            if not _covariance_positive(sigma_wide, diagonal):
+                raise ValueError("the moment-matched covariance update is not positive definite in float64 either "
+                                 "(the float32 update failed first and was recomputed in float64); no repair applied")
+            _count_source_recovery(torch.full((), math.prod(mu.shape[:-1]), dtype=torch.long, device=mu.device))
+            sigma_plus = sigma_wide.to(sigma_plus.dtype)
+        return self.ceiling_term(sigma_plus, floor_anchor, diagonal=diagonal)   # at most c Sigma_p when set
+
+    def _kernel_covariance(
+        self,
+        mu:      torch.Tensor,                     # (..., N, K)
+        sigma:   torch.Tensor,                     # (..., N, K) or (..., N, K, K)
+        beta:    torch.Tensor,                     # (..., H, N, N)
+        frame:   CanonicalFrameContext,
+        receive: Optional[torch.Tensor],           # (H, K, d) or None
+        extra:   Tuple[EdgeContext, ...],          # () or (edges,)
+    ) -> torch.Tensor:                             # sigma's layout: U C^att U^T, without the floor
+        r""":meth:`_predictive_covariance_update`, one non-reentrant checkpoint under ``predictive_covariance_checkpoint``."""
         if self.predictive_covariance_checkpoint and torch.is_grad_enabled():
-            kernel = checkpoint(self._predictive_covariance_update, mu, sigma, beta, frame, receive, *extra,
-                                use_reentrant=False, preserve_rng_state=False)
-        else:
-            kernel = self._predictive_covariance_update(mu, sigma, beta, frame, receive, *extra)
-        return self.ceiling_term(kernel + floor, floor_anchor,      # f Sigma_p in local coordinates (floor_term)
-                                 diagonal=sigma.dim() == mu.dim())  # at most c Sigma_p when the ceiling is set
+            return checkpoint(self._predictive_covariance_update, mu, sigma, beta, frame, receive, *extra,
+                              use_reentrant=False, preserve_rng_state=False)
+        return self._predictive_covariance_update(mu, sigma, beta, frame, receive, *extra)
 
     @ieee_fp32_matmul()
     def _predictive_covariance_update(
