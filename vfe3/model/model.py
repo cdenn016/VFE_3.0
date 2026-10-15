@@ -317,6 +317,7 @@ class VFEModel(nn.Module):
                                 predictive_covariance_floor=cfg.predictive_covariance_floor,
                                 predictive_covariance_ceiling=cfg.predictive_covariance_ceiling,
                                 predictive_covariance_checkpoint=cfg.predictive_covariance_checkpoint,
+                                predictive_covariance_fp64_escalation=cfg.predictive_covariance_fp64_escalation,
                                 predictive_readout=cfg.predictive_readout,
                                 minimal_agent_inference=cfg.minimal_agent_inference,
                                 minimal_agent_channel_noise=cfg.minimal_agent_channel_noise,
