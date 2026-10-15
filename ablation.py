@@ -70,6 +70,7 @@ import json
 import logging
 import math
 import random
+import re
 import shutil
 import stat
 import subprocess
@@ -131,6 +132,7 @@ _RESERVED_SWEEP_KEYS = {
 _DECLARATIVE_ABLATION_NAMES = {
     "BASELINE_CONFIG",
     "fully_gauge_covariant",
+    "LR_WIDTH_TRANSFER",
     "CONFIG",
     "DATA_SEED",
     "SWEEPS",
@@ -279,6 +281,25 @@ CONFIG: Dict[str, Any] = {
     "resume":      True,
 
     "output_dir":  "vfe3_ablation_results",   # "vfe3_ablation_results_attention_20260913"
+}
+
+
+# Learning-rate width transfer (2026-10-15). True: run only the "lr_width_transfer" sweep, which crosses each width
+# (embed_dim, n_heads) with each listed M-step rate scaled by each multiplier around its BASELINE_CONFIG value (one
+# rate moved per cell, everything else at the baseline), then fits, per rate, log(best lr) against log(K) and writes
+# lr_width_transfer_fit.json beside the sweep CSV. The best multiplier of a width is the one with the lowest final
+# validation PPL; a best multiplier at either end of the grid is flagged, since the optimum may lie outside it.
+# Instability shows within a few hundred steps here, so a short max_steps screens well. The defaults keep the head
+# block d = K / n_heads = 10 of the K=20 operating point fixed.
+LR_WIDTH_TRANSFER: Dict[str, Any] = {
+    "enabled":     False,                                  # True | False
+    "widths":      [(20, 2), (40, 4), (80, 8)],             # (embed_dim, n_heads) pairs; n_heads must divide embed_dim
+    "lr_fields":   ["m_block_mlp_lr", "m_relational_score_lr", "m_relational_content_lr", "m_phi_lr",
+                    "m_table_fisher_lr", "m_decode_mu_lr", "m_decode_sigma_lr"],
+                   # any M-step *_lr field active in BASELINE_CONFIG (m_p_mu_lr / m_p_sigma_lr only under
+                   # m_table_update_mode="adamw"; an inert rate is refused at startup)
+    "multipliers": [0.25, 0.5, 1.0, 2.0, 4.0],              # applied to each rate's BASELINE_CONFIG value
+    "max_steps":   1000,                                    # replaces CONFIG["max_steps"] for this sweep
 }
 
 
@@ -1161,6 +1182,48 @@ SWEEPS["component_ablation_forest"] = {
 # FIELD VALIDATION  -- guard #1: a typo'd field name aborts loudly.
 # =============================================================================
 _VFE3_FIELDS = {f.name for f in dataclass_fields(VFE3Config)}
+
+
+_LR_WIDTH_TRANSFER_SWEEP = "lr_width_transfer"
+
+
+def _lr_width_transfer_label(embed_dim: int, n_heads: int, field: str, multiplier: float) -> str:
+    return f"K={embed_dim},H={n_heads},{field}=x{multiplier:g}"
+
+
+def _lr_width_transfer_arms(
+    settings: Mapping[str, Any],          # LR_WIDTH_TRANSFER
+    baseline: Mapping[str, Any],          # BASELINE_CONFIG
+
+    *,
+    strict:   bool = True,                # False: skip a rate without a positive baseline value instead of raising
+) -> List[Dict[str, Any]]:
+    r"""One arm per (width, rate, multiplier): ``embed_dim``, ``n_heads`` and that rate times the multiplier.
+
+    The sweep is registered at import with ``strict`` set to ``LR_WIDTH_TRANSFER["enabled"]``, so a listed rate the
+    baseline leaves unset refuses the transfer run but does not break importing the module for other sweeps."""
+    arms: List[Dict[str, Any]] = []
+    for embed_dim, n_heads in settings["widths"]:
+        if embed_dim % n_heads:
+            raise ValueError(f"LR_WIDTH_TRANSFER width ({embed_dim}, {n_heads}): n_heads must divide embed_dim")
+        for field in settings["lr_fields"]:
+            base = baseline.get(field)
+            if not isinstance(base, (int, float)) or isinstance(base, bool) or base <= 0:
+                if not strict:
+                    continue
+                raise ValueError(f"LR_WIDTH_TRANSFER rate {field!r} needs a positive BASELINE_CONFIG value, "
+                                 f"got {base!r}")
+            for multiplier in settings["multipliers"]:
+                arms.append({"label": _lr_width_transfer_label(embed_dim, n_heads, field, multiplier),
+                             "embed_dim": int(embed_dim), "n_heads": int(n_heads),
+                             field: float(base) * float(multiplier)})
+    return arms
+
+
+SWEEPS[_LR_WIDTH_TRANSFER_SWEEP] = {
+    "description": "M-step rates x multipliers x widths; fits the width exponent of each best rate",
+    "configs": _lr_width_transfer_arms(LR_WIDTH_TRANSFER, BASELINE_CONFIG, strict=LR_WIDTH_TRANSFER["enabled"]),
+}
 
 
 def _swept_field_names(sweep: Dict[str, Any]) -> List[str]:
@@ -4413,6 +4476,77 @@ def _print_ablation_rows(rows: List[Dict[str, Any]], *, parameter_matched: bool)
             print(f"{row['label']:<34}{ppl:>12}{params:>12}  {gauge}")
 
 
+_LR_WIDTH_TRANSFER_LABEL = re.compile(r"^K=(\d+),H=(\d+),([A-Za-z0-9_]+)=x([0-9.eE+-]+)$")
+
+
+def fit_lr_width_transfer(
+    rows:     Sequence[Mapping[str, Any]],   # sweep_results.csv rows of the lr_width_transfer sweep
+    baseline: Mapping[str, Any],             # BASELINE_CONFIG (the rates the multipliers scale)
+) -> Dict[str, Any]:
+    r"""Per rate and width, the best multiplier by final validation PPL; per rate, the fit
+    :math:`\log \eta^*(K) = a + b \log K` over the widths whose best multiplier is interior.
+
+    A cell with an error or a non-finite PPL counts as diverged. Seeds of one cell are averaged. ``b`` is the width
+    exponent (``eta* ~ K^b``) and ``eta_at`` extrapolates it; a rate with fewer than two interior widths gets no fit.
+    """
+    cells: Dict[Tuple[str, int, int, float], List[float]] = {}
+    for row in rows:
+        match = _LR_WIDTH_TRANSFER_LABEL.match(str(row.get("label", "")).split("|")[0].strip())
+        if match is None:
+            continue
+        embed_dim, n_heads, field, multiplier = int(match[1]), int(match[2]), match[3], float(match[4])
+        ppl = _as_float(row.get("primary_val_ppl"))
+        failed = bool(str(row.get("error", "") or "").strip()) or not math.isfinite(ppl)
+        cells.setdefault((field, embed_dim, n_heads, multiplier), []).append(float("inf") if failed else ppl)
+    fields: Dict[str, Any] = {}
+    for field in sorted({key[0] for key in cells}):
+        widths = sorted({(key[1], key[2]) for key in cells if key[0] == field})
+        per_width = []
+        for embed_dim, n_heads in widths:
+            grid = sorted((multiplier, sum(v) / len(v)) for (f, k, h, multiplier), v in cells.items()
+                          if (f, k, h) == (field, embed_dim, n_heads))
+            finite = [(m, ppl) for m, ppl in grid if math.isfinite(ppl)]
+            entry: Dict[str, Any] = {
+                "embed_dim": embed_dim, "n_heads": n_heads,
+                "ppl_by_multiplier": {f"{m:g}": (ppl if math.isfinite(ppl) else None) for m, ppl in grid},
+                "diverged_multipliers": [m for m, ppl in grid if not math.isfinite(ppl)],
+            }
+            if finite:
+                best_multiplier, best_ppl = min(finite, key=lambda item: item[1])
+                entry.update(best_multiplier=best_multiplier, best_ppl=best_ppl,
+                             best_lr=float(baseline[field]) * best_multiplier,
+                             at_grid_edge=best_multiplier in (grid[0][0], grid[-1][0]))
+            per_width.append(entry)
+        interior = [e for e in per_width if "best_lr" in e and not e["at_grid_edge"]]
+        fit: Dict[str, Any] = {"field": field, "base_lr": float(baseline[field]), "widths": per_width,
+                               "interior_widths": len(interior)}
+        if len({e["embed_dim"] for e in interior}) >= 2:
+            x = [math.log(e["embed_dim"]) for e in interior]
+            y = [math.log(e["best_lr"]) for e in interior]
+            mx, my = sum(x) / len(x), sum(y) / len(y)
+            b = sum((xi - mx) * (yi - my) for xi, yi in zip(x, y)) / sum((xi - mx) ** 2 for xi in x)
+            a = my - b * mx
+            fit.update(exponent=b, log_intercept=a,
+                       eta_at={str(k): math.exp(a + b * math.log(k)) for k in (64, 128, 160, 256)})
+        fields[field] = fit
+    return {"sweep": _LR_WIDTH_TRANSFER_SWEEP, "fields": fields}
+
+
+def analyze_lr_width_transfer(sweep_dir: Path) -> Dict[str, Any]:
+    r"""Write ``lr_width_transfer_fit.json`` for the sweep in ``sweep_dir`` and print the per-rate exponents."""
+    report = fit_lr_width_transfer(_read_sweep_csv(sweep_dir), BASELINE_CONFIG)
+    (sweep_dir / "lr_width_transfer_fit.json").write_text(json.dumps(report, indent=2, sort_keys=True),
+                                                         encoding="utf-8")
+    print(f"\n{'=' * 70}\nLR WIDTH TRANSFER: {sweep_dir.name}\n{'=' * 70}")
+    for field, fit in report["fields"].items():
+        best = ", ".join(f"K={e['embed_dim']}: x{e['best_multiplier']:g}{' (edge)' if e['at_grid_edge'] else ''}"
+                         for e in fit["widths"] if "best_multiplier" in e)
+        exponent = (f"exponent {fit['exponent']:+.2f}, lr(K=160) {fit['eta_at']['160']:.3g}" if "exponent" in fit
+                    else f"no fit ({fit['interior_widths']} interior widths)")
+        print(f"  {field:<28}{exponent}  [{best}]")
+    return report
+
+
 def analyze_sweep(sweep_dir: Path) -> None:
     rows = _read_sweep_csv(sweep_dir)
     if not rows:
@@ -5233,6 +5367,8 @@ def main() -> int:
         device = torch.device(CONFIG["device"])
 
     sweep_names = SWEEP_ORDER if CONFIG["sweep"] is None else [CONFIG["sweep"]]
+    if LR_WIDTH_TRANSFER["enabled"]:
+        sweep_names = [_LR_WIDTH_TRANSFER_SWEEP]
     for name in sweep_names:
         if name not in SWEEPS:
             raise ValueError(f"unknown sweep {name!r}; choose from {sorted(SWEEPS)}")
@@ -5282,7 +5418,9 @@ def main() -> int:
             continue
         run_sweep(name, output_dir, dataset=CONFIG["dataset"], device=device,
                   seed=CONFIG["seed"], resume=CONFIG["resume"],
-                  max_tokens=CONFIG["max_tokens"], max_steps=CONFIG["max_steps"],
+                  max_tokens=CONFIG["max_tokens"],
+                  max_steps=(LR_WIDTH_TRANSFER["max_steps"] if name == _LR_WIDTH_TRANSFER_SWEEP
+                             else CONFIG["max_steps"]),
                   stop_after_steps=CONFIG.get("stop_after_steps"))
         sweep_dir = output_dir / sweep_scope
 
@@ -5310,6 +5448,8 @@ def main() -> int:
             incomplete_sweeps.append(name)
             continue
         analyze_sweep(sweep_dir)                            # this sweep's numeric table (accumulated)
+        if name == _LR_WIDTH_TRANSFER_SWEEP:
+            analyze_lr_width_transfer(sweep_dir)
         if not _run_ablation_figures_isolated(output_dir, scope=sweep_scope):
             failed_figure_scopes.append(f"{sweep_scope}:render")
 
