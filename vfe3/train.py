@@ -699,6 +699,23 @@ def _role_norms_and_clip_coefficients(
     return norms, coefficients
 
 
+def _parameter_clip_scales(
+    norm_sets: Sequence[Tuple[str, list, bool]],      # (role, parameters, clipped) of train_step
+    values:    Optional[Sequence[float]],             # host pre-clip norm of each set; None if not transferred
+    grad_clip: Optional[float],                       # the applied threshold c; None when no clip ran
+) -> Dict[int, float]:
+    r"""The coefficient :math:`\min(1, c/(\|g_s\| + 10^{-6}))` that scaled each clipped parameter, keyed by ``id``."""
+    if values is None or grad_clip is None:
+        return {}
+    scales: Dict[int, float] = {}
+    for (_, parameters, clipped), value in zip(norm_sets, values):
+        if clipped:
+            coefficient = min(1.0, float(grad_clip) / (float(value) + CLIP_COEFFICIENT_EPS))
+            for parameter in parameters:
+                scales[id(parameter)] = coefficient
+    return scales
+
+
 def _transfer_targets(
     targets: torch.Tensor,             # (B, N) CPU-loader labels or public/custom input
     model:   VFEModel,
@@ -1171,6 +1188,9 @@ def train_step(
             norm_sets, set_norm_values, grad_clip if clip_applied and not skip_step else None)
         status_out["role_grad_norms"] = role_norms
         status_out["clip_coefs"] = clip_coefs
+        # Per-parameter clip coefficient (keyed by id), so a spike can undo the clip on the live gradients.
+        status_out["clip_scales"] = _parameter_clip_scales(
+            norm_sets, set_norm_values, grad_clip if clip_applied and not skip_step else None)
     if metrics_out is not None:
         metrics_out["step_skipped"] = float(not did_step)
     _cfg = model.cfg
@@ -3880,6 +3900,131 @@ class _RunningStat:
         return self.peak if self.count else float("nan")
 
 
+DIVERGENCE_SPIKE_LOG = "divergence_spikes.jsonl"          # run_dir/diagnostics: one record per reported spike
+_SPIKE_TOP_PARAMETERS = 5
+_SPIKE_TOP_ROWS = 3
+_SPIKE_TABLE_INDEX = {"mu_embed": "token", "sigma_log_embed": "token", "phi_embed": "token", "pos_phi": "position"}
+
+
+def _spike_attribution(
+    model:            torch.nn.Module,
+    optimizer:        torch.optim.Optimizer,
+    status:           Mapping[str, Any],          # train_step status_out of the spiking step
+    tokens:           torch.Tensor,               # (B, N) the step's input tokens
+    *,
+    roles:            Sequence[str],              # the roles to attribute (the spiking roles, or all of them)
+    loss_spiked:      bool,
+    replayed:         bool,                       # the step was replayed at a stricter matmul precision
+    last_group_norms: Mapping[str, float],        # pre-clip grad_norm_group_* of the last logged row
+) -> Dict[str, Any]:
+    r"""Which parameters, named groups and table rows carry a spiking role's pre-clip gradient, and why.
+
+    Reads the live gradients after the step (``train_step`` zeroes them on entry) and undoes each parameter's clip
+    coefficient (``status["clip_scales"]``), so :math:`\|g_p\|` is the pre-clip norm and a role's norm is
+    :math:`(\sum_{p\in r}\|g_p\|^2)^{1/2}`. Shares are of the squared role norm. For the token and positional tables
+    among the top parameters, the rows with the largest gradient are reported with their share of the table's
+    squared norm and, for token tables, their count in the batch. ``causes`` lists what coincides with the spike:
+    the loss spike (a hard batch), a binding clip, a precision replay, one parameter or a few rows carrying most of
+    the norm, and groups far above their last logged norm. One host transfer for the norms.
+    """
+    scales: Mapping[int, float] = status.get("clip_scales") or {}
+    role_of = {id(p): group.get("role", "other") for group in optimizer.param_groups for p in group["params"]}
+    wanted = set(roles)
+    entries: List[Tuple[str, torch.nn.Parameter, str, str]] = []
+    norms: List[torch.Tensor] = []
+    for name, parameter in model.named_parameters():
+        role = role_of.get(id(parameter))
+        if parameter.grad is None or role is None:
+            continue
+        entries.append((name, parameter, role, _parameter_group(name)))
+        norms.append(torch.linalg.vector_norm(parameter.grad.detach()).to(torch.float64))
+    values = torch.stack(norms).cpu().tolist() if norms else []
+    pre = [value / scales.get(id(parameter), 1.0) for value, (_, parameter, _, _) in zip(values, entries)]
+    report: Dict[str, Any] = {"roles": {}, "top_parameters": [], "table_rows": {}, "group_norms": {}, "causes": []}
+    group_sq: Dict[str, float] = {}
+    for norm, (_, _, _, group) in zip(pre, entries):
+        group_sq[group] = group_sq.get(group, 0.0) + norm * norm
+    report["group_norms"] = {group: math.sqrt(value) for group, value in group_sq.items()}
+    role_sq: Dict[str, float] = {}
+    for role in roles:
+        members = [(norm, group) for norm, (_, _, r, group) in zip(pre, entries) if r == role]
+        total = sum(norm * norm for norm, _ in members)
+        if not members:
+            continue
+        role_sq[role] = total
+        shares: Dict[str, float] = {}
+        for norm, group in members:
+            shares[group] = shares.get(group, 0.0) + (norm * norm / total if total > 0 else 0.0)
+        report["roles"][role] = {"pre_clip_norm": math.sqrt(total), "group_shares": shares,
+                                 "clip_coef": float((status.get("clip_coefs") or {}).get(role, 1.0))}
+    ranked = sorted((item for item in zip(pre, entries) if item[1][2] in wanted), key=lambda item: -item[0])
+    for norm, (name, parameter, role, group) in ranked[:_SPIKE_TOP_PARAMETERS]:
+        share = norm * norm / role_sq[role] if role_sq.get(role, 0.0) > 0 else 0.0
+        report["top_parameters"].append({"name": name, "role": role, "group": group, "pre_clip_norm": norm,
+                                         "role_share": share})
+        index = _SPIKE_TABLE_INDEX.get(group)
+        if index is None or parameter.grad.dim() < 2:
+            continue
+        with torch.no_grad():
+            rows = parameter.grad.detach().flatten(1).to(torch.float64).square().sum(dim=1)    # (rows,)
+            k = min(_SPIKE_TOP_ROWS, rows.numel())
+            top_sq, top_rows = rows.topk(k)
+            entry: Dict[str, Any] = {"indexed_by": index, "rows": top_rows.cpu().tolist(),
+                                     "top_share": float(top_sq.sum() / rows.sum().clamp_min(1e-300)),
+                                     "rows_with_gradient": int((rows > 0).sum())}
+            if index == "token":
+                counts = torch.bincount(tokens.reshape(-1).to(rows.device), minlength=rows.numel())
+                entry["batch_counts"] = counts[top_rows].cpu().tolist()
+        report["table_rows"][name] = entry
+    causes: List[str] = report["causes"]
+    if loss_spiked:
+        causes.append("the loss spiked on the same step (a hard batch drives the gradient)")
+    if replayed:
+        causes.append("the step was replayed at a stricter matmul precision")
+    for role, info in report["roles"].items():
+        if info["clip_coef"] < 1.0:
+            causes.append(f"clip binding on {role} (coefficient {info['clip_coef']:.3g})")
+    for entry in report["top_parameters"]:
+        if entry["role_share"] >= 0.5:
+            causes.append(f"{entry['name']} carries {entry['role_share']:.0%} of ||g_{entry['role']}||^2")
+    for name, entry in report["table_rows"].items():
+        if entry["top_share"] >= 0.5:
+            counts = f", batch counts {entry['batch_counts']}" if "batch_counts" in entry else ""
+            causes.append(f"{name} {entry['indexed_by']} rows {entry['rows']} carry {entry['top_share']:.0%} "
+                          f"of its gradient{counts}")
+    for group, norm in sorted(report["group_norms"].items()):
+        last = last_group_norms.get(group)
+        if last is not None and math.isfinite(last) and last > 0 and norm > 10.0 * last:
+            causes.append(f"group {group} is {norm / last:.0f}x its last logged norm {last:.3g}")
+    return report
+
+
+def _spike_summary(report: Mapping[str, Any]) -> str:
+    r"""One log line of :func:`_spike_attribution`: role norms by group, the top parameters and the causes."""
+    parts = []
+    for role, info in report["roles"].items():
+        groups = ", ".join(f"{group} {share:.0%}" for group, share in
+                           sorted(info["group_shares"].items(), key=lambda item: -item[1]) if share >= 0.01)
+        parts.append(f"{role} {info['pre_clip_norm']:.4g} [{groups}]")
+    top = ", ".join(f"{entry['name']} {entry['pre_clip_norm']:.3g} ({entry['role_share']:.0%} of {entry['role']})"
+                    for entry in report["top_parameters"][:3])
+    causes = "; ".join(report["causes"]) or "none identified"
+    return f"{' | '.join(parts)}; top: {top}; causes: {causes}"
+
+
+def _append_spike_record(
+    run_dir: Path,
+    record:  Mapping[str, object],
+) -> Path:
+    r"""Append one JSON line to ``run_dir/diagnostics/divergence_spikes.jsonl``."""
+    directory = Path(run_dir) / "diagnostics"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / DIVERGENCE_SPIKE_LOG
+    with path.open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps(dict(record), sort_keys=True) + "\n")
+    return path
+
+
 class _DivergenceMonitor:
     r"""Interval statistics and spike detection over the host values of every training step.
 
@@ -3902,6 +4047,8 @@ class _DivergenceMonitor:
         self._norm_ema: Dict[str, float] = {}
         self._norm_seen: Dict[str, int] = {}
         self._last_spike: Optional[int] = None
+        self.spike_roles: Tuple[str, ...] = ()
+        self.spike_loss = False
         self.reset_interval()
 
     def reset_interval(self) -> None:
@@ -3931,6 +4078,8 @@ class _DivergenceMonitor:
             self._clipped += 1
             self._binding += int(any(value < 1.0 for value in coefficients.values()))
         reasons: List[str] = []
+        roles: List[str] = []
+        loss_spiked = False
         for role, value in sorted(norms.items()):
             if not math.isfinite(value):
                 continue
@@ -3938,6 +4087,7 @@ class _DivergenceMonitor:
             if (ema is not None and seen >= DIVERGENCE_EMA_WARMUP and ema > 0.0
                     and value > DIVERGENCE_NORM_SPIKE_RATIO * ema):
                 reasons.append(f"pre-clip grad_norm_{role} {value:.4g} is {value / ema:.1f}x its EMA {ema:.4g}")
+                roles.append(role)
             self._norm_ema[role] = value if ema is None else (
                 DIVERGENCE_EMA_DECAY * ema + (1.0 - DIVERGENCE_EMA_DECAY) * value)
             self._norm_seen[role] = seen + 1
@@ -3946,11 +4096,15 @@ class _DivergenceMonitor:
             if (ema is not None and self._loss_seen >= DIVERGENCE_EMA_WARMUP
                     and loss > ema + DIVERGENCE_LOSS_SPIKE_MARGIN):
                 reasons.append(f"train loss {loss:.4f} exceeds its EMA {ema:.4f} by {loss - ema:.3f} nats")
+                loss_spiked = True
             self._loss_ema = loss if ema is None else (
                 DIVERGENCE_EMA_DECAY * ema + (1.0 - DIVERGENCE_EMA_DECAY) * loss)
             self._loss_seen += 1
         if reasons and (self._last_spike is None or step - self._last_spike >= DIVERGENCE_SPIKE_COOLDOWN):
             self._last_spike = step
+            # Read by the spike attribution: the roles over their EMA, and whether the loss spiked too.
+            self.spike_roles = tuple(roles)
+            self.spike_loss = loss_spiked
             return "; ".join(reasons)
         return None
 
@@ -4248,6 +4402,7 @@ def train(
     # Finite-divergence detection (audit 2026-10-10 round 2, item 1): interval statistics and spike warnings
     # on host values train_step already transfers.
     divergence = _DivergenceMonitor()
+    last_group_norms: Dict[str, float] = {}               # pre-clip group norms of the last logged step
     completed_steps = int(n_steps)
     reset_nonfinite_tangent_elements()   # per-run accounting for the SPD-retraction guard
     reset_public_spd_repair_elements()   # ... and its certificate repairs
@@ -4619,8 +4774,29 @@ def train(
         # Divergence monitor (audit 2026-10-10 round 2, item 1), on host values only. A spike is logged and
         # forces a metrics row at this step.
         spike = divergence.observe(step + 1, step_loss, step_status)
+        spike_groups: Dict[str, float] = {}
         if spike is not None:
             logger.warning("step %d: divergence spike: %s", step + 1, spike)
+            if step_status["did_step"]:                      # a rejected update dropped its gradients
+                try:
+                    report = _spike_attribution(
+                        model, optimizer, step_status, tokens,
+                        roles=divergence.spike_roles or DIVERGENCE_ROLES, loss_spiked=divergence.spike_loss,
+                        replayed=replays > 0, last_group_norms=last_group_norms)
+                    spike_groups = report["group_norms"]
+                    logger.warning("step %d: spike attribution: %s", step + 1, _spike_summary(report))
+                    if artifacts is not None:
+                        _append_spike_record(artifacts.run_dir, {
+                            "step": step + 1, "spike": spike, "spiking_roles": list(divergence.spike_roles),
+                            "loss": step_loss, **report})
+                except Exception as exc:
+                    _record_diagnostic_failure(diagnostics_failures, "divergence_spike_attribution", exc, logger)
+            else:
+                logger.warning("step %d: spike attribution unavailable: the update was rejected and its "
+                               "gradients dropped", step + 1)
+        if step_metrics is not None:                         # the reference for "x its last logged norm"
+            last_group_norms.update({column[len("grad_norm_group_"):]: float(step_metrics[column])
+                                     for column in _GRAD_GROUP_COLUMNS if column in step_metrics})
         forced_row = (not do_csv and artifacts is not None and timer is not None and spike is not None)
         if forced_row:
             # Nothing was collected before the step: the pre-step diagnostics are blank on this row.
@@ -5057,7 +5233,9 @@ def train(
             # The S1 panel D per-evaluation counters ride in the same eval-cadence set.
             row.update(last_train_sample if do_eval
                        else {column: float("nan") for column in _EVAL_CADENCE_COLUMNS})
-            group_values = {**(step_metrics or {}), **group_stats}
+            # A forced spike row collected no step metrics: its group norms are the spike attribution's (pre-clip).
+            group_values = {**{f"grad_norm_group_{group}": norm for group, norm in spike_groups.items()},
+                            **(step_metrics or {}), **group_stats}
             for column in _GROUP_COLUMNS + _STEP_LR_COLUMNS:
                 row[column] = float(group_values.get(column, float("nan")))
             try:
