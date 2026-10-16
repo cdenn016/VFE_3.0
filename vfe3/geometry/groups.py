@@ -42,6 +42,25 @@ class _ElementaryBlockBasis:
         return (self.n_heads * (self.K // self.n_heads) ** 2, self.K, self.K)
 
 
+@dataclass(frozen=True, eq=False)
+class _BlockLocalBasis:
+    r"""Lazy dense basis of a block-local group: ``local`` (m, d, d) copied into each of ``n_heads`` blocks.
+
+    The dense (n_heads m, K, K) tensor is built only when ``GaugeGroup.generators`` is read. The training
+    and evaluation paths read the (m, d, d) local basis instead (:meth:`GaugeGroup.certified_block_local_basis`).
+    """
+
+    K:       int
+    n_heads: int
+    local:   torch.Tensor                    # (m, d, d) float64 local algebra basis
+    dtype:   torch.dtype
+    device:  torch.device
+
+    @property
+    def shape(self) -> Tuple[int, int, int]:
+        return (self.n_heads * self.local.shape[0], self.K, self.K)
+
+
 class _GeneratorTensor:
     """Keep public Tensor access lazy; callers receive the same mutable Tensor thereafter."""
 
@@ -54,13 +73,19 @@ class _GeneratorTensor:
                 source.K, source.n_heads, dtype=source.dtype, device=source.device)
             instance._generator_source = source
             instance._elementary_certificate = instance._generator_cache_key()
+        elif isinstance(source, _BlockLocalBasis):
+            source = generate_block_local(source.K, source.n_heads, source.local,
+                                          dtype=source.dtype, device=source.device)
+            instance._generator_source = source
+            instance._block_local_certificate = instance._generator_cache_key()
         elif instance._elementary_layout is not None and instance.elementary_block_shape is None:
             instance.phi_coordinate_layout = None
             instance.frobenius_gram_diagonal = False
             instance.frobenius_gram_uniform = None
         return source
 
-    def __set__(self, instance: "GaugeGroup", value: 'torch.Tensor | _ElementaryBlockBasis') -> None:
+    def __set__(self, instance: "GaugeGroup",
+                value: 'torch.Tensor | _ElementaryBlockBasis | _BlockLocalBasis') -> None:
         previous = getattr(instance, "_generator_source", None)
         if isinstance(previous, _ElementaryBlockBasis) or getattr(instance, "_elementary_certificate", None) is not None:
             # Replacement withdraws the built-in certificate, including same-shape replacements.
@@ -70,6 +95,7 @@ class _GeneratorTensor:
         instance._generator_source = value
         instance.float64_generators = None              # a replaced basis has no float64 master
         instance._elementary_certificate = None
+        instance._block_local_certificate = None        # a replaced basis is no longer the local copy
         instance._elementary_layout = (
             (value.n_heads, value.K // value.n_heads)
             if isinstance(value, _ElementaryBlockBasis) else None)
@@ -80,7 +106,7 @@ class GaugeGroup:
     """A structure group plus the metadata the transport layer consumes."""
 
     name:                 str
-    generators:           'torch.Tensor | _ElementaryBlockBasis' = _GeneratorTensor()  # constructor union; descriptor reads Tensor
+    generators:           'torch.Tensor | _ElementaryBlockBasis | _BlockLocalBasis' = _GeneratorTensor()  # constructor union; descriptor reads Tensor
     irrep_dims:           List[int]                          # block sizes; sum == K
     # NOT a transpose-for-inverse fast path: no such path exists (audit 2026-07-25 F21). Every
     # inverse routes through _checked_group_inverse's float64 solve. What this flag actually gates:
@@ -116,6 +142,7 @@ class GaugeGroup:
     _gram_uniform_ready:  bool                   = field(default=False, init=False, repr=False, compare=False)
     _head_block_cache:    Optional[torch.Tensor] = field(default=None, init=False, repr=False, compare=False)
     _head_block_key:      Optional[tuple]        = field(default=None, init=False, repr=False, compare=False)
+    _local_cast_cache:    Optional[Dict[tuple, torch.Tensor]] = field(default=None, init=False, repr=False, compare=False)
 
     @property
     def generator_shape(self) -> Tuple[int, int, int]:
@@ -149,6 +176,37 @@ class GaugeGroup:
             return layout
         return None
 
+    def certified_block_local_basis(self) -> Optional[torch.Tensor]:   # (m, d, d) float64, or None
+        r"""The local basis of a block-local group while the stored basis is still its exact copy, else None.
+
+        Valid while the source is the lazy :class:`_BlockLocalBasis` or the dense tensor materialized from it,
+        unchanged and not trainable; a replaced or mutated basis withdraws it, as for the elementary basis.
+        """
+        local = self.block_local_basis
+        if local is None or len(set(self.irrep_dims)) != 1:
+            return None
+        source = self._generator_source
+        if isinstance(source, _BlockLocalBasis):
+            return local
+        if (isinstance(source, torch.Tensor) and not source.requires_grad
+                and self._block_local_certificate == self._generator_cache_key()):
+            return local
+        return None
+
+    def _local_basis_as(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:   # (m, d, d)
+        r"""The certified local basis at ``dtype`` on ``device``, cached per (stored dtype, dtype, device).
+
+        It is rounded to the stored basis dtype first, so every local-basis path equals the dense basis
+        ``generators.to(dtype)`` entry for entry (a float32 group upcast to float64 keeps float32 entries).
+        """
+        local = self.certified_block_local_basis()
+        if self._local_cast_cache is None:
+            self._local_cast_cache = {}
+        key = (self.generator_dtype, dtype, device)
+        if key not in self._local_cast_cache:
+            self._local_cast_cache[key] = local.to(dtype=self.generator_dtype).to(device=device, dtype=dtype)
+        return self._local_cast_cache[key]
+
     def apply_generators(self, fn: Callable[[torch.Tensor], torch.Tensor]) -> None:
         """Move basis metadata with the model, materializing only an already-dense source."""
         source = self._generator_source
@@ -156,14 +214,21 @@ class GaugeGroup:
             moved = fn(torch.empty(0, device=source.device, dtype=source.dtype))
             self._generator_source = _ElementaryBlockBasis(
                 source.K, source.n_heads, moved.dtype, moved.device)
+        elif isinstance(source, _BlockLocalBasis):
+            moved = fn(torch.empty(0, device=source.device, dtype=source.dtype))
+            self._generator_source = _BlockLocalBasis(
+                source.K, source.n_heads, source.local, moved.dtype, moved.device)
         else:
             canonical = self.elementary_block_shape is not None
+            block_local = self.certified_block_local_basis() is not None
             moved = fn(source)
             if self.float64_generators is not None and moved.dtype == torch.float64:
                 moved = self.float64_generators.to(device=moved.device)
             self._generator_source = moved
             if canonical:
                 self._elementary_certificate = self._generator_cache_key()
+            if block_local:
+                self._block_local_certificate = self._generator_cache_key()
 
     def embed_algebra(
         self,
@@ -180,13 +245,20 @@ class GaugeGroup:
         """
         basis_dtype = self.generator_dtype if dtype is None else dtype
         layout = self.elementary_block_shape
-        if (layout is None or phi.dtype != basis_dtype or phi.device != self.generator_device
+        local = self.certified_block_local_basis() if layout is None else None
+        if ((layout is None and local is None) or phi.dtype != basis_dtype or phi.device != self.generator_device
                 or (torch.is_grad_enabled() and phi.requires_grad)
                 or not bool(torch.isfinite(phi).all())):
             basis = self.generators if dtype is None else self.generators.to(dtype=dtype)
             return torch.einsum("...a,aij->...ij", phi, basis)
-        H, d = layout
-        blocks = phi.reshape(*phi.shape[:-1], H, d, d)
+        if layout is not None:
+            H, d = layout
+            blocks = phi.reshape(*phi.shape[:-1], H, d, d)
+        else:
+            # Block-local: M_h = sum_a phi_(h,a) L_a, the coordinates of head h being a contiguous run of m.
+            H, d = len(self.irrep_dims), self.irrep_dims[0]
+            blocks = torch.einsum("...hm,mij->...hij", phi.reshape(*phi.shape[:-1], H, local.shape[0]),
+                                  self._local_basis_as(phi.dtype, phi.device))
         matrix = phi.new_zeros(*phi.shape[:-1], H * d, H * d)
         for h in range(H):
             matrix[..., h*d:(h+1)*d, h*d:(h+1)*d] = blocks[..., h, :, :]
@@ -206,6 +278,17 @@ class GaugeGroup:
         compact route reshapes ``phi``. A trainable basis returns None too, so the dense embedding keeps its graph.
         """
         dims = self.irrep_dims
+        local = self.certified_block_local_basis()
+        if len(dims) >= 2 and local is not None:
+            key = ("block_local",) + self._generator_cache_key()
+            if self._head_block_key != key:                  # generator (h, a) is L_a on block h, zero elsewhere
+                H, m, d = len(dims), local.shape[0], dims[0]
+                blocks = torch.zeros(H * m, H, d, d, dtype=self.generator_dtype, device=self.generator_device)
+                cast = self._local_basis_as(self.generator_dtype, self.generator_device)
+                for h in range(H):
+                    blocks[h * m:(h + 1) * m, h] = cast
+                self._head_block_cache, self._head_block_key = blocks, key
+            return self._head_block_cache
         if (len(dims) < 2 or len(set(dims)) != 1 or self.elementary_block_shape is not None
                 or self._generator_source.requires_grad):
             return None
@@ -227,7 +310,28 @@ class GaugeGroup:
         if layout is not None:
             H, d = layout
             return torch.eye(d, device=self.generator_device, dtype=self.generator_dtype).expand(H, d, d).reshape(-1)
+        if self.certified_block_local_basis() is not None:
+            local = self._local_basis_as(self.generator_dtype, self.generator_device)
+            return local.diagonal(dim1=-2, dim2=-1).sum(-1).repeat(len(self.irrep_dims))
         return self.generators.diagonal(dim1=-2, dim2=-1).sum(-1)
+
+    def block_trace_vectors(self) -> torch.Tensor:              # (n_blocks, n_gen)
+        r"""Per-block trace functionals :math:`V_{ha} = \operatorname{tr}(G_a|_{\text{block }h})`.
+
+        A block-local group reads them from its local basis (generator (h, a) has trace tr L_a on block h only),
+        without the dense basis; every other group takes the blocks of ``generators``.
+        """
+        from vfe3.geometry.lie_ops import _block_trace_vectors
+        if self.certified_block_local_basis() is not None:
+            H = len(self.irrep_dims)
+            local = self._local_basis_as(self.generator_dtype, self.generator_device)
+            m = local.shape[0]
+            traces = local.diagonal(dim1=-2, dim2=-1).sum(-1)                # (m,)
+            V = traces.new_zeros(H, H * m)
+            for h in range(H):
+                V[h, h * m:(h + 1) * m] = traces
+            return V
+        return _block_trace_vectors(self.generators, self.irrep_dims)
 
     def gram_diagonal(self) -> Optional[torch.Tensor]:
         r"""Return cached weights ``||G_a||_F^2`` for a certified diagonal generator Gram."""
@@ -697,7 +801,9 @@ def _build_block_local(
     GL(d) on each of the ``n_heads`` equal head blocks.
 
     The generators are ``local`` copied into every block in head-major order
-    (:func:`vfe3.geometry.generators.generate_block_local`), built in float64 and cast. ``local``
+    (:func:`vfe3.geometry.generators.generate_block_local`). The group stores only ``local`` (a lazy
+    :class:`_BlockLocalBasis`): the dense (H m, K, K) basis is built on the first read of ``generators``,
+    and the transport, ``embed_algebra``, the trace projection and ``head_block_generators`` read ``local``. ``local``
     must have Frobenius Gram ``gram_weight`` times the identity (orthonormal by default), which the
     build verifies, so the generator Gram is ``gram_weight * I``.
     The group carries no ``phi_coordinate_layout``; its transport keeps compact head blocks through
@@ -705,16 +811,18 @@ def _build_block_local(
     from their own builder.
     """
     local = local.to(torch.float64)
+    if K % n_heads != 0 or local.ndim != 3 or tuple(local.shape[1:]) != (K // n_heads,) * 2:
+        raise ValueError(f"{name}: local basis of shape {tuple(local.shape)} does not fit K={K}, n_heads={n_heads}")
     m = local.shape[0]
     gram = torch.einsum("aij,bij->ab", local, local)
     if float((gram - gram_weight * torch.eye(m, dtype=torch.float64)).abs().max()) > 1e-12:
         raise ValueError(f"{name}: the local basis must have Frobenius Gram {gram_weight} * I (orthonormal at 1)")
     if skew and float((local + local.transpose(-1, -2)).abs().max()) > 0.0:
         raise ValueError(f"{name}: skew=True needs an exactly skew local basis")
-    generators = generate_block_local(K, n_heads, local, dtype=torch.float64)
+    placement = torch.empty(0, device=device, dtype=dtype)
     return GaugeGroup(
         name=name,
-        generators=generators.to(device=device, dtype=dtype),
+        generators=_BlockLocalBasis(K, n_heads, local, placement.dtype, placement.device),
         irrep_dims=[K // n_heads] * n_heads,
         skew_symmetric=skew,
         frobenius_gram_diagonal=True,

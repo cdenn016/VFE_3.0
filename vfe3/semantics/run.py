@@ -334,7 +334,7 @@ class SemanticRun:
         if coords is None:
             return None
         if self.cfg.pos_phi_project_slk:
-            coords = project_phi_to_slk(coords, self.group.generators, self.group.irrep_dims)
+            coords = project_phi_to_slk(coords, self.group, self.group.irrep_dims)
         return self._coords_to_blocks(coords[torch.from_numpy(index)])
 
     # ---- decode tables ------------------------------------------------------------------------
