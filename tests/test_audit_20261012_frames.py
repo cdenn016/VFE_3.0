@@ -37,6 +37,7 @@ def _spread_skew_trace(blocks: torch.Tensor) -> tuple:
     dict(gauge_group="block_glk", embed_dim=6, n_heads=2),
     dict(gauge_group="block_glk", embed_dim=6, n_heads=2, gauge_tying="shared"),
     dict(gauge_group="block_glmc", embed_dim=8, n_heads=2),
+    dict(gauge_group="block_sl", embed_dim=6, n_heads=2),
 ])
 def test_projection_bounds_spread_and_keeps_skew_and_trace(overrides: dict) -> None:
     cfg = test_config(vocab_size=6, max_seq_len=3, pos_phi="learned", phi_frame_condition_max=20.0, **overrides)
@@ -99,6 +100,7 @@ def _float64_reference(model: VFEModel, kappa_max: float) -> torch.Tensor:
     dict(gauge_group="block_glk", embed_dim=6, n_heads=2),
     dict(gauge_group="block_glk", embed_dim=6, n_heads=2, gauge_tying="shared"),
     dict(gauge_group="block_glmc", embed_dim=8, n_heads=2),
+    dict(gauge_group="block_sl", embed_dim=6, n_heads=2),
 ])
 def test_screened_float32_projection_matches_the_float64_projection(overrides: dict) -> None:
     r"""The screen skips only rows already within the bound (bitwise unchanged), and the certified float32

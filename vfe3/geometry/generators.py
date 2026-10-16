@@ -173,6 +173,19 @@ def local_basis_borel(d: int) -> torch.Tensor:
     return torch.stack(basis)
 
 
+def local_basis_unipotent(d: int) -> torch.Tensor:
+    r"""Orthonormal strictly upper-triangular algebra n+(d): :math:`E_{ij}` for :math:`i<j`, row-major. Returns (d(d-1)/2, d, d)."""
+    if d < 2:
+        raise ValueError(f"n+(d) needs d >= 2, got d={d}")
+    basis = []
+    for i in range(d):
+        for j in range(i + 1, d):
+            E = torch.zeros(d, d, dtype=torch.float64)
+            E[i, j] = 1.0
+            basis.append(E)
+    return torch.stack(basis)
+
+
 def local_basis_glc(d: int) -> torch.Tensor:
     r"""Realified gl(m, C) on R^{2m}, d = 2m: :math:`E_{ij}\otimes I_2` (row-major), then :math:`E_{ij}\otimes J`.
 
