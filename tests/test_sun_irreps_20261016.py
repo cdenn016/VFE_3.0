@@ -110,12 +110,9 @@ def test_config_accepts_and_refuses() -> None:
         test_config(**{**base, "group_n": 2, "irrep_spec": [("pq1_1", 2)], "embed_dim": 6})
     with pytest.raises(ValueError, match="p >= q"):
         test_config(**{**base, "irrep_spec": [("pq1_2", 2)], "embed_dim": 60})
-    with pytest.raises(ValueError, match="no construction yet"):
-        test_config(**{**base, "irrep_spec": [("pq1_0", 2)], "embed_dim": 12})
+    assert test_config(**{**base, "irrep_spec": [("pq1_0", 2)], "embed_dim": 12}).head_dims == [6, 6]   # M2
     with pytest.raises(ValueError, match="so\\(N\\) towers only"):
         test_config(**{**base, "irrep_spec": "random"})
-    with pytest.raises(ValueError, match="not built for su_n"):
-        test_config(**{**base, "irrep_spec": [("pq1_1", 2)], "use_cg_coupling": True})
     with pytest.raises(ValueError, match="unknown irrep label"):
         test_config(**{**base, "irrep_spec": [("l1", 2)], "embed_dim": 6})
 

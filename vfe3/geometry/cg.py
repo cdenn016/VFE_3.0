@@ -32,7 +32,7 @@ from typing import Dict, List, Tuple
 
 import torch
 
-from vfe3.geometry.generators import generate_son
+from vfe3.geometry.generators import generate_son, generate_sun_real
 from vfe3.geometry.irreps import irrep_dim, irrep_generators
 
 _CG_CACHE: Dict[Tuple[str, int, str, str, str, float], torch.Tensor] = {}
@@ -41,7 +41,9 @@ _CG_CACHE: Dict[Tuple[str, int, str, str, str, float], torch.Tensor] = {}
 def _defining(N: int, algebra: str) -> torch.Tensor:
     if algebra == "so":
         return generate_son(N, dtype=torch.float64)
-    raise ValueError(f"unknown algebra {algebra!r}; registered: 'so'")
+    if algebra == "su":
+        return generate_sun_real(N)                    # the realified su(N) basis the su_n tower is built on
+    raise ValueError(f"unknown algebra {algebra!r}; registered: 'so', 'su'")
 
 
 def cg_intertwiners(
