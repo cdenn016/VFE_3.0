@@ -40,6 +40,7 @@ A new irrep family (Young-tableau highest-weight reps, spinors, ...) slots in by
 
 import itertools
 import math
+import re
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -47,6 +48,8 @@ import torch
 # key 'algebra:prefix' -> (dim_fn(N, p) -> int, build_fn(G_def, p) -> (n_gen, d, d))
 _IRREPS: Dict[str, Tuple[Callable[[int, int], int],
                          Callable[[torch.Tensor, int], torch.Tensor]]] = {}
+# key -> label arity: 1 for '<prefix><p>' (rank p), 2 for '<prefix><p>_<q>' (rank (p, q)).
+_IRREP_ARITY: Dict[str, int] = {}
 
 
 def register_irrep(
@@ -56,8 +59,9 @@ def register_irrep(
 
     *,
     override: bool = False,
+    arity:    int  = 1,                                          # 1: '<prefix><p>'; 2: '<prefix><p>_<q>'
 ) -> None:
-    """Register an irrep family under ``key`` (label grammar: '<prefix><rank>').
+    """Register an irrep family under ``key`` (label grammar: '<prefix><rank>', or '<prefix><p>_<q>' at arity 2).
 
     Duplicate keys fail closed (audit 2026-07-01 round-3): a second
     registration under an existing key silently shadowed the first. Pass ``override=True`` to
@@ -65,15 +69,21 @@ def register_irrep(
     """
     if key in _IRREPS and not override:
         raise KeyError(f"irrep family {key!r} already registered; pass override=True to replace")
+    if arity not in (1, 2):
+        raise ValueError(f"irrep label arity must be 1 or 2, got {arity!r}")
     _IRREPS[key] = (dim_fn, build_fn)
+    _IRREP_ARITY[key] = arity
 
 
-def _parse_label(algebra: str, label: str) -> Tuple[str, int]:
-    """Split 'l2' -> ('so:l', 2); raise with the registered keys on an unknown label."""
+def _parse_label(algebra: str, label: str) -> 'Tuple[str, int | Tuple[int, int]]':
+    """Split 'l2' -> ('so:l', 2), or 'pq1_1' -> ('su:pq', (1, 1)) for an arity-2 family; raise on an unknown label."""
+    two = re.fullmatch(r"([A-Za-z]+)(\d+)_(\d+)", label)
+    if two is not None and _IRREP_ARITY.get(f"{algebra}:{two.group(1)}") == 2:
+        return f"{algebra}:{two.group(1)}", (int(two.group(2)), int(two.group(3)))
     prefix = label.rstrip("0123456789")
     digits = label[len(prefix):]
     key = f"{algebra}:{prefix}"
-    if not digits or key not in _IRREPS:
+    if not digits or key not in _IRREPS or _IRREP_ARITY.get(key, 1) != 1:
         raise ValueError(
             f"unknown irrep label {label!r} for algebra {algebra!r}; registered families: "
             f"{sorted(_IRREPS)} (label grammar '<family><rank>', e.g. 'l2')"
@@ -115,6 +125,13 @@ def check_irrep_constructible(
     """Raise, before any tensor is built, if ``label`` cannot be constructed."""
     key, p = _parse_label(algebra, label)
     _IRREPS[key][0](N, p)                  # the family's dimension formula refuses an undefined (N, rank)
+    if key == "su:pq":
+        if p not in _SU_BUILT:
+            raise ValueError(
+                f"su({N}) irrep {label!r} has a closed-form dimension but no construction yet: su_n builds "
+                f"{sorted('pq%d_%d' % pq for pq in _SU_BUILT)} (the trivial and adjoint blocks); further "
+                f"(p, q) irreps await the su_n M2 buildout")
+        return
     if key in _WEDGE_FAMILIES:
         return                             # direct construction on the p-vector basis: no tensor power
     if algebra == "so" and N == 3:
@@ -344,8 +361,9 @@ def direct_sum_generators(
     irrep_spec: Sequence[Tuple[str, int]],          # (label, multiplicity) pairs, in block order
 ) -> Tuple[torch.Tensor, List[int]]:                # ((n_gen, K, K) float64, per-block dims)
     """Assemble blockdiag_b rho_b(X_a) over the spec; each distinct label is built once,
-    verified (dimension formula + bracket homomorphism), then tiled by its multiplicity."""
-    N = G_def.shape[-1]
+    verified (dimension formula + bracket homomorphism), then tiled by its multiplicity.
+    For 'su' the defining basis is the realified 2N x 2N one, so N is half its width."""
+    N = G_def.shape[-1] // 2 if algebra == "su" else G_def.shape[-1]
     n_gen = G_def.shape[0]
     f = structure_constants(G_def)
 
@@ -503,6 +521,63 @@ register_irrep("so:wp",  _wedge_half_dim, _wedge_plus_build)
 register_irrep("so:wm",  _wedge_half_dim, _wedge_minus_build)
 
 
+
+# ---------------------------------------------------------------- SU(N) irreps (p, q)
+#
+# Label 'pq<p>_<q>': the irrep with highest weight p (fundamental) + q (antifundamental), the traceless
+# tensors in Sym^p(C^N) (x) Sym^q(conj C^N). The defining basis is the realified su(N) basis
+# (generators.generate_sun_real), a faithful real representation, so the structure constants are the
+# real f_abc of X_a = i lambda_a. Built so far (su_n M1): the trivial 'pq0_0' and the adjoint 'pq1_1',
+# ad(X_a)_{cb} = f_abc, which is real, skew (the basis is orthonormal under the Killing form) and
+# irreducible over R (real type). Every other (p, q) has a dimension but is refused by
+# check_irrep_constructible until the M2 realification.
+
+_SU_BUILT = ((0, 0), (1, 1))
+
+
+def _su_pq_dim(N: int, pq: Tuple[int, int]) -> int:
+    r"""Real dimension of the su(N) irrep (p, q): the complex dimension
+    :math:`D = \binom{p+N-1}{p}\binom{q+N-1}{q} - \binom{p+N-2}{p-1}\binom{q+N-2}{q-1}` for the real type p = q,
+    2D for the complex type p != q (realified). N >= 3 and p >= q; (q, p) is R-equivalent to (p, q)."""
+    p, q = pq
+    if N < 3:
+        raise ValueError(f"su_n needs group_n >= 3 (SU(2) is so_n with group_n=3, 'l<p>' = spin p), got N={N}")
+    if p < 0 or q < 0 or p < q:
+        raise ValueError(f"su({N}) irrep labels need p >= q >= 0 ((q, p) is R-equivalent to (p, q)), got ({p}, {q})")
+
+    def comb(n: int, k: int) -> int:
+        return math.comb(n, k) if k >= 0 else 0
+
+    D = comb(p + N - 1, p) * comb(q + N - 1, q) - comb(p + N - 2, p - 1) * comb(q + N - 2, q - 1)
+    return D if p == q else 2 * D
+
+
+def _su_pq_build(G_def: torch.Tensor, pq: Tuple[int, int]) -> torch.Tensor:
+    r"""Generator images of the built su(N) irreps on their real orthonormal basis: 'pq0_0' is zero (1 x 1), and
+    'pq1_1' is the adjoint :math:`\mathrm{ad}(X_a)_{cb} = f_{abc}` of the defining basis."""
+    n_gen = G_def.shape[0]
+    if tuple(pq) == (0, 0):
+        return torch.zeros(n_gen, 1, 1, dtype=torch.float64)
+    if tuple(pq) == (1, 1):
+        # The realified su(N) basis is Frobenius-orthogonal with one common weight, so the structure constants
+        # are the exact projections f_abc = <R_c, [R_a, R_b]>_F / ||R_c||_F^2: deterministic products only (a
+        # least-squares solve is not bit-reproducible, and the basis fingerprint must be).
+        gram = torch.einsum("aij,bij->ab", G_def, G_def)
+        weight = gram.diagonal()
+        if float((gram - torch.diag(weight)).abs().max()) > 1e-12 * float(weight.max()):
+            raise RuntimeError("the su(N) defining basis must be Frobenius-orthogonal")
+        brackets = torch.einsum("aij,bjk->abik", G_def, G_def)
+        brackets = brackets - brackets.transpose(0, 1)                  # (n, n, 2N, 2N) [R_a, R_b]
+        f = torch.einsum("abij,cij->abc", brackets, G_def) / weight     # [R_a, R_b] = f[a, b, c] R_c
+        rho = f.transpose(1, 2)                                         # rho[a, c, b] = f[a, b, c]
+        # f is totally antisymmetric in this basis; antisymmetrize the rounding so every image is exactly skew.
+        return (0.5 * (rho - rho.transpose(1, 2))).contiguous()
+    raise ValueError(f"su irrep ({pq[0]}, {pq[1]}) is not built yet (su_n M1 builds pq0_0 and pq1_1)")
+
+
+register_irrep("su:pq", _su_pq_dim, _su_pq_build, arity=2)
+
+
 def _multiset_counts(
     dims:    List[int],                    # candidate block dimensions, one per label
     n_heads: int,
@@ -557,7 +632,7 @@ def random_irrep_spec(
                          f"min_rank={min_rank!r}, max_rank={max_rank!r}")
     top = K if max_rank is None else max_rank
     candidates: List[Tuple[str, int]] = []                     # (label, dim) in draw order
-    for key in sorted(k for k in _IRREPS if k.startswith(f"{algebra}:")):
+    for key in sorted(k for k in _IRREPS if k.startswith(f"{algebra}:") and _IRREP_ARITY.get(k, 1) == 1):
         prefix = key.split(":", 1)[1]
         for p in range(min_rank, top + 1):
             label = f"{prefix}{p}"

@@ -1117,7 +1117,7 @@ def project_phi_parameter_rows_(
 # functional calculus of the realified Hermitian part and so stays realified. Frames of the inert
 # groups are orthogonal or conformal on every head (S_0 = 0), so cond_2 = 1 and nothing is projected.
 FRAME_CONDITION_GROUPS:       Tuple[str, ...] = ("block_glk", "block_glmc")
-FRAME_CONDITION_INERT_GROUPS: Tuple[str, ...] = ("block_so", "block_co", "so_n")
+FRAME_CONDITION_INERT_GROUPS: Tuple[str, ...] = ("block_so", "block_co", "so_n", "su_n")
 _SPREAD_BISECTION_STEPS = 64
 
 

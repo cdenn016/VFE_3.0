@@ -228,11 +228,11 @@ config = dict(
     #          Gauge Group
     #################################
     gauge_transport                  = "on",           # "on" | "off" | "frozen" (random fixed frame)
-    gauge_group                      = "block_glk",    # "block_glk" | "so_n" | "block_so" | "block_co" | "block_glmc" (block_glmc: even d_head)
+    gauge_group                      = "block_glk",    # "block_glk" | "so_n" | "su_n" | "block_so" | "block_co" | "block_glmc" (block_glmc: even d_head)
     gauge_tying                      = "per_head",     # None (group default) | "per_head" | "shared" (shared: block_glk, so_n only)
     
-    group_n                          = None,                # so_n only: the N of SO(N), int >= 2; None for every other group
-    irrep_spec                       = None,                # so_n only: [(label, mult), ...] (labels "l<p>", "w<p>", "wp<m>", "wm<m>") | "random"; None for every other group
+    group_n                          = None,                # so_n / su_n only: the N of SO(N) (>= 2) or SU(N) (>= 3); None for every other group
+    irrep_spec                       = None,                # so_n: [(label, mult), ...] (labels "l<p>", "w<p>", "wp<m>", "wm<m>") | "random"; su_n: [("pq1_1", n), ...] ("pq0_0", "pq1_1"); None otherwise
    
     ####################################
     #       Positional Encoding
