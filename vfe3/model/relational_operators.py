@@ -95,6 +95,10 @@ def _centered_spread(
     return tiles[0] if len(tiles) == 1 else torch.cat(tiles, dim=-4)
 
 
+# "prior": f Sigma_p (frame-free, reference-invariant); "relative": f (tr C_i / K) U_i U_i^T, the floor before
+# October 12, 2026, relative to the input covariance C_i = U_i^{-1} Sigma_i U_i^{-T} (not reference-invariant).
+PREDICTIVE_COVARIANCE_FLOOR_MODES = ("prior", "relative")
+
 _FP64_ESCALATION_FAILURE = ("the moment-matched covariance update is not positive definite in float64 either (the "
                             "float32 update failed first and was recomputed in float64); no repair applied")
 
@@ -433,6 +437,7 @@ class RelationalOperators(nn.Module):
         routing:               str   = "gaussian_kl",
         predictive_covariance: str,
         predictive_covariance_floor: float = 1e-4,
+        predictive_covariance_floor_mode: str = "prior",
         predictive_covariance_ceiling: Optional[float] = None,
         receiver_noise:        float = 1.0,
         receiver_update:       str,
@@ -529,6 +534,10 @@ class RelationalOperators(nn.Module):
                 f"predictive_covariance_floor must be finite and positive, got {predictive_covariance_floor!r}")
         self.predictive_covariance = predictive_covariance
         self.predictive_covariance_floor = float(predictive_covariance_floor)
+        if predictive_covariance_floor_mode not in PREDICTIVE_COVARIANCE_FLOOR_MODES:
+            raise ValueError(f"predictive_covariance_floor_mode must be one of {PREDICTIVE_COVARIANCE_FLOOR_MODES}, "
+                             f"got {predictive_covariance_floor_mode!r}")
+        self.predictive_covariance_floor_mode = predictive_covariance_floor_mode
         if predictive_covariance_ceiling is not None and (
                 isinstance(predictive_covariance_ceiling, bool)
                 or not isinstance(predictive_covariance_ceiling, (int, float))
@@ -906,8 +915,13 @@ class RelationalOperators(nn.Module):
         self,
         floor_anchor: Optional[torch.Tensor],      # the local prior covariance Sigma_p, sigma's layout (broadcastable)
         sigma:        torch.Tensor,                # (..., N, K) or (..., N, K, K) the covariance being floored
-    ) -> torch.Tensor:                             # sigma's shape and dtype: f Sigma_p
+        frame:        Optional[CanonicalFrameContext] = None,   # required under floor_mode="relative"
+        diagonal:     bool = True,                 # sigma is (..., N, K) diagonal (read under floor_mode="relative")
+    ) -> torch.Tensor:                             # sigma's shape and dtype: f Sigma_p (or the relative floor)
         r"""The prior-anchored covariance floor :math:`f\,\Sigma_{p,i}` of the moment-matched readouts.
+
+        Under ``predictive_covariance_floor_mode="relative"`` it is instead :meth:`relative_floor_term`, the floor used
+        before October 12, 2026 (kept for testing).
 
         :math:`\Sigma_{p,i}` is the prior covariance of token :math:`i` in local coordinates (the layer's prior, which is
         the embedding prior under ``prior_handoff_sigma=0``). It involves no frame, so the floored covariance is exactly
@@ -917,10 +931,49 @@ class RelationalOperators(nn.Module):
         :math:`\operatorname{tr}(a^{-1}Ca^{-\top}) \ne \operatorname{tr}C` (audit 2026-10-12, item 4 and T5). It does not
         compound with depth: every layer's output is at least :math:`f\,\Sigma_{p,i}` whatever the input was.
         """
+        if self.predictive_covariance_floor_mode == "relative":
+            return self.relative_floor_term(sigma, frame, diagonal)
         if floor_anchor is None:
             raise ValueError("the moment-matched covariance needs floor_anchor, the local prior covariance Sigma_p of "
                              "each token (the covariance floor is f * Sigma_p)")
         return torch.broadcast_to(self.predictive_covariance_floor * floor_anchor.to(sigma.dtype), sigma.shape)
+
+    def relative_floor_term(
+        self,
+        sigma: torch.Tensor,                       # (..., N, K) or (..., N, K, K) local input covariance Sigma_i
+        frame: Optional[CanonicalFrameContext],
+        diagonal: bool,                            # sigma is (..., N, K) diagonal
+    ) -> torch.Tensor:                             # sigma's shape and dtype
+        r"""The relative floor :math:`f \tfrac{\operatorname{tr}C_i}{K} U_iU_i^\top`, :math:`C_i = U_i^{-1}\Sigma_iU_i^{-\top}`.
+
+        The floor before October 12, 2026: a ridge :math:`f \tfrac{\operatorname{tr}C_i}{K} I` on the attended covariance
+        in reference coordinates, here added after the sandwich (equal in exact arithmetic). It scales with the input
+        covariance, so the output stays above :math:`f` times the input's mean reference variance however the
+        covariance grows through depth, but it changes under a non-orthogonal common reference change
+        :math:`U_i \to U_ia` because :math:`\operatorname{tr}(a^{-1}Ca^{-\top}) \ne \operatorname{tr}C` (audit
+        2026-10-12, item 4). A diagonal family reads :math:`\mathrm{diag}(U_iU_i^\top)`.
+        """
+        if frame is None:
+            raise ValueError("predictive_covariance_floor_mode='relative' needs the frame of the floored covariance")
+        C = self._reference_covariance(sigma, frame, sigma.dtype, diagonal=diagonal)   # blocks or (..., N, K, K)
+        blocks = frame.block_diagonal and diagonal                                     # C is (..., N, H, d, d)
+        trace = torch.diagonal(C, dim1=-2, dim2=-1).sum(dim=(-2, -1) if blocks else -1)
+        scale = trace / sigma.shape[-1]                                                # (..., N) tr(C_i)/K
+        forward = frame.forward.to(sigma.dtype)
+        if frame.block_diagonal:
+            gram = forward @ forward.transpose(-1, -2)                                     # (..., N, H, d, d)
+            if diagonal:
+                base = torch.diagonal(gram, dim1=-2, dim2=-1).flatten(-2)                  # (..., N, K)
+            else:
+                H = gram.shape[-3]
+                eye_h = torch.eye(H, dtype=gram.dtype, device=gram.device)
+                base = torch.einsum("...hab,hg->...hagb", gram, eye_h).reshape(*gram.shape[:-3], H * gram.shape[-1],
+                                                                                 H * gram.shape[-1])   # (..., N, K, K)
+        else:
+            gram = forward @ forward.transpose(-1, -2)                                     # (..., N, K, K)
+            base = torch.diagonal(gram, dim1=-2, dim2=-1) if diagonal else gram
+        scale = scale[..., None] if diagonal else scale[..., None, None]
+        return torch.broadcast_to(self.predictive_covariance_floor * scale * base, sigma.shape).to(sigma.dtype)
 
     def ceiling_term(
         self,
@@ -997,7 +1050,8 @@ class RelationalOperators(nn.Module):
         # escalated call then adds only the rest of its entries below, so no entry is counted twice.
         before = (source_recovery_counter(mu.device) if dtype != torch.float64
                   and self.minimal_agent_inference == "mean_field" and projected_condition_recovery() else None)
-        floor = self.floor_term(floor_anchor, sigma) if return_covariance else None
+        floor = (self.floor_term(floor_anchor, sigma, frame, diagonal=sigma.dim() == mu.dim())
+                 if return_covariance else None)
         mu_plus, sigma_plus, record, status = self._minimal_agent_call(
             mu, sigma, frame, log_prior, return_covariance, capture is not None, floor)
         # The one host read of a healthy call; it also resolves raise-only checks queued by
@@ -1195,7 +1249,7 @@ class RelationalOperators(nn.Module):
         computed outside the checkpointed region and enters it as an input.
         """
         self._require_kernel_readout("predictive_covariance_update")
-        floor = self.floor_term(floor_anchor, sigma)
+        floor = self.floor_term(floor_anchor, sigma, frame, diagonal=sigma.dim() == mu.dim())
         if edges is None and self.content_link_edges != "off":
             edges = self.edge_context(mu, beta, frame, receive, sigma=sigma)
         if edges is not None:

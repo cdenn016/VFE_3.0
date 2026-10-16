@@ -50,6 +50,7 @@ def fully_gauge_covariant_overrides(
         "sigma_max":                 None,
         "phi_mstep_max_matrix_norm": None,
         "phi_frame_condition_max":   None,
+        "predictive_covariance_floor_mode": "prior",
         "lambda_alpha_mode":         "state_dependent",
     }
     if get("family") not in ("gaussian_full", "gaussian_block"):
