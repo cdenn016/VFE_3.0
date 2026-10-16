@@ -103,3 +103,27 @@ def test_a_spike_logs_attribution_writes_the_record_and_fills_the_group_columns(
     forced = _rows(tmp_path / "run" / "metrics.csv")[1]
     assert int(forced["step"]) == 5
     assert any(math.isfinite(float(forced[c])) for c in T._GRAD_GROUP_COLUMNS if forced.get(c, "") != "")
+
+
+def test_decode_table_rows_are_counted_over_the_targets() -> None:
+    r"""Untied decode tables are read at the targets, so their rows are reported with target counts
+    (audit 2026-10-15, finding 8: decode_sigma_log_embed topped every sigma spike with no rows listed)."""
+    cfg = _cfg(decode_mode="diagonal_chunked", untie_decode_bank=True)
+    model = _model(cfg)
+    optimizer = T.build_optimizer(model, cfg)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
+    status: Dict[str, Any] = {}
+    tokens, targets = _batch(cfg)
+    T.train_step(model, optimizer, scheduler, tokens, targets, grad_clip=None, status_out=status)
+    report = T._spike_attribution(model, optimizer, status, tokens, roles=("mu", "sigma", "phi"),
+                                  loss_spiked=False, replayed=False, last_group_norms={}, targets=targets)
+    decode = {name: entry for name, entry in report["table_rows"].items()
+              if name.rsplit(".", 1)[-1] in T._SPIKE_DECODE_TABLES}
+    top_names = {entry["name"] for entry in report["top_parameters"]}
+    expected = {name for name in top_names if name.rsplit(".", 1)[-1] in T._SPIKE_DECODE_TABLES}
+    assert expected, "the tiny case must put a decode table among the top parameters"
+    assert set(decode) == expected
+    counts = torch.bincount(targets.reshape(-1), minlength=cfg.vocab_size)
+    for entry in decode.values():
+        assert entry["indexed_by"] == "target"
+        assert entry["batch_counts"] == [int(counts[row]) for row in entry["rows"]]

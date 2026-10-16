@@ -522,7 +522,7 @@ class VFE3Config:
     # intermediates (identical values and gradients; saves memory at large K).
     predictive_covariance_checkpoint: bool            = False
     # moment_matched, kernel readout only: recompute the failing sequences of a float32 update in float64 when its
-    # output is not positive definite (diag(U C^att U^T) amplifies float32 rounding by about kappa(U)^2), counted in source_recovery_elements;
+    # output is not positive definite (diag(U C^att U^T) amplifies float32 rounding by about kappa(U)^2), counted in covariance_escalation_elements;
     # one host read per layer call. A float64 failure raises.
     predictive_covariance_fp64_escalation: bool       = False
     attention_residual:               bool            = True      # kernel only: new mean = mu_i + content (False: content only)
@@ -2997,6 +2997,9 @@ def _migrate_projected_factorization(
 #                                     whose migration treats an absent rope_space as "frame"
 #   kl_max                            100.0 until 2026-10-12, now None (8 * embed_dim)
 #   relational_receiver_measurement   "adjoint" from 2026-10-10 until 2026-10-12, now "inverse"
+#   decode_logits_amp                 False at 46a3a6c (2026-10-07)
+#   decode_ce_triton                  False at 5e5a118 (2026-10-12)
+#   routing_kl_max_reference          "absolute" at e0a3bb4 (2026-10-08)
 _HISTORICAL_DEFAULT_PINS: dict[str, Any] = {
     "content_link_chart":               "affine",
     "predictive_covariance":            "passthrough",
@@ -3004,6 +3007,9 @@ _HISTORICAL_DEFAULT_PINS: dict[str, Any] = {
     "m_decode_sigma_lr":                None,
     "kl_max":                           100.0,
     "relational_receiver_measurement":  "adjoint",
+    "decode_logits_amp":                False,
+    "decode_ce_triton":                 False,
+    "routing_kl_max_reference":         "absolute",
 }
 
 

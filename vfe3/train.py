@@ -89,6 +89,8 @@ from vfe3.model.block_mlp import (                              # LayerNorm push
     layernorm_trace_cap_elements, reset_layernorm_trace_cap_elements)
 from vfe3.model.covariance_ceiling import (                     # moment-matched covariance ceiling clamps
     covariance_ceiling_elements, reset_covariance_ceiling_elements)
+from vfe3.model.relational_operators import (                   # moment-matched covariance fp64 escalations
+    covariance_escalation_elements, reset_covariance_escalation_elements)
 
 
 _SUCCESSFUL_UPDATES_KEY = "successful_updates"
@@ -2106,7 +2108,7 @@ RUN_TOTAL_COUNTER_KEYS: Tuple[str, ...] = (
     "nonfinite_tangent_elements", "mu_trust_fallback_elements", "decode_logdet_fallback_elements",
     "frame_pair_fp64_escalations", "public_spd_repair_elements", "public_spd_ceiling_contact_elements",
     "source_recovery_elements", "layernorm_trace_cap_elements", "covariance_ceiling_elements",
-    "matmul_precision_replays")
+    "covariance_escalation_elements", "matmul_precision_replays")
 
 
 def _process_counter_values() -> Dict[str, int]:
@@ -2119,7 +2121,8 @@ def _process_counter_values() -> Dict[str, int]:
             "public_spd_ceiling_contact_elements": int(public_spd_ceiling_contact_elements()),
             "source_recovery_elements": int(source_recovery_elements()),
             "layernorm_trace_cap_elements": int(layernorm_trace_cap_elements()),
-            "covariance_ceiling_elements": int(covariance_ceiling_elements())}
+            "covariance_ceiling_elements": int(covariance_ceiling_elements()),
+            "covariance_escalation_elements": int(covariance_escalation_elements())}
 
 
 def _resumed_run_totals(
@@ -3904,6 +3907,8 @@ DIVERGENCE_SPIKE_LOG = "divergence_spikes.jsonl"          # run_dir/diagnostics:
 _SPIKE_TOP_PARAMETERS = 5
 _SPIKE_TOP_ROWS = 3
 _SPIKE_TABLE_INDEX = {"mu_embed": "token", "sigma_log_embed": "token", "phi_embed": "token", "pos_phi": "position"}
+# Decode-side tables (untied decode bank) are read at the step's targets, so their rows are counted over targets.
+_SPIKE_DECODE_TABLES = ("decode_mu_embed", "decode_sigma_log_embed")
 
 
 def _spike_attribution(
@@ -3916,6 +3921,7 @@ def _spike_attribution(
     loss_spiked:      bool,
     replayed:         bool,                       # the step was replayed at a stricter matmul precision
     last_group_norms: Mapping[str, float],        # pre-clip grad_norm_group_* of the last logged row
+    targets:          Optional[torch.Tensor] = None,   # (B, N) the step's targets; counts decode-table rows
 ) -> Dict[str, Any]:
     r"""Which parameters, named groups and table rows carry a spiking role's pre-clip gradient, and why.
 
@@ -3923,7 +3929,7 @@ def _spike_attribution(
     coefficient (``status["clip_scales"]``), so :math:`\|g_p\|` is the pre-clip norm and a role's norm is
     :math:`(\sum_{p\in r}\|g_p\|^2)^{1/2}`. Shares are of the squared role norm. For the token and positional tables
     among the top parameters, the rows with the largest gradient are reported with their share of the table's
-    squared norm and, for token tables, their count in the batch. ``causes`` lists what coincides with the spike:
+    squared norm and, for token tables, their count in the batch (decode tables: their count among the targets). ``causes`` lists what coincides with the spike:
     the loss spike (a hard batch), a binding clip, a precision replay, one parameter or a few rows carrying most of
     the norm, and groups far above their last logged norm. One host transfer for the norms.
     """
@@ -3963,6 +3969,8 @@ def _spike_attribution(
         report["top_parameters"].append({"name": name, "role": role, "group": group, "pre_clip_norm": norm,
                                          "role_share": share})
         index = _SPIKE_TABLE_INDEX.get(group)
+        if index is None and targets is not None and name.rsplit(".", 1)[-1] in _SPIKE_DECODE_TABLES:
+            index = "target"
         if index is None or parameter.grad.dim() < 2:
             continue
         with torch.no_grad():
@@ -3972,8 +3980,10 @@ def _spike_attribution(
             entry: Dict[str, Any] = {"indexed_by": index, "rows": top_rows.cpu().tolist(),
                                      "top_share": float(top_sq.sum() / rows.sum().clamp_min(1e-300)),
                                      "rows_with_gradient": int((rows > 0).sum())}
-            if index == "token":
-                counts = torch.bincount(tokens.reshape(-1).to(rows.device), minlength=rows.numel())
+            if index in ("token", "target"):
+                ids = (tokens if index == "token" else targets).reshape(-1).to(rows.device)
+                ids = ids[(ids >= 0) & (ids < rows.numel())]                  # drop ignore-index targets
+                counts = torch.bincount(ids, minlength=rows.numel())
                 entry["batch_counts"] = counts[top_rows].cpu().tolist()
         report["table_rows"][name] = entry
     causes: List[str] = report["causes"]
@@ -4412,6 +4422,7 @@ def train(
     reset_frame_pair_fp64_escalations()     # ... and float64 frame-pair escalations
     reset_layernorm_trace_cap_elements()    # ... and LayerNorm pushforward sphere-bound caps
     reset_covariance_ceiling_elements()     # ... and moment-matched covariance ceiling clamps
+    reset_covariance_escalation_elements()  # ... and moment-matched covariance fp64 escalations
     run_total_base = _resumed_run_totals(getattr(artifacts, "resumed_numerics_counters", None),
                                          start_step, logger)
     # steps replayed at a stricter matmul policy (whole run), and its value at the last log step
@@ -4782,7 +4793,7 @@ def train(
                     report = _spike_attribution(
                         model, optimizer, step_status, tokens,
                         roles=divergence.spike_roles or DIVERGENCE_ROLES, loss_spiked=divergence.spike_loss,
-                        replayed=replays > 0, last_group_norms=last_group_norms)
+                        replayed=replays > 0, last_group_norms=last_group_norms, targets=targets)
                     spike_groups = report["group_norms"]
                     logger.warning("step %d: spike attribution: %s", step + 1, _spike_summary(report))
                     if artifacts is not None:
@@ -5257,6 +5268,9 @@ def train(
             # Cumulative moment-matched covariance entries clamped by predictive_covariance_ceiling.
             row["covariance_ceiling_elements"] = (run_total_base["covariance_ceiling_elements"]
                                                   + covariance_ceiling_elements())
+            # Cumulative tokens of moment-matched covariance updates recomputed in float64.
+            row["covariance_escalation_elements"] = (run_total_base["covariance_escalation_elements"]
+                                                     + covariance_escalation_elements())
             row["tokens_seen"] = tokens_seen
             row["diagnostics_failures"] = int(sum(diagnostics_failures.values()))
             pipeline_timing = timer.sample_pipeline_window()
