@@ -1520,8 +1520,12 @@ def build_factored_transport(
     )
     # Any other basis supported on equal head blocks (block_so, block_co, block_glmc, shared block_glk,
     # an equal-block so_n tower) embeds through its head blocks instead (audit 2026-10-10, item 26).
-    head_blocks = None if elementary or not compact_blocks else group.head_block_generators()
-    compact = elementary or head_blocks is not None
+    # A block-local group (block_so, block_co, block_glmc) embeds through its (m, d, d) local basis, the head's
+    # coordinates being a contiguous run of m; the dense and per-head bases are never built.
+    local = (None if elementary or not compact_blocks or block_dims is None or len(set(block_dims)) != 1
+             else group.certified_block_local_basis())
+    head_blocks = None if elementary or local is not None or not compact_blocks else group.head_block_generators()
+    compact = elementary or local is not None or head_blocks is not None
     if gauge_mode == "trivial":
         # Trivial gauge: exp = I. Build the same per-token factors the dense path would (the
         # caller's guard normally excludes trivial, but keep the container well-formed).
@@ -1549,6 +1553,12 @@ def build_factored_transport(
             # contracts the coordinates with its blocks, M_h = sum_a phi_a G_a^(h).
             if elementary:
                 return coordinates.reshape(*coordinates.shape[:-1], H, d, d)
+            if local is not None:
+                return _embed_algebra_fp32_floor(
+                    coordinates.reshape(*coordinates.shape[:-1], H, local.shape[0]),
+                    group._local_basis_as(torch.float64 if coordinates.dtype == torch.float64 else torch.float32,
+                                          coordinates.device),
+                    pattern="...hm,mij->...hij")
             return _embed_algebra_fp32_floor(coordinates, head_blocks, pattern="...a,ahij->...hij")
 
         phi_blocks = _embed(phi)

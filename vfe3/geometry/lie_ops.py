@@ -760,7 +760,7 @@ def _block_trace_vectors(
 
 def project_phi_to_slk(
     phi:        torch.Tensor,             # (..., n_gen)
-    generators: torch.Tensor,             # (n_gen, K, K)
+    generators: 'torch.Tensor | GaugeGroup',  # (n_gen, K, K) basis, or the group (its block_trace_vectors)
     irrep_dims: List[int],                # block sizes; sum == K
 ) -> torch.Tensor:                        # (..., n_gen) per-block trace-free
     r"""Hard projection to sl(K) per block: remove the trace component so
@@ -784,7 +784,8 @@ def project_phi_to_slk(
         # bf16/fp16 -> fp32 (neither pinv nor the mixed-dtype matmul below has a reduced-precision
         # kernel); fp32/fp64 are returned unchanged by promote_types, so nothing is ever downcast.
         phi_c = phi.to(torch.promote_types(phi.dtype, torch.float32))
-        V = _block_trace_vectors(generators, irrep_dims)      # (H, n_gen)
+        V = (generators.block_trace_vectors() if hasattr(generators, "block_trace_vectors")
+             else _block_trace_vectors(generators, irrep_dims)).to(device=phi_c.device)   # (H, n_gen)
         gram_pinv = torch.linalg.pinv(V @ V.transpose(-1, -2))   # (H, H); diag -> 1/||V_h||^2
         s = phi_c @ V.transpose(-1, -2)                       # (..., H)
         coeffs = s @ gram_pinv                                # (..., H) joint solve, not per-block

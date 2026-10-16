@@ -710,6 +710,7 @@ class VFEModel(nn.Module):
         r"""Whether the transport keeps compact head-block vertex factors: the packed canonical ``block_glk``
         coordinates, or any basis supported on equal head blocks (audit 2026-10-10, item 26)."""
         return (self.group.phi_coordinate_layout == "block_head_row_major"
+                or (len(self.group.irrep_dims) > 1 and self.group.certified_block_local_basis() is not None)
                 or self.group.head_block_generators() is not None)
 
     def _apply_pos_phi(self, phi: torch.Tensor) -> torch.Tensor:
@@ -727,7 +728,7 @@ class VFEModel(nn.Module):
             device=phi.device, dtype=phi.dtype,
         )
         if coords is not None and self.cfg.pos_phi_project_slk:
-            coords = project_phi_to_slk(coords, self.group.generators, self.group.irrep_dims)
+            coords = project_phi_to_slk(coords, self.group, self.group.irrep_dims)
         return coords
 
     @staticmethod
