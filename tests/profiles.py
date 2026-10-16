@@ -92,6 +92,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'minimal_agent_channel_noise': 1.0,
     'predictive_covariance': 'passthrough',
     'predictive_covariance_floor': 0.0001,
+    'predictive_covariance_floor_mode': 'prior',
     'predictive_covariance_ceiling': None,
     'predictive_covariance_checkpoint': False,
     'predictive_covariance_fp64_escalation': False,
