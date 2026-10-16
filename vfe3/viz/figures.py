@@ -2848,6 +2848,11 @@ def plot_geometry_health(
         {"title": "Gauge-frame spread", "ylabel": "spread", "series": [
             ("gauge_invariant_spread", "frame class-function spread", _CB[3]),
             ("gauge_head_logdet_spread", r"head $\log|\det|$", _CB[4])]},
+        # block_glmc only: the U(1) phase of the head frames and the impropriety of the belief covariance against
+        # the complex structure J (0 = proper); both columns are absent for every other group.
+        {"title": "Complex structure (block_glmc)", "ylabel": "radians / [0, 1)", "series": [
+            ("gauge_head_phase_abs_mean", r"mean $|\arg\det_{\mathbb{C}} U_h|$", _CB[0]),
+            ("belief_circularity_mean", "belief circularity", _CB[3])]},
         {"title": "Gauge-frame magnitude", "ylabel": r"$\|\phi\|$", "series": [
             ("phi_norm_mean", r"mean $\|\phi\|$", _CB[0]),
             ("phi_norm_std", r"std $\|\phi\|$", _CB[5])]},
@@ -2891,7 +2896,9 @@ def plot_geometry_health(
 
 # The metrics.csv columns plot_geometry_health reads (the run finalizer passes exactly these).
 GEOMETRY_HEALTH_COLUMNS = (
-    "gauge_invariant_spread", "gauge_head_logdet_spread", "phi_norm_mean", "phi_norm_std",
+    "gauge_invariant_spread", "gauge_head_logdet_spread",
+    "gauge_head_phase_abs_mean", "belief_circularity_mean",
+    "phi_norm_mean", "phi_norm_std",
     "phi_matrix_norm_p95", "phi_matrix_norm_p99", "phi_matrix_norm_max",
     "pos_phi_matrix_norm_p95", "pos_phi_matrix_norm_max",
     "vertex_cond_median", "vertex_cond_p95", "vertex_cond_p99",
@@ -5648,6 +5655,8 @@ PUB_LABELS: Dict[str, str] = {
     # -- geometry-health dashboard (gauge / SPD / Fisher / guard) --
     "gauge_invariant_spread":  r"frame class-function spread $\mathrm{std}_i\,I(\exp\phi_i)$",
     "phi_norm_mean":           r"gauge-frame norm $\langle\|\phi_i\|\rangle$",
+    "gauge_head_phase_abs_mean": r"head frame phase $\langle|\arg\det_{\mathbb{C}}U_h|\rangle$",
+    "belief_circularity_mean": r"belief circularity $\langle s_{\max}(R^{-1/2}PR^{-1/2})\rangle$",
     "belief_cond_p95":         r"belief conditioning $\kappa_{95}(\Sigma)$",
     "eff_rank_median":         r"belief effective rank $\mathrm{med}_i\,\mathrm{erank}(\Sigma_i)$",
     "fisher_trace_median":     r"Half Fisher trace $\mathrm{med}_i\mathrm{tr}(I_{\mu,i})/2$",

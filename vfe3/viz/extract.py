@@ -868,9 +868,16 @@ def projected_gauge_equivariance(
             base["self_coupling"] = base_self_coupling
         worst: Dict[str, float] = {}
         for _ in range(int(n_draws)):
+            local = model.group.certified_block_local_basis()                  # (m, d, d) or None
             if model.group.name == "block_glk" and model.group.tying == "per_head":
                 A = torch.randn(1, n, H, d, d, generator=generator, dtype=torch.float64)
                 g = torch.linalg.matrix_exp(float(scale) * A).to(mu.device)    # (1, N, H, d, d)
+            elif local is not None and H > 1:
+                # Block-local group (block_so / block_co / block_glmc): per-head g_h = exp(s a_h . L) from its
+                # (m, d, d) local basis, without building the dense (H m, K, K) generators.
+                a = torch.randn(1, n, H, local.shape[0], generator=generator, dtype=torch.float64)
+                g = torch.linalg.matrix_exp(
+                    float(scale) * torch.einsum("...hm,mij->...hij", a, local.to(torch.float64))).to(mu.device)
             else:
                 # Draw from the selected group, g_i = exp(s a_i . T) with a_i standard normal over
                 # its generators T (shared tying: one element acting in every block; untied so_n:
