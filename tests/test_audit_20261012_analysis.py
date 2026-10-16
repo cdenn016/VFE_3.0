@@ -42,6 +42,8 @@ _CONDITIONAL_COLUMNS = {
     "phi_chart_projected_fraction": "phi_mstep_max_matrix_norm is None",
     "phi_chart_projection_scale_min": "phi_mstep_max_matrix_norm is None",
     "phi_chart_projection_ms": "phi_mstep_max_matrix_norm is None",
+    "gauge_head_phase_abs_mean": "gauge_group != 'block_glmc'",
+    "belief_circularity_mean": "gauge_group != 'block_glmc'",
 }
 # The multi-seed scalars that come from research.json (vfe3.posthoc), not from summary.json.
 _RESEARCH_SCALARS = {"ece", "overall_ce", "sigma_trace_cv", "sigma_ce_spearman", "fd_gradient_worst_rel_error",
