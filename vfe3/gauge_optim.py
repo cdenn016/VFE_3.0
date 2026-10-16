@@ -277,7 +277,7 @@ def _dense_group_element(
 ) -> torch.Tensor:                           # (..., K, K)
     r"""A dense group element, assembling direct-sum blocks when the per-block direction reported them.
 
-    A group whose basis is not the elementary block basis (block_so, block_co, block_glmc) is staged densely
+    A group whose basis is not the elementary block basis (block_so, block_co, block_sl, block_borel, block_unipotent, block_glmc) is staged densely
     while its per-block direction reports :math:`\exp(\varphi)` as blocks (audit 2026-10-07, F47).
     """
     if element.shape[-1] == K and element.shape[-2] == K:
@@ -1113,10 +1113,12 @@ def project_phi_parameter_rows_(
 
 
 # Groups whose head-block algebra the spread projection maps into itself: gl(d) on every head
-# (block_glk, per-head or shared) and the realified gl(m, C) (block_glmc), where the clamp is a
-# functional calculus of the realified Hermitian part and so stays realified. Frames of the inert
-# groups are orthogonal or conformal on every head (S_0 = 0), so cond_2 = 1 and nothing is projected.
-FRAME_CONDITION_GROUPS:       Tuple[str, ...] = ("block_glk", "block_glmc")
+# (block_glk, per-head or shared), sl(d) (block_sl, since the change S_0' - S_0 is traceless), and the
+# realified gl(m, C) (block_glmc), where the clamp is a functional calculus of the realified Hermitian
+# part and so stays realified. Frames of the inert groups are orthogonal or conformal on every head
+# (S_0 = 0), so cond_2 = 1 and nothing is projected. b+(d) and n+(d) (block_borel, block_unipotent) are
+# not closed under the symmetric projection, so the bound refuses them.
+FRAME_CONDITION_GROUPS:       Tuple[str, ...] = ("block_glk", "block_glmc", "block_sl")
 FRAME_CONDITION_INERT_GROUPS: Tuple[str, ...] = ("block_so", "block_co", "so_n", "su_n")
 _SPREAD_BISECTION_STEPS = 64
 

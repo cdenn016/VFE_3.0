@@ -23,8 +23,8 @@ import torch
 
 from vfe3.geometry.generators import generate_sun_real
 from vfe3.geometry.generators import (
-    generate_block_local, generate_glk_multihead, generate_son, local_basis_co, local_basis_glc,
-    local_basis_so,
+    generate_block_local, generate_glk_multihead, generate_son, local_basis_borel, local_basis_co,
+    local_basis_glc, local_basis_sl, local_basis_so, local_basis_unipotent,
 )
 from vfe3.geometry.irreps import direct_sum_generators
 
@@ -984,6 +984,95 @@ def _build_block_glmc(
         raise ValueError(f"block_glmc needs an even head size d_head = 2m; got d_head={K // n_heads}")
     return _build_block_local("block_glmc", K, n_heads, local_basis_glc(K // n_heads), skew=False,
                               gram_weight=2.0, dtype=dtype, device=device)
+
+
+@register_group(
+    "block_sl",
+    pullback_capability="pullback_per_block",
+    invariant_families=_HEAD_BLOCK_INVARIANT_FAMILIES,
+    traits=GroupTraits(min_head_dim=2),
+)
+def _build_block_sl(
+    K:       int,
+    n_heads: int,
+
+    *,
+    dtype:   torch.dtype                 = torch.float32,
+    device:  'torch.device | str | None' = None,
+) -> GaugeGroup:
+    r"""Volume-preserving frames SL(d)^H: an independent SL(d_head) element on each head block.
+
+    Generators: the off-diagonal :math:`E_{ij}` (row-major), then the Helmert traceless diagonals
+    :math:`\mathrm{diag}(1,\dots,1,-k,0,\dots,0)/\sqrt{k(k+1)}`, k = 1, ..., d - 1, per head (head-major,
+    Frobenius-orthonormal, n_gen = H (d^2 - 1)). Every generator is traceless, so every frame has
+    :math:`\det U_h = 1`: ``pos_phi_project_slk`` and the trace projection are the identity, and the
+    :math:`-c_i\log|\det g_i|` shift of the receiver energy under a gauge move vanishes. This is ``block_glk``
+    without the per-head volume, the third rung of the ladder SO -> CO -> SL -> GL, and RoPE stays inside it.
+    exp is not onto SL(d) (for d = 2, :math:`\mathrm{diag}(-2, -1/2)` is not an exponential), but its image
+    generates the group, and every frame used here is an exponential.
+    """
+    if K % n_heads != 0:
+        raise ValueError(f"K={K} must be divisible by n_heads={n_heads}")
+    return _build_block_local("block_sl", K, n_heads, local_basis_sl(K // n_heads), skew=False,
+                              dtype=dtype, device=device)
+
+
+@register_group(
+    "block_borel",
+    pullback_capability="pullback_per_block",
+    invariant_families=_HEAD_BLOCK_INVARIANT_FAMILIES,
+    traits=GroupTraits(contains_pair_rotations=False),
+)
+def _build_block_borel(
+    K:       int,
+    n_heads: int,
+
+    *,
+    dtype:   torch.dtype                 = torch.float32,
+    device:  'torch.device | str | None' = None,
+) -> GaugeGroup:
+    r"""Upper-triangular frames B+(d)^H: on each head an upper-triangular matrix with positive diagonal.
+
+    Generators :math:`E_{ij}`, :math:`i\le j`, row-major per head (head-major, Frobenius-orthonormal,
+    n_gen = H d(d+1)/2). exp is a diffeomorphism from b+(d) onto the group (positive diagonal). Each frame
+    preserves the coordinate flag :math:`\langle e_1\rangle\subset\langle e_1, e_2\rangle\subset\cdots` of its
+    head, a fixed hierarchical ordering of the channels, and the group acts simply transitively on SPD
+    matrices through the Cholesky factor. By the Iwasawa factorization :math:`GL^+(d) = SO(d)\,B^+(d)`,
+    ``block_so`` and ``block_borel`` together reach the identity component of ``block_glk``. The group
+    contains no rotation, so frame-space RoPE leaves it (the config warns).
+    """
+    if K % n_heads != 0:
+        raise ValueError(f"K={K} must be divisible by n_heads={n_heads}")
+    return _build_block_local("block_borel", K, n_heads, local_basis_borel(K // n_heads), skew=False,
+                              dtype=dtype, device=device)
+
+
+@register_group(
+    "block_unipotent",
+    pullback_capability="pullback_per_block",
+    invariant_families=_HEAD_BLOCK_INVARIANT_FAMILIES,
+    traits=GroupTraits(min_head_dim=2, contains_pair_rotations=False),
+)
+def _build_block_unipotent(
+    K:       int,
+    n_heads: int,
+
+    *,
+    dtype:   torch.dtype                 = torch.float32,
+    device:  'torch.device | str | None' = None,
+) -> GaugeGroup:
+    r"""Unipotent frames N+(d)^H: on each head an upper-triangular matrix with unit diagonal.
+
+    Generators :math:`E_{ij}`, :math:`i<j`, row-major per head (head-major, Frobenius-orthonormal,
+    n_gen = H d(d-1)/2). The algebra is nilpotent, so :math:`e^X = \sum_{k<d} X^k/k!` is a polynomial,
+    exp is a diffeomorphism onto N+(d), and :math:`\det U_h = 1`. A frame adds to channel i a combination of
+    the later channels j > i and never the reverse, a strict hierarchy; d = 3 is the Heisenberg group. It is
+    the derived subgroup of ``block_borel`` and contains no rotation, so frame-space RoPE leaves it.
+    """
+    if K % n_heads != 0:
+        raise ValueError(f"K={K} must be divisible by n_heads={n_heads}")
+    return _build_block_local("block_unipotent", K, n_heads, local_basis_unipotent(K // n_heads),
+                              skew=False, dtype=dtype, device=device)
 
 
 def generator_fingerprint(

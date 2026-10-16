@@ -254,8 +254,8 @@ class VFE3Config:
     # "gaussian_diagonal" | "gaussian_full" | "gaussian_block"
     # The belief covariance structure (read diagonal_covariance, never a second flag).
     #   gaussian_block  one SPD d_head x d_head block per head, stored in the dense (K, K) layout. only:
-    #                   projected_predictive, predictive_readout="kernel", equal head blocks (block_glk, block_so,
-    #                   block_co, block_glmc or an equal-block so_n tower; any tying), content_link_edges
+    #                   projected_predictive, predictive_readout="kernel", equal head blocks (block_glk, any
+    #                   block_* group or an equal-block so_n tower; any tying), content_link_edges
     #                   "off", decode_mode "linear" | "diagonal_chunked" | "full_chunked"; a block MLP covariance
     #                   is read through its head-block projection (posterior needs block_mlp_inference="mean_field")
     family:                           str             = "gaussian_diagonal"
@@ -350,12 +350,16 @@ class VFE3Config:
     #   6. Gauge group
     ##################################################
 
-    # "block_glk" | "so_n" | "su_n" | "block_so" | "block_co" | "block_glmc"
+    # "block_glk" | "so_n" | "su_n" | "block_so" | "block_co" | "block_sl" | "block_borel" | "block_unipotent"
+    # | "block_glmc"
     #   block_glk   GL(d_head) per head
     #   so_n        SO(group_n) acting through the irrep blocks of irrep_spec (one block per head)
     #   su_n        SU(group_n) acting through the irrep blocks of irrep_spec (one block per head)
     #   block_so    SO(d_head) per head (rotations)
     #   block_co    CO(d_head) = R+ x SO(d_head) per head (rotation and a positive gain)
+    #   block_sl    SL(d_head) per head (det = 1, so pos_phi_project_slk is the identity)
+    #   block_borel B+(d_head) per head: upper triangular, positive diagonal (no rotations: RoPE leaves it)
+    #   block_unipotent  N+(d_head) per head: upper triangular, unit diagonal (det = 1; no rotations)
     #   block_glmc  GL(m, C) per head realified on d_head = 2m (even); complex coordinate k = pair (2k, 2k+1)
     gauge_group:                      str             = "block_glk"
 
@@ -735,7 +739,8 @@ class VFE3Config:
     # bounded: a learned positional row (pos_phi="learned") by log(kappa_max) / 2, then the token frame by
     # log(kappa_max) minus the realized positional spread (learned or "frozen"), so cond_2(U_i) <= kappa_max
     # (Omega_ij <= kappa_max^2). A frozen positional factor whose spread alone reaches log(kappa_max) is refused
-    # at model construction. block_glk / block_glmc; inert (cond = 1) for block_so, block_co, so_n. None: no bound.
+    # at model construction. block_glk / block_glmc / block_sl; inert (cond = 1) for block_so, block_co, so_n,
+    # su_n; refused for block_borel and block_unipotent. None: no bound.
     phi_frame_condition_max:          Optional[float] = None
 
     m_phi_group_trust_radius:        float           = 0.1          # pullback_group / fisher_group only: step bound
@@ -1280,8 +1285,8 @@ class VFE3Config:
             if ("gaussian_block" not in declared_invariant_families(self.gauge_group)
                     or len(set(self.head_dims)) != 1):
                 block_problems.append(f"gauge_group={self.gauge_group!r} with head sizes {self.head_dims} (requires "
-                                      "equal head blocks of a group that preserves them: block_glk, block_so, "
-                                      "block_co, block_glmc or an equal-block so_n tower)")
+                                      "equal head blocks of a group that preserves them: block_glk, any block_* "
+                                      "group or an equal-block so_n tower)")
             if self.content_link_edges != "off":
                 block_problems.append(f"content_link_edges={self.content_link_edges!r} (requires 'off')")
             if self.decode_mode not in ("linear", "diagonal_chunked", "full_chunked"):
@@ -2465,7 +2470,9 @@ class VFE3Config:
         """
         from vfe3.geometry.phi_preconditioner import STRICT_STRUCTURE_BYTES, strict_structure_bytes
         local_algebra = {"block_glk": lambda d: d * d, "block_so": lambda d: d * (d - 1) // 2,
-                         "block_co": lambda d: d * (d - 1) // 2 + 1, "block_glmc": lambda d: d * d // 2}
+                         "block_co": lambda d: d * (d - 1) // 2 + 1, "block_glmc": lambda d: d * d // 2,
+                         "block_sl": lambda d: d * d - 1, "block_borel": lambda d: d * (d + 1) // 2,
+                         "block_unipotent": lambda d: d * (d - 1) // 2}
         if self.gauge_group in ("so_n", "su_n"):
             n_alg = (int(self.group_n) * (int(self.group_n) - 1) // 2 if self.gauge_group == "so_n"
                      else int(self.group_n) ** 2 - 1)
