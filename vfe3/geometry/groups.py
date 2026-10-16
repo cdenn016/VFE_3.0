@@ -21,6 +21,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from vfe3.geometry.generators import generate_sun_real
 from vfe3.geometry.generators import (
     generate_block_local, generate_glk_multihead, generate_son, local_basis_co, local_basis_glc,
     local_basis_so,
@@ -740,15 +741,35 @@ def _build_so_n(
     diagonal, with weight :math:`\|\rho_b(L)\|_F^2` on block b's coordinates, so it is uniform
     only when every block has the same spin.
     """
-    if tying not in GAUGE_TYINGS:
-        raise ValueError(f"so_n tying must be one of {GAUGE_TYINGS}, got {tying!r}")
     if group_n is None or irrep_spec is None:
         raise ValueError(
             "gauge_group='so_n' requires group_n (the N of SO(N)) and irrep_spec "
             "([(label, mult), ...], labels 'l<p>'); set both in the config"
         )
-    G_def = generate_son(group_n, dtype=torch.float64)
-    G, dims = direct_sum_generators(G_def, algebra="so", irrep_spec=irrep_spec)
+    return _build_irrep_tower("so_n", "so", generate_son(group_n, dtype=torch.float64), K, irrep_spec,
+                              group_n=group_n, tying=tying, dtype=dtype, device=device)
+
+
+def _build_irrep_tower(
+    name:       str,                                # registered group name ('so_n', 'su_n')
+    algebra:    str,                                # irrep-registry namespace ('so', 'su')
+    G_def:      torch.Tensor,                       # (n_alg, n, n) float64 real defining basis
+    K:          int,
+    irrep_spec: List[Tuple[str, int]],
+
+    *,
+    group_n:    int,
+    tying:      str,
+    dtype:      torch.dtype,
+    device:     'torch.device | str | None',
+) -> GaugeGroup:
+    r"""The direct-sum irrep tower shared by ``so_n`` and ``su_n``: blockdiag_b rho_b(X_a) over ``irrep_spec``,
+    tied (one element in every block) or untied (``tying='per_head'``: block b carries its own copy of the
+    generators, generator-free trivial blocks dropped), with the Frobenius Gram certificate and the float64
+    basis fingerprint."""
+    if tying not in GAUGE_TYINGS:
+        raise ValueError(f"{name} tying must be one of {GAUGE_TYINGS}, got {tying!r}")
+    G, dims = direct_sum_generators(G_def, algebra=algebra, irrep_spec=irrep_spec)
     if sum(dims) != K:
         raise ValueError(
             f"irrep_spec blocks {dims} sum to {sum(dims)} != K={K} (group_n={group_n})"
@@ -759,30 +780,68 @@ def _build_so_n(
         for d in dims:
             block = torch.zeros_like(G)
             block[:, start:start + d, start:start + d] = G[:, start:start + d, start:start + d]
-            if bool(block.abs().amax() > 0):                          # 'l0' blocks carry no generators
+            if bool(block.abs().amax() > 0):                          # trivial blocks carry no generators
                 untied.append(block)
             start += d
         if not untied:
-            raise ValueError("an untied so_n tower needs at least one nontrivial irrep block")
-        G = torch.cat(untied)                                         # (n_blocks' * dim so(N), K, K)
+            raise ValueError(f"an untied {name} tower needs at least one nontrivial irrep block")
+        G = torch.cat(untied)                                         # (n_blocks' * dim g, K, K)
     gram = torch.einsum("aij,bij->ab", G, G)                          # (n_gen, n_gen) float64
     diag = gram.diagonal()
     scale = max(float(diag.abs().max()), 1.0)
     diagonal = float((gram - torch.diag(diag)).abs().max()) <= 1e-12 * scale
     uniform = diagonal and float((diag - diag.mean()).abs().max()) <= 1e-12 * scale
     return GaugeGroup(
-        name="so_n",
+        name=name,
         generators=G.to(dtype).to(device),
         float64_generators=G.to(device),
         irrep_dims=dims,
         skew_symmetric=True,
         irrep_labels=labels,
-        algebra="so",
+        algebra=algebra,
         frobenius_gram_diagonal=diagonal,
         frobenius_gram_uniform=float(diag.mean()) if uniform else None,
         basis_fingerprint=generator_fingerprint(G),
         tying=tying,
     )
+
+
+@register_group(
+    "su_n",
+    invariant_families=_HEAD_BLOCK_INVARIANT_FAMILIES,
+    # No certified strict pullback route yet (fails closed); RoPE's pair rotation is not in rho(SU(N)).
+    traits=GroupTraits(algebra="su", tyings=GAUGE_TYINGS, native_tying="shared",
+                       contains_pair_rotations=False),
+)
+def _build_su_n(
+    K:          int,
+
+    *,
+    group_n:    Optional[int]                   = None,
+    irrep_spec: Optional[List[Tuple[str, int]]] = None,
+    tying:      str                             = "shared",
+    dtype:      torch.dtype                     = torch.float32,
+    device:     'torch.device | str | None'     = None,
+) -> GaugeGroup:
+    r"""SU(N) acting on R^K through a direct sum of real irreps (tied gauge by default; heads = irreps).
+
+    The structure group is SU(N) with N = ``group_n`` >= 3, decoupled from K. Labels 'pq<p>_<q>' name the irrep
+    of highest weight (p, q); built so far are the trivial 'pq0_0' (no generators) and the adjoint 'pq1_1'
+    (real dimension N^2 - 1), :math:`\mathrm{ad}(X_a)_{cb} = f_{abc}` for :math:`X_a = i\lambda_a`. The
+    generators are real and exactly skew (skew_symmetric=True, det = 1), n_gen = N^2 - 1 per tied tower; the
+    first N(N-1)/2 phi coordinates are the so(N) subalgebra. An adjoint-only tower is a representation of
+    PSU(N) = SU(N)/Z_N, since the centre acts trivially on (1, 1). Tying, the Gram certificate and the basis
+    fingerprint behave as for ``so_n`` (:func:`_build_irrep_tower`).
+    """
+    if group_n is None or irrep_spec is None:
+        raise ValueError(
+            "gauge_group='su_n' requires group_n (the N of SU(N), >= 3) and irrep_spec "
+            "([(label, mult), ...], labels 'pq<p>_<q>'); set both in the config"
+        )
+    if group_n < 3:
+        raise ValueError(f"su_n needs group_n >= 3 (SU(2) is so_n with group_n=3), got {group_n}")
+    return _build_irrep_tower("su_n", "su", generate_sun_real(group_n), K, irrep_spec,
+                              group_n=group_n, tying=tying, dtype=dtype, device=device)
 
 
 def _build_block_local(

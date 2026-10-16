@@ -69,6 +69,52 @@ def generate_son(
 
 
 
+def generate_sun(N: int) -> torch.Tensor:
+    r"""su(N) basis :math:`X_a = i\lambda_a` (generalized Gell-Mann). Returns (N^2 - 1, N, N) complex128.
+
+    Order: the N(N-1)/2 antisymmetric :math:`X = E_{jk} - E_{kj}` (j < k, exactly :func:`generate_son`'s
+    :math:`L_{jk}`, so phi carries so(N) as its leading slice), then the symmetric :math:`i(E_{jk} + E_{kj})`
+    (j < k), then the N - 1 diagonal :math:`i\sqrt{2/(l(l+1))}\,\mathrm{diag}(1, \dots, 1, -l, 0, \dots)`. Every
+    element is anti-Hermitian and traceless, :math:`\operatorname{tr}(X_a^\dagger X_b) = 2\delta_{ab}`, and the
+    structure constants are real.
+    """
+    if N < 2:
+        raise ValueError(f"N must be >= 2 for SU(N), got N={N}")
+    basis = [generate_son(N, dtype=torch.float64).to(torch.complex128)]
+    sym = []
+    for j in range(N):
+        for k in range(j + 1, N):
+            X = torch.zeros(N, N, dtype=torch.complex128)
+            X[j, k] = X[k, j] = 1j
+            sym.append(X)
+    diag = []
+    for l in range(1, N):
+        entries = torch.zeros(N, dtype=torch.complex128)
+        entries[:l] = 1.0
+        entries[l] = -float(l)
+        diag.append(1j * (2.0 / (l * (l + 1))) ** 0.5 * torch.diag(entries))
+    return torch.cat([basis[0], torch.stack(sym), torch.stack(diag)])
+
+
+def realify(X: torch.Tensor) -> torch.Tensor:
+    r"""Real form :math:`\begin{pmatrix}A & -B\\ B & A\end{pmatrix}` of :math:`X = A + iB`, (..., n, n) -> (..., 2n, 2n).
+
+    A Lie-algebra homomorphism :math:`\mathfrak{gl}(n, \mathbb{C}) \to \mathfrak{gl}(2n, \mathbb{R})`; an
+    anti-Hermitian X maps to a skew matrix.
+    """
+    A, B = X.real, X.imag
+    return torch.cat([torch.cat([A, -B], dim=-1), torch.cat([B, A], dim=-1)], dim=-2)
+
+
+def generate_sun_real(N: int) -> torch.Tensor:
+    r"""The realified su(N) basis :func:`realify` (:func:`generate_sun`), (N^2 - 1, 2N, 2N) float64, skew.
+
+    A faithful real representation, so the real structure-constant solve and the irrep registry run on it
+    exactly as on so(N).
+    """
+    return realify(generate_sun(N)).to(torch.float64)
+
+
 # ---------------------------------------------------------------- block-local bases
 #
 # A block-local group acts on each head's d-dimensional block by its own element of one local

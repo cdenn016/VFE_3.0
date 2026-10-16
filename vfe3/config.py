@@ -350,18 +350,19 @@ class VFE3Config:
     #   6. Gauge group
     ##################################################
 
-    # "block_glk" | "so_n" | "block_so" | "block_co" | "block_glmc"
+    # "block_glk" | "so_n" | "su_n" | "block_so" | "block_co" | "block_glmc"
     #   block_glk   GL(d_head) per head
     #   so_n        SO(group_n) acting through the irrep blocks of irrep_spec (one block per head)
+    #   su_n        SU(group_n) acting through the irrep blocks of irrep_spec (one block per head)
     #   block_so    SO(d_head) per head (rotations)
     #   block_co    CO(d_head) = R+ x SO(d_head) per head (rotation and a positive gain)
     #   block_glmc  GL(m, C) per head realified on d_head = 2m (even); complex coordinate k = pair (2k, 2k+1)
     gauge_group:                      str             = "block_glk"
 
     # None | "per_head" | "shared"
-    #   None      the group's native tying (block_glk "per_head", so_n "shared")
+    #   None      the group's native tying (block_glk "per_head", so_n and su_n "shared")
     #   per_head  an independent group element per head
-    #   shared    one element acting on every head. only: block_glk, so_n. block_glk "shared" refuses
+    #   shared    one element acting on every head. only: block_glk, so_n, su_n. block_glk "shared" refuses
     #             pullback_group, fisher_group and group_log; so_n "per_head" refuses
     #             use_cg_coupling
     gauge_tying:                      Optional[str]   = None
@@ -373,10 +374,13 @@ class VFE3Config:
     #   frozen  a random fixed frame: keeps phi_scale, coerces m_phi_lr=0 (same parameter count as "on")
     gauge_transport:                  str             = "on"
 
-    # so_n only (None for every other group). group_n is the N of SO(N), an int >= 2, decoupled from K.
-    # irrep_spec: [(label, mult), ...] | "random". Labels: "l<p>" symmetric-traceless rank p (N=3: spin
-    # p, dim 2p+1), "w<p>" exterior power, "wp<m>" / "wm<m>" self-dual / anti-self-dual halves at
-    # m = N/2 even. Blocks are laid out in order, one per head, and their dims must sum to embed_dim.
+    # so_n and su_n only (None for every other group). group_n is the N of SO(N) (int >= 2) or SU(N)
+    # (int >= 3), decoupled from K. irrep_spec: [(label, mult), ...] | "random" (so_n only).
+    # so_n labels: "l<p>" symmetric-traceless rank p (N=3: spin p, dim 2p+1), "w<p>" exterior power,
+    # "wp<m>" / "wm<m>" self-dual / anti-self-dual halves at m = N/2 even.
+    # su_n labels: "pq<p>_<q>" (p >= q), built so far "pq0_0" (trivial, dim 1) and "pq1_1" (adjoint,
+    # dim N^2 - 1); an adjoint-only tower is PSU(N). su_n refuses use_cg_coupling for now.
+    # Blocks are laid out in order, one per head, and their dims must sum to embed_dim.
     # "random" draws exactly n_heads irreps summing to embed_dim (ranks in [irrep_min_rank,
     # irrep_max_rank], None = all that fit) with irrep_spec_seed, and the saved config keeps the drawn list.
     # JSON list-of-lists pairs are accepted and coerced to tuples.
@@ -1159,6 +1163,10 @@ class VFE3Config:
                 raise ValueError(f"group_n must be an int >= 2, got {self.group_n!r}")
             from vfe3.geometry.irreps import check_irrep_constructible, irrep_dim
             if isinstance(self.irrep_spec, str):
+                if self.irrep_spec == "random" and _traits.algebra != "so":
+                    raise ValueError(
+                        f"irrep_spec='random' draws so(N) towers only; gauge_group={self.gauge_group!r} needs an "
+                        "explicit [(label, mult), ...] list")
                 if self.irrep_spec != "random":
                     raise ValueError(f"irrep_spec must be a list of (label, mult) pairs or 'random', "
                                      f"got {self.irrep_spec!r}")
@@ -1208,6 +1216,10 @@ class VFE3Config:
                 f"group_n/irrep_spec are consumed only by irrep-tower groups (e.g. 'so_n'); got "
                 f"gauge_group={self.gauge_group!r}"
             )
+        if self.use_cg_coupling and _traits.algebra == "su":
+            raise ValueError(
+                "use_cg_coupling is not built for su_n yet (its Clebsch-Gordan defining representation awaits "
+                "the su_n M2 buildout); use so_n or set use_cg_coupling=False")
         if self.use_cg_coupling and not _tower:
             raise ValueError(
                 f"use_cg_coupling requires an irrep-labeled tower group (e.g. 'so_n'); got "
@@ -2457,8 +2469,9 @@ class VFE3Config:
         from vfe3.geometry.phi_preconditioner import STRICT_STRUCTURE_BYTES, strict_structure_bytes
         local_algebra = {"block_glk": lambda d: d * d, "block_so": lambda d: d * (d - 1) // 2,
                          "block_co": lambda d: d * (d - 1) // 2 + 1, "block_glmc": lambda d: d * d // 2}
-        if self.gauge_group == "so_n":
-            n_alg = int(self.group_n) * (int(self.group_n) - 1) // 2
+        if self.gauge_group in ("so_n", "su_n"):
+            n_alg = (int(self.group_n) * (int(self.group_n) - 1) // 2 if self.gauge_group == "so_n"
+                     else int(self.group_n) ** 2 - 1)
             shapes = ([(n_alg, self.embed_dim)] if self.gauge_tying == "shared"
                       else [(n_alg, d) for d in sorted(set(self.head_dims)) if d > 1])   # 'l0' blocks carry none
         elif self.gauge_group in local_algebra:
