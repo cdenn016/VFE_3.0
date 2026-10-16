@@ -378,8 +378,9 @@ class VFE3Config:
     # (int >= 3), decoupled from K. irrep_spec: [(label, mult), ...] | "random" (so_n only).
     # so_n labels: "l<p>" symmetric-traceless rank p (N=3: spin p, dim 2p+1), "w<p>" exterior power,
     # "wp<m>" / "wm<m>" self-dual / anti-self-dual halves at m = N/2 even.
-    # su_n labels: "pq<p>_<q>" (p >= q), built so far "pq0_0" (trivial, dim 1) and "pq1_1" (adjoint,
-    # dim N^2 - 1); an adjoint-only tower is PSU(N). su_n refuses use_cg_coupling for now.
+    # su_n labels: "pq<p>_<q>" (p >= q >= 0, p + q <= 6): highest weight (p, q). Real dimension D for p = q
+    # (real type) and 2D for p != q (complex type, realified), D = C(p+N-1, p) C(q+N-1, q) - C(p+N-2, p-1)
+    # C(q+N-2, q-1); e.g. SU(3): pq1_0 6, pq1_1 8 (adjoint), pq2_0 12, pq2_2 27. pq1_1-only towers are PSU(N).
     # Blocks are laid out in order, one per head, and their dims must sum to embed_dim.
     # "random" draws exactly n_heads irreps summing to embed_dim (ranks in [irrep_min_rank,
     # irrep_max_rank], None = all that fit) with irrep_spec_seed, and the saved config keeps the drawn list.
@@ -1216,10 +1217,6 @@ class VFE3Config:
                 f"group_n/irrep_spec are consumed only by irrep-tower groups (e.g. 'so_n'); got "
                 f"gauge_group={self.gauge_group!r}"
             )
-        if self.use_cg_coupling and _traits.algebra == "su":
-            raise ValueError(
-                "use_cg_coupling is not built for su_n yet (its Clebsch-Gordan defining representation awaits "
-                "the su_n M2 buildout); use so_n or set use_cg_coupling=False")
         if self.use_cg_coupling and not _tower:
             raise ValueError(
                 f"use_cg_coupling requires an irrep-labeled tower group (e.g. 'so_n'); got "

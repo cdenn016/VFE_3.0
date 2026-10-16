@@ -126,11 +126,8 @@ def check_irrep_constructible(
     key, p = _parse_label(algebra, label)
     _IRREPS[key][0](N, p)                  # the family's dimension formula refuses an undefined (N, rank)
     if key == "su:pq":
-        if p not in _SU_BUILT:
-            raise ValueError(
-                f"su({N}) irrep {label!r} has a closed-form dimension but no construction yet: su_n builds "
-                f"{sorted('pq%d_%d' % pq for pq in _SU_BUILT)} (the trivial and adjoint blocks); further "
-                f"(p, q) irreps await the su_n M2 buildout")
+        if tuple(p) not in ((0, 0), (1, 1)) and sum(p) >= 2:
+            _guard_cost(N, sum(p))           # the tensor construction works on N^(p+q) x N^(p+q) matrices
         return
     if key in _WEDGE_FAMILIES:
         return                             # direct construction on the p-vector basis: no tensor power
@@ -527,12 +524,9 @@ register_irrep("so:wm",  _wedge_half_dim, _wedge_minus_build)
 # Label 'pq<p>_<q>': the irrep with highest weight p (fundamental) + q (antifundamental), the traceless
 # tensors in Sym^p(C^N) (x) Sym^q(conj C^N). The defining basis is the realified su(N) basis
 # (generators.generate_sun_real), a faithful real representation, so the structure constants are the
-# real f_abc of X_a = i lambda_a. Built so far (su_n M1): the trivial 'pq0_0' and the adjoint 'pq1_1',
-# ad(X_a)_{cb} = f_abc, which is real, skew (the basis is orthonormal under the Killing form) and
-# irreducible over R (real type). Every other (p, q) has a dimension but is refused by
-# check_irrep_constructible until the M2 realification.
-
-_SU_BUILT = ((0, 0), (1, 1))
+# real f_abc of X_a = i lambda_a. The adjoint 'pq1_1' is ad(X_a)_{cb} = f_abc (real, skew, real type). Every
+# other (p, q) is built on the traceless tensors of Sym^p (x) Sym^q (_su_tensor_irrep): realified to real
+# dimension 2D when p != q (complex type), and given a real form of dimension D when p = q (real type).
 
 
 def _su_pq_dim(N: int, pq: Tuple[int, int]) -> int:
@@ -552,9 +546,144 @@ def _su_pq_dim(N: int, pq: Tuple[int, int]) -> int:
     return D if p == q else 2 * D
 
 
+def su_casimir(N: int, p: int, q: int) -> float:
+    r"""Quadratic Casimir :math:`C_2(p,q) = \tfrac12\bigl[(p^2+q^2)\tfrac{N-1}{N} + \tfrac{2pq}{N} + (p+q)(N-1)\bigr]`
+    in the normalization :math:`\sum_a T_a^2` with :math:`T_a = \lambda_a/2`; for :math:`X_a = i\lambda_a` the
+    irrep satisfies :math:`-\sum_a\rho(X_a)^2 = 4C_2 I`. Fundamental: (N^2 - 1)/(2N); adjoint: N."""
+    return 0.5 * ((p * p + q * q) * (N - 1) / N + 2 * p * q / N + (p + q) * (N - 1))
+
+
+def _su_complex_basis(G_def: torch.Tensor) -> torch.Tensor:          # (n_gen, N, N) complex128
+    r"""Undo :func:`vfe3.geometry.generators.realify`: X = A + iB from the realified [[A, -B], [B, A]]."""
+    N = G_def.shape[-1] // 2
+    return torch.complex(G_def[:, :N, :N], G_def[:, N:, :N])
+
+
+def _mixed_leibniz(X: torch.Tensor, p: int, q: int) -> torch.Tensor:   # (N^(p+q), N^(p+q)) complex
+    r"""Action on :math:`(\mathbb{C}^N)^{\otimes p}\otimes(\overline{\mathbb{C}^N})^{\otimes q}`: X on the p
+    fundamental slots, :math:`\bar X` on the q antifundamental slots (Leibniz rule)."""
+    N = X.shape[-1]
+    eye = torch.eye(N, dtype=X.dtype)
+    out = torch.zeros(N ** (p + q), N ** (p + q), dtype=X.dtype)
+    for k in range(p + q):
+        M = torch.eye(1, dtype=X.dtype)
+        for slot in range(p + q):
+            M = torch.kron(M, (X if k < p else X.conj()) if slot == k else eye)
+        out += M
+    return out
+
+
+def _mixed_trace_basis(N: int, p: int, q: int) -> torch.Tensor:      # (N^(p+q), D) float64
+    r"""Real orthonormal basis of the traceless tensors in :math:`\mathrm{Sym}^p\otimes\mathrm{Sym}^q`.
+
+    The monomial bases of the two symmetric powers are real, and so is the fund-antifund contraction of slot 0
+    with slot p (on symmetric tensors every such pair gives the same contraction), so the invariant subspace has
+    a real basis: ordered Gram-Schmidt of the projector off the contraction, as for so(N).
+    """
+    S = torch.kron(_canonical_invariant_basis(N, p, traceless=False),
+                   _canonical_invariant_basis(N, q, traceless=False))     # (N^(p+q), m)
+    if p == 0 or q == 0:
+        return S
+    rest = N ** (p + q - 2)
+    C = torch.zeros(rest, N ** (p + q), dtype=torch.float64)
+    for r in range(rest):
+        digits = []
+        x = r
+        for _ in range(p + q - 2):
+            digits.append(x % N)
+            x //= N
+        digits = digits[::-1]                                         # the p-1 + q-1 untouched slots
+        for i in range(N):
+            idx = [i] + digits[:p - 1] + [i] + digits[p - 1:]
+            flat = 0
+            for v in idx:
+                flat = flat * N + v
+            C[r, flat] = 1.0
+    M = C @ S
+    P = torch.eye(S.shape[1], dtype=torch.float64) - torch.linalg.pinv(M) @ M
+    return S @ _ordered_gram_schmidt(P)
+
+
+def _slot_swap(N: int, p: int) -> torch.Tensor:                        # (N^(2p), N^(2p)) real permutation
+    r"""Permutation exchanging the p fundamental slots with the p antifundamental slots (p = q)."""
+    n = N ** (2 * p)
+    perm = torch.zeros(n, n, dtype=torch.float64)
+    for flat in range(n):
+        digits, x = [], flat
+        for _ in range(2 * p):
+            digits.append(x % N)
+            x //= N
+        digits = digits[::-1]
+        swapped = digits[p:] + digits[:p]
+        target = 0
+        for v in swapped:
+            target = target * N + v
+        perm[target, flat] = 1.0
+    return perm
+
+
+def _su_tensor_irrep(G_def: torch.Tensor, p: int, q: int) -> torch.Tensor:   # (n_gen, d, d) float64
+    r"""su(N) irrep (p, q) in a real orthonormal basis, verified at build time.
+
+    On the traceless tensors W (basis Q, real) the complex images are :math:`\rho_{\mathbb C}(X) = Q^\top L(X) Q`,
+    anti-Hermitian. For p != q (complex type) the real form is the realification, dimension 2D. For p = q (real
+    type) the antilinear :math:`J = P\circ\overline{\,\cdot\,}` (P the slot swap) commutes with the action and
+    squares to 1; in the Q coordinates it is :math:`a \mapsto M\bar a` with :math:`M = Q^\top P Q` a real symmetric
+    involution, so the real subspace is spanned by the +1 eigenvectors of M and i times the -1 eigenvectors, a
+    real orthonormal basis B of dimension D in which :math:`B^\dagger\rho_{\mathbb C}B` is real. Checks (raise): the
+    imaginary residual, skewness, and the Casimir :math:`-\sum_a\rho_a^2 = 4C_2(p,q)I`.
+
+    Built single-threaded: a threaded matmul changes the reduction order and the last bit of the images (seen
+    for (2, 2) at four threads), and the tower fingerprint hashes the bytes.
+    """
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        return _su_tensor_irrep_unthreaded(G_def, p, q)
+    finally:
+        torch.set_num_threads(threads)
+
+
+def _su_tensor_irrep_unthreaded(G_def: torch.Tensor, p: int, q: int) -> torch.Tensor:   # (n_gen, d, d) float64
+    """The body of :func:`_su_tensor_irrep`, run under its single-thread guard."""
+    X = _su_complex_basis(G_def)
+    N = X.shape[-1]
+    Q = _mixed_trace_basis(N, p, q).to(torch.complex128)
+    rho_c = torch.stack([Q.T @ _mixed_leibniz(X[a], p, q) @ Q for a in range(X.shape[0])])
+    if p != q:
+        A, B = rho_c.real, rho_c.imag
+        rho = torch.cat([torch.cat([A, -B], dim=-1), torch.cat([B, A], dim=-1)], dim=-2)
+    else:
+        Mswap = (Q.T @ _slot_swap(N, p).to(torch.complex128) @ Q).real
+        if float((Mswap @ Mswap - torch.eye(Mswap.shape[0], dtype=torch.float64)).abs().max()) > 1e-9:
+            raise RuntimeError(f"su({N}) irrep ({p}, {p}): the slot swap is not an involution on the irrep")
+        eye = torch.eye(Mswap.shape[0], dtype=torch.float64)
+        plus = _ordered_gram_schmidt(0.5 * (eye + Mswap))
+        minus = _ordered_gram_schmidt(0.5 * (eye - Mswap))
+        if plus.shape[1] + minus.shape[1] != Mswap.shape[0]:
+            raise RuntimeError(f"su({N}) irrep ({p}, {p}): the swap eigenspaces do not span the irrep")
+        basis = torch.cat([plus.to(torch.complex128), 1j * minus.to(torch.complex128)], dim=1)
+        rho_full = basis.conj().T @ rho_c @ basis
+        imag = float(rho_full.imag.abs().max())
+        if imag > 1e-9:
+            raise RuntimeError(f"su({N}) irrep ({p}, {p}) real form has imaginary residual {imag:.3e}")
+        rho = rho_full.real
+    skew = float((rho + rho.transpose(-1, -2)).abs().max())
+    if skew > 1e-9:
+        raise RuntimeError(f"su({N}) irrep ({p}, {q}) images are not skew (residual {skew:.3e})")
+    rho = 0.5 * (rho - rho.transpose(-1, -2))                         # exactly skew
+    d = rho.shape[-1]
+    casimir = -(rho @ rho).sum(0)
+    target = 4.0 * su_casimir(N, p, q) * torch.eye(d, dtype=torch.float64)
+    if float((casimir - target).abs().max()) > 1e-8 * max(1.0, float(target.max())):
+        raise RuntimeError(f"su({N}) irrep ({p}, {q}) Casimir differs from 4 C_2 = {4 * su_casimir(N, p, q):.6g}")
+    return rho.contiguous()
+
+
 def _su_pq_build(G_def: torch.Tensor, pq: Tuple[int, int]) -> torch.Tensor:
-    r"""Generator images of the built su(N) irreps on their real orthonormal basis: 'pq0_0' is zero (1 x 1), and
-    'pq1_1' is the adjoint :math:`\mathrm{ad}(X_a)_{cb} = f_{abc}` of the defining basis."""
+    r"""Generator images of the su(N) irrep (p, q) on a real orthonormal basis: 'pq0_0' is zero (1 x 1), 'pq1_1' is
+    the adjoint :math:`\mathrm{ad}(X_a)_{cb} = f_{abc}` of the defining basis (kept from M1, so its fingerprint is
+    unchanged), and every other (p, q) comes from :func:`_su_tensor_irrep`."""
     n_gen = G_def.shape[0]
     if tuple(pq) == (0, 0):
         return torch.zeros(n_gen, 1, 1, dtype=torch.float64)
@@ -572,7 +701,7 @@ def _su_pq_build(G_def: torch.Tensor, pq: Tuple[int, int]) -> torch.Tensor:
         rho = f.transpose(1, 2)                                         # rho[a, c, b] = f[a, b, c]
         # f is totally antisymmetric in this basis; antisymmetrize the rounding so every image is exactly skew.
         return (0.5 * (rho - rho.transpose(1, 2))).contiguous()
-    raise ValueError(f"su irrep ({pq[0]}, {pq[1]}) is not built yet (su_n M1 builds pq0_0 and pq1_1)")
+    return _su_tensor_irrep(G_def, int(pq[0]), int(pq[1]))
 
 
 register_irrep("su:pq", _su_pq_dim, _su_pq_build, arity=2)
