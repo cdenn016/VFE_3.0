@@ -632,7 +632,20 @@ def _su_tensor_irrep(G_def: torch.Tensor, p: int, q: int) -> torch.Tensor:   # (
     involution, so the real subspace is spanned by the +1 eigenvectors of M and i times the -1 eigenvectors, a
     real orthonormal basis B of dimension D in which :math:`B^\dagger\rho_{\mathbb C}B` is real. Checks (raise): the
     imaginary residual, skewness, and the Casimir :math:`-\sum_a\rho_a^2 = 4C_2(p,q)I`.
+
+    Built single-threaded: a threaded matmul changes the reduction order and the last bit of the images (seen
+    for (2, 2) at four threads), and the tower fingerprint hashes the bytes.
     """
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        return _su_tensor_irrep_unthreaded(G_def, p, q)
+    finally:
+        torch.set_num_threads(threads)
+
+
+def _su_tensor_irrep_unthreaded(G_def: torch.Tensor, p: int, q: int) -> torch.Tensor:   # (n_gen, d, d) float64
+    """The body of :func:`_su_tensor_irrep`, run under its single-thread guard."""
     X = _su_complex_basis(G_def)
     N = X.shape[-1]
     Q = _mixed_trace_basis(N, p, q).to(torch.complex128)

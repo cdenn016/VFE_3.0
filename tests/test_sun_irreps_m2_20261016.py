@@ -86,12 +86,16 @@ def test_su4_fundamental_and_size_guard() -> None:
                     embed_dim=2 * irrep_dim(3, algebra="su", label="pq4_3"), n_heads=2)
 
 
-def test_tower_fingerprint_is_deterministic_across_processes() -> None:
-    code = ("import sys; sys.path.insert(0, '.'); from vfe3.geometry.groups import get_group; "
+def test_tower_fingerprint_is_deterministic_across_processes_and_threads() -> None:
+    # The real-type (2, 2) images differed in the last bit at four threads before the build was single-threaded.
+    code = ("import sys, torch; sys.path.insert(0, '.'); torch.set_num_threads({}); "
+            "from vfe3.geometry.groups import get_group; "
             "print(get_group('su_n')(53, group_n=3, irrep_spec=[('pq1_0', 1), ('pq2_2', 1), ('pq2_0', 1), "
-            "('pq1_1', 1)]).basis_fingerprint)")
-    prints = {subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout.strip()
-              for _ in range(2)}
+            "('pq1_1', 1)]).basis_fingerprint, torch.get_num_threads())")
+    outputs = [subprocess.run([sys.executable, "-c", code.format(t)], capture_output=True, text=True,
+                              check=True).stdout.split() for t in (1, 4, 4)]
+    assert [int(threads) for _, threads in outputs] == [1, 4, 4]                # the caller's count is restored
+    prints = {fingerprint for fingerprint, _ in outputs}
     here = get_group("su_n")(53, group_n=3, irrep_spec=[("pq1_0", 1), ("pq2_2", 1), ("pq2_0", 1), ("pq1_1", 1)])
     assert prints == {here.basis_fingerprint}
 
