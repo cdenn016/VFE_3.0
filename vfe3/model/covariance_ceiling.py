@@ -119,7 +119,13 @@ def covariance_ceiling(
     A diagonal layout is clamped elementwise, :math:`\min(\sigma^+, c\sigma_p)`, the same bound for diagonal
     matrices. ``head_dims`` (``gaussian_block``) clamps each diagonal head block against the matching block of the
     anchor and keeps the zero off-head blocks, so the result stays in the head-block family.
+
+    The anchor enters as a constant (detached). Differentiated through, a binding clamp would route the whole
+    upstream gradient of every clamped entry into the token's own prior-variance row at gain :math:`c` while the
+    kernel received none (audit 2026-10-15, finding 1); the clamp bounds the readout and does not train
+    :math:`\Sigma_p`. The floor keeps its live anchor.
     """
+    anchor = anchor.detach()
     if diagonal:
         bound = ceiling * anchor.to(sigma.dtype)
         with torch.no_grad():

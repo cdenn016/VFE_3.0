@@ -98,6 +98,27 @@ def _centered_spread(
 _FP64_ESCALATION_FAILURE = ("the moment-matched covariance update is not positive definite in float64 either (the "
                             "float32 update failed first and was recomputed in float64); no repair applied")
 
+# Tokens of moment-matched covariance updates recomputed in float64, per device, counted on the device
+# (its own counter, separate from the projected source-factor recoveries; audit 2026-10-15, finding 8).
+_COVARIANCE_ESCALATION_COUNTS: Dict[str, torch.Tensor] = {}
+
+
+def _count_covariance_escalation(tokens: int, device: torch.device) -> None:
+    key = str(device)
+    total = torch.full((), tokens, dtype=torch.long, device=device)
+    _COVARIANCE_ESCALATION_COUNTS[key] = (total if key not in _COVARIANCE_ESCALATION_COUNTS
+                                          else _COVARIANCE_ESCALATION_COUNTS[key] + total)
+
+
+def covariance_escalation_elements() -> int:
+    r"""Tokens of moment-matched covariance updates recomputed in float64 since the last reset. Host-syncs."""
+    return int(sum(int(count) for count in _COVARIANCE_ESCALATION_COUNTS.values()))
+
+
+def reset_covariance_escalation_elements() -> None:
+    r"""Zero the per-device covariance-escalation counters."""
+    _COVARIANCE_ESCALATION_COUNTS.clear()
+
 
 def _covariance_positive(
     sigma:    torch.Tensor,   # (..., N, K) diagonal or (..., N, K, K) covariance
@@ -1158,8 +1179,8 @@ class RelationalOperators(nn.Module):
         float32 values are discarded, so backward runs through the float64 recompute there. The diagonal :math:`\mathrm{diag}(U_iC_i^{\mathrm{att}}U_i^\top)` leaves reference
         coordinates through :math:`U_i`, so float32 rounding of :math:`C_i^{\mathrm{att}}` is amplified by about
         :math:`\kappa(U_i)^2`; on ill-conditioned block_glk frames it returned negative variances. The check is one
-        host read per call; every token of a recomputed sequence is counted in the source-recovery counter
-        (``source_recovery_elements``). A float64 failure raises ``ValueError``; nothing is repaired. The ceiling
+        host read per call; every token of a recomputed sequence is counted in its own counter
+        (``covariance_escalation_elements``). A float64 failure raises ``ValueError``; nothing is repaired. The ceiling
         is applied after the check.
 
         Under ``content_link_edges`` the kernel is the same with :math:`M_h \to M_h^{ij} = G_{ij}\Pi_h`:
@@ -1229,7 +1250,7 @@ class RelationalOperators(nn.Module):
                 tuple(edge_links.cast_context(e, torch.float64) for e in extra)) + floor.double()
             if not _covariance_positive(sigma_wide, diagonal):
                 raise ValueError(_FP64_ESCALATION_FAILURE)
-            _count_source_recovery(torch.full((), math.prod(mu.shape[:-1]), dtype=torch.long, device=mu.device))
+            _count_covariance_escalation(math.prod(mu.shape[:-1]), mu.device)
             return sigma_wide.to(sigma_plus.dtype)
         # A frame with its own batch axis is split with the beliefs; a shared (unbatched or size-1) frame broadcasts.
         per_sequence = (frame.forward.dim() >= (5 if frame.block_diagonal else 4)
@@ -1240,7 +1261,7 @@ class RelationalOperators(nn.Module):
             mu[rows].double(), sigma[rows].double(), beta[rows].double(), sub_frame, wide_receive, ())             + floor[rows].double()
         if not _covariance_positive(sigma_wide, diagonal):
             raise ValueError(_FP64_ESCALATION_FAILURE)
-        _count_source_recovery(torch.full((), n_rows * mu.shape[-2], dtype=torch.long, device=mu.device))
+        _count_covariance_escalation(n_rows * mu.shape[-2], mu.device)
         return sigma_plus.index_copy(0, rows, sigma_wide.to(sigma_plus.dtype))
 
     def _kernel_covariance(

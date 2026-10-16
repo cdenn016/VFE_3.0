@@ -129,3 +129,22 @@ def test_config_rejects_a_ceiling_at_or_below_the_floor() -> None:
     with pytest.raises(ValueError, match="predictive_covariance_ceiling"):
         VFE3Config(predictive_covariance_floor=1e-2, predictive_covariance_ceiling=1e-2)
     assert VFE3Config(predictive_covariance_ceiling=100.0).predictive_covariance_ceiling == 100.0
+
+
+@pytest.mark.parametrize("diagonal", [True, False])
+def test_the_anchor_is_a_constant_for_gradients(diagonal: bool) -> None:
+    r"""A binding ceiling does not train Sigma_p (audit 2026-10-15, finding 1): the clamped entries' gradient no
+    longer flows into the anchor, so it cannot pile onto the token's own prior-variance row."""
+    torch.manual_seed(0)
+    if diagonal:
+        sigma = (torch.rand(3, 4, dtype=F64) * 10).requires_grad_(True)
+        anchor = torch.ones(3, 4, dtype=F64, requires_grad=True)
+    else:
+        A = torch.randn(3, 4, 4, dtype=F64)
+        sigma = (5.0 * (A @ A.mT) + torch.eye(4, dtype=F64)).requires_grad_(True)
+        anchor = torch.eye(4, dtype=F64).expand(3, 4, 4).clone().requires_grad_(True)
+    out = cc.covariance_ceiling(sigma, anchor, 2.0, diagonal=diagonal)
+    assert not torch.allclose(out, sigma)                              # the ceiling binds
+    out.sum().backward()
+    assert anchor.grad is None
+    assert sigma.grad is not None and bool(torch.isfinite(sigma.grad).all())
