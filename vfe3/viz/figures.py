@@ -1685,6 +1685,22 @@ _CANONICAL_ROUTER_SERIES: Tuple[Tuple[str, str], ...] = (
 )
 _CANONICAL_FE_NOTE = ("Canonical F at the beliefs each router read (diagnose_canonical_free_energy): a diagnostic. "
                       "No step on this route optimizes it.")
+# The batch the plotted canonical F was evaluated on: the val_* columns of _val_diagnostics (the validation split
+# val_ce is scored on) or, for a run that logged only the log-step columns, the training batch (audit 2026-10-16
+# F83): (title prefix, note sentence).
+_CANONICAL_FE_POPULATIONS: Dict[str, Tuple[str, str]] = {
+    "held_out": ("Held-out", "F on the held-out diagnostic sequences, CE over the validation split."),
+    "training_batch": ("Training-batch", "F on the training batch of each log step, CE over the validation "
+                                         "split: the two come from different data."),
+}
+
+
+def _canonical_fe_population(population: str) -> Tuple[str, str]:
+    r"""``(title prefix, note sentence)`` of a canonical-F population; ValueError for an unknown one."""
+    if population not in _CANONICAL_FE_POPULATIONS:
+        raise ValueError(f"canonical free-energy population must be one of "
+                         f"{sorted(_CANONICAL_FE_POPULATIONS)}, got {population!r}")
+    return _CANONICAL_FE_POPULATIONS[population]
 
 
 def _canonical_router_panel(ax, history: Dict, step: np.ndarray) -> bool:
@@ -1714,6 +1730,7 @@ def plot_canonical_free_energy_relationship(
 
     *,
     lambda_beta: 'float | np.ndarray' = 1.0,
+    population:  str           = "held_out",     # "held_out" | "training_batch" (_CANONICAL_FE_POPULATIONS)
     path:        Optional[str] = None,
 ):
     r"""The canonical free energy at the captured beliefs beside the held-out CE (a diagnostic).
@@ -1724,7 +1741,11 @@ def plot_canonical_free_energy_relationship(
     line under a rolling mean, with their Pearson association in the title. Right, when logged: the total
     variation between the model's router and :math:`\beta^*` (and the canonical self weight). On the
     projected routes nothing optimizes :math:`F`, so the figure makes no E-step or co-descent claim.
+    ``population`` names the batch the :math:`F` columns were evaluated on, in the title and the note: the
+    held-out diagnostic sequences (the ``val_*`` columns) or the training batch of each log step, which
+    pairs the correlation across two populations.
     """
+    title_prefix, population_note = _canonical_fe_population(population)
     step, _comps, total, ce = _fe_terms(history, lambda_beta)
     keep = np.isfinite(total) & np.isfinite(ce)
     router_history = {key: _np(history[key]).astype(float)[keep]
@@ -1750,14 +1771,15 @@ def plot_canonical_free_energy_relationship(
         ln2, = ax2.plot(step, _rolling_mean(ce, w), lw=1.6, color=_CB[1], ls="--", label=clab)
         ax2.set_ylabel("validation CE (nats/token)", color=_CB[1]); ax2.tick_params(axis="y", colors=_CB[1])
         ax2.grid(False)
-        title = "Canonical F (diagnostic) and validation CE"
+        title = f"{title_prefix} canonical F (diagnostic) and validation CE"
         if total.size > 2:
             title += rf" (Pearson $r={float(np.corrcoef(total, ce)[0, 1]):+.2f}$)"
         ax.set_title(title)
         ax.legend([ln1, ln2], [ln1.get_label(), ln2.get_label()], loc="upper right", frameon=False)
         if has_router:
             _canonical_router_panel(axes[0][1], router_history, step)
-        fig.text(0.01, 0.005, _CANONICAL_FE_NOTE, fontsize=6, color="#444444", ha="left", va="bottom")
+        fig.text(0.01, 0.005, f"{_CANONICAL_FE_NOTE} {population_note}", fontsize=6, color="#444444",
+                 ha="left", va="bottom")
         fig.tight_layout(rect=(0.0, 0.05, 1.0, 1.0))
         return _save(fig, path)
 
@@ -1769,6 +1791,7 @@ def plot_canonical_free_energy_decomposition(
 
     *,
     lambda_beta: 'float | np.ndarray' = 1.0,
+    population:  str           = "held_out",     # "held_out" | "training_batch" (_CANONICAL_FE_POPULATIONS)
     path:        Optional[str] = None,
 ):
     r"""Terms of the canonical free energy at the captured beliefs, at the last evaluation and by training third.
@@ -1780,8 +1803,10 @@ def plot_canonical_free_energy_decomposition(
     Panel B: the same terms as medians over the early, mid and late thirds of training. Panel C, when
     logged: the total variation between the model's router and :math:`\beta^*` (and the canonical self
     weight). The axes are logarithmic when every drawn value is positive. A diagnostic: nothing on the
-    projected routes optimizes :math:`F`.
+    projected routes optimizes :math:`F`. ``population`` names, in the note, the batch the terms were evaluated
+    on (the held-out diagnostic sequences or the training batch of each log step).
     """
+    _title_prefix, population_note = _canonical_fe_population(population)
     step, comps, _total, _ce = _fe_terms(history, lambda_beta)
     names = [_CANONICAL_FE_LABELS[k][1] for k, _ in comps]
     labels = [_CANONICAL_FE_LABELS[k][0] for k, _ in comps]
@@ -1828,7 +1853,8 @@ def plot_canonical_free_energy_decomposition(
         axes[1].legend(frameon=False, loc="best")
         if has_router:
             _canonical_router_panel(axes[2], history, step)
-        fig.text(0.01, 0.005, _CANONICAL_FE_NOTE, fontsize=6, color="#444444", ha="left", va="bottom")
+        fig.text(0.01, 0.005, f"{_CANONICAL_FE_NOTE} {population_note}", fontsize=6, color="#444444",
+                 ha="left", va="bottom")
         fig.tight_layout(rect=(0.0, 0.05, 1.0, 1.0))
         return _save(fig, path)
 
@@ -3025,6 +3051,13 @@ def plot_validation_sanity(
         {"title": "Held-out frame norm", "ylabel": r"$\|\phi\|$", "series": [
             ("val_phi_norm_mean", r"mean $\|\phi\|$", _CB[0]),
             ("val_phi_norm_std", r"std $\|\phi\|$", _CB[5])]},
+        # The held-out counterparts of geometry_health's chart-radius and vertex panels (audit 2026-10-16 F83).
+        {"title": "Held-out phi chart radius", "ylabel": r"$\|\phi^a G_a\|_F$", "logy": True, "series": [
+            ("val_phi_matrix_norm_p95", "p95", _CB[0]),
+            ("val_phi_matrix_norm_p99", "p99", _CB[1]),
+            ("val_phi_matrix_norm_max", "max", _CB[3])]},
+        {"title": "Held-out vertex conditioning", "ylabel": r"$\kappa(\exp\phi)$", "logy": True,
+         "series": [("val_vertex_cond_p99", "p99", _CB[3])]},
     ]
     return _history_dashboard(history, panels, "Held-out validation sanity", path, ncols=3)
 
@@ -3036,7 +3069,8 @@ VALIDATION_SANITY_COLUMNS = (
     "val_gauge_invariant_spread",
     "val_belief_cond_p95", "val_fisher_trace_mean", "val_guard_sigma_floor_frac",
     "val_guard_sigma_ceil_frac",
-    "val_phi_norm_mean", "val_phi_norm_std")
+    "val_phi_norm_mean", "val_phi_norm_std",
+    "val_phi_matrix_norm_p95", "val_phi_matrix_norm_p99", "val_phi_matrix_norm_max", "val_vertex_cond_p99")
 
 
 @register_figure("optimizer_geometry")

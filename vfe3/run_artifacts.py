@@ -5597,32 +5597,51 @@ def _save_figures(
         # Free-energy figures: the per-token budget decomposition (snapshot + early/mid/late evolution)
         # and, separately, the final-iterate objective/CE relationship over training. Both need every plotted term
         # finite, so rows before the first eval (NaN val_*) are dropped.
-        fe_keys = ("self_coupling", "belief_coupling", "attention_entropy", "val_ce")
-        fe_rows = [r for r in artifacts.history
-                   if all(k in r and math.isfinite(r[k]) for k in fe_keys)]
-        if fe_rows:
-            cfg = getattr(artifacts, "cfg", None)
-            hist = {"step": [r.get("step", i) for i, r in enumerate(fe_rows)],
-                    **{k: [r[k] for r in fe_rows] for k in fe_keys}}
-            # Scale the coupling terms by the static config lambda_beta scalar.
-            lam = getattr(cfg, "lambda_beta", 1.0)
-            # On the projected routes these columns are finite only under diagnose_canonical_free_energy, which
+        fe_terms = ("self_coupling", "belief_coupling", "attention_entropy")
+
+        def _finite_rows(keys: tuple) -> List[Dict]:
+            r"""History rows on which every column of ``keys`` is a finite number."""
+            return [r for r in artifacts.history
+                    if all(k in r and isinstance(r[k], (int, float)) and math.isfinite(r[k]) for k in keys)]
+
+        def _canonical_rows(rows: List[Dict]) -> bool:
+            # On the projected routes the F columns are finite only under diagnose_canonical_free_energy, which
             # writes canonical_beta_tv beside them (relational_* columns mark the route): the canonical F at the
             # captured beliefs, which nothing there optimizes. Its figures carry no E-step or co-descent reading
             # and plot the self-divergence apart from R(alpha) (audit 2026-10-10 round 2, #17).
-            canonical_fe = any("canonical_beta_tv" in r or "relational_legacy_global_f_available" in r
-                               for r in fe_rows)
-            if canonical_fe:
+            return any("canonical_beta_tv" in r or "relational_legacy_global_f_available" in r for r in rows)
+
+        fe_rows = _finite_rows(fe_terms + ("val_ce",))
+        held_out_rows = _finite_rows(tuple(f"val_{k}" for k in fe_terms) + ("val_ce",))
+        # The canonical figures correlate F with val_ce, so they read the held-out val_* F columns of the same
+        # evaluation rows when the run logged them (the validation split val_ce is scored on), and otherwise the
+        # log step's training-batch columns, naming the population either way (audit 2026-10-16 F83).
+        if held_out_rows and _canonical_rows(held_out_rows):
+            population, rows, prefix = "held_out", held_out_rows, "val_"
+        elif fe_rows and _canonical_rows(fe_rows):
+            population, rows, prefix = "training_batch", fe_rows, ""
+        else:
+            population, rows, prefix = None, fe_rows, ""
+        if rows:
+            cfg = getattr(artifacts, "cfg", None)
+            hist = {"step": [r.get("step", i) for i, r in enumerate(rows)],
+                    **{k: [r[prefix + k] for r in rows] for k in fe_terms},
+                    "val_ce": [r["val_ce"] for r in rows]}
+            # Scale the coupling terms by the static config lambda_beta scalar.
+            lam = getattr(cfg, "lambda_beta", 1.0)
+            if population is not None:
                 for key in ("self_divergence",) + tuple(k for k, _ in raw_figs._CANONICAL_ROUTER_SERIES):
-                    column = [float(r[key]) if isinstance(r.get(key), (int, float)) else float("nan")
-                              for r in fe_rows]
+                    column = [float(r[prefix + key]) if isinstance(r.get(prefix + key), (int, float))
+                              else float("nan") for r in rows]
                     if any(math.isfinite(v) for v in column):
                         hist[key] = column
                 fig = figs.plot_canonical_free_energy_decomposition(
-                    hist, lambda_beta=lam, path=str(run / "canonical_free_energy_decomposition.png"))
+                    hist, lambda_beta=lam, population=population,
+                    path=str(run / "canonical_free_energy_decomposition.png"))
                 figs.plt.close(fig)
                 fig = figs.plot_canonical_free_energy_relationship(
-                    hist, lambda_beta=lam, path=str(run / "canonical_free_energy_relationship.png"))
+                    hist, lambda_beta=lam, population=population,
+                    path=str(run / "canonical_free_energy_relationship.png"))
                 figs.plt.close(fig)
             else:
                 fig = figs.plot_free_energy_decomposition(
@@ -5654,9 +5673,7 @@ def _save_figures(
             figs.plt.close(fig)
         # Held-out validation-sanity dashboard: the per-eval probes (_val_diagnostics) that were CSV-only
         # -- generalization gap, positional loss, causal/attention sanity, and the held-out geometry.
-        hist_val = _hist_subset(raw_figs.VALIDATION_SANITY_COLUMNS + (
-            "val_phi_matrix_norm_p95", "val_phi_matrix_norm_p99", "val_phi_matrix_norm_max",
-            "val_vertex_cond_p99"))
+        hist_val = _hist_subset(raw_figs.VALIDATION_SANITY_COLUMNS)
         if hist_val:
             fig = figs.plot_validation_sanity(
                 hist_val,

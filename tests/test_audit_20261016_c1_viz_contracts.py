@@ -154,3 +154,79 @@ def test_readout_diagnostics_keeps_no_canonical_panel_without_the_diagnostic(
     ra._save_figures(SimpleNamespace(run_dir=tmp_path, cfg=None, history=history), None, LOGGER)
     assert "Canonical F at the captured beliefs (diagnostic)" not in captured["titles"]
     assert "total" not in captured["history"]
+
+
+# ------------------------------------------------------------------------------------------------ F83
+
+def _canonical_spies(monkeypatch: pytest.MonkeyPatch) -> Dict[str, Dict[str, Any]]:
+    calls: Dict[str, Dict[str, Any]] = {}
+    for name in ("plot_canonical_free_energy_relationship", "plot_canonical_free_energy_decomposition"):
+        def fake(history: Dict, *, _name: str = name, **kwargs: Any) -> Any:
+            calls[_name] = {"history": history, **kwargs}
+            Path(kwargs["path"]).write_bytes(b"png")
+            return figs.plt.figure()
+        monkeypatch.setattr(figs, name, fake)
+    return calls
+
+
+def test_canonical_figures_read_the_held_out_free_energy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _canonical_spies(monkeypatch)
+    history = [_canonical_row(index, eval_row=index % 2 == 1) for index in range(6)]
+    ra._save_figures(SimpleNamespace(run_dir=tmp_path, cfg=None, history=history), None, LOGGER)
+    evals = [row for row in history if row["val_ce"] == row["val_ce"]]
+    assert sorted(calls) == ["plot_canonical_free_energy_decomposition", "plot_canonical_free_energy_relationship"]
+    for call in calls.values():
+        assert call["population"] == "held_out"
+        hist = call["history"]
+        assert list(hist["step"]) == [row["step"] for row in evals]
+        assert list(hist["val_ce"]) == [row["val_ce"] for row in evals]
+        for key in ("self_coupling", "belief_coupling", "attention_entropy", "self_divergence",
+                    "canonical_beta_tv", "canonical_self_weight"):
+            assert list(hist[key]) == [row[f"val_{key}"] for row in evals], key
+
+
+def test_canonical_figures_fall_back_to_the_training_batch_and_say_so(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _canonical_spies(monkeypatch)
+    history = [_canonical_row(index, held_out=False) for index in range(4)]
+    ra._save_figures(SimpleNamespace(run_dir=tmp_path, cfg=None, history=history), None, LOGGER)
+    for call in calls.values():
+        assert call["population"] == "training_batch"
+        assert list(call["history"]["self_coupling"]) == [row["self_coupling"] for row in history]
+
+
+def _canonical_history(n: int = 12) -> Dict[str, np.ndarray]:
+    return {"step": np.arange(n, dtype=float) * 100.0,
+            "self_coupling": 24.0 + 0.1 * np.arange(n), "self_divergence": 6.0 + 0.05 * np.arange(n),
+            "belief_coupling": 3.0 - 0.1 * np.arange(n) / n, "attention_entropy": 1.0 + 0.01 * np.arange(n),
+            "val_ce": 5.0 - 0.1 * np.arange(n), "canonical_beta_tv": np.linspace(0.6, 0.4, n)}
+
+
+@pytest.mark.parametrize("population, phrase", [("held_out", "held-out diagnostic sequences"),
+                                                 ("training_batch", "training batch of each log step")])
+def test_canonical_figures_name_their_population(population: str, phrase: str) -> None:
+    for build in (figs.plot_canonical_free_energy_relationship, figs.plot_canonical_free_energy_decomposition):
+        fig = build(_canonical_history(), lambda_beta=1.0, population=population)
+        assert phrase in _texts(fig), build.__name__
+        figs.plt.close(fig)
+    fig = figs.plot_canonical_free_energy_relationship(_canonical_history(), population=population)
+    title = fig.axes[0].get_title()
+    assert title.startswith("Held-out canonical F" if population == "held_out" else "Training-batch canonical F")
+    figs.plt.close(fig)
+
+
+def test_canonical_figures_refuse_an_unknown_population() -> None:
+    with pytest.raises(ValueError, match="population"):
+        figs.plot_canonical_free_energy_relationship(_canonical_history(), population="test")
+
+
+def test_validation_sanity_draws_the_held_out_chart_radius_and_vertex_conditioning() -> None:
+    keys = ("val_phi_matrix_norm_p95", "val_phi_matrix_norm_p99", "val_phi_matrix_norm_max", "val_vertex_cond_p99")
+    for key in keys:
+        assert key in figs.VALIDATION_SANITY_COLUMNS, key
+    history = {"step": np.arange(4, dtype=float) * 10.0,
+               **{key: np.linspace(1.0, 2.0, 4) * (index + 1) for index, key in enumerate(keys)}}
+    fig = figs.plot_validation_sanity(history)
+    titles = _titles(fig)
+    assert "Held-out phi chart radius" in titles and "Held-out vertex conditioning" in titles
+    figs.plt.close(fig)
