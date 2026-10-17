@@ -822,7 +822,8 @@ def _strict_cholesky(
     (formed in float64, then rounded to the working dtype) and factor it by shifted CholeskyQR3 in
     the working dtype, whose factor C satisfies C C^T = (X + dX)(X + dX)^T with
     ||dX|| <= c eps ||X|| for kappa_2(X) up to about 1/(u sqrt(11 (m r + r (r + 1)))) (Fukaya et al. 2020;
-    see :func:`vfe3.numerics.cholesky_qr2`); the factor tensor stays in the working dtype. No jitter, covariance floor, or projection constraint is introduced.
+    see :func:`vfe3.numerics.cholesky_qr2`); the factor tensor stays in the working dtype. No jitter,
+    covariance floor, or projection constraint is introduced.
 
     ``factored`` marks a ``prepared`` factor from :func:`_factor_status` (CholeskyQR2 of the source
     root); its healthy entries keep their prepared factor bitwise. Without the certificate
