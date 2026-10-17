@@ -131,6 +131,10 @@ def test_factor_tolerance_moves_the_certificate(device: torch.device, monkeypatc
 
 # -- recovery precision -----------------------------------------------------------------------------
 
+# Relative tolerance of a float32 recovery against the float64 reference (see the bound in the test below).
+_RECOVERY_RTOL: float = 3e-4
+
+
 @pytest.mark.parametrize("role", ["q", "k"])
 @pytest.mark.parametrize("full", [False, True])
 def test_fp32_recovery_stays_in_the_working_dtype(device: torch.device, role: str, full: bool) -> None:
@@ -146,8 +150,11 @@ def test_fp32_recovery_stays_in_the_working_dtype(device: torch.device, role: st
     assert score.dtype == torch.float32
     # Only the per-entry source root is formed in float64; no float64 QR or pair tiles run.
     assert "linalg_qr" not in ops.names and "linalg_solve_triangular" not in ops.float64
-    # Measured: <= 6.2e-6 relative to |reference| + 1.
-    torch.testing.assert_close(score.double(), reference, rtol=5e-5, atol=5e-5)
+    # The relative KL error is bounded by the whitened error ||Z Z^T - I||, Z = C^{-1} X, of the recovered
+    # factor, O(u kappa(X)) with kappa(X) = 1e4 (4.8e-4 for this fixture). Measured: 1.0e-4 for role k under
+    # the shift of Fukaya et al. eq. (67) (audit 2026-10-16 F42), 6.2e-6 under the former larger shift; the
+    # whitened errors of the two shifts agree in distribution, so the difference is rounding.
+    torch.testing.assert_close(score.double(), reference, rtol=_RECOVERY_RTOL, atol=5e-5)
     score.sum().backward()
     assert torch.isfinite(S.grad).all()
 
@@ -176,7 +183,7 @@ def test_fp32_recovery_keeps_the_factor_route_factor(device: torch.device) -> No
     with ops:
         score = projected_gaussian_kl(aq, Gq, ak, Gk, projection_q=source_q, projection_k=source_k)
     assert "linalg_qr" not in ops.names and "linalg_solve_triangular" not in ops.float64
-    torch.testing.assert_close(score.double(), _reference(device, "k", False), rtol=5e-5, atol=5e-5)
+    torch.testing.assert_close(score.double(), _reference(device, "k", False), rtol=_RECOVERY_RTOL, atol=5e-5)
 
 
 # -- moment-matched covariance checkpoint ---------------------------------------------------------

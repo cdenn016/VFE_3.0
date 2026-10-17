@@ -122,7 +122,8 @@ GRAM_CONDITION_TOL: float = 1e-4
 _CONDITION_RECOVERY: bool = False
 
 # Working precision of a source recovery: fp32 on the Gram routes and the uncertified factor route. The flagged
-# factors are rebuilt by float32 shifted CholeskyQR3 of the source root (backward stable for kappa_2(X) <~ 1/eps_32;
+# factors are rebuilt by float32 shifted CholeskyQR3 of the source root (backward stable for kappa_2(X) up to about
+# 1/(u_32 sqrt(11 (m r + r (r + 1)))), O(1/u_32) with a dimension-dependent constant, see numerics.cholesky_qr2;
 # Fukaya et al., SIAM J. Sci. Comput. 42 (2020) A477), the factor stays in the working dtype, and the touched pairs
 # are evaluated by triangular-solve tiles in the working dtype. A call whose float32 retry fails, a float64 input,
 # and every rebuild on the certified factor route (cholesky_qr2_certified, where a float32 rebuild would keep the
@@ -820,8 +821,8 @@ def _strict_cholesky(
     :func:`projected_condition_recovery`, reconstruct the source root X = S U^{-1} Sigma^{1/2}
     (formed in float64, then rounded to the working dtype) and factor it by shifted CholeskyQR3 in
     the working dtype, whose factor C satisfies C C^T = (X + dX)(X + dX)^T with
-    ||dX|| <= c eps ||X|| for kappa_2(X) <~ 1/eps (Fukaya et al. 2020); the factor tensor stays in
-    the working dtype. No jitter, covariance floor, or projection constraint is introduced.
+    ||dX|| <= c eps ||X|| for kappa_2(X) up to about 1/(u sqrt(11 (m r + r (r + 1)))) (Fukaya et al. 2020;
+    see :func:`vfe3.numerics.cholesky_qr2`); the factor tensor stays in the working dtype. No jitter, covariance floor, or projection constraint is introduced.
 
     ``factored`` marks a ``prepared`` factor from :func:`_factor_status` (CholeskyQR2 of the source
     root); its healthy entries keep their prepared factor bitwise. Without the certificate
@@ -905,8 +906,9 @@ def _strict_cholesky(
                 recovered = _source_qr_factor(root)
             elif factored:
                 # Uncertified factor route (or a float64 input, where nothing is flagged): outright
-                # CholeskyQR2 failures retry shifted CholeskyQR3 in the working dtype (valid to
-                # kappa(X) ~ 1/eps), and failed retries take the float64 QR.
+                # CholeskyQR2 failures retry shifted CholeskyQR3 in the working dtype (valid to about
+                # kappa(X) ~ 1/(u sqrt(11 (m r + r (r + 1)))), see cholesky_qr2), and failed retries take the
+                # float64 QR.
                 shifted, shifted_failed = cholesky_qr2(root.to(G.dtype), shift=True)
                 recovered = torch.where(shifted_failed[..., None, None],
                                         torch.zeros((), dtype=root.dtype, device=root.device),
