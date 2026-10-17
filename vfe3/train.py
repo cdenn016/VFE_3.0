@@ -80,6 +80,7 @@ from vfe3.numerics import (                    # non-equivariant / non-PD fallba
     bounded_variance_from_log,
 )
 from vfe3.relational_scoring import (                                # projected float64 source-factor recovery count
+    gemm_fallback_slices, reset_gemm_fallback_slices,                   # ... and pair-KL GEMM fallback slices
     reset_source_recovery_elements, source_recovery_elements)
 from vfe3.geometry.transport import (                           # float64 frame-pair escalation count
     frame_pair_fp64_escalations,
@@ -450,6 +451,11 @@ def build_optimizer(
                 if phi_update_policy.requires_fisher_statistics else None
             ),
             phi_fisher_rotation_weight=cfg.m_phi_fisher_rotation_weight,
+            # The exact Daleckii-Krein route, the eigenbasis group_log fallback and the stabilizer completion are
+            # config fields, read per optimizer (audit 2026-10-16 F37, F40, F50).
+            phi_group_differential_mode=cfg.m_phi_group_differential_mode,
+            phi_group_log_fallback=cfg.m_phi_group_log_fallback,
+            phi_fisher_completion=cfg.m_phi_fisher_completion,
             weight_decay=cfg.weight_decay,
             fused=next(model.parameters()).is_cuda,
         )
@@ -2132,7 +2138,7 @@ RUN_TOTAL_COUNTER_KEYS: Tuple[str, ...] = (
     "nonfinite_tangent_elements", "mu_trust_fallback_elements", "decode_logdet_fallback_elements",
     "frame_pair_fp64_escalations", "public_spd_repair_elements", "public_spd_ceiling_contact_elements",
     "source_recovery_elements", "layernorm_trace_cap_elements", "covariance_ceiling_elements",
-    "covariance_escalation_elements", "matmul_precision_replays")
+    "covariance_escalation_elements", "gemm_fallback_slices", "phi_rejected_rows", "matmul_precision_replays")
 
 
 def _process_counter_values() -> Dict[str, int]:
@@ -2146,7 +2152,8 @@ def _process_counter_values() -> Dict[str, int]:
             "source_recovery_elements": int(source_recovery_elements()),
             "layernorm_trace_cap_elements": int(layernorm_trace_cap_elements()),
             "covariance_ceiling_elements": int(covariance_ceiling_elements()),
-            "covariance_escalation_elements": int(covariance_escalation_elements())}
+            "covariance_escalation_elements": int(covariance_escalation_elements()),
+            "gemm_fallback_slices": int(gemm_fallback_slices())}
 
 
 def _resumed_run_totals(
@@ -2173,10 +2180,18 @@ def _resumed_run_totals(
 def _run_total_counters(
     base:               Mapping[str, int],     # _resumed_run_totals
     precision_replays:  int,                   # whole-run count (already includes its base)
+
+    *,
+    phi_rejected_rows:  int = 0,               # GaugeManifoldAdamW.phi_rejected_rows of this process
 ) -> Dict[str, int]:
-    r"""Whole-run values of ``RUN_TOTAL_COUNTER_KEYS``: the resumed base plus this process's counts."""
+    r"""Whole-run values of ``RUN_TOTAL_COUNTER_KEYS``: the resumed base plus this process's counts.
+
+    The optimizer's rejected pullback-group rows restart at 0 after a resume (the count is not optimizer state),
+    so the whole-run total adds the count the checkpoint carried (audit 2026-10-16 F126).
+    """
     current = _process_counter_values()
     out = {key: int(base[key]) + current[key] for key in current}
+    out["phi_rejected_rows"] = int(base["phi_rejected_rows"]) + int(phi_rejected_rows)
     out["matmul_precision_replays"] = int(precision_replays)
     return out
 
@@ -4712,6 +4727,7 @@ def train(
     reset_mu_trust_fallback_elements()   # ... the mu-trust-region equivariance fallback
     reset_decode_logdet_fallback_elements()   # ... and the decode log-det non-PD fallback
     reset_source_recovery_elements()        # ... and projected float64 source-factor recoveries
+    reset_gemm_fallback_slices()            # ... and pair-KL GEMM slices rescored by the direct tiles
     reset_frame_pair_fp64_escalations()     # ... and float64 frame-pair escalations
     reset_layernorm_trace_cap_elements()    # ... and LayerNorm pushforward sphere-bound caps
     reset_covariance_ceiling_elements()     # ... and moment-matched covariance ceiling clamps
@@ -5323,7 +5339,8 @@ def train(
                 artifacts.numerics_counters_state = {
                     **(_frame_projection_state(frame_projection_counter, frame_projection_base,
                                                frame_projection_since) or {}),
-                    **_run_total_counters(run_total_base, precision_replays)}
+                    **_run_total_counters(run_total_base, precision_replays,
+                                      phi_rejected_rows=int(getattr(optimizer, "phi_rejected_rows", 0)))}
             except Exception as exc:
                 _record_diagnostic_failure(diagnostics_failures, "numerics_checkpoint_state",
                                            exc, logger)
@@ -5534,6 +5551,9 @@ def train(
                         "phi_conditioned_direction_norm_mean",
                         "phi_effective_step_scale_mean",
                         "phi_effective_step_scale_min",
+                        # factor-scale halvings of the accepted step, on both retractions (audit 2026-10-16 F14)
+                        "phi_group_backtracks_mean",
+                        "phi_group_backtracks_max",
                     ):
                         row[_pk] = _gd.get(_pk, float("nan"))
                     # group_log adds its own fixed key set; the chart route's columns are unchanged.
@@ -5589,6 +5609,13 @@ def train(
             # Cumulative tokens of moment-matched covariance updates recomputed in float64.
             row["covariance_escalation_elements"] = (run_total_base["covariance_escalation_elements"]
                                                      + covariance_escalation_elements())
+            # Cumulative LayerNorm-pushforward tokens capped at the sphere bound (the delta method outside its
+            # regime; zero under pushforward_moment, whose cap is read net of its floor; audit 2026-10-16 F3).
+            row["layernorm_trace_cap_elements"] = (run_total_base["layernorm_trace_cap_elements"]
+                                                   + layernorm_trace_cap_elements())
+            # Cumulative (batch, head) slices whose pair KL the pair_kl_gemm_tol fallback moved to the direct
+            # tiles; 0 while pair_kl_gemm_tol is None (audit 2026-10-16 F95).
+            row["gemm_fallback_slices"] = run_total_base["gemm_fallback_slices"] + gemm_fallback_slices()
             row["tokens_seen"] = tokens_seen
             row["diagnostics_failures"] = int(sum(diagnostics_failures.values()))
             pipeline_timing = timer.sample_pipeline_window()
@@ -5638,7 +5665,8 @@ def train(
             artifacts.numerics_counters_state = {
                 **(_frame_projection_state(frame_projection_counter, frame_projection_base,
                                            frame_projection_since) or {}),
-                **_run_total_counters(run_total_base, precision_replays)}
+                **_run_total_counters(run_total_base, precision_replays,
+                                      phi_rejected_rows=int(getattr(optimizer, "phi_rejected_rows", 0)))}
             artifacts.numerics_counters = _numerics_counters_summary(
                 completed_steps, optimizer, artifacts.numerics_counters_state, numerics_last_eval,
                 numerics_reasons, diagnostic_windows)
@@ -5668,7 +5696,8 @@ def train(
         if diagnostics_failures:
             logger.warning(" diagnostic failures during training (counted, training unaffected): %s",
                            dict(sorted(diagnostics_failures.items())))
-        run_totals = _run_total_counters(run_total_base, precision_replays)   # whole run across resumes
+        run_totals = _run_total_counters(                                 # whole run across resumes
+            run_total_base, precision_replays, phi_rejected_rows=int(getattr(optimizer, "phi_rejected_rows", 0)))
         neutralized = run_totals["nonfinite_tangent_elements"]
         mu_fallbacks = run_totals["mu_trust_fallback_elements"]
         artifacts.final_step = int(completed_steps)

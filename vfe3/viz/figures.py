@@ -1944,6 +1944,8 @@ _PULLBACK_COLUMNS = (
     "phi_pullback_damped_gen_cond_median", "phi_pullback_damped_gen_cond_max",
     "phi_group_trust_scale_mean", "phi_group_trust_scale_min",
     "phi_group_active_rows", "phi_group_chart_norm_max",
+    # factor-scale halvings of the accepted step on both retractions (audit 2026-10-16 F14)
+    "phi_group_backtracks_mean", "phi_group_backtracks_max",
 )
 # History columns each training-time dashboard reads; run_artifacts._save_figures selects these.
 GRAD_NORM_DECOMPOSITION_COLUMNS = (
@@ -3151,6 +3153,9 @@ def plot_optimizer_geometry(
         {"title": "Accepted factor scale", "ylabel": "scale", "series": [
             ("phi_group_trust_scale_mean", "mean", _CB[0]),
             ("phi_group_trust_scale_min", "min", _CB[1])]},
+        {"title": "Factor-scale halvings", "ylabel": "halvings", "series": [
+            ("phi_group_backtracks_mean", "mean", _CB[0]),
+            ("phi_group_backtracks_max", "max", _CB[3])]},
         {"title": "Pullback active rows", "ylabel": "rows", "series": [
             ("phi_group_active_rows", "active", _CB[2])]},
         {"title": "Accepted chart norm", "ylabel": r"$\|\phi\|_F$", "series": [
@@ -5756,6 +5761,8 @@ PUB_LABELS: Dict[str, str] = {
     "phi_group_trust_scale_min":           "accepted factor scale (min)",
     "phi_group_active_rows":               "active phi rows",
     "phi_group_chart_norm_max":            r"accepted chart norm $\max\|\phi\|_F$",
+    "phi_group_backtracks_mean":           "factor-scale halvings (mean)",
+    "phi_group_backtracks_max":            "factor-scale halvings (max)",
 }
 
 

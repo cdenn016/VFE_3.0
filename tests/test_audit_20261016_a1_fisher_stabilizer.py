@@ -205,8 +205,7 @@ def test_tiny_model_train_step_under_the_stabilizer_completion(retraction: str) 
         warnings.simplefilter("ignore")
         model = VFEModel(cfg)
         optimizer = build_optimizer(model, cfg)
-    # build_optimizer forwards cfg.m_phi_fisher_completion once lane C1 plumbs it; set it here meanwhile.
-    optimizer._phi_fisher_completion = cfg.m_phi_fisher_completion
+    assert optimizer._phi_fisher_completion == "stabilizer"            # build_optimizer forwards the field
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
     tokens = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3], [3, 2, 1, 0, 3, 2, 1, 0]])
     phi_before = model.prior_bank.phi_embed.detach().clone()

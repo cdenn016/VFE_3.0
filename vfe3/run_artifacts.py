@@ -5360,6 +5360,8 @@ def _pure_path_report(
             "m_phi_group_trust_radius":      float(getattr(cfg, "m_phi_group_trust_radius", 0.1)),
             "m_phi_group_retraction":        getattr(cfg, "m_phi_group_retraction", "chart"),
             "m_phi_fisher_rotation_weight":  float(getattr(cfg, "m_phi_fisher_rotation_weight", 2.0)),
+            # fisher_group's completed metric (audit 2026-10-16 F50); a record without it ran "rotation".
+            "m_phi_fisher_completion":       getattr(cfg, "m_phi_fisher_completion", "rotation"),
             "phi_mstep_max_matrix_norm":     getattr(cfg, "phi_mstep_max_matrix_norm", None),
             "transport_chart_max_norm":      transport_chart_max_norm,
             "frame_pair_escalation_tol":     getattr(cfg, "frame_pair_escalation_tol", None),
