@@ -630,6 +630,28 @@ def covariance_frozen_at_encode(cfg: object) -> bool:
     return e_step_frozen and not (mlp_rewrites_sigma or cg_rewrites_sigma or norm_rewrites_sigma)
 
 
+def variance_guard_activity(cfg: object) -> Tuple[bool, bool]:
+    r"""Whether the ``eps`` variance floor and the ``sigma_max`` ceiling clamp a layer's converged covariance.
+
+    Returns ``(floor, ceiling)``. :func:`guard_saturation` counts the variances within a relative window of
+    ``eps`` and of ``sigma_max``; the count certifies a clamp only where the route applies one to the covariance
+    it reads. The ceiling is the sigma E-step's SPD bound, absent when ``sigma_max`` is None or
+    ``cfg.inactive_fields()`` marks it inert (projected-predictive routes, ``skip_belief_sigma_update``, the
+    closed-form full-covariance receiver), the rule ``vfe3.viz.report`` applies to its ceiling row. The floor is
+    absent where a moment-matched readout (``predictive_covariance`` ``'moment_matched'`` or ``'spread_corrected'``
+    on ``attention_mode='projected_predictive'``, the routes on which ``predictive_covariance_floor`` is active)
+    writes the converged covariance: it returns :math:`\Sigma_i^+ = \Sigma_i^{\mathrm{att}} + f\Sigma_{p,i}`, an
+    additive floor with no clamp at ``eps``. That readout's one clamp, the Loewner ceiling
+    :math:`\Sigma_i^+ \preceq c\Sigma_{p,i}`, is counted in ``covariance_ceiling_elements``. Elsewhere the converged
+    covariance is the sigma E-step's retraction onto :math:`[\epsilon, \sigma_{\max}]` or a passthrough of the
+    encoded table variance, which :func:`vfe3.numerics.bounded_variance_from_log` clamps at ``eps``.
+    """
+    inactive = cfg.inactive_fields()
+    floor = "predictive_covariance_floor" in inactive
+    ceiling = getattr(cfg, "sigma_max", None) is not None and "sigma_max" not in inactive
+    return floor, ceiling
+
+
 def rank_one_residual(
     mu:  torch.Tensor,                   # (..., N, K) per-token belief means of ONE layer
 

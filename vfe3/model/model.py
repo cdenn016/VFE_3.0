@@ -1840,7 +1840,10 @@ class VFEModel(nn.Module):
         of tokens whose condition is a belief property (smallest eigenvalue above the covariance floor); the
         mean and median per-token half mean-block Fisher trace :math:`\tfrac12\mathrm{tr}\,\Sigma_i^{-1}`
         (:func:`vfe3.metrics.half_fisher_trace`); the fractions of variance eigenvalues at the ``eps`` floor and
-        the ``sigma_max`` ceiling (:func:`vfe3.metrics.guard_saturation`); the non-finite fraction of the belief
+        the ``sigma_max`` ceiling (:func:`vfe3.metrics.guard_saturation`), each NaN on a route that applies no
+        such clamp to the converged covariance (:func:`vfe3.metrics.variance_guard_activity`; audit 2026-10-16
+        F52: the moment-matched readout's floor is the additive :math:`f\Sigma_p` and its clamp the Loewner
+        ceiling counted in ``covariance_ceiling_elements``); the non-finite fraction of the belief
         entries :math:`(\mu, \Sigma, \phi)`; and the number of heads whose mean normalized row entropy
         :math:`H(\beta_{i\cdot})/\log|S_i|` over the scorable rows is below
         :data:`vfe3.metrics.COLLAPSE_ENTROPY_FRACTION`.
@@ -1867,9 +1870,11 @@ class VFEModel(nn.Module):
         guard = metrics.guard_saturation(belief.sigma.double(), empty, empty,
                                          diagonal=self.cfg.diagonal_covariance,
                                          eps=self.cfg.eps, sigma_max=self.cfg.sigma_max)
-        d["guard_sigma_floor_frac"] = guard["sigma_floor_frac"]
-        d["guard_sigma_ceil_frac"] = guard["sigma_ceil_frac"]
-        entries = [t for t in (belief.mu, belief.sigma, belief.phi) if t is not None]
+        # A guard the route does not apply is not measured: a variance near eps or sigma_max there is no clamp.
+        floor_active, ceiling_active = metrics.variance_guard_activity(self.cfg)
+        d["guard_sigma_floor_frac"] = guard["sigma_floor_frac"] if floor_active else float("nan")
+        d["guard_sigma_ceil_frac"] = guard["sigma_ceil_frac"] if ceiling_active else float("nan")
+        entries =[t for t in (belief.mu, belief.sigma, belief.phi) if t is not None]
         d["nonfinite_frac"] = (float(sum(int((~torch.isfinite(t)).sum()) for t in entries))
                                / max(sum(t.numel() for t in entries), 1))
         n_support = support.sum(-1).clamp_min(2).double()                              # (B, H, N)
