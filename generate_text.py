@@ -28,9 +28,11 @@ identical scorer, which slides ``max_seq_len`` windows back from the end of the 
 targets, so every tail token is counted exactly once with at least ``max_seq_len - stride`` tokens of
 context (disjoint blocks would give the first target of each block one token). A self-CE well below
 the held-out CE means the model has a sharp mode its own sampler keeps falling into; a self-CE at or
-above it means the loop is not a preferred mode at all, and greedy is walking a flat, uninformative
-distribution. Note that the held-out reference is the model's own, not a ceiling: this script scores
-one model against itself, and says nothing about how its held-out CE compares to another model's.
+above it means the loop is not a preferred mode at all, and the decoder (greedy or sampled) is walking a
+flat, uninformative distribution. Note that the held-out reference is the model's own, not a ceiling:
+this script scores one model against itself, and says nothing about how its held-out CE compares to
+another model's. The ``BASELINE`` control decodes its continuation with the same sampler settings and
+per-prompt seed, so its row differs from the run's by model, not by sampler.
 
 Usage
 -----
@@ -399,6 +401,47 @@ def score_streams(
     return SelfCEScore(generated=generated, reference=reference)
 
 
+def sample_next_token(
+    logits: torch.Tensor,            # (B, V) last-position logits
+
+    *,
+    greedy:      bool,
+    temperature: float,
+    top_k:       Optional[int],
+    top_p:       Optional[float],
+) -> torch.Tensor:
+    r"""Next token ids ``(B, 1)`` by the map :meth:`vfe3.model.model.VFEModel.generate` applies to its
+    last-position logits, so the ``BASELINE`` control decodes under the run's own sampler.
+
+    Greedy takes the argmax. Otherwise the logits are divided by ``temperature``, entries below the k-th
+    largest are set to :math:`-\infty`, the nucleus rule removes the sorted entry :math:`i` when
+    :math:`\sum_{j<i} p_{(j)} \ge` ``top_p`` (the top entry is always kept), and one token is drawn from
+    the softmax with ``torch.multinomial``. The steps, their order and the single draw are the model's, so
+    from the same logits and RNG state both loops select the same token.
+    """
+    if (torch.isnan(logits).any() or torch.isposinf(logits).any()
+            or not bool(torch.isfinite(logits).any(dim=-1).all())):
+        raise ValueError("generation logits contain NaN or +inf values, or a row with no finite value")
+    if greedy:
+        return logits.argmax(dim=-1, keepdim=True)                       # (B, 1)
+    if not temperature > 0.0:
+        raise ValueError(f"temperature must be > 0, got {temperature}")
+    if top_k is not None and not 1 <= top_k <= logits.shape[-1]:
+        raise ValueError(f"top_k must be in [1, vocab_size={logits.shape[-1]}], got {top_k}")
+    if top_p is not None and not 0.0 < top_p <= 1.0:
+        raise ValueError(f"top_p must be in (0, 1], got {top_p}")
+    logits = logits / temperature
+    if top_k is not None:
+        kth = logits.topk(top_k, dim=-1).values[:, -1:]                  # (B, 1) k-th largest
+        logits = logits.masked_fill(logits < kth, float("-inf"))
+    if top_p is not None:
+        sorted_logits, sorted_idx = torch.sort(logits, dim=-1, descending=True)
+        sorted_probs = sorted_logits.softmax(dim=-1)
+        remove = sorted_probs.cumsum(dim=-1) - sorted_probs >= top_p
+        logits = logits.masked_fill(remove.scatter(-1, sorted_idx, remove), float("-inf"))
+    return torch.multinomial(logits.softmax(dim=-1), num_samples=1)      # (B, 1)
+
+
 class HuggingFaceBaseline:
     r"""A HuggingFace causal LM behind the ``(1, L, V)`` logits call the scorer expects.
 
@@ -422,13 +465,33 @@ class HuggingFaceBaseline:
         return self._model(inputs).logits
 
     @torch.no_grad()
-    def generate(self, prompt_ids: List[int], max_new_tokens: int) -> List[int]:
-        r"""Greedy with a full recompute per step -- the same protocol ``VFEModel.generate`` uses."""
+    def generate(
+        self,
+        prompt_ids:     List[int],
+        max_new_tokens: int,
+
+        *,
+        greedy:      bool,
+        temperature: float,
+        top_k:       Optional[int],
+        top_p:       Optional[float],
+        seed:        Optional[int],
+    ) -> List[int]:
+        r"""Continue ``prompt_ids`` by the protocol ``VFEModel.generate`` uses: a full recompute over the
+        last ``context`` tokens per step and :func:`sample_next_token` on the last position.
+
+        ``seed`` reseeds the global RNG before the first step, as :func:`generate_for_prompts` does per
+        prompt, so prompt ``i`` of the control starts from the same RNG state as the run's own draw.
+        """
         device = next(self.parameters()).device
         seq = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+        if seed is not None:
+            torch.manual_seed(seed)
         for _ in range(max_new_tokens):
-            logits = self._model(seq[:, -self.context:]).logits[:, -1, :]
-            seq = torch.cat([seq, logits.argmax(dim=-1, keepdim=True)], dim=1)
+            logits = self._model(seq[:, -self.context:]).logits[:, -1, :]   # (1, V)
+            next_token = sample_next_token(
+                logits, greedy=greedy, temperature=temperature, top_k=top_k, top_p=top_p)
+            seq = torch.cat([seq, next_token], dim=1)
         return seq[0, len(prompt_ids):].tolist()
 
     def parameter_count(self) -> int:
@@ -506,7 +569,12 @@ def main() -> None:
             loaded.model, prompt_ids, [g.token_ids for g in generations],
             draws, MAX_NEW_TOKENS, seq_len, stride=stride)
         if baseline is not None:
-            baseline_ids = [baseline.generate(ids, MAX_NEW_TOKENS) for ids in prompt_ids]
+            # The control decodes under the run's sampler, reseeded per prompt, so the two self-CE rows
+            # differ by model and not by sampler (greedy text sits at the mode and scores lower).
+            baseline_ids = [
+                baseline.generate(ids, MAX_NEW_TOKENS, greedy=GREEDY, temperature=TEMPERATURE,
+                                  top_k=TOP_K, top_p=TOP_P, seed=None if GREEDY else SEED)
+                for ids in prompt_ids]
             baseline_texts = [decode_ids(ids, loaded.dataset) for ids in baseline_ids]
             baseline_scores = score_streams(
                 baseline, prompt_ids, baseline_ids, draws, MAX_NEW_TOKENS, baseline_seq_len,
@@ -547,6 +615,7 @@ def main() -> None:
                 base_mean, base_low, base_high = baseline_scores.summary()
                 payload["self_ce"]["baseline"] = {
                     "name":               BASELINE,
+                    "sampler":            sampler,
                     "parameters":         baseline.parameter_count(),
                     "block_tokens":       baseline_seq_len,
                     "stride_tokens":      baseline_stride,
@@ -588,6 +657,7 @@ def main() -> None:
             base_label = f"{BASELINE} ({baseline.parameter_count() / 1e6:.0f}M)"
             print(f"  {base_label:<38}{baseline_seq_len:>6}{base_ref:>10.3f}{base_mean:>10.3f}"
                   f"{base_mean - base_ref:>+9.3f}{math.exp(base_mean):>9.2f}")
+            print(f"  both rows decoded with sampler: {sampler}")
         print()
     for index, generation in enumerate(generations):
         print(f"--- prompt: {generation.prompt!r}")
@@ -598,7 +668,8 @@ def main() -> None:
             print(f"  self-CE {value:.3f}  (delta {value - mean:+.3f}, ppl {math.exp(value):.2f})")
             if baseline_scores is not None:
                 base_value = baseline_scores.generated[index]
-                print(f"  {BASELINE:<7} {base_value:.3f}  (delta {base_value - mean:+.3f}, "
+                base_ref = baseline_scores.summary()[0]
+                print(f"  {BASELINE:<7} {base_value:.3f}  (delta {base_value - base_ref:+.3f}, "
                       f"ppl {math.exp(base_value):.2f})")
                 # Printed because the loop-vs-no-loop question is the whole point of the control:
                 # a low self-CE means nothing without seeing what the baseline actually produced.
