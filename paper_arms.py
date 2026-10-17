@@ -73,7 +73,9 @@ base's except where declared. Rules:
   measured train-only device-hours of those runs; every width of the pre-declared ladder
   (``width_ladder`` multiples of the matched width, whole 32-dim heads) gets a
   ``calibration_steps`` calibration run whose median train-step throughput feeds
-  ``vfe3.baseline.width_ladder_rule``, which picks the width and ``max_steps``; the rule's record is
+  ``vfe3.baseline.width_ladder_rule``, which picks the width and ``max_steps`` and transfers the
+  hidden-matrix learning rate to it as the total-matched arm does (``hidden_lr_scale`` K_0/K, recorded in
+  the row's ``changes`` and, at a width other than K_0, as "lr not tuned at this width"); the rule's record is
   written once to ``<arm dir>/width_rule.json`` and reused by every later launch (a relaunch after
   more evaluated runs complete does not change the rule under finished runs). Calibration runs are
   reused only when their config is the matched arm's at that width, and must share the evaluated
@@ -537,9 +539,10 @@ TIER_B: Tuple[str, ...] = (
     "Covariance-blind routing (mean distance)",
 )
 
-# Fields the compute-matched baseline changes by construction (width rule, calibrated steps, cadence).
+# Fields the compute-matched baseline changes by construction (width rule, calibrated steps, cadence, and
+# the hidden-matrix lr scale the rule transfers to the chosen width, audit 2026-10-16 F20).
 COMPUTE_MATCHED_FIELDS: Tuple[str, ...] = (
-    "embed_dim", "n_heads", "max_steps", "eval_interval", "checkpoint_interval")
+    "embed_dim", "n_heads", "max_steps", "eval_interval", "checkpoint_interval", "hidden_lr_scale")
 # Fields the total-parameter-matched baseline changes by construction (vfe3.baseline.total_parameter_width).
 TOTAL_MATCHED_FIELDS: Tuple[str, ...] = ("embed_dim", "n_heads")
 # The compute-matched arm's rule record, written once in its arm directory and reused by later launches.
@@ -981,6 +984,45 @@ def resolve_arm(
     return plan
 
 
+LR_NOT_TUNED = "lr not tuned at this width"
+
+
+def _lr_transfer_deviation(unscaled: Any, cfg: Any) -> str:
+    r"""The declared deviation of a baseline widened from ``unscaled`` (width :math:`K_0`) to ``cfg`` (:math:`K`).
+
+    Both width-changed Table M2 rows (total parameters and measured compute) keep the matched width's
+    peak lr, initialization and warmup and transfer the hidden-matrix lr muP-style,
+    :math:`s = s_0 K_0 / K` (:func:`vfe3.baseline.total_parameter_width`,
+    :func:`vfe3.baseline.width_ladder_rule`); a frozen rule computed without the transfer says so.
+    """
+    k0, k = int(unscaled.embed_dim), int(cfg.embed_dim)
+    if cfg.hidden_lr_scale != unscaled.hidden_lr_scale:
+        transfer = (f"the hidden-matrix lr is scaled by {k0}/{k} (hidden_lr_scale={cfg.hidden_lr_scale:g}, "
+                    "muP-style transfer, Yang et al. 2022, arXiv:2203.03466)")
+    else:
+        transfer = f"the hidden-matrix lr is not transferred (hidden_lr_scale={cfg.hidden_lr_scale:g})"
+    return f"{LR_NOT_TUNED}: the peak lr, initialization and warmup are width {k0}'s; {transfer}"
+
+
+def _record_width_rule(plan: ArmPlan, cfg: Any) -> Any:
+    r"""Check the compute-matched config ``cfg`` against the matched VFE config and record it in ``plan``.
+
+    The applied differences (width, heads, steps, cadence, hidden-matrix lr scale) go into ``plan.diff``
+    and, when the width changed, the lr deviation into ``plan.deviations`` (once), so the manifest row's
+    ``changes`` and ``declared_deviations`` describe the arm that is trained. Returns ``cfg``.
+    """
+    diff = check_baseline_arm(plan.matched_cfg, cfg, declared=(*COMPUTE_MATCHED_FIELDS, *plan.diff))
+    plan.diff.update(diff)
+    if cfg.hidden_lr_scale != plan.cfg.hidden_lr_scale:
+        plan.diff["hidden_lr_scale"] = (plan.cfg.hidden_lr_scale, cfg.hidden_lr_scale)
+    if cfg.embed_dim != plan.cfg.embed_dim:
+        deviation = _lr_transfer_deviation(plan.cfg, cfg)
+        if deviation not in plan.deviations:
+            plan.deviations.append(deviation)
+            plan.notes.append(f"declared difference: {deviation}")
+    return cfg
+
+
 def _resolve_baseline(
     spec:     Mapping[str, Any],
     plan:     ArmPlan,
@@ -1028,10 +1070,7 @@ def _resolve_baseline(
                           f"({rule['config'].n_heads} heads of {rule['head_dim']}) against the base's "
                           f"{target:,} ({100 * rule['relative_error']:+.2f}%)")
         if plan.cfg.embed_dim != unscaled.embed_dim:
-            deviation = (f"lr not tuned at this width: the peak lr, initialization and warmup are width "
-                         f"{unscaled.embed_dim}'s; the hidden-matrix lr is scaled by {unscaled.embed_dim}/"
-                         f"{plan.cfg.embed_dim} (hidden_lr_scale={plan.cfg.hidden_lr_scale:g}, muP-style "
-                         "transfer, Yang et al. 2022, arXiv:2203.03466)")
+            deviation = _lr_transfer_deviation(unscaled, plan.cfg)
             plan.deviations.append(deviation)
             plan.notes.append(f"declared difference: {deviation}")
     # A protocol field set by the arm's own overrides is a declared difference.
@@ -1062,6 +1101,9 @@ def _resolve_baseline(
         plan.reason = ("width and max_steps are set at run time by vfe3.baseline.width_ladder_rule from the "
                        "retrained evaluated arm's measured train device-hours and one calibration run per "
                        "ladder width; shown at the matched width and budget")
+        plan.notes.append(f"the width rule transfers the hidden-matrix lr to the chosen width K "
+                          f"(hidden_lr_scale = {plan.cfg.hidden_lr_scale:g} x {plan.cfg.embed_dim}/K); a width "
+                          f"other than {plan.cfg.embed_dim} is declared '{LR_NOT_TUNED}' when the rule is computed")
     if counts:
         plan.params = _baseline_counts(plan.cfg)
 
@@ -1580,7 +1622,7 @@ def _frozen_width_rule(plan: ArmPlan, path: Path, runs: Sequence[Path], logger: 
                        "evaluated runs are now %s and the rule is not recomputed", plan.label, recorded, current)
     logger.info("%s: frozen width rule %s -> width %d, max_steps %d", plan.label, path, frozen.embed_dim,
                 frozen.max_steps)
-    return frozen
+    return _record_width_rule(plan, frozen)
 
 
 def compute_matched_config(
@@ -1672,8 +1714,8 @@ def compute_matched_config(
                                  unique_train_tokens=int(cached_token_count(plan.dataset, "train")))
     chosen = rule["config"]
     steps = int(chosen.max_steps)
-    cfg = dataclasses.replace(chosen, eval_interval=max(1, steps // M3_POINTS), checkpoint_interval=steps)
-    check_baseline_arm(plan.matched_cfg, cfg, declared=COMPUTE_MATCHED_FIELDS)
+    cfg = _record_width_rule(plan, dataclasses.replace(chosen, eval_interval=max(1, steps // M3_POINTS),
+                                                       checkpoint_interval=steps))
     record = {key: value for key, value in rule.items() if key != "config"}
     record.update(config=cfg.serialize(), evaluated_runs=[str(run) for run in runs],
                   calibration_runs={w: str(run) for w, run in calibrations.items()},
