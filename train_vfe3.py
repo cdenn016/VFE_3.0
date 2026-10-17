@@ -343,7 +343,7 @@ config = dict(
    
     frame_pair_escalation_tol        = None,       # None (off) | tol, e.g. 1e-4: redo ill-conditioned frame pairs in fp64 (costly)
     predictive_covariance_checkpoint = False,       # moment_matched only: recompute the (B,N,K,K) update in backward; bit-identical.
-    predictive_covariance_fp64_escalation = False,  # True | False: moment_matched kernel readout: redo a non-PD fp32 update in fp64 (counted in source_recovery_elements)
+    predictive_covariance_fp64_escalation = False,  # True | False: moment_matched kernel readout: redo the failing sequences of a non-PD fp32 update in fp64 (counted in covariance_escalation_elements)
         
    
     
