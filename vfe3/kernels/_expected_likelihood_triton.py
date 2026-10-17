@@ -8,7 +8,9 @@ energy sums k in blocks of 16, two levels, see ``_energy_tile``). Tables arrive 
 each feature row loads coalesced over v.
 
 Kernels (one owner per output element, so no atomics and no partial buffers):
-  ``el_fwd_kernel``       program = BI rows; online logsumexp over V; writes lse_i and CE_i.
+  ``el_fwd_kernel``       program = BI rows; online logsumexp over V; writes m_i, log l_i and CE_i.
+                          lse_i = m_i + log l_i is never formed: rounding it to the ulp of m_i (the logits
+                          are large at a small tau) put an error into every softmax weight of the row.
   ``el_bwd_rows_kernel``  program = BI rows; writes dCE/dmu_q, dCE/dsigma_q and sum_v w_iv E_iv.
   ``el_bwd_cols_kernel``  program = BV vocabulary entries; writes dCE/dmu_v, dCE/dsigma_v, dCE/du.
 """
@@ -80,19 +82,23 @@ def _energy_tile(MQ, SQ, MVT, SVT, offs_i, mi, offs_v, mv_ok, V,
 
 
 @triton.jit
-def _pair_weights(E, c, U, offs_v, mv_ok, mi, t, lse, scale, HAS_U: tl.constexpr):
-    r"""w_iv = (p_iv - [v = t_i]) * scale with p_iv = exp(logit_iv - lse_i); zero off the grid."""
+def _pair_weights(E, c, U, offs_v, mv_ok, mi, t, m, log_l, scale, HAS_U: tl.constexpr):
+    r"""w_iv = (p_iv - [v = t_i]) * scale with p_iv = exp((logit_iv - m_i) - log l_i); zero off the grid.
+
+    The leading difference logit - m is exact for the logits that carry the mass (Sterbenz), so p carries
+    the rounding of log l rather than the ulp of m that lse = m + log l would add.
+    """
     logit = -c * E
     if HAS_U:
         logit += tl.load(U + offs_v, mask=mv_ok, other=0.0)[None, :]
-    p = tl.exp(logit - lse[:, None])
+    p = tl.exp((logit - m[:, None]) - log_l[:, None])
     hit = offs_v[None, :] == t[:, None]
     w = (p - tl.where(hit, 1.0, 0.0)) * scale
     return tl.where(mi[:, None] & mv_ok[None, :], w, 0.0)
 
 
 @triton.jit
-def el_fwd_kernel(MQ, SQ, MVT, SVT, U, TGT, TAU, LSE, CE, S, V,
+def el_fwd_kernel(MQ, SQ, MVT, SVT, U, TGT, TAU, M, LOGL, CE, S, V,
                   K: tl.constexpr, BI: tl.constexpr, BV: tl.constexpr,
                   HAS_U: tl.constexpr, FAST_LOG: tl.constexpr):
     pid = tl.program_id(0)
@@ -116,13 +122,14 @@ def el_fwd_kernel(MQ, SQ, MVT, SVT, U, TGT, TAU, LSE, CE, S, V,
         m_new = tl.maximum(m, tl.max(logit, 1))
         l = l * tl.exp(m - m_new) + tl.sum(tl.exp(logit - m_new[:, None]), 1)
         m = m_new
-    lse = m + tl.log(l)
-    tl.store(LSE + offs_i, lse, mask=mi)
-    tl.store(CE + offs_i, lse - lt, mask=mi)
+    log_l = tl.log(l)
+    tl.store(M + offs_i, m, mask=mi)
+    tl.store(LOGL + offs_i, log_l, mask=mi)
+    tl.store(CE + offs_i, (m - lt) + log_l, mask=mi)                 # lse - lt with m and log l kept apart
 
 
 @triton.jit
-def el_bwd_rows_kernel(MQ, SQ, MVT, SVT, U, TGT, TAU, LSE, SCALE, GMQ, GSQ, GE, S, V,
+def el_bwd_rows_kernel(MQ, SQ, MVT, SVT, U, TGT, TAU, M, LOGL, SCALE, GMQ, GSQ, GE, S, V,
                        K: tl.constexpr, KP: tl.constexpr, BI: tl.constexpr, BV: tl.constexpr,
                        HAS_U: tl.constexpr, FAST_LOG: tl.constexpr):
     pid = tl.program_id(0)
@@ -131,7 +138,8 @@ def el_bwd_rows_kernel(MQ, SQ, MVT, SVT, U, TGT, TAU, LSE, SCALE, GMQ, GSQ, GE, 
     c = 0.5 / tl.load(TAU)
     scale = tl.load(SCALE)
     t = tl.load(TGT + offs_i, mask=mi, other=-1)
-    lse = tl.load(LSE + offs_i, mask=mi, other=0.0)
+    m = tl.load(M + offs_i, mask=mi, other=0.0)                     # lse = m + log_l, kept apart
+    log_l = tl.load(LOGL + offs_i, mask=mi, other=0.0)
     kk = tl.arange(0, KP)
     dt = MQ.dtype.element_ty
     acc_m = tl.zeros([BI, KP], dt)                                   # sum_v w r
@@ -141,7 +149,7 @@ def el_bwd_rows_kernel(MQ, SQ, MVT, SVT, U, TGT, TAU, LSE, SCALE, GMQ, GSQ, GE, 
         offs_v = v0 + tl.arange(0, BV)
         mv_ok = offs_v < V
         E = _energy_tile(MQ, SQ, MVT, SVT, offs_i, mi, offs_v, mv_ok, V, K, BI, BV, FAST_LOG)
-        w = _pair_weights(E, c, U, offs_v, mv_ok, mi, t, lse, scale, HAS_U)
+        w = _pair_weights(E, c, U, offs_v, mv_ok, mi, t, m, log_l, scale, HAS_U)
         acc_e += tl.sum(w * E, 1)
         for k in range(K):
             a = tl.load(MQ + offs_i * K + k, mask=mi, other=0.0)
@@ -159,7 +167,7 @@ def el_bwd_rows_kernel(MQ, SQ, MVT, SVT, U, TGT, TAU, LSE, SCALE, GMQ, GSQ, GE, 
 
 
 @triton.jit
-def el_bwd_cols_kernel(MQ, SQ, MVT, SVT, U, TGT, TAU, LSE, SCALE, GMV, GSV, GU, S, V,
+def el_bwd_cols_kernel(MQ, SQ, MVT, SVT, U, TGT, TAU, M, LOGL, SCALE, GMV, GSV, GU, S, V,
                        K: tl.constexpr, KP: tl.constexpr, BI: tl.constexpr, BV: tl.constexpr,
                        HAS_U: tl.constexpr, FAST_LOG: tl.constexpr):
     pid = tl.program_id(0)
@@ -176,9 +184,10 @@ def el_bwd_cols_kernel(MQ, SQ, MVT, SVT, U, TGT, TAU, LSE, SCALE, GMV, GSV, GU, 
         offs_i = i0 + tl.arange(0, BI)
         mi = offs_i < S
         t = tl.load(TGT + offs_i, mask=mi, other=-1)
-        lse = tl.load(LSE + offs_i, mask=mi, other=0.0)
+        m = tl.load(M + offs_i, mask=mi, other=0.0)
+        log_l = tl.load(LOGL + offs_i, mask=mi, other=0.0)
         E = _energy_tile(MQ, SQ, MVT, SVT, offs_i, mi, offs_v, mv_ok, V, K, BI, BV, FAST_LOG)
-        w = _pair_weights(E, c, U, offs_v, mv_ok, mi, t, lse, scale, HAS_U)
+        w = _pair_weights(E, c, U, offs_v, mv_ok, mi, t, m, log_l, scale, HAS_U)
         acc_u += tl.sum(w, 0)
         for k in range(K):
             a = tl.load(MQ + offs_i * K + k, mask=mi, other=0.0)
