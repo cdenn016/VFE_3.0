@@ -10,12 +10,15 @@ edit ``CONFIG`` and run ``python scaling_analysis.py``.
 
 The y-axis is ``test_ce`` (nats/token), the canonical additive scaling quantity; perplexity is a
 nonlinear re-read. The x-axis is the recorded ``n_params`` (never a derived ``d^2`` proxy); when the runs
-record ``n_non_embedding_params`` (total minus per-token / positional lookup tables, ~99% of ``n_params``
-at the scaling widths) the law is also fit against that axis. R^2, the exponent CI, and the lack-of-fit
+record ``n_non_embedding_params`` (total minus the per-token / positional lookup tables, which are ~99%
+of ``n_params`` at the scaling widths, so ~1% of ``n_params``) the law is also fit against that axis. R^2, the exponent CI, and the lack-of-fit
 test are reported only from four distinct sizes; fewer leave the fit ``not_testable``. Runs whose
 ``test_ce`` is null (no test split) or non-positive are dropped before the log fit; the analysis warns
 if the harvested points span more than one ``data_sha256`` (mixed corpus) or ``git_sha`` (code drift),
-either of which confounds a frontier.
+either of which confounds a frontier. The summary records whether the seeds of a cell shared one
+training data order (``data_order``; the shipped ``scaling.CONFIG["data_seed"] = 3`` gives every model
+seed the same order). Under a shared order the seed spread, and with it the pure error behind the exponent
+CI and the lack-of-fit test, omits data-order variance and is a lower bound on the replicate variance.
 
 Two further figures, ``capacity_scaling.png`` and ``pareto_frontier.png`` (audit finding PB-07), are
 dispatched separately from persisted validation metrics: ``vfe3.viz.sweep_adapters.aggregate_validation_points``
@@ -109,7 +112,7 @@ _CSV_COLUMNS = [
     "n_gen", "gauge_group", "n_layers", "n_e_steps", "family",
     "use_block_mlp", "block_mlp_mode", "block_mlp_covariance", "block_mlp_expansion",
     "block_mlp_activation", "block_mlp_dropout", "block_mlp_covariance_floor",
-    "tokens_seen", "est_flops_6ND",
+    "data_seed", "tokens_seen", "est_flops_6ND",
     "est_flops_analytic", "active_params_per_token", "test_ce", "test_ppl",
     "test_bits_per_token", "test_bpc",
     "estep_final_f_per_token", "best_val_ppl",
@@ -530,6 +533,9 @@ def harvest(
             "scale_knob":  cell["scale_knob"],
             "label":       cell["label"],
             "seed":        verified["seed"],
+            # the training data-order seed (null: the global RNG seeded by the model seed); absent
+            # when the cell does not record it
+            **({"data_seed": cell["data_seed"]} if "data_seed" in cell else {}),
             "artifact_verified": True,
             "n_params":    verified["n_params"],
             "n_learnable_params":      sp.get("n_learnable_params"),
@@ -901,6 +907,75 @@ def _analysis_provenance(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "n_missing_token_budgets": sum(not np.isfinite(_as_float(r.get("tokens_seen"))) for r in rows),
         "missing": missing,
     }
+
+
+def _data_order_status(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    r"""Whether the seeds of each replicate cell shared one training data order, with its caveat.
+
+    A replicate cell is a (route, label) with two or more seed runs; only these give the seed spread
+    that the SEM weights, the pure error :math:`SS_{PE}` of the lack-of-fit test and the bootstrap
+    exponent CI rest on. A run's ``data_seed`` is the explicit seed of its training-order generator, or
+    ``None`` when the order follows the global RNG seeded by the model seed (``scaling.CONFIG["data_seed"]
+    = None``), which differs between model seeds. ``status`` is
+
+    - ``"shared_explicit"``: in every replicate cell all seeds record one explicit data seed, so the
+      spread measures initialization and optimization only and is a lower bound on the replicate
+      variance over data orders;
+    - ``"distinct"``: no two seeds of a replicate cell share an explicit data seed;
+    - ``"nonshared_unspecified"``: every replicate run records ``data_seed = None``;
+    - ``"partially_shared"``: some seeds share an order and others do not;
+    - ``"unknown"``: some replicate run does not record its data seed;
+    - ``"no_replicates"``: no cell has two seeds.
+
+    ``data_seeds`` lists the distinct explicit data seeds of the replicate runs."""
+    cells: Dict[Tuple[str, str], List[Mapping[str, Any]]] = {}
+    for row in rows:
+        cells.setdefault((str(row.get("route")), str(row.get("label"))), []).append(row)
+    replicate = {key: grp for key, grp in sorted(cells.items()) if len(grp) >= 2}
+    runs = [row for grp in replicate.values() for row in grp]
+    explicit = sorted({row["data_seed"] for row in runs
+                       if "data_seed" in row and row["data_seed"] is not None})
+    out: Dict[str, Any] = {"n_replicate_cells": len(replicate), "data_seeds": explicit}
+    lower_bound = ("the across-seed spread, and with it the pure error behind the exponent CI and the "
+                   "lack-of-fit test, measures initialization and optimization only and is a lower bound "
+                   "on the replicate variance over data orders: the CI is conditional on that order, and "
+                   "the lack-of-fit test counts a data-order deviation from the law as lack of fit")
+    if not replicate:
+        return {**out, "status": "no_replicates",
+                "caveat": "No cell has two or more seeds, so no seed spread enters the analysis."}
+    unrecorded = sorted(f"{route}/{label}" for (route, label), grp in replicate.items()
+                        if any("data_seed" not in row for row in grp))
+    if unrecorded:
+        return {**out, "status": "unknown",
+                "caveat": ("The training data seed is not recorded for runs of " + ", ".join(unrecorded)
+                           + ", so whether their seeds share one data order is unknown. If they do, "
+                           + lower_bound + ".")}
+    shared_cells = distinct_cells = 0
+    for grp in replicate.values():
+        values = [row["data_seed"] for row in grp]
+        explicit_values = [value for value in values if value is not None]
+        if len(set(values)) == 1 and values[0] is not None:
+            shared_cells += 1
+        elif len(set(explicit_values)) == len(explicit_values):
+            distinct_cells += 1
+    seeds_text = ", ".join(str(value) for value in explicit)
+    if shared_cells == len(replicate):
+        return {**out, "status": "shared_explicit",
+                "caveat": (f"Every replicate cell's seeds share one training data order (data seed "
+                           f"{seeds_text}): " + lower_bound + ".")}
+    if distinct_cells == len(replicate):
+        if not explicit:
+            return {**out, "status": "nonshared_unspecified",
+                    "caveat": ("No replicate run records an explicit data seed (data_seed=None: the order "
+                               "follows the global RNG seeded by each model seed), so the seeds train on "
+                               "different orders and the across-seed spread includes data-order variance.")}
+        return {**out, "status": "distinct",
+                "caveat": ("No two seeds of a replicate cell share a training data order, so the "
+                           "across-seed spread includes data-order variance.")}
+    return {**out, "status": "partially_shared",
+            "caveat": (f"Some replicate seeds share a training data order and others do not ({shared_cells} "
+                       f"of {len(replicate)} replicate cells share one throughout), so the across-seed "
+                       "spread mixes seeds with and without data-order variance.")}
 
 
 def _pooled_status(
@@ -1518,6 +1593,7 @@ def analyze() -> None:
     # Persist every identity used to judge whether the parameter frontier is comparable.  Scope the
     # sets to the rows that actually enter L(N), not flat-N inference arms that are plotted separately.
     provenance = _analysis_provenance(param_rows)
+    data_order = _data_order_status(param_rows)
     if provenance["mixed_corpus"]:
         logger.warning("harvested parameter runs span multiple data SHA-256 identities -- mixed corpus confounds the fit")
     if provenance["code_drift"]:
@@ -1555,7 +1631,7 @@ def analyze() -> None:
         "n_budget_points": len(budget_points),
         "budget_points_excluded_from_fit": sorted(f"{p['route']}/{p['label']}" for p in budget_points),
         "design": design,
-        "provenance": provenance, "pooled_fit": None, "pooled_fit_status": "not_fitted",
+        "provenance": provenance, "data_order": data_order, "pooled_fit": None, "pooled_fit_status": "not_fitted",
         "pooled_fit_confounds": [], "pooled_fit_lack_of_fit": None,
         "pooled_fit_non_embedding": None, "per_route": {}, "frontier_collapse": frontier,
         "route_notes": route_notes, "estep_structural": None,
@@ -1620,6 +1696,7 @@ def analyze() -> None:
                           f"{lack_of_fit['F']:.3f}  p = {lack_of_fit['p_value']:.4g}")
                 else:
                     print(f"  lack-of-fit test not testable ({lack_of_fit.get('reason')})")
+                print(f"  seed data order: {data_order['status']}. {data_order['caveat']}")
             else:
                 print(f"\nPOOLED L(N) fit ({fit['form']}):  alpha = {fit['alpha']:.4f}   "
                       f"A = {fit['A']:.4g}   over {fit['n_distinct_sizes']} distinct sizes -- "
@@ -1850,6 +1927,9 @@ def _write_scaling_md(path: Path, summary: Dict[str, Any]) -> None:
             L.append(f"- lack-of-fit F({lof['df_lof']},{lof['df_pe']}) = {lof['F']:.3f}, "
                      f"p = {lof['p_value']:.4g}" if lof.get("testable")
                      else f"- lack-of-fit test not testable ({lof.get('reason')})")
+        data_order = summary.get("data_order")
+        if data_order:
+            L.append(f"- seed data order: `{data_order.get('status')}`. {data_order.get('caveat')}")
         ne = summary.get("pooled_fit_non_embedding")
         if ne:
             L.append(f"- non-embedding parameters: alpha = {ne['alpha']:.4f}, "
