@@ -9,9 +9,10 @@ BASES. Each arm is a declared change of one base configuration, read from the ba
 ``config.json`` with :func:`vfe3.legacy_config.lenient_config_from_serialized`. Fields a newer code
 line retired are dropped and recorded; a field the record lacks whose default was flipped after it
 was introduced takes its introduction-time value from the loader
-(``vfe3.config._HISTORICAL_DEFAULT_PINS``, listed as pinned), so the arms never inherit a default
-flip; every other field the record lacks takes the current default and is listed. Every base is its
-own experiment with its own directory and manifest.
+(``vfe3.config._HISTORICAL_DEFAULT_PINS``, or a migration keyed on the record's era; listed as
+pinned), so the arms never inherit a default flip; a selector the loader merged from historical keys
+the record carries is listed as migrated; every other field the record lacks takes the current
+default and is listed. Every base is its own experiment with its own directory and manifest.
 
 BUDGET. ``base_protocol``: the base run's own ``max_steps`` and ``eval_interval``, with
 ``checkpoint_interval = max_steps``. ``one_epoch``:
@@ -52,10 +53,16 @@ base's except where declared. Rules:
   reference moments (xi, C), so its frames are removable and the frame-free table arm is its equivalent.
   A base the validator does not admit these on resolves them as invalid with the validator's reason.
 * LayerNorm and MLP in reference coordinates: ``block_coordinates='reference'`` (the decoder stays
-  local; one change). On a base without a LayerNorm it conjugates the MLP alone.
+  local; one change). On a base without a LayerNorm it conjugates the MLP alone. On a
+  ``gaussian_diagonal`` base with ``block_norm_covariance='pushforward'`` it also declares
+  ``'passthrough'``: the reference-coordinate norm of the diagonal family maps the mean only (the field
+  is inert there, as the plan notes), so on that base the arm also gives up the base's covariance
+  pushforward, a declared second difference.
 * Intertwiner-constrained block: ``block_mlp_mode='gauge_gate'``, the block (and final) LayerNorm
   replaced by ``'mahalanobis'`` where the base has one (``'none'`` stays), and
-  ``decode_coordinates='reference'``.
+  ``decode_coordinates='reference'``. Where it replaces the LayerNorm it also declares
+  ``block_norm_covariance='passthrough'``: the LayerNorm Jacobian pushforward has no Mahalanobis
+  counterpart, so the field is inert under the replaced norm.
 * Word level: dataset ``wikitext-103-word-eos`` (the published stream, one ``<eos>`` per line), the
   vocabulary size from its sidecar, ``decode_ce_checkpoint='auto_aggregate'``, and the one-epoch budget over
   the word training split under either selected budget (:data:`WORD_LEVEL_BUDGET`). The conventional word arm is matched to the Gaussian word arm.
@@ -204,6 +211,32 @@ def _covariant_norm(name: str) -> Callable[[Any], str]:
         current = getattr(base, name)
         return "mahalanobis" if current == "layernorm" else current
     return value
+
+
+# Families whose reference-coordinate block norm pushes the covariance (audit 2026-10-10 round 2, item 51).
+_REFERENCE_PUSHFORWARD_FAMILIES: Tuple[str, ...] = ("gaussian_full", "gaussian_block")
+
+
+def _norm_covariance_without_layernorm(base: Any) -> str:
+    r"""``'passthrough'`` where the arm replaces the base's block LayerNorm, the base value otherwise.
+
+    ``block_norm_covariance='pushforward'`` is the LayerNorm Jacobian pushforward; the Mahalanobis norm that
+    replaces the LayerNorm has none, so the recorded value is unread there and ``'passthrough'`` is the only
+    value the validator admits.
+    """
+    return "passthrough" if base.norm_type_block == "layernorm" else base.block_norm_covariance
+
+
+def _norm_covariance_in_reference_coordinates(base: Any) -> str:
+    r"""``'passthrough'`` where the base family has no reference-coordinate pushforward, the base value otherwise.
+
+    In reference coordinates the block norm pushes the dense :math:`C = U^{-1} \Sigma U^{-T}` and maps it back
+    as :math:`U C' U^{T}`, which only the full and head-block families keep; on ``gaussian_diagonal`` the
+    reference-coordinate norm maps the mean only, so a recorded ``'pushforward'`` is unread there.
+    """
+    if base.family in _REFERENCE_PUSHFORWARD_FAMILIES:
+        return base.block_norm_covariance
+    return "passthrough"
 
 
 def _word_vocab_size(base: Any) -> int:
@@ -380,15 +413,20 @@ ARMS: Dict[str, Dict[str, Any]] = {
     "Frames frozen at their random initialization": {
         "group": _RETRAINING, "slug": "frozen_frames", "vfe": {"gauge_transport": "frozen"},
         "coerced": ("m_phi_lr",), "inapplicable": _already("gauge_transport", "frozen")},
+    # On some bases both arms leave the LayerNorm covariance pushforward unread; they then declare the
+    # passthrough the validator admits (a declared difference on a pushforward base, noted as inert).
     "LayerNorm and MLP in reference coordinates": {
-        "group": _RETRAINING, "slug": "reference_block", "vfe": {"block_coordinates": "reference"},
-        "requires": ("block_coordinates",), "inapplicable": _no_ln_or_mlp},
+        "group": _RETRAINING, "slug": "reference_block",
+        "vfe": {"block_coordinates": "reference",
+                "block_norm_covariance": _norm_covariance_in_reference_coordinates},
+        "requires": ("block_coordinates", "block_norm_covariance"), "inapplicable": _no_ln_or_mlp},
     "Intertwiner-constrained nonlinear block": {
         "group": _RETRAINING, "slug": "intertwiner_block",
         "vfe": {"block_mlp_mode": "gauge_gate",
                 "norm_type_block": _covariant_norm("norm_type_block"),
+                "block_norm_covariance": _norm_covariance_without_layernorm,
                 "decode_coordinates": "reference"},
-        "requires": ("decode_coordinates",), "inapplicable": _no_mlp_or_reference_decode},
+        "requires": ("decode_coordinates", "block_norm_covariance"), "inapplicable": _no_mlp_or_reference_decode},
     # Audit 2026-10-09 round 2 items 4 and 12: frames are pure gauge wherever every consumer reads (xi, C),
     # so there a learned-frame model equals the frame-free per-type (xi_v, C_v) table. The head-block family
     # makes the routing projection closed under block-GL congruence; the covariant stack (three declared
@@ -520,7 +558,8 @@ class Base:
     dataset:          str
     dropped:          Dict[str, Any] = field(default_factory=dict)   # retired fields dropped on load
     pinned:           Dict[str, Any] = field(default_factory=dict)   # absent fields the loader pins -> value
-    defaulted:        List[str] = field(default_factory=list)        # fields the record lacks
+    migrated:         Dict[str, Any] = field(default_factory=dict)   # selectors merged from recorded keys -> value
+    defaulted:        List[str] = field(default_factory=list)        # absent fields at the current default
     recorded_params:  Optional[int] = None                           # config.json n_params
     tokens_per_s:     Optional[float] = None                         # measured wall-clock throughput
     throughput_source: Optional[str] = None
@@ -533,12 +572,59 @@ def _quiet_config(build: Callable[[], Any]) -> Any:
         return build()
 
 
+def _merged_selector_sources() -> Dict[str, Tuple[str, ...]]:
+    r"""``{surviving selector: historical keys}`` for the selectors ``config_from_serialized`` merges.
+
+    A record that carries any of the historical keys had the surviving selector derived from them, whatever
+    value it took, so the selector is migrated, not defaulted.
+    """
+    from vfe3.config import _FRAME_PAIR_FIELDS, _PROJECTED_FACTORIZATION_FIELDS, _ROPE_FIELDS
+
+    return {"attention_mode": ("relational_mode", "relational_readout_mode"),
+            "projected_factorization": tuple(_PROJECTED_FACTORIZATION_FIELDS),
+            "rope_mode": tuple(_ROPE_FIELDS),
+            "frame_pair_escalation_tol": tuple(_FRAME_PAIR_FIELDS)}
+
+
+def _loader_chosen(cfg: Any, raw: Mapping[str, Any], known: Sequence[str], source: str) -> Dict[str, Any]:
+    r"""Fields ``raw`` lacks whose loaded value the loader chose instead of the current default.
+
+    This catches a conditional migration of an absent field (one keyed on the record's era, which no
+    table lists). A field whose loaded value equals its dataclass default is a default. Any other is
+    rebuilt alone at its default: a value ``VFE3Config.__post_init__`` resolves or coerces from the
+    record's own fields (``kl_max = 8 K``, the ``gauge_transport='off'`` frame fields) comes back
+    unchanged and is a default too; a value that comes back different, or a default the validator
+    refuses, was set by the loader.
+    """
+    from vfe3.config import VFE3Config, config_from_serialized, serialize_config
+
+    serialized = serialize_config(cfg)
+    chosen: Dict[str, Any] = {}
+    for spec in dataclasses.fields(VFE3Config):
+        if spec.name in raw or spec.name in known or spec.default is dataclasses.MISSING:
+            continue
+        value = getattr(cfg, spec.name)
+        if value == spec.default:
+            continue
+        probe_payload = {**serialized, spec.name: spec.default}
+        try:
+            probe = _quiet_config(lambda: config_from_serialized(probe_payload, source=source))
+        except (ValueError, TypeError):
+            chosen[spec.name] = value
+            continue
+        if getattr(probe, spec.name) != value:
+            chosen[spec.name] = value
+    return chosen
+
+
 def load_base(name: str, path: Union[str, Path]) -> Base:
     r"""Load a base run's config (lenient) and its measured throughput.
 
     A field the record lacks whose default was flipped after its introduction is pinned by the loader
-    (``vfe3.config._HISTORICAL_DEFAULT_PINS``, applied by ``config_from_serialized``) and listed in
-    ``pinned`` with its pinned value; every other absent field is listed in ``defaulted``.
+    (``vfe3.config._HISTORICAL_DEFAULT_PINS``, applied by ``config_from_serialized``), and so is one a
+    conditional migration of the loader sets from the record's era (:func:`_loader_chosen`); both are
+    listed in ``pinned`` with the value the base loads with. A selector the loader merged from historical
+    keys the record carries is listed in ``migrated``; every other absent field is listed in ``defaulted``.
     """
     from vfe3.config import _HISTORICAL_DEFAULT_PINS, VFE3Config
     from vfe3.legacy_config import lenient_config_from_serialized
@@ -546,20 +632,21 @@ def load_base(name: str, path: Union[str, Path]) -> Base:
     run_dir = Path(path)
     if not run_dir.is_absolute():
         run_dir = ROOT / run_dir
+    source = str(run_dir / "config.json")
     record = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
     raw = dict(record.get("config", record))
-    cfg, dropped = _quiet_config(
-        lambda: lenient_config_from_serialized(raw, source=str(run_dir / "config.json")))
-    pinned = {key: value for key, value in _HISTORICAL_DEFAULT_PINS.items() if key not in raw}
-    present = set(raw) | set(pinned)
-    if present & {"relational_mode", "relational_readout_mode"}:
-        present.add("attention_mode")                     # migrated from the historical pair
+    cfg, dropped = _quiet_config(lambda: lenient_config_from_serialized(raw, source=source))
+    pinned = {key: getattr(cfg, key) for key in _HISTORICAL_DEFAULT_PINS if key not in raw}
+    migrated = {selector: getattr(cfg, selector) for selector, keys in _merged_selector_sources().items()
+                if selector not in raw and any(key in raw for key in keys)}
+    pinned.update(_loader_chosen(cfg, raw, [*pinned, *migrated], source))
+    present = set(raw) | set(pinned) | set(migrated)
     defaulted = sorted(f.name for f in dataclasses.fields(VFE3Config) if f.name not in present)
     dataset = record.get("dataset")
     if not isinstance(dataset, str) or not dataset:
         raise ValueError(f"{run_dir / 'config.json'} records no dataset")
     base = Base(name=name, run_dir=run_dir, cfg=cfg, dataset=dataset, dropped=dict(dropped),
-                pinned=pinned, defaulted=defaulted,
+                pinned=pinned, migrated=migrated, defaulted=defaulted,
                 recorded_params=record.get("n_params") if isinstance(record.get("n_params"), int) else None)
     provenance_path = run_dir / "provenance.json"
     if provenance_path.is_file():
@@ -1047,7 +1134,8 @@ def format_plan(base: Base, plans: Sequence[ArmPlan], *, budget: str) -> str:
         f"norm={cfg.norm_type_block} affine={cfg.layernorm_affine} "
         f"mlp={cfg.block_mlp_mode if cfg.use_block_mlp else 'none'}x{cfg.block_mlp_expansion} "
         f"decode={cfg.decode_mode} batch={cfg.batch_size}x{cfg.max_seq_len} sigma_wd={cfg.sigma_weight_decay}",
-        f"  pinned (historical defaults the loader applies to absent fields): {base.pinned}",
+        f"  pinned (historical values the loader gives absent fields): {base.pinned}",
+        f"  migrated (selectors merged from recorded historical keys): {base.migrated}",
         f"  dropped retired fields: {sorted(base.dropped)}",
         f"  fields filled by current defaults: {base.defaulted}",
         f"  recorded n_params={base.recorded_params:,}" if base.recorded_params else "  recorded n_params=-",
@@ -1302,7 +1390,8 @@ def build_manifest(
         "out_dir": str(exp_dir / "paper_artifacts"),
         "paper_arms": {"base": base.name, "base_run": str(base.run_dir), "budget": budget,
                        "seeds": [list(pair) for pair in seeds], "rows": rows,
-                       "dropped_config_fields": sorted(base.dropped), "pinned": base.pinned},
+                       "dropped_config_fields": sorted(base.dropped), "pinned": base.pinned,
+                       "migrated": base.migrated},
     }
 
 

@@ -248,6 +248,7 @@ config: Dict[str, Any] = dict(
 
     layernorm_affine           = False,
     norm_type_block            = "none",             # "none" | "mahalanobis"
+    block_norm_covariance      = "passthrough",      # "passthrough" (the only value without a 'layernorm' block norm) | "pushforward"
 
     prior_handoff_rho          = 1,                  # 1.0 = full flow; 0.0 = priors frozen
     prior_handoff_sigma        = 0.1,                # sigma damping in [0,1] (0.0 = frozen at embedding)
