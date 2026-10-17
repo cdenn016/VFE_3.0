@@ -20,12 +20,12 @@ recomputes the scores tile by tile and writes
            = -\frac{[\tfrac12(a_{iv}-c_i) \ge 0]}{2} \frac{w_{iv}}{\tau}, \qquad
     w_{iv} = g_i \big(p_{iv} - [v = t_i]\big),
 
-into one (S, Vc) buffer that feeds the two cuBLAS backward GEMMs (dlhs = G rhs, [drhs, db] = G^T [lhs, 1]), and
-accumulates :math:`\partial/\partial c_i = -\sum_v G_{iv}` and :math:`\partial/\partial\tau = \tau^{-2}\sum_{iv}
-w_{iv}\,\mathrm{kl}_{iv}` per row. The backward GEMMs run under the caller's fp32 matmul policy, as the torch
-route's autograd backward does. When the torch route would keep its chunk workspace for backward
-(``decode_ce_checkpoint`` accounting), A is kept per chunk and G goes to a separate buffer; when it would
-checkpoint, A is recomputed by the same GEMM in backward and G overwrites it.
+into one (S, Vc) buffer that feeds the two cuBLAS backward GEMMs (dlhs = G rhs, drhs = G^T lhs) and the column
+reduction db = sum_i G, and accumulates :math:`\partial/\partial c_i = -\sum_v G_{iv}` and
+:math:`\partial/\partial\tau = \tau^{-2}\sum_{iv} w_{iv}\,\mathrm{kl}_{iv}` per row. The backward GEMMs run under the
+caller's fp32 matmul policy and db is a float32 reduction, as in the torch route's autograd backward. When the torch
+route would keep its chunk workspace for backward (``decode_ce_checkpoint`` accounting), A is kept per chunk and G
+goes to a separate buffer; when it would checkpoint, A is recomputed by the same GEMM in backward and G overwrites it.
 
 The logits are the torch route's bitwise (same operations in the same order, fp32 division by IEEE ``div_rn``; the
 compiled division flushes denormal results to zero; pinned by the CUDA test). The torch route is unchanged and
@@ -37,7 +37,7 @@ remains the reference; the differences are rounding-level and none changes the f
   multiplied the gradient error by up to 20 at tau = 0.01;
 * compiled kernels take ``exp`` from libdevice, since ``tl.exp`` (``ex2.approx``) tripled the temperature-gradient
   error at tau = 1; the interpreter uses numpy;
-* the row and column sums of the backward (dper_pos, dtau, db) are tile-ordered or GEMM-ordered sums.
+* the row and column sums of the backward (dper_pos, dtau, db) are tile-ordered or reduction-ordered sums.
 
 The kernels use no atomics, so results are bitwise reproducible run to run for a fixed GPU, shape and dtype.
 ``triton`` is imported only when this route launches.
@@ -137,12 +137,15 @@ class KLDecodeCE(torch.autograd.Function):
         need = ctx.needs_input_grad
         S, V = lhs.shape[0], rhs.shape[0]
         dtype, device = lhs.dtype, lhs.device
-        want_lhs, want_pp, want_cols, want_tau = need[0], need[1], need[2] or need[3], need[5]
+        want_lhs, want_pp, want_rhs, want_bias, want_tau = need[0], need[1], need[2], need[3], need[5]
         g_lhs = torch.zeros_like(lhs) if want_lhs else None                  # (S, 2K)
-        g_cols = torch.empty(V, lhs.shape[1] + 1, dtype=dtype, device=device) if want_cols else None
+        # d_rhs is a GEMM under the caller's fp32 matmul policy, as the torch route's autograd backward runs it;
+        # d_bias is a float32 column reduction, as the torch route's sum over the "+ bias" broadcast is. Folded into
+        # the GEMM as the ones column of [lhs, 1], it rounded G to TF32 under 'high' on CUDA (audit 2026-10-16, F115).
+        g_rhs = torch.empty(V, lhs.shape[1], dtype=dtype, device=device) if want_rhs else None   # (V, 2K)
+        g_bias = torch.empty(V, dtype=dtype, device=device) if want_bias else None               # (V,)
         d_pp = torch.zeros(S, dtype=dtype, device=device)                    # (S,) -sum_v G
         d_tau = torch.zeros(S if want_tau else 1, dtype=dtype, device=device)   # (S,) sum_v w kl
-        lhs_one = torch.cat([lhs, torch.ones(S, 1, dtype=dtype, device=device)], dim=1) if want_cols else None
         grad_rows = grad_rows.contiguous()
         cfg = tk.launch_config()["bwd"]
         scratch = (torch.empty(S * min(ctx.chunk, V), dtype=dtype, device=device)
@@ -152,8 +155,10 @@ class KLDecodeCE(torch.autograd.Function):
                 v1 = min(v0 + ctx.chunk, V)
                 rhs_c = rhs[v0:v1]
                 if S == 0:
-                    if want_cols:
-                        g_cols[v0:v1].zero_()
+                    if want_rhs:
+                        g_rhs[v0:v1].zero_()
+                    if want_bias:
+                        g_bias[v0:v1].zero_()
                     continue
                 if ctx.keep:
                     A = kept[index]
@@ -167,10 +172,10 @@ class KLDecodeCE(torch.autograd.Function):
                         NEED_TAU=want_tau)
                 if want_lhs:
                     g_lhs.addmm_(G, rhs_c)                                   # (S, 2K) += G rhs_c
-                if want_cols:
-                    torch.mm(G.t(), lhs_one, out=g_cols[v0:v1])              # (Vc, 2K+1) = G^T [lhs, 1]
-        g_rhs = g_cols[:, :-1] if (want_cols and need[2]) else None
-        g_bias = g_cols[:, -1] if (want_cols and need[3]) else None
+                if want_rhs:
+                    torch.mm(G.t(), lhs, out=g_rhs[v0:v1])                   # (Vc, 2K) = G^T lhs
+                if want_bias:
+                    torch.sum(G, dim=0, out=g_bias[v0:v1])                   # (Vc,) = sum_i G_iv
         g_tau = (d_tau.sum() / (tau * tau)).reshape(tau.shape) if want_tau else None
         return (g_lhs, d_pp if want_pp else None, g_rhs, g_bias, None, g_tau, None, None, None)
 
