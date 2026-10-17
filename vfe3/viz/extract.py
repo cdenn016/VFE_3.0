@@ -575,11 +575,6 @@ def numerical_health(
     }
 
 
-def _numel_counts(**tensors: torch.Tensor) -> Dict[str, int]:
-    r"""``numel_<name>``: the number of entries each ``nan_<name>`` fraction was taken over."""
-    return {f"numel_{name}": int(tensor.numel()) for name, tensor in tensors.items()}
-
-
 def guard_denominators(
     sigma:    torch.Tensor,                    # (..., K) diagonal OR (..., K, K) full covariance
     energy:   torch.Tensor,                    # (..., N, N) pairwise energies
