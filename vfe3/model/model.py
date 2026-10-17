@@ -1876,7 +1876,7 @@ class VFEModel(nn.Module):
         floor_active, ceiling_active = metrics.variance_guard_activity(self.cfg)
         d["guard_sigma_floor_frac"] = guard["sigma_floor_frac"] if floor_active else float("nan")
         d["guard_sigma_ceil_frac"] = guard["sigma_ceil_frac"] if ceiling_active else float("nan")
-        entries =[t for t in (belief.mu, belief.sigma, belief.phi) if t is not None]
+        entries = [t for t in (belief.mu, belief.sigma, belief.phi) if t is not None]
         d["nonfinite_frac"] = (float(sum(int((~torch.isfinite(t)).sum()) for t in entries))
                                / max(sum(t.numel() for t in entries), 1))
         n_support = support.sum(-1).clamp_min(2).double()                              # (B, H, N)
