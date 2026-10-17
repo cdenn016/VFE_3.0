@@ -3828,8 +3828,19 @@ def _no_update_call_with_precision_retry(
 
 def _eval_forward_with_precision_retry(model: VFEModel, *args: Any, **kwargs: Any) -> Any:
     r"""Run a no-update evaluation forward ``model(*args, **kwargs)`` on the replay ladder of training
-    (:func:`_no_update_call_with_precision_retry`)."""
-    return _no_update_call_with_precision_retry(model, lambda: model(*args, **kwargs), "evaluation forward")
+    (:func:`_no_update_call_with_precision_retry`).
+
+    Each attempt runs inside :func:`~vfe3.contracts.deferred_host_checks`, as the forward of :func:`train_step`
+    does: its raise-only certificates join the forward's next mandatory host read instead of synchronizing one at
+    a time, and the scope closes (resolving anything still queued) when the forward returns, before the caller
+    reads its decode statistics, so a deferred verdict still raises inside the ladder and is replayed (audit
+    2026-10-16 F125). Training diagnostics stay outside the scope: ``model.diagnostics`` reads its values on the
+    host before it returns, which the scope's contract excludes.
+    """
+    def forward() -> Any:
+        with deferred_host_checks():
+            return model(*args, **kwargs)
+    return _no_update_call_with_precision_retry(model, forward, "evaluation forward")
 
 
 def _diagnostics_with_precision_retry(

@@ -13,9 +13,9 @@ an unsized loader that yields nothing after re-iteration raises a ``RuntimeError
 F80: the word-cache builder wrote neither the vocabulary digest nor the ``<cache>.provenance.json`` manifest the
 loader checks, so neither check ran on a cache the repository builds.
 
-F125: evaluation and diagnostic forwards ran outside ``deferred_host_checks`` and paid one host synchronization per
-raise-only certificate. The no-update replay ladder now runs its call inside the deferral scope; the outputs are
-unchanged and a deferred verdict still reaches the ladder.
+F125: evaluation forwards ran outside ``deferred_host_checks`` and paid one host synchronization per raise-only
+certificate. Each attempt of the evaluation forward on the replay ladder now runs inside the deferral scope; the
+metrics are unchanged and a deferred verdict still reaches the ladder.
 
 Tiny CPU models only (K=4, two heads, N=4, vocab 7; the deferral test runs ``tests.profiles.live_config``).
 """
@@ -181,3 +181,71 @@ def test_forced_rebuild_publishes_a_manifest_for_the_new_payload(
     assert after["tokenizer_provenance"]["payload_sha256"] == after["sha256"]
 
 
+
+
+# ------------------------------------------------------------------------------------------------ F125
+
+def _counted_host_checks(monkeypatch: pytest.MonkeyPatch) -> Dict[str, int]:
+    r"""Count every ``host_check`` call as immediate (outside a deferral scope) or queued (inside one)."""
+    original = contracts.host_check
+    counts = {"immediate": 0, "queued": 0}
+
+    def counting(flags: torch.Tensor, verdict: Any) -> None:
+        counts["immediate" if contracts._DEFERRED_CHECKS is None else "queued"] += 1
+        original(flags, verdict)
+
+    for name, module in list(sys.modules.items()):
+        if name.startswith("vfe3") and getattr(module, "host_check", None) is original:
+            monkeypatch.setattr(module, "host_check", counting)
+    return counts
+
+
+def _live_evaluation() -> Tuple[VFEModel, List[Tuple[torch.Tensor, torch.Tensor]]]:
+    from tests.profiles import live_config
+    cfg = live_config()
+    torch.manual_seed(11)
+    model = VFEModel(cfg)
+    generator = torch.Generator().manual_seed(12)
+    stream = torch.randint(0, cfg.vocab_size, (3, cfg.batch_size, cfg.max_seq_len + 1), generator=generator)
+    return model, [(window[:, :-1], window[:, 1:]) for window in stream]   # (B, N) inputs and next-token targets
+
+
+def test_evaluation_forward_defers_its_raise_only_certificates(monkeypatch: pytest.MonkeyPatch) -> None:
+    model, batches = _live_evaluation()
+    counts = _counted_host_checks(monkeypatch)
+    T.evaluate(model, batches, device=CPU)
+    assert counts["queued"] > 0
+    assert counts["immediate"] == 0, counts
+
+
+def test_deferred_evaluation_keeps_the_metrics(monkeypatch: pytest.MonkeyPatch) -> None:
+    model, batches = _live_evaluation()
+    deferred = T.evaluate(model, batches, device=CPU)
+    monkeypatch.setattr(T, "deferred_host_checks", contextlib.nullcontext)
+    immediate = T.evaluate(model, batches, device=CPU)
+    assert deferred == immediate
+
+
+def test_a_deferred_evaluation_verdict_still_reaches_the_precision_ladder() -> None:
+    seen: List[Tuple[str, bool]] = []
+
+    def failing(host: List[bool]) -> None:
+        if host[0]:
+            raise ValueError("projected covariance is not positive definite")
+
+    class Fake:
+        def __call__(self, *args: Any, **kwargs: Any) -> str:
+            policy = torch.get_float32_matmul_precision()
+            seen.append((policy, contracts._DEFERRED_CHECKS is not None))
+            contracts.host_check(torch.tensor([policy != "highest"]), failing)
+            return "ok"
+
+    previous = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("high")
+    try:
+        assert T._eval_forward_with_precision_retry(Fake()) == "ok"
+        assert torch.get_float32_matmul_precision() == "high"
+    finally:
+        torch.set_float32_matmul_precision(previous)
+    assert seen == [("high", True), ("highest", True)]
+    assert contracts._DEFERRED_CHECKS is None
