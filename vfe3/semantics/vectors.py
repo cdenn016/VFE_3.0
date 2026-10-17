@@ -1152,14 +1152,19 @@ def semantic_projection(view: VectorView, axis: Mapping[str, Any], center: bool 
     ``axis`` = ``{"pairs": [(neg_id, pos_id), ...], "words": [ids], "neg_label": str,
     "pos_label": str}`` (resolved token ids). The axis direction is the unit mean of
     ``x_pos - x_neg`` over the pairs in the view (prepared rows); each word's score is its inner
-    product with it. ``loo_pair_accuracy`` is the fraction of pairs whose positive pole scores
-    above its negative pole on the axis built from the OTHER pairs (a held-out validity check).
+    product with it. A scored word that is also a pole word of a kept pair would be ranked on an
+    axis it helped define, so it is scored on the unit axis built from the pairs that do not
+    contain it (``held_out_pole_words``), and dropped when every pair contains it
+    (``dropped_pole_words``; audit 2026-10-16 F75). ``loo_pair_accuracy`` is the fraction of pairs
+    whose positive pole scores above its negative pole on the axis built from the OTHER pairs (a
+    held-out validity check).
     """
     ra, rb, kept = _row_pairs(view, [(int(n), int(p)) for n, p in axis["pairs"]])
     if not kept:
         return {"status": "skipped", "reason": "no axis pair in view"}
     Xp = prepare(view, center)
     diff = Xp[rb] - Xp[ra]                                              # (m, D) pos - neg
+    total = diff.sum(axis=0)                                            # (D,) sum of the pair offsets
     u = diff.mean(axis=0)
     u_norm = float(np.linalg.norm(u))
     if u_norm <= 0.0:
@@ -1167,18 +1172,38 @@ def semantic_projection(view: VectorView, axis: Mapping[str, Any], center: bool 
     u = u / u_norm
     loo = None
     if len(kept) >= 2:
-        total = diff.sum(axis=0)
         hits = []
         for i in range(len(kept)):
             rest = total - diff[i]
             hits.append(float(diff[i] @ rest) > 0.0)
         loo = float(np.mean(hits))
-    words = [int(w) for w in axis.get("words", []) if view.has(w)]
-    wrows = view.rows(words)
-    scores = Xp[wrows] @ u if words else np.zeros(0)
+    pole_pairs: Dict[int, List[int]] = {}                               # pole word -> kept pairs containing it
+    for i, pair in enumerate(kept):
+        for w in set(pair):
+            pole_pairs.setdefault(w, []).append(i)
+    words: List[int] = []
+    scores_list: List[float] = []
+    held_out: List[int] = []
+    dropped: List[int] = []
+    for w in (int(w) for w in axis.get("words", []) if view.has(w)):
+        x = Xp[view.rows([w])[0]]                                       # (D,)
+        if w not in pole_pairs:
+            words.append(w)
+            scores_list.append(float(x @ u))
+            continue
+        rest = total - diff[pole_pairs[w]].sum(axis=0)                  # (D,) axis of the other pairs
+        rest_norm = float(np.linalg.norm(rest))
+        if len(pole_pairs[w]) == len(kept) or rest_norm <= 0.0:
+            dropped.append(w)
+            continue
+        words.append(w)
+        scores_list.append(float(x @ rest) / rest_norm)
+        held_out.append(w)
+    scores = np.asarray(scores_list, dtype=np.float64)
     order = np.argsort(-scores, kind="stable")
     return {
         "n_pairs": len(kept), "n_words": len(words),
+        "held_out_pole_words": held_out, "dropped_pole_words": dropped,
         "neg_label": axis.get("neg_label", "neg"), "pos_label": axis.get("pos_label", "pos"),
         "words": [(words[i], float(scores[i])) for i in order],
         "pair_words": [{"neg": a, "pos": b, "neg_score": float(Xp[r0] @ u), "pos_score": float(Xp[r1] @ u)}
@@ -2497,7 +2522,8 @@ def _compare_projections(results: Results, views: Views, ctx: AnalysisContext, h
         ax.set_xlabel(f"{p['neg_label']} $\\leftrightarrow$ {p['pos_label']}", fontsize=7)
     _panel_letters(axes[0])
     _suptitle(fig, f"{views[headline].label}: semantic projection")
-    _footnote(fig, "Shaded: score range of the negative (vermillion) and positive (blue) pole words; LOO: "
+    _footnote(fig, "Shaded: score range of the negative (vermillion) and positive (blue) pole words; a listed "
+                   "word that is also a pole word is scored on the axis built from the pairs without it; LOO: "
                    "fraction of pole pairs ordered correctly by the axis built from the other pairs "
                    "(Grand et al. 2022).", width=60 if len(axes_ok) == 1 else 100)
     return fig

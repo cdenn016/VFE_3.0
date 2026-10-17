@@ -1,4 +1,4 @@
-r"""Audit 2026-10-16, lane C2 (semantic analysis), batch 4: F74, F76.
+r"""Audit 2026-10-16, lane C2 (semantic analysis), batch 4: F74, F75, F76.
 
 Fake runs, planted vector views and a tiny model (vocabulary of about 90 words, K=4, two heads, at most
 two layers); nothing is trained, everything runs on the CPU.
@@ -7,6 +7,9 @@ two layers); nothing is trained, everything runs on the CPU.
   REPORT.md gauge paragraph and the phi-section note say so, and name the relational content links as a
   separate connection whose triangle holonomy is not the identity in general, whatever
   ``content_link_edges`` is.
+* F75: a scored word that is also a pole word of the antonym axis is scored on the axis built from the
+  pairs that do not contain it (dropped when every pair contains it), so no word is ranked on an axis it
+  defines.
 * F76: without training counts the frame reference set is the first candidates in token-id order, and
   the phi note, the ``phi_log`` view note and the phi summary say so instead of "most frequent".
 """
@@ -70,6 +73,50 @@ def test_phi_holonomy_note_adds_the_edge_factors_when_edges_are_on() -> None:
     on = F._frame_holonomy_note(SimpleNamespace(content_link_edges="pure_gauge"))
     assert "not the identity in general" in off and "content_link_edges" not in off
     assert "content_link_edges='pure_gauge'" in on and on.startswith(off.split(";")[0])
+
+
+# ----------------------------------------------------------------------------------------------
+# F75: pole words are scored on the axis built from the pairs that do not contain them
+# ----------------------------------------------------------------------------------------------
+
+def _planted_axis_view(seed: int = 21) -> VectorView:
+    rng = np.random.default_rng(seed)
+    D = 6
+    X = rng.standard_normal((14, D))
+    for i in range(4):                                                  # pair i = (2i, 2i + 1), pos - neg ~ e0
+        X[2 * i + 1] = X[2 * i] + np.eye(D)[0] + 0.4 * rng.standard_normal(D)
+    return VectorView("v", "v", np.arange(14), X, metric="euclidean")
+
+
+def test_semantic_projection_scores_pole_words_out_of_sample() -> None:
+    view = _planted_axis_view()
+    pairs = [(2 * i, 2 * i + 1) for i in range(4)]
+    words = [1, 4] + list(range(8, 14))                                 # 1 and 4 are pole words of pairs 0 and 2
+    res = vectors.semantic_projection(view, {"pairs": pairs, "words": words, "neg_label": "n",
+                                             "pos_label": "p"})
+    Xp = vectors.prepare(view, True)
+    diff = np.stack([Xp[b] - Xp[a] for a, b in pairs])                  # (4, D) pos - neg
+
+    def unit(v: np.ndarray) -> np.ndarray:
+        return v / np.linalg.norm(v)
+
+    u = unit(diff.mean(axis=0))
+    scores = dict(res["words"])
+    assert res["n_words"] == len(words) and sorted(res["held_out_pole_words"]) == [1, 4]
+    assert res["dropped_pole_words"] == []
+    assert scores[1] == pytest.approx(float(Xp[1] @ unit(diff[[1, 2, 3]].sum(axis=0))), abs=1e-12)
+    assert scores[4] == pytest.approx(float(Xp[4] @ unit(diff[[0, 1, 3]].sum(axis=0))), abs=1e-12)
+    assert abs(scores[1] - float(Xp[1] @ u)) > 1e-3                    # the in-sample score differs
+    for w in range(8, 14):                                               # other words keep the full axis
+        assert scores[w] == pytest.approx(float(Xp[w] @ u), abs=1e-12)
+    assert [s for _, s in res["words"]] == sorted(scores.values(), reverse=True)
+
+
+def test_semantic_projection_drops_a_word_that_every_pair_contains() -> None:
+    view = _planted_axis_view()
+    res = vectors.semantic_projection(view, {"pairs": [(0, 1)], "words": [1, 9, 10]})
+    assert res["dropped_pole_words"] == [1] and res["held_out_pole_words"] == []
+    assert sorted(w for w, _ in res["words"]) == [9, 10] and res["n_words"] == 2
 
 
 # ----------------------------------------------------------------------------------------------
