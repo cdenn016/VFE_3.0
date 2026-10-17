@@ -11,7 +11,7 @@ from typing import List, Optional, Sequence, Tuple
 import torch
 
 from vfe3.families.base import (
-    BeliefParams, register_family, safe_kl_clamp, _logdet_chol, ratio_minus_one_minus_log,
+    BeliefParams, register_family, safe_kl_clamp, _logdet_chol, ratio_minus_one_minus_log, x_minus_log1p,
     _KL_ALPHA_SWITCH, _RENYI_KL_BAND,
 )
 from vfe3.numerics import safe_cholesky, validated_cholesky_solve
@@ -123,7 +123,9 @@ def _full_gaussian_kl_coordinate_terms(
     v = torch.linalg.solve_triangular(L_p, (mu_q - mu_p).unsqueeze(-1), upper=False).squeeze(-1)
     pivot = T.diagonal(dim1=-2, dim2=-1)
     delta = pivot - 1
-    variance_cost = delta.square() + 2 * (delta - torch.log1p(delta))
+    # delta - log1p(delta) through the cancellation-free helper: the direct form loses about eps/|delta|
+    # relative accuracy near equality (9e-3 at |delta| ~ 1e-5 in float32; audit 2026-10-16, F44).
+    variance_cost = delta.square() + 2 * x_minus_log1p(delta)
     terms = .5 * (variance_cost + T.tril(-1).square().sum(-1) + v.square())
     inv_cond = torch.minimum(_inv_cond_from_chol(L_q), _inv_cond_from_chol(L_p))
     return terms, ok_q & ok_p, inv_cond
