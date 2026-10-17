@@ -31,9 +31,10 @@ def _full_gaussian_public_dtype(*dtypes: torch.dtype) -> torch.dtype:
 #
 # Pivot-ratio floor at which a float32 grid is promoted to float64.
 #
-# CALIBRATED, NOT DERIVED. The proxy is min(diag L)^2 / max(diag L)^2, which is a lower bound on
-# 1/cond and under-reports true conditioning by 2-3 decades, so the threshold was measured rather
-# than reasoned (K=20, 20 draws per row, random orthogonal eigenbasis):
+# CALIBRATED, NOT DERIVED. The proxy is min(diag L)^2 / max(diag L)^2, which is an upper bound on
+# 1/cond (each squared pivot L_kk^2 is a Schur-complement pivot, so lambda_min <= L_kk^2 <= Sigma_kk
+# <= lambda_max) and under-reports true conditioning by 2-3 decades, so the threshold was measured
+# rather than reasoned (K=20, 20 draws per row, random orthogonal eigenbasis):
 #
 #   true cond   pivot ratio   fp32 relative KL error
 #   1e2         1.04e-1       4.1e-07
@@ -55,7 +56,13 @@ _FULL_COV_KL_COND_FLOOR: float = 1e-4
 
 
 def _inv_cond_from_chol(factor: torch.Tensor) -> torch.Tensor:
-    r"""``min(diag L)^2 / max(diag L)^2`` -- a free lower bound on ``1 / cond(L L^T)``."""
+    r"""``min(diag L)^2 / max(diag L)^2`` -- a free upper bound on ``1 / cond(L L^T)``.
+
+    Each squared pivot is a Schur-complement pivot of :math:`\Sigma = L L^T`, so
+    :math:`\lambda_{\min} \le L_{kk}^2 \le \Sigma_{kk} \le \lambda_{\max}` and the ratio is at least
+    :math:`\lambda_{\min} / \lambda_{\max} = 1 / \mathrm{cond}`. The proxy is a lower bound on the condition
+    number: a small ratio certifies ill-conditioning, a large one does not certify the converse.
+    """
     diag = torch.diagonal(factor, dim1=-2, dim2=-1).abs()
     lo = diag.amin(dim=-1)
     hi = diag.amax(dim=-1).clamp_min(torch.finfo(diag.dtype).tiny)
@@ -90,8 +97,9 @@ def _full_gaussian_kl_terms(
     logdet_q = _logdet_chol(L_q)
     div = 0.5 * (trace_term + mahal_term - K + logdet_p - logdet_q)
     # Free conditioning estimate from the factors already computed: for Sigma = L L^T the squared
-    # Cholesky pivots bracket the spectrum, so min(diag L)^2 / max(diag L)^2 is a lower bound on
-    # 1/cond(Sigma). Costs two reductions over an existing tensor -- no extra factorization.
+    # Cholesky pivots lie inside the spectrum, so min(diag L)^2 / max(diag L)^2 is an upper bound on
+    # 1/cond(Sigma) (a lower bound on cond). Costs two reductions over an existing tensor -- no extra
+    # factorization.
     inv_cond = torch.minimum(_inv_cond_from_chol(L_p), _inv_cond_from_chol(L_q))
     return div, ok_p & ok_q, inv_cond
 
