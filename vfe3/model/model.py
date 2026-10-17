@@ -856,8 +856,9 @@ class VFEModel(nn.Module):
                 return (float(self.cfg.sigma_init) * eye).expand_as(sigma_q).contiguous()
             return torch.full_like(sigma_q, float(self.cfg.sigma_init))
         if encoded_sigma is None:
-            raise ValueError("decode_covariance='encoded' needs the encoded covariance; decode through "
-                             "forward_beliefs or forward, which carry it")
+            raise ValueError("decode_covariance='encoded' needs the encoded covariance: pass encoded_sigma, the "
+                             "stack-input covariance forward_beliefs decodes with (capture['prior'].sigma of a "
+                             "captured forward_beliefs, or its diagnostic capture's initial_belief.sigma)")
         if full and encoded_sigma.dim() == mu_q.dim():
             encoded_sigma = torch.diag_embed(encoded_sigma)          # (B, N, K) -> (B, N, K, K)
         return encoded_sigma
@@ -877,7 +878,10 @@ class VFEModel(nn.Module):
         Decoding is positionwise, so ``decode_last`` slices the query, its covariance, and its
         realized frame to the final position BEFORE the vocabulary readout rather than decoding
         all ``N`` positions and discarding ``N - 1`` of them. A prior-bank decoder reads the covariance
-        :meth:`_decode_covariance` selects; the linear readout ignores it.
+        :meth:`_decode_covariance` selects; the linear readout ignores it. Under ``decode_covariance='encoded'`` a
+        caller that decodes a stored belief again passes ``encoded_sigma``, the stack-input covariance
+        :meth:`forward_beliefs` decoded with: ``capture['prior'].sigma`` of a captured forward, the same tensor as
+        the diagnostic capture's ``initial_belief.sigma`` (audit 2026-10-16 F64).
         """
         if self.cfg.decode_mode != "linear":
             sigma_q = self._decode_covariance(mu_q, sigma_q, encoded_sigma)
