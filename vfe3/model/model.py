@@ -1316,12 +1316,15 @@ class VFEModel(nn.Module):
                                      reduction="sum") / n_valid
         loss = ce if decode_objective is None else decode_objective
         if self.cfg.mstep_self_coupling_weight > 0.0:
-            # M-step self-coupling regularizer (manuscript Algorithm 1, GL(K)_attention.tex:2111):
-            # L += alpha_hat * sum_i alpha_i D(q_i*||p_i), the alpha-weighted self-coupling of the
-            # CONVERGED variational belief q* (captured by vfe_block BEFORE
-            # cg_coupling / block_norm -- the belief the E-step's F was actually minimized over,
-            # which the manuscript pins the self-term to) against the live prior captured immediately
-            # before the final block. With the three transform toggles
+            # M-step self-coupling regularizer L += alpha_hat * sum_i alpha_i D(q_i*||p_i), the hat-alpha term of
+            # the M-step loss of Algorithm alg:em_loop in the original GL(K)_attention.tex (archived as
+            # OLD_MAgent_Model-main/Manuscripts-Theory/GL(K)_attention.tex:2118; the alg:em_loop of the local
+            # docs/manuscripts/2026-09-20-glk-attention snapshot and the current GL(K)_attention_v2.tex carry no
+            # such term). It is the alpha-weighted self-coupling of q*, the belief the final block's E-step
+            # returns (captured by vfe_block BEFORE cg_coupling / block_norm; on projected_predictive this is the
+            # predictive readout, not a minimizer of F, which no supported route minimizes:
+            # free_energy.free_energy), against the live prior captured immediately before the final block.
+            # With the three transform toggles
             # at their defaults q* IS the returned `out` (same object), so the pure path is
             # unchanged; under the toggles the term now reads q* rather than the transformed
             # handoff T(q*) it accidentally read before (audit 2026-06-09 overnight F19,
@@ -1334,7 +1337,12 @@ class VFEModel(nn.Module):
             # so d/dalpha[alpha*D + R] = 0 there), the M-step gradient of the F self-term w.r.t. the
             # prior is alpha_i* dD/dtheta with alpha_i* held fixed -- detaching it (and dropping R)
             # is exact for the closed-form forms (state_dependent/state_dependent_per_coord).
-            # Grad-connected through D (no detach on D), so it backprops to the learned prior tables.
+            # Grad-connected through D (no detach on D), so it backprops to the learned prior tables and, through
+            # q* (and, at prior_handoff_rho > 0 with n_layers > 1, the handed-off prior, a previous block's
+            # output), to every parameter upstream of the final block: the straight-through M-step of that
+            # algorithm, whose gradients flow through the whole graph. It is not a coordinate M-step with q*
+            # held fixed (audit 2026-10-16 F11); tests/test_phi_outer_objective_gradient.py pins this total
+            # derivative against finite differences.
             # Capturing the final-block input preserves the exact stack recurrence at
             # every depth; at n_layers=1 it is the encode-time prior, preserving the existing path.
             from vfe3.families import get_family
@@ -1343,7 +1351,7 @@ class VFEModel(nn.Module):
             cfg = self.cfg
             mu_p, sigma_p = cap["final_block_prior"]            # live prior entering the final block
             fam = get_family(cfg.family)
-            q_conv = cap["converged"]                           # q*: pre-transform converged belief
+            q_conv = cap["converged"]                           # q*: final-block E-step output, pre-transform
             self_div = self_divergence_for_alpha(               # (B, N) summed, or (B, N, K) per-coord
                 fam(q_conv.mu, q_conv.sigma),
                 fam(mu_p, sigma_p),
