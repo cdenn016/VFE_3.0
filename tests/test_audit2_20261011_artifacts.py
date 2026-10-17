@@ -204,9 +204,13 @@ def test_save_figures_routes_the_canonical_diagnostic(tmp_path: Path, monkeypatc
     called: List[str] = []
     for name in ("plot_canonical_free_energy_relationship", "plot_canonical_free_energy_decomposition",
                  "plot_free_energy_relationship", "plot_free_energy_decomposition"):
-        def fake(history: Dict, *, lambda_beta: float = 1.0, path: str = "", _name: str = name) -> Any:
+        def fake(history: Dict, *, lambda_beta: float = 1.0, path: str = "", _name: str = name,
+                 **kwargs: Any) -> Any:
             called.append(_name)
             assert _name.startswith("plot_free") or "self_divergence" in history
+            # No held-out val_* F columns in this history: the canonical figures name the training batch
+            # (audit 2026-10-16 F83).
+            assert _name.startswith("plot_free") or kwargs == {"population": "training_batch"}
             Path(path).write_bytes(b"png")
             return figs.plt.figure()
         monkeypatch.setattr(figs, name, fake)

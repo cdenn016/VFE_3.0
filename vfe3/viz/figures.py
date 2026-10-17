@@ -25,7 +25,7 @@ import matplotlib.figure
 import matplotlib.pyplot as plt
 
 from vfe3.families.base import get_functional_display
-from vfe3.metric_contracts import SCALING_MIN_TESTABLE_SIZES
+from vfe3.metric_contracts import scaling_min_testable_sizes
 from vfe3.process_utils import ProcessTree, spawn_process_tree
 import numpy as np
 from matplotlib.collections import PathCollection, QuadMesh
@@ -1685,6 +1685,22 @@ _CANONICAL_ROUTER_SERIES: Tuple[Tuple[str, str], ...] = (
 )
 _CANONICAL_FE_NOTE = ("Canonical F at the beliefs each router read (diagnose_canonical_free_energy): a diagnostic. "
                       "No step on this route optimizes it.")
+# The batch the plotted canonical F was evaluated on: the val_* columns of _val_diagnostics (the validation split
+# val_ce is scored on) or, for a run that logged only the log-step columns, the training batch (audit 2026-10-16
+# F83): (title prefix, note sentence).
+_CANONICAL_FE_POPULATIONS: Dict[str, Tuple[str, str]] = {
+    "held_out": ("Held-out", "F on the held-out diagnostic sequences, CE over the validation split."),
+    "training_batch": ("Training-batch", "F on the training batch of each log step, CE over the validation "
+                                         "split: the two come from different data."),
+}
+
+
+def _canonical_fe_population(population: str) -> Tuple[str, str]:
+    r"""``(title prefix, note sentence)`` of a canonical-F population; ValueError for an unknown one."""
+    if population not in _CANONICAL_FE_POPULATIONS:
+        raise ValueError(f"canonical free-energy population must be one of "
+                         f"{sorted(_CANONICAL_FE_POPULATIONS)}, got {population!r}")
+    return _CANONICAL_FE_POPULATIONS[population]
 
 
 def _canonical_router_panel(ax, history: Dict, step: np.ndarray) -> bool:
@@ -1714,6 +1730,7 @@ def plot_canonical_free_energy_relationship(
 
     *,
     lambda_beta: 'float | np.ndarray' = 1.0,
+    population:  str           = "held_out",     # "held_out" | "training_batch" (_CANONICAL_FE_POPULATIONS)
     path:        Optional[str] = None,
 ):
     r"""The canonical free energy at the captured beliefs beside the held-out CE (a diagnostic).
@@ -1724,7 +1741,11 @@ def plot_canonical_free_energy_relationship(
     line under a rolling mean, with their Pearson association in the title. Right, when logged: the total
     variation between the model's router and :math:`\beta^*` (and the canonical self weight). On the
     projected routes nothing optimizes :math:`F`, so the figure makes no E-step or co-descent claim.
+    ``population`` names the batch the :math:`F` columns were evaluated on, in the title and the note: the
+    held-out diagnostic sequences (the ``val_*`` columns) or the training batch of each log step, which
+    pairs the correlation across two populations.
     """
+    title_prefix, population_note = _canonical_fe_population(population)
     step, _comps, total, ce = _fe_terms(history, lambda_beta)
     keep = np.isfinite(total) & np.isfinite(ce)
     router_history = {key: _np(history[key]).astype(float)[keep]
@@ -1750,14 +1771,15 @@ def plot_canonical_free_energy_relationship(
         ln2, = ax2.plot(step, _rolling_mean(ce, w), lw=1.6, color=_CB[1], ls="--", label=clab)
         ax2.set_ylabel("validation CE (nats/token)", color=_CB[1]); ax2.tick_params(axis="y", colors=_CB[1])
         ax2.grid(False)
-        title = "Canonical F (diagnostic) and validation CE"
+        title = f"{title_prefix} canonical F (diagnostic) and validation CE"
         if total.size > 2:
             title += rf" (Pearson $r={float(np.corrcoef(total, ce)[0, 1]):+.2f}$)"
         ax.set_title(title)
         ax.legend([ln1, ln2], [ln1.get_label(), ln2.get_label()], loc="upper right", frameon=False)
         if has_router:
             _canonical_router_panel(axes[0][1], router_history, step)
-        fig.text(0.01, 0.005, _CANONICAL_FE_NOTE, fontsize=6, color="#444444", ha="left", va="bottom")
+        fig.text(0.01, 0.005, f"{_CANONICAL_FE_NOTE} {population_note}", fontsize=6, color="#444444",
+                 ha="left", va="bottom")
         fig.tight_layout(rect=(0.0, 0.05, 1.0, 1.0))
         return _save(fig, path)
 
@@ -1769,6 +1791,7 @@ def plot_canonical_free_energy_decomposition(
 
     *,
     lambda_beta: 'float | np.ndarray' = 1.0,
+    population:  str           = "held_out",     # "held_out" | "training_batch" (_CANONICAL_FE_POPULATIONS)
     path:        Optional[str] = None,
 ):
     r"""Terms of the canonical free energy at the captured beliefs, at the last evaluation and by training third.
@@ -1780,8 +1803,10 @@ def plot_canonical_free_energy_decomposition(
     Panel B: the same terms as medians over the early, mid and late thirds of training. Panel C, when
     logged: the total variation between the model's router and :math:`\beta^*` (and the canonical self
     weight). The axes are logarithmic when every drawn value is positive. A diagnostic: nothing on the
-    projected routes optimizes :math:`F`.
+    projected routes optimizes :math:`F`. ``population`` names, in the note, the batch the terms were evaluated
+    on (the held-out diagnostic sequences or the training batch of each log step).
     """
+    _title_prefix, population_note = _canonical_fe_population(population)
     step, comps, _total, _ce = _fe_terms(history, lambda_beta)
     names = [_CANONICAL_FE_LABELS[k][1] for k, _ in comps]
     labels = [_CANONICAL_FE_LABELS[k][0] for k, _ in comps]
@@ -1828,7 +1853,8 @@ def plot_canonical_free_energy_decomposition(
         axes[1].legend(frameon=False, loc="best")
         if has_router:
             _canonical_router_panel(axes[2], history, step)
-        fig.text(0.01, 0.005, _CANONICAL_FE_NOTE, fontsize=6, color="#444444", ha="left", va="bottom")
+        fig.text(0.01, 0.005, f"{_CANONICAL_FE_NOTE} {population_note}", fontsize=6, color="#444444",
+                 ha="left", va="bottom")
         fig.tight_layout(rect=(0.0, 0.05, 1.0, 1.0))
         return _save(fig, path)
 
@@ -2215,6 +2241,15 @@ def plot_estep_character(
     return _save(fig, path)
 
 
+# Bar labels of plot_beta_channel_decomposition. Under a rope_mode other than 'none' the routing cost carries
+# RoPE position as well as content (the writer flags energy_includes_rope_position), so content_channel is
+# relabelled and the rotation-only arm is drawn beside it (audit 2026-10-16, F25).
+BETA_CHANNEL_POSITIONAL_LABEL   = "positional prior"
+BETA_CHANNEL_CONTENT_LABEL      = "content energy"
+BETA_CHANNEL_ROUTING_COST_LABEL = "routing cost\n(content + RoPE position)"
+BETA_CHANNEL_ROPE_LABEL         = "RoPE position\n(rotation only)"
+
+
 @register_figure("beta_channel_decomposition")
 def plot_beta_channel_decomposition(
     record: Mapping[str, object],
@@ -2222,29 +2257,45 @@ def plot_beta_channel_decomposition(
     *,
     path:   Optional[str] = None,
 ):
-    r"""Plot what each channel of the attention weight is worth, in nats of cross-entropy."""
+    r"""Plot what each channel of the attention weight is worth, in nats of cross-entropy.
+
+    Each bar is :math:`\Delta\mathrm{CE} = \mathrm{CE}(\text{arm}) - \mathrm{CE}(\text{full})` of one separate
+    ablation of :func:`vfe3.run_artifacts.collect_beta_channel_decomposition`. When the record flags
+    ``energy_includes_rope_position``, the ``content_channel`` bar (the whole routing cost zeroed) is labelled
+    as content plus RoPE position and the ``rope_position_channel`` arm (rotation :math:`R_i = I` inside the
+    cost) is drawn beside it. The arms are not additive, so no difference of bars is shown as "content".
+    A record without the flag (``rope_mode='none'``, or written before the flag existed) keeps two bars.
+    """
     if record.get("available") is False:
         return _unavailable_probe_figure(record, path)
     fig, ax = plt.subplots(figsize=(5.0, 3.4))
     deltas = record.get("delta_ce") or {}
-    labels, values = [], []
-    for key, label in (("positional_channel", "positional prior"),
-                       ("content_channel", "content energy")):
+    rope_in_cost = bool(record.get("energy_includes_rope_position"))
+    channels = [("positional_channel", BETA_CHANNEL_POSITIONAL_LABEL, _CB[1]),
+                ("content_channel",
+                 BETA_CHANNEL_ROUTING_COST_LABEL if rope_in_cost else BETA_CHANNEL_CONTENT_LABEL, _CB[0])]
+    if rope_in_cost:
+        channels.append(("rope_position_channel", BETA_CHANNEL_ROPE_LABEL, _CB[2]))
+    labels, values, colors = [], [], []
+    for key, label, color in channels:
         if deltas.get(key) is not None:
             labels.append(label)
             values.append(float(deltas[key]))
+            colors.append(color)
     if not values:
         ax.text(0.5, 0.5, "no live beta softmax intercepted", ha="center", va="center",
                 transform=ax.transAxes, fontsize=9)
         ax.set_axis_off()
         return _save(fig, path)
-    bars = ax.bar(labels, values, color=[_CB[1], _CB[0]][:len(values)], width=0.55)
+    bars = ax.bar(labels, values, color=colors, width=0.55)
     for bar, value in zip(bars, values):
         ax.annotate(f"{value:+.3f}", (bar.get_x() + bar.get_width() / 2.0, value),
                     ha="center", va="bottom", fontsize=8)
     ax.axhline(0.0, color="#555555", lw=0.8)
     ax.set(ylabel=r"$\Delta$CE when ablated (nats)",
            title="What each attention channel carries")
+    if rope_in_cost and len(values) == 3:
+        ax.set_xlabel("separate ablations; the bars do not add", fontsize=7, color="#555555")
     fig.tight_layout()
     return _save(fig, path)
 
@@ -3000,6 +3051,13 @@ def plot_validation_sanity(
         {"title": "Held-out frame norm", "ylabel": r"$\|\phi\|$", "series": [
             ("val_phi_norm_mean", r"mean $\|\phi\|$", _CB[0]),
             ("val_phi_norm_std", r"std $\|\phi\|$", _CB[5])]},
+        # The held-out counterparts of geometry_health's chart-radius and vertex panels (audit 2026-10-16 F83).
+        {"title": "Held-out phi chart radius", "ylabel": r"$\|\phi^a G_a\|_F$", "logy": True, "series": [
+            ("val_phi_matrix_norm_p95", "p95", _CB[0]),
+            ("val_phi_matrix_norm_p99", "p99", _CB[1]),
+            ("val_phi_matrix_norm_max", "max", _CB[3])]},
+        {"title": "Held-out vertex conditioning", "ylabel": r"$\kappa(\exp\phi)$", "logy": True,
+         "series": [("val_vertex_cond_p99", "p99", _CB[3])]},
     ]
     return _history_dashboard(history, panels, "Held-out validation sanity", path, ncols=3)
 
@@ -3011,7 +3069,8 @@ VALIDATION_SANITY_COLUMNS = (
     "val_gauge_invariant_spread",
     "val_belief_cond_p95", "val_fisher_trace_mean", "val_guard_sigma_floor_frac",
     "val_guard_sigma_ceil_frac",
-    "val_phi_norm_mean", "val_phi_norm_std")
+    "val_phi_norm_mean", "val_phi_norm_std",
+    "val_phi_matrix_norm_p95", "val_phi_matrix_norm_p99", "val_phi_matrix_norm_max", "val_vertex_cond_p99")
 
 
 @register_figure("optimizer_geometry")
@@ -4438,7 +4497,7 @@ def plot_lr_grid_heatmap(
     fig.colorbar(im, ax=ax, shrink=0.85, label="val PPL")
     iy, ix = np.unravel_index(np.nanargmin(z), z.shape)
     ax.scatter([x[ix]], [y[iy]], marker="*", s=160, color="white", edgecolor="black", label="min")
-    if "baseline" in grid:
+    if grid.get("baseline") is not None:                   # a sweep may declare no baseline point
         bx, by = grid["baseline"]
         ax.scatter([bx], [by], marker="o", s=60, facecolor="none", edgecolor="red", label="baseline")
     ax.set(xlabel=grid.get("xlabel", "lr x"), ylabel=grid.get("ylabel", "lr y"),
@@ -4457,6 +4516,7 @@ def plot_numerical_trust(
     *,
     guard_denominators: Optional[Mapping[str, int]] = None,  # guard key -> entries examined
     population:         Optional[str]               = None,  # e.g. "test split, one sequence of 64 tokens"
+    guard_scope:        Optional[str]               = None,  # e.g. "last layer": what the guard rows read
     leak_tol:           float                       = 1e-6,
     row_sum_tol:        float                       = 1e-5,
     path:               Optional[str]               = None,
@@ -4471,9 +4531,17 @@ def plot_numerical_trust(
     :func:`vfe3.viz.extract.numerical_health`). Causal rows count (layer, head) maps with future
     attention :math:`\max_{j>i}\beta_{ij}>` ``leak_tol`` and with row-sum error above
     ``row_sum_tol``. A missing denominator is printed as such rather than guessed. Nonzero counts
-    are shaded. ``population`` names what the counts were measured on.
+    are shaded. ``population`` names what the counts were measured on. The row groups may read
+    different layers, so each names its own scope: ``guard_scope`` suffixes the guard rows, and the
+    finiteness rows and the condition-number title carry "all L layers" when ``health["n_layers"]``
+    is above one (``numerical_health`` pools every layer).
     """
     guard_denominators = dict(guard_denominators or {})
+    guard_suffix = f" ({guard_scope})" if guard_scope else ""
+    n_layers = health.get("n_layers")
+    layer_suffix = (f" (all {int(n_layers)} layers)"
+                    if isinstance(n_layers, (int, float)) and np.isfinite(float(n_layers))
+                    and int(n_layers) > 1 else "")
     guard_names = {
         "sigma_floor_frac":       r"variance at the floor $\varepsilon$",
         "sigma_ceil_frac":        r"variance at the ceiling $\sigma_{\max}$",
@@ -4495,10 +4563,11 @@ def plot_numerical_trust(
 
     for key, label in guard_names.items():
         if key in guard:
-            _add(label, float(guard[key]), guard_denominators.get(key))
+            _add(label + guard_suffix, float(guard[key]), guard_denominators.get(key))
     for key in (k for k in health if k.startswith("nan_")):
         name = key.removeprefix("nan_")
-        _add(f"non-finite {symbols.get(name, name)}", float(health[key]), health.get(f"numel_{name}"))
+        _add(f"non-finite {symbols.get(name, name)}{layer_suffix}", float(health[key]),
+             health.get(f"numel_{name}"))
     if causal is not None:
         leak = _np(causal["future_leakage"]).astype(float).ravel()
         n_maps = int(leak.size)
@@ -4537,7 +4606,7 @@ def plot_numerical_trust(
         if population:
             title += f" ({population})"
         if max_condition is not None and np.isfinite(float(max_condition)):
-            title += f"\nlargest covariance condition number: {float(max_condition):.4g}"
+            title += f"\nlargest covariance condition number{layer_suffix}: {float(max_condition):.4g}"
         ax.set_title(title, fontsize=8)
         fig.tight_layout()
         return _save(fig, path)
@@ -4735,7 +4804,8 @@ def plot_scaling_law(
 
     The fit is a (SEM-weighted) log-log least squares ``L = A N^{-alpha}`` (or the Chinchilla
     ``E + A N^{-alpha}`` when ``with_offset``); the exponent ``alpha`` is annotated, and ``R^2`` only
-    from ``SCALING_MIN_TESTABLE_SIZES`` distinct sizes (fewer are labeled "not testable").
+    from :func:`~vfe3.metric_contracts.scaling_min_testable_sizes` distinct sizes of the fitted form (four for
+    the two-parameter law, five for the offset law; fewer are labeled "not testable").
     The residual panel plots ``log(mean / fit)`` against ``log N`` -- systematic curvature there is
     the signature of a pre-asymptotic (not-yet-power-law) regime. The point count is annotated so a
     two-or-three-size fit is never read as more precise than it is."""
@@ -4754,12 +4824,15 @@ def plot_scaling_law(
         fit = _fit_power_law(st["x"], st["mean"], weights=w, with_offset=with_offset)
         xx = np.geomspace(st["x"].min(), st["x"].max(), 100)
         yy = fit["E"] + fit["A"] * np.power(xx, -fit["alpha"])
-        # Below SCALING_MIN_TESTABLE_SIZES distinct sizes the curve has <= 1 residual dof, so R^2
-        # (exactly 1 at two sizes) tests nothing: annotate "not testable" instead of printing it.
-        testable = int(fit["n_distinct_sizes"]) >= SCALING_MIN_TESTABLE_SIZES
+        # Below scaling_min_testable_sizes distinct sizes the fitted law keeps <= 1 residual dof, so R^2
+        # (exactly 1 at two sizes) tests nothing: annotate "not testable" instead of printing it. The gate is
+        # the fitted form's (a with_offset fit that fell back to the plain law has two parameters), as in
+        # scaling_analysis (audit 2026-10-16 F85).
+        min_sizes = scaling_min_testable_sizes(fit["form"] == "offset_power_law")
+        testable = int(fit["n_distinct_sizes"]) >= min_sizes
         lbl = (rf"fit $\alpha$={fit['alpha']:.3f}, "
                + (rf"$R^2$={fit['r2']:.3f}" if testable
-                  else f"not testable (<{SCALING_MIN_TESTABLE_SIZES} sizes)")
+                  else f"not testable (<{min_sizes} sizes)")
                + (f", E={fit['E']:.3f}" if fit["form"] == "offset_power_law" else "")
                + f", {_scaling_fit_form_label(fit['form'])}")
         ax.plot(xx, yy, "--", color="#444444", lw=1.6, label=lbl, zorder=4)

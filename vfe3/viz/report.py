@@ -1116,7 +1116,10 @@ def generate_figures(
                                   else extract.guard_denominators(
                                       cstate["sigma"], cstate["energy"], cstate.get("self_div"),
                                       diagonal=cfg.diagonal_covariance)),
-              population=report_population, path=p),
+              population=report_population,
+              # readout_state reads the last layer; numerical_health pools every layer.
+              guard_scope=("last layer" if int(cfg.n_layers) > 1 else None),
+              path=p),
           "numerical_trust.png" in planned_figures)
     # Next-token vocabulary-probability figures (single arm). vocab_confusion needs the token decoder for its
     # category bucketing; decode_readout is None (skipped) on prior-bank decode paths.

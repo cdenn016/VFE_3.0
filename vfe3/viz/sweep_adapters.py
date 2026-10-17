@@ -357,7 +357,7 @@ def lr_grid_heatmap_kwargs(
     y_key:    str,
     x_values: Sequence[float],
     y_values: Sequence[float],
-    baseline: Tuple[float, float],
+    baseline: Optional[Tuple[float, float]],   # None: the sweep declared no grid_baseline
 ) -> Optional[Dict[str, Any]]:
     r"""Build ``plot_lr_grid_heatmap``'s ``grid`` kwarg from one completed two-dimensional sweep.
 
@@ -365,6 +365,8 @@ def lr_grid_heatmap_kwargs(
     pair from ``x_values`` x ``y_values`` present exactly once, each carrying a finite
     ``primary_val_ppl``. A duplicate cell, a missing cell, an off-grid pair, a nonfinite value, or a
     row whose ``overrides`` lacks either learning rate withholds the whole figure (returns ``None``).
+    The ``baseline`` key is present only when a baseline operating point was declared (audit
+    2026-10-16 F86).
     """
     xs = tuple(float(value) for value in x_values)
     ys = tuple(float(value) for value in y_values)
@@ -391,5 +393,7 @@ def lr_grid_heatmap_kwargs(
                        len(cells), len(expected))
         return None
     z = np.asarray([[cells[(x, y)] for x in xs] for y in ys], dtype=float)
-    return {"grid": {"x": np.asarray(xs), "y": np.asarray(ys), "z": z,
-                     "xlabel": x_key, "ylabel": y_key, "baseline": baseline}}
+    grid: Dict[str, Any] = {"x": np.asarray(xs), "y": np.asarray(ys), "z": z, "xlabel": x_key, "ylabel": y_key}
+    if baseline is not None:
+        grid["baseline"] = baseline
+    return {"grid": grid}
