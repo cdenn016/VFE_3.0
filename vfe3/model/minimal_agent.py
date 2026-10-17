@@ -791,15 +791,22 @@ def channel_noise_mstep(
     inside the neighboring grid cells (bisection when a step leaves the bracket). This is the stationarity condition
     of the collapsed record.
 
+    :math:`F` is bounded below on :math:`n > 0`. A source with :math:`m_j > 0` has
+    :math:`E_j \succeq \sum_i\beta_{ij}A_i^+ \succ 0`, because :math:`A_i^+ = S_hC_i^+S_h^\top` is positive definite in
+    every state the readout accepts (its query covariances :math:`S_hC_iS_h^\top` factor, so :math:`S_h` has full row
+    rank, and :math:`C_i^+ \succ 0`); then :math:`e_{jk} > 0` and each term is at least
+    :math:`m_j(1 + \log(e_{jk}/m_j))`, its value at :math:`v_{jk} + n = e_{jk}/m_j`. A source with :math:`m_j = 0` has
+    :math:`E_j = 0`, and its terms vanish.
+
     Boundary. The minimizer sits at the :math:`n\to 0` end of the bracket in two cases. With :math:`U = 0` every term
     increases in :math:`n`: the source covariance :math:`V_j` alone already exceeds the expected mismatch
     :math:`E_j/m_j` in every direction, so the constrained minimizer is the boundary :math:`n = 0`. With :math:`U > 0`
-    and a minimizer at the lowest grid point, :math:`F` still decreases toward :math:`0`, and a direction with
-    :math:`v_{jk} = e_{jk} = 0` makes it unbounded below (:math:`m_j\log n\to -\infty`): the declared record's likelihood
-    is unbounded as :math:`n\to 0`. In neither case is the value an interior optimum. At the launcher's
-    ``sigma_init = 15`` every head sat at the bracket and the column read 0.0 as if it had been learned (audit
-    2026-10-12 round 2, M2), so such a head now returns NaN and sets its flag in the second output; :math:`n_h^*` is
-    reported only when the optimum is interior. Treating :math:`X_j` as a
+    and a minimizer at the lowest grid point, :math:`F` still decreases down to :math:`n = 10^{-12}U`, so the
+    constrained minimizer is :math:`n = 0` or lies in the lowest grid cell, within a few :math:`10^{-12}U` of it. In
+    neither case is the value an interior optimum, and :math:`\log n` has no finite representative at :math:`n = 0`.
+    At the launcher's ``sigma_init = 15`` every head sat at the bracket and the column read 0.0 as if it had been
+    learned (audit 2026-10-12 round 2, M2), so such a head now returns NaN and sets its flag in the second output;
+    :math:`n_h^*` is reported only when the optimum is interior. Treating :math:`X_j` as a
     latent at its snapshot law instead gives the closed form :math:`n = \sum\beta E\|S_hX_i - T_hX_j\|^2/(d\sum\beta)`,
     which minimizes a looser bound and is not this M-step (audit 2026-10-12, T6).
 
