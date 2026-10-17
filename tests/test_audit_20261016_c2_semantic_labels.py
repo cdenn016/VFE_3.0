@@ -1,4 +1,4 @@
-r"""Audit 2026-10-16, lane C2 (semantic analysis), batch 4: F74, F75, F76.
+r"""Audit 2026-10-16, lane C2 (semantic analysis), batch 4: F74, F75, F76, F121.
 
 Fake runs, planted vector views and a tiny model (vocabulary of about 90 words, K=4, two heads, at most
 two layers); nothing is trained, everything runs on the CPU.
@@ -12,6 +12,8 @@ two layers); nothing is trained, everything runs on the CPU.
   defines.
 * F76: without training counts the frame reference set is the first candidates in token-id order, and
   the phi note, the ``phi_log`` view note and the phi summary say so instead of "most frequent".
+* F121: the logit-lens sentence names the bank's split and calls it held out only when it is not the
+  split that selected the checkpoint.
 """
 
 from __future__ import annotations
@@ -162,3 +164,35 @@ def test_phi_log_view_note_without_counts(tmp_path: Path) -> None:
         views = R.build_views(run, ctx)
     note = views["phi_log"].note
     assert "most frequent" not in note and "candidate frames in token-id order" in note
+
+
+# ----------------------------------------------------------------------------------------------
+# F121: the logit-lens bank is called held out only off the selection split
+# ----------------------------------------------------------------------------------------------
+
+def _lens_metrics(split: str, selection_split) -> dict:
+    return {"logit_lens": {"ce": [{"mean": 5.0}, {"mean": 4.0}], "n_tokens": 32},
+            "bank": {"split": split, "selection_split": selection_split}}
+
+
+def test_logit_lens_sentence_names_the_selection_split() -> None:
+    selected = C.contextual_summary(_lens_metrics("validation", "validation"))
+    assert "held-out" not in selected
+    assert "logit lens on 32 validation-split tokens, the split that selected the checkpoint" in selected
+    test = C.contextual_summary(_lens_metrics("test", "validation"))
+    assert "logit lens on 32 held-out test-split tokens" in test
+    unknown = C.contextual_summary(_lens_metrics("validation", None))
+    assert "held-out" not in unknown and "logit lens on 32 validation-split tokens)" in unknown
+    legacy = C.contextual_summary({"logit_lens": {"ce": [{"mean": 5.0}, {"mean": 4.0}], "n_tokens": 32}})
+    assert "held-out" not in legacy and "logit lens on 32 tokens)" in legacy
+
+
+def test_collect_bank_records_the_selection_split(tmp_path: Path) -> None:
+    from tests.test_semantics_contextual import _build, _ctx, _run, _stream
+
+    run = _run(tmp_path, "bank", {"validation": _stream(1)}, decode_mode="linear")
+    model = _build(run)
+    assert C.collect_bank(run, model, _ctx(tmp_path, run), n_tokens=16).diagnostics["selection_split"] is None
+    run.selection_identity = {"split": "validation"}
+    bank = C.collect_bank(run, model, _ctx(tmp_path, run), n_tokens=16)
+    assert bank.diagnostics["split"] == "validation" and bank.diagnostics["selection_split"] == "validation"

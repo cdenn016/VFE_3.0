@@ -70,7 +70,7 @@ _SECTION = "contextual"
 # Budgets and switches read from ``ctx.options`` (any key may be overridden there). ``None`` batch
 # sizes and lens chunk are resolved per device by ``_resolved_options`` (CPU: 8 windows, 1024 tokens).
 CONTEXTUAL_DEFAULTS: Dict[str, Any] = {
-    "contextual_tokens":     32768,    # bank size (held-out tokens)
+    "contextual_tokens":     32768,    # bank size (tokens of contextual_split)
     "contextual_split":      "validation",
     "contextual_seq_len":    None,     # None -> cfg.max_seq_len
     "contextual_batch_size": None,     # windows per bank forward (None -> _auto_batch_windows)
@@ -387,7 +387,7 @@ def _readout(model: Any, mu: torch.Tensor, sigma: torch.Tensor, canonical_frame:
 
 @dataclass
 class ContextualBank:
-    r"""Per-layer beliefs of every position of ``n_seq`` held-out windows, window-major.
+    r"""Per-layer beliefs of every position of ``n_seq`` windows of one split, window-major.
 
     Row ``r`` is position ``positions[r]`` of window ``seq_index[r]`` (``windows[seq_index[r]]``);
     ``targets[r]`` is the next token of the stream (``-1`` if the stream ends). Layer 0 is the stack
@@ -450,7 +450,9 @@ def collect_bank(
     ``torch.no_grad()``, halved by :func:`_forward_split` when the model's exact-symmetry check fails;
     windows that fail alone are dropped, and both counts are in ``diagnostics["forward_resplit"]``.
     Whether Sigma and phi move is measured by ``torch.equal`` against the stack input at every layer
-    of every batch and recorded, together with the config-level flags.
+    of every batch and recorded, together with the config-level flags. ``diagnostics["selection_split"]``
+    is the split that selected the checkpoint (``None`` without a recorded identity), so a report can
+    tell a held-out bank from one drawn on the selection split (audit 2026-10-16 F121).
     """
     cfg = run.cfg
     N = int(seq_len if seq_len is not None else cfg.max_seq_len)
@@ -543,7 +545,8 @@ def collect_bank(
         mu=mu, sigma=None if sigma_equal else var, phi_moves=not phi_equal, sigma0=var[0].copy(),
         windows=windows, offsets=offsets, split=split, sigma_frozen=sigma_equal, sigma_kind=sigma_kind,
         diagnostics={
-            "split": split, "seq_len": N, "n_windows": int(n_windows), "n_tokens": int(n),
+            "split": split, "selection_split": (getattr(run, "selection_identity", None) or {}).get("split"),
+            "seq_len": N, "n_windows": int(n_windows), "n_tokens": int(n),
             "n_tokens_requested": int(n_tokens), "n_slots": int(n_slots), "stream_tokens": T,
             "sigma_frozen_measured": sigma_equal, "sigma_frozen_config": run.sigma_frozen,
             "phi_moves_measured": not phi_equal, "phi_frozen_config": run.phi_frozen,
@@ -1845,8 +1848,17 @@ def contextual_summary(metrics: Mapping[str, Any]) -> str:
     ce = _pick(metrics, "logit_lens", "ce")
     if ce and ce[0].get("mean") is not None and ce[-1].get("mean") is not None:
         L = len(ce) - 1
+        split, selection = _pick(metrics, "bank", "split"), _pick(metrics, "bank", "selection_split")
+        if split is None:
+            tokens = "tokens"
+        elif selection is None:
+            tokens = f"{split}-split tokens"
+        elif split == selection:                        # audit 2026-10-16 F121: not held out from selection
+            tokens = f"{split}-split tokens, the split that selected the checkpoint"
+        else:
+            tokens = f"held-out {split}-split tokens"
         text = (f"Read out through the model's own final decode (logit lens on "
-                f"{_pick(metrics, 'logit_lens', 'n_tokens')} held-out tokens), the next-token cross-entropy "
+                f"{_pick(metrics, 'logit_lens', 'n_tokens')} {tokens}), the next-token cross-entropy "
                 f"{'falls' if ce[-1]['mean'] < ce[0]['mean'] else 'rises'} from {ce[0]['mean']:.3f} nats at the "
                 f"stack input to {ce[-1]['mean']:.3f} nats at block {L}")
         unigram = _pick(metrics, "logit_lens", "unigram_ce", "mean")
