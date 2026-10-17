@@ -135,7 +135,8 @@ def test_checkpoint_divergence_state_is_tolerant_and_round_trips() -> None:
 
 # ------------------------------------------------------------------------------------------------ F81
 
-def _finalized_run(cfg: VFE3Config, run_dir: Path, *, n_steps: int) -> Tuple[ra.RunArtifacts, float]:
+def _finalized_run(cfg: VFE3Config, run_dir: Path, *, n_steps: int,
+                   resume_from: Any = None) -> Tuple[ra.RunArtifacts, float]:
     r"""A terminal-callback run (log/eval/checkpoint cadence off, so train() builds no timer) and its wall time."""
     torch.manual_seed(5)
     model = VFEModel(cfg)
@@ -151,7 +152,7 @@ def _finalized_run(cfg: VFE3Config, run_dir: Path, *, n_steps: int) -> Tuple[ra.
     start = time.perf_counter()
     T.train(model, _loader(cfg), cfg, n_steps=n_steps, grad_clip=cfg.grad_clip, log_interval=0,
             eval_interval=0, val_loader=val_loader, device=CPU, logger=logging.getLogger("audit-c1-resume"),
-            artifacts=artifacts, generate_samples=False, terminal_callback=finalize)
+            artifacts=artifacts, generate_samples=False, terminal_callback=finalize, resume_from=resume_from)
     return artifacts, time.perf_counter() - start
 
 
@@ -180,3 +181,47 @@ def test_periodic_checkpoint_without_a_timer_carries_the_wall_clock(tmp_path: Pa
              for step in (2, 4)]
     assert all(isinstance(wall, float) for wall in walls)
     assert 0.0 < walls[0] < walls[1] <= elapsed
+
+
+# ----------------------------------------------------------------------------------------------- F123
+
+def test_resumed_summary_names_the_source_run_of_the_earlier_history(tmp_path: Path) -> None:
+    cfg = _cfg(checkpoint_interval=2, max_steps=4)
+    _run(cfg, tmp_path / "source", n_steps=4, log_interval=1)
+    checkpoint = tmp_path / "source" / "checkpoints" / "step_2.pt"
+    fresh, _ = _finalized_run(_cfg(max_steps=4), tmp_path / "fresh", n_steps=4)
+    assert fresh.resume_source is None
+    assert json.loads((tmp_path / "fresh" / "summary.json").read_text(encoding="utf-8"))["resume_source"] is None
+    resumed, _ = _finalized_run(cfg, tmp_path / "resumed", n_steps=4, resume_from=checkpoint)
+    expected = {"source_run_dir": str((tmp_path / "source").resolve()),
+                "checkpoint_path": str(checkpoint.resolve()), "saved_step": 2}
+    assert resumed.resume_source == expected
+    summary = json.loads((tmp_path / "resumed" / "summary.json").read_text(encoding="utf-8"))
+    assert summary["resume_source"] == expected
+    # The continuation's own history starts after the saved step; the earlier rows are in the source run.
+    steps = [int(row["step"]) for row in _rows(tmp_path / "resumed" / "metrics.csv")]
+    assert min(steps) > expected["saved_step"]
+    assert [int(row["step"]) for row in _rows(tmp_path / "source" / "metrics.csv")][:2] == [1, 2]
+
+
+def test_resume_source_has_no_run_dir_for_a_checkpoint_outside_one(tmp_path: Path) -> None:
+    cfg = _cfg(checkpoint_interval=2, max_steps=4)
+    _run(cfg, tmp_path / "source", n_steps=2, log_interval=0)
+    moved = tmp_path / "loose" / "step_2.pt"
+    moved.parent.mkdir()
+    (tmp_path / "source" / "checkpoints" / "step_2.pt").replace(moved)
+    losses, resumed = _run(cfg, tmp_path / "resumed", n_steps=4, log_interval=0, resume_from=moved)
+    expected = {"source_run_dir": None, "checkpoint_path": str(moved.resolve()), "saved_step": 2}
+    assert resumed.resume_source == expected
+    # The launcher finalizer publishes the same record.
+    model = VFEModel(cfg)
+    model.load_state_dict(torch.load(tmp_path / "resumed" / "checkpoints" / "step_4.pt",
+                                     weights_only=True)["model_state"])
+    val_loader = DataLoader(TokenWindows((torch.arange(23) * 3) % V, N, pad_final=True, stride=cfg.eval_stride),
+                            batch_size=2, shuffle=False)
+    test_loader = DataLoader(TokenWindows((torch.arange(19) * 5 + 1) % V, N, pad_final=True,
+                                          stride=cfg.eval_stride), batch_size=2, shuffle=False)
+    ra.finalize_run(model, resumed, cfg, final_validation=T.evaluate(model, val_loader), val_loader=val_loader,
+                    test_loader=test_loader, losses=losses)
+    summary = json.loads((tmp_path / "resumed" / "summary.json").read_text(encoding="utf-8"))
+    assert summary["resume_source"] == expected

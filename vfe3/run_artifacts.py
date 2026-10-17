@@ -1971,6 +1971,10 @@ class RunArtifacts:
         # resumed checkpoint carried in (set by load_checkpoint), so spike detection continues exactly.
         self.divergence_state: Optional[Dict[str, object]] = None
         self.resumed_divergence_state: Optional[Dict[str, object]] = None
+        # The run a resume continues (set by load_checkpoint; None from scratch). This directory's
+        # metrics.csv, diagnostics and figures start after saved_step, while best_step is run-wide, so
+        # summary.json names where the earlier history lives (audit 2026-10-16 F123).
+        self.resume_source: Optional[Dict[str, object]] = None
         # Source bytes at run start: vfe3/**/*.py, root *.py drivers and pyproject.toml, zipped with
         # their hash, the Git HEAD and the dirty-file list. Best-effort: a failure is recorded in
         # the returned mapping (and later in provenance.json), never raised.
@@ -2746,6 +2750,14 @@ def load_checkpoint(
             and not isinstance(saved_wall_clock, bool) and math.isfinite(saved_wall_clock) else None)
         # Divergence-monitor state (None for an older checkpoint or a malformed record); train() continues it.
         artifacts.resumed_divergence_state = _checkpoint_divergence_state(ckpt.get("divergence_monitor"))
+        resolved_checkpoint = checkpoint_path.resolve()
+        artifacts.resume_source = {
+            # <run_dir>/checkpoints/step_<N>.pt; None for a checkpoint kept outside a run directory.
+            "source_run_dir":  (str(resolved_checkpoint.parent.parent)
+                                if resolved_checkpoint.parent.name == "checkpoints" else None),
+            "checkpoint_path": str(resolved_checkpoint),
+            "saved_step":      saved_step,
+        }
         saved_code_identity = ckpt.get("code_identity_sha256")
         code_identity_match = (
             saved_code_identity == expected_code_identity
@@ -4232,6 +4244,9 @@ def finalize_run(
         "final_train_loss": (losses[-1] if losses else None),
         "wall_time_s":  wall_time,
         "wall_time_resumed_s": resumed_wall_time,     # carried in by a resumed checkpoint (in wall_time_s)
+        # A resumed run's metrics.csv starts after resume_source.saved_step; earlier rows (and a best_step at or
+        # before it) are in resume_source.source_run_dir. None from scratch.
+        "resume_source": getattr(artifacts, "resume_source", None),
         "decode_mode":     cfg.decode_mode,
         "decode_tau_eff":  decode_tau_eff,
         # The expected-likelihood CE kernel that last ran ('torch' | 'triton'; None when that decoder never
@@ -4926,6 +4941,7 @@ def finalize_validation_run(
         "final_train_loss":    final_train_loss,
         "wall_time_s":         (float(wall_time) if wall_time is not None else None),
         "wall_time_resumed_s": resumed_wall_time,     # carried in by a resumed checkpoint (in wall_time_s)
+        "resume_source":       getattr(artifacts, "resume_source", None),   # as in finalize_run
         "terminal_checkpoint": terminal_checkpoint,
         "save_model_artifacts": artifacts.save_model_artifacts,
         "figures_written":     figures_written,
