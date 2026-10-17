@@ -48,6 +48,9 @@ from vfe3.data.datasets import (
     tokenizer_vocab_size as _tokenizer_vocab_size,
 )
 from vfe3.runtime import seed_everything
+# The shared run-directory helpers (audit 2026-10-16 F96): atomic reservation (base_2, base_3, ... on a collision)
+# and the rename by test perplexity.
+from vfe3.experiment import rename_run_by_test_ppl, reserve_directory as _reserve_directory
 from vfe3.train import _fmt_tau, evaluate, train
 
 
@@ -251,6 +254,7 @@ config = dict(
     ######################################
     
     lambda_alpha_mode                = "state_dependent_per_coord",  # "state_dependent" | "state_dependent_per_coord"
+    mstep_self_coupling_weight       = 0.0,      # float >= 0: alpha_hat of the M-step term alpha_hat * mean_i alpha_i D(q_i*||p_i), gradient through q*; 0.0 = off
   
     ########################################
     #     Attention Belief/Model Settings
@@ -365,9 +369,16 @@ def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int,
     dead_line = ([" dead under config (no grad): "
                   + ", ".join(n.replace("prior_bank.", "") for n in rep["dead_names"])]
                  if rep["probed"] and rep["dead_names"] else [])
+    # Live parameters whose init-probe gradient is identically zero (audit 2026-10-16 F110), e.g. the first layer of
+    # a zero-initialized gate: benign at init, but named so a parameter that never moves is not mistaken for live.
+    zero_names = rep.get("zero_grad_names", [])
+    zero_line = ([" zero gradient at the init probe (counted live): "
+                  + ", ".join(n.replace("prior_bank.", "") for n in zero_names)]
+                 if rep["probed"] and zero_names else [])
+    probe_note = "" if rep["probed"] else "  [live/dead probe failed]"
     return "\n".join([
         bar,
-        f" Gauge VFE Transformer | {rep['total']:,} params{live_note} | {device}",
+        f" Gauge VFE Transformer | {rep['total']:,} params{live_note}{probe_note} | {device}",
         bar,
         f" K={cfg.embed_dim}  N={cfg.max_seq_len}  L={cfg.n_layers}  "
         f"heads={len(model.group.irrep_dims)}  "  # runtime attention heads = irrep blocks
@@ -375,6 +386,7 @@ def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int,
         f" steps={n_steps}  batch={cfg.batch_size}  dataset={dataset}",
         *cov,
         *dead_line,
+        *zero_line,
         f" M-LRs: {_fmt_table_lrs(cfg)}  "
         f"phi={cfg.m_phi_lr}",
         f" decoder M-LRs: {_fmt_decode_lrs(cfg)}",
@@ -449,18 +461,6 @@ def _run_label(cfg: VFE3Config, dataset: str) -> str:
     return f"{dataset}_K{cfg.embed_dim}_{cfg.gauge_group}{tags}_s{cfg.seed}"
 
 
-def _reserve_directory(root: Path, base: str) -> Path:
-    """Atomically reserve ``root/base`` and retry deterministic numeric suffixes on collision."""
-    root.mkdir(parents=True, exist_ok=True)
-    suffix = 1
-    while True:
-        candidate = root / (base if suffix == 1 else f"{base}_{suffix}")
-        try:
-            candidate.mkdir(exist_ok=False)
-        except FileExistsError:
-            suffix += 1
-            continue
-        return candidate
 
 
 def _run_dir(
@@ -503,30 +503,7 @@ def _rename_run_by_test_ppl(
     the numeric results are already on disk, so a failed rename is logged, never fatal). A name clash
     gets a ``_2``, ``_3``, ... suffix so an existing run is never clobbered.
     """
-    import math
-    from pathlib import Path
-
-    src = Path(run_dir)
-    if test_ppl is None or not math.isfinite(test_ppl) or not src.exists():
-        return run_dir
-    dst = src.parent / f"{test_ppl:.2f}_{label}"
-    i = 2
-    while dst.exists():
-        dst = src.parent / f"{test_ppl:.2f}_{label}_{i}"
-        i += 1
-    try:
-        src.rename(dst)
-    except OSError as exc:                                # open handle / locked dir -> keep run, log it
-        logger.warning("could not rename run dir to %s (%s); kept %s", dst.name, exc, src.name)
-        return run_dir
-    logger.info("Renamed run dir -> %s", dst.name)
-    return str(dst)
-
-
-# Compatibility aliases for callers that imported an older boundary. The PPL argument is now the
-# held-out TEST perplexity, not validation.
-_rename_run_by_ppl = _rename_run_by_test_ppl
-_rename_run_by_validation_ppl = _rename_run_by_test_ppl
+    return str(rename_run_by_test_ppl(Path(run_dir), label, test_ppl, logger))
 
 
 def _run_once(
@@ -578,6 +555,11 @@ def _run_once(
     # -> BPC unavailable, while evaluate publishes the always-defined bits_per_token separately.
     from vfe3.data.datasets import tokens_per_char as _tokens_per_char
     val_tpc = _tokens_per_char(DATASET, "validation")
+    # The end-of-run test split opens here, with the train and validation splits, so a missing test cache fails
+    # before training and before a run directory exists (audit 2026-10-16 F122). A sequential loader draws no RNG.
+    persist = (RUN_ROOT if run_root is None else run_root) is not None
+    test_loader = _select_loader(DATASET, cfg, split="test") if persist else None
+    test_tpc = _tokens_per_char(DATASET, "test") if persist else None
 
     # Run-artifacts directory (config.json, metrics.csv, checkpoints/, best_model.pt, figures).
     # None disables persistence (RUN_ROOT = None); the synthetic fallback also runs unsaved-free.
@@ -649,11 +631,9 @@ def _run_once(
         (f"{float(m['bpc']):.4f}" if m["bpc"] is not None else "unavailable"),
     )
 
-    # End-of-run held-out TEST evaluation on the final training weights, plus summary +
-    # figures, on the dataset's test split (a missing cache raises -- no synthetic substitution).
+    # End-of-run held-out TEST evaluation on the final training weights, plus summary + figures, on the
+    # dataset's test split opened at launch (a missing cache raised there -- no synthetic substitution).
     if artifacts is not None:
-        test_loader = _select_loader(DATASET, cfg, split="test")
-        test_tpc = _tokens_per_char(DATASET, "test")
         results = finalize_run(
             model,
             artifacts,
