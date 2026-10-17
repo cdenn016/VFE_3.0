@@ -728,7 +728,16 @@ class VFE3Config:
     #   chart      additive chart step with product-residual backtracking
     #   group_log  exact right product Log(exp(phi) exp(-eta s xi)) (untied block_glk)
     m_phi_group_retraction:           str             = "chart"
-        
+
+    # "series" | "spectral"
+    # pullback_group only: evaluation of the trivialized exponential differentials Psi_R / Psi_L in the strict
+    # Frobenius-pullback direction (vfe3/geometry/phi_preconditioner.py; under group_log only on the rows off the
+    # closed form). Checkpointed with the optimizer state; a resumed run keeps the saved route.
+    #   series    truncated power series with a geometric-majorant tail certificate (orders 8 to 128)
+    #   spectral  exact Daleckii-Krein closed form from one eigendecomposition of the chart block; a call whose
+    #             eigenbasis fails the conditioning or imaginary-residue guard uses the series instead
+    m_phi_group_differential_mode:    str             = "series"
+
     # Interior radius for phi after each M-step, < transport_chart_max_norm (AdamW projects rows back;
     # pullback_group rejects the step). None: nothing bounds ||phi|| under adamw.
     phi_mstep_max_matrix_norm:        Optional[float] = None
@@ -1013,6 +1022,7 @@ class VFE3Config:
                 f"{self.m_phi_group_trust_radius}"
             )
         _require(self.m_phi_group_retraction, ("chart", "group_log"), "m_phi_group_retraction")
+        _require(self.m_phi_group_differential_mode, ("series", "spectral"), "m_phi_group_differential_mode")
         if not (
             math.isfinite(self.m_phi_fisher_rotation_weight)
             and self.m_phi_fisher_rotation_weight > 0.0
@@ -2074,6 +2084,9 @@ class VFE3Config:
             mark(("m_phi_group_trust_radius", "m_phi_group_retraction"),
                  "only read by the manifold phi optimizer "
                  "(m_phi_update_mode='pullback_group' or 'fisher_group')")
+        if not phi_update_policy.requires_pullback_geometry:
+            mark(("m_phi_group_differential_mode",),
+                 "only read by the Frobenius-pullback direction (m_phi_update_mode='pullback_group')")
         if self.m_table_update_mode != "fisher":
             mark(("m_table_fisher_lr", "m_table_fisher_trust_radius"), "only read by m_table_update_mode='fisher'")
         else:

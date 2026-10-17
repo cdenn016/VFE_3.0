@@ -106,6 +106,10 @@ _PHI_GROUP_SOLVE_RESIDUAL: float   = 1e-10
 #               eigendecomposition replaces the whole matmul ladder. Exact in exact arithmetic:
 #               there is no truncation and hence no order to certify.
 #
+# A run opts in with m_phi_group_differential_mode="spectral", which the optimizer receives as
+# phi_group_differential_mode; the process-global below is only the default of calls that name no mode
+# (set_phi_group_differential_mode; audit 2026-10-16, F37).
+#
 # OPT-IN, because the closed form trades a truncation error for a CONDITIONING one. It needs
 # P = eigenvectors(X), and X is a general real matrix built from an unconstrained gradient: it can
 # be defective (P singular, no eigenbasis at all) and is near-defective on a set of positive

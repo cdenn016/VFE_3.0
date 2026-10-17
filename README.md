@@ -521,6 +521,15 @@ Three numerical safeguards trade cost for conditioning; each is at its cheapest 
 | `projected_factorization` | Factorization of the projected Gaussian-KL scorer. `"gram"` (default) factors the float32 Gram matrix (error $O(\epsilon\kappa^2)$); `"gram_certified"` also rebuilds entries that factor but fail a condition certificate; `"cholesky_qr2_certified"` factors by CholeskyQR2 (error $O(\epsilon\kappa)$) where the scorer has source roots. The certified modes are costly on CUDA. |
 | `frame_pair_escalation_tol` | Default `None`. A tolerance in $(0,1)$ recomputes a frame producer call in float64 when its float32 frame pair has $\epsilon_{32}\kappa_F(U)$ above it; about 7 times the cost of an escalated step. |
 
+Under `m_phi_update_mode="pullback_group"`, `m_phi_group_differential_mode` selects how the
+strict Frobenius-pullback direction evaluates the trivialized exponential differentials
+$\Psi_R(z)=(e^z-1)/z$ and $\Psi_L(z)=(1-e^{-z})/z$ at $z=\mathrm{ad}_\varphi$. The default
+`"series"` truncates their power series at a certified order between 8 and 128; `"spectral"`
+evaluates the exact Daleckii-Krein closed form from one eigendecomposition of the chart block,
+trading the truncation error for a conditioning one, and uses the series whenever that
+eigenbasis fails its condition or imaginary-residue guard. The optimizer checkpoints the
+route, and a resumed run keeps the saved one.
+
 When every covariance contract passes the covariance through
 (`predictive_covariance="passthrough"`, `block_mlp_covariance="passthrough"` and
 `block_norm_covariance="passthrough"`),

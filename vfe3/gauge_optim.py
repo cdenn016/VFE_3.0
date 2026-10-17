@@ -37,9 +37,10 @@ from vfe3.geometry.phi_fisher import (
     whitened_condition,
 )
 from vfe3.geometry.phi_preconditioner import (
+    _PHI_GROUP_DIFFERENTIAL_MODES,
     PullbackGroupDirectionResult,
     pullback_group_direction,
-    phi_group_differential_mode,
+    phi_group_differential_mode as phi_group_differential_mode_global,
     uspace_ambient_gradient,
     uspace_chart_velocity,
     uspace_pullback_body_direction,
@@ -1450,6 +1451,12 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
     :func:`belief_fisher_group_direction` under either retraction; the provider supplies the batch
     belief statistics of the active rows of each table. The update creates no optimizer state for
     the phi table.
+
+    ``phi_group_differential_mode`` (``m_phi_group_differential_mode``: ``"series"`` or ``"spectral"``)
+    selects how the Frobenius-pullback direction evaluates :math:`\Psi_R`, :math:`\Psi_L`; ``None`` takes
+    the process-global :func:`~vfe3.geometry.phi_preconditioner.phi_group_differential_mode` at
+    construction (the historical behavior). The choice is per optimizer, never written to the
+    process-global, and is checkpointed: a loaded state's saved mode replaces it.
     """
 
     # Signature-convention exception: torch.optim.Optimizer's contract REQUIRES params as the
@@ -1465,10 +1472,18 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
         phi_group_retraction:   str = "chart",
         phi_statistics_provider:    Optional[PhiStatisticsProvider] = None,
         phi_fisher_rotation_weight: float = 2.0,
+        phi_group_differential_mode: Optional[str] = None,
         **kwargs,
     ) -> None:
         if not isinstance(group, GaugeGroup):
             raise TypeError(f"group must be a GaugeGroup, got {type(group).__name__}")
+        if phi_group_differential_mode is None:
+            phi_group_differential_mode = phi_group_differential_mode_global()
+        elif phi_group_differential_mode not in _PHI_GROUP_DIFFERENTIAL_MODES:
+            raise ValueError(
+                f"phi_group_differential_mode must be one of {_PHI_GROUP_DIFFERENTIAL_MODES}, got "
+                f"{phi_group_differential_mode!r}"
+            )
         if phi_group_retraction not in _UGROUP_RETRACTIONS:
             raise ValueError(
                 f"phi_group_retraction must be one of {_UGROUP_RETRACTIONS}, got "
@@ -1490,7 +1505,7 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
         )
         super().__init__(params, **kwargs)
         self._group                  = group
-        self._phi_group_differential_mode = phi_group_differential_mode()
+        self._phi_group_differential_mode = phi_group_differential_mode
         self._phi_group_trust_radius = phi_group_trust_radius
         self._phi_chart_max_norm     = phi_chart_max_norm
         self._phi_group_retraction   = phi_group_retraction
@@ -1538,14 +1553,23 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
         self,
         state_dict: Dict[str, object],
     ) -> None:                                                        # type: ignore[override]
-        r"""Restore AdamW state and the saved phi differential mode."""
+        r"""Restore AdamW state and the saved phi differential mode (it replaces the constructed one)."""
         core_state = dict(state_dict)
         saved_mode = core_state.pop("phi_group_differential_mode", None)
-        if saved_mode is not None and saved_mode not in ("series", "spectral"):
+        if saved_mode is not None and saved_mode not in _PHI_GROUP_DIFFERENTIAL_MODES:
             raise ValueError(f"unsupported saved phi differential mode: {saved_mode!r}")
+        pullback_groups = any(item.get("pullback_group", False) for item in self.param_groups)
+        if (saved_mode is not None and saved_mode != self._phi_group_differential_mode and pullback_groups
+                and self.phi_statistics_provider is None):            # fisher_group never reads the mode
+            warnings.warn(
+                f"Checkpoint's phi_group_differential_mode={saved_mode!r} replaces the constructed "
+                f"{self._phi_group_differential_mode!r} (m_phi_group_differential_mode); the resumed "
+                "run keeps the saved Psi route.",
+                UserWarning, stacklevel=2,
+            )
         if saved_mode is None:
             saved_mode = "series"
-            if any(item.get("pullback_group", False) for item in self.param_groups):
+            if pullback_groups:
                 warnings.warn(
                     "Checkpoint omits phi_group_differential_mode; restoring the historical "
                     "series default. A prior process-global spectral choice is not recoverable.",
