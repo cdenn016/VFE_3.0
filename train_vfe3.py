@@ -229,14 +229,14 @@ config = dict(
     #################################
     gauge_transport                  = "on",           # "on" | "off" | "frozen" (random fixed frame)
     gauge_group                      = "block_glk",    # "block_glk" | "so_n" | "su_n" | "block_so" | "block_co" | "block_sl" | "block_borel" | "block_unipotent" | "block_glmc" (block_glmc: even d_head)
-    gauge_tying                      = "per_head",     # None (group default) | "per_head" | "shared" (shared: block_glk, so_n only)
+    gauge_tying                      = "per_head",     # None (group default) | "per_head" | "shared" (shared: block_glk, so_n, su_n only)
     
     group_n                          = None,                # so_n / su_n only: the N of SO(N) (>= 2) or SU(N) (>= 3); None for every other group
     irrep_spec                       = None,                # so_n: [(label, mult), ...] (labels "l<p>", "w<p>", "wp<m>", "wm<m>") | "random"; su_n: [("pq<p>_<q>", mult), ...] (p >= q; SU(3) dims pq1_0 6, pq1_1 8, pq2_0 12); None otherwise
    
     ####################################
     #       Positional Encoding
-    #    BCH gauge-frame PE (pos_phi)
+    #    gauge-frame PE (pos_phi): exact right factor exp(X_i) exp(Y_n)
     #     gauge-RoPE (rope_mode)
     ####################################
 
@@ -278,10 +278,13 @@ config = dict(
     
     m_phi_update_mode                = "adamw",        # "adamw" | "pullback_group" | "fisher_group" (belief-Fisher natural gradient)
     m_phi_group_retraction           = "chart",        # "chart" | "group_log" (exact Log(U e^{-eta xi}); pullback_group/fisher_group only)
-    phi_frame_condition_max          = None,           # None (off) | kappa_max > 1, e.g. 1e4: after each step bound cond_2(U_i) <= kappa_max (adamw; block_glk/block_glmc)
+    m_phi_group_log_fallback         = "series",       # "series" (certified series direction; structure-constant budget, block_glk d_head <= 16) | "eigenbasis" (off-strip blocks by the eigenbasis Psi inverse, kappa_2(U) > 1e3 rows take no step; no width budget); pullback_group with group_log only
+    m_phi_group_differential_mode    = "series",       # "series" (certified power series) | "spectral" (Daleckii-Krein closed form, series fallback); pullback_group only
+    phi_frame_condition_max          = None,           # None (off) | kappa_max > 1, e.g. 1e4: after each step bound cond_2(U_i) <= kappa_max (adamw; block_glk/block_glmc/block_sl; inert for block_so/block_co/so_n/su_n)
 
-    m_phi_group_trust_radius         = 0.1,
-    m_phi_fisher_rotation_weight     = 2.0,       # fisher_group only: completion weight on every rotation (also damps Fisher-visible ones)
+    m_phi_group_trust_radius         = 0.1,       # pullback_group/fisher_group only: float > 0, bound on ||eta s xi||_F per row (exact under group_log; the chart route's 1e-6 residual certificate caps the step near 1e-2 off the identity)
+    m_phi_fisher_rotation_weight     = 2.0,       # fisher_group only: completion weight lambda (under "rotation" it also damps Fisher-visible rotations)
+    m_phi_fisher_completion          = "rotation",  # fisher_group only: "rotation" (lambda on every rotation) | "stabilizer" (lambda on the belief's stabilizer only: the belief-Fisher natural gradient on the visible subspace; not with pos_phi="learned")
 
     m_table_update_mode              = "adamw",   # "adamw" | "fisher" (natural-gradient M-step on mu_embed / sigma_log_embed; linear or untied decode)
     m_table_fisher_lr                = 0.1,       # fisher only: natural step size eta (the AdamW rates m_p_mu_lr / m_p_sigma_lr schedule it and set decay)
@@ -340,7 +343,7 @@ config = dict(
    
     frame_pair_escalation_tol        = None,       # None (off) | tol, e.g. 1e-4: redo ill-conditioned frame pairs in fp64 (costly)
     predictive_covariance_checkpoint = False,       # moment_matched only: recompute the (B,N,K,K) update in backward; bit-identical.
-    predictive_covariance_fp64_escalation = False,  # True | False: moment_matched kernel readout: redo a non-PD fp32 update in fp64 (counted in source_recovery_elements)
+    predictive_covariance_fp64_escalation = False,  # True | False: moment_matched kernel readout: redo the failing sequences of a non-PD fp32 update in fp64 (counted in covariance_escalation_elements)
         
    
     
@@ -544,7 +547,8 @@ def _run_once(
 
     overrides = {}
     if fully_gauge_covariant:
-        from vfe3.gauge_covariant import fully_gauge_covariant_overrides, gauge_covariance_failures
+        from vfe3.gauge_covariant import (describe_fully_gauge_covariant_overrides, fully_gauge_covariant_overrides,
+                                          gauge_covariance_failures)
         overrides = fully_gauge_covariant_overrides(config)
     cfg = VFE3Config(**{**config, **overrides, "seed": seed})   # the run's seed, from SEEDS
     if fully_gauge_covariant:
@@ -552,7 +556,7 @@ def _run_once(
         if failures:
             raise ValueError(f"fully_gauge_covariant=True left these gauge flags false: {failures}")
         logger.info("fully_gauge_covariant=True: overriding %s",
-                    ", ".join(f"{key}={config.get(key)!r} -> {value!r}" for key, value in overrides.items())
+                    describe_fully_gauge_covariant_overrides(config, overrides)
                     or "nothing (the config is already fully gauge covariant)")
     # Always shown, unlike the env-gated ConfigNotice: every setting this launcher names explicitly
     # that no active path reads under the resolved config, with the structural reason.

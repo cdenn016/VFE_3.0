@@ -49,88 +49,6 @@ def _public_spd_bounds(
     return lower, upper
 
 
-class _EighDamped(torch.autograd.Function):
-    r"""``torch.linalg.eigh`` with a gap-regularized (Lorentzian-damped) backward.
-
-    The symmetric-eigendecomposition adjoint carries ``1/(lambda_i - lambda_j)`` gap terms that
-    diverge on repeated eigenvalues (Higham, *Functions of Matrices* 2008, Sec 3.2). At a degenerate
-    spectrum -- e.g. the isotropic ``Sigma = I`` that is the default ``gaussian_full`` prior init --
-    the eigenvectors are arbitrary but the downstream function ``V f(lambda) V^T`` (matrix
-    sqrt / inv-sqrt / log / exp here) is smooth, so the *true* gradient is finite; only the
-    eigendecomposition's intermediate adjoint blows up, poisoning the whole backward with NaN.
-
-    Replacing ``1/Delta`` by the Lorentzian ``Delta / (Delta^2 + gap_eps)`` leaves a well-separated
-    spectrum unchanged (relative error ~ ``gap_eps / Delta^2`` for gaps ``Delta``) while damping the
-    degenerate gap term to 0 instead of +/-inf -- it kills the (physically immaterial) gradient
-    component within a degenerate eigenspace rather than emitting NaN. Forward is bit-identical to
-    ``torch.linalg.eigh`` (only the backward is regularized), so every forward-value contract on the
-    retractions is preserved. Validated against the stock ``eigh`` backward on well-separated spectra
-    (tests/test_retraction.py).
-    """
-
-    @staticmethod
-    def forward(ctx, A: torch.Tensor, gap_eps):             # gap_eps: float or 0-d tensor  # noqa: D401
-        # safe_eigh: value-identical to torch.linalg.eigh, but chunks the flattened batch below the
-        # cuSOLVER batched-eigensolver ceiling (audit 2026-09-23 low; see numerics._EIG_MAX_BATCH).
-        w, V = safe_eigh(A)
-        ctx.save_for_backward(w, V)
-        ctx.gap_eps = gap_eps
-        return w, V
-
-    @staticmethod
-    def backward(ctx, gw: Optional[torch.Tensor], gV: Optional[torch.Tensor]):
-        w, V = ctx.saved_tensors
-        Vt = V.transpose(-1, -2)
-        # delta_ij = w_j - w_i (the symmetric-eigh adjoint's F_ij = 1/(w_j - w_i); the j index is the
-        # eigenvector being perturbed). The diagonal (w_i - w_i = 0) gives F_ii = 0 for gap_eps > 0.
-        delta = w.unsqueeze(-2) - w.unsqueeze(-1)            # (..., n, n), delta_ij = w_j - w_i
-        F = delta / (delta * delta + ctx.gap_eps)           # Lorentzian-damped 1/(w_j - w_i)
-        inner = F * (Vt @ gV) if gV is not None else torch.zeros_like(V)
-        if gw is not None:
-            inner = inner + torch.diag_embed(gw)
-        gA = V @ inner @ Vt
-        gA = 0.5 * (gA + gA.transpose(-1, -2))              # A is symmetric -> symmetric cotangent
-        return gA, None
-
-
-def _eigh_damped(A: torch.Tensor, gap_eps) -> Tuple[torch.Tensor, torch.Tensor]:  # gap_eps: float or 0-d tensor
-    r"""``(eigenvalues, eigenvectors)`` of symmetric ``A`` with a gap-regularized backward (see
-    :class:`_EighDamped`). Drop-in for ``torch.linalg.eigh`` on the full-cov SPD retraction paths so a
-    degenerate spectrum (the ``Sigma = I`` default init) yields finite -- not NaN -- gradients on the
-    unrolled E-step. ``gap_eps`` bounds the worst-case gap factor at ``1/(2 sqrt(gap_eps))``; the
-    retraction call sites pass a spectrum-relative value via :func:`_rel_gap_eps`."""
-    return _EighDamped.apply(A, gap_eps)
-
-
-def _rel_gap_eps(
-    A:     torch.Tensor,
-
-    *,
-    rel:    Optional[float] = None,
-    floor:  Optional[float] = None,
-) -> torch.Tensor:                         # (..., 1, 1) on-device tensor; no host-sync
-    r"""Spectrum-relative ``gap_eps`` for :func:`_eigh_damped` on the SPD retraction paths (audit
-    2026-06-13 L11). The fixed ``gap_eps=1e-8`` over-damps the eigh adjoint ``F_ij = 1/(w_j - w_i)``
-    for MEANINGFUL gaps near the variance floor -- a resolvable gap of 1e-4 is biased ~50%. Scaling
-    to ``(rel * ||A||_max)^2`` -- the squared fp32 noise floor of the spectrum -- damps only gaps
-    below fp32 resolution (true degeneracy stays finite, ``F = 0``) and leaves resolvable gaps
-    accurate. When omitted, ``rel`` is derived from the active dtype; ``finfo.tiny`` keeps a
-    near-zero spectrum finite without imposing a coordinate-scale floor. Passing an explicit
-    nonnegative ``floor`` preserves the diagnostic/test API; ``floor=0.0`` exposes the un-clamped
-    relative value. Each matrix receives its own scale so unrelated batch elements cannot change
-    its eigendecomposition adjoint. Returns ``(..., 1, 1)`` on A's device/dtype to avoid a CUDA
-    host-sync."""
-    dtype_info = torch.finfo(A.dtype)
-    relative = 8.0 * dtype_info.eps if rel is None else rel
-    if not math.isfinite(relative) or relative <= 0.0:
-        raise ValueError(f"rel must be None or finite and positive, got {rel!r}")
-    minimum = dtype_info.tiny if floor is None else floor
-    if not math.isfinite(minimum) or minimum < 0.0:
-        raise ValueError(f"floor must be None or finite and nonnegative, got {floor!r}")
-    scale = A.detach().abs().amax(dim=(-2, -1), keepdim=True)
-    return (relative * scale).pow(2).clamp(min=minimum)
-
-
 def _spectral_values_and_derivatives(
     eigenvalues: torch.Tensor,
     kind:        str,
@@ -268,7 +186,16 @@ def _loewner_adjoint(
 
 
 class _SymmetricSpectralMap(torch.autograd.Function):
-    r"""Symmetric matrix function with Loewner divided differences in the adjoint."""
+    r"""Symmetric matrix function :math:`F(A) = V f(\Lambda) V^T` with the exact Loewner adjoint.
+
+    The backward is the Daleckii-Krein form :math:`\bar A = V (D \circ V^T \bar F V) V^T` with
+    :math:`D_{ij} = (f(\lambda_i) - f(\lambda_j)) / (\lambda_i - \lambda_j)` and the repeated-eigenvalue
+    limit :math:`D_{ij} = f'(\lambda)` (Daleckii and Krein, AMS Transl. 47, 1965; Bhatia, *Matrix
+    Analysis*, 1997, Sec. V.3), built from the saved eigenpairs by :func:`_loewner_adjoint`. It never
+    differentiates the eigendecomposition, so it is finite and exact at a degenerate spectrum such as
+    the isotropic ``Sigma = I`` init, and the forward needs only the plain ``safe_eigh`` (audit
+    2026-10-16, F99).
+    """
 
     @staticmethod
     def forward(
@@ -279,7 +206,9 @@ class _SymmetricSpectralMap(torch.autograd.Function):
         upper:  Optional[float],
     ) -> torch.Tensor:
         symmetric = 0.5 * (matrix + matrix.transpose(-1, -2))
-        eigenvalues, eigenvectors = _eigh_damped(symmetric, _rel_gap_eps(symmetric))
+        # safe_eigh: value-identical to torch.linalg.eigh, but chunks the flattened batch below the
+        # cuSOLVER batched-eigensolver ceiling (audit 2026-09-23 low; see numerics._EIG_MAX_BATCH).
+        eigenvalues, eigenvectors = safe_eigh(symmetric)
         values, _ = _spectral_values_and_derivatives(eigenvalues, kind, lower, upper)
         ctx.save_for_backward(eigenvalues, eigenvectors)
         ctx.kind = kind
@@ -305,11 +234,11 @@ class _SymmetricSpectralMapPair(torch.autograd.Function):
     r"""TWO symmetric matrix functions of ONE matrix, sharing a single eigendecomposition.
 
     ``retract_spd_full`` needs both ``Sigma^{1/2}`` and ``Sigma^{-1/2}`` of the SAME ``Sigma``.
-    Two ``_symmetric_spectral_map`` calls ran ``_eigh_damped`` twice on identical input; the two
+    Two ``_symmetric_spectral_map`` calls ran the eigendecomposition twice on identical input; the two
     functions share a spectrum, so one decomposition serves both (audit 2026-08-05: measured as a
     redundant ``eigh`` over the live ``(B*N, K, K)`` covariance stack on every E-step).
 
-    Forward is bit-identical to the two separate calls -- same symmetrization, same damped
+    Forward is bit-identical to the two separate calls -- same symmetrization, same ``safe_eigh``
     eigendecomposition, same per-kind value map. Backward returns the SUM of the two adjoints,
     which is exactly what autograd accumulates when one tensor feeds two consumers (IEEE-754
     addition of the two contributions is order-independent, so the sum is bit-identical too).
@@ -332,7 +261,7 @@ class _SymmetricSpectralMapPair(torch.autograd.Function):
         # identically zero either way.
         ctx.set_materialize_grads(False)
         symmetric = 0.5 * (matrix + matrix.transpose(-1, -2))
-        eigenvalues, eigenvectors = _eigh_damped(symmetric, _rel_gap_eps(symmetric))
+        eigenvalues, eigenvectors = safe_eigh(symmetric)
         values_a, _ = _spectral_values_and_derivatives(eigenvalues, kind_a, lower, upper)
         values_b, _ = _spectral_values_and_derivatives(eigenvalues, kind_b, lower, upper)
         ctx.save_for_backward(eigenvalues, eigenvectors)
@@ -391,6 +320,81 @@ def _symmetric_spectral_map_pair(
     return _SymmetricSpectralMapPair.apply(matrix, kind_a, kind_b, lower, upper)
 
 
+class _ClippedSpectralRebuild(torch.autograd.Function):
+    r"""Per-row spectral clip :math:`V \min(\max(\Lambda, l_r), u_r) V^T` from a supplied eigendecomposition.
+
+    The SPD repair rebuilds one row at several clearances from ONE eigendecomposition of ``matrix``, so
+    the eigenpairs arrive precomputed (detached) and ``matrix`` carries the graph. The adjoint in
+    ``matrix`` is the Loewner form of :class:`_SymmetricSpectralMap` for :math:`f(\lambda) =
+    \mathrm{clip}(\lambda; l_r, u_r)`: :math:`D_{ij} = 1` on a pair of distinct unclipped eigenvalues,
+    the quotient :math:`(f_i - f_j)/(\lambda_i - \lambda_j)` on a pair with a clipped member, and the
+    limit :math:`f'(\bar\lambda) = [l_r \le \bar\lambda \le u_r]` at the midpoint of an unresolved pair.
+    Differentiating the rebuild through the eigendecomposition instead damped the in-cluster term of a
+    degenerate unclipped cluster to zero, against an exact value of 1 (audit 2026-10-16, F39). The
+    bounds are differentiable as well: :math:`\partial f_k/\partial l_r = [\lambda_k < l_r]` and
+    :math:`\partial f_k/\partial u_r = [\lambda_k > u_r]`, the derivative of the clip as written, so a
+    clearance that depends on the row keeps its gradient.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        matrix:       torch.Tensor,             # (R, K, K) symmetric; the eigenpairs below decompose it
+        eigenvalues:  torch.Tensor,             # (R, K) detached
+        eigenvectors: torch.Tensor,             # (R, K, K) detached
+        lower:        torch.Tensor,             # (R, 1) per-row floor l_r
+        upper:        Optional[torch.Tensor],   # (R, 1) per-row ceiling u_r > l_r, or None
+    ) -> torch.Tensor:                          # (R, K, K)
+        clipped = torch.maximum(eigenvalues, lower)
+        if upper is not None:
+            clipped = torch.minimum(clipped, upper)
+        ctx.save_for_backward(eigenvalues, eigenvectors, clipped, lower,
+                              upper if upper is not None else lower)
+        ctx.has_upper = upper is not None
+        return eigenvectors * clipped.unsqueeze(-2) @ eigenvectors.transpose(-1, -2)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        eigenvalues, eigenvectors, clipped, lower, upper = ctx.saved_tensors
+        has_upper = ctx.has_upper
+        eigenvectors_t = eigenvectors.transpose(-1, -2)
+        symmetric_grad = 0.5 * (grad_output + grad_output.transpose(-1, -2))
+        inner = eigenvectors_t @ symmetric_grad @ eigenvectors           # (R, K, K) V^T G V
+
+        lambda_i = eigenvalues.unsqueeze(-1)                             # (R, K, 1)
+        lambda_j = eigenvalues.unsqueeze(-2)                             # (R, 1, K)
+        gap = lambda_i - lambda_j                                        # (R, K, K)
+        scale = torch.maximum(lambda_i.abs(), lambda_j.abs())
+        resolution = (
+            8.0 * torch.finfo(eigenvalues.dtype).eps * scale
+        ).clamp(min=torch.finfo(eigenvalues.dtype).tiny)
+        repeated = gap.abs() <= resolution                               # the rule of _loewner_adjoint
+        lower_pair = lower.unsqueeze(-1)                                 # (R, 1, 1)
+        upper_pair = upper.unsqueeze(-1)
+        active = eigenvalues >= lower                                    # (R, K) unclipped eigenvalues
+        if has_upper:
+            active = active & (eigenvalues <= upper)
+        safe_gap = torch.where(repeated, torch.ones_like(gap), gap)
+        divided_difference = (clipped.unsqueeze(-1) - clipped.unsqueeze(-2)) / safe_gap
+        both_active = active.unsqueeze(-1) & active.unsqueeze(-2) & ~repeated
+        divided_difference = torch.where(both_active, torch.ones_like(gap), divided_difference)
+        midpoint = 0.5 * (lambda_i + lambda_j)
+        limit = midpoint >= lower_pair
+        if has_upper:
+            limit = limit & (midpoint <= upper_pair)
+        divided_difference = torch.where(repeated, limit.to(gap.dtype), divided_difference)
+        grad_matrix = eigenvectors @ (divided_difference * inner) @ eigenvectors_t
+        grad_matrix = 0.5 * (grad_matrix + grad_matrix.transpose(-1, -2))
+
+        diagonal = inner.diagonal(dim1=-2, dim2=-1)                      # (R, K) cotangent of each clipped value
+        grad_lower = grad_upper = None
+        if ctx.needs_input_grad[3]:
+            grad_lower = torch.where(eigenvalues < lower, diagonal, torch.zeros_like(diagonal)).sum(-1, keepdim=True)
+        if has_upper and ctx.needs_input_grad[4]:
+            grad_upper = torch.where(eigenvalues > upper, diagonal, torch.zeros_like(diagonal)).sum(-1, keepdim=True)
+        return grad_matrix, None, None, grad_lower, grad_upper
+
+
 def _certify_public_spd(
     matrix: torch.Tensor,                  # (..., K, K) projected covariance in its public dtype
 
@@ -436,7 +440,10 @@ def _certify_public_spd(
     # row that touched the ceiling, and pooling those rows hid the floor lift the counter exposes.
     _count_public_spd_repairs(floor_failed, ceiling_failed & ~floor_failed)
     repair_input = certificate[failed]
-    eigenvalues, eigenvectors = _eigh_damped(repair_input, _rel_gap_eps(repair_input))
+    # The eigenpairs are detached: each rebuild below differentiates through the exact Loewner adjoint
+    # of the clip (_ClippedSpectralRebuild, audit 2026-10-16 F39), not through the eigendecomposition.
+    with torch.no_grad():
+        eigenvalues, eigenvectors = safe_eigh(repair_input)
     scale = repair_input.abs().amax(dim=(-2, -1), keepdim=True).clamp_min(1.0)
     margin = scale * (8.0 * dimension * torch.finfo(symmetric.dtype).eps)
     margin_scalar = margin.squeeze(-1).squeeze(-1).unsqueeze(-1)
@@ -449,11 +456,10 @@ def _certify_public_spd(
 
     def rebuild(clearance: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""Clip the spectrum to [eps + c, sigma_max - c], rebuild in the public dtype, and certify it."""
-        lower = torch.full_like(eigenvalues, float(eps)) + clearance
-        clipped = torch.maximum(eigenvalues, lower)
-        if sigma_max is not None:
-            clipped = torch.minimum(clipped, torch.full_like(eigenvalues, float(sigma_max)) - clearance)
-        rebuilt = (eigenvectors * clipped.unsqueeze(-2) @ eigenvectors.transpose(-1, -2)).to(symmetric.dtype)
+        lower = float(eps) + clearance                                   # (R, 1)
+        upper = None if sigma_max is None else float(sigma_max) - clearance
+        rebuilt = _ClippedSpectralRebuild.apply(repair_input, eigenvalues, eigenvectors, lower, upper)
+        rebuilt = rebuilt.to(symmetric.dtype)
         rebuilt = 0.5 * (rebuilt + rebuilt.transpose(-1, -2))
         represented = rebuilt.to(check_dtype)
         _, lower_info = torch.linalg.cholesky_ex(represented - float(eps) * eye_check, check_errors=False)
@@ -667,9 +673,11 @@ def retract_spd_full(
         Sigma_new = S^{1/2} exp(S^{-1/2} (tau dSigma) S^{-1/2}) S^{1/2},
     with one Frobenius-ball trust region on the whole whitened tangent matrix and an eigenvalue
     floor/ceiling [eps, sigma_max] (eigenvalues are variances: the SAME physical ceiling the
-    diagonal arm applies to sigma). Uses the gap-regularized ``_eigh_damped`` eigendecomposition so
-    the unrolled backward stays finite on a degenerate spectrum -- the isotropic ``Sigma = I`` default
-    gaussian_full init makes the stock eigh backward 100% NaN; forward values are unchanged.
+    diagonal arm applies to sigma). Every matrix function is differentiated by its exact Loewner
+    (Daleckii-Krein) adjoint with the repeated-eigenvalue limit :math:`f'(\lambda)` (see
+    :class:`_SymmetricSpectralMap`), so the unrolled backward is finite and exact on a degenerate
+    spectrum -- at the isotropic ``Sigma = I`` default gaussian_full init the stock eigh backward is
+    100% NaN.
     When sigma_max is None the eigenvalue ceiling is skipped (pure-path: eps floor only).
     """
     _check_sigma_max(sigma_max, eps)

@@ -320,9 +320,19 @@ class GaugeGroup:
         r"""Per-block trace functionals :math:`V_{ha} = \operatorname{tr}(G_a|_{\text{block }h})`.
 
         A block-local group reads them from its local basis (generator (h, a) has trace tr L_a on block h only),
-        without the dense basis; every other group takes the blocks of ``generators``.
+        and the canonical elementary block_glk basis from its layout (generator (h, i, j) is E_ij on block h, so
+        :math:`V_{h,(h,i,j)} = \delta_{ij}`, as in :meth:`generator_traces`; audit 2026-10-16, F87), both without
+        the dense basis; every other group takes the blocks of ``generators``.
         """
         from vfe3.geometry.lie_ops import _block_trace_vectors
+        layout = self.elementary_block_shape
+        if layout is not None:
+            H, d = layout
+            V = torch.zeros(H, H * d * d, device=self.generator_device, dtype=self.generator_dtype)
+            identity = torch.eye(d, device=self.generator_device, dtype=self.generator_dtype).reshape(-1)
+            for h in range(H):
+                V[h, h * d * d:(h + 1) * d * d] = identity
+            return V
         if self.certified_block_local_basis() is not None:
             H = len(self.irrep_dims)
             local = self._local_basis_as(self.generator_dtype, self.generator_device)
@@ -393,9 +403,10 @@ class GaugeGroup:
 
         ``extract_phi`` recovers algebra coordinates by solving ``Gram c = g`` with
         ``c = Gram^+ g``; ``Gram_ab = <G_a, G_b>_F`` depends ONLY on the fixed generator basis.
-        The BCH positional-composition hot path (``compose_bch -> extract_phi``) recomputed a dense
-        ``(n_gen, n_gen)`` float64 ``pinv`` every forward (for the orthonormal block_glk basis the
-        Gram is exactly ``I``, so the recompute was pure waste). Caching is value-identical -- the
+        No production path calls it: it served the BCH positional composition
+        (``compose_bch -> extract_phi``), which the exact right-factor product ``exp(X) exp(Y)`` has
+        replaced, and it is kept for the test and diagnostic composition utilities of
+        :mod:`vfe3.geometry.lie_ops` (audit 2026-10-16, F91). Caching is value-identical -- the
         returned tensor equals ``gram_pinv(self.generators)`` -- and recomputed after device/dtype
         moves, replacement, or an in-place basis mutation.
         """
@@ -713,7 +724,9 @@ def _build_so_n(
     The registered ``pullback_per_block`` capability therefore solves a tied tower as ONE full
     block (the exact Frobenius pullback of the whole representation, audit 2026-10-07 F47); an
     untied tower is solved per block, skipping generator-free 'l0' blocks. All blocks are built
-    in real orthonormal bases, so every embedded generator is exactly skew
+    in real orthonormal bases, so every embedded generator is skew: exactly for SO(3), 'l1' and
+    the wedge blocks, to rounding (about 1e-16, not antisymmetrized, so the fingerprint below is
+    unchanged) for the Gram-Schmidt tensor-power blocks at N != 3, p >= 2
     (skew_symmetric=True: det Omega = 1 structurally; inverses still route through the float64
     group-inverse solve, there is no transpose fast path).
     'l0' (trivial) blocks carry ZERO generators: those coordinates are gauge-invariant by
@@ -825,13 +838,19 @@ def _build_su_n(
 ) -> GaugeGroup:
     r"""SU(N) acting on R^K through a direct sum of real irreps (tied gauge by default; heads = irreps).
 
-    The structure group is SU(N) with N = ``group_n`` >= 3, decoupled from K. Labels 'pq<p>_<q>' name the irrep
-    of highest weight (p, q); built so far are the trivial 'pq0_0' (no generators) and the adjoint 'pq1_1'
-    (real dimension N^2 - 1), :math:`\mathrm{ad}(X_a)_{cb} = f_{abc}` for :math:`X_a = i\lambda_a`. The
-    generators are real and exactly skew (skew_symmetric=True, det = 1), n_gen = N^2 - 1 per tied tower; the
-    first N(N-1)/2 phi coordinates are the so(N) subalgebra. An adjoint-only tower is a representation of
-    PSU(N) = SU(N)/Z_N, since the centre acts trivially on (1, 1). Tying, the Gram certificate and the basis
-    fingerprint behave as for ``so_n`` (:func:`_build_irrep_tower`).
+    The structure group is SU(N) with N = ``group_n`` >= 3, decoupled from K. Labels 'pq<p>_<q>' (p >= q >= 0)
+    name the irrep of highest weight :math:`p\omega_1 + q\omega_{N-1}`, the traceless tensors in
+    :math:`\mathrm{Sym}^p\mathbb{C}^N\otimes\mathrm{Sym}^q\overline{\mathbb{C}^N}`. For N = 3 these are all the
+    irreps of SU(3) up to complex conjugation, which the realification identifies; for N >= 4 they are only the
+    irreps whose inner Dynkin labels vanish, so for example :math:`\Lambda^2\mathbb{C}^4` of SU(4) is not among
+    them. The trivial 'pq0_0' (no generators) and the adjoint 'pq1_1' (real dimension N^2 - 1,
+    :math:`\mathrm{ad}(X_a)_{cb} = f_{abc}` for :math:`X_a = i\lambda_a`) are built in closed form, and every other
+    (p, q) with p + q <= 6 and N^(p+q) <= 60000 by the tensor construction
+    (:func:`vfe3.geometry.irreps._su_tensor_irrep`), realified to real dimension 2D when p != q. The generators
+    are real and exactly skew (skew_symmetric=True, det = 1), n_gen = N^2 - 1 per tied tower; the first N(N-1)/2
+    phi coordinates are the so(N) subalgebra. An adjoint-only tower is a representation of PSU(N) = SU(N)/Z_N,
+    since the centre acts trivially on (1, 1). Tying, the Gram certificate and the basis fingerprint behave as
+    for ``so_n`` (:func:`_build_irrep_tower`).
     """
     if group_n is None or irrep_spec is None:
         raise ValueError(

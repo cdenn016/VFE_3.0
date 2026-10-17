@@ -7,7 +7,8 @@ Groups, by roadmap item:
   A2  per-position state_dependent alpha is envelope-correct for EVERY divergence (the gradient is
       alpha*(D)*dD with no product-rule residue), the divergence-agnostic alpha-envelope.
   A3  the full-covariance unrolled oracle gradient (oracle_unroll_grad=True) is FINITE on a single
-      training backward -- the _eigh_damped/safe_cholesky fix; the old "expect NaNs" docstring is stale.
+      training backward -- the exact Loewner spectral adjoint (retraction.py) and safe_cholesky; the
+      old "expect NaNs" docstring is stale.
   B1  fused chunked full-covariance decode+CE (decode_mode='full_chunked'): the diagonal-prior closed
       form, equal to the dense full decode CE, with no per-pair (B,N,V,K,K) Cholesky workspace.
   B2  per-head full-covariance transport sandwich: the block-diagonal congruence equals the dense
@@ -61,8 +62,9 @@ def test_per_coord_bhattacharyya_jeffreys_sum_to_scalar():
 # ---------------------------------------------------------------------------
 # A3: full-cov unrolled oracle gradient is FINITE (and live) on a single training backward.
 # The config docstring's "expect NaNs there" for gaussian_full + oracle_unroll_grad=True predates
-# the _eigh_damped gap-regularized eigh backward (retraction.py); the single training backward is
-# now finite. This pins that, and contrasts it with the truncated default (oracle_unroll_grad=False).
+# the full-covariance retraction's finite backward, now the exact Loewner (Daleckii-Krein) adjoint of
+# its spectral maps in retraction.py (the gap-damped eigh it once used was retired under audit
+# 2026-10-16 F99); the single training backward is finite. This pins that, and contrasts it with the truncated default (oracle_unroll_grad=False).
 # ---------------------------------------------------------------------------
 
 

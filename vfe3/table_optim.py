@@ -21,11 +21,13 @@ back to Fisher norm at most :math:`r`,
 
 and is then multiplied by the schedule factor :math:`\mathrm{lr}_t/\mathrm{lr}_0` of the table's AdamW group. The
 trust radius bounds the divergence only to second order, :math:`\mathrm{KL}(p_v^{+}\|p_v) = \tfrac12\|\Delta_v\|^2_{G_v}
-+ O(r^3) \le r^2/2 + O(r^3)`: along :math:`+\Delta l` the exact ratio :math:`\mathrm{KL}/(r^2/2)` is
-:math:`(e^{x} - 1 - x)/x^2` with :math:`x = \sqrt2 r`, which is 1.049 at :math:`r = 0.1` and 1.158 at :math:`r = 0.3`
-(audit 2026-10-10 round 2, item 36). Rows absent from the step (:math:`n_v = 0`) take no gradient step. Each
-group's decoupled decay is applied as AdamW applies it, :math:`p \leftarrow p(1 - \mathrm{lr}_t\lambda)`, so
-``mu_weight_decay`` and ``sigma_weight_decay`` keep their meaning; the decay sits outside the trust-radius bound.
++ O(r^3) \le r^2/2 + O(r^3)`: along :math:`+\Delta l` (one coordinate, :math:`\Delta l = x = \sqrt2 r`) the exact
+divergence is :math:`\mathrm{KL} = \tfrac12(e^{x} - 1 - x)` and :math:`r^2/2 = x^2/4`, so the ratio
+:math:`\mathrm{KL}/(r^2/2) = 2(e^{x} - 1 - x)/x^2` is 1.049 at :math:`r = 0.1`, 1.158 at :math:`r = 0.3` and 1.284
+at :math:`r = 0.5` (audit 2026-10-10 round 2, item 36; the factor 2, audit 2026-10-16 F105). Rows absent from
+the step (:math:`n_v = 0`) take no gradient step. Each group's decoupled decay is applied as AdamW applies it,
+:math:`p \leftarrow p(1 - \mathrm{lr}_t\lambda)`, so ``mu_weight_decay`` and ``sigma_weight_decay`` keep their
+meaning; the decay sits outside the trust-radius bound.
 The groups marked ``table_fisher`` are excluded from gradient clipping (``vfe3.train.train_step``), so the realized
 step is the one above. AdamW cannot express this update: its per-coordinate normalization cancels any slowly
 varying diagonal preconditioner such as :math:`s_v`. The step keeps no optimizer state.

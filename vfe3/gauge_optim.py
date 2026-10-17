@@ -27,6 +27,7 @@ from vfe3.geometry.matrix_log import (
     principal_strip_certificate,
 )
 from vfe3.geometry.phi_fisher import (
+    FISHER_COMPLETIONS,
     FisherRowStatistics,
     fisher_type_solve,
     jacobi_cholesky_solve,
@@ -37,9 +38,10 @@ from vfe3.geometry.phi_fisher import (
     whitened_condition,
 )
 from vfe3.geometry.phi_preconditioner import (
+    _PHI_GROUP_DIFFERENTIAL_MODES,
     PullbackGroupDirectionResult,
     pullback_group_direction,
-    phi_group_differential_mode,
+    phi_group_differential_mode as phi_group_differential_mode_global,
     uspace_ambient_gradient,
     uspace_chart_velocity,
     uspace_pullback_body_direction,
@@ -58,6 +60,8 @@ _UGROUP_STRIP_MARGIN = 0.25
 # form amplifies relative covector noise by about kappa(U_h) (review 2026-09-28).
 _UGROUP_FAST_FRAME_COND_MAX = 1e3
 _UGROUP_RETRACTIONS = ("chart", "group_log")
+# Route of the group_log rows the closed form does not serve (m_phi_group_log_fallback; audit 2026-10-16, F40).
+_UGROUP_LOG_FALLBACKS = ("series", "eigenbasis")
 # Relative group-product residual gate of the staged phi retractions (``bch_residual_max`` in
 # configs before 2026-10-12, hardcoded then).
 _GROUP_PRODUCT_RESIDUAL_MAX = 1e-6
@@ -253,6 +257,31 @@ def _pullback_group_compact_blocks(group: GaugeGroup) -> bool:
     )
 
 
+def _pullback_group_local_head_blocks(
+    coordinates: torch.Tensor,               # (A, n_gen) float64 chart coordinates
+    group:       GaugeGroup,
+) -> Optional[torch.Tensor]:                 # (A, H, d, d) head blocks, or None off the block-local route
+    r"""Head blocks :math:`M_h = \sum_a \varphi_{(h,a)} L_a` of a certified block-local group, else None.
+
+    ``block_so``, ``block_co``, ``block_sl``, ``block_borel``, ``block_unipotent`` and ``block_glmc``
+    copy one (m, d, d) local basis :math:`L` into each of ``H`` equal head blocks, head-major, so the
+    coordinates of head ``h`` are the contiguous run ``[h m, (h + 1) m)``. The cached float64 cast of
+    the local basis (rounded to the stored dtype first, so it equals ``generators.to(float64)`` entry
+    for entry) replaces the dense (H m, K, K) basis, whose float64 copy the residual check used to make
+    on every backtracking attempt (audit 2026-10-16, F29).
+    """
+    local = group.certified_block_local_basis()
+    if local is None:
+        return None
+    n_blocks, block_dim = len(group.irrep_dims), group.irrep_dims[0]
+    basis = group._local_basis_as(torch.float64, coordinates.device)          # (m, d, d)
+    return torch.einsum(
+        "ahm,mij->ahij",
+        coordinates.reshape(-1, n_blocks, basis.shape[0]),
+        basis,
+    )
+
+
 def _pullback_group_current_element(
     phi:   torch.Tensor,                     # (active, n_gen) current chart
     group: GaugeGroup,
@@ -263,10 +292,18 @@ def _pullback_group_current_element(
     change while the trust factor is halved; only ``delta`` and ``candidate_phi`` do. Recomputing
     this exponential inside the residual check cost up to ``max_backtracks`` redundant
     ``matrix_exp`` calls on the whole active batch per M-step.
+
+    The layout matches the per-block direction's ``current_element``: ``(A, H, d, d)`` head blocks
+    for the per-head ``block_glk`` basis and for a block-local group with ``H > 1``, ``(A, K, K)``
+    otherwise (a one-block block-local group is its own local basis).
     """
     if _pullback_group_compact_blocks(group):
         n_blocks, block_dim = len(group.irrep_dims), group.irrep_dims[0]
         return torch.linalg.matrix_exp(phi.reshape(-1, n_blocks, block_dim, block_dim))
+    blocks = _pullback_group_local_head_blocks(phi, group)                    # (A, H, d, d) or None
+    if blocks is not None:
+        element = torch.linalg.matrix_exp(blocks)
+        return element if blocks.shape[-3] > 1 else element[..., 0, :, :]
     generators = group.generators.to(device=phi.device, dtype=torch.float64)
     return torch.linalg.matrix_exp(torch.einsum("...a,aij->...ij", phi, generators))
 
@@ -277,8 +314,10 @@ def _dense_group_element(
 ) -> torch.Tensor:                           # (..., K, K)
     r"""A dense group element, assembling direct-sum blocks when the per-block direction reported them.
 
-    A group whose basis is not the elementary block basis (block_so, block_co, block_sl, block_borel, block_unipotent, block_glmc) is staged densely
-    while its per-block direction reports :math:`\exp(\varphi)` as blocks (audit 2026-10-07, F47).
+    A block-diagonal group without a blockwise residual route (a basis replaced or mutated after
+    construction, which withdraws the block-local certificate) is staged densely while its per-block
+    direction reports :math:`\exp(\varphi)` as blocks (audit 2026-10-07, F47); the collect-step frame
+    displacement also assembles both elements when their layouts differ.
     """
     if element.shape[-1] == K and element.shape[-2] == K:
         return element
@@ -287,6 +326,29 @@ def _dense_group_element(
     for h in range(element.shape[-3]):
         dense[..., h * d:(h + 1) * d, h * d:(h + 1) * d] = element[..., h, :, :]
     return dense
+
+
+def _group_element_head_blocks(
+    element:   torch.Tensor,                 # (A, H, d, d) head blocks, or (A, K, K) block-diagonal
+    n_blocks:  int,
+    block_dim: int,
+) -> torch.Tensor:                           # (A, H, d, d)
+    r"""The diagonal head blocks of a block-diagonal group element; the inverse of :func:`_dense_group_element`.
+
+    A one-block direction reports :math:`\exp(\varphi)` as ``(A, K, K)``; it is read as ``(A, 1, K, K)``.
+    """
+    if element.ndim == 4 and tuple(element.shape[-3:]) == (n_blocks, block_dim, block_dim):
+        return element
+    K = n_blocks * block_dim
+    if element.ndim != 3 or tuple(element.shape[-2:]) != (K, K):
+        raise ValueError(
+            f"expected a (A, {n_blocks}, {block_dim}, {block_dim}) or (A, {K}, {K}) group element, got "
+            f"{tuple(element.shape)}")
+    return torch.stack(
+        [element[:, h * block_dim:(h + 1) * block_dim, h * block_dim:(h + 1) * block_dim]
+         for h in range(n_blocks)],
+        dim=-3,
+    )
 
 
 def _pullback_group_product_residual(
@@ -299,16 +361,24 @@ def _pullback_group_product_residual(
 
     ``current_element`` is supplied by the caller rather than recomputed, so a backtracking loop
     pays one ``exp(phi)`` instead of one per attempt (audit 2026-08-07). Value-identical.
+
+    Block-diagonal groups compare head blocks: the per-head ``block_glk`` chart reshapes into them, a
+    block-local chart embeds through its local basis (audit 2026-10-16, F29). Off the blocks both
+    elements vanish, so the summed block Frobenius norms equal the dense ones up to roundoff.
     """
-    if _pullback_group_compact_blocks(group):
+    compact = _pullback_group_compact_blocks(group)
+    local_blocks = None if compact else _pullback_group_local_head_blocks(candidate_phi, group)
+    if compact or local_blocks is not None:
         n_blocks, block_dim = len(group.irrep_dims), group.irrep_dims[0]
-
-        def _blocks(coordinates: torch.Tensor) -> torch.Tensor:
-            return coordinates.reshape(-1, n_blocks, block_dim, block_dim)
-
-        candidate_element = torch.linalg.matrix_exp(_blocks(candidate_phi))
-        right_element = torch.linalg.matrix_exp(_blocks(delta))
-        reference = current_element @ right_element
+        if compact:
+            candidate_blocks = candidate_phi.reshape(-1, n_blocks, block_dim, block_dim)
+            delta_blocks = delta.reshape(-1, n_blocks, block_dim, block_dim)
+        else:
+            candidate_blocks = local_blocks                                   # (A, H, d, d)
+            delta_blocks = _pullback_group_local_head_blocks(delta, group)    # (A, H, d, d)
+        candidate_element = torch.linalg.matrix_exp(candidate_blocks)
+        right_element = torch.linalg.matrix_exp(delta_blocks)
+        reference = _group_element_head_blocks(current_element, n_blocks, block_dim) @ right_element
         error_sq = (candidate_element - reference).square().sum(dim=(-3, -2, -1))
         reference_sq = reference.square().sum(dim=(-3, -2, -1))
         return error_sq.sqrt() / reference_sq.sqrt().clamp_min(torch.finfo(torch.float64).tiny)
@@ -613,20 +683,38 @@ def pullback_group_log_direction(
     collect:           bool,
     group:             GaugeGroup,
     differential_mode: Optional[str] = None,
+    fallback:          str = "series",
 ) -> GroupLogDirection:
-    r"""Closed-form Frobenius-pullback body direction with the series direction off the strip.
+    r"""Closed-form Frobenius-pullback body direction with a fallback for the rows it does not serve.
 
     Rows whose blocks all satisfy :math:`\max|\mathrm{Im}\,\lambda(X_h)| < \pi - 0.25` (Bendixson,
     then exact eigenvalues) and :math:`\max_h \kappa_2(U_h) \le 10^3` use
     :math:`\xi = U^{-1} L_{\log}(U^\top, M)` blockwise (:func:`uspace_pullback_body_direction`).
-    The other rows, and rows whose Frechet log fails, use :func:`pullback_group_direction` with
-    per-row conditioning rejection; rows it rejects are rejected. The frame-condition bound keeps
+    The other rows, and rows whose Frechet log fails, take the ``fallback``
+    (``m_phi_group_log_fallback``):
+
+    ``'series'`` uses :func:`pullback_group_direction` with per-row conditioning rejection; rows it
+    rejects are rejected. It builds the dense structure constants of the block algebra.
+
+    ``'eigenbasis'`` keeps :math:`\xi = U^{-1}\bar G` and recovers
+    :math:`\bar G = U^{-\top}\Psi_L(\mathrm{ad}_{X^\top})^{-1}(M)` on each block off the strip (or whose
+    Frechet log failed) in the eigenbasis of the chart block (:func:`uspace_ambient_gradient` with
+    ``offstrip=True``), exact wherever :math:`\Psi_L` is invertible. That is the series direction
+    without its Gram ridge: for block gl the chart differential :math:`D` is invertible there, so
+    :math:`v = G_0^{-1}D^\top\bar G = D^{-1}\bar G` and :math:`U\xi = Dv = \bar G`. Rows with
+    :math:`\max_h \kappa_2(U_h) > 10^3`, which have no metric certificate on this route, and rows whose
+    eigenbasis solve fails its gate are rejected. No structure constants are built (audit 2026-10-16, F40).
+
+    The frame-condition bound keeps
     the chart route's acceptance semantics: the closed form has no metric certificate, and it
     amplifies relative covector noise by about :math:`\kappa_2(U_h)`. The covector is :math:`U \xi = P_T \bar G`, which for gl and block gl is the ambient
-    gradient itself (with the Gram ridge on fallback rows). With ``collect`` the chart velocity
-    :math:`v = L_{\log}(U, U \xi)` is formed for the cosine diagnostic; fast rows carry NaN
-    conditioning fields because no metric is assembled for them.
+    gradient itself (with the Gram ridge on series fallback rows). With ``collect`` the chart velocity
+    :math:`v = L_{\log}(U, U \xi)` (off the strip :math:`\Psi_R(\mathrm{ad}_X)^{-1}(U\xi U^{-1})`) is formed
+    for the cosine diagnostic; rows without a series solve carry NaN conditioning fields because no metric
+    is assembled for them.
     """
+    if fallback not in _UGROUP_LOG_FALLBACKS:
+        raise ValueError(f"group_log fallback must be one of {_UGROUP_LOG_FALLBACKS}, got {fallback!r}")
     rows, n_gen = grad_phi.shape
     n_blocks, block_dim = current_blocks.shape[-3], current_blocks.shape[-1]
     X = phi.view(rows, n_blocks, block_dim, block_dim)                   # (A, H, d, d)
@@ -644,13 +732,31 @@ def pullback_group_log_direction(
     v_phi = torch.full_like(phi, float("nan")) if collect else None
     series_order = 0
     fast_index = fast.nonzero(as_tuple=True)[0]
+    log_served = certified.clone()                                       # (A, H) blocks the log route serves
     if fast_index.numel() > 0:
         xi_fast, ok = uspace_pullback_body_direction(
             X[fast_index], M[fast_index], U=U[fast_index], certified=certified[fast_index])
         xi[fast_index] = xi_fast
         fast[fast_index] = ok.all(dim=-1)                                # a log failure falls back
+        log_served[fast_index] = certified[fast_index] & ok              # the eigenbasis takes a failed log
     fallback_index = (~fast).nonzero(as_tuple=True)[0]
-    if fallback_index.numel() > 0:
+    if fallback_index.numel() > 0 and fallback == "eigenbasis":
+        xi[fallback_index] = 0.0
+        accepted[fallback_index] = False                                 # max_h kappa_2(U_h) > 1e3: no certificate
+        solved = fallback_index[frame_condition[fallback_index] <= _UGROUP_FAST_FRAME_COND_MAX]
+        if solved.numel() > 0:
+            X_s, U_s, served = X[solved], U[solved], log_served[solved]  # (e, H, d, d), (e, H)
+            G_bar, block_ok = uspace_ambient_gradient(X_s, M[solved], U=U_s, certified=served, offstrip=True)
+            xi_s = torch.linalg.solve(U_s, G_bar)                        # (e, H, d, d) U^{-1} G_bar
+            row_ok = block_ok.all(dim=-1) & torch.isfinite(xi_s).flatten(1).all(dim=-1)   # (e,)
+            xi[solved] = torch.where(row_ok[:, None, None, None], xi_s, torch.zeros_like(xi_s))
+            accepted[solved] = row_ok
+            if v_phi is not None:
+                W = torch.linalg.solve(U_s, U_s @ xi[solved], left=False)    # (e, H, d, d) U xi U^{-1}
+                v_s, v_ok = uspace_chart_velocity(X_s, W, U=U_s, certified=served, offstrip=True)
+                v_phi[solved] = torch.where((row_ok & v_ok.all(dim=-1))[:, None],
+                                            v_s.reshape(-1, n_gen), float("nan"))
+    elif fallback_index.numel() > 0:
         series = pullback_group_direction(
             grad_phi[fallback_index],
             phi[fallback_index],
@@ -707,6 +813,7 @@ def belief_fisher_group_direction(
     rotation_weight: float,
     chart_velocity:  bool = False,
     diagnostics_out: Optional[Dict[str, List[torch.Tensor]]] = None,
+    completion:      str = "rotation",
 ) -> GroupLogDirection:
     r"""Belief-Fisher natural-gradient body direction of the stored factor rows (Track 2).
 
@@ -737,7 +844,18 @@ def belief_fisher_group_direction(
     ``collect``, zero otherwise); they are not Frobenius-pullback conditions, so the optimizer logs
     them under ``phi_fisher_condP_max`` / ``phi_fisher_pos_cond_max`` and leaves the
     ``phi_pullback_damped_gen_cond_*`` columns NaN.
+
+    ``completion`` (``m_phi_fisher_completion``) selects the completed metric of the type rows:
+    ``'rotation'`` (weight :math:`\lambda` on every rotation) or ``'stabilizer'`` (on the belief's
+    stabilizer only, so the solve is the belief-Fisher natural gradient on the Fisher-visible subspace;
+    :mod:`vfe3.geometry.phi_fisher`). Positional rows have no ``'stabilizer'`` operator and raise.
     """
+    if completion not in FISHER_COMPLETIONS:
+        raise ValueError(f"Fisher completion must be one of {FISHER_COMPLETIONS}, got {completion!r}")
+    if completion == "stabilizer" and statistics.kind != "type":
+        raise ValueError(
+            "completion='stabilizer' is implemented for token-type Fisher rows only; positional rows "
+            f"(statistics.kind={statistics.kind!r}) take completion='rotation'")
     rows, n_gen = grad_phi.shape
     n_blocks, block_dim = current_blocks.shape[-3], current_blocks.shape[-1]
     X = phi.view(rows, n_blocks, block_dim, block_dim)                   # (A, H, d, d)
@@ -751,9 +869,11 @@ def belief_fisher_group_direction(
     accepted = covector_ok.all(dim=-1) & (count > 0)
     if statistics.kind == "type":
         mu, s = statistics.local_mean, statistics.local_var              # (A, H, d)
-        W = fisher_type_solve(G_W, mu, s, scale, rotation_weight=rotation_weight)
-        a, lam_min, cond = type_row_spectrum(mu, s, rotation_weight=rotation_weight)   # (A, H)
-        residual = type_metric_residual(W, G_W, mu, s, scale, rotation_weight=rotation_weight)
+        W = fisher_type_solve(G_W, mu, s, scale, rotation_weight=rotation_weight, completion=completion)
+        a, lam_min, cond = type_row_spectrum(mu, s, rotation_weight=rotation_weight,
+                                             completion=completion)                     # (A, H)
+        residual = type_metric_residual(W, G_W, mu, s, scale, rotation_weight=rotation_weight,
+                                        completion=completion)
     elif statistics.kind == "pos":
         # The (A, H, d*d, d*d) operators are formed and solved a row chunk at a time under a byte
         # budget (audit 2026-10-08 P2-22); every row's solve is independent, so this is exact.
@@ -1450,6 +1570,19 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
     :func:`belief_fisher_group_direction` under either retraction; the provider supplies the batch
     belief statistics of the active rows of each table. The update creates no optimizer state for
     the phi table.
+
+    ``phi_group_differential_mode`` (``m_phi_group_differential_mode``: ``"series"`` or ``"spectral"``)
+    selects how the Frobenius-pullback direction evaluates :math:`\Psi_R`, :math:`\Psi_L`; ``None`` takes
+    the process-global :func:`~vfe3.geometry.phi_preconditioner.phi_group_differential_mode` at
+    construction (the historical behavior). The choice is per optimizer, never written to the
+    process-global, and is checkpointed: a loaded state's saved mode replaces it.
+
+    ``phi_fisher_completion`` (``m_phi_fisher_completion``: ``"rotation"`` or ``"stabilizer"``) selects the
+    completed belief-Fisher metric of the ``fisher_group`` type rows (:func:`belief_fisher_group_direction`).
+
+    ``phi_group_log_fallback`` (``m_phi_group_log_fallback``: ``"series"`` or ``"eigenbasis"``) routes the
+    ``group_log`` pullback rows the closed form does not serve (:func:`pullback_group_log_direction`); the
+    chart retraction and ``fisher_group`` never read it.
     """
 
     # Signature-convention exception: torch.optim.Optimizer's contract REQUIRES params as the
@@ -1465,10 +1598,28 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
         phi_group_retraction:   str = "chart",
         phi_statistics_provider:    Optional[PhiStatisticsProvider] = None,
         phi_fisher_rotation_weight: float = 2.0,
+        phi_group_differential_mode: Optional[str] = None,
+        phi_fisher_completion:      str = "rotation",
+        phi_group_log_fallback:     str = "series",
         **kwargs,
     ) -> None:
         if not isinstance(group, GaugeGroup):
             raise TypeError(f"group must be a GaugeGroup, got {type(group).__name__}")
+        if phi_group_log_fallback not in _UGROUP_LOG_FALLBACKS:
+            raise ValueError(
+                f"phi_group_log_fallback must be one of {_UGROUP_LOG_FALLBACKS}, got {phi_group_log_fallback!r}"
+            )
+        if phi_group_differential_mode is None:
+            phi_group_differential_mode = phi_group_differential_mode_global()
+        elif phi_group_differential_mode not in _PHI_GROUP_DIFFERENTIAL_MODES:
+            raise ValueError(
+                f"phi_group_differential_mode must be one of {_PHI_GROUP_DIFFERENTIAL_MODES}, got "
+                f"{phi_group_differential_mode!r}"
+            )
+        if phi_fisher_completion not in FISHER_COMPLETIONS:
+            raise ValueError(
+                f"phi_fisher_completion must be one of {FISHER_COMPLETIONS}, got {phi_fisher_completion!r}"
+            )
         if phi_group_retraction not in _UGROUP_RETRACTIONS:
             raise ValueError(
                 f"phi_group_retraction must be one of {_UGROUP_RETRACTIONS}, got "
@@ -1490,12 +1641,14 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
         )
         super().__init__(params, **kwargs)
         self._group                  = group
-        self._phi_group_differential_mode = phi_group_differential_mode()
+        self._phi_group_differential_mode = phi_group_differential_mode
         self._phi_group_trust_radius = phi_group_trust_radius
         self._phi_chart_max_norm     = phi_chart_max_norm
         self._phi_group_retraction   = phi_group_retraction
         self.phi_statistics_provider = phi_statistics_provider
         self._phi_fisher_rotation_weight = phi_fisher_rotation_weight
+        self._phi_fisher_completion = phi_fisher_completion
+        self._phi_group_log_fallback = phi_group_log_fallback
         # Training-time diagnostics are gated by train.py to log/eval steps. The silent hot path
         # performs no diagnostic tensor work or host reduction. Pullback groups report the fixed-
         # coordinate ridge-direction cosine, reused generalized-condition certificate, accepted
@@ -1511,7 +1664,10 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
         r"""Cumulative count of pullback-group row updates rejected since construction.
 
         Counts rows rejected by the direction's conditioning certificate or by the chart bound
-        (audit 2026-09-23 #10). Reading it synchronizes with the device.
+        (audit 2026-09-23 #10) on every step, logged or not; the per-step ``phi_group_rejected_rows``
+        diagnostic covers only the gated log/eval steps. It is not part of :meth:`state_dict`, so it
+        counts from 0 again after a resume, and a whole-run total adds the count the checkpoint
+        carried (audit 2026-10-16, F126). Reading it synchronizes with the device.
         """
         return 0 if self._phi_rejected_rows is None else int(self._phi_rejected_rows)
 
@@ -1538,14 +1694,23 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
         self,
         state_dict: Dict[str, object],
     ) -> None:                                                        # type: ignore[override]
-        r"""Restore AdamW state and the saved phi differential mode."""
+        r"""Restore AdamW state and the saved phi differential mode (it replaces the constructed one)."""
         core_state = dict(state_dict)
         saved_mode = core_state.pop("phi_group_differential_mode", None)
-        if saved_mode is not None and saved_mode not in ("series", "spectral"):
+        if saved_mode is not None and saved_mode not in _PHI_GROUP_DIFFERENTIAL_MODES:
             raise ValueError(f"unsupported saved phi differential mode: {saved_mode!r}")
+        pullback_groups = any(item.get("pullback_group", False) for item in self.param_groups)
+        if (saved_mode is not None and saved_mode != self._phi_group_differential_mode and pullback_groups
+                and self.phi_statistics_provider is None):            # fisher_group never reads the mode
+            warnings.warn(
+                f"Checkpoint's phi_group_differential_mode={saved_mode!r} replaces the constructed "
+                f"{self._phi_group_differential_mode!r} (m_phi_group_differential_mode); the resumed "
+                "run keeps the saved Psi route.",
+                UserWarning, stacklevel=2,
+            )
         if saved_mode is None:
             saved_mode = "series"
-            if any(item.get("pullback_group", False) for item in self.param_groups):
+            if pullback_groups:
                 warnings.warn(
                     "Checkpoint omits phi_group_differential_mode; restoring the historical "
                     "series default. A prior process-global spectral choice is not recoverable.",
@@ -1652,6 +1817,7 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                         belief_fisher_group_direction,
                         statistics=statistics,
                         rotation_weight=self._phi_fisher_rotation_weight,
+                        completion=self._phi_fisher_completion,
                         diagnostics_out=fisher_acc,
                     )
                 if group_log:
@@ -1663,6 +1829,7 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                             pullback_group_log_direction,
                             group=self._group,
                             differential_mode=self._phi_group_differential_mode,
+                            fallback=self._phi_group_log_fallback,
                         ),
                         learning_rate=phi_group["lr"],
                         trust_radius=self._phi_group_trust_radius,
@@ -1688,13 +1855,16 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                 if collect and group_log:
                     fast_acc.append(candidate.fast_rows)
                     rechart_acc.append(candidate.recharted_rows)
-                    backtrack_acc.append(candidate.backtracking_reductions)
                     margin_acc.append(candidate.strip_margin)
                     frame_cond_acc.append(
                         None if candidate.frame_condition is None or candidate.fast_rows is None
                         else torch.where(candidate.fast_rows, candidate.frame_condition,
                                          float("nan")))
                 if collect:
+                    # Halvings of the factor scale, on both retractions: on the chart route the 1e-6
+                    # product-residual certificate halves a trust-saturated step away from the
+                    # identity frame (audit 2026-10-16, F14).
+                    backtrack_acc.append(candidate.backtracking_reductions)
                     cosine = torch.nn.functional.cosine_similarity(
                         candidate.direction.v_phi,
                         flat_gradient[active].to(dtype=torch.float64),
@@ -1722,7 +1892,7 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                     committed_element = _pullback_group_current_element(
                         candidate.candidate_phi, self._group)
                     if committed_element.shape != current_element.shape:
-                        K = self._group.generators.shape[-1]
+                        K = self._group.generator_shape[-1]           # no dense basis read
                         current_element = _dense_group_element(current_element, K)
                         committed_element = _dense_group_element(committed_element, K)
                     frame_displacement_acc.append(torch.linalg.vector_norm(
@@ -1784,6 +1954,8 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                     (torch.stack(rejected_acc).sum().to(dtype=effective_scale.dtype)
                      if rejected_acc else effective_scale.new_zeros(())),
                 ]
+                all_backtracks = torch.cat(backtrack_acc).to(dtype=effective_scale.dtype)
+                statistics += [all_backtracks.mean(), all_backtracks.amax()]
                 if group_log:
                     nan = effective_scale.new_tensor(float("nan"))
                     fast = (torch.cat(fast_acc) if all(f is not None for f in fast_acc)
@@ -1792,7 +1964,7 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                         nan if fast is None else fast.sum().to(dtype=nan.dtype),
                         nan if fast is None else (~fast).sum().to(dtype=nan.dtype),
                         torch.cat(rechart_acc).sum().to(dtype=nan.dtype),
-                        torch.cat(backtrack_acc).amax().to(dtype=nan.dtype),
+                        all_backtracks.amax(),
                         torch.cat(margin_acc).amin(),
                         (nan if any(c is None for c in frame_cond_acc)
                          else _nan_amax(torch.cat(frame_cond_acc))),
@@ -1815,9 +1987,11 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                     "phi_effective_step_scale_mean":           values[12],
                     "phi_effective_step_scale_min":            values[13],
                     "phi_group_rejected_rows":                 values[14],
+                    "phi_group_backtracks_mean":               values[15],
+                    "phi_group_backtracks_max":                values[16],
                 })
                 if group_log:
-                    self._gauge_diag.update(dict(zip(GROUP_LOG_DIAGNOSTIC_KEYS, values[15:])))
+                    self._gauge_diag.update(dict(zip(GROUP_LOG_DIAGNOSTIC_KEYS, values[17:])))
             if fisher_acc is not None:
                 self._gauge_diag.update(_fisher_diagnostics(fisher_acc))
         return super().step()                                          # closure already rejected above

@@ -214,7 +214,9 @@ def test_sigma_max_annotation_matches_config(function) -> None:
 # -- Low: numerics keep float64 in float64 -------------------------------------------------------
 
 
-def test_eigh_damped_forward_routes_through_safe_eigh(monkeypatch) -> None:
+def test_spectral_map_forward_routes_through_safe_eigh(monkeypatch) -> None:
+    # The retired _eigh_damped wrapper carried this routing before audit 2026-10-16 F99; the spectral
+    # map now calls safe_eigh directly.
     calls = []
     original = retraction.safe_eigh
 
@@ -225,10 +227,12 @@ def test_eigh_damped_forward_routes_through_safe_eigh(monkeypatch) -> None:
     monkeypatch.setattr(retraction, "safe_eigh", spy)
     A = torch.randn(3, 4, 4, dtype=torch.float64)
     A = A @ A.transpose(-1, -2) + torch.eye(4, dtype=torch.float64)
-    w, V = retraction._eigh_damped(A, 1e-12)
+    A = 0.5 * (A + A.transpose(-1, -2))
+    projected = retraction._symmetric_spectral_map(A, "project", lower=1e-6)
     reference = torch.linalg.eigh(A)
     assert calls == [A.shape]
-    assert torch.equal(w, reference.eigenvalues) and torch.equal(V, reference.eigenvectors)
+    V = reference.eigenvectors
+    assert torch.equal(projected, V * reference.eigenvalues.unsqueeze(-2) @ V.transpose(-1, -2))
 
 
 # -- Low: relational scorer recovery counter, per-pair routing, exact certificate ----------------

@@ -1,4 +1,4 @@
-from tests.profiles import config_values, test_config, tiny_config
+from tests.profiles import config_values, launcher_values, live_config, test_config, tiny_config
 from types import SimpleNamespace
 
 import pytest
@@ -194,13 +194,14 @@ def test_block_uses_moment_api_and_forwards_canonical_frame():
     assert torch.equal(out.sigma, capture["converged"].sigma + 5.0)
 
 
-def test_launcher_accepts_mode_and_covariance_controls(monkeypatch):
+def test_launcher_accepts_mode_and_covariance_controls() -> None:
+    r"""The launcher dictionary names the block-MLP selectors, and its route accepts the coordinate MLP with the
+    passthrough covariance. Both read the real ``train_vfe3.config`` (audit 2026-10-16 F112: the test used to
+    replace that dictionary with the test baseline and assert the values it had just set)."""
     selectors = {"block_mlp_mode", "block_mlp_covariance", "block_mlp_covariance_floor"}
-    local = config_values(block_mlp_mode="coordinate", block_mlp_covariance="passthrough",
-                          block_mlp_covariance_floor=1e-4)
-    monkeypatch.setattr(train_vfe3, "config", local)
-    assert selectors <= set(train_vfe3.config)
-    cfg = test_config(**train_vfe3.config)
+    assert selectors <= set(launcher_values())
+    cfg = live_config(block_mlp_mode="coordinate", block_mlp_covariance="passthrough",
+                      block_mlp_covariance_floor=1e-4)
     assert cfg.block_mlp_mode == "coordinate"
     assert cfg.block_mlp_covariance == "passthrough"
     assert cfg.block_mlp_covariance_floor == 1e-4
