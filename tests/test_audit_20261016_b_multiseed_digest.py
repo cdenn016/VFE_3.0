@@ -83,3 +83,35 @@ def test_per_seed_orders_are_distinct_in_the_digest(tmp_path: Path, monkeypatch:
     assert summary["design"]["data_order"]["status"] == "distinct"
     report = (tmp_path / "MULTISEED_ANALYSIS.md").read_text(encoding="utf-8")
     assert "`distinct`" in report and "includes data-order variance" in report
+
+
+# =============================================================================
+# F119: realized-update counts and the final validation PPL enter the digest
+# =============================================================================
+
+def test_realized_update_counts_enter_the_scalars_and_the_digest(tmp_path: Path,
+                                                                 monkeypatch: pytest.MonkeyPatch):
+    _group(tmp_path, {6: 3, 54: 3, 271: 3}, summaries={
+        6: {"skipped_steps": 0, "accepted_update_frac": 1.0, "final_val_ppl": 10.5},
+        54: {"skipped_steps": 4, "accepted_update_frac": 0.96, "final_val_ppl": 30.0},
+        271: {"skipped_steps": 0, "accepted_update_frac": 1.0, "final_val_ppl": 12.5}})
+    summary = _main(tmp_path, monkeypatch)                      # the shipped SCALAR_KEYS
+    scalars = summary["scalars"]
+    assert scalars["skipped_steps"]["values"] == [0.0, 4.0, 0.0]
+    assert scalars["accepted_update_frac"]["values"] == [1.0, 0.96, 1.0]
+    assert scalars["final_val_ppl"]["mean"] == pytest.approx(53.0 / 3.0)
+    assert scalars["skipped_steps"]["cv"] is None                # a count, not a ratio-scale metric
+    assert scalars["final_val_ppl"]["cv"] is not None
+    report = (tmp_path / "MULTISEED_ANALYSIS.md").read_text(encoding="utf-8")
+    assert "## Divergence indicators" in report
+    assert "seed 54: 4 skipped optimizer update(s)" in report
+    assert "seed 6:" not in report.split("## Divergence indicators")[1].split("##")[0]
+
+
+def test_no_divergence_section_when_every_update_was_accepted(tmp_path: Path,
+                                                              monkeypatch: pytest.MonkeyPatch):
+    _group(tmp_path, {6: 3, 54: 3}, summaries={
+        6: {"skipped_steps": 0, "accepted_update_frac": 1.0},
+        54: {"skipped_steps": 0, "accepted_update_frac": 1.0}})
+    _main(tmp_path, monkeypatch)
+    assert "Divergence indicators" not in (tmp_path / "MULTISEED_ANALYSIS.md").read_text(encoding="utf-8")

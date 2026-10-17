@@ -936,11 +936,14 @@ CURVE_X_OPTIONS: Dict[str, str] = {"step": "training step", "tokens_seen": "trai
 # Headline scalars to aggregate (searched in summary.json -> test_results.json -> research.json).
 # Dotted keys dig into nested research blocks. ``test_best_*`` are the test split at the
 # best-validation weights and ``train_sample_ce_{final,best}`` the fixed training sample under the
-# evaluation protocol (summary.json of runs trained on or after 2026-09-28).
+# evaluation protocol (summary.json of runs trained on or after 2026-09-28). ``final_val_ppl`` beside
+# ``best_val_ppl``, and the realized-update counts ``skipped_steps`` / ``accepted_update_frac``, show a
+# seed that diverged after its best step, which the best-validation headline alone hides.
 SCALAR_KEYS: List[str] = [
-    "test_ppl", "best_val_ppl", "test_ce", "test_bits_per_token", "test_bpc",
+    "test_ppl", "best_val_ppl", "final_val_ppl", "test_ce", "test_bits_per_token", "test_bpc",
     "test_best_ce", "test_best_ppl", "test_best_step",
     "train_sample_ce_final", "train_sample_ce_best",
+    "skipped_steps", "accepted_update_frac",
     "wall_time_s", "ece", "overall_ce", "sigma_trace_cv", "sigma_ce_spearman",
     "fd_gradient_worst_rel_error",
     "corpus_freq_strata_ce.rare", "corpus_freq_strata_ce.mid", "corpus_freq_strata_ce.frequent",
@@ -973,7 +976,7 @@ CURVE_SPECS: List[tuple] = [
 # (a correlation, a gradient-check error, a step index, ECE) keep their SD on their own
 # scale but get no CV and are left out of the seed-stability ranking.
 CV_RATIO_SCALE_KEYS = frozenset({
-    "test_ppl", "best_val_ppl", "test_ce", "test_bits_per_token", "test_bpc",
+    "test_ppl", "best_val_ppl", "final_val_ppl", "test_ce", "test_bits_per_token", "test_bpc",
     "test_best_ce", "test_best_ppl", "train_sample_ce_final", "train_sample_ce_best",
     "wall_time_s", "overall_ce",
     "corpus_freq_strata_ce.rare", "corpus_freq_strata_ce.mid", "corpus_freq_strata_ce.frequent",
@@ -1099,6 +1102,24 @@ def _final_finite(d: Dict[str, np.ndarray]) -> Dict[str, Any]:
             "sd": (sd if math.isfinite(sd) else None), "n": int(d["n"][i])}
 
 
+def _divergence_lines(scalars: Mapping[str, Any]) -> List[str]:
+    r"""One line per seed whose run rejected an optimizer update (``skipped_steps > 0``), with its accepted
+    fraction when recorded; empty when every seed accepted every update or the counts are withheld."""
+    skipped = scalars.get("skipped_steps")
+    if not isinstance(skipped, Mapping):
+        return []
+    fractions = scalars.get("accepted_update_frac")
+    accepted = (dict(zip(fractions.get("seeds", []), fractions.get("values", [])))
+                if isinstance(fractions, Mapping) else {})
+    lines = []
+    for seed, value in zip(skipped.get("seeds", []), skipped.get("values", [])):
+        if value > 0:
+            fraction = accepted.get(seed)
+            lines.append(f"- seed {seed}: {int(value)} skipped optimizer update(s)"
+                         + (f" (accepted fraction {fraction:.4f})" if fraction is not None else ""))
+    return lines
+
+
 def _write_csv(path: Path, scalars: Dict[str, Any]) -> None:
     with open(path, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
@@ -1149,6 +1170,11 @@ def _write_md(path: Path, root: Path, seeds, scalars, per_layer, *,
         L.append(f"- Least seed-stable ratio-scale metric: `{least[0]}` "
                  f"(CV {100 * least[1]['cv']:.3f}%). Signed or near-zero metrics carry no CV; "
                  "read their SD on their own scale.")
+    divergence = _divergence_lines(scalars)
+    if divergence:
+        L += ["", "## Divergence indicators", "", *divergence, "",
+              "A best-validation value of such a seed can predate the divergence; compare `final_val_ppl` "
+              "with `best_val_ppl` and `test_ce` with `test_best_ce`."]
     if per_layer:
         L += ["", f"## Per-layer ({len(per_layer)} layer(s))", "",
               "See `figures/per_layer__*.png` for across-seed per-layer bars."]
@@ -1296,6 +1322,8 @@ def main() -> int:
             print("optional per-layer diagnostics are incomplete; that channel is withheld")
         if partial_scalars:
             print(f"withheld scalars (not complete across the accepted seeds): {partial_scalars}")
+        for line in _divergence_lines(scalars):
+            print(f"divergence indicator: {line[2:]}")
         if withheld_curves:
             print(f"withheld {len(withheld_curves)} curve column(s); reasons in "
                   "multiseed_summary.json diagnostics.withheld_curves")
