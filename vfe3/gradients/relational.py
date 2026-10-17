@@ -20,9 +20,17 @@ def _diagonal_comparison_route(operators: RelationalOperators, r: int, n_pairs: 
     :math:`P(G)` is structurally diagonal when at most one coordinate of the block stays unrotated
     (:func:`vfe3.geometry.rope.rope_commutant_is_diagonal`). The diagonal route
     (``diagonal_covariance`` of :func:`vfe3.relational_scoring.projected_gaussian_kl`) also requires the Gaussian-KL
-    cost, no GEMM error fallback (``pair_kl_gemm_tol`` None) and conditioning-triggered recovery off, whose
-    float64 rescoring it would bypass; every other case keeps the dense route with its certificate, recovery and
-    fallback (audit 2026-10-10 round 2, item 30).
+    cost, no GEMM error fallback (``pair_kl_gemm_tol`` None, since the diagonal route has none) and
+    conditioning-triggered recovery off (``projected_factorization='gram'``); every other case keeps the dense route
+    with its certificate, recovery and fallback (audit 2026-10-10 round 2, item 30).
+
+    The recovery clause keeps what the certified toggles add on the dense route, not a float64 rescoring: a commutant
+    projection has no source-root factor route, so ``cholesky_qr2_certified`` runs here as ``gram_certified``. An
+    entry failing :math:`\varepsilon_{32}\lVert G\rVert_F\lVert G^{-1}\rVert_F \le 10^{-4}` has :math:`P(XX^\top)`
+    rebuilt in the working dtype from its source root (:func:`vfe3.relational_scoring._commutant_root_factor`; float64 QR
+    only if that rebuild fails), its pairs leave the GEMM for working-dtype triangular-solve tiles, and it is counted in
+    :func:`vfe3.relational_scoring.source_recovery_elements`. On a diagonal :math:`P(G)` this moved a flagged pair by
+    at most about 2e-5 nats against the diagonal route on the audit probe (audit 2026-10-16 F9).
     """
     return (rope_commutant_is_diagonal(r, n_pairs) and operators.routing == "gaussian_kl"
             and operators.pair_kl_gemm_tol is None and not projected_condition_recovery())
@@ -65,7 +73,8 @@ def relational_score(
     :math:`P(G)`, the covariance the router scores. The scorer takes its Gram route; the source tuples carry the
     rotated maps :math:`R_iS` with ``commutant_pairs``, so a failed (or, under condition recovery, flagged)
     factorization is rebuilt as :math:`P(XX^\top)` from the source (audit 2026-10-10 round 2, item 12). When
-    :math:`P(G)` is structurally diagonal (:func:`_diagonal_comparison_route`) only diag(G) is formed and the
+    :math:`P(G)` is structurally diagonal and :func:`_diagonal_comparison_route` admits it (Gaussian-KL routing,
+    ``projected_factorization='gram'``, ``pair_kl_gemm_tol`` None) only diag(G) is formed and the
     Gaussian KL takes its diagonal route, with no Gram, factorization or source tuple.
     Under ``tie_comparison_maps`` a belief scored against itself is projected once and both roles share it.
     """

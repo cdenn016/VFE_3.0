@@ -260,7 +260,10 @@ class VFEModel(nn.Module):
         # caller-set RNG state (e.g. a test that seeds then constructs several models).
         self.cfg = cfg
         # projected_factorization: the certificate and factor route; tolerances and the recovery precision
-        # (fp32 with a float64 fallback on the Gram routes, float64 on cholesky_qr2_certified) are fixed.
+        # (fp32 with a float64 fallback on the Gram routes, float64 on cholesky_qr2_certified's factor route) are
+        # fixed. A scorer without a source-root factor route (comparison_invariant, noisy_query, minimal_agent) runs
+        # cholesky_qr2_certified as gram_certified, and either certified value keeps a diagonal P(G) on the dense
+        # route (vfe3.gradients.relational._diagonal_comparison_route; audit 2026-10-16 F9).
         set_projected_condition_recovery(cfg.projected_factorization != "gram")
         set_projected_factor_route(
             "cholesky_qr2" if cfg.projected_factorization == "cholesky_qr2_certified" else "gram")
