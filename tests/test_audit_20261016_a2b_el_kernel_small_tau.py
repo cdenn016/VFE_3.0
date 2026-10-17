@@ -93,7 +93,8 @@ print(json.dumps([case(8, 0.1), case(8, 0.01), case(20, 0.1), case(20, 0.01)]))
 def test_float32_kernel_gradients_match_the_torch_route_accuracy_at_small_tau(record_property: Any) -> None:
     results = _run_script(_SCRIPT)
     for r in results:
-        record_property(f"el_small_tau_K{r['K']}_tau{r['tau']}", json.dumps({"torch": r["torch"], "kernel": r["kernel"]}))
+        record_property(f"el_small_tau_K{r['K']}_tau{r['tau']}",
+                        json.dumps({"torch": r["torch"], "kernel": r["kernel"]}))
         assert set(r["kernel"]) == set(r["torch"]) >= {"mu_q", "sigma_q", "mu_embed", "sigma_log_embed"}
         torch_err = max(r["torch"].values())
         kernel_err = max(r["kernel"].values())
