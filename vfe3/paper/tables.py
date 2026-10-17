@@ -918,16 +918,46 @@ def _group_name(group: Mapping[str, Any]) -> str:
     return f"{role} ({len(names)} tensors)" if names else str(role)
 
 
+def _table_fisher_step_text(run: RunRecord) -> str:
+    r"""The natural-gradient table step of :mod:`vfe3.table_optim`: step size and Fisher-norm trust radius."""
+    def raw(key: str) -> str:
+        return _fmt_value(run.raw(key)) if key in run.config_raw else NOT_RECORDED
+    return (f"Fisher natural-gradient step (eta={raw('m_table_fisher_lr')}, "
+            f"trust radius r={raw('m_table_fisher_trust_radius')})")
+
+
 def _optimization_items(run: RunRecord) -> List[Item]:
+    r"""The Optimization field: optimizer groups as executed, schedule, table step and gradient clipping.
+
+    Under ``m_table_update_mode='fisher'`` the groups the checkpoint marks ``table_fisher`` (the type-prior
+    tables) take the natural-gradient step :math:`-\eta (N/n_v)(s_v \partial_\mu, 2 \partial_l)` of
+    :mod:`vfe3.table_optim` in place of AdamW's adaptive step; their AdamW rate :math:`\mathrm{lr}_t` enters only
+    through the schedule factor :math:`\mathrm{lr}_t/\mathrm{lr}_0` and the decoupled decay
+    :math:`1 - \mathrm{lr}_t\lambda`, and :func:`vfe3.train.train_step` never clips them. The clip sets follow
+    ``grad_clip_scope`` (``"role"`` for configs that predate the key). ``m_table_fisher_lr`` and
+    ``m_table_fisher_trust_radius`` are printed only under the Fisher mode, where they are live
+    (audit 2026-10-16 F22).
+    """
     items: List[Item] = []
     groups = optimizer_groups(run)
-    if groups is not None and groups["groups"]:
-        decoupled = {g.get("decoupled_weight_decay") for g in groups["groups"]}
-        items.append(("optimizer", "AdamW, decoupled weight decay" if decoupled == {True}
-                      else f"AdamW (decoupled_weight_decay={sorted(map(str, decoupled))})"))
-        for g in groups["groups"]:
-            items.append(("", Code(f"{_group_name(g)}: lr={_fmt_value(g['initial_lr'])}, "
-                                   f"wd={_fmt_value(g['weight_decay'])}")))
+    rows = (groups or {}).get("groups") or []
+    fisher_mode = run.raw("m_table_update_mode") == "fisher"
+    exempt = [g for g in rows if g.get("table_fisher")]           # executed table_fisher groups
+    if groups is not None and rows:
+        decoupled = {g.get("decoupled_weight_decay") for g in rows}
+        optimizer = ("AdamW, decoupled weight decay" if decoupled == {True}
+                     else f"AdamW (decoupled_weight_decay={sorted(map(str, decoupled))})")
+        if exempt:
+            optimizer += ", the groups marked table_fisher taking the natural-gradient table step instead"
+        items.append(("optimizer", optimizer))
+        for g in rows:
+            if g.get("table_fisher"):
+                items.append(("", Code(f"{_group_name(g)}: {_table_fisher_step_text(run)} scheduled by "
+                                       f"lr_t/lr_0, lr={_fmt_value(g['initial_lr'])} (schedule and decoupled "
+                                       f"decay lr_t*wd only), wd={_fmt_value(g['weight_decay'])}")))
+            else:
+                items.append(("", Code(f"{_group_name(g)}: lr={_fmt_value(g['initial_lr'])}, "
+                                       f"wd={_fmt_value(g['weight_decay'])}")))
         items.append(("groups read from", Code(Path(groups["checkpoint"]).name)))
     else:
         sched = (run.summary.get("scheduler") or {}).get("groups") or []
@@ -937,18 +967,37 @@ def _optimization_items(run: RunRecord) -> List[Item]:
             items.append(("per-table weight decay", NOT_RECORDED + " (no training checkpoint)"))
         else:
             items.append(("per-table learning rates", NOT_RECORDED))
+        if fisher_mode:
+            items.append(("type-prior tables", f"{_table_fisher_step_text(run)}, their AdamW rates setting only "
+                                               "the schedule lr_t/lr_0 and the decoupled decay"))
     kind = (run.summary.get("scheduler") or {}).get("kind")
     items.append(("schedule", Code(kind) if kind else NOT_RECORDED))
     items += _raw_items(run, ("warmup_steps", "max_steps", "min_lr_frac", "grad_clip",
-                              "m_phi_update_mode", "phi_mstep_max_matrix_norm",
-                              "phi_frame_condition_max"))
-    # vfe3.train.train_step bounds each optimizer role's gradient L2 norm by grad_clip separately (the
-    # global clip was retired with grad_clip_per_role).
+                              "m_table_update_mode")
+                        + (("m_table_fisher_lr", "m_table_fisher_trust_radius") if fisher_mode else ())
+                        + ("m_phi_update_mode", "phi_mstep_max_matrix_norm", "phi_frame_condition_max"))
+    # vfe3.train.train_step bounds each grad_clip_scope set's gradient L2 norm by grad_clip separately (the
+    # global clip was retired with grad_clip_per_role; grad_clip_scope, audit 2026-10-10 round 2, items 8
+    # and 9) and never clips the groups marked table_fisher.
     clip = finite_float(run.raw("grad_clip"))
     if clip is not None and clip > 0:
-        roles = sorted({str(g.get("role") or "other") for g in (groups or {}).get("groups") or []})
-        items.append(("gradient clipping", "per optimizer role, each role's L2 norm bounded by grad_clip"
-                      + (f" (roles: {', '.join(roles)})" if roles else "")))
+        scope = run.raw("grad_clip_scope", "role")
+        clipped = [g for g in rows if not g.get("table_fisher")]
+        if scope == "group":
+            text = ("per optimizer group, each group's L2 norm bounded by grad_clip"
+                    + (f" ({len(clipped)} groups)" if clipped else ""))
+        elif scope == "role":
+            roles = sorted({str(g.get("role") or "other") for g in clipped})
+            text = ("per optimizer role, each role's L2 norm bounded by grad_clip"
+                    + (f" (roles: {', '.join(roles)})" if roles else ""))
+        else:
+            text = f"grad_clip_scope={_fmt_value(scope)}"
+        items.append(("gradient clipping", text))
+        if exempt:
+            items.append(("not clipped (table_fisher, step bounded by the trust radius)",
+                          ", ".join(_group_name(g) for g in exempt)))
+        elif fisher_mode:
+            items.append(("not clipped (table_fisher, step bounded by the trust radius)", "the type-prior tables"))
     ops = run.config_record.get("relational_operators")
     if isinstance(ops, Mapping) and ops.get("gradient_clipping"):
         items.append(("relational clipping", Code(str(ops["gradient_clipping"]))))
