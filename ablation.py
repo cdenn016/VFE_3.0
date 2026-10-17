@@ -78,7 +78,7 @@ import sys
 import time
 import warnings
 from collections.abc import Mapping
-from dataclasses import asdict, fields as dataclass_fields
+from dataclasses import MISSING, asdict, fields as dataclass_fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -4431,6 +4431,97 @@ def _seed_aggregate(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(agg, key=lambda d: d["mean"])
 
 
+_NO_SETTING = object()                    # a field neither the baseline nor VFE3Config sets
+
+
+def _same_setting(a: Any, b: Any) -> bool:
+    r"""Whether two config values are the same setting: numbers by value (``1 == 1.0``), never a bool for a
+    number, and lists and tuples element by element."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return type(a) is type(b) and a == b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return float(a) == float(b)
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        return len(a) == len(b) and all(_same_setting(x, y) for x, y in zip(a, b))
+    return a == b
+
+
+def _paired_reference_label(sweep_name: Optional[str]) -> Optional[str]:
+    r"""The arm a seeded sweep's paired differences are taken against.
+
+    The sweep's ``forest_baseline_label`` when it declares one; otherwise the one arm whose overrides leave the
+    baseline (``BASELINE_CONFIG`` with the sweep's ``requires``, over the VFE3Config defaults) unchanged. None for
+    an unknown or ``parameter_grid`` sweep, and when no arm, or more than one, is the baseline."""
+    sweep = SWEEPS.get(str(sweep_name)) if sweep_name is not None else None
+    if not isinstance(sweep, Mapping):
+        return None
+    if sweep.get("forest_baseline_label"):
+        return str(sweep["forest_baseline_label"])
+    if "parameter_grid" in sweep:
+        return None
+    defaults: Dict[str, Any] = {}
+    for f in dataclass_fields(VFE3Config):
+        if f.default is not MISSING:
+            defaults[f.name] = f.default
+        elif f.default_factory is not MISSING:
+            defaults[f.name] = f.default_factory()
+    baseline = {**defaults, **BASELINE_CONFIG, **sweep.get("requires", {})}
+    try:
+        runs = make_run_overrides(str(sweep_name))
+    except (KeyError, ValueError, TypeError):
+        return None
+    matches = [label for label, overrides in runs
+               if all(_same_setting(baseline.get(field, _NO_SETTING), value) for field, value in overrides.items())]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _paired_seed_differences(
+    rows:      Sequence[Mapping[str, Any]],   # sweep_results.csv rows
+    reference: str,                           # base label of the reference arm
+) -> List[Dict[str, Any]]:
+    r"""Seed-paired primary validation PPL differences of every arm against ``reference``.
+
+    Cells of one seed share the model-init seed and the data order (``_effective_data_seed``), so the arms pair on
+    the seed: :math:`d_s = \mathrm{PPL}^{\rm arm}_s - \mathrm{PPL}^{\rm ref}_s` over the :math:`n` seeds both arms
+    finished. With :math:`\bar d` their mean and :math:`s_d` their SD (ddof = 1),
+
+    .. math::
+        \mathrm{SE} = s_d / \sqrt{n}, \qquad \bar d \pm t_{0.975,\, n-1}\, \mathrm{SE},
+
+    the 95% Student-t interval; SE and the interval are None for :math:`n < 2`. A row without a finite PPL or an
+    integer seed is not paired. Sorted by :math:`\bar d`; empty when the reference arm has no row."""
+    by_arm: Dict[str, Dict[int, float]] = {}
+    for row in rows:
+        ppl = _as_float(row.get("primary_val_ppl"))
+        try:
+            seed = int(str(row.get("seed", "")).strip())
+        except ValueError:
+            continue
+        if math.isfinite(ppl):
+            by_arm.setdefault(_base_label(str(row.get("label", ""))), {})[seed] = ppl
+    ref = by_arm.get(reference)
+    if not ref:
+        return []
+    out: List[Dict[str, Any]] = []
+    for label, by_seed in by_arm.items():
+        seeds = sorted(set(by_seed) & set(ref))
+        if label == reference or not seeds:
+            continue
+        diffs = [by_seed[s] - ref[s] for s in seeds]
+        n = len(diffs)
+        mean = sum(diffs) / n
+        sd = math.sqrt(sum((d - mean) ** 2 for d in diffs) / (n - 1)) if n > 1 else None
+        se = sd / math.sqrt(n) if sd is not None else None
+        ci95 = None
+        if se is not None:
+            from scipy.stats import t as student_t
+
+            half = float(student_t.ppf(0.975, n - 1)) * se
+            ci95 = [mean - half, mean + half]
+        out.append({"label": label, "n": n, "seeds": seeds, "mean": mean, "sd": sd, "se": se, "ci95": ci95})
+    return sorted(out, key=lambda d: d["mean"])
+
+
 def _aggregate_cells(
     cells:      List[Dict[str, Any]],
     key_fields: 'tuple | list',
@@ -4579,6 +4670,23 @@ def analyze_sweep(sweep_dir: Path) -> None:
         print("-" * 68)
         for a in agg:
             print(f"{a['label']:<34}{a['n']:>4}{a['mean']:>12.3f}{a['sd']:>10.3f}{a['cv'] * 100:>8.1f}")
+
+    # Seed-paired differences against the reference arm: every arm of a seed shares its init seed and data
+    # order, so the paired SE is the honest error bar on an arm-vs-reference difference.
+    try:
+        sweep_name = json.loads((sweep_dir / "sweep_meta.json").read_text(encoding="utf-8")).get("sweep_name")
+    except (OSError, ValueError, AttributeError):
+        sweep_name = None
+    reference = _paired_reference_label(sweep_name)
+    paired = _paired_seed_differences(rows, reference) if reference else []
+    if any(p["n"] > 1 for p in paired):
+        print(f"\npaired across-seed differences vs {reference} (PPL arm - PPL reference on shared seeds):")
+        print(f"{'label':<34}{'n':>4}{'mean diff':>12}{'SE':>10}{'95% t-interval':>24}")
+        print("-" * 84)
+        for p in paired:
+            se = "-" if p["se"] is None else f"{p['se']:.3f}"
+            ci = "-" if p["ci95"] is None else f"[{p['ci95'][0]:+.3f}, {p['ci95'][1]:+.3f}]"
+            print(f"{p['label']:<34}{p['n']:>4}{p['mean']:>+12.3f}{se:>10}{ci:>24}")
 
 
 def _cross_sweep_cohort_identity(
