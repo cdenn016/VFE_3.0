@@ -806,7 +806,10 @@ def train_step(
     the clip sets of a role combined in quadrature; empty when no norm was transferred) and
     ``"clip_coefs"`` (per role, the smallest realized clip coefficient of its clipped sets; empty
     when no clip was applied). Asking for ``status_out`` also computes the set norms when clipping
-    is off, so they join the same transfer (audit 2026-10-10 round 2, item 1). On a step that reaches
+    is off, so they join the same transfer (audit 2026-10-10 round 2, item 1). Under an enabled GradScaler,
+    asking for ``status_out`` unscales the gradients once before the norms (``GradScaler.step`` does not
+    repeat it), and with clipping off the set norms take their own transfer, as on the clipped scaler
+    route (audit 2026-10-16, F51). On a step that reaches
     ``optimizer.step``, ``status_out["grads"]`` holds references, keyed by ``id``, to the gradients the
     step consumed (after unscale and clip; no copy and no synchronization), because the table Fisher step
     and the manifold phi step clear ``.grad`` inside ``step()`` (audit 2026-10-16, F4).
@@ -945,14 +948,17 @@ def train_step(
         loss_finite = math.isfinite(step_loss)
     else:
         loss_finite = True                                  # resolved with the fused default-path scan below
-    # Unscale once when clipping/metrics needs true-unit gradients or the enabled scaler must classify
+    # Unscale once when clipping/metrics/status needs true-unit gradients or the enabled scaler must classify
     # a nonfinite scalar loss. GradScaler remembers that unscale_ ran; its later step does not repeat it.
+    # status_out joins the list so its role norms and the spike attribution read true units with clipping
+    # off (audit 2026-10-16, F51); without a scaler unscale_ is a no-op.
     need_unscale = (
         grad_accum_steps > 1
         or
         (grad_clip is not None and grad_clip > 0)
         or (metrics_out is not None)
         or (_scaler_enabled and not loss_finite)
+        or (_scaler_enabled and status_out is not None)
     )
     if need_unscale:
         _scaler.unscale_(optimizer)
@@ -1137,6 +1143,12 @@ def train_step(
     if metrics_out is not None:
         metrics_out["grad_finite"] = float(grad_finite)
     clip_applied = False
+    if (status_out is not None and _scaler_enabled and not clip_on and not skip_step
+            and set_norm_values is None and norm_sets):
+        # Enabled scaler with clipping off: no transfer above carried the set norms, so they take their own,
+        # as on the clipped scaler route below; the gradients were unscaled above (audit 2026-10-16, F51).
+        set_norm_values = torch.stack([norm.to(device=tokens.device, dtype=torch.float64)
+                                       for norm in _set_norms()]).tolist()
     if grad_clip is not None and grad_clip > 0 and not skip_step:
         if clip_norms is None:                                  # scaler / fallback routes: own transfer
             set_norms = _set_norms()

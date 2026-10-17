@@ -166,3 +166,41 @@ def test_fisher_table_step_columns_divide_by_the_realized_step_size() -> None:
         assert low[column] == pytest.approx(high[column], rel=1e-9), column
         n = dict(_model(_route_cfg("fisher", "adamw")).named_parameters())[name].numel()
         assert low[column] == pytest.approx(deltas[name] / (0.5 * eta * math.sqrt(n)), rel=1e-9), column
+
+
+# ------------------------------------------------------------------------------------------------ F51
+
+def _scaled_step(grad_clip: Any, *, scaler_on: bool, with_status: bool = True) -> Tuple[Any, Any, Dict[str, Any],
+                                                                                         torch.Tensor]:
+    cfg = _cfg()
+    model = _model(cfg)
+    optimizer = T.build_optimizer(model, cfg)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
+    scaler = torch.amp.GradScaler(device="cpu", init_scale=1024.0, enabled=scaler_on)
+    status: Dict[str, Any] = {}
+    tokens, targets = _batch(cfg)
+    T.train_step(model, optimizer, scheduler, tokens, targets, grad_clip=grad_clip, scaler=scaler,
+                 status_out=status if with_status else None)
+    return model, optimizer, status, tokens
+
+
+@pytest.mark.parametrize("grad_clip", [None, 1.0])
+def test_enabled_scaler_publishes_true_unit_role_norms(grad_clip: Any) -> None:
+    _, _, reference, _ = _scaled_step(grad_clip, scaler_on=False)
+    model, optimizer, status, tokens = _scaled_step(grad_clip, scaler_on=True)
+    assert status["did_step"] and reference["role_grad_norms"]
+    assert status["role_grad_norms"].keys() == reference["role_grad_norms"].keys()
+    for role, norm in reference["role_grad_norms"].items():
+        assert status["role_grad_norms"][role] == pytest.approx(norm, rel=1e-5), role
+    report = T._spike_attribution(model, optimizer, status, tokens, roles=("mu", "sigma", "phi"),
+                                  loss_spiked=False, replayed=False, last_group_norms={})
+    for role, norm in reference["role_grad_norms"].items():
+        if norm > 0.0:
+            assert report["roles"][role]["pre_clip_norm"] == pytest.approx(norm, rel=1e-5), role
+
+
+def test_enabled_scaler_status_request_leaves_the_update_unchanged() -> None:
+    with_status, _, _, _ = _scaled_step(None, scaler_on=True)
+    silent, _, _, _ = _scaled_step(None, scaler_on=True, with_status=False)
+    for (name, p), (_, q) in zip(with_status.named_parameters(), silent.named_parameters()):
+        assert torch.equal(p, q), name
