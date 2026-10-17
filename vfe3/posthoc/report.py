@@ -47,7 +47,8 @@ from vfe3.posthoc import evaluate as ev
 from vfe3.posthoc import streams as st
 
 # |CE(replay) - CE(recorded)| tolerance (nats) of the reproduction check: the arithmetic of the run's
-# own evaluation (its amp dtype on CUDA), and a float32 replay of a mixed-precision evaluation.
+# own evaluation (its amp dtype on CUDA and its fp32 matmul policy), and a float32 replay of a
+# mixed-precision evaluation or of a reduced matmul policy (TF32 under 'high', bf16 under 'medium').
 REPRODUCTION_TOL_MATCHED: float = 1e-3
 REPRODUCTION_TOL_FP32_REPLAY: float = 5e-3
 # Windows re-run after the intervention arms to confirm every patch was undone.
@@ -200,6 +201,21 @@ def _recorded_reference(info: st.RunInfo, checkpoint: str, split: str) -> Option
             return {"source": f"summary.json {key}", "ce": float(s[key]), "scored_targets": None,
                     "kind": "in-training evaluation"}
     return None
+
+
+def _replay_matches_run(loaded: Any, cfg: Any, device: torch.device) -> bool:
+    r"""Whether the replay ran the arithmetic of the run's own evaluation (the tight reproduction tolerance).
+
+    Both the autocast dtype and the fp32 matmul policy must be the run's: ``precision='fp32'`` replaces
+    a reduced policy (``'high'``, TF32) by ``'highest'`` (:func:`vfe3.posthoc.evaluate.load_model`), and an
+    IEEE fp32 replay of a TF32 evaluation is an fp32 replay, not matched arithmetic (audit 2026-10-16
+    F68). A run that left the policy unset (``None``, the card's policy as found) matches only a replay
+    that also leaves it unset. A mixed-precision run matches only a replay on CUDA in its amp dtype.
+    """
+    same_amp = loaded.amp_dtype == cfg.amp_dtype and (cfg.amp_dtype is None or device.type == "cuda")
+    same_matmul = (getattr(loaded.cfg, "fp32_matmul_precision", None)
+                   == getattr(cfg, "fp32_matmul_precision", None))
+    return bool(same_amp and same_matmul)
 
 
 def _reproduction(
@@ -718,7 +734,7 @@ def run_posthoc(
         loaded = ev.load_model(run_dir, checkpoint, device=device, precision=options.precision,
                                drop_unknown_config_fields=options.drop_unknown_config_fields)
         model = loaded.model
-        matched = loaded.amp_dtype == cfg.amp_dtype and (cfg.amp_dtype is None or device.type == "cuda")
+        matched = _replay_matches_run(loaded, cfg, device)
         report["notes"].extend(f"{checkpoint}: {n}" for n in loaded.notes)
         step = _checkpoint_step(info, checkpoint)
         is_final = checkpoint == final_ckpt

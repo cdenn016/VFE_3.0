@@ -6,11 +6,14 @@ Synthetic strings and tiny models only (single-digit dimensions, CPU, one thread
   segment matched in its wildcard window and every ``<unk>`` wildcard matched characters.
 * F66: M5 row 5 sets every stored covariance table to the identity, the untied decode bank's
   ``decode_sigma_log_embed`` included; ``decode=False`` keeps the earlier encode-side-only arm.
+* F68: the reproduction check calls a replay matched arithmetic only when its amp dtype and its fp32
+  matmul policy are the run's; an IEEE fp32 replay of a TF32 run gets the fp32-replay tolerance.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, Optional
 
 import numpy as np
 import pytest
@@ -20,6 +23,7 @@ from tests.test_posthoc_20260928 import DEVICE, _cfg, _model, _stream
 from vfe3.posthoc import calibration as cal
 from vfe3.posthoc import evaluate as ev
 from vfe3.posthoc import interventions as iv
+from vfe3.posthoc import report as rp
 from vfe3.posthoc import streams as st
 
 
@@ -122,3 +126,32 @@ def test_stored_covariances_identity_covers_the_block_cholesky_table() -> None:
         torch.testing.assert_close(blocks, (1.0 + pb.eps) * eye.expand_as(blocks), rtol=0, atol=1e-7)
     assert record["tables"] == ["prior_bank.sigma_chol_embed", "prior_bank.decode_sigma_log_embed"]
     assert torch.count_nonzero(pb.sigma_chol_embed) > 0
+
+
+# ----------------------------------------------------------------------------------------------
+# F68: matched arithmetic includes the fp32 matmul policy
+# ----------------------------------------------------------------------------------------------
+
+def _replay(amp: Optional[str], matmul: Optional[str]) -> Any:
+    return SimpleNamespace(amp_dtype=amp, cfg=SimpleNamespace(amp_dtype=amp, fp32_matmul_precision=matmul))
+
+
+def test_an_ieee_fp32_replay_of_a_tf32_run_is_not_matched_arithmetic() -> None:
+    run = SimpleNamespace(amp_dtype=None, fp32_matmul_precision="high")
+    cuda = torch.device("cuda")
+    assert not rp._replay_matches_run(_replay(None, "highest"), run, cuda)          # precision='fp32'
+    assert rp._replay_matches_run(_replay(None, "high"), run, cuda)                 # precision='run'
+    same = SimpleNamespace(amp_dtype=None, fp32_matmul_precision="highest")
+    assert rp._replay_matches_run(_replay(None, "highest"), same, cuda)
+    mixed = SimpleNamespace(amp_dtype="bf16", fp32_matmul_precision="highest")
+    assert not rp._replay_matches_run(_replay(None, "highest"), mixed, cuda)
+    assert rp._replay_matches_run(_replay("bf16", "highest"), mixed, cuda)
+    assert not rp._replay_matches_run(_replay("bf16", "highest"), mixed, torch.device("cpu"))
+
+
+def test_reproduction_check_uses_the_replay_tolerance_and_label_when_not_matched() -> None:
+    reference = {"ce": 1.0, "scored_targets": None}
+    result = {"ce": 1.002, "n_scored": 10}
+    loose = rp._reproduction(result, reference, full=True, matched=False)
+    assert loose["arithmetic"] == "fp32 replay" and loose["tolerance"] == rp.REPRODUCTION_TOL_FP32_REPLAY
+    assert loose["status"] == "ok"
