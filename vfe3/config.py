@@ -2284,6 +2284,11 @@ class VFE3Config:
             mark(("decode_ce_checkpoint",), "the selected decoder has no checkpointed chunked CE kernel")
         if self.decode_mode not in ("diagonal_chunked", "full_chunked"):
             mark(("decode_ce_triton",), "read only by the diagonal_chunked and full_chunked KL decode CE")
+            # The linear and expected-likelihood decodes form no a_v reduction and run no ranking guard
+            # (audit 2026-10-16 F36).
+            mark(("decode_av_precision", "decode_ranking_fp64_escalation"),
+                 "read only by the diagonal_chunked and full_chunked KL decoders (the a_v reduction) and their "
+                 "ranking guard")
 
         # The route-specific rules below were confirmed by tiny launcher-derived CPU probes: loss and
         # every parameter gradient stay torch.equal under an override of the marked knob
@@ -2292,8 +2297,6 @@ class VFE3Config:
         # override leaves only a floating-point roundoff residue in the gradients.
         if self.decode_mode == "linear":
             mark(("m_decode_sigma_lr",), "linear decode has no independent variance table")
-            mark(("decode_av_precision", "decode_ranking_fp64_escalation"),
-                 "read only by the prior-bank Gaussian KL decoders and their ranking guard")
             mark(("decode_tau",), "read only by the prior-bank KL decode")
             mark(("decode_covariance",), "the linear readout reads no covariance")
             mark(("untie_decode_bank",),
