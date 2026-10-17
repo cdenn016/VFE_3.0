@@ -2176,6 +2176,18 @@ class VFEModel(nn.Module):
         ``snapshot.layer_converged[l]``, and ``canonical_total_delta`` is
         :math:`F_l(\mathrm{out}) - F_l(\mathrm{in})`: negative when the readout lowers the canonical free
         energy of its layer (item 27).
+
+        :math:`F` is a tempered functional, not an evidence bound (audit 2026-10-16 F46). Per head the label sector
+        is :math:`\sum_j\beta^{*h}_{ij}D^h_{ij} + \tau_h\mathrm{KL}(\beta^{*h}_{i\cdot}\|\pi^h_{i\cdot})
+        = \tau_h\mathcal F^{(h)}_i = -\tau_h\log Z^h_i`, where :math:`\mathcal F^{(h)}_i
+        = \mathrm{KL}(\beta^{*h}_{i\cdot}\|\pi^h_{i\cdot}) + \tau_h^{-1}\sum_j\beta^{*h}_{ij}D^h_{ij}` is the
+        unit-temperature row free energy of the record joint (supplement, Eqs. rg_bridge_record_joint and
+        rg_bridge_row), and it enters weighted by :math:`\lambda_\beta` beside a self sector of unit weight. The
+        supplement states that rescaling a row objective by :math:`\tau_h` keeps its optimizer
+        :math:`\beta^*` but does not license rescaling one sector of an ELBO, so ``total`` is not the negative ELBO
+        of that joint and ``canonical_total_delta`` is not an ELBO change. The label sectors carry the joint's unit
+        weight only at :math:`\tau_h = \lambda_\beta = 1`, and the self sector only at :math:`\alpha_i = 1` with no
+        :math:`R(\alpha_i)`.
         """
         from vfe3.alpha_i import alpha_is_per_coord, self_coupling_alpha
         from vfe3.families import get_family

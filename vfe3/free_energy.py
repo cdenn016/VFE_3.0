@@ -521,7 +521,12 @@ class CanonicalRoutingRows(NamedTuple):
     r"""Per-head rows of the canonical routing block (float64; heads indexed by ``irrep_dims``).
 
     ``belief_coupling`` is :math:`\sum_j\beta^*_{ij}D_{ij}` and ``attention_entropy`` is
-    :math:`\tau_h\sum_j\beta^*_{ij}\log(\beta^*_{ij}/\pi_{ij})`, both unweighted by :math:`\lambda_\beta`;
+    :math:`\tau_h\sum_j\beta^*_{ij}\log(\beta^*_{ij}/\pi_{ij})`, both unweighted by :math:`\lambda_\beta`. Their sum
+    is :math:`-\tau_h\log Z_i`, :math:`\tau_h` times the unit-temperature row free energy
+    :math:`\mathrm{KL}(\beta^*_{i\cdot}\|\pi_{i\cdot}) + \tau_h^{-1}\sum_j\beta^*_{ij}D_{ij}` of the record joint
+    (supplement, Eq. rg_bridge_row), so adding these rows to a unit-weight self term gives a tempered functional
+    rather than that joint's negative ELBO; the rows carry the joint's unit weight only at :math:`\tau_h = 1`
+    (audit 2026-10-16 F46);
     ``log_partition`` is :math:`\log Z_i`, :math:`-\infty` on a row with no admissible source (whose two
     rows are zero) and NaN on a row that reads a failed factorization, whose router and two rows are then
     NaN too (audit 2026-10-10 round 2, item 38)."""
