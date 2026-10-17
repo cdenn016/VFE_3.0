@@ -1,7 +1,7 @@
 import math
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Callable, Dict, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -353,7 +353,9 @@ def layernorm_diagonal_pushforward(
     saturates (row :math:`k` of :math:`J` near zero) its rounding is of order :math:`u\max_l\sigma_l(\gamma_k/s)^2`; the
     floor keeps the result positive unless that exceeds :math:`f\sigma_k(\gamma_k/s)^2`. Below float64 the float64 result
     is also formed and selected where the working value is not positive: an O(K) elementwise pass with no host read
-    of the failure mask (audit 2026-10-10 round 2, item 57). Evaluated with autocast off at
+    of the failure mask (audit 2026-10-10 round 2, item 57). The float64 result carries no autograd graph; the
+    gradient at every entry is that of the working-precision closed form (:class:`_SelectWorkingGradient`, audit
+    2026-10-16 F89). Evaluated with autocast off at
     ``promote_types(mu.dtype, sigma.dtype, float32)``, as :func:`_delta_covariance` is.
 
     ``effective_scale`` (``block_norm_covariance='pushforward_moment'``, audit 2026-10-16 F3) evaluates the same
@@ -368,10 +370,30 @@ def layernorm_diagonal_pushforward(
             effective_scale)
         if dtype == torch.float64:
             return pushed
-        high = _layernorm_diagonal_pushforward_at(
-            mu.double(), sigma.double(), eps, covariance_floor, None if weight is None else weight.double(),
-            effective_scale)
-        return torch.where(pushed <= 0, high.to(dtype), pushed)
+        with torch.no_grad():                    # no float64 graph: the select below routes no gradient here
+            high = _layernorm_diagonal_pushforward_at(
+                mu.double(), sigma.double(), eps, covariance_floor, None if weight is None else weight.double(),
+                effective_scale)
+        return _SelectWorkingGradient.apply(pushed, high.to(dtype), pushed <= 0)
+
+
+class _SelectWorkingGradient(torch.autograd.Function):
+    r"""``torch.where(selected, high, pushed)`` in value, with the gradient of ``pushed`` at every entry.
+
+    The float64 rescue of :func:`layernorm_diagonal_pushforward` replaces the value of the working-precision closed
+    form where it rounds to a nonpositive variance. Its derivative is that of the same closed form, so the gradient
+    is taken from the working-precision graph everywhere and the float64 result is formed without one; before audit
+    2026-10-16 F89 the ``torch.where`` kept the float64 graph alive on every call, about half the forward and
+    backward ops of the closed form, although entries are selected only where the norm saturates.
+    """
+
+    @staticmethod
+    def forward(ctx: Any, pushed: torch.Tensor, high: torch.Tensor, selected: torch.Tensor) -> torch.Tensor:
+        return torch.where(selected, high, pushed)
+
+    @staticmethod
+    def backward(ctx: Any, grad: torch.Tensor) -> Tuple[Optional[torch.Tensor], None, None]:
+        return grad, None, None
 
 
 def _layernorm_effective_scale(
