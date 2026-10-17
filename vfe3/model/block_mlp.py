@@ -333,6 +333,7 @@ def layernorm_diagonal_pushforward(
     eps:              float,
     covariance_floor: float,
     weight:           Optional[torch.Tensor] = None,  # (K,) affine gamma, or None for the plain norm
+    effective_scale:  bool                   = False, # block_norm_covariance='pushforward_moment': at s_eff
 ) -> torch.Tensor:                                    # (..., K)
     r"""Diagonal of the LayerNorm pushforward :math:`J\operatorname{diag}(\sigma)J^\top + fD\operatorname{diag}(\sigma)D + \rho gg^\top`, O(K) per token.
 
@@ -344,24 +345,121 @@ def layernorm_diagonal_pushforward(
             \sigma_k\Bigl(1 - \frac{2(1 + z_k^2)}{K}\Bigr) + \frac{S_0 + 2z_kS_1 + z_k^2S_2}{K^2}\Bigr],
 
     so the result is :math:`(\gamma_k/s)^2\bigl([\cdot] + f\sigma_k\bigr) + \rho\gamma_k^2z_k^2` without forming :math:`J`,
-    the last term the radial second-order variance (:func:`layernorm_radial_term`). It is the M-projection
-    onto the diagonal family of the dense pushforward, the moment-matched diagonal Gaussian. The bracket equals the sum of
+    the last term the radial second-order variance (:func:`layernorm_radial_term`). It is the diagonal of the dense
+    delta-method pushforward, that Gaussian's M-projection onto the diagonal family. The delta method itself
+    approximates the LayerNorm output's moments only while :math:`\Sigma` is small against :math:`s^2`
+    (:func:`layernorm_trace_cap`). The bracket equals the sum of
     squares :math:`\sum_l(\delta_{kl} - (1 + z_kz_l)/K)^2\sigma_l` but is evaluated with signed terms, so where the norm
     saturates (row :math:`k` of :math:`J` near zero) its rounding is of order :math:`u\max_l\sigma_l(\gamma_k/s)^2`; the
     floor keeps the result positive unless that exceeds :math:`f\sigma_k(\gamma_k/s)^2`. Below float64 the float64 result
     is also formed and selected where the working value is not positive: an O(K) elementwise pass with no host read
     of the failure mask (audit 2026-10-10 round 2, item 57). Evaluated with autocast off at
     ``promote_types(mu.dtype, sigma.dtype, float32)``, as :func:`_delta_covariance` is.
+
+    ``effective_scale`` (``block_norm_covariance='pushforward_moment'``, audit 2026-10-16 F3) evaluates the same
+    expression at the effective scale of :func:`_layernorm_effective_scale`, a moment estimate valid at every
+    :math:`\Sigma/s^2`; it is the diagonal of the full layout's (:func:`layernorm_full_pushforward`) at
+    :math:`\operatorname{diag}(\sigma)`.
     """
     dtype = _pushforward_dtype(mu, sigma)
     with torch.autocast(device_type=mu.device.type, enabled=False):
         pushed = _layernorm_diagonal_pushforward_at(
-            mu.to(dtype), sigma.to(dtype), eps, covariance_floor, None if weight is None else weight.to(dtype))
+            mu.to(dtype), sigma.to(dtype), eps, covariance_floor, None if weight is None else weight.to(dtype),
+            effective_scale)
         if dtype == torch.float64:
             return pushed
         high = _layernorm_diagonal_pushforward_at(
-            mu.double(), sigma.double(), eps, covariance_floor, None if weight is None else weight.double())
+            mu.double(), sigma.double(), eps, covariance_floor, None if weight is None else weight.double(),
+            effective_scale)
         return torch.where(pushed <= 0, high.to(dtype), pushed)
+
+
+def _layernorm_effective_scale(
+    s2:    torch.Tensor,                              # (..., 1) s^2 = v + eps at the pre-norm mean
+    noise: torch.Tensor,                              # (..., 1) T = tr(Pi Sigma Pi), the centered input variance
+    K:     int,
+) -> torch.Tensor:                                    # (..., 1) s_eff^2 = s^2 + T / K
+    r"""The effective LayerNorm scale :math:`s_{\mathrm{eff}}^2 = s^2 + \operatorname{tr}(\Pi\Sigma\Pi)/K` of the
+    moment pushforward (``block_norm_covariance='pushforward_moment'``, audit 2026-10-16 F3).
+
+    With :math:`\Pi = I - \mathbf 1\mathbf 1^\top/K`, :math:`u \sim \mathcal N(\mu, \Sigma)` and
+    :math:`c = \Pi u = c_\mu + \delta`, :math:`\delta \sim \mathcal N(0, \Pi\Sigma\Pi)`, the LayerNorm variance is
+
+    .. math::
+        v(u) + \epsilon = \bigl(\lVert c_\mu\rVert^2 + 2c_\mu^\top\delta + \lVert\delta\rVert^2\bigr)/K + \epsilon,
+        \qquad E\lVert\delta\rVert^2 = T = \operatorname{tr}(\Pi\Sigma\Pi),
+
+    so its mean is :math:`s_{\mathrm{eff}}^2`. Replacing :math:`\lVert\delta\rVert^2` by :math:`T` leaves the map
+    :math:`\Gamma(c_\mu + \delta)/\sqrt{s_{\mathrm{eff}}^2 + 2c_\mu^\top\delta/K}`, whose only nonlinearity is the
+    scalar :math:`2c_\mu^\top\delta/K`, of standard deviation at most :math:`s_{\mathrm{eff}}^2/\sqrt{K-1}` for
+    :math:`\Sigma = \sigma I` (AM-GM on :math:`\lVert c_\mu\rVert^2 + (K-1)\sigma`) at every :math:`\Sigma/s^2`. Its delta
+    method at :math:`\mu` is the LayerNorm's with :math:`\epsilon` replaced by :math:`\epsilon + T/K`: Jacobian
+    :math:`D(I - \tfrac1K\mathbf 1\mathbf 1^\top - \tfrac1Kz z^\top)`, :math:`D = \operatorname{diag}(\gamma)/s_{\mathrm{eff}}`,
+    :math:`z = c_\mu/s_{\mathrm{eff}}`. The fluctuation of :math:`\lVert\delta\rVert^2` about :math:`T` is the radial
+    term :math:`\rho gg^\top` at the same scale, :math:`\rho_{\mathrm{eff}} = \rho(s/s_{\mathrm{eff}})^4` and
+    :math:`g = \gamma\odot z` (:func:`layernorm_radial_term`, of which it is the small-noise limit). The estimate is the
+    delta method as :math:`\Sigma/s^2 \to 0`; for :math:`\Sigma = \sigma I` as :math:`\sigma/s^2 \to \infty` it is
+    :math:`\tfrac{K}{K-1}\Gamma\Pi\Gamma`, the covariance of the uniform distribution on the centered sphere of
+    radius :math:`\sqrt K`, plus its floors :math:`\tfrac{K}{K-1}f\Gamma^2 + f\Gamma\mathbf 1\mathbf 1^\top\Gamma/K`
+    (below); in between its error is of order :math:`1/K_{\mathrm{eff}}`,
+    :math:`K_{\mathrm{eff}} = T^2/\operatorname{tr}((\Pi\Sigma\Pi)^2)`, the concentration of :math:`\lVert\delta\rVert^2`
+    (Monte Carlo at :math:`\Sigma/s^2` from :math:`10^{-2}` to :math:`10^3`: within 5% per coordinate at K = 128,
+    10% at K = 32 and 22% at K = 8).
+
+    Floor. The LayerNorm output has no variance along :math:`\Gamma^{-1}\mathbf 1` (its coordinates are centered),
+    where :math:`fD\Sigma D` alone fills the null direction of :math:`P` with :math:`f` of the input's variance along
+    :math:`\mathbf 1`. Behind another such seam that input variance is itself of order :math:`f` of the scale, so the
+    floor compounds to order :math:`f^\ell` after :math:`\ell` seams (condition number :math:`4\cdot10^7` at the second
+    layer at K = 8, audit 2026-10-16 F2). The moment pushforward therefore adds the span floor
+    :math:`f(T/K)\,DWW^\top D` on :math:`\operatorname{span}\{\mathbf 1, z\}`, which :math:`P = I - WW^\top` annihilates
+    or shrinks: :math:`f` times the mean pushed variance :math:`T/(Ks_{\mathrm{eff}}^2)` there, so the condition number
+    stays about :math:`1/f` times the input's own anisotropy at every depth. The sphere bound
+    (:func:`layernorm_trace_cap`) is read net of both floor terms (:func:`_layernorm_moment_floor_trace`).
+    """
+    return s2 + noise / K
+
+
+def _centered_trace(
+    sigma:    torch.Tensor,                           # (..., K) diagonal or (..., K, K) full covariance
+    diagonal: bool,
+) -> torch.Tensor:                                    # (..., 1) T = tr(Pi Sigma Pi), Pi = I - 1 1^T / K
+    K = sigma.shape[-1]
+    if diagonal:                                                                    # S0 (K - 1) / K
+        return sigma.sum(dim=-1, keepdim=True) * ((K - 1) / K)
+    return (torch.diagonal(sigma, dim1=-2, dim2=-1).sum(dim=-1, keepdim=True)        # tr Sigma - 1^T Sigma 1 / K
+            - sigma.sum(dim=(-2, -1)).unsqueeze(-1) / K)
+
+
+def _layernorm_moment_floor_trace(
+    mu:               torch.Tensor,                   # (..., K) pre-norm means
+    sigma:            torch.Tensor,                   # (..., K) diagonal or (..., K, K) full covariance at mu
+    *,
+    eps:              float,
+    covariance_floor: float,
+    weight:           Optional[torch.Tensor] = None,  # (K,) affine gamma, or None for the plain norm
+) -> torch.Tensor:                                    # (..., 1) at promote_types(dtype, float32)
+    r"""Trace of the moment pushforward's floor terms, :math:`f\sum_kd_k^2\bigl(\Sigma_{kk} + (T/K)(1 + z_k^2)/K\bigr)`.
+
+    :math:`fD\Sigma D + f(T/K)DWW^\top D` with :math:`D = \operatorname{diag}(\gamma)/s_{\mathrm{eff}}`,
+    :math:`z = c_\mu/s_{\mathrm{eff}}` and :math:`\operatorname{diag}(WW^\top)_k = (1 + z_k^2)/K`
+    (:func:`_layernorm_effective_scale`), O(K) per token. The trace guard of ``'pushforward_moment'`` allows this on
+    top of the sphere bound, which bounds the LayerNorm output's covariance and not the regularizing floor, so the
+    guard binds only where the estimate net of its floor exceeds the bound. Head-block projection keeps the diagonal,
+    so the trace is that of the ``gaussian_block`` result as well.
+    """
+    dtype = _pushforward_dtype(mu, sigma)
+    diagonal = _is_diagonal_layout(mu, sigma)
+    with torch.autocast(device_type=mu.device.type, enabled=False):
+        work, cov = mu.to(dtype), sigma.to(dtype)
+        K = work.shape[-1]
+        centered = work - work.mean(dim=-1, keepdim=True)                           # (..., K)
+        s2 = centered.square().mean(dim=-1, keepdim=True) + eps                     # (..., 1)
+        noise = _centered_trace(cov, diagonal)                                      # (..., 1) T
+        scale2 = _layernorm_effective_scale(s2, noise, K)                           # (..., 1) s_eff^2
+        variances = cov if diagonal else torch.diagonal(cov, dim1=-2, dim2=-1)     # (..., K) Sigma_kk
+        d2 = 1.0 / scale2 if weight is None else weight.to(dtype).square() / scale2  # (..., 1) or (..., K)
+        span = (noise / K) * (1.0 + centered.square() / scale2) / K                 # (..., K) (T/K) diag(W W^T)
+        return covariance_floor * (d2 * (variances + span)).sum(dim=-1, keepdim=True)
 
 
 def _layernorm_diagonal_pushforward_at(
@@ -370,20 +468,27 @@ def _layernorm_diagonal_pushforward_at(
     eps:              float,
     covariance_floor: float,
     weight:           Optional[torch.Tensor],         # (K,) gamma at the working dtype, or None
+    effective_scale:  bool = False,                   # pushforward_moment: s^2 -> s_eff^2 = s^2 + tr(Pi Sigma Pi)/K
 ) -> torch.Tensor:                                    # (..., K)
     K = mu.shape[-1]
     centered = mu - mu.mean(dim=-1, keepdim=True)                                   # (..., K)
     s2 = centered.square().mean(dim=-1, keepdim=True) + eps                         # (..., 1) s^2
-    z = centered / s2.sqrt()                                                        # (..., K)
+    noise = _centered_trace(sigma, True) if effective_scale else None               # (..., 1) T
+    scale2 = _layernorm_effective_scale(s2, noise, K) if effective_scale else s2    # (..., 1) s_eff^2 or s^2
+    z = centered / scale2.sqrt()                                                    # (..., K)
     z2 = z.square()
     S0 = sigma.sum(dim=-1, keepdim=True)                                            # (..., 1)
     S1 = (sigma * z).sum(dim=-1, keepdim=True)                                      # (..., 1)
     S2 = (sigma * z2).sum(dim=-1, keepdim=True)                                     # (..., 1)
     bracket = sigma * (1.0 - 2.0 * (1.0 + z2) / K) + (S0 + 2.0 * z * S1 + z2 * S2) / (K * K)   # (..., K)
-    d2 = 1.0 / s2 if weight is None else weight.square() / s2                       # (..., 1) or (..., K): D^2
+    d2 = 1.0 / scale2 if weight is None else weight.square() / scale2               # (..., 1) or (..., K): D^2
     rho = _layernorm_radial_coefficient(centered, s2, sigma, eps)                   # (..., 1)
+    floor = covariance_floor * sigma                                                # (..., K) f diag(Sigma)
+    if effective_scale:
+        rho = rho * (s2 / scale2).square()                                          # rho (s / s_eff)^4
+        floor = floor + covariance_floor * (noise / K) * (1.0 + z2) / K             # span floor f (T/K) diag(W W^T)
     g2 = z2 if weight is None else weight.square() * z2                             # (..., K) (gamma o z)^2
-    return d2 * (bracket + covariance_floor * sigma) + rho * g2
+    return d2 * (bracket + floor) + rho * g2
 
 
 class BlockNormLinearization(NamedTuple):
@@ -427,24 +532,47 @@ def block_norm_linearization(
                                   layernorm_scale(mu, eps=eps, weight=weight))
 
 
+# The block_norm_covariance values that push the covariance through the block LayerNorm.
+#   pushforward         the delta method at the pre-norm mean, capped at the sphere bound (valid while Sigma << s^2)
+#   pushforward_moment  the delta method at the effective scale s_eff^2 = s^2 + tr(Pi Sigma Pi)/K (audit 2026-10-16 F3)
+BLOCK_NORM_PUSHFORWARD_MODES = ("pushforward", "pushforward_moment")
+
+
 def block_norm_covariance_pushforward(
     norm:             Callable[..., torch.Tensor],
     mu:               torch.Tensor,                   # (..., K) pre-norm means
     sigma:            torch.Tensor,                   # (..., K) diagonal or (..., K, K) full covariance at mu
     covariance_floor: float,
     head_dims:        Optional[Sequence[int]] = None, # full layout: keep only these head blocks (gaussian_block)
+    *,
+    mode:             str                     = "pushforward",   # a BLOCK_NORM_PUSHFORWARD_MODES value
 ) -> torch.Tensor:                                    # sigma's layout, at promote_types(dtype, float32)
-    r"""The covariance through a LayerNorm seam at the pre-norm mean (``block_norm_covariance='pushforward'``).
+    r"""The covariance through a LayerNorm seam at the pre-norm mean (``block_norm_covariance`` = ``mode``).
 
     Full layout: :math:`J_{\mathrm{LN}}\Sigma J_{\mathrm{LN}}^\top + fD\Sigma D + \rho gg^\top`,
     :math:`D = \operatorname{diag}(\gamma)/s`, in the O(K^2) rank-two form (:func:`layernorm_full_pushforward`), with
     the radial second-order term (:func:`layernorm_radial_term`); ``head_dims`` returns its head-block projection.
-    Diagonal layout: its diagonal, the M-projection onto the diagonal family, in closed form
-    (:func:`layernorm_diagonal_pushforward`). Both are capped at the sphere bound (:func:`layernorm_trace_cap`).
+    Diagonal layout: its diagonal in closed form (:func:`layernorm_diagonal_pushforward`). Both are capped at the
+    sphere bound (:func:`layernorm_trace_cap`).
+
+    ``mode='pushforward'`` is the delta method at :math:`s`, a moment estimate only while :math:`\Sigma` is small
+    against :math:`s^2`; where its cap binds the result keeps the delta method's radial shape rather than the
+    LayerNorm output's (audit 2026-10-16 F3, F2). ``mode='pushforward_moment'`` evaluates it at the effective scale
+    :math:`s_{\mathrm{eff}}^2 = s^2 + \operatorname{tr}(\Pi\Sigma\Pi)/K` (:func:`_layernorm_effective_scale`) with a span
+    floor that keeps its conditioning from compounding across seams; it tracks the Monte Carlo moments at every
+    :math:`\Sigma/s^2`, and net of its floor terms it is within the sphere bound in every tested regime, so there the
+    cap, read net of the floor, is a guard whose counter reads zero.
     """
-    pushed = _uncapped_block_norm_pushforward(norm, mu, sigma, covariance_floor, head_dims)
+    if mode not in BLOCK_NORM_PUSHFORWARD_MODES:
+        raise ValueError(f"block norm covariance pushforward mode must be one of {BLOCK_NORM_PUSHFORWARD_MODES}, "
+                         f"got {mode!r}")
+    moment = mode == "pushforward_moment"
+    pushed = _uncapped_block_norm_pushforward(norm, mu, sigma, covariance_floor, head_dims, effective_scale=moment)
     diagonal = _is_diagonal_layout(mu, sigma)
-    return _apply_trace_cap(pushed, layernorm_trace_cap(pushed, _layernorm_arguments(norm)[1], diagonal), diagonal)
+    eps, weight = _layernorm_arguments(norm)
+    allowance = (_layernorm_moment_floor_trace(mu, sigma, eps=eps, covariance_floor=covariance_floor, weight=weight)
+                 if moment else None)                                        # (..., 1) the floor's trace, or None
+    return _apply_trace_cap(pushed, layernorm_trace_cap(pushed, weight, diagonal, allowance), diagonal)
 
 
 def _uncapped_block_norm_pushforward(
@@ -453,12 +581,14 @@ def _uncapped_block_norm_pushforward(
     sigma:            torch.Tensor,
     covariance_floor: float,
     head_dims:        Optional[Sequence[int]] = None,
+    effective_scale:  bool                    = False,
 ) -> torch.Tensor:
     eps, weight = _layernorm_arguments(norm)
     if _is_diagonal_layout(mu, sigma):
-        return layernorm_diagonal_pushforward(mu, sigma, eps=eps, covariance_floor=covariance_floor, weight=weight)
+        return layernorm_diagonal_pushforward(mu, sigma, eps=eps, covariance_floor=covariance_floor, weight=weight,
+                                              effective_scale=effective_scale)
     return layernorm_full_pushforward(mu, sigma, eps=eps, covariance_floor=covariance_floor, weight=weight,
-                                      head_dims=head_dims)
+                                      head_dims=head_dims, effective_scale=effective_scale)
 
 
 # Tokens whose LayerNorm covariance pushforward was capped at the sphere bound, per device, counted on the device
@@ -470,6 +600,7 @@ def layernorm_trace_cap(
     pushed:   torch.Tensor,                           # (..., K) diagonal or (..., K, K) full LayerNorm pushforward
     weight:   Optional[torch.Tensor],                 # (K,) affine gamma, or None for the plain norm
     diagonal: bool,
+    allowance: Optional[torch.Tensor] = None,         # (..., 1) trace allowed above B (pushforward_moment: its floor)
 ) -> torch.Tensor:                                    # (..., 1) lambda in (0, 1]
     r"""Scale :math:`\lambda = \min(1, B/\operatorname{tr}P)` that caps a LayerNorm pushforward at the sphere bound.
 
@@ -489,11 +620,21 @@ def layernorm_trace_cap(
     :math:`\Sigma/s^2` and its radial term as :math:`(\Sigma/s^2)^2`, and at :math:`\Sigma/s^2 \approx 4\cdot 10^3` it
     gave a trace of :math:`7\cdot 10^6` against the Monte Carlo value :math:`K = 20`, reaching NaN by the third layer (audit 2026-10-12, item 1). Scaling the pushforward :math:`P` by
     :math:`\lambda` keeps it positive semidefinite, leaves it unchanged wherever its trace is within the bound, and
-    otherwise makes its trace exactly :math:`B`. In the bad regime the result is still an approximation; the capped
-    tokens are counted (:func:`layernorm_trace_cap_elements`).
+    otherwise makes its trace exactly :math:`B`. It fixes the trace, not the shape: where it binds the capped
+    delta method is :math:`BP/\operatorname{tr}P`, dominated by the radial term :math:`\rho gg^\top`, so its diagonal
+    follows :math:`\gamma_k^2z_k^2` and its full layout is near rank one, while the LayerNorm output tends to the
+    uniform distribution on the centered sphere (audit 2026-10-16 F3, F2;
+    ``block_norm_covariance='pushforward_moment'`` is the moment estimate there). The capped tokens are counted
+    (:func:`layernorm_trace_cap_elements`).
+
+    ``allowance`` raises the bound to :math:`B + a` per token. The moment pushforward passes the trace of its floor
+    terms (:func:`_layernorm_moment_floor_trace`): the sphere bound holds for the LayerNorm output's covariance, not
+    for the regularizing floor added to it, so there the cap is a guard on the estimate net of its floor.
     """
     K = pushed.shape[-1]
     bound = float(K) if weight is None else K * weight.to(pushed.dtype).square().amax()   # carries d/d gamma
+    if allowance is not None:
+        bound = bound + allowance.to(pushed.dtype)                                            # (..., 1) B + a
     trace = (pushed.sum(dim=-1, keepdim=True) if diagonal
              else torch.diagonal(pushed, dim1=-2, dim2=-1).sum(dim=-1, keepdim=True))       # (..., 1)
     lam = torch.clamp(bound / trace, max=1.0)                                                 # (..., 1)
@@ -548,6 +689,7 @@ def layernorm_full_pushforward(
     covariance_floor: float,
     weight:           Optional[torch.Tensor] = None,  # (K,) affine gamma, or None for the plain norm
     head_dims:        Optional[Sequence[int]] = None, # keep only these head blocks (gaussian_block), sum = K
+    effective_scale:  bool                    = False, # block_norm_covariance='pushforward_moment': at s_eff
 ) -> torch.Tensor:                                    # (..., K, K)
     r"""The full-layout LayerNorm pushforward in O(K^2) per token (audit 2026-10-10 round 2, item 50).
 
@@ -559,22 +701,33 @@ def layernorm_full_pushforward(
         \qquad P\Sigma P = \Sigma - W(\Sigma W)^\top - (\Sigma W)W^\top + W(W^\top\Sigma W)W^\top,
 
     a rank-two correction of :math:`\Sigma` instead of the dense Jacobian, its Cholesky factor, :math:`JL` and their
-    Gram (about :math:`2.3K^3` per token). Below float64 the result is certified by a Cholesky factorization, of
+    Gram (about :math:`2.3K^3` per token). Below float64 the result is checked by a Cholesky factorization, of
     each head block when ``head_dims`` is given (only those blocks are kept), and tokens that fail are recomputed in
-    float64, as in :func:`_delta_covariance`. Autocast off and IEEE fp32 GEMMs at ``promote_types(dtype, float32)``.
+    float64 and cast back, as in :func:`_delta_covariance`; the cast is not re-checked, so a float64 result whose
+    condition number approaches :math:`1/u_{32}` can still fail to factor at the working dtype (the capped delta
+    method at :math:`\Sigma \gg s^2`, audit 2026-10-16 F2). Autocast off and IEEE fp32 GEMMs at
+    ``promote_types(dtype, float32)``.
+
+    The delta method approximates the LayerNorm output's moments only while :math:`\Sigma` is small against
+    :math:`s^2`; beyond, its radial term dominates and the capped result is near rank one (condition number about
+    :math:`10^7` at the launcher's initialization, audit 2026-10-16 F2). ``effective_scale``
+    (``block_norm_covariance='pushforward_moment'``) evaluates the same expression at the effective scale
+    :math:`s_{\mathrm{eff}}^2 = s^2 + \operatorname{tr}(\Pi\Sigma\Pi)/K` (:func:`_layernorm_effective_scale`), where
+    :math:`P` has eigenvalue :math:`(\epsilon + T/K)/(v + \epsilon + T/K)` on :math:`z` and the floor
+    :math:`fD\Sigma D` stays about :math:`f` of the pushed scale.
     """
     dtype = _pushforward_dtype(mu, sigma)
     with torch.autocast(device_type=mu.device.type, enabled=False), ieee_fp32_matmul():
         pushed = _layernorm_full_pushforward_at(
             mu.to(dtype), sigma.to(dtype), eps, covariance_floor, None if weight is None else weight.to(dtype),
-            head_dims)
+            head_dims, effective_scale)
         if dtype == torch.float64:
             return pushed
         failed = _cholesky_failures(pushed, head_dims)                              # (...,)
         if bool(failed.any()):
             high = _layernorm_full_pushforward_at(
                 mu.double(), sigma.double(), eps, covariance_floor, None if weight is None else weight.double(),
-                head_dims)
+                head_dims, effective_scale)
             pushed = torch.where(failed.unsqueeze(-1).unsqueeze(-1), high.to(dtype), pushed)
     return pushed
 
@@ -586,19 +739,26 @@ def _layernorm_full_pushforward_at(
     covariance_floor: float,
     weight:           Optional[torch.Tensor],         # (K,) at the working dtype, or None
     head_dims:        Optional[Sequence[int]],
+    effective_scale:  bool = False,                   # pushforward_moment: s^2 -> s_eff^2 = s^2 + tr(Pi Sigma Pi)/K
 ) -> torch.Tensor:                                    # (..., K, K) symmetrized
     K = mu.shape[-1]
     centered = mu - mu.mean(dim=-1, keepdim=True)                                   # (..., K)
     s2 = centered.square().mean(dim=-1, keepdim=True) + eps                         # (..., 1) s^2
-    z = centered / s2.sqrt()                                                        # (..., K)
-    d = (1.0 / s2.sqrt()).expand_as(z) if weight is None else weight / s2.sqrt()    # (..., K) D
+    noise = _centered_trace(sigma, False) if effective_scale else None              # (..., 1) T
+    scale2 = _layernorm_effective_scale(s2, noise, K) if effective_scale else s2    # (..., 1) s_eff^2 or s^2
+    z = centered / scale2.sqrt()                                                    # (..., K)
+    d = (1.0 / scale2.sqrt()).expand_as(z) if weight is None else weight / scale2.sqrt()   # (..., K) D
     W = torch.stack([torch.ones_like(z), z], dim=-1) / math.sqrt(K)                 # (..., K, 2)
     SW = sigma @ W                                                                  # (..., K, 2) Sigma W
     A = W.transpose(-1, -2) @ SW                                                    # (..., 2, 2) W^T Sigma W
     cross = W @ SW.transpose(-1, -2)                                                # (..., K, K) W (Sigma W)^T
     core = sigma - cross - cross.transpose(-1, -2) + W @ A @ W.transpose(-1, -2) + covariance_floor * sigma
+    if effective_scale:                                                             # span floor f (T/K) W W^T
+        core = core + (covariance_floor * noise / K).unsqueeze(-1) * (W @ W.transpose(-1, -2))
     g = z if weight is None else weight * z                                         # (..., K) gamma o z
     rho = _layernorm_radial_coefficient(centered, s2, sigma, eps)                   # (..., 1)
+    if effective_scale:
+        rho = rho * (s2 / scale2).square()                                          # rho (s / s_eff)^4
     pushed = d.unsqueeze(-1) * core * d.unsqueeze(-2) + rho.unsqueeze(-1) * (g.unsqueeze(-1) * g.unsqueeze(-2))
     pushed = 0.5 * (pushed + pushed.transpose(-1, -2))
     if head_dims is None:
