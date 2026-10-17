@@ -342,8 +342,10 @@ def free_energy(
 # ``free_energy`` above is the pure q-only training scalar and keeps its byte-for-byte one-shot
 # ``.sum()`` reductions; it does NOT delegate to the rows below, because float32 one-shot reductions
 # are not bitwise associative with the row-then-query reductions the evaluator performs. The rows and
-# the evaluator are the SINGLE typed boundary the diagnostics route their belief assembly through, so
-# the belief rows are no longer summed into the total by hand at each call site.
+# the evaluator are test oracles like the scalar: their one caller, ``metrics.free_energy_terms``, is
+# called only by tests. The projected routes' canonical diagnostic
+# (``VFEModel._canonical_free_energy_diagnostics``) sums its own float64 rows from
+# :func:`canonical_routing_rows` and does not route through them (audit 2026-10-16 F92).
 # ===========================================================================
 
 class BeliefFreeEnergyRows(NamedTuple):

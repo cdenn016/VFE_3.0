@@ -293,8 +293,10 @@ def free_energy_terms(
 ) -> Dict[str, float]:
     r"""Per-term free-energy decomposition: self-coupling, belief-coupling, attention entropy.
 
-    Mirrors ``vfe3.free_energy.free_energy`` so the reported ``total`` equals the scalar that
-    function returns for the SAME inputs (within float32 rounding):
+    A test-only reference, like the scalar it mirrors: no production path calls it, and the projected
+    routes' canonical diagnostic assembles its own float64 rows (audit 2026-10-16 F92). It mirrors
+    ``vfe3.free_energy.free_energy`` so the reported ``total`` equals the scalar that function returns
+    for the SAME inputs (within float32 rounding):
 
         F = sum_i [ alpha_i D(q_i||p_i) + R(alpha_i)
                   + lambda_beta ( sum_j beta_ij E_ij
@@ -343,7 +345,10 @@ def free_energy_terms(
         _belief_free_energy_rows, _broadcast_tau, hierarchical_free_energy_terms,
     )
     _tau_e = _broadcast_tau(tau, energy)
-    entropy = float((_tau_e * (beta * (torch.log(beta.clamp(min=eps)) - log_pi))).sum())
+    # xlogy, as in the rows that assemble ``total``: zero at beta == 0 with no floor on a positive tail
+    # probability, so the reported block is the one ``total`` carries (audit 2026-10-16 F92).
+    beta_for_log = torch.where(beta > 0.0, beta, torch.ones_like(beta))
+    entropy = float((_tau_e * (torch.special.xlogy(beta, beta_for_log) - beta * log_pi)).sum())
     observation_likelihood = None
     if log_likelihood is not None:
         observation_likelihood = float(log_likelihood.sum())

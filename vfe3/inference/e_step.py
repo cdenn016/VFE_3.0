@@ -400,7 +400,7 @@ def e_step(
         sequence_index = state_record.get("sequence_index")
         state_record.clear()
         state_record.update(
-            sequence_index=sequence_index, beliefs=[belief], free_energy=[],
+            sequence_index=sequence_index, beliefs=[belief],
             semantics=relational_operators.inference_semantics)
     for _ in range(n_iter):
         belief = e_step_iteration(
