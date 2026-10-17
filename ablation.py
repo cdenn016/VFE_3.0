@@ -76,7 +76,6 @@ import stat
 import subprocess
 import sys
 import time
-import warnings
 from collections.abc import Mapping
 from dataclasses import MISSING, asdict, fields as dataclass_fields
 from pathlib import Path

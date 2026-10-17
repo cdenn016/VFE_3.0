@@ -22,9 +22,12 @@ import math
 import weakref
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 
 import torch
+
+if TYPE_CHECKING:                       # the annotation of project_phi_to_slk only (audit 2026-10-16 F97)
+    from vfe3.geometry.groups import GaugeGroup
 
 
 def embed_phi(

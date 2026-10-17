@@ -3,7 +3,7 @@ r"""Role-specific comparison and content operators in realized canonical frames.
 import math
 from contextlib import contextmanager
 from numbers import Real
-from typing import Dict, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -1189,7 +1189,7 @@ class RelationalOperators(nn.Module):
         Returns the local outputs, the capture record and the status ``(failed, ill_conditioned, covariance_failed)``
         ``(3,)`` bool, unchecked (the caller makes the host check): the readout's factorization and certificate flags
         and the device-side screen of the floored covariance (False without ``return_covariance``)."""
-        H, K = len(self.irrep_dims), self.input_dim
+        H = len(self.irrep_dims)
         S, T, log_noise = self.raw_score_q, self.T, self.channel_log_noise
         dtype = _compute_dtype(mu, sigma, S, T, log_noise, frame.forward)
         with torch.autocast(device_type=mu.device.type, enabled=False), ieee_fp32_matmul():

@@ -273,7 +273,7 @@ def _pullback_group_local_head_blocks(
     local = group.certified_block_local_basis()
     if local is None:
         return None
-    n_blocks, block_dim = len(group.irrep_dims), group.irrep_dims[0]
+    n_blocks = len(group.irrep_dims)
     basis = group._local_basis_as(torch.float64, coordinates.device)          # (m, d, d)
     return torch.einsum(
         "ahm,mij->ahij",

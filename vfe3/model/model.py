@@ -2629,7 +2629,6 @@ class VFEModel(nn.Module):
         token_ids: torch.Tensor,           # (B, N) token ids; projected diagnostics reduce the captured batch
 
         *,
-        log_likelihood: Optional[torch.Tensor] = None,  # (N,) optional E_q[log p(o|k)] diagnostic seam
         snapshot:       Optional[DiagnosticSnapshot] = None,  # one-forward captured evaluation state
     ) -> dict:
         r"""Report the captured projected routing, receiver costs, and state diagnostics (no_grad).
@@ -2642,7 +2641,6 @@ class VFEModel(nn.Module):
         (``self_coupling``, ``belief_coupling``, ``attention_entropy``, ``total``, ...) are NaN, except
         under ``diagnose_canonical_free_energy``, which evaluates the canonical free energy at the
         beliefs the router read (:meth:`_canonical_free_energy_diagnostics`).
-        ``log_likelihood`` is accepted for call-site compatibility and unused.
         """
         snapshot = (self.build_diagnostic_snapshot(token_ids, return_logits=False) if snapshot is None
                     else self._validate_diagnostic_snapshot(token_ids, snapshot))
@@ -2690,13 +2688,11 @@ class VFEModel(nn.Module):
         token_ids: torch.Tensor,           # (B, N) token ids; projected diagnostics reduce the captured batch
 
         *,
-        log_likelihood: Optional[torch.Tensor] = None,  # (N,) optional E_q[log p(o|k)] diagnostic seam
         snapshot:       Optional[DiagnosticSnapshot] = None,
     ) -> dict:                             # each value a list of length L = cfg.n_layers
         r"""Per-layer projected diagnostics: :meth:`_relational_diagnostics` at every layer (no_grad).
 
         Returns a dict of ``L``-length lists keyed like :meth:`diagnostics`, from one snapshot.
-        ``log_likelihood`` is accepted for call-site compatibility and unused.
         """
         snapshot = (self.build_diagnostic_snapshot(token_ids, return_logits=False) if snapshot is None
                     else self._validate_diagnostic_snapshot(token_ids, snapshot))

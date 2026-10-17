@@ -199,7 +199,7 @@ def e_step_iteration(
     belief:                    BeliefState,
     mu_p:                      torch.Tensor,        # (N, K)
     sigma_p:                   torch.Tensor,        # (N, K)
-    group:                     Optional[GaugeGroup],
+    group:                     Optional[GaugeGroup],  # unread: kept positionally for the callers (audit 2026-10-16 F97)
 
     *,
     tau:                       'float | torch.Tensor' = 1.0,
@@ -338,7 +338,7 @@ def e_step(
     belief:            BeliefState,
     mu_p:              torch.Tensor,        # (N, K)
     sigma_p:           torch.Tensor,        # (N, K)
-    group:             Optional[GaugeGroup],
+    group:             Optional[GaugeGroup],  # unread: kept positionally for the callers (audit 2026-10-16 F97)
 
     *,
     tau:                       'float | torch.Tensor' = 1.0,
