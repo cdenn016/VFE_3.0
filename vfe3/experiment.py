@@ -5,12 +5,14 @@ argument (the config, the dataset, the output root, the model seed, the data-ord
 run label), so experiment launchers such as ``paper_arms.py`` can run many configurations in one
 process without editing or importing the click-to-run launcher and its module globals.
 
-The sequence is the launcher's, step for step. The global RNG is seeded from ``seed`` before the
-model is built and again after it (so later global draws do not depend on how much RNG the model's
-construction consumed); the training loader shuffles with its own generator seeded from
-``data_seed``, so the batch order is a function of the data seed alone; validation and test read the
-whole split in order with the config's evaluation stride. After training, the final validation
-handed back by the loop (or a fresh evaluation) is logged, :func:`vfe3.run_artifacts.finalize_run`
+The sequence is the launcher's, and the trained weights and test scores match it bitwise. The global
+RNG is seeded from ``seed`` before the model is built and again after it (so later global draws do
+not depend on how much RNG the model's construction consumed); the training loader shuffles with its
+own generator seeded from ``data_seed``, so the batch order is a function of the data seed alone;
+validation and test read the whole split in order with the config's evaluation stride. All three
+splits are opened before training (building a sequential loader draws no RNG), so a missing test
+cache fails at launch rather than after the training budget (audit 2026-10-16 F122). After training,
+the final validation handed back by the loop (or a fresh evaluation) is logged, :func:`vfe3.run_artifacts.finalize_run`
 scores the test split and writes the run's records, and the directory
 ``<out_root>/<timestamp>_<label>`` is renamed to ``<out_root>/<test PPL>_<label>``.
 
@@ -129,20 +131,25 @@ def rename_run_by_test_ppl(
     label:    str,
     test_ppl: Optional[float],
     logger:   logging.Logger,
+
+    *,
+    prefix:   str = "",
 ) -> Path:
-    r"""Rename ``run_dir`` to ``<parent>/<test_ppl:.2f>_<label>`` (``_2``, ... on a clash).
+    r"""Rename ``run_dir`` to ``<parent>/<prefix><test_ppl:.2f>_<label>`` (``_2``, ... on a clash).
 
     Nothing within the run is selected on test; the name is a sorting convenience applied after
     the test evaluation. Across runs the name exposes the test perplexity, so recipes chosen by
     comparing run names were chosen on the test split. The directory keeps its timestamped name when the perplexity is missing or not
     finite, or when the operating system refuses the move (the results are already on disk).
+    ``prefix`` marks a name that carries another perplexity: ``train_baseline`` names a learning-rate
+    sweep arm, which never scores test, ``val<best_val_ppl:.2f>_<label>``.
     """
-    if test_ppl is None or not math.isfinite(test_ppl) or not run_dir.exists():
+    if test_ppl is None or not math.isfinite(float(test_ppl)) or not run_dir.exists():
         return run_dir
-    target = run_dir.parent / f"{test_ppl:.2f}_{label}"
+    target = run_dir.parent / f"{prefix}{float(test_ppl):.2f}_{label}"
     index = 2
     while target.exists():
-        target = run_dir.parent / f"{test_ppl:.2f}_{label}_{index}"
+        target = run_dir.parent / f"{prefix}{float(test_ppl):.2f}_{label}_{index}"
         index += 1
     try:
         run_dir.rename(target)
@@ -236,6 +243,11 @@ def run_vfe(
     train_loader = _loader(dataset, cfg, "train", data_seed)
     val_loader = _loader(dataset, cfg, "validation", data_seed)
     val_tpc = tokens_per_char(dataset, "validation")
+    # The test split is opened here, with the others, so a missing or unreadable test cache fails at
+    # launch rather than after the whole training budget (audit 2026-10-16 F122). Building a
+    # sequential loader draws no RNG, so the run is unchanged.
+    test_loader = _loader(dataset, cfg, "test", data_seed)
+    test_tpc = tokens_per_char(dataset, "test")
 
     run_dir = reserve_directory(Path(out_root), f"{datetime.now().strftime('%Y%m%d-%H%M%S')}_{label}")
     artifacts = RunArtifacts(run_dir, cfg, model, dataset=dataset, device=device,
@@ -277,11 +289,10 @@ def run_vfe(
                 metrics["ce"], metrics["ppl"], metrics["bits_per_token"],
                 f"{float(metrics['bpc']):.4f}" if metrics["bpc"] is not None else "unavailable")
 
-    test_loader = _loader(dataset, cfg, "test", data_seed)
     results = finalize_run(
         model, artifacts, cfg,
         final_validation=metrics,
-        tokens_per_char=tokens_per_char(dataset, "test"),
+        tokens_per_char=test_tpc,
         train_loader=train_loader,
         val_loader=val_loader,
         test_loader=test_loader,
