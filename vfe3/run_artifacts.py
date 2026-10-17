@@ -5471,9 +5471,17 @@ def _save_figures(
         readout_keys = tuple({key for row in artifacts.history for key in row
                               if key.startswith("relational_")})
         if readout_keys:
+            # The canonical-F panels read the diagnose_canonical_free_energy columns (NaN otherwise, so
+            # _hist_subset drops them), and their "F at the layer input" series is the per-layer figure's
+            # "total", which metrics.csv writes as inner_alignment_energy_total (audit 2026-10-16 F82).
             readout_history = _hist_subset(readout_keys + (
                 "attn_entropy", "attn_entropy_min", "effective_rank", "belief_cond_median",
-                "belief_cond_median_layer_max"))
+                "belief_cond_median_layer_max",
+                "self_coupling", "self_divergence", "belief_coupling", "attention_entropy",
+                "inner_alignment_energy_total", "canonical_total_output",
+                *(key for key, _ in raw_figs._CANONICAL_ROUTER_SERIES)))
+            if readout_history is not None and "inner_alignment_energy_total" in readout_history:
+                readout_history["total"] = readout_history.pop("inner_alignment_energy_total")
             if readout_history is not None:
                 try:
                     from vfe3.metrics import covariance_frozen_at_encode
