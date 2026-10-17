@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import contextlib
 import math
-from typing import Any, Dict, Hashable, Iterator, Optional, Sequence, Tuple
+from typing import Any, Dict, Hashable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -579,6 +579,30 @@ def wilson_interval(k: float, n: int, z: float = 1.959963984540054) -> Tuple[flo
     lo = 0.0 if k <= 0 else max(0.0, center - half)                    # exact endpoints, no round-off
     hi = 1.0 if k >= n else min(1.0, center + half)
     return lo, hi
+
+
+def holm_adjust(p: Sequence[Optional[float]]) -> List[Optional[float]]:
+    r"""Holm step-down adjusted p-values of one family of tests (Holm 1979, Scand. J. Statist. 6:65).
+
+    With the ``m`` finite p-values of the family ordered :math:`p_{(1)} \le \dots \le p_{(m)}`,
+
+    .. math:: \tilde p_{(i)} = \max_{j \le i} \min\big(1, (m - j + 1) p_{(j)}\big),
+
+    and :math:`\tilde p_{(i)} < \alpha` rejects exactly the hypotheses Holm's procedure rejects at
+    family-wise error rate :math:`\alpha`, under any dependence between the tests (the relations of a
+    view share words, so their tests are dependent). ``None`` or NaN entries are not tests: they keep
+    ``None`` and do not count in ``m``. Ties keep their input order, which does not change the values.
+    """
+    values = [None if v is None or not math.isfinite(float(v)) else float(v) for v in p]
+    tested = [i for i, v in enumerate(values) if v is not None]
+    order = sorted(tested, key=lambda i: values[i])
+    m = len(order)
+    out: List[Optional[float]] = [None] * len(values)
+    running = 0.0
+    for j, i in enumerate(order):                                       # j = 0 .. m - 1
+        running = max(running, min(1.0, (m - j) * values[i]))
+        out[i] = running
+    return out
 
 
 def unit_bootstrap_weights(unit_a: Any, unit_b: Any, n_units: int, rng: np.random.Generator,

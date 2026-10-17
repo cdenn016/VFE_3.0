@@ -1336,9 +1336,12 @@ def _phi_summary(res: SectionResult) -> str:
     ok_rel = {k: v for k, v in rel.items() if isinstance(v, Mapping) and v.get("status") == "ok"}
     if ok_rel:
         sig = [k for k, v in ok_rel.items() if _num(v.get("p")) is not None and v["p"] < 0.01]
+        holm = [_num(v.get("p_holm")) for v in ok_rel.values() if _num(v.get("p_holm")) is not None]
         cons = [v["consistency"] for v in ok_rel.values() if _num(v.get("consistency")) is not None]
         s.append(f"{len(sig)} of {len(ok_rel)} relations have relation transports Û_(a*_i) Û_(a_i)⁻¹ more consistent "
-                 f"than their re-pairing null at p < 0.01"
+                 f"than their re-pairing null at p < 0.01 (unadjusted"
+                 + (f"; {sum(1 for p in holm if p < 0.01)} after the Holm adjustment over the {len(holm)} relations"
+                    if holm else "") + ")"
                  + (f", with absolute consistencies between {min(cons):.3f} and {max(cons):.3f}." if cons else "."))
     pos = m.get("positional")
     if isinstance(pos, Mapping) and _num(pos.get("r2_offset")) is not None:

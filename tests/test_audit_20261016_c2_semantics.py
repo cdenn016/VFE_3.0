@@ -8,6 +8,10 @@ nothing is trained, everything runs on the CPU.
   ``"gaussian_likelihood"``: the decode accessors, the ``decode_mu`` view and the decode-bank
   battery apply; only the natural-parameter view (linear in :math:`\lambda(q)` for the KL decode
   alone) is skipped.
+* F71: Holm-adjusted p-values (family-wise error under any dependence) are reported next to the raw
+  ones for each family: the relation transports of the phi section, the relations of an offsets view,
+  the relation pairs of a concept-direction view and the scorers of a similarity comparison; the
+  offsets heatmap fills only the cells that survive the adjustment.
 * F72: a word-level run's vocabulary sidecar is read from the ``cache_dir`` its token streams use.
 * F73: every stochastic sub-step of the phi and Sigma sections draws from its own seeded stream, so a
   budget change or skip in one step leaves the draws of the others unchanged.
@@ -183,3 +187,107 @@ def test_sigma_similarity_draws_do_not_depend_on_the_frequency_step(tmp_path: Pa
     with_counts, without = similarity(True), similarity(False)
     # the frequency step draws only with counts; the similarity bootstraps of both banks are unchanged
     assert with_counts == without
+
+
+# ----------------------------------------------------------------------------------------------
+# F71: Holm-adjusted p-values next to the raw ones, per family of tests
+# ----------------------------------------------------------------------------------------------
+
+def test_holm_adjust_is_the_step_down_procedure() -> None:
+    from vfe3.semantics.stats import holm_adjust
+
+    got = holm_adjust([0.01, 0.04, 0.03, None, float("nan"), 0.005])
+    # family of the m = 4 finite p: sorted 0.005, 0.01, 0.03, 0.04 -> 4p, 3p, 2p, 1p = 0.02, 0.03, 0.06, 0.04,
+    # then the running maximum 0.02, 0.03, 0.06, 0.06
+    assert got[3] is None and got[4] is None
+    np.testing.assert_allclose([got[0], got[1], got[2], got[5]], [0.03, 0.06, 0.06, 0.02], rtol=1e-12)
+    assert holm_adjust([0.6, 0.7]) == [1.0, 1.0] and holm_adjust([]) == []
+    assert holm_adjust([0.2]) == [0.2]
+
+
+def test_phi_relation_transports_report_holm_adjusted_p(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.test_semantics_frames import _section_setup
+    from vfe3.semantics import frames as F
+    from vfe3.semantics.stats import holm_adjust
+
+    monkeypatch.setattr(F, "apply_style", lambda: None)
+    run, ctx = _section_setup(tmp_path)
+    ctx.relations["half"] = [(i, i + 12) for i in range(6)]
+    res = F.run_phi_section(run, ctx)
+    rel = res.metrics["relation_transports"]
+    ok = [k for k, v in rel.items() if v["status"] == "ok"]
+    assert ok == ["planted", "half"]
+    want = holm_adjust([rel[k]["p"] for k in ok])
+    assert [rel[k]["p_holm"] for k in ok] == pytest.approx(want)
+    key = "phi: relations with consistent transports (Holm-adjusted p < 0.01 over the 2 relations)"
+    assert res.headline[key] == f"{sum(p < 0.01 for p in want)} / 2"
+    # frame_null = 50: the smallest attainable Holm-adjusted p is 2/51 > 0.01, which the report says
+    assert any("2/(1 + 50)" in n for n in res.notes)
+    assert "p (Holm)" in res.tables["relation_transports"]
+
+
+def test_offsets_and_directions_carry_holm_adjusted_p() -> None:
+    from scipy.stats import norm
+
+    from vfe3.semantics import vectors
+    from vfe3.semantics.common import VectorView
+    from vfe3.semantics.stats import holm_adjust
+
+    rng = np.random.default_rng(16)
+    n, D = 80, 12
+    X = rng.standard_normal((n, D))
+    delta = 3.0 * rng.standard_normal(D)
+    for i in range(10):
+        X[30 + i] = X[i] + delta + 0.05 * rng.standard_normal(D)
+    view = VectorView("e", "e", np.arange(n), X)
+    relations = {"planted": [(i, 30 + i) for i in range(10)],
+                 "random": [(int(a), int(b)) for a, b in rng.choice(np.arange(40, 60), size=(8, 2), replace=False)],
+                 "other": [(int(a), int(b)) for a, b in rng.choice(np.arange(60, 80), size=(8, 2), replace=False)],
+                 "tiny": [(0, 1), (2, 3)]}
+    off = vectors.offset_consistency(view, relations, np.random.default_rng(1), n_perm=100)
+    names = list(off["relations"])
+    want = holm_adjust([off["relations"][k]["p"] for k in names])
+    assert [off["relations"][k]["p_holm"] for k in names] == pytest.approx(want)
+
+    out = vectors.concept_direction_cosines(view, relations, whiten=False, rng=np.random.default_rng(7), n_null=50)
+    R = len(out["relations"])
+    iu = np.triu_indices(R, k=1)
+    p_normal = 2.0 * norm.sf(np.abs(out["z"][iu]))
+    np.testing.assert_allclose(out["p_normal"][iu], p_normal, rtol=1e-12)
+    np.testing.assert_allclose(out["p_holm"][iu], holm_adjust(list(p_normal)), rtol=1e-12)
+    np.testing.assert_array_equal(out["p_holm"], out["p_holm"].T)
+    assert out["n_significant_pairs_holm"] == int((np.asarray(holm_adjust(list(p_normal))) < 0.05).sum())
+    assert out["n_significant_pairs_holm"] <= out["n_significant_pairs"]
+
+
+def test_offset_heatmap_fills_only_holm_significant_cells(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    from vfe3.semantics import vectors
+
+    def rec(p: float) -> dict:
+        return {"ocs": 0.5, "null_mean": 0.1, "effect_size": 0.4, "p": p}
+
+    # one view, four relations: raw p < 0.05 for three; Holm keeps 0.001 * 4 and 0.01 * 3 below 0.05 only
+    results = {"v": {"offsets": {"relations": {"a": rec(0.001), "b": rec(0.01), "c": rec(0.04), "d": rec(0.5)}}}}
+    ctx = SimpleNamespace(options={})
+    fig = vectors._compare_offsets(results, {"v": SimpleNamespace(label="v")}, ctx, ["v"])
+    ax = fig.axes[0]
+    marks = {line.get_label(): len(line.get_xdata()) for line in ax.lines}
+    assert marks == {"holm": 2, "raw": 1}
+
+
+def test_gaussian_similarity_reports_holm_over_the_scorers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.test_semantics_gaussians import _FakeRun, _context as sigma_context
+    from vfe3.semantics import gaussians as G
+    from vfe3.semantics.stats import holm_adjust
+
+    monkeypatch.setattr(G, "apply_style", lambda: None)
+    monkeypatch.setattr(G, "_bank_outputs", lambda *args, **kwargs: None)
+    run = _FakeRun(frames_active=False, seed=2)
+    result = G.run_sigma_section(run, sigma_context(run, tmp_path))
+    per = result.metrics["banks"]["prior"]["similarity"]["simlex999"]["scorers"]
+    for field in ("delta_vs_cos_mu", "delta_vs_euclid_mu"):
+        keys = [k for k, _ in G._SCORERS if field in per[k]]
+        want = holm_adjust([per[k][field]["p"] for k in keys])
+        assert [per[k][field]["p_holm"] for k in keys] == pytest.approx(want), field

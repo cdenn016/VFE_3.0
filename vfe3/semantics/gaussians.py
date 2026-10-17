@@ -49,6 +49,7 @@ from vfe3.semantics.common import (
     save_figure,
     write_table,
 )
+from vfe3.semantics.stats import holm_adjust
 
 
 _SECTION = "sigma"
@@ -710,7 +711,9 @@ def _similarity(ctx: AnalysisContext, row_of: Dict[int, int], mu: np.ndarray, mu
     Identical-word pairs (e.g. WordSim's "tiger tiger") are dropped, as in the vector battery, so
     both score the same pairs. The headline scorer is pre-registered (:data:`_HEADLINE_SCORER`,
     the symmetric :math:`-J`); ``best_gaussian`` is the post-hoc maximum over the Sigma-using
-    scorers and is labeled as not adjusted for selection.
+    scorers and is labeled as not adjusted for selection. Each paired comparison also carries
+    ``p_holm``, its bootstrap ``p`` Holm-adjusted over the scorers of that comparison on the same
+    benchmark (:func:`vfe3.semantics.stats.holm_adjust`).
     """
     out: Dict[str, Any] = {}
     for bench, triples in ctx.similarity.items():
@@ -736,6 +739,10 @@ def _similarity(ctx: AnalysisContext, row_of: Dict[int, int], mu: np.ndarray, mu
                 entry["delta_vs_euclid_mu"] = _paired_spearman_delta(
                     scores[key], scores["neg_euclid_mu"], human, rng=rng)
             per[key] = entry
+        for field in ("delta_vs_cos_mu", "delta_vs_euclid_mu"):         # one family per comparison and benchmark
+            keys = [k for k, _ in _SCORERS if field in per[k]]
+            for k, p_holm in zip(keys, holm_adjust([per[k][field]["p"] for k in keys])):
+                per[k][field]["p_holm"] = p_holm
         gaussian = [k for k, _ in _SCORERS if k not in _REFERENCE_SCORERS
                     and per[k].get("rho") is not None and np.isfinite(per[k]["rho"])]
         best = max(gaussian, key=lambda k: per[k]["rho"]) if gaussian else None
@@ -1057,6 +1064,8 @@ def _plot_similarity(ctx: AnalysisContext, sim: Dict[str, Any], title: str,
         per = sim[bench]["scorers"]
         keys = [k for k, _ in _SCORERS]
         y = np.arange(len(keys))[::-1]
+        # Holm over the panel's scorers, recomputed from the bootstrap p (equal to the stored p_holm)
+        p_holm = dict(zip(keys, holm_adjust([per[k].get("delta_vs_cos_mu", {}).get("p") for k in keys])))
         for yi, key in zip(y, keys):
             e = per[key]
             rho = e.get("rho")
@@ -1064,10 +1073,12 @@ def _plot_similarity(ctx: AnalysisContext, sim: Dict[str, Any], title: str,
                 continue
             d = e.get("delta_vs_cos_mu", {})
             sig = (d.get("ci_lo") is not None and (d["ci_lo"] > 0 or d["ci_hi"] < 0))
+            holm = sig and p_holm[key] is not None and p_holm[key] < 0.05
             color = OKABE_ITO[7] if key in _REFERENCE_SCORERS else OKABE_ITO[0]
             # a percentile bootstrap interval need not contain the point estimate; clip the bars
             ax.errorbar(rho, yi, xerr=[[max(rho - e["ci_lo"], 0.0)], [max(e["ci_hi"] - rho, 0.0)]], fmt="o",
                         color=color, mfc=color if (sig or key == "cos_mu") else "white", ms=4,
+                        fillstyle="full" if (holm or key == "cos_mu" or not sig) else "left",
                         capsize=2)
         if per["cos_mu"].get("rho") is not None and np.isfinite(per["cos_mu"]["rho"]):
             ax.axvline(per["cos_mu"]["rho"], color="0.5", ls="--", lw=0.8)
@@ -1079,8 +1090,9 @@ def _plot_similarity(ctx: AnalysisContext, sim: Dict[str, Any], title: str,
         ax.set_xlabel("Spearman ρ with human ratings")
         ax.set_title(f"{bench} (n = {sim[bench]['n']})", fontsize=8)
         panel_label(ax, "abcdefgh"[j])
-    fig.suptitle(title + "\n(filled: paired Δρ vs cos(μ) CI excludes 0; bold: pre-registered "
-                 "headline scorer)", fontsize=8)
+    fig.suptitle(title + "\n(filled: paired Δρ vs cos(μ) CI excludes 0 and Holm-adjusted p < 0.05 over the "
+                 "panel's scorers; half-filled: unadjusted only; bold: pre-registered headline scorer)",
+                 fontsize=8)
     fig.tight_layout()
     return save_figure(fig, ctx, _SECTION, name)
 
@@ -1140,11 +1152,13 @@ def _similarity_table(sim: Dict[str, Any]) -> str:
             rows.append({"benchmark": bench, "scorer": label, "role": role, "n": e.get("n"),
                          "rho": e.get("rho"), "ci_lo": e.get("ci_lo"), "ci_hi": e.get("ci_hi"),
                          "Δρ vs cos(μ)": d.get("delta"), "Δ ci_lo": d.get("ci_lo"),
-                         "Δ ci_hi": d.get("ci_hi"), "Δρ vs −‖Δμ‖": de.get("delta"),
-                         "Δ' ci_lo": de.get("ci_lo"), "Δ' ci_hi": de.get("ci_hi")})
+                         "Δ ci_hi": d.get("ci_hi"), "Δ p (Holm)": d.get("p_holm"),
+                         "Δρ vs −‖Δμ‖": de.get("delta"),
+                         "Δ' ci_lo": de.get("ci_lo"), "Δ' ci_hi": de.get("ci_hi"),
+                         "Δ' p (Holm)": de.get("p_holm")})
     return markdown_table(rows, columns=["benchmark", "scorer", "role", "n", "rho", "ci_lo", "ci_hi",
-                                         "Δρ vs cos(μ)", "Δ ci_lo", "Δ ci_hi", "Δρ vs −‖Δμ‖",
-                                         "Δ' ci_lo", "Δ' ci_hi"])
+                                         "Δρ vs cos(μ)", "Δ ci_lo", "Δ ci_hi", "Δ p (Holm)", "Δρ vs −‖Δμ‖",
+                                         "Δ' ci_lo", "Δ' ci_hi", "Δ' p (Holm)"])
 
 
 # ----------------------------------------------------------------------------------------------

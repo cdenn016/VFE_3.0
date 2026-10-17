@@ -50,6 +50,7 @@ from vfe3.semantics.common import (
     save_figure,
     write_table,
 )
+from vfe3.semantics.stats import holm_adjust
 
 Tensor = torch.Tensor
 
@@ -76,6 +77,7 @@ PHI_DEFAULTS: Dict[str, Any] = {
 # vectors._STEP_STREAM; audit 2026-10-16 F73). Ids are nonzero: trailing zero words do not change a
 # SeedSequence pool, so [seed, _PHI_STREAM, 0] would collide with [seed, _PHI_STREAM].
 _PHI_STREAM = 0x70E1
+_TRANSPORT_ALPHA = 0.01      # relation transports: consistent when the permutation p (and Holm-adjusted p) < this
 _PHI_STEP_STREAM: Dict[str, int] = {"positional": 1, "commutators_raw": 2, "commutators_canonical": 3,
                                     "group_analogies_benchmark": 4, "relation_transports": 5}
 
@@ -1649,6 +1651,7 @@ def _relation_table(rel: Dict[str, Any]) -> str:
                      "consistency": v["consistency"] if ok else None,
                      "null mean": v["null_mean"] if ok else None, "null sd": v["null_std"] if ok else None,
                      "z": v["z"] if ok else None, "p": v["p"] if ok else None,
+                     "p (Holm)": v.get("p_holm") if ok else None,
                      "mean ||log T||_F": v["log_norm_mean"] if ok else None})
     return markdown_table(rows)
 
@@ -1787,6 +1790,19 @@ def run_phi_section(run: Any, ctx: AnalysisContext) -> SectionResult:
     rel = ((step("relation_transports", lambda: relation_transports(cf, ctx.relations, rng("relation_transports"),
                                                                     int(_opt(ctx, "frame_null"))))
             if cf is not None and ctx.relations else None) or {})
+    tested = [k for k, v in rel.items() if v.get("status") == "ok" and v.get("p") is not None]
+    if tested:
+        # One family: every relation whose transports were tested (audit 2026-10-16 F71).
+        for k, p_holm in zip(tested, holm_adjust([rel[k]["p"] for k in tested])):
+            rel[k]["p_holm"] = p_holm
+        n_null = int(_opt(ctx, "frame_null"))
+        floor = len(tested) / (1.0 + n_null)
+        res.notes.append(
+            f"Relation-transport p-values are Holm-adjusted over the {len(tested)} tested relations (p_holm; "
+            "family-wise error under any dependence between relations that share words)."
+            + (f" With {n_null} null draws the smallest attainable adjusted p is {len(tested)}/(1 + {n_null}) = "
+               f"{floor:.3g} >= {_TRANSPORT_ALPHA:g}, so no relation can pass the adjusted test at this budget "
+               "(frame_null)." if floor >= _TRANSPORT_ALPHA else ""))
 
     n_perm = int(_opt(ctx, "frame_positional_null"))
     pos = step("positional_frames",
@@ -1893,8 +1909,12 @@ def run_phi_section(run: Any, ctx: AnalysisContext) -> SectionResult:
             f"{q['rank_chart']} / {_rerank_rank_text(q, ga_cur['rerank_pool'])}")
     ok_rel = [v for v in rel.values() if v.get("status") == "ok"]
     if ok_rel:
-        head["phi: relations with consistent transports (p < 0.01)"] = (
-            f"{sum(1 for v in ok_rel if v['p'] is not None and v['p'] < 0.01)} / {len(ok_rel)}")
+        head[f"phi: relations with consistent transports (p < {_TRANSPORT_ALPHA:g})"] = (
+            f"{sum(1 for v in ok_rel if v['p'] is not None and v['p'] < _TRANSPORT_ALPHA)} / {len(ok_rel)}")
+        holm = [v["p_holm"] for v in ok_rel if v.get("p_holm") is not None]
+        if holm:
+            head[f"phi: relations with consistent transports (Holm-adjusted p < {_TRANSPORT_ALPHA:g} over the "
+                 f"{len(holm)} relations)"] = f"{sum(1 for p in holm if p < _TRANSPORT_ALPHA)} / {len(holm)}"
     if pos is not None:
         key = "phi: positional R2 by offset / by absolute m (position-permutation null mean, q95, p)"
         null = pos["null"] or {}
