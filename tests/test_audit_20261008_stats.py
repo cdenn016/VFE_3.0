@@ -290,7 +290,7 @@ def test_per_seed_data_order_panel_aggregates_with_nonshared_status(tmp_path):
         (d / "provenance.json").write_text(json.dumps(prov))
     design = ms._requested_seed_design(tmp_path)
     assert design["complete"] is True
-    assert design["data_order"]["status"] == "nonshared_or_mixed"
+    assert design["data_order"]["status"] == "distinct"              # audit 2026-10-16 F62
     assert ms.aggregate_scalar(tmp_path, "test_ppl")["n"] == 3
 
 

@@ -32,7 +32,7 @@ import re
 import typing
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 
 from vfe3.process_utils import run_isolated_python
@@ -479,9 +479,9 @@ def _request_manifest(root: Path, observed: List[int]) -> Dict[str, Any]:
 
 
 _CODE_IDENTITY_KEYS = ("git_sha", "git_dirty", "git_dirty_fingerprint")
-# The data-order seed is reported through ``_data_order_status`` and the noise-band caption; it is
-# not a comparability key, so a per-seed data order (``DATA_SEED=None``, data_seed == seed) still
-# aggregates, with the 'nonshared_or_mixed' status recorded.
+# The data-order seed is reported through ``_data_order_status``, the digest and the noise-band caption;
+# it is not a comparability key, so a per-seed data order (``DATA_SEED=None``, data_seed == seed) still
+# aggregates, with the 'distinct' status recorded.
 _DATA_ORDER_KEYS = ("data_seed",)
 
 
@@ -562,9 +562,10 @@ def _requested_seed_design(
         )
         for contract in provenance_contracts.values()
     }
-    data_order = _data_order_status([
-        contract.get("data_seed") for contract in provenance_contracts.values()
-    ])
+    data_order = _data_order_status(
+        [contract.get("data_seed") for contract in provenance_contracts.values()],
+        seeds=list(provenance_contracts),
+    )
     provenance_verified = (
         bool(cells)
         and len(provenance_contracts) == len(cells)
@@ -1008,13 +1009,46 @@ PER_LAYER_METRICS: List[str] = [                                  # per-layer ba
     "self_divergence", "total", "canonical_beta_tv", "canonical_total_delta",   # diagnose_canonical_free_energy
 ]
 
-def _data_order_status(data_seeds: Iterable[object]) -> Dict[str, object]:
+def _data_order_status(
+    data_seeds: Iterable[object],
+
+    *,
+    seeds: Optional[Sequence[int]] = None,
+) -> Dict[str, object]:
+    r"""Whether the accepted seeds shared one training data order, with the sentence the digest prints.
+
+    ``status`` is ``"shared_explicit"`` (every seed records one explicit common data seed: the across-seed
+    SD and the noise floor measure initialization and optimization only and are a lower bound on the
+    variance over data orders), ``"distinct"`` (no two seeds share an explicit data seed), ``"partially_shared"``
+    (some seeds share one and others do not), ``"nonshared_unspecified"`` (no seed records one) or
+    ``"no_seeds"``. A seed without an explicit data seed (``data_seed=None``) has a nonshared, unspecified
+    order, never a shared shuffle stream. ``seeds`` (the model seeds, in the order of ``data_seeds``) adds
+    the ``per_seed`` mapping.
+    """
     values = list(data_seeds)
-    if values and all(type(value) is int for value in values) and len(set(values)) == 1:
-        return {"status": "shared_explicit", "shared": True, "data_seed": values[0]}
-    if values and all(value is None for value in values):
-        return {"status": "nonshared_unspecified", "shared": False, "data_seed": None}
-    return {"status": "nonshared_or_mixed", "shared": False, "data_seed": None}
+    explicit = [value for value in values if type(value) is int]
+    listed = ", ".join("none" if value is None else str(value) for value in values)
+    out: Dict[str, object] = {"shared": False, "data_seed": None}
+    if seeds is not None:
+        out["per_seed"] = {str(seed): value for seed, value in zip(seeds, values)}
+    if not values:
+        return {**out, "status": "no_seeds", "caveat": "No accepted seed records its data order."}
+    if len(explicit) == len(values) and len(set(values)) == 1:
+        return {**out, "status": "shared_explicit", "shared": True, "data_seed": values[0],
+                "caveat": (f"All {len(values)} seeds share one training data order (data seed {values[0]}): "
+                           "the across-seed SD and the single-seed noise floor measure initialization and "
+                           "optimization only and are a lower bound on the variance over data orders.")}
+    if not explicit:
+        return {**out, "status": "nonshared_unspecified",
+                "caveat": ("No seed records an explicit data seed (data_seed=None: a nonshared, unspecified "
+                           "order), so the across-seed SD includes data-order variance.")}
+    if len(set(explicit)) == len(explicit):
+        return {**out, "status": "distinct",
+                "caveat": (f"No two seeds share a training data order (data seeds {listed}), so the "
+                           "across-seed SD includes data-order variance.")}
+    return {**out, "status": "partially_shared",
+            "caveat": (f"Some seeds share a training data order and others do not (data seeds {listed}), so "
+                       "the across-seed SD mixes seeds with and without data-order variance.")}
 
 
 CAVEAT = ("Data-order sharing is reported only for one explicit common data_seed; data_seed=None "
@@ -1078,9 +1112,12 @@ def _write_csv(path: Path, scalars: Dict[str, Any]) -> None:
 
 
 def _write_md(path: Path, root: Path, seeds, scalars, per_layer, *,
-              code_identity: Optional[Mapping[str, Any]] = None) -> None:
+              code_identity: Optional[Mapping[str, Any]] = None,
+              data_order: Optional[Mapping[str, Any]] = None) -> None:
     L: List[str] = [f"# Multi-seed digest: {root.name}", "",
                     f"Across {len(seeds)} seeds: {seeds}.", ""]
+    if data_order is not None:
+        L += [f"Seed data order: `{data_order.get('status')}`. {data_order.get('caveat', '')}".rstrip(), ""]
     if code_identity is not None and code_identity.get("mixed"):
         L += [f"**Mixed code identity:** {code_identity['n_distinct']} distinct git_sha / "
               "dirty-tree fingerprints across seeds, accepted by `allow_mixed_code_identity=True`. "
@@ -1271,7 +1308,9 @@ def main() -> int:
     if code_identity["mixed"] and code_identity["mixed_allowed"]:
         print(f"WARNING: {code_identity['n_distinct']} distinct code identities accepted "
               f"(allow_mixed_code_identity=True); the across-seed SD includes any code effect")
-    print(f"\nNOTE: {CAVEAT}\n")
+    data_order = request_design["data_order"]
+    print(f"\nseed data order: {data_order['status']}. {data_order.get('caveat', '')}")
+    print(f"NOTE: {CAVEAT}\n")
 
     accepted_config_dirs = [
         Path(cell["run_dir"])
@@ -1332,7 +1371,7 @@ def main() -> int:
     _write_json_atomic(root / "multiseed_summary.json", _json_clean(manifest))
     _write_csv(root / "multiseed_summary.csv", scalars)
     _write_md(root / "MULTISEED_ANALYSIS.md", root, seeds, scalars, per_layer,
-              code_identity=request_design["code_identity"])
+              code_identity=request_design["code_identity"], data_order=request_design["data_order"])
     for name in ("multiseed_summary.json", "multiseed_summary.csv", "MULTISEED_ANALYSIS.md"):
         print(f"  data    -> {root / name}")
 
