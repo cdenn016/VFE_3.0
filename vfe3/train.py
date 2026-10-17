@@ -2459,6 +2459,40 @@ def _sigma_log_statistics(
     return {"sigma_log_mean": float(mean), "sigma_log_sd": float(sd)}
 
 
+# Decode-table variance columns of every metrics row (audit 2026-10-16 F12); NaN under the linear readout.
+DECODE_VARIANCE_COLUMNS: Tuple[str, ...] = (
+    "decode_sigma_v_min", "decode_sigma_log_mean", "decode_sigma_log_sd")
+
+
+@torch.no_grad()
+def _decode_variance_statistics(
+    model: torch.nn.Module,
+) -> Dict[str, float]:
+    r"""The variance margin of the table the prior-bank decoder scores against.
+
+    ``decode_sigma_v_min`` is :meth:`PriorBank.decode_sigma_v_min`,
+    :math:`\min_{v,k}\max(e^{\ell_{vk}}, \varepsilon)` over the decode log-variance table :math:`\ell`
+    (``decode_sigma_log_embed`` when the bank is untied, else ``sigma_log_embed``), the number that sets
+    how many digits the fp32 ``a_v`` reduction loses (``decode_av_precision``). The mean and standard
+    deviation of :math:`\ell` (``correction=0``) sit beside it: on an untied bank ``sigma_log_mean`` and
+    ``sigma_log_sd`` read the encoder table only, which does not see the decode table's lower tail.
+    NaN under ``decode_mode='linear'``, whose readout reads no variance table.
+    """
+    nan = {column: float("nan") for column in DECODE_VARIANCE_COLUMNS}
+    bank = getattr(model, "prior_bank", None)
+    if bank is None or getattr(bank, "decode_mode", "linear") == "linear":
+        return nan
+    table = bank._decode_sigma_log_table()                                # (V, K) decode log-variances
+    if not isinstance(table, torch.Tensor) or table.numel() == 0:
+        return nan
+    values = table.detach()
+    if not values.is_floating_point() or values.element_size() < 4:
+        values = values.float()
+    sd, mean = torch.std_mean(values, correction=0)
+    return {"decode_sigma_v_min": float(bank.decode_sigma_v_min()),
+            "decode_sigma_log_mean": float(mean), "decode_sigma_log_sd": float(sd)}
+
+
 SIGMA_LOG_CHUNK_TYPES: int = 4096          # vocabulary rows per block_cholesky covariance chunk
 
 
@@ -5301,6 +5335,12 @@ def train(
             except Exception as exc:
                 _record_diagnostic_failure(diagnostics_failures, "sigma_log_statistics", exc, logger)
                 row.update({"sigma_log_mean": float("nan"), "sigma_log_sd": float("nan")})
+            # The decode table's variance margin (decode_av_precision's gauge; NaN under the linear readout).
+            try:
+                row.update(_decode_variance_statistics(model))
+            except Exception as exc:
+                _record_diagnostic_failure(diagnostics_failures, "decode_variance_statistics", exc, logger)
+                row.update({column: float("nan") for column in DECODE_VARIANCE_COLUMNS})
             # S1 panel D cumulative counters on every row (one host read of the device counter).
             try:
                 row.update(_cumulative_counter_columns(

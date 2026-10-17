@@ -1,10 +1,15 @@
-r"""Training-loop monitors of the 2026-10-16 deep audit, lane C1 (findings 4, 13, 51 and 110).
+r"""Training-loop monitors of the 2026-10-16 deep audit, lane C1 (findings 4, 12, 13, 51 and 110).
 
 F4: an optimizer that clears ``.grad`` inside ``step()`` (the table Fisher step on ``mu_embed`` and
 ``sigma_log_embed``; the manifold step on ``phi_embed`` and ``pos_phi_free`` under ``pullback_group``)
 hid those tables from the spike attribution and from the known-dead set of the parameter-motion check,
 both of which read ``p.grad`` after the step. ``train_step`` now keeps references to the gradients that
 reached ``optimizer.step`` in ``status_out["grads"]`` and both readers consult them.
+
+F12: the decode variance table had no training-time gauge (``decode_sigma_v_min``, which the
+``decode_av_precision`` comment says to watch, had no caller), and the logged ``sigma_log_*`` columns read the
+encoder table only. Every metrics row now carries ``decode_sigma_v_min`` and the decode table's log-variance
+mean and standard deviation, NaN under the linear readout.
 
 F13: under ``m_table_update_mode='fisher'`` the ``update_rms_per_lr_group_*`` columns divided the table
 step by the AdamW rate the config marks inert; they now divide by the realized Fisher step size
@@ -225,3 +230,66 @@ def test_parameter_report_lists_zero_gradient_parameters_beside_the_dead_ones() 
     plain = VFEModel(test_config())
     assert T.parameter_report(plain)["zero_grad_names"] == []
     assert "zero gradient at the init probe" not in T._banner(plain, plain.cfg, "synthetic", torch.device("cpu"), 1)
+
+
+# ------------------------------------------------------------------------------------------------ F12
+
+def _set_rows(table: torch.Tensor, rows: slice, value: float) -> None:
+    with torch.no_grad():
+        table[rows] = value
+
+
+def test_decode_variance_columns_read_the_table_the_decoder_scores_against() -> None:
+    from tests.profiles import live_config
+    from vfe3.model.model import VFEModel
+    # The launcher's untied prior-bank decode (its committed readout may be linear; the decode route is pinned here).
+    cfg = live_config(decode_mode="diagonal_chunked", untie_decode_bank=True)
+    torch.manual_seed(0)
+    model = VFEModel(cfg)
+    bank = model.prior_bank
+    before = T._sigma_log_statistics(model)
+    stats = T._decode_variance_statistics(model)
+    assert set(stats) == set(T.DECODE_VARIANCE_COLUMNS)
+    assert stats["decode_sigma_v_min"] == pytest.approx(bank.decode_sigma_v_min(), rel=1e-12)
+    # Shrinking half of the untied decode table moves the decode columns and leaves the encoder ones alone.
+    _set_rows(bank.decode_sigma_log_embed, slice(0, cfg.vocab_size // 2), math.log(1e-5))
+    after = T._decode_variance_statistics(model)
+    assert after["decode_sigma_v_min"] == pytest.approx(1e-5, rel=1e-5)
+    values = bank.decode_sigma_log_embed.detach().double()
+    assert after["decode_sigma_log_mean"] == pytest.approx(float(values.mean()), rel=1e-6)
+    assert after["decode_sigma_log_sd"] == pytest.approx(float(values.std(correction=0)), rel=1e-6)
+    assert T._sigma_log_statistics(model) == before
+
+
+def test_decode_variance_columns_on_a_tied_bank_and_under_the_linear_readout() -> None:
+    from tests.profiles import test_config
+    from vfe3.model.model import VFEModel
+    torch.manual_seed(0)
+    tied = VFEModel(test_config(decode_mode="diagonal_chunked", untie_decode_bank=False))
+    _set_rows(tied.prior_bank.sigma_log_embed, slice(0, 2), math.log(1e-3))
+    stats = T._decode_variance_statistics(tied)
+    assert stats["decode_sigma_v_min"] == pytest.approx(1e-3, rel=1e-5)
+    encoder = T._sigma_log_statistics(tied)
+    assert stats["decode_sigma_log_mean"] == pytest.approx(encoder["sigma_log_mean"], rel=1e-12)
+    assert stats["decode_sigma_log_sd"] == pytest.approx(encoder["sigma_log_sd"], rel=1e-12)
+    linear = VFEModel(test_config(decode_mode="linear"))
+    assert all(math.isnan(value) for value in T._decode_variance_statistics(linear).values())
+
+
+@pytest.mark.parametrize("decode_mode", ["diagonal_chunked", "linear"])
+def test_decode_variance_columns_reach_metrics_csv(tmp_path: Path, decode_mode: str) -> None:
+    cfg = _cfg(decode_mode=decode_mode, untie_decode_bank=decode_mode != "linear", max_steps=4)
+    model = _model(cfg)
+    artifacts = ra.RunArtifacts(tmp_path / "run", cfg, model, save_model_artifacts=False)
+    _train(model, cfg, _loaders(cfg), artifacts=artifacts, log_interval=2, n_steps=4)
+    rows = _rows(tmp_path / "run" / "metrics.csv")
+    assert [int(row["step"]) for row in rows] == [2, 4]
+    for row in rows:
+        for column in T.DECODE_VARIANCE_COLUMNS:
+            if decode_mode == "linear":
+                assert row[column] == "", column
+            else:
+                assert math.isfinite(float(row[column])), column
+        if decode_mode != "linear":
+            assert float(row["decode_sigma_v_min"]) > 0.0
+    assert artifacts.diagnostics_failures == {}
