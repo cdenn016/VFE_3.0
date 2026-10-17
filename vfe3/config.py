@@ -655,6 +655,10 @@ class VFE3Config:
     #                of the LayerNorm output at every Sigma/s^2, where 'pushforward' (the delta method at s, capped at
     #                the sphere bound) keeps the delta method's radial shape (audit 2026-10-16 F3, F2)
     block_norm_covariance:            str             = "passthrough"
+    # Scale the LayerNorm covariance pushforward (both pushforward modes, and the delta_full composite's norm stage)
+    # by min(1, K max(gamma^2) / tr) at the sphere bound (audit 2026-10-12 item 1). False skips the cap: the
+    # uncapped delta method, which can exceed the bound by orders of magnitude once Sigma is large against s^2.
+    block_norm_trace_cap:             bool            = True
 
     # "local" | "reference"
     #   local      the block norm and block MLP act on mu_i
@@ -1848,6 +1852,8 @@ class VFE3Config:
                              "full-covariance layout (family='gaussian_full' or 'gaussian_block')")
         _require(self.block_norm_covariance, ("passthrough", "pushforward", "pushforward_moment"),
                  "block_norm_covariance")
+        if type(self.block_norm_trace_cap) is not bool:
+            raise ValueError(f"block_norm_trace_cap must be a bool, got {self.block_norm_trace_cap!r}")
         if self.block_norm_covariance in ("pushforward", "pushforward_moment") and self.norm_type_block == "layernorm":
             # The block norm pushes Sigma; in reference coordinates it acts on the dense C = U^-1 Sigma U^-T and
             # maps back as U C' U^T, which the full and head-block families keep (audit 2026-10-10 round 2, item 51).
@@ -2349,6 +2355,9 @@ class VFE3Config:
         norm_floor = () if norm_pushes and not mlp_delta_full else ("block_mlp_covariance_floor",)
         if norm_pushes and mlp_delta_full:
             mark(("block_norm_covariance",), "block_mlp_covariance='delta_full' already composes the norm Jacobian")
+        if not (self.norm_type_block == "layernorm" and (norm_pushes or mlp_delta_full)):
+            mark(("block_norm_trace_cap",), "only read by a LayerNorm covariance pushforward (block_norm_covariance "
+                 "'pushforward' or 'pushforward_moment', or block_mlp_covariance='delta_full')")
         if not self.use_block_mlp:
             mark(("block_mlp_mode", "block_mlp_covariance", *norm_floor,
                   "block_mlp_expansion", "block_mlp_activation", "block_mlp_dropout", "m_block_mlp_lr"),

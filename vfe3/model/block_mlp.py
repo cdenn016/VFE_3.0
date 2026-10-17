@@ -568,6 +568,7 @@ def block_norm_covariance_pushforward(
     head_dims:        Optional[Sequence[int]] = None, # full layout: keep only these head blocks (gaussian_block)
     *,
     mode:             str                     = "pushforward",   # a BLOCK_NORM_PUSHFORWARD_MODES value
+    trace_cap:        bool                    = True,            # block_norm_trace_cap; False returns it uncapped
 ) -> torch.Tensor:                                    # sigma's layout, at promote_types(dtype, float32)
     r"""The covariance through a LayerNorm seam at the pre-norm mean (``block_norm_covariance`` = ``mode``).
 
@@ -590,6 +591,8 @@ def block_norm_covariance_pushforward(
                          f"got {mode!r}")
     moment = mode == "pushforward_moment"
     pushed = _uncapped_block_norm_pushforward(norm, mu, sigma, covariance_floor, head_dims, effective_scale=moment)
+    if not trace_cap:
+        return pushed
     diagonal = _is_diagonal_layout(mu, sigma)
     eps, weight = _layernorm_arguments(norm)
     allowance = (_layernorm_moment_floor_trace(mu, sigma, eps=eps, covariance_floor=covariance_floor, weight=weight)

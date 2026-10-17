@@ -129,6 +129,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'm_per_type_hidden_bias_lr': None,
     'layernorm_affine': True,
     'block_norm_covariance': 'passthrough',
+    'block_norm_trace_cap': True,
     'm_layernorm_lr': None,
     'e_q_mu_lr': 0.5,
     'e_q_sigma_lr': 0.015,

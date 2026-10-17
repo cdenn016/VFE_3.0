@@ -1776,6 +1776,13 @@ CAP_ACTIVATION_FIELDS: Tuple[str, ...] = ("step", "layer", "head", "capped", "en
 # diagnostics/cap_clamped_rows.csv: per (layer, head), query rows (|S_i| >= 2) whose every source cost is
 # capped, the only case in which the clamp changes beta (audit 2026-10-08 critic-gapfill-2#3).
 CAP_CLAMPED_ROW_FIELDS: Tuple[str, ...] = ("step", "layer", "head", "clamped_rows", "rows")
+# diagnostics/block_variance.csv: per layer and stage, quantiles over the diagnostic windows of the local variances
+# diag(Sigma_i) and the median per-token mean rms s_i = ||mu_i|| / sqrt(K). Stages: "pre_norm" (the converged belief
+# entering the block norm), "post_norm" (after the norm, the block MLP's input) and "block_out" (the layer output).
+BLOCK_VARIANCE_FIELDS: Tuple[str, ...] = (
+    "step", "layer", "stage", "var_min", "var_q001", "var_q01", "var_median", "var_max", "mean_rms_median")
+_BLOCK_VARIANCE_STAGES: Tuple[Tuple[str, str], ...] = (
+    ("pre_norm", "layer_converged"), ("post_norm", "layer_block_mlp_inputs"), ("block_out", "layer_outputs"))
 _EVAL_CADENCE_COLUMNS: Tuple[str, ...] = _TRAIN_SAMPLE_COLUMNS + NUMERICS_EVAL_COLUMNS
 
 
@@ -2710,8 +2717,13 @@ def _residual_and_attention_rows(
     counters_out: Optional[Dict[str, Any]] = None,
     holonomy_out: Optional[Dict[Any, Any]] = None,
     features_out: Optional[Dict[str, Any]] = None,
+    variance_out: Optional[Dict[Tuple[int, str], List[Any]]] = None,
 ) -> Tuple[List[Dict[str, float]], List[Dict[str, float]]]:
     r"""Per-layer residual-ratio quantiles and per-head attention statistics on fixed windows.
+
+    ``variance_out``: when a dict is given, per (layer, stage) of :data:`_BLOCK_VARIANCE_STAGES` the local variances
+    :math:`\mathrm{diag}(\Sigma_i)` and per-token mean rms values of the same captures are collected into it, for
+    :func:`_block_variance_rows`.
 
     ``features_out``: when a dict is given, the minimal-agent captures are summed per (layer, head) under
     ``"minimal_agent"`` and, for ``prototype_agents`` block MLPs, the template weights and removed variance of the
@@ -2777,6 +2789,16 @@ def _residual_and_attention_rows(
                 except Exception as exc:                  # noqa: BLE001 - reported by the caller
                     counters_out["error"] = exc
             n_layers = len(diagnostic["layer_converged"])
+            if variance_out is not None:
+                for stage, key in _BLOCK_VARIANCE_STAGES:
+                    for layer, belief in enumerate(diagnostic.get(key) or ()):
+                        sigma = belief.sigma.float()
+                        variances = sigma if sigma.dim() == belief.mu.dim() else torch.diagonal(
+                            sigma, dim1=-2, dim2=-1)                             # (B, N, K) diag Sigma_i
+                        rms = belief.mu.float().square().mean(dim=-1).sqrt()     # (B, N) s_i
+                        slot = variance_out.setdefault((layer, stage), [[], []])
+                        slot[0].append(variances.reshape(-1).cpu())
+                        slot[1].append(rms.reshape(-1).cpu())
             for layer in range(n_layers):
                 source = (diagnostic["initial_belief"] if layer == 0
                           else diagnostic["layer_outputs"][layer - 1])
@@ -2873,6 +2895,31 @@ def _residual_and_attention_rows(
             "n_rows": int(count),
         })
     return residual_rows, attention_rows
+
+
+def _block_variance_rows(
+    variance_out: Mapping[Tuple[int, str], List[Any]],   # filled by _residual_and_attention_rows
+    step:         int,
+) -> List[Dict[str, Any]]:
+    r"""``diagnostics/block_variance.csv`` rows (:data:`BLOCK_VARIANCE_FIELDS`), one per (layer, stage)."""
+    order = {stage: index for index, (stage, _) in enumerate(_BLOCK_VARIANCE_STAGES)}
+    rows: List[Dict[str, Any]] = []
+    for (layer, stage) in sorted(variance_out, key=lambda key: (key[0], order[key[1]])):
+        variances = torch.cat(variance_out[(layer, stage)][0]).double()
+        rms = torch.cat(variance_out[(layer, stage)][1]).double()
+        variances = variances[torch.isfinite(variances)]
+        if variances.numel() > 2 ** 24:                               # torch.quantile's input limit
+            variances = variances[torch.randperm(variances.numel())[:2 ** 24]]
+        quantiles = (torch.quantile(variances, torch.tensor([0.001, 0.01, 0.5], dtype=torch.float64)).tolist()
+                     if variances.numel() else [float("nan")] * 3)
+        rows.append({
+            "step": int(step), "layer": int(layer), "stage": stage,
+            "var_min": float(variances.min()) if variances.numel() else float("nan"),
+            "var_q001": quantiles[0], "var_q01": quantiles[1], "var_median": quantiles[2],
+            "var_max": float(variances.max()) if variances.numel() else float("nan"),
+            "mean_rms_median": float(rms[torch.isfinite(rms)].median()) if rms.numel() else float("nan"),
+        })
+    return rows
 
 
 def _collapsed_head_count(
@@ -3104,14 +3151,21 @@ def _eval_cadence_diagnostics(
             counters: Optional[Dict[str, Any]] = {} if count_numerics else None
             holonomy: Optional[Dict[Any, Any]] = {}
             features: Optional[Dict[str, Any]] = {}
+            variances: Optional[Dict[Tuple[int, str], List[Any]]] = {}
             try:
                 residual_rows, attention_rows = _residual_and_attention_rows(
                     model, windows, step, device, counters_out=counters, holonomy_out=holonomy,
-                    features_out=features)
+                    features_out=features, variance_out=variances)
             except Exception as exc:
                 _record_diagnostic_failure(failures, "residual_attention", exc, logger)
                 residual_rows = attention_rows = None
-                counters = holonomy = features = None   # their capture pass failed; counted once above
+                counters = holonomy = features = variances = None   # their capture pass failed; counted once above
+            if variances:
+                try:
+                    artifacts.append_diagnostic_rows(
+                        "block_variance.csv", BLOCK_VARIANCE_FIELDS, _block_variance_rows(variances, step))
+                except Exception as exc:
+                    _record_diagnostic_failure(failures, "block_variance", exc, logger)
             if features:
                 try:
                     head_rows, template_rows = _feature_rows(model, features, step)
