@@ -1710,6 +1710,67 @@ class VFEModel(nn.Module):
         return float(((score >= cap_level) & support).sum() / support.sum().clamp(min=1))
 
     @staticmethod
+    def _nonfinite_frac(
+        cap:           dict,                   # the layer's relational capture
+        score:         torch.Tensor,           # (B, H, N, N) captured routing cost
+        support:       torch.Tensor,           # (B, H, N, N) bool causal support
+        minimal_agent: bool,
+    ) -> float:
+        r"""Share of the causal support whose raw routing cost is NaN or :math:`\pm\infty` (audit 2026-10-16 F10).
+
+        ``safe_kl_clamp`` maps such a cost to ``kl_max``, so :meth:`_klmax_frac` counts it as capped; the kernel
+        readouts therefore capture the pre-clamp map ``score_nonfinite_pre``. The minimal agent's captured cost is
+        unclamped and is read directly. NaN when a kernel capture carries no map (not measured).
+        """
+        nonfinite = ~torch.isfinite(score) if minimal_agent else cap.get("score_nonfinite_pre")
+        if nonfinite is None:
+            return float("nan")
+        if nonfinite.dim() == 3:
+            nonfinite = nonfinite.unsqueeze(1)                                # (B, 1, N, N) single head
+        return float((nonfinite & support).sum().double() / support.sum().clamp(min=1).double())
+
+    def _routing_free_energy(
+        self,
+        snapshot:    DiagnosticSnapshot,
+        layer_index: int,
+        score:       torch.Tensor,             # (B, H, N, N) clamped routing cost as captured
+        support:     torch.Tensor,             # (B, H, N, N) bool causal support
+    ) -> float:
+        r"""Per-token label free energy of one layer's kernel router (audit 2026-10-16 F114).
+
+        .. math::
+            F^{\mathrm{route}}_i = \sum_h -\tau_h\log\sum_{j\in S_i}\pi^h_{ij}e^{-D^h_{ij}/\tau_h}
+            = \sum_h\min_{\beta^h_{i\cdot}}\Big[\sum_j\beta^h_{ij}D^h_{ij}
+              + \tau_h\sum_j\beta^h_{ij}\log\frac{\beta^h_{ij}}{\pi^h_{ij}}\Big],
+
+        with :math:`D` the clamped cost the router read (``score_energy_pre``; the row gaps under the ``row_min``
+        reference, so there the value omits each row's minimum cost), :math:`\pi = \operatorname{softmax}_j` of the
+        attention log-prior on the causal support :math:`S_i` and :math:`\tau_h` the temperature the router ran at
+        (:meth:`RelationalOperators.routing_temperature`: learned under ``learn_attention_temperature``, 1 under
+        ``noisy_key``). The minimizer is the model's router :math:`\beta`, and each head's term is :math:`\tau_h`
+        times the unit-temperature row free energy :math:`-\log Z^h_i` of the record joint (supplement,
+        Eq. rg_bridge_row). The value is the mean over the batch rows :math:`(b, i)` of the head sum; a row with
+        no admissible source contributes zero. Unlike :meth:`_canonical_free_energy_diagnostics`, which scores the
+        flat-alignment energies of :func:`vfe3.free_energy.canonical_routing_rows`, this reads the router's own
+        cost (comparison maps, :math:`P(G)` projection, ``kl_max`` clamp).
+        """
+        from vfe3.free_energy import attention_tau
+        device = score.device
+        tau = self.relational_operators_by_layer[layer_index].routing_temperature(
+            attention_tau(_as_coeff(self.cfg.kappa_beta, device), self.group.irrep_dims, device=device),
+            torch.float64)
+        tau_h = torch.as_tensor(tau, dtype=torch.float64, device=device).reshape(-1).expand(score.shape[-3])  # (H,)
+        bias = (torch.zeros((), dtype=torch.float64, device=device) if snapshot.log_prior is None
+                else snapshot.log_prior.double())
+        while bias.dim() < 4:
+            bias = bias.unsqueeze(0)                                           # (1|B, 1|H, N, N)
+        bias = torch.where(support, bias.expand_as(score), float("-inf"))       # (B, H, N, N)
+        logits = torch.log_softmax(bias, dim=-1) - score.double() / tau_h[:, None, None]   # log pi - D / tau_h
+        rows = -tau_h[:, None] * torch.logsumexp(logits, dim=-1)               # (B, H, N) -tau_h log Z_i^h
+        rows = torch.where(support.any(dim=-1), rows, torch.zeros_like(rows))  # empty rows (NaN above) give 0
+        return float(rows.sum(dim=1).mean())
+
+    @staticmethod
     def _router_head_statistics(
         score:     torch.Tensor,               # (B, H, N, N) clamped routing cost as captured
         beta:      torch.Tensor,               # (B, H, N, N) router
@@ -1978,10 +2039,15 @@ class VFEModel(nn.Module):
         ``relational_projected_cov_gram_min_eigenvalue`` and ``relational_input_cov_scale_ratio``
         (``_layer_min`` / ``_argmin_layer``), and the layer maximum
         ``relational_comparison_map_norm_spread_layer_max``. NaN layers are skipped; NaN when every layer is.
+
+        Failed router costs (audit 2026-10-16 F10): ``relational_score_nonfinite_frac_layer_max`` is the layer
+        maximum of :meth:`_nonfinite_frac`, the share of the causal support whose raw cost was non-finite before
+        the clamp mapped it to ``kl_max``. Beside ``relational_score_klmax_frac_layer_max`` it tells a layer
+        saturated by finite costs (zero here) from one whose costs failed.
         """
         from vfe3.posthoc.klcap import causal_support
         n_layers = self.cfg.n_layers
-        frac, condition, median, min_eigenvalue = [], [], [], []
+        frac, nonfinite, condition, median, min_eigenvalue = [], [], [], [], []
         scale: List[Dict[str, float]] = []
         unit_distance: List[Optional[torch.Tensor]] = []
         heads: Dict[str, List[torch.Tensor]] = {}
@@ -2000,12 +2066,14 @@ class VFEModel(nn.Module):
             if layer_index == n_layers - 1:
                 break
             frac.append(self._klmax_frac(score, support, cap_level))
+            nonfinite.append(self._nonfinite_frac(cap, score, support, minimal_agent))
             extremes = self._projected_cov_extremes(cap)
             min_eigenvalue.append(extremes[0])
             condition.append(extremes[1])
             scale.append(self._covariance_scale_statistics(snapshot, layer_index, cap))
             median.append(float(self._belief_spectrum(snapshot, layer_index)["condition"].median()))
         frac.append(last["relational_score_klmax_frac"])
+        nonfinite.append(last["relational_score_nonfinite_frac"])
         condition.append(last["relational_projected_cov_max_condition"])
         min_eigenvalue.append(last["relational_projected_cov_min_eigenvalue"])
         scale.append({key: last[key] for key in _COVARIANCE_SCALE_KEYS})
@@ -2029,6 +2097,7 @@ class VFEModel(nn.Module):
                 values, largest=False)
         extremes_out["relational_comparison_map_norm_spread_layer_max"] = layer_extreme(
             [row["relational_comparison_map_norm_spread"] for row in scale], largest=True)[0]
+        extremes_out["relational_score_nonfinite_frac_layer_max"] = layer_extreme(nonfinite, largest=True)[0]
 
         def head_max(key: str) -> Tuple[float, float, float]:
             r"""Maximum over (layer, head) and the first (layer, head) attaining it; NaN if all NaN."""
@@ -2247,7 +2316,12 @@ class VFEModel(nn.Module):
 
     def _relational_diagnostics(self, snapshot: DiagnosticSnapshot, layer_index: int = -1) -> dict:
         """Report the actual relational router and fixed-context cost; the legacy global-F fields are NaN
-        unless ``diagnose_canonical_free_energy`` (:meth:`_canonical_free_energy_diagnostics`)."""
+        unless ``diagnose_canonical_free_energy`` (:meth:`_canonical_free_energy_diagnostics`).
+
+        Beside the capped share ``relational_score_klmax_frac``, ``relational_score_nonfinite_frac`` is the share of
+        the causal support whose raw cost was non-finite before the clamp (:meth:`_nonfinite_frac`), and
+        ``relational_routing_free_energy`` the router's own per-token label free energy
+        (:meth:`_routing_free_energy`; NaN under the minimal agent) (audit 2026-10-16 F10, F114)."""
         cap = self._layer_capture(snapshot, layer_index)
         beta, score = cap["beta_pre"], cap["score_energy_pre"]
         ops = self.relational_operators_by_layer[layer_index]
@@ -2274,6 +2348,10 @@ class VFEModel(nn.Module):
             attn_entropy=float(entropy.mean()),
             attn_entropy_min=(float(entropy[scorable].min()) if scorable.any() else float("nan")),
             relational_score_klmax_frac=self._klmax_frac(score, support, cap_level),
+            # The capped share above includes failed (non-finite) costs; this column separates them.
+            relational_score_nonfinite_frac=self._nonfinite_frac(cap, score, support, minimal_agent),
+            relational_routing_free_energy=(float("nan") if minimal_agent
+                                            else self._routing_free_energy(snapshot, layer_index, score, support)),
         )
         if self.cfg.diagnose_canonical_free_energy:
             d.update(self._canonical_free_energy_diagnostics(snapshot, layer_index, beta, support))

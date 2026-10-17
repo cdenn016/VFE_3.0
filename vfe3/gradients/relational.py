@@ -293,6 +293,9 @@ def relational_predictive_readout(
     ``link_state`` (``{"previous": ..., "current": ...}``, threaded across layers by ``vfe_stack``).
     ``floor_anchor`` is the local prior covariance :math:`\Sigma_p` whose multiple :math:`f\,\Sigma_p` floors the
     returned covariance (:meth:`RelationalOperators.floor_term`); it is required with ``return_covariance``.
+    ``capture`` receives the router ``beta_pre``, the clamped cost ``score_energy_pre`` and the boolean map
+    ``score_nonfinite_pre`` of raw costs that were NaN or infinite before the clamp mapped them to ``kl_max``
+    (audit 2026-10-16 F10).
 
     Under ``predictive_readout='minimal_agent'`` the routing, the content and the residual are replaced by the
     exact Gaussian conditioning of :meth:`RelationalOperators.minimal_agent_update`, which reads the ROUTING frame
@@ -323,10 +326,13 @@ def relational_predictive_readout(
         # Under the row_min reference the clamp and softmax read only row gaps, so the query
         # log-determinant (a row constant of the Gaussian KL) needs no autograd.
         row_invariant = operators.kl_max_reference == "row_min"
+        raw_score = relational_score(mu_work, sigma_work, mu_work, sigma_work, frame, operators, capture,
+                                     **({"row_invariant": True} if row_invariant else {}))   # (..., H, N, N)
+        # The clamp maps NaN and +inf to kl_max, so a capped captured cost cannot tell a failed cost from a
+        # finite one at the cap; the capture keeps which raw costs were non-finite (audit 2026-10-16 F10).
+        score_nonfinite = None if capture is None else ~torch.isfinite(raw_score.detach())   # (..., H, N, N)
         score = clamped_routing_cost(
-            relational_score(mu_work, sigma_work, mu_work, sigma_work, frame, operators, capture,
-                             **({"row_invariant": True} if row_invariant else {})),
-            operators, kl_max=kl_max, log_prior=None if log_prior is None else log_prior.to(dtype))
+            raw_score, operators, kl_max=kl_max, log_prior=None if log_prior is None else log_prior.to(dtype))
         beta = attention_weights(score, tau=operators.routing_temperature(tau, dtype),
                                  log_prior=None if log_prior is None else log_prior.to(dtype))
         if getattr(operators, "content_link_edges", "off") != "off":
@@ -347,7 +353,7 @@ def relational_predictive_readout(
                                                              **shared).to(sigma.dtype)
                       if return_covariance else None)
     if capture is not None:
-        capture.update(beta_pre=beta.detach(), score_energy_pre=score.detach(),
+        capture.update(beta_pre=beta.detach(), score_energy_pre=score.detach(), score_nonfinite_pre=score_nonfinite,
                        relational_mean_displacement_norm=(result-mu).norm().detach())
         if edges is not None:
             capture.update(edge_diagnostic_capture(edges, beta))
