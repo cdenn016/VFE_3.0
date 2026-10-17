@@ -83,3 +83,34 @@ def test_every_ablation_declarative_name_is_declarative_for_the_package_identity
         assert ra._is_declarative_driver_statement(statement), name
 
 
+# ------------------------------------------------------------------------------------------------ F79
+
+def _train(cfg: Any, loader: Any, n_steps: int) -> List[float]:
+    torch.manual_seed(5)
+    model = VFEModel(cfg)
+    return T.train(model, loader, cfg, n_steps=n_steps, grad_clip=cfg.grad_clip, log_interval=0, eval_interval=0,
+                   device=CPU, logger=logging.getLogger("audit-c1-short-stream"), generate_samples=False)
+
+
+def test_train_refuses_a_stream_shorter_than_one_batch_per_epoch() -> None:
+    cfg = _cfg(batch_size=4)
+    seq_len = cfg.max_seq_len
+    # Per-epoch origins fit floor((T - L) / s) windows once T >= L + s, so one batch of B needs T >= L + B s.
+    minimum = seq_len + cfg.batch_size * seq_len
+    short = DataLoader(TokenWindows(torch.arange(minimum - 1) % cfg.vocab_size, seq_len),
+                       batch_size=cfg.batch_size, shuffle=False, drop_last=True)
+    with pytest.raises(ValueError, match=rf"at least {minimum} tokens"):
+        _train(cfg, short, n_steps=2)
+    enough = DataLoader(TokenWindows(torch.arange(minimum) % cfg.vocab_size, seq_len),
+                        batch_size=cfg.batch_size, shuffle=False, drop_last=True)
+    assert len(_train(cfg, enough, n_steps=2)) == 2
+
+
+def test_train_names_an_unsized_loader_that_cannot_be_cycled() -> None:
+    cfg = _cfg()
+    tokens = torch.arange(cfg.batch_size * cfg.max_seq_len).reshape(cfg.batch_size, cfg.max_seq_len) % cfg.vocab_size
+    one_shot = iter([(tokens, tokens.roll(-1, dims=1))])                   # no __len__, one batch, no restart
+    with pytest.raises(RuntimeError, match="yielded no batch"):
+        _train(cfg, one_shot, n_steps=3)
+
+

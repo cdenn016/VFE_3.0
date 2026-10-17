@@ -3695,6 +3695,35 @@ def _configure_train_window_offset(
     return dataset
 
 
+def _empty_training_epoch_message(
+    loader: object,
+) -> str:
+    r"""Describe a sized training loader that yields no batch per epoch, with the shortest stream that fills one.
+
+    With ``drop_last`` a loader over :math:`n` windows yields :math:`\lfloor n / B \rfloor` batches of :math:`B`.
+    For a :class:`~vfe3.data.datasets.TokenWindows` stream of :math:`T` tokens, window length :math:`L` and stride
+    :math:`s`, the per-epoch origins of training fit :math:`n = \lfloor (T - L) / s \rfloor` windows once
+    :math:`T \ge L + s` (one window below that), so a batch of :math:`B \ge 2` needs :math:`T \ge L + B s`; fixed
+    origins fit :math:`n = \lfloor (T - L - 1) / s \rfloor + 1` and need :math:`T \ge L + 1 + (B - 1) s`.
+    """
+    dataset = getattr(loader, "dataset", None)
+    batch_size = getattr(loader, "batch_size", None)
+    tokens = getattr(dataset, "tokens", None)
+    seq_len, stride = getattr(dataset, "seq_len", None), getattr(dataset, "stride", None)
+    message = "the training loader yields no batch per epoch (len(loader) == 0)"
+    if (not isinstance(tokens, torch.Tensor) or not isinstance(batch_size, int) or not isinstance(seq_len, int)
+            or not isinstance(stride, int)):
+        return message + "; give it at least one full batch"
+    if getattr(dataset, "window_offset_mode", "fixed") == "per_epoch_random":
+        minimum = seq_len + 1 if batch_size == 1 else seq_len + batch_size * stride
+    else:
+        minimum = seq_len + 1 + (batch_size - 1) * stride
+    return (f"{message}: {len(dataset)} training windows (seq_len={seq_len}, stride={stride}) of a "
+            f"{tokens.numel()}-token stream do not fill one batch of batch_size={batch_size} with drop_last; the "
+            f"stream needs at least {minimum} tokens. Raise the token cap (MAX_TOKENS / max_tokens) or lower "
+            "batch_size")
+
+
 def _training_cursor_fields(
     completed_step:  int,
     steps_per_epoch: int,
@@ -4491,10 +4520,14 @@ def train(
                         else None)                           # None: the global CPU RNG
     try:
         steps_per_epoch = int(len(loader))  # type: ignore[arg-type]
+        sized_loader = True
     except (TypeError, AttributeError):
-        steps_per_epoch = 0
+        steps_per_epoch, sized_loader = 0, False
     if steps_per_epoch < 0:
         raise ValueError(f"loader length must be nonnegative, got {steps_per_epoch}")
+    if sized_loader and steps_per_epoch == 0 and n_steps > 0:
+        # Every epoch would be empty: refuse before step 0 rather than die on a bare StopIteration.
+        raise ValueError(_empty_training_epoch_message(loader))
     periodic_checkpoint_requested = bool(
         artifacts is not None
         and cfg.checkpoint_interval > 0
@@ -4890,7 +4923,13 @@ def train(
             if offset_windows is not None:
                 offset_windows.draw_window_offset(offset_generator)
             it = iter(loader)
-            tokens, targets = next(it)
+            try:
+                tokens, targets = next(it)
+            except StopIteration:
+                raise RuntimeError(
+                    f"the training loader yielded no batch after it was re-iterated for step {step}: "
+                    "train() cycles its loader, so it needs a re-iterable loader (a DataLoader or a list "
+                    "of batches), not a one-shot iterator, and at least one batch per epoch") from None
         batches_consumed += 1
         tokens_seen += int(tokens.numel())                   # input-token presentations (metadata only)
         tokens = tokens.to(device, non_blocking=True)
