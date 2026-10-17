@@ -51,9 +51,57 @@ def test_live_forward_backward_is_finite() -> None:
     _, loss, _ = model(tokens, targets)
     assert torch.isfinite(loss)
     loss.backward()
-    grads = [p.grad for p in model.parameters() if p.grad is not None]
-    assert grads and all(bool(torch.isfinite(g).all()) for g in grads)
+    trainable = {name: p for name, p in model.named_parameters() if p.requires_grad}
+    # Every trainable parameter is reached by backward (audit 2026-10-16 F111): a dead table or a severed
+    # detach leaves its gradient None.
+    assert trainable and [name for name, p in trainable.items() if p.grad is None] == []
+    grads = [p.grad for p in trainable.values()]
+    assert all(bool(torch.isfinite(g).all()) for g in grads)
     assert any(bool((g != 0).any()) for g in grads)
+
+
+def test_live_backward_matches_float64_central_differences() -> None:
+    r"""Each trainable parameter's gradient on the live route matches a float64 central difference (audit
+    2026-10-16 F111).
+
+    For one random direction :math:`d_p` per parameter :math:`p`,
+    :math:`(L(p + h d_p) - L(p - h d_p))/(2h) = \langle\nabla_p L, d_p\rangle + O(h^2)`. A wrong custom
+    backward, a missing chain-rule term or a stray detach on the launcher route moves the analytic side away
+    from the difference. The block-norm gains start tied at one; they are moved off the tie so that no
+    maximum over the gains is differentiated at a kink.
+    """
+    torch.manual_seed(0)
+    model = VFEModel(live_config()).double()
+    with torch.no_grad():
+        generator = torch.Generator().manual_seed(5)
+        for name, p in model.named_parameters():
+            if name.endswith("norm.weight"):
+                p.add_(0.01 * torch.randn(p.shape, dtype=p.dtype, generator=generator))
+    tokens, targets = _batch(model.cfg)
+
+    def loss() -> torch.Tensor:
+        return model(tokens, targets)[1]
+
+    loss().backward()
+    trainable = {name: p for name, p in model.named_parameters() if p.requires_grad}
+    assert trainable and [name for name, p in trainable.items() if p.grad is None] == []
+    h = 1e-5
+    directions = torch.Generator().manual_seed(2)
+    mismatched = {}
+    for name, p in trainable.items():
+        d = torch.randn(p.shape, dtype=p.dtype, generator=directions)
+        original = p.detach().clone()
+        with torch.no_grad():
+            p.copy_(original + h * d)
+            plus = float(loss())
+            p.copy_(original - h * d)
+            minus = float(loss())
+            p.copy_(original)
+        difference = (plus - minus) / (2.0 * h)
+        analytic = float((p.grad * d).sum())
+        if abs(difference - analytic) > 1e-5 * max(abs(difference), abs(analytic)) + 1e-8:
+            mismatched[name] = (difference, analytic)
+    assert mismatched == {}
 
 
 def test_live_route_is_causal() -> None:
