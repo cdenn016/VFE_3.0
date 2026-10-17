@@ -24,6 +24,7 @@ readout, the predictive covariance, the learning rates or the numerics.
 :func:`gauge_covariance_failures` re-derives the gauge flags from the resolved config, so a launcher can refuse a
 run the overrides did not make covariant.
 """
+import warnings
 from typing import Any, Callable, Dict, List, Mapping
 
 # Block-MLP modes covariant in local coordinates; block_coordinates='reference' refuses them.
@@ -117,6 +118,16 @@ def fully_gauge_covariant_overrides(
                 f"got {norm!r}")
         wanted["block_coordinates"] = "reference"
         wanted["use_cg_coupling"] = False        # CG coupling acts in local coordinates before the norm
+    family = wanted.get("family", get("family"))
+    if (family in ("gaussian_full", "gaussian_block") and norm == "layernorm"
+            and get("block_norm_covariance") == "pushforward"):
+        # A warning, not an override: the switch never changes the covariance estimator (audit 2026-10-16 F2).
+        warnings.warn(
+            "fully_gauge_covariant: block_norm_covariance='pushforward' with the full or head-block family keeps the "
+            "capped delta-method LayerNorm pushforward, which is near rank one (condition number about 1e7, "
+            "float32-indefinite) where Sigma/s^2 >> 1, as at the launcher's initialization; "
+            "block_norm_covariance='pushforward_moment' is the moment estimate there (audit 2026-10-16 F2)",
+            stacklevel=2)
     return {key: value for key, value in wanted.items() if get(key) != value}
 
 

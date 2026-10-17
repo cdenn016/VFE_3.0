@@ -112,8 +112,8 @@ def vfe_block(
         **({"link_state": link_state} if link_state is not None else {}),
     )
     if capture is not None:
-        # The CONVERGED variational belief q* -- what the E-step's F was minimized over,
-        # BEFORE the post-inference transforms below. The manuscript's self-coupling
+        # The belief q* the E-step returns (on projected_predictive the predictive readout; no supported route
+        # minimizes F, vfe3.free_energy.free_energy), BEFORE the post-inference transforms below. The manuscript's self-coupling
         # alpha*KL(q||p) is pinned to THIS belief (audit 2026-06-09 overnight F19); the
         # M-step regularizer and the diagnostics F self-term read it from here. With the
         # transforms off (the pure path) it is the SAME object the block returns.
@@ -137,10 +137,12 @@ def vfe_block(
     mlp_delta_full = getattr(block_mlp, "covariance_contract", None) == "delta_full"
     # block_norm_covariance='pushforward' (audit 2026-10-10, item 9) or 'pushforward_moment' (audit 2026-10-16, F3):
     # each norm application also carries Sigma to post-norm units; inert under a delta_full MLP, whose Jacobian
-    # composes the norm's.
+    # composes the norm's, and under a norm other than the LayerNorm, the only norm with that pushforward (the
+    # validator admits either value there and inactive_fields marks it inert; audit 2026-10-16 F5).
     from vfe3.model.block_mlp import BLOCK_NORM_PUSHFORWARD_MODES
     norm_covariance = getattr(cfg, "block_norm_covariance", "passthrough")
-    push_norm = norm_covariance in BLOCK_NORM_PUSHFORWARD_MODES and not mlp_delta_full
+    push_norm = (norm_covariance in BLOCK_NORM_PUSHFORWARD_MODES and not mlp_delta_full
+                 and getattr(cfg, "norm_type_block", "none") == "layernorm")
     if getattr(cfg, "block_coordinates", "local") == "reference":
         return _reference_coordinate_block(
             out, block_norm=block_norm, block_mlp=block_mlp, frame=relational_frame,

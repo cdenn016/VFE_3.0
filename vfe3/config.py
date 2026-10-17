@@ -218,8 +218,9 @@ class VFE3Config:
     # posterior (predictive_readout='minimal_agent') and of each prototype_agents block, the evidence of the declared
     # record model (ADF over heads for the minimal agent, exact for the prototypes) and their gap, in nats per token.
     # The minimal agent also logs the exact evidence (NaN unless its heads are uncoupled) and a 64-sample
-    # importance-sampled evidence under q with its gap (audit 2026-10-12 round 2, item 12 and M1).
-    # Logged as val_relational_minimal_agent_{elbo,adf_evidence,adf_elbo_gap,evidence,is_evidence,is_elbo_gap}
+    # importance-sampled evidence under q with its gap (audit 2026-10-12 round 2, item 12 and M1), and the effective
+    # sample size fraction (sum w)^2/(n sum w^2) of its weights (audit 2026-10-16, F47).
+    # Logged as val_relational_minimal_agent_{elbo,adf_evidence,adf_elbo_gap,evidence,is_evidence,is_elbo_gap,is_ess}
     # (last layer) and in
     # diagnostics/minimal_agent_elbo.csv and diagnostics/prototype_elbo.csv; computed without autograd, never in the
     # loss (the evidence is unbounded above as the maps and the noise shrink). The mean field also runs the exact
@@ -333,7 +334,8 @@ class VFE3Config:
 
     # "fp64" | "fp32"
     # Prior-bank Gaussian decoders only: precision of the a_v reduction (sum of 1/sigma_v terms). fp32 loses digits once
-    # sigma_v falls far below 1; watch decode_sigma_v_min.
+    # sigma_v falls far below 1; watch the decode_sigma_v_min column of metrics.csv (min decode prior variance of the
+    # table the decoder scores against; NaN under decode_mode="linear").
     decode_av_precision:              str             = "fp32"
 
     # Prior-bank Gaussian decoders only: recompute an uncertain float32 decode argmax in float64 for the
@@ -437,7 +439,9 @@ class VFE3Config:
     #                         per rotating plane, the full non-rotating block, no cross-covariance), so
     #                         R_i P(G) R_i^T = P(G) and only the mean term carries i - j; scored on the Gram route (no
     #                         source-root factor route), or in closed form with no factorization when P(G) is diagonal
-    #                         (rope_fraction = 1). only: the kernel readout (not minimal_agent)
+    #                         (rope_fraction = 1) and projected_factorization="gram" and pair_kl_gemm_tol=None
+    #                         (vfe3.gradients.relational._diagonal_comparison_route). only: the kernel readout (not
+    #                         minimal_agent)
     rope_mode:                        str             = "none"
     pos_phi_project_slk:              bool            = False        # pos_phi only: per-block trace projection (det = 1)
     
@@ -544,6 +548,12 @@ class VFE3Config:
     # output is not positive definite (diag(U C^att U^T) amplifies float32 rounding by about kappa(U)^2), counted in covariance_escalation_elements;
     # one host read per layer call. A float64 failure raises.
     predictive_covariance_fp64_escalation: bool       = False
+    # "fp32" | "fp64"
+    # moment_matched, kernel readout only: compute precision of the covariance update.
+    #   fp32  the beliefs' precision
+    #   fp64  the whole update (C_i, pooling, sandwich, floor, ceiling) in float64 from float32 beliefs, cast back:
+    #         removes the kappa(U)^2 rounding the sign-only escalation misses (audit 2026-10-16 F7); costly
+    predictive_covariance_precision:  str             = "fp32"
     attention_residual:               bool            = True      # kernel only: new mean = mu_i + content (False: content only)
 
     ##################################################
@@ -633,13 +643,17 @@ class VFE3Config:
     norm_type_block:                  str             = "layernorm"
     layernorm_affine:                 bool            = False        # layernorm only: learned gamma/beta (init 1/0)
 
-    # "passthrough" | "pushforward"
+    # "passthrough" | "pushforward" | "pushforward_moment"
     # Covariance through the LayerNorm block norm (norm_type_block="layernorm").
     #   passthrough  the norms map the mean only; Sigma stays in pre-norm units
     #   pushforward  J_LN Sigma J_LN^T + block_mlp_covariance_floor * D Sigma D + rho g g^T, D = diag(gamma)/s, with
     #                rho g g^T the radial second-order variance; its diagonal on the diagonal family (O(K) per
     #                token). In reference coordinates (gaussian_full / gaussian_block only) it acts on C = U^-1 Sigma U^-T.
     #                At the block norm inert under block_mlp_covariance="delta_full", whose Jacobian composes the norm's
+    #   pushforward_moment  the same expression at the effective scale s_eff^2 = s^2 + tr(Pi Sigma Pi)/K (the input's
+    #                expected LayerNorm variance) plus a span floor f (T/K) D W W^T D on span{1, z}: a moment estimate
+    #                of the LayerNorm output at every Sigma/s^2, where 'pushforward' (the delta method at s, capped at
+    #                the sphere bound) keeps the delta method's radial shape (audit 2026-10-16 F3, F2)
     block_norm_covariance:            str             = "passthrough"
 
     # "local" | "reference"
@@ -693,7 +707,7 @@ class VFE3Config:
     
     block_mlp_expansion:              int             = 8            # hidden width (or template count) = expansion * K
     block_mlp_dropout:                float           = 0.0
-    block_mlp_covariance_floor:       float           = 1e-4         # delta_full and block_norm_covariance="pushforward"
+    block_mlp_covariance_floor:       float           = 1e-4         # delta_full and a block_norm_covariance pushforward
     block_mlp_template_init_variance: float           = 10.0         # prototype_agents only: initial template variance > 0
     # "absolute" | "working_variance"
     # prototype_agents only: template initialization.
@@ -870,6 +884,11 @@ class VFE3Config:
     # a-priori error estimate of the centered pair-KL GEMM exceeds it is rescored by the direct-difference
     # tiles (audit 2026-10-09 round 2 #7). Opt-in: about +45% step time on the K=128 base.
     pair_kl_gemm_tol:                 Optional[float] = None
+    # int >= 1. Byte budget, in MiB, of one tile of the relational scorer (projected moments, source-root factor,
+    # GEMM-fallback direct pair tiles, mean-distance rows) and of the routed spread's query-row tiles. Larger tiles
+    # dispatch fewer kernels and hold more transient memory; values change only by float32 reduction order, and
+    # loops above 32 MiB stay checkpointed. Keep 32 until a CUDA A/B confirms a gain (audit 2026-10-16 F26).
+    relational_tile_mib:              int             = 32
     sigma_max:                        Optional[float] = 100.0        # variance ceiling; None = none
     transport_chart_max_norm:         float           = 50.0         # fail-closed ||M||_F radius of every transport exponential
 
@@ -899,12 +918,16 @@ class VFE3Config:
     #   gram_certified          gram, and also rebuild entries that factor but fail
     #                           eps_32 ||G||_F ||G^-1||_F <= 1e-4 (costly on CUDA; with minimal_agent it
     #                           also screens the ADF query covariances; under comparison_invariant with a
-    #                           diagonal P(G) it keeps the factored route in place of the diagonal one)
+    #                           diagonal P(G) it keeps the dense Gram route in place of the diagonal one, as do
+    #                           cholesky_qr2_certified and any pair_kl_gemm_tol)
     #   cholesky_qr2_certified  factor X by CholeskyQR2 (error O(eps kappa)) and rebuild entries failing
     #                           eps_32 kappa_1(C) <= 3e-4, or failing outright, in float64 (QR of the
     #                           float64 source root; their pairs leave the GEMM for float64 triangular-solve
-    #                           tiles); the Gram route serves minimal_agent,
-    #                           noisy_query and comparison_invariant, which pass no source root
+    #                           tiles); the Gram route serves minimal_agent, noisy_query and comparison_invariant,
+    #                           which have no source-root factor route (comparison_invariant does pass its R_i S
+    #                           source tuples, but a commutant projection P(XX^T) has no CholeskyQR2 root factor),
+    #                           so there cholesky_qr2_certified acts as gram_certified: float32 rebuilds from source
+    #                           with float64 QR only on failure
     projected_factorization:          str             = "gram"
     
     def __post_init__(self) -> None:
@@ -969,6 +992,9 @@ class VFE3Config:
         if not isinstance(self.predictive_covariance_fp64_escalation, bool):
             raise ValueError("predictive_covariance_fp64_escalation must be bool, got "
                              f"{self.predictive_covariance_fp64_escalation!r}")
+        from vfe3.model.relational_operators import PREDICTIVE_COVARIANCE_PRECISIONS
+        _require(self.predictive_covariance_precision, PREDICTIVE_COVARIANCE_PRECISIONS,
+                 "predictive_covariance_precision")
         if self.predictive_covariance_floor_mode not in ("prior", "relative"):
             raise ValueError(f"predictive_covariance_floor_mode must be 'prior' or 'relative', "
                              f"got {self.predictive_covariance_floor_mode!r}")
@@ -1782,6 +1808,8 @@ class VFE3Config:
                                                       and not isinstance(self.pair_kl_gemm_tol, bool)
                                                       and self.pair_kl_gemm_tol > 0):
             raise ValueError(f"pair_kl_gemm_tol must be None or a positive number, got {self.pair_kl_gemm_tol!r}")
+        if type(self.relational_tile_mib) is not int or self.relational_tile_mib < 1:
+            raise ValueError(f"relational_tile_mib must be an int >= 1 (MiB), got {self.relational_tile_mib!r}")
 
         if self.block_mlp_expansion < 1:
             raise ValueError(
@@ -1818,8 +1846,9 @@ class VFE3Config:
                 and self.family == "gaussian_diagonal" and self.block_mlp_mode == "gauge_gate"):
             raise ValueError("block_mlp_mode='gauge_gate' with block_mlp_covariance='delta_full' needs the "
                              "full-covariance layout (family='gaussian_full' or 'gaussian_block')")
-        _require(self.block_norm_covariance, ("passthrough", "pushforward"), "block_norm_covariance")
-        if self.block_norm_covariance == "pushforward" and self.norm_type_block == "layernorm":
+        _require(self.block_norm_covariance, ("passthrough", "pushforward", "pushforward_moment"),
+                 "block_norm_covariance")
+        if self.block_norm_covariance in ("pushforward", "pushforward_moment") and self.norm_type_block == "layernorm":
             # The block norm pushes Sigma; in reference coordinates it acts on the dense C = U^-1 Sigma U^-T and
             # maps back as U C' U^T, which the full and head-block families keep (audit 2026-10-10 round 2, item 51).
             # Only a LayerNorm block norm reads the field: under 'none' or 'mahalanobis' it is inert (inactive_fields)
@@ -1831,7 +1860,7 @@ class VFE3Config:
             if self.family not in ("gaussian_full", "gaussian_block", "gaussian_diagonal"):
                 problems.append(f"a Gaussian family (got {self.family!r})")
             if problems:
-                raise ValueError("block_norm_covariance='pushforward' needs " + "; ".join(problems))
+                raise ValueError(f"block_norm_covariance={self.block_norm_covariance!r} needs " + "; ".join(problems))
         if (isinstance(self.block_mlp_em_weight, bool) or not isinstance(self.block_mlp_em_weight, Real)
                 or not math.isfinite(float(self.block_mlp_em_weight)) or float(self.block_mlp_em_weight) < 0.0):
             raise ValueError(f"block_mlp_em_weight must be a finite real value >= 0, got {self.block_mlp_em_weight!r}")
@@ -2061,6 +2090,29 @@ class VFE3Config:
                 "changing them will have no effect:\n  - " + "\n  - ".join(notices),
                 ConfigNotice, stacklevel=2,
             )
+        # The commutant-projected comparison route reads the factorization toggles differently from the other routes
+        # (vfe3.gradients.relational._diagonal_comparison_route); a notice, since gram and certified still differ here
+        # (audit 2026-10-16 F9).
+        if (self.attention_mode == "projected_predictive" and self.predictive_readout == "kernel"
+                and self.relational_routing == "gaussian_kl" and self.rope_mode == "comparison_invariant"):
+            route_notes = []
+            if self.projected_factorization == "cholesky_qr2_certified":
+                route_notes.append("projected_factorization='cholesky_qr2_certified' acts as 'gram_certified' on this "
+                                   "route: the commutant projection P(XX^T) has no source-root factor route")
+            from vfe3.geometry.groups import group_traits
+            if group_traits(self.gauge_group).algebra is None:            # equal heads of embed_dim // n_heads
+                from vfe3.geometry.rope import rope_commutant_is_diagonal, rope_rotated_pairs
+                d_head = self.embed_dim // self.n_heads
+                if (rope_commutant_is_diagonal(d_head, rope_rotated_pairs(d_head, self.rope_fraction))
+                        and (self.projected_factorization != "gram" or self.pair_kl_gemm_tol is not None)):
+                    route_notes.append(
+                        f"P(G) is diagonal (rope_fraction={self.rope_fraction!r}), but projected_factorization="
+                        f"{self.projected_factorization!r} with pair_kl_gemm_tol={self.pair_kl_gemm_tol!r} bypasses "
+                        "the closed-form diagonal comparison scorer for the dense Gram route")
+            if route_notes:
+                import warnings
+                warnings.warn("rope_mode='comparison_invariant': " + "; ".join(route_notes), ConfigNotice,
+                              stacklevel=2)
 
         # A phi update policy whose optimizer-group metadata overrides weight_decay replaces the
         # configured phi_weight_decay AFTER train.py sets it, and phi_weight_decay has no consumer in
@@ -2212,7 +2264,7 @@ class VFE3Config:
         if self.attention_mode != "projected_predictive":
             mark(("predictive_covariance", "predictive_covariance_floor", "predictive_covariance_floor_mode",
                   "predictive_covariance_ceiling", "attention_residual", "predictive_covariance_checkpoint",
-                  "predictive_covariance_fp64_escalation"),
+                  "predictive_covariance_fp64_escalation", "predictive_covariance_precision"),
                  "only read by attention_mode='projected_predictive': the gradient receiver's covariance "
                  "comes from its receiver update, and its self-information enters through "
                  "alpha KL(q||p) and the closed-form damping")
@@ -2221,11 +2273,14 @@ class VFE3Config:
             mark(("predictive_covariance_floor", "predictive_covariance_floor_mode", "predictive_covariance_ceiling")
                  if minimal_agent
                  else ("predictive_covariance_floor", "predictive_covariance_floor_mode", "predictive_covariance_ceiling",
-                       "predictive_covariance_checkpoint", "predictive_covariance_fp64_escalation"),
+                       "predictive_covariance_checkpoint", "predictive_covariance_fp64_escalation",
+                       "predictive_covariance_precision"),
                  "only read by predictive_covariance='moment_matched' or 'spread_corrected'")
         elif minimal_agent:
-            mark(("predictive_covariance_fp64_escalation",),
-                 "only read by predictive_readout='kernel'; the minimal agent escalates its own failed readout")
+            mark(("predictive_covariance_fp64_escalation", "predictive_covariance_precision"),
+                 "only read by predictive_readout='kernel'; the minimal agent recomputes a float32 call in float64 "
+                 "on its own readout status (factorization failures, the A^h certificate under a certified "
+                 "projected_factorization, and the screen of its floored posterior covariance), unconditionally")
         if self.attention_mode != "projected_predictive":
             mark(("predictive_readout",), "only read by attention_mode='projected_predictive'")
         if not ((self.attention_mode == "projected_predictive" and minimal_agent)
@@ -2288,10 +2343,11 @@ class VFE3Config:
                      "predictive_content with mstep_self_coupling_weight=0 has no self-coupling consumer; with "
                      "diagnose_canonical_free_energy=True they would feed that log-step diagnostic only")
         mlp_delta_full = self.use_block_mlp and self.block_mlp_covariance == "delta_full"
-        # The norm pushforward reads the same floor (in post-norm units) as delta_full.
-        norm_floor = () if self.block_norm_covariance == "pushforward" and not mlp_delta_full else (
-            "block_mlp_covariance_floor",)
-        if self.block_norm_covariance == "pushforward" and mlp_delta_full:
+        # The norm pushforward reads the same floor (in post-norm units) as delta_full; only a LayerNorm pushes it.
+        norm_pushes = (self.block_norm_covariance in ("pushforward", "pushforward_moment")
+                       and self.norm_type_block == "layernorm")
+        norm_floor = () if norm_pushes and not mlp_delta_full else ("block_mlp_covariance_floor",)
+        if norm_pushes and mlp_delta_full:
             mark(("block_norm_covariance",), "block_mlp_covariance='delta_full' already composes the norm Jacobian")
         if not self.use_block_mlp:
             mark(("block_mlp_mode", "block_mlp_covariance", *norm_floor,
@@ -2305,7 +2361,7 @@ class VFE3Config:
                  "prototype_agents has no hidden activation, and its posterior covariance is exact, "
                  "with no floor")
         elif self.block_mlp_covariance != "delta_full":
-            mark(norm_floor, "only read by block_mlp_covariance='delta_full' or block_norm_covariance='pushforward'")
+            mark(norm_floor, "only read by block_mlp_covariance='delta_full' or a block_norm_covariance pushforward")
         if not (self.use_block_mlp and self.block_mlp_mode == "prototype_agents"):
             mark(("block_mlp_inference", "block_mlp_template_init_variance", "block_mlp_template_init",
                   "block_mlp_template_init_pull", "block_mlp_cavi_steps", "block_mlp_em_weight"),
@@ -2454,13 +2510,14 @@ class VFE3Config:
                 and self.block_coordinates == "local" and self.decode_coordinates == "local"
                 and not (self.use_block_mlp and self.block_mlp_covariance != "passthrough")
                 and not (self.use_cg_coupling and self.cg_covariance_mode == "delta_full")
-                and self.block_norm_covariance != "pushforward"):
+                and not (self.block_norm_covariance in ("pushforward", "pushforward_moment")
+                         and self.norm_type_block == "layernorm")):
             # A passthrough gauge gate no longer distinguishes the families: the diagonal gate on
             # (mu, sigma) is the full gate on (mu, diag_embed sigma), and nothing densifies sigma.
             mark(("family",),
                  "value-identical to gaussian_diagonal under the rank-matched decoder on this "
                  "route: stored covariance is a diagonal token lookup and no seam densifies it; "
-                 "full covariance requires block_mlp_covariance='delta_full', block_norm_covariance='pushforward', "
+                 "full covariance requires block_mlp_covariance='delta_full', a block_norm_covariance pushforward, "
                  "predictive_covariance='moment_matched', or attention_mode='projected_gradient'")
         # Reference coordinates. With identically-I frames xi = mu and C = Sigma exactly, so both
         # selectors are no-ops; without a block norm or block MLP nothing is conjugated.

@@ -69,10 +69,11 @@ from vfe3.numerics import safe_eigvalsh
 from vfe3.relational_scoring import (
     set_projected_condition_recovery,
     set_projected_factor_route,
+    set_projection_tile_bytes,
 )
 from vfe3.runtime import set_fp32_matmul_precision
 from vfe3.model.minimal_agent import MINIMAL_AGENT_ELBO_KEYS
-from vfe3.model.relational_operators import RelationalOperators, shared_content_charts
+from vfe3.model.relational_operators import RelationalOperators, set_spread_tile_bytes, shared_content_charts
 
 
 def _block_mlp_diagnostic_eval(method: Callable) -> Callable:
@@ -269,6 +270,10 @@ class VFEModel(nn.Module):
         set_projected_condition_recovery(cfg.projected_factorization != "gram")
         set_projected_factor_route(
             "cholesky_qr2" if cfg.projected_factorization == "cholesky_qr2_certified" else "gram")
+        # The scorer and routed-spread tile budgets (relational_tile_mib), process-global like the toggles above
+        # (audit 2026-10-16 F26).
+        set_projection_tile_bytes(cfg.relational_tile_mib * 1024 ** 2)
+        set_spread_tile_bytes(cfg.relational_tile_mib * 1024 ** 2)
         set_frame_pair_fp64_escalation(cfg.frame_pair_escalation_tol is not None)
         set_frame_pair_condition_tol(cfg.frame_pair_escalation_tol if cfg.frame_pair_escalation_tol is not None
                                      else DEFAULT_FRAME_PAIR_CONDITION_TOL)
@@ -324,6 +329,7 @@ class VFEModel(nn.Module):
                                 predictive_covariance_ceiling=cfg.predictive_covariance_ceiling,
                                 predictive_covariance_checkpoint=cfg.predictive_covariance_checkpoint,
                                 predictive_covariance_fp64_escalation=cfg.predictive_covariance_fp64_escalation,
+                                predictive_covariance_precision=cfg.predictive_covariance_precision,
                                 predictive_readout=cfg.predictive_readout,
                                 minimal_agent_inference=cfg.minimal_agent_inference,
                                 minimal_agent_channel_noise=cfg.minimal_agent_channel_noise,

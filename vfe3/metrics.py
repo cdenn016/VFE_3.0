@@ -616,7 +616,8 @@ def covariance_frozen_at_encode(cfg: object) -> bool:
     ``skip_belief_sigma_update=True``. Later seams can also rewrite sigma: a block MLP with any
     non-passthrough ``block_mlp_covariance`` (the delta-method ``'delta_full'`` or the prototype-agent
     ``'posterior'``) or CG coupling with ``cg_covariance_mode='delta_full'``. Normalization acts on the mean alone,
-    except the block LayerNorm under ``block_norm_covariance='pushforward'``, which carries Sigma to post-norm units
+    except the block LayerNorm under a ``block_norm_covariance`` pushforward (``'pushforward'`` or
+    ``'pushforward_moment'``), which carries Sigma to post-norm units
     through the context-dependent scale of the mean. Without those updates, tr Sigma_q(x_i) depends only
     on the input token, so B1/EXP-3 measures input-token variance against next-token CE.
     """
@@ -630,8 +631,9 @@ def covariance_frozen_at_encode(cfg: object) -> bool:
                           and getattr(cfg, "block_mlp_covariance", "passthrough") != "passthrough")
     cg_rewrites_sigma = (bool(getattr(cfg, "use_cg_coupling", False))
                          and getattr(cfg, "cg_covariance_mode", "passthrough") == "delta_full")
-    # Validation admits 'pushforward' only for a local-coordinate block LayerNorm.
-    norm_rewrites_sigma = getattr(cfg, "block_norm_covariance", "passthrough") == "pushforward"
+    # A block_norm_covariance pushforward rewrites Sigma only under the block LayerNorm (inert elsewhere; F5).
+    norm_rewrites_sigma = (getattr(cfg, "block_norm_covariance", "passthrough") in ("pushforward", "pushforward_moment")
+                           and getattr(cfg, "norm_type_block", "none") == "layernorm")
     return e_step_frozen and not (mlp_rewrites_sigma or cg_rewrites_sigma or norm_rewrites_sigma)
 
 

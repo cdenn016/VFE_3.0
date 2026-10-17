@@ -597,10 +597,11 @@ def _require_static_routing_covariance(model: torch.nn.Module) -> None:
         raise NotApplicable(
             "the block MLP propagates the covariance (covariance_contract != 'passthrough'), so the routing "
             "covariance is not the static C_i of the normal form")
-    if getattr(model.cfg, "block_norm_covariance", "passthrough") == "pushforward":
+    if (getattr(model.cfg, "block_norm_covariance", "passthrough") in ("pushforward", "pushforward_moment")
+            and getattr(model.cfg, "norm_type_block", "none") == "layernorm"):
         raise NotApplicable(
-            "block_norm_covariance='pushforward': the block LayerNorm carries the covariance to post-norm units at "
-            "every layer, so the routing covariance is not the static C_i of the normal form")
+            f"block_norm_covariance={model.cfg.block_norm_covariance!r}: the block LayerNorm carries the covariance "
+            "to post-norm units at every layer, so the routing covariance is not the static C_i of the normal form")
 
 
 def _norm_plan(model: torch.nn.Module, norm: Any, norm_type: str) -> str:
@@ -807,10 +808,12 @@ def frames_removed(model: torch.nn.Module, roles: Sequence[str]) -> Iterator[Dic
         _require_static_routing_covariance(model)
         record["intercepted_calls"] = 0
     if ROLE_NORM_MLP in roles:
-        if getattr(cfg, "block_norm_covariance", "passthrough") == "pushforward":
+        if (getattr(cfg, "block_norm_covariance", "passthrough") in ("pushforward", "pushforward_moment")
+                and getattr(cfg, "norm_type_block", "none") == "layernorm"):
             raise NotApplicable(
-                "block_norm_covariance='pushforward': the block LayerNorm also pushes the covariance through its "
-                "local-coordinate Jacobian, so its reference conjugate is not the normal form's mean-only normalization")
+                f"block_norm_covariance={cfg.block_norm_covariance!r}: the block LayerNorm also pushes the covariance "
+                "through its local-coordinate Jacobian, so its reference conjugate is not the normal form's mean-only "
+                "normalization")
         norm_plan = _norm_plan(model, getattr(model, "block_norm", None), cfg.norm_type_block)
         mlp_plans = [_mlp_plan(m) for m in (getattr(model, "block_mlps", None) or ())]
         if norm_plan != "conjugated" and not any(p.startswith("conjugated") for p in mlp_plans):

@@ -43,17 +43,9 @@ def _switched_values(**overrides) -> dict:
 
 
 def _config(values: dict, mode: str) -> VFE3Config:
-    r"""The config at ``block_norm_covariance=mode``. Until the validator admits ``'pushforward_moment'`` (it has the
-    admissibility conditions of ``'pushforward'``), the config is validated at ``'pushforward'`` and the value set
-    afterwards, so the code path keyed on the string is exercised either way."""
-    try:
-        return VFE3Config(**{**values, "block_norm_covariance": mode})
-    except ValueError as error:
-        if mode != MODE or "block_norm_covariance" not in str(error):
-            raise
-    cfg = VFE3Config(**{**values, "block_norm_covariance": "pushforward"})
-    object.__setattr__(cfg, "block_norm_covariance", mode)
-    return cfg
+    r"""The config at ``block_norm_covariance=mode``; the validator admits ``'pushforward_moment'`` under the
+    admissibility conditions of ``'pushforward'``."""
+    return VFE3Config(**{**values, "block_norm_covariance": mode})
 
 
 def _model(cfg: VFE3Config) -> VFEModel:

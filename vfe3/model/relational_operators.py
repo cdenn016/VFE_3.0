@@ -22,6 +22,26 @@ from vfe3.runtime import ieee_fp32_matmul
 # Byte budget of one query-row tile of the centered predictive spread (the (rows, N, H, d) differences).
 _SPREAD_TILE_BYTES = 32 * 1024 ** 2
 
+# A spread whose whole transient exceeds this is checkpointed under autograd also when a raised _SPREAD_TILE_BYTES
+# leaves it one tile, so the budget sets the tile count, never what autograd saves (audit 2026-10-16 F26). It equals
+# the default budget, so at the default the spread tiles and checkpoints exactly as before the knob.
+_SPREAD_CHECKPOINT_BYTES = 32 * 1024 ** 2
+
+
+def set_spread_tile_bytes(nbytes: int) -> int:
+    r"""Set the routed-spread tile budget ``_SPREAD_TILE_BYTES``, in bytes; returns the previous value."""
+    if type(nbytes) is not int or nbytes < 1:
+        raise ValueError(f"spread tile budget must be a positive int of bytes, got {nbytes!r}")
+    global _SPREAD_TILE_BYTES
+    previous = _SPREAD_TILE_BYTES
+    _SPREAD_TILE_BYTES = nbytes
+    return previous
+
+
+def spread_tile_bytes() -> int:
+    r"""Return the routed-spread tile budget ``_SPREAD_TILE_BYTES``, in bytes."""
+    return _SPREAD_TILE_BYTES
+
 # Receiving-map charts of the content link on the stored factors (O, T) (attention_unified.tex,
 # "The tiled message order by order"). A later truncation such as "second_order" adds one branch
 # to ``chart_receive_map`` and one initial value to ``_chart_initial_output``.
@@ -88,7 +108,8 @@ def _centered_spread(
     tiles = []
     for i in range(0, N, step):
         args = (b[..., i:i + step, :], values, mean[..., i:i + step, :, :])
-        if torch.is_grad_enabled() and step < N and any(x.requires_grad for x in args):
+        if (torch.is_grad_enabled() and (step < N or N * per_row > _SPREAD_CHECKPOINT_BYTES)
+                and any(x.requires_grad for x in args)):
             tiles.append(checkpoint(_centered_spread_tile, *args, use_reentrant=False, preserve_rng_state=False))
         else:
             tiles.append(_centered_spread_tile(*args))
