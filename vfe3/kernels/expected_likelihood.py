@@ -50,6 +50,7 @@ this route launches, so CPU-only machines never import it.
 from typing import Any, Optional, Tuple
 
 import torch
+from torch.autograd.function import once_differentiable
 
 _KERNELS: Any = None
 
@@ -77,7 +78,12 @@ def _grid_launch(kernel: Any, n_programs: int, cfg: dict, *args: Any, **constexp
 
 
 class ExpectedLikelihoodCE(torch.autograd.Function):
-    r"""Mean expected-likelihood cross-entropy over packed rows; saves only lse_i (S,) besides inputs."""
+    r"""Mean expected-likelihood cross-entropy over packed rows; saves only the row states (S,) besides inputs.
+
+    The backward is ``once_differentiable``: its gradients are Triton writes autograd does not track, so a
+    ``create_graph=True`` gradient would carry a truncated graph (the temperature gradient through tau alone) and
+    a wrong second derivative. A double backward raises instead (audit 2026-10-16, F49).
+    """
 
     @staticmethod
     def forward(
@@ -111,6 +117,7 @@ class ExpectedLikelihoodCE(torch.autograd.Function):
         return ce_rows.sum() / max(S, 1)
 
     @staticmethod
+    @once_differentiable
     def backward(ctx: Any, grad_ce: torch.Tensor) -> Tuple[Optional[torch.Tensor], ...]:
         tk = _kernels()
         mu_q, sigma_q, mu_v_t, sigma_v_t, u_arg, tau, targets, lse = ctx.saved_tensors

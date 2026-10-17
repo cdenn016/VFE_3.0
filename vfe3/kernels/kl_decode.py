@@ -45,6 +45,7 @@ The kernels use no atomics, so results are bitwise reproducible run to run for a
 from typing import Any, List, Optional, Tuple
 
 import torch
+from torch.autograd.function import once_differentiable
 
 from vfe3.runtime import ieee_fp32_matmul
 
@@ -79,7 +80,12 @@ def _cross_term(lhs: torch.Tensor, rhs_c: torch.Tensor) -> torch.Tensor:
 
 
 class KLDecodeCE(torch.autograd.Function):
-    r"""Per-row KL-decode cross-entropy over packed rows; see the module docstring."""
+    r"""Per-row KL-decode cross-entropy over packed rows; see the module docstring.
+
+    The backward is ``once_differentiable``: G is a Triton write autograd does not track (it can even overwrite
+    a recomputed cross term in place), so a ``create_graph=True`` gradient would carry a truncated graph and a
+    wrong second derivative. A double backward raises instead (audit 2026-10-16, F49).
+    """
 
     @staticmethod
     def forward(
@@ -124,6 +130,7 @@ class KLDecodeCE(torch.autograd.Function):
         return (m - t) + log_l
 
     @staticmethod
+    @once_differentiable
     def backward(ctx: Any, grad_rows: torch.Tensor) -> Tuple[Optional[torch.Tensor], ...]:
         tk = _kernels()
         lhs, per_pos, rhs, bias, u_arg, tau, targets, m, log_l, *kept = ctx.saved_tensors
