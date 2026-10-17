@@ -8,7 +8,10 @@ the Gibbs weights ``attention_weights`` are live.
 
 F is divergence-agnostic: it assembles the scalar from per-pair energies E_ij and
 self-divergences D(q_i||p_i) supplied by the `divergence` registry, so a new
-divergence slots in by registration + config, never by editing F. Canonical (with
+divergence slots in by registration, never by editing F. No configuration selects a member:
+``divergence_family`` and ``renyi_order`` are retired fields pinned to the KL member (``renyi`` at
+alpha = 1), so the other registered functionals and the alpha != 1 kernels are reached from tests
+only (audit 2026-10-16 F93). Canonical (with
 the attention-entropy term) vs surrogate is a single toggle. The attention prior
 is a log-bias B_ij from the `attention_prior` seam; beta* = softmax_j(B - E/tau).
 """
