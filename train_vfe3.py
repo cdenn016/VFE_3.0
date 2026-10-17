@@ -278,6 +278,7 @@ config = dict(
     
     m_phi_update_mode                = "adamw",        # "adamw" | "pullback_group" | "fisher_group" (belief-Fisher natural gradient)
     m_phi_group_retraction           = "chart",        # "chart" | "group_log" (exact Log(U e^{-eta xi}); pullback_group/fisher_group only)
+    m_phi_group_log_fallback         = "series",       # "series" (certified series direction; structure-constant budget, block_glk d_head <= 16) | "eigenbasis" (off-strip blocks by the eigenbasis Psi inverse, kappa_2(U) > 1e3 rows take no step; no width budget); pullback_group with group_log only
     m_phi_group_differential_mode    = "series",       # "series" (certified power series) | "spectral" (Daleckii-Krein closed form, series fallback); pullback_group only
     phi_frame_condition_max          = None,           # None (off) | kappa_max > 1, e.g. 1e4: after each step bound cond_2(U_i) <= kappa_max (adamw; block_glk/block_glmc)
 

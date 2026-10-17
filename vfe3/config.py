@@ -730,6 +730,17 @@ class VFE3Config:
     #   group_log  exact right product Log(exp(phi) exp(-eta s xi)) (untied block_glk)
     m_phi_group_retraction:           str             = "chart"
 
+    # "series" | "eigenbasis"
+    # pullback_group with group_log only: direction of the rows the closed form xi = U^{-1} G_bar does not serve
+    # (a block off the principal strip, max_h kappa_2(U_h) > 1e3, or a Frechet-log failure).
+    #   series      the certified strict Frobenius-pullback direction; it builds the dense structure constants,
+    #               whose budget refuses block_glk from d_head = 17 on
+    #   eigenbasis  off-strip blocks invert Psi_L(ad_{X^T}) in the eigenbasis of the chart block (exact where Psi is
+    #               invertible); rows with max_h kappa_2(U_h) > 1e3 or a failed eigenbasis gate take no step. No
+    #               structure constants, so no head-width budget. The gate (shared with fisher_group) is tight at
+    #               d_head = 32, where it rejected every generic off-strip block of a probe (README)
+    m_phi_group_log_fallback:         str             = "series"
+
     # "series" | "spectral"
     # pullback_group only: evaluation of the trivialized exponential differentials Psi_R / Psi_L in the strict
     # Frobenius-pullback direction (vfe3/geometry/phi_preconditioner.py; under group_log only on the rows off the
@@ -1043,6 +1054,7 @@ class VFE3Config:
                 f"{self.m_phi_group_trust_radius}"
             )
         _require(self.m_phi_group_retraction, ("chart", "group_log"), "m_phi_group_retraction")
+        _require(self.m_phi_group_log_fallback, ("series", "eigenbasis"), "m_phi_group_log_fallback")
         _require(self.m_phi_group_differential_mode, ("series", "spectral"), "m_phi_group_differential_mode")
         if not (
             math.isfinite(self.m_phi_fisher_rotation_weight)
@@ -1497,7 +1509,9 @@ class VFE3Config:
                     f"gauge_group={self.gauge_group!r} registers no pullback capability; phase one "
                     "requires a built-in bracket-closed per-block pullback direction"
                 )
-            structure_problem = self._pullback_structure_problem()
+            # The eigenbasis fallback of group_log never builds structure constants (audit 2026-10-16, F40).
+            structure_problem = (None if self._pullback_uses_eigenbasis_fallback()
+                                 else self._pullback_structure_problem())
             if structure_problem is not None:
                 raise ValueError(f"pullback_group {structure_problem}")
             if self.pos_phi_project_slk:
@@ -2115,6 +2129,12 @@ class VFE3Config:
         if not phi_update_policy.requires_pullback_geometry:
             mark(("m_phi_group_differential_mode",),
                  "only read by the Frobenius-pullback direction (m_phi_update_mode='pullback_group')")
+        elif self._pullback_uses_eigenbasis_fallback():
+            mark(("m_phi_group_differential_mode",),
+                 "only read by the series direction, which m_phi_group_log_fallback='eigenbasis' never calls")
+        if not (phi_update_policy.requires_pullback_geometry and self.m_phi_group_retraction == "group_log"):
+            mark(("m_phi_group_log_fallback",),
+                 "only read by m_phi_update_mode='pullback_group' with m_phi_group_retraction='group_log'")
         if self.m_table_update_mode != "fisher":
             mark(("m_table_fisher_lr", "m_table_fisher_trust_radius"), "only read by m_table_update_mode='fisher'")
         else:
@@ -2504,6 +2524,21 @@ class VFE3Config:
     def rope_insertion(self) -> Literal["right"]:
         """Fixed positional composition in the vertex frame."""
         return "right"
+
+    def _pullback_uses_eigenbasis_fallback(self) -> bool:
+        r"""Whether the pullback_group M-step runs without the strict series direction (audit 2026-10-16, F40).
+
+        Under ``m_phi_group_retraction='group_log'`` with ``m_phi_group_log_fallback='eigenbasis'`` every row is
+        either the closed form :math:`\xi = U^{-1}\bar G` or the eigenbasis inverse of :math:`\Psi_L`, so the
+        structure-constant budget of :meth:`_pullback_structure_problem` does not apply.
+        """
+        from vfe3.gauge_optim import get_phi_update_policy
+        try:
+            policy = get_phi_update_policy(self.m_phi_update_mode)
+        except (KeyError, ValueError):
+            return False
+        return (policy.requires_pullback_geometry and self.m_phi_group_retraction == "group_log"
+                and self.m_phi_group_log_fallback == "eigenbasis")
 
     def _pullback_structure_problem(self) -> Optional[str]:
         r"""Why the strict pullback M-step cannot build this group's structure constants, or None.

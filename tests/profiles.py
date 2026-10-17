@@ -146,6 +146,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'm_table_fisher_trust_radius': 0.1,
     'm_phi_group_trust_radius': 0.1,
     'm_phi_group_retraction': 'chart',
+    'm_phi_group_log_fallback': 'series',
     'm_phi_group_differential_mode': 'series',
     'm_phi_fisher_rotation_weight': 2.0,
     'm_phi_fisher_completion': 'rotation',

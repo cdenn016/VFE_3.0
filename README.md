@@ -542,6 +542,22 @@ falls from about $4\times10^{-2}$ at $\|\varphi\|_F=0.05$ to $7\times10^{-3}$ at
 $\|\varphi\|_F=1.7$ ($d=6$), and a larger $R$ changes nothing there. The optimizer reports
 the halvings as `phi_group_backtracks_mean` and `phi_group_backtracks_max` on both retractions.
 
+Under `m_phi_update_mode="pullback_group"` with `m_phi_group_retraction="group_log"`, a row
+whose blocks lie inside the principal strip (margin 0.25) and satisfy
+$\max_h\kappa_2(U_h)\le10^3$ takes the closed-form direction $\xi=U^{-1}\bar G$, and
+`m_phi_group_log_fallback` routes the other rows. The default `"series"` uses the certified
+strict pullback direction, whose dense structure constants ($3\cdot 8 n_{\rm gen}^2 d^2$
+bytes per block against a 512 MiB budget) limit `block_glk` to $d_{\rm head}\le16$.
+`"eigenbasis"` recovers $\bar G$ on each off-strip block by inverting
+$\Psi_L(\mathrm{ad}_{X^\top})$ in the eigenbasis of the chart block, which is exact wherever
+$\Psi_L$ is invertible and is the series direction without its $10^{-6}$ Gram ridge, and it
+rejects the rows with $\max_h\kappa_2(U_h)>10^3$. It builds no structure constants, so the
+budget does not apply. A rejected row keeps its chart. The eigenbasis gate is the spectral
+round-off budget $\kappa_F(V)^2(\gamma_{8d}+r_{\rm eig})\le10^{-10}$ that the `fisher_group`
+off-strip solve also uses. Since $\kappa_F(V)\ge d$ it is tight at $d=32$: it rejected all
+48 random non-normal off-strip blocks of a $d=32$ probe (median $\kappa_F(V)\approx120$) and
+passed every one at $d\le8$.
+
 The belief-Fisher frame metric of `fisher_group` vanishes on the stabilizer of each belief, so
 it is completed by `m_phi_fisher_rotation_weight` $\lambda$. Under
 `m_phi_fisher_completion="rotation"` (default) the weight acts on every rotation of the

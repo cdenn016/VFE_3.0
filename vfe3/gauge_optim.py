@@ -60,6 +60,8 @@ _UGROUP_STRIP_MARGIN = 0.25
 # form amplifies relative covector noise by about kappa(U_h) (review 2026-09-28).
 _UGROUP_FAST_FRAME_COND_MAX = 1e3
 _UGROUP_RETRACTIONS = ("chart", "group_log")
+# Route of the group_log rows the closed form does not serve (m_phi_group_log_fallback; audit 2026-10-16, F40).
+_UGROUP_LOG_FALLBACKS = ("series", "eigenbasis")
 # Relative group-product residual gate of the staged phi retractions (``bch_residual_max`` in
 # configs before 2026-10-12, hardcoded then).
 _GROUP_PRODUCT_RESIDUAL_MAX = 1e-6
@@ -681,20 +683,38 @@ def pullback_group_log_direction(
     collect:           bool,
     group:             GaugeGroup,
     differential_mode: Optional[str] = None,
+    fallback:          str = "series",
 ) -> GroupLogDirection:
-    r"""Closed-form Frobenius-pullback body direction with the series direction off the strip.
+    r"""Closed-form Frobenius-pullback body direction with a fallback for the rows it does not serve.
 
     Rows whose blocks all satisfy :math:`\max|\mathrm{Im}\,\lambda(X_h)| < \pi - 0.25` (Bendixson,
     then exact eigenvalues) and :math:`\max_h \kappa_2(U_h) \le 10^3` use
     :math:`\xi = U^{-1} L_{\log}(U^\top, M)` blockwise (:func:`uspace_pullback_body_direction`).
-    The other rows, and rows whose Frechet log fails, use :func:`pullback_group_direction` with
-    per-row conditioning rejection; rows it rejects are rejected. The frame-condition bound keeps
+    The other rows, and rows whose Frechet log fails, take the ``fallback``
+    (``m_phi_group_log_fallback``):
+
+    ``'series'`` uses :func:`pullback_group_direction` with per-row conditioning rejection; rows it
+    rejects are rejected. It builds the dense structure constants of the block algebra.
+
+    ``'eigenbasis'`` keeps :math:`\xi = U^{-1}\bar G` and recovers
+    :math:`\bar G = U^{-\top}\Psi_L(\mathrm{ad}_{X^\top})^{-1}(M)` on each block off the strip (or whose
+    Frechet log failed) in the eigenbasis of the chart block (:func:`uspace_ambient_gradient` with
+    ``offstrip=True``), exact wherever :math:`\Psi_L` is invertible. That is the series direction
+    without its Gram ridge: for block gl the chart differential :math:`D` is invertible there, so
+    :math:`v = G_0^{-1}D^\top\bar G = D^{-1}\bar G` and :math:`U\xi = Dv = \bar G`. Rows with
+    :math:`\max_h \kappa_2(U_h) > 10^3`, which have no metric certificate on this route, and rows whose
+    eigenbasis solve fails its gate are rejected. No structure constants are built (audit 2026-10-16, F40).
+
+    The frame-condition bound keeps
     the chart route's acceptance semantics: the closed form has no metric certificate, and it
     amplifies relative covector noise by about :math:`\kappa_2(U_h)`. The covector is :math:`U \xi = P_T \bar G`, which for gl and block gl is the ambient
-    gradient itself (with the Gram ridge on fallback rows). With ``collect`` the chart velocity
-    :math:`v = L_{\log}(U, U \xi)` is formed for the cosine diagnostic; fast rows carry NaN
-    conditioning fields because no metric is assembled for them.
+    gradient itself (with the Gram ridge on series fallback rows). With ``collect`` the chart velocity
+    :math:`v = L_{\log}(U, U \xi)` (off the strip :math:`\Psi_R(\mathrm{ad}_X)^{-1}(U\xi U^{-1})`) is formed
+    for the cosine diagnostic; rows without a series solve carry NaN conditioning fields because no metric
+    is assembled for them.
     """
+    if fallback not in _UGROUP_LOG_FALLBACKS:
+        raise ValueError(f"group_log fallback must be one of {_UGROUP_LOG_FALLBACKS}, got {fallback!r}")
     rows, n_gen = grad_phi.shape
     n_blocks, block_dim = current_blocks.shape[-3], current_blocks.shape[-1]
     X = phi.view(rows, n_blocks, block_dim, block_dim)                   # (A, H, d, d)
@@ -712,13 +732,31 @@ def pullback_group_log_direction(
     v_phi = torch.full_like(phi, float("nan")) if collect else None
     series_order = 0
     fast_index = fast.nonzero(as_tuple=True)[0]
+    log_served = certified.clone()                                       # (A, H) blocks the log route serves
     if fast_index.numel() > 0:
         xi_fast, ok = uspace_pullback_body_direction(
             X[fast_index], M[fast_index], U=U[fast_index], certified=certified[fast_index])
         xi[fast_index] = xi_fast
         fast[fast_index] = ok.all(dim=-1)                                # a log failure falls back
+        log_served[fast_index] = certified[fast_index] & ok              # the eigenbasis takes a failed log
     fallback_index = (~fast).nonzero(as_tuple=True)[0]
-    if fallback_index.numel() > 0:
+    if fallback_index.numel() > 0 and fallback == "eigenbasis":
+        xi[fallback_index] = 0.0
+        accepted[fallback_index] = False                                 # max_h kappa_2(U_h) > 1e3: no certificate
+        solved = fallback_index[frame_condition[fallback_index] <= _UGROUP_FAST_FRAME_COND_MAX]
+        if solved.numel() > 0:
+            X_s, U_s, served = X[solved], U[solved], log_served[solved]  # (e, H, d, d), (e, H)
+            G_bar, block_ok = uspace_ambient_gradient(X_s, M[solved], U=U_s, certified=served, offstrip=True)
+            xi_s = torch.linalg.solve(U_s, G_bar)                        # (e, H, d, d) U^{-1} G_bar
+            row_ok = block_ok.all(dim=-1) & torch.isfinite(xi_s).flatten(1).all(dim=-1)   # (e,)
+            xi[solved] = torch.where(row_ok[:, None, None, None], xi_s, torch.zeros_like(xi_s))
+            accepted[solved] = row_ok
+            if v_phi is not None:
+                W = torch.linalg.solve(U_s, U_s @ xi[solved], left=False)    # (e, H, d, d) U xi U^{-1}
+                v_s, v_ok = uspace_chart_velocity(X_s, W, U=U_s, certified=served, offstrip=True)
+                v_phi[solved] = torch.where((row_ok & v_ok.all(dim=-1))[:, None],
+                                            v_s.reshape(-1, n_gen), float("nan"))
+    elif fallback_index.numel() > 0:
         series = pullback_group_direction(
             grad_phi[fallback_index],
             phi[fallback_index],
@@ -1541,6 +1579,10 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
 
     ``phi_fisher_completion`` (``m_phi_fisher_completion``: ``"rotation"`` or ``"stabilizer"``) selects the
     completed belief-Fisher metric of the ``fisher_group`` type rows (:func:`belief_fisher_group_direction`).
+
+    ``phi_group_log_fallback`` (``m_phi_group_log_fallback``: ``"series"`` or ``"eigenbasis"``) routes the
+    ``group_log`` pullback rows the closed form does not serve (:func:`pullback_group_log_direction`); the
+    chart retraction and ``fisher_group`` never read it.
     """
 
     # Signature-convention exception: torch.optim.Optimizer's contract REQUIRES params as the
@@ -1558,10 +1600,15 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
         phi_fisher_rotation_weight: float = 2.0,
         phi_group_differential_mode: Optional[str] = None,
         phi_fisher_completion:      str = "rotation",
+        phi_group_log_fallback:     str = "series",
         **kwargs,
     ) -> None:
         if not isinstance(group, GaugeGroup):
             raise TypeError(f"group must be a GaugeGroup, got {type(group).__name__}")
+        if phi_group_log_fallback not in _UGROUP_LOG_FALLBACKS:
+            raise ValueError(
+                f"phi_group_log_fallback must be one of {_UGROUP_LOG_FALLBACKS}, got {phi_group_log_fallback!r}"
+            )
         if phi_group_differential_mode is None:
             phi_group_differential_mode = phi_group_differential_mode_global()
         elif phi_group_differential_mode not in _PHI_GROUP_DIFFERENTIAL_MODES:
@@ -1601,6 +1648,7 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
         self.phi_statistics_provider = phi_statistics_provider
         self._phi_fisher_rotation_weight = phi_fisher_rotation_weight
         self._phi_fisher_completion = phi_fisher_completion
+        self._phi_group_log_fallback = phi_group_log_fallback
         # Training-time diagnostics are gated by train.py to log/eval steps. The silent hot path
         # performs no diagnostic tensor work or host reduction. Pullback groups report the fixed-
         # coordinate ridge-direction cosine, reused generalized-condition certificate, accepted
@@ -1781,6 +1829,7 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                             pullback_group_log_direction,
                             group=self._group,
                             differential_mode=self._phi_group_differential_mode,
+                            fallback=self._phi_group_log_fallback,
                         ),
                         learning_rate=phi_group["lr"],
                         trust_radius=self._phi_group_trust_radius,
