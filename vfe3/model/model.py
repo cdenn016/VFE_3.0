@@ -172,10 +172,12 @@ def build_group(cfg: VFE3Config) -> GaugeGroup:
 
 
 # Per-layer covariance-scale and rank columns of VFEModel._covariance_scale_statistics (audit 2026-10-10 round 2,
-# items 3, 4 and 13); the canonical free-energy columns that only diagnose_canonical_free_energy adds (items 18, 27).
+# items 3, 4 and 13; the reference-frame rank-one residual, audit 2026-10-16 F45); the canonical free-energy columns
+# that only diagnose_canonical_free_energy adds (items 18, 27).
 _COVARIANCE_SCALE_KEYS: Tuple[str, ...] = (
     "relational_projected_cov_scale", "relational_projected_cov_gram_min_eigenvalue",
-    "relational_comparison_map_norm_spread", "relational_input_cov_scale_ratio", "relational_rank_one_residual")
+    "relational_comparison_map_norm_spread", "relational_input_cov_scale_ratio", "relational_rank_one_residual",
+    "relational_rank_one_residual_reference")
 CANONICAL_DIAGNOSTIC_KEYS: Tuple[str, ...] = (
     "canonical_beta_tv", "canonical_self_weight", "canonical_total_output", "canonical_total_delta")
 
@@ -1943,10 +1945,17 @@ class VFEModel(nn.Module):
         ``relational_rank_one_residual`` is the Dong et al. (2021) residual
         :math:`r(X) = \|X - \mathbf 1\bar x^\top\|_F/\|X\|_F` of the layer's output means
         (:func:`vfe3.metrics.rank_one_residual`, the definition of
-        :func:`vfe3.viz.extract.across_layer_belief_trace`), the mean over the batch (item 4).
+        :func:`vfe3.viz.extract.across_layer_belief_trace`), the mean over the batch (item 4). It reads the local
+        coordinates :math:`\mu_i = U_i\xi_i`, so it moves with the per-token frames under the passive action
+        :math:`(\mu_i, U_i)\mapsto(g_i\mu_i, g_iU_i)`, and frame diversity can hide a collapse of the mixed content.
+        ``relational_rank_one_residual_reference`` is :math:`r` of the reference means
+        :math:`\xi_i = U_i^{-1}\mu_i` in the content (value) frame the predictive kernel averages
+        (:meth:`_content_frame`), which that action leaves fixed (audit 2026-10-16 F45). The two agree when every
+        frame is the identity.
         """
         from vfe3 import metrics
         from vfe3.geometry.rope import rope_commutant_projection, rope_rotated_pairs
+        from vfe3.model.frame_actions import frame_matvec
         ops = self.relational_operators_by_layer[layer_index]
         query_cov, key_cov = cap["projected_covariance_pre"], cap["projected_key_covariance_pre"]
         if torch.is_tensor(query_cov):                                         # equal heads: one tensor
@@ -1988,6 +1997,9 @@ class VFEModel(nn.Module):
             return (sigma if sigma.dim() == belief.mu.dim()
                     else torch.diagonal(sigma, dim1=-2, dim2=-1)).sum(dim=-1)
 
+        content_frame = self._content_frame(snapshot)
+        output_mu = snapshot.layer_outputs[layer].mu.double()                  # (B, N, K) local coordinates
+        xi = frame_matvec(content_frame.inverse, output_mu, content_frame.block_diagonal)   # (B, N, K) U^{-1} mu
         return {
             "relational_projected_cov_scale": float(torch.cat(scales).median()),
             "relational_projected_cov_gram_min_eigenvalue": (float(finite_minima.min()) if finite_minima.numel()
@@ -1995,9 +2007,22 @@ class VFEModel(nn.Module):
             "relational_comparison_map_norm_spread": (float(finite_spreads.max()) if finite_spreads.numel()
                                                       else float("nan")),
             "relational_input_cov_scale_ratio": float((trace(q) / trace(start)).median()),
-            "relational_rank_one_residual": float(
-                metrics.rank_one_residual(snapshot.layer_outputs[layer].mu.double()).mean()),
+            "relational_rank_one_residual": float(metrics.rank_one_residual(output_mu).mean()),
+            "relational_rank_one_residual_reference": float(metrics.rank_one_residual(xi).mean()),
         }
+
+    def _content_frame(self, snapshot: DiagnosticSnapshot) -> CanonicalFrameContext:
+        r"""The realized content (value) frame :math:`U_i` of the snapshot's forward, rebuilt from its stack entry.
+
+        :meth:`_relational_frames` of ``snapshot.initial_belief`` and ``snapshot.rope``, the frames
+        :meth:`forward_beliefs` built from the same belief and shared by every layer: :math:`U_i` under
+        ``rope_mode`` ``'none'``, ``'frame'`` (RoPE folds into the routing frame only) and the comparison modes,
+        and :math:`U_iR_i^\top` under ``'frame_value'``. Autocast is off, as in the forward's frame actions.
+        """
+        start = snapshot.initial_belief
+        with torch.no_grad(), torch.autocast(device_type=start.mu.device.type, enabled=False):
+            _, _, value_frame = self._relational_frames(start, snapshot.rope)
+        return value_frame
 
     @staticmethod
     def _self_map_unit_distance(ops: RelationalOperators) -> Optional[torch.Tensor]:   # (H,) float64, or None

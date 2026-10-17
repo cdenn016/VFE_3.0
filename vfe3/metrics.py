@@ -666,6 +666,11 @@ def rank_one_residual(
     FFN-brake object of F2/EXP-7, computed on the MEAN stream -- DISTINCT from ``effective_rank``,
     which is the spectral rank of the per-token COVARIANCE Sigma (a different object). Reference:
     Dong et al. 2021, "Attention is not all you need: pure attention loses rank doubly exponentially".
+
+    r is not invariant under per-token linear maps of the rows. Local-coordinate means mu_i = U_i xi_i carry
+    each token's frame U_i, so their r counts frame diversity as spread; the frame-invariant reading of the
+    mixed content is r of the reference means xi_i = U_i^{-1} mu_i (the model's
+    ``relational_rank_one_residual_reference``, audit 2026-10-16 F45).
     """
     xbar = mu.mean(dim=-2, keepdim=True)                                  # (..., 1, K) mean token
     num = torch.linalg.norm((mu - xbar).flatten(-2, -1), dim=-1)          # ||X - 1 xbar^T||_F
