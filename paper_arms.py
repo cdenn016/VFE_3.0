@@ -127,7 +127,11 @@ notes when the base's recorded code identity is not the current tree's.
 LAYOUT: ``<out_root>/<base>/<budget>/<arm slug>/<test PPL>_<slug>_s<seed>_d<data seed>/``. An (arm,
 seed) pair whose run directory already holds a complete ``summary.json`` (finite ``test_ce``) and
 whose saved config, dataset and seeds are the plan's (:func:`reuse_mismatch`) is skipped; a complete
-run that differs is reported as stale, and a launch refuses to train while one blocks a pair. After every run the manifest ``<out_root>/<base>/<budget>/m2_manifest.json`` is rewritten
+run that differs is reported as stale, and a launch refuses to train while one blocks a pair. Several
+complete runs of one pair select none (the folder names begin with the test PPL, so their order is a
+result): each is reported as stale and blocks the launch. A finished run of the plan's config whose test
+CE is not finite (a divergence) is a recorded failure, listed under ``paper_arms.rows[label]["failed"]``
+and never retrained by a relaunch. After every run the manifest ``<out_root>/<base>/<budget>/m2_manifest.json`` is rewritten
 with every row of the table (rows without complete runs stay pending); pass it to
 ``python paper_artifacts.py <manifest>``. A listed run whose recorded code identity is not the
 current tree's (:func:`vfe3.paper.runs.code_identity_mismatch`) is kept, not rejected, and flagged
@@ -1218,19 +1222,46 @@ def is_complete(run_dir: Path) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
-def complete_runs(arm_dir: Path, label: str) -> List[Path]:
-    r"""Every complete run of ``label`` in ``arm_dir`` (``<prefix>_<label>`` or ``..._<label>_<n>``), sorted."""
+def failed_run_reason(run_dir: Path) -> Optional[str]:
+    r"""Why ``run_dir`` is a finished run without a test result, or None.
+
+    A run that published ``summary.json`` finished; one whose ``test_ce`` is not a finite number (NaN or
+    infinity after a divergence, or null) finished and failed. A run without a readable ``summary.json``
+    is unfinished (interrupted, or still training) and is not a failure.
+    """
+    try:
+        summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(summary, dict):
+        return None
+    value = summary.get("test_ce")
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        return None
+    return f"finished without a finite test CE (summary.json test_ce={value!r})"
+
+
+def _label_runs(arm_dir: Path, label: str) -> List[Path]:
+    r"""Every run directory of ``label`` in ``arm_dir`` (``<prefix>_<label>`` or ``..._<label>_<n>``), sorted."""
     if not arm_dir.is_dir():
         return []
     pattern = re.compile(rf"^.+_{re.escape(label)}(_\d+)?$")
-    return [child for child in sorted(arm_dir.iterdir())
-            if child.is_dir() and pattern.match(child.name) and is_complete(child)]
+    return [child for child in sorted(arm_dir.iterdir()) if child.is_dir() and pattern.match(child.name)]
+
+
+def complete_runs(arm_dir: Path, label: str) -> List[Path]:
+    r"""Every complete run of ``label`` in ``arm_dir`` (``<prefix>_<label>`` or ``..._<label>_<n>``), sorted."""
+    return [child for child in _label_runs(arm_dir, label) if is_complete(child)]
 
 
 def find_complete_run(arm_dir: Path, label: str) -> Optional[Path]:
-    r"""The first complete run of ``label`` in ``arm_dir`` (no config check; see :func:`completed_run`)."""
+    r"""The complete run of ``label`` in ``arm_dir`` (no config check; see :func:`completed_run`).
+
+    None when there is none or more than one: the folder names begin with the test PPL, so their order
+    is a result, and no run is chosen by it (audit 2026-10-16 F60).
+    """
     found = complete_runs(arm_dir, label)
-    return found[0] if found else None
+    return found[0] if len(found) == 1 else None
 
 
 # Fields a reused run may differ in from the plan: the model seed (checked against the run's recorded
@@ -1306,26 +1337,48 @@ def completed_run(
     cfg:       Any = None,
     dataset:   Optional[str] = None,
     stale:     Optional[List[Dict[str, str]]] = None,
+    failed:    Optional[List[Dict[str, str]]] = None,
 ) -> Optional[Path]:
     r"""The complete run of arm ``label`` at ``(seed, data_seed)``, or None.
 
     A run in the experiment directory wins. With the plan's ``cfg`` (and ``dataset``) given, only a
     run that :func:`reuse_mismatch` accepts is returned; every rejected complete run is appended to
     ``stale`` with its reason, so a changed arm, ``baseline_overrides`` value or base is reported
-    rather than silently reused. Without ``cfg`` the first complete run is returned unchecked.
+    rather than silently reused. Without ``cfg`` every complete run is accepted unchecked. More than
+    one accepted run of the pair selects none: each is appended to ``stale`` as a duplicate, since
+    the folder names begin with the test PPL and their order is a result (audit 2026-10-16 F60). A
+    finished run without a finite test CE (:func:`failed_run_reason`) whose config is the plan's (any,
+    without ``cfg``) is appended to ``failed``: it is a recorded failure of the pair, not an absent
+    run (audit 2026-10-16 F61).
     Otherwise, under the ``base_protocol`` budget, the evaluated arm at the base run's own
     ``(seed, data_seed)`` is the base run itself when it is complete and, with ``cfg`` given,
     :func:`reuse_mismatch` accepts it with :data:`BASE_REUSE_IGNORED_FIELDS` (its own checkpoint cadence
     is not a difference; a base recorded with another budget is stale).
     """
     slug = (ARMS if arms is None else arms)[label]["slug"]
-    for found in complete_runs(exp_dir / slug, run_label(slug, seed, data_seed)):
-        reason = (None if cfg is None else
-                  reuse_mismatch(found, cfg, dataset=str(dataset), seed=seed, data_seed=data_seed))
-        if reason is None:
-            return found
+    accepted: List[Path] = []
+    for found in _label_runs(exp_dir / slug, run_label(slug, seed, data_seed)):
+        if is_complete(found):
+            reason = (None if cfg is None else
+                      reuse_mismatch(found, cfg, dataset=str(dataset), seed=seed, data_seed=data_seed))
+            if reason is None:
+                accepted.append(found)
+            elif stale is not None:
+                stale.append({"run": str(found), "reason": reason})
+            continue
+        failure = failed_run_reason(found) if failed is not None else None
+        if failure is not None and (cfg is None or reuse_mismatch(
+                found, cfg, dataset=str(dataset), seed=seed, data_seed=data_seed) is None):
+            failed.append({"run": str(found), "reason": failure})
+    if len(accepted) == 1:
+        return accepted[0]
+    if accepted:
         if stale is not None:
-            stale.append({"run": str(found), "reason": reason})
+            stale.extend({"run": str(run), "reason": f"one of {len(accepted)} complete runs of seed pair "
+                                                     f"({seed}, {data_seed}) that match the plan; none is "
+                                                     "selected until exactly one is kept"}
+                         for run in accepted)
+        return None
     if (base is not None and budget == "base_protocol" and label == EVALUATED
             and base.data_seed is not None and (int(base.cfg.seed), base.data_seed) == (seed, data_seed)
             and is_complete(base.run_dir)):
@@ -1357,7 +1410,9 @@ def build_manifest(
     r"""The manifest :mod:`vfe3.paper` reads: every table row, with the complete runs of the plan's seeds.
 
     A selected arm lists only runs whose saved config is the plan's (:func:`reuse_mismatch`); a
-    rejected complete run is listed under ``paper_arms.rows[label]["stale"]`` with its reason. Runs of an
+    rejected complete run is listed under ``paper_arms.rows[label]["stale"]`` with its reason, and so is
+    every one of several complete runs of one seed pair (none is listed under ``runs``); a finished run
+    without a finite test CE is listed under ``paper_arms.rows[label]["failed"]`` with its reason. Runs of an
     arm this launch did not resolve (``"not selected"``), or of the compute-matched arm before its width
     rule exists, are listed unchecked and flagged ``reuse_verified: false``. Every listed run's code
     identity (:func:`vfe3.paper.runs.code_identity`) is recorded, and a run whose identity is not the
@@ -1381,9 +1436,11 @@ def build_manifest(
         expected = _expected_cfg(exp_dir, plan) if plan is not None else None
         runs: List[str] = []
         stale: List[Dict[str, str]] = []
+        failed: List[Dict[str, str]] = []
         for seed, data_seed in seeds:
             found = completed_run(exp_dir, label, seed, data_seed, base=base, budget=budget, arms=arms,
-                                  cfg=expected, dataset=plan.dataset if plan else None, stale=stale)
+                                  cfg=expected, dataset=plan.dataset if plan else None, stale=stale,
+                                  failed=failed)
             if found is not None:
                 runs.append(str(found))
         shown = shown_evaluated if label == EVALUATED else label
@@ -1399,6 +1456,7 @@ def build_manifest(
                        "declared_deviations": list(plan.deviations) if plan else [],
                        "reuse_verified": expected is not None,
                        "stale": stale,
+                       "failed": failed,
                        "code_identity": {}, "code_identity_mismatch": []}
         for run in runs:
             record = load_run(run)
@@ -1562,12 +1620,13 @@ def compute_matched_config(
     for s, d in plan.seeds:
         # completed_run checks every run it returns against the matched config, the reused base run too.
         stale: List[Dict[str, str]] = []
+        failed: List[Dict[str, str]] = []
         found = completed_run(exp_dir, EVALUATED, s, d, base=base, budget=budget, cfg=plan.matched_cfg,
-                              dataset=plan.dataset, stale=stale)
+                              dataset=plan.dataset, stale=stale, failed=failed)
         if found is not None:
             runs.append(found)
         else:
-            reason = "; ".join(f"{entry['run']}: {entry['reason']}" for entry in stale) or "no complete run"
+            reason = "; ".join(f"{entry['run']}: {entry['reason']}" for entry in (*stale, *failed))                 or "no complete run"
             missing_pairs.append(f"({s}, {d}): {reason}")
     rule_path = exp_dir / plan.slug / WIDTH_RULE_FILE
     if rule_path.is_file():
@@ -1644,8 +1703,10 @@ def run_plan(
     The manifest is rewritten before the first run and after every run, so an interrupted launch
     leaves a manifest of the runs that completed. A complete run is reused only when its saved config
     is the plan's (:func:`completed_run` with the plan's config); the launch refuses to start while a
-    selected (arm, seed) pair has complete runs that are all stale, listing them, so a changed arm is
-    neither silently reused nor silently retrained beside its old runs.
+    selected (arm, seed) pair has complete runs that are all stale, or more than one complete run of the
+    plan's config, listing them, so a changed arm is neither silently reused nor silently retrained
+    beside its old runs. A pair whose only run of the plan's config finished without a finite test CE
+    is a recorded failure: it is logged and listed in the manifest, and never retrained by a relaunch.
     """
     from vfe3.experiment import run_vfe
 
@@ -1673,8 +1734,9 @@ def run_plan(
                                   if Path(entry["run"]) == base.run_dir else "")
                                for entry in stale)
     if blocked:
-        raise SystemExit("refusing to train: complete runs on disk do not match the plan (move them aside, or "
-                         "restore the configuration they were trained with):\n  " + "\n  ".join(blocked))
+        raise SystemExit("refusing to train: complete runs on disk do not match the plan or duplicate a seed "
+                         "pair (move them aside, or restore the configuration they were trained with):\n  "
+                         + "\n  ".join(blocked))
 
     def refresh() -> Path:
         return write_manifest(exp_dir, build_manifest(exp_dir, plans, base=base, budget=budget,
@@ -1695,10 +1757,18 @@ def run_plan(
         arm_dir = exp_dir / plan.slug
         for seed, data_seed in plan.seeds:
             label = run_label(plan.slug, seed, data_seed)
+            failed: List[Dict[str, str]] = []
             done = completed_run(exp_dir, plan.label, seed, data_seed, base=base, budget=budget, arms=arms,
-                                 cfg=cfg, dataset=plan.dataset)
+                                 cfg=cfg, dataset=plan.dataset, failed=failed)
             if done is not None:
                 logger.info("complete, skipped: %s", done)
+                continue
+            if failed:
+                # A relaunch must not re-roll a diverged replicate (audit 2026-10-16 F61).
+                logger.warning("not retrained: %s seed=(%d, %d) has a recorded failure (%s); it is listed in "
+                               "the manifest row's 'failed'; move the run aside to retrain the pair deliberately",
+                               plan.label, seed, data_seed,
+                               "; ".join(f"{entry['run']}: {entry['reason']}" for entry in failed))
                 continue
             logger.info("training %s | %s | seed=%d data_seed=%d", plan.label, plan.dataset, seed, data_seed)
             if plan.kind == "vfe":
