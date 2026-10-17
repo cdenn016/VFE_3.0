@@ -1313,7 +1313,10 @@ class RelationalOperators(nn.Module):
         whole update (:math:`C_i`, the pooling, the sandwich, the floor and the ceiling) runs in float64 with the
         float32 frame cast by the body, and the result is cast back; backward runs through the float64 update. Its
         error is then that of the float32 inputs and frame pair, and the escalation, which checks float32 outputs
-        only, is inert.
+        only, is inert. An edge context passed in (the readout builds it from the float32 beliefs for the mean and
+        the covariance together) is cast as built, so its links keep their float32 rounding, an error of order
+        :math:`\varepsilon_{32}` without the :math:`\kappa(U_i)^2` factor; without ``edges`` the context is built
+        here in float64.
 
         Under ``content_link_edges`` the kernel is the same with :math:`M_h \to M_h^{ij} = G_{ij}\Pi_h`:
 
@@ -1329,7 +1332,8 @@ class RelationalOperators(nn.Module):
         self._require_kernel_readout("predictive_covariance_update")
         if self.predictive_covariance_precision == "fp64" and sigma.dtype != torch.float64:
             # The float64 update of the float32 inputs; a float64 call takes the plain path below, so this equals
-            # the float64-belief update cast back, bit for bit. The body casts the frame and the content maps itself.
+            # the float64-belief update cast back, bit for bit (with a given edge context: of that context cast to
+            # float64). The body casts the frame and the content maps itself.
             wide_receive = None if receive is None else [O.double() for O in self._receive_runs(receive)]
             return self.predictive_covariance_update(
                 mu.double(), sigma.double(), beta.double(), frame, wide_receive,
