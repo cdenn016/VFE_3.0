@@ -14,6 +14,11 @@ last layer. The extractor now pools every layer (summed non-finite counts over s
 maximum condition over layers, the covariance layout of the family) and the figure names each row group's
 layer scope.
 
+F25: ``beta_channel_decomposition.png`` and the run log called ``content_channel`` "content energy" and
+dropped ``rope_position_channel``, although the writer flags ``energy_includes_rope_position`` under every
+``rope_mode`` other than ``'none'``. Under that flag both now label the bar as the routing cost (content plus
+RoPE position) and show the rotation-only arm beside it; a record without the flag keeps the two bars.
+
 Tiny CPU models only (K=4, two heads, N=4, vocab 7; F24 runs ``tests.profiles.live_config`` with three layers).
 """
 import csv
@@ -256,3 +261,68 @@ def test_report_marks_the_guard_rows_as_last_layer(tmp_path: Path, monkeypatch: 
     assert "numerical_trust.png" in {path.name for path in written}
     assert seen["guard_scope"] == "last layer"
     assert seen["health"]["n_layers"] == 2
+
+
+# ------------------------------------------------------------------------------------------------ F25
+
+ROPE_RECORD: Dict[str, Any] = {
+    "available": True, "energy_includes_rope_position": True,
+    "delta_ce": {"content_channel": 0.022, "positional_channel": 0.005, "rope_position_channel": 0.047},
+}
+NO_ROPE_RECORD: Dict[str, Any] = {
+    "available": True, "energy_includes_rope_position": False,
+    "delta_ce": {"content_channel": 0.074, "positional_channel": 0.003},
+}
+
+
+def _tick_labels(record: Dict[str, Any], tmp_path: Path) -> List[str]:
+    fig = figs.plot_beta_channel_decomposition(record, path=str(tmp_path / "beta.png"))
+    labels = [tick.get_text() for tick in fig.axes[0].get_xticklabels()]
+    plt.close(fig)
+    return labels
+
+
+def test_beta_channel_figure_shows_the_rope_arm_and_relabels_the_routing_cost(tmp_path: Path) -> None:
+    labels = _tick_labels(ROPE_RECORD, tmp_path)
+    assert labels == [figs.BETA_CHANNEL_POSITIONAL_LABEL, figs.BETA_CHANNEL_ROUTING_COST_LABEL,
+                      figs.BETA_CHANNEL_ROPE_LABEL]
+    assert "RoPE position" in labels[1] and "content" in labels[1]
+    assert "rotation only" in labels[2]
+
+
+@pytest.mark.parametrize("record", [NO_ROPE_RECORD, {"available": True, "delta_ce": {
+    "content_channel": 0.074, "positional_channel": 0.003}}], ids=["rope-none", "pre-2026-10-10"])
+def test_beta_channel_figure_keeps_two_bars_without_rope(record: Dict[str, Any], tmp_path: Path) -> None:
+    assert _tick_labels(record, tmp_path) == ["positional prior", "content energy"]
+
+
+def test_mechanism_log_names_the_rope_arm(caplog: pytest.LogCaptureFixture) -> None:
+    logger = logging.getLogger("audit-c1-beta-log")
+    with caplog.at_level(logging.INFO, logger="audit-c1-beta-log"):
+        ra._log_mechanism_diagnostics(logger, None, ROPE_RECORD, None)
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Attention channels"))
+    assert "content energy" not in line
+    assert "routing cost (content + RoPE position) +0.0220" in line
+    assert "RoPE position (rotation only) +0.0470" in line
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="audit-c1-beta-log"):
+        ra._log_mechanism_diagnostics(logger, None, NO_ROPE_RECORD, None)
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Attention channels"))
+    assert "content energy +0.0740" in line and "RoPE" not in line
+
+
+@pytest.mark.parametrize("rope_mode", ["comparison_invariant", "none"])
+def test_beta_channel_writer_and_figure_agree_on_the_rope_reading(rope_mode: str, tmp_path: Path) -> None:
+    torch.manual_seed(0)
+    cfg = _cfg(rope_mode=rope_mode, n_layers=2)
+    model = VFEModel(cfg)
+    tokens = torch.randint(0, V, (2, N))
+    targets = torch.randint(0, V, (2, N))
+    record = ra.collect_beta_channel_decomposition(model, tokens, targets)
+    assert record["available"]
+    labels = _tick_labels(record, tmp_path)
+    if rope_mode == "none":
+        assert labels == ["positional prior", "content energy"]
+    else:
+        assert record["energy_includes_rope_position"] is True
+        assert len(labels) == 3 and labels[2] == figs.BETA_CHANNEL_ROPE_LABEL

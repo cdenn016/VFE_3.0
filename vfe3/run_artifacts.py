@@ -4395,9 +4395,19 @@ def _log_mechanism_diagnostics(
                 100.0 * (deepest.get("step1_share_of_displacement") or 0.0))
     if beta is not None and beta.get("available"):
         deltas = beta["delta_ce"]
-        logger.info(
-            "Attention channels (delta CE, nats): positional prior %+.4f vs content energy %+.4f",
-            deltas["positional_channel"], deltas["content_channel"])
+        if beta.get("energy_includes_rope_position"):
+            # Under RoPE the routing cost carries position too; the rotation-only arm is a separate,
+            # non-additive ablation (audit 2026-10-16, F25).
+            rope = deltas.get("rope_position_channel")
+            logger.info(
+                "Attention channels (delta CE, nats): positional prior %+.4f vs routing cost "
+                "(content + RoPE position) %+.4f%s",
+                deltas["positional_channel"], deltas["content_channel"],
+                (f" vs RoPE position (rotation only) {rope:+.4f}" if rope is not None else ""))
+        else:
+            logger.info(
+                "Attention channels (delta CE, nats): positional prior %+.4f vs content energy %+.4f",
+                deltas["positional_channel"], deltas["content_channel"])
     if context is not None and context.get("stages"):
         logger.info(
             "Context injection (relative belief shift under prefix randomization): %s",
@@ -4447,14 +4457,17 @@ def collect_beta_channel_decomposition(
 
     The belief attention weight is :math:`\beta_{ij}=\mathrm{softmax}_j(\log\pi_{ij}-E_{ij}/\tau)`,
     where :math:`\log\pi` is the positional/precision prior and :math:`E_{ij}` is the
-    belief-coupling energy -- the only content-dependent channel. Three arms isolate them:
+    belief-coupling energy -- the only content-dependent channel. Three arms isolate them, and a fourth
+    (``no_rope``, below) runs under RoPE:
 
     ============ ============================================ ==================================
     arm          beta                                         reads
     ============ ============================================ ==================================
     ``full``     ``softmax(log_prior - E/tau)``                as trained; reproduces the baseline
-    ``no_energy``  ``softmax(log_prior)``                      the CONTENT channel's worth
+    ``no_energy``  ``softmax(log_prior)``                      the CONTENT channel's worth (plus
+                                                               RoPE position under a rope_mode)
     ``no_prior``   ``softmax(-E/tau)``                         the POSITIONAL channel's worth
+    ``no_rope``    ``full`` with the rotation :math:`R_i = I`  RoPE position (rope_mode != 'none')
     ============ ============================================ ==================================
 
     Measured 2026-07-25 on the K=300 baseline: flattening the prior cost 0.612 nats against 0.210

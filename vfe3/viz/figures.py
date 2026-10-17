@@ -2215,6 +2215,15 @@ def plot_estep_character(
     return _save(fig, path)
 
 
+# Bar labels of plot_beta_channel_decomposition. Under a rope_mode other than 'none' the routing cost carries
+# RoPE position as well as content (the writer flags energy_includes_rope_position), so content_channel is
+# relabelled and the rotation-only arm is drawn beside it (audit 2026-10-16, F25).
+BETA_CHANNEL_POSITIONAL_LABEL   = "positional prior"
+BETA_CHANNEL_CONTENT_LABEL      = "content energy"
+BETA_CHANNEL_ROUTING_COST_LABEL = "routing cost\n(content + RoPE position)"
+BETA_CHANNEL_ROPE_LABEL         = "RoPE position\n(rotation only)"
+
+
 @register_figure("beta_channel_decomposition")
 def plot_beta_channel_decomposition(
     record: Mapping[str, object],
@@ -2222,29 +2231,45 @@ def plot_beta_channel_decomposition(
     *,
     path:   Optional[str] = None,
 ):
-    r"""Plot what each channel of the attention weight is worth, in nats of cross-entropy."""
+    r"""Plot what each channel of the attention weight is worth, in nats of cross-entropy.
+
+    Each bar is :math:`\Delta\mathrm{CE} = \mathrm{CE}(\text{arm}) - \mathrm{CE}(\text{full})` of one separate
+    ablation of :func:`vfe3.run_artifacts.collect_beta_channel_decomposition`. When the record flags
+    ``energy_includes_rope_position``, the ``content_channel`` bar (the whole routing cost zeroed) is labelled
+    as content plus RoPE position and the ``rope_position_channel`` arm (rotation :math:`R_i = I` inside the
+    cost) is drawn beside it. The arms are not additive, so no difference of bars is shown as "content".
+    A record without the flag (``rope_mode='none'``, or written before the flag existed) keeps two bars.
+    """
     if record.get("available") is False:
         return _unavailable_probe_figure(record, path)
     fig, ax = plt.subplots(figsize=(5.0, 3.4))
     deltas = record.get("delta_ce") or {}
-    labels, values = [], []
-    for key, label in (("positional_channel", "positional prior"),
-                       ("content_channel", "content energy")):
+    rope_in_cost = bool(record.get("energy_includes_rope_position"))
+    channels = [("positional_channel", BETA_CHANNEL_POSITIONAL_LABEL, _CB[1]),
+                ("content_channel",
+                 BETA_CHANNEL_ROUTING_COST_LABEL if rope_in_cost else BETA_CHANNEL_CONTENT_LABEL, _CB[0])]
+    if rope_in_cost:
+        channels.append(("rope_position_channel", BETA_CHANNEL_ROPE_LABEL, _CB[2]))
+    labels, values, colors = [], [], []
+    for key, label, color in channels:
         if deltas.get(key) is not None:
             labels.append(label)
             values.append(float(deltas[key]))
+            colors.append(color)
     if not values:
         ax.text(0.5, 0.5, "no live beta softmax intercepted", ha="center", va="center",
                 transform=ax.transAxes, fontsize=9)
         ax.set_axis_off()
         return _save(fig, path)
-    bars = ax.bar(labels, values, color=[_CB[1], _CB[0]][:len(values)], width=0.55)
+    bars = ax.bar(labels, values, color=colors, width=0.55)
     for bar, value in zip(bars, values):
         ax.annotate(f"{value:+.3f}", (bar.get_x() + bar.get_width() / 2.0, value),
                     ha="center", va="bottom", fontsize=8)
     ax.axhline(0.0, color="#555555", lw=0.8)
     ax.set(ylabel=r"$\Delta$CE when ablated (nats)",
            title="What each attention channel carries")
+    if rope_in_cost and len(values) == 3:
+        ax.set_xlabel("separate ablations; the bars do not add", fontsize=7, color="#555555")
     fig.tight_layout()
     return _save(fig, path)
 
