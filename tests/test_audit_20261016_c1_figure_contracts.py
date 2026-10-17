@@ -7,9 +7,17 @@ every other trajectory in the same directory used the absolute ``step`` column. 
 the absolute step before the first loss (``final_step - len(losses)``), and the curve is labelled as the
 training loss.
 
-Tiny CPU models only (K=4, two heads, N=4, vocab 7).
+F24: ``numerical_health`` read layer 0's converged belief for the mu/Sigma/phi finiteness rows and the
+largest condition number, but the shared ``conditional_capture`` (the LAST block's, ``stack.py``) for the
+energy/beta rows, and ``numerical_trust.png`` presented both as one population; the guard rows come from the
+last layer. The extractor now pools every layer (summed non-finite counts over summed entry counts, the
+maximum condition over layers, the covariance layout of the family) and the figure names each row group's
+layer scope.
+
+Tiny CPU models only (K=4, two heads, N=4, vocab 7; F24 runs ``tests.profiles.live_config`` with three layers).
 """
 import csv
+import dataclasses
 import json
 import logging
 import subprocess
@@ -24,11 +32,15 @@ from torch.utils.data import DataLoader
 import vfe3.run_artifacts as ra
 import vfe3.train as T
 import vfe3.viz.figures as figs
+import matplotlib.pyplot as plt
+
+from tests.profiles import live_config
 from tests.test_audit2_20261011_training import _cfg
+from vfe3 import metrics
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import TokenWindows
 from vfe3.model.model import VFEModel
-from vfe3.viz import figure_worker
+from vfe3.viz import extract, figure_worker
 
 B, N, V = 2, 4, 7
 CPU = torch.device("cpu")
@@ -156,3 +168,91 @@ def test_finalize_request_requires_the_loss_start_step() -> None:
     del request["losses_start_step"]
     with pytest.raises(ValueError, match="losses_start_step"):
         figure_worker._validated_finalize_request(request)
+
+
+# ------------------------------------------------------------------------------------------------ F24
+
+def _three_layer_model() -> VFEModel:
+    torch.manual_seed(0)
+    return VFEModel(live_config(n_layers=3)).eval()
+
+
+def _layer_conditions(model: VFEModel, snapshot: Any) -> List[float]:
+    return [float(metrics.belief_spectrum(
+        belief.sigma[0], diagonal=model.cfg.diagonal_covariance, eps=model.cfg.eps,
+        family=model.cfg.family)["condition"].max()) for belief in snapshot.layer_converged]
+
+
+def test_numerical_health_pools_every_layer() -> None:
+    model = _three_layer_model()
+    tokens = torch.randint(0, model.cfg.vocab_size, (1, model.cfg.max_seq_len))
+    snapshot = model.build_diagnostic_snapshot(tokens)
+    health = extract.numerical_health(model, tokens, snapshot=snapshot)
+    conditions = _layer_conditions(model, snapshot)
+    assert max(conditions) != conditions[0], "the seed must make a deeper layer the worst conditioned"
+    assert health["n_layers"] == 3
+    assert health["max_condition"] == pytest.approx(max(conditions), rel=1e-6)
+    per_layer = model.diagnostics_per_layer(tokens, snapshot=snapshot)    # B = 1: the same population
+    assert health["max_condition"] == pytest.approx(max(per_layer["belief_cond_max"]), rel=1e-6)
+    assert health["numel_mu"] == sum(b.mu[0].numel() for b in snapshot.layer_converged)
+    assert health["numel_sigma"] == sum(b.sigma[0].numel() for b in snapshot.layer_converged)
+    assert health["numel_beta"] == sum(c["beta_pre"][0].numel() for c in snapshot.layer_conditional_captures)
+    assert health["numel_energy"] == sum(
+        c["score_energy_pre"][0].numel() for c in snapshot.layer_conditional_captures)
+    assert all(health[f"nan_{name}"] == 0.0 for name in ("mu", "sigma", "phi", "energy", "beta"))
+
+
+def test_numerical_health_sees_a_middle_layer_nonfinite_entry() -> None:
+    model = _three_layer_model()
+    tokens = torch.randint(0, model.cfg.vocab_size, (1, model.cfg.max_seq_len))
+    snapshot = model.build_diagnostic_snapshot(tokens)
+    beliefs = list(snapshot.layer_converged)
+    mu = beliefs[1].mu.clone()
+    mu[0, 0, 0] = float("nan")
+    beliefs[1] = beliefs[1]._replace(mu=mu)
+    captures = [dict(cap) for cap in snapshot.layer_conditional_captures]
+    beta = captures[0]["beta_pre"].clone()
+    beta[0, 0, -1, 0] = float("inf")
+    captures[0]["beta_pre"] = beta
+    poisoned = dataclasses.replace(snapshot, layer_converged=tuple(beliefs),
+                                   layer_conditional_captures=tuple(captures))
+    health = extract.numerical_health(model, tokens, snapshot=poisoned)
+    assert health["nan_mu"] * health["numel_mu"] == pytest.approx(1.0)  # one of the pooled entries
+    assert health["nan_beta"] * health["numel_beta"] == pytest.approx(1.0)
+
+
+def test_numerical_trust_names_each_row_groups_layer_scope(tmp_path: Path) -> None:
+    guard = {"sigma_floor_frac": 0.25, "sigma_ceil_frac": 0.0, "energy_klmax_frac": 0.0}
+    health = {"nan_mu": 0.0, "nan_beta": 0.0, "numel_mu": 12, "numel_beta": 48,
+              "max_condition": 3.0, "n_layers": 3}
+    fig = figs.plot_numerical_trust(
+        guard, health, guard_denominators={"sigma_floor_frac": 8, "sigma_ceil_frac": 8,
+                                           "energy_klmax_frac": 16},
+        guard_scope="last layer", population="test split, one 4-token sequence",
+        path=str(tmp_path / "t.png"))
+    cells = {(r, c): cell.get_text().get_text()
+             for (r, c), cell in fig.axes[0].tables[0].get_celld().items()}
+    labels = [cells[(r, 0)] for r in range(1, 1 + max(key[0] for key in cells))]
+    assert r"variance at the floor $\varepsilon$ (last layer)" in labels
+    assert r"non-finite $\mu$ (all 3 layers)" in labels
+    assert r"non-finite $\beta$ (all 3 layers)" in labels
+    assert "largest covariance condition number (all 3 layers): 3" in fig.axes[0].get_title()
+    plt.close(fig)
+
+
+def test_report_marks_the_guard_rows_as_last_layer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from vfe3.viz import report
+
+    torch.manual_seed(71)
+    model = VFEModel(_cfg(n_layers=2)).eval()
+    seen: Dict[str, Any] = {}
+    trust = figs.plot_numerical_trust
+    monkeypatch.setattr(figs, "plot_numerical_trust",
+                        lambda guard, health, *a, **kw: seen.update(health=health, **kw)
+                        or trust(guard, health, *a, **kw))
+    tokens, targets = torch.tensor([[0, 1, 2, 3]]), torch.tensor([[1, 2, 3, 4]])
+    written = report.generate_figures(tmp_path, model=model, loader=[(tokens, targets)],
+                                      device=CPU, max_sequences=1)
+    assert "numerical_trust.png" in {path.name for path in written}
+    assert seen["guard_scope"] == "last layer"
+    assert seen["health"]["n_layers"] == 2

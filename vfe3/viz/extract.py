@@ -509,36 +509,67 @@ def numerical_health(
     *,
     snapshot: 'Optional[DiagnosticSnapshot]' = None,
 ) -> Dict[str, float]:
-    r"""Non-finite fractions of the captured intermediates + the worst covariance conditioning.
+    r"""Non-finite fractions of every layer's captured intermediates + the worst covariance conditioning.
 
-    Reads the first layer's converged belief and its captured routing score / weights and
-    reports ``nan_inf_fraction`` for mu, sigma, phi, energy, and beta (``nan_<x>``) with the entry
-    count each fraction is taken over (``numel_<x>``, so a fraction converts to "k of N"), plus the
-    maximum spectral condition number of the belief covariances. A near-zero finiteness map certifies stability is
-    genuine convergence, not masked blow-ups. (Numerical-FALLBACK activation counters --
+    Reads sequence 0 of each layer's converged belief :math:`(\mu_\ell, \Sigma_\ell, \phi_\ell)` and of each
+    layer's own routing capture (the pre-update cost ``score_energy_pre`` and weights ``beta_pre`` of
+    ``snapshot.layer_conditional_captures``; the shared ``conditional_capture`` holds only the LAST block's)
+    for :math:`\ell = 1, \dots, L`. Each field :math:`x` is pooled over the layers,
+
+    .. math::
+
+        \mathrm{nan}_x = \frac{\sum_\ell \#\{\text{non-finite entries of } x_\ell\}}{\sum_\ell |x_\ell|},
+
+    reported as ``nan_<x>`` with the pooled entry count ``numel_<x>`` :math:`= \sum_\ell |x_\ell|` (so a
+    fraction converts exactly to "k of N"), together with ``max_condition``
+    :math:`= \max_\ell \max_i \kappa(\Sigma_{\ell, i})`, the spectral condition number over every layer's
+    covariances in the family's layout, and ``n_layers`` :math:`= L`. A near-zero finiteness map certifies
+    stability is genuine convergence, not masked blow-ups. (Numerical-FALLBACK activation counters --
     safe_cholesky jitter rounds, pinv fallbacks -- would require instrumenting numerics and are
     left to a future pass.)
     """
-    from vfe3.numerics import nan_inf_fraction
-
     if snapshot is None:
         snapshot = model.build_diagnostic_snapshot(token_ids)
     snapshot = model._validate_diagnostic_snapshot(token_ids, snapshot)
-    out = _snapshot_sequence(snapshot.layer_converged[0])
-    capture = snapshot.conditional_capture
-    if capture is None:
-        raise RuntimeError("projected numerical health requires the executed inference capture")
-    condition = metrics.belief_spectrum(
-        out.sigma, diagonal=True, eps=model.cfg.eps, family=model.cfg.family)["condition"]
+    beliefs = [_snapshot_sequence(belief) for belief in snapshot.layer_converged]
+    captures = tuple(snapshot.layer_conditional_captures)
+    if not captures:
+        # A one-capture snapshot carries only the shared capture, which is the last block's: it pairs with
+        # the converged belief only when there is one layer.
+        if snapshot.conditional_capture is None:
+            raise RuntimeError("projected numerical health requires the executed inference capture")
+        if len(beliefs) != 1:
+            raise RuntimeError(
+                f"projected numerical health needs one routing capture per layer; this {len(beliefs)}-layer "
+                "snapshot carries only the last layer's")
+        captures = (snapshot.conditional_capture,)
+    if len(captures) != len(beliefs):
+        raise ValueError(
+            f"snapshot has {len(beliefs)} converged layers but {len(captures)} routing captures")
+    fields: Dict[str, List[torch.Tensor]] = {
+        "mu":     [belief.mu for belief in beliefs],                          # each (N, K)
+        "sigma":  [belief.sigma for belief in beliefs],                       # each (N, K) or (N, K, K)
+        "phi":    [belief.phi for belief in beliefs],
+        "energy": [capture["score_energy_pre"][0] for capture in captures],   # each (H, N, N), sequence 0
+        "beta":   [capture["beta_pre"][0] for capture in captures],           # each (H, N, N), sequence 0
+    }
+    health: Dict[str, float] = {}
+    counts: Dict[str, int] = {}
+    for name, tensors in fields.items():
+        numel = sum(int(tensor.numel()) for tensor in tensors)
+        nonfinite = sum(int((~torch.isfinite(tensor)).sum()) for tensor in tensors)
+        health[f"nan_{name}"] = float(nonfinite) / numel if numel else 0.0
+        counts[f"numel_{name}"] = numel
+    conditions = torch.stack([                                                # (L,) per-layer maxima
+        metrics.belief_spectrum(
+            belief.sigma, diagonal=model.cfg.diagonal_covariance, eps=model.cfg.eps,
+            family=model.cfg.family)["condition"].max()
+        for belief in beliefs])
     return {
-        "nan_mu": nan_inf_fraction(out.mu),
-        "nan_sigma": nan_inf_fraction(out.sigma),
-        "nan_phi": nan_inf_fraction(out.phi),
-        "nan_energy": nan_inf_fraction(capture["score_energy_pre"]),
-        "nan_beta": nan_inf_fraction(capture["beta_pre"]),
-        "max_condition": float(condition.max()),
-        **_numel_counts(mu=out.mu, sigma=out.sigma, phi=out.phi,
-                        energy=capture["score_energy_pre"], beta=capture["beta_pre"]),
+        **health,
+        "max_condition": float(conditions.max()),
+        **counts,
+        "n_layers": len(beliefs),
     }
 
 

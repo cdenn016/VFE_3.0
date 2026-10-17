@@ -4457,6 +4457,7 @@ def plot_numerical_trust(
     *,
     guard_denominators: Optional[Mapping[str, int]] = None,  # guard key -> entries examined
     population:         Optional[str]               = None,  # e.g. "test split, one sequence of 64 tokens"
+    guard_scope:        Optional[str]               = None,  # e.g. "last layer": what the guard rows read
     leak_tol:           float                       = 1e-6,
     row_sum_tol:        float                       = 1e-5,
     path:               Optional[str]               = None,
@@ -4471,9 +4472,17 @@ def plot_numerical_trust(
     :func:`vfe3.viz.extract.numerical_health`). Causal rows count (layer, head) maps with future
     attention :math:`\max_{j>i}\beta_{ij}>` ``leak_tol`` and with row-sum error above
     ``row_sum_tol``. A missing denominator is printed as such rather than guessed. Nonzero counts
-    are shaded. ``population`` names what the counts were measured on.
+    are shaded. ``population`` names what the counts were measured on. The row groups may read
+    different layers, so each names its own scope: ``guard_scope`` suffixes the guard rows, and the
+    finiteness rows and the condition-number title carry "all L layers" when ``health["n_layers"]``
+    is above one (``numerical_health`` pools every layer).
     """
     guard_denominators = dict(guard_denominators or {})
+    guard_suffix = f" ({guard_scope})" if guard_scope else ""
+    n_layers = health.get("n_layers")
+    layer_suffix = (f" (all {int(n_layers)} layers)"
+                    if isinstance(n_layers, (int, float)) and np.isfinite(float(n_layers))
+                    and int(n_layers) > 1 else "")
     guard_names = {
         "sigma_floor_frac":       r"variance at the floor $\varepsilon$",
         "sigma_ceil_frac":        r"variance at the ceiling $\sigma_{\max}$",
@@ -4495,10 +4504,11 @@ def plot_numerical_trust(
 
     for key, label in guard_names.items():
         if key in guard:
-            _add(label, float(guard[key]), guard_denominators.get(key))
+            _add(label + guard_suffix, float(guard[key]), guard_denominators.get(key))
     for key in (k for k in health if k.startswith("nan_")):
         name = key.removeprefix("nan_")
-        _add(f"non-finite {symbols.get(name, name)}", float(health[key]), health.get(f"numel_{name}"))
+        _add(f"non-finite {symbols.get(name, name)}{layer_suffix}", float(health[key]),
+             health.get(f"numel_{name}"))
     if causal is not None:
         leak = _np(causal["future_leakage"]).astype(float).ravel()
         n_maps = int(leak.size)
@@ -4537,7 +4547,7 @@ def plot_numerical_trust(
         if population:
             title += f" ({population})"
         if max_condition is not None and np.isfinite(float(max_condition)):
-            title += f"\nlargest covariance condition number: {float(max_condition):.4g}"
+            title += f"\nlargest covariance condition number{layer_suffix}: {float(max_condition):.4g}"
         ax.set_title(title, fontsize=8)
         fig.tight_layout()
         return _save(fig, path)
