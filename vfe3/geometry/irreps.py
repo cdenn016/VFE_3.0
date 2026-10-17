@@ -12,7 +12,9 @@ of one structure group (possibly with unequal dimensions). Registered family:
     so : label 'l<p>'   -- symmetric-traceless rank-p tensors over R^N,
                            dim = C(N+p-1, p) - C(N+p-3, p-2); for N = 3 this is the
                            spin-p tower (dim 2p + 1). Built in real orthonormal bases,
-                           so every generator image is exactly skew.
+                           so every generator image is skew: exactly for SO(3), 'l1' and
+                           the wedge recipes, to rounding (about 1e-16) for the
+                           Gram-Schmidt tensor powers at N != 3, p >= 2.
 
 Every block is built in one deterministic (canonical) basis. For N = 3 the spin-l block is
 built in closed form from the angular-momentum ladder, J_z |l,m> = m |l,m> and
@@ -38,10 +40,11 @@ A new irrep family (Young-tableau highest-weight reps, spinors, ...) slots in by
 ``register_irrep`` -- never by editing call sites (the modularity contract).
 """
 
+import contextlib
 import itertools
 import math
 import re
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -135,6 +138,23 @@ def check_irrep_constructible(
         return                             # closed-form ladder construction: any rank
     if p >= 2:
         _guard_cost(N, p)
+
+
+@contextlib.contextmanager
+def _single_threaded() -> Iterator[None]:
+    r"""Run the block at one intra-op thread and restore the caller's count on exit or error.
+
+    A threaded matmul or LAPACK call can change its reduction order and so the last bit of a
+    numerically built irrep (seen for the su(N) (2, 2) images at four threads), and the tower
+    ``basis_fingerprint`` hashes the bytes. The su(N) tensor irreps and the so(N) tensor-power
+    irreps (N != 3), whose bases come from a pseudo-inverse and Gram-Schmidt, build under it.
+    """
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(threads)
 
 
 def _guard_cost(N: int, p: int) -> None:
@@ -241,13 +261,20 @@ def _tensor_power_irrep(
     *,
     traceless: bool,                       # so: True (sym-traceless)
 ) -> torch.Tensor:                         # (n_gen, d, d) generator images on the irrep
-    """Restrict the Leibniz action to the invariant subspace: rho(X) = Q^T rho_p(X) Q."""
+    r"""Restrict the Leibniz action to the invariant subspace: rho(X) = Q^T rho_p(X) Q.
+
+    Built single-threaded (:func:`_single_threaded`), since the tower fingerprint hashes the bytes. The
+    images are skew to rounding (about 1e-16 at p >= 2), not exactly: Q comes from a pseudo-inverse and
+    Gram-Schmidt, and the images are deliberately not antisymmetrized, which would change their bytes and
+    refuse saved so_n checkpoints through the fingerprint (audit 2026-10-16, F38).
+    """
     n_gen, N, _ = G_def.shape
     if p == 0:
         return torch.zeros(n_gen, 1, 1, dtype=torch.float64)  # trivial rep: zero generators
     _guard_cost(N, p)
-    Q = _canonical_invariant_basis(N, p, traceless=traceless)
-    return torch.stack([Q.T @ _leibniz_action(G_def[a], p) @ Q for a in range(n_gen)])
+    with _single_threaded():
+        Q = _canonical_invariant_basis(N, p, traceless=traceless)              # (N^p, d)
+        return torch.stack([Q.T @ _leibniz_action(G_def[a], p) @ Q for a in range(n_gen)])
 
 
 # Standard rotation generators of R^3 in the (x, y, z) basis, (A_a)_{jk} = -epsilon_{ajk}, so that
@@ -633,15 +660,11 @@ def _su_tensor_irrep(G_def: torch.Tensor, p: int, q: int) -> torch.Tensor:   # (
     real orthonormal basis B of dimension D in which :math:`B^\dagger\rho_{\mathbb C}B` is real. Checks (raise): the
     imaginary residual, skewness, and the Casimir :math:`-\sum_a\rho_a^2 = 4C_2(p,q)I`.
 
-    Built single-threaded: a threaded matmul changes the reduction order and the last bit of the images (seen
-    for (2, 2) at four threads), and the tower fingerprint hashes the bytes.
+    Built single-threaded (:func:`_single_threaded`): a threaded matmul changes the reduction order and the
+    last bit of the images (seen for (2, 2) at four threads), and the tower fingerprint hashes the bytes.
     """
-    threads = torch.get_num_threads()
-    torch.set_num_threads(1)
-    try:
+    with _single_threaded():
         return _su_tensor_irrep_unthreaded(G_def, p, q)
-    finally:
-        torch.set_num_threads(threads)
 
 
 def _su_tensor_irrep_unthreaded(G_def: torch.Tensor, p: int, q: int) -> torch.Tensor:   # (n_gen, d, d) float64

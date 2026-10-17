@@ -713,7 +713,9 @@ def _build_so_n(
     The registered ``pullback_per_block`` capability therefore solves a tied tower as ONE full
     block (the exact Frobenius pullback of the whole representation, audit 2026-10-07 F47); an
     untied tower is solved per block, skipping generator-free 'l0' blocks. All blocks are built
-    in real orthonormal bases, so every embedded generator is exactly skew
+    in real orthonormal bases, so every embedded generator is skew: exactly for SO(3), 'l1' and
+    the wedge blocks, to rounding (about 1e-16, not antisymmetrized, so the fingerprint below is
+    unchanged) for the Gram-Schmidt tensor-power blocks at N != 3, p >= 2
     (skew_symmetric=True: det Omega = 1 structurally; inverses still route through the float64
     group-inverse solve, there is no transpose fast path).
     'l0' (trivial) blocks carry ZERO generators: those coordinates are gauge-invariant by
