@@ -119,8 +119,10 @@ SEEDS: ``seeds`` lists ints (``data_seed = seed``) or explicit ``(seed, data_see
 by every arm so replicates are paired across arms. Under the ``base_protocol`` budget the evaluated
 arm's replicate whose pair equals the base run's own ``(seed, data_seed)`` is the base run itself: it is
 reused (skipped in training, listed in the manifest, and read by the compute-matched rule when its
-config passes :func:`reuse_mismatch`) rather than retrained; the plan notes when its recorded code
-identity is not the current tree's.
+config passes :func:`reuse_mismatch`, which ignores the base's own checkpoint cadence,
+:data:`BASE_REUSE_IGNORED_FIELDS`) rather than retrained; the plan claims the reuse only when that check
+passes, notes the reason when it does not (the launch then refuses while the base blocks the pair), and
+notes when the base's recorded code identity is not the current tree's.
 
 LAYOUT: ``<out_root>/<base>/<budget>/<arm slug>/<test PPL>_<slug>_s<seed>_d<data seed>/``. An (arm,
 seed) pair whose run directory already holds a complete ``summary.json`` (finite ``test_ce``) and
@@ -1094,17 +1096,31 @@ def build_plan(
         evaluated.notes.append(
             f"total parameters {total:,} equal the base record" if total == base.recorded_params
             else f"total parameters {total:,} differ from the base record {base.recorded_params:,}")
-    if (evaluated is not None and budget == "base_protocol" and base.data_seed is not None
-            and (int(base.cfg.seed), base.data_seed) in evaluated.seeds and is_complete(base.run_dir)):
+    if (evaluated is not None and evaluated.status == "ready" and budget == "base_protocol"
+            and base.data_seed is not None and (int(base.cfg.seed), base.data_seed) in evaluated.seeds
+            and is_complete(base.run_dir)):
         from vfe3.paper.runs import code_identity_mismatch, load_run
 
-        evaluated.reused = [(int(base.cfg.seed), base.data_seed)]
-        evaluated.notes.append(f"seed pair {evaluated.reused[0]} is the base run itself and is reused, "
-                               "not retrained")
-        mismatch = code_identity_mismatch(load_run(base.run_dir))
-        if mismatch is not None:
-            evaluated.notes.append(f"the reused base run's code identity is not the current tree's ({mismatch}); "
-                                   "it is kept and flagged in the manifest")
+        pair = (int(base.cfg.seed), base.data_seed)
+        # The launch's own check (completed_run's base fallback), so the plan never claims a reuse the
+        # launch then rejects as stale (audit 2026-10-16 F19).
+        rejected = reuse_mismatch(base.run_dir, evaluated.cfg, dataset=str(evaluated.dataset), seed=pair[0],
+                                  data_seed=pair[1], ignored=BASE_REUSE_IGNORED_FIELDS)
+        if rejected is None:
+            evaluated.reused = [pair]
+            evaluated.notes.append(f"seed pair {pair} is the base run itself and is reused, not retrained")
+            if int(base.cfg.checkpoint_interval) != int(evaluated.cfg.checkpoint_interval):
+                evaluated.notes.append(
+                    f"the reused base run's checkpoint_interval={int(base.cfg.checkpoint_interval)} is not the "
+                    f"budget's {int(evaluated.cfg.checkpoint_interval)}; the cadence does not change the trained "
+                    "weights and is ignored for this reuse")
+            mismatch = code_identity_mismatch(load_run(base.run_dir))
+            if mismatch is not None:
+                evaluated.notes.append(f"the reused base run's code identity is not the current tree's "
+                                       f"({mismatch}); it is kept and flagged in the manifest")
+        else:
+            evaluated.notes.append(f"seed pair {pair} is the base run's own, but the base run is not reused: "
+                                   f"{rejected}; a launch refuses to train while it blocks the pair")
     for plan in plans:
         if plan.status == "deferred" and evaluated is not None:
             plan.est_hours = evaluated.est_hours
@@ -1220,6 +1236,13 @@ def find_complete_run(arm_dir: Path, label: str) -> Optional[Path]:
 # Fields a reused run may differ in from the plan: the model seed (checked against the run's recorded
 # seed instead) and a resume path, neither of which defines the arm.
 REUSE_IGNORED_FIELDS: Tuple[str, ...] = ("seed", "resume_from")
+# The base run, reused as the evaluated arm's replicate at its own seed pair, may also differ in its
+# training-checkpoint cadence: it was trained with its own checkpoint_interval (the 36.41 base: 90,000 of
+# 120,000 steps) while every budget writes one checkpoint at the end. The cadence only decides when a
+# resumable checkpoint is written, so it does not change the trained weights (the best-model contract of
+# vfe3.run_artifacts drops it for the same reason). Runs in the experiment directory, which paper_arms
+# writes at the budget's cadence, are still compared on it (audit 2026-10-16 F19).
+BASE_REUSE_IGNORED_FIELDS: Tuple[str, ...] = (*REUSE_IGNORED_FIELDS, "checkpoint_interval")
 
 
 def _serialized(cfg: Any) -> Dict[str, Any]:
@@ -1239,12 +1262,14 @@ def reuse_mismatch(
     dataset:   str,
     seed:      int,
     data_seed: int,
+    ignored:   Sequence[str] = REUSE_IGNORED_FIELDS,
 ) -> Optional[str]:
     r"""Why the complete run ``run_dir`` is not a run of ``cfg`` at ``(seed, data_seed)`` on ``dataset``.
 
     None when it is: the run's saved config, loaded as :mod:`vfe3.paper` loads it, serializes to the
-    plan's config on every field except :data:`REUSE_IGNORED_FIELDS`, and its dataset, model seed and
-    data-order seed (when recorded) are the plan's. A label match alone never reuses a run.
+    plan's config on every field except ``ignored`` (:data:`REUSE_IGNORED_FIELDS`; the base run's
+    fallback passes :data:`BASE_REUSE_IGNORED_FIELDS`), and its dataset, model seed and data-order seed
+    (when recorded) are the plan's. A label match alone never reuses a run.
     """
     from vfe3.paper.runs import load_run
 
@@ -1260,7 +1285,7 @@ def reuse_mismatch(
     if type(record.cfg) is not type(cfg):
         return f"model family {type(record.cfg).__name__}, plan {type(cfg).__name__}"
     recorded, planned = _serialized(record.cfg), _serialized(cfg)
-    keys = sorted((set(recorded) | set(planned)) - set(REUSE_IGNORED_FIELDS))
+    keys = sorted((set(recorded) | set(planned)) - set(ignored))
     differing = [key for key in keys if _canonical(recorded.get(key)) != _canonical(planned.get(key))]
     if differing:
         return "config differs from the plan in " + ", ".join(
@@ -1290,7 +1315,8 @@ def completed_run(
     rather than silently reused. Without ``cfg`` the first complete run is returned unchecked.
     Otherwise, under the ``base_protocol`` budget, the evaluated arm at the base run's own
     ``(seed, data_seed)`` is the base run itself when it is complete and, with ``cfg`` given,
-    :func:`reuse_mismatch` accepts it (a base recorded with another budget or cadence is stale).
+    :func:`reuse_mismatch` accepts it with :data:`BASE_REUSE_IGNORED_FIELDS` (its own checkpoint cadence
+    is not a difference; a base recorded with another budget is stale).
     """
     slug = (ARMS if arms is None else arms)[label]["slug"]
     for found in complete_runs(exp_dir / slug, run_label(slug, seed, data_seed)):
@@ -1304,7 +1330,8 @@ def completed_run(
             and base.data_seed is not None and (int(base.cfg.seed), base.data_seed) == (seed, data_seed)
             and is_complete(base.run_dir)):
         reason = (None if cfg is None else
-                  reuse_mismatch(base.run_dir, cfg, dataset=str(dataset), seed=seed, data_seed=data_seed))
+                  reuse_mismatch(base.run_dir, cfg, dataset=str(dataset), seed=seed, data_seed=data_seed,
+                                 ignored=BASE_REUSE_IGNORED_FIELDS))
         if reason is None:
             return base.run_dir
         if stale is not None:
@@ -1533,14 +1560,14 @@ def compute_matched_config(
     runs: List[Path] = []
     missing_pairs: List[str] = []
     for s, d in plan.seeds:
+        # completed_run checks every run it returns against the matched config, the reused base run too.
+        stale: List[Dict[str, str]] = []
         found = completed_run(exp_dir, EVALUATED, s, d, base=base, budget=budget, cfg=plan.matched_cfg,
-                              dataset=plan.dataset)
-        # The base-run fallback of completed_run is not config-checked; check every run here.
-        reason = ("no complete run" if found is None else
-                  reuse_mismatch(found, plan.matched_cfg, dataset=str(plan.dataset), seed=s, data_seed=d))
-        if reason is None:
+                              dataset=plan.dataset, stale=stale)
+        if found is not None:
             runs.append(found)
         else:
+            reason = "; ".join(f"{entry['run']}: {entry['reason']}" for entry in stale) or "no complete run"
             missing_pairs.append(f"({s}, {d}): {reason}")
     rule_path = exp_dir / plan.slug / WIDTH_RULE_FILE
     if rule_path.is_file():
@@ -1638,7 +1665,12 @@ def run_plan(
             stale: List[Dict[str, str]] = []
             if completed_run(exp_dir, plan.label, seed, data_seed, base=base, budget=budget, arms=arms,
                              cfg=expected, dataset=plan.dataset, stale=stale) is None and stale:
+                # The base run cannot be moved aside: load_base reads it.
                 blocked.extend(f"{plan.label} seed=({seed}, {data_seed}): {entry['run']}: {entry['reason']}"
+                               + (" (the base run itself, which load_base reads: leave it in place; this pair "
+                                  "cannot run until the plan's evaluated config matches the base run's, or "
+                                  "the pair is dropped from CONFIG['seeds'])"
+                                  if Path(entry["run"]) == base.run_dir else "")
                                for entry in stale)
     if blocked:
         raise SystemExit("refusing to train: complete runs on disk do not match the plan (move them aside, or "
