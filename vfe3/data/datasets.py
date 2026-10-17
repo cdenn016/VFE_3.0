@@ -12,7 +12,9 @@ import codecs
 import copy
 import hashlib
 import json
+import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Callable, Dict, Optional, Sequence, Tuple
 
@@ -178,6 +180,62 @@ def _binary_cache_metadata(
     return canonical_meta, dtype
 
 
+def _expected_cache_provenance(
+    dataset:        str,
+    split:          str,
+    payload_sha256: str,
+
+    *,
+    cache_dir:      Path,
+) -> Dict[str, object]:
+    r"""The tokenizer-provenance manifest that binds one cache payload (see :func:`_cache_tokenizer_provenance`)."""
+    return {
+        "schema_version": _CACHE_PROVENANCE_SCHEMA_VERSION,
+        "dataset": dataset,
+        "split": split,
+        "tokenizer_tag": _tokenizer_tag(dataset),
+        "tokenizer_encoding": tiktoken_encoding_name(dataset),
+        "tokenizer_vocab_size": tokenizer_vocab_size(dataset, cache_dir=cache_dir),
+        "payload_sha256": payload_sha256,
+    }
+
+
+def publish_cache_provenance(
+    dataset:   str,
+    split:     str,
+
+    *,
+    cache_dir: Optional[Path] = None,
+) -> Path:
+    r"""Write the ``<cache>.provenance.json`` manifest of ``dataset``/``split``'s current payload; return its path.
+
+    The payload resolves as in :func:`cache_source_identity` (the ``.pt`` cache first, then the ``.bin``
+    memmap), and the manifest binds its SHA-256 digest, the dataset, split, tokenizer tag, encoding and
+    vocabulary size, so the loader reports ``tokenizer_provenance_status='manifest_verified'`` for it. A
+    word cache reads its vocabulary size from the sidecar, so publish the manifest after the sidecar. The
+    file is replaced atomically. Publishing a manifest changes the cache's source identity, which runs bind.
+    """
+    pt = cache_path(dataset, split, suffix="pt", cache_dir=cache_dir)
+    binp = cache_path(dataset, split, suffix="bin", cache_dir=cache_dir)
+    if pt.exists():
+        payload = pt.resolve()
+    elif binp.exists():
+        payload = _resolved_binary_cache_paths(binp)[0]
+    else:
+        raise FileNotFoundError(f"no tokenized cache for {dataset!r}/{split!r}: tried {pt} and {binp}")
+    manifest = _expected_cache_provenance(dataset, split, _sha256_file(payload), cache_dir=payload.parent)
+    target = Path(str(payload) + ".provenance.json")
+    handle, temporary = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
+        os.replace(temporary, target)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
+    return target
+
+
 def _cache_tokenizer_provenance(
     path:           Path,
     dataset:       str,
@@ -214,15 +272,7 @@ def _cache_tokenizer_provenance(
     }
     if not isinstance(manifest, dict) or set(manifest) != required:
         raise ValueError(f"token cache provenance manifest has an unsupported schema: {manifest_path}")
-    expected = {
-        "schema_version": _CACHE_PROVENANCE_SCHEMA_VERSION,
-        "dataset": dataset,
-        "split": split,
-        "tokenizer_tag": _tokenizer_tag(dataset),
-        "tokenizer_encoding": tiktoken_encoding_name(dataset),
-        "tokenizer_vocab_size": tokenizer_vocab_size(dataset, cache_dir=path.parent),
-        "payload_sha256": payload_sha256,
-    }
+    expected = _expected_cache_provenance(dataset, split, payload_sha256, cache_dir=path.parent)
     differing = sorted(key for key in required if manifest.get(key) != expected[key])
     if differing:
         raise ValueError(

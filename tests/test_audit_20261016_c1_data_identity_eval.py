@@ -114,3 +114,70 @@ def test_train_names_an_unsized_loader_that_cannot_be_cycled() -> None:
         _train(cfg, one_shot, n_steps=3)
 
 
+# ------------------------------------------------------------------------------------------------ F80
+
+_ROWS: Dict[Tuple[str, int], List[str]] = {
+    ("train", 0): [" the cat sat ", " the cat , the dog . "],
+    ("validation", 0): [" the cat "],
+    ("test", 0): [" dog . "],
+}
+
+
+@pytest.fixture()
+def fake_corpus(monkeypatch: pytest.MonkeyPatch) -> Dict[Tuple[str, int], List[str]]:
+    rows = {key: list(value) for key, value in _ROWS.items()}
+    monkeypatch.setattr(builder, "SPLIT_FILES",
+                        {"train": ("train|0",), "validation": ("validation|0",), "test": ("test|0",)})
+
+    def read_rows(file_name: str) -> List[str]:
+        split, index = file_name.split("|")
+        return list(rows[(split, int(index))])
+
+    monkeypatch.setattr(builder, "_read_rows", read_rows)
+    datasets_mod._WORD_VOCABULARY_CACHE.clear()
+    return rows
+
+
+def _meta(dataset: str, split: str, root: Path) -> Dict[str, Any]:
+    return json.loads(Path(str(cache_path(dataset, split, suffix="pt", cache_dir=root)) + ".meta.json")
+                      .read_text(encoding="utf-8"))
+
+
+def test_builder_records_the_vocabulary_digest_and_a_verified_provenance_manifest(
+        tmp_path: Path, fake_corpus: Dict[Tuple[str, int], List[str]]) -> None:
+    builder.build(min_count=1, cache_dir=tmp_path)
+    vocabulary = WordVocabulary.load(vocabulary_path(builder.DATASET, tag="word", cache_dir=tmp_path))
+    for split in builder.SPLIT_FILES:
+        assert _meta(builder.DATASET, split, tmp_path)["vocabulary_sha256"] == word_vocabulary_sha256(vocabulary.words)
+        identity = cache_source_identity(builder.DATASET, split, cache_dir=tmp_path)
+        assert identity["tokenizer_provenance_status"] == "manifest_verified", split
+        assert identity["tokenizer_provenance"]["tokenizer_vocab_size"] == vocabulary.vocab_size
+
+
+def test_loader_rejects_a_same_size_reordered_vocabulary_of_a_built_cache(
+        tmp_path: Path, fake_corpus: Dict[Tuple[str, int], List[str]]) -> None:
+    builder.build(min_count=1, cache_dir=tmp_path)
+    sidecar = vocabulary_path(builder.DATASET, tag="word", cache_dir=tmp_path)
+    vocabulary = WordVocabulary.load(sidecar)
+    words = list(vocabulary.words)
+    words[1], words[2] = words[2], words[1]                                 # same size, different id order
+    sidecar.unlink()
+    WordVocabulary(words, min_count=vocabulary.min_count, eos=vocabulary.eos).save(sidecar)
+    datasets_mod._WORD_VOCABULARY_CACHE.clear()
+    with pytest.raises(ValueError, match="vocabulary_sha256"):
+        datasets_mod.make_dataloader(builder.DATASET, "test", 2, 1, shuffle=False, drop_last=False,
+                                     cache_dir=tmp_path)
+
+
+def test_forced_rebuild_publishes_a_manifest_for_the_new_payload(
+        tmp_path: Path, fake_corpus: Dict[Tuple[str, int], List[str]]) -> None:
+    builder.build(min_count=1, cache_dir=tmp_path)
+    before = cache_source_identity(builder.DATASET, "validation", cache_dir=tmp_path)
+    fake_corpus[("validation", 0)] = [" the the cat cat "]
+    builder.build(min_count=1, cache_dir=tmp_path, force=True)
+    after = cache_source_identity(builder.DATASET, "validation", cache_dir=tmp_path)
+    assert after["sha256"] != before["sha256"]
+    assert after["tokenizer_provenance_status"] == "manifest_verified"
+    assert after["tokenizer_provenance"]["payload_sha256"] == after["sha256"]
+
+
