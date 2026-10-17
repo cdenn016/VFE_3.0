@@ -4221,6 +4221,162 @@ class _DivergenceMonitor:
         out["divergence_spike"] = float(flagged)
         return out
 
+    def state_dict(
+        self,
+        *,
+        interval_ends: bool,               # this step writes a log/eval row, which ends the open interval
+    ) -> Dict[str, Any]:
+        r"""The host state a resumed run needs to continue the EMAs, warmups, cooldown and interval exactly.
+
+        A periodic checkpoint is written before its step's metrics row, so on a log/eval step
+        (``interval_ends``) the saved interval is the empty one :meth:`reset_interval` leaves after the row.
+        Plain floats, ints and dicts, so the record loads under ``torch.load(weights_only=True)``.
+        """
+        def stat(value: _RunningStat) -> List[Any]:
+            return [value.count, value.total, value.peak]
+
+        source = _DivergenceMonitor() if interval_ends else self
+        return {
+            "loss_ema":   self._loss_ema,
+            "loss_seen":  self._loss_seen,
+            "norm_ema":   dict(self._norm_ema),
+            "norm_seen":  dict(self._norm_seen),
+            "last_spike": self._last_spike,
+            "interval": {
+                "steps":   source.steps,
+                "loss":    stat(source._loss),
+                "ce":      stat(source._ce),
+                "norms":   {role: stat(source._norms[role]) for role in DIVERGENCE_ROLES},
+                "clipped": source._clipped,
+                "binding": source._binding,
+            },
+        }
+
+    def load_state_dict(
+        self,
+        state: object,                     # a state_dict() record, possibly from an older or malformed checkpoint
+    ) -> bool:
+        r"""Restore :meth:`state_dict`; a malformed record leaves the monitor fresh and returns False."""
+        monitor = _divergence_monitor_state(state)
+        if monitor is None:
+            return False
+
+        def stat(values: List[Any]) -> _RunningStat:
+            out = _RunningStat()
+            out.count, out.total, out.peak = values
+            return out
+
+        interval = monitor["interval"]
+        self._loss_ema, self._loss_seen = monitor["loss_ema"], monitor["loss_seen"]
+        self._norm_ema, self._norm_seen = dict(monitor["norm_ema"]), dict(monitor["norm_seen"])
+        self._last_spike = monitor["last_spike"]
+        self.steps = interval["steps"]
+        self._loss, self._ce = stat(interval["loss"]), stat(interval["ce"])
+        self._norms = {role: stat(interval["norms"][role]) for role in DIVERGENCE_ROLES}
+        self._clipped, self._binding = interval["clipped"], interval["binding"]
+        return True
+
+
+DIVERGENCE_STATE_SCHEMA: int = 1          # checkpoint "divergence_monitor" record (audit 2026-10-16 F77)
+
+
+def _count(value: object) -> Optional[int]:
+    r"""``value`` when it is an int >= 0 (not a bool), else None."""
+    return value if type(value) is int and value >= 0 else None
+
+
+def _real(value: object) -> Optional[float]:
+    r"""``value`` as a float when it is a non-bool int or float, else None (NaN and infinities pass)."""
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _divergence_monitor_state(
+    value: object,
+) -> Optional[Dict[str, Any]]:
+    r"""A validated copy of :meth:`_DivergenceMonitor.state_dict`, or None when anything is malformed."""
+    if not isinstance(value, Mapping):
+        return None
+
+    def stat(item: object) -> Optional[List[Any]]:
+        if not isinstance(item, (list, tuple)) or len(item) != 3:
+            return None
+        count, total, peak = _count(item[0]), _real(item[1]), _real(item[2])
+        return None if count is None or total is None or peak is None else [count, total, peak]
+
+    def table(item: object, kind: Callable[[object], Any]) -> Optional[Dict[str, Any]]:
+        if not isinstance(item, Mapping):
+            return None
+        out = {key: kind(entry) for key, entry in item.items()}
+        return out if all(isinstance(key, str) and entry is not None for key, entry in out.items()) else None
+
+    loss_ema = value.get("loss_ema")
+    last_spike = value.get("last_spike")
+    interval = value.get("interval")
+    out: Dict[str, Any] = {
+        "loss_ema":   None if loss_ema is None else _real(loss_ema),
+        "loss_seen":  _count(value.get("loss_seen")),
+        "norm_ema":   table(value.get("norm_ema"), _real),
+        "norm_seen":  table(value.get("norm_seen"), _count),
+        "last_spike": None if last_spike is None else _count(last_spike),
+    }
+    if (out["loss_seen"] is None or out["norm_ema"] is None or out["norm_seen"] is None
+            or (loss_ema is not None and out["loss_ema"] is None)
+            or (last_spike is not None and out["last_spike"] is None) or not isinstance(interval, Mapping)):
+        return None
+    norms = interval.get("norms")
+    if not isinstance(norms, Mapping):
+        return None
+    restored = {
+        "steps":   _count(interval.get("steps")),
+        "loss":    stat(interval.get("loss")),
+        "ce":      stat(interval.get("ce")),
+        "norms":   {role: stat(norms.get(role)) for role in DIVERGENCE_ROLES},
+        "clipped": _count(interval.get("clipped")),
+        "binding": _count(interval.get("binding")),
+    }
+    if (any(restored[key] is None for key in ("steps", "loss", "ce", "clipped", "binding"))
+            or any(entry is None for entry in restored["norms"].values())):
+        return None
+    out["interval"] = restored
+    return out
+
+
+def _divergence_checkpoint_record(
+    divergence:        _DivergenceMonitor,
+    *,
+    interval_ends:     bool,                     # the checkpoint step writes a log/eval row after the save
+    skipped_steps:     int,                      # rejected updates so far (whole run)
+    consecutive_skips: int,
+    last_group_norms:  Mapping[str, float],      # pre-clip group norms of the last logged step
+) -> Dict[str, Any]:
+    r"""The checkpoint's ``divergence_monitor`` entry: the monitor state plus the host counters beside it."""
+    return {"schema": DIVERGENCE_STATE_SCHEMA,
+            "monitor": divergence.state_dict(interval_ends=interval_ends),
+            "skipped_steps": int(skipped_steps), "consecutive_skips": int(consecutive_skips),
+            "last_group_norms": {str(key): float(norm) for key, norm in last_group_norms.items()}}
+
+
+def _checkpoint_divergence_state(
+    value: object,
+) -> Optional[Dict[str, Any]]:
+    r"""A validated copy of a :func:`_divergence_checkpoint_record`, or None.
+
+    Tolerant like the checkpoint's numerics counters: the record is a diagnostic, so a missing or malformed
+    one (an older checkpoint) makes the resumed run restart its monitor instead of failing the resume.
+    """
+    if not isinstance(value, Mapping) or value.get("schema") != DIVERGENCE_STATE_SCHEMA:
+        return None
+    monitor = _divergence_monitor_state(value.get("monitor"))
+    skipped, consecutive = _count(value.get("skipped_steps")), _count(value.get("consecutive_skips"))
+    norms = value.get("last_group_norms")
+    if monitor is None or skipped is None or consecutive is None or not isinstance(norms, Mapping):
+        return None
+    group_norms = {key: _real(norm) for key, norm in norms.items()}
+    if not all(isinstance(key, str) and norm is not None for key, norm in group_norms.items()):
+        return None
+    return {"schema": DIVERGENCE_STATE_SCHEMA, "monitor": monitor, "skipped_steps": skipped,
+            "consecutive_skips": consecutive, "last_group_norms": group_norms}
+
 
 def _conform_row(
     row:    Mapping[str, Any],
@@ -4495,6 +4651,17 @@ def train(
     # on host values train_step already transfers.
     divergence = _DivergenceMonitor()
     last_group_norms: Dict[str, float] = {}               # pre-clip group norms of the last logged step
+    # A resumed run continues the monitor, the skip counters and the last logged group norms from the
+    # checkpoint, so its spikes and divergence columns match the uninterrupted run (audit 2026-10-16 F77).
+    # An older checkpoint carries none: the monitor restarts and spikes wait for DIVERGENCE_EMA_WARMUP steps.
+    resumed_divergence = getattr(artifacts, "resumed_divergence_state", None) if start_step > 0 else None
+    if resumed_divergence is not None and divergence.load_state_dict(resumed_divergence["monitor"]):
+        skipped_steps = resumed_divergence["skipped_steps"]
+        consecutive_skips = resumed_divergence["consecutive_skips"]
+        last_group_norms.update(resumed_divergence["last_group_norms"])
+    elif start_step > 0 and artifacts is not None:
+        logger.info(" resume: the checkpoint carries no divergence-monitor state; spike detection restarts "
+                    "and waits %d finite steps", DIVERGENCE_EMA_WARMUP)
     completed_steps = int(n_steps)
     reset_nonfinite_tangent_elements()   # per-run accounting for the SPD-retraction guard
     reset_public_spd_repair_elements()   # ... and its certificate repairs
@@ -5102,6 +5269,10 @@ def train(
                                            exc, logger)
                 artifacts.numerics_counters_state = None
             artifacts.wall_clock_state = timer.elapsed_wall_clock_s() if timer is not None else None
+            # The row of this step is written after the save and then ends the interval (do_log or do_csv).
+            artifacts.divergence_state = _divergence_checkpoint_record(
+                divergence, interval_ends=bool(do_log or do_csv), skipped_steps=skipped_steps,
+                consecutive_skips=consecutive_skips, last_group_norms=last_group_norms)
             try:
                 artifacts.save_checkpoint(step + 1, model, optimizer, cfg, scaler=scaler,
                                           data_state=checkpoint_data_state)

@@ -1877,6 +1877,16 @@ def _checkpoint_numerics_counters(
     return out or None
 
 
+def _checkpoint_divergence_state(
+    value: object,
+) -> Optional[Dict[str, object]]:
+    r"""The checkpoint's divergence-monitor record, validated by ``vfe3.train._checkpoint_divergence_state``
+    (None when missing or malformed: a diagnostic, so it never fails a save or a resume)."""
+    from vfe3.train import _checkpoint_divergence_state as validated
+
+    return validated(value)
+
+
 class RunArtifacts:
     r"""Owns a run directory and its incremental metrics, reports, and optional model files.
 
@@ -1957,6 +1967,10 @@ class RunArtifacts:
         # checkpoint carried in (set by load_checkpoint), so metrics.csv wall_clock_s continues.
         self.wall_clock_state: Optional[float] = None
         self.resumed_wall_clock_s: Optional[float] = None
+        # Divergence-monitor host state a checkpoint carries (set by train()) and the validated record a
+        # resumed checkpoint carried in (set by load_checkpoint), so spike detection continues exactly.
+        self.divergence_state: Optional[Dict[str, object]] = None
+        self.resumed_divergence_state: Optional[Dict[str, object]] = None
         # Source bytes at run start: vfe3/**/*.py, root *.py drivers and pyproject.toml, zipped with
         # their hash, the Git HEAD and the dirty-file list. Best-effort: a failure is recorded in
         # the returned mapping (and later in provenance.json), never raised.
@@ -2270,6 +2284,9 @@ class RunArtifacts:
                 "numerics_counters": _checkpoint_numerics_counters(
                     getattr(self, "numerics_counters_state", None)),
                 "wall_clock_s":    getattr(self, "wall_clock_state", None),
+                # Divergence-monitor EMAs, warmups, cooldown and open interval with the skip counters
+                # (vfe3.train._divergence_checkpoint_record, or None); a diagnostic like the counters above.
+                "divergence_monitor": _checkpoint_divergence_state(getattr(self, "divergence_state", None)),
             }, tmp)
             _atomic_replace(path, tmp)
         return path
@@ -2727,6 +2744,8 @@ def load_checkpoint(
         artifacts.resumed_wall_clock_s = (
             float(saved_wall_clock) if isinstance(saved_wall_clock, (int, float))
             and not isinstance(saved_wall_clock, bool) and math.isfinite(saved_wall_clock) else None)
+        # Divergence-monitor state (None for an older checkpoint or a malformed record); train() continues it.
+        artifacts.resumed_divergence_state = _checkpoint_divergence_state(ckpt.get("divergence_monitor"))
         saved_code_identity = ckpt.get("code_identity_sha256")
         code_identity_match = (
             saved_code_identity == expected_code_identity
