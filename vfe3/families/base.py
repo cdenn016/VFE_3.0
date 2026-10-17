@@ -2,14 +2,13 @@ r"""The exponential-family parameter layer for VFE_3.0.
 
 A ``BeliefParams`` is a batched parameter container plus the family's math
 (natural<->moment, log-partition A(theta), entropy, divergences). The divergence
-functional ``renyi`` (KL = alpha 1) dispatches on the parameter object: a family with a
-``renyi_closed_form`` method uses it (the pinned Gaussian moment forms); a family that
-defines only ``log_partition_at`` (and ``natural``/``expected_statistic``) gets the
-generic Bregman/Renyi-from-A divergence for free. This is the seam a new exponential
+functional ``renyi`` (the KL, alpha = 1; other orders are refused) dispatches on the parameter
+object: a family with a ``renyi_closed_form`` method uses it (the pinned Gaussian moment forms);
+a family that defines only ``log_partition_at`` (and ``natural``/``expected_statistic``) gets the
+generic Bregman KL for free. This is the seam a new exponential
 family slots in behind -- by writing-and-registering a subclass, never editing call sites.
 """
 
-import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Callable, ClassVar, Dict, List, Optional, Tuple, Type
@@ -66,18 +65,6 @@ def safe_kl_clamp(
     r"""Clamp to [0, kl_max]; positive infinity disables the finite upper ceiling."""
     kl = kl.clamp(min=0.0, max=kl_max)
     return kl.nan_to_num(nan=kl_max, posinf=kl_max, neginf=0.0)
-
-
-def _warn_alpha_gt_one(alpha: float, family: str) -> None:
-    r"""Warn that alpha > 1 leaves the convex regime of the Renyi blend."""
-    warnings.warn(
-        f"renyi: alpha={alpha} > 1 (family={family!r}) leaves the convex regime; "
-        f"the blend (1-alpha)*Sigma_q + alpha*Sigma_t may be non-positive-definite, where the "
-        f"divergence is undefined and the pair is returned at kl_max (diagonal: any non-positive "
-        f"coordinate; full: an indefinite blend, whatever the Cholesky ridge).",
-        RuntimeWarning,
-        stacklevel=3,
-    )
 
 
 def _logdet_chol(L: torch.Tensor) -> torch.Tensor:
@@ -431,11 +418,8 @@ def divergence_functionals() -> Tuple[str, ...]:
 
 # Per-COORDINATE divergence registry (the unsummed (..., K) form consumed by the
 # state_dependent_per_coord alpha). A divergence has a per-coordinate form ONLY when it decomposes
-# as a sum over the diagonal-Gaussian coordinates: Renyi/KL does (renyi_per_coord), and so do the
-# divergences that are AFFINE in the Renyi divergence -- Bhattacharyya (0.5 D_{1/2}) and Jeffreys
-# (KL + KL_rev). squared_hellinger is deliberately ABSENT: H^2 = 1 - exp(-D_{1/2}/2) is a nonlinear
-# transform of the SUMMED divergence and does not split coordinate-wise. A functional with no member
-# here is rejected by ``free_energy.self_divergence_per_coord`` (and at config construction).
+# as a sum over coordinates: the KL does (renyi_per_coord; ordered conditional terms for the full
+# family). A functional with no member here is rejected by ``free_energy.self_divergence_per_coord``.
 _FUNCTIONALS_PER_COORD: Dict[str, Callable[..., torch.Tensor]] = {}
 
 
@@ -473,16 +457,19 @@ def divergence_functionals_per_coord() -> Tuple[str, ...]:
     return tuple(sorted(_FUNCTIONALS_PER_COORD))
 
 
-# Renyi orders with |alpha - 1| < _KL_ALPHA_SWITCH are evaluated as the KL (alpha = 1) limit.
+# Renyi orders with |alpha - 1| < _KL_ALPHA_SWITCH are evaluated as the KL (alpha = 1) limit; every
+# other order is refused (audit 2026-10-16 F93: the retired divergence_family / renyi_order fields left
+# KL as the only configured divergence, so the alpha != 1 blend kernels were removed). Defined once
+# here; the family modules import it (they already import base, which imports no family module).
 _KL_ALPHA_SWITCH: float = 1e-6
 
-# fp32 catastrophic-cancellation band around the alpha->1 (KL) limit of the Renyi forms: outside the
-# |alpha-1| < _KL_ALPHA_SWITCH KL switch but inside this band the three nearly-equal log terms (the
-# log-partition values of the generic A-form, the logdets of the Gaussian closed forms) cancel before
-# the /(alpha-1) divide, losing ~1% accuracy in float32 out to ~|alpha-1| ~ 1e-3. Inside the band the
-# term is evaluated in float64 and cast back. Both constants are defined once here; the family modules
-# import them (they already import base, which imports no family module).
-_RENYI_KL_BAND: float = 1e-2
+
+def _require_kl_order(alpha: float, where: str) -> None:
+    r"""Refuse a Renyi order outside the KL switch :math:`|\alpha - 1| < 10^{-6}` (only KL is implemented)."""
+    if not abs(alpha - 1.0) < _KL_ALPHA_SWITCH:
+        raise ValueError(
+            f"{where}: only the KL divergence (alpha = 1) is implemented, got alpha={alpha!r}; "
+            f"the Renyi alpha != 1 kernels were removed (audit 2026-10-16 F93)")
 
 
 def _renyi_from_log_partition(
@@ -494,46 +481,32 @@ def _renyi_from_log_partition(
     kl_max:  float,
     eps:     float,
 ) -> torch.Tensor:
-    r"""Generic Renyi/KL from the log-partition (for families with no closed form).
+    r"""Generic KL from the log-partition (for families with no closed form).
 
-    alpha != 1:  R = 1/(alpha-1) [ A(alpha*tq + (1-alpha)*tp) - alpha*A(tq) - (1-alpha)*A(tp) ].
-    alpha == 1:  KL = A(tp) - A(tq) - <gradA(tq), tp - tq>, gradA(tq) = E_q[T] (expected_statistic).
+    KL = A(tp) - A(tq) - <gradA(tq), tp - tq>, gradA(tq) = E_q[T] (expected_statistic). ``alpha`` is
+    kept for signature stability and must lie in the KL switch (ValueError otherwise).
 
     ``eps`` is accepted for signature symmetry with the closed-form path and is intentionally
     unused here: the A-form is evaluated directly from the natural parameters with no clamp.
     """
+    _require_kl_order(alpha, "_renyi_from_log_partition")
     cls = type(q)
     tq = q.natural()
     tp = p.natural()
-    if abs(alpha - 1.0) < _KL_ALPHA_SWITCH:
-        grad = q.expected_statistic()                       # E_q[T] = gradA(theta_q)
-        A_q = cls.log_partition_at(tq)                       # batch-shaped (parameter axes summed)
-        batch_ndim = A_q.dim()
-        # Bregman KL = A(tp) - A(tq) - sum_c <gradA_c, (tp - tq)_c>, where each natural-parameter
-        # component c is contracted over ITS parameter axes (the trailing dims beyond the batch).
-        # A vector statistic (..., K) sums the last axis; a matrix statistic (..., K, K) is
-        # Frobenius-contracted over the last two -- so a matrix-parameter family (e.g. the full
-        # Gaussian's t2) works through the generic path, not only vector-parameter families.
-        inner: 'torch.Tensor | float' = 0.0          # float seed; becomes a Tensor on the first term
-        for g, a, b in zip(grad, tq, tp):
-            term = g * (b - a)
-            param_axes = tuple(range(batch_ndim, term.dim()))
-            inner = inner + (term.sum(dim=param_axes) if param_axes else term)
-        div = cls.log_partition_at(tp) - A_q - inner
-    elif abs(alpha - 1.0) < _RENYI_KL_BAND:
-        # fp32 cancellation band: evaluate the three log-partitions in float64, then cast back
-        # (mirrors the closed-form gaussian._RENYI_KL_BAND float64 island).
-        tq64    = tuple(t.double() for t in tq)
-        tp64    = tuple(t.double() for t in tp)
-        blend64 = tuple(alpha * a + (1.0 - alpha) * b for a, b in zip(tq64, tp64))
-        div = ((cls.log_partition_at(blend64)
-                - alpha * cls.log_partition_at(tq64)
-                - (1.0 - alpha) * cls.log_partition_at(tp64)) / (alpha - 1.0)).to(tq[0].dtype)
-    else:
-        blend = tuple(alpha * a + (1.0 - alpha) * b for a, b in zip(tq, tp))
-        div = (cls.log_partition_at(blend)
-               - alpha * cls.log_partition_at(tq)
-               - (1.0 - alpha) * cls.log_partition_at(tp)) / (alpha - 1.0)
+    grad = q.expected_statistic()                           # E_q[T] = gradA(theta_q)
+    A_q = cls.log_partition_at(tq)                           # batch-shaped (parameter axes summed)
+    batch_ndim = A_q.dim()
+    # Bregman KL = A(tp) - A(tq) - sum_c <gradA_c, (tp - tq)_c>, where each natural-parameter
+    # component c is contracted over ITS parameter axes (the trailing dims beyond the batch).
+    # A vector statistic (..., K) sums the last axis; a matrix statistic (..., K, K) is
+    # Frobenius-contracted over the last two -- so a matrix-parameter family (e.g. the full
+    # Gaussian's t2) works through the generic path, not only vector-parameter families.
+    inner: 'torch.Tensor | float' = 0.0              # float seed; becomes a Tensor on the first term
+    for g, a, b in zip(grad, tq, tp):
+        term = g * (b - a)
+        param_axes = tuple(range(batch_ndim, term.dim()))
+        inner = inner + (term.sum(dim=param_axes) if param_axes else term)
+    div = cls.log_partition_at(tp) - A_q - inner
     return safe_kl_clamp(div, kl_max=kl_max)
 
 
@@ -547,18 +520,17 @@ def renyi(
     eps:     float = 1e-6,
     **kwargs,
 ) -> torch.Tensor:
-    r"""Renyi alpha-divergence D_alpha(q || p) between two parameter objects (KL at alpha=1).
+    r"""KL(q || p) between two parameter objects, the alpha = 1 Renyi divergence.
 
     Uses ``q.renyi_closed_form`` when the family provides one (the pinned Gaussian moment
-    form); otherwise the generic Bregman/Renyi-from-A path.
+    form); otherwise the generic Bregman path. ``alpha`` is kept so call signatures stay stable;
+    any order outside the KL switch :math:`|\alpha - 1| < 10^{-6}` raises ``ValueError`` (audit
+    2026-10-16 F93).
 
     The trailing ``**kwargs`` is the permissive functional contract every divergence-registry
     member shares (a member ignores params it does not use); ``renyi`` consumes ``alpha``.
     """
-    if alpha <= 0.0:
-        raise ValueError(f"alpha must be positive, got {alpha}")
-    if alpha > 1.0 + _KL_ALPHA_SWITCH:                  # only when the closed form takes the blend
-        _warn_alpha_gt_one(alpha, type(q).__name__)     # branch; alpha in (1, 1+switch] is plain KL
+    _require_kl_order(alpha, "renyi")
     closed = getattr(q, "renyi_closed_form", None)
     if closed is not None:
         return closed(p, alpha=alpha, kl_max=kl_max, eps=eps)
@@ -577,79 +549,6 @@ def kl(
     return renyi(q, p, alpha=1.0, kl_max=kl_max, eps=eps)
 
 
-def squared_hellinger(
-    q:       BeliefParams,
-    p:       BeliefParams,
-
-    *,
-    kl_max:  float = 100.0,
-    eps:     float = 1e-6,
-    **kwargs,
-) -> torch.Tensor:                             # (...) squared Hellinger H^2(q||p) in [0, 1]
-    r"""Squared Hellinger f-divergence H^2(q || p) = 1 - BC(q || p).
-
-    For Gaussians the Bhattacharyya coefficient is BC = exp(-D_{1/2}(q||p)/2), where D_{1/2}
-    is the Renyi-1/2 divergence the pinned ``renyi`` kernel already computes, so
-
-        H^2(q || p) = 1 - exp( -D_{1/2}(q || p) / 2 ),   D_{1/2} = renyi(q, p, alpha=0.5).
-
-    This member ignores any ``alpha`` the call sites forward (Hellinger has no order); it is
-    absorbed by ``**kwargs`` and never reaches ``renyi`` (the inner call always uses alpha=0.5,
-    so the alpha>1 blend warning cannot fire). ``kl_max`` IS forwarded so the inner D_{1/2}
-    stays bounded in [0, kl_max]; the H^2 output is then naturally in [0, 1] without a second
-    clamp (mathematically the range is the half-open [0, 1), but in float32 ``1 - exp(-0.5 d_half)``
-    saturates to exactly 1.0 for d_half >= ~35, so at the default kl_max=100 a clamped
-    D_{1/2}=kl_max maps to H^2 = 1.0, the maximal-Hellinger limit, which composes correctly).
-    """
-    d_half = renyi(q, p, alpha=0.5, kl_max=kl_max, eps=eps)
-    return 1.0 - torch.exp(-0.5 * d_half)
-
-
-def bhattacharyya(
-    q:       BeliefParams,
-    p:       BeliefParams,
-
-    *,
-    kl_max:  float = 100.0,
-    eps:     float = 1e-6,
-    **kwargs,
-) -> torch.Tensor:                             # (...) Bhattacharyya distance D_B(q||p) >= 0
-    r"""Bhattacharyya distance D_B(q || p) = -log BC(q || p), BC the Bhattacharyya coefficient.
-
-    For Gaussians BC = exp(-D_{1/2}(q||p)/2) (the same coefficient squared-Hellinger uses), so
-
-        D_B(q || p) = D_{1/2}(q || p) / 2,   D_{1/2} = renyi(q, p, alpha=0.5).
-
-    SYMMETRIC (the Renyi-1/2 divergence is) and zero iff q == p. Reuses the pinned Gaussian renyi
-    closed form at alpha=0.5; ``kl_max`` bounds the inner D_{1/2}. A forwarded ``alpha`` is absorbed
-    by ``**kwargs`` (Bhattacharyya has no order) and never reaches the inner renyi call (always 0.5).
-    """
-    return 0.5 * renyi(q, p, alpha=0.5, kl_max=kl_max, eps=eps)
-
-
-def jeffreys(
-    q:       BeliefParams,
-    p:       BeliefParams,
-
-    *,
-    kl_max:  float = 100.0,
-    eps:     float = 1e-6,
-    **kwargs,
-) -> torch.Tensor:                             # (...) Jeffreys (symmetrized KL) J(q||p) >= 0
-    r"""Jeffreys divergence J(q || p) = KL(q || p) + KL(p || q), the symmetrized KL.
-
-    Each term is renyi at alpha=1 (the pinned Gaussian KL closed form):
-
-        J(q || p) = renyi(q, p, alpha=1) + renyi(p, q, alpha=1).
-
-    SYMMETRIC by construction and zero iff q == p. Each KL is clamped to ``kl_max``, so J is bounded
-    in [0, 2*kl_max]. A forwarded ``alpha`` is absorbed by ``**kwargs`` (Jeffreys has no order); the
-    two inner calls always use alpha=1.
-    """
-    return (renyi(q, p, alpha=1.0, kl_max=kl_max, eps=eps)
-            + renyi(p, q, alpha=1.0, kl_max=kl_max, eps=eps))
-
-
 def renyi_per_coord(
     q:       BeliefParams,
     p:       BeliefParams,
@@ -660,66 +559,18 @@ def renyi_per_coord(
     eps:     float = 1e-6,
     **kwargs,
 ) -> torch.Tensor:                             # (..., K) per-coordinate Renyi/KL D^(k)
-    r"""Per-coordinate Renyi/KL: the unsummed diagonal coordinate terms (family hook).
+    r"""Per-coordinate KL: the unsummed coordinate terms (family hook).
 
-    Defined for families exposing ``renyi_per_coord``. Full Gaussians provide ordered
-    conditional KL contributions and reject alpha != 1; diagonal families also support Renyi.
+    Defined for families exposing ``renyi_per_coord``. Diagonal Gaussians give the coordinate KL
+    terms and full Gaussians the ordered conditional KL contributions; ``alpha`` is kept for
+    signature stability and must lie in the KL switch (ValueError otherwise, audit 2026-10-16 F93).
     """
+    _require_kl_order(alpha, "renyi_per_coord")
     return q.renyi_per_coord(p, alpha=alpha, kl_max=kl_max, eps=eps)
-
-
-def bhattacharyya_per_coord(
-    q:       BeliefParams,
-    p:       BeliefParams,
-
-    *,
-    kl_max:  float = 100.0,
-    eps:     float = 1e-6,
-    **kwargs,
-) -> torch.Tensor:                             # (..., K) per-coordinate Bhattacharyya D_B^(k)
-    r"""Per-coordinate Bhattacharyya D_B^(k) = 0.5 D_{1/2}^(k); sum_k recovers ``bhattacharyya``.
-
-    Bhattacharyya is AFFINE in the Renyi-1/2 divergence (D_B = 0.5 D_{1/2}), so it decomposes
-    coordinate-wise as 0.5 times the per-coordinate Renyi-1/2. A forwarded ``alpha`` is absorbed
-    (Bhattacharyya has no order; the inner per-coord call always uses alpha=0.5).
-    """
-    return 0.5 * q.renyi_per_coord(p, alpha=0.5, kl_max=kl_max, eps=eps)
-
-
-def jeffreys_per_coord(
-    q:       BeliefParams,
-    p:       BeliefParams,
-
-    *,
-    kl_max:  float = 100.0,
-    eps:     float = 1e-6,
-    **kwargs,
-) -> torch.Tensor:                             # (..., K) per-coordinate Jeffreys J^(k)
-    r"""Per-coordinate Jeffreys J^(k) = KL^(k)(q||p) + KL^(k)(p||q); sum_k recovers ``jeffreys``.
-
-    Jeffreys is a SUM of two KLs, each of which decomposes coordinate-wise (per-coord Renyi at
-    alpha=1), so the symmetrized divergence decomposes too. Both q and p are diagonal Gaussians
-    (the belief and its prior). A forwarded ``alpha`` is absorbed (the inner calls always use 1).
-    """
-    return (q.renyi_per_coord(p, alpha=1.0, kl_max=kl_max, eps=eps)
-            + p.renyi_per_coord(q, alpha=1.0, kl_max=kl_max, eps=eps))
 
 
 register_functional(
     "renyi", display=FunctionalDisplayMetadata("Renyi divergence", "dimensionless"))(renyi)
-register_functional(
-    "squared_hellinger",
-    display=FunctionalDisplayMetadata("squared Hellinger divergence", "dimensionless"),
-)(squared_hellinger)
-register_functional(
-    "bhattacharyya",
-    display=FunctionalDisplayMetadata("Bhattacharyya divergence", "dimensionless"),
-)(bhattacharyya)
-register_functional(
-    "jeffreys", display=FunctionalDisplayMetadata("Jeffreys divergence", "dimensionless"))(jeffreys)
 
-# Per-coordinate forms for the divergences that decompose coordinate-wise (see _FUNCTIONALS_PER_COORD).
-# squared_hellinger is intentionally NOT registered here (non-additive outer transform).
+# The per-coordinate form of the KL (see _FUNCTIONALS_PER_COORD).
 register_functional_per_coord("renyi")(renyi_per_coord)
-register_functional_per_coord("bhattacharyya")(bhattacharyya_per_coord)
-register_functional_per_coord("jeffreys")(jeffreys_per_coord)

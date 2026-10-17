@@ -613,7 +613,7 @@ def check_admissible(
     Draws ``n_samples`` random group elements ``g = exp(sum_a c_a G_a)`` (coefficients ~ ``scale`` *
     N(0,1)) and a random Gaussian belief PAIR, pushes the pair forward by the family's representation,
     and asserts ``D(rho(g) q || rho(g) p) == D(q || p)`` to tolerance, where ``D`` is the registered
-    divergence ``functional`` (renyi/squared_hellinger). Returns ``True`` iff invariant for every
+    divergence ``functional`` (``renyi``, the KL at ``alpha`` = 1). Returns ``True`` iff invariant for every
     sample, else ``False`` -- so it turns ``GaugeGroup.invariant_for``'s string declaration into a
     verified invariant and catches a wrongly-declared ``invariant_families``.
 

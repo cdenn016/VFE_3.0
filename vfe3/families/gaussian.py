@@ -1,8 +1,10 @@
 r"""Gaussian exponential families (diagonal and full covariance) for VFE_3.0.
 
-The closed-form Renyi/KL kernels are ported verbatim from the legacy ``divergence.py``
-moment forms, so the live numerics are byte-identical; natural-parameter and log-partition
-maps are added so the generic Bregman/Renyi-from-A path can be pinned against them.
+The closed-form KL kernels are ported verbatim from the legacy ``divergence.py`` moment forms,
+so the live numerics are byte-identical; natural-parameter and log-partition maps are added so the
+generic Bregman path can be pinned against them. The methods keep the Renyi names and the ``alpha``
+keyword for signature stability, but only the KL (alpha = 1) is implemented: any other order raises
+``ValueError`` (audit 2026-10-16 F93).
 """
 
 import math
@@ -12,7 +14,7 @@ import torch
 
 from vfe3.families.base import (
     BeliefParams, register_family, safe_kl_clamp, _logdet_chol, ratio_minus_one_minus_log, x_minus_log1p,
-    _KL_ALPHA_SWITCH, _RENYI_KL_BAND,
+    _require_kl_order,
 )
 from vfe3.numerics import safe_cholesky, validated_cholesky_solve
 
@@ -79,7 +81,7 @@ def _full_gaussian_kl_terms(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:  # KL, ok mask, 1/cond estimate
     r"""Exact full-covariance KL(q||t) and its per-element factorization mask.
 
-    Lifted verbatim out of ``FullGaussian.renyi_closed_form``'s alpha==1 branch so the float64
+    Lifted verbatim out of ``FullGaussian.renyi_closed_form``'s KL path so the float64
     escalation can re-evaluate the identical arithmetic at a higher precision rather than
     duplicating it (audit 2026-08-05). Every operand must already share one dtype.
     """
@@ -305,8 +307,9 @@ class DiagonalGaussian(BeliefParams):
         kl_max:  float = 100.0,
         eps:     float = 1e-6,
     ) -> torch.Tensor:
-        r"""Closed-form diagonal Gaussian Renyi/KL (ported verbatim from
-        ``divergence._gaussian_diagonal_renyi``; mu_q=self, mu_t=other).
+        r"""Closed-form diagonal Gaussian KL (ported verbatim from
+        ``divergence._gaussian_diagonal_renyi``; mu_q=self, mu_t=other). ``alpha`` must lie in the
+        KL switch (ValueError otherwise).
 
         ``eps`` is the variance floor for the log/division terms and MUST equal the upstream belief
         sigma floor (``cfg.eps``, default 1e-6; the SPD retraction clamps every sigma to
@@ -315,6 +318,7 @@ class DiagonalGaussian(BeliefParams):
         than the hardcoded 1e-12 in ``natural()``/``entropy()`` (the generic A-path): the closed form
         tracks the pipeline floor, while the natural-parameter maps only need positivity for
         log(-2 t2)."""
+        _require_kl_order(alpha, "DiagonalGaussian.renyi_closed_form")
         compute_dtype = (torch.float64
                          if torch.float64 in (self.mu.dtype, self.sigma.dtype,
                                               other.mu.dtype, other.sigma.dtype)
@@ -323,38 +327,7 @@ class DiagonalGaussian(BeliefParams):
         sigma_q = self.sigma.to(compute_dtype).clamp(min=eps)
         mu_t = other.mu.to(compute_dtype)
         sigma_t = other.sigma.to(compute_dtype).clamp(min=eps)
-        if abs(alpha - 1.0) < _KL_ALPHA_SWITCH:
-            div = diag_kl_unclamped(mu_q, sigma_q, mu_t, sigma_t, eps=eps)
-        else:
-            # alpha in (0,1): the blend is a convex combination of positive variances, so it is
-            # always > 0 and the mask below is inert (byte-identical to the old clamp-only path).
-            # alpha > 1 leaves the convex regime: a coordinate's blend can go non-positive, which
-            # makes the divergence undefined. clamp(min=eps) here only guards log/division on the
-            # GOOD coordinates; a non-PD coordinate maps the whole pair to NaN -> kl_max below,
-            # mirroring the full-cov safe_cholesky mask (instead of emitting a wrong finite value).
-            raw_blend   = (1.0 - alpha) * sigma_q + alpha * sigma_t
-            sigma_blend = raw_blend.clamp(min=eps)
-            delta       = mu_t - mu_q
-            mahal_term  = (alpha * (delta ** 2) / sigma_blend).sum(dim=-1)
-            if abs(alpha - 1.0) < _RENYI_KL_BAND:
-                # fp32 cancellation band: evaluate the logdet term in float64, then cast back.
-                sq64 = sigma_q.double()
-                st64 = sigma_t.double()
-                sb64 = ((1.0 - alpha) * sq64 + alpha * st64).clamp(min=eps)
-                logdet_term = (
-                    ((1.0 - alpha) * torch.log(sq64) + alpha * torch.log(st64) - torch.log(sb64)).sum(dim=-1)
-                    / (alpha - 1.0)
-                ).to(sigma_q.dtype)
-            else:
-                logdet_per_dim = (
-                    (1.0 - alpha) * torch.log(sigma_q)
-                    + alpha * torch.log(sigma_t)
-                    - torch.log(sigma_blend)
-                )
-                logdet_term = logdet_per_dim.sum(dim=-1) / (alpha - 1.0)
-            div = 0.5 * (mahal_term + logdet_term)
-            ok  = (raw_blend > 0.0).all(dim=-1)            # any non-PD coordinate -> NaN -> kl_max
-            div = torch.where(ok, div, div.new_tensor(float("nan")))
+        div = diag_kl_unclamped(mu_q, sigma_q, mu_t, sigma_t, eps=eps)
         return safe_kl_clamp(div, kl_max=kl_max)
 
     def renyi_per_coord(
@@ -366,12 +339,14 @@ class DiagonalGaussian(BeliefParams):
         kl_max:  float = 100.0,
         eps:     float = 1e-6,
     ) -> torch.Tensor:
-        r"""Per-coordinate diagonal Gaussian Renyi/KL: the diagonal Renyi/KL coordinate terms
+        r"""Per-coordinate diagonal Gaussian KL: the diagonal KL coordinate terms
         left UNSUMMED, each clamped independently. Summing over k recovers ``renyi_closed_form``
         ONLY when no per-coordinate term saturates ``kl_max``: this routine clamps each coordinate
         to kl_max independently, whereas the closed form clamps the single summed scalar once, so a
         coordinate that individually exceeds kl_max diverges between the two. The independent
-        per-coordinate clamp is the intended behavior here; only the recovery identity is conditional."""
+        per-coordinate clamp is the intended behavior here; only the recovery identity is conditional.
+        ``alpha`` must lie in the KL switch (ValueError otherwise)."""
+        _require_kl_order(alpha, "DiagonalGaussian.renyi_per_coord")
         compute_dtype = (torch.float64
                          if torch.float64 in (self.mu.dtype, self.sigma.dtype,
                                               other.mu.dtype, other.sigma.dtype)
@@ -380,35 +355,7 @@ class DiagonalGaussian(BeliefParams):
         sigma_q = self.sigma.to(compute_dtype).clamp(min=eps)
         mu_t = other.mu.to(compute_dtype)
         sigma_t = other.sigma.to(compute_dtype).clamp(min=eps)
-        delta = mu_t - mu_q
-        if abs(alpha - 1.0) < _KL_ALPHA_SWITCH:
-            per_coord = diag_kl_unclamped_per_coord(mu_q, sigma_q, mu_t, sigma_t, eps=eps)
-        else:
-            # See renyi_closed_form: alpha in (0,1) blend is always > 0 (mask inert, byte-identical);
-            # for alpha > 1 a non-positive-blend coordinate is masked to NaN -> kl_max PER COORDINATE
-            # (the per-coord twin of the summed mask), so a bad coordinate is gated without killing
-            # its in-bounds neighbors.
-            raw_blend   = (1.0 - alpha) * sigma_q + alpha * sigma_t
-            sigma_blend = raw_blend.clamp(min=eps)
-            mahal       = alpha * (delta ** 2) / sigma_blend
-            if abs(alpha - 1.0) < _RENYI_KL_BAND:
-                # fp32 cancellation band: evaluate the per-coord logdet term in float64 (see
-                # renyi_closed_form / _RENYI_KL_BAND), then cast back.
-                sq64   = sigma_q.double()
-                st64   = sigma_t.double()
-                sb64   = ((1.0 - alpha) * sq64 + alpha * st64).clamp(min=eps)
-                logdet = (
-                    ((1.0 - alpha) * torch.log(sq64) + alpha * torch.log(st64) - torch.log(sb64))
-                    / (alpha - 1.0)
-                ).to(sigma_q.dtype)
-            else:
-                logdet  = (
-                    (1.0 - alpha) * torch.log(sigma_q)
-                    + alpha * torch.log(sigma_t)
-                    - torch.log(sigma_blend)
-                ) / (alpha - 1.0)
-            per_coord = 0.5 * (mahal + logdet)
-            per_coord = torch.where(raw_blend > 0.0, per_coord, per_coord.new_tensor(float("nan")))
+        per_coord = diag_kl_unclamped_per_coord(mu_q, sigma_q, mu_t, sigma_t, eps=eps)
         return safe_kl_clamp(per_coord, kl_max=kl_max)
 
     def natural_gradient(
@@ -629,10 +576,9 @@ class FullGaussian(BeliefParams):
         Correlations contribute through conditional regressions, not marginal KLs.
         Individual contributions depend on coordinate order; the unclipped sum
         does not. Each term is clipped separately, matching diagonal alpha weights.
-        General Renyi orders have no such KL chain rule and remain unsupported.
+        Renyi orders other than one have no such chain rule and are refused (ValueError).
         """
-        if alpha != 1.0:
-            raise ValueError("full-Gaussian per-coordinate self-coupling requires KL (alpha=1)")
+        _require_kl_order(alpha, "FullGaussian.renyi_per_coord (per-coordinate self-coupling)")
         public_dtype = _full_gaussian_public_dtype(self._public_dtype, other._public_dtype)
         compute_dtype = public_dtype
         with torch.autocast(device_type=self.mu.device.type, enabled=False):
@@ -657,8 +603,10 @@ class FullGaussian(BeliefParams):
         kl_max:  float = 100.0,
         eps:     float = 1e-6,
     ) -> torch.Tensor:
-        r"""Closed-form full-covariance Gaussian Renyi/KL (ported verbatim from
-        ``divergence._gaussian_full_renyi``; mu_q=self, mu_t=other)."""
+        r"""Closed-form full-covariance Gaussian KL (ported verbatim from
+        ``divergence._gaussian_full_renyi``; mu_q=self, mu_t=other). ``alpha`` must lie in the KL
+        switch (ValueError otherwise)."""
+        _require_kl_order(alpha, "FullGaussian.renyi_closed_form")
         K = self.mu.shape[-1]
         # Public dtype: float64 when either operand's public dtype is float64, otherwise float32.
         # External construction retains the any-operand float64 policy. Family-owned transport
@@ -672,7 +620,7 @@ class FullGaussian(BeliefParams):
         # unconditional `compute_dtype = torch.float64`; on the live gaussian_full pair grid that
         # ran every cholesky / solve_triangular / logdet in float64, measured at 15.7x the float32
         # cost on a consumer GPU whose float64 throughput is heavily reduced. A float32 family now
-        # computes in float32 and the KL branch below escalates to float64 on a failed
+        # computes in float32 and the KL below escalates to float64 on a failed
         # certificate (near the cond(Sigma)~1e6 ceiling float32 can turn the exact self-KL and
         # shared derivative into O(1e-2) and O(1e4) artifacts).
         compute_dtype = result_dtype
@@ -687,114 +635,38 @@ class FullGaussian(BeliefParams):
         # safe_cholesky below: round 0 adds ZERO jitter (valid-SPD inputs are byte-identical to
         # torch.linalg.cholesky), failures get an escalating eps ridge, and a pair failing every
         # round -> NaN -> safe_kl_clamp -> kl_max.
-        if abs(alpha - 1.0) < _KL_ALPHA_SWITCH:
-            # safe_cholesky (jittered cholesky_ex, never raises) hardens the KL against a
-            # numerically non-PD prior/posterior covariance -- reachable once training shifts the
-            # prior, and routed here for any full-cov / non-kernel config via the E-step oracle.
-            # This matches the robustness the alpha != 1 branch already has. Round 0 adds zero
-            # jitter, so valid-SPD inputs stay byte-identical to torch.linalg.cholesky; an element
-            # that fails every round -> NaN -> safe_kl_clamp -> kl_max (mirroring that branch).
-            div, ok, inv_cond = _full_gaussian_kl_terms(mu_q, sigma_q, mu_t, sigma_t, K, eps)
-            # Data-keyed escalation: a float32 pair is recomputed in float64 rather than being
-            # written off to kl_max. The whole grid is escalated (not the failed subset) so the
-            # returned tensor keeps one dtype and one autograd graph; the branch is skipped
-            # entirely for a float64 family.
-            #
-            # The trigger is a failed Cholesky row, Task 4's zero-jitter residual/spectral
-            # certificate on either operand, or the pivot-ratio floor. The certificate runs a
-            # second Cholesky and eigvalsh on every matrix of the pair grid, measured at about 3x
-            # the Cholesky-failure-only trigger, and a single row past the condition limit
-            # promotes the whole grid to float64. The certificate limit is conservative and
-            # dimension/dtype dependent; at K=20 float32 it is about 6.55e3, so upper-tail rows
-            # may promote even when Cholesky succeeds.
-            if compute_dtype is not torch.float64:
-                q_certificate = validated_cholesky_solve(sigma_q)
-                t_certificate = validated_cholesky_solve(sigma_t)
-                escalate_mask = (
-                    ~ok
-                    | ~q_certificate.certified
-                    | ~t_certificate.certified
-                    | (inv_cond < _FULL_COV_KL_COND_FLOOR)
-                )
-                if bool(escalate_mask.any()):
-                    div, ok, _ = _full_gaussian_kl_terms(
-                        mu_q.double(), sigma_q.double(), mu_t.double(), sigma_t.double(), K, eps)
-                    return_dtype = torch.float64
-            div = torch.where(ok, div, div.new_tensor(float("nan")))
-        else:
-            # alpha > 1 leaves the convex regime: the blend can be indefinite for some
-            # (i,j) pairs. safe_cholesky factors per element (cholesky_ex, never raises),
-            # tries an escalating eps ridge on failures, and returns an `ok` mask; a pair
-            # that fails ALL rounds is set to NaN so safe_kl_clamp maps it to kl_max while
-            # good pairs in the same batch keep their finite divergence. Round 0 adds zero
-            # extra jitter, so valid-SPD inputs stay byte-identical to torch.linalg.cholesky.
-            sigma_blend = (1.0 - alpha) * sigma_q + alpha * sigma_t
-            sigma_blend = 0.5 * (sigma_blend + sigma_blend.transpose(-1, -2))
-            L_blend, _ = safe_cholesky(sigma_blend, eps=eps, rounds=5)  # factor for mahal_term only
-            L_q, ok_q = safe_cholesky(sigma_q, eps=eps, rounds=5)
-            L_t, ok_t = safe_cholesky(sigma_t, eps=eps, rounds=5)
-            delta_mu = mu_t - mu_q
-            v = torch.linalg.solve_triangular(
-                L_blend, delta_mu.unsqueeze(-1), upper=False
-            ).squeeze(-1)
-            mahal_term = alpha * (v ** 2).sum(dim=-1)
-            if abs(alpha - 1.0) < _RENYI_KL_BAND:
-                # The three logdets nearly cancel before division by (alpha - 1). Retain the
-                # established slogdet cancellation route inside the float64 island.
-                sq64 = sigma_q.double()
-                st64 = sigma_t.double()
-                sb64 = (1.0 - alpha) * sq64 + alpha * st64
-                sb64 = 0.5 * (sb64 + sb64.transpose(-1, -2))
-                logdet_term = (
-                    ((1.0 - alpha) * torch.linalg.slogdet(sq64).logabsdet
-                     + alpha * torch.linalg.slogdet(st64).logabsdet
-                     - torch.linalg.slogdet(sb64).logabsdet)
-                    / (alpha - 1.0)
-                ).to(sigma_q.dtype)
-            else:
-                logdet_q = _logdet_chol(L_q)
-                logdet_t = _logdet_chol(L_t)
-                logdet_blend = _logdet_chol(L_blend)
-                logdet_term = (
-                    (1.0 - alpha) * logdet_q + alpha * logdet_t - logdet_blend
-                ) / (alpha - 1.0)
-            div = 0.5 * (mahal_term + logdet_term)
-            # safe_cholesky's escalating ridge can factor an INDEFINITE blend as PD (its ok mask
-            # True) even though alpha>1 left the convex regime and the Renyi divergence is undefined
-            # there -- the fp64 slogdet then drops the sign and the value collapses to ~0 instead of
-            # kl_max. Gate on the SIGN of the (symmetrized) blend so a non-PD blend -> NaN -> kl_max
-            # regardless of the ridge (audit 2026-06-17). sigma_q/sigma_t are SPD on the live
-            # pipeline (SPD retraction); safe_cholesky owns the off-pipeline non-PD handling.
-            #
-            # SCOPE (audit 2026-08-07). This gate was unscoped -- it ran for every alpha != 1 -- but
-            # its justification above holds only ABOVE alpha=1. For alpha in (0,1) the blend is a
-            # strict convex combination of two SPD matrices, hence SPD, so the test could only ever
-            # return True: measured min-eigenvalue 5.2e-3 over 2000 pairs x alpha in {.25,.5,.75},
-            # and 0/4000 fp32 non-PD verdicts at every cond from 1e2 to 1e10. Not merely inert --
-            # at cond 1e12 it FALSELY rejected 25/4000 blends whose exact fp64 spectrum is strictly
-            # positive, converting a valid divergence into a gradient-dead kl_max.
-            #
-            # It is also the ONLY batch-limited op in this branch. torch.linalg.eigvalsh routes to
-            # cuSOLVER syevBatched for n <= 32, which rejects the CALL past ~2.6e4-3.2e4 matrices
-            # (K=8: 29915/29916, K=20: 26305/26306; IDENTICAL in fp32 and fp64, so it is a shape-only
-            # parameter rejection, not a workspace-byte limit -- PyTorch 2.8.0 regression
-            # syevjBatched_bufferSize -> xsyevBatched_bufferSize, pytorch/pytorch#166004). That put a
-            # hard ceiling on the whole full-covariance non-KL surface: squared_hellinger and
-            # bhattacharyya both hardcode alpha=0.5, and the E-step pair grid H*B*N^2 crosses it at
-            # batch_size=1 (2*64*128^2 = 2.1e6 at the live config, 71.7x over). cholesky_ex carries
-            # no such ceiling (verified to 2,097,152), reproduces the spectral verdict 20000/20000 at
-            # alpha in {1.5,2.0,5.0}, and costs ~K^3/3 flops against eigvalsh's ~9K^3. Measured 8.0x
-            # end-to-end on the (since retired) family_chunked decode, with max relative value diff
-            # 0.000e+00.
-            if alpha > 1.0:
-                # info == 0 IS the numerical PD predicate, and NO ridge is added here (unlike
-                # safe_cholesky above), so an indefinite blend is reported as such.
-                _, blend_info = torch.linalg.cholesky_ex(sigma_blend)
-                blend_pd = blend_info == 0
-                ok = blend_pd & ok_q & ok_t        # non-PD blend or failed factor -> NaN -> kl_max
-            else:
-                ok = ok_q & ok_t                   # convex blend of SPD is SPD; only factors can fail
-            div = torch.where(ok, div, div.new_tensor(float("nan")))
+        # safe_cholesky (jittered cholesky_ex, never raises) hardens the KL against a
+        # numerically non-PD prior/posterior covariance -- reachable once training shifts the
+        # prior, and routed here for any full-cov / non-kernel config via the E-step oracle.
+        # Round 0 adds zero jitter, so valid-SPD inputs stay byte-identical to
+        # torch.linalg.cholesky; an element that fails every round -> NaN -> safe_kl_clamp -> kl_max.
+        div, ok, inv_cond = _full_gaussian_kl_terms(mu_q, sigma_q, mu_t, sigma_t, K, eps)
+        # Data-keyed escalation: a float32 pair is recomputed in float64 rather than being
+        # written off to kl_max. The whole grid is escalated (not the failed subset) so the
+        # returned tensor keeps one dtype and one autograd graph; the branch is skipped
+        # entirely for a float64 family.
+        #
+        # The trigger is a failed Cholesky row, Task 4's zero-jitter residual/spectral
+        # certificate on either operand, or the pivot-ratio floor. The certificate runs a
+        # second Cholesky and eigvalsh on every matrix of the pair grid, measured at about 3x
+        # the Cholesky-failure-only trigger, and a single row past the condition limit
+        # promotes the whole grid to float64. The certificate limit is conservative and
+        # dimension/dtype dependent; at K=20 float32 it is about 6.55e3, so upper-tail rows
+        # may promote even when Cholesky succeeds.
+        if compute_dtype is not torch.float64:
+            q_certificate = validated_cholesky_solve(sigma_q)
+            t_certificate = validated_cholesky_solve(sigma_t)
+            escalate_mask = (
+                ~ok
+                | ~q_certificate.certified
+                | ~t_certificate.certified
+                | (inv_cond < _FULL_COV_KL_COND_FLOOR)
+            )
+            if bool(escalate_mask.any()):
+                div, ok, _ = _full_gaussian_kl_terms(
+                    mu_q.double(), sigma_q.double(), mu_t.double(), sigma_t.double(), K, eps)
+                return_dtype = torch.float64
+        div = torch.where(ok, div, div.new_tensor(float("nan")))
         return safe_kl_clamp(div, kl_max=kl_max).to(return_dtype)
 
 

@@ -1,11 +1,9 @@
 r"""Full-covariance + alpha/divergence completion roadmap (2026-06-13 multi-expert investigation).
 
 Groups, by roadmap item:
-  A1  per-coordinate Bhattacharyya / Jeffreys (the two non-Renyi divergences that DO decompose
-      coordinate-wise for a diagonal Gaussian); squared_hellinger stays rejected (1-exp(-D/2) is
-      non-additive).
-  A2  per-position state_dependent alpha is envelope-correct for EVERY divergence (the gradient is
-      alpha*(D)*dD with no product-rule residue), the divergence-agnostic alpha-envelope.
+  A1  (removed 2026-10-17 with the Bhattacharyya / Jeffreys functionals, audit 2026-10-16 F93).
+  A2  per-position state_dependent alpha is envelope-correct (the gradient is alpha*(D)*dD with no
+      product-rule residue), pinned on the KL, the only registered divergence.
   A3  the full-covariance unrolled oracle gradient (oracle_unroll_grad=True) is FINITE on a single
       training backward -- the exact Loewner spectral adjoint (retraction.py) and safe_cholesky; the
       old "expect NaNs" docstring is stale.
@@ -29,37 +27,6 @@ from vfe3.model.model import VFEModel
 
 
 # ---------------------------------------------------------------------------
-# A1: per-coordinate Bhattacharyya / Jeffreys
-# ---------------------------------------------------------------------------
-
-
-def test_per_coord_bhattacharyya_jeffreys_sum_to_scalar():
-    """The per-coordinate form summed over k recovers the scalar divergence (kl_max=inf so no
-    per-coordinate clamp diverges from the single summed clamp)."""
-    from vfe3.divergence import (
-        bhattacharyya, jeffreys,
-        bhattacharyya_per_coord, jeffreys_per_coord,
-    )
-    g = torch.Generator().manual_seed(0)
-    diag = get_family("gaussian_diagonal")
-    mu_q = torch.randn(4, 3, generator=g)
-    sigma_q = torch.rand(4, 3, generator=g) + 0.5
-    mu_p = torch.randn(4, 3, generator=g)
-    sigma_p = torch.rand(4, 3, generator=g) + 0.5
-    q = diag(mu_q, sigma_q)
-    p = diag(mu_p, sigma_p)
-
-    bc_pc = bhattacharyya_per_coord(q, p, kl_max=float("inf"))    # (4, 3)
-    bc = bhattacharyya(q, p, kl_max=float("inf"))                 # (4,)
-    assert bc_pc.shape == (4, 3)
-    assert torch.allclose(bc_pc.sum(-1), bc, atol=1e-5)
-
-    jf_pc = jeffreys_per_coord(q, p, kl_max=float("inf"))
-    jf = jeffreys(q, p, kl_max=float("inf"))
-    assert torch.allclose(jf_pc.sum(-1), jf, atol=1e-5)
-
-
-# ---------------------------------------------------------------------------
 # A3: full-cov unrolled oracle gradient is FINITE (and live) on a single training backward.
 # The config docstring's "expect NaNs there" for gaussian_full + oracle_unroll_grad=True predates
 # the full-covariance retraction's finite backward, now the exact Loewner (Daleckii-Krein) adjoint of
@@ -71,11 +38,9 @@ def test_per_coord_bhattacharyya_jeffreys_sum_to_scalar():
 # ---------------------------------------------------------------------------
 # A2: the alpha-envelope is divergence-AGNOSTIC. For state_dependent alpha*(D) = c0/(b0+D) with
 # R(alpha) = b0 alpha - c0 log alpha, d/dmu[alpha*(D) D + R(alpha*(D))] = alpha*(D) dD/dmu exactly,
-# for ANY differentiable self-divergence D -- so state_dependent + a non-Renyi divergence is
-# mathematically correct (the user's "doesn't work with non-renyi" is the per-COORD config lock,
-# A1, not a wrong per-position gradient).
+# for ANY differentiable self-divergence D; the KL is the only registered member.
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("div_name", ["renyi", "squared_hellinger", "bhattacharyya", "jeffreys"])
+@pytest.mark.parametrize("div_name", ["renyi"])
 def test_state_dependent_envelope_has_no_product_rule_residue(div_name):
     from vfe3.alpha_i import self_coupling_alpha
     from vfe3.divergence import get_functional
