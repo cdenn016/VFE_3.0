@@ -287,10 +287,11 @@ def _strict_structure_constants(
     .. math::
         \max_{a,b} \frac{r_{ab}}{2\lVert G_a\rVert_F \lVert G_b\rVert_F} \le \mathrm{closure\_tol},
 
-    the denominator being the Frobenius bound on :math:`\lVert [G_a, G_b]\rVert_F`, so every
-    bracket the former per-bracket ratio :math:`r_{ab}/\lVert [G_a, G_b]\rVert_F` accepted is
-    still accepted. The bilinear scale is the one the structure constants enter
-    :math:`\mathrm{ad}_\varphi` at. A bracket that vanishes in exact arithmetic (commuting
+    the denominator being the Frobenius bound on :math:`\lVert [G_a, G_b]\rVert_F`, so the ratio
+    never exceeds the former per-bracket ratio :math:`r_{ab}/\lVert [G_a, G_b]\rVert_F` (taken
+    without its eps guard). An out-of-span part :math:`\delta_{ab}` of :math:`[G_a, G_b]` perturbs
+    :math:`\mathrm{ad}_\varphi v` by at most :math:`\sum_{a,b}|\varphi_a||v_b|\lVert\delta_{ab}\rVert_F`,
+    so this is the scale of the error it carries. A bracket that vanishes in exact arithmetic (commuting
     so(N) generators on disjoint index pairs, N >= 4) carries rounding with no component in the
     span, and its own norm made that ratio O(1) on closed Gram-Schmidt tensor-power bases
     (audit 2026-10-16, F6).
