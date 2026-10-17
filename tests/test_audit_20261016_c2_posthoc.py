@@ -4,14 +4,23 @@ Synthetic strings and tiny models only (single-digit dimensions, CPU, one thread
 
 * F65: :func:`vfe3.posthoc.calibration.text_audit` reports ``same_text`` only when every literal
   segment matched in its wildcard window and every ``<unk>`` wildcard matched characters.
+* F66: M5 row 5 sets every stored covariance table to the identity, the untied decode bank's
+  ``decode_sigma_log_embed`` included; ``decode=False`` keeps the earlier encode-side-only arm.
 """
 
 from __future__ import annotations
 
+from typing import Any
+
+import numpy as np
 import pytest
 import torch
 
+from tests.test_posthoc_20260928 import DEVICE, _cfg, _model, _stream
 from vfe3.posthoc import calibration as cal
+from vfe3.posthoc import evaluate as ev
+from vfe3.posthoc import interventions as iv
+from vfe3.posthoc import streams as st
 
 
 @pytest.fixture(autouse=True)
@@ -44,3 +53,72 @@ def test_text_audit_still_accepts_matched_wildcards() -> None:
     for audit in (inner, trailing):
         assert audit["same_text"] and audit["unmatched_unk_wildcards"] == 0
         assert audit["mismatched_segments"] == 0
+
+
+# ----------------------------------------------------------------------------------------------
+# F66: row 5 on an untied Gaussian decode bank
+# ----------------------------------------------------------------------------------------------
+
+def _untied_model(**over: Any) -> Any:
+    cfg = _cfg(decode_mode="diagonal_chunked", untie_decode_bank=True, **over)
+    model = _model(cfg)
+    with torch.no_grad():
+        model.prior_bank.decode_sigma_log_embed.normal_(0.0, 0.5)
+    return model
+
+
+def test_stored_covariances_identity_also_sets_the_untied_decode_bank_to_identity() -> None:
+    model = _untied_model()
+    pb = model.prior_bank
+    assert pb.untie_decode_bank and pb._decode_sigma_log_table() is pb.decode_sigma_log_embed
+    encode_before = pb.sigma_log_embed.detach().clone()
+    decode_before = pb.decode_sigma_log_embed.detach().clone()
+    with iv.stored_covariances_identity(model) as record:
+        assert torch.count_nonzero(pb.sigma_log_embed) == 0
+        assert torch.count_nonzero(pb._decode_sigma_log_table()) == 0
+    assert record["tables"] == ["prior_bank.sigma_log_embed", "prior_bank.decode_sigma_log_embed"]
+    assert record["decode_bank"] == "untied"
+    assert torch.equal(pb.sigma_log_embed, encode_before) and torch.equal(pb.decode_sigma_log_embed, decode_before)
+
+
+def test_stored_covariances_identity_encode_side_only_variant_keeps_the_decode_bank() -> None:
+    model = _untied_model()
+    pb = model.prior_bank
+    dataset = st.eval_windows(_stream(61, 3), 8, 4)
+    indices = np.arange(len(dataset))
+    with iv.stored_covariances_identity(model, decode=False) as record:
+        assert torch.count_nonzero(pb.sigma_log_embed) == 0
+        assert torch.count_nonzero(pb.decode_sigma_log_embed) > 0
+        encode_only = ev.nll_pass(model, dataset, indices, batch_size=2, device=DEVICE)
+    assert record["tables"] == ["prior_bank.sigma_log_embed"]
+    with iv.stored_covariances_identity(model):
+        both = ev.nll_pass(model, dataset, indices, batch_size=2, device=DEVICE)
+    assert np.abs(both.nll - encode_only.nll).max() > 1e-6
+
+
+def test_stored_covariances_identity_covers_the_block_cholesky_table() -> None:
+    import warnings
+
+    from tests.profiles import tiny_config
+    from vfe3.model.model import VFEModel
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        cfg = tiny_config(embed_dim=6, n_heads=2, vocab_size=9, max_seq_len=5, n_layers=1, family="gaussian_block",
+                          decode_mode="full_chunked", untie_decode_bank=True, block_coordinates="reference",
+                          decode_coordinates="reference", norm_type_block="layernorm", layernorm_affine=True,
+                          use_block_mlp=True, block_mlp_mode="coordinate", content_link_chart="exponential",
+                          pos_phi="none", gauge_transport="off", prior_covariance_table="block_cholesky")
+        torch.manual_seed(0)
+        model = VFEModel(cfg).eval()
+    pb = model.prior_bank
+    assert pb.sigma_log_embed is None
+    with torch.no_grad():
+        pb.sigma_chol_embed.normal_(0.0, 0.5)
+        pb.decode_sigma_log_embed.normal_(0.0, 0.5)
+    with iv.stored_covariances_identity(model) as record:
+        blocks = pb._prior_covariance_blocks()                                     # (V, H, d, d)
+        eye = torch.eye(blocks.shape[-1], dtype=blocks.dtype)
+        torch.testing.assert_close(blocks, (1.0 + pb.eps) * eye.expand_as(blocks), rtol=0, atol=1e-7)
+    assert record["tables"] == ["prior_bank.sigma_chol_embed", "prior_bank.decode_sigma_log_embed"]
+    assert torch.count_nonzero(pb.sigma_chol_embed) > 0

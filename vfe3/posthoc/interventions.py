@@ -13,7 +13,9 @@ row   key                                    modification
 2     ``routing_costs_removed``              :math:`\beta = \operatorname{softmax}_j(\log\pi_{ij})`: costs zeroed, prior kept
 3     ``prior_flattened``                    :math:`\log\pi_{ij} \to 0` on the causal support (the ``-inf`` mask is kept)
 4     ``residual_removed``                   :math:`\mu_i + m_i \mapsto m_i` at every layer
-5     ``stored_covariances_identity``        :math:`\Sigma_{p,v} \to I` (``sigma_log_embed`` :math:`\to 0`)
+5     ``stored_covariances_identity``        :math:`\Sigma_{p,v} \to I` in every stored table (``sigma_log_embed``
+                                             or ``sigma_chol_embed``, and an untied ``decode_sigma_log_embed``,
+                                             :math:`\to 0`)
 6     ``routing_covariances_identity``       :math:`C_i \to I` for every query and key: projected covariances
                                              :math:`S C_i S^\top \to S S^\top`, projected means unchanged
 7     ``token_frames_identity``              :math:`\exp(X_v) \to I` (``phi_embed`` :math:`\to 0`), in every role
@@ -248,13 +250,44 @@ def residual_removed(model: torch.nn.Module) -> Iterator[Dict[str, Any]]:
 # ----------------------------------------------------------------------------------------------
 
 @contextmanager
-def stored_covariances_identity(model: torch.nn.Module) -> Iterator[Dict[str, Any]]:
-    r"""Row 5: ``sigma_log_embed`` :math:`\to 0`, so every stored :math:`\Sigma_{p,v} = I`."""
-    table = getattr(model.prior_bank, "sigma_log_embed", None)
-    if table is None:
-        raise NotApplicable("the prior bank has no sigma_log_embed table")
-    with swap_parameter_data(table, zeros_view(table)):
-        yield {"table": "prior_bank.sigma_log_embed"}
+def stored_covariances_identity(
+    model:  torch.nn.Module,
+
+    *,
+    decode: bool = True,
+) -> Iterator[Dict[str, Any]]:
+    r"""Row 5: every stored covariance table :math:`\to I`, so :math:`\Sigma_{p,v} = I` in every role that reads one.
+
+    The token prior table (encode, the self-coupling target and a tied Gaussian decode) is the diagonal
+    log-variance ``sigma_log_embed`` :math:`\to 0` (:math:`\Sigma_{p,v} = I`), or under
+    ``prior_covariance_table='block_cholesky'`` the packed factor ``sigma_chol_embed`` :math:`\to 0`
+    (:math:`\ell = 0` and :math:`N = 0`, so :math:`L = I` and :math:`C_v = I + \epsilon I` with the table's
+    eigenvalue floor kept). An untied Gaussian decode bank (``untie_decode_bank=True``) scores
+    :math:`-\mathrm{KL}(q\|p_v)/\tau` against its own ``decode_sigma_log_embed``, which is set to zero as well
+    (audit 2026-10-16 F66: the row zeroed the encode table only, so on an untied bank the decode kept its
+    trained covariances). ``decode=False`` keeps the decode bank, the encode-side-only arm the row computed
+    before; on a tied bank one table serves both sides and the flag changes nothing. The record lists the
+    tables set to zero.
+    """
+    pb = model.prior_bank
+    tables: List[Tuple[str, torch.Tensor]] = []
+    for name in ("sigma_log_embed", "sigma_chol_embed"):
+        table = getattr(pb, name, None)
+        if table is not None:
+            tables.append((f"prior_bank.{name}", table))
+    untied = bool(getattr(pb, "untie_decode_bank", False))
+    decode_table = getattr(pb, "decode_sigma_log_embed", None) if untied else None
+    if decode and decode_table is not None:
+        tables.append(("prior_bank.decode_sigma_log_embed", decode_table))
+    if not tables:
+        raise NotApplicable("the prior bank has no stored covariance table")
+    bank = ("linear (no decode covariance)" if getattr(pb, "decode_mode", None) == "linear"
+            else "untied" if untied else "tied")
+    with ExitStack() as stack:
+        for _, table in tables:
+            stack.enter_context(swap_parameter_data(table, zeros_view(table)))
+        yield {"table": ", ".join(name for name, _ in tables), "tables": [name for name, _ in tables],
+               "decode_bank": bank, "decode_bank_kept": bool(decode_table is not None and not decode)}
 
 
 @contextmanager
