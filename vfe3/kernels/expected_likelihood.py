@@ -120,8 +120,9 @@ class ExpectedLikelihoodCE(torch.autograd.Function):
                          K=K, HAS_U=has_u, FAST_LOG=fast_log)
         # m and log_l stay separate (lse = m + log_l is never formed): at a small tau the logits are large, and
         # rounding lse to the ulp of m put an error into every softmax weight of the row (audit 2026-10-16, F48).
-        # The second row state costs registers in the backward kernels: offline sm_120a ptxas (triton 3.5.1, K = 20)
-        # reports spill stores of 396 -> 460 bytes (rows) and 4 -> 300 bytes (cols); the GPU time is unmeasured.
+        # The second row state costs registers in the rows backward kernel: offline sm_120a ptxas (triton 3.5.1,
+        # K = 20) reports spill stores of 396 -> 460 bytes there; the cols kernel loads the row state after its
+        # energy tile and spills 0 bytes (4 before). The forward's 228 bytes predate F48. GPU time is unmeasured.
         ctx.save_for_backward(mu_q, sigma_q, mu_v_t, sigma_v_t, u_arg, tau, targets, m, log_l)
         ctx.has_u, ctx.fast_log = has_u, fast_log
         return ce_rows.sum() / max(S, 1)

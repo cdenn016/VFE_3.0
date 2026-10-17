@@ -183,10 +183,12 @@ def el_bwd_cols_kernel(MQ, SQ, MVT, SVT, U, TGT, TAU, M, LOGL, SCALE, GMV, GSV, 
     for i0 in range(0, S, BI):
         offs_i = i0 + tl.arange(0, BI)
         mi = offs_i < S
+        E = _energy_tile(MQ, SQ, MVT, SVT, offs_i, mi, offs_v, mv_ok, V, K, BI, BV, FAST_LOG)
+        # The row state is loaded after the energy tile so that it is not live across it: loaded before, the
+        # second row vector (log l, F48) took the kernel from 4 to 300 bytes of sm_120a spill stores; here 0.
         t = tl.load(TGT + offs_i, mask=mi, other=-1)
         m = tl.load(M + offs_i, mask=mi, other=0.0)
         log_l = tl.load(LOGL + offs_i, mask=mi, other=0.0)
-        E = _energy_tile(MQ, SQ, MVT, SVT, offs_i, mi, offs_v, mv_ok, V, K, BI, BV, FAST_LOG)
         w = _pair_weights(E, c, U, offs_v, mv_ok, mi, t, m, log_l, scale, HAS_U)
         acc_u += tl.sum(w, 0)
         for k in range(K):
