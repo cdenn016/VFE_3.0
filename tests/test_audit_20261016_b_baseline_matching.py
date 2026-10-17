@@ -5,6 +5,11 @@ hidden-matrix learning rate (``hidden_lr_scale = 1``), while the total-matched a
 (:math:`s_0 K_0 / K`, Yang et al. 2022) and declares "lr not tuned at this width". The ladder rule now
 transfers the same scale (``transfer_hidden_lr=False`` reproduces the previous rule), the frozen
 ``width_rule.json`` accepts the field it sets, and the arm's plan records the change and the deviation.
+F58: the protocol check compared the nominal ``amp_dtype``, so a base recorded with ``'bf16'`` on a route
+that runs every contraction in an fp32 island (``inactive_fields`` marks it inert) was "matched" by baselines
+whose blocks run under bf16 autocast, and the Linear-decoder arm made it live without saying so. The check now
+compares effective precision; a difference is a declared deviation in the plan and the manifest, and a
+baseline pinned to fp32 (``baseline_overrides`` ``amp_dtype=None``) passes as matched.
 
 Every config is tiny (K = 4, two heads, two layers, vocabulary 7); nothing is trained (the evaluated run,
 the calibrations and the token count are replaced by fixed numbers).
@@ -95,3 +100,64 @@ def test_the_compute_matched_arm_records_the_lr_transfer_and_reloads_its_frozen_
     row = pa.build_manifest(exp, [fresh], base=base, budget="base_protocol", seeds=[(1, 1)])[
         "paper_arms"]["rows"][COMPUTE]
     assert recorded[0] in row["declared_deviations"] and row["changes"]["hidden_lr_scale"] == ["1.0", "0.5"]
+
+
+# ---- F58: effective precision in the protocol check --------------------------------------------
+
+MATCHED_PARAMS = "Matched context-processing parameters"
+PRECISION = "precision:"
+
+
+def test_the_protocol_check_compares_effective_precision() -> None:
+    from vfe3.baseline import BaselineConfig
+
+    inert = _tiny_cfg(amp_dtype="bf16")                       # linear decode without decode_logits_amp
+    assert "amp_dtype" in inert.inactive_fields() and pa.effective_precision(inert) == "float32"
+    bf16 = BaselineConfig.matched_to(inert)
+    assert bf16.amp_dtype == "bf16" and pa.effective_precision(bf16) == "bf16"
+    with pytest.raises(pa.ArmDefinitionError, match="amp_dtype"):
+        pa.check_baseline_arm(inert, bf16)
+    assert pa.check_baseline_arm(inert, bf16, declared=("amp_dtype",)) == {"amp_dtype": ("float32", "bf16")}
+    assert pa.check_baseline_arm(inert, BaselineConfig.matched_to(inert, amp_dtype=None)) == {}
+    live = _tiny_cfg(amp_dtype="bf16", decode_logits_amp=True)
+    assert pa.effective_precision(live) == "bf16"
+    assert pa.check_baseline_arm(live, BaselineConfig.matched_to(live)) == {}
+    with pytest.raises(pa.ArmDefinitionError, match="amp_dtype"):
+        pa.check_baseline_arm(live, BaselineConfig.matched_to(live, amp_dtype=None))
+    off = _tiny_cfg()
+    assert off.amp_dtype is None and pa.check_baseline_arm(off, BaselineConfig.matched_to(off)) == {}
+
+
+def test_a_bf16_baseline_against_an_effective_fp32_base_declares_the_precision(tmp_path: Path) -> None:
+    import train_baseline  # noqa: F401
+
+    base = pa.load_base("bf16", _write_base(tmp_path / "bf16", _tiny_cfg(amp_dtype="bf16")))
+    plan = pa.build_plan(base, budget="base_protocol", seeds=[(1, 1)], counts=False, labels=[MATCHED_PARAMS],
+                         baseline_overrides={"lr": 3e-3})[0]
+    assert plan.status == "ready" and plan.diff == {"amp_dtype": ("float32", "bf16")}
+    declared = [d for d in plan.deviations if d.startswith(PRECISION)]
+    assert len(declared) == 1 and "bf16 autocast" in declared[0] and "inert" in declared[0]
+    row = pa.build_manifest(tmp_path / "exp", [plan], base=base, budget="base_protocol", seeds=[(1, 1)])[
+        "paper_arms"]["rows"][MATCHED_PARAMS]
+    assert row["declared_deviations"] == plan.deviations and row["changes"]["amp_dtype"] == ["'float32'", "'bf16'"]
+    # Pinned to fp32, the baseline matches the base's effective precision (it was refused before).
+    pinned = pa.build_plan(base, budget="base_protocol", seeds=[(1, 1)], counts=False, labels=[MATCHED_PARAMS],
+                           baseline_overrides={"lr": 3e-3, "amp_dtype": None})[0]
+    assert pinned.status == "ready" and pinned.cfg.amp_dtype is None
+    assert pinned.diff == {} and not any(d.startswith(PRECISION) for d in pinned.deviations)
+
+
+def test_the_linear_decoder_arm_declares_the_precision_it_makes_live(tmp_path: Path) -> None:
+    chunked = _tiny_cfg(amp_dtype="bf16", decode_mode="diagonal_chunked", decode_logits_amp=True)
+    assert pa.effective_precision(chunked) == "float32"
+    base = pa.load_base("chunked", _write_base(tmp_path / "c", chunked))
+    plan = pa.build_plan(base, budget="base_protocol", seeds=[(1, 1)], counts=False, labels=["Linear decoder"])[0]
+    assert plan.status == "ready" and plan.diff == {"decode_mode": ("diagonal_chunked", "linear")}
+    declared = [d for d in plan.deviations if d.startswith(PRECISION)]
+    assert len(declared) == 1 and "decode_logits_amp" in declared[0] and "bf16" in declared[0]
+    row = pa.build_manifest(tmp_path / "exp", [plan], base=base, budget="base_protocol", seeds=[(1, 1)])[
+        "paper_arms"]["rows"]["Linear decoder"]
+    assert row["declared_deviations"] == plan.deviations
+    fp32 = pa.load_base("fp32", _write_base(tmp_path / "f", _tiny_cfg(decode_mode="diagonal_chunked")))
+    plain = pa.build_plan(fp32, budget="base_protocol", seeds=[(1, 1)], counts=False, labels=["Linear decoder"])[0]
+    assert plain.status == "ready" and plain.deviations == []

@@ -30,7 +30,10 @@ resolved base config) and the fields the config itself coerces as a documented c
 differs from the resolved base in the declared fields and the documented coercions only, and that
 every declared value survived validation. A baseline arm declares a ``vfe3.baseline`` spec; its
 protocol fields (tokenizer, context, stride, budget, cadence, shape, prior, decoder) must equal the
-base's except where declared. Rules:
+base's except where declared. Precision is compared by its effect (:func:`effective_precision`): a base
+recorded with ``amp_dtype='bf16'`` on a route that computes in float32 is matched by a float32 baseline,
+and a bf16 baseline against it is a declared deviation, as is a VFE arm that changes the precision (the
+linear decoder under ``decode_logits_amp``). Rules:
 
 * Stored-covariance decay. "Decayed" keeps the base's ``sigma_weight_decay``; "without decay" sets
   it to 0. For a base whose decay is already 0 (``full_K64``) the row "Learned frames, stored
@@ -753,6 +756,33 @@ def check_vfe_arm(
     return diff
 
 
+def effective_precision(cfg: Any) -> str:
+    r"""The precision ``cfg`` computes in: its ``amp_dtype``, or ``"float32"`` without autocast.
+
+    A VFE config whose route runs every contraction in an autocast-disabled fp32 island marks
+    ``amp_dtype`` inert (:meth:`vfe3.config.VFE3Config.inactive_fields`; only the linear decode's logits
+    under ``decode_logits_amp`` and the CG coupling consume it), so a recorded ``'bf16'`` computes in
+    float32 there. A baseline's blocks run under any ``amp_dtype`` it sets.
+    """
+    amp = getattr(cfg, "amp_dtype", None)
+    if amp is None:
+        return "float32"
+    inactive = getattr(cfg, "inactive_fields", None)
+    if callable(inactive) and "amp_dtype" in inactive():
+        return "float32"
+    return str(amp)
+
+
+def _amp_consumers(cfg: Any) -> List[str]:
+    r"""What runs under ``cfg.amp_dtype`` on a VFE route that makes it live."""
+    consumers: List[str] = []
+    if getattr(cfg, "decode_mode", None) == "linear" and getattr(cfg, "decode_logits_amp", False):
+        consumers.append("decode_logits_amp=True runs the linear decode's logits matmul under it")
+    if getattr(cfg, "use_cg_coupling", False):
+        consumers.append("use_cg_coupling runs the CG coupling's moment contraction under it")
+    return consumers
+
+
 def check_baseline_arm(
     matched_cfg:  Any,
     baseline_cfg: Any,
@@ -761,13 +791,19 @@ def check_baseline_arm(
     r"""Assert the baseline's protocol fields equal the matched VFE config's except ``declared``.
 
     Returns ``{BaselineConfig field: (VFE value, baseline value)}`` of the declared differences.
+    ``amp_dtype`` is compared by :func:`effective_precision` (audit 2026-10-16 F58): a VFE base recorded
+    with ``'bf16'`` on a route that computes in float32 is matched by a float32 baseline, and a bf16
+    baseline against it is a difference ``("float32", "bf16")``.
     """
     declared = set(declared)
     diff: Dict[str, Tuple[Any, Any]] = {}
     for name, vfe_name in BASELINE_PROTOCOL_FIELDS.items():
         if not hasattr(baseline_cfg, name) or not hasattr(matched_cfg, vfe_name):
             continue
-        a, b = getattr(matched_cfg, vfe_name), getattr(baseline_cfg, name)
+        if name == "amp_dtype":
+            a, b = effective_precision(matched_cfg), effective_precision(baseline_cfg)
+        else:
+            a, b = getattr(matched_cfg, vfe_name), getattr(baseline_cfg, name)
         if a != b:
             diff[name] = (a, b)
     # The baseline's rotary positions match a VFE rope_mode other than "none".
@@ -968,6 +1004,15 @@ def resolve_arm(
         # A base value no path read becomes live under the arm (e.g. a recorded hidden-bias rate).
         plan.notes.extend(f"{key}={getattr(plan.cfg, key)!r} is inert on the base and live in this arm"
                           for key in sorted(set(base_cfg.inactive_fields()) - set(inert)))
+        precision = (effective_precision(base_cfg), effective_precision(plan.cfg))
+        if precision[0] != precision[1]:
+            # Audit 2026-10-16 F58: a changed precision is a second difference of the arm, recorded as one.
+            consumers = _amp_consumers(plan.cfg if precision[1] != "float32" else base_cfg)
+            deviation = (f"precision: the base computes in {precision[0]} and this arm in {precision[1]} "
+                         f"(amp_dtype={plan.cfg.amp_dtype!r}"
+                         + (f"; {'; '.join(consumers)}" if consumers else "") + ")")
+            plan.deviations.append(deviation)
+            plan.notes.append(f"declared difference: {deviation}")
         for seed, _ in seeds:
             _with_seed(plan.cfg, seed)                      # validates every seed's config
         if counts:
@@ -1073,6 +1118,18 @@ def _resolve_baseline(
             deviation = _lr_transfer_deviation(unscaled, plan.cfg)
             plan.deviations.append(deviation)
             plan.notes.append(f"declared difference: {deviation}")
+    precision = (effective_precision(matched), effective_precision(plan.cfg))
+    if precision[0] != precision[1]:
+        # Audit 2026-10-16 F58: declared, not hidden; baseline_overrides amp_dtype=None matches a float32 base.
+        declared += ("amp_dtype",)
+        recorded = (f" (its amp_dtype={matched.amp_dtype!r} is inert there)"
+                    if matched.amp_dtype is not None and precision[0] == "float32" else "")
+        deviation = (f"precision: the matched VFE config computes in {precision[0]}{recorded}, this baseline's "
+                     + (f"blocks under {precision[1]} autocast" if precision[1] != "float32" else "blocks in float32")
+                     + (" (baseline_overrides amp_dtype=None trains it in float32)" if precision[0] == "float32"
+                        else ""))
+        plan.deviations.append(deviation)
+        plan.notes.append(f"declared difference: {deviation}")
     # A protocol field set by the arm's own overrides is a declared difference.
     plan.diff = check_baseline_arm(matched, plan.cfg, declared=declared)
     if plan.cfg.hidden_lr_scale != 1.0:
