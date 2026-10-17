@@ -28,9 +28,12 @@ which stays finite on the degenerate eigenvalues the clamp creates, where the ``
 :math:`\lambda_a - \lambda_b` (Bhatia, *Matrix Analysis*, Section V.3). Since :math:`g` is monotone and 1-Lipschitz,
 :math:`F_{ab} \in [0, 1]`.
 """
-from typing import Dict, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import torch
+
+from vfe3.contracts import host_check
+from vfe3.numerics import safe_eigh
 
 
 # Entries (tokens, or token head blocks under head_dims) whose covariance the ceiling clamped, per device, counted on
@@ -59,7 +62,7 @@ class _SpectralCeiling(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, W: torch.Tensor, ceiling: float) -> torch.Tensor:   # (n, r, r) -> (n, r, r)
-        lam, V = torch.linalg.eigh(W)                                   # (n, r), (n, r, r)
+        lam, V = safe_eigh(W)                                           # (n, r), (n, r, r), batch-chunked
         g = lam.clamp(max=ceiling)                                      # (n, r)
         ctx.save_for_backward(lam, g, V)
         ctx.ceiling = ceiling
@@ -78,6 +81,14 @@ class _SpectralCeiling(torch.autograd.Function):
         return V @ (F * (V.mT @ G @ V)) @ V.mT, None
 
 
+def _anchor_verdict(host: List[bool]) -> None:
+    r"""Raise-only verdict of the anchor factorization of :func:`_dense_ceiling`."""
+    if host[0]:
+        raise ValueError("predictive_covariance_ceiling: the anchor Sigma_p of a clamped covariance is not positive "
+                         "definite in float64 (zero-jitter Cholesky failed), so the ceiling c * Sigma_p has no "
+                         "whitening; no repair applied")
+
+
 def _dense_ceiling(
     sigma:   torch.Tensor,   # (..., r, r) SPD covariance
     anchor:  torch.Tensor,   # (..., r, r) SPD anchor Sigma_p, broadcastable to sigma
@@ -87,6 +98,9 @@ def _dense_ceiling(
 
     The certificate is a Cholesky test of :math:`c\Sigma_p - \Sigma`; only failing entries are whitened and clamped,
     in float64. A false failure is harmless: the clamp leaves a matrix below the ceiling unchanged up to rounding.
+    The anchor of a clamped entry is factored by ``cholesky_ex``; one that is not positive definite has no whitening,
+    so it factors the identity in its place and a raise-only verdict (:func:`vfe3.contracts.host_check`, deferred to
+    the next mandatory host read inside :func:`vfe3.contracts.deferred_host_checks`) reports it, with no repair.
     """
     anchor = torch.broadcast_to(anchor.to(sigma.dtype), sigma.shape)
     with torch.no_grad():
@@ -96,7 +110,10 @@ def _dense_ceiling(
     if not bool(clamp.any()):
         return sigma
     S = sigma[clamp].double()                                           # (n, r, r)
-    L = torch.linalg.cholesky(anchor[clamp].double())                   # (n, r, r) Sigma_p = L L^T
+    L, info_p = torch.linalg.cholesky_ex(anchor[clamp].double())        # (n, r, r) Sigma_p = L L^T, (n,) info
+    failed = info_p != 0                                                # (n,) anchor not positive definite
+    host_check(failed.any().reshape(1), _anchor_verdict)
+    L = torch.where(failed[..., None, None], torch.eye(L.shape[-1], dtype=L.dtype, device=L.device), L)
     Y = torch.linalg.solve_triangular(L, S, upper=False)                # L^{-1} S
     W = torch.linalg.solve_triangular(L, Y.mT, upper=False)             # L^{-1} S L^{-T}
     W = 0.5 * (W + W.mT)
