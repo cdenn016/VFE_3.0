@@ -148,6 +148,7 @@ _CONFIG_VALUES: dict[str, Any] = {
     'm_phi_group_retraction': 'chart',
     'm_phi_group_differential_mode': 'series',
     'm_phi_fisher_rotation_weight': 2.0,
+    'm_phi_fisher_completion': 'rotation',
     'weight_decay': 0.05,
     'sigma_weight_decay': None,
     'mu_weight_decay': None,

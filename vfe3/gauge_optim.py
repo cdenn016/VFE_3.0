@@ -27,6 +27,7 @@ from vfe3.geometry.matrix_log import (
     principal_strip_certificate,
 )
 from vfe3.geometry.phi_fisher import (
+    FISHER_COMPLETIONS,
     FisherRowStatistics,
     fisher_type_solve,
     jacobi_cholesky_solve,
@@ -774,6 +775,7 @@ def belief_fisher_group_direction(
     rotation_weight: float,
     chart_velocity:  bool = False,
     diagnostics_out: Optional[Dict[str, List[torch.Tensor]]] = None,
+    completion:      str = "rotation",
 ) -> GroupLogDirection:
     r"""Belief-Fisher natural-gradient body direction of the stored factor rows (Track 2).
 
@@ -804,7 +806,18 @@ def belief_fisher_group_direction(
     ``collect``, zero otherwise); they are not Frobenius-pullback conditions, so the optimizer logs
     them under ``phi_fisher_condP_max`` / ``phi_fisher_pos_cond_max`` and leaves the
     ``phi_pullback_damped_gen_cond_*`` columns NaN.
+
+    ``completion`` (``m_phi_fisher_completion``) selects the completed metric of the type rows:
+    ``'rotation'`` (weight :math:`\lambda` on every rotation) or ``'stabilizer'`` (on the belief's
+    stabilizer only, so the solve is the belief-Fisher natural gradient on the Fisher-visible subspace;
+    :mod:`vfe3.geometry.phi_fisher`). Positional rows have no ``'stabilizer'`` operator and raise.
     """
+    if completion not in FISHER_COMPLETIONS:
+        raise ValueError(f"Fisher completion must be one of {FISHER_COMPLETIONS}, got {completion!r}")
+    if completion == "stabilizer" and statistics.kind != "type":
+        raise ValueError(
+            "completion='stabilizer' is implemented for token-type Fisher rows only; positional rows "
+            f"(statistics.kind={statistics.kind!r}) take completion='rotation'")
     rows, n_gen = grad_phi.shape
     n_blocks, block_dim = current_blocks.shape[-3], current_blocks.shape[-1]
     X = phi.view(rows, n_blocks, block_dim, block_dim)                   # (A, H, d, d)
@@ -818,9 +831,11 @@ def belief_fisher_group_direction(
     accepted = covector_ok.all(dim=-1) & (count > 0)
     if statistics.kind == "type":
         mu, s = statistics.local_mean, statistics.local_var              # (A, H, d)
-        W = fisher_type_solve(G_W, mu, s, scale, rotation_weight=rotation_weight)
-        a, lam_min, cond = type_row_spectrum(mu, s, rotation_weight=rotation_weight)   # (A, H)
-        residual = type_metric_residual(W, G_W, mu, s, scale, rotation_weight=rotation_weight)
+        W = fisher_type_solve(G_W, mu, s, scale, rotation_weight=rotation_weight, completion=completion)
+        a, lam_min, cond = type_row_spectrum(mu, s, rotation_weight=rotation_weight,
+                                             completion=completion)                     # (A, H)
+        residual = type_metric_residual(W, G_W, mu, s, scale, rotation_weight=rotation_weight,
+                                        completion=completion)
     elif statistics.kind == "pos":
         # The (A, H, d*d, d*d) operators are formed and solved a row chunk at a time under a byte
         # budget (audit 2026-10-08 P2-22); every row's solve is independent, so this is exact.
@@ -1523,6 +1538,9 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
     the process-global :func:`~vfe3.geometry.phi_preconditioner.phi_group_differential_mode` at
     construction (the historical behavior). The choice is per optimizer, never written to the
     process-global, and is checkpointed: a loaded state's saved mode replaces it.
+
+    ``phi_fisher_completion`` (``m_phi_fisher_completion``: ``"rotation"`` or ``"stabilizer"``) selects the
+    completed belief-Fisher metric of the ``fisher_group`` type rows (:func:`belief_fisher_group_direction`).
     """
 
     # Signature-convention exception: torch.optim.Optimizer's contract REQUIRES params as the
@@ -1539,6 +1557,7 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
         phi_statistics_provider:    Optional[PhiStatisticsProvider] = None,
         phi_fisher_rotation_weight: float = 2.0,
         phi_group_differential_mode: Optional[str] = None,
+        phi_fisher_completion:      str = "rotation",
         **kwargs,
     ) -> None:
         if not isinstance(group, GaugeGroup):
@@ -1549,6 +1568,10 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
             raise ValueError(
                 f"phi_group_differential_mode must be one of {_PHI_GROUP_DIFFERENTIAL_MODES}, got "
                 f"{phi_group_differential_mode!r}"
+            )
+        if phi_fisher_completion not in FISHER_COMPLETIONS:
+            raise ValueError(
+                f"phi_fisher_completion must be one of {FISHER_COMPLETIONS}, got {phi_fisher_completion!r}"
             )
         if phi_group_retraction not in _UGROUP_RETRACTIONS:
             raise ValueError(
@@ -1577,6 +1600,7 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
         self._phi_group_retraction   = phi_group_retraction
         self.phi_statistics_provider = phi_statistics_provider
         self._phi_fisher_rotation_weight = phi_fisher_rotation_weight
+        self._phi_fisher_completion = phi_fisher_completion
         # Training-time diagnostics are gated by train.py to log/eval steps. The silent hot path
         # performs no diagnostic tensor work or host reduction. Pullback groups report the fixed-
         # coordinate ridge-direction cosine, reused generalized-condition certificate, accepted
@@ -1745,6 +1769,7 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                         belief_fisher_group_direction,
                         statistics=statistics,
                         rotation_weight=self._phi_fisher_rotation_weight,
+                        completion=self._phi_fisher_completion,
                         diagnostics_out=fisher_acc,
                     )
                 if group_log:

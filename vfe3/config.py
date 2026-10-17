@@ -762,7 +762,19 @@ class VFE3Config:
     # docs/derivations/2026-09-28-phi-natgrad.tex, Table tab:cap), so values above the cap change nothing there.
     # The optimizer reports the halvings as phi_group_backtracks_mean / phi_group_backtracks_max.
     m_phi_group_trust_radius:        float           = 0.1
-    m_phi_fisher_rotation_weight:     float           = 2.0          # fisher_group only: completion weight lambda on every rotation; raises Fisher-visible rotation metrics a -> a + 2 lambda
+    m_phi_fisher_rotation_weight:     float           = 2.0          # fisher_group only: completion weight lambda; under m_phi_fisher_completion='rotation' on every rotation, raising Fisher-visible rotation metrics a -> a + 2 lambda
+
+    # "rotation" | "stabilizer"
+    # fisher_group only: completion of the belief-Fisher frame metric g(Z) = ||Z eta||^2 + 2||sym Z||_F^2, whose kernel
+    # is the stabilizer of the belief (whitened Z = L^{-1} X L, eta = L^{-1} xi).
+    #   rotation    g + lambda ||asym Z||_F^2 on every rotation; it also raises the metric of a Fisher-visible rotation
+    #               e n^T - n e^T (unit e orthogonal to n below) from a to a + 2 lambda (a = |eta|^2), so no lambda gives
+    #               the belief-Fisher natural gradient there
+    #   stabilizer  g + lambda ||P asym(Z) P||_F^2, P = I - n n^T, n = eta/|eta|: lambda only on the kernel, so the
+    #               whitened step is the pseudo-inverse belief-Fisher natural gradient on the Fisher-visible
+    #               subspace plus Pi R / lambda on the kernel (vfe3/geometry/phi_fisher.py). Token-type rows only:
+    #               refused with pos_phi='learned' (the pooled positional metric has no stabilizer-only form yet)
+    m_phi_fisher_completion:          str             = "rotation"
 
     # "adamw" | "fisher"
     # M-step update of the type-prior tables mu_embed and sigma_log_embed, p_v = N(mu_v, diag s_v), s_v = e^{l_v}.
@@ -1040,6 +1052,7 @@ class VFE3Config:
                 "m_phi_fisher_rotation_weight must be finite and positive, got "
                 f"{self.m_phi_fisher_rotation_weight}"
             )
+        _require(self.m_phi_fisher_completion, ("rotation", "stabilizer"), "m_phi_fisher_completion")
         # sigma_max caps the covariance in the SPD retractions; a nonfinite or sub-eps cap would push
         # the clamped covariance below eps / negative / NaN. None stays permissive (no cap).
         if self.sigma_max is not None and not (
@@ -1469,6 +1482,12 @@ class VFE3Config:
             if fisher_problems:
                 raise ValueError(
                     "m_phi_update_mode='fisher_group' requires " + "; ".join(fisher_problems))
+            if self.m_phi_fisher_completion == "stabilizer" and self.pos_phi == "learned":
+                raise ValueError(
+                    "m_phi_fisher_completion='stabilizer' is implemented for the token-type frame rows only; "
+                    "pos_phi='learned' also steps the positional frames, whose pooled Fisher has no "
+                    "stabilizer-only completion yet. Use m_phi_fisher_completion='rotation', or pos_phi='none' "
+                    "or 'frozen'")
         if phi_update_policy.requires_pullback_geometry:
             from vfe3.geometry.groups import get_group
             group_builder = get_group(self.gauge_group)
@@ -2133,7 +2152,8 @@ class VFE3Config:
         elif self.cg_covariance_mode == "passthrough":
             mark(("cg_covariance_floor",), "only read by cg_covariance_mode='delta_full'")
         if not phi_update_policy.requires_fisher_statistics:
-            mark(("m_phi_fisher_rotation_weight",), "only read by m_phi_update_mode='fisher_group'")
+            mark(("m_phi_fisher_rotation_weight", "m_phi_fisher_completion"),
+                 "only read by m_phi_update_mode='fisher_group'")
         minimal_agent = self.predictive_readout == "minimal_agent"
         if self.decode_mode != "linear" or self.amp_dtype is None:
             mark(("decode_logits_amp",), "only read by decode_mode='linear' with amp_dtype set")

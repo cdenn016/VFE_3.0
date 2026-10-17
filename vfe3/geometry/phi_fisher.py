@@ -17,7 +17,15 @@ has the Frobenius-self-adjoint operator
     \mathcal M(X) = C^{-1} X (c_1 C + \xi\xi^\top) + c_2 X^\top, \qquad
     c_1 = 1 + \lambda/2, \quad c_2 = 1 - \lambda/2,
 
-a single Kronecker product at the default :math:`\lambda = 2`. For a fixed belief the metric is
+a single Kronecker product at the default :math:`\lambda = 2`. That ``'rotation'`` completion also raises
+the metric of every Fisher-visible rotation (one with :math:`Z\eta \ne 0`) from :math:`a` toward
+:math:`a + 2\lambda`. The ``'stabilizer'`` completion :math:`g + \lambda\|P_\perp\,\mathrm{asym}(Z)\,P_\perp\|_F^2`,
+:math:`P_\perp = I - nn^\top`, :math:`n = \eta/|\eta|` (:math:`P_\perp = I` at :math:`\eta = 0`), penalizes only the
+kernel: :math:`Z \mapsto P_\perp\,\mathrm{asym}(Z)\,P_\perp` is the Frobenius-orthogonal projector :math:`\Pi` onto
+:math:`\{Z : \mathrm{sym}\,Z = 0,\ Z\eta = 0\}`, so in whitened coordinates the solve is
+:math:`F^+ R + \Pi R/\lambda`, the pseudo-inverse belief-Fisher natural gradient on the Fisher-visible subspace plus
+a kernel step that vanishes as :math:`\lambda \to \infty` (audit 2026-10-16, F50). It is implemented for the
+token-type rows only. For a fixed belief the metric is
 right-invariant, so in the spatial generator :math:`W = \delta U\,U^{-1}` of a token-type factor it
 is the same formula at the local table row :math:`(\mu_v, \mathrm{diag}\,s_v)`, independent of the
 position. Positional factors see the batch column of middle-fiber beliefs
@@ -61,6 +69,17 @@ class FisherRowStatistics:
 POOLED_OPERATOR_CHUNK_BYTES: int = 256 * 2**20
 
 
+# Completions of the frame Fisher (``m_phi_fisher_completion``): lambda on every rotation, or on the stabilizer only.
+FISHER_COMPLETIONS: Tuple[str, ...] = ("rotation", "stabilizer")
+
+
+def _check_completion(completion: str) -> str:
+    r"""Return ``completion`` if it is one of :data:`FISHER_COMPLETIONS`, else raise."""
+    if completion not in FISHER_COMPLETIONS:
+        raise ValueError(f"Fisher completion must be one of {FISHER_COMPLETIONS}, got {completion!r}")
+    return completion
+
+
 def completion_coefficients(rotation_weight: float) -> Tuple[float, float]:
     r"""Return :math:`(c_1, c_2) = (1 + \lambda/2, 1 - \lambda/2)` for :math:`(\lambda_s, \lambda_a) = (0, \lambda)`."""
     return 1.0 + 0.5 * rotation_weight, 1.0 - 0.5 * rotation_weight
@@ -73,11 +92,38 @@ def completed_fisher_operator(
 
     *,
     rotation_weight: float,
+    completion:      str = "rotation",
 ) -> torch.Tensor:                     # (..., d, d)
-    r"""Apply :math:`\mathcal M(X) = C^{-1} X (c_1 C + \xi\xi^\top) + c_2 X^\top`."""
-    c1, c2 = completion_coefficients(rotation_weight)
-    N = c1 * C + xi[..., :, None] * xi[..., None, :]
-    return torch.linalg.solve(C, X @ N) + c2 * X.transpose(-1, -2)
+    r"""Apply the completed metric operator in spatial coordinates.
+
+    ``'rotation'``: :math:`\mathcal M(X) = C^{-1} X (c_1 C + \xi\xi^\top) + c_2 X^\top`. ``'stabilizer'``:
+
+    .. math::
+        \mathcal M(X) = C^{-1} X (C + \xi\xi^\top) + X^\top
+            + \frac{\lambda}{2}\bigl(A X B - D X^\top D\bigr),
+
+    the pullback of :math:`\lambda\,\Pi` through :math:`Z = L^{-1} X L`, with :math:`u = C^{-1}\xi`,
+    :math:`a = \xi^\top u`, :math:`A = C^{-1} - uu^\top/a`, :math:`B = C - \xi\xi^\top/a`,
+    :math:`D = I - u\xi^\top/a`; at :math:`\xi = 0` it is the ``'rotation'`` operator. Both are basis-free
+    (independent of the factor :math:`L` of :math:`C`).
+    """
+    if _check_completion(completion) == "rotation":
+        c1, c2 = completion_coefficients(rotation_weight)
+        N = c1 * C + xi[..., :, None] * xi[..., None, :]
+        return torch.linalg.solve(C, X @ N) + c2 * X.transpose(-1, -2)
+    lam = float(rotation_weight)
+    u = torch.linalg.solve(C, xi[..., :, None])[..., 0]                    # (..., d) C^{-1} xi
+    a = (xi * u).sum(dim=-1)                                               # (...)
+    inv_a = torch.where(a > 0, 1.0 / torch.where(a > 0, a, torch.ones_like(a)),
+                        torch.zeros_like(a))[..., None, None]              # 0 where xi = 0
+    xi_xi = xi[..., :, None] * xi[..., None, :]
+    B = C - inv_a * xi_xi
+    D = torch.eye(xi.shape[-1], dtype=X.dtype, device=X.device) - inv_a * (u[..., :, None] * xi[..., None, :])
+    XB = X @ B
+    AXB = torch.linalg.solve(C, XB) - inv_a * u[..., :, None] * (u[..., None, :] @ XB)
+    X_t = X.transpose(-1, -2)
+    return (torch.linalg.solve(C, X @ (C + xi_xi)) + X_t
+            + 0.5 * lam * (AXB - D @ X_t @ D))
 
 
 def fisher_spectrum_bounds(
@@ -86,6 +132,7 @@ def fisher_spectrum_bounds(
 
     *,
     rotation_weight: float,
+    completion:      str = "rotation",
 ) -> Tuple[torch.Tensor, torch.Tensor]:   # (...) lambda_min, (...) lambda_max
     r"""Extreme generalized eigenvalues of the completed metric relative to :math:`\mathcal P(X) = C^{-1} X C`.
 
@@ -95,7 +142,22 @@ def fisher_spectrum_bounds(
     maximum uses every member, which corrects the spec's ``cond_P`` for :math:`\lambda > 2`; the
     minimum also keeps the shear value 2, which the spec's ``min(lam, minus)`` omits and which is the
     minimum whenever :math:`\lambda > 2`.
+
+    Under ``completion='stabilizer'`` the Fisher-visible pairs keep the uncompleted values
+    :math:`\tfrac12(2 + a \pm \sqrt{a^2 + 4})` (:math:`c_1 = c_2 = 1`), the smaller of which is about
+    :math:`a/2` for small :math:`a`; at :math:`a = 0` the stabilizer is every rotation and the smaller
+    member is :math:`\lambda`.
     """
+    if _check_completion(completion) == "stabilizer":
+        root = torch.sqrt(a.square() + 4.0)
+        members = [2.0 + a]
+        if d >= 2:
+            minus = torch.where(a > 0, 0.5 * (2.0 + a - root), torch.full_like(a, float(rotation_weight)))
+            members += [minus, 0.5 * (2.0 + a + root), torch.full_like(a, 2.0)]
+        if d >= 3:
+            members.append(torch.full_like(a, float(rotation_weight)))
+        stacked = torch.stack(members)                                     # (m, ...)
+        return stacked.amin(dim=0), stacked.amax(dim=0)
     c1, c2 = completion_coefficients(rotation_weight)
     root = torch.sqrt(a.square() + 4.0 * c2 * c2)
     members = [2.0 + a]
@@ -116,6 +178,7 @@ def fisher_type_solve(
 
     *,
     rotation_weight: float,
+    completion:      str = "rotation",
 ) -> torch.Tensor:                     # (R, H, d, d) spatial direction W
     r"""Solve :math:`\mathcal M(W) = \mathrm{scale}\cdot G_W` at the local row :math:`(\mu, S = \mathrm{diag}\,s)` in :math:`O(d^2)`.
 
@@ -138,8 +201,24 @@ def fisher_type_solve(
 
     then :math:`W = \mathrm{scale}\cdot S^{1/2} Z S^{-1/2}`. Both forms are basis-free and valid at
     :math:`\mu = 0`.
+
+    ``completion='stabilizer'`` solves :math:`Z\eta\eta^\top + 2\,\mathrm{sym}Z + \lambda P_\perp\mathrm{asym}(Z)P_\perp = R`
+    blockwise in the frame :math:`n = \eta/|\eta|`, :math:`a = |\eta|^2`: with :math:`R_{\perp\perp} = P_\perp R P_\perp`,
+    :math:`r_{\perp n} = P_\perp R n`, :math:`r_{n\perp} = P_\perp R^\top n`, :math:`r_{nn} = n^\top R n`,
+
+    .. math::
+        Z_{\perp\perp} = \tfrac12\,\mathrm{sym}R_{\perp\perp} + \tfrac1\lambda\,\mathrm{asym}R_{\perp\perp}, \qquad
+        z_{\perp n} = \frac{r_{\perp n} - r_{n\perp}}{a}, \qquad
+        z_{n\perp} = r_{n\perp} - z_{\perp n}, \qquad
+        z_{nn} = \frac{r_{nn}}{2 + a},
+
+    and :math:`Z = Z_{\perp\perp} + z_{\perp n}n^\top + n z_{n\perp}^\top + z_{nn}nn^\top`. At :math:`\mu = 0`,
+    :math:`P_\perp = I` and the solve is the ``'rotation'`` one. The visible mean rotations carry metric
+    eigenvalue about :math:`a/2`, so the step along them grows like :math:`1/a` as :math:`\mu \to 0`.
     """
     scale = scale[:, None, None, None]
+    if _check_completion(completion) == "stabilizer":
+        return scale * _stabilizer_whitened_solve(G_W, mu, s, float(rotation_weight))
     if rotation_weight == 2.0:
         Q = G_W * (s[..., :, None] / s[..., None, :])                      # (R, H, d, d)
         u = mu / s                                                         # (R, H, d) S^{-1} mu
@@ -167,6 +246,39 @@ def fisher_type_solve(
     w = (b - beta * eta * eta_b / (1.0 + a * (alpha + beta))) / (1.0 + a * alpha)
     Z = Y0 - inverse_base(w[..., :, None] * eta[..., None, :])
     return scale * Z * ratio
+
+
+def _stabilizer_whitened_solve(
+    G_W: torch.Tensor,                 # (R, H, d, d) spatial covector
+    mu:  torch.Tensor,                 # (R, H, d) local table mean
+    s:   torch.Tensor,                 # (R, H, d) local table variance
+    lam: float,
+) -> torch.Tensor:                     # (R, H, d, d) S^{1/2} Z S^{-1/2}, before the count scale
+    r"""The ``'stabilizer'`` branch of :func:`fisher_type_solve` (block formulas in its docstring)."""
+    r = s.sqrt()
+    ratio = r[..., :, None] / r[..., None, :]                              # (R, H, d, d) sqrt(s_j/s_k)
+    R = G_W * ratio                                                        # whitened covector
+    eta = mu / r                                                           # (R, H, d)
+    a = eta.square().sum(dim=-1)                                           # (R, H)
+    visible = a > 0
+    n = torch.where(visible[..., None], eta / a.sqrt().clamp_min(torch.finfo(a.dtype).tiny)[..., None],
+                    torch.zeros_like(eta))                                 # (R, H, d); 0 where eta = 0
+    R_n = (R @ n[..., None])[..., 0]                                       # (R, H, d) R n
+    R_t_n = (R.transpose(-1, -2) @ n[..., None])[..., 0]                   # (R, H, d) R^T n
+    r_nn = (n * R_n).sum(dim=-1)                                           # (R, H)
+    r_pn = R_n - r_nn[..., None] * n                                       # P_perp R n
+    r_np = R_t_n - r_nn[..., None] * n                                     # P_perp R^T n
+    eye = torch.eye(eta.shape[-1], dtype=R.dtype, device=R.device)
+    P = eye - n[..., :, None] * n[..., None, :]                            # (R, H, d, d)
+    R_pp = P @ R @ P
+    R_pp_t = R_pp.transpose(-1, -2)
+    Z = 0.25 * (R_pp + R_pp_t) + 0.5 * (R_pp - R_pp_t) / lam              # (R, H, d, d)
+    z_pn = (r_pn - r_np) / torch.where(visible, a, torch.ones_like(a))[..., None]
+    z_np = r_np - z_pn
+    z_nn = r_nn / (2.0 + a)
+    Z = (Z + z_pn[..., :, None] * n[..., None, :] + n[..., :, None] * z_np[..., None, :]
+         + z_nn[..., None, None] * (n[..., :, None] * n[..., None, :]))
+    return Z * ratio
 
 
 def middle_fiber_moments(
@@ -302,10 +414,12 @@ def type_row_spectrum(
 
     *,
     rotation_weight: float,
+    completion:      str = "rotation",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:   # a, lambda_min, cond_P, each (R, H)
     r"""Per-block :math:`a = \mu^\top S^{-1}\mu` and :math:`\lambda_{\min}`, :math:`\mathrm{cond}_{\mathcal P}` of the completed metric."""
     a = (mu.square() / s).sum(dim=-1)
-    lam_min, lam_max = fisher_spectrum_bounds(a, mu.shape[-1], rotation_weight=rotation_weight)
+    lam_min, lam_max = fisher_spectrum_bounds(a, mu.shape[-1], rotation_weight=rotation_weight,
+                                              completion=completion)
     return a, lam_min, lam_max / lam_min
 
 
@@ -318,11 +432,20 @@ def type_metric_residual(
 
     *,
     rotation_weight: float,
+    completion:      str = "rotation",
 ) -> torch.Tensor:                     # (R,) max over blocks
-    r"""Relative residual :math:`\|\mathcal M(W) - \mathrm{scale}\,G_W\|_F / \|\mathrm{scale}\,G_W\|_F` at the local row."""
-    c1, c2 = completion_coefficients(rotation_weight)
-    N = c1 * torch.diag_embed(s) + mu[..., :, None] * mu[..., None, :]
-    applied = (W / s[..., :, None]) @ N + c2 * W.transpose(-1, -2)
+    r"""Relative residual :math:`\|\mathcal M(W) - \mathrm{scale}\,G_W\|_F / \|\mathrm{scale}\,G_W\|_F` at the local row.
+
+    The ``'stabilizer'`` operator is applied through :func:`completed_fisher_operator` in spatial
+    coordinates, independently of the solver's whitened block formulas.
+    """
+    if _check_completion(completion) == "stabilizer":
+        applied = completed_fisher_operator(W, mu, torch.diag_embed(s), rotation_weight=rotation_weight,
+                                            completion=completion)
+    else:
+        c1, c2 = completion_coefficients(rotation_weight)
+        N = c1 * torch.diag_embed(s) + mu[..., :, None] * mu[..., None, :]
+        applied = (W / s[..., :, None]) @ N + c2 * W.transpose(-1, -2)
     target = scale[:, None, None, None] * G_W
     return (torch.linalg.matrix_norm(applied - target)
             / torch.linalg.matrix_norm(target).clamp_min(torch.finfo(W.dtype).tiny)).amax(dim=-1)

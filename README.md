@@ -542,6 +542,15 @@ falls from about $4\times10^{-2}$ at $\|\varphi\|_F=0.05$ to $7\times10^{-3}$ at
 $\|\varphi\|_F=1.7$ ($d=6$), and a larger $R$ changes nothing there. The optimizer reports
 the halvings as `phi_group_backtracks_mean` and `phi_group_backtracks_max` on both retractions.
 
+The belief-Fisher frame metric of `fisher_group` vanishes on the stabilizer of each belief, so
+it is completed by `m_phi_fisher_rotation_weight` $\lambda$. Under
+`m_phi_fisher_completion="rotation"` (default) the weight acts on every rotation of the
+whitened generator, which also stiffens the rotations that move the mean, so no $\lambda$
+gives the natural gradient there. `"stabilizer"` puts it on the stabilizer only: the
+token-frame step is then the pseudo-inverse belief-Fisher natural gradient on the
+Fisher-visible directions plus a kernel step proportional to $1/\lambda$. It is refused with
+`pos_phi="learned"`, whose pooled positional metric has no stabilizer-only form.
+
 When every covariance contract passes the covariance through
 (`predictive_covariance="passthrough"`, `block_mlp_covariance="passthrough"` and
 `block_norm_covariance="passthrough"`),
