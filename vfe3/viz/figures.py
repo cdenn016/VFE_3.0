@@ -4497,7 +4497,7 @@ def plot_lr_grid_heatmap(
     fig.colorbar(im, ax=ax, shrink=0.85, label="val PPL")
     iy, ix = np.unravel_index(np.nanargmin(z), z.shape)
     ax.scatter([x[ix]], [y[iy]], marker="*", s=160, color="white", edgecolor="black", label="min")
-    if "baseline" in grid:
+    if grid.get("baseline") is not None:                   # a sweep may declare no baseline point
         bx, by = grid["baseline"]
         ax.scatter([bx], [by], marker="o", s=60, facecolor="none", edgecolor="red", label="baseline")
     ax.set(xlabel=grid.get("xlabel", "lr x"), ylabel=grid.get("ylabel", "lr y"),

@@ -55,6 +55,7 @@ def _cpu_bank_value(value: object) -> object:
         return CanonicalFrameContext(
             forward=_cpu_bank_tensor(value.forward),
             inverse=_cpu_bank_tensor(value.inverse),
+            block_diagonal=value.block_diagonal,              # compact (..., H, d, d) head blocks stay compact
         )
     if isinstance(value, CompactBlockElement):
         return CompactBlockElement(
@@ -239,6 +240,7 @@ def _decode_inference_record(
         canonical_frame = CanonicalFrameContext(
             forward=canonical_frame.forward.to(device),
             inverse=canonical_frame.inverse.to(device),
+            block_diagonal=canonical_frame.block_diagonal,
         )
     logits = model._decode_belief_with_context(
         mu,

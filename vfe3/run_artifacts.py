@@ -4262,9 +4262,9 @@ def finalize_run(
         "test_padding_targets": results.get("test_padding_targets"),
         "test_stream_transitions": results.get("test_stream_transitions"),
         "diagnostics":  results["diagnostics"],
-        "estep_final_iterate_f_per_token": results.get("estep_final_iterate_f_per_token"),
-        "estep_final_f_per_token": results.get("estep_final_f_per_token"),
-        "estep_iterate_evidence": results.get("estep_iterate_evidence"),
+        # No estep_final_iterate_f_per_token / estep_final_f_per_token / estep_iterate_evidence: nothing on the
+        # projected routes produces an E-step iterate sequence, so those keys were always null (audit 2026-10-16
+        # F86); the legacy_reduced_free_energy diagnostic records why the shared F is unavailable.
         "scheduler": _scheduler_metadata(
             min_lr_frac=cfg.min_lr_frac,
             base_lrs=getattr(artifacts, "scheduler_base_lrs", ()),

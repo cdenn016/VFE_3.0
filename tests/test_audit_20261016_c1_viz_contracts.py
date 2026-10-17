@@ -19,8 +19,8 @@ F85: ``plot_scaling_law`` printed :math:`R^2` for the offset law at four sizes, 
 one residual degree of freedom; the gate now uses ``scaling_min_testable_sizes`` of the fitted form.
 
 F86: ``lr_grid_heatmap_kwargs`` stored a ``None`` baseline that the heatmap then unpacked; the inference-bank
-copy dropped ``CanonicalFrameContext.block_diagonal``; ``summary.json`` wrote three ``estep_final_*`` keys that
-nothing produces, so they were always null.
+copy and the record decode's device move dropped ``CanonicalFrameContext.block_diagonal``; ``summary.json`` wrote
+three ``estep_final_*`` keys that nothing produces, so they were always null.
 
 Tiny CPU models only (K=4, two heads, N=4, vocab 7).
 """
@@ -41,6 +41,7 @@ import vfe3.train as T
 import vfe3.viz.figures as figs
 from tests.profiles import test_config
 from tests.test_audit2_20261011_training import _cfg
+from vfe3.belief import BeliefState
 from vfe3.config import serialize_config
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.data.datasets import TokenWindows
@@ -310,3 +311,65 @@ def test_scaling_law_gates_r2_on_the_fitted_form(n_sizes: int, with_offset: bool
     assert ("$R^2$=" in label) is testable, label
     if not testable:
         assert f"not testable (<{scaling_min_testable_sizes(with_offset)} sizes)" in label
+
+
+# ------------------------------------------------------------------------------------------------ F86
+
+def _grid_rows() -> List[Dict[str, Any]]:
+    return [{"overrides": {"lr_a": x, "lr_b": y}, "primary_val_ppl": 10.0 + x + y}
+            for x in (0.1, 0.2) for y in (1.0, 2.0)]
+
+
+def test_lr_grid_heatmap_without_a_baseline() -> None:
+    kwargs = sweep_adapters.lr_grid_heatmap_kwargs(_grid_rows(), "lr_a", "lr_b", (0.1, 0.2), (1.0, 2.0), None)
+    assert kwargs is not None and "baseline" not in kwargs["grid"]
+    fig = figs.plot_lr_grid_heatmap(**kwargs)
+    assert "baseline" not in _texts(fig)
+    figs.plt.close(fig)
+    fig = figs.plot_lr_grid_heatmap({**kwargs["grid"], "baseline": None})      # an explicit None is tolerated
+    figs.plt.close(fig)
+    with_baseline = sweep_adapters.lr_grid_heatmap_kwargs(
+        _grid_rows(), "lr_a", "lr_b", (0.1, 0.2), (1.0, 2.0), (0.1, 1.0))
+    assert with_baseline["grid"]["baseline"] == (0.1, 1.0)
+    fig = figs.plot_lr_grid_heatmap(**with_baseline)
+    assert "baseline" in _texts(fig)
+    figs.plt.close(fig)
+
+
+def test_bank_copy_keeps_the_compact_frame_layout() -> None:
+    forward = torch.eye(2).expand(2, 3, 2, 2, 2).clone()                # (B, N, H, d, d) head blocks
+    context = CanonicalFrameContext(forward=forward, inverse=forward.clone(), block_diagonal=True)
+    copy = extract._cpu_bank_value(context)
+    assert isinstance(copy, CanonicalFrameContext) and copy.block_diagonal is True
+    assert torch.equal(copy.forward, forward) and torch.equal(copy.inverse, forward)
+    dense = extract._cpu_bank_value(CanonicalFrameContext(forward=torch.eye(4).expand(2, 3, 4, 4).clone(),
+                                                          inverse=torch.eye(4).expand(2, 3, 4, 4).clone()))
+    assert dense.block_diagonal is False
+    decoded: Dict[str, Any] = {}
+
+    def decode(mu: torch.Tensor, sigma: torch.Tensor, *, canonical_frame: Any) -> torch.Tensor:
+        decoded["frame"] = canonical_frame
+        return mu
+
+    belief = BeliefState(mu=torch.zeros(2, 3, 4), sigma=torch.ones(2, 3, 4), phi=torch.zeros(2, 3, 1))
+    extract._decode_inference_record(SimpleNamespace(_decode_belief_with_context=decode),
+                                     {"belief": belief, "canonical_frame": copy}, CPU)
+    assert decoded["frame"].block_diagonal is True                       # the decode re-host keeps it too
+
+
+def test_summary_carries_no_always_null_estep_final_keys(tmp_path: Path) -> None:
+    cfg = _cfg(max_steps=2)
+    torch.manual_seed(5)
+    model = VFEModel(cfg)
+    artifacts = ra.RunArtifacts(tmp_path / "run", cfg, model)
+    loader = DataLoader(TokenWindows((torch.arange(61) * 5 + 2) % V, N), batch_size=B, shuffle=False,
+                        drop_last=True)
+    losses = T.train(model, loader, cfg, n_steps=2, grad_clip=cfg.grad_clip, log_interval=0, eval_interval=0,
+                     device=CPU, logger=LOGGER, artifacts=artifacts, generate_samples=False)
+    val_loader = DataLoader(TokenWindows((torch.arange(23) * 3) % V, N, pad_final=True, stride=cfg.eval_stride),
+                            batch_size=2, shuffle=False)
+    ra.finalize_run(model, artifacts, cfg, final_validation=T.evaluate(model, val_loader), val_loader=val_loader,
+                    losses=losses, logger=LOGGER)
+    summary = json.loads((tmp_path / "run" / "summary.json").read_text(encoding="utf-8"))
+    for key in ("estep_final_iterate_f_per_token", "estep_final_f_per_token", "estep_iterate_evidence"):
+        assert key not in summary, key
