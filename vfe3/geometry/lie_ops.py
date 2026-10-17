@@ -196,11 +196,12 @@ def _bracket_closure_residual(
     eps:        float,
     gram_pinv_: Optional[torch.Tensor],
 ) -> float:
-    r"""Max relative out-of-span residual of the brackets :math:`[G_a, G_b]` (see :func:`require_basis_closed`)."""
+    r"""Max out-of-span residual of the brackets :math:`[G_a, G_b]` on the bilinear scale (see :func:`require_basis_closed`)."""
     brak = torch.einsum("aij,bjk->abik", G, G) - torch.einsum("bij,ajk->abik", G, G)  # (n_gen, n_gen, K, K) [G_a,G_b]
     proj = embed_phi(extract_phi(brak, G, gram_pinv_=gram_pinv_), G)         # span projection of each bracket
     res  = (brak - proj).norm(dim=(-2, -1))                                 # (n_gen, n_gen)
-    den  = brak.norm(dim=(-2, -1)) + eps                                    # (n_gen, n_gen)
+    gnorm = G.norm(dim=(-2, -1))                                            # (n_gen,)
+    den  = 2.0 * gnorm[:, None] * gnorm[None, :] + eps                      # (n_gen, n_gen) >= ||[G_a,G_b]||_F
     return float((res / den).max())
 
 
@@ -271,11 +272,15 @@ def require_basis_closed(
 ) -> None:
     r"""Raise if ``generators`` is not closed under the Lie bracket (fail closed; audit 2026-10-07 F20).
 
-    Measures the max relative out-of-span residual
+    Measures the max out-of-span residual on the bilinear scale,
     :math:`\max_{a,b} \lVert [G_a,G_b] - \mathrm{embed}(\mathrm{extract}([G_a,G_b]))\rVert_F /
-    (\lVert [G_a,G_b]\rVert_F + \epsilon)`. On a closed (default direct-sum) basis this is ~0; on a
+    (2\lVert G_a\rVert_F \lVert G_b\rVert_F + \epsilon)`, whose denominator is the Frobenius bound on
+    :math:`\lVert [G_a,G_b]\rVert_F`. On a closed (default direct-sum) basis this is ~0; on a
     non-closed custom basis it is O(1), the span projection in BCH composition would silently
-    truncate the out-of-span part, and this raises instead.
+    truncate the out-of-span part, and this raises instead. The bracket's own norm is not the scale:
+    a bracket that vanishes in exact arithmetic (commuting so(N) generators, N >= 4) carries rounding
+    with no component in the span, which read as O(1) on closed Gram-Schmidt tensor-power towers
+    (audit 2026-10-16, F6).
     The result depends only on generator values, so a bounded value-signature cache avoids repeating
     the bracket scan without retaining the caller's tensor storage.
 
@@ -314,8 +319,8 @@ def require_basis_closed(
         _BRACKET_CLOSURE_RES.move_to_end(key)
     if max_res > closure_tol:
         raise ValueError(
-            f"{where}: gauge generator basis is not closed under the Lie bracket (max relative "
-            f"out-of-span residual {max_res:.3e} > {closure_tol:.1e}); BCH composition would "
+            f"{where}: gauge generator basis is not closed under the Lie bracket (max out-of-span "
+            f"residual relative to 2 ||G_a||_F ||G_b||_F {max_res:.3e} > {closure_tol:.1e}); BCH composition would "
             f"truncate the out-of-span [G_a,G_b] terms. Use a bracket-closed basis.")
 
 
@@ -625,9 +630,9 @@ def compose_bch(
     :math:`Z` out of :math:`\mathrm{span}\{G_a\}`, and the final
     :math:`\mathrm{extract\_phi}(Z)` least-squares projection silently discards that
     out-of-span component. The guard :func:`require_basis_closed` therefore measures the max
-    relative bracket residual
+    bracket residual on the bilinear scale
     :math:`\max_{a,b} \lVert [G_a,G_b] - \mathrm{embed}(\mathrm{extract}([G_a,G_b]))\rVert_F /
-    (\lVert [G_a,G_b]\rVert_F + \epsilon)` and raises ``ValueError`` if it exceeds
+    (2\lVert G_a\rVert_F \lVert G_b\rVert_F + \epsilon)` and raises ``ValueError`` if it exceeds
     ``closure_tol`` (fail closed, audit 2026-10-07 F20); on a closed (default direct-sum) basis the
     residual is ~0, so the guard passes and the returned phi is unchanged.
     """

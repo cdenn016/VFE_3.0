@@ -277,7 +277,19 @@ def _strict_structure_constants(
 
     For ``B_cd = <G_c, G_d>_F`` and ``[G_a, G_b] = f_ab^c G_c``, the coordinates
     solve ``B_cd f_ab^d = <G_c, [G_a, G_b]>_F`` through the Cholesky factor of
-    ``B``. Reconstruction of every bracket certifies closure of the span.
+    ``B``. Reconstruction of every bracket certifies closure of the span: the
+    out-of-span residual :math:`r_{ab}` must satisfy
+
+    .. math::
+        \max_{a,b} \frac{r_{ab}}{2\lVert G_a\rVert_F \lVert G_b\rVert_F} \le \mathrm{closure\_tol},
+
+    the denominator being the Frobenius bound on :math:`\lVert [G_a, G_b]\rVert_F`, so every
+    bracket the former per-bracket ratio :math:`r_{ab}/\lVert [G_a, G_b]\rVert_F` accepted is
+    still accepted. The bilinear scale is the one the structure constants enter
+    :math:`\mathrm{ad}_\varphi` at. A bracket that vanishes in exact arithmetic (commuting
+    so(N) generators on disjoint index pairs, N >= 4) carries rounding with no component in the
+    span, and its own norm made that ratio O(1) on closed Gram-Schmidt tensor-power bases
+    (audit 2026-10-16, F6).
     """
     n_gen, K = generators.shape[0], generators.shape[-1]
     if strict_structure_bytes(n_gen, K) > structure_bytes:
@@ -301,13 +313,14 @@ def _strict_structure_constants(
         gram_factor,
     ).transpose(0, 1).reshape(n_gen, n_gen, n_gen)
     reconstructed = torch.einsum("abc,cij->abij", coordinates, basis)
-    residual = torch.linalg.matrix_norm(reconstructed - bracket, dim=(-2, -1))
-    bracket_norm = torch.linalg.matrix_norm(bracket, dim=(-2, -1))
-    relative = residual / (bracket_norm + torch.finfo(torch.float64).eps)
+    residual = torch.linalg.matrix_norm(reconstructed - bracket, dim=(-2, -1))   # (n_gen, n_gen)
+    generator_norm = torch.linalg.matrix_norm(basis, dim=(-2, -1))                # (n_gen,), > 0 by Cholesky
+    bilinear_scale = 2.0 * generator_norm[:, None] * generator_norm[None, :]      # >= ||[G_a, G_b]||_F
+    relative = residual / bilinear_scale
     if not bool(torch.isfinite(relative).all()) or float(relative.max()) > closure_tol:
         raise ValueError(
             "strict phi group direction requires a bracket-closed generator span; "
-            f"relative reconstruction residual={float(relative.max()):.3e}"
+            f"reconstruction residual relative to 2 ||G_a||_F ||G_b||_F = {float(relative.max()):.3e}"
         )
     return coordinates, gram
 
