@@ -838,13 +838,19 @@ def _build_su_n(
 ) -> GaugeGroup:
     r"""SU(N) acting on R^K through a direct sum of real irreps (tied gauge by default; heads = irreps).
 
-    The structure group is SU(N) with N = ``group_n`` >= 3, decoupled from K. Labels 'pq<p>_<q>' name the irrep
-    of highest weight (p, q); built so far are the trivial 'pq0_0' (no generators) and the adjoint 'pq1_1'
-    (real dimension N^2 - 1), :math:`\mathrm{ad}(X_a)_{cb} = f_{abc}` for :math:`X_a = i\lambda_a`. The
-    generators are real and exactly skew (skew_symmetric=True, det = 1), n_gen = N^2 - 1 per tied tower; the
-    first N(N-1)/2 phi coordinates are the so(N) subalgebra. An adjoint-only tower is a representation of
-    PSU(N) = SU(N)/Z_N, since the centre acts trivially on (1, 1). Tying, the Gram certificate and the basis
-    fingerprint behave as for ``so_n`` (:func:`_build_irrep_tower`).
+    The structure group is SU(N) with N = ``group_n`` >= 3, decoupled from K. Labels 'pq<p>_<q>' (p >= q >= 0)
+    name the irrep of highest weight :math:`p\omega_1 + q\omega_{N-1}`, the traceless tensors in
+    :math:`\mathrm{Sym}^p\mathbb{C}^N\otimes\mathrm{Sym}^q\overline{\mathbb{C}^N}`. For N = 3 these are all the
+    irreps of SU(3) up to complex conjugation, which the realification identifies; for N >= 4 they are only the
+    irreps whose inner Dynkin labels vanish, so for example :math:`\Lambda^2\mathbb{C}^4` of SU(4) is not among
+    them. The trivial 'pq0_0' (no generators) and the adjoint 'pq1_1' (real dimension N^2 - 1,
+    :math:`\mathrm{ad}(X_a)_{cb} = f_{abc}` for :math:`X_a = i\lambda_a`) are built in closed form, and every other
+    (p, q) with p + q <= 6 and N^(p+q) <= 60000 by the tensor construction
+    (:func:`vfe3.geometry.irreps._su_tensor_irrep`), realified to real dimension 2D when p != q. The generators
+    are real and exactly skew (skew_symmetric=True, det = 1), n_gen = N^2 - 1 per tied tower; the first N(N-1)/2
+    phi coordinates are the so(N) subalgebra. An adjoint-only tower is a representation of PSU(N) = SU(N)/Z_N,
+    since the centre acts trivially on (1, 1). Tying, the Gram certificate and the basis fingerprint behave as
+    for ``so_n`` (:func:`_build_irrep_tower`).
     """
     if group_n is None or irrep_spec is None:
         raise ValueError(

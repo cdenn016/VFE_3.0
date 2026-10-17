@@ -30,7 +30,8 @@ whole model: the diagonal family cannot represent $g\Sigma g^\top$, and local
 `block_coordinates` and `decode_coordinates` apply the block norm, the block MLP and the
 decoder to frame-dependent coordinates. Setting `family="gaussian_full"` with
 `block_coordinates="reference"` and `decode_coordinates="reference"` on the
-projected-predictive route without RoPE (these admit a `none` or `layernorm` norm and the
+projected-predictive route with `rope_mode` `none` or a comparison mode (frame-space RoPE
+folds a rotation into the content frame; these admit a `none` or `layernorm` norm and the
 coordinate, Gaussian-template or prototype block MLP, all conjugated by the realized frame)
 gives the frame-covariant path.
 In this sense the model expresses coordination among agents as inference: whom to trust, how
@@ -116,8 +117,10 @@ SPD family closed under the block_glk congruence. It is stored in the dense $(K,
 with zero off-head blocks, and the moment-matched update returns the head blocks
 $U_{i,h}[C_i^{\mathrm{att}}]_{hh}U_{i,h}^\top$, the moment projection onto the family, which
 does not depend on the frame. It is defined on the kernel predictive readout with compact
-head-block frames (block_glk, block_so, block_co, block_glmc or an equal-block so_n tower, any
-tying), edge links off, a passthrough block MLP, and the `linear`,
+head-block frames (block_glk, block_so, block_co, block_sl, block_borel, block_unipotent,
+block_glmc or an equal-block so_n or su_n tower, any tying), edge links off, a block MLP whose
+covariance is read through its head-block projection (`posterior` needs
+`block_mlp_inference="mean_field"`), no CG coupling, and the `linear`,
 `diagonal_chunked` or `full_chunked` decoders (the diagonal decoder reads
 $\operatorname{diag}\Sigma_i$, exact up to a per-position constant). With identity frames
 (`gauge_transport="off"`), `prior_covariance_table="block_cholesky"` replaces the diagonal
@@ -517,7 +520,7 @@ Three numerical safeguards trade cost for conditioning; each is at its cheapest 
 
 | Setting | Effect |
 |---|---|
-| `phi_frame_condition_max` | Default `None`. A number $\kappa_{\max}>1$ bounds $\mathrm{cond}_2(U_i)\le\kappa_{\max}$ after each accepted step: through $\kappa_2(e^X)\le e^{\mathrm{spread}(\mathrm{sym}X)}$, the eigenvalue spread of the traceless symmetric part of every head block of each frame factor is limited to $\log\kappa_{\max}/n_{\mathrm{factors}}$, keeping the trace and the skew part. `block_glk` and `block_glmc` with `m_phi_update_mode="adamw"` and `encode_mode="per_token"` only; under `pos_phi="frozen"` the frozen positional factor is not bounded. |
+| `phi_frame_condition_max` | Default `None`. A number $\kappa_{\max}>1$ bounds $\mathrm{cond}_2(U_i)\le\kappa_{\max}$ after each accepted step: through $\kappa_2(e^X)\le e^{\mathrm{spread}(\mathrm{sym}X)}$, the eigenvalue spread of the traceless symmetric part of every head block of each frame factor is limited to $\log\kappa_{\max}/n_{\mathrm{factors}}$, keeping the trace and the skew part. `block_glk`, `block_glmc` and `block_sl` with `m_phi_update_mode="adamw"` and `encode_mode="per_token"` only (inert, since $\mathrm{cond}_2=1$, for `block_so`, `block_co`, `so_n` and `su_n`; refused for `block_borel` and `block_unipotent`); under `pos_phi="frozen"` the frozen positional factor is not bounded. |
 | `projected_factorization` | Factorization of the projected Gaussian-KL scorer. `"gram"` (default) factors the float32 Gram matrix (error $O(\epsilon\kappa^2)$); `"gram_certified"` also rebuilds entries that factor but fail a condition certificate; `"cholesky_qr2_certified"` factors by CholeskyQR2 (error $O(\epsilon\kappa)$) where the scorer has source roots. The certified modes are costly on CUDA. |
 | `frame_pair_escalation_tol` | Default `None`. A tolerance in $(0,1)$ recomputes a frame producer call in float64 when its float32 frame pair has $\epsilon_{32}\kappa_F(U)$ above it; about 7 times the cost of an escalated step. |
 

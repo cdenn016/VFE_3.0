@@ -7,7 +7,7 @@ gauge group can act on the K-dim embedding through a DIRECT SUM of irreps,
 
 with ONE shared per-token phi -- a TIED gauge: the same group element acts in every
 block through that block's representation, so attention heads can be DIFFERENT irreps
-of one structure group (possibly with unequal dimensions). Registered family:
+of one structure group (possibly with unequal dimensions). Registered families:
 
     so : label 'l<p>'   -- symmetric-traceless rank-p tensors over R^N,
                            dim = C(N+p-1, p) - C(N+p-3, p-2); for N = 3 this is the
@@ -15,6 +15,13 @@ of one structure group (possibly with unequal dimensions). Registered family:
                            so every generator image is skew: exactly for SO(3), 'l1' and
                            the wedge recipes, to rounding (about 1e-16) for the
                            Gram-Schmidt tensor powers at N != 3, p >= 2.
+    so : label 'w<p>'   -- exterior powers Lambda^p R^N, 2 <= p <= N/2, dim C(N, p)
+                           (p = N/2 only for N = 2 mod 4).
+    so : 'wp<m>', 'wm<m>' -- the self-dual and anti-self-dual halves of Lambda^m R^N at
+                           m = N/2 even, dim C(N, m)/2 each.
+    su : label 'pq<p>_<q>' -- the su(N) irrep of highest weight p w_1 + q w_{N-1}, p >= q >= 0
+                           (traceless tensors in Sym^p C^N (x) Sym^q conj(C^N)), realified
+                           to dimension 2D for p != q, a real form of dimension D for p = q.
 
 Every block is built in one deterministic (canonical) basis. For N = 3 the spin-l block is
 built in closed form from the angular-momentum ladder, J_z |l,m> = m |l,m> and
@@ -122,8 +129,8 @@ def check_irrep_constructible(
     N:       int,                          # defining-rep dimension
 
     *,
-    algebra: str,                          # 'so'
-    label:   str,                          # e.g. 'l8'
+    algebra: str,                          # 'so' | 'su'
+    label:   str,                          # e.g. 'l8', 'pq2_1'
 ) -> None:
     """Raise, before any tensor is built, if ``label`` cannot be constructed."""
     key, p = _parse_label(algebra, label)

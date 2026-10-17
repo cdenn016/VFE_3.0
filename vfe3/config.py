@@ -255,7 +255,7 @@ class VFE3Config:
     # The belief covariance structure (read diagonal_covariance, never a second flag).
     #   gaussian_block  one SPD d_head x d_head block per head, stored in the dense (K, K) layout. only:
     #                   projected_predictive, predictive_readout="kernel", equal head blocks (block_glk, any
-    #                   block_* group or an equal-block so_n tower; any tying), content_link_edges
+    #                   block_* group or an equal-block so_n / su_n tower; any tying), content_link_edges
     #                   "off", decode_mode "linear" | "diagonal_chunked" | "full_chunked"; a block MLP covariance
     #                   is read through its head-block projection (posterior needs block_mlp_inference="mean_field")
     family:                           str             = "gaussian_diagonal"
@@ -367,8 +367,8 @@ class VFE3Config:
     #   None      the group's native tying (block_glk "per_head", so_n and su_n "shared")
     #   per_head  an independent group element per head
     #   shared    one element acting on every head. only: block_glk, so_n, su_n. block_glk "shared" refuses
-    #             pullback_group, fisher_group and group_log; so_n "per_head" refuses
-    #             use_cg_coupling
+    #             fisher_group and the group_log retraction (pullback_group runs with the chart retraction);
+    #             so_n and su_n "per_head" refuse use_cg_coupling
     gauge_tying:                      Optional[str]   = None
 
     # "on" | "off" | "frozen"
@@ -382,9 +382,11 @@ class VFE3Config:
     # (int >= 3), decoupled from K. irrep_spec: [(label, mult), ...] | "random" (so_n only).
     # so_n labels: "l<p>" symmetric-traceless rank p (N=3: spin p, dim 2p+1), "w<p>" exterior power,
     # "wp<m>" / "wm<m>" self-dual / anti-self-dual halves at m = N/2 even.
-    # su_n labels: "pq<p>_<q>" (p >= q >= 0, p + q <= 6): highest weight (p, q). Real dimension D for p = q
-    # (real type) and 2D for p != q (complex type, realified), D = C(p+N-1, p) C(q+N-1, q) - C(p+N-2, p-1)
-    # C(q+N-2, q-1); e.g. SU(3): pq1_0 6, pq1_1 8 (adjoint), pq2_0 12, pq2_2 27. pq1_1-only towers are PSU(N).
+    # su_n labels: "pq<p>_<q>" (p >= q >= 0, p + q <= 6): highest weight p w_1 + q w_{N-1}, which covers every
+    # SU(3) irrep up to conjugation but for N >= 4 only those with vanishing inner Dynkin labels (not Lambda^2 C^4).
+    # Real dimension D for p = q (real type) and 2D for p != q (complex type, realified),
+    # D = C(p+N-1, p) C(q+N-1, q) - C(p+N-2, p-1) C(q+N-2, q-1); e.g. SU(3): pq1_0 6, pq1_1 8 (adjoint),
+    # pq2_0 12, pq2_2 27. pq1_1-only towers are PSU(N).
     # Blocks are laid out in order, one per head, and their dims must sum to embed_dim.
     # "random" draws exactly n_heads irreps summing to embed_dim (ranks in [irrep_min_rank,
     # irrep_max_rank], None = all that fit) with irrep_spec_seed, and the saved config keeps the drawn list.
@@ -396,7 +398,7 @@ class VFE3Config:
     irrep_spec_seed:                    int             = 0
     irrep_min_rank:                     int             = 1            # 1 skips the gauge-invariant trivial irrep l0
     
-    # so_n with gauge_tying="shared" only: Clebsch-Gordan coupling between irrep blocks on the means
+    # so_n or su_n with gauge_tying="shared" only: Clebsch-Gordan coupling between irrep blocks on the means
     # (exactly equivariant; learned scalar path weights, zero init).
     use_cg_coupling:                  bool            = False
     
@@ -1330,7 +1332,7 @@ class VFE3Config:
                     or len(set(self.head_dims)) != 1):
                 block_problems.append(f"gauge_group={self.gauge_group!r} with head sizes {self.head_dims} (requires "
                                       "equal head blocks of a group that preserves them: block_glk, any block_* "
-                                      "group or an equal-block so_n tower)")
+                                      "group or an equal-block so_n / su_n tower)")
             if self.content_link_edges != "off":
                 block_problems.append(f"content_link_edges={self.content_link_edges!r} (requires 'off')")
             if self.decode_mode not in ("linear", "diagonal_chunked", "full_chunked"):

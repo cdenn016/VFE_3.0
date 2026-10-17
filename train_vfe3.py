@@ -229,7 +229,7 @@ config = dict(
     #################################
     gauge_transport                  = "on",           # "on" | "off" | "frozen" (random fixed frame)
     gauge_group                      = "block_glk",    # "block_glk" | "so_n" | "su_n" | "block_so" | "block_co" | "block_sl" | "block_borel" | "block_unipotent" | "block_glmc" (block_glmc: even d_head)
-    gauge_tying                      = "per_head",     # None (group default) | "per_head" | "shared" (shared: block_glk, so_n only)
+    gauge_tying                      = "per_head",     # None (group default) | "per_head" | "shared" (shared: block_glk, so_n, su_n only)
     
     group_n                          = None,                # so_n / su_n only: the N of SO(N) (>= 2) or SU(N) (>= 3); None for every other group
     irrep_spec                       = None,                # so_n: [(label, mult), ...] (labels "l<p>", "w<p>", "wp<m>", "wm<m>") | "random"; su_n: [("pq<p>_<q>", mult), ...] (p >= q; SU(3) dims pq1_0 6, pq1_1 8, pq2_0 12); None otherwise
@@ -280,7 +280,7 @@ config = dict(
     m_phi_group_retraction           = "chart",        # "chart" | "group_log" (exact Log(U e^{-eta xi}); pullback_group/fisher_group only)
     m_phi_group_log_fallback         = "series",       # "series" (certified series direction; structure-constant budget, block_glk d_head <= 16) | "eigenbasis" (off-strip blocks by the eigenbasis Psi inverse, kappa_2(U) > 1e3 rows take no step; no width budget); pullback_group with group_log only
     m_phi_group_differential_mode    = "series",       # "series" (certified power series) | "spectral" (Daleckii-Krein closed form, series fallback); pullback_group only
-    phi_frame_condition_max          = None,           # None (off) | kappa_max > 1, e.g. 1e4: after each step bound cond_2(U_i) <= kappa_max (adamw; block_glk/block_glmc)
+    phi_frame_condition_max          = None,           # None (off) | kappa_max > 1, e.g. 1e4: after each step bound cond_2(U_i) <= kappa_max (adamw; block_glk/block_glmc/block_sl; inert for block_so/block_co/so_n/su_n)
 
     m_phi_group_trust_radius         = 0.1,       # pullback_group/fisher_group only: float > 0, bound on ||eta s xi||_F per row (exact under group_log; the chart route's 1e-6 residual certificate caps the step near 1e-2 off the identity)
     m_phi_fisher_rotation_weight     = 2.0,       # fisher_group only: completion weight lambda (under "rotation" it also damps Fisher-visible rotations)
