@@ -5,12 +5,18 @@ EMAs, their warmup counts, the spike cooldown and the open interval statistics r
 carries the monitor's host state (with the skip counters and the last logged group norms) and a resumed run
 flags the same spikes and writes the same divergence columns as the uninterrupted run.
 
+F81: only the periodic checkpoint set the wall clock, and only from the optional timer, so the terminal
+checkpoint of a terminal-callback cell (and any checkpoint of a run without log or eval rows) carried None
+and a resume from it reported the continuation's wall time alone. Every checkpoint now carries the
+cumulative training wall clock.
+
 Tiny CPU models only (K=4, two heads, N=4, vocab 7; the live-route test runs ``tests.profiles.live_config``).
 """
 import csv
 import json
 import logging
 import math
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -125,3 +131,52 @@ def test_checkpoint_divergence_state_is_tolerant_and_round_trips() -> None:
                       {**record, "monitor": {**bad_monitor, "interval": {"steps": 1}}}):
         assert T._checkpoint_divergence_state(malformed) is None
     assert not T._DivergenceMonitor().load_state_dict({**bad_monitor, "loss_seen": -1})
+
+
+# ------------------------------------------------------------------------------------------------ F81
+
+def _finalized_run(cfg: VFE3Config, run_dir: Path, *, n_steps: int) -> Tuple[ra.RunArtifacts, float]:
+    r"""A terminal-callback run (log/eval/checkpoint cadence off, so train() builds no timer) and its wall time."""
+    torch.manual_seed(5)
+    model = VFEModel(cfg)
+    artifacts = ra.RunArtifacts(run_dir, cfg, model)
+    val_loader = DataLoader(TokenWindows((torch.arange(23) * 3) % V, N, pad_final=True, stride=cfg.eval_stride),
+                            batch_size=2, shuffle=False)
+
+    def finalize(state: Any, losses: List[float]) -> None:
+        ra.finalize_validation_run(model, artifacts, cfg, val_loader, losses=losses, terminal_state=state,
+                                   device=CPU, logger=logging.getLogger("audit-c1-resume"))
+
+    torch.manual_seed(11)
+    start = time.perf_counter()
+    T.train(model, _loader(cfg), cfg, n_steps=n_steps, grad_clip=cfg.grad_clip, log_interval=0,
+            eval_interval=0, val_loader=val_loader, device=CPU, logger=logging.getLogger("audit-c1-resume"),
+            artifacts=artifacts, generate_samples=False, terminal_callback=finalize)
+    return artifacts, time.perf_counter() - start
+
+
+def test_terminal_checkpoint_carries_the_run_wall_clock(tmp_path: Path) -> None:
+    cfg = _cfg(max_steps=4)
+    _, elapsed = _finalized_run(cfg, tmp_path / "cell", n_steps=4)
+    payload = torch.load(tmp_path / "cell" / "checkpoints" / "step_4.pt", weights_only=True)
+    wall = payload["wall_clock_s"]
+    assert isinstance(wall, float) and 0.0 < wall <= elapsed
+    assert T._checkpoint_divergence_state(payload["divergence_monitor"]) is not None
+    # A resume from the terminal checkpoint carries the cell's wall time into the continuation.
+    _, resumed = _run(cfg, tmp_path / "resumed", n_steps=6, log_interval=1,
+                      resume_from=tmp_path / "cell" / "checkpoints" / "step_4.pt")
+    assert resumed.resumed_wall_clock_s == wall
+    rows = _rows(tmp_path / "resumed" / "metrics.csv")
+    assert [int(row["step"]) for row in rows] == [5, 6]
+    assert all(float(row["wall_clock_s"]) > wall for row in rows)
+
+
+def test_periodic_checkpoint_without_a_timer_carries_the_wall_clock(tmp_path: Path) -> None:
+    cfg = _cfg(checkpoint_interval=2, max_steps=4)
+    start = time.perf_counter()
+    _run(cfg, tmp_path / "run", n_steps=4, log_interval=0)          # no log or eval row: no timer
+    elapsed = time.perf_counter() - start
+    walls = [torch.load(tmp_path / "run" / "checkpoints" / f"step_{step}.pt", weights_only=True)["wall_clock_s"]
+             for step in (2, 4)]
+    assert all(isinstance(wall, float) for wall in walls)
+    assert 0.0 < walls[0] < walls[1] <= elapsed

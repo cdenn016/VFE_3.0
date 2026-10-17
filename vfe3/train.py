@@ -4763,6 +4763,16 @@ def train(
     resumed_wall_clock = getattr(artifacts, "resumed_wall_clock_s", None) if start_step > 0 else None
     timer = (TrainingTimer(device, wall_clock_offset=resumed_wall_clock or 0.0)
              if timing_enabled else None)
+    wall_clock_origin = time.perf_counter()
+
+    def _elapsed_wall_clock() -> float:
+        r"""Cumulative training wall clock (the resumed offset included) for a checkpoint: the timer's when it
+        runs, so metrics.csv ``wall_clock_s`` and the checkpoint agree, else a clock of this call
+        (audit 2026-10-16 F81: a run without log/eval rows has no timer, and its checkpoints carried None)."""
+        if timer is not None:
+            return timer.elapsed_wall_clock_s()
+        return (resumed_wall_clock or 0.0) + time.perf_counter() - wall_clock_origin
+
     last_val: Dict[str, Optional[float]] = {}        # most recent validation, carried into each CSV row
     # VFE-only diagnostics (held-out probes, residual/attention capture, frame-clamp warning) are
     # skipped for another model family; their columns keep the VFE schema and stay blank.
@@ -5268,7 +5278,7 @@ def train(
                 _record_diagnostic_failure(diagnostics_failures, "numerics_checkpoint_state",
                                            exc, logger)
                 artifacts.numerics_counters_state = None
-            artifacts.wall_clock_state = timer.elapsed_wall_clock_s() if timer is not None else None
+            artifacts.wall_clock_state = _elapsed_wall_clock()
             # The row of this step is written after the save and then ends the interval (do_log or do_csv).
             artifacts.divergence_state = _divergence_checkpoint_record(
                 divergence, interval_ends=bool(do_log or do_csv), skipped_steps=skipped_steps,
@@ -5566,7 +5576,14 @@ def train(
     # S1 panel D handoff (2026-09-28), before the terminal callback so its checkpoint and summary see
     # it: the cumulative frame-projection counts for any later checkpoint, and summary.json's
     # "numerics_counters" (final cumulative counts, last measured per-evaluation counts, skip reasons).
+    # The terminal checkpoint also carries the run's wall clock and the divergence-monitor state, which only the
+    # periodic branch set before, so a resume from it keeps both (audit 2026-10-16 F77, F81). The last row has
+    # already ended its interval, so the monitor is saved as it stands.
     if artifacts is not None:
+        artifacts.wall_clock_state = _elapsed_wall_clock()
+        artifacts.divergence_state = _divergence_checkpoint_record(
+            divergence, interval_ends=False, skipped_steps=skipped_steps,
+            consecutive_skips=consecutive_skips, last_group_norms=last_group_norms)
         try:
             artifacts.numerics_counters_state = {
                 **(_frame_projection_state(frame_projection_counter, frame_projection_base,
