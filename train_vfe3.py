@@ -202,6 +202,7 @@ config = dict(
     layernorm_affine                 = True,
     norm_type_block                  = "layernorm",        # "none" | "layernorm" | "mahalanobis" - often useful
     block_norm_covariance            = "passthrough",      # "passthrough" | "pushforward" (Sigma -> J_LN Sigma J_LN^T + floor D Sigma D; diagonal family: its diagonal) | "pushforward_moment" (the same at the effective scale s^2 + tr(Pi Sigma Pi)/K with a span floor; a moment estimate at every Sigma/s^2)
+    block_norm_trace_cap             = True,               # True | False: cap the LayerNorm covariance pushforward at the sphere bound K max(gamma^2) (False: uncapped delta method)
 
     #################################
     #        Initialization

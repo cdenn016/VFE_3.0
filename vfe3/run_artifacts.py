@@ -5313,6 +5313,7 @@ def _pure_path_report(
             "block_mlp_structural_mode":    block_mlp_structural_mode,
             "block_mlp_covariance_contract": block_mlp_covariance_contract,
             "block_norm_covariance":        getattr(cfg, "block_norm_covariance", "passthrough"),
+            "block_norm_trace_cap":         bool(getattr(cfg, "block_norm_trace_cap", True)),
             "gauge_transport":              cfg.gauge_transport,
             "rope_mode":                    cfg.rope_mode,
             # Which RoPE regime the routing score used (audit 2026-07-26 A-02). A comparison rope_mode
