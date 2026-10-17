@@ -129,3 +129,40 @@ def test_fisher_spike_row_and_motion_report_carry_the_tables(
     motion = json.loads((tmp_path / "run" / "parameter_motion.json").read_text(encoding="utf-8"))
     for name in ("prior_bank.mu_embed", "prior_bank.sigma_log_embed"):
         assert motion["motion"][name]["known_dead"] is False, name
+
+
+# ------------------------------------------------------------------------------------------------ F13
+
+def _fisher_step_columns(m_p_mu_lr: float, m_p_sigma_lr: float) -> Tuple[Dict[str, float], Dict[str, float],
+                                                                         Dict[str, float], Dict[str, float]]:
+    r"""The step-in-rate-units columns of one Fisher table step at a schedule factor of 0.5."""
+    # Zero table decay, as on the live route: the AdamW rate then only schedules the Fisher step (it is inert).
+    cfg = _route_cfg("fisher", "adamw", m_p_mu_lr=m_p_mu_lr, m_p_sigma_lr=m_p_sigma_lr,
+                     mu_weight_decay=0.0, sigma_weight_decay=0.0)
+    model = _model(cfg)
+    optimizer = T.build_optimizer(model, cfg)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 0.5)
+    tokens, targets = _batch(cfg)
+    before = T._parameter_snapshot(model)
+    rates = T._parameter_learning_rates(model, optimizer)
+    fisher_rates = T._table_fisher_learning_rates(optimizer)
+    T.train_step(model, optimizer, scheduler, tokens, targets, grad_clip=1.0, status_out={})
+    out = T._group_update_statistics(model, before, learning_rates=rates)
+    deltas = {name: float((dict(model.named_parameters())[name].detach().double() - before[name].double()).norm())
+              for name in ("prior_bank.mu_embed", "prior_bank.sigma_log_embed")}
+    return out, rates, fisher_rates, deltas
+
+
+def test_fisher_table_step_columns_divide_by_the_realized_step_size() -> None:
+    low, rates, fisher_rates, deltas = _fisher_step_columns(0.025, 0.001)
+    high, _, _, high_deltas = _fisher_step_columns(0.25, 0.01)
+    eta = 0.1                                                                   # tests/profiles m_table_fisher_lr
+    assert fisher_rates == pytest.approx({"mu": 0.5 * eta, "sigma": 0.5 * eta})
+    assert rates["prior_bank.mu_embed"] == pytest.approx(fisher_rates["mu"])
+    assert rates["prior_bank.sigma_log_embed"] == pytest.approx(fisher_rates["sigma"])
+    for group, name in (("mu_embed", "prior_bank.mu_embed"), ("sigma_log_embed", "prior_bank.sigma_log_embed")):
+        column = f"update_rms_per_lr_group_{group}"
+        assert deltas[name] > 0.0 and deltas[name] == pytest.approx(high_deltas[name], rel=1e-9)   # inert rate
+        assert low[column] == pytest.approx(high[column], rel=1e-9), column
+        n = dict(_model(_route_cfg("fisher", "adamw")).named_parameters())[name].numel()
+        assert low[column] == pytest.approx(deltas[name] / (0.5 * eta * math.sqrt(n)), rel=1e-9), column

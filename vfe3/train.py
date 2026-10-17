@@ -1674,9 +1674,12 @@ _GROUP_COLUMNS: Tuple[str, ...] = tuple(
     f"{kind}_group_{group}"
     for kind in ("grad_norm", "param_norm", "update_ratio") for group in PARAMETER_GROUPS)
 _GRAD_GROUP_COLUMNS: Tuple[str, ...] = tuple(f"grad_norm_group_{group}" for group in PARAMETER_GROUPS)
-# Per-element RMS realized step in units of the learning rate for the prior tables (audit 2026-10-09 round 2,
+# Per-element RMS realized step in units of the step size for the prior tables (audit 2026-10-09 round 2,
 # item 26): update_ratio_group_* of a log-scale table divides by a norm dominated by the log(sigma_init)
 # offset, so it is not a trainability measure; this column is O(1) for an AdamW table whose elements move.
+# Under m_table_update_mode='fisher' the unit is the realized Fisher step size eta*lr_t/lr_0 (the row's
+# lr_mu/lr_sigma), and the value scales with the gradient, the trust clip and the fraction of rows with
+# n_v > 0, so the O(1) reading does not carry over (audit 2026-10-16, F13).
 _STEP_LR_GROUPS: Tuple[str, ...] = ("mu_embed", "sigma_log_embed")
 _STEP_LR_COLUMNS: Tuple[str, ...] = tuple(f"update_rms_per_lr_group_{group}" for group in _STEP_LR_GROUPS)
 _TRAIN_SAMPLE_COLUMNS: Tuple[str, ...] = (
@@ -2329,9 +2332,23 @@ def _parameter_learning_rates(
     model:     torch.nn.Module,
     optimizer: torch.optim.Optimizer,
 ) -> Dict[str, float]:
-    r"""Current learning rate of every optimized parameter, by parameter name (read before the step)."""
-    by_id = {id(parameter): float(group["lr"]) for group in optimizer.param_groups
-             for parameter in group["params"]}
+    r"""Current step size of every optimized parameter, by parameter name (read before the step).
+
+    The group's AdamW rate, except for a group marked ``table_fisher``: under
+    ``m_table_update_mode='fisher'`` that rate only schedules the table step and sets its decay, and the
+    table moves at the realized Fisher step size :math:`\eta\,\mathrm{lr}_t/\mathrm{lr}_0`, the value
+    ``lr_mu``/``lr_sigma`` report (audit 2026-10-16, F13).
+    """
+    eta = getattr(optimizer, "_table_fisher_lr", None)
+    if eta is not None:
+        from vfe3.table_optim import _schedule_factor
+
+    def rate(group: Mapping[str, Any]) -> float:
+        if eta is not None and group.get("table_fisher"):
+            return float(eta) * _schedule_factor(group)                  # type: ignore[arg-type]
+        return float(group["lr"])
+
+    by_id = {id(parameter): rate(group) for group in optimizer.param_groups for parameter in group["params"]}
     return {name: by_id[id(parameter)] for name, parameter in model.named_parameters() if id(parameter) in by_id}
 
 
@@ -2359,7 +2376,9 @@ def _group_update_statistics(
     .. math::
         s_G = \Big(\frac{1}{n_G}\sum_{p \in G} \frac{\|p_{t+1} - p_t\|_2^2}{\eta_p^2}\Big)^{1/2},
 
-    with :math:`n_G` the group's element count and :math:`\eta_p` the step's learning rate (NaN if any is 0).
+    with :math:`n_G` the group's element count and :math:`\eta_p` the step's realized step size from
+    :func:`_parameter_learning_rates` (NaN if any is 0): the AdamW learning rate, or under
+    ``m_table_update_mode='fisher'`` the Fisher step size :math:`\eta\,\mathrm{lr}_t/\mathrm{lr}_0`.
     """
     delta_sq: Dict[str, float] = {}
     norm_sq: Dict[str, float] = {}
