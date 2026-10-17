@@ -201,7 +201,6 @@ class DiagnosticSnapshot:
     logits:            Optional[torch.Tensor]   # None when built with return_logits=False
     beta_maps:         torch.Tensor
     trace_states:      'Tuple[BeliefState, ...]'
-    trace_free_energy: torch.Tensor
     rope:              Optional[torch.Tensor]
     log_prior:         Optional[torch.Tensor]
     relational_capture: Optional[dict] = None
@@ -1601,8 +1600,8 @@ class VFEModel(nn.Module):
 
         The capture path records the encoded and stack-entry beliefs, every block's live prior,
         pre-transform converged belief and post-transform output, plus the first block's actual
-        E-step states. ``trace_free_energy`` is empty: the projected routes define no shared free
-        energy to record per iterate (audit 2026-10-16 F92). Beta/gamma maps are then reduced from
+        E-step states; the projected routes define no shared free energy, so no per-iterate free energy is
+        recorded (audit 2026-10-16 F92). Beta/gamma maps are then reduced from
         those captured tensors; no encode, E-step, block, or stack replay is performed.
         Public calls own independent Tensor fields. The private ``_share_frame_copies``
         contract permits phi/right_phi aliases only for internal read-only consumers.
@@ -1629,9 +1628,6 @@ class VFEModel(nn.Module):
         beta_maps = torch.stack([beta if beta.dim() == 3 else beta.unsqueeze(0)
                                  for beta in layer_betas])
         trace = diagnostic["e_step_trace"]
-        # Routing and content run in distinct conditional stages, so no iterate carries a shared free
-        # energy; the empty field stays only while viz.extract.e_step_belief_trace reads it.
-        trace_free_energy = final_belief.mu.new_empty(0)
 
         return DiagnosticSnapshot(
             owner=self,
@@ -1653,7 +1649,6 @@ class VFEModel(nn.Module):
             logits=_freeze_tensor(logits) if logits is not None else None,
             beta_maps=_freeze_tensor(beta_maps),
             trace_states=tuple(_freeze_belief(belief, _frame_cache=frame_cache) for belief in trace["beliefs"]),
-            trace_free_energy=_freeze_tensor(trace_free_energy),
             **{self.conditional_capture_key: {
                 key: _freeze_tensor(value) if isinstance(value, torch.Tensor) else value
                 for key, value in relational_capture.items()}},

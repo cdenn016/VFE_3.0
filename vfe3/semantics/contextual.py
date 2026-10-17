@@ -368,17 +368,21 @@ def _forward_split(model: Any, x: torch.Tensor, log: _SplitLog, *, return_logits
     return pieces + [(a + h, b + h, out) for a, b, out in right]
 
 
-def _readout(model: Any, mu: torch.Tensor, sigma: torch.Tensor, canonical_frame: Any) -> torch.Tensor:
+def _readout(model: Any, mu: torch.Tensor, sigma: torch.Tensor, canonical_frame: Any,
+             *, encoded_sigma: Optional[torch.Tensor] = None) -> torch.Tensor:
     r"""Logits of one belief through the model's final readout, as ``forward_beliefs`` applies it.
 
     .. math:: \ell = \mathrm{decode}\big(\mu,\ \Sigma;\ U\big),
 
     i.e. ``VFEModel._decode_belief_with_context`` -- ``prior_bank.decode`` in the fp32 island with the
     realized frame ``U`` of the same forward (``decode_coordinates='reference'`` only) and the
-    unigram bias :math:`\kappa \log\pi_v`. Returns ``(B, N, V)`` float32 logits.
+    unigram bias :math:`\kappa \log\pi_v`. Under ``decode_covariance='encoded'`` the decoder reads
+    ``encoded_sigma``, the stack-input covariance (``layers[0].sigma``, the tensor ``forward_beliefs`` decodes with;
+    audit 2026-10-16 F64). Returns ``(B, N, V)`` float32 logits.
     """
     with torch.no_grad():
-        return model._decode_belief_with_context(mu, sigma, canonical_frame=canonical_frame)
+        return model._decode_belief_with_context(mu, sigma, canonical_frame=canonical_frame,
+                                                 encoded_sigma=encoded_sigma)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -628,7 +632,8 @@ def logit_lens(
             safe_tgt = tgt.clamp_min(0)[..., None]                      # (B, N, 1)
             rerun = torch.stack([b.mu.reshape(-1, bank.K) for b in layers]).float().cpu().numpy()   # (L+1, B*N, K)
             max_mu_diff = max(max_mu_diff, float(np.abs(rerun - bank.mu[:, b0 * N:b1 * N]).max()))
-            logits_L = _readout(model, layers[L].mu, layers[L].sigma, frame)  # (B, N, V)
+            logits_L = _readout(model, layers[L].mu, layers[L].sigma, frame,
+                                encoded_sigma=layers[0].sigma)                  # (B, N, V)
             logit_diff = torch.maximum(logit_diff, (logits_L - out["logits"]).abs().max().float())
             top_L = logits_L.argmax(dim=-1)                             # (B, N)
             logp_L = torch.log_softmax(logits_L.float(), dim=-1)        # (B, N, V)
@@ -640,7 +645,8 @@ def logit_lens(
                 if l == L:
                     logp, top = logp_L, top_L
                 else:
-                    logits = _readout(model, layers[l].mu, layers[l].sigma, frame)   # (B, N, V)
+                    logits = _readout(model, layers[l].mu, layers[l].sigma, frame,
+                                      encoded_sigma=layers[0].sigma)           # (B, N, V)
                     top = logits.argmax(dim=-1)                          # (B, N)
                     logp = torch.log_softmax(logits.float(), dim=-1)     # (B, N, V)
                     del logits

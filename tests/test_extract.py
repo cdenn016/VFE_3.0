@@ -47,7 +47,7 @@ def test_e_step_belief_trace_captures_configured_projected_states():
     assert tr["mu"].shape[-2:] == (5, 4)
     assert tr["mu"].shape[0] == tr["phi"].shape[0]
     assert tr["free_energy_available"] is False
-    assert tr["free_energy"].numel() == 0
+    assert "free_energy" not in tr
     assert torch.isfinite(tr["mu"]).all()
 
 

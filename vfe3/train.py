@@ -1588,6 +1588,10 @@ _VAL_RELATIONAL_DIAG_KEYS = (
     "val_relational_score_klmax_frac",
     # the per-layer maximum and its layer (the headline column above reduces only the last layer)
     "val_relational_score_klmax_frac_layer_max", "val_relational_score_klmax_frac_argmax_layer",
+    # raw router costs that were non-finite before the kl_max clamp, and the router's label free energy
+    # (VFEModel._nonfinite_frac, VFEModel._routing_free_energy; audit 2026-10-16 F10, F114)
+    "val_relational_score_nonfinite_frac", "val_relational_score_nonfinite_frac_layer_max",
+    "val_relational_routing_free_energy",
     # per-(layer, head) router saturation, maxima over layers and heads (VFEModel._layer_guard_maxima)
     "val_relational_score_klmax_frac_head_max",
     "val_relational_clamped_row_frac_head_max", "val_relational_clamped_row_frac_argmax_layer",
@@ -1610,9 +1614,10 @@ _VAL_RELATIONAL_DIAG_KEYS = (
     "projected_cov_min_eigenvalue", "projected_cov_max_condition", "covariance_repair_count",
     "projected_cov_max_condition_layer_max",
     # covariance scale, the scale-free Gram-normalized lambda_min and the rank-one residual of the last layer,
-    # and their layer extremes (VFEModel._covariance_scale_statistics; audit 2026-10-10 round 2, items 3, 4, 13)
+    # and their layer extremes (VFEModel._covariance_scale_statistics; audit 2026-10-10 round 2, items 3, 4, 13),
+    # and the rank-one residual of the reference means (audit 2026-10-16 F45)
     "projected_cov_scale", "projected_cov_gram_min_eigenvalue", "comparison_map_norm_spread",
-    "input_cov_scale_ratio", "rank_one_residual",
+    "input_cov_scale_ratio", "rank_one_residual", "rank_one_residual_reference",
     "projected_cov_min_eigenvalue_layer_min", "projected_cov_min_eigenvalue_argmin_layer",
     "projected_cov_scale_layer_min", "projected_cov_scale_argmin_layer",
     "projected_cov_gram_min_eigenvalue_layer_min", "projected_cov_gram_min_eigenvalue_argmin_layer",
@@ -1746,7 +1751,8 @@ PROTOTYPE_TEMPLATE_FIELDS: Tuple[str, ...] = (
 # fixed validation windows, in nats: the evidence lower bound of the posterior the layer forms, the evidence of its
 # declared record model and their gap. Minimal agent (round 2, item 12 and M1): the ADF evidence over the heads
 # (assumed density, exact for uncoupled heads) and its gap, the exact evidence (NaN unless every receiver's heads are
-# uncoupled), and the importance-sampled evidence under q with its gap and sample count. Prototypes: exact.
+# uncoupled), and the importance-sampled evidence under q with its gap, the effective sample size fraction of its
+# weights (is_ess, unitless; audit 2026-10-16 F47) and sample count. Prototypes: exact.
 # Written to diagnostics/minimal_agent_elbo.csv and diagnostics/prototype_elbo.csv only when the toggle is on.
 MINIMAL_AGENT_ELBO_FIELDS: Tuple[str, ...] = (
     "step", "layer", *(key[len("relational_minimal_agent_"):] for key in MINIMAL_AGENT_ELBO_KEYS), "is_samples")
@@ -1775,8 +1781,8 @@ _EVAL_CADENCE_COLUMNS: Tuple[str, ...] = _TRAIN_SAMPLE_COLUMNS + NUMERICS_EVAL_C
 
 # Dead-router thresholds (audit 2026-10-09, round 2, item 9; audit 2026-10-10 round 2, item 7), read per
 # (layer, head) under every clamp reference. Under the absolute reference a head with more than
-# DEAD_ROUTER_CLAMPED_ROW_FRAC of its scored rows fully clamped at kl_max routes those rows uniformly with zero
-# router gradient (layer 1 of the 32.65 run); under 'row_min' and under tie_comparison_maps no row can be fully
+# DEAD_ROUTER_CLAMPED_ROW_FRAC of its scored rows fully clamped at kl_max routes those rows by the attention prior pi
+# alone (uniformly under a plain causal mask) with zero router gradient (layer 1 of the 32.65 run); under 'row_min' and under tie_comparison_maps no row can be fully
 # clamped. A head whose mean self weight beta_ii exceeds DEAD_ROUTER_SELF_WEIGHT saturates its softmax on the
 # self pair (layer 1 head 0 of the 99.68 run), whatever the reference. A head with more than
 # DEAD_ROUTER_CAPPED_FRAC of its admissible entries capped gives those entries no router gradient; under
@@ -1822,8 +1828,8 @@ def _warn_dead_router(
     a self-locked identity head and separates it from a locked head that does not pass content through.
 
     ``clamped``: ``relational_clamped_row_frac_head_max`` above :data:`DEAD_ROUTER_CLAMPED_ROW_FRAC`, at
-    ``relational_clamped_row_frac_argmax_{layer,head}``: fully clamped rows route uniformly with zero router
-    gradient. Only the absolute reference without the tie can clamp a whole row; the value is zero otherwise.
+    ``relational_clamped_row_frac_argmax_{layer,head}``: fully clamped rows route by the attention prior pi alone,
+    with zero router gradient. Only the absolute reference without the tie can clamp a whole row; the value is zero otherwise.
 
     ``capped``: ``relational_score_klmax_frac_head_max`` above :data:`DEAD_ROUTER_CAPPED_FRAC`, at
     ``relational_score_klmax_frac_head_argmax_{layer,head}``: the capped entries carry a constant cost and get no
@@ -1858,7 +1864,8 @@ def _warn_dead_router(
         elif kind == "clamped":
             logger.warning(
                 " router layer %s head %s: %.3f of its scored rows are fully clamped at kl_max (> %.2f); those rows "
-                "route uniformly with zero router gradient (consider routing_kl_max_reference='row_min')",
+                "route by the attention prior alone with zero router gradient "
+                "(consider routing_kl_max_reference='row_min')",
                 *where, value, threshold)
         else:
             logger.warning(
@@ -1966,10 +1973,10 @@ def _capture_numerics_counts(
     whose posterior applies no clamp) is counted under that rule.
 
     Fully clamped rows. A capped entry changes :math:`\beta` only when its row's smallest cost reaches
-    :math:`\kappa`; a row with :math:`|S_i| \ge 2` whose every entry is capped routes uniformly with zero
-    routing gradient. When ``rows_out`` is given, one list per layer of ``(clamped_rows, rows)`` per head
-    is appended to it, with ``rows`` the number of query rows with :math:`|S_i| \ge 2` (audit 2026-10-08
-    critic-gapfill-2#3). The entry counts above are unchanged.
+    :math:`\kappa`; a row with :math:`|S_i| \ge 2` whose every entry is capped routes by the attention prior
+    :math:`\pi` alone with zero routing gradient. When ``rows_out`` is given, one list per layer of
+    ``(clamped_rows, rows)`` per head is appended to it, with ``rows`` the number of query rows with
+    :math:`|S_i| \ge 2` (audit 2026-10-08 critic-gapfill-2#3). The entry counts above are unchanged.
 
     Factorizations. Each layer factors its reduced query and key covariances
     :math:`G = L \Sigma L^\top` (:math:`L = S U^{-1}`, comparison rank :math:`r`) once per (window,

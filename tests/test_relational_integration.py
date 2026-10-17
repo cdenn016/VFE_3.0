@@ -96,7 +96,7 @@ def test_snapshot_reports_actual_receiver_semantics(autocast: bool) -> None:
     with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
         snapshot = model.build_diagnostic_snapshot(ids)
     assert snapshot.relational_capture is not None
-    assert snapshot.trace_free_energy.numel() == 0
+    assert not hasattr(snapshot, "trace_free_energy")              # no shared free energy per iterate (F92)
     diagnostics = model.diagnostics(ids, snapshot=snapshot)
     assert diagnostics["relational_semantics"] == "relational_full_link_frozen_filtering"
     assert diagnostics["relational_legacy_global_f_available"] == 0.0

@@ -275,4 +275,4 @@ def test_diagnostics_report_the_captured_frozen_receiver_cost() -> None:
     assert diagnostics["relational_receiver_cost_delta"] == after - before
     assert diagnostics["relational_receiver_noise"] == model.cfg.relational_receiver_noise
     assert diagnostics["relational_legacy_global_f_available"] == 0.0
-    assert snapshot.trace_free_energy.numel() == 0
+    assert not hasattr(snapshot, "trace_free_energy")              # no shared free energy per iterate (F92)

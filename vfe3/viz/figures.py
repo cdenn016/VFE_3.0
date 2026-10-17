@@ -2129,7 +2129,7 @@ def plot_estep_grad_norm_decomposition(
 @register_figure("estep_convergence")
 @register_figure("iterate_trajectory")
 def plot_iterate_trajectory(
-    trace:    Dict,                      # e_step_belief_trace output: mu, sigma, phi, free_energy
+    trace:    Dict,                      # e_step_belief_trace output: mu, sigma, phi
 
     *,
     diagonal:          Optional[bool] = None,
@@ -2137,29 +2137,25 @@ def plot_iterate_trajectory(
     evidence:           Optional[Mapping[str, object]] = None,
     path:               Optional[str] = None,
 ):
-    r"""Free energy and belief motion across the configured E-step iterate trajectory.
+    r"""Belief motion across the configured E-step iterate trajectory.
 
-    Panel A is the global F(t) over inner iterations with the trained budget marked. Panel B is the
-    Step lengths are shown without treating small final movement as convergence unless structured
-    evidence establishes it.
+    The projected routes compute routing and readout in distinct conditional stages and define no shared free
+    energy, so panel A states that and the trace carries no free-energy series (audit 2026-10-16 F92). Panel B
+    is the per-iteration step length of the captured states, shown without treating small final movement as
+    convergence unless structured evidence establishes it.
     """
     from vfe3 import metrics
     objective_label, objective_units = _registered_divergence_axis(divergence_family)
     evidence = dict(evidence or {})
-    fe = _np(trace["free_energy"])
     if diagonal is None:
         diagonal = trace.get("diagonal_covariance")
     res = metrics.estep_residuals(trace["mu"], trace["sigma"], trace["phi"], diagonal=diagonal)
     fig, axes = plt.subplots(1, 2, figsize=(9, 3.6))
-    if fe.size and trace.get("free_energy_available", True):
-        axes[0].plot(np.arange(fe.size), fe, "o-", color=_CB[0], ms=4, lw=1.6)
-        axes[0].axhline(fe[-1], color="#888888", ls=":", lw=1)
-    else:
-        axes[0].text(0.5, 0.5,
-                     "Shared free energy unavailable\nRouting and readout use distinct stages.\n"
-                     "The captured state movement is shown at right.",
-                     ha="center", va="center", transform=axes[0].transAxes, fontsize=9)
-        axes[0].set_axis_off()
+    axes[0].text(0.5, 0.5,
+                 "Shared free energy unavailable\nRouting and readout use distinct stages.\n"
+                 "The captured state movement is shown at right.",
+                 ha="center", va="center", transform=axes[0].transAxes, fontsize=9)
+    axes[0].set_axis_off()
     trajectory_title = "E-step iterate trajectory"
     if evidence.get("fixed_point_evidence"):
         trajectory_title += " (fixed point established)"
