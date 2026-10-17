@@ -99,6 +99,11 @@ def _centered_spread(
 # October 12, 2026, relative to the input covariance C_i = U_i^{-1} Sigma_i U_i^{-T} (not reference-invariant).
 PREDICTIVE_COVARIANCE_FLOOR_MODES = ("prior", "relative")
 
+# Compute precision of the kernel moment-matched covariance (audit 2026-10-16, F7). "fp32": the beliefs' precision
+# (float32 beliefs compute in float32 at IEEE GEMMs); "fp64": the whole update (C_i, the head-pair pooling, the
+# sandwich, the floor and the ceiling) in float64 from the beliefs, cast back to their dtype.
+PREDICTIVE_COVARIANCE_PRECISIONS = ("fp32", "fp64")
+
 _FP64_ESCALATION_FAILURE = ("the moment-matched covariance update is not positive definite in float64 either (the "
                             "float32 update failed first and was recomputed in float64); no repair applied")
 
@@ -135,6 +140,14 @@ def _covariance_positive(
         else:
             healthy = (torch.linalg.cholesky_ex(sigma.detach())[1] == 0).all()
     return bool(host_read(healthy.reshape(1))[0])
+
+
+def _receiver_mask(
+    bad:      torch.Tensor,   # (..., N) bool, the failing receivers
+    diagonal: bool,
+) -> torch.Tensor:            # (..., N, 1) or (..., N, 1, 1): broadcasts against the covariance layout
+    r"""``bad`` shaped to select whole receivers of a diagonal (..., N, K) or full (..., N, K, K) covariance."""
+    return bad[..., None] if diagonal else bad[..., None, None]
 
 
 def _per_block_bmm(
@@ -390,6 +403,9 @@ class RelationalOperators(nn.Module):
     for about half the activation memory of a large-K step.
     ``predictive_covariance_fp64_escalation`` recomputes a float32 kernel-readout moment-matched update in float64
     when its output is not positive definite (:meth:`predictive_covariance_update`).
+    ``predictive_covariance_precision`` (:data:`PREDICTIVE_COVARIANCE_PRECISIONS`) is ``"fp32"`` (the beliefs'
+    precision) or ``"fp64"``, which computes every kernel-readout moment-matched update in float64 from float32
+    beliefs and casts it back; the minimal agent does not read it.
     ``block_covariance`` (family ``gaussian_block``; equal heads, the kernel predictive readout, edges off) makes
     the moment-matched update return the head-block M-projection of :math:`\Sigma_i^+` in the dense layout,
     one SPD :math:`d\times d` block per head (:meth:`_predictive_covariance_update_blockwise`).
@@ -446,6 +462,7 @@ class RelationalOperators(nn.Module):
         content_link_chart:    str,
         predictive_covariance_checkpoint: bool = False,
         predictive_covariance_fp64_escalation: bool = False,
+        predictive_covariance_precision: str = "fp32",
         content_link_edges:    str   = "off",
         content_link_edge_rank: int  = 4,
         content_link_latent:   bool  = False,
@@ -556,6 +573,10 @@ class RelationalOperators(nn.Module):
             raise ValueError("predictive_covariance_fp64_escalation must be bool, got "
                              f"{predictive_covariance_fp64_escalation!r}")
         self.predictive_covariance_fp64_escalation = predictive_covariance_fp64_escalation
+        if predictive_covariance_precision not in PREDICTIVE_COVARIANCE_PRECISIONS:
+            raise ValueError(f"predictive_covariance_precision must be one of {PREDICTIVE_COVARIANCE_PRECISIONS}, "
+                             f"got {predictive_covariance_precision!r}")
+        self.predictive_covariance_precision = predictive_covariance_precision   # plain attribute, not state
         if content_link_chart not in CONTENT_LINK_CHARTS:
             raise ValueError(
                 f"content_link_chart must be one of {CONTENT_LINK_CHARTS}, got {content_link_chart!r}")
@@ -1233,9 +1254,18 @@ class RelationalOperators(nn.Module):
         float32 values are discarded, so backward runs through the float64 recompute there. The diagonal :math:`\mathrm{diag}(U_iC_i^{\mathrm{att}}U_i^\top)` leaves reference
         coordinates through :math:`U_i`, so float32 rounding of :math:`C_i^{\mathrm{att}}` is amplified by about
         :math:`\kappa(U_i)^2`; on ill-conditioned block_glk frames it returned negative variances. The check is one
-        host read per call; every token of a recomputed sequence is counted in its own counter
-        (``covariance_escalation_elements``). A float64 failure raises ``ValueError``; nothing is repaired. The ceiling
-        is applied after the check.
+        host read per call; only the failing receivers take the float64 values, every token of a recomputed sequence
+        is counted in its own counter (``covariance_escalation_elements``). A float64 failure raises ``ValueError``;
+        nothing is repaired. The ceiling is applied after the check.
+
+        The sign check sees only the errors that reach the floor. The rounding of :math:`C_i` itself, before any
+        pooling, already carries the :math:`\kappa(U_i)^2` amplification, so at :math:`\kappa(U_i)\approx 50` float32
+        returns variances that are positive but wrong by half (audit 2026-10-16, F7). Under
+        ``predictive_covariance_precision="fp64"`` float32 beliefs, router and content maps are cast to float64, the
+        whole update (:math:`C_i`, the pooling, the sandwich, the floor and the ceiling) runs in float64 with the
+        float32 frame cast by the body, and the result is cast back; backward runs through the float64 update. Its
+        error is then that of the float32 inputs and frame pair, and the escalation, which checks float32 outputs
+        only, is inert.
 
         Under ``content_link_edges`` the kernel is the same with :math:`M_h \to M_h^{ij} = G_{ij}\Pi_h`:
 
@@ -1249,6 +1279,14 @@ class RelationalOperators(nn.Module):
         computed outside the checkpointed region and enters it as an input.
         """
         self._require_kernel_readout("predictive_covariance_update")
+        if self.predictive_covariance_precision == "fp64" and sigma.dtype != torch.float64:
+            # The float64 update of the float32 inputs; a float64 call takes the plain path below, so this equals
+            # the float64-belief update cast back, bit for bit. The body casts the frame and the content maps itself.
+            wide_receive = None if receive is None else [O.double() for O in self._receive_runs(receive)]
+            return self.predictive_covariance_update(
+                mu.double(), sigma.double(), beta.double(), frame, wide_receive,
+                edges=None if edges is None else edge_links.cast_context(edges, torch.float64),
+                floor_anchor=None if floor_anchor is None else floor_anchor.double()).to(sigma.dtype)
         floor = self.floor_term(floor_anchor, sigma, frame, diagonal=sigma.dim() == mu.dim())
         if edges is None and self.content_link_edges != "off":
             edges = self.edge_context(mu, beta, frame, receive, sigma=sigma)
@@ -1279,9 +1317,13 @@ class RelationalOperators(nn.Module):
         A token fails when a variance is nonpositive or non-finite (diagonal) or its matrix does not factor by
         Cholesky (full and head-block families); one host read finds the sequences with a failing token. The
         update of a receiver reads only its own sequence (beta is (B, H, N, N)), so those sequences are recomputed
-        whole in float64 and written back, and the others keep their float32 values and graph bit for bit. Every
-        token of a recomputed sequence is counted. Without a single leading batch axis, or with edge links (whose
-        context is not split here), the whole call is recomputed. A float64 failure raises; nothing is repaired.
+        whole in float64 and the others keep their float32 values and graph bit for bit. Only the failing receivers
+        of a recomputed sequence take the float64 values: receiver i reads its own routing row and its sources
+        j <= i, so the healthy receivers keep their float32 values and graph, and a failure at a later token does not
+        change an earlier position (the update stays causal; audit 2026-10-16, F41). Every token of a recomputed
+        sequence is counted. Without a single leading batch axis, or with edge links (whose context is not split
+        here), the whole call is recomputed, with the same per-receiver write-back. A float64 failure raises (the
+        whole recompute is checked); nothing is repaired.
         """
         with torch.no_grad():
             if diagonal:
@@ -1305,18 +1347,21 @@ class RelationalOperators(nn.Module):
             if not _covariance_positive(sigma_wide, diagonal):
                 raise ValueError(_FP64_ESCALATION_FAILURE)
             _count_covariance_escalation(math.prod(mu.shape[:-1]), mu.device)
-            return sigma_wide.to(sigma_plus.dtype)
+            return torch.where(_receiver_mask(bad, diagonal), sigma_wide.to(sigma_plus.dtype), sigma_plus)
         # A frame with its own batch axis is split with the beliefs; a shared (unbatched or size-1) frame broadcasts.
         per_sequence = (frame.forward.dim() >= (5 if frame.block_diagonal else 4)
                         and frame.forward.shape[0] == mu.shape[0] > 1)
         sub_frame = (CanonicalFrameContext(frame.forward[rows], frame.inverse[rows],
                                            block_diagonal=frame.block_diagonal) if per_sequence else frame)
-        sigma_wide = self._kernel_covariance(
-            mu[rows].double(), sigma[rows].double(), beta[rows].double(), sub_frame, wide_receive, ())             + floor[rows].double()
+        sigma_wide = (self._kernel_covariance(mu[rows].double(), sigma[rows].double(), beta[rows].double(),
+                                              sub_frame, wide_receive, ())
+                      + floor[rows].double())
         if not _covariance_positive(sigma_wide, diagonal):
             raise ValueError(_FP64_ESCALATION_FAILURE)
         _count_covariance_escalation(n_rows * mu.shape[-2], mu.device)
-        return sigma_plus.index_copy(0, rows, sigma_wide.to(sigma_plus.dtype))
+        merged = torch.where(_receiver_mask(bad[rows], diagonal), sigma_wide.to(sigma_plus.dtype),
+                             sigma_plus[rows])                     # failing receivers only (causal write-back)
+        return sigma_plus.index_copy(0, rows, merged)
 
     def _kernel_covariance(
         self,
