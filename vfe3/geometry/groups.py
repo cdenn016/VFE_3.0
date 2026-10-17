@@ -403,9 +403,10 @@ class GaugeGroup:
 
         ``extract_phi`` recovers algebra coordinates by solving ``Gram c = g`` with
         ``c = Gram^+ g``; ``Gram_ab = <G_a, G_b>_F`` depends ONLY on the fixed generator basis.
-        The BCH positional-composition hot path (``compose_bch -> extract_phi``) recomputed a dense
-        ``(n_gen, n_gen)`` float64 ``pinv`` every forward (for the orthonormal block_glk basis the
-        Gram is exactly ``I``, so the recompute was pure waste). Caching is value-identical -- the
+        No production path calls it: it served the BCH positional composition
+        (``compose_bch -> extract_phi``), which the exact right-factor product ``exp(X) exp(Y)`` has
+        replaced, and it is kept for the test and diagnostic composition utilities of
+        :mod:`vfe3.geometry.lie_ops` (audit 2026-10-16, F91). Caching is value-identical -- the
         returned tensor equals ``gram_pinv(self.generators)`` -- and recomputed after device/dtype
         moves, replacement, or an in-place basis mutation.
         """

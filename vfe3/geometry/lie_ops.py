@@ -5,6 +5,16 @@ generator basis {G_a}: the algebra element is embed(phi) = sum_a phi^a G_a. The
 group element U = exp(embed(phi)) lies in GL+(K) (det>0) or SO(N). This module
 supplies: coordinate<->matrix maps, the Lie bracket, a composition registry
 (euclidean step or BCH chart correction), and determinant control. Pure: operates on a generator TENSOR, not a GaugeGroup.
+
+The model consumes only :class:`CompactBlockElement` and :func:`project_phi_to_slk` (and the
+per-block trace functionals behind it). The composition registry (:func:`compose_phi`,
+:func:`compose_bch`, :func:`compose_euclidean`, :func:`get_compose`, :func:`register_compose`), its
+closure guard :func:`require_basis_closed` and the coordinate maps :func:`embed_phi`,
+:func:`extract_phi` and :func:`lie_bracket_coords` have no production caller: the positional frame
+composes as the exact group product :math:`U_i = \exp(X_i)\exp(Y_n)`, the ``right_phi`` factor of
+``build_factored_transport``, with no truncation error. They are kept as test and diagnostic
+utilities, for example to measure the order-4 BCH chart error against that exact product (audit
+2026-10-16, F91 and F101).
 """
 
 import hashlib
@@ -602,6 +612,10 @@ def compose_bch(
     residual_max:   Optional[float]        = None,   # opt-in fail-closed group-product residual bound
 ) -> torch.Tensor:
     r"""BCH chart correction: coords of log(exp(embed phi1) exp(embed phi2)).
+
+    A test and diagnostic utility: no model path calls it, since the positional frame composes as the
+    exact product ``exp(X) exp(Y)`` in ``build_factored_transport`` (see the module docstring). The
+    training-step cost notes below date from when it was the positional composition.
 
     Symmetric Dynkin series (matrix space, extracted once). Terms by `order`:
       order>=1: + 1/2 [X,Y]
