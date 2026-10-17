@@ -10,6 +10,16 @@ checkpoint of a terminal-callback cell (and any checkpoint of a run without log 
 and a resume from it reported the continuation's wall time alone. Every checkpoint now carries the
 cumulative training wall clock.
 
+F123: a resumed run directory holds only the continuation's metrics, diagnostics and figures while its
+summary's best_step is run-wide. The summary now names the source run (``resume_source``), where the earlier
+history lives.
+
+F128: every resume-equivalence test ran on the legacy test baseline (AdamW tables, per-role clip, passthrough
+covariance). A parametrized test now resumes the launcher route of ``tests.profiles.live_config`` with the live
+optimizer routing pinned (Fisher table step, per-group clip, untied diagonal decode, moment-matched predictive
+covariance, frame condition bound; phi under AdamW or ``fisher_group``; kernel and minimal-agent readouts) from an
+epoch boundary and from mid-epoch of a shuffled loader, and compares the final checkpoints leg by leg.
+
 Tiny CPU models only (K=4, two heads, N=4, vocab 7; the live-route test runs ``tests.profiles.live_config``).
 """
 import csv
@@ -225,3 +235,76 @@ def test_resume_source_has_no_run_dir_for_a_checkpoint_outside_one(tmp_path: Pat
                     test_loader=test_loader, losses=losses)
     summary = json.loads((tmp_path / "resumed" / "summary.json").read_text(encoding="utf-8"))
     assert summary["resume_source"] == expected
+
+
+# ----------------------------------------------------------------------------------------------- F128
+
+# The checkpoint legs that a resume must reproduce bitwise; the identity, config and wall-clock legs are
+# provenance, not state.
+_STATE_LEGS = ("step", "model_state", "optimizer_state", "rng_state", "data_state", "scaler_state",
+               "best_val_ppl", "best_step", "numerics_counters", "divergence_monitor")
+
+
+def _assert_same(actual: Any, expected: Any, path: str) -> None:
+    if isinstance(expected, torch.Tensor):
+        assert isinstance(actual, torch.Tensor) and actual.dtype == expected.dtype, path
+        assert torch.equal(actual, expected), path
+    elif isinstance(expected, dict):
+        assert isinstance(actual, dict) and set(actual) == set(expected), path
+        for key in expected:
+            _assert_same(actual[key], expected[key], f"{path}.{key}")
+    elif isinstance(expected, (list, tuple)):
+        assert type(actual) is type(expected) and len(actual) == len(expected), path
+        for index, (a, e) in enumerate(zip(actual, expected)):
+            _assert_same(a, e, f"{path}[{index}]")
+    elif isinstance(expected, float) and math.isnan(expected):
+        assert isinstance(actual, float) and math.isnan(actual), path
+    else:
+        assert actual == expected, path
+
+
+def _live_route(readout: str, phi_mode: str) -> VFE3Config:
+    r"""The launcher route at tiny scale with the live optimizer routing pinned: Fisher table step, one clip per
+    optimizer group, untied diagonal prior-bank decode, moment-matched predictive covariance, and the frame
+    condition bound (which the manifold phi optimizer does not take)."""
+    from tests.profiles import live_config
+    return live_config(m_table_update_mode="fisher", grad_clip_scope="group", decode_mode="diagonal_chunked",
+                       untie_decode_bank=True, predictive_covariance="moment_matched",
+                       attention_mode="projected_predictive", predictive_readout=readout, m_phi_update_mode=phi_mode,
+                       phi_frame_condition_max=1e4 if phi_mode == "adamw" else None, checkpoint_interval=1,
+                       max_steps=8)
+
+
+def _shuffled_loader(cfg: VFE3Config) -> DataLoader:
+    tokens = torch.randint(0, cfg.vocab_size, (29,), generator=torch.Generator().manual_seed(123))
+    return DataLoader(TokenWindows(tokens, cfg.max_seq_len), batch_size=cfg.batch_size, shuffle=True,
+                      drop_last=True, generator=torch.Generator().manual_seed(0))
+
+
+def _live_run(cfg: VFE3Config, run_dir: Path, resume_from: Any = None) -> List[float]:
+    torch.manual_seed(5)
+    model = VFEModel(cfg)
+    artifacts = ra.RunArtifacts(run_dir, cfg, model)
+    torch.manual_seed(11)
+    return T.train(model, _shuffled_loader(cfg), cfg, n_steps=8, grad_clip=cfg.grad_clip, log_interval=0,
+                   eval_interval=0, device=CPU, logger=logging.getLogger("audit-c1-live-resume"),
+                   artifacts=artifacts, generate_samples=False, resume_from=resume_from)
+
+
+@pytest.mark.parametrize("readout", ["minimal_agent", "kernel"])
+@pytest.mark.parametrize("phi_mode", ["adamw", "fisher_group"])
+def test_live_route_resume_is_bitwise_at_an_epoch_boundary_and_mid_epoch(
+        tmp_path: Path, readout: str, phi_mode: str) -> None:
+    cfg = _live_route(readout, phi_mode)
+    steps_per_epoch = len(_shuffled_loader(cfg))
+    assert 2 <= steps_per_epoch <= 4                                     # an epoch boundary and a mid-epoch step
+    straight = _live_run(cfg, tmp_path / "straight")
+    reference = torch.load(tmp_path / "straight" / "checkpoints" / "step_8.pt", weights_only=True)
+    assert reference["divergence_monitor"] is not None and reference["data_state"]["epoch"] >= 1
+    for resume_step in (steps_per_epoch, steps_per_epoch + 1):
+        run_dir = tmp_path / f"resumed_{resume_step}"
+        resumed = _live_run(cfg, run_dir, tmp_path / "straight" / "checkpoints" / f"step_{resume_step}.pt")
+        assert resumed == straight[resume_step:], resume_step
+        final = torch.load(run_dir / "checkpoints" / "step_8.pt", weights_only=True)
+        for leg in _STATE_LEGS:
+            _assert_same(final[leg], reference[leg], f"resume@{resume_step}:{leg}")
