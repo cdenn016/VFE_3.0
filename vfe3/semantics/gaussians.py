@@ -63,6 +63,13 @@ _MIN_ENTAILMENT = 5                 # minimum resolved (hyponym, hypernym) pairs
 _N_BOOT_CLUSTER = 2000              # cluster-bootstrap resamples (entailment, over hypernym groups)
 _HEADLINE_SCORER = "neg_jeffreys"   # pre-registered headline Gaussian scorer (symmetric)
 _FAILED_STEP: Dict[str, Any] = {"status": "failed", "reason": "raised; see metrics['failed_steps']"}
+# Stable per-(bank, step) streams np.random.default_rng([seed, _SIGMA_STREAM, bank, step]), so each
+# stochastic step draws the same numbers whichever other steps and banks ran or failed (as in
+# vectors._STEP_STREAM; audit 2026-10-16 F73). Ids are nonzero (a trailing zero word does not change
+# a SeedSequence pool).
+_SIGMA_STREAM = 0x516A
+_BANK_STREAM: Dict[str, int] = {"Prior bank": 1, "Decode bank": 2}
+_STEP_STREAM: Dict[str, int] = {"frequency": 1, "entailment": 2, "similarity": 3}
 
 
 # ----------------------------------------------------------------------------------------------
@@ -797,7 +804,7 @@ def _fields(ctx: AnalysisContext, row_of: Dict[int, int], logdet: np.ndarray,
 
 def _bank_battery(run: Any, ctx: AnalysisContext, mu_fn: Callable[[np.ndarray], np.ndarray],
                   lv_fn: Callable[[np.ndarray], np.ndarray], lv_init: float,
-                  rng: np.random.Generator, *, bank: str, failed: List[Dict[str, str]],
+                  *, bank: str, failed: List[Dict[str, str]],
                   notes: List[str],
                   logdet_fn: Optional[Callable[[np.ndarray], np.ndarray]] = None,
                   ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -806,8 +813,14 @@ def _bank_battery(run: Any, ctx: AnalysisContext, mu_fn: Callable[[np.ndarray], 
     Loading the tables and the dispersion summary are required; every later item that raises is
     recorded in ``failed`` (step ``"<bank>: <item>"``) and replaced by a failed-status entry.
     ``logdet_fn`` gives (n,) :math:`\log\det\Sigma_v` for a covariance that is not diagonal (the
-    per-head ``block_cholesky`` blocks); None takes the row sum of ``lv_fn``.
+    per-head ``block_cholesky`` blocks); None takes the row sum of ``lv_fn``. The frequency,
+    entailment and similarity bootstraps each draw from their own stream
+    ``[ctx.seed, _SIGMA_STREAM, _BANK_STREAM[bank], _STEP_STREAM[step]]``.
     """
+    def rng(step_name: str) -> np.random.Generator:
+        return np.random.default_rng(
+            [int(ctx.seed), _SIGMA_STREAM, _BANK_STREAM[bank], _STEP_STREAM[step_name]])
+
     ids = np.asarray(ctx.candidate_ids, dtype=np.int64)
     row_of = {int(t): r for r, t in enumerate(ids)}
     V = int(run.vocab.size)
@@ -834,11 +847,13 @@ def _bank_battery(run: Any, ctx: AnalysisContext, mu_fn: Callable[[np.ndarray], 
     binned: List[Dict[str, Any]] = []
     if log_count is not None:
         binned = step("binned log det medians", lambda: _binned_medians(log_count, logdet), [])
-        metrics["frequency"] = step("frequency", lambda: {
-            "logdet_vs_log_count": _spearman(logdet, log_count, rng),
-            "trace_vs_log_count": _spearman(np.exp(lv).sum(axis=1), log_count, rng),
-            "binned_medians": binned,
-        }, dict(_FAILED_STEP))
+        def frequency() -> Dict[str, Any]:
+            gen = rng("frequency")
+            return {"logdet_vs_log_count": _spearman(logdet, log_count, gen),
+                    "trace_vs_log_count": _spearman(np.exp(lv).sum(axis=1), log_count, gen),
+                    "binned_medians": binned}
+
+        metrics["frequency"] = step("frequency", frequency, dict(_FAILED_STEP))
     else:
         metrics["frequency"] = {"status": "skipped", "reason": "training counts unavailable"}
     metrics["classes"], class_groups = step(
@@ -849,9 +864,9 @@ def _bank_battery(run: Any, ctx: AnalysisContext, mu_fn: Callable[[np.ndarray], 
         "variance-sorted neighbors",
         lambda: _variance_sorted_neighbors(ctx, ids, row_of, mu, lv, mu_d0, logdet), [])
     metrics["entailment"] = step(
-        "entailment", lambda: _entailment(ctx, row_of, mu, lv, logdet, rng), dict(_FAILED_STEP))
+        "entailment", lambda: _entailment(ctx, row_of, mu, lv, logdet, rng("entailment")), dict(_FAILED_STEP))
     metrics["similarity"] = step(
-        "similarity", lambda: _similarity(ctx, row_of, mu, mu_d0, lv_d0, rng), dict(_FAILED_STEP))
+        "similarity", lambda: _similarity(ctx, row_of, mu, mu_d0, lv_d0, rng("similarity")), dict(_FAILED_STEP))
     metrics["table_geometry"] = step(
         "table geometry", lambda: _table_geometry(mu_d0, lv), dict(_FAILED_STEP))
     arrays = {"lv": lv, "logdet": logdet, "log_count": log_count, "binned": binned,
@@ -1334,7 +1349,6 @@ def run_sigma_section(run: Any, ctx: AnalysisContext) -> SectionResult:
         result.status = "skipped"
         result.notes.append(f"only {ids.size} candidate tokens; the Sigma section needs at least 3")
         return result
-    rng = np.random.default_rng(ctx.seed)
     cfg = run.cfg
     family = str(cfg.family)
     lv_init = _init_log_var(cfg)
@@ -1390,7 +1404,7 @@ def run_sigma_section(run: Any, ctx: AnalysisContext) -> SectionResult:
     elif run.decode_kind not in GAUSSIAN_BANK_DECODE_KINDS:
         result.notes.append(f"decode kind {run.decode_kind!r}: no decode-bank covariance analysis")
 
-    m, arr = _bank_battery(run, ctx, run.mu, run.log_var, lv_init, rng, bank="Prior bank",
+    m, arr = _bank_battery(run, ctx, run.mu, run.log_var, lv_init, bank="Prior bank",
                            failed=failed, notes=result.notes, logdet_fn=run.log_det if blocks else None)
     metrics["banks"]["prior"] = m
     disp = m["dispersion"]
@@ -1410,7 +1424,7 @@ def run_sigma_section(run: Any, ctx: AnalysisContext) -> SectionResult:
                 result.notes.append("the Gaussian decode bank equals the prior bank on the candidates "
                                     "(tied); its battery would repeat the prior bank's and is skipped")
                 return {"status": "skipped", "reason": "tied to the prior bank"}
-            md, arrd = _bank_battery(run, ctx, run.decode_mu, run.decode_log_var, lv_init, rng,
+            md, arrd = _bank_battery(run, ctx, run.decode_mu, run.decode_log_var, lv_init,
                                      bank="Decode bank", failed=failed, notes=result.notes)
             md["tau_eff"] = float(run.tau_eff())
             _bank_outputs(run, ctx, result, md, arrd, "Decode bank", "decode_", failed)

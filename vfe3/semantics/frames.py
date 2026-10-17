@@ -71,6 +71,14 @@ PHI_DEFAULTS: Dict[str, Any] = {
     "frame_positional_null":    200,    # position-permutation null draws of the relative-position R^2
 }
 
+# Stable per-step streams np.random.default_rng([seed, _PHI_STREAM, id]) of run_phi_section, so each
+# stochastic step draws the same numbers whichever others ran, failed or changed budget (as in
+# vectors._STEP_STREAM; audit 2026-10-16 F73). Ids are nonzero: trailing zero words do not change a
+# SeedSequence pool, so [seed, _PHI_STREAM, 0] would collide with [seed, _PHI_STREAM].
+_PHI_STREAM = 0x70E1
+_PHI_STEP_STREAM: Dict[str, int] = {"positional": 1, "commutators_raw": 2, "commutators_canonical": 3,
+                                    "group_analogies_benchmark": 4, "relation_transports": 5}
+
 
 # ----------------------------------------------------------------------------------------------
 # Small tensor helpers
@@ -1709,7 +1717,9 @@ def run_phi_section(run: Any, ctx: AnalysisContext) -> SectionResult:
         finally:
             timings[name] = timings.get(name, 0.0) + time.perf_counter() - t0
 
-    rng = np.random.default_rng([int(ctx.seed), 0x70E1])
+    def rng(step_name: str) -> np.random.Generator:
+        return np.random.default_rng([int(ctx.seed), _PHI_STREAM, _PHI_STEP_STREAM[step_name]])
+
     n_ref = int(min(int(_opt(ctx, "frame_ref_count")), ids.size))
     ref_ids = ids[:n_ref]
     cfg = run.cfg
@@ -1750,11 +1760,11 @@ def run_phi_section(run: Any, ctx: AnalysisContext) -> SectionResult:
              if scalars is not None and log_count is not None else None)
 
     n_pairs = int(_opt(ctx, "frame_commutator_pairs"))
-    comm = step("commutators_raw", lambda: commutator_diagnostics(run, ids, rng, n_pairs))
+    comm = step("commutators_raw", lambda: commutator_diagnostics(run, ids, rng("commutators_raw"), n_pairs))
 
     def _canonical_commutators() -> Dict[str, Any]:
         ok_rows = np.flatnonzero(cf.ok)
-        pa, pb = _random_pairs(ok_rows.size, n_pairs, rng)
+        pa, pb = _random_pairs(ok_rows.size, n_pairs, rng("commutators_canonical"))
         ta, tb = torch.from_numpy(ok_rows[pa]), torch.from_numpy(ok_rows[pb])
         return _commutator_stats([Lb[ta] for Lb in cf.L], [Lb[tb] for Lb in cf.L])
 
@@ -1763,7 +1773,8 @@ def run_phi_section(run: Any, ctx: AnalysisContext) -> SectionResult:
     rerank = int(_opt(ctx, "frame_rerank"))
     ga_bench = (step("group_analogies_benchmark",
                      lambda: group_analogies(cf, ctx.analogies, rerank=rerank,
-                                             max_rerank_questions=_opt(ctx, "frame_rerank_questions"), rng=rng))
+                                             max_rerank_questions=_opt(ctx, "frame_rerank_questions"),
+                                             rng=rng("group_analogies_benchmark")))
                 if cf is not None and ctx.analogies else None)
     ga_cur = (step("group_analogies_curated", lambda: group_analogies(cf, ctx.curated_analogies, rerank=rerank))
               if cf is not None and ctx.curated_analogies else None)
@@ -1773,13 +1784,14 @@ def run_phi_section(run: Any, ctx: AnalysisContext) -> SectionResult:
                          "on all covered questions and on exactly that sample, and only the latter pairs with the "
                          "rerank accuracy.")
 
-    rel = ((step("relation_transports", lambda: relation_transports(cf, ctx.relations, rng, int(_opt(ctx, "frame_null"))))
+    rel = ((step("relation_transports", lambda: relation_transports(cf, ctx.relations, rng("relation_transports"),
+                                                                    int(_opt(ctx, "frame_null"))))
             if cf is not None and ctx.relations else None) or {})
 
     n_perm = int(_opt(ctx, "frame_positional_null"))
-    pos_rng = np.random.default_rng([int(ctx.seed), 0x70E1, 1])
     pos = step("positional_frames",
-               lambda: positional_frames(run, _opt(ctx, "frame_max_positions"), n_perm=n_perm, rng=pos_rng))
+               lambda: positional_frames(run, _opt(ctx, "frame_max_positions"), n_perm=n_perm,
+                                         rng=rng("positional")))
     if pos is None and not any(f["step"] == "positional_frames" for f in failed):
         res.notes.append("No positional frames (pos_phi='none'): the realized frame is the token frame.")
     elif pos is not None:

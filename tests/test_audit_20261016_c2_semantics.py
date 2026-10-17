@@ -9,6 +9,8 @@ nothing is trained, everything runs on the CPU.
   battery apply; only the natural-parameter view (linear in :math:`\lambda(q)` for the KL decode
   alone) is skipped.
 * F72: a word-level run's vocabulary sidecar is read from the ``cache_dir`` its token streams use.
+* F73: every stochastic sub-step of the phi and Sigma sections draws from its own seeded stream, so a
+  budget change or skip in one step leaves the draws of the others unchanged.
 """
 
 from __future__ import annotations
@@ -124,3 +126,60 @@ def test_word_level_vocab_sidecar_follows_cache_dir(tmp_path: Path, monkeypatch:
         run = load_semantic_run(run_dir, cache_dir=custom)
     assert run.vocab.word_id("king") == words.index("king")
     assert run.vocab.word_id("other1") is None
+
+
+# ----------------------------------------------------------------------------------------------
+# F73: each stochastic sub-step of the phi and Sigma sections draws from its own stream
+# ----------------------------------------------------------------------------------------------
+
+def _phi_draws(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **options) -> dict:
+    r"""The relation-transport null and the rerank-subset generator state of one phi section run."""
+    import copy
+
+    from tests.test_semantics_frames import _section_setup
+    from vfe3.semantics import frames as F
+
+    seen: dict = {}
+    original = F.group_analogies
+
+    def recording(cf, questions, **kw):
+        rng = kw.get("rng")
+        if rng is not None:
+            seen["rerank_draw"] = copy.deepcopy(rng).integers(0, 1 << 62, size=4).tolist()
+        return original(cf, questions, **kw)
+
+    monkeypatch.setattr(F, "group_analogies", recording)
+    monkeypatch.setattr(F, "apply_style", lambda: None)
+    run, ctx = _section_setup(tmp_path, **options)
+    res = F.run_phi_section(run, ctx)
+    assert res.status == "ok" and res.metrics["failed_steps"] == []
+    planted = res.metrics["relation_transports"]["planted"]
+    seen.update(null_mean=planted["null_mean"], null_std=planted["null_std"], p=planted["p"])
+    return seen
+
+
+def test_phi_rerank_subset_and_transport_null_do_not_depend_on_the_commutator_budget(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    a = _phi_draws(tmp_path / "a", monkeypatch, frame_commutator_pairs=40)
+    b = _phi_draws(tmp_path / "b", monkeypatch, frame_commutator_pairs=17)
+    assert a == b
+
+
+def test_sigma_similarity_draws_do_not_depend_on_the_frequency_step(tmp_path: Path,
+                                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.test_semantics_gaussians import _FakeRun, _context as sigma_context
+    from vfe3.semantics import gaussians as G
+
+    monkeypatch.setattr(G, "apply_style", lambda: None)
+    monkeypatch.setattr(G, "_bank_outputs", lambda *args, **kwargs: None)   # figures are not under test
+
+    def similarity(with_counts: bool) -> dict:
+        run = _FakeRun(decode_kind="gaussian", frames_active=False, seed=5)
+        result = G.run_sigma_section(run, sigma_context(run, tmp_path / str(with_counts), with_counts=with_counts))
+        assert result.metrics["failed_steps"] == []
+        banks = result.metrics["banks"]
+        return {bank: banks[bank]["similarity"]["simlex999"]["scorers"] for bank in ("prior", "decode")}
+
+    with_counts, without = similarity(True), similarity(False)
+    # the frequency step draws only with counts; the similarity bootstraps of both banks are unchanged
+    assert with_counts == without
